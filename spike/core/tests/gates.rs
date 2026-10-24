@@ -191,8 +191,67 @@ fn b_g7_bga_99_percent() {
         }
     };
     let due = 240 * 60;
-    assert_eq!(gate_with("G7", skip(due / 100)), (true, 0));
-    assert_eq!(gate_with("G7", skip(due / 100 + 1)), (false, 1));
+    // Without a PresentMon capture G7 uses the app's flags.
+    let no_pm = |n: usize| {
+        move |r: &mut RunData| {
+            skip(n)(r);
+            r.pm_frames.clear();
+        }
+    };
+    assert!(evaluate_with(no_pm(due / 100)).gate("G7").pass);
+    assert!(!evaluate_with(no_pm(due / 100 + 1)).gate("G7").pass);
+    // With one, what PresentMon shows on screen decides.
+    let not_shown = |n: usize| {
+        move |r: &mut RunData| {
+            let tl = r.info.timeline;
+            r.pm_frames
+                .iter_mut()
+                .filter(|p| p.display_us.is_some_and(|d| tl.is_heavy(d)))
+                .take(n)
+                .for_each(|p| {
+                    p.display_us = None;
+                    p.display_change_ms = None;
+                });
+        }
+    };
+    let s = evaluate_with(not_shown(due / 100));
+    assert!(s.gate("G7").pass);
+    let s = evaluate_with(not_shown(due / 100 + 1));
+    assert!(!s.gate("G7").pass);
+    assert_eq!(
+        s.records.bga_prediction_disagreements,
+        (due / 100 + 1) as u64
+    );
+}
+
+#[test]
+fn g7_follows_presentmon_not_the_prediction() {
+    // The app predicted every BGA frame displayed; PresentMon shows the
+    // composed window dropped most presents: G7 follows PresentMon.
+    let s = evaluate_with(|r: &mut RunData| {
+        for (k, p) in r.pm_frames.iter_mut().enumerate() {
+            if k % 7 != 0 {
+                p.display_us = None;
+                p.display_change_ms = None;
+            }
+        }
+    });
+    assert!(!s.gate("G7").pass);
+    assert!(s.gate("G7").value < Some(20.0));
+    assert!(s.records.bga_prediction_disagreements > 10_000);
+    // A synthetic run's prediction and capture agree.
+    assert_eq!(
+        evaluate(&passing_run())
+            .records
+            .bga_prediction_disagreements,
+        0
+    );
+}
+
+fn evaluate_with(edit: impl Fn(&mut RunData)) -> Summary {
+    let mut run = passing_run();
+    edit(&mut run);
+    evaluate(&run)
 }
 
 // O1/O2 thresholds are in tests/obs.rs with the OBS fixtures.

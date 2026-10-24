@@ -80,6 +80,7 @@ const JSON_KEYS: &[&str] = &[
     "voice_steals",
     "bga_pool_exhausted",
     "bga_skipped",
+    "bga_prediction_disagreements",
     "obs_pre_roll_ms",
     "obs_post_roll_ms",
     "present_modes",

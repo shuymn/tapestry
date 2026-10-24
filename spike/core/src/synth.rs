@@ -44,7 +44,9 @@ pub fn passing_run() -> RunData {
             render_cpu_us: 800,
             present_call_us: 50,
             present_count: None,
-            bga_index: None,
+            // The BGA frame due when this frame is displayed (5 ms after
+            // its present), one per 1/60 s of play.
+            bga_index: Some(((t + 5_000 - PLAY_START_US).max(0) * 60 / 1_000_000) as u64),
             visible_notes: 80,
             effect_instances: 120,
             lanes_with_effects: 8,

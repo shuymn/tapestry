@@ -90,6 +90,11 @@ pub struct Records {
     pub voice_steals: u64,
     pub bga_pool_exhausted: u64,
     pub bga_skipped: u64,
+    /// BGA due frames whose displayed flag from the app's display
+    /// prediction differs from PresentMon's display rows (0 without a
+    /// capture). G7 uses PresentMon.
+    #[serde(default)]
+    pub bga_prediction_disagreements: u64,
     pub obs_pre_roll_ms: Option<i64>,
     pub obs_post_roll_ms: Option<i64>,
     /// PresentMon rows by present mode over the whole run (independent
@@ -395,6 +400,38 @@ fn v4(run: &RunData) -> Check {
         r.push("capture-gap-over-1s");
     }
     check("V4", r)
+}
+
+/// G7's displayed flag of each BGA due record (record `k` is BGA frame `k`
+/// of play). With a PresentMon capture, frame `k` is displayed when a
+/// presented frame that showed it has a PresentMon row displayed within
+/// play: what reached the screen, not what the app predicted (a composed
+/// window can drop most presents). Without a capture, the app's flags.
+fn bga_displayed(run: &RunData) -> Vec<bool> {
+    if run.pm_frames.is_empty() {
+        return run.bga.iter().map(|b| b.displayed).collect();
+    }
+    let tl = run.info.timeline;
+    let presented: Vec<(i64, Option<u64>)> = run
+        .frames
+        .iter()
+        .filter_map(|f| Some((f.present_us?, f.bga_index)))
+        .collect();
+    let times: Vec<i64> = presented.iter().map(|p| p.0).collect();
+    let pm: Vec<i64> = run.pm_frames.iter().map(|f| f.present_us).collect();
+    let mut shown = vec![false; run.bga.len()];
+    for ((_, index), m) in presented.iter().zip(match_presents(&times, &pm)) {
+        let (Some(i), Some(j)) = (index, m) else {
+            continue;
+        };
+        let on_screen = run.pm_frames[j]
+            .display_us
+            .is_some_and(|d| (tl.play_start_us..tl.play_end_us()).contains(&d));
+        if on_screen && let Some(s) = shown.get_mut(*i as usize) {
+            *s = true;
+        }
+    }
+    shown
 }
 
 /// One-to-one match of spike present times to PresentMon present times
@@ -711,9 +748,16 @@ fn gates(run: &RunData, tl: &Timeline, t_ms: Option<f64>) -> (Vec<Gate>, Records
     .iter()
     .map(|t| run.counters.app_allocs.get(t).copied().unwrap_or(0))
     .sum();
-    // G7.
-    let due: Vec<_> = run.bga.iter().filter(|b| tl.is_heavy(b.due_us)).collect();
-    let shown = due.iter().filter(|b| b.displayed).count();
+    // G7: displayed as PresentMon saw it.
+    let bga_shown = bga_displayed(run);
+    let due: Vec<bool> = run
+        .bga
+        .iter()
+        .zip(&bga_shown)
+        .filter(|(b, _)| tl.is_heavy(b.due_us))
+        .map(|(_, &s)| s)
+        .collect();
+    let shown = due.iter().filter(|&&s| s).count();
     let g7_pass = !due.is_empty() && shown * 100 >= due.len() * 99;
     // O1, O2.
     let obs = kind == RunKind::Obs;
@@ -852,7 +896,13 @@ fn gates(run: &RunData, tl: &Timeline, t_ms: Option<f64>) -> (Vec<Gate>, Records
         library_allocs: run.counters.library_allocs.clone(),
         voice_steals: run.counters.voice_steals,
         bga_pool_exhausted: run.counters.bga_pool_exhausted,
-        bga_skipped: run.bga.iter().filter(|b| !b.displayed).count() as u64,
+        bga_skipped: bga_shown.iter().filter(|&&s| !s).count() as u64,
+        bga_prediction_disagreements: run
+            .bga
+            .iter()
+            .zip(&bga_shown)
+            .filter(|(b, s)| b.displayed != **s)
+            .count() as u64,
         obs_pre_roll_ms: None,
         obs_post_roll_ms: None,
         present_modes: {
