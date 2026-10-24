@@ -11,7 +11,7 @@ use crate::chart::{LANES, MIN_NOTES};
 use crate::heavy::Timeline;
 use crate::obslog::{EncoderFamily, ObsSession};
 use crate::run::{
-    EncoderClass, EventKind, PmFrame, Profile, RunData, RunKind, StreamCount, ThreadTag,
+    EncoderClass, EventKind, PmFrame, Profile, Rational, RunData, RunKind, StreamCount, ThreadTag,
 };
 use crate::stats::{percentile_f64, percentile_i64};
 use serde::{Deserialize, Serialize};
@@ -98,7 +98,9 @@ pub struct Summary {
     pub exit_code: u8,
     /// Refresh class from V3, and the G1 target (cap or class).
     pub refresh_class_hz: Option<u32>,
+    /// Nominal G1 target (the class, or the cap) and the exact T in ms.
     pub target_hz: Option<u32>,
+    pub target_period_ms: Option<f64>,
     pub validity: Vec<Check>,
     pub gates: Vec<Gate>,
     pub records: Records,
@@ -124,6 +126,7 @@ pub fn evaluate(run: &RunData) -> Summary {
     let tl = run.info.timeline;
     let refresh_class_hz = refresh_class(run);
     let target_hz = refresh_class_hz.map(|c| target(run, c));
+    let target_period_ms = refresh_class_hz.map(|c| target_period_ms(run, c));
     let validity = vec![
         m1(run),
         v1(run),
@@ -135,7 +138,7 @@ pub fn evaluate(run: &RunData) -> Summary {
         v7(run),
         v8(run),
     ];
-    let (gates, mut records) = gates(run, &tl, target_hz);
+    let (gates, mut records) = gates(run, &tl, target_period_ms);
     records.obs_pre_roll_ms = session(run).and_then(|s| s.connect_lead_ms.max(s.start_lead_ms));
     records.obs_post_roll_ms = session(run).and_then(|s| s.post_roll_ms);
     let exit_code = if validity.iter().any(|c| !c.ok) {
@@ -149,6 +152,7 @@ pub fn evaluate(run: &RunData) -> Summary {
         exit_code,
         refresh_class_hz,
         target_hz,
+        target_period_ms,
         validity,
         gates,
         records,
@@ -171,12 +175,25 @@ fn bga_on(run: &RunData) -> bool {
     run.info.profile != Profile::NoBga
 }
 
-/// G1 target T: the refresh class for R1 and for standard-profile OBS runs;
+/// Nominal G1 target: the class for R1 and for standard-profile OBS runs;
 /// the cap only for streaming-profile OBS runs and diagnostics.
 fn target(run: &RunData, class: u32) -> u32 {
     match (run.info.kind, run.info.profile) {
         (RunKind::Baseline, _) | (RunKind::Obs, Profile::Standard) => class,
         _ => run.info.fps_cap.unwrap_or(class),
+    }
+}
+
+/// G1's T in ms: the exact refresh period of the run's mode (for example
+/// 1/59.951 Hz = 16.680 ms) when the target is the refresh rate; 1/cap when
+/// a cap is the target.
+fn target_period_ms(run: &RunData, class: u32) -> f64 {
+    let rf = run.info.refresh;
+    let t = target(run, class);
+    if t == class || run.info.fps_cap.is_none() {
+        1000.0 * rf.den as f64 / rf.num as f64
+    } else {
+        1000.0 / f64::from(t)
     }
 }
 
@@ -262,29 +279,38 @@ fn v2(run: &RunData) -> Check {
 }
 
 /// The refresh class when the exact rate is in `[class, class × 1.001]`.
+/// The run's class when its monitor's exact refresh rate is within ±0.1%
+/// of the nominal class rate (59.94–60.06 Hz, 239.76–240.24 Hz) and VRR is
+/// off.
 fn refresh_class(run: &RunData) -> Option<u32> {
-    let rf = run.info.refresh;
+    let i = &run.info;
+    (REFRESH_CLASSES.contains(&i.class_hz) && !i.vrr && in_band(i.refresh, i.class_hz))
+        .then_some(i.class_hz)
+}
+
+fn in_band(rf: Rational, class: u32) -> bool {
     if rf.den == 0 {
-        return None;
+        return false;
     }
-    let (n, d) = (u128::from(rf.num), u128::from(rf.den));
-    REFRESH_CLASSES.into_iter().find(|&c| {
-        let c = u128::from(c);
-        n >= c * d && n * 1000 <= c * 1001 * d
-    })
+    let (n, d, c) = (u128::from(rf.num), u128::from(rf.den), u128::from(class));
+    n * 1000 >= c * 999 * d && n * 1000 <= c * 1001 * d
 }
 
 fn v3(run: &RunData, class: Option<u32>) -> Check {
+    let i = &run.info;
     let mut r = vec![];
-    match class {
-        None => r.push("refresh-not-exact-60-or-240"),
-        Some(c) => {
-            if let Some(cap) = run.info.fps_cap
-                && (cap == 0 || c % cap != 0)
-            {
-                r.push("cap-does-not-divide-refresh");
-            }
-        }
+    if !REFRESH_CLASSES.contains(&i.class_hz) {
+        r.push("class-not-60-or-240");
+    } else if !in_band(i.refresh, i.class_hz) {
+        r.push("refresh-outside-class-band");
+    }
+    if i.vrr {
+        r.push("vrr-on");
+    }
+    if let (Some(c), Some(cap)) = (class, i.fps_cap)
+        && (cap == 0 || c % cap != 0)
+    {
+        r.push("cap-does-not-divide-refresh");
     }
     check("V3", r)
 }
@@ -505,7 +531,8 @@ fn v8(run: &RunData) -> Check {
     let play = (tl.play_start_us, tl.play_end_us());
     let mut r = vec![];
     let s = &run.streams;
-    let frame_us = 1_000_000 / i64::from(refresh_class(run).map_or(60, |c| target(run, c)));
+    let frame_us =
+        refresh_class(run).map_or(16_667, |c| (target_period_ms(run, c) * 1000.0) as i64);
     if !complete(s.frames, run.frames.len())
         || !spans(
             &run.frames,
@@ -588,14 +615,13 @@ fn gate(
     }
 }
 
-fn gates(run: &RunData, tl: &Timeline, target_hz: Option<u32>) -> (Vec<Gate>, Records) {
+fn gates(run: &RunData, tl: &Timeline, t_ms: Option<f64>) -> (Vec<Gate>, Records) {
     let kind = run.info.kind;
     let heavy_pm: Vec<&PmFrame> = run
         .pm_frames
         .iter()
         .filter(|f| tl.is_heavy(f.window_time_us()))
         .collect();
-    let t_ms = target_hz.map(|hz| 1000.0 / f64::from(hz));
 
     // G1 / G1r.
     // TODO(P5): PresentMon prints durations rounded to a fixed number of

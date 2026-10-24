@@ -53,7 +53,13 @@ pub struct RunInfo {
     /// Required for `RunKind::Obs`.
     pub obs_encoder: Option<EncoderClass>,
     pub timeline: Timeline,
+    /// The PC/display class the run measures: nominal 60 Hz (reference)
+    /// or 240 Hz (mid-range).
+    pub class_hz: u32,
+    /// Exact refresh rate of the monitor the run is on (QueryDisplayConfig).
     pub refresh: Rational,
+    /// Variable refresh rate was on for that monitor (invalid, V3).
+    pub vrr: bool,
     /// Frame cap; `None` means the cap is the refresh rate.
     pub fps_cap: Option<u32>,
     /// Decoded BGA size; `None` when BGA is off.

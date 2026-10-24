@@ -197,35 +197,64 @@ fn b_g7_bga_99_percent() {
 
 // O1/O2 thresholds are in tests/obs.rs with the OBS fixtures.
 
-// ---- (c) refresh must be exactly 60 or 240 Hz -------------------------
+// ---- (c) refresh within ±0.1% of the run's class -----------------------
 
-fn validity_with_refresh(num: u64, den: u64, cap: Option<u32>) -> bool {
+fn validity_with(class_hz: u32, num: u64, den: u64, cap: Option<u32>) -> bool {
     let mut run = passing_run();
+    run.info.class_hz = class_hz;
     run.info.refresh = Rational { num, den };
     run.info.fps_cap = cap;
     evaluate(&run).check("V3").ok
 }
 
 #[test]
-fn c_59_94_and_239_76_are_invalid() {
-    assert!(!validity_with_refresh(60_000, 1_001, None));
-    assert!(!validity_with_refresh(240_000, 1_001, None));
+fn c_refresh_must_be_within_a_tenth_of_a_percent_of_the_class() {
+    // NVIDIA's "60 Hz" (59.951) and 59.94 / 239.76 are in band now.
+    assert!(validity_with(60, 59_951, 1_000, None));
+    assert!(validity_with(60, 60_000, 1_001, None));
+    assert!(validity_with(240, 240_000, 1_001, None));
+    assert!(validity_with(240, 240_085, 1_000, None));
+    assert!(validity_with(60, 60, 1, None));
+    // Band edges are inclusive.
+    assert!(validity_with(60, 59_940, 1_000, None));
+    assert!(validity_with(60, 60_060, 1_000, None));
+    assert!(!validity_with(60, 59_939, 1_000, None));
+    assert!(!validity_with(60, 60_061, 1_000, None));
+    assert!(!validity_with(240, 240_241, 1_000, None));
+    // A 240 Hz-class run on a 60 Hz mode, and another class.
+    assert!(!validity_with(240, 59_951, 1_000, None));
+    assert!(!validity_with(144, 144, 1, None));
     let mut run = passing_run();
+    run.info.class_hz = 240;
+    run.info.refresh = Rational { num: 60, den: 1 };
+    let s = evaluate(&run);
+    assert_eq!(s.check("V3").reasons, vec!["refresh-outside-class-band"]);
+    assert_eq!(s.exit_code, 2);
+    // VRR invalidates.
+    let mut run = passing_run();
+    run.info.vrr = true;
+    assert_eq!(evaluate(&run).check("V3").reasons, vec!["vrr-on"]);
+    // Caps must divide the nominal class rate.
+    assert!(validity_with(240, 240, 1, Some(120)));
+    assert!(validity_with(240, 240, 1, Some(60)));
+    assert!(!validity_with(240, 240, 1, Some(100)));
+}
+
+#[test]
+fn g1_target_is_the_exact_refresh_period_of_the_mode() {
+    // A frame every 16.68 ms meets T on a 59.951 Hz mode (16.680 ms) but
+    // not on an exact 60 Hz mode (16.667 ms).
+    let mut run = passing_run();
+    set_heavy_pm(&mut run, |p| p.display_change_ms = Some(16.68));
     run.info.refresh = Rational {
-        num: 60_000,
-        den: 1_001,
+        num: 59_951,
+        den: 1_000,
     };
-    assert_eq!(evaluate(&run).exit_code, 2);
-    assert!(validity_with_refresh(60, 1, None));
-    assert!(validity_with_refresh(240, 1, None));
-    // Upper bound target × 1.001 is inclusive.
-    assert!(validity_with_refresh(60_060, 1_000, None));
-    assert!(!validity_with_refresh(60_061, 1_000, None));
-    assert!(!validity_with_refresh(144, 1, None));
-    // Caps must divide the refresh rate.
-    assert!(validity_with_refresh(240, 1, Some(120)));
-    assert!(validity_with_refresh(240, 1, Some(60)));
-    assert!(!validity_with_refresh(240, 1, Some(100)));
+    let s = evaluate(&run);
+    assert!((s.target_period_ms.unwrap() - 16.680_288).abs() < 1e-5);
+    assert!(s.gate("G1").pass);
+    run.info.refresh = Rational { num: 60, den: 1 };
+    assert!(!evaluate(&run).gate("G1").pass);
 }
 
 // ---- matrix eligibility (M1) ------------------------------------------
@@ -233,6 +262,7 @@ fn c_59_94_and_239_76_are_invalid() {
 #[test]
 fn m1_capped_240_hz_baseline_is_invalid_not_a_pass() {
     let mut run = passing_run();
+    run.info.class_hz = 240;
     run.info.refresh = Rational { num: 240, den: 1 };
     run.info.fps_cap = Some(60);
     let s = evaluate(&run);
@@ -294,6 +324,7 @@ fn m1_required_runs_need_the_matrix_configuration() {
 fn g1_target_is_the_cap_only_for_streaming_obs_runs() {
     use spike_core::run::Profile;
     let mut run = passing_obs_run();
+    run.info.class_hz = 240;
     run.info.refresh = Rational { num: 240, den: 1 };
     run.info.profile = Profile::Streaming;
     run.info.fps_cap = Some(60);

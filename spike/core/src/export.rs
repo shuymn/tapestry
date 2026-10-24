@@ -147,6 +147,8 @@ const JSON_KEYS: &[&str] = &[
     "bga_width",
     "bga_height",
     "mix_rate_hz",
+    "class_hz",
+    "target_period_ms",
     "audio_period_us",
     "presentmon_error",
     "notes_total",
@@ -483,6 +485,7 @@ fn structural_kind(key: &str) -> Option<Structural> {
         "audio_period_us" => Range(1.0, 1_000_000.0),
         "display_change_ms" | "gpu_busy_ms" => Range(0.0, 60_000.0),
         "whole_run_p99_interval_ms" | "whole_run_max_interval_ms" => Range(0.0, 600_000.0),
+        "target_period_ms" => Range(0.1, 1_000.0),
         // OBS offsets against the play window.
         "connect_lead_ms" | "start_lead_ms" | "post_roll_ms" | "obs_pre_roll_ms"
         | "obs_post_roll_ms" => Range(-DAY_MS, DAY_MS),
