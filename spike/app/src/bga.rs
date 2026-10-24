@@ -6,6 +6,7 @@
 //! newest frame due at the predicted display time; older due frames are
 //! skipped and counted, and every due frame becomes a P1 `BgaDue` record.
 
+#[cfg(not(feature = "ffmpeg"))]
 use spike_core::run::BgaDue;
 
 /// Outcome of taking the frame due at some time.
@@ -22,7 +23,7 @@ mod imp {
     use spike_core::run::BgaDue;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
+    use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -149,14 +150,8 @@ mod imp {
             loop {
                 let next = match self.pending.take() {
                     Some(i) => Some(i),
-                    None if wait => match self.ready.recv_timeout(Duration::from_secs(2)) {
-                        Ok(i) => Some(i),
-                        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
-                    },
-                    None => match self.ready.try_recv() {
-                        Ok(i) => Some(i),
-                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-                    },
+                    None if wait => self.ready.recv_timeout(Duration::from_secs(2)).ok(),
+                    None => self.ready.try_recv().ok(),
                 };
                 let Some(i) = next else { break };
                 if self.pts(i) > due_us {
@@ -217,7 +212,6 @@ mod imp {
             ctx.set_threading(ff::codec::threading::Config {
                 kind: ff::codec::threading::Type::Frame,
                 count: 2,
-                ..Default::default()
             });
             let mut decoder = ctx.decoder().video().map_err(|e| e.to_string())?;
             let mut frame = ff::frame::Video::empty();
