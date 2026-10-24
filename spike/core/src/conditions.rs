@@ -308,12 +308,10 @@ pub fn obs_log_day_base(origin_local_ms: i64, first_line_tod_ms: i64) -> i64 {
     (origin_local_ms - first_line_tod_ms).div_euclid(DAY_MS) * DAY_MS
 }
 
-fn nearest_rank(sorted: &[u32], p: usize) -> Option<u32> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let rank = (sorted.len() * p).div_ceil(100).max(1);
-    Some(sorted[rank - 1])
+/// Nearest-rank percentile of already sorted values (the min and max come
+/// from the same slice).
+fn nearest_rank(sorted: &[u32], pct: u32) -> Option<u32> {
+    (!sorted.is_empty()).then(|| sorted[crate::stats::rank_index(sorted.len(), pct)])
 }
 
 /// nvidia-smi's polling interval (`-lms`).

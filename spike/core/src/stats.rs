@@ -9,15 +9,19 @@ pub fn percentile<T: Copy, F: FnMut(&T, &T) -> std::cmp::Ordering>(
     pct: u32,
     cmp: F,
 ) -> Option<T> {
-    assert!((1..=100).contains(&pct));
     if values.is_empty() {
         return None;
     }
-    let n = values.len();
-    let rank = (pct as usize * n).div_ceil(100);
     let mut v = values.to_vec();
-    let (_, x, _) = v.select_nth_unstable_by(rank - 1, cmp);
+    let (_, x, _) = v.select_nth_unstable_by(rank_index(values.len(), pct), cmp);
     Some(*x)
+}
+
+/// Index of the nearest-rank percentile `pct` (1..=100) in `n` sorted
+/// values (`n > 0`): rank `ceil(pct * n / 100)`, minus one.
+pub fn rank_index(n: usize, pct: u32) -> usize {
+    assert!((1..=100).contains(&pct) && n > 0);
+    (pct as usize * n).div_ceil(100) - 1
 }
 
 pub fn percentile_f64(values: &[f64], pct: u32) -> Option<f64> {

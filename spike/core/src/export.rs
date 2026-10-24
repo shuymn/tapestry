@@ -263,6 +263,16 @@ pub fn build(
     conditions: &PublicConditions,
     ctx: &ScanContext,
 ) -> Result<Export, ExportError> {
+    build_with_summary(run, conditions, ctx).map(|(e, _)| e)
+}
+
+/// `build`, also returning the summary it evaluated (the run is evaluated
+/// once per report).
+pub fn build_with_summary(
+    run: &RunData,
+    conditions: &PublicConditions,
+    ctx: &ScanContext,
+) -> Result<(Export, Summary), ExportError> {
     let summary = evaluate(run);
     let run_json = RunJson {
         info: run.info.clone(),
@@ -289,13 +299,15 @@ pub fn build(
     let export = Export { files };
     let findings = scan(&export, ctx);
     if findings.is_empty() {
-        Ok(export)
+        Ok((export, summary))
     } else {
         Err(ExportError::Rejected(findings))
     }
 }
 
-/// Every finding in the export; empty means it may leave the PC.
+/// Every finding in the export; empty means it may leave the PC. Each file
+/// is parsed once; its scalar fields serve the raw-QPC scan and the
+/// structural check.
 pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
     let mut out = Vec::new();
     let json_keys: BTreeSet<&str> = JSON_KEYS
@@ -305,6 +317,13 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
         .chain(NESTED_KEYS)
         .copied()
         .collect();
+    // Scalar fields of the files the structural check covers (`None`:
+    // unparsable).
+    let mut structural: Vec<(&String, Option<Fields>)> = vec![];
+    let in_qpc = |v: &str| {
+        ctx.qpc_range
+            .is_some_and(|(lo, hi)| digit_runs(v).any(|x| (lo..=hi).contains(&x)))
+    };
     for (name, bytes) in &export.files {
         if !FILES.contains(&name.as_str()) {
             out.push(Finding::UnknownFile(name.clone()));
@@ -319,40 +338,42 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
         if contains_name(text, &ctx.forbidden_names) {
             out.push(Finding::Name(name.clone()));
         }
+        // The conditions and the report are scanned as whole text and have
+        // no time fields; the others by field.
+        let whole_text = name == CONDITIONS || name == REPORT;
         let json = name
             .ends_with(".json")
             .then(|| serde_json::from_str::<Value>(text));
+        let fields = match &json {
+            _ if whole_text => None,
+            Some(Ok(v)) => Some(json_fields(v)),
+            Some(Err(_)) => None,
+            None => csv_fields(text),
+        };
         // Raw QPC: time and duration fields (`*_us`, `*_ms`) are checked by
         // unit and range in `structural_findings` (a relative µs value may
         // legitimately fall inside the raw QPC range on a recently booted
         // PC); everything else, text and counts alike, is scanned for it.
-        if let Some((lo, hi)) = ctx.qpc_range {
-            let scanned: Vec<String> = if name == CONDITIONS || name == REPORT {
-                vec![text.to_owned()]
-            } else {
-                fields(name, text)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|(k, _)| structural_kind(k).is_none())
-                    .map(|(_, v)| v)
-                    .collect()
-            };
-            if scanned
+        let raw_qpc = if whole_text {
+            in_qpc(text)
+        } else {
+            fields
                 .iter()
-                .any(|v| digit_runs(v).any(|x| (lo..=hi).contains(&x)))
-            {
-                out.push(Finding::RawQpc(name.clone()));
-            }
+                .flatten()
+                .any(|(k, v)| structural_kind(k).is_none() && in_qpc(v))
+        };
+        if raw_qpc {
+            out.push(Finding::RawQpc(name.clone()));
         }
         let keys: Vec<String> = if name == REPORT {
             // Prose: no keys or columns; times are printed in seconds so the
             // raw-QPC scan above can cover the whole text.
             vec![]
-        } else if let Some(json) = json {
+        } else if let Some(json) = &json {
             match json {
                 Ok(v) => {
                     let mut k = Vec::new();
-                    collect_keys(&v, &mut k);
+                    collect_keys(v, &mut k);
                     k.into_iter()
                         .filter(|k| !json_keys.contains(k.as_str()))
                         .collect()
@@ -374,9 +395,12 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
             file: name.clone(),
             key,
         }));
+        if !whole_text {
+            structural.push((name, fields));
+        }
     }
     if out.is_empty() {
-        out.extend(structural_findings(export));
+        out.extend(structural_findings(export, &structural));
     }
     out
 }
@@ -449,38 +473,45 @@ fn structural_kind(key: &str) -> Option<Structural> {
     })
 }
 
-/// `(key, raw value)` of every scalar in a JSON or CSV export file (JSON
-/// array items take their parent's key; empty CSV cells are skipped).
-fn fields(name: &str, text: &str) -> Option<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    if name.ends_with(".json") {
-        fn walk(key: &str, v: &Value, out: &mut Vec<(String, String)>) {
-            match v {
-                Value::Object(m) => m.iter().for_each(|(k, x)| walk(k, x, out)),
-                Value::Array(a) => a.iter().for_each(|x| walk(key, x, out)),
-                Value::String(s) => out.push((key.to_owned(), s.clone())),
-                Value::Number(n) => out.push((key.to_owned(), n.to_string())),
-                Value::Bool(_) | Value::Null => {}
-            }
+/// `(key, raw value)` pairs of a file's scalars.
+type Fields = Vec<(String, String)>;
+
+/// `(key, raw value)` of every scalar of a JSON file (array items take
+/// their parent's key).
+fn json_fields(v: &Value) -> Fields {
+    fn walk(key: &str, v: &Value, out: &mut Fields) {
+        match v {
+            Value::Object(m) => m.iter().for_each(|(k, x)| walk(k, x, out)),
+            Value::Array(a) => a.iter().for_each(|x| walk(key, x, out)),
+            Value::String(s) => out.push((key.to_owned(), s.clone())),
+            Value::Number(n) => out.push((key.to_owned(), n.to_string())),
+            Value::Bool(_) | Value::Null => {}
         }
-        walk("", &serde_json::from_str::<Value>(text).ok()?, &mut out);
-    } else {
-        let mut rdr = csv::Reader::from_reader(text.as_bytes());
-        let header = rdr.headers().ok()?.clone();
-        for rec in rdr.records() {
-            for (k, v) in header.iter().zip(rec.ok()?.iter()) {
-                if !v.is_empty() {
-                    out.push((k.to_owned(), v.to_owned()));
-                }
+    }
+    let mut out = Vec::new();
+    walk("", v, &mut out);
+    out
+}
+
+/// `(column, raw value)` of every non-empty CSV cell; `None` if unparsable.
+fn csv_fields(text: &str) -> Option<Fields> {
+    let mut out = Vec::new();
+    let mut rdr = csv::Reader::from_reader(text.as_bytes());
+    let header = rdr.headers().ok()?.clone();
+    for rec in rdr.records() {
+        for (k, v) in header.iter().zip(rec.ok()?.iter()) {
+            if !v.is_empty() {
+                out.push((k.to_owned(), v.to_owned()));
             }
         }
     }
     Some(out)
 }
 
-/// Structural unit check: every time and duration field of the export lies
-/// in its plausible range (a raw QPC value or a wrong unit does not).
-fn structural_findings(e: &Export) -> Vec<Finding> {
+/// Structural unit check over the scanned files' fields: every time and
+/// duration field lies in its plausible range (a raw QPC value or a wrong
+/// unit does not).
+fn structural_findings(e: &Export, files: &[(&String, Option<Fields>)]) -> Vec<Finding> {
     let Ok(run) = json::<RunJson>(e, RUN) else {
         return vec![Finding::Unparsable(RUN.into())];
     };
@@ -490,13 +521,9 @@ fn structural_findings(e: &Export) -> Vec<Finding> {
         (tl.play_end_us() + TIME_SLACK_US) as f64,
     );
     let mut out = vec![];
-    for (name, bytes) in &e.files {
-        if name == CONDITIONS || name == REPORT {
-            continue;
-        }
-        let text = String::from_utf8_lossy(bytes);
-        let Some(fields) = fields(name, &text) else {
-            out.push(Finding::Unparsable(name.clone()));
+    for (name, fields) in files {
+        let Some(fields) = fields else {
+            out.push(Finding::Unparsable((*name).clone()));
             continue;
         };
         let bad = fields.iter().any(|(k, v)| {
@@ -513,7 +540,7 @@ fn structural_findings(e: &Export) -> Vec<Finding> {
             }
         });
         if bad {
-            out.push(Finding::OutOfRange(name.clone()));
+            out.push(Finding::OutOfRange((*name).clone()));
         }
     }
     out
