@@ -254,9 +254,9 @@ pub enum Finding {
     Path(String),
     Name(String),
     RawQpc(String),
-    /// A timestamp outside the run's relative-µs range (wrong unit, or a
-    /// raw QPC value in a time field).
-    TimestampOutOfRange(String),
+    /// A time or duration field outside its plausible range (wrong unit,
+    /// or a raw QPC value in it).
+    OutOfRange(String),
     Key {
         file: String,
         key: String,
@@ -365,21 +365,25 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
         let json = name
             .ends_with(".json")
             .then(|| serde_json::from_str::<Value>(text));
-        // Raw QPC: numbers in the structured files are checked by unit and
-        // range below (a relative µs value may legitimately fall inside the
-        // raw QPC range on a recently booted PC); free text, which is all of
-        // the condition file and every JSON string, is scanned for it.
+        // Raw QPC: time and duration fields (`*_us`, `*_ms`) are checked by
+        // unit and range in `structural_findings` (a relative µs value may
+        // legitimately fall inside the raw QPC range on a recently booted
+        // PC); everything else, text and counts alike, is scanned for it.
         if let Some((lo, hi)) = ctx.qpc_range {
-            let free_text = match &json {
-                _ if name == CONDITIONS => text.to_owned(),
-                Some(Ok(v)) => {
-                    let mut strings = Vec::new();
-                    collect_strings(v, &mut strings);
-                    strings.join(" ")
-                }
-                _ => String::new(),
+            let scanned: Vec<String> = if name == CONDITIONS {
+                vec![text.to_owned()]
+            } else {
+                fields(name, text)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(k, _)| structural_kind(k).is_none())
+                    .map(|(_, v)| v)
+                    .collect()
             };
-            if digit_runs(&free_text).any(|v| (lo..=hi).contains(&v)) {
+            if scanned
+                .iter()
+                .any(|v| digit_runs(v).any(|x| (lo..=hi).contains(&x)))
+            {
                 out.push(Finding::RawQpc(name.clone()));
             }
         }
@@ -411,7 +415,7 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
         }));
     }
     if out.is_empty() {
-        out.extend(timestamp_findings(export));
+        out.extend(structural_findings(export));
     }
     out
 }
@@ -442,80 +446,107 @@ fn contains_name(text: &str, names: &[String]) -> bool {
 /// Times may lie this far outside the play window (countdown, capture
 /// lead-in and tail).
 const TIME_SLACK_US: i64 = 600_000_000;
+const DAY_MS: f64 = 86_400_000.0;
 
-/// Structural unit check: every µs time in the export lies within the
-/// run's relative range.
-fn timestamp_findings(e: &Export) -> Vec<Finding> {
-    let Ok(run) = read(e) else {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Structural {
+    /// Relative µs time.
+    Time,
+    PlayStart,
+    /// Duration or offset with its plausible range, in the field's unit.
+    Range(f64, f64),
+}
+
+/// How a `*_us` / `*_ms` field is checked; `None` for other keys. An
+/// unlisted `*_us` / `*_ms` key is `Range(NaN, NaN)`, which nothing passes,
+/// so a new time field must be classified here deliberately.
+fn structural_kind(key: &str) -> Option<Structural> {
+    use Structural::*;
+    Some(match key {
+        "play_start_us" => PlayStart,
+        "present_us" | "display_us" | "render_us" | "t_us" | "due_us" | "start_us" | "end_us"
+        | "capture_from_us" | "capture_to_us" => Time,
+        // Per-frame and per-event durations: at most 10 s.
+        "latency_us" | "render_cpu_us" | "present_call_us" => Range(0.0, 10_000_000.0),
+        "audio_period_us" => Range(1.0, 1_000_000.0),
+        "display_change_ms" | "gpu_busy_ms" => Range(0.0, 60_000.0),
+        "whole_run_p99_interval_ms" | "whole_run_max_interval_ms" => Range(0.0, 600_000.0),
+        // OBS offsets against the play window.
+        "connect_lead_ms" | "start_lead_ms" | "post_roll_ms" | "obs_pre_roll_ms"
+        | "obs_post_roll_ms" => Range(-DAY_MS, DAY_MS),
+        k if k.ends_with("_us") || k.ends_with("_ms") => Range(f64::NAN, f64::NAN),
+        _ => return None,
+    })
+}
+
+/// `(key, raw value)` of every scalar in a JSON or CSV export file (JSON
+/// array items take their parent's key; empty CSV cells are skipped).
+fn fields(name: &str, text: &str) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    if name.ends_with(".json") {
+        fn walk(key: &str, v: &Value, out: &mut Vec<(String, String)>) {
+            match v {
+                Value::Object(m) => m.iter().for_each(|(k, x)| walk(k, x, out)),
+                Value::Array(a) => a.iter().for_each(|x| walk(key, x, out)),
+                Value::String(s) => out.push((key.to_owned(), s.clone())),
+                Value::Number(n) => out.push((key.to_owned(), n.to_string())),
+                Value::Bool(_) | Value::Null => {}
+            }
+        }
+        walk("", &serde_json::from_str::<Value>(text).ok()?, &mut out);
+    } else {
+        let mut rdr = csv::Reader::from_reader(text.as_bytes());
+        let header = rdr.headers().ok()?.clone();
+        for rec in rdr.records() {
+            for (k, v) in header.iter().zip(rec.ok()?.iter()) {
+                if !v.is_empty() {
+                    out.push((k.to_owned(), v.to_owned()));
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Structural unit check: every time and duration field of the export lies
+/// in its plausible range (a raw QPC value or a wrong unit does not).
+fn structural_findings(e: &Export) -> Vec<Finding> {
+    let Ok(run) = json::<RunJson>(e, RUN) else {
         return vec![Finding::Unparsable(RUN.into())];
     };
     let tl = run.info.timeline;
-    let ok_start = (0..=TIME_SLACK_US).contains(&tl.play_start_us);
-    let (lo, hi) = (-TIME_SLACK_US, tl.play_end_us() + TIME_SLACK_US);
-    let ok = |t: i64| (lo..=hi).contains(&t);
+    let (lo, hi) = (
+        -TIME_SLACK_US as f64,
+        (tl.play_end_us() + TIME_SLACK_US) as f64,
+    );
     let mut out = vec![];
-    if !ok_start {
-        out.push(Finding::TimestampOutOfRange(RUN.into()));
-    }
-    let mut check = |file: &str, mut times: Box<dyn Iterator<Item = i64> + '_>| {
-        if !times.all(ok) {
-            out.push(Finding::TimestampOutOfRange(file.into()));
+    for (name, bytes) in &e.files {
+        if name == CONDITIONS {
+            continue;
         }
-    };
-    check(
-        RUN,
-        Box::new(
-            run.events
-                .iter()
-                .map(|x| x.t_us)
-                .chain(
-                    run.audio
-                        .episodes
-                        .iter()
-                        .flat_map(|x| [x.start_us, x.end_us]),
-                )
-                .chain(run.audio.capture_from_us)
-                .chain(run.audio.capture_to_us),
-        ),
-    );
-    check(
-        PM_FRAMES,
-        Box::new(
-            run.pm_frames
-                .iter()
-                .flat_map(|f| std::iter::once(f.present_us).chain(f.display_us)),
-        ),
-    );
-    check(
-        FRAMES,
-        Box::new(
-            run.frames
-                .iter()
-                .flat_map(|f| std::iter::once(f.render_us).chain(f.present_us)),
-        ),
-    );
-    check(
-        AUDIO_PERIODS,
-        Box::new(run.audio_periods.iter().map(|x| x.t_us)),
-    );
-    check(INPUT, Box::new(run.input.iter().map(|x| x.t_us)));
-    check(BGA, Box::new(run.bga.iter().map(|x| x.due_us)));
-    if let Ok(summary) = json::<Summary>(e, SUMMARY) {
-        check(
-            SUMMARY,
-            Box::new(summary.records.worst_frames.iter().map(|w| w.present_us)),
-        );
+        let text = String::from_utf8_lossy(bytes);
+        let Some(fields) = fields(name, &text) else {
+            out.push(Finding::Unparsable(name.clone()));
+            continue;
+        };
+        let bad = fields.iter().any(|(k, v)| {
+            let Some(kind) = structural_kind(k) else {
+                return false;
+            };
+            let Ok(x) = v.parse::<f64>() else {
+                return true;
+            };
+            match kind {
+                Structural::PlayStart => !(0.0..=TIME_SLACK_US as f64).contains(&x),
+                Structural::Time => !(lo..=hi).contains(&x),
+                Structural::Range(a, b) => !(a..=b).contains(&x),
+            }
+        });
+        if bad {
+            out.push(Finding::OutOfRange(name.clone()));
+        }
     }
     out
-}
-
-fn collect_strings(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::String(s) => out.push(s.clone()),
-        Value::Object(m) => m.values().for_each(|x| collect_strings(x, out)),
-        Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
-        _ => {}
-    }
 }
 
 fn has_path(text: &str) -> bool {

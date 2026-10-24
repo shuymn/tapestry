@@ -3,8 +3,8 @@
 use serde_json::{Map, Value, json};
 use spike_core::evaluate::evaluate;
 use spike_core::export::{
-    CONDITIONS, ExportError, FRAMES, Finding, RUN, SUMMARY, ScanContext, build, read, recompute,
-    scan,
+    CONDITIONS, ExportError, FRAMES, Finding, INPUT, RUN, SUMMARY, ScanContext, build, read,
+    recompute, scan,
 };
 use spike_core::obslog::{WallWindow, derive};
 use spike_core::run::RunData;
@@ -143,7 +143,7 @@ fn i_scan_finds_paths_names_raw_qpc_and_unknown_keys() {
     let f = planted(RUN, |v| {
         v["info"]["timeline"]["play_start_us"] = json!(QPC_LO + 1_234)
     });
-    assert_eq!(f, vec![Finding::TimestampOutOfRange(RUN.into())]);
+    assert_eq!(f, vec![Finding::OutOfRange(RUN.into())]);
     let f = planted(RUN, |v| {
         v["info"]["presentmon_error"] = json!(format!("bad row at {}", QPC_LO + 9))
     });
@@ -189,22 +189,43 @@ fn i_build_refuses_a_run_that_would_leak() {
     run.info.timeline.play_start_us = QPC_LO as i64 + 77;
     assert!(matches!(
         build(&run, &conditions(), &ctx()),
-        Err(ExportError::Rejected(f)) if f == vec![Finding::TimestampOutOfRange(RUN.into())]
+        Err(ExportError::Rejected(f)) if f == vec![Finding::OutOfRange(RUN.into())]
     ));
     let mut run = passing_run();
     run.frames[100].render_us = QPC_LO as i64;
     assert!(matches!(
         build(&run, &conditions(), &ctx()),
-        Err(ExportError::Rejected(f)) if f == vec![Finding::TimestampOutOfRange(FRAMES.into())]
+        Err(ExportError::Rejected(f)) if f == vec![Finding::OutOfRange(FRAMES.into())]
+    ));
+}
+
+#[test]
+fn i_durations_and_counts_are_not_exempt() {
+    // A raw QPC value in a duration field fails its range.
+    let mut run = passing_run();
+    run.input[10].latency_us = 52_000_000_009;
+    assert!(matches!(
+        build(&run, &conditions(), &ctx()),
+        Err(ExportError::Rejected(f)) if f == vec![Finding::OutOfRange(INPUT.into())]
+    ));
+    let mut run = passing_run();
+    run.frames[3].render_cpu_us = u32::MAX;
+    assert!(build(&run, &conditions(), &ctx()).is_err());
+    // A count is scanned by value.
+    let mut run = passing_run();
+    run.counters.voice_steals = QPC_LO + 5;
+    assert!(matches!(
+        build(&run, &conditions(), &ctx()),
+        Err(ExportError::Rejected(f)) if f.contains(&Finding::RawQpc(RUN.into()))
     ));
 }
 
 #[test]
 fn i_relative_times_inside_the_raw_qpc_range_are_accepted() {
-    // Shortly after boot the raw QPC range overlaps the run's relative µs
-    // values (here 0–200 s of 10 MHz ticks); those values are legitimate.
+    // A minute after boot the raw QPC range (10 MHz ticks, 60–260 s of
+    // uptime) overlaps the run's relative µs times; those are legitimate.
     let ctx = ScanContext {
-        qpc_range: Some((0, 2_000_000_000)),
+        qpc_range: Some((600_000_000, 2_600_000_000)),
         ..ScanContext::default()
     };
     let export = build(&passing_run(), &conditions(), &ctx).unwrap();
