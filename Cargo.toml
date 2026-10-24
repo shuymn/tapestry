@@ -15,7 +15,9 @@ eval = { path = "crates/eval" }
 
 # xtask (dev tooling, never shipped)
 cargo_metadata = "0.23.1"
+encoding_rs = "0.8.42"
 tempfile = "3.27.0"
+unicode-normalization = "0.1.26"
 
 # Used by the `cargo xtask` alias (.cargo/config.toml).
 [profile.xtask]
