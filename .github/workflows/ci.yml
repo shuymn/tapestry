@@ -31,9 +31,8 @@ jobs:
           version: 2026.10.12
           install: true
           cache: true
-      - name: Re-run install and show toolchain
+      - name: Show toolchain
         run: |
-          mise install
           mise ls --current
           expected=$(mise current rust)
           actual=$(mise exec -- rustc --version | cut -d' ' -f2)
@@ -85,9 +84,8 @@ jobs:
           version: 2026.10.12
           install: true
           cache: true
-      - name: Re-run install and show toolchain
+      - name: Show toolchain
         run: |
-          mise install
           mise ls --current
           expected=$(mise current rust)
           actual=$(mise exec -- rustc --version | cut -d' ' -f2)

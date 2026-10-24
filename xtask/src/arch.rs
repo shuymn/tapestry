@@ -75,7 +75,6 @@ fn check_metadata(metadata: &Metadata) -> Result<Vec<String>, String> {
         .ok_or("cargo metadata returned no dependency graph")?;
     let graph = Graph::new(resolve);
     let members: Vec<&Package> = metadata.workspace_packages();
-    let member_ids: HashSet<&PackageId> = members.iter().map(|p| &p.id).collect();
     let mut diagnostics = Vec::new();
 
     // R1
@@ -85,7 +84,7 @@ fn check_metadata(metadata: &Metadata) -> Result<Vec<String>, String> {
             for (id, path) in graph.closure(&eval.id, false) {
                 let pkg = &metadata[&id];
                 let name = pkg.name.as_str();
-                let allowed = if member_ids.contains(&id) {
+                let allowed = if metadata.workspace_members.contains(&id) {
                     EVAL_ALLOWED_WORKSPACE.contains(&name)
                 } else {
                     EVAL_ALLOWED_EXTERNAL.contains(&name)
@@ -144,7 +143,8 @@ fn check_metadata(metadata: &Metadata) -> Result<Vec<String>, String> {
     Ok(diagnostics)
 }
 
-/// The resolved dependency graph, restricted to normal and build edges.
+/// The resolved dependency graph: normal and build edges, plus dev edges
+/// marked as such (followed only from the root, for R2).
 struct Graph<'a> {
     /// `(dependency, is_dev_only)` per package.
     edges: HashMap<&'a PackageId, Vec<(&'a PackageId, bool)>>,
