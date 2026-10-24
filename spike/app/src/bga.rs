@@ -45,6 +45,10 @@ mod imp {
         free: SyncSender<usize>,
         stop: Arc<AtomicBool>,
         pub decoded: Arc<AtomicU64>,
+        /// Times the decoder found every slot in use and waited. With the
+        /// decoder ahead of the display this is normal backpressure, not
+        /// the D4 "exhausted pool": a due frame that could not be decoded
+        /// in time shows up as skipped or not displayed instead.
         pub decoder_waits: Arc<AtomicU64>,
         /// Received but not yet due.
         pending: Option<usize>,
