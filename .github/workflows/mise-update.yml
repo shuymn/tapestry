@@ -81,8 +81,6 @@ jobs:
             echo "| Tool | From | To |"
             echo "| --- | --- | --- |"
             jq -r '.[] | "| `\(.name)` | \(.old_versions | join(", ")) | \(.new_versions | join(", ")) |"' "$RUNNER_TEMP/changes.json"
-            echo
-            echo "Refs #1"
           } >"$RUNNER_TEMP/body.md"
           cat "$RUNNER_TEMP/body.md" >>"$GITHUB_STEP_SUMMARY"
 
