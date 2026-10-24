@@ -409,6 +409,7 @@ If a "sound to play" event arrives too late for the current buffer write, the so
 - Short effects such as bombs and the judgment display can be missed with the snapshot alone. Sequence-numbered judgment events are also passed to the render thread through a queue, and the render thread receives everything it has not yet processed as effects.
 - Conversion to LR2 IDs or beatoraja property IDs happens only inside each skin's adapter. The game's internal structures are not shaped to fit a skin's ID system.
 - Skin buttons and sliders do not modify state directly; they send commands.
+- **Screen resolution and aspect ratio**: Output resolutions from FHD to 4K are the realistic range. The render resolution is independent of the display: players may run below the native resolution to keep performance stable, and it is scaled to the output. Only 16:9 is supported for now, because skins are authored for it, but layout and skin coordinates are not hard-coded to 16:9: a skin declares its base resolution and aspect ratio, so other ratios such as 21:9 can be added later by skins designed for them.
 
 ### Custom Skin Format
 
