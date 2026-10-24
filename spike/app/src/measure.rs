@@ -299,6 +299,19 @@ fn file_version(exe: &Path) -> Option<String> {
     }
 }
 
+/// The version in a release file name (`PresentMon-2.6.0-x64.exe` →
+/// `2.6.0`), for executables without a version resource.
+fn version_in_name(exe: &Path) -> Option<String> {
+    let stem = exe.file_stem()?.to_str()?;
+    stem.split('-')
+        .find(|p| {
+            p.contains('.')
+                && p.split('.')
+                    .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+}
+
 fn parse(args: &[String]) -> Result<(Measure, Option<EncoderClass>, Vec<String>), String> {
     let mut m = Measure {
         presentmon: PathBuf::new(),
@@ -436,7 +449,7 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
     )?;
     cond.insert(
         "presentmon_version".into(),
-        json!(file_version(&m.presentmon)),
+        json!(file_version(&m.presentmon).or_else(|| version_in_name(&m.presentmon))),
     );
     cond.insert(
         "gpu_power_mode_declared".into(),
@@ -664,6 +677,16 @@ mod tests {
             .err()
             .unwrap();
         assert!(e.contains("did not become ready"), "{e}");
+    }
+
+    #[test]
+    fn presentmon_version_from_the_release_name() {
+        let v = |p: &str| version_in_name(Path::new(p));
+        assert_eq!(
+            v("presentmon/PresentMon-2.6.0-x64.exe").as_deref(),
+            Some("2.6.0")
+        );
+        assert_eq!(v("PresentMon.exe"), None);
     }
 
     #[test]
