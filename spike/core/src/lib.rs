@@ -5,12 +5,14 @@
 //! relative to the run origin unless a name says otherwise.
 
 pub mod chart;
+pub mod engine;
 pub mod evaluate;
 pub mod export;
 pub mod heavy;
 pub mod mixer;
 pub mod obslog;
 pub mod pilot;
+pub mod play;
 pub mod presentmon;
 pub mod rng;
 pub mod run;

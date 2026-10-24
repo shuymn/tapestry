@@ -8,7 +8,9 @@ publish.workspace = true
 
 # No FFmpeg and no `windows` crate: this crate builds and tests on Linux too.
 [dependencies]
+audioadapter-buffers = "5.2.0"
 csv.workspace = true
+rubato = { version = "5.0.1", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

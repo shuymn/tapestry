@@ -1,9 +1,11 @@
-//! P1 test (h): the mix loop makes no allocations.
+//! P1 test (h): the mix loop, and the audio thread's whole signal path
+//! (`Engine::render` with triggers), make no allocations.
 //!
 //! A counting global allocator counts allocations made on threads that
 //! opted in (a thread-local flag), so the test harness's own threads do not
 //! disturb the count. This file holds a single test for the same reason.
 
+use spike_core::engine::{Engine, Injection};
 use spike_core::mixer::{MAX_VOICES, Mixer, SoundBank};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -56,6 +58,18 @@ fn h_mix_loop_makes_no_allocations() {
     };
     let mut mixer = Mixer::new(MAX_VOICES, 96);
     let mut out = vec![0.0f32; 480 * 2];
+    let mut engine = Engine::new(
+        48_000,
+        480,
+        bank.clone(),
+        Some(Injection {
+            first: 1_000,
+            every: 48_000,
+            len: 96,
+            count: 10,
+        }),
+    );
+    let mut device = vec![0.0f32; 480 * 4];
 
     // Sanity: the counter sees allocations on this thread.
     TRACK.with(|t| t.set(true));
@@ -73,8 +87,21 @@ fn h_mix_loop_makes_no_allocations() {
         out.fill(0.0);
         mixer.mix(&bank, start, &mut out);
     }
+    // 10 s of the engine (4-channel device, odd block sizes), with a
+    // trigger every 11 device frames.
+    let mut next = 0u64;
+    for block in 0..1_200u64 {
+        let n = [480, 441, 333][(block % 3) as usize];
+        let now = engine.device_frames();
+        while next < now + 960 {
+            engine.trigger_at_device((next % 64) as u16, next);
+            next += 11;
+        }
+        engine.render(&mut device[..n * 4], 4, n);
+    }
     TRACK.with(|t| t.set(false));
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
+    assert!(engine.mixer().steals > 0);
     assert!(mixer.steals > 0);
     assert!(mixer.active() > 0);
 }
