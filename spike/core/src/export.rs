@@ -62,6 +62,7 @@ pub const CONDITION_KEYS: &[&str] = &[
     "pc_form",
     "gpu_adapter",
     "gpu_vram_mb",
+    "gpu_driver",
     "gpu_display_attached",
     "hybrid_present",
     "windows_build",

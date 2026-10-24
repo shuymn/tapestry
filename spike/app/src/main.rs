@@ -18,11 +18,15 @@
 mod alloc;
 mod audio;
 mod bga;
+mod conditions;
 mod display;
 mod gen_assets;
+mod measure;
 mod pacing;
 mod render;
+mod report;
 mod run;
+mod rundata;
 mod scene;
 mod session;
 mod threads;
@@ -46,7 +50,13 @@ const USAGE: &str = "usage:
       [--audio wasapi|null] [--audio-period min|next|<frames>] [--audio-queue <periods>]
       [--audio-device <part>]
       [--inject-gap-every-s N --inject-gap-ms M] [--starve-ms N]
-      [--offscreen WxH --audio null --frames N]";
+      [--profile standard|streaming|no-bga] [--countdown-s N]
+      [--offscreen WxH --audio null --frames N]
+  tapestry-spike measure --presentmon <exe> [--obs <obs64.exe> --obs-profile <name>
+      --obs-collection <name> --obs-encoder hardware|x264] [--dry-run] <run options>
+  tapestry-spike conditions [--out <dir>] [--audio-device <part>] [--bga <video>]
+  tapestry-spike report <run-dir> [--notes <owner-notes.toml>]
+  tapestry-spike report --from-export <zip>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -54,6 +64,9 @@ fn main() -> ExitCode {
         Some("--version") if args.len() == 1 => Ok(version()),
         Some("gen-assets") => gen_assets_cmd(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
+        Some("measure") => measure::run(&args[1..]),
+        Some("conditions") => conditions_cmd(&args[1..]),
+        Some("report") => report_cmd(&args[1..]),
         Some("displays") if args.len() == 1 => {
             display::print_displays();
             Ok(ExitCode::SUCCESS)
@@ -115,6 +128,15 @@ fn gen_assets_cmd(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let a = parse_run(args)?;
+    match a.offscreen {
+        Some(sz) => run::offscreen(&a, sz),
+        None => window::windowed(&a),
+    }
+}
+
+/// The options of `run` (also the run part of `measure`).
+pub fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     let mut a = RunArgs {
         offscreen: None,
         window: None,
@@ -126,6 +148,12 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
         bga: None,
         monitor: None,
         audio: None,
+        countdown_us: run::COUNTDOWN_US,
+        meta: rundata::RunMeta {
+            profile: spike_core::run::Profile::Standard,
+            kind: spike_core::run::RunKind::Diagnostic,
+            obs_encoder: None,
+        },
         out: PathBuf::new(),
     };
     let mut out = None;
@@ -180,6 +208,19 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
             "fps-cap" => a.fps_cap = Some(num(k, v)?),
             "bga" => a.bga = Some(PathBuf::from(v)),
             "monitor" => a.monitor = Some(v.to_owned()),
+            "countdown-s" => a.countdown_us = num::<i64>(k, v)? * 1_000_000,
+            "profile" => {
+                a.meta.profile = match v {
+                    "standard" => spike_core::run::Profile::Standard,
+                    "streaming" => spike_core::run::Profile::Streaming,
+                    "no-bga" => spike_core::run::Profile::NoBga,
+                    _ => {
+                        return Err(format!(
+                            "--profile {v}: expected standard, streaming or no-bga"
+                        ));
+                    }
+                }
+            }
             "out" => out = Some(PathBuf::from(v)),
             _ => return Err(format!("unknown option --{k} {v}\n{USAGE}")),
         }
@@ -196,9 +237,39 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
         }
         a.audio = Some(audio);
     }
-    match a.offscreen {
-        Some(sz) => run::offscreen(&a, sz),
-        None => window::windowed(&a),
+    Ok(a)
+}
+
+/// `conditions [--out DIR] [--audio-device PART] [--bga FILE]`.
+fn conditions_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let (mut out, mut device, mut bga) = (PathBuf::from("."), None, None);
+    for (k, v) in options(args)? {
+        match k {
+            "out" => out = PathBuf::from(v),
+            "audio-device" => device = Some(v.to_owned()),
+            "bga" => bga = Some(PathBuf::from(v)),
+            _ => return Err(format!("unknown option --{k}\n{USAGE}")),
+        }
+    }
+    conditions::run(&out, device.as_deref(), bga.as_deref())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `report <run-dir> [--notes FILE]` or `report --from-export <zip>`.
+fn report_cmd(args: &[String]) -> Result<ExitCode, String> {
+    match args {
+        [flag, zip] if flag == "--from-export" => report::from_export(&PathBuf::from(zip)),
+        [dir, rest @ ..] => {
+            let mut notes = PathBuf::from("owner-notes.toml");
+            for (k, v) in options(rest)? {
+                match k {
+                    "notes" => notes = PathBuf::from(v),
+                    _ => return Err(format!("unknown option --{k}\n{USAGE}")),
+                }
+            }
+            report::run(&PathBuf::from(dir), &notes)
+        }
+        _ => Err(USAGE.to_owned()),
     }
 }
 
@@ -207,6 +278,25 @@ fn version() -> ExitCode {
     println!("commit: {} ({})", env!("SPIKE_COMMIT"), env!("SPIKE_TREE"));
     println!("profile: {}", env!("SPIKE_PROFILE"));
     ffmpeg_version()
+}
+
+/// The linked FFmpeg's version string (conditions).
+#[cfg(feature = "ffmpeg")]
+pub fn ffmpeg_version_string() -> String {
+    // SAFETY: returns a static NUL-terminated string.
+    let p = unsafe { ffmpeg_next::ffi::av_version_info() };
+    if p.is_null() {
+        return "unknown".into();
+    }
+    // SAFETY: as above.
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(not(feature = "ffmpeg"))]
+pub fn ffmpeg_version_string() -> String {
+    "not built".into()
 }
 
 #[cfg(not(feature = "ffmpeg"))]

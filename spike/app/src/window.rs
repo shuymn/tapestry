@@ -16,12 +16,12 @@ use crate::pacing::{
 };
 use crate::render::Renderer;
 use crate::run::{
-    BgaState, COUNTDOWN_US, DxgiSummary, POST_PLAY_US, Recorder, RunArgs, adapter, bga_due, device,
-    event, heavy_values, instance, print_summary, summary_common, write_outputs,
+    BgaState, DxgiSummary, POST_PLAY_US, Recorder, RunArgs, adapter, bga_due, device, event,
+    heavy_values, instance, print_summary, summary_common, write_outputs,
 };
 use crate::scene::{Frame, Scene};
-use crate::session;
 use crate::timebase::{Clock, HiResTimer, qpc, qpc_freq};
+use crate::{rundata, session};
 use spike_core::chart::{CHART_LEN_US, Chart, DEFAULT_SEED};
 use spike_core::heavy::Timeline;
 use spike_core::run::{EventKind, RunEvent, SpikeFrame};
@@ -320,9 +320,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let mut frame = Frame::new();
     let play_len = args.play_us();
     // Input, logic and audio threads, behind the play barrier with this one.
-    let mut session = session::start(args.audio.clone(), clock, play_len)?;
+    let mut session = session::start(args.audio.clone(), clock, args.countdown_us, play_len)?;
     // Frames: countdown + play + post-play at up to 500 Hz, with margin.
-    let max_frames = ((COUNTDOWN_US + play_len + POST_PLAY_US) / 2_000 + 1_000) as usize;
+    let max_frames = ((args.countdown_us + play_len + POST_PLAY_US) / 2_000 + 1_000) as usize;
     let mut rec = Recorder::new(max_frames);
     // Private trace per frame: start QPC, wake kind, predicted display QPC,
     // present count.
@@ -528,6 +528,20 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     write_outputs(&args.out, &rec, &due, &summary)?;
     session::write(&args.out, &played)?;
     write_private_trace(&args.out, &trace, &dxgi.raw, &dxgi.anchors, &cap_trace)?;
+    let run = rundata::assemble(
+        args,
+        args.meta,
+        refresh,
+        timeline,
+        &rec.frames,
+        rec.frame_records,
+        &due,
+        bga.bga.as_ref().map(|b| (b.width, b.height)),
+        &summary.events,
+        &played,
+    );
+    let origin = rundata::Origin::now(clock, play_start, play_len);
+    rundata::write(&args.out, &run, &origin)?;
     Ok(())
 }
 

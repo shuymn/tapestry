@@ -3,7 +3,6 @@
 //! thread behind one play barrier; their records after the run.
 
 use crate::audio::{self, AudioArgs, LoopbackSide, RenderSide};
-use crate::run::COUNTDOWN_US;
 use crate::threads::{
     self, Event, HitMsg, InputStats, LogicSinks, PlaySync, Snapshot, spawn_input, spawn_logic,
 };
@@ -57,6 +56,7 @@ impl Drop for Session {
 pub fn start(
     audio_args: Option<AudioArgs>,
     clock: Clock,
+    countdown_us: i64,
     play_len: i64,
 ) -> Result<Session, String> {
     let chart = Chart::generate(DEFAULT_SEED);
@@ -71,7 +71,7 @@ pub fn start(
     let stop = Arc::new(AtomicBool::new(false));
     // Input, logic, render, and audio when it runs.
     let members = 3 + usize::from(audio_args.is_some());
-    let sync = Arc::new(PlaySync::new(members, clock, COUNTDOWN_US, play_len));
+    let sync = Arc::new(PlaySync::new(members, clock, countdown_us, play_len));
     let has_audio = audio_args.is_some();
     // Threads join the session as they start, so an error below drops it
     // and releases and joins them.
@@ -153,9 +153,6 @@ pub struct InjectionCheck {
     pub timestamp_offsets_us: Vec<i64>,
 }
 
-// TODO(P4): a render or loopback error here only fills
-// `render_error`/`loopback_error` while the run itself exits 0; the report
-// must make such a run invalid (V6/V8) instead of trusting the exit status.
 #[derive(Serialize)]
 pub struct AudioSummary {
     /// Run µs of play start (episode times are run µs).

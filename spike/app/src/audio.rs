@@ -190,6 +190,44 @@ fn open_endpoint(part: Option<&str>) -> Result<IMMDevice, String> {
     }
 }
 
+/// The render endpoint's shared-mode format and engine periods, for the
+/// measurement conditions. `name` is private.
+#[derive(Clone, Debug)]
+pub struct EndpointInfo {
+    pub name: String,
+    pub rate_hz: u32,
+    pub channels: usize,
+    pub periods: Option<EnginePeriods>,
+}
+
+pub fn endpoint_info(part: Option<&str>) -> Result<EndpointInfo, String> {
+    let _com = Com::init()?;
+    let device = open_endpoint(part)?;
+    // SAFETY: COM calls on a live endpoint; the format outlives them.
+    unsafe {
+        let c3: IAudioClient3 = hr("Activate IAudioClient3", device.Activate(CLSCTX_ALL, None))?;
+        let base: IAudioClient = hr("IAudioClient", windows::core::Interface::cast(&c3))?;
+        let fmt = MixFormat::get(&base)?;
+        let mut p = EnginePeriods::default();
+        let periods = c3
+            .GetSharedModeEnginePeriod(
+                fmt.ptr,
+                &mut p.default,
+                &mut p.fundamental,
+                &mut p.min,
+                &mut p.max,
+            )
+            .ok()
+            .map(|_| p);
+        Ok(EndpointInfo {
+            name: friendly_name(&device),
+            rate_hz: fmt.rate,
+            channels: fmt.channels,
+            periods,
+        })
+    }
+}
+
 /// `audio-devices`: the active render endpoints (console only).
 pub fn print_endpoints() -> Result<(), String> {
     let _com = Com::init()?;

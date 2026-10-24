@@ -44,6 +44,11 @@ impl Clock {
         spike_core::time::qpc_to_us(qpc, self.origin, freq())
     }
 
+    /// Raw QPC of the origin (private: never exported).
+    pub fn origin_qpc(self) -> i64 {
+        self.origin
+    }
+
     pub fn now_us(self) -> i64 {
         self.to_us(qpc())
     }

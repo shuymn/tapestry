@@ -51,6 +51,9 @@ pub struct RunArgs {
     pub monitor: Option<String>,
     /// WASAPI audio; `None` is `--audio null`.
     pub audio: Option<crate::audio::AudioArgs>,
+    /// Countdown before play (OBS runs use a longer one).
+    pub countdown_us: i64,
+    pub meta: crate::rundata::RunMeta,
     pub out: PathBuf,
 }
 
