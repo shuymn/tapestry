@@ -37,7 +37,7 @@ if [ "${SPIKE_SKIP_APP:-0}" != 1 ]; then
     grep -q '^ffmpeg license: LGPL$' <<<"$version"
     smoke_dir=target/smoke
     "$exe" gen-assets --ffmpeg third_party/ffmpeg/bin/ffmpeg.exe --out "$smoke_dir/assets" --seconds 3
-    smoke=$("$exe" run --offscreen 1920x1080 --adapter warp --audio null --frames 300         --bga "$smoke_dir/assets/bga.mp4" --out "$smoke_dir/run")
+    smoke=$("$exe" run --offscreen 1920x1080 --adapter warp --audio null --frames 300 --bga "$smoke_dir/assets/bga.mp4" --out "$smoke_dir/run")
     echo "$smoke"
     grep -q '^adapter: Microsoft Basic Render Driver ' <<<"$smoke"
     # Every frame showed its due BGA frame across the 3 s clip's loop
@@ -45,6 +45,13 @@ if [ "${SPIKE_SKIP_APP:-0}" != 1 ]; then
     grep -q -E '^bga: 1920x1080 decoded [1-9][0-9]* due 300 displayed 300 .* advanced Some\(true\)$' <<<"$smoke"
     grep -q '^bga-only readback: non-blank ' <<<"$smoke"
     grep -q '^readback: non-blank ' <<<"$smoke"
+    # Profiles set the workload: no-bga never opens the BGA it is given.
+    nobga=$("$exe" run --offscreen 640x360 --adapter warp --audio null --frames 30 --profile no-bga --bga "$smoke_dir/assets/bga.mp4" --out "$smoke_dir/run-nobga")
+    grep -q '^bga: off$' <<<"$nobga"
+    # Conditions take the BGA's hash and codec from the file itself.
+    cond=$("$exe" conditions --out "$smoke_dir/conditions" --bga "$smoke_dir/assets/bga.mp4")
+    grep -q '"bga_codec": "h264"' <<<"$cond"
+    grep -q "\"bga_sha256\": \"$(sha256sum "$smoke_dir/assets/bga.mp4" | cut -d' ' -f1)\"" <<<"$cond"
 fi
 
 cd "$repo_root"
