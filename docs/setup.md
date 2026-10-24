@@ -59,17 +59,19 @@ The pre-commit hook runs the banned-word check and the `rustfmt` check. The hook
 
 ## Linux-Side Tools (WSL)
 
-- Linux-side tools are pinned in the development shell of a Nix flake (`flake.nix` and `flake.lock`). The dated nightly used for fuzzing is also used only here.
-- On NixOS, enable `nix-command` and `flakes`. A flake reads only files tracked by Git, so add `flake.nix` and the files it references to Git before using them.
-- Build output in WSL is separated into a directory inside WSL via `CARGO_TARGET_DIR`. This keeps it from mixing with the Windows-side output and avoids slow writes over `/mnt/c`.
-- To call WSL commands from the Windows side, use the repository's wrapper script. The wrapper takes the working copy's Windows path, converts it to the WSL path (`wslpath`), and runs `wsl.exe -d NixOS --cd <converted path> -- nix develop --command ...`. Argument quoting and exit code propagation are also fixed in the wrapper.
+- Linux-side tools are pinned in the development shell of a Nix flake (`flake.nix` and `flake.lock`). The Rust version is read from `mise.lock`, so WSL uses the same `rustc` as Windows. The dated nightly used for fuzzing is also used only here.
+- On NixOS, enable `nix-command` and `flakes`. The Nix in WSL must be linked to libgit2 1.9.4 or later: `worktree.useRelativePaths` enables the `relativeWorktrees` repository extension, and older libgit2 refuses to open the repository.
+- A flake reads only files tracked by Git. Stage (`git add`) a new `flake.nix` input, or a file the flake reads, before using it.
+- Build output in WSL is separated into a directory inside WSL via `CARGO_TARGET_DIR` (`~/.cache/tapestry/target/<hash of the working copy root>`). This keeps it from mixing with the Windows-side output and between working copies, and avoids slow writes over `/mnt/c`.
+- To call WSL commands from the Windows side, use `scripts/wsl.sh <command> [args...]` from Git Bash. It runs `wsl.exe -d NixOS --exec /bin/sh`, which converts the working copy's path with `wslpath` inside WSL, changes to the working copy root (the wrapper always runs there, whatever the current directory), and runs `nix develop --command <command> [args...]`. Arguments are passed verbatim, without being parsed again by a shell, and the exit code is the command's (125 if the working copy cannot be entered). `TAPESTRY_WSL_DISTRO` selects another distro. On Linux the wrapper runs `nix develop --command` directly. `scripts/wsl-selftest.sh` checks the wrapper.
+- From PowerShell, call it through Git's `bash.exe` (`& "$env:ProgramFiles\Git\bin\bash.exe" scripts/wsl.sh ...`). Plain `bash` may resolve to WSL's `bash.exe`. Windows PowerShell 5.1 drops empty arguments and strips embedded quotes when calling native programs, so run commands with such arguments from Git Bash.
 
 ## CI
 
 | Runner | What it does |
 | --- | --- |
 | Windows (label with an explicit OS version) | Production build (pinned to a configuration with `dev-tools` disabled), verifying that development features are not included, rendering image comparison with WARP, Windows tests |
-| Linux | Builds and tests of crates that do not depend on Windows, WASM build, short fuzzing runs, banned-word check, dependency checks (`cargo-deny`, `cargo-audit`) |
+| Linux | Builds and tests of crates that do not depend on Windows, WASM build, short fuzzing runs, banned-word check, dependency checks (`cargo-deny`, `cargo-audit`), tests in the Nix development shell through `scripts/wsl.sh` |
 
 - Both runners install tools from the same `mise.lock` (`jdx/mise-action`). Run the install step even after restoring the cache, and verify the Rust version in use.
 - GitHub Actions are pinned by commit SHA.

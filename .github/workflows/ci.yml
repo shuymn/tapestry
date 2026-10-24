@@ -104,6 +104,23 @@ jobs:
       - name: cargo-audit
         run: mise exec -- cargo audit --deny warnings
 
+  # The Nix dev shell used from WSL: the flake evaluates with the Rust version
+  # from mise.lock, and the wrapper's Linux path passes arguments and exit codes.
+  nix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Test (portable crates, dev shell)
+        run: scripts/wsl.sh cargo xtask portable test --locked
+      - name: Wrapper self-test
+        run: scripts/wsl-selftest.sh
+
   lint:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -125,3 +142,5 @@ jobs:
           cache: true
       - name: actionlint
         run: mise exec -- actionlint
+      - name: shellcheck
+        run: mise exec -- shellcheck scripts/*.sh
