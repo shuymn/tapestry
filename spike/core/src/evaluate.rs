@@ -184,16 +184,19 @@ fn target(run: &RunData, class: u32) -> u32 {
     }
 }
 
-/// G1's T in ms: the exact refresh period of the run's mode (for example
-/// 1/59.951 Hz = 16.680 ms) when the target is the refresh rate; 1/cap when
-/// a cap is the target.
+/// G1's T in ms, from the exact refresh period of the run's mode (for
+/// example 1/59.951 Hz = 16.680 ms). R1 and standard-profile OBS runs use
+/// that period; streaming OBS runs and capped diagnostics use
+/// (class / cap) × that period, since a cap shows one frame every
+/// class/cap refreshes (caps divide the nominal class). Chosen by run kind
+/// and profile, never by comparing numbers.
 fn target_period_ms(run: &RunData, class: u32) -> f64 {
     let rf = run.info.refresh;
-    let t = target(run, class);
-    if t == class || run.info.fps_cap.is_none() {
-        1000.0 * rf.den as f64 / rf.num as f64
-    } else {
-        1000.0 / f64::from(t)
+    let period = 1000.0 * rf.den as f64 / rf.num as f64;
+    match (run.info.kind, run.info.profile, run.info.fps_cap) {
+        (RunKind::Baseline, _, _) | (RunKind::Obs, Profile::Standard, _) => period,
+        (_, _, Some(cap)) if cap > 0 => period * f64::from(class) / f64::from(cap),
+        _ => period,
     }
 }
 

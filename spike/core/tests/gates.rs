@@ -257,6 +257,41 @@ fn g1_target_is_the_exact_refresh_period_of_the_mode() {
     assert!(!evaluate(&run).gate("G1").pass);
 }
 
+#[test]
+fn capped_t_is_class_over_cap_refresh_periods_of_the_exact_mode() {
+    use spike_core::run::{Profile, RunKind};
+    let t = |kind: RunKind, profile: Profile, class: u32, num: u64, cap: u32| {
+        let mut run = passing_run();
+        run.info.kind = kind;
+        run.info.profile = profile;
+        run.info.class_hz = class;
+        run.info.refresh = Rational { num, den: 1_000 };
+        run.info.fps_cap = Some(cap);
+        evaluate(&run).target_period_ms.unwrap()
+    };
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let stream = (RunKind::Obs, Profile::Streaming);
+    let diag = (RunKind::Diagnostic, Profile::Standard);
+    for (kind, profile) in [stream, diag] {
+        // Cap equal to the class: one refresh period, on either side of
+        // nominal.
+        assert!(close(t(kind, profile, 60, 59_951, 60), 1e6 / 59_951.0));
+        assert!(close(t(kind, profile, 60, 60_050, 60), 1e6 / 60_050.0));
+        assert!(close(t(kind, profile, 240, 239_760, 240), 1e6 / 239_760.0));
+        assert!(close(t(kind, profile, 240, 240_085, 240), 1e6 / 240_085.0));
+        // Cap below the class: class/cap refresh periods.
+        assert!(close(t(kind, profile, 60, 59_951, 30), 2e6 / 59_951.0));
+        assert!(close(t(kind, profile, 60, 60_050, 30), 2e6 / 60_050.0));
+        assert!(close(t(kind, profile, 240, 239_760, 120), 2e6 / 239_760.0));
+        assert!(close(t(kind, profile, 240, 240_085, 120), 2e6 / 240_085.0));
+        assert!(close(t(kind, profile, 240, 240_085, 60), 4e6 / 240_085.0));
+    }
+    // The design's examples.
+    assert!((t(stream.0, stream.1, 60, 59_951, 60) - 16.680).abs() < 5e-4);
+    assert!((t(stream.0, stream.1, 240, 240_085, 120) - 8.3304).abs() < 5e-5);
+    assert!((t(stream.0, stream.1, 60, 59_951, 30) - 33.361).abs() < 5e-4);
+}
+
 // ---- matrix eligibility (M1) ------------------------------------------
 
 #[test]

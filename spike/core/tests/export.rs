@@ -74,7 +74,15 @@ fn obs_run() -> RunData {
 
 #[test]
 fn i_round_trip_gives_an_identical_summary() {
-    for run in [passing_run(), obs_run()] {
+    // Also a run on a non-nominal (in-band) refresh rate with a cap.
+    let mut odd = passing_run();
+    odd.info.refresh = spike_core::run::Rational {
+        num: 59_951,
+        den: 1_000,
+    };
+    odd.info.kind = spike_core::run::RunKind::Diagnostic;
+    odd.info.fps_cap = Some(30);
+    for run in [passing_run(), obs_run(), odd] {
         let export = build(&run, &conditions(), &ctx()).expect("clean export");
         assert_eq!(read(&export).unwrap(), run);
         let r = recompute(&export).unwrap();
