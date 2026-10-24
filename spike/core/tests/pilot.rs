@@ -477,7 +477,8 @@ fn g_capture_deletion_hidden_by_the_pilot_is_unverifiable() {
             end: 1_000_000 + 50 * 480 + 48
         }]
     );
-    assert_eq!(report.evaluated.unwrap().end, pos);
+    // The last 3 ms are not counted as evaluated (filter settling).
+    assert_eq!(report.evaluated.unwrap().end, pos - 144);
 }
 
 #[test]
@@ -578,4 +579,78 @@ fn g_an_episode_closes_only_after_the_signal_has_recovered() {
     };
     assert_eq!(count(72), 1);
     assert_eq!(count(480), 2);
+}
+
+#[test]
+fn g_final_gap_is_detected_or_outside_the_evaluated_span() {
+    // A loud 14 kHz tone (2 ms attack, phase 11π/8) under the pilot, and the
+    // last 1 ms of the capture silenced: the filter has not settled when
+    // the capture ends, so the detector must either report the gap or end
+    // its evaluated span before it (then V6 sees play as not covered unless
+    // the capture runs on past play end).
+    let rate = 48_000u32;
+    let r = rate as usize;
+    let cal = calibrate(
+        &(0..r).map(|n| pilot(n, rate, 0.0)).collect::<Vec<_>>(),
+        rate,
+    )
+    .unwrap();
+    let total = r / 2;
+    let mut s: Vec<f32> = (0..total)
+        .map(|n| {
+            let t = n as f64 / f64::from(rate);
+            let attack = (t / 0.002).min(1.0);
+            let tone =
+                0.25 * attack * (TAU * 14_000.0 * t + 11.0 * std::f64::consts::PI / 8.0).sin();
+            pilot(n, rate, 0.0) + tone as f32
+        })
+        .collect();
+    s[total - 48..].fill(0.0);
+    let mut det = Detector::new(rate, cal);
+    det.push(&s);
+    let report = det.finish();
+    let gap_start = (total - 48) as u64;
+    let covered_to = report.evaluated.unwrap().end;
+    assert!(
+        !report.episodes.is_empty() || covered_to <= gap_start,
+        "gap missed and counted as covered: {report:?}"
+    );
+}
+
+#[test]
+fn g_gap_ending_at_the_evaluated_span_end_is_detected() {
+    // The 3 ms settle margin is enough: a 1 ms gap that ends exactly where
+    // the evaluated span ends is reported, at every offset and tone phase.
+    let rate = 48_000u32;
+    let r = rate as usize;
+    let cal = calibrate(
+        &(0..r).map(|n| pilot(n, rate, 0.0)).collect::<Vec<_>>(),
+        rate,
+    )
+    .unwrap();
+    for phase8 in 0..16 {
+        for extra in 0..48 {
+            let total = r / 4 + extra;
+            let mut s: Vec<f32> = (0..total)
+                .map(|n| {
+                    let t = n as f64 / f64::from(rate);
+                    let attack = (t / 0.002).min(1.0);
+                    let ph = f64::from(phase8) * std::f64::consts::PI / 8.0;
+                    let tone = 0.25 * attack * (TAU * 14_000.0 * t + ph).sin();
+                    pilot(n, rate, 0.0) + tone as f32
+                })
+                .collect();
+            let mut det = Detector::new(rate, cal);
+            let end = total - 144;
+            s[end - 48..end].fill(0.0);
+            det.push(&s);
+            let report = det.finish();
+            assert_eq!(report.evaluated.unwrap().end, end as u64);
+            assert_eq!(
+                report.episodes.len(),
+                1,
+                "phase {phase8}π/8, length {total}"
+            );
+        }
+    }
 }

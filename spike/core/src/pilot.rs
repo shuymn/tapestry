@@ -22,8 +22,11 @@
 //! Capture continuity is not inferred from the samples: packets carry their
 //! device position and flags, and a position jump, overlap or discontinuity
 //! flag is an unverifiable span (V6). The trailing partial window is
-//! checked at the end, and the report states the evaluated span, which V6
-//! requires to cover the play window (so the warm-up falls before play).
+//! checked at the end, and the report states the evaluated span: it starts
+//! after the 3 ms warm-up and ends 3 ms before the capture ends (the
+//! filter's settling), and V6 requires it to cover the play window, so the
+//! capture must start at least 3 ms before play and run at least 3 ms past
+//! it.
 
 /// Pilot frequency.
 pub const PILOT_HZ: u32 = 19_000;
@@ -35,6 +38,11 @@ pub const PHASE_STEP_LIMIT_RAD: f64 = 0.35;
 const LPF_HZ: f64 = 1_000.0;
 /// Windows skipped at the start while the filter settles (3 ms).
 const WARMUP_WINDOWS: u64 = 12;
+/// Capture after the evaluated span's end, in windows (3 ms): the
+/// low-pass's response and one window must settle after a gap before it is
+/// certain to show, so the last 3 ms of a capture are not evaluated and the
+/// capture must run at least that long past play end (V6).
+const SETTLE_WINDOWS: u64 = 12;
 /// Good windows in a row that close an episode (2 ms).
 pub const CLOSE_GOOD_WINDOWS: u64 = 8;
 
@@ -436,7 +444,8 @@ impl Detector {
         self.episodes.extend(self.open.take());
         let base = self.base.unwrap_or(0);
         let from = base + WARMUP_WINDOWS * self.demod.hop as u64;
-        let to = base + self.jumped + self.demod.fed;
+        let to = (base + self.jumped + self.demod.fed)
+            .saturating_sub(SETTLE_WINDOWS * self.demod.hop as u64);
         DetectorReport {
             episodes: self.episodes,
             unverifiable: self.unverifiable,
