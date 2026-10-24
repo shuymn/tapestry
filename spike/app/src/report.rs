@@ -22,7 +22,7 @@ use spike_core::conditions::{
     AdapterRecord, GpuState, NVIDIA_VENDOR_ID, PeriodLadder, PublicConditions, gpu_state_from_smi,
     ladder, obs_log_day_base, power_mode_contradicted, power_modes_during, select_adapter,
 };
-use spike_core::evaluate::{Summary, evaluate};
+use spike_core::evaluate::Summary;
 use spike_core::export::{self, Export, ExportError, ScanContext};
 use spike_core::obslog::{self, WallWindow};
 use spike_core::presentmon::{self, QpcClock};
@@ -49,8 +49,6 @@ fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T, String> {
 /// A run completed with its private context.
 pub struct Completed {
     pub run: RunData,
-    /// The private conditions with the run's facts added.
-    pub conditions: Map<String, Value>,
     pub public: PublicConditions,
     pub origin: Origin,
     /// Names the export scan must not find (never empty).
@@ -231,7 +229,6 @@ pub fn complete(dir: &Path, notes: &Path) -> Result<Completed, String> {
     let public = PublicConditions::from_conditions(&cond)?;
     Ok(Completed {
         run,
-        conditions: cond,
         public,
         origin,
         private_names: names,
@@ -320,18 +317,13 @@ fn print_summary(s: &Summary) {
 /// `ladder.txt`: the next rungs (`profile=`, `audio=` run options, `note=`
 /// lines), empty when none applies; `run-obs.cmd` prints the commands.
 fn write_ladder(dir: &Path, summary: &Summary, c: &Completed) -> Result<(), String> {
-    let u = |k: &str| {
-        c.conditions
-            .get(k)
-            .and_then(Value::as_u64)
-            .map(|v| v as u32)
-    };
     // The ladder stops at the default period (design D5), not the
     // engine's maximum.
+    let p = &c.public;
     let periods = match (
-        u("audio_period_chosen"),
-        u("audio_period_step"),
-        u("audio_period_default"),
+        p.audio_period_chosen,
+        p.audio_period_step,
+        p.audio_period_default,
     ) {
         (Some(chosen), Some(step), Some(default)) => Some(PeriodLadder {
             chosen,
@@ -363,7 +355,6 @@ pub fn run(dir: &Path, notes: &Path) -> Result<ExitCode, String> {
     }
     let c = complete(dir, notes)?;
     let (run, origin) = (&c.run, &c.origin);
-    let summary = evaluate(run);
     let ctx = ScanContext {
         forbidden_names: c.private_names.clone(),
         qpc_range: Some((
@@ -371,8 +362,9 @@ pub fn run(dir: &Path, notes: &Path) -> Result<ExitCode, String> {
             origin.qpc_end.max(origin.qpc_origin) as u64,
         )),
     };
-    let e = match export::build(run, &c.public, &ctx) {
-        Ok(e) => e,
+    // The summary the export carries is the report's (one evaluation).
+    let (e, summary) = match export::build_with_summary(run, &c.public, &ctx) {
+        Ok(x) => x,
         Err(ExportError::Rejected(f)) => {
             return Err(format!("export refused by the scan: {f:?}"));
         }

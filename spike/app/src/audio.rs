@@ -20,7 +20,9 @@
 //! countdown's pilot-only capture calibrates the detector, which then gets
 //! every packet with its device position and flags (D5).
 //!
-//! Device names are printed to the console only, never written to files.
+//! Device names are printed to the console; the measured endpoint's name is
+//! also kept in the private `conditions.json` (`private_names`) so the
+//! export scan can refuse it. It is never part of an export.
 
 use crate::alloc::{self, Tag};
 use crate::threads::{Mmcss, PlaySync, SoundCmd};

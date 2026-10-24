@@ -232,13 +232,7 @@ pub fn audio_check(a: Option<&AudioSummary>, inject: bool, starve: bool) -> Audi
                 .push("starvation: writes were never withheld".into());
         }
         for st in starves {
-            let to = st.at_us + i64::from(st.withheld_ms) * 1_000 + STARVE_EPISODE_SLACK_US;
-            let episodes = a
-                .facts
-                .episodes
-                .iter()
-                .filter(|e| (st.at_us..to).contains(&(e.start_us - a.play_start_us)))
-                .count();
+            let episodes = starve_episode_count(a, st);
             // A withholding shorter than the queued audio never starves
             // the device: it checks nothing, so S0 fails.
             if !st.exceeds_queued {
@@ -263,6 +257,17 @@ pub fn audio_check(a: Option<&AudioSummary>, inject: bool, starve: bool) -> Audi
 /// Episodes are stamped by the loopback, which trails the mix clock by the
 /// engine's buffering (tens of ms).
 const STARVE_EPISODE_SLACK_US: i64 = 100_000;
+
+/// Episodes starting from a withholding until its end plus the slack (play
+/// µs, half-open): the S0 verdict and the printed evidence both count these.
+pub fn starve_episode_count(a: &AudioSummary, st: &audio::Starve) -> usize {
+    let to = st.at_us + i64::from(st.withheld_ms) * 1_000 + STARVE_EPISODE_SLACK_US;
+    a.facts
+        .episodes
+        .iter()
+        .filter(|e| (st.at_us..to).contains(&(e.start_us - a.play_start_us)))
+        .count()
+}
 
 pub struct SessionOut {
     pub summary: PlaySummary,
@@ -558,15 +563,7 @@ pub fn print(s: &PlaySummary) {
             r.sound_commands
         );
         for st in &r.starves {
-            // Episodes by timestamps, which trail the mix clock by the
-            // engine's buffering.
-            let to = st.at_us + i64::from(st.withheld_ms) * 1_000 + STARVE_EPISODE_SLACK_US;
-            let episodes = a
-                .facts
-                .episodes
-                .iter()
-                .filter(|e| (st.at_us..to).contains(&(e.start_us - a.play_start_us)))
-                .count();
+            let episodes = starve_episode_count(a, st);
             println!(
                 "starve: at {} us withheld {} ms, queued {} us (exceeds: {}); padding-0 wakes {}; episodes {}",
                 st.at_us,

@@ -1,9 +1,10 @@
 //! `ingest-check --url <rtmp> [--delay-s N] [--seconds N]`: reads the local
 //! ingest (what OBS streams to MediaMTX) and checks that it carries the
 //! game: a 1920×1080 video stream with packets, and an audio stream that is
-//! not silent (V7's "game visible and audio present", checked before an OBS
-//! cell instead of trusted). Video is not decoded; audio is decoded to
-//! measure its peak. Exit 0 when both are present, 1 otherwise.
+//! not silent. It checks stream presence only (video is not decoded; audio
+//! is decoded to measure its peak); V7 still requires the owner's
+//! confirmation that the game was visible and its audio present in every
+//! required OBS run. Exit 0 when both streams are present, 1 otherwise.
 
 use std::time::Duration;
 
