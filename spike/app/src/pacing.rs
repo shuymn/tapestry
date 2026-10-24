@@ -33,17 +33,37 @@ pub fn cap_step(now: i64, anchor: i64, period: i64, last_slot: Option<i64>) -> (
     }
 }
 
+/// Cap-grid anchor from a display sync at refresh count `count` and QPC
+/// `sync`, keeping the cap's phase: grid points are the vblanks whose
+/// refresh count is `phase` modulo `k` (the cap period in refreshes).
+/// Re-anchoring to a later sync therefore never flips which vblanks the cap
+/// uses (with `k = 2`, a sync on an odd refresh still keeps even slots).
+pub fn cap_anchor(sync: i64, count: u32, phase: u32, k: u32, refresh: i64) -> i64 {
+    let off = (i64::from(count) - i64::from(phase)).rem_euclid(i64::from(k.max(1)));
+    sync - off * refresh
+}
+
+/// Whether two display syncs `(qpc, refresh count)` lie on one fixed
+/// refresh grid of `period` (within a tenth of a period). With VRR or
+/// composition the refresh count advances per present instead, and such
+/// syncs must not anchor the cap or the prediction.
+pub fn sync_consistent(prev: (i64, u32), cur: (i64, u32), period: i64) -> bool {
+    let counts = i64::from(cur.1.wrapping_sub(prev.1));
+    counts > 0 && (cur.0 - prev.0 - counts * period).abs() <= period / 10
+}
+
 /// Whether a cap needs pacing at all: a cap at (or above) the refresh rate
 /// is what Fifo already delivers, so it adds no timer wait.
 pub fn cap_needed(cap_hz: u32, refresh_mhz: u32) -> bool {
     u64::from(cap_hz) * 1000 < u64::from(refresh_mhz)
 }
 
-/// Vblanks between a frame's start and its display. With Fifo, maximum
-/// frame latency 1 and the waitable-object wait, a frame starts just after
-/// a vblank and is shown at the second vblank after it: the first local
-/// run (60 Hz) paired every DXGI display estimate one period after a
-/// one-vblank prediction.
+/// Vblanks between a frame's start and its display. UNCALIBRATED: an
+/// empirical value from one local 60 Hz run, where every DXGI display
+/// estimate came one period after a one-vblank prediction (Fifo, maximum
+/// frame latency 1, waitable-object wait). P5 calibrates it against
+/// PresentMon at 60 and 240 Hz, with and without a cap, using the run's
+/// private trace.
 pub const DISPLAY_VBLANKS: i64 = 2;
 
 /// Predicted display time of a frame starting at `now`: the
@@ -125,6 +145,28 @@ mod tests {
         // A vblank at 3_000 becomes the anchor: the next slot is on its grid.
         let (wait, s1) = cap_step(2_000, 3_000, P, Some(s0));
         assert_eq!((wait, s1), (Some(3_000 + P), 3_000 + P));
+    }
+
+    #[test]
+    fn reanchoring_keeps_the_cap_parity() {
+        // 120 Hz cap on 240 Hz: k = 2. The grid started on even refreshes
+        // (sync at count 100, QPC 0).
+        assert_eq!(cap_anchor(0, 100, 0, 2, R), 0);
+        // The next sync is on an odd refresh (count 101, one refresh
+        // later): the anchor stays on the even grid.
+        let later = cap_anchor(R, 101, 0, 2, R);
+        assert_eq!(later, 0);
+        let (_, slot) = cap_step(R + 10, later, 2 * R, Some(0));
+        assert_eq!(slot, 2 * R);
+        assert_eq!(cap_anchor(5 * R, 5, 0, 2, R), 4 * R);
+    }
+
+    #[test]
+    fn only_syncs_on_the_refresh_grid_anchor() {
+        assert!(sync_consistent((0, 10), (3 * R + 100, 13), R));
+        // VRR: one count per 33 ms present at a 16.7 ms refresh.
+        assert!(!sync_consistent((0, 10), (2 * R, 11), R));
+        assert!(!sync_consistent((0, 10), (0, 10), R));
     }
 
     #[test]

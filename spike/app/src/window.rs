@@ -9,7 +9,9 @@
 //! instance and surface are created there and moved to the render thread.
 
 use crate::alloc::{self, Scope, Tag, scope};
-use crate::pacing::{cap_needed, cap_step, predict_display};
+use crate::pacing::{
+    DISPLAY_VBLANKS, cap_anchor, cap_needed, cap_step, predict_display, sync_consistent,
+};
 use crate::render::Renderer;
 use crate::run::{
     BgaState, COUNTDOWN_US, DxgiSummary, POST_PLAY_US, Recorder, RunArgs, adapter, bga_due, device,
@@ -122,6 +124,9 @@ impl ApplicationHandler<Result<(), String>> for App {
         match ev {
             WindowEvent::CloseRequested => self.shared.stop.store(true, Ordering::Relaxed),
             WindowEvent::Focused(false) => self.push(EventKind::FocusLoss),
+            // The swap chain is not reconfigured; a size change during play
+            // invalidates the run (V5 rejects swap-chain recreation).
+            WindowEvent::Resized(_) => self.push(EventKind::SwapChainRecreate),
             _ => {}
         }
     }
@@ -194,9 +199,16 @@ struct Dxgi {
     period_qpc: i64,
     /// (present count, estimated display QPC); preallocated.
     samples: Vec<(u32, i64)>,
+    /// Raw statistics for the private trace: PresentCount,
+    /// PresentRefreshCount, SyncRefreshCount, SyncQPCTime.
+    raw: Vec<(u32, u32, u32, i64)>,
     summary: DxgiSummary,
-    /// Latest valid SyncQPCTime: the vblank-grid anchor.
+    /// Latest valid SyncQPCTime and its SyncRefreshCount whose timing
+    /// agrees with a fixed refresh grid: the vblank-grid anchor.
     sync_anchor: Option<i64>,
+    sync_count: Option<u32>,
+    /// Previous sync, to check grid consistency.
+    last_sync: Option<(i64, u32)>,
 }
 
 impl Dxgi {
@@ -227,8 +239,28 @@ impl Dxgi {
             return;
         }
         self.last_present_count = s.PresentCount;
-        self.sync_anchor = Some(s.SyncQPCTime);
+        let cur = (s.SyncQPCTime, s.SyncRefreshCount);
+        // Only a sync that sits on the fixed refresh grid anchors it (with
+        // VRR or composition, refresh counts follow presents instead).
+        if self
+            .last_sync
+            .is_some_and(|prev| sync_consistent(prev, cur, self.period_qpc))
+        {
+            self.sync_anchor = Some(cur.0);
+            self.sync_count = Some(cur.1);
+        } else if self.last_sync.is_some() {
+            self.summary.off_grid += 1;
+        }
+        self.last_sync = Some(cur);
         self.summary.samples += 1;
+        if self.raw.len() < self.raw.capacity() {
+            self.raw.push((
+                s.PresentCount,
+                s.PresentRefreshCount,
+                s.SyncRefreshCount,
+                s.SyncQPCTime,
+            ));
+        }
         if self.samples.len() < self.samples.capacity() {
             let display = s.SyncQPCTime - i64::from(gap) * self.period_qpc;
             self.samples.push((s.PresentCount, display));
@@ -281,22 +313,31 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     // Frames: countdown + play + post-play at up to 500 Hz, with margin.
     let max_frames = ((COUNTDOWN_US + play_len + POST_PLAY_US) / 2_000 + 1_000) as usize;
     let mut rec = Recorder::new(max_frames);
-    let mut predicted: Vec<(u32, i64)> = Vec::with_capacity(max_frames);
+    // Private trace per frame: start QPC, predicted display QPC, present
+    // count.
+    let mut trace: Vec<(i64, i64, Option<u32>)> = Vec::with_capacity(max_frames);
     let mut dxgi = Dxgi {
         chain,
         last_present_count: 0,
         period_qpc,
         samples: Vec::with_capacity(max_frames),
+        raw: Vec::with_capacity(max_frames),
         summary: DxgiSummary::default(),
         sync_anchor: None,
+        sync_count: None,
+        last_sync: None,
     };
+    // The cap period in whole refreshes (V3: caps divide the refresh rate).
     let cap = match args.fps_cap {
         Some(hz) if cap_needed(hz, refresh_mhz) => {
-            Some((CapTimer::new()?, qpc_freq() / i64::from(hz)))
+            let hz = u64::from(hz);
+            let k = ((u64::from(refresh_mhz) + hz * 500) / (hz * 1000)).max(1);
+            Some((CapTimer::new()?, k as u32))
         }
         _ => None,
     };
     let mut cap_anchor_fallback: Option<i64> = None;
+    let mut cap_phase: Option<u32> = None;
     let mut last_slot: Option<i64> = None;
     let interval = bga.interval_us();
     // First BGA frame uploaded before the countdown (design D2).
@@ -311,12 +352,17 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
                 continue;
             }
         }
-        if let Some((timer, period)) = &cap {
+        if let Some((timer, k)) = &cap {
             let now = qpc();
-            let anchor = dxgi
-                .sync_anchor
-                .unwrap_or(*cap_anchor_fallback.get_or_insert(now));
-            let (wait, slot) = cap_step(now, anchor, *period, last_slot);
+            let anchor = match (dxgi.sync_anchor, dxgi.sync_count) {
+                // Keep the cap's refresh-count phase across re-anchoring.
+                (Some(q), Some(c)) => {
+                    let phase = *cap_phase.get_or_insert(c % k);
+                    cap_anchor(q, c, phase, *k, period_qpc)
+                }
+                _ => *cap_anchor_fallback.get_or_insert(now),
+            };
+            let (wait, slot) = cap_step(now, anchor, i64::from(*k) * period_qpc, last_slot);
             if let Some(w) = wait {
                 timer.wait_until(w);
             }
@@ -374,10 +420,8 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         let p1 = qpc();
         let present_count = dxgi.present_count();
         dxgi.sample();
-        if let Some(c) = present_count
-            && predicted.len() < predicted.capacity()
-        {
-            predicted.push((c, predicted_qpc));
+        if trace.len() < trace.capacity() {
+            trace.push((t0, predicted_qpc, present_count));
         }
         let us = |q: i64| (q * 1_000_000 / qpc_freq()) as u32;
         rec.frame(
@@ -391,6 +435,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
                 effect_instances: load.effect_instances,
                 lanes_with_effects: load.lanes_with_effects,
                 bga_frame_shown: shown.is_some(),
+                bga_index: shown,
             },
             shown,
             &frame,
@@ -399,7 +444,10 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     }
     alloc::disarm();
     // Pair DXGI display estimates with frames by present count.
-    let by_count: HashMap<u32, i64> = predicted.iter().copied().collect();
+    let by_count: HashMap<u32, i64> = trace
+        .iter()
+        .filter_map(|&(_, p, c)| Some((c?, p)))
+        .collect();
     let errors: Vec<i64> = dxgi
         .samples
         .iter()
@@ -431,8 +479,41 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     ) = heavy_values(&rec, &due, timeline);
     summary.bga = bga.summary(&due);
     summary.dxgi = Some(dxgi.summary);
+    summary.notes = vec![
+        "G7 'displayed' means shown by a presented frame; P5 reconciles it with PresentMon display rows".into(),
+        format!(
+            "display prediction uses DISPLAY_VBLANKS = {DISPLAY_VBLANKS}, uncalibrated; P5 calibrates it against PresentMon at 60 and 240 Hz with and without a cap using private/trace.csv"
+        ),
+    ];
     summary.events = shared.events.lock().map_err(|e| e.to_string())?.clone();
     print_summary(&summary);
     write_outputs(&args.out, &rec, &due, &summary)?;
+    write_private_trace(&args.out, &trace, &dxgi.raw)?;
+    Ok(())
+}
+
+/// `private/trace.csv` and `private/dxgi.csv`: raw QPC values for P5's
+/// reconciliation with PresentMon; never part of the export.
+fn write_private_trace(
+    out: &std::path::Path,
+    trace: &[(i64, i64, Option<u32>)],
+    raw: &[(u32, u32, u32, i64)],
+) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let dir = out.join("private");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut t = String::from("frame_start_qpc,predicted_display_qpc,present_count\n");
+    for (s, p, c) in trace {
+        let c = c.map_or(String::new(), |c| c.to_string());
+        let _ = writeln!(t, "{s},{p},{c}");
+    }
+    std::fs::write(dir.join("trace.csv"), t).map_err(|e| e.to_string())?;
+    let mut d = String::from("present_count,present_refresh_count,sync_refresh_count,sync_qpc\n");
+    for (a, b, c, q) in raw {
+        let _ = writeln!(d, "{a},{b},{c},{q}");
+    }
+    std::fs::write(dir.join("dxgi.csv"), d).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("qpc.txt"), format!("frequency {}\n", qpc_freq()))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }

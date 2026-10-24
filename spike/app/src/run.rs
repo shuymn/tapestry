@@ -78,6 +78,9 @@ pub struct DxgiSummary {
     pub frames: u64,
     pub samples: u64,
     pub rejected: u64,
+    /// Samples off a fixed refresh grid (VRR or composition), not used as
+    /// anchors.
+    pub off_grid: u64,
     /// Samples paired with a frame by present count.
     pub paired: u64,
     pub prediction_error_us_p50: Option<i64>,
@@ -109,6 +112,8 @@ pub struct RenderSummary {
     pub other_thread_app_allocs: u64,
     /// G6/G6r count allocations through Rust's global allocator only.
     pub allocs_scope: String,
+    /// Caveats on the values above.
+    pub notes: Vec<String>,
     pub readback_distinct_colors: Option<usize>,
     pub bga_only_readback_distinct_colors: Option<usize>,
     pub events: Vec<RunEvent>,
@@ -394,10 +399,11 @@ pub fn print_summary(s: &RenderSummary) {
     }
     if let Some(d) = &s.dxgi {
         println!(
-            "dxgi: {} samples for {} frames ({} rejected, {} paired); display prediction error p50 {:?} us, |p99| {:?} us",
+            "dxgi: {} samples for {} frames ({} rejected, {} off the refresh grid, {} paired); display prediction error p50 {:?} us, |p99| {:?} us",
             d.samples,
             d.frames,
             d.rejected,
+            d.off_grid,
             d.paired,
             d.prediction_error_us_p50,
             d.prediction_error_us_p99_abs
@@ -413,6 +419,9 @@ pub fn print_summary(s: &RenderSummary) {
         "allocations during play: app {:?} (other threads {}), library {:?} [{}]",
         s.app_allocs, s.other_thread_app_allocs, s.library_allocs, s.allocs_scope
     );
+    for n in &s.notes {
+        println!("note: {n}");
+    }
     if let Some(c) = s.readback_distinct_colors {
         println!(
             "readback: {} ({c} distinct colors)",
@@ -503,6 +512,7 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
                 effect_instances: load.effect_instances,
                 lanes_with_effects: load.lanes_with_effects,
                 bga_frame_shown: shown.is_some(),
+                bga_index: shown,
             },
             shown,
             &frame,

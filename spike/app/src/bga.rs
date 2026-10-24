@@ -13,6 +13,20 @@
 /// Interval when the stream does not state its frame rate (60 fps).
 pub const DEFAULT_INTERVAL_US: i64 = 16_667;
 
+/// First frame number of the next pass of the looped video. Passes are
+/// `clip_frames` long (from the stream's frame count or duration), so
+/// frames missing at the end of a pass keep their numbers and count as
+/// missed; only when the clip length is unknown (0) does the next pass
+/// follow the last decoded frame (`next`).
+#[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
+pub fn next_pass_base(base: u64, clip_frames: u64, next: u64) -> u64 {
+    if clip_frames > 0 {
+        base + clip_frames
+    } else {
+        next
+    }
+}
+
 #[cfg(feature = "ffmpeg")]
 mod imp {
     use crate::alloc::{self, Scope, Tag, scope};
@@ -58,7 +72,9 @@ mod imp {
         pub superseded: u64,
     }
 
-    fn probe(path: &Path) -> Result<(u32, u32, i64), String> {
+    /// Width, height, frame interval (µs) and clip length in frames (0 if
+    /// the stream states neither its frame count nor its duration).
+    fn probe(path: &Path) -> Result<(u32, u32, i64, u64), String> {
         let ictx = ff::format::input(path).map_err(|e| format!("open BGA: {e}"))?;
         let stream = ictx
             .streams()
@@ -70,16 +86,26 @@ mod imp {
         } else {
             super::DEFAULT_INTERVAL_US
         };
+        let tb = stream.time_base();
+        let clip_frames = if stream.frames() > 0 {
+            stream.frames() as u64
+        } else if stream.duration() > 0 && tb.denominator() > 0 {
+            let us = i128::from(stream.duration()) * 1_000_000 * i128::from(tb.numerator())
+                / i128::from(tb.denominator());
+            ((us + i128::from(interval) / 2) / i128::from(interval)) as u64
+        } else {
+            0
+        };
         let ctx = ff::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| e.to_string())?;
         let dec = ctx.decoder().video().map_err(|e| e.to_string())?;
-        Ok((dec.width(), dec.height(), interval))
+        Ok((dec.width(), dec.height(), interval, clip_frames))
     }
 
     impl Bga {
         pub fn open(path: &Path) -> Result<Self, String> {
             ff::init().map_err(|e| e.to_string())?;
-            let (width, height, interval_us) = probe(path)?;
+            let (width, height, interval_us, clip_frames) = probe(path)?;
             let (w, h) = (width as usize, height as usize);
             let slots: Arc<Vec<Mutex<Slot>>> = Arc::new(
                 (0..POOL)
@@ -106,6 +132,7 @@ mod imp {
             let worker = Worker {
                 path: path.to_owned(),
                 interval_us,
+                clip_frames,
                 slots: slots.clone(),
                 ready: ready_tx,
                 free: free_rx,
@@ -203,6 +230,7 @@ mod imp {
     struct Worker {
         path: PathBuf,
         interval_us: i64,
+        clip_frames: u64,
         slots: Arc<Vec<Mutex<Slot>>>,
         ready: SyncSender<usize>,
         free: Receiver<usize>,
@@ -257,7 +285,7 @@ mod imp {
                         if next == base {
                             return Err("BGA pass decoded no frames".into());
                         }
-                        base = next;
+                        base = super::next_pass_base(base, self.clip_frames, next);
                         scope(Scope::FfmpegDecode, || {
                             decoder.flush();
                             ictx.seek(0, ..)
@@ -369,4 +397,19 @@ impl Bga {
         unreachable!("no BGA without ffmpeg")
     }
     pub fn release(&self, _: usize) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_pass_base;
+
+    #[test]
+    fn frames_lost_before_the_end_of_a_pass_keep_their_numbers() {
+        // A 180-frame clip whose frames 178 and 179 were never decoded:
+        // the next pass still starts at 180.
+        assert_eq!(next_pass_base(0, 180, 178), 180);
+        assert_eq!(next_pass_base(180, 180, 359), 360);
+        // Unknown clip length: follow the decoded frames.
+        assert_eq!(next_pass_base(0, 0, 178), 178);
+    }
 }
