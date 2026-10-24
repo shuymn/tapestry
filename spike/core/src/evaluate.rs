@@ -376,6 +376,14 @@ fn v6(run: &RunData) -> Check {
     if run.audio.unverifiable_spans > 0 {
         r.push("unverifiable-loopback-span");
     }
+    let tl = run.info.timeline;
+    let covered = matches!(
+        (run.audio.capture_from_us, run.audio.capture_to_us),
+        (Some(a), Some(b)) if a <= tl.play_start_us && b >= tl.play_end_us()
+    );
+    if !covered {
+        r.push("loopback-does-not-cover-play");
+    }
     if run.info.mix_rate_hz < MIN_MIX_RATE_HZ {
         r.push("mix-rate-below-44100");
     }

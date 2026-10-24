@@ -155,6 +155,8 @@ const JSON_KEYS: &[&str] = &[
     "app_allocs",
     "pilot_calibrated",
     "unverifiable_spans",
+    "capture_from_us",
+    "capture_to_us",
     "episodes",
     "start_us",
     "end_us",

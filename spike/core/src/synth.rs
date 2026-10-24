@@ -102,6 +102,8 @@ pub fn passing_run() -> RunData {
         audio: AudioFacts {
             pilot_calibrated: true,
             unverifiable_spans: 0,
+            capture_from_us: Some(PLAY_START_US - 10_000_000),
+            capture_to_us: Some(timeline.play_end_us() + 3_000_000),
             episodes: vec![],
         },
         owner: OwnerPublic::default(),

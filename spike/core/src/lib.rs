@@ -15,6 +15,7 @@ pub mod presentmon;
 pub mod rng;
 pub mod run;
 pub mod scroll;
+pub mod sounds;
 pub mod stats;
 #[doc(hidden)]
 pub mod synth;

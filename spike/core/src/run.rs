@@ -172,6 +172,10 @@ pub struct Episode {
 pub struct AudioFacts {
     pub pilot_calibrated: bool,
     pub unverifiable_spans: u32,
+    /// Span the detector evaluated (after its warm-up), mapped to run µs;
+    /// V6 requires it to cover the play window.
+    pub capture_from_us: Option<i64>,
+    pub capture_to_us: Option<i64>,
     /// Confirmed discontinuity episodes over the whole run (G5).
     pub episodes: Vec<Episode>,
 }

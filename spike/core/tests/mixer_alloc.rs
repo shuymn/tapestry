@@ -54,7 +54,7 @@ fn h_mix_loop_makes_no_allocations() {
             .map(|k| (0..4_800).map(|i| ((i * (k + 3)) % 2_000) as i16).collect())
             .collect(),
     };
-    let mut mixer = Mixer::new(MAX_VOICES);
+    let mut mixer = Mixer::new(MAX_VOICES, 96);
     let mut out = vec![0.0f32; 480 * 2];
 
     // Sanity: the counter sees allocations on this thread.

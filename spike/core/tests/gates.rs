@@ -620,6 +620,16 @@ fn v1_v2_v5_v6_invalidate() {
         ("V6", Box::new(|r| r.audio.pilot_calibrated = false)),
         ("V6", Box::new(|r| r.audio.unverifiable_spans = 1)),
         ("V6", Box::new(|r| r.info.mix_rate_hz = 32_000)),
+        // The detector's warm-up or end must not fall inside play.
+        (
+            "V6",
+            Box::new(|r| r.audio.capture_from_us = Some(PLAY_START_US + 1)),
+        ),
+        (
+            "V6",
+            Box::new(|r| r.audio.capture_to_us = Some(r.info.timeline.play_end_us() - 1)),
+        ),
+        ("V6", Box::new(|r| r.audio.capture_to_us = None)),
     ];
     for (id, edit) in cases {
         let mut run = passing_run();

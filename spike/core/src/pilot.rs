@@ -13,10 +13,17 @@
 //! A window is bad if its amplitude is below 60% of the countdown
 //! calibration, or if its phase differs from the previous non-overlapping
 //! window (4 hops back) by more than `PHASE_STEP_LIMIT_RAD` while both have
-//! full amplitude. Consecutive bad windows coalesce into one episode; G5
-//! counts episodes. A gap of 1 ms or longer silences at least 0.75 ms of
-//! some window, so its amplitude falls far below 60%; shorter gaps are a
-//! stated limit.
+//! full amplitude. Bad windows coalesce into one episode, which closes only
+//! after `CLOSE_GOOD_WINDOWS` good windows in a row (the filter's recovery
+//! after a gap); G5 counts episodes. A gap of 1 ms or longer silences at
+//! least 0.75 ms of some window, so its amplitude falls far below 60%;
+//! shorter gaps are a stated limit.
+//!
+//! Capture continuity is not inferred from the samples: packets carry their
+//! device position and flags, and a position jump, overlap or discontinuity
+//! flag is an unverifiable span (V6). The trailing partial window is
+//! checked at the end, and the report states the evaluated span, which V6
+//! requires to cover the play window (so the warm-up falls before play).
 
 /// Pilot frequency.
 pub const PILOT_HZ: u32 = 19_000;
@@ -28,6 +35,8 @@ pub const PHASE_STEP_LIMIT_RAD: f64 = 0.35;
 const LPF_HZ: f64 = 1_000.0;
 /// Windows skipped at the start while the filter settles (3 ms).
 const WARMUP_WINDOWS: u64 = 12;
+/// Good windows in a row that close an episode (2 ms).
+pub const CLOSE_GOOD_WINDOWS: u64 = 8;
 
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
@@ -126,6 +135,9 @@ struct Demod {
     acc: (f64, f64),
     blocks: [(f64, f64); 4],
     blocks_done: u64,
+    /// The last `win` filtered baseband samples, for the trailing window.
+    ring: Vec<(f64, f64)>,
+    fed: u64,
 }
 
 impl Demod {
@@ -150,6 +162,17 @@ impl Demod {
             acc: (0.0, 0.0),
             blocks: [(0.0, 0.0); 4],
             blocks_done: 0,
+            ring: vec![(0.0, 0.0); win],
+            fed: 0,
+        }
+    }
+
+    fn stat(&self, index: u64, start_sample: u64, (si, sq): (f64, f64)) -> WindowStat {
+        WindowStat {
+            index,
+            start_sample,
+            amplitude: 2.0 * (si * si + sq * sq).sqrt() / self.win as f64,
+            phase: sq.atan2(si),
         }
     }
 
@@ -164,6 +187,8 @@ impl Demod {
         for s in &mut self.lpf[1] {
             q = s.run(q);
         }
+        self.ring[(self.fed % self.win as u64) as usize] = (i, q);
+        self.fed += 1;
         self.acc.0 += i;
         self.acc.1 += q;
         self.fill += 1;
@@ -177,18 +202,26 @@ impl Demod {
         if self.blocks_done < 4 {
             return None;
         }
-        let (si, sq) = self
+        let sum = self
             .blocks
             .iter()
             .fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
         let index = self.blocks_done - 4;
-        let n = self.win as f64;
-        Some(WindowStat {
-            index,
-            start_sample: index * self.hop as u64,
-            amplitude: 2.0 * (si * si + sq * sq).sqrt() / n,
-            phase: sq.atan2(si),
-        })
+        Some(self.stat(index, index * self.hop as u64, sum))
+    }
+
+    /// The window over the last `win` samples when samples after the last
+    /// full window would otherwise go unchecked.
+    fn trailing(&self) -> Option<WindowStat> {
+        let last_end = (self.blocks_done.checked_sub(4)? * self.hop as u64) + self.win as u64;
+        if self.fed <= last_end {
+            return None;
+        }
+        let sum = self
+            .ring
+            .iter()
+            .fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+        Some(self.stat(self.blocks_done - 3, self.fed - self.win as u64, sum))
     }
 }
 
@@ -218,12 +251,39 @@ pub fn calibrate(samples: &[f32], rate_hz: u32) -> Option<Calibration> {
     (steady && level_ok).then_some(Calibration { amplitude: median })
 }
 
-/// A confirmed discontinuity, in capture samples (half-open).
+/// A span of capture device positions (half-open).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleSpan {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// A confirmed discontinuity, in capture device positions (half-open).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SampleEpisode {
     pub start_sample: u64,
     pub end_sample: u64,
     pub bad_windows: u64,
+}
+
+/// Capture packet flags (`AUDCLNT_BUFFERFLAGS_SILENT`,
+/// `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PacketFlags {
+    pub silent: bool,
+    pub discontinuity: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetectorReport {
+    pub episodes: Vec<SampleEpisode>,
+    /// Spans whose content is unknown: device-position jumps or overlaps,
+    /// and packets flagged as a data discontinuity. Any one invalidates the
+    /// run (V6).
+    pub unverifiable: Vec<SampleSpan>,
+    /// Device positions actually checked (after the filter warm-up). V6
+    /// requires it to cover the play window.
+    pub evaluated: Option<SampleSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -233,8 +293,16 @@ pub struct Detector {
     /// Last four windows: (amplitude ok, phase).
     recent: [(bool, f64); 4],
     open: Option<SampleEpisode>,
+    good_run: u64,
     episodes: Vec<SampleEpisode>,
     windows: u64,
+    /// Device position of the first captured sample, and of the next one
+    /// expected.
+    base: Option<u64>,
+    next: u64,
+    /// Frames skipped by position jumps (device position minus fed count).
+    jumped: u64,
+    unverifiable: Vec<SampleSpan>,
 }
 
 impl Detector {
@@ -244,8 +312,13 @@ impl Detector {
             threshold: AMPLITUDE_RATIO * cal.amplitude,
             recent: [(false, 0.0); 4],
             open: None,
+            good_run: 0,
             episodes: Vec::new(),
             windows: 0,
+            base: None,
+            next: 0,
+            jumped: 0,
+            unverifiable: Vec::new(),
         }
     }
 
@@ -257,15 +330,59 @@ impl Detector {
         self.demod.hop
     }
 
+    /// Contiguous samples following the previous ones.
     pub fn push(&mut self, samples: &[f32]) {
+        let pos = if self.base.is_some() { self.next } else { 0 };
+        self.push_packet(pos, PacketFlags::default(), samples);
+    }
+
+    /// One capture packet at device position `pos`. Continuity comes from
+    /// the device positions and flags, not from the samples: a jump, an
+    /// overlap or a discontinuity flag is an unverifiable span, even where
+    /// the periodic pilot would hide it (a 48-frame jump at 48 kHz is one
+    /// whole pilot period). Missing frames are not invented: later positions
+    /// are offset by the jump. A silent packet is silence.
+    pub fn push_packet(&mut self, pos: u64, flags: PacketFlags, samples: &[f32]) {
+        if self.base.is_none() {
+            self.base = Some(pos);
+            self.next = pos;
+        }
+        let mut samples = samples;
+        let mut pos = pos;
+        if pos > self.next {
+            self.unverifiable.push(SampleSpan {
+                start: self.next,
+                end: pos,
+            });
+            self.jumped += pos - self.next;
+        } else if pos < self.next {
+            let overlap = ((self.next - pos) as usize).min(samples.len());
+            self.unverifiable.push(SampleSpan {
+                start: pos,
+                end: self.next,
+            });
+            samples = &samples[overlap..];
+            pos += overlap as u64;
+        }
+        if flags.discontinuity {
+            self.unverifiable.push(SampleSpan {
+                start: pos,
+                end: pos + samples.len() as u64,
+            });
+        }
         for &x in samples {
-            if let Some(w) = self.demod.push(x) {
-                self.window(w);
-            }
+            self.feed(if flags.silent { 0.0 } else { x });
+        }
+        self.next = pos + samples.len() as u64;
+    }
+
+    fn feed(&mut self, x: f32) {
+        if let Some(w) = self.demod.push(x) {
+            self.window(w, true);
         }
     }
 
-    fn window(&mut self, w: WindowStat) {
+    fn window(&mut self, w: WindowStat, check_phase: bool) {
         self.windows += 1;
         let amp_ok = w.amplitude >= self.threshold;
         let slot = (w.index % 4) as usize;
@@ -276,22 +393,32 @@ impl Detector {
         }
         let mut step = w.phase - prev_phase;
         step -= std::f64::consts::TAU * (step / std::f64::consts::TAU).round();
-        let bad = !amp_ok || (prev_ok && step.abs() > PHASE_STEP_LIMIT_RAD);
-        let end = w.start_sample + self.demod.win as u64;
-        match (&mut self.open, bad) {
-            (Some(e), true) => {
-                e.end_sample = end;
-                e.bad_windows += 1;
+        let phase_bad = check_phase && amp_ok && prev_ok && step.abs() > PHASE_STEP_LIMIT_RAD;
+        let start = self.base.unwrap_or(0) + self.jumped + w.start_sample;
+        let end = start + self.demod.win as u64;
+        if !amp_ok || phase_bad {
+            self.good_run = 0;
+            match &mut self.open {
+                Some(e) => {
+                    e.end_sample = end;
+                    e.bad_windows += 1;
+                }
+                None => {
+                    self.open = Some(SampleEpisode {
+                        start_sample: start,
+                        end_sample: end,
+                        bad_windows: 1,
+                    });
+                }
             }
-            (None, true) => {
-                self.open = Some(SampleEpisode {
-                    start_sample: w.start_sample,
-                    end_sample: end,
-                    bad_windows: 1,
-                });
+        } else if self.open.is_some() {
+            // Close only after the filter has recovered: bad windows
+            // separated by a short good run are one episode.
+            self.good_run += 1;
+            if self.good_run >= CLOSE_GOOD_WINDOWS {
+                self.episodes.extend(self.open.take());
+                self.good_run = 0;
             }
-            (Some(_), false) => self.episodes.extend(self.open.take()),
-            (None, false) => {}
         }
     }
 
@@ -299,10 +426,25 @@ impl Detector {
         self.windows
     }
 
-    /// Closes any open episode and returns all episodes.
-    pub fn finish(mut self) -> Vec<SampleEpisode> {
+    /// Checks the trailing partial window, closes any open episode and
+    /// returns the report.
+    pub fn finish(mut self) -> DetectorReport {
+        if let Some(w) = self.demod.trailing() {
+            // Overlaps the previous windows, so only its amplitude counts.
+            self.window(w, false);
+        }
         self.episodes.extend(self.open.take());
-        self.episodes
+        let base = self.base.unwrap_or(0);
+        let from = base + WARMUP_WINDOWS * self.demod.hop as u64;
+        let to = base + self.jumped + self.demod.fed;
+        DetectorReport {
+            episodes: self.episodes,
+            unverifiable: self.unverifiable,
+            evaluated: (to > from).then_some(SampleSpan {
+                start: from,
+                end: to,
+            }),
+        }
     }
 }
 
@@ -320,6 +462,21 @@ mod tests {
             let d = Demod::new(rate);
             assert_eq!((d.win, d.hop, d.cos.len()), (win, hop, table));
         }
+    }
+
+    #[test]
+    fn trailing_window_covers_the_last_samples() {
+        let mut d = Demod::new(48_000);
+        for _ in 0..(480 + 5) {
+            d.push(0.1);
+        }
+        let t = d.trailing().expect("unaligned tail");
+        assert_eq!(t.start_sample, 485 - 48);
+        for _ in 0..7 {
+            d.push(0.1);
+        }
+        // 492 = 41 hops: the last full window ends at the last sample.
+        assert!(d.trailing().is_none());
     }
 
     #[test]
