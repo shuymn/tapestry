@@ -268,7 +268,8 @@ fn default_reaches_dev_tools(members: &[&Package], start: &Package) -> Option<Ve
 
 /// R3 (resolved): the features `cargo build --release -p <package>
 /// --no-default-features --target <target>` would enable. Dev-dependencies
-/// are excluded, as in that build.
+/// are excluded, as in that build. Build-dependencies resolve for the host
+/// running this check, so it must also run on the production host (Windows).
 fn check_production_features(
     manifest: &Path,
     metadata: &Metadata,
@@ -529,5 +530,37 @@ mod tests {
              [dev-dependencies]\ninput = { path = \"../input\", features = [\"dev-tools\"] }\n",
         );
         assert_eq!(check(&crates), Vec::<String>::new());
+    }
+
+    /// Build-dependencies resolve for the host, not for `--target`, so this
+    /// case is only visible when check-arch runs on a Windows host (the
+    /// `windows` CI job runs it for that reason).
+    #[cfg(windows)]
+    #[test]
+    fn r3_rejects_dev_tools_requested_by_windows_build_dependency() {
+        let mut crates = baseline();
+        crates.push(lib(
+            "input",
+            "[package.metadata.tapestry]\nwindows-only = true\n[features]\ndev-tools = []\n",
+        ));
+        set(
+            &mut crates,
+            "player",
+            "[package.metadata.tapestry]\nwindows-only = true\n\
+             [target.'cfg(windows)'.build-dependencies]\n\
+             input = { path = \"../input\", features = [\"dev-tools\"] }\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace(dir.path(), &crates);
+        std::fs::write(dir.path().join("crates/player/build.rs"), "fn main() {}\n").unwrap();
+        let diagnostics = run(&dir.path().join("Cargo.toml"), &["--offline"]).unwrap();
+        assert_single(
+            &diagnostics,
+            &[
+                "R3:",
+                "production build of `player`",
+                "enables `dev-tools` on `input`",
+            ],
+        );
     }
 }

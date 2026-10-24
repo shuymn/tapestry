@@ -49,6 +49,10 @@ jobs:
         run: mise exec -- cargo clippy -p player --all-targets --locked --features dev-tools -- -D warnings
       - name: Test
         run: mise exec -- cargo test --workspace --locked
+      # Also run on Windows: build-dependencies resolve for the host, so the
+      # R3 production-feature check sees cfg(windows) build-dependencies only here.
+      - name: Architecture rules
+        run: mise exec -- cargo xtask check-arch
       - name: Production build
         run: mise exec -- cargo build --release --locked -p player --no-default-features
       - name: Production excludes dev-tools
