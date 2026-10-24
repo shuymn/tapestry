@@ -262,4 +262,15 @@ fn i_short_names_are_checked_as_whole_words() {
     ));
     c.insert("cpu_brand".into(), json!("xa-by performance plan"));
     assert!(build(&passing_run(), &c, &ctx).is_ok());
+    // Overlapping occurrences: the first `a-a` in "extra-a-a" is inside a
+    // word, the overlapping second one is the name.
+    let ctx = ScanContext {
+        forbidden_names: vec!["a-a".into()],
+        ..ScanContext::default()
+    };
+    c.insert("cpu_brand".into(), json!("extra-a-a performance plan"));
+    assert!(matches!(
+        build(&passing_run(), &c, &ctx),
+        Err(ExportError::Rejected(f)) if f == vec![Finding::Name(CONDITIONS.into())]
+    ));
 }

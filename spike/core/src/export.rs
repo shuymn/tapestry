@@ -433,11 +433,16 @@ fn contains_name(text: &str, names: &[String]) -> bool {
         } else if n.chars().count() >= 4 {
             lower.contains(&n)
         } else {
-            lower.match_indices(n.as_str()).any(|(i, m)| {
-                let before = lower[..i].chars().next_back();
-                let after = lower[i + m.len()..].chars().next();
-                !before.is_some_and(char::is_alphanumeric)
-                    && !after.is_some_and(char::is_alphanumeric)
+            // Every start position, overlapping ones included: `a-a` in
+            // "extra-a-a" first hits inside "extra" (rejected), then at the
+            // overlapping valid position.
+            lower.char_indices().any(|(i, _)| {
+                lower[i..].starts_with(n.as_str()) && {
+                    let before = lower[..i].chars().next_back();
+                    let after = lower[i + n.len()..].chars().next();
+                    !before.is_some_and(char::is_alphanumeric)
+                        && !after.is_some_and(char::is_alphanumeric)
+                }
             })
         }
     })
