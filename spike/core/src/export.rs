@@ -251,7 +251,13 @@ pub enum Finding {
     Path(String),
     Name(String),
     RawQpc(String),
-    Key { file: String, key: String },
+    /// A timestamp outside the run's relative-µs range (wrong unit, or a
+    /// raw QPC value in a time field).
+    TimestampOutOfRange(String),
+    Key {
+        file: String,
+        key: String,
+    },
     Unparsable(String),
 }
 
@@ -350,21 +356,32 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
         if has_path(text) {
             out.push(Finding::Path(name.clone()));
         }
-        let lower = text.to_lowercase();
-        if ctx
-            .forbidden_names
-            .iter()
-            .any(|n| n.trim().len() >= 3 && lower.contains(&n.trim().to_lowercase()))
-        {
+        if contains_name(text, &ctx.forbidden_names) {
             out.push(Finding::Name(name.clone()));
         }
-        if let Some((lo, hi)) = ctx.qpc_range
-            && digit_runs(text).any(|v| (lo..=hi).contains(&v))
-        {
-            out.push(Finding::RawQpc(name.clone()));
+        let json = name
+            .ends_with(".json")
+            .then(|| serde_json::from_str::<Value>(text));
+        // Raw QPC: numbers in the structured files are checked by unit and
+        // range below (a relative µs value may legitimately fall inside the
+        // raw QPC range on a recently booted PC); free text, which is all of
+        // the condition file and every JSON string, is scanned for it.
+        if let Some((lo, hi)) = ctx.qpc_range {
+            let free_text = match &json {
+                _ if name == CONDITIONS => text.to_owned(),
+                Some(Ok(v)) => {
+                    let mut strings = Vec::new();
+                    collect_strings(v, &mut strings);
+                    strings.join(" ")
+                }
+                _ => String::new(),
+            };
+            if digit_runs(&free_text).any(|v| (lo..=hi).contains(&v)) {
+                out.push(Finding::RawQpc(name.clone()));
+            }
         }
-        let keys: Vec<String> = if name.ends_with(".json") {
-            match serde_json::from_str::<Value>(text) {
+        let keys: Vec<String> = if let Some(json) = json {
+            match json {
                 Ok(v) => {
                     let mut k = Vec::new();
                     collect_keys(&v, &mut k);
@@ -390,7 +407,110 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
             key,
         }));
     }
+    if out.is_empty() {
+        out.extend(timestamp_findings(export));
+    }
     out
+}
+
+/// Every forbidden name, however short: names of 4+ characters match as
+/// substrings, shorter ones as whole alphanumeric tokens (so a 2-letter user
+/// name is found as a word without matching inside every longer word).
+fn contains_name(text: &str, names: &[String]) -> bool {
+    let lower = text.to_lowercase();
+    let tokens: BTreeSet<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    names.iter().any(|n| {
+        let n = n.trim().to_lowercase();
+        if n.is_empty() {
+            false
+        } else if n.chars().count() >= 4 {
+            lower.contains(&n)
+        } else {
+            tokens.contains(n.as_str())
+        }
+    })
+}
+
+/// Times may lie this far outside the play window (countdown, capture
+/// lead-in and tail).
+const TIME_SLACK_US: i64 = 600_000_000;
+
+/// Structural unit check: every µs time in the export lies within the
+/// run's relative range.
+fn timestamp_findings(e: &Export) -> Vec<Finding> {
+    let Ok(run) = read(e) else {
+        return vec![Finding::Unparsable(RUN.into())];
+    };
+    let tl = run.info.timeline;
+    let ok_start = (0..=TIME_SLACK_US).contains(&tl.play_start_us);
+    let (lo, hi) = (-TIME_SLACK_US, tl.play_end_us() + TIME_SLACK_US);
+    let ok = |t: i64| (lo..=hi).contains(&t);
+    let mut out = vec![];
+    if !ok_start {
+        out.push(Finding::TimestampOutOfRange(RUN.into()));
+    }
+    let mut check = |file: &str, mut times: Box<dyn Iterator<Item = i64> + '_>| {
+        if !times.all(ok) {
+            out.push(Finding::TimestampOutOfRange(file.into()));
+        }
+    };
+    check(
+        RUN,
+        Box::new(
+            run.events
+                .iter()
+                .map(|x| x.t_us)
+                .chain(
+                    run.audio
+                        .episodes
+                        .iter()
+                        .flat_map(|x| [x.start_us, x.end_us]),
+                )
+                .chain(run.audio.capture_from_us)
+                .chain(run.audio.capture_to_us),
+        ),
+    );
+    check(
+        PM_FRAMES,
+        Box::new(
+            run.pm_frames
+                .iter()
+                .flat_map(|f| std::iter::once(f.present_us).chain(f.display_us)),
+        ),
+    );
+    check(
+        FRAMES,
+        Box::new(
+            run.frames
+                .iter()
+                .flat_map(|f| std::iter::once(f.render_us).chain(f.present_us)),
+        ),
+    );
+    check(
+        AUDIO_PERIODS,
+        Box::new(run.audio_periods.iter().map(|x| x.t_us)),
+    );
+    check(INPUT, Box::new(run.input.iter().map(|x| x.t_us)));
+    check(BGA, Box::new(run.bga.iter().map(|x| x.due_us)));
+    if let Ok(summary) = json::<Summary>(e, SUMMARY) {
+        check(
+            SUMMARY,
+            Box::new(summary.records.worst_frames.iter().map(|w| w.present_us)),
+        );
+    }
+    out
+}
+
+fn collect_strings(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Object(m) => m.values().for_each(|x| collect_strings(x, out)),
+        Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
+        _ => {}
+    }
 }
 
 fn has_path(text: &str) -> bool {

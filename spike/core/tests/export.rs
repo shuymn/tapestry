@@ -138,10 +138,20 @@ fn i_scan_finds_paths_names_raw_qpc_and_unknown_keys() {
         v["cpu_brand"] = json!("built on desktop-synth01")
     });
     assert_eq!(f, vec![Finding::Name(CONDITIONS.into())]);
+    // Raw QPC in a time field breaks the unit check; in free text it is
+    // found by value.
     let f = planted(RUN, |v| {
         v["info"]["timeline"]["play_start_us"] = json!(QPC_LO + 1_234)
     });
+    assert_eq!(f, vec![Finding::TimestampOutOfRange(RUN.into())]);
+    let f = planted(RUN, |v| {
+        v["info"]["presentmon_error"] = json!(format!("bad row at {}", QPC_LO + 9))
+    });
     assert_eq!(f, vec![Finding::RawQpc(RUN.into())]);
+    let f = planted(CONDITIONS, |v| {
+        v["cpu_brand"] = json!(format!("Synthetic {}", QPC_LO + 9))
+    });
+    assert_eq!(f, vec![Finding::RawQpc(CONDITIONS.into())]);
     let f = planted(RUN, |v| v["info"]["computer"] = json!("x"));
     assert_eq!(
         f,
@@ -179,17 +189,44 @@ fn i_build_refuses_a_run_that_would_leak() {
     run.info.timeline.play_start_us = QPC_LO as i64 + 77;
     assert!(matches!(
         build(&run, &conditions(), &ctx()),
-        Err(ExportError::Rejected(f)) if f.iter().any(|x| matches!(x, Finding::RawQpc(_)))
+        Err(ExportError::Rejected(f)) if f == vec![Finding::TimestampOutOfRange(RUN.into())]
+    ));
+    let mut run = passing_run();
+    run.frames[100].render_us = QPC_LO as i64;
+    assert!(matches!(
+        build(&run, &conditions(), &ctx()),
+        Err(ExportError::Rejected(f)) if f == vec![Finding::TimestampOutOfRange(FRAMES.into())]
     ));
 }
 
 #[test]
-fn i_fractional_digits_are_not_raw_qpc() {
-    // T60 = 16.666666666666668 has a long fractional digit run.
+fn i_relative_times_inside_the_raw_qpc_range_are_accepted() {
+    // Shortly after boot the raw QPC range overlaps the run's relative µs
+    // values (here 0–200 s of 10 MHz ticks); those values are legitimate.
     let ctx = ScanContext {
-        qpc_range: Some((666_666_666_666_000, 666_666_666_667_000)),
+        qpc_range: Some((0, 2_000_000_000)),
         ..ScanContext::default()
     };
     let export = build(&passing_run(), &conditions(), &ctx).unwrap();
     assert!(scan(&export, &ctx).is_empty());
+}
+
+#[test]
+fn i_short_names_are_checked_as_whole_words() {
+    let ctx = ScanContext {
+        forbidden_names: vec!["jk".into()],
+        ..ScanContext::default()
+    };
+    assert!(build(&passing_run(), &conditions(), &ctx).is_ok());
+    let mut c = conditions();
+    c.insert("cpu_brand".into(), json!("Synthetic CPU (jk)"));
+    assert!(matches!(
+        build(&passing_run(), &c, &ctx),
+        Err(ExportError::Rejected(f)) if f == vec![Finding::Name(CONDITIONS.into())]
+    ));
+    c.insert("cpu_brand".into(), json!("Synthetic JK-8 CPU"));
+    assert!(build(&passing_run(), &c, &ctx).is_err());
+    // Inside a longer word it is not that name.
+    c.insert("cpu_brand".into(), json!("Synthetic ajkx CPU"));
+    assert!(build(&passing_run(), &c, &ctx).is_ok());
 }
