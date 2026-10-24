@@ -1,0 +1,38 @@
+# MediaMTX for the spike's OBS runs (design §4.1): a local RTMP ingest that
+# accepts OBS's stream at rtmp://127.0.0.1:1935/live and discards it unless
+# someone reads it. Every listener is bound to 127.0.0.1, and every protocol
+# but RTMP is off, so Windows Firewall never asks to allow a public port.
+# Run from the bundle: mediamtx\mediamtx.exe obs\mediamtx.yml
+logLevel: info
+logDestinations: [stdout]
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+
+api: false
+metrics: false
+pprof: false
+playback: false
+
+rtsp: false
+rtmp: true
+rtmpEncryption: "no"
+rtmpAddress: 127.0.0.1:1935
+hls: false
+webrtc: false
+srt: false
+moq: false
+
+pathDefaults:
+  source: publisher
+
+paths:
+  all_others:

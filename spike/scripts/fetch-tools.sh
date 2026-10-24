@@ -4,7 +4,9 @@
 #
 #   third_party/ffmpeg/      FFmpeg LGPL shared build (bin/, include/, lib/)
 #   third_party/presentmon/  PresentMon console exe
-#   licenses/                FFmpeg license and build record, PresentMon MIT
+#   third_party/mediamtx/    MediaMTX (local RTMP ingest for OBS runs)
+#   licenses/                FFmpeg license and build record, PresentMon and
+#                            MediaMTX MIT
 #
 # Fails (non-zero) on a hash mismatch, or unless `ffmpeg -buildconf` lacks
 # --enable-gpl and --enable-nonfree and the avcodec and avutil libraries
@@ -88,6 +90,16 @@ mkdir -p "$pm_dir"
 pm_exe="$pm_dir/PresentMon-$(toml presentmon version)-x64.exe"
 fetch "$(toml presentmon url)" "$(toml presentmon sha256)" "$pm_exe"
 
+# --- MediaMTX -----------------------------------------------------------------
+mtx_asset=$(toml mediamtx asset)
+mtx_zip="$downloads/$mtx_asset"
+fetch "$(toml mediamtx url)" "$(toml mediamtx sha256)" "$mtx_zip"
+mtx_dir="$third/mediamtx"
+rm -rf "$mtx_dir"
+mkdir -p "$mtx_dir"
+unzip -q "$mtx_zip" -d "$mtx_dir"
+[ -f "$mtx_dir/mediamtx.exe" ] || fail "mediamtx.exe not found in $mtx_asset"
+
 # --- licenses/ ----------------------------------------------------------------
 rm -rf "$licenses"
 mkdir -p "$licenses/ffmpeg" "$licenses/presentmon"
@@ -118,4 +130,12 @@ Source:   https://github.com/GameTechDev/PresentMon/releases/tag/v$(toml present
 SHA-256:  $(toml presentmon sha256)
 EOF
 
-echo "fetch-tools: ok ($ff_version; PresentMon $(toml presentmon version))"
+mkdir -p "$licenses/mediamtx"
+cp "$mtx_dir/LICENSE" "$licenses/mediamtx/LICENSE.txt"
+cat >"$licenses/mediamtx/BUILD.txt" <<EOF
+MediaMTX $(toml mediamtx version) (MIT), unmodified release binary.
+Source:   https://github.com/bluenviron/mediamtx/releases/tag/v$(toml mediamtx version)
+SHA-256:  $(toml mediamtx sha256) ($(toml mediamtx asset))
+EOF
+
+echo "fetch-tools: ok ($ff_version; PresentMon $(toml presentmon version); MediaMTX $(toml mediamtx version))"

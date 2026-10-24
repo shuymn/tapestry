@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>spike overlay</title>
+<style>
+  html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: transparent; }
+  #bar { position: absolute; left: 1500px; top: 60px; width: 360px; height: 120px;
+         border-radius: 12px; background: rgba(20, 20, 30, 0.6); color: #fff;
+         font: 600 40px sans-serif; display: flex; align-items: center; justify-content: center; }
+  #meter { position: absolute; left: 1500px; top: 200px; width: 360px; height: 16px;
+           background: rgba(255, 255, 255, 0.2); border-radius: 8px; overflow: hidden; }
+  #fill { height: 100%; width: 0; background: #4ad; }
+</style>
+</head>
+<body>
+<!-- A light, always-changing browser source, as a streamer's overlay is
+     (design §4.1: one local browser source at 1920x1080, 30 fps). -->
+<div id="bar">00:00.0</div>
+<div id="meter"><div id="fill"></div></div>
+<script>
+  const start = performance.now();
+  function tick(now) {
+    const t = (now - start) / 1000;
+    const m = Math.floor(t / 60), s = (t % 60).toFixed(1).padStart(4, "0");
+    document.getElementById("bar").textContent = `${String(m).padStart(2, "0")}:${s}`;
+    document.getElementById("fill").style.width = `${(t % 4) / 4 * 100}%`;
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>
+</body>
+</html>

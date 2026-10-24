@@ -121,8 +121,8 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
     let mut m = Measure {
         presentmon: PathBuf::new(),
         obs: None,
-        obs_profile: "tapestry-spike-hardware".into(),
-        obs_collection: "tapestry-spike".into(),
+        obs_profile: "tapestry-spike-nvenc".into(),
+        obs_collection: crate::obs::COLLECTION.into(),
         dry_run: false,
     };
     let mut encoder = None;

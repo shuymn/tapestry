@@ -20,3 +20,11 @@ url = "https://github.com/GameTechDev/PresentMon/releases/download/v2.6.0/Presen
 sha256 = "b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af"
 license_url = "https://raw.githubusercontent.com/GameTechDev/PresentMon/e13fce6acdb55a808fd8318175a56863e532d95f/LICENSE.txt"
 license_sha256 = "4c949341b1893c8c6ad82f7fb4eedf622cd1fd9c22a9af8f19b2dac19d1947b6"
+
+[mediamtx]
+# Local RTMP ingest for OBS runs (design §4.1, Q4), bound to 127.0.0.1 only
+# by obs/mediamtx.yml. MIT; unmodified release binary.
+version = "1.21.2"
+asset = "mediamtx_v1.21.2_windows_amd64.zip"
+url = "https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/mediamtx_v1.21.2_windows_amd64.zip"
+sha256 = "a84224f5a490855684e62ba6fb71e80ea2a5e16aed61883bb58380290e93e467"

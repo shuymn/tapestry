@@ -22,6 +22,7 @@ mod conditions;
 mod display;
 mod gen_assets;
 mod measure;
+mod obs;
 mod pacing;
 mod render;
 mod report;
@@ -56,7 +57,8 @@ const USAGE: &str = "usage:
       --obs-collection <name> --obs-encoder hardware|x264] [--dry-run] <run options>
   tapestry-spike conditions [--out <dir>] [--audio-device <part>] [--bga <video>]
   tapestry-spike report <run-dir> [--notes <owner-notes.toml>]
-  tapestry-spike report --from-export <zip>";
+  tapestry-spike report --from-export <zip>
+  tapestry-spike obs-files --out <dir> [--overlay <html>]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -67,6 +69,7 @@ fn main() -> ExitCode {
         Some("measure") => measure::run(&args[1..]),
         Some("conditions") => conditions_cmd(&args[1..]),
         Some("report") => report_cmd(&args[1..]),
+        Some("obs-files") => obs_files_cmd(&args[1..]),
         Some("displays") if args.len() == 1 => {
             display::print_displays();
             Ok(ExitCode::SUCCESS)
@@ -252,6 +255,20 @@ fn conditions_cmd(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     conditions::run(&out, device.as_deref(), bga.as_deref())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `obs-files --out DIR [--overlay FILE]`.
+fn obs_files_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let (mut out, mut overlay) = (None, PathBuf::from("obs/overlay.html"));
+    for (k, v) in options(args)? {
+        match k {
+            "out" => out = Some(PathBuf::from(v)),
+            "overlay" => overlay = PathBuf::from(v),
+            _ => return Err(format!("unknown option --{k}\n{USAGE}")),
+        }
+    }
+    obs::write(&out.ok_or("--out is required")?, &overlay)?;
     Ok(ExitCode::SUCCESS)
 }
 

@@ -1,0 +1,21 @@
+# Owner notes (design 3.5). Fill once per PC, and the OBS fields after each
+# OBS run. Only these fields are read; values are true/false or "text".
+
+# Laptop or desktop.
+pc_form = ""
+# Variable refresh rate (G-SYNC/FreeSync/VRR) for the monitor the run is on.
+# A run counts as VRR on (invalid) until this says false.
+vrr =
+# How the monitor is connected (for example "DisplayPort", "HDMI",
+# "internal").
+display_connection = ""
+# The GPU the display is connected to (for example "discrete", "integrated").
+gpu_display_attached = ""
+# Windows audio enhancements on the output device ("on", "off", "unknown").
+audio_enhancements = ""
+# Output device class (for example "USB interface", "onboard", "headset").
+audio_device_class = ""
+
+# OBS runs only: the game was visible, and its audio present, in the ingest.
+game_visible =
+audio_present =
