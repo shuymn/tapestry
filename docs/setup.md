@@ -70,7 +70,7 @@ PRs created with `GITHUB_TOKEN` do not run CI unattended, so auto-merge would ne
 
 - A GitHub App installed on this repository only, with the repository permissions Contents (read and write) and Pull requests (read and write).
 - The repository variable `APP_CLIENT_ID` (the App's client ID) and the secret `APP_PRIVATE_KEY` (a private key of the App).
-- "Allow auto-merge" enabled for the repository, and the CI jobs required on `main` (auto-merge waits only for required checks).
+- "Allow auto-merge" and the CI jobs required on `main` (auto-merge waits only for required checks). Both are declared in `.github/infra.yaml`.
 
 ## Linux-Side Tools (WSL)
 
