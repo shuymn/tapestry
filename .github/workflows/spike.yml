@@ -1,0 +1,51 @@
+name: Spike
+
+# Stage 0 spike (issue #3): spike/ is its own Cargo workspace on spike/*
+# branches, never merged into main.
+on:
+  push:
+    branches: ["spike/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spike:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.3
+          install: true
+          cache: true
+      - name: Show runner image and toolchain
+        run: |
+          echo "runner image $ImageOS $ImageVersion"
+          mise exec -- rustc -Vv
+      - name: Fetch tools (FFmpeg LGPL shared, PresentMon)
+        run: bash spike/scripts/fetch-tools.sh
+      # ffmpeg-sys-next generates bindings with bindgen, which loads libclang;
+      # the runner image ships LLVM.
+      - name: Use the runner's LLVM for libclang
+        run: |
+          llvm="C:/Program Files/LLVM/bin"
+          test -f "$llvm/libclang.dll"
+          "$llvm/clang.exe" --version | head -n 1
+          echo "LIBCLANG_PATH=$llvm" >> "$GITHUB_ENV"
+      - name: Check (fmt, clippy, tests, app smoke, banned words)
+        run: bash spike/scripts/check.sh
+      - name: tapestry-spike --version
+        run: spike/target/debug/tapestry-spike.exe --version
