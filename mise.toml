@@ -1,0 +1,16 @@
+min_version = "2026.10.12"
+
+[settings]
+lockfile_platforms = ["windows-x64", "linux-x64"]
+minimum_release_age = "1d"
+
+[tool_config]
+locked = true
+
+[tools]
+rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
+lefthook = "2"
+cargo-deny = "0"
+"aqua:rustsec/rustsec/cargo-audit" = "0"
+actionlint = "1"
+shellcheck = "0"
