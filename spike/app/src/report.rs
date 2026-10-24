@@ -37,6 +37,8 @@ pub const OBS_LOG: &str = "private/obs.log";
 /// `nvidia-smi` samples during the run (`measure`), local timestamps.
 pub const GPU_SAMPLES: &str = "private/nvidia-smi.csv";
 pub const LADDER: &str = "ladder.txt";
+/// Whether the GPU sampler was still running when the run ended (`measure`).
+pub const GPU_SAMPLER: &str = "private/gpu_sampler.json";
 pub const APP: &str = "tapestry-spike.exe";
 
 fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T, String> {
@@ -78,8 +80,14 @@ fn gpu_state(dir: &Path, vendor: u32, name: &str, from: i64, to: i64) -> GpuStat
     if vendor != NVIDIA_VENDOR_ID {
         return GpuState::unavailable("adapter is not an NVIDIA GPU");
     }
+    // A sampler that exited before the run ended (or an unknown status)
+    // leaves the capture incomplete.
+    let sampler_ok = read_json::<Value>(&dir.join(GPU_SAMPLER))
+        .ok()
+        .and_then(|v| v["running_at_end"].as_bool())
+        .unwrap_or(false);
     match std::fs::read_to_string(dir.join(GPU_SAMPLES)) {
-        Ok(text) => gpu_state_from_smi(&text, name, from, to),
+        Ok(text) => gpu_state_from_smi(&text, name, from, to, sampler_ok),
         Err(_) => GpuState::unavailable("no nvidia-smi samples"),
     }
 }
@@ -318,12 +326,18 @@ fn write_ladder(dir: &Path, summary: &Summary, c: &Completed) -> Result<(), Stri
             .and_then(Value::as_u64)
             .map(|v| v as u32)
     };
+    // The ladder stops at the default period (design D5), not the
+    // engine's maximum.
     let periods = match (
         u("audio_period_chosen"),
         u("audio_period_step"),
-        u("audio_period_max"),
+        u("audio_period_default"),
     ) {
-        (Some(chosen), Some(step), Some(max)) => Some(PeriodLadder { chosen, step, max }),
+        (Some(chosen), Some(step), Some(default)) => Some(PeriodLadder {
+            chosen,
+            step,
+            default,
+        }),
         _ => None,
     };
     let l = ladder(summary, &c.run.info, periods);
@@ -343,20 +357,13 @@ fn write_ladder(dir: &Path, summary: &Summary, c: &Completed) -> Result<(), Stri
 
 /// `report <run-dir> [--notes owner-notes.toml]`.
 pub fn run(dir: &Path, notes: &Path) -> Result<ExitCode, String> {
+    // Outputs of an earlier report never stand for this one.
+    for f in [export::SUMMARY, export::REPORT, LADDER] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
     let c = complete(dir, notes)?;
     let (run, origin) = (&c.run, &c.origin);
     let summary = evaluate(run);
-    std::fs::write(
-        dir.join("summary.json"),
-        serde_json::to_vec_pretty(&summary).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    std::fs::write(
-        dir.join("report.md"),
-        export::markdown(&summary, run, &c.public),
-    )
-    .map_err(|e| e.to_string())?;
-    write_ladder(dir, &summary, &c)?;
     let ctx = ScanContext {
         forbidden_names: c.private_names.clone(),
         qpc_range: Some((
@@ -371,6 +378,12 @@ pub fn run(dir: &Path, notes: &Path) -> Result<ExitCode, String> {
         }
         Err(e) => return Err(format!("export: {e:?}")),
     };
+    // Public outputs only after the scan accepted them: the local summary
+    // and report are the export's own files.
+    for f in [export::SUMMARY, export::REPORT] {
+        std::fs::write(dir.join(f), &e.files[f]).map_err(|e| e.to_string())?;
+    }
+    write_ladder(dir, &summary, &c)?;
     let id = run_id(run);
     let out = dir.join("export").join(format!("{id}.zip"));
     std::fs::create_dir_all(out.parent().unwrap_or(dir)).map_err(|e| e.to_string())?;
@@ -482,11 +495,30 @@ mod tests {
         let err = run(&dir, &n).err().unwrap();
         assert!(err.contains("refused") && err.contains("Name"), "{err}");
         assert!(!dir.join("export").exists());
+        // No public output is left with the name either.
+        for f in [export::SUMMARY, export::REPORT, LADDER] {
+            assert!(!dir.join(f).exists(), "{f}");
+        }
         // The same run with a harmless note exports.
         let n = notes(
             &dir,
             "vrr = false\naudio_device_class = \"USB interface\"\n",
         );
+        assert!(run(&dir, &n).is_ok());
+        assert!(dir.join(export::REPORT).exists());
+        // A later refused report removes the earlier outputs.
+        let planted = notes(
+            &dir,
+            "vrr = false\naudio_device_class = \"studio speakers xr\"\n",
+        );
+        assert!(run(&dir, &planted).is_err());
+        assert!(!dir.join(export::REPORT).exists());
+        let n = notes(
+            &dir,
+            "vrr = false\naudio_device_class = \"USB interface\"\n",
+        );
+        assert!(run(&dir, &n).is_ok());
+        let _ = std::fs::remove_dir_all(dir.join("export"));
         assert!(run(&dir, &n).is_ok());
         let zip = std::fs::read_dir(dir.join("export"))
             .unwrap()
