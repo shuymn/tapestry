@@ -11,7 +11,8 @@
 use crate::alloc::{self, Scope, Tag, scope};
 use crate::display::{DisplayPath, active_paths, find_display, pick_refresh};
 use crate::pacing::{
-    DISPLAY_VBLANKS, DisplayPredictor, GridEvent, GridTracker, cap_anchor, cap_needed, cap_step,
+    DISPLAY_VBLANKS, DisplayPredictor, GridEvent, GridTracker, Wake, cap_anchor, cap_needed,
+    cap_step, early_wake_tolerance,
 };
 use crate::render::Renderer;
 use crate::run::{
@@ -354,9 +355,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     // Frames: countdown + play + post-play at up to 500 Hz, with margin.
     let max_frames = ((COUNTDOWN_US + play_len + POST_PLAY_US) / 2_000 + 1_000) as usize;
     let mut rec = Recorder::new(max_frames);
-    // Private trace per frame: start QPC, predicted display QPC, present
-    // count.
-    let mut trace: Vec<(i64, i64, Option<u32>)> = Vec::with_capacity(max_frames);
+    // Private trace per frame: start QPC, wake kind, predicted display QPC,
+    // present count.
+    let mut trace: Vec<(i64, &'static str, i64, Option<u32>)> = Vec::with_capacity(max_frames);
     let mut dxgi = Dxgi {
         chain,
         last_present_count: 0,
@@ -379,7 +380,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let mut cap_anchor_fallback: Option<i64> = None;
     let mut cap_phase: Option<u32> = None;
     let mut last_slot: Option<i64> = None;
-    let mut predictor = DisplayPredictor::default();
+    let mut predictor = DisplayPredictor::new(early_wake_tolerance(period_qpc, qpc_freq()));
     // Cap decisions for the private trace: (now, anchor, slot, wait until,
     // wake).
     let mut cap_trace: Vec<(i64, i64, i64, Option<i64>, i64)> = Vec::with_capacity(max_frames);
@@ -389,11 +390,17 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let play_start = clock.now_us() + COUNTDOWN_US;
     let mut armed = false;
     while !shared.stop.load(Ordering::Relaxed) {
+        let mut wake = Wake::Late;
         if let Some(h) = waitable {
+            // Already signaled (the previous frame overran its vblank): the
+            // frame is released late, not by a vblank.
             // SAFETY: the waitable object belongs to the live swap chain.
-            let r = unsafe { WaitForSingleObject(h, 1000) };
-            if r != WAIT_OBJECT_0 {
-                continue;
+            if unsafe { WaitForSingleObject(h, 0) } != WAIT_OBJECT_0 {
+                // SAFETY: as above.
+                if unsafe { WaitForSingleObject(h, 1000) } != WAIT_OBJECT_0 {
+                    continue;
+                }
+                wake = Wake::Vblank;
             }
         }
         if let Some((timer, k)) = &cap {
@@ -409,6 +416,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
             let (wait, slot) = cap_step(now, anchor, i64::from(*k) * period_qpc, last_slot);
             if let Some(w) = wait {
                 timer.wait_until(w);
+                wake = Wake::CapSlot(slot);
             }
             if cap_trace.len() < cap_trace.capacity() {
                 cap_trace.push((now, anchor, slot, wait, qpc()));
@@ -431,7 +439,8 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
             armed = in_play;
         }
         let load = scene.build(play_us.min(play_len), &mut frame);
-        let predicted_qpc = predictor.predict(t0, dxgi.grid.anchor().map(|a| a.0), period_qpc);
+        let predicted_qpc =
+            predictor.predict(t0, wake, dxgi.grid.anchor().map(|a| a.0), period_qpc);
         let predicted_play = clock.to_us(predicted_qpc) - play_start;
         let shown = if play_us >= 0 {
             bga.step(
@@ -468,7 +477,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         let present_count = dxgi.present_count();
         dxgi.sample();
         if trace.len() < trace.capacity() {
-            trace.push((t0, predicted_qpc, present_count));
+            trace.push((t0, wake_label(wake), predicted_qpc, present_count));
         }
         let us = |q: i64| (q * 1_000_000 / qpc_freq()) as u32;
         rec.frame(
@@ -492,7 +501,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     // Pair DXGI display estimates with frames by present count.
     let by_count: HashMap<u32, i64> = trace
         .iter()
-        .filter_map(|&(_, p, c)| Some((c?, p)))
+        .filter_map(|&(_, _, p, c)| Some((c?, p)))
         .collect();
     let errors: Vec<i64> = dxgi
         .samples
@@ -552,14 +561,23 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     Ok(())
 }
 
+/// Wake kind for the private trace.
+fn wake_label(wake: Wake) -> &'static str {
+    match wake {
+        Wake::Vblank => "vblank",
+        Wake::CapSlot(_) => "cap",
+        Wake::Late => "late",
+    }
+}
+
 /// `private/`: raw QPC values for P5's reconciliation with PresentMon, never
-/// part of the export. `trace.csv` (per frame: start, predicted display,
-/// present count), `dxgi.csv` (frame statistics), `anchors.csv` (refresh
+/// part of the export. `trace.csv` (per frame: start, wake kind, predicted
+/// display, present count), `dxgi.csv` (frame statistics), `anchors.csv` (refresh
 /// grid anchor changes and why), `cap.csv` (per capped frame: decision
 /// time, anchor, slot, wait target, wake time), `qpc.txt` (frequency).
 fn write_private_trace(
     out: &std::path::Path,
-    trace: &[(i64, i64, Option<u32>)],
+    trace: &[(i64, &'static str, i64, Option<u32>)],
     raw: &[(u32, u32, u32, i64)],
     anchors: &[(i64, Option<i64>, i64, &'static str)],
     cap: &[(i64, i64, i64, Option<i64>, i64)],
@@ -567,10 +585,10 @@ fn write_private_trace(
     use std::fmt::Write as _;
     let dir = out.join("private");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mut t = String::from("frame_start_qpc,predicted_display_qpc,present_count\n");
-    for (s, p, c) in trace {
+    let mut t = String::from("frame_start_qpc,wake,predicted_display_qpc,present_count\n");
+    for (s, w, p, c) in trace {
         let c = c.map_or(String::new(), |c| c.to_string());
-        let _ = writeln!(t, "{s},{p},{c}");
+        let _ = writeln!(t, "{s},{w},{p},{c}");
     }
     std::fs::write(dir.join("trace.csv"), t).map_err(|e| e.to_string())?;
     let mut d = String::from("present_count,present_refresh_count,sync_refresh_count,sync_qpc\n");

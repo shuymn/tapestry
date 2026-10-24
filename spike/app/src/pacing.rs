@@ -121,70 +121,84 @@ pub fn cap_needed(cap_hz: u32, refresh_mhz: u32) -> bool {
 /// with and without a cap, using the run's private trace.
 pub const DISPLAY_VBLANKS: i64 = 1;
 
-/// Predicted display time of a frame starting at `now`: the
-/// `DISPLAY_VBLANKS`-th vblank of the display grid after `now` when a sync
-/// anchor is known, else `now + DISPLAY_VBLANKS × period`.
-pub fn predict_display(now: i64, sync_anchor: Option<i64>, period: i64) -> i64 {
-    match sync_anchor {
-        // A frame starts on the vblank that released it (the waitable
-        // wait), give or take wake jitter, so a start up to a quarter period
-        // before a vblank counts as that vblank: plain `floor` flips to the
-        // previous vblank whenever the wake lands a few µs early.
-        Some(a) => floor_grid(now + period / 4, a, period) + DISPLAY_VBLANKS * period,
-        None => now + DISPLAY_VBLANKS * period,
+/// How the render thread was released for a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// The frame-latency waitable object blocked and released the thread at
+    /// a vblank. Measured against the trusted grid, such wakes land up to
+    /// `EARLY_WAKE_TOLERANCE_US` before the vblank they belong to.
+    Vblank,
+    /// The cap timer released the thread for `slot` (a vblank on the cap
+    /// grid). The frame belongs to that vblank or a later one: a timer wake
+    /// may land early, and a late one belongs to the vblank it passed.
+    CapSlot(i64),
+    /// Not released by a vblank (the waitable object was already signaled,
+    /// or there is none): the frame belongs to the latest vblank before it.
+    Late,
+}
+
+/// Early-wake tolerance for `Wake::Vblank`, in µs. Measured: windowed
+/// 59.951 Hz runs (out/p-, s-, mon-DISPLAY2, ~1,000 frames each) had
+/// waitable wakes up to 249 µs before the trusted grid's vblank (1–2% of
+/// frames), and 240.085 Hz runs none before it; this is twice the measured
+/// worst case. It is bounded by `period / 8` (`early_wake_tolerance`) so it
+/// can never move a frame past more than an eighth of a refresh. Wakes by
+/// the cap timer or after an overrun never use it.
+pub const EARLY_WAKE_TOLERANCE_US: i64 = 500;
+
+/// `EARLY_WAKE_TOLERANCE_US` in the unit of `period` (`units_per_s` per
+/// second), at most an eighth of a period.
+pub fn early_wake_tolerance(period: i64, units_per_s: i64) -> i64 {
+    (EARLY_WAKE_TOLERANCE_US * units_per_s / 1_000_000).min(period / 8)
+}
+
+/// The vblank (on the grid `anchor + k × period`) that released a frame
+/// woken at `now`: its identity on the display grid.
+pub fn release_vblank(now: i64, wake: Wake, anchor: i64, period: i64, tolerance: i64) -> i64 {
+    match wake {
+        Wake::Vblank => floor_grid(now + tolerance, anchor, period),
+        // The slot rounded to the display grid (the cap grid may be anchored
+        // on an earlier sync of the same grid).
+        Wake::CapSlot(slot) => {
+            floor_grid(now, anchor, period).max(floor_grid(slot + period / 2, anchor, period))
+        }
+        Wake::Late => floor_grid(now, anchor, period),
     }
 }
 
-/// Frames the grid must disagree with the running target before the target
-/// follows the grid.
-pub const PREDICTION_RESYNC_FRAMES: u32 = 3;
-
-/// Display-time prediction that advances monotonically. With Fifo and
-/// latency 1, each present shows on the vblank after the previous one, so
-/// when presents keep up the target advances by exactly the refreshes
-/// between successive frame starts (a stall advances it by the refreshes
-/// it took). The grid prediction anchors the first target and corrects the
-/// target only after it has disagreed for `PREDICTION_RESYNC_FRAMES` frames
-/// in a row (a re-anchored grid, a lasting phase change, presents dropped by
-/// composition), so a single wake that lands on the other side of a vblank
-/// cannot move it. A target never moves back (it may hold for a frame while
-/// resyncing), so the due BGA frame never skips a frame the display will
-/// not skip.
+/// Display-time prediction from anchored vblank identities. A frame shows
+/// `DISPLAY_VBLANKS` refreshes after the vblank that released it
+/// (`release_vblank`), so successive targets follow the display's own
+/// opportunities: a frame woken late at 1.6 periods belongs to the vblank
+/// at 1 and shows at 2, never inventing a refresh. Every target lies after
+/// `now` (an expired target cannot be chosen), and a target never moves
+/// back: two frames released by one vblank (presents the compositor drops,
+/// a grid re-anchored to another phase) share the earlier target. Without
+/// an anchor the target is `now + DISPLAY_VBLANKS × period`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DisplayPredictor {
-    last: Option<(i64, i64)>,
-    disagree: u32,
+    tolerance: i64,
+    last: Option<i64>,
 }
 
 impl DisplayPredictor {
-    pub fn predict(&mut self, now: i64, sync_anchor: Option<i64>, period: i64) -> i64 {
-        let grid = predict_display(now, sync_anchor, period);
-        let target = match self.last {
-            Some((start, target)) => {
-                let steps = ((now - start) as f64 / period as f64).round().max(1.0) as i64;
-                let expected = target + steps * period;
-                if (grid - expected).abs() < period / 2 {
-                    // Same vblank: take the grid's exact phase (the running
-                    // target may have started off-grid before an anchor
-                    // existed).
-                    self.disagree = 0;
-                    grid.max(target)
-                } else {
-                    self.disagree += 1;
-                    if self.disagree >= PREDICTION_RESYNC_FRAMES {
-                        self.disagree = 0;
-                        // Follow the grid, holding the target rather than
-                        // moving it back when the running target got ahead
-                        // (composition can drop presents at startup).
-                        grid.max(target)
-                    } else {
-                        expected
-                    }
-                }
-            }
-            None => grid,
+    /// `tolerance` from `early_wake_tolerance`, in the unit of the times.
+    pub fn new(tolerance: i64) -> Self {
+        Self {
+            tolerance,
+            last: None,
+        }
+    }
+
+    pub fn predict(&mut self, now: i64, wake: Wake, sync_anchor: Option<i64>, period: i64) -> i64 {
+        let release = match (sync_anchor, wake) {
+            (Some(a), _) => release_vblank(now, wake, a, period, self.tolerance),
+            (None, Wake::CapSlot(slot)) => now.max(slot),
+            (None, _) => now,
         };
-        self.last = Some((now, target));
+        let target = (release + DISPLAY_VBLANKS * period).max(self.last.unwrap_or(i64::MIN));
+        debug_assert!(target > now);
+        self.last = Some(target);
         target
     }
 }
@@ -322,122 +336,267 @@ mod tests {
     #[test]
     fn prediction_uses_the_vblank_grid_when_known() {
         // Grid points 1_000 + k·R; the first after 10_100 is k = 3.
+        let mut p = DisplayPredictor::new(early_wake_tolerance(R, 1_000_000));
         assert_eq!(
-            predict_display(10_100, Some(1_000), R),
+            p.predict(10_100, Wake::Late, Some(1_000), R),
             1_000 + (2 + DISPLAY_VBLANKS) * R
         );
+        let mut p = DisplayPredictor::new(early_wake_tolerance(R, 1_000_000));
         assert_eq!(
-            predict_display(10_100, None, R),
+            p.predict(10_100, Wake::Vblank, None, R),
             10_100 + DISPLAY_VBLANKS * R
         );
     }
 
-    /// Frames released at each vblank of a `num/1000` Hz display, with wake
-    /// jitter of up to ±150 µs (as in the 59.951 Hz trace), showing a 60 fps
-    /// clip: returns (frames whose prediction missed the actual display,
-    /// BGA frames skipped).
-    fn simulate(num: i64, frames: i64) -> (usize, usize) {
-        let period = 1_000_000_000 / num; // µs (num in mHz)
-        let anchor = 0;
-        let mut p = DisplayPredictor::default();
-        let mut rng = spike_core::rng::SplitMix64::new(9);
-        let mut last_index: Option<i64> = None;
-        let (mut wrong, mut skips) = (0, 0);
-        for k in 1..=frames {
-            let vblank = anchor + k * period;
-            let jitter = rng.below(301) as i64 - 150;
-            let start = vblank + jitter;
-            // Shown on the next vblank.
-            let actual = vblank + DISPLAY_VBLANKS * period;
-            let predicted = p.predict(start, Some(anchor), period);
-            if predicted != actual {
-                wrong += 1;
-            }
-            let index = predicted * 60 / 1_000_000;
-            if let Some(l) = last_index
-                && index > l + 1
-            {
-                skips += (index - l - 1) as usize;
-            }
-            last_index = Some(index);
+    #[test]
+    fn the_early_wake_tolerance_is_bounded_and_only_for_vblank_wakes() {
+        assert_eq!(early_wake_tolerance(16_680, 1_000_000), 500);
+        assert_eq!(early_wake_tolerance(R, 1_000_000), 500);
+        // A 1 kHz grid: an eighth of a period.
+        assert_eq!(early_wake_tolerance(1_000, 1_000_000), 125);
+        // QPC units (10 MHz).
+        assert_eq!(early_wake_tolerance(41_652, 10_000_000), 5_000);
+        let tol = early_wake_tolerance(R, 1_000_000);
+        // A waitable wake 250 µs before the vblank at 3R belongs to it.
+        assert_eq!(release_vblank(3 * R - 250, Wake::Vblank, 0, R, tol), 3 * R);
+        // 600 µs before it is a wake for the vblank at 2R.
+        assert_eq!(release_vblank(3 * R - 600, Wake::Vblank, 0, R, tol), 2 * R);
+        // A late wake just before a vblank presents before it.
+        assert_eq!(release_vblank(3 * R - 30, Wake::Late, 0, R, tol), 2 * R);
+        // A cap-timer wake late at 1.8R for the slot at R presents at 2R.
+        assert_eq!(release_vblank(R * 18 / 10, Wake::CapSlot(R), 0, R, tol), R);
+        // A cap-timer wake 300 µs early still belongs to its slot.
+        assert_eq!(
+            release_vblank(2 * R - 300, Wake::CapSlot(2 * R), 0, R, tol),
+            2 * R
+        );
+        let mut p = DisplayPredictor::new(tol);
+        assert_eq!(p.predict(R * 18 / 10, Wake::CapSlot(R), Some(0), R), 2 * R);
+    }
+
+    #[test]
+    fn targets_follow_the_display_opportunities() {
+        // Starts at 0, 1.6R (released late), 2R, 3R show at R, 2R, 3R, 4R:
+        // no invented refresh at 60 Hz.
+        let r = 16_680;
+        let mut p = DisplayPredictor::new(early_wake_tolerance(r, 1_000_000));
+        let starts = [
+            (0, Wake::Vblank),
+            (r * 16 / 10, Wake::Late),
+            (2 * r, Wake::Vblank),
+            (3 * r, Wake::Vblank),
+        ];
+        let targets: Vec<i64> = starts
+            .iter()
+            .map(|&(t, w)| p.predict(t, w, Some(0), r))
+            .collect();
+        assert_eq!(targets, [r, 2 * r, 3 * r, 4 * r]);
+    }
+
+    #[test]
+    fn targets_never_expire_or_move_back() {
+        let mut p = DisplayPredictor::new(early_wake_tolerance(R, 1_000_000));
+        assert_eq!(p.predict(0, Wake::Vblank, Some(0), R), R);
+        // A fractional stall: released late at 2.45R, shown at 3R.
+        assert_eq!(p.predict(R * 245 / 100, Wake::Late, Some(0), R), 3 * R);
+        assert_eq!(p.predict(3 * R - 100, Wake::Vblank, Some(0), R), 4 * R);
+        // A burst within one refresh (presents the compositor drops) holds
+        // the target instead of running ahead.
+        for k in 1..4 {
+            assert_eq!(p.predict(3 * R + k * R / 4, Wake::Late, Some(0), R), 4 * R);
         }
-        (wrong, skips)
+        // A grid re-anchored half a period later: the next target follows
+        // it, after the previous one.
+        let a = R / 2;
+        assert_eq!(p.predict(4 * R, Wake::Vblank, Some(a), R), a + 4 * R);
+        // No anchor at first: one period after the start; the anchored
+        // target that follows takes the grid phase.
+        let mut q = DisplayPredictor::new(early_wake_tolerance(R, 1_000_000));
+        assert_eq!(
+            q.predict(1_000 + R / 3, Wake::Vblank, None, R),
+            1_000 + R / 3 + R
+        );
+        assert_eq!(
+            q.predict(1_000 + R, Wake::Vblank, Some(1_000), R),
+            1_000 + 2 * R
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    struct Scenario {
+        /// Refresh rate in mHz.
+        refresh_mhz: i64,
+        frames: i64,
+        /// Waitable wakes from `early` µs before to `late` µs after the
+        /// vblank.
+        early: i64,
+        late: i64,
+        /// Cap period in refreshes; cap-timer wakes land from 300 µs early
+        /// to 1 ms late.
+        cap_k: Option<i64>,
+        /// Every n-th frame the thread stalls 0.5–1.5 periods after its
+        /// present, so the next wake finds the waitable object signaled.
+        stall_every: Option<i64>,
+        /// Every n-th present is dropped (never displayed).
+        drop_every: Option<i64>,
+    }
+
+    const JITTER: Scenario = Scenario {
+        refresh_mhz: 0,
+        frames: 0,
+        early: 150,
+        late: 150,
+        cap_k: None,
+        stall_every: None,
+        drop_every: None,
+    };
+
+    #[derive(Debug, Default)]
+    struct Outcome {
+        /// Displayed frames whose prediction missed the actual display.
+        wrong: usize,
+        /// Of those, predicted after the actual display.
+        wrong_late: usize,
+        stalls: usize,
+        /// 60 fps clip frames skipped between displayed frames when chosen
+        /// by the prediction, and by the actual display times.
+        skips: usize,
+        skips_actual: usize,
+    }
+
+    /// Fifo with maximum frame latency 1 on a fixed vblank grid (anchor 0):
+    /// the waitable object signals at the previous frame's display, a frame
+    /// presents 0.2–0.4 periods after it runs and shows on the first vblank
+    /// after its present, and each prediction is checked against that.
+    fn simulate(s: Scenario) -> Outcome {
+        let period = 1_000_000_000 / s.refresh_mhz; // µs
+        let mut p = DisplayPredictor::new(early_wake_tolerance(period, 1_000_000));
+        let mut rng = spike_core::rng::SplitMix64::new(9);
+        let mut jit = |lo: i64, hi: i64| rng.below((hi - lo + 1) as u64) as i64 + lo;
+        let (mut ready, mut signal) = (0, 0);
+        let mut last_slot = None;
+        let mut prev_target = i64::MIN;
+        let mut o = Outcome::default();
+        let (mut shown, mut shown_actual) = (vec![], vec![]);
+        for f in 1..=s.frames {
+            let (mut start, mut wake) = if ready < signal {
+                (signal + jit(-s.early, s.late), Wake::Vblank)
+            } else {
+                (ready, Wake::Late)
+            };
+            if let Some(k) = s.cap_k {
+                let (wait, slot) = cap_step(start, 0, k * period, last_slot);
+                last_slot = Some(slot);
+                if let Some(w) = wait {
+                    start = w + jit(-300, 1_000);
+                    wake = Wake::CapSlot(slot);
+                }
+            }
+            let predicted = p.predict(start, wake, Some(0), period);
+            assert!(predicted > start, "expired target at frame {f}");
+            assert!(predicted >= prev_target, "target moved back at frame {f}");
+            prev_target = predicted;
+            // The thread cannot run before the waitable object signaled.
+            let present = start.max(signal) + jit(period / 5, 2 * period / 5);
+            let display = floor_grid(present, 0, period) + period;
+            if !s.drop_every.is_some_and(|d| f % d == 0) {
+                if predicted != display {
+                    o.wrong += 1;
+                    o.wrong_late += usize::from(predicted > display);
+                }
+                shown.push(predicted * 60 / 1_000_000);
+                shown_actual.push(display * 60 / 1_000_000);
+            }
+            signal = display;
+            ready = present;
+            if s.stall_every.is_some_and(|n| f % n == 0) {
+                o.stalls += 1;
+                ready += jit(period / 2, 3 * period / 2);
+            }
+        }
+        let skips = |v: &[i64]| -> usize {
+            v.windows(2)
+                .map(|w| (w[1] - w[0] - 1).max(0) as usize)
+                .sum()
+        };
+        o.skips = skips(&shown);
+        o.skips_actual = skips(&shown_actual);
+        o
     }
 
     #[test]
     fn jitter_around_the_vblank_does_not_skip_bga_frames() {
         // 20 s at 59.951 Hz with a 60 fps clip: only the ~1 frame the rate
         // difference itself skips.
-        let (wrong, skips) = simulate(59_951, 1_199);
-        assert_eq!(wrong, 0);
-        assert!(skips <= 1, "{skips} skips");
+        let o = simulate(Scenario {
+            refresh_mhz: 59_951,
+            frames: 1_199,
+            ..JITTER
+        });
+        assert_eq!(o.wrong, 0);
+        assert!(o.skips <= 1, "{o:?}");
         // 240 Hz: four presents per clip frame, none skipped.
-        let (wrong, skips) = simulate(240_085, 4_800);
-        assert_eq!((wrong, skips), (0, 0));
+        let o = simulate(Scenario {
+            refresh_mhz: 240_085,
+            frames: 4_800,
+            ..JITTER
+        });
+        assert_eq!((o.wrong, o.skips), (0, 0));
+        // The measured early wakes (up to 250 µs) and late ones (up to 1 ms)
+        // are still on time.
+        let o = simulate(Scenario {
+            refresh_mhz: 240_085,
+            frames: 4_800,
+            early: 250,
+            late: 1_000,
+            ..JITTER
+        });
+        assert_eq!((o.wrong, o.skips), (0, 0));
     }
 
     #[test]
-    fn prediction_follows_presents_and_corrects_after_a_stall() {
-        // The first frame has no running target: a wake just before a
-        // vblank still counts as that vblank.
-        let mut q = DisplayPredictor::default();
-        assert_eq!(q.predict(1_000 + R - 30, Some(1_000), R), 1_000 + 2 * R);
-        let mut p = DisplayPredictor::default();
-        assert_eq!(p.predict(1_000, Some(1_000), R), 1_000 + R);
-        assert_eq!(p.predict(1_000 + R - 30, Some(1_000), R), 1_000 + 2 * R);
-        // A stall of three refreshes: the target moves by three.
-        assert_eq!(p.predict(1_000 + 4 * R + 20, Some(1_000), R), 1_000 + 5 * R);
-        // A wake 0.4 period early for the vblank at 6R: two refreshes after
-        // the previous start, shown at 7R.
-        assert_eq!(
-            p.predict(1_000 + 6 * R - 4 * R / 10, Some(1_000), R),
-            1_000 + 7 * R
-        );
-        // A single wake on the far side of a vblank (0.4 period late): one
-        // refresh, not two.
-        assert_eq!(
-            p.predict(1_000 + 6 * R + 4 * R / 10, Some(1_000), R),
-            1_000 + 8 * R
-        );
-        // A lasting phase change of the grid is followed after
-        // `PREDICTION_RESYNC_FRAMES` frames, still moving forward.
-        let a = 1_000 + R / 2;
-        let mut t = 0;
-        let last = 8 + i64::from(PREDICTION_RESYNC_FRAMES) - 1;
-        for k in 8..=last {
-            t = p.predict(1_000 + k * R, Some(a), R);
+    fn capped_wakes_predict_their_slot() {
+        for (refresh_mhz, k) in [(59_951, 2), (240_085, 2), (240_085, 4), (240_085, 8)] {
+            let o = simulate(Scenario {
+                refresh_mhz,
+                frames: 2_400,
+                cap_k: Some(k),
+                ..JITTER
+            });
+            assert_eq!(o.wrong, 0, "{refresh_mhz} k={k}: {o:?}");
+            assert_eq!(o.skips, o.skips_actual, "{refresh_mhz} k={k}: {o:?}");
         }
-        assert_eq!(t, predict_display(1_000 + last * R, Some(a), R));
     }
 
     #[test]
-    fn a_target_started_before_the_anchor_takes_the_grid_phase() {
-        // No anchor yet: start + one period, a third of a period off the
-        // later grid. Once the anchor exists the target snaps to it.
-        let mut p = DisplayPredictor::default();
-        assert_eq!(p.predict(1_000 + R / 3, None, R), 1_000 + R / 3 + R);
-        assert_eq!(p.predict(1_000 + R, Some(1_000), R), 1_000 + 2 * R);
-    }
-
-    #[test]
-    fn a_running_target_that_got_ahead_resyncs_to_the_grid() {
-        // A burst of starts a quarter period apart (presents the compositor
-        // drops) pushes the running target ahead; steady frames then follow
-        // the grid again after `PREDICTION_RESYNC_FRAMES`, never moving back.
-        let mut p = DisplayPredictor::default();
-        let mut t = 0;
-        let mut prev = i64::MIN;
-        for k in 0..4 {
-            t = p.predict(1_000 + k * R / 4, Some(1_000), R);
-            assert!(t >= prev);
-            prev = t;
+    fn stalls_and_dropped_presents_keep_targets_on_the_grid() {
+        for refresh_mhz in [59_951, 240_085] {
+            for cap_k in [None, Some(2)] {
+                // A fractional stall every 50 frames: the late frame may
+                // present after the vblank following its wake, so only
+                // those frames can be mispredicted, and only early.
+                let o = simulate(Scenario {
+                    refresh_mhz,
+                    frames: 2_400,
+                    cap_k,
+                    stall_every: Some(50),
+                    ..JITTER
+                });
+                assert!(o.stalls > 0 && o.wrong <= o.stalls, "{o:?}");
+                assert_eq!(o.wrong_late, 0, "{o:?}");
+                assert!(o.skips <= o.skips_actual + o.wrong, "{o:?}");
+                // Every 7th present dropped: the displayed ones are on time.
+                let o = simulate(Scenario {
+                    refresh_mhz,
+                    frames: 2_400,
+                    cap_k,
+                    drop_every: Some(7),
+                    ..JITTER
+                });
+                assert_eq!(o.wrong, 0, "{o:?}");
+                assert_eq!(o.skips, o.skips_actual, "{o:?}");
+            }
         }
-        for k in 2..20 {
-            t = p.predict(1_000 + k * R, Some(1_000), R);
-            assert!(t >= prev);
-            prev = t;
-        }
-        assert_eq!(t, predict_display(1_000 + 19 * R, Some(1_000), R));
     }
 
     #[test]
