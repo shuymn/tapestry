@@ -57,7 +57,7 @@ pub struct BgaSummary {
     pub decoded: u64,
     pub displayed: u64,
     pub skipped: u64,
-    pub pool_exhausted: u64,
+    pub decoder_waits: u64,
 }
 
 #[derive(Serialize, Default)]
@@ -236,7 +236,7 @@ pub fn summary_common(
             decoded: b.decoded.load(std::sync::atomic::Ordering::Relaxed),
             displayed: b.displayed,
             skipped: b.skipped,
-            pool_exhausted: b.pool_exhausted.load(std::sync::atomic::Ordering::Relaxed),
+            decoder_waits: b.decoder_waits.load(std::sync::atomic::Ordering::Relaxed),
         }),
         dxgi: None,
         app_allocs,
@@ -279,8 +279,8 @@ pub fn print_summary(s: &RenderSummary) {
     }
     if let Some(b) = &s.bga {
         println!(
-            "bga: {}x{} decoded {} displayed {} skipped {} pool-exhausted {}",
-            b.width, b.height, b.decoded, b.displayed, b.skipped, b.pool_exhausted
+            "bga: {}x{} decoded {} displayed {} skipped {} decoder-waits {}",
+            b.width, b.height, b.decoded, b.displayed, b.skipped, b.decoder_waits
         );
     } else {
         println!("bga: off");

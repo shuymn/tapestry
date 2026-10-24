@@ -45,7 +45,7 @@ mod imp {
         free: SyncSender<usize>,
         stop: Arc<AtomicBool>,
         pub decoded: Arc<AtomicU64>,
-        pub pool_exhausted: Arc<AtomicU64>,
+        pub decoder_waits: Arc<AtomicU64>,
         /// Received but not yet due.
         pending: Option<usize>,
         pub skipped: u64,
@@ -88,7 +88,7 @@ mod imp {
             }
             let stop = Arc::new(AtomicBool::new(false));
             let decoded = Arc::new(AtomicU64::new(0));
-            let pool_exhausted = Arc::new(AtomicU64::new(0));
+            let decoder_waits = Arc::new(AtomicU64::new(0));
             let worker = Worker {
                 path: path.to_owned(),
                 slots: slots.clone(),
@@ -96,7 +96,7 @@ mod imp {
                 free: free_rx,
                 stop: stop.clone(),
                 decoded: decoded.clone(),
-                pool_exhausted: pool_exhausted.clone(),
+                decoder_waits: decoder_waits.clone(),
             };
             std::thread::Builder::new()
                 .name("bga-decode".into())
@@ -115,7 +115,7 @@ mod imp {
                 free,
                 stop,
                 decoded,
-                pool_exhausted,
+                decoder_waits,
                 pending: None,
                 skipped: 0,
                 displayed: 0,
@@ -195,7 +195,7 @@ mod imp {
         free: Receiver<usize>,
         stop: Arc<AtomicBool>,
         decoded: Arc<AtomicU64>,
-        pool_exhausted: Arc<AtomicU64>,
+        decoder_waits: Arc<AtomicU64>,
     }
 
     impl Worker {
@@ -290,7 +290,7 @@ mod imp {
                 let i = match self.free.try_recv() {
                     Ok(i) => i,
                     Err(_) => {
-                        self.pool_exhausted.fetch_add(1, Ordering::Relaxed);
+                        self.decoder_waits.fetch_add(1, Ordering::Relaxed);
                         match self.free.recv() {
                             Ok(i) => i,
                             Err(_) => return Ok(()),
@@ -334,7 +334,7 @@ pub struct Bga {
     pub width: u32,
     pub height: u32,
     pub decoded: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub pool_exhausted: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub decoder_waits: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub skipped: u64,
     pub displayed: u64,
 }
