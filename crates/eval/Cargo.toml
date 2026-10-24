@@ -1,0 +1,17 @@
+[package]
+name = "eval"
+version = "0.0.0"
+description = "Pure evaluator: (chart, input log, preset) to judgment event stream."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# `cargo xtask check-arch` (R1) rejects any dependency outside `bms-model`,
+# `rules`, and the reviewed allowlist in `xtask/src/arch.rs`.
+[dependencies]
+bms-model.workspace = true
+rules.workspace = true
+
+[lints]
+workspace = true

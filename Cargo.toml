@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shuymn/tapestry"
+publish = false
+
+[workspace.dependencies]
+bms-model = { path = "crates/bms-model" }
+rules = { path = "crates/rules" }
+eval = { path = "crates/eval" }
+
+# xtask (dev tooling, never shipped)
+cargo_metadata = "0.23.1"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

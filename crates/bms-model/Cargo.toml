@@ -1,0 +1,11 @@
+[package]
+name = "bms-model"
+version = "0.0.0"
+description = "Chart model shared by the parser, the evaluator, and the player."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

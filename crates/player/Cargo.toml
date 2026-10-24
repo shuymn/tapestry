@@ -1,0 +1,29 @@
+[package]
+name = "player"
+version = "0.0.0"
+description = "The Windows game executable."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tapestry"
+path = "src/main.rs"
+
+# Excluded from `cargo xtask portable`; checked by `cargo xtask check-arch` (R2).
+[package.metadata.tapestry]
+windows-only = true
+
+[features]
+default = []
+# Development features. Never enabled in production builds (R3).
+dev-tools = []
+
+[dependencies]
+bms-model.workspace = true
+eval.workspace = true
+rules.workspace = true
+
+[lints]
+workspace = true
