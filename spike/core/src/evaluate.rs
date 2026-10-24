@@ -1,4 +1,5 @@
-//! Validity V1–V7, gates G1–G7, O1, O2 (design §3.3, §3.4).
+//! Matrix eligibility M1, validity V1–V8, gates G1–G7, O1, O2 (design
+//! §3.3, §3.4).
 //!
 //! `evaluate` turns a `RunData` into a `Summary`. Exit code: 2 if any
 //! validity check fails, otherwise 1 if any applicable gate fails,
@@ -423,14 +424,14 @@ fn v7(run: &RunData) -> Check {
     {
         r.push("obs-post-roll");
     }
-    let enc = s.encoder.clone().unwrap_or_default();
-    let family_ok = match (run.info.obs_encoder, enc.family) {
+    let enc = s.encoder.as_ref();
+    let family_ok = match (run.info.obs_encoder, enc.and_then(|e| e.family)) {
         (Some(EncoderClass::X264), Some(EncoderFamily::X264)) => true,
         (Some(EncoderClass::Hardware), Some(f)) => f != EncoderFamily::X264,
         _ => false,
     };
     let video_ok = s.video.as_ref().is_some_and(|v| v.matches_procedure());
-    if !(family_ok && enc.matches_procedure() && video_ok) {
+    if !(family_ok && enc.is_some_and(|e| e.matches_procedure()) && video_ok) {
         r.push("obs-settings-mismatch");
     }
     if s.bandwidth_dropped.unwrap_or(0) > 0 {
@@ -449,18 +450,25 @@ fn v7(run: &RunData) -> Check {
     check("V7", r)
 }
 
-/// Times must reach within `edge` of both ends of play and, with
-/// `max_gap`, have no larger hole inside play.
-fn spans(times: &[i64], start: i64, end: i64, edge: i64, max_gap: Option<i64>) -> bool {
-    let (Some(&a), Some(&b)) = (times.first(), times.last()) else {
+/// The times of `rows` (sorted) must reach within `edge` of both ends of
+/// play and, with `max_gap`, have no larger hole inside play.
+fn spans<T>(
+    rows: &[T],
+    time: impl Fn(&T) -> i64,
+    (start, end): (i64, i64),
+    edge: i64,
+    max_gap: Option<i64>,
+) -> bool {
+    let (Some(a), Some(b)) = (rows.first(), rows.last()) else {
         return false;
     };
-    a <= start + edge
-        && b >= end - edge
+    time(a) <= start + edge
+        && time(b) >= end - edge
         && max_gap.is_none_or(|g| {
-            times
-                .windows(2)
-                .all(|w| w[1] - w[0] <= g || w[1] <= start || w[0] >= end)
+            rows.windows(2).all(|w| {
+                let (a, b) = (time(&w[0]), time(&w[1]));
+                b - a <= g || b <= start || a >= end
+            })
         })
 }
 
@@ -473,13 +481,18 @@ fn complete(c: StreamCount, rows: usize) -> bool {
 /// stream (one sample cannot satisfy G4, V2 or G7).
 fn v8(run: &RunData) -> Check {
     let tl = run.info.timeline;
-    let (start, end) = (tl.play_start_us, tl.play_end_us());
+    let play = (tl.play_start_us, tl.play_end_us());
     let mut r = vec![];
     let s = &run.streams;
     let frame_us = 1_000_000 / i64::from(refresh_class(run).map_or(60, |c| target(run, c)));
-    let frames: Vec<i64> = run.frames.iter().map(|f| f.render_us).collect();
-    if !complete(s.frames, frames.len())
-        || !spans(&frames, start, end, EDGE_PERIODS * frame_us, None)
+    if !complete(s.frames, run.frames.len())
+        || !spans(
+            &run.frames,
+            |f| f.render_us,
+            play,
+            EDGE_PERIODS * frame_us,
+            None,
+        )
     {
         r.push("frames-incomplete");
     }
@@ -489,25 +502,23 @@ fn v8(run: &RunData) -> Check {
     {
         r.push("input-incomplete");
     }
-    let periods: Vec<i64> = run.audio_periods.iter().map(|p| p.t_us).collect();
-    if !complete(s.audio_periods, periods.len())
+    if !complete(s.audio_periods, run.audio_periods.len())
         || !spans(
-            &periods,
-            start,
-            end,
+            &run.audio_periods,
+            |p| p.t_us,
+            play,
             EDGE_PERIODS * i64::from(run.info.audio_period_us),
             Some(MAX_AUDIO_PERIOD_GAP_US),
         )
     {
         r.push("audio-periods-incomplete");
     }
-    let due: Vec<i64> = run.bga.iter().map(|b| b.due_us).collect();
     if bga_on(run)
-        && (!complete(s.bga, due.len())
+        && (!complete(s.bga, run.bga.len())
             || !spans(
-                &due,
-                start,
-                end,
+                &run.bga,
+                |b| b.due_us,
+                play,
                 EDGE_PERIODS * BGA_FRAME_US,
                 Some(EDGE_PERIODS * BGA_FRAME_US),
             ))

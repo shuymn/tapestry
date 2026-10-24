@@ -427,6 +427,9 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
 /// so `a-b` stays one name) where neither neighbour is alphanumeric, so a
 /// 2-letter user name is found as a word but not inside a longer word.
 fn contains_name(text: &str, names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
     let lower = text.to_lowercase();
     names.iter().any(|n| {
         let n = n.trim().to_lowercase();
@@ -661,9 +664,10 @@ pub struct Recomputed {
     pub matches_recorded: bool,
 }
 
-/// `report --from-export`: scans the export (no private context is known
-/// off the PC, so only paths, keys and files are checked), recomputes the
-/// summary from the derived data and compares it with the recorded one.
+/// `report --from-export`: scans the export, recomputes the summary from the
+/// derived data and compares it with the recorded one. No private context
+/// is known off the PC, so the scan checks paths, keys, files and the
+/// structural time and duration ranges, but not names or raw QPC values.
 pub fn recompute(e: &Export) -> Result<Recomputed, ExportError> {
     let findings = scan(e, &ScanContext::default());
     if !findings.is_empty() {

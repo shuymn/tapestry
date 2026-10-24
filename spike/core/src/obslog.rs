@@ -263,6 +263,13 @@ fn end_ownership(sessions: &mut [Raw]) {
     sessions.iter_mut().for_each(|r| r.owns_lag = false);
 }
 
+/// Start and stop marker prefixes of outputs other than the stream.
+const OTHER_OUTPUT_MARKERS: [(&str, &str); 3] = [
+    ("==== Recording Start", "==== Recording Stop"),
+    ("==== Replay Buffer Start", "==== Replay Buffer Stop"),
+    ("==== Virtual Camera Start", "==== Virtual Camera Stop"),
+];
+
 #[derive(Clone, Copy, PartialEq)]
 enum Block {
     None,
@@ -370,14 +377,14 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
             continue;
         }
 
-        for name in ["Recording", "Replay Buffer", "Virtual Camera"] {
-            if msg.starts_with(&format!("==== {name} Start")) {
+        for (start, stop) in OTHER_OUTPUT_MARKERS {
+            if msg.starts_with(start) {
                 end_ownership(&mut sessions);
                 others_running += 1;
                 if open && let Some(r) = sessions.last_mut() {
                     r.s.other_output_active = true;
                 }
-            } else if msg.starts_with(&format!("==== {name} Stop")) {
+            } else if msg.starts_with(stop) {
                 others_running = others_running.saturating_sub(1);
             }
         }
