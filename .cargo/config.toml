@@ -1,2 +1,6 @@
 [alias]
-xtask = "run --quiet --locked --package xtask --"
+# xtask builds into its own target dir so that cargo commands it runs (such as
+# `cargo xtask portable test`) never overwrite the running xtask executable,
+# which Windows does not allow. The path is relative to the current directory,
+# so run `cargo xtask` from the repository root.
+xtask = "run --quiet --locked --target-dir target/xtask --package xtask --"
