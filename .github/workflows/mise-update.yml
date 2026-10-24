@@ -150,9 +150,8 @@ jobs:
               -F body=@"$RUNNER_TEMP/body.md")
             echo "opened #$(printf '%s' "$pr" | jq -r .number)"
           fi
-          # The API refuses to enable auto-merge on a PR that is already
-          # mergeable (CI passed after an earlier run failed to enable it);
-          # `gh pr merge --auto` merges such a PR at once instead.
+          # --auto enables auto-merge, or merges at once if the PR already
+          # meets the required checks.
           if [ "$(printf '%s' "$pr" | jq '.auto_merge == null')" = true ]; then
             gh pr merge -R "$repo" --auto --merge "$(printf '%s' "$pr" | jq -r .number)"
           fi
