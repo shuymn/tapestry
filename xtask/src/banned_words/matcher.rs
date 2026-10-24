@@ -45,6 +45,8 @@ pub fn parse_list(name: &str, text: &str) -> Result<Vec<Term>, String> {
     let mut terms: Vec<Term> = Vec::new();
     let mut errors = Vec::new();
     let mut seen: Vec<(String, usize)> = Vec::new();
+    // Editors on Windows may save the list with a UTF-8 BOM.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let normalized = nfkc(raw);
@@ -278,6 +280,14 @@ mod tests {
         let err = parse_list("list", "# only a header\n\n").unwrap_err();
         assert_eq!(err, "list: list has no terms");
         assert!(parse_list("list", "\u{3000}\n").is_err());
+    }
+
+    #[test]
+    fn leading_bom_is_ignored() {
+        let terms = parse_list("list", "\u{FEFF}zorblax\n").unwrap();
+        assert_eq!(find(&terms, "Zorblax").len(), 1);
+        let terms = parse_list("list", "\u{FEFF}# header\nzorblax\n").unwrap();
+        assert_eq!(terms.len(), 1);
     }
 
     #[test]
