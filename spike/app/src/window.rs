@@ -538,9 +538,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<u8, String
     summary.other_displays = paths.iter().filter(|p| !on(p)).cloned().collect();
     summary.refresh_mhz_used = Some(refresh_mhz);
     summary.notes = vec![
-        "G7 'displayed' means shown by a presented frame; P5 reconciles it with PresentMon display rows".into(),
+        "bga.csv 'displayed' means shown by a presented frame predicted on screen in play; with a PresentMon capture, report decides G7 from its display rows".into(),
         format!(
-            "display prediction uses DISPLAY_VBLANKS = {DISPLAY_VBLANKS}, uncalibrated; P5 calibrates it against PresentMon at 60 and 240 Hz with and without a cap using private/trace.csv"
+            "display prediction uses DISPLAY_VBLANKS = {DISPLAY_VBLANKS}, calibrated for fullscreen (independent flip); a composed window is not predicted by a fixed count"
         ),
     ];
     summary.events = shared.events.lock().map_err(|e| e.to_string())?.clone();

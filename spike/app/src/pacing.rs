@@ -113,12 +113,17 @@ pub fn cap_needed(cap_hz: u32, refresh_mhz: u32) -> bool {
     u64::from(cap_hz) * 1000 < u64::from(refresh_mhz)
 }
 
-/// Vblanks between a frame's start and its display. UNCALIBRATED: an
-/// empirical value from local 59.951 Hz runs (Fifo, maximum frame latency
-/// 1, waitable-object wait), where the DXGI display estimates fell on the
-/// first vblank after the frame started once the grid used the exact
-/// refresh rational. P5 calibrates it against PresentMon at 60 and 240 Hz,
-/// with and without a cap, using the run's private trace.
+/// Vblanks between the vblank that released a frame and its display.
+/// Calibrated against PresentMon display rows (borderless fullscreen, Fifo,
+/// maximum frame latency 1): at 240.085 and 59.951 Hz, uncapped and capped
+/// (120 on 240 Hz; 60 and 30 on 60 Hz), every frame whose GPU work ended
+/// before its predicted vblank was displayed on it (independent flip and
+/// hardware-composed independent flip); the frames displayed 1–2 refreshes
+/// later all finished their GPU work after it (missed deadlines, not
+/// prediction error). A composed window (DWM "Composed: Flip") has no fixed
+/// count: displays 3–12 refreshes later at 240 Hz, and most presents not
+/// displayed at all in a 60 Hz window, so windowed predictions are
+/// diagnostic only and G7 uses PresentMon's display rows.
 pub const DISPLAY_VBLANKS: i64 = 1;
 
 /// How the render thread was released for a frame.
@@ -223,8 +228,10 @@ impl DisplayPredictor {
 }
 
 /// BGA frames on screen during play: the index each presented frame
-/// showed, kept when its display time (predicted, until P5 reconciles it
-/// with PresentMon) lies in the play window `[play_start, play_end)`.
+/// showed, kept when its predicted display time lies in the play window
+/// `[play_start, play_end)`. These are the app's own G7 records; with a
+/// PresentMon capture `evaluate` decides G7 from the capture's display rows
+/// instead and counts the disagreements.
 /// Selecting by present time instead would drop index 0 in every run: the
 /// frames that show it during play were presented in the countdown, and
 /// the first frame presented in play reaches the screen after index 0's
