@@ -6,10 +6,34 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = ["ffmpeg"]
+# BGA decode and the FFmpeg license report. Dynamically linked against the
+# LGPL shared build from scripts/fetch-tools.sh (FFMPEG_DIR in
+# .cargo/config.toml); building it needs libclang (bindgen). Without it the
+# rest of the app still builds (`--no-default-features`).
+ffmpeg = ["dep:ffmpeg-next"]
+
 [dependencies]
-# Dynamically linked against the LGPL shared build from scripts/fetch-tools.sh
-# (FFMPEG_DIR in .cargo/config.toml); building it needs libclang (bindgen).
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
+bytemuck = { version = "1", features = ["derive"] }
+csv.workspace = true
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format"], optional = true }
+pollster = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+spike-core = { path = "../core" }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+wgpu-hal = { version = "30", features = ["dx12"] }
+winit = "0.30"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+] }
 
 [lints]
 workspace = true

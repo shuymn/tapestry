@@ -23,13 +23,23 @@ mise exec -- cargo fmt --all --check
 mise exec -- cargo clippy "${packages[@]}" --all-targets --locked -- -D warnings
 mise exec -- cargo test "${packages[@]}" --locked
 
-# App smoke. P2 adds the WARP offscreen run here
-# (`run --offscreen 1920x1080 --adapter warp --audio null --frames 300`).
+# App smoke: `--version` reports LGPL FFmpeg, then the WARP offscreen run
+# (300 frames on a virtual 60 Hz clock over a generated 3 s BGA clip) must
+# use the software adapter, decode and show BGA frames, and read back a
+# non-blank last frame.
 if [ "${SPIKE_SKIP_APP:-0}" != 1 ]; then
     mise exec -- cargo build -p tapestry-spike --locked
-    version=$(target/debug/tapestry-spike.exe --version)
+    exe=target/debug/tapestry-spike.exe
+    version=$("$exe" --version)
     echo "$version"
     grep -q '^ffmpeg license: LGPL$' <<<"$version"
+    smoke_dir=target/smoke
+    "$exe" gen-assets --ffmpeg third_party/ffmpeg/bin/ffmpeg.exe --out "$smoke_dir/assets" --seconds 3
+    smoke=$("$exe" run --offscreen 1920x1080 --adapter warp --audio null --frames 300         --bga "$smoke_dir/assets/bga.mp4" --out "$smoke_dir/run")
+    echo "$smoke"
+    grep -q '^adapter: Microsoft Basic Render Driver ' <<<"$smoke"
+    grep -q -E '^bga: 1920x1080 decoded [1-9][0-9]* displayed [1-9]' <<<"$smoke"
+    grep -q '^readback: non-blank ' <<<"$smoke"
 fi
 
 cd "$repo_root"
