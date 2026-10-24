@@ -178,9 +178,15 @@ fn bga_on(run: &RunData) -> bool {
 /// Nominal G1 target: the class for R1 and for standard-profile OBS runs;
 /// the cap only for streaming-profile OBS runs and diagnostics.
 fn target(run: &RunData, class: u32) -> u32 {
+    g1_cap(run).unwrap_or(class)
+}
+
+/// The cap that sets G1's target: none for R1 and standard-profile OBS runs
+/// (the refresh rate is the target), the run's cap otherwise.
+fn g1_cap(run: &RunData) -> Option<u32> {
     match (run.info.kind, run.info.profile) {
-        (RunKind::Baseline, _) | (RunKind::Obs, Profile::Standard) => class,
-        _ => run.info.fps_cap.unwrap_or(class),
+        (RunKind::Baseline, _) | (RunKind::Obs, Profile::Standard) => None,
+        _ => run.info.fps_cap,
     }
 }
 
@@ -193,9 +199,8 @@ fn target(run: &RunData, class: u32) -> u32 {
 fn target_period_ms(run: &RunData, class: u32) -> f64 {
     let rf = run.info.refresh;
     let period = 1000.0 * rf.den as f64 / rf.num as f64;
-    match (run.info.kind, run.info.profile, run.info.fps_cap) {
-        (RunKind::Baseline, _, _) | (RunKind::Obs, Profile::Standard, _) => period,
-        (_, _, Some(cap)) if cap > 0 => period * f64::from(class) / f64::from(cap),
+    match g1_cap(run) {
+        Some(cap) if cap > 0 => period * f64::from(class) / f64::from(cap),
         _ => period,
     }
 }
@@ -281,7 +286,6 @@ fn v2(run: &RunData) -> Check {
     check("V2", r)
 }
 
-/// The refresh class when the exact rate is in `[class, class × 1.001]`.
 /// The run's class when its monitor's exact refresh rate is within ±0.1%
 /// of the nominal class rate (59.94–60.06 Hz, 239.76–240.24 Hz) and VRR is
 /// off.

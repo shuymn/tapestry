@@ -189,8 +189,6 @@ pub fn device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), St
 /// silent gap.
 pub struct Recorder {
     pub frames: Vec<SpikeFrame>,
-    /// BGA frame index each recorded frame showed.
-    pub shown: Vec<Option<u64>>,
     pub frame_records: StreamCount,
     pub instances_max: u32,
     pub instances_dropped: u64,
@@ -200,14 +198,13 @@ impl Recorder {
     pub fn new(max_frames: usize) -> Self {
         Self {
             frames: Vec::with_capacity(max_frames),
-            shown: Vec::with_capacity(max_frames),
             frame_records: StreamCount::default(),
             instances_max: 0,
             instances_dropped: 0,
         }
     }
 
-    pub fn frame(&mut self, f: SpikeFrame, shown: Option<u64>, frame: &Frame, load: FrameLoad) {
+    pub fn frame(&mut self, f: SpikeFrame, frame: &Frame, load: FrameLoad) {
         self.instances_max = self
             .instances_max
             .max((frame.alpha.len() + frame.additive.len()) as u32);
@@ -215,7 +212,6 @@ impl Recorder {
         self.frame_records.produced += 1;
         if self.frames.len() < self.frames.capacity() {
             self.frames.push(f);
-            self.shown.push(shown);
         } else {
             self.frame_records.lost += 1;
         }
@@ -287,7 +283,7 @@ impl BgaState {
 }
 
 /// G7 due records for a play of `play_us` from what presented frames
-/// showed (`rec.shown` for frames with `presented`).
+/// showed (`bga_index` of frames with `presented`).
 pub fn bga_due(
     rec: &Recorder,
     bga: &BgaState,
@@ -303,9 +299,8 @@ pub fn bga_due(
     let shown = rec
         .frames
         .iter()
-        .zip(&rec.shown)
-        .filter(|(f, _)| presented(f))
-        .filter_map(|(_, s)| *s);
+        .filter(|f| presented(f))
+        .filter_map(|f| f.bga_index);
     bga_due_records(play_start, interval, due_count, shown)
 }
 
@@ -555,7 +550,6 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
                 bga_frame_shown: shown.is_some(),
                 bga_index: shown,
             },
-            shown,
             &frame,
             load,
         );

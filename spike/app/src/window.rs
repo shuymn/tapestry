@@ -235,11 +235,8 @@ struct Dxgi {
     /// PresentRefreshCount, SyncRefreshCount, SyncQPCTime.
     raw: Vec<(u32, u32, u32, i64)>,
     summary: DxgiSummary,
-    /// Latest valid SyncQPCTime and its SyncRefreshCount whose timing
-    /// agrees with a fixed refresh grid: the vblank-grid anchor.
-    sync_anchor: Option<i64>,
-    sync_count: Option<u32>,
-    /// Trusted refresh grid.
+    /// Trusted refresh grid; its anchor (latest trusted SyncQPCTime and
+    /// SyncRefreshCount) anchors the cap and the prediction.
     grid: GridTracker,
     /// Anchor changes for the private trace: (sync QPC, old, new, reason).
     anchors: Vec<(i64, Option<i64>, i64, &'static str)>,
@@ -293,10 +290,6 @@ impl Dxgi {
                 _ => "on-grid",
             };
             self.anchors.push((s.SyncQPCTime, old, q, reason));
-        }
-        if let Some((q, c)) = self.grid.anchor() {
-            self.sync_anchor = Some(q);
-            self.sync_count = Some(c);
         }
         self.summary.samples += 1;
         if self.raw.len() < self.raw.capacity() {
@@ -371,8 +364,6 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         samples: Vec::with_capacity(max_frames),
         raw: Vec::with_capacity(max_frames),
         summary: DxgiSummary::default(),
-        sync_anchor: None,
-        sync_count: None,
         grid: GridTracker::default(),
         anchors: Vec::with_capacity(max_frames),
     };
@@ -406,9 +397,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         }
         if let Some((timer, k)) = &cap {
             let now = qpc();
-            let anchor = match (dxgi.sync_anchor, dxgi.sync_count) {
+            let anchor = match dxgi.grid.anchor() {
                 // Keep the cap's refresh-count phase across re-anchoring.
-                (Some(q), Some(c)) => {
+                Some((q, c)) => {
                     let phase = *cap_phase.get_or_insert(c % k);
                     cap_anchor(q, c, phase, *k, period_qpc)
                 }
@@ -439,7 +430,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
             armed = in_play;
         }
         let load = scene.build(play_us.min(play_len), &mut frame);
-        let predicted_qpc = predict_display(t0, dxgi.sync_anchor, period_qpc);
+        let predicted_qpc = predict_display(t0, dxgi.grid.anchor().map(|a| a.0), period_qpc);
         let predicted_play = clock.to_us(predicted_qpc) - play_start;
         let shown = if play_us >= 0 {
             bga.step(
@@ -492,7 +483,6 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
                 bga_frame_shown: shown.is_some(),
                 bga_index: shown,
             },
-            shown,
             &frame,
             load,
         );

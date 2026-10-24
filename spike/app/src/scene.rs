@@ -232,15 +232,14 @@ impl Scene {
     }
 
     /// Hits every note up to `play_us` (time since play start, looping the
-    /// chart). Returns the number of notes hit.
-    fn advance(&mut self, play_us: i64) -> u32 {
+    /// chart).
+    fn advance(&mut self, play_us: i64) {
         let loop_base = play_us.div_euclid(CHART_LEN_US) * CHART_LEN_US;
         let chart_us = play_us - loop_base;
         if chart_us < self.last_chart_us {
             self.next_note = 0;
         }
         self.last_chart_us = chart_us;
-        let mut n = 0;
         while let Some(note) = self.chart.notes.get(self.next_note)
             && note.time_us <= chart_us
         {
@@ -253,9 +252,7 @@ impl Scene {
             self.hit_count += 1;
             self.next_note += 1;
             self.combo += 1;
-            n += 1;
         }
-        n
     }
 
     /// Builds frame `out` for play time `play_us` (negative during the

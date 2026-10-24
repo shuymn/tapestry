@@ -28,7 +28,9 @@ mise exec -- cargo test "${packages[@]}" --locked
 # use the software adapter, show every due BGA frame (the run fails on a
 # decoder error or stall), and read back non-blank frames.
 if [ "${SPIKE_SKIP_APP:-0}" != 1 ]; then
-    mise exec -- cargo build -p tapestry-spike --locked
+    # The test profile's optimized dependencies are already built by the
+    # test step above; reuse them for the smoke instead of a second build.
+    mise exec -- cargo build -p tapestry-spike --profile test --locked
     exe=target/debug/tapestry-spike.exe
     version=$("$exe" --version)
     echo "$version"

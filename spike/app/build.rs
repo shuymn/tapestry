@@ -40,7 +40,6 @@ fn main() {
         out.join("always-rerun.absent").display()
     );
 
-    println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     let Ok(ffmpeg) = env::var("FFMPEG_DIR") else {
         return;
     };
@@ -65,7 +64,6 @@ fn copy_dlls(from: &Path, to: &Path) {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
         {
-            println!("cargo:rerun-if-changed={}", path.display());
             let dest = to.join(entry.file_name());
             fs::copy(&path, &dest)
                 .unwrap_or_else(|e| panic!("copy {} to {}: {e}", path.display(), dest.display()));

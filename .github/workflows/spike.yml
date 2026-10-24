@@ -54,7 +54,7 @@ jobs:
         working-directory: spike
         run: |
           tree() {
-            mise exec -- cargo build -p tapestry-spike --locked
+            mise exec -- cargo build -p tapestry-spike --profile test --locked
             v=$(target/debug/tapestry-spike.exe --version)
             grep '^commit: ' <<<"$v" | grep -o '([a-z]*)$'
           }
