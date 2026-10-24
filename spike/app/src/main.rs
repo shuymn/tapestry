@@ -152,6 +152,7 @@ pub fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         monitor: None,
         audio: None,
         countdown_us: run::COUNTDOWN_US,
+        gpu_timestamps: false,
         meta: rundata::RunMeta {
             profile: spike_core::run::Profile::Standard,
             kind: spike_core::run::RunKind::Diagnostic,
@@ -212,6 +213,7 @@ pub fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "bga" => a.bga = Some(PathBuf::from(v)),
             "monitor" => a.monitor = Some(v.to_owned()),
             "countdown-s" => a.countdown_us = num::<i64>(k, v)? * 1_000_000,
+            "gpu-timestamps" => a.gpu_timestamps = v == "on",
             "profile" => {
                 a.meta.profile = match v {
                     "standard" => spike_core::run::Profile::Standard,

@@ -53,6 +53,8 @@ pub struct RunArgs {
     pub audio: Option<crate::audio::AudioArgs>,
     /// Countdown before play (OBS runs use a longer one).
     pub countdown_us: i64,
+    /// Diagnostic GPU timestamps (`private/gpu_timestamps.csv`).
+    pub gpu_timestamps: bool,
     pub meta: crate::rundata::RunMeta,
     pub out: PathBuf,
 }
@@ -185,9 +187,21 @@ pub fn instance() -> wgpu::Instance {
     wgpu::Instance::new(desc)
 }
 
-pub fn device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-        .map_err(|e| format!("request device: {e}"))
+/// The device; `timestamps` requests the diagnostic timestamp features
+/// when the adapter has them.
+pub fn device(
+    adapter: &wgpu::Adapter,
+    timestamps: bool,
+) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    let mut desc = wgpu::DeviceDescriptor::default();
+    if timestamps
+        && adapter
+            .features()
+            .contains(crate::render::TIMESTAMP_FEATURES)
+    {
+        desc.required_features = crate::render::TIMESTAMP_FEATURES;
+    }
+    pollster::block_on(adapter.request_device(&desc)).map_err(|e| format!("request device: {e}"))
 }
 
 /// Per-run recording; buffers are preallocated and every production attempt
@@ -494,7 +508,7 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
     let instance = instance();
     let adapter = adapter(&instance, &args.adapter, None)?;
     let info = adapter.get_info();
-    let (dev, queue) = device(&adapter)?;
+    let (dev, queue) = device(&adapter, false)?;
     let mut bga = BgaState::open(&args.bga)?;
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let dims = bga.bga.as_ref().map(|b| (b.width, b.height));

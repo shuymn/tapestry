@@ -84,7 +84,36 @@ pub struct Renderer {
     atlas_bind: wgpu::BindGroup,
     instances: wgpu::Buffer,
     bga: Option<Bga>,
+    timer: Option<GpuTimer>,
 }
+
+/// Diagnostic GPU timestamps per drawn frame (`--gpu-timestamps`): slots
+/// 0/1 around the BGA plane uploads (two tiny submits around the queue's
+/// pending copies), 2..5 at the render pass's start, after the BGA draw,
+/// after the alpha sprites and at the pass's end. Resolved per frame into
+/// one buffer (256 bytes per frame) and read once after the run.
+struct GpuTimer {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    frame: u32,
+    cap: u32,
+    uploads: Vec<bool>,
+}
+
+/// Per frame: upload, BGA draw, alpha sprites, additive sprites and whole
+/// pass, in GPU µs (`None` where the frame had no upload).
+#[derive(Clone, Copy, Debug)]
+pub struct GpuTimes {
+    pub upload_us: Option<f64>,
+    pub bga_us: f64,
+    pub alpha_us: f64,
+    pub additive_us: f64,
+    pub pass_us: f64,
+}
+
+pub const TIMESTAMP_FEATURES: wgpu::Features = wgpu::Features::TIMESTAMP_QUERY
+    .union(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+    .union(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
 
 fn sprite_pipeline(
     device: &wgpu::Device,
@@ -331,7 +360,91 @@ impl Renderer {
             atlas_bind,
             instances,
             bga,
+            timer: None,
         }
+    }
+
+    /// Turns on the diagnostic timestamps for up to `frames` frames (the
+    /// device must have `TIMESTAMP_FEATURES`).
+    pub fn enable_timestamps(&mut self, frames: u32) {
+        if !self.device.features().contains(TIMESTAMP_FEATURES) {
+            return;
+        }
+        self.timer = Some(GpuTimer {
+            set: self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("gpu timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 8,
+            }),
+            resolve: self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu timestamps"),
+                size: u64::from(frames) * 256,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            frame: 0,
+            cap: frames,
+            uploads: vec![false; frames as usize],
+        });
+    }
+
+    fn stamp(&self, index: u32) {
+        let Some(t) = &self.timer else {
+            return;
+        };
+        let mut e = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        e.write_timestamp(&t.set, index);
+        self.queue.submit([e.finish()]);
+    }
+
+    /// The timestamps of every timed frame, in drawing order.
+    pub fn read_timestamps(&self) -> Vec<GpuTimes> {
+        let Some(t) = &self.timer else {
+            return vec![];
+        };
+        let n = t.frame.min(t.cap);
+        if n == 0 {
+            return vec![];
+        }
+        let size = u64::from(n) * 256;
+        let read = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu timestamps read"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut e = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        e.copy_buffer_to_buffer(&t.resolve, 0, &read, 0, size);
+        self.queue.submit([e.finish()]);
+        let slice = read.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map timestamps"));
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = slice.get_mapped_range().expect("mapped timestamps");
+        let ns = f64::from(self.queue.get_timestamp_period());
+        (0..n as usize)
+            .map(|f| {
+                let q: Vec<u64> = (0..6)
+                    .map(|k| {
+                        let o = f * 256 + k * 8;
+                        u64::from_le_bytes(data[o..o + 8].try_into().expect("8 bytes"))
+                    })
+                    .collect();
+                let us = |a: usize, b: usize| q[b].saturating_sub(q[a]) as f64 * ns / 1000.0;
+                GpuTimes {
+                    upload_us: t.uploads[f].then(|| us(0, 1)),
+                    bga_us: us(2, 3),
+                    alpha_us: us(3, 4),
+                    additive_us: us(4, 5),
+                    pass_us: us(2, 5),
+                }
+            })
+            .collect()
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -348,6 +461,15 @@ impl Renderer {
             return;
         };
         let (w, h) = (bga.width, bga.height);
+        if let Some(t) = &mut self.timer
+            && let Some(u) = t.uploads.get_mut(t.frame as usize)
+        {
+            *u = true;
+        }
+        self.stamp(0);
+        let Some(bga) = &mut self.bga else {
+            return;
+        };
         for (tex, data, pw, ph) in [
             (&bga.planes[0], y, w, h),
             (&bga.planes[1], u, w / 2, h / 2),
@@ -371,10 +493,12 @@ impl Renderer {
             });
         }
         bga.shown = true;
+        // Flushes the pending plane copies, then stamps.
+        self.stamp(1);
     }
 
     /// Records and submits one frame into `target` (letterboxed 16:9).
-    pub fn draw(&self, target: &wgpu::TextureView, size: (u32, u32), frame: &Frame) {
+    pub fn draw(&mut self, target: &wgpu::TextureView, size: (u32, u32), frame: &Frame) {
         let a = frame.alpha.len();
         let b = frame.additive.len();
         scope(Scope::WriteBuffer, || {
@@ -403,7 +527,14 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .timer
+                    .as_ref()
+                    .map(|t| wgpu::RenderPassTimestampWrites {
+                        query_set: &t.set,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(5),
+                    }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -416,13 +547,25 @@ impl Renderer {
                 pass.set_bind_group(0, &bga.bind, &[]);
                 pass.draw(0..3, 0..1);
             }
+            if let Some(t) = &self.timer {
+                pass.write_timestamp(&t.set, 3);
+            }
             pass.set_bind_group(0, &self.atlas_bind, &[]);
             pass.set_vertex_buffer(0, self.instances.slice(..));
             pass.set_pipeline(&self.alpha);
             pass.draw(0..4, 0..a as u32);
+            if let Some(t) = &self.timer {
+                pass.write_timestamp(&t.set, 4);
+            }
             pass.set_pipeline(&self.additive);
             pass.draw(0..4, a as u32..(a + b) as u32);
         });
+        if let Some(t) = &mut self.timer {
+            if t.frame < t.cap {
+                encoder.resolve_query_set(&t.set, 0..6, &t.resolve, u64::from(t.frame) * 256);
+            }
+            t.frame += 1;
+        }
         let cmd = scope(Scope::OtherLibrary, || encoder.finish());
         scope(Scope::Submit, || {
             self.queue.submit([cmd]);

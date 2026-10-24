@@ -288,7 +288,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let refresh_mhz = (u64::from(refresh.0) * 1000 / u64::from(refresh.1.max(1))) as u32;
     let adapter = adapter(&instance, &args.adapter, Some(&surface))?;
     let info = adapter.get_info();
-    let (dev, queue) = device(&adapter)?;
+    let (dev, queue) = device(&adapter, args.gpu_timestamps)?;
     let size = window.inner_size();
     let size = (size.width.max(1), size.height.max(1));
     let mut config = surface
@@ -324,6 +324,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     // Frames: countdown + play + post-play at up to 500 Hz, with margin.
     let max_frames = ((args.countdown_us + play_len + POST_PLAY_US) / 2_000 + 1_000) as usize;
     let mut rec = Recorder::new(max_frames);
+    if args.gpu_timestamps {
+        renderer.enable_timestamps(max_frames as u32);
+    }
     // Private trace per frame: start QPC, wake kind, predicted display QPC,
     // present count.
     let mut trace: Vec<(i64, &'static str, i64, Option<u32>)> = Vec::with_capacity(max_frames);
@@ -528,6 +531,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     write_outputs(&args.out, &rec, &due, &summary)?;
     session::write(&args.out, &played)?;
     write_private_trace(&args.out, &trace, &dxgi.raw, &dxgi.anchors, &cap_trace)?;
+    if args.gpu_timestamps {
+        write_gpu_times(&args.out, &trace, &renderer.read_timestamps())?;
+    }
     let run = rundata::assemble(
         args,
         args.meta,
@@ -543,6 +549,31 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let origin = rundata::Origin::now(clock, play_start, play_len);
     rundata::write(&args.out, &run, &origin)?;
     Ok(())
+}
+
+/// `private/gpu_timestamps.csv`: per drawn frame, its start QPC (the
+/// trace's) and the GPU time of the BGA plane upload, BGA draw, alpha and
+/// additive sprites and the whole pass (µs).
+fn write_gpu_times(
+    out: &std::path::Path,
+    trace: &[(i64, &'static str, i64, Option<u32>)],
+    times: &[crate::render::GpuTimes],
+) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let mut t = String::from(
+        "frame_start_qpc,present_count,upload_us,bga_us,alpha_us,additive_us,pass_us\n",
+    );
+    for (row, g) in trace.iter().zip(times) {
+        let up = g.upload_us.map_or(String::new(), |u| format!("{u:.1}"));
+        let c = row.3.map_or(String::new(), |c| c.to_string());
+        let _ = writeln!(
+            t,
+            "{},{c},{up},{:.1},{:.1},{:.1},{:.1}",
+            row.0, g.bga_us, g.alpha_us, g.additive_us, g.pass_us
+        );
+    }
+    std::fs::create_dir_all(out.join("private")).map_err(|e| e.to_string())?;
+    std::fs::write(out.join("private").join("gpu_timestamps.csv"), t).map_err(|e| e.to_string())
 }
 
 /// Wake kind for the private trace.
