@@ -229,4 +229,16 @@ fn i_short_names_are_checked_as_whole_words() {
     // Inside a longer word it is not that name.
     c.insert("cpu_brand".into(), json!("Synthetic ajkx CPU"));
     assert!(build(&passing_run(), &c, &ctx).is_ok());
+    // Punctuation inside a short name is part of it.
+    let ctx = ScanContext {
+        forbidden_names: vec!["a-b".into()],
+        ..ScanContext::default()
+    };
+    c.insert("cpu_brand".into(), json!("a-b performance plan"));
+    assert!(matches!(
+        build(&passing_run(), &c, &ctx),
+        Err(ExportError::Rejected(f)) if f == vec![Finding::Name(CONDITIONS.into())]
+    ));
+    c.insert("cpu_brand".into(), json!("xa-by performance plan"));
+    assert!(build(&passing_run(), &c, &ctx).is_ok());
 }

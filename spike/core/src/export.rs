@@ -417,14 +417,11 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
 }
 
 /// Every forbidden name, however short: names of 4+ characters match as
-/// substrings, shorter ones as whole alphanumeric tokens (so a 2-letter user
-/// name is found as a word without matching inside every longer word).
+/// substrings; shorter ones match literally (punctuation inside included,
+/// so `a-b` stays one name) where neither neighbour is alphanumeric, so a
+/// 2-letter user name is found as a word but not inside a longer word.
 fn contains_name(text: &str, names: &[String]) -> bool {
     let lower = text.to_lowercase();
-    let tokens: BTreeSet<&str> = lower
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .collect();
     names.iter().any(|n| {
         let n = n.trim().to_lowercase();
         if n.is_empty() {
@@ -432,7 +429,12 @@ fn contains_name(text: &str, names: &[String]) -> bool {
         } else if n.chars().count() >= 4 {
             lower.contains(&n)
         } else {
-            tokens.contains(n.as_str())
+            lower.match_indices(n.as_str()).any(|(i, m)| {
+                let before = lower[..i].chars().next_back();
+                let after = lower[i + m.len()..].chars().next();
+                !before.is_some_and(char::is_alphanumeric)
+                    && !after.is_some_and(char::is_alphanumeric)
+            })
         }
     })
 }
