@@ -17,6 +17,10 @@ eval = { path = "crates/eval" }
 cargo_metadata = "0.23.1"
 tempfile = "3.27.0"
 
+# Used by the `cargo xtask` alias (.cargo/config.toml).
+[profile.xtask]
+inherits = "dev"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
