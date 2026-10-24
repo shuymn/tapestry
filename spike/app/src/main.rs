@@ -32,8 +32,9 @@ static GLOBAL: alloc::Counting = alloc::Counting;
 const USAGE: &str = "usage:
   tapestry-spike --version
   tapestry-spike gen-assets --ffmpeg <exe> --out <dir> [--seconds N]
+  tapestry-spike displays
   tapestry-spike run --out <dir> [--bga <video>] [--fps-cap N] [--loops N | --duration-s N]
-      [--window WxH] [--adapter warp|hardware|low-power | --adapter-name <part>]
+      [--window WxH] [--monitor <part>] [--adapter warp|hardware|low-power | --adapter-name <part>]
       [--offscreen WxH --audio null --frames N]";
 
 fn main() -> ExitCode {
@@ -42,6 +43,10 @@ fn main() -> ExitCode {
         Some("--version") if args.len() == 1 => Ok(version()),
         Some("gen-assets") => gen_assets_cmd(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
+        Some("displays") if args.len() == 1 => {
+            display::print_displays();
+            Ok(ExitCode::SUCCESS)
+        }
         _ => Err(USAGE.to_owned()),
     };
     result.unwrap_or_else(|e| {
@@ -105,6 +110,7 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
         loops: 4,
         fps_cap: None,
         bga: None,
+        monitor: None,
         out: PathBuf::new(),
     };
     let mut out = None;
@@ -132,6 +138,7 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
             "loops" => a.loops = num(k, v)?,
             "fps-cap" => a.fps_cap = Some(num(k, v)?),
             "bga" => a.bga = Some(PathBuf::from(v)),
+            "monitor" => a.monitor = Some(v.to_owned()),
             "out" => out = Some(PathBuf::from(v)),
             _ => return Err(format!("unknown option --{k} {v}\n{USAGE}")),
         }

@@ -9,7 +9,7 @@
 //! instance and surface are created there and moved to the render thread.
 
 use crate::alloc::{self, Scope, Tag, scope};
-use crate::display::{active_paths, pick_refresh};
+use crate::display::{DisplayPath, active_paths, find_display, pick_refresh};
 use crate::pacing::{
     DISPLAY_VBLANKS, GridEvent, GridTracker, cap_anchor, cap_needed, cap_step, predict_display,
 };
@@ -61,14 +61,39 @@ struct Gpu {
     /// Exact refresh rate `(numerator, denominator)` Hz of the window's
     /// display.
     refresh: (u32, u32),
+    /// GDI name of the window's monitor.
+    gdi_name: Option<String>,
 }
 
 impl App {
     fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
+        // The requested monitor, matched against the active displays and
+        // then against winit's monitors by GDI device name.
+        let target = match &self.args.monitor {
+            Some(part) => {
+                let paths = active_paths();
+                let gdi = find_display(part, &paths)?.gdi_name.clone();
+                let m = el
+                    .available_monitors()
+                    .find(|m| m.name().is_some_and(|n| n.eq_ignore_ascii_case(&gdi)))
+                    .ok_or_else(|| format!("no window-system monitor named {gdi}"))?;
+                Some(m)
+            }
+            None => None,
+        };
         let mut attrs = Window::default_attributes().with_title("tapestry-spike");
         attrs = match self.args.window {
-            Some((w, h)) => attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h)),
-            None => attrs.with_fullscreen(Some(Fullscreen::Borderless(None))),
+            Some((w, h)) => {
+                let a = attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                match &target {
+                    Some(m) => {
+                        let p = m.position();
+                        a.with_position(winit::dpi::PhysicalPosition::new(p.x + 40, p.y + 40))
+                    }
+                    None => a,
+                }
+            }
+            None => attrs.with_fullscreen(Some(Fullscreen::Borderless(target.clone()))),
         };
         let window = Arc::new(
             el.create_window(attrs)
@@ -91,6 +116,7 @@ impl App {
             surface,
             window,
             refresh,
+            gdi_name: name,
         };
         let (args, shared, proxy) = (self.args.clone(), self.shared.clone(), self.proxy.clone());
         std::thread::Builder::new()
@@ -296,6 +322,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         surface,
         window,
         refresh,
+        gdi_name,
     } = gpu;
     let refresh_mhz = (u64::from(refresh.0) * 1000 / u64::from(refresh.1.max(1))) as u32;
     let adapter = adapter(&instance, &args.adapter, Some(&surface))?;
@@ -512,7 +539,14 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     ) = heavy_values(&rec, &due, timeline);
     summary.bga = bga.summary(&due);
     summary.dxgi = Some(dxgi.summary);
-    summary.display_refresh = active_paths().iter().map(|p| (p.num, p.den)).collect();
+    let paths = active_paths();
+    let on = |p: &&DisplayPath| {
+        gdi_name
+            .as_deref()
+            .is_some_and(|n| p.gdi_name.eq_ignore_ascii_case(n))
+    };
+    summary.monitor = paths.iter().find(on).cloned();
+    summary.other_displays = paths.iter().filter(|p| !on(p)).cloned().collect();
     summary.refresh_mhz_used = Some(refresh_mhz);
     summary.notes = vec![
         "G7 'displayed' means shown by a presented frame; P5 reconciles it with PresentMon display rows".into(),

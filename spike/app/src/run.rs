@@ -46,6 +46,8 @@ pub struct RunArgs {
     pub loops: u32,
     pub fps_cap: Option<u32>,
     pub bga: Option<PathBuf>,
+    /// Part of the monitor's name or GDI device name to run on.
+    pub monitor: Option<String>,
     pub out: PathBuf,
 }
 
@@ -118,10 +120,12 @@ pub struct RenderSummary {
     pub allocs_scope: String,
     /// Caveats on the values above.
     pub notes: Vec<String>,
-    /// Windowed: exact refresh rationals of the active display paths, and
-    /// the refresh rate (mHz, from winit) the run used for its grid.
-    pub display_refresh: Vec<(u32, u32)>,
+    /// Windowed: the monitor the run is on (exact mode), the refresh rate
+    /// (mHz) its grid used, and the other active monitors' modes (mixed
+    /// refresh rates can affect composition).
+    pub monitor: Option<crate::display::DisplayPath>,
     pub refresh_mhz_used: Option<u32>,
+    pub other_displays: Vec<crate::display::DisplayPath>,
     pub readback_distinct_colors: Option<usize>,
     pub bga_only_readback_distinct_colors: Option<usize>,
     pub events: Vec<RunEvent>,
@@ -442,15 +446,18 @@ pub fn print_summary(s: &RenderSummary) {
         s.app_allocs, s.other_thread_app_allocs, s.library_allocs, s.allocs_scope
     );
     if let Some(mhz) = s.refresh_mhz_used {
-        let modes: Vec<String> = s
-            .display_refresh
-            .iter()
-            .map(|(n, d)| format!("{n}/{d} ({:.5} Hz)", f64::from(*n) / f64::from((*d).max(1))))
-            .collect();
+        let on = s
+            .monitor
+            .as_ref()
+            .map_or("unknown".to_owned(), |m| m.describe());
+        let others: Vec<String> = s.other_displays.iter().map(|d| d.describe()).collect();
         println!(
-            "display: refresh used {} mHz; active paths {}",
-            mhz,
-            modes.join(", ")
+            "display: {on} (grid {mhz} mHz); other displays: {}",
+            if others.is_empty() {
+                "none".to_owned()
+            } else {
+                others.join("; ")
+            }
         );
     }
     for n in &s.notes {
