@@ -1,24 +1,41 @@
 //! `measure`: a windowed run under PresentMon, optionally with OBS
-//! streaming (design §4, §5 P4).
+//! streaming to the bundle's local ingest (design §4, §5 P4).
 //!
-//! 1. Conditions go to `<out>/private/conditions.json`.
-//! 2. PresentMon 2.6 captures this process by name into
-//!    `<out>/private/presentmon.csv` (`--qpc_time` for the run clock,
-//!    `--track_hybrid_present`). It runs unelevated (the logon is in
-//!    Performance Log Users). `--terminate_on_proc_exit` does not fire
-//!    unelevated, so the session is stopped explicitly after the run with
-//!    `--terminate_existing_session --session_name tapestry_spike`.
+//! 1. Conditions go to `<out>/private/conditions.json`, with the PresentMon
+//!    version and the owner-declared GPU power setting (`--gpu-power-mode`;
+//!    the per-program driver setting is not readable without vendor APIs).
+//! 2. Helper processes start, each owned by a `Tool` that stops it however
+//!    `measure` ends (error, early return or panic) and that fails fast if
+//!    the process exits during its start-up check:
+//!    - With `--ingest`, MediaMTX on 127.0.0.1:1935. The port must be free
+//!      first (another instance is never touched), and the listener must
+//!      come up; only the process started here is stopped.
+//!    - `nvidia-smi` samples P-state and clocks every 100 ms into
+//!      `<out>/private/nvidia-smi.csv` when an NVIDIA adapter is present
+//!      (`report` keeps the run's adapter, during play).
+//!    - PresentMon 2.6 captures this process by name into
+//!      `<out>/private/presentmon.csv` (`--qpc_time`,
+//!      `--track_hybrid_present`). It runs unelevated (Performance Log
+//!      Users); `--terminate_on_proc_exit` does not fire unelevated, so the
+//!      session is stopped with `--terminate_existing_session`.
+//!
+//!    The effective power mode is watched over the run
+//!    (`<out>/private/power_modes.csv`).
 //! 3. With `--obs`, OBS starts streaming with the bundle's profile and
 //!    scene collection; after the run the owner stops streaming and exits
-//!    OBS, and the newest OBS log is copied to `<out>/private/obs.log`
-//!    (its final `Number of memory leaks:` line confirms teardown, V7).
+//!    OBS, and the newest OBS log is copied to `<out>/private/obs.log`.
+//!    `--ingest-check` also reads the ingest for 10 s during play (game
+//!    video and audio present; the run is then diagnostic).
 //! 4. `report <out>` then evaluates and exports.
 //!
 //! `--dry-run` prints the commands without starting anything.
 
 use crate::run::RunArgs;
 use crate::{conditions, parse_run, window};
+use serde_json::json;
+use spike_core::conditions::NVIDIA_VENDOR_ID;
 use spike_core::run::{EncoderClass, RunKind};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -32,12 +49,30 @@ const PRESENTMON_SETTLE: Duration = Duration::from_secs(3);
 const OBS_SETTLE: Duration = Duration::from_secs(8);
 /// OBS countdown default (design §4.2: 20 s).
 const OBS_COUNTDOWN_US: i64 = 20_000_000;
+/// The local ingest's RTMP listener (obs/mediamtx.yml, `obs::SERVER`).
+pub const INGEST_ADDR: &str = "127.0.0.1:1935";
+const INGEST_SETTLE: Duration = Duration::from_secs(5);
+/// Values of the driver's per-program power management setting the owner
+/// may declare (`--gpu-power-mode`).
+pub const GPU_POWER_MODES: &[&str] = &[
+    "default",
+    "normal",
+    "optimal-power",
+    "adaptive",
+    "prefer-max-performance",
+    "prefer-consistent-performance",
+];
+const SMI_QUERY: &str = "--query-gpu=timestamp,name,pstate,clocks.gr,clocks.mem";
 
 struct Measure {
     presentmon: PathBuf,
     obs: Option<PathBuf>,
     obs_profile: String,
     obs_collection: String,
+    /// MediaMTX executable and its configuration.
+    ingest: Option<(PathBuf, PathBuf)>,
+    ingest_check: bool,
+    gpu_power_mode: Option<String>,
     dry_run: bool,
 }
 
@@ -79,29 +114,145 @@ fn show(exe: &Path, args: &[String]) -> String {
     format!("\"{}\" {}", exe.display(), args.join(" "))
 }
 
-/// Stops the PresentMon session and waits for the capture process.
-fn stop_presentmon(exe: &Path, child: &mut Child) -> Result<(), String> {
-    let status = Command::new(exe)
-        .args(["--terminate_existing_session", "--session_name", SESSION])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("PresentMon terminate: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            break;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            return Err("PresentMon did not exit after its session was terminated".into());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+/// A helper process `measure` started. It is stopped by `stop` (graceful,
+/// then killed after `grace`) when `finish` is called or when the `Tool`
+/// is dropped on any other path, so no helper outlives `measure`.
+pub struct Tool {
+    name: &'static str,
+    child: Option<Child>,
+    stop: Box<dyn FnMut(&mut Child)>,
+    grace: Duration,
+}
+
+impl Tool {
+    pub fn spawn(
+        name: &'static str,
+        cmd: &mut Command,
+        stop: Box<dyn FnMut(&mut Child)>,
+        grace: Duration,
+    ) -> Result<Self, String> {
+        let child = cmd.spawn().map_err(|e| format!("start {name}: {e}"))?;
+        Ok(Self {
+            name,
+            child: Some(child),
+            stop,
+            grace,
+        })
     }
-    if !status.success() {
-        eprintln!("measure: PresentMon --terminate_existing_session exited with {status}");
+
+    /// Waits up to `limit` for `ready` (checked every 50 ms; `None` waits
+    /// the whole `limit`). Fails if the process exits first, or if `ready`
+    /// never holds.
+    pub fn settle(
+        &mut self,
+        limit: Duration,
+        mut ready: Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(c) = self.child.as_mut()
+                && let Some(status) = c.try_wait().map_err(|e| e.to_string())?
+            {
+                self.child = None;
+                return Err(format!("{} exited during start-up ({status})", self.name));
+            }
+            if let Some(r) = ready.as_mut()
+                && r()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return match ready {
+                    Some(_) => Err(format!("{} did not become ready", self.name)),
+                    None => Ok(()),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
-    Ok(())
+
+    /// The process is still running.
+    pub fn running(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+
+    /// Stops the process; `Err` if it had to be killed.
+    pub fn finish(mut self) -> Result<(), String> {
+        self.shutdown()
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Ok(());
+        }
+        (self.stop)(&mut child);
+        let deadline = Instant::now() + self.grace;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(format!("{} did not stop and was killed", self.name))
+    }
+}
+
+impl Drop for Tool {
+    fn drop(&mut self) {
+        if let Err(e) = self.shutdown() {
+            eprintln!("measure: {e}");
+        }
+    }
+}
+
+fn kill(child: &mut Child) {
+    let _ = child.kill();
+}
+
+/// PresentMon under its session name; stopped by terminating the session.
+fn start_presentmon(exe: &Path, args: &[String], log: &Path) -> Result<Tool, String> {
+    let log = std::fs::File::create(log).map_err(|e| e.to_string())?;
+    let stop_exe = exe.to_owned();
+    let mut tool = Tool::spawn(
+        "PresentMon",
+        Command::new(exe)
+            .args(args)
+            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log),
+        Box::new(move |_| {
+            let _ = Command::new(&stop_exe)
+                .args(["--terminate_existing_session", "--session_name", SESSION])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }),
+        Duration::from_secs(15),
+    )?;
+    tool.settle(PRESENTMON_SETTLE, None)
+        .map_err(|e| format!("{e}; see private/presentmon.log"))?;
+    Ok(tool)
+}
+
+/// The local ingest on `addr`: refused if something already listens there
+/// (an instance this run did not start is never stopped), and ready once
+/// its listener accepts.
+pub fn start_ingest(cmd: &mut Command, addr: SocketAddr, limit: Duration) -> Result<Tool, String> {
+    if TcpListener::bind(addr).is_err() {
+        return Err(format!(
+            "{addr} is already in use by another program (another MediaMTX?); stop it first"
+        ));
+    }
+    let mut tool = Tool::spawn("MediaMTX", cmd, Box::new(kill), Duration::from_secs(2))?;
+    let mut up = || TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok();
+    tool.settle(limit, Some(&mut up))?;
+    Ok(tool)
 }
 
 /// The newest OBS log (`%APPDATA%\obs-studio\logs`).
@@ -117,27 +268,75 @@ fn newest_obs_log() -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
-pub fn run(args: &[String]) -> Result<ExitCode, String> {
+/// The file version of an executable (`2.6.0`), from its version resource.
+fn file_version(exe: &Path) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+    };
+    use windows::core::{HSTRING, w};
+    let name = HSTRING::from(exe.as_os_str());
+    // SAFETY: the buffer has the size the first call reports; the fixed
+    // info pointer points into it.
+    unsafe {
+        let len = GetFileVersionInfoSizeW(&name, None);
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        GetFileVersionInfoW(&name, None, len, buf.as_mut_ptr().cast()).ok()?;
+        let mut p = std::ptr::null_mut();
+        let mut n = 0u32;
+        if !VerQueryValueW(buf.as_ptr().cast(), w!("\\"), &mut p, &mut n).as_bool() || p.is_null() {
+            return None;
+        }
+        let f = &*(p as *const VS_FIXEDFILEINFO);
+        Some(format!(
+            "{}.{}.{}",
+            f.dwFileVersionMS >> 16,
+            f.dwFileVersionMS & 0xffff,
+            f.dwFileVersionLS >> 16
+        ))
+    }
+}
+
+fn parse(args: &[String]) -> Result<(Measure, Option<EncoderClass>, Vec<String>), String> {
     let mut m = Measure {
         presentmon: PathBuf::new(),
         obs: None,
         obs_profile: "tapestry-spike-nvenc".into(),
         obs_collection: crate::obs::COLLECTION.into(),
+        ingest: None,
+        ingest_check: false,
+        gpu_power_mode: None,
         dry_run: false,
     };
     let mut encoder = None;
+    let (mut ingest, mut ingest_config) = (None, None);
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--dry-run" => m.dry_run = true,
-            "--presentmon" | "--obs" | "--obs-profile" | "--obs-collection" | "--obs-encoder" => {
+            "--ingest-check" => m.ingest_check = true,
+            "--presentmon" | "--obs" | "--obs-profile" | "--obs-collection" | "--obs-encoder"
+            | "--ingest" | "--ingest-config" | "--gpu-power-mode" => {
                 let v = it.next().ok_or(format!("{a} needs a value"))?.clone();
                 match a.as_str() {
                     "--presentmon" => m.presentmon = PathBuf::from(v),
                     "--obs" => m.obs = Some(PathBuf::from(v)),
                     "--obs-profile" => m.obs_profile = v,
                     "--obs-collection" => m.obs_collection = v,
+                    "--ingest" => ingest = Some(PathBuf::from(v)),
+                    "--ingest-config" => ingest_config = Some(PathBuf::from(v)),
+                    "--gpu-power-mode" => {
+                        if !GPU_POWER_MODES.contains(&v.as_str()) {
+                            return Err(format!(
+                                "--gpu-power-mode {v}: one of {}",
+                                GPU_POWER_MODES.join(", ")
+                            ));
+                        }
+                        m.gpu_power_mode = Some(v);
+                    }
                     _ => {
                         encoder = Some(match v.as_str() {
                             "hardware" => EncoderClass::Hardware,
@@ -153,20 +352,34 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
     if m.presentmon.as_os_str().is_empty() {
         return Err("measure needs --presentmon <exe>".into());
     }
+    m.ingest = match (ingest, ingest_config) {
+        (Some(e), Some(c)) => Some((e, c)),
+        (None, None) => None,
+        _ => return Err("--ingest and --ingest-config go together".into()),
+    };
+    if m.ingest_check && (m.obs.is_none() || m.ingest.is_none()) {
+        return Err("--ingest-check needs --obs and --ingest".into());
+    }
+    Ok((m, encoder, rest))
+}
+
+pub fn run(args: &[String]) -> Result<ExitCode, String> {
+    let (m, encoder, rest) = parse(args)?;
     let mut a: RunArgs = parse_run(&rest)?;
     if a.offscreen.is_some() {
         return Err("measure runs on a display, not offscreen".into());
     }
     let required = a.duration_s.is_none() && a.loops == spike_core::evaluate::REQUIRED_LOOPS;
-    a.meta.kind = match (&m.obs, required) {
-        (Some(_), _) => RunKind::Obs,
+    a.meta.kind = match (&m.obs, required && !m.ingest_check) {
+        (_, false) => RunKind::Diagnostic,
+        (Some(_), true) => RunKind::Obs,
         (None, true) => RunKind::Baseline,
-        (None, false) => RunKind::Diagnostic,
     };
     a.meta.obs_encoder = encoder;
     if m.obs.is_some() && !rest.iter().any(|x| x == "--countdown-s") {
         a.countdown_us = OBS_COUNTDOWN_US;
     }
+    let private = a.out.join("private");
     let csv = a.out.join(crate::report::PRESENTMON_CSV);
     let pm_args = presentmon_args(&csv);
     let obs = m
@@ -179,7 +392,14 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
             a.meta.kind,
             a.countdown_us / 1_000_000
         );
-        println!("1. {}", show(&m.presentmon, &pm_args));
+        if let Some((exe, cfg)) = &m.ingest {
+            println!(
+                "0. {} (refused if {INGEST_ADDR} is in use; this process only is stopped after the run)",
+                show(exe, &[cfg.display().to_string()])
+            );
+        }
+        println!("1. nvidia-smi {SMI_QUERY} -lms 100 (NVIDIA adapters only); power-mode watch");
+        println!("   {}", show(&m.presentmon, &pm_args));
         if let Some((exe, args)) = &obs {
             println!(
                 "2. (working directory {}) {}",
@@ -209,28 +429,73 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         println!("then: tapestry-spike report {}", a.out.display());
         return Ok(ExitCode::SUCCESS);
     }
-    std::fs::create_dir_all(a.out.join("private")).map_err(|e| e.to_string())?;
-    let cond = conditions::collect(
+    std::fs::create_dir_all(&private).map_err(|e| e.to_string())?;
+    let mut cond = conditions::collect(
         a.audio.as_ref().and_then(|x| x.device.as_deref()),
         a.bga.as_deref(),
+    )?;
+    cond.insert(
+        "presentmon_version".into(),
+        json!(file_version(&m.presentmon)),
+    );
+    cond.insert(
+        "gpu_power_mode_declared".into(),
+        json!(m.gpu_power_mode.as_deref().unwrap_or("undeclared")),
     );
     std::fs::write(
-        a.out.join("private").join(conditions::CONDITIONS),
+        private.join(conditions::CONDITIONS),
         serde_json::to_vec_pretty(&cond).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let log = std::fs::File::create(a.out.join("private").join("presentmon.log"))
-        .map_err(|e| e.to_string())?;
-    let mut pm = Command::new(&m.presentmon)
-        .args(&pm_args)
-        .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log)
-        .spawn()
-        .map_err(|e| format!("start PresentMon {}: {e}", m.presentmon.display()))?;
-    std::thread::sleep(PRESENTMON_SETTLE);
+
+    let ingest = match &m.ingest {
+        Some((exe, cfg)) => {
+            let log =
+                std::fs::File::create(private.join("mediamtx.log")).map_err(|e| e.to_string())?;
+            let addr: SocketAddr = INGEST_ADDR.parse().map_err(|_| "ingest address")?;
+            let t = start_ingest(
+                Command::new(exe)
+                    .arg(cfg)
+                    .stdout(log.try_clone().map_err(|e| e.to_string())?)
+                    .stderr(log),
+                addr,
+                INGEST_SETTLE,
+            )?;
+            println!("measure: local ingest listening on {INGEST_ADDR}");
+            Some(t)
+        }
+        None => None,
+    };
+    let power = crate::power::Watch::start()
+        .map_err(|e| eprintln!("measure: {e}; power mode not recorded"))
+        .ok();
+    let nvidia = conditions::dxgi()
+        .0
+        .iter()
+        .any(|a| a.vendor_id == NVIDIA_VENDOR_ID);
+    let smi = if nvidia {
+        let out = std::fs::File::create(a.out.join(crate::report::GPU_SAMPLES))
+            .map_err(|e| e.to_string())?;
+        Tool::spawn(
+            "nvidia-smi",
+            Command::new("nvidia-smi")
+                .args([SMI_QUERY, "--format=csv,noheader,nounits", "-lms", "100"])
+                .stdout(out)
+                .stderr(Stdio::null()),
+            Box::new(kill),
+            Duration::from_secs(1),
+        )
+        .map_err(|e| eprintln!("measure: {e}; GPU state not recorded"))
+        .ok()
+    } else {
+        None
+    };
+    let mut pm = start_presentmon(&m.presentmon, &pm_args, &private.join("presentmon.log"))?;
     let mut obs_child = None;
     if let Some((exe, args)) = &obs {
         let dir = exe.parent().unwrap_or(Path::new("."));
+        // An OBS that cannot start returns here; the tools above stop on
+        // drop.
         obs_child = Some(
             Command::new(exe)
                 .args(args)
@@ -240,8 +505,50 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         );
         std::thread::sleep(OBS_SETTLE);
     }
+    let check = if m.ingest_check {
+        let delay = (a.countdown_us / 1_000_000 + 5).to_string();
+        let out =
+            std::fs::File::create(private.join("ingest-check.txt")).map_err(|e| e.to_string())?;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        Some(
+            Command::new(exe)
+                .args([
+                    "ingest-check",
+                    "--url",
+                    &format!("rtmp://{INGEST_ADDR}/live/{}", crate::obs::STREAM_KEY),
+                    "--delay-s",
+                    &delay,
+                    "--seconds",
+                    "10",
+                ])
+                .stdout(out)
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("start ingest check: {e}"))?,
+        )
+    } else {
+        None
+    };
     let result = window::windowed(&a);
-    let stopped = stop_presentmon(&m.presentmon, &mut pm);
+    let pm_alive = pm.running();
+    let stopped = pm.finish();
+    if let Some(t) = smi {
+        let _ = t.finish();
+    }
+    if let Some(w) = power {
+        let mut text = String::new();
+        for (q, mode) in w.changes() {
+            text.push_str(&format!("{q},{mode}\n"));
+        }
+        std::fs::write(a.out.join(crate::power::POWER_MODES), text).map_err(|e| e.to_string())?;
+    }
+    let mut ingest_ok = true;
+    if let Some(mut c) = check {
+        let status = c.wait().map_err(|e| e.to_string())?;
+        let text = std::fs::read_to_string(private.join("ingest-check.txt")).unwrap_or_default();
+        print!("{text}");
+        ingest_ok = status.success();
+    }
     if let Some(mut child) = obs_child {
         println!(
             "measure: stop streaming and exit OBS now (File > Exit); waiting for OBS to close..."
@@ -256,12 +563,125 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
             None => eprintln!("measure: no OBS log found"),
         }
     }
+    if let Some(t) = ingest {
+        t.finish()?;
+    }
+    if !pm_alive {
+        eprintln!("measure: PresentMon exited before the run ended (capture incomplete, V4)");
+    }
     stopped?;
     let code = result?;
+    if !ingest_ok {
+        eprintln!("measure: the ingest check failed (see above)");
+        return Ok(ExitCode::from(1));
+    }
     println!(
         "measure: capture in {}; next: tapestry-spike report {}",
         csv.display(),
         a.out.display()
     );
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn long_running() -> Command {
+        let mut c = Command::new("ping");
+        c.args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null());
+        c
+    }
+
+    fn alive(pid: u32) -> bool {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    }
+
+    /// A fake capture tool, then an OBS launch that fails.
+    fn launch(stopped: Arc<AtomicBool>, pid: &mut u32) -> Result<(), String> {
+        let mut pm = Tool::spawn(
+            "fake capture",
+            &mut long_running(),
+            Box::new(move |c| {
+                stopped.store(true, Ordering::SeqCst);
+                let _ = c.kill();
+            }),
+            Duration::from_secs(5),
+        )?;
+        pm.settle(Duration::from_millis(200), None)?;
+        *pid = pm.child.as_ref().map_or(0, Child::id);
+        Command::new("no-such-obs-executable-for-the-test")
+            .spawn()
+            .map_err(|e| format!("start OBS: {e}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_launch_after_the_capture_still_stops_it() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut pid = 0;
+        assert!(launch(stopped.clone(), &mut pid).is_err());
+        // Stopped by the time the error reached the caller.
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(
+            pid != 0 && !alive(pid),
+            "the fake capture outlived the failure"
+        );
+    }
+
+    #[test]
+    fn a_tool_that_exits_during_start_up_fails_fast() {
+        let mut c = Command::new("cmd");
+        c.args(["/c", "exit 3"]);
+        let mut t = Tool::spawn("fake", &mut c, Box::new(kill), Duration::from_secs(1)).unwrap();
+        let t0 = Instant::now();
+        let e = t.settle(Duration::from_secs(10), None).unwrap_err();
+        assert!(e.contains("exited during start-up"), "{e}");
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_ingest_never_starts_over_a_port_in_use_and_must_come_up() {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = held.local_addr().unwrap();
+        let e = start_ingest(&mut long_running(), addr, Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert!(e.contains("already in use"), "{e}");
+        drop(held);
+        // A process that never listens is reported and stopped.
+        let free = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let e = start_ingest(&mut long_running(), free, Duration::from_millis(500))
+            .err()
+            .unwrap();
+        assert!(e.contains("did not become ready"), "{e}");
+    }
+
+    #[test]
+    fn measure_options_are_checked() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(parse(&a(&["--presentmon", "p", "--gpu-power-mode", "turbo"])).is_err());
+        assert!(parse(&a(&["--presentmon", "p", "--ingest", "m.exe"])).is_err());
+        assert!(parse(&a(&["--presentmon", "p", "--ingest-check"])).is_err());
+        let (m, _, rest) = parse(&a(&[
+            "--presentmon",
+            "p",
+            "--gpu-power-mode",
+            "prefer-max-performance",
+            "--duration-s",
+            "60",
+        ]))
+        .unwrap();
+        assert_eq!(m.gpu_power_mode.as_deref(), Some("prefer-max-performance"));
+        assert_eq!(rest, a(&["--duration-s", "60"]));
+    }
 }

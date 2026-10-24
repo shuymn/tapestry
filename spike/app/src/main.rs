@@ -21,9 +21,11 @@ mod bga;
 mod conditions;
 mod display;
 mod gen_assets;
+mod ingest;
 mod measure;
 mod obs;
 mod pacing;
+mod power;
 mod render;
 mod report;
 mod run;
@@ -54,11 +56,15 @@ const USAGE: &str = "usage:
       [--profile standard|streaming|no-bga] [--countdown-s N]
       [--offscreen WxH --audio null --frames N]
   tapestry-spike measure --presentmon <exe> [--obs <obs64.exe> --obs-profile <name>
-      --obs-collection <name> --obs-encoder hardware|x264] [--dry-run] <run options>
+      --obs-collection <name> --obs-encoder hardware|x264]
+      [--ingest <mediamtx.exe> --ingest-config <yml> [--ingest-check]]
+      [--gpu-power-mode default|normal|optimal-power|adaptive|prefer-max-performance|prefer-consistent-performance]
+      [--dry-run] <run options>
   tapestry-spike conditions [--out <dir>] [--audio-device <part>] [--bga <video>]
   tapestry-spike report <run-dir> [--notes <owner-notes.toml>]
   tapestry-spike report --from-export <zip>
-  tapestry-spike obs-files --out <dir> [--overlay <html>]";
+  tapestry-spike obs-files --out <dir> [--overlay <html>] [--canvas WxH | --monitor <part>]
+  tapestry-spike ingest-check --url <rtmp url> [--delay-s N] [--seconds N]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -70,6 +76,7 @@ fn main() -> ExitCode {
         Some("conditions") => conditions_cmd(&args[1..]),
         Some("report") => report_cmd(&args[1..]),
         Some("obs-files") => obs_files_cmd(&args[1..]),
+        Some("ingest-check") => ingest_cmd(&args[1..]),
         Some("displays") if args.len() == 1 => {
             display::print_displays();
             Ok(ExitCode::SUCCESS)
@@ -231,6 +238,12 @@ pub fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         }
     }
     a.out = out.ok_or("--out is required")?;
+    // The profile sets the workload before anything is created: no-bga
+    // never opens or decodes a BGA, whatever `--bga` says (the bundle's
+    // wrappers always pass it).
+    if a.meta.profile == spike_core::run::Profile::NoBga {
+        a.bga = None;
+    }
     audio.inject = match (every, gap) {
         (Some(e), Some(g)) if e > 0 && g > 0 => Some((e, g)),
         (None, None) => None,
@@ -260,17 +273,64 @@ fn conditions_cmd(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `obs-files --out DIR [--overlay FILE]`.
+/// `ingest-check --url URL [--delay-s N] [--seconds N]`.
+fn ingest_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let (mut url, mut delay, mut seconds) = (None, 0, 10);
+    for (k, v) in options(args)? {
+        match k {
+            "url" => url = Some(v.to_owned()),
+            "delay-s" => delay = num(k, v)?,
+            "seconds" => seconds = num(k, v)?,
+            _ => {
+                return Err(format!(
+                    "unknown option --{k}
+{USAGE}"
+                ));
+            }
+        }
+    }
+    ingest::run(&url.ok_or("--url is required")?, delay, seconds)
+}
+
+/// `obs-files --out DIR [--overlay FILE] [--canvas WxH | --monitor PART]`:
+/// the canvas is the game's native resolution, given or read from the
+/// monitor's mode (the only active display's, without either).
 fn obs_files_cmd(args: &[String]) -> Result<ExitCode, String> {
     let (mut out, mut overlay) = (None, PathBuf::from("obs/overlay.html"));
+    let (mut canvas, mut monitor) = (None, None);
     for (k, v) in options(args)? {
         match k {
             "out" => out = Some(PathBuf::from(v)),
             "overlay" => overlay = PathBuf::from(v),
-            _ => return Err(format!("unknown option --{k}\n{USAGE}")),
+            "canvas" => canvas = Some(size(v)?),
+            "monitor" => monitor = Some(v.to_owned()),
+            _ => {
+                return Err(format!(
+                    "unknown option --{k}
+{USAGE}"
+                ));
+            }
         }
     }
-    obs::write(&out.ok_or("--out is required")?, &overlay)?;
+    let canvas = match (canvas, monitor) {
+        (Some(c), None) => c,
+        (None, Some(m)) => {
+            let paths = display::active_paths();
+            let d = display::find_display(&m, &paths)?;
+            (d.width, d.height)
+        }
+        (None, None) => match display::active_paths().as_slice() {
+            [one] => (one.width, one.height),
+            _ => {
+                return Err(
+                    "several displays are active: give --monitor <part> (the game's display) or --canvas WxH"
+                        .into(),
+                );
+            }
+        },
+        (Some(_), Some(_)) => return Err("--canvas and --monitor exclude each other".into()),
+    };
+    obs::write(&out.ok_or("--out is required")?, &overlay, canvas)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -365,5 +425,39 @@ fn ffmpeg_version() -> ExitCode {
     } else {
         eprintln!("tapestry-spike: the linked FFmpeg is not an LGPL build");
         ExitCode::from(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spike_core::run::Profile;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_bga_drops_the_bga_and_other_profiles_keep_it() {
+        let base = [
+            "--out",
+            "o",
+            "--bga",
+            "b.mp4",
+            "--audio",
+            "null",
+            "--profile",
+        ];
+        for (p, profile, bga) in [
+            ("standard", Profile::Standard, true),
+            ("streaming", Profile::Streaming, true),
+            ("no-bga", Profile::NoBga, false),
+        ] {
+            let mut v = base.to_vec();
+            v.push(p);
+            let a = parse_run(&args(&v)).unwrap();
+            assert_eq!(a.meta.profile, profile);
+            assert_eq!(a.bga.is_some(), bga, "{p}");
+        }
     }
 }
