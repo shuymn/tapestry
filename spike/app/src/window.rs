@@ -11,7 +11,7 @@
 use crate::alloc::{self, Scope, Tag, scope};
 use crate::display::{DisplayPath, active_paths, find_display, pick_refresh};
 use crate::pacing::{
-    DISPLAY_VBLANKS, GridEvent, GridTracker, cap_anchor, cap_needed, cap_step, predict_display,
+    DISPLAY_VBLANKS, DisplayPredictor, GridEvent, GridTracker, cap_anchor, cap_needed, cap_step,
 };
 use crate::render::Renderer;
 use crate::run::{
@@ -379,6 +379,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let mut cap_anchor_fallback: Option<i64> = None;
     let mut cap_phase: Option<u32> = None;
     let mut last_slot: Option<i64> = None;
+    let mut predictor = DisplayPredictor::default();
     // Cap decisions for the private trace: (now, anchor, slot, wait until,
     // wake).
     let mut cap_trace: Vec<(i64, i64, i64, Option<i64>, i64)> = Vec::with_capacity(max_frames);
@@ -430,7 +431,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
             armed = in_play;
         }
         let load = scene.build(play_us.min(play_len), &mut frame);
-        let predicted_qpc = predict_display(t0, dxgi.grid.anchor().map(|a| a.0), period_qpc);
+        let predicted_qpc = predictor.predict(t0, dxgi.grid.anchor().map(|a| a.0), period_qpc);
         let predicted_play = clock.to_us(predicted_qpc) - play_start;
         let shown = if play_us >= 0 {
             bga.step(
