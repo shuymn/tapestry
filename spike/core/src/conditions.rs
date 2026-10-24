@@ -45,6 +45,12 @@ pub struct GpuState {
     /// `nvidia-smi`, or `unavailable: <reason>` (fixed reasons only).
     pub source: String,
     pub samples: u32,
+    /// Samples the polling interval implies over play.
+    pub expected_samples: u32,
+    /// The sampler ran until the run ended, and its samples cover play:
+    /// the first and last within `MAX_SAMPLE_GAP_MS` of play's edges and no
+    /// gap longer than that. An incomplete capture decides nothing.
+    pub complete: bool,
     pub pstates: Vec<PstateShare>,
     pub core_mhz_min: Option<u32>,
     pub core_mhz_p50: Option<u32>,
@@ -200,6 +206,8 @@ pub const NESTED_KEYS: &[&str] = &[
     "hybrid_rows",
     "source",
     "samples",
+    "expected_samples",
+    "complete",
     "pstates",
     "pstate",
     "pct",
@@ -308,21 +316,36 @@ fn nearest_rank(sorted: &[u32], p: usize) -> Option<u32> {
     Some(sorted[rank - 1])
 }
 
+/// nvidia-smi's polling interval (`-lms`).
+pub const SMI_INTERVAL_MS: i64 = 100;
+/// The longest sampling gap a complete GPU capture may have.
+pub const MAX_SAMPLE_GAP_MS: i64 = 1_000;
+
 /// The GPU state during play from `nvidia-smi --query-gpu=timestamp,name,
-/// pstate,clocks.gr,clocks.mem --format=csv,noheader,nounits` lines, for
-/// the GPU named `gpu` and samples in `[from, to]` (local ms).
-pub fn gpu_state_from_smi(text: &str, gpu: &str, from: i64, to: i64) -> GpuState {
+/// pci.bus_id,pstate,clocks.gr,clocks.mem --format=csv,noheader,nounits`
+/// lines, for the GPU named `gpu` and samples in `[from, to]` (local ms).
+/// `sampler_ok`: the sampler was still running when the run ended. Several
+/// GPUs of the same name (by bus id) make the state ambiguous, so it is
+/// unavailable rather than merged.
+pub fn gpu_state_from_smi(text: &str, gpu: &str, from: i64, to: i64, sampler_ok: bool) -> GpuState {
     let mut pstates: Vec<(String, u32)> = vec![];
-    let (mut core, mut mem) = (vec![], vec![]);
+    let (mut core, mut mem, mut times) = (vec![], vec![], vec![]);
+    let mut buses: Vec<&str> = vec![];
     for line in text.lines() {
         let f: Vec<&str> = line.split(',').map(str::trim).collect();
-        let [ts, name, pstate, gr, memclk] = f.as_slice() else {
+        let [ts, name, bus, pstate, gr, memclk] = f.as_slice() else {
             continue;
         };
+        if *name != gpu {
+            continue;
+        }
+        if !buses.contains(bus) {
+            buses.push(bus);
+        }
         let Some(t) = parse_local_timestamp(ts) else {
             continue;
         };
-        if *name != gpu || t < from || t > to {
+        if t < from || t > to {
             continue;
         }
         let (Ok(gr), Ok(memclk)) = (gr.parse::<u32>(), memclk.parse::<u32>()) else {
@@ -334,10 +357,21 @@ pub fn gpu_state_from_smi(text: &str, gpu: &str, from: i64, to: i64) -> GpuState
         }
         core.push(gr);
         mem.push(memclk);
+        times.push(t);
+    }
+    if buses.len() > 1 {
+        return GpuState::unavailable("ambiguous: several GPUs of this model");
     }
     if core.is_empty() {
         return GpuState::unavailable("no samples during play");
     }
+    times.sort_unstable();
+    let edges = [times[0] - from, to - times[times.len() - 1]];
+    let gaps = times.windows(2).map(|w| w[1] - w[0]);
+    let covered = edges
+        .into_iter()
+        .chain(gaps)
+        .all(|g| g <= MAX_SAMPLE_GAP_MS);
     core.sort_unstable();
     mem.sort_unstable();
     pstates.sort();
@@ -345,6 +379,8 @@ pub fn gpu_state_from_smi(text: &str, gpu: &str, from: i64, to: i64) -> GpuState
     GpuState {
         source: "nvidia-smi".into(),
         samples: n as u32,
+        expected_samples: ((to - from) / SMI_INTERVAL_MS) as u32,
+        complete: sampler_ok && covered,
         pstates: pstates
             .into_iter()
             .map(|(pstate, c)| PstateShare {
@@ -362,9 +398,10 @@ pub fn gpu_state_from_smi(text: &str, gpu: &str, from: i64, to: i64) -> GpuState
 }
 
 /// Whether a declared driver power setting contradicts the GPU state
-/// during play; `None` when the state was not observed.
+/// during play; `None` (unknown) when the state was not observed or its
+/// capture is incomplete.
 pub fn power_mode_contradicted(declared: Option<&str>, state: &GpuState) -> Option<bool> {
-    if state.source != "nvidia-smi" {
+    if state.source != "nvidia-smi" || !state.complete {
         return None;
     }
     let p0 = state.pstates.iter().any(|p| p.pstate == "P0");
@@ -414,12 +451,14 @@ pub struct Ladder {
     pub notes: Vec<String>,
 }
 
-/// The engine period ladder of the endpoint (frames).
+/// The audio period ladder (frames): the run's period, the engine's step,
+/// and the highest rung the procedure allows, the default period (design D5
+/// "up to default"), not the engine's maximum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeriodLadder {
     pub chosen: u32,
     pub step: u32,
-    pub max: u32,
+    pub default: u32,
 }
 
 pub fn ladder(summary: &Summary, info: &RunInfo, periods: Option<PeriodLadder>) -> Ladder {
@@ -448,12 +487,12 @@ pub fn ladder(summary: &Summary, info: &RunInfo, periods: Option<PeriodLadder>) 
     }
     if failed("G5") {
         match periods {
-            Some(p) if p.chosen + p.step.max(1) <= p.max => {
+            Some(p) if p.chosen + p.step.max(1) <= p.default => {
                 l.audio = Some(format!("--audio-period {}", p.chosen + p.step.max(1)));
             }
-            Some(_) => l
-                .notes
-                .push("no longer shared-mode period on this endpoint".into()),
+            Some(_) => l.notes.push(
+                "audio period ladder exhausted: the run is at or above the default period".into(),
+            ),
             None => l.notes.push("audio period ladder unknown".into()),
         }
     }
@@ -496,17 +535,18 @@ mod tests {
     fn gpu_state_counts_only_the_named_gpu_during_play() {
         let t0 = local_ms(2026, 10, 25, 0);
         let text = "\
-2026/10/24 23:59:59.900, GPU A, P8, 210, 405
-2026/10/25 00:00:00.100, GPU A, P5, 900, 810
-2026/10/25 00:00:00.200, GPU B, P0, 2500, 11501
-2026/10/25 00:00:00.300, GPU A, P0, 2550, 11501
-2026/10/25 00:00:00.400, GPU A, P0, 2550, 11501
-2026/10/25 00:00:00.500, GPU A, [N/A], x, 1
-2026/10/25 00:00:05.000, GPU A, P8, 210, 405
+2026/10/24 23:59:59.900, GPU A, 00000000:01:00.0, P8, 210, 405
+2026/10/25 00:00:00.100, GPU A, 00000000:01:00.0, P5, 900, 810
+2026/10/25 00:00:00.200, GPU B, 00000000:02:00.0, P0, 2500, 11501
+2026/10/25 00:00:00.300, GPU A, 00000000:01:00.0, P0, 2550, 11501
+2026/10/25 00:00:00.400, GPU A, 00000000:01:00.0, P0, 2550, 11501
+2026/10/25 00:00:00.500, GPU A, 00000000:01:00.0, [N/A], x, 1
+2026/10/25 00:00:05.000, GPU A, 00000000:01:00.0, P8, 210, 405
 ";
-        let s = gpu_state_from_smi(text, "GPU A", t0, t0 + 1_000);
+        let s = gpu_state_from_smi(text, "GPU A", t0, t0 + 1_000, true);
         assert_eq!(s.source, "nvidia-smi");
-        assert_eq!(s.samples, 3);
+        assert_eq!((s.samples, s.expected_samples), (3, 10));
+        assert!(s.complete);
         assert_eq!(
             s.pstates,
             vec![
@@ -525,8 +565,62 @@ mod tests {
             (Some(900), Some(2550), Some(2550))
         );
         assert_eq!((s.mem_mhz_min, s.mem_mhz_max), (Some(810), Some(11501)));
-        let none = gpu_state_from_smi(text, "GPU C", t0, t0 + 1_000);
+        let none = gpu_state_from_smi(text, "GPU C", t0, t0 + 1_000, true);
         assert!(none.source.starts_with("unavailable"));
+    }
+
+    #[test]
+    fn twin_gpus_of_one_model_are_ambiguous() {
+        let t0 = local_ms(2026, 10, 25, 0);
+        let text = "\
+2026/10/25 00:00:00.100, GPU A, 00000000:01:00.0, P8, 210, 405
+2026/10/25 00:00:00.100, GPU A, 00000000:02:00.0, P0, 2550, 11501
+";
+        let s = gpu_state_from_smi(text, "GPU A", t0, t0 + 1_000, true);
+        assert_eq!(
+            s.source,
+            "unavailable: ambiguous: several GPUs of this model"
+        );
+        assert_eq!(
+            power_mode_contradicted(Some("prefer-max-performance"), &s),
+            None
+        );
+    }
+
+    #[test]
+    fn an_incomplete_gpu_capture_decides_nothing() {
+        let t0 = local_ms(2026, 10, 25, 0);
+        let line = |ms: i64, p: &str| {
+            format!(
+                "2026/10/25 00:00:{:02}.{:03}, GPU A, 00000000:01:00.0, {p}, 300, 405\n",
+                ms / 1000,
+                ms % 1000
+            )
+        };
+        // Samples every 100 ms over 10 s of play.
+        let full: String = (0..=100).map(|k| line(k * 100, "P5")).collect();
+        let max = Some("prefer-max-performance");
+        let s = gpu_state_from_smi(&full, "GPU A", t0, t0 + 10_000, true);
+        assert!(s.complete);
+        assert_eq!(power_mode_contradicted(max, &s), Some(true));
+        // The sampler failed after one sample, or stopped early, or left a
+        // gap: incomplete, so the contradiction is unknown.
+        for (text, ok) in [
+            (line(0, "P5"), true),
+            ((0..=50).map(|k| line(k * 100, "P5")).collect(), true),
+            (
+                (0..=100)
+                    .filter(|k| !(40..60).contains(k))
+                    .map(|k| line(k * 100, "P5"))
+                    .collect(),
+                true,
+            ),
+            (full.clone(), false),
+        ] {
+            let s = gpu_state_from_smi(&text, "GPU A", t0, t0 + 10_000, ok);
+            assert!(!s.complete);
+            assert_eq!(power_mode_contradicted(max, &s), None);
+        }
     }
 
     #[test]
@@ -534,6 +628,7 @@ mod tests {
         let state = |p: &str| GpuState {
             source: "nvidia-smi".into(),
             samples: 1,
+            complete: true,
             pstates: vec![PstateShare {
                 pstate: p.into(),
                 pct: 100.0,
@@ -666,7 +761,7 @@ mod tests {
         let p = Some(PeriodLadder {
             chosen: 441,
             step: 1,
-            max: 441,
+            default: 441,
         });
         let l = ladder(&failing(&mut run, "G1"), &run.info, p);
         assert_eq!(
@@ -676,16 +771,26 @@ mod tests {
         assert_eq!(l.audio, None);
         run.info.class_hz = 60;
         let ok = Some(PeriodLadder {
-            chosen: 480,
+            chosen: 384,
             step: 48,
-            max: 960,
+            default: 480,
         });
         let l = ladder(&failing(&mut run, "G5"), &run.info, ok);
         assert_eq!(
             l.profile.as_deref(),
             Some("--profile streaming --fps-cap 60")
         );
-        assert_eq!(l.audio.as_deref(), Some("--audio-period 528"));
+        assert_eq!(l.audio.as_deref(), Some("--audio-period 432"));
+        // At the default period the ladder is exhausted, whatever the
+        // engine's maximum.
+        let at_default = Some(PeriodLadder {
+            chosen: 480,
+            step: 48,
+            default: 480,
+        });
+        let l = ladder(&failing(&mut run, "G5"), &run.info, at_default);
+        assert_eq!(l.audio, None);
+        assert!(l.notes[0].contains("exhausted"));
         let l = ladder(&failing(&mut run, "G5"), &run.info, p);
         assert_eq!(l.audio, None);
         assert_eq!(l.notes.len(), 1);

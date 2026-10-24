@@ -62,7 +62,9 @@ pub const GPU_POWER_MODES: &[&str] = &[
     "prefer-max-performance",
     "prefer-consistent-performance",
 ];
-const SMI_QUERY: &str = "--query-gpu=timestamp,name,pstate,clocks.gr,clocks.mem";
+/// The bus id stays in the private samples only: it tells several GPUs of
+/// one model apart (`report` then records the state as ambiguous).
+const SMI_QUERY: &str = "--query-gpu=timestamp,name,pci.bus_id,pstate,clocks.gr,clocks.mem";
 
 struct Measure {
     presentmon: PathBuf,
@@ -181,6 +183,15 @@ impl Tool {
     /// Stops the process; `Err` if it had to be killed.
     pub fn finish(mut self) -> Result<(), String> {
         self.shutdown()
+    }
+
+    /// Waits for the process to exit on its own (OBS is closed by the
+    /// owner, the ingest check ends by itself); nothing is stopped.
+    pub fn wait(mut self) -> Result<std::process::ExitStatus, String> {
+        match self.child.take() {
+            Some(mut c) => c.wait().map_err(|e| e.to_string()),
+            None => Err(format!("{} was not running", self.name)),
+        }
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
@@ -504,18 +515,18 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         None
     };
     let mut pm = start_presentmon(&m.presentmon, &pm_args, &private.join("presentmon.log"))?;
+    // OBS and the ingest check are Tools too: an error return closes them
+    // with the rest; on the normal path OBS is closed by the owner and the
+    // check ends by itself (`Tool::wait`).
     let mut obs_child = None;
     if let Some((exe, args)) = &obs {
         let dir = exe.parent().unwrap_or(Path::new("."));
-        // An OBS that cannot start returns here; the tools above stop on
-        // drop.
-        obs_child = Some(
-            Command::new(exe)
-                .args(args)
-                .current_dir(dir)
-                .spawn()
-                .map_err(|e| format!("start OBS: {e}"))?,
-        );
+        obs_child = Some(Tool::spawn(
+            "OBS",
+            Command::new(exe).args(args).current_dir(dir),
+            Box::new(kill),
+            Duration::from_secs(2),
+        )?);
         std::thread::sleep(OBS_SETTLE);
     }
     let check = if m.ingest_check {
@@ -523,7 +534,8 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         let out =
             std::fs::File::create(private.join("ingest-check.txt")).map_err(|e| e.to_string())?;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        Some(
+        Some(Tool::spawn(
+            "ingest check",
             Command::new(exe)
                 .args([
                     "ingest-check",
@@ -535,18 +547,26 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
                     "10",
                 ])
                 .stdout(out)
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("start ingest check: {e}"))?,
-        )
+                .stderr(Stdio::null()),
+            Box::new(kill),
+            Duration::from_secs(1),
+        )?)
     } else {
         None
     };
     let result = window::windowed(&a);
     let pm_alive = pm.running();
     let stopped = pm.finish();
-    if let Some(t) = smi {
+    if let Some(mut t) = smi {
+        // A sampler that died during the run leaves the GPU capture
+        // incomplete (report: contradiction unknown).
+        let running = t.running();
         let _ = t.finish();
+        std::fs::write(
+            a.out.join(crate::report::GPU_SAMPLER),
+            json!({ "running_at_end": running }).to_string(),
+        )
+        .map_err(|e| e.to_string())?;
     }
     if let Some(w) = power {
         let mut text = String::new();
@@ -556,13 +576,13 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         std::fs::write(a.out.join(crate::power::POWER_MODES), text).map_err(|e| e.to_string())?;
     }
     let mut ingest_ok = true;
-    if let Some(mut c) = check {
-        let status = c.wait().map_err(|e| e.to_string())?;
+    if let Some(c) = check {
+        let status = c.wait()?;
         let text = std::fs::read_to_string(private.join("ingest-check.txt")).unwrap_or_default();
         print!("{text}");
         ingest_ok = status.success();
     }
-    if let Some(mut child) = obs_child {
+    if let Some(child) = obs_child {
         println!(
             "measure: stop streaming and exit OBS now (File > Exit); waiting for OBS to close..."
         );
@@ -646,6 +666,43 @@ mod tests {
             pid != 0 && !alive(pid),
             "the fake capture outlived the failure"
         );
+    }
+
+    #[test]
+    fn owner_closed_tools_are_waited_for_and_error_paths_close_them() {
+        // Normal path: the process ends by itself and is not stopped.
+        let stopped = Arc::new(AtomicBool::new(false));
+        let s = stopped.clone();
+        let mut c = Command::new("cmd");
+        c.args(["/c", "exit 0"]);
+        let t = Tool::spawn(
+            "fake OBS",
+            &mut c,
+            Box::new(move |c| {
+                s.store(true, Ordering::SeqCst);
+                let _ = c.kill();
+            }),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(t.wait().unwrap().success());
+        assert!(!stopped.load(Ordering::SeqCst));
+        // Error path after the launch (for example a failed file write):
+        // the early return drops the tool, which closes the process.
+        let mut pid = 0;
+        let mut after_launch = || -> Result<(), String> {
+            let obs = Tool::spawn(
+                "fake OBS",
+                &mut long_running(),
+                Box::new(kill),
+                Duration::from_secs(1),
+            )?;
+            pid = obs.child.as_ref().map_or(0, Child::id);
+            std::fs::File::create("Z:/no/such/dir/ingest-check.txt").map_err(|e| e.to_string())?;
+            obs.wait().map(|_| ())
+        };
+        assert!(after_launch().is_err());
+        assert!(pid != 0 && !alive(pid), "the fake OBS outlived the error");
     }
 
     #[test]
