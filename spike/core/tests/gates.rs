@@ -588,7 +588,7 @@ fn d_na_rows_are_counted_as_not_displayed() {
     let s = evaluate(&run);
     assert_valid(&s);
     assert_eq!(s.records.not_displayed, n);
-    assert_eq!(s.records.missed_deadlines, n);
+    assert_eq!(s.records.missed_deadlines, Some(n));
     let heavy_rows = run
         .pm_frames
         .iter()
@@ -737,7 +737,7 @@ fn e_complete_capture_of_a_50_fps_run_on_60_hz_fails_g1_but_is_valid() {
     assert_valid(&s);
     assert!(!s.gate("G1").pass);
     assert!(s.gate("G1").value > Some(30.0));
-    assert!(s.records.missed_deadlines > 0);
+    assert!(s.records.missed_deadlines > Some(0));
     assert_eq!(s.exit_code, 1);
 }
 
@@ -809,4 +809,50 @@ fn v1_v2_v5_v6_invalidate() {
     });
     run.counters.bga_pool_exhausted = 3;
     assert_eq!(evaluate(&run).exit_code, 0);
+}
+
+#[test]
+fn g1_and_g1r_follow_the_mode_when_v3_is_invalid() {
+    // VRR unreported (counts as on): V3 invalid, but T, G1 and G1r are
+    // still measured against the run's own refresh.
+    let mut run = slow_run(20_000, 1);
+    run.info.vrr = true;
+    let s = evaluate(&run);
+    assert!(!s.check("V3").ok);
+    assert_eq!(s.exit_code, 2);
+    assert_eq!(s.refresh_class_hz, None);
+    assert!((s.target_period_ms.unwrap() - 1000.0 / 60.0).abs() < 1e-9);
+    let g1 = s.gate("G1");
+    assert_eq!(g1.threshold, s.target_period_ms);
+    assert!(!g1.pass && g1.value > Some(30.0));
+    assert!(s.records.missed_deadlines > Some(0));
+    let md = spike_core::export::markdown(&s, &run, &Default::default());
+    assert!(!md.contains("| G1 | true | false | 33.333 | 0 ms"), "{md}");
+    // An off-band mode is invalid too, and still measured.
+    run.info.vrr = false;
+    run.info.refresh = spike_core::run::Rational { num: 50, den: 1 };
+    let s = evaluate(&run);
+    assert!(!s.check("V3").ok);
+    assert!((s.gate("G1").threshold.unwrap() - 20.0).abs() < 1e-9);
+}
+
+#[test]
+fn an_unknown_mode_leaves_t_and_g1r_unavailable_never_zero() {
+    let mut run = slow_run(20_000, 1);
+    run.info.refresh = spike_core::run::Rational { num: 0, den: 0 };
+    let s = evaluate(&run);
+    assert_eq!(s.target_period_ms, None);
+    assert_eq!(s.gate("G1").threshold, None);
+    assert!(!s.gate("G1").pass);
+    assert_eq!(s.records.missed_deadlines, None);
+    let md = spike_core::export::markdown(&s, &run, &Default::default());
+    assert!(
+        md.contains("G1 T — ms") && md.contains("Missed deadlines (G1r): —"),
+        "{md}"
+    );
+    assert!(
+        md.lines()
+            .any(|l| l.starts_with("| G1 |") && l.contains("| — ms |")),
+        "{md}"
+    );
 }

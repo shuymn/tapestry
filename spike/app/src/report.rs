@@ -306,7 +306,7 @@ fn print_summary(s: &Summary) {
             if g.pass { "pass" } else { "FAIL" },
             if g.applies { "" } else { " (recorded)" },
             g.value,
-            g.threshold,
+            g.threshold.map_or("unknown".into(), |t| t.to_string()),
             g.unit,
             g.samples
         );

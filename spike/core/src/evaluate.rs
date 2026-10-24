@@ -61,7 +61,8 @@ pub struct Gate {
     pub applies: bool,
     pub pass: bool,
     pub value: Option<f64>,
-    pub threshold: f64,
+    /// `None` when unknown (G1 without the run's mode).
+    pub threshold: Option<f64>,
     pub unit: String,
     pub samples: u64,
 }
@@ -80,7 +81,9 @@ pub struct WorstFrame {
 pub struct Records {
     /// G1r: heavy-window frames displayed ≥ 1.5 T after the previous one,
     /// plus heavy-window frames not displayed.
-    pub missed_deadlines: u64,
+    /// `None` when T is unknown (the run's mode is unknown): never 0 for
+    /// "not counted".
+    pub missed_deadlines: Option<u64>,
     pub not_displayed: u64,
     pub heavy_frames: u64,
     pub whole_run_p99_interval_ms: Option<f64>,
@@ -141,8 +144,12 @@ impl Summary {
 pub fn evaluate(run: &RunData) -> Summary {
     let tl = run.info.timeline;
     let refresh_class_hz = refresh_class(run);
-    let target_hz = refresh_class_hz.map(|c| target(run, c));
-    let target_period_ms = refresh_class_hz.map(|c| target_period_ms(run, c));
+    // T follows the run's mode whenever it is known; V3 only decides
+    // validity (a VRR-on or off-band run is invalid, yet its G1 and G1r are
+    // still measured against its own refresh).
+    let mode = mode_class(run);
+    let target_hz = mode.map(|c| target(run, c));
+    let target_period_ms = mode.map(|c| target_period_ms(run, c));
     let validity = vec![
         m1(run),
         v1(run),
@@ -300,6 +307,14 @@ fn v2(run: &RunData) -> Check {
     }
     r.dedup();
     check("V2", r)
+}
+
+/// The class of the run's mode for T: its 60/240 Hz class with a known
+/// exact refresh rational, whether or not V3 accepts the mode.
+fn mode_class(run: &RunData) -> Option<u32> {
+    let i = &run.info;
+    (REFRESH_CLASSES.contains(&i.class_hz) && i.refresh.num > 0 && i.refresh.den > 0)
+        .then_some(i.class_hz)
 }
 
 /// The run's class when its monitor's exact refresh rate is within ±0.1%
@@ -601,8 +616,7 @@ fn v8(run: &RunData) -> Check {
     let play = (tl.play_start_us, tl.play_end_us());
     let mut r = vec![];
     let s = &run.streams;
-    let frame_us =
-        refresh_class(run).map_or(16_667, |c| (target_period_ms(run, c) * 1000.0) as i64);
+    let frame_us = mode_class(run).map_or(16_667, |c| (target_period_ms(run, c) * 1000.0) as i64);
     if !complete(s.frames, run.frames.len())
         || !spans(
             &run.frames,
@@ -670,7 +684,7 @@ fn gate(
     applies: bool,
     pass: bool,
     value: Option<f64>,
-    threshold: f64,
+    threshold: impl Into<Option<f64>>,
     unit: &str,
     samples: usize,
 ) -> Gate {
@@ -679,7 +693,7 @@ fn gate(
         applies,
         pass,
         value,
-        threshold,
+        threshold: threshold.into(),
         unit: unit.into(),
         samples: samples as u64,
     }
@@ -707,9 +721,7 @@ fn gates(run: &RunData, tl: &Timeline, t_ms: Option<f64>) -> (Vec<Gate>, Records
         .iter()
         .filter(|f| f.display_change_ms.is_none())
         .count() as u64;
-    let late = t_ms.map_or(0, |t| {
-        intervals.iter().filter(|&&i| i >= 1.5 * t).count() as u64
-    });
+    let late = t_ms.map(|t| intervals.iter().filter(|&&i| i >= 1.5 * t).count() as u64);
 
     // G2: render CPU work, assigned to windows like G1/G3: by the display
     // time of the frame's PresentMon row, or its render time if it has none.
@@ -766,15 +778,7 @@ fn gates(run: &RunData, tl: &Timeline, t_ms: Option<f64>) -> (Vec<Gate>, Records
     let pct = |n: u64, d: u64| (d > 0).then(|| n as f64 * 100.0 / d as f64);
 
     let gates = vec![
-        gate(
-            "G1",
-            true,
-            g1_pass,
-            p99,
-            t_ms.unwrap_or(0.0),
-            "ms",
-            intervals.len(),
-        ),
+        gate("G1", true, g1_pass, p99, t_ms, "ms", intervals.len()),
         gate(
             "G2",
             kind == RunKind::Baseline,
@@ -887,7 +891,7 @@ fn gates(run: &RunData, tl: &Timeline, t_ms: Option<f64>) -> (Vec<Gate>, Records
         })
         .collect();
     let records = Records {
-        missed_deadlines: late + not_displayed,
+        missed_deadlines: late.map(|l| l + not_displayed),
         not_displayed,
         heavy_frames: heavy_pm.len() as u64,
         whole_run_p99_interval_ms: percentile_f64(&all, 99),

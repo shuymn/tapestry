@@ -722,7 +722,7 @@ pub fn markdown(s: &Summary, run: &RunData, cond: &PublicConditions) -> String {
             g.applies,
             g.pass,
             ms(g.value),
-            g.threshold,
+            g.threshold.map_or("—".into(), |t| t.to_string()),
             g.unit,
             g.samples
         );
@@ -746,7 +746,7 @@ pub fn markdown(s: &Summary, run: &RunData, cond: &PublicConditions) -> String {
     let _ = writeln!(
         m,
         "\n## Records\n\n- Missed deadlines (G1r): {} ({} not displayed) of {} heavy-window frames\n- Whole run p99 / max interval: {} / {} ms\n- Voice steals: {}; BGA due not displayed: {}\n- Present modes (PresentMon rows): {modes}\n- Library allocations (G6r): {libs}",
-        r.missed_deadlines,
+        r.missed_deadlines.map_or("—".into(), |m| m.to_string()),
         r.not_displayed,
         r.heavy_frames,
         ms(r.whole_run_p99_interval_ms),
