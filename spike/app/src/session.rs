@@ -156,6 +156,8 @@ pub struct InjectionCheck {
 
 #[derive(Serialize)]
 pub struct AudioSummary {
+    /// Run µs of play start (episode times are run µs).
+    pub play_start_us: i64,
     pub render: Option<RenderSide>,
     pub render_error: Option<String>,
     pub loopback: Option<LoopbackSide>,
@@ -270,6 +272,7 @@ impl Session {
                     _ => None,
                 };
                 Some(AudioSummary {
+                    play_start_us: play_start,
                     render: render_side,
                     render_error,
                     loopback: loop_side,
@@ -434,9 +437,23 @@ pub fn print(s: &PlaySummary) {
             r.sound_commands
         );
         for st in &r.starves {
+            // Episodes by timestamps, which trail the mix clock by the
+            // engine's buffering (tens of ms): within 100 ms after.
+            let to = st.at_us + i64::from(st.withheld_ms) * 1_000 + 100_000;
+            let episodes = a
+                .facts
+                .episodes
+                .iter()
+                .filter(|e| (st.at_us..to).contains(&(e.start_us - a.play_start_us)))
+                .count();
             println!(
-                "starve: at {} us withheld {} ms, queued {} us (exceeds: {})",
-                st.at_us, st.withheld_ms, st.queued_us, st.exceeds_queued
+                "starve: at {} us withheld {} ms, queued {} us (exceeds: {}); padding-0 wakes {}; episodes {}",
+                st.at_us,
+                st.withheld_ms,
+                st.queued_us,
+                st.exceeds_queued,
+                st.padding_zero_wakes,
+                episodes
             );
         }
     }

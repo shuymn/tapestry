@@ -35,7 +35,7 @@ use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::window::{Fullscreen, Window, WindowId};
 
 struct Shared {
@@ -167,6 +167,10 @@ pub fn windowed(args: &RunArgs) -> Result<ExitCode, String> {
     let el = EventLoop::<Result<(), String>>::with_user_event()
         .build()
         .map_err(|e| e.to_string())?;
+    // The input thread registers keyboard Raw Input on its own window; Raw
+    // Input has one target window per device type per process, so winit
+    // must not register its device events over it.
+    el.listen_device_events(DeviceEvents::Never);
     let mut app = App {
         args: args.clone(),
         shared: Arc::new(Shared {

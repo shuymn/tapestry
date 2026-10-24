@@ -337,6 +337,10 @@ pub struct Starve {
     /// Audio queued on the device when writes stopped.
     pub queued_us: i64,
     pub exceeds_queued: bool,
+    /// Wakes that found the device buffer empty from the start of the
+    /// withholding until a period after writes resumed (the diagnostic
+    /// that should match the episode).
+    pub padding_zero_wakes: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -507,7 +511,14 @@ fn render_thread(
                 &mut p.max,
             )
             .ok()
-            .and_then(|_| pick_period(p, args.period).ok())
+            .map(|_| pick_period(p, args.period))
+            .transpose()
+            .or_else(|e| match args.period {
+                // Only the smallest period may fall back to the default
+                // one; an explicit rung off the ladder is an error.
+                PeriodChoice::Min => Ok(None),
+                _ => Err(e),
+            })?
             .and_then(|period| {
                 c3.InitializeSharedAudioStream(
                     AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -527,9 +538,6 @@ fn render_thread(
                 period,
             ),
             None => {
-                if let PeriodChoice::Frames(_) = args.period {
-                    pick_period(p, args.period)?;
-                }
                 // Fallback: a fresh client at the default period.
                 let c: IAudioClient =
                     hr("Activate IAudioClient", device.Activate(CLSCTX_ALL, None))?;
@@ -651,6 +659,11 @@ fn render_thread(
         if padding == 0 {
             diag.wakes_padding_zero += 1;
             note_at(&mut diag.padding_zero_at_us, now_play);
+            if let Some(st) = starves.last_mut()
+                && now_play <= st.at_us + i64::from(st.withheld_ms) * 1_000 + period_us
+            {
+                st.padding_zero_wakes += 1;
+            }
         }
         // The engine mix clock: the event fires after the audio engine
         // took a period from the buffer, so the first frame still queued
@@ -691,6 +704,7 @@ fn render_thread(
                 withheld_ms: ms,
                 queued_us,
                 exceeds_queued: i64::from(ms) * 1_000 > queued_us,
+                padding_zero_wakes: 0,
             });
             next_starve += 1;
             starve_until = Some(now_play + i64::from(ms) * 1_000);
