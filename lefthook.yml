@@ -18,3 +18,10 @@ pre-commit:
     shellcheck:
       glob: "**/*.sh"
       run: mise exec -- shellcheck {staged_files}
+
+# An automatic merge commit runs pre-merge-commit, not pre-commit. Rebases can
+# replay commits without either hook; CI is the final gate.
+pre-merge-commit:
+  commands:
+    banned-words:
+      run: mise exec -- cargo xtask banned-words --staged

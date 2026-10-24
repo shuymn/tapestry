@@ -47,9 +47,15 @@ impl Repo {
         out
     }
 
-    /// Exit status is ignored (a merge with conflicts exits 1).
-    fn git_any(&self, args: &[&str]) {
-        self.command("git").args(args).output().unwrap();
+    /// Runs git without requiring success; returns the exit code.
+    fn git_code(&self, args: &[&str]) -> i32 {
+        let out = self.command("git").args(args).output().unwrap();
+        out.status.code().unwrap()
+    }
+
+    /// Whether a merge is in progress (`MERGE_HEAD` exists).
+    fn merging(&self) -> bool {
+        self.git_code(&["rev-parse", "-q", "--verify", "MERGE_HEAD"]) == 0
     }
 
     fn write(&self, path: &str, contents: &str) {
@@ -184,7 +190,10 @@ fn merge_resolution_adding_a_term_is_staged() {
     repo.git(&["checkout", "-q", "main"]);
     repo.stage("a.md", "main\n");
     repo.commit("main");
-    repo.git_any(&["merge", "-q", "side"]);
+    assert_eq!(repo.git_code(&["merge", "-q", "side"]), 1);
+    assert!(repo.merging());
+    let unmerged = repo.git(&["ls-files", "--unmerged", "--", "a.md"]).stdout;
+    assert!(!unmerged.is_empty(), "a.md should be in conflict");
     repo.stage("a.md", "resolved zorblax\n");
     let (code, err) = repo.check(&["--staged"]);
     assert_eq!(code, 1, "{err}");
@@ -203,4 +212,24 @@ fn missing_list_and_bad_usage_exit_2() {
     assert_eq!(repo.check(&[]).0, 2);
     assert_eq!(repo.check(&["--staged", "--all"]).0, 2);
     assert_eq!(repo.check(&["--all", "--list"]).0, 2);
+}
+
+/// What `pre-merge-commit` sees: an automatic merge, before its commit.
+#[test]
+fn automatic_merge_bringing_a_term_is_staged() {
+    let repo = Repo::new();
+    repo.stage("banned-words.txt", LIST);
+    repo.stage("a.md", "base\n");
+    repo.commit("base");
+    repo.git(&["checkout", "-q", "-b", "side"]);
+    repo.stage("b.md", "zorblax\n");
+    repo.commit("side");
+    repo.git(&["checkout", "-q", "main"]);
+    repo.stage("a.md", "main\n");
+    repo.commit("main");
+    repo.git(&["merge", "-q", "--no-commit", "--no-ff", "side"]);
+    assert!(repo.merging());
+    let (code, err) = repo.check(&["--staged"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("b.md:1:1:"), "{err}");
 }
