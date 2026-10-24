@@ -9,7 +9,9 @@
 use crate::chart::{LANES, MIN_NOTES};
 use crate::heavy::Timeline;
 use crate::obslog::{EncoderFamily, ObsSession};
-use crate::run::{EncoderClass, EventKind, PmFrame, Profile, RunData, RunKind, ThreadTag};
+use crate::run::{
+    EncoderClass, EventKind, PmFrame, Profile, RunData, RunKind, StreamCount, ThreadTag,
+};
 use crate::stats::{percentile_f64, percentile_i64};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,6 +28,15 @@ pub const PRESENT_MATCH_TOL_US: i64 = 1_000;
 /// V4: longest PresentMon row gap allowed while the spike presents.
 pub const MAX_CAPTURE_GAP_US: i64 = 1_000_000;
 pub const MIN_MIX_RATE_HZ: u32 = 44_100;
+/// Required runs play the chart this many times (600 s).
+pub const REQUIRED_LOOPS: u32 = 4;
+/// V8: longest gap between audio-period records, and between BGA due
+/// records, inside the play window.
+pub const MAX_AUDIO_PERIOD_GAP_US: i64 = 50_000;
+pub const MAX_BGA_DUE_GAP_US: i64 = 50_000;
+/// V8: a stream must start within this of play start and end within this
+/// of play end.
+pub const STREAM_EDGE_US: i64 = 1_000_000;
 /// V7 measurement-window bounds.
 pub const MAX_OBS_PRE_ROLL_MS: i64 = 30_000;
 pub const MAX_OBS_POST_ROLL_MS: i64 = 60_000;
@@ -113,8 +124,9 @@ impl Summary {
 pub fn evaluate(run: &RunData) -> Summary {
     let tl = run.info.timeline;
     let refresh_class_hz = refresh_class(run);
-    let target_hz = refresh_class_hz.map(|c| run.info.fps_cap.unwrap_or(c));
+    let target_hz = refresh_class_hz.map(|c| target(run, c));
     let validity = vec![
+        m1(run),
         v1(run),
         v2(run),
         v3(run, refresh_class_hz),
@@ -122,6 +134,7 @@ pub fn evaluate(run: &RunData) -> Summary {
         v5(run),
         v6(run),
         v7(run),
+        v8(run),
     ];
     let (gates, mut records) = gates(run, &tl, target_hz);
     records.obs_pre_roll_ms = session(run).map(|s| s.pre_roll_ms);
@@ -159,6 +172,44 @@ fn bga_on(run: &RunData) -> bool {
     run.info.profile != Profile::NoBga
 }
 
+/// G1 target T: the refresh class for R1 and for standard-profile OBS runs;
+/// the cap only for streaming-profile OBS runs and diagnostics.
+fn target(run: &RunData, class: u32) -> u32 {
+    match (run.info.kind, run.info.profile) {
+        (RunKind::Baseline, _) | (RunKind::Obs, Profile::Standard) => class,
+        _ => run.info.fps_cap.unwrap_or(class),
+    }
+}
+
+/// Matrix eligibility: a run counts as a required cell only in the
+/// configuration the matrix defines (§2 profiles, §4.2). Anything else must
+/// be marked `Diagnostic`.
+fn m1(run: &RunData) -> Check {
+    let i = &run.info;
+    let mut r = vec![];
+    match i.kind {
+        RunKind::Diagnostic => {}
+        RunKind::Baseline => {
+            if i.profile != Profile::Standard {
+                r.push("baseline-not-standard-profile");
+            }
+            if i.fps_cap.is_some() {
+                r.push("baseline-capped");
+            }
+        }
+        RunKind::Obs => match i.profile {
+            Profile::Standard if i.fps_cap.is_some() => r.push("standard-profile-capped"),
+            Profile::Streaming if i.fps_cap.is_none() => r.push("streaming-profile-uncapped"),
+            Profile::NoBga => r.push("no-bga-is-diagnostic-only"),
+            _ => {}
+        },
+    }
+    if i.kind != RunKind::Diagnostic && i.timeline.loops != REQUIRED_LOOPS {
+        r.push("not-4-loops");
+    }
+    check("M1", r)
+}
+
 fn v1(run: &RunData) -> Check {
     let c = &run.counters;
     let mut r = vec![];
@@ -187,9 +238,11 @@ fn v2(run: &RunData) -> Check {
         }
         // Every whole second of the window has a frame with all lanes lit.
         let mut lit = vec![false; ((w.end_us - w.start_us) / 1_000_000) as usize];
-        for f in run.frames.iter().filter(|f| inw(f.present_us)) {
+        // Rendered frames, presented or not: V2 checks the load, not the
+        // presentation.
+        for f in run.frames.iter().filter(|f| inw(f.render_us)) {
             if f.lanes_with_effects >= LANES {
-                let s = ((f.present_us - w.start_us) / 1_000_000) as usize;
+                let s = ((f.render_us - w.start_us) / 1_000_000) as usize;
                 if let Some(x) = lit.get_mut(s) {
                     *x = true;
                 }
@@ -255,22 +308,14 @@ fn v4(run: &RunData) -> Check {
     let spike: Vec<i64> = run
         .frames
         .iter()
-        .map(|f| f.present_us)
+        .filter_map(|f| f.present_us)
         .filter(|&t| tl.in_play(t))
         .collect();
     // Every spike present in the play window has its own PresentMon row.
-    let mut j = 0;
-    let mut missing = 0usize;
-    for &p in &spike {
-        while j < pm.len() && pm[j] < p - PRESENT_MATCH_TOL_US {
-            j += 1;
-        }
-        if j < pm.len() && pm[j] <= p + PRESENT_MATCH_TOL_US {
-            j += 1;
-        } else {
-            missing += 1;
-        }
-    }
+    let missing = match_presents(&spike, &pm)
+        .iter()
+        .filter(|m| m.is_none())
+        .count();
     if missing > 0 {
         r.push("presents-missing-from-capture");
     }
@@ -286,6 +331,24 @@ fn v4(run: &RunData) -> Check {
         r.push("capture-gap-over-1s");
     }
     check("V4", r)
+}
+
+/// One-to-one match of spike present times to PresentMon present times
+/// (both sorted), within `PRESENT_MATCH_TOL_US`.
+fn match_presents(spike: &[i64], pm: &[i64]) -> Vec<Option<usize>> {
+    let mut j = 0;
+    spike
+        .iter()
+        .map(|&p| {
+            while j < pm.len() && pm[j] < p - PRESENT_MATCH_TOL_US {
+                j += 1;
+            }
+            (j < pm.len() && pm[j] <= p + PRESENT_MATCH_TOL_US).then(|| {
+                j += 1;
+                j - 1
+            })
+        })
+        .collect()
 }
 
 fn v5(run: &RunData) -> Check {
@@ -376,6 +439,77 @@ fn v7(run: &RunData) -> Check {
     check("V7", r)
 }
 
+/// Times inside play must reach both ends of play and, with `max_gap`,
+/// have no larger hole.
+fn spans(times: &[i64], start: i64, end: i64, max_gap: Option<i64>) -> bool {
+    let (Some(&a), Some(&b)) = (times.first(), times.last()) else {
+        return false;
+    };
+    a <= start + STREAM_EDGE_US
+        && b >= end - STREAM_EDGE_US
+        && max_gap.is_none_or(|g| {
+            times
+                .windows(2)
+                .all(|w| w[1] - w[0] <= g || w[1] <= start || w[0] >= end)
+        })
+}
+
+fn complete(c: StreamCount, rows: usize) -> bool {
+    c.lost == 0 && c.produced == rows as u64
+}
+
+/// V8: measurement evidence is complete. Every stream reports what its
+/// producer made and lost, so a gate is never computed from a partial
+/// stream (one sample cannot satisfy G4, V2 or G7).
+fn v8(run: &RunData) -> Check {
+    let tl = run.info.timeline;
+    let (start, end) = (tl.play_start_us, tl.play_end_us());
+    let mut r = vec![];
+    let s = &run.streams;
+    let frames: Vec<i64> = run.frames.iter().map(|f| f.render_us).collect();
+    if !complete(s.frames, frames.len()) || !spans(&frames, start, end, None) {
+        r.push("frames-incomplete");
+    }
+    // One synthetic press per note.
+    if !complete(s.input, run.input.len())
+        || run.input.len() as u64 != u64::from(run.counters.notes_total)
+    {
+        r.push("input-incomplete");
+    }
+    let periods: Vec<i64> = run.audio_periods.iter().map(|p| p.t_us).collect();
+    if !complete(s.audio_periods, periods.len())
+        || !spans(&periods, start, end, Some(MAX_AUDIO_PERIOD_GAP_US))
+    {
+        r.push("audio-periods-incomplete");
+    }
+    let due: Vec<i64> = run.bga.iter().map(|b| b.due_us).collect();
+    if bga_on(run)
+        && (!complete(s.bga, due.len()) || !spans(&due, start, end, Some(MAX_BGA_DUE_GAP_US)))
+    {
+        r.push("bga-incomplete");
+    }
+    let threads = [
+        ThreadTag::Input,
+        ThreadTag::Logic,
+        ThreadTag::Audio,
+        ThreadTag::Render,
+    ];
+    if !threads
+        .iter()
+        .all(|t| run.counters.app_allocs.contains_key(t))
+    {
+        r.push("allocation-counters-missing");
+    }
+    if run
+        .pm_frames
+        .iter()
+        .any(|f| tl.is_heavy(f.window_time_us()) && f.gpu_busy_ms.is_none())
+    {
+        r.push("gpu-time-missing");
+    }
+    check("V8", r)
+}
+
 fn gate(
     id: &str,
     applies: bool,
@@ -423,11 +557,18 @@ fn gates(run: &RunData, tl: &Timeline, target_hz: Option<u32>) -> (Vec<Gate>, Re
         intervals.iter().filter(|&&i| i >= 1.5 * t).count() as u64
     });
 
-    // G2: render CPU work.
+    // G2: render CPU work, assigned to windows like G1/G3: by the display
+    // time of the frame's PresentMon row, or its render time if it has none.
+    let pm_present: Vec<i64> = run.pm_frames.iter().map(|f| f.present_us).collect();
+    let presented: Vec<i64> = run.frames.iter().filter_map(|f| f.present_us).collect();
+    let mut matched = match_presents(&presented, &pm_present).into_iter();
     let cpu: Vec<i64> = run
         .frames
         .iter()
-        .filter(|f| tl.is_heavy(f.present_us))
+        .filter(|f| {
+            let row = f.present_us.and_then(|_| matched.next().flatten());
+            tl.is_heavy(row.map_or(f.render_us, |i| run.pm_frames[i].window_time_us()))
+        })
         .map(|f| i64::from(f.render_cpu_us))
         .collect();
     let cpu99 = percentile_i64(&cpu, 99);
@@ -568,12 +709,12 @@ fn gates(run: &RunData, tl: &Timeline, target_hz: Option<u32>) -> (Vec<Gate>, Re
         .take(10)
         .map(|f| {
             // Load counters of the spike frame presented nearest this row.
-            let k = run.frames.partition_point(|s| s.present_us < f.present_us);
+            let k = run.frames.partition_point(|s| s.render_us < f.present_us);
             let near = [k.checked_sub(1), Some(k)]
                 .into_iter()
                 .flatten()
                 .filter_map(|i| run.frames.get(i))
-                .min_by_key(|s| (s.present_us - f.present_us).abs());
+                .min_by_key(|s| (s.present_us.unwrap_or(s.render_us) - f.present_us).abs());
             WorstFrame {
                 present_us: f.present_us,
                 display_change_ms: f.display_change_ms.unwrap_or(0.0),

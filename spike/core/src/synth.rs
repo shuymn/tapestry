@@ -26,7 +26,7 @@ pub fn passing_run() -> RunData {
         loops: 4,
     };
     let presents = present_times(&timeline, 60);
-    let pm_frames = presents
+    let pm_frames: Vec<PmFrame> = presents
         .iter()
         .map(|&t| PmFrame {
             present_us: t,
@@ -35,10 +35,11 @@ pub fn passing_run() -> RunData {
             gpu_busy_ms: Some(1.0),
         })
         .collect();
-    let frames = presents
+    let frames: Vec<SpikeFrame> = presents
         .iter()
         .map(|&t| SpikeFrame {
-            present_us: t,
+            render_us: t - 3_000,
+            present_us: Some(t),
             render_cpu_us: 800,
             present_call_us: 50,
             visible_notes: 80,
@@ -48,29 +49,30 @@ pub fn passing_run() -> RunData {
         })
         .collect();
     let (start, end) = (timeline.play_start_us, timeline.play_end_us());
-    let audio_periods = (start..end)
+    let audio_periods: Vec<AudioPeriod> = (start..end)
         .step_by(10_000)
         .map(|t| AudioPeriod {
             t_us: t,
             active_voices: 150,
         })
         .collect();
-    let input = (start..end)
+    let input: Vec<InputLatency> = (start..end)
         .step_by(5_000)
         .map(|t| InputLatency {
             t_us: t,
             latency_us: 200,
         })
         .collect();
-    let bga = (0..(end - start) * 60 / 1_000_000)
+    let bga: Vec<BgaDue> = (0..(end - start) * 60 / 1_000_000)
         .map(|i| BgaDue {
             due_us: start + i * 1_000_000 / 60,
             displayed: true,
         })
         .collect();
     let mut counters = Counters {
-        notes_total: 4 * 19_700,
-        notes_played: 4 * 19_700,
+        // One synthetic press (input record) per note.
+        notes_total: input.len() as u32,
+        notes_played: input.len() as u32,
         ..Counters::default()
     };
     for t in [
@@ -82,7 +84,7 @@ pub fn passing_run() -> RunData {
         counters.app_allocs.insert(t, 0);
     }
     counters.library_allocs.insert("submit".into(), 3);
-    RunData {
+    let mut run = RunData {
         info: RunInfo {
             profile: Profile::Standard,
             kind: RunKind::Baseline,
@@ -96,6 +98,7 @@ pub fn passing_run() -> RunData {
             presentmon_error: None,
         },
         counters,
+        streams: StreamCounts::default(),
         audio: AudioFacts {
             pilot_calibrated: true,
             unverifiable_spans: 0,
@@ -109,7 +112,24 @@ pub fn passing_run() -> RunData {
         audio_periods,
         input,
         bga,
-    }
+    };
+    sync_streams(&mut run);
+    run
+}
+
+/// Sets every stream's produced count to its row count with nothing lost,
+/// for tests that edit the rows.
+pub fn sync_streams(run: &mut RunData) {
+    let c = |n: usize| StreamCount {
+        produced: n as u64,
+        lost: 0,
+    };
+    run.streams = StreamCounts {
+        frames: c(run.frames.len()),
+        input: c(run.input.len()),
+        audio_periods: c(run.audio_periods.len()),
+        bga: c(run.bga.len()),
+    };
 }
 
 /// `passing_run` as an R3 cell (x264) with a clean OBS session.

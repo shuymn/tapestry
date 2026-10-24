@@ -85,11 +85,14 @@ impl PmFrame {
     }
 }
 
-/// One frame from the spike's own render-thread log (one Present per frame).
+/// One frame from the spike's own render-thread log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpikeFrame {
-    /// When the spike called Present.
-    pub present_us: i64,
+    /// When the render thread started building the frame (its load counters
+    /// below belong to this time).
+    pub render_us: i64,
+    /// When the spike called Present for it; `None` if it was not presented.
+    pub present_us: Option<i64>,
     /// Update, sprite building, BGA upload command and submission (no waits).
     pub render_cpu_us: u32,
     /// Diagnostic only.
@@ -182,10 +185,29 @@ pub struct OwnerPublic {
     pub audio_present: Option<bool>,
 }
 
+/// Producer-side count of one measurement stream: records produced and
+/// records the recorder could not keep (ring full). Written records are the
+/// stream's rows; evidence is complete only if `produced == rows` and
+/// `lost == 0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCount {
+    pub produced: u64,
+    pub lost: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCounts {
+    pub frames: StreamCount,
+    pub input: StreamCount,
+    pub audio_periods: StreamCount,
+    pub bga: StreamCount,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunData {
     pub info: RunInfo,
     pub counters: Counters,
+    pub streams: StreamCounts,
     pub audio: AudioFacts,
     pub owner: OwnerPublic,
     pub obs: Option<ObsDerived>,

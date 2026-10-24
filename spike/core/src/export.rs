@@ -14,7 +14,7 @@ use crate::evaluate::{Summary, evaluate};
 use crate::obslog::ObsDerived;
 use crate::run::{
     AudioFacts, AudioPeriod, BgaDue, Counters, InputLatency, LIBRARY_SCOPES, OwnerPublic, PmFrame,
-    RunData, RunEvent, RunInfo, SpikeFrame,
+    RunData, RunEvent, RunInfo, SpikeFrame, StreamCounts,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,13 @@ const JSON_KEYS: &[&str] = &[
     "game_visible",
     "audio_present",
     "t_us",
+    // streams
+    "streams",
+    "frames",
+    "audio_periods",
+    "bga",
+    "produced",
+    "lost",
     // app_allocs keys
     "input",
     "logic",
@@ -192,6 +199,7 @@ const JSON_KEYS: &[&str] = &[
 
 const CSV_COLUMNS: &[&str] = &[
     "present_us",
+    "render_us",
     "display_us",
     "display_change_ms",
     "gpu_busy_ms",
@@ -236,6 +244,7 @@ pub enum Finding {
 struct RunJson {
     info: RunInfo,
     counters: Counters,
+    streams: StreamCounts,
     audio: AudioFacts,
     owner: OwnerPublic,
     events: Vec<RunEvent>,
@@ -279,6 +288,7 @@ pub fn build(
     let run_json = RunJson {
         info: run.info.clone(),
         counters: run.counters.clone(),
+        streams: run.streams,
         audio: run.audio.clone(),
         owner: run.owner.clone(),
         events: run.events.clone(),
@@ -453,6 +463,7 @@ pub fn read(e: &Export) -> Result<RunData, ExportError> {
     Ok(RunData {
         info: r.info,
         counters: r.counters,
+        streams: r.streams,
         audio: r.audio,
         owner: r.owner,
         obs,

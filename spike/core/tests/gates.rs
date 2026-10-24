@@ -3,7 +3,7 @@
 
 use spike_core::evaluate::{Summary, evaluate};
 use spike_core::run::{Episode, EventKind, PmFrame, Rational, RunData, RunEvent, ThreadTag};
-use spike_core::synth::{PLAY_START_US, T60_MS, passing_run};
+use spike_core::synth::{PLAY_START_US, T60_MS, passing_obs_run, passing_run, sync_streams};
 
 fn heavy(run: &RunData, t: i64) -> bool {
     run.info.timeline.is_heavy(t)
@@ -44,7 +44,7 @@ fn spoil_heavy(run: &mut RunData, outside_instead: bool) {
         }
     }
     for (i, f) in run.frames.iter_mut().enumerate() {
-        if pick(&snapshot, f.present_us, i, every) {
+        if pick(&snapshot, f.present_us.unwrap() + 5_000, i, every) {
             f.render_cpu_us = 4_000;
         }
     }
@@ -120,7 +120,7 @@ fn b_g2_render_cpu_1_5_ms() {
             let tl = r.info.timeline;
             r.frames
                 .iter_mut()
-                .filter(|f| tl.is_heavy(f.present_us))
+                .filter(|f| tl.is_heavy(f.present_us.unwrap() + 5_000))
                 .for_each(|f| f.render_cpu_us = v);
         }
     };
@@ -232,16 +232,201 @@ fn c_59_94_and_239_76_are_invalid() {
     assert!(!validity_with_refresh(240, 1, Some(100)));
 }
 
+// ---- matrix eligibility (M1) ------------------------------------------
+
 #[test]
-fn g1_target_is_the_cap_when_capped() {
+fn m1_capped_240_hz_baseline_is_invalid_not_a_pass() {
     let mut run = passing_run();
     run.info.refresh = Rational { num: 240, den: 1 };
     run.info.fps_cap = Some(60);
     let s = evaluate(&run);
+    assert_eq!(s.check("M1").reasons, vec!["baseline-capped"]);
+    // T stays 1/240 s for R1, so the 60 fps frames also fail G1.
+    assert_eq!(s.target_hz, Some(240));
+    assert!(!s.gate("G1").pass);
+    assert_eq!(s.exit_code, 2);
+}
+
+#[test]
+fn m1_required_runs_need_the_matrix_configuration() {
+    use spike_core::run::{Profile, RunKind};
+    let reasons = |edit: &dyn Fn(&mut RunData)| {
+        let mut run = passing_run();
+        edit(&mut run);
+        evaluate(&run).check("M1").reasons.clone()
+    };
+    assert_eq!(
+        reasons(&|r| r.info.profile = Profile::Streaming),
+        vec!["baseline-not-standard-profile"]
+    );
+    assert_eq!(reasons(&|r| r.info.timeline.loops = 1), vec!["not-4-loops"]);
+    assert_eq!(
+        reasons(&|r| {
+            r.info.kind = RunKind::Obs;
+            r.info.profile = Profile::NoBga;
+            r.info.fps_cap = Some(60);
+        }),
+        vec!["no-bga-is-diagnostic-only"]
+    );
+    assert_eq!(
+        reasons(&|r| {
+            r.info.kind = RunKind::Obs;
+            r.info.fps_cap = Some(60);
+        }),
+        vec!["standard-profile-capped"]
+    );
+    assert_eq!(
+        reasons(&|r| {
+            r.info.kind = RunKind::Obs;
+            r.info.profile = Profile::Streaming;
+        }),
+        vec!["streaming-profile-uncapped"]
+    );
+    // The same configurations are fine as diagnostics.
+    assert!(
+        reasons(&|r| {
+            r.info.kind = RunKind::Diagnostic;
+            r.info.profile = Profile::NoBga;
+            r.info.timeline.loops = 1;
+            r.info.fps_cap = Some(60);
+        })
+        .is_empty()
+    );
+}
+
+#[test]
+fn g1_target_is_the_cap_only_for_streaming_obs_runs() {
+    use spike_core::run::Profile;
+    let mut run = passing_obs_run();
+    run.info.refresh = Rational { num: 240, den: 1 };
+    run.info.profile = Profile::Streaming;
+    run.info.fps_cap = Some(60);
+    let s = evaluate(&run);
     assert_eq!(s.target_hz, Some(60));
+    assert!(s.check("M1").ok);
     assert!(s.gate("G1").pass);
+    run.info.profile = Profile::Standard;
     run.info.fps_cap = None;
-    assert!(!evaluate(&run).gate("G1").pass);
+    let s = evaluate(&run);
+    assert_eq!(s.target_hz, Some(240));
+    assert!(!s.gate("G1").pass);
+}
+
+// ---- G2 window assignment ------------------------------------------------
+
+#[test]
+fn g2_assigns_frames_by_display_time_like_g1_and_g3() {
+    // Every frame is displayed 30 s after its present, so present-time
+    // windows and display-time windows differ. Spoil exactly the frames
+    // displayed in heavy windows: G2 must see them.
+    let mut run = passing_run();
+    let tl = run.info.timeline;
+    for f in &mut run.pm_frames {
+        f.display_us = Some(f.present_us + 30_000_000);
+    }
+    for f in &mut run.frames {
+        let p = f.present_us.unwrap();
+        if tl.is_heavy(p + 30_000_000) && !tl.is_heavy(p) {
+            f.render_cpu_us = 5_000;
+        }
+    }
+    let s = evaluate(&run);
+    assert_valid(&s);
+    assert!(!s.gate("G2").pass);
+}
+
+// ---- complete evidence (V8) -------------------------------------------
+
+#[test]
+fn v8_missing_or_partial_evidence_is_invalid() {
+    use spike_core::run::{AudioPeriod, InputLatency};
+    type Edit = Box<dyn Fn(&mut RunData)>;
+    let cases: Vec<(&str, Edit)> = vec![
+        (
+            "input-incomplete",
+            Box::new(|r| {
+                r.input.pop();
+                sync_streams(r);
+            }),
+        ),
+        ("input-incomplete", Box::new(|r| r.streams.input.lost = 1)),
+        (
+            "input-incomplete",
+            Box::new(|r| {
+                // One sample cannot satisfy G4.
+                r.input = vec![InputLatency {
+                    t_us: PLAY_START_US + 50_000_000,
+                    latency_us: 100,
+                }];
+                sync_streams(r);
+            }),
+        ),
+        (
+            "audio-periods-incomplete",
+            Box::new(|r| {
+                r.audio_periods = vec![AudioPeriod {
+                    t_us: PLAY_START_US + 50_000_000,
+                    active_voices: 200,
+                }];
+                sync_streams(r);
+            }),
+        ),
+        (
+            "audio-periods-incomplete",
+            Box::new(|r| {
+                let a = PLAY_START_US + 100_000_000;
+                r.audio_periods
+                    .retain(|p| !(a..a + 60_000).contains(&p.t_us));
+                sync_streams(r);
+            }),
+        ),
+        (
+            "audio-periods-incomplete",
+            Box::new(|r| r.streams.audio_periods.produced += 1),
+        ),
+        (
+            "bga-incomplete",
+            Box::new(|r| {
+                let a = PLAY_START_US + 45_000_000;
+                r.bga.retain(|b| !(a..a + 100_000).contains(&b.due_us));
+                sync_streams(r);
+            }),
+        ),
+        (
+            "frames-incomplete",
+            Box::new(|r| {
+                let end = r.info.timeline.play_end_us();
+                r.frames.retain(|f| f.render_us < end - 5_000_000);
+                sync_streams(r);
+            }),
+        ),
+        ("frames-incomplete", Box::new(|r| r.streams.frames.lost = 2)),
+        (
+            "allocation-counters-missing",
+            Box::new(|r| {
+                r.counters.app_allocs.remove(&ThreadTag::Audio);
+            }),
+        ),
+        (
+            "gpu-time-missing",
+            Box::new(|r| {
+                let tl = r.info.timeline;
+                let f = r
+                    .pm_frames
+                    .iter_mut()
+                    .find(|f| tl.is_heavy(f.window_time_us()))
+                    .unwrap();
+                f.gpu_busy_ms = None;
+            }),
+        ),
+    ];
+    for (reason, edit) in cases {
+        let mut run = passing_run();
+        edit(&mut run);
+        let s = evaluate(&run);
+        assert_eq!(s.check("V8").reasons, vec![reason]);
+        assert_eq!(s.exit_code, 2, "{reason}");
+    }
 }
 
 // ---- (d) NA rows count as not displayed, never dropped ----------------
@@ -327,28 +512,33 @@ fn e_capture_gap_while_presenting_is_invalid() {
     );
 }
 
-/// A run presenting every `period_us` with a complete capture whose
+/// A run rendering a frame every `render_period_us` at full load and
+/// presenting every `present_every`-th one, with a complete capture whose
 /// displayed intervals follow the 60 Hz refresh grid.
-fn slow_run(period_us: i64) -> RunData {
+fn slow_run(render_period_us: i64, present_every: usize) -> RunData {
     let mut run = passing_run();
     let tl = run.info.timeline;
     let from = tl.play_start_us - 1_000_000;
-    let times: Vec<i64> = (from..tl.play_end_us() + 2 * period_us)
-        .step_by(period_us as usize)
+    let renders: Vec<i64> = (from..tl.play_end_us() + 2_000_000)
+        .step_by(render_period_us as usize)
         .collect();
     let refresh_us = 1_000_000.0 / 60.0;
     let template_frame = run.frames[0];
-    run.frames = times
+    run.frames = renders
         .iter()
-        .map(|&t| spike_core::run::SpikeFrame {
-            present_us: t,
+        .enumerate()
+        .map(|(i, &t)| spike_core::run::SpikeFrame {
+            render_us: t,
+            present_us: i.is_multiple_of(present_every).then_some(t + 3_000),
             ..template_frame
         })
         .collect();
     let mut prev_vsync: Option<i64> = None;
-    run.pm_frames = times
+    run.pm_frames = run
+        .frames
         .iter()
-        .map(|&t| {
+        .filter_map(|f| f.present_us)
+        .map(|t| {
             let vsync = ((t - from) as f64 / refresh_us).ceil() as i64;
             let change = prev_vsync.map(|p| (vsync - p) as f64 * T60_MS);
             prev_vsync = Some(vsync);
@@ -360,12 +550,13 @@ fn slow_run(period_us: i64) -> RunData {
             }
         })
         .collect();
+    sync_streams(&mut run);
     run
 }
 
 #[test]
 fn e_complete_capture_of_a_50_fps_run_on_60_hz_fails_g1_but_is_valid() {
-    let s = evaluate(&slow_run(20_000));
+    let s = evaluate(&slow_run(20_000, 1));
     assert_valid(&s);
     assert!(!s.gate("G1").pass);
     assert!(s.gate("G1").value > Some(30.0));
@@ -374,12 +565,13 @@ fn e_complete_capture_of_a_50_fps_run_on_60_hz_fails_g1_but_is_valid() {
 }
 
 #[test]
-fn e_complete_capture_presenting_every_2_s_passes_v4() {
-    // V2 (all lanes lit every second) also fails for such a run; this
-    // checks that V4 alone does not call a slow but complete capture lossy.
-    let s = evaluate(&slow_run(2_000_000));
-    assert!(s.check("V4").ok, "{:?}", s.check("V4"));
+fn e_full_load_run_presenting_every_2_s_is_valid_and_fails_g1() {
+    // V2 looks at rendered frames, so the load is proven although only one
+    // frame in 120 reaches the screen.
+    let s = evaluate(&slow_run(1_000_000 / 60, 120));
+    assert_valid(&s);
     assert!(!s.gate("G1").pass);
+    assert_eq!(s.exit_code, 1);
 }
 
 // ---- other validity rules ----------------------------------------------
@@ -408,7 +600,7 @@ fn v1_v2_v5_v6_invalidate() {
                 r.frames
                     .iter_mut()
                     .filter(|f| {
-                        (w.start_us + 7_000_000..w.start_us + 8_000_000).contains(&f.present_us)
+                        (w.start_us + 7_000_000..w.start_us + 8_000_000).contains(&f.render_us)
                     })
                     .for_each(|f| f.lanes_with_effects = 7);
             }),
