@@ -1,21 +1,26 @@
-//! `run`: the render loop (offscreen for the WARP smoke, or windowed on the
-//! display), frame metrics into the P1 record types, and the outputs.
+//! `run`: shared render-run pieces (GPU setup, recording, outputs) and the
+//! offscreen run used by the WARP smoke. The windowed run is in `window`.
 
 use crate::alloc::{self, Scope, Tag, scope};
 use crate::bga::Bga;
+use crate::pacing::bga_due_records;
 use crate::render::Renderer;
 use crate::scene::{Frame, FrameLoad, Scene};
 use crate::timebase::{Clock, qpc, qpc_freq};
 use serde::Serialize;
 use spike_core::chart::{CHART_LEN_US, Chart, DEFAULT_SEED};
 use spike_core::heavy::Timeline;
-use spike_core::run::{BgaDue, EventKind, RunEvent, SpikeFrame, ThreadTag};
+use spike_core::run::{BgaDue, EventKind, RunEvent, SpikeFrame, StreamCount, ThreadTag};
 use spike_core::stats::percentile_i64;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub const COUNTDOWN_US: i64 = 5_000_000;
+/// Presenting continues this long after play so PresentMon's capture
+/// brackets the play window (V4); outside the gates and the allocation
+/// interval.
+pub const POST_PLAY_US: i64 = 2_000_000;
 /// Offscreen virtual frame interval (60 Hz).
 const VIRTUAL_FRAME_US: i64 = 16_667;
 
@@ -55,16 +60,28 @@ pub struct BgaSummary {
     pub width: u32,
     pub height: u32,
     pub decoded: u64,
+    /// Due in play / displayed by a presented frame (G7 inputs).
+    pub due: u64,
     pub displayed: u64,
-    pub skipped: u64,
+    /// Decoded frames released without upload.
+    pub superseded: u64,
     pub decoder_waits: u64,
+    pub decode_us_p50: Option<i64>,
+    pub decode_us_p99: Option<i64>,
+    /// Offscreen: every frame showed exactly the due BGA frame, across the
+    /// clip's loop boundary.
+    pub advanced_every_frame: Option<bool>,
 }
 
 #[derive(Serialize, Default)]
 pub struct DxgiSummary {
     pub frames: u64,
-    pub estimated: u64,
+    pub samples: u64,
     pub rejected: u64,
+    /// Samples paired with a frame by present count.
+    pub paired: u64,
+    pub prediction_error_us_p50: Option<i64>,
+    pub prediction_error_us_p99_abs: Option<i64>,
 }
 
 /// `render.json`: what one render run measured.
@@ -75,10 +92,12 @@ pub struct RenderSummary {
     pub device_type: String,
     pub size: (u32, u32),
     pub frames: u64,
+    /// Producer counts of the frame records (P1 V8).
+    pub frame_records: StreamCount,
     pub render_cpu_us_p50: Option<i64>,
     pub render_cpu_us_p99: Option<i64>,
     pub present_call_us_p99: Option<i64>,
-    /// Heavy-window values for the local check (G2 µs, G7 %).
+    /// Heavy-window values for the local check (G2 µs, G7 %); windowed only.
     pub heavy_render_cpu_us_p99: Option<i64>,
     pub heavy_bga_displayed_pct: Option<f64>,
     pub instances_max: u32,
@@ -88,18 +107,11 @@ pub struct RenderSummary {
     pub app_allocs: BTreeMap<ThreadTag, u64>,
     pub library_allocs: BTreeMap<String, u64>,
     pub other_thread_app_allocs: u64,
+    /// G6/G6r count allocations through Rust's global allocator only.
+    pub allocs_scope: String,
     pub readback_distinct_colors: Option<usize>,
+    pub bga_only_readback_distinct_colors: Option<usize>,
     pub events: Vec<RunEvent>,
-}
-
-pub fn instance() -> wgpu::Instance {
-    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-    desc.backends = wgpu::Backends::DX12;
-    // The render loop waits on the waitable object itself (design D3 open
-    // choice 1).
-    desc.backend_options.dx12.latency_waitable_object =
-        wgpu::Dx12UseFrameLatencyWaitableObject::DontWait;
-    wgpu::Instance::new(desc)
 }
 
 pub fn adapter(
@@ -126,15 +138,29 @@ pub fn adapter(
     }
 }
 
+pub fn instance() -> wgpu::Instance {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::DX12;
+    // The render loop waits on the waitable object itself (design D3 open
+    // choice 1).
+    desc.backend_options.dx12.latency_waitable_object =
+        wgpu::Dx12UseFrameLatencyWaitableObject::DontWait;
+    wgpu::Instance::new(desc)
+}
+
 pub fn device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
         .map_err(|e| format!("request device: {e}"))
 }
 
-/// Per-run recording state shared by both modes; all buffers preallocated.
+/// Per-run recording; buffers are preallocated and every production attempt
+/// is counted, so a full buffer shows up as lost records (V8), never as a
+/// silent gap.
 pub struct Recorder {
     pub frames: Vec<SpikeFrame>,
-    pub bga: Vec<BgaDue>,
+    /// BGA frame index each recorded frame showed.
+    pub shown: Vec<Option<u64>>,
+    pub frame_records: StreamCount,
     pub instances_max: u32,
     pub instances_dropped: u64,
 }
@@ -143,45 +169,113 @@ impl Recorder {
     pub fn new(max_frames: usize) -> Self {
         Self {
             frames: Vec::with_capacity(max_frames),
-            bga: Vec::with_capacity(max_frames * 2),
+            shown: Vec::with_capacity(max_frames),
+            frame_records: StreamCount::default(),
             instances_max: 0,
             instances_dropped: 0,
         }
     }
 
-    pub fn frame(&mut self, f: SpikeFrame, frame: &Frame, load: FrameLoad) {
+    pub fn frame(&mut self, f: SpikeFrame, shown: Option<u64>, frame: &Frame, load: FrameLoad) {
         self.instances_max = self
             .instances_max
             .max((frame.alpha.len() + frame.additive.len()) as u32);
         self.instances_dropped += u64::from(load.dropped);
+        self.frame_records.produced += 1;
         if self.frames.len() < self.frames.capacity() {
             self.frames.push(f);
+            self.shown.push(shown);
+        } else {
+            self.frame_records.lost += 1;
         }
     }
 }
 
-/// Uploads the BGA frame due at `video_us`, if any.
-pub fn bga_step(
-    bga: &mut Option<Bga>,
-    renderer: &mut Renderer,
-    video_us: i64,
-    wait: bool,
-    base_us: i64,
-    records: &mut Vec<BgaDue>,
-) -> bool {
-    let Some(b) = bga else {
-        return false;
-    };
-    let due = b.take_due(video_us, wait, base_us, records);
-    let Some(i) = due.slot else {
-        return false;
-    };
-    {
-        let slot = b.slot(i);
-        renderer.upload_bga(&slot.y, &slot.u, &slot.v);
+/// The BGA frame on screen: uploads the frame due at `due` if a newer one
+/// is available, and returns the index now in the textures.
+pub struct BgaState {
+    pub bga: Option<Bga>,
+    pub current: Option<u64>,
+}
+
+impl BgaState {
+    pub fn open(path: &Option<PathBuf>) -> Result<Self, String> {
+        Ok(Self {
+            bga: path.as_deref().map(Bga::open).transpose()?,
+            current: None,
+        })
     }
-    b.release(i);
-    true
+
+    pub fn step(
+        &mut self,
+        renderer: &mut Renderer,
+        due: u64,
+        wait: bool,
+    ) -> Result<Option<u64>, String> {
+        let Some(b) = &mut self.bga else {
+            return Ok(None);
+        };
+        if let Some(i) = b.take(due, wait)? {
+            let index = {
+                let slot = b.slot(i);
+                renderer.upload_bga(&slot.y, &slot.u, &slot.v);
+                slot.index
+            };
+            b.release(i);
+            self.current = Some(index);
+        }
+        Ok(self.current)
+    }
+
+    pub fn interval_us(&self) -> i64 {
+        self.bga
+            .as_ref()
+            .map_or(crate::bga::DEFAULT_INTERVAL_US, |b| b.interval_us)
+    }
+
+    pub fn summary(&self, due: &[BgaDue]) -> Option<BgaSummary> {
+        let b = self.bga.as_ref()?;
+        let decode: Vec<i64> = b
+            .decode_us
+            .lock()
+            .map(|d| d.iter().map(|&x| i64::from(x)).collect())
+            .unwrap_or_default();
+        Some(BgaSummary {
+            width: b.width,
+            height: b.height,
+            decoded: b.decoded.load(std::sync::atomic::Ordering::Relaxed),
+            due: due.len() as u64,
+            displayed: due.iter().filter(|d| d.displayed).count() as u64,
+            superseded: b.superseded,
+            decoder_waits: b.decoder_waits.load(std::sync::atomic::Ordering::Relaxed),
+            decode_us_p50: percentile_i64(&decode, 50),
+            decode_us_p99: percentile_i64(&decode, 99),
+            advanced_every_frame: None,
+        })
+    }
+}
+
+/// G7 due records for a play of `play_us` from what presented frames
+/// showed (`rec.shown` for frames with `presented`).
+pub fn bga_due(
+    rec: &Recorder,
+    bga: &BgaState,
+    play_start: i64,
+    play_us: i64,
+    presented: impl Fn(&SpikeFrame) -> bool,
+) -> Vec<BgaDue> {
+    if bga.bga.is_none() {
+        return vec![];
+    }
+    let interval = bga.interval_us();
+    let due_count = (play_us / interval) as u64;
+    let shown = rec
+        .frames
+        .iter()
+        .zip(&rec.shown)
+        .filter(|(f, _)| presented(f))
+        .filter_map(|(_, s)| *s);
+    bga_due_records(play_start, interval, due_count, shown)
 }
 
 pub fn summary_common(
@@ -189,18 +283,10 @@ pub fn summary_common(
     info: &wgpu::AdapterInfo,
     size: (u32, u32),
     rec: &Recorder,
-    bga: &Option<Bga>,
-    timeline: Timeline,
 ) -> RenderSummary {
     let cpu: Vec<i64> = rec
         .frames
         .iter()
-        .map(|f| i64::from(f.render_cpu_us))
-        .collect();
-    let heavy_cpu: Vec<i64> = rec
-        .frames
-        .iter()
-        .filter(|f| timeline.is_heavy(f.render_us))
         .map(|f| i64::from(f.render_cpu_us))
         .collect();
     let present: Vec<i64> = rec
@@ -209,11 +295,6 @@ pub fn summary_common(
         .filter(|f| f.present_us.is_some())
         .map(|f| i64::from(f.present_call_us))
         .collect();
-    let heavy_due: Vec<&BgaDue> = rec
-        .bga
-        .iter()
-        .filter(|b| timeline.is_heavy(b.due_us))
-        .collect();
     let (app_allocs, library_allocs) = alloc::snapshot();
     RenderSummary {
         mode: mode.into(),
@@ -221,33 +302,45 @@ pub fn summary_common(
         device_type: format!("{:?}", info.device_type),
         size,
         frames: rec.frames.len() as u64,
+        frame_records: rec.frame_records,
         render_cpu_us_p50: percentile_i64(&cpu, 50),
         render_cpu_us_p99: percentile_i64(&cpu, 99),
         present_call_us_p99: percentile_i64(&present, 99),
-        heavy_render_cpu_us_p99: percentile_i64(&heavy_cpu, 99),
-        heavy_bga_displayed_pct: (!heavy_due.is_empty()).then(|| {
-            heavy_due.iter().filter(|b| b.displayed).count() as f64 * 100.0 / heavy_due.len() as f64
-        }),
         instances_max: rec.instances_max,
         instances_dropped: rec.instances_dropped,
-        bga: bga.as_ref().map(|b| BgaSummary {
-            width: b.width,
-            height: b.height,
-            decoded: b.decoded.load(std::sync::atomic::Ordering::Relaxed),
-            displayed: b.displayed,
-            skipped: b.skipped,
-            decoder_waits: b.decoder_waits.load(std::sync::atomic::Ordering::Relaxed),
-        }),
-        dxgi: None,
         app_allocs,
         library_allocs,
         other_thread_app_allocs: alloc::other_app(),
-        readback_distinct_colors: None,
-        events: vec![],
+        allocs_scope: "Rust global allocator only (FFmpeg and D3D12 native heaps not counted)"
+            .into(),
+        ..RenderSummary::default()
     }
 }
 
-pub fn write_outputs(out: &Path, rec: &Recorder, summary: &RenderSummary) -> Result<(), String> {
+/// Heavy-window G2 (render CPU p99) and G7 (% displayed) for windowed runs.
+pub fn heavy_values(
+    rec: &Recorder,
+    due: &[BgaDue],
+    timeline: Timeline,
+) -> (Option<i64>, Option<f64>) {
+    let cpu: Vec<i64> = rec
+        .frames
+        .iter()
+        .filter(|f| timeline.is_heavy(f.render_us))
+        .map(|f| i64::from(f.render_cpu_us))
+        .collect();
+    let heavy: Vec<&BgaDue> = due.iter().filter(|b| timeline.is_heavy(b.due_us)).collect();
+    let pct = (!heavy.is_empty())
+        .then(|| heavy.iter().filter(|b| b.displayed).count() as f64 * 100.0 / heavy.len() as f64);
+    (percentile_i64(&cpu, 99), pct)
+}
+
+pub fn write_outputs(
+    out: &Path,
+    rec: &Recorder,
+    due: &[BgaDue],
+    summary: &RenderSummary,
+) -> Result<(), String> {
     std::fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
     let csv_out = |name: &str| {
         csv::Writer::from_path(out.join(name)).map_err(|e| format!("write {name}: {e}"))
@@ -258,7 +351,7 @@ pub fn write_outputs(out: &Path, rec: &Recorder, summary: &RenderSummary) -> Res
     }
     w.flush().map_err(|e| e.to_string())?;
     let mut w = csv_out("bga.csv")?;
-    for b in &rec.bga {
+    for b in due {
         w.serialize(b).map_err(|e| e.to_string())?;
     }
     w.flush().map_err(|e| e.to_string())?;
@@ -271,33 +364,54 @@ pub fn print_summary(s: &RenderSummary) {
     println!("adapter: {} ({})", s.adapter, s.device_type);
     println!("mode: {} {}x{}", s.mode, s.size.0, s.size.1);
     println!(
-        "frames: {} (render cpu p50 {:?} us, p99 {:?} us; instances max {}, dropped {})",
-        s.frames, s.render_cpu_us_p50, s.render_cpu_us_p99, s.instances_max, s.instances_dropped
+        "frames: {} (records produced {}, lost {}; render cpu p50 {:?} us, p99 {:?} us; instances max {}, dropped {})",
+        s.frames,
+        s.frame_records.produced,
+        s.frame_records.lost,
+        s.render_cpu_us_p50,
+        s.render_cpu_us_p99,
+        s.instances_max,
+        s.instances_dropped
     );
     if let Some(p) = s.present_call_us_p99 {
         println!("present call p99: {p} us");
     }
-    if let Some(b) = &s.bga {
-        println!(
-            "bga: {}x{} decoded {} displayed {} skipped {} decoder-waits {}",
-            b.width, b.height, b.decoded, b.displayed, b.skipped, b.decoder_waits
-        );
-    } else {
-        println!("bga: off");
+    match &s.bga {
+        Some(b) => println!(
+            "bga: {}x{} decoded {} due {} displayed {} superseded {} decoder-waits {} decode p50 {:?} us p99 {:?} us advanced {:?}",
+            b.width,
+            b.height,
+            b.decoded,
+            b.due,
+            b.displayed,
+            b.superseded,
+            b.decoder_waits,
+            b.decode_us_p50,
+            b.decode_us_p99,
+            b.advanced_every_frame
+        ),
+        None => println!("bga: off"),
     }
     if let Some(d) = &s.dxgi {
         println!(
-            "dxgi display-time estimates: {} of {} frames ({} rejected)",
-            d.estimated, d.frames, d.rejected
+            "dxgi: {} samples for {} frames ({} rejected, {} paired); display prediction error p50 {:?} us, |p99| {:?} us",
+            d.samples,
+            d.frames,
+            d.rejected,
+            d.paired,
+            d.prediction_error_us_p50,
+            d.prediction_error_us_p99_abs
+        );
+    }
+    if s.mode == "windowed" {
+        println!(
+            "heavy windows: G2 render cpu p99 {:?} us, G7 bga displayed {:?} %",
+            s.heavy_render_cpu_us_p99, s.heavy_bga_displayed_pct
         );
     }
     println!(
-        "heavy windows: G2 render cpu p99 {:?} us, G7 bga displayed {:?} %",
-        s.heavy_render_cpu_us_p99, s.heavy_bga_displayed_pct
-    );
-    println!(
-        "allocations after countdown: app {:?} (other threads {}), library {:?}",
-        s.app_allocs, s.other_thread_app_allocs, s.library_allocs
+        "allocations during play: app {:?} (other threads {}), library {:?} [{}]",
+        s.app_allocs, s.other_thread_app_allocs, s.library_allocs, s.allocs_scope
     );
     if let Some(c) = s.readback_distinct_colors {
         println!(
@@ -305,15 +419,30 @@ pub fn print_summary(s: &RenderSummary) {
             if c >= 16 { "non-blank" } else { "blank" }
         );
     }
+    if let Some(c) = s.bga_only_readback_distinct_colors {
+        println!(
+            "bga-only readback: {} ({c} distinct colors)",
+            if c >= 16 { "non-blank" } else { "blank" }
+        );
+    }
 }
 
-fn open_bga(path: &Option<PathBuf>) -> Result<Option<Bga>, String> {
-    path.as_deref().map(Bga::open).transpose()
+fn distinct_colors(pixels: &[u8]) -> usize {
+    let mut colors: Vec<u32> = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .step_by(97)
+        .map(|p| u32::from_le_bytes(*p))
+        .collect();
+    colors.sort_unstable();
+    colors.dedup();
+    colors.len()
 }
 
 /// Offscreen run (the WARP smoke): `frames` frames on a virtual 60 Hz clock;
-/// the BGA waits for its due frame so the result does not depend on the
-/// software rasterizer's speed.
+/// each frame waits for its due BGA frame so the result does not depend on
+/// the software rasterizer's speed. Fails on a decoder error or stall.
 pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
     alloc::tag_thread(Tag::Render);
     let clock = Clock::start();
@@ -321,14 +450,10 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
     let adapter = adapter(&instance, args.adapter, None)?;
     let info = adapter.get_info();
     let (dev, queue) = device(&adapter)?;
-    let mut bga = open_bga(&args.bga)?;
+    let mut bga = BgaState::open(&args.bga)?;
     let format = wgpu::TextureFormat::Rgba8Unorm;
-    let mut renderer = Renderer::new(
-        dev,
-        queue,
-        format,
-        bga.as_ref().map(|b| (b.width, b.height)),
-    );
+    let dims = bga.bga.as_ref().map(|b| (b.width, b.height));
+    let mut renderer = Renderer::new(dev, queue, format, dims);
     let target = renderer.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen"),
         size: wgpu::Extent3d {
@@ -348,74 +473,72 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
     let mut frame = Frame::new();
     let n = args.frames.unwrap_or(300) as usize;
     let mut rec = Recorder::new(n);
-    // Play starts at the first frame; video time equals play time.
+    let interval = bga.interval_us();
     let play_start = clock.now_us();
+    let mut advanced = true;
     for i in 0..n {
         if i == 1 {
             // Frame 0 creates lazily initialized state; count from frame 1.
             alloc::arm();
         }
         let virtual_us = i as i64 * VIRTUAL_FRAME_US;
+        let due = (virtual_us / interval) as u64;
         let t0 = qpc();
         let load = scene.build(virtual_us, &mut frame);
-        let shown = bga_step(
-            &mut bga,
-            &mut renderer,
-            virtual_us,
-            true,
-            play_start,
-            &mut rec.bga,
-        );
+        let shown = bga.step(&mut renderer, due, true)?;
+        advanced &= bga.bga.is_none() || shown == Some(due);
         renderer.draw(&view, size, &frame);
         let t1 = qpc();
         scope(Scope::OtherLibrary, || {
             let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
         });
-        let render_us = clock.to_us(t0);
         rec.frame(
             SpikeFrame {
-                render_us,
+                render_us: clock.to_us(t0),
                 present_us: None,
                 render_cpu_us: ((t1 - t0) * 1_000_000 / qpc_freq()) as u32,
                 present_call_us: 0,
+                present_count: None,
                 visible_notes: load.visible_notes,
                 effect_instances: load.effect_instances,
                 lanes_with_effects: load.lanes_with_effects,
-                bga_frame_shown: shown,
+                bga_frame_shown: shown.is_some(),
             },
+            shown,
             &frame,
             load,
         );
     }
     alloc::disarm();
-    let pixels = renderer.read_back(&target, size);
-    let mut colors: Vec<u32> = pixels
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .step_by(97)
-        .map(|p| u32::from_le_bytes(*p))
-        .collect();
-    colors.sort_unstable();
-    colors.dedup();
-    let timeline = Timeline {
-        play_start_us: play_start,
-        loops: 1,
-    };
-    let mut summary = summary_common("offscreen", &info, size, &rec, &bga, timeline);
-    summary.readback_distinct_colors = Some(colors.len());
+    let readback = distinct_colors(&renderer.read_back(&target, size));
+    // The BGA alone (no sprites), so its pixels are checked independently.
+    let bga_only = bga.bga.is_some().then(|| {
+        frame.alpha.clear();
+        frame.additive.clear();
+        renderer.draw(&view, size, &frame);
+        distinct_colors(&renderer.read_back(&target, size))
+    });
+    let virtual_play = n as i64 * VIRTUAL_FRAME_US;
+    let due = bga_due(&rec, &bga, play_start, virtual_play, |_| true);
+    let mut summary = summary_common("offscreen", &info, size, &rec);
+    summary.bga = bga.summary(&due).map(|mut b| {
+        b.advanced_every_frame = Some(advanced);
+        b
+    });
+    summary.readback_distinct_colors = Some(readback);
+    summary.bga_only_readback_distinct_colors = bga_only;
     print_summary(&summary);
-    write_outputs(&args.out, &rec, &summary)?;
-    let bga_ok = bga.as_ref().is_none_or(|b| b.displayed > 0);
-    Ok(if colors.len() >= 16 && bga_ok {
+    write_outputs(&args.out, &rec, &due, &summary)?;
+    let bga_ok = bga.bga.is_none() || (advanced && bga_only.is_some_and(|c| c >= 16));
+    Ok(if readback >= 16 && bga_ok {
         ExitCode::SUCCESS
     } else {
-        eprintln!("run: smoke failed (blank readback or no BGA frame displayed)");
+        eprintln!("run: smoke failed (blank readback, BGA not advancing, or blank BGA)");
         ExitCode::from(1)
     })
 }
 
-/// Records a window event that V5 cares about.
+/// A window event that V5 cares about.
 pub fn event(clock: &Clock, kind: EventKind) -> RunEvent {
     RunEvent {
         t_us: clock.now_us(),

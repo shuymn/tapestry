@@ -51,6 +51,10 @@ thread_local! {
 
 static ARMED: AtomicBool = AtomicBool::new(false);
 #[allow(clippy::declare_interior_mutable_const)]
+const NO: AtomicBool = AtomicBool::new(false);
+/// G6 tags with a thread that took part in the run.
+static REGISTERED: [AtomicBool; TAGS] = [NO; TAGS];
+#[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
 #[allow(clippy::declare_interior_mutable_const)]
 const ROW: [AtomicU64; SCOPES] = [ZERO; SCOPES];
@@ -93,12 +97,15 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-/// Tags the calling thread.
+/// Tags the calling thread and registers its tag as taking part in the
+/// run, so its G6 count is reported (an unused tag is absent, not zero).
 pub fn tag_thread(tag: Tag) {
     TAG.with(|t| t.set(tag as u8));
+    REGISTERED[tag as usize].store(true, Ordering::Relaxed);
 }
 
-/// Starts counting (after the countdown).
+/// Starts counting at play start; `disarm` at play end. The interval is
+/// shared by every thread.
 pub fn arm() {
     ARMED.store(true, Ordering::Relaxed);
 }
@@ -116,8 +123,10 @@ pub fn scope<R>(scope: Scope, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// App-code allocations by G6 thread, and library allocations by scope
-/// (all threads), in the P1 record types.
+/// App-code allocations by registered G6 thread, and library allocations
+/// by scope (all threads), in the P1 record types. Only allocations through
+/// Rust's global allocator are seen: FFmpeg's and the D3D12 runtime's own
+/// heaps are not.
 pub fn snapshot() -> (
     std::collections::BTreeMap<ThreadTag, u64>,
     std::collections::BTreeMap<String, u64>,
@@ -130,6 +139,7 @@ pub fn snapshot() -> (
         (ThreadTag::Render, Tag::Render),
     ]
     .into_iter()
+    .filter(|(_, t)| REGISTERED[*t as usize].load(Ordering::Relaxed))
     .map(|(k, t)| (k, get(t, 0)))
     .collect();
     let lib = (1..SCOPES)

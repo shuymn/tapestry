@@ -2,25 +2,22 @@
 //! decode thread capped at 2 threads, pool of 8 preallocated frames).
 //!
 //! The decode thread loops the video, copying each decoded I420 frame into
-//! a free pool slot and sending its index. The render thread takes the
-//! newest frame due at the predicted display time; older due frames are
-//! skipped and counted, and every due frame becomes a P1 `BgaDue` record.
+//! a free pool slot and sending its index. Frames are numbered by their
+//! position in the looped video (pts / frame interval). The render thread
+//! asks for the frame due at its predicted display time and gets the newest
+//! decoded frame not after it; older ones are released unshown. Which frame
+//! each presented frame showed is recorded by the caller, and G7's due
+//! records are built from that (`pacing::bga_due_records`), so frames that
+//! were never decoded count as missed.
 
-#[cfg(not(feature = "ffmpeg"))]
-use spike_core::run::BgaDue;
-
-/// Outcome of taking the frame due at some time.
-pub struct Due {
-    /// Pool slot to upload, if a new frame is due.
-    pub slot: Option<usize>,
-}
+/// Interval when the stream does not state its frame rate (60 fps).
+pub const DEFAULT_INTERVAL_US: i64 = 16_667;
 
 #[cfg(feature = "ffmpeg")]
 mod imp {
-    use super::Due;
     use crate::alloc::{self, Scope, Tag, scope};
+    use crate::timebase::{qpc, qpc_freq};
     use ffmpeg_next as ff;
-    use spike_core::run::BgaDue;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -33,45 +30,56 @@ mod imp {
         pub y: Vec<u8>,
         pub u: Vec<u8>,
         pub v: Vec<u8>,
-        /// Presentation time in the looped video, µs.
-        pub pts_us: i64,
+        /// Frame number in the looped video.
+        pub index: u64,
     }
 
     pub struct Bga {
         pub width: u32,
         pub height: u32,
+        pub interval_us: i64,
         slots: Arc<Vec<Mutex<Slot>>>,
         ready: Receiver<usize>,
         free: SyncSender<usize>,
         stop: Arc<AtomicBool>,
+        error: Arc<Mutex<Option<String>>>,
         pub decoded: Arc<AtomicU64>,
         /// Times the decoder found every slot in use and waited. With the
         /// decoder ahead of the display this is normal backpressure, not
         /// the D4 "exhausted pool": a due frame that could not be decoded
-        /// in time shows up as skipped or not displayed instead.
+        /// in time shows up as a missed due record instead.
         pub decoder_waits: Arc<AtomicU64>,
+        /// Decode time per frame (send + receive), µs, excluding the copy
+        /// and any wait for a free slot (§3.2).
+        pub decode_us: Arc<Mutex<Vec<u32>>>,
         /// Received but not yet due.
         pending: Option<usize>,
-        pub skipped: u64,
-        pub displayed: u64,
+        /// Decoded frames released without being uploaded.
+        pub superseded: u64,
     }
 
-    fn probe(path: &Path) -> Result<(u32, u32), String> {
+    fn probe(path: &Path) -> Result<(u32, u32, i64), String> {
         let ictx = ff::format::input(path).map_err(|e| format!("open BGA: {e}"))?;
         let stream = ictx
             .streams()
             .best(ff::media::Type::Video)
             .ok_or("BGA has no video stream")?;
+        let rate = stream.avg_frame_rate();
+        let interval = if rate.numerator() > 0 {
+            1_000_000 * i64::from(rate.denominator()) / i64::from(rate.numerator())
+        } else {
+            super::DEFAULT_INTERVAL_US
+        };
         let ctx = ff::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| e.to_string())?;
         let dec = ctx.decoder().video().map_err(|e| e.to_string())?;
-        Ok((dec.width(), dec.height()))
+        Ok((dec.width(), dec.height(), interval))
     }
 
     impl Bga {
         pub fn open(path: &Path) -> Result<Self, String> {
             ff::init().map_err(|e| e.to_string())?;
-            let (width, height) = probe(path)?;
+            let (width, height, interval_us) = probe(path)?;
             let (w, h) = (width as usize, height as usize);
             let slots: Arc<Vec<Mutex<Slot>>> = Arc::new(
                 (0..POOL)
@@ -80,7 +88,7 @@ mod imp {
                             y: vec![0; w * h],
                             u: vec![0; w * h / 4],
                             v: vec![0; w * h / 4],
-                            pts_us: 0,
+                            index: 0,
                         })
                     })
                     .collect(),
@@ -91,38 +99,45 @@ mod imp {
                 free.send(i).expect("free list has room");
             }
             let stop = Arc::new(AtomicBool::new(false));
+            let error = Arc::new(Mutex::new(None));
             let decoded = Arc::new(AtomicU64::new(0));
             let decoder_waits = Arc::new(AtomicU64::new(0));
+            let decode_us = Arc::new(Mutex::new(Vec::with_capacity(1 << 16)));
             let worker = Worker {
                 path: path.to_owned(),
+                interval_us,
                 slots: slots.clone(),
                 ready: ready_tx,
                 free: free_rx,
                 stop: stop.clone(),
                 decoded: decoded.clone(),
                 decoder_waits: decoder_waits.clone(),
+                decode_us: decode_us.clone(),
             };
+            let err = error.clone();
             std::thread::Builder::new()
                 .name("bga-decode".into())
                 .spawn(move || {
                     alloc::tag_thread(Tag::Other);
                     if let Err(e) = worker.run() {
-                        eprintln!("bga-decode: {e}");
+                        *err.lock().expect("BGA error") = Some(e);
                     }
                 })
                 .map_err(|e| e.to_string())?;
             Ok(Self {
                 width,
                 height,
+                interval_us,
                 slots,
                 ready,
                 free,
                 stop,
+                error,
                 decoded,
                 decoder_waits,
+                decode_us,
                 pending: None,
-                skipped: 0,
-                displayed: 0,
+                superseded: 0,
             })
         }
 
@@ -134,51 +149,44 @@ mod imp {
             let _ = self.free.send(i);
         }
 
-        fn pts(&self, i: usize) -> i64 {
-            self.slot(i).pts_us
+        fn failed(&self) -> Option<String> {
+            self.error.lock().ok().and_then(|e| e.clone())
         }
 
-        /// Takes the newest decoded frame with `pts <= due_us`. Superseded
-        /// due frames are skipped. With `wait`, blocks (up to 2 s per frame)
-        /// until the decoder has passed `due_us`, as the offscreen smoke's
-        /// virtual clock requires. `base_us` maps video time to run time for
-        /// the `BgaDue` records.
-        pub fn take_due(
-            &mut self,
-            due_us: i64,
-            wait: bool,
-            base_us: i64,
-            records: &mut Vec<BgaDue>,
-        ) -> Due {
+        /// The newest decoded frame with index `<= due`, as a pool slot the
+        /// caller uploads and releases. With `wait`, blocks (up to 2 s per
+        /// frame) until the decoder has passed `due`; a decoder error, or a
+        /// stall while waiting, is an error.
+        pub fn take(&mut self, due: u64, wait: bool) -> Result<Option<usize>, String> {
+            if let Some(e) = self.failed() {
+                return Err(format!("BGA decoder failed: {e}"));
+            }
             let mut chosen: Option<usize> = None;
             loop {
                 let next = match self.pending.take() {
                     Some(i) => Some(i),
-                    None if wait => self.ready.recv_timeout(Duration::from_secs(2)).ok(),
+                    None if wait => match self.ready.recv_timeout(Duration::from_secs(2)) {
+                        Ok(i) => Some(i),
+                        Err(_) => {
+                            return Err(self.failed().map_or_else(
+                                || format!("BGA decoder stalled before frame {due}"),
+                                |e| format!("BGA decoder failed: {e}"),
+                            ));
+                        }
+                    },
                     None => self.ready.try_recv().ok(),
                 };
                 let Some(i) = next else { break };
-                if self.pts(i) > due_us {
+                if self.slot(i).index > due {
                     self.pending = Some(i);
                     break;
                 }
                 if let Some(old) = chosen.replace(i) {
-                    self.skipped += 1;
-                    push(records, base_us + self.pts(old), false);
+                    self.superseded += 1;
                     self.release(old);
                 }
             }
-            if let Some(i) = chosen {
-                self.displayed += 1;
-                push(records, base_us + self.pts(i), true);
-            }
-            Due { slot: chosen }
-        }
-    }
-
-    fn push(records: &mut Vec<BgaDue>, due_us: i64, displayed: bool) {
-        if records.len() < records.capacity() {
-            records.push(BgaDue { due_us, displayed });
+            Ok(chosen)
         }
     }
 
@@ -194,12 +202,14 @@ mod imp {
 
     struct Worker {
         path: PathBuf,
+        interval_us: i64,
         slots: Arc<Vec<Mutex<Slot>>>,
         ready: SyncSender<usize>,
         free: Receiver<usize>,
         stop: Arc<AtomicBool>,
         decoded: Arc<AtomicU64>,
         decoder_waits: Arc<AtomicU64>,
+        decode_us: Arc<Mutex<Vec<u32>>>,
     }
 
     impl Worker {
@@ -223,42 +233,31 @@ mod imp {
                 (i128::from(ts) * 1_000_000 * i128::from(tb.numerator())
                     / i128::from(tb.denominator().max(1))) as i64
             };
-            // Each pass of the video is offset by the previous pass's length.
-            let mut offset = 0i64;
-            let mut last = 0i64;
-            let mut step = 16_667i64;
+            // Frame numbers continue across passes of the looped video.
+            let mut base = 0u64;
+            let mut next = 0u64;
             while !self.stop.load(Ordering::Relaxed) {
-                let next = scope(Scope::FfmpegDecode, || {
+                let t0 = qpc();
+                let packet = scope(Scope::FfmpegDecode, || {
                     ictx.packets()
                         .find(|(s, _)| s.index() == index)
                         .map(|(_, p)| p)
                 });
-                match next {
+                match packet {
                     Some(packet) => {
                         scope(Scope::FfmpegDecode, || decoder.send_packet(&packet))
                             .map_err(|e| e.to_string())?;
-                        self.drain(
-                            &mut decoder,
-                            &mut frame,
-                            &to_us,
-                            offset,
-                            &mut last,
-                            &mut step,
-                        )?;
+                        self.drain(&mut decoder, &mut frame, &to_us, base, &mut next, t0)?;
                     }
                     None => {
                         // End of the video: drain, then loop from the start.
                         scope(Scope::FfmpegDecode, || decoder.send_eof())
                             .map_err(|e| e.to_string())?;
-                        self.drain(
-                            &mut decoder,
-                            &mut frame,
-                            &to_us,
-                            offset,
-                            &mut last,
-                            &mut step,
-                        )?;
-                        offset = last + step;
+                        self.drain(&mut decoder, &mut frame, &to_us, base, &mut next, t0)?;
+                        if next == base {
+                            return Err("BGA pass decoded no frames".into());
+                        }
+                        base = next;
                         scope(Scope::FfmpegDecode, || {
                             decoder.flush();
                             ictx.seek(0, ..)
@@ -275,22 +274,26 @@ mod imp {
             decoder: &mut ff::decoder::Video,
             frame: &mut ff::frame::Video,
             to_us: &dyn Fn(i64) -> i64,
-            offset: i64,
-            last: &mut i64,
-            step: &mut i64,
+            base: u64,
+            next: &mut u64,
+            mut t0: i64,
         ) -> Result<(), String> {
             while scope(Scope::FfmpegDecode, || decoder.receive_frame(frame)).is_ok() {
+                let decode = ((qpc() - t0) * 1_000_000 / qpc_freq()) as u32;
+                if let Ok(mut d) = self.decode_us.lock()
+                    && d.len() < d.capacity()
+                {
+                    d.push(decode);
+                }
                 if frame.format() != ff::format::Pixel::YUV420P {
                     return Err(format!(
                         "BGA pixel format {:?}, need yuv420p",
                         frame.format()
                     ));
                 }
-                let pts = offset + to_us(frame.timestamp().unwrap_or(0));
-                if pts > *last {
-                    *step = (pts - *last).clamp(1_000, 100_000);
-                }
-                *last = pts;
+                let pts = to_us(frame.timestamp().unwrap_or(0));
+                let index = base + (pts + self.interval_us / 2).div_euclid(self.interval_us) as u64;
+                *next = (*next).max(index + 1);
                 let i = match self.free.try_recv() {
                     Ok(i) => i,
                     Err(_) => {
@@ -307,16 +310,18 @@ mod imp {
                 {
                     let mut slot = self.slots[i].lock().expect("BGA slot");
                     let (w, h) = (frame.width() as usize, frame.height() as usize);
-                    let Slot { y, u, v, pts_us } = &mut *slot;
+                    let Slot { y, u, v, index: si } = &mut *slot;
                     copy_plane(frame.data(0), frame.stride(0), w, h, y);
                     copy_plane(frame.data(1), frame.stride(1), w / 2, h / 2, u);
                     copy_plane(frame.data(2), frame.stride(2), w / 2, h / 2, v);
-                    *pts_us = pts;
+                    *si = index;
                 }
                 self.decoded.fetch_add(1, Ordering::Relaxed);
                 if self.ready.send(i).is_err() {
                     return Ok(());
                 }
+                // The next frame's decode time starts after this hand-off.
+                t0 = qpc();
             }
             Ok(())
         }
@@ -337,10 +342,11 @@ pub use imp::Bga;
 pub struct Bga {
     pub width: u32,
     pub height: u32,
+    pub interval_us: i64,
     pub decoded: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub decoder_waits: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub skipped: u64,
-    pub displayed: u64,
+    pub decode_us: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    pub superseded: u64,
 }
 
 #[cfg(not(feature = "ffmpeg"))]
@@ -348,15 +354,16 @@ pub struct Slot {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+    pub index: u64,
 }
 
 #[cfg(not(feature = "ffmpeg"))]
 impl Bga {
     pub fn open(_: &std::path::Path) -> Result<Self, String> {
-        Err("built without the ffmpeg feature".into())
+        Err("built without the ffmpeg feature; run without --bga".into())
     }
-    pub fn take_due(&mut self, _: i64, _: bool, _: i64, _: &mut Vec<BgaDue>) -> Due {
-        Due { slot: None }
+    pub fn take(&mut self, _: u64, _: bool) -> Result<Option<usize>, String> {
+        Ok(None)
     }
     pub fn slot(&self, _: usize) -> Box<Slot> {
         unreachable!("no BGA without ffmpeg")

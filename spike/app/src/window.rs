@@ -2,19 +2,26 @@
 //! monitor (or a sized window), DX12 Fifo with maximum frame latency 1, the
 //! swap chain's waitable object waited on by the render thread itself
 //! (`DontWait`), an optional frame cap on a high-resolution waitable timer
-//! aligned to predicted vblank, and the DXGI frame-statistics diagnostic.
+//! aligned to the display's vblank grid, and the DXGI frame-statistics
+//! diagnostic paired with frames by present count.
+//!
+//! winit only hands out the window handle on the main thread, so the wgpu
+//! instance and surface are created there and moved to the render thread.
 
 use crate::alloc::{self, Scope, Tag, scope};
+use crate::pacing::{cap_needed, cap_step, predict_display};
 use crate::render::Renderer;
 use crate::run::{
-    COUNTDOWN_US, DxgiSummary, Recorder, RunArgs, adapter, bga_step, device, event, instance,
-    print_summary, summary_common, write_outputs,
+    BgaState, COUNTDOWN_US, DxgiSummary, POST_PLAY_US, Recorder, RunArgs, adapter, bga_due, device,
+    event, heavy_values, instance, print_summary, summary_common, write_outputs,
 };
 use crate::scene::{Frame, Scene};
 use crate::timebase::{Clock, qpc, qpc_freq};
 use spike_core::chart::{CHART_LEN_US, Chart, DEFAULT_SEED};
 use spike_core::heavy::Timeline;
 use spike_core::run::{EventKind, RunEvent, SpikeFrame};
+use spike_core::stats::percentile_i64;
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,33 +50,67 @@ struct App {
     result: Option<Result<(), String>>,
 }
 
-impl ApplicationHandler<Result<(), String>> for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
+/// What the main thread hands to the render thread.
+struct Gpu {
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    window: Arc<Window>,
+    refresh_mhz: u32,
+}
+
+impl App {
+    fn start(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
         let mut attrs = Window::default_attributes().with_title("tapestry-spike");
         attrs = match self.args.window {
             Some((w, h)) => attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h)),
             None => attrs.with_fullscreen(Some(Fullscreen::Borderless(None))),
         };
-        let window = match el.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                self.result = Some(Err(format!("create window: {e}")));
-                el.exit();
-                return;
-            }
-        };
+        let window = Arc::new(
+            el.create_window(attrs)
+                .map_err(|e| format!("create window: {e}"))?,
+        );
         self.window = Some(window.clone());
+        let instance = instance();
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| format!("create surface: {e}"))?;
+        let refresh_mhz = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .unwrap_or(60_000);
+        let gpu = Gpu {
+            instance,
+            surface,
+            window,
+            refresh_mhz,
+        };
         let (args, shared, proxy) = (self.args.clone(), self.shared.clone(), self.proxy.clone());
         std::thread::Builder::new()
             .name("render".into())
             .spawn(move || {
-                let r = render_thread(&args, &shared, window);
+                let r = render_thread(&args, &shared, gpu);
                 let _ = proxy.send_event(r);
             })
-            .expect("spawn render thread");
+            .map_err(|e| format!("spawn render thread: {e}"))?;
+        Ok(())
+    }
+
+    fn push(&self, kind: EventKind) {
+        if let Ok(mut e) = self.shared.events.lock() {
+            e.push(event(&self.shared.clock, kind));
+        }
+    }
+}
+
+impl ApplicationHandler<Result<(), String>> for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.window.is_some() || self.result.is_some() {
+            return;
+        }
+        if let Err(e) = self.start(el) {
+            self.result = Some(Err(e));
+            el.exit();
+        }
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, result: Result<(), String>) {
@@ -81,16 +122,7 @@ impl ApplicationHandler<Result<(), String>> for App {
         match ev {
             WindowEvent::CloseRequested => self.shared.stop.store(true, Ordering::Relaxed),
             WindowEvent::Focused(false) => self.push(EventKind::FocusLoss),
-            WindowEvent::Resized(_) => self.push(EventKind::SwapChainRecreate),
             _ => {}
-        }
-    }
-}
-
-impl App {
-    fn push(&self, kind: EventKind) {
-        if let Ok(mut e) = self.shared.events.lock() {
-            e.push(event(&self.shared.clock, kind));
         }
     }
 }
@@ -151,20 +183,32 @@ impl CapTimer {
     }
 }
 
-/// DXGI frame-statistics diagnostic (§3.2): display time of the last
-/// present = SyncQPCTime − (SyncRefreshCount − PresentRefreshCount) ×
-/// period, rejected if PresentCount did not advance, the refresh gap is
-/// over 4, or the call fails.
+/// DXGI frame-statistics diagnostic (§3.2): display time of the present
+/// numbered `PresentCount` = SyncQPCTime − (SyncRefreshCount −
+/// PresentRefreshCount) × period, rejected if PresentCount did not advance,
+/// the refresh gap is over 4, or the call fails. Samples are paired with
+/// frames by present count.
 struct Dxgi {
     chain: Option<IDXGISwapChain3>,
     last_present_count: u32,
     period_qpc: i64,
+    /// (present count, estimated display QPC); preallocated.
+    samples: Vec<(u32, i64)>,
     summary: DxgiSummary,
-    /// Latest SyncQPCTime, the anchor for the cap timer.
-    last_sync_qpc: Option<i64>,
+    /// Latest valid SyncQPCTime: the vblank-grid anchor.
+    sync_anchor: Option<i64>,
 }
 
 impl Dxgi {
+    fn present_count(&self) -> Option<u32> {
+        let chain = self.chain.as_ref()?;
+        // SAFETY: valid swap chain.
+        scope(Scope::OtherLibrary, || unsafe {
+            chain.GetLastPresentCount()
+        })
+        .ok()
+    }
+
     fn sample(&mut self) {
         self.summary.frames += 1;
         let Some(chain) = &self.chain else {
@@ -183,19 +227,24 @@ impl Dxgi {
             return;
         }
         self.last_present_count = s.PresentCount;
-        self.last_sync_qpc = Some(s.SyncQPCTime);
-        let _display_qpc = s.SyncQPCTime - i64::from(gap) * self.period_qpc;
-        self.summary.estimated += 1;
+        self.sync_anchor = Some(s.SyncQPCTime);
+        self.summary.samples += 1;
+        if self.samples.len() < self.samples.capacity() {
+            let display = s.SyncQPCTime - i64::from(gap) * self.period_qpc;
+            self.samples.push((s.PresentCount, display));
+        }
     }
 }
 
-fn render_thread(args: &RunArgs, shared: &Shared, window: Arc<Window>) -> Result<(), String> {
+fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String> {
     alloc::tag_thread(Tag::Render);
     let clock = shared.clock;
-    let instance = instance();
-    let surface = instance
-        .create_surface(window.clone())
-        .map_err(|e| format!("create surface: {e}"))?;
+    let Gpu {
+        instance,
+        surface,
+        window,
+        refresh_mhz,
+    } = gpu;
     let adapter = adapter(&instance, args.adapter, Some(&surface))?;
     let info = adapter.get_info();
     let (dev, queue) = device(&adapter)?;
@@ -222,39 +271,36 @@ fn render_thread(args: &RunArgs, shared: &Shared, window: Arc<Window>) -> Result
             None => (None, None),
         }
     };
-    let refresh_mhz = window
-        .current_monitor()
-        .and_then(|m| m.refresh_rate_millihertz())
-        .unwrap_or(60_000);
     let period_qpc = qpc_freq() * 1000 / i64::from(refresh_mhz);
-    let mut bga = args.bga.as_deref().map(crate::bga::Bga::open).transpose()?;
-    let mut renderer = Renderer::new(
-        dev,
-        queue,
-        config.format,
-        bga.as_ref().map(|b| (b.width, b.height)),
-    );
+    let mut bga = BgaState::open(&args.bga)?;
+    let dims = bga.bga.as_ref().map(|b| (b.width, b.height));
+    let mut renderer = Renderer::new(dev, queue, config.format, dims);
     let mut scene = Scene::new(Chart::generate(DEFAULT_SEED));
     let mut frame = Frame::new();
     let play_len = args.play_us();
-    // Frames: countdown + play at up to 500 Hz, with margin.
-    let max_frames = ((COUNTDOWN_US + play_len) / 2_000 + 1_000) as usize;
+    // Frames: countdown + play + post-play at up to 500 Hz, with margin.
+    let max_frames = ((COUNTDOWN_US + play_len + POST_PLAY_US) / 2_000 + 1_000) as usize;
     let mut rec = Recorder::new(max_frames);
+    let mut predicted: Vec<(u32, i64)> = Vec::with_capacity(max_frames);
     let mut dxgi = Dxgi {
         chain,
         last_present_count: 0,
         period_qpc,
+        samples: Vec::with_capacity(max_frames),
         summary: DxgiSummary::default(),
-        last_sync_qpc: None,
+        sync_anchor: None,
     };
     let cap = match args.fps_cap {
-        Some(hz) => Some((CapTimer::new()?, qpc_freq() / i64::from(hz))),
-        None => None,
+        Some(hz) if cap_needed(hz, refresh_mhz) => {
+            Some((CapTimer::new()?, qpc_freq() / i64::from(hz)))
+        }
+        _ => None,
     };
-    let mut next_deadline: Option<i64> = None;
+    let mut cap_anchor_fallback: Option<i64> = None;
+    let mut last_slot: Option<i64> = None;
+    let interval = bga.interval_us();
     // First BGA frame uploaded before the countdown (design D2).
-    let mut first_bga = Vec::new();
-    bga_step(&mut bga, &mut renderer, 0, true, 0, &mut first_bga);
+    bga.step(&mut renderer, 0, true)?;
     let play_start = clock.now_us() + COUNTDOWN_US;
     let mut armed = false;
     while !shared.stop.load(Ordering::Relaxed) {
@@ -266,39 +312,43 @@ fn render_thread(args: &RunArgs, shared: &Shared, window: Arc<Window>) -> Result
             }
         }
         if let Some((timer, period)) = &cap {
-            let anchor = dxgi.last_sync_qpc.unwrap_or_else(qpc);
             let now = qpc();
-            let deadline = match next_deadline {
-                Some(d) if d > now => d,
-                // Next vblank-aligned deadline after now.
-                _ => anchor + ((now - anchor) / period + 1) * period,
-            };
-            timer.wait_until(deadline);
-            next_deadline = Some(deadline + period);
+            let anchor = dxgi
+                .sync_anchor
+                .unwrap_or(*cap_anchor_fallback.get_or_insert(now));
+            let (wait, slot) = cap_step(now, anchor, *period, last_slot);
+            if let Some(w) = wait {
+                timer.wait_until(w);
+            }
+            last_slot = Some(slot);
         }
         let t0 = qpc();
         let now_us = clock.to_us(t0);
         let play_us = now_us - play_start;
-        if play_us >= play_len {
+        if play_us >= play_len + POST_PLAY_US {
             break;
         }
-        if play_us >= 0 && !armed {
-            alloc::arm();
-            armed = true;
+        let in_play = (0..play_len).contains(&play_us);
+        if in_play != armed {
+            if in_play {
+                alloc::arm();
+            } else {
+                alloc::disarm();
+            }
+            armed = in_play;
         }
-        let load = scene.build(play_us, &mut frame);
-        // The frame is displayed about one refresh after it starts (max
-        // latency 1): take the BGA frame due then.
-        let predicted = play_us + period_qpc * 1_000_000 / qpc_freq();
-        let shown = play_us >= 0
-            && bga_step(
-                &mut bga,
+        let load = scene.build(play_us.min(play_len), &mut frame);
+        let predicted_qpc = predict_display(t0, dxgi.sync_anchor, period_qpc);
+        let predicted_play = clock.to_us(predicted_qpc) - play_start;
+        let shown = if play_us >= 0 {
+            bga.step(
                 &mut renderer,
-                predicted,
+                (predicted_play.max(0) / interval) as u64,
                 false,
-                play_start,
-                &mut rec.bga,
-            );
+            )?
+        } else {
+            bga.current
+        };
         let a0 = qpc();
         let tex = match scope(Scope::GetCurrentTexture, || surface.get_current_texture()) {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -322,7 +372,13 @@ fn render_thread(args: &RunArgs, shared: &Shared, window: Arc<Window>) -> Result
         let p0 = qpc();
         scope(Scope::Present, || renderer.queue().present(tex));
         let p1 = qpc();
+        let present_count = dxgi.present_count();
         dxgi.sample();
+        if let Some(c) = present_count
+            && predicted.len() < predicted.capacity()
+        {
+            predicted.push((c, predicted_qpc));
+        }
         let us = |q: i64| (q * 1_000_000 / qpc_freq()) as u32;
         rec.frame(
             SpikeFrame {
@@ -330,25 +386,53 @@ fn render_thread(args: &RunArgs, shared: &Shared, window: Arc<Window>) -> Result
                 present_us: Some(clock.to_us(p0)),
                 render_cpu_us: us((t1 - t0) - (a1 - a0)),
                 present_call_us: us(p1 - p0),
+                present_count,
                 visible_notes: load.visible_notes,
                 effect_instances: load.effect_instances,
                 lanes_with_effects: load.lanes_with_effects,
-                bga_frame_shown: shown,
+                bga_frame_shown: shown.is_some(),
             },
+            shown,
             &frame,
             load,
         );
     }
     alloc::disarm();
+    // Pair DXGI display estimates with frames by present count.
+    let by_count: HashMap<u32, i64> = predicted.iter().copied().collect();
+    let errors: Vec<i64> = dxgi
+        .samples
+        .iter()
+        .filter_map(|(c, display)| {
+            by_count
+                .get(c)
+                .map(|p| (display - p) * 1_000_000 / qpc_freq())
+        })
+        .collect();
+    dxgi.summary.paired = errors.len() as u64;
+    dxgi.summary.prediction_error_us_p50 = percentile_i64(&errors, 50);
+    let abs: Vec<i64> = errors.iter().map(|e| e.abs()).collect();
+    dxgi.summary.prediction_error_us_p99_abs = percentile_i64(&abs, 99);
     let loops = (play_len as u64).div_ceil(CHART_LEN_US as u64).max(1) as u32;
     let timeline = Timeline {
         play_start_us: play_start,
         loops,
     };
-    let mut summary = summary_common("windowed", &info, size, &rec, &bga, timeline);
+    // G7 from frames actually presented during play.
+    let in_play = |f: &SpikeFrame| {
+        f.present_us
+            .is_some_and(|p| (play_start..play_start + play_len).contains(&p))
+    };
+    let due = bga_due(&rec, &bga, play_start, play_len, in_play);
+    let mut summary = summary_common("windowed", &info, size, &rec);
+    (
+        summary.heavy_render_cpu_us_p99,
+        summary.heavy_bga_displayed_pct,
+    ) = heavy_values(&rec, &due, timeline);
+    summary.bga = bga.summary(&due);
     summary.dxgi = Some(dxgi.summary);
     summary.events = shared.events.lock().map_err(|e| e.to_string())?.clone();
     print_summary(&summary);
-    write_outputs(&args.out, &rec, &summary)?;
+    write_outputs(&args.out, &rec, &due, &summary)?;
     Ok(())
 }

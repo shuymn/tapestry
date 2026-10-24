@@ -25,8 +25,8 @@ mise exec -- cargo test "${packages[@]}" --locked
 
 # App smoke: `--version` reports LGPL FFmpeg, then the WARP offscreen run
 # (300 frames on a virtual 60 Hz clock over a generated 3 s BGA clip) must
-# use the software adapter, decode and show BGA frames, and read back a
-# non-blank last frame.
+# use the software adapter, show every due BGA frame (the run fails on a
+# decoder error or stall), and read back non-blank frames.
 if [ "${SPIKE_SKIP_APP:-0}" != 1 ]; then
     mise exec -- cargo build -p tapestry-spike --locked
     exe=target/debug/tapestry-spike.exe
@@ -38,7 +38,10 @@ if [ "${SPIKE_SKIP_APP:-0}" != 1 ]; then
     smoke=$("$exe" run --offscreen 1920x1080 --adapter warp --audio null --frames 300         --bga "$smoke_dir/assets/bga.mp4" --out "$smoke_dir/run")
     echo "$smoke"
     grep -q '^adapter: Microsoft Basic Render Driver ' <<<"$smoke"
-    grep -q -E '^bga: 1920x1080 decoded [1-9][0-9]* displayed [1-9]' <<<"$smoke"
+    # Every frame showed its due BGA frame across the 3 s clip's loop
+    # boundary, the BGA alone is non-blank, and so is the full frame.
+    grep -q -E '^bga: 1920x1080 decoded [1-9][0-9]* due 300 displayed 300 .* advanced Some\(true\)$' <<<"$smoke"
+    grep -q '^bga-only readback: non-blank ' <<<"$smoke"
     grep -q '^readback: non-blank ' <<<"$smoke"
 fi
 

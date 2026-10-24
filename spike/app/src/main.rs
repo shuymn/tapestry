@@ -14,6 +14,7 @@
 mod alloc;
 mod bga;
 mod gen_assets;
+mod pacing;
 mod render;
 mod run;
 mod scene;
