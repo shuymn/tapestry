@@ -154,6 +154,18 @@ impl Enc {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Shutdown {
+    /// OBS still running when the log was taken.
+    No,
+    /// Separator, then the final `Number of memory leaks:` line.
+    AfterStop,
+    /// Separator before the stream's stop block; final line at the end.
+    BeforeStop,
+    /// Separator after the stop, log cut before the final line.
+    Truncated,
+}
+
 struct Log {
     attempt_ms: i64,
     connect_ms: i64,
@@ -168,8 +180,8 @@ struct Log {
     stop: bool,
     /// Lines logged after the stream's stop marker, 1 s apart.
     after: Vec<String>,
-    /// OBS exits at the end of the log (`==== Shutting down`).
-    shutdown: bool,
+    /// How the log ends.
+    shutdown: Shutdown,
 }
 
 impl Default for Log {
@@ -188,7 +200,7 @@ impl Default for Log {
             during: vec![],
             stop: true,
             after: vec![],
-            shutdown: true,
+            shutdown: Shutdown::AfterStop,
         }
     }
 }
@@ -236,6 +248,12 @@ impl Log {
             self.start_ms + 900,
             "[game-capture: 'Game'] attempting to hook process",
         ));
+        let separator = "==== Shutting down ==================================================";
+        if self.shutdown == Shutdown::BeforeStop {
+            // closeEvent prints the separator, then drains posted events,
+            // which can still log the stream's stop.
+            l.push(at(self.stop_ms - 100, separator));
+        }
         if self.stop {
             let e = self.stop_ms;
             l.push(at(e - 20, &format!("{rtmp} User stopped the stream")));
@@ -251,12 +269,11 @@ impl Log {
                 l.push(at(e + k * 1_000, a));
             }
         }
-        if self.shutdown {
-            let t = self.stop_ms + 300_000;
-            l.push(at(
-                t,
-                "==== Shutting down ==================================================",
-            ));
+        let t = self.stop_ms + 300_000;
+        if matches!(self.shutdown, Shutdown::AfterStop | Shutdown::Truncated) {
+            l.push(at(t, separator));
+        }
+        if matches!(self.shutdown, Shutdown::AfterStop | Shutdown::BeforeStop) {
             l.push(at(t + 100, "Number of memory leaks: 0"));
         }
         l.join("\n") + "\n"
@@ -546,6 +563,24 @@ fn f_stream_lag_summary_after_its_stop_marker_is_the_streams() {
 }
 
 #[test]
+fn f_stream_lag_summary_after_the_shutdown_separator_is_the_streams() {
+    // Separator, stop marker, the stream's summary, then the final line.
+    let log = Log {
+        shutdown: Shutdown::BeforeStop,
+        after: vec![STREAM_LAG.into()],
+        ..Log::default()
+    };
+    let (run, s) = with_log(&log);
+    let sess = run.obs.unwrap().session.unwrap();
+    assert_eq!(
+        (sess.encode_skipped, sess.encode_total),
+        (Some(300), Some(36_000))
+    );
+    assert!(s.check("V7").ok, "{:?}", s.check("V7").reasons);
+    assert!(!s.gate("O2").pass);
+}
+
+#[test]
 fn f_later_recording_lag_does_not_replace_the_streams() {
     let mut after = vec![STREAM_LAG.to_string()];
     after.extend(recording_after(Some(RECORDING_LAG)));
@@ -577,11 +612,23 @@ fn f_lag_summary_after_another_output_started_is_ambiguous() {
 
 #[test]
 fn f_no_lag_summary_counts_as_zero_only_after_obs_shut_down() {
-    let log = Log {
-        shutdown: false,
-        ..Log::default()
-    };
-    assert_eq!(reasons(&log), vec!["obs-teardown-unconfirmed"]);
+    for shutdown in [Shutdown::No, Shutdown::Truncated] {
+        let log = Log {
+            shutdown,
+            ..Log::default()
+        };
+        assert_eq!(reasons(&log), vec!["obs-teardown-unconfirmed"]);
+    }
+    // The separator before or after the stop marker, then the final line.
+    for shutdown in [Shutdown::BeforeStop, Shutdown::AfterStop] {
+        let log = Log {
+            shutdown,
+            ..Log::default()
+        };
+        let (_, s) = with_log(&log);
+        assert!(s.check("V7").ok, "{:?}", s.check("V7").reasons);
+        assert_eq!(s.gate("O2").value, Some(0.0));
+    }
     // A later recording without any summary, then OBS exits: zero.
     let log = Log {
         after: recording_after(None),

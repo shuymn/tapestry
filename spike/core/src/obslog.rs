@@ -23,7 +23,8 @@
 //!   `log_frame_info`)
 //! - `Video stopped, number of skipped frames due to encoding lag: N/M (…)`
 //!   (libobs `log_skipped`)
-//! - `==== Shutting down ====…` (OBS exiting)
+//! - `Number of memory leaks: N`, the last line OBS 31 logs, after
+//!   `obs_shutdown` has destroyed every output (joining their teardown)
 //!
 //! Encoding-lag ownership: libobs logs the encoding-lag summary from the
 //! output's teardown thread, which it does not join, so the line may come
@@ -33,8 +34,11 @@
 //! start marker or connection, or an encoder being created). A summary
 //! logged after that while the stream has none is ambiguous, which V7
 //! rejects. A stream with no summary has zero skipped frames only if the log
-//! shows OBS shutting down after the stream stopped (every teardown has
-//! finished by then); otherwise V7 rejects it as unconfirmed.
+//! reaches OBS's final `Number of memory leaks:` line after the stream
+//! stopped (every teardown has finished by then); otherwise V7 rejects it as
+//! unconfirmed. The `==== Shutting down` separator does not confirm
+//! anything: OBS prints it at the start of closing the window, before core
+//! shutdown, and may still log the stream's stop after it.
 //!
 //! OBS prints the lag and drop lines only when the count is nonzero, so in a
 //! completed session their absence means zero. Only the streaming output's
@@ -125,8 +129,8 @@ pub struct ObsSession {
     pub encode_skipped: Option<u64>,
     pub encode_total: Option<u64>,
     pub bandwidth_dropped: Option<u64>,
-    /// OBS logged its shutdown after the stream stopped, so the stream's
-    /// teardown (and any encoding-lag summary) has been logged.
+    /// The log reaches OBS's final line after the stream stopped, so the
+    /// stream's teardown (and any encoding-lag summary) has been logged.
     pub teardown_confirmed: bool,
     /// An encoding-lag summary came after another output started while the
     /// stream had none: it may be the stream's or the other output's.
@@ -323,7 +327,7 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
             }
             continue;
         }
-        if msg.starts_with("==== Shutting down") {
+        if msg.starts_with("Number of memory leaks:") {
             for r in sessions.iter_mut().filter(|r| r.stop_ms.is_some()) {
                 r.s.teardown_confirmed = true;
             }
