@@ -10,6 +10,7 @@
 use bytemuck::{Pod, Zeroable};
 use spike_core::chart::{CHART_LEN_US, Chart, LANES, Note};
 use spike_core::rng::SplitMix64;
+use spike_core::run::Profile;
 use spike_core::scroll::NoteTrack;
 
 /// Layout space; the renderer letterboxes it to the output.
@@ -205,8 +206,45 @@ fn lane_x(lane: u8) -> f32 {
     LANE_X0 + f32::from(lane) * LANE_W
 }
 
+/// The effects a settings profile draws (design D2 profiles): standard
+/// draws everything; streaming and no-bga turn particles off and keep one
+/// of the four skin overlays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Effects {
+    pub particles: bool,
+    pub skin_layers: u32,
+}
+
+impl Effects {
+    pub fn for_profile(p: Profile) -> Self {
+        match p {
+            Profile::Standard => Self {
+                particles: true,
+                skin_layers: 4,
+            },
+            Profile::Streaming | Profile::NoBga => Self {
+                particles: false,
+                skin_layers: 1,
+            },
+        }
+    }
+}
+
+/// SHA-256 of the generated scene: the atlas and the layout and effect
+/// constants (`scene_hash` in the conditions).
+pub fn scene_hash() -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(build_atlas());
+    h.update(format!(
+        "{LAYOUT_W} {LAYOUT_H} {LANE_X0} {LANE_W} {JUDGE_Y} {LANE_H} {BOMB_US} {BEAM_US} {PARTICLES} {HIT_RING} {MAX_INSTANCES}"
+    ));
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub struct Scene {
     chart: Chart,
+    effects: Effects,
     track: NoteTrack,
     hits: [Hit; HIT_RING],
     hit_count: usize,
@@ -217,10 +255,11 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn new(chart: Chart) -> Self {
+    pub fn new(chart: Chart, effects: Effects) -> Self {
         let track = NoteTrack::new(&chart);
         Self {
             chart,
+            effects,
             track,
             hits: [Hit::default(); HIT_RING],
             hit_count: 0,
@@ -251,8 +290,8 @@ impl Scene {
         out.alpha.clear();
         out.additive.clear();
         let mut load = FrameLoad::default();
-        // Four translucent full-screen skin layers.
-        for k in 0..4 {
+        // Translucent full-screen skin layers (four in standard).
+        for k in 0..self.effects.skin_layers {
             let i = Instance {
                 rect: [0.0, 0.0, LAYOUT_W, LAYOUT_H],
                 uv: uv(region::WHITE),
@@ -349,7 +388,8 @@ impl Scene {
                 load,
             );
             let t = dt as f32 / BOMB_US as f32;
-            for p in 0..PARTICLES {
+            let particles = if self.effects.particles { PARTICLES } else { 0 };
+            for p in 0..particles {
                 let a = (hit
                     .seed
                     .wrapping_mul(2_654_435_761)
@@ -444,7 +484,7 @@ mod tests {
     fn heavy_window_frames_light_all_lanes_without_overflow() {
         let chart = Chart::generate(DEFAULT_SEED);
         let mut play = Play::new(&chart, CHART_LEN_US);
-        let mut scene = Scene::new(chart);
+        let mut scene = Scene::new(chart, Effects::for_profile(Profile::Standard));
         let mut frame = Frame::new();
         let mut max = 0;
         let mut all_lanes = 0;
@@ -460,5 +500,32 @@ mod tests {
         }
         assert!(all_lanes > 30 * 30, "{all_lanes}");
         assert!(max > 1_000 && max < MAX_INSTANCES, "{max}");
+    }
+
+    /// Instances of one frame at `t` under `profile`, after playing up to it.
+    fn frame_at(profile: Profile, t: i64) -> (FrameLoad, usize, usize) {
+        let chart = Chart::generate(DEFAULT_SEED);
+        let mut play = Play::new(&chart, CHART_LEN_US);
+        let mut scene = Scene::new(chart, Effects::for_profile(profile));
+        let mut frame = Frame::new();
+        play.advance_to(t, |j| scene.hit(j.note_us + j.delta_us, j.lane));
+        let load = scene.build(t, &mut frame);
+        (load, frame.alpha.len(), frame.additive.len())
+    }
+
+    #[test]
+    fn streaming_profiles_draw_lighter_effects() {
+        let t = 55_000_000; // inside H1
+        let (std_load, std_alpha, std_add) = frame_at(Profile::Standard, t);
+        for p in [Profile::Streaming, Profile::NoBga] {
+            let (load, alpha, add) = frame_at(p, t);
+            // Same chart state: same notes and lit lanes.
+            assert_eq!(load.visible_notes, std_load.visible_notes);
+            assert_eq!(load.lanes_with_effects, std_load.lanes_with_effects);
+            // Three fewer skin layers, and no particles.
+            assert_eq!(alpha, std_alpha - 3);
+            assert!(add * 10 < std_add, "{add} vs {std_add}");
+            assert!(load.effect_instances < std_load.effect_instances);
+        }
     }
 }
