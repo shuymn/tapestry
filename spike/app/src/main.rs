@@ -249,6 +249,11 @@ pub fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         (None, None) => None,
         _ => return Err("--inject-gap-every-s and --inject-gap-ms go together (both > 0)".into()),
     };
+    if !audio_on && (audio.inject.is_some() || audio.starve_ms.is_some()) {
+        // S0's checks need the audio stream; a null run would pass them
+        // without evidence.
+        return Err("--inject-gap-* and --starve-ms need --audio wasapi".into());
+    }
     if audio_on {
         if a.offscreen.is_some() {
             return Err("--offscreen runs need --audio null".into());
@@ -435,6 +440,35 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn s0_options_need_the_audio_stream() {
+        assert!(
+            parse_run(&args(&[
+                "--out",
+                "o",
+                "--audio",
+                "null",
+                "--starve-ms",
+                "50"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_run(&args(&[
+                "--out",
+                "o",
+                "--audio",
+                "null",
+                "--inject-gap-every-s",
+                "10",
+                "--inject-gap-ms",
+                "2"
+            ]))
+            .is_err()
+        );
+        assert!(parse_run(&args(&["--out", "o", "--starve-ms", "50"])).is_ok());
     }
 
     #[test]
