@@ -17,6 +17,7 @@
 use crate::alloc::{self, Tag};
 use crate::timebase::{Clock, HiResTimer, qpc, qpc_freq};
 use rtrb::{Consumer, Producer};
+use serde::Serialize;
 use spike_core::play::{Judge, Press};
 use spike_core::run::{InputLatency, StreamCount};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -217,7 +218,7 @@ pub trait Ticker {
     fn tick(&mut self) -> Option<(i64, i64)>;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct InputStats {
     /// MMCSS "Games" registration succeeded.
     pub mmcss: bool,
@@ -713,6 +714,52 @@ mod tests {
         let mine = sync.ready().unwrap();
         assert_eq!(other.join().unwrap(), Ok(mine));
         assert_eq!(sync.start(), Some(mine));
+    }
+
+    #[test]
+    fn each_press_is_emitted_once_in_order_when_due() {
+        let chart = Chart::generate(DEFAULT_SEED);
+        let (presses, _) = Play::new(&chart, 5_000_000).split();
+        let (mut tx, mut rx) = RingBuffer::<PressMsg>::new(presses.len());
+        let wake = Event::new().unwrap();
+        // Each tick's QPC stamp is its play time, to check due-ness.
+        struct Stamped(i64);
+        impl Ticker for Stamped {
+            fn tick(&mut self) -> Option<(i64, i64)> {
+                self.0 += TICK_US;
+                (self.0 <= 6_000_000).then_some((self.0, self.0))
+            }
+        }
+        let s = input_loop(&presses, &mut Stamped(-100_000), &mut tx, &wake, || {});
+        assert_eq!(s.emitted as usize, presses.len());
+        let mut got = vec![];
+        while let Ok(m) = rx.pop() {
+            assert!(m.press.t_us <= m.t_qpc && m.t_qpc - m.press.t_us < TICK_US);
+            got.push(m.press);
+        }
+        assert_eq!(got, presses);
+    }
+
+    #[test]
+    fn input_stats_serialize_with_their_field_names() {
+        let v = serde_json::to_value(InputStats {
+            mmcss: true,
+            emitted: 3,
+            overflows: 0,
+            ticks: 9,
+            raw_input_events: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "mmcss": true,
+                "emitted": 3,
+                "overflows": 0,
+                "ticks": 9,
+                "raw_input_events": 1
+            })
+        );
     }
 
     #[test]

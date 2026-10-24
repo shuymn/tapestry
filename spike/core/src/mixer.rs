@@ -22,31 +22,6 @@ pub struct SoundBank {
     pub sounds: Vec<Vec<i16>>,
 }
 
-/// Maps the judgment timeline (µs) to output sample positions.
-#[derive(Clone, Copy, Debug)]
-pub struct SampleClock {
-    /// A µs time and the output sample that plays at it.
-    pub anchor_us: i64,
-    pub anchor_sample: u64,
-    pub rate_hz: u32,
-}
-
-impl SampleClock {
-    /// Output sample for `t_us` (floor), saturating at 0.
-    pub fn sample_at(&self, t_us: i64) -> u64 {
-        let d = (i128::from(t_us) - i128::from(self.anchor_us)) * i128::from(self.rate_hz);
-        let s = i128::from(self.anchor_sample) + d.div_euclid(1_000_000);
-        s.max(0) as u64
-    }
-}
-
-/// Target sample for a sound triggered by an event at `event_us`: the event
-/// time plus a fixed scheduling delay (resampler delay plus one period), but
-/// never before `earliest`, the first sample not yet handed to the device.
-pub fn schedule(event_us: i64, clock: &SampleClock, delay_samples: u64, earliest: u64) -> u64 {
-    (clock.sample_at(event_us) + delay_samples).max(earliest)
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct Voice {
     active: bool,
@@ -327,20 +302,6 @@ mod tests {
         }
         // 4 steals into 2 release slots: the last 2 overwrite releases.
         assert_eq!((m.steals, m.hard_cuts), (4, 2));
-    }
-
-    #[test]
-    fn schedule_converts_exactly_and_never_schedules_in_the_past() {
-        let c = SampleClock {
-            anchor_us: 1_000_000,
-            anchor_sample: 48_000,
-            rate_hz: 48_000,
-        };
-        assert_eq!(c.sample_at(1_000_000), 48_000);
-        assert_eq!(c.sample_at(1_000_021), 48_001);
-        assert_eq!(c.sample_at(999_979), 47_998);
-        assert_eq!(schedule(2_000_000, &c, 480, 0), 96_480);
-        assert_eq!(schedule(2_000_000, &c, 480, 100_000), 100_000);
     }
 
     #[test]

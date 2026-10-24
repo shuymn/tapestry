@@ -122,7 +122,7 @@ pub struct InputSummary {
     pub notes_total: u32,
     pub judged: u32,
     pub records: StreamCount,
-    pub stats: InputStatsOut,
+    pub stats: InputStats,
     pub sound_overflows: u64,
     pub hit_overflows: u64,
     /// Longest dequeue → judgment completion (part of G4).
@@ -132,27 +132,6 @@ pub struct InputSummary {
     pub latency_us_p50: Option<i64>,
     pub latency_us_p99: Option<i64>,
     pub latency_us_max: Option<i64>,
-}
-
-#[derive(Serialize)]
-pub struct InputStatsOut {
-    pub mmcss: bool,
-    pub emitted: u64,
-    pub overflows: u64,
-    pub ticks: u64,
-    pub raw_input_events: u64,
-}
-
-impl From<InputStats> for InputStatsOut {
-    fn from(s: InputStats) -> Self {
-        Self {
-            mmcss: s.mmcss,
-            emitted: s.emitted,
-            overflows: s.overflows,
-            ticks: s.ticks,
-            raw_input_events: s.raw_input_events,
-        }
-    }
 }
 
 /// Injected gaps against episodes, in the capture's frame domain: gap `k`
@@ -250,7 +229,7 @@ impl Session {
             notes_total: self.notes,
             judged: logic.judged,
             records: logic.input_records,
-            stats: stats.into(),
+            stats,
             sound_overflows: logic.sound_overflows,
             hit_overflows: logic.hit_overflows,
             judge_us_max: logic.judge_us_max,

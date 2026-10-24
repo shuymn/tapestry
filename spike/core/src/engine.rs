@@ -137,10 +137,6 @@ impl Engine {
         }
     }
 
-    pub fn rate_hz(&self) -> u32 {
-        self.rate_hz
-    }
-
     /// Resampler delay in device frames.
     pub fn resampler_delay(&self) -> u64 {
         self.resampler.output_delay() as u64
@@ -158,11 +154,6 @@ impl Engine {
         // consumed, plus the filter delay.
         let produced = self.out + (self.staged - self.stage_pos) as u64;
         produced as i64 - self.mixed as i64 + self.resampler.output_delay() as i64
-    }
-
-    /// The first mixer frame not yet mixed: a sound may start no earlier.
-    pub fn mixer_frames(&self) -> u64 {
-        self.mixed
     }
 
     /// Keeps the output silent before device frame `frame`: the pilot then
@@ -417,6 +408,8 @@ mod tests {
         e.render(&mut out, 2, 970);
         let written = e.device_frames();
         let at = e.trigger_at_device(0, written);
+        // A sound never starts in what was already written.
+        assert!(e.trigger_at_device(0, 0) >= written);
         // At most 64 frames (1.3 ms at 48 kHz) staged beyond the delay.
         let slack = e.resampler_delay() + 64;
         assert!(
@@ -445,6 +438,14 @@ mod tests {
             }
         }
         assert!(worst <= 200, "{worst} us");
+        // Exact conversion: frame 48_000 mixed at 1 s on a 48 kHz grid;
+        // times map to frames by floor, and never before frame 0.
+        let mut g = MixClock::new(48_000, 480);
+        g.observe(48_000, 1_000_000);
+        assert_eq!(g.at(48_000), Some(1_000_000));
+        assert_eq!(g.frame_at(1_000_021), Some(48_001));
+        assert_eq!(g.frame_at(999_979), Some(47_998));
+        assert_eq!(g.frame_at(-5_000_000), Some(0));
         // The latest wake alone would be off by up to the full lateness.
         assert!(c.latest_error_us() > 1_000);
     }

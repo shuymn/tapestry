@@ -116,8 +116,6 @@ pub fn tag_thread(tag: Tag) {
     REGISTERED[tag as usize].store(true, Ordering::Relaxed);
 }
 
-/// Starts counting at play start; `disarm` at play end. The interval is
-/// shared by every thread.
 /// Serializes tests that set the counting interval.
 #[cfg(test)]
 pub static ARM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

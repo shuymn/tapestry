@@ -87,7 +87,6 @@ impl Play {
             base += CHART_LEN_US;
         }
         presses.sort_by_key(|p| p.t_us);
-        let judged = vec![false; notes.len()];
         Self {
             presses,
             next_press: 0,
@@ -95,7 +94,6 @@ impl Play {
                 notes,
                 cursor: vec![0; lanes.len()],
                 lanes,
-                judged,
                 count: 0,
             },
         }
@@ -108,19 +106,6 @@ impl Play {
 
     pub fn presses(&self) -> &[Press] {
         &self.presses
-    }
-
-    /// The presses due at or before `t_us`, in order, not yet emitted.
-    pub fn take_due(&mut self, t_us: i64) -> &[Press] {
-        let from = self.next_press;
-        while self
-            .presses
-            .get(self.next_press)
-            .is_some_and(|p| p.t_us <= t_us)
-        {
-            self.next_press += 1;
-        }
-        &self.presses[from..self.next_press]
     }
 
     pub fn judge_mut(&mut self) -> &mut Judge {
@@ -156,9 +141,9 @@ pub struct Judge {
     notes: Vec<PlayNote>,
     /// Note indexes of each lane, by time.
     lanes: Vec<Vec<u32>>,
-    /// Per lane: position of the first note that may still be unjudged.
+    /// Per lane: the first unjudged note (every note before it is judged
+    /// or out of reach).
     cursor: Vec<usize>,
-    judged: Vec<bool>,
     count: u32,
 }
 
@@ -169,11 +154,9 @@ impl Judge {
         let lane = usize::from(press.lane);
         let list = self.lanes.get(lane)?;
         let mut c = self.cursor[lane];
-        // Notes too old to be judged any more, or already judged, are
-        // skipped for good.
+        // Notes too old to be judged any more are skipped for good.
         while let Some(&i) = list.get(c)
-            && (self.judged[i as usize]
-                || self.notes[i as usize].t_us < press.t_us - JUDGE_WINDOW_US)
+            && self.notes[i as usize].t_us < press.t_us - JUDGE_WINDOW_US
         {
             c += 1;
         }
@@ -183,7 +166,6 @@ impl Judge {
             return None;
         }
         self.cursor[lane] = c + 1;
-        self.judged[i as usize] = true;
         self.count += 1;
         let n = self.notes[i as usize];
         Some(Judgment {
@@ -230,23 +212,6 @@ mod tests {
         // a neighbour, but never further than the window.
         assert!(worst <= JUDGE_WINDOW_US, "{worst}");
         assert!(play.presses().windows(2).all(|w| w[0].t_us <= w[1].t_us));
-    }
-
-    #[test]
-    fn take_due_emits_each_press_once_in_order() {
-        let chart = Chart::generate(DEFAULT_SEED);
-        let mut play = Play::new(&chart, 5_000_000);
-        let total = play.notes_total() as usize;
-        let mut seen = 0;
-        let mut t = -PRESS_JITTER_US;
-        while t < 5_000_000 + PRESS_JITTER_US {
-            let due = play.take_due(t);
-            assert!(due.iter().all(|p| p.t_us <= t));
-            seen += due.len();
-            t += 1_000;
-        }
-        assert_eq!(seen, total);
-        assert!(play.take_due(i64::MAX).is_empty());
     }
 
     #[test]

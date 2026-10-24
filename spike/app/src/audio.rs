@@ -387,7 +387,6 @@ pub struct RenderOut {
     pub side: RenderSide,
     pub periods: Vec<AudioPeriod>,
     pub period_records: StreamCount,
-    /// Judgment → scheduled device frame, µs.
     /// Judgment → scheduled mix, per sound: (judgment run µs, µs).
     pub judge_to_mix_us: Vec<(i64, i64)>,
     /// Mix-clock anchors per wake: (device frame, run µs), for the
@@ -429,8 +428,8 @@ pub struct LoopbackOut {
 
 /// Shared between the render and loopback threads.
 pub struct AudioShared {
-    /// Run µs when the render stream started (0 until then).
-    pub started_us: AtomicI64,
+    /// The render stream has started.
+    pub started: AtomicBool,
     /// Run µs when the render thread stopped writing (`i64::MAX` until
     /// then): the loopback evaluates capture only up to shortly before it,
     /// since the stream's stop is a cut to silence, not a dropout.
@@ -457,7 +456,7 @@ pub fn spawn(
     stop: Arc<AtomicBool>,
 ) -> Result<AudioThreads, String> {
     let shared = Arc::new(AudioShared {
-        started_us: AtomicI64::new(0),
+        started: AtomicBool::new(false),
         stopped_us: AtomicI64::new(i64::MAX),
         render_done: AtomicBool::new(false),
         stop,
@@ -621,7 +620,7 @@ fn render_thread(
         mix_over_period_at_us: Vec::with_capacity(DIAG_TIMES),
         ..Default::default()
     };
-    // Design D3/`mixer::schedule`: the judgment time plus the resampler's
+    // Design D3: the judgment time plus the resampler's
     // delay and one period, never before the first frame not yet mixed
     // (frames already queued on the device or staged cannot change).
     let schedule_delay = u64::from(period) + engine.resampler_delay();
@@ -652,9 +651,7 @@ fn render_thread(
         hr("ReleaseBuffer", render.ReleaseBuffer(queue_frames, 0))?;
         hr("Start", client.Start())?;
     }
-    shared
-        .started_us
-        .store(clock.now_us().max(1), Ordering::Release);
+    shared.started.store(true, Ordering::Release);
 
     let mut injection: Option<Injection> = None;
     let mut next_gap = 0u64;
@@ -723,7 +720,7 @@ fn render_thread(
         // least-late wake of its window, so lateness does not enter the
         // clock (engine::MixClock). IAudioClock positions were not used:
         // on the RME they advanced a period at a time against a current
-        // QPC. Only wakes that write are observed (a withholding skipped
+        // QPC. Only non-withheld wakes are observed (a withholding skipped
         // them above); an empty buffer resets the window.
         let queued_from = engine.device_frames() - u64::from(padding);
         if padding == 0 {
@@ -893,7 +890,7 @@ fn loopback_thread(
         timer.wait_until(next_poll);
         next_poll += poll_qpc;
         let done = shared.render_done.load(Ordering::Acquire);
-        let started = shared.started_us.load(Ordering::Acquire) > 0;
+        let started = shared.started.load(Ordering::Acquire);
         loop {
             // SAFETY: COM calls on the started capture stream; the packet
             // is read before it is released.

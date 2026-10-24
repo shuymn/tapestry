@@ -513,10 +513,6 @@ impl OnsetFinder {
     pub fn onset(&self) -> Option<u64> {
         self.found
     }
-
-    pub fn broken(&self) -> bool {
-        self.broken
-    }
 }
 
 #[cfg(test)]
