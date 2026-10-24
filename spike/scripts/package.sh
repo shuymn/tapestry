@@ -10,7 +10,7 @@
 # The exe is built here, in its own target directory, with every local build
 # path (Cargo's registry, the user profile, this checkout) remapped, so panic
 # locations and debug strings carry no developer paths; the staged files are
-# then scanned for them and the package fails on any hit. Needs libclang
+# then scanned for them (scan-paths.sh) and the package fails on any hit. Needs libclang
 # (LIBCLANG_PATH), scripts/fetch-tools.sh's third_party/ and licenses/, and
 # assets/bga.mp4 (gen-assets).
 set -euo pipefail
@@ -70,32 +70,8 @@ for f in "$root"/*.cmd; do
     sed -i 's/\r$//; s/$/\r/' "$f"
 done
 
-# Developer paths in any staged file (UTF-8 and UTF-16LE): the user profile,
-# Cargo's registry and git checkouts, rustup, and this checkout.
-utf16() {
-    local s=$1 out="" c i
-    for ((i = 0; i < ${#s}; i++)); do
-        c=${s:i:1}
-        case $c in [][\\.^$*+?{}\(\)\|/]) c="\\$c" ;; esac
-        out+="$c\\x00"
-    done
-    printf '%s' "$out"
-}
-patterns=("$user_dir" "$(cygpath -m "$USERPROFILE")" "$HOME" '.cargo\registry' '.cargo/registry'
-    '.cargo\git' '.cargo/git' '.rustup' "$spike_win" "$(cygpath -m "$spike_dir")")
-hits=0
-for p in "${patterns[@]}"; do
-    if found=$(grep -r -a -i -l -F -e "$p" "$root"); then
-        echo "package: developer path '$p' in: $found" >&2
-        hits=1
-    fi
-    if found=$(grep -r -a -i -l -P "$(utf16 "$p")" "$root"); then
-        echo "package: developer path '$p' (UTF-16) in: $found" >&2
-        hits=1
-    fi
-done
-[ $hits = 0 ] || fail "staged files contain developer paths"
-echo "package: no developer paths in the staged files (${#patterns[@]} patterns, UTF-8 and UTF-16)"
+# No developer path in any staged file.
+bash scripts/scan-paths.sh "$root" || fail "staged files contain developer paths"
 
 # Manifest: every file except itself, sorted, with size and SHA-256.
 commit=$("$exe" --version | sed -n 's/^commit: //p')
