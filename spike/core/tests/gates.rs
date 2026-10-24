@@ -5,10 +5,6 @@ use spike_core::evaluate::{Summary, evaluate};
 use spike_core::run::{Episode, EventKind, PmFrame, Rational, RunData, RunEvent, ThreadTag};
 use spike_core::synth::{PLAY_START_US, T60_MS, passing_obs_run, passing_run, sync_streams};
 
-fn heavy(run: &RunData, t: i64) -> bool {
-    run.info.timeline.is_heavy(t)
-}
-
 fn assert_valid(s: &Summary) {
     let bad: Vec<_> = s.validity.iter().filter(|c| !c.ok).collect();
     assert!(bad.is_empty(), "invalid: {bad:?}");
@@ -32,24 +28,24 @@ fn synthetic_run_is_valid_and_passes() {
 /// Makes every 50th heavy-window sample bad (2% of heavy, 0.8% of the run):
 /// the whole-run p99 stays good while the heavy-window p99 is bad.
 fn spoil_heavy(run: &mut RunData, outside_instead: bool) {
-    let pick = |r: &RunData, t: i64, i: usize, every: usize| {
-        (heavy(r, t) != outside_instead) && i.is_multiple_of(every)
+    let tl = run.info.timeline;
+    let pick = |t: i64, i: usize, every: usize| {
+        (tl.is_heavy(t) != outside_instead) && i.is_multiple_of(every)
     };
-    let snapshot = run.clone();
     let every = if outside_instead { 3 } else { 50 };
     for (i, f) in run.pm_frames.iter_mut().enumerate() {
-        if pick(&snapshot, f.window_time_us(), i, every) {
+        if pick(f.window_time_us(), i, every) {
             f.display_change_ms = Some(40.0);
             f.gpu_busy_ms = Some(5.0);
         }
     }
     for (i, f) in run.frames.iter_mut().enumerate() {
-        if pick(&snapshot, f.present_us.unwrap() + 5_000, i, every) {
+        if pick(f.present_us.unwrap() + 5_000, i, every) {
             f.render_cpu_us = 4_000;
         }
     }
     for (i, x) in run.input.iter_mut().enumerate() {
-        if pick(&snapshot, x.t_us, i, every) {
+        if pick(x.t_us, i, every) {
             x.latency_us = 5_000;
         }
     }
@@ -383,87 +379,62 @@ fn v8_streams_must_reach_play_edges_within_two_of_their_periods() {
 #[test]
 fn v8_missing_or_partial_evidence_is_invalid() {
     use spike_core::run::{AudioPeriod, InputLatency};
-    type Edit = Box<dyn Fn(&mut RunData)>;
-    let cases: Vec<(&str, Edit)> = vec![
-        (
-            "input-incomplete",
-            Box::new(|r| {
-                r.input.pop();
-                sync_streams(r);
-            }),
-        ),
-        ("input-incomplete", Box::new(|r| r.streams.input.lost = 1)),
-        (
-            "input-incomplete",
-            Box::new(|r| {
-                // One sample cannot satisfy G4.
-                r.input = vec![InputLatency {
-                    t_us: PLAY_START_US + 50_000_000,
-                    latency_us: 100,
-                }];
-                sync_streams(r);
-            }),
-        ),
-        (
-            "audio-periods-incomplete",
-            Box::new(|r| {
-                r.audio_periods = vec![AudioPeriod {
-                    t_us: PLAY_START_US + 50_000_000,
-                    active_voices: 200,
-                }];
-                sync_streams(r);
-            }),
-        ),
-        (
-            "audio-periods-incomplete",
-            Box::new(|r| {
-                let a = PLAY_START_US + 100_000_000;
-                r.audio_periods
-                    .retain(|p| !(a..a + 60_000).contains(&p.t_us));
-                sync_streams(r);
-            }),
-        ),
-        (
-            "audio-periods-incomplete",
-            Box::new(|r| r.streams.audio_periods.produced += 1),
-        ),
-        (
-            "bga-incomplete",
-            Box::new(|r| {
-                let a = PLAY_START_US + 45_000_000;
-                r.bga.retain(|b| !(a..a + 100_000).contains(&b.due_us));
-                sync_streams(r);
-            }),
-        ),
-        (
-            "frames-incomplete",
-            Box::new(|r| {
-                let end = r.info.timeline.play_end_us();
-                r.frames.retain(|f| f.render_us < end - 5_000_000);
-                sync_streams(r);
-            }),
-        ),
-        ("frames-incomplete", Box::new(|r| r.streams.frames.lost = 2)),
-        (
-            "allocation-counters-missing",
-            Box::new(|r| {
-                r.counters.app_allocs.remove(&ThreadTag::Audio);
-            }),
-        ),
-        (
-            "gpu-time-missing",
-            Box::new(|r| {
-                let tl = r.info.timeline;
-                let f = r
-                    .pm_frames
-                    .iter_mut()
-                    .find(|f| tl.is_heavy(f.window_time_us()))
-                    .unwrap();
-                f.gpu_busy_ms = None;
-            }),
-        ),
+    type Edit = fn(&mut RunData);
+    let cases: &[(&str, Edit)] = &[
+        ("input-incomplete", |r| {
+            r.input.pop();
+            sync_streams(r);
+        }),
+        ("input-incomplete", |r| r.streams.input.lost = 1),
+        ("input-incomplete", |r| {
+            // One sample cannot satisfy G4.
+            r.input = vec![InputLatency {
+                t_us: PLAY_START_US + 50_000_000,
+                latency_us: 100,
+            }];
+            sync_streams(r);
+        }),
+        ("audio-periods-incomplete", |r| {
+            r.audio_periods = vec![AudioPeriod {
+                t_us: PLAY_START_US + 50_000_000,
+                active_voices: 200,
+            }];
+            sync_streams(r);
+        }),
+        ("audio-periods-incomplete", |r| {
+            let a = PLAY_START_US + 100_000_000;
+            r.audio_periods
+                .retain(|p| !(a..a + 60_000).contains(&p.t_us));
+            sync_streams(r);
+        }),
+        ("audio-periods-incomplete", |r| {
+            r.streams.audio_periods.produced += 1
+        }),
+        ("bga-incomplete", |r| {
+            let a = PLAY_START_US + 45_000_000;
+            r.bga.retain(|b| !(a..a + 100_000).contains(&b.due_us));
+            sync_streams(r);
+        }),
+        ("frames-incomplete", |r| {
+            let end = r.info.timeline.play_end_us();
+            r.frames.retain(|f| f.render_us < end - 5_000_000);
+            sync_streams(r);
+        }),
+        ("frames-incomplete", |r| r.streams.frames.lost = 2),
+        ("allocation-counters-missing", |r| {
+            r.counters.app_allocs.remove(&ThreadTag::Audio);
+        }),
+        ("gpu-time-missing", |r| {
+            let tl = r.info.timeline;
+            let f = r
+                .pm_frames
+                .iter_mut()
+                .find(|f| tl.is_heavy(f.window_time_us()))
+                .unwrap();
+            f.gpu_busy_ms = None;
+        }),
     ];
-    for (reason, edit) in cases {
+    for &(reason, edit) in cases {
         let mut run = passing_run();
         edit(&mut run);
         let s = evaluate(&run);
@@ -621,60 +592,45 @@ fn e_full_load_run_presenting_every_2_s_is_valid_and_fails_g1() {
 
 #[test]
 fn v1_v2_v5_v6_invalidate() {
-    type Edit = Box<dyn Fn(&mut RunData)>;
-    let cases: Vec<(&str, Edit)> = vec![
-        ("V1", Box::new(|r| r.counters.notes_played -= 1)),
-        ("V1", Box::new(|r| r.counters.notes_total = 9_999)),
-        (
-            "V2",
-            Box::new(|r| {
-                let tl = r.info.timeline;
-                let w = tl.window(5);
-                r.audio_periods
-                    .iter_mut()
-                    .filter(|p| (w.start_us..w.start_us + 2_000_000).contains(&p.t_us))
-                    .for_each(|p| p.active_voices = 99);
-            }),
-        ),
-        (
-            "V2",
-            Box::new(|r| {
-                let w = r.info.timeline.window(3);
-                r.frames
-                    .iter_mut()
-                    .filter(|f| {
-                        (w.start_us + 7_000_000..w.start_us + 8_000_000).contains(&f.render_us)
-                    })
-                    .for_each(|f| f.lanes_with_effects = 7);
-            }),
-        ),
-        ("V2", Box::new(|r| r.info.bga_height = Some(720))),
-        (
-            "V5",
-            Box::new(|r| {
-                r.events.push(RunEvent {
-                    t_us: PLAY_START_US + 5,
-                    kind: EventKind::FocusLoss,
-                })
-            }),
-        ),
-        ("V5", Box::new(|r| r.counters.sound_overflows = 1)),
-        ("V5", Box::new(|r| r.counters.input_overflows = 1)),
-        ("V6", Box::new(|r| r.audio.pilot_calibrated = false)),
-        ("V6", Box::new(|r| r.audio.unverifiable_spans = 1)),
-        ("V6", Box::new(|r| r.info.mix_rate_hz = 32_000)),
+    type Edit = fn(&mut RunData);
+    let cases: &[(&str, Edit)] = &[
+        ("V1", |r| r.counters.notes_played -= 1),
+        ("V1", |r| r.counters.notes_total = 9_999),
+        ("V2", |r| {
+            let tl = r.info.timeline;
+            let w = tl.window(5);
+            r.audio_periods
+                .iter_mut()
+                .filter(|p| (w.start_us..w.start_us + 2_000_000).contains(&p.t_us))
+                .for_each(|p| p.active_voices = 99);
+        }),
+        ("V2", |r| {
+            let w = r.info.timeline.window(3);
+            r.frames
+                .iter_mut()
+                .filter(|f| (w.start_us + 7_000_000..w.start_us + 8_000_000).contains(&f.render_us))
+                .for_each(|f| f.lanes_with_effects = 7);
+        }),
+        ("V2", |r| r.info.bga_height = Some(720)),
+        ("V5", |r| {
+            r.events.push(RunEvent {
+                t_us: PLAY_START_US + 5,
+                kind: EventKind::FocusLoss,
+            })
+        }),
+        ("V5", |r| r.counters.sound_overflows = 1),
+        ("V5", |r| r.counters.input_overflows = 1),
+        ("V6", |r| r.audio.pilot_calibrated = false),
+        ("V6", |r| r.audio.unverifiable_spans = 1),
+        ("V6", |r| r.info.mix_rate_hz = 32_000),
         // The detector's warm-up or end must not fall inside play.
-        (
-            "V6",
-            Box::new(|r| r.audio.capture_from_us = Some(PLAY_START_US + 1)),
-        ),
-        (
-            "V6",
-            Box::new(|r| r.audio.capture_to_us = Some(r.info.timeline.play_end_us() - 1)),
-        ),
-        ("V6", Box::new(|r| r.audio.capture_to_us = None)),
+        ("V6", |r| r.audio.capture_from_us = Some(PLAY_START_US + 1)),
+        ("V6", |r| {
+            r.audio.capture_to_us = Some(r.info.timeline.play_end_us() - 1)
+        }),
+        ("V6", |r| r.audio.capture_to_us = None),
     ];
-    for (id, edit) in cases {
+    for &(id, edit) in cases {
         let mut run = passing_run();
         edit(&mut run);
         let s = evaluate(&run);

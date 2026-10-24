@@ -201,17 +201,21 @@ fn g_detects_1_to_20_ms_gaps_at_every_offset_phase_and_rate_as_one_episode() {
         let lead = r * 15 / 1000;
         let cal_signal: Vec<f32> = (0..r / 2).map(|n| pilot(n, rate, 0.0)).collect();
         let cal = calibrate(&cal_signal, rate).expect("calibrates");
-        let probe = Detector::new(rate, cal);
-        let (win, hop) = (probe.window_len(), probe.hop_len());
-        for gap_ms in 1..=20usize {
-            let gap = (gap_ms * r).div_ceil(1000);
-            for offset in 0..win {
-                for phase in [0.0, 1.1, 2.6, 4.4] {
+        // One fresh detector and one longest clean waveform per phase,
+        // copied for each case.
+        let fresh = Detector::new(rate, cal);
+        let (win, hop) = (fresh.window_len(), fresh.hop_len());
+        let longest = lead + win + (20 * r).div_ceil(1000) + lead;
+        for phase in [0.0, 1.1, 2.6, 4.4] {
+            let clean: Vec<f32> = (0..longest).map(|n| pilot(n, rate, phase)).collect();
+            for gap_ms in 1..=20usize {
+                let gap = (gap_ms * r).div_ceil(1000);
+                for offset in 0..win {
                     let start = lead + offset;
                     let total = start + gap + lead;
-                    let mut s: Vec<f32> = (0..total).map(|n| pilot(n, rate, phase)).collect();
+                    let mut s = clean[..total].to_vec();
                     s[start..start + gap].fill(0.0);
-                    let mut det = Detector::new(rate, cal);
+                    let mut det = fresh.clone();
                     det.push(&s);
                     let eps = det.finish().episodes;
                     let ctx = format!(
@@ -628,19 +632,22 @@ fn g_gap_ending_at_the_evaluated_span_end_is_detected() {
         rate,
     )
     .unwrap();
+    let fresh = Detector::new(rate, cal);
     for phase8 in 0..16 {
+        // The longest waveform once per phase; each length is a prefix.
+        let clean: Vec<f32> = (0..r / 4 + 47)
+            .map(|n| {
+                let t = n as f64 / f64::from(rate);
+                let attack = (t / 0.002).min(1.0);
+                let ph = f64::from(phase8) * std::f64::consts::PI / 8.0;
+                let tone = 0.25 * attack * (TAU * 14_000.0 * t + ph).sin();
+                pilot(n, rate, 0.0) + tone as f32
+            })
+            .collect();
         for extra in 0..48 {
             let total = r / 4 + extra;
-            let mut s: Vec<f32> = (0..total)
-                .map(|n| {
-                    let t = n as f64 / f64::from(rate);
-                    let attack = (t / 0.002).min(1.0);
-                    let ph = f64::from(phase8) * std::f64::consts::PI / 8.0;
-                    let tone = 0.25 * attack * (TAU * 14_000.0 * t + ph).sin();
-                    pilot(n, rate, 0.0) + tone as f32
-                })
-                .collect();
-            let mut det = Detector::new(rate, cal);
+            let mut s = clean[..total].to_vec();
+            let mut det = fresh.clone();
             let end = total - 144;
             s[end - 48..end].fill(0.0);
             det.push(&s);

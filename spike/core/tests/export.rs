@@ -3,8 +3,8 @@
 use serde_json::{Map, Value, json};
 use spike_core::evaluate::evaluate;
 use spike_core::export::{
-    CONDITIONS, ExportError, FRAMES, Finding, INPUT, RUN, SUMMARY, ScanContext, build, read,
-    recompute, scan,
+    CONDITIONS, Export, ExportError, FRAMES, Finding, INPUT, RUN, SUMMARY, ScanContext, build,
+    read, recompute, scan,
 };
 use spike_core::obslog::{WallWindow, derive};
 use spike_core::run::RunData;
@@ -113,11 +113,11 @@ fn i_export_drops_private_condition_fields_and_the_raw_obs_log() {
             !t.contains("192.0.2.10") && !t.contains("synthuser") && !t.contains("game-capture")
         );
     }
-    assert!(scan(&export, &ctx()).is_empty());
 }
 
-fn planted(file: &str, edit: impl Fn(&mut Value)) -> Vec<Finding> {
-    let mut export = build(&passing_run(), &conditions(), &ctx()).unwrap();
+/// Scans a copy of `base` with one JSON file edited.
+fn planted(base: &Export, file: &str, edit: impl Fn(&mut Value)) -> Vec<Finding> {
+    let mut export = base.clone();
     let mut v: Value = serde_json::from_slice(&export.files[file]).unwrap();
     edit(&mut v);
     export
@@ -128,31 +128,34 @@ fn planted(file: &str, edit: impl Fn(&mut Value)) -> Vec<Finding> {
 
 #[test]
 fn i_scan_finds_paths_names_raw_qpc_and_unknown_keys() {
-    let f = planted(CONDITIONS, |v| {
+    let base = build(&passing_run(), &conditions(), &ctx()).unwrap();
+    let f = planted(&base, CONDITIONS, |v| {
         v["cpu_brand"] = json!("C:\\Users\\x\\a.txt")
     });
     assert!(f.contains(&Finding::Path(CONDITIONS.into())), "{f:?}");
-    let f = planted(CONDITIONS, |v| v["cpu_brand"] = json!("/home/x/spike"));
+    let f = planted(&base, CONDITIONS, |v| {
+        v["cpu_brand"] = json!("/home/x/spike")
+    });
     assert!(f.contains(&Finding::Path(CONDITIONS.into())));
-    let f = planted(CONDITIONS, |v| {
+    let f = planted(&base, CONDITIONS, |v| {
         v["cpu_brand"] = json!("built on desktop-synth01")
     });
     assert_eq!(f, vec![Finding::Name(CONDITIONS.into())]);
     // Raw QPC in a time field breaks the unit check; in free text it is
     // found by value.
-    let f = planted(RUN, |v| {
+    let f = planted(&base, RUN, |v| {
         v["info"]["timeline"]["play_start_us"] = json!(QPC_LO + 1_234)
     });
     assert_eq!(f, vec![Finding::OutOfRange(RUN.into())]);
-    let f = planted(RUN, |v| {
+    let f = planted(&base, RUN, |v| {
         v["info"]["presentmon_error"] = json!(format!("bad row at {}", QPC_LO + 9))
     });
     assert_eq!(f, vec![Finding::RawQpc(RUN.into())]);
-    let f = planted(CONDITIONS, |v| {
+    let f = planted(&base, CONDITIONS, |v| {
         v["cpu_brand"] = json!(format!("Synthetic {}", QPC_LO + 9))
     });
     assert_eq!(f, vec![Finding::RawQpc(CONDITIONS.into())]);
-    let f = planted(RUN, |v| v["info"]["computer"] = json!("x"));
+    let f = planted(&base, RUN, |v| v["info"]["computer"] = json!("x"));
     assert_eq!(
         f,
         vec![Finding::Key {
@@ -160,13 +163,13 @@ fn i_scan_finds_paths_names_raw_qpc_and_unknown_keys() {
             key: "computer".into()
         }]
     );
-    let f = planted(RUN, |v| {
+    let f = planted(&base, RUN, |v| {
         v["counters"]["library_allocs"]["some_new_scope"] = json!(1);
     });
     assert_eq!(f.len(), 1);
 
     // CSV: an extra column, an unknown file.
-    let mut export = build(&passing_run(), &conditions(), &ctx()).unwrap();
+    let mut export = base.clone();
     let csv = String::from_utf8(export.files[FRAMES].clone()).unwrap();
     let csv = csv.replacen("present_us,", "present_us,raw_qpc,", 1);
     export.files.insert(FRAMES.into(), csv.into_bytes());
@@ -228,8 +231,8 @@ fn i_relative_times_inside_the_raw_qpc_range_are_accepted() {
         qpc_range: Some((600_000_000, 2_600_000_000)),
         ..ScanContext::default()
     };
-    let export = build(&passing_run(), &conditions(), &ctx).unwrap();
-    assert!(scan(&export, &ctx).is_empty());
+    // `build` scans the export and refuses it on any finding.
+    assert!(build(&passing_run(), &conditions(), &ctx).is_ok());
 }
 
 #[test]
