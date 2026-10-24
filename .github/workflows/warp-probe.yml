@@ -1,0 +1,42 @@
+# Throwaway probe for issue #2: on a Windows runner, a D3D12 WARP device can be
+# created explicitly and rendering results can be read back. Records the runner
+# image version and the adapter description.
+name: WARP probe
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.12
+          install: true
+          cache: true
+      - name: Show toolchain
+        run: |
+          expected=$(mise current rust)
+          actual=$(mise exec -- rustc --version | cut -d' ' -f2)
+          test "$expected" = "$actual"
+          mise exec -- rustc -Vv
+      - name: Show runner image
+        run: echo "runner image $ImageOS $ImageVersion"
+      - name: Build probe
+        working-directory: probe/warp
+        run: mise exec -- cargo build --locked
+      - name: Run probe
+        working-directory: probe/warp
+        run: mise exec -- cargo run --locked
