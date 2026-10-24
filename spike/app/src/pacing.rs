@@ -125,8 +125,8 @@ pub const DISPLAY_VBLANKS: i64 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
     /// The frame-latency waitable object blocked and released the thread at
-    /// a vblank. Measured against the trusted grid, such wakes land up to
-    /// `EARLY_WAKE_TOLERANCE_US` before the vblank they belong to.
+    /// a vblank. Measured against the trusted grid, such wakes may land
+    /// slightly before their vblank (`EARLY_WAKE_TOLERANCE_US`).
     Vblank,
     /// The cap timer released the thread for `slot` (a vblank on the cap
     /// grid). The frame belongs to that vblank or a later one: a timer wake
