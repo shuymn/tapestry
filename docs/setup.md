@@ -14,7 +14,10 @@ The environment for developing this repository, and how tool versions are pinned
 
 ## Repository Location
 
-- Place the working copy at a short path (e.g. `C:\dev\tapestry`). Set `core.longpaths=true` in Git and also enable long paths in the OS. The OS setting alone does not make every tool support long paths.
+- Place the working copy at a short path (e.g. `C:\dev\tapestry`). Set `core.longpaths=true` in Git and also enable long paths in the OS. The OS setting alone does not make every tool support long paths:
+  - A process's current directory cannot exceed 260 characters, so Git, mise and other native programs cannot even start in a deeper working copy.
+  - The MSVC linker (`link.exe`) cannot open paths over 260 characters (`LNK1104`), even with long paths enabled.
+  - Keep every path under the working copy, including `target/`, below 260 characters. With the current dependencies the deepest path under `target/` is about 120 characters, so the working copy root must stay under about 140 characters; a root of about 200 characters fails to link.
 - Line endings are determined by `.gitattributes`.
 - From WSL, use the same working copy as `/mnt/c/...`. So that worktrees created on Windows can also be read from WSL, set `git config --global worktree.useRelativePaths true` before creating worktrees (both the Windows-side and the WSL-side Git must be versions that support this setting). Git operations that change the working copy (commits, branch switches, etc.) are done only on the Windows side. Do not use file change watching across Windows and WSL.
 
@@ -43,6 +46,7 @@ rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
 ```
 
 - mise installs Rust using rustup and selects the version by setting `RUSTUP_TOOLCHAIN`. So calling `cargo` without going through mise does not give you the version pinned in this repository. Call it as `mise exec -- cargo ...`, or work in a shell with mise activated.
+- On both Windows and Linux (locally and in CI), mise selects the version in `mise.lock` with exactly the `minimal` profile plus `rustfmt` and `clippy`.
 - Without mise, install the version written in `mise.lock` with rustup and call `cargo +<version> ...`.
 - Additional targets (such as `wasm32-unknown-unknown`) are added in the stage that uses them.
 
@@ -63,6 +67,7 @@ The pre-commit hook runs the banned-word check and the `rustfmt` check. The hook
 - On NixOS, enable `nix-command` and `flakes`. The Nix in WSL must be linked to libgit2 1.9.4 or later: `worktree.useRelativePaths` enables the `relativeWorktrees` repository extension, and older libgit2 refuses to open the repository.
 - A flake reads only files tracked by Git. Stage (`git add`) a new `flake.nix` input, or a file the flake reads, before using it.
 - Build output in WSL is separated into a directory inside WSL via `CARGO_TARGET_DIR` (`~/.cache/tapestry/target/<hash of the working copy root>`). This keeps it from mixing with the Windows-side output and between working copies, and avoids slow writes over `/mnt/c`.
+- Work in WSL directly on the `/mnt/c` working copy. With the target directory inside WSL, `cargo test --workspace` (crates that do not depend on Windows) after `cargo clean` took 1.05 times as long as on a copy of the same commit inside WSL (median of three alternating runs, 4.0 s against 3.8 s). Revisit this if the ratio exceeds 1.5; heavy work would then use a copy inside WSL.
 - To call WSL commands from the Windows side, use `scripts/wsl.sh <command> [args...]` from Git Bash. It runs `wsl.exe -d NixOS --exec /bin/sh`, which converts the working copy's path with `wslpath` inside WSL, changes to the working copy root (the wrapper always runs there, whatever the current directory), and runs `nix develop --command <command> [args...]`. Arguments are passed verbatim, without being parsed again by a shell, and the exit code is the command's (125 if the working copy cannot be entered). `TAPESTRY_WSL_DISTRO` selects another distro. On Linux the wrapper runs `nix develop --command` directly. `scripts/wsl-selftest.sh` checks the wrapper.
 - From PowerShell, call it through Git's `bash.exe` (`& "$env:ProgramFiles\Git\bin\bash.exe" scripts/wsl.sh ...`). Plain `bash` may resolve to WSL's `bash.exe`. Windows PowerShell 5.1 drops empty arguments and strips embedded quotes when calling native programs, so run commands with such arguments from Git Bash.
 
@@ -76,6 +81,7 @@ The pre-commit hook runs the banned-word check and the `rustfmt` check. The hook
 - Both runners install tools from the same `mise.lock` (`jdx/mise-action`). Run the install step even after restoring the cache, and verify the Rust version in use.
 - GitHub Actions are pinned by commit SHA.
 - Windows runner images keep being updated even when the version is specified by label. Record the runner image version, the adapter used, and the available features. When an image update changes image comparison results, review the diff images before updating the expected images.
+- On the `windows-2025` runner, a WARP device can be created explicitly (D3D12, `IDXGIFactory4::EnumWarpAdapter`) and a rendered target read back exactly. Verified on image `win25-vs2026 20261021.278.1` (the `windows-2025` label currently maps to the Visual Studio 2026 image): Microsoft Basic Render Driver, driver 10.0.26100.33648, maximum feature level 12_1.
 - Repository settings (merge methods, the `main` rulesets with the required CI checks, allowed Actions, security features) are declared in `.github/infra.yaml`. Change them there and run `mise exec -- gh-infra plan .github/infra.yaml`, then `apply`.
 
 ## Measurement Conditions
