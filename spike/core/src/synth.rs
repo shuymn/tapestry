@@ -43,6 +43,7 @@ pub fn passing_run() -> RunData {
             render_cpu_us: 800,
             present_call_us: 50,
             present_count: None,
+            bga_index: None,
             visible_notes: 80,
             effect_instances: 120,
             lanes_with_effects: 8,

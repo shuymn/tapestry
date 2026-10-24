@@ -103,6 +103,8 @@ pub struct SpikeFrame {
     /// after its Present); pairs the frame with DXGI statistics and, for
     /// V4, with PresentMon rows. `None` offscreen or if the call failed.
     pub present_count: Option<u32>,
+    /// Number of the BGA frame (in the looped video) this frame showed.
+    pub bga_index: Option<u64>,
     pub visible_notes: u32,
     pub effect_instances: u32,
     pub lanes_with_effects: u8,

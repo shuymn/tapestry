@@ -315,7 +315,24 @@ fn v4(run: &RunData) -> Check {
         .iter()
         .filter(|m| m.is_none())
         .count();
-    if missing > 0 {
+    // The spike's own present counts say how many presents it issued in
+    // play, including any whose frame record was lost; PresentMon must have
+    // at least that many rows there.
+    let counts = run
+        .frames
+        .iter()
+        .filter(|f| f.present_us.is_some_and(|t| tl.in_play(t)))
+        .filter_map(|f| f.present_count);
+    let issued = counts
+        .clone()
+        .min()
+        .zip(counts.max())
+        .map(|(lo, hi)| u64::from(hi - lo) + 1);
+    let rows = pm
+        .iter()
+        .filter(|&&t| (start - PRESENT_MATCH_TOL_US..end + PRESENT_MATCH_TOL_US).contains(&t))
+        .count() as u64;
+    if missing > 0 || issued.is_some_and(|n| rows < n) {
         r.push("presents-missing-from-capture");
     }
     // No row gap over 1 s during which the spike presented.

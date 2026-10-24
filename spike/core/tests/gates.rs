@@ -512,6 +512,37 @@ fn e_missing_presents_are_invalid() {
     assert_eq!(s.exit_code, 2);
 }
 
+/// Present counts on every frame; `lost` frame records are dropped (the
+/// spike lost them) and `pm_missing` PresentMon rows for the same frames.
+fn counted_run(lost: usize, pm_missing: usize) -> RunData {
+    let mut run = passing_run();
+    for (i, f) in run.frames.iter_mut().enumerate() {
+        f.present_count = Some(1_000 + i as u32);
+    }
+    let mid = run.frames.len() / 2;
+    let gone: Vec<i64> = run.frames[mid..mid + lost]
+        .iter()
+        .filter_map(|f| f.present_us)
+        .collect();
+    run.frames.drain(mid..mid + lost);
+    let pm_gone = &gone[..pm_missing];
+    run.pm_frames.retain(|f| !pm_gone.contains(&f.present_us));
+    sync_streams(&mut run);
+    run
+}
+
+#[test]
+fn e_presents_counted_by_present_count_must_all_be_captured() {
+    // Lost frame records alone: PresentMon still has every present.
+    assert!(evaluate(&counted_run(3, 0)).check("V4").ok);
+    // The same presents also missing from PresentMon: time matching sees
+    // nothing wrong (no record to match), the present count does.
+    assert_eq!(
+        evaluate(&counted_run(3, 3)).check("V4").reasons,
+        vec!["presents-missing-from-capture"]
+    );
+}
+
 #[test]
 fn e_capture_gap_while_presenting_is_invalid() {
     let mut run = passing_run();
