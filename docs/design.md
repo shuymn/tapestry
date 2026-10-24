@@ -409,6 +409,7 @@ If a "sound to play" event arrives too late for the current buffer write, the so
 - Short effects such as bombs and the judgment display can be missed with the snapshot alone. Sequence-numbered judgment events are also passed to the render thread through a queue, and the render thread receives everything it has not yet processed as effects.
 - Conversion to LR2 IDs or beatoraja property IDs happens only inside each skin's adapter. The game's internal structures are not shaped to fit a skin's ID system.
 - Skin buttons and sliders do not modify state directly; they send commands.
+- **Screen resolution and aspect ratio**: Output resolutions from FHD to 4K are the realistic range. The render resolution is independent of the display: players may run below the native resolution to keep performance stable, and it is scaled to the output. Only 16:9 is supported for now, because skins are authored for it, but layout and skin coordinates are not hard-coded to 16:9: a skin declares its base resolution and aspect ratio, so other ratios such as 21:9 can be added later by skins designed for them.
 
 ### Custom Skin Format
 
@@ -433,7 +434,7 @@ From stage 1, the frame time distribution (not just the average, but also the sl
 
 ## Performance
 
-Performance is not something optimized all at once at the end, but a constraint kept from the start. The target is that, in the heaviest scene, the p99 of the presented frame interval fits within one frame time, for a 60 Hz display on the reference PC (for example a laptop with an iGPU) and a 240 Hz display on a mid-range PC. The target is treated as a value under fixed conditions: hardware, resolution, chart and skin, measurement duration, and measurement windows. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
+Performance is not something optimized all at once at the end, but a constraint kept from the start. The target is that, in the heaviest scene, the p99 of the presented frame interval fits within one frame time, for a 60 Hz display on the reference PC (for example a laptop with an iGPU) and a 240 Hz display on a mid-range PC. The target is treated as a value under fixed conditions: hardware, output and render resolutions, chart and skin, measurement duration, and measurement windows. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
 
 ### Budget
 
@@ -517,7 +518,7 @@ The rules above are a commitment for the standard settings. Only when players ch
 
 Measure with the following conditions fixed, and confirm that both sides meet the criteria. The concrete values are decided in stage 0 and written into this section.
 
-- **Conditions**: The reference PC, the game's resolution and refresh rate, the OBS scene (game capture plus about one browser source), the OBS output (1080p, 60 fps), the encoder (both hardware such as NVENC, and x264) and its settings, and the measurement duration (10 minutes or more, including the heaviest chart). The state of Windows Game Mode is left unchanged and recorded.
+- **Conditions**: The reference PC, the game's output and render resolutions and refresh rate, the OBS scene (game capture plus about one browser source), the OBS output (1080p, 60 fps), the encoder (both hardware such as NVENC, and x264) and its settings, and the measurement duration (10 minutes or more, including the heaviest chart). The state of Windows Game Mode is left unchanged and recorded.
 - **Game side**: Under that settings profile, the presented frame interval, the latency from input to judgment, and the number of audio dropouts.
 - **OBS side**: In the OBS statistics, the percentages of frames dropped due to rendering lag and frames dropped due to encoding lag. Upper bounds are set on these (for example under 0.5% each).
 - For configurations where both sides cannot meet the criteria with the standard settings, the streaming settings are recommended.
