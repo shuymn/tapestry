@@ -225,7 +225,7 @@ fn redact(text: &str, hits: &[Hit]) -> String {
         while let Some(next) = hits.next_if(|h| h.start < end) {
             end = end.max(next.end);
         }
-        out.push_str(&text[pos..hit.start.max(pos)]);
+        out.push_str(&text[pos..hit.start]);
         out.push_str(&format!("<banned term #{}>", hit.term + 1));
         pos = end;
     }

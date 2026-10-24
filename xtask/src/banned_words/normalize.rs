@@ -61,11 +61,13 @@ pub struct Token {
 /// letter↔digit, and before the last capital of an acronym followed by a
 /// lowercase letter (`HTTPServer` → `HTTP`, `Server`).
 pub fn tokenize(s: &str) -> Vec<Token> {
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut chars = s.char_indices().peekable();
     let mut tokens = Vec::new();
     let mut start: Option<usize> = None;
     let mut gap = true;
-    for (k, &(i, c)) in chars.iter().enumerate() {
+    let mut prev = '\0';
+    while let Some((i, c)) = chars.next() {
+        let before = std::mem::replace(&mut prev, c);
         if !c.is_ascii_alphanumeric() {
             if let Some(s0) = start.take() {
                 tokens.push(token(s, s0, i, gap));
@@ -74,9 +76,8 @@ pub fn tokenize(s: &str) -> Vec<Token> {
             continue;
         }
         if let Some(s0) = start {
-            let prev = chars[k - 1].1;
-            let next = chars.get(k + 1).map(|&(_, n)| n);
-            if is_split(prev, c, next) {
+            let next = chars.peek().map(|&(_, n)| n);
+            if is_split(before, c, next) {
                 tokens.push(token(s, s0, i, gap));
                 gap = false;
                 start = Some(i);

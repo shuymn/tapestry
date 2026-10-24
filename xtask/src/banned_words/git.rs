@@ -107,7 +107,7 @@ pub fn read_blobs(root: &Path, oids: &[&str]) -> Result<Vec<Vec<u8>>, String> {
         .spawn()
         .map_err(|e| format!("cannot run git cat-file: {e}"))?;
     let mut stdin = child.stdin.take().expect("piped stdin");
-    let input: String = oids.iter().map(|oid| format!("{oid}\n")).collect();
+    let input = oids.join("\n") + "\n";
     // Write from another thread so a full stdout pipe cannot deadlock us.
     let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
     let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
