@@ -20,10 +20,15 @@ during a run. No other MediaMTX may be running (the OBS runs refuse to start
 over it and never stop it).
 
 GPU driver power setting: add --gpu-power-mode <value> to every run to
-record the per-program power management setting you chose for
-tapestry-spike.exe in the GPU control panel (default, normal, optimal-power,
-adaptive, prefer-max-performance, prefer-consistent-performance). It cannot
-be read by the spike and is recorded as declared.
+record the per-program power management setting that applies to this
+copy of tapestry-spike.exe (default, normal, optimal-power, adaptive,
+prefer-max-performance, prefer-consistent-performance). The driver's
+program profile is per executable path: it must point at the
+tapestry-spike.exe in this folder, not another copy; without such a
+profile, declare default. The spike cannot read the setting; it records
+the declaration and the GPU's observed P-state and clocks during play, and
+the report warns when prefer-max-performance is declared but the GPU never
+reached P0.
 
 Runs (results in runs\<name>; hand off only runs\<name>\export\*.zip)
   run-starve.cmd s0                         S0: prints "S0: pass" or the failure

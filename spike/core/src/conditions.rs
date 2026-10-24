@@ -96,6 +96,10 @@ pub struct PublicConditions {
     /// The per-program driver power setting as the owner declared it
     /// (`measure --gpu-power-mode`); not readable without vendor APIs.
     pub gpu_power_mode_declared: Option<String>,
+    /// The declaration contradicts the observed state: maximum performance
+    /// declared, yet the GPU never reached P0 during play (the driver's
+    /// program profile is per executable path and may not cover this copy).
+    pub gpu_power_mode_contradicted: Option<bool>,
     // Windows and power.
     pub windows_build: Option<String>,
     pub windows_ubr: Option<u32>,
@@ -155,6 +159,7 @@ pub const PUBLIC_KEYS: &[&str] = &[
     "hybrid_present",
     "gpu_state",
     "gpu_power_mode_declared",
+    "gpu_power_mode_contradicted",
     "windows_build",
     "windows_ubr",
     "power_source",
@@ -356,6 +361,16 @@ pub fn gpu_state_from_smi(text: &str, gpu: &str, from: i64, to: i64) -> GpuState
     }
 }
 
+/// Whether a declared driver power setting contradicts the GPU state
+/// during play; `None` when the state was not observed.
+pub fn power_mode_contradicted(declared: Option<&str>, state: &GpuState) -> Option<bool> {
+    if state.source != "nvidia-smi" {
+        return None;
+    }
+    let p0 = state.pstates.iter().any(|p| p.pstate == "P0");
+    Some(declared == Some("prefer-max-performance") && !p0)
+}
+
 /// Windows' effective power mode (`EFFECTIVE_POWER_MODE`) by value.
 pub fn power_mode_name(mode: i32) -> &'static str {
     match mode {
@@ -512,6 +527,30 @@ mod tests {
         assert_eq!((s.mem_mhz_min, s.mem_mhz_max), (Some(810), Some(11501)));
         let none = gpu_state_from_smi(text, "GPU C", t0, t0 + 1_000);
         assert!(none.source.starts_with("unavailable"));
+    }
+
+    #[test]
+    fn a_max_performance_declaration_needs_p0_during_play() {
+        let state = |p: &str| GpuState {
+            source: "nvidia-smi".into(),
+            samples: 1,
+            pstates: vec![PstateShare {
+                pstate: p.into(),
+                pct: 100.0,
+            }],
+            ..GpuState::default()
+        };
+        let max = Some("prefer-max-performance");
+        assert_eq!(power_mode_contradicted(max, &state("P5")), Some(true));
+        assert_eq!(power_mode_contradicted(max, &state("P0")), Some(false));
+        assert_eq!(
+            power_mode_contradicted(Some("default"), &state("P8")),
+            Some(false)
+        );
+        assert_eq!(
+            power_mode_contradicted(max, &GpuState::unavailable("x")),
+            None
+        );
     }
 
     #[test]

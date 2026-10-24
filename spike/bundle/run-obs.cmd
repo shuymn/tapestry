@@ -6,6 +6,8 @@ rem scene collection, a 20 s countdown and 4 loops. When the run ends, stop
 rem streaming and exit OBS at once (V7 allows 60 s after play); the newest
 rem OBS log is then collected. After a gate failure the next ladder rung
 rem (streaming profile, next audio period) is printed.
+rem Add --gpu-power-mode <value> (README): the GPU driver's program profile
+rem is per executable path and must point at this folder's tapestry-spike.exe.
 rem   run-obs.cmd <run-name> <obs-profile> <hardware|x264> [run options]
 rem   e.g. run-obs.cmd r2 tapestry-spike-nvenc hardware
 rem        run-obs.cmd r3 tapestry-spike-x264 x264

@@ -2,6 +2,8 @@
 rem R1 baseline (design 4.2): standard profile, no cap, BGA on, 4 loops (600 s),
 rem under PresentMon, then the report and the export. After a G5 failure the
 rem next audio period rung is printed.
+rem Add --gpu-power-mode <value> (README): the GPU driver's program profile
+rem is per executable path and must point at this folder's tapestry-spike.exe.
 rem   run-baseline.cmd <run-name> [more run options, e.g. --monitor DISPLAY1]
 setlocal
 cd /d "%~dp0"

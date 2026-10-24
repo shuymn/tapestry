@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use spike_core::conditions::{
     AdapterRecord, GpuState, NVIDIA_VENDOR_ID, PeriodLadder, PublicConditions, gpu_state_from_smi,
-    ladder, obs_log_day_base, power_modes_during, select_adapter,
+    ladder, obs_log_day_base, power_mode_contradicted, power_modes_during, select_adapter,
 };
 use spike_core::evaluate::{Summary, evaluate};
 use spike_core::export::{self, Export, ExportError, ScanContext};
@@ -178,16 +178,25 @@ pub fn complete(dir: &Path, notes: &Path) -> Result<Completed, String> {
         "gpu_driver".into(),
         json!(used.and_then(|a| a.driver.clone())),
     );
-    cond.insert(
-        "gpu_state".into(),
-        json!(gpu_state(
-            dir,
-            vendor,
-            &used_name,
-            origin.local_ms(play_start),
-            origin.local_ms(play_end)
-        )),
+    let state = gpu_state(
+        dir,
+        vendor,
+        &used_name,
+        origin.local_ms(play_start),
+        origin.local_ms(play_end),
     );
+    let declared = cond
+        .get("gpu_power_mode_declared")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let contradicted = power_mode_contradicted(declared.as_deref(), &state);
+    if contradicted == Some(true) {
+        eprintln!(
+            "report: WARNING: prefer-max-performance was declared but the GPU never reached P0 during play; the driver's program profile is per executable path, so it may not cover this copy"
+        );
+    }
+    cond.insert("gpu_state".into(), json!(state));
+    cond.insert("gpu_power_mode_contradicted".into(), json!(contradicted));
     // Effective power modes during play (`measure`'s watch); unknown without
     // one, never the mode at collection time.
     let modes = std::fs::read_to_string(dir.join(crate::power::POWER_MODES))
