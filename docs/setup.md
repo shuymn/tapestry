@@ -15,9 +15,9 @@ The environment for developing this repository, and how tool versions are pinned
 ## Repository Location
 
 - Place the working copy at a short path (e.g. `C:\dev\tapestry`). Set `core.longpaths=true` in Git and also enable long paths in the OS. The OS setting alone does not make every tool support long paths:
-  - A process's current directory cannot exceed 260 characters, so Git, mise and other native programs cannot even start in a deeper working copy.
+  - Native programs (Git, mise, cargo) cannot be started from a current directory longer than 260 characters.
   - The MSVC linker (`link.exe`) cannot open paths over 260 characters (`LNK1104`), even with long paths enabled.
-  - Keep every path under the working copy, including `target/`, below 260 characters. With the current dependencies the deepest path under `target/` is about 120 characters, so the working copy root must stay under about 140 characters; a root of about 200 characters fails to link.
+  - Keep every path under the working copy, including `target/`, below 260 characters, with margin for new dependencies. With a 94-character root the deepest path was 217 characters and everything built; with a 201-character root it was 333 characters and build scripts failed to link.
 - Line endings are determined by `.gitattributes`.
 - From WSL, use the same working copy as `/mnt/c/...`. So that worktrees created on Windows can also be read from WSL, set `git config --global worktree.useRelativePaths true` before creating worktrees (both the Windows-side and the WSL-side Git must be versions that support this setting). Git operations that change the working copy (commits, branch switches, etc.) are done only on the Windows side. Do not use file change watching across Windows and WSL.
 
@@ -46,7 +46,7 @@ rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
 ```
 
 - mise installs Rust using rustup and selects the version by setting `RUSTUP_TOOLCHAIN`. So calling `cargo` without going through mise does not give you the version pinned in this repository. Call it as `mise exec -- cargo ...`, or work in a shell with mise activated.
-- On both Windows and Linux (locally and in CI), mise selects the version in `mise.lock` with exactly the `minimal` profile plus `rustfmt` and `clippy`.
+- On both Windows and Linux (locally and in CI), mise selects the version in `mise.lock` with the `minimal` profile plus `rustfmt` and `clippy`.
 - Without mise, install the version written in `mise.lock` with rustup and call `cargo +<version> ...`.
 - Additional targets (such as `wasm32-unknown-unknown`) are added in the stage that uses them.
 
