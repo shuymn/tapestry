@@ -1,0 +1,4 @@
+[env]
+# The LGPL shared FFmpeg that scripts/fetch-tools.sh unpacks. ffmpeg-sys-next
+# links against it, and app/build.rs copies its DLLs next to the executable.
+FFMPEG_DIR = { value = "third_party/ffmpeg", relative = true }

@@ -1,9 +1,10 @@
 # Stage 0 spike workspace (issue #3). Separate from the root workspace on
 # purpose: it is never merged into `main`, and the root checks (check-arch,
-# cargo deny, tests) must not see it. `app` joins `members` in P0/P2.
+# cargo deny, tests) must not see it. `core` is pure and portable; `app` is the
+# Windows executable (FFmpeg, and in P2/P3 wgpu and WASAPI).
 [workspace]
 resolver = "3"
-members = ["core"]
+members = ["app", "core"]
 
 [workspace.package]
 edition = "2024"

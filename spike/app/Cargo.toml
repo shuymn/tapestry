@@ -1,0 +1,15 @@
+[package]
+name = "tapestry-spike"
+version = "0.0.0"
+description = "Stage 0 spike executable: rendering, audio and measurement on Windows."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Dynamically linked against the LGPL shared build from scripts/fetch-tools.sh
+# (FFMPEG_DIR in .cargo/config.toml); building it needs libclang (bindgen).
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
+
+[lints]
+workspace = true
