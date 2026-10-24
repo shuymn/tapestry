@@ -5,8 +5,8 @@ name: Update mise tools
 # never installs or runs the tools, so the App token is created in the same job
 # after it. Only tools whose version changes are re-locked, so checksums of
 # unchanged versions stay pinned. The PR is opened with an App token because
-# PRs created with GITHUB_TOKEN do not trigger CI, so auto-merge would never
-# get checks.
+# PRs created with GITHUB_TOKEN do not run CI unattended, so auto-merge would
+# never get checks.
 
 on:
   schedule:
@@ -103,10 +103,6 @@ jobs:
             mutation($input: CreateCommitOnBranchInput!) {
               createCommitOnBranch(input: $input) { commit { oid } }
             }
-          AUTO_MERGE_QUERY: >-
-            mutation($id: ID!) {
-              enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: MERGE}) { clientMutationId }
-            }
         run: |
           set -eu
           repo=$GITHUB_REPOSITORY
@@ -154,6 +150,9 @@ jobs:
               -F body=@"$RUNNER_TEMP/body.md")
             echo "opened #$(printf '%s' "$pr" | jq -r .number)"
           fi
+          # The API refuses to enable auto-merge on a PR that is already
+          # mergeable (CI passed after an earlier run failed to enable it);
+          # `gh pr merge --auto` merges such a PR at once instead.
           if [ "$(printf '%s' "$pr" | jq '.auto_merge == null')" = true ]; then
-            gh api graphql -f query="$AUTO_MERGE_QUERY" -f id="$(printf '%s' "$pr" | jq -r .node_id)" >/dev/null
+            gh pr merge -R "$repo" --auto --merge "$(printf '%s' "$pr" | jq -r .number)"
           fi

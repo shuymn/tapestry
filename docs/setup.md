@@ -66,7 +66,7 @@ The pre-commit hook runs the banned-word check and the `rustfmt` check. The hook
 - It fails if any file other than `mise.lock` and `flake.lock` changed.
 - The result is a signed commit on the `mise-update` branch, with one open PR from it (a From/To table, auto-merge with a merge commit). A branch that already proposes the same lockfiles is kept, and its PR is reused or opened again; otherwise the branch is recreated from `main`, which closes the stale PR. To keep a tool at its version, write the exact version in `mise.toml` with a comment saying why. Major updates are manual: change the range in `mise.toml` and run `mise lock`.
 
-PRs created with `GITHUB_TOKEN` do not trigger CI, so auto-merge would never get checks. The workflow opens the PR with a GitHub App token instead, which needs:
+PRs created with `GITHUB_TOKEN` do not run CI unattended, so auto-merge would never get checks. The workflow opens the PR with a GitHub App token instead, which needs:
 
 - A GitHub App installed on this repository only, with the repository permissions Contents (read and write) and Pull requests (read and write).
 - The repository variable `APP_CLIENT_ID` (the App's client ID) and the secret `APP_PRIVATE_KEY` (a private key of the App).
