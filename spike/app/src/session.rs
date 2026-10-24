@@ -206,6 +206,8 @@ pub struct SessionOut {
     pub summary: PlaySummary,
     pub input: Vec<InputLatency>,
     pub periods: Vec<AudioPeriod>,
+    /// (judgment run µs, judgment → scheduled mix µs) per sound.
+    pub judge_to_mix: Vec<(i64, i64)>,
     /// Private: mix-clock anchors (device frame, run µs) and loopback
     /// packet anchors (capture position, run µs).
     pub mix_anchors: Vec<(u64, i64)>,
@@ -258,6 +260,7 @@ impl Session {
             latency_us_max: lat.iter().max().copied(),
         };
         let mut periods = vec![];
+        let mut judge_to_mix = vec![];
         let (mut mix_anchors, mut capture_anchors) = (vec![], vec![]);
         let audio = match self.audio.take() {
             None => None,
@@ -286,6 +289,8 @@ impl Session {
                     }
                     Err(e) => (None, Some(e), AudioFacts::default()),
                 };
+                let j2m_us: Vec<i64> = j2m.iter().map(|x| x.1).collect();
+                judge_to_mix = j2m;
                 let v6 = audio_validity(&facts, (play_start, play_start + play_len), rate);
                 let injection = match (&render_side, &loop_side) {
                     (Some(r), Some(l)) if !r.injected_frames.is_empty() => {
@@ -308,10 +313,10 @@ impl Session {
                     v6,
                     facts,
                     period_records,
-                    judge_to_mix_us_p50: percentile_i64(&j2m, 50),
-                    judge_to_mix_us_p99: percentile_i64(&j2m, 99),
-                    judge_to_mix_us_min: j2m.iter().min().copied(),
-                    judge_to_mix_us_max: j2m.iter().max().copied(),
+                    judge_to_mix_us_p50: percentile_i64(&j2m_us, 50),
+                    judge_to_mix_us_p99: percentile_i64(&j2m_us, 99),
+                    judge_to_mix_us_min: j2m_us.iter().min().copied(),
+                    judge_to_mix_us_max: j2m_us.iter().max().copied(),
                     injection,
                 })
             }
@@ -320,6 +325,7 @@ impl Session {
             summary: PlaySummary { input, audio },
             input: logic.input,
             periods,
+            judge_to_mix,
             mix_anchors,
             capture_anchors,
         })
@@ -384,6 +390,14 @@ pub fn write(out: &Path, s: &SessionOut) -> Result<(), String> {
     }
     w.flush().map_err(|e| e.to_string())?;
     if s.summary.audio.is_some() {
+        let mut w = csv_out("judge_to_mix.csv")?;
+        w.write_record(["judged_us", "judge_to_mix_us"])
+            .map_err(|e| e.to_string())?;
+        for (t, d) in &s.judge_to_mix {
+            w.write_record([t.to_string(), d.to_string()])
+                .map_err(|e| e.to_string())?;
+        }
+        w.flush().map_err(|e| e.to_string())?;
         let mut w = csv_out("audio_periods.csv")?;
         for r in &s.periods {
             w.serialize(r).map_err(|e| e.to_string())?;
@@ -453,9 +467,10 @@ pub fn print(s: &PlaySummary) {
             r.endpoint_muted
         );
         println!(
-            "audio: queue {} periods; MMCSS {}; wake lateness vs the mix clock p50 {:?} us p99 {:?} us max {:?} us",
+            "audio: queue {} periods; MMCSS {}; mix clock resets {}; wake lateness vs the mix clock p50 {:?} us p99 {:?} us max {:?} us",
             r.queue_periods,
             r.mmcss,
+            r.mix_clock_rebases,
             r.wake_lateness_us_p50,
             r.wake_lateness_us_p99,
             r.wake_lateness_us_max

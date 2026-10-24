@@ -348,6 +348,8 @@ pub struct Starve {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct RenderSide {
     pub backend: String,
+    /// Mix-clock window resets (empty buffer) and rebases (a jump).
+    pub mix_clock_rebases: u64,
     /// MMCSS "Pro Audio" registration succeeded.
     pub mmcss: bool,
     pub queue_periods: u32,
@@ -386,7 +388,8 @@ pub struct RenderOut {
     pub periods: Vec<AudioPeriod>,
     pub period_records: StreamCount,
     /// Judgment → scheduled device frame, µs.
-    pub judge_to_mix_us: Vec<i64>,
+    /// Judgment → scheduled mix, per sound: (judgment run µs, µs).
+    pub judge_to_mix_us: Vec<(i64, i64)>,
     /// Mix-clock anchors per wake: (device frame, run µs), for the
     /// private trace.
     pub anchors: Vec<(u64, i64)>,
@@ -597,7 +600,7 @@ fn render_thread(
         (render, buffer)
     };
     let mut engine = Engine::new(rate, key_bank(SOUND_SEED, rate), None);
-    let mut mix_clock = MixClock::new(rate);
+    let mut mix_clock = MixClock::new(rate, period);
     // Queued audio: whole periods, at most what the buffer holds.
     let queue_periods = args.queue_periods.clamp(1, (buffer_frames / period).max(1));
     let queue_frames = queue_periods * period;
@@ -611,7 +614,7 @@ fn render_thread(
         Vec::with_capacity((total_us / period_us.max(1)) as usize * 2 + 1_000);
     let mut lateness: Vec<i64> = Vec::with_capacity(period_log.capacity());
     let mut period_records = StreamCount::default();
-    let mut judge_to_mix: Vec<i64> = Vec::with_capacity(notes + 16);
+    let mut judge_to_mix: Vec<(i64, i64)> = Vec::with_capacity(notes + 16);
     let mut diag = Diagnostics {
         padding_zero_at_us: Vec::with_capacity(DIAG_TIMES),
         wake_gap_at_us: Vec::with_capacity(DIAG_TIMES),
@@ -690,33 +693,6 @@ fn render_thread(
                 st.padding_zero_wakes += 1;
             }
         }
-        // The engine mix clock: the event fires when the audio engine has
-        // taken a period from the buffer, so the first frame still queued
-        // (written minus padding) is read at the next pass, a period after
-        // that pass. The wake itself may come late; `MixClock` keeps the
-        // least-late wake of its window, so lateness does not enter the
-        // clock (engine::MixClock). IAudioClock positions were not used:
-        // on the RME they advanced a period at a time against a current
-        // QPC.
-        let queued_from = engine.device_frames() - u64::from(padding);
-        mix_clock.observe(queued_from, clock.to_us(wake_q) + period_us);
-        if lateness.len() < lateness.capacity() {
-            lateness.push(mix_clock.latest_error_us());
-        }
-        if mix_anchors.len() < mix_anchors.capacity() {
-            mix_anchors.push((queued_from, clock.to_us(wake_q) + period_us));
-        }
-        let mixed_at = |f: u64| mix_clock.at(f).unwrap_or(0);
-        if let (None, Some((every_s, gap_ms))) = (injection, args.inject) {
-            let every = u64::from(every_s) * u64::from(rate);
-            injection = Some(Injection {
-                first: mix_clock.frame_at(play_start).unwrap_or(0) + every,
-                every,
-                len: u64::from(gap_ms) * u64::from(rate) / 1000,
-                count: gaps as u64,
-            });
-            engine.set_injection(injection);
-        }
         // Starvation: withhold writes for `starve_ms` from each start.
         if let Some(ms) = args.starve_ms
             && next_starve < starve_count
@@ -740,6 +716,39 @@ fn render_thread(
             }
             starve_until = None;
         }
+        // The engine mix clock: the event fires when the audio engine has
+        // taken a period from the buffer, so the first frame still queued
+        // (written minus padding) is read at the next pass, a period after
+        // that pass. The wake itself may come late; `MixClock` keeps the
+        // least-late wake of its window, so lateness does not enter the
+        // clock (engine::MixClock). IAudioClock positions were not used:
+        // on the RME they advanced a period at a time against a current
+        // QPC. Only wakes that write are observed (a withholding skipped
+        // them above); an empty buffer resets the window.
+        let queued_from = engine.device_frames() - u64::from(padding);
+        if padding == 0 {
+            // The buffer ran empty: the engine may have played silence,
+            // which moves the frame/time relation.
+            mix_clock.reset();
+        }
+        mix_clock.observe(queued_from, clock.to_us(wake_q) + period_us);
+        if lateness.len() < lateness.capacity() {
+            lateness.push(mix_clock.latest_error_us());
+        }
+        if mix_anchors.len() < mix_anchors.capacity() {
+            mix_anchors.push((queued_from, clock.to_us(wake_q) + period_us));
+        }
+        let mixed_at = |f: u64| mix_clock.at(f).unwrap_or(0);
+        if let (None, Some((every_s, gap_ms))) = (injection, args.inject) {
+            let every = u64::from(every_s) * u64::from(rate);
+            injection = Some(Injection {
+                first: mix_clock.frame_at(play_start).unwrap_or(0) + every,
+                every,
+                len: u64::from(gap_ms) * u64::from(rate) / 1000,
+                count: gaps as u64,
+            });
+            engine.set_injection(injection);
+        }
         // Sound commands: each at a fixed delay after its judgment.
         while let Ok(cmd) = sounds.pop() {
             sound_commands += 1;
@@ -751,7 +760,7 @@ fn render_thread(
             }
             let at_us = mixed_at(at);
             if judge_to_mix.len() < judge_to_mix.capacity() {
-                judge_to_mix.push(at_us - judged_us);
+                judge_to_mix.push((judged_us, at_us - judged_us));
             }
         }
         let frames = queue_frames.saturating_sub(padding) / period * period;
@@ -808,6 +817,7 @@ fn render_thread(
     Ok(RenderOut {
         side: RenderSide {
             backend,
+            mix_clock_rebases: mix_clock.rebases,
             mmcss: mmcss.is_some(),
             queue_periods,
             wake_lateness_us_p50: percentile_i64(&lateness, 50),

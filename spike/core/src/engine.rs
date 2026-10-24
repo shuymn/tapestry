@@ -277,27 +277,53 @@ impl Engine {
 /// by that smallest lateness (tens of µs in practice) instead of the
 /// latest wake's. The device clock's drift against QPC (tens of ppm) moves
 /// it by under 30 µs across the window.
+///
+/// The window holds only while the frame/time relation does: an underrun
+/// (frames stall while time goes on) or any other discontinuity moves it.
+/// The caller resets the clock when the buffer was found empty, and the
+/// clock rebases itself when `MIX_CLOCK_REBASE_AFTER` observations in a
+/// row lie more than half a period above the window's earliest, or one
+/// lies more than half a period below it.
 pub const MIX_CLOCK_WINDOW: usize = 128;
+pub const MIX_CLOCK_REBASE_AFTER: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct MixClock {
     rate_hz: u32,
+    /// Half a period, µs: the jump that rebases the window.
+    jump_us: i64,
     /// Residuals in µs (time minus `frame / rate`), a ring.
     residuals: Vec<i64>,
     len: usize,
     next: usize,
     last: Option<i64>,
+    /// Consecutive observations above the window's earliest by `jump_us`.
+    above: usize,
+    /// Times the window was reset or rebased.
+    pub rebases: u64,
 }
 
 impl MixClock {
-    pub fn new(rate_hz: u32) -> Self {
+    pub fn new(rate_hz: u32, period_frames: u32) -> Self {
         Self {
             rate_hz,
+            jump_us: i64::from(period_frames) * 1_000_000 / i64::from(rate_hz) / 2,
             residuals: vec![0; MIX_CLOCK_WINDOW],
             len: 0,
             next: 0,
             last: None,
+            above: 0,
+            rebases: 0,
         }
+    }
+
+    /// Forgets every observation (the frame/time relation may have moved).
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.next = 0;
+        self.last = None;
+        self.above = 0;
+        self.rebases += 1;
     }
 
     fn frame_us(&self, frame: u64) -> i64 {
@@ -307,6 +333,18 @@ impl MixClock {
     /// Frame `frame` is read by the engine at `t_us` or earlier.
     pub fn observe(&mut self, frame: u64, t_us: i64) {
         let r = t_us - self.frame_us(frame);
+        if let Some(&min) = self.residuals[..self.len].iter().min() {
+            if r < min - self.jump_us {
+                self.reset();
+            } else if r > min + self.jump_us {
+                self.above += 1;
+                if self.above >= MIX_CLOCK_REBASE_AFTER {
+                    self.reset();
+                }
+            } else {
+                self.above = 0;
+            }
+        }
         self.residuals[self.next] = r;
         self.next = (self.next + 1) % self.residuals.len();
         self.len = (self.len + 1).min(self.residuals.len());
@@ -393,7 +431,7 @@ mod tests {
         // 50 µs to 4 ms late. The frame's time comes from the least-late
         // wake, so its error stays near the smallest lateness.
         let rate = 44_100;
-        let mut c = MixClock::new(rate);
+        let mut c = MixClock::new(rate, 441);
         let mut rng = crate::rng::SplitMix64::new(3);
         let true_at = |f: u64| 1_000_000 + (f as i128 * 1_000_000 / i128::from(rate)) as i64;
         let mut worst = 0;
@@ -409,6 +447,51 @@ mod tests {
         assert!(worst <= 200, "{worst} us");
         // The latest wake alone would be off by up to the full lateness.
         assert!(c.latest_error_us() > 1_000);
+    }
+
+    /// 300 steady events, then a 40 ms underrun (four events with the
+    /// queued frame stalled while time goes on and nothing written), then
+    /// steady again 40 ms later. Returns the clock's worst error over the recovered events
+    /// from the `from`-th on.
+    fn underrun(reset_on_empty: bool, from: usize) -> i64 {
+        let rate = 44_100;
+        let mut c = MixClock::new(rate, 441);
+        let mut rng = crate::rng::SplitMix64::new(5);
+        let at = |f: u64, shift: i64| {
+            1_000_000 + shift + (f as i128 * 1_000_000 / i128::from(rate)) as i64
+        };
+        for k in 0..300u64 {
+            c.observe(k * 441, at(k * 441, 0) + 50 + rng.below(500) as i64);
+        }
+        let stalled = 300 * 441;
+        for k in 0..4 {
+            if reset_on_empty {
+                // Empty buffer and nothing written: reset, no observation.
+                c.reset();
+            } else {
+                c.observe(stalled, at(stalled, 0) + k * 10_000 + 50);
+            }
+        }
+        let mut worst = 0;
+        for k in 0..100u64 {
+            let f = stalled + k * 441;
+            c.observe(f, at(f, 40_000) + 50 + rng.below(500) as i64);
+            if k as usize >= from {
+                worst = worst.max((c.at(f).unwrap() - at(f, 40_000)).abs());
+            }
+        }
+        worst
+    }
+
+    // Codex P3 confirmation: observations from before an underrun must not
+    // keep the clock 40 ms early after it.
+    #[test]
+    fn the_mix_clock_recovers_from_an_underrun() {
+        // Reset when the buffer was found empty: right from recovery.
+        assert!(underrun(true, 0) <= 600, "{}", underrun(true, 0));
+        // Without that reset the jump itself rebases the window.
+        let after = MIX_CLOCK_REBASE_AFTER;
+        assert!(underrun(false, after) <= 600, "{}", underrun(false, after));
     }
 
     #[test]
