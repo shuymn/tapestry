@@ -5,7 +5,7 @@ use crate::alloc::{self, Scope, Tag, scope};
 use crate::bga::Bga;
 use crate::pacing::bga_due_records;
 use crate::render::Renderer;
-use crate::scene::{Frame, FrameLoad, Scene};
+use crate::scene::{Effects, Frame, FrameLoad, Scene};
 use crate::timebase::{Clock, qpc, qpc_freq};
 use serde::Serialize;
 use spike_core::chart::{CHART_LEN_US, Chart, DEFAULT_SEED};
@@ -106,6 +106,9 @@ pub struct DxgiSummary {
 pub struct RenderSummary {
     pub mode: String,
     pub adapter: String,
+    /// PCI vendor and device id of the adapter (picks its conditions).
+    pub adapter_vendor: u32,
+    pub adapter_device: u32,
     pub device_type: String,
     pub size: (u32, u32),
     pub frames: u64,
@@ -339,6 +342,8 @@ pub fn summary_common(
     RenderSummary {
         mode: mode.into(),
         adapter: info.name.clone(),
+        adapter_vendor: info.vendor,
+        adapter_device: info.device,
         device_type: format!("{:?}", info.device_type),
         size,
         frames: rec.frames.len() as u64,
@@ -532,7 +537,7 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
     let n = args.frames.unwrap_or(300) as usize;
     // Threadless presses and judgments on the virtual clock.
     let mut play = Play::new(&chart, n as i64 * VIRTUAL_FRAME_US);
-    let mut scene = Scene::new(chart);
+    let mut scene = Scene::new(chart, Effects::for_profile(args.meta.profile));
     let mut frame = Frame::new();
     let mut rec = Recorder::new(n);
     let interval = bga.interval_us();

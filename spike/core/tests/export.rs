@@ -1,10 +1,11 @@
 //! P1 test (i): export round trip and the leak scan.
 
 use serde_json::{Map, Value, json};
+use spike_core::conditions::{DisplayMode, GpuState, HybridPresent, PstateShare, PublicConditions};
 use spike_core::evaluate::evaluate;
 use spike_core::export::{
-    CONDITIONS, Export, ExportError, FRAMES, Finding, INPUT, RUN, SUMMARY, ScanContext, build,
-    read, recompute, scan,
+    CONDITIONS, Export, ExportError, FRAMES, Finding, INPUT, REPORT, RUN, SUMMARY, ScanContext,
+    build, read, recompute, scan,
 };
 use spike_core::obslog::{WallWindow, derive};
 use spike_core::run::RunData;
@@ -24,7 +25,7 @@ fn ctx() -> ScanContext {
     }
 }
 
-fn conditions() -> Map<String, Value> {
+fn private_conditions() -> Map<String, Value> {
     let v = json!({
         "commit": "0123abcd",
         "dirty": false,
@@ -39,9 +40,22 @@ fn conditions() -> Map<String, Value> {
         "audio_device_name": "Speakers (Synth Audio)",
         "origin_qpc": QPC_LO + 5,
         "wall_clock_start": "2026-10-24T21:00:10+09:00",
-        "gpu_adapter": { "nested": "dropped" }
+        "gpu_adapters": [{ "name": "Synthetic GPU", "vendor_id": 1 }]
     });
     v.as_object().unwrap().clone()
+}
+
+fn conditions() -> PublicConditions {
+    PublicConditions::from_conditions(&private_conditions()).unwrap()
+}
+
+/// A name planted in the public conditions shows up in both files that
+/// carry them.
+fn name_findings() -> Vec<Finding> {
+    vec![
+        Finding::Name(CONDITIONS.into()),
+        Finding::Name(REPORT.into()),
+    ]
 }
 
 fn obs_run() -> RunData {
@@ -103,9 +117,15 @@ fn i_round_trip_gives_an_identical_summary() {
 fn i_export_drops_private_condition_fields_and_the_raw_obs_log() {
     let export = build(&obs_run(), &conditions(), &ctx()).unwrap();
     let c: Value = serde_json::from_slice(&export.files[CONDITIONS]).unwrap();
-    let keys: Vec<&String> = c.as_object().unwrap().keys().collect();
+    let set: Vec<&String> = c
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, v)| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()))
+        .map(|(k, _)| k)
+        .collect();
     assert_eq!(
-        keys,
+        set,
         [
             "commit",
             "cpu_brand",
@@ -251,27 +271,27 @@ fn i_short_names_are_checked_as_whole_words() {
     };
     assert!(build(&passing_run(), &conditions(), &ctx).is_ok());
     let mut c = conditions();
-    c.insert("cpu_brand".into(), json!("Synthetic CPU (jk)"));
+    c.cpu_brand = Some("Synthetic CPU (jk)".into());
     assert!(matches!(
         build(&passing_run(), &c, &ctx),
-        Err(ExportError::Rejected(f)) if f == vec![Finding::Name(CONDITIONS.into())]
+        Err(ExportError::Rejected(f)) if f == name_findings()
     ));
-    c.insert("cpu_brand".into(), json!("Synthetic JK-8 CPU"));
+    c.cpu_brand = Some("Synthetic JK-8 CPU".into());
     assert!(build(&passing_run(), &c, &ctx).is_err());
     // Inside a longer word it is not that name.
-    c.insert("cpu_brand".into(), json!("Synthetic ajkx CPU"));
+    c.cpu_brand = Some("Synthetic ajkx CPU".into());
     assert!(build(&passing_run(), &c, &ctx).is_ok());
     // Punctuation inside a short name is part of it.
     let ctx = ScanContext {
         forbidden_names: vec!["a-b".into()],
         ..ScanContext::default()
     };
-    c.insert("cpu_brand".into(), json!("a-b performance plan"));
+    c.cpu_brand = Some("a-b performance plan".into());
     assert!(matches!(
         build(&passing_run(), &c, &ctx),
-        Err(ExportError::Rejected(f)) if f == vec![Finding::Name(CONDITIONS.into())]
+        Err(ExportError::Rejected(f)) if f == name_findings()
     ));
-    c.insert("cpu_brand".into(), json!("xa-by performance plan"));
+    c.cpu_brand = Some("xa-by performance plan".into());
     assert!(build(&passing_run(), &c, &ctx).is_ok());
     // Overlapping occurrences: the first `a-a` in "extra-a-a" is inside a
     // word, the overlapping second one is the name.
@@ -279,9 +299,81 @@ fn i_short_names_are_checked_as_whole_words() {
         forbidden_names: vec!["a-a".into()],
         ..ScanContext::default()
     };
-    c.insert("cpu_brand".into(), json!("extra-a-a performance plan"));
+    c.cpu_brand = Some("extra-a-a performance plan".into());
     assert!(matches!(
         build(&passing_run(), &c, &ctx),
-        Err(ExportError::Rejected(f)) if f == vec![Finding::Name(CONDITIONS.into())]
+        Err(ExportError::Rejected(f)) if f == name_findings()
     ));
+}
+
+#[test]
+fn i_every_condition_section_survives_the_export() {
+    let mut c = conditions();
+    c.displays = vec![
+        DisplayMode {
+            gdi_name: "DISPLAY1".into(),
+            width: 2560,
+            height: 1440,
+            refresh_num: 240_085,
+            refresh_den: 1_000,
+        },
+        DisplayMode {
+            gdi_name: "DISPLAY2".into(),
+            width: 1920,
+            height: 1080,
+            refresh_num: 59_951,
+            refresh_den: 1_000,
+        },
+    ];
+    c.presentmon_version = Some("2.6.0".into());
+    c.scene_hash = Some("ab".repeat(32));
+    c.hybrid_present = Some(HybridPresent {
+        rows: 100,
+        hybrid_rows: 0,
+    });
+    c.gpu_state = Some(GpuState {
+        source: "nvidia-smi".into(),
+        samples: 550,
+        pstates: vec![PstateShare {
+            pstate: "P0".into(),
+            pct: 100.0,
+        }],
+        core_mhz_p50: Some(2550),
+        mem_mhz_p50: Some(11501),
+        ..GpuState::default()
+    });
+    c.gpu_power_mode_declared = Some("prefer-max-performance".into());
+    c.power_mode = Some("balanced, game-mode".into());
+    (c.audio_period_min, c.audio_period_max, c.audio_period_step) =
+        (Some(384), Some(480), Some(48));
+    c.audio_period_default = Some(480);
+    let export = build(&passing_run(), &c, &ctx()).unwrap();
+    let back: PublicConditions = serde_json::from_slice(&export.files[CONDITIONS]).unwrap();
+    assert_eq!(back, c);
+    let md = String::from_utf8(export.files[REPORT].clone()).unwrap();
+    assert!(md.contains("DISPLAY2") && md.contains("nvidia-smi") && md.contains("game-mode"));
+    assert!(recompute(&export).unwrap().matches_recorded);
+}
+
+#[test]
+fn i_the_report_is_scanned_and_recomputed() {
+    let base = build(&passing_run(), &conditions(), &ctx()).unwrap();
+    let md = String::from_utf8(base.files[REPORT].clone()).unwrap();
+    assert!(md.contains("## Gates") && md.contains("Present s"));
+    let edit = |text: String| {
+        let mut e = base.clone();
+        e.files.insert(REPORT.into(), text.into_bytes());
+        e
+    };
+    // A path, a name and a raw QPC value in the prose are each found.
+    let f = scan(&edit(format!("{md}C:\\Users\\x\n")), &ctx());
+    assert_eq!(f, vec![Finding::Path(REPORT.into())]);
+    let f = scan(&edit(format!("{md}synthuser\n")), &ctx());
+    assert_eq!(f, vec![Finding::Name(REPORT.into())]);
+    let f = scan(&edit(format!("{md}{}\n", QPC_LO + 3)), &ctx());
+    assert_eq!(f, vec![Finding::RawQpc(REPORT.into())]);
+    // A report that does not match the data is detected.
+    let tampered = edit(md.replace("pass", "PASS"));
+    assert!(scan(&tampered, &ctx()).is_empty());
+    assert!(!recompute(&tampered).unwrap().matches_recorded);
 }

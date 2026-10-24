@@ -1,6 +1,8 @@
 //! Measurement conditions (design §3.5): `conditions.json` is collected on
-//! the measurement PC and stays there; only the whitelisted public fields
-//! (`spike_core::export::CONDITION_KEYS`) leave it, through the export.
+//! the measurement PC and stays there; only the typed public record
+//! (`spike_core::conditions::PublicConditions`) leaves it, through the
+//! export. Per-run facts (the adapter the run used, the GPU state and the
+//! effective power mode during play) are added by `report`.
 //! Names that must never leave (user, computer, monitor and audio endpoint
 //! names) are kept in `private_names`, which the export scan searches for.
 //! Owner-reported fields come from `owner-notes.toml`.
@@ -8,6 +10,8 @@
 use crate::audio;
 use crate::display::active_paths;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use spike_core::conditions::{AdapterRecord, PublicConditions, power_mode_name};
 use std::path::Path;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
@@ -23,8 +27,8 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 use windows::core::{HSTRING, Interface};
 
 pub const CONDITIONS: &str = "conditions.json";
-/// Fields the owner fills (`owner-notes.toml`); the public ones are in
-/// `CONDITION_KEYS`.
+/// Fields the owner fills (`owner-notes.toml`); all but the OBS
+/// confirmations are public conditions.
 pub const OWNER_FIELDS: &[&str] = &[
     "pc_form",
     "vrr",
@@ -100,11 +104,9 @@ fn power_scheme() -> String {
     .into()
 }
 
-type Adapter = (String, u64, Option<String>);
-
-/// Hardware DXGI adapters: (name, dedicated VRAM MB, user-mode driver
-/// version), and tearing support.
-fn dxgi() -> (Vec<Adapter>, Option<bool>) {
+/// Hardware DXGI adapters (name, PCI ids, dedicated VRAM, user-mode driver
+/// version) and tearing support.
+pub fn dxgi() -> (Vec<AdapterRecord>, Option<bool>) {
     // SAFETY: DXGI factory queries.
     unsafe {
         let Ok(f) = CreateDXGIFactory1::<IDXGIFactory1>() else {
@@ -128,11 +130,13 @@ fn dxgi() -> (Vec<Adapter>, Option<bool>) {
                         v & 0xffff
                     )
                 });
-                out.push((
-                    String::from_utf16_lossy(&d.Description[..n]),
-                    d.DedicatedVideoMemory as u64 / (1024 * 1024),
+                out.push(AdapterRecord {
+                    name: String::from_utf16_lossy(&d.Description[..n]),
+                    vendor_id: d.VendorId,
+                    device_id: d.DeviceId,
+                    vram_mb: d.DedicatedVideoMemory as u64 / (1024 * 1024),
                     driver,
-                ));
+                });
             }
         }
         let tearing = f.cast::<IDXGIFactory5>().ok().map(|f5| {
@@ -176,8 +180,46 @@ pub fn owner_notes(path: &Path) -> Map<String, Value> {
         .collect()
 }
 
+/// SHA-256 of a file's bytes.
+pub fn file_sha256(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether the file's `.sha256` sidecar names `sha`; `None` without one.
+fn sidecar_matches(path: &Path, sha: &str) -> Option<bool> {
+    let mut sidecar = path.as_os_str().to_owned();
+    sidecar.push(".sha256");
+    std::fs::read_to_string(sidecar)
+        .ok()
+        .map(|s| s.split_whitespace().next() == Some(sha))
+}
+
+/// BGA provenance from the measured file itself: its SHA-256, the codec of
+/// its video stream, and whether a `.sha256` sidecar (if any) agrees. A
+/// stale sidecar never stands in for the file.
+pub fn bga_facts(path: &Path) -> Result<(String, String, Option<bool>), String> {
+    let sha = file_sha256(path)?;
+    let codec = crate::bga::codec_name(path)?;
+    let sidecar = sidecar_matches(path, &sha);
+    Ok((sha, codec, sidecar))
+}
+
 /// Collects the conditions. `audio_device` is the endpoint the run uses.
-pub fn collect(audio_device: Option<&str>, bga: Option<&Path>) -> Map<String, Value> {
+pub fn collect(
+    audio_device: Option<&str>,
+    bga: Option<&Path>,
+) -> Result<Map<String, Value>, String> {
     let mut c = Map::new();
     let mut private: Vec<String> = vec![];
     for var in ["USERNAME", "COMPUTERNAME", "USERDOMAIN"] {
@@ -190,12 +232,17 @@ pub fn collect(audio_device: Option<&str>, bga: Option<&Path>) -> Map<String, Va
     c.insert("build_profile".into(), json!(env!("SPIKE_PROFILE")));
     let chart = spike_core::chart::Chart::generate(spike_core::chart::DEFAULT_SEED);
     c.insert("chart_hash".into(), json!(chart.content_hash()));
+    c.insert("scene_hash".into(), json!(crate::scene::scene_hash()));
     if let Some(b) = bga {
-        let sha = std::fs::read_to_string(b.with_extension("mp4.sha256"))
-            .ok()
-            .and_then(|s| s.split_whitespace().next().map(str::to_owned));
+        let (sha, codec, sidecar) = bga_facts(b)?;
+        if sidecar == Some(false) {
+            eprintln!(
+                "conditions: the BGA's .sha256 sidecar does not match the file; recording the file's own hash"
+            );
+        }
         c.insert("bga_sha256".into(), json!(sha));
-        c.insert("bga_codec".into(), json!("h264"));
+        c.insert("bga_codec".into(), json!(codec));
+        c.insert("bga_sidecar_matches".into(), json!(sidecar));
     }
     c.insert("wgpu_version".into(), json!("30"));
     c.insert(
@@ -223,12 +270,9 @@ pub fn collect(audio_device: Option<&str>, bga: Option<&Path>) -> Map<String, Va
             json!((mem.ullTotalPhys as f64 / (1u64 << 30) as f64).round() as u64),
         );
     }
+    // Every hardware adapter; `report` keeps the one the run used.
     let (adapters, tearing) = dxgi();
-    if let Some((name, vram, driver)) = adapters.first() {
-        c.insert("gpu_adapter".into(), json!(name));
-        c.insert("gpu_vram_mb".into(), json!(vram));
-        c.insert("gpu_driver".into(), json!(driver));
-    }
+    c.insert("gpu_adapters".into(), json!(adapters));
     c.insert("tearing_support".into(), json!(tearing));
     let nt = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
     c.insert(
@@ -250,8 +294,12 @@ pub fn collect(audio_device: Option<&str>, bga: Option<&Path>) -> Map<String, Va
         c.insert("power_source".into(), json!(source));
     }
     c.insert("power_scheme".into(), json!(power_scheme()));
-    // The effective power mode needs a notification callback; not read.
-    c.insert("power_mode".into(), json!("unknown"));
+    // The effective power mode now; `report` replaces it with the modes in
+    // force during play.
+    c.insert(
+        "power_mode".into(),
+        json!(crate::power::current().map(power_mode_name)),
+    );
     let game_mode = reg_dword(
         HKEY_CURRENT_USER,
         r"Software\Microsoft\GameBar",
@@ -296,6 +344,8 @@ pub fn collect(audio_device: Option<&str>, bga: Option<&Path>) -> Map<String, Va
             c.insert("audio_share_mode".into(), json!("shared"));
             if let Some(p) = e.periods {
                 c.insert("audio_period_min".into(), json!(p.min));
+                c.insert("audio_period_max".into(), json!(p.max));
+                c.insert("audio_period_step".into(), json!(p.fundamental));
                 c.insert("audio_period_default".into(), json!(p.default));
             }
         }
@@ -308,13 +358,13 @@ pub fn collect(audio_device: Option<&str>, bga: Option<&Path>) -> Map<String, Va
     private.sort();
     private.dedup();
     c.insert("private_names".into(), json!(private));
-    c
+    Ok(c)
 }
 
 /// `conditions [--out DIR] [--audio-device PART] [--bga FILE]`: writes
 /// `conditions.json` and prints the public fields.
 pub fn run(out: &Path, audio_device: Option<&str>, bga: Option<&Path>) -> Result<(), String> {
-    let mut c = collect(audio_device, bga);
+    let mut c = collect(audio_device, bga)?;
     let notes = owner_notes(Path::new("owner-notes.toml"));
     for (k, v) in notes {
         c.insert(k, v);
@@ -326,14 +376,43 @@ pub fn run(out: &Path, audio_device: Option<&str>, bga: Option<&Path>) -> Result
         serde_json::to_vec_pretty(&c).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let public = spike_core::export::sanitize_conditions(&c);
+    let public = PublicConditions::from_conditions(&c)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&public).map_err(|e| e.to_string())?
     );
     println!(
-        "conditions: written to {} (private; only the fields above leave the PC)",
+        "conditions: written to {} (private; only the fields above leave the PC; the GPU the run uses, its state and the power mode during play are added per run)",
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bga_provenance_comes_from_the_file_not_a_stale_sidecar() {
+        let dir = std::env::temp_dir().join(format!("spike-bga-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("bga.mp4");
+        std::fs::write(&clip, b"abc").unwrap();
+        let sha = file_sha256(&clip).unwrap();
+        assert_eq!(
+            sha,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(sidecar_matches(&clip, &sha), None);
+        // The sidecar still names the asset the file replaced.
+        let sidecar = dir.join("bga.mp4.sha256");
+        std::fs::write(&sidecar, format!("{}  bga.mp4", "0".repeat(64))).unwrap();
+        assert_eq!(sidecar_matches(&clip, &sha), Some(false));
+        std::fs::write(&sidecar, format!("{sha}  bga.mp4")).unwrap();
+        assert_eq!(sidecar_matches(&clip, &sha), Some(true));
+        // The codec comes from the stream: a file without one is an error,
+        // never a default codec name.
+        assert!(bga_facts(&clip).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

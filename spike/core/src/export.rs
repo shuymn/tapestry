@@ -10,6 +10,7 @@
 //! The export is an in-memory file map; the app writes it as a zip (zip I/O
 //! stays out of this crate, which only needs the bytes).
 
+use crate::conditions::{NESTED_KEYS, PUBLIC_KEYS, PublicConditions};
 use crate::evaluate::{Summary, evaluate};
 use crate::obslog::ObsDerived;
 use crate::run::{
@@ -18,7 +19,7 @@ use crate::run::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const SUMMARY: &str = "summary.json";
@@ -30,7 +31,8 @@ pub const FRAMES: &str = "frames.csv";
 pub const AUDIO_PERIODS: &str = "audio-periods.csv";
 pub const INPUT: &str = "input-judgment.csv";
 pub const BGA: &str = "bga.csv";
-pub const FILES: [&str; 9] = [
+pub const REPORT: &str = "report.md";
+pub const FILES: [&str; 10] = [
     SUMMARY,
     RUN,
     OBS,
@@ -40,56 +42,7 @@ pub const FILES: [&str; 9] = [
     AUDIO_PERIODS,
     INPUT,
     BGA,
-];
-
-/// Condition fields (§3.5) that may leave the PC. Everything else in
-/// `conditions.json` (paths, names, serials, wall clock) is dropped.
-pub const CONDITION_KEYS: &[&str] = &[
-    "commit",
-    "dirty",
-    "build_profile",
-    "scene_hash",
-    "chart_hash",
-    "bga_sha256",
-    "bga_codec",
-    "wgpu_version",
-    "ffmpeg_version",
-    "presentmon_version",
-    "obs_version",
-    "cpu_brand",
-    "cpu_cores",
-    "ram_gb",
-    "pc_form",
-    "gpu_adapter",
-    "gpu_vram_mb",
-    "gpu_driver",
-    "gpu_display_attached",
-    "hybrid_present",
-    "windows_build",
-    "windows_ubr",
-    "power_source",
-    "power_scheme",
-    "power_mode",
-    "game_mode",
-    "hags",
-    "refresh_num",
-    "refresh_den",
-    "aspect_ratio",
-    "render_width",
-    "render_height",
-    "tearing_support",
-    "monitor_count",
-    "vrr",
-    "display_connection",
-    "audio_mix_format",
-    "audio_share_mode",
-    "audio_period_min",
-    "audio_period_default",
-    "audio_period_chosen",
-    "audio_backend",
-    "audio_enhancements",
-    "audio_device_class",
-    "input",
+    REPORT,
 ];
 
 /// Keys allowed in the structured JSON files (field names of the exported
@@ -292,15 +245,6 @@ pub enum ExportError {
     Rejected(Vec<Finding>),
 }
 
-/// Keeps only whitelisted scalar condition fields.
-pub fn sanitize_conditions(conditions: &Map<String, Value>) -> Map<String, Value> {
-    conditions
-        .iter()
-        .filter(|(k, v)| CONDITION_KEYS.contains(&k.as_str()) && !v.is_object() && !v.is_array())
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
 fn csv_bytes<T: Serialize>(rows: &[T]) -> Vec<u8> {
     let mut w = csv::Writer::from_writer(Vec::new());
     for r in rows {
@@ -316,7 +260,7 @@ fn json_bytes<T: Serialize>(v: &T) -> Vec<u8> {
 /// Builds the export of `run` and rejects it if the scan finds anything.
 pub fn build(
     run: &RunData,
-    conditions: &Map<String, Value>,
+    conditions: &PublicConditions,
     ctx: &ScanContext,
 ) -> Result<Export, ExportError> {
     let summary = evaluate(run);
@@ -332,9 +276,10 @@ pub fn build(
     files.insert(SUMMARY.into(), json_bytes(&summary));
     files.insert(RUN.into(), json_bytes(&run_json));
     files.insert(OBS.into(), json_bytes(&run.obs));
+    files.insert(CONDITIONS.into(), json_bytes(conditions));
     files.insert(
-        CONDITIONS.into(),
-        json_bytes(&sanitize_conditions(conditions)),
+        REPORT.into(),
+        markdown(&summary, run, conditions).into_bytes(),
     );
     files.insert(PM_FRAMES.into(), csv_bytes(&run.pm_frames));
     files.insert(FRAMES.into(), csv_bytes(&run.frames));
@@ -356,7 +301,8 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
     let json_keys: BTreeSet<&str> = JSON_KEYS
         .iter()
         .chain(LIBRARY_SCOPES)
-        .chain(CONDITION_KEYS)
+        .chain(PUBLIC_KEYS)
+        .chain(NESTED_KEYS)
         .copied()
         .collect();
     for (name, bytes) in &export.files {
@@ -381,7 +327,7 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
         // legitimately fall inside the raw QPC range on a recently booted
         // PC); everything else, text and counts alike, is scanned for it.
         if let Some((lo, hi)) = ctx.qpc_range {
-            let scanned: Vec<String> = if name == CONDITIONS {
+            let scanned: Vec<String> = if name == CONDITIONS || name == REPORT {
                 vec![text.to_owned()]
             } else {
                 fields(name, text)
@@ -398,7 +344,11 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
                 out.push(Finding::RawQpc(name.clone()));
             }
         }
-        let keys: Vec<String> = if let Some(json) = json {
+        let keys: Vec<String> = if name == REPORT {
+            // Prose: no keys or columns; times are printed in seconds so the
+            // raw-QPC scan above can cover the whole text.
+            vec![]
+        } else if let Some(json) = json {
             match json {
                 Ok(v) => {
                     let mut k = Vec::new();
@@ -541,7 +491,7 @@ fn structural_findings(e: &Export) -> Vec<Finding> {
     );
     let mut out = vec![];
     for (name, bytes) in &e.files {
-        if name == CONDITIONS {
+        if name == CONDITIONS || name == REPORT {
             continue;
         }
         let text = String::from_utf8_lossy(bytes);
@@ -670,7 +620,8 @@ pub fn read(e: &Export) -> Result<RunData, ExportError> {
 #[derive(Debug)]
 pub struct Recomputed {
     pub summary: Summary,
-    /// The recomputed summary equals the export's `summary.json`.
+    /// The recomputed summary and report equal the export's `summary.json`
+    /// and `report.md`.
     pub matches_recorded: bool,
 }
 
@@ -684,9 +635,118 @@ pub fn recompute(e: &Export) -> Result<Recomputed, ExportError> {
         return Err(ExportError::Rejected(findings));
     }
     let recorded: Summary = json(e, SUMMARY)?;
-    let summary = evaluate(&read(e)?);
+    let conditions: PublicConditions = json(e, CONDITIONS)?;
+    let run = read(e)?;
+    let summary = evaluate(&run);
+    let report = markdown(&summary, &run, &conditions);
     Ok(Recomputed {
-        matches_recorded: summary == recorded,
+        matches_recorded: summary == recorded && file(e, REPORT)? == report.as_bytes(),
         summary,
     })
+}
+
+fn ms(v: Option<f64>) -> String {
+    v.map_or("—".into(), |v| format!("{v:.3}"))
+}
+
+/// `report.md`: the run's verdict, validity, gates, records, worst frames
+/// and public conditions. Times are seconds (fractional digits), never raw
+/// integers, so the export scan can search the whole text for raw QPC.
+pub fn markdown(s: &Summary, run: &RunData, cond: &PublicConditions) -> String {
+    use std::fmt::Write as _;
+    let mut m = String::new();
+    let _ = writeln!(m, "# Stage 0 spike run report\n");
+    let verdict = match s.exit_code {
+        0 => "pass",
+        1 => "gate failed",
+        _ => "invalid",
+    };
+    let i = &run.info;
+    let _ = writeln!(
+        m,
+        "Result: **{verdict}** (exit {}). Profile {:?}, kind {:?}, class {} Hz, refresh {}/{} Hz, cap {}, loops {}, G1 T {} ms.\n",
+        s.exit_code,
+        i.profile,
+        i.kind,
+        i.class_hz,
+        i.refresh.num,
+        i.refresh.den,
+        i.fps_cap.map_or("none".into(), |c| c.to_string()),
+        i.timeline.loops,
+        ms(s.target_period_ms),
+    );
+    let _ = writeln!(
+        m,
+        "## Validity\n\n| Check | OK | Reasons |\n| --- | --- | --- |"
+    );
+    for c in &s.validity {
+        let _ = writeln!(m, "| {} | {} | {} |", c.id, c.ok, c.reasons.join(", "));
+    }
+    let _ = writeln!(
+        m,
+        "\n## Gates (heavy windows)\n\n| Gate | Applies | Pass | Value | Threshold | Samples |\n| --- | --- | --- | --- | --- | --- |"
+    );
+    for g in &s.gates {
+        let _ = writeln!(
+            m,
+            "| {} | {} | {} | {} | {} {} | {} |",
+            g.id,
+            g.applies,
+            g.pass,
+            ms(g.value),
+            g.threshold,
+            g.unit,
+            g.samples
+        );
+    }
+    let r = &s.records;
+    let modes = if r.present_modes.is_empty() {
+        "none".to_owned()
+    } else {
+        r.present_modes
+            .iter()
+            .map(|c| format!("{:?} {}", c.mode, c.frames))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let libs = r
+        .library_allocs
+        .iter()
+        .map(|(k, v)| format!("{k} {v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        m,
+        "\n## Records\n\n- Missed deadlines (G1r): {} ({} not displayed) of {} heavy-window frames\n- Whole run p99 / max interval: {} / {} ms\n- Voice steals: {}; BGA due not displayed: {}\n- Present modes (PresentMon rows): {modes}\n- Library allocations (G6r): {libs}",
+        r.missed_deadlines,
+        r.not_displayed,
+        r.heavy_frames,
+        ms(r.whole_run_p99_interval_ms),
+        ms(r.whole_run_max_interval_ms),
+        r.voice_steals,
+        r.bga_skipped,
+    );
+    let _ = writeln!(
+        m,
+        "\n## Worst frames\n\n| Present s | Interval ms | Visible notes | Effects | Lanes lit | BGA shown |\n| --- | --- | --- | --- | --- | --- |"
+    );
+    for w in &r.worst_frames {
+        let _ = writeln!(
+            m,
+            "| {:.6} | {} | {} | {} | {} | {} |",
+            w.present_us as f64 / 1e6,
+            ms(Some(w.display_change_ms)),
+            w.visible_notes,
+            w.effect_instances,
+            w.lanes_with_effects,
+            w.bga_frame_shown
+        );
+    }
+    let _ = writeln!(m, "\n## Conditions (public)\n");
+    if let Ok(Value::Object(c)) = serde_json::to_value(cond) {
+        for (k, v) in &c {
+            let _ = writeln!(m, "- {k} = {v}");
+        }
+    }
+    m
 }

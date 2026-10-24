@@ -5,6 +5,7 @@
 //! relative to the run origin unless a name says otherwise.
 
 pub mod chart;
+pub mod conditions;
 pub mod engine;
 pub mod evaluate;
 pub mod export;

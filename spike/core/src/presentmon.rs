@@ -15,6 +15,7 @@
 //!
 //! A row is never dropped for `NA`; it becomes a not-displayed frame.
 
+use crate::conditions::HybridPresent;
 use crate::run::{PmFrame, PresentMode};
 use crate::time::{ms_to_us, qpc_to_us};
 use serde::{Deserialize, Deserializer};
@@ -88,6 +89,29 @@ const REQUIRED: [&str; 6] = [
     "MsBetweenDisplayChange",
     "MsUntilDisplayed",
 ];
+
+/// The `HybridPresent` column (`--track_hybrid_present`) over the rows of
+/// `app`: hybrid presents cross adapters (§3.5's hybrid-present evidence).
+/// `None` without the column.
+pub fn hybrid_present(csv_text: &[u8], app: &str) -> Option<HybridPresent> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_text);
+    let headers = rdr.headers().ok()?.clone();
+    let col = |name: &str| headers.iter().position(|h| h == name);
+    let (a, h) = (col("Application")?, col("HybridPresent")?);
+    let mut out = HybridPresent::default();
+    for rec in rdr.records().map_while(Result::ok) {
+        if !rec.get(a).is_some_and(|x| x.eq_ignore_ascii_case(app)) {
+            continue;
+        }
+        out.rows += 1;
+        if rec.get(h).is_some_and(|x| x.trim() == "1") {
+            out.hybrid_rows += 1;
+        }
+    }
+    Some(out)
+}
 
 /// Parses a PresentMon CSV, keeping rows whose `Application` equals `app`
 /// (case-insensitive), sorted by present time.
@@ -212,5 +236,29 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn hybrid_presents_are_counted_for_the_app_only() {
+        let csv = "Application,HybridPresent,CPUStartQPC
+tapestry-spike.exe,0,1
+tapestry-spike.exe,1,2
+other.exe,1,3
+";
+        assert_eq!(
+            hybrid_present(csv.as_bytes(), "tapestry-spike.exe"),
+            Some(HybridPresent {
+                rows: 2,
+                hybrid_rows: 1
+            })
+        );
+        assert_eq!(
+            hybrid_present(
+                b"Application,X
+",
+                "a"
+            ),
+            None
+        );
     }
 }

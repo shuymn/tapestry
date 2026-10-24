@@ -25,9 +25,10 @@ pub const ORIGIN: &str = "private/origin.json";
 pub struct Origin {
     pub qpc_origin: i64,
     pub qpc_freq: i64,
-    /// Local date of the origin (`YYYY-MM-DD`) and its time of day in ms.
-    pub wall_date: String,
-    pub wall_origin_ms: i64,
+    /// Local wall clock of the origin: ms since 1970-01-01 00:00 local time,
+    /// so dates carry across midnight (OBS log lines and GPU samples are
+    /// placed on the run clock through it).
+    pub wall_origin_local_ms: i64,
     pub play_start_us: i64,
     pub play_len_us: i64,
     /// Last QPC of the run (for the export's raw-QPC scan range).
@@ -41,20 +42,29 @@ impl Origin {
         let t = unsafe { GetLocalTime() };
         let now_qpc = qpc();
         let freq = qpc_freq();
-        let now_ms = i64::from(t.wHour) * 3_600_000
-            + i64::from(t.wMinute) * 60_000
-            + i64::from(t.wSecond) * 1_000
-            + i64::from(t.wMilliseconds);
+        let now_ms = spike_core::conditions::local_ms(
+            i64::from(t.wYear),
+            u32::from(t.wMonth),
+            u32::from(t.wDay),
+            i64::from(t.wHour) * 3_600_000
+                + i64::from(t.wMinute) * 60_000
+                + i64::from(t.wSecond) * 1_000
+                + i64::from(t.wMilliseconds),
+        );
         let since_origin_ms = (now_qpc - clock.origin_qpc()) * 1_000 / freq;
         Self {
             qpc_origin: clock.origin_qpc(),
             qpc_freq: freq,
-            wall_date: format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay),
-            wall_origin_ms: now_ms - since_origin_ms,
+            wall_origin_local_ms: now_ms - since_origin_ms,
             play_start_us,
             play_len_us,
             qpc_end: now_qpc,
         }
+    }
+
+    /// Local wall-clock ms of run µs `t_us`.
+    pub fn local_ms(&self, t_us: i64) -> i64 {
+        self.wall_origin_local_ms + t_us.div_euclid(1000)
     }
 }
 

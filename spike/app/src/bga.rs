@@ -365,6 +365,27 @@ mod imp {
 #[cfg(feature = "ffmpeg")]
 pub use imp::Bga;
 
+/// The codec of the file's video stream as FFmpeg names it (`h264`), read
+/// from the stream itself (conditions' `bga_codec`).
+#[cfg(feature = "ffmpeg")]
+pub fn codec_name(path: &std::path::Path) -> Result<String, String> {
+    use ffmpeg_next as ff;
+    ff::init().map_err(|e| e.to_string())?;
+    let ictx = ff::format::input(path).map_err(|e| format!("open BGA: {e}"))?;
+    let stream = ictx
+        .streams()
+        .best(ff::media::Type::Video)
+        .ok_or("BGA has no video stream")?;
+    ff::codec::decoder::find(stream.parameters().id())
+        .map(|c| c.name().to_owned())
+        .ok_or_else(|| "BGA codec unknown to this FFmpeg".into())
+}
+
+#[cfg(not(feature = "ffmpeg"))]
+pub fn codec_name(_: &std::path::Path) -> Result<String, String> {
+    Err("built without the ffmpeg feature".into())
+}
+
 /// Stand-in when built without FFmpeg (`--no-default-features`).
 #[cfg(not(feature = "ffmpeg"))]
 pub struct Bga {

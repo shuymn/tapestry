@@ -277,6 +277,13 @@ enum Block {
     Encoder,
 }
 
+/// Time of day (ms) of the log's first timestamped line; the base day of
+/// `WallWindow` is the day of this line.
+pub fn first_time_of_day(log: &str) -> Option<i64> {
+    let mut clock = Clock::default();
+    log.lines().find_map(|l| clock.split(l)).map(|(t, _)| t)
+}
+
 /// Parses an OBS log and reduces the session overlapping `play`.
 pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
     let mut sessions: Vec<Raw> = Vec::new();
@@ -592,6 +599,15 @@ mod tests {
         assert_eq!(c.split("23:59:59.900: a").map(|x| x.0), Some(86_399_900));
         assert_eq!(c.split("00:00:00.100: b").map(|x| x.0), Some(86_400_100));
         assert_eq!(c.split("not a line"), None);
+        assert_eq!(
+            first_time_of_day(
+                "header
+23:59:59.900: a
+00:00:00.100: b
+"
+            ),
+            Some(86_399_900)
+        );
     }
 
     #[test]
