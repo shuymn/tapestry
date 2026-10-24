@@ -35,7 +35,7 @@ Updates to `mise.lock` are submitted as PRs by a periodically running workflow.
 
 ### Rust
 
-The Rust version is also pinned with mise. No language-specific version file (`rust-toolchain.toml`) is used.
+The Rust version is also pinned with mise. Do not add a language-specific version file (`rust-toolchain.toml`).
 
 ```toml
 [tools]

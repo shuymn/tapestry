@@ -75,7 +75,7 @@ This is a game, and the correctness of judgment is merely the foundation for "be
 
 - The first target is a state where "one song can be played pleasantly to the end". IR, distribution, and skin compatibility are added after that.
 - Effects, screens, and the default judgment and gauge values are treated as things tuned by playing. Tuning can be tried without restarting, by reloading presets and skins.
-- The default look (native skin) and the default judgment are the face of this game. Make the standard setup fun to play without relying on compatible skins.
+- The default look (custom skin) and the default judgment are the face of this game. Make the standard setup fun to play without relying on compatible skins.
 
 ## Overall Architecture
 
@@ -127,7 +127,7 @@ GameInput input carries µs timestamps that can be compared with `IGameInput::Ge
 | --- | --- | --- |
 | Input | The QPC immediately after receipt (previous subsection) | Judgment |
 | Audio | The pair of the playback position returned by `IAudioClock::GetPosition` and the QPC time at which that position was read (in 100 ns units) | Correcting audio drift (the "Time and Offsets" section) |
-| Display | The QPC time of a past vertical sync (`SyncQPCTime`) in the DXGI frame statistics (`GetFrameStatistics`), and the present count corresponding to it | Aiding the prediction of note draw positions, and measuring display latency |
+| Display | The QPC time of a past vertical sync (`SyncQPCTime`) in the DXGI frame statistics (`GetFrameStatistics`), and the corresponding display-refresh count | Aiding the prediction of note draw positions, and measuring display latency |
 
 - DXGI frame statistics are only an aid to prediction. The first time, right after a display mode change, when the statistics are stale, and when the refresh period is irregular under VRR, prediction uses only QPC and the configured display latency.
 - The display's lag and the scan-out time down to the judgment line are calibrated as the display latency offset. Do not double-add the portion derived from the statistics and the offset.
@@ -303,7 +303,7 @@ Gauges are divided into two kinds by how a clear is decided.
 | Kind | Examples | Clear condition | Failure |
 | --- | --- | --- | --- |
 | Decided by the amount remaining at the end | ASSIST EASY, EASY, NORMAL | The amount remaining at song end is at or above the clear threshold | Never fails midway |
-| Decided by survival | HARD, EX HARD, dan-course gauges, etc. | Does not reach 0 before song end | Finalized the moment it reaches 0 and never recovers afterward (recorded in `failed_at`) |
+| Decided by survival | HARD, EX HARD, dan-course gauges, etc. | Stays above 0 through the end of the song | Finalized the moment it reaches 0 and never recovers afterward (recorded in `failed_at`) |
 
 - All gauge types included in the preset are computed side by side.
 - For survival gauges, separately from the real value (which stops at 0 on failure), "the trajectory had it not failed" is computed in separate state as a reference value. The reference value is not used for clear determination.
@@ -338,7 +338,7 @@ A replay holds the inputs needed to reproduce evaluation. Judgment results are k
 | Other operations | Hi-speed and lane cover changes (a stream separate from the judgment input) |
 | Status | End status (played to the end, ended midway), whether input is incomplete. Start token for IR (optional) |
 
-The format uses its own schema, and version detection does not rely on the hash of the serialized output. For a chart of about 2000 notes, it fits in a few tens of KB even before compression.
+The format uses a custom schema, and version detection does not rely on the hash of the serialized output. For a chart of about 2000 notes, it fits in a few tens of KB even before compression.
 
 ### Practice Speed Changes
 
@@ -410,7 +410,7 @@ If a "sound to play" event arrives too late for the current buffer write, the so
 - Conversion to LR2 IDs or beatoraja property IDs happens only inside each skin's adapter. The game's internal structures are not shaped to fit a skin's ID system.
 - Skin buttons and sliders do not modify state directly; they send commands.
 
-### Native Skin Format
+### Custom Skin Format
 
 The standard skin does not use a scripting language with GC. It uses a declarative format with no scripts.
 
@@ -418,15 +418,15 @@ The standard skin does not use a scripting language with GC. It uses a declarati
 - Numbers and conditions are written as small expressions that reference `PlayView` fields (e.g. `combo >= 100`, `gauge.value`). Expressions are type-checked and compiled at load time, and per-frame evaluation does not allocate memory.
 - **Branching by settings**: The skin declares options (display toggles, replacement images, position adjustment values), and depending on the player's choices, parts are included or omitted and images are switched at load time.
 - **Repetition**: Definitions where the same shape repeats, such as the lanes for 7 keys, number digits, and sequentially numbered animation frames, are made with templates and repetition specifications.
-- When an expression the declarative format cannot represent becomes necessary, it is first handled by adding expressions or parts. No general-purpose scripting is added.
+- When a visual behavior that the declarative format cannot represent becomes necessary, it is first handled by adding expressions or parts. No general-purpose scripting is added.
 
 The main reason beatoraja uses Lua is to do these two things (branching by settings and generating repetition) at load time. Both are load-time processing, so building them into the declarative format removes the need for both scripts and GC. Free-form per-frame computation is limited to what expressions can cover.
 
 ### beatoraja Lua Skins
 
 - Lua is used only inside the adapter for reading beatoraja Lua skins, on the loading thread.
-- Lua is run once with the skin settings, and once the returned definition has been converted into the native skin's declarative format, the Lua state is discarded. When the settings change, the conversion is redone. Lua does not run during play, so Lua's GC does not affect play.
-- Lua functions that are expected to be called every frame are analyzed and converted into native skin expressions. Functions that cannot be converted (those with internal state, those that read the clock, etc.) are treated as constants, and a warning is issued at load time.
+- Lua is run once with the skin settings, and once the returned definition has been converted into the custom skin's declarative format, the Lua state is discarded. When the settings change, the conversion is redone. Lua does not run during play, so Lua's GC does not affect play.
+- Lua functions that are expected to be called every frame are analyzed and converted into custom skin expressions. Functions that cannot be converted (those with internal state, those that read the clock, etc.) are treated as constants, and a warning is issued at load time.
 - A tool is provided that tries the conversion on commonly used skins and lists the functions that could not be turned into expressions, and it is used to decide on widening the range of expressions supported.
 
 From stage 1, the frame time distribution (not just the average, but also the slowest frames) and the latency from input to judgment can be measured and displayed.
@@ -513,7 +513,7 @@ The rules above are a commitment for the standard settings. Only when players ch
 - When low-latency priority is chosen, the settings screen shows the following: in exclusive mode, other apps' audio may stop playing on that output device, and the streaming software's normal desktop audio capture cannot capture the game's audio. Whether ASIO can coexist with other software depends on the device and the audio routing. Exclusive fullscreen does not necessarily reduce latency.
 - A profile is a starting point; items can be changed individually.
 
-### How to verify running alongside OBS
+### How to Verify Running Alongside OBS
 
 Measure with the following conditions fixed, and confirm that both sides meet the criteria. The concrete values are decided in stage 0 and written into this section.
 
@@ -528,9 +528,9 @@ Quality settings such as lowering the BGA resolution or turning the BGA off, and
 
 ## Extension Boundaries
 
-Extensions can plug in only at named stages. The evaluation stage has no plug-in point.
+Extensions can plug in only at named extension points. Evaluation has no plug-in point.
 
-| Stage | Kind | Example extensions | Constraint |
+| Extension point | Kind | Example extensions | Constraint |
 | --- | --- | --- | --- |
 | Ingestion | Handler | Chart format adapters (BMS, PMS, BMSON, etc.) | Outputs the common chart model |
 | Chart transformation | Transform | RANDOM, MIRROR, etc. | Randomness can be used only when the seed is recorded |
@@ -557,7 +557,7 @@ Extensions can plug in only at named stages. The evaluation stage has no plug-in
 
 Conversely, judgment logic is placed in core and fixed, to preserve fairness and reproducibility. Rule-specific evaluation implementations are only those built into the evaluator, and no mechanism is built for users to extend judgment rules with code.
 
-This stage table is a commitment about where extensions belong; it does not mean everything is built as a generic mechanism from the start. The initial implementation keeps only the boundaries between the evaluator and everything else (input log, presets, judgment event stream), and each adapter is built when it becomes necessary.
+This extension point table is a commitment about where extensions belong; it does not mean everything is built as a generic mechanism from the start. The initial implementation keeps only the boundaries between the evaluator and everything else (input log, presets, judgment event stream), and each adapter is built when it becomes necessary.
 
 ### Screen Transition and Session Events
 
@@ -643,7 +643,7 @@ Server ─store→ store the input log as the source of truth
 
 ### Connecting to Existing IRs
 
-Built in a later stage as a saving extension. The connection adapter holds "the preset that IR requires", and sends scores computed on the client in the existing format. As long as the input log format has all the fields above, this can be added later.
+Built in a later roadmap stage, as an extension at the saving extension point. The connection adapter holds "the preset that IR requires", and sends scores computed on the client in the existing format. As long as the input log format has all the fields above, this can be added later.
 
 ## Threat Model
 
@@ -779,7 +779,7 @@ Where there is no reason to build our own, established libraries are used. We bu
 | --- | --- | --- |
 | Windows API | `windows` | Use Raw Input, WASAPI, MMCSS, and waitable timers directly. The official bindings |
 | Audio output | WASAPI directly via `windows` | Used directly because low-latency shared mode (`IAudioClient3`), exclusive mode, event-driven operation, and fine-grained buffer control are needed. ASIO is an optional feature, supported once the choice of ASIO SDK license (two options: commercial or GPLv3) is settled |
-| Audio (alternative) | BASS, BASSmix, BASSWASAPI (BASS\_FX and BASSASIO if needed) | The alternative if our own stack (WASAPI, `symphonia`, `rubato`, our own mixer) hits a dead end in terms of effort or feasibility. It has a track record in rhythm games and provides low-latency playback, scheduling at specified positions on the mixer, and pitch-preserving speed change together. It is a library whose source is not public, and its license terms differ per DLL (BASS is free for non-commercial use with no revenue; BASSASIO has a separate license), so if it is adopted, each DLL's terms and their compatibility with the project's license are checked individually. As conditions for adoption, verify by measurement that the playback position can be mapped to QPC, that clock drift can be corrected, and that latency and dropouts stay within the targets. The commitment not to allocate memory applies only to app-side code; inside the DLLs, it is verified by native heap measurement if needed. DLL versions, sources, and licenses are managed as dependencies outside Cargo. Audio is enclosed within the boundary of the `audio` crate, so swapping it is done within that crate |
+| Audio (alternative) | BASS, BASSmix, BASSWASAPI (BASS\_FX and BASSASIO if needed) | The alternative if our own stack (WASAPI, `symphonia`, `rubato`, our own mixer) hits a dead end in terms of effort or feasibility. It has a track record in rhythm games and provides low-latency playback, scheduling at specified positions on the mixer, and pitch-preserving speed change together. It is a library whose source is not public, and its license terms differ per DLL (BASS is free for non-commercial use with no revenue; BASSASIO has a separate license), so if it is adopted, each DLL's terms and their compatibility with the project's license are checked individually. As conditions for adoption, verify by measurement that the playback position can be mapped to QPC, that clock drift can be corrected, and that latency and dropouts stay within the targets. The commitment not to allocate memory applies only to app-side code; inside the DLLs, it is verified by native heap measurement if needed. DLL versions, where they were obtained, and licenses are managed as dependencies outside Cargo. Audio is enclosed within the boundary of the `audio` crate, so swapping it is done within that crate |
 | MIDI input | `midir` | Handles Windows MIDI input. Times are the QPC at the point the callback receives the input |
 | Input timestamp measurement | GameInput (optional) | Used to record the timestamps attached to input and measure the variance of the latency until receipt (not used for judgment). Available on desktop Windows 10 1903 and later and Windows 11, but requires handling the NuGet package and the redistributable runtime, and a way to call it from Rust (our own bindings). Whether dedicated controllers are supported is checked per device, and devices that are not supported are received through Raw Input only |
 | Audio decoding | `symphonia` | Handles WAV, OGG Vorbis, FLAC, and MP3 in pure Rust. It is MPL-2.0, so its obligations (publishing modified files, etc.) are honored |
@@ -828,7 +828,7 @@ The input thread, the logic thread, the audio callback, and the per-frame work o
 | Recommended offset | Only when enough deviations have been collected, the median and the spread are output. This value includes not only device latency but also the player's habits, so it is presented as "a recommendation based on timing bias" |
 | Rendering | Sprites are grouped per texture and drawn at once with instanced rendering, as far as layer order and translucent overlap can be preserved |
 | Song search | In addition to Unicode normalization (full-width and half-width), our own conversion that removes the distinction between hiragana and katakana is applied before indexing. Substring matching uses the FTS5 trigram tokenizer, and short queries of 2 characters or fewer are supplemented by another method (prefix matching, etc.) |
-| Library scanning | Only files changed by modification time and size are selected, and only their headers are read. Processed in parallel on multiple threads |
+| Library scanning | Only files whose modification time or size has changed are selected, and only their headers are read. Processed in parallel on multiple threads |
 | Chart storage (distribution) | Files are stored by the SHA-256 of their contents, and identical files are not stored twice |
 
 ## Testing Strategy
@@ -898,10 +898,10 @@ Feel, local dedicated controllers, running alongside OBS, behavior when the wind
 
 | Stage | Contents | Exit criteria |
 | --- | --- | --- |
-| 0 | A short technical spike (meant to be thrown away): run high-speed scrolling with 10,000+ notes, 100+ simultaneous voices, 1080p BGA, and effects on all lanes at the same time. Include a scene with simultaneous streaming through OBS. When done, move to stage 1 immediately | A 60 Hz display on the reference PC and a 240 Hz display on a mid-range PC can be held within the budget in the Performance section. The conditions and criteria for running alongside OBS are decided and can be met (Performance section, "How to verify running alongside OBS"). If they cannot be held, the rendering or audio approach is revisited before building it out |
+| 0 | A short technical spike (meant to be thrown away): run high-speed scrolling with 10,000+ notes, 100+ simultaneous voices, 1080p BGA, and effects on all lanes at the same time. Include a scene with simultaneous streaming through OBS. When done, move to stage 1 immediately | A 60 Hz display on the reference PC and a 240 Hz display on a mid-range PC can be held within the budget in the Performance section. The conditions and criteria for running alongside OBS are decided and can be met (Performance section, "How to Verify Running Alongside OBS"). If they cannot be held, the rendering or audio approach is revisited before building it out |
 | 1 | The minimal setup for playing one song: chart loading, input, audio, a simple play screen, an evaluator with one custom preset, saving the input log. Also includes key config, volume, offset, hi-speed, and instant retry. The testing mechanisms (swappable clock and I/O, processing that can advance without threads) are also put in here | One chart on hand can be played to the end without feeling latency or stutter. Key sound and frame latency can be measured and displayed |
 | 2 | One full gameplay loop: song selection, results, retry, practice (section repeat and speed change), beatoraja-style and LR2-style presets with switching on the result screen, `eval-cli`, and development features such as scenario launch. The test input device is built in this stage or the next | Song selection through play, results, and retry can be played repeatedly. The property tests pass |
-| 3 | Look and effects: the declarative native skin format, polished effects, followed by the LR2 and beatoraja skin adapters | Playing with the standard skin is fun. The play screen can be displayed with representative existing skins |
+| 3 | Look and effects: the declarative custom skin format, polished effects, followed by the LR2 and beatoraja skin adapters | Playing with the standard skin is fun. The play screen can be displayed with representative existing skins |
 | 4 | Custom IR (server-side computation, start registration, impossible-input detection, allowlist) | Input logs can be sent, and rankings for multiple presets can be viewed |
 | 5 | Chart registry (catalog only) and installer | Difficulty tables can be installed in one go, and derivative chart dependencies can be resolved |
 | 6 | Connecting to existing IRs | Scores computed with the specified preset can be sent in the existing format |
@@ -916,7 +916,7 @@ Between stages 1 and 2, a generous period of playing and fixing is set aside. IR
 
 - In the IR rankings, when presets or the evaluator change, whether to create new rankings or recompute and replace them
 - When replays are published, how much of the input log to show to others
-- How much expressiveness (computation, conditions, changes over time) the native skin expressions should cover
+- How much expressiveness (computation, conditions, changes over time) the custom skin expressions should cover
 - How far LR2 skin support should go
 - In chart distribution, how to record authors' distribution terms and how to obtain consent for hosting (requires consultation with event organizers and difficulty table maintainers)
 - The criteria for inclusion in the allowlist, and the takedown request procedure (including legal judgment)
