@@ -5,10 +5,14 @@
 # Hangul characters match anywhere.
 # Do not add explanations or context next to terms.
 
-beatmania
+beat mania
 IIDX
 INFINITAS
 BEMANI
 Konami
 ビートマニア
 コナミ
+e amusement
+インフィニタス
+ビーマニ
+イーアミューズメント
