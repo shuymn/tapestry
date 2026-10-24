@@ -30,13 +30,16 @@ pub const MAX_CAPTURE_GAP_US: i64 = 1_000_000;
 pub const MIN_MIX_RATE_HZ: u32 = 44_100;
 /// Required runs play the chart this many times (600 s).
 pub const REQUIRED_LOOPS: u32 = 4;
-/// V8: longest gap between audio-period records, and between BGA due
-/// records, inside the play window.
+/// V8: longest gap between audio-period records inside the play window
+/// (a late wake-up is a diagnostic, lost records are not).
 pub const MAX_AUDIO_PERIOD_GAP_US: i64 = 50_000;
-pub const MAX_BGA_DUE_GAP_US: i64 = 50_000;
-/// V8: a stream must start within this of play start and end within this
-/// of play end.
-pub const STREAM_EDGE_US: i64 = 1_000_000;
+/// One BGA frame at 60 fps, rounded up.
+pub const BGA_FRAME_US: i64 = 16_667;
+/// V8: a stream must reach within this many of its own periods of play
+/// start and play end (audio: device periods; BGA: frame intervals;
+/// rendered frames: refresh intervals of the G1 target). BGA due records
+/// also may not be further apart than this.
+pub const EDGE_PERIODS: i64 = 2;
 /// V7 measurement-window bounds.
 pub const MAX_OBS_PRE_ROLL_MS: i64 = 30_000;
 pub const MAX_OBS_POST_ROLL_MS: i64 = 60_000;
@@ -439,14 +442,14 @@ fn v7(run: &RunData) -> Check {
     check("V7", r)
 }
 
-/// Times inside play must reach both ends of play and, with `max_gap`,
-/// have no larger hole.
-fn spans(times: &[i64], start: i64, end: i64, max_gap: Option<i64>) -> bool {
+/// Times must reach within `edge` of both ends of play and, with
+/// `max_gap`, have no larger hole inside play.
+fn spans(times: &[i64], start: i64, end: i64, edge: i64, max_gap: Option<i64>) -> bool {
     let (Some(&a), Some(&b)) = (times.first(), times.last()) else {
         return false;
     };
-    a <= start + STREAM_EDGE_US
-        && b >= end - STREAM_EDGE_US
+    a <= start + edge
+        && b >= end - edge
         && max_gap.is_none_or(|g| {
             times
                 .windows(2)
@@ -466,8 +469,11 @@ fn v8(run: &RunData) -> Check {
     let (start, end) = (tl.play_start_us, tl.play_end_us());
     let mut r = vec![];
     let s = &run.streams;
+    let frame_us = 1_000_000 / i64::from(refresh_class(run).map_or(60, |c| target(run, c)));
     let frames: Vec<i64> = run.frames.iter().map(|f| f.render_us).collect();
-    if !complete(s.frames, frames.len()) || !spans(&frames, start, end, None) {
+    if !complete(s.frames, frames.len())
+        || !spans(&frames, start, end, EDGE_PERIODS * frame_us, None)
+    {
         r.push("frames-incomplete");
     }
     // One synthetic press per note.
@@ -478,13 +484,26 @@ fn v8(run: &RunData) -> Check {
     }
     let periods: Vec<i64> = run.audio_periods.iter().map(|p| p.t_us).collect();
     if !complete(s.audio_periods, periods.len())
-        || !spans(&periods, start, end, Some(MAX_AUDIO_PERIOD_GAP_US))
+        || !spans(
+            &periods,
+            start,
+            end,
+            EDGE_PERIODS * i64::from(run.info.audio_period_us),
+            Some(MAX_AUDIO_PERIOD_GAP_US),
+        )
     {
         r.push("audio-periods-incomplete");
     }
     let due: Vec<i64> = run.bga.iter().map(|b| b.due_us).collect();
     if bga_on(run)
-        && (!complete(s.bga, due.len()) || !spans(&due, start, end, Some(MAX_BGA_DUE_GAP_US)))
+        && (!complete(s.bga, due.len())
+            || !spans(
+                &due,
+                start,
+                end,
+                EDGE_PERIODS * BGA_FRAME_US,
+                Some(EDGE_PERIODS * BGA_FRAME_US),
+            ))
     {
         r.push("bga-incomplete");
     }

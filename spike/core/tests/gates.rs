@@ -338,6 +338,49 @@ fn g2_assigns_frames_by_display_time_like_g1_and_g3() {
 // ---- complete evidence (V8) -------------------------------------------
 
 #[test]
+fn v8_streams_must_reach_play_edges_within_two_of_their_periods() {
+    let start = PLAY_START_US;
+    let v8 = |edit: &dyn Fn(&mut RunData)| {
+        let mut run = passing_run();
+        edit(&mut run);
+        sync_streams(&mut run);
+        evaluate(&run).check("V8").reasons.clone()
+    };
+    let end = passing_run().info.timeline.play_end_us();
+    // Audio periods every 10 ms: first record 20 ms late is fine, 30 ms not.
+    assert!(v8(&|r| r.audio_periods.retain(|p| p.t_us >= start + 20_000)).is_empty());
+    assert_eq!(
+        v8(&|r| r.audio_periods.retain(|p| p.t_us >= start + 30_000)),
+        vec!["audio-periods-incomplete"]
+    );
+    assert!(v8(&|r| r.audio_periods.retain(|p| p.t_us <= end - 20_000)).is_empty());
+    assert_eq!(
+        v8(&|r| r.audio_periods.retain(|p| p.t_us <= end - 30_000)),
+        vec!["audio-periods-incomplete"]
+    );
+    // BGA due every 1/60 s: two intervals late is fine, three not.
+    assert!(
+        v8(&|r| {
+            r.bga.drain(..2);
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        v8(&|r| {
+            r.bga.drain(..3);
+        }),
+        vec!["bga-incomplete"]
+    );
+    assert_eq!(
+        v8(&|r| {
+            let n = r.bga.len();
+            r.bga.truncate(n - 3);
+        }),
+        vec!["bga-incomplete"]
+    );
+}
+
+#[test]
 fn v8_missing_or_partial_evidence_is_invalid() {
     use spike_core::run::{AudioPeriod, InputLatency};
     type Edit = Box<dyn Fn(&mut RunData)>;

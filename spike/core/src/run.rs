@@ -60,6 +60,8 @@ pub struct RunInfo {
     pub bga_width: Option<u32>,
     pub bga_height: Option<u32>,
     pub mix_rate_hz: u32,
+    /// Device period the audio thread ran at (V8 audio-stream edges).
+    pub audio_period_us: u32,
     /// Set when the PresentMon CSV could not be parsed to the end; a fixed
     /// category message, never file content.
     pub presentmon_error: Option<String>,

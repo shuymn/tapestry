@@ -147,6 +147,7 @@ const JSON_KEYS: &[&str] = &[
     "bga_width",
     "bga_height",
     "mix_rate_hz",
+    "audio_period_us",
     "presentmon_error",
     "notes_total",
     "notes_played",

@@ -95,6 +95,7 @@ pub fn passing_run() -> RunData {
             bga_width: Some(1920),
             bga_height: Some(1080),
             mix_rate_hz: 48_000,
+            audio_period_us: 10_000,
             presentmon_error: None,
         },
         counters,
