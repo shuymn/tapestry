@@ -541,6 +541,12 @@ fn e_presents_counted_by_present_count_must_all_be_captured() {
         evaluate(&counted_run(3, 3)).check("V4").reasons,
         vec!["presents-missing-from-capture"]
     );
+    // A single lost present, also missing from PresentMon: rows after play
+    // must not make up for it.
+    assert_eq!(
+        evaluate(&counted_run(1, 1)).check("V4").reasons,
+        vec!["presents-missing-from-capture"]
+    );
 }
 
 #[test]

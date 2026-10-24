@@ -315,24 +315,28 @@ fn v4(run: &RunData) -> Check {
         .iter()
         .filter(|m| m.is_none())
         .count();
-    // The spike's own present counts say how many presents it issued in
-    // play, including any whose frame record was lost; PresentMon must have
-    // at least that many rows there.
-    let counts = run
+    // Presents whose frame record was lost still have present counts: a
+    // count gap between two retained presents in play means that many
+    // presents were issued between them, and PresentMon must have a row
+    // for each strictly between the two (rows matched to the retained
+    // presents themselves, and rows outside play, do not count).
+    let mut counted: Vec<(u32, i64)> = run
         .frames
         .iter()
-        .filter(|f| f.present_us.is_some_and(|t| tl.in_play(t)))
-        .filter_map(|f| f.present_count);
-    let issued = counts
-        .clone()
-        .min()
-        .zip(counts.max())
-        .map(|(lo, hi)| u64::from(hi - lo) + 1);
-    let rows = pm
-        .iter()
-        .filter(|&&t| (start - PRESENT_MATCH_TOL_US..end + PRESENT_MATCH_TOL_US).contains(&t))
-        .count() as u64;
-    if missing > 0 || issued.is_some_and(|n| rows < n) {
+        .filter_map(|f| Some((f.present_count?, f.present_us?)))
+        .filter(|&(_, t)| tl.in_play(t))
+        .collect();
+    counted.sort_unstable();
+    let uncaptured = counted.windows(2).any(|w| {
+        let ((ca, ta), (cb, tb)) = (w[0], w[1]);
+        let issued_between = u64::from(cb.wrapping_sub(ca)).saturating_sub(1);
+        issued_between > 0 && {
+            let lo = pm.partition_point(|&t| t <= ta + PRESENT_MATCH_TOL_US);
+            let hi = pm.partition_point(|&t| t < tb - PRESENT_MATCH_TOL_US);
+            ((hi.saturating_sub(lo)) as u64) < issued_between
+        }
+    });
+    if missing > 0 || uncaptured {
         r.push("presents-missing-from-capture");
     }
     // No row gap over 1 s during which the spike presented.
