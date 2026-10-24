@@ -73,6 +73,44 @@ pub struct RunInfo {
     pub presentmon_error: Option<String>,
 }
 
+/// PresentMon's `PresentMode`: how the frame reached the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PresentMode {
+    /// "Hardware: Independent Flip": the swap chain flips the display
+    /// directly (fullscreen or independent flip).
+    HardwareIndependentFlip,
+    /// "Hardware Composed: Independent Flip" (multiplane overlay).
+    HardwareComposedIndependentFlip,
+    /// "Hardware: Legacy Flip".
+    HardwareLegacyFlip,
+    /// "Hardware: Legacy Copy to front buffer".
+    HardwareLegacyCopy,
+    /// "Composed: Flip": composed by DWM.
+    ComposedFlip,
+    /// "Composed: Copy with GPU GDI" / "Composed: Copy with CPU GDI".
+    ComposedCopyGpuGdi,
+    ComposedCopyCpuGdi,
+    /// Anything else PresentMon prints ("Unknown").
+    Other,
+}
+
+impl PresentMode {
+    /// From PresentMon's text.
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "Hardware: Independent Flip" => Self::HardwareIndependentFlip,
+            "Hardware Composed: Independent Flip" => Self::HardwareComposedIndependentFlip,
+            "Hardware: Legacy Flip" => Self::HardwareLegacyFlip,
+            "Hardware: Legacy Copy to front buffer" => Self::HardwareLegacyCopy,
+            "Composed: Flip" => Self::ComposedFlip,
+            "Composed: Copy with GPU GDI" => Self::ComposedCopyGpuGdi,
+            "Composed: Copy with CPU GDI" => Self::ComposedCopyCpuGdi,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// One PresentMon row of the spike's swap chain.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PmFrame {
@@ -83,6 +121,9 @@ pub struct PmFrame {
     /// `MsBetweenDisplayChange`; `None` (NA) if not displayed.
     pub display_change_ms: Option<f64>,
     pub gpu_busy_ms: Option<f64>,
+    /// `None` when the capture had no PresentMode column.
+    #[serde(default)]
+    pub present_mode: Option<PresentMode>,
 }
 
 impl PmFrame {
@@ -192,6 +233,9 @@ pub struct AudioFacts {
     pub capture_to_us: Option<i64>,
     /// Confirmed discontinuity episodes over the whole run (G5).
     pub episodes: Vec<Episode>,
+    /// The audio or loopback stream failed (V6 invalid).
+    #[serde(default)]
+    pub stream_error: bool,
 }
 
 /// Owner-note fields that may leave the PC.

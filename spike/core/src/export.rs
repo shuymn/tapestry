@@ -128,6 +128,9 @@ const JSON_KEYS: &[&str] = &[
     "bga_skipped",
     "obs_pre_roll_ms",
     "obs_post_roll_ms",
+    "present_modes",
+    "mode",
+    "stream_error",
     // run.json
     "info",
     "counters",
@@ -238,6 +241,7 @@ const CSV_COLUMNS: &[&str] = &[
     "latency_us",
     "due_us",
     "displayed",
+    "present_mode",
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

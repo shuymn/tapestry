@@ -11,10 +11,11 @@
 //! - `MsUntilDisplayed`: display time = present time + this.
 //! - `MsBetweenDisplayChange`: presented interval; `NA` = not displayed.
 //! - `MsGPUBusy`: GPU time.
+//! - `PresentMode` (optional): how the frame reached the screen.
 //!
 //! A row is never dropped for `NA`; it becomes a not-displayed frame.
 
-use crate::run::PmFrame;
+use crate::run::{PmFrame, PresentMode};
 use crate::time::{ms_to_us, qpc_to_us};
 use serde::{Deserialize, Deserializer};
 
@@ -58,6 +59,8 @@ struct Row {
     ms_between_display_change: Option<f64>,
     #[serde(deserialize_with = "na")]
     ms_until_displayed: Option<f64>,
+    #[serde(default)]
+    present_mode: Option<String>,
 }
 
 /// `NA` or empty is `None`; anything else must be a finite, non-negative
@@ -127,6 +130,7 @@ pub fn parse(csv_text: &[u8], app: &str, clock: QpcClock) -> (Vec<PmFrame>, Opti
             },
             display_change_ms: row.ms_between_display_change,
             gpu_busy_ms: row.ms_gpu_busy,
+            present_mode: row.present_mode.as_deref().map(PresentMode::parse),
         });
     }
     frames.sort_by_key(|f| f.present_us);
@@ -170,6 +174,10 @@ mod tests {
         assert_eq!(frames[0].display_us, Some(16_666 + 1_200 + 4_000));
         assert_eq!(frames[0].display_change_ms, Some(16.6667));
         assert_eq!(frames[0].gpu_busy_ms, Some(1.05));
+        assert_eq!(
+            frames[0].present_mode,
+            Some(PresentMode::HardwareIndependentFlip)
+        );
         // (d) NA row kept as a not-displayed frame.
         assert_eq!(frames[1].display_us, None);
         assert_eq!(frames[1].display_change_ms, None);

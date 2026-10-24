@@ -664,6 +664,7 @@ fn slow_run(render_period_us: i64, present_every: usize) -> RunData {
                 display_us: Some(from + (vsync as f64 * refresh_us) as i64),
                 display_change_ms: change.or(Some(T60_MS)),
                 gpu_busy_ms: Some(1.0),
+                present_mode: None,
             }
         })
         .collect();
@@ -724,6 +725,7 @@ fn v1_v2_v5_v6_invalidate() {
         ("V5", |r| r.counters.sound_overflows = 1),
         ("V5", |r| r.counters.input_overflows = 1),
         ("V6", |r| r.audio.pilot_calibrated = false),
+        ("V6", |r| r.audio.stream_error = true),
         ("V6", |r| r.audio.unverifiable_spans = 1),
         ("V6", |r| r.info.mix_rate_hz = 32_000),
         // The detector's warm-up or end must not fall inside play.

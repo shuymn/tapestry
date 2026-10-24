@@ -33,6 +33,7 @@ pub fn passing_run() -> RunData {
             display_us: Some(t + 5_000),
             display_change_ms: Some(T60_MS),
             gpu_busy_ms: Some(1.0),
+            present_mode: Some(PresentMode::HardwareIndependentFlip),
         })
         .collect();
     let frames: Vec<SpikeFrame> = presents
@@ -110,6 +111,7 @@ pub fn passing_run() -> RunData {
             capture_from_us: Some(PLAY_START_US - 10_000_000),
             capture_to_us: Some(timeline.play_end_us() + 3_000_000),
             episodes: vec![],
+            stream_error: false,
         },
         owner: OwnerPublic::default(),
         obs: None,

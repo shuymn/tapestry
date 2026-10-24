@@ -11,8 +11,8 @@ use crate::chart::{LANES, MIN_NOTES};
 use crate::heavy::Timeline;
 use crate::obslog::{EncoderFamily, ObsSession};
 use crate::run::{
-    AudioFacts, EncoderClass, EventKind, PmFrame, Profile, Rational, RunData, RunKind, StreamCount,
-    ThreadTag,
+    AudioFacts, EncoderClass, EventKind, PmFrame, PresentMode, Profile, Rational, RunData, RunKind,
+    StreamCount, ThreadTag,
 };
 use crate::stats::{percentile_f64, percentile_i64};
 use serde::{Deserialize, Serialize};
@@ -92,6 +92,16 @@ pub struct Records {
     pub bga_skipped: u64,
     pub obs_pre_roll_ms: Option<i64>,
     pub obs_post_roll_ms: Option<i64>,
+    /// PresentMon rows by present mode over the whole run (independent
+    /// flip vs DWM composition), in mode order.
+    #[serde(default)]
+    pub present_modes: Vec<ModeCount>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModeCount {
+    pub mode: PresentMode,
+    pub frames: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -442,6 +452,9 @@ fn v6(run: &RunData) -> Check {
 /// runs may be shorter than whole loops.
 pub fn audio_validity(audio: &AudioFacts, (start, end): (i64, i64), mix_rate_hz: u32) -> Check {
     let mut r = vec![];
+    if audio.stream_error {
+        r.push("audio-stream-error");
+    }
     if !audio.pilot_calibrated {
         r.push("pilot-not-calibrated");
     }
@@ -842,6 +855,17 @@ fn gates(run: &RunData, tl: &Timeline, t_ms: Option<f64>) -> (Vec<Gate>, Records
         bga_skipped: run.bga.iter().filter(|b| !b.displayed).count() as u64,
         obs_pre_roll_ms: None,
         obs_post_roll_ms: None,
+        present_modes: {
+            let mut m: BTreeMap<PresentMode, u64> = BTreeMap::new();
+            for f in &run.pm_frames {
+                if let Some(p) = f.present_mode {
+                    *m.entry(p).or_default() += 1;
+                }
+            }
+            m.into_iter()
+                .map(|(mode, frames)| ModeCount { mode, frames })
+                .collect()
+        },
     };
     (gates, records)
 }
