@@ -40,11 +40,6 @@ pub const STREAM_EDGE_US: i64 = 1_000_000;
 /// V7 measurement-window bounds.
 pub const MAX_OBS_PRE_ROLL_MS: i64 = 30_000;
 pub const MAX_OBS_POST_ROLL_MS: i64 = 60_000;
-/// V7 settings (owner procedure §4.1).
-pub const OBS_BITRATE_KBPS: u32 = 6_000;
-pub const OBS_WIDTH: u32 = 1_920;
-pub const OBS_HEIGHT: u32 = 1_080;
-pub const OBS_FPS: u32 = 60;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Check {
@@ -137,7 +132,7 @@ pub fn evaluate(run: &RunData) -> Summary {
         v8(run),
     ];
     let (gates, mut records) = gates(run, &tl, target_hz);
-    records.obs_pre_roll_ms = session(run).map(|s| s.pre_roll_ms);
+    records.obs_pre_roll_ms = session(run).and_then(|s| s.connect_lead_ms.max(s.start_lead_ms));
     records.obs_post_roll_ms = session(run).and_then(|s| s.post_roll_ms);
     let exit_code = if validity.iter().any(|c| !c.ok) {
         2
@@ -402,8 +397,14 @@ fn v7(run: &RunData) -> Check {
     if s.frames_output.unwrap_or(0) == 0 || s.drawn.unwrap_or(0) == 0 {
         r.push("obs-no-frames");
     }
-    if !(0..=MAX_OBS_PRE_ROLL_MS).contains(&s.pre_roll_ms) {
+    // Counters cover the session from the successful connection and the
+    // streaming start; both must precede play by at most the pre-roll bound.
+    let lead_ok = |l: Option<i64>| l.is_some_and(|l| (0..=MAX_OBS_PRE_ROLL_MS).contains(&l));
+    if !lead_ok(s.connect_lead_ms) || !lead_ok(s.start_lead_ms) {
         r.push("obs-pre-roll");
+    }
+    if s.other_output_active {
+        r.push("obs-other-output-active");
     }
     if !s
         .post_roll_ms
@@ -417,17 +418,8 @@ fn v7(run: &RunData) -> Check {
         (Some(EncoderClass::Hardware), Some(f)) => f != EncoderFamily::X264,
         _ => false,
     };
-    let settings_ok = family_ok
-        && enc
-            .rate_control
-            .as_deref()
-            .is_some_and(|m| m.eq_ignore_ascii_case("CBR"))
-        && enc.bitrate_kbps == Some(OBS_BITRATE_KBPS)
-        && enc.width == Some(OBS_WIDTH)
-        && enc.height == Some(OBS_HEIGHT)
-        && enc.fps_num == Some(OBS_FPS)
-        && enc.fps_den.unwrap_or(1) == 1;
-    if !settings_ok {
+    let video_ok = s.video.as_ref().is_some_and(|v| v.matches_procedure());
+    if !(family_ok && enc.matches_procedure() && video_ok) {
         r.push("obs-settings-mismatch");
     }
     if s.bandwidth_dropped.unwrap_or(0) > 0 {

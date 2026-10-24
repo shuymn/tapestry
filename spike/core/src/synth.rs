@@ -4,7 +4,7 @@
 //! 60 Hz with every frame displayed exactly one refresh apart.
 
 use crate::heavy::Timeline;
-use crate::obslog::{EncoderFamily, ObsDerived, ObsEncoderSettings, ObsSession};
+use crate::obslog::{EncoderFamily, ObsDerived, ObsEncoderSettings, ObsSession, ObsVideo};
 use crate::run::*;
 
 pub const PLAY_START_US: i64 = 20_000_000;
@@ -147,16 +147,27 @@ pub fn passing_obs_run() -> RunData {
             start_marker: true,
             connected: true,
             stop_marker: true,
-            pre_roll_ms: 10_000,
+            connect_lead_ms: Some(10_000),
+            start_lead_ms: Some(9_900),
             post_roll_ms: Some(20_000),
-            encoder: Some(ObsEncoderSettings {
-                family: Some(EncoderFamily::X264),
-                rate_control: Some("CBR".into()),
-                bitrate_kbps: Some(6_000),
-                width: Some(1920),
-                height: Some(1080),
+            video: Some(ObsVideo {
+                base_width: Some(1920),
+                base_height: Some(1080),
+                output_width: Some(1920),
+                output_height: Some(1080),
                 fps_num: Some(60),
                 fps_den: Some(1),
+                downscale_filter: Some("Bicubic".into()),
+            }),
+            encoder: Some(ObsEncoderSettings {
+                family: Some(EncoderFamily::X264),
+                label: Some("x264 encoder".into()),
+                rate_control: Some("CBR".into()),
+                bitrate_kbps: Some(6_000),
+                preset: Some("veryfast".into()),
+                profile: Some("high".into()),
+                tune: Some("(null)".into()),
+                ..ObsEncoderSettings::default()
             }),
             frames_output: Some(37_800),
             drawn: Some(37_800),

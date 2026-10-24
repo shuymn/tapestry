@@ -1,7 +1,9 @@
 //! P1 test (f): OBS log evidence (V7), O1 and O2, plus their thresholds.
 //!
-//! The logs are synthetic but follow OBS's line shapes; P5 refreshes them
-//! from a real (sanitized) log.
+//! The logs are synthetic but follow the line shapes in OBS's sources
+//! (libobs `obs_reset_video`, `log_frame_info`, `log_skipped`; the x264,
+//! obs-nvenc, texture-amf and qsv encoder plugins); P5 refreshes them from a
+//! real (sanitized) log.
 
 use spike_core::evaluate::{Summary, evaluate};
 use spike_core::obslog::{WallWindow, derive};
@@ -26,26 +28,160 @@ fn ts(ms: i64) -> String {
     )
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Enc {
+    X264,
+    Nvenc,
+    Amf,
+    Qsv,
+}
+
+fn tab(kvs: &[(&str, &str)], width: usize) -> Vec<String> {
+    kvs.iter()
+        .map(|(k, v)| format!("\t{:<width$}{v}", format!("{k}:")))
+        .collect()
+}
+
+impl Enc {
+    fn class(self) -> EncoderClass {
+        match self {
+            Enc::X264 => EncoderClass::X264,
+            _ => EncoderClass::Hardware,
+        }
+    }
+
+    /// Lines as each plugin logs them at encoder creation, with the
+    /// procedure's settings (§4.1).
+    fn lines(self) -> Vec<String> {
+        let name = "advanced_video_stream";
+        match self {
+            Enc::X264 => {
+                let p = format!("[x264 encoder: '{name}']");
+                let mut l = vec![
+                    "---------------------------------".to_string(),
+                    format!("{p} preset: veryfast"),
+                    format!("{p} profile: high"),
+                    format!("{p} tune: (null)"),
+                    format!("{p} settings:"),
+                ];
+                l.extend(tab(
+                    &[
+                        ("rate_control", "CBR"),
+                        ("bitrate", "6000"),
+                        ("buffer size", "6000"),
+                        ("crf", "23"),
+                        ("fps_num", "60"),
+                        ("fps_den", "1"),
+                        ("width", "1920"),
+                        ("height", "1080"),
+                        ("keyint", "120"),
+                    ],
+                    14,
+                ));
+                l.push(String::new());
+                l
+            }
+            Enc::Nvenc => {
+                let mut l = vec![format!("[obs-nvenc: '{name}'] settings:")];
+                l.extend(tab(
+                    &[
+                        ("codec", "H264"),
+                        ("rate_control", "CBR"),
+                        ("bitrate", "6000"),
+                        ("keyint", "120"),
+                        ("preset", "p5"),
+                        ("tuning", "hq"),
+                        ("multipass", "qres"),
+                        ("profile", "high"),
+                        ("width", "1920"),
+                        ("height", "1080"),
+                        ("b-frames", "2"),
+                        ("b-ref-mode", "0"),
+                        ("lookahead", "false (0 frames)"),
+                        ("aq", "true"),
+                    ],
+                    14,
+                ));
+                l
+            }
+            Enc::Amf => {
+                // AMF logs no fps; the common video block carries it.
+                let mut l = vec![format!("[texture-amf-h264: '{name}'] settings:")];
+                l.extend(tab(
+                    &[
+                        ("rate_control", "CBR"),
+                        ("bitrate", "6000"),
+                        ("cqp", "20"),
+                        ("keyint", "120"),
+                        ("preset", "quality"),
+                        ("profile", "high"),
+                        ("level", "auto"),
+                        ("b-frames", "0"),
+                        ("width", "1920"),
+                        ("height", "1080"),
+                        ("pre-analysis", "off"),
+                        ("params", ""),
+                    ],
+                    14,
+                ));
+                l
+            }
+            Enc::Qsv => {
+                let p = format!("[qsv encoder: '{name}']");
+                let mut l = vec![format!("{p} settings:")];
+                // `codec` and `rate_control` come with the prefixed call;
+                // the rest are separate unprefixed blog lines.
+                l.extend(tab(&[("codec", "H.264"), ("rate_control", "CBR")], 16));
+                l.extend(tab(&[("target_bitrate", "6000")], 16));
+                l.extend(tab(
+                    &[
+                        ("target_usage", "TU4"),
+                        ("profile", "high"),
+                        ("keyint", "2"),
+                        ("latency", "normal"),
+                        ("b-frames", "3"),
+                        ("fps_num", "60"),
+                        ("fps_den", "1"),
+                        ("width", "1920"),
+                        ("height", "1080"),
+                    ],
+                    16,
+                ));
+                l.push(format!("{p} debug info:"));
+                l
+            }
+        }
+    }
+}
+
 struct Log {
-    begin_ms: i64,
+    attempt_ms: i64,
+    connect_ms: i64,
+    start_ms: i64,
     stop_ms: i64,
-    encoder: &'static str,
-    bitrate: u32,
+    enc: Enc,
+    /// `(from, to)` substitutions applied to the encoder and video lines.
+    edits: Vec<(&'static str, &'static str)>,
     totals: Vec<String>,
+    /// Lines logged shortly after the streaming start marker.
+    during: Vec<String>,
     stop: bool,
 }
 
 impl Default for Log {
     fn default() -> Self {
         Self {
-            begin_ms: PLAY.start_ms - 10_000,
+            attempt_ms: PLAY.start_ms - 10_200,
+            connect_ms: PLAY.start_ms - 10_000,
+            start_ms: PLAY.start_ms - 9_900,
             stop_ms: PLAY.end_ms + 20_000,
-            encoder: "x264",
-            bitrate: 6000,
+            enc: Enc::X264,
+            edits: vec![],
             totals: vec![
                 "Output 'adv_stream': Total frames output: 37800".into(),
                 "Output 'adv_stream': Total drawn frames: 37800".into(),
             ],
+            during: vec![],
             stop: true,
         }
     }
@@ -53,92 +189,159 @@ impl Default for Log {
 
 impl Log {
     fn text(&self) -> String {
-        let b = self.begin_ms;
+        let at = |t: i64, m: &str| format!("{}: {m}", ts(t));
+        let edit = |s: String| self.edits.iter().fold(s, |s, (a, b)| s.replace(a, b));
+        let t0 = self.attempt_ms - 60_000;
         let mut l = vec![
-            format!("{}: Start streaming clicked", ts(b - 5)),
-            format!(
-                "{}: [rtmp stream: 'adv_stream'] Connecting to RTMP URL rtmp://192.0.2.10/live...",
-                ts(b)
-            ),
-            format!(
-                "{}: [rtmp stream: 'adv_stream'] Connection to rtmp://192.0.2.10/live successful",
-                ts(b + 40)
-            ),
+            at(t0, "OBS 31.0.0 (64-bit, windows)"),
+            at(t0, "---------------------------------"),
         ];
-        let label = match self.encoder {
-            "x264" => "x264 encoder",
-            _ => "obs-nvenc",
-        };
-        l.push(format!(
-            "{}: [{label}: 'advanced_video_stream'] settings:",
-            ts(b + 60)
-        ));
-        for kv in [
-            "rate_control: CBR".to_string(),
-            format!("bitrate:      {}", self.bitrate),
-            "buffer size:  6000".into(),
-            "fps_num:      60".into(),
-            "fps_den:      1".into(),
-            "width:        1920".into(),
-            "height:       1080".into(),
-            "keyint:       120".into(),
+        for v in [
+            "video settings reset:",
+            "\tbase resolution:   2560x1440",
+            "\toutput resolution: 1920x1080",
+            "\tdownscale filter:  Bicubic",
+            "\tfps:               60/1",
+            "\tformat:            NV12",
+            "\tYUV mode:          709/Partial",
         ] {
-            l.push(format!("{}: \t{kv}", ts(b + 60)));
+            l.push(at(t0 + 5, &edit(v.to_string())));
         }
-        l.push(format!("{}: ", ts(b + 60)));
-        l.push(format!(
-            "{}: ==== Streaming Start ===============================================",
-            ts(b + 100)
+        let rtmp = "[rtmp stream: 'adv_stream']";
+        l.push(at(
+            self.attempt_ms,
+            &format!("{rtmp} Connecting to RTMP URL rtmp://192.0.2.10/live..."),
         ));
-        l.push(format!(
-            "{}: [game-capture: 'Game'] attempting to hook process",
-            ts(b + 900)
+        l.push(at(
+            self.connect_ms,
+            &format!("{rtmp} Connection to rtmp://192.0.2.10/live successful"),
+        ));
+        for e in self.enc.lines() {
+            l.push(at(self.connect_ms + 20, &edit(e)));
+        }
+        l.push(at(
+            self.start_ms,
+            "==== Streaming Start ===============================================",
+        ));
+        for d in &self.during {
+            l.push(at(self.start_ms + 500, d));
+        }
+        l.push(at(
+            self.start_ms + 900,
+            "[game-capture: 'Game'] attempting to hook process",
         ));
         if self.stop {
             let e = self.stop_ms;
-            l.push(format!(
-                "{}: [rtmp stream: 'adv_stream'] User stopped the stream",
-                ts(e - 20)
-            ));
-            l.push(format!("{}: Output 'adv_stream': stopping", ts(e - 10)));
+            l.push(at(e - 20, &format!("{rtmp} User stopped the stream")));
+            l.push(at(e - 10, "Output 'adv_stream': stopping"));
             for t in &self.totals {
-                l.push(format!("{}: {t}", ts(e - 10)));
+                l.push(at(e - 10, t));
             }
-            l.push(format!(
-                "{}: ==== Streaming Stop ================================================",
-                ts(e)
+            l.push(at(
+                e,
+                "==== Streaming Stop ================================================",
             ));
         }
         l.join("\n") + "\n"
     }
 }
 
-fn with_log(log: &Log, class: EncoderClass) -> (RunData, Summary) {
+fn with_log(log: &Log) -> (RunData, Summary) {
     let mut run = passing_obs_run();
-    run.info.obs_encoder = Some(class);
+    run.info.obs_encoder = Some(log.enc.class());
     run.obs = Some(derive(&log.text(), PLAY));
     let s = evaluate(&run);
     (run, s)
 }
 
-fn reasons(s: &Summary) -> Vec<String> {
-    s.check("V7").reasons.clone()
+fn reasons(log: &Log) -> Vec<String> {
+    with_log(log).1.check("V7").reasons.clone()
 }
 
 #[test]
-fn f_complete_log_without_lag_lines_is_valid_with_zero_lag() {
-    let (run, s) = with_log(&Log::default(), EncoderClass::X264);
-    assert!(s.check("V7").ok, "{:?}", reasons(&s));
-    assert_eq!(s.gate("O1").value, Some(0.0));
-    assert_eq!(s.gate("O2").value, Some(0.0));
-    assert!(s.gate("O1").pass && s.gate("O2").pass);
-    assert_eq!(s.exit_code, 0);
-    let sess = run.obs.unwrap().session.unwrap();
+fn f_every_encoder_fixture_is_valid_with_zero_lag() {
+    for enc in [Enc::X264, Enc::Nvenc, Enc::Amf, Enc::Qsv] {
+        let log = Log {
+            enc,
+            ..Log::default()
+        };
+        let (run, s) = with_log(&log);
+        assert!(s.check("V7").ok, "{:?}", s.check("V7").reasons);
+        assert_eq!(s.gate("O1").value, Some(0.0));
+        assert_eq!(s.gate("O2").value, Some(0.0));
+        assert_eq!(s.exit_code, 0);
+        let sess = run.obs.unwrap().session.unwrap();
+        assert_eq!(
+            (sess.connect_lead_ms, sess.start_lead_ms, sess.post_roll_ms),
+            (Some(10_000), Some(9_900), Some(20_000))
+        );
+    }
+}
+
+#[test]
+fn f_encoder_workload_mismatch_is_invalid() {
+    let cases: [(Enc, &str, &str); 10] = [
+        (Enc::X264, "preset: veryfast", "preset: medium"),
+        (Enc::X264, "profile: high", "profile: main"),
+        (Enc::X264, "tune: (null)", "tune: zerolatency"),
+        (Enc::X264, "6000", "4500"),
+        (Enc::Nvenc, "p5", "p4"),
+        (Enc::Nvenc, "qres", "fullres"),
+        (Enc::Nvenc, "H264", "HEVC"),
+        (Enc::Amf, "quality", "speed"),
+        (Enc::Qsv, "TU4", "TU7"),
+        (Enc::Qsv, "CBR", "VBR"),
+    ];
+    for (enc, from, to) in cases {
+        let log = Log {
+            enc,
+            edits: vec![(from, to)],
+            ..Log::default()
+        };
+        assert_eq!(
+            reasons(&log),
+            vec!["obs-settings-mismatch"],
+            "{from} -> {to}"
+        );
+    }
+    // Hardware log in the x264 cell, and the reverse.
+    let mut run = passing_obs_run();
+    let nvenc = Log {
+        enc: Enc::Nvenc,
+        ..Log::default()
+    };
+    run.obs = Some(derive(&nvenc.text(), PLAY));
     assert_eq!(
-        (sess.pre_roll_ms, sess.post_roll_ms),
-        (10_000, Some(20_000))
+        evaluate(&run).check("V7").reasons,
+        vec!["obs-settings-mismatch"]
     );
-    assert_eq!(s.records.obs_post_roll_ms, Some(20_000));
+    run.info.obs_encoder = Some(EncoderClass::Hardware);
+    run.obs = Some(derive(&Log::default().text(), PLAY));
+    assert_eq!(
+        evaluate(&run).check("V7").reasons,
+        vec!["obs-settings-mismatch"]
+    );
+}
+
+#[test]
+fn f_common_video_settings_come_from_the_video_block() {
+    for (from, to) in [
+        ("fps:               60/1", "fps:               30/1"),
+        (
+            "output resolution: 1920x1080",
+            "output resolution: 1280x720",
+        ),
+        ("Bicubic", "Bilinear"),
+    ] {
+        for enc in [Enc::Amf, Enc::X264] {
+            let log = Log {
+                enc,
+                edits: vec![(from, to)],
+                ..Log::default()
+            };
+            assert_eq!(reasons(&log), vec!["obs-settings-mismatch"], "{to}");
+        }
+    }
 }
 
 #[test]
@@ -152,7 +355,7 @@ fn f_render_lag_uses_the_attempted_denominator() {
         ],
         ..Log::default()
     };
-    let (_, s) = with_log(&log, EncoderClass::X264);
+    let (_, s) = with_log(&log);
     assert!(s.check("V7").ok);
     let o1 = s.gate("O1");
     assert_eq!(o1.samples, 36_300);
@@ -167,8 +370,10 @@ fn f_render_lag_uses_the_attempted_denominator() {
         ],
         ..Log::default()
     };
-    let (_, s) = with_log(&log, EncoderClass::X264);
-    assert_eq!(s.gate("O1").value, Some(100.0 * 100.0 / 36_100.0));
+    assert_eq!(
+        with_log(&log).1.gate("O1").value,
+        Some(100.0 * 100.0 / 36_100.0)
+    );
 }
 
 #[test]
@@ -185,31 +390,82 @@ fn f_lagged_play_diluted_by_idle_post_roll_is_invalid_not_a_pass() {
         ],
         ..Log::default()
     };
-    let (_, s) = with_log(&log, EncoderClass::X264);
+    let (_, s) = with_log(&log);
     assert!(s.gate("O1").pass, "the diluted ratio alone would pass");
-    assert_eq!(reasons(&s), vec!["obs-post-roll"]);
+    assert_eq!(s.check("V7").reasons, vec!["obs-post-roll"]);
     assert_eq!(s.exit_code, 2);
 }
 
 #[test]
-fn f_pre_roll_over_30_s_is_invalid() {
+fn f_coverage_starts_at_the_connection_and_streaming_start() {
+    // A slow connect: the attempt is 40 s before play but the connection
+    // and the streaming start are within 30 s.
     let log = Log {
-        begin_ms: PLAY.start_ms - 31_000,
+        attempt_ms: PLAY.start_ms - 40_000,
+        connect_ms: PLAY.start_ms - 25_000,
+        start_ms: PLAY.start_ms - 24_900,
         ..Log::default()
     };
-    assert_eq!(
-        reasons(&with_log(&log, EncoderClass::X264).1),
-        vec!["obs-pre-roll"]
-    );
-    // Session starting after play starts does not bracket it.
+    assert!(reasons(&log).is_empty(), "{:?}", reasons(&log));
+    // Connected 31 s before play: too much pre-roll.
     let log = Log {
-        begin_ms: PLAY.start_ms + 1,
+        attempt_ms: PLAY.start_ms - 31_200,
+        connect_ms: PLAY.start_ms - 31_000,
+        start_ms: PLAY.start_ms - 29_000,
         ..Log::default()
     };
+    assert_eq!(reasons(&log), vec!["obs-pre-roll"]);
+    // Connected, or streaming started, after play started.
+    let log = Log {
+        attempt_ms: PLAY.start_ms - 1_000,
+        connect_ms: PLAY.start_ms + 500,
+        start_ms: PLAY.start_ms + 600,
+        ..Log::default()
+    };
+    assert_eq!(reasons(&log), vec!["obs-pre-roll"]);
+    let log = Log {
+        start_ms: PLAY.start_ms + 1,
+        ..Log::default()
+    };
+    assert_eq!(reasons(&log), vec!["obs-pre-roll"]);
+}
+
+#[test]
+fn f_recording_during_the_session_is_invalid_and_not_mixed_in() {
+    // A recording ran through the session: its 90,000 frames (none lagged)
+    // must not dilute the stream's 0.8% lag.
+    let log = Log {
+        during: vec!["==== Recording Start ===============================================".into()],
+        totals: vec![
+            "Output 'adv_stream': Total frames output: 36000".into(),
+            "Output 'adv_stream': Total drawn frames: 36000 (36290 attempted)".into(),
+            "Output 'adv_stream': Number of lagged frames due to rendering lag/stalls: 290 (0.8%)"
+                .into(),
+            "Output 'adv_file_output': stopping".into(),
+            "Output 'adv_file_output': Total frames output: 90000".into(),
+            "Output 'adv_file_output': Total drawn frames: 90000".into(),
+            "==== Recording Stop ================================================".into(),
+        ],
+        ..Log::default()
+    };
+    let (run, s) = with_log(&log);
+    let sess = run.obs.unwrap().session.unwrap();
     assert_eq!(
-        reasons(&with_log(&log, EncoderClass::X264).1),
-        vec!["obs-pre-roll"]
+        (sess.frames_output, sess.drawn_attempted),
+        (Some(36_000), Some(36_290))
     );
+    assert_eq!(s.check("V7").reasons, vec!["obs-other-output-active"]);
+    assert!(!s.gate("O1").pass);
+    // Counters of another output alone also reveal it.
+    let log = Log {
+        totals: vec![
+            "Output 'adv_file_output': Total frames output: 90000".into(),
+            "Output 'adv_stream': Total frames output: 37800".into(),
+            "Output 'adv_stream': Total drawn frames: 37800".into(),
+        ],
+        ..Log::default()
+    };
+    assert_eq!(reasons(&log), vec!["obs-other-output-active"]);
 }
 
 #[test]
@@ -218,9 +474,14 @@ fn f_missing_stop_block_is_invalid() {
         stop: false,
         ..Log::default()
     };
-    let (_, s) = with_log(&log, EncoderClass::X264);
-    let r = reasons(&s);
-    assert!(r.contains(&"obs-session-incomplete".to_string()), "{r:?}");
+    let (_, s) = with_log(&log);
+    assert!(
+        s.check("V7")
+            .reasons
+            .contains(&"obs-session-incomplete".to_string()),
+        "{:?}",
+        s.check("V7").reasons
+    );
     assert_eq!(s.exit_code, 2);
 }
 
@@ -243,38 +504,17 @@ fn f_no_session_is_invalid() {
 #[test]
 fn f_non_overlapping_session_is_invalid() {
     let log = Log {
-        begin_ms: PLAY.start_ms - 900_000,
+        attempt_ms: PLAY.start_ms - 900_200,
+        connect_ms: PLAY.start_ms - 900_000,
+        start_ms: PLAY.start_ms - 899_900,
         stop_ms: PLAY.start_ms - 300_000,
         ..Log::default()
     };
-    let (run, s) = with_log(&log, EncoderClass::X264);
+    let (run, s) = with_log(&log);
     assert_eq!(run.obs.unwrap().sessions_in_log, 1);
-    assert_eq!(reasons(&s), vec!["no-obs-session-overlapping-play"]);
-}
-
-#[test]
-fn f_settings_mismatch_is_invalid() {
-    let log = Log {
-        bitrate: 4500,
-        ..Log::default()
-    };
     assert_eq!(
-        reasons(&with_log(&log, EncoderClass::X264).1),
-        vec!["obs-settings-mismatch"]
-    );
-    // Hardware encoder log in the x264 cell, and the reverse.
-    let hw = Log {
-        encoder: "nvenc",
-        ..Log::default()
-    };
-    assert_eq!(
-        reasons(&with_log(&hw, EncoderClass::X264).1),
-        vec!["obs-settings-mismatch"]
-    );
-    assert!(with_log(&hw, EncoderClass::Hardware).1.check("V7").ok);
-    assert_eq!(
-        reasons(&with_log(&Log::default(), EncoderClass::Hardware).1),
-        vec!["obs-settings-mismatch"]
+        s.check("V7").reasons,
+        vec!["no-obs-session-overlapping-play"]
     );
 }
 
@@ -285,10 +525,7 @@ fn f_bandwidth_drop_is_invalid() {
         "Output 'adv_stream': Number of dropped frames due to insufficient bandwidth/connection stalls: 3 (0.0%)"
             .into(),
     );
-    assert_eq!(
-        reasons(&with_log(&log, EncoderClass::X264).1),
-        vec!["obs-bandwidth-drop"]
-    );
+    assert_eq!(reasons(&log), vec!["obs-bandwidth-drop"]);
 }
 
 #[test]
@@ -309,33 +546,37 @@ fn f_session_across_midnight() {
         end_ms: 24 * H + 9 * 60_000 + 30_000,
     };
     let log = Log {
-        begin_ms: play.start_ms - 5_000,
+        attempt_ms: play.start_ms - 5_200,
+        connect_ms: play.start_ms - 5_000,
+        start_ms: play.start_ms - 4_900,
         stop_ms: play.end_ms + 5_000,
         ..Log::default()
     };
-    let d = derive(&log.text(), play);
-    let s = d.session.unwrap();
-    assert_eq!((s.pre_roll_ms, s.post_roll_ms), (5_000, Some(5_000)));
+    let s = derive(&log.text(), play).session.unwrap();
+    assert_eq!(
+        (s.connect_lead_ms, s.post_roll_ms),
+        (Some(5_000), Some(5_000))
+    );
 }
 
 // (b) for O1 and O2: below 0.5% passes, 0.5% exactly fails.
 #[test]
 fn b_o1_o2_thresholds() {
     let o = |drawn: u64, lagged: u64, skipped: u64| {
-        let mut log = Log {
+        let log = Log {
             totals: vec![
                 "Output 'adv_stream': Total frames output: 36000".into(),
                 format!("Output 'adv_stream': Total drawn frames: {drawn} (36000 attempted)"),
                 format!(
                     "Output 'adv_stream': Number of lagged frames due to rendering lag/stalls: {lagged} (0.5%)"
                 ),
+                format!(
+                    "Video stopped, number of skipped frames due to encoding lag: {skipped}/36000 (0.5%)"
+                ),
             ],
             ..Log::default()
         };
-        log.totals.push(format!(
-            "Video stopped, number of skipped frames due to encoding lag: {skipped}/36000 (0.5%)"
-        ));
-        let (_, s) = with_log(&log, EncoderClass::X264);
+        let (_, s) = with_log(&log);
         (s.gate("O1").pass, s.gate("O2").pass)
     };
     assert_eq!(o(36000 - 179, 179, 179), (true, true));
