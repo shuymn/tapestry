@@ -335,7 +335,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         refresh,
     } = gpu;
     let refresh_mhz = (u64::from(refresh.0) * 1000 / u64::from(refresh.1.max(1))) as u32;
-    let adapter = adapter(&instance, args.adapter, Some(&surface))?;
+    let adapter = adapter(&instance, &args.adapter, Some(&surface))?;
     let info = adapter.get_info();
     let (dev, queue) = device(&adapter)?;
     let size = window.inner_size();
@@ -530,7 +530,12 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
             .is_some_and(|p| (play_start..play_start + play_len).contains(&p))
     };
     let due = bga_due(&rec, &bga, play_start, play_len, in_play);
-    let mut summary = summary_common("windowed", &info, size, &rec);
+    let mode = if args.window.is_some() {
+        "windowed"
+    } else {
+        "borderless-fullscreen"
+    };
+    let mut summary = summary_common(mode, &info, size, &rec);
     (
         summary.heavy_render_cpu_us_p99,
         summary.heavy_bga_displayed_pct,

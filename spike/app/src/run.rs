@@ -24,12 +24,16 @@ pub const POST_PLAY_US: i64 = 2_000_000;
 /// Offscreen virtual frame interval (60 Hz).
 const VIRTUAL_FRAME_US: i64 = 16_667;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterChoice {
     /// The default high-performance hardware adapter.
     Hardware,
+    /// The low-power adapter (an integrated GPU when there is one).
+    LowPower,
     /// WARP, the DX12 software rasterizer ("Microsoft Basic Render Driver").
     Warp,
+    /// The first DX12 adapter whose name contains this (case-insensitive).
+    Name(String),
 }
 
 #[derive(Clone, Debug)]
@@ -125,24 +129,38 @@ pub struct RenderSummary {
 
 pub fn adapter(
     instance: &wgpu::Instance,
-    choice: AdapterChoice,
+    choice: &AdapterChoice,
     surface: Option<&wgpu::Surface<'_>>,
 ) -> Result<wgpu::Adapter, String> {
+    let all = || pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
+    let request = |power_preference| {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference,
+            force_fallback_adapter: false,
+            compatible_surface: surface,
+            apply_limit_buckets: false,
+        }))
+        .map_err(|e| format!("request adapter: {e}"))
+    };
     match choice {
-        AdapterChoice::Warp => {
-            pollster::block_on(instance.enumerate_adapters(wgpu::Backends::DX12))
+        AdapterChoice::Warp => all()
+            .into_iter()
+            .find(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
+            .ok_or_else(|| "no WARP adapter".into()),
+        AdapterChoice::Hardware => request(wgpu::PowerPreference::HighPerformance),
+        AdapterChoice::LowPower => request(wgpu::PowerPreference::LowPower),
+        AdapterChoice::Name(part) => {
+            let adapters = all();
+            let names: Vec<String> = adapters.iter().map(|a| a.get_info().name).collect();
+            adapters
                 .into_iter()
-                .find(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
-                .ok_or_else(|| "no WARP adapter".into())
-        }
-        AdapterChoice::Hardware => {
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: surface,
-                apply_limit_buckets: false,
-            }))
-            .map_err(|e| format!("request adapter: {e}"))
+                .find(|a| {
+                    a.get_info()
+                        .name
+                        .to_lowercase()
+                        .contains(&part.to_lowercase())
+                })
+                .ok_or_else(|| format!("no DX12 adapter named like {part:?}; adapters: {names:?}"))
         }
     }
 }
@@ -413,7 +431,7 @@ pub fn print_summary(s: &RenderSummary) {
             d.prediction_error_us_p99_abs
         );
     }
-    if s.mode == "windowed" {
+    if s.mode != "offscreen" {
         println!(
             "heavy windows: G2 render cpu p99 {:?} us, G7 bga displayed {:?} %",
             s.heavy_render_cpu_us_p99, s.heavy_bga_displayed_pct
@@ -472,7 +490,7 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
     alloc::tag_thread(Tag::Render);
     let clock = Clock::start();
     let instance = instance();
-    let adapter = adapter(&instance, args.adapter, None)?;
+    let adapter = adapter(&instance, &args.adapter, None)?;
     let info = adapter.get_info();
     let (dev, queue) = device(&adapter)?;
     let mut bga = BgaState::open(&args.bga)?;

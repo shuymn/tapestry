@@ -32,7 +32,8 @@ const USAGE: &str = "usage:
   tapestry-spike --version
   tapestry-spike gen-assets --ffmpeg <exe> --out <dir> [--seconds N]
   tapestry-spike run --out <dir> [--bga <video>] [--fps-cap N] [--loops N | --duration-s N]
-      [--window WxH] [--offscreen WxH --adapter warp|hardware --audio null --frames N]";
+      [--window WxH] [--adapter warp|hardware|low-power | --adapter-name <part>]
+      [--offscreen WxH --audio null --frames N]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -114,9 +115,15 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
                 a.adapter = match v {
                     "warp" => AdapterChoice::Warp,
                     "hardware" => AdapterChoice::Hardware,
-                    _ => return Err(format!("--adapter {v}: expected warp or hardware")),
+                    "low-power" => AdapterChoice::LowPower,
+                    _ => {
+                        return Err(format!(
+                            "--adapter {v}: expected warp, hardware or low-power"
+                        ));
+                    }
                 }
             }
+            "adapter-name" => a.adapter = AdapterChoice::Name(v.to_owned()),
             // Audio arrives in P3; only the null device exists yet.
             "audio" if v == "null" => {}
             "frames" => a.frames = Some(num(k, v)?),
