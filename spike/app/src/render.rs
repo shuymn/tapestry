@@ -392,11 +392,19 @@ impl Renderer {
         let Some(t) = &self.timer else {
             return;
         };
-        let mut e = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        e.write_timestamp(&t.set, index);
-        self.queue.submit([e.finish()]);
+        // Library work like the frame's own encoder and submit, so the
+        // diagnostic does not count as app allocations (G6).
+        let mut e = scope(Scope::CreateCommandEncoder, || {
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+        });
+        let cmd = scope(Scope::OtherLibrary, || {
+            e.write_timestamp(&t.set, index);
+            e.finish()
+        });
+        scope(Scope::Submit, || {
+            self.queue.submit([cmd]);
+        });
     }
 
     /// The timestamps of every timed frame, in drawing order.
@@ -562,7 +570,9 @@ impl Renderer {
         });
         if let Some(t) = &mut self.timer {
             if t.frame < t.cap {
-                encoder.resolve_query_set(&t.set, 0..6, &t.resolve, u64::from(t.frame) * 256);
+                scope(Scope::OtherLibrary, || {
+                    encoder.resolve_query_set(&t.set, 0..6, &t.resolve, u64::from(t.frame) * 256)
+                });
             }
             t.frame += 1;
         }
