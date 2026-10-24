@@ -1,0 +1,18 @@
+# Terms that must not appear in this repository (AGENTS.md).
+# One term per line. '#' starts a comment line. Blank lines are ignored.
+# Latin terms (letters and digits, words separated by space, '-' or '_') match
+# whole words in any case, width, or camelCase; terms with Han, Kana, or
+# Hangul characters match anywhere.
+# Do not add explanations or context next to terms.
+
+beat mania
+IIDX
+INFINITAS
+BEMANI
+Konami
+ビートマニア
+コナミ
+e amusement
+インフィニタス
+ビーマニ
+イーアミューズメント

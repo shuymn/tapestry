@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 cargo_metadata.workspace = true
+encoding_rs.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

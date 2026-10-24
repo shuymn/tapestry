@@ -91,6 +91,8 @@ jobs:
           actual=$(mise exec -- rustc --version | cut -d' ' -f2)
           test "$expected" = "$actual"
           mise exec -- rustc -Vv
+      - name: Banned words
+        run: mise exec -- cargo xtask banned-words --all
       - name: Format
         run: mise exec -- cargo fmt --all --check
       - name: Architecture rules
