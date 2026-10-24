@@ -153,6 +153,12 @@ jobs:
           # The API refuses to enable auto-merge on a PR that is already
           # mergeable (CI passed after an earlier run failed to enable it);
           # `gh pr merge --auto` merges such a PR at once instead.
+          # Without required checks that would also merge while CI is pending or
+          # failing, so leave the PR to a human until a ruleset requires CI.
           if [ "$(printf '%s' "$pr" | jq '.auto_merge == null')" = true ]; then
+            if [ "$(gh api "repos/$repo/rules/branches/$BASE_BRANCH" --jq 'any(.[]; .type == "required_status_checks")')" != true ]; then
+              echo "::error::$BASE_BRANCH has no required status checks; not enabling auto-merge"
+              exit 1
+            fi
             gh pr merge -R "$repo" --auto --merge "$(printf '%s' "$pr" | jq -r .number)"
           fi
