@@ -2,8 +2,10 @@
 //! settings), written by `obs-files --out <dir>` so the scene collection
 //! can name the overlay page by its absolute path in the unzipped bundle.
 //! The owner imports them in OBS (Profile > Import, Scene Collection >
-//! Import) once per PC and sets Settings > Video > Base (Canvas) to the
-//! game's resolution.
+//! Import) once per PC. The canvas (base resolution) is the game's native
+//! resolution (`--canvas WxH`, or the mode of `--monitor`); the game and
+//! the overlay are fitted to it, and OBS scales the canvas to the 1920×1080
+//! output.
 //!
 //! Profiles (one per encoder family, H.264 CBR 6000 kbps, keyframe 2 s,
 //! Advanced output, no encoder-side rescale, recording not started):
@@ -14,8 +16,9 @@
 //! to the bundle's MediaMTX at rtmp://127.0.0.1:1935/live.
 //!
 //! Scene collection `tapestry-spike`: game capture of the spike's window
-//! (cursor off) and one local browser source (`overlay.html`, 1920×1080 at
-//! 30 fps).
+//! (cursor off, the game's own audio captured with it, since the collection
+//! has no desktop audio source) and one local browser source
+//! (`overlay.html`, 1920×1080 at 30 fps).
 
 use serde_json::{Value, json};
 use std::path::Path;
@@ -38,7 +41,7 @@ pub fn profiles() -> Vec<(&'static str, &'static str, Value)> {
         (
             "tapestry-spike-nvenc",
             "obs_nvenc_h264_tex",
-            common(json!({"preset2": "p5", "tune": "hq", "multipass": "qres"})),
+            common(json!({"preset": "p5", "tune": "hq", "multipass": "qres"})),
         ),
         (
             "tapestry-spike-amf",
@@ -58,7 +61,41 @@ pub fn profiles() -> Vec<(&'static str, &'static str, Value)> {
     ]
 }
 
-fn basic_ini(name: &str, encoder: &str) -> String {
+/// Settings keys each encoder reads in OBS 33 (its properties); a key
+/// outside these is ignored by OBS and leaves the default in place.
+#[cfg(test)]
+fn encoder_keys(encoder: &str) -> &'static [&'static str] {
+    match encoder {
+        "obs_nvenc_h264_tex" => &[
+            "rate_control",
+            "bitrate",
+            "keyint_sec",
+            "preset",
+            "tune",
+            "multipass",
+            "profile",
+        ],
+        "h264_texture_amf" => &["rate_control", "bitrate", "keyint_sec", "preset", "profile"],
+        "obs_qsv11_v2" => &[
+            "rate_control",
+            "bitrate",
+            "keyint_sec",
+            "target_usage",
+            "profile",
+        ],
+        "obs_x264" => &[
+            "rate_control",
+            "bitrate",
+            "keyint_sec",
+            "preset",
+            "profile",
+            "tune",
+        ],
+        _ => &[],
+    }
+}
+
+fn basic_ini(name: &str, encoder: &str, (cw, ch): (u32, u32)) -> String {
     format!(
         "[General]
 Name={name}
@@ -76,8 +113,8 @@ Track1Bitrate=160
 RecType=Standard
 
 [Video]
-BaseCX=1920
-BaseCY=1080
+BaseCX={cw}
+BaseCY={ch}
 OutputCX=1920
 OutputCY=1080
 FPSType=0
@@ -94,8 +131,11 @@ ChannelSetup=Stereo
     )
 }
 
-pub fn scene_collection(overlay: &Path) -> Value {
+/// The scene collection for a `canvas` (width, height): both items are
+/// scaled to fit the whole canvas.
+pub fn scene_collection(overlay: &Path, (cw, ch): (u32, u32)) -> Value {
     let overlay = overlay.to_string_lossy().replace('\\', "/");
+    let fit = json!({"x": f64::from(cw), "y": f64::from(ch)});
     json!({
         "name": COLLECTION,
         "current_scene": "spike",
@@ -122,7 +162,7 @@ pub fn scene_collection(overlay: &Path) -> Value {
                             "align": 5,
                             "bounds_type": 2,
                             "bounds_align": 0,
-                            "bounds": {"x": 1920.0, "y": 1080.0}
+                            "bounds": fit
                         },
                         {
                             "name": "overlay",
@@ -132,7 +172,9 @@ pub fn scene_collection(overlay: &Path) -> Value {
                             "pos": {"x": 0.0, "y": 0.0},
                             "scale": {"x": 1.0, "y": 1.0},
                             "align": 5,
-                            "bounds_type": 0
+                            "bounds_type": 2,
+                            "bounds_align": 0,
+                            "bounds": fit
                         }
                     ]
                 }
@@ -145,7 +187,8 @@ pub fn scene_collection(overlay: &Path) -> Value {
                     "capture_mode": "window",
                     "window": "tapestry-spike:Window Class:tapestry-spike.exe",
                     "priority": 2,
-                    "capture_cursor": false
+                    "capture_cursor": false,
+                    "capture_audio": true
                 }
             },
             {
@@ -167,14 +210,14 @@ pub fn scene_collection(overlay: &Path) -> Value {
     })
 }
 
-/// `obs-files --out <dir> [--overlay <html>]`.
-pub fn write(out: &Path, overlay: &Path) -> Result<(), String> {
+/// `obs-files --out <dir> [--overlay <html>]` for a `canvas`.
+pub fn write(out: &Path, overlay: &Path, canvas: (u32, u32)) -> Result<(), String> {
     let overlay = std::path::absolute(overlay).map_err(|e| e.to_string())?;
     let io = |e: std::io::Error| e.to_string();
     for (name, encoder, settings) in profiles() {
         let dir = out.join("profiles").join(name);
         std::fs::create_dir_all(&dir).map_err(io)?;
-        std::fs::write(dir.join("basic.ini"), basic_ini(name, encoder)).map_err(io)?;
+        std::fs::write(dir.join("basic.ini"), basic_ini(name, encoder, canvas)).map_err(io)?;
         std::fs::write(dir.join("streamEncoder.json"), settings.to_string()).map_err(io)?;
         let service = json!({"type": "rtmp_custom", "settings": {
             "server": SERVER, "key": STREAM_KEY, "use_auth": false, "bwtest": false}});
@@ -184,11 +227,14 @@ pub fn write(out: &Path, overlay: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&scenes).map_err(io)?;
     std::fs::write(
         scenes.join(format!("{COLLECTION}.json")),
-        serde_json::to_vec_pretty(&scene_collection(&overlay)).map_err(|e| e.to_string())?,
+        serde_json::to_vec_pretty(&scene_collection(&overlay, canvas))
+            .map_err(|e| e.to_string())?,
     )
     .map_err(io)?;
     println!(
-        "obs-files: profiles and scene collection in {} (import in OBS; set Base (Canvas) to the game's resolution)",
+        "obs-files: profiles and scene collection for a {}x{} canvas in {} (import both in OBS)",
+        canvas.0,
+        canvas.1,
         out.display()
     );
     Ok(())
@@ -202,7 +248,12 @@ mod tests {
     // The profiles carry the workload V7 checks in the log (§4.1).
     #[test]
     fn profiles_match_the_procedure_settings() {
-        for (name, _, s) in profiles() {
+        for (name, encoder, s) in profiles() {
+            // Only keys OBS reads for this encoder (an unread key would
+            // leave OBS's default in place unnoticed).
+            for k in s.as_object().unwrap().keys() {
+                assert!(encoder_keys(encoder).contains(&k.as_str()), "{name}: {k}");
+            }
             let get = |k: &str| s.get(k).and_then(Value::as_str).map(str::to_owned);
             let family = match name {
                 "tapestry-spike-nvenc" => EncoderFamily::Nvenc,
@@ -216,7 +267,7 @@ mod tests {
                 codec: Some("h264".into()),
                 rate_control: get("rate_control"),
                 bitrate_kbps: s.get("bitrate").and_then(Value::as_u64).map(|b| b as u32),
-                preset: get("preset2").or(get("preset")),
+                preset: get("preset"),
                 profile: get("profile"),
                 tune: get("tune").filter(|_| family == EncoderFamily::X264),
                 tuning: get("tune").filter(|_| family == EncoderFamily::Nvenc),
@@ -227,5 +278,41 @@ mod tests {
             };
             assert!(e.matches_procedure(), "{name}: {e:?}");
         }
+    }
+
+    #[test]
+    fn game_and_overlay_fill_the_canvas_at_any_native_resolution() {
+        for canvas in [(1920, 1080), (2560, 1440), (3840, 2160)] {
+            let c = scene_collection(Path::new("C:/bundle/obs/overlay.html"), canvas);
+            let items = c["sources"][0]["settings"]["items"].as_array().unwrap();
+            for item in items {
+                assert_eq!(item["bounds_type"], 2, "{item}");
+                assert_eq!(item["bounds"]["x"], f64::from(canvas.0));
+                assert_eq!(item["bounds"]["y"], f64::from(canvas.1));
+                assert_eq!(
+                    (item["pos"]["x"].as_f64(), item["pos"]["y"].as_f64()),
+                    (Some(0.0), Some(0.0))
+                );
+            }
+            let ini = basic_ini("p", "obs_x264", canvas);
+            assert!(ini.contains(&format!("BaseCX={}\nBaseCY={}\n", canvas.0, canvas.1)));
+            assert!(ini.contains("OutputCX=1920\nOutputCY=1080\n"));
+        }
+    }
+
+    #[test]
+    fn game_capture_captures_the_game_audio() {
+        let c = scene_collection(Path::new("o.html"), (1920, 1080));
+        let game = &c["sources"][1];
+        assert_eq!(game["id"], "game_capture");
+        assert_eq!(game["settings"]["capture_audio"], true);
+        // No other audio source is defined, so the game's own audio is the
+        // stream's audio.
+        let sources = c["sources"].as_array().unwrap();
+        assert!(
+            sources
+                .iter()
+                .all(|s| !s["id"].as_str().unwrap().contains("wasapi"))
+        );
     }
 }
