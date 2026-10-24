@@ -249,6 +249,9 @@ pub fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         (None, None) => None,
         _ => return Err("--inject-gap-every-s and --inject-gap-ms go together (both > 0)".into()),
     };
+    if audio.starve_ms == Some(0) {
+        return Err("--starve-ms must be above 0".into());
+    }
     if !audio_on && (audio.inject.is_some() || audio.starve_ms.is_some()) {
         // S0's checks need the audio stream; a null run would pass them
         // without evidence.
@@ -469,6 +472,7 @@ mod tests {
             .is_err()
         );
         assert!(parse_run(&args(&["--out", "o", "--starve-ms", "50"])).is_ok());
+        assert!(parse_run(&args(&["--out", "o", "--starve-ms", "0"])).is_err());
     }
 
     #[test]

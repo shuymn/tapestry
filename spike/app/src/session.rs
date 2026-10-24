@@ -209,6 +209,12 @@ pub fn audio_check(a: Option<&AudioSummary>, inject: bool, starve: bool) -> Audi
     if c.exit == 2 {
         return c;
     }
+    // S0's detections count only on valid audio evidence (V6: calibrated,
+    // no unverifiable span, capture covering play).
+    if (inject || starve) && !a.v6.ok {
+        c.reasons
+            .push(format!("V6 invalid ({})", a.v6.reasons.join(", ")));
+    }
     if inject {
         match &a.injection {
             Some(i) if i.injected > 0 && i.matched == i.injected && i.episodes == i.injected => {}
@@ -233,7 +239,14 @@ pub fn audio_check(a: Option<&AudioSummary>, inject: bool, starve: bool) -> Audi
                 .iter()
                 .filter(|e| (st.at_us..to).contains(&(e.start_us - a.play_start_us)))
                 .count();
-            if st.exceeds_queued && (episodes == 0 || st.padding_zero_wakes == 0) {
+            // A withholding shorter than the queued audio never starves
+            // the device: it checks nothing, so S0 fails.
+            if !st.exceeds_queued {
+                c.reasons.push(format!(
+                    "starvation at {} us: withheld {} ms did not exceed the {} us queued",
+                    st.at_us, st.withheld_ms, st.queued_us
+                ));
+            } else if episodes == 0 || st.padding_zero_wakes == 0 {
                 c.reasons.push(format!(
                     "starvation at {} us: {episodes} episodes, {} empty-buffer wakes (both must be found)",
                     st.at_us, st.padding_zero_wakes
@@ -683,6 +696,18 @@ mod tests {
         a.render.as_mut().unwrap().starves = vec![starve(3)];
         // Withheld, no episode.
         assert_eq!(audio_check(Some(&a), false, true).exit, 1);
+        // Withheld less than was queued: never starved, so S0 fails even
+        // with an episode found elsewhere.
+        a.render.as_mut().unwrap().starves = vec![Starve {
+            exceeds_queued: false,
+            ..starve(0)
+        }];
+        a.facts.episodes = vec![Episode {
+            start_us: 5_000_000 + 10_030_000,
+            end_us: 5_000_000 + 10_060_000,
+        }];
+        assert_eq!(audio_check(Some(&a), false, true).exit, 1);
+        a.render.as_mut().unwrap().starves = vec![starve(3)];
         a.facts.episodes = vec![Episode {
             start_us: 5_000_000 + 10_030_000,
             end_us: 5_000_000 + 10_060_000,
@@ -690,6 +715,20 @@ mod tests {
         assert_eq!(audio_check(Some(&a), false, true).exit, 0);
         a.render.as_mut().unwrap().starves = vec![starve(0)];
         assert_eq!(audio_check(Some(&a), false, true).exit, 1);
+    }
+
+    #[test]
+    fn s0_needs_valid_audio_evidence() {
+        let mut a = summary();
+        a.injection = injection(12, 12, 12);
+        assert_eq!(audio_check(Some(&a), true, false).exit, 0);
+        a.v6.ok = false;
+        a.v6.reasons = vec!["unverifiable-spans".into()];
+        let c = audio_check(Some(&a), true, false);
+        assert_eq!(c.exit, 1);
+        assert!(c.reasons[0].contains("V6"), "{:?}", c.reasons);
+        // A run without S0 checks is judged by the report's V6, not here.
+        assert_eq!(audio_check(Some(&a), false, false).exit, 0);
     }
 
     #[test]
