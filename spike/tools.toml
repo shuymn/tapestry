@@ -1,0 +1,22 @@
+# Third-party tools for the stage 0 spike, pinned by URL and SHA-256.
+# `scripts/fetch-tools.sh` downloads them into third_party/ and writes
+# licenses/. Neither is committed; the bundle ships only to the owner's PCs.
+
+[ffmpeg]
+# BtbN FFmpeg-Builds, dated autobuild (the rolling `latest` tag is never
+# used). LGPL shared build of FFmpeg 9.0 for ffmpeg-next 9.x. BtbN prunes
+# old autobuilds; when this one is gone, pin a newer one here.
+release = "autobuild-2026-10-23-13-04"
+build_scripts_commit = "937868360a21d711ec94a33f5591d345ad9b7754"
+asset = "ffmpeg-n9.0.2-35-g9a9b70bb8c-win64-lgpl-shared-9.0.zip"
+url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-23-13-04/ffmpeg-n9.0.2-35-g9a9b70bb8c-win64-lgpl-shared-9.0.zip"
+sha256 = "8e06443f9cb7f25cb79f4e08082e9d53bc1aed51dcb36e25f3ff24c6c4e790a6"
+# FFmpeg source commit the build was made from (from the version string).
+source_commit = "9a9b70bb8c"
+
+[presentmon]
+version = "2.6.0"
+url = "https://github.com/GameTechDev/PresentMon/releases/download/v2.6.0/PresentMon-2.6.0-x64.exe"
+sha256 = "b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af"
+license_url = "https://raw.githubusercontent.com/GameTechDev/PresentMon/e13fce6acdb55a808fd8318175a56863e532d95f/LICENSE.txt"
+license_sha256 = "4c949341b1893c8c6ad82f7fb4eedf622cd1fd9c22a9af8f19b2dac19d1947b6"
