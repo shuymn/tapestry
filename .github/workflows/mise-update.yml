@@ -1,0 +1,157 @@
+name: Update mise tools
+
+# Re-resolve the version ranges in mise.toml and propose the new mise.lock.
+# `mise lock --bump` only reads release metadata and writes the lockfile; it
+# never installs or runs the tools, so the App token is created in the same job
+# after it. Only tools whose version changes are re-locked, so checksums of
+# unchanged versions stay pinned. The PR is opened with an App token because
+# PRs created with GITHUB_TOKEN do not run CI unattended, so auto-merge would
+# never get checks.
+
+on:
+  schedule:
+    - cron: "23 21 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mise-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      BRANCH: mise-update
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.12
+          install: false
+          cache: false
+
+      - name: Update lockfile
+        id: lock
+        env:
+          MISE_GITHUB_TOKEN: ${{ github.token }}
+          MISE_YES: 1
+        run: |
+          set -eu
+          mise lock --bump --dry-run --json >"$RUNNER_TEMP/changes.json"
+          if [ "$(jq length "$RUNNER_TEMP/changes.json")" -eq 0 ]; then
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jq -r '.[].name' "$RUNNER_TEMP/changes.json" | while IFS= read -r tool; do
+            mise lock --bump "$tool" </dev/null
+          done
+          echo "changed=true" >>"$GITHUB_OUTPUT"
+          echo "rust=$(jq 'any(.[]; .name == "rust")' "$RUNNER_TEMP/changes.json")" >>"$GITHUB_OUTPUT"
+
+      # flake.nix takes the Rust version from mise.lock, so rust-overlay must
+      # know the new version. The eval fails if it does not.
+      - if: steps.lock.outputs.rust == 'true'
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Update rust-overlay
+        if: steps.lock.outputs.rust == 'true'
+        run: |
+          nix flake update rust-overlay
+          nix eval .#devShells.x86_64-linux.default.drvPath
+
+      - name: Check changed files
+        if: steps.lock.outputs.changed == 'true'
+        run: |
+          set -eu
+          status=$(git status --porcelain --untracked-files=all)
+          if [ "$status" != " M mise.lock" ] && [ "$status" != "$(printf ' M flake.lock\n M mise.lock')" ]; then
+            printf 'unexpected changed files:\n%s\n' "$status" >&2
+            exit 1
+          fi
+          {
+            echo "| Tool | From | To |"
+            echo "| --- | --- | --- |"
+            jq -r '.[] | "| `\(.name)` | \(.old_versions | join(", ")) | \(.new_versions | join(", ")) |"' "$RUNNER_TEMP/changes.json"
+          } >"$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Create App token
+        if: steps.lock.outputs.changed == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open pull request
+        if: steps.lock.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BASE_BRANCH: ${{ github.ref_name }}
+          COMMIT_QUERY: >-
+            mutation($input: CreateCommitOnBranchInput!) {
+              createCommitOnBranch(input: $input) { commit { oid } }
+            }
+        run: |
+          set -eu
+          repo=$GITHUB_REPOSITORY
+          # The branch is current when both managed files match. Otherwise start
+          # over from the current base; deleting the branch closes its stale PR.
+          current=false
+          if gh api "repos/$repo/git/ref/heads/$BRANCH" --silent 2>/dev/null; then
+            current=true
+            for path in mise.lock flake.lock; do
+              proposed=$(gh api "repos/$repo/contents/$path?ref=$BRANCH" --jq .sha)
+              if [ "$proposed" != "$(git hash-object "$path")" ]; then
+                current=false
+              fi
+            done
+            if [ "$current" = false ]; then
+              gh api -X DELETE "repos/$repo/git/refs/heads/$BRANCH"
+            fi
+          fi
+
+          if [ "$current" = false ]; then
+            gh api -X POST "repos/$repo/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$GITHUB_SHA" >/dev/null
+            # createCommitOnBranch produces a signed commit.
+            jq -n \
+              --arg query "$COMMIT_QUERY" \
+              --arg repository "$repo" \
+              --arg branch "$BRANCH" \
+              --arg head "$GITHUB_SHA" \
+              --rawfile mise mise.lock \
+              --rawfile flake flake.lock \
+              '{query: $query, variables: {input: {branch: {repositoryNameWithOwner: $repository, branchName: $branch}, expectedHeadOid: $head, message: {headline: "Update mise tools"}, fileChanges: {additions: [{path: "mise.lock", contents: ($mise | @base64)}, {path: "flake.lock", contents: ($flake | @base64)}]}}}}' \
+              >"$RUNNER_TEMP/commit.json"
+            gh api graphql --input "$RUNNER_TEMP/commit.json" >/dev/null
+            pr=
+          else
+            echo "$BRANCH already proposes these lockfiles"
+            pr=$(gh api "repos/$repo/pulls?head=${repo%%/*}:$BRANCH&base=$BASE_BRANCH&state=open" --jq '.[0] // empty')
+          fi
+
+          # Keep exactly one open PR from the branch, with auto-merge enabled.
+          if [ -z "$pr" ]; then
+            pr=$(gh api -X POST "repos/$repo/pulls" \
+              -f title="Update mise tools" \
+              -f head="$BRANCH" \
+              -f base="$BASE_BRANCH" \
+              -F body=@"$RUNNER_TEMP/body.md")
+            echo "opened #$(printf '%s' "$pr" | jq -r .number)"
+          fi
+          # --auto enables auto-merge, or merges at once if the PR already
+          # meets the required checks.
+          if [ "$(printf '%s' "$pr" | jq '.auto_merge == null')" = true ]; then
+            gh pr merge -R "$repo" --auto --merge "$(printf '%s' "$pr" | jq -r .number)"
+          fi
