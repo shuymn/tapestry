@@ -197,6 +197,8 @@ const JSON_KEYS: &[&str] = &[
     "tuning",
     "multipass",
     "target_usage",
+    "width",
+    "height",
     "encoder",
     "family",
     "rate_control",

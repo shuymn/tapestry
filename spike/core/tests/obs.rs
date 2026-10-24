@@ -324,6 +324,30 @@ fn f_encoder_workload_mismatch_is_invalid() {
 }
 
 #[test]
+fn f_encoder_scaling_below_the_output_size_is_invalid() {
+    // The canvas output stays 1080p but the encoder rescales to 720p.
+    for enc in [Enc::X264, Enc::Nvenc, Enc::Amf, Enc::Qsv] {
+        let log = Log {
+            enc,
+            edits: vec![("1920", "1280"), ("1080", "720")],
+            ..Log::default()
+        };
+        // Restore the common video block: only the encoder lines say 720p.
+        let text = log.text().replace(
+            "output resolution: 1280x720",
+            "output resolution: 1920x1080",
+        );
+        let mut run = passing_obs_run();
+        run.info.obs_encoder = Some(enc.class());
+        run.obs = Some(derive(&text, PLAY));
+        assert_eq!(
+            evaluate(&run).check("V7").reasons,
+            vec!["obs-settings-mismatch"]
+        );
+    }
+}
+
+#[test]
 fn f_common_video_settings_come_from_the_video_block() {
     for (from, to) in [
         ("fps:               60/1", "fps:               30/1"),

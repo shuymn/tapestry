@@ -169,6 +169,8 @@ pub fn passing_obs_run() -> RunData {
                 preset: Some("veryfast".into()),
                 profile: Some("high".into()),
                 tune: Some("(null)".into()),
+                width: Some(1920),
+                height: Some(1080),
                 ..ObsEncoderSettings::default()
             }),
             frames_output: Some(37_800),

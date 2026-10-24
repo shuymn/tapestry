@@ -70,6 +70,11 @@ pub struct ObsEncoderSettings {
     pub multipass: Option<String>,
     /// QSV `target_usage`.
     pub target_usage: Option<String>,
+    /// Encoded frame size. Every supported encoder logs it; it must be the
+    /// output size, or the encoder scales the stream (for example to 720p
+    /// while the canvas is 1080p).
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// The output video settings (`video settings reset:` block).
@@ -183,7 +188,10 @@ impl ObsEncoderSettings {
     /// veryfast/high/no tune, NVENC P5/HQ/two-pass quarter resolution/high,
     /// AMF quality/high, QSV balanced (TU4)/high.
     pub fn matches_procedure(&self) -> bool {
-        let common = is(&self.rate_control, "CBR") && self.bitrate_kbps == Some(BITRATE_KBPS);
+        let common = is(&self.rate_control, "CBR")
+            && self.bitrate_kbps == Some(BITRATE_KBPS)
+            && self.width == Some(OUTPUT_WIDTH)
+            && self.height == Some(OUTPUT_HEIGHT);
         let family = match self.family {
             Some(EncoderFamily::X264) => {
                 is(&self.preset, "veryfast")
@@ -446,6 +454,8 @@ fn apply_encoder(enc: &mut ObsEncoderSettings, key: &str, value: &str) {
         "tuning" => enc.tuning = s(),
         "multipass" => enc.multipass = s(),
         "target_usage" => enc.target_usage = s(),
+        "width" => enc.width = leading_u64(value).and_then(|v| u32::try_from(v).ok()),
+        "height" => enc.height = leading_u64(value).and_then(|v| u32::try_from(v).ok()),
         _ => {}
     }
 }
