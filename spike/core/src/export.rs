@@ -722,7 +722,10 @@ pub fn markdown(s: &Summary, run: &RunData, cond: &PublicConditions) -> String {
             g.applies,
             g.pass,
             ms(g.value),
-            g.threshold.map_or("—".into(), |t| t.to_string()),
+            g.threshold.map_or("—".into(), |t| {
+                let t = format!("{t:.4}");
+                t.trim_end_matches('0').trim_end_matches('.').to_owned()
+            }),
             g.unit,
             g.samples
         );
