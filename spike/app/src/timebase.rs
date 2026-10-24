@@ -1,7 +1,12 @@
 //! QPC time base (design D3: QPC→µs via i128 multiply-then-divide).
 
 use std::sync::OnceLock;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::Threading::{
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer,
+    TIMER_ALL_ACCESS, WaitForSingleObject,
+};
 
 fn freq() -> i64 {
     static FREQ: OnceLock<i64> = OnceLock::new();
@@ -43,3 +48,49 @@ impl Clock {
         self.to_us(qpc())
     }
 }
+
+/// High-resolution waitable timer (frame cap, input thread tick); no
+/// `timeBeginPeriod` (design D3 coexistence rules).
+pub struct HiResTimer(HANDLE);
+
+impl HiResTimer {
+    pub fn new() -> Result<Self, String> {
+        // SAFETY: plain timer creation; the handle is owned by this value.
+        let h = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                windows::core::PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+        }
+        .map_err(|e| format!("CreateWaitableTimerExW: {e}"))?;
+        Ok(Self(h))
+    }
+
+    /// Sleeps until QPC `deadline` (no spinning).
+    pub fn wait_until(&self, deadline: i64) {
+        let left = deadline - qpc();
+        if left <= 0 {
+            return;
+        }
+        // Relative due time in 100 ns units (negative).
+        let due = -((i128::from(left) * 10_000_000 / i128::from(qpc_freq())) as i64);
+        // SAFETY: valid timer handle; no completion routine.
+        unsafe {
+            if SetWaitableTimer(self.0, &due, 0, None, None, false).is_ok() {
+                WaitForSingleObject(self.0, 1000);
+            }
+        }
+    }
+}
+
+impl Drop for HiResTimer {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned by this value.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+// SAFETY: a waitable timer handle may be used from any thread.
+unsafe impl Send for HiResTimer {}

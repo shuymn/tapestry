@@ -5,13 +5,18 @@
 //! tapestry-spike gen-assets --ffmpeg <exe> --out <dir> [--seconds N]
 //! tapestry-spike run --out <dir> [--bga <video>] [--fps-cap N]
 //!     [--loops N | --duration-s N] [--window WxH]
+//!     [--audio wasapi|null] [--audio-period min|next|<frames>]
+//!     [--audio-device <part>] [--inject-gap-every-s N --inject-gap-ms M]
+//!     [--starve-ms N]
 //!     [--offscreen WxH --adapter warp --audio null --frames N]
+//! tapestry-spike audio-devices
 //! ```
 //!
 //! `--version` reports the build and the linked FFmpeg with the license its
 //! libraries report, and exits 1 unless both avcodec and avutil are LGPL.
 
 mod alloc;
+mod audio;
 mod bga;
 mod display;
 mod gen_assets;
@@ -19,6 +24,8 @@ mod pacing;
 mod render;
 mod run;
 mod scene;
+mod session;
+mod threads;
 mod timebase;
 mod window;
 
@@ -33,8 +40,11 @@ const USAGE: &str = "usage:
   tapestry-spike --version
   tapestry-spike gen-assets --ffmpeg <exe> --out <dir> [--seconds N]
   tapestry-spike displays
+  tapestry-spike audio-devices
   tapestry-spike run --out <dir> [--bga <video>] [--fps-cap N] [--loops N | --duration-s N]
       [--window WxH] [--monitor <part>] [--adapter warp|hardware|low-power | --adapter-name <part>]
+      [--audio wasapi|null] [--audio-period min|next|<frames>] [--audio-device <part>]
+      [--inject-gap-every-s N --inject-gap-ms M] [--starve-ms N]
       [--offscreen WxH --audio null --frames N]";
 
 fn main() -> ExitCode {
@@ -46,6 +56,9 @@ fn main() -> ExitCode {
         Some("displays") if args.len() == 1 => {
             display::print_displays();
             Ok(ExitCode::SUCCESS)
+        }
+        Some("audio-devices") if args.len() == 1 => {
+            audio::print_endpoints().map(|()| ExitCode::SUCCESS)
         }
         _ => Err(USAGE.to_owned()),
     };
@@ -111,9 +124,18 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
         fps_cap: None,
         bga: None,
         monitor: None,
+        audio: None,
         out: PathBuf::new(),
     };
     let mut out = None;
+    let mut audio_on = true;
+    let mut audio = audio::AudioArgs {
+        period: audio::PeriodChoice::Min,
+        device: None,
+        inject: None,
+        starve_ms: None,
+    };
+    let (mut every, mut gap) = (None, None);
     for (k, v) in options(args)? {
         match k {
             "offscreen" => a.offscreen = Some(size(v)?),
@@ -131,8 +153,24 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
                 }
             }
             "adapter-name" => a.adapter = AdapterChoice::Name(v.to_owned()),
-            // Audio arrives in P3; only the null device exists yet.
-            "audio" if v == "null" => {}
+            "audio" => {
+                audio_on = match v {
+                    "wasapi" => true,
+                    "null" => false,
+                    _ => return Err(format!("--audio {v}: expected wasapi or null")),
+                }
+            }
+            "audio-period" => {
+                audio.period = match v {
+                    "min" => audio::PeriodChoice::Min,
+                    "next" => audio::PeriodChoice::Next,
+                    n => audio::PeriodChoice::Frames(num(k, n)?),
+                }
+            }
+            "audio-device" => audio.device = Some(v.to_owned()),
+            "inject-gap-every-s" => every = Some(num(k, v)?),
+            "inject-gap-ms" => gap = Some(num(k, v)?),
+            "starve-ms" => audio.starve_ms = Some(num(k, v)?),
             "frames" => a.frames = Some(num(k, v)?),
             "duration-s" => a.duration_s = Some(num(k, v)?),
             "loops" => a.loops = num(k, v)?,
@@ -144,6 +182,17 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     a.out = out.ok_or("--out is required")?;
+    audio.inject = match (every, gap) {
+        (Some(e), Some(g)) if e > 0 && g > 0 => Some((e, g)),
+        (None, None) => None,
+        _ => return Err("--inject-gap-every-s and --inject-gap-ms go together (both > 0)".into()),
+    };
+    if audio_on {
+        if a.offscreen.is_some() {
+            return Err("--offscreen runs need --audio null".into());
+        }
+        a.audio = Some(audio);
+    }
     match a.offscreen {
         Some(sz) => run::offscreen(&a, sz),
         None => window::windowed(&a),

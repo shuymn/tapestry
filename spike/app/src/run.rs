@@ -10,6 +10,7 @@ use crate::timebase::{Clock, qpc, qpc_freq};
 use serde::Serialize;
 use spike_core::chart::{CHART_LEN_US, Chart, DEFAULT_SEED};
 use spike_core::heavy::Timeline;
+use spike_core::play::Play;
 use spike_core::run::{BgaDue, EventKind, RunEvent, SpikeFrame, StreamCount, ThreadTag};
 use spike_core::stats::percentile_i64;
 use std::collections::BTreeMap;
@@ -18,9 +19,9 @@ use std::process::ExitCode;
 
 pub const COUNTDOWN_US: i64 = 5_000_000;
 /// Presenting continues this long after play so PresentMon's capture
-/// brackets the play window (V4); outside the gates and the allocation
-/// interval.
-pub const POST_PLAY_US: i64 = 2_000_000;
+/// brackets the play window (V4), and as long as audio runs after play
+/// (`audio::AUDIO_POST_US`); outside the gates and the allocation interval.
+pub const POST_PLAY_US: i64 = crate::audio::AUDIO_POST_US;
 /// Offscreen virtual frame interval (60 Hz).
 const VIRTUAL_FRAME_US: i64 = 16_667;
 
@@ -48,6 +49,8 @@ pub struct RunArgs {
     pub bga: Option<PathBuf>,
     /// Part of the monitor's name or GDI device name to run on.
     pub monitor: Option<String>,
+    /// WASAPI audio; `None` is `--audio null`.
+    pub audio: Option<crate::audio::AudioArgs>,
     pub out: PathBuf,
 }
 
@@ -508,9 +511,12 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    let mut scene = Scene::new(Chart::generate(DEFAULT_SEED));
-    let mut frame = Frame::new();
+    let chart = Chart::generate(DEFAULT_SEED);
     let n = args.frames.unwrap_or(300) as usize;
+    // Threadless presses and judgments on the virtual clock.
+    let mut play = Play::new(&chart, n as i64 * VIRTUAL_FRAME_US);
+    let mut scene = Scene::new(chart);
+    let mut frame = Frame::new();
     let mut rec = Recorder::new(n);
     let interval = bga.interval_us();
     let play_start = clock.now_us();
@@ -523,6 +529,8 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
         let virtual_us = i as i64 * VIRTUAL_FRAME_US;
         let due = (virtual_us / interval) as u64;
         let t0 = qpc();
+        play.advance_to(virtual_us, |j| scene.hit(j.note_us + j.delta_us, j.lane));
+        scene.set_score(play.judge_mut().judged());
         let load = scene.build(virtual_us, &mut frame);
         let shown = bga.step(&mut renderer, due, true)?;
         advanced &= bga.bga.is_none() || shown == Some(due);

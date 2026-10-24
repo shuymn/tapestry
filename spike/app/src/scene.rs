@@ -1,11 +1,11 @@
 //! Procedural atlas and per-frame sprite building (design D2 rendering).
 //!
-//! A temporary autoplay iterator walks the P1 chart: every note is hit at
-//! its time and spawns the per-hit effects (16-frame additive bomb over
-//! 250 ms, 24 particles, lane beam, judgment bar, combo digits). Effects are
-//! pure functions of hit time, so the only state is a fixed ring of recent
-//! hits. Building a frame writes into preallocated instance buffers and
-//! never allocates.
+//! Notes scroll from the chart; every judged press (`hit`, from the logic
+//! thread's events, or from `Play::advance_to` offscreen) spawns the per-hit
+//! effects (16-frame additive bomb over 250 ms, 24 particles, lane beam,
+//! judgment bar, combo digits). Effects are pure functions of hit time, so
+//! the only state is a fixed ring of recent hits. Building a frame writes
+//! into preallocated instance buffers and never allocates.
 
 use bytemuck::{Pod, Zeroable};
 use spike_core::chart::{CHART_LEN_US, Chart, LANES, Note};
@@ -210,9 +210,9 @@ pub struct Scene {
     track: NoteTrack,
     hits: [Hit; HIT_RING],
     hit_count: usize,
-    next_note: usize,
-    last_chart_us: i64,
     combo: u32,
+    /// Judged notes (the logic thread's snapshot), shown as the score.
+    score: u32,
     rng: SplitMix64,
 }
 
@@ -224,35 +224,25 @@ impl Scene {
             track,
             hits: [Hit::default(); HIT_RING],
             hit_count: 0,
-            next_note: 0,
-            last_chart_us: -1,
             combo: 0,
+            score: 0,
             rng: SplitMix64::new(0x5EED_0000_00FF),
         }
     }
 
-    /// Hits every note up to `play_us` (time since play start, looping the
-    /// chart).
-    fn advance(&mut self, play_us: i64) {
-        let loop_base = play_us.div_euclid(CHART_LEN_US) * CHART_LEN_US;
-        let chart_us = play_us - loop_base;
-        if chart_us < self.last_chart_us {
-            self.next_note = 0;
-        }
-        self.last_chart_us = chart_us;
-        while let Some(note) = self.chart.notes.get(self.next_note)
-            && note.time_us <= chart_us
-        {
-            let hit = Hit {
-                t_us: loop_base + note.time_us,
-                lane: note.lane,
-                seed: self.rng.next_u64() as u32,
-            };
-            self.hits[self.hit_count % HIT_RING] = hit;
-            self.hit_count += 1;
-            self.next_note += 1;
-            self.combo += 1;
-        }
+    /// A judged press on `lane` at `t_us` (µs since play start).
+    pub fn hit(&mut self, t_us: i64, lane: u8) {
+        self.hits[self.hit_count % HIT_RING] = Hit {
+            t_us,
+            lane,
+            seed: self.rng.next_u64() as u32,
+        };
+        self.hit_count += 1;
+        self.combo += 1;
+    }
+
+    pub fn set_score(&mut self, judged: u32) {
+        self.score = judged;
     }
 
     /// Builds frame `out` for play time `play_us` (negative during the
@@ -280,7 +270,6 @@ impl Scene {
             push(&mut out.alpha, i, &mut load);
         }
         if play_us >= 0 {
-            self.advance(play_us);
             self.notes_and_effects(play_us, out, &mut load);
         }
         // Gauge and score digits.
@@ -291,7 +280,7 @@ impl Scene {
         };
         push(&mut out.alpha, gauge, &mut load);
         digits(
-            u64::from(self.combo) * 2,
+            u64::from(self.score) * 2,
             7,
             [1400.0, 80.0],
             40.0,
@@ -449,15 +438,19 @@ fn digits(
 mod tests {
     use super::*;
     use spike_core::chart::DEFAULT_SEED;
+    use spike_core::play::Play;
 
     #[test]
     fn heavy_window_frames_light_all_lanes_without_overflow() {
-        let mut scene = Scene::new(Chart::generate(DEFAULT_SEED));
+        let chart = Chart::generate(DEFAULT_SEED);
+        let mut play = Play::new(&chart, CHART_LEN_US);
+        let mut scene = Scene::new(chart);
         let mut frame = Frame::new();
         let mut max = 0;
         let mut all_lanes = 0;
         for f in 0..(150 * 60) {
             let t = f * 1_000_000 / 60;
+            play.advance_to(t, |j| scene.hit(j.note_us + j.delta_us, j.lane));
             let load = scene.build(t, &mut frame);
             assert_eq!(load.dropped, 0, "at {t}");
             max = max.max(frame.alpha.len() + frame.additive.len());

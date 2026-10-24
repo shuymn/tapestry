@@ -88,6 +88,8 @@ pub struct Engine {
     mixed: u64,
     out: u64,
     injection: Option<Injection>,
+    /// Device frames before this one are silent (pilot included).
+    pilot_start: u64,
     /// Mixed samples that reached the clamp.
     pub clamped: u64,
 }
@@ -126,6 +128,7 @@ impl Engine {
             mixed: 0,
             out: 0,
             injection,
+            pilot_start: 0,
             clamped: 0,
         }
     }
@@ -156,6 +159,19 @@ impl Engine {
     /// The first mixer frame not yet mixed: a sound may start no earlier.
     pub fn mixer_frames(&self) -> u64 {
         self.mixed
+    }
+
+    /// Keeps the output silent before device frame `frame`: the pilot then
+    /// starts with a step at a known frame, long after the audio engine's
+    /// own start-up, which aligns the stream's frames with capture
+    /// positions (`pilot::OnsetFinder`).
+    pub fn set_pilot_start(&mut self, frame: u64) {
+        self.pilot_start = frame;
+    }
+
+    /// Sets the injected gaps (before the first gap is rendered).
+    pub fn set_injection(&mut self, injection: Option<Injection>) {
+        self.injection = injection;
     }
 
     pub fn mixer(&self) -> &Mixer {
@@ -235,7 +251,7 @@ impl Engine {
             };
             let (mut l, mut r) = (clamp(l), clamp(r));
             l += self.pilot.next_sample();
-            if self.injection.is_some_and(|i| i.silent(frame)) {
+            if frame < self.pilot_start || self.injection.is_some_and(|i| i.silent(frame)) {
                 (l, r) = (0.0, 0.0);
             }
             self.stage[2 * k] = l;

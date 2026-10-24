@@ -11,7 +11,8 @@ use crate::chart::{LANES, MIN_NOTES};
 use crate::heavy::Timeline;
 use crate::obslog::{EncoderFamily, ObsSession};
 use crate::run::{
-    EncoderClass, EventKind, PmFrame, Profile, Rational, RunData, RunKind, StreamCount, ThreadTag,
+    AudioFacts, EncoderClass, EventKind, PmFrame, Profile, Rational, RunData, RunKind, StreamCount,
+    ThreadTag,
 };
 use crate::stats::{percentile_f64, percentile_i64};
 use serde::{Deserialize, Serialize};
@@ -427,22 +428,34 @@ fn v5(run: &RunData) -> Check {
 }
 
 fn v6(run: &RunData) -> Check {
+    let tl = run.info.timeline;
+    audio_validity(
+        &run.audio,
+        (tl.play_start_us, tl.play_end_us()),
+        run.info.mix_rate_hz,
+    )
+}
+
+/// V6 for a play window `(start, end)`: pilot calibrated, no unverifiable
+/// loopback span, the detector's evaluated span covers play, mix rate at
+/// least 44.1 kHz. Also used by the app's local summary, whose diagnostic
+/// runs may be shorter than whole loops.
+pub fn audio_validity(audio: &AudioFacts, (start, end): (i64, i64), mix_rate_hz: u32) -> Check {
     let mut r = vec![];
-    if !run.audio.pilot_calibrated {
+    if !audio.pilot_calibrated {
         r.push("pilot-not-calibrated");
     }
-    if run.audio.unverifiable_spans > 0 {
+    if audio.unverifiable_spans > 0 {
         r.push("unverifiable-loopback-span");
     }
-    let tl = run.info.timeline;
     let covered = matches!(
-        (run.audio.capture_from_us, run.audio.capture_to_us),
-        (Some(a), Some(b)) if a <= tl.play_start_us && b >= tl.play_end_us()
+        (audio.capture_from_us, audio.capture_to_us),
+        (Some(a), Some(b)) if a <= start && b >= end
     );
     if !covered {
         r.push("loopback-does-not-cover-play");
     }
-    if run.info.mix_rate_hz < MIN_MIX_RATE_HZ {
+    if mix_rate_hz < MIN_MIX_RATE_HZ {
         r.push("mix-rate-below-44100");
     }
     check("V6", r)

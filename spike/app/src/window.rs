@@ -20,7 +20,8 @@ use crate::run::{
     event, heavy_values, instance, print_summary, summary_common, write_outputs,
 };
 use crate::scene::{Frame, Scene};
-use crate::timebase::{Clock, qpc, qpc_freq};
+use crate::session;
+use crate::timebase::{Clock, HiResTimer, qpc, qpc_freq};
 use spike_core::chart::{CHART_LEN_US, Chart, DEFAULT_SEED};
 use spike_core::heavy::Timeline;
 use spike_core::run::{EventKind, RunEvent, SpikeFrame};
@@ -29,12 +30,9 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
-use windows::Win32::System::Threading::{
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer,
-    TIMER_ALL_ACCESS, WaitForSingleObject,
-};
+use windows::Win32::System::Threading::WaitForSingleObject;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -186,41 +184,6 @@ pub fn windowed(args: &RunArgs) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// High-resolution waitable timer for the frame cap.
-struct CapTimer(HANDLE);
-
-impl CapTimer {
-    fn new() -> Result<Self, String> {
-        // SAFETY: plain timer creation; the handle is owned by this value.
-        let h = unsafe {
-            CreateWaitableTimerExW(
-                None,
-                windows::core::PCWSTR::null(),
-                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                TIMER_ALL_ACCESS.0,
-            )
-        }
-        .map_err(|e| format!("CreateWaitableTimerExW: {e}"))?;
-        Ok(Self(h))
-    }
-
-    /// Sleeps until QPC `deadline` (no spinning).
-    fn wait_until(&self, deadline: i64) {
-        let left = deadline - qpc();
-        if left <= 0 {
-            return;
-        }
-        // Relative due time in 100 ns units (negative).
-        let due = -((i128::from(left) * 10_000_000 / i128::from(qpc_freq())) as i64);
-        // SAFETY: valid timer handle; no completion routine.
-        unsafe {
-            if SetWaitableTimer(self.0, &due, 0, None, None, false).is_ok() {
-                WaitForSingleObject(self.0, 1000);
-            }
-        }
-    }
-}
-
 /// DXGI frame-statistics diagnostic (§3.2): display time of the present
 /// numbered `PresentCount` = SyncQPCTime − (SyncRefreshCount −
 /// PresentRefreshCount) × period, rejected if PresentCount did not advance,
@@ -352,6 +315,8 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let mut scene = Scene::new(Chart::generate(DEFAULT_SEED));
     let mut frame = Frame::new();
     let play_len = args.play_us();
+    // Input, logic and audio threads, behind the play barrier with this one.
+    let mut session = session::start(args.audio.clone(), clock, play_len)?;
     // Frames: countdown + play + post-play at up to 500 Hz, with margin.
     let max_frames = ((COUNTDOWN_US + play_len + POST_PLAY_US) / 2_000 + 1_000) as usize;
     let mut rec = Recorder::new(max_frames);
@@ -373,7 +338,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         Some(hz) if cap_needed(hz, refresh_mhz) => {
             let hz = u64::from(hz);
             let k = ((u64::from(refresh_mhz) + hz * 500) / (hz * 1000)).max(1);
-            Some((CapTimer::new()?, k as u32))
+            Some((HiResTimer::new()?, k as u32))
         }
         _ => None,
     };
@@ -387,7 +352,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let interval = bga.interval_us();
     // First BGA frame uploaded before the countdown (design D2).
     bga.step(&mut renderer, 0, true)?;
-    let play_start = clock.now_us() + COUNTDOWN_US;
+    let play_start = session.ready();
     let mut armed = false;
     while !shared.stop.load(Ordering::Relaxed) {
         let mut wake = Wake::Late;
@@ -438,6 +403,10 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
             }
             armed = in_play;
         }
+        while let Ok(h) = session.hits.pop() {
+            scene.hit(h.t_us, h.lane);
+        }
+        scene.set_score(session.snapshot.read().judged);
         let load = scene.build(play_us.min(play_len), &mut frame);
         let predicted_qpc =
             predictor.predict(t0, wake, dxgi.grid.anchor().map(|a| a.0), period_qpc);
@@ -498,6 +467,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         );
     }
     alloc::disarm();
+    let played = session.finish(play_start, play_len)?;
     // Pair DXGI display estimates with frames by present count.
     let by_count: HashMap<u32, i64> = trace
         .iter()
@@ -558,7 +528,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     ];
     summary.events = shared.events.lock().map_err(|e| e.to_string())?.clone();
     print_summary(&summary);
+    session::print(&played.summary);
     write_outputs(&args.out, &rec, &due, &summary)?;
+    session::write(&args.out, &played)?;
     write_private_trace(&args.out, &trace, &dxgi.raw, &dxgi.anchors, &cap_trace)?;
     Ok(())
 }

@@ -457,6 +457,64 @@ impl Detector {
     }
 }
 
+/// Finds where the pilot starts in a capture: the start of the first
+/// window whose amplitude reaches `AMPLITUDE_RATIO` of the nominal pilot.
+/// It uses the same demodulator and threshold as the detector, so the
+/// onset of the render stream (its frame 0) and an episode start are
+/// measured the same way: a rising edge at capture position `s` and a gap
+/// starting at `g` give `episode - onset` within one window of `g - s`.
+/// That aligns the render stream's frames with capture positions without
+/// either stream's timestamps.
+#[derive(Clone, Debug)]
+pub struct OnsetFinder {
+    demod: Demod,
+    base: Option<u64>,
+    next: u64,
+    found: Option<u64>,
+    /// A position jump or discontinuity before the onset: no alignment.
+    broken: bool,
+}
+
+impl OnsetFinder {
+    pub fn new(rate_hz: u32) -> Self {
+        Self {
+            demod: Demod::new(rate_hz),
+            base: None,
+            next: 0,
+            found: None,
+            broken: false,
+        }
+    }
+
+    pub fn push_packet(&mut self, pos: u64, flags: PacketFlags, samples: &[f32]) {
+        if self.found.is_some() || self.broken {
+            return;
+        }
+        let base = *self.base.get_or_insert(pos);
+        if (pos != self.next && self.next != 0) || (flags.discontinuity && pos != base) {
+            self.broken = true;
+            return;
+        }
+        for &x in samples {
+            if let Some(w) = self.demod.push(if flags.silent { 0.0 } else { x })
+                && w.amplitude >= AMPLITUDE_RATIO * PILOT_AMPLITUDE
+            {
+                self.found = Some(base + w.start_sample);
+                return;
+            }
+        }
+        self.next = pos + samples.len() as u64;
+    }
+
+    pub fn onset(&self) -> Option<u64> {
+        self.found
+    }
+
+    pub fn broken(&self) -> bool {
+        self.broken
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +544,38 @@ mod tests {
         }
         // 492 = 41 hops: the last full window ends at the last sample.
         assert!(d.trailing().is_none());
+    }
+
+    #[test]
+    fn onset_and_gap_are_measured_alike() {
+        // Silence, then the pilot from capture position 1_000 + 3_000 (the
+        // stream's frame 0), then a 2 ms gap at stream frame 48_000.
+        let rate = 48_000;
+        let base = 1_000u64;
+        let (start, gap) = (3_000usize, 48_000usize);
+        let mut o = PilotOscillator::new(rate);
+        let mut s = vec![0.0f32; start];
+        for f in 0..96_000usize {
+            let x = o.next_sample();
+            s.push(if (gap..gap + 96).contains(&f) { 0.0 } else { x });
+        }
+        let mut finder = OnsetFinder::new(rate);
+        for (k, c) in s.chunks(480).enumerate() {
+            finder.push_packet(base + (k * 480) as u64, PacketFlags::default(), c);
+        }
+        let onset = finder.onset().expect("pilot found");
+        let cal = calibrate(&s[start + 4_800..start + 40_000], rate).unwrap();
+        let mut d = Detector::new(rate, cal);
+        for (k, c) in s.chunks(480).enumerate() {
+            d.push_packet(base + (k * 480) as u64, PacketFlags::default(), c);
+        }
+        let r = d.finish();
+        let eps: Vec<u64> = r.episodes.iter().map(|e| e.start_sample).collect();
+        // The silent lead-in is an episode too; the gap is the last one.
+        let ep = *eps.last().unwrap();
+        let measured = ep as i64 - onset as i64;
+        assert!((measured - gap as i64).abs() <= 48, "{measured} vs {gap}");
+        assert!(onset.abs_diff(base + start as u64) <= 48, "{onset}");
     }
 
     #[test]
