@@ -60,11 +60,20 @@ struct Row {
     ms_until_displayed: Option<f64>,
 }
 
+/// `NA` or empty is `None`; anything else must be a finite, non-negative
+/// duration (`inf`, `NaN` and negative values make the row malformed).
 fn na<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
     let s = String::deserialize(d)?;
     match s.trim() {
         "NA" | "" => Ok(None),
-        v => v.parse().map(Some).map_err(serde::de::Error::custom),
+        v => {
+            let x: f64 = v.parse().map_err(serde::de::Error::custom)?;
+            if x.is_finite() && x >= 0.0 {
+                Ok(Some(x))
+            } else {
+                Err(serde::de::Error::custom("non-finite or negative duration"))
+            }
+        }
     }
 }
 
@@ -178,5 +187,22 @@ mod tests {
             parse(csv.as_bytes(), "x", CLOCK).1,
             Some(PmError::MissingColumn)
         );
+    }
+
+    #[test]
+    fn non_finite_or_negative_durations_are_malformed() {
+        for bad in ["inf", "NaN", "-1.0"] {
+            let r = row("tapestry-spike.exe", 1_000_166_667, true).replace("1.0500", bad);
+            let csv = format!(
+                "{HEADER}
+{r}
+"
+            );
+            assert_eq!(
+                parse(csv.as_bytes(), "tapestry-spike.exe", CLOCK).1,
+                Some(PmError::BadRow(2)),
+                "{bad}"
+            );
+        }
     }
 }

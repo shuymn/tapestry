@@ -406,6 +406,9 @@ fn gates(run: &RunData, tl: &Timeline, target_hz: Option<u32>) -> (Vec<Gate>, Re
     let t_ms = target_hz.map(|hz| 1000.0 / f64::from(hz));
 
     // G1 / G1r.
+    // TODO(P5): PresentMon prints durations rounded to a fixed number of
+    // decimals, so a frame exactly one refresh apart may print above T
+    // (16.6667 > 1000/60). Settle the comparison with a real CSV in P5.
     let intervals: Vec<f64> = heavy_pm
         .iter()
         .filter_map(|f| f.display_change_ms)
