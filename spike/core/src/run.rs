@@ -99,6 +99,10 @@ pub struct SpikeFrame {
     pub render_cpu_us: u32,
     /// Diagnostic only.
     pub present_call_us: u32,
+    /// The spike's own present count for this frame (`GetLastPresentCount`
+    /// after its Present); pairs the frame with DXGI statistics and, for
+    /// V4, with PresentMon rows. `None` offscreen or if the call failed.
+    pub present_count: Option<u32>,
     pub visible_notes: u32,
     pub effect_instances: u32,
     pub lanes_with_effects: u8,

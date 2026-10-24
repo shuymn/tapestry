@@ -225,6 +225,7 @@ const CSV_COLUMNS: &[&str] = &[
     "gpu_busy_ms",
     "render_cpu_us",
     "present_call_us",
+    "present_count",
     "visible_notes",
     "effect_instances",
     "lanes_with_effects",
