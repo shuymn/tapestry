@@ -103,7 +103,7 @@ fn is_word_term(term: &str) -> bool {
         && term.ends_with(|c: char| c.is_ascii_alphanumeric())
 }
 
-/// Every match of every term in `text` (one NFKC line or path).
+/// Every match of every term in `text` (NFKC contents or path).
 pub fn find(terms: &[Term], text: &str) -> Vec<Hit> {
     let mut hits = Vec::new();
     let tokens = tokenize(text);

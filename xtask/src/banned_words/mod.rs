@@ -181,13 +181,15 @@ fn check_file(terms: &[Term], list_name: &str, path: &str, contents: Option<&[u8
     if is_content_exempt(path) || bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0) {
         return diagnostics;
     }
-    let text = decode(bytes);
-    for (i, line) in text.lines().enumerate() {
-        let line = nfkc(line);
-        for hit in matcher::find(terms, &line) {
-            let col = line[..hit.start].chars().count() + 1;
-            diagnostics.push(format!("{shown_path}:{}:{col}: {}", i + 1, label(&hit)));
-        }
+    // The whole text at once, so a line ending between the words of a term
+    // (wrapped prose) is a separator like any other.
+    let text = nfkc(&decode(bytes));
+    for hit in matcher::find(terms, &text) {
+        let before = &text[..hit.start];
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        let line = before.matches('\n').count() + 1;
+        let col = before[line_start..].chars().count() + 1;
+        diagnostics.push(format!("{shown_path}:{line}:{col}: {}", label(&hit)));
     }
     diagnostics
 }
@@ -310,6 +312,22 @@ mod tests {
         assert_eq!(check("vendor/zorblax.rs", Some(b"")).len(), 1);
         assert_eq!(check("src/vendor/a.rs", Some(b"zorblax\n")).len(), 1);
         assert_eq!(check("docs/banned-words.txt", Some(b"zorblax\n")).len(), 1);
+    }
+
+    #[test]
+    fn matches_across_line_endings_at_term_boundaries() {
+        for text in ["x\nsee Quux\nCorp\n", "x\r\nsee Quux\r\nCorp\r\n"] {
+            assert_eq!(
+                check("a.md", Some(text.as_bytes())),
+                ["a.md:2:5: banned term #2 (banned-words.txt:3)"],
+                "{text:?}"
+            );
+        }
+        assert_eq!(check("a.md", Some(b"zorb\nlax\n")), Vec::<String>::new());
+        assert_eq!(
+            check("a.md", Some(b"zorb\r\nlax\r\n")),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
