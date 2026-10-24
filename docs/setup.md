@@ -91,6 +91,7 @@ PRs created with `GITHUB_TOKEN` do not run CI unattended, so auto-merge would ne
 - Both runners install tools from the same `mise.lock` (`jdx/mise-action`). Run the install step even after restoring the cache, and verify the Rust version in use.
 - GitHub Actions are pinned by commit SHA.
 - Windows runner images keep being updated even when the version is specified by label. Record the runner image version, the adapter used, and the available features. When an image update changes image comparison results, review the diff images before updating the expected images.
+- Repository settings (merge methods, the `main` rulesets with the required CI checks, allowed Actions, security features) are declared in `.github/infra.yaml`. Change them there and run `mise exec -- gh-infra plan .github/infra.yaml`, then `apply`.
 
 ## Measurement Conditions
 
