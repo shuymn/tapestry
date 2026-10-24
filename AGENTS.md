@@ -21,6 +21,10 @@ mise exec -- lefthook install
 mise exec -- cargo fmt --check
 mise exec -- cargo clippy --workspace --all-targets -- -D warnings
 mise exec -- cargo test --workspace
+mise exec -- cargo xtask portable test
+mise exec -- cargo xtask check-arch
 ```
+
+`cargo xtask portable <command>` runs a cargo command on every crate except the Windows-only ones (what Linux CI builds and tests). `cargo xtask check-arch` checks the rules above that can be checked mechanically.
 
 Linux-side tools (fuzzing, Linux builds) run inside `nix develop` via the WSL wrapper script (docs/setup.md "Linux-Side Tools (WSL)").
