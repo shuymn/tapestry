@@ -23,6 +23,8 @@ The environment for developing this repository, and how tool versions are pinned
 
 ## Version Pinning
 
+Use mise 2026.10.3 or newer. CI runs the minimum supported mise version.
+
 Tool versions are pinned with mise. `mise.toml` specifies major-version ranges, and the exact versions are pinned in `mise.lock`. Configure `mise.toml` so that versions not in `mise.lock` are not used:
 
 ```toml
@@ -30,7 +32,7 @@ Tool versions are pinned with mise. `mise.toml` specifies major-version ranges, 
 locked = true
 
 [settings]
-lockfile_platforms = ["windows-x64", "linux-x64"]
+lockfile_platforms = ["windows-x64", "linux-x64", "macos-arm64"]
 ```
 
 `locked` in `[tool_config]` applies only to tools declared in this repository (it does not apply to global tools).

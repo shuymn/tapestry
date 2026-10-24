@@ -1,7 +1,7 @@
-min_version = "2026.10.12"
+min_version = "2026.10.3"
 
 [settings]
-lockfile_platforms = ["windows-x64", "linux-x64"]
+lockfile_platforms = ["windows-x64", "linux-x64", "macos-arm64"]
 minimum_release_age = "1d"
 
 [tool_config]
