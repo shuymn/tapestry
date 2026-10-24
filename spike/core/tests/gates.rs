@@ -1,0 +1,447 @@
+//! P1 tests (a)–(e): heavy-window gating, thresholds, refresh validity,
+//! NA rows and PresentMon capture integrity.
+
+use spike_core::evaluate::{Summary, evaluate};
+use spike_core::run::{Episode, EventKind, PmFrame, Rational, RunData, RunEvent, ThreadTag};
+use spike_core::synth::{PLAY_START_US, T60_MS, passing_run};
+
+fn heavy(run: &RunData, t: i64) -> bool {
+    run.info.timeline.is_heavy(t)
+}
+
+fn assert_valid(s: &Summary) {
+    let bad: Vec<_> = s.validity.iter().filter(|c| !c.ok).collect();
+    assert!(bad.is_empty(), "invalid: {bad:?}");
+}
+
+#[test]
+fn synthetic_run_is_valid_and_passes() {
+    let s = evaluate(&passing_run());
+    assert_valid(&s);
+    assert!(
+        s.gates.iter().all(|g| !g.applies || g.pass),
+        "{:?}",
+        s.gates
+    );
+    assert_eq!(s.exit_code, 0);
+    assert_eq!((s.refresh_class_hz, s.target_hz), (Some(60), Some(60)));
+}
+
+// ---- (a) whole-run pass but heavy-window fail -> fail -----------------
+
+/// Makes every 50th heavy-window sample bad (2% of heavy, 0.8% of the run):
+/// the whole-run p99 stays good while the heavy-window p99 is bad.
+fn spoil_heavy(run: &mut RunData, outside_instead: bool) {
+    let pick = |r: &RunData, t: i64, i: usize, every: usize| {
+        (heavy(r, t) != outside_instead) && i.is_multiple_of(every)
+    };
+    let snapshot = run.clone();
+    let every = if outside_instead { 3 } else { 50 };
+    for (i, f) in run.pm_frames.iter_mut().enumerate() {
+        if pick(&snapshot, f.window_time_us(), i, every) {
+            f.display_change_ms = Some(40.0);
+            f.gpu_busy_ms = Some(5.0);
+        }
+    }
+    for (i, f) in run.frames.iter_mut().enumerate() {
+        if pick(&snapshot, f.present_us, i, every) {
+            f.render_cpu_us = 4_000;
+        }
+    }
+    for (i, x) in run.input.iter_mut().enumerate() {
+        if pick(&snapshot, x.t_us, i, every) {
+            x.latency_us = 5_000;
+        }
+    }
+}
+
+#[test]
+fn a_whole_run_pass_but_heavy_window_fail_is_a_fail() {
+    let mut run = passing_run();
+    spoil_heavy(&mut run, false);
+    let s = evaluate(&run);
+    assert_valid(&s);
+    // Informational whole-run p99 still looks fine.
+    assert_eq!(s.records.whole_run_p99_interval_ms, Some(T60_MS));
+    for id in ["G1", "G2", "G3", "G4"] {
+        assert!(!s.gate(id).pass, "{id} should fail on heavy windows");
+    }
+    assert_eq!(s.exit_code, 1);
+}
+
+#[test]
+fn a_bad_samples_outside_heavy_windows_do_not_fail_gates() {
+    let mut run = passing_run();
+    spoil_heavy(&mut run, true);
+    let s = evaluate(&run);
+    assert!(s.records.whole_run_p99_interval_ms > Some(T60_MS));
+    for id in ["G1", "G2", "G3", "G4"] {
+        assert!(s.gate(id).pass, "{id} must only see heavy windows");
+    }
+    assert_eq!(s.exit_code, 0);
+}
+
+// ---- (b) each gate at and just past its threshold ---------------------
+
+fn gate_with(id: &str, edit: impl Fn(&mut RunData)) -> (bool, u8) {
+    let mut run = passing_run();
+    edit(&mut run);
+    let s = evaluate(&run);
+    assert_valid(&s);
+    (s.gate(id).pass, s.exit_code)
+}
+
+fn set_heavy_pm(run: &mut RunData, f: impl Fn(&mut PmFrame)) {
+    let tl = run.info.timeline;
+    run.pm_frames
+        .iter_mut()
+        .filter(|p| tl.is_heavy(p.window_time_us()))
+        .for_each(f);
+}
+
+#[test]
+fn b_g1_at_and_above_one_refresh() {
+    assert_eq!(
+        gate_with("G1", |r| set_heavy_pm(r, |p| p.display_change_ms =
+            Some(T60_MS))),
+        (true, 0)
+    );
+    assert_eq!(
+        gate_with("G1", |r| set_heavy_pm(r, |p| p.display_change_ms =
+            Some(T60_MS + 0.0001))),
+        (false, 1)
+    );
+}
+
+#[test]
+fn b_g2_render_cpu_1_5_ms() {
+    let set = |v: u32| {
+        move |r: &mut RunData| {
+            let tl = r.info.timeline;
+            r.frames
+                .iter_mut()
+                .filter(|f| tl.is_heavy(f.present_us))
+                .for_each(|f| f.render_cpu_us = v);
+        }
+    };
+    assert_eq!(gate_with("G2", set(1_500)), (true, 0));
+    assert_eq!(gate_with("G2", set(1_501)), (false, 1));
+}
+
+#[test]
+fn b_g3_gpu_2_ms() {
+    assert_eq!(
+        gate_with("G3", |r| set_heavy_pm(r, |p| p.gpu_busy_ms = Some(2.0))),
+        (true, 0)
+    );
+    assert_eq!(
+        gate_with("G3", |r| set_heavy_pm(r, |p| p.gpu_busy_ms = Some(2.0001))),
+        (false, 1)
+    );
+}
+
+#[test]
+fn b_g4_input_to_judgment_1_ms() {
+    let set = |v: i64| {
+        move |r: &mut RunData| {
+            let tl = r.info.timeline;
+            r.input
+                .iter_mut()
+                .filter(|x| tl.is_heavy(x.t_us))
+                .for_each(|x| x.latency_us = v);
+        }
+    };
+    assert_eq!(gate_with("G4", set(1_000)), (true, 0));
+    assert_eq!(gate_with("G4", set(1_001)), (false, 1));
+}
+
+#[test]
+fn b_g5_g6_zero() {
+    assert_eq!(gate_with("G5", |_| {}), (true, 0));
+    assert_eq!(
+        gate_with("G5", |r| r.audio.episodes.push(Episode {
+            start_us: PLAY_START_US + 1,
+            end_us: PLAY_START_US + 2_000,
+        })),
+        (false, 1)
+    );
+    // Library-scope allocations are recorded (G6r), not gated.
+    assert_eq!(
+        gate_with("G6", |r| {
+            r.counters
+                .library_allocs
+                .insert("write_texture".into(), 500);
+        }),
+        (true, 0)
+    );
+    assert_eq!(
+        gate_with("G6", |r| {
+            r.counters.app_allocs.insert(ThreadTag::Render, 1);
+        }),
+        (false, 1)
+    );
+}
+
+#[test]
+fn b_g7_bga_99_percent() {
+    let skip = |n: usize| {
+        move |r: &mut RunData| {
+            let tl = r.info.timeline;
+            r.bga
+                .iter_mut()
+                .filter(|b| tl.is_heavy(b.due_us))
+                .take(n)
+                .for_each(|b| b.displayed = false);
+        }
+    };
+    let due = 240 * 60;
+    assert_eq!(gate_with("G7", skip(due / 100)), (true, 0));
+    assert_eq!(gate_with("G7", skip(due / 100 + 1)), (false, 1));
+}
+
+// O1/O2 thresholds are in tests/obs.rs with the OBS fixtures.
+
+// ---- (c) refresh must be exactly 60 or 240 Hz -------------------------
+
+fn validity_with_refresh(num: u64, den: u64, cap: Option<u32>) -> bool {
+    let mut run = passing_run();
+    run.info.refresh = Rational { num, den };
+    run.info.fps_cap = cap;
+    evaluate(&run).check("V3").ok
+}
+
+#[test]
+fn c_59_94_and_239_76_are_invalid() {
+    assert!(!validity_with_refresh(60_000, 1_001, None));
+    assert!(!validity_with_refresh(240_000, 1_001, None));
+    let mut run = passing_run();
+    run.info.refresh = Rational {
+        num: 60_000,
+        den: 1_001,
+    };
+    assert_eq!(evaluate(&run).exit_code, 2);
+    assert!(validity_with_refresh(60, 1, None));
+    assert!(validity_with_refresh(240, 1, None));
+    // Upper bound target × 1.001 is inclusive.
+    assert!(validity_with_refresh(60_060, 1_000, None));
+    assert!(!validity_with_refresh(60_061, 1_000, None));
+    assert!(!validity_with_refresh(144, 1, None));
+    // Caps must divide the refresh rate.
+    assert!(validity_with_refresh(240, 1, Some(120)));
+    assert!(validity_with_refresh(240, 1, Some(60)));
+    assert!(!validity_with_refresh(240, 1, Some(100)));
+}
+
+#[test]
+fn g1_target_is_the_cap_when_capped() {
+    let mut run = passing_run();
+    run.info.refresh = Rational { num: 240, den: 1 };
+    run.info.fps_cap = Some(60);
+    let s = evaluate(&run);
+    assert_eq!(s.target_hz, Some(60));
+    assert!(s.gate("G1").pass);
+    run.info.fps_cap = None;
+    assert!(!evaluate(&run).gate("G1").pass);
+}
+
+// ---- (d) NA rows count as not displayed, never dropped ----------------
+
+#[test]
+fn d_na_rows_are_counted_as_not_displayed() {
+    let mut run = passing_run();
+    let tl = run.info.timeline;
+    let mut n = 0;
+    for f in run
+        .pm_frames
+        .iter_mut()
+        .filter(|f| tl.is_heavy(f.present_us))
+        .step_by(100)
+    {
+        f.display_us = None;
+        f.display_change_ms = None;
+        n += 1;
+    }
+    let s = evaluate(&run);
+    assert_valid(&s);
+    assert_eq!(s.records.not_displayed, n);
+    assert_eq!(s.records.missed_deadlines, n);
+    let heavy_rows = run
+        .pm_frames
+        .iter()
+        .filter(|f| tl.is_heavy(f.window_time_us()))
+        .count() as u64;
+    assert_eq!(s.records.heavy_frames, heavy_rows);
+    assert_eq!(s.gate("G1").samples, heavy_rows - n);
+}
+
+// ---- (e) PresentMon capture integrity (V4) vs a slow run --------------
+
+#[test]
+fn e_truncated_capture_is_invalid() {
+    let mut run = passing_run();
+    run.info.presentmon_error = Some("malformed or truncated PresentMon row at line 9".into());
+    assert!(!evaluate(&run).check("V4").ok);
+    // Cut at a row boundary before play ends: does not bracket.
+    let mut run = passing_run();
+    let end = run.info.timeline.play_end_us();
+    run.pm_frames.retain(|f| f.present_us < end - 10_000_000);
+    let s = evaluate(&run);
+    assert!(
+        s.check("V4")
+            .reasons
+            .contains(&"presentmon-does-not-bracket-play".to_string())
+    );
+    assert_eq!(s.exit_code, 2);
+}
+
+#[test]
+fn e_non_bracketing_capture_is_invalid() {
+    let mut run = passing_run();
+    run.pm_frames
+        .retain(|f| f.present_us > PLAY_START_US + 100_000);
+    assert!(!evaluate(&run).check("V4").ok);
+}
+
+#[test]
+fn e_missing_presents_are_invalid() {
+    let mut run = passing_run();
+    let mid = PLAY_START_US + 300_000_000;
+    run.pm_frames
+        .retain(|f| !(mid..mid + 50_000).contains(&f.present_us));
+    let s = evaluate(&run);
+    assert_eq!(s.check("V4").reasons, vec!["presents-missing-from-capture"]);
+    assert_eq!(s.exit_code, 2);
+}
+
+#[test]
+fn e_capture_gap_while_presenting_is_invalid() {
+    let mut run = passing_run();
+    let mid = PLAY_START_US + 100_000_000;
+    run.pm_frames
+        .retain(|f| !(mid..mid + 1_500_000).contains(&f.present_us));
+    assert!(
+        evaluate(&run)
+            .check("V4")
+            .reasons
+            .contains(&"capture-gap-over-1s".to_string())
+    );
+}
+
+/// A run presenting every `period_us` with a complete capture whose
+/// displayed intervals follow the 60 Hz refresh grid.
+fn slow_run(period_us: i64) -> RunData {
+    let mut run = passing_run();
+    let tl = run.info.timeline;
+    let from = tl.play_start_us - 1_000_000;
+    let times: Vec<i64> = (from..tl.play_end_us() + 2 * period_us)
+        .step_by(period_us as usize)
+        .collect();
+    let refresh_us = 1_000_000.0 / 60.0;
+    let template_frame = run.frames[0];
+    run.frames = times
+        .iter()
+        .map(|&t| spike_core::run::SpikeFrame {
+            present_us: t,
+            ..template_frame
+        })
+        .collect();
+    let mut prev_vsync: Option<i64> = None;
+    run.pm_frames = times
+        .iter()
+        .map(|&t| {
+            let vsync = ((t - from) as f64 / refresh_us).ceil() as i64;
+            let change = prev_vsync.map(|p| (vsync - p) as f64 * T60_MS);
+            prev_vsync = Some(vsync);
+            PmFrame {
+                present_us: t,
+                display_us: Some(from + (vsync as f64 * refresh_us) as i64),
+                display_change_ms: change.or(Some(T60_MS)),
+                gpu_busy_ms: Some(1.0),
+            }
+        })
+        .collect();
+    run
+}
+
+#[test]
+fn e_complete_capture_of_a_50_fps_run_on_60_hz_fails_g1_but_is_valid() {
+    let s = evaluate(&slow_run(20_000));
+    assert_valid(&s);
+    assert!(!s.gate("G1").pass);
+    assert!(s.gate("G1").value > Some(30.0));
+    assert!(s.records.missed_deadlines > 0);
+    assert_eq!(s.exit_code, 1);
+}
+
+#[test]
+fn e_complete_capture_presenting_every_2_s_passes_v4() {
+    // V2 (all lanes lit every second) also fails for such a run; this
+    // checks that V4 alone does not call a slow but complete capture lossy.
+    let s = evaluate(&slow_run(2_000_000));
+    assert!(s.check("V4").ok, "{:?}", s.check("V4"));
+    assert!(!s.gate("G1").pass);
+}
+
+// ---- other validity rules ----------------------------------------------
+
+#[test]
+fn v1_v2_v5_v6_invalidate() {
+    type Edit = Box<dyn Fn(&mut RunData)>;
+    let cases: Vec<(&str, Edit)> = vec![
+        ("V1", Box::new(|r| r.counters.notes_played -= 1)),
+        ("V1", Box::new(|r| r.counters.notes_total = 9_999)),
+        (
+            "V2",
+            Box::new(|r| {
+                let tl = r.info.timeline;
+                let w = tl.window(5);
+                r.audio_periods
+                    .iter_mut()
+                    .filter(|p| (w.start_us..w.start_us + 2_000_000).contains(&p.t_us))
+                    .for_each(|p| p.active_voices = 99);
+            }),
+        ),
+        (
+            "V2",
+            Box::new(|r| {
+                let w = r.info.timeline.window(3);
+                r.frames
+                    .iter_mut()
+                    .filter(|f| {
+                        (w.start_us + 7_000_000..w.start_us + 8_000_000).contains(&f.present_us)
+                    })
+                    .for_each(|f| f.lanes_with_effects = 7);
+            }),
+        ),
+        ("V2", Box::new(|r| r.info.bga_height = Some(720))),
+        (
+            "V5",
+            Box::new(|r| {
+                r.events.push(RunEvent {
+                    t_us: PLAY_START_US + 5,
+                    kind: EventKind::FocusLoss,
+                })
+            }),
+        ),
+        ("V5", Box::new(|r| r.counters.sound_overflows = 1)),
+        ("V5", Box::new(|r| r.counters.input_overflows = 1)),
+        ("V6", Box::new(|r| r.audio.pilot_calibrated = false)),
+        ("V6", Box::new(|r| r.audio.unverifiable_spans = 1)),
+        ("V6", Box::new(|r| r.info.mix_rate_hz = 32_000)),
+    ];
+    for (id, edit) in cases {
+        let mut run = passing_run();
+        edit(&mut run);
+        let s = evaluate(&run);
+        assert!(!s.check(id).ok, "{id}");
+        assert_eq!(s.exit_code, 2, "{id}");
+    }
+    // Events outside play and BGA-pool exhaustion do not invalidate.
+    let mut run = passing_run();
+    run.events.push(RunEvent {
+        t_us: 0,
+        kind: EventKind::FocusLoss,
+    });
+    run.counters.bga_pool_exhausted = 3;
+    assert_eq!(evaluate(&run).exit_code, 0);
+}
