@@ -5,7 +5,6 @@ name: Spike
 on:
   push:
     branches: ["spike/**"]
-  workflow_dispatch:
 
 permissions: {}
 
@@ -49,3 +48,21 @@ jobs:
         run: bash spike/scripts/check.sh
       - name: tapestry-spike --version
         run: spike/target/debug/tapestry-spike.exe --version
+      # The recorded tree state follows edits without a commit: a modified
+      # tracked file, then an untracked file, must each rebuild as dirty.
+      - name: --version reports a dirty tree
+        working-directory: spike
+        run: |
+          tree() {
+            mise exec -- cargo build -p tapestry-spike --locked
+            v=$(target/debug/tapestry-spike.exe --version)
+            grep '^commit: ' <<<"$v" | grep -o '([a-z]*)$'
+          }
+          test "$(tree)" = "(clean)"
+          echo "// probe" >> app/src/main.rs
+          test "$(tree)" = "(dirty)"
+          git checkout -- app/src/main.rs
+          test "$(tree)" = "(clean)"
+          touch untracked-probe.txt
+          test "$(tree)" = "(dirty)"
+          rm untracked-probe.txt

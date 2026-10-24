@@ -1,7 +1,9 @@
 //! Build metadata for `--version` and the FFmpeg runtime DLLs.
 //!
-//! - `SPIKE_COMMIT`, `SPIKE_TREE` (clean/dirty, tracked files) and
-//!   `SPIKE_PROFILE` for `tapestry-spike --version`.
+//! - `SPIKE_COMMIT`, `SPIKE_TREE` and `SPIKE_PROFILE` for
+//!   `tapestry-spike --version`. The tree is dirty if `git status` shows
+//!   any change: modified, staged or untracked (not ignored) files. The
+//!   script runs on every build, so the recorded state is never stale.
 //! - Copies `$FFMPEG_DIR/bin/*.dll` next to the executable (and into
 //!   `deps/` for test binaries) so it runs without FFmpeg on `PATH`.
 
@@ -18,10 +20,8 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("set by cargo"));
-
     let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let tree = match git(&["status", "--porcelain", "--untracked-files=no"]) {
+    let tree = match git(&["status", "--porcelain"]) {
         Some(s) if s.is_empty() => "clean",
         Some(_) => "dirty",
         None => "unknown",
@@ -32,23 +32,19 @@ fn main() {
         "cargo:rustc-env=SPIKE_PROFILE={}",
         env::var("PROFILE").expect("set by cargo")
     );
-    // Re-run when HEAD moves or the index changes.
-    let mut watched = vec!["HEAD".to_owned(), "index".to_owned()];
-    if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        watched.push(head_ref);
-    }
-    for path in watched {
-        if let Some(p) = git(&["rev-parse", "--git-path", &path]) {
-            println!("cargo:rerun-if-changed={}", manifest.join(p).display());
-        }
-    }
+    // Watching a path that never exists makes cargo run this script on
+    // every build: any edit anywhere in the tree must change the state.
+    let out = PathBuf::from(env::var("OUT_DIR").expect("set by cargo"));
+    println!(
+        "cargo:rerun-if-changed={}",
+        out.join("always-rerun.absent").display()
+    );
 
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     let Ok(ffmpeg) = env::var("FFMPEG_DIR") else {
         return;
     };
     // OUT_DIR is <target>/<profile>/build/<pkg>-<hash>/out.
-    let out = PathBuf::from(env::var("OUT_DIR").expect("set by cargo"));
     let profile_dir = out
         .ancestors()
         .nth(3)
