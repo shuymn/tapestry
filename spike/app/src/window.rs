@@ -12,7 +12,7 @@ use crate::alloc::{self, Scope, Tag, scope};
 use crate::display::{DisplayPath, active_paths, find_display, pick_refresh};
 use crate::pacing::{
     DISPLAY_VBLANKS, DisplayPredictor, GridEvent, GridTracker, Wake, cap_anchor, cap_needed,
-    cap_step, early_wake_tolerance,
+    cap_step, early_wake_tolerance, shown_in_play,
 };
 use crate::render::Renderer;
 use crate::run::{
@@ -521,12 +521,14 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         play_start_us: play_start,
         loops,
     };
-    // G7 from frames actually presented during play.
-    let in_play = |f: &SpikeFrame| {
-        f.present_us
-            .is_some_and(|p| (play_start..play_start + play_len).contains(&p))
-    };
-    let due = bga_due(&rec, &bga, play_start, play_len, in_play);
+    // G7 from presented frames on screen during play (predicted display
+    // time; the trace has one row per recorded frame).
+    let on_screen = trace.iter().zip(&rec.frames).map(|(t, f)| {
+        let display = clock.to_us(t.2);
+        (display, f.present_us.and(f.bga_index))
+    });
+    let shown = shown_in_play(on_screen, play_start, play_start + play_len);
+    let due = bga_due(&bga, play_start, play_len, shown);
     let mode = if args.window.is_some() {
         "windowed"
     } else {

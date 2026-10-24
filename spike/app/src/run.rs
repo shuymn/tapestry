@@ -282,25 +282,19 @@ impl BgaState {
     }
 }
 
-/// G7 due records for a play of `play_us` from what presented frames
-/// showed (`bga_index` of frames with `presented`).
+/// G7 due records for a play of `play_us` from the BGA indexes on screen
+/// during play (`pacing::shown_in_play`).
 pub fn bga_due(
-    rec: &Recorder,
     bga: &BgaState,
     play_start: i64,
     play_us: i64,
-    presented: impl Fn(&SpikeFrame) -> bool,
+    shown: impl IntoIterator<Item = u64>,
 ) -> Vec<BgaDue> {
     if bga.bga.is_none() {
         return vec![];
     }
     let interval = bga.interval_us();
     let due_count = (play_us / interval) as u64;
-    let shown = rec
-        .frames
-        .iter()
-        .filter(|f| presented(f))
-        .filter_map(|f| f.bga_index);
     bga_due_records(play_start, interval, due_count, shown)
 }
 
@@ -564,7 +558,12 @@ pub fn offscreen(args: &RunArgs, size: (u32, u32)) -> Result<ExitCode, String> {
         distinct_colors(&renderer.read_back(&target, size))
     });
     let virtual_play = n as i64 * VIRTUAL_FRAME_US;
-    let due = bga_due(&rec, &bga, play_start, virtual_play, |_| true);
+    let due = bga_due(
+        &bga,
+        play_start,
+        virtual_play,
+        rec.frames.iter().filter_map(|f| f.bga_index),
+    );
     let mut summary = summary_common("offscreen", &info, size, &rec);
     summary.bga = bga.summary(&due).map(|mut b| {
         b.advanced_every_frame = Some(advanced);

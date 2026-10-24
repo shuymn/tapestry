@@ -222,6 +222,24 @@ impl DisplayPredictor {
     }
 }
 
+/// BGA frames on screen during play: the index each presented frame
+/// showed, kept when its display time (predicted, until P5 reconciles it
+/// with PresentMon) lies in the play window `[play_start, play_end)`.
+/// Selecting by present time instead would drop index 0 in every run: the
+/// frames that show it during play were presented in the countdown, and
+/// the first frame presented in play reaches the screen after index 0's
+/// interval has passed.
+pub fn shown_in_play(
+    frames: impl IntoIterator<Item = (i64, Option<u64>)>,
+    play_start: i64,
+    play_end: i64,
+) -> impl Iterator<Item = u64> {
+    frames
+        .into_iter()
+        .filter(move |&(display, _)| (play_start..play_end).contains(&display))
+        .filter_map(|(_, index)| index)
+}
+
 /// G7 due records from what was actually presented. Every BGA frame due
 /// in play (`0..due_count`, one per `interval_us` from `play_start_us`) gets
 /// a record; it is displayed if some presented frame showed it (repeats
@@ -638,6 +656,32 @@ mod tests {
                 assert_eq!(o.skips, o.skips_actual, "{o:?}");
             }
         }
+    }
+
+    #[test]
+    fn index_0_on_screen_at_play_start_counts_as_displayed() {
+        // 60 Hz frames with display one refresh after present. The frame
+        // presented 5 ms before play start shows index 0 on screen from
+        // 11.7 ms; the first frame presented in play shows at 28.4 ms, past
+        // index 0's interval, with index 1.
+        let r = 16_667;
+        let frames: Vec<(i64, i64, Option<u64>)> = (-3..60)
+            .map(|k| {
+                let present = -5_000 + k * r;
+                let display = present + r;
+                (present, display, Some((display.max(0) / r) as u64))
+            })
+            .collect();
+        let play_end = 60 * r;
+        let shown = shown_in_play(frames.iter().map(|&(_, d, i)| (d, i)), 0, play_end);
+        let due = bga_due_records(0, r, 59, shown);
+        assert!(due.iter().all(|d| d.displayed), "{due:?}");
+        // By present time index 0 would be lost.
+        let by_present = frames
+            .iter()
+            .filter(|f| (0..play_end).contains(&f.0))
+            .filter_map(|f| f.2);
+        assert!(!bga_due_records(0, r, 59, by_present)[0].displayed);
     }
 
     #[test]
