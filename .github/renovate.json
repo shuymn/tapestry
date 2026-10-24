@@ -1,0 +1,17 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>shuymn/github-actions#main"],
+  "platformAutomerge": true,
+  "minimumReleaseAge": "1 days",
+  "lockFileMaintenance": {
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null,
+    "prCreation": "immediate"
+  },
+  "mise": {
+    "enabled": false
+  },
+  "nix": {
+    "enabled": true
+  }
+}
