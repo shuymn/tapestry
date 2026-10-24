@@ -61,6 +61,13 @@ pub const GRID_ACQUIRE_SAMPLES: u32 = 8;
 /// agrees with its neighbour. Only `GRID_ACQUIRE_SAMPLES` consecutive
 /// mutually consistent syncs (re)establish a grid, so a short locally
 /// consistent stretch inside VRR-like timing cannot shift the cap slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridEvent {
+    OnGrid,
+    Acquired,
+    OffGrid,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GridTracker {
     trusted: Option<(i64, u32)>,
@@ -69,16 +76,16 @@ pub struct GridTracker {
 }
 
 impl GridTracker {
-    /// Feeds one sync `(qpc, refresh count)`; returns whether it is on the
-    /// trusted grid (after this call).
-    pub fn observe(&mut self, sync: (i64, u32), period: i64) -> bool {
+    /// Feeds one sync `(qpc, refresh count)`: whether it extended the
+    /// trusted grid, (re)acquired one, or lies off it.
+    pub fn observe_event(&mut self, sync: (i64, u32), period: i64) -> GridEvent {
         if let Some(t) = self.trusted
             && sync_consistent(t, sync, period)
         {
             self.trusted = Some(sync);
             self.candidate = None;
             self.streak = 0;
-            return true;
+            return GridEvent::OnGrid;
         }
         self.streak = match self.candidate {
             Some(c) if sync_consistent(c, sync, period) => self.streak + 1,
@@ -89,9 +96,9 @@ impl GridTracker {
             self.trusted = Some(sync);
             self.candidate = None;
             self.streak = 0;
-            return true;
+            return GridEvent::Acquired;
         }
-        false
+        GridEvent::OffGrid
     }
 
     /// The latest trusted sync, if a grid is established.
@@ -222,24 +229,27 @@ mod tests {
         let mut g = GridTracker::default();
         // Acquire on the grid 0 + k·R.
         for k in 0..GRID_ACQUIRE_SAMPLES {
-            g.observe((i64::from(k) * R, k), R);
+            g.observe_event((i64::from(k) * R, k), R);
         }
         assert_eq!(g.anchor(), Some((7 * R, 7)));
         // Off-grid stretch: one count per 2R.
         for k in 8..12u32 {
-            assert!(!g.observe((i64::from(k) * 2 * R, k), R));
+            assert_eq!(
+                g.observe_event((i64::from(k) * 2 * R, k), R),
+                GridEvent::OffGrid
+            );
         }
         // A locally consistent pair, offset by a third of a refresh from
         // the trusted grid: still not trusted.
         let off = R / 3;
-        assert!(!g.observe((30 * R + off, 30), R));
-        assert!(!g.observe((31 * R + off, 31), R));
+        assert_eq!(g.observe_event((30 * R + off, 30), R), GridEvent::OffGrid);
+        assert_eq!(g.observe_event((31 * R + off, 31), R), GridEvent::OffGrid);
         assert_eq!(g.anchor(), Some((7 * R, 7)));
         // Back on the trusted grid: accepted at once.
-        assert!(g.observe((40 * R, 40), R));
+        assert_eq!(g.observe_event((40 * R, 40), R), GridEvent::OnGrid);
         // A sustained new grid is reacquired.
         for k in 50..50 + GRID_ACQUIRE_SAMPLES {
-            g.observe((i64::from(k) * R + off, k), R);
+            g.observe_event((i64::from(k) * R + off, k), R);
         }
         assert_eq!(g.anchor(), Some((57 * R + off, 57)));
     }

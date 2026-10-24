@@ -9,8 +9,9 @@
 //! instance and surface are created there and moved to the render thread.
 
 use crate::alloc::{self, Scope, Tag, scope};
+use crate::display::{active_paths, pick_refresh};
 use crate::pacing::{
-    DISPLAY_VBLANKS, GridTracker, cap_anchor, cap_needed, cap_step, predict_display,
+    DISPLAY_VBLANKS, GridEvent, GridTracker, cap_anchor, cap_needed, cap_step, predict_display,
 };
 use crate::render::Renderer;
 use crate::run::{
@@ -78,11 +79,13 @@ impl App {
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("create surface: {e}"))?;
-        let winit_mhz = window
-            .current_monitor()
+        let monitor = window.current_monitor();
+        let winit_mhz = monitor
+            .as_ref()
             .and_then(|m| m.refresh_rate_millihertz())
             .unwrap_or(60_000);
-        let refresh = exact_refresh(winit_mhz, &display_refresh_rationals());
+        let name = monitor.as_ref().and_then(|m| m.name());
+        let refresh = pick_refresh(name.as_deref(), winit_mhz, &active_paths());
         let gpu = Gpu {
             instance,
             surface,
@@ -156,60 +159,6 @@ pub fn windowed(args: &RunArgs) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Exact refresh rate of every active display path (QueryDisplayConfig),
-/// as `numerator/denominator` Hz; V3 needs the rational, not winit's rounded
-/// integer.
-fn display_refresh_rationals() -> Vec<(u32, u32)> {
-    use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, GetDisplayConfigBufferSizes,
-        QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
-    };
-    use windows::Win32::Foundation::ERROR_SUCCESS;
-    let (mut np, mut nm) = (0u32, 0u32);
-    // SAFETY: the buffers are sized from GetDisplayConfigBufferSizes and the
-    // counts are updated to what QueryDisplayConfig wrote.
-    unsafe {
-        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != ERROR_SUCCESS {
-            return vec![];
-        }
-        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-        if QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        ) != ERROR_SUCCESS
-        {
-            return vec![];
-        }
-        paths.truncate(np as usize);
-        paths
-            .iter()
-            .map(|p| {
-                (
-                    p.targetInfo.refreshRate.Numerator,
-                    p.targetInfo.refreshRate.Denominator,
-                )
-            })
-            .collect()
-    }
-}
-
-/// The exact rational of the window's display: winit reports whole hertz
-/// (59 for a 59.951 Hz mode), so take the active path whose rate truncates
-/// to it; fall back to winit's value.
-fn exact_refresh(winit_mhz: u32, paths: &[(u32, u32)]) -> (u32, u32) {
-    paths
-        .iter()
-        .copied()
-        .filter(|&(_, d)| d > 0)
-        .find(|&(n, d)| n / d == winit_mhz / 1000)
-        .unwrap_or((winit_mhz, 1000))
-}
-
 /// High-resolution waitable timer for the frame cap.
 struct CapTimer(HANDLE);
 
@@ -266,6 +215,8 @@ struct Dxgi {
     sync_count: Option<u32>,
     /// Trusted refresh grid.
     grid: GridTracker,
+    /// Anchor changes for the private trace: (sync QPC, old, new, reason).
+    anchors: Vec<(i64, Option<i64>, i64, &'static str)>,
 }
 
 impl Dxgi {
@@ -299,11 +250,23 @@ impl Dxgi {
         // Only a sync on the trusted refresh grid anchors the cap and the
         // prediction (with VRR or composition, refresh counts follow
         // presents instead).
-        if !self
+        let old = self.grid.anchor().map(|a| a.0);
+        let ev = self
             .grid
-            .observe((s.SyncQPCTime, s.SyncRefreshCount), self.period_qpc)
-        {
+            .observe_event((s.SyncQPCTime, s.SyncRefreshCount), self.period_qpc);
+        if ev == GridEvent::OffGrid {
             self.summary.off_grid += 1;
+        }
+        if let Some((q, _)) = self.grid.anchor()
+            && old != Some(q)
+            && self.anchors.len() < self.anchors.capacity()
+        {
+            let reason = match ev {
+                GridEvent::Acquired if old.is_some() => "reacquired",
+                GridEvent::Acquired => "acquired",
+                _ => "on-grid",
+            };
+            self.anchors.push((s.SyncQPCTime, old, q, reason));
         }
         if let Some((q, c)) = self.grid.anchor() {
             self.sync_anchor = Some(q);
@@ -384,6 +347,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         sync_anchor: None,
         sync_count: None,
         grid: GridTracker::default(),
+        anchors: Vec::with_capacity(max_frames),
     };
     // The cap period in whole refreshes (V3: caps divide the refresh rate).
     let cap = match args.fps_cap {
@@ -397,6 +361,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let mut cap_anchor_fallback: Option<i64> = None;
     let mut cap_phase: Option<u32> = None;
     let mut last_slot: Option<i64> = None;
+    // Cap decisions for the private trace: (now, anchor, slot, wait until,
+    // wake).
+    let mut cap_trace: Vec<(i64, i64, i64, Option<i64>, i64)> = Vec::with_capacity(max_frames);
     let interval = bga.interval_us();
     // First BGA frame uploaded before the countdown (design D2).
     bga.step(&mut renderer, 0, true)?;
@@ -423,6 +390,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
             let (wait, slot) = cap_step(now, anchor, i64::from(*k) * period_qpc, last_slot);
             if let Some(w) = wait {
                 timer.wait_until(w);
+            }
+            if cap_trace.len() < cap_trace.capacity() {
+                cap_trace.push((now, anchor, slot, wait, qpc()));
             }
             last_slot = Some(slot);
         }
@@ -542,7 +512,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     ) = heavy_values(&rec, &due, timeline);
     summary.bga = bga.summary(&due);
     summary.dxgi = Some(dxgi.summary);
-    summary.display_refresh = display_refresh_rationals();
+    summary.display_refresh = active_paths().iter().map(|p| (p.num, p.den)).collect();
     summary.refresh_mhz_used = Some(refresh_mhz);
     summary.notes = vec![
         "G7 'displayed' means shown by a presented frame; P5 reconciles it with PresentMon display rows".into(),
@@ -553,16 +523,21 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     summary.events = shared.events.lock().map_err(|e| e.to_string())?.clone();
     print_summary(&summary);
     write_outputs(&args.out, &rec, &due, &summary)?;
-    write_private_trace(&args.out, &trace, &dxgi.raw)?;
+    write_private_trace(&args.out, &trace, &dxgi.raw, &dxgi.anchors, &cap_trace)?;
     Ok(())
 }
 
-/// `private/trace.csv` and `private/dxgi.csv`: raw QPC values for P5's
-/// reconciliation with PresentMon; never part of the export.
+/// `private/`: raw QPC values for P5's reconciliation with PresentMon, never
+/// part of the export. `trace.csv` (per frame: start, predicted display,
+/// present count), `dxgi.csv` (frame statistics), `anchors.csv` (refresh
+/// grid anchor changes and why), `cap.csv` (per capped frame: decision
+/// time, anchor, slot, wait target, wake time), `qpc.txt` (frequency).
 fn write_private_trace(
     out: &std::path::Path,
     trace: &[(i64, i64, Option<u32>)],
     raw: &[(u32, u32, u32, i64)],
+    anchors: &[(i64, Option<i64>, i64, &'static str)],
+    cap: &[(i64, i64, i64, Option<i64>, i64)],
 ) -> Result<(), String> {
     use std::fmt::Write as _;
     let dir = out.join("private");
@@ -578,6 +553,18 @@ fn write_private_trace(
         let _ = writeln!(d, "{a},{b},{c},{q}");
     }
     std::fs::write(dir.join("dxgi.csv"), d).map_err(|e| e.to_string())?;
+    let mut a = String::from("sync_qpc,old_anchor_qpc,new_anchor_qpc,reason\n");
+    for (at, old, new, reason) in anchors {
+        let old = old.map_or(String::new(), |o| o.to_string());
+        let _ = writeln!(a, "{at},{old},{new},{reason}");
+    }
+    std::fs::write(dir.join("anchors.csv"), a).map_err(|e| e.to_string())?;
+    let mut c = String::from("now_qpc,anchor_qpc,slot_qpc,wait_until_qpc,wake_qpc\n");
+    for (now, anchor, slot, wait, wake) in cap {
+        let wait = wait.map_or(String::new(), |w| w.to_string());
+        let _ = writeln!(c, "{now},{anchor},{slot},{wait},{wake}");
+    }
+    std::fs::write(dir.join("cap.csv"), c).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("qpc.txt"), format!("frequency {}\n", qpc_freq()))
         .map_err(|e| e.to_string())?;
     Ok(())

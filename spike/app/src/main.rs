@@ -13,6 +13,7 @@
 
 mod alloc;
 mod bga;
+mod display;
 mod gen_assets;
 mod pacing;
 mod render;
