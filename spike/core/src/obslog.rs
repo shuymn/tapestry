@@ -22,7 +22,8 @@
 //!   insufficient bandwidth/connection stalls: N (…)` (libobs
 //!   `log_frame_info`)
 //! - `Video stopped, number of skipped frames due to encoding lag: N/M (…)`
-//!   (libobs `log_skipped`)
+//!   (libobs `log_skipped`), taken only before the stream's stop marker
+//!   (P5 confirms this order in a real log)
 //!
 //! OBS prints the lag and drop lines only when the count is nonzero, so in a
 //! completed session their absence means zero. Only the streaming output's
@@ -388,6 +389,9 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
         } else if let Some((n, m)) = msg
             .strip_prefix("Video stopped, number of skipped frames due to encoding lag: ")
             .and_then(|r| r.split_once('/'))
+            // Only the stream's own encoder stopping, inside its session: a
+            // later output (a recording after the stream) logs its own line.
+            .filter(|_| r.stop_ms.is_none())
         {
             r.s.encode_skipped = leading_u64(n);
             r.s.encode_total = leading_u64(m);

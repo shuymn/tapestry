@@ -493,6 +493,54 @@ fn f_recording_during_the_session_is_invalid_and_not_mixed_in() {
 }
 
 #[test]
+fn f_encoding_lag_after_the_stream_stopped_does_not_overwrite_it() {
+    // The stream skipped 300/36000; a recording made after the stream
+    // stopped reports 1/36000 and must not replace it.
+    let mut log = Log::default();
+    log.totals.push(
+        "Video stopped, number of skipped frames due to encoding lag: 300/36000 (0.8%)".into(),
+    );
+    let mut text = log.text();
+    let after = PLAY.end_ms + 120_000;
+    for (dt, line) in [
+        (
+            0,
+            "==== Recording Start ===============================================",
+        ),
+        (60_000, "Output 'adv_file_output': stopping"),
+        (
+            60_000,
+            "Output 'adv_file_output': Total frames output: 36000",
+        ),
+        (
+            60_000,
+            "Video stopped, number of skipped frames due to encoding lag: 1/36000 (0.0%)",
+        ),
+        (
+            60_010,
+            "==== Recording Stop ================================================",
+        ),
+    ] {
+        text.push_str(&format!(
+            "{}: {line}
+",
+            ts(after + dt)
+        ));
+    }
+    let mut run = passing_obs_run();
+    run.obs = Some(derive(&text, PLAY));
+    let sess = run.obs.as_ref().unwrap().session.clone().unwrap();
+    assert_eq!(
+        (sess.encode_skipped, sess.encode_total),
+        (Some(300), Some(36_000))
+    );
+    assert!(!sess.other_output_active);
+    let s = evaluate(&run);
+    assert!(s.check("V7").ok);
+    assert!(!s.gate("O2").pass);
+}
+
+#[test]
 fn f_missing_stop_block_is_invalid() {
     let log = Log {
         stop: false,
