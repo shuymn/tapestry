@@ -1,941 +1,941 @@
-# BMSプレーヤー基本設計
+# BMS Player Basic Design
 
-Windows専用のBMSプレーヤー（7鍵＋スクラッチの音楽ゲーム）の基本設計。判定を入力ログから計算し直せる評価器を中心に、ルールプリセット、スキン互換、独自IR、譜面配布までの境界を定める。
+The basic design of a Windows-only BMS player (a 7-key + scratch music game). Centered on an evaluator that can recompute judgments from the input log, it defines the boundaries out to rule presets, skin compatibility, a custom IR, and chart distribution.
 
-対象：Windows 10/11 ／ 時刻の単位：整数µs ／ coreの言語：Rust（推奨）
+Target: Windows 10/11 / Time unit: integer µs / Core language: Rust (recommended)
 
-## 目的と範囲
+## Goals and Scope
 
-beatorajaやLunatic Rave 2のように遊べるBMSプレーヤーを作る。最大の特徴は、プレイ中の入力を時刻付きですべて記録し、判定・スコア・ゲージを後から別のルールで計算し直せることにある。普段は「beatoraja風」で遊び、リザルト画面で「LR2風ならどうだったか」に切り替えて確認できる。
+Build a BMS player that plays like beatoraja or Lunatic Rave 2. Its biggest distinguishing feature is that every input during play is recorded with a timestamp, so judgments, score, and gauge can be recomputed later under a different rule. You normally play with "beatoraja-style", and on the result screen you can switch over to see "how it would have gone under LR2-style".
 
-### 目標
+### Goals
 
-- 押した手応え（キー音、判定表示、フレームの安定）が良く、何度も遊び直したくなるゲームであること
-- 配信や録画のソフトと同時に動かしても、相手の動作を大きく損なわないこと
-- スコアの1点を争う遊びに耐える、入力時刻にもとづく公平な判定
-- 判定・ゲージ・スコアの規則をプリセット（データ）で切り替えられること
-- 同じ入力ログと同じプリセットなら、どの環境でも同じ結果になること
-- 既存のスキン資産（LR2 CSV、beatoraja JSON・Lua）を、アダプタを介して使えること
+- A game that feels good to press (key sounds, judgment display, frame stability) and makes you want to replay it again and again
+- Running alongside streaming or recording software without significantly impairing their operation
+- Fair judgment based on input timestamps, robust enough for play that competes over a single point of score
+- Judgment, gauge, and scoring rules switchable via presets (data)
+- The same input log and the same preset produce the same result on any environment
+- Existing skin assets (LR2 CSV, beatoraja JSON and Lua) usable through adapters
 
-### 目標にしないこと
+### Non-goals
 
-- **beatorajaやLR2の判定を完全に再現すること**。近い挙動の「風」プリセットは用意するが、既存実装のバグまで一致させることはしない。
-- **元になった市販ゲームと同じ判定を標準にすること**。デフォルトは独自プリセットとする。
-- **市販ゲームのデータの取り込みや変換**。coreにも公式の拡張にも入れない。
-- Windows以外への対応。
+- **Exactly reproducing the judgment of beatoraja or LR2.** We provide "-style" presets with similar behavior, but do not go as far as matching bugs in the existing implementations.
+- **Making the judgment of the commercial game this is based on the standard.** The default is a custom preset.
+- **Importing or converting commercial game data.** It goes neither in core nor in official extensions.
+- Support for platforms other than Windows.
 
-## 設計原則
+## Design Principles
 
-> **評価は純粋関数**
+> **Evaluation is a pure function**
 >
-> 判定・スコア・ゲージは `(譜面, 入力ログ, プリセット)` だけから決まる。時計・音声・描画・グローバル状態を読まず、譜面も書き換えない。
+> Judgment, score, and gauge are determined solely by `(chart, input log, preset)`. Evaluation does not read the clock, audio, rendering, or global state, and does not modify the chart.
 
-> **入力は時刻付きの全エッジ**
+> **Input is every edge, timestamped**
 >
-> 押し・離しを1つ残らず、受け取った瞬間のQPC時刻とともに追記する。キーの「現在の状態」だけを持つことはしない。
+> Every press and release, without exception, is appended along with the QPC time at the moment it was received. Never keep only the "current state" of the keys.
 
-> **時刻は整数µs**
+> **Time is integer µs**
 >
-> 時計は単調増加するQPC。譜面・入力・判定はすべて `i64` のµsで扱い、ゲージは固定小数点で計算する。
+> The clock is the monotonically increasing QPC. Chart, input, and judgment all use `i64` µs, and the gauge is computed in fixed point.
 
-> **coreは閉じ、外側に拡張**
+> **Core is closed; extend outside it**
 >
-> 評価器には差し込み口を設けない。拡張は評価の前（譜面と入力を整える）と後（判定イベントを受け取る）にだけ置く。
+> The evaluator has no plug-in points. Extensions are placed only before evaluation (preparing the chart and input) and after it (receiving judgment events).
 
-プレイ中、リザルト、リプレイ、IRサーバーは、すべて同じ評価器のコードを使う。プレイ中の表示とリザルトの数字がずれる余地を構造的になくすためである。
+Live play, results, replays, and the IR server all use the same evaluator code. This structurally eliminates any room for the in-play display and the numbers on the result screen to diverge.
 
-> **禁止事項：元になった市販ゲームの名前を書かない**
+> **Prohibited: do not write the name of the commercial game this is based on**
 >
-> コード（識別子、コメント、文字列、ログの文言、テストの名前、アセットやファイルの名前）に、元になった市販ゲームの作品名・シリーズ名・メーカー名を入れない。用語は「7鍵」「スクラッチ」「BMS」のような一般的な語を使う。禁止語の一覧との照合は、同じ検査のスクリプトをgitのpre-commitフックとCIの両方から呼んで行う。フックはコミットの前に手元で気づくためのもので、手元で飛ばすこともできるので、見つかったら失敗させる最終の関門はCIとする。照合は、リポジトリで管理する自作のコード・ファイル名・文書を対象に、大文字と小文字の違いとUnicodeの正規化をそろえ、語の境界で行う。禁止語の一覧を置く専用のファイルだけを例外とし、外部の依存やライセンスの文書は対象外とする。コミットメッセージは対象外とする。
+> Do not put the title, series name, or maker name of the commercial game this is based on into code (identifiers, comments, strings, log messages, test names, asset or file names). Use generic terms such as "7-key", "scratch", and "BMS". Matching against the banned-word list is done by calling the same check script from both the git pre-commit hook and CI. The hook is for noticing locally before a commit and can also be skipped locally, so the final gate that fails on any hit is CI. Matching targets the self-authored code, file names, and documents managed in the repository, normalizes case and Unicode, and is done at word boundaries. Only the dedicated file that holds the banned-word list is exempt; external dependencies and license documents are out of scope. Commit messages are out of scope.
 
-厳密さを求めるのは、判定・時刻・入力ログまわりだけにする。それ以外（画面、演出、スキン、設定画面）は、遊んで確かめながら作り変える前提で軽く作る。
+Strictness is required only around judgment, time, and the input log. Everything else (screens, effects, skins, settings screens) is built lightly, on the assumption that it will be reworked while checking it by playing.
 
-## ゲームとしての体験
+## Game Experience
 
-これはゲームであり、判定の正しさは「気持ちよく遊べる」ための土台にすぎない。設計の良し悪しは、実際に遊んで手触りが良いかで判断する。
+This is a game, and the correctness of judgment is merely the foundation for "being pleasant to play". The quality of the design is judged by whether it actually feels good when played.
 
-### 手触りの目標
+### Feel Targets
 
-| 項目 | 目標 | 理由 |
+| Item | Target | Reason |
 | --- | --- | --- |
-| 押してからキー音が鳴るまで | 10ms以下 | 音の遅れは、判定のずれより先に「重い」と感じられる |
-| 押してから判定とボムが映るまで | 1〜2フレーム | 押した手応えは画面の反応で決まる |
-| フレームの安定 | 144/240Hzで落ちない | ノーツの流れが一瞬でも引っかかると、読みが崩れる |
-| 選曲から演奏開始まで | 1〜2秒 | 何度も遊び直すゲームなので、待ち時間がそのまま不満になる |
-| リトライ | 1操作・即時 | 同じ譜面の繰り返しが遊びの中心になる |
+| From press to key sound | 10 ms or less | Audio latency is felt as "heavy" before judgment deviation is |
+| From press to judgment and bomb appearing on screen | 1–2 frames | The feel of a press is determined by the screen's response |
+| Frame stability | No drops at 144/240 Hz | Even a momentary hitch in the note flow breaks reading |
+| From song selection to play start | 1–2 seconds | It is a game you replay many times, so waiting time turns directly into frustration |
+| Retry | One action, instant | Repeating the same chart is the core of play |
 
-### 遊びの流れ
+### Gameplay Loop
 
-- **選曲**：数万曲のライブラリでも一瞬で絞り込める検索と並べ替え、難易度表による選曲、曲のプレビュー再生。ライブラリの走査はバックグラウンドで差分だけ行う。
-- **演奏**：判定の文字・コンボ・ボム・レーザー・ゲージの動きが、押した瞬間に気持ちよく返ってくること。演出は判定イベント列を受け取って作るので、自由に作り込める。
-- **リザルト**：スコアと自己ベストとの差、ゲージの推移、早押し・遅押しの分布、ほかのプリセットでの結果を一画面で見られる。次の一回を遊びたくなる情報を出す。
-- **練習**：区間リピート、速度変更、オフセットの調整（入力ログから推奨値を出す）。上達そのものが遊びの大部分を占めるので、練習機能は後回しにしない。
+- **Song selection**: Search and sorting that narrow down even a library of tens of thousands of songs instantly, selection by difficulty table, and song preview playback. Library scanning runs in the background and processes only the differences.
+- **Play**: Judgment text, combo, bombs, lasers, and gauge movement respond pleasantly the instant you press. Effects are built by receiving the judgment event stream, so they can be elaborated freely.
+- **Result**: The score and the difference from the personal best, the gauge history, the early/late distribution, and the results under other presets can be seen on one screen. Show information that makes you want to play one more time.
+- **Practice**: Section repeat, speed change, and offset adjustment (a recommended value is derived from the input log). Improvement itself makes up most of the play, so practice features are not postponed.
 
-### 作り方
+### How We Build It
 
-- 最初の目標は「1曲を最後まで気持ちよく遊べる」状態にする。IR、配布、スキン互換はその後に足す。
-- 演出・画面・既定の判定とゲージの数値は、遊んで調整するものとして扱う。調整はプリセットとスキンの読み直しで、再起動せずに試せるようにする。
-- 既定の見た目（独自スキン）と既定の判定は、このゲームの顔になる。互換スキンに頼らず、標準で遊んで楽しい状態にする。
+- The first target is a state where "one song can be played pleasantly to the end". IR, distribution, and skin compatibility are added after that.
+- Effects, screens, and the default judgment and gauge values are treated as things tuned by playing. Tuning can be tried without restarting, by reloading presets and skins.
+- The default look (native skin) and the default judgment are the face of this game. Make the standard setup fun to play without relying on compatible skins.
 
-## 全体構成
+## Overall Architecture
 
-*図：入力スレッドが入力ログに追記し、ロジックスレッドの評価器がルールプリセットとともに入力の水位まで評価して判定イベント列を出す。音声スレッド、描画スレッド、リザルトとリプレイがそれを受け取り、描画はスキンのアダプタを通す。*
+*Figure: The input thread appends to the input log, and the evaluator on the logic thread, together with the rule preset, evaluates up to the input watermark and emits the judgment event stream. The audio thread, the render thread, and results and replays receive it; rendering goes through the skin adapter.*
 
-| スレッド | 役割 | やってはいけないこと |
+| Thread | Role | Must not |
 | --- | --- | --- |
-| 入力 | 機器のイベントを受け取り、QPC時刻を付けて入力ログに追記する。水位を公開する | 判定、メモリ確保を伴う処理 |
-| ロジック | 入力の公開と水位の更新で起き、評価器を水位まで進める。判定イベントを音声と描画へ渡す | 描画やファイル入出力を待つこと |
-| 音声 | WASAPIのコールバックでミキシングする。キー音とBGMを鳴らす | ロックの取得、メモリ確保 |
-| 描画 | 状態の写しを読み、スキンを描く | 評価器や譜面への書き込み |
-| 読み込み | 譜面・音声・BGAの読み込みと、動画のデコード | プレイ中の重い処理（事前に終える） |
+| Input | Receives device events, attaches QPC times, and appends them to the input log. Publishes the watermark | Judgment, processing that allocates memory |
+| Logic | Wakes on input publication and watermark updates, and advances the evaluator up to the watermark. Passes judgment events to audio and rendering | Waiting on rendering or file I/O |
+| Audio | Mixes in the WASAPI callback. Plays key sounds and BGM | Acquiring locks, allocating memory |
+| Render | Reads the state snapshot and draws the skin | Writing to the evaluator or the chart |
+| Loading | Loading charts, audio, and BGA, and decoding video | Heavy processing during play (finish it beforehand) |
 
-スレッド間は、ロックを使わない単一生産者・単一消費者のキューでつなぐ。キューは入力の出どころごと、ロジック→音声、ロジック→描画（演出イベント）に1本ずつ置き、取りこぼしてはいけないデータはすべてキューで渡す。三重バッファは、最新の値だけが要る描画用の状態の写しにだけ使う。共有する可変状態は持たない。
+Threads are connected by lock-free single-producer single-consumer queues. One queue is placed per input source, one for logic→audio, and one for logic→render (effect events), and all data that must not be dropped is passed through queues. Triple buffering is used only for the render state snapshot, where only the latest value is needed. There is no shared mutable state.
 
-### テストのための仕組み
+### Mechanisms for Testing
 
-次の3つは後から足すと作り直しになるので、最初から入れておく。
+The following three would mean rework if added later, so they are built in from the start.
 
-- **時計の差し替え**：QPCを直接読まず、`TimeSource` を通して読む。本番では実際のQPC、テストでは自分で進める仮想の時計を使う。入力・ロジック・音声・描画のすべてが、これを通して時刻を読む。
-- **スレッドなしで進められる処理**：ロジックの処理は「指定した時刻まで進める」関数として作り、スレッドはそれを呼ぶだけにする。テストでは、同じ関数をスレッドなしで順番に呼ぶ。
-- **入出力の差し替え**：入力は、入力ログやテストの台本から流し込む仮の入力に差し替えられる。音声は、画面外で波形を作る出力や、予約した音とサンプル位置を記録する出力に差し替えられる。描画は、画面外のテクスチャに描ける。
+- **Swappable clock**: QPC is not read directly but through `TimeSource`. Production uses the real QPC; tests use a virtual clock that the test advances itself. Input, logic, audio, and rendering all read time through it.
+- **Processing that can advance without threads**: Logic processing is written as a function that "advances to a specified time", and threads only call it. Tests call the same function sequentially, without threads.
+- **Swappable I/O**: Input can be replaced with fake input fed from an input log or a test scenario. Audio can be replaced with an output that generates waveforms offscreen, or an output that records scheduled sounds and sample positions. Rendering can draw to an offscreen texture.
 
-テストでは、テスト用の実行器が本番と同じ順番で全体を進める：仮の入力を流し込む → 出どころごとの水位を公開する → 評価器を水位まで進める → 音声を1ブロック処理する → 描画する。評価器を水位を介さずに直接進めることはしない。音声の再生位置とそのQPC時刻も実行器が模擬し、時計のずれ、読み取りの揺れ、再開による不連続を注入して、本番と同じ音声時計の補正の処理を確かめる。
+In tests, a test runner advances the whole system in the same order as production: feed fake input → publish the per-source watermarks → advance the evaluator up to the watermark → process one audio block → render. The evaluator is never advanced directly, bypassing the watermark. The runner also simulates the audio playback position and its QPC time, injecting clock drift, read jitter, and discontinuities from resume, to verify the same audio clock correction as production.
 
-## 時刻の基準（QPC）
+## Time Base (QPC)
 
-この設計の正しさは、すべての時刻を1つの時計にそろえることにかかっている。基準は `QueryPerformanceCounter`（QPC）とし、入力・音声・表示の3つの時計をすべてQPCに対応させる。壁時計（`system_clock`など）は使わない。
+The correctness of this design depends on aligning all times to a single clock. The base is `QueryPerformanceCounter` (QPC), and all three clocks (input, audio, and display) are mapped to QPC. Wall clocks (`system_clock`, etc.) are not used.
 
-### QPCの扱い
+### Handling QPC
 
-- QPCは全コアで一貫し、時刻が戻ることはない。CPUの割り当て（affinity）は固定しない。別のスレッドで取った時刻どうしは±1刻みの差だと前後が決まらないので、イベントの順番は時刻と連番の全順序で決める。
-- 周波数（`QueryPerformanceFrequency`）は起動時に1回読んでおく。多くの環境で10MHz（100ns刻み）である。µsへの変換は `i128` で掛けてから割る。丸めは数学的な切り捨て（負の値でも小さい側へ。Rustでは `div_euclid`）に固定する。
-- 演奏開始時のQPC値を譜面の0µsとし、以後の時刻はすべてそこからの経過µsで表す。入力ログには相対時刻だけを書き、QPCの値そのものはPCの外に出さない（起動してからの時間がわかるため）。
-- QPCはスリープ中も進む。ゲームのウィンドウでサスペンドと再開の通知（`WM_POWERBROADCAST` の `PBT_APMSUSPEND` と再開の通知。Modern Standbyの環境では通知の登録も行う）を受けたら、そのプレイを中断し、入力ログを「不完全」とする。AC電源の接続の変化のような、ほかの電源の通知では中断しない。
+- QPC is consistent across all cores and never goes backward. CPU affinity is not pinned. Times taken on different threads cannot be ordered when they differ by ±1 tick, so the order of events is determined by a total order of time and sequence number.
+- The frequency (`QueryPerformanceFrequency`) is read once at startup. On many environments it is 10 MHz (100 ns ticks). Conversion to µs multiplies first and then divides, in `i128`. Rounding is fixed to mathematical floor (toward the smaller side even for negative values; `div_euclid` in Rust).
+- The QPC value at play start is the chart's 0 µs, and every later time is expressed as the elapsed µs from there. Only relative times are written to the input log, and raw QPC values never leave the PC (because they reveal the time since boot).
+- QPC keeps advancing during sleep. When the game window receives the suspend and resume notifications (`PBT_APMSUSPEND` of `WM_POWERBROADCAST` and the resume notification; on Modern Standby environments, also register for the notifications), that play is aborted and the input log is marked "incomplete". Other power notifications, such as a change in AC power connection, do not abort play.
 
-### 判定に使う時刻
+### Timestamps Used for Judgment
 
-判定に使うのは、入力スレッドがイベントを受け取った直後のQPC（受信時刻）とする。水位の保証（「入力」の章）は受信時刻の上で成り立つ。キーボードと専用コントローラーはRaw Input、MIDIはコールバックで受け取り、どれも同じ扱いにする。
+Judgment uses the QPC taken immediately after the input thread receives the event (the receive time). The watermark guarantee (the "Input" section) holds on receive times. Keyboards and dedicated controllers are received via Raw Input and MIDI via callbacks, and all of them are treated the same.
 
-GameInputの入力にはµs単位の時刻が付き、`IGameInput::GetCurrentTimeStamp` と比べられる。ただし公式の仕様からは、その時刻がどこで付くか、QPCとの正確な対応、時計どうしのずれの有無までは読み取れない。また、後から読み出す入力がすでに確定した水位より前の時刻を持ちうるので、そのまま判定に使うと水位の保証が崩れる。そこで当面は次のように扱う。
+GameInput input carries µs timestamps that can be compared with `IGameInput::GetCurrentTimeStamp`. However, the official specification does not tell where that timestamp is attached, its exact correspondence with QPC, or whether the clocks drift relative to each other. Also, input read out later can carry a time earlier than an already-finalized watermark, so using it for judgment as is would break the watermark guarantee. For now, it is therefore handled as follows.
 
-- GameInputの時刻は、受信時刻と並べて入力ログに記録し、計測（受信までの遅れのばらつき）にだけ使う。QPCとの対応は、QPCで前後を挟んで `GetCurrentTimeStamp` を読む測定を繰り返して求め、その不確かさも記録する。
-- 判定に使う時刻をGameInputの時刻に切り替えるのは、計測の結果で受信までの遅れに上限があると確かめられた場合だけとする。その場合は、水位を「受信時刻の水位からその上限を引いた値」とし、上限を超えて遅れた入力は入力ログを「不完全」とする。
+- GameInput timestamps are recorded in the input log alongside the receive times and used only for measurement (the variance of the latency until receipt). The mapping to QPC is obtained by repeatedly measuring `GetCurrentTimeStamp` reads bracketed by QPC reads, and its uncertainty is also recorded.
+- Judgment switches to GameInput timestamps only if measurement confirms that the latency until receipt has an upper bound. In that case the watermark is "the receive-time watermark minus that bound", and any input delayed beyond the bound marks the input log "incomplete".
 
-### 3つの時計の対応
+### Mapping the Three Clocks
 
-| 時計 | QPCとの対応の取り方 | 使い道 |
+| Clock | How it is mapped to QPC | Used for |
 | --- | --- | --- |
-| 入力 | 受け取った直後のQPC（上の節） | 判定 |
-| 音声 | `IAudioClock::GetPosition` が返す再生位置と、その位置を読んだQPC時刻（100ns単位）の組 | 音声のずれの補正（「時刻とオフセット」の章） |
-| 表示 | DXGIのフレーム統計（`GetFrameStatistics`）にある、過去の垂直同期のQPC時刻（`SyncQPCTime`）と、それに対応する表示の回数 | ノーツを描く位置の予測の補助と、表示の遅れの計測 |
+| Input | The QPC immediately after receipt (previous subsection) | Judgment |
+| Audio | The pair of the playback position returned by `IAudioClock::GetPosition` and the QPC time at which that position was read (in 100 ns units) | Correcting audio drift (the "Time and Offsets" section) |
+| Display | The QPC time of a past vertical sync (`SyncQPCTime`) in the DXGI frame statistics (`GetFrameStatistics`), and the present count corresponding to it | Aiding the prediction of note draw positions, and measuring display latency |
 
-- DXGIのフレーム統計は予測の補助にとどめる。初回や表示モードの変更の直後、統計が古いとき、VRRで更新の周期が一定でないときは、QPCと設定した表示遅延だけで予測する。
-- 画面の遅れや判定線までの走査にかかる時間は、表示遅延のオフセットとして校正する。統計から求めた分とオフセットを二重に足さない。
-- wgpuは生のスワップチェーンを公開しないので、DX12のバックエンドの内部（`as_hal`）からDXGIのスワップチェーンに触れる。この部分は `render` の中に閉じ込める。
+- DXGI frame statistics are only an aid to prediction. The first time, right after a display mode change, when the statistics are stale, and when the refresh period is irregular under VRR, prediction uses only QPC and the configured display latency.
+- The display's lag and the scan-out time down to the judgment line are calibrated as the display latency offset. Do not double-add the portion derived from the statistics and the offset.
+- wgpu does not expose the raw swap chain, so the DXGI swap chain is reached from inside the DX12 backend (`as_hal`). This part is confined to `render`.
 
-### 時刻の精度を決めるもの
+### What Determines Timing Accuracy
 
-判定の公平さを決めるのは、QPCの分解能ではなく、押してから受信時刻が付くまでの遅れとそのばらつきである。
+What determines the fairness of judgment is not the resolution of QPC, but the latency from the press until the receive time is attached, and its variance.
 
-- **USBのポーリング**：125Hzの機器では、USBの報告を待つ間だけで最大8msの幅が出る（1000Hzなら1ms）。報告の間隔を記録し、変化のたびに報告が届く条件がそろったときだけポーリング頻度を推定する。推定できたときに頻度が低ければ警告し、推定できなければ「推定不能」と記録する。
-- **OSが届けるまでの遅れ**：ほぼ一定の分は入力遅延のオフセットで補正する。
-- **スレッドが起きるまでのばらつき**：起きたら直ちに時刻を付け、`GetRawInputBuffer` でまとめて読む。入力スレッドはMMCSSで優先する。まとめて読んだイベントは同じ受信時刻になり、個々の発生時刻は復元できない。
+- **USB polling**: With a 125 Hz device, waiting for the USB report alone introduces a spread of up to 8 ms (1 ms at 1000 Hz). Report intervals are recorded, and the polling rate is estimated only when the conditions for a report to arrive on every change are met. If it can be estimated and the rate is low, a warning is shown; if it cannot be estimated, "not estimable" is recorded.
+- **Latency until the OS delivers**: The roughly constant part is corrected by the input latency offset.
+- **Variance in thread wake-up**: The time is attached immediately on waking, and events are read in batches with `GetRawInputBuffer`. The input thread is prioritized with MMCSS. Events read in one batch get the same receive time, and their individual occurrence times cannot be recovered.
 
-受信の方式（Raw Input、MIDIなど）、報告の間隔の記録、推定したポーリング頻度（または推定不能）は、機器の情報として入力ログに記録する。計測の表示には、報告の間隔の分布、スレッドが起きるまでのばらつき、3つの時計の対応のずれを出し、その環境の時刻の質を数字で確かめられるようにする。
+The receive method (Raw Input, MIDI, etc.), the record of report intervals, and the estimated polling rate (or "not estimable") are recorded in the input log as device information. The measurement display shows the distribution of report intervals, the variance in thread wake-up, and the deviation in the mapping of the three clocks, so the timing quality of that environment can be checked in numbers.
 
-## 時刻とオフセット
+## Time and Offsets
 
-- **判定の時間軸**：QPCを基準にした、演奏開始からの経過µs（「時刻の基準（QPC）」の章）。
-- **単位**：譜面・入力・判定の時刻はすべて `i64` のµs。ms単位への丸めはしない。
-- **譜面の時刻**：BPM変化とSTOPを含む時刻の計算は有理数で行い、µsに丸めるのは1回だけにする。浮動小数点の誤差の積み重ねと、環境による差をなくすため。
+- **Judgment timeline**: The elapsed µs from play start, based on QPC (the "Time Base (QPC)" section).
+- **Unit**: Chart, input, and judgment times are all `i64` µs. There is no rounding to ms.
+- **Chart time**: Time computation, including BPM changes and STOPs, is done with rational numbers, and rounding to µs happens only once. This eliminates accumulated floating-point error and environment-dependent differences.
 
-### 音声を判定の時間軸に合わせる
+### Aligning Audio to the Judgment Timeline
 
-音声デバイスの時計はQPCに対して少しずつずれる（ドリフトする）。判定の時間軸はQPCに固定し、ずれは音声側で吸収する。こうすれば、リプレイに音声時計の変換履歴を残さなくても判定を再現できる。
+The audio device's clock drifts gradually relative to QPC. The judgment timeline is fixed to QPC, and the drift is absorbed on the audio side. This way, judgments can be reproduced without keeping an audio clock conversion history in the replay.
 
-- `IAudioClock::GetPosition` は、デバイス上の位置 `pos` と、その位置を読んだ時刻 `qpcPos`（100ns単位）を返す。位置は `GetFrequency` の値 `freq` で割って秒にする（`pos` がサンプル数とは限らない）。
-- 音声上の時刻 `pos / freq` と、QPCから求めた判定の時間軸上の時刻（`qpcPos` を換算）の差を、数百msごとに測る。
-- 差が広がったら、ミキサーがごくわずかな再サンプリング（または無音区間での数サンプルの詰め・伸ばし）で戻す。演奏中に目立つ跳びは起こさない。
-- 開始・一時停止・再開のときは、この対応を取り直す。
+- `IAudioClock::GetPosition` returns the position on the device, `pos`, and the time at which that position was read, `qpcPos` (in 100 ns units). The position is converted to seconds by dividing by `freq`, the value from `GetFrequency` (`pos` is not necessarily a sample count).
+- The difference between the audio time `pos / freq` and the time on the judgment timeline derived from QPC (converted from `qpcPos`) is measured every few hundred ms.
+- When the difference grows, the mixer brings it back with very slight resampling (or by trimming or stretching a few samples in silent sections). No noticeable jumps happen during play.
+- This mapping is re-established on start, pause, and resume.
 
-### オフセットは3つに分ける
+### Three Separate Offsets
 
-| 名前 | 意味 | 使う場所 |
+| Name | Meaning | Where used |
 | --- | --- | --- |
-| 入力遅延 | 押してから入力スレッドが受け取るまでの遅れ | 評価器（受信時刻から差し引いて評価時刻にする） |
-| 音声出力遅延 | デバイスの再生位置から、実際に音が耳に届くまでの残りの遅れ | 音声の予約位置 |
-| 表示遅延 | 描画してから画面に映るまでの遅れ | ノーツの描画位置だけ |
+| Input latency | The delay from the press until the input thread receives it | Evaluator (subtracted from the receive time to get the evaluation time) |
+| Audio output latency | The remaining delay from the device playback position until the sound actually reaches the ear | Audio scheduling position |
+| Display latency | The delay from rendering until it appears on screen | Note draw position only |
 
-`GetPosition` の位置は、デバイスがすでに再生した位置を表す。そのため、そこに含まれる遅れを音声出力遅延として二重に足さない。音声出力遅延は、測定で残った分だけを表す。
+The `GetPosition` position represents the position the device has already played. Therefore, the delay already included in it must not be double-added as audio output latency. Audio output latency represents only what remains in measurement.
 
-3つのオフセットは評価の入力としてリプレイに記録する。
+The three offsets are recorded in the replay as inputs to evaluation.
 
-### 自動オフセット調整
+### Automatic Offset Adjustment
 
-- **提案（常に行う）**：プレイ後に入力ログから推奨値を出す。調整が無効のときでも出す。
-- **プレイ中の調整（任意）**：セッション方針で有効にすると、プレイ中に入力遅延のオフセットを少しずつ動かす。調整の規則（観測するずれの範囲、移動平均の窓、更新の間隔、動かせる範囲、変化の速さの上限）は版付きのセッション方針として持つ。
-- **記録**：実際に適用したオフセットの変化を入力ログに残す。どのオフセットで遊んだかは、押し方と同じく入力の一部として扱う。
-- **計算し直すとき**：調整の規則を動かし直さず、記録した変化をそのまま適用する。どのプリセットで計算し直しても、プレイ中と同じオフセットで判定される。
-- **検証**：調整の規則は、それまでの判定のずれだけから決まる。遊んだときのプリセットと規則で計算し直せば、記録された変化が再現されるはずなので、IRではこれを確かめ、一致しない記録は受け付けない。
+- **Suggestion (always)**: After play, a recommended value is derived from the input log. It is produced even when adjustment is disabled.
+- **In-play adjustment (optional)**: When enabled by the session policy, the input latency offset is moved gradually during play. The adjustment rules (range of observed deviations, moving-average window, update interval, allowed range, maximum rate of change) are held as a versioned session policy.
+- **Recording**: The offset changes actually applied are kept in the input log. Which offset you played with is treated as part of the input, just like how you pressed.
+- **When recomputing**: The adjustment rules are not rerun; the recorded changes are applied as is. Whichever preset is used for recomputation, judgment uses the same offsets as during play.
+- **Verification**: The adjustment rules are determined solely by the judgment deviations up to that point. Recomputing with the preset and rules used during play should reproduce the recorded changes, so the IR checks this and rejects records that do not match.
 
-### オフセットの変化と水位
+### Offset Changes and the Watermark
 
-オフセットは出どころごとに受信時刻の関数 `offset_i(t)` として表し、評価時刻は `t − offset_i(t)` とする。
+Offsets are expressed per source as a function of receive time, `offset_i(t)`, and the evaluation time is `t − offset_i(t)`.
 
-- 変化は一度に跳ばさず、受信時刻に対する傾きに上限（1未満）を設けた区分的な一次関数として連続的に動かす。値は整数µsで、区間の中の補間は決まった丸め方（切り捨て）で計算する。
-- 新しい変化は、それを決めた時点より後の受信時刻から始まる区間としてだけ追加する。公開済みの水位までの区間は書き換えない。
-- 調整は確定済みの判定だけを材料にし、次の区間をいつから始めるかは評価器の版で固定した規則で決める。
+- Changes do not jump at once; they move continuously as a piecewise linear function with an upper bound (less than 1) on the slope with respect to receive time. Values are integer µs, and interpolation within a segment is computed with a fixed rounding method (floor).
+- A new change is added only as a segment that starts at a receive time later than the point at which it was decided. Segments up to the published watermark are never rewritten.
+- Adjustment uses only finalized judgments as its material, and when the next segment starts is decided by a rule fixed by the evaluator version.
 
-こうすると受信時刻から評価時刻への対応は常に単調に増え、過去の対応も変わらないので、確定済みの水位より前の評価時刻を持つ入力が後から現れることはない。
+This keeps the mapping from receive time to evaluation time always monotonically increasing, and past mappings never change, so an input with an evaluation time earlier than the finalized watermark never shows up later.
 
-プレイ中の調整は、判定のずれを縮める方向に働くので、補助機能の一種として扱う。IRでは当面、調整を有効にした記録を通常のランキングと分ける。
+In-play adjustment works in the direction of shrinking judgment deviation, so it is treated as a kind of assist feature. For now, the IR separates records with adjustment enabled from the normal rankings.
 
-## 入力
+## Input
 
-- **受け取り方**：専用スレッドでRaw Input（キーボード、HIDの専用コントローラー）を受け取る。MIDIは別のコールバックで受け、同じ形式にそろえる。時刻の付け方は「時刻の基準（QPC）」の章による。GameInputを併用する場合も、同じ機器を2つの経路から二重に取り込まない。
-- **キーボード**：専用コントローラーを持たない人が最初に使う標準の機器として扱う。入力は物理キーのIDで記録するので、標準のキー配置、スクラッチの割り当て、同時押しを確かめる画面（キーボードの同時押しの制限に気づくため）は、入力の層の中で後から足せる。
-- **時刻**：イベントを受け取った瞬間にQPC時刻を付ける（受信時刻）。OSが届けるまでの一定の遅れは、入力遅延のオフセットで補正する。
-- **正本は物理入力**：記録するのは「どの機器のどのボタン・軸が、いつ、どう変わったか」である。レーンへの対応（キー設定）は記録した上で評価器が適用する。1つのレーンに複数のキーを割り当てた場合や、機器ごとのデバウンスも、これで再現できる。
-- **デバウンス**：記録の段階ではかけない。評価器が機器の設定として後からかける。
+- **Receiving**: A dedicated thread receives Raw Input (keyboards, HID dedicated controllers). MIDI is received in a separate callback and normalized to the same format. How times are attached follows the "Time Base (QPC)" section. Even when GameInput is also used, the same device is never ingested twice through two paths.
+- **Keyboard**: Treated as the standard device that people without a dedicated controller use first. Input is recorded by physical key ID, so a standard key layout, scratch assignment, and a screen for checking simultaneous presses (to notice the keyboard's simultaneous-press limits) can be added later within the input layer.
+- **Time**: A QPC time is attached at the moment the event is received (the receive time). The constant delay until the OS delivers it is corrected by the input latency offset.
+- **Physical input is the source of truth**: What is recorded is "which button or axis of which device changed, when, and how". The mapping to lanes (key config) is recorded, and the evaluator applies it. This also reproduces multiple keys assigned to one lane and per-device debounce.
+- **Debounce**: Not applied at the recording step. The evaluator applies it later as a device setting.
 
-### アナログスクラッチ
+### Analog Scratch
 
-軸の値を時刻付きで生のまま記録し、スクラッチの押し・離しへの変換は評価器が機器の設定にもとづいて行う。設定には次を含め、すべてリプレイに記録する。
+Axis values are recorded raw with timestamps, and the evaluator converts them into scratch presses and releases based on the device settings. The settings include the following, and all of them are recorded in the replay.
 
-- 値が絶対値か差分か、一周したときの折り返し、回転方向の反転
-- 押しとみなす回転量のしきい値、動きが止まってから離しとみなすまでの時間
-- ボタン入力とアナログ入力を同じレーンに合成するときの規則
-- 機器が切断されたときは、押されていた入力をすべて離したものとして扱う
+- Whether the value is absolute or relative, wraparound on a full revolution, inversion of the rotation direction
+- The rotation threshold for counting as a press, and the time after movement stops before counting as a release
+- The rule for combining button input and analog input on the same lane
+- When a device is disconnected, every input that was pressed is treated as released
 
-### 水位
+### Watermark
 
-水位とは、「今後これより前の評価時刻を持つ入力は届かない」という境界である。評価時刻は、受信時刻から入力遅延を引き、譜面の時間軸に換算した値をいう。
+The watermark is the boundary that "no input with an earlier evaluation time will arrive from now on". The evaluation time is the receive time minus the input latency, converted to the chart's timeline.
 
-- 入力の出どころ（Raw Input、MIDIなど）ごとに専用のキューを持つ。出どころは、受け取ったイベントをすべてキューに入れてから、その時点の受信時刻 `w_i` を公開する。この順序を守る。
-- 全体の水位は、出どころごとに受信時刻を評価時刻に換算してから最小値を取る：`min_i(w_i − offset_i(w_i))`。ロジックスレッドは、各キューのイベントを決まった全順序で1本に合わせてから評価器に渡す。
-- 入力のないMIDI機器のように自分からは何も届けない出どころは、入力スレッドが定期的に「この時刻までは何もない」という知らせ（受信時刻の更新）を代わりに公開し、水位が止まらないようにする。
-- 水位と同じ時刻のイベントは、水位の公開より前に公開済みであることを保証する。
-- 入力スレッドは最低1kHzで起き、新しいイベントがなくても水位を進める。
+- Each input source (Raw Input, MIDI, etc.) has its own dedicated queue. A source puts all the events it has received into its queue, and then publishes the receive time `w_i` at that point. This order is kept.
+- The overall watermark is the minimum after converting each source's receive time into an evaluation time: `min_i(w_i − offset_i(w_i))`. The logic thread merges the events of the queues into one stream in a fixed total order before passing them to the evaluator.
+- For sources that deliver nothing on their own, such as a MIDI device with no input, the input thread periodically publishes on their behalf a notice that "there is nothing up to this time" (a receive-time update), so the watermark does not stall.
+- Events with the same time as the watermark are guaranteed to have been published before the watermark is published.
+- The input thread wakes at least at 1 kHz and advances the watermark even when there are no new events.
 
-> **判定に関係しない操作は別の列にする**
+> **Operations unrelated to judgment go in a separate stream**
 >
-> ハイスピードやレーンカバーの変更は、判定用の入力とは別の列として記録する。評価器は判定用の列だけを読む。
+> Hi-speed and lane cover changes are recorded as a stream separate from the judgment input. The evaluator reads only the judgment stream.
 
-## 評価器
+## Evaluator
 
-評価器は、入力イベントとノーツの期限（見逃しのミス、LNの離し、HCNのゲージ増減、地雷、曲の終了）を1本のキューに並べ、時刻の順に処理する離散イベントの処理系である。フレームにも固定の時間刻みにも依存しない。
+The evaluator is a discrete-event processing system that puts input events and note deadlines (miss for an unhit note, LN release, HCN gauge increase and decrease, mines, song end) in a single queue and processes them in time order. It depends neither on frames nor on a fixed time step.
 
 ```
-pub struct Evaluator { /* 判定状態。譜面そのものは持たず参照する */ }
+pub struct Evaluator { /* Judgment state. Does not own the chart itself; references it */ }
 
 impl Evaluator {
     pub fn new(chart: &Chart, rule: &RulePreset, device: &DeviceProfile) -> Self;
     pub fn push_input(&mut self, ev: PhysicalInputEvent);
-    /// 水位までのイベントを確定させ、判定イベントを out に追加する
+    /// Finalizes events up to the watermark and appends judgment events to out
     pub fn advance_to(&mut self, watermark: Micros, out: &mut Vec<JudgeEvent>);
 }
 
-/// リザルト・リプレイ・IRで使う一括評価。中身は push_input と advance_to(終端)
+/// Batch evaluation used for results, replays, and IR. Internally push_input and advance_to(end)
 pub fn evaluate(chart: &Chart, log: &InputLog, rule: &RulePreset, range: Option<&RangeSpec>) -> Evaluation;
-// RangeSpec：区間、助走の長さ、ゲージの初期値（「入力ログとリプレイ」の章の区間の評価）
+// RangeSpec: section, lead-in length, initial gauge value (section evaluation in the "Input Logs and Replays" section)
 ```
 
-### 水位までしか確定しない
+### Finalize Only Up to the Watermark
 
-プレイ中は `advance_to(水位)` だけを呼ぶ。期限を過ぎたノーツでも、水位がその期限を越えるまではミスを確定しない。そのため、届く途中だった入力に先回りしてミスにすることは構造的に起きない。確定の遅れは水位の間隔で決まり、目標は1ms以下とする（Windowsでは保証できないので、計測して確かめる）。
+During play, only `advance_to(watermark)` is called. Even for a note whose deadline has passed, the miss is not finalized until the watermark passes that deadline. Therefore, a miss is structurally never decided ahead of an input that was still on its way. The finalization delay is determined by the watermark interval, and the target is 1 ms or less (this cannot be guaranteed on Windows, so it is measured and verified).
 
-### ロジックスレッドが起きるきっかけ
+### What Wakes the Logic Thread
 
-- 入力イベントの公開と、水位の更新の両方で起きる。入力がなくても、見逃し・HCN・地雷・曲の終了が水位の更新で処理される。
-- 起床の通知を取りこぼしても、次に起きたときに最新の水位まで進めれば結果は同じになる。
-- 入力のキューがあふれた場合は、そのプレイの入力ログを「不完全」として記録し、リプレイやIRの対象から外す。黙って入力を捨てることはしない。
+- It wakes both on input event publication and on watermark updates. Even without input, misses, HCN, mines, and song end are processed on watermark updates.
+- Even if a wake notification is missed, advancing to the latest watermark on the next wake gives the same result.
+- If an input queue overflows, that play's input log is recorded as "incomplete" and excluded from replays and IR. Input is never silently dropped.
 
-### 出力は判定イベント列だけ
+### The Only Output Is the Judgment Event Stream
 
-- 判定（ノーツ、判定の種類、ずれのµs）、コンボの変化、ゲージの変化、鳴らすキー音、LNの状態変化を、時刻付きのイベントとして出す。イベントには連番を付ける。
-- キー音、ボムの演出、スコアの表示は、イベントを受け取る側の仕事にする。評価器は音声にもスキンにも触れない。
-- 押したときにどのノーツの音を鳴らすかもルールで変わるので、評価器が「鳴らす音」をイベントとして出す。
+- Judgments (note, judgment type, deviation in µs), combo changes, gauge changes, key sounds to play, and LN state changes are emitted as timestamped events. Events carry sequence numbers.
+- Key sounds, bomb effects, and score display are the job of whoever receives the events. The evaluator touches neither audio nor skins.
+- Which note's sound plays on a press also varies by rule, so the evaluator emits the "sound to play" as an event.
 
-### 決定性
+### Determinism
 
-- 時刻は整数µs、ゲージは固定小数点（丸めの規則は評価器の版で固定）。浮動小数点は使わない。
-- 同じ時刻のイベントの処理順は、プリセットの項目として明示する。
-- 乱数を使うもの（`#RANDOM` の分岐、RANDOM系のオプション）は、評価の前に譜面を確定させる段階で決め、結果を記録する。評価器自身は乱数を使わない。
-- 同じ譜面ファイルでも、読み込み処理の版が変わると解釈が変わりうる。そのため、読み込み処理の版と、確定した譜面のハッシュを記録する。
+- Time is integer µs, and the gauge is fixed-point (the rounding rules are fixed by the evaluator version). No floating point is used.
+- The processing order of events at the same time is made explicit as a preset item.
+- Anything that uses randomness (`#RANDOM` branches, RANDOM-type options) is decided at the step that resolves the chart before evaluation, and the result is recorded. The evaluator itself uses no randomness.
+- Even for the same chart file, a change in the loader version can change its interpretation. So the loader version and the hash of the resolved chart are recorded.
 
-## ルールプリセット
+## Rule Presets
 
-ルールの違いは、データ（TOMLの数値）、決まった選択肢（`enum`）、評価器に組み込まれたルール専用の実装の3つで表す。どれも評価器の中にあるコードで、利用者が後から読み込むプラグインにはしない。プリセットはデータ・選択肢と、使う評価の実装の名前と版を持ち、丸ごとシリアライズしてハッシュを取れるようにする。どのルールで評価したかを確実に記録するためである。
+Rule differences are expressed in three ways: data (numbers in TOML), fixed choices (`enum`), and rule-specific implementations built into the evaluator. All of them are code inside the evaluator, not plugins that users load later. A preset holds the data and choices plus the name and version of the evaluation implementation to use, and can be serialized in full and hashed. This is so that which rule was used for evaluation is reliably recorded.
 
-| 段階 | 内容 |
+| Level | Contents |
 | --- | --- |
-| データ | 判定窓（判定ごと、早い側と遅い側を別々に。通常ノーツ・スクラッチ・LNの終端で表を分ける）<br>`#RANK` / `#DEFEXRANK` から判定窓の倍率への換算表、`#TOTAL` がないときの既定値<br>空POORの範囲<br>ゲージ（初期値、下限、クリアの境界、判定ごとの増減、低残量時の軽減）<br>スコアの重み（EXスコア）、BPに数えるもの、同じ時刻のイベントの処理順 |
-| 選択肢 | 押した入力の割り当て方：最も近いノーツ／未処理で最も古いノーツ／コンボ優先<br>LNの判定方式：LN／CN／HCN（譜面の指定がない場合の既定値と、譜面の指定より優先するかどうか）<br>`#TOTAL` の効かせ方：増加量に掛ける／ダメージも補正する<br>地雷の条件：通過時に押していたら／その時刻に押したら |
-| 固定 | 入力時刻で判定する、時刻の順に処理する、生存系のゲージは一度0になったら戻らない、時刻は整数µs |
+| Data | Judgment windows (per judgment, early and late sides separately; separate tables for normal notes, scratch, and LN ends)<br>Conversion table from `#RANK` / `#DEFEXRANK` to judgment window multipliers, default value when `#TOTAL` is absent<br>Empty POOR range<br>Gauge (initial value, lower limit, clear threshold, per-judgment increase and decrease, reduction at low remaining gauge)<br>Score weights (EX score), what counts toward BP, processing order of events at the same time |
+| Choices | How a press is assigned: nearest note / oldest unprocessed note / combo priority<br>LN judgment mode: LN / CN / HCN (the default when the chart does not specify one, and whether it overrides the chart's specification)<br>How `#TOTAL` applies: multiplies the increase / also corrects damage<br>Mine condition: held while it passes / pressed at its time |
+| Fixed | Judge by input time, process in time order, survival gauges never recover once they reach 0, time is integer µs |
 
-> **LNの「書き方」と「判定方式」は別物**
+> **LN "notation" and "judgment mode" are different things**
 >
-> `#LNTYPE` と `#LNOBJ` は、譜面の中でLNをどう書いているかを表す。読み込み処理がこれを解釈して、LNの区間（始点と終点）を復元する。LN／CN／HCNのどれとして判定するかは、それとは別に決まる。譜面が判定方式を指定している場合（beatorajaの `#LNMODE` など）はその値を、なければプリセットの既定値を使う。プリセットで「譜面の指定より優先する」と決めた場合だけ、プリセットの値を使う。
+> `#LNTYPE` and `#LNOBJ` express how LNs are written in the chart. The loader interprets them and reconstructs the LN spans (start and end). Whether to judge them as LN, CN, or HCN is decided separately. If the chart specifies a judgment mode (such as beatoraja's `#LNMODE`), that value is used; otherwise the preset's default is used. Only when the preset is set to "override the chart's specification" is the preset's value used.
 
-### 標準のプリセット
+### Standard Presets
 
-- **独自（デフォルト）**：このプレーヤー固有の判定。元になった市販ゲームの判定とは異なる値にする。
-- **beatoraja風**、**LR2風**：公開されている情報をもとに、近い挙動を目指す。名前は「互換」ではなく「風」とし、完全な一致は約束しない。
+- **Custom (default)**: Judgment specific to this player. Its values differ from the judgment of the commercial game this is based on.
+- **beatoraja-style**, **LR2-style**: Aim for similar behavior based on public information. They are named "-style", not "compatible", and an exact match is not promised.
 
-項目は、それを必要とするプリセットが現れたときに追加する。使われない調整項目は先に作らない。
+Items are added when a preset that needs them appears. Unused tuning items are not built in advance.
 
-### 数値で表せない違いへの対応
+### Handling Differences Not Expressible as Numbers
 
-守るのは「データだけで表す」ことではなく、評価器の外から見た約束である。すなわち `(譜面, 入力ログ, プリセット)` から判定イベント列を出す処理が純粋で決定的であり、版とともに記録されること。この約束の内側で、次の順に対応を広げる。
+What is kept is not "express everything with data only", but the contract as seen from outside the evaluator: the process that produces the judgment event stream from `(chart, input log, preset)` is pure and deterministic, and is recorded together with versions. Within this contract, support is extended in the following order.
 
-1. **数値で表せる違い**：プリセットのデータで扱う。
-2. **数値で表せない違い**：該当する軸に選択肢を1つ足す（例：見逃しの条件、空POORでコンボが切れるかどうか）。ルールの違いは軸ごとに1つのモジュールにまとめ、選択肢の追加がその軸の中だけで済むようにする。「ルール全体」で分岐するコードを判定の各所に散らさない。
-3. **軸に分けられないほど違う**：そのルール専用の評価の実装を評価器の中に1つ足す。プリセットからは名前と版で選び、外から見た約束は変えない。
+1. **Differences expressible as numbers**: Handled by preset data.
+2. **Differences not expressible as numbers**: Add one choice to the relevant axis (e.g. the condition for missing an unhit note, whether an empty POOR breaks the combo). Rule differences are gathered into one module per axis, so that adding a choice stays within that axis. Do not scatter code that branches on the "whole rule" across the judgment code.
+3. **Too different to split into axes**: Add one evaluation implementation dedicated to that rule inside the evaluator. Presets select it by name and version, and the contract seen from outside does not change.
 
-この順に試し尽くす必要はない。複数の振る舞いが絡み合っていて、独立した軸に分けると不自然になる場合は、最初から専用の実装にしてよい。軸の選択肢の組み合わせは、実際に動作を確かめたものだけを許す。最初は評価の実装1つと具体的な例から始め、実際のルールが求めたときにだけ軸や実装を足す。
+There is no need to exhaust this order. If several behaviors are intertwined and splitting them into independent axes would be unnatural, a dedicated implementation from the start is fine. Only combinations of axis choices whose behavior has actually been verified are allowed. Start with one evaluation implementation and concrete examples, and add axes or implementations only when an actual rule demands them.
 
-違いは、プリセットごとの手書きの例（「この入力ならこの判定」）を書く過程で見つけ、見つけるたびに軸か選択肢を足す。意味が変わる変更では評価器の版を上げ、過去の記録と混ぜない。
+Differences are found in the process of writing hand-written examples per preset ("this input gives this judgment"), and each time one is found, an axis or a choice is added. For a change that alters meaning, the evaluator version is bumped and the results are not mixed with past records.
 
-## ゲージとセッション方針
+## Gauges and Session Policy
 
-ゲージは、クリアの決まり方で2種類に分ける。
+Gauges are divided into two kinds by how a clear is decided.
 
-| 種類 | 例 | クリアの条件 | 失格 |
+| Kind | Examples | Clear condition | Failure |
 | --- | --- | --- | --- |
-| 終了時の残量で決まる | ASSIST EASY、EASY、NORMAL | 曲の終了時に残量がクリアの境界以上 | 途中では失格しない |
-| 生き残りで決まる | HARD、EX HARD、段位用など | 曲の終了まで0にならない | 0になった時点で確定し、以後は戻らない（`failed_at` に記録） |
+| Decided by the amount remaining at the end | ASSIST EASY, EASY, NORMAL | The amount remaining at song end is at or above the clear threshold | Never fails midway |
+| Decided by survival | HARD, EX HARD, dan-course gauges, etc. | Does not reach 0 before song end | Finalized the moment it reaches 0 and never recovers afterward (recorded in `failed_at`) |
 
-- プリセットに含まれるゲージの種類をすべて並べて計算する。
-- 生き残り系のゲージは、本来の値（失格時に0で止まる）とは別に、「失格しなかった場合の推移」を参考値として別の状態で計算する。クリアの判定には参考値を使わない。
-- ゲージの推移は判定イベントごとに記録する。一定間隔での間引きはしない。
+- All gauge types included in the preset are computed side by side.
+- For survival gauges, separately from the real value (which stops at 0 on failure), "the trajectory had it not failed" is computed in separate state as a reference value. The reference value is not used for clear determination.
+- Gauge history is recorded for every judgment event. It is not thinned out at fixed intervals.
 
-### セッション方針は評価器の外に置く
+### Session Policy Lives Outside the Evaluator
 
-次の3つはルールではなく、プレイの進め方の方針として評価器の外に置く。評価器は全ゲージを計算するだけで、どれを表示するか、いつ止めるかは決めない。
+The following three are not rules but policies for how play proceeds, and they are kept outside the evaluator. The evaluator only computes all the gauges; it does not decide which one to display or when to stop.
 
-- **表示するゲージの選び方**：固定／生き残っている最上位のゲージに自動で切り替える（GAS）
-- **失格したときの扱い**：そこで止める／最後まで演奏を続ける
-- **自動オフセット調整**：無効／有効（調整の規則）。「時刻とオフセット」の章を参照
+- **Choosing the displayed gauge**: fixed / automatically switch to the highest surviving gauge (GAS)
+- **Handling failure**: stop there / keep playing to the end
+- **Automatic offset adjustment**: disabled / enabled (adjustment rules). See the "Time and Offsets" section
 
-> **計算し直した結果の意味**
+> **What recomputed results mean**
 >
-> 別のルールで計算し直した結果は「同じ入力をそのルールで判定したらどうなるか」の値で、「そのルールで遊んでいたらどうなったか」ではない。プレイヤーは画面の判定表示を見て押し方を変えるし、失格して演奏が止まればそれ以降の入力はない。画面ではこの違いを文言で示し、止まった後の区間は「入力なし」と表示する。最後まで続ける方針にしておけば、入力ログは常に最後までそろう。
+> A result recomputed under another rule is the value of "what if the same input were judged under that rule", not "what would have happened had you been playing under that rule". Players change how they press based on the judgment display on screen, and once play stops on failure there is no input after that. The screen shows this difference in its wording, and the part after the stop is shown as "no input". With the policy of playing to the end, the input log is always complete through the end.
 
-## 入力ログとリプレイ
+## Input Logs and Replays
 
-リプレイは、評価を再現するための入力を持つ。判定結果はキャッシュとしてだけ持ち、正しい値とはみなさない。形式には版番号を付け、項目は版を上げて追加できるようにしておく。
+A replay holds the inputs needed to reproduce evaluation. Judgment results are kept only as a cache and are not treated as the correct values. The format carries a version number, and fields can be added by bumping the version.
 
-| 項目 | 内容 |
+| Field | Contents |
 | --- | --- |
-| 版 | リプレイ形式の版、評価器の版、読み込み処理の版、アプリの版 |
-| 譜面 | 譜面ファイルのSHA-256とMD5（既存の難易度表やIRとの互換のため）、確定した譜面のハッシュ |
-| 譜面の確定 | `#RANDOM` の分岐結果、オプション（RANDOM、MIRRORなど）とシード、確定したレーンの対応 |
-| ルール | プリセットのID、内容のハッシュ、プリセット本体の写し。セッション方針 |
-| 機器 | 機器の種類、受信の方式（Raw Input、MIDIなど）、報告の間隔の記録と推定したポーリング頻度（または推定不能）、キー設定、デバウンス、アナログスクラッチの設定、3つのオフセット |
-| プレイの種類と評価の条件 | プレイの種類（全体、途中からの演奏、区間リピート）、区間、何回目か、助走の長さ、速度（実時間と譜面の時刻の対応）、ゲージの初期値（「練習の記録」の項を参照） |
-| 物理入力 | `(評価前の受信時刻µs, 機器ID, ボタン/軸ID, 値)` の列。時刻は差分で符号化し、圧縮する |
-| オフセットの変化 | 自動オフセット調整で適用した変化（時刻、新しい値） |
-| その他の操作 | ハイスピードやレーンカバーの変更（判定用の入力とは別の列） |
-| 状態 | 終了の状態（最後まで演奏した、途中で終えた）、入力が不完全か。IR用の開始トークン（任意） |
+| Versions | Replay format version, evaluator version, loader version, app version |
+| Chart | SHA-256 and MD5 of the chart file (MD5 for compatibility with existing difficulty tables and IRs), hash of the resolved chart |
+| Chart resolution | `#RANDOM` branch results, options (RANDOM, MIRROR, etc.) and seed, the resolved lane mapping |
+| Rule | Preset ID, content hash, a copy of the preset itself. Session policy |
+| Device | Device type, receive method (Raw Input, MIDI, etc.), the record of report intervals and the estimated polling rate (or "not estimable"), key config, debounce, analog scratch settings, the three offsets |
+| Play type and evaluation conditions | Play type (full, mid-chart start, section repeat), section, attempt number, lead-in length, speed (the mapping between real time and chart time), initial gauge value (see the "Practice Records" subsection) |
+| Physical input | A sequence of `(pre-evaluation receive time µs, device ID, button/axis ID, value)`. Times are delta-encoded and compressed |
+| Offset changes | Changes applied by automatic offset adjustment (time, new value) |
+| Other operations | Hi-speed and lane cover changes (a stream separate from the judgment input) |
+| Status | End status (played to the end, ended midway), whether input is incomplete. Start token for IR (optional) |
 
-形式は独自のスキーマとし、シリアライズ結果のハッシュに版の判定を頼らない。2000ノーツ程度の譜面で、圧縮前でも数十KBに収まる。
+The format uses its own schema, and version detection does not rely on the hash of the serialized output. For a chart of about 2000 notes, it fits in a few tens of KB even before compression.
 
-### 練習の速度変更
+### Practice Speed Changes
 
-- 速度変更は、実時間と譜面の時刻の対応（区間ごとに一定の倍率）として表す。譜面そのものは書き換えない。
-- 判定窓は実時間で測る。0.5倍速でも、押してから判定されるまでの許容幅は通常と同じにする。
-- 音声は速度に合わせて再生し、音程を保つかどうかはプレイヤーが選ぶ。
+- A speed change is expressed as a mapping between real time and chart time (a constant multiplier per segment). The chart itself is not modified.
+- Judgment windows are measured in real time. Even at 0.5x speed, the tolerance from press to judgment is the same as normal.
+- Audio is played back matched to the speed, and the player chooses whether to preserve pitch.
 
-### 区間の評価
+### Section Evaluation
 
-途中からの演奏、区間リピート、完走の記録からの切り出しは、すべて同じ「区間の評価」の規則で扱う。区間は譜面の時刻で `[開始, 終了)` とする。
+Mid-chart starts, section repeat, and excerpts from full-play records are all handled by the same "section evaluation" rules. A section is `[start, end)` in chart time.
 
-- **対象のノーツ**：時刻が区間に入るノーツだけを対象にする。開始か終了をまたぐLNは、全体を対象外にする。
-- **入力を受け付ける範囲**：対象のノーツの選別とは分けて決める。開始より前の助走の間の押しは、最初の対象ノーツの早押しの判定窓に入るものだけを受け付ける。終了のあとも、対象のノーツの最後の判定の期限（遅押しの判定窓、見逃しの期限、LNの離しの期限）まで水位を進めて確定させる。
-- **評価器の状態**：判定とゲージの状態は区間の開始で初期化する。ゲージの初期値（固定小数点の値）は練習の設定で決める。
-- **入力の変換の状態**：開始の時点で押されているキー、デバウンスの保留、スクラッチの積み上げとヒステリシスの状態は、助走の区間の入力から組み立てる。開始をまたいで押し続けているキーは、開始の時点で押されている状態として扱い、新しい押しとは数えない。
-- **オフセット**：開始の時点の値と、進行中の補間の区間を含めて、記録された変化をそのまま使う。
+- **Target notes**: Only notes whose time falls within the section are targeted. An LN that crosses the start or the end is excluded entirely.
+- **Input acceptance range**: Decided separately from the selection of target notes. Presses during the lead-in before the start are accepted only if they fall within the early judgment window of the first target note. After the end, too, the watermark is advanced and judgments are finalized up to the last judgment deadline of the target notes (late judgment window, miss deadline, LN release deadline).
+- **Evaluator state**: Judgment and gauge state are initialized at the section start. The initial gauge value (a fixed-point value) is set by the practice settings.
+- **Input conversion state**: The keys pressed at the start, pending debounce, and the accumulated scratch and hysteresis state are reconstructed from the input in the lead-in. A key held down across the start is treated as already pressed at the start and is not counted as a new press.
+- **Offsets**: The recorded changes are used as is, including the value at the start and any interpolation segment in progress.
 
-`evaluate` は、この区間の条件（区間、助走の長さ、ゲージの初期値、オフセットの変化）を受け取れるようにする。条件を渡さなければ譜面の全体を評価する。
+`evaluate` accepts these section conditions (section, lead-in length, initial gauge value, offset changes). Without the conditions, it evaluates the whole chart.
 
-### 途中からの演奏と区間リピート
+### Mid-Chart Start and Section Repeat
 
-- **途中からの演奏**：練習の機能として、譜面の任意の位置から演奏を始められる。判定は上の規則で、開始位置から新しい評価セッションとして始める。
-- **音と画面の復元**：開始位置までは、同じ速度と設定のオートプレイで早送りし、鳴り続けている長い音、BGA、演出の状態を復元する。キー音やボムは判定イベントから決まるので、何を元に復元するかを決めておく必要がある。通常の練習はオートプレイを元にし、リプレイの再生では記録された入力を元にする。音声処理は、無音を流すのではなく通常どおり処理を進め、最終の出力だけを捨てる。
-- **区間リピート**：途中からの演奏を繰り返し使う。各回はリセット → 復元 → 助走 → 区間の評価の順に進め、1回を1つの評価セッションとして区切る。
-- 復元した状態が、同じ元（オートプレイか記録された入力）で先頭から進めた同じ時刻の状態と一致すること（判定以外の部分）をテストで確かめる。
+- **Mid-chart start**: As a practice feature, play can start from any position in the chart. Judgment follows the rules above and starts as a new evaluation session at the start position.
+- **Restoring audio and screen**: Up to the start position, autoplay with the same speed and settings fast-forwards to restore long sounds still playing, the BGA, and effect state. Key sounds and bombs are determined by judgment events, so what to restore them from has to be decided. Normal practice restores from autoplay; replay playback restores from the recorded input. Audio processing advances as usual rather than feeding silence, and only the final output is discarded.
+- **Section repeat**: Uses mid-chart start repeatedly. Each round proceeds in the order reset → restore → lead-in → section evaluation, and each round is delimited as one evaluation session.
+- Tests verify that the restored state matches (outside judgment) the state at the same time reached by advancing from the beginning with the same source (autoplay or recorded input).
 
-### 練習の記録
+### Practice Records
 
-- 速度を変えた記録や練習の記録も、入力ログは破棄せずに保存し、分析に使えるようにする。
-- 記録には評価の条件として、プレイの種類（全体、途中からの演奏、区間リピート）、区間、何回目か、助走の長さ、速度（実時間と譜面の時刻の対応）、補助のオプション、ゲージの初期値を保存する。最後まで演奏したか、途中で終えたかは、終了の状態として別の項目にする。
-- 比べられるのは、同じ区間の評価の規則で評価した記録どうしだけとする。全体を演奏した記録からは、任意の区間を同じ規則で切り出して評価し直せるので、途中からの演奏と比べられる。途中からの演奏の記録から全体の結果を作ることはできないので、その向きの比較はしない。
-- 切り出した区間の評価では、オフセットの変化はもとの記録のものを使う。その変化が自動調整の規則に従っているかは、もとの全体の記録でだけ確かめられる。
-- 速度が違う記録は、実時間で測った指標（ずれの分布など）を速度ごとに並べて見せる。速度が違えば難しさも変わるので、同じ成績とはみなさない。
+- Records with a changed speed and practice records also keep their input logs instead of discarding them, so they can be used for analysis.
+- As evaluation conditions, a record stores the play type (full, mid-chart start, section repeat), section, attempt number, lead-in length, speed (the mapping between real time and chart time), assist options, and initial gauge value. Whether play reached the end or ended midway is a separate field, the end status.
+- Only records evaluated under the same section evaluation rules can be compared with each other. From a full-play record, any section can be excerpted and re-evaluated under the same rules, so it can be compared with a mid-chart start. A full result cannot be produced from a mid-chart start record, so comparison in that direction is not done.
+- When evaluating an excerpted section, the offset changes from the original record are used. Whether those changes follow the automatic adjustment rules can be verified only on the original full record.
+- For records at different speeds, metrics measured in real time (such as the deviation distribution) are shown side by side per speed. A different speed changes the difficulty, so they are not treated as the same result.
 
-## 音声
+## Audio
 
-- 出力の標準は、WASAPI共有モードの低遅延のイベント駆動とする。`IAudioClient3` で対応する周期の範囲（基本周期の整数倍）を問い合わせ、安定して動く最短の周期を選ぶ。短い周期での初期化に失敗したら、通常の共有モードに戻す。共有モードなら、OBSなどがデスクトップの音や他のアプリの音をそのまま取り込める。
-- 排他モードは、遅れをさらに詰めたい人向けの任意の設定にする。設定画面では「その出力デバイスで他のアプリの音が鳴らなくなる場合があり、配信ソフトの通常のデスクトップ音声の取り込みではゲームの音を取れない」ことを示す。ASIOも任意の設定とし、他のソフトと共存できるかは機器と音の経路しだいであることを示す。
-- 音声スレッドはWASAPIのイベントハンドルを待ち、起きるたびに次のバッファを書く。
-- ミキサーは自前で持つ。譜面が参照するキー音だけを、プレイ開始前にPCMにデコードし、デバイスのサンプルレートに変換してi16でメモリに置く。同じ中身のファイルは1つにまとめる。
-- 一定より長い音（曲全体のBGMを1ファイルにしたものなど）はメモリに置かず、別スレッドで先読みしながら再生する。
-- 音声のリアルタイムの処理（コールバック）では、読み込みもデコードもしない。BGAのデコードや長い音の先読みは、上限のある別スレッドの処理として行う。
-- 同時発音数に上限を設け、超えたときにどの音を止めるかの規則を決めておく。
-- BGMとして鳴る音は、譜面の時刻から再生位置を計算し、ミキサーにサンプル単位で予約する。
-- BGA（動画）はデコード用のスレッドで処理し、表示は判定の時間軸に合わせる。
+- The standard output is low-latency event-driven WASAPI shared mode. The supported period range (integer multiples of the fundamental period) is queried with `IAudioClient3`, and the shortest period that runs stably is chosen. If initialization with a short period fails, it falls back to normal shared mode. In shared mode, OBS and the like can capture desktop audio and other apps' audio as is.
+- Exclusive mode is an optional setting for those who want to cut latency further. The settings screen states that "other apps' audio may stop playing on that output device, and the streaming software's normal desktop audio capture cannot capture the game's audio". ASIO is also an optional setting, and the screen states that whether it can coexist with other software depends on the device and the audio routing.
+- The audio thread waits on the WASAPI event handle and writes the next buffer each time it wakes.
+- The mixer is our own. Only the key sounds referenced by the chart are decoded to PCM before play starts, converted to the device's sample rate, and kept in memory as i16. Files with identical contents are merged into one.
+- Sounds longer than a threshold (such as a whole song's BGM in a single file) are not kept in memory, but played while being read ahead on a separate thread.
+- The real-time audio processing (callback) does neither loading nor decoding. BGA decoding and read-ahead of long sounds run as bounded work on separate threads.
+- Polyphony has an upper limit, and the rule for which sound to stop when it is exceeded is decided in advance.
+- For sounds that play as BGM, the playback position is computed from chart time and scheduled on the mixer with sample precision.
+- BGA (video) is processed on a decode thread, and its display is aligned to the judgment timeline.
 
-### 押してから鳴るまでの経路
+### Path from Press to Sound
 
-キー音の遅れは、次の区間の合計になる。各区間を計測できるようにし、合計10ms以下を、決めた機器での実測の目標とする。届かない環境では排他モードやASIOを選べることを案内するが、自動では切り替えない。
+Key sound latency is the sum of the following segments. Each segment is made measurable, and a total of 10 ms or less is the target, measured on chosen hardware. On environments that cannot reach it, the game points out that exclusive mode or ASIO can be chosen, but does not switch automatically.
 
-| 区間 | 中身 | 抑え方 |
+| Segment | What it is | How it is kept down |
 | --- | --- | --- |
-| 機器 | コントローラーの走査とUSBの報告の間隔 | 機器しだい。機器の設定として記録する |
-| 入力の受信 | OSが入力を届けるまで | Raw Inputを専用スレッドで受ける |
-| 評価 | ロジックスレッドの起床と判定 | 入力の公開で即座に起こす。判定の処理時間はµs単位を目標に計測する |
-| 音声への受け渡し | 次にバッファを書くまでの待ち | ロックを使わないキュー。バッファの周期を短くする |
-| ミキシング | 合成、サンプルレート変換、リミッター | 変換とリミッターの先読みの遅れを予算に含める |
-| 出力 | 書いたバッファがOSとドライバーを経てDACから鳴るまで | 共有モードの短い周期（標準）、排他モード（任意）。どちらでも実際の遅れを計測して表示する |
+| Device | Controller scanning and the USB report interval | Depends on the device. Recorded as a device setting |
+| Input receipt | Until the OS delivers the input | Receive Raw Input on a dedicated thread |
+| Evaluation | Logic thread wake-up and judgment | Wake it immediately on input publication. Judgment processing time is measured, targeting the µs scale |
+| Handoff to audio | Waiting until the next buffer write | Lock-free queue. Shorten the buffer period |
+| Mixing | Summing, sample rate conversion, limiter | Include the conversion and limiter look-ahead latency in the budget |
+| Output | From the written buffer, through the OS and driver, until it sounds from the DAC | Short period in shared mode (standard), exclusive mode (optional). Either way, measure and display the actual latency |
 
-「鳴らす音」のイベントが届いた時点で、そのバッファの書き込みに間に合わなければ、次に書ける最初のサンプルから鳴らす。遅れた分を取り戻すために音の頭を削ることはしない。内部の待ち時間の計測とは別に、実際に押してから音が出るまでの時間も、マイクや専用の計測で確かめる。
+If a "sound to play" event arrives too late for the current buffer write, the sound starts from the first sample that can be written next. The head of the sound is never cut off to make up for the delay. Separately from measuring internal wait times, the actual time from press to sound is also verified with a microphone or dedicated measurement.
 
-## 描画とスキン
+## Rendering and Skins
 
-- プレイ画面はwgpuによる自前の描画ループで描く。設定画面などの道具的な画面にはeguiを重ねてよい。
-- 表示の方式（垂直同期の有無、`present_mode`）と、先行して描くフレーム数（`desired_maximum_frame_latency`）を設定項目として持つ。既定値は遅れの少ない側にする。
-- ノーツの位置は、描画する時刻ではなく、画面に映る予定の時刻で計算する。予定の時刻は、QPCと表示遅延のオフセットから予測し、DXGIのフレーム統計が有効なときはその補助に使う（「時刻の基準（QPC）」の章）。
-- ロジックスレッドは、型の付いた状態の写し（たとえば `PlayView`）を三重バッファで公開する。描画スレッドはそれを読むだけで、書き込みはしない。
-- ボムや判定表示のように短い演出は、写しだけでは取りこぼすことがある。連番付きの判定イベントをキューで描画スレッドにも渡し、描画スレッドが未処理の分をすべて演出として受け取る。
-- LR2のIDやbeatorajaのプロパティIDへの変換は、それぞれのスキンのアダプタの中だけで行う。ゲーム内部の構造をスキンのID体系に合わせない。
-- スキンのボタンやスライダーは状態を直接書き換えず、コマンドを送る。
+- The play screen is drawn by our own render loop with wgpu. Tool-like screens such as settings may overlay egui.
+- The presentation mode (vsync on or off, `present_mode`) and the number of frames rendered ahead (`desired_maximum_frame_latency`) are settings. The defaults favor lower latency.
+- Note positions are computed from the time the frame is expected to appear on screen, not the time it is rendered. The expected time is predicted from QPC and the display latency offset, and DXGI frame statistics are used as an aid when valid (the "Time Base (QPC)" section).
+- The logic thread publishes a typed state snapshot (for example `PlayView`) through a triple buffer. The render thread only reads it and never writes.
+- Short effects such as bombs and the judgment display can be missed with the snapshot alone. Sequence-numbered judgment events are also passed to the render thread through a queue, and the render thread receives everything it has not yet processed as effects.
+- Conversion to LR2 IDs or beatoraja property IDs happens only inside each skin's adapter. The game's internal structures are not shaped to fit a skin's ID system.
+- Skin buttons and sliders do not modify state directly; they send commands.
 
-### 独自スキンの形式
+### Native Skin Format
 
-標準のスキンには、GCのあるスクリプト言語を使わない。スクリプトを持たない宣言的な形式にする。
+The standard skin does not use a scripting language with GC. It uses a declarative format with no scripts.
 
-- 配置、画像、アニメーション、表示条件をデータ（TOMLなど）で書く。
-- 数値や条件は `PlayView` の項目を参照する小さな式で書く（例：`combo >= 100`、`gauge.value`）。式は読み込み時に型を確かめて変換し、毎フレームの評価ではメモリを確保しない。
-- **設定による分岐**：スキンが選択肢（表示の切り替え、差し替え用の画像、位置の調整値）を宣言し、プレイヤーの選択に応じて部品の有無や画像を読み込み時に切り替える。
-- **繰り返し**：7鍵分のレーン、数字の桁、連番のアニメーションのように同じ形が並ぶ定義は、テンプレートと繰り返しの指定で作る。
-- 宣言的な形式で表せない表現が必要になったら、まず式や部品を足すことで対応する。汎用のスクリプトは入れない。
+- Layout, images, animations, and display conditions are written as data (TOML, etc.).
+- Numbers and conditions are written as small expressions that reference `PlayView` fields (e.g. `combo >= 100`, `gauge.value`). Expressions are type-checked and compiled at load time, and per-frame evaluation does not allocate memory.
+- **Branching by settings**: The skin declares options (display toggles, replacement images, position adjustment values), and depending on the player's choices, parts are included or omitted and images are switched at load time.
+- **Repetition**: Definitions where the same shape repeats, such as the lanes for 7 keys, number digits, and sequentially numbered animation frames, are made with templates and repetition specifications.
+- When an expression the declarative format cannot represent becomes necessary, it is first handled by adding expressions or parts. No general-purpose scripting is added.
 
-beatorajaがLuaを使う主な理由は、この2つ（設定による分岐と、繰り返しの生成）を読み込み時に行うことにある。どちらも読み込み時の処理なので、宣言的な形式に組み込めば、スクリプトもGCも要らない。毎フレームの自由な計算は、式で足りる範囲に絞る。
+The main reason beatoraja uses Lua is to do these two things (branching by settings and generating repetition) at load time. Both are load-time processing, so building them into the declarative format removes the need for both scripts and GC. Free-form per-frame computation is limited to what expressions can cover.
 
-### beatorajaのLuaスキン
+### beatoraja Lua Skins
 
-- Luaは、beatorajaのLuaスキンを読むためのアダプタの中でだけ、読み込み用のスレッドで使う。
-- スキンの設定を渡してLuaを1回実行し、返ってきた定義を独自スキンの宣言的な形式に変換したら、Luaの状態を捨てる。設定が変わったら変換し直す。プレイ中にLuaは動かないので、LuaのGCは演奏に影響しない。
-- 毎フレーム呼ばれる前提のLua関数は、中身を解析して独自スキンの式に変換する。変換できない関数（内部に状態を持つもの、時計を読むものなど）は固定値として扱い、読み込み時に警告を出す。
-- よく使われるスキンで変換を試し、式にできなかった関数の一覧を出すツールを用意して、式の対応範囲を広げる判断に使う。
+- Lua is used only inside the adapter for reading beatoraja Lua skins, on the loading thread.
+- Lua is run once with the skin settings, and once the returned definition has been converted into the native skin's declarative format, the Lua state is discarded. When the settings change, the conversion is redone. Lua does not run during play, so Lua's GC does not affect play.
+- Lua functions that are expected to be called every frame are analyzed and converted into native skin expressions. Functions that cannot be converted (those with internal state, those that read the clock, etc.) are treated as constants, and a warning is issued at load time.
+- A tool is provided that tries the conversion on commonly used skins and lists the functions that could not be turned into expressions, and it is used to decide on widening the range of expressions supported.
 
-段階1から、フレーム時間の分布（平均だけでなく、最も遅いフレーム）と、入力から判定までの遅れを計測して表示できるようにする。
+From stage 1, the frame time distribution (not just the average, but also the slowest frames) and the latency from input to judgment can be measured and displayed.
 
-## 性能
+## Performance
 
-性能は最後にまとめて最適化するものではなく、最初から守り続ける制約として扱う。最も重い場面で、基準のPC（たとえばiGPUのノートPC）では60Hz、ミドルクラスのPCでは240Hzの表示に対して、表示されたフレームの間隔のp99が1フレームの時間に収まることを目標にする。目標は、ハードウェア・解像度・譜面とスキン・計測時間・計測の区切りを決めた条件のもとでの値として扱う。Windowsで最大値を保証することはできないので、最大値は原因を調べるための指標とする。
+Performance is not something optimized all at once at the end, but a constraint kept from the start. The target is that, in the heaviest scene, the p99 of the presented frame interval fits within one frame time, for a 60 Hz display on the reference PC (for example a laptop with an iGPU) and a 240 Hz display on a mid-range PC. The target is treated as a value under fixed conditions: hardware, resolution, chart and skin, measurement duration, and measurement windows. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
 
-### 予算
+### Budget
 
-| 指標 | 目標 |
+| Metric | Target |
 | --- | --- |
-| 表示されたフレームの間隔（240Hz） | p99で4.16ms以内、締め切りに遅れたフレームの数を記録 |
-| 描画のCPU処理（スキンの評価、BGAの転送の指示を含む） | 1.5ms |
-| GPU | 2ms |
-| 入力から判定まで | 1ms以下 |
-| 押してから鳴るまで | 10ms以下 |
-| 音切れ | 0回 |
-| 選曲から演奏開始まで | 1〜2秒 |
+| Presented frame interval (240 Hz) | Within 4.16 ms at p99; record the number of frames that missed the deadline |
+| Render CPU work (including skin evaluation and BGA upload commands) | 1.5 ms |
+| GPU | 2 ms |
+| Input to judgment | 1 ms or less |
+| Press to sound | 10 ms or less |
+| Audio dropouts | 0 |
+| Song selection to play start | 1–2 seconds |
 
-判定と音声は描画とは別のスレッドで動くので、描画が予算を超えてもスコアは変わらない。ただしノーツの見え方が乱れるので、描画の予算も同じ重みで守る。
+Judgment and audio run on threads separate from rendering, so the score does not change even if rendering exceeds its budget. But the look of the notes gets disrupted, so the render budget is kept with equal weight.
 
-### 構造で上限を決める
+### Bounding Work by Structure
 
-- 毎フレームの処理量は、譜面の大きさではなく画面に見えている量に比例させる。見えているノーツだけを描き、スキンも見えている要素だけを評価する。
-- 入力・ロジック・音声のコールバック・描画の毎フレームの処理では、プレイ中にメモリを確保しない（範囲の定義は「主要なライブラリとアルゴリズム」の章）。
-- スプライトはテクスチャアトラスとインスタンス描画で、少数の描画命令にまとめる。ノーツごとに描画命令を出さない。
-- 文字はグリフのアトラスを事前に作り、毎フレームの組版をしない。
-- プレイ画面にはeguiを使わない（毎フレーム画面を組み立て直すため）。eguiは設定画面などに限る。
-- 入力スレッドは高精度の待機タイマー（`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`）で1kHzで起きる。入力・音声スレッドはMMCSS（`AvSetMmThreadCharacteristics`）で優先度を上げる。優先度を上げるのはこの2つのスレッドだけとする（次節）。
-- BGAのデコードが遅れたらそのフレームを飛ばし、音と判定には影響させない。
+- Per-frame work is made proportional to what is visible on screen, not to the size of the chart. Only visible notes are drawn, and only visible skin elements are evaluated.
+- Input, logic, the audio callback, and per-frame render work do not allocate memory during play (the scope is defined in the "Key Libraries and Algorithms" section).
+- Sprites are batched into a few draw calls with texture atlases and instanced rendering. No draw call is issued per note.
+- Text uses a glyph atlas built in advance, and there is no per-frame typesetting.
+- egui is not used on the play screen (because it rebuilds the UI every frame). egui is limited to settings screens and the like.
+- The input thread wakes at 1 kHz with a high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`). The input and audio threads have their priority raised with MMCSS (`AvSetMmThreadCharacteristics`). Only these two threads get raised priority (see below).
+- If BGA decoding falls behind, that frame is skipped, without affecting audio or judgment.
 
-### 表示の遅れと引っかかり
+### Display Latency and Stutter
 
-CPUとGPUの処理時間が予算内でも、表示が安定するとは限らない。次の点を決めて確かめる。
+Even if the CPU and GPU times are within budget, presentation is not necessarily stable. The following points are decided and verified.
 
-- **表示の方式**：DXGIのflip modelを使い、待機可能なスワップチェーンと、先行して描くフレーム数1で、ボーダーレス表示でも遅れが少ない経路にする。垂直同期あり・なし、可変リフレッシュレート（VRR）、ティアリングの許可を設定として持ち、wgpuが実際にどの経路を使っているかを確かめる。
-- **最初の1回の引っかかり**：シェーダーとパイプラインの作成、テクスチャの初回転送は、カウントダウンの前にすべて済ませる。転送は上限のあるキューで少しずつ行う。
-- **計測**：実際に表示されたフレームの間隔をPresentMonなどで測る。初回の読み込み（キャッシュなし）、リトライ、実際のコントローラー、ノートPCの省電力と発熱による速度低下も計測の条件に含める。
+- **Presentation mode**: Use the DXGI flip model with a waitable swap chain and 1 frame rendered ahead, a low-latency path even in borderless display. Vsync on or off, variable refresh rate (VRR), and allowing tearing are settings, and which path wgpu actually uses is verified.
+- **First-time stutter**: Shader and pipeline creation and the first texture uploads are all completed before the countdown. Uploads are done a little at a time through a bounded queue.
+- **Measurement**: The actually presented frame intervals are measured with PresentMon or similar. First load (no cache), retry, real controllers, and slowdowns from laptop power saving and heat are also included in the measurement conditions.
 
-### メモリの予算
+### Memory Budget
 
-デコード済みの音声（2チャンネル・48kHz・i16で10分あたり約115MB）、読み込み中の一時的な使用量、テクスチャ、BGAの表示用の面に、それぞれ予算を設ける。デコードの並列数には上限を設ける。プレイ前に予算を超えると分かった場合は、長い音の先読みへの切り替えやBGAの画質を下げて収め、それでも収まらなければ理由を示して演奏を始めない。
+Budgets are set for each of decoded audio (about 115 MB per 10 minutes at 2 channels, 48 kHz, i16), temporary usage during loading, textures, and BGA display surfaces. The number of parallel decodes is capped. If it is known before play that the budget will be exceeded, it is brought within budget by switching to read-ahead for long sounds or lowering BGA quality; if it still does not fit, the reason is shown and play does not start.
 
-### 読み込みと選曲
+### Loading and Song Selection
 
-- キー音のデコードを複数スレッドで並列に行う。変換済みのPCMは、ファイルのハッシュ・変換の設定・デコーダーの版をキーにしてディスクにキャッシュする。リトライでは、メモリ上のデータを使い回す。初回の読み込みとリトライは、別の目標として計測する。
-- 数万曲のライブラリはSQLiteに入れ、更新日時とサイズが変わったファイルだけを読み直す。検索にはFTS5を使い、走査はバックグラウンドで行う。
+- Key sounds are decoded in parallel on multiple threads. Converted PCM is cached on disk, keyed by file hash, conversion settings, and decoder version. Retries reuse the data in memory. First load and retry are measured as separate targets.
+- A library of tens of thousands of songs is stored in SQLite, and only files whose modification time or size changed are re-read. Search uses FTS5, and scanning runs in the background.
 
-### 計測
+### Measurement
 
-- ゲーム内で、フレーム時間の分布（p99と最大）、入力から判定までの遅れ、音切れの回数をいつでも表示できるようにする。
-- 最悪ケースの譜面とスキンで決まった入力ログを再生するベンチマーク用の場面を持ち、基準のPCで定期的に計測する。
-- CPU側の時間（評価器、スキンの評価、読み込み）はベンチマーク（criterion）としてCIで計測し、大きな後退を検出する。共有のCIは計測が揺れるので、絶対値の合否は決まった専用のPCで判断する。
-- 詳しく調べるときはTracy（`tracy-client`）で区間ごとの時間を見る。
+- In game, the frame time distribution (p99 and maximum), the latency from input to judgment, and the number of audio dropouts can be displayed at any time.
+- A benchmark scene plays back a fixed input log with the worst-case chart and skin, and it is measured regularly on the reference PC.
+- CPU-side time (evaluator, skin evaluation, loading) is measured as benchmarks (criterion) in CI to detect large regressions. Measurements on shared CI fluctuate, so pass/fail on absolute values is decided on a fixed dedicated PC.
+- For detailed investigation, per-span times are inspected with Tracy (`tracy-client`).
 
-### 他のソフトとの共存
+### Coexisting with Other Software
 
-配信や録画をしながら遊ぶ人が多いので、このゲームの遅れの目標を守るために、PCの資源を独占して他のソフト（OBS、ブラウザ、通話ソフトなど）の動作を大きく損なうことはしない。次の決まりは標準の設定でのものである。
+Many people play while streaming or recording, so the game does not, for the sake of its own latency targets, monopolize the PC's resources and significantly impair other software (OBS, browsers, voice chat software, etc.). The following rules are for the standard settings.
 
-| 資源 | 決まり |
+| Resource | Rule |
 | --- | --- |
-| CPU | 空回りで待つ処理（スピンループ）を使わず、すべてのスレッドはイベントか待機タイマーで眠る。1kHzで起きるのは演奏中の入力スレッドだけとし、演奏していないときは間隔を空けるか止める。プロセスの優先度は通常のままにし、MMCSSに登録するのは入力と音声のスレッドの短い処理だけにする。裏側の処理には並列数の上限を設け、演奏中は重い処理（ライブラリの走査など）を止める。CPUの割り当て（affinity）は固定しない |
-| GPU | 表示の更新頻度を超えて描かない。VRRを使うときは、上限をVRRの範囲の上限より少し下に取る。GPUのキューの優先度は通常のままにする。更新頻度で制限してもGPUを使い切る場合があるので、配信向けの設定では上限を下げ、演出を軽くする |
-| 音声 | 共有モードにして、他のアプリの音と配信ソフトの取り込みを妨げない（「音声」の章） |
-| 表示 | ボーダーレスのflip modelにして、OBSのゲームキャプチャやウィンドウキャプチャで取り込めるようにする |
-| 入力 | 入力を独占する方式（排他的なDirectInput、低レベルのキーボードフック）を使わない。他のアプリのホットキー（配信ソフトの操作など）を妨げない |
-| システム全体の設定 | タイマーの分解能の要求（`timeBeginPeriod`）、電源プラン、他のプロセスの優先度を変えない。不要なタイマーの要求を避け、必要な精度は高精度の待機タイマーで得る（待機タイマーも起きる時刻を保証するものではないので、遅れは計測する） |
-| ディスクとメモリ | 読み込みやライブラリの走査は優先度の低いスレッド（I/Oの優先度も下げる）で行う。メモリは「メモリの予算」の範囲に収める |
+| CPU | No busy-waiting (spin loops); every thread sleeps on events or waitable timers. Only the input thread during play wakes at 1 kHz; when not playing, it uses longer intervals or stops. Process priority stays normal, and only the short work of the input and audio threads is registered with MMCSS. Background work has a parallelism cap, and heavy work (library scanning, etc.) is paused during play. CPU affinity is not pinned |
+| GPU | Never render beyond the display refresh rate. With VRR, the cap is set slightly below the top of the VRR range. GPU queue priority stays normal. The GPU can be saturated even when capped at the refresh rate, so the streaming settings lower the cap and lighten the effects |
+| Audio | Use shared mode so as not to interfere with other apps' audio or with capture by streaming software (the "Audio" section) |
+| Display | Use the borderless flip model so that OBS game capture and window capture can capture it |
+| Input | Do not use methods that monopolize input (exclusive DirectInput, low-level keyboard hooks). Do not interfere with other apps' hotkeys (such as controls for streaming software) |
+| System-wide settings | Do not change the timer resolution request (`timeBeginPeriod`), the power plan, or other processes' priorities. Avoid unnecessary timer requests, and get the needed precision from high-resolution waitable timers (waitable timers do not guarantee the wake time either, so the latency is measured) |
+| Disk and memory | Loading and library scanning run on low-priority threads (with lowered I/O priority as well). Memory stays within the "Memory Budget" |
 
-### 設定のまとまり
+### Settings Profiles
 
-上の決まりは標準の設定に対する約束とする。プレイヤーが自分で選んだときだけ、遅れを詰めるために独占的な方式を使ってよい。
+The rules above are a commitment for the standard settings. Only when players choose it themselves may exclusive methods be used to cut latency.
 
-| 項目 | 標準 | 低遅延優先 | 配信向け |
+| Item | Standard | Low-latency priority | Streaming |
 | --- | --- | --- | --- |
-| 音声 | WASAPI共有モードの低遅延 | WASAPI排他モード、またはASIO | 共有モード |
-| 表示と同期 | ボーダーレスのflip model。VRRがあればVRR、なければ垂直同期 | 次の組み合わせから選ぶ：VRR、ティアリングの許可（垂直同期なし）、排他的な全画面表示 | ボーダーレスのflip model、垂直同期 |
-| フレームレートの上限 | 表示の更新頻度（VRRでは範囲の上限より少し下） | ティアリングを許可した場合だけ、更新頻度を超えてよい | 更新頻度より下げる（たとえば60か120） |
-| 演出・BGA | 標準 | 標準 | 軽くする |
-| ゲーム側の目標 | 表示の更新頻度 | 表示の更新頻度、または設定した上限 | 設定した上限。OBSの安定を優先する |
+| Audio | Low-latency WASAPI shared mode | WASAPI exclusive mode, or ASIO | Shared mode |
+| Display and sync | Borderless flip model. VRR if available, otherwise vsync | Choose from combinations of: VRR, allowing tearing (no vsync), exclusive fullscreen | Borderless flip model, vsync |
+| Frame rate cap | Display refresh rate (with VRR, slightly below the top of the range) | May exceed the refresh rate only when tearing is allowed | Below the refresh rate (for example 60 or 120) |
+| Effects and BGA | Standard | Standard | Lighter |
+| Game-side target | Display refresh rate | Display refresh rate, or the configured cap | The configured cap. OBS stability takes priority |
 
-- どのまとまりでも、システム全体に効く設定は変えず、スピンループで待たず、入力を独占しない。遅れの短縮にほとんど効かないのに、PC全体に影響するためである。
-- 低遅延優先を選んだときは、設定画面に次を示す：排他モードでは、その出力デバイスで他のアプリの音が鳴らなくなる場合があり、配信ソフトの通常のデスクトップ音声の取り込みではゲームの音を取れない。ASIOで他のソフトと共存できるかは機器と音の経路しだいである。排他的な全画面表示は、必ず遅れが小さくなるとは限らない。
-- まとまりは出発点で、項目は個別に変えられる。
+- In every profile, system-wide settings are not changed, there is no waiting in spin loops, and input is not monopolized. These barely help shorten latency, yet affect the whole PC.
+- When low-latency priority is chosen, the settings screen shows the following: in exclusive mode, other apps' audio may stop playing on that output device, and the streaming software's normal desktop audio capture cannot capture the game's audio. Whether ASIO can coexist with other software depends on the device and the audio routing. Exclusive fullscreen does not necessarily reduce latency.
+- A profile is a starting point; items can be changed individually.
 
-### OBSとの同時実行の確かめ方
+### How to verify running alongside OBS
 
-次の条件を固定して計測し、両方が基準を満たすことを確かめる。具体的な値は段階0で決めて、この章に書き込む。
+Measure with the following conditions fixed, and confirm that both sides meet the criteria. The concrete values are decided in stage 0 and written into this section.
 
-- **条件**：基準のPC、ゲームの解像度とリフレッシュレート、OBSのシーン（ゲームキャプチャとブラウザソース1つ程度）、OBSの出力（1080p・60fps）、エンコーダー（NVENCなどのハードウェアと、x264の両方）とその設定、計測時間（最も重い譜面を含めて10分以上）。Windowsのゲームモードの状態は変えずに記録する。
-- **ゲーム側**：その設定のまとまりでの、表示されたフレームの間隔、入力から判定までの遅れ、音切れの回数。
-- **OBS側**：OBSの統計にある、描画の遅れで落ちたフレームとエンコードの遅れで落ちたフレームの割合。これに上限を設ける（たとえばそれぞれ0.5%未満）。
-- 標準の設定で両方が基準を満たせない構成では、配信向けの設定を案内する。
+- **Conditions**: The reference PC, the game's resolution and refresh rate, the OBS scene (game capture plus about one browser source), the OBS output (1080p, 60 fps), the encoder (both hardware such as NVENC, and x264) and its settings, and the measurement duration (10 minutes or more, including the heaviest chart). The state of Windows Game Mode is left unchanged and recorded.
+- **Game side**: Under that settings profile, the presented frame interval, the latency from input to judgment, and the number of audio dropouts.
+- **OBS side**: In the OBS statistics, the percentages of frames dropped due to rendering lag and frames dropped due to encoding lag. Upper bounds are set on these (for example under 0.5% each).
+- For configurations where both sides cannot meet the criteria with the standard settings, the streaming settings are recommended.
 
-### 重いPCのための設定
+### Settings for Low-End PCs
 
-BGAの解像度を下げる・BGAを切る、演出を減らす、といった画質の設定を用意し、基準のPCでも60fpsを保てるようにする。
+Quality settings such as lowering the BGA resolution or turning the BGA off, and reducing effects, are provided so that 60 fps can be kept even on the reference PC.
 
-## 拡張の境界
+## Extension Boundaries
 
-拡張は、名前の付いたステージにだけ差し込める。評価のステージには差し込み口を設けない。
+Extensions can plug in only at named stages. The evaluation stage has no plug-in point.
 
-| ステージ | 種類 | 拡張の例 | 制約 |
+| Stage | Kind | Example extensions | Constraint |
 | --- | --- | --- | --- |
-| 取り込み | 担当 | 譜面形式のアダプタ（BMS、PMS、BMSONなど） | 共通の譜面モデルを出す |
-| 譜面の変換 | 変換 | RANDOM、MIRRORなど | 乱数はシードを記録する場合だけ使える |
-| 入力 | 変換 | 入力機器のアダプタ | 時刻付きのイベントにそろえて渡す |
-| 評価 | — | なし（プリセットのデータだけで変える） | 差し込み口を設けない |
-| セッション方針 | 可否判断 | GAS、落ちたときの扱い | 拡張が失敗したら既定の方針に戻す |
-| 出力 | 受け取りのみ | 音声、スキン、統計 | 評価器にも音声にも書き込めない |
-| 画面遷移とセッションのイベント | 受け取りのみ | OBSの操作、Discordの表示、配信用のオーバーレイ | 別スレッドで受け取り、ゲームを止めも遅らせもできない |
-| リザルト | 変換 | 分析画面、他のプリセットでの再評価 | 入力ログと判定イベント列を読む |
-| 保存 | 受け取りのみ | IRへの送信、エクスポート | 失敗してもプレイの記録は手元に残す |
+| Ingestion | Handler | Chart format adapters (BMS, PMS, BMSON, etc.) | Outputs the common chart model |
+| Chart transformation | Transform | RANDOM, MIRROR, etc. | Randomness can be used only when the seed is recorded |
+| Input | Transform | Input device adapters | Passes events normalized to timestamped events |
+| Evaluation | — | None (changed only through preset data) | No plug-in point |
+| Session policy | Decision | GAS, handling of failure | Falls back to the default policy if the extension fails |
+| Output | Receive only | Audio, skins, statistics | Cannot write to the evaluator or to audio |
+| Screen transition and session events | Receive only | OBS control, Discord presence, streaming overlays | Receives on a separate thread, and can neither stop nor delay the game |
+| Results | Transform | Analysis screens, re-evaluation under other presets | Reads the input log and the judgment event stream |
+| Saving | Receive only | Sending to IR, export | Even on failure, the play record remains locally |
 
-### coreに入れないもの
+### What Stays Out of Core
 
-| 機能 | 理由 | 置き場所 |
+| Feature | Reason | Where it lives |
 | --- | --- | --- |
-| 譜面形式 | 形式は増えるが、すべて共通の譜面モデルに変換できる | 取り込みのアダプタ |
-| スキン | 互換の対象ごとに作りが大きく違う | スキンのアダプタ |
-| 入力機器 | 機器ごとに差がある | 入力のアダプタ |
-| 統計・分析画面 | 見たいものは人それぞれ | リザルトの拡張 |
-| 配信・外部ツールとの連携（OBS、Discordなど） | 連携先ごとに通信の仕組みが違い、増えたり変わったりする | 画面遷移とセッションのイベントを受け取る拡張 |
-| IR・外部連携 | 送り先が増えたり変わったりする | 保存の拡張 |
-| 譜面の配布 | 本体は手元のフォルダだけで完結して動く | 別のサービスとインストーラー |
-| 市販ゲームのデータの変換 | 割れを助けるため | どこにも置かない |
+| Chart formats | Formats multiply, but all can be converted to the common chart model | Ingestion adapters |
+| Skins | The structure differs greatly per compatibility target | Skin adapters |
+| Input devices | Devices differ from one another | Input adapters |
+| Statistics and analysis screens | What people want to see differs from person to person | Result extensions |
+| Integration with streaming and external tools (OBS, Discord, etc.) | Each integration target has a different communication mechanism, and targets increase and change | Extensions that receive screen transition and session events |
+| IR and external integration | Destinations increase and change | Saving extensions |
+| Chart distribution | The player itself works entirely from local folders | A separate service and installer |
+| Converting commercial game data | It would aid piracy | Nowhere |
 
-逆に、判定のロジックはcoreに置いて固定する。公平さと再現性を保つためである。ルール専用の評価の実装は評価器に組み込むものだけとし、利用者が判定ルールをコードで拡張する仕組みは作らない。
+Conversely, judgment logic is placed in core and fixed, to preserve fairness and reproducibility. Rule-specific evaluation implementations are only those built into the evaluator, and no mechanism is built for users to extend judgment rules with code.
 
-このステージ表は拡張の置き場所の約束であり、最初からすべてを汎用の仕組みとして作るわけではない。初期の実装では、評価器とそれ以外の境界（入力ログ、プリセット、判定イベント列）だけを守り、各アダプタは必要になった時点で作る。
+This stage table is a commitment about where extensions belong; it does not mean everything is built as a generic mechanism from the start. The initial implementation keeps only the boundaries between the evaluator and everything else (input log, presets, judgment event stream), and each adapter is built when it becomes necessary.
 
-### 画面遷移とセッションのイベント
+### Screen Transition and Session Events
 
-coreは、画面とプレイの状態の変化（選曲、演奏開始、一時停止、失格、演奏終了、リザルトの表示）を、時刻付きのイベントとして流す。配信や外部ツールとの連携は、すべてこのイベントを受け取る拡張として作る。
+Core streams changes in screen and play state (song selection, play start, pause, failure, play end, result display) as timestamped events. All integrations with streaming and external tools are built as extensions that receive these events.
 
-- 拡張は別スレッドで、上限のあるキューから受け取る。キューがあふれたら古いイベントを捨て、ゲーム側は待たない。拡張が失敗しても、ゲームはそのまま続ける。
-- イベントにはセッションIDと連番を付け、現在の状態もいつでも取り出せるようにする。拡張は連番の抜けや再接続に気づいたら、現在の状態を取り直す。イベントを取りこぼしても、状態の取り直しで正しい状態に戻れる。
-- 拡張は判定・音声・描画のどれにも書き込めない。
-- 流すのは画面の状態とプレイの結果（曲名、譜面、プリセット、スコア、クリアの状態）までとし、入力ログそのものは流さない。
+- Extensions receive on a separate thread from a bounded queue. When the queue overflows, old events are dropped, and the game does not wait. Even if an extension fails, the game simply continues.
+- Events carry a session ID and a sequence number, and the current state can also be fetched at any time. When an extension notices a gap in sequence numbers or a reconnect, it re-fetches the current state. Even if events are missed, re-fetching the state gets back to the correct state.
+- Extensions cannot write to judgment, audio, or rendering.
+- What is streamed is limited to screen state and play results (song title, chart, preset, score, clear status); the input log itself is not streamed.
 
-### ローカルのイベントの口
+### Local Event Endpoint
 
-このPCの中からだけ接続できる汎用の口（ローカルのWebSocket）を用意し、上のイベントと現在の状態を公開する。OBSのスクリプト、ブラウザで表示する配信用のオーバーレイ、統計ツールは、本体を作り直さずにこの口を使って作れる。
+A generic endpoint (a local WebSocket) that can be connected to only from within this PC is provided, exposing the events above and the current state. OBS scripts, streaming overlays displayed in a browser, and statistics tools can be built on this endpoint without rebuilding the player.
 
-- 待ち受けはループバックのアドレスだけにし、既定では無効にする。
-- 接続には、設定画面で発行するランダムな接続トークンを必要とする。認証が済むまでは何も送らない。
-- 接続時の `Host` は、既知のループバックの表記と設定したポートの組み合わせだけを受け付ける（DNS rebindingへの対策）。`Origin` は許可リストと完全一致で確かめる。OBSのブラウザソースでローカルのHTMLを読むと `Origin` は `http://absolute` になるなど、読み込み方法によって値が変わるので、対応する読み込み方法を決めて実際の値で確かめる。`Origin` は認証の代わりにはならない。
-- 送信が遅い接続にも送信キューの上限を設け、あふれたら切断する。
-- OBS WebSocketを使ったシーンの切り替えや録画の開始・停止は、この口の上に作る公式の拡張として提供する。録画の開始・停止は何度送っても結果が同じになるように扱い、この拡張が開始していない録画は自動で止めない。
-- Discordの表示連携は外部に情報を送るので、既定で無効にし、送る内容を設定画面に示す。
+- It listens only on loopback addresses and is disabled by default.
+- A connection requires a random connection token issued from the settings screen. Nothing is sent until authentication completes.
+- The `Host` on connection is accepted only for combinations of a known loopback notation and the configured port (a defense against DNS rebinding). `Origin` is checked by exact match against an allowlist. The value depends on the loading method; for example, when an OBS browser source loads local HTML, `Origin` is `http://absolute`. So the supported loading methods are decided and checked against the actual values. `Origin` is not a substitute for authentication.
+- Connections that are slow to receive also have a send queue cap, and are disconnected on overflow.
+- Scene switching and recording start and stop via OBS WebSocket are provided as an official extension built on top of this endpoint. Recording start and stop are handled so that sending them any number of times gives the same result, and recordings this extension did not start are never stopped automatically.
+- Discord presence integration sends information externally, so it is disabled by default, and the settings screen shows what is sent.
 
-### 再起動なしの調整
+### Tuning Without Restart
 
-- プリセットとスキンのファイルが変わったら、すぐに読み直す。
-- 読み直したプリセットを演奏に使うのは、次のリトライからにする。演奏の途中でルールが変わると、1つのプリセットでは再現できなくなるため。
-- リザルトでの再評価には、読み直したプリセットをすぐ使ってよい。`eval-cli` と組み合わせると、プリセットを書き、手元の入力ログで計算し直し、結果を比べて直す作業が再起動なしで回る。
-- スキンの読み直しは別スレッドで行い、組み立て終わったものを演奏の合間に差し替える。プレイ中の描画処理でメモリを確保しないためである。
+- When preset or skin files change, they are reloaded immediately.
+- A reloaded preset is used for play from the next retry on. If the rule changed in the middle of play, the play could no longer be reproduced with a single preset.
+- Re-evaluation on the result screen may use the reloaded preset immediately. Combined with `eval-cli`, the cycle of writing a preset, recomputing with local input logs, comparing the results, and fixing it runs without a restart.
+- Skin reloading is done on a separate thread, and the fully assembled result is swapped in between plays. This is so that render work during play does not allocate memory.
 
-## 設定の範囲
+## Settings Scopes
 
-| 範囲 | 持ち主 | 例 |
+| Scope | Owner | Examples |
 | --- | --- | --- |
-| 機器 | このPCとこの機器 | 3つのオフセット、デバウンス、ポーリング、音声デバイス、バッファ、OBSの接続先（パスワードはOSの資格情報の保管場所に置く）、ローカルのイベントの口の有効・無効 |
-| プレイヤー | 遊ぶ人 | ハイスピード、レーンカバー、使うプリセットとスキン、セッション方針 |
-| プリセット | ルールを作る人 | 判定窓、ゲージ、`#RANK` の換算 |
-| 譜面 | 譜面の作者 | `#RANK`、`#TOTAL`、LNの判定方式の指定（解釈と優先順位はプリセットが決める） |
+| Device | This PC and this device | The three offsets, debounce, polling, audio device, buffer, the OBS connection target (the password is kept in the OS credential store), whether the local event endpoint is enabled |
+| Player | The person playing | Hi-speed, lane cover, the presets and skins used, session policy |
+| Preset | The person who authors rules | Judgment windows, gauge, `#RANK` conversion |
+| Chart | The chart author | `#RANK`, `#TOTAL`, specification of the LN judgment mode (the preset decides the interpretation and precedence) |
 
-機器とプレイヤーの設定は別のファイルにする。同じPCを複数人で使う場合や、機器を替えた場合に、遅延の設定が混ざらないようにするためである。チームや組織の範囲は設けない。共有したいものは、プリセットやスキンのファイルとして配る。
+Device and player settings go in separate files, so that latency settings do not get mixed up when several people share one PC or when a device is replaced. There is no team or organization scope. Anything to be shared is distributed as preset or skin files.
 
-リザルトとリプレイには、使った値の出どころ（「プリセットX（ハッシュ）、オフセットは機器の設定から」）を表示し、記録する。
+Results and replays display and record where the values used came from ("preset X (hash), offsets from the device settings").
 
-## IR（ランキング）
+## IR (Rankings)
 
-独自IRにはスコアではなく入力ログ（リプレイ）を送る。サーバーは同じ評価器で計算し直し、ランキングを作る。
+The custom IR receives input logs (replays), not scores. The server recomputes with the same evaluator and builds the rankings.
 
 ```
-クライアント ─送信→ { 開始トークン, 譜面ハッシュ, 譜面の変換, 機器の設定, 入力ログ, 版 }
-サーバー     ─保存→ 入力ログを正本として保存
-             ─評価→ 登録されたプリセットすべてで evaluate()
-             ─集計→ (譜面, プリセット, 評価器の版, 指標) ごとのランキング
+Client ─send→ { start token, chart hash, chart transformations, device settings, input log, versions }
+Server ─store→ store the input log as the source of truth
+       ─evaluate→ evaluate() with every registered preset
+       ─aggregate→ rankings per (chart, preset, evaluator version, metric)
 ```
 
-### できること
+### What This Enables
 
-- どのプリセットで遊んでも、すべてのプリセットのランキングに載る。公式のプリセットを1つに決める必要がない。
-- 新しいプリセットを、保存済みのプレイにさかのぼって適用できる。
-- 評価器のバグを直したら、全ログを計算し直して反映できる。
-- スコア以外の指標も順位にできる。プリセットごとのEXスコア・BP・ゲージ種類ごとのクリアのほか、タイミングの精度（ずれの平均と標準偏差）など。指標は判定イベント列を受け取る純粋関数として、サーバーに追加していく。
+- Whichever preset you play with, you appear in the rankings for all presets. There is no need to settle on a single official preset.
+- New presets can be applied retroactively to stored plays.
+- When an evaluator bug is fixed, all logs can be recomputed to reflect the fix.
+- Metrics other than score can also be ranked: besides per-preset EX score, BP, and clears per gauge type, timing accuracy (the mean and standard deviation of deviation) and so on. Metrics are added to the server over time as pure functions that take the judgment event stream.
 
-### 決めておくこと
+### Decisions to Make
 
-- **ランキングの単位**：プリセットの内容のハッシュと評価器の版。どちらかが変わったときに、ランキングを新しく作るか、計算し直して置き換えるかを方針として決める。
-- **実際に遊んだプリセットとの区別**：そのプリセットで実際に遊んだ記録に印を付けるか、ランキングを分ける。
-- **オフセット**：正当な調整として認め、範囲の上限を決めて記録する。
-- **条件の違う記録**：通常のランキングに入れるのは、譜面の全体を通常の速度で最後まで演奏し、許可された条件を満たす記録だけとする。速度変更、補助のオプション、途中で終えた記録、途中からの演奏、区間リピート、切り出した区間の評価は、通常のランキングに入れない。
-- **譜面の取得**：サーバーが同じ譜面を確定させられるよう、譜面ファイル（ハッシュで識別）の取得経路を用意する。配布の登録簿（「譜面の配布」の章）がその経路を兼ねる。
+- **Ranking unit**: The preset's content hash and the evaluator version. When either changes, a policy decides whether to create new rankings or recompute and replace them.
+- **Distinguishing the preset actually played**: Either mark the records actually played with that preset, or separate the rankings.
+- **Offsets**: Accepted as legitimate adjustment, with an upper limit on the range decided and recorded.
+- **Records under different conditions**: Normal rankings include only records that played the whole chart at normal speed to the end and meet the permitted conditions. Speed changes, assist options, records ended midway, mid-chart starts, section repeats, and excerpted section evaluations are not included in the normal rankings.
+- **Chart retrieval**: A retrieval path for chart files (identified by hash) is provided so the server can resolve the same chart. The distribution registry (the "Chart Distribution" section) doubles as that path.
 
-### サーバーの構成（Cloudflare）
+### Server Architecture (Cloudflare)
 
-| 役割 | 使うもの |
+| Role | What is used |
 | --- | --- |
-| API | Workers（TypeScript） |
-| 評価器 | Rustの `eval` crateを `wasm32-unknown-unknown` にビルドしたWASMモジュール。APIのWorkerから呼ぶ |
-| 評価の実行 | Queuesの受信側のWorker。APIは入力ログをR2に保存し、その参照だけを待ち行列に入れる。受信側が評価してD1に書く |
-| 入力ログと譜面ファイル | R2 |
-| 結果とランキング | D1 |
+| API | Workers (TypeScript) |
+| Evaluator | A WASM module built from the Rust `eval` crate for `wasm32-unknown-unknown`. Called from the API Worker |
+| Running evaluation | A Queues consumer Worker. The API stores the input log in R2 and enqueues only a reference to it. The consumer evaluates it and writes to D1 |
+| Input logs and chart files | R2 |
+| Results and rankings | D1 |
 
-- 評価器はスレッドも時計も入出力も使わず整数だけで計算するので、WASMにそのまま載る。`eval` crateはWASM向けのビルドをCIで常に通す。
-- 同じ入力ログを、手元のネイティブ版とWASM版の両方で評価し、結果が一致することをCIで確かめる。
-- 評価はHTTPの要求の中では行わない。1件の処理（入力ログの展開、譜面の読み込みと確定、JSとWASMの間の受け渡し、評価、結果の書き込み）全体のCPU時間とメモリを計測し、Workersの制限よりも十分小さい予算に収める。入力ログ、譜面ファイル、WASMモジュールのサイズにも上限を設ける。
-- D1への書き込みは何度実行しても同じ結果になるようにする。再試行の回数に上限を設け、失敗した処理は別に記録する。全体の受け付け量の上限と、過去の記録を計算し直すときの流量の上限も設ける。Queuesは負荷をならすが、総量は抑えないためである。
-- サーバーが評価するには譜面の中身が要る。譜面のテキストファイル（音声や画像は含まない）を受け取り、サーバー側で計算したSHA-256が許可リストと一致し、かつ配布の登録簿で作者が評価用の保存を許可している場合だけ、非公開で保存する。許可のない譜面はサーバーで評価せず、ランキングの対象にしない。サーバーは譜面が参照する音声や画像のパスを解決しない。
+- The evaluator uses no threads, clock, or I/O and computes only with integers, so it runs on WASM as is. The WASM build of the `eval` crate is kept passing in CI at all times.
+- The same input log is evaluated with both the local native build and the WASM build, and CI verifies that the results match.
+- Evaluation is not done inside an HTTP request. The CPU time and memory of the whole processing of one item (expanding the input log, loading and resolving the chart, passing data between JS and WASM, evaluation, writing the result) are measured and kept within a budget well below the Workers limits. The sizes of input logs, chart files, and the WASM module are also capped.
+- Writes to D1 give the same result however many times they run. The number of retries is capped, and failed jobs are recorded separately. A cap on overall intake and a rate cap for recomputing past records are also set. This is because Queues smooth the load but do not limit the total.
+- The server needs the chart's contents to evaluate. It receives the chart text file (not including audio or images), and stores it privately only if the SHA-256 computed on the server matches the allowlist and the author has permitted storage for evaluation in the distribution registry. Charts without permission are not evaluated on the server and are not eligible for rankings. The server does not resolve the audio or image paths that charts reference.
 
-### 既存のIRへの接続
+### Connecting to Existing IRs
 
-後の段階で、保存の拡張として作る。接続のアダプタが「そのIRが求めるプリセット」を持ち、クライアントで計算したスコアを既存の形式で送る。入力ログの形式が上の項目をすべて持っていれば、後から追加できる。
+Built in a later stage as a saving extension. The connection adapter holds "the preset that IR requires", and sends scores computed on the client in the existing format. As long as the input log format has all the fields above, this can be added later.
 
-## 脅威モデル
+## Threat Model
 
-### 守るもの
+### Assets to Protect
 
-- プレイヤーのPC（譜面・スキン・パッケージ経由のコード実行やクラッシュを防ぐ）
-- ランキングの信頼性
-- アカウントと鍵
-- プライバシー（入力ログ、プレイの時間帯）
-- サービスの運営費（Cloudflareの課金）
-- 法的な立場（割れ、権利者との関係）
+- The player's PC (preventing code execution and crashes via charts, skins, or packages)
+- The trustworthiness of the rankings
+- Accounts and keys
+- Privacy (input logs, the times of day of play)
+- Service operating costs (Cloudflare billing)
+- Legal standing (piracy, relationships with rights holders)
 
-### 脅威と対策
+### Threats and Mitigations
 
-| 攻撃の経路 | 脅威 | 対策 | 段階 |
+| Attack vector | Threat | Mitigation | Stage |
 | --- | --- | --- | --- |
-| 譜面ファイル | 巨大なノーツ数、極端なBPMやSTOP、深くネストした `#RANDOM` による計算の破綻やDoS | ノーツ数・ネストの深さ・時刻の範囲に上限を設ける。時刻計算はオーバーフローを検出し（`i128` とchecked演算）、超えたら読み込みを拒否する。同じ上限をサーバーにも適用する | 1 |
-| 音声・動画 | デコーダーの脆弱性 | 保守されているデコーダーを使い、対応するコーデックを絞る。残るリスクは受け入れ、依存は常に更新する。権限を制限した別プロセスでのデコードは、受け渡しの手間に見合うかを測ってから判断する | 1 |
-| アーカイブ | zip slip、zip bomb | 展開先の外に書き込ませない。展開後のサイズとファイル数に上限を設ける | 1 |
-| 依存ライブラリ | サプライチェーン攻撃 | `cargo-deny` と `cargo-audit` をCIで回し、ロックファイルを固定する | 1 |
-| ローカルのイベントの口 | ほかのPCや悪意あるWebページからの接続、情報の持ち出し | ループバックのアドレスだけで待ち受け、既定で無効にする。接続トークンで認証し、`Host` と `Origin` を許可リストで確かめる（「拡張の境界」の章）。入力ログは流さない | 2 |
-| 開発用の機能 | 本番ビルドに残った台本での起動や外からの操作の悪用 | Cargoのfeatureで本番ビルドからコードごと除き、CIで除かれていることを確かめる（「テスト方針」の章） | 1 |
-| 自動更新 | 全利用者への不正なコードの配布 | 更新ファイルに署名して検証する。Windowsのコード署名を行う | 2 |
-| スキン | Luaによるコード実行、無限ループ | Luaは読み込み時だけ動かす。環境は許可したものだけを入れる方式で組み立て、`io`・`os`・`dofile`・`loadfile`・`debug`・制限のない `package` とモジュールの読み込みを入れない。メモリ、コルーチンを含めた命令数、ホスト側の関数の呼び出しに上限を設ける。宣言的な形式の式にも、大きさと評価の手間の上限を設ける。画像の縦横と展開後の大きさに上限を設け、スキンと譜面が参照するファイルはそれぞれのフォルダの中に限る | 3 |
-| 改造クライアント | 入力ログの捏造 | 防げない前提で、検出と人の確認に頼る（「不正と割れへの対策」の章） | 4 |
-| 他人のログ | 他人の記録の再送 | 開始トークンをアカウントに結びつける。送信内容のハッシュは重複の手がかりにとどまり、手を加えた複製までは見分けられない | 4 |
-| 評価器の版 | バグのある古い版を名乗る | サーバーは自分の評価器でだけ計算する。クライアントの版は参考情報として扱う | 4 |
-| 大量送信 | CPU時間と課金の浪費 | アカウントとIPごとの流量制限。入力ログのサイズの上限（曲の長さ×入力頻度の上限）。Queuesで負荷をならす | 4 |
-| アカウント | 乗っ取り、なりすまし | パスワードを持たず、外部のログイン（Discord、GitHubなど）を使う。APIトークンの権限を絞る | 4 |
-| 登録簿 | 割れの登録、作者のなりすまし、紛らわしい名前 | 署名の鍵で公開者を確かめ、鍵の失効と更新の手順を持つ。登録は審査制にする | 5 |
-| 削除の申し立て | 虚偽の申し立てによる削除 | 申し立てと異議申し立ての手順を定める | 5 |
-| 配布元のURL | 中身のすり替え | 必ずハッシュで中身を確かめ、一致しなければ入れない | 5 |
+| Chart files | Computation breakdown or DoS from a huge note count, extreme BPM or STOP, deeply nested `#RANDOM` | Cap the note count, nesting depth, and time range. Time computation detects overflow (`i128` and checked arithmetic) and rejects loading when exceeded. The same caps are applied on the server | 1 |
+| Audio and video | Decoder vulnerabilities | Use maintained decoders and narrow the supported codecs. Accept the remaining risk and keep dependencies up to date. Decoding in a separate process with restricted privileges is decided after measuring whether it is worth the handoff cost | 1 |
+| Archives | zip slip, zip bomb | Do not allow writes outside the extraction directory. Cap the extracted size and file count | 1 |
+| Dependencies | Supply chain attacks | Run `cargo-deny` and `cargo-audit` in CI, and pin the lockfile | 1 |
+| Local event endpoint | Connections from other PCs or malicious web pages, exfiltration of information | Listen only on loopback addresses, disabled by default. Authenticate with a connection token, and check `Host` and `Origin` against allowlists (the "Extension Boundaries" section). Input logs are not streamed | 2 |
+| Development features | Abuse of scenario launch or external control left in production builds | Remove the code entirely from production builds with Cargo features, and verify the removal in CI (the "Testing Strategy" section) | 1 |
+| Auto-update | Distribution of malicious code to all users | Sign update files and verify them. Use Windows code signing | 2 |
+| Skins | Code execution via Lua, infinite loops | Run Lua only at load time. Build the environment allowlist-style, without `io`, `os`, `dofile`, `loadfile`, `debug`, unrestricted `package`, or module loading. Cap memory, instruction count including coroutines, and calls to host functions. Expressions in the declarative format also have caps on size and evaluation cost. Cap image dimensions and decoded size, and restrict the files that skins and charts reference to within their respective folders | 3 |
+| Modified clients | Fabricated input logs | Assume it cannot be prevented, and rely on detection and human review (the "Countermeasures Against Cheating and Piracy" section) | 4 |
+| Others' logs | Resubmission of someone else's record | Bind start tokens to accounts. The hash of the submission is only a hint of duplication and cannot identify modified copies | 4 |
+| Evaluator version | Claiming an old version with bugs | The server computes only with its own evaluator. The client's version is treated as informational only | 4 |
+| Mass submission | Wasting CPU time and billing | Rate limits per account and per IP. A cap on input log size (song length × maximum input rate). Smooth the load with Queues | 4 |
+| Accounts | Takeover, impersonation | Hold no passwords and use external login (Discord, GitHub, etc.). Narrow API token permissions | 4 |
+| Registry | Registration of pirated content, author impersonation, confusing names | Verify publishers with signing keys, with procedures for key revocation and renewal. Registration is reviewed | 5 |
+| Takedown requests | Removal through false claims | Define procedures for requests and counter-notices | 5 |
+| Source URLs | Content substitution | Always verify contents by hash, and do not install on mismatch | 5 |
 
-クライアントのソースは公開する前提とし、攻撃者がコードを読める状態で成り立つ対策だけを採る。検出のしきい値と秘密の値はサーバーにだけ置く。
+The client source is assumed to be public, and only mitigations that hold while attackers can read the code are adopted. Detection thresholds and secret values are kept only on the server.
 
-### プライバシー
+### Privacy
 
-- リプレイの公開は既定で非公開とし、プレイヤーが選べるようにする。
-- アカウントの削除と、データの書き出しに対応する。
-- Discordの連携は、外部に送る情報（曲名、プレイ中かどうか）を設定画面に示し、既定では無効にする。OBSとの連携は手元のPCの中で完結させる。
+- Replays are private by default, and the player can choose to publish them.
+- Account deletion and data export are supported.
+- For the Discord integration, the information sent externally (song title, whether playing) is shown on the settings screen, and it is disabled by default. The OBS integration stays entirely within the local PC.
 
-### 対象外
+### Out of Scope
 
-- カーネルレベルのチートや、ハードウェアで押す自動入力
-- オフラインの一人遊びでの不正
+- Kernel-level cheats, and automated input pressed by hardware
+- Cheating in offline single-player play
 
-## 不正と割れへの対策
+## Countermeasures Against Cheating and Piracy
 
-どちらも完全には防げない。不正は割に合わなくなる層を重ね、割れは「ランキングに載せない」「割れを助ける機能を作らない」の2点で対処する。クライアントはソースを公開する前提とし、カーネルレベルのアンチチートや難読化は採用しない。
+Neither can be prevented completely. Cheating is handled by stacking layers that make it not worth the effort, and piracy by two points: "do not list it in the rankings" and "do not build features that aid piracy". The client is assumed to be open source, and kernel-level anti-cheat and obfuscation are not adopted.
 
-### 不正への対策
+### Anti-Cheating Measures
 
-| 層 | 仕組み | 防げるもの |
+| Layer | Mechanism | What it prevents |
 | --- | --- | --- |
-| サーバーで計算 | スコアは受け取らず、入力ログから計算する | スコアの数値だけを書き換えること、記録したオプションと計算の食い違い。入力ログそのものの捏造は防げない |
-| 開始の登録 | 開始時に一回限りのトークンと乱数シードを発行する。譜面の長さに見合う時間内の送信だけ受け付ける | クライアントが好きなシードを指定して特定の配置を狙うこと、過去のログの使い回し。その場で自動入力を流すことは防げない |
-| ありえない入力 | 機器の仕様に合わない入力（ポーリング間隔より短い連打、デバウンス違反など）。HIDは1つの報告に複数のボタンが入るので、同時押しの時刻の一致だけでは判断しない | 雑な自動入力の手がかり |
-| 統計 | ずれの分布が人間らしいか（密度や同時押しでの増え方、曲の後半の疲れ、本人の過去との比較） | 調べる対象の絞り込み（これだけで処分はしない） |
-| 人の確認 | 公開されたリプレイは誰でもクライアントで再生できる。上位の記録は、リプレイの公開か動画の提出で「検証済み」にする | 精巧な不正 |
-| 信頼の段階 | 新しいアカウントや未検証の記録は、すぐには上位に出さない | 捨てアカウントによる荒らし |
+| Server-side computation | Scores are not accepted; they are computed from the input log | Rewriting just the score numbers, mismatches between the recorded options and the computation. Fabrication of the input log itself cannot be prevented |
+| Start registration | A one-time token and a random seed are issued at start. Only submissions within a time consistent with the chart's length are accepted | Clients specifying a seed of their choice to aim for a particular arrangement, reuse of old logs. Feeding automated input live cannot be prevented |
+| Impossible input | Input inconsistent with the device's specifications (mashing faster than the polling interval, debounce violations, etc.). HID puts multiple buttons in one report, so matching times of simultaneous presses alone is not used as the basis for a decision | Clues to crude automated input |
+| Statistics | Whether the deviation distribution looks human (how it grows with density and chords, fatigue late in the song, comparison with the player's own history) | Narrowing down what to investigate (no action is taken on this alone) |
+| Human review | Anyone can play published replays in the client. Top records become "verified" by publishing the replay or submitting a video | Sophisticated cheating |
+| Trust levels | New accounts and unverified records are not shown at the top right away | Vandalism with throwaway accounts |
 
-> **RANDOMの引き直しは通常の遊び方**
+> **Rerolling RANDOM is normal play**
 >
-> 当たりの配置が出るまでリトライを繰り返すのは正当な遊び方として扱い、制限しない。開始の登録は「シードが本当に乱数であること」を保証するためのもので、引き直しの回数は問わない。リトライの手触りを損なわないよう、トークンとシードは前もってまとめて受け取っておき、リトライのたびに通信を待たない。通信できないときもそのまま遊べて、記録は「未検証」として扱う。
+> Retrying over and over until a favorable arrangement comes up is treated as legitimate play and is not restricted. Start registration exists to guarantee that "the seed is truly random", and the number of rerolls does not matter. So as not to spoil the feel of retries, tokens and seeds are received in batches in advance, and no retry waits on the network. Play also works as is when offline, and the records are treated as "unverified".
 
-検出のしきい値はサーバー側にだけ置き、公開しない。十分に作り込まれた自動入力はいずれ統計でも見分けられなくなるので、最上位の記録は人の確認に頼る。
+Detection thresholds are kept only on the server side and are not published. Sufficiently sophisticated automated input will eventually become indistinguishable even statistically, so the very top records rely on human review.
 
-### 割れへの対策
+### Anti-Piracy Measures
 
-- **ランキングは許可リスト方式にする**。出どころがはっきりした譜面（BMSイベントの作品、出どころを管理する難易度表に載った譜面、配布の登録簿に署名付きで登録された譜面）だけを対象にする。禁止リストは、1バイト変えるだけでハッシュが変わるので効かない。
-- 許可リストにない譜面も手元では遊べる。ランキングに載らないか、「未検証」として分けるだけにする。
-- 権利者や作者から申し立てがあれば、譜面を登録簿と許可リストから外す。外れた譜面はIRの対象からも自動的に外れる。
-- 利用者の手元のファイルは走査しない。市販データとの照合もしない（照合の元として市販データを持つ必要が出てしまうため）。
+- **Rankings use an allowlist.** Only charts with clear provenance (works from BMS events, charts listed in difficulty tables that manage provenance, charts registered with a signature in the distribution registry) are eligible. A denylist does not work, because changing a single byte changes the hash.
+- Charts not on the allowlist can still be played locally. They simply do not appear in the rankings, or are separated as "unverified".
+- On a request from a rights holder or author, the chart is removed from the registry and the allowlist. A removed chart also automatically drops out of IR eligibility.
+- Users' local files are not scanned. There is no matching against commercial data either (because matching would require holding commercial data as the reference).
 
-## 譜面の配布
+## Chart Distribution
 
-譜面の登録簿（レジストリ）とインストーラーを、プレイヤー本体とは別のサービスとして提供する。登録簿はIRの許可リストを兼ね、譜面の出どころの記録になる。
+A chart registry and an installer are provided as a service separate from the player itself. The registry doubles as the IR allowlist and serves as the record of chart provenance.
 
-### マニフェスト（1パッケージ＝1作品）
+### Manifest (One Package = One Work)
 
-- 名前、版、作者、配布条件（再配布してよいか、ミラーしてよいか）
-- ファイルの一覧とハッシュ。譜面にはSHA-256とMD5
-- 取得元のURL、依存関係（差分の場合は、依存する本体のパッケージ）
-- 作者またはイベント運営者の署名（minisignのような方式）
+- Name, version, author, distribution terms (whether redistribution is allowed, whether mirroring is allowed)
+- File list and hashes. SHA-256 and MD5 for charts
+- Source URLs, dependencies (for a derivative chart, the base package it depends on)
+- Signature by the author or the event organizer (a scheme like minisign)
 
-### 配布方式
+### Distribution Modes
 
-- **目録のみ（既定）**：作者の配布URLから取得し、ハッシュで中身が正しいか確かめる。運営の負担と法的なリスクが最も小さい。
-- **保管**：作者が同意した場合だけ、こちらで保管する。イベントのサイトが閉じてもリンクが切れない。
+- **Catalog only (default)**: Fetch from the author's distribution URL and verify by hash that the contents are correct. The lowest operational burden and legal risk.
+- **Hosted**: Only when the author consents, we host it. Links do not break even if the event site shuts down.
 
-### BMSならではの機能
+### BMS-Specific Features
 
-- **差分の依存解決**：差分の譜面を入れると、必要な本体のパッケージも入れる。
-- **難易度表のコレクション**：譜面のハッシュとURLの一覧である難易度表を、まとめて入れられる。
-- **中身のハッシュによる保存**：同じ本体を使う差分が多いので、ファイルを中身のハッシュで保存し、同じキー音を重複して持たない。
+- **Derivative chart dependency resolution**: Installing a derivative chart also installs the base package it needs.
+- **Difficulty table collections**: A difficulty table, which is a list of chart hashes and URLs, can be installed in one go.
+- **Content-hash storage**: Many derivative charts use the same base, so files are stored by content hash and the same key sounds are not stored twice.
 
-### 取り込みの安全性
+### Import Safety
 
-- zipの中のパスで展開先の外に書き込む攻撃（zip slip）と、展開すると巨大になるzip（zip bomb）を防ぐ。
-- zip内のファイル名はShift\_JISのことが多いので、文字コードを判定して扱う。
-- パッケージの中身は何も実行しない。Luaスキンを配る場合も、読み込み時の制限された環境での変換にだけ使い、譜面より一段慎重に扱う。
+- Prevent attacks that write outside the extraction directory through paths inside a zip (zip slip), and zips that become enormous when extracted (zip bomb).
+- File names inside zips are often Shift\_JIS, so the character encoding is detected before handling them.
+- Nothing in a package is executed. Even when Lua skins are distributed, they are used only for conversion in the restricted load-time environment, and are handled one step more cautiously than charts.
 
-作者が譜面を直すとハッシュが変わる。ランキングは譜面のハッシュごとに分けたまま、マニフェストで旧版と新版を関連付ける。旧版の記録を引き継ぐかどうかは、作者かランキングの運営者が決める。
+When an author fixes a chart, its hash changes. Rankings stay separate per chart hash, and the manifest links the old and new versions. Whether records for the old version carry over is decided by the author or the ranking operator.
 
-## 言語とcrate構成
+## Language and Crate Structure
 
-coreの言語はRustを推奨する。評価器をクライアントとIRサーバーで共有でき、決定的な計算とテストがしやすく、Shift\_JISの変換（`encoding_rs`）などのライブラリもそろっている。Odinも有力な選択肢で、miniaudio・D3D・Luaのバインディングが標準でそろい、ゲーム部分を早く形にできる。ただし1.0前であることとライブラリの少なさを受け入れる必要がある。標準のスキンはスクリプトを持たない宣言的な形式にし、LuaはbeatorajaのLuaスキンのアダプタでだけ使う。
+Rust is recommended as the core language. The evaluator can be shared between the client and the IR server, deterministic computation and testing are easy, and libraries such as Shift\_JIS conversion (`encoding_rs`) are available. Odin is also a strong option: miniaudio, D3D, and Lua bindings come standard, and the game part can take shape quickly. However, it would mean accepting that it is pre-1.0 and has few libraries. The standard skin uses a declarative format with no scripts, and Lua is used only in the beatoraja Lua skin adapter.
 
-| 層 | crate | 役割 |
+| Layer | crate | Role |
 | --- | --- | --- |
-| L0 | `bms-model` | 譜面の型、時刻（µs）の型 |
-| L1 | `bms-parser` | BMS/BME/PMS/BMSONの読み込み、`#RANDOM`、有理数による時刻計算 |
-| L2 | `rules` | プリセットの型と読み込み、判定窓・ゲージの表 |
-| L2 | `eval` | 評価器。`bms-model` と `rules` にだけ依存する |
-| L2 | `replay` | 入力ログとリプレイの形式 |
-| L3 | `input`、`audio` | Raw Input/HID/MIDI、WASAPI/ASIOとミキサー |
-| L4 | `game` | ロジックスレッド、セッション方針、状態の写しの公開 |
-| L5 | `render`、`skin-*`、`ui` | wgpuの描画、各スキンのアダプタ、eguiの画面 |
-| apps | `player`、`eval-cli` | 本体と、リプレイを評価するヘッドレスのCLI |
-| 後段 | `ir-server`、`pkg` | IRサーバー（`eval` を共有）、配布の登録簿とインストーラー |
+| L0 | `bms-model` | Chart types, time (µs) types |
+| L1 | `bms-parser` | Loading BMS/BME/PMS/BMSON, `#RANDOM`, time computation with rational numbers |
+| L2 | `rules` | Preset types and loading, judgment window and gauge tables |
+| L2 | `eval` | The evaluator. Depends only on `bms-model` and `rules` |
+| L2 | `replay` | Input log and replay formats |
+| L3 | `input`, `audio` | Raw Input/HID/MIDI, WASAPI/ASIO and the mixer |
+| L4 | `game` | Logic thread, session policy, publishing the state snapshot |
+| L5 | `render`, `skin-*`, `ui` | wgpu rendering, the adapter for each skin, egui screens |
+| apps | `player`, `eval-cli` | The player itself, and a headless CLI that evaluates replays |
+| Later | `ir-server`, `pkg` | IR server (shares `eval`), distribution registry and installer |
 
-依存は上の層から下の層への一方向だけにする。`eval` は時計・入出力・音声・描画のcrateに依存できないので、純粋さをcrateの依存関係で強制できる。
+Dependencies go only one way, from upper layers to lower layers. `eval` cannot depend on clock, I/O, audio, or rendering crates, so its purity can be enforced by crate dependencies.
 
-Windowsに依存するコードは `input`・`audio`・`render`・`player` に閉じ込める。それ以外のcrateは、Windows以外でもビルドとテストが通ることをLinuxのCIで確かめる。そのため、それ以外のcrateからこれらのWindows専用の実装への依存（間接的な依存を含む）も作らない。分け方（条件付きのコンパイルにするか、crateを分けるか）は実装のときに決める。
+Windows-dependent code is confined to `input`, `audio`, `render`, and `player`. Linux CI verifies that every other crate builds and passes tests on platforms other than Windows. Therefore, no dependency (including indirect dependencies) from those other crates on these Windows-only implementations is created either. How to split them (conditional compilation or separate crates) is decided at implementation time.
 
-## 主要なライブラリとアルゴリズム
+## Key Libraries and Algorithms
 
-独自に作る理由がない部分は、確立したライブラリを使う。自前で作るのは、判定の意味に直結する部分（評価器、譜面の読み込みと時刻計算）と、性能の要になる部分（ミキサー）に限る。バージョンとライセンスは採用時に確かめ、`cargo-deny` で管理する。コーデック・圧縮・計測のライブラリは `eval` に入れない。
+Where there is no reason to build our own, established libraries are used. We build our own only for the parts directly tied to the meaning of judgment (the evaluator, chart loading, and time computation) and the parts central to performance (the mixer). Versions and licenses are checked at adoption and managed with `cargo-deny`. Codec, compression, and measurement libraries are not put in `eval`.
 
-### ライブラリ
+### Libraries
 
-| 用途 | 候補 | 判断 |
+| Purpose | Candidate | Decision |
 | --- | --- | --- |
-| Windows API | `windows` | Raw Input、WASAPI、MMCSS、待機タイマーを直接使う。公式のバインディング |
-| 音声の出力 | `windows` でWASAPIを直接 | 共有モードの低遅延（`IAudioClient3`）、排他モード、イベント駆動とバッファの細かい制御が要るので直接使う。ASIOは任意の機能とし、ASIO SDKのライセンス（商用とGPLv3の2通り）の選択が決まってから対応する |
-| 音声（代替） | BASS、BASSmix、BASSWASAPI（必要ならBASS\_FX、BASSASIO） | 自前の構成（WASAPI、`symphonia`、`rubato`、自前のミキサー）が工数や実現の見通しの面で行き詰まった場合の代替とする。リズムゲームでの実績があり、低遅延の再生、ミキサー上の位置を指定した予約、音程を保った速度変更をそろえて使える。ソースが公開されていないライブラリで、ライセンスはDLLごとに条件が違う（BASSは非商用で収益がない場合に無料、BASSASIOは別のライセンス）ので、採用するときは各DLLの条件とプロジェクトのライセンスとの整合を個別に確かめる。採用の条件として、再生位置とQPCの対応が取れること、時計のずれを補正できること、遅れと音切れが目標に収まることを実測で確かめる。メモリを確保しない約束はアプリ側のコードに限り、DLLの内部は必要ならネイティブのヒープの計測で確かめる。DLLの版・入手元・ライセンスはCargoの外の依存として管理する。音声は `audio` crateの境界の内側に閉じているので、差し替えはその中で済む |
-| MIDI入力 | `midir` | WindowsのMIDI入力を扱う。時刻はコールバックで受け取った時点のQPCで付ける |
-| 入力の時刻の計測 | GameInput（任意） | 入力に付く時刻を記録して、受信までの遅れのばらつきを測るために使う（判定には使わない）。Windows 10 1903以降と11のデスクトップで使えるが、NuGetのパッケージと再頒布用のランタイムの扱い、Rustからの呼び出し方（自前のバインディング）が必要になる。専用コントローラーを扱えるかは機器ごとに確かめ、扱えない機器はRaw Inputだけで受ける |
-| 音声のデコード | `symphonia` | WAV、OGG Vorbis、FLAC、MP3をRustだけで扱える。MPL-2.0なので、その義務（変更したファイルの公開など）を守る |
-| サンプルレート変換 | `rubato` | 読み込み時の変換と、音声時計のずれの補正（比率を変えられる変換器）に使う。リアルタイム側では処理用のバッファを事前に確保する |
-| ラウドネス | `ebur128` | 譜面ごとの音量の正規化に使う（EBU R128） |
-| スレッド間のキュー | `rtrb`（単一生産者・単一消費者のリングバッファ） | 入力の出どころごと、ロジック→音声、ロジック→描画（演出イベント）に1本ずつ置く。取りこぼしてはいけないデータはすべてこれで渡す |
-| 状態の写し | `triple_buffer` | 描画用の状態の写しだけに使う（最新の値だけが届き、途中の値は飛ぶため）。MPL-2.0 |
-| 描画 | `wgpu`、`winit` | DX12を主なバックエンドにする。パイプラインはプレイ前にすべて作り、キャッシュする |
-| 文字 | `cosmic-text`、`glyphon` | 日本語の組版は `cosmic-text`、GPUのグリフアトラスと描画は `glyphon`。プレイ画面では事前に作ったアトラスだけを使う |
-| 画像 | `image` | PNG・JPEG・BMPの読み込み。縦横と展開後の大きさに上限を設ける |
-| 動画（BGA） | FFmpeg（`ffmpeg-next`） | BGAの形式は多様で、自前のデコードは現実的でない。GPLやnonfreeの部品を含めずにビルドしたものを動的リンクし、LGPLの義務（対応するソースとビルド手順の提供、表示、DLLを差し替えられること）を守る。`ffmpeg-next` は保守のみの状態なので、薄いバインディングを自前で持つ選択肢も残す |
-| 設定画面 | `egui` | 設定・管理用の画面だけに使う |
-| 文字コード | `encoding_rs`、`chardetng` | BMSはShift\_JISが多く、UTF-8も混ざる。判定してから変換する |
-| 譜面の読み込み | 自作（`bms-rs` を比較対象にする） | 時刻の扱いと上限付きの安全な読み込みは判定の正しさに直結するので、自前で持つ。BMSONは `serde_json` で読む |
-| 有理数 | `num-rational`（`i128`） | 時刻の計算に使う。演算は必ずchecked版を使い、オーバーフローを検出する |
-| ライブラリのDB | `rusqlite`（SQLite同梱、FTS5） | 楽曲の情報、スコア、検索の索引 |
-| アーカイブ | `zip`、`sevenz-rust2` | 展開先とサイズの上限を必ず確かめる。RARは、使えるデコーダーのライセンスに制約があるので対応を後回しにする |
-| 設定とプリセット | `serde`、`toml` | 人が書くファイルはTOMLにする |
-| リプレイ | 独自のバイナリ形式、`zstd` | 版番号を先頭に置き、時刻の差分を可変長整数にして並べ、zstdで圧縮する |
-| ハッシュと署名 | `sha2`、`md-5`、`minisign-verify` | 識別と検証はSHA-256で行い、MD5は既存の難易度表との互換のためだけに使う。署名はminisign形式に統一する（配布の登録簿、自動更新）。暗号は自前で実装しない |
-| Lua（互換用） | `mlua`（Lua 5.4） | beatorajaのLuaスキンを読み込み時に変換するためだけに使う。`mlua` の `sandbox()` はLuau専用なので、Lua 5.4では許可リスト方式の環境を自前で組み立てる |
-| WASM | `wasm-bindgen` | 評価器をWorkersから呼ぶ |
-| 計測とテスト | `tracy-client`、`criterion`、`proptest` | 区間の計測、ベンチマーク、評価器の性質のテスト |
+| Windows API | `windows` | Use Raw Input, WASAPI, MMCSS, and waitable timers directly. The official bindings |
+| Audio output | WASAPI directly via `windows` | Used directly because low-latency shared mode (`IAudioClient3`), exclusive mode, event-driven operation, and fine-grained buffer control are needed. ASIO is an optional feature, supported once the choice of ASIO SDK license (two options: commercial or GPLv3) is settled |
+| Audio (alternative) | BASS, BASSmix, BASSWASAPI (BASS\_FX and BASSASIO if needed) | The alternative if our own stack (WASAPI, `symphonia`, `rubato`, our own mixer) hits a dead end in terms of effort or feasibility. It has a track record in rhythm games and provides low-latency playback, scheduling at specified positions on the mixer, and pitch-preserving speed change together. It is a library whose source is not public, and its license terms differ per DLL (BASS is free for non-commercial use with no revenue; BASSASIO has a separate license), so if it is adopted, each DLL's terms and their compatibility with the project's license are checked individually. As conditions for adoption, verify by measurement that the playback position can be mapped to QPC, that clock drift can be corrected, and that latency and dropouts stay within the targets. The commitment not to allocate memory applies only to app-side code; inside the DLLs, it is verified by native heap measurement if needed. DLL versions, sources, and licenses are managed as dependencies outside Cargo. Audio is enclosed within the boundary of the `audio` crate, so swapping it is done within that crate |
+| MIDI input | `midir` | Handles Windows MIDI input. Times are the QPC at the point the callback receives the input |
+| Input timestamp measurement | GameInput (optional) | Used to record the timestamps attached to input and measure the variance of the latency until receipt (not used for judgment). Available on desktop Windows 10 1903 and later and Windows 11, but requires handling the NuGet package and the redistributable runtime, and a way to call it from Rust (our own bindings). Whether dedicated controllers are supported is checked per device, and devices that are not supported are received through Raw Input only |
+| Audio decoding | `symphonia` | Handles WAV, OGG Vorbis, FLAC, and MP3 in pure Rust. It is MPL-2.0, so its obligations (publishing modified files, etc.) are honored |
+| Sample rate conversion | `rubato` | Used for load-time conversion and for correcting audio clock drift (a resampler with a variable ratio). The real-time side preallocates its working buffers |
+| Loudness | `ebur128` | Used for per-chart volume normalization (EBU R128) |
+| Inter-thread queues | `rtrb` (single-producer single-consumer ring buffer) | One per input source, one for logic→audio, and one for logic→render (effect events). All data that must not be dropped is passed through these |
+| State snapshot | `triple_buffer` | Used only for the render state snapshot (only the latest value arrives, and intermediate values are skipped). MPL-2.0 |
+| Rendering | `wgpu`, `winit` | DX12 is the primary backend. All pipelines are created before play and cached |
+| Text | `cosmic-text`, `glyphon` | Japanese typesetting with `cosmic-text`; GPU glyph atlas and drawing with `glyphon`. The play screen uses only atlases built in advance |
+| Images | `image` | Loading PNG, JPEG, and BMP. Dimensions and decoded size are capped |
+| Video (BGA) | FFmpeg (`ffmpeg-next`) | BGA formats are diverse, and decoding them ourselves is not realistic. A build without GPL or nonfree components is dynamically linked, and the LGPL obligations (providing the corresponding source and build instructions, notices, allowing the DLL to be replaced) are honored. `ffmpeg-next` is in maintenance-only status, so the option of keeping our own thin bindings stays open |
+| Settings screens | `egui` | Used only for settings and management screens |
+| Character encoding | `encoding_rs`, `chardetng` | BMS is mostly Shift\_JIS, with UTF-8 mixed in. Detect first, then convert |
+| Chart loading | Our own (with `bms-rs` as a point of comparison) | Time handling and safe bounded loading are directly tied to the correctness of judgment, so we own it. BMSON is read with `serde_json` |
+| Rational numbers | `num-rational` (`i128`) | Used for time computation. Operations always use the checked versions to detect overflow |
+| Library DB | `rusqlite` (bundled SQLite, FTS5) | Song information, scores, search index |
+| Archives | `zip`, `sevenz-rust2` | The extraction target and the size caps are always checked. RAR support is postponed because the usable decoders have license constraints |
+| Settings and presets | `serde`, `toml` | Files written by people are TOML |
+| Replays | Custom binary format, `zstd` | The version number goes first, time deltas are laid out as variable-length integers, and the result is compressed with zstd |
+| Hashing and signing | `sha2`, `md-5`, `minisign-verify` | Identification and verification use SHA-256, and MD5 is used only for compatibility with existing difficulty tables. Signatures are unified on the minisign format (distribution registry, auto-update). No cryptography is implemented ourselves |
+| Lua (for compatibility) | `mlua` (Lua 5.4) | Used only to convert beatoraja Lua skins at load time. `mlua`'s `sandbox()` is Luau-only, so for Lua 5.4 the allowlist-style environment is built ourselves |
+| WASM | `wasm-bindgen` | Calls the evaluator from Workers |
+| Measurement and testing | `tracy-client`, `criterion`, `proptest` | Span measurement, benchmarks, property tests of the evaluator |
 
-GPLのプロジェクト（beatoraja、bmz-playerなど）のコードや、そこから移植した表は使わない。挙動は公開されている情報と手書きのテストで決め、表やテストの元になった情報の出どころを記録する。
+Code from GPL projects (beatoraja, bmz-player, etc.) and tables ported from them are not used. Behavior is determined from public information and hand-written tests, and the sources of the information behind tables and tests are recorded.
 
-### メモリを確保しない範囲
+### Scope of No Allocation
 
-入力スレッド、ロジックスレッド、音声のコールバック、描画スレッドの毎フレームの処理（アプリ側のコード）では、プレイ中にメモリを確保しない。評価器の出力、入力ログ、演出イベントの領域は事前に確保し、上限に達したときの扱い（入力ログなら「不完全」として記録）を決めておく。デコードや先読みのような裏側の処理と、GPUドライバー内部の確保は対象外とする。検査はテスト用のグローバルアロケーターで行い、リリースビルドでも有効にできるようにする。
+The input thread, the logic thread, the audio callback, and the per-frame work of the render thread (app-side code) do not allocate memory during play. The regions for evaluator output, the input log, and effect events are allocated in advance, and what happens on reaching the limit is decided (for the input log, it is recorded as "incomplete"). Background work such as decoding and read-ahead, and allocations inside the GPU driver, are out of scope. The check is done with a test global allocator, which can also be enabled in release builds.
 
-### アルゴリズム
+### Algorithms
 
-| 処理 | 方法 |
+| Process | Method |
 | --- | --- |
-| 譜面の時刻 | 小節の位置（有理数）を、BPM変化とSTOPの区間ごとに積み上げて時刻にする。BPMが0以下、分母が0、小数の桁が多すぎる値は拒否する。同じ位置のBPM変化とSTOPの順番、負の値の丸め方を規則として固定する。µsへの丸めは最後に1回だけ行う |
-| スクロール位置 | BPM・STOP・スクロール速度の変化から、時刻→表示位置の区分的な一次関数を読み込み時に作る。STOPの区間は傾き0になる。逆スクロールは対象外とし、表示位置は時刻に対して減らないことを前提に、見えている範囲を区間ごとに二分探索で求める |
-| ハイスピード | 2つの方式を区別して持つ。基準BPMによる方式は、主なBPMで緑数字（ノーツが見えている時間）を合わせるが、BPMが変わると見えている時間も変わる。見えている時間を一定に保つ方式は、BPMにかかわらず緑数字を保つ。レーンカバーとリフトの位置は、見えている範囲の計算に含める |
-| 評価のイベント処理 | レーンごとのノーツの期限、スクラッチの離し・デバウンス・HCN・曲の終了の期限、入力の列を、決まった全順序（時刻、次に種類、次にレーン、次に連番）で取り出す。レーンごとの列はもともと時刻順なので、全体を優先度付きキューに積むより軽い |
-| ノーツの割り当て | レーンごとに未処理の先頭を指す位置を持ち、判定窓の中にあるノーツだけを候補にする。候補の選び方はプリセットの選択肢で決める |
-| デバウンス | ボタンごとの小さな状態機械で処理する。短すぎる変化は捨てるが、離しを捨てて押しっぱなしにならないよう、最終的な状態は必ず実際の状態に戻す。1つのレーンに複数のボタンを割り当てた場合は、どれかが押されていれば押しとする |
-| アナログスクラッチ | 軸の値は一周の折り返しを考慮して連続な位置に直し、位置の変化量を積み上げる（差分を返す機器では差分をそのまま使い、二重に積み上げない）。押しと離しに別のしきい値（ヒステリシス）を持たせ、回転方向の反転は新しい押しとして扱う。止まってから一定時間たった時点の離しは、評価器の期限として扱う |
-| ゲージ | 固定小数点（たとえば残量を1/100000%単位の `i64`）で計算する。途中の計算は `i128` で行い、増減の計算→上下限で丸める、の順番と、割り切れない余りの扱い（切り捨て）を固定する |
-| 音声時計の補正 | デバイスの再生位置とQPCから求めた位置の差を一定間隔で測り、雑音を均してから、比例・積分の制御で変換の比率をわずかに動かす。積分の暴走を防ぎ、比率とその変化の速さに上限を設け、一時停止や再開のような不連続があったら制御をリセットする。変換とリミッターの遅れは、押してから鳴るまでの予算に含める |
-| ミキシング | 事前に確保した発音の枠を使い回す。i16で持った音（メモリの節約のため）をf32で足し合わせ、リミッター（上限、立ち上がりと戻りの速さ、左右の連動、先読みの量は実装時に決める）を通して出力の形式に変換する |
-| 譜面ごとの音量の正規化 | オートプレイで全キー音とBGMを鳴らした場合の音を、裏側でEBU R128（ゲート付きのラウドネスとトゥルーピーク）で解析してキャッシュし、次のプレイから一定の補正量として適用する。初回の読み込みは待たせない |
-| オフセットの推奨値 | 十分な数のずれが集まった場合だけ、中央値とばらつきを出す。この値は機器の遅れだけでなくプレイヤーの癖も含むので、「タイミングの偏りにもとづく推奨値」として示す |
-| 描画 | スプライトはレイヤーの順番と半透明の重なりを保てる範囲で、テクスチャごとにまとめてインスタンス描画で一度に描く |
-| 楽曲の検索 | Unicodeの正規化（全角と半角）に加えて、ひらがなとカタカナの区別をなくす変換を自前で行ってから索引にする。部分一致はFTS5のtrigramを使い、2文字以下の短い検索は別の方法（前方一致など）で補う |
-| ライブラリの走査 | 更新日時とサイズで変わったファイルだけを選び、ヘッダーだけを読む。複数スレッドで並列に処理する |
-| 譜面の保存（配布） | ファイルを中身のSHA-256で保存し、同じファイルを重複して持たない |
+| Chart time | Measure positions (rational numbers) are accumulated into time, segment by segment between BPM changes and STOPs. Values with a BPM of 0 or less, a zero denominator, or too many decimal digits are rejected. The order of a BPM change and a STOP at the same position, and how negative values are rounded, are fixed as rules. Rounding to µs is done only once, at the end |
+| Scroll position | From BPM, STOP, and scroll speed changes, a piecewise linear function from time to display position is built at load time. STOP segments have a slope of 0. Reverse scrolling is out of scope; on the premise that the display position never decreases with time, the visible range is found per segment by binary search |
+| Hi-speed | Two methods are kept distinct. The base-BPM method matches the green number (the time a note is visible) at the main BPM, but the visible time changes when the BPM changes. The constant-visible-time method keeps the green number regardless of BPM. Lane cover and lift positions are included in the visible range calculation |
+| Evaluation event processing | Per-lane note deadlines, deadlines for scratch release, debounce, HCN, and song end, and the input stream are taken out in a fixed total order (time, then kind, then lane, then sequence number). The per-lane streams are already in time order, so this is lighter than pushing everything into a priority queue |
+| Note assignment | Each lane keeps a position pointing at its first unprocessed note, and only notes within the judgment window are candidates. How to choose among candidates is decided by a preset choice |
+| Debounce | Handled by a small state machine per button. Changes that are too short are dropped, but so that dropping a release does not leave a key held down, the final state always returns to the actual state. When multiple buttons are assigned to one lane, the lane is pressed if any of them is pressed |
+| Analog scratch | Axis values are converted into a continuous position, taking wraparound into account, and changes in position are accumulated (for devices that report deltas, the deltas are used as is and not accumulated twice). Separate thresholds for press and release (hysteresis) are used, and a reversal of the rotation direction is treated as a new press. The release at a fixed time after movement stops is handled as an evaluator deadline |
+| Gauge | Computed in fixed point (for example, the remaining amount as an `i64` in units of 1/100000%). Intermediate computation is done in `i128`, and the order (compute the increase or decrease → clamp to the bounds) and the handling of remainders that do not divide evenly (floor) are fixed |
+| Audio clock correction | The difference between the device playback position and the position derived from QPC is measured at regular intervals, smoothed to remove noise, and then the conversion ratio is nudged slightly with proportional-integral control. Integral windup is prevented, the ratio and its rate of change are capped, and the controller is reset on discontinuities such as pause and resume. Conversion and limiter latency are included in the press-to-sound budget |
+| Mixing | Preallocated voice slots are reused. Sounds held as i16 (to save memory) are summed in f32, passed through a limiter (the ceiling, attack and release speeds, stereo linking, and amount of look-ahead are decided at implementation time), and converted to the output format |
+| Per-chart volume normalization | The sound of playing all key sounds and the BGM with autoplay is analyzed in the background with EBU R128 (gated loudness and true peak) and cached, and from the next play it is applied as a fixed correction. The first load does not wait for it |
+| Recommended offset | Only when enough deviations have been collected, the median and the spread are output. This value includes not only device latency but also the player's habits, so it is presented as "a recommendation based on timing bias" |
+| Rendering | Sprites are grouped per texture and drawn at once with instanced rendering, as far as layer order and translucent overlap can be preserved |
+| Song search | In addition to Unicode normalization (full-width and half-width), our own conversion that removes the distinction between hiragana and katakana is applied before indexing. Substring matching uses the FTS5 trigram tokenizer, and short queries of 2 characters or fewer are supplemented by another method (prefix matching, etc.) |
+| Library scanning | Only files changed by modification time and size are selected, and only their headers are read. Processed in parallel on multiple threads |
+| Chart storage (distribution) | Files are stored by the SHA-256 of their contents, and identical files are not stored twice |
 
-## テスト方針
+## Testing Strategy
 
-既存実装の結果との一致ではなく、評価器が満たすべき性質を確かめる。
+Verify the properties the evaluator must satisfy, not agreement with the results of existing implementations.
 
-- 同じ入力ログと同じプリセットなら、必ず同じ結果になる（異なるビルドや環境でも）
-- プレイ中に少しずつ評価した結果と、一括で評価した結果が一致する
-- 入力の順番を保ったまま、水位を進める刻みを変えても結果が変わらない
-- 入力とノーツの対応を固定した単体の判定では、判定窓を広げても判定が悪くならない（全体の評価では、先の入力が別のノーツを取ることがあるので成り立たない）
-- 生き残り系のゲージは、一度0になったら戻らない
-- 同じ区間・同じ助走の入力・同じ時刻の対応・同じオフセットの変化を与えれば、全体の入力ログから切り出した区間の評価と、途中からの演奏の評価が一致する
+- The same input log and the same preset always give the same result (even across different builds and environments)
+- The result of incremental evaluation during play matches the result of batch evaluation
+- With the order of inputs preserved, changing the steps by which the watermark advances does not change the result
+- In single-note judgment with a fixed mapping between input and note, widening the judgment window never makes the judgment worse (in whole-chart evaluation this does not hold, because an earlier input can take a different note)
+- Survival gauges never recover once they reach 0
+- Given the same section, the same lead-in input, the same time mapping, and the same offset changes, the evaluation of a section excerpted from a full input log matches the evaluation of a mid-chart start
 
-全体の評価では、壊れやすい場所を重点的に確かめる。判定窓の境界ちょうどの入力、同じ時刻のイベントの処理順、連打、LNの離しと押し直し、水位の境界ちょうどに届く入力である。
+Whole-chart evaluation focuses on the fragile spots: inputs exactly on a judgment window boundary, the processing order of events at the same time, mashing, LN release and re-press, and inputs that arrive exactly at the watermark boundary.
 
-ネイティブ版とWASM版の一致は、評価器だけでなく全体で確かめる。譜面ファイルのバイト列と入力ログから、確定した譜面のハッシュと判定イベント列までを、ネイティブ版と、実際にデプロイしたWorkersの両方で計算して比べる。読み込み処理・評価器・プリセットの版を固定し、オーバーフローの扱いと同じ時刻のイベントの順番は明示した規則に従わせる。少しずつ評価した結果と一括で評価した結果の一致も、オフセットの変化や同じ時刻のイベントを含む入力ログで確かめる。
+Agreement between the native and WASM builds is verified end to end, not just for the evaluator. From the chart file's bytes and the input log, the resolved chart hash and the judgment event stream are computed on both the native build and the actually deployed Workers, and compared. The loader, evaluator, and preset versions are fixed, and overflow handling and the order of events at the same time follow explicit rules. Agreement between incremental and batch evaluation is also verified with input logs that include offset changes and events at the same time.
 
-加えて、プリセットごとに「この入力ならこの判定」という手書きの小さな例を数十件持ち、プリセットを調整したときの意図しない変化を検出する。評価器はプロパティテスト（ランダムな入力ログの生成）でも確かめる。
+In addition, each preset has a few dozen small hand-written examples of "this input gives this judgment", to detect unintended changes when presets are tuned. The evaluator is also checked with property tests (generating random input logs).
 
-### 画面を起動せずに確かめる
+### Verifying Without Launching the UI
 
-確認のたびにアプリを起動して手で操作しなくて済むよう、ゲーム全体を画面なしで動かせる作りにする（「全体構成」の章の、テストのための仕組み）。
+So that each check does not require launching the app and operating it by hand, the whole game is built to run without a screen (the testing mechanisms in the "Overall Architecture" section).
 
-| 対象 | 方法 | 確かめること |
+| Target | Method | What it verifies |
 | --- | --- | --- |
-| 評価器、譜面の読み込み、プリセット | 単体テスト、プロパティテスト、手書きの例、`eval-cli` | 判定、ゲージ、時刻の計算 |
-| 譜面の読み込み | `cargo-fuzz` によるファジング | 壊れたファイルに対する安全性 |
-| ゲーム全体（画面なし） | 仮想の時計と入力ログの流し込みで、1曲を最高速度で通す | 画面の遷移、判定イベント、音の予約位置、リトライ、練習の区間 |
-| 音声 | 本番と同じ処理で、入力のPCM・サンプルレート・初期状態・ブロック長を固定して画面外で波形を作る。音を予約したサンプル位置は完全一致で、波形の値は許容範囲付きで正解と比べる。リミッターの先読みの遅れと末尾の出し切りも含め、ブロックの分け方を変えても結果が変わらないことも確かめる | ミキシング、リミッター、音量の正規化 |
-| 描画 | 指定した時刻の画面を画面外に描き、許容範囲付きで正解の画像と比べる。WindowsのCIでは、ソフトウェアで描くDX12（WARP）のアダプターを明示して選び、使ったアダプターを記録する。取得できなければ失敗とし、黙って飛ばさない。WARPも版によって結果が変わりうるので、Windowsのイメージ、wgpuとシェーダーの変換器、フォント、描画の設定を固定し、更新したときは差分の画像を確かめる。表示の方式・VRR・表示の遅れは、この方法では確かめられない | スキン、ノーツの位置、演出 |
-| 性能 | 決まった場面のベンチマーク。CPU側はCI、GPUを含む計測は決まった専用のPC | 予算と後退 |
+| Evaluator, chart loading, presets | Unit tests, property tests, hand-written examples, `eval-cli` | Judgment, gauge, time computation |
+| Chart loading | Fuzzing with `cargo-fuzz` | Safety against broken files |
+| Whole game (headless) | Run one song through at maximum speed, with a virtual clock and a fed input log | Screen transitions, judgment events, sound scheduling positions, retry, practice sections |
+| Audio | Generate waveforms offscreen with the same processing as production, with the input PCM, sample rate, initial state, and block length fixed. The sample positions where sounds were scheduled are compared exactly, and waveform values within a tolerance, against the expected output. Including the limiter's look-ahead delay and flushing the tail, also verify that changing how the blocks are divided does not change the result | Mixing, limiter, volume normalization |
+| Rendering | Render the screen at a given time offscreen and compare it with the expected image within a tolerance. On Windows CI, the DX12 adapter that renders in software (WARP) is explicitly selected, and the adapter used is recorded. If it cannot be obtained, the test fails rather than being silently skipped. WARP results can also vary by version, so the Windows image, wgpu and the shader translator, fonts, and rendering settings are pinned, and the diff images are reviewed on updates. Presentation mode, VRR, and display latency cannot be verified this way | Skins, note positions, effects |
+| Performance | Benchmarks of fixed scenes. CPU side on CI, measurements including the GPU on a fixed dedicated PC | Budget and regressions |
 
-テスト用の譜面は、テストのコードの中で譜面を組み立てる小さな仕組みと、自作の小さなBMSのテキストファイル（読み込みの経路を通すため）で作り、権利のある譜面をリポジトリに置かない。実際の譜面での確認は手元の環境で行う。
+Test charts are made with a small mechanism that builds charts in test code and with small self-made BMS text files (to exercise the loading path), and copyrighted charts are not put in the repository. Checks with real charts are done in local environments.
 
-スレッドを使わないテストでは、通知やキューの不具合は見つからない。そこで、実際のスレッドで動かすテストも少数持ち、入力の順番、水位、停止と再開を確かめる。
+Tests without threads do not find bugs in notifications or queues. So a small number of tests also run on real threads, to verify input order, the watermark, and stop and resume.
 
-### 起動しての確認を短くする（開発用ビルドだけ）
+### Shortening Launch-Based Checks (Development Builds Only)
 
-- **台本での起動**：「この譜面を読む、この入力ログを流す、この時刻で画面を保存する、終了する」を書いた台本（`--scenario 台本.toml`）で起動できる。人が確かめるときも、AIに確かめさせるときも同じ台本を使う。
-- **開始位置の指定**：コマンドラインや台本で、練習の「途中からの演奏」（「入力ログとリプレイ」の章）の開始位置を指定して起動できる。仕組みは製品の練習機能と同じものを使い、開発用ビルドが足すのは指定の方法だけとする。プリセットとスキンの読み直しと組み合わせて使う。
-- **外からの操作**：ローカルのイベントの口に、読み込み・開始・画面の保存の操作を足す。イベントの口は本来受け取るだけの口なので、これは開発用ビルドだけの例外とし、接続トークンとループバックの制限はそのまま適用する。
-- **計測用の出力**：判定のたびに画面の決まった位置を光らせる四角と、テスト用の音を出せる（下の試験用の装置で使う）。
+- **Scenario launch**: The app can be launched with a scenario (`--scenario scenario.toml`) that describes "load this chart, feed this input log, save the screen at this time, exit". The same scenario is used whether a human or an AI does the checking.
+- **Specifying the start position**: From the command line or a scenario, the app can be launched with a specified start position for the practice "mid-chart start" (the "Input Logs and Replays" section). It uses the same mechanism as the product's practice feature, and the development build adds only the way to specify it. It is used in combination with preset and skin reloading.
+- **External control**: Load, start, and screen-save operations are added to the local event endpoint. The event endpoint is by nature receive-only, so this is an exception for development builds only, and the connection token and loopback restrictions still apply.
+- **Measurement output**: On each judgment, the app can flash a square at a fixed position on the screen and emit a test sound (used by the test device below).
 
-### 開発用ビルドと本番ビルドの分離
+### Separating Development and Production Builds
 
-- 上の機能はすべて、Cargoのfeature（たとえば `dev-tools`）を有効にしたビルドにだけ入れる。実行時のフラグで隠すのではなく、本番ビルドにはコードそのものを含めない。
-- 本番ビルドは `dev-tools` を無効にして作る。`release` のプロファイルでもfeatureは有効にできてしまうので、配布用のCIではfeatureの構成を固定する。開発用のコマンドラインの引数（`--scenario` など）は、本番ビルドでは存在せず、渡されれば不明な引数として扱う。
-- CIで本番ビルドを作り、開発用の引数を受け付けないこと、イベントの口に開発用の操作がないことを確かめる。
-- 開発用ビルドで作ったリプレイやスコアは、開発用であることを記録し、IRには送れないようにする。
+- All of the features above go only into builds with a Cargo feature (for example `dev-tools`) enabled. Rather than hiding them behind a runtime flag, the production build does not contain the code itself.
+- The production build is made with `dev-tools` disabled. Features can be enabled even with the `release` profile, so the distribution CI pins the feature configuration. Development command-line arguments (`--scenario`, etc.) do not exist in the production build, and are treated as unknown arguments if passed.
+- CI builds the production build and verifies that it does not accept development arguments and that the event endpoint has no development operations.
+- Replays and scores made with a development build record that they come from a development build, and cannot be sent to IR.
 
-### 試験用の入力装置
+### Test Input Device
 
-手元のコントローラーでの確認に加えて、AIが操作できる試験用の入力装置を作る。装置の設計は別の文書にまとめ、ここでは役割だけを定める。
+In addition to checks with local controllers, a test input device that an AI can operate is built. The device's design is described in a separate document; here only its role is defined.
 
-- **入力の再現**：マイコン（Raspberry Pi Pico 2など）がUSBのHID機器（キーボード・ゲームパッド、1000Hz）としてPCにつながり、制御用のシリアルで事前に受け取った台本どおりに押す。押し・離しは1つずつ順番に報告として送り、報告を送る前に次の変化で状態を上書きしない（短い押しが消えないように）。「押した時刻」は、その報告をUSBの送信に渡した時点のマイコンのµsタイマーの値と定める。1000Hzは報告の間隔であり、µs単位で届くことの保証ではない。
-- **受信までの遅れの推定**：マイコンとPCの時計は原点も速さも違うので、押した時刻と受信時刻をそのまま比べることはできない。押し・離しには連番を付けて受信したイベントと対応付け、2つの時計の対応は制御用のシリアルの往復で繰り返し校正する。往復の校正では片道の遅れが分からないので、結果は誤差の幅付きの推定値として扱い、遅れの分布のばらつきと変化を見る用途に使う。
-- **遅れの実測**：画面に貼った光センサーで計測用の四角を、音声の出力の取り込みでテスト用の音を検出する。押してから光るまで、押してから鳴るまでを、マイコン1つの時計で測るので、時計どうしの校正は要らない。音声の取り込みには、バイアス、減衰、入力の保護の回路を入れ、検出のしきい値と、どのサンプルの時刻を検出時刻とするかを決めておく。
-- **本物のコントローラーを押す仕組み**（ソレノイドとモーター）は、上の2つで足りないと分かったときに検討する。
+- **Reproducing input**: A microcontroller (such as a Raspberry Pi Pico 2) connects to the PC as a USB HID device (keyboard or gamepad, 1000 Hz) and presses according to a scenario received in advance over a control serial link. Presses and releases are sent one at a time, in order, as reports, and the state is never overwritten by the next change before its report has been sent (so that short presses are not lost). The "press time" is defined as the value of the microcontroller's µs timer at the point that report is handed to USB transmission. 1000 Hz is the report interval, not a guarantee of delivery at µs precision.
+- **Estimating latency until receipt**: The microcontroller and PC clocks differ in both origin and rate, so the press time and the receive time cannot be compared directly. Presses and releases carry sequence numbers to match them with the received events, and the mapping between the two clocks is calibrated repeatedly with round trips over the control serial link. Round-trip calibration cannot determine the one-way latency, so the results are treated as estimates with error bounds, and used to observe the spread of the latency distribution and its changes.
+- **Measuring actual latency**: A light sensor attached to the screen detects the measurement square, and capturing the audio output detects the test sound. Press-to-light and press-to-sound are measured with the single clock of the microcontroller, so no calibration between clocks is needed. The audio capture includes bias, attenuation, and input protection circuits, and the detection threshold and which sample's time counts as the detection time are decided in advance.
+- **A mechanism that presses a real controller** (solenoids and motors) is considered only if the two above prove insufficient.
 
-この装置はPCからは普通のHID機器に見えるので、ゲーム側に専用の入力の経路は要らない。また、実際の専用コントローラーの癖（ポーリングの揺れ、スクラッチの検出方式）は再現しないので、手元のコントローラーでの確認を置き換えるものではない。
+To the PC, this device looks like an ordinary HID device, so the game needs no dedicated input path. Also, it does not reproduce the quirks of real dedicated controllers (polling jitter, the scratch detection method), so it does not replace checks with local controllers.
 
-### 人が確かめるもの
+### What Humans Verify
 
-手触り、手元の専用コントローラー、OBSとの同時実行、ウィンドウのフォーカスを失ったときの動作、機器の切断と再接続、音声デバイスを変えたあとの復帰は、リリースごとの確認項目表にまとめ、人が確かめる。
+Feel, local dedicated controllers, running alongside OBS, behavior when the window loses focus, device disconnection and reconnection, and recovery after changing the audio device are compiled into a per-release checklist and verified by humans.
 
-## 進め方
+## Roadmap
 
-| 段階 | 内容 | 終わりの条件 |
+| Stage | Contents | Exit criteria |
 | --- | --- | --- |
-| 0 | 短期間の技術検証（捨てる前提）：1万ノーツ以上の高速スクロール、100音以上の同時発音、1080pのBGA、全レーンの演出を同時に動かす。OBSでの配信を同時に行う場面も含める。終わったらすぐ段階1に移る | 基準のPCで60Hz、ミドルクラスのPCで240Hzの表示を、性能の章の予算内で保てる。OBSとの同時実行の条件と基準値を決め、その基準を満たせる（性能の章「OBSとの同時実行の確かめ方」）。保てなければ描画や音声の方式を作り込む前に見直す |
-| 1 | 1曲を遊べる最小構成：譜面の読み込み、入力、音声、簡素なプレイ画面、独自プリセット1つの評価器、入力ログの保存。キー設定、音量、オフセット、ハイスピード、即時リトライも含める。テストのための仕組み（時計と入出力の差し替え、スレッドなしで進められる処理）もここで入れる | 手持ちの譜面を1曲、遅れや引っかかりを感じずに最後まで遊べる。キー音とフレームの遅れを計測して表示できる |
-| 2 | 遊びの一周：選曲、リザルト、リトライ、練習（区間リピートと速度変更）、beatoraja風・LR2風のプリセットとリザルトでの切り替え、`eval-cli`、台本での起動などの開発用の機能。試験用の入力装置はこの段階か次の段階で作る | 選曲から演奏・リザルト・リトライまでを繰り返し遊べる。性質のテストが通る |
-| 3 | 見た目と演出：独自スキンの宣言的な形式、演出の作り込み、続いてLR2・beatorajaのスキンのアダプタ | 標準のスキンで遊んで楽しい。代表的な既存スキンでプレイ画面が表示できる |
-| 4 | 独自IR（サーバーでの計算、開始の登録、ありえない入力の検出、許可リスト） | 入力ログを送り、複数プリセットのランキングが見られる |
-| 5 | 譜面の登録簿（目録のみ）とインストーラー | 難易度表をまとめて入れられ、差分の依存を解決できる |
-| 6 | 既存IRへの接続 | 指定されたプリセットで計算したスコアを既存の形式で送れる |
+| 0 | A short technical spike (meant to be thrown away): run high-speed scrolling with 10,000+ notes, 100+ simultaneous voices, 1080p BGA, and effects on all lanes at the same time. Include a scene with simultaneous streaming through OBS. When done, move to stage 1 immediately | A 60 Hz display on the reference PC and a 240 Hz display on a mid-range PC can be held within the budget in the Performance section. The conditions and criteria for running alongside OBS are decided and can be met (Performance section, "How to verify running alongside OBS"). If they cannot be held, the rendering or audio approach is revisited before building it out |
+| 1 | The minimal setup for playing one song: chart loading, input, audio, a simple play screen, an evaluator with one custom preset, saving the input log. Also includes key config, volume, offset, hi-speed, and instant retry. The testing mechanisms (swappable clock and I/O, processing that can advance without threads) are also put in here | One chart on hand can be played to the end without feeling latency or stutter. Key sound and frame latency can be measured and displayed |
+| 2 | One full gameplay loop: song selection, results, retry, practice (section repeat and speed change), beatoraja-style and LR2-style presets with switching on the result screen, `eval-cli`, and development features such as scenario launch. The test input device is built in this stage or the next | Song selection through play, results, and retry can be played repeatedly. The property tests pass |
+| 3 | Look and effects: the declarative native skin format, polished effects, followed by the LR2 and beatoraja skin adapters | Playing with the standard skin is fun. The play screen can be displayed with representative existing skins |
+| 4 | Custom IR (server-side computation, start registration, impossible-input detection, allowlist) | Input logs can be sent, and rankings for multiple presets can be viewed |
+| 5 | Chart registry (catalog only) and installer | Difficulty tables can be installed in one go, and derivative chart dependencies can be resolved |
+| 6 | Connecting to existing IRs | Scores computed with the specified preset can be sent in the existing format |
 
-> **作る範囲の線引き**
+> **Drawing the line on scope**
 >
-> 段階3が終わるまで、IR、配布の登録簿、不正対策、サーバーには手を付けない。将来のIRなどに備えてそれまでに決めておくのは、後から足せるようにするための入力ログの形式と評価器の境界だけとする。この設計書の後段の章は、その時点で作るための設計であり、先に作る理由にはしない。
+> Until stage 3 is finished, IR, the distribution registry, anti-cheat, and servers are not touched. The only things decided before then in preparation for a future IR and the like are the input log format and the evaluator boundary, so that these can be added later. The later sections of this design document are designs for building at that point, not reasons to build earlier.
 
-段階1と2の間は、遊んで直す期間を長めに取る。IR（段階4以降）は、遊んで楽しい状態ができてから着手する。入力ログの形式は段階1から版番号を持たせ、物理入力・時刻・譜面の識別・プリセットの記録という中心部分だけは最初から入れる。そのほかの項目は、版を上げながら足していく。crateの分け方も、最初は少数にまとめ、境界がはっきりしてから分ける。
+Between stages 1 and 2, a generous period of playing and fixing is set aside. IR (stage 4 onward) is started once a state that is fun to play exists. The input log format carries a version number from stage 1, and only its core parts (physical input, time, chart identification, and the preset record) are included from the start. Other fields are added while bumping the version. Crates, too, start out consolidated into a few, and are split once the boundaries become clear.
 
-## 未決事項
+## Open Questions
 
-- IRのランキングで、プリセットや評価器が変わったときに、ランキングを新しく作るか計算し直して置き換えるか
-- リプレイを公開する場合に、入力ログをどこまで他人に見せるか
-- 独自スキンの式で、どこまでの表現（計算、条件、時間による変化）を扱うか
-- LR2スキンへの対応をどこまでの範囲にするか
-- 譜面の配布で、作者の配布条件をどう記録し、保管の同意をどう得るか（イベントの運営者や難易度表の管理者との相談が必要）
-- 許可リストに載せる基準と、削除の申し立ての手順（法的な判断を含む）
-- 作者から「評価用の保存」の許可を得る方法と、その記録の形（IRを始める前に決める）
-- 基準のPCの具体的な構成
+- In the IR rankings, when presets or the evaluator change, whether to create new rankings or recompute and replace them
+- When replays are published, how much of the input log to show to others
+- How much expressiveness (computation, conditions, changes over time) the native skin expressions should cover
+- How far LR2 skin support should go
+- In chart distribution, how to record authors' distribution terms and how to obtain consent for hosting (requires consultation with event organizers and difficulty table maintainers)
+- The criteria for inclusion in the allowlist, and the takedown request procedure (including legal judgment)
+- How to obtain authors' permission for "storage for evaluation", and the form of that record (to be decided before starting IR)
+- The concrete configuration of the reference PC
 
-## 付録：既存実装の教訓
+## Appendix: Lessons from Existing Implementations
 
-beatoraja（Java）とLunatic Vibes F（C++、LR2クローン）のソースから読み取った点のうち、この設計に反映したもの。
+Points read from the source code of beatoraja (Java) and Lunatic Vibes F (C++, an LR2 clone) that are reflected in this design.
 
-| 項目 | 既存実装 | この設計での扱い |
+| Item | Existing implementations | Treatment in this design |
 | --- | --- | --- |
-| 入力の記録 | beatorajaはキーごとに最新の状態だけを持つため、短い押し・離しの片方が失われうる | 全エッジを追記する |
-| 判定のタイミング | beatorajaは判定用スレッドがあるが、時刻が描画フレームでしか進まない。LVFは1ms刻みで、入力の処理より先にミスを確定することがある | 時刻順のイベント処理と水位 |
-| 時計 | LVFは `system_clock` をmsで扱う | QPCと整数µs |
-| 判定と他処理の結合 | 両者とも、判定の中でキー音・スキンのタイマー・設定・譜面の状態を直接書き換える | 判定イベント列だけを出す |
-| ルールの切り替え | beatorajaにはLR2用のルールのコードがあるが選ばれない。LVFはLR2のルールが固定 | データと選択肢によるプリセット |
-| リプレイ | 両者とも判定ランクや版を保存しない。beatorajaは再生結果がフレームに依存して揺れる | 評価に必要な入力をすべて記録する |
-| ゲージ | 両者とも全ゲージを並べて計算するが、浮動小数点。beatorajaは推移を0.5秒ごとに記録 | 固定小数点、判定イベントごとに記録 |
-| オフセット | 両者とも表示のオフセットだけで、自動調整はプレイ中に設定を書き換える | 3つのオフセット。推奨値の提案と、記録・検証できるプレイ中の調整 |
-| スキン | beatorajaは968個のID定数、LVFはグローバル配列をLR2のIDとして直接使う | 状態の写しと、アダプタ内での変換 |
-| テスト | beatorajaはなし、LVFは判定のテストが1件 | 性質のテストと手書きの例 |
+| Input recording | beatoraja keeps only the latest state per key, so one half of a short press and release can be lost | Append every edge |
+| Judgment timing | beatoraja has a judgment thread, but its time advances only with render frames. LVF uses 1 ms steps, and can finalize a miss before processing input | Time-ordered event processing and the watermark |
+| Clock | LVF handles `system_clock` in ms | QPC and integer µs |
+| Coupling of judgment and other processing | Both directly modify key sounds, skin timers, settings, and chart state inside judgment | Emit only the judgment event stream |
+| Rule switching | beatoraja has rule code for LR2, but it is never selected. LVF has the LR2 rules fixed | Presets made of data and choices |
+| Replays | Neither saves the judgment rank or the version. beatoraja's playback results fluctuate depending on frames | Record every input needed for evaluation |
+| Gauge | Both compute all gauges side by side, but in floating point. beatoraja records the history every 0.5 seconds | Fixed point, recorded per judgment event |
+| Offsets | Both have only a display offset, and their automatic adjustment rewrites the settings during play | Three offsets. Suggestion of a recommended value, and in-play adjustment that is recorded and verifiable |
+| Skins | beatoraja uses 968 ID constants, and LVF uses global arrays directly as LR2 IDs | The state snapshot, and conversion inside adapters |
+| Tests | beatoraja has none, and LVF has one judgment test | Property tests and hand-written examples |
