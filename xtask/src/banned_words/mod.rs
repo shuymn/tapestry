@@ -5,8 +5,9 @@
 //!   `HEAD`; `--all` (CI) checks every index entry. Both read paths, contents,
 //!   and the list itself from the index, never from the working copy.
 //!   `--list <path>` reads the list from a file instead (tests).
-//! - Contents with a NUL byte in the first 8 KiB are binary and skipped (the
-//!   path is still checked). Contents that are not UTF-8 are decoded as
+//! - Contents with a UTF-8 or UTF-16 BOM are decoded by it. Otherwise,
+//!   contents with a NUL byte in the first 8 KiB are binary and skipped (the
+//!   path is still checked), and contents that are not UTF-8 are decoded as
 //!   Shift_JIS.
 //! - Diagnostics never print a term, and replace the matched part of a path
 //!   with `<banned term #N>`. Columns count characters of the NFKC line.
@@ -178,12 +179,15 @@ fn check_file(terms: &[Term], list_name: &str, path: &str, contents: Option<&[u8
     let Some(bytes) = contents else {
         return diagnostics;
     };
-    if is_content_exempt(path) || bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0) {
+    if is_content_exempt(path) {
         return diagnostics;
     }
+    let Some(text) = decode(bytes) else {
+        return diagnostics;
+    };
     // The whole text at once, so a line ending between the words of a term
     // (wrapped prose) is a separator like any other.
-    let text = nfkc(&decode(bytes));
+    let text = nfkc(&text);
     for hit in matcher::find(terms, &text) {
         let before = &text[..hit.start];
         let line_start = before.rfind('\n').map_or(0, |i| i + 1);
@@ -194,12 +198,20 @@ fn check_file(terms: &[Term], list_name: &str, path: &str, contents: Option<&[u8
     diagnostics
 }
 
-/// UTF-8 if valid, otherwise Shift_JIS (lossy).
-fn decode(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
-    match std::str::from_utf8(bytes) {
+/// Text of a file: by its BOM (UTF-8, UTF-16LE, UTF-16BE) if it has one;
+/// otherwise `None` if binary (a NUL in the first 8 KiB), UTF-8 if valid, and
+/// Shift_JIS (lossy) if not.
+fn decode(bytes: &[u8]) -> Option<std::borrow::Cow<'_, str>> {
+    if let Some((encoding, bom)) = encoding_rs::Encoding::for_bom(bytes) {
+        return Some(encoding.decode_without_bom_handling(&bytes[bom..]).0);
+    }
+    if bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0) {
+        return None;
+    }
+    Some(match std::str::from_utf8(bytes) {
         Ok(s) => s.into(),
         Err(_) => encoding_rs::SHIFT_JIS.decode_without_bom_handling(bytes).0,
-    }
+    })
 }
 
 /// `text` with each matched range (overlaps merged) replaced by
@@ -327,6 +339,31 @@ mod tests {
         assert_eq!(
             check("a.md", Some(b"zorb\r\nlax\r\n")),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn decodes_by_bom() {
+        let mut utf16le = vec![0xFF, 0xFE];
+        utf16le.extend(
+            "x\r\nsee Zorblax\r\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        let mut utf16be = vec![0xFE, 0xFF];
+        utf16be.extend("see Zorblax\n".encode_utf16().flat_map(u16::to_be_bytes));
+        let utf8 = b"\xEF\xBB\xBFZorblax\n";
+        assert_eq!(
+            check("out.txt", Some(&utf16le)),
+            ["out.txt:2:5: banned term #1 (banned-words.txt:2)"]
+        );
+        assert_eq!(
+            check("out.txt", Some(&utf16be)),
+            ["out.txt:1:5: banned term #1 (banned-words.txt:2)"]
+        );
+        assert_eq!(
+            check("out.txt", Some(utf8)),
+            ["out.txt:1:1: banned term #1 (banned-words.txt:2)"]
         );
     }
 
