@@ -2,13 +2,15 @@
 //!
 //! Every allocation is attributed to the calling thread's tag and, while the
 //! thread is inside a named library scope (`scope`), to that scope. Counting
-//! starts when `arm` is called after the countdown. The allocator itself
-//! never allocates: tags and scopes are const-initialized thread-locals and
-//! the counters are atomics.
+//! covers an absolute QPC interval (`arm_interval`): the play window, fixed
+//! once for every thread before any of them leaves the play barrier, so it
+//! does not depend on when a thread next runs. The allocator itself never
+//! allocates: tags and scopes are const-initialized thread-locals, the
+//! counters are atomics and the clock is QueryPerformanceCounter.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use spike_core::run::{LIBRARY_SCOPES, ThreadTag};
 
@@ -49,7 +51,9 @@ thread_local! {
     static SCOPE: Cell<u8> = const { Cell::new(0) };
 }
 
-static ARMED: AtomicBool = AtomicBool::new(false);
+/// Counting interval `[ARM_FROM, ARM_TO)` in QPC ticks; empty when equal.
+static ARM_FROM: AtomicI64 = AtomicI64::new(0);
+static ARM_TO: AtomicI64 = AtomicI64::new(0);
 #[allow(clippy::declare_interior_mutable_const)]
 const NO: AtomicBool = AtomicBool::new(false);
 /// G6 tags with a thread that took part in the run.
@@ -63,7 +67,15 @@ static COUNTS: [[AtomicU64; SCOPES]; TAGS] = [ROW; TAGS];
 pub struct Counting;
 
 fn record() {
-    if !ARMED.load(Ordering::Relaxed) {
+    let (from, to) = (
+        ARM_FROM.load(Ordering::Relaxed),
+        ARM_TO.load(Ordering::Relaxed),
+    );
+    if from >= to {
+        return;
+    }
+    let now = crate::timebase::qpc();
+    if now < from || now >= to {
         return;
     }
     let tag = TAG.try_with(Cell::get).unwrap_or(0) as usize;
@@ -106,12 +118,25 @@ pub fn tag_thread(tag: Tag) {
 
 /// Starts counting at play start; `disarm` at play end. The interval is
 /// shared by every thread.
-pub fn arm() {
-    ARMED.store(true, Ordering::Relaxed);
+/// Serializes tests that set the counting interval.
+#[cfg(test)]
+pub static ARM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Counts allocations from QPC `from` until `to` on every thread.
+pub fn arm_interval(from: i64, to: i64) {
+    ARM_TO.store(i64::MIN, Ordering::Relaxed);
+    ARM_FROM.store(from, Ordering::Relaxed);
+    ARM_TO.store(to, Ordering::Relaxed);
 }
 
+/// Counts from now on (offscreen run).
+pub fn arm() {
+    arm_interval(crate::timebase::qpc(), i64::MAX);
+}
+
+/// Ends counting now (a run that stops early).
 pub fn disarm() {
-    ARMED.store(false, Ordering::Relaxed);
+    ARM_TO.store(i64::MIN, Ordering::Relaxed);
 }
 
 /// Runs `f` with allocations attributed to library scope `scope`.
@@ -156,4 +181,43 @@ pub fn snapshot() -> (
 /// App-code allocations on threads outside G6 (main, decode, recorder).
 pub fn other_app() -> u64 {
     COUNTS[Tag::Other as usize][0].load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timebase::{qpc, qpc_freq};
+
+    // G6: counting follows the absolute interval, whatever thread runs
+    // when; no thread has to arm it.
+    #[test]
+    fn allocations_count_only_inside_the_armed_interval() {
+        let _arming = ARM_TEST_LOCK.lock();
+        let ms = qpc_freq() / 1_000;
+        let from = qpc() + 40 * ms;
+        arm_interval(from, from + 80 * ms);
+        let count = || COUNTS[Tag::Logic as usize][0].load(Ordering::Relaxed);
+        let n = std::thread::spawn(move || {
+            tag_thread(Tag::Logic);
+            let before = count();
+            drop(std::hint::black_box(vec![1u8; 8]));
+            let outside_before = count() - before;
+            while qpc() < from + 20 * ms {
+                std::thread::yield_now();
+            }
+            let at = count();
+            drop(std::hint::black_box(vec![1u8; 8]));
+            let inside = count() - at;
+            while qpc() < from + 100 * ms {
+                std::thread::yield_now();
+            }
+            let at = count();
+            drop(std::hint::black_box(vec![1u8; 8]));
+            (outside_before, inside, count() - at)
+        })
+        .join()
+        .unwrap();
+        disarm();
+        assert_eq!(n, (0, 1, 0));
+    }
 }

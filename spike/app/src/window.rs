@@ -356,8 +356,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let interval = bga.interval_us();
     // First BGA frame uploaded before the countdown (design D2).
     bga.step(&mut renderer, 0, true)?;
-    let play_start = session.ready();
-    let mut armed = false;
+    // Allocation counting is armed for every thread over the play window
+    // when the barrier releases (threads::PlaySync).
+    let play_start = session.ready()?;
     while !shared.stop.load(Ordering::Relaxed) {
         let mut wake = Wake::Late;
         if let Some(h) = waitable {
@@ -397,15 +398,6 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         let play_us = now_us - play_start;
         if play_us >= play_len + POST_PLAY_US {
             break;
-        }
-        let in_play = (0..play_len).contains(&play_us);
-        if in_play != armed {
-            if in_play {
-                alloc::arm();
-            } else {
-                alloc::disarm();
-            }
-            armed = in_play;
         }
         while let Ok(h) = session.hits.pop() {
             scene.hit(h.t_us, h.lane);

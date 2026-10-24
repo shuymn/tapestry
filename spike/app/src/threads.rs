@@ -20,7 +20,7 @@ use rtrb::{Consumer, Producer};
 use spike_core::play::{Judge, Press};
 use spike_core::run::{InputLatency, StreamCount};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::{
@@ -43,38 +43,83 @@ pub const HIT_RING: usize = 4_096;
 const TICK_US: i64 = 1_000;
 
 /// The play barrier: every G6 thread registers its tag, finishes its setup
-/// (including every allocation it needs in play) and waits here; the play
-/// start is fixed when the last one arrives, a countdown later. Allocation
-/// counting is armed only over the play window, so no thread can still be
-/// in setup when it starts (G6).
+/// (including every allocation it needs in play) and waits here. When the
+/// last one arrives, the play window (a countdown later, `play_us` long) is
+/// fixed and allocation counting is armed over exactly that QPC interval
+/// before any thread is released (G6). A thread whose setup fails aborts
+/// the barrier instead: every waiting thread is released with the error,
+/// so the run can stop and join them.
 pub struct PlaySync {
-    barrier: Barrier,
-    start: OnceLock<i64>,
+    state: Mutex<SyncState>,
+    cv: Condvar,
+    members: usize,
     clock: Clock,
     countdown_us: i64,
+    play_us: i64,
+}
+
+#[derive(Default)]
+struct SyncState {
+    arrived: usize,
+    start: Option<i64>,
+    aborted: Option<String>,
 }
 
 impl PlaySync {
-    pub fn new(threads: usize, clock: Clock, countdown_us: i64) -> Self {
+    pub fn new(members: usize, clock: Clock, countdown_us: i64, play_us: i64) -> Self {
         Self {
-            barrier: Barrier::new(threads),
-            start: OnceLock::new(),
+            state: Mutex::new(SyncState::default()),
+            cv: Condvar::new(),
+            members,
             clock,
             countdown_us,
+            play_us,
         }
     }
 
-    /// The play start, once every thread has arrived.
-    pub fn start(&self) -> Option<i64> {
-        self.start.get().copied()
+    fn lock(&self) -> std::sync::MutexGuard<'_, SyncState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Waits for every thread, then returns the play start (run µs).
-    pub fn ready(&self) -> i64 {
-        self.barrier.wait();
-        *self
-            .start
-            .get_or_init(|| self.clock.now_us() + self.countdown_us)
+    /// The play start, once every thread has arrived.
+    #[cfg(test)]
+    pub fn start(&self) -> Option<i64> {
+        self.lock().start
+    }
+
+    /// Waits for every thread; returns the play start (run µs), or the
+    /// error of the thread that aborted.
+    pub fn ready(&self) -> Result<i64, String> {
+        let mut s = self.lock();
+        if let Some(e) = &s.aborted {
+            return Err(e.clone());
+        }
+        s.arrived += 1;
+        if s.arrived == self.members {
+            let freq = qpc_freq();
+            let from = qpc() + self.countdown_us * freq / 1_000_000;
+            alloc::arm_interval(from, from + self.play_us * freq / 1_000_000);
+            s.start = Some(self.clock.to_us(from));
+            self.cv.notify_all();
+        }
+        while s.start.is_none() && s.aborted.is_none() {
+            s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        match (s.start, &s.aborted) {
+            (Some(t), _) => Ok(t),
+            (None, Some(e)) => Err(e.clone()),
+            (None, None) => unreachable!("woken without a start or an abort"),
+        }
+    }
+
+    /// Releases every waiting thread with `why`; no effect once play start
+    /// is fixed.
+    pub fn abort(&self, why: String) {
+        let mut s = self.lock();
+        if s.start.is_none() && s.aborted.is_none() {
+            s.aborted = Some(why);
+            self.cv.notify_all();
+        }
     }
 }
 
@@ -144,7 +189,8 @@ impl Drop for Event {
 }
 
 /// MMCSS registration of the calling thread for `task` ("Games", "Pro
-/// Audio"); reverted on drop. `None` if the service refused.
+/// Audio"); reverted on drop. `None` if the service refused (recorded per
+/// thread in the summary).
 pub struct Mmcss(HANDLE);
 
 impl Mmcss {
@@ -173,6 +219,8 @@ pub trait Ticker {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InputStats {
+    /// MMCSS "Games" registration succeeded.
+    pub mmcss: bool,
     pub emitted: u64,
     pub overflows: u64,
     pub ticks: u64,
@@ -220,6 +268,23 @@ pub struct LogicOut {
     pub judged: u32,
     pub sound_overflows: u64,
     pub hit_overflows: u64,
+    /// Longest time from dequeue to judgment completion (inside G4).
+    pub judge_us_max: i64,
+}
+
+impl LogicOut {
+    /// The latency log for `records` presses (allocated before the play
+    /// barrier).
+    pub fn new(records: usize) -> Self {
+        Self {
+            input: Vec::with_capacity(records),
+            input_records: StreamCount::default(),
+            judged: 0,
+            sound_overflows: 0,
+            hit_overflows: 0,
+            judge_us_max: 0,
+        }
+    }
 }
 
 /// Where the logic thread sends its results.
@@ -230,8 +295,10 @@ pub struct LogicSinks {
 }
 
 /// Judges presses as they arrive until the input thread is done and the
-/// queue is empty. `records` is the capacity of the latency log (one per
-/// note).
+/// queue is empty, logging into `out`. G4 runs from the input tick to the
+/// completion of the judgment (`now` after `judge`), which also stamps the
+/// sound command.
+#[allow(clippy::too_many_arguments)]
 pub fn logic_loop(
     mut judge: Judge,
     rx: &mut Consumer<PressMsg>,
@@ -239,33 +306,31 @@ pub fn logic_loop(
     input_done: &AtomicBool,
     sinks: &mut LogicSinks,
     clock: Clock,
-    records: usize,
+    mut out: LogicOut,
+    now: &mut dyn FnMut() -> i64,
 ) -> LogicOut {
-    let mut out = LogicOut {
-        input: Vec::with_capacity(records),
-        input_records: StreamCount::default(),
-        judged: 0,
-        sound_overflows: 0,
-        hit_overflows: 0,
-    };
     let freq = qpc_freq();
+    let us = |q: i64| (q as i128 * 1_000_000 / i128::from(freq)) as i64;
     loop {
         // Read the flag before draining: a press pushed before it was set
         // is then still drained below.
         let done = input_done.load(Ordering::Acquire);
         while let Ok(m) = rx.pop() {
-            let t = qpc();
+            let dequeued = now();
+            let judgment = judge.judge(m.press);
+            let t = now();
+            out.judge_us_max = out.judge_us_max.max(us(t - dequeued));
             out.input_records.produced += 1;
             let rec = InputLatency {
                 t_us: clock.to_us(m.t_qpc),
-                latency_us: ((t - m.t_qpc) as i128 * 1_000_000 / i128::from(freq)) as i64,
+                latency_us: us(t - m.t_qpc),
             };
             if out.input.len() < out.input.capacity() {
                 out.input.push(rec);
             } else {
                 out.input_records.lost += 1;
             }
-            if let Some(j) = judge.judge(m.press) {
+            if let Some(j) = judgment {
                 if let Some(h) = &mut sinks.hits
                     && h.push(HitMsg {
                         t_us: m.press.t_us,
@@ -419,11 +484,18 @@ pub fn spawn_input(
         .spawn(move || {
             alloc::tag_thread(Tag::Input);
             let r = (|| {
-                let _mmcss = Mmcss::join(&windows::core::HSTRING::from("Games"));
-                let raw = RawInput::new()?;
-                let timer = HiResTimer::new()?;
+                let mmcss = Mmcss::join(&windows::core::HSTRING::from("Games"));
+                let setup = RawInput::new().and_then(|raw| Ok((raw, HiResTimer::new()?)));
+                let (raw, timer) = match setup {
+                    Ok(x) => x,
+                    Err(e) => {
+                        // Release the threads waiting to start.
+                        sync.abort(format!("input: {e}"));
+                        return Err(e);
+                    }
+                };
                 let period_qpc = qpc_freq() * TICK_US / 1_000_000;
-                let play_start = sync.ready();
+                let play_start = sync.ready()?;
                 let mut ticker = TimerTicker {
                     timer,
                     clock,
@@ -438,6 +510,7 @@ pub fn spawn_input(
                     raw_events += raw.pump();
                 });
                 s.raw_input_events = raw_events;
+                s.mmcss = mmcss.is_some();
                 Ok(s)
             })();
             done.store(true, Ordering::Release);
@@ -465,7 +538,10 @@ pub fn spawn_logic(
         .name("logic".into())
         .spawn(move || {
             alloc::tag_thread(Tag::Logic);
-            sync.ready();
+            let out = LogicOut::new(records);
+            if sync.ready().is_err() {
+                return out;
+            }
             logic_loop(
                 judge,
                 &mut rx,
@@ -473,7 +549,8 @@ pub fn spawn_logic(
                 &input_done,
                 &mut sinks,
                 clock,
-                records,
+                out,
+                &mut qpc,
             )
         })
         .map_err(|e| format!("spawn logic thread: {e}"))
@@ -527,7 +604,16 @@ mod tests {
                     sounds: None,
                     snapshot: snap_in,
                 };
-                logic_loop(judge, &mut rx, &wake, &done, &mut sinks, clock, notes)
+                logic_loop(
+                    judge,
+                    &mut rx,
+                    &wake,
+                    &done,
+                    &mut sinks,
+                    clock,
+                    LogicOut::new(notes),
+                    &mut qpc,
+                )
             })
         };
         let mut ticker = FastTicker {
@@ -548,6 +634,85 @@ mod tests {
         assert_eq!(hits_rx.slots(), notes);
         assert_eq!(snap_out.read().judged, expected);
         assert!(hits_rx.pop().is_ok());
+    }
+
+    // G4 ends when the judgment is complete, not when the press is
+    // dequeued: the second clock reading (after `judge`) is the one used.
+    #[test]
+    fn g4_and_the_sound_stamp_end_at_judgment_completion() {
+        let chart = Chart::generate(DEFAULT_SEED);
+        let (presses, judge) = Play::new(&chart, 1_000_000).split();
+        let (mut tx, mut rx) = RingBuffer::<PressMsg>::new(4);
+        let (sound_tx, mut sound_rx) = RingBuffer::<SoundCmd>::new(4);
+        let (snap_in, _snap_out) = triple_buffer::triple_buffer(&Snapshot::default());
+        tx.push(PressMsg {
+            press: presses[0],
+            t_qpc: 0,
+        })
+        .unwrap();
+        let wake = Event::new().unwrap();
+        let done = AtomicBool::new(true);
+        let mut sinks = LogicSinks {
+            hits: None,
+            sounds: Some(sound_tx),
+            snapshot: snap_in,
+        };
+        // Dequeued at 1 ms, judged at 3 ms (QPC units).
+        let freq = qpc_freq();
+        let mut stamps = [freq / 1_000, 3 * freq / 1_000].into_iter();
+        let out = logic_loop(
+            judge,
+            &mut rx,
+            &wake,
+            &done,
+            &mut sinks,
+            Clock::start(),
+            LogicOut::new(4),
+            &mut || stamps.next().unwrap(),
+        );
+        assert_eq!(out.input[0].latency_us, 3_000);
+        assert_eq!(out.judge_us_max, 2_000);
+        assert_eq!(sound_rx.pop().unwrap().judged_qpc, 3 * freq / 1_000);
+    }
+
+    // An aborted barrier releases every waiting thread with the error.
+    #[test]
+    fn a_failed_setup_releases_the_threads_waiting_to_start() {
+        let sync = Arc::new(PlaySync::new(3, Clock::start(), 1_000_000, 1_000_000));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let (sync, tx) = (sync.clone(), tx.clone());
+                std::thread::spawn(move || tx.send(sync.ready()).unwrap())
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        sync.abort("input: no timer".into());
+        for _ in 0..2 {
+            let r = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a waiting thread was not released");
+            assert_eq!(r, Err("input: no timer".into()));
+        }
+        for w in waiters {
+            w.join().unwrap();
+        }
+        // A thread arriving later fails at once; the start never comes.
+        assert_eq!(sync.ready(), Err("input: no timer".into()));
+        assert_eq!(sync.start(), None);
+    }
+
+    #[test]
+    fn the_last_arrival_fixes_play_start_for_everyone() {
+        let _arming = crate::alloc::ARM_TEST_LOCK.lock();
+        let sync = Arc::new(PlaySync::new(2, Clock::start(), 0, 0));
+        let other = {
+            let sync = sync.clone();
+            std::thread::spawn(move || sync.ready())
+        };
+        let mine = sync.ready().unwrap();
+        assert_eq!(other.join().unwrap(), Ok(mine));
+        assert_eq!(sync.start(), Some(mine));
     }
 
     #[test]

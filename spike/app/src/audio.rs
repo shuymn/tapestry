@@ -27,11 +27,11 @@ use crate::threads::{Mmcss, PlaySync, SoundCmd};
 use crate::timebase::{Clock, HiResTimer, qpc, qpc_freq};
 use rtrb::Consumer;
 use serde::Serialize;
-use spike_core::engine::{Engine, Injection};
-use spike_core::mixer::SampleClock;
-use spike_core::pilot::{self, Detector, OnsetFinder, PacketFlags};
-use spike_core::run::{AudioFacts, AudioPeriod, Episode, StreamCount};
+use spike_core::engine::{Engine, Injection, MixClock};
+use spike_core::loopback::{CaptureEval, CaptureFlags};
+use spike_core::run::{AudioFacts, AudioPeriod, StreamCount};
 use spike_core::sounds::key_bank;
+use spike_core::stats::percentile_i64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread::JoinHandle;
@@ -67,8 +67,6 @@ const LOOPBACK_POLL_US: i64 = 2_000;
 /// The render stream starts silent and its pilot steps in after this
 /// (before calibration, `CAL_SETTLE_US`).
 const PILOT_START_MS: u64 = 250;
-/// Capture this close to the render stream's stop is not evaluated.
-const STOP_MARGIN_US: i64 = 10_000;
 /// Loopback buffer.
 const LOOPBACK_BUFFER_HNS: i64 = 2_000_000;
 /// Starvation tests (`--starve-ms`) start at this play time and repeat.
@@ -93,6 +91,10 @@ pub struct AudioArgs {
     /// `(every_s, gap_ms)`.
     pub inject: Option<(u32, u32)>,
     pub starve_ms: Option<u32>,
+    /// Audio kept queued on the device, in periods (`--audio-queue N`):
+    /// each event tops the queue up to this, so a sound starts at most
+    /// this much after the frame being mixed.
+    pub queue_periods: u32,
 }
 
 struct Com;
@@ -346,6 +348,14 @@ pub struct Starve {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct RenderSide {
     pub backend: String,
+    /// MMCSS "Pro Audio" registration succeeded.
+    pub mmcss: bool,
+    pub queue_periods: u32,
+    /// Each event's lateness against the least-late event of the mix
+    /// clock's window (`engine::MixClock`), µs: what the clock leaves out.
+    pub wake_lateness_us_p50: Option<i64>,
+    pub wake_lateness_us_p99: Option<i64>,
+    pub wake_lateness_us_max: Option<i64>,
     pub periods: Option<EnginePeriods>,
     pub period_frames: u32,
     pub period_us: u32,
@@ -394,7 +404,16 @@ pub struct LoopbackSide {
     pub packets: u64,
     pub silent_packets: u64,
     pub discontinuity_packets: u64,
+    /// Packets with an uncertain timestamp, left out of the time map.
     pub timestamp_errors: u64,
+    /// Largest residual of the capture-position → time map (µs), and the
+    /// timestamps it used.
+    pub map_error_us: Option<i64>,
+    pub anchors_used: usize,
+    /// Capture position of the stop cut, and whether capture beyond it had
+    /// already been evaluated.
+    pub cut_position: Option<u64>,
+    pub cut_late: bool,
     pub error: Option<String>,
 }
 
@@ -451,11 +470,10 @@ pub fn spawn(
                     .stopped_us
                     .fetch_min(clock.now_us(), Ordering::AcqRel);
                 shared.render_done.store(true, Ordering::Release);
-                if r.is_err() {
-                    // Still release the other threads waiting to start.
-                    if sync.start().is_none() {
-                        sync.ready();
-                    }
+                if let Err(e) = &r {
+                    // Release the threads waiting to start (no effect once
+                    // play has started).
+                    sync.abort(format!("audio: {e}"));
                 }
                 r
             })
@@ -491,7 +509,7 @@ fn render_thread(
     shared: &AudioShared,
 ) -> Result<RenderOut, String> {
     let _com = Com::init()?;
-    let _mmcss = Mmcss::join(&windows::core::HSTRING::from("Pro Audio"));
+    let mmcss = Mmcss::join(&windows::core::HSTRING::from("Pro Audio"));
     let device = open_endpoint(args.device.as_deref())?;
     println!("audio: render endpoint {}", friendly_name(&device));
     let (endpoint_volume_db, endpoint_muted) = endpoint_volume(&device);
@@ -578,7 +596,11 @@ fn render_thread(
         let buffer = hr("GetBufferSize", client.GetBufferSize())?;
         (render, buffer)
     };
-    let mut engine = Engine::new(rate, period as usize, key_bank(SOUND_SEED, rate), None);
+    let mut engine = Engine::new(rate, key_bank(SOUND_SEED, rate), None);
+    let mut mix_clock = MixClock::new(rate);
+    // Queued audio: whole periods, at most what the buffer holds.
+    let queue_periods = args.queue_periods.clamp(1, (buffer_frames / period).max(1));
+    let queue_frames = queue_periods * period;
     let pilot_start_frame = u64::from(rate) * PILOT_START_MS / 1000;
     engine.set_pilot_start(pilot_start_frame);
     let period_us = (u64::from(period) * 1_000_000 / u64::from(rate)) as i64;
@@ -587,6 +609,7 @@ fn render_thread(
         Vec::with_capacity((total_us / period_us.max(1)) as usize * 2 + 1_000);
     let mut period_log: Vec<AudioPeriod> =
         Vec::with_capacity((total_us / period_us.max(1)) as usize * 2 + 1_000);
+    let mut lateness: Vec<i64> = Vec::with_capacity(period_log.capacity());
     let mut period_records = StreamCount::default();
     let mut judge_to_mix: Vec<i64> = Vec::with_capacity(notes + 16);
     let mut diag = Diagnostics {
@@ -614,14 +637,16 @@ fn render_thread(
     let mut starves: Vec<Starve> = Vec::with_capacity(starve_count);
     let freq = qpc_freq();
 
-    let play_start = sync.ready();
-    // Pilot-only prefill, then start.
-    // SAFETY: writes at most the buffer size into the buffer just obtained.
+    let play_start = sync.ready()?;
+    // Prefill the queue (whole periods, silent before the pilot step),
+    // then start.
+    // SAFETY: writes `queue_frames` (at most the buffer) into the buffer
+    // just obtained.
     unsafe {
-        let p = hr("GetBuffer", render.GetBuffer(buffer_frames))?;
-        let out = std::slice::from_raw_parts_mut(p as *mut f32, buffer_frames as usize * channels);
-        engine.render(out, channels, buffer_frames as usize);
-        hr("ReleaseBuffer", render.ReleaseBuffer(buffer_frames, 0))?;
+        let p = hr("GetBuffer", render.GetBuffer(queue_frames))?;
+        let out = std::slice::from_raw_parts_mut(p as *mut f32, queue_frames as usize * channels);
+        engine.render(out, channels, queue_frames as usize);
+        hr("ReleaseBuffer", render.ReleaseBuffer(queue_frames, 0))?;
         hr("Start", client.Start())?;
     }
     shared
@@ -665,27 +690,27 @@ fn render_thread(
                 st.padding_zero_wakes += 1;
             }
         }
-        // The engine mix clock: the event fires after the audio engine
-        // took a period from the buffer, so the first frame still queued
-        // (written minus padding) is mixed at its next pass, a period after
-        // this wake. Engine passes are what the loopback packets are stamped
-        // with; IAudioClock positions were not used because many drivers
-        // advance them a period at a time against a current QPC.
-        if mix_anchors.len() < mix_anchors.capacity() {
-            mix_anchors.push((
-                engine.device_frames() - u64::from(padding),
-                clock.to_us(wake_q) + period_us,
-            ));
+        // The engine mix clock: the event fires when the audio engine has
+        // taken a period from the buffer, so the first frame still queued
+        // (written minus padding) is read at the next pass, a period after
+        // that pass. The wake itself may come late; `MixClock` keeps the
+        // least-late wake of its window, so lateness does not enter the
+        // clock (engine::MixClock). IAudioClock positions were not used:
+        // on the RME they advanced a period at a time against a current
+        // QPC.
+        let queued_from = engine.device_frames() - u64::from(padding);
+        mix_clock.observe(queued_from, clock.to_us(wake_q) + period_us);
+        if lateness.len() < lateness.capacity() {
+            lateness.push(mix_clock.latest_error_us());
         }
-        let c = SampleClock {
-            anchor_us: clock.to_us(wake_q) + period_us,
-            anchor_sample: engine.device_frames() - u64::from(padding),
-            rate_hz: rate,
-        };
+        if mix_anchors.len() < mix_anchors.capacity() {
+            mix_anchors.push((queued_from, clock.to_us(wake_q) + period_us));
+        }
+        let mixed_at = |f: u64| mix_clock.at(f).unwrap_or(0);
         if let (None, Some((every_s, gap_ms))) = (injection, args.inject) {
             let every = u64::from(every_s) * u64::from(rate);
             injection = Some(Injection {
-                first: c.sample_at(play_start) + every,
+                first: mix_clock.frame_at(play_start).unwrap_or(0) + every,
                 every,
                 len: u64::from(gap_ms) * u64::from(rate) / 1000,
                 count: gaps as u64,
@@ -719,19 +744,17 @@ fn render_thread(
         while let Ok(cmd) = sounds.pop() {
             sound_commands += 1;
             let judged_us = clock.to_us(cmd.judged_qpc);
-            let want = c.sample_at(judged_us) + schedule_delay;
+            let want = mix_clock.frame_at(judged_us).unwrap_or(0) + schedule_delay;
             let at = engine.trigger_at_device(cmd.sound, want);
             if at > want {
                 diag.sounds_at_earliest += 1;
             }
-            let at_us = c.anchor_us
-                + ((at as i128 - i128::from(c.anchor_sample)) * 1_000_000 / i128::from(rate))
-                    as i64;
+            let at_us = mixed_at(at);
             if judge_to_mix.len() < judge_to_mix.capacity() {
                 judge_to_mix.push(at_us - judged_us);
             }
         }
-        let frames = (buffer_frames - padding) / period * period;
+        let frames = queue_frames.saturating_sub(padding) / period * period;
         if frames == 0 {
             continue;
         }
@@ -740,9 +763,7 @@ fn render_thread(
             let end = engine.device_frames() + u64::from(frames);
             while next_gap < inj.count && inj.start(next_gap) < end {
                 let f = inj.start(next_gap);
-                let t = c.anchor_us
-                    + ((f as i128 - i128::from(c.anchor_sample)) * 1_000_000 / i128::from(rate))
-                        as i64;
+                let t = mixed_at(f);
                 if injected_us.len() < injected_us.capacity() {
                     injected_us.push(t - play_start);
                     injected_frames.push(f);
@@ -787,6 +808,11 @@ fn render_thread(
     Ok(RenderOut {
         side: RenderSide {
             backend,
+            mmcss: mmcss.is_some(),
+            queue_periods,
+            wake_lateness_us_p50: percentile_i64(&lateness, 50),
+            wake_lateness_us_p99: percentile_i64(&lateness, 99),
+            wake_lateness_us_max: lateness.iter().max().copied(),
             periods: engine_periods,
             period_frames: period,
             period_us: period_us as u32,
@@ -812,51 +838,6 @@ fn render_thread(
         judge_to_mix_us: judge_to_mix,
         anchors: mix_anchors,
     })
-}
-
-/// Least-squares line through `(position, µs)` anchors.
-#[derive(Clone, Copy, Debug)]
-struct LinearMap {
-    mean_pos: f64,
-    mean_us: f64,
-    us_per_frame: f64,
-}
-
-impl LinearMap {
-    fn fit(anchors: &[(u64, i64)]) -> Option<Self> {
-        if anchors.len() < 2 {
-            return None;
-        }
-        let n = anchors.len() as f64;
-        let mean_pos = anchors.iter().map(|a| a.0 as f64).sum::<f64>() / n;
-        let mean_us = anchors.iter().map(|a| a.1 as f64).sum::<f64>() / n;
-        let (mut sxx, mut sxy) = (0.0, 0.0);
-        for &(p, t) in anchors {
-            let dx = p as f64 - mean_pos;
-            sxx += dx * dx;
-            sxy += dx * (t as f64 - mean_us);
-        }
-        (sxx > 0.0).then(|| Self {
-            mean_pos,
-            mean_us,
-            us_per_frame: sxy / sxx,
-        })
-    }
-
-    fn at(&self, pos: u64) -> i64 {
-        (self.mean_us + (pos as f64 - self.mean_pos) * self.us_per_frame).round() as i64
-    }
-}
-
-enum Phase {
-    /// Waiting for the render stream to start and settle.
-    Waiting,
-    /// Collecting the pilot-only calibration capture.
-    Calibrating {
-        next: Option<u64>,
-    },
-    Detecting(Box<Detector>),
-    Failed,
 }
 
 fn loopback_thread(
@@ -893,19 +874,16 @@ fn loopback_thread(
     let poll_qpc = freq * LOOPBACK_POLL_US / 1_000_000;
     let max_packet = rate as usize; // 1 s, far above a 200 ms buffer
     let mut left = vec![0.0f32; max_packet];
-    let cal_len = (i64::from(rate) * CAL_LEN_US / 1_000_000) as usize;
-    let mut cal: Vec<f32> = Vec::with_capacity(cal_len);
-    // One anchor per packet: up to 15 minutes of 1 ms packets.
-    let mut anchors: Vec<(u64, i64)> = Vec::with_capacity(1_000_000);
+    // One timestamp per packet: up to 15 minutes of 1 ms packets.
+    let mut eval = CaptureEval::new(rate, CAL_SETTLE_US, CAL_LEN_US, 1_000_000);
     let mut side = LoopbackSide::default();
-    let mut phase = Phase::Waiting;
-    let mut onset = OnsetFinder::new(rate);
     let mut next_poll = qpc();
     let mut drained_after_done = false;
     loop {
         timer.wait_until(next_poll);
         next_poll += poll_qpc;
         let done = shared.render_done.load(Ordering::Acquire);
+        let started = shared.started_us.load(Ordering::Acquire) > 0;
         loop {
             // SAFETY: COM calls on the started capture stream; the packet
             // is read before it is released.
@@ -929,9 +907,12 @@ fn loopback_thread(
                 break;
             }
             let count = (frames as usize).min(max_packet);
-            let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
-            let discontinuity = flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
-            if !silent {
+            let f = CaptureFlags {
+                silent: flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0,
+                discontinuity: flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
+                timestamp_error: flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0,
+            };
+            if !f.silent {
                 // SAFETY: the packet holds `frames` frames of `channels`
                 // f32 samples.
                 let src = unsafe {
@@ -948,86 +929,10 @@ fn loopback_thread(
                 let _ = capture.ReleaseBuffer(frames);
             }
             side.packets += 1;
-            side.silent_packets += u64::from(silent);
-            side.discontinuity_packets += u64::from(discontinuity);
-            side.timestamp_errors +=
-                u64::from(flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0);
+            side.silent_packets += u64::from(f.silent);
+            side.discontinuity_packets += u64::from(f.discontinuity);
             let t_us = clock.to_us((i128::from(qpos) * i128::from(freq) / 10_000_000) as i64);
-            // Only capture from before the render stream stopped.
-            let limit = shared
-                .stopped_us
-                .load(Ordering::Acquire)
-                .saturating_sub(STOP_MARGIN_US);
-            let keep = if t_us >= limit {
-                0
-            } else {
-                (((limit - t_us) as i128 * i128::from(rate) / 1_000_000) as usize).min(count)
-            };
-            if keep == 0 {
-                continue;
-            }
-            let samples = &left[..keep];
-            let count = keep;
-            onset.push_packet(
-                pos,
-                PacketFlags {
-                    silent,
-                    discontinuity,
-                },
-                samples,
-            );
-            phase = match phase {
-                Phase::Waiting => {
-                    let started = shared.started_us.load(Ordering::Acquire);
-                    if started > 0 && t_us >= started + CAL_SETTLE_US {
-                        Phase::Calibrating { next: None }
-                    } else {
-                        Phase::Waiting
-                    }
-                }
-                p => p,
-            };
-            phase = match phase {
-                Phase::Calibrating { next } => {
-                    // Contiguous capture only: restart on any gap or flag.
-                    if discontinuity || next.is_some_and(|n| n != pos) {
-                        cal.clear();
-                    }
-                    let take = (cal_len - cal.len()).min(samples.len());
-                    cal.extend_from_slice(&samples[..take]);
-                    if cal.len() < cal_len {
-                        Phase::Calibrating {
-                            next: Some(pos + count as u64),
-                        }
-                    } else {
-                        match pilot::calibrate(&cal, rate) {
-                            Some(c) => {
-                                side.calibration_amplitude = Some(c.amplitude);
-                                Phase::Detecting(Box::new(Detector::new(rate, c)))
-                            }
-                            None => {
-                                side.error = Some("pilot did not calibrate".into());
-                                Phase::Failed
-                            }
-                        }
-                    }
-                }
-                Phase::Detecting(mut d) => {
-                    if anchors.len() < anchors.capacity() {
-                        anchors.push((pos, t_us));
-                    }
-                    d.push_packet(
-                        pos,
-                        PacketFlags {
-                            silent,
-                            discontinuity,
-                        },
-                        samples,
-                    );
-                    Phase::Detecting(d)
-                }
-                p => p,
-            };
+            eval.push(pos, f, t_us, &left[..count], started);
         }
         if done {
             // One more pass after the render stream stopped, for the
@@ -1043,32 +948,18 @@ fn loopback_thread(
     unsafe {
         let _ = client.Stop();
     }
-    let mut facts = AudioFacts::default();
-    side.onset_position = onset.onset();
-    if let Phase::Detecting(d) = phase {
-        let report = d.finish();
-        facts.pilot_calibrated = true;
-        facts.unverifiable_spans = report.unverifiable.len() as u32;
-        side.episode_positions = report.episodes.iter().map(|e| e.start_sample).collect();
-        // Packet timestamps jitter by milliseconds; a least-squares line
-        // through all of them maps positions to time.
-        let map = LinearMap::fit(&anchors);
-        let at = |p: u64| map.map(|m| m.at(p));
-        if let Some(span) = report.evaluated {
-            facts.capture_from_us = at(span.start);
-            facts.capture_to_us = at(span.end);
-        }
-        facts.episodes = report
-            .episodes
-            .iter()
-            .filter_map(|e| {
-                Some(Episode {
-                    start_us: at(e.start_sample)?,
-                    end_us: at(e.end_sample)?,
-                })
-            })
-            .collect();
-    }
+    let anchors = eval.anchors().to_vec();
+    let stopped = shared.stopped_us.load(Ordering::Acquire);
+    let (facts, sum) = eval.finish((stopped != i64::MAX).then_some(stopped));
+    side.calibration_amplitude = sum.calibration_amplitude;
+    side.onset_position = sum.onset_position;
+    side.episode_positions = sum.episode_positions;
+    side.timestamp_errors = sum.timestamp_errors;
+    side.map_error_us = sum.map_error_us;
+    side.anchors_used = sum.anchors_used;
+    side.cut_position = sum.cut_position;
+    side.cut_late = sum.cut_late;
+    side.error = sum.error.map(str::to_owned);
     Ok(LoopbackOut {
         side,
         facts,
@@ -1093,23 +984,5 @@ mod tests {
         assert_eq!(pick_period(p, PeriodChoice::Frames(240)), Ok(240));
         assert!(pick_period(p, PeriodChoice::Frames(200)).is_err());
         assert!(pick_period(p, PeriodChoice::Frames(528)).is_err());
-    }
-
-    #[test]
-    fn capture_positions_map_through_a_line_fitted_to_jittered_stamps() {
-        // 10 ms packets at 48 kHz stamped with alternating ±3 ms jitter.
-        let a: Vec<(u64, i64)> = (0..1_000u64)
-            .map(|k| {
-                let jitter = if k % 2 == 0 { 3_000 } else { -3_000 };
-                (k * 480, 5_000 + k as i64 * 10_000 + jitter)
-            })
-            .collect();
-        let m = LinearMap::fit(&a).unwrap();
-        assert!(
-            (m.at(480 * 500) - 5_005_000).abs() <= 10,
-            "{}",
-            m.at(480 * 500)
-        );
-        assert!(LinearMap::fit(&a[..1]).is_none());
     }
 }

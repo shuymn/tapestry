@@ -43,7 +43,8 @@ const USAGE: &str = "usage:
   tapestry-spike audio-devices
   tapestry-spike run --out <dir> [--bga <video>] [--fps-cap N] [--loops N | --duration-s N]
       [--window WxH] [--monitor <part>] [--adapter warp|hardware|low-power | --adapter-name <part>]
-      [--audio wasapi|null] [--audio-period min|next|<frames>] [--audio-device <part>]
+      [--audio wasapi|null] [--audio-period min|next|<frames>] [--audio-queue <periods>]
+      [--audio-device <part>]
       [--inject-gap-every-s N --inject-gap-ms M] [--starve-ms N]
       [--offscreen WxH --audio null --frames N]";
 
@@ -134,6 +135,7 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
         device: None,
         inject: None,
         starve_ms: None,
+        queue_periods: 2,
     };
     let (mut every, mut gap) = (None, None);
     for (k, v) in options(args)? {
@@ -171,6 +173,7 @@ fn run_cmd(args: &[String]) -> Result<ExitCode, String> {
             "inject-gap-every-s" => every = Some(num(k, v)?),
             "inject-gap-ms" => gap = Some(num(k, v)?),
             "starve-ms" => audio.starve_ms = Some(num(k, v)?),
+            "audio-queue" => audio.queue_periods = num(k, v)?,
             "frames" => a.frames = Some(num(k, v)?),
             "duration-s" => a.duration_s = Some(num(k, v)?),
             "loops" => a.loops = num(k, v)?,

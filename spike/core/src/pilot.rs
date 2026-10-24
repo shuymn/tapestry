@@ -458,8 +458,10 @@ impl Detector {
 }
 
 /// Finds where the pilot starts in a capture: the start of the first
-/// window whose amplitude reaches `AMPLITUDE_RATIO` of the nominal pilot.
-/// It uses the same demodulator and threshold as the detector, so the
+/// window whose amplitude reaches `AMPLITUDE_RATIO` of the calibrated
+/// pilot (`Calibration::amplitude`, so an attenuated pilot that
+/// calibrates is also found). It uses the same demodulator and threshold
+/// as the detector, so the
 /// onset of the render stream (its frame 0) and an episode start are
 /// measured the same way: a rising edge at capture position `s` and a gap
 /// starting at `g` give `episode - onset` within one window of `g - s`.
@@ -468,6 +470,7 @@ impl Detector {
 #[derive(Clone, Debug)]
 pub struct OnsetFinder {
     demod: Demod,
+    threshold: f64,
     base: Option<u64>,
     next: u64,
     found: Option<u64>,
@@ -476,9 +479,10 @@ pub struct OnsetFinder {
 }
 
 impl OnsetFinder {
-    pub fn new(rate_hz: u32) -> Self {
+    pub fn new(rate_hz: u32, cal: Calibration) -> Self {
         Self {
             demod: Demod::new(rate_hz),
+            threshold: AMPLITUDE_RATIO * cal.amplitude,
             base: None,
             next: 0,
             found: None,
@@ -497,7 +501,7 @@ impl OnsetFinder {
         }
         for &x in samples {
             if let Some(w) = self.demod.push(if flags.silent { 0.0 } else { x })
-                && w.amplitude >= AMPLITUDE_RATIO * PILOT_AMPLITUDE
+                && w.amplitude >= self.threshold
             {
                 self.found = Some(base + w.start_sample);
                 return;
@@ -549,22 +553,24 @@ mod tests {
     #[test]
     fn onset_and_gap_are_measured_alike() {
         // Silence, then the pilot from capture position 1_000 + 3_000 (the
-        // stream's frame 0), then a 2 ms gap at stream frame 48_000.
+        // stream's frame 0), then a 2 ms gap at stream frame 48_000. The
+        // pilot arrives at 55% of its nominal level, which still
+        // calibrates.
         let rate = 48_000;
         let base = 1_000u64;
         let (start, gap) = (3_000usize, 48_000usize);
         let mut o = PilotOscillator::new(rate);
         let mut s = vec![0.0f32; start];
         for f in 0..96_000usize {
-            let x = o.next_sample();
+            let x = o.next_sample() * 0.55;
             s.push(if (gap..gap + 96).contains(&f) { 0.0 } else { x });
         }
-        let mut finder = OnsetFinder::new(rate);
+        let cal = calibrate(&s[start + 4_800..start + 40_000], rate).unwrap();
+        let mut finder = OnsetFinder::new(rate, cal);
         for (k, c) in s.chunks(480).enumerate() {
             finder.push_packet(base + (k * 480) as u64, PacketFlags::default(), c);
         }
         let onset = finder.onset().expect("pilot found");
-        let cal = calibrate(&s[start + 4_800..start + 40_000], rate).unwrap();
         let mut d = Detector::new(rate, cal);
         for (k, c) in s.chunks(480).enumerate() {
             d.push_packet(base + (k * 480) as u64, PacketFlags::default(), c);

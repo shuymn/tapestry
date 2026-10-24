@@ -29,6 +29,11 @@ pub const DRIFT_STEP_MS: u64 = 500;
 /// 100–256 concurrent voices this keeps the sum below the clamp (`clamped`
 /// counts any sample that reaches it, since a clipped peak is broadband).
 pub const VOICE_GAIN: f32 = 0.05;
+/// The resampler's fixed output chunk. Device writes need not be
+/// multiples of it: what a write leaves of a chunk stays resampled and
+/// staged, and a sound triggered later cannot change it, so the chunk is
+/// kept small (1.3 ms at 48 kHz) rather than a device period.
+pub const ENGINE_CHUNK: usize = 64;
 /// The key-sound mix is clamped here, leaving room for the pilot.
 const MIX_LIMIT: f32 = 1.0 - PILOT_AMPLITUDE as f32;
 
@@ -95,8 +100,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// `chunk` is the resampler's fixed output size (the device period).
-    pub fn new(rate_hz: u32, chunk: usize, bank: SoundBank, injection: Option<Injection>) -> Self {
+    pub fn new(rate_hz: u32, bank: SoundBank, injection: Option<Injection>) -> Self {
         let params = SincInterpolationParameters {
             sinc_len: 128,
             f_cutoff: None,
@@ -108,7 +112,7 @@ impl Engine {
             1.0,
             1.0 + 2.0 * DRIFT_PPM * 1e-6,
             &params,
-            chunk,
+            ENGINE_CHUNK,
             2,
             FixedAsync::Output,
         )
@@ -262,6 +266,76 @@ impl Engine {
     }
 }
 
+/// The engine's mix clock: which run µs each device frame is mixed at.
+///
+/// The render thread observes, at each buffer event, the first frame still
+/// queued (`written - padding`) and the time of the engine pass that will
+/// read it (the wake plus one period). Wakes come late by a scheduler-
+/// dependent amount; engine passes do not. Over a sliding window of
+/// `MIX_CLOCK_WINDOW` observations the earliest residual (observation minus
+/// `frame / rate`) is the least-late wake, which bounds the clock's error
+/// by that smallest lateness (tens of µs in practice) instead of the
+/// latest wake's. The device clock's drift against QPC (tens of ppm) moves
+/// it by under 30 µs across the window.
+pub const MIX_CLOCK_WINDOW: usize = 128;
+
+#[derive(Clone, Debug)]
+pub struct MixClock {
+    rate_hz: u32,
+    /// Residuals in µs (time minus `frame / rate`), a ring.
+    residuals: Vec<i64>,
+    len: usize,
+    next: usize,
+    last: Option<i64>,
+}
+
+impl MixClock {
+    pub fn new(rate_hz: u32) -> Self {
+        Self {
+            rate_hz,
+            residuals: vec![0; MIX_CLOCK_WINDOW],
+            len: 0,
+            next: 0,
+            last: None,
+        }
+    }
+
+    fn frame_us(&self, frame: u64) -> i64 {
+        (i128::from(frame) * 1_000_000 / i128::from(self.rate_hz)) as i64
+    }
+
+    /// Frame `frame` is read by the engine at `t_us` or earlier.
+    pub fn observe(&mut self, frame: u64, t_us: i64) {
+        let r = t_us - self.frame_us(frame);
+        self.residuals[self.next] = r;
+        self.next = (self.next + 1) % self.residuals.len();
+        self.len = (self.len + 1).min(self.residuals.len());
+        self.last = Some(r);
+    }
+
+    /// When `frame` is mixed, by the least-late observation in the window.
+    pub fn at(&self, frame: u64) -> Option<i64> {
+        let min = self.residuals[..self.len].iter().min()?;
+        Some(min + self.frame_us(frame))
+    }
+
+    /// The frame mixed at `t_us`.
+    pub fn frame_at(&self, t_us: i64) -> Option<u64> {
+        let min = *self.residuals[..self.len].iter().min()?;
+        let us = (t_us - min).max(0);
+        Some((i128::from(us) * i128::from(self.rate_hz) / 1_000_000) as u64)
+    }
+
+    /// The latest observation's excess over the window's earliest (its
+    /// wake lateness relative to the least-late wake), µs.
+    pub fn latest_error_us(&self) -> i64 {
+        match (self.last, self.residuals[..self.len].iter().min()) {
+            (Some(l), Some(m)) => l - m,
+            _ => 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,12 +367,57 @@ mod tests {
     }
 
     #[test]
+    fn a_sound_after_an_unaligned_write_starts_right_after_it() {
+        // A 970-frame prefill against 441-frame periods: the next sound
+        // must start right after what was written (plus the resampler's
+        // delay and at most one chunk staged), not a period later.
+        let bank = SoundBank {
+            sounds: vec![vec![16_000; 4_000]],
+        };
+        let mut e = Engine::new(44_100, bank, None);
+        let mut out = vec![0.0f32; 970 * 2];
+        e.render(&mut out, 2, 970);
+        let written = e.device_frames();
+        let at = e.trigger_at_device(0, written);
+        // At most 64 frames (1.3 ms at 48 kHz) staged beyond the delay.
+        let slack = e.resampler_delay() + 64;
+        assert!(
+            at >= written && at - written <= slack,
+            "{at} vs {written} (+{slack})"
+        );
+    }
+
+    #[test]
+    fn mix_clock_takes_the_earliest_wake_of_its_window() {
+        // Engine passes every 441 frames at 44.1 kHz from 1 s; wakes land
+        // 50 µs to 4 ms late. The frame's time comes from the least-late
+        // wake, so its error stays near the smallest lateness.
+        let rate = 44_100;
+        let mut c = MixClock::new(rate);
+        let mut rng = crate::rng::SplitMix64::new(3);
+        let true_at = |f: u64| 1_000_000 + (f as i128 * 1_000_000 / i128::from(rate)) as i64;
+        let mut worst = 0;
+        for k in 0..1_000u64 {
+            let frame = k * 441;
+            let late = 50 + rng.below(3_951) as i64;
+            c.observe(frame, true_at(frame) + late);
+            if k >= 128 {
+                let probe = frame + 1_000;
+                worst = worst.max((c.at(probe).unwrap() - true_at(probe)).abs());
+            }
+        }
+        assert!(worst <= 200, "{worst} us");
+        // The latest wake alone would be off by up to the full lateness.
+        assert!(c.latest_error_us() > 1_000);
+    }
+
+    #[test]
     fn render_in_any_block_size_gives_the_same_samples() {
         let bank = SoundBank {
             sounds: vec![vec![16_000; 4_000]],
         };
         let run = |block: usize| {
-            let mut e = Engine::new(48_000, 480, bank.clone(), None);
+            let mut e = Engine::new(48_000, bank.clone(), None);
             e.trigger_at_device(0, 1_000);
             let mut out = vec![0.0f32; 9_600 * 3];
             let mut done = 0;

@@ -9,6 +9,7 @@ pub mod engine;
 pub mod evaluate;
 pub mod export;
 pub mod heavy;
+pub mod loopback;
 pub mod mixer;
 pub mod obslog;
 pub mod pilot;

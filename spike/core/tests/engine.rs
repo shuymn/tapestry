@@ -19,7 +19,7 @@ const LEAD_S: u64 = 2;
 fn render(play_s: u64, injection: Option<Injection>) -> (Vec<f32>, Engine, u32) {
     let chart = Chart::generate(DEFAULT_SEED);
     let mut play = Play::new(&chart, play_s as i64 * 1_000_000);
-    let mut engine = Engine::new(RATE, PERIOD, key_bank(11, RATE), injection);
+    let mut engine = Engine::new(RATE, key_bank(11, RATE), injection);
     let lead = LEAD_S * u64::from(RATE);
     let total = lead + (play_s + 1) * u64::from(RATE);
     let mut out = vec![0.0f32; PERIOD * 2];

@@ -60,7 +60,6 @@ fn h_mix_loop_makes_no_allocations() {
     let mut out = vec![0.0f32; 480 * 2];
     let mut engine = Engine::new(
         48_000,
-        480,
         bank.clone(),
         Some(Injection {
             first: 1_000,

@@ -23,13 +23,33 @@ use std::thread::JoinHandle;
 
 pub struct Session {
     sync: Arc<PlaySync>,
-    input: threads::InputThread,
-    logic: JoinHandle<threads::LogicOut>,
+    input: Option<threads::InputThread>,
+    logic: Option<JoinHandle<threads::LogicOut>>,
     audio: Option<audio::AudioThreads>,
     pub hits: Consumer<HitMsg>,
     pub snapshot: triple_buffer::Output<Snapshot>,
     notes: u32,
     stop: Arc<AtomicBool>,
+}
+
+/// A session dropped without `finish` (a failed start, or a render thread
+/// that failed before play) releases the barrier and joins every thread it
+/// started.
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.sync.abort("the run ended before play".into());
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(i) = self.input.take() {
+            let _ = i.handle.join();
+        }
+        if let Some(l) = self.logic.take() {
+            let _ = l.join();
+        }
+        if let Some(a) = self.audio.take() {
+            let _ = a.render.join();
+            let _ = a.loopback.join();
+        }
+    }
 }
 
 /// Starts the play threads; the render thread is the barrier's last
@@ -51,9 +71,22 @@ pub fn start(
     let stop = Arc::new(AtomicBool::new(false));
     // Input, logic, render, and audio when it runs.
     let members = 3 + usize::from(audio_args.is_some());
-    let sync = Arc::new(PlaySync::new(members, clock, COUNTDOWN_US));
-    let audio = match audio_args {
-        Some(a) => Some(audio::spawn(
+    let sync = Arc::new(PlaySync::new(members, clock, COUNTDOWN_US, play_len));
+    let has_audio = audio_args.is_some();
+    // Threads join the session as they start, so an error below drops it
+    // and releases and joins them.
+    let mut session = Session {
+        sync: sync.clone(),
+        input: None,
+        logic: None,
+        audio: None,
+        hits: hit_rx,
+        snapshot: snap_out,
+        notes: notes as u32,
+        stop: stop.clone(),
+    };
+    if let Some(a) = audio_args {
+        session.audio = Some(audio::spawn(
             a,
             sound_rx,
             sync.clone(),
@@ -61,10 +94,9 @@ pub fn start(
             play_len,
             notes,
             stop.clone(),
-        )?),
-        None => None,
-    };
-    let input = spawn_input(
+        )?);
+    }
+    session.input = Some(spawn_input(
         presses,
         press_tx,
         wake.clone(),
@@ -73,32 +105,16 @@ pub fn start(
         clock,
         play_len + PRESS_JITTER_US + 1_000,
         stop.clone(),
-    )?;
+    )?);
     let sinks = LogicSinks {
         hits: Some(hit_tx),
-        sounds: audio.is_some().then_some(sound_tx),
+        sounds: has_audio.then_some(sound_tx),
         snapshot: snap_in,
     };
-    let logic = spawn_logic(
-        judge,
-        press_rx,
-        wake,
-        done,
-        sinks,
-        sync.clone(),
-        clock,
-        notes,
-    )?;
-    Ok(Session {
-        sync,
-        input,
-        logic,
-        audio,
-        hits: hit_rx,
-        snapshot: snap_out,
-        notes: notes as u32,
-        stop,
-    })
+    session.logic = Some(spawn_logic(
+        judge, press_rx, wake, done, sinks, sync, clock, notes,
+    )?);
+    Ok(session)
 }
 
 #[derive(Serialize)]
@@ -109,6 +125,8 @@ pub struct InputSummary {
     pub stats: InputStatsOut,
     pub sound_overflows: u64,
     pub hit_overflows: u64,
+    /// Longest dequeue → judgment completion (part of G4).
+    pub judge_us_max: i64,
     /// G4 over heavy windows, and over all of play.
     pub heavy_latency_us_p99: Option<i64>,
     pub latency_us_p50: Option<i64>,
@@ -118,6 +136,7 @@ pub struct InputSummary {
 
 #[derive(Serialize)]
 pub struct InputStatsOut {
+    pub mmcss: bool,
     pub emitted: u64,
     pub overflows: u64,
     pub ticks: u64,
@@ -127,6 +146,7 @@ pub struct InputStatsOut {
 impl From<InputStats> for InputStatsOut {
     fn from(s: InputStats) -> Self {
         Self {
+            mmcss: s.mmcss,
             emitted: s.emitted,
             overflows: s.overflows,
             ticks: s.ticks,
@@ -154,6 +174,9 @@ pub struct InjectionCheck {
     pub timestamp_offsets_us: Vec<i64>,
 }
 
+// TODO(P4): a render or loopback error here only fills
+// `render_error`/`loopback_error` while the run itself exits 0; the report
+// must make such a run invalid (V6/V8) instead of trusting the exit status.
 #[derive(Serialize)]
 pub struct AudioSummary {
     /// Run µs of play start (episode times are run µs).
@@ -190,20 +213,23 @@ pub struct SessionOut {
 }
 
 impl Session {
-    /// The barrier (render thread): returns the play start.
-    pub fn ready(&self) -> i64 {
+    /// The barrier (render thread): returns the play start, or the error of
+    /// a play thread whose setup failed.
+    pub fn ready(&self) -> Result<i64, String> {
         self.sync.ready()
     }
 
     /// Stops the threads (if still running) and collects their records.
-    pub fn finish(self, play_start: i64, play_len: i64) -> Result<SessionOut, String> {
+    pub fn finish(mut self, play_start: i64, play_len: i64) -> Result<SessionOut, String> {
         self.stop.store(true, Ordering::Relaxed);
-        let stats = self
-            .input
-            .handle
+        let input = self.input.take().ok_or("input thread missing")?;
+        let stats = input.handle.join().map_err(|_| "input thread panicked")??;
+        let logic = self
+            .logic
+            .take()
+            .ok_or("logic thread missing")?
             .join()
-            .map_err(|_| "input thread panicked")??;
-        let logic = self.logic.join().map_err(|_| "logic thread panicked")?;
+            .map_err(|_| "logic thread panicked")?;
         let loops = (play_len as u64)
             .div_ceil(spike_core::chart::CHART_LEN_US as u64)
             .max(1) as u32;
@@ -225,6 +251,7 @@ impl Session {
             stats: stats.into(),
             sound_overflows: logic.sound_overflows,
             hit_overflows: logic.hit_overflows,
+            judge_us_max: logic.judge_us_max,
             heavy_latency_us_p99: percentile_i64(&heavy, 99),
             latency_us_p50: percentile_i64(&lat, 50),
             latency_us_p99: percentile_i64(&lat, 99),
@@ -232,7 +259,7 @@ impl Session {
         };
         let mut periods = vec![];
         let (mut mix_anchors, mut capture_anchors) = (vec![], vec![]);
-        let audio = match self.audio {
+        let audio = match self.audio.take() {
             None => None,
             Some(a) => {
                 let render = a.render.join().map_err(|_| "audio thread panicked")?;
@@ -383,7 +410,7 @@ pub fn write(out: &Path, s: &SessionOut) -> Result<(), String> {
 pub fn print(s: &PlaySummary) {
     let i = &s.input;
     println!(
-        "input: {} notes, {} judged; records produced {} lost {}; overflows input {} sound {} hit {}; raw input events {}",
+        "input: {} notes, {} judged; records produced {} lost {}; overflows input {} sound {} hit {}; raw input events {}; MMCSS {}",
         i.notes_total,
         i.judged,
         i.records.produced,
@@ -391,11 +418,16 @@ pub fn print(s: &PlaySummary) {
         i.stats.overflows,
         i.sound_overflows,
         i.hit_overflows,
-        i.stats.raw_input_events
+        i.stats.raw_input_events,
+        i.stats.mmcss
     );
     println!(
-        "G4 input->judgment: heavy p99 {:?} us; all p50 {:?} us p99 {:?} us max {:?} us",
-        i.heavy_latency_us_p99, i.latency_us_p50, i.latency_us_p99, i.latency_us_max
+        "G4 input->judgment: heavy p99 {:?} us; all p50 {:?} us p99 {:?} us max {:?} us (judgment itself up to {} us)",
+        i.heavy_latency_us_p99,
+        i.latency_us_p50,
+        i.latency_us_p99,
+        i.latency_us_max,
+        i.judge_us_max
     );
     let Some(a) = &s.audio else {
         println!("audio: null");
@@ -419,6 +451,14 @@ pub fn print(s: &PlaySummary) {
             r.periods,
             r.endpoint_volume_db,
             r.endpoint_muted
+        );
+        println!(
+            "audio: queue {} periods; MMCSS {}; wake lateness vs the mix clock p50 {:?} us p99 {:?} us max {:?} us",
+            r.queue_periods,
+            r.mmcss,
+            r.wake_lateness_us_p50,
+            r.wake_lateness_us_p99,
+            r.wake_lateness_us_max
         );
         let d = &r.diagnostics;
         println!(
@@ -459,12 +499,16 @@ pub fn print(s: &PlaySummary) {
     }
     if let Some(l) = &a.loopback {
         println!(
-            "loopback: calibration {:?}, packets {} (silent {}, discontinuity {}, timestamp errors {}){}",
+            "loopback: calibration {:?}, packets {} (silent {}, discontinuity {}, timestamp errors {}); time map error {:?} us over {} stamps; stop cut at {:?} (late {}){}",
             l.calibration_amplitude,
             l.packets,
             l.silent_packets,
             l.discontinuity_packets,
             l.timestamp_errors,
+            l.map_error_us,
+            l.anchors_used,
+            l.cut_position,
+            l.cut_late,
             l.error
                 .as_ref()
                 .map_or(String::new(), |e| format!(", error: {e}"))
