@@ -1,0 +1,27 @@
+# Stage 0 spike workspace (issue #3). Separate from the root workspace on
+# purpose: it is never merged into `main`, and the root checks (check-arch,
+# cargo deny, tests) must not see it. `app` joins `members` in P0/P2.
+[workspace]
+resolver = "3"
+members = ["core"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+csv = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.11"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# The pilot detector tests scan 600 s of audio; unoptimized they take minutes.
+[profile.test]
+opt-level = 3

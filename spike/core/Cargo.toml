@@ -1,0 +1,17 @@
+[package]
+name = "spike-core"
+version = "0.0.0"
+description = "Stage 0 spike: pure logic (chart, scroll, measurement evaluation, parsers, export, pilot detector, mixer)."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# No FFmpeg and no `windows` crate: this crate builds and tests on Linux too.
+[dependencies]
+csv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
