@@ -175,6 +175,7 @@ pub fn passing_obs_run() -> RunData {
                 ..ObsEncoderSettings::default()
             }),
             frames_output: Some(37_800),
+            teardown_confirmed: true,
             drawn: Some(37_800),
             ..ObsSession::default()
         }),

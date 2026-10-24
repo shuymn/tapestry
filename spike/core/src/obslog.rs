@@ -22,8 +22,19 @@
 //!   insufficient bandwidth/connection stalls: N (…)` (libobs
 //!   `log_frame_info`)
 //! - `Video stopped, number of skipped frames due to encoding lag: N/M (…)`
-//!   (libobs `log_skipped`), taken only before the stream's stop marker
-//!   (P5 confirms this order in a real log)
+//!   (libobs `log_skipped`)
+//! - `==== Shutting down ====…` (OBS exiting)
+//!
+//! Encoding-lag ownership: libobs logs the encoding-lag summary from the
+//! output's teardown thread, which it does not join, so the line may come
+//! before or after the frontend's `Streaming Stop` marker. The stream owns
+//! the first summary logged while it runs or after its stop marker, until
+//! the next output or encoder starts (another output's or a new session's
+//! start marker or connection, or an encoder being created). A summary
+//! logged after that while the stream has none is ambiguous, which V7
+//! rejects. A stream with no summary has zero skipped frames only if the log
+//! shows OBS shutting down after the stream stopped (every teardown has
+//! finished by then); otherwise V7 rejects it as unconfirmed.
 //!
 //! OBS prints the lag and drop lines only when the count is nonzero, so in a
 //! completed session their absence means zero. Only the streaming output's
@@ -114,6 +125,12 @@ pub struct ObsSession {
     pub encode_skipped: Option<u64>,
     pub encode_total: Option<u64>,
     pub bandwidth_dropped: Option<u64>,
+    /// OBS logged its shutdown after the stream stopped, so the stream's
+    /// teardown (and any encoding-lag summary) has been logged.
+    pub teardown_confirmed: bool,
+    /// An encoding-lag summary came after another output started while the
+    /// stream had none: it may be the stream's or the other output's.
+    pub encode_lag_ambiguous: bool,
 }
 
 impl ObsSession {
@@ -230,7 +247,16 @@ struct Raw {
     connect_ms: Option<i64>,
     start_ms: Option<i64>,
     stop_ms: Option<i64>,
+    /// After the stop marker, until the next output or encoder starts: a
+    /// trailing encoding-lag summary is the stream's.
+    owns_lag: bool,
     s: ObsSession,
+}
+
+/// Another output or encoder started: stopped streams stop owning trailing
+/// encoding-lag summaries.
+fn end_ownership(sessions: &mut [Raw]) {
+    sessions.iter_mut().for_each(|r| r.owns_lag = false);
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -274,6 +300,35 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
         }
         block = Block::None;
 
+        if let Some((n, m)) = msg
+            .strip_prefix("Video stopped, number of skipped frames due to encoding lag: ")
+            .and_then(|r| r.split_once('/'))
+        {
+            let lag = (leading_u64(n), leading_u64(m));
+            let owner = sessions
+                .iter()
+                .rposition(|r| r.owns_lag)
+                .or_else(|| sessions.iter().rposition(|r| r.stop_ms.is_none()));
+            if let Some(i) = owner
+                && sessions[i].s.encode_skipped.is_none()
+            {
+                let r = &mut sessions[i];
+                (r.s.encode_skipped, r.s.encode_total) = lag;
+                r.owns_lag = false;
+            }
+            for (k, r) in sessions.iter_mut().enumerate() {
+                if Some(k) != owner && r.stop_ms.is_some() && r.s.encode_skipped.is_none() {
+                    r.s.encode_lag_ambiguous = true;
+                }
+            }
+            continue;
+        }
+        if msg.starts_with("==== Shutting down") {
+            for r in sessions.iter_mut().filter(|r| r.stop_ms.is_some()) {
+                r.s.teardown_confirmed = true;
+            }
+            continue;
+        }
         if msg == "video settings reset:" {
             video = Some(ObsVideo::default());
             block = Block::Video;
@@ -290,6 +345,7 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
                 Some(e) => starts_new || e.family != Some(family),
             };
             if needs_new {
+                end_ownership(&mut sessions);
                 let enc = ObsEncoderSettings {
                     family: Some(family),
                     label: Some(label),
@@ -312,6 +368,7 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
 
         for name in ["Recording", "Replay Buffer", "Virtual Camera"] {
             if msg.starts_with(&format!("==== {name} Start")) {
+                end_ownership(&mut sessions);
                 others_running += 1;
                 if open && let Some(r) = sessions.last_mut() {
                     r.s.other_output_active = true;
@@ -327,6 +384,7 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
         let begins = rtmp_output.is_some_and(|(_, m)| m.starts_with("Connecting to RTMP URL"))
             || msg.starts_with("==== Streaming Start");
         if begins && !open {
+            end_ownership(&mut sessions);
             sessions.push(Raw {
                 begin_ms: t,
                 s: ObsSession {
@@ -359,6 +417,7 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
             if r.stop_ms.is_none() {
                 r.s.stop_marker = true;
                 r.stop_ms = Some(t);
+                r.owns_lag = true;
             }
         } else if let Some(rest) = msg.strip_prefix("Output '") {
             let Some((out, m)) = rest.split_once("': ") else {
@@ -386,15 +445,6 @@ pub fn derive(log: &str, play: WallWindow) -> ObsDerived {
             ) {
                 s.bandwidth_dropped = leading_u64(rest);
             }
-        } else if let Some((n, m)) = msg
-            .strip_prefix("Video stopped, number of skipped frames due to encoding lag: ")
-            .and_then(|r| r.split_once('/'))
-            // Only the stream's own encoder stopping, inside its session: a
-            // later output (a recording after the stream) logs its own line.
-            .filter(|_| r.stop_ms.is_none())
-        {
-            r.s.encode_skipped = leading_u64(n);
-            r.s.encode_total = leading_u64(m);
         }
     }
     let sessions_in_log = sessions.len() as u32;

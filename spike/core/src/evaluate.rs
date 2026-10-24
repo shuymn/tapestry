@@ -436,6 +436,13 @@ fn v7(run: &RunData) -> Check {
     if s.bandwidth_dropped.unwrap_or(0) > 0 {
         r.push("obs-bandwidth-drop");
     }
+    // O2 needs the stream's own encoding-lag summary, or proof there was
+    // none (obslog: ownership rule).
+    if s.encode_lag_ambiguous {
+        r.push("obs-encode-lag-ambiguous");
+    } else if s.encode_skipped.is_none() && !s.teardown_confirmed {
+        r.push("obs-teardown-unconfirmed");
+    }
     if run.owner.game_visible != Some(true) || run.owner.audio_present != Some(true) {
         r.push("owner-did-not-confirm-capture");
     }

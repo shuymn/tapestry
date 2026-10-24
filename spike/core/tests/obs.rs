@@ -166,6 +166,10 @@ struct Log {
     /// Lines logged shortly after the streaming start marker.
     during: Vec<String>,
     stop: bool,
+    /// Lines logged after the stream's stop marker, 1 s apart.
+    after: Vec<String>,
+    /// OBS exits at the end of the log (`==== Shutting down`).
+    shutdown: bool,
 }
 
 impl Default for Log {
@@ -183,6 +187,8 @@ impl Default for Log {
             ],
             during: vec![],
             stop: true,
+            after: vec![],
+            shutdown: true,
         }
     }
 }
@@ -241,6 +247,17 @@ impl Log {
                 e,
                 "==== Streaming Stop ================================================",
             ));
+            for (k, a) in (1..).zip(&self.after) {
+                l.push(at(e + k * 1_000, a));
+            }
+        }
+        if self.shutdown {
+            let t = self.stop_ms + 300_000;
+            l.push(at(
+                t,
+                "==== Shutting down ==================================================",
+            ));
+            l.push(at(t + 100, "Number of memory leaks: 0"));
         }
         l.join("\n") + "\n"
     }
@@ -492,52 +509,87 @@ fn f_recording_during_the_session_is_invalid_and_not_mixed_in() {
     assert_eq!(reasons(&log), vec!["obs-other-output-active"]);
 }
 
+const STREAM_LAG: &str =
+    "Video stopped, number of skipped frames due to encoding lag: 300/36000 (0.8%)";
+const RECORDING_LAG: &str =
+    "Video stopped, number of skipped frames due to encoding lag: 1/36000 (0.0%)";
+
+/// A recording made after the stream stopped.
+fn recording_after(lag: Option<&str>) -> Vec<String> {
+    let mut l = vec![
+        "==== Recording Start ===============================================".to_string(),
+        "Output 'adv_file_output': stopping".to_string(),
+        "Output 'adv_file_output': Total frames output: 36000".to_string(),
+    ];
+    l.extend(lag.map(String::from));
+    l.push("==== Recording Stop ================================================".to_string());
+    l
+}
+
 #[test]
-fn f_encoding_lag_after_the_stream_stopped_does_not_overwrite_it() {
-    // The stream skipped 300/36000; a recording made after the stream
-    // stopped reports 1/36000 and must not replace it.
-    let mut log = Log::default();
-    log.totals.push(
-        "Video stopped, number of skipped frames due to encoding lag: 300/36000 (0.8%)".into(),
+fn f_stream_lag_summary_after_its_stop_marker_is_the_streams() {
+    // libobs logs the summary from an unjoined teardown thread, so it can
+    // follow the frontend's stop marker.
+    let log = Log {
+        after: vec![STREAM_LAG.into()],
+        ..Log::default()
+    };
+    let (run, s) = with_log(&log);
+    let sess = run.obs.unwrap().session.unwrap();
+    assert_eq!(
+        (sess.encode_skipped, sess.encode_total),
+        (Some(300), Some(36_000))
     );
-    let mut text = log.text();
-    let after = PLAY.end_ms + 120_000;
-    for (dt, line) in [
-        (
-            0,
-            "==== Recording Start ===============================================",
-        ),
-        (60_000, "Output 'adv_file_output': stopping"),
-        (
-            60_000,
-            "Output 'adv_file_output': Total frames output: 36000",
-        ),
-        (
-            60_000,
-            "Video stopped, number of skipped frames due to encoding lag: 1/36000 (0.0%)",
-        ),
-        (
-            60_010,
-            "==== Recording Stop ================================================",
-        ),
-    ] {
-        text.push_str(&format!(
-            "{}: {line}
-",
-            ts(after + dt)
-        ));
-    }
-    let mut run = passing_obs_run();
-    run.obs = Some(derive(&text, PLAY));
-    let sess = run.obs.as_ref().unwrap().session.clone().unwrap();
+    assert!(s.check("V7").ok, "{:?}", s.check("V7").reasons);
+    assert!(!s.gate("O2").pass);
+    assert_eq!(s.exit_code, 1);
+}
+
+#[test]
+fn f_later_recording_lag_does_not_replace_the_streams() {
+    let mut after = vec![STREAM_LAG.to_string()];
+    after.extend(recording_after(Some(RECORDING_LAG)));
+    let log = Log {
+        after,
+        ..Log::default()
+    };
+    let (run, s) = with_log(&log);
+    let sess = run.obs.unwrap().session.unwrap();
     assert_eq!(
         (sess.encode_skipped, sess.encode_total),
         (Some(300), Some(36_000))
     );
     assert!(!sess.other_output_active);
-    let s = evaluate(&run);
     assert!(s.check("V7").ok);
     assert!(!s.gate("O2").pass);
+}
+
+#[test]
+fn f_lag_summary_after_another_output_started_is_ambiguous() {
+    // The stream logged none before the recording started; the recording's
+    // summary could be the stream's late one.
+    let log = Log {
+        after: recording_after(Some(RECORDING_LAG)),
+        ..Log::default()
+    };
+    assert_eq!(reasons(&log), vec!["obs-encode-lag-ambiguous"]);
+}
+
+#[test]
+fn f_no_lag_summary_counts_as_zero_only_after_obs_shut_down() {
+    let log = Log {
+        shutdown: false,
+        ..Log::default()
+    };
+    assert_eq!(reasons(&log), vec!["obs-teardown-unconfirmed"]);
+    // A later recording without any summary, then OBS exits: zero.
+    let log = Log {
+        after: recording_after(None),
+        ..Log::default()
+    };
+    let (_, s) = with_log(&log);
+    assert!(s.check("V7").ok, "{:?}", s.check("V7").reasons);
+    assert_eq!(s.gate("O2").value, Some(0.0));
 }
 
 #[test]

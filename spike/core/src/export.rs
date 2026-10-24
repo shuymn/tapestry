@@ -213,6 +213,8 @@ const JSON_KEYS: &[&str] = &[
     "encode_skipped",
     "encode_total",
     "bandwidth_dropped",
+    "teardown_confirmed",
+    "encode_lag_ambiguous",
 ];
 
 const CSV_COLUMNS: &[&str] = &[
