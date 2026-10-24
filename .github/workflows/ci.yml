@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.12
+          install: true
+          cache: true
+      - name: Show toolchain
+        run: |
+          mise ls --current
+          expected=$(mise current rust)
+          actual=$(mise exec -- rustc --version | cut -d' ' -f2)
+          test "$expected" = "$actual"
+          mise exec -- rustc -Vv
+      - name: Show runner image
+        run: echo "runner image $ImageOS $ImageVersion"
+      - name: Format
+        run: mise exec -- cargo fmt --all --check
+      - name: Clippy
+        run: mise exec -- cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy (dev-tools)
+        run: mise exec -- cargo clippy -p player --all-targets --locked --features dev-tools -- -D warnings
+      - name: Test
+        run: mise exec -- cargo test --workspace --locked
+      # Also run on Windows: build-dependencies resolve for the host, so the
+      # R3 production-feature check sees cfg(windows) build-dependencies only here.
+      - name: Architecture rules
+        run: mise exec -- cargo xtask check-arch
+      - name: Production build
+        run: mise exec -- cargo build --release --locked -p player --no-default-features
+      - name: Production excludes dev-tools
+        run: |
+          mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
+          set +e
+          target/release/tapestry.exe --dev-tools-probe 2> probe.err
+          code=$?
+          set -e
+          cat probe.err
+          test "$code" -eq 2
+          grep -q "unknown argument" probe.err
+      - name: Development build includes dev-tools (positive control)
+        run: |
+          mise exec -- cargo build --locked -p player --features dev-tools
+          mise exec -- cargo xtask check-binary --present "tapestry dev-tools enabled" target/debug/tapestry.exe
+          target/debug/tapestry.exe --dev-tools-probe
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.12
+          install: true
+          cache: true
+      - name: Show toolchain
+        run: |
+          mise ls --current
+          expected=$(mise current rust)
+          actual=$(mise exec -- rustc --version | cut -d' ' -f2)
+          test "$expected" = "$actual"
+          mise exec -- rustc -Vv
+      - name: Format
+        run: mise exec -- cargo fmt --all --check
+      - name: Architecture rules
+        run: mise exec -- cargo xtask check-arch
+      - name: Clippy (portable crates)
+        run: mise exec -- cargo xtask portable clippy --all-targets --locked -- -D warnings
+      - name: Test (portable crates)
+        run: mise exec -- cargo xtask portable test --locked
+      - name: cargo-deny
+        run: mise exec -- cargo deny check
+      - name: cargo-audit
+        run: mise exec -- cargo audit --deny warnings
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      # Only the tools in install_args are needed; keep `mise exec` from
+      # installing the rest (Rust) on demand.
+      MISE_EXEC_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.12
+          install: true
+          install_args: actionlint shellcheck
+          cache: true
+      - name: actionlint
+        run: mise exec -- actionlint

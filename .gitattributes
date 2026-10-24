@@ -1,0 +1,24 @@
+* text=auto eol=lf
+*.rs   text eol=lf diff=rust
+*.md   text eol=lf diff=markdown
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.nix  text eol=lf
+*.sh   text eol=lf
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+Cargo.lock text eol=lf linguist-generated
+mise.lock  text eol=lf linguist-generated
+flake.lock text eol=lf linguist-generated
+banned-words.txt text eol=lf -diff linguist-documentation
+# Test BMS text may be Shift_JIS; keep bytes exact.
+*.bms -text diff
+*.bme -text diff
+*.bml -text diff
+*.pms -text diff
+*.png binary
+*.wav binary
+*.ogg binary
+*.flac binary

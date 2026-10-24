@@ -1,0 +1,36 @@
+# cargo-deny configuration. Run with `mise exec -- cargo deny check`.
+
+[graph]
+# The platforms this workspace builds for: Windows (player) and Linux (CI).
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+# Check optional dependencies too, so the bans below also see crates that only
+# a non-default feature pulls in.
+all-features = true
+
+[advisories]
+# Defaults: vulnerabilities, unmaintained and unsound crates, and yanked
+# versions are errors.
+
+[licenses]
+# Only what the dependency graph needs. Add a license together with the
+# crate that brings it in.
+allow = [
+    "MIT",        # most crates (MIT OR Apache-2.0), cargo_metadata
+    "Apache-2.0", # most crates (MIT OR Apache-2.0)
+    "Unicode-3.0", # unicode-ident
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # The Windows API crate only inside the Windows-only crates (AGENTS.md).
+    # `windows-sys` is not banned: portable crates such as tempfile use it
+    # under cfg(windows).
+    { crate = "windows", wrappers = ["input", "audio", "render", "player"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

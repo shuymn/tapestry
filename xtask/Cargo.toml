@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+description = "Repository checks and helpers (dev tooling, never shipped)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cargo_metadata.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

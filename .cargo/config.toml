@@ -1,0 +1,5 @@
+[alias]
+# xtask builds with its own profile (into `<target-dir>/xtask/`) so that cargo
+# commands it runs (such as `cargo xtask portable test`) never overwrite the
+# running xtask executable, which Windows does not allow.
+xtask = "run --quiet --locked --profile xtask --package xtask --"
