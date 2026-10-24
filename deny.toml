@@ -17,7 +17,8 @@ all-features = true
 allow = [
     "MIT",        # most crates (MIT OR Apache-2.0), cargo_metadata
     "Apache-2.0", # most crates (MIT OR Apache-2.0)
-    "Unicode-3.0", # unicode-ident
+    "Unicode-3.0", # unicode-ident, unicode-normalization
+    "BSD-3-Clause", # encoding_rs (together with MIT OR Apache-2.0)
 ]
 
 [bans]

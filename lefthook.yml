@@ -1,0 +1,27 @@
+assert_lefthook_installed: true
+glob_matcher: doublestar
+no_tty: true
+output: [summary, failure, execution_out]
+
+pre-commit:
+  parallel: true
+  commands:
+    # No glob: file names are checked too.
+    banned-words:
+      run: mise exec -- cargo xtask banned-words --staged
+    rustfmt:
+      glob: "**/*.rs"
+      run: mise exec -- cargo fmt --all --check
+    actionlint:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: mise exec -- actionlint
+    shellcheck:
+      glob: "**/*.sh"
+      run: mise exec -- shellcheck {staged_files}
+
+# An automatic merge commit runs pre-merge-commit, not pre-commit. Rebases can
+# replay commits without either hook; CI is the final gate.
+pre-merge-commit:
+  commands:
+    banned-words:
+      run: mise exec -- cargo xtask banned-words --staged

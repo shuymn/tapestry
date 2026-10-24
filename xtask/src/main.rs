@@ -3,6 +3,7 @@
 //! Exit codes: 0 success, 1 check failed, 2 usage or environment error.
 
 mod arch;
+mod banned_words;
 mod binary;
 #[cfg(test)]
 mod fixture;
@@ -17,6 +18,9 @@ usage: cargo xtask <command>
 
 commands:
   check-arch                              check the architecture rules (R1-R3)
+  banned-words (--staged|--all) [--list <path>]
+                                          check paths and contents in the index for
+                                          terms in banned-words.txt
   portable <cargo-command> [args...]      run cargo on every non-Windows-only package
   check-binary (--absent|--present) <text> <file>
                                           check whether a file contains <text>";
@@ -31,6 +35,7 @@ fn main() -> ExitCode {
         Some("check-arch") if rest.is_empty() => {
             report(arch::run(&workspace_manifest(), &["--locked"]))
         }
+        Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
         Some("check-binary") => binary::run(&rest),
         Some("-h" | "--help") => {

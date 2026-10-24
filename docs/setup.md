@@ -23,6 +23,8 @@ The environment for developing this repository, and how tool versions are pinned
 
 ## Version Pinning
 
+Use mise 2026.10.3 or newer. CI runs the minimum supported mise version.
+
 Tool versions are pinned with mise. `mise.toml` specifies major-version ranges, and the exact versions are pinned in `mise.lock`. Configure `mise.toml` so that versions not in `mise.lock` are not used:
 
 ```toml
@@ -30,7 +32,7 @@ Tool versions are pinned with mise. `mise.toml` specifies major-version ranges, 
 locked = true
 
 [settings]
-lockfile_platforms = ["windows-x64", "linux-x64"]
+lockfile_platforms = ["windows-x64", "linux-x64", "macos-arm64"]
 ```
 
 `locked` in `[tool_config]` applies only to tools declared in this repository (it does not apply to global tools).
@@ -106,7 +108,7 @@ Performance and latency are measured in a state kept separate from everyday deve
 - The code commit, whether there are uncommitted changes, and the build configuration
 - The measurement scene, the input log used, and the measurement tool versions
 - CPU and memory, GPU and driver version, Windows build, power settings
-- Resolution, refresh rate, and VRR
+- Output and render resolutions, refresh rate, and VRR
 - Audio device and driver, WASAPI shared or exclusive, sample rate, buffer, whether audio enhancements are enabled
 - Input device and the USB port it is connected to
 
