@@ -125,8 +125,10 @@ pub const DISPLAY_VBLANKS: i64 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
     /// The frame-latency waitable object blocked and released the thread at
-    /// a vblank. Measured against the trusted grid, such wakes may land
-    /// slightly before their vblank (`EARLY_WAKE_TOLERANCE_US`).
+    /// a vblank: the one the previous frame was predicted to show on, where
+    /// the object signals. Measured against the trusted grid, such wakes may
+    /// land slightly before it (`EARLY_WAKE_TOLERANCE_US`). A wait the
+    /// scheduler resumed later, near the next vblank, is a late wake.
     Vblank,
     /// The cap timer released the thread for `slot` (a vblank on the cap
     /// grid). The frame belongs to that vblank or a later one: a timer wake
@@ -153,10 +155,27 @@ pub fn early_wake_tolerance(period: i64, units_per_s: i64) -> i64 {
 }
 
 /// The vblank (on the grid `anchor + k × period`) that released a frame
-/// woken at `now`: its identity on the display grid.
-pub fn release_vblank(now: i64, wake: Wake, anchor: i64, period: i64, tolerance: i64) -> i64 {
+/// woken at `now`: its identity on the display grid. `expected` is the
+/// vblank a blocking wait was for (the previous frame's target); the early
+/// tolerance only ever lands a wake on it, so a wait resumed late just
+/// before the following vblank keeps the vblank it passed.
+pub fn release_vblank(
+    now: i64,
+    wake: Wake,
+    anchor: i64,
+    period: i64,
+    tolerance: i64,
+    expected: Option<i64>,
+) -> i64 {
     match wake {
-        Wake::Vblank => floor_grid(now + tolerance, anchor, period),
+        Wake::Vblank => {
+            let passed = floor_grid(now, anchor, period);
+            let early = floor_grid(now + tolerance, anchor, period);
+            match expected {
+                Some(e) if early != passed && (early - e).abs() >= period / 2 => passed,
+                _ => early,
+            }
+        }
         // The slot rounded to the display grid (the cap grid may be anchored
         // on an earlier sync of the same grid).
         Wake::CapSlot(slot) => {
@@ -192,7 +211,7 @@ impl DisplayPredictor {
 
     pub fn predict(&mut self, now: i64, wake: Wake, sync_anchor: Option<i64>, period: i64) -> i64 {
         let release = match (sync_anchor, wake) {
-            (Some(a), _) => release_vblank(now, wake, a, period, self.tolerance),
+            (Some(a), _) => release_vblank(now, wake, a, period, self.tolerance, self.last),
             (None, Wake::CapSlot(slot)) => now.max(slot),
             (None, _) => now,
         };
@@ -358,16 +377,38 @@ mod tests {
         assert_eq!(early_wake_tolerance(41_652, 10_000_000), 5_000);
         let tol = early_wake_tolerance(R, 1_000_000);
         // A waitable wake 250 µs before the vblank at 3R belongs to it.
-        assert_eq!(release_vblank(3 * R - 250, Wake::Vblank, 0, R, tol), 3 * R);
+        assert_eq!(
+            release_vblank(3 * R - 250, Wake::Vblank, 0, R, tol, Some(3 * R)),
+            3 * R
+        );
         // 600 µs before it is a wake for the vblank at 2R.
-        assert_eq!(release_vblank(3 * R - 600, Wake::Vblank, 0, R, tol), 2 * R);
+        assert_eq!(
+            release_vblank(3 * R - 600, Wake::Vblank, 0, R, tol, Some(3 * R)),
+            2 * R
+        );
+        // A blocking wait for the vblank at R that the scheduler resumed
+        // 400 µs before 2R: a frame rendered in 100 µs presents before 2R
+        // and shows there, so the tolerance must not carry it to 2R.
+        assert_eq!(
+            release_vblank(2 * R - 400, Wake::Vblank, 0, R, tol, Some(R)),
+            R
+        );
+        let mut p = DisplayPredictor::new(tol);
+        assert_eq!(p.predict(0, Wake::Vblank, Some(0), R), R);
+        assert_eq!(p.predict(2 * R - 400, Wake::Vblank, Some(0), R), 2 * R);
         // A late wake just before a vblank presents before it.
-        assert_eq!(release_vblank(3 * R - 30, Wake::Late, 0, R, tol), 2 * R);
+        assert_eq!(
+            release_vblank(3 * R - 30, Wake::Late, 0, R, tol, None),
+            2 * R
+        );
         // A cap-timer wake late at 1.8R for the slot at R presents at 2R.
-        assert_eq!(release_vblank(R * 18 / 10, Wake::CapSlot(R), 0, R, tol), R);
+        assert_eq!(
+            release_vblank(R * 18 / 10, Wake::CapSlot(R), 0, R, tol, None),
+            R
+        );
         // A cap-timer wake 300 µs early still belongs to its slot.
         assert_eq!(
-            release_vblank(2 * R - 300, Wake::CapSlot(2 * R), 0, R, tol),
+            release_vblank(2 * R - 300, Wake::CapSlot(2 * R), 0, R, tol, None),
             2 * R
         );
         let mut p = DisplayPredictor::new(tol);
