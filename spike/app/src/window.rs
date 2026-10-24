@@ -19,7 +19,7 @@ use crate::run::{
     BgaState, DxgiSummary, POST_PLAY_US, Recorder, RunArgs, adapter, bga_due, device, event,
     heavy_values, instance, print_summary, summary_common, write_outputs,
 };
-use crate::scene::{Frame, Scene};
+use crate::scene::{Effects, Frame, Scene};
 use crate::timebase::{Clock, HiResTimer, qpc, qpc_freq};
 use crate::{rundata, session};
 use spike_core::chart::{CHART_LEN_US, Chart, DEFAULT_SEED};
@@ -47,9 +47,9 @@ struct Shared {
 struct App {
     args: RunArgs,
     shared: Arc<Shared>,
-    proxy: EventLoopProxy<Result<(), String>>,
+    proxy: EventLoopProxy<Result<u8, String>>,
     window: Option<Arc<Window>>,
-    result: Option<Result<(), String>>,
+    result: Option<Result<u8, String>>,
 }
 
 /// What the main thread hands to the render thread.
@@ -135,7 +135,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler<Result<(), String>> for App {
+impl ApplicationHandler<Result<u8, String>> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() || self.result.is_some() {
             return;
@@ -146,7 +146,7 @@ impl ApplicationHandler<Result<(), String>> for App {
         }
     }
 
-    fn user_event(&mut self, el: &ActiveEventLoop, result: Result<(), String>) {
+    fn user_event(&mut self, el: &ActiveEventLoop, result: Result<u8, String>) {
         self.result = Some(result);
         el.exit();
     }
@@ -164,7 +164,7 @@ impl ApplicationHandler<Result<(), String>> for App {
 }
 
 pub fn windowed(args: &RunArgs) -> Result<ExitCode, String> {
-    let el = EventLoop::<Result<(), String>>::with_user_event()
+    let el = EventLoop::<Result<u8, String>>::with_user_event()
         .build()
         .map_err(|e| e.to_string())?;
     // The input thread registers keyboard Raw Input on its own window; Raw
@@ -183,9 +183,10 @@ pub fn windowed(args: &RunArgs) -> Result<ExitCode, String> {
         result: None,
     };
     el.run_app(&mut app).map_err(|e| e.to_string())?;
-    app.result
+    let code = app
+        .result
         .unwrap_or_else(|| Err("event loop ended without a result".into()))?;
-    Ok(ExitCode::SUCCESS)
+    Ok(ExitCode::from(code))
 }
 
 /// DXGI frame-statistics diagnostic (§3.2): display time of the present
@@ -275,7 +276,8 @@ impl Dxgi {
     }
 }
 
-fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String> {
+/// The run; its exit code is the audio verdict (`session::audio_check`).
+fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<u8, String> {
     alloc::tag_thread(Tag::Render);
     let clock = shared.clock;
     let Gpu {
@@ -316,7 +318,10 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     let mut bga = BgaState::open(&args.bga)?;
     let dims = bga.bga.as_ref().map(|b| (b.width, b.height));
     let mut renderer = Renderer::new(dev, queue, config.format, dims);
-    let mut scene = Scene::new(Chart::generate(DEFAULT_SEED));
+    let mut scene = Scene::new(
+        Chart::generate(DEFAULT_SEED),
+        Effects::for_profile(args.meta.profile),
+    );
     let mut frame = Frame::new();
     let play_len = args.play_us();
     // Input, logic and audio threads, behind the play barrier with this one.
@@ -466,7 +471,20 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         );
     }
     alloc::disarm();
-    let played = session.finish(play_start, play_len)?;
+    let mut played = session.finish(play_start, play_len)?;
+    let code = match &args.audio {
+        Some(a) => {
+            let check = session::audio_check(
+                played.summary.audio.as_ref(),
+                a.inject.is_some(),
+                a.starve_ms.is_some(),
+            );
+            let code = check.exit;
+            played.summary.check = Some(check);
+            code
+        }
+        None => 0,
+    };
     // Pair DXGI display estimates with frames by present count.
     let by_count: HashMap<u32, i64> = trace
         .iter()
@@ -548,7 +566,16 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     );
     let origin = rundata::Origin::now(clock, play_start, play_len);
     rundata::write(&args.out, &run, &origin)?;
-    Ok(())
+    if let Some(c) = &played.summary.check
+        && c.exit != 0
+    {
+        eprintln!(
+            "run: audio check failed (exit {}): {}",
+            c.exit,
+            c.reasons.join("; ")
+        );
+    }
+    Ok(code)
 }
 
 /// `private/gpu_timestamps.csv`: per drawn frame, its start QPC (the

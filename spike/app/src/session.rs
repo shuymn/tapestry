@@ -176,7 +176,80 @@ pub struct AudioSummary {
 pub struct PlaySummary {
     pub input: InputSummary,
     pub audio: Option<AudioSummary>,
+    /// The run's own audio verdict (S0 checks, audio evidence).
+    pub check: Option<AudioCheck>,
 }
+
+/// A windowed run's audio verdict: `exit` 2 if the audio evidence itself
+/// failed (a stream or loopback error), 1 if an S0 check failed (injected
+/// gaps not each found once, or a withholding without its episode), else 0.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct AudioCheck {
+    pub exit: u8,
+    pub reasons: Vec<String>,
+}
+
+/// The audio verdict of a run with `audio` on, given whether gaps were
+/// injected and writes withheld.
+pub fn audio_check(a: Option<&AudioSummary>, inject: bool, starve: bool) -> AudioCheck {
+    let mut c = AudioCheck::default();
+    let Some(a) = a else {
+        c.exit = 2;
+        c.reasons.push("no audio summary".into());
+        return c;
+    };
+    if let Some(e) = &a.render_error {
+        c.exit = 2;
+        c.reasons.push(format!("render stream failed: {e}"));
+    }
+    if let Some(e) = &a.loopback_error {
+        c.exit = 2;
+        c.reasons.push(format!("loopback capture failed: {e}"));
+    }
+    if c.exit == 2 {
+        return c;
+    }
+    if inject {
+        match &a.injection {
+            Some(i) if i.injected > 0 && i.matched == i.injected && i.episodes == i.injected => {}
+            Some(i) => c.reasons.push(format!(
+                "injection: {} gaps, {} episodes, {} matched (each gap must be found exactly once)",
+                i.injected, i.episodes, i.matched
+            )),
+            None => c.reasons.push("injection: no gaps were injected".into()),
+        }
+    }
+    if starve {
+        let starves = a.render.as_ref().map_or(&[][..], |r| &r.starves[..]);
+        if starves.is_empty() {
+            c.reasons
+                .push("starvation: writes were never withheld".into());
+        }
+        for st in starves {
+            let to = st.at_us + i64::from(st.withheld_ms) * 1_000 + STARVE_EPISODE_SLACK_US;
+            let episodes = a
+                .facts
+                .episodes
+                .iter()
+                .filter(|e| (st.at_us..to).contains(&(e.start_us - a.play_start_us)))
+                .count();
+            if st.exceeds_queued && (episodes == 0 || st.padding_zero_wakes == 0) {
+                c.reasons.push(format!(
+                    "starvation at {} us: {episodes} episodes, {} empty-buffer wakes (both must be found)",
+                    st.at_us, st.padding_zero_wakes
+                ));
+            }
+        }
+    }
+    if !c.reasons.is_empty() {
+        c.exit = 1;
+    }
+    c
+}
+
+/// Episodes are stamped by the loopback, which trails the mix clock by the
+/// engine's buffering (tens of ms).
+const STARVE_EPISODE_SLACK_US: i64 = 100_000;
 
 pub struct SessionOut {
     pub summary: PlaySummary,
@@ -298,7 +371,11 @@ impl Session {
             }
         };
         Ok(SessionOut {
-            summary: PlaySummary { input, audio },
+            summary: PlaySummary {
+                input,
+                audio,
+                check: None,
+            },
             input: logic.input,
             periods,
             judge_to_mix,
@@ -469,8 +546,8 @@ pub fn print(s: &PlaySummary) {
         );
         for st in &r.starves {
             // Episodes by timestamps, which trail the mix clock by the
-            // engine's buffering (tens of ms): within 100 ms after.
-            let to = st.at_us + i64::from(st.withheld_ms) * 1_000 + 100_000;
+            // engine's buffering.
+            let to = st.at_us + i64::from(st.withheld_ms) * 1_000 + STARVE_EPISODE_SLACK_US;
             let episodes = a
                 .facts
                 .episodes
@@ -534,5 +611,92 @@ pub fn print(s: &PlaySummary) {
             c.offsets_us,
             c.timestamp_offsets_us
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::Starve;
+    use spike_core::run::Episode;
+
+    fn summary() -> AudioSummary {
+        AudioSummary {
+            play_start_us: 5_000_000,
+            render: Some(RenderSide::default()),
+            render_error: None,
+            loopback: Some(LoopbackSide::default()),
+            loopback_error: None,
+            facts: AudioFacts::default(),
+            v6: Check {
+                id: "V6".into(),
+                ok: true,
+                reasons: vec![],
+            },
+            g5_episodes: 0,
+            period_records: StreamCount::default(),
+            judge_to_mix_us_p50: None,
+            judge_to_mix_us_p99: None,
+            judge_to_mix_us_min: None,
+            judge_to_mix_us_max: None,
+            injection: None,
+        }
+    }
+
+    fn injection(injected: usize, episodes: usize, matched: usize) -> Option<InjectionCheck> {
+        Some(InjectionCheck {
+            injected,
+            episodes,
+            window_frames: 48,
+            matched,
+            offsets_us: vec![],
+            timestamp_offsets_us: vec![],
+        })
+    }
+
+    #[test]
+    fn s0_injection_needs_every_gap_found_exactly_once() {
+        let mut a = summary();
+        assert_eq!(audio_check(Some(&a), false, false).exit, 0);
+        a.injection = injection(12, 12, 12);
+        assert_eq!(audio_check(Some(&a), true, false).exit, 0);
+        for (e, m) in [(11, 11), (13, 12), (12, 11)] {
+            a.injection = injection(12, e, m);
+            assert_eq!(audio_check(Some(&a), true, false).exit, 1, "{e} {m}");
+        }
+        a.injection = None;
+        assert_eq!(audio_check(Some(&a), true, false).exit, 1);
+    }
+
+    #[test]
+    fn s0_starvation_needs_an_episode_and_empty_buffer_wakes() {
+        let mut a = summary();
+        let starve = |padding_zero_wakes| Starve {
+            at_us: 10_000_000,
+            withheld_ms: 50,
+            queued_us: 20_000,
+            exceeds_queued: true,
+            padding_zero_wakes,
+        };
+        // Never withheld.
+        assert_eq!(audio_check(Some(&a), false, true).exit, 1);
+        a.render.as_mut().unwrap().starves = vec![starve(3)];
+        // Withheld, no episode.
+        assert_eq!(audio_check(Some(&a), false, true).exit, 1);
+        a.facts.episodes = vec![Episode {
+            start_us: 5_000_000 + 10_030_000,
+            end_us: 5_000_000 + 10_060_000,
+        }];
+        assert_eq!(audio_check(Some(&a), false, true).exit, 0);
+        a.render.as_mut().unwrap().starves = vec![starve(0)];
+        assert_eq!(audio_check(Some(&a), false, true).exit, 1);
+    }
+
+    #[test]
+    fn failed_audio_evidence_is_invalid() {
+        let mut a = summary();
+        a.loopback_error = Some("device lost".into());
+        assert_eq!(audio_check(Some(&a), false, false).exit, 2);
+        assert_eq!(audio_check(None, false, false).exit, 2);
     }
 }

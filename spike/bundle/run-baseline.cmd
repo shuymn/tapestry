@@ -1,6 +1,7 @@
 @echo off
 rem R1 baseline (design 4.2): standard profile, no cap, BGA on, 4 loops (600 s),
-rem under PresentMon, then the report and the export.
+rem under PresentMon, then the report and the export. After a G5 failure the
+rem next audio period rung is printed.
 rem   run-baseline.cmd <run-name> [more run options, e.g. --monitor DISPLAY1]
 setlocal
 cd /d "%~dp0"
@@ -20,5 +21,10 @@ goto collect
 .\tapestry-spike.exe measure --presentmon presentmon\PresentMon-2.6.0-x64.exe --profile standard --bga assets\bga.mp4 --out runs\%NAME% %EXTRA%
 if errorlevel 1 exit /b %errorlevel%
 .\tapestry-spike.exe report runs\%NAME%
+set RESULT=%errorlevel%
+if exist runs\%NAME%\ladder.txt for /f "usebackq tokens=1,* delims==" %%a in ("runs\%NAME%\ladder.txt") do (
+  if "%%a"=="audio" echo Next, audio period rung: run-baseline.cmd %NAME%-period%EXTRA% %%b
+  if "%%a"=="note" echo Ladder: %%b
+)
 echo Hand-off: only runs\%NAME%\export\*.zip leaves this PC.
-exit /b %errorlevel%
+exit /b %RESULT%
