@@ -1,26 +1,26 @@
-# 開発環境
+# Development Environment
 
-このリポジトリを開発するための環境と、道具の版の固定の仕方。設計は [design.md](design.md) にある。
+The environment for developing this repository, and how tool versions are pinned. The design is in [design.md](design.md).
 
-## 必要なもの
+## Requirements
 
-| 対象 | 内容 |
+| Item | Details |
 | --- | --- |
-| OS | Windows 10/11（x64）。ゲームのビルド・実行・計測は、Windowsのネイティブで行う |
+| OS | Windows 10/11 (x64). Building, running, and measuring the game are done natively on Windows |
 | Git | Git for Windows |
-| C++のビルド環境 | Visual Studio Build Tools（C++のワークロード、MSVCのツールセット、Windows SDK） |
-| 版の固定 | [mise](https://mise.jdx.dev/)。Rustと補助のCLIの版は `mise.toml` と `mise.lock` で固定する |
-| Linux側の道具（任意） | WSL上のNixOS（またはNixの入ったLinux）。ファジング、Windowsに依存しないcrateのLinuxでのビルドとテスト、WASMのビルドの確認に使う。CIでも同じ確認をするので、手元に無くても開発はできる |
+| C++ build environment | Visual Studio Build Tools (C++ workload, MSVC toolset, Windows SDK) |
+| Version pinning | [mise](https://mise.jdx.dev/). Rust and auxiliary CLI versions are pinned in `mise.toml` and `mise.lock` |
+| Linux-side tools (optional) | NixOS on WSL (or a Linux with Nix installed). Used for fuzzing, Linux builds and tests of crates that do not depend on Windows, and checking the WASM build. CI performs the same checks, so development is possible without it locally |
 
-## リポジトリの置き場所
+## Repository Location
 
-- 作業コピーは、短いパス（例：`C:\dev\tapestry`）に置く。Gitでは `core.longpaths=true` を設定し、OSでも長いパスを有効にする。OSの設定だけでは、すべての道具が長いパスに対応するわけではない。
-- 改行は `.gitattributes` で決める。
-- WSLからは、同じ作業コピーを `/mnt/c/...` として使う。Windowsで作ったworktreeもWSLから読めるように、`git config --global worktree.useRelativePaths true` を設定してからworktreeを作る（Windows側とWSL側のGitが、ともにこの設定に対応している版であること）。作業コピーを変えるGitの操作（コミット、ブランチの切り替えなど）はWindows側だけで行う。ファイルの変更の監視は、WindowsとWSLをまたいで使わない。
+- Place the working copy at a short path (e.g. `C:\dev\tapestry`). Set `core.longpaths=true` in Git and also enable long paths in the OS. The OS setting alone does not make every tool support long paths.
+- Line endings are determined by `.gitattributes`.
+- From WSL, use the same working copy as `/mnt/c/...`. So that worktrees created on Windows can also be read from WSL, set `git config --global worktree.useRelativePaths true` before creating worktrees (both the Windows-side and the WSL-side Git must be versions that support this setting). Git operations that change the working copy (commits, branch switches, etc.) are done only on the Windows side. Do not use file change watching across Windows and WSL.
 
-## 版の固定
+## Version Pinning
 
-道具の版は mise で固定する。`mise.toml` にはメジャー番号の範囲を書き、正確な版は `mise.lock` で固定する。`mise.toml` で `mise.lock` に無い版を使わない設定にする：
+Tool versions are pinned with mise. `mise.toml` specifies major-version ranges, and the exact versions are pinned in `mise.lock`. Configure `mise.toml` so that versions not in `mise.lock` are not used:
 
 ```toml
 [tool_config]
@@ -30,65 +30,65 @@ locked = true
 lockfile_platforms = ["windows-x64", "linux-x64"]
 ```
 
-`[tool_config]` の `locked` は、このリポジトリで宣言した道具だけに効く（グローバルの道具には効かない）。
-`mise.lock` の更新は、定期的に動くワークフローがPRとして出す。
+`locked` in `[tool_config]` applies only to tools declared in this repository (it does not apply to global tools).
+Updates to `mise.lock` are submitted as PRs by a periodically running workflow.
 
 ### Rust
 
-Rustの版も mise で固定する。言語ごとの版のファイル（`rust-toolchain.toml`）は置かない。
+The Rust version is also pinned with mise. Do not add a language-specific version file (`rust-toolchain.toml`).
 
 ```toml
 [tools]
 rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
 ```
 
-- miseのRustはrustupを使って導入し、`RUSTUP_TOOLCHAIN` を設定して版を選ぶ。そのため、miseを通さずに `cargo` を呼ぶと、このリポジトリで固定した版にならない。`mise exec -- cargo ...` で呼ぶか、miseを有効にしたシェルで作業する。
-- miseを使わない場合は、`mise.lock` に書かれた版をrustupで入れ、`cargo +<版> ...` で呼ぶ。
-- 追加のターゲット（`wasm32-unknown-unknown` など）は、それを使う段階で足す。
+- mise installs Rust using rustup and selects the version by setting `RUSTUP_TOOLCHAIN`. So calling `cargo` without going through mise does not give you the version pinned in this repository. Call it as `mise exec -- cargo ...`, or work in a shell with mise activated.
+- Without mise, install the version written in `mise.lock` with rustup and call `cargo +<version> ...`.
+- Additional targets (such as `wasm32-unknown-unknown`) are added in the stage that uses them.
 
-### フック
+### Hooks
 
-[lefthook](https://lefthook.dev/) でgitのpre-commitフックを動かす。lefthook自体も mise で固定する。
+[lefthook](https://lefthook.dev/) runs the git pre-commit hook. lefthook itself is also pinned with mise.
 
 ```sh
 mise install
 mise exec -- lefthook install
 ```
 
-pre-commitでは、禁止語の検査と `rustfmt` の確認を行う。フックは手元で早く気づくためのもので、最終の関門はCIである。
+The pre-commit hook runs the banned-word check and the `rustfmt` check. The hook is for noticing problems early locally; CI is the final gate.
 
-## Linux側の道具（WSL）
+## Linux-Side Tools (WSL)
 
-- Linux側の道具は、Nixのflake（`flake.nix` と `flake.lock`）の開発用シェルで固定する。ファジングに使う日付付きのnightlyも、ここでだけ使う。
-- NixOSでは `nix-command` と `flakes` を有効にしておく。flakeはGitに登録されたファイルしか読まないので、`flake.nix` とそこから参照するファイルはGitに登録してから使う。
-- WSLでのビルドの出力は、`CARGO_TARGET_DIR` でWSLの中のディレクトリに分ける。Windows側の出力と混ざらず、`/mnt/c` 越しの書き込みの遅さも避けられる。
-- Windows側からWSLのコマンドを呼ぶときは、リポジトリのラッパースクリプトを使う。ラッパーは、作業コピーのWindowsでのパスを受け取ってWSLでのパスに変換し（`wslpath`）、`wsl.exe -d NixOS --cd <変換したパス> -- nix develop --command ...` を実行する。引数の引用と終了コードの受け渡しも、ラッパーで固定する。
+- Linux-side tools are pinned in the development shell of a Nix flake (`flake.nix` and `flake.lock`). The dated nightly used for fuzzing is also used only here.
+- On NixOS, enable `nix-command` and `flakes`. A flake reads only files tracked by Git, so add `flake.nix` and the files it references to Git before using them.
+- Build output in WSL is separated into a directory inside WSL via `CARGO_TARGET_DIR`. This keeps it from mixing with the Windows-side output and avoids slow writes over `/mnt/c`.
+- To call WSL commands from the Windows side, use the repository's wrapper script. The wrapper takes the working copy's Windows path, converts it to the WSL path (`wslpath`), and runs `wsl.exe -d NixOS --cd <converted path> -- nix develop --command ...`. Argument quoting and exit code propagation are also fixed in the wrapper.
 
 ## CI
 
-| ランナー | 行うこと |
+| Runner | What it does |
 | --- | --- |
-| Windows（OSの版を明示したラベル） | 本番ビルド（`dev-tools` を無効にした構成で固定）、開発用の機能が含まれていないことの確認、WARPによる描画の画像比較、Windows向けのテスト |
-| Linux | Windowsに依存しないcrateのビルドとテスト、WASMのビルド、ファジングの短時間の実行、禁止語の検査、依存の検査（`cargo-deny`、`cargo-audit`） |
+| Windows (label with an explicit OS version) | Production build (pinned to a configuration with `dev-tools` disabled), verifying that development features are not included, rendering image comparison with WARP, Windows tests |
+| Linux | Builds and tests of crates that do not depend on Windows, WASM build, short fuzzing runs, banned-word check, dependency checks (`cargo-deny`, `cargo-audit`) |
 
-- どちらのランナーも、同じ `mise.lock` から道具を入れる（`jdx/mise-action`）。キャッシュを戻したあとも導入の処理を走らせ、使われているRustの版を確かめる。
-- GitHub Actionsは、コミットのSHAで固定する。
-- Windowsのランナーは、ラベルで版を指定してもイメージが更新され続ける。ランナーのイメージの版、使ったアダプター、使える機能を記録する。イメージの更新で画像比較の結果が変わったときは、差分の画像を確かめてから正解の画像を更新する。
+- Both runners install tools from the same `mise.lock` (`jdx/mise-action`). Run the install step even after restoring the cache, and verify the Rust version in use.
+- GitHub Actions are pinned by commit SHA.
+- Windows runner images keep being updated even when the version is specified by label. Record the runner image version, the adapter used, and the available features. When an image update changes image comparison results, review the diff images before updating the expected images.
 
-## 計測のときの条件
+## Measurement Conditions
 
-性能と遅れの計測は、普段の開発とは分けた状態で行い、次の条件を結果とともに記録する。
+Performance and latency are measured in a state kept separate from everyday development, and the following conditions are recorded along with the results.
 
-- コードのコミットと、まだコミットしていない変更の有無、ビルドの構成
-- 計測の場面と、使った入力ログ、計測の道具の版
-- CPUとメモリー、GPUとドライバーの版、Windowsのビルド、電源の設定
-- 解像度、リフレッシュレートとVRR
-- 音声デバイスとドライバー、WASAPIの共有か排他か、サンプルレート、バッファ、音声の拡張処理の有無
-- 入力装置と、つないだUSBの口
+- The code commit, whether there are uncommitted changes, and the build configuration
+- The measurement scene, the input log used, and the measurement tool versions
+- CPU and memory, GPU and driver version, Windows build, power settings
+- Resolution, refresh rate, and VRR
+- Audio device and driver, WASAPI shared or exclusive, sample rate, buffer, whether audio enhancements are enabled
+- Input device and the USB port it is connected to
 
-OBSなしの基準と、OBSありの基準（エンコーダー、解像度、fpsを固定）は別に持つ。音の遅れの絶対値は、ゲームの内部の時刻だけでなく、試験用の入力装置で確かめる（[design.md](design.md) の「テスト方針」）。
+Keep separate baselines without OBS and with OBS (encoder, resolution, and fps fixed). Verify absolute audio latency not only with the game's internal times but also with the test input device ([design.md](design.md), "Testing Strategy").
 
-## その他
+## Other
 
-- ウイルス対策の除外は、既定では設定しない。ビルドが遅いと実際に確かめた場合だけ、ビルドの出力のディレクトリに限って除外する。
-- コード署名は、公開して配布する前に準備する。開発中は不要。
+- Antivirus exclusions are not configured by default. Only if builds are actually confirmed to be slow, exclude the build output directory and nothing else.
+- Code signing is prepared before public distribution. It is not needed during development.
