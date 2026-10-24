@@ -114,6 +114,10 @@ pub struct RenderSummary {
     pub allocs_scope: String,
     /// Caveats on the values above.
     pub notes: Vec<String>,
+    /// Windowed: exact refresh rationals of the active display paths, and
+    /// the refresh rate (mHz, from winit) the run used for its grid.
+    pub display_refresh: Vec<(u32, u32)>,
+    pub refresh_mhz_used: Option<u32>,
     pub readback_distinct_colors: Option<usize>,
     pub bga_only_readback_distinct_colors: Option<usize>,
     pub events: Vec<RunEvent>,
@@ -419,6 +423,18 @@ pub fn print_summary(s: &RenderSummary) {
         "allocations during play: app {:?} (other threads {}), library {:?} [{}]",
         s.app_allocs, s.other_thread_app_allocs, s.library_allocs, s.allocs_scope
     );
+    if let Some(mhz) = s.refresh_mhz_used {
+        let modes: Vec<String> = s
+            .display_refresh
+            .iter()
+            .map(|(n, d)| format!("{n}/{d} ({:.5} Hz)", f64::from(*n) / f64::from((*d).max(1))))
+            .collect();
+        println!(
+            "display: refresh used {} mHz; active paths {}",
+            mhz,
+            modes.join(", ")
+        );
+    }
     for n in &s.notes {
         println!("note: {n}");
     }

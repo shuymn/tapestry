@@ -52,6 +52,54 @@ pub fn sync_consistent(prev: (i64, u32), cur: (i64, u32), period: i64) -> bool {
     counts > 0 && (cur.0 - prev.0 - counts * period).abs() <= period / 10
 }
 
+/// Consecutive mutually consistent syncs needed to acquire (or reacquire)
+/// the refresh grid.
+pub const GRID_ACQUIRE_SAMPLES: u32 = 8;
+
+/// The trusted display-refresh grid. A sync on the trusted grid advances
+/// the anchor; a sync off it never moves the grid by itself, however well it
+/// agrees with its neighbour. Only `GRID_ACQUIRE_SAMPLES` consecutive
+/// mutually consistent syncs (re)establish a grid, so a short locally
+/// consistent stretch inside VRR-like timing cannot shift the cap slots.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GridTracker {
+    trusted: Option<(i64, u32)>,
+    candidate: Option<(i64, u32)>,
+    streak: u32,
+}
+
+impl GridTracker {
+    /// Feeds one sync `(qpc, refresh count)`; returns whether it is on the
+    /// trusted grid (after this call).
+    pub fn observe(&mut self, sync: (i64, u32), period: i64) -> bool {
+        if let Some(t) = self.trusted
+            && sync_consistent(t, sync, period)
+        {
+            self.trusted = Some(sync);
+            self.candidate = None;
+            self.streak = 0;
+            return true;
+        }
+        self.streak = match self.candidate {
+            Some(c) if sync_consistent(c, sync, period) => self.streak + 1,
+            _ => 1,
+        };
+        self.candidate = Some(sync);
+        if self.streak >= GRID_ACQUIRE_SAMPLES {
+            self.trusted = Some(sync);
+            self.candidate = None;
+            self.streak = 0;
+            return true;
+        }
+        false
+    }
+
+    /// The latest trusted sync, if a grid is established.
+    pub fn anchor(&self) -> Option<(i64, u32)> {
+        self.trusted
+    }
+}
+
 /// Whether a cap needs pacing at all: a cap at (or above) the refresh rate
 /// is what Fifo already delivers, so it adds no timer wait.
 pub fn cap_needed(cap_hz: u32, refresh_mhz: u32) -> bool {
@@ -59,12 +107,12 @@ pub fn cap_needed(cap_hz: u32, refresh_mhz: u32) -> bool {
 }
 
 /// Vblanks between a frame's start and its display. UNCALIBRATED: an
-/// empirical value from one local 60 Hz run, where every DXGI display
-/// estimate came one period after a one-vblank prediction (Fifo, maximum
-/// frame latency 1, waitable-object wait). P5 calibrates it against
-/// PresentMon at 60 and 240 Hz, with and without a cap, using the run's
-/// private trace.
-pub const DISPLAY_VBLANKS: i64 = 2;
+/// empirical value from local 59.951 Hz runs (Fifo, maximum frame latency
+/// 1, waitable-object wait), where the DXGI display estimates fell on the
+/// first vblank after the frame started once the grid used the exact
+/// refresh rational. P5 calibrates it against PresentMon at 60 and 240 Hz,
+/// with and without a cap, using the run's private trace.
+pub const DISPLAY_VBLANKS: i64 = 1;
 
 /// Predicted display time of a frame starting at `now`: the
 /// `DISPLAY_VBLANKS`-th vblank of the display grid after `now` when a sync
@@ -170,6 +218,33 @@ mod tests {
     }
 
     #[test]
+    fn off_grid_pair_does_not_move_the_trusted_grid() {
+        let mut g = GridTracker::default();
+        // Acquire on the grid 0 + k·R.
+        for k in 0..GRID_ACQUIRE_SAMPLES {
+            g.observe((i64::from(k) * R, k), R);
+        }
+        assert_eq!(g.anchor(), Some((7 * R, 7)));
+        // Off-grid stretch: one count per 2R.
+        for k in 8..12u32 {
+            assert!(!g.observe((i64::from(k) * 2 * R, k), R));
+        }
+        // A locally consistent pair, offset by a third of a refresh from
+        // the trusted grid: still not trusted.
+        let off = R / 3;
+        assert!(!g.observe((30 * R + off, 30), R));
+        assert!(!g.observe((31 * R + off, 31), R));
+        assert_eq!(g.anchor(), Some((7 * R, 7)));
+        // Back on the trusted grid: accepted at once.
+        assert!(g.observe((40 * R, 40), R));
+        // A sustained new grid is reacquired.
+        for k in 50..50 + GRID_ACQUIRE_SAMPLES {
+            g.observe((i64::from(k) * R + off, k), R);
+        }
+        assert_eq!(g.anchor(), Some((57 * R + off, 57)));
+    }
+
+    #[test]
     fn cap_at_refresh_needs_no_pacing() {
         assert!(!cap_needed(240, 240_000));
         assert!(!cap_needed(60, 59_940));
@@ -179,8 +254,14 @@ mod tests {
     #[test]
     fn prediction_uses_the_vblank_grid_when_known() {
         // Grid points 1_000 + k·R; the first after 10_100 is k = 3.
-        assert_eq!(predict_display(10_100, Some(1_000), R), 1_000 + 4 * R);
-        assert_eq!(predict_display(10_100, None, R), 10_100 + 2 * R);
+        assert_eq!(
+            predict_display(10_100, Some(1_000), R),
+            1_000 + (2 + DISPLAY_VBLANKS) * R
+        );
+        assert_eq!(
+            predict_display(10_100, None, R),
+            10_100 + DISPLAY_VBLANKS * R
+        );
     }
 
     #[test]

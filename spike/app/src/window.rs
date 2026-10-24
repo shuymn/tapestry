@@ -10,7 +10,7 @@
 
 use crate::alloc::{self, Scope, Tag, scope};
 use crate::pacing::{
-    DISPLAY_VBLANKS, cap_anchor, cap_needed, cap_step, predict_display, sync_consistent,
+    DISPLAY_VBLANKS, GridTracker, cap_anchor, cap_needed, cap_step, predict_display,
 };
 use crate::render::Renderer;
 use crate::run::{
@@ -57,7 +57,9 @@ struct Gpu {
     instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     window: Arc<Window>,
-    refresh_mhz: u32,
+    /// Exact refresh rate `(numerator, denominator)` Hz of the window's
+    /// display.
+    refresh: (u32, u32),
 }
 
 impl App {
@@ -76,15 +78,16 @@ impl App {
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| format!("create surface: {e}"))?;
-        let refresh_mhz = window
+        let winit_mhz = window
             .current_monitor()
             .and_then(|m| m.refresh_rate_millihertz())
             .unwrap_or(60_000);
+        let refresh = exact_refresh(winit_mhz, &display_refresh_rationals());
         let gpu = Gpu {
             instance,
             surface,
             window,
-            refresh_mhz,
+            refresh,
         };
         let (args, shared, proxy) = (self.args.clone(), self.shared.clone(), self.proxy.clone());
         std::thread::Builder::new()
@@ -153,6 +156,60 @@ pub fn windowed(args: &RunArgs) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Exact refresh rate of every active display path (QueryDisplayConfig),
+/// as `numerator/denominator` Hz; V3 needs the rational, not winit's rounded
+/// integer.
+fn display_refresh_rationals() -> Vec<(u32, u32)> {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, GetDisplayConfigBufferSizes,
+        QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    };
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    let (mut np, mut nm) = (0u32, 0u32);
+    // SAFETY: the buffers are sized from GetDisplayConfigBufferSizes and the
+    // counts are updated to what QueryDisplayConfig wrote.
+    unsafe {
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != ERROR_SUCCESS {
+            return vec![];
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+        if QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut np,
+            paths.as_mut_ptr(),
+            &mut nm,
+            modes.as_mut_ptr(),
+            None,
+        ) != ERROR_SUCCESS
+        {
+            return vec![];
+        }
+        paths.truncate(np as usize);
+        paths
+            .iter()
+            .map(|p| {
+                (
+                    p.targetInfo.refreshRate.Numerator,
+                    p.targetInfo.refreshRate.Denominator,
+                )
+            })
+            .collect()
+    }
+}
+
+/// The exact rational of the window's display: winit reports whole hertz
+/// (59 for a 59.951 Hz mode), so take the active path whose rate truncates
+/// to it; fall back to winit's value.
+fn exact_refresh(winit_mhz: u32, paths: &[(u32, u32)]) -> (u32, u32) {
+    paths
+        .iter()
+        .copied()
+        .filter(|&(_, d)| d > 0)
+        .find(|&(n, d)| n / d == winit_mhz / 1000)
+        .unwrap_or((winit_mhz, 1000))
+}
+
 /// High-resolution waitable timer for the frame cap.
 struct CapTimer(HANDLE);
 
@@ -207,8 +264,8 @@ struct Dxgi {
     /// agrees with a fixed refresh grid: the vblank-grid anchor.
     sync_anchor: Option<i64>,
     sync_count: Option<u32>,
-    /// Previous sync, to check grid consistency.
-    last_sync: Option<(i64, u32)>,
+    /// Trusted refresh grid.
+    grid: GridTracker,
 }
 
 impl Dxgi {
@@ -239,19 +296,19 @@ impl Dxgi {
             return;
         }
         self.last_present_count = s.PresentCount;
-        let cur = (s.SyncQPCTime, s.SyncRefreshCount);
-        // Only a sync that sits on the fixed refresh grid anchors it (with
-        // VRR or composition, refresh counts follow presents instead).
-        if self
-            .last_sync
-            .is_some_and(|prev| sync_consistent(prev, cur, self.period_qpc))
+        // Only a sync on the trusted refresh grid anchors the cap and the
+        // prediction (with VRR or composition, refresh counts follow
+        // presents instead).
+        if !self
+            .grid
+            .observe((s.SyncQPCTime, s.SyncRefreshCount), self.period_qpc)
         {
-            self.sync_anchor = Some(cur.0);
-            self.sync_count = Some(cur.1);
-        } else if self.last_sync.is_some() {
             self.summary.off_grid += 1;
         }
-        self.last_sync = Some(cur);
+        if let Some((q, c)) = self.grid.anchor() {
+            self.sync_anchor = Some(q);
+            self.sync_count = Some(c);
+        }
         self.summary.samples += 1;
         if self.raw.len() < self.raw.capacity() {
             self.raw.push((
@@ -275,8 +332,9 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         instance,
         surface,
         window,
-        refresh_mhz,
+        refresh,
     } = gpu;
+    let refresh_mhz = (u64::from(refresh.0) * 1000 / u64::from(refresh.1.max(1))) as u32;
     let adapter = adapter(&instance, args.adapter, Some(&surface))?;
     let info = adapter.get_info();
     let (dev, queue) = device(&adapter)?;
@@ -303,7 +361,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
             None => (None, None),
         }
     };
-    let period_qpc = qpc_freq() * 1000 / i64::from(refresh_mhz);
+    let period_qpc = qpc_freq() * i64::from(refresh.1) / i64::from(refresh.0.max(1));
     let mut bga = BgaState::open(&args.bga)?;
     let dims = bga.bga.as_ref().map(|b| (b.width, b.height));
     let mut renderer = Renderer::new(dev, queue, config.format, dims);
@@ -325,7 +383,7 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
         summary: DxgiSummary::default(),
         sync_anchor: None,
         sync_count: None,
-        last_sync: None,
+        grid: GridTracker::default(),
     };
     // The cap period in whole refreshes (V3: caps divide the refresh rate).
     let cap = match args.fps_cap {
@@ -479,6 +537,8 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<(), String
     ) = heavy_values(&rec, &due, timeline);
     summary.bga = bga.summary(&due);
     summary.dxgi = Some(dxgi.summary);
+    summary.display_refresh = display_refresh_rationals();
+    summary.refresh_mhz_used = Some(refresh_mhz);
     summary.notes = vec![
         "G7 'displayed' means shown by a presented frame; P5 reconciles it with PresentMon display rows".into(),
         format!(
