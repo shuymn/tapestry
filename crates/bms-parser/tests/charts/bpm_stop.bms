@@ -15,11 +15,12 @@
 #00103:F0
 #00109:01
 #00111:0101
-*  Measure 2: 3 beats long; at beat 1 channel 03 says 180 and channel 08
-*  says 180.5 (08 wins); at beat 2 a half-beat STOP with a note on it.
+*  Measure 2: 3 beats long; at beat 1 channel 08 says 180.5 and channel 03
+*  says 180 (08 wins though written first); at beat 2 a half-beat STOP
+*  with a note on it.
 #00202:0.75
-#00203:00B400
 #00208:000100
+#00203:00B400
 #00209:000002
 #00211:000001
 #00311:01

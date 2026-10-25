@@ -19,6 +19,9 @@ pub struct Timed {
     pub time: TimeUs,
     pub kind: ObjectKind,
     pub line: usize,
+    /// Position of the object in the file, the tie-breaker among objects
+    /// that share a time.
+    pub seq: usize,
 }
 
 /// The chart's objects in time order with the scroll changes.
@@ -177,6 +180,7 @@ pub fn compute(
                             time: at,
                             kind: o.kind,
                             line: o.line,
+                            seq: i,
                         });
                     }
                 }

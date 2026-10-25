@@ -25,8 +25,10 @@
 //!   object (21-29, 61-69, E1-E9) is an `Unsupported` error.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane. The end plays no sound.
-//! - **`#LNTYPE 1` end sound:** the end object's sound when its id differs
-//!   from the start's, otherwise none.
+//! - **`#LNTYPE 1` pairing:** endpoints at one time in a lane merge first,
+//!   keeping the later object in the file, so a duplicated line does not
+//!   split a long note. The end object's sound is the end sound when its id
+//!   differs from the start's, otherwise there is none.
 //! - **Conflicts in a lane:** at one time one note is kept: a long note over
 //!   a tap over a mine, and the later object in the file among equals. A note
 //!   at or inside the span of an earlier long note in its lane, mines

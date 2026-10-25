@@ -157,8 +157,6 @@ pub enum WarningKind {
     UnpairedLongNoteStart,
     /// A long-note end without a start; dropped.
     UnpairedLongNoteEnd,
-    /// A long note that does not end after it starts; dropped.
-    EmptyLongNote,
     /// A note at the same time and lane as a note that won; dropped.
     SameTimeNoteDropped,
     /// A note at or inside the span of an earlier long note in its lane;

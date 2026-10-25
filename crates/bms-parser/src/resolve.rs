@@ -1,6 +1,6 @@
 //! Timed objects to lanes: long-note reconstruction and same-lane conflicts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bms_model::{BgmEvent, LANE_COUNT, Note, NoteKind, SoundId, TimeUs};
 
@@ -61,10 +61,19 @@ pub struct Resolved {
     pub bgm: Vec<BgmEvent>,
 }
 
-/// Builds lanes from objects sorted by time, then file order.
+/// A `#LNTYPE 1` endpoint before pairing.
+#[derive(Clone, Copy)]
+struct Endpoint {
+    time: TimeUs,
+    id: u16,
+    seq: usize,
+    line: usize,
+}
+
+/// Builds lanes from objects sorted by time.
 pub fn resolve(
     objects: &[Timed],
-    lnobj: &[u16],
+    lnobj: &BTreeSet<u16>,
     sounds: &mut Sounds<'_>,
     warnings: &mut Vec<Warning>,
 ) -> Resolved {
@@ -73,9 +82,9 @@ pub fn resolve(
     // Per lane: the last plain note, which an #LNOBJ end may turn into a
     // long note; and an open #LNTYPE 1 start.
     let mut last_plain: [Option<usize>; LANE_COUNT] = [None; LANE_COUNT];
-    let mut open_long: [Option<(usize, TimeUs, u16, usize)>; LANE_COUNT] = [None; LANE_COUNT];
+    let mut endpoints: [Vec<Endpoint>; LANE_COUNT] = Default::default();
 
-    for (order, obj) in objects.iter().enumerate() {
+    for obj in objects {
         let warn = |warnings: &mut Vec<Warning>, kind| {
             warnings.push(Warning {
                 line: Some(obj.line),
@@ -118,40 +127,16 @@ pub fn resolve(
                         sound,
                         kind: NoteKind::Tap,
                     },
-                    order,
+                    obj.seq,
                     obj.line,
                 ));
             }
-            ObjectKind::Long(lane, id) => {
-                let l = lane.index();
-                match open_long[l].take() {
-                    None => open_long[l] = Some((order, obj.time, id, obj.line)),
-                    Some((start_order, start, start_id, start_line)) => {
-                        if start < obj.time {
-                            let sound = sounds.get(start_id, obj.line, warnings);
-                            let end_sound = if id == start_id {
-                                None
-                            } else {
-                                sounds.get(id, obj.line, warnings)
-                            };
-                            candidates[l].push(Candidate::new(
-                                Note {
-                                    time: start,
-                                    sound,
-                                    kind: NoteKind::Long {
-                                        end: obj.time,
-                                        end_sound,
-                                    },
-                                },
-                                start_order,
-                                start_line,
-                            ));
-                        } else {
-                            warn(warnings, WarningKind::EmptyLongNote);
-                        }
-                    }
-                }
-            }
+            ObjectKind::Long(lane, id) => endpoints[lane.index()].push(Endpoint {
+                time: obj.time,
+                id,
+                seq: obj.seq,
+                line: obj.line,
+            }),
             ObjectKind::Mine(lane, id) => {
                 candidates[lane.index()].push(Candidate::new(
                     Note {
@@ -161,22 +146,70 @@ pub fn resolve(
                             damage: i32::from(id),
                         },
                     },
-                    order,
+                    obj.seq,
                     obj.line,
                 ));
             }
             ObjectKind::BpmHex(_) | ObjectKind::BpmRef(_) | ObjectKind::StopRef(_) => {}
         }
     }
-    for &(_, _, _, line) in open_long.iter().flatten() {
-        warnings.push(Warning {
-            line: Some(line),
-            kind: WarningKind::UnpairedLongNoteStart,
-        });
+    for (l, lane) in endpoints.into_iter().enumerate() {
+        pair_long_notes(lane, &mut candidates[l], sounds, warnings);
     }
 
     let lanes = candidates.map(|lane| settle(lane, warnings));
     Resolved { lanes, bgm }
+}
+
+/// Pairs one lane's `#LNTYPE 1` endpoints in time order. Endpoints at one
+/// time merge first, keeping the later object in the file, so a duplicated
+/// line does not split a long note.
+fn pair_long_notes(
+    mut lane: Vec<Endpoint>,
+    out: &mut Vec<Candidate>,
+    sounds: &mut Sounds<'_>,
+    warnings: &mut Vec<Warning>,
+) {
+    lane.sort_by_key(|e| (e.time, e.seq));
+    let mut merged: Vec<Endpoint> = Vec::with_capacity(lane.len());
+    for e in lane {
+        if let Some(last) = merged.last_mut().filter(|last| last.time == e.time) {
+            warnings.push(Warning {
+                line: Some(last.line),
+                kind: WarningKind::SameTimeNoteDropped,
+            });
+            *last = e;
+        } else {
+            merged.push(e);
+        }
+    }
+    let (pairs, open) = merged.as_chunks::<2>();
+    for &[start, end] in pairs {
+        let sound = sounds.get(start.id, start.line, warnings);
+        let end_sound = if end.id == start.id {
+            None
+        } else {
+            sounds.get(end.id, end.line, warnings)
+        };
+        out.push(Candidate::new(
+            Note {
+                time: start.time,
+                sound,
+                kind: NoteKind::Long {
+                    end: end.time,
+                    end_sound,
+                },
+            },
+            start.seq,
+            start.line,
+        ));
+    }
+    if let [open] = open {
+        warnings.push(Warning {
+            line: Some(open.line),
+            kind: WarningKind::UnpairedLongNoteStart,
+        });
+    }
 }
 
 /// Settles one lane: at one time the highest priority wins, then the later
@@ -208,7 +241,7 @@ fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Note> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use bms_model::{Lane, NoteKind, SoundId, TimeUs};
 
@@ -222,6 +255,7 @@ mod tests {
             time: TimeUs(time),
             kind,
             line: usize::try_from(time).unwrap(),
+            seq: 0,
         }
     }
 
@@ -234,7 +268,12 @@ mod tests {
             warned: Vec::new(),
         };
         let mut warnings = Vec::new();
-        let resolved = resolve(objects, &[], &mut sounds, &mut warnings);
+        // File order is the order given.
+        let objects: Vec<Timed> = (0..)
+            .zip(objects)
+            .map(|(seq, o)| Timed { seq, ..*o })
+            .collect();
+        let resolved = resolve(&objects, &BTreeSet::new(), &mut sounds, &mut warnings);
         let notes = resolved.lanes[1]
             .iter()
             .map(|n| (n.time.0, n.sound, n.kind))

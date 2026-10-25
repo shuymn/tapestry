@@ -329,6 +329,30 @@ fn sound_path_escape_is_rejected() {
         load_in(&chart("escape_junction.bms"), dir.path()),
         Err(LoadError::SoundPathEscapes { line: 2 })
     );
+    // The extension fallback is confined too: `link\a.wav` is missing and
+    // `link\a.ogg` lies outside.
+    write_wav(&outside.path().join("a.ogg"));
+    assert_eq!(
+        load_in(&chart("escape_fallback.bms"), dir.path()),
+        Err(LoadError::SoundPathEscapes { line: 2 })
+    );
+}
+
+#[test]
+fn case_variant_name_stays_in_folder() {
+    let dir = folder(&[]);
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    write_wav(&dir.path().join("sub").join("click.wav"));
+    let loaded = load_in(&chart("case_variant.bms"), dir.path()).unwrap();
+    let path = loaded.chart.sounds[0].path.clone();
+    if cfg!(windows) {
+        // Case-insensitive: `SUB\CLICK.WAV` finds the file inside.
+        let path = path.unwrap();
+        assert!(path.starts_with(dir.path().canonicalize().unwrap()));
+        assert!(path.is_file());
+    } else {
+        assert_eq!(path, None);
+    }
 }
 
 /// A directory junction on Windows, a symbolic link elsewhere.
@@ -389,8 +413,8 @@ fn moving_chart_folder_keeps_resolved_hash() {
 #[test]
 fn same_bytes_same_hashes() {
     // Computed at authoring time with `sha256sum` and `md5sum`.
-    const SHA256: &str = "7dd90b738ae9bdb023ca2bfbded4737fc4d804850b333c6bfb69256a8ed3876d";
-    const MD5: &str = "1a864cb1964aad5f5703a1c470f5c534";
+    const SHA256: &str = "313aa9d953946f8cf35af3900e20b598f3b866aa19517aedb409987d0e0b2fa3";
+    const MD5: &str = "f3f28ed064ce1c019ba3b36322ac40ae";
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let dir = folder(&["click.wav"]);
     let bytes = chart("bpm_stop.bms");
@@ -443,4 +467,163 @@ fn empty_chart_loads_with_a_warning() {
         loaded.warnings.iter().map(|w| &w.kind).collect::<Vec<_>>(),
         vec![&WarningKind::NoPlayableNotes]
     );
+}
+
+#[test]
+fn duplicated_lntype1_line_keeps_one_long_note() {
+    let text = "#BPM 120\n#WAV01 click.wav\n#00151:0101\n#00151:0101\n";
+    let loaded = load_text(text).unwrap();
+    assert_eq!(
+        loaded.chart.lanes[1],
+        vec![Note {
+            time: TimeUs(2_000_000),
+            sound: Some(SoundId(0)),
+            kind: NoteKind::Long {
+                end: TimeUs(3_000_000),
+                end_sound: None
+            }
+        }]
+    );
+    assert_eq!(
+        loaded.warnings.iter().map(|w| &w.kind).collect::<Vec<_>>(),
+        vec![&WarningKind::SameTimeNoteDropped; 2]
+    );
+}
+
+#[test]
+fn notes_rounded_to_one_time_keep_the_later_line() {
+    // Measure 0 lasts 2 µs: the first line's note sits at 0.5 µs and the
+    // second line's at 0 µs; both floor to 0, and the later line wins even
+    // though its note comes first in time.
+    let text = "#BPM 120\n#WAV01 click.wav\n#WAV02 click.wav\n#00002:0.000001\n\
+                #00011:00010000\n#00011:02\n";
+    let loaded = load_text(text).unwrap();
+    assert_eq!(
+        loaded.chart.lanes[1],
+        vec![Note {
+            time: TimeUs(0),
+            sound: Some(SoundId(1)),
+            kind: NoteKind::Tap
+        }]
+    );
+}
+
+#[test]
+fn long_note_edge_cases() {
+    let text = "#BPM 120\n#LNOBJ ZZ\n#WAV01 click.wav\n#WAV02 click.wav\n\
+                #00111:ZZ\n\
+                #00152:01\n\
+                #00153:0102\n\
+                #00114:01\n#00214:ZZ\n#00154:00010001\n";
+    let loaded = load_text(text).unwrap();
+    let lanes = &loaded.chart.lanes;
+    // Key 1: an #LNOBJ end without a start is dropped.
+    assert_eq!(lanes[1], vec![]);
+    // Key 2: an unterminated start is dropped.
+    assert_eq!(lanes[2], vec![]);
+    // Key 3: a different end id is the end sound.
+    assert_eq!(
+        lanes[3][0].kind,
+        NoteKind::Long {
+            end: TimeUs(3_000_000),
+            end_sound: Some(SoundId(1))
+        }
+    );
+    // Key 4: a channel 5x long note inside an #LNOBJ one is dropped.
+    assert_eq!(times(&lanes[4]), vec![2_000_000]);
+    assert_eq!(
+        lanes[4][0].kind,
+        NoteKind::Long {
+            end: TimeUs(4_000_000),
+            end_sound: None
+        }
+    );
+    let warned: Vec<_> = loaded.warnings.iter().map(|w| (w.line, &w.kind)).collect();
+    assert_eq!(
+        warned,
+        vec![
+            (Some(5), &WarningKind::UnpairedLongNoteEnd),
+            (Some(6), &WarningKind::UnpairedLongNoteStart),
+            (Some(10), &WarningKind::NoteInsideLongNoteDropped),
+        ]
+    );
+    // An undefined start sound is reported on the start's line.
+    let undefined = load_text("#BPM 120\n#00151:05\n#00251:05\n").unwrap();
+    assert_eq!(
+        undefined
+            .warnings
+            .iter()
+            .map(|w| (w.line, &w.kind))
+            .collect::<Vec<_>>(),
+        vec![(Some(2), &WarningKind::UndefinedReference)]
+    );
+}
+
+#[test]
+fn resolved_hash_matches_golden() {
+    // Computed at authoring time by an independent script encoding the
+    // documented fields of this chart: version 1, 120 BPM, no scroll changes,
+    // one tap at 2 s on key 1 with sound 0, bar lines at 0 and 2 s, the sound
+    // name `a.wav`, an empty title and no other values.
+    const GOLDEN: &str = "79e898e7d73b6464ab8b946c59b58a5e4679e8dc6d3d71b546dce6f52a34a4a5";
+    let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
+    let hex: String = loaded
+        .chart
+        .identity
+        .resolved_hash
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect();
+    assert_eq!(hex, GOLDEN);
+}
+
+#[test]
+fn each_resolved_field_changes_the_resolved_hash() {
+    const BASE: &[&str] = &[
+        "#TITLE t",
+        "#BPM 120",
+        "#RANK 2",
+        "#TOTAL 200",
+        "#WAV01 a.wav",
+        "#WAV02 b.wav",
+        "#00111:01",
+        "#00152:0101",
+        "#00101:02",
+        "#00211:01",
+    ];
+    type Variant<'a> = (&'a str, &'a [(usize, &'a str)], &'a [&'a str]);
+    // Each variant replaces a line or adds lines to change one field.
+    let variants: &[Variant<'_>] = &[
+        ("base", &[], &[]),
+        ("note time", &[(6, "#00111:0001")], &[]),
+        ("note lane", &[(6, "#00113:01")], &[]),
+        ("note sound", &[(6, "#00111:02")], &[]),
+        ("note kind", &[(6, "#001D1:01")], &[]),
+        ("long-note end", &[(7, "#00152:01000001")], &[]),
+        ("end sound", &[(7, "#00152:0102")], &[]),
+        ("BGM time", &[(8, "#00101:0002")], &[]),
+        ("BGM sound", &[(8, "#00101:01")], &[]),
+        ("STOP", &[], &["#STOP01 48", "#00209:0001"]),
+        ("BPM change", &[], &["#00203:00F0"]),
+        ("bar line", &[], &["#00302:0.5"]),
+        ("title", &[(0, "#TITLE u")], &[]),
+        ("rank", &[(2, "#RANK 3")], &[]),
+        ("total", &[(3, "#TOTAL 201")], &[]),
+        ("sound name", &[(5, "#WAV02 c.wav")], &[]),
+    ];
+    let mut seen: Vec<(&str, [u8; 32])> = Vec::new();
+    for &(name, replace, add) in variants {
+        let mut lines = BASE.to_vec();
+        for &(i, line) in replace {
+            lines[i] = line;
+        }
+        lines.extend_from_slice(add);
+        let text = lines.join("\n") + "\n";
+        let hash = load_text(&text).unwrap().chart.identity.resolved_hash;
+        for (other, h) in &seen {
+            assert_ne!(*h, hash, "{name} hashes like {other}");
+        }
+        seen.push((name, hash));
+    }
+    assert_eq!(seen.len(), 16);
 }

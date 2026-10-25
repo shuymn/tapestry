@@ -1,6 +1,6 @@
 //! Text to headers and raw objects, with the text limits of D14.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bms_model::{JudgeRank, Lane, LnMode};
 use num_traits::Signed;
@@ -55,7 +55,8 @@ pub struct Source {
     pub rank: Option<JudgeRank>,
     pub total_milli: Option<i64>,
     pub ln_mode: Option<LnMode>,
-    pub lnobj: Vec<u16>,
+    /// Bounded by the 1295 ids, so lookups stay cheap.
+    pub lnobj: BTreeSet<u16>,
     /// `#xxx02` values, by measure.
     pub measure_lengths: BTreeMap<u16, Defined<Rational>>,
     /// In file order.
@@ -317,7 +318,9 @@ fn parse_header(
             None => ignore(warnings, "#TOTAL"),
         },
         "LNOBJ" => match parse_base36(value.as_bytes()).filter(|&id| id != 0) {
-            Some(id) => source.lnobj.push(id),
+            Some(id) => {
+                source.lnobj.insert(id);
+            }
             None => return Err(invalid("#LNOBJ", "not an object id")),
         },
         "LNTYPE" => {
