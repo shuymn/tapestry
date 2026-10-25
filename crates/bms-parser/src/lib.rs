@@ -205,7 +205,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
             md5,
             resolved_hash: [0; 32],
             loader_version: LOADER_VERSION,
-            random_results: std::mem::take(&mut source.random_results),
+            random_results: source.random_results,
         },
     };
     chart.validate().map_err(LoadError::Model)?;

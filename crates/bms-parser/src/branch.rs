@@ -31,9 +31,9 @@ impl SplitMix64 {
 
 #[derive(Clone, Copy, Debug)]
 enum Frame {
-    /// A `#RANDOM` or `#SETRANDOM` block; `value` is `None` when the block
-    /// sits in a branch not taken, so nothing was drawn.
-    Random { value: Option<u32>, active: bool },
+    /// A `#RANDOM` or `#SETRANDOM` block; `value` is `None` exactly when the
+    /// block sits in a branch not taken, so nothing was drawn.
+    Random { value: Option<u32> },
     /// An `#IF` block: `active` while the current branch is taken, `taken`
     /// once any branch of it was, `parent` whether its block is taken.
     If {
@@ -46,7 +46,8 @@ enum Frame {
 impl Frame {
     const fn active(self) -> bool {
         match self {
-            Self::Random { active, .. } | Self::If { active, .. } => active,
+            Self::Random { value } => value.is_some(),
+            Self::If { active, .. } => active,
         }
     }
 }
@@ -105,11 +106,7 @@ impl Branches {
                     } else {
                         "#SETRANDOM"
                     };
-                    let n = positive_integer(value).ok_or(LoadError::InvalidValue {
-                        line,
-                        what,
-                        reason: "not a positive integer",
-                    })?;
+                    let n = positive_integer(value, line, what)?;
                     let v = if name == "RANDOM" {
                         self.rng.draw(n)
                     } else {
@@ -120,13 +117,7 @@ impl Branches {
                 } else {
                     None
                 };
-                self.push(
-                    Frame::Random {
-                        value,
-                        active: parent,
-                    },
-                    line,
-                )?;
+                self.push(Frame::Random { value }, line)?;
             }
             "IF" => {
                 let random = self.frames.iter().rev().find_map(|f| match f {
@@ -134,11 +125,7 @@ impl Branches {
                     Frame::If { .. } => None,
                 });
                 let taken = if active {
-                    let k = positive_integer(value).ok_or(LoadError::InvalidValue {
-                        line,
-                        what: "#IF",
-                        reason: "not a positive integer",
-                    })?;
+                    let k = positive_integer(value, line, "#IF")?;
                     if random.is_none() {
                         warn(warnings, WarningKind::UnmatchedDirective("#IF"));
                     }
@@ -195,10 +182,8 @@ impl Branches {
                     .iter()
                     .rposition(|f| matches!(f, Frame::Random { .. }))
                 {
-                    if self.frames[i..]
-                        .iter()
-                        .any(|f| matches!(f, Frame::If { .. }))
-                    {
+                    // Every frame above the last #RANDOM is an #IF.
+                    if i + 1 < self.frames.len() {
                         warn(warnings, WarningKind::UnclosedIf);
                     }
                     self.frames.truncate(i);
@@ -232,9 +217,16 @@ impl Branches {
     }
 }
 
-/// A decimal integer in `1..=u32::MAX`.
-fn positive_integer(text: &str) -> Option<u32> {
-    text.parse::<u32>().ok().filter(|&n| n > 0)
+/// A decimal integer in `1..=u32::MAX`, or an error naming `what`.
+fn positive_integer(text: &str, line: usize, what: &'static str) -> Result<u32, LoadError> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or(LoadError::InvalidValue {
+            line,
+            what,
+            reason: "not a positive integer",
+        })
 }
 
 #[cfg(test)]
