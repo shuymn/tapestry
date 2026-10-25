@@ -211,6 +211,19 @@ impl AudioEngine {
         self.play_origin = origin;
     }
 
+    /// BGM events not yet started.
+    #[must_use]
+    pub fn bgm_left(&self) -> usize {
+        self.bgm.len() - self.next_bgm
+    }
+
+    /// Stops the play (an abort): every voice and pending start stops, and
+    /// no remaining BGM event starts. The output stream continues, silent.
+    pub fn stop(&mut self) {
+        self.mixer.stop_all();
+        self.next_bgm = self.bgm.len();
+    }
+
     /// Calls `f` with each scheduled start kept since the last drain, then
     /// forgets them.
     pub fn drain_scheduled(&mut self, mut f: impl FnMut(&Scheduled)) {
