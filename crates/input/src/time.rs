@@ -47,12 +47,11 @@ pub enum Percentile {
 }
 
 /// The distribution of the input thread's wake intervals, in 1 µs buckets
-/// up to [`WAKE_HISTOGRAM_LIMIT`] and one bucket above it, with the exact
-/// maximum. Recording allocates nothing.
+/// up to [`WAKE_HISTOGRAM_LIMIT`]; longer ones are only counted, with the
+/// exact maximum. Recording allocates nothing.
 #[derive(Clone, Debug)]
 pub struct WakeHistogram {
     buckets: Box<[u64]>,
-    above: u64,
     count: u64,
     max: u64,
 }
@@ -69,7 +68,6 @@ impl WakeHistogram {
     pub fn new() -> Self {
         Self {
             buckets: vec![0; WAKE_HISTOGRAM_LIMIT as usize + 1].into_boxed_slice(),
-            above: 0,
             count: 0,
             max: 0,
         }
@@ -77,9 +75,11 @@ impl WakeHistogram {
 
     /// Records one interval in µs.
     pub fn record(&mut self, interval_us: u64) {
-        match self.buckets.get_mut(interval_us as usize) {
-            Some(b) => *b += 1,
-            None => self.above += 1,
+        if let Some(b) = usize::try_from(interval_us)
+            .ok()
+            .and_then(|i| self.buckets.get_mut(i))
+        {
+            *b += 1;
         }
         self.count += 1;
         self.max = self.max.max(interval_us);
