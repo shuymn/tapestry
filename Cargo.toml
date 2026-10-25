@@ -32,6 +32,9 @@ zstd = { version = "0.13.3", default-features = false }
 # input and game
 rtrb = "0.4.0"
 
+# input (Windows only)
+windows = "0.62.2"
+
 # game
 triple_buffer = "9.0.0"
 
