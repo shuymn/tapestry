@@ -418,19 +418,19 @@ mod tests {
     fn r2_rejects_portable_package_depending_on_windows_only_package() {
         let mut crates = baseline();
         crates.push(lib(
-            "input",
+            "render",
             "[package.metadata.tapestry]\nwindows-only = true\n",
         ));
         set(
             &mut crates,
             "xtask",
-            "[dependencies]\ninput = { path = \"../input\" }\n",
+            "[dependencies]\nrender = { path = \"../render\" }\n",
         );
         assert_single(
             &check(&crates),
             &[
                 "R2:",
-                "portable package `xtask` depends on Windows-only package `input`",
+                "portable package `xtask` depends on Windows-only package `render`",
             ],
         );
     }
@@ -439,17 +439,17 @@ mod tests {
     fn r2_rejects_dev_dependency_on_windows_only_package() {
         let mut crates = baseline();
         crates.push(lib(
-            "input",
+            "render",
             "[package.metadata.tapestry]\nwindows-only = true\n",
         ));
         set(
             &mut crates,
             "xtask",
-            "[dev-dependencies]\ninput = { path = \"../input\" }\n",
+            "[dev-dependencies]\nrender = { path = \"../render\" }\n",
         );
         assert_single(
             &check(&crates),
-            &["R2:", "`xtask` depends on Windows-only package `input`"],
+            &["R2:", "`xtask` depends on Windows-only package `render`"],
         );
     }
 
@@ -472,22 +472,22 @@ mod tests {
     fn r3_rejects_dev_tools_forwarded_from_default() {
         let mut crates = baseline();
         crates.push(lib(
-            "input",
+            "render",
             "[package.metadata.tapestry]\nwindows-only = true\n[features]\ndev-tools = []\n",
         ));
         set(
             &mut crates,
             "player",
             "[package.metadata.tapestry]\nwindows-only = true\n\
-             [features]\ndefault = [\"debug\"]\ndebug = [\"input/dev-tools\"]\n\
-             [dependencies]\ninput = { path = \"../input\" }\n",
+             [features]\ndefault = [\"debug\"]\ndebug = [\"render/dev-tools\"]\n\
+             [dependencies]\nrender = { path = \"../render\" }\n",
         );
         assert_single(
             &check(&crates),
             &[
                 "R3:",
                 "`player`",
-                "player/default -> player/debug -> input/dev-tools",
+                "player/default -> player/debug -> render/dev-tools",
             ],
         );
     }
@@ -496,21 +496,21 @@ mod tests {
     fn r3_rejects_dev_tools_requested_by_normal_dependency_in_production() {
         let mut crates = baseline();
         crates.push(lib(
-            "input",
+            "render",
             "[package.metadata.tapestry]\nwindows-only = true\n[features]\ndev-tools = []\n",
         ));
         set(
             &mut crates,
             "player",
             "[package.metadata.tapestry]\nwindows-only = true\n\
-             [dependencies]\ninput = { path = \"../input\", features = [\"dev-tools\"] }\n",
+             [dependencies]\nrender = { path = \"../render\", features = [\"dev-tools\"] }\n",
         );
         assert_single(
             &check(&crates),
             &[
                 "R3:",
                 "production build of `player`",
-                "enables `dev-tools` on `input`",
+                "enables `dev-tools` on `render`",
             ],
         );
     }
@@ -519,15 +519,15 @@ mod tests {
     fn r3_allows_dev_tools_requested_by_dev_dependency() {
         let mut crates = baseline();
         crates.push(lib(
-            "input",
+            "render",
             "[package.metadata.tapestry]\nwindows-only = true\n[features]\ndev-tools = []\n",
         ));
         set(
             &mut crates,
             "player",
             "[package.metadata.tapestry]\nwindows-only = true\n\
-             [dependencies]\ninput = { path = \"../input\" }\n\
-             [dev-dependencies]\ninput = { path = \"../input\", features = [\"dev-tools\"] }\n",
+             [dependencies]\nrender = { path = \"../render\" }\n\
+             [dev-dependencies]\nrender = { path = \"../render\", features = [\"dev-tools\"] }\n",
         );
         assert_eq!(check(&crates), Vec::<String>::new());
     }
@@ -540,7 +540,7 @@ mod tests {
     fn r3_rejects_dev_tools_requested_by_windows_build_dependency() {
         let mut crates = baseline();
         crates.push(lib(
-            "input",
+            "render",
             "[package.metadata.tapestry]\nwindows-only = true\n[features]\ndev-tools = []\n",
         ));
         set(
@@ -548,7 +548,7 @@ mod tests {
             "player",
             "[package.metadata.tapestry]\nwindows-only = true\n\
              [target.'cfg(windows)'.build-dependencies]\n\
-             input = { path = \"../input\", features = [\"dev-tools\"] }\n",
+             render = { path = \"../render\", features = [\"dev-tools\"] }\n",
         );
         let dir = tempfile::tempdir().unwrap();
         write_workspace(dir.path(), &crates);
@@ -559,7 +559,7 @@ mod tests {
             &[
                 "R3:",
                 "production build of `player`",
-                "enables `dev-tools` on `input`",
+                "enables `dev-tools` on `render`",
             ],
         );
     }
