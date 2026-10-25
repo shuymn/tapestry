@@ -178,8 +178,8 @@ impl Chart {
     ///
     /// Returns the first violation: a lane out of time order, a long note
     /// that does not end after it starts, a note starting at or before the
-    /// end of the previous note in its lane, BGM out of time order, or a
-    /// sound outside the sound table.
+    /// end of the previous note in its lane, BGM or bar lines out of time
+    /// order, or a sound outside the sound table.
     pub fn validate(&self) -> Result<(), ModelError> {
         for lane in Lane::all() {
             let notes = &self.lanes[lane.index()];
@@ -209,6 +209,9 @@ impl Chart {
                 return Err(ModelError::BgmUnsorted { index });
             }
             self.check_sound(event.sound)?;
+        }
+        if let Some(index) = self.bar_lines.windows(2).position(|w| w[1] < w[0]) {
+            return Err(ModelError::BarLinesUnsorted { index: index + 1 });
         }
         Ok(())
     }

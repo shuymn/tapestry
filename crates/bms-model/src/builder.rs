@@ -248,6 +248,49 @@ mod tests {
     }
 
     #[test]
+    fn validate_checks_long_note_end_sounds() {
+        let mut chart = ChartBuilder::new(BPM_150)
+            .sound("a.wav")
+            .long(key(6), TimeUs(10), TimeUs(20))
+            .build()
+            .unwrap();
+        for (end_sound, expected) in [
+            (SoundId(0), Ok(())),
+            (
+                SoundId(1),
+                Err(ModelError::UnknownSound { sound: SoundId(1) }),
+            ),
+        ] {
+            chart.lanes[6][0].kind = NoteKind::Long {
+                end: TimeUs(20),
+                end_sound: Some(end_sound),
+            };
+            assert_eq!(chart.validate(), expected);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unsorted_bgm_and_bar_lines() {
+        let mut chart = ChartBuilder::new(BPM_150)
+            .sound("a.wav")
+            .bgm(TimeUs(20), SoundId(0))
+            .bgm(TimeUs(10), SoundId(0))
+            .build()
+            .unwrap();
+        chart.bgm.swap(0, 1);
+        assert_eq!(chart.validate(), Err(ModelError::BgmUnsorted { index: 1 }));
+        chart.bgm.swap(0, 1);
+
+        chart.bar_lines = vec![TimeUs(10), TimeUs(10), TimeUs(20)];
+        assert_eq!(chart.validate(), Ok(()));
+        chart.bar_lines = vec![TimeUs(10), TimeUs(30), TimeUs(20)];
+        assert_eq!(
+            chart.validate(),
+            Err(ModelError::BarLinesUnsorted { index: 2 })
+        );
+    }
+
+    #[test]
     fn builder_bpm_changes_take_thousandths() {
         // 150 BPM: 2.5 millionths of a beat per microsecond; then 60.5 BPM.
         let chart = ChartBuilder::new(BPM_150)

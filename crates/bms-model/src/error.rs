@@ -59,6 +59,11 @@ pub enum ModelError {
         /// Index of the event.
         index: usize,
     },
+    /// A bar line came earlier than the bar line before it.
+    BarLinesUnsorted {
+        /// Index of the bar line.
+        index: usize,
+    },
     /// A note or BGM event named a sound outside the sound table.
     UnknownSound {
         /// The missing sound.
@@ -103,6 +108,9 @@ impl fmt::Display for ModelError {
             }
             Self::BgmUnsorted { index } => {
                 write!(f, "BGM event {index} is earlier than the event before it")
+            }
+            Self::BarLinesUnsorted { index } => {
+                write!(f, "bar line {index} is earlier than the bar line before it")
             }
             Self::UnknownSound { sound } => {
                 write!(f, "sound {} is not in the sound table", sound.0)
