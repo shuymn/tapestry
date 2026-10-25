@@ -10,7 +10,7 @@ use eval::{
     Binding, ControlId, DeviceProfile, InputKind, JudgeEvent, JudgeEventKind, PhysicalInputEvent,
     SourceId, SourceProfile,
 };
-use game::RunnerAudio;
+use game::{Runner, RunnerAudio, Wakes};
 use input::{DeviceKind, ScriptedInput, SourceConfig, autoplay};
 use rules::Judgment;
 
@@ -154,4 +154,23 @@ pub fn count_judged(events: &[JudgeEvent], j: Judgment) -> usize {
         .iter()
         .filter(|e| matches!(e.kind, JudgeEventKind::Judged { judgment, .. } if judgment == j))
         .count()
+}
+
+/// The left channel `runner`'s output recorded.
+pub fn left<O: audio::AudioOutput + Wakes>(runner: &Runner<'_, RecordingOutput<O>>) -> Vec<f32> {
+    runner
+        .audio()
+        .output()
+        .samples()
+        .iter()
+        .step_by(2)
+        .copied()
+        .collect()
+}
+
+/// The frames where sound starts after silence.
+pub fn onsets(left: &[f32]) -> Vec<usize> {
+    (1..left.len())
+        .filter(|&f| left[f - 1] == 0.0 && left[f] != 0.0)
+        .collect()
 }

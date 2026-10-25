@@ -122,7 +122,7 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
     }
 
     /// Runs every engine step whose buffer event is due before `now` (with
-    /// `through`, at `now` too), in time order, and returns how many ran.
+    /// `through`, at `now` too), in time order.
     ///
     /// # Errors
     ///
@@ -132,15 +132,13 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
         now: TimeUs,
         through: bool,
         queue: &mut AudioQueue,
-    ) -> Result<u32, OutputError> {
-        let mut wakes = 0;
+    ) -> Result<(), OutputError> {
         loop {
             let at = self.output.next_wake();
             if at > now || (at == now && !through) {
-                return Ok(wakes);
+                return Ok(());
             }
-            self.engine.step(&mut self.output, queue.commands())?;
-            wakes += 1;
+            self.wake(queue)?;
         }
     }
 

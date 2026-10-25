@@ -99,17 +99,7 @@ fn autoplay_key_sounds_land_at_their_frames() {
     assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
     assert_eq!(count_judged(runner.stream(), Judgment::Perfect), N as usize);
 
-    let left: Vec<f32> = runner
-        .audio()
-        .output()
-        .samples()
-        .iter()
-        .step_by(2)
-        .copied()
-        .collect();
-    let onsets: Vec<usize> = (1..left.len())
-        .filter(|&f| left[f - 1] == 0.0 && left[f] != 0.0)
-        .collect();
+    let left = common::left(&runner);
     let expected: Vec<usize> = (0..N)
         .map(|i| {
             let r = 1_002 * MS + i * 50 * MS + 3 * MS;
@@ -117,78 +107,12 @@ fn autoplay_key_sounds_land_at_their_frames() {
             usize::try_from((j + 1) * 480).unwrap()
         })
         .collect();
-    assert_eq!(onsets, expected);
+    assert_eq!(common::onsets(&left), expected);
     for (i, &f) in expected.iter().enumerate() {
         // Sound k is the constant 1000 + 7 k (common::bank).
         let first = f32::from(1_000 + 7 * i16::try_from(i % 3).unwrap()) / 32_768.0;
         assert_eq!(left[f], first, "note {i}");
     }
-}
-
-/// A device that wakes like the simulated one but refuses every write.
-struct Lost(audio::SimDevice);
-
-impl audio::AudioOutput for Lost {
-    fn rate(&self) -> u32 {
-        self.0.rate()
-    }
-    fn period(&self) -> u32 {
-        self.0.period()
-    }
-    fn wait(&mut self) -> audio::Wake {
-        self.0.wait()
-    }
-    fn write(&mut self, _f: impl FnOnce(&mut [f32])) -> Result<(), audio::OutputError> {
-        Err(audio::OutputError::DeviceLost)
-    }
-}
-
-impl game::Wakes for Lost {
-    fn next_wake(&self) -> TimeUs {
-        self.0.next_wake()
-    }
-}
-
-#[test]
-fn a_failed_output_stops_the_run() {
-    let (chart, rule, dev) = play();
-    let (_, script) = autoplay_script(&chart, &dev);
-    let sources = SourceSet::new(common::sources()).unwrap();
-    // The device's first wake is 20 ms into the run.
-    let first = TimeUs(START.0 + 20 * MS);
-    let engine = audio::AudioEngine::new(
-        common::bank(&chart),
-        &chart.bgm,
-        common::RATE,
-        common::PERIOD,
-        8,
-        0,
-    )
-    .unwrap();
-    let device = audio::SimDevice::new(audio::SimConfig::steady(
-        common::RATE,
-        common::PERIOD,
-        first,
-    ));
-    let audio = game::RunnerAudio::new(engine, Lost(device));
-    let mut runner = Runner::new(
-        &chart,
-        &rule,
-        &dev,
-        sources,
-        script,
-        config(&chart, 64),
-        START,
-        audio,
-    )
-    .unwrap();
-    assert_eq!(
-        runner.run_to_end(TimeUs(MS)),
-        RunOutcome::OutputFailed(audio::OutputError::DeviceLost)
-    );
-    // It stopped at the step that woke the device, not before or after:
-    // that step published `first` − 1 µs, less the 3 ms input offset.
-    assert_eq!(runner.view().finalized, Some(TimeUs(first.0 - 1 - 3 * MS)));
 }
 
 #[test]

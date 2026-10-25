@@ -13,7 +13,7 @@ use audio::{
     Wake,
 };
 use bms_model::{BgmEvent, Chart, ChartBuilder, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, autoplay_script, control, device, lane};
+use common::{MS, PERIOD, RATE, autoplay_script, control, device, lane, left, onsets};
 use game::{AbortCause, LogicConfig, RunOutcome, Runner, RunnerAudio, Wakes};
 use input::{Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceSet};
 
@@ -40,36 +40,14 @@ fn spaced_chart() -> Chart {
     chart
 }
 
-fn audio_on(
+/// An engine with `chart`'s BGM playing into `out`, recording 6 s.
+fn audio_on<O: AudioOutput + Wakes>(
     chart: &Chart,
     bank: Arc<SoundBank>,
-    sim: SimConfig,
-) -> RunnerAudio<RecordingOutput<SimDevice>> {
+    out: O,
+) -> RunnerAudio<RecordingOutput<O>> {
     let engine = AudioEngine::new(bank, &chart.bgm, RATE, PERIOD, 64, 0).unwrap();
-    RunnerAudio::new(
-        engine,
-        RecordingOutput::new(SimDevice::new(sim), 6 * 48_000),
-    )
-}
-
-fn left<O>(runner: &Runner<'_, RecordingOutput<O>>) -> Vec<f32>
-where
-    O: audio::AudioOutput + game::Wakes,
-{
-    runner
-        .audio()
-        .output()
-        .samples()
-        .iter()
-        .step_by(2)
-        .copied()
-        .collect()
-}
-
-fn onsets(left: &[f32]) -> Vec<usize> {
-    (1..left.len())
-        .filter(|&f| left[f - 1] == 0.0 && left[f] != 0.0)
-        .collect()
+    RunnerAudio::new(engine, RecordingOutput::new(out, 6 * 48_000))
 }
 
 fn run_spaced(sim: SimConfig, step: i64) -> (Vec<f32>, SimDevice) {
@@ -78,7 +56,7 @@ fn run_spaced(sim: SimConfig, step: i64) -> (Vec<f32>, SimDevice) {
     let dev = device(&[3 * MS]);
     let (_, script) = autoplay_script(&chart, &dev);
     let sources = SourceSet::new(common::sources()).unwrap();
-    let audio = audio_on(&chart, common::bank(&chart), sim);
+    let audio = audio_on(&chart, common::bank(&chart), SimDevice::new(sim));
     let mut runner =
         Runner::new(&chart, &rule, &dev, sources, script, config(), START, audio).unwrap();
     assert_eq!(runner.run_to_end(TimeUs(step)), RunOutcome::Complete);
@@ -187,15 +165,6 @@ impl Wakes for Flaky {
     }
 }
 
-fn audio_flaky(
-    chart: &Chart,
-    bank: Arc<SoundBank>,
-    out: Flaky,
-) -> RunnerAudio<RecordingOutput<Flaky>> {
-    let engine = AudioEngine::new(bank, &chart.bgm, RATE, PERIOD, 64, 0).unwrap();
-    RunnerAudio::new(engine, RecordingOutput::new(out, 6 * 48_000))
-}
-
 /// One keyboard pressing lane 1 at each of `presses` (released 40 µs
 /// later), and losing focus at `focus`.
 fn key_script(presses: &[i64], focus: Option<i64>) -> ScriptedInput {
@@ -241,7 +210,7 @@ fn late_edge(out: Flaky, step: i64) -> (RunOutcome, Vec<f32>) {
     let dev = device(&[0]);
     let script = key_script(&[1_180 * MS], None);
     let sources = SourceSet::new(common::sources()).unwrap();
-    let audio = audio_flaky(&chart, common::bank(&chart), out);
+    let audio = audio_on(&chart, common::bank(&chart), out);
     let mut runner =
         Runner::new(&chart, &rule, &dev, sources, script, config(), START, audio).unwrap();
     let outcome = runner.run_to_end(TimeUs(step));
@@ -307,7 +276,7 @@ fn a_healthy_backlog_of_sounds_completes() {
         }),
         ..Flaky::new(START, 0)
     };
-    let audio = audio_flaky(&chart, common::bank(&chart), out);
+    let audio = audio_on(&chart, common::bank(&chart), out);
     let config = LogicConfig {
         inputs: 16_384,
         effects: 16_384,
@@ -341,7 +310,7 @@ fn a_stalled_output_ends_the_handoff_instead_of_waiting_forever() {
     let presses: Vec<i64> = (0..1_100).map(|k| 200 * MS + k * 100).collect();
     let script = key_script(&presses, None);
     let sources = SourceSet::new(common::sources()).unwrap();
-    let audio = audio_flaky(&chart, common::bank(&chart), Flaky::new(START, u32::MAX));
+    let audio = audio_on(&chart, common::bank(&chart), Flaky::new(START, u32::MAX));
     let config = LogicConfig {
         inputs: 4_096,
         effects: 4_096,
@@ -363,7 +332,7 @@ fn abort_run(
     click: i64,
     presses: &[i64],
     out: Flaky,
-) -> (RunOutcome, Vec<f32>, usize, usize, usize, usize) {
+) -> (RunOutcome, Vec<f32>, usize, usize, usize) {
     let mut chart = ChartBuilder::new(150_000)
         .sound("long")
         .sound("click")
@@ -394,7 +363,7 @@ fn abort_run(
     let dev = device(&[0]);
     let script = key_script(presses, Some(focus));
     let sources = SourceSet::new(common::sources()).unwrap();
-    let audio = audio_flaky(&chart, bank, out);
+    let audio = audio_on(&chart, bank, out);
     let mut runner =
         Runner::new(&chart, &rule, &dev, sources, script, config(), START, audio).unwrap();
     let outcome = runner.run_to_end(TimeUs(step));
@@ -403,7 +372,6 @@ fn abort_run(
         outcome,
         left(&runner),
         engine.mixer().sounding(),
-        engine.mixer().pending(),
         engine.bgm_left(),
         runner.queued_sounds(),
     )
@@ -416,9 +384,10 @@ fn an_abort_stops_the_sounds_and_the_bgm_to_come() {
     // pressed at 0.985 s was taken by the 0.99 s wake, which wrote nothing,
     // so it waits as a pending start; one pressed at 0.998 s is still
     // queued. The abort comes before the 1 s wake: the click never sounds,
-    // and the long sound, the pending start, the queued sound and the BGM
+    // and the long sound, the pending start (counted as sounding), the
+    // queued sound and the BGM
     // to come all stop.
-    let (outcome, samples, sounding, pending, bgm_left, queued) = abort_run(
+    let (outcome, samples, sounding, bgm_left, queued) = abort_run(
         MS,
         1_000 * MS,
         1_025 * MS,
@@ -429,7 +398,7 @@ fn an_abort_stops_the_sounds_and_the_bgm_to_come() {
     // The long sound was playing (0.25 of full scale), nothing else.
     assert!(samples.contains(&0.25));
     assert!(samples.iter().all(|&x| x <= 0.25), "the click sounded");
-    assert_eq!((sounding, pending, bgm_left, queued), (0, 0, 0, 0));
+    assert_eq!((sounding, bgm_left, queued), (0, 0, 0));
 }
 
 #[test]
@@ -441,10 +410,10 @@ fn a_failed_write_stops_the_sounds_and_the_bgm_to_come() {
         fail_from: TimeUs(1_000 * MS),
         ..Flaky::new(START, 0)
     };
-    let (outcome, _, sounding, pending, bgm_left, queued) =
+    let (outcome, _, sounding, bgm_left, queued) =
         abort_run(MS, 3_000 * MS, 1_025 * MS, &[998 * MS], out);
     assert_eq!(outcome, RunOutcome::OutputFailed(OutputError::DeviceLost));
-    assert_eq!((sounding, pending, bgm_left, queued), (0, 0, 0, 0));
+    assert_eq!((sounding, bgm_left, queued), (0, 0, 0));
 }
 
 #[test]
@@ -453,7 +422,7 @@ fn a_focus_loss_between_coarse_steps_stops_audio_before_its_overdue_wakes() {
     // The wakes from 1.060 s on are overdue then, but come after the loss;
     // the 1.080 s one would write the block holding a click due at
     // 1.105 s. The abort stops audio before any of them runs.
-    let (outcome, samples, sounding, _, bgm_left, _) =
+    let (outcome, samples, sounding, bgm_left, _) =
         abort_run(100 * MS, 1_050 * MS, 1_105 * MS, &[], Flaky::new(START, 0));
     assert_eq!(outcome, RunOutcome::Aborted(AbortCause::FocusLoss));
     assert!(samples.contains(&0.25));
@@ -488,7 +457,7 @@ fn bgm_starts_at_its_chart_time_frames_across_the_lead_in() {
     let audio = audio_on(
         &chart,
         common::bank(&chart),
-        SimConfig::steady(RATE, PERIOD, START),
+        SimDevice::new(SimConfig::steady(RATE, PERIOD, START)),
     );
     let mut runner =
         Runner::new(&chart, &rule, &dev, sources, script, config(), START, audio).unwrap();
@@ -500,4 +469,30 @@ fn bgm_starts_at_its_chart_time_frames_across_the_lead_in() {
         let want = f32::from(1_000 + 7 * i16::try_from(k).unwrap()) / 32_768.0;
         assert_eq!(samples[f], want);
     }
+}
+
+#[test]
+fn a_failed_output_stops_the_run() {
+    // The device's first wake is 20 ms into the run, and every write fails.
+    let first = TimeUs(START.0 + 20 * MS);
+    let chart = spaced_chart();
+    let rule = rules::custom();
+    let dev = device(&[3 * MS]);
+    let (_, script) = autoplay_script(&chart, &dev);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    let out = Flaky {
+        inner: SimDevice::new(SimConfig::steady(RATE, PERIOD, first)),
+        fail_from: TimeUs(i64::MIN),
+        ..Flaky::new(START, 0)
+    };
+    let audio = audio_on(&chart, common::bank(&chart), out);
+    let mut runner =
+        Runner::new(&chart, &rule, &dev, sources, script, config(), START, audio).unwrap();
+    assert_eq!(
+        runner.run_to_end(TimeUs(MS)),
+        RunOutcome::OutputFailed(OutputError::DeviceLost)
+    );
+    // It stopped at the step that woke the device, not before or after:
+    // that step published `first` - 1 us, less the 3 ms input offset.
+    assert_eq!(runner.view().finalized, Some(TimeUs(first.0 - 1 - 3 * MS)));
 }
