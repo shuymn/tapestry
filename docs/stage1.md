@@ -309,8 +309,8 @@ mise exec -- cargo xtask banned-words --all
   pub fn merge(staged: &mut [Staged], device: &DeviceProfile, up_to: TimeUs, out: &mut Vec<PhysicalInputEvent>);
   impl<'a> Evaluator<'a> {
       pub fn new(chart: &'a Chart, rule: &'a RulePreset, device: &'a DeviceProfile, start: &InputStart, input_capacity: usize) -> Result<Self, EvalError>;
-      pub fn push_input(&mut self, ev: PhysicalInputEvent);
-      pub fn advance_to(&mut self, watermark: TimeUs, out: &mut Vec<JudgeEvent>);
+      pub fn push_input(&mut self, ev: PhysicalInputEvent) -> Result<(), PushError>; // Full, Finalized, OutOfOrder; nothing changes
+      pub fn advance_to(&mut self, watermark: TimeUs, out: &mut Vec<JudgeEvent>) -> Result<(), AdvanceError>; // Backward
   }
   pub struct JudgeEvent { pub seq: u64, pub time: TimeUs, pub origin: Option<TimeUs>, pub kind: JudgeEventKind }
   ```

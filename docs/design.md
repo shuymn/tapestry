@@ -196,9 +196,15 @@ In-play adjustment works in the direction of shrinking judgment deviation, so it
 
 - **Receiving**: A dedicated thread receives Raw Input (keyboards, HID dedicated controllers). MIDI is received in a separate callback and normalized to the same format. How times are attached follows the "Time Base (QPC)" section. Even when GameInput is also used, the same device is never ingested twice through two paths.
 - **Keyboard**: Treated as the standard device that people without a dedicated controller use first. Input is recorded by physical key ID, so a standard key layout, scratch assignment, and a screen for checking simultaneous presses (to notice the keyboard's simultaneous-press limits) can be added later within the input layer.
-- **Time**: A QPC time is attached at the moment the event is received (the receive time). The constant delay until the OS delivers it is corrected by the input latency offset.
+- **Time**: A QPC time is attached at the moment the event is received (the receive time). It is the true receive time: the floor of the QPC read taken when the batch was received, the same for every event of that batch. The constant delay until the OS delivers it is corrected by the input latency offset.
 - **Physical input is the source of truth**: What is recorded is "which button or axis of which device changed, when, and how". The mapping to lanes (key config) is recorded, and the evaluator applies it. This also reproduces multiple keys assigned to one lane and per-device debounce.
 - **Debounce**: Not applied at the recording step. The evaluator applies it later as a device setting.
+- **Sources**: One physical device is one source. It owns one queue, one input latency offset, and all its controls, buttons and axes alike; several keyboards are several sources, even when they share a key binding. Sources get anonymous session-local ids (0, 1, … in the order devices are found when recording opens); interface paths, names and serials never enter the input log. Source bookkeeping is preallocated with a fixed maximum, and a device beyond it does not take part; the input log is then marked "incomplete".
+- **Participants are frozen**: The set of participating sources is fixed when play recording opens and does not grow during the play. A device that arrives during play is lifecycle metadata only: its arrival time and kind go into a bounded arrivals list outside the input stream and the watermark, and it takes part from the next play.
+- **What is recorded**: Only controls bound in the key config (lanes and system controls), and only while play recording is open. Unbound controls cannot affect evaluation, so an input log never holds typed text. While recording is closed, the key config screen may capture any control to bind it; nothing captured there is recorded.
+- **Held-input snapshot**: The input thread keeps each device's physical state (pressed controls, last axis values) for the whole run of the game, across retries. A control of a device not seen since the game started counts as released. Recording opens at a boundary between two batches: the held state of the participating sources is copied into the start snapshot of the play, and every event pushed after that point, in stream order, belongs to the play. Input conversion starts a held control as pressed with no press edge, so nothing is judged from it, and its later release is a plain release. A release of a control that is not held changes nothing.
+- **Removal**: Removing a participating device records a disconnect event for its source (see "Analog Scratch" for what input conversion does with it). The source publishes the removal time as its final watermark and is closed. It stays in the watermark minimum until all its queued and staged events are merged, and is retired only then, so a removed device neither stalls the watermark nor loses an event. Removing the last participating device aborts the play.
+- **Focus loss**: Losing focus during play aborts the play. The window's focus-loss notification sets a latch that the input thread checks before each batch, and any Raw Input packet received while the game was in the background is rejected before it can be recorded and trips the latch too. Once the latch is set, nothing more is appended; the play ends at the last finalized watermark and is saved as "ended midway".
 
 ### Analog Scratch
 
@@ -213,8 +219,8 @@ Axis values are recorded raw with timestamps, and the evaluator converts them in
 
 The watermark is the boundary that "no input with an earlier evaluation time will arrive from now on". The evaluation time is the receive time minus the input latency, converted to the chart's timeline.
 
-- Each input device is its own source, with its own dedicated queue and its own input latency offset (devices sharing one receive path, such as several Raw Input devices, are still separate sources). A source puts all the events it has received into its queue, and then publishes the receive time `w_i` at that point. This order is kept. Within one source, events keep their receive order, and because one offset applies to the whole source, that is also their evaluation-time order.
-- The overall watermark is the minimum after converting each source's receive time into an evaluation time: `min_i(w_i − offset_i(w_i))`. The logic thread merges the events of the queues into one stream ordered by evaluation time, with a fixed tie-break, before passing them to the evaluator.
+- Each input device is its own source, with its own dedicated queue and its own input latency offset (devices sharing one receive path, such as several Raw Input devices, are still separate sources). A source puts all the events of a batch into its queue, then reads QPC afresh and publishes `w_i = floor(fresh QPC) − 1 µs`. This order is kept. Any later batch takes its own QPC read after that, so it is stamped at or above the fresh value and never at or below a published `w_i`; receive times stay true. Within one source, events keep their receive order, and because one offset applies to the whole source, that is also their evaluation-time order.
+- The overall watermark is the minimum, over the participating sources not yet retired (see "Removal" under "Input"), after converting each source's receive time into an evaluation time: `min_i(w_i − offset_i(w_i))`. When every source is retired there is no watermark, which only happens when the play is aborted. The logic thread merges the events of the queues into one stream ordered by evaluation time, with a fixed tie-break (source index, then the order within the source), before passing them to the evaluator.
 - For sources that deliver nothing on their own, such as a MIDI device with no input, the input thread periodically publishes on their behalf a notice that "there is nothing up to this time" (a receive-time update), so the watermark does not stall.
 - Events with the same time as the watermark are guaranteed to have been published before the watermark is published.
 - The input thread wakes at least at 1 kHz and advances the watermark even when there are no new events.
@@ -228,13 +234,15 @@ The watermark is the boundary that "no input with an earlier evaluation time wil
 The evaluator is a discrete-event processing system that puts input events and note deadlines (miss for an unhit note, LN release, HCN gauge increase and decrease, mines, song end) in a single queue and processes them in time order. It depends neither on frames nor on a fixed time step.
 
 ```
-pub struct Evaluator { /* Judgment state. Does not own the chart itself; references it */ }
+pub struct Evaluator<'a> { /* Judgment state. Does not own the chart itself; references it */ }
 
-impl Evaluator {
-    pub fn new(chart: &Chart, rule: &RulePreset, device: &DeviceProfile) -> Self;
-    pub fn push_input(&mut self, ev: PhysicalInputEvent);
+impl<'a> Evaluator<'a> {
+    /// Input conversion starts from the start snapshot (held controls are pressed, with no press edge)
+    pub fn new(chart: &'a Chart, rule: &'a RulePreset, device: &'a DeviceProfile, start: &InputStart, input_capacity: usize) -> Result<Self, EvalError>;
+    /// Refuses (without change) an input beyond the fixed capacity, at or before the finalized watermark, or earlier than the last one
+    pub fn push_input(&mut self, ev: PhysicalInputEvent) -> Result<(), PushError>;
     /// Finalizes events up to the watermark and appends judgment events to out
-    pub fn advance_to(&mut self, watermark: Micros, out: &mut Vec<JudgeEvent>);
+    pub fn advance_to(&mut self, watermark: Micros, out: &mut Vec<JudgeEvent>) -> Result<(), AdvanceError>; // refuses a backward watermark
 }
 
 /// Batch evaluation used for results, replays, and IR. Internally push_input and advance_to(end)
@@ -806,7 +814,7 @@ Rust is recommended as the core language. The evaluator can be shared between th
 | L0 | `bms-model` | Chart types, time (µs) types |
 | L1 | `bms-parser` | Loading BMS/BME/PMS/BMSON, `#RANDOM`, time computation with rational numbers |
 | L2 | `rules` | Preset types, validation and canonical encoding, judgment window and gauge tables. Takes no external dependency; loading preset files (TOML) sits in `game`, so `eval`'s dependency closure stays free of external crates |
-| L2 | `eval` | The evaluator. Depends only on `bms-model` and `rules` |
+| L2 | `eval` | The evaluator and its input contract (physical input events, device profile, start snapshot, watermark and merge), which `input` and `replay` use. Depends only on `bms-model` and `rules` |
 | L2 | `replay` | Input log and replay formats |
 | L3 | `input`, `audio` | Raw Input/HID/MIDI, WASAPI/ASIO and the mixer |
 | L4 | `game` | Logic thread, session policy, publishing the state snapshot |
@@ -866,7 +874,7 @@ The input thread, the logic thread, the audio callback, and the per-frame work o
 | Chart time | Measure positions (rational numbers) are accumulated into time, segment by segment between BPM changes and STOPs. Values with a BPM of 0 or less, a zero denominator, or too many decimal digits are rejected. The order of a BPM change and a STOP at the same position, and how negative values are rounded, are fixed as rules. Rounding to µs is done only once, at the end |
 | Scroll position | From BPM, STOP, and scroll speed changes, a piecewise linear function from time to display position is built at load time. STOP segments have a slope of 0. Reverse scrolling is out of scope; on the premise that the display position never decreases with time, the visible range is found per segment by binary search |
 | Hi-speed | Two methods are kept distinct. The base-BPM method matches the green number (the time a note is visible) at the main BPM, but the visible time changes when the BPM changes. The constant-visible-time method keeps the green number regardless of BPM. Lane cover and lift positions are included in the visible range calculation |
-| Evaluation event processing | Per-lane note deadlines, deadlines for scratch release, debounce, HCN, and song end, and the input stream are taken out in a fixed total order (time, then kind, then lane, then sequence number). The per-lane streams are already in time order, so this is lighter than pushing everything into a priority queue |
+| Evaluation event processing | Per-lane note deadlines, deadlines for scratch release, debounce, HCN, and song end, and the input stream are taken out in a fixed total order by time. At equal times, inputs come before deadlines (a preset item); inputs keep the merged stream's order (source index, then the order within the source), and deadlines are ordered by kind, then lane, then sequence number. The per-lane streams are already in time order, so this is lighter than pushing everything into a priority queue |
 | Note assignment | Each lane keeps a position pointing at its first unprocessed note, and only notes within the judgment window are candidates. How to choose among candidates is decided by a preset choice |
 | Debounce | Handled by a small state machine per button. Changes that are too short are dropped, but so that dropping a release does not leave a key held down, the final state always returns to the actual state. When multiple buttons are assigned to one lane, the lane is pressed if any of them is pressed |
 | Analog scratch | Axis values are converted into a continuous position, taking wraparound into account, and changes in position are accumulated (for devices that report deltas, the deltas are used as is and not accumulated twice). Separate thresholds for press and release (hysteresis) are used, and a reversal of the rotation direction is treated as a new press. The release at a fixed time after movement stops is handled as an evaluator deadline |
