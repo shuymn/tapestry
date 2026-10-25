@@ -103,7 +103,11 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
     }
 
     /// Steps the clock by `step` until evaluation completes or the play is
-    /// aborted.
+    /// aborted. Audio buffer events that fell between two steps run before
+    /// the later step's logic, in time order, so none takes a key sound
+    /// judged after it. An abort stops the audio before anything more is
+    /// mixed. Once evaluation completes, the audio alone keeps running
+    /// until every queued key sound has been taken.
     ///
     /// # Panics
     ///
@@ -117,19 +121,40 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
             if self.sources.gate().is_tripped() {
                 self.logic.abort(AbortCause::FocusLoss);
             }
+            // Buffer events that fell between the previous step and this
+            // one came before this step's logic, so they must not see the
+            // commands it emits.
+            if let Err(e) = self.audio.step(now, false, &mut self.sounds) {
+                return RunOutcome::OutputFailed(e);
+            }
             let advance = self.logic.advance_to(now);
             self.stream.extend_from_slice(self.logic.events());
-            if let Err(e) = self.audio.step(now, &mut self.sounds) {
+            if let Some(cause) = advance.aborted {
+                self.audio.cancel(&mut self.sounds);
+                self.render_step();
+                return RunOutcome::Aborted(cause);
+            }
+            if let Err(e) = self.audio.step(now, true, &mut self.sounds) {
                 return RunOutcome::OutputFailed(e);
             }
             self.render_step();
-            if let Some(cause) = advance.aborted {
-                return RunOutcome::Aborted(cause);
-            }
             if advance.complete {
-                return RunOutcome::Complete;
+                return self.finish_handoff(step);
             }
         }
+    }
+
+    /// After evaluation completes, keeps the audio running, with input and
+    /// evaluation frozen, until every queued key sound has been taken, so
+    /// the last one is mixed. (How long the tail plays on is session policy.)
+    fn finish_handoff(&mut self, step: TimeUs) -> RunOutcome {
+        while !self.sounds.is_empty() {
+            self.clock.advance(step);
+            if let Err(e) = self.audio.step(self.clock.now(), true, &mut self.sounds) {
+                return RunOutcome::OutputFailed(e);
+            }
+        }
+        RunOutcome::Complete
     }
 
     /// The render step: drains the effects and reads the newest view.

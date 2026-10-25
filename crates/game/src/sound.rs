@@ -55,6 +55,12 @@ impl AudioQueue {
         &mut self.cmds
     }
 
+    /// Whether no key sound is waiting.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cmds.is_empty()
+    }
+
     /// Sounds dropped because the queue was full.
     #[must_use]
     pub fn dropped(&self) -> u64 {
@@ -109,7 +115,8 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
         &self.output
     }
 
-    /// Runs every engine step whose buffer event is due by `now`.
+    /// Runs every engine step whose buffer event is due before `now` (with
+    /// `through`, at `now` too), in time order.
     ///
     /// # Errors
     ///
@@ -117,13 +124,24 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
     pub(crate) fn step(
         &mut self,
         now: TimeUs,
+        through: bool,
         queue: &mut AudioQueue,
     ) -> Result<StepReport, OutputError> {
         let mut last = StepReport::default();
-        while self.output.next_wake() <= now {
+        loop {
+            let at = self.output.next_wake();
+            if at > now || (at == now && !through) {
+                return Ok(last);
+            }
             last = self.engine.step(&mut self.output, queue.commands())?;
         }
-        Ok(last)
+    }
+
+    /// Stops the play's audio (an abort): voices, pending starts and the
+    /// remaining BGM stop, and queued key sounds are discarded.
+    pub(crate) fn cancel(&mut self, queue: &mut AudioQueue) {
+        self.engine.stop();
+        while queue.commands().pop().is_ok() {}
     }
 }
 
