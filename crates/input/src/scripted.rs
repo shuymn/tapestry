@@ -32,11 +32,14 @@ pub struct ScriptItem {
 
 /// Feeds a script to a [`SourceSet`] as the clock reaches each item. Items
 /// with the same time form one batch, and every poll ends with a
-/// publication, as the input thread's wake does.
+/// publication, as the input thread's wake does. A device the script
+/// connects gets the recorded controls given by
+/// [`with_recorded`](Self::with_recorded).
 #[derive(Clone, Debug)]
 pub struct ScriptedInput {
     items: Vec<ScriptItem>,
     next: usize,
+    recorded: Vec<(DeviceId, Vec<ControlId>)>,
 }
 
 impl ScriptedInput {
@@ -45,14 +48,26 @@ impl ScriptedInput {
     #[must_use]
     pub fn new(mut items: Vec<ScriptItem>) -> Self {
         items.sort_by_key(|i| i.at);
-        Self { items, next: 0 }
+        Self {
+            items,
+            next: 0,
+            recorded: Vec::new(),
+        }
+    }
+
+    /// Records `controls` from `device` when the script connects it.
+    #[must_use]
+    pub fn with_recorded(mut self, device: DeviceId, controls: Vec<ControlId>) -> Self {
+        self.recorded.push((device, controls));
+        self
     }
 
     /// A script that replays a recorded play. Source `i` becomes device
     /// `DeviceId(i)` of kind `kinds[i]`; the devices connect and press the
     /// held controls at the first poll, which must come before recording
-    /// opens at `start.opened_at`. The events follow at their receive
-    /// times, so polls after the opening record them again.
+    /// opens at `start.opened_at`. Each device records the controls its
+    /// source has in the log. The events follow at their receive times, so
+    /// polls after the opening record them again.
     #[must_use]
     pub fn from_log(
         start: &InputStart,
@@ -90,7 +105,27 @@ impl ScriptedInput {
                 InputKind::Disconnected => Action::Disconnect(device(ev.source)),
             },
         }));
-        Self::new(items)
+        let mut script = Self::new(items);
+        for i in 0..kinds.len() {
+            let source = SourceId(u16::try_from(i).expect("a log's sources fit in u16"));
+            let mut controls: Vec<ControlId> =
+                start
+                    .held
+                    .iter()
+                    .filter(|h| h.0 == source)
+                    .map(|h| h.1)
+                    .chain(events.iter().filter(|e| e.source == source).filter_map(
+                        |e| match e.kind {
+                            InputKind::Control { control, .. } => Some(control),
+                            InputKind::Disconnected => None,
+                        },
+                    ))
+                    .collect();
+            controls.sort_unstable();
+            controls.dedup();
+            script = script.with_recorded(device(source), controls);
+        }
+        script
     }
 
     /// Whether every item has been fed.
@@ -111,7 +146,14 @@ impl InputAdapter for ScriptedInput {
             {
                 self.next += 1;
                 match item.action {
-                    Action::Connect(device, kind) => sources.connect(device, kind),
+                    Action::Connect(device, kind) => {
+                        sources.connect(device, kind);
+                        if let Some((_, controls)) =
+                            self.recorded.iter().find(|(d, _)| *d == device)
+                        {
+                            sources.set_recorded(device, controls.clone());
+                        }
+                    }
                     Action::Disconnect(device) => sources.disconnect(device),
                     Action::Packet(p) => {
                         sources.packet(&p);
@@ -173,8 +215,13 @@ pub fn autoplay(
                 NoteKind::Mine { .. } => continue,
                 NoteKind::Long { end, .. } => end,
                 NoteKind::Tap => {
-                    let held = add(note.time, TAP_HOLD)?;
-                    notes.get(i + 1).map_or(held, |next| held.min(next.time))
+                    // The minimum is taken in i128, so a next note before
+                    // an unrepresentable hold end still gives a release.
+                    let held = i128::from(note.time.0) + i128::from(TAP_HOLD.0);
+                    let release = notes
+                        .get(i + 1)
+                        .map_or(held, |next| held.min(i128::from(next.time.0)));
+                    TimeUs(i64::try_from(release).map_err(|_| TimeOverflow)?)
                 }
             };
             events.push(ev(note.time, control, 1)?);

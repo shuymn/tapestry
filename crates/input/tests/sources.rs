@@ -28,7 +28,6 @@ fn config() -> SourceConfig {
         max_held: 16,
         queue_capacity: 1024,
         max_arrivals: 2,
-        recorded: vec![(DeviceKind::Keyboard, vec![A, B, C])],
     }
 }
 
@@ -53,12 +52,18 @@ fn drain(reader: &mut SourceReader) -> Vec<PhysicalInputEvent> {
     std::iter::from_fn(|| reader.pop()).collect()
 }
 
+/// Connects `device`, recording the bound keys A, B and C from it.
+fn plug(set: &mut SourceSet, device: DeviceId, kind: DeviceKind) {
+    set.connect(device, kind);
+    set.set_recorded(device, vec![A, B, C]);
+}
+
 /// A set with keyboards `0..n` connected, in that order.
 fn keyboards(n: u64) -> SourceSet {
     let mut set = SourceSet::new(config()).unwrap();
     set.begin_batch(TimeUs(0));
     for d in 0..n {
-        set.connect(DeviceId(d), DeviceKind::Keyboard);
+        plug(&mut set, DeviceId(d), DeviceKind::Keyboard);
     }
     set.end_batch(TimeUs(0));
     set
@@ -87,7 +92,7 @@ fn events_published_before_watermark_are_visible() {
     })
     .unwrap();
     set.begin_batch(TimeUs(-1));
-    set.connect(DeviceId(0), DeviceKind::Keyboard);
+    plug(&mut set, DeviceId(0), DeviceKind::Keyboard);
     set.open_recording(TimeUs(-1));
     let mut reader = set.take_readers().pop().unwrap();
     let consumed = Arc::new(AtomicI64::new(0));
@@ -208,7 +213,7 @@ fn overflow_is_flagged_never_silent() {
     })
     .unwrap();
     set.begin_batch(TimeUs(0));
-    set.connect(DeviceId(0), DeviceKind::Keyboard);
+    plug(&mut set, DeviceId(0), DeviceKind::Keyboard);
     set.open_recording(TimeUs(0));
     let mut readers = set.take_readers();
     let controls = [A, B, C, A, B, C];
@@ -249,7 +254,7 @@ fn arrival_stays_out_of_stream_and_watermark() {
     set.open_recording(TimeUs(0));
     let mut readers = set.take_readers();
     assert!(set.begin_batch(TimeUs(50)));
-    set.connect(DeviceId(7), DeviceKind::Controller);
+    plug(&mut set, DeviceId(7), DeviceKind::Controller);
     set.packet(&key(7, A, 1));
     set.end_batch(TimeUs(60));
     assert_eq!(
@@ -278,7 +283,7 @@ fn full_arrivals_list_drops_and_counts() {
     set.open_recording(TimeUs(0));
     set.begin_batch(TimeUs(5));
     for d in 10..13 {
-        set.connect(DeviceId(d), DeviceKind::Keyboard);
+        plug(&mut set, DeviceId(d), DeviceKind::Keyboard);
     }
     assert_eq!(set.arrivals().len(), 2);
     assert_eq!(set.arrivals_dropped(), 1);
@@ -309,7 +314,7 @@ fn focus_script() -> Vec<ScriptItem> {
 #[test]
 fn bound_keys_after_focus_loss_are_never_recorded() {
     let mut set = SourceSet::new(config()).unwrap();
-    let mut script = ScriptedInput::new(focus_script());
+    let mut script = ScriptedInput::new(focus_script()).with_recorded(DeviceId(0), vec![A, B, C]);
     script.poll(TimeUs(0), &mut set);
     set.open_recording(TimeUs(0));
     let mut readers = set.take_readers();
@@ -488,7 +493,7 @@ fn closed_source_keeps_its_final_watermark() {
 fn reconnecting_a_known_device_adds_no_source() {
     let mut set = keyboards(2);
     set.begin_batch(TimeUs(5));
-    set.connect(DeviceId(1), DeviceKind::Controller);
+    plug(&mut set, DeviceId(1), DeviceKind::Controller);
     set.open_recording(TimeUs(10));
     assert_eq!(
         set.participants().collect::<Vec<_>>(),
@@ -510,7 +515,7 @@ fn source_and_device_limits_mark_the_log_incomplete() {
     .unwrap();
     set.begin_batch(TimeUs(0));
     for d in [4, 5, 6] {
-        set.connect(DeviceId(d), DeviceKind::Keyboard);
+        plug(&mut set, DeviceId(d), DeviceKind::Keyboard);
     }
     set.open_recording(TimeUs(1));
     assert!(set.source_limited());
@@ -524,7 +529,7 @@ fn source_and_device_limits_mark_the_log_incomplete() {
     .unwrap();
     set.begin_batch(TimeUs(0));
     for d in [4, 5, 6] {
-        set.connect(DeviceId(d), DeviceKind::Keyboard);
+        plug(&mut set, DeviceId(d), DeviceKind::Keyboard);
     }
     set.open_recording(TimeUs(1));
     assert!(set.source_limited());
@@ -543,7 +548,7 @@ fn full_held_state_marks_the_log_incomplete() {
     })
     .unwrap();
     set.begin_batch(TimeUs(0));
-    set.connect(DeviceId(3), DeviceKind::Keyboard);
+    plug(&mut set, DeviceId(3), DeviceKind::Keyboard);
     set.open_recording(TimeUs(1));
     batch(&mut set, 10, &[key(3, A, 1), key(3, B, 2)], 11);
     assert!(!set.overflowed());
@@ -555,7 +560,7 @@ fn full_held_state_marks_the_log_incomplete() {
     assert!(set.overflowed());
     // A device that arrives and loses state does not take part: no flag.
     set.begin_batch(TimeUs(35));
-    set.connect(DeviceId(4), DeviceKind::Keyboard);
+    plug(&mut set, DeviceId(4), DeviceKind::Keyboard);
     batch(
         &mut set,
         40,
@@ -566,7 +571,7 @@ fn full_held_state_marks_the_log_incomplete() {
     // this opening, still makes the play incomplete.
     set.begin_batch(TimeUs(50));
     set.disconnect(DeviceId(3));
-    set.connect(DeviceId(3), DeviceKind::Keyboard);
+    plug(&mut set, DeviceId(3), DeviceKind::Keyboard);
     set.open_recording(TimeUs(60));
     assert!(set.overflowed());
     set.begin_batch(TimeUs(70));
@@ -584,46 +589,50 @@ fn arrival_losing_state_during_play_leaves_the_log_complete() {
     })
     .unwrap();
     set.begin_batch(TimeUs(0));
-    set.connect(DeviceId(1), DeviceKind::Keyboard);
+    plug(&mut set, DeviceId(1), DeviceKind::Keyboard);
     set.open_recording(TimeUs(5));
     set.begin_batch(TimeUs(10));
-    set.connect(DeviceId(2), DeviceKind::Keyboard);
+    plug(&mut set, DeviceId(2), DeviceKind::Keyboard);
     batch(&mut set, 20, &[key(2, A, 1), key(2, B, 2)], 21);
     assert!(!set.overflowed());
 }
 
 #[test]
-fn bindings_are_per_source_kind() {
-    const D: ControlId = ControlId(0x101);
-    let mut set = SourceSet::new(SourceConfig {
-        recorded: vec![
-            (DeviceKind::Keyboard, vec![A]),
-            (DeviceKind::Controller, vec![D]),
-        ],
-        ..config()
-    })
-    .unwrap();
+fn bindings_are_per_device() {
+    const X: ControlId = ControlId(0x101);
+    const Y: ControlId = ControlId(0x102);
+    let mut set = SourceSet::new(config()).unwrap();
     set.begin_batch(TimeUs(0));
-    set.connect(DeviceId(5), DeviceKind::Keyboard);
+    // Two controllers of different models, each with its own binding.
+    set.connect(DeviceId(5), DeviceKind::Controller);
     set.connect(DeviceId(6), DeviceKind::Controller);
-    // Each device holds its own control and the other's.
+    assert!(set.set_recorded(DeviceId(5), vec![X]));
+    assert!(set.set_recorded(DeviceId(6), vec![Y]));
+    assert!(!set.set_recorded(DeviceId(9), vec![X]));
+    // Each holds its own control and the other's.
     batch(
         &mut set,
         10,
-        &[key(5, A, 1), key(5, D, 2), key(6, A, 3), key(6, D, 4)],
+        &[key(5, X, 1), key(5, Y, 2), key(6, X, 3), key(6, Y, 4)],
         11,
     );
     let start = set.open_recording(TimeUs(20));
     let mut readers = set.take_readers();
-    assert_eq!(start.held, [(SourceId(0), A, 1), (SourceId(1), D, 4)]);
+    assert_eq!(start.held, [(SourceId(0), X, 1), (SourceId(1), Y, 4)]);
     batch(
         &mut set,
         30,
-        &[key(5, A, 0), key(5, D, 0), key(6, A, 0), key(6, D, 0)],
+        &[key(5, X, 0), key(5, Y, 0), key(6, X, 0), key(6, Y, 0)],
         31,
     );
-    assert_eq!(drain(&mut readers[0]), [ev(30, 0, A, 0)]);
-    assert_eq!(drain(&mut readers[1]), [ev(30, 1, D, 0)]);
+    assert_eq!(drain(&mut readers[0]), [ev(30, 0, X, 0)]);
+    assert_eq!(drain(&mut readers[1]), [ev(30, 1, Y, 0)]);
+    // A change applies from the next opening.
+    assert!(set.set_recorded(DeviceId(5), vec![Y]));
+    batch(&mut set, 40, &[key(5, X, 5)], 41);
+    assert_eq!(drain(&mut readers[0]), [ev(40, 0, X, 5)]);
+    let start = set.open_recording(TimeUs(50));
+    assert!(start.held.is_empty());
 }
 
 #[test]
@@ -725,5 +734,19 @@ fn autoplay_refuses_times_outside_the_range() {
     assert_eq!(
         autoplay(&chart, &profile(fits + 1)),
         Err(input::TimeOverflow)
+    );
+    // The hold would end past the range, but the lane's next note comes
+    // first, so the release is representable.
+    let late = ChartBuilder::new(120_000)
+        .tap(lane, TimeUs(i64::MAX - 100))
+        .mine(lane, TimeUs(i64::MAX - 50), 10)
+        .build()
+        .unwrap();
+    assert_eq!(
+        autoplay(&late, &profile(0)),
+        Ok(vec![
+            ev(i64::MAX - 100, 0, A, 1),
+            ev(i64::MAX - 50, 0, A, 0)
+        ])
     );
 }

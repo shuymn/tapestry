@@ -61,12 +61,12 @@ fn batches_do_not_allocate() {
         max_held: 2,
         queue_capacity: QUEUE,
         max_arrivals: 1,
-        recorded: vec![(DeviceKind::Keyboard, controls.to_vec())],
     })
     .unwrap();
     set.begin_batch(TimeUs(0));
     for d in 0..3 {
         set.connect(DeviceId(d), DeviceKind::Keyboard);
+        set.set_recorded(DeviceId(d), controls.to_vec());
     }
     set.open_recording(TimeUs(0));
     let mut readers = set.take_readers();

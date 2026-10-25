@@ -50,11 +50,6 @@ pub struct SourceConfig {
     pub queue_capacity: usize,
     /// Arrivals kept per play.
     pub max_arrivals: usize,
-    /// The controls recorded for each kind of device: its lane and system
-    /// bindings (keyboard bindings are shared by every keyboard). Each
-    /// source freezes its kind's list when recording opens; other controls
-    /// change only the physical state. A kind not listed records nothing.
-    pub recorded: Vec<(DeviceKind, Vec<ControlId>)>,
 }
 
 /// A known device and its physical state.
@@ -66,6 +61,9 @@ struct Device {
     held: Vec<(ControlId, i32)>,
     /// Its source while it takes part in the open recording.
     source: Option<SourceId>,
+    /// The controls recorded from it: its lane and system bindings, set by
+    /// [`SourceSet::set_recorded`].
+    recorded: Vec<ControlId>,
     /// A held control did not fit, so `held` may miss one. Kept until the
     /// device is removed; every play it takes part in is incomplete.
     state_lost: bool,
@@ -232,6 +230,7 @@ impl SourceSet {
                 kind,
                 held,
                 source: None,
+                recorded: Vec::new(),
                 state_lost: false,
             });
         } else {
@@ -246,6 +245,23 @@ impl SourceSet {
             } else {
                 rec.arrivals_dropped += 1;
             }
+        }
+    }
+
+    /// Sets the controls recorded from `device`: its lane and system
+    /// bindings, worked out by the caller (keyboards share one list by scan
+    /// code; each controller has its own). Other controls change only the
+    /// physical state, and a device without a list records nothing. The
+    /// list is frozen per source when recording opens, so a change applies
+    /// from the next opening. Call it outside play: it may allocate.
+    /// Returns `false` for a device that is not connected.
+    pub fn set_recorded(&mut self, device: DeviceId, controls: Vec<ControlId>) -> bool {
+        match self.devices.iter_mut().find(|d| d.id == device) {
+            Some(d) => {
+                d.recorded = controls;
+                true
+            }
+            None => false,
         }
     }
 
@@ -312,13 +328,7 @@ impl SourceSet {
             let source = SourceId(u16::try_from(i).expect("source ids fit in u16"));
             device.source = Some(source);
             overflowed |= device.state_lost;
-            let recorded = self
-                .config
-                .recorded
-                .iter()
-                .find(|(kind, _)| *kind == device.kind)
-                .map(|(_, controls)| controls.clone())
-                .unwrap_or_default();
+            let recorded = device.recorded.clone();
             held.extend(
                 device
                     .held
