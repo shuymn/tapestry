@@ -100,12 +100,12 @@ Values and behaviors are chosen by what the player experiences, and the owner ch
 | LN mode | LN: only the head is judged, as a tap | Holding to the end matters, but the release need not be exact |
 | LN early release | Release earlier than end − 100 ms after a scored head: an "LN break". The head's judgment, counts and EX score stay; combo breaks, BP +1, gauge takes POOR damage, and `ln_breaks` +1. The LN is finished, and a re-press is an ordinary press on the lane | Letting go early costs the combo, not the score already earned |
 | Late head after a short LN's end | A head pressed within its late window but after the LN's end is judged by its deviation, and the LN counts as completed at the press; the following release is ignored | Very short LNs behave like taps |
-| Mines | Damage the gauge by the chart's value when the lane is held as the mine passes; no judgment, combo or BP effect | — |
+| Mines | Damage every gauge by the chart's value when the lane is held as the mine passes, at 0.5 percentage points per unit of the value (the chart's own unit; `1E` = 50 units = 25 %). The damage applies as is: the survival gauge's low-gauge halving does not reduce it. No judgment, combo or BP effect | — |
 | Gauge denominator | Judgeable notes = taps + LN heads; mines excluded | — |
-| `#RANK` scale | 0: 50 %, 1: 75 %, 2: 100 %, 3: 125 %; `#DEFEXRANK n`: n % | Harder ranks shrink every window by one factor |
+| `#RANK` scale | 0: 50 %, 1: 75 %, 2: 100 %, 3: 125 %; `#DEFEXRANK n`: n %; no rank, or a `#RANK` outside 0-3 (an extension this preset does not support): 100 %. Each window edge is scaled in µs and floored | Harder ranks shrink every window by one factor |
 | `#TOTAL` absent | 160 | An all-PERFECT play fills the normal gauge from 20 % to full at about half the chart |
 | Normal gauge (decided at the end) | Start 20 %, clear 80 %, PERFECT and GREAT +TOTAL/notes, GOOD half of that, BAD −2 %, POOR −6 %, floor 2 % | — |
-| Survival gauge | Start 100 %, PERFECT +0.16 %, GREAT +0.16 %, GOOD 0, BAD −5 %, POOR −9 %; damage is halved when the value before the change is below 30 % (exactly 30 % takes full damage) | — |
+| Survival gauge | Start 100 %, PERFECT +0.16 %, GREAT +0.16 %, GOOD 0, BAD −5 %, POOR −9 %; damage is halved when the value before the change is below 30 % (exactly 30 % takes full damage; the halved change is floored with its sign, so −1.5 units become −2; mines are not halved) | — |
 | EX score | PERFECT 2, GREAT 1 | — |
 | Zero judgeable notes | `Evaluator::new` returns `EvalError::NoJudgeableNotes`, and the session refuses to start with that message | Nothing to play, rather than a division by zero |
 
