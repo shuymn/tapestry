@@ -243,7 +243,8 @@ pub struct LnBreakRule {
 pub struct RankScale {
     /// The scale for `#RANK 0` to `#RANK 3`.
     pub rank_milli: [i64; 4],
-    /// The scale when the chart declares no rank.
+    /// The scale when the chart declares no rank, or a `#RANK` outside 0-3
+    /// (an extension this preset does not support).
     pub absent_milli: i64,
 }
 
@@ -251,15 +252,18 @@ impl RankScale {
     /// The window scale for a chart's declared rank.
     ///
     /// `#DEFEXRANK n` scales by `n` %, which the chart model already holds in
-    /// thousandths of a percent. `None` for a `#RANK` outside 0-3 or a
-    /// `#DEFEXRANK` that is not positive.
+    /// thousandths of a percent. No rank and a `#RANK` outside 0-3 use
+    /// `absent_milli`. `None` for a `#DEFEXRANK` that is not positive.
     #[must_use]
     pub fn scale_milli(&self, rank: Option<JudgeRank>) -> Option<i64> {
         match rank {
             None => Some(self.absent_milli),
-            Some(JudgeRank::Rank(r)) => usize::try_from(r)
-                .ok()
-                .and_then(|i| self.rank_milli.get(i).copied()),
+            Some(JudgeRank::Rank(r)) => Some(
+                usize::try_from(r)
+                    .ok()
+                    .and_then(|i| self.rank_milli.get(i).copied())
+                    .unwrap_or(self.absent_milli),
+            ),
             Some(JudgeRank::DefExRankMilli(v)) => (v > 0).then_some(v),
         }
     }
@@ -296,15 +300,16 @@ pub enum GaugeKind {
         /// The clear threshold.
         clear: GaugeValue,
     },
-    /// Failed the moment it reaches its minimum, and never recovers.
+    /// Failed the moment it reaches 0, and never recovers. Its `min` is 0.
     Survival,
 }
 
 /// Reduced damage while the gauge is low.
 ///
 /// When the value before a change is strictly below `below`, a negative
-/// change `d` becomes `−floor(|d| × num / den)`. A value exactly at `below`
-/// takes full damage.
+/// change `d` becomes `floor(d × num / den)` (a signed floor, so a remainder
+/// adds damage). A value exactly at `below` takes full damage. Mines are not
+/// reduced (see [`MineRule`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LowDamage {
     /// The value below which damage is reduced.
@@ -329,10 +334,11 @@ impl LowDamage {
         if damage.0 >= 0 {
             return damage;
         }
-        let magnitude = (-i128::from(damage.0)) * i128::from(self.num) / i128::from(self.den);
-        // The reduced magnitude never exceeds the original when num ≤ den;
-        // saturate otherwise, so a validated preset cannot overflow here.
-        GaugeValue(i64::try_from(-magnitude).unwrap_or(i64::MIN))
+        let reduced =
+            (i128::from(damage.0) * i128::from(self.num)).div_euclid(i128::from(self.den));
+        // A validated preset has num ≤ den, so this stays within `damage`;
+        // saturate otherwise.
+        GaugeValue(i64::try_from(reduced).unwrap_or(i64::MIN))
     }
 }
 
@@ -358,8 +364,8 @@ pub struct GaugeRule {
     pub empty_poor: GaugeDelta,
     /// Change for an LN break.
     pub ln_break: GaugeDelta,
-    /// Reduced damage while low, if any. Applies to every negative change,
-    /// mines included.
+    /// Reduced damage while low, if any. Applies to every negative change
+    /// except mines.
     pub low_damage: Option<LowDamage>,
 }
 
@@ -426,12 +432,24 @@ pub enum TotalMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MineRule {
     /// A mine damages every gauge when its lane is held as it passes, by the
-    /// chart's damage value × `per_unit`. It has no judgment, combo or BP
-    /// effect.
+    /// chart's damage value × `per_unit`, as is: never reduced by
+    /// [`LowDamage`], then clamped like any change. It has no judgment, combo
+    /// or BP effect.
     WhileHeld {
         /// Gauge damage per unit of the chart's value (not negative).
         per_unit: GaugeValue,
     },
+}
+
+impl MineRule {
+    /// The gauge change of a mine whose chart damage value is
+    /// `chart_damage`, computed in `i128` and saturated to `i64`.
+    #[must_use]
+    pub fn change(&self, chart_damage: i32) -> GaugeValue {
+        let Self::WhileHeld { per_unit } = *self;
+        let v = -(i128::from(chart_damage) * i128::from(per_unit.0));
+        GaugeValue(i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX }))
+    }
 }
 
 /// A named set of judgment and gauge rules.
@@ -501,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn defexrank_is_a_percentage_and_bad_ranks_are_none() {
+    fn defexrank_is_a_percentage_and_unknown_ranks_use_absent() {
         let rank = RankScale {
             rank_milli: [50_000, 75_000, 100_000, 125_000],
             absent_milli: 100_000,
@@ -511,8 +529,8 @@ mod tests {
             Some(80_000)
         );
         assert_eq!(rank.scale_milli(None), Some(100_000));
-        assert_eq!(rank.scale_milli(Some(JudgeRank::Rank(4))), None);
-        assert_eq!(rank.scale_milli(Some(JudgeRank::Rank(-1))), None);
+        assert_eq!(rank.scale_milli(Some(JudgeRank::Rank(4))), Some(100_000));
+        assert_eq!(rank.scale_milli(Some(JudgeRank::Rank(-1))), Some(100_000));
         assert_eq!(rank.scale_milli(Some(JudgeRank::DefExRankMilli(0))), None);
         let w = Window::symmetric(i64::MAX);
         let windows = super::JudgeWindows {
@@ -526,6 +544,16 @@ mod tests {
     }
 
     #[test]
+    fn mine_damage_is_half_a_percent_per_unit() {
+        let mine = custom().mine;
+        // `1E` in base 36 is 1 × 36 + 14 = 50 units; 50 × 0.5 % = 25 %, so a
+        // survival gauge at 40 % keeps 15 %.
+        assert_eq!(mine.change(50), GaugeValue(-2_500_000));
+        assert_eq!(mine.change(1), GaugeValue(-50_000));
+        assert_eq!(mine.change(0), GaugeValue(0));
+    }
+
+    #[test]
     fn low_damage_starts_strictly_below_threshold() {
         let low = LowDamage {
             below: GaugeValue(30 * GaugeValue::PERCENT),
@@ -535,7 +563,8 @@ mod tests {
         assert!(!low.applies_at(GaugeValue(30 * GaugeValue::PERCENT)));
         assert!(low.applies_at(GaugeValue(30 * GaugeValue::PERCENT - 1)));
         assert_eq!(low.reduce(GaugeValue(-900_000)), GaugeValue(-450_000));
-        assert_eq!(low.reduce(GaugeValue(-3)), GaugeValue(-1));
+        // Signed floor: -1.5 becomes -2.
+        assert_eq!(low.reduce(GaugeValue(-3)), GaugeValue(-2));
         assert_eq!(low.reduce(GaugeValue(16_000)), GaugeValue(16_000));
     }
 }

@@ -100,6 +100,9 @@ fn check_gauge(gauge: &GaugeRule) -> Result<(), RuleError> {
     if !ordered {
         return Err(fail("min, start, max"));
     }
+    if gauge.kind == GaugeKind::Survival && gauge.min != GaugeValue::EMPTY {
+        return Err(fail("min"));
+    }
     let bounded = gauge.min..=gauge.max;
     if let GaugeKind::EndThreshold { clear } = gauge.kind
         && !bounded.contains(&clear)
@@ -209,6 +212,13 @@ mod tests {
             out(|p| p.gauges[1].id = "normal".to_owned()),
             Err(RuleError::DuplicateGauge {
                 id: "normal".to_owned()
+            })
+        );
+        assert_eq!(
+            out(|p| p.gauges[1].min = GaugeValue(2 * GaugeValue::PERCENT)),
+            Err(RuleError::GaugeOutOfBounds {
+                id: "survival".to_owned(),
+                field: "min",
             })
         );
         assert_eq!(out(|p| p.gauges.clear()), Err(RuleError::NoGauges));
