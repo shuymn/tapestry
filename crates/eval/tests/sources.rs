@@ -5,8 +5,8 @@ mod common;
 use bms_model::{ChartBuilder, TimeUs};
 use common::{MS, device, disconnect, judgments, lane, press, release};
 use eval::{
-    Evaluator, InputStart, PhysicalInputEvent, Published, SourceId, SourceState, StageError,
-    Staged, merge, watermark,
+    Binding, ControlId, ConversionState, Evaluator, InputKind, InputStart, LaneEdge,
+    PhysicalInputEvent, Published, SourceId, SourceState, StageError, Staged, merge, watermark,
 };
 use rules::Judgment::{Great, Perfect, Poor};
 
@@ -105,17 +105,23 @@ fn removed_source_is_drained_before_retiring() {
     merge(&mut stages, &dev, w, &mut merged);
     assert_eq!(merged.len(), 2);
     for e in merged.drain(..) {
-        ev.push_input(e);
+        ev.push_input(e).unwrap();
     }
-    ev.advance_to(w, &mut out);
+    ev.advance_to(w, &mut out).unwrap();
     assert_eq!(judgments(&out), [(1, 0, Perfect, Some(0))]);
 
+    // Staging is empty, but the queue is not: still closed.
+    published[1].retire_if_drained(false, &stages[1]);
+    assert_eq!(published[1].state, SourceState::Closed);
+    // An open source is never retired, drained or not.
+    published[0].retire_if_drained(true, &stages[0]);
+    assert_eq!(published[0].state, SourceState::Open);
     // Drained: retired, and the watermark follows the remaining source.
     published[1].retire_if_drained(true, &stages[1]);
     assert_eq!(published[1].state, SourceState::Retired);
     let w = watermark(&published, &dev).unwrap();
     assert_eq!(w, TimeUs(3_000 * MS));
-    ev.advance_to(w, &mut out);
+    ev.advance_to(w, &mut out).unwrap();
     assert_eq!(
         judgments(&out),
         [(1, 0, Perfect, Some(0)), (2, 0, Poor, None)]
@@ -141,12 +147,45 @@ fn crossing_offsets_judge_in_evaluation_order() {
     merge(&mut stages, &dev, TimeUs(2_000 * MS), &mut merged);
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
     for e in merged {
-        ev.push_input(e);
+        ev.push_input(e).unwrap();
     }
     let mut out = Vec::new();
-    ev.advance_to(TimeUs(2_000 * MS), &mut out);
+    ev.advance_to(TimeUs(2_000 * MS), &mut out).unwrap();
     assert_eq!(
         judgments(&out),
         [(1, 0, Perfect, Some(0)), (1, 1, Great, Some(-21 * MS))]
     );
+}
+
+#[test]
+fn lane_stays_held_while_any_control_holds_it() {
+    // Source 0 binds a second control to lane 1; source 1 binds lane 1 too.
+    let mut dev = device(&[0, 0]);
+    dev.sources[0].bindings.push(Binding {
+        control: ControlId(100),
+        lane: lane(1),
+    });
+    let extra = |received, value| {
+        let mut e = press(received, 0, 1);
+        e.kind = InputKind::Control {
+            control: ControlId(100),
+            value,
+        };
+        e
+    };
+    let mut c = ConversionState::init(&dev, &InputStart::default()).unwrap();
+    let l1 = lane(1);
+    let mut step = |e| c.apply(&e).as_slice().to_vec();
+    assert_eq!(step(press(1, 0, 1)), [LaneEdge::Press(l1)]);
+    assert_eq!(step(extra(2, 1)), []);
+    // Releasing one of two held controls keeps the lane held.
+    assert_eq!(step(release(3, 0, 1)), []);
+    assert_eq!(step(extra(4, 0)), [LaneEdge::Release(l1)]);
+    // A disconnect releases only its own source's controls.
+    assert_eq!(step(press(5, 1, 1)), [LaneEdge::Press(l1)]);
+    assert_eq!(step(press(6, 0, 1)), []);
+    assert_eq!(step(disconnect(7, 1)), []);
+    assert_eq!(step(press(8, 0, 1)), []);
+    assert_eq!(step(release(9, 0, 1)), [LaneEdge::Release(l1)]);
+    assert!(!c.is_held(l1));
 }

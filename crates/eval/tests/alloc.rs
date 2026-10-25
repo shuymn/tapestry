@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use bms_model::{ChartBuilder, TimeUs};
 use common::{MS, device, lane, press, release};
-use eval::{Evaluator, InputStart, JudgeEventKind};
+use eval::{Evaluator, InputStart, JudgeEventKind, PushError};
 use rules::Judgment;
 
 struct Counting;
@@ -73,6 +73,10 @@ fn advance_does_not_allocate() {
     let end = 1_000 * MS + NOTES * 50 * MS + 1_000 * MS;
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 64).unwrap();
     let mut out = Vec::with_capacity(4 * 2_000);
+    // A second evaluator whose ring a burst fills to capacity.
+    const BURST: usize = 4;
+    let mut burst = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), BURST).unwrap();
+    let mut burst_out = Vec::with_capacity(16);
 
     TRACK.with(|t| t.set(true));
     let started = Instant::now();
@@ -81,13 +85,22 @@ fn advance_does_not_allocate() {
     while w <= end {
         // What the merge would hand over at this watermark.
         while next < inputs.len() && inputs[next].received.0 <= w {
-            ev.push_input(inputs[next]);
+            ev.push_input(inputs[next]).unwrap();
             next += 1;
         }
-        ev.advance_to(TimeUs(w), &mut out);
+        ev.advance_to(TimeUs(w), &mut out).unwrap();
         w += MS;
     }
     let elapsed = started.elapsed();
+    // Fill the ring to capacity: one more is refused, not allocated.
+    for e in &inputs[..BURST] {
+        burst.push_input(*e).unwrap();
+    }
+    let refused = burst.push_input(inputs[BURST]);
+    burst
+        .advance_to(inputs[BURST - 1].received, &mut burst_out)
+        .unwrap();
+    let after_drain = burst.push_input(inputs[BURST]);
     TRACK.with(|t| t.set(false));
 
     let allocations = ALLOCS.load(Ordering::Relaxed);
@@ -105,6 +118,9 @@ fn advance_does_not_allocate() {
         .count();
     assert_eq!(perfect, 2_000);
     assert_eq!(out.len(), 2_000);
+    assert_eq!(refused, Err(PushError::Full));
+    assert_eq!(after_drain, Ok(()));
+    assert_eq!(burst_out.len(), 2);
     assert_eq!(allocations, 0);
     let per_input = elapsed.as_nanos() / u128::try_from(inputs.len()).unwrap();
     println!(

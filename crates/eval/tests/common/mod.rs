@@ -89,10 +89,10 @@ pub fn run_with(
 ) -> (Vec<JudgeEvent>, Tally) {
     let mut ev = Evaluator::new(chart, preset, device, start, 64).unwrap();
     for &i in inputs {
-        ev.push_input(i);
+        ev.push_input(i).unwrap();
     }
     let mut out = Vec::new();
-    ev.advance_to(TimeUs(watermark), &mut out);
+    ev.advance_to(TimeUs(watermark), &mut out).unwrap();
     (out, *ev.tally())
 }
 

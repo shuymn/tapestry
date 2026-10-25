@@ -6,7 +6,7 @@ mod common;
 
 use bms_model::{ChartBuilder, JudgeRank, SoundId, TimeUs};
 use common::{MS, device, empty_poors, judgments, lane, press, release, run, set};
-use eval::{ControlId, Evaluator, InputStart, JudgeEventKind, SourceId};
+use eval::{AdvanceError, ControlId, Evaluator, InputStart, JudgeEventKind, PushError, SourceId};
 use rules::Judgment::{Bad, Good, Great, Perfect, Poor};
 
 const BPM: i64 = 150_000;
@@ -42,24 +42,69 @@ fn miss_waits_for_watermark() {
     let preset = rules::custom();
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
     let mut out = Vec::new();
-    // The deadline (1180 ms) has passed in wall time, but the watermark is
-    // 1 µs before it: nothing is finalized.
-    ev.advance_to(TimeUs(1_180 * MS - 1), &mut out);
+    // A press on the late edge (1180 ms) is queued, but the watermark is
+    // 1 µs before it: neither the press nor the miss is processed.
+    ev.push_input(press(1_180 * MS, 0, 1)).unwrap();
+    ev.advance_to(TimeUs(1_180 * MS - 1), &mut out).unwrap();
     assert!(out.is_empty());
-    // A press that was still on its way arrives with an earlier time.
-    ev.push_input(press(1_179 * MS, 0, 1));
-    ev.advance_to(TimeUs(1_200 * MS), &mut out);
-    assert_eq!(judgments(&out), [(1, 0, Bad, Some(179 * MS))]);
+    // At the watermark, the press is judged and the miss never happens.
+    ev.advance_to(TimeUs(1_180 * MS), &mut out).unwrap();
+    assert_eq!(judgments(&out), [(1, 0, Bad, Some(180 * MS))]);
 
     // Without a press, the POOR appears only when the watermark reaches the
     // deadline.
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
     let mut out = Vec::new();
-    ev.advance_to(TimeUs(1_180 * MS - 1), &mut out);
+    ev.advance_to(TimeUs(1_180 * MS - 1), &mut out).unwrap();
     assert!(out.is_empty());
-    ev.advance_to(TimeUs(1_180 * MS), &mut out);
+    ev.advance_to(TimeUs(1_180 * MS), &mut out).unwrap();
     assert_eq!(judgments(&out), [(1, 0, Poor, None)]);
     assert_eq!(out[0].time, TimeUs(1_180 * MS));
+}
+
+#[test]
+fn finalized_or_unordered_input_and_backward_advance_are_refused() {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let dev = device(&[0]);
+    let preset = rules::custom();
+    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 2).unwrap();
+    let mut out = Vec::new();
+    ev.advance_to(TimeUs(1_180 * MS), &mut out).unwrap();
+    assert_eq!(judgments(&out), [(1, 0, Poor, None)]);
+    // At the finalized watermark itself: too late, the miss is final.
+    assert_eq!(
+        ev.push_input(press(1_180 * MS, 0, 1)),
+        Err(PushError::Finalized {
+            time: TimeUs(1_180 * MS),
+            finalized: TimeUs(1_180 * MS),
+        })
+    );
+    ev.push_input(press(1_190 * MS, 0, 1)).unwrap();
+    assert_eq!(
+        ev.push_input(release(1_185 * MS, 0, 1)),
+        Err(PushError::OutOfOrder {
+            time: TimeUs(1_185 * MS),
+            last: TimeUs(1_190 * MS),
+        })
+    );
+    ev.push_input(release(1_190 * MS, 0, 1)).unwrap();
+    assert_eq!(ev.push_input(press(1_191 * MS, 0, 1)), Err(PushError::Full));
+    assert_eq!(
+        ev.advance_to(TimeUs(1_179 * MS), &mut out),
+        Err(AdvanceError::Backward {
+            watermark: TimeUs(1_179 * MS),
+            finalized: TimeUs(1_180 * MS),
+        })
+    );
+    // The refused calls changed nothing: the two queued inputs still run,
+    // and an equal watermark is not backward.
+    ev.advance_to(TimeUs(1_180 * MS), &mut out).unwrap();
+    ev.advance_to(TimeUs(2_000 * MS), &mut out).unwrap();
+    assert_eq!(judgments(&out), [(1, 0, Poor, None)]);
+    ev.push_input(press(2_001 * MS, 0, 1)).unwrap();
 }
 
 #[test]

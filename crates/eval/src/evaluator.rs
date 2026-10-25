@@ -174,7 +174,7 @@ impl LaneState {
 /// The incremental evaluator. It references the chart, preset and device
 /// profile, and after construction allocates nothing in
 /// [`push_input`](Self::push_input) and [`advance_to`](Self::advance_to)
-/// while the input ring and the output have room.
+/// while the output has room; a full input ring refuses input instead.
 #[derive(Debug)]
 pub struct Evaluator<'a> {
     chart: &'a Chart,
@@ -184,8 +184,49 @@ pub struct Evaluator<'a> {
     lanes: [LaneState; LANE_COUNT],
     conversion: ConversionState,
     inputs: VecDeque<(TimeUs, PhysicalInputEvent)>,
+    /// The ring's fixed capacity.
+    input_capacity: usize,
+    /// The evaluation time of the last input pushed.
+    last_input: Option<TimeUs>,
+    /// The watermark last advanced to: everything at or before it is final.
+    finalized: Option<TimeUs>,
     seq: u64,
     tally: Tally,
+}
+
+/// Why [`Evaluator::push_input`] refused an input. The evaluator is left
+/// unchanged; the caller marks the input log incomplete or aborts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushError {
+    /// The input ring is at the capacity given at construction.
+    Full,
+    /// The input's evaluation time is at or before the finalized watermark,
+    /// so it can no longer be evaluated in order.
+    Finalized {
+        /// The input's evaluation time.
+        time: TimeUs,
+        /// The finalized watermark.
+        finalized: TimeUs,
+    },
+    /// The input's evaluation time is earlier than the previous input's.
+    OutOfOrder {
+        /// The input's evaluation time.
+        time: TimeUs,
+        /// The previous input's evaluation time.
+        last: TimeUs,
+    },
+}
+
+/// Why [`Evaluator::advance_to`] refused to advance. Nothing was processed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdvanceError {
+    /// The watermark is earlier than one already advanced to.
+    Backward {
+        /// The requested watermark.
+        watermark: TimeUs,
+        /// The finalized watermark.
+        finalized: TimeUs,
+    },
 }
 
 impl<'a> Evaluator<'a> {
@@ -251,6 +292,9 @@ impl<'a> Evaluator<'a> {
             lanes,
             conversion: ConversionState::init(device, start)?,
             inputs: VecDeque::with_capacity(input_capacity),
+            input_capacity,
+            last_input: None,
+            finalized: None,
             seq: 0,
             tally: Tally::new(),
         })
@@ -269,18 +313,56 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Appends an input, in the order [`merge`](crate::merge) produced.
-    /// Inputs must come in nondecreasing evaluation time and not below a
-    /// watermark already advanced to. Beyond the capacity given at
-    /// construction the ring grows (allocating) rather than dropping input.
-    pub fn push_input(&mut self, ev: PhysicalInputEvent) {
-        let t = evaluation_time(&ev, self.device);
-        self.inputs.push_back((t, ev));
+    /// Never allocates: the ring keeps the capacity given at construction.
+    ///
+    /// # Errors
+    ///
+    /// The input is refused, and nothing changes, when the ring is full,
+    /// when its evaluation time is at or before the finalized watermark, or
+    /// when it is earlier than the previous input's.
+    pub fn push_input(&mut self, ev: PhysicalInputEvent) -> Result<(), PushError> {
+        let time = evaluation_time(&ev, self.device);
+        if let Some(finalized) = self.finalized
+            && time <= finalized
+        {
+            return Err(PushError::Finalized { time, finalized });
+        }
+        if let Some(last) = self.last_input
+            && time < last
+        {
+            return Err(PushError::OutOfOrder { time, last });
+        }
+        if self.inputs.len() >= self.input_capacity {
+            return Err(PushError::Full);
+        }
+        self.inputs.push_back((time, ev));
+        self.last_input = Some(time);
+        Ok(())
     }
 
     /// Processes every input and deadline at or before `watermark`, in the
     /// order (time, inputs before deadlines, deadline kind, lane, sequence),
-    /// and appends the resulting events to `out`.
-    pub fn advance_to(&mut self, watermark: TimeUs, out: &mut Vec<JudgeEvent>) {
+    /// and appends the resulting events to `out`. Everything at or before
+    /// `watermark` is then final.
+    ///
+    /// # Errors
+    ///
+    /// [`AdvanceError::Backward`], with nothing processed, when `watermark`
+    /// is earlier than one already advanced to.
+    pub fn advance_to(
+        &mut self,
+        watermark: TimeUs,
+        out: &mut Vec<JudgeEvent>,
+    ) -> Result<(), AdvanceError> {
+        if let Some(finalized) = self.finalized
+            && watermark < finalized
+        {
+            return Err(AdvanceError::Backward {
+                watermark,
+                finalized,
+            });
+        }
+        self.finalized = Some(watermark);
         loop {
             let input = self
                 .inputs
@@ -289,7 +371,7 @@ impl<'a> Evaluator<'a> {
                 .filter(|&t| t <= watermark);
             let deadline = self.next_deadline().filter(|(d, _)| d.time <= watermark);
             match (input, deadline) {
-                (None, None) => return,
+                (None, None) => return Ok(()),
                 (Some(t), Some((d, lane))) => {
                     let deadline_first = match self.rule.same_time_order {
                         SameTimeOrder::InputsFirst => d.time < t,
