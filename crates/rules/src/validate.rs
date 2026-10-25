@@ -100,8 +100,14 @@ fn check_gauge(gauge: &GaugeRule) -> Result<(), RuleError> {
     if !ordered {
         return Err(fail("min, start, max"));
     }
-    if gauge.kind == GaugeKind::Survival && gauge.min != GaugeValue::EMPTY {
-        return Err(fail("min"));
+    if gauge.kind == GaugeKind::Survival {
+        if gauge.min != GaugeValue::EMPTY {
+            return Err(fail("min"));
+        }
+        // Starting at 0 would start the gauge failed.
+        if gauge.start == GaugeValue::EMPTY {
+            return Err(fail("start"));
+        }
     }
     let bounded = gauge.min..=gauge.max;
     if let GaugeKind::EndThreshold { clear } = gauge.kind
@@ -219,6 +225,13 @@ mod tests {
             Err(RuleError::GaugeOutOfBounds {
                 id: "survival".to_owned(),
                 field: "min",
+            })
+        );
+        assert_eq!(
+            out(|p| p.gauges[1].start = GaugeValue::EMPTY),
+            Err(RuleError::GaugeOutOfBounds {
+                id: "survival".to_owned(),
+                field: "start",
             })
         );
         assert_eq!(out(|p| p.gauges.clear()), Err(RuleError::NoGauges));

@@ -308,8 +308,10 @@ fn origin_is_raw_receive_time() {
         &[press(1_005 * MS, 0, 7)],
         3_000 * MS,
     );
+    // Gauge reports share their judgment's time and origin; leave them out.
     let summary: Vec<_> = events
         .iter()
+        .filter(|e| !matches!(e.kind, JudgeEventKind::Gauge { .. }))
         .map(|e| (e.seq, e.time.0, e.origin.map(|o| o.0)))
         .collect();
     assert_eq!(
@@ -317,9 +319,15 @@ fn origin_is_raw_receive_time() {
         [
             (0, 1_000 * MS, Some(1_005 * MS)),
             (1, 1_000 * MS, Some(1_005 * MS)),
-            (2, 2_180 * MS, None),
+            (4, 2_180 * MS, None),
+            (7, 2_180 * MS, None),
         ]
     );
+    assert!(events.iter().all(|e| match e.kind {
+        JudgeEventKind::Gauge { .. } => e.time == events[usize::try_from(e.seq).unwrap() - 1].time,
+        _ => true,
+    }));
+    assert_eq!(events[7].kind, JudgeEventKind::SongEnd);
     assert!(matches!(
         events[0].kind,
         JudgeEventKind::PlaySound {
