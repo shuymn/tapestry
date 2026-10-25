@@ -15,18 +15,20 @@
 //! events per source, the device profile, the held-input snapshot, the
 //! watermark over sources, and the merge of their events into one stream.
 //! The live logic thread and batch evaluation call the same [`merge`] and the
-//! same evaluator, so they cannot diverge.
+//! same [`Evaluator`], so they cannot diverge.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
 mod convert;
 mod error;
+mod evaluator;
 mod input;
 mod merge;
 
 pub use convert::{ConversionState, Edges, LaneEdge};
 pub use error::EvalError;
+pub use evaluator::{Evaluator, JudgeEvent, JudgeEventKind, Tally};
 pub use input::{
     Binding, ControlId, DeviceProfile, InputKind, InputStart, PhysicalInputEvent, SourceId,
     SourceProfile, evaluation_time,
