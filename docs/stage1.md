@@ -220,7 +220,7 @@ New dependencies. Each license not yet in `deny.toml:17-22` is added in the PR t
 | `num-rational` (+`num-integer`, `num-traits`) | Checked `Ratio<i128>` time (D3) | MIT OR Apache-2.0 | Chart time | `bms-parser` |
 | `chardetng` (+`encoding_rs`, already allowed) | Shift_JIS / UTF-8 detection | MIT OR Apache-2.0 | Real charts are mostly Shift_JIS (design.md:844) | `bms-parser` |
 | `sha2`, `md-5` | Chart file hashes, preset hash | MIT OR Apache-2.0 | Log identity (design.md:333-335) | `bms-parser`, `replay` |
-| `zstd` | Log body compression | MIT (`zstd-sys` MIT OR Apache-2.0, bundled C library BSD-3-Clause) | design.md:850 | `replay` |
+| `zstd` | Log body compression | MIT (`zstd-safe` and `zstd-sys` BSD-3-Clause, with the bundled C library) | design.md:850 | `replay` |
 | `serde`, `toml` | Settings and preset files | MIT OR Apache-2.0 | D10 | `game` |
 | `rtrb` | SPSC queues | MIT OR Apache-2.0 | D8 | `input`, `game`, `audio` |
 | `triple_buffer` | Render snapshot | MPL-2.0 (add) | D8 | `game` |

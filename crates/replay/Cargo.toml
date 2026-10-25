@@ -1,0 +1,18 @@
+[package]
+name = "replay"
+version = "0.0.0"
+description = "Input log format: the play record and its binary encoding."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bms-model.workspace = true
+eval.workspace = true
+rules.workspace = true
+sha2.workspace = true
+zstd.workspace = true
+
+[lints]
+workspace = true
