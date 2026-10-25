@@ -566,7 +566,7 @@ fn resolved_hash_matches_golden() {
     // documented fields of this chart: version 1, 120 BPM, no scroll changes,
     // one tap at 2 s on key 1 with sound 0, bar lines at 0 and 2 s, the sound
     // name `a.wav`, an empty title and no other values.
-    const GOLDEN: &str = "79e898e7d73b6464ab8b946c59b58a5e4679e8dc6d3d71b546dce6f52a34a4a5";
+    const GOLDEN: &str = "e86790ddd8254fadbfccacc43e8ef18f37240733004cf019911db730b50477bb";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart

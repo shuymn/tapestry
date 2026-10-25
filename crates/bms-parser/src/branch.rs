@@ -155,17 +155,28 @@ impl Branches {
                     line,
                 )?;
             }
-            "ELSE" => match self.frames.last_mut() {
-                Some(Frame::If {
-                    active,
-                    taken,
-                    parent,
-                }) => {
-                    *active = *parent && !*taken;
-                    *taken = true;
+            "ELSE" => {
+                // The innermost open #IF; a #RANDOM left open inside its
+                // branch ends here.
+                if let Some(i) = self
+                    .frames
+                    .iter()
+                    .rposition(|f| matches!(f, Frame::If { .. }))
+                {
+                    self.frames.truncate(i + 1);
+                    if let Some(Frame::If {
+                        active,
+                        taken,
+                        parent,
+                    }) = self.frames.last_mut()
+                    {
+                        *active = *parent && !*taken;
+                        *taken = true;
+                    }
+                } else {
+                    warn(warnings, WarningKind::UnmatchedDirective("#ELSE"));
                 }
-                _ => warn(warnings, WarningKind::UnmatchedDirective("#ELSE")),
-            },
+            }
             "ENDIF" => {
                 if let Some(i) = self
                     .frames

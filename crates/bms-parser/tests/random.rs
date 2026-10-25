@@ -51,7 +51,6 @@ fn setrandom_selects_each_branch() {
         assert_eq!(loaded.chart.identity.random_results, vec![value]);
         hashes.push(loaded.chart.identity.resolved_hash);
     }
-    assert_eq!(hashes.len(), 3);
     assert_ne!(hashes[0], hashes[1]);
     assert_ne!(hashes[1], hashes[2]);
     assert_ne!(hashes[0], hashes[2]);
@@ -92,16 +91,19 @@ fn nested_if_selects_inner_branch() {
 
 #[test]
 fn branch_results_are_recorded_in_order() {
-    // Seed 1 draws 10451216379200822465, 13757245211066428519, ... (an
-    // independent computation): % 5 + 1 gives 1, then 5. The second block
-    // has no matching #IF and is recorded anyway; #SETRANDOM values are
-    // recorded too; the block inside the branch not taken draws nothing.
+    // Seed 1 draws 10451216379200822465, 13757245211066428519, then a third
+    // and fourth value (an independent computation): % 5 + 1 gives 1, then
+    // 5. The second block has no matching #IF and is recorded anyway;
+    // #SETRANDOM values are recorded too; the block inside the branch not
+    // taken draws nothing, so the final #RANDOM 7 takes the third value
+    // (% 7 + 1 = 2) rather than the fourth (1).
     let text = "#BPM 120\n#WAV01 click.wav\n\
                 #RANDOM 5\n#IF 1\n#00111:01\n#ENDIF\n#ENDRANDOM\n\
                 #RANDOM 5\n#IF 1\n#00112:01\n#ENDIF\n\
-                #SETRANDOM 7\n#IF 3\n#RANDOM 9\n#ENDIF\n#ENDRANDOM\n";
+                #SETRANDOM 7\n#IF 3\n#RANDOM 9\n#ENDIF\n#ENDRANDOM\n\
+                #RANDOM 7\n";
     let loaded = load_seeded(text, 1).unwrap();
-    assert_eq!(loaded.chart.identity.random_results, vec![1, 5, 7]);
+    assert_eq!(loaded.chart.identity.random_results, vec![1, 5, 7, 2]);
     assert_eq!(keys(&loaded), vec![1]);
 }
 
@@ -215,4 +217,51 @@ fn stray_directives_warn_and_bad_values_fail() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn else_closes_a_random_left_open_in_its_branch() {
+    // The inner block has no #ENDRANDOM; #ELSE still belongs to the outer #IF.
+    for (outer, key, results) in [(1, 1, vec![1, 1]), (2, 2, vec![2])] {
+        let text = format!(
+            "#BPM 120\n#WAV01 click.wav\n#SETRANDOM {outer}\n#IF 1\n#RANDOM 1\n#IF 1\n\
+             #00111:01\n#ENDIF\n#ELSE\n#00112:01\n#ENDIF\n"
+        );
+        let loaded = load(&text).unwrap();
+        assert_eq!(keys(&loaded), vec![key], "outer {outer}");
+        assert_eq!(
+            loaded.chart.identity.random_results, results,
+            "outer {outer}"
+        );
+        assert_eq!(loaded.warnings, vec![], "outer {outer}");
+    }
+}
+
+#[test]
+fn elseif_is_rejected_whether_or_not_its_branch_is_reached() {
+    for value in [1, 2] {
+        let text = format!(
+            "#BPM 120\n#WAV01 click.wav\n#SETRANDOM {value}\n#IF 1\n#00111:01\n\
+             #ELSEIF 2\n#00112:01\n#ENDIF\n"
+        );
+        assert_eq!(
+            load(&text),
+            Err(LoadError::Unsupported {
+                line: 6,
+                what: "#ELSEIF".to_owned()
+            }),
+            "value {value}"
+        );
+    }
+}
+
+#[test]
+fn branch_records_do_not_change_the_resolved_hash() {
+    // An unused block: seeds 0 and 1 draw 2 and 3, the objects are the same.
+    let text = "#BPM 120\n#WAV01 click.wav\n#00111:01\n#RANDOM 3\n";
+    let a = load_seeded(text, 0).unwrap().chart.identity;
+    let b = load_seeded(text, 1).unwrap().chart.identity;
+    assert_eq!(a.random_results, vec![2]);
+    assert_eq!(b.random_results, vec![3]);
+    assert_eq!(a.resolved_hash, b.resolved_hash);
 }

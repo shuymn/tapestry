@@ -130,6 +130,14 @@ pub fn parse(
         } else {
             let (name, value) = split_header(body);
             let upper = name.to_ascii_uppercase();
+            // Refused even inside a branch not taken, so whether a chart
+            // loads never depends on the branch drawn.
+            if UNSUPPORTED_HEADERS.contains(&upper.as_str()) {
+                return Err(LoadError::Unsupported {
+                    line,
+                    what: format!("#{upper}"),
+                });
+            }
             if !branches.directive(&upper, value, line, warnings)? && branches.active() {
                 parse_header(&mut source, line, &upper, value, warnings)?;
             }
@@ -327,12 +335,6 @@ fn parse_header(
                     kind: WarningKind::PlayerNotOne,
                 });
             }
-        }
-        _ if UNSUPPORTED_HEADERS.contains(&upper) => {
-            return Err(LoadError::Unsupported {
-                line,
-                what: format!("#{upper}"),
-            });
         }
         _ if IGNORED_HEADERS.contains(&upper) || defined_id("BMP").is_some() => {}
         _ => {

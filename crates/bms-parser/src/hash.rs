@@ -10,9 +10,11 @@ pub fn file_hashes(bytes: &[u8]) -> ([u8; 32], [u8; 16]) {
 }
 
 /// SHA-256 over a canonical encoding of the resolved chart: loader version,
-/// scroll changes, notes, BGM, bar lines, sound names as written, header
-/// values and `#RANDOM` results. Resolved sound paths are left out, so moving
-/// the chart folder keeps the hash.
+/// scroll changes, notes, BGM, bar lines, sound names as written and header
+/// values. Resolved sound paths are left out, so moving the chart folder
+/// keeps the hash, and so are the `#RANDOM` results, which identify how the
+/// chart was resolved rather than what it resolved to; they stay in
+/// `ChartIdentity` beside the hash.
 pub fn resolved_hash(chart: &Chart, scroll: &[ScrollChange]) -> [u8; 32] {
     let mut h = Encoder(Sha256::new());
     h.bytes(b"tapestry resolved chart");
@@ -90,10 +92,6 @@ pub fn resolved_hash(chart: &Chart, scroll: &[ScrollChange]) -> [u8; 32] {
         Some(LnMode::Cn) => 2,
         Some(LnMode::Hcn) => 3,
     });
-    h.len(chart.identity.random_results.len());
-    for &r in &chart.identity.random_results {
-        h.u64(u64::from(r));
-    }
     h.0.finalize().into()
 }
 

@@ -49,14 +49,18 @@
 //!   headers (`#WAVxx`, `#BPMxx`, `#LNOBJ`, ...) included. `#IF k` is taken
 //!   when the nearest enclosing block's value is `k`; `#ELSE` when no
 //!   earlier branch of its `#IF` was. A `#RANDOM` directly inside another
-//!   ends it, since `#ENDRANDOM` is often left out; `#ENDIF` also closes
-//!   blocks left open inside it. `#IF` outside any block is never taken, and
+//!   ends it, since `#ENDRANDOM` is often left out; `#ELSE` and `#ENDIF`
+//!   also close blocks left open inside their `#IF`. `#IF` outside any block is never taken, and
 //!   a stray `#ELSE`, `#ENDIF` or `#ENDRANDOM` is ignored, each with a
 //!   warning: the base chart stays playable. An `#IF` still open at the end
 //!   of the file ends there, with a warning. Blocks nest at most
 //!   [`Limits::max_nesting`] deep (an error).
 //! - **Unsupported:** `#LNTYPE 2`, `#LNMODE` other than 1, negative
 //!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
+//!   The branching ones are refused even inside a branch not taken.
+//! - **Resolved hash:** covers what the chart resolved to, not the
+//!   `#RANDOM` results that chose it, so two draws resolving to the same
+//!   objects share one hash.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
