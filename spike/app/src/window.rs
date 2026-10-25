@@ -41,7 +41,46 @@ use winit::window::{Fullscreen, Window, WindowId};
 struct Shared {
     stop: AtomicBool,
     events: Mutex<Vec<RunEvent>>,
+    /// Private: (run µs, executable of the foreground window) at each
+    /// focus loss, to find what took the focus (`private/focus.csv`).
+    focus: Mutex<Vec<(i64, String)>>,
     clock: Clock,
+}
+
+/// File name of the executable owning the foreground window.
+fn foreground_exe() -> String {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    // SAFETY: plain queries; the process handle is closed below.
+    unsafe {
+        let h = GetForegroundWindow();
+        if h.is_invalid() {
+            return "none".into();
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return format!("pid {pid}");
+        };
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            p,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(p);
+        if !ok {
+            return format!("pid {pid}");
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned()
+    }
 }
 
 struct App {
@@ -154,7 +193,14 @@ impl ApplicationHandler<Result<u8, String>> for App {
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
         match ev {
             WindowEvent::CloseRequested => self.shared.stop.store(true, Ordering::Relaxed),
-            WindowEvent::Focused(false) => self.push(EventKind::FocusLoss),
+            WindowEvent::Focused(false) => {
+                self.push(EventKind::FocusLoss);
+                let exe = foreground_exe();
+                eprintln!("run: focus lost to {exe}");
+                if let Ok(mut f) = self.shared.focus.lock() {
+                    f.push((self.shared.clock.now_us(), exe));
+                }
+            }
             // The swap chain is not reconfigured; a size change during play
             // invalidates the run (V5 rejects swap-chain recreation).
             WindowEvent::Resized(_) => self.push(EventKind::SwapChainRecreate),
@@ -176,6 +222,7 @@ pub fn windowed(args: &RunArgs) -> Result<ExitCode, String> {
         shared: Arc::new(Shared {
             stop: AtomicBool::new(false),
             events: Mutex::new(Vec::new()),
+            focus: Mutex::new(Vec::new()),
             clock: Clock::start(),
         }),
         proxy: el.create_proxy(),
@@ -549,6 +596,14 @@ fn render_thread(args: &RunArgs, shared: &Shared, gpu: Gpu) -> Result<u8, String
     write_outputs(&args.out, &rec, &due, &summary)?;
     session::write(&args.out, &played)?;
     write_private_trace(&args.out, &trace, &dxgi.raw, &dxgi.anchors, &cap_trace)?;
+    let focus: String = shared
+        .focus
+        .lock()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|(t, exe)| format!("{t},{exe}\n"))
+        .collect();
+    std::fs::write(args.out.join("private").join("focus.csv"), focus).map_err(|e| e.to_string())?;
     if args.gpu_timestamps {
         write_gpu_times(&args.out, &trace, &renderer.read_timestamps())?;
     }

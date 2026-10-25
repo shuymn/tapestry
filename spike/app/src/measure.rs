@@ -28,9 +28,10 @@
 //!    video and audio present; the run is then diagnostic).
 //! 4. `report <out>` then evaluates and exports.
 //!
-//! `--unattended` (design §4.3): nobody is at the PC. OBS starts without
-//! `--minimize-to-tray`; after the run measure stops the stream through
-//! obs-websocket and closes OBS's main window itself (never a kill; if the
+//! `--unattended` (design §4.3): nobody is at the PC. OBS starts in the
+//! tray as in attended runs (no OBS window that could take the focus);
+//! after the run measure stops the stream through obs-websocket and
+//! closes OBS's hidden main window itself (never a kill; if the
 //! WebSocket is unreachable OBS is left running for the owner and measure
 //! fails), and MediaMTX records the ingest to `<out>/private/ingest/` for
 //! the owner's later review. The run is marked unattended, so its V7 owner
@@ -485,14 +486,10 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
     let private = a.out.join("private");
     let csv = a.out.join(crate::report::PRESENTMON_CSV);
     let pm_args = presentmon_args(&csv);
-    let obs = m.obs.as_ref().map(|exe| {
-        let mut args = obs_args(&m.obs_profile, &m.obs_collection);
-        if m.unattended {
-            // Its main window must exist for the closing WM_CLOSE.
-            args.retain(|a| a != "--minimize-to-tray");
-        }
-        (exe.clone(), args)
-    });
+    let obs = m
+        .obs
+        .as_ref()
+        .map(|exe| (exe.clone(), obs_args(&m.obs_profile, &m.obs_collection)));
     if m.dry_run {
         println!(
             "measure (dry run): kind {:?}, countdown {} s",

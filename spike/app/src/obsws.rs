@@ -235,12 +235,14 @@ pub fn stop_stream(limit: Duration) -> Result<(), String> {
     Ok(())
 }
 
-/// Closes the visible top-level windows of process `pid` (OBS's main
-/// window) with WM_CLOSE, the same as the window's close button.
+/// Closes the unowned top-level windows of process `pid` whose title
+/// starts with "OBS" (OBS's main window, hidden or not: unattended runs
+/// keep OBS in the tray) with WM_CLOSE, the
+/// same as the window's close button.
 pub fn close_main_window(pid: u32) -> bool {
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
+        EnumWindows, GW_OWNER, GetWindow, GetWindowTextW, GetWindowThreadProcessId, PostMessageW,
         WM_CLOSE,
     };
     struct Find {
@@ -254,8 +256,10 @@ pub fn close_main_window(pid: u32) -> bool {
         // SAFETY: plain window queries.
         unsafe {
             GetWindowThreadProcessId(h, Some(&mut pid));
+            let mut title = [0u16; 64];
+            let n = GetWindowTextW(h, &mut title).max(0) as usize;
             if pid == f.pid
-                && IsWindowVisible(h).as_bool()
+                && String::from_utf16_lossy(&title[..n]).starts_with("OBS")
                 && GetWindow(h, GW_OWNER).map_or(true, |o| o.is_invalid())
             {
                 f.found.push(h);
