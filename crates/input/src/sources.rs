@@ -253,8 +253,10 @@ impl SourceSet {
     /// code; each controller has its own). Other controls change only the
     /// physical state, and a device without a list records nothing. The
     /// list is frozen per source when recording opens, so a change applies
-    /// from the next opening. Call it outside play: it may allocate.
-    /// Returns `false` for a device that is not connected.
+    /// from the next opening: callers must set it before recording opens,
+    /// and again after the device reconnects, which starts it empty. The
+    /// call moves `controls` in and allocates nothing itself. Returns
+    /// `false` for a device that is not connected.
     pub fn set_recorded(&mut self, device: DeviceId, controls: Vec<ControlId>) -> bool {
         match self.devices.iter_mut().find(|d| d.id == device) {
             Some(d) => {

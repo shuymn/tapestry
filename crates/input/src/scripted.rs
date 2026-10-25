@@ -34,12 +34,14 @@ pub struct ScriptItem {
 /// with the same time form one batch, and every poll ends with a
 /// publication, as the input thread's wake does. A device the script
 /// connects gets the recorded controls given by
-/// [`with_recorded`](Self::with_recorded).
+/// [`with_recorded`](Self::with_recorded), prepared for each connection
+/// beforehand and moved in when it happens, so polling allocates nothing.
 #[derive(Clone, Debug)]
 pub struct ScriptedInput {
     items: Vec<ScriptItem>,
     next: usize,
-    recorded: Vec<(DeviceId, Vec<ControlId>)>,
+    /// The recorded controls for each `Connect` item, by item index.
+    connect_lists: Vec<Option<Vec<ControlId>>>,
 }
 
 impl ScriptedInput {
@@ -48,17 +50,22 @@ impl ScriptedInput {
     #[must_use]
     pub fn new(mut items: Vec<ScriptItem>) -> Self {
         items.sort_by_key(|i| i.at);
+        let connect_lists = vec![None; items.len()];
         Self {
             items,
             next: 0,
-            recorded: Vec::new(),
+            connect_lists,
         }
     }
 
-    /// Records `controls` from `device` when the script connects it.
+    /// Records `controls` from `device` each time the script connects it.
     #[must_use]
     pub fn with_recorded(mut self, device: DeviceId, controls: Vec<ControlId>) -> Self {
-        self.recorded.push((device, controls));
+        for (item, list) in self.items.iter().zip(&mut self.connect_lists) {
+            if matches!(item.action, Action::Connect(d, _) if d == device) {
+                *list = Some(controls.clone());
+            }
+        }
         self
     }
 
@@ -105,25 +112,26 @@ impl ScriptedInput {
                 InputKind::Disconnected => Action::Disconnect(device(ev.source)),
             },
         }));
+        // The controls of each source in the log, in one pass.
+        let mut buckets: Vec<Vec<ControlId>> = vec![Vec::new(); kinds.len()];
+        let controls = start
+            .held
+            .iter()
+            .map(|&(s, c, _)| (s, c))
+            .chain(events.iter().filter_map(|e| match e.kind {
+                InputKind::Control { control, .. } => Some((e.source, control)),
+                InputKind::Disconnected => None,
+            }));
+        for (source, control) in controls {
+            if let Some(bucket) = buckets.get_mut(source.index()) {
+                bucket.push(control);
+            }
+        }
         let mut script = Self::new(items);
-        for i in 0..kinds.len() {
-            let source = SourceId(u16::try_from(i).expect("a log's sources fit in u16"));
-            let mut controls: Vec<ControlId> =
-                start
-                    .held
-                    .iter()
-                    .filter(|h| h.0 == source)
-                    .map(|h| h.1)
-                    .chain(events.iter().filter(|e| e.source == source).filter_map(
-                        |e| match e.kind {
-                            InputKind::Control { control, .. } => Some(control),
-                            InputKind::Disconnected => None,
-                        },
-                    ))
-                    .collect();
-            controls.sort_unstable();
-            controls.dedup();
-            script = script.with_recorded(device(source), controls);
+        for (i, mut bucket) in buckets.into_iter().enumerate() {
+            bucket.sort_unstable();
+            bucket.dedup();
+            script = script.with_recorded(DeviceId(i as u64), bucket);
         }
         script
     }
@@ -144,14 +152,13 @@ impl InputAdapter for ScriptedInput {
             while let Some(item) = self.items.get(self.next)
                 && item.at == at
             {
+                let index = self.next;
                 self.next += 1;
                 match item.action {
                     Action::Connect(device, kind) => {
                         sources.connect(device, kind);
-                        if let Some((_, controls)) =
-                            self.recorded.iter().find(|(d, _)| *d == device)
-                        {
-                            sources.set_recorded(device, controls.clone());
+                        if let Some(controls) = self.connect_lists[index].take() {
+                            sources.set_recorded(device, controls);
                         }
                     }
                     Action::Disconnect(device) => sources.disconnect(device),

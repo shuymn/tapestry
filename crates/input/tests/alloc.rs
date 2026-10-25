@@ -1,6 +1,6 @@
 //! After construction and `open_recording`, batches allocate nothing:
 //! packets, pushes, publications, device changes, arrivals, overflow and
-//! focus rejection.
+//! focus rejection, and a scripted connect and reconnect.
 //!
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::TimeUs;
 use eval::ControlId;
-use input::{DeviceId, DeviceKind, Packet, SourceConfig, SourceSet};
+use input::{
+    Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceConfig,
+    SourceSet,
+};
 
 struct Counting;
 
@@ -97,6 +100,25 @@ fn batches_do_not_allocate() {
             popped += 1;
         }
     }
+    // A scripted connect, disconnect and reconnect while recording is open;
+    // the script is built outside the counted section.
+    TRACK.with(|t| t.set(false));
+    let item = |at, action| ScriptItem {
+        at: TimeUs(at),
+        action,
+    };
+    let device = DeviceId(20);
+    let mut script = ScriptedInput::new(vec![
+        item(15_000, Action::Connect(device, DeviceKind::Controller)),
+        item(15_100, Action::Disconnect(device)),
+        item(15_200, Action::Connect(device, DeviceKind::Controller)),
+    ])
+    .with_recorded(device, vec![ControlId(0x101), ControlId(0x102)]);
+    TRACK.with(|t| t.set(true));
+    for now in [15_000, 15_100, 15_200] {
+        script.poll(TimeUs(now), &mut set);
+    }
+    assert!(script.is_done());
     set.begin_batch(TimeUs(20_000));
     set.packet(&Packet {
         background: true,
@@ -109,7 +131,7 @@ fn batches_do_not_allocate() {
     assert!(readers[1].overflowed());
     assert!(set.overflowed());
     assert_eq!(set.arrivals().len(), 1);
-    assert_eq!(set.arrivals_dropped(), 1);
+    assert_eq!(set.arrivals_dropped(), 3);
     assert!(set.gate().is_tripped());
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 }
