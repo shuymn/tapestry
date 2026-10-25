@@ -343,10 +343,10 @@ A replay holds the inputs needed to reproduce evaluation. Judgment results are k
 | Rule | Preset ID, content hash, a copy of the preset itself. Session policy |
 | Device | Device type, receive method (Raw Input, MIDI, etc.), the record of report intervals and the estimated polling rate (or "not estimable"), key config, debounce, analog scratch settings, the three offsets |
 | Play type and evaluation conditions | Play type (full, mid-chart start, section repeat), section, attempt number, lead-in length, speed (the mapping between real time and chart time), initial gauge value (see the "Practice Records" subsection) |
-| Physical input | A sequence of `(pre-evaluation receive time µs, device ID, button/axis ID, value)`, plus device connect and disconnect events and, at the start of each play, a snapshot of the inputs already held. Times are delta-encoded and compressed |
+| Physical input | A sequence of `(pre-evaluation receive time µs, source ID, button/axis ID, value)` with the disconnect event of a source in the same stream. The held-input snapshot (`InputStart`: the time recording opened and the controls held at that point) precedes it. Devices that arrive during play are a separate arrivals list (time and kind), outside the input stream. Times are delta-encoded per source and compressed |
 | Offset changes | Changes applied by automatic offset adjustment (time, new value) |
 | Other operations | Hi-speed and lane cover changes (a stream separate from the judgment input) |
-| Status | End status (played to the end, ended midway), whether input is incomplete. Start token for IR (optional) |
+| Status | End status (played to the end, ended midway), the finalized watermark at the end (an aborted play is re-evaluated up to it), whether input is incomplete and why. Start token for IR (optional) |
 
 The format uses a custom schema, and version detection does not rely on the hash of the serialized output. For a chart of about 2000 notes, it fits in a few tens of KB even before compression.
 
