@@ -144,6 +144,22 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
         }
     }
 
+    /// When the output's next buffer event is due.
+    pub(crate) fn next_wake(&self) -> TimeUs {
+        self.output.next_wake()
+    }
+
+    /// Runs one engine step, for the output's next buffer event.
+    ///
+    /// # Errors
+    ///
+    /// The output's failure.
+    pub(crate) fn wake(&mut self, queue: &mut AudioQueue) -> Result<(), OutputError> {
+        self.engine
+            .step(&mut self.output, queue.commands())
+            .map(|_| ())
+    }
+
     /// Stops the play's audio (an abort): voices, pending starts and the
     /// remaining BGM stop, and queued key sounds are discarded.
     pub(crate) fn cancel(&mut self, queue: &mut AudioQueue) {

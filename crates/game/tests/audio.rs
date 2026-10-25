@@ -199,6 +199,11 @@ fn audio_flaky(
 /// One keyboard pressing lane 1 at each of `presses` (released 40 µs
 /// later), and losing focus at `focus`.
 fn key_script(presses: &[i64], focus: Option<i64>) -> ScriptedInput {
+    key_script_with(presses, 40, focus)
+}
+
+/// As [`key_script`], each press held `hold` µs.
+fn key_script_with(presses: &[i64], hold: i64, focus: Option<i64>) -> ScriptedInput {
     let key = |value| {
         Action::Packet(Packet {
             device: DeviceId(0),
@@ -217,7 +222,7 @@ fn key_script(presses: &[i64], focus: Option<i64>) -> ScriptedInput {
     )];
     for &t in presses {
         items.push(at(t, key(1)));
-        items.push(at(t + 40, key(0)));
+        items.push(at(t + hold, key(0)));
     }
     items.extend(focus.map(|t| at(t, Action::FocusLoss)));
     ScriptedInput::new(items).with_recorded(DeviceId(0), vec![control(lane(1))])
@@ -225,7 +230,7 @@ fn key_script(presses: &[i64], focus: Option<i64>) -> ScriptedInput {
 
 /// One sounded tap at 1 s, pressed exactly on its late edge (1.180 s) with
 /// no offset: the press and the song end are emitted together at 1.181 s.
-fn late_edge(out: Flaky) -> (RunOutcome, Vec<f32>) {
+fn late_edge(out: Flaky, step: i64) -> (RunOutcome, Vec<f32>) {
     let mut chart = ChartBuilder::new(150_000)
         .sound("a")
         .tap(lane(1), TimeUs(1_000 * MS))
@@ -239,7 +244,7 @@ fn late_edge(out: Flaky) -> (RunOutcome, Vec<f32>) {
     let audio = audio_flaky(&chart, common::bank(&chart), out);
     let mut runner =
         Runner::new(&chart, &rule, &dev, sources, script, config(), START, audio).unwrap();
-    let outcome = runner.run_to_end(TimeUs(MS));
+    let outcome = runner.run_to_end(TimeUs(step));
     (outcome, left(&runner))
 }
 
@@ -247,7 +252,7 @@ fn late_edge(out: Flaky) -> (RunOutcome, Vec<f32>) {
 fn a_key_sound_judged_with_the_song_end_is_still_mixed() {
     // The next wake, 1.190 s, comes after evaluation completed and must
     // still take the sound: wake j = 219 writes from frame 220 × 480.
-    let (outcome, samples) = late_edge(Flaky::new(START, 0));
+    let (outcome, samples) = late_edge(Flaky::new(START, 0), MS);
     assert_eq!(outcome, RunOutcome::Complete);
     assert_eq!(onsets(&samples), [220 * 480]);
 }
@@ -257,9 +262,67 @@ fn a_key_sound_taken_by_an_empty_write_is_rendered_by_the_next() {
     // The 1.190 s wake takes the sound but writes nothing, so it waits as a
     // pending start; the 1.200 s wake renders it, still from frame
     // 220 × 480 (the first one not written).
-    let (outcome, samples) = late_edge(Flaky::new(TimeUs(1_190 * MS), 1));
+    let (outcome, samples) = late_edge(Flaky::new(TimeUs(1_190 * MS), 1), MS);
     assert_eq!(outcome, RunOutcome::Complete);
     assert_eq!(onsets(&samples), [220 * 480]);
+}
+
+#[test]
+fn the_handoff_ends_at_the_wake_that_renders_the_last_sound() {
+    // Steps of 25 ms: the press at 1.180 s and the song end are emitted at
+    // the 1.200 s step, whose wake takes the sound but writes nothing. The
+    // 1.210 s wake renders it, from frame 221 × 480; the device fails from
+    // 1.220 s on, which the finished handoff must not reach.
+    let out = Flaky {
+        fail_from: TimeUs(1_220 * MS),
+        ..Flaky::new(TimeUs(1_200 * MS), 1)
+    };
+    let (outcome, samples) = late_edge(out, 25 * MS);
+    assert_eq!(outcome, RunOutcome::Complete);
+    assert_eq!(onsets(&samples), [221 * 480]);
+}
+
+#[test]
+fn a_healthy_backlog_of_sounds_completes() {
+    // 5000 key sounds pressed from 0.71 s, while the device misses every
+    // wake from 0.70 s to 1.20 s (passes 169 to 219), so all of them are
+    // still queued when evaluation completes at 1.181 s. Each wake after
+    // takes up to 1024, more than four wakes in all, and every one makes
+    // progress: the handoff completes.
+    let mut chart = ChartBuilder::new(150_000)
+        .sound("a")
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    chart.lanes[1][0].sound = Some(SoundId(0));
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let presses: Vec<i64> = (0..5_000).map(|k| 710 * MS + k * 20).collect();
+    let script = key_script_with(&presses, 10, None);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    let out = Flaky {
+        inner: SimDevice::new(SimConfig {
+            missed_wakes: (169..=219).collect(),
+            ..SimConfig::steady(RATE, PERIOD, START)
+        }),
+        ..Flaky::new(START, 0)
+    };
+    let audio = audio_flaky(&chart, common::bank(&chart), out);
+    let config = LogicConfig {
+        inputs: 16_384,
+        effects: 16_384,
+    };
+    let mut runner =
+        Runner::new(&chart, &rule, &dev, sources, script, config, START, audio).unwrap();
+    assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
+    let sounds = runner
+        .stream()
+        .iter()
+        .filter(|e| matches!(e.kind, eval::JudgeEventKind::PlaySound { .. }))
+        .count();
+    assert_eq!(sounds, 5_000);
+    assert_eq!(runner.queued_sounds(), 0);
+    assert_eq!(runner.audio().engine().mixer().pending(), 0);
 }
 
 #[test]

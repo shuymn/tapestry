@@ -21,17 +21,17 @@ pub enum RunOutcome {
     Aborted(AbortCause),
     /// The audio output failed; the run stopped at that step.
     OutputFailed(OutputError),
-    /// Evaluation completed, but the output rendered the last key sounds
-    /// within [`HANDOFF_WAKES`] buffer events; the run stopped there.
+    /// Evaluation completed, but the output did not render the last key
+    /// sounds: [`HANDOFF_WAKES`] buffer events in a row made no progress.
+    /// The run stopped there and the rest was cancelled.
     HandoffStalled,
 }
 
-/// Buffer events the runner waits, after evaluation completes, for the
-/// last key sounds to be rendered. The wake after the final step takes its
-/// sounds and renders each in the block it writes; each wake takes up to
-/// [`audio::MAX_PENDING_STARTS`], so four cover a final step of up to four
-/// times that many. An output that renders nothing in that time has
-/// stalled.
+/// Buffer events in a row without progress after which the runner stops
+/// waiting for the last key sounds. A healthy wake takes queued sounds (up
+/// to [`audio::MAX_PENDING_STARTS`]) and renders each in the block it
+/// writes, and a start waiting one or two periods ahead is rendered within
+/// three writes; an output that takes nothing for four wakes has stalled.
 pub const HANDOFF_WAKES: u32 = 4;
 
 /// Runs a scripted play on a [`VirtualClock`]. Each step moves the clock,
@@ -120,7 +120,8 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
     /// mixed; a focus loss known at the step stops it before the buffer
     /// events still due run, and so does a failed write. Once evaluation
     /// completes, the audio alone keeps running until every key sound has
-    /// been rendered, for at most [`HANDOFF_WAKES`] buffer events.
+    /// been rendered, unless [`HANDOFF_WAKES`] buffer events in a row make
+    /// no progress.
     ///
     /// # Panics
     ///
@@ -151,7 +152,7 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
             }
             self.render_step();
             if advance.complete {
-                return self.finish_handoff(step);
+                return self.finish_handoff();
             }
         }
     }
@@ -165,20 +166,31 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
     /// evaluation frozen, until no key sound is queued or waiting to start,
     /// so the last one is rendered. (How long the tail plays on is session
     /// policy.)
-    fn finish_handoff(&mut self, step: TimeUs) -> RunOutcome {
-        let mut wakes = 0;
-        while !(self.sounds.is_empty() && self.audio.engine().mixer().pending() == 0) {
-            if wakes >= HANDOFF_WAKES {
+    fn finish_handoff(&mut self) -> RunOutcome {
+        let mut idle = 0;
+        loop {
+            let queued = self.sounds.len();
+            let pending = self.audio.engine().mixer().pending();
+            if queued == 0 && pending == 0 {
+                return RunOutcome::Complete;
+            }
+            if idle >= HANDOFF_WAKES {
                 self.audio.cancel(&mut self.sounds);
                 return RunOutcome::HandoffStalled;
             }
-            self.clock.advance(step);
-            match self.audio.step(self.clock.now(), true, &mut self.sounds) {
-                Ok(n) => wakes += n,
-                Err(e) => return self.output_failed(e),
+            // One buffer event at a time, so completion is seen at the
+            // first wake that reaches it.
+            let at = self.audio.next_wake();
+            if at > self.clock.now() {
+                self.clock.set(at);
             }
+            if let Err(e) = self.audio.wake(&mut self.sounds) {
+                return self.output_failed(e);
+            }
+            let progressed =
+                self.sounds.len() < queued || self.audio.engine().mixer().pending() < pending;
+            idle = if progressed { 0 } else { idle + 1 };
         }
-        RunOutcome::Complete
     }
 
     /// The render step: drains the effects and reads the newest view.
