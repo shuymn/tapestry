@@ -16,8 +16,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPA
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentThreadId,
-    SetWaitableTimer, TIMER_ALL_ACCESS, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer,
+    TIMER_ALL_ACCESS, WaitForSingleObject,
 };
 use windows::Win32::UI::Input::{
     GetRawInputBuffer, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT,
@@ -32,7 +32,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use crate::InputAdapter;
 use crate::capture::Capture;
 use crate::gate::DeviceId;
 use crate::raw;
@@ -235,13 +234,13 @@ fn as_bytes(words: &[u64]) -> &[u8] {
 /// device arrivals and removals arrive as messages. Each keyboard is a
 /// device of its own, by handle.
 ///
-/// The window belongs to the thread that creates the adapter, so that
-/// thread must poll it; the input thread does both.
+/// The window belongs to the thread that creates the receiver, which
+/// polls and destroys it, so the receiver is not `Send` and stays on the
+/// input thread; [`InputThread`] is the handle other threads hold.
 #[derive(Debug)]
-pub struct RawInput {
-    /// The receiver window, as an integer so the adapter is `Send`.
-    hwnd: isize,
-    thread: u32,
+struct RawInput {
+    /// The receiver window; `HWND` keeps the receiver on its thread.
+    hwnd: HWND,
     clock: QpcClock,
     capture: Capture,
     /// 8-byte aligned, as `GetRawInputBuffer` requires.
@@ -257,7 +256,7 @@ impl RawInput {
     /// # Errors
     ///
     /// [`InputError::Os`] if the window or the registration fails.
-    pub fn new(clock: QpcClock, capture: Capture) -> Result<Self, InputError> {
+    fn new(clock: QpcClock, capture: Capture) -> Result<Self, InputError> {
         let class = w!("tapestry-raw-input");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(receiver_proc),
@@ -300,9 +299,7 @@ impl RawInput {
             return Err(InputError::os("RegisterRawInputDevices", e));
         }
         Ok(Self {
-            hwnd: hwnd.0 as isize,
-            // SAFETY: no preconditions.
-            thread: unsafe { GetCurrentThreadId() },
+            hwnd,
             clock,
             capture,
             one: vec![0; ONE_WORDS].into_boxed_slice(),
@@ -317,7 +314,7 @@ impl RawInput {
     /// # Errors
     ///
     /// [`InputError::Os`] if the device list cannot be read.
-    pub fn connect_present(&self, sources: &mut SourceSet) -> Result<(), InputError> {
+    fn connect_present(&self, sources: &mut SourceSet) -> Result<(), InputError> {
         let entry = size_of::<RAWINPUTDEVICELIST>() as u32;
         let failed =
             || InputError::os("GetRawInputDeviceList", windows::core::Error::from_thread());
@@ -422,16 +419,12 @@ fn deliver(block: &[u8], capture: &Capture, sources: &mut SourceSet) {
     }
 }
 
-impl InputAdapter for RawInput {
+impl RawInput {
     /// One batch: everything queued now, stamped `now`, then the
-    /// publication from a fresh clock read.
+    /// publication from a fresh clock read. It plays the part of
+    /// [`InputAdapter::poll`](crate::InputAdapter::poll), which needs a
+    /// `Send` adapter.
     fn poll(&mut self, now: TimeUs, sources: &mut SourceSet) {
-        debug_assert_eq!(
-            self.thread,
-            // SAFETY: no preconditions.
-            unsafe { GetCurrentThreadId() },
-            "RawInput is polled on the thread that created it"
-        );
         sources.begin_batch(now);
         let mut msg = MSG::default();
         // No message filter, so WM_INPUT_DEVICE_CHANGE is never dropped.
@@ -469,7 +462,7 @@ impl Drop for RawInput {
         // destroys the window this thread created.
         unsafe {
             let _ = RegisterRawInputDevices(&[device], size_of::<RAWINPUTDEVICE>() as u32);
-            let _ = DestroyWindow(HWND(self.hwnd as *mut c_void));
+            let _ = DestroyWindow(self.hwnd);
         }
     }
 }
@@ -489,17 +482,20 @@ pub struct WakeReport {
 /// The input thread: wakes at 1 kHz on a high-resolution timer under MMCSS
 /// "Games", reads QPC, receives everything Raw Input queued as one batch
 /// stamped with that read, publishes, and calls the owner's hook at the
-/// boundary after the batch.
+/// boundary after the batch. This handle may move between threads;
+/// dropping it stops and joins the thread, as [`stop`](Self::stop) does.
 #[derive(Debug)]
 pub struct InputThread {
     stop: Arc<AtomicBool>,
-    handle: JoinHandle<WakeReport>,
+    /// `None` once joined.
+    handle: Option<JoinHandle<WakeReport>>,
 }
 
 impl InputThread {
     /// Starts the thread with `sources`, connecting the keyboards present.
-    /// `on_wake` runs after each batch's publication with the batch time;
-    /// it is the boundary where the owner opens and closes recording, sets
+    /// `on_wake` runs after each batch's publication with a clock read
+    /// taken after it, which is the QPC read of that boundary (the batch
+    /// itself keeps its wake time); it is the boundary where the owner opens and closes recording, sets
     /// recorded controls and wakes the logic thread, and it must not
     /// allocate during play.
     ///
@@ -554,14 +550,19 @@ impl InputThread {
                     report.intervals.record(now.0.abs_diff(last.0));
                     last = now;
                     raw.poll(now, &mut sources);
-                    on_wake(&mut sources, now);
+                    // Polling may take a while after a scheduling stall;
+                    // the boundary is read after it.
+                    on_wake(&mut sources, clock.now());
                 }
                 drop(mmcss);
                 report
             })
             .map_err(InputError::Spawn)?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { stop, handle }),
+            Ok(Ok(())) => Ok(Self {
+                stop,
+                handle: Some(handle),
+            }),
             Ok(Err(e)) => {
                 let _ = handle.join();
                 Err(e)
@@ -576,8 +577,20 @@ impl InputThread {
     /// # Errors
     ///
     /// [`InputError::Panicked`] if the thread panicked.
-    pub fn stop(self) -> Result<WakeReport, InputError> {
+    pub fn stop(mut self) -> Result<WakeReport, InputError> {
+        self.shutdown().unwrap_or(Err(InputError::Panicked))
+    }
+
+    /// Signals the thread to stop and joins it; `None` if already joined.
+    fn shutdown(&mut self) -> Option<Result<WakeReport, InputError>> {
         self.stop.store(true, Ordering::Release);
-        self.handle.join().map_err(|_| InputError::Panicked)
+        let handle = self.handle.take()?;
+        Some(handle.join().map_err(|_| InputError::Panicked))
+    }
+}
+
+impl Drop for InputThread {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }

@@ -13,7 +13,7 @@
 //! path, and [`autoplay`] makes the inputs that hit every note of a chart.
 //!
 //! On Windows, the input thread (`InputThread`) receives keyboards
-//! through Raw Input (`RawInput`) and stamps each batch with the QPC
+//! through Raw Input and stamps each batch with the QPC
 //! read at its wake (`QpcClock`). Decoding the Raw Input packets
 //! ([`raw`]) and converting QPC ticks ([`qpc_to_us`]) are portable.
 //!
@@ -44,10 +44,11 @@ pub use scripted::{Action, ScriptItem, ScriptedInput, TimeOverflow, autoplay};
 pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, SourceSet};
 pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
 #[cfg(windows)]
-pub use win::{InputError, InputThread, QpcClock, RawInput, WakeReport};
+pub use win::{InputError, InputThread, QpcClock, WakeReport};
 
-/// Something that delivers input to a [`SourceSet`]: Raw Input on the input
-/// thread, or a script in tests.
+/// Something that delivers input to a [`SourceSet`], such as a script in
+/// tests. The Raw Input receiver polls the same way but is not `Send`: it
+/// stays on the input thread that owns its window.
 pub trait InputAdapter: Send {
     /// Delivers everything received up to `now`, in batches, and ends with
     /// a publication.
