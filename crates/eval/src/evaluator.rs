@@ -3,11 +3,15 @@
 
 use std::collections::VecDeque;
 
-use bms_model::{Chart, LANE_COUNT, Lane, NoteKind, SoundId, TimeUs};
-use rules::{Assignment, JudgeWindows, Judgment, MissRule, PerJudgment, RulePreset, SameTimeOrder};
+use bms_model::{Chart, LANE_COUNT, Lane, LnMode as ChartLnMode, NoteKind, SoundId, TimeUs};
+use rules::{
+    Assignment, Denominator, GaugeValue, JudgeWindows, Judgment, LateHeadRule, LnMode, MissRule,
+    PerJudgment, RulePreset, SameTimeOrder, TotalMode,
+};
 
 use crate::EvalError;
 use crate::convert::{ConversionState, LaneEdge};
+use crate::gauge::{Cause, GaugeState, Gauges, increment};
 use crate::input::{DeviceProfile, InputStart, PhysicalInputEvent, evaluation_time};
 
 /// One output of the evaluator.
@@ -53,6 +57,45 @@ pub enum JudgeEventKind {
         /// The sound.
         sound: SoundId,
     },
+    /// A long note whose head was judged finished.
+    LnEnd {
+        /// The note's lane.
+        lane: Lane,
+        /// The note's index in its lane of [`Chart::lanes`].
+        note: usize,
+        /// How it finished.
+        outcome: LnOutcome,
+    },
+    /// A mine passed while its lane was held.
+    MineHit {
+        /// The mine's lane.
+        lane: Lane,
+        /// The mine's index in its lane of [`Chart::lanes`].
+        note: usize,
+    },
+    /// A gauge's value after the event just before it. After each event
+    /// that changes gauges, every gauge is reported in the preset's order.
+    Gauge {
+        /// The gauge's index in the preset's gauges.
+        gauge: usize,
+        /// The real value.
+        value: GaugeValue,
+        /// The value had the gauge never failed.
+        reference: GaugeValue,
+    },
+    /// Evaluation is complete: the watermark reached the chart's final
+    /// deadline. Emitted once, at that deadline's time.
+    SongEnd,
+}
+
+/// How a long note finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LnOutcome {
+    /// Held to its end, released within the margin, or its head was pressed
+    /// at or after its end.
+    Completed,
+    /// Released too early: an LN break.
+    Broken,
 }
 
 /// Running totals of a play.
@@ -71,6 +114,8 @@ pub struct Tally {
     pub max_combo: u32,
     /// Number of empty POORs.
     pub empty_poor: u32,
+    /// Number of LN breaks.
+    pub ln_breaks: u32,
 }
 
 impl Tally {
@@ -88,6 +133,7 @@ impl Tally {
             combo: 0,
             max_combo: 0,
             empty_poor: 0,
+            ln_breaks: 0,
         }
     }
 
@@ -114,12 +160,18 @@ impl Tally {
     }
 }
 
-/// Kinds of chart deadline; at equal times they are processed in this
-/// order.
+/// Kinds of deadline; at equal times they are processed in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum DeadlineKind {
     /// The late edge of an unjudged note's miss window.
     Miss,
+    /// The end of a long note not yet finished.
+    LnEnd,
+    /// A mine passing.
+    Mine,
+    /// The chart's final deadline, after every lane deadline (not stored per
+    /// lane).
+    SongEnd,
 }
 
 /// A chart deadline, prepared at construction.
@@ -127,8 +179,9 @@ enum DeadlineKind {
 struct Deadline {
     time: TimeUs,
     kind: DeadlineKind,
-    /// Index into the lane's targets.
-    target: usize,
+    /// Index into the lane's targets for `Miss` and `LnEnd`; into the chart
+    /// lane for `Mine`.
+    index: usize,
 }
 
 /// One lane's notes to judge and its deadlines.
@@ -139,9 +192,14 @@ struct LaneState {
     targets: Vec<usize>,
     /// Whether each target is judged.
     judged: Vec<bool>,
+    /// Whether each target's long note is finished: completed, broken, or
+    /// its head missed. Unused for taps.
+    ln_finished: Vec<bool>,
+    /// The long note whose head was judged and which is held now.
+    holding: Option<usize>,
     /// The first unjudged target.
     cursor: usize,
-    /// Deadlines sorted by `(time, kind, target)`.
+    /// Deadlines sorted by `(time, kind, index)`.
     deadlines: Vec<Deadline>,
     /// The first deadline not yet processed or skipped.
     next: usize,
@@ -156,11 +214,15 @@ impl LaneState {
     }
 
     /// The first deadline still to process, skipping those whose own
-    /// condition says so: a miss deadline of a judged note.
+    /// condition says so: a miss deadline of a judged note, and an LN end of
+    /// a finished long note (a judged head does not finish it). A mine is
+    /// never skipped.
     fn head(&mut self) -> Option<Deadline> {
         while let Some(&d) = self.deadlines.get(self.next) {
             let skip = match d.kind {
-                DeadlineKind::Miss => self.judged[d.target],
+                DeadlineKind::Miss => self.judged[d.index],
+                DeadlineKind::LnEnd => self.ln_finished[d.index],
+                DeadlineKind::Mine | DeadlineKind::SongEnd => false,
             };
             if !skip {
                 return Some(d);
@@ -188,6 +250,12 @@ pub struct Evaluator<'a> {
     input_capacity: usize,
     /// The watermark last advanced to: everything at or before it is final.
     finalized: Option<TimeUs>,
+    /// The latest deadline of the chart; evaluation is complete once the
+    /// watermark reaches it.
+    final_deadline: TimeUs,
+    /// Whether [`JudgeEventKind::SongEnd`] was emitted.
+    ended: bool,
+    gauges: Gauges,
     seq: u64,
     tally: Tally,
 }
@@ -229,14 +297,15 @@ pub enum AdvanceError {
 
 impl<'a> Evaluator<'a> {
     /// Prepares evaluation: scales the windows by the chart's rank, builds
-    /// each lane's deadlines, and sets up input conversion from `start`.
-    /// `input_capacity` sizes the ring of inputs pushed but not yet
-    /// processed.
+    /// each lane's deadlines, computes the gauge increment, and sets up input
+    /// conversion from `start`. `input_capacity` sizes the ring of inputs
+    /// pushed but not yet processed.
     ///
     /// # Errors
     ///
-    /// An invalid preset, a rank whose scale is unusable, a deadline outside
-    /// the `i64` range, or a source binding one control twice.
+    /// An invalid preset, a rank whose scale is unusable, a long-note mode
+    /// the preset cannot judge, a chart without judgeable notes, a deadline
+    /// outside the `i64` range, or a source binding one control twice.
     pub fn new(
         chart: &'a Chart,
         rule: &'a RulePreset,
@@ -253,6 +322,10 @@ impl<'a> Evaluator<'a> {
         let miss_after = match rule.miss {
             MissRule::PoorAfterLateBad => windows.bad.late,
         };
+        match (rule.ln_mode.default, chart.meta.ln_mode) {
+            (LnMode::Ln, None | Some(ChartLnMode::Ln)) => {}
+            (LnMode::Ln, Some(mode)) => return Err(EvalError::UnsupportedLnMode(mode)),
+        }
         let mut lanes: [LaneState; LANE_COUNT] = Default::default();
         for (state, notes) in lanes.iter_mut().zip(&chart.lanes) {
             state.targets = notes
@@ -262,26 +335,61 @@ impl<'a> Evaluator<'a> {
                 .map(|(i, _)| i)
                 .collect();
             state.judged = vec![false; state.targets.len()];
-            state.deadlines = state
-                .targets
-                .iter()
-                .enumerate()
-                .map(|(target, &i)| {
-                    let time = notes[i]
-                        .time
-                        .checked_add(miss_after)
-                        .ok_or(EvalError::TimeOverflow)?;
-                    Ok(Deadline {
-                        time,
-                        kind: DeadlineKind::Miss,
-                        target,
-                    })
-                })
-                .collect::<Result<_, EvalError>>()?;
-            // Note times being sorted does not make deadlines sorted once
-            // other kinds join, so sort explicitly.
-            state.deadlines.sort_unstable();
+            state.ln_finished = vec![false; state.targets.len()];
+            let mut deadlines = Vec::with_capacity(notes.len() * 2);
+            for (target, &i) in state.targets.iter().enumerate() {
+                let note = notes[i];
+                let miss = note
+                    .time
+                    .checked_add(miss_after)
+                    .ok_or(EvalError::TimeOverflow)?;
+                deadlines.push(Deadline {
+                    time: miss,
+                    kind: DeadlineKind::Miss,
+                    index: target,
+                });
+                if let NoteKind::Long { end, .. } = note.kind {
+                    deadlines.push(Deadline {
+                        time: end,
+                        kind: DeadlineKind::LnEnd,
+                        index: target,
+                    });
+                }
+            }
+            for (i, note) in notes.iter().enumerate() {
+                if matches!(note.kind, NoteKind::Mine { .. }) {
+                    deadlines.push(Deadline {
+                        time: note.time,
+                        kind: DeadlineKind::Mine,
+                        index: i,
+                    });
+                }
+            }
+            // Note times being sorted does not make deadlines sorted (a tap
+            // at 1000 ms misses at 1180 ms, after a mine at 1100 ms).
+            deadlines.sort_unstable();
+            state.deadlines = deadlines;
         }
+        let notes = match rule.denominator {
+            Denominator::TapsAndLnHeads => lanes.iter().map(|l| l.targets.len()).sum::<usize>(),
+        };
+        if notes == 0 {
+            return Err(EvalError::NoJudgeableNotes);
+        }
+        let final_deadline = lanes
+            .iter()
+            .filter_map(|l| l.deadlines.last().map(|d| d.time))
+            .max()
+            .unwrap_or(TimeUs(0));
+        // A #TOTAL that is not positive counts as absent.
+        let total_milli = chart
+            .meta
+            .total_milli
+            .filter(|&t| t > 0)
+            .unwrap_or(rule.default_total_milli);
+        let increment = match rule.total_mode {
+            TotalMode::ScalesIncrease => increment(total_milli, notes),
+        };
         Ok(Self {
             chart,
             rule,
@@ -292,6 +400,9 @@ impl<'a> Evaluator<'a> {
             inputs: VecDeque::with_capacity(input_capacity),
             input_capacity,
             finalized: None,
+            final_deadline,
+            ended: false,
+            gauges: Gauges::new(&rule.gauges, increment),
             seq: 0,
             tally: Tally::new(),
         })
@@ -307,6 +418,26 @@ impl<'a> Evaluator<'a> {
     #[must_use]
     pub const fn tally(&self) -> &Tally {
         &self.tally
+    }
+
+    /// Every gauge's state, in the preset's order.
+    #[must_use]
+    pub fn gauges(&self) -> &[GaugeState] {
+        self.gauges.states()
+    }
+
+    /// The chart's latest deadline: tap and LN head misses, LN ends and
+    /// mines.
+    #[must_use]
+    pub const fn final_deadline(&self) -> TimeUs {
+        self.final_deadline
+    }
+
+    /// Whether evaluation is complete ([`JudgeEventKind::SongEnd`] was
+    /// emitted).
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.ended
     }
 
     /// Appends an input, in the order [`merge`](crate::merge) produced.
@@ -386,7 +517,8 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// The earliest pending deadline over all lanes, by (time, kind, lane).
+    /// The earliest pending deadline over all lanes, by (time, kind, lane);
+    /// once every lane deadline is done, the song end.
     fn next_deadline(&mut self) -> Option<(Deadline, usize)> {
         let mut best: Option<(Deadline, usize)> = None;
         for (lane, state) in self.lanes.iter_mut().enumerate() {
@@ -396,15 +528,56 @@ impl<'a> Evaluator<'a> {
                 best = Some((d, lane));
             }
         }
+        if best.is_none() && !self.ended {
+            let end = Deadline {
+                time: self.final_deadline,
+                kind: DeadlineKind::SongEnd,
+                index: 0,
+            };
+            return Some((end, 0));
+        }
         best
     }
 
     fn process_deadline(&mut self, d: Deadline, lane: usize, out: &mut Vec<JudgeEvent>) {
-        self.lanes[lane].next += 1;
+        if d.kind == DeadlineKind::SongEnd {
+            self.ended = true;
+            self.emit(d.time, None, JudgeEventKind::SongEnd, out);
+            return;
+        }
+        let state = &mut self.lanes[lane];
+        state.next += 1;
         match d.kind {
             DeadlineKind::Miss => {
-                self.judge(lane, d.target, Judgment::Poor, None, d.time, None, out);
+                // A missed head finishes its long note too.
+                state.ln_finished[d.index] = true;
+                self.judge(lane, d.index, Judgment::Poor, None, d.time, None, out);
             }
+            DeadlineKind::LnEnd => {
+                // An unjudged head still waits for its press or its miss. A
+                // judged one is held here, since a release would have
+                // finished it.
+                if state.judged[d.index] {
+                    state.holding = None;
+                    state.ln_finished[d.index] = true;
+                    self.ln_end(lane, d.index, LnOutcome::Completed, d.time, None, out);
+                }
+            }
+            DeadlineKind::Mine => {
+                if self.conversion.is_held(lane_of(lane)) {
+                    let damage = match self.chart.lanes[lane][d.index].kind {
+                        NoteKind::Mine { damage } => damage,
+                        NoteKind::Tap | NoteKind::Long { .. } => 0,
+                    };
+                    let kind = JudgeEventKind::MineHit {
+                        lane: lane_of(lane),
+                        note: d.index,
+                    };
+                    self.emit(d.time, None, kind, out);
+                    self.change_gauges(Cause::Mine(damage), d.time, None, out);
+                }
+            }
+            DeadlineKind::SongEnd => {}
         }
     }
 
@@ -416,8 +589,7 @@ impl<'a> Evaluator<'a> {
         for &edge in edges.as_slice() {
             match edge {
                 LaneEdge::Press(lane) => self.press(lane.index(), t, ev.received, out),
-                // Releases judge nothing for taps.
-                LaneEdge::Release(_) => {}
+                LaneEdge::Release(lane) => self.release(lane.index(), t, ev.received, out),
             }
         }
     }
@@ -473,6 +645,20 @@ impl<'a> Evaluator<'a> {
             let deviation = TimeUs(i64::try_from(deviation).unwrap_or(i64::MAX));
             let judgment = judgment_of(&self.windows, deviation);
             self.judge(lane, k, judgment, Some(deviation), t, Some(origin), out);
+            if let NoteKind::Long { end, .. } = note.kind {
+                let completed = match self.rule.ln_mode.late_head {
+                    // A head pressed at or after its end completes the LN at
+                    // the press; the following release is ignored.
+                    LateHeadRule::CompletesAtPress => t >= end,
+                };
+                let state = &mut self.lanes[lane];
+                if completed {
+                    state.ln_finished[k] = true;
+                    self.ln_end(lane, k, LnOutcome::Completed, t, Some(origin), out);
+                } else {
+                    state.holding = Some(k);
+                }
+            }
             return;
         }
         let gap = i128::from(note.time.0) - at;
@@ -497,7 +683,53 @@ impl<'a> Evaluator<'a> {
                 },
                 out,
             );
+            self.change_gauges(Cause::EmptyPoor, t, Some(origin), out);
         }
+    }
+
+    /// A release edge on `lane` at evaluation time `t`: finishes the held
+    /// long note, as a break if strictly earlier than its end minus the
+    /// margin.
+    fn release(&mut self, lane: usize, t: TimeUs, origin: TimeUs, out: &mut Vec<JudgeEvent>) {
+        let state = &mut self.lanes[lane];
+        let Some(k) = state.holding.take() else {
+            return;
+        };
+        state.ln_finished[k] = true;
+        let end = self.chart.lanes[lane][state.targets[k]].end();
+        let rule = self.rule.ln_break;
+        let broken = i128::from(t.0) < i128::from(end.0) - i128::from(rule.release_margin.0);
+        if !broken {
+            self.ln_end(lane, k, LnOutcome::Completed, t, Some(origin), out);
+            return;
+        }
+        // The head's judgment, counts and EX score stay.
+        self.tally.ln_breaks = self.tally.ln_breaks.saturating_add(1);
+        if rule.breaks_combo {
+            self.tally.combo = 0;
+        }
+        if rule.counts_bp {
+            self.tally.bp = self.tally.bp.saturating_add(1);
+        }
+        self.ln_end(lane, k, LnOutcome::Broken, t, Some(origin), out);
+        self.change_gauges(Cause::LnBreak, t, Some(origin), out);
+    }
+
+    fn ln_end(
+        &mut self,
+        lane: usize,
+        target: usize,
+        outcome: LnOutcome,
+        time: TimeUs,
+        origin: Option<TimeUs>,
+        out: &mut Vec<JudgeEvent>,
+    ) {
+        let kind = JudgeEventKind::LnEnd {
+            lane: lane_of(lane),
+            note: self.lanes[lane].targets[target],
+            outcome,
+        };
+        self.emit(time, origin, kind, out);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -530,6 +762,28 @@ impl<'a> Evaluator<'a> {
             combo: self.tally.combo,
         };
         self.emit(time, origin, kind, out);
+        self.change_gauges(Cause::Judged(judgment), time, origin, out);
+    }
+
+    /// Applies `cause` to every gauge and reports each gauge's value.
+    fn change_gauges(
+        &mut self,
+        cause: Cause,
+        time: TimeUs,
+        origin: Option<TimeUs>,
+        out: &mut Vec<JudgeEvent>,
+    ) {
+        self.gauges
+            .apply(&self.rule.gauges, &self.rule.mine, cause, time);
+        for gauge in 0..self.gauges.states().len() {
+            let s = self.gauges.states()[gauge];
+            let kind = JudgeEventKind::Gauge {
+                gauge,
+                value: s.value,
+                reference: s.reference,
+            };
+            self.emit(time, origin, kind, out);
+        }
     }
 
     fn emit(

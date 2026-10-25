@@ -117,10 +117,15 @@ fn advance_does_not_allocate() {
         })
         .count();
     assert_eq!(perfect, 2_000);
-    assert_eq!(out.len(), 2_000);
+    // Each judgment reports both gauges, and the song end comes last.
+    assert_eq!(out.len(), 2_000 * 3 + 1);
+    assert!(matches!(
+        out.last().map(|e| e.kind),
+        Some(JudgeEventKind::SongEnd)
+    ));
     assert_eq!(refused, Err(PushError::Full));
     assert_eq!(after_drain, Ok(()));
-    assert_eq!(burst_out.len(), 2);
+    assert_eq!(burst_out.len(), 2 * 3);
     assert_eq!(allocations, 0);
     let per_input = elapsed.as_nanos() / u128::try_from(inputs.len()).unwrap();
     println!(

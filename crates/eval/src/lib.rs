@@ -23,12 +23,16 @@
 mod convert;
 mod error;
 mod evaluator;
+mod gauge;
 mod input;
 mod merge;
 
 pub use convert::{ConversionState, Edges, LaneEdge};
 pub use error::EvalError;
-pub use evaluator::{AdvanceError, Evaluator, JudgeEvent, JudgeEventKind, PushError, Tally};
+pub use evaluator::{
+    AdvanceError, Evaluator, JudgeEvent, JudgeEventKind, LnOutcome, PushError, Tally,
+};
+pub use gauge::GaugeState;
 pub use input::{
     Binding, ControlId, DeviceProfile, InputKind, InputStart, PhysicalInputEvent, SourceId,
     SourceProfile, evaluation_time,
