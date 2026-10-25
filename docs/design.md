@@ -76,7 +76,7 @@ This is a game, and the correctness of judgment is merely the foundation for "be
 - The first target is a state where "one song can be played pleasantly to the end". IR, distribution, and skin compatibility are added after that.
 - Effects, screens, and the default judgment and gauge values are treated as things tuned by playing. Tuning can be tried without restarting, by reloading presets and skins.
 - The default look (custom skin) and the default judgment are the face of this game. Make the standard setup fun to play without relying on compatible skins.
-- Build it to completion with the fewest extensions first. Only the extension points the first playable version needs are implemented; the others stay as boundaries in this document. Variations (other PCs and refresh rates, running alongside other software, skins, presets) are then added one at a time. If a design flaw blocks one of them, the affected part is rebuilt from scratch with that flaw taken into account. This is a personal project, so finishing the concept matters more than the effort it takes.
+- Build it to completion with the fewest extensions first. Every extension point exists in code from the start, but only the extensions the first playable version needs are plugged into them ("Extension Boundaries"). Variations (other PCs and refresh rates, running alongside other software, skins, presets) are then added one at a time. If a design flaw blocks one of them, the affected part is rebuilt from scratch with that flaw taken into account. This is a personal project, so finishing the concept matters more than the effort it takes.
 - Performance comes from doing what game development normally does (the "Performance" section): no wasted resources, and no over-engineering. Measured figures are tracked to find problems; they are not targets that stop work.
 
 ## Overall Architecture
@@ -207,14 +207,14 @@ Axis values are recorded raw with timestamps, and the evaluator converts them in
 - Whether the value is absolute or relative, wraparound on a full revolution, inversion of the rotation direction
 - The rotation threshold for counting as a press, and the time after movement stops before counting as a release
 - The rule for combining button input and analog input on the same lane
-- When a device is disconnected, every input that was pressed is treated as released
+- When a device is disconnected, a disconnect event is recorded in the physical input stream. On it, input conversion releases every input of that device that was pressed and clears that device's pending debounce and scratch state, so live play and re-evaluation handle it identically
 
 ### Watermark
 
 The watermark is the boundary that "no input with an earlier evaluation time will arrive from now on". The evaluation time is the receive time minus the input latency, converted to the chart's timeline.
 
-- Each input source (Raw Input, MIDI, etc.) has its own dedicated queue. A source puts all the events it has received into its queue, and then publishes the receive time `w_i` at that point. This order is kept.
-- The overall watermark is the minimum after converting each source's receive time into an evaluation time: `min_i(w_i − offset_i(w_i))`. The logic thread merges the events of the queues into one stream in a fixed total order before passing them to the evaluator.
+- Each input device is its own source, with its own dedicated queue and its own input latency offset (devices sharing one receive path, such as several Raw Input devices, are still separate sources). A source puts all the events it has received into its queue, and then publishes the receive time `w_i` at that point. This order is kept. Within one source, events keep their receive order, and because one offset applies to the whole source, that is also their evaluation-time order.
+- The overall watermark is the minimum after converting each source's receive time into an evaluation time: `min_i(w_i − offset_i(w_i))`. The logic thread merges the events of the queues into one stream ordered by evaluation time, with a fixed tie-break, before passing them to the evaluator.
 - For sources that deliver nothing on their own, such as a MIDI device with no input, the input thread periodically publishes on their behalf a notice that "there is nothing up to this time" (a receive-time update), so the watermark does not stall.
 - Events with the same time as the watermark are guaranteed to have been published before the watermark is published.
 - The input thread wakes at least at 1 kHz and advances the watermark even when there are no new events.
@@ -335,7 +335,7 @@ A replay holds the inputs needed to reproduce evaluation. Judgment results are k
 | Rule | Preset ID, content hash, a copy of the preset itself. Session policy |
 | Device | Device type, receive method (Raw Input, MIDI, etc.), the record of report intervals and the estimated polling rate (or "not estimable"), key config, debounce, analog scratch settings, the three offsets |
 | Play type and evaluation conditions | Play type (full, mid-chart start, section repeat), section, attempt number, lead-in length, speed (the mapping between real time and chart time), initial gauge value (see the "Practice Records" subsection) |
-| Physical input | A sequence of `(pre-evaluation receive time µs, device ID, button/axis ID, value)`. Times are delta-encoded and compressed |
+| Physical input | A sequence of `(pre-evaluation receive time µs, device ID, button/axis ID, value)`, plus device connect and disconnect events and, at the start of each play, a snapshot of the inputs already held. Times are delta-encoded and compressed |
 | Offset changes | Changes applied by automatic offset adjustment (time, new value) |
 | Other operations | Hi-speed and lane cover changes (a stream separate from the judgment input) |
 | Status | End status (played to the end, ended midway), whether input is incomplete. Start token for IR (optional) |
@@ -355,7 +355,7 @@ Mid-chart starts, section repeat, and excerpts from full-play records are all ha
 - **Target notes**: Only notes whose time falls within the section are targeted. An LN that crosses the start or the end is excluded entirely.
 - **Input acceptance range**: Decided separately from the selection of target notes. Presses during the lead-in before the start are accepted only if they fall within the early judgment window of the first target note. After the end, too, the watermark is advanced and judgments are finalized up to the last judgment deadline of the target notes (late judgment window, miss deadline, LN release deadline).
 - **Evaluator state**: Judgment and gauge state are initialized at the section start. The initial gauge value (a fixed-point value) is set by the practice settings.
-- **Input conversion state**: The keys pressed at the start, pending debounce, and the accumulated scratch and hysteresis state are reconstructed from the input in the lead-in. A key held down across the start is treated as already pressed at the start and is not counted as a new press.
+- **Input conversion state**: The keys pressed at the start, pending debounce, and the accumulated scratch and hysteresis state are reconstructed from all physical input before the start: from the play's held-input snapshot and every event up to the start, not only the lead-in. A key held down across the start is treated as already pressed at the start and is not counted as a new press. Judgment and gauge state are reset separately, as above.
 - **Offsets**: The recorded changes are used as is, including the value at the start and any interpolation segment in progress.
 
 `evaluate` accepts these section conditions (section, lead-in length, initial gauge value, offset changes). Without the conditions, it evaluates the whole chart.
@@ -532,7 +532,7 @@ Many people play while streaming or recording, so the game does not, for the sak
 
 ### Settings Profiles
 
-The rules above are a commitment for the standard settings. Only when players choose it themselves may exclusive methods be used to cut latency.
+The rules above are a commitment for the standard settings. Only when players choose it themselves may exclusive methods be used to cut latency. The first version builds only the standard profile; the low-latency priority and streaming profiles are later variations.
 
 | Item | Standard | Low-latency priority | Streaming |
 | --- | --- | --- | --- |
@@ -590,11 +590,26 @@ Extensions can plug in only at named extension points. Evaluation has no plug-in
 
 Conversely, judgment logic is placed in core and fixed, to preserve fairness and reproducibility. Rule-specific evaluation implementations are only those built into the evaluator, and no mechanism is built for users to extend judgment rules with code.
 
-This extension point table is a commitment about where extensions belong; it does not mean everything is built as a generic mechanism from the start. The initial implementation keeps only the boundaries between the evaluator and everything else (input log, presets, judgment event stream), and each adapter is built when it becomes necessary.
+The extension points exist from the first version as named interfaces in code, and core runs through them; what is kept to a minimum is the extensions plugged into them. The first playable version (stages 1–3) plugs in only what it needs to be played to completion ("How We Build It"), and the rest are added one at a time later:
+
+| Extension point | Plugged in for the first version | Added later |
+| --- | --- | --- |
+| Ingestion | BMS/BME adapter, including `#RANDOM`, writing the common chart model | PMS, BMSON, and other formats |
+| Chart transformation | None (the stage exists between ingestion and evaluation and passes the chart through) | MIRROR, RANDOM options and the like |
+| Input | Raw Input adapter for keyboards and HID dedicated controllers | MIDI and other input adapters |
+| Evaluation | — (no plug-in point) | — |
+| Session policy | The default policy | GAS and other policies |
+| Output | Audio and rendering, receiving the judgment event stream | Statistics and other receivers |
+| Screen transition and session events | None | The event stream, the local event endpoint, and integrations built on them (OBS, Discord, overlays) |
+| Results | Re-evaluation under other presets (the game's core feature, shipped as the built-in result extension) | Other analysis screens |
+| Saving | Local saving of play records and input logs | Sending to IR, export |
+| Skins (through the skin adapter) | The declarative custom skin | LR2 and beatoraja skin adapters |
+
+Settings profiles follow the same rule: the first version ships the standard profile, and the low-latency priority and streaming profiles come later.
 
 ### Screen Transition and Session Events
 
-Core streams changes in screen and play state (song selection, play start, pause, failure, play end, result display) as timestamped events. All integrations with streaming and external tools are built as extensions that receive these events.
+Built as a later variation, not in the first version. Core streams changes in screen and play state (song selection, play start, pause, failure, play end, result display) as timestamped events. All integrations with streaming and external tools are built as extensions that receive these events.
 
 - Extensions receive on a separate thread from a bounded queue. When the queue overflows, old events are dropped, and the game does not wait. Even if an extension fails, the game simply continues.
 - Events carry a session ID and a sequence number, and the current state can also be fetched at any time. When an extension notices a gap in sequence numbers or a reconnect, it re-fetches the current state. Even if events are missed, re-fetching the state gets back to the correct state.
@@ -603,7 +618,7 @@ Core streams changes in screen and play state (song selection, play start, pause
 
 ### Local Event Endpoint
 
-A generic endpoint (a local WebSocket) that can be connected to only from within this PC is provided, exposing the events above and the current state. OBS scripts, streaming overlays displayed in a browser, and statistics tools can be built on this endpoint without rebuilding the player.
+Built with the screen transition and session events, as a later variation. A generic endpoint (a local WebSocket) that can be connected to only from within this PC is provided, exposing the events above and the current state. OBS scripts, streaming overlays displayed in a browser, and statistics tools can be built on this endpoint without rebuilding the player.
 
 - It listens only on loopback addresses and is disabled by default.
 - A connection requires a random connection token issued from the settings screen. Nothing is sent until authentication completes.
@@ -623,7 +638,7 @@ A generic endpoint (a local WebSocket) that can be connected to only from within
 
 | Scope | Owner | Examples |
 | --- | --- | --- |
-| Device | This PC and this device | The three offsets, debounce, polling, audio device, buffer, the OBS connection target (the password is kept in the OS credential store), whether the local event endpoint is enabled |
+| Device | This PC and this device | The three offsets, debounce, polling, audio device, buffer; with their variations, the OBS connection target (the password is kept in the OS credential store) and whether the local event endpoint is enabled |
 | Player | The person playing | Hi-speed, lane cover, the presets and skins used, session policy |
 | Preset | The person who authors rules | Judgment windows, gauge, `#RANK` conversion |
 | Chart | The chart author | `#RANK`, `#TOTAL`, specification of the LN judgment mode (the preset decides the interpretation and precedence) |
@@ -697,10 +712,11 @@ Built in a later roadmap stage, as an extension at the saving extension point. T
 | Audio and video | Decoder vulnerabilities | Use maintained decoders and narrow the supported codecs. Accept the remaining risk and keep dependencies up to date. Decoding in a separate process with restricted privileges is decided after measuring whether it is worth the handoff cost | 1 |
 | Archives | zip slip, zip bomb | Do not allow writes outside the extraction directory. Cap the extracted size and file count | 1 |
 | Dependencies | Supply chain attacks | Run `cargo-deny` and `cargo-audit` in CI, and pin the lockfile | 1 |
-| Local event endpoint | Connections from other PCs or malicious web pages, exfiltration of information | Listen only on loopback addresses, disabled by default. Authenticate with a connection token, and check `Host` and `Origin` against allowlists (the "Extension Boundaries" section). Input logs are not streamed | 2 |
+| Local event endpoint | Connections from other PCs or malicious web pages, exfiltration of information | Listen only on loopback addresses, disabled by default. Authenticate with a connection token, and check `Host` and `Origin` against allowlists (the "Extension Boundaries" section). Input logs are not streamed | With its variation |
 | Development features | Abuse of scenario launch or external control left in production builds | Remove the code entirely from production builds with Cargo features, and verify the removal in CI (the "Testing Strategy" section) | 1 |
 | Auto-update | Distribution of malicious code to all users | Sign update files and verify them. Use Windows code signing | 2 |
-| Skins | Code execution via Lua, infinite loops | Run Lua only at load time. Build the environment allowlist-style, without `io`, `os`, `dofile`, `loadfile`, `debug`, unrestricted `package`, or module loading. Cap memory, instruction count including coroutines, and calls to host functions. Expressions in the declarative format also have caps on size and evaluation cost. Cap image dimensions and decoded size, and restrict the files that skins and charts reference to within their respective folders | 3 |
+| Skins | Resource exhaustion, reading outside the skin | Expressions in the declarative format have caps on size and evaluation cost. Cap image dimensions and decoded size, and restrict the files that skins and charts reference to within their respective folders | 3 |
+| Lua skins | Code execution via Lua, infinite loops | Run Lua only at load time. Build the environment allowlist-style, without `io`, `os`, `dofile`, `loadfile`, `debug`, unrestricted `package`, or module loading. Cap memory, instruction count including coroutines, and calls to host functions | With the beatoraja skin adapter |
 | Modified clients | Fabricated input logs | Assume it cannot be prevented, and rely on detection and human review (the "Countermeasures Against Cheating and Piracy" section) | 4 |
 | Others' logs | Resubmission of someone else's record | Bind start tokens to accounts. The hash of the submission is only a hint of duplication and cannot identify modified copies | 4 |
 | Evaluator version | Claiming an old version with bugs | The server computes only with its own evaluator. The client's version is treated as informational only | 4 |
@@ -873,11 +889,11 @@ Verify the properties the evaluator must satisfy, not agreement with the results
 - With the order of inputs preserved, changing the steps by which the watermark advances does not change the result
 - In single-note judgment with a fixed mapping between input and note, widening the judgment window never makes the judgment worse (in whole-chart evaluation this does not hold, because an earlier input can take a different note)
 - Survival gauges never recover once they reach 0
-- Given the same section, the same lead-in input, the same time mapping, and the same offset changes, the evaluation of a section excerpted from a full input log matches the evaluation of a mid-chart start
+- Given the same section, the same input conversion state at the start of the lead-in, the same lead-in input, the same time mapping, and the same offset changes, the evaluation of a section excerpted from a full input log matches the evaluation of a mid-chart start
 
 Whole-chart evaluation focuses on the fragile spots: inputs exactly on a judgment window boundary, the processing order of events at the same time, mashing, LN release and re-press, and inputs that arrive exactly at the watermark boundary.
 
-Agreement between the native and WASM builds is verified end to end, not just for the evaluator. From the chart file's bytes and the input log, the resolved chart hash and the judgment event stream are computed on both the native build and the actually deployed Workers, and compared. The loader, evaluator, and preset versions are fixed, and overflow handling and the order of events at the same time follow explicit rules. Agreement between incremental and batch evaluation is also verified with input logs that include offset changes and events at the same time.
+From the IR stage on, agreement between the native and WASM builds is verified end to end, not just for the evaluator. From the chart file's bytes and the input log, the resolved chart hash and the judgment event stream are computed on both the native build and the actually deployed Workers, and compared. The loader, evaluator, and preset versions are fixed, and overflow handling and the order of events at the same time follow explicit rules from stage 1. Agreement between incremental and batch evaluation is also verified with input logs that include offset changes and events at the same time.
 
 In addition, each preset has a few dozen small hand-written examples of "this input gives this judgment", to detect unintended changes when presets are tuned. The evaluator is also checked with property tests (generating random input logs).
 
@@ -902,7 +918,7 @@ Tests without threads do not find bugs in notifications or queues. So a small nu
 
 - **Scenario launch**: The app can be launched with a scenario (`--scenario scenario.toml`) that describes "load this chart, feed this input log, save the screen at this time, exit". The same scenario is used whether a human or an AI does the checking.
 - **Specifying the start position**: From the command line or a scenario, the app can be launched with a specified start position for the practice "mid-chart start" (the "Input Logs and Replays" section). It uses the same mechanism as the product's practice feature, and the development build adds only the way to specify it. It is used in combination with preset and skin reloading.
-- **External control**: Load, start, and screen-save operations are added to the local event endpoint. The event endpoint is by nature receive-only, so this is an exception for development builds only, and the connection token and loopback restrictions still apply.
+- **External control** (once the local event endpoint exists): Load, start, and screen-save operations are added to the local event endpoint. The event endpoint is by nature receive-only, so this is an exception for development builds only, and the connection token and loopback restrictions still apply.
 - **Measurement output**: On each judgment, the app can flash a square at a fixed position on the screen and emit a test sound (used by the test device below).
 
 ### Separating Development and Production Builds
@@ -934,7 +950,7 @@ Feel, local dedicated controllers, running alongside OBS (once that variation is
 | 0 | A short technical spike (meant to be thrown away) on the development PC at WQHD 240 Hz: run high-speed scrolling with 10,000+ notes, 100+ simultaneous voices, 1080p BGA, and effects on all lanes at the same time. When done, move to stage 1 immediately | The rendering and audio approach runs on the real path on the development PC. Each player-visible problem found has a cause and a design response, or is recorded as an open question or a later variation. The indicators the spike can measure are implemented, and their stage 0 values are recorded as a baseline; the others are recorded as not yet measured |
 | 1 | The minimal setup for playing one song: chart loading, input, audio, a simple play screen, an evaluator with one custom preset, saving the input log. Also includes key config, volume, offset, hi-speed, and instant retry. The testing mechanisms (swappable clock and I/O, processing that can advance without threads) are also put in here | One chart on hand can be played to the end without feeling latency or stutter. Key sound and frame latency can be measured and displayed |
 | 2 | One full gameplay loop: song selection, results, retry, practice (section repeat and speed change), beatoraja-style and LR2-style presets with switching on the result screen, `eval-cli`, and development features such as scenario launch. The test input device is built in this stage or the next | Song selection through play, results, and retry can be played repeatedly. The property tests pass |
-| 3 | Look and effects: the declarative custom skin format, polished effects, followed by the LR2 and beatoraja skin adapters | Playing with the standard skin is fun. The play screen can be displayed with representative existing skins |
+| 3 | Look and effects: the declarative custom skin format and polished effects. The LR2 and beatoraja skin adapters come after this, as variations ("Extension Boundaries") | Playing with the standard skin is fun |
 | 4 | Custom IR (server-side computation, start registration, impossible-input detection, allowlist) | Input logs can be sent, and rankings for multiple presets can be viewed |
 | 5 | Chart registry (catalog only) and installer | Difficulty tables can be installed in one go, and derivative chart dependencies can be resolved |
 | 6 | Connecting to existing IRs | Scores computed with the specified preset can be sent in the existing format |
@@ -943,7 +959,7 @@ Feel, local dedicated controllers, running alongside OBS (once that variation is
 >
 > Until stage 3 is finished, IR, the distribution registry, anti-cheat, and servers are not touched. The only things decided before then in preparation for a future IR and the like are the input log format and the evaluator boundary, so that these can be added later. The later sections of this design document are designs for building at that point, not reasons to build earlier.
 
-Between stages 1 and 2, a generous period of playing and fixing is set aside. IR (stage 4 onward) is started once a state that is fun to play exists. The input log format carries a version number from stage 1, and only its core parts (physical input, time, chart identification, and the preset record) are included from the start. Other fields are added while bumping the version. Crates, too, start out consolidated into a few, and are split once the boundaries become clear.
+After stage 3, variations (other chart formats, input adapters, skin adapters, settings profiles, other PCs, running alongside other software) are added one at a time as needed, before or alongside the later stages. Between stages 1 and 2, a generous period of playing and fixing is set aside. IR (stage 4 onward) is started once a state that is fun to play exists. The input log format carries a version number from stage 1, and only its core parts (physical input, time, chart identification, and the preset record) are included from the start. Other fields are added while bumping the version. Crates, too, start out consolidated into a few, and are split once the boundaries become clear.
 
 ## Open Questions
 
