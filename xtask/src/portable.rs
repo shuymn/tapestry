@@ -18,6 +18,7 @@ const REQUIRED_PORTABLE: &[&str] = &[
     "rules",
     "eval",
     "replay",
+    "input",
     "xtask",
 ];
 

@@ -202,6 +202,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "input"
+version = "0.0.0"
+dependencies = [
+ "bms-model",
+ "eval",
+ "rtrb",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,6 +343,12 @@ dependencies = [
  "sha2",
  "zstd",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9278fb35b3e730abe136e9b395b5b81b96d06b9f5478a50f0c8430a2237b22de"
 
 [[package]]
 name = "rules"

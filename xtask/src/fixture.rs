@@ -35,6 +35,11 @@ pub fn baseline() -> Vec<Crate> {
              eval = { path = \"../eval\" }\n\
              rules = { path = \"../rules\" }\n",
         ),
+        lib(
+            "input",
+            "[dependencies]\nbms-model = { path = \"../bms-model\" }\n\
+             eval = { path = \"../eval\" }\n",
+        ),
         (
             "player",
             "[package.metadata.tapestry]\nwindows-only = true\n\
