@@ -1,0 +1,21 @@
+[package]
+name = "audio"
+version = "0.0.0"
+description = "Sound bank, mixer and audio clock; WASAPI output on Windows."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bms-model.workspace = true
+rtrb.workspace = true
+rubato.workspace = true
+sha2.workspace = true
+symphonia.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
