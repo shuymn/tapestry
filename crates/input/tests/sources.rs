@@ -1,6 +1,9 @@
 //! Source queues, the watermark protocol, recording and the focus gate.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bms_model::{ChartBuilder, Lane, TimeUs};
 use eval::{
@@ -25,7 +28,7 @@ fn config() -> SourceConfig {
         max_held: 16,
         queue_capacity: 1024,
         max_arrivals: 2,
-        recorded: vec![A, B, C],
+        recorded: vec![(DeviceKind::Keyboard, vec![A, B, C])],
     }
 }
 
@@ -52,7 +55,7 @@ fn drain(reader: &mut SourceReader) -> Vec<PhysicalInputEvent> {
 
 /// A set with keyboards `0..n` connected, in that order.
 fn keyboards(n: u64) -> SourceSet {
-    let mut set = SourceSet::new(config());
+    let mut set = SourceSet::new(config()).unwrap();
     set.begin_batch(TimeUs(0));
     for d in 0..n {
         set.connect(DeviceId(d), DeviceKind::Keyboard);
@@ -74,31 +77,52 @@ fn batch(set: &mut SourceSet, at: i64, packets: &[Packet], fresh: i64) {
 fn events_published_before_watermark_are_visible() {
     const BATCHES: i64 = 250_000;
     const PER_BATCH: i64 = 4;
+    // A queue far smaller than the stream: the producer waits for room, so
+    // the two threads interleave throughout.
+    const QUEUE: i64 = 64;
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut set = SourceSet::new(SourceConfig {
-        queue_capacity: 1 << 20,
+        queue_capacity: QUEUE as usize,
         ..config()
-    });
+    })
+    .unwrap();
     set.begin_batch(TimeUs(-1));
     set.connect(DeviceId(0), DeviceKind::Keyboard);
     set.open_recording(TimeUs(-1));
     let mut reader = set.take_readers().pop().unwrap();
-    let producer = thread::spawn(move || {
-        for t in 0..BATCHES {
-            set.begin_batch(TimeUs(t));
-            for i in 0..PER_BATCH {
-                set.packet(&key(0, [A, B][(i % 2) as usize], (i % 2) as i32));
+    let consumed = Arc::new(AtomicI64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let producer = {
+        let (consumed, done) = (Arc::clone(&consumed), Arc::clone(&done));
+        thread::spawn(move || {
+            for t in 0..BATCHES {
+                while (t + 1) * PER_BATCH - consumed.load(Ordering::Acquire) > QUEUE {
+                    assert!(Instant::now() < deadline, "producer timed out");
+                    thread::yield_now();
+                }
+                set.begin_batch(TimeUs(t));
+                for i in 0..PER_BATCH {
+                    set.packet(&key(0, [A, B][(i % 2) as usize], (i % 2) as i32));
+                }
+                // The fresh read after the batch is `t + 1`.
+                set.end_batch(TimeUs(t + 1));
             }
-            // The fresh read after the batch is `t + 1`.
-            set.end_batch(TimeUs(t + 1));
-        }
-        set.overflowed()
-    });
+            done.store(true, Ordering::Release);
+            set.overflowed()
+        })
+    };
     let total = BATCHES * PER_BATCH;
     let mut popped = 0;
-    let mut checks = 0u64;
+    // Checks that found a new prefix while the producer was still running.
+    let mut intermediate = 0u64;
     while popped < total {
+        assert!(Instant::now() < deadline, "consumer timed out");
+        let running = !done.load(Ordering::Acquire);
         let w = reader.published().received_up_to.0;
         let due = if w < 0 { 0 } else { (w + 1) * PER_BATCH };
+        if running && due > popped {
+            intermediate += 1;
+        }
         while popped < due {
             let e = reader.pop().unwrap_or_else(|| {
                 panic!("event {popped} received at or before {w} is not poppable")
@@ -106,11 +130,14 @@ fn events_published_before_watermark_are_visible() {
             assert!(e.received.0 <= w);
             popped += 1;
         }
-        checks += 1;
+        consumed.store(popped, Ordering::Release);
+        thread::yield_now();
     }
     assert!(!producer.join().unwrap());
     assert_eq!(popped, 1_000_000);
-    assert!(checks > 0);
+    // The producer cannot run more than one queue ahead, so most of the
+    // stream is checked prefix by prefix while it runs.
+    assert!(intermediate >= 1_000, "{intermediate}");
     assert!(!reader.overflowed());
 }
 
@@ -178,7 +205,8 @@ fn overflow_is_flagged_never_silent() {
     let mut set = SourceSet::new(SourceConfig {
         queue_capacity: 4,
         ..config()
-    });
+    })
+    .unwrap();
     set.begin_batch(TimeUs(0));
     set.connect(DeviceId(0), DeviceKind::Keyboard);
     set.open_recording(TimeUs(0));
@@ -280,7 +308,7 @@ fn focus_script() -> Vec<ScriptItem> {
 
 #[test]
 fn bound_keys_after_focus_loss_are_never_recorded() {
-    let mut set = SourceSet::new(config());
+    let mut set = SourceSet::new(config()).unwrap();
     let mut script = ScriptedInput::new(focus_script());
     script.poll(TimeUs(0), &mut set);
     set.open_recording(TimeUs(0));
@@ -385,7 +413,7 @@ fn scripted_log_first_event_at_opened_at_is_recorded() {
     ];
     let mut script =
         ScriptedInput::from_log(&start, &log, &[DeviceKind::Keyboard, DeviceKind::Keyboard]);
-    let mut set = SourceSet::new(config());
+    let mut set = SourceSet::new(config()).unwrap();
     script.poll(TimeUs(999), &mut set);
     assert_eq!(set.open_recording(TimeUs(1_000)), start);
     let mut readers = set.take_readers();
@@ -417,7 +445,7 @@ fn autoplay_presses_every_note_and_releases_before_the_next() {
             })
             .to_vec(),
     };
-    let events = autoplay(&chart, &profile);
+    let events = autoplay(&chart, &profile).unwrap();
     assert_eq!(
         events,
         [
@@ -478,7 +506,8 @@ fn source_and_device_limits_mark_the_log_incomplete() {
     let mut set = SourceSet::new(SourceConfig {
         max_sources: 2,
         ..config()
-    });
+    })
+    .unwrap();
     set.begin_batch(TimeUs(0));
     for d in [4, 5, 6] {
         set.connect(DeviceId(d), DeviceKind::Keyboard);
@@ -491,7 +520,8 @@ fn source_and_device_limits_mark_the_log_incomplete() {
     let mut set = SourceSet::new(SourceConfig {
         max_devices: 2,
         ..config()
-    });
+    })
+    .unwrap();
     set.begin_batch(TimeUs(0));
     for d in [4, 5, 6] {
         set.connect(DeviceId(d), DeviceKind::Keyboard);
@@ -510,7 +540,8 @@ fn full_held_state_marks_the_log_incomplete() {
     let mut set = SourceSet::new(SourceConfig {
         max_held: 2,
         ..config()
-    });
+    })
+    .unwrap();
     set.begin_batch(TimeUs(0));
     set.connect(DeviceId(3), DeviceKind::Keyboard);
     set.open_recording(TimeUs(1));
@@ -518,6 +549,181 @@ fn full_held_state_marks_the_log_incomplete() {
     assert!(!set.overflowed());
     batch(&mut set, 20, &[key(3, C, 3)], 21);
     assert!(set.overflowed());
+    // The retry's snapshot lacks C, so its log is incomplete too.
     let start = set.open_recording(TimeUs(30));
     assert_eq!(start.held, [(SourceId(0), A, 1), (SourceId(0), B, 2)]);
+    assert!(set.overflowed());
+    // A device that arrives and loses state does not take part: no flag.
+    set.begin_batch(TimeUs(35));
+    set.connect(DeviceId(4), DeviceKind::Keyboard);
+    batch(
+        &mut set,
+        40,
+        &[key(4, A, 4), key(4, B, 5), key(4, C, 6)],
+        41,
+    );
+    // Removing the first device clears its loss; the second, lost before
+    // this opening, still makes the play incomplete.
+    set.begin_batch(TimeUs(50));
+    set.disconnect(DeviceId(3));
+    set.connect(DeviceId(3), DeviceKind::Keyboard);
+    set.open_recording(TimeUs(60));
+    assert!(set.overflowed());
+    set.begin_batch(TimeUs(70));
+    set.disconnect(DeviceId(4));
+    let start = set.open_recording(TimeUs(80));
+    assert!(start.held.is_empty());
+    assert!(!set.overflowed());
+}
+
+#[test]
+fn arrival_losing_state_during_play_leaves_the_log_complete() {
+    let mut set = SourceSet::new(SourceConfig {
+        max_held: 1,
+        ..config()
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    set.connect(DeviceId(1), DeviceKind::Keyboard);
+    set.open_recording(TimeUs(5));
+    set.begin_batch(TimeUs(10));
+    set.connect(DeviceId(2), DeviceKind::Keyboard);
+    batch(&mut set, 20, &[key(2, A, 1), key(2, B, 2)], 21);
+    assert!(!set.overflowed());
+}
+
+#[test]
+fn bindings_are_per_source_kind() {
+    const D: ControlId = ControlId(0x101);
+    let mut set = SourceSet::new(SourceConfig {
+        recorded: vec![
+            (DeviceKind::Keyboard, vec![A]),
+            (DeviceKind::Controller, vec![D]),
+        ],
+        ..config()
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    set.connect(DeviceId(5), DeviceKind::Keyboard);
+    set.connect(DeviceId(6), DeviceKind::Controller);
+    // Each device holds its own control and the other's.
+    batch(
+        &mut set,
+        10,
+        &[key(5, A, 1), key(5, D, 2), key(6, A, 3), key(6, D, 4)],
+        11,
+    );
+    let start = set.open_recording(TimeUs(20));
+    let mut readers = set.take_readers();
+    assert_eq!(start.held, [(SourceId(0), A, 1), (SourceId(1), D, 4)]);
+    batch(
+        &mut set,
+        30,
+        &[key(5, A, 0), key(5, D, 0), key(6, A, 0), key(6, D, 0)],
+        31,
+    );
+    assert_eq!(drain(&mut readers[0]), [ev(30, 0, A, 0)]);
+    assert_eq!(drain(&mut readers[1]), [ev(30, 1, D, 0)]);
+}
+
+#[test]
+fn scripted_focus_loss_without_later_input_stops_publication() {
+    let item = |at: i64, action| ScriptItem {
+        at: TimeUs(at),
+        action,
+    };
+    let mut script = ScriptedInput::new(vec![
+        item(0, Action::Connect(DeviceId(0), DeviceKind::Keyboard)),
+        item(500, Action::FocusLoss),
+    ]);
+    let mut set = SourceSet::new(config()).unwrap();
+    script.poll(TimeUs(0), &mut set);
+    set.open_recording(TimeUs(0));
+    let readers = set.take_readers();
+    script.poll(TimeUs(400), &mut set);
+    assert_eq!(readers[0].published(), Published::open(TimeUs(399)));
+    for now in [500, 600, 700] {
+        script.poll(TimeUs(now), &mut set);
+    }
+    assert!(set.gate().is_tripped());
+    assert_eq!(readers[0].published(), Published::open(TimeUs(399)));
+}
+
+#[test]
+fn latch_set_outside_any_batch_stops_publication() {
+    let mut set = keyboards(1);
+    set.open_recording(TimeUs(0));
+    let readers = set.take_readers();
+    let latch = set.gate().handle();
+    set.end_batch(TimeUs(100));
+    latch.latch();
+    set.end_batch(TimeUs(200));
+    assert!(set.gate().is_tripped());
+    assert_eq!(readers[0].published(), Published::open(TimeUs(99)));
+}
+
+#[test]
+fn background_press_is_held_without_a_press_edge() {
+    let mut set = keyboards(1);
+    set.open_recording(TimeUs(0));
+    let mut readers = set.take_readers();
+    set.begin_batch(TimeUs(10));
+    let pressed = Packet {
+        background: true,
+        ..key(0, B, 7)
+    };
+    assert_eq!(set.packet(&pressed), Admit::Reject);
+    set.end_batch(TimeUs(11));
+    assert!(drain(&mut readers[0]).is_empty());
+    // Focus comes back; the next play starts with B held.
+    set.gate_mut().reset();
+    let start = set.open_recording(TimeUs(20));
+    let mut readers = set.take_readers();
+    assert_eq!(start.held, [(SourceId(0), B, 7)]);
+    batch(&mut set, 30, &[key(0, B, 0)], 31);
+    assert_eq!(drain(&mut readers[0]), [ev(30, 0, B, 0)]);
+}
+
+#[test]
+fn too_many_sources_are_refused_at_construction() {
+    let at_limit = SourceConfig {
+        max_sources: input::SOURCE_LIMIT,
+        ..config()
+    };
+    assert!(SourceSet::new(at_limit.clone()).is_ok());
+    let over = SourceConfig {
+        max_sources: input::SOURCE_LIMIT + 1,
+        ..at_limit
+    };
+    assert_eq!(
+        SourceSet::new(over).err(),
+        Some(input::ConfigError::TooManySources(65_537))
+    );
+}
+
+#[test]
+fn autoplay_refuses_times_outside_the_range() {
+    let lane = Lane::new(1).unwrap();
+    let chart = ChartBuilder::new(120_000)
+        .tap(lane, TimeUs(1_000_000))
+        .build()
+        .unwrap();
+    let profile = |offset| SourceProfile {
+        input_offset: TimeUs(offset),
+        bindings: vec![Binding { control: A, lane }],
+    };
+    // The release is at 1_050_000: the largest offset that fits.
+    let fits = i64::MAX - 1_050_000;
+    assert_eq!(
+        autoplay(&chart, &profile(fits))
+            .unwrap()
+            .last()
+            .unwrap()
+            .received,
+        TimeUs(i64::MAX)
+    );
+    assert_eq!(
+        autoplay(&chart, &profile(fits + 1)),
+        Err(input::TimeOverflow)
+    );
 }

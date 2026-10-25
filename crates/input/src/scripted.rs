@@ -130,19 +130,32 @@ impl InputAdapter for ScriptedInput {
 /// How long autoplay holds a tap, unless the lane's next note comes first.
 const TAP_HOLD: TimeUs = TimeUs(50_000);
 
+/// A note time plus the hold or the input offset left the `i64` range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeOverflow;
+
 /// Inputs that hit every tap and long note of `chart` on time, as source 0
 /// with `profile`'s bindings and input offset: each note's control is
 /// pressed at the note and released after [`TAP_HOLD`] or at the lane's
 /// next note, whichever is first, or at a long note's end. Mines are left
 /// alone, and lanes without a binding are skipped. The events are in
 /// receive-time order.
-#[must_use]
-pub fn autoplay(chart: &Chart, profile: &SourceProfile) -> Vec<PhysicalInputEvent> {
-    let offset = profile.input_offset.0;
-    let ev = |at: TimeUs, control: ControlId, value: i32| PhysicalInputEvent {
-        received: TimeUs(at.0.saturating_add(offset)),
-        source: SourceId(0),
-        kind: InputKind::Control { control, value },
+///
+/// # Errors
+///
+/// [`TimeOverflow`] if a receive time (note time plus the hold and the
+/// input offset) is outside the `i64` range.
+pub fn autoplay(
+    chart: &Chart,
+    profile: &SourceProfile,
+) -> Result<Vec<PhysicalInputEvent>, TimeOverflow> {
+    let add = |a: TimeUs, b: TimeUs| a.0.checked_add(b.0).map(TimeUs).ok_or(TimeOverflow);
+    let ev = |at: TimeUs, control: ControlId, value: i32| {
+        Ok(PhysicalInputEvent {
+            received: add(at, profile.input_offset)?,
+            source: SourceId(0),
+            kind: InputKind::Control { control, value },
+        })
     };
     let mut events = Vec::new();
     for lane in Lane::all() {
@@ -160,16 +173,16 @@ pub fn autoplay(chart: &Chart, profile: &SourceProfile) -> Vec<PhysicalInputEven
                 NoteKind::Mine { .. } => continue,
                 NoteKind::Long { end, .. } => end,
                 NoteKind::Tap => {
-                    let held = TimeUs(note.time.0.saturating_add(TAP_HOLD.0));
+                    let held = add(note.time, TAP_HOLD)?;
                     notes.get(i + 1).map_or(held, |next| held.min(next.time))
                 }
             };
-            events.push(ev(note.time, control, 1));
-            events.push(ev(release, control, 0));
+            events.push(ev(note.time, control, 1)?);
+            events.push(ev(release, control, 0)?);
         }
     }
     // Stable: a release and the lane's next press at the same time stay in
     // that order.
     events.sort_by_key(|e| e.received);
-    events
+    Ok(events)
 }

@@ -61,8 +61,9 @@ fn batches_do_not_allocate() {
         max_held: 2,
         queue_capacity: QUEUE,
         max_arrivals: 1,
-        recorded: controls.to_vec(),
-    });
+        recorded: vec![(DeviceKind::Keyboard, controls.to_vec())],
+    })
+    .unwrap();
     set.begin_batch(TimeUs(0));
     for d in 0..3 {
         set.connect(DeviceId(d), DeviceKind::Keyboard);

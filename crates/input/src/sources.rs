@@ -27,6 +27,16 @@ pub struct Arrival {
     pub kind: DeviceKind,
 }
 
+/// The most sources a play can have: one per [`SourceId`].
+pub const SOURCE_LIMIT: usize = 1 << 16;
+
+/// Why [`SourceSet::new`] refused a configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    /// `max_sources` exceeds [`SOURCE_LIMIT`].
+    TooManySources(usize),
+}
+
 /// Fixed sizes of a [`SourceSet`]; nothing grows beyond them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceConfig {
@@ -40,9 +50,11 @@ pub struct SourceConfig {
     pub queue_capacity: usize,
     /// Arrivals kept per play.
     pub max_arrivals: usize,
-    /// The controls that are recorded (lane and system bindings). Others
-    /// change only the physical state.
-    pub recorded: Vec<ControlId>,
+    /// The controls recorded for each kind of device: its lane and system
+    /// bindings (keyboard bindings are shared by every keyboard). Each
+    /// source freezes its kind's list when recording opens; other controls
+    /// change only the physical state. A kind not listed records nothing.
+    pub recorded: Vec<(DeviceKind, Vec<ControlId>)>,
 }
 
 /// A known device and its physical state.
@@ -54,6 +66,9 @@ struct Device {
     held: Vec<(ControlId, i32)>,
     /// Its source while it takes part in the open recording.
     source: Option<SourceId>,
+    /// A held control did not fit, so `held` may miss one. Kept until the
+    /// device is removed; every play it takes part in is incomplete.
+    state_lost: bool,
 }
 
 /// One participating source of the open recording.
@@ -63,6 +78,8 @@ struct Participant {
     kind: DeviceKind,
     writer: SourceWriter,
     closed: bool,
+    /// The controls recorded from this source, frozen at the opening.
+    recorded: Vec<ControlId>,
 }
 
 /// The open recording.
@@ -102,13 +119,20 @@ pub struct SourceSet {
 impl SourceSet {
     /// An empty set. Every buffer the batches use is allocated here or in
     /// [`open_recording`](Self::open_recording).
-    #[must_use]
-    pub fn new(config: SourceConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::TooManySources`] if `max_sources` exceeds
+    /// [`SOURCE_LIMIT`].
+    pub fn new(config: SourceConfig) -> Result<Self, ConfigError> {
+        if config.max_sources > SOURCE_LIMIT {
+            return Err(ConfigError::TooManySources(config.max_sources));
+        }
         let devices = Vec::with_capacity(config.max_devices);
         let spare_held = (0..config.max_devices)
             .map(|_| Vec::with_capacity(config.max_held))
             .collect();
-        Self {
+        Ok(Self {
             config,
             devices,
             spare_held,
@@ -116,7 +140,7 @@ impl SourceSet {
             gate: FocusGate::new(),
             batch_at: TimeUs(i64::MIN),
             recording: None,
-        }
+        })
     }
 
     /// The focus gate.
@@ -140,11 +164,12 @@ impl SourceSet {
     /// Ends the batch: each open source publishes `fresh − 1 µs`, where
     /// `fresh` is a clock read taken after the batch was pushed. A later
     /// batch reads the clock after this, so its events are stamped at or
-    /// above `fresh` and stay above the publication. Nothing is published
-    /// once the gate has tripped, so the play ends at what was already
-    /// finalized.
+    /// above `fresh` and stay above the publication. The latch is checked
+    /// here too, so a focus loss is seen even when no batch follows it;
+    /// nothing is published once the gate has tripped, so the play ends at
+    /// what was already finalized.
     pub fn end_batch(&mut self, fresh: TimeUs) {
-        if self.gate.is_tripped() {
+        if !self.gate.check() {
             return;
         }
         let Some(rec) = &self.recording else {
@@ -166,17 +191,23 @@ impl SourceSet {
         let Some(device) = self.devices.iter_mut().find(|d| d.id == packet.device) else {
             return admit;
         };
+        let source = device.source;
         if !track(&mut device.held, max_held, packet.control, packet.value) {
-            // The state table is full; a later snapshot may miss the
-            // control, so the play's log is incomplete.
-            if let Some(rec) = &mut self.recording {
+            // The state table is full; snapshots of this device may miss
+            // the control from now on.
+            device.state_lost = true;
+            if source.is_some()
+                && let Some(rec) = &mut self.recording
+            {
                 rec.overflowed = true;
             }
         }
-        let source = device.source;
         if admit == Admit::Record
             && let Some(source) = source
-            && self.config.recorded.contains(&packet.control)
+            && let Some(rec) = &self.recording
+            && rec.participants[source.index()]
+                .recorded
+                .contains(&packet.control)
         {
             self.push(
                 source,
@@ -201,6 +232,7 @@ impl SourceSet {
                 kind,
                 held,
                 source: None,
+                state_lost: false,
             });
         } else {
             self.untracked += 1;
@@ -271,34 +303,45 @@ impl SourceSet {
         self.close_recording();
         let n = self.devices.len().min(self.config.max_sources);
         let source_limited = self.devices.len() > n || self.untracked > 0;
+        let mut overflowed = false;
         let mut participants = Vec::with_capacity(n);
         let mut readers = Vec::with_capacity(n);
         let mut held = Vec::new();
         for (i, device) in self.devices.iter_mut().take(n).enumerate() {
-            let source = SourceId(u16::try_from(i).expect("max_sources fits in u16"));
+            // `SourceSet::new` bounds `max_sources` by `SOURCE_LIMIT`.
+            let source = SourceId(u16::try_from(i).expect("source ids fit in u16"));
             device.source = Some(source);
+            overflowed |= device.state_lost;
+            let recorded = self
+                .config
+                .recorded
+                .iter()
+                .find(|(kind, _)| *kind == device.kind)
+                .map(|(_, controls)| controls.clone())
+                .unwrap_or_default();
+            held.extend(
+                device
+                    .held
+                    .iter()
+                    .filter(|(c, _)| recorded.contains(c))
+                    .map(|&(c, v)| (source, c, v)),
+            );
             let (writer, reader) = source_queue(self.config.queue_capacity);
             participants.push(Participant {
                 device: device.id,
                 kind: device.kind,
                 writer,
                 closed: false,
+                recorded,
             });
             readers.push(reader);
-            held.extend(
-                device
-                    .held
-                    .iter()
-                    .filter(|(c, _)| self.config.recorded.contains(c))
-                    .map(|&(c, v)| (source, c, v)),
-            );
         }
         self.recording = Some(Recording {
             participants,
             readers,
             arrivals: Vec::with_capacity(self.config.max_arrivals),
             arrivals_dropped: 0,
-            overflowed: false,
+            overflowed,
             source_limited,
         });
         InputStart {
@@ -344,7 +387,8 @@ impl SourceSet {
         self.recording.as_ref().map_or(0, |r| r.arrivals_dropped)
     }
 
-    /// Whether an event or a held control could not be kept: the log is
+    /// Whether an event could not be queued or a participating device's
+    /// held state was lost (now or before the opening): the log is
     /// incomplete.
     #[must_use]
     pub fn overflowed(&self) -> bool {

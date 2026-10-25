@@ -27,8 +27,8 @@ use bms_model::TimeUs;
 
 pub use gate::{Admit, DeviceId, FocusGate, FocusLatch, Packet};
 pub use queue::{Overflow, SourceReader, SourceWriter, source_queue};
-pub use scripted::{Action, ScriptItem, ScriptedInput, autoplay};
-pub use sources::{Arrival, DeviceKind, SourceConfig, SourceSet};
+pub use scripted::{Action, ScriptItem, ScriptedInput, TimeOverflow, autoplay};
+pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, SourceSet};
 
 /// Something that delivers input to a [`SourceSet`]: Raw Input on the input
 /// thread, or a script in tests.
