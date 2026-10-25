@@ -71,6 +71,9 @@ pub enum InputError {
     Spawn(std::io::Error),
     /// The thread panicked.
     Panicked,
+    /// [`InputThread::stop`] was called from the input thread itself; the
+    /// thread ends after its current wake without being joined.
+    StopFromWorker,
 }
 
 impl InputError {
@@ -85,6 +88,7 @@ impl fmt::Display for InputError {
             Self::Os { call, error } => write!(f, "{call} failed: {error}"),
             Self::Spawn(e) => write!(f, "spawning the input thread failed: {e}"),
             Self::Panicked => f.write_str("the input thread panicked"),
+            Self::StopFromWorker => f.write_str("the input thread cannot join itself"),
         }
     }
 }
@@ -576,16 +580,24 @@ impl InputThread {
     ///
     /// # Errors
     ///
-    /// [`InputError::Panicked`] if the thread panicked.
+    /// [`InputError::Panicked`] if the thread panicked, and
+    /// [`InputError::StopFromWorker`] if called from the input thread
+    /// itself, which then ends after its current wake.
     pub fn stop(mut self) -> Result<WakeReport, InputError> {
-        self.shutdown().unwrap_or(Err(InputError::Panicked))
+        self.shutdown()
     }
 
-    /// Signals the thread to stop and joins it; `None` if already joined.
-    fn shutdown(&mut self) -> Option<Result<WakeReport, InputError>> {
+    /// Signals the thread to stop and joins it. From the input thread
+    /// itself (its hook, or a destructor while it unwinds) joining would
+    /// never return, so the thread is detached and ends after its wake.
+    fn shutdown(&mut self) -> Result<WakeReport, InputError> {
         self.stop.store(true, Ordering::Release);
-        let handle = self.handle.take()?;
-        Some(handle.join().map_err(|_| InputError::Panicked))
+        // Only a second call finds the handle gone.
+        let handle = self.handle.take().ok_or(InputError::Panicked)?;
+        if handle.thread().id() == std::thread::current().id() {
+            return Err(InputError::StopFromWorker);
+        }
+        handle.join().map_err(|_| InputError::Panicked)
     }
 }
 

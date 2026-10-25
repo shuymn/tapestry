@@ -1,11 +1,12 @@
-//! The Windows input thread's lifecycle. One test per process: Raw Input
-//! has one keyboard registration per process.
+//! Dropping the Windows input thread's handle. One test per process: Raw
+//! Input has one keyboard registration per process.
 
 #![cfg(windows)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use input::{Capture, InputThread, QpcClock, SourceConfig, SourceSet};
 
@@ -19,7 +20,7 @@ impl Drop for DropFlag {
 }
 
 #[test]
-fn dropping_the_input_thread_stops_and_joins_it() {
+fn dropping_the_input_thread_waits_for_it() {
     let sources = SourceSet::new(SourceConfig {
         max_devices: 9,
         max_sources: 3,
@@ -28,23 +29,35 @@ fn dropping_the_input_thread_stops_and_joins_it() {
         max_arrivals: 5,
     })
     .unwrap();
-    let wakes = Arc::new(AtomicU64::new(0));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
     let dropped = Arc::new(AtomicBool::new(false));
-    let (hook_wakes, flag) = (Arc::clone(&wakes), DropFlag(Arc::clone(&dropped)));
+    let flag = DropFlag(Arc::clone(&dropped));
+    let mut blocked = false;
     let thread = InputThread::spawn(QpcClock::start(), sources, Capture::new(), move |_, _| {
         let _keep = &flag;
-        hook_wakes.fetch_add(1, Ordering::Relaxed);
+        if !blocked {
+            // The first wake holds the hook until the test releases it.
+            blocked = true;
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
     })
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while wakes.load(Ordering::Relaxed) < 20 {
-        assert!(Instant::now() < deadline, "the thread does not wake");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let released = Arc::new(AtomicBool::new(false));
+    let releaser = {
+        let released = Arc::clone(&released);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            released.store(true, Ordering::Release);
+            release_tx.send(()).unwrap();
+        })
+    };
     drop(thread);
-    // Joined: the hook is gone and no wake follows.
+    // Drop returned only after the held hook was released and the thread
+    // ended, dropping the hook.
+    assert!(released.load(Ordering::Acquire));
     assert!(dropped.load(Ordering::Acquire));
-    let after = wakes.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(20));
-    assert_eq!(wakes.load(Ordering::Relaxed), after);
+    releaser.join().unwrap();
 }
