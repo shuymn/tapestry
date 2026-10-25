@@ -19,6 +19,7 @@ const REQUIRED_PORTABLE: &[&str] = &[
     "eval",
     "replay",
     "input",
+    "audio",
     "game",
     "xtask",
 ];
@@ -105,10 +106,10 @@ mod tests {
         let mut crates = baseline();
         set(
             &mut crates,
-            "eval",
+            "audio",
             "[package.metadata.tapestry]\nwindows-only = true\n",
         );
         let err = excludes(&crates).unwrap_err();
-        assert!(err.contains("R2: `eval` must be a portable"), "{err}");
+        assert!(err.contains("R2: `audio` must be a portable"), "{err}");
     }
 }
