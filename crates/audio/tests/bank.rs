@@ -7,7 +7,7 @@ use std::thread;
 
 use audio::{BankError, BankLimits, BankWarning, Cap, Found, load_bank};
 use bms_model::SoundId;
-use common::{chart_of, put, ramp, tmp, wav, wav_declaring, wav_streaming};
+use common::{chart_of, put, ramp, tmp, wav, wav_declaring, wav_padded, wav_streaming};
 
 const RATE: u32 = 48_000;
 
@@ -16,7 +16,7 @@ fn default_limits_are_the_plan_caps() {
     let l = BankLimits::default();
     assert_eq!(l.max_sound_seconds, 600);
     assert_eq!(l.max_bank_bytes, 536_870_912);
-    assert_eq!(l.max_file_bytes, 536_870_912);
+    assert_eq!(l.max_file_bytes, 134_217_728);
     assert_eq!(l.max_decode_threads, 4);
 }
 
@@ -85,7 +85,12 @@ fn load_files(
 
 #[test]
 fn bank_over_memory_cap_is_refused_before_decoding() {
-    let limits = BankLimits::default();
+    // One decode thread, so the declared sizes add up in sound order and
+    // the fifth sound is the one that crosses the cap.
+    let limits = BankLimits {
+        max_decode_threads: 1,
+        ..BankLimits::default()
+    };
     // Exactly at the cap: accepted, and decoding finds the short data.
     let bank = load_files(&declared_bank(19_017_728), RATE, &limits).unwrap();
     assert_eq!(bank.stored_count(), 5);
@@ -188,25 +193,53 @@ fn bank_without_declared_lengths_is_bounded_while_decoding() {
 }
 
 #[test]
-fn source_pcm_above_the_device_size_is_charged() {
-    // 400 frames at 16 kHz become 200 at 8 kHz, but the 800 source bytes
-    // are what decoding holds: a 799-byte cap refuses it, 800 does not.
+fn source_and_converted_pcm_are_charged_while_converting() {
+    // 400 frames at 16 kHz become 200 at 8 kHz. Converting holds both: 800
+    // source bytes plus 400 converted bytes, so a 1199-byte cap refuses it
+    // and 1200 does not, though the stored sound is only 400 bytes.
     let file = || vec![wav_streaming(16_000, 1, &ramp(400, 5, 9))];
     let limits = |max_bank_bytes| BankLimits {
         max_bank_bytes,
         ..BankLimits::default()
     };
-    let bank = load_files(&file(), 8_000, &limits(800)).unwrap();
+    let bank = load_files(&file(), 8_000, &limits(1_200)).unwrap();
     assert_eq!(bank.get(SoundId(0)).unwrap().frames(), 200);
+    assert_eq!(bank.bytes(), 400);
     assert_eq!(
-        load_files(&file(), 8_000, &limits(799)).unwrap_err(),
+        load_files(&file(), 8_000, &limits(1_199)).unwrap_err(),
         BankError::OverCap {
             cap: Cap::BankMemory,
             found: Found::WhileDecoding,
             sound: SoundId(0),
-            amount: 800,
-            limit: 799,
+            amount: 1_200,
+            limit: 1_199,
         }
+    );
+}
+
+#[test]
+fn raw_bytes_held_at_once_stay_within_one_file_per_worker() {
+    // 32 files of 1 MiB padding and 16 frames of audio, each contents
+    // twice: 32 MiB read in all, 16 distinct sounds of 32 bytes.
+    let pad = 1 << 20;
+    let files: Vec<Vec<u8>> = (0..32)
+        .map(|k| wav_padded(RATE, 1, &ramp(16, (k / 2) as i16 * 40 + 1, 1), pad))
+        .collect();
+    let len = files[0].len() as u64;
+    let limits = BankLimits {
+        max_decode_threads: 2,
+        ..BankLimits::default()
+    };
+    let bank = load_files(&files, RATE, &limits).unwrap();
+    assert_eq!(bank.stored_count(), 16);
+    assert_eq!(bank.bytes(), 16 * 32);
+    let stats = bank.stats();
+    assert!(stats.peak_raw_bytes >= len, "{}", stats.peak_raw_bytes);
+    assert!(
+        stats.peak_raw_bytes <= stats.decode_threads as u64 * len,
+        "{} raw bytes held with {} threads",
+        stats.peak_raw_bytes,
+        stats.decode_threads
     );
 }
 

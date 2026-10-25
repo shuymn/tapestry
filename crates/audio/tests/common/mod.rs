@@ -58,6 +58,22 @@ pub fn wav_declaring(rate: u32, channels: u16, declared_frames: u64, samples: &[
     append(header(rate, channels, data_len, 36 + data_len), samples)
 }
 
+/// A WAV holding `samples` behind a `JUNK` chunk of `pad` zero bytes, which
+/// readers skip.
+pub fn wav_padded(rate: u32, channels: u16, samples: &[i16], pad: u32) -> Vec<u8> {
+    let plain = wav(rate, channels, samples);
+    let mut b = Vec::with_capacity(plain.len() + 8 + pad as usize);
+    b.extend_from_slice(b"RIFF");
+    let riff_len = u32::from_le_bytes(plain[4..8].try_into().unwrap()) + 8 + pad;
+    b.extend_from_slice(&riff_len.to_le_bytes());
+    b.extend_from_slice(b"WAVE");
+    b.extend_from_slice(b"JUNK");
+    b.extend_from_slice(&pad.to_le_bytes());
+    b.resize(b.len() + pad as usize, 0);
+    b.extend_from_slice(&plain[12..]);
+    b
+}
+
 /// A WAV with the "length unknown" sizes a streaming writer leaves
 /// (0xFFFFFFFF), so it declares no frame count.
 pub fn wav_streaming(rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
