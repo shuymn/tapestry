@@ -41,7 +41,8 @@ use sha2::{Digest, Sha256};
 pub use error::{DecodeError, Section};
 pub use record::{
     Arrival, BuildProvenance, ChartRecord, DeviceKind, DeviceRecord, EndStatus, Incomplete,
-    PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions,
+    PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, TransformRecord,
+    Versions,
 };
 
 use wire::{Reader, Writer};
@@ -193,6 +194,7 @@ fn write_chart(w: &mut Writer, c: &ChartRecord) {
                 random_results,
             },
         random_seed,
+        transform: TransformRecord { id, version },
     } = c;
     w.raw(sha256);
     w.raw(md5);
@@ -202,6 +204,8 @@ fn write_chart(w: &mut Writer, c: &ChartRecord) {
     for r in random_results {
         w.uint(u64::from(*r));
     }
+    w.str(id);
+    w.uint(u64::from(*version));
 }
 
 fn write_preset(w: &mut Writer, p: &PresetRecord) {
@@ -466,6 +470,10 @@ fn read_chart(r: &mut Reader<'_>, loader_version: u32) -> Result<ChartRecord, De
     for _ in 0..n {
         random_results.push(r.u32()?);
     }
+    let transform = TransformRecord {
+        id: r.string()?,
+        version: r.u32()?,
+    };
     Ok(ChartRecord {
         identity: ChartIdentity {
             sha256,
@@ -475,6 +483,7 @@ fn read_chart(r: &mut Reader<'_>, loader_version: u32) -> Result<ChartRecord, De
             random_results,
         },
         random_seed,
+        transform,
     })
 }
 

@@ -339,7 +339,7 @@ A replay holds the inputs needed to reproduce evaluation. Judgment results are k
 | --- | --- |
 | Versions | Replay format version, evaluator version, loader version, app version |
 | Chart | SHA-256 and MD5 of the chart file (MD5 for compatibility with existing difficulty tables and IRs), hash of the resolved chart |
-| Chart resolution | `#RANDOM` branch results, options (RANDOM, MIRROR, etc.) and seed, the resolved lane mapping |
+| Chart resolution | `#RANDOM` branch results, the chart transform applied (an id and the version of its rules, such as the pass-through or RANDOM and MIRROR options) and its seed, the resolved lane mapping |
 | Rule | Preset ID, content hash, a copy of the preset itself. Session policy |
 | Device | Device type, receive method (Raw Input, MIDI, etc.), the record of report intervals and the estimated polling rate (or "not estimable"), key config, debounce, analog scratch settings, the three offsets |
 | Play type and evaluation conditions | Play type (full, mid-chart start, section repeat), section, attempt number, lead-in length, speed (the mapping between real time and chart time), initial gauge value (see the "Practice Records" subsection) |
