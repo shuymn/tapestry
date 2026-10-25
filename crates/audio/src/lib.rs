@@ -19,11 +19,13 @@
 //! on the step path allocates once the engine is built.
 
 mod bank;
+mod clock;
 mod mixer;
 
 pub use bank::{
     BankError, BankLimits, BankWarning, Cap, Found, LoadStats, Sound, SoundBank, load_bank,
 };
+pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use mixer::{
     LIMITER_CEILING, LIMITER_RELEASE_MS, Limiter, MAX_VOICES, Mixer, STEAL_FADE_MS, Started,
 };
