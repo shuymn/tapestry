@@ -11,8 +11,8 @@ pub enum ModelError {
     InvalidBpm {
         /// Time of the change (`TimeUs(0)` for the initial BPM).
         at: TimeUs,
-        /// The rejected BPM, in thousandths.
-        bpm_milli: i64,
+        /// The rejected BPM, in millionths.
+        bpm_micro: i64,
     },
     /// A STOP had a zero or negative length.
     InvalidStop {
@@ -69,8 +69,8 @@ pub enum ModelError {
 impl fmt::Display for ModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::InvalidBpm { at, bpm_milli } => {
-                write!(f, "BPM {bpm_milli}/1000 at {} µs is not positive", at.0)
+            Self::InvalidBpm { at, bpm_micro } => {
+                write!(f, "BPM {bpm_micro}/1000000 at {} µs is not positive", at.0)
             }
             Self::InvalidStop { at, len } => {
                 write!(f, "STOP at {} µs has non-positive length {}", at.0, len.0)

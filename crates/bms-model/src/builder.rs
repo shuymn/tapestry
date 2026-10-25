@@ -10,14 +10,17 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct ChartBuilder {
     bpm_milli: i64,
+    /// Scroll changes, with BPMs still in thousandths.
+    scroll: Vec<ScrollChange>,
     lanes: [Vec<Note>; LANE_COUNT],
     bgm: Vec<BgmEvent>,
     sounds: Vec<SoundRef>,
-    scroll: Vec<ScrollChange>,
 }
 
 impl ChartBuilder {
-    /// Starts a chart with an initial BPM in thousandths.
+    /// Starts a chart with an initial BPM in thousandths. The builder takes
+    /// BPMs in thousandths for convenience; [`ScrollMap::new`] takes
+    /// millionths.
     #[must_use]
     pub fn new(bpm_milli: i64) -> Self {
         Self {
@@ -80,10 +83,13 @@ impl ChartBuilder {
         self
     }
 
-    /// Changes the BPM at `at`.
+    /// Changes the BPM, in thousandths, at `at`.
     #[must_use]
     pub fn bpm(mut self, at: TimeUs, bpm_milli: i64) -> Self {
-        self.scroll.push(ScrollChange::Bpm { at, bpm_milli });
+        self.scroll.push(ScrollChange::Bpm {
+            at,
+            bpm_micro: bpm_milli,
+        });
         self
     }
 
@@ -104,12 +110,23 @@ impl ChartBuilder {
             notes.sort_by_key(|n| n.time);
         }
         self.bgm.sort_by_key(|e| e.time);
+        let to_micro = |milli: i64| milli.checked_mul(1_000).ok_or(ModelError::Overflow);
+        let mut scroll = Vec::with_capacity(self.scroll.len());
+        for change in self.scroll {
+            scroll.push(match change {
+                ScrollChange::Bpm { at, bpm_micro } => ScrollChange::Bpm {
+                    at,
+                    bpm_micro: to_micro(bpm_micro)?,
+                },
+                stop @ ScrollChange::Stop { .. } => stop,
+            });
+        }
         let chart = Chart {
             lanes: self.lanes,
             bgm: self.bgm,
             sounds: self.sounds,
             bar_lines: Vec::new(),
-            scroll: ScrollMap::new(self.bpm_milli, &self.scroll)?,
+            scroll: ScrollMap::new(to_micro(self.bpm_milli)?, &scroll)?,
             meta: ChartMeta::default(),
             identity: ChartIdentity::default(),
         };
@@ -228,6 +245,30 @@ mod tests {
             .bgm(TimeUs(0), SoundId(0))
             .build();
         assert_eq!(bgm, Err(ModelError::UnknownSound { sound: SoundId(0) }));
+    }
+
+    #[test]
+    fn builder_bpm_changes_take_thousandths() {
+        // 150 BPM: 2.5 millionths of a beat per microsecond; then 60.5 BPM.
+        let chart = ChartBuilder::new(BPM_150)
+            .bpm(TimeUs(1_000), 60_500)
+            .build()
+            .unwrap();
+        assert_eq!(chart.scroll.initial_bpm_micro(), 150_000_000);
+        assert_eq!(chart.scroll.position_at(TimeUs(1_000)), Position(2_500));
+        // 120_000 µs at 60.5 BPM: 120_000 * 60_500_000 / 60_000_000 = 121_000.
+        assert_eq!(
+            chart.scroll.position_at(TimeUs(121_000)),
+            Position(2_500 + 121_000)
+        );
+        assert_eq!(
+            ChartBuilder::new(i64::MAX).build(),
+            Err(ModelError::Overflow)
+        );
+        assert_eq!(
+            ChartBuilder::new(BPM_150).bpm(TimeUs(1), i64::MIN).build(),
+            Err(ModelError::Overflow)
+        );
     }
 
     #[test]
