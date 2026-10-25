@@ -338,9 +338,6 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
         if has_path(text) {
             out.push(Finding::Path(name.clone()));
         }
-        if contains_name(text, &ctx.forbidden_names) {
-            out.push(Finding::Name(name.clone()));
-        }
         // The conditions and the report are scanned as whole text and have
         // no time fields; the others by field.
         let whole_text = name == CONDITIONS || name == REPORT;
@@ -353,6 +350,9 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
             Some(Err(_)) => None,
             None => csv_fields(text),
         };
+        if has_name(text, json.as_ref(), &ctx.forbidden_names) {
+            out.push(Finding::Name(name.clone()));
+        }
         // Raw QPC: time and duration fields (`*_us`, `*_ms`) are checked by
         // unit and range in `structural_findings` (a relative µs value may
         // legitimately fall inside the raw QPC range on a recently booted
@@ -406,6 +406,89 @@ pub fn scan(export: &Export, ctx: &ScanContext) -> Vec<Finding> {
         out.extend(structural_findings(export, &structural));
     }
     out
+}
+
+/// A forbidden name in the serialized text or in any decoded string: JSON
+/// keys and values, CSV cells, and the JSON or Rust-escaped string literals
+/// embedded in text such as `report.md` (`"a\"b"` decodes to `a"b`), so an
+/// escaped quote or backslash cannot hide a name.
+fn has_name(text: &str, json: Option<&Result<Value, serde_json::Error>>, names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    // Each name's JSON-escaped spelling too, which also holds where a stray
+    // quote in prose pairs the literals wrongly.
+    let escaped: Vec<String> = names
+        .iter()
+        .filter_map(|n| {
+            let e = serde_json::to_string(n.trim()).ok()?;
+            let e = e[1..e.len() - 1].to_owned();
+            (e != n.trim()).then_some(e)
+        })
+        .collect();
+    if contains_name(text, names)
+        || contains_name(text, &escaped)
+        || string_literals(text).any(|s| contains_name(&s, names))
+    {
+        return true;
+    }
+    let mut decoded = Vec::new();
+    match json {
+        Some(Ok(v)) => collect_strings(v, &mut decoded),
+        Some(Err(_)) => {}
+        None => {
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .flexible(true)
+                .from_reader(text.as_bytes());
+            for rec in rdr.records().flatten() {
+                decoded.extend(rec.iter().map(str::to_owned));
+            }
+        }
+    }
+    decoded.iter().any(|s| contains_name(s, names))
+}
+
+/// Keys and string values of a JSON value, decoded.
+fn collect_strings(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => m.iter().for_each(|(k, x)| {
+            out.push(k.clone());
+            collect_strings(x, out);
+        }),
+        Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
+        Value::String(s) => out.push(s.clone()),
+        _ => {}
+    }
+}
+
+/// Every double-quoted literal in `text` that decodes as a JSON string
+/// (`\"`, `\\`, `\uXXXX` and the other JSON escapes).
+fn string_literals(text: &str) -> impl Iterator<Item = String> + '_ {
+    let b = text.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < b.len() {
+            if b[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'"' {
+                j += if b[j] == b'\\' { 2 } else { 1 };
+            }
+            if j >= b.len() {
+                i = b.len();
+                return None;
+            }
+            i = j + 1;
+            if let Ok(s) = serde_json::from_str::<String>(&text[start..=j]) {
+                return Some(s);
+            }
+        }
+        None
+    })
 }
 
 /// Every forbidden name, however short: names of 4+ characters match as

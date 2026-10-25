@@ -377,3 +377,55 @@ fn i_the_report_is_scanned_and_recomputed() {
     assert!(scan(&tampered, &ctx()).is_empty());
     assert!(!recompute(&tampered).unwrap().matches_recorded);
 }
+
+#[test]
+fn i_escaped_quotes_and_backslashes_cannot_hide_a_name() {
+    // A password-like name with a quote and a backslash: serialized JSON
+    // and report.md's condition values escape both. (Any backslash is also
+    // a path finding; the name must be found on its own all the same.)
+    let secret = r#"Zq"8\xTest"#;
+    let ctx = ScanContext {
+        forbidden_names: vec![secret.into()],
+        ..ctx()
+    };
+    let mut c = conditions();
+    c.cpu_brand = Some(format!("Synthetic {secret} CPU"));
+    match build(&passing_run(), &c, &ctx) {
+        Err(ExportError::Rejected(f)) => {
+            assert!(name_findings().iter().all(|n| f.contains(n)), "{f:?}")
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    // In any other JSON file's string, and in a CSV cell.
+    let base = build(&passing_run(), &conditions(), &ctx).unwrap();
+    let mut e = base.clone();
+    let mut v: Value = serde_json::from_slice(&e.files[RUN]).unwrap();
+    v["info"]["profile"] = json!(format!("standard {secret}"));
+    e.files.insert(RUN.into(), serde_json::to_vec(&v).unwrap());
+    assert!(scan(&e, &ctx).contains(&Finding::Name(RUN.into())));
+    let mut e = base.clone();
+    let csv = String::from_utf8(e.files[FRAMES].clone()).unwrap();
+    let header = csv.lines().next().unwrap().to_owned();
+    let cell = format!("\"{}\"", secret.replace('"', "\"\""));
+    e.files
+        .insert(FRAMES.into(), format!("{header}\n{cell}\n").into_bytes());
+    assert!(scan(&e, &ctx).contains(&Finding::Name(FRAMES.into())));
+    // In report.md as an escaped literal only, with a stray quote before
+    // it in the prose.
+    let md = String::from_utf8(base.files[REPORT].clone()).unwrap();
+    for planted in [
+        format!("- note = {}\n", serde_json::to_string(secret).unwrap()),
+        format!("a \" stray quote\n- note = {:?}\n", format!("x{secret}y")),
+        // A \u escape is found only by decoding the literal.
+        "- note = \"Zq\\u00228\\\\xTest\"\n".to_owned(),
+    ] {
+        let mut e = base.clone();
+        e.files
+            .insert(REPORT.into(), format!("{md}{planted}").into_bytes());
+        let f = scan(&e, &ctx);
+        assert!(
+            f.contains(&Finding::Name(REPORT.into())),
+            "{planted}: {f:?}"
+        );
+    }
+}
