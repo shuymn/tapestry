@@ -492,24 +492,38 @@ Even if the CPU and GPU times are within budget, presentation is not necessarily
 
 ### GPU Power State
 
-The play scene is a light load for a discrete GPU, so under the driver's default power management the GPU stays in a low performance state with low core and memory clocks. In stage 0, at the default setting, GPU time reached about 4.5 ms at p99 and 3.5% of the 240 Hz heavy-scene intervals missed a refresh, every miss a frame whose GPU work ended after the vblank. At 60 Hz no refresh was missed, but GPU time was still about 5.5 ms. With the driver's per-application setting at maximum performance, the GPU held its top state, GPU time stayed under 1 ms at p99 without streaming software, and no refresh was missed.
+The frame pacing and GPU budgets are measured with the GPU in its performance state, and every measurement records the driver's power management setting and the observed performance state. Whether the game must hold the budgets under the driver's default settings, and how, is an open question, because the cause of the low performance state below is not established.
 
-| Option | What it gives | Why not, or the cost |
+Measured in stage 0 on a discrete GPU:
+
+- **Default driver settings**: During play the GPU stayed in low performance states (P5 and P8) at about 30% utilization. At 240 Hz, GPU time reached about 4.5 ms at p99 and 3.5% of the heavy-scene intervals missed a refresh, every miss a frame whose GPU work ended after the vblank. At 60 Hz no refresh was missed, but GPU time was still about 5.5 ms at p99.
+- **Driver's per-application power management at maximum performance**: The GPU held its top state (P0), GPU time stayed under 1 ms at p99 without streaming software, and the misses disappeared.
+- **Startup**: P0 appears around startup under the default settings too.
+- **GPU-bound window**: A windowed 1920×1080 run that was GPU-bound (30–60 fps, GPU time about 5 ms at p50) still stayed in P8. This contradicts the explanation that the driver keeps clocks low because the load is light.
+
+Candidate causes, none tested:
+
+- The game is not recognized as a game: it has no driver application profile, and Windows does not treat it as a game.
+- The game makes no clock request of its own (for example the boost mode of a GPU vendor's low-latency SDK).
+- A load-based driver policy that the measurements so far do not explain.
+
+Experiments that decide it, each recording the performance state over time, clocks, GPU time, and missed deadlines under the default settings:
+
+- A load sweep in fullscreen and in a window, from startup on, to see what drops the state and whether load ever raises it again.
+- Reading whether Windows recognizes the game as a game, then repeating the run after marking it as one through the Game Bar ("remember this is a game").
+- Repeating the run with a vendor low-latency SDK's boost mode on and off.
+- Repeating the deciding runs on the reference class and on another GPU vendor.
+
+Options for meeting the budget, kept as candidates until the cause is known. The descriptions come from general knowledge and are unverified:
+
+| Option | What it would give | Cost or doubt (unverified) |
 | --- | --- | --- |
-| Fix the clocks from the game (D3D12 stable power state) | No settings for the player | Works only in Windows developer mode, is meant for profiling, and fixes clocks at a base value rather than the top state |
+| Fix the clocks from the game (D3D12 stable power state) | No settings for the player | Said to work only in Windows developer mode, to be meant for profiling, and to fix clocks at a base value rather than the top state |
+| Make the game recognized as a game, or request clocks through a vendor SDK | Performance state without player action, if recognition or the request is the cause | Vendor-specific; depends on the experiments above |
 | Write the driver's application profile from the game | Performance state without player action | Vendor-specific, and changes settings outside the game (against "Coexisting with Other Software") |
-| Add GPU work so the driver raises clocks | Works under the default setting | Spends power and GPU time that other software needs |
+| Add GPU work so the driver raises clocks | Might work under the default settings | The GPU-bound window run stayed in P8, so load may not raise the state; spends power and GPU time that other software needs |
 | Render one more frame ahead when misses are detected | On time at low clocks while GPU time fits within two refreshes | One more refresh of display latency, and display latency changes during a session |
-| State the requirement, detect, and guide the player | No settings changed by the game | Under the default setting, 240 Hz misses until the player changes it |
-
-The game takes the last option:
-
-- The 240 Hz frame pacing budget and the GPU budget assume the GPU in its performance state. On the drivers measured so far, that requires the driver's per-application power management set to maximum performance for the game's executable. The settings screen states this.
-- The game does not write driver or power settings itself, and does not add GPU work to raise clocks.
-- The game already measures missed deadlines and GPU time during play ("Measurement"). When misses come from GPU work ending after the vblank, the measurement display and the result screen name the power management setting as the likely cause.
-- GPU time under the default setting is recorded but not judged against the GPU budget, because the clock, not the work, sets it there. Frame pacing is judged under whichever setting the run declares.
-
-The reasons: every option that keeps presentation on time under the default setting either changes settings outside the game or spends GPU time and power that coexistence reserves for other software. Guidance leaves the choice with the player, as with exclusive audio modes. Whether the standard profile should fall back to one more frame ahead under the default setting, and whether the 60 Hz reference class holds its budget under the default setting, are open questions.
+| State the requirement, detect, and guide the player | No settings changed by the game | Under the default settings, 240 Hz misses until the player changes the setting |
 
 ### Memory Budget
 
@@ -967,7 +981,7 @@ Between stages 1 and 2, a generous period of playing and fixing is set aside. IR
 - How to obtain authors' permission for "storage for evaluation", and the form of that record (to be decided before starting IR)
 - The concrete configuration of the reference PC
 - Press to sound on WASAPI shared mode with a device period of 10 ms: exclusive mode, ASIO, or a revised budget (owner decision; "Path from Press to Sound")
-- Under the driver's default GPU power management: whether the standard profile falls back to one more frame rendered ahead, and whether the 60 Hz reference class holds its budget ("GPU Power State")
+- Why a discrete GPU stays in low performance states under the driver's default settings, whether the game must hold the frame pacing and GPU budgets under those settings, and if so which option meets them (a measure in the game, guidance to the player, or a revised target), decided after the experiments in "GPU Power State"; also whether the 60 Hz reference class holds its budget under the default settings
 - How to judge frame pacing under VRR, where counting in whole refreshes does not apply ("Frame Pacing in Refreshes")
 
 ## Appendix: Lessons from Existing Implementations
