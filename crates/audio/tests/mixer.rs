@@ -131,64 +131,108 @@ fn assert_close(got: &[f32], want: &[f32]) {
     }
 }
 
+// At 2 kHz the 2 ms fade is 4 frames, gains 0.5 (1 + cos(πk/4)) for
+// k = 1..4: 0.8535534, 0.5, 0.1464466, 0 (by hand).
+const F1: f32 = 0.853_553_4;
+const F3: f32 = 0.146_446_6;
+
 #[test]
 fn oldest_voice_is_stolen_with_fade() {
-    // At 2 kHz the 2 ms fade is 4 frames, gains 0.5 (1 + cos(πk/4)) for
-    // k = 1..4: 0.8535534, 0.5, 0.1464466, 0 (by hand).
     let bank = steal_bank(2_000);
     let mut m = Mixer::new(2, 2_000);
-    let a = m.trigger(&bank, SoundId(0), 10).unwrap();
-    let b = m.trigger(&bank, SoundId(1), 5).unwrap();
-    assert!(!a.stole && !b.stole);
-    // All voices busy: the oldest by start is B (5 < 10), though A was
-    // triggered first. B is stolen before any of it was rendered, so it
-    // plays and fades in the same block.
-    let c = m.trigger(&bank, SoundId(2), 20).unwrap();
-    assert_eq!((c.frame, c.voice, c.stole), (20, b.voice, true));
-    assert_eq!(m.steals(), 1);
+    // A at 10, then B at 5, then C at 20, all scheduled before rendering.
+    // At 20 both voices are busy and the oldest by start is B (5 < 10),
+    // though A was triggered first: B fades from 20.
+    assert_eq!(m.trigger(&bank, SoundId(0), 10), Some(10));
+    assert_eq!(m.trigger(&bank, SoundId(1), 5), Some(5));
+    assert_eq!(m.trigger(&bank, SoundId(2), 20), Some(20));
     let out = left(&render(&mut m, &bank, 40));
+    assert_eq!((m.steals(), m.hard_cuts()), (1, 0));
     let mut want = vec![0.0; 40];
     want[5..10].fill(0.25);
     want[10..20].fill(0.75);
-    want[20] = 0.5 + 0.25 * 0.853_553_4 + 0.125;
+    want[20] = 0.5 + 0.25 * F1 + 0.125;
     want[21] = 0.5 + 0.25 * 0.5 + 0.125;
-    want[22] = 0.5 + 0.25 * 0.146_446_6 + 0.125;
+    want[22] = 0.5 + 0.25 * F3 + 0.125;
     want[23..40].fill(0.625);
     assert_close(&out, &want);
 
-    // Equal starts: the earlier trigger is the older one.
+    // Equal starts: the earlier trigger (0.5) is the older one and fades.
     let mut m = Mixer::new(2, 2_000);
-    let x = m.trigger(&bank, SoundId(0), 0).unwrap();
+    m.trigger(&bank, SoundId(0), 0).unwrap();
     m.trigger(&bank, SoundId(1), 0).unwrap();
-    let z = m.trigger(&bank, SoundId(2), 1).unwrap();
-    assert_eq!((z.voice, z.stole), (x.voice, true));
+    m.trigger(&bank, SoundId(2), 1).unwrap();
+    let out = left(&render(&mut m, &bank, 3));
+    assert_close(&out, &[0.75, 0.5 * F1 + 0.375, 0.5 * 0.5 + 0.375]);
 }
 
 #[test]
 fn exhausted_release_slots_cut_the_most_faded() {
-    // One voice and one release slot. A (0.5) at 0 is stolen by B (0.25)
-    // at 1, then B by C (0.125) at 2: B's release needs A's slot, so A is
-    // cut outright and never sounds.
+    // One voice and one release slot. A (0.5) starts at 0; B (0.25) steals
+    // it at 1, and A fades from there; C (0.125) steals B at 2, and B's
+    // release needs the slot A is fading in, so A is cut at 2. Everything
+    // A played before its cut stays.
     let bank = steal_bank(2_000);
     let mut m = Mixer::new(1, 2_000);
     m.trigger(&bank, SoundId(0), 0).unwrap();
     m.trigger(&bank, SoundId(1), 1).unwrap();
     m.trigger(&bank, SoundId(2), 2).unwrap();
-    assert_eq!((m.steals(), m.hard_cuts()), (2, 1));
     let out = left(&render(&mut m, &bank, 8));
+    assert_eq!((m.steals(), m.hard_cuts()), (2, 1));
     assert_close(
         &out,
         &[
-            0.0,
-            0.25,
-            0.25 * 0.853_553_4 + 0.125,
+            0.5,
+            0.5 * F1 + 0.25,
+            0.25 * F1 + 0.125,
             0.25 * 0.5 + 0.125,
-            0.25 * 0.146_446_6 + 0.125,
+            0.25 * F3 + 0.125,
             0.125,
             0.125,
             0.125,
         ],
     );
+}
+
+#[test]
+fn starts_scheduled_ahead_apply_in_time_order() {
+    // One voice; one-frame sounds at 0, 100 and 200 never overlap, so none
+    // is stolen, whether all three are scheduled before the first block or
+    // each just before its own, and whatever the block split.
+    let bank = SoundBank::from_sounds(
+        2_000,
+        vec![
+            Sound::mono(vec![16_384]),
+            Sound::mono(vec![8_192]),
+            Sound::mono(vec![4_096]),
+        ],
+    );
+    let starts = [(0u16, 0u64), (1, 100), (2, 200)];
+    let run = |block: usize, ahead: bool| {
+        let mut m = Mixer::new(1, 2_000);
+        let mut out = Vec::new();
+        let mut next = 0;
+        while out.len() < 2 * 480 {
+            let from = m.mixed_to();
+            while next < starts.len() && (ahead || starts[next].1 < from + block as u64) {
+                let (s, at) = starts[next];
+                assert_eq!(m.trigger(&bank, SoundId(s), at), Some(at));
+                next += 1;
+            }
+            out.extend(render(&mut m, &bank, block));
+        }
+        assert_eq!((m.steals(), m.hard_cuts()), (0, 0));
+        left(&out)[..480].to_vec()
+    };
+    let mut want = vec![0.0; 480];
+    want[0] = 0.5;
+    want[100] = 0.25;
+    want[200] = 0.125;
+    for block in [1, 7, 100, 150, 480] {
+        for ahead in [true, false] {
+            assert_eq!(run(block, ahead), want, "block {block}, ahead {ahead}");
+        }
+    }
 }
 
 #[test]
@@ -201,8 +245,11 @@ fn late_command_never_cuts_the_head() {
     for (target, start) in [(100, 480), (479, 480), (480, 480), (481, 481)] {
         let mut m = Mixer::new(4, RATE);
         render(&mut m, &bank, 480);
-        let s = m.trigger(&bank, SoundId(0), target).unwrap();
-        assert_eq!(s.frame, start, "target {target}");
+        assert_eq!(
+            m.trigger(&bank, SoundId(0), target),
+            Some(start),
+            "target {target}"
+        );
         let out = left(&render(&mut m, &bank, 480));
         let at = (start - 480) as usize;
         assert!(out[..at].iter().all(|&x| x == 0.0));
@@ -216,7 +263,7 @@ fn late_command_never_cuts_the_head() {
 fn volume_scales_before_the_limiter() {
     let bank = SoundBank::from_sounds(RATE, vec![Sound::mono(vec![16_384; 4])]);
     let mut m = Mixer::new(1, RATE);
-    m.set_volume(0.5);
+    m.set_volume(0.5).unwrap();
     m.trigger(&bank, SoundId(0), 0).unwrap();
     assert_eq!(left(&render(&mut m, &bank, 4)), [0.25; 4]);
 }

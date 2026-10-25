@@ -10,7 +10,7 @@ use rtrb::Consumer;
 use crate::CHANNELS;
 use crate::bank::SoundBank;
 use crate::clock::MixClock;
-use crate::mixer::Mixer;
+use crate::mixer::{InvalidVolume, Mixer};
 use crate::output::{AudioOutput, OutputError};
 
 /// A key sound to play, from the logic thread.
@@ -187,8 +187,13 @@ impl AudioEngine {
     }
 
     /// Sets the master volume.
-    pub fn set_volume(&mut self, volume: f32) {
-        self.mixer.set_volume(volume);
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidVolume`] for a negative, infinite or NaN volume, which is
+    /// not applied.
+    pub fn set_volume(&mut self, volume: f32) -> Result<(), InvalidVolume> {
+        self.mixer.set_volume(volume)
     }
 
     /// Sets the audio output latency offset: BGM is scheduled this much
@@ -216,15 +221,15 @@ impl AudioEngine {
     /// Starts `sound` at output frame `target` (or the first unwritten
     /// frame) and logs where it started.
     fn start(&mut self, sound: SoundId, kind: ScheduledKind, target: u64) {
-        let Some(started) = self.mixer.trigger(&self.bank, sound, target) else {
+        let Some(frame) = self.mixer.trigger(&self.bank, sound, target) else {
             return;
         };
         if self.scheduled.len() < self.scheduled.capacity() {
             self.scheduled.push(Scheduled {
                 sound,
                 kind,
-                frame: started.frame,
-                at: self.clock.time_at(started.frame),
+                frame,
+                at: self.clock.time_at(frame),
             });
         } else {
             self.scheduled_dropped += 1;

@@ -69,8 +69,12 @@ impl SimConfig {
     }
 }
 
-/// The simulated device. Waiting and writing allocate nothing, except a
-/// record of each underrun beyond the first 64.
+/// Underruns whose timing shift [`SimDevice::true_time`] remembers.
+pub const SHIFT_HISTORY: usize = 64;
+
+/// The simulated device. Waiting and writing allocate nothing.
+/// [`SimDevice::true_time`] is exact for frames written after the
+/// [`SHIFT_HISTORY`]th most recent underrun.
 #[derive(Clone, Debug)]
 pub struct SimDevice {
     cfg: SimConfig,
@@ -102,7 +106,7 @@ impl SimDevice {
             written: 0,
             consumed: 0,
             silence: 0,
-            shifts: Vec::with_capacity(64),
+            shifts: Vec::with_capacity(SHIFT_HISTORY),
             buf,
             next_jitter: 0,
             underruns: 0,
@@ -207,6 +211,10 @@ impl AudioOutput for SimDevice {
             if take < p {
                 self.underruns += 1;
                 self.silence += p - take;
+                if self.shifts.len() == SHIFT_HISTORY {
+                    // Forget the oldest; frames written before it are long played.
+                    self.shifts.remove(0);
+                }
                 self.shifts.push((self.consumed + take, self.silence));
             }
             self.consumed += take;

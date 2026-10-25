@@ -81,21 +81,23 @@ impl MixClock {
         self.rebases
     }
 
-    fn frame_us(&self, frame: u64) -> i64 {
-        (i128::from(frame) * 1_000_000 / i128::from(self.rate)) as i64
+    fn frame_us(&self, frame: u64) -> i128 {
+        i128::from(frame) * 1_000_000 / i128::from(self.rate)
     }
 
     fn earliest(&self) -> Option<i64> {
         self.residuals[..self.len].iter().copied().min()
     }
 
-    /// Frame `queued_from` is mixed at `mixed_at` or earlier.
+    /// Frame `queued_from` is mixed at `mixed_at` or earlier. Residuals
+    /// beyond the `i64` range saturate.
     pub fn observe(&mut self, queued_from: u64, mixed_at: TimeUs) {
-        let r = mixed_at.0 - self.frame_us(queued_from);
+        let wide = i128::from(mixed_at.0) - self.frame_us(queued_from);
+        let r = wide.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
         if let Some(min) = self.earliest() {
-            if r < min - self.jump_us {
+            if r < min.saturating_sub(self.jump_us) {
                 self.reset();
-            } else if r > min + self.jump_us {
+            } else if r > min.saturating_add(self.jump_us) {
                 self.above += 1;
                 if self.above >= MIX_CLOCK_REBASE_AFTER {
                     self.reset();
@@ -115,18 +117,19 @@ impl MixClock {
     }
 
     /// When frame `frame` is mixed, by the least-late observation in the
-    /// window; `None` before any observation.
+    /// window; `None` before any observation or past the `i64` range.
     #[must_use]
     pub fn time_at(&self, frame: u64) -> Option<TimeUs> {
-        Some(TimeUs(self.earliest()? + self.frame_us(frame)))
+        let t = i128::from(self.earliest()?) + self.frame_us(frame);
+        i64::try_from(t).ok().map(TimeUs)
     }
 
-    /// The frame mixed at `t` (floor), never before frame 0; `None` before
-    /// any observation.
+    /// The frame mixed at `t` (floor), never before frame 0 and saturating
+    /// at `u64::MAX`; `None` before any observation.
     #[must_use]
     pub fn frame_at(&self, t: TimeUs) -> Option<u64> {
-        let us = (t.0 - self.earliest()?).max(0);
-        Some((i128::from(us) * i128::from(self.rate) / 1_000_000) as u64)
+        let us = (i128::from(t.0) - i128::from(self.earliest()?)).max(0);
+        Some(u64::try_from(us * i128::from(self.rate) / 1_000_000).unwrap_or(u64::MAX))
     }
 
     /// The device clock's speed against the judgment timeline, in ppm
@@ -139,7 +142,7 @@ impl MixClock {
         if t1 <= t0 {
             return None;
         }
-        Some(-((r1 - r0) as f64) / ((t1 - t0) as f64) * 1e6)
+        Some(-(r1 as f64 - r0 as f64) / (t1 as f64 - t0 as f64) * 1e6)
     }
 }
 
@@ -160,6 +163,32 @@ mod tests {
         assert_eq!(c.frame_at(TimeUs(1_000_021)), Some(48_001));
         assert_eq!(c.frame_at(TimeUs(999_979)), Some(47_998));
         assert_eq!(c.frame_at(TimeUs(-5_000_000)), Some(0));
+    }
+
+    #[test]
+    fn extreme_times_and_frames_saturate_or_give_none() {
+        let mut c = MixClock::new(48_000, 480);
+        c.observe(0, TimeUs(-1_000));
+        assert_eq!(c.frame_at(TimeUs(i64::MIN)), Some(0));
+        // (i64::MAX + 1000) µs at 48 kHz is about 4.4e17 frames, in range.
+        assert_eq!(
+            c.frame_at(TimeUs(i64::MAX)),
+            Some(((i128::from(i64::MAX) + 1_000) * 48_000 / 1_000_000) as u64)
+        );
+        // u64::MAX frames are about 3.8e20 µs, past i64.
+        assert_eq!(c.time_at(u64::MAX), None);
+        // A frame count past i64 µs saturates the residual instead of
+        // wrapping, which reads as an early jump and rebases.
+        c.observe(u64::MAX, TimeUs(0));
+        assert_eq!(c.rebases(), 1);
+        assert_eq!(
+            c.frame_at(TimeUs(0)),
+            Some(((i128::from(i64::MAX) + 1) * 48_000 / 1_000_000) as u64)
+        );
+        // At a rate of u32::MAX the frame count itself passes u64.
+        let mut c = MixClock::new(u32::MAX, 1);
+        c.observe(0, TimeUs(i64::MIN));
+        assert_eq!(c.frame_at(TimeUs(i64::MAX)), Some(u64::MAX));
     }
 
     #[test]

@@ -10,7 +10,9 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use audio::{AudioEngine, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank, SoundCmd};
+use audio::{
+    AudioEngine, RecordingOutput, SHIFT_HISTORY, SimConfig, SimDevice, Sound, SoundBank, SoundCmd,
+};
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::RingBuffer;
 
@@ -70,7 +72,13 @@ fn mixing_does_not_allocate() {
         })
         .collect();
     let mut e = AudioEngine::new(bank, &bgm, RATE, 480, 8, 64).unwrap();
+    // 40 stalls of three missed wakes, two underruns each: more than the
+    // simulator's shift history holds.
+    let missed_wakes = (0..40u64)
+        .flat_map(|k| [50 + 70 * k, 51 + 70 * k, 52 + 70 * k])
+        .collect();
     let dev = SimDevice::new(SimConfig {
+        missed_wakes,
         drift_ppm: 80,
         jitter_us: 1_500,
         seed: 11,
@@ -98,7 +106,9 @@ fn mixing_does_not_allocate() {
     TRACK.set(false);
 
     assert_eq!(commands, 3 * STEPS);
-    assert_eq!(frames, u64::from(STEPS + 1) * 480);
+    assert!(frames > u64::from(STEPS) * 480, "{frames}");
+    assert!(out.inner().underruns() > SHIFT_HISTORY as u64);
+    assert_eq!(e.underruns(), 40);
     assert!(e.mixer().steals() > 1_000, "{}", e.mixer().steals());
     assert!(e.mixer().limiter().limited() > 0);
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);

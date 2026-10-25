@@ -1,13 +1,17 @@
 //! The mixer: preallocated voices summed in `f32`, oldest-voice stealing with
 //! a raised-cosine fade, volume, and a peak limiter without look-ahead.
 //!
-//! Voices start at an absolute output frame, so a sound starts at the same
-//! sample whatever the block split. A start already rendered moves to the
-//! first frame not yet rendered: the head of a sound is never cut. A stolen
-//! voice is not cut off either: it moves to a release slot and fades out
-//! over [`STEAL_FADE_MS`], because an abrupt cut is a broadband click. Only
-//! when every release slot is busy is the most-faded release cut, counted in
-//! [`Mixer::hard_cuts`].
+//! A triggered sound waits as a pending start at an absolute output frame,
+//! and rendering applies pending starts in time order as it reaches them, so
+//! a sound starts at the same sample, and steals the same voice, whatever
+//! the block split and however far ahead it was triggered. A start already
+//! rendered moves to the first frame not yet rendered: the head of a sound
+//! is never cut. A stolen voice is not cut off either: it moves to a release
+//! slot and fades out over [`STEAL_FADE_MS`] from the new sound's start,
+//! because an abrupt cut is a broadband click. Only when every release slot
+//! is busy is the most-faded release cut, counted in [`Mixer::hard_cuts`].
+
+use std::fmt;
 
 use bms_model::SoundId;
 
@@ -16,6 +20,8 @@ use crate::bank::SoundBank;
 
 /// Voice cap.
 pub const MAX_VOICES: usize = 256;
+/// Starts that can wait to be applied; more are dropped and counted.
+pub const MAX_PENDING_STARTS: usize = 1024;
 /// Fade applied to a stolen voice.
 pub const STEAL_FADE_MS: u32 = 2;
 /// The limiter's ceiling: full scale.
@@ -34,16 +40,17 @@ struct Voice {
     cut: u64,
 }
 
-/// Where a triggered sound starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Started {
-    /// The output frame of the sound's first sample.
-    pub frame: u64,
-    /// The voice slot it took.
-    pub voice: usize,
-    /// Whether the slot was taken from the oldest playing voice.
-    pub stole: bool,
+/// A volume that is negative, infinite or NaN.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InvalidVolume(pub f32);
+
+impl fmt::Display for InvalidVolume {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "volume {} is not a finite, non-negative gain", self.0)
+    }
 }
+
+impl std::error::Error for InvalidVolume {}
 
 /// A stereo-linked peak limiter without look-ahead.
 ///
@@ -108,6 +115,8 @@ impl Limiter {
 pub struct Mixer {
     voices: Vec<Voice>,
     releases: Vec<Voice>,
+    /// Starts not yet applied, latest first (the next one is last).
+    pending: Vec<Voice>,
     /// Gain over the fade, from just below 1 down to 0.
     fade: Vec<f32>,
     /// First output frame not yet rendered.
@@ -117,6 +126,7 @@ pub struct Mixer {
     limiter: Limiter,
     steals: u64,
     hard_cuts: u64,
+    dropped_starts: u64,
 }
 
 impl Mixer {
@@ -134,6 +144,7 @@ impl Mixer {
         Self {
             voices: vec![Voice::default(); voices],
             releases: vec![Voice::default(); voices],
+            pending: Vec::with_capacity(MAX_PENDING_STARTS),
             fade,
             mixed_to: 0,
             seq: 0,
@@ -141,6 +152,7 @@ impl Mixer {
             limiter: Limiter::new(rate),
             steals: 0,
             hard_cuts: 0,
+            dropped_starts: 0,
         }
     }
 
@@ -150,16 +162,16 @@ impl Mixer {
         self.mixed_to
     }
 
-    /// Voices playing or scheduled, release slots excluded.
+    /// Voices playing, release slots and pending starts excluded.
     #[must_use]
     pub fn active(&self) -> usize {
         self.voices.iter().filter(|v| v.active).count()
     }
 
-    /// Voices and fading releases still to sound.
+    /// Voices, fading releases and pending starts still to sound.
     #[must_use]
     pub fn sounding(&self) -> usize {
-        self.active() + self.releases.iter().filter(|v| v.active).count()
+        self.active() + self.releases.iter().filter(|v| v.active).count() + self.pending.len()
     }
 
     /// Voices stolen so far.
@@ -174,6 +186,12 @@ impl Mixer {
         self.hard_cuts
     }
 
+    /// Starts dropped because [`MAX_PENDING_STARTS`] were already waiting.
+    #[must_use]
+    pub fn dropped_starts(&self) -> u64 {
+        self.dropped_starts
+    }
+
     /// The limiter's state.
     #[must_use]
     pub fn limiter(&self) -> &Limiter {
@@ -181,25 +199,40 @@ impl Mixer {
     }
 
     /// Sets the master volume, applied before the limiter.
-    pub fn set_volume(&mut self, volume: f32) {
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidVolume`] for a negative, infinite or NaN volume, which is
+    /// not applied.
+    pub fn set_volume(&mut self, volume: f32) -> Result<(), InvalidVolume> {
+        if !(volume.is_finite() && volume >= 0.0) {
+            return Err(InvalidVolume(volume));
+        }
         self.volume = volume;
+        Ok(())
     }
 
-    /// Stops every voice and release (a retry).
+    /// Stops every voice, release and pending start (a retry).
     pub fn stop_all(&mut self) {
         for v in self.voices.iter_mut().chain(self.releases.iter_mut()) {
             v.active = false;
         }
+        self.pending.clear();
     }
 
-    /// Starts sound `id` of `bank` at output frame `at`, or at the first
-    /// frame not yet rendered if `at` is already rendered. When every voice
-    /// is busy, the oldest (earliest start, then earliest trigger) is stolen
-    /// and fades out from the new sound's start. Returns `None` if the bank
-    /// holds no sound for `id` or the mixer has no voice slot.
-    pub fn trigger(&mut self, bank: &SoundBank, id: SoundId, at: u64) -> Option<Started> {
+    /// Schedules sound `id` of `bank` to start at output frame `at`, or at
+    /// the first frame not yet rendered if `at` is already rendered, and
+    /// returns that frame. When the start is reached and every voice is
+    /// busy, the oldest playing voice (earliest start, then earliest
+    /// trigger) is stolen and fades out from it. Returns `None` if the bank
+    /// holds no sound for `id` or [`MAX_PENDING_STARTS`] are waiting.
+    pub fn trigger(&mut self, bank: &SoundBank, id: SoundId, at: u64) -> Option<u64> {
         let sound = bank.slot(id)?;
         let start = at.max(self.mixed_to);
+        if self.pending.len() == self.pending.capacity() {
+            self.dropped_starts += 1;
+            return None;
+        }
         self.seq += 1;
         let voice = Voice {
             active: true,
@@ -208,24 +241,26 @@ impl Mixer {
             seq: self.seq,
             cut: u64::MAX,
         };
+        let key = (start, self.seq);
+        let i = self.pending.partition_point(|p| (p.start, p.seq) > key);
+        self.pending.insert(i, voice);
+        Some(start)
+    }
+
+    /// Puts a pending start into a voice slot, at its start frame.
+    fn apply(&mut self, voice: Voice) {
         if let Some(i) = self.voices.iter().position(|v| !v.active) {
             self.voices[i] = voice;
-            return Some(Started {
-                frame: start,
-                voice: i,
-                stole: false,
-            });
+            return;
         }
-        let i =
-            (0..self.voices.len()).min_by_key(|&i| (self.voices[i].start, self.voices[i].seq))?;
+        let Some(i) =
+            (0..self.voices.len()).min_by_key(|&i| (self.voices[i].start, self.voices[i].seq))
+        else {
+            return;
+        };
         let victim = std::mem::replace(&mut self.voices[i], voice);
         self.steals += 1;
-        self.release(victim, start);
-        Some(Started {
-            frame: start,
-            voice: i,
-            stole: true,
-        })
+        self.release(victim, voice.start);
     }
 
     /// Moves a stolen voice to a release slot fading out from `cut`.
@@ -244,14 +279,10 @@ impl Mixer {
         self.releases[slot] = Voice { cut, ..victim };
     }
 
-    /// Renders the next `out.len() / 2` frames into interleaved stereo
-    /// `out` (overwritten), starting at [`Mixer::mixed_to`]: every voice
-    /// summed, then the volume and the limiter. Voices that end are freed.
-    pub fn render(&mut self, bank: &SoundBank, out: &mut [f32]) {
-        out.fill(0.0);
-        let frames = (out.len() / CHANNELS) as u64;
-        let block_start = self.mixed_to;
-        let block_end = block_start + frames;
+    /// Adds every voice and release into `out` (whose first frame is
+    /// `block_start`) over frames `from..to`. Voices that end by `to` are
+    /// freed.
+    fn mix(&mut self, bank: &SoundBank, out: &mut [f32], block_start: u64, from: u64, to: u64) {
         let fade = &self.fade;
         for v in self
             .voices
@@ -259,16 +290,16 @@ impl Mixer {
             .chain(self.releases.iter_mut())
             .filter(|v| v.active)
         {
-            if v.start >= block_end {
+            if v.start >= to {
                 continue;
             }
             let Some(sound) = bank.stored(v.sound) else {
                 v.active = false;
                 continue;
             };
-            let first = v.start.max(block_start);
+            let first = v.start.max(from);
             let src_end = (v.start + sound.frames()).min(v.cut.saturating_add(fade.len() as u64));
-            let last = src_end.min(block_end);
+            let last = src_end.min(to);
             for s in first..last {
                 let g = if s < v.cut {
                     1.0
@@ -280,9 +311,31 @@ impl Mixer {
                 out[o] += l * g;
                 out[o + 1] += r * g;
             }
-            if src_end <= block_end {
+            if src_end <= to {
                 v.active = false;
             }
+        }
+    }
+
+    /// Renders the next `out.len() / 2` frames into interleaved stereo
+    /// `out` (overwritten), starting at [`Mixer::mixed_to`]: every voice
+    /// summed, with each pending start applied when its frame is reached,
+    /// then the volume and the limiter.
+    pub fn render(&mut self, bank: &SoundBank, out: &mut [f32]) {
+        out.fill(0.0);
+        let block_start = self.mixed_to;
+        let block_end = block_start + (out.len() / CHANNELS) as u64;
+        let mut pos = block_start;
+        loop {
+            let next = self.pending.last().filter(|p| p.start < block_end).copied();
+            let until = next.map_or(block_end, |p| p.start);
+            if until > pos {
+                self.mix(bank, out, block_start, pos, until);
+                pos = until;
+            }
+            let Some(voice) = next else { break };
+            self.pending.pop();
+            self.apply(voice);
         }
         for [l, r] in out.as_chunks_mut::<CHANNELS>().0 {
             (*l, *r) = self.limiter.process(*l * self.volume, *r * self.volume);
@@ -321,11 +374,41 @@ mod tests {
         let bank = SoundBank::from_sounds(400, vec![crate::Sound::mono(vec![8_192; 4])]);
         let mut m = Mixer::new(1, 400);
         m.trigger(&bank, SoundId(0), 0).unwrap();
-        let s = m.trigger(&bank, SoundId(0), 2).unwrap();
-        assert!(s.stole);
+        m.trigger(&bank, SoundId(0), 2).unwrap();
         let mut out = [0.0; 12];
         m.render(&bank, &mut out);
+        assert_eq!(m.steals(), 1);
         let left: Vec<f32> = out.iter().step_by(2).copied().collect();
         assert_eq!(left, [0.25; 6]);
+    }
+
+    #[test]
+    fn invalid_volumes_are_refused_and_not_applied() {
+        let bank = SoundBank::from_sounds(400, vec![crate::Sound::mono(vec![8_192; 2])]);
+        let mut m = Mixer::new(1, 400);
+        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5] {
+            assert!(m.set_volume(v).is_err(), "{v}");
+        }
+        assert_eq!(m.set_volume(0.0), Ok(()));
+        assert_eq!(m.set_volume(0.5), Ok(()));
+        m.trigger(&bank, SoundId(0), 0).unwrap();
+        let mut out = [0.0; 4];
+        m.render(&bank, &mut out);
+        assert_eq!(out, [0.125; 4]);
+    }
+
+    #[test]
+    fn starts_beyond_the_pending_cap_are_dropped_and_counted() {
+        let bank = SoundBank::from_sounds(400, vec![crate::Sound::mono(vec![1; 2])]);
+        let mut m = Mixer::new(4, 400);
+        for k in 0..MAX_PENDING_STARTS as u64 {
+            assert_eq!(m.trigger(&bank, SoundId(0), k), Some(k));
+        }
+        assert_eq!(m.trigger(&bank, SoundId(0), 0), None);
+        assert_eq!(m.dropped_starts(), 1);
+        // Rendering frees room again.
+        let mut out = vec![0.0; 2 * 2 * MAX_PENDING_STARTS];
+        m.render(&bank, &mut out);
+        assert!(m.trigger(&bank, SoundId(0), 0).is_some());
     }
 }
