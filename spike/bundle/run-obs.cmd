@@ -35,7 +35,7 @@ goto collect
 .\tapestry-spike.exe measure --presentmon presentmon\PresentMon-2.6.0-x64.exe --ingest mediamtx\mediamtx.exe --ingest-config obs\mediamtx.yml --obs "%ProgramFiles%\obs-studio\bin\64bit\obs64.exe" --obs-profile %PROFILE% --obs-collection tapestry-spike --obs-encoder %ENCODER% --bga assets\bga.mp4 --out runs\%NAME% %EXTRA%
 set RESULT=%errorlevel%
 if not "%RESULT%"=="0" exit /b %RESULT%
-echo Fill game_visible and audio_present in owner-notes.toml (what the ingest showed),
+echo Answer game_visible and audio_present in runs\%NAME%\owner-review.toml (what the ingest showed; this run only),
 pause
 .\tapestry-spike.exe report runs\%NAME%
 set RESULT=%errorlevel%

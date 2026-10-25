@@ -29,6 +29,7 @@ mod pacing;
 mod power;
 mod render;
 mod report;
+mod review;
 mod run;
 mod rundata;
 mod scene;

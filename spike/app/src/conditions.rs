@@ -27,8 +27,8 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 use windows::core::{HSTRING, Interface};
 
 pub const CONDITIONS: &str = "conditions.json";
-/// Fields the owner fills (`owner-notes.toml`); all but the OBS
-/// confirmations are public conditions.
+/// Fields the owner fills once per PC (`owner-notes.toml`), all public
+/// conditions. The OBS confirmations are per run (`review`).
 pub const OWNER_FIELDS: &[&str] = &[
     "pc_form",
     "vrr",
@@ -36,8 +36,6 @@ pub const OWNER_FIELDS: &[&str] = &[
     "gpu_display_attached",
     "audio_enhancements",
     "audio_device_class",
-    "game_visible",
-    "audio_present",
 ];
 
 fn reg_string(root: HKEY, key: &str, value: &str) -> Option<String> {

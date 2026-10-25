@@ -23,7 +23,11 @@
 //!    (`<out>/private/power_modes.csv`).
 //! 3. With `--obs`, OBS starts streaming with the bundle's profile and
 //!    scene collection; after the run the owner stops streaming and exits
-//!    OBS, and the newest OBS log is copied to `<out>/private/obs.log`.
+//!    OBS, the newest OBS log is copied to `<out>/private/obs.log`, and the
+//!    run's unanswered review `<out>/owner-review.toml` is written. OBS is
+//!    never killed, on any path: an error return or a panic asks it to stop
+//!    streaming and exit through obs-websocket (as unattended runs do) and
+//!    otherwise leaves it running.
 //!    `--ingest-check` also reads the ingest for 10 s during play (game
 //!    video and audio present; the run is then diagnostic).
 //! 4. `report <out>` then evaluates and exports.
@@ -31,11 +35,14 @@
 //! `--unattended` (design §4.3): nobody is at the PC. OBS starts in the
 //! tray as in attended runs (no OBS window that could take the focus);
 //! after the run measure stops the stream through obs-websocket and
-//! closes OBS's hidden main window itself (never a kill; if the
-//! WebSocket is unreachable OBS is left running for the owner and measure
-//! fails), and MediaMTX records the ingest to `<out>/private/ingest/` for
-//! the owner's later review. The run is marked unattended, so its V7 owner
-//! confirmation is pending until the owner notes answer it.
+//! closes OBS's hidden main window itself, within one 20 s deadline for
+//! the whole WebSocket exchange and only while the OBS it started is still
+//! running and is the only OBS (checked before every write and before the
+//! close). On any failure nothing more is sent, OBS is left running for
+//! the owner and measure fails; MediaMTX and PresentMon are stopped either
+//! way. MediaMTX records the ingest to `<out>/private/ingest/` for the
+//! owner's later review. The run is marked unattended, so its V7 owner
+//! confirmation is pending until the run's review answers it.
 //!
 //! `--dry-run` prints the commands without starting anything.
 
@@ -126,21 +133,28 @@ fn show(exe: &Path, args: &[String]) -> String {
     format!("\"{}\" {}", exe.display(), args.join(" "))
 }
 
-/// A helper process `measure` started. It is stopped by `stop` (graceful,
-/// then killed after `grace`) when `finish` is called or when the `Tool`
-/// is dropped on any other path, so no helper outlives `measure`.
+/// How a `Tool` asks its process to stop; `Err` if it could not.
+pub type Stop = Box<dyn FnMut(&mut Child) -> Result<(), String>>;
+
+/// A helper process `measure` started. It is stopped by `stop` when
+/// `finish` is called or when the `Tool` is dropped on any other path
+/// (error, early return or panic), so no helper outlives `measure`: a
+/// killable helper is killed if it is still running `grace` later; a
+/// never-killed one (OBS) is left running instead, as it is when `stop`
+/// fails.
 pub struct Tool {
     name: &'static str,
     child: Option<Child>,
-    stop: Box<dyn FnMut(&mut Child)>,
+    stop: Stop,
     grace: Duration,
+    kill: bool,
 }
 
 impl Tool {
     pub fn spawn(
         name: &'static str,
         cmd: &mut Command,
-        stop: Box<dyn FnMut(&mut Child)>,
+        stop: Stop,
         grace: Duration,
     ) -> Result<Self, String> {
         let child = cmd.spawn().map_err(|e| format!("start {name}: {e}"))?;
@@ -149,7 +163,20 @@ impl Tool {
             child: Some(child),
             stop,
             grace,
+            kill: true,
         })
+    }
+
+    /// A tool that is never killed, on any path: `stop` is its only way out.
+    pub fn spawn_never_killed(
+        name: &'static str,
+        cmd: &mut Command,
+        stop: Stop,
+        grace: Duration,
+    ) -> Result<Self, String> {
+        let mut t = Self::spawn(name, cmd, stop, grace)?;
+        t.kill = false;
+        Ok(t)
     }
 
     /// Waits up to `limit` for `ready` (checked every 50 ms; `None` waits
@@ -190,32 +217,7 @@ impl Tool {
             .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
     }
 
-    /// Waits up to `limit` for the process to exit on its own; `false` if
-    /// it is still running.
-    pub fn wait_for(&mut self, limit: Duration) -> bool {
-        let deadline = Instant::now() + limit;
-        while Instant::now() < deadline {
-            match self.child.as_mut().map(Child::try_wait) {
-                None | Some(Ok(Some(_))) | Some(Err(_)) => {
-                    self.child = None;
-                    return true;
-                }
-                Some(Ok(None)) => std::thread::sleep(Duration::from_millis(100)),
-            }
-        }
-        false
-    }
-
-    /// Lets the process run on unowned (it is neither stopped nor killed).
-    pub fn release(&mut self) {
-        self.child = None;
-    }
-
-    pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
-    }
-
-    /// Stops the process; `Err` if it had to be killed.
+    /// Stops the process; `Err` if it had to be killed or was left running.
     pub fn finish(mut self) -> Result<(), String> {
         self.shutdown()
     }
@@ -236,13 +238,22 @@ impl Tool {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return Ok(());
         }
-        (self.stop)(&mut child);
+        let stopped = (self.stop)(&mut child);
+        if let (Err(e), false) = (&stopped, self.kill) {
+            return Err(format!("{}: {e}; left running", self.name));
+        }
         let deadline = Instant::now() + self.grace;
         while Instant::now() < deadline {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+        if !self.kill {
+            return Err(format!(
+                "{} did not exit after it was asked to; left running",
+                self.name
+            ));
         }
         let _ = child.kill();
         let _ = child.wait();
@@ -258,8 +269,8 @@ impl Drop for Tool {
     }
 }
 
-fn kill(child: &mut Child) {
-    let _ = child.kill();
+fn kill(child: &mut Child) -> Result<(), String> {
+    child.kill().map_err(|e| e.to_string())
 }
 
 /// PresentMon under its session name; stopped by terminating the session.
@@ -273,11 +284,13 @@ fn start_presentmon(exe: &Path, args: &[String], log: &Path) -> Result<Tool, Str
             .stdout(log.try_clone().map_err(|e| e.to_string())?)
             .stderr(log),
         Box::new(move |_| {
-            let _ = Command::new(&stop_exe)
+            Command::new(&stop_exe)
                 .args(["--terminate_existing_session", "--session_name", SESSION])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .status()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }),
         Duration::from_secs(15),
     )?;
@@ -315,31 +328,78 @@ pub fn record_env(dir: &Path) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Whether a process with this image name runs (any user session's view
-/// through `tasklist`).
-fn process_running(image: &str) -> bool {
-    Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
-        .output()
-        .is_ok_and(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .to_lowercase()
-                .contains(&image.to_lowercase())
-        })
+/// The ids of the processes with this image name (any user session's).
+fn processes_named(image: &str) -> Result<Vec<u32>, String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: the snapshot handle is closed below; the entry carries its
+    // own size.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .map_err(|e| format!("process list: {e}"))?;
+        let mut e = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut out = vec![];
+        let mut more = Process32FirstW(snap, &mut e).is_ok();
+        while more {
+            let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(260);
+            if String::from_utf16_lossy(&e.szExeFile[..n]).eq_ignore_ascii_case(image) {
+                out.push(e.th32ProcessID);
+            }
+            more = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+        Ok(out)
+    }
 }
 
-/// Unattended OBS exit: stop the stream through obs-websocket, then close
-/// the main window and wait for OBS to exit by itself.
-fn unattended_exit(obs: &mut Tool) -> Result<(), String> {
-    crate::obsws::stop_stream(Duration::from_secs(20))?;
-    let pid = obs.pid().ok_or("OBS is not running")?;
-    if !crate::obsws::close_main_window(pid) {
-        return Err("no OBS window to close".into());
+/// The OBS processes (`pids`) are exactly the one this run started.
+pub fn sole_owned(pids: &[u32], own: u32) -> Result<(), String> {
+    match pids {
+        [p] if *p == own => Ok(()),
+        _ if !pids.contains(&own) => Err("the OBS this run started is not running".into()),
+        _ => Err("another OBS is running besides the one this run started".into()),
     }
-    if obs.wait_for(Duration::from_secs(40)) {
+}
+
+/// The OBS this run started (`child`, image `image`) is still running and
+/// is the only OBS: the condition for every WebSocket write and the close.
+fn owned_obs(child: &mut Child, image: &str) -> Result<(), String> {
+    if !matches!(child.try_wait(), Ok(None)) {
+        return Err("the OBS this run started has exited".into());
+    }
+    sole_owned(&processes_named(image)?, child.id())
+}
+
+/// The whole WebSocket exchange of the OBS exit (connect, authenticate,
+/// stop, wait for the outputs) ends within this.
+const OBS_WS_LIMIT: Duration = Duration::from_secs(20);
+/// OBS is given this long to exit after its window is closed.
+const OBS_EXIT_WAIT: Duration = Duration::from_secs(40);
+
+/// OBS's way out on every path (`Tool::spawn_never_killed`): stop the
+/// stream through obs-websocket, then close the main window; `Tool` then
+/// waits for OBS to exit by itself. Nothing is sent and nothing closed
+/// unless the OBS this run started is still the only OBS; on any failure
+/// OBS is left running for the owner.
+fn obs_exit(child: &mut Child, image: &str) -> Result<(), String> {
+    let deadline = Instant::now() + OBS_WS_LIMIT;
+    owned_obs(child, image)?;
+    let (port, password) =
+        crate::obsws::server().ok_or("obs-websocket is not enabled in OBS's settings")?;
+    crate::obsws::stop_stream(port, password.as_deref(), deadline, &mut || {
+        owned_obs(child, image)
+    })?;
+    owned_obs(child, image)?;
+    if crate::obsws::close_main_window(child.id()) {
         Ok(())
     } else {
-        Err("OBS did not exit after its window was closed".into())
+        Err("no OBS window to close".into())
     }
 }
 
@@ -598,22 +658,28 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         None
     };
     let mut pm = start_presentmon(&m.presentmon, &pm_args, &private.join("presentmon.log"))?;
-    // OBS and the ingest check are Tools too: an error return closes them
-    // with the rest; on the normal path OBS is closed by the owner and the
-    // check ends by itself (`Tool::wait`).
+    // OBS and the ingest check are Tools too. OBS is never killed: an error
+    // return (or a panic) asks it to stop streaming and exit through
+    // obs-websocket and otherwise leaves it running; on the normal path the
+    // owner closes it, or measure does the same exit when unattended. The
+    // ingest check ends by itself (`Tool::wait`).
     let mut obs_child = None;
     if let Some((exe, args)) = &obs {
-        if process_running("obs64.exe") {
+        let image = exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or("--obs needs the OBS executable")?;
+        if !processes_named(&image)?.is_empty() {
             // A second OBS only shows "already running"; the running one
             // belongs to the owner and is never touched.
             return Err("OBS is already running; close it before an OBS run".into());
         }
         let dir = exe.parent().unwrap_or(Path::new("."));
-        obs_child = Some(Tool::spawn(
+        obs_child = Some(Tool::spawn_never_killed(
             "OBS",
             Command::new(exe).args(args).current_dir(dir),
-            Box::new(kill),
-            Duration::from_secs(2),
+            Box::new(move |c| obs_exit(c, &image)),
+            OBS_EXIT_WAIT,
         )?);
         std::thread::sleep(OBS_SETTLE);
     }
@@ -670,15 +736,11 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         print!("{text}");
         ingest_ok = status.success();
     }
-    if let Some(mut child) = obs_child {
+    if let Some(child) = obs_child {
         if m.unattended {
-            if let Err(e) = unattended_exit(&mut child) {
-                // Never kill OBS: the stream or OBS stays for the owner.
-                child.release();
-                return Err(format!(
-                    "unattended OBS exit failed ({e}); OBS left running for the owner"
-                ));
-            }
+            child.finish().map_err(|e| {
+                format!("unattended OBS exit failed ({e}); OBS left running for the owner")
+            })?;
             println!("measure: stream stopped and OBS closed (unattended)");
         } else {
             println!(
@@ -694,6 +756,11 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
             }
             None => eprintln!("measure: no OBS log found"),
         }
+        let review = crate::review::ensure(&a.out)?;
+        println!(
+            "measure: owner review of this run goes in {}",
+            review.display()
+        );
     }
     if let Some(t) = ingest {
         t.finish()?;
@@ -742,7 +809,7 @@ mod tests {
             &mut long_running(),
             Box::new(move |c| {
                 stopped.store(true, Ordering::SeqCst);
-                let _ = c.kill();
+                kill(c)
             }),
             Duration::from_secs(5),
         )?;
@@ -775,11 +842,11 @@ mod tests {
         let mut c = Command::new("cmd");
         c.args(["/c", "exit 0"]);
         let t = Tool::spawn(
-            "fake OBS",
+            "fake ingest check",
             &mut c,
             Box::new(move |c| {
                 s.store(true, Ordering::SeqCst);
-                let _ = c.kill();
+                kill(c)
             }),
             Duration::from_secs(1),
         )
@@ -790,18 +857,18 @@ mod tests {
         // the early return drops the tool, which closes the process.
         let mut pid = 0;
         let mut after_launch = || -> Result<(), String> {
-            let obs = Tool::spawn(
-                "fake OBS",
+            let check = Tool::spawn(
+                "fake ingest check",
                 &mut long_running(),
                 Box::new(kill),
                 Duration::from_secs(1),
             )?;
-            pid = obs.child.as_ref().map_or(0, Child::id);
+            pid = check.child.as_ref().map_or(0, Child::id);
             std::fs::File::create("Z:/no/such/dir/ingest-check.txt").map_err(|e| e.to_string())?;
-            obs.wait().map(|_| ())
+            check.wait().map(|_| ())
         };
         assert!(after_launch().is_err());
-        assert!(pid != 0 && !alive(pid), "the fake OBS outlived the error");
+        assert!(pid != 0 && !alive(pid), "the fake check outlived the error");
     }
 
     #[test]
@@ -854,23 +921,82 @@ mod tests {
             && v.contains("%f")));
     }
 
-    #[test]
-    fn a_released_tool_is_left_running() {
-        let mut t = Tool::spawn(
-            "fake OBS",
-            &mut long_running(),
-            Box::new(kill),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let pid = t.pid().unwrap();
-        assert!(!t.wait_for(Duration::from_millis(200)));
-        t.release();
-        drop(t);
-        assert!(alive(pid));
+    fn taskkill(pid: u32) {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .output();
+    }
+
+    #[test]
+    fn a_never_killed_tool_is_left_running_on_every_path() {
+        // Error path after the launch (a failed file write): the early
+        // return asks it to exit; that fails (no WebSocket), so it is left
+        // running, not killed.
+        let asked = Arc::new(AtomicBool::new(false));
+        let a = asked.clone();
+        let mut pid = 0;
+        let after_launch = || -> Result<(), String> {
+            let obs = Tool::spawn_never_killed(
+                "fake OBS",
+                &mut long_running(),
+                Box::new(move |_| {
+                    a.store(true, Ordering::SeqCst);
+                    Err("obs-websocket is not enabled in OBS's settings".into())
+                }),
+                Duration::from_secs(1),
+            )?;
+            pid = obs.child.as_ref().map_or(0, Child::id);
+            std::fs::File::create("Z:/no/such/dir/ingest-check.txt").map_err(|e| e.to_string())?;
+            obs.finish()
+        };
+        assert!(after_launch().is_err());
+        assert!(asked.load(Ordering::SeqCst));
+        assert!(pid != 0 && alive(pid), "the fake OBS was killed");
+        taskkill(pid);
+        // Asked successfully but still running after the grace: left
+        // running, and the exit is an error.
+        let t = Tool::spawn_never_killed(
+            "fake OBS",
+            &mut long_running(),
+            Box::new(|_| Ok(())),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let pid = t.child.as_ref().map_or(0, Child::id);
+        let e = t.finish().unwrap_err();
+        assert!(e.contains("left running"), "{e}");
+        assert!(alive(pid), "the fake OBS was killed");
+        taskkill(pid);
+        // A stop that makes it exit (standing in for the graceful exit).
+        let t = Tool::spawn_never_killed(
+            "fake OBS",
+            &mut long_running(),
+            Box::new(kill),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(t.finish().is_ok());
+    }
+
+    #[test]
+    fn websocket_commands_need_the_owned_obs_to_be_the_only_one() {
+        assert!(sole_owned(&[7], 7).is_ok());
+        assert!(sole_owned(&[], 7).unwrap_err().contains("not running"));
+        assert!(sole_owned(&[8], 7).unwrap_err().contains("not running"));
+        assert!(sole_owned(&[7, 8], 7).unwrap_err().contains("another OBS"));
+        // The process list sees this test process.
+        let me = std::env::current_exe().unwrap();
+        let image = me.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            processes_named(&image)
+                .unwrap()
+                .contains(&std::process::id())
+        );
+        // An owned OBS that has exited: nothing is sent or closed.
+        let mut c = Command::new("cmd").args(["/c", "exit 0"]).spawn().unwrap();
+        let _ = c.wait();
+        let e = obs_exit(&mut c, "cmd.exe").unwrap_err();
+        assert!(e.contains("has exited"), "{e}");
     }
 
     #[test]

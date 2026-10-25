@@ -3,13 +3,16 @@
 //! `report <run-dir>` completes the run's `RunData` with PresentMon rows
 //! (`private/presentmon.csv`, placed on the run clock by
 //! `private/origin.json`), the OBS session (`private/obs.log`), the owner's
-//! notes (`owner-notes.toml`), and the run's conditions (the adapter it
+//! notes (`owner-notes.toml`), the OBS confirmations from the run's own
+//! review (`owner-review.toml`, created unanswered for an OBS run), and the
+//! run's conditions (the adapter it
 //! used, the GPU state and effective power mode during play), evaluates it,
 //! writes `summary.json`, `report.md` and `ladder.txt` (the next rung after
 //! a gate failure), and builds the sanitized export `export/<run-id>.zip`,
 //! refused if the scan finds a path, a private name or a raw QPC value. It
 //! fails closed: without readable conditions and their private names
-//! nothing is exported. Exit 0 pass, 1 gate failed, 2 invalid.
+//! nothing is exported. Exit 0 pass, 1 gate failed, 2 invalid, 4 provisional
+//! (an unattended OBS run whose review is open).
 //!
 //! `report --from-export <zip>` reads only the export, recomputes the
 //! summary and compares it with the recorded one.
@@ -26,7 +29,7 @@ use spike_core::evaluate::Summary;
 use spike_core::export::{self, Export, ExportError, ScanContext};
 use spike_core::obslog::{self, WallWindow};
 use spike_core::presentmon::{self, QpcClock};
-use spike_core::run::{OwnerPublic, RunData};
+use spike_core::run::{RunData, RunKind};
 use spike_core::time::qpc_to_us;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -110,10 +113,18 @@ pub fn complete(dir: &Path, notes: &Path) -> Result<Completed, String> {
     }
     // V3: VRR as the owner reports it; unreported counts as on (invalid).
     run.info.vrr = owner.get("vrr").and_then(Value::as_bool).unwrap_or(true);
-    run.owner = OwnerPublic {
-        game_visible: owner.get("game_visible").and_then(Value::as_bool),
-        audio_present: owner.get("audio_present").and_then(Value::as_bool),
-    };
+    // The OBS confirmations come from this run's own review only.
+    if crate::review::stray_answers(notes) {
+        eprintln!(
+            "report: game_visible and audio_present in {} are ignored; answer them per run in {}",
+            notes.display(),
+            dir.join(crate::review::REVIEW).display()
+        );
+    }
+    if run.info.kind == RunKind::Obs {
+        crate::review::ensure(dir)?;
+    }
+    run.owner = crate::review::read(dir)?;
     let play_start = origin.play_start_us;
     let play_end = play_start + origin.play_len_us;
     let pm = dir.join(PRESENTMON_CSV);
@@ -359,8 +370,12 @@ pub fn run(dir: &Path, notes: &Path) -> Result<ExitCode, String> {
     }
     let c = complete(dir, notes)?;
     let (run, origin) = (&c.run, &c.origin);
-    // The obs-websocket password (read from OBS's settings, never stored)
-    // must not leave the PC either.
+    // The obs-websocket password must not leave the PC either. It is the
+    // password in OBS's current configuration, read here and never copied
+    // into any file: a password changed (or a server or authentication
+    // disabled) since the run is not the one scanned for. The scan matches
+    // it in decoded strings too, so quotes or backslashes in it do not hide
+    // it.
     let mut forbidden = c.private_names.clone();
     forbidden.extend(crate::obsws::password());
     let ctx = ScanContext {
@@ -394,6 +409,22 @@ pub fn run(dir: &Path, notes: &Path) -> Result<ExitCode, String> {
         dir.join("summary.json").display(),
         out.display()
     );
+    let o = &run.owner;
+    if run.info.kind == RunKind::Obs
+        && (o.game_visible != Some(true) || o.audio_present != Some(true))
+    {
+        println!(
+            "report: owner review{}: watch the recording in {}, answer game_visible and audio_present (true or false) in {} (this run only), then rerun: tapestry-spike.exe report {}",
+            if summary.owner_review_pending {
+                " pending (provisional result, exit 4)"
+            } else {
+                ""
+            },
+            dir.join("private").join("ingest").display(),
+            dir.join(crate::review::REVIEW).display(),
+            dir.display()
+        );
+    }
     Ok(ExitCode::from(summary.exit_code))
 }
 
@@ -619,22 +650,51 @@ mod tests {
             .join("plugin_config")
             .join("obs-websocket");
         std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::write(
-            cfg.join("config.json"),
-            r#"{"server_enabled": true, "auth_required": true, "server_port": 4455, "server_password": "Zq8xTestSecret"}"#,
-        )
-        .unwrap();
+        // A password with a quote and a backslash, which JSON and report.md
+        // escape.
+        let secret = r#"Zq"8\xTestSecret"#;
+        let config = json!({"server_enabled": true, "auth_required": true,
+            "server_port": 4455, "server_password": secret});
+        std::fs::write(cfg.join("config.json"), config.to_string()).unwrap();
         // SAFETY: no other test thread reads or writes APPDATA.
         unsafe { std::env::set_var("APPDATA", dir.join("appdata")) };
+        assert_eq!(crate::obsws::password().as_deref(), Some(secret));
         let n = notes(
             &dir,
-            "vrr = false
-pc_form = \"desktop Zq8xTestSecret\"
-",
+            &format!("vrr = false\npc_form = \"desktop {secret}\"\n"),
         );
         let err = run(&dir, &n).err().unwrap();
         assert!(err.contains("refused") && err.contains("Name"), "{err}");
         assert!(!dir.join(export::REPORT).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn obs_answers_come_from_the_runs_own_review_only() {
+        let dir = run_dir("review", Some(r#"{"private_names": ["host-name-x"]}"#));
+        let mut run: RunData = read_json(&dir.join(RUNDATA)).unwrap();
+        run.info.kind = RunKind::Obs;
+        run.info.unattended = true;
+        std::fs::write(dir.join(RUNDATA), serde_json::to_vec(&run).unwrap()).unwrap();
+        // Answers in the shared owner notes are ignored, and the run gets
+        // its own unanswered review.
+        let n = notes(
+            &dir,
+            "vrr = false\ngame_visible = true\naudio_present = true\n",
+        );
+        let done = complete(&dir, &n).unwrap();
+        assert_eq!(done.run.owner, Default::default());
+        let review = dir.join(crate::review::REVIEW);
+        let text = std::fs::read_to_string(&review).unwrap();
+        // The run's answers are read from its review.
+        std::fs::write(
+            &review,
+            text.replace("game_visible =", "game_visible = true"),
+        )
+        .unwrap();
+        let done = complete(&dir, &n).unwrap();
+        assert_eq!(done.run.owner.game_visible, Some(true));
+        assert_eq!(done.run.owner.audio_present, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

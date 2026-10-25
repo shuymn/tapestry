@@ -3,9 +3,9 @@ rem Unattended R2/R3 OBS run (design 4.3): as run-obs.cmd, but nobody is at
 rem the PC. After the run measure stops the stream through OBS's WebSocket
 rem server (enable it in OBS: Tools ^> WebSocket Server Settings) and closes
 rem OBS itself; the ingest is recorded to runs\<name>\private\ingest\ for your
-rem later review. The result stays provisional (exit 4) until you fill
-rem game_visible and audio_present in owner-notes.toml from the recording and
-rem rerun: tapestry-spike.exe report runs\<name>
+rem later review. The result stays provisional (exit 4) until you answer
+rem game_visible and audio_present in this run's own runs\<name>\owner-review.toml
+rem from its recording and rerun: tapestry-spike.exe report runs\<name>
 rem Add --gpu-power-mode <value> (README).
 rem   run-obs-unattended.cmd <run-name> <obs-profile> <hardware^|x264> [run options]
 setlocal
@@ -33,7 +33,8 @@ if not "%RESULT%"=="0" exit /b %RESULT%
 .\tapestry-spike.exe report runs\%NAME%
 set RESULT=%errorlevel%
 call :ladder
-echo Review runs\%NAME%\private\ingest\ (game visible, audio present, hitches, tearing, BGA, crackles).
+echo Review runs\%NAME%\private\ingest\ (game visible, audio present, hitches, tearing, BGA, crackles),
+echo answer in runs\%NAME%\owner-review.toml (this run only), then rerun: tapestry-spike.exe report runs\%NAME%
 echo Hand-off: only runs\%NAME%\export\*.zip leaves this PC.
 exit /b %RESULT%
 

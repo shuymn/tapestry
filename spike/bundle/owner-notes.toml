@@ -1,5 +1,6 @@
-# Owner notes (design 3.5). Fill once per PC, and the OBS fields after each
-# OBS run. Only these fields are read; values are true/false or "text".
+# Owner notes (design 3.5). Fill once per PC. Only these fields are read;
+# values are true/false or "text". The OBS answers (game visible, audio
+# present) are per run: each OBS run has its own runs\<name>\owner-review.toml.
 
 # Laptop or desktop.
 pc_form = ""
@@ -15,7 +16,3 @@ gpu_display_attached = ""
 audio_enhancements = ""
 # Output device class (for example "USB interface", "onboard", "headset").
 audio_device_class = ""
-
-# OBS runs only: the game was visible, and its audio present, in the ingest.
-game_visible =
-audio_present =
