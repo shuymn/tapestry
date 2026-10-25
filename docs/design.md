@@ -389,6 +389,14 @@ Mid-chart starts, section repeat, and excerpts from full-play records are all ha
 
 Key sound latency is the sum of the following segments. Each segment is made measurable, and a total of 10 ms or less is the target, measured on chosen hardware. On environments that cannot reach it, the game points out that exclusive mode or ASIO can be chosen, but does not switch automatically.
 
+The standard path does not reach the target on every device. Stage 0 measured WASAPI shared mode on an audio interface whose shared-mode period is fixed at 10 ms (`IAudioClient3` offers no shorter period on it): the segment from judgment to the scheduled mix sample alone was about 26 ms at p50 and 32 ms at p99, before the output segment and the device segments. With a 10 ms period, one period already uses the whole budget, so no shared-mode implementation meets 10 ms on such a device. How to resolve this is an open decision for the owner (the "Open Questions" section):
+
+- **Exclusive mode** as the path that meets the budget: a shorter device period, at the cost that other apps' audio may stop on that device and the streaming software's desktop audio capture loses the game's audio.
+- **ASIO** as that path: requires settling the ASIO SDK license choice, and coexistence with streaming software depends on the device's own routing (for example an interface's internal loopback).
+- **A revised budget**: 10 ms applies to the low-latency profile only, and the standard shared path gets a budget stated in terms of the device period.
+
+Until it is decided, the 10 ms target stands, the standard path measures and displays its actual latency, and the game points out exclusive mode or ASIO as above.
+
 | Segment | What it is | How it is kept down |
 | --- | --- | --- |
 | Device | Controller scanning and the USB report interval | Depends on the device. Recorded as a device setting |
@@ -434,21 +442,35 @@ From stage 1, the frame time distribution (not just the average, but also the sl
 
 ## Performance
 
-Performance is not something optimized all at once at the end, but a constraint kept from the start. The target is that, in the heaviest scene, the p99 of the presented frame interval fits within one frame time, for a 60 Hz display on the reference PC (for example a laptop with an iGPU) and a 240 Hz display on a mid-range PC. The target is treated as a value under fixed conditions: hardware, output and render resolutions, chart and skin, measurement duration, and measurement windows. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
+Performance is not something optimized all at once at the end, but a constraint kept from the start. The target is that, in the heaviest scene, frames reach the screen on the refreshes the target frame rate asks for, with missed deadlines within the frame pacing budget, for a 60 Hz display on the reference PC (for example a laptop with an iGPU) and a 240 Hz display on a mid-range PC. The target is treated as a value under fixed conditions: hardware, display mode, the GPU's power management setting, output and render resolutions, chart and skin, measurement duration, and measurement windows. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
 
 ### Budget
 
 | Metric | Target |
 | --- | --- |
-| Presented frame interval (240 Hz) | Within 4.16 ms at p99; record the number of frames that missed the deadline |
+| Frame pacing | Missed deadlines at most 0.1% of the target intervals, counted in whole refreshes ("Frame Pacing in Refreshes") |
 | Render CPU work (including skin evaluation and BGA upload commands) | 1.5 ms |
-| GPU | 2 ms |
+| GPU | 2 ms, with the GPU in its performance state ("GPU Power State") |
 | Input to judgment | 1 ms or less |
-| Press to sound | 10 ms or less |
+| Press to sound | 10 ms or less; not reachable on WASAPI shared mode with a 10 ms device period, open decision ("Path from Press to Sound") |
 | Audio dropouts | 0 |
 | Song selection to play start | 1–2 seconds |
 
 Judgment and audio run on threads separate from rendering, so the score does not change even if rendering exceeds its budget. But the look of the notes gets disrupted, so the render budget is kept with equal weight.
+
+### Frame Pacing in Refreshes
+
+A display with a fixed refresh rate can only show a new frame on a refresh, so frame pacing is counted in whole refreshes rather than judged by a percentile in milliseconds.
+
+- **Refresh period T**: One refresh period of the display mode actually in use, from its exact refresh rate (16.680 ms at 59.951 Hz, 4.165 ms at 240.085 Hz). Modes offered as 60 Hz or 240 Hz are rarely exact; a mode belongs to the 60 Hz or 240 Hz class when it is within ±0.1% of the nominal rate (59.94–60.06 Hz, 239.76–240.24 Hz). The nominal 1/60 s (16.67 ms) and 1/240 s (4.17 ms) are only for orientation.
+- **Target interval**: k refreshes, where k = 1 without a frame rate cap, and k = nominal rate ÷ cap with a cap (caps divide the nominal rate exactly; a 120 fps cap on a 240 Hz display is k = 2).
+- **Counting**: Each displayed frame's interval (from PresentMon, the interval between display changes) counts as n refreshes, the nearest whole number to interval ÷ T. The timestamp tolerance is 0.5 ms: if the p99 of |interval − n × T| exceeds it, the display is not running on a fixed refresh grid (VRR or composition), and the run is not valid for this metric.
+- **Missed deadline**: A displayed interval with n > k, or a presented frame that is never displayed.
+- **Budget**: Missed deadlines in the measurement windows are at most 0.1% of the target intervals in those windows (for example, 240 s of heavy-scene windows at 240 Hz hold about 57,600 target intervals, so at most 57). The count is always recorded, and the in-game measurement display shows it.
+
+The reason is timestamp jitter. In stage 0, with the GPU in its performance state, the p99 interval exceeded T by 0.03–0.07 ms in every run while no refresh was missed without streaming software, and intervals of late frames stayed within 0.1 ms of a whole number of refreshes. A p99 threshold at exactly T fails such runs on jitter alone, yet lets 1% of intervals be real misses; the refresh count ignores the jitter and allows a tenth of that.
+
+This metric assumes a fixed refresh rate, so frame pacing is measured with VRR off. How to judge pacing under VRR is an open question.
 
 ### Bounding Work by Structure
 
@@ -466,7 +488,28 @@ Even if the CPU and GPU times are within budget, presentation is not necessarily
 
 - **Presentation mode**: Use the DXGI flip model with a waitable swap chain and 1 frame rendered ahead, a low-latency path even in borderless display. Vsync on or off, variable refresh rate (VRR), and allowing tearing are settings, and which path wgpu actually uses is verified.
 - **First-time stutter**: Shader and pipeline creation and the first texture uploads are all completed before the countdown. Uploads are done a little at a time through a bounded queue.
-- **Measurement**: The actually presented frame intervals are measured with PresentMon or similar. First load (no cache), retry, real controllers, and slowdowns from laptop power saving and heat are also included in the measurement conditions.
+- **Measurement**: The actually presented frame intervals are measured with PresentMon or similar. First load (no cache), retry, real controllers, slowdowns from laptop power saving and heat, and the GPU's power management setting and observed performance state are also included in the measurement conditions.
+
+### GPU Power State
+
+The play scene is a light load for a discrete GPU, so under the driver's default power management the GPU stays in a low performance state with low core and memory clocks. In stage 0, at the default setting, GPU time reached about 4.5 ms at p99 and 3.5% of the 240 Hz heavy-scene intervals missed a refresh, every miss a frame whose GPU work ended after the vblank. At 60 Hz no refresh was missed, but GPU time was still about 5.5 ms. With the driver's per-application setting at maximum performance, the GPU held its top state, GPU time stayed under 1 ms at p99, and no refresh was missed.
+
+| Option | What it gives | Why not, or the cost |
+| --- | --- | --- |
+| Fix the clocks from the game (D3D12 stable power state) | No settings for the player | Works only in Windows developer mode, is meant for profiling, and fixes clocks at a base value rather than the top state |
+| Write the driver's application profile from the game | Performance state without player action | Vendor-specific, and changes settings outside the game (against "Coexisting with Other Software") |
+| Add GPU work so the driver raises clocks | Works under the default setting | Spends power and GPU time that other software needs |
+| Render one more frame ahead when misses are detected | On time at low clocks while GPU time fits within two refreshes | One more refresh of display latency, and display latency changes during a session |
+| State the requirement, detect, and guide the player | No settings changed by the game | Under the default setting, 240 Hz misses until the player changes it |
+
+The game takes the last option:
+
+- The 240 Hz frame pacing budget and the GPU budget assume the GPU in its performance state. On the drivers measured so far, that requires the driver's per-application power management set to maximum performance for the game's executable. The settings screen states this.
+- The game does not write driver or power settings itself, and does not add GPU work to raise clocks.
+- The game already measures missed deadlines and GPU time during play ("Measurement"). When misses come from GPU work ending after the vblank, the measurement display and the result screen name the power management setting as the likely cause.
+- GPU time under the default setting is recorded but not judged against the GPU budget, because the clock, not the work, sets it there. Frame pacing is judged under whichever setting the run declares.
+
+The reasons: every option that keeps presentation on time under the default setting either changes settings outside the game or spends GPU time and power that coexistence reserves for other software. Guidance leaves the choice with the player, as with exclusive audio modes. Whether the standard profile should fall back to one more frame ahead under the default setting, and whether the 60 Hz reference class holds its budget under the default setting, are open questions.
 
 ### Memory Budget
 
@@ -479,7 +522,7 @@ Budgets are set for each of decoded audio (about 115 MB per 10 minutes at 2 chan
 
 ### Measurement
 
-- In game, the frame time distribution (p99 and maximum), the latency from input to judgment, and the number of audio dropouts can be displayed at any time.
+- In game, the frame time distribution (p99 and maximum), the number of missed deadlines, GPU time, the latency from input to judgment, and the number of audio dropouts can be displayed at any time.
 - A benchmark scene plays back a fixed input log with the worst-case chart and skin, and it is measured regularly on the reference PC.
 - CPU-side time (evaluator, skin evaluation, loading) is measured as benchmarks (criterion) in CI to detect large regressions. Measurements on shared CI fluctuate, so pass/fail on absolute values is decided on a fixed dedicated PC.
 - For detailed investigation, per-span times are inspected with Tracy (`tracy-client`).
@@ -923,6 +966,9 @@ Between stages 1 and 2, a generous period of playing and fixing is set aside. IR
 - The criteria for inclusion in the allowlist, and the takedown request procedure (including legal judgment)
 - How to obtain authors' permission for "storage for evaluation", and the form of that record (to be decided before starting IR)
 - The concrete configuration of the reference PC
+- Press to sound on WASAPI shared mode with a device period of 10 ms: exclusive mode, ASIO, or a revised budget (owner decision; "Path from Press to Sound")
+- Under the driver's default GPU power management: whether the standard profile falls back to one more frame rendered ahead, and whether the 60 Hz reference class holds its budget ("GPU Power State")
+- How to judge frame pacing under VRR, where counting in whole refreshes does not apply ("Frame Pacing in Refreshes")
 
 ## Appendix: Lessons from Existing Implementations
 
