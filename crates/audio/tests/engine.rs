@@ -227,6 +227,71 @@ fn resume_discontinuity_rebases_the_clock() {
 }
 
 #[test]
+fn starts_beyond_the_pending_capacity_wait_for_the_next_step() {
+    // 1100 one-frame sounds within the first two-period fill at 96 kHz
+    // (frame 0 plays at 10 ms), once as BGM 10 µs apart from 10 ms and once
+    // as key commands in one step: more than the 1024 starts the mixer
+    // holds. Every one still sounds, each with its sample, none dropped.
+    const N: usize = 1_100;
+    const RATE96: u32 = 96_000;
+    let bank = || Arc::new(SoundBank::from_sounds(RATE96, vec![Sound::mono(vec![100])]));
+    for as_bgm in [true, false] {
+        let bgm: Vec<BgmEvent> = if as_bgm {
+            (0..N as i64)
+                .map(|k| BgmEvent {
+                    time: TimeUs(10_000 + k * 10),
+                    sound: SoundId(0),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut e = AudioEngine::new(bank(), &bgm, RATE96, 960, 64, 2 * N).unwrap();
+        let dev = SimDevice::new(SimConfig::steady(RATE96, 960, TimeUs(0)));
+        let mut out = RecordingOutput::new(dev, 96_000);
+        let (mut tx, mut rx) = RingBuffer::new(2 * N);
+        if !as_bgm {
+            for k in 0..N as i64 {
+                tx.push(SoundCmd {
+                    sound: SoundId(0),
+                    origin: TimeUs(k),
+                })
+                .unwrap();
+            }
+        }
+        let mut starts = Vec::new();
+        let (mut bgm_started, mut commands) = (0, 0);
+        for _ in 0..20 {
+            let r = e.step(&mut out, &mut rx).unwrap();
+            bgm_started += r.bgm_started;
+            commands += r.commands;
+            drain(&mut e, &mut starts);
+        }
+        assert_eq!(starts.len(), N, "bgm {as_bgm}");
+        assert_eq!(if as_bgm { bgm_started } else { commands }, N as u32);
+        assert_eq!(e.mixer().dropped_starts(), 0);
+        let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+        let one = 100.0 / 32_768.0;
+        for s in &starts {
+            assert!(left[s.frame as usize] >= one, "frame {}", s.frame);
+        }
+        if as_bgm {
+            // At most two share a frame, so nothing is limited: the samples
+            // add up to one per start.
+            let total: f32 = left.iter().sum();
+            assert!((total - N as f32 * one).abs() < 1e-3, "{total}");
+        } else {
+            // Key sounds start at the first unwritten frame: 1024 in the
+            // first fill, the other 76 at the start of the next block.
+            let first = starts[0].frame;
+            let at_first = starts.iter().filter(|s| s.frame == first).count();
+            assert_eq!(at_first, 1_024);
+            assert!(starts[1_024..].iter().all(|s| s.frame == first + 1_920));
+        }
+    }
+}
+
+#[test]
 fn engine_refuses_zero_rate_or_period_and_a_bank_at_another_rate() {
     let new = |rate, period| AudioEngine::new(bank(), &[], rate, period, 4, 4).map(|_| ());
     assert_eq!(new(0, PERIOD), Err(EngineError::ZeroRateOrPeriod));

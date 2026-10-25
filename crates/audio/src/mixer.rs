@@ -22,6 +22,8 @@ use crate::bank::SoundBank;
 pub const MAX_VOICES: usize = 256;
 /// Starts that can wait to be applied; more are dropped and counted.
 pub const MAX_PENDING_STARTS: usize = 1024;
+/// Largest master volume (+24 dB), so no sum of voices overflows `f32`.
+pub const MAX_VOLUME: f32 = 16.0;
 /// Fade applied to a stolen voice.
 pub const STEAL_FADE_MS: u32 = 2;
 /// The limiter's ceiling: full scale.
@@ -40,13 +42,13 @@ struct Voice {
     cut: u64,
 }
 
-/// A volume that is negative, infinite or NaN.
+/// A volume outside `0.0..=MAX_VOLUME` (NaN included).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InvalidVolume(pub f32);
 
 impl fmt::Display for InvalidVolume {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "volume {} is not a finite, non-negative gain", self.0)
+        write!(f, "volume {} is outside 0 to {MAX_VOLUME}", self.0)
     }
 }
 
@@ -192,6 +194,12 @@ impl Mixer {
         self.dropped_starts
     }
 
+    /// Whether another start can wait to be applied.
+    #[must_use]
+    pub fn can_start(&self) -> bool {
+        self.pending.len() < self.pending.capacity()
+    }
+
     /// The limiter's state.
     #[must_use]
     pub fn limiter(&self) -> &Limiter {
@@ -202,10 +210,10 @@ impl Mixer {
     ///
     /// # Errors
     ///
-    /// [`InvalidVolume`] for a negative, infinite or NaN volume, which is
+    /// [`InvalidVolume`] for a volume outside `0.0..=MAX_VOLUME`, which is
     /// not applied.
     pub fn set_volume(&mut self, volume: f32) -> Result<(), InvalidVolume> {
-        if !(volume.is_finite() && volume >= 0.0) {
+        if !(0.0..=MAX_VOLUME).contains(&volume) {
             return Err(InvalidVolume(volume));
         }
         self.volume = volume;
@@ -386,10 +394,18 @@ mod tests {
     fn invalid_volumes_are_refused_and_not_applied() {
         let bank = SoundBank::from_sounds(400, vec![crate::Sound::mono(vec![8_192; 2])]);
         let mut m = Mixer::new(1, 400);
-        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.5] {
+        for v in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.5,
+            16.01,
+            f32::MAX,
+        ] {
             assert!(m.set_volume(v).is_err(), "{v}");
         }
         assert_eq!(m.set_volume(0.0), Ok(()));
+        assert_eq!(m.set_volume(MAX_VOLUME), Ok(()));
         assert_eq!(m.set_volume(0.5), Ok(()));
         m.trigger(&bank, SoundId(0), 0).unwrap();
         let mut out = [0.0; 4];

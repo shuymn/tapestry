@@ -190,7 +190,7 @@ impl AudioEngine {
     ///
     /// # Errors
     ///
-    /// [`InvalidVolume`] for a negative, infinite or NaN volume, which is
+    /// [`InvalidVolume`] for a volume outside `0.0..=MAX_VOLUME`, which is
     /// not applied.
     pub fn set_volume(&mut self, volume: f32) -> Result<(), InvalidVolume> {
         self.mixer.set_volume(volume)
@@ -260,7 +260,11 @@ impl AudioEngine {
         }
         self.clock
             .observe(wake.queued_from, TimeUs(wake.at.0 + self.period_us));
-        while let Ok(cmd) = cmds.pop() {
+        // A command or BGM event that finds the mixer's pending starts full
+        // stays queued for the next step, which starts it at the first frame
+        // it can still write, head intact.
+        while self.mixer.can_start() {
+            let Ok(cmd) = cmds.pop() else { break };
             report.commands += 1;
             let target = self.clock.frame_at(cmd.origin).unwrap_or(0);
             let kind = ScheduledKind::Key { origin: cmd.origin };
@@ -271,7 +275,7 @@ impl AudioEngine {
             while let Some(&event) = self.bgm.get(self.next_bgm) {
                 let at = TimeUs(self.play_origin.0 + event.time.0 - self.output_offset.0);
                 let target = self.clock.frame_at(at).unwrap_or(0);
-                if target >= block_end {
+                if target >= block_end || !self.mixer.can_start() {
                     break;
                 }
                 self.next_bgm += 1;
