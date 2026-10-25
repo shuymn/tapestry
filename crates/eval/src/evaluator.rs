@@ -192,10 +192,9 @@ struct LaneState {
     targets: Vec<usize>,
     /// Whether each target is judged.
     judged: Vec<bool>,
-    /// Whether each target's long note is finished: completed, broken, or
-    /// its head missed. Unused for taps.
-    ln_finished: Vec<bool>,
-    /// The long note whose head was judged and which is held now.
+    /// The long note whose head was judged and which is held now. A long
+    /// note is finished (completed, broken, or its head missed) once its
+    /// head is judged and it is not this one.
     holding: Option<usize>,
     /// The first unjudged target.
     cursor: usize,
@@ -221,7 +220,7 @@ impl LaneState {
         while let Some(&d) = self.deadlines.get(self.next) {
             let skip = match d.kind {
                 DeadlineKind::Miss => self.judged[d.index],
-                DeadlineKind::LnEnd => self.ln_finished[d.index],
+                DeadlineKind::LnEnd => self.judged[d.index] && self.holding != Some(d.index),
                 DeadlineKind::Mine | DeadlineKind::SongEnd => false,
             };
             if !skip {
@@ -335,7 +334,6 @@ impl<'a> Evaluator<'a> {
                 .map(|(i, _)| i)
                 .collect();
             state.judged = vec![false; state.targets.len()];
-            state.ln_finished = vec![false; state.targets.len()];
             let mut deadlines = Vec::with_capacity(notes.len() * 2);
             for (target, &i) in state.targets.iter().enumerate() {
                 let note = notes[i];
@@ -576,8 +574,7 @@ impl<'a> Evaluator<'a> {
         state.next += 1;
         match d.kind {
             DeadlineKind::Miss => {
-                // A missed head finishes its long note too.
-                state.ln_finished[d.index] = true;
+                // A missed head is judged, which finishes its long note too.
                 self.judge(lane, d.index, Judgment::Poor, None, d.time, None, out);
             }
             DeadlineKind::LnEnd => {
@@ -586,7 +583,6 @@ impl<'a> Evaluator<'a> {
                 // finished it.
                 if state.judged[d.index] {
                     state.holding = None;
-                    state.ln_finished[d.index] = true;
                     self.ln_end(lane, d.index, LnOutcome::Completed, d.time, None, out);
                 }
             }
@@ -678,12 +674,10 @@ impl<'a> Evaluator<'a> {
                     // the press; the following release is ignored.
                     LateHeadRule::CompletesAtPress => t >= end,
                 };
-                let state = &mut self.lanes[lane];
                 if completed {
-                    state.ln_finished[k] = true;
                     self.ln_end(lane, k, LnOutcome::Completed, t, Some(origin), out);
                 } else {
-                    state.holding = Some(k);
+                    self.lanes[lane].holding = Some(k);
                 }
             }
             return;
@@ -722,7 +716,6 @@ impl<'a> Evaluator<'a> {
         let Some(k) = state.holding.take() else {
             return;
         };
-        state.ln_finished[k] = true;
         let end = self.chart.lanes[lane][state.targets[k]].end();
         let rule = self.rule.ln_break;
         let broken = i128::from(t.0) < i128::from(end.0) - i128::from(rule.release_margin.0);

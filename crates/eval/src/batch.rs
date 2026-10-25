@@ -91,27 +91,28 @@ pub fn evaluate(
     // The first advance cannot be backward.
     let _ = ev.advance_to(to, &mut events);
     let completed = ev.is_complete();
+    let mut histories = vec![Vec::new(); rule.gauges.len()];
+    for e in &events {
+        if let JudgeEventKind::Gauge {
+            gauge,
+            value,
+            reference,
+        } = e.kind
+            && let Some(h) = histories.get_mut(gauge)
+        {
+            h.push(GaugePoint {
+                time: e.time,
+                value,
+                reference,
+            });
+        }
+    }
     let gauges = rule
         .gauges
         .iter()
         .zip(ev.gauges())
-        .enumerate()
-        .map(|(i, (rule, state))| {
-            let history = events
-                .iter()
-                .filter_map(|e| match e.kind {
-                    JudgeEventKind::Gauge {
-                        gauge,
-                        value,
-                        reference,
-                    } if gauge == i => Some(GaugePoint {
-                        time: e.time,
-                        value,
-                        reference,
-                    }),
-                    _ => None,
-                })
-                .collect();
+        .zip(histories)
+        .map(|((rule, state), history)| {
             let passed = match rule.kind {
                 GaugeKind::EndThreshold { clear } => state.value >= clear,
                 GaugeKind::Survival => state.failed_at.is_none(),

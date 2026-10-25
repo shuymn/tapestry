@@ -108,20 +108,15 @@ impl Gauges {
         for (rule, state) in rules.iter().zip(&mut self.states) {
             let d = delta(rule, mine, cause, self.increment);
             state.reference = step(rule, state.reference, d, cause);
-            match rule.kind {
-                GaugeKind::EndThreshold { .. } => state.value = state.reference,
-                GaugeKind::Survival => {
-                    if state.failed_at.is_some() {
-                        continue;
-                    }
-                    let next = step(rule, state.value, d, cause);
-                    if next <= rule.min {
-                        state.value = GaugeValue::EMPTY;
-                        state.failed_at = Some(time);
-                    } else {
-                        state.value = next;
-                    }
-                }
+            // Until a failure the real value equals the reference; after
+            // one it stays at 0.
+            if state.failed_at.is_some() {
+                continue;
+            }
+            state.value = state.reference;
+            if rule.kind == GaugeKind::Survival && state.value <= rule.min {
+                state.value = GaugeValue::EMPTY;
+                state.failed_at = Some(time);
             }
         }
     }
