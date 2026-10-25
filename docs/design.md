@@ -58,9 +58,9 @@ This is a game, and the correctness of judgment is merely the foundation for "be
 
 | Item | Target | Reason |
 | --- | --- | --- |
-| From press to key sound | 10 ms or less | Audio latency is felt as "heavy" before judgment deviation is |
+| From press to key sound | 10 ms or less on the low-latency path; shared mode follows the device period ("Path from Press to Sound") | Audio latency is felt as "heavy" before judgment deviation is |
 | From press to judgment and bomb appearing on screen | 1–2 frames | The feel of a press is determined by the screen's response |
-| Frame stability | No drops at 144/240 Hz | Even a momentary hitch in the note flow breaks reading |
+| Frame stability | No drops at 144/240 Hz, watched through the frame pacing indicators ("Frame Pacing in Refreshes") | Even a momentary hitch in the note flow breaks reading |
 | From song selection to play start | 1–2 seconds | It is a game you replay many times, so waiting time turns directly into frustration |
 | Retry | One action, instant | Repeating the same chart is the core of play |
 
@@ -76,6 +76,8 @@ This is a game, and the correctness of judgment is merely the foundation for "be
 - The first target is a state where "one song can be played pleasantly to the end". IR, distribution, and skin compatibility are added after that.
 - Effects, screens, and the default judgment and gauge values are treated as things tuned by playing. Tuning can be tried without restarting, by reloading presets and skins.
 - The default look (custom skin) and the default judgment are the face of this game. Make the standard setup fun to play without relying on compatible skins.
+- Build it to completion with the fewest extensions first. Only the extension points the first playable version needs are implemented; the others stay as boundaries in this document. Variations (other PCs and refresh rates, running alongside other software, skins, presets) are then added one at a time. If a design flaw blocks one of them, the affected part is rebuilt from scratch with that flaw taken into account. This is a personal project, so finishing the concept matters more than the effort it takes.
+- Performance comes from doing what game development normally does (the "Performance" section): no wasted resources, and no over-engineering. Measured figures are tracked to find problems; they are not targets that stop work.
 
 ## Overall Architecture
 
@@ -242,7 +244,7 @@ pub fn evaluate(chart: &Chart, log: &InputLog, rule: &RulePreset, range: Option<
 
 ### Finalize Only Up to the Watermark
 
-During play, only `advance_to(watermark)` is called. Even for a note whose deadline has passed, the miss is not finalized until the watermark passes that deadline. Therefore, a miss is structurally never decided ahead of an input that was still on its way. The finalization delay is determined by the watermark interval, and the target is 1 ms or less (this cannot be guaranteed on Windows, so it is measured and verified).
+During play, only `advance_to(watermark)` is called. Even for a note whose deadline has passed, the miss is not finalized until the watermark passes that deadline. Therefore, a miss is structurally never decided ahead of an input that was still on its way. The finalization delay is determined by the watermark interval (about 1 ms with the input thread's 1 kHz wake-up). It cannot be guaranteed on Windows, so it is measured and tracked.
 
 ### What Wakes the Logic Thread
 
@@ -387,7 +389,10 @@ Mid-chart starts, section repeat, and excerpts from full-play records are all ha
 
 ### Path from Press to Sound
 
-Key sound latency is the sum of the following segments. Each segment is made measurable, and a total of 10 ms or less is the target, measured on chosen hardware. On environments that cannot reach it, the game points out that exclusive mode or ASIO can be chosen, but does not switch automatically.
+Key sound latency is the sum of the following segments. Each segment is made measurable, and what can be expected depends on the output path. The device period granted by the audio device is recorded with every measurement, and the game measures and displays the actual latency of the path in use.
+
+- **Standard path (WASAPI shared mode)**: The latency follows from the shared-mode device period P. From judgment to the scheduled mix sample, it is about 2P for the two device periods queued ahead of playback (with one period queued, audio dropped out repeatedly), plus P/2 on average for the wait until the next period event, plus the resampler's filter delay (about 1 ms). The OS audio engine and the device's output latency come after this, and the device and input-receipt segments come before judgment. Stage 0 measured a device whose shared-mode period is fixed at 10 ms (`IAudioClient3` offers no shorter period on it): judgment to the scheduled mix sample was about 26 ms at p50 and 32 ms at p99, which the parts above account for, and no further delay was found. This is how shared mode works on such a device, not a defect.
+- **Low-latency path (later stage)**: The 10 ms or less from press to sound applies to a low-latency path built in a later stage: exclusive mode, ASIO, or a device that grants a shorter shared-mode period. Exclusive mode and ASIO stay as described in "Audio" and "Settings Profiles" and are not built before then.
 
 | Segment | What it is | How it is kept down |
 | --- | --- | --- |
@@ -395,7 +400,7 @@ Key sound latency is the sum of the following segments. Each segment is made mea
 | Input receipt | Until the OS delivers the input | Receive Raw Input on a dedicated thread |
 | Evaluation | Logic thread wake-up and judgment | Wake it immediately on input publication. Judgment processing time is measured, targeting the µs scale |
 | Handoff to audio | Waiting until the next buffer write | Lock-free queue. Shorten the buffer period |
-| Mixing | Summing, sample rate conversion, limiter | Include the conversion and limiter look-ahead latency in the budget |
+| Mixing | Summing, sample rate conversion, limiter | Count the conversion and limiter look-ahead latency in the press-to-sound figure |
 | Output | From the written buffer, through the OS and driver, until it sounds from the DAC | Short period in shared mode (standard), exclusive mode (optional). Either way, measure and display the actual latency |
 
 If a "sound to play" event arrives too late for the current buffer write, the sound starts from the first sample that can be written next. The head of the sound is never cut off to make up for the delay. Separately from measuring internal wait times, the actual time from press to sound is also verified with a microphone or dedicated measurement.
@@ -434,21 +439,42 @@ From stage 1, the frame time distribution (not just the average, but also the sl
 
 ## Performance
 
-Performance is not something optimized all at once at the end, but a constraint kept from the start. The target is that, in the heaviest scene, the p99 of the presented frame interval fits within one frame time, for a 60 Hz display on the reference PC (for example a laptop with an iGPU) and a 240 Hz display on a mid-range PC. The target is treated as a value under fixed conditions: hardware, output and render resolutions, chart and skin, measurement duration, and measurement windows. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
+Performance is not something optimized all at once at the end, but a constraint kept from the start by doing what game development normally does: bounding per-frame work by structure, keeping hot paths free of allocation, keeping heavy work off the render and audio paths, and presenting in step with the display. For now it is verified on one development PC with a WQHD 240 Hz display. Other PCs, other refresh rates, and running alongside other software (streaming and recording software included) are verified later, as variations ("How We Build It").
 
-### Budget
+The figures below are indicators tracked over time, not targets. When an indicator points to a problem a player would notice, its cause is investigated, and then either a mechanism prevents it or it is documented as a limitation. An indicator is never a reason to stop work, and no threshold is set without a reason grounded in what the player sees. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
 
-| Metric | Target |
-| --- | --- |
-| Presented frame interval (240 Hz) | Within 4.16 ms at p99; record the number of frames that missed the deadline |
-| Render CPU work (including skin evaluation and BGA upload commands) | 1.5 ms |
-| GPU | 2 ms |
-| Input to judgment | 1 ms or less |
-| Press to sound | 10 ms or less |
-| Audio dropouts | 0 |
-| Song selection to play start | 1–2 seconds |
+### Indicators
 
-Judgment and audio run on threads separate from rendering, so the score does not change even if rendering exceeds its budget. But the look of the notes gets disrupted, so the render budget is kept with equal weight.
+| Indicator | What it watches | Orientation |
+| --- | --- | --- |
+| Frame pacing | Refresh opportunities lost and the longest single loss, counted in whole refreshes ("Frame Pacing in Refreshes") | None lost |
+| Render CPU work (including skin evaluation and BGA upload commands) | Render thread time per frame | Well inside one refresh (4.17 ms at 240 Hz) |
+| GPU time | GPU work per frame, with the GPU's performance state recorded ("GPU Power State") | Well inside one refresh |
+| Input to judgment | From input receipt to the judgment event | On the µs scale |
+| Press to sound | Shared mode: judgment to scheduled mix, about 2.5 device periods plus resampler delay, with the device period recorded ("Path from Press to Sound") | As short as the output path allows |
+| Audio dropouts | Periods the device played without new audio | None |
+| Song selection to play start | Load time, first load and retry separately | 1–2 seconds (Feel Targets) |
+
+Judgment and audio run on threads separate from rendering, so the score does not change even if rendering runs late. But the look of the notes gets disrupted, so rendering is watched with equal weight.
+
+### Frame Pacing in Refreshes
+
+A display with a fixed refresh rate can only show a new frame on a refresh, so frame pacing is counted in whole refreshes rather than as a percentile in milliseconds.
+
+- **Applicability**: The count applies to a fixed refresh rate with vsync: VRR off, tearing not allowed, and either no frame rate cap or a cap paced as a whole number k of actual refreshes (counting vblanks, not a timer at the nominal rate). In any other configuration (VRR, tearing, a cap paced by a timer or not a whole number of refreshes) it is not applicable, and results and the in-game display show N/A, never zero. The standard profile uses VRR when available, so measurements run with VRR off; how to watch pacing under VRR is an open question.
+- **Refresh period T**: One refresh period of the display mode actually in use, from its exact refresh rate (for example 4.165 ms at 240.085 Hz). Modes offered as 60 Hz or 240 Hz are rarely exact; the nominal 1/240 s (4.17 ms) is only for orientation.
+- **Target interval**: k refreshes of the actual mode, where k = 1 without a cap and, with a cap, the whole number of refreshes per frame the cap is configured for (a 120 fps cap on a 240.085 Hz display is k = 2). k is fixed for the run and does not follow what was observed: an interval of 3 refreshes at k = 2 loses one opportunity.
+- **Spans**: Counted over the whole play span, from play start to play end, and over each measurement window inside it.
+- **Evidence**: For each span [a, b), the display capture (PresentMon) must contain the span's predecessor (the last displayed frame before a), its successor (the first displayed frame at or after b), and every present the game issued in between. Without that coverage the span's figures are unavailable and shown as unavailable, never as zero.
+- **Expected opportunities**: The target grid of a span is anchored at its predecessor's display time p: the times p + j × k × T inside [a, b) are its expected opportunities, the denominator when lost opportunities are given as a share. A span with none has no share and shows it as unavailable. Lost opportunities are clipped to the span as below, so the share is approximate at span edges; it is an indicator, and the lost count itself is exact.
+- **Counting a displayed interval**: Only displayed frames count, in display-time order, starting from the span's predecessor, so the interval leading into the span is charged like any other. The interval Δ between two consecutive displayed frames counts as n refreshes, n = floor(Δ ÷ T + 1/2) (a half rounds up). It loses L = ceil(n ÷ k) − 1 opportunities when n > k, otherwise none (at k = 1 an interval of n refreshes loses n − 1). The lost opportunities are the times d + j × k × T for j = 1 … L after the earlier frame's display time d, and only those inside the span count toward it, so an interval that crosses a span boundary is clipped. Because the capture reaches the successor, the last interval of a span is always complete, and a freeze at the end of a span is charged when it ends or leaves the span unavailable.
+- **Off-grid intervals**: An interval with |Δ − n × T| above a timestamp tolerance of 0.5 ms is off-grid and counts as one more lost opportunity, in the span that contains its later display time. The tolerance is grounded in stage 0: timestamps of displayed frames scattered by less than 0.1 ms around whole refreshes, while a real miss is a whole refresh (4.17 ms at 240 Hz), so any tolerance between the two classifies the same intervals. The off-grid count is reported; a non-zero count means the display was not on a fixed grid (VRR, composition) or the capture is suspect, and the data is inspected before the lost-opportunity figures are read.
+- **Never-displayed presents**: A present that never reaches the screen is not part of the count. When it leaves a frame on screen longer, the displayed interval already carries the loss; when the next present replaces it on time, nothing visible was lost. Never-displayed presents are counted separately as a diagnostic.
+- **Recorded figures**: The lost opportunities per span and their share of the expected opportunities, the longest single-interval loss over play, the off-grid count, and the never-displayed count are recorded with every measurement, and the in-game measurement display shows them.
+
+The reason for whole refreshes is timestamp jitter. In stage 0, with the GPU held in its top performance state, the p99 interval exceeded T by 0.03–0.07 ms in every run while no refresh was missed, so a percentile in milliseconds at T flags jitter alone, and it also hides how long a stall lasted. Counting lost opportunities ignores the jitter and counts every refresh a stall covers.
+
+In stage 0 on the development PC at 240 Hz, play lost no refresh opportunity at the top performance state. Under the driver's default power settings it lost single intervals of 1–2 refreshes, frames whose GPU work ended after the vblank ("GPU Power State"). Runs at 60 Hz and with streaming software are kept for the later verification of those variations.
 
 ### Bounding Work by Structure
 
@@ -462,11 +488,17 @@ Judgment and audio run on threads separate from rendering, so the score does not
 
 ### Display Latency and Stutter
 
-Even if the CPU and GPU times are within budget, presentation is not necessarily stable. The following points are decided and verified.
+Even if the CPU and GPU times are short, presentation is not necessarily stable. The following points are decided and verified.
 
 - **Presentation mode**: Use the DXGI flip model with a waitable swap chain and 1 frame rendered ahead, a low-latency path even in borderless display. Vsync on or off, variable refresh rate (VRR), and allowing tearing are settings, and which path wgpu actually uses is verified.
 - **First-time stutter**: Shader and pipeline creation and the first texture uploads are all completed before the countdown. Uploads are done a little at a time through a bounded queue.
-- **Measurement**: The actually presented frame intervals are measured with PresentMon or similar. First load (no cache), retry, real controllers, and slowdowns from laptop power saving and heat are also included in the measurement conditions.
+- **Measurement**: The actually presented frame intervals are measured with PresentMon or similar. First load (no cache), retry, real controllers, and the GPU's power management setting and observed performance state are also included in the measurement conditions; slowdowns from laptop power saving and heat join them when laptops are supported.
+
+### GPU Power State
+
+In stage 0 the development PC's discrete GPU stayed in low performance states (P5 and P8) during play under the driver's default power settings, and at 240 Hz some frames' GPU work ended after the vblank and lost a refresh. With the driver's power management set to maximum performance it held its top state (P0) and no refresh was lost. The development PC runs with that setting, and every measurement records the setting and the observed performance state.
+
+How games usually keep the GPU out of low performance states is taken from common game development practice when it matters, rather than investigated here. It is an open question.
 
 ### Memory Budget
 
@@ -474,19 +506,19 @@ Budgets are set for each of decoded audio (about 115 MB per 10 minutes at 2 chan
 
 ### Loading and Song Selection
 
-- Key sounds are decoded in parallel on multiple threads. Converted PCM is cached on disk, keyed by file hash, conversion settings, and decoder version. Retries reuse the data in memory. First load and retry are measured as separate targets.
+- Key sounds are decoded in parallel on multiple threads. Converted PCM is cached on disk, keyed by file hash, conversion settings, and decoder version. Retries reuse the data in memory. First load and retry are measured separately.
 - A library of tens of thousands of songs is stored in SQLite, and only files whose modification time or size changed are re-read. Search uses FTS5, and scanning runs in the background.
 
 ### Measurement
 
-- In game, the frame time distribution (p99 and maximum), the latency from input to judgment, and the number of audio dropouts can be displayed at any time.
-- A benchmark scene plays back a fixed input log with the worst-case chart and skin, and it is measured regularly on the reference PC.
-- CPU-side time (evaluator, skin evaluation, loading) is measured as benchmarks (criterion) in CI to detect large regressions. Measurements on shared CI fluctuate, so pass/fail on absolute values is decided on a fixed dedicated PC.
+- In game, the frame time distribution (p99 and maximum), the lost refresh opportunities (N/A where that count does not apply), GPU time, the latency from input to judgment, and the number of audio dropouts can be displayed at any time.
+- A benchmark scene plays back a fixed input log with the worst-case chart and skin, and it is measured regularly on the development PC.
+- CPU-side time (evaluator, skin evaluation, loading) is measured as benchmarks (criterion) in CI to detect large regressions. Measurements on shared CI fluctuate, so absolute values are tracked on the development PC.
 - For detailed investigation, per-span times are inspected with Tracy (`tracy-client`).
 
 ### Coexisting with Other Software
 
-Many people play while streaming or recording, so the game does not, for the sake of its own latency targets, monopolize the PC's resources and significantly impair other software (OBS, browsers, voice chat software, etc.). The following rules are for the standard settings.
+Many people play while streaming or recording, so the game does not, for the sake of its own latency targets, monopolize the PC's resources and significantly impair other software (OBS, browsers, voice chat software, etc.). The following rules are for the standard settings. They are followed from the start; verifying them with other software running is a later variation ("How to Verify Running Alongside OBS").
 
 | Resource | Rule |
 | --- | --- |
@@ -516,16 +548,16 @@ The rules above are a commitment for the standard settings. Only when players ch
 
 ### How to Verify Running Alongside OBS
 
-Measure with the following conditions fixed, and confirm that both sides meet the criteria. The concrete values are decided in stage 0 and written into this section.
+Running alongside OBS is verified later, as a variation, once the game can be played to the end on the development PC. What stage 0 found to build on:
 
-- **Conditions**: The reference PC, the game's output and render resolutions and refresh rate, the OBS scene (game capture plus about one browser source), the OBS output (1080p, 60 fps), the encoder (both hardware such as NVENC, and x264) and its settings, and the measurement duration (10 minutes or more, including the heaviest chart). The state of Windows Game Mode is left unchanged and recorded.
-- **Game side**: Under that settings profile, the presented frame interval, the latency from input to judgment, and the number of audio dropouts.
-- **OBS side**: In the OBS statistics, the percentages of frames dropped due to rendering lag and frames dropped due to encoding lag. Upper bounds are set on these (for example under 0.5% each).
-- For configurations where both sides cannot meet the criteria with the standard settings, the streaming settings are recommended.
+- **Same GPU**: OBS game capture needs OBS and the game to render on the same GPU. With the game on one adapter and OBS on another, capture failed, and its repeated re-hooking disturbed the game. Streaming guidance tells players with two GPUs to run both on the same one.
+- **Conditions to fix when it is verified**: The game's output and render resolutions and refresh rate, the OBS scene (game capture plus about one browser source), the OBS output (1080p, 60 fps), the encoder and its settings, and a measurement of 10 minutes or more including the heaviest chart. The state of Windows Game Mode is left unchanged and recorded.
+- **What is watched**: On the game side, the same indicators as without OBS. On the OBS side, the share of frames lagged due to rendering (lagged ÷ attempted drawn frames) and of frames skipped due to encoding lag (skipped ÷ total frames).
+- The streaming settings exist to lighten the game when either side shows problems.
 
 ### Settings for Low-End PCs
 
-Quality settings such as lowering the BGA resolution or turning the BGA off, and reducing effects, are provided so that 60 fps can be kept even on the reference PC.
+Quality settings such as lowering the BGA resolution or turning the BGA off, and reducing effects, are provided so that PCs slower than the development PC can keep their refresh rate. They are tuned when those PCs are supported.
 
 ## Extension Boundaries
 
@@ -780,7 +812,7 @@ Where there is no reason to build our own, established libraries are used. We bu
 | --- | --- | --- |
 | Windows API | `windows` | Use Raw Input, WASAPI, MMCSS, and waitable timers directly. The official bindings |
 | Audio output | WASAPI directly via `windows` | Used directly because low-latency shared mode (`IAudioClient3`), exclusive mode, event-driven operation, and fine-grained buffer control are needed. ASIO is an optional feature, supported once the choice of ASIO SDK license (two options: commercial or GPLv3) is settled |
-| Audio (alternative) | BASS, BASSmix, BASSWASAPI (BASS\_FX and BASSASIO if needed) | The alternative if our own stack (WASAPI, `symphonia`, `rubato`, our own mixer) hits a dead end in terms of effort or feasibility. It has a track record in rhythm games and provides low-latency playback, scheduling at specified positions on the mixer, and pitch-preserving speed change together. It is a library whose source is not public, and its license terms differ per DLL (BASS is free for non-commercial use with no revenue; BASSASIO has a separate license), so if it is adopted, each DLL's terms and their compatibility with the project's license are checked individually. As conditions for adoption, verify by measurement that the playback position can be mapped to QPC, that clock drift can be corrected, and that latency and dropouts stay within the targets. The commitment not to allocate memory applies only to app-side code; inside the DLLs, it is verified by native heap measurement if needed. DLL versions, where they were obtained, and licenses are managed as dependencies outside Cargo. Audio is enclosed within the boundary of the `audio` crate, so swapping it is done within that crate |
+| Audio (alternative) | BASS, BASSmix, BASSWASAPI (BASS\_FX and BASSASIO if needed) | The alternative if our own stack (WASAPI, `symphonia`, `rubato`, our own mixer) hits a dead end in terms of effort or feasibility. It has a track record in rhythm games and provides low-latency playback, scheduling at specified positions on the mixer, and pitch-preserving speed change together. It is a library whose source is not public, and its license terms differ per DLL (BASS is free for non-commercial use with no revenue; BASSASIO has a separate license), so if it is adopted, each DLL's terms and their compatibility with the project's license are checked individually. As conditions for adoption, verify by measurement that the playback position can be mapped to QPC and that clock drift can be corrected. Its latency and dropouts are measured and recorded with the same indicators, compared with our own stack where both run. The commitment not to allocate memory applies only to app-side code; inside the DLLs, it is verified by native heap measurement if needed. DLL versions, where they were obtained, and licenses are managed as dependencies outside Cargo. Audio is enclosed within the boundary of the `audio` crate, so swapping it is done within that crate |
 | MIDI input | `midir` | Handles Windows MIDI input. Times are the QPC at the point the callback receives the input |
 | Input timestamp measurement | GameInput (optional) | Used to record the timestamps attached to input and measure the variability of the latency until receipt (not used for judgment). Available on desktop Windows 10 1903 and later and Windows 11, but requires handling the NuGet package and the redistributable runtime, and a way to call it from Rust (our own bindings). Whether dedicated controllers are supported is checked per device, and devices that are not supported are received through Raw Input only |
 | Audio decoding | `symphonia` | Handles WAV, OGG Vorbis, FLAC, and MP3 in pure Rust. It is MPL-2.0, so its obligations (publishing modified files, etc.) are honored |
@@ -823,7 +855,7 @@ The input thread, the logic thread, the audio callback, and the per-frame work o
 | Debounce | Handled by a small state machine per button. Changes that are too short are dropped, but so that dropping a release does not leave a key held down, the final state always returns to the actual state. When multiple buttons are assigned to one lane, the lane is pressed if any of them is pressed |
 | Analog scratch | Axis values are converted into a continuous position, taking wraparound into account, and changes in position are accumulated (for devices that report deltas, the deltas are used as is and not accumulated twice). Separate thresholds for press and release (hysteresis) are used, and a reversal of the rotation direction is treated as a new press. The release at a fixed time after movement stops is handled as an evaluator deadline |
 | Gauge | Computed in fixed point (for example, the remaining amount as an `i64` in units of 1/100000%). Intermediate computation is done in `i128`, and the order (compute the increase or decrease → clamp to the bounds) and the handling of remainders that do not divide evenly (floor) are fixed |
-| Audio clock correction | The difference between the device playback position and the position derived from QPC is measured at regular intervals, smoothed to remove noise, and then the conversion ratio is nudged slightly with proportional-integral control. Integral windup is prevented, the ratio and its rate of change are capped, and the controller is reset on discontinuities such as pause and resume. Conversion and limiter latency are included in the press-to-sound budget |
+| Audio clock correction | The difference between the device playback position and the position derived from QPC is measured at regular intervals, smoothed to remove noise, and then the conversion ratio is nudged slightly with proportional-integral control. Integral windup is prevented, the ratio and its rate of change are capped, and the controller is reset on discontinuities such as pause and resume. Conversion and limiter latency are counted in the press-to-sound figure |
 | Mixing | Preallocated voice slots are reused. Sounds held as i16 (to save memory) are summed in f32, passed through a limiter (the ceiling, attack and release speeds, stereo linking, and amount of look-ahead are decided at implementation time), and converted to the output format |
 | Per-chart volume normalization | The sound of playing all key sounds and the BGM with autoplay is analyzed in the background with EBU R128 (gated loudness and true peak) and cached, and from the next play it is applied as a fixed correction. The first load does not wait for it |
 | Recommended offset | Only when enough deviations have been collected, the median and the spread are output. This value includes not only device latency but also the player's habits, so it is presented as "a recommendation based on timing bias" |
@@ -860,7 +892,7 @@ So that each check does not require launching the app and operating it by hand, 
 | Whole game (headless) | Run one song through at maximum speed, with a virtual clock and a fed input log | Screen transitions, judgment events, sound scheduling positions, retry, practice sections |
 | Audio | Generate waveforms offscreen with the same processing as production, with the input PCM, sample rate, initial state, and block length fixed. The sample positions where sounds were scheduled are compared exactly, and waveform values within a tolerance, against the expected output. Including the limiter's look-ahead delay and flushing the tail, also verify that changing how the blocks are divided does not change the result | Mixing, limiter, volume normalization |
 | Rendering | Render the screen at a given time offscreen and compare it with the expected image within a tolerance. On Windows CI, the DX12 adapter that renders in software (WARP) is explicitly selected, and the adapter used is recorded. If it cannot be obtained, the test fails rather than being silently skipped. WARP results can also vary by version, so the Windows image, wgpu and the shader translator, fonts, and rendering settings are pinned, and the diff images are reviewed on updates. Presentation mode, VRR, and display latency cannot be verified this way | Skins, note positions, effects |
-| Performance | Benchmarks of fixed scenes. CPU side on CI, measurements including the GPU on a fixed dedicated PC | Budget and regressions |
+| Performance | Benchmarks of fixed scenes. CPU side on CI, measurements including the GPU on the development PC | Regressions in the indicators |
 
 Test charts are made with a small mechanism that builds charts in test code and with small self-made BMS text files (to exercise the loading path), and copyrighted charts are not put in the repository. Checks with real charts are done in local environments.
 
@@ -893,13 +925,13 @@ To the PC, this device looks like an ordinary HID device, so the game needs no d
 
 ### What Humans Verify
 
-Feel, local dedicated controllers, running alongside OBS, behavior when the window loses focus, device disconnection and reconnection, and recovery after changing the audio device are compiled into a per-release checklist and verified by humans.
+Feel, local dedicated controllers, running alongside OBS (once that variation is supported), behavior when the window loses focus, device disconnection and reconnection, and recovery after changing the audio device are compiled into a per-release checklist and verified by humans.
 
 ## Roadmap
 
 | Stage | Contents | Exit criteria |
 | --- | --- | --- |
-| 0 | A short technical spike (meant to be thrown away): run high-speed scrolling with 10,000+ notes, 100+ simultaneous voices, 1080p BGA, and effects on all lanes at the same time. Include a scene with simultaneous streaming through OBS. When done, move to stage 1 immediately | A 60 Hz display on the reference PC and a 240 Hz display on a mid-range PC can be held within the budget in the Performance section. The conditions and criteria for running alongside OBS are decided and can be met (Performance section, "How to Verify Running Alongside OBS"). If they cannot be held, the rendering or audio approach is revisited before building it out |
+| 0 | A short technical spike (meant to be thrown away) on the development PC at WQHD 240 Hz: run high-speed scrolling with 10,000+ notes, 100+ simultaneous voices, 1080p BGA, and effects on all lanes at the same time. When done, move to stage 1 immediately | The rendering and audio approach runs on the real path on the development PC. Each player-visible problem found has a cause and a design response, or is recorded as an open question or a later variation. The indicators the spike can measure are implemented, and their stage 0 values are recorded as a baseline; the others are recorded as not yet measured |
 | 1 | The minimal setup for playing one song: chart loading, input, audio, a simple play screen, an evaluator with one custom preset, saving the input log. Also includes key config, volume, offset, hi-speed, and instant retry. The testing mechanisms (swappable clock and I/O, processing that can advance without threads) are also put in here | One chart on hand can be played to the end without feeling latency or stutter. Key sound and frame latency can be measured and displayed |
 | 2 | One full gameplay loop: song selection, results, retry, practice (section repeat and speed change), beatoraja-style and LR2-style presets with switching on the result screen, `eval-cli`, and development features such as scenario launch. The test input device is built in this stage or the next | Song selection through play, results, and retry can be played repeatedly. The property tests pass |
 | 3 | Look and effects: the declarative custom skin format, polished effects, followed by the LR2 and beatoraja skin adapters | Playing with the standard skin is fun. The play screen can be displayed with representative existing skins |
@@ -922,7 +954,8 @@ Between stages 1 and 2, a generous period of playing and fixing is set aside. IR
 - In chart distribution, how to record authors' distribution terms and how to obtain consent for hosting (requires consultation with event organizers and difficulty table maintainers)
 - The criteria for inclusion in the allowlist, and the takedown request procedure (including legal judgment)
 - How to obtain authors' permission for "storage for evaluation", and the form of that record (to be decided before starting IR)
-- The concrete configuration of the reference PC
+- How the game keeps a discrete GPU out of low performance states under the driver's default settings ("GPU Power State")
+- How to watch frame pacing under VRR, where counting in whole refreshes does not apply ("Frame Pacing in Refreshes")
 
 ## Appendix: Lessons from Existing Implementations
 
