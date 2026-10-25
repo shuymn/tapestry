@@ -440,6 +440,32 @@ impl<'a> Evaluator<'a> {
         self.ended
     }
 
+    /// The most events a whole play with at most `inputs` inputs can emit.
+    /// An output reserved to this capacity (and cleared between steps, never
+    /// shrunk) never reallocates in [`advance_to`](Self::advance_to).
+    ///
+    /// Each judgeable note is judged once (1 event plus one per gauge),
+    /// finishes as a long note once, and breaks at most once (one per
+    /// gauge). Each input causes at most one press, which plays a sound and
+    /// may be an empty POOR (1 plus one per gauge). Each mine hits at most
+    /// once (1 plus one per gauge). The song ends once.
+    #[must_use]
+    pub fn max_events(&self, inputs: usize) -> usize {
+        let g = self.gauges.states().len();
+        let notes: usize = self.lanes.iter().map(|l| l.targets.len()).sum();
+        let mines = self
+            .lanes
+            .iter()
+            .flat_map(|l| &l.deadlines)
+            .filter(|d| d.kind == DeadlineKind::Mine)
+            .count();
+        notes
+            .saturating_mul(2 + 2 * g)
+            .saturating_add(inputs.saturating_mul(2 + g))
+            .saturating_add(mines.saturating_mul(1 + g))
+            .saturating_add(1)
+    }
+
     /// Appends an input, in the order [`merge`](crate::merge) produced.
     /// Never allocates: the ring keeps the capacity given at construction.
     ///
@@ -472,7 +498,8 @@ impl<'a> Evaluator<'a> {
     /// Processes every input and deadline at or before `watermark`, in the
     /// order (time, inputs before deadlines, deadline kind, lane, sequence),
     /// and appends the resulting events to `out`. Everything at or before
-    /// `watermark` is then final.
+    /// `watermark` is then final. `out` grows only past its capacity; see
+    /// [`max_events`](Self::max_events) for a capacity that is never passed.
     ///
     /// # Errors
     ///

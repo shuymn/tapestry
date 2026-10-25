@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use bms_model::{ChartBuilder, TimeUs};
+use bms_model::{ChartBuilder, NoteKind, SoundId, TimeUs};
 use common::{MS, device, lane, press, release};
 use eval::{Evaluator, InputStart, JudgeEventKind, PushError};
 use rules::Judgment;
@@ -58,25 +58,58 @@ static GLOBAL: Counting = Counting;
 #[test]
 fn advance_does_not_allocate() {
     const NOTES: i64 = 2_000;
-    let mut builder = ChartBuilder::new(150_000);
+    // Notes every 50 ms over lanes 1-7, so one lane's notes are 350 ms
+    // apart. Every 4th is a 200 ms LN, every 8th released early (an LN
+    // break). Every 10th has a held mine on the scratch lane. Some taps get
+    // an empty POOR press 250 ms early. Every note has a sound.
+    let mut builder = ChartBuilder::new(150_000).sound("k.wav");
     let mut inputs = Vec::new();
+    let mut expected_empty_poor = 0;
     for i in 0..NOTES {
         let n = u8::try_from(i % 7).unwrap() + 1;
         let t = 1_000 * MS + i * 50 * MS;
-        builder = builder.tap(lane(n), TimeUs(t));
-        inputs.push(press(t, 0, n));
-        inputs.push(release(t + 20 * MS, 0, n));
+        if i % 4 == 0 {
+            builder = builder.long(lane(n), TimeUs(t), TimeUs(t + 200 * MS));
+            inputs.push(press(t, 0, n));
+            let held = if i % 8 == 0 { 50 } else { 120 };
+            inputs.push(release(t + held * MS, 0, n));
+        } else {
+            builder = builder.tap(lane(n), TimeUs(t));
+            inputs.push(press(t, 0, n));
+            inputs.push(release(t + 20 * MS, 0, n));
+        }
+        // The previous note on this lane is a tap released long before.
+        if i % 6 == 3 && i >= 7 && (i - 7) % 4 != 0 {
+            inputs.push(press(t - 250 * MS, 0, n));
+            inputs.push(release(t - 240 * MS, 0, n));
+            expected_empty_poor += 1;
+        }
+        if i % 5 == 0 {
+            builder = builder.mine(lane(0), TimeUs(t + 10 * MS), 2);
+        }
+        if i % 10 == 0 {
+            inputs.push(press(t, 0, 0));
+            inputs.push(release(t + 30 * MS, 0, 0));
+        }
     }
-    let chart = builder.build().unwrap();
+    inputs.sort_by_key(|e| e.received);
+    let mut chart = builder.build().unwrap();
+    for note in chart.lanes.iter_mut().flatten() {
+        if !matches!(note.kind, NoteKind::Mine { .. }) {
+            note.sound = Some(SoundId(0));
+        }
+    }
     let preset = rules::custom();
     let dev = device(&[0]);
     let end = 1_000 * MS + NOTES * 50 * MS + 1_000 * MS;
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 64).unwrap();
-    let mut out = Vec::with_capacity(4 * 2_000);
+    let bound = ev.max_events(inputs.len());
+    let mut out = Vec::with_capacity(bound);
+    let capacity = out.capacity();
     // A second evaluator whose ring a burst fills to capacity.
     const BURST: usize = 4;
     let mut burst = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), BURST).unwrap();
-    let mut burst_out = Vec::with_capacity(16);
+    let mut burst_out = Vec::with_capacity(burst.max_events(BURST + 1));
 
     TRACK.with(|t| t.set(true));
     let started = Instant::now();
@@ -98,34 +131,43 @@ fn advance_does_not_allocate() {
     }
     let refused = burst.push_input(inputs[BURST]);
     burst
-        .advance_to(inputs[BURST - 1].received, &mut burst_out)
+        .advance_to(TimeUs(inputs[BURST].received.0 - 1), &mut burst_out)
         .unwrap();
     let after_drain = burst.push_input(inputs[BURST]);
     TRACK.with(|t| t.set(false));
 
     let allocations = ALLOCS.load(Ordering::Relaxed);
-    let perfect = out
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.kind,
-                JudgeEventKind::Judged {
-                    judgment: Judgment::Perfect,
-                    ..
-                }
-            )
-        })
-        .count();
-    assert_eq!(perfect, 2_000);
-    // Each judgment reports both gauges, and the song end comes last.
-    assert_eq!(out.len(), 2_000 * 3 + 1);
+    let count = |f: fn(&JudgeEventKind) -> bool| out.iter().filter(|e| f(&e.kind)).count();
+    assert_eq!(
+        count(|k| matches!(
+            k,
+            JudgeEventKind::Judged {
+                judgment: Judgment::Perfect,
+                ..
+            }
+        )),
+        2_000
+    );
+    assert_eq!(ev.tally().ln_breaks, 250);
+    assert_eq!(count(|k| matches!(k, JudgeEventKind::MineHit { .. })), 200);
+    assert!(expected_empty_poor > 0);
+    assert_eq!(
+        count(|k| matches!(k, JudgeEventKind::EmptyPoor { .. })),
+        expected_empty_poor
+    );
+    assert_eq!(
+        count(|k| matches!(k, JudgeEventKind::PlaySound { .. })),
+        2_000 + expected_empty_poor
+    );
     assert!(matches!(
         out.last().map(|e| e.kind),
         Some(JudgeEventKind::SongEnd)
     ));
+    assert!(out.len() <= bound);
+    assert_eq!(out.capacity(), capacity);
     assert_eq!(refused, Err(PushError::Full));
     assert_eq!(after_drain, Ok(()));
-    assert_eq!(burst_out.len(), 2 * 3);
+    assert!(!burst_out.is_empty());
     assert_eq!(allocations, 0);
     let per_input = elapsed.as_nanos() / u128::try_from(inputs.len()).unwrap();
     println!(

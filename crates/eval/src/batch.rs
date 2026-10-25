@@ -80,13 +80,14 @@ pub fn evaluate(
     let merged = merge_log(&input.events, &input.device);
     let mut ev = Evaluator::new(chart, rule, &input.device, &input.start, merged.len())?;
     let last_input = merged.last().map(|e| evaluation_time(e, &input.device));
+    let inputs = merged.len();
     for e in merged {
         ev.push_input(e).map_err(EvalError::Input)?;
     }
     let to = input
         .finalized
         .unwrap_or_else(|| last_input.map_or(ev.final_deadline(), |t| t.max(ev.final_deadline())));
-    let mut events = Vec::new();
+    let mut events = Vec::with_capacity(ev.max_events(inputs));
     // The first advance cannot be backward.
     let _ = ev.advance_to(to, &mut events);
     let completed = ev.is_complete();
