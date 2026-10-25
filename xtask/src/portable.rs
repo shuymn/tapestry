@@ -12,7 +12,7 @@ use cargo_metadata::MetadataCommand;
 use crate::arch::is_windows_only;
 
 /// Packages that must stay in the portable set (built and tested on Linux).
-const REQUIRED_PORTABLE: &[&str] = &["bms-model", "rules", "eval", "xtask"];
+const REQUIRED_PORTABLE: &[&str] = &["bms-model", "bms-parser", "rules", "eval", "xtask"];
 
 pub fn run(manifest: &Path, args: &[OsString]) -> ExitCode {
     let Some((command, rest)) = args.split_first() else {

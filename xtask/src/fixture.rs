@@ -11,10 +11,15 @@ pub fn lib(name: &'static str, body: &str) -> Crate {
     (name, body.to_owned(), "src/lib.rs")
 }
 
-/// The real workspace's shape: three pure crates, `player`, and `xtask`.
+/// The real workspace's shape: the portable library crates, `player`, and
+/// `xtask`.
 pub fn baseline() -> Vec<Crate> {
     vec![
         lib("bms-model", ""),
+        lib(
+            "bms-parser",
+            "[dependencies]\nbms-model = { path = \"../bms-model\" }\n",
+        ),
         lib(
             "rules",
             "[dependencies]\nbms-model = { path = \"../bms-model\" }\n",
