@@ -141,8 +141,6 @@ impl Record {
 #[derive(Debug)]
 struct Source<R> {
     reader: R,
-    /// The last publication read; `Retired` sticks once reached.
-    published: Published,
     /// The receive time of the last event popped.
     last_popped: Option<TimeUs>,
     /// Whether the last pop found the queue empty.
@@ -166,8 +164,9 @@ pub struct Logic<'a, R = SourceReader> {
     max_events: usize,
     /// Events emitted so far.
     emitted: u64,
-    /// Per step: each source's publication.
-    bounds: Vec<Published>,
+    /// Each source's last publication, by source id; `Retired` sticks once
+    /// reached.
+    published: Vec<Published>,
     merged: Vec<PhysicalInputEvent>,
     out: Vec<JudgeEvent>,
     record: Vec<PhysicalInputEvent>,
@@ -231,7 +230,6 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             .into_iter()
             .map(|reader| Source {
                 reader,
-                published: Published::open(TimeUs(i64::MIN)),
                 last_popped: None,
                 drained: false,
             })
@@ -254,7 +252,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             inputs: budget,
             max_events,
             emitted: 0,
-            bounds: vec![Published::open(TimeUs(i64::MIN)); n],
+            published: vec![Published::open(TimeUs(i64::MIN)); n],
             merged: Vec::with_capacity(budget),
             // Sized for the whole play's inputs, not one step's (it is
             // cleared every step and never shrinks).
@@ -290,25 +288,24 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
         // (1) Every watermark first.
         let mut open = false;
-        for (s, bound) in self.sources.iter_mut().zip(&mut self.bounds) {
-            if s.published.state != SourceState::Retired {
-                s.published = s.reader.published();
+        for (s, p) in self.sources.iter().zip(&mut self.published) {
+            if p.state != SourceState::Retired {
+                *p = s.reader.published();
             }
-            open |= s.published.state == SourceState::Open;
-            *bound = s.published;
+            open |= p.state == SourceState::Open;
         }
         // (3), taken here since it depends only on the publications: the
         // global watermark. With no source left open the play is over: it
         // ends at what was already finalized, before a closed source's
         // final watermark could finalize more.
-        let Some(w) = watermark(&self.bounds, self.device).filter(|_| open) else {
+        let Some(w) = watermark(&self.published, self.device).filter(|_| open) else {
             self.abort(AbortCause::LastSourceRemoved);
             return self.idle();
         };
         // (2) Then each source's guaranteed prefix, within the budget.
-        for (i, s) in self.sources.iter_mut().enumerate() {
-            let up_to = s.published.received_up_to;
-            if s.published.state == SourceState::Retired {
+        for (i, (s, p)) in self.sources.iter_mut().zip(&self.published).enumerate() {
+            let up_to = p.received_up_to;
+            if p.state == SourceState::Retired {
                 continue;
             }
             s.drained = false;
@@ -350,7 +347,6 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             .any(|&ev| self.evaluator.push_input(ev).is_err());
         self.merged.clear();
         if refused {
-            self.overflowed = true;
             self.abort(AbortCause::Overflow);
             return self.idle();
         }
@@ -370,8 +366,13 @@ impl<'a, R: SourceRead> Logic<'a, R> {
                 oldest = Some(oldest.map_or(o, |t| t.min(o)));
             }
         }
-        for (s, staged) in self.sources.iter_mut().zip(&self.staged) {
-            s.published.retire_if_drained(s.drained, staged);
+        for ((s, p), staged) in self
+            .sources
+            .iter()
+            .zip(&mut self.published)
+            .zip(&self.staged)
+        {
+            p.retire_if_drained(s.drained, staged);
         }
         self.publish_view();
         Advance {
@@ -394,8 +395,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
         self.aborted = Some(cause);
         self.overflowed |= cause == AbortCause::Overflow;
-        for s in &mut self.sources {
-            if s.published.state == SourceState::Retired {
+        for (s, p) in self.sources.iter_mut().zip(&self.published) {
+            if p.state == SourceState::Retired {
                 continue;
             }
             while let Some(ev) = s.reader.pop() {

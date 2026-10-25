@@ -100,8 +100,8 @@ fn logic_does_not_allocate_during_play() {
     let mut runner = Runner::new(&chart, &rule, &dev, sources, script, config, START).unwrap();
 
     // Three sources each with two inputs inside the watermark, against a
-    // shared budget of three: their disconnect allowances and no control
-    // events.
+    // shared budget of four (one control event and three disconnect
+    // allowances); each source's own share (two) holds both of its.
     let taps = ChartBuilder::new(150_000)
         .tap(lane(1), TimeUs(1_000 * MS))
         .build()
@@ -127,7 +127,7 @@ fn logic_does_not_allocate_during_play() {
         readers.push(r);
     }
     let budget = LogicConfig {
-        inputs: 0,
+        inputs: 1,
         effects: 16,
     };
     let (mut overflowing, _side) = Logic::new(
@@ -157,6 +157,6 @@ fn logic_does_not_allocate_during_play() {
     assert_eq!(empty, 2_000);
     assert_eq!(runner.effects().len(), stream.len());
     assert_eq!(overflow.aborted, Some(AbortCause::Overflow));
-    assert_eq!(overflowing.record().events.len(), 3);
+    assert_eq!(overflowing.record().events.len(), 4);
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 }

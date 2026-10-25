@@ -115,5 +115,8 @@ pub fn judgments(events: &[JudgeEvent]) -> Vec<(usize, usize, Judgment, Option<i
 }
 
 pub fn count_judged(events: &[JudgeEvent], j: Judgment) -> usize {
-    judgments(events).iter().filter(|x| x.2 == j).count()
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::Judged { judgment, .. } if judgment == j))
+        .count()
 }
