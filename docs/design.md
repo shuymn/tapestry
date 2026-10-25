@@ -239,9 +239,10 @@ pub struct Evaluator<'a> { /* Judgment state. Does not own the chart itself; ref
 impl<'a> Evaluator<'a> {
     /// Input conversion starts from the start snapshot (held controls are pressed, with no press edge)
     pub fn new(chart: &'a Chart, rule: &'a RulePreset, device: &'a DeviceProfile, start: &InputStart, input_capacity: usize) -> Result<Self, EvalError>;
-    pub fn push_input(&mut self, ev: PhysicalInputEvent);
+    /// Refuses (without change) an input beyond the fixed capacity, at or before the finalized watermark, or earlier than the last one
+    pub fn push_input(&mut self, ev: PhysicalInputEvent) -> Result<(), PushError>;
     /// Finalizes events up to the watermark and appends judgment events to out
-    pub fn advance_to(&mut self, watermark: Micros, out: &mut Vec<JudgeEvent>);
+    pub fn advance_to(&mut self, watermark: Micros, out: &mut Vec<JudgeEvent>) -> Result<(), AdvanceError>; // refuses a backward watermark
 }
 
 /// Batch evaluation used for results, replays, and IR. Internally push_input and advance_to(end)
