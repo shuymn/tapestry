@@ -46,7 +46,8 @@ pub fn baseline() -> Vec<Crate> {
         ),
         lib(
             "game",
-            "[dependencies]\nbms-model = { path = \"../bms-model\" }\n\
+            "[dependencies]\naudio = { path = \"../audio\" }\n\
+             bms-model = { path = \"../bms-model\" }\n\
              eval = { path = \"../eval\" }\n\
              input = { path = \"../input\" }\n\
              replay = { path = \"../replay\" }\n\
