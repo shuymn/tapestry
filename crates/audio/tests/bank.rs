@@ -16,6 +16,7 @@ fn default_limits_are_the_plan_caps() {
     let l = BankLimits::default();
     assert_eq!(l.max_sound_seconds, 600);
     assert_eq!(l.max_bank_bytes, 536_870_912);
+    assert_eq!(l.max_file_bytes, 536_870_912);
     assert_eq!(l.max_decode_threads, 4);
 }
 
@@ -138,20 +139,23 @@ fn sound_over_length_cap_is_refused_before_decoding() {
 
 #[test]
 fn sound_without_declared_length_is_bounded_while_decoding() {
-    // At a 1 kHz device rate the 10-minute cap is 600 000 frames.
-    let limits = BankLimits::default();
-    let at = wav_streaming(1_000, 1, &ramp(600_000, 0, 1));
-    let bank = load_files(&[at], 1_000, &limits).unwrap();
-    assert_eq!(bank.get(SoundId(0)).unwrap().frames(), 600_000);
-    let over = wav_streaming(1_000, 1, &ramp(600_001, 0, 1));
+    // A 1-second cap at 8 kHz is 8000 frames.
+    let limits = BankLimits {
+        max_sound_seconds: 1,
+        ..BankLimits::default()
+    };
+    let at = wav_streaming(8_000, 1, &ramp(8_000, 0, 3));
+    let bank = load_files(&[at], 8_000, &limits).unwrap();
+    assert_eq!(bank.get(SoundId(0)).unwrap().frames(), 8_000);
+    let over = wav_streaming(8_000, 1, &ramp(8_001, 0, 3));
     assert_eq!(
-        load_files(&[over], 1_000, &limits).unwrap_err(),
+        load_files(&[over], 8_000, &limits).unwrap_err(),
         BankError::OverCap {
             cap: Cap::SoundLength,
             found: Found::WhileDecoding,
             sound: SoundId(0),
-            amount: 600_001,
-            limit: 600_000,
+            amount: 8_001,
+            limit: 8_000,
         }
     );
 }
@@ -165,14 +169,14 @@ fn bank_without_declared_lengths_is_bounded_while_decoding() {
     };
     let files = |second: usize| {
         vec![
-            wav_streaming(1_000, 1, &ramp(500, 11, 2)),
-            wav_streaming(1_000, 1, &ramp(second, 13, 3)),
+            wav_streaming(8_000, 1, &ramp(500, 11, 2)),
+            wav_streaming(8_000, 1, &ramp(second, 13, 3)),
         ]
     };
-    let bank = load_files(&files(500), 1_000, &limits).unwrap();
+    let bank = load_files(&files(500), 8_000, &limits).unwrap();
     assert_eq!(bank.bytes(), 2_000);
     assert_eq!(
-        load_files(&files(501), 1_000, &limits).unwrap_err(),
+        load_files(&files(501), 8_000, &limits).unwrap_err(),
         BankError::OverCap {
             cap: Cap::BankMemory,
             found: Found::WhileDecoding,
@@ -181,6 +185,57 @@ fn bank_without_declared_lengths_is_bounded_while_decoding() {
             limit: 2_000,
         }
     );
+}
+
+#[test]
+fn source_pcm_above_the_device_size_is_charged() {
+    // 400 frames at 16 kHz become 200 at 8 kHz, but the 800 source bytes
+    // are what decoding holds: a 799-byte cap refuses it, 800 does not.
+    let file = || vec![wav_streaming(16_000, 1, &ramp(400, 5, 9))];
+    let limits = |max_bank_bytes| BankLimits {
+        max_bank_bytes,
+        ..BankLimits::default()
+    };
+    let bank = load_files(&file(), 8_000, &limits(800)).unwrap();
+    assert_eq!(bank.get(SoundId(0)).unwrap().frames(), 200);
+    assert_eq!(
+        load_files(&file(), 8_000, &limits(799)).unwrap_err(),
+        BankError::OverCap {
+            cap: Cap::BankMemory,
+            found: Found::WhileDecoding,
+            sound: SoundId(0),
+            amount: 800,
+            limit: 799,
+        }
+    );
+}
+
+#[test]
+fn file_over_size_cap_is_refused_before_decoding() {
+    // A WAV of n mono frames is 44 + 2n bytes: 478 frames are 1000 bytes.
+    // Reading stops one byte past the cap, so the excess reads as 1001.
+    let limits = BankLimits {
+        max_file_bytes: 1_000,
+        ..BankLimits::default()
+    };
+    assert!(load_files(&[wav(RATE, 1, &ramp(478, 1, 1))], RATE, &limits).is_ok());
+    assert_eq!(
+        load_files(&[wav(RATE, 1, &ramp(479, 1, 1))], RATE, &limits).unwrap_err(),
+        BankError::OverCap {
+            cap: Cap::FileSize,
+            found: Found::Declared,
+            sound: SoundId(0),
+            amount: 1_001,
+            limit: 1_000,
+        }
+    );
+}
+
+fn warned(bank: &audio::SoundBank) -> Vec<SoundId> {
+    bank.warnings()
+        .iter()
+        .map(|BankWarning::Undecodable { sound, .. }| *sound)
+        .collect()
 }
 
 #[test]
@@ -196,21 +251,49 @@ fn undecodable_files_are_left_silent_with_a_warning() {
     .unwrap();
     assert_eq!(bank.stored_count(), 1);
     assert!(bank.get(SoundId(2)).is_some());
-    let warned: Vec<SoundId> = bank
-        .warnings()
-        .iter()
-        .map(|BankWarning::Undecodable { sound, .. }| *sound)
-        .collect();
-    assert_eq!(warned, [SoundId(0), SoundId(1)]);
+    assert_eq!(warned(&bank), [SoundId(0), SoundId(1)]);
 }
 
 #[test]
-fn zero_rate_is_refused() {
+fn malformed_header_that_breaks_the_decoder_is_left_silent() {
+    // 32 768 channels of 16-bit samples: the block alignment the header
+    // implies does not fit in 16 bits.
+    let huge = wav(RATE, 32_768, &ramp(64, 3, 1));
+    let good = wav(RATE, 1, &ramp(64, 4, 1));
+    let bank = load_files(&[huge, good], RATE, &BankLimits::default()).unwrap();
+    assert_eq!(bank.stored_count(), 1);
+    assert_eq!(warned(&bank), [SoundId(0)]);
+}
+
+#[test]
+fn source_rate_outside_the_range_is_left_silent() {
+    // u32::MAX would size the resampler's FFT at gigabytes from a one-frame
+    // file. 8 kHz and 384 kHz are the edges of the range.
+    let files: Vec<Vec<u8>> = [u32::MAX, 7_999, 8_000, 384_000, 384_001]
+        .iter()
+        .enumerate()
+        .map(|(k, &rate)| wav(rate, 1, &ramp(16, k as i16 * 50, 1)))
+        .collect();
+    let bank = load_files(&files, RATE, &BankLimits::default()).unwrap();
+    assert_eq!(warned(&bank), [SoundId(0), SoundId(1), SoundId(4)]);
+    // 16 frames: ceil(16 × 6) = 96 at 48 kHz from 8 kHz, ceil(16 / 8) = 2
+    // from 384 kHz (by hand).
+    assert_eq!(bank.get(SoundId(2)).unwrap().frames(), 96);
+    assert_eq!(bank.get(SoundId(3)).unwrap().frames(), 2);
+}
+
+#[test]
+fn device_rate_outside_the_range_is_refused() {
     let chart = chart_of(&[None]);
-    assert_eq!(
-        load_bank(&chart, 0, &BankLimits::default()).unwrap_err(),
-        BankError::ZeroRate
-    );
+    for rate in [0, 7_999, 384_001] {
+        assert_eq!(
+            load_bank(&chart, rate, &BankLimits::default()).unwrap_err(),
+            BankError::RateOutOfRange { rate }
+        );
+    }
+    for rate in [8_000, 384_000] {
+        assert!(load_bank(&chart, rate, &BankLimits::default()).is_ok());
+    }
 }
 
 #[test]

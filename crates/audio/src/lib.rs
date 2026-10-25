@@ -26,7 +26,8 @@ mod output;
 mod sim;
 
 pub use bank::{
-    BankError, BankLimits, BankWarning, Cap, Found, LoadStats, Sound, SoundBank, load_bank,
+    BankError, BankLimits, BankWarning, Cap, Found, LoadStats, MAX_RATE, MIN_RATE, Sound,
+    SoundBank, load_bank,
 };
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use engine::{AudioEngine, EngineError, Scheduled, ScheduledKind, SoundCmd, StepReport};

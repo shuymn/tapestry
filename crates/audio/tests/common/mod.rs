@@ -20,7 +20,7 @@ pub fn tmp() -> tempfile::TempDir {
 }
 
 fn header(rate: u32, channels: u16, data_len: u32, riff_len: u32) -> Vec<u8> {
-    let block = channels * 2;
+    let block = channels.wrapping_mul(2);
     let mut b = Vec::with_capacity(44);
     b.extend_from_slice(b"RIFF");
     b.extend_from_slice(&riff_len.to_le_bytes());
@@ -30,7 +30,7 @@ fn header(rate: u32, channels: u16, data_len: u32, riff_len: u32) -> Vec<u8> {
     b.extend_from_slice(&1u16.to_le_bytes()); // PCM
     b.extend_from_slice(&channels.to_le_bytes());
     b.extend_from_slice(&rate.to_le_bytes());
-    b.extend_from_slice(&(rate * u32::from(block)).to_le_bytes());
+    b.extend_from_slice(&rate.wrapping_mul(u32::from(block)).to_le_bytes());
     b.extend_from_slice(&block.to_le_bytes());
     b.extend_from_slice(&16u16.to_le_bytes());
     b.extend_from_slice(b"data");
