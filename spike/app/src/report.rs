@@ -416,7 +416,7 @@ pub fn run(dir: &Path, notes: &Path) -> Result<ExitCode, String> {
         println!(
             "report: owner review{}: watch the recording in {}, answer game_visible and audio_present (true or false) in {} (this run only), then rerun: tapestry-spike.exe report {}",
             if summary.owner_review_pending {
-                " pending (provisional result, exit 4)"
+                " pending"
             } else {
                 ""
             },
