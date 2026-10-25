@@ -39,13 +39,29 @@
 //! - **Empty charts:** a chart with no notes loads, with a
 //!   [`WarningKind::NoPlayableNotes`] warning; whether to play it is the
 //!   caller's decision.
+//! - **`#RANDOM n`:** draws `next() % n + 1` from SplitMix64 seeded with
+//!   [`LoadOptions::seed`]; `#SETRANDOM n` sets `n`. Every value of a block
+//!   in a taken branch is recorded in [`ChartIdentity::random_results`] in
+//!   file order, whether or not an `#IF` matches it. A block in a branch not
+//!   taken draws nothing. `n` must be a positive integer (an error
+//!   otherwise, since the chart's branches would be undefined).
+//! - **Blocks:** every line inside an `#IF` branch not taken is skipped,
+//!   headers (`#WAVxx`, `#BPMxx`, `#LNOBJ`, ...) included. `#IF k` is taken
+//!   when the nearest enclosing block's value is `k`; `#ELSE` when no
+//!   earlier branch of its `#IF` was. A `#RANDOM` directly inside another
+//!   ends it, since `#ENDRANDOM` is often left out; `#ENDIF` also closes
+//!   blocks left open inside it. `#IF` outside any block is never taken, and
+//!   a stray `#ELSE`, `#ENDIF` or `#ENDRANDOM` is ignored, each with a
+//!   warning: the base chart stays playable. An `#IF` still open at the end
+//!   of the file ends there, with a warning. Blocks nest at most
+//!   [`Limits::max_nesting`] deep (an error).
 //! - **Unsupported:** `#LNTYPE 2`, `#LNMODE` other than 1, negative
-//!   `#STOPxx`, `#RANDOM` and its branches (until they are implemented), and
-//!   `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
+//!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+mod branch;
 mod decimal;
 mod error;
 mod hash;
@@ -79,6 +95,8 @@ pub struct Limits {
     pub max_measure: u16,
     /// Longest resolved chart accepted.
     pub max_duration: TimeUs,
+    /// Deepest nesting of open `#RANDOM` and `#IF` blocks, each counting one.
+    pub max_nesting: usize,
 }
 
 impl Default for Limits {
@@ -89,6 +107,7 @@ impl Default for Limits {
             max_objects: 500_000,
             max_measure: 999,
             max_duration: TimeUs(60 * 60 * 1_000_000),
+            max_nesting: 16,
         }
     }
 }
@@ -126,7 +145,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
     let mut warnings = Vec::new();
     let mut source = {
         let text = decode(bytes, &mut warnings);
-        parse::parse(&text, limits, &mut warnings)?
+        parse::parse(&text, limits, opts.seed, &mut warnings)?
     };
     let timeline = timing::compute(&source, limits, &mut warnings)?;
 
@@ -182,7 +201,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
             md5,
             resolved_hash: [0; 32],
             loader_version: LOADER_VERSION,
-            random_results: Vec::new(),
+            random_results: std::mem::take(&mut source.random_results),
         },
     };
     chart.validate().map_err(LoadError::Model)?;

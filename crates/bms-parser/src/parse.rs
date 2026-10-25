@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bms_model::{ChartMeta, JudgeRank, Lane, LnMode};
 use num_traits::Signed;
 
+use crate::branch::Branches;
 use crate::decimal::{Rational, parse_base36, parse_decimal, parse_hex};
 use crate::{Limits, LoadError, Warning, WarningKind};
 
@@ -59,6 +60,8 @@ pub struct Source {
     pub measure_lengths: BTreeMap<u16, Rational>,
     /// In file order.
     pub objects: Vec<RawObject>,
+    /// Every `#RANDOM` and `#SETRANDOM` value in a taken branch, in order.
+    pub random_results: Vec<u32>,
 }
 
 /// Descriptive headers read and ignored without a warning.
@@ -77,16 +80,9 @@ const IGNORED_HEADERS: &[&str] = &[
     "PREVIEW",
 ];
 
-/// Branching directives: `#RANDOM` and friends come with PR3; `#SWITCH` and
-/// friends are not supported.
+/// Branching directives the loader does not support.
 const UNSUPPORTED_HEADERS: &[&str] = &[
-    "RANDOM",
-    "SETRANDOM",
-    "IF",
     "ELSEIF",
-    "ELSE",
-    "ENDIF",
-    "ENDRANDOM",
     "SWITCH",
     "SETSWITCH",
     "CASE",
@@ -101,9 +97,11 @@ const SILENT_CHANNELS: &[&str] = &["04", "06", "07"];
 pub fn parse(
     text: &str,
     limits: &Limits,
+    seed: u64,
     warnings: &mut Vec<Warning>,
 ) -> Result<Source, LoadError> {
     let mut source = Source::default();
+    let mut branches = Branches::new(seed, limits.max_nesting);
     let mut objects = 0_usize;
     for (i, raw_line) in text.lines().enumerate() {
         let line = i + 1;
@@ -114,6 +112,9 @@ pub fn parse(
             continue;
         };
         if let Some((measure, channel, data)) = split_channel(body) {
+            if !branches.active() {
+                continue;
+            }
             let measure = u16::try_from(measure)
                 .ok()
                 .filter(|&m| m <= limits.max_measure)
@@ -127,10 +128,21 @@ pub fn parse(
                 warnings,
             )?;
         } else {
-            parse_header(&mut source, line, body, warnings)?;
+            let (name, value) = split_header(body);
+            let upper = name.to_ascii_uppercase();
+            if !branches.directive(&upper, value, line, warnings)? && branches.active() {
+                parse_header(&mut source, line, &upper, value, warnings)?;
+            }
         }
     }
+    source.random_results = branches.finish(warnings);
     Ok(source)
+}
+
+/// Splits `NAME value`, trimming the value.
+fn split_header(body: &str) -> (&str, &str) {
+    body.split_once(|c: char| c.is_ascii_whitespace())
+        .map_or((body, ""), |(n, v)| (n, v.trim()))
 }
 
 /// Splits `mmmcc:data`. The measure takes three or more digits, so an
@@ -249,13 +261,10 @@ fn parse_channel(
 fn parse_header(
     source: &mut Source,
     line: usize,
-    body: &str,
+    upper: &str,
+    value: &str,
     warnings: &mut Vec<Warning>,
 ) -> Result<(), LoadError> {
-    let (name, value) = body
-        .split_once(|c: char| c.is_ascii_whitespace())
-        .map_or((body, ""), |(n, v)| (n, v.trim()));
-    let upper = name.to_ascii_uppercase();
     let defined_id = |prefix: &str| {
         upper
             .strip_prefix(prefix)
@@ -271,7 +280,7 @@ fn parse_header(
             kind: WarningKind::IgnoredValue(what),
         });
     };
-    match upper.as_str() {
+    match upper {
         "TITLE" => source.meta.title = value.to_owned(),
         "BPM" => {
             source.bpm = Some(positive("#BPM")?);
@@ -319,13 +328,13 @@ fn parse_header(
                 });
             }
         }
-        _ if UNSUPPORTED_HEADERS.contains(&upper.as_str()) => {
+        _ if UNSUPPORTED_HEADERS.contains(&upper) => {
             return Err(LoadError::Unsupported {
                 line,
                 what: format!("#{upper}"),
             });
         }
-        _ if IGNORED_HEADERS.contains(&upper.as_str()) || defined_id("BMP").is_some() => {}
+        _ if IGNORED_HEADERS.contains(&upper) || defined_id("BMP").is_some() => {}
         _ => {
             if let Some(id) = defined_id("BPM") {
                 source.bpm_defs.insert(id, positive("#BPMxx")?);
@@ -349,7 +358,7 @@ fn parse_header(
             } else {
                 warnings.push(Warning {
                     line: Some(line),
-                    kind: WarningKind::UnknownHeader(upper),
+                    kind: WarningKind::UnknownHeader(upper.to_owned()),
                 });
             }
         }

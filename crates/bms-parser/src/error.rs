@@ -38,6 +38,12 @@ pub enum LoadError {
         /// Why it was refused.
         reason: &'static str,
     },
+    /// `#RANDOM` and `#IF` blocks nest deeper than
+    /// [`Limits::max_nesting`](crate::Limits).
+    NestingTooDeep {
+        /// The line opening the first block past the limit.
+        line: usize,
+    },
     /// A directive whose meaning the loader cannot honor.
     Unsupported {
         /// The line.
@@ -87,6 +93,9 @@ impl fmt::Display for LoadError {
             }
             Self::InvalidValue { line, what, reason } => {
                 write!(f, "line {line}: {what}: {reason}")
+            }
+            Self::NestingTooDeep { line } => {
+                write!(f, "line {line}: #RANDOM and #IF blocks nest too deep")
             }
             Self::Unsupported { line, what } => write!(f, "line {line}: unsupported {what}"),
             Self::DurationExceeded { measure } => {
@@ -164,4 +173,9 @@ pub enum WarningKind {
     NoteInsideLongNoteDropped,
     /// The chart has no note to judge.
     NoPlayableNotes,
+    /// `#IF` outside any `#RANDOM` block (never taken), or `#ELSE`,
+    /// `#ENDIF` or `#ENDRANDOM` without its block (ignored).
+    UnmatchedDirective(&'static str),
+    /// An `#IF` closed by `#ENDRANDOM` or by the end of the file.
+    UnclosedIf,
 }

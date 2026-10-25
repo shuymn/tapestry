@@ -1,0 +1,18 @@
+#PLAYER 1
+#TITLE Random branches
+#BPM 120
+#WAV01 click.wav
+
+*  One note on key 1 in every branch, and a different key per branch.
+#00111:01
+#RANDOM 3
+#IF 1
+#00112:01
+#ENDIF
+#IF 2
+#00113:01
+#ENDIF
+#IF 3
+#00114:01
+#ENDIF
+#ENDRANDOM
