@@ -186,8 +186,6 @@ pub struct Evaluator<'a> {
     inputs: VecDeque<(TimeUs, PhysicalInputEvent)>,
     /// The ring's fixed capacity.
     input_capacity: usize,
-    /// The evaluation time of the last input pushed.
-    last_input: Option<TimeUs>,
     /// The watermark last advanced to: everything at or before it is final.
     finalized: Option<TimeUs>,
     seq: u64,
@@ -293,7 +291,6 @@ impl<'a> Evaluator<'a> {
             conversion: ConversionState::init(device, start)?,
             inputs: VecDeque::with_capacity(input_capacity),
             input_capacity,
-            last_input: None,
             finalized: None,
             seq: 0,
             tally: Tally::new(),
@@ -327,7 +324,9 @@ impl<'a> Evaluator<'a> {
         {
             return Err(PushError::Finalized { time, finalized });
         }
-        if let Some(last) = self.last_input
+        // Inputs already processed are at or before `finalized`, so only the
+        // queued ones need checking.
+        if let Some(&(last, _)) = self.inputs.back()
             && time < last
         {
             return Err(PushError::OutOfOrder { time, last });
@@ -336,7 +335,6 @@ impl<'a> Evaluator<'a> {
             return Err(PushError::Full);
         }
         self.inputs.push_back((time, ev));
-        self.last_input = Some(time);
         Ok(())
     }
 
@@ -450,33 +448,16 @@ impl<'a> Evaluator<'a> {
                 best = Some((deviation, k));
             }
         }
-        if let Some((deviation, k)) = best {
-            let note = notes[state.targets[k]];
-            // Within the BAD window, so it fits in i64.
-            let deviation = TimeUs(i64::try_from(deviation).unwrap_or(i64::MAX));
-            if let Some(sound) = note.sound {
-                self.emit(
-                    t,
-                    Some(origin),
-                    JudgeEventKind::PlaySound {
-                        lane: lane_of(lane),
-                        sound,
-                    },
-                    out,
-                );
-            }
-            let judgment = judgment_of(&self.windows, deviation);
-            self.judge(lane, k, judgment, Some(deviation), t, Some(origin), out);
-            return;
-        }
-        // No note inside BAD: the first unjudged target is the next ahead.
-        let ahead = (state.cursor..state.targets.len())
-            .find(|&k| !state.judged[k])
-            .map(|k| notes[state.targets[k]]);
-        let Some(next) = ahead else {
+        // The judged note, else the next unjudged one (the cursor: no
+        // unjudged note lies inside BAD, and earlier ones are missed).
+        let target = best
+            .map(|(_, k)| k)
+            .or_else(|| (state.cursor < state.targets.len()).then_some(state.cursor));
+        let Some(k) = target else {
             return;
         };
-        if let Some(sound) = next.sound {
+        let note = notes[state.targets[k]];
+        if let Some(sound) = note.sound {
             self.emit(
                 t,
                 Some(origin),
@@ -487,7 +468,14 @@ impl<'a> Evaluator<'a> {
                 out,
             );
         }
-        let gap = i128::from(next.time.0) - at;
+        if let Some((deviation, _)) = best {
+            // Within the BAD window, so it fits in i64.
+            let deviation = TimeUs(i64::try_from(deviation).unwrap_or(i64::MAX));
+            let judgment = judgment_of(&self.windows, deviation);
+            self.judge(lane, k, judgment, Some(deviation), t, Some(origin), out);
+            return;
+        }
+        let gap = i128::from(note.time.0) - at;
         let rule = self.rule.empty_poor;
         if gap > 0 && gap <= i128::from(rule.ahead.0) {
             self.tally.empty_poor = self.tally.empty_poor.saturating_add(1);
