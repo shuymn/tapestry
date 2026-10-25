@@ -58,7 +58,7 @@ This is a game, and the correctness of judgment is merely the foundation for "be
 
 | Item | Target | Reason |
 | --- | --- | --- |
-| From press to key sound | 10 ms or less | Audio latency is felt as "heavy" before judgment deviation is |
+| From press to key sound | 10 ms or less on the low-latency path; shared mode follows the device period ("Path from Press to Sound") | Audio latency is felt as "heavy" before judgment deviation is |
 | From press to judgment and bomb appearing on screen | 1–2 frames | The feel of a press is determined by the screen's response |
 | Frame stability | No drops at 144/240 Hz | Even a momentary hitch in the note flow breaks reading |
 | From song selection to play start | 1–2 seconds | It is a game you replay many times, so waiting time turns directly into frustration |
