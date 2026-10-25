@@ -295,7 +295,8 @@ pub enum GaugeKind {
         /// The clear threshold.
         clear: GaugeValue,
     },
-    /// Failed the moment it reaches 0, and never recovers. Its `min` is 0.
+    /// Failed the moment it reaches 0, and never recovers. Its `min` is 0,
+    /// and it starts above 0.
     Survival,
 }
 
