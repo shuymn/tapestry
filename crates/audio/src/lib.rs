@@ -19,9 +19,13 @@
 //! on the step path allocates once the engine is built.
 
 mod bank;
+mod mixer;
 
 pub use bank::{
     BankError, BankLimits, BankWarning, Cap, Found, LoadStats, Sound, SoundBank, load_bank,
+};
+pub use mixer::{
+    LIMITER_CEILING, LIMITER_RELEASE_MS, Limiter, MAX_VOICES, Mixer, STEAL_FADE_MS, Started,
 };
 
 /// Channels of every output buffer (interleaved left, right).

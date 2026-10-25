@@ -202,6 +202,17 @@ impl Sound {
     fn channels(&self) -> usize {
         if self.stereo { 2 } else { 1 }
     }
+
+    /// Frame `i` as left, right in `[-1, 1)`.
+    pub(crate) fn frame(&self, i: usize) -> (f32, f32) {
+        let to_f32 = |s: i16| f32::from(s) / 32_768.0;
+        if self.stereo {
+            (to_f32(self.samples[2 * i]), to_f32(self.samples[2 * i + 1]))
+        } else {
+            let x = to_f32(self.samples[i]);
+            (x, x)
+        }
+    }
 }
 
 /// The decoded sounds of a chart, indexed by [`SoundId`].
