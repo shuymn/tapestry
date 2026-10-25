@@ -643,6 +643,10 @@ Built with the screen transition and session events, as a later variation. A gen
 - Re-evaluation on the result screen may use the reloaded preset immediately. Combined with `eval-cli`, the cycle of writing a preset, recomputing with local input logs, comparing the results, and fixing it runs without a restart.
 - Skin reloading is done on a separate thread, and the fully assembled result is swapped in between plays. This is so that render work during play does not allocate memory.
 
+> **Stage 1: the preset reloads at the next retry**
+>
+> Stage 1 does not watch files. At each retry the session checks the preset file's modification time, and a changed file is loaded and used from that retry on, which is the earliest point a reloaded preset may be used in play. A file that fails to load leaves the previous preset in use, and the error is reported. File watching, and immediate re-evaluation on the result screen, arrive with the result screen in stage 2.
+
 ## Settings Scopes
 
 | Scope | Owner | Examples |
