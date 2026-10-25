@@ -58,7 +58,17 @@ fn threaded_logic_matches_threadless() {
 
     let (_, script) = autoplay_script(&chart, &dev);
     let sources = SourceSet::new(common::sources()).unwrap();
-    let mut runner = Runner::new(&chart, &rule, &dev, sources, script, config, START).unwrap();
+    let mut runner = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config,
+        START,
+        common::audio(&chart, START),
+    )
+    .unwrap();
     assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
     let expected = runner.stream().to_vec();
     assert_eq!(count_judged(&expected, Judgment::Perfect), 200);
