@@ -182,7 +182,10 @@ impl SourceSet {
     /// A packet of the current batch. The device's physical state follows
     /// every packet, admitted or not, so it stays true across plays. The
     /// packet is recorded when the gate admits it, recording is open, its
-    /// device takes part, and its control is recorded.
+    /// device takes part, and its control is recorded. A press repeated
+    /// while the control is held, such as a key's auto-repeat, is recorded
+    /// like any packet: recording applies no filter (design.md "Input",
+    /// debounce), and input conversion ignores it.
     pub fn packet(&mut self, packet: &Packet) -> Admit {
         let admit = self.gate.admit(packet);
         let max_held = self.config.max_held;
@@ -377,6 +380,18 @@ impl SourceSet {
         for d in &mut self.devices {
             d.source = None;
         }
+    }
+
+    /// Whether recording is open.
+    #[must_use]
+    pub const fn is_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// The connected devices whose state is kept, in the order they were
+    /// found, which is the order of source ids at the next opening.
+    pub fn devices(&self) -> impl Iterator<Item = (DeviceId, DeviceKind)> + '_ {
+        self.devices.iter().map(|d| (d.id, d.kind))
     }
 
     /// The participating sources' devices and kinds, indexed by

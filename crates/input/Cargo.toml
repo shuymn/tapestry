@@ -1,7 +1,7 @@
 [package]
 name = "input"
 version = "0.0.0"
-description = "Input sources: per-source queues and watermarks, the focus gate, and scripted input."
+description = "Input sources: per-source queues and watermarks, the focus gate, scripted input, and Raw Input keyboards with QPC on Windows."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,6 +11,17 @@ publish.workspace = true
 bms-model.workspace = true
 eval.workspace = true
 rtrb.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_UI_Input",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [lints]
 workspace = true
