@@ -7,6 +7,10 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+mod clock;
+
+pub use clock::{TimeSource, VirtualClock};
+
 /// A point in chart time, in integer microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TimeUs(pub i64);
