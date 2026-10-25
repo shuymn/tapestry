@@ -405,12 +405,12 @@ mod tests {
         let mut crates = baseline();
         set(
             &mut crates,
-            "eval",
+            "replay",
             "[package.metadata.tapestry]\nwindows-only = true\n",
         );
         assert_single(
             &check(&crates),
-            &["R2:", "package `eval` is marked windows-only"],
+            &["R2:", "package `replay` is marked windows-only"],
         );
     }
 
