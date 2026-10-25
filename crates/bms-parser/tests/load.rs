@@ -471,13 +471,14 @@ fn empty_chart_loads_with_a_warning() {
 
 #[test]
 fn duplicated_lntype1_line_keeps_one_long_note() {
-    let text = "#BPM 120\n#WAV01 click.wav\n#00151:0101\n#00151:0101\n";
+    // The later line wins at each endpoint: the long note plays sound 02.
+    let text = "#BPM 120\n#WAV01 click.wav\n#WAV02 click.wav\n#00151:0101\n#00151:0202\n";
     let loaded = load_text(text).unwrap();
     assert_eq!(
         loaded.chart.lanes[1],
         vec![Note {
             time: TimeUs(2_000_000),
-            sound: Some(SoundId(0)),
+            sound: Some(SoundId(1)),
             kind: NoteKind::Long {
                 end: TimeUs(3_000_000),
                 end_sound: None
@@ -590,6 +591,9 @@ fn each_resolved_field_changes_the_resolved_hash() {
         "#00152:0101",
         "#00101:02",
         "#00211:01",
+        // A silent tap (undefined sound) and a mine.
+        "#00114:05",
+        "#001D5:05",
     ];
     type Variant<'a> = (&'a str, &'a [(usize, &'a str)], &'a [&'a str]);
     // Each variant replaces a line or adds lines to change one field.
@@ -598,7 +602,8 @@ fn each_resolved_field_changes_the_resolved_hash() {
         ("note time", &[(6, "#00111:0001")], &[]),
         ("note lane", &[(6, "#00113:01")], &[]),
         ("note sound", &[(6, "#00111:02")], &[]),
-        ("note kind", &[(6, "#001D1:01")], &[]),
+        ("silent tap to mine", &[(10, "#001D4:05")], &[]),
+        ("mine damage", &[(11, "#001D5:06")], &[]),
         ("long-note end", &[(7, "#00152:01000001")], &[]),
         ("end sound", &[(7, "#00152:0102")], &[]),
         ("BGM time", &[(8, "#00101:0002")], &[]),
@@ -625,5 +630,5 @@ fn each_resolved_field_changes_the_resolved_hash() {
         }
         seen.push((name, hash));
     }
-    assert_eq!(seen.len(), 16);
+    assert_eq!(seen.len(), 17);
 }
