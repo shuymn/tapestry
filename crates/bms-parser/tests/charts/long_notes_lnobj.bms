@@ -1,0 +1,16 @@
+#PLAYER 1
+#TITLE Long notes
+#BPM 120
+#LNOBJ ZZ
+#WAV01 click.wav
+
+*  Key 1: measure 1, 0 to 1/2.
+#00111:01ZZ
+*  Key 2: measure 1 at 1/4 to measure 2 at 0.
+#00112:00010000
+#00212:ZZ
+*  Scratch: measure 1, 0 to 3/4.
+#00116:010000ZZ
+*  Key 7: measure 2 at 1/2 to measure 3 at 0.
+#00219:0001
+#00319:ZZ

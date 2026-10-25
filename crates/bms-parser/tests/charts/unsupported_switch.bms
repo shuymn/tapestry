@@ -1,0 +1,8 @@
+#PLAYER 1
+#BPM 120
+#WAV01 click.wav
+#SWITCH 2
+#CASE 1
+#00111:01
+#SKIP
+#ENDSW

@@ -1,0 +1,27 @@
+*---------------------- HEADER FIELD
+#PLAYER 1
+#TITLE BPM and STOP
+#BPM 120
+#RANK 2
+#TOTAL 250.5
+#BPM01 180.5
+#STOP01 96
+#STOP02 24
+#WAV01 click.wav
+
+*---------------------- MAIN DATA FIELD
+*  Measure 1: BPM 240 (channel 03) and a 2-beat STOP at its start, with a
+*  note on the STOP position and one half a measure later.
+#00103:F0
+#00109:01
+#00111:0101
+*  Measure 2: 3 beats long; at beat 1 channel 08 says 180.5 and channel 03
+*  says 180 (08 wins though written first); at beat 2 a half-beat STOP
+*  with a note on it.
+#00202:0.75
+#00208:000100
+#00203:00B400
+#00209:000002
+#00211:000001
+#00311:01
+#00301:01
