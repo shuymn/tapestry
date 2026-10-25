@@ -50,26 +50,18 @@ struct Segment {
 }
 
 impl Segment {
-    /// The position at `t`, unbounded.
-    fn position(self, t: i128) -> i128 {
-        let advance = (t - i128::from(self.start)).saturating_mul(i128::from(self.bpm_micro));
-        self.scaled.saturating_add(advance).div_euclid(RATE_DIVISOR)
+    /// The position at `t`, unbounded. Cannot overflow: segments start at or
+    /// after time 0 (`before_zero` at 0), so `|t - start| <= 2^63`, the
+    /// product stays within `2^126`, and anchors stay within `2^89`.
+    fn position(self, t: i64) -> i128 {
+        let advance = (i128::from(t) - i128::from(self.start)) * i128::from(self.bpm_micro);
+        (self.scaled + advance).div_euclid(RATE_DIVISOR)
     }
 
     /// The smallest `t` with `position(t) >= p`. Needs `bpm_micro > 0`.
     fn earliest_at_or_past(self, p: i128) -> i128 {
         i128::from(self.start)
             + ceil_div(p * RATE_DIVISOR - self.scaled, i128::from(self.bpm_micro))
-    }
-
-    /// The largest `t` with `position(t) <= p`. Needs `bpm_micro > 0`.
-    fn latest_not_past(self, p: i128) -> i128 {
-        i128::from(self.start)
-            + ceil_div(
-                (p + 1) * RATE_DIVISOR - self.scaled,
-                i128::from(self.bpm_micro),
-            )
-            - 1
     }
 }
 
@@ -146,7 +138,7 @@ impl ScrollMap {
                         return Err(ModelError::InvalidStop { at, len });
                     }
                     map.push(at.0, 0)?;
-                    resume_at = Some(at.0.checked_add(len.0).ok_or(ModelError::Overflow)?);
+                    resume_at = Some(at.checked_add(len).ok_or(ModelError::Overflow)?.0);
                 }
             }
         }
@@ -197,7 +189,7 @@ impl ScrollMap {
     /// bounds far outside any chart.
     #[must_use]
     pub fn position_at(&self, t: TimeUs) -> Position {
-        Position(saturate(self.segment_at(t.0).position(i128::from(t.0))))
+        Position(saturate(self.segment_at(t.0).position(t.0)))
     }
 
     /// The times whose position lies in `[from, to]`, as an inclusive pair
@@ -220,7 +212,7 @@ impl ScrollMap {
         let hi = if to.0 == i64::MAX {
             i128::MAX
         } else {
-            self.latest_not_past(i128::from(to.0))
+            self.earliest_at_or_past(i128::from(to.0) + 1) - 1
         };
         let (min, max) = (i128::from(i64::MIN), i128::from(i64::MAX));
         let (lo, hi) = if lo > max {
@@ -233,41 +225,20 @@ impl ScrollMap {
         (TimeUs(saturate(lo)), TimeUs(saturate(hi)))
     }
 
-    /// The smallest `t` with an unbounded position at or past `p`.
+    /// The smallest `t` with an unbounded position at or past `p`; the
+    /// latest time not past `p` is one before that for `p + 1`.
+    ///
+    /// The answer lies in the last segment anchored below `p`, or before
+    /// time 0 when none is. That segment is never a STOP, because the segment
+    /// after a STOP has the same exact anchor, and the answer never passes
+    /// the next anchor, because anchors are exact.
     fn earliest_at_or_past(&self, p: i128) -> i128 {
         let next = self
             .segments
             .partition_point(|s| s.scaled < p * RATE_DIVISOR);
-        if next == 0 {
-            // p <= 0: before time 0.
-            return self.before_zero.earliest_at_or_past(p).min(0);
-        }
-        let seg = self.segments[next - 1];
-        let next_start = self.segments.get(next).map(|s| i128::from(s.start));
-        if seg.bpm_micro == 0 {
-            // A STOP below p is always followed by a resume segment.
-            return next_start.unwrap_or(i128::MAX);
-        }
-        let t = seg.earliest_at_or_past(p);
-        next_start.map_or(t, |n| t.min(n))
-    }
-
-    /// The largest `t` with an unbounded position not past `p`.
-    fn latest_not_past(&self, p: i128) -> i128 {
-        let next = self
-            .segments
-            .partition_point(|s| s.scaled < (p + 1) * RATE_DIVISOR);
-        if next == 0 {
-            // p < 0: before time 0.
-            return self.before_zero.latest_not_past(p).min(-1);
-        }
-        let seg = self.segments[next - 1];
-        let next_end = self.segments.get(next).map(|s| i128::from(s.start) - 1);
-        if seg.bpm_micro == 0 {
-            return next_end.unwrap_or(i128::MAX);
-        }
-        let t = seg.latest_not_past(p);
-        next_end.map_or(t, |n| t.min(n))
+        next.checked_sub(1)
+            .map_or(self.before_zero, |i| self.segments[i])
+            .earliest_at_or_past(p)
     }
 }
 

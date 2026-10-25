@@ -111,22 +111,17 @@ impl ChartBuilder {
         }
         self.bgm.sort_by_key(|e| e.time);
         let to_micro = |milli: i64| milli.checked_mul(1_000).ok_or(ModelError::Overflow);
-        let mut scroll = Vec::with_capacity(self.scroll.len());
-        for change in self.scroll {
-            scroll.push(match change {
-                ScrollChange::Bpm { at, bpm_micro } => ScrollChange::Bpm {
-                    at,
-                    bpm_micro: to_micro(bpm_micro)?,
-                },
-                stop @ ScrollChange::Stop { .. } => stop,
-            });
+        for change in &mut self.scroll {
+            if let ScrollChange::Bpm { bpm_micro, .. } = change {
+                *bpm_micro = to_micro(*bpm_micro)?;
+            }
         }
         let chart = Chart {
             lanes: self.lanes,
             bgm: self.bgm,
             sounds: self.sounds,
             bar_lines: Vec::new(),
-            scroll: ScrollMap::new(to_micro(self.bpm_milli)?, &scroll)?,
+            scroll: ScrollMap::new(to_micro(self.bpm_milli)?, &self.scroll)?,
             meta: ChartMeta::default(),
             identity: ChartIdentity::default(),
         };
