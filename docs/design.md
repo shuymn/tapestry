@@ -532,7 +532,7 @@ Many people play while streaming or recording, so the game does not, for the sak
 
 ### Settings Profiles
 
-The rules above are a commitment for the standard settings. Only when players choose it themselves may exclusive methods be used to cut latency.
+The rules above are a commitment for the standard settings. Only when players choose it themselves may exclusive methods be used to cut latency. The first version builds only the standard profile; the low-latency priority and streaming profiles are later variations.
 
 | Item | Standard | Low-latency priority | Streaming |
 | --- | --- | --- | --- |
@@ -590,11 +590,26 @@ Extensions can plug in only at named extension points. Evaluation has no plug-in
 
 Conversely, judgment logic is placed in core and fixed, to preserve fairness and reproducibility. Rule-specific evaluation implementations are only those built into the evaluator, and no mechanism is built for users to extend judgment rules with code.
 
-This extension point table is a commitment about where extensions belong; it does not mean everything is built as a generic mechanism from the start. The initial implementation keeps only the boundaries between the evaluator and everything else (input log, presets, judgment event stream), and each adapter is built when it becomes necessary.
+This extension point table is a commitment about where extensions belong; it does not mean everything is built as a generic mechanism from the start. The first playable version (stages 1–3) builds the game to completion with the fewest extensions ("How We Build It"):
+
+| Built in the first version | Stays a boundary until its variation is added |
+| --- | --- |
+| The evaluator boundary: input log, presets as data, the judgment event stream | — |
+| A BMS/BME loader, including `#RANDOM`, writing the common chart model | Other chart formats (PMS, BMSON) |
+| Raw Input from keyboards and HID dedicated controllers | MIDI input, other input adapters |
+| The default session policy | Other session policies (GAS and the like) |
+| Re-evaluation under other presets on the result screen (a core feature, built in, not an extension) | Other statistics and analysis screens |
+| Local saving of play records and input logs | Sending to IR, export |
+| The declarative custom skin | LR2 and beatoraja skin adapters |
+| The standard settings profile | The low-latency priority profile (exclusive mode, ASIO) and the streaming profile |
+| — | Chart transformations chosen by the player (MIRROR, RANDOM options) |
+| — | Screen transition and session events, the local event endpoint, and integrations built on them (OBS, Discord, overlays) |
+
+Inside the first version these are plain code behind the boundary, not plug-in mechanisms; a boundary becomes a mechanism only when its second implementation arrives.
 
 ### Screen Transition and Session Events
 
-Core streams changes in screen and play state (song selection, play start, pause, failure, play end, result display) as timestamped events. All integrations with streaming and external tools are built as extensions that receive these events.
+Built as a later variation, not in the first version. Core streams changes in screen and play state (song selection, play start, pause, failure, play end, result display) as timestamped events. All integrations with streaming and external tools are built as extensions that receive these events.
 
 - Extensions receive on a separate thread from a bounded queue. When the queue overflows, old events are dropped, and the game does not wait. Even if an extension fails, the game simply continues.
 - Events carry a session ID and a sequence number, and the current state can also be fetched at any time. When an extension notices a gap in sequence numbers or a reconnect, it re-fetches the current state. Even if events are missed, re-fetching the state gets back to the correct state.
@@ -603,7 +618,7 @@ Core streams changes in screen and play state (song selection, play start, pause
 
 ### Local Event Endpoint
 
-A generic endpoint (a local WebSocket) that can be connected to only from within this PC is provided, exposing the events above and the current state. OBS scripts, streaming overlays displayed in a browser, and statistics tools can be built on this endpoint without rebuilding the player.
+Built with the screen transition and session events, as a later variation. A generic endpoint (a local WebSocket) that can be connected to only from within this PC is provided, exposing the events above and the current state. OBS scripts, streaming overlays displayed in a browser, and statistics tools can be built on this endpoint without rebuilding the player.
 
 - It listens only on loopback addresses and is disabled by default.
 - A connection requires a random connection token issued from the settings screen. Nothing is sent until authentication completes.
@@ -623,7 +638,7 @@ A generic endpoint (a local WebSocket) that can be connected to only from within
 
 | Scope | Owner | Examples |
 | --- | --- | --- |
-| Device | This PC and this device | The three offsets, debounce, polling, audio device, buffer, the OBS connection target (the password is kept in the OS credential store), whether the local event endpoint is enabled |
+| Device | This PC and this device | The three offsets, debounce, polling, audio device, buffer; with their variations, the OBS connection target (the password is kept in the OS credential store) and whether the local event endpoint is enabled |
 | Player | The person playing | Hi-speed, lane cover, the presets and skins used, session policy |
 | Preset | The person who authors rules | Judgment windows, gauge, `#RANK` conversion |
 | Chart | The chart author | `#RANK`, `#TOTAL`, specification of the LN judgment mode (the preset decides the interpretation and precedence) |
@@ -902,7 +917,7 @@ Tests without threads do not find bugs in notifications or queues. So a small nu
 
 - **Scenario launch**: The app can be launched with a scenario (`--scenario scenario.toml`) that describes "load this chart, feed this input log, save the screen at this time, exit". The same scenario is used whether a human or an AI does the checking.
 - **Specifying the start position**: From the command line or a scenario, the app can be launched with a specified start position for the practice "mid-chart start" (the "Input Logs and Replays" section). It uses the same mechanism as the product's practice feature, and the development build adds only the way to specify it. It is used in combination with preset and skin reloading.
-- **External control**: Load, start, and screen-save operations are added to the local event endpoint. The event endpoint is by nature receive-only, so this is an exception for development builds only, and the connection token and loopback restrictions still apply.
+- **External control** (once the local event endpoint exists): Load, start, and screen-save operations are added to the local event endpoint. The event endpoint is by nature receive-only, so this is an exception for development builds only, and the connection token and loopback restrictions still apply.
 - **Measurement output**: On each judgment, the app can flash a square at a fixed position on the screen and emit a test sound (used by the test device below).
 
 ### Separating Development and Production Builds
@@ -934,7 +949,7 @@ Feel, local dedicated controllers, running alongside OBS (once that variation is
 | 0 | A short technical spike (meant to be thrown away) on the development PC at WQHD 240 Hz: run high-speed scrolling with 10,000+ notes, 100+ simultaneous voices, 1080p BGA, and effects on all lanes at the same time. When done, move to stage 1 immediately | The rendering and audio approach runs on the real path on the development PC. Each player-visible problem found has a cause and a design response, or is recorded as an open question or a later variation. The indicators the spike can measure are implemented, and their stage 0 values are recorded as a baseline; the others are recorded as not yet measured |
 | 1 | The minimal setup for playing one song: chart loading, input, audio, a simple play screen, an evaluator with one custom preset, saving the input log. Also includes key config, volume, offset, hi-speed, and instant retry. The testing mechanisms (swappable clock and I/O, processing that can advance without threads) are also put in here | One chart on hand can be played to the end without feeling latency or stutter. Key sound and frame latency can be measured and displayed |
 | 2 | One full gameplay loop: song selection, results, retry, practice (section repeat and speed change), beatoraja-style and LR2-style presets with switching on the result screen, `eval-cli`, and development features such as scenario launch. The test input device is built in this stage or the next | Song selection through play, results, and retry can be played repeatedly. The property tests pass |
-| 3 | Look and effects: the declarative custom skin format, polished effects, followed by the LR2 and beatoraja skin adapters | Playing with the standard skin is fun. The play screen can be displayed with representative existing skins |
+| 3 | Look and effects: the declarative custom skin format and polished effects. The LR2 and beatoraja skin adapters come after this, as variations ("Extension Boundaries") | Playing with the standard skin is fun |
 | 4 | Custom IR (server-side computation, start registration, impossible-input detection, allowlist) | Input logs can be sent, and rankings for multiple presets can be viewed |
 | 5 | Chart registry (catalog only) and installer | Difficulty tables can be installed in one go, and derivative chart dependencies can be resolved |
 | 6 | Connecting to existing IRs | Scores computed with the specified preset can be sent in the existing format |
@@ -943,7 +958,7 @@ Feel, local dedicated controllers, running alongside OBS (once that variation is
 >
 > Until stage 3 is finished, IR, the distribution registry, anti-cheat, and servers are not touched. The only things decided before then in preparation for a future IR and the like are the input log format and the evaluator boundary, so that these can be added later. The later sections of this design document are designs for building at that point, not reasons to build earlier.
 
-Between stages 1 and 2, a generous period of playing and fixing is set aside. IR (stage 4 onward) is started once a state that is fun to play exists. The input log format carries a version number from stage 1, and only its core parts (physical input, time, chart identification, and the preset record) are included from the start. Other fields are added while bumping the version. Crates, too, start out consolidated into a few, and are split once the boundaries become clear.
+After stage 3, variations (other chart formats, input adapters, skin adapters, settings profiles, other PCs, running alongside other software) are added one at a time as needed, before or alongside the later stages. Between stages 1 and 2, a generous period of playing and fixing is set aside. IR (stage 4 onward) is started once a state that is fun to play exists. The input log format carries a version number from stage 1, and only its core parts (physical input, time, chart identification, and the preset record) are included from the start. Other fields are added while bumping the version. Crates, too, start out consolidated into a few, and are split once the boundaries become clear.
 
 ## Open Questions
 
