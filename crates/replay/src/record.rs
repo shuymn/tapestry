@@ -4,7 +4,7 @@ use bms_model::{ChartIdentity, TimeUs};
 use eval::{DeviceProfile, InputStart, PhysicalInputEvent, SourceProfile};
 use rules::RulePreset;
 
-use crate::preset_hash;
+use sha2::{Digest, Sha256};
 
 /// Whether the app that recorded the play was a production or a development
 /// build.
@@ -53,10 +53,11 @@ impl PresetRecord {
     /// The record of `preset`.
     #[must_use]
     pub fn of(preset: &RulePreset) -> Self {
+        let canonical_bytes = preset.canonical_bytes();
         Self {
             id: preset.id.clone(),
-            sha256: preset_hash(preset),
-            canonical_bytes: preset.canonical_bytes(),
+            sha256: Sha256::digest(&canonical_bytes).into(),
+            canonical_bytes,
         }
     }
 }

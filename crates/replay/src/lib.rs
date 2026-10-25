@@ -404,8 +404,7 @@ fn read_section<'a, T>(
 fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeError> {
     let mut r = Reader::new(body);
     let (versions, loader) = read_section(&mut r, Section::Versions, read_versions)?;
-    let mut chart = read_section(&mut r, Section::Chart, read_chart)?;
-    chart.identity.loader_version = loader;
+    let chart = read_section(&mut r, Section::Chart, |r| read_chart(r, loader))?;
     let preset = read_section(&mut r, Section::Preset, read_preset)?;
     let (session_policy, play_type) = read_section(&mut r, Section::Session, |r| {
         let policy = r.string()?;
@@ -457,7 +456,7 @@ fn read_versions(r: &mut Reader<'_>) -> Result<(Versions, u32), DecodeError> {
     ))
 }
 
-fn read_chart(r: &mut Reader<'_>) -> Result<ChartRecord, DecodeError> {
+fn read_chart(r: &mut Reader<'_>, loader_version: u32) -> Result<ChartRecord, DecodeError> {
     let sha256 = r.array()?;
     let md5 = r.array()?;
     let resolved_hash = r.array()?;
@@ -472,7 +471,7 @@ fn read_chart(r: &mut Reader<'_>) -> Result<ChartRecord, DecodeError> {
             sha256,
             md5,
             resolved_hash,
-            loader_version: 0,
+            loader_version,
             random_results,
         },
         random_seed,

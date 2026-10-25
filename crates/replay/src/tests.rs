@@ -1,4 +1,4 @@
-use bms_model::{ChartBuilder, ChartIdentity, Lane, TimeUs};
+use bms_model::{ChartIdentity, Lane, TimeUs};
 use eval::{
     Binding, ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile,
 };
@@ -408,38 +408,22 @@ fn v1_golden_body() {
     assert_eq!(hex(&Sha256::digest(&body)), GOLDEN_BODY_SHA256);
     // Another zstd encoding of the same body decodes to the same record.
     for level in [1, 3, 19] {
-        let decoded = decode(&wrap(&body, level), &limits()).unwrap();
-        assert_eq!(
-            hex(&Sha256::digest(body_bytes(&decoded))),
-            GOLDEN_BODY_SHA256
-        );
-        assert_eq!(decoded, rec);
+        assert_eq!(decode(&wrap(&body, level), &limits()), Ok(rec.clone()));
     }
 }
 
 #[test]
 fn two_thousand_notes_fit_in_tens_of_kb() {
-    // 2000 taps over 2 minutes, cycling the 8 lanes.
-    let mut builder = ChartBuilder::new(150_000);
-    for i in 0..2000_i64 {
-        builder = builder.tap(lane((i % 8) as u8), TimeUs(1_000_000 + i * 60_000));
-    }
-    let chart = builder.build().unwrap();
-    let mut notes: Vec<(TimeUs, Lane)> = Lane::all()
-        .flat_map(|l| chart.lanes[l.index()].iter().map(move |n| (n.time, l)))
-        .collect();
-    notes.sort();
-    assert_eq!(notes.len(), 2000);
-
-    // Autoplay: one scripted source presses each note's control at the note
-    // and releases it 40 ms later.
+    // Autoplay of 2000 taps 60 ms apart over 2 minutes, cycling the 8
+    // lanes: one scripted source presses each note's control at the note
+    // and releases it 40 ms later, so the events come out in time order.
     let scan = |l: Lane| 0x1e + l.index() as u32;
     let mut events = Vec::with_capacity(4000);
-    for &(t, l) in &notes {
-        events.push(control(0, t.0, scan(l), 1));
-        events.push(control(0, t.0 + 40_000, scan(l), 0));
+    for i in 0..2000_i64 {
+        let (t, l) = (1_000_000 + i * 60_000, lane((i % 8) as u8));
+        events.push(control(0, t, scan(l), 1));
+        events.push(control(0, t + 40_000, scan(l), 0));
     }
-    events.sort_by_key(|e| e.received);
     let mut rec = sample(0);
     rec.devices.sources = vec![SourceRecord {
         receive: ReceiveMethod::Scripted,
