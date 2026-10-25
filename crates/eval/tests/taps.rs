@@ -66,6 +66,8 @@ fn miss_waits_for_watermark() {
 fn finalized_or_unordered_input_and_backward_advance_are_refused() {
     let chart = ChartBuilder::new(BPM)
         .tap(lane(1), TimeUs(1_000 * MS))
+        // A future note the queued press will judge.
+        .tap(lane(1), TimeUs(1_300 * MS))
         .build()
         .unwrap();
     let dev = device(&[0]);
@@ -99,12 +101,52 @@ fn finalized_or_unordered_input_and_backward_advance_are_refused() {
             finalized: TimeUs(1_180 * MS),
         })
     );
-    // The refused calls changed nothing: the two queued inputs still run,
-    // and an equal watermark is not backward.
+    // The refused calls changed nothing: the two queued inputs still run
+    // (the press judges the future note), and an equal watermark is not
+    // backward.
     ev.advance_to(TimeUs(1_180 * MS), &mut out).unwrap();
     ev.advance_to(TimeUs(2_000 * MS), &mut out).unwrap();
-    assert_eq!(judgments(&out), [(1, 0, Poor, None)]);
+    assert_eq!(
+        judgments(&out),
+        [(1, 0, Poor, None), (1, 1, Bad, Some(-110 * MS))]
+    );
     ev.push_input(press(2_001 * MS, 0, 1)).unwrap();
+}
+
+#[test]
+fn finalization_compares_evaluation_time_not_receive_time() {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(2_000 * MS))
+        .build()
+        .unwrap();
+    let preset = rules::custom();
+    let w = TimeUs(1_000 * MS);
+
+    // +5 ms: received after the watermark, but evaluated at or before it.
+    let late = device(&[5 * MS]);
+    let mut ev = Evaluator::new(&chart, &preset, &late, &InputStart::default(), 4).unwrap();
+    ev.advance_to(w, &mut Vec::new()).unwrap();
+    assert_eq!(
+        ev.push_input(press(1_005 * MS, 0, 1)),
+        Err(PushError::Finalized {
+            time: w,
+            finalized: w,
+        })
+    );
+    assert_eq!(ev.push_input(press(1_005 * MS + 1, 0, 1)), Ok(()));
+
+    // −5 ms: received at or before the watermark, but evaluated after it.
+    let early = device(&[-5 * MS]);
+    let mut ev = Evaluator::new(&chart, &preset, &early, &InputStart::default(), 4).unwrap();
+    ev.advance_to(w, &mut Vec::new()).unwrap();
+    assert_eq!(
+        ev.push_input(press(995 * MS, 0, 1)),
+        Err(PushError::Finalized {
+            time: w,
+            finalized: w,
+        })
+    );
+    assert_eq!(ev.push_input(press(995 * MS + 1, 0, 1)), Ok(()));
 }
 
 #[test]
