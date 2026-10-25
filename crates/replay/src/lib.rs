@@ -15,7 +15,9 @@
 //! are LEB128 varints, zigzag for signed values; strings and byte strings are
 //! a length then the bytes; hashes are raw. An event's time is the delta
 //! from the previous event of the same source, and a source's first event
-//! counts from `InputStart::opened_at`.
+//! counts from `InputStart::opened_at`. Deltas are taken and accumulated
+//! modulo 2^64 as two's complement `i64`, so every pair of times encodes
+//! exactly (a delta from `i64::MAX` to `i64::MIN` is `1`).
 //!
 //! The layout is written field by field, not derived from struct layout.
 //! Every record struct is destructured in full when encoded, so a new field
