@@ -10,12 +10,17 @@
 //!
 //! A sound is checked against the caps before decoding, from the frame count
 //! its container declares, and while decoding, from a running count. While
-//! a sound decodes, its PCM is reserved against [`BankLimits::max_bank_bytes`]
-//! at its source size, plus its device-rate size while converting; on
-//! success the reservation becomes the stored size, and on failure or panic
-//! it is returned. Peak memory is therefore bounded by workers × the file cap
-//! plus the bank cap (plus each worker's fixed decoder and resampler
-//! buffers, which the rate range [`MIN_RATE`]..=[`MAX_RATE`] bounds).
+//! a sound decodes, the PCM it has allocated is charged to
+//! [`BankLimits::max_bank_bytes`] before each allocation: its source buffer
+//! (allocated exactly when the length is declared), both buffers while one
+//! grows, and the source and converted buffers together while converting.
+//! On success the charge becomes the stored sound's allocation; on failure
+//! or panic it, and the sound's declared share, are returned.
+//!
+//! The caps bound the raw file bytes in flight (workers × the file cap) and
+//! the decoded PCM (the bank cap). They do not bound the decoder's own
+//! workspace (for example the codebooks a Vorbis header sets up), which only
+//! the decoder could limit; design.md "Threat Model" records that gap.
 //!
 //! A sound over a cap refuses the whole bank. A file that cannot be decoded,
 //! declares a sample rate outside the range, or makes the decoder panic is
@@ -55,8 +60,9 @@ pub const MAX_RATE: u32 = 384_000;
 pub struct BankLimits {
     /// Longest sound, in seconds of frames at the device rate.
     pub max_sound_seconds: u32,
-    /// Largest bank, in bytes of decoded i16, counting sounds still being
-    /// decoded at the larger of their source and device-rate sizes.
+    /// Largest bank, in bytes of i16 PCM allocated, counting sounds still
+    /// being decoded at what they hold: the source buffer, plus the
+    /// converted buffer while converting.
     pub max_bank_bytes: u64,
     /// Largest sound file, in bytes.
     pub max_file_bytes: u64,
@@ -335,6 +341,27 @@ fn pcm_bytes(frames: u64, ch: u64) -> u64 {
     frames.saturating_mul(ch * 2)
 }
 
+/// Bytes `samples` has allocated.
+fn cap_bytes(samples: &Vec<i16>) -> u64 {
+    samples.capacity() as u64 * 2
+}
+
+/// Makes room for `extra` more samples, charging what is allocated: during
+/// a reallocation the old and the new buffer both, then the new one. The
+/// charge is taken before allocating, so a refusal allocates nothing.
+fn grow(samples: &mut Vec<i16>, extra: u64, r: &mut Reservation<'_>) -> Result<(), u64> {
+    let len = samples.len() as u64;
+    let need = len + extra;
+    let old = samples.capacity() as u64;
+    if need <= old {
+        return Ok(());
+    }
+    let new = need.max(old * 2);
+    r.resize((old + new) * 2)?;
+    samples.reserve_exact(usize::try_from(new - len).unwrap_or(usize::MAX));
+    r.resize(cap_bytes(samples))
+}
+
 /// A share of the bank budget held while a sound decodes. Dropping it (on
 /// failure, cancellation or unwinding) returns the share; [`Self::commit`]
 /// keeps it for a stored sound.
@@ -382,10 +409,19 @@ struct RawBytes<'a> {
 }
 
 impl<'a> RawBytes<'a> {
-    fn new(live: &'a AtomicU64, peak: &AtomicU64, n: u64) -> Self {
-        let now = live.fetch_add(n, Ordering::Relaxed) + n;
+    fn new(live: &'a AtomicU64) -> Self {
+        Self { live, n: 0 }
+    }
+
+    /// Counts `n` bytes held from now on, before they are allocated.
+    fn set(&mut self, n: u64, peak: &AtomicU64) {
+        let now = if n >= self.n {
+            self.live.fetch_add(n - self.n, Ordering::Relaxed) + (n - self.n)
+        } else {
+            self.live.fetch_sub(self.n - n, Ordering::Relaxed) - (self.n - n)
+        };
+        self.n = n;
         peak.fetch_max(now, Ordering::Relaxed);
-        Self { live, n }
     }
 }
 
@@ -397,16 +433,24 @@ impl Drop for RawBytes<'_> {
 
 /// Reads `path` into memory, refusing it past `max` bytes (`Err(Ok(n))`,
 /// with the bytes read, one past the cap).
-fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, Result<u64, String>> {
+/// The buffer is counted in `raw` from before it is allocated.
+fn read_capped(
+    path: &Path,
+    max: u64,
+    raw: &mut RawBytes<'_>,
+    peak: &AtomicU64,
+) -> Result<Vec<u8>, Result<u64, String>> {
     let file = File::open(path).map_err(|e| Err(e.to_string()))?;
     let hint = file
         .metadata()
         .map_or(0, |m| m.len())
         .min(max.saturating_add(1));
+    raw.set(hint, peak);
     let mut bytes = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
     file.take(max.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| Err(e.to_string()))?;
+    raw.set(bytes.capacity() as u64, peak);
     if bytes.len() as u64 > max {
         return Err(Ok(bytes.len() as u64));
     }
@@ -494,7 +538,13 @@ fn process(i: usize, path: &Path, sound: SoundId, shared: &Shared<'_>) -> Outcom
     if shared.stop.load(Ordering::Relaxed) {
         return Outcome::Stopped(Stop::Cancelled);
     }
-    let bytes = match read_capped(path, shared.limits.max_file_bytes) {
+    let mut raw = RawBytes::new(&shared.raw_live);
+    let bytes = match read_capped(
+        path,
+        shared.limits.max_file_bytes,
+        &mut raw,
+        &shared.raw_peak,
+    ) {
         Ok(bytes) => bytes,
         Err(Ok(n)) => {
             return Outcome::Stopped(Stop::Cap(BankError::OverCap {
@@ -507,7 +557,6 @@ fn process(i: usize, path: &Path, sound: SoundId, shared: &Shared<'_>) -> Outcom
         }
         Err(Err(reason)) => return Outcome::Stopped(Stop::Undecodable(reason)),
     };
-    let _raw = RawBytes::new(&shared.raw_live, &shared.raw_peak, bytes.len() as u64);
     let hash: [u8; 32] = Sha256::digest(&bytes).into();
     {
         let mut taken = shared.taken.lock().unwrap_or_else(|e| e.into_inner());
@@ -570,20 +619,19 @@ fn decode(
                 limit: shared.max_frames,
             }));
         }
-        let add = charged(n);
-        let total = shared
-            .declared
-            .fetch_add(add, Ordering::Relaxed)
-            .saturating_add(add);
-        if total > max_bytes {
-            return Err(Stop::Cap(BankError::OverCap {
+    }
+    // The declared share is returned if this sound is not stored.
+    let mut declared = Reservation::new(&shared.declared, max_bytes);
+    if let Some(n) = opened.declared {
+        declared.resize(charged(n)).map_err(|total| {
+            Stop::Cap(BankError::OverCap {
                 cap: Cap::BankMemory,
                 found: Found::Declared,
                 sound,
                 amount: total,
                 limit: max_bytes,
-            }));
-        }
+            })
+        })?;
     }
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&opened.params, &AudioDecoderOptions::default())
@@ -599,6 +647,10 @@ fn decode(
         })
     };
     let mut samples: Vec<i16> = Vec::new();
+    if let Some(n) = opened.declared {
+        // A known length is allocated exactly, once.
+        grow(&mut samples, n * ch, &mut reservation).map_err(over_bank)?;
+    }
     let mut scratch: Vec<i16> = Vec::new();
     let mut src_frames = 0u64;
     loop {
@@ -630,9 +682,7 @@ fn decode(
                 limit: shared.max_frames,
             }));
         }
-        reservation
-            .resize(pcm_bytes(src_frames, ch))
-            .map_err(over_bank)?;
+        grow(&mut samples, frames as u64 * ch, &mut reservation).map_err(over_bank)?;
         for f in 0..frames {
             for c in 0..ch as usize {
                 samples.push(scratch.get(f * sc + c.min(sc - 1)).copied().unwrap_or(0));
@@ -642,18 +692,23 @@ fn decode(
         inject::check(path, src_frames)?;
     }
     let out_frames = device_frames(src_frames, src_rate, shared.rate);
+    let held = cap_bytes(&samples);
     if src_rate != shared.rate {
-        // Source and converted PCM are both held while converting.
+        // The source and the converted output are both held while converting.
         reservation
-            .resize(pcm_bytes(src_frames, ch) + pcm_bytes(out_frames, ch))
+            .resize(held + pcm_bytes(out_frames, ch))
             .map_err(over_bank)?;
         samples = resample(&samples, ch as usize, src_rate, shared.rate, out_frames)?;
+    } else if samples.capacity() > samples.len() {
+        // Shrinking copies into a buffer of the length beside the old one.
+        reservation
+            .resize(held + pcm_bytes(src_frames, ch))
+            .map_err(over_bank)?;
+        samples.shrink_to_fit();
     }
-    debug_assert!(charged(src_frames) >= pcm_bytes(out_frames, ch));
-    reservation
-        .resize(pcm_bytes(out_frames, ch))
-        .map_err(over_bank)?;
+    reservation.resize(cap_bytes(&samples)).map_err(over_bank)?;
     reservation.commit();
+    declared.commit();
     Ok(if ch == 2 {
         Sound::stereo(samples)
     } else {
@@ -917,11 +972,18 @@ mod tests {
         assert_eq!(device_frames(0, 22_050, 48_000), 0);
     }
 
-    /// A streaming (length-unknown) 16-bit mono WAV at 8 kHz.
-    fn streaming_wav(samples: &[i16]) -> Vec<u8> {
+    /// A 16-bit mono WAV at 8 kHz that declares its length when `known`,
+    /// and otherwise carries the "length unknown" sizes of a stream.
+    fn wav(samples: &[i16], known: bool) -> Vec<u8> {
+        let data_len = (samples.len() * 2) as u32;
+        let (riff_len, data_len) = if known {
+            (36 + data_len, data_len)
+        } else {
+            (u32::MAX, u32::MAX)
+        };
         let mut b = Vec::new();
         b.extend_from_slice(b"RIFF");
-        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&riff_len.to_le_bytes());
         b.extend_from_slice(b"WAVEfmt ");
         b.extend_from_slice(&16u32.to_le_bytes());
         for v in [1u16, 1] {
@@ -934,7 +996,7 @@ mod tests {
             b.extend_from_slice(&v.to_le_bytes());
         }
         b.extend_from_slice(b"data");
-        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&data_len.to_le_bytes());
         for s in samples {
             b.extend_from_slice(&s.to_le_bytes());
         }
@@ -943,9 +1005,9 @@ mod tests {
 
     /// A broken sound of 500 frames (1000 bytes) that fails or panics
     /// after decoding them, then a healthy one of 1000 frames (2000 bytes),
-    /// against a 2000-byte bank: the broken one's charge must be returned
-    /// for the healthy one to fit.
-    fn failure_then_healthy(fault: Fault, name: &str) {
+    /// against a 2000-byte bank: the broken one's charges, live and (for a
+    /// known length) declared, must be returned for the healthy one to fit.
+    fn failure_then_healthy(fault: Fault, known: bool, name: &str) {
         // The workspace's target directory, as for the integration tests.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
         std::fs::create_dir_all(&root).unwrap();
@@ -955,8 +1017,8 @@ mod tests {
             .unwrap();
         let broken = dir.path().join(format!("{name}.wav"));
         let healthy = dir.path().join("healthy.wav");
-        std::fs::write(&broken, streaming_wav(&[100; 500])).unwrap();
-        std::fs::write(&healthy, streaming_wav(&[200; 1_000])).unwrap();
+        std::fs::write(&broken, wav(&[100; 500], known)).unwrap();
+        std::fs::write(&healthy, wav(&[200; 1_000], known)).unwrap();
         inject::arm(&broken, fault);
         let mut chart = ChartBuilder::new(120_000)
             .sound("broken.wav")
@@ -980,11 +1042,13 @@ mod tests {
 
     #[test]
     fn a_failed_decode_returns_its_charge() {
-        failure_then_healthy(Fault::Fail, "fails");
+        failure_then_healthy(Fault::Fail, false, "fails");
+        failure_then_healthy(Fault::Fail, true, "fails-known");
     }
 
     #[test]
     fn a_decode_panic_is_contained_and_returns_its_charge() {
-        failure_then_healthy(Fault::Panic, "panics");
+        failure_then_healthy(Fault::Panic, false, "panics");
+        failure_then_healthy(Fault::Panic, true, "panics-known");
     }
 }

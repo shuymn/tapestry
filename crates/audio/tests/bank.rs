@@ -218,6 +218,35 @@ fn source_and_converted_pcm_are_charged_while_converting() {
 }
 
 #[test]
+fn pcm_is_charged_at_its_allocation_while_growing() {
+    // 20 000 mono frames are 40 000 bytes. Declared, they are allocated
+    // exactly once and fit a 40 000-byte bank. Streamed, the buffer grows
+    // packet by packet; while it reallocates, the old and new buffers are
+    // both charged, so the same bank refuses it, though the stored sound,
+    // shrunk to its length, is the same 40 000 bytes.
+    let samples = ramp(20_000, -7, 3);
+    let limits = |max_bank_bytes| BankLimits {
+        max_bank_bytes,
+        ..BankLimits::default()
+    };
+    let known = load_files(&[wav(RATE, 1, &samples)], RATE, &limits(40_000)).unwrap();
+    assert_eq!(known.bytes(), 40_000);
+    let streamed = || vec![wav_streaming(RATE, 1, &samples)];
+    match load_files(&streamed(), RATE, &limits(40_000)).unwrap_err() {
+        BankError::OverCap {
+            cap: Cap::BankMemory,
+            found: Found::WhileDecoding,
+            amount,
+            ..
+        } => assert!(amount > 40_000, "{amount}"),
+        e => panic!("{e:?}"),
+    }
+    let bank = load_files(&streamed(), RATE, &limits(1_000_000)).unwrap();
+    assert_eq!(bank.get(SoundId(0)).unwrap().samples(), &samples[..]);
+    assert_eq!(bank.bytes(), 40_000);
+}
+
+#[test]
 fn raw_bytes_held_at_once_stay_within_one_file_per_worker() {
     // 32 files of 1 MiB padding and 16 frames of audio, each contents
     // twice: 32 MiB read in all, 16 distinct sounds of 32 bytes.
