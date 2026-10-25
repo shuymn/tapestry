@@ -387,15 +387,10 @@ Mid-chart starts, section repeat, and excerpts from full-play records are all ha
 
 ### Path from Press to Sound
 
-Key sound latency is the sum of the following segments. Each segment is made measurable, and a total of 10 ms or less is the target, measured on chosen hardware. On environments that cannot reach it, the game points out that exclusive mode or ASIO can be chosen, but does not switch automatically.
+Key sound latency is the sum of the following segments. Each segment is made measurable, and the budget depends on the output path. The device period granted by the audio device is recorded with every measurement, and the game measures and displays the actual latency of the path in use.
 
-The standard path does not reach the target on every device. Stage 0 measured WASAPI shared mode on an audio interface whose shared-mode period is fixed at 10 ms (`IAudioClient3` offers no shorter period on it): the segment from judgment to the scheduled mix sample alone was about 26 ms at p50 and 32 ms at p99, before the output segment and the device segments. With a 10 ms period, one period already uses the whole budget, so no shared-mode implementation meets 10 ms on such a device. How to resolve this is an open decision for the owner (the "Open Questions" section):
-
-- **Exclusive mode** as the path that meets the budget: a shorter device period, at the cost that other apps' audio may stop on that device and the streaming software's desktop audio capture loses the game's audio.
-- **ASIO** as that path: requires settling the ASIO SDK license choice, and coexistence with streaming software depends on the device's own routing (for example an interface's internal loopback).
-- **A revised budget**: 10 ms applies to the low-latency profile only, and the standard shared path gets a budget stated in terms of the device period.
-
-Until it is decided, the 10 ms target stands, the standard path measures and displays its actual latency, and the game points out exclusive mode or ASIO as above.
+- **Standard path (WASAPI shared mode)**: The budget is derived from the shared-mode device period P. From judgment to the scheduled mix sample, it is about 2P for the two device periods queued ahead of playback (with one period queued, audio dropped out repeatedly), plus P/2 on average for the wait until the next period event, plus the resampler's filter delay (about 1 ms). The OS audio engine and the device's output latency come after this, and the device and input-receipt segments come before judgment. Stage 0 measured a device whose shared-mode period is fixed at 10 ms (`IAudioClient3` offers no shorter period on it): judgment to the scheduled mix sample was about 26 ms at p50 and 32 ms at p99, which the parts above account for, and no further delay was found. This is how shared mode works on such a device, not a defect.
+- **Low-latency path (later stage)**: The 10 ms or less from press to sound applies to a low-latency path built in a later stage: exclusive mode, ASIO, or a device that grants a shorter shared-mode period. Exclusive mode and ASIO stay as described in "Audio" and "Settings Profiles" and are not built before then.
 
 | Segment | What it is | How it is kept down |
 | --- | --- | --- |
@@ -452,7 +447,7 @@ Performance is not something optimized all at once at the end, but a constraint 
 | Render CPU work (including skin evaluation and BGA upload commands) | 1.5 ms |
 | GPU | 2 ms, with the GPU in its performance state ("GPU Power State") |
 | Input to judgment | 1 ms or less |
-| Press to sound | 10 ms or less; not reachable on WASAPI shared mode with a 10 ms device period, open decision ("Path from Press to Sound") |
+| Press to sound | Shared mode: judgment to scheduled mix about 2.5 device periods plus resampler delay, with the device period recorded; 10 ms or less on the later low-latency path ("Path from Press to Sound") |
 | Audio dropouts | 0 |
 | Song selection to play start | 1–2 seconds |
 
@@ -980,7 +975,6 @@ Between stages 1 and 2, a generous period of playing and fixing is set aside. IR
 - The criteria for inclusion in the allowlist, and the takedown request procedure (including legal judgment)
 - How to obtain authors' permission for "storage for evaluation", and the form of that record (to be decided before starting IR)
 - The concrete configuration of the reference PC
-- Press to sound on WASAPI shared mode with a device period of 10 ms: exclusive mode, ASIO, or a revised budget (owner decision; "Path from Press to Sound")
 - Why a discrete GPU stays in low performance states under the driver's default settings, whether the game must hold the frame pacing and GPU budgets under those settings, and if so which option meets them (a measure in the game, guidance to the player, or a revised target), decided after the experiments in "GPU Power State"; also whether the 60 Hz reference class holds its budget under the default settings
 - How to judge frame pacing under VRR, where counting in whole refreshes does not apply ("Frame Pacing in Refreshes")
 
