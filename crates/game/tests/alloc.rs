@@ -99,8 +99,9 @@ fn logic_does_not_allocate_during_play() {
     let sources = SourceSet::new(common::sources()).unwrap();
     let mut runner = Runner::new(&chart, &rule, &dev, sources, script, config, START).unwrap();
 
-    // Three sources each with one input inside the watermark, against a
-    // shared budget of two.
+    // Three sources each with two inputs inside the watermark, against a
+    // shared budget of three: their disconnect allowances and no control
+    // events.
     let taps = ChartBuilder::new(150_000)
         .tap(lane(1), TimeUs(1_000 * MS))
         .build()
@@ -110,17 +111,23 @@ fn logic_does_not_allocate_during_play() {
     let mut readers = Vec::new();
     for s in 0..3 {
         let (mut w, r) = source_queue(4);
-        w.push(PhysicalInputEvent {
-            source: SourceId(s),
-            ..press(1_000_000, 0, lane(1))
-        })
-        .unwrap();
+        for value in [1, 0] {
+            w.push(PhysicalInputEvent {
+                source: SourceId(s),
+                kind: InputKind::Control {
+                    control: common::control(lane(1)),
+                    value,
+                },
+                ..press(1_000_000, 0, lane(1))
+            })
+            .unwrap();
+        }
         w.publish(TimeUs(1_000_000));
         writers.push(w);
         readers.push(r);
     }
     let budget = LogicConfig {
-        inputs: 2,
+        inputs: 0,
         effects: 16,
     };
     let (mut overflowing, _side) = Logic::new(
@@ -150,6 +157,6 @@ fn logic_does_not_allocate_during_play() {
     assert_eq!(empty, 2_000);
     assert_eq!(runner.effects().len(), stream.len());
     assert_eq!(overflow.aborted, Some(AbortCause::Overflow));
-    assert_eq!(overflowing.record().events.len(), 2);
+    assert_eq!(overflowing.record().events.len(), 3);
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 }

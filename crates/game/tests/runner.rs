@@ -9,7 +9,7 @@ use common::{
 use eval::{
     ControlId, DeviceProfile, EvalInput, InputKind, InputStart, PhysicalInputEvent, SourceId,
 };
-use game::{AbortCause, LogicConfig, RunOutcome, Runner};
+use game::{AbortCause, LogicConfig, LogicError, RunOutcome, Runner};
 use input::{
     Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceConfig, SourceSet,
 };
@@ -348,6 +348,28 @@ fn event_at_the_opening_belongs_to_the_play() {
     let record = runner.record();
     assert_eq!(record.start, start);
     assert_eq!(record.events, events);
+}
+
+#[test]
+fn start_at_the_earliest_time_is_refused() {
+    let (chart, rule, dev) = play();
+    let (_, script) = autoplay_script(&chart, &dev);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    let config = config(&chart, 16);
+    let at_min = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config,
+        TimeUs(i64::MIN),
+    );
+    assert_eq!(at_min.err(), Some(LogicError::StartAtMinimum));
+    let (_, script) = autoplay_script(&chart, &dev);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    let next = TimeUs(i64::MIN + 1);
+    assert!(Runner::new(&chart, &rule, &dev, sources, script, config, next).is_ok());
 }
 
 #[test]

@@ -18,6 +18,7 @@ const CONFIG: LogicConfig = LogicConfig {
     effects: 64,
 };
 
+/// A budget of `inputs` control events, plus one disconnect per source.
 fn budget(inputs: usize) -> LogicConfig {
     LogicConfig {
         inputs,
@@ -258,7 +259,7 @@ fn capacity_one_takes_one_input() {
     let (mut writer, reader) = source_queue(4);
     writer.push(press(1_000_000, 0, lane(1))).unwrap();
     writer.publish(TimeUs(1_200_000));
-    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(1));
+    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(0));
     let a = logic.advance_to(TimeUs(1_200_500));
 
     assert_eq!(
@@ -275,11 +276,11 @@ fn equal_time_group_beyond_the_budget_aborts_unevaluated() {
     let rule = rules::custom();
     let dev = device(&[0]);
     let (mut writer, reader) = source_queue(4);
-    // One batch of two presses, and a budget of one input.
+    // One batch of two presses, and a budget of one input (the one source's disconnect allowance).
     writer.push(press(1_000_000, 0, lane(1))).unwrap();
     writer.push(press(1_000_000, 0, lane(2))).unwrap();
     writer.publish(TimeUs(1_000_000));
-    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(1));
+    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(0));
     let a = logic.advance_to(TimeUs(1_000_500));
 
     assert_eq!(a.aborted, Some(AbortCause::Overflow));
@@ -302,9 +303,10 @@ fn input_beyond_the_budget_aborts_at_the_finalized_watermark() {
     let (mut w1, r1) = source_queue(16);
     w0.publish(TimeUs(999_999));
     w1.publish(TimeUs(999_999));
-    let mut logic = logic(&chart, &rule, &dev, vec![r0, r1], budget(3));
+    let mut logic = logic(&chart, &rule, &dev, vec![r0, r1], budget(1));
     logic.advance_to(TimeUs(1_000_000));
-    // Four inputs over two sources against a budget of three, which is
+    // Four inputs over two sources against a budget of three (one control
+    // event and two disconnect allowances), which is
     // shared: no single source exceeds it.
     w0.push(press(1_000_000, 0, lane(1))).unwrap();
     w0.push(press(1_100_000, 0, lane(2))).unwrap();
@@ -409,7 +411,7 @@ fn abort_tail_beyond_the_budget_marks_overflow() {
     let (mut writer, reader) = source_queue(16);
     writer.push(press(1_000_000, 0, lane(1))).unwrap();
     writer.publish(TimeUs(1_200_000));
-    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(1));
+    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(0));
     logic.advance_to(TimeUs(1_200_500));
     assert!(!logic.overflowed());
     writer.push(press(1_500_000, 0, lane(2))).unwrap();
@@ -417,6 +419,83 @@ fn abort_tail_beyond_the_budget_marks_overflow() {
 
     assert!(logic.overflowed());
     assert_eq!(logic.record().events, vec![press(1_000_000, 0, lane(1))]);
+}
+
+#[test]
+fn disconnect_after_a_full_d8_window_fits_the_budget() {
+    // A tap at 3 s on lane 1; the inputs below play lane 7, which has none.
+    let chart = taps(&[(1, 3_000)]);
+    let rule = rules::custom();
+    let dev = device(&[0, 0]);
+    // D8: one bound button per source, pressed and released 30 times a
+    // second over a 2 s window: 2 × 60 × 2 = 240 control events.
+    let inputs = common::window_capacity(TimeUs(0), TimeUs(2_000_000), 2);
+    assert_eq!(inputs, 240);
+    let (mut w0, r0) = source_queue(256);
+    let (mut w1, r1) = source_queue(256);
+    for k in 0..60 {
+        for (s, w) in [(0, &mut w0), (1, &mut w1)] {
+            let t = k * 33_000 + i64::from(s) * 1_000;
+            w.push(press(t, s, lane(7))).unwrap();
+            w.push(PhysicalInputEvent {
+                kind: InputKind::Control {
+                    control: common::control(lane(7)),
+                    value: 0,
+                },
+                ..press(t + 10_000, s, lane(7))
+            })
+            .unwrap();
+        }
+    }
+    w0.publish(TimeUs(1_999_999));
+    w1.publish(TimeUs(1_999_999));
+    let mut logic = logic(&chart, &rule, &dev, vec![r0, r1], budget(inputs));
+    logic.advance_to(TimeUs(2_000_000));
+    assert_eq!(logic.record().events.len(), 240);
+    // The window is spent; source 0 is then removed while source 1 stays.
+    w0.push(disconnected(2_000_000, 0)).unwrap();
+    w0.close(TimeUs(2_000_000));
+    w1.publish(TimeUs(2_100_000));
+    let a = logic.advance_to(TimeUs(2_100_500));
+
+    assert_eq!(a.aborted, None);
+    assert_eq!(a.watermark, Some(TimeUs(2_000_000)));
+    assert!(!logic.overflowed());
+    assert_eq!(logic.record().events.len(), 241);
+}
+
+#[test]
+fn source_beyond_its_share_of_the_window_aborts() {
+    let chart = taps(&[(1, 1_000), (2, 1_100)]);
+    let rule = rules::custom();
+    let dev = device(&[0, 0]);
+    let (mut w0, r0) = source_queue(4);
+    let (w1, r1) = source_queue(4);
+    // No control events in the window: each source may stage only its
+    // disconnect, though the shared budget (two) has room for both.
+    w0.push(press(1_000_000, 0, lane(1))).unwrap();
+    w0.push(press(1_100_000, 0, lane(2))).unwrap();
+    w0.publish(TimeUs(1_200_000));
+    w1.publish(TimeUs(1_200_000));
+    let mut logic = logic(&chart, &rule, &dev, vec![r0, r1], budget(0));
+    let a = logic.advance_to(TimeUs(1_200_500));
+
+    assert_eq!(a.aborted, Some(AbortCause::Overflow));
+    assert!(logic.events().is_empty());
+    assert_eq!(logic.record().events.len(), 2);
+}
+
+#[test]
+fn overflow_abort_from_the_caller_marks_overflow() {
+    let chart = taps(&[(1, 1_000)]);
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let (_writer, reader) = source_queue(4);
+    let mut logic = logic(&chart, &rule, &dev, vec![reader], CONFIG);
+    logic.abort(AbortCause::Overflow);
+
+    assert_eq!(logic.aborted(), Some(AbortCause::Overflow));
+    assert!(logic.overflowed());
 }
 
 /// A source that never publishes anything.

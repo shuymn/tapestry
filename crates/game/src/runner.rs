@@ -56,7 +56,8 @@ impl<'a> Runner<'a> {
     ///
     /// # Errors
     ///
-    /// What [`Logic::new`] refuses.
+    /// [`LogicError::StartAtMinimum`] for a `start` of `i64::MIN`, or what
+    /// [`Logic::new`] refuses.
     pub fn new(
         chart: &'a Chart,
         rule: &'a RulePreset,
@@ -66,8 +67,11 @@ impl<'a> Runner<'a> {
         config: LogicConfig,
         start: TimeUs,
     ) -> Result<Self, LogicError> {
+        let Some(before) = start.0.checked_sub(1) else {
+            return Err(LogicError::StartAtMinimum);
+        };
         let clock = VirtualClock::new(start);
-        script.poll(TimeUs(start.0.saturating_sub(1)), &mut sources);
+        script.poll(TimeUs(before), &mut sources);
         let input_start = sources.open_recording(start);
         let readers = sources.take_readers();
         let sinks: Vec<Box<dyn EventSink + Send + 'a>> = Vec::new();

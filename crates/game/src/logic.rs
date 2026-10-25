@@ -41,9 +41,10 @@ impl SourceRead for SourceReader {
 /// Fixed sizes of a [`Logic`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogicConfig {
-    /// The input budget of the whole play: the capacity of the recording
-    /// window (D8). Every popped input spends one unit, whatever its
-    /// source; it sizes the record, the staging, the merge, the evaluator's
+    /// The control events of the whole play: the capacity of the recording
+    /// window (D8). The input budget is this plus one disconnect per
+    /// source. Every popped input spends one unit, whatever its source; the
+    /// budget sizes the record, the staging, the merge, the evaluator's
     /// input ring, and through [`Evaluator::max_events`] the output.
     pub inputs: usize,
     /// The effects the render queue holds.
@@ -57,6 +58,9 @@ pub enum LogicError {
     Eval(EvalError),
     /// More readers than [`SourceId`]s.
     TooManySources(usize),
+    /// A runner start of `i64::MIN` leaves no time before it for the
+    /// bootstrap, so the opening could not separate it from the play.
+    StartAtMinimum,
 }
 
 impl fmt::Display for LogicError {
@@ -64,6 +68,7 @@ impl fmt::Display for LogicError {
         match self {
             Self::Eval(e) => write!(f, "evaluation cannot start: {e}"),
             Self::TooManySources(n) => write!(f, "{n} sources exceed the source id range"),
+            Self::StartAtMinimum => f.write_str("the play cannot start at the earliest time"),
         }
     }
 }
@@ -207,14 +212,19 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         if n > usize::from(u16::MAX) + 1 {
             return Err(LogicError::TooManySources(n));
         }
+        // The control events of the window, plus one `Disconnected` per
+        // participant, which D8's rate does not count.
+        let budget = config.inputs.saturating_add(n);
         let evaluator =
-            Evaluator::new(chart, rule, device, start, config.inputs).map_err(LogicError::Eval)?;
-        // Each buffer can hold the whole budget, since one source may spend
-        // all of it.
+            Evaluator::new(chart, rule, device, start, budget).map_err(LogicError::Eval)?;
+        // Each buffer holds every control event of the window and its own
+        // source's disconnect; a source beyond that exceeds the window, and
+        // the push refused overflows like the budget.
+        let per_source = config.inputs.saturating_add(1);
         let staged = (0..n)
             .map(|i| {
                 let id = SourceId(u16::try_from(i).unwrap_or(u16::MAX));
-                Staged::with_capacity(id, config.inputs)
+                Staged::with_capacity(id, per_source)
             })
             .collect();
         let sources = readers
@@ -234,22 +244,22 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             events: 0,
         };
         let (render, view, side) = render_link(config.effects, &initial);
-        let max_events = evaluator.max_events(config.inputs);
+        let max_events = evaluator.max_events(budget);
         let logic = Self {
             evaluator,
             device,
             start: start.clone(),
             sources,
             staged,
-            inputs: config.inputs,
+            inputs: budget,
             max_events,
             emitted: 0,
             bounds: vec![Published::open(TimeUs(i64::MIN)); n],
-            merged: Vec::with_capacity(config.inputs),
+            merged: Vec::with_capacity(budget),
             // Sized for the whole play's inputs, not one step's (it is
             // cleared every step and never shrinks).
             out: Vec::with_capacity(max_events),
-            record: Vec::with_capacity(config.inputs),
+            record: Vec::with_capacity(budget),
             render,
             sinks,
             view,
@@ -317,7 +327,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
                 }
                 self.record.push(ev);
                 if self.staged[i].push(ev).is_err() {
-                    // Another source's event: it cannot be ordered here.
+                    // Another source's event, which cannot be ordered here, or
+                    // more than this source's share of the window.
                     self.overflowed = true;
                     break;
                 }
@@ -382,6 +393,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             return;
         }
         self.aborted = Some(cause);
+        self.overflowed |= cause == AbortCause::Overflow;
         for s in &mut self.sources {
             if s.published.state == SourceState::Retired {
                 continue;
