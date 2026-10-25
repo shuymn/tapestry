@@ -85,6 +85,12 @@ impl MixClock {
         i128::from(frame) * 1_000_000 / i128::from(self.rate)
     }
 
+    /// The window's earliest residual as of the latest observation (cached;
+    /// `None` after a reset).
+    fn anchor(&self) -> Option<i64> {
+        self.latest.map(|(_, min)| min)
+    }
+
     fn earliest(&self) -> Option<i64> {
         self.residuals[..self.len].iter().copied().min()
     }
@@ -94,7 +100,7 @@ impl MixClock {
     pub fn observe(&mut self, queued_from: u64, mixed_at: TimeUs) {
         let wide = i128::from(mixed_at.0) - self.frame_us(queued_from);
         let r = wide.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-        if let Some(min) = self.earliest() {
+        if let Some(min) = self.anchor() {
             if r < min.saturating_sub(self.jump_us) {
                 self.reset();
             } else if r > min.saturating_add(self.jump_us) {
@@ -120,7 +126,7 @@ impl MixClock {
     /// window; `None` before any observation or past the `i64` range.
     #[must_use]
     pub fn time_at(&self, frame: u64) -> Option<TimeUs> {
-        let t = i128::from(self.earliest()?) + self.frame_us(frame);
+        let t = i128::from(self.anchor()?) + self.frame_us(frame);
         i64::try_from(t).ok().map(TimeUs)
     }
 
@@ -128,7 +134,7 @@ impl MixClock {
     /// at `u64::MAX`; `None` before any observation.
     #[must_use]
     pub fn frame_at(&self, t: TimeUs) -> Option<u64> {
-        let us = (i128::from(t.0) - i128::from(self.earliest()?)).max(0);
+        let us = (i128::from(t.0) - i128::from(self.anchor()?)).max(0);
         Some(u64::try_from(us * i128::from(self.rate) / 1_000_000).unwrap_or(u64::MAX))
     }
 

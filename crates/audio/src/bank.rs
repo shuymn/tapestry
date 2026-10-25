@@ -437,10 +437,11 @@ impl Drop for RawBytes<'_> {
 fn read_capped(
     path: &Path,
     max: u64,
+    sound: SoundId,
     raw: &mut RawBytes<'_>,
     peak: &AtomicU64,
-) -> Result<Vec<u8>, Result<u64, String>> {
-    let file = File::open(path).map_err(|e| Err(e.to_string()))?;
+) -> Result<Vec<u8>, Stop> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
     let hint = file
         .metadata()
         .map_or(0, |m| m.len())
@@ -449,10 +450,16 @@ fn read_capped(
     let mut bytes = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
     file.take(max.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|e| Err(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     raw.set(bytes.capacity() as u64, peak);
     if bytes.len() as u64 > max {
-        return Err(Ok(bytes.len() as u64));
+        return Err(Stop::Cap(BankError::OverCap {
+            cap: Cap::FileSize,
+            found: Found::Declared,
+            sound,
+            amount: bytes.len() as u64,
+            limit: max,
+        }));
     }
     Ok(bytes)
 }
@@ -539,23 +546,10 @@ fn process(i: usize, path: &Path, sound: SoundId, shared: &Shared<'_>) -> Outcom
         return Outcome::Stopped(Stop::Cancelled);
     }
     let mut raw = RawBytes::new(&shared.raw_live);
-    let bytes = match read_capped(
-        path,
-        shared.limits.max_file_bytes,
-        &mut raw,
-        &shared.raw_peak,
-    ) {
+    let max = shared.limits.max_file_bytes;
+    let bytes = match read_capped(path, max, sound, &mut raw, &shared.raw_peak) {
         Ok(bytes) => bytes,
-        Err(Ok(n)) => {
-            return Outcome::Stopped(Stop::Cap(BankError::OverCap {
-                cap: Cap::FileSize,
-                found: Found::Declared,
-                sound,
-                amount: n,
-                limit: shared.limits.max_file_bytes,
-            }));
-        }
-        Err(Err(reason)) => return Outcome::Stopped(Stop::Undecodable(reason)),
+        Err(stop) => return Outcome::Stopped(stop),
     };
     let hash: [u8; 32] = Sha256::digest(&bytes).into();
     {
@@ -602,12 +596,8 @@ fn decode(
         0 | 1 => 1,
         _ => 2,
     };
-    let charged = |src_frames: u64| {
-        pcm_bytes(
-            src_frames.max(device_frames(src_frames, src_rate, shared.rate)),
-            ch,
-        )
-    };
+    // The declared share is returned if this sound is not stored.
+    let mut declared = Reservation::new(&shared.declared, max_bytes);
     if let Some(n) = opened.declared {
         let frames = device_frames(n, src_rate, shared.rate);
         if frames > shared.max_frames {
@@ -619,19 +609,17 @@ fn decode(
                 limit: shared.max_frames,
             }));
         }
-    }
-    // The declared share is returned if this sound is not stored.
-    let mut declared = Reservation::new(&shared.declared, max_bytes);
-    if let Some(n) = opened.declared {
-        declared.resize(charged(n)).map_err(|total| {
-            Stop::Cap(BankError::OverCap {
-                cap: Cap::BankMemory,
-                found: Found::Declared,
-                sound,
-                amount: total,
-                limit: max_bytes,
-            })
-        })?;
+        declared
+            .resize(pcm_bytes(n.max(frames), ch))
+            .map_err(|total| {
+                Stop::Cap(BankError::OverCap {
+                    cap: Cap::BankMemory,
+                    found: Found::Declared,
+                    sound,
+                    amount: total,
+                    limit: max_bytes,
+                })
+            })?;
     }
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&opened.params, &AudioDecoderOptions::default())
