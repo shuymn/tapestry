@@ -7,6 +7,21 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+mod builder;
+mod chart;
+mod clock;
+mod error;
+mod scroll;
+
+pub use builder::ChartBuilder;
+pub use chart::{
+    BgmEvent, Chart, ChartIdentity, ChartMeta, JudgeRank, LANE_COUNT, Lane, LnMode, Note, NoteKind,
+    SoundId, SoundRef,
+};
+pub use clock::{TimeSource, VirtualClock};
+pub use error::ModelError;
+pub use scroll::{Position, ScrollChange, ScrollMap};
+
 /// A point in chart time, in integer microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TimeUs(pub i64);
