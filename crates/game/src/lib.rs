@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 mod logic;
+mod preset;
 mod render;
 mod runner;
 mod sound;
@@ -22,6 +23,7 @@ mod sound;
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };
+pub use preset::{PresetError, load_preset_toml, preset_to_toml};
 pub use render::{PlayView, RenderSide, RenderSink};
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link};

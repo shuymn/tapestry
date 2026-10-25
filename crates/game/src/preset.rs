@@ -1,0 +1,510 @@
+//! Rule presets as TOML files (stage1.md D1, D10). `rules` stays free of
+//! dependencies, so the file's shape lives here as a separate set of types
+//! that convert to and from [`RulePreset`] field by field.
+//!
+//! Times are integer µs and gauge values raw units of 1/100000 %, so a file
+//! round-trips to the same canonical bytes and the same hash.
+
+use std::fmt;
+
+use bms_model::TimeUs;
+use rules::{
+    Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
+    Implementation, JudgeWindows, LateHeadRule, LnBreakRule, LnMode, LnModeRule, LowDamage,
+    MineRule, MissRule, PerJudgment, RankScale, RuleError, RulePreset, SameTimeOrder, ScoreWeights,
+    TotalMode, Window,
+};
+use serde::{Deserialize, Serialize};
+
+/// Why a preset file could not be used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresetError {
+    /// The text is not TOML of the preset's shape.
+    Parse(String),
+    /// The preset failed its validation.
+    Invalid(RuleError),
+}
+
+impl fmt::Display for PresetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(e) => write!(f, "the preset file cannot be read: {e}"),
+            Self::Invalid(e) => write!(f, "the preset is invalid: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PresetError {}
+
+/// Reads a preset from TOML and validates it.
+///
+/// # Errors
+///
+/// [`PresetError::Parse`] for text that is not a preset file, including an
+/// unknown key; [`PresetError::Invalid`] for a preset that fails
+/// [`RulePreset::validate`].
+pub fn load_preset_toml(text: &str) -> Result<RulePreset, PresetError> {
+    let file: PresetFile = toml::from_str(text).map_err(|e| PresetError::Parse(e.to_string()))?;
+    let preset = RulePreset::from(file);
+    preset.validate().map_err(PresetError::Invalid)?;
+    Ok(preset)
+}
+
+/// Writes a preset as TOML that [`load_preset_toml`] reads back to an equal
+/// preset.
+///
+/// # Panics
+///
+/// Never for a preset: every field has a TOML form.
+#[must_use]
+pub fn preset_to_toml(p: &RulePreset) -> String {
+    toml::to_string(&PresetFile::from(p)).expect("every preset field has a TOML form")
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetFile {
+    id: String,
+    version: u32,
+    implementation: ImplementationFile,
+    windows: WindowsFile,
+    miss: MissFile,
+    empty_poor: EmptyPoorFile,
+    ln_break: LnBreakFile,
+    rank_scale: RankScaleFile,
+    default_total_milli: i64,
+    denominator: DenominatorFile,
+    score: ScoreFile,
+    same_time_order: SameTimeOrderFile,
+    assignment: AssignmentFile,
+    ln_mode: LnModeFile,
+    total_mode: TotalModeFile,
+    mine: MineFile,
+    gauges: Vec<GaugeFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+enum ImplementationFile {
+    Standard { version: u32 },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowFile {
+    early_us: i64,
+    late_us: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsFile {
+    perfect: WindowFile,
+    great: WindowFile,
+    good: WindowFile,
+    bad: WindowFile,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MissFile {
+    PoorAfterLateBad,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyPoorFile {
+    ahead_us: i64,
+    breaks_combo: bool,
+    counts_bp: bool,
+    counted: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LnBreakFile {
+    release_margin_us: i64,
+    breaks_combo: bool,
+    counts_bp: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RankScaleFile {
+    rank_milli: [i64; 4],
+    absent_milli: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DenominatorFile {
+    TapsAndLnHeads,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PerJudgmentFile<T> {
+    perfect: T,
+    great: T,
+    good: T,
+    bad: T,
+    poor: T,
+}
+
+impl<T: Copy> PerJudgmentFile<T> {
+    fn map<U>(self, f: impl Fn(T) -> U) -> PerJudgment<U> {
+        PerJudgment {
+            perfect: f(self.perfect),
+            great: f(self.great),
+            good: f(self.good),
+            bad: f(self.bad),
+            poor: f(self.poor),
+        }
+    }
+
+    fn of<U: Copy>(p: &PerJudgment<U>, f: impl Fn(U) -> T) -> Self {
+        Self {
+            perfect: f(p.perfect),
+            great: f(p.great),
+            good: f(p.good),
+            bad: f(p.bad),
+            poor: f(p.poor),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScoreFile {
+    ex: PerJudgmentFile<u32>,
+    breaks_combo: PerJudgmentFile<bool>,
+    counts_bp: PerJudgmentFile<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SameTimeOrderFile {
+    InputsFirst,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AssignmentFile {
+    NearestTiesEarlier,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LnModeFile {
+    default: LnKindFile,
+    late_head: LateHeadFile,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LnKindFile {
+    Ln,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LateHeadFile {
+    CompletesAtPress,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TotalModeFile {
+    ScalesIncrease,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+enum MineFile {
+    WhileHeld { per_unit: i64 },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum DeltaFile {
+    Fixed(i64),
+    TotalShare { num: u32, den: u32 },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+enum GaugeKindFile {
+    EndThreshold { clear: i64 },
+    Survival,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LowDamageFile {
+    below: i64,
+    num: u32,
+    den: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GaugeFile {
+    id: String,
+    kind: GaugeKindFile,
+    start: i64,
+    min: i64,
+    max: i64,
+    change: PerJudgmentFile<DeltaFile>,
+    empty_poor: DeltaFile,
+    ln_break: DeltaFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    low_damage: Option<LowDamageFile>,
+}
+
+const fn window(w: WindowFile) -> Window {
+    Window {
+        early: TimeUs(w.early_us),
+        late: TimeUs(w.late_us),
+    }
+}
+
+const fn window_file(w: Window) -> WindowFile {
+    WindowFile {
+        early_us: w.early.0,
+        late_us: w.late.0,
+    }
+}
+
+const fn delta(d: DeltaFile) -> GaugeDelta {
+    match d {
+        DeltaFile::Fixed(v) => GaugeDelta::Fixed(GaugeValue(v)),
+        DeltaFile::TotalShare { num, den } => GaugeDelta::TotalShare { num, den },
+    }
+}
+
+const fn delta_file(d: GaugeDelta) -> DeltaFile {
+    match d {
+        GaugeDelta::Fixed(v) => DeltaFile::Fixed(v.0),
+        GaugeDelta::TotalShare { num, den } => DeltaFile::TotalShare { num, den },
+    }
+}
+
+impl From<PresetFile> for RulePreset {
+    fn from(f: PresetFile) -> Self {
+        let PresetFile {
+            id,
+            version,
+            implementation,
+            windows,
+            miss,
+            empty_poor,
+            ln_break,
+            rank_scale,
+            default_total_milli,
+            denominator,
+            score,
+            same_time_order,
+            assignment,
+            ln_mode,
+            total_mode,
+            mine,
+            gauges,
+        } = f;
+        Self {
+            id,
+            version,
+            implementation: match implementation {
+                ImplementationFile::Standard { version } => Implementation::Standard { version },
+            },
+            windows: JudgeWindows {
+                perfect: window(windows.perfect),
+                great: window(windows.great),
+                good: window(windows.good),
+                bad: window(windows.bad),
+            },
+            miss: match miss {
+                MissFile::PoorAfterLateBad => MissRule::PoorAfterLateBad,
+            },
+            empty_poor: EmptyPoorRule {
+                ahead: TimeUs(empty_poor.ahead_us),
+                breaks_combo: empty_poor.breaks_combo,
+                counts_bp: empty_poor.counts_bp,
+                counted: empty_poor.counted,
+            },
+            ln_break: LnBreakRule {
+                release_margin: TimeUs(ln_break.release_margin_us),
+                breaks_combo: ln_break.breaks_combo,
+                counts_bp: ln_break.counts_bp,
+            },
+            rank_scale: RankScale {
+                rank_milli: rank_scale.rank_milli,
+                absent_milli: rank_scale.absent_milli,
+            },
+            default_total_milli,
+            denominator: match denominator {
+                DenominatorFile::TapsAndLnHeads => Denominator::TapsAndLnHeads,
+            },
+            gauges: gauges
+                .into_iter()
+                .map(|g| GaugeRule {
+                    id: g.id,
+                    kind: match g.kind {
+                        GaugeKindFile::EndThreshold { clear } => GaugeKind::EndThreshold {
+                            clear: GaugeValue(clear),
+                        },
+                        GaugeKindFile::Survival => GaugeKind::Survival,
+                    },
+                    start: GaugeValue(g.start),
+                    min: GaugeValue(g.min),
+                    max: GaugeValue(g.max),
+                    change: g.change.map(delta),
+                    empty_poor: delta(g.empty_poor),
+                    ln_break: delta(g.ln_break),
+                    low_damage: g.low_damage.map(|l| LowDamage {
+                        below: GaugeValue(l.below),
+                        num: l.num,
+                        den: l.den,
+                    }),
+                })
+                .collect(),
+            score: ScoreWeights {
+                ex: score.ex.map(|v| v),
+                breaks_combo: score.breaks_combo.map(|v| v),
+                counts_bp: score.counts_bp.map(|v| v),
+            },
+            same_time_order: match same_time_order {
+                SameTimeOrderFile::InputsFirst => SameTimeOrder::InputsFirst,
+            },
+            assignment: match assignment {
+                AssignmentFile::NearestTiesEarlier => Assignment::NearestTiesEarlier,
+            },
+            ln_mode: LnModeRule {
+                default: match ln_mode.default {
+                    LnKindFile::Ln => LnMode::Ln,
+                },
+                late_head: match ln_mode.late_head {
+                    LateHeadFile::CompletesAtPress => LateHeadRule::CompletesAtPress,
+                },
+            },
+            total_mode: match total_mode {
+                TotalModeFile::ScalesIncrease => TotalMode::ScalesIncrease,
+            },
+            mine: match mine {
+                MineFile::WhileHeld { per_unit } => MineRule::WhileHeld {
+                    per_unit: GaugeValue(per_unit),
+                },
+            },
+        }
+    }
+}
+
+impl From<&RulePreset> for PresetFile {
+    fn from(p: &RulePreset) -> Self {
+        // Destructured in full, so a new preset field fails to compile until
+        // the file writes it.
+        let RulePreset {
+            id,
+            version,
+            implementation,
+            windows,
+            miss,
+            empty_poor,
+            ln_break,
+            rank_scale,
+            default_total_milli,
+            denominator,
+            gauges,
+            score,
+            same_time_order,
+            assignment,
+            ln_mode,
+            total_mode,
+            mine,
+        } = p;
+        Self {
+            id: id.clone(),
+            version: *version,
+            implementation: match *implementation {
+                Implementation::Standard { version } => ImplementationFile::Standard { version },
+            },
+            windows: WindowsFile {
+                perfect: window_file(windows.perfect),
+                great: window_file(windows.great),
+                good: window_file(windows.good),
+                bad: window_file(windows.bad),
+            },
+            miss: match miss {
+                MissRule::PoorAfterLateBad => MissFile::PoorAfterLateBad,
+            },
+            empty_poor: EmptyPoorFile {
+                ahead_us: empty_poor.ahead.0,
+                breaks_combo: empty_poor.breaks_combo,
+                counts_bp: empty_poor.counts_bp,
+                counted: empty_poor.counted,
+            },
+            ln_break: LnBreakFile {
+                release_margin_us: ln_break.release_margin.0,
+                breaks_combo: ln_break.breaks_combo,
+                counts_bp: ln_break.counts_bp,
+            },
+            rank_scale: RankScaleFile {
+                rank_milli: rank_scale.rank_milli,
+                absent_milli: rank_scale.absent_milli,
+            },
+            default_total_milli: *default_total_milli,
+            denominator: match denominator {
+                Denominator::TapsAndLnHeads => DenominatorFile::TapsAndLnHeads,
+            },
+            score: ScoreFile {
+                ex: PerJudgmentFile::of(&score.ex, |v| v),
+                breaks_combo: PerJudgmentFile::of(&score.breaks_combo, |v| v),
+                counts_bp: PerJudgmentFile::of(&score.counts_bp, |v| v),
+            },
+            same_time_order: match same_time_order {
+                SameTimeOrder::InputsFirst => SameTimeOrderFile::InputsFirst,
+            },
+            assignment: match assignment {
+                Assignment::NearestTiesEarlier => AssignmentFile::NearestTiesEarlier,
+            },
+            ln_mode: LnModeFile {
+                default: match ln_mode.default {
+                    LnMode::Ln => LnKindFile::Ln,
+                },
+                late_head: match ln_mode.late_head {
+                    LateHeadRule::CompletesAtPress => LateHeadFile::CompletesAtPress,
+                },
+            },
+            total_mode: match total_mode {
+                TotalMode::ScalesIncrease => TotalModeFile::ScalesIncrease,
+            },
+            mine: match *mine {
+                MineRule::WhileHeld { per_unit } => MineFile::WhileHeld {
+                    per_unit: per_unit.0,
+                },
+            },
+            gauges: gauges
+                .iter()
+                .map(|g| GaugeFile {
+                    id: g.id.clone(),
+                    kind: match g.kind {
+                        GaugeKind::EndThreshold { clear } => {
+                            GaugeKindFile::EndThreshold { clear: clear.0 }
+                        }
+                        GaugeKind::Survival => GaugeKindFile::Survival,
+                    },
+                    start: g.start.0,
+                    min: g.min.0,
+                    max: g.max.0,
+                    change: PerJudgmentFile::of(&g.change, delta_file),
+                    empty_poor: delta_file(g.empty_poor),
+                    ln_break: delta_file(g.ln_break),
+                    low_damage: g.low_damage.map(|l| LowDamageFile {
+                        below: l.below.0,
+                        num: l.num,
+                        den: l.den,
+                    }),
+                })
+                .collect(),
+        }
+    }
+}

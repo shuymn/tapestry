@@ -42,6 +42,8 @@ windows = "0.62.2"
 
 # game
 triple_buffer = "9.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
 
 # bms-parser and xtask
 encoding_rs = "0.8.42"
