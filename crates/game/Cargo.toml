@@ -8,6 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+audio.workspace = true
 bms-model.workspace = true
 eval.workspace = true
 input.workspace = true

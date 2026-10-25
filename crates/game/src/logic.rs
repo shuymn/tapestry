@@ -422,6 +422,12 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.max_events
     }
 
+    /// Adds a sink after the others, before play: a sink sized from
+    /// [`Self::max_events`] can only be made once the step exists.
+    pub fn add_sink(&mut self, sink: Box<dyn EventSink + Send + 'a>) {
+        self.sinks.push(sink);
+    }
+
     /// The watermark the evaluator last finalized.
     #[must_use]
     pub const fn finalized(&self) -> Option<TimeUs> {

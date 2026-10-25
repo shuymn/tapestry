@@ -2,11 +2,15 @@
 
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
+use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
 use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
 use eval::{
     Binding, ControlId, DeviceProfile, InputKind, JudgeEvent, JudgeEventKind, PhysicalInputEvent,
     SourceId, SourceProfile,
 };
+use game::{Runner, RunnerAudio, Wakes};
 use input::{DeviceKind, ScriptedInput, SourceConfig, autoplay};
 use rules::Judgment;
 
@@ -64,6 +68,37 @@ pub fn window_capacity(start: TimeUs, end: TimeUs, buttons: usize) -> usize {
     buttons * 60 * secs
 }
 
+/// The simulated device's rate and period (10 ms).
+pub const RATE: u32 = 48_000;
+pub const PERIOD: u32 = 480;
+
+/// Sound `i` of `chart` as 480 frames of the constant `1000 + 7 i`.
+pub fn bank(chart: &Chart) -> Arc<SoundBank> {
+    let sounds = (0..chart.sounds.len())
+        .map(|i| Sound::mono(vec![1_000 + 7 * i16::try_from(i).unwrap(); 480]))
+        .collect();
+    Arc::new(SoundBank::from_sounds(RATE, sounds))
+}
+
+/// The runner's audio: an engine with `chart`'s BGM, playing into a steady
+/// simulated device that wakes first at `start`, recording `record_frames`
+/// frames and logging `log` scheduled starts.
+pub fn audio_with(
+    chart: &Chart,
+    start: TimeUs,
+    record_frames: usize,
+    log: usize,
+) -> RunnerAudio<RecordingOutput<SimDevice>> {
+    let engine = AudioEngine::new(bank(chart), &chart.bgm, RATE, PERIOD, MAX_VOICES, log).unwrap();
+    let device = SimDevice::new(SimConfig::steady(RATE, PERIOD, start));
+    RunnerAudio::new(engine, RecordingOutput::new(device, record_frames))
+}
+
+/// [`audio_with`] recording and logging nothing.
+pub fn audio(chart: &Chart, start: TimeUs) -> RunnerAudio<RecordingOutput<SimDevice>> {
+    audio_with(chart, start, 0, 0)
+}
+
 pub fn sources() -> SourceConfig {
     SourceConfig {
         max_devices: 4,
@@ -119,4 +154,23 @@ pub fn count_judged(events: &[JudgeEvent], j: Judgment) -> usize {
         .iter()
         .filter(|e| matches!(e.kind, JudgeEventKind::Judged { judgment, .. } if judgment == j))
         .count()
+}
+
+/// The left channel `runner`'s output recorded.
+pub fn left<O: audio::AudioOutput + Wakes>(runner: &Runner<'_, RecordingOutput<O>>) -> Vec<f32> {
+    runner
+        .audio()
+        .output()
+        .samples()
+        .iter()
+        .step_by(2)
+        .copied()
+        .collect()
+}
+
+/// The frames where sound starts after silence.
+pub fn onsets(left: &[f32]) -> Vec<usize> {
+    (1..left.len())
+        .filter(|&f| left[f - 1] == 0.0 && left[f] != 0.0)
+        .collect()
 }
