@@ -1,0 +1,20 @@
+[package]
+name = "game"
+version = "0.0.0"
+description = "Game core: the logic step, its outputs to rendering, and the headless runner."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bms-model.workspace = true
+eval.workspace = true
+input.workspace = true
+replay.workspace = true
+rules.workspace = true
+rtrb.workspace = true
+triple_buffer.workspace = true
+
+[lints]
+workspace = true
