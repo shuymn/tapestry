@@ -71,6 +71,11 @@ pub struct RunInfo {
     /// Set when the PresentMon CSV could not be parsed to the end; a fixed
     /// category message, never file content.
     pub presentmon_error: Option<String>,
+    /// Unattended session (design §4.3): nobody watched; the owner reviews
+    /// the ingest recording later, so V7's owner confirmation may be
+    /// pending.
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 /// PresentMon's `PresentMode`: how the frame reached the screen.

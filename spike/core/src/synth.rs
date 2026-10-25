@@ -104,6 +104,7 @@ pub fn passing_run() -> RunData {
             mix_rate_hz: 48_000,
             audio_period_us: 10_000,
             presentmon_error: None,
+            unattended: false,
         },
         counters,
         streams: StreamCounts::default(),

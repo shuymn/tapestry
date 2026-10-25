@@ -133,7 +133,11 @@ pub fn complete(dir: &Path, notes: &Path) -> Result<Completed, String> {
         }
         Err(_) => run.info.presentmon_error = Some("no PresentMon capture".into()),
     }
-    if let Ok(log) = std::fs::read_to_string(dir.join(OBS_LOG)) {
+    if let Ok(bytes) = std::fs::read(dir.join(OBS_LOG)) {
+        // OBS writes device names in the system code page, so the log is not
+        // always UTF-8; the lines parsed here are ASCII, so a lossy decode
+        // keeps them (a strict read made the whole session disappear).
+        let log = String::from_utf8_lossy(&bytes);
         // OBS log lines carry a time of day only; their day is placed by the
         // date-aware origin (the log began before the run).
         let base = obslog::first_time_of_day(&log)
@@ -355,8 +359,12 @@ pub fn run(dir: &Path, notes: &Path) -> Result<ExitCode, String> {
     }
     let c = complete(dir, notes)?;
     let (run, origin) = (&c.run, &c.origin);
+    // The obs-websocket password (read from OBS's settings, never stored)
+    // must not leave the PC either.
+    let mut forbidden = c.private_names.clone();
+    forbidden.extend(crate::obsws::password());
     let ctx = ScanContext {
-        forbidden_names: c.private_names.clone(),
+        forbidden_names: forbidden,
         qpc_range: Some((
             origin.qpc_origin as u64,
             origin.qpc_end.max(origin.qpc_origin) as u64,
@@ -577,7 +585,15 @@ mod tests {
                 tod(start_ms - 10_000),
                 tod(start_ms + origin.play_len_us / 1000 + 5_000),
             );
-            std::fs::write(dir.join(OBS_LOG), log).unwrap();
+            // A device name in the system code page (not UTF-8) after the
+            // header line: the session must still be found.
+            let at = log.find('\n').unwrap() + 1;
+            let mut bytes = log.clone().into_bytes();
+            // Same time of day as the header, so the clock does not wrap.
+            let mut line = log.as_bytes()[..14].to_vec();
+            line.extend_from_slice(b"[win-wasapi: '\x83\x51\x81\x5b'] update settings:\n");
+            bytes.splice(at..at, line);
+            std::fs::write(dir.join(OBS_LOG), bytes).unwrap();
             let n = notes(&dir, "vrr = false\n");
             let done = complete(&dir, &n).unwrap();
             let s = done
@@ -589,6 +605,36 @@ mod tests {
             assert_eq!(s.start_lead_ms, Some(10_000));
             assert_eq!(s.post_roll_ms, Some(5_000));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_obs_websocket_password_never_leaves_the_pc() {
+        // OBS's settings under a test APPDATA; nothing else in these tests
+        // reads APPDATA.
+        let dir = run_dir("wspass", Some(r#"{"private_names": ["host-name-x"]}"#));
+        let cfg = dir
+            .join("appdata")
+            .join("obs-studio")
+            .join("plugin_config")
+            .join("obs-websocket");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("config.json"),
+            r#"{"server_enabled": true, "auth_required": true, "server_port": 4455, "server_password": "Zq8xTestSecret"}"#,
+        )
+        .unwrap();
+        // SAFETY: no other test thread reads or writes APPDATA.
+        unsafe { std::env::set_var("APPDATA", dir.join("appdata")) };
+        let n = notes(
+            &dir,
+            "vrr = false
+pc_form = \"desktop Zq8xTestSecret\"
+",
+        );
+        let err = run(&dir, &n).err().unwrap();
+        assert!(err.contains("refused") && err.contains("Name"), "{err}");
+        assert!(!dir.join(export::REPORT).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

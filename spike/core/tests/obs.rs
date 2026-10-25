@@ -754,3 +754,39 @@ fn b_o1_o2_thresholds() {
     assert_eq!(o(36000 - 180, 180, 179), (false, true));
     assert_eq!(o(36000 - 179, 179, 180), (true, false));
 }
+
+#[test]
+fn unattended_runs_are_provisional_until_the_owner_confirms() {
+    let mut run = passing_obs_run();
+    run.owner = spike_core::run::OwnerPublic::default();
+    // Attended: no confirmation is invalid.
+    let s = evaluate(&run);
+    assert!(!s.check("V7").ok);
+    assert_eq!(s.exit_code, 2);
+    // Unattended: pending, provisional, never a pass.
+    run.info.unattended = true;
+    let s = evaluate(&run);
+    assert!(s.check("V7").ok);
+    assert!(s.owner_review_pending);
+    assert_eq!(s.exit_code, spike_core::evaluate::PROVISIONAL_EXIT);
+    let md = spike_core::export::markdown(&s, &run, &Default::default());
+    assert!(md.contains("provisional"), "{md}");
+    // The owner confirms: a pass.
+    run.owner.game_visible = Some(true);
+    run.owner.audio_present = Some(true);
+    let s = evaluate(&run);
+    assert!(!s.owner_review_pending);
+    assert_eq!(s.exit_code, 0);
+    // The owner reports a problem: invalid.
+    run.owner.audio_present = Some(false);
+    assert_eq!(evaluate(&run).exit_code, 2);
+    // A failed gate stays a failure while the review is pending.
+    run.owner = spike_core::run::OwnerPublic::default();
+    run.audio.episodes.push(spike_core::run::Episode {
+        start_us: run.info.timeline.play_start_us + 1_000,
+        end_us: run.info.timeline.play_start_us + 2_000,
+    });
+    let s = evaluate(&run);
+    assert!(s.owner_review_pending);
+    assert_eq!(s.exit_code, 1);
+}

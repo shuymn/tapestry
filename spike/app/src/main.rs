@@ -24,6 +24,7 @@ mod gen_assets;
 mod ingest;
 mod measure;
 mod obs;
+mod obsws;
 mod pacing;
 mod power;
 mod render;
@@ -164,6 +165,7 @@ pub fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             profile: spike_core::run::Profile::Standard,
             kind: spike_core::run::RunKind::Diagnostic,
             obs_encoder: None,
+            unattended: false,
         },
         out: PathBuf::new(),
     };

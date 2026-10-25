@@ -109,6 +109,8 @@ const JSON_KEYS: &[&str] = &[
     "target_period_ms",
     "audio_period_us",
     "presentmon_error",
+    "unattended",
+    "owner_review_pending",
     "notes_total",
     "notes_played",
     "input_overflows",
@@ -687,6 +689,9 @@ pub fn markdown(s: &Summary, run: &RunData, cond: &PublicConditions) -> String {
     let verdict = match s.exit_code {
         0 => "pass",
         1 => "gate failed",
+        crate::evaluate::PROVISIONAL_EXIT => {
+            "provisional: owner review of the ingest recording pending"
+        }
         _ => "invalid",
     };
     let i = &run.info;

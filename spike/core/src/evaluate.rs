@@ -120,6 +120,11 @@ pub struct Summary {
     /// Nominal G1 target (the class, or the cap) and the exact T in ms.
     pub target_hz: Option<u32>,
     pub target_period_ms: Option<f64>,
+    /// An unattended OBS run whose owner review (game visible and audio
+    /// present in the recording) is still open: the result is provisional
+    /// (exit 4), never a pass, until the owner notes confirm it.
+    #[serde(default)]
+    pub owner_review_pending: bool,
     pub validity: Vec<Check>,
     pub gates: Vec<Gate>,
     pub records: Records,
@@ -164,10 +169,13 @@ pub fn evaluate(run: &RunData) -> Summary {
     let (gates, mut records) = gates(run, &tl, target_period_ms);
     records.obs_pre_roll_ms = session(run).and_then(|s| s.connect_lead_ms.max(s.start_lead_ms));
     records.obs_post_roll_ms = session(run).and_then(|s| s.post_roll_ms);
+    let owner_review_pending = owner_review_pending(run);
     let exit_code = if validity.iter().any(|c| !c.ok) {
         2
     } else if gates.iter().any(|g| g.applies && !g.pass) {
         1
+    } else if owner_review_pending {
+        PROVISIONAL_EXIT
     } else {
         0
     };
@@ -176,6 +184,7 @@ pub fn evaluate(run: &RunData) -> Summary {
         refresh_class_hz,
         target_hz,
         target_period_ms,
+        owner_review_pending,
         validity,
         gates,
         records,
@@ -576,10 +585,28 @@ fn v7(run: &RunData) -> Check {
     } else if s.encode_skipped.is_none() && !s.teardown_confirmed {
         r.push("obs-teardown-unconfirmed");
     }
-    if run.owner.game_visible != Some(true) || run.owner.audio_present != Some(true) {
+    // Unattended, an unanswered confirmation is pending (provisional
+    // result), not invalid; a "false" is invalid either way.
+    let o = &run.owner;
+    let answered = o.game_visible.is_some() || o.audio_present.is_some();
+    if (answered || !run.info.unattended)
+        && (o.game_visible != Some(true) || o.audio_present != Some(true))
+    {
         r.push("owner-did-not-confirm-capture");
     }
     check("V7", r)
+}
+
+/// Exit code of a run whose instrumented checks pass while the owner's
+/// review of an unattended OBS run is still open.
+pub const PROVISIONAL_EXIT: u8 = 4;
+
+fn owner_review_pending(run: &RunData) -> bool {
+    let o = &run.owner;
+    run.info.kind == RunKind::Obs
+        && run.info.unattended
+        && o.game_visible.is_none()
+        && o.audio_present.is_none()
 }
 
 /// The times of `rows` (sorted) must reach within `edge` of both ends of

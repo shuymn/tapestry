@@ -41,5 +41,15 @@ Runs (results in runs\<name>; hand off only runs\<name>\export\*.zip)
   gate failure the scripts print the next run (streaming profile, or the next
   audio period).
 
+Unattended sessions (design 4.3; nobody at the PC): prepare the PC once
+(settings as above, other windows closed or minimized off the measured
+monitor, display-off and sleep never on AC), enable OBS's WebSocket server
+(Tools > WebSocket Server Settings, authentication on), and use
+run-obs-unattended.cmd instead of run-obs.cmd. It stops streaming and closes
+OBS by itself and records the ingest to runs\<name>\private\ingest\. Review
+each recording later; until game_visible and audio_present are filled in
+owner-notes.toml and the report rerun, the OBS result is provisional (exit 4),
+never a pass. S0 and R1 run unattended as they are.
+
 Files: bundle-manifest.json lists every file with its SHA-256; licenses\
 holds the FFmpeg (LGPL), PresentMon and MediaMTX (MIT) licenses.

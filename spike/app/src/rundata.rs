@@ -75,6 +75,8 @@ pub struct RunMeta {
     pub profile: Profile,
     pub kind: RunKind,
     pub obs_encoder: Option<spike_core::run::EncoderClass>,
+    /// `measure --unattended` (design §4.3).
+    pub unattended: bool,
 }
 
 /// Display class of an exact refresh rate: 240 for rates near it, else 60.
@@ -123,6 +125,7 @@ pub fn assemble(
             mix_rate_hz: render.map_or(0, |r| r.rate_hz),
             audio_period_us: render.map_or(0, |r| r.period_us),
             presentmon_error: None,
+            unattended: args.meta.unattended,
         },
         counters: Counters {
             notes_total: input.notes_total,

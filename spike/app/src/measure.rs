@@ -28,6 +28,14 @@
 //!    video and audio present; the run is then diagnostic).
 //! 4. `report <out>` then evaluates and exports.
 //!
+//! `--unattended` (design §4.3): nobody is at the PC. OBS starts without
+//! `--minimize-to-tray`; after the run measure stops the stream through
+//! obs-websocket and closes OBS's main window itself (never a kill; if the
+//! WebSocket is unreachable OBS is left running for the owner and measure
+//! fails), and MediaMTX records the ingest to `<out>/private/ingest/` for
+//! the owner's later review. The run is marked unattended, so its V7 owner
+//! confirmation is pending until the owner notes answer it.
+//!
 //! `--dry-run` prints the commands without starting anything.
 
 use crate::run::RunArgs;
@@ -75,6 +83,7 @@ struct Measure {
     ingest: Option<(PathBuf, PathBuf)>,
     ingest_check: bool,
     gpu_power_mode: Option<String>,
+    unattended: bool,
     dry_run: bool,
 }
 
@@ -180,6 +189,31 @@ impl Tool {
             .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
     }
 
+    /// Waits up to `limit` for the process to exit on its own; `false` if
+    /// it is still running.
+    pub fn wait_for(&mut self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            match self.child.as_mut().map(Child::try_wait) {
+                None | Some(Ok(Some(_))) | Some(Err(_)) => {
+                    self.child = None;
+                    return true;
+                }
+                Some(Ok(None)) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        false
+    }
+
+    /// Lets the process run on unowned (it is neither stopped nor killed).
+    pub fn release(&mut self) {
+        self.child = None;
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     /// Stops the process; `Err` if it had to be killed.
     pub fn finish(mut self) -> Result<(), String> {
         self.shutdown()
@@ -266,6 +300,48 @@ pub fn start_ingest(cmd: &mut Command, addr: SocketAddr, limit: Duration) -> Res
     Ok(tool)
 }
 
+/// MediaMTX's recorder settings for every path, writing fragmented MP4
+/// under `dir` (MediaMTX reads `MTX_*` variables over its configuration).
+pub fn record_env(dir: &Path) -> Vec<(&'static str, String)> {
+    let dir = dir.to_string_lossy().replace('\\', "/");
+    vec![
+        ("MTX_PATHDEFAULTS_RECORD", "yes".into()),
+        ("MTX_PATHDEFAULTS_RECORDFORMAT", "fmp4".into()),
+        (
+            "MTX_PATHDEFAULTS_RECORDPATH",
+            format!("{dir}/%path/%Y-%m-%d_%H-%M-%S-%f"),
+        ),
+    ]
+}
+
+/// Whether a process with this image name runs (any user session's view
+/// through `tasklist`).
+fn process_running(image: &str) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_lowercase()
+                .contains(&image.to_lowercase())
+        })
+}
+
+/// Unattended OBS exit: stop the stream through obs-websocket, then close
+/// the main window and wait for OBS to exit by itself.
+fn unattended_exit(obs: &mut Tool) -> Result<(), String> {
+    crate::obsws::stop_stream(Duration::from_secs(20))?;
+    let pid = obs.pid().ok_or("OBS is not running")?;
+    if !crate::obsws::close_main_window(pid) {
+        return Err("no OBS window to close".into());
+    }
+    if obs.wait_for(Duration::from_secs(40)) {
+        Ok(())
+    } else {
+        Err("OBS did not exit after its window was closed".into())
+    }
+}
+
 /// The newest OBS log (`%APPDATA%\obs-studio\logs`).
 fn newest_obs_log() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("APPDATA")?)
@@ -332,6 +408,7 @@ fn parse(args: &[String]) -> Result<(Measure, Option<EncoderClass>, Vec<String>)
         ingest: None,
         ingest_check: false,
         gpu_power_mode: None,
+        unattended: false,
         dry_run: false,
     };
     let mut encoder = None;
@@ -342,6 +419,7 @@ fn parse(args: &[String]) -> Result<(Measure, Option<EncoderClass>, Vec<String>)
         match a.as_str() {
             "--dry-run" => m.dry_run = true,
             "--ingest-check" => m.ingest_check = true,
+            "--unattended" => m.unattended = true,
             "--presentmon" | "--obs" | "--obs-profile" | "--obs-collection" | "--obs-encoder"
             | "--ingest" | "--ingest-config" | "--gpu-power-mode" => {
                 let v = it.next().ok_or(format!("{a} needs a value"))?.clone();
@@ -400,16 +478,21 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         (None, true) => RunKind::Baseline,
     };
     a.meta.obs_encoder = encoder;
+    a.meta.unattended = m.unattended;
     if m.obs.is_some() && !rest.iter().any(|x| x == "--countdown-s") {
         a.countdown_us = OBS_COUNTDOWN_US;
     }
     let private = a.out.join("private");
     let csv = a.out.join(crate::report::PRESENTMON_CSV);
     let pm_args = presentmon_args(&csv);
-    let obs = m
-        .obs
-        .as_ref()
-        .map(|exe| (exe.clone(), obs_args(&m.obs_profile, &m.obs_collection)));
+    let obs = m.obs.as_ref().map(|exe| {
+        let mut args = obs_args(&m.obs_profile, &m.obs_collection);
+        if m.unattended {
+            // Its main window must exist for the closing WM_CLOSE.
+            args.retain(|a| a != "--minimize-to-tray");
+        }
+        (exe.clone(), args)
+    });
     if m.dry_run {
         println!(
             "measure (dry run): kind {:?}, countdown {} s",
@@ -477,14 +560,17 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
             let log =
                 std::fs::File::create(private.join("mediamtx.log")).map_err(|e| e.to_string())?;
             let addr: SocketAddr = INGEST_ADDR.parse().map_err(|_| "ingest address")?;
-            let t = start_ingest(
-                Command::new(exe)
-                    .arg(cfg)
-                    .stdout(log.try_clone().map_err(|e| e.to_string())?)
-                    .stderr(log),
-                addr,
-                INGEST_SETTLE,
-            )?;
+            let mut cmd = Command::new(exe);
+            cmd.arg(cfg)
+                .stdout(log.try_clone().map_err(|e| e.to_string())?)
+                .stderr(log);
+            if m.unattended {
+                // MediaMTX's own recorder, configured for this run only.
+                for (k, v) in record_env(&private.join("ingest")) {
+                    cmd.env(k, v);
+                }
+            }
+            let t = start_ingest(&mut cmd, addr, INGEST_SETTLE)?;
             println!("measure: local ingest listening on {INGEST_ADDR}");
             Some(t)
         }
@@ -520,6 +606,11 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
     // check ends by itself (`Tool::wait`).
     let mut obs_child = None;
     if let Some((exe, args)) = &obs {
+        if process_running("obs64.exe") {
+            // A second OBS only shows "already running"; the running one
+            // belongs to the owner and is never touched.
+            return Err("OBS is already running; close it before an OBS run".into());
+        }
         let dir = exe.parent().unwrap_or(Path::new("."));
         obs_child = Some(Tool::spawn(
             "OBS",
@@ -582,11 +673,22 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
         print!("{text}");
         ingest_ok = status.success();
     }
-    if let Some(child) = obs_child {
-        println!(
-            "measure: stop streaming and exit OBS now (File > Exit); waiting for OBS to close..."
-        );
-        let _ = child.wait();
+    if let Some(mut child) = obs_child {
+        if m.unattended {
+            if let Err(e) = unattended_exit(&mut child) {
+                // Never kill OBS: the stream or OBS stays for the owner.
+                child.release();
+                return Err(format!(
+                    "unattended OBS exit failed ({e}); OBS left running for the owner"
+                ));
+            }
+            println!("measure: stream stopped and OBS closed (unattended)");
+        } else {
+            println!(
+                "measure: stop streaming and exit OBS now (File > Exit); waiting for OBS to close..."
+            );
+            let _ = child.wait();
+        }
         match newest_obs_log() {
             Some(p) => {
                 std::fs::copy(&p, a.out.join(crate::report::OBS_LOG))
@@ -744,6 +846,34 @@ mod tests {
             Some("2.6.0")
         );
         assert_eq!(v("PresentMon.exe"), None);
+    }
+
+    #[test]
+    fn the_ingest_recorder_writes_under_the_run() {
+        let env = record_env(Path::new(r"C:\run\private\ingest"));
+        assert!(env.contains(&("MTX_PATHDEFAULTS_RECORD", "yes".into())));
+        assert!(env.iter().any(|(k, v)| *k == "MTX_PATHDEFAULTS_RECORDPATH"
+            && v.starts_with("C:/run/private/ingest/%path/")
+            && v.contains("%f")));
+    }
+
+    #[test]
+    fn a_released_tool_is_left_running() {
+        let mut t = Tool::spawn(
+            "fake OBS",
+            &mut long_running(),
+            Box::new(kill),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let pid = t.pid().unwrap();
+        assert!(!t.wait_for(Duration::from_millis(200)));
+        t.release();
+        drop(t);
+        assert!(alive(pid));
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
     }
 
     #[test]
