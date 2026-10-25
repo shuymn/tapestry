@@ -20,15 +20,21 @@
 
 mod bank;
 mod clock;
+mod engine;
 mod mixer;
+mod output;
+mod sim;
 
 pub use bank::{
     BankError, BankLimits, BankWarning, Cap, Found, LoadStats, Sound, SoundBank, load_bank,
 };
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
+pub use engine::{AudioEngine, EngineError, Scheduled, ScheduledKind, SoundCmd, StepReport};
 pub use mixer::{
     LIMITER_CEILING, LIMITER_RELEASE_MS, Limiter, MAX_VOICES, Mixer, STEAL_FADE_MS, Started,
 };
+pub use output::{AudioOutput, OutputError, RecordingOutput, Wake};
+pub use sim::{Resume, SimConfig, SimDevice};
 
 /// Channels of every output buffer (interleaved left, right).
 pub const CHANNELS: usize = 2;
