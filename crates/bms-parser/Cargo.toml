@@ -1,0 +1,23 @@
+[package]
+name = "bms-parser"
+version = "0.0.0"
+description = "BMS chart loader: text to a resolved chart model."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bms-model.workspace = true
+chardetng.workspace = true
+encoding_rs.workspace = true
+md-5.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

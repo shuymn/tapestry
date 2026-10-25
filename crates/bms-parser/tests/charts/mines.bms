@@ -1,0 +1,21 @@
+#PLAYER 1
+#TITLE Mines and conflicts
+#BPM 120
+#LNTYPE 1
+#WAV01 click.wav
+#WAV02 clack.wav
+
+*  Key 1: a long note with a mine inside and one at its end (both
+*  dropped), and a mine after it (kept, damage 10).
+#00151:0101
+#001D1:00050500
+#002D1:0A
+*  Key 2: a tap and a long-note start at one time: the long note wins.
+#00112:01
+#00152:0101
+*  Key 3: two taps at one time: the later line wins.
+#00113:01
+#00113:02
+*  Key 4: a tap and a mine at one time: the tap wins.
+#00114:01
+#001D4:05
