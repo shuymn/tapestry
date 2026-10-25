@@ -1,7 +1,7 @@
 //! After construction, a whole play allocates nothing: scripted input,
-//! publication, the logic step, and draining the render side, including a
-//! play whose output is mostly input-driven and an overflow over several
-//! sources.
+//! publication, the logic step, the audio step and draining the render side,
+//! including a play whose output is mostly input-driven and an overflow over
+//! several sources.
 //!
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -97,7 +97,17 @@ fn logic_does_not_allocate_during_play() {
         effects: 4_096,
     };
     let sources = SourceSet::new(common::sources()).unwrap();
-    let mut runner = Runner::new(&chart, &rule, &dev, sources, script, config, START).unwrap();
+    let mut runner = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config,
+        START,
+        common::audio(&chart, START),
+    )
+    .unwrap();
 
     // Three sources each with two inputs inside the watermark, against a
     // shared budget of four (one control event and three disconnect
@@ -158,5 +168,17 @@ fn logic_does_not_allocate_during_play() {
     assert_eq!(runner.effects().len(), stream.len());
     assert_eq!(overflow.aborted, Some(AbortCause::Overflow));
     assert_eq!(overflowing.record().events.len(), 4);
+    // The audio step ran inside the tracked region: every key sound became
+    // a start (the schedule log keeps none, so each start counts as
+    // dropped from it), and the device was fed through the whole play.
+    let sounds = stream
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::PlaySound { .. }))
+        .count();
+    assert_eq!(sounds, 101 + 2_000);
+    let engine = runner.audio().engine();
+    assert_eq!(engine.scheduled_dropped(), sounds as u64);
+    assert_eq!(runner.dropped_sounds(), 0);
+    assert!(engine.written() >= 48 * 11_000, "{}", engine.written());
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 }

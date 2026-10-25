@@ -53,9 +53,142 @@ fn autoplay_runner<'a>(
         script,
         config(chart, effects),
         START,
+        common::audio(chart, START),
     )
     .unwrap();
     (events, runner)
+}
+
+#[test]
+fn autoplay_key_sounds_land_at_their_frames() {
+    // 40 taps 50 ms apart from 1.002 s, sounds 0, 1, 2 in turn; presses
+    // arrive 3 ms after their notes. The device wakes every 10 ms from
+    // START (-1 s), so a press at r lies 5 ms after a wake. It is judged
+    // within 2 ms (the next publication covers it), so the wake at r + 5 ms
+    // takes it; wake j writes from frame (j + 1) × 480, where the sound must
+    // start with its first sample.
+    const N: i64 = 40;
+    let mut b = ChartBuilder::new(150_000).sound("a").sound("b").sound("c");
+    for i in 0..N {
+        let l = lane(u8::try_from(i % 7).unwrap() + 1);
+        b = b.tap(l, TimeUs(1_002 * MS + i * 50 * MS));
+    }
+    let mut chart = b.build().unwrap();
+    for l in &mut chart.lanes {
+        for n in l.iter_mut() {
+            let i = (n.time.0 - 1_002 * MS) / (50 * MS);
+            n.sound = Some(bms_model::SoundId(u16::try_from(i % 3).unwrap()));
+        }
+    }
+    let rule = rules::custom();
+    let dev = device(&[3 * MS]);
+    let (_, script) = autoplay_script(&chart, &dev);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    let audio = common::audio_with(&chart, START, 6 * 48_000, 0);
+    let mut runner = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config(&chart, 256),
+        START,
+        audio,
+    )
+    .unwrap();
+    assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
+    assert_eq!(count_judged(runner.stream(), Judgment::Perfect), N as usize);
+
+    let left: Vec<f32> = runner
+        .audio()
+        .output()
+        .samples()
+        .iter()
+        .step_by(2)
+        .copied()
+        .collect();
+    let onsets: Vec<usize> = (1..left.len())
+        .filter(|&f| left[f - 1] == 0.0 && left[f] != 0.0)
+        .collect();
+    let expected: Vec<usize> = (0..N)
+        .map(|i| {
+            let r = 1_002 * MS + i * 50 * MS + 3 * MS;
+            let j = (r + 5 * MS - START.0) / (10 * MS);
+            usize::try_from((j + 1) * 480).unwrap()
+        })
+        .collect();
+    assert_eq!(onsets, expected);
+    for (i, &f) in expected.iter().enumerate() {
+        // Sound k is the constant 1000 + 7 k (common::bank).
+        let first = f32::from(1_000 + 7 * i16::try_from(i % 3).unwrap()) / 32_768.0;
+        assert_eq!(left[f], first, "note {i}");
+    }
+}
+
+/// A device that wakes like the simulated one but refuses every write.
+struct Lost(audio::SimDevice);
+
+impl audio::AudioOutput for Lost {
+    fn rate(&self) -> u32 {
+        self.0.rate()
+    }
+    fn period(&self) -> u32 {
+        self.0.period()
+    }
+    fn wait(&mut self) -> audio::Wake {
+        self.0.wait()
+    }
+    fn write(&mut self, _f: impl FnOnce(&mut [f32])) -> Result<(), audio::OutputError> {
+        Err(audio::OutputError::DeviceLost)
+    }
+}
+
+impl game::Wakes for Lost {
+    fn next_wake(&self) -> TimeUs {
+        self.0.next_wake()
+    }
+}
+
+#[test]
+fn a_failed_output_stops_the_run() {
+    let (chart, rule, dev) = play();
+    let (_, script) = autoplay_script(&chart, &dev);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    // The device's first wake is 20 ms into the run.
+    let first = TimeUs(START.0 + 20 * MS);
+    let engine = audio::AudioEngine::new(
+        common::bank(&chart),
+        &chart.bgm,
+        common::RATE,
+        common::PERIOD,
+        8,
+        0,
+    )
+    .unwrap();
+    let device = audio::SimDevice::new(audio::SimConfig::steady(
+        common::RATE,
+        common::PERIOD,
+        first,
+    ));
+    let audio = game::RunnerAudio::new(engine, Lost(device));
+    let mut runner = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config(&chart, 64),
+        START,
+        audio,
+    )
+    .unwrap();
+    assert_eq!(
+        runner.run_to_end(TimeUs(MS)),
+        RunOutcome::OutputFailed(audio::OutputError::DeviceLost)
+    );
+    // It stopped at the step that woke the device, not before or after:
+    // that step published `first` − 1 µs, less the 3 ms input offset.
+    assert_eq!(runner.view().finalized, Some(TimeUs(first.0 - 1 - 3 * MS)));
 }
 
 #[test]
@@ -172,7 +305,17 @@ fn aborted_play_records_its_tail_unevaluated() {
         inputs: 64,
         effects: 64,
     };
-    let mut runner = Runner::new(&chart, &rule, &dev, sources, script, config, START).unwrap();
+    let mut runner = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config,
+        START,
+        common::audio(&chart, START),
+    )
+    .unwrap();
     assert_eq!(
         runner.run_to_end(TimeUs(MS)),
         RunOutcome::Aborted(AbortCause::FocusLoss)
@@ -266,7 +409,17 @@ fn removing_the_last_device_aborts_at_the_finalized_watermark() {
         inputs: 64,
         effects: 64,
     };
-    let mut runner = Runner::new(&chart, &rule, &dev, sources, script, config, START).unwrap();
+    let mut runner = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config,
+        START,
+        common::audio(&chart, START),
+    )
+    .unwrap();
     // Steps of 100 ms: the last one before the removal publishes 1 099 999.
     assert_eq!(
         runner.run_to_end(TimeUs(100 * MS)),
@@ -340,6 +493,7 @@ fn event_at_the_opening_belongs_to_the_play() {
         script,
         config,
         TimeUs(opened_at),
+        common::audio(&chart, TimeUs(opened_at)),
     )
     .unwrap();
     assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
@@ -364,12 +518,14 @@ fn start_at_the_earliest_time_is_refused() {
         script,
         config,
         TimeUs(i64::MIN),
+        common::audio(&chart, TimeUs(i64::MIN)),
     );
     assert_eq!(at_min.err(), Some(LogicError::StartAtMinimum));
     let (_, script) = autoplay_script(&chart, &dev);
     let sources = SourceSet::new(common::sources()).unwrap();
     let next = TimeUs(i64::MIN + 1);
-    assert!(Runner::new(&chart, &rule, &dev, sources, script, config, next).is_ok());
+    let audio = common::audio(&chart, next);
+    assert!(Runner::new(&chart, &rule, &dev, sources, script, config, next, audio).is_ok());
 }
 
 #[test]
@@ -397,6 +553,7 @@ fn device_beyond_the_source_limit_marks_the_record_incomplete() {
         script,
         config(&chart, 64),
         START,
+        common::audio(&chart, START),
     )
     .unwrap();
     assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
