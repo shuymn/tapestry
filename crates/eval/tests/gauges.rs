@@ -11,7 +11,7 @@ mod common;
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{MS, device, lane, press, release};
 use eval::{EvalError, EvalInput, Evaluation, InputStart, JudgeEventKind, LnOutcome, evaluate};
-use rules::GaugeValue;
+use rules::{GaugeDelta, GaugeValue, RulePreset};
 
 const BPM: i64 = 150_000;
 
@@ -47,15 +47,28 @@ fn summary(e: &Evaluation) -> Summary {
 }
 
 fn play(chart: &Chart, events: Vec<eval::PhysicalInputEvent>) -> Evaluation {
+    play_with(chart, &rules::custom(), events)
+}
+
+fn play_with(
+    chart: &Chart,
+    rule: &RulePreset,
+    events: Vec<eval::PhysicalInputEvent>,
+) -> Evaluation {
     let input = EvalInput {
         events,
         device: device(&[0]),
         start: InputStart::default(),
         finalized: None,
     };
-    let e = evaluate(chart, &input, &rules::custom()).unwrap();
+    let e = evaluate(chart, &input, rule).unwrap();
     assert!(e.completed);
     e
+}
+
+/// A gauge's values after each change.
+fn history(e: &Evaluation, gauge: usize) -> Vec<i64> {
+    e.gauges[gauge].history.iter().map(|p| p.value.0).collect()
 }
 
 fn ln_ends(e: &Evaluation) -> Vec<(i64, LnOutcome)> {
@@ -159,9 +172,29 @@ fn late_head_after_short_ln_end() {
     assert_eq!(ln_ends(&e), [(1_100 * MS, LnOutcome::Completed)]);
 
     // Pressed exactly at the end (+50 ms, GOOD): completed at the press.
+    // The press itself ends it, right after its judgment and gauges, not
+    // the LN end deadline at the same time.
     let e = play(&chart, vec![press(1_050 * MS, 0, 2)]);
     assert_eq!(ln_ends(&e), [(1_050 * MS, LnOutcome::Completed)]);
     assert_eq!(e.tally.counts.good, 1);
+    let at_end: Vec<_> = e
+        .events
+        .iter()
+        .filter(|ev| ev.time == TimeUs(1_050 * MS))
+        .map(|ev| (ev.kind, ev.origin))
+        .collect();
+    assert!(matches!(at_end[0].0, JudgeEventKind::Judged { .. }));
+    assert!(matches!(
+        at_end[1].0,
+        JudgeEventKind::Gauge { gauge: 0, .. }
+    ));
+    assert!(matches!(
+        at_end[2].0,
+        JudgeEventKind::Gauge { gauge: 1, .. }
+    ));
+    assert!(matches!(at_end[3].0, JudgeEventKind::LnEnd { .. }));
+    assert_eq!(at_end[3].1, Some(TimeUs(1_050 * MS)));
+    assert_eq!(at_end.len(), 4);
 }
 
 #[test]
@@ -298,6 +331,121 @@ fn empty_poor_full_result() {
             survival: 9_566_000,
         }
     );
+    // The cap hides the empty POOR in the final value; the history shows it.
+    assert_eq!(history(&e, 0), [10_000_000, 9_700_000, 10_000_000]);
+    assert_eq!(history(&e, 1), [10_000_000, 9_550_000, 9_566_000]);
+}
+
+#[test]
+fn poor_ln_end_and_held_mine_at_one_time() {
+    // At 2180 ms a tap misses (lane 3), a held LN ends (lane 2), and a held
+    // 10-unit mine passes (lane 4). Survival is at 34 % before them: the
+    // POOR takes full damage (34 → 25 %), then the mine its full 5 %
+    // (→ 20 %). A halved mine would leave 22.5 %; the mine first, 24.5 %.
+    let chart = ChartBuilder::new(BPM)
+        .long(lane(2), TimeUs(300 * MS), TimeUs(2_180 * MS))
+        .mine(lane(1), TimeUs(500 * MS), 132)
+        .tap(lane(3), TimeUs(2_000 * MS))
+        .mine(lane(4), TimeUs(2_180 * MS), 10)
+        .build()
+        .unwrap();
+    let e = play(
+        &chart,
+        vec![
+            press(300 * MS, 0, 2), // head PERFECT: 10_000_000 (capped) both
+            press(400 * MS, 0, 1), // mine of 66 %: 3_400_000 both
+            release(600 * MS, 0, 1),
+            press(2_100 * MS, 0, 4),
+        ],
+    );
+    assert_eq!(
+        summary(&e),
+        Summary {
+            counts: [1, 0, 0, 0, 1],
+            combo: 0,
+            max_combo: 1,
+            ex: 2,
+            bp: 1,
+            ln_breaks: 0,
+            empty_poor: 0,
+            normal: 2_300_000,
+            survival: 2_000_000,
+        }
+    );
+    let at: Vec<_> = e
+        .events
+        .iter()
+        .filter(|ev| ev.time == TimeUs(2_180 * MS))
+        .map(|ev| ev.kind)
+        .collect();
+    let g = |gauge, value| JudgeEventKind::Gauge {
+        gauge,
+        value: GaugeValue(value),
+        reference: GaugeValue(value),
+    };
+    assert_eq!(
+        at,
+        [
+            JudgeEventKind::Judged {
+                lane: lane(3),
+                note: 0,
+                judgment: rules::Judgment::Poor,
+                deviation: None,
+                combo: 0,
+            },
+            g(0, 2_800_000),
+            g(1, 2_500_000),
+            JudgeEventKind::LnEnd {
+                lane: lane(2),
+                note: 0,
+                outcome: LnOutcome::Completed,
+            },
+            JudgeEventKind::MineHit {
+                lane: lane(4),
+                note: 0,
+            },
+            g(0, 2_300_000),
+            g(1, 2_000_000),
+            JudgeEventKind::SongEnd,
+        ]
+    );
+}
+
+#[test]
+fn reduced_odd_damage_floors_with_its_sign() {
+    // Survival POOR of −3 units, taken below 30 %: −3 / 2 = −1.5, floored
+    // to −2.
+    let mut rule = rules::custom();
+    rule.gauges[1].change.poor = GaugeDelta::Fixed(GaugeValue(-3));
+    let chart = ChartBuilder::new(BPM)
+        .mine(lane(1), TimeUs(500 * MS), 141)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let e = play_with(
+        &chart,
+        &rule,
+        vec![press(400 * MS, 0, 1), release(600 * MS, 0, 1)],
+    );
+    assert_eq!(history(&e, 1), [2_950_000, 2_949_998]);
+}
+
+#[test]
+fn non_positive_total_counts_as_absent() {
+    // Five taps: with #TOTAL 160 the increment is 3_200_000.
+    let mut chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(1), TimeUs(2_000 * MS))
+        .tap(lane(1), TimeUs(3_000 * MS))
+        .tap(lane(1), TimeUs(4_000 * MS))
+        .tap(lane(1), TimeUs(5_000 * MS))
+        .build()
+        .unwrap();
+    for total in [None, Some(0), Some(-1), Some(-160_000)] {
+        chart.meta.total_milli = total;
+        let e = play(&chart, vec![press(1_000 * MS, 0, 1)]);
+        assert_eq!(history(&e, 0)[0], 5_200_000, "{total:?}");
+    }
 }
 
 /// A mine of `units` (0.5 % each) held at 500 ms, then one unhit tap.
