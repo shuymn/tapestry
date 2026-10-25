@@ -437,13 +437,13 @@ From stage 1, the frame time distribution (not just the average, but also the sl
 
 ## Performance
 
-Performance is not something optimized all at once at the end, but a constraint kept from the start. The target is that, in the heaviest scene, frames reach the screen on the refreshes the target frame rate asks for, with missed deadlines within the frame pacing budget, for a 60 Hz display on the reference PC (for example a laptop with an iGPU) and a 240 Hz display on a mid-range PC. The target is treated as a value under fixed conditions: hardware, display mode, the GPU's power management setting, output and render resolutions, chart and skin, measurement duration, and measurement windows. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
+Performance is not something optimized all at once at the end, but a constraint kept from the start. The target is that, in the heaviest scene, frames reach the screen on the refreshes the target frame rate asks for, with missed target opportunities within the frame pacing budget, for a 60 Hz display on the reference PC (for example a laptop with an iGPU) and a 240 Hz display on a mid-range PC. The target is treated as a value under fixed conditions: hardware, display mode, the GPU's power management setting, output and render resolutions, chart and skin, measurement duration, and measurement windows. Maximums cannot be guaranteed on Windows, so the maximum is an indicator for investigating causes.
 
 ### Budget
 
 | Metric | Target |
 | --- | --- |
-| Frame pacing | Missed deadlines at most 0.1% of the target intervals, counted in whole refreshes ("Frame Pacing in Refreshes") |
+| Frame pacing | Missed target opportunities at most 0.1% of the expected opportunities, counted in whole refreshes ("Frame Pacing in Refreshes") |
 | Render CPU work (including skin evaluation and BGA upload commands) | 1.5 ms |
 | GPU | 2 ms, with the GPU in its performance state ("GPU Power State") |
 | Input to judgment | 1 ms or less |
@@ -457,15 +457,16 @@ Judgment and audio run on threads separate from rendering, so the score does not
 
 A display with a fixed refresh rate can only show a new frame on a refresh, so frame pacing is counted in whole refreshes rather than judged by a percentile in milliseconds.
 
+- **Eligibility**: The metric applies only to a fixed refresh rate with vsync: VRR off, tearing not allowed, a display mode in the 60 Hz or 240 Hz class, and either no frame rate cap or a cap that divides the nominal rate exactly. In any other configuration (VRR, tearing, a cap that does not divide the nominal rate, a mode outside both classes) the metric is not applicable: results and the in-game display show it as N/A, never as zero misses. The standard profile with VRR and a cap slightly below the top of the VRR range is outside this metric; budget measurements run the standard profile with VRR off, where it presents at the refresh rate with vsync. How to judge pacing under VRR is an open question.
 - **Refresh period T**: One refresh period of the display mode actually in use, from its exact refresh rate (16.680 ms at 59.951 Hz, 4.165 ms at 240.085 Hz). Modes offered as 60 Hz or 240 Hz are rarely exact; a mode belongs to the 60 Hz or 240 Hz class when it is within ±0.1% of the nominal rate (59.94–60.06 Hz, 239.76–240.24 Hz). The nominal 1/60 s (16.67 ms) and 1/240 s (4.17 ms) are only for orientation.
-- **Target interval**: k refreshes, where k = 1 without a frame rate cap, and k = nominal rate ÷ cap with a cap (caps divide the nominal rate exactly; a 120 fps cap on a 240 Hz display is k = 2).
-- **Counting**: Each displayed frame's interval (from PresentMon, the interval between display changes) counts as n refreshes, the nearest whole number to interval ÷ T. The timestamp tolerance is 0.5 ms: if the p99 of |interval − n × T| exceeds it, the display is not running on a fixed refresh grid (VRR or composition), and the run is not valid for this metric.
-- **Missed deadline**: A displayed interval with n > k, or a presented frame that is never displayed.
-- **Budget**: Missed deadlines in the measurement windows are at most 0.1% of the target intervals in those windows (for example, 240 s of heavy-scene windows at 240 Hz hold about 57,600 target intervals, so at most 57). The count is always recorded, and the in-game measurement display shows it.
+- **Target interval**: k refreshes, where k = 1 without a cap and k = nominal rate ÷ cap with a cap (a 120 fps cap on a 240 Hz display is k = 2).
+- **Expected opportunities**: A measurement window [a, b) on the display timeline holds floor((b − a) ÷ (k × T)) target opportunities. The denominator of the budget is the sum over the measurement windows.
+- **Counting a displayed interval**: Displayed frames are taken in display-time order (from PresentMon). The interval Δ between two consecutive displayed frames counts as n refreshes, the nearest whole number to Δ ÷ T. It loses L = ceil(n ÷ k) − 1 opportunities when n > k, otherwise none (at k = 1 an interval of n refreshes loses n − 1). The lost opportunities are the times d + j × k × T for j = 1 … L after the earlier frame's display time d, and only those inside a measurement window count toward it, so an interval that crosses a window boundary is clipped.
+- **Off-grid intervals**: An interval with |Δ − n × T| above the timestamp tolerance of 0.5 ms is off-grid and also counts as one missed opportunity. If more than 0.1% of the displayed intervals in the measurement windows are off-grid, the display is not running on a fixed refresh grid (VRR, composition), and the run is invalid for this metric.
+- **Never-displayed presents**: A present that never reaches the screen has no display time, so it is placed by the time of its Present call. If that time falls between two displayed frames whose interval already lost an opportunity, it is not counted again; otherwise it counts as one missed opportunity, in the window that contains its Present call.
+- **Budget**: Missed opportunities are at most 0.1% of the expected opportunities, rounded down. For example, eight 30 s heavy-scene windows at 240.085 Hz hold 8 × 7,202 = 57,616 opportunities without a cap (at most 57 missed) and 8 × 3,601 = 28,808 with a 120 fps cap (at most 28). The count is always recorded, and the in-game measurement display shows it.
 
-The reason is timestamp jitter. In stage 0, with the GPU in its performance state, the p99 interval exceeded T by 0.03–0.07 ms in every run while no refresh was missed without streaming software, and intervals of late frames stayed within 0.1 ms of a whole number of refreshes. A p99 threshold at exactly T fails such runs on jitter alone, yet lets 1% of intervals be real misses; the refresh count ignores the jitter and allows a tenth of that.
-
-This metric assumes a fixed refresh rate, so frame pacing is measured with VRR off. How to judge pacing under VRR is an open question.
+The reason is timestamp jitter. In stage 0, with the GPU held in its top performance state, the p99 interval exceeded T by 0.03–0.07 ms in every run while no refresh was missed without streaming software, and intervals of late frames stayed within 0.1 ms of a whole number of refreshes. A p99 threshold at exactly T fails such runs on jitter alone, yet lets 1% of intervals be real misses and counts a long stall as a single interval. Counting lost opportunities ignores the jitter, counts every refresh a stall covers, and allows a tenth of that.
 
 ### Bounding Work by Structure
 
@@ -492,9 +493,9 @@ The frame pacing and GPU budgets are measured with the GPU in its performance st
 Measured in stage 0 on a discrete GPU:
 
 - **Default driver settings**: During play the GPU stayed in low performance states (P5 and P8) at about 30% utilization. At 240 Hz, GPU time reached about 4.5 ms at p99 and 3.5% of the heavy-scene intervals missed a refresh, every miss a frame whose GPU work ended after the vblank. At 60 Hz no refresh was missed, but GPU time was still about 5.5 ms at p99.
-- **Driver's per-application power management at maximum performance**: The GPU held its top state (P0), GPU time stayed under 1 ms at p99 without streaming software, and the misses disappeared.
+- **Power management at maximum performance**: With the driver's per-application setting at maximum performance for the exact executable measured, two 60 s runs (240 Hz and 60 Hz) held the top state (P0) throughout, GPU time stayed under 1 ms at p99, and no refresh was missed. The later 600 s runs, with the setting applied globally, also held P0 throughout with no refresh missed without streaming software.
 - **Startup**: P0 appears around startup under the default settings too.
-- **GPU-bound window**: A windowed 1920×1080 run that was GPU-bound (30–60 fps, GPU time about 5 ms at p50) still stayed in P8. This contradicts the explanation that the driver keeps clocks low because the load is light.
+- **Heavier window**: A windowed 1920×1080 run at 30–60 fps with GPU time about 5 ms at p50 still stayed in P8. Whether that run was GPU-bound is not established, so it neither confirms nor rules out that the driver keeps clocks low because the load is light; it is a reason to test load directly.
 
 Candidate causes, none tested:
 
@@ -502,22 +503,22 @@ Candidate causes, none tested:
 - The game makes no clock request of its own (for example the boost mode of a GPU vendor's low-latency SDK).
 - A load-based driver policy that the measurements so far do not explain.
 
-Experiments that decide it, each recording the performance state over time, clocks, GPU time, and missed deadlines under the default settings:
+Experiments that decide it, each recording the performance state over time, clocks, GPU time, and missed opportunities under the default settings:
 
 - A load sweep in fullscreen and in a window, from startup on, to see what drops the state and whether load ever raises it again.
 - Reading whether Windows recognizes the game as a game, then repeating the run after marking it as one through the Game Bar ("remember this is a game").
 - Repeating the run with a vendor low-latency SDK's boost mode on and off.
 - Repeating the deciding runs on the reference class and on another GPU vendor.
 
-Options for meeting the budget, kept as candidates until the cause is known. The descriptions come from general knowledge and are unverified:
+Options for meeting the budget, kept as candidates until the cause is known. Apart from the stable power state, which is ruled out by its documentation, the descriptions come from general knowledge and are unverified:
 
-| Option | What it would give | Cost or doubt (unverified) |
+| Option | What it would give | Cost or doubt |
 | --- | --- | --- |
-| Fix the clocks from the game (D3D12 stable power state) | No settings for the player | Said to work only in Windows developer mode, to be meant for profiling, and to fix clocks at a base value rather than the top state |
+| Fix the clocks from the game (D3D12 stable power state) | — | Ruled out as a shipping remedy: Microsoft documents `ID3D12Device::SetStablePowerState` as for development only, and calling it without Windows developer mode removes the device |
 | Make the game recognized as a game, or request clocks through a vendor SDK | Performance state without player action, if recognition or the request is the cause | Vendor-specific; depends on the experiments above |
 | Write the driver's application profile from the game | Performance state without player action | Vendor-specific, and changes settings outside the game (against "Coexisting with Other Software") |
-| Add GPU work so the driver raises clocks | Might work under the default settings | The GPU-bound window run stayed in P8, so load may not raise the state; spends power and GPU time that other software needs |
-| Render one more frame ahead when misses are detected | On time at low clocks while GPU time fits within two refreshes | One more refresh of display latency, and display latency changes during a session |
+| Add GPU work so the driver raises clocks | Might work under the default settings | The heavier window run stayed in P8, which hints that load may not raise the state (unverified); spends power and GPU time that other software needs |
+| Render one more frame ahead when misses are detected | Absorbs occasional overruns, but only when sustained throughput already meets the target (sustained 5 ms of GPU work per frame supports only 200 fps at 240 Hz) | One more refresh of display latency, and display latency changes during a session |
 | State the requirement, detect, and guide the player | No settings changed by the game | Under the default settings, 240 Hz misses until the player changes the setting |
 
 ### Memory Budget
@@ -531,7 +532,7 @@ Budgets are set for each of decoded audio (about 115 MB per 10 minutes at 2 chan
 
 ### Measurement
 
-- In game, the frame time distribution (p99 and maximum), the number of missed deadlines, GPU time, the latency from input to judgment, and the number of audio dropouts can be displayed at any time.
+- In game, the frame time distribution (p99 and maximum), the number of missed target opportunities (N/A where that metric does not apply), GPU time, the latency from input to judgment, and the number of audio dropouts can be displayed at any time.
 - A benchmark scene plays back a fixed input log with the worst-case chart and skin, and it is measured regularly on the reference PC.
 - CPU-side time (evaluator, skin evaluation, loading) is measured as benchmarks (criterion) in CI to detect large regressions. Measurements on shared CI fluctuate, so pass/fail on absolute values is decided on a fixed dedicated PC.
 - For detailed investigation, per-span times are inspected with Tracy (`tracy-client`).
@@ -571,8 +572,8 @@ The rules above are a commitment for the standard settings. Only when players ch
 Measure with the following conditions fixed, and confirm that both sides meet the criteria. The concrete values are decided in stage 0 and written into this section.
 
 - **Conditions**: The reference PC, the game's output and render resolutions and refresh rate, the OBS scene (game capture plus about one browser source), the OBS output (1080p, 60 fps), the encoder (both hardware such as NVENC, and x264) and its settings, and the measurement duration (10 minutes or more, including the heaviest chart). The state of Windows Game Mode is left unchanged and recorded.
-- **Game side**: Under that settings profile, the presented frame interval, the latency from input to judgment, and the number of audio dropouts.
-- **OBS side**: In the OBS statistics, the percentages of frames dropped due to rendering lag and frames dropped due to encoding lag. Upper bounds are set on these (for example under 0.5% each).
+- **Game side**: Under that settings profile, frame pacing judged as in "Frame Pacing in Refreshes" (same eligibility, counting, and budget), the latency from input to judgment within its budget, and zero audio dropouts.
+- **OBS side**: In the OBS statistics, the percentage of frames lagged due to rendering (lagged ÷ attempted drawn frames) and of frames skipped due to encoding lag (skipped ÷ total frames). Proposed bound: under 0.5% each, pending the stage 0 close, which writes the decided thresholds and denominators here.
 - For configurations where both sides cannot meet the criteria with the standard settings, the streaming settings are recommended.
 
 ### Settings for Low-End PCs
