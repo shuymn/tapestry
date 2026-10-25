@@ -492,7 +492,7 @@ Even if the CPU and GPU times are within budget, presentation is not necessarily
 
 ### GPU Power State
 
-The play scene is a light load for a discrete GPU, so under the driver's default power management the GPU stays in a low performance state with low core and memory clocks. In stage 0, at the default setting, GPU time reached about 4.5 ms at p99 and 3.5% of the 240 Hz heavy-scene intervals missed a refresh, every miss a frame whose GPU work ended after the vblank. At 60 Hz no refresh was missed, but GPU time was still about 5.5 ms. With the driver's per-application setting at maximum performance, the GPU held its top state, GPU time stayed under 1 ms at p99, and no refresh was missed.
+The play scene is a light load for a discrete GPU, so under the driver's default power management the GPU stays in a low performance state with low core and memory clocks. In stage 0, at the default setting, GPU time reached about 4.5 ms at p99 and 3.5% of the 240 Hz heavy-scene intervals missed a refresh, every miss a frame whose GPU work ended after the vblank. At 60 Hz no refresh was missed, but GPU time was still about 5.5 ms. With the driver's per-application setting at maximum performance, the GPU held its top state, GPU time stayed under 1 ms at p99 without streaming software, and no refresh was missed.
 
 | Option | What it gives | Why not, or the cost |
 | --- | --- | --- |
