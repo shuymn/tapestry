@@ -9,7 +9,7 @@ use crate::{
     Arrival, BuildProvenance, ChartRecord, DecodeError, DecodeLimits, DeviceKind, DeviceRecord,
     EndStatus, FORMAT_VERSION, Incomplete, MAGIC, PlayRecord, PlayType, PresetRecord,
     ReceiveMethod, Section, SourceRecord, Status, Versions, body_bytes, decode, encode,
-    preset_hash, write_events,
+    preset_hash, write_events, write_status,
 };
 
 fn lane(i: u8) -> Lane {
@@ -333,7 +333,7 @@ fn section_length_beyond_remaining_bytes_is_an_error() {
 fn golden() -> PlayRecord {
     PlayRecord {
         versions: Versions {
-            evaluator: 1,
+            evaluator: 3,
             app: "0.1.0".to_owned(),
             provenance: BuildProvenance::Production,
         },
@@ -342,7 +342,7 @@ fn golden() -> PlayRecord {
                 sha256: [0xa1; 32],
                 md5: [0xb2; 16],
                 resolved_hash: [0xc3; 32],
-                loader_version: 1,
+                loader_version: 5,
                 random_results: vec![3, 1],
             },
             random_seed: 42,
@@ -395,7 +395,7 @@ fn golden() -> PlayRecord {
 
 /// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
 /// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "aa9fcd9fe8d4d682b282e1ca985699ab2fe38866b340780182594e8b0e422e29";
+const GOLDEN_BODY_SHA256: &str = "76fb2f3e8da15b092e4359fc07f3a78574bda0cafa48ddbb7a41435fbb49815e";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -482,4 +482,147 @@ fn preset_hash_is_sha256_of_canonical_bytes() {
         decode(&encode(&bad), &limits()),
         Err(DecodeError::PresetHashMismatch)
     );
+}
+
+#[test]
+fn status_reasons_and_end_statuses_are_pinned() {
+    let status = |end, overflow, source_limit, suspend| Status {
+        end,
+        finalized: TimeUs(-2),
+        incomplete: Incomplete {
+            overflow,
+            source_limit,
+            suspend,
+        },
+    };
+    // End status tag, zigzag finalized watermark (-2 is 3), reason bits.
+    let cases = [
+        (
+            status(EndStatus::PlayedToEnd, false, false, false),
+            [0, 3, 0],
+        ),
+        (
+            status(EndStatus::EndedMidway, false, false, false),
+            [1, 3, 0],
+        ),
+        (
+            status(EndStatus::EndedMidway, true, false, false),
+            [1, 3, 1],
+        ),
+        (
+            status(EndStatus::EndedMidway, false, true, false),
+            [1, 3, 2],
+        ),
+        (
+            status(EndStatus::EndedMidway, false, false, true),
+            [1, 3, 4],
+        ),
+    ];
+    for (s, bytes) in cases {
+        let mut w = Writer::default();
+        write_status(&mut w, &s);
+        assert_eq!(w.0, bytes, "{s:?}");
+        let mut rec = sample(9);
+        rec.status = s;
+        assert_eq!(decode(&encode(&rec), &limits()), Ok(rec));
+    }
+}
+
+#[test]
+fn lowered_limits_refuse_files_sources_and_events() {
+    let rec = sample(30);
+    let file = encode(&rec);
+    let exact = DecodeLimits {
+        max_compressed: file.len(),
+        max_uncompressed: DecodeLimits::STANDARD.max_uncompressed,
+        max_sources: 3,
+        max_events: 30,
+    };
+    assert_eq!(decode(&file, &exact), Ok(rec));
+    let below = |change: fn(&mut DecodeLimits)| {
+        let mut l = exact;
+        change(&mut l);
+        decode(&file, &l)
+    };
+    assert_eq!(
+        below(|l| l.max_compressed -= 1),
+        Err(DecodeError::FileTooLarge {
+            len: file.len(),
+            max: file.len() - 1,
+        })
+    );
+    assert_eq!(
+        below(|l| l.max_sources = 2),
+        Err(DecodeError::TooManySources(3))
+    );
+    assert_eq!(
+        below(|l| l.max_events = 29),
+        Err(DecodeError::TooManyEvents(30))
+    );
+}
+
+/// The payloads of `body`'s sections, in order.
+fn split_sections(body: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        out.push(rest[4..4 + len].to_vec());
+        rest = &rest[4 + len..];
+    }
+    assert_eq!(out.len(), 9);
+    out
+}
+
+fn join_sections(sections: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for s in sections {
+        body.extend_from_slice(&u32::try_from(s.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(s);
+    }
+    body
+}
+
+#[test]
+fn forged_counts_are_refused_before_allocating() {
+    let sections = split_sections(&body_bytes(&sample(9)));
+    let huge = u64::MAX >> 4;
+    let no_event_limit = DecodeLimits {
+        max_events: u64::MAX,
+        ..limits()
+    };
+    let payload = |prefix: &[u8], n: u64, suffix: &[u8]| {
+        let mut w = Writer::default();
+        w.raw(prefix);
+        w.uint(n);
+        w.raw(suffix);
+        w.0
+    };
+    let beyond = DecodeError::CountBeyondData;
+    // (section index, forged payload, expected error, limits)
+    let cases = [
+        // The app version string's length, after two versions.
+        (0, payload(&[3, 5], huge, &[]), beyond(huge), limits()),
+        // `#RANDOM` results, after the three hashes and the seed.
+        (1, payload(&[0; 81], huge, &[]), beyond(huge), limits()),
+        // Five sources take at least 20 bytes; none are left.
+        (4, payload(&[], 5, &[]), beyond(5), limits()),
+        // Held controls, after `opened_at`.
+        (5, payload(&[0], huge, &[]), beyond(huge), limits()),
+        // Events, with the event limit out of the way.
+        (6, payload(&[], huge, &[]), beyond(huge), no_event_limit),
+        // Two events take at least six bytes; five are left.
+        (6, payload(&[], 2, &[0, 0, 1, 0, 0]), beyond(2), limits()),
+        // Arrivals.
+        (7, payload(&[], huge, &[]), beyond(huge), limits()),
+    ];
+    for (index, forged_payload, expected, lim) in cases {
+        let mut forged = sections.clone();
+        forged[index] = forged_payload;
+        assert_eq!(
+            decode(&wrap(&join_sections(&forged), 3), &lim),
+            Err(expected),
+            "section {index}"
+        );
+    }
 }

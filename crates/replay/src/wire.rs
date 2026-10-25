@@ -193,6 +193,9 @@ mod tests {
         // Eleven bytes.
         let eleven = [0xff; 11];
         assert_eq!(Reader::new(&eleven).uint(), Err(DecodeError::BadVarint));
+        // Ten bytes whose payload fits but whose tenth byte continues: the
+        // length limit, not the end of the data, refuses it.
+        assert_eq!(Reader::new(&[0x80; 10]).uint(), Err(DecodeError::BadVarint));
         assert_eq!(Reader::new(&[0x80]).uint(), Err(DecodeError::Truncated));
     }
 }
