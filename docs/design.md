@@ -60,7 +60,7 @@ This is a game, and the correctness of judgment is merely the foundation for "be
 | --- | --- | --- |
 | From press to key sound | 10 ms or less on the low-latency path; shared mode follows the device period ("Path from Press to Sound") | Audio latency is felt as "heavy" before judgment deviation is |
 | From press to judgment and bomb appearing on screen | 1–2 frames | The feel of a press is determined by the screen's response |
-| Frame stability | Within the frame pacing budget ("Frame Pacing in Refreshes"), not literally no drops: one interval may lose up to 2 refresh opportunities (8.3 ms at 240 Hz, 33 ms at 60 Hz without a cap) | Even a momentary hitch in the note flow breaks reading |
+| Frame stability | No drops at 144/240 Hz, held as the frame pacing budget ("Frame Pacing in Refreshes"): one interval may still lose up to 2 refresh opportunities (8.3 ms at 240 Hz, 33 ms at 60 Hz without a cap). The budget is measured and gated at the 60 Hz and 240 Hz classes; 144 Hz follows the same refresh-count definition without a measured class of its own yet | Even a momentary hitch in the note flow breaks reading |
 | From song selection to play start | 1–2 seconds | It is a game you replay many times, so waiting time turns directly into frustration |
 | Retry | One action, instant | Repeating the same chart is the core of play |
 
