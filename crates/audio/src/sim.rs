@@ -95,8 +95,17 @@ pub struct SimDevice {
 
 impl SimDevice {
     /// A device with `cfg`.
+    ///
+    /// # Panics
+    ///
+    /// If `cfg` queues no frames (`queue_periods` or `period` is zero) or
+    /// its rate is zero: such a device could never be written to.
     #[must_use]
     pub fn new(cfg: SimConfig) -> Self {
+        assert!(
+            cfg.queue_periods > 0 && cfg.period > 0 && cfg.rate > 0,
+            "a simulated device needs a nonzero rate, period and queue"
+        );
         let buf = vec![0.0; (cfg.queue_periods * cfg.period) as usize * CHANNELS];
         let mut dev = Self {
             rng: cfg.seed,

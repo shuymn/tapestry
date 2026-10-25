@@ -194,6 +194,12 @@ impl Mixer {
         self.dropped_starts
     }
 
+    /// Starts waiting to be applied.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Whether another start can wait to be applied.
     #[must_use]
     pub fn can_start(&self) -> bool {

@@ -367,3 +367,16 @@ fn recording_output_counts_what_exceeds_its_capacity() {
     assert!(out.samples().iter().all(|&x| x == 0.5));
     assert_eq!(out.dropped(), 860);
 }
+
+#[test]
+fn a_simulated_device_that_queues_nothing_is_refused() {
+    for (queue_periods, period, rate) in [(0, PERIOD, RATE), (2, 0, RATE), (2, PERIOD, 0)] {
+        let cfg = SimConfig {
+            queue_periods,
+            ..SimConfig::steady(rate, period, TimeUs(0))
+        };
+        let refused = std::panic::catch_unwind(|| SimDevice::new(cfg));
+        assert!(refused.is_err(), "{queue_periods} {period} {rate}");
+    }
+    let _ = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+}
