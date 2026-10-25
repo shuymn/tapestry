@@ -257,14 +257,9 @@ impl RankScale {
     #[must_use]
     pub fn scale_milli(&self, rank: Option<JudgeRank>) -> Option<i64> {
         match rank {
-            None => Some(self.absent_milli),
-            Some(JudgeRank::Rank(r)) => Some(
-                usize::try_from(r)
-                    .ok()
-                    .and_then(|i| self.rank_milli.get(i).copied())
-                    .unwrap_or(self.absent_milli),
-            ),
+            Some(JudgeRank::Rank(r @ 0..=3)) => Some(self.rank_milli[r as usize]),
             Some(JudgeRank::DefExRankMilli(v)) => (v > 0).then_some(v),
+            None | Some(JudgeRank::Rank(_)) => Some(self.absent_milli),
         }
     }
 }
@@ -354,7 +349,8 @@ pub struct GaugeRule {
     pub kind: GaugeKind,
     /// Value at the start.
     pub start: GaugeValue,
-    /// Lower bound; a survival gauge fails on reaching it.
+    /// Lower clamp bound; must be `EMPTY` for survival gauges, which fail at
+    /// zero.
     pub min: GaugeValue,
     /// Upper bound.
     pub max: GaugeValue,
