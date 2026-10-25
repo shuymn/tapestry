@@ -12,23 +12,34 @@
 //! [`ScriptedInput`] feeds a scenario or a recorded log through the same
 //! path, and [`autoplay`] makes the inputs that hit every note of a chart.
 //!
+//! On Windows, the input thread (`InputThread`) receives keyboards
+//! through Raw Input (`RawInput`) and stamps each batch with the QPC
+//! read at its wake (`QpcClock`). Decoding the Raw Input packets
+//! ([`raw`]) and converting QPC ticks ([`qpc_to_us`]) are portable.
+//!
 //! After construction (and after [`SourceSet::open_recording`]), pushing
-//! and publishing allocate nothing. The Raw Input adapter for Windows is
-//! added under `cfg(windows)`.
+//! and publishing allocate nothing.
 
-#![forbid(unsafe_code)]
+// Only the Windows OS calls will use `unsafe`.
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))]
 
+mod capture;
 mod gate;
 mod queue;
+pub mod raw;
 mod scripted;
 mod sources;
+mod time;
 
 use bms_model::TimeUs;
 
+pub use capture::Capture;
 pub use gate::{Admit, DeviceId, FocusGate, FocusLatch, Packet};
 pub use queue::{Overflow, SourceReader, SourceWriter, source_queue};
 pub use scripted::{Action, ScriptItem, ScriptedInput, TimeOverflow, autoplay};
 pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, SourceSet};
+pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
 
 /// Something that delivers input to a [`SourceSet`]: Raw Input on the input
 /// thread, or a script in tests.
