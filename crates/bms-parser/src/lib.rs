@@ -54,10 +54,11 @@ mod resolve;
 mod sound;
 mod timing;
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use bms_model::{Chart, ChartIdentity, ChartMeta, ScrollMap, SoundId, SoundRef, TimeUs};
+use bms_model::{Chart, ChartIdentity, ScrollMap, SoundId, SoundRef, TimeUs};
 
 pub use error::{LoadError, Warning, WarningKind};
 
@@ -123,16 +124,19 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         return Err(LoadError::FileTooLarge { bytes: bytes.len() });
     }
     let mut warnings = Vec::new();
-    let text = decode(bytes, &mut warnings);
-    let source = parse::parse(&text, limits, &mut warnings)?;
+    let mut source = {
+        let text = decode(bytes, &mut warnings);
+        parse::parse(&text, limits, &mut warnings)?
+    };
     let timeline = timing::compute(&source, limits, &mut warnings)?;
 
     let dir = chart_dir
         .canonicalize()
         .map_err(|e| LoadError::ChartDir { kind: e.kind() })?;
     let mut ids = BTreeMap::new();
-    let mut sounds = Vec::with_capacity(source.wavs.len());
-    for (&id, wav) in &source.wavs {
+    let wavs = std::mem::take(&mut source.wavs);
+    let mut sounds = Vec::with_capacity(wavs.len());
+    for (id, wav) in wavs {
         let path = if wav.value.is_empty() {
             None
         } else {
@@ -147,14 +151,14 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         let index = u16::try_from(sounds.len()).unwrap_or(u16::MAX);
         ids.insert(id, SoundId(index));
         sounds.push(SoundRef {
-            name: wav.value.clone(),
+            name: wav.value,
             path,
         });
     }
 
     let mut lookup = resolve::Sounds {
         ids: &ids,
-        warned: Vec::new(),
+        warned: BTreeSet::new(),
     };
     let resolved = resolve::resolve(&timeline.objects, &source.lnobj, &mut lookup, &mut warnings);
     if resolved.lanes.iter().all(Vec::is_empty) {
@@ -172,12 +176,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         bar_lines: timeline.bar_lines,
         scroll: ScrollMap::new(timeline.initial_bpm_micro, &timeline.scroll)
             .map_err(LoadError::Model)?,
-        meta: ChartMeta {
-            title: source.title,
-            rank: source.rank,
-            total_milli: source.total_milli,
-            ln_mode: source.ln_mode,
-        },
+        meta: source.meta,
         identity: ChartIdentity {
             sha256,
             md5,
@@ -187,13 +186,12 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         },
     };
     chart.validate().map_err(LoadError::Model)?;
-    chart.identity.resolved_hash =
-        hash::resolved_hash(&chart, timeline.initial_bpm_micro, &timeline.scroll);
+    chart.identity.resolved_hash = hash::resolved_hash(&chart, &timeline.scroll);
     Ok(Loaded { chart, warnings })
 }
 
 /// Decodes the text in its detected encoding (Shift_JIS, UTF-8, ...).
-fn decode(bytes: &[u8], warnings: &mut Vec<Warning>) -> String {
+fn decode<'a>(bytes: &'a [u8], warnings: &mut Vec<Warning>) -> Cow<'a, str> {
     let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
     detector.feed(bytes, true);
     let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
@@ -204,5 +202,5 @@ fn decode(bytes: &[u8], warnings: &mut Vec<Warning>) -> String {
             kind: WarningKind::DecodeErrors,
         });
     }
-    text.into_owned()
+    text
 }

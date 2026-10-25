@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bms_model::{JudgeRank, Lane, LnMode};
+use bms_model::{ChartMeta, JudgeRank, Lane, LnMode};
 use num_traits::Signed;
 
 use crate::decimal::{Rational, parse_base36, parse_decimal, parse_hex};
@@ -47,18 +47,16 @@ pub struct Defined<T> {
 /// Everything read from the text.
 #[derive(Debug, Default)]
 pub struct Source {
-    pub title: String,
-    pub bpm: Option<Defined<Rational>>,
+    /// Title, rank, total and long-note mode.
+    pub meta: ChartMeta,
+    pub bpm: Option<Rational>,
     pub bpm_defs: BTreeMap<u16, Rational>,
     pub stop_defs: BTreeMap<u16, Rational>,
     pub wavs: BTreeMap<u16, Defined<String>>,
-    pub rank: Option<JudgeRank>,
-    pub total_milli: Option<i64>,
-    pub ln_mode: Option<LnMode>,
     /// Bounded by the 1295 ids, so lookups stay cheap.
     pub lnobj: BTreeSet<u16>,
     /// `#xxx02` values, by measure.
-    pub measure_lengths: BTreeMap<u16, Defined<Rational>>,
+    pub measure_lengths: BTreeMap<u16, Rational>,
     /// In file order.
     pub objects: Vec<RawObject>,
 }
@@ -176,25 +174,8 @@ fn parse_channel(
 ) -> Result<(), LoadError> {
     let name = String::from_utf8_lossy(&channel).into_owned();
     if channel == *b"02" {
-        let length = parse_decimal(data).map_err(|e| LoadError::InvalidValue {
-            line,
-            what: "measure length",
-            reason: e.reason(),
-        })?;
-        if !length.is_positive() {
-            return Err(LoadError::InvalidValue {
-                line,
-                what: "measure length",
-                reason: "not positive",
-            });
-        }
-        source.measure_lengths.insert(
-            measure,
-            Defined {
-                value: length,
-                line,
-            },
-        );
+        let length = positive_decimal(data, line, "measure length")?;
+        source.measure_lengths.insert(measure, length);
         return Ok(());
     }
     let bytes = data.as_bytes();
@@ -283,14 +264,7 @@ fn parse_header(
     };
     let invalid =
         |what: &'static str, reason: &'static str| LoadError::InvalidValue { line, what, reason };
-    let positive = |what: &'static str| -> Result<Rational, LoadError> {
-        let v = parse_decimal(value).map_err(|e| invalid(what, e.reason()))?;
-        if v.is_positive() {
-            Ok(v)
-        } else {
-            Err(invalid(what, "not positive"))
-        }
-    };
+    let positive = |what: &'static str| positive_decimal(value, line, what);
     let ignore = |warnings: &mut Vec<Warning>, what: &'static str| {
         warnings.push(Warning {
             line: Some(line),
@@ -298,23 +272,20 @@ fn parse_header(
         });
     };
     match upper.as_str() {
-        "TITLE" => source.title = value.to_owned(),
+        "TITLE" => source.meta.title = value.to_owned(),
         "BPM" => {
-            source.bpm = Some(Defined {
-                value: positive("#BPM")?,
-                line,
-            });
+            source.bpm = Some(positive("#BPM")?);
         }
         "RANK" => match value.parse::<i32>() {
-            Ok(rank) => source.rank = Some(JudgeRank::Rank(rank)),
+            Ok(rank) => source.meta.rank = Some(JudgeRank::Rank(rank)),
             Err(_) => ignore(warnings, "#RANK"),
         },
         "DEFEXRANK" => match thousandths(value) {
-            Some(v) => source.rank = Some(JudgeRank::DefExRankMilli(v)),
+            Some(v) => source.meta.rank = Some(JudgeRank::DefExRankMilli(v)),
             None => ignore(warnings, "#DEFEXRANK"),
         },
         "TOTAL" => match thousandths(value) {
-            Some(v) => source.total_milli = Some(v),
+            Some(v) => source.meta.total_milli = Some(v),
             None => ignore(warnings, "#TOTAL"),
         },
         "LNOBJ" => match parse_base36(value.as_bytes()).filter(|&id| id != 0) {
@@ -338,7 +309,7 @@ fn parse_header(
                     what: format!("#LNMODE {value}"),
                 });
             }
-            source.ln_mode = Some(LnMode::Ln);
+            source.meta.ln_mode = Some(LnMode::Ln);
         }
         "PLAYER" => {
             if value != "1" {
@@ -386,9 +357,21 @@ fn parse_header(
     Ok(())
 }
 
-/// A non-negative decimal in thousandths, rounded down.
+/// A positive decimal, or an error naming `what`.
+fn positive_decimal(text: &str, line: usize, what: &'static str) -> Result<Rational, LoadError> {
+    let invalid = |reason| LoadError::InvalidValue { line, what, reason };
+    let v = parse_decimal(text).map_err(|e| invalid(e.reason()))?;
+    if v.is_positive() {
+        Ok(v)
+    } else {
+        Err(invalid("not positive"))
+    }
+}
+
+/// A non-negative decimal in thousandths, rounded down (truncation is the
+/// floor for a non-negative value).
 fn thousandths(value: &str) -> Option<i64> {
     let v = parse_decimal(value).ok().filter(|v| !v.is_negative())?;
-    let milli = (v * Rational::from_integer(1_000)).floor().to_integer();
+    let milli = (v * Rational::from_integer(1_000)).to_integer();
     i64::try_from(milli).ok()
 }

@@ -13,11 +13,11 @@ pub fn file_hashes(bytes: &[u8]) -> ([u8; 32], [u8; 16]) {
 /// scroll changes, notes, BGM, bar lines, sound names as written, header
 /// values and `#RANDOM` results. Resolved sound paths are left out, so moving
 /// the chart folder keeps the hash.
-pub fn resolved_hash(chart: &Chart, initial_bpm_micro: i64, scroll: &[ScrollChange]) -> [u8; 32] {
+pub fn resolved_hash(chart: &Chart, scroll: &[ScrollChange]) -> [u8; 32] {
     let mut h = Encoder(Sha256::new());
     h.bytes(b"tapestry resolved chart");
     h.u64(u64::from(chart.identity.loader_version));
-    h.i64(initial_bpm_micro);
+    h.i64(chart.scroll.initial_bpm_micro());
     h.len(scroll.len());
     for change in scroll {
         match *change {

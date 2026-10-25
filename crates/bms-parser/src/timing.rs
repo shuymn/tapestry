@@ -27,8 +27,10 @@ pub struct Timed {
 /// The chart's objects in time order with the scroll changes.
 #[derive(Debug)]
 pub struct Timeline {
-    /// Notes, long-note objects, mines and BGM, sorted by time, then by file
-    /// order. Timing objects are consumed.
+    /// Notes, long-note objects, mines and BGM in measure-position order,
+    /// file order within one position. Positions that floor to the same µs
+    /// keep position order; file order travels in [`Timed::seq`]. Timing
+    /// objects are consumed.
     pub objects: Vec<Timed>,
     pub initial_bpm_micro: i64,
     pub scroll: Vec<ScrollChange>,
@@ -47,8 +49,8 @@ pub fn compute(
     limits: &Limits,
     warnings: &mut Vec<Warning>,
 ) -> Result<Timeline, LoadError> {
-    let initial_bpm = if let Some(bpm) = &source.bpm {
-        bpm.value
+    let initial_bpm = if let Some(bpm) = source.bpm {
+        bpm
     } else {
         warnings.push(Warning {
             line: None,
@@ -72,7 +74,7 @@ pub fn compute(
         let length = source
             .measure_lengths
             .get(&m)
-            .map_or_else(|| Rational::from_integer(1), |l| l.value);
+            .map_or_else(|| Rational::from_integer(1), |l| *l);
         let next = length
             .checked_mul(&Rational::from_integer(4))
             .and_then(|beats| measure_start[usize::from(m)].checked_add(&beats))
@@ -100,7 +102,7 @@ pub fn compute(
 
     let mut timeline = Timeline {
         objects: Vec::with_capacity(source.objects.len()),
-        initial_bpm_micro: bpm_micro(initial_bpm, source.bpm.as_ref().map_or(0, |b| b.line))?,
+        initial_bpm_micro: bpm_micro(initial_bpm),
         scroll: Vec::new(),
         bar_lines: Vec::with_capacity(usize::from(last_measure) + 1),
     };
@@ -152,18 +154,18 @@ pub fn compute(
         let mut new_bpm = None;
         for (l, value) in pick(false).chain(pick(true)) {
             match value {
-                Some(v) => new_bpm = Some((l, v)),
+                Some(v) => new_bpm = Some(v),
                 None => warnings.push(Warning {
                     line: Some(l),
                     kind: WarningKind::UndefinedReference,
                 }),
             }
         }
-        if let Some((l, v)) = new_bpm {
+        if let Some(v) = new_bpm {
             bpm = v;
             timeline.scroll.push(ScrollChange::Bpm {
                 at,
-                bpm_micro: bpm_micro(v, l)?,
+                bpm_micro: bpm_micro(v),
             });
         }
 
@@ -230,25 +232,15 @@ fn to_micros(time: Rational, cap: Rational, measure: u16) -> Result<TimeUs, Load
     if time > cap {
         return Err(LoadError::DurationExceeded { measure });
     }
-    i64::try_from(time.floor().to_integer())
+    // Truncation is the floor for a non-negative time.
+    i64::try_from(time.to_integer())
         .map(TimeUs)
         .map_err(|_| LoadError::TimeOverflow { measure })
 }
 
-/// A BPM in millionths; exact because BPM text has at most 6 fractional
-/// digits.
-fn bpm_micro(bpm: Rational, line: usize) -> Result<i64, LoadError> {
-    let micro = bpm * Rational::from_integer(1_000_000);
-    if !micro.is_integer() {
-        return Err(LoadError::InvalidValue {
-            line,
-            what: "BPM",
-            reason: "more than 6 fractional digits",
-        });
-    }
-    i64::try_from(micro.to_integer()).map_err(|_| LoadError::InvalidValue {
-        line,
-        what: "BPM",
-        reason: "too large",
-    })
+/// A BPM in millionths. Exact and in range: every BPM is two hex digits,
+/// the default, or a decimal of at most 12 integer and 6 fractional digits,
+/// so the value is an integer below 10^18. Saturates if that ever changes.
+fn bpm_micro(bpm: Rational) -> i64 {
+    i64::try_from((bpm * Rational::from_integer(1_000_000)).to_integer()).unwrap_or(i64::MAX)
 }

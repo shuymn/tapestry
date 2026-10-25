@@ -12,40 +12,30 @@ use crate::{Warning, WarningKind};
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
     note: Note,
-    /// Long note 2, tap 1, mine 0: the winner at one time and lane.
-    priority: u8,
     /// File order of the object, the tie-breaker (later wins).
-    order: usize,
+    seq: usize,
     line: usize,
 }
 
-impl Candidate {
-    fn new(note: Note, order: usize, line: usize) -> Self {
-        let priority = match note.kind {
-            NoteKind::Long { .. } => 2,
-            NoteKind::Tap => 1,
-            NoteKind::Mine { .. } => 0,
-        };
-        Self {
-            note,
-            priority,
-            order,
-            line,
-        }
+/// Long note 2, tap 1, mine 0: the winner at one time and lane.
+const fn priority(kind: NoteKind) -> u8 {
+    match kind {
+        NoteKind::Long { .. } => 2,
+        NoteKind::Tap => 1,
+        NoteKind::Mine { .. } => 0,
     }
 }
 
 /// Maps `#WAV` ids to the dense sound table, warning once per undefined id.
 pub struct Sounds<'a> {
     pub ids: &'a BTreeMap<u16, SoundId>,
-    pub warned: Vec<u16>,
+    pub warned: BTreeSet<u16>,
 }
 
 impl Sounds<'_> {
     fn get(&mut self, id: u16, line: usize, warnings: &mut Vec<Warning>) -> Option<SoundId> {
         let sound = self.ids.get(&id).copied();
-        if sound.is_none() && !self.warned.contains(&id) {
-            self.warned.push(id);
+        if sound.is_none() && self.warned.insert(id) {
             warnings.push(Warning {
                 line: Some(line),
                 kind: WarningKind::UndefinedReference,
@@ -80,7 +70,7 @@ pub fn resolve(
     let mut candidates: [Vec<Candidate>; LANE_COUNT] = Default::default();
     let mut bgm = Vec::new();
     // Per lane: the last plain note, which an #LNOBJ end may turn into a
-    // long note; and an open #LNTYPE 1 start.
+    // long note.
     let mut last_plain: [Option<usize>; LANE_COUNT] = [None; LANE_COUNT];
     let mut endpoints: [Vec<Endpoint>; LANE_COUNT] = Default::default();
 
@@ -112,7 +102,6 @@ pub fn resolve(
                             end: obj.time,
                             end_sound: None,
                         };
-                        start.priority = 2;
                     }
                     None => warn(warnings, WarningKind::UnpairedLongNoteEnd),
                 }
@@ -121,15 +110,15 @@ pub fn resolve(
                 let sound = sounds.get(id, obj.line, warnings);
                 let l = lane.index();
                 last_plain[l] = Some(candidates[l].len());
-                candidates[l].push(Candidate::new(
-                    Note {
+                candidates[l].push(Candidate {
+                    note: Note {
                         time: obj.time,
                         sound,
                         kind: NoteKind::Tap,
                     },
-                    obj.seq,
-                    obj.line,
-                ));
+                    seq: obj.seq,
+                    line: obj.line,
+                });
             }
             ObjectKind::Long(lane, id) => endpoints[lane.index()].push(Endpoint {
                 time: obj.time,
@@ -138,17 +127,17 @@ pub fn resolve(
                 line: obj.line,
             }),
             ObjectKind::Mine(lane, id) => {
-                candidates[lane.index()].push(Candidate::new(
-                    Note {
+                candidates[lane.index()].push(Candidate {
+                    note: Note {
                         time: obj.time,
                         sound: None,
                         kind: NoteKind::Mine {
                             damage: i32::from(id),
                         },
                     },
-                    obj.seq,
-                    obj.line,
-                ));
+                    seq: obj.seq,
+                    line: obj.line,
+                });
             }
             ObjectKind::BpmHex(_) | ObjectKind::BpmRef(_) | ObjectKind::StopRef(_) => {}
         }
@@ -170,7 +159,7 @@ fn pair_long_notes(
     sounds: &mut Sounds<'_>,
     warnings: &mut Vec<Warning>,
 ) {
-    lane.sort_by_key(|e| (e.time, e.seq));
+    lane.sort_unstable_by_key(|e| (e.time, e.seq));
     let mut merged: Vec<Endpoint> = Vec::with_capacity(lane.len());
     for e in lane {
         if let Some(last) = merged.last_mut().filter(|last| last.time == e.time) {
@@ -191,8 +180,8 @@ fn pair_long_notes(
         } else {
             sounds.get(end.id, end.line, warnings)
         };
-        out.push(Candidate::new(
-            Note {
+        out.push(Candidate {
+            note: Note {
                 time: start.time,
                 sound,
                 kind: NoteKind::Long {
@@ -200,9 +189,9 @@ fn pair_long_notes(
                     end_sound,
                 },
             },
-            start.seq,
-            start.line,
-        ));
+            seq: start.seq,
+            line: start.line,
+        });
     }
     if let [open] = open {
         warnings.push(Warning {
@@ -216,7 +205,7 @@ fn pair_long_notes(
 /// object in the file; a note at or inside an earlier long note's span is
 /// dropped.
 fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Note> {
-    lane.sort_by_key(|c| (c.note.time, c.priority, c.order));
+    lane.sort_unstable_by_key(|c| (c.note.time, priority(c.note.kind), c.seq));
     let mut kept: Vec<Note> = Vec::with_capacity(lane.len());
     for (i, c) in lane.iter().enumerate() {
         let drop = |warnings: &mut Vec<Warning>, kind| {
@@ -265,7 +254,7 @@ mod tests {
         let ids = BTreeMap::from([(1, SoundId(0)), (2, SoundId(1))]);
         let mut sounds = Sounds {
             ids: &ids,
-            warned: Vec::new(),
+            warned: BTreeSet::new(),
         };
         let mut warnings = Vec::new();
         // File order is the order given.
