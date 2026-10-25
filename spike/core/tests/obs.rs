@@ -777,9 +777,35 @@ fn unattended_runs_are_provisional_until_the_owner_confirms() {
     let s = evaluate(&run);
     assert!(!s.owner_review_pending);
     assert_eq!(s.exit_code, 0);
-    // The owner reports a problem: invalid.
-    run.owner.audio_present = Some(false);
+    // A partial review stays pending: one answer in, the other open.
+    for (g, a) in [(Some(true), None), (None, Some(true))] {
+        run.owner.game_visible = g;
+        run.owner.audio_present = a;
+        let s = evaluate(&run);
+        assert!(s.check("V7").ok, "{g:?} {a:?}");
+        assert!(s.owner_review_pending, "{g:?} {a:?}");
+        assert_eq!(s.exit_code, spike_core::evaluate::PROVISIONAL_EXIT);
+    }
+    // The owner reports a problem: invalid, even with the other answer
+    // open.
+    for (g, a) in [
+        (Some(true), Some(false)),
+        (Some(false), None),
+        (None, Some(false)),
+    ] {
+        run.owner.game_visible = g;
+        run.owner.audio_present = a;
+        let s = evaluate(&run);
+        assert!(!s.check("V7").ok, "{g:?} {a:?}");
+        assert!(!s.owner_review_pending, "{g:?} {a:?}");
+        assert_eq!(s.exit_code, 2);
+    }
+    // Attended, a partial review is invalid.
+    run.info.unattended = false;
+    run.owner.game_visible = Some(true);
+    run.owner.audio_present = None;
     assert_eq!(evaluate(&run).exit_code, 2);
+    run.info.unattended = true;
     // A failed gate stays a failure while the review is pending.
     run.owner = spike_core::run::OwnerPublic::default();
     run.audio.episodes.push(spike_core::run::Episode {

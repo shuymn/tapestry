@@ -122,7 +122,7 @@ pub struct Summary {
     pub target_period_ms: Option<f64>,
     /// An unattended OBS run whose owner review (game visible and audio
     /// present in the recording) is still open: the result is provisional
-    /// (exit 4), never a pass, until the owner notes confirm it.
+    /// (exit 4), never a pass, until the run's owner review confirms it.
     #[serde(default)]
     pub owner_review_pending: bool,
     pub validity: Vec<Check>,
@@ -586,12 +586,11 @@ fn v7(run: &RunData) -> Check {
         r.push("obs-teardown-unconfirmed");
     }
     // Unattended, an unanswered confirmation is pending (provisional
-    // result), not invalid; a "false" is invalid either way.
+    // result), not invalid, even when the other answer is in; a "false" is
+    // invalid either way.
     let o = &run.owner;
-    let answered = o.game_visible.is_some() || o.audio_present.is_some();
-    if (answered || !run.info.unattended)
-        && (o.game_visible != Some(true) || o.audio_present != Some(true))
-    {
+    let confirmed = o.game_visible == Some(true) && o.audio_present == Some(true);
+    if owner_denied(run) || (!run.info.unattended && !confirmed) {
         r.push("owner-did-not-confirm-capture");
     }
     check("V7", r)
@@ -601,12 +600,19 @@ fn v7(run: &RunData) -> Check {
 /// review of an unattended OBS run is still open.
 pub const PROVISIONAL_EXIT: u8 = 4;
 
+/// The owner answered `false` to either confirmation.
+fn owner_denied(run: &RunData) -> bool {
+    let o = &run.owner;
+    o.game_visible == Some(false) || o.audio_present == Some(false)
+}
+
+/// An unattended OBS run with an answer still open and none `false`.
 fn owner_review_pending(run: &RunData) -> bool {
     let o = &run.owner;
     run.info.kind == RunKind::Obs
         && run.info.unattended
-        && o.game_visible.is_none()
-        && o.audio_present.is_none()
+        && !owner_denied(run)
+        && (o.game_visible.is_none() || o.audio_present.is_none())
 }
 
 /// The times of `rows` (sorted) must reach within `edge` of both ends of
