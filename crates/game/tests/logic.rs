@@ -1,5 +1,6 @@
 //! The logic step against source queues: D8's consumer order, staging,
-//! retirement, abort, and the guards that keep the record honest.
+//! retirement, the input budget, abort, and the guards that keep the
+//! record honest.
 
 mod common;
 
@@ -8,7 +9,7 @@ use common::{MS, device, judgments, lane, press};
 use eval::{
     DeviceProfile, EvalError, InputKind, InputStart, PhysicalInputEvent, Published, SourceId,
 };
-use game::{Logic, LogicConfig, LogicError, SourceRead};
+use game::{AbortCause, Logic, LogicConfig, LogicError, SourceRead};
 use input::{SourceReader, SourceWriter, source_queue};
 use rules::{Judgment, RulePreset};
 
@@ -16,6 +17,13 @@ const CONFIG: LogicConfig = LogicConfig {
     inputs: 64,
     effects: 64,
 };
+
+fn budget(inputs: usize) -> LogicConfig {
+    LogicConfig {
+        inputs,
+        effects: 64,
+    }
+}
 
 fn taps(times_ms: &[(u8, i64)]) -> Chart {
     let mut b = ChartBuilder::new(150_000);
@@ -43,6 +51,14 @@ fn logic<'a, R: SourceRead>(
     )
     .unwrap()
     .0
+}
+
+fn disconnected(at: i64, source: u16) -> PhysicalInputEvent {
+    PhysicalInputEvent {
+        received: TimeUs(at),
+        source: SourceId(source),
+        kind: InputKind::Disconnected,
+    }
 }
 
 /// A reader whose producer pushes and publishes a press right after the
@@ -108,7 +124,7 @@ fn boundary_press_published_between_pop_and_watermark_read_is_judged() {
         judgments(logic.events()),
         vec![(1, 0, Judgment::Bad, Some(180_000))]
     );
-    assert!(!logic.incomplete());
+    assert!(!logic.overflowed());
     assert_eq!(render.view().tally.counts.bad, 1);
     assert_eq!(render.view().tally.counts.poor, 0);
 }
@@ -159,87 +175,162 @@ fn unmoved_watermark_step_emits_nothing() {
     assert!(logic.events().is_empty());
     assert_eq!(b.finalization_delay, Some(TimeUs(1_900)));
     assert_eq!(logic.finalized(), Some(TimeUs(1_000_000)));
-    assert!(!logic.incomplete());
+    assert!(!logic.overflowed());
 }
 
 #[test]
-fn every_source_retired_at_once_stops_advancing() {
-    let chart = taps(&[(1, 1_000)]);
+fn removed_source_drains_then_retires_while_another_remains() {
+    let chart = taps(&[(1, 400), (2, 900)]);
     let rule = rules::custom();
     let dev = device(&[0, 0]);
-    let (mut w0, r0) = source_queue(4);
-    let (mut w1, r1) = source_queue(4);
-    for (w, s) in [(&mut w0, 0), (&mut w1, 1)] {
-        w.push(PhysicalInputEvent {
-            received: TimeUs(500_000),
-            source: SourceId(s),
-            kind: InputKind::Disconnected,
-        })
-        .unwrap();
-        w.close(TimeUs(500_000));
-    }
+    let (mut gone, r0) = source_queue(4);
+    let (mut kept, r1) = source_queue(4);
+    gone.push(press(400_000, 0, lane(1))).unwrap();
+    gone.push(disconnected(500_000, 0)).unwrap();
+    gone.close(TimeUs(500_000));
+    kept.publish(TimeUs(450_000));
     let mut logic = logic(&chart, &rule, &dev, vec![r0, r1], CONFIG);
 
-    // Both are closed at their final watermark and drained in this step.
-    let a = logic.advance_to(TimeUs(501_000));
-    assert_eq!(a.watermark, Some(TimeUs(500_000)));
-    // Then both are retired: there is no watermark and nothing advances.
-    let b = logic.advance_to(TimeUs(502_000));
-    assert_eq!(b.watermark, None);
-    assert_eq!(b.emitted, 0);
-    assert_eq!(logic.finalized(), Some(TimeUs(500_000)));
-    assert_eq!(logic.record().events.len(), 2);
+    // The closed source still bounds the watermark while it drains.
+    let a = logic.advance_to(TimeUs(451_000));
+    assert_eq!(a.watermark, Some(TimeUs(450_000)));
+    assert_eq!(
+        judgments(logic.events()),
+        vec![(1, 0, Judgment::Perfect, Some(0))]
+    );
+    kept.publish(TimeUs(700_000));
+    let b = logic.advance_to(TimeUs(701_000));
+    assert_eq!(b.watermark, Some(TimeUs(500_000)));
+    // Drained and retired: the open source alone sets the watermark.
+    kept.push(press(900_000, 1, lane(2))).unwrap();
+    kept.publish(TimeUs(950_000));
+    let c = logic.advance_to(TimeUs(951_000));
+    assert_eq!(c.watermark, Some(TimeUs(950_000)));
+    assert_eq!(c.aborted, None);
+    assert_eq!(
+        judgments(logic.events()),
+        vec![(2, 0, Judgment::Perfect, Some(0))]
+    );
 }
 
 #[test]
-fn staging_full_holds_back_the_watermark_and_loses_nothing() {
-    let chart = taps(&[(1, 1_000), (2, 1_100), (3, 1_200), (4, 1_300)]);
+fn losing_every_source_aborts_before_advancing() {
+    let chart = taps(&[(1, 300)]);
+    let rule = rules::custom();
+    let dev = device(&[0, 0]);
+    let (w0, r0) = source_queue(4);
+    let (w1, r1) = source_queue(4);
+    w0.publish(TimeUs(200_000));
+    w1.publish(TimeUs(200_000));
+    let mut logic = logic(&chart, &rule, &dev, vec![r0, r1], CONFIG);
+    assert_eq!(
+        logic.advance_to(TimeUs(201_000)).watermark,
+        Some(TimeUs(200_000))
+    );
+
+    // Both devices go in the same batch, after the note's miss deadline
+    // (480 000 µs): their final watermarks would finalize the miss.
+    let mut writers = [w0, w1];
+    for (s, w) in (0..).zip(&mut writers) {
+        w.push(disconnected(500_000, s)).unwrap();
+        w.close(TimeUs(500_000));
+    }
+    let a = logic.advance_to(TimeUs(501_000));
+    assert_eq!(a.watermark, None);
+    assert_eq!(a.emitted, 0);
+    assert_eq!(a.aborted, Some(AbortCause::LastSourceRemoved));
+    assert_eq!(logic.finalized(), Some(TimeUs(200_000)));
+    let record = logic.record();
+    // The tails are recorded, not evaluated.
+    assert_eq!(
+        record.events,
+        vec![disconnected(500_000, 0), disconnected(500_000, 1)]
+    );
+    let batch = eval::evaluate(&chart, &record.eval_input().unwrap(), &rule).unwrap();
+    assert!(judgments(&batch.events).is_empty());
+}
+
+#[test]
+fn capacity_one_takes_one_input() {
+    let chart = taps(&[(1, 1_000)]);
     let rule = rules::custom();
     let dev = device(&[0]);
-    let (mut writer, reader) = source_queue(16);
-    for (l, t) in [
-        (1, 1_000_000),
-        (2, 1_100_000),
-        (3, 1_200_000),
-        (4, 1_300_000),
-    ] {
-        writer.push(press(t, 0, lane(l))).unwrap();
-    }
-    writer.publish(TimeUs(2_000_000));
-    // Room for two inputs: staging and the record hold two.
-    let config = LogicConfig {
-        inputs: 2,
-        effects: 64,
-    };
-    let mut logic = logic(&chart, &rule, &dev, vec![reader], config);
+    let (mut writer, reader) = source_queue(4);
+    writer.push(press(1_000_000, 0, lane(1))).unwrap();
+    writer.publish(TimeUs(1_200_000));
+    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(1));
+    let a = logic.advance_to(TimeUs(1_200_500));
 
-    let mut watermarks = Vec::new();
-    let mut judged = Vec::new();
-    for step in 1..=4 {
-        let a = logic.advance_to(TimeUs(2_000_000 + step));
-        watermarks.push(a.watermark.unwrap().0);
-        judged.extend(judgments(logic.events()));
-    }
-    // A full staging buffer bounds its source just below the last popped
-    // time, since events of that time may still be queued.
-    assert_eq!(watermarks, vec![1_099_999, 1_199_999, 1_299_999, 2_000_000]);
     assert_eq!(
-        judged,
-        vec![
-            (1, 0, Judgment::Perfect, Some(0)),
-            (2, 0, Judgment::Perfect, Some(0)),
-            (3, 0, Judgment::Perfect, Some(0)),
-            (4, 0, Judgment::Perfect, Some(0)),
-        ]
+        judgments(logic.events()),
+        vec![(1, 0, Judgment::Perfect, Some(0))]
     );
-    assert!(logic.is_complete());
-    // The record had room for two of the four.
-    assert_eq!(logic.record().events.len(), 2);
-    assert!(logic.incomplete());
+    assert!(a.complete);
+    assert!(!logic.overflowed());
 }
 
 #[test]
-fn input_at_or_before_the_finalized_watermark_marks_incomplete() {
+fn equal_time_group_beyond_the_budget_aborts_unevaluated() {
+    let chart = taps(&[(1, 1_000), (2, 1_000)]);
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let (mut writer, reader) = source_queue(4);
+    // One batch of two presses, and a budget of one input.
+    writer.push(press(1_000_000, 0, lane(1))).unwrap();
+    writer.push(press(1_000_000, 0, lane(2))).unwrap();
+    writer.publish(TimeUs(1_000_000));
+    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(1));
+    let a = logic.advance_to(TimeUs(1_000_500));
+
+    assert_eq!(a.aborted, Some(AbortCause::Overflow));
+    assert_eq!(a.emitted, 0);
+    assert!(logic.overflowed());
+    let record = logic.record();
+    assert_eq!(record.events, vec![press(1_000_000, 0, lane(1))]);
+    // Nothing was finalized, so there is nothing to re-evaluate.
+    assert_eq!(record.finalized, None);
+    assert_eq!(record.eval_input(), None);
+    assert_eq!(logic.advance_to(TimeUs(2_000_000)).watermark, None);
+}
+
+#[test]
+fn input_beyond_the_budget_aborts_at_the_finalized_watermark() {
+    let chart = taps(&[(1, 1_000), (2, 1_100), (3, 1_200), (4, 1_300)]);
+    let rule = rules::custom();
+    let dev = device(&[0, 0]);
+    let (mut w0, r0) = source_queue(16);
+    let (mut w1, r1) = source_queue(16);
+    w0.publish(TimeUs(999_999));
+    w1.publish(TimeUs(999_999));
+    let mut logic = logic(&chart, &rule, &dev, vec![r0, r1], budget(3));
+    logic.advance_to(TimeUs(1_000_000));
+    // Four inputs over two sources against a budget of three, which is
+    // shared: no single source exceeds it.
+    w0.push(press(1_000_000, 0, lane(1))).unwrap();
+    w0.push(press(1_100_000, 0, lane(2))).unwrap();
+    w1.push(press(1_200_000, 1, lane(3))).unwrap();
+    w1.push(press(1_300_000, 1, lane(4))).unwrap();
+    w0.publish(TimeUs(2_000_000));
+    w1.publish(TimeUs(2_000_000));
+    let a = logic.advance_to(TimeUs(2_000_500));
+
+    assert_eq!(a.aborted, Some(AbortCause::Overflow));
+    assert_eq!(a.emitted, 0);
+    assert!(logic.overflowed());
+    let record = logic.record();
+    assert_eq!(record.finalized, Some(TimeUs(999_999)));
+    assert_eq!(
+        record.events,
+        vec![
+            press(1_000_000, 0, lane(1)),
+            press(1_100_000, 0, lane(2)),
+            press(1_200_000, 1, lane(3)),
+        ]
+    );
+}
+
+#[test]
+fn input_at_or_before_the_finalized_watermark_aborts() {
     let chart = taps(&[(1, 1_050)]);
     let rule = rules::custom();
     let dev = device(&[0]);
@@ -252,14 +343,16 @@ fn input_at_or_before_the_finalized_watermark_marks_incomplete() {
     writer.publish(TimeUs(1_100_000));
     let a = logic.advance_to(TimeUs(1_100_500));
 
-    assert_eq!(a.watermark, Some(TimeUs(1_100_000)));
-    assert!(judgments(logic.events()).is_empty());
-    assert!(logic.incomplete());
+    assert_eq!(a.aborted, Some(AbortCause::Overflow));
+    assert_eq!(a.watermark, None);
+    assert!(logic.events().is_empty());
+    assert!(logic.overflowed());
+    assert_eq!(logic.finalized(), Some(TimeUs(1_000_000)));
     assert_eq!(logic.record().events, vec![press(900_000, 0, lane(1))]);
 }
 
 #[test]
-fn event_of_another_source_is_recorded_but_not_staged() {
+fn event_of_another_source_aborts() {
     let chart = taps(&[(1, 1_000)]);
     let rule = rules::custom();
     let dev = device(&[0, 0]);
@@ -269,10 +362,11 @@ fn event_of_another_source_is_recorded_but_not_staged() {
     writer.publish(TimeUs(1_000_000));
     quiet.publish(TimeUs(1_000_000));
     let mut logic = logic(&chart, &rule, &dev, vec![reader, other], CONFIG);
-    logic.advance_to(TimeUs(1_000_500));
+    let a = logic.advance_to(TimeUs(1_000_500));
 
-    assert!(judgments(logic.events()).is_empty());
-    assert!(logic.incomplete());
+    assert_eq!(a.aborted, Some(AbortCause::Overflow));
+    assert!(logic.events().is_empty());
+    assert!(logic.overflowed());
     assert_eq!(logic.record().events, vec![press(1_000_000, 1, lane(1))]);
 }
 
@@ -290,17 +384,39 @@ fn abort_keeps_queued_events_and_stops_advancing() {
     // Queued and published, then the play aborts before the next step.
     writer.push(press(1_500_000, 0, lane(2))).unwrap();
     writer.publish(TimeUs(1_600_000));
-    logic.abort();
+    logic.abort(AbortCause::FocusLoss);
+    logic.abort(AbortCause::Overflow);
     let a = logic.advance_to(TimeUs(1_600_500));
 
     assert_eq!(a.watermark, None);
     assert_eq!(a.emitted, 0);
+    // The first cause stays.
+    assert_eq!(a.aborted, Some(AbortCause::FocusLoss));
+    assert!(!logic.overflowed());
     let record = logic.record();
     assert_eq!(
         record.events,
         vec![press(1_000_000, 0, lane(1)), press(1_500_000, 0, lane(2))]
     );
     assert_eq!(record.finalized, Some(TimeUs(1_200_000)));
+}
+
+#[test]
+fn abort_tail_beyond_the_budget_marks_overflow() {
+    let chart = taps(&[(1, 1_000), (2, 1_500)]);
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let (mut writer, reader) = source_queue(16);
+    writer.push(press(1_000_000, 0, lane(1))).unwrap();
+    writer.publish(TimeUs(1_200_000));
+    let mut logic = logic(&chart, &rule, &dev, vec![reader], budget(1));
+    logic.advance_to(TimeUs(1_200_500));
+    assert!(!logic.overflowed());
+    writer.push(press(1_500_000, 0, lane(2))).unwrap();
+    logic.abort(AbortCause::FocusLoss);
+
+    assert!(logic.overflowed());
+    assert_eq!(logic.record().events, vec![press(1_000_000, 0, lane(1))]);
 }
 
 /// A source that never publishes anything.

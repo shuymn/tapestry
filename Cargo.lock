@@ -194,6 +194,7 @@ dependencies = [
  "bms-model",
  "eval",
  "input",
+ "replay",
  "rtrb",
  "rules",
  "triple_buffer",

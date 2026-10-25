@@ -65,7 +65,7 @@ fn threaded_logic_matches_threadless() {
 
     let (_, mut script) = autoplay_script(&chart, &dev);
     let mut sources = SourceSet::new(common::sources()).unwrap();
-    script.poll(START, &mut sources);
+    script.poll(TimeUs(START.0 - 1), &mut sources);
     let start: InputStart = sources.open_recording(START);
     let readers = sources.take_readers();
     let (mut logic, mut render) =
@@ -124,4 +124,52 @@ fn threaded_logic_matches_threadless() {
     assert_eq!(effects, stream);
     summary("input -> judgment", &mut latency);
     summary("finalization delay", &mut delay);
+}
+
+#[test]
+fn publication_wakes_parked_logic() {
+    // The logic thread parks far longer than the test waits, so only the
+    // notification can wake it in time.
+    const PARK: Duration = Duration::from_secs(20);
+    const WAIT: Duration = Duration::from_secs(5);
+    let chart = chart(1, 11 * MS, 30 * MS);
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let (mut writer, reader) = input::source_queue(4);
+    let config = LogicConfig {
+        inputs: 4,
+        effects: 64,
+    };
+    let (mut logic, _render) = Logic::new(
+        &chart,
+        &rule,
+        &dev,
+        &InputStart::default(),
+        vec![reader],
+        config,
+        Vec::new(),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let woke = thread::scope(|s| {
+        let logic_thread = s.spawn(move || {
+            while started.elapsed() < WAIT {
+                thread::park_timeout(PARK);
+                logic.advance_to(TimeUs(1_200_500));
+                if count_judged(logic.events(), Judgment::Perfect) == 1 {
+                    return Some(started.elapsed());
+                }
+            }
+            None
+        });
+        // The chart's one note is the scratch at 1 s.
+        writer
+            .push(common::press(1_000_000, 0, common::lane(0)))
+            .unwrap();
+        writer.publish(TimeUs(1_200_000));
+        logic_thread.thread().unpark();
+        logic_thread.join().unwrap()
+    });
+    let woke = woke.expect("the logic thread did not judge the press");
+    assert!(woke < WAIT, "woke after {woke:?}");
 }

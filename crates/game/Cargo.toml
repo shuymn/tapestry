@@ -11,6 +11,7 @@ publish.workspace = true
 bms-model.workspace = true
 eval.workspace = true
 input.workspace = true
+replay.workspace = true
 rules.workspace = true
 rtrb.workspace = true
 triple_buffer.workspace = true

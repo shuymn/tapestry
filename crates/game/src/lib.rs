@@ -17,6 +17,8 @@ mod logic;
 mod render;
 mod runner;
 
-pub use logic::{Advance, EventSink, Logic, LogicConfig, LogicError, SourceRead};
+pub use logic::{
+    AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
+};
 pub use render::{PlayView, RenderSide, RenderSink};
 pub use runner::{RunOutcome, Runner};

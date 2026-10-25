@@ -41,10 +41,10 @@ impl SourceRead for SourceReader {
 /// Fixed sizes of a [`Logic`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogicConfig {
-    /// The most inputs the whole play can hold: the capacity of the
-    /// recording window (D8). It sizes the collected record, each source's
-    /// staging, the evaluator's input ring, and through
-    /// [`Evaluator::max_events`] the output buffer.
+    /// The input budget of the whole play: the capacity of the recording
+    /// window (D8). Every popped input spends one unit, whatever its
+    /// source; it sizes the record, the staging, the merge, the evaluator's
+    /// input ring, and through [`Evaluator::max_events`] the output.
     pub inputs: usize,
     /// The effects the render queue holds.
     pub effects: usize,
@@ -70,23 +70,66 @@ impl fmt::Display for LogicError {
 
 impl std::error::Error for LogicError {}
 
+/// Why a play was aborted. It ends at the watermark already finalized
+/// (D13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbortCause {
+    /// The window lost focus.
+    FocusLoss,
+    /// No participating source is left open.
+    LastSourceRemoved,
+    /// An input did not fit the play's input budget, or the evaluator
+    /// refused it: the record is incomplete (overflow).
+    Overflow,
+}
+
 /// What one logic step did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Advance {
     /// The global watermark of this step: everything at or before it is
-    /// final. `None` when the step did not advance: after
-    /// [`Logic::abort`], or once every source is retired, which only an
-    /// aborted play leads to.
+    /// final. `None` when the step did not advance.
     pub watermark: Option<TimeUs>,
     /// Events emitted in this step.
     pub emitted: usize,
     /// Whether evaluation is complete.
     pub complete: bool,
+    /// Why the play was aborted, in this step or before.
+    pub aborted: Option<AbortCause>,
     /// `now − watermark`: how long finalization trails the logic time.
     pub finalization_delay: Option<TimeUs>,
     /// `now − origin` of the oldest input judged in this step: input to
     /// judgment.
     pub judgment_latency: Option<TimeUs>,
+}
+
+/// The recorded play.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+    /// Every event popped, in pop order (each source's in its receive
+    /// order), within the input budget.
+    pub events: Vec<PhysicalInputEvent>,
+    /// How each source is evaluated.
+    pub device: DeviceProfile,
+    /// The controls held when recording opened.
+    pub start: InputStart,
+    /// The watermark the evaluator last finalized; `None` if it never
+    /// advanced.
+    pub finalized: Option<TimeUs>,
+}
+
+impl Record {
+    /// The record as batch evaluation takes it, stopping at the finalized
+    /// watermark; `None` if nothing was ever finalized, so there is nothing
+    /// to re-evaluate.
+    #[must_use]
+    pub fn eval_input(&self) -> Option<EvalInput> {
+        self.finalized.map(|finalized| EvalInput {
+            events: self.events.clone(),
+            device: self.device.clone(),
+            start: self.start.clone(),
+            finalized: Some(finalized),
+        })
+    }
 }
 
 /// One source as the logic step sees it.
@@ -104,20 +147,21 @@ struct Source<R> {
 /// The logic step. It owns the evaluator, the source readers, their
 /// staging buffers, the collected record, the event sinks and the play
 /// view's writer. After construction, [`advance_to`](Self::advance_to)
-/// allocates nothing.
+/// allocates nothing: every popped input spends the play's input budget,
+/// so staging, merge, record and output stay within what was reserved.
 pub struct Logic<'a, R = SourceReader> {
     evaluator: Evaluator<'a>,
     device: &'a DeviceProfile,
     start: InputStart,
     sources: Vec<Source<R>>,
     staged: Vec<Staged>,
-    /// The fixed input capacity: of the record and of each staging buffer.
+    /// The input budget; the record's length is what has been spent.
     inputs: usize,
     /// The output bound for the whole play.
     max_events: usize,
     /// Events emitted so far.
     emitted: u64,
-    /// Per step: each source's bound on the global watermark.
+    /// Per step: each source's publication.
     bounds: Vec<Published>,
     merged: Vec<PhysicalInputEvent>,
     out: Vec<JudgeEvent>,
@@ -126,8 +170,8 @@ pub struct Logic<'a, R = SourceReader> {
     sinks: Vec<Box<dyn EventSink + Send + 'a>>,
     view: ViewWriter,
     finalized: Option<TimeUs>,
-    incomplete: bool,
-    aborted: bool,
+    overflowed: bool,
+    aborted: Option<AbortCause>,
 }
 
 impl<R> fmt::Debug for Logic<'_, R> {
@@ -136,7 +180,7 @@ impl<R> fmt::Debug for Logic<'_, R> {
             .field("sources", &self.sources.len())
             .field("finalized", &self.finalized)
             .field("recorded", &self.record.len())
-            .field("incomplete", &self.incomplete)
+            .field("overflowed", &self.overflowed)
             .field("aborted", &self.aborted)
             .finish_non_exhaustive()
     }
@@ -165,6 +209,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
         let evaluator =
             Evaluator::new(chart, rule, device, start, config.inputs).map_err(LogicError::Eval)?;
+        // Each buffer can hold the whole budget, since one source may spend
+        // all of it.
         let staged = (0..n)
             .map(|i| {
                 let id = SourceId(u16::try_from(i).unwrap_or(u16::MAX));
@@ -208,8 +254,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             sinks,
             view,
             finalized: None,
-            incomplete: false,
-            aborted: false,
+            overflowed: false,
+            aborted: None,
         };
         Ok((logic, side))
     }
@@ -223,65 +269,82 @@ impl<'a, R: SourceRead> Logic<'a, R> {
     /// popping would let an event pushed in between be skipped while its
     /// miss is finalized.
     ///
-    /// After [`abort`](Self::abort) nothing advances.
+    /// `W` depends only on the publications, so it is taken right after
+    /// (1). The play is aborted instead of advancing when no source is
+    /// left open, or when an input exceeds the budget or is refused.
+    /// After an abort nothing advances.
     pub fn advance_to(&mut self, now: TimeUs) -> Advance {
         self.out.clear();
-        if self.aborted {
+        if self.aborted.is_some() {
             return self.idle();
         }
         // (1) Every watermark first.
-        for s in &mut self.sources {
+        let mut open = false;
+        for (s, bound) in self.sources.iter_mut().zip(&mut self.bounds) {
             if s.published.state != SourceState::Retired {
                 s.published = s.reader.published();
             }
+            open |= s.published.state == SourceState::Open;
+            *bound = s.published;
         }
-        // (2) Then each source's guaranteed prefix.
+        // (3), taken here since it depends only on the publications: the
+        // global watermark. With no source left open the play is over: it
+        // ends at what was already finalized, before a closed source's
+        // final watermark could finalize more.
+        let Some(w) = watermark(&self.bounds, self.device).filter(|_| open) else {
+            self.abort(AbortCause::LastSourceRemoved);
+            return self.idle();
+        };
+        // (2) Then each source's guaranteed prefix, within the budget.
         for (i, s) in self.sources.iter_mut().enumerate() {
-            let w = s.published.received_up_to;
-            self.bounds[i] = s.published;
+            let up_to = s.published.received_up_to;
             if s.published.state == SourceState::Retired {
                 continue;
             }
             s.drained = false;
-            loop {
-                // An event beyond `w` is staged already: the rest of the
-                // queue is beyond it too.
-                if s.last_popped.is_some_and(|t| t > w) {
-                    break;
-                }
-                let staged = &mut self.staged[i];
-                if staged.len() >= self.inputs {
-                    // Events at or before `w` may still be queued, so
-                    // nothing at or after the last popped time is final.
-                    let held = s.last_popped.map_or(i64::MIN, |t| t.0.saturating_sub(1));
-                    self.bounds[i].received_up_to = TimeUs(held.min(w.0));
-                    break;
-                }
+            // An event beyond `up_to` ends the pops: the rest of the queue
+            // is beyond it too.
+            while s.last_popped.is_none_or(|t| t <= up_to) {
                 let Some(ev) = s.reader.pop() else {
                     s.drained = true;
                     break;
                 };
                 s.last_popped = Some(ev.received);
-                self.incomplete |= !keep(&mut self.record, self.inputs, ev);
-                if staged.push(ev).is_err() {
+                if self.record.len() >= self.inputs {
+                    // Over budget: the event is lost and the play ends.
+                    self.overflowed = true;
+                    break;
+                }
+                self.record.push(ev);
+                if self.staged[i].push(ev).is_err() {
                     // Another source's event: it cannot be ordered here.
-                    self.incomplete = true;
+                    self.overflowed = true;
+                    break;
                 }
             }
-        }
-        // (3) The global watermark.
-        let Some(w) = watermark(&self.bounds, self.device) else {
-            return self.idle();
-        };
-        // (4) Merge through it; later events stay staged.
-        merge(&mut self.staged, self.device, w, &mut self.merged);
-        for &ev in &self.merged {
-            if self.evaluator.push_input(ev).is_err() {
-                self.incomplete = true;
+            if self.overflowed {
+                break;
             }
         }
+        if self.overflowed {
+            self.abort(AbortCause::Overflow);
+            return self.idle();
+        }
+        // (4) Merge through it; later events stay staged. Everything staged
+        // was popped within the budget, so `merged` never grows.
+        merge(&mut self.staged, self.device, w, &mut self.merged);
+        let refused = self
+            .merged
+            .iter()
+            .any(|&ev| self.evaluator.push_input(ev).is_err());
         self.merged.clear();
-        // (5) Advance. A backward watermark processes nothing.
+        if refused {
+            self.overflowed = true;
+            self.abort(AbortCause::Overflow);
+            return self.idle();
+        }
+        // (5) Advance. The watermark never moves back: each publication
+        // only grows, and a source leaves the minimum only by retiring.
         if self.evaluator.advance_to(w, &mut self.out).is_ok() {
             self.finalized = Some(w);
         }
@@ -304,22 +367,31 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             watermark: Some(w),
             emitted: self.out.len(),
             complete: self.evaluator.is_complete(),
+            aborted: None,
             finalization_delay: Some(TimeUs(now.0.saturating_sub(w.0))),
             judgment_latency: oldest.map(|o| TimeUs(now.0.saturating_sub(o.0))),
         }
     }
 
     /// Ends the play at the watermark already finalized, with no further
-    /// advance (D13). Every event still queued is popped into the record;
-    /// staged ones are there already. None of them is evaluated.
-    pub fn abort(&mut self) {
-        self.aborted = true;
+    /// advance (D13). Every event still queued is popped into the record,
+    /// while the budget lasts; staged ones are there already. None of them
+    /// is evaluated. Only the first cause is kept.
+    pub fn abort(&mut self, cause: AbortCause) {
+        if self.aborted.is_some() {
+            return;
+        }
+        self.aborted = Some(cause);
         for s in &mut self.sources {
             if s.published.state == SourceState::Retired {
                 continue;
             }
             while let Some(ev) = s.reader.pop() {
-                self.incomplete |= !keep(&mut self.record, self.inputs, ev);
+                if self.record.len() < self.inputs {
+                    self.record.push(ev);
+                } else {
+                    self.overflowed = true;
+                }
             }
         }
     }
@@ -349,23 +421,27 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.evaluator.is_complete()
     }
 
-    /// Whether an input could not be recorded or evaluated in order: the
-    /// record is incomplete.
+    /// Why the play was aborted, if it was.
     #[must_use]
-    pub const fn incomplete(&self) -> bool {
-        self.incomplete
+    pub const fn aborted(&self) -> Option<AbortCause> {
+        self.aborted
     }
 
-    /// The play as recorded so far: every event popped, in pop order (each
-    /// source's in its receive order), with the finalized watermark that
-    /// re-evaluation stops at.
+    /// Whether an input did not fit the budget or was refused: the record
+    /// is incomplete (overflow).
     #[must_use]
-    pub fn record(&self) -> EvalInput {
-        EvalInput {
+    pub const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// The play as recorded so far.
+    #[must_use]
+    pub fn record(&self) -> Record {
+        Record {
             events: self.record.clone(),
             device: self.device.clone(),
             start: self.start.clone(),
-            finalized: Some(self.finalized.unwrap_or(TimeUs(i64::MIN))),
+            finalized: self.finalized,
         }
     }
 
@@ -374,6 +450,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             watermark: None,
             emitted: 0,
             complete: self.evaluator.is_complete(),
+            aborted: self.aborted,
             finalization_delay: None,
             judgment_latency: None,
         }
@@ -390,14 +467,4 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         v.events = self.emitted;
         self.view.publish();
     }
-}
-
-/// Appends `ev` to the record if it has room below `capacity`, so it never
-/// grows. Returns `false` when the event did not fit.
-fn keep(record: &mut Vec<PhysicalInputEvent>, capacity: usize, ev: PhysicalInputEvent) -> bool {
-    let fits = record.len() < capacity;
-    if fits {
-        record.push(ev);
-    }
-    fits
 }

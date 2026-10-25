@@ -6,9 +6,13 @@ use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{
     MS, autoplay_script, chart, control, count_judged, device, judgments, lane, window_capacity,
 };
-use eval::{ControlId, DeviceProfile, InputKind, PhysicalInputEvent, SourceId};
-use game::{LogicConfig, RunOutcome, Runner};
-use input::{Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceSet};
+use eval::{
+    ControlId, DeviceProfile, EvalInput, InputKind, InputStart, PhysicalInputEvent, SourceId,
+};
+use game::{AbortCause, LogicConfig, RunOutcome, Runner};
+use input::{
+    Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceConfig, SourceSet,
+};
 use rules::{Judgment, RulePreset};
 
 /// Recording opens 1 s before chart time 0.
@@ -62,7 +66,7 @@ fn runner_autoplay_is_all_perfect() {
 
     assert_eq!(judgments(runner.stream()).len(), 500);
     assert_eq!(count_judged(runner.stream(), Judgment::Perfect), 500);
-    assert!(!runner.incomplete());
+    assert!(!runner.incomplete().any());
     let view = runner.view();
     assert!(view.complete);
     assert_eq!(view.tally.counts.perfect, 500);
@@ -80,7 +84,7 @@ fn live_events_equal_batch_evaluation() {
     // One press and one release per note.
     assert_eq!(record.events.len(), 1_000);
     assert_eq!(record.events, events);
-    let batch = eval::evaluate(&chart, &record, &rule).unwrap();
+    let batch = eval::evaluate(&chart, &record.eval_input().unwrap(), &rule).unwrap();
     assert!(batch.completed);
     assert_eq!(batch.events, runner.stream());
 }
@@ -169,7 +173,10 @@ fn aborted_play_records_its_tail_unevaluated() {
         effects: 64,
     };
     let mut runner = Runner::new(&chart, &rule, &dev, sources, script, config, START).unwrap();
-    assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Aborted);
+    assert_eq!(
+        runner.run_to_end(TimeUs(MS)),
+        RunOutcome::Aborted(AbortCause::FocusLoss)
+    );
 
     // The last step before the abort ran at 2 019 000: both keyboards
     // published 2 018 999, and keyboard 1's offset gives 1 978 999.
@@ -211,7 +218,7 @@ fn aborted_play_records_its_tail_unevaluated() {
             .iter()
             .all(|e| e.origin.is_none_or(|o| o.0 < 2_000_000))
     );
-    let batch = eval::evaluate(&chart, &record, &rule).unwrap();
+    let batch = eval::evaluate(&chart, &record.eval_input().unwrap(), &rule).unwrap();
     assert!(!batch.completed);
     assert_eq!(batch.events, runner.stream());
 }
@@ -222,4 +229,158 @@ fn run_to_end_refuses_a_step_that_does_not_move_the_clock() {
     let (chart, rule, dev) = play();
     let (_, mut runner) = autoplay_runner(&chart, &rule, &dev, 16);
     runner.run_to_end(TimeUs(0));
+}
+
+#[test]
+fn removing_the_last_device_aborts_at_the_finalized_watermark() {
+    let chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(2), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let at = |t: i64, action| ScriptItem {
+        at: TimeUs(t),
+        action,
+    };
+    let key = |value| {
+        Action::Packet(Packet {
+            device: DeviceId(0),
+            control: control(lane(1)),
+            value,
+            background: false,
+        })
+    };
+    let script = ScriptedInput::new(vec![
+        at(i64::MIN, Action::Connect(DeviceId(0), DeviceKind::Keyboard)),
+        at(1_000_000, key(1)),
+        at(1_050_000, key(0)),
+        // After lane 2's miss deadline (1 180 000): the device's final
+        // watermark would finalize the miss and the song end.
+        at(1_200_000, Action::Disconnect(DeviceId(0))),
+    ])
+    .with_recorded(DeviceId(0), vec![control(lane(1)), control(lane(2))]);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    let config = LogicConfig {
+        inputs: 64,
+        effects: 64,
+    };
+    let mut runner = Runner::new(&chart, &rule, &dev, sources, script, config, START).unwrap();
+    // Steps of 100 ms: the last one before the removal publishes 1 099 999.
+    assert_eq!(
+        runner.run_to_end(TimeUs(100 * MS)),
+        RunOutcome::Aborted(AbortCause::LastSourceRemoved)
+    );
+
+    assert_eq!(
+        judgments(runner.stream()),
+        vec![(1, 0, Judgment::Perfect, Some(0))]
+    );
+    let record = runner.record();
+    assert_eq!(record.finalized, Some(TimeUs(1_099_999)));
+    assert_eq!(record.events.len(), 3);
+    assert_eq!(
+        record.events.last().map(|e| (e.received, e.kind)),
+        Some((TimeUs(1_200_000), InputKind::Disconnected))
+    );
+}
+
+#[test]
+fn event_at_the_opening_belongs_to_the_play() {
+    let opened_at = 1_000_000;
+    let chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(opened_at))
+        .tap(lane(2), TimeUs(1_200 * MS))
+        .build()
+        .unwrap();
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let ev = |t: i64, l: u8, value: i32| PhysicalInputEvent {
+        received: TimeUs(t),
+        source: SourceId(0),
+        kind: InputKind::Control {
+            control: control(lane(l)),
+            value,
+        },
+    };
+    // Lane 3 is held from before the opening; lane 1 is pressed in the
+    // first batch after it, in the same microsecond.
+    let start = InputStart {
+        opened_at: TimeUs(opened_at),
+        held: vec![(SourceId(0), control(lane(3)), 1)],
+    };
+    let events = vec![
+        ev(opened_at, 1, 1),
+        ev(1_040_000, 1, 0),
+        ev(1_100_000, 3, 0),
+        ev(1_200_000, 2, 1),
+        ev(1_250_000, 2, 0),
+    ];
+    let original = EvalInput {
+        events: events.clone(),
+        device: dev.clone(),
+        start: start.clone(),
+        finalized: None,
+    };
+    let expected = eval::evaluate(&chart, &original, &rule).unwrap().events;
+    assert_eq!(count_judged(&expected, Judgment::Perfect), 2);
+
+    let script = ScriptedInput::from_log(&start, &events, &[DeviceKind::Keyboard]);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    let config = LogicConfig {
+        inputs: 64,
+        effects: 64,
+    };
+    let mut runner = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config,
+        TimeUs(opened_at),
+    )
+    .unwrap();
+    assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
+
+    assert_eq!(runner.stream(), expected);
+    let record = runner.record();
+    assert_eq!(record.start, start);
+    assert_eq!(record.events, events);
+}
+
+#[test]
+fn device_beyond_the_source_limit_marks_the_record_incomplete() {
+    let chart = chart(8, 100 * MS, 50 * MS);
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let events = input::autoplay(&chart, &dev.sources[0]).unwrap();
+    // Two keyboards, room for one source.
+    let script = ScriptedInput::from_log(
+        &InputStart::default(),
+        &events,
+        &[DeviceKind::Keyboard, DeviceKind::Keyboard],
+    );
+    let sources = SourceSet::new(SourceConfig {
+        max_sources: 1,
+        ..common::sources()
+    })
+    .unwrap();
+    let mut runner = Runner::new(
+        &chart,
+        &rule,
+        &dev,
+        sources,
+        script,
+        config(&chart, 64),
+        START,
+    )
+    .unwrap();
+    assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
+
+    assert_eq!(count_judged(runner.stream(), Judgment::Perfect), 8);
+    let incomplete = runner.incomplete();
+    assert!(incomplete.source_limit);
+    assert!(!incomplete.overflow);
 }

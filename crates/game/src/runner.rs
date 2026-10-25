@@ -2,11 +2,12 @@
 //! order production runs it (design.md "Mechanisms for Testing").
 
 use bms_model::{Chart, TimeSource, TimeUs, VirtualClock};
-use eval::{DeviceProfile, EvalInput, JudgeEvent};
+use eval::{DeviceProfile, JudgeEvent};
 use input::{InputAdapter, ScriptedInput, SourceSet};
+use replay::Incomplete;
 use rules::RulePreset;
 
-use crate::logic::{EventSink, Logic, LogicConfig, LogicError};
+use crate::logic::{AbortCause, EventSink, Logic, LogicConfig, LogicError, Record};
 use crate::render::{PlayView, RenderSide};
 
 /// How a run ended.
@@ -14,15 +15,16 @@ use crate::render::{PlayView, RenderSide};
 pub enum RunOutcome {
     /// Evaluation completed.
     Complete,
-    /// The play was aborted: the focus gate tripped, or every source was
-    /// retired. It ends at the watermark already finalized.
-    Aborted,
+    /// The play was aborted. It ends at the watermark already finalized.
+    Aborted(AbortCause),
 }
 
 /// Runs a scripted play on a [`VirtualClock`]. Each step moves the clock,
 /// then feeds the script (which publishes), advances the logic, runs the
 /// audio step and drains the render side. Every buffer is reserved at
-/// construction, so the steps allocate nothing.
+/// construction, so the steps allocate nothing: the logic emits at most
+/// [`Logic::max_events`] events over the whole play, which the stream and
+/// effect collectors reserve.
 pub struct Runner<'a> {
     clock: VirtualClock,
     sources: SourceSet,
@@ -45,9 +47,12 @@ impl std::fmt::Debug for Runner<'_> {
 }
 
 impl<'a> Runner<'a> {
-    /// Feeds the script up to `start`, which connects its devices, opens
-    /// recording there, and prepares the logic for the participating
-    /// sources. `device` is indexed by their source ids.
+    /// Bootstraps the input side by feeding the script's items before
+    /// `start` (device connections and the controls held before the play),
+    /// opens recording at `start`, and prepares the logic for the
+    /// participating sources. Items at `start` or later are fed by the
+    /// steps and belong to the play, as events after the snapshot boundary
+    /// do. `device` is indexed by the source ids.
     ///
     /// # Errors
     ///
@@ -62,7 +67,7 @@ impl<'a> Runner<'a> {
         start: TimeUs,
     ) -> Result<Self, LogicError> {
         let clock = VirtualClock::new(start);
-        script.poll(start, &mut sources);
+        script.poll(TimeUs(start.0.saturating_sub(1)), &mut sources);
         let input_start = sources.open_recording(start);
         let readers = sources.take_readers();
         let sinks: Vec<Box<dyn EventSink + Send + 'a>> = Vec::new();
@@ -93,21 +98,17 @@ impl<'a> Runner<'a> {
             let now = self.clock.now();
             self.script.poll(now, &mut self.sources);
             if self.sources.gate().is_tripped() {
-                // The play ends at what was already finalized.
-                self.logic.abort();
-                self.render_step();
-                return RunOutcome::Aborted;
+                self.logic.abort(AbortCause::FocusLoss);
             }
             let advance = self.logic.advance_to(now);
             self.stream.extend_from_slice(self.logic.events());
             Self::audio_step(now);
             self.render_step();
+            if let Some(cause) = advance.aborted {
+                return RunOutcome::Aborted(cause);
+            }
             if advance.complete {
                 return RunOutcome::Complete;
-            }
-            if advance.watermark.is_none() {
-                self.logic.abort();
-                return RunOutcome::Aborted;
             }
         }
     }
@@ -147,15 +148,20 @@ impl<'a> Runner<'a> {
 
     /// The collected record, for re-evaluation.
     #[must_use]
-    pub fn record(&self) -> EvalInput {
+    pub fn record(&self) -> Record {
         self.logic.record()
     }
 
-    /// Whether the record is incomplete: an input queue or the record
-    /// overflowed, or an input could not be evaluated in order.
+    /// Why the record may be incomplete: an input queue, the input budget
+    /// or the evaluator overflowed, or a device beyond the source limit did
+    /// not take part.
     #[must_use]
-    pub fn incomplete(&self) -> bool {
-        self.logic.incomplete() || self.sources.overflowed()
+    pub fn incomplete(&self) -> Incomplete {
+        Incomplete {
+            overflow: self.logic.overflowed() || self.sources.overflowed(),
+            source_limit: self.sources.source_limited(),
+            suspend: false,
+        }
     }
 
     /// The logic step.
