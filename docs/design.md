@@ -805,7 +805,7 @@ Rust is recommended as the core language. The evaluator can be shared between th
 | --- | --- | --- |
 | L0 | `bms-model` | Chart types, time (µs) types |
 | L1 | `bms-parser` | Loading BMS/BME/PMS/BMSON, `#RANDOM`, time computation with rational numbers |
-| L2 | `rules` | Preset types and loading, judgment window and gauge tables |
+| L2 | `rules` | Preset types, validation and canonical encoding, judgment window and gauge tables. Takes no external dependency; loading preset files (TOML) sits in `game`, so `eval`'s dependency closure stays free of external crates |
 | L2 | `eval` | The evaluator. Depends only on `bms-model` and `rules` |
 | L2 | `replay` | Input log and replay formats |
 | L3 | `input`, `audio` | Raw Input/HID/MIDI, WASAPI/ASIO and the mixer |
