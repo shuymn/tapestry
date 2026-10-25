@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ::audio::{AudioEngine, AudioOutput, OutputError, SoundCmd, StepReport};
+use ::audio::{AudioEngine, AudioOutput, OutputError, SoundCmd};
 use bms_model::TimeUs;
 use eval::{JudgeEvent, JudgeEventKind};
 
@@ -59,6 +59,12 @@ impl AudioQueue {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.cmds.is_empty()
+    }
+
+    /// Key sounds waiting.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cmds.slots()
     }
 
     /// Sounds dropped because the queue was full.
@@ -116,7 +122,7 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
     }
 
     /// Runs every engine step whose buffer event is due before `now` (with
-    /// `through`, at `now` too), in time order.
+    /// `through`, at `now` too), in time order, and returns how many ran.
     ///
     /// # Errors
     ///
@@ -126,14 +132,15 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
         now: TimeUs,
         through: bool,
         queue: &mut AudioQueue,
-    ) -> Result<StepReport, OutputError> {
-        let mut last = StepReport::default();
+    ) -> Result<u32, OutputError> {
+        let mut wakes = 0;
         loop {
             let at = self.output.next_wake();
             if at > now || (at == now && !through) {
-                return Ok(last);
+                return Ok(wakes);
             }
-            last = self.engine.step(&mut self.output, queue.commands())?;
+            self.engine.step(&mut self.output, queue.commands())?;
+            wakes += 1;
         }
     }
 

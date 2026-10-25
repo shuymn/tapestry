@@ -21,7 +21,18 @@ pub enum RunOutcome {
     Aborted(AbortCause),
     /// The audio output failed; the run stopped at that step.
     OutputFailed(OutputError),
+    /// Evaluation completed, but the output rendered the last key sounds
+    /// within [`HANDOFF_WAKES`] buffer events; the run stopped there.
+    HandoffStalled,
 }
+
+/// Buffer events the runner waits, after evaluation completes, for the
+/// last key sounds to be rendered. The wake after the final step takes its
+/// sounds and renders each in the block it writes; each wake takes up to
+/// [`audio::MAX_PENDING_STARTS`], so four cover a final step of up to four
+/// times that many. An output that renders nothing in that time has
+/// stalled.
+pub const HANDOFF_WAKES: u32 = 4;
 
 /// Runs a scripted play on a [`VirtualClock`]. Each step moves the clock,
 /// then feeds the script (which publishes), advances the logic, runs the
@@ -106,8 +117,10 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
     /// aborted. Audio buffer events that fell between two steps run before
     /// the later step's logic, in time order, so none takes a key sound
     /// judged after it. An abort stops the audio before anything more is
-    /// mixed. Once evaluation completes, the audio alone keeps running
-    /// until every queued key sound has been taken.
+    /// mixed; a focus loss known at the step stops it before the buffer
+    /// events still due run, and so does a failed write. Once evaluation
+    /// completes, the audio alone keeps running until every key sound has
+    /// been rendered, for at most [`HANDOFF_WAKES`] buffer events.
     ///
     /// # Panics
     ///
@@ -120,12 +133,11 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
             self.script.poll(now, &mut self.sources);
             if self.sources.gate().is_tripped() {
                 self.logic.abort(AbortCause::FocusLoss);
-            }
-            // Buffer events that fell between the previous step and this
-            // one came before this step's logic, so they must not see the
-            // commands it emits.
-            if let Err(e) = self.audio.step(now, false, &mut self.sounds) {
-                return RunOutcome::OutputFailed(e);
+            } else if let Err(e) = self.audio.step(now, false, &mut self.sounds) {
+                // Buffer events that fell between the previous step and this
+                // one came before this step's logic, so they must not see the
+                // commands it emits.
+                return self.output_failed(e);
             }
             let advance = self.logic.advance_to(now);
             self.stream.extend_from_slice(self.logic.events());
@@ -135,7 +147,7 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
                 return RunOutcome::Aborted(cause);
             }
             if let Err(e) = self.audio.step(now, true, &mut self.sounds) {
-                return RunOutcome::OutputFailed(e);
+                return self.output_failed(e);
             }
             self.render_step();
             if advance.complete {
@@ -144,14 +156,26 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
         }
     }
 
+    fn output_failed(&mut self, e: OutputError) -> RunOutcome {
+        self.audio.cancel(&mut self.sounds);
+        RunOutcome::OutputFailed(e)
+    }
+
     /// After evaluation completes, keeps the audio running, with input and
-    /// evaluation frozen, until every queued key sound has been taken, so
-    /// the last one is mixed. (How long the tail plays on is session policy.)
+    /// evaluation frozen, until no key sound is queued or waiting to start,
+    /// so the last one is rendered. (How long the tail plays on is session
+    /// policy.)
     fn finish_handoff(&mut self, step: TimeUs) -> RunOutcome {
-        while !self.sounds.is_empty() {
+        let mut wakes = 0;
+        while !(self.sounds.is_empty() && self.audio.engine().mixer().pending() == 0) {
+            if wakes >= HANDOFF_WAKES {
+                self.audio.cancel(&mut self.sounds);
+                return RunOutcome::HandoffStalled;
+            }
             self.clock.advance(step);
-            if let Err(e) = self.audio.step(self.clock.now(), true, &mut self.sounds) {
-                return RunOutcome::OutputFailed(e);
+            match self.audio.step(self.clock.now(), true, &mut self.sounds) {
+                Ok(n) => wakes += n,
+                Err(e) => return self.output_failed(e),
             }
         }
         RunOutcome::Complete
@@ -221,5 +245,11 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
     #[must_use]
     pub fn dropped_sounds(&self) -> u64 {
         self.sounds.dropped()
+    }
+
+    /// Key sounds queued for audio and not yet taken.
+    #[must_use]
+    pub fn queued_sounds(&self) -> usize {
+        self.sounds.len()
     }
 }

@@ -8,10 +8,13 @@ mod common;
 
 use std::sync::Arc;
 
-use audio::{AudioEngine, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
+use audio::{
+    AudioEngine, AudioOutput, OutputError, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank,
+    Wake,
+};
 use bms_model::{BgmEvent, Chart, ChartBuilder, SoundId, TimeUs};
 use common::{MS, PERIOD, RATE, autoplay_script, control, device, lane};
-use game::{AbortCause, LogicConfig, RunOutcome, Runner, RunnerAudio};
+use game::{AbortCause, LogicConfig, RunOutcome, Runner, RunnerAudio, Wakes};
 use input::{Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceSet};
 
 const START: TimeUs = TimeUs(-1_000_000);
@@ -129,20 +132,73 @@ fn jittered_wakes_never_take_a_key_sound_before_its_judgment() {
     }
 }
 
-#[test]
-fn a_key_sound_judged_with_the_song_end_is_still_mixed() {
-    // One sounded tap at 1 s, pressed exactly on its late edge (1.180 s)
-    // with no offset. The press and the song end are emitted together at
-    // 1.181 s; the next wake, 1.190 s, comes after evaluation completed and
-    // must still take the sound: wake j = 219 writes from frame 220 × 480.
-    let mut chart = ChartBuilder::new(150_000)
-        .sound("a")
-        .tap(lane(1), TimeUs(1_000 * MS))
-        .build()
-        .unwrap();
-    chart.lanes[1][0].sound = Some(SoundId(0));
-    let rule = rules::custom();
-    let dev = device(&[0]);
+/// A simulated device that, for `empty_wakes` buffer events from
+/// `empty_from` on, hands the engine an empty buffer (a legal write that
+/// takes nothing), so nothing it renders reaches the device.
+struct Flaky {
+    inner: SimDevice,
+    empty_from: TimeUs,
+    empty_wakes: u32,
+    last: TimeUs,
+    /// Writes from wakes at or after this time fail.
+    fail_from: TimeUs,
+}
+
+impl Flaky {
+    fn new(empty_from: TimeUs, empty_wakes: u32) -> Self {
+        Self {
+            inner: SimDevice::new(SimConfig::steady(RATE, PERIOD, START)),
+            empty_from,
+            empty_wakes,
+            last: TimeUs(i64::MIN),
+            fail_from: TimeUs(i64::MAX),
+        }
+    }
+}
+
+impl AudioOutput for Flaky {
+    fn rate(&self) -> u32 {
+        self.inner.rate()
+    }
+    fn period(&self) -> u32 {
+        self.inner.period()
+    }
+    fn wait(&mut self) -> Wake {
+        let w = self.inner.wait();
+        self.last = w.at;
+        w
+    }
+    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
+        if self.last >= self.fail_from {
+            return Err(OutputError::DeviceLost);
+        }
+        if self.last >= self.empty_from && self.empty_wakes > 0 {
+            self.empty_wakes -= 1;
+            f(&mut []);
+            return Ok(());
+        }
+        self.inner.write(f)
+    }
+}
+
+impl Wakes for Flaky {
+    fn next_wake(&self) -> TimeUs {
+        self.inner.next_wake()
+    }
+}
+
+fn audio_flaky(
+    chart: &Chart,
+    bank: Arc<SoundBank>,
+    out: Flaky,
+) -> RunnerAudio<RecordingOutput<Flaky>> {
+    let engine = AudioEngine::new(bank, &chart.bgm, RATE, PERIOD, 64, 0).unwrap();
+    RunnerAudio::new(engine, RecordingOutput::new(out, 6 * 48_000))
+}
+
+/// One keyboard pressing lane 1 at each of `presses` (released 40 µs
+/// later), and losing focus at `focus`.
+fn key_script(presses: &[i64], focus: Option<i64>) -> ScriptedInput {
     let key = |value| {
         Action::Packet(Packet {
             device: DeviceId(0),
@@ -151,53 +207,115 @@ fn a_key_sound_judged_with_the_song_end_is_still_mixed() {
             background: false,
         })
     };
-    let script = ScriptedInput::new(vec![
-        ScriptItem {
-            at: TimeUs(i64::MIN),
-            action: Action::Connect(DeviceId(0), DeviceKind::Keyboard),
-        },
-        ScriptItem {
-            at: TimeUs(1_180 * MS),
-            action: key(1),
-        },
-        ScriptItem {
-            at: TimeUs(1_200 * MS),
-            action: key(0),
-        },
-    ])
-    .with_recorded(DeviceId(0), vec![control(lane(1))]);
+    let at = |t: i64, action| ScriptItem {
+        at: TimeUs(t),
+        action,
+    };
+    let mut items = vec![at(
+        i64::MIN,
+        Action::Connect(DeviceId(0), DeviceKind::Keyboard),
+    )];
+    for &t in presses {
+        items.push(at(t, key(1)));
+        items.push(at(t + 40, key(0)));
+    }
+    items.extend(focus.map(|t| at(t, Action::FocusLoss)));
+    ScriptedInput::new(items).with_recorded(DeviceId(0), vec![control(lane(1))])
+}
+
+/// One sounded tap at 1 s, pressed exactly on its late edge (1.180 s) with
+/// no offset: the press and the song end are emitted together at 1.181 s.
+fn late_edge(out: Flaky) -> (RunOutcome, Vec<f32>) {
+    let mut chart = ChartBuilder::new(150_000)
+        .sound("a")
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    chart.lanes[1][0].sound = Some(SoundId(0));
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let script = key_script(&[1_180 * MS], None);
     let sources = SourceSet::new(common::sources()).unwrap();
-    let audio = audio_on(
-        &chart,
-        common::bank(&chart),
-        SimConfig::steady(RATE, PERIOD, START),
-    );
+    let audio = audio_flaky(&chart, common::bank(&chart), out);
     let mut runner =
         Runner::new(&chart, &rule, &dev, sources, script, config(), START, audio).unwrap();
-    assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::Complete);
-    assert_eq!(onsets(&left(&runner)), [220 * 480]);
+    let outcome = runner.run_to_end(TimeUs(MS));
+    (outcome, left(&runner))
 }
 
 #[test]
-fn an_abort_stops_the_sounds_and_the_bgm_to_come() {
-    // A 2 s BGM sound from 0.5 s is playing when focus is lost at 1 s; a
-    // BGM click is due at 1.025 s, inside the block the 1 s wake would
-    // write. The abort comes before that wake's mixing: the click never
-    // sounds, and the long sound, the BGM still to come and the queue all
-    // stop.
+fn a_key_sound_judged_with_the_song_end_is_still_mixed() {
+    // The next wake, 1.190 s, comes after evaluation completed and must
+    // still take the sound: wake j = 219 writes from frame 220 × 480.
+    let (outcome, samples) = late_edge(Flaky::new(START, 0));
+    assert_eq!(outcome, RunOutcome::Complete);
+    assert_eq!(onsets(&samples), [220 * 480]);
+}
+
+#[test]
+fn a_key_sound_taken_by_an_empty_write_is_rendered_by_the_next() {
+    // The 1.190 s wake takes the sound but writes nothing, so it waits as a
+    // pending start; the 1.200 s wake renders it, still from frame
+    // 220 × 480 (the first one not written).
+    let (outcome, samples) = late_edge(Flaky::new(TimeUs(1_190 * MS), 1));
+    assert_eq!(outcome, RunOutcome::Complete);
+    assert_eq!(onsets(&samples), [220 * 480]);
+}
+
+#[test]
+fn a_stalled_output_ends_the_handoff_instead_of_waiting_forever() {
+    // An output that never takes a frame, and 1100 key sounds, more than the
+    // 1024 starts the mixer holds: they can never all be rendered, so the
+    // runner gives up after HANDOFF_WAKES wakes and says so.
+    let mut chart = ChartBuilder::new(150_000)
+        .sound("a")
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    chart.lanes[1][0].sound = Some(SoundId(0));
+    let rule = rules::custom();
+    let dev = device(&[0]);
+    let presses: Vec<i64> = (0..1_100).map(|k| 200 * MS + k * 100).collect();
+    let script = key_script(&presses, None);
+    let sources = SourceSet::new(common::sources()).unwrap();
+    let audio = audio_flaky(&chart, common::bank(&chart), Flaky::new(START, u32::MAX));
+    let config = LogicConfig {
+        inputs: 4_096,
+        effects: 4_096,
+    };
+    let mut runner =
+        Runner::new(&chart, &rule, &dev, sources, script, config, START, audio).unwrap();
+    assert_eq!(runner.run_to_end(TimeUs(MS)), RunOutcome::HandoffStalled);
+    assert!(onsets(&left(&runner)).is_empty());
+    assert_eq!(runner.queued_sounds(), 0);
+    assert_eq!(runner.audio().engine().mixer().pending(), 0);
+}
+
+/// A 2 s BGM sound playing from 0.5 s, a BGM click due at `click`, a
+/// sounded tap at 2 s whose key sound is pressed at each of `presses`, and
+/// focus lost at `focus`; returns the run's outcome and samples.
+fn abort_run(
+    step: i64,
+    focus: i64,
+    click: i64,
+    presses: &[i64],
+    out: Flaky,
+) -> (RunOutcome, Vec<f32>, usize, usize, usize, usize) {
     let mut chart = ChartBuilder::new(150_000)
         .sound("long")
         .sound("click")
+        .sound("key")
         .tap(lane(1), TimeUs(2_000 * MS))
         .build()
         .unwrap();
+    chart.lanes[1][0].sound = Some(SoundId(2));
     chart.bgm = vec![
         BgmEvent {
             time: TimeUs(500 * MS),
             sound: SoundId(0),
         },
         BgmEvent {
-            time: TimeUs(1_025 * MS),
+            time: TimeUs(click),
             sound: SoundId(1),
         },
     ];
@@ -206,36 +324,78 @@ fn an_abort_stops_the_sounds_and_the_bgm_to_come() {
         vec![
             Sound::mono(vec![8_192; 96_000]),
             Sound::mono(vec![4_096; 480]),
+            Sound::mono(vec![2_048; 480]),
         ],
     ));
     let rule = rules::custom();
     let dev = device(&[0]);
-    let script = ScriptedInput::new(vec![
-        ScriptItem {
-            at: TimeUs(i64::MIN),
-            action: Action::Connect(DeviceId(0), DeviceKind::Keyboard),
-        },
-        ScriptItem {
-            at: TimeUs(1_000 * MS),
-            action: Action::FocusLoss,
-        },
-    ])
-    .with_recorded(DeviceId(0), vec![control(lane(1))]);
+    let script = key_script(presses, Some(focus));
     let sources = SourceSet::new(common::sources()).unwrap();
-    let audio = audio_on(&chart, bank, SimConfig::steady(RATE, PERIOD, START));
+    let audio = audio_flaky(&chart, bank, out);
     let mut runner =
         Runner::new(&chart, &rule, &dev, sources, script, config(), START, audio).unwrap();
-    assert_eq!(
-        runner.run_to_end(TimeUs(MS)),
-        RunOutcome::Aborted(AbortCause::FocusLoss)
+    let outcome = runner.run_to_end(TimeUs(step));
+    let engine = runner.audio().engine();
+    (
+        outcome,
+        left(&runner),
+        engine.mixer().sounding(),
+        engine.mixer().pending(),
+        engine.bgm_left(),
+        runner.queued_sounds(),
+    )
+}
+
+#[test]
+fn an_abort_stops_the_sounds_and_the_bgm_to_come() {
+    // Focus is lost at 1 s, while the long sound plays. A click is due at
+    // 1.025 s, inside the block the 1 s wake would write. A key sound
+    // pressed at 0.985 s was taken by the 0.99 s wake, which wrote nothing,
+    // so it waits as a pending start; one pressed at 0.998 s is still
+    // queued. The abort comes before the 1 s wake: the click never sounds,
+    // and the long sound, the pending start, the queued sound and the BGM
+    // to come all stop.
+    let (outcome, samples, sounding, pending, bgm_left, queued) = abort_run(
+        MS,
+        1_000 * MS,
+        1_025 * MS,
+        &[985 * MS, 998 * MS],
+        Flaky::new(TimeUs(990 * MS), 1),
     );
-    let samples = left(&runner);
-    // The long sound was playing (0.25 of full scale), the click never.
+    assert_eq!(outcome, RunOutcome::Aborted(AbortCause::FocusLoss));
+    // The long sound was playing (0.25 of full scale), nothing else.
     assert!(samples.contains(&0.25));
     assert!(samples.iter().all(|&x| x <= 0.25), "the click sounded");
-    let engine = runner.audio().engine();
-    assert_eq!(engine.mixer().sounding(), 0);
-    assert_eq!(engine.bgm_left(), 0);
+    assert_eq!((sounding, pending, bgm_left, queued), (0, 0, 0, 0));
+}
+
+#[test]
+fn a_failed_write_stops_the_sounds_and_the_bgm_to_come() {
+    // The device fails from its 1 s wake on, while the long sound plays and
+    // a key sound pressed at 0.998 s is queued: the run stops with the
+    // failure, and everything still to sound is cancelled.
+    let out = Flaky {
+        fail_from: TimeUs(1_000 * MS),
+        ..Flaky::new(START, 0)
+    };
+    let (outcome, _, sounding, pending, bgm_left, queued) =
+        abort_run(MS, 3_000 * MS, 1_025 * MS, &[998 * MS], out);
+    assert_eq!(outcome, RunOutcome::OutputFailed(OutputError::DeviceLost));
+    assert_eq!((sounding, pending, bgm_left, queued), (0, 0, 0, 0));
+}
+
+#[test]
+fn a_focus_loss_between_coarse_steps_stops_audio_before_its_overdue_wakes() {
+    // Steps of 100 ms: focus lost at 1.050 s is seen at the 1.100 s step.
+    // The wakes from 1.060 s on are overdue then, but come after the loss;
+    // the 1.080 s one would write the block holding a click due at
+    // 1.105 s. The abort stops audio before any of them runs.
+    let (outcome, samples, sounding, _, bgm_left, _) =
+        abort_run(100 * MS, 1_050 * MS, 1_105 * MS, &[], Flaky::new(START, 0));
+    assert_eq!(outcome, RunOutcome::Aborted(AbortCause::FocusLoss));
+    assert!(samples.contains(&0.25));
+    assert!(samples.iter().all(|&x| x <= 0.25), "the click sounded");
+    assert_eq!((sounding, bgm_left), (0, 0));
 }
 
 #[test]

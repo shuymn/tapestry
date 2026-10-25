@@ -23,5 +23,5 @@ pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };
 pub use render::{PlayView, RenderSide, RenderSink};
-pub use runner::{RunOutcome, Runner};
+pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link};
