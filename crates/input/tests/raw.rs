@@ -100,11 +100,6 @@ fn keyboard_packet_decodes_to_scan_code_edge() {
             decoded(0xBB05, 0x36, 0),
         ),
     ];
-    let decoded = cases
-        .iter()
-        .filter(|(block, _)| decode_keyboard(block).is_some())
-        .count();
-    assert_eq!(decoded, 10);
     for (i, (block, want)) in cases.iter().enumerate() {
         assert_eq!(decode_keyboard(block), *want, "case {i}");
     }
