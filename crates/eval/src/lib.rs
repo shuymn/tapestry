@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+mod batch;
 mod convert;
 mod error;
 mod evaluator;
@@ -27,6 +28,7 @@ mod gauge;
 mod input;
 mod merge;
 
+pub use batch::{EvalInput, Evaluation, GaugePoint, GaugeResult, evaluate};
 pub use convert::{ConversionState, Edges, LaneEdge};
 pub use error::EvalError;
 pub use evaluator::{
