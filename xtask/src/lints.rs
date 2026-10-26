@@ -13,10 +13,12 @@
 //!   workspace member inherits `[workspace.lints]`; the cast and
 //!   disallowed-API lines stand at the crate roots in [`CRATE_ROOT_LINES`];
 //!   every in-play site in [`IN_PLAY`] carries the attribute denying
-//!   `unwrap`, `expect` and indexing; the test allowances of the two
+//!   `unwrap`, `expect` and indexing, and no attribute in its file lowers
+//!   them to `allow` or `warn`; the test allowances of the two
 //!   `clippy.toml` files match; `crates/eval/clippy.toml` lists every path
 //!   in [`REQUIRED_DISALLOWED`]; and the fixture files are exactly
-//!   [`LINTS`], with no attribute in them.
+//!   [`LINTS`], with no attribute (doc comments aside) and no macro
+//!   definition in them.
 //!
 //! The site check is partial, like R1's allowlist: it checks the listed
 //! sites, and the in-play list is a reviewed table (design.md "Scope of No
@@ -26,11 +28,13 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr as _;
 
 use cargo_metadata::diagnostic::DiagnosticLevel;
 use cargo_metadata::{Message, MetadataCommand};
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens as _;
+use syn::punctuated::Punctuated;
 
 /// The cfg that compiles the fixtures.
 const FIXTURE_CFG: &str = "tapestry_lint_fixtures";
@@ -562,16 +566,22 @@ pub fn check_sites(root: &Path, members: &[PathBuf]) -> Result<Vec<String>, Stri
 /// One [`IN_PLAY`] entry.
 fn check_site(root: &Path, site: Site) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
+    let (Site::File(file) | Site::Fns(file, _)) = site;
+    let (source, tokens) = parse_and_lex(root, file)?;
+    for attr in lowering_attributes(tokens) {
+        out.push(format!(
+            "{file}: `{attr}` lowers an in-play lint; state the invariant in an `#[expect]`"
+        ));
+    }
     match site {
-        Site::File(file) => {
-            if !has_module_attr(&parse_source(root, file)?) {
+        Site::File(_) => {
+            if !has_module_attr(&source) {
                 out.push(format!(
                     "{file}: in-play module lacks `{MODULE_ATTR}` before its first item"
                 ));
             }
         }
-        Site::Fns(file, names) => {
-            let source = parse_source(root, file)?;
+        Site::Fns(_, names) => {
             let whole = has_module_attr(&source);
             let fns = fn_attributes(&source);
             let fn_attr = normalize(FN_ATTR);
@@ -628,7 +638,7 @@ fn check_clippy_toml(root: &Path) -> Result<Vec<String>, String> {
 }
 
 /// The fixture directories hold exactly a `mod.rs` and one file per lint of
-/// [`LINTS`], and no fixture file carries an attribute.
+/// [`LINTS`], and no fixture file holds what [`fixture_violation`] rejects.
 fn check_fixture_files(root: &Path) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let dirs: BTreeSet<&str> = LINTS.iter().map(|&(_, dir)| dir).collect();
@@ -645,11 +655,10 @@ fn check_fixture_files(root: &Path) -> Result<Vec<String>, String> {
             let entry = entry.map_err(|e| format!("reading {dir}: {e}"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let text = read(&entry.path())?;
-            let attr = any_attribute(&text).map_err(|e| format!("parsing {dir}/{name}: {e}"))?;
-            if let Some(attr) = attr {
-                out.push(format!(
-                    "{dir}/{name}: fixtures carry no attribute, found `{attr}`"
-                ));
+            let violation =
+                fixture_violation(&text).map_err(|e| format!("parsing {dir}/{name}: {e}"))?;
+            if let Some(violation) = violation {
+                out.push(format!("{dir}/{name}: {violation}"));
             }
             found.insert(name);
         }
@@ -696,8 +705,15 @@ fn attr_text(attr: &syn::Attribute) -> String {
 /// Parses the Rust source file `path`. A file that does not parse fails
 /// the check: it cannot be shown to carry its attributes.
 fn parse_source(root: &Path, path: &str) -> Result<syn::File, String> {
+    Ok(parse_and_lex(root, path)?.0)
+}
+
+/// [`parse_source`], and the file's tokens.
+fn parse_and_lex(root: &Path, path: &str) -> Result<(syn::File, TokenStream), String> {
     let text = read(&root.join(path))?;
-    syn::parse_file(&text).map_err(|e| format!("parsing {path}: {e}"))
+    let file = syn::parse_file(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    let tokens = lex(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    Ok((file, tokens))
 }
 
 /// The file's inner attributes (those before its first item), normalized.
@@ -773,90 +789,135 @@ fn type_name(ty: &syn::Type) -> String {
     }
 }
 
-/// The first attribute anywhere in fixture source `text`, normalized, if
-/// any: outer or inner, on any item, statement, expression or field, and
-/// in macro input (where the parser sees only tokens). Doc comments
-/// (`#[doc = "..."]`) set no lint and are allowed. `Err` when `text` does
-/// not parse.
-fn any_attribute(text: &str) -> Result<Option<String>, syn::Error> {
-    let file = syn::parse_file(text)?;
-    let mut found = FirstAttribute(None);
-    syn::visit::visit_file(&mut found, &file);
-    Ok(found.0)
+/// Lexes Rust source `text` into tokens. Comments are dropped, doc comments
+/// become `#[doc = "..."]` attributes, and every literal is one token, so
+/// nothing inside a string or comment is seen as code.
+fn lex(text: &str) -> Result<TokenStream, String> {
+    TokenStream::from_str(text).map_err(|e| e.to_string())
 }
 
-struct FirstAttribute(Option<String>);
-
-impl<'ast> syn::visit::Visit<'ast> for FirstAttribute {
-    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-        if self.0.is_none() {
-            self.0 = token_attribute(attr.to_token_stream());
-        }
-    }
-
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        if self.0.is_none() {
-            self.0 = token_attribute(mac.tokens.clone());
-        }
-        syn::visit::visit_macro(self, mac);
-    }
-
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        if let syn::Item::Verbatim(tokens) = item
-            && self.0.is_none()
-        {
-            self.0 = token_attribute(tokens.clone());
-        }
-        syn::visit::visit_item(self, item);
-    }
-
-    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
-        if let syn::Expr::Verbatim(tokens) = expr
-            && self.0.is_none()
-        {
-            self.0 = token_attribute(tokens.clone());
-        }
-        syn::visit::visit_expr(self, expr);
-    }
-}
-
-/// The first attribute (`#` and `[...]`, or `#`, `!` and `[...]`) in
-/// `tokens`, at any depth, other than a doc comment (`doc = "..."`),
-/// normalized.
-fn token_attribute(tokens: TokenStream) -> Option<String> {
+/// Calls `f` on every token tree of `tokens`, at any depth, with the trees
+/// that follow it in its own group.
+fn for_each_tree(tokens: TokenStream, f: &mut impl FnMut(&TokenTree, &[TokenTree])) {
     let trees: Vec<TokenTree> = tokens.into_iter().collect();
     for (k, tree) in trees.iter().enumerate() {
+        f(tree, trees.get(k + 1..).unwrap_or_default());
+        if let TokenTree::Group(g) = tree {
+            for_each_tree(g.stream(), f);
+        }
+    }
+}
+
+/// The attribute a `#` starts, given the trees after it: `!` for an inner
+/// one, and its bracket group.
+fn attribute_after(rest: &[TokenTree]) -> Option<(&'static str, &Group)> {
+    match rest {
+        [TokenTree::Punct(b), TokenTree::Group(g), ..]
+            if b.as_char() == '!' && g.delimiter() == Delimiter::Bracket =>
+        {
+            Some(("!", g))
+        }
+        [TokenTree::Group(g), ..] if g.delimiter() == Delimiter::Bracket => Some(("", g)),
+        _ => None,
+    }
+}
+
+/// The attribute `#`, `bang` and `group` form, normalized.
+fn attribute_text(bang: &str, group: &Group) -> String {
+    normalize(&format!("#{bang}{group}"))
+}
+
+/// Whether an attribute's bracket group is a doc comment's, exactly
+/// `doc = "..."`.
+fn is_doc(group: &Group) -> bool {
+    let body: Vec<TokenTree> = group.stream().into_iter().collect();
+    matches!(
+        body.as_slice(),
+        [TokenTree::Ident(i), TokenTree::Punct(eq), TokenTree::Literal(l)]
+            if *i == "doc" && eq.as_char() == '=' && l.to_string().starts_with('"')
+    )
+}
+
+/// What a fixture may not hold, if `text` holds any: a `#` anywhere (an
+/// attribute, or one being built from pieces) other than a doc comment, or
+/// a `macro_rules!` definition, whose expansion could build one. `Err` when
+/// `text` does not lex.
+fn fixture_violation(text: &str) -> Result<Option<String>, String> {
+    let mut found = None;
+    for_each_tree(lex(text)?, &mut |tree, rest| {
+        if found.is_some() {
+            return;
+        }
         match tree {
-            TokenTree::Punct(p) if p.as_char() == '#' => {
-                let (bang, group) = match trees.get(k + 1..).unwrap_or_default() {
-                    [TokenTree::Punct(b), TokenTree::Group(g), ..] if b.as_char() == '!' => {
-                        ("!", g)
-                    }
-                    [TokenTree::Group(g), ..] => ("", g),
-                    _ => continue,
-                };
-                if group.delimiter() != Delimiter::Bracket {
-                    continue;
+            TokenTree::Punct(p) if p.as_char() == '#' => match attribute_after(rest) {
+                Some((_, g)) if is_doc(g) => {}
+                Some((bang, g)) => {
+                    let attr = attribute_text(bang, g);
+                    found = Some(format!("fixtures carry no attribute, found `{attr}`"));
                 }
-                let body: Vec<TokenTree> = group.stream().into_iter().collect();
-                let doc = matches!(
-                    body.as_slice(),
-                    [TokenTree::Ident(i), TokenTree::Punct(eq), TokenTree::Literal(l)]
-                        if *i == "doc" && eq.as_char() == '=' && l.to_string().starts_with('"')
-                );
-                if !doc {
-                    return Some(normalize(&format!("#{bang}{group}")));
-                }
-            }
-            TokenTree::Group(g) => {
-                if let Some(found) = token_attribute(g.stream()) {
-                    return Some(found);
-                }
+                None => found = Some("fixtures carry no attribute, found a `#`".to_owned()),
+            },
+            TokenTree::Ident(i)
+                if *i == "macro_rules"
+                    && matches!(rest.first(), Some(TokenTree::Punct(b)) if b.as_char() == '!') =>
+            {
+                found = Some("fixtures define no macro, found `macro_rules!`".to_owned());
             }
             _ => {}
         }
+    });
+    Ok(found)
+}
+
+/// The lints the in-play attributes deny, and the groups that hold them.
+const IN_PLAY_LINTS: &[&str] = &[
+    "clippy::expect_used",
+    "clippy::indexing_slicing",
+    "clippy::unwrap_used",
+    "clippy::restriction",
+    "clippy::all",
+];
+
+/// Every attribute in source `tokens`, at any depth (statements,
+/// expressions and macro input included), that lowers an in-play lint to
+/// `allow` or `warn`, directly or through `cfg_attr`, normalized. Such an
+/// attribute would silently undo the file's or function's deny; an
+/// in-play exception is an `#[expect]` instead, which states its reason
+/// and fails when unfulfilled.
+fn lowering_attributes(tokens: TokenStream) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_tree(tokens, &mut |tree, rest| {
+        if let TokenTree::Punct(p) = tree
+            && p.as_char() == '#'
+            && let Some((bang, g)) = attribute_after(rest)
+            && syn::parse2::<syn::Meta>(g.stream()).is_ok_and(|meta| lowers(&meta))
+        {
+            out.push(attribute_text(bang, g));
+        }
+    });
+    out
+}
+
+/// Whether `meta` is `allow(..)` or `warn(..)` naming an in-play lint, or a
+/// `cfg_attr` holding one. Arguments that do not parse count as lowering.
+fn lowers(meta: &syn::Meta) -> bool {
+    let syn::Meta::List(list) = meta else {
+        return false;
+    };
+    let args = || list.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated);
+    if list.path.is_ident("allow") || list.path.is_ident("warn") {
+        return args().map_or(true, |lints| {
+            lints.iter().any(|lint| {
+                matches!(lint, syn::Meta::Path(path)
+                    if IN_PLAY_LINTS.contains(&normalize(&path.to_token_stream().to_string()).as_str()))
+            })
+        });
     }
-    None
+    if list.path.is_ident("cfg_attr") {
+        // The predicate, then the attributes it applies.
+        return args().map_or(true, |metas| metas.iter().skip(1).any(lowers));
+    }
+    false
 }
 
 #[cfg(test)]
@@ -870,8 +931,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Diag, FN_ATTR, LINTS, MODULE_ATTR, Site, any_attribute, check_site, classify,
-        fn_attributes, has_module_attr, json_messages, normalize, workspace_relative,
+        Diag, FN_ATTR, IN_PLAY_LINTS, LINTS, MODULE_ATTR, Site, check_site, classify,
+        fixture_violation, fn_attributes, has_module_attr, json_messages, lowering_attributes,
+        normalize, workspace_relative,
     };
 
     fn diag(file: &str, code: &str, error: bool) -> Diag {
@@ -1086,9 +1148,10 @@ mod tests {
     #[test]
     fn a_raw_byte_string_hides_no_definition() {
         // An annotated copy inside the literal is not a definition, and the
-        // real one after it is read.
+        // real one after it is read. The literal holds a `"`, which ends an
+        // ordinary string.
         let text = format!(
-            "const FAKE: &[u8] = br#\"\nimpl S {{\n    {FN_ATTR}\n    fn hot() {{}}\n}}\n\"#;\n\
+            "const FAKE: &[u8] = br#\"\n\"\nimpl S {{\n    {FN_ATTR}\n    fn hot() {{}}\n}}\n\"#;\n\
              const FAKE_C: &core::ffi::CStr = cr#\"\nimpl S {{ fn hot() {{}} }}\n\"#;\n\
              impl S {{\n    fn hot() {{}}\n}}\n"
         );
@@ -1129,11 +1192,14 @@ mod tests {
     }
 
     #[test]
-    fn fixture_files_reject_any_attribute() {
-        let found = |text: &str| any_attribute(text).unwrap();
+    fn fixture_files_reject_attributes_and_macro_definitions() {
+        let found = |text: &str| fixture_violation(text).unwrap();
+        let attr = |found: &str| format!("fixtures carry no attribute, found `{found}`");
         assert_eq!(found("fn f() {}\n"), None);
         assert_eq!(
-            found("//! Docs that allow(x).\n/// Doc.\nfn f() {}\n"),
+            found(
+                "//! Docs that allow(x).\n/// Doc.\nfn f() {}\nconst S: &str = \"#[deny(x)]\";\n"
+            ),
             None
         );
         assert!(found("#[allow(dead_code)]\nfn f() {}\n").is_some());
@@ -1144,22 +1210,97 @@ mod tests {
         // module.
         let nested =
             "#[rustfmt::skip]\nmod inner { #[deny(clippy::todo)] fn f() -> u8 { todo!() } }\n";
-        assert_eq!(found(nested).as_deref(), Some("#[rustfmt::skip]"));
+        assert_eq!(found(nested), Some(attr("#[rustfmt::skip]")));
         let inline = "mod inner { #[deny(clippy::todo)] fn f() -> u8 { todo!() } }\n";
-        assert_eq!(found(inline).as_deref(), Some("#[deny(clippy::todo)]"));
+        assert_eq!(found(inline), Some(attr("#[deny(clippy::todo)]")));
         // Attribute tokens split by whitespace and comments.
         let split = "fn g() -> u8 {\n    0\n}\n# /* c */ [deny(clippy::todo)]\nfn f() -> u8 {\n    todo!()\n}\n";
-        assert_eq!(found(split).as_deref(), Some("#[deny(clippy::todo)]"));
-        // On a statement, an expression and a field.
+        assert_eq!(found(split), Some(attr("#[deny(clippy::todo)]")));
+        // On a statement, an expression and a field, and in macro input.
         assert!(found("fn f() { #[deny(clippy::todo)] let x = 1; }\n").is_some());
         assert!(found("fn f() -> u8 { (#[allow(unused)] 1) }\n").is_some());
         assert!(found("struct S { #[allow(dead_code)] x: u8 }\n").is_some());
-        // In macro input, which the parser does not read as items.
-        let in_macro = "macro_rules! m {\n    () => {\n        #[deny(clippy::todo)]\n        fn f() -> u8 { todo!() }\n    };\n}\nm!();\n";
-        assert_eq!(found(in_macro).as_deref(), Some("#[deny(clippy::todo)]"));
         assert!(found("m! { #![deny(clippy::todo)] }\n").is_some());
-        // A fixture that does not parse fails closed.
-        assert!(any_attribute("fn f( {}\n").is_err());
+        // An item the parser keeps as unparsed tokens.
+        let foreign = "unsafe extern \"C\" {\n    #[deny(clippy::todo)]\n    safe fn f();\n}\n";
+        assert_eq!(found(foreign), Some(attr("#[deny(clippy::todo)]")));
+        // A `#` handed to a macro that builds the attribute at expansion.
+        let built = "macro_rules! m {\n    ($h:tt, $i:item) => {\n        $h[deny(clippy::todo)] $i\n    };\n}\n\
+                     m!(#, fn fixture() -> u8 { todo!() });\n";
+        assert_eq!(
+            found(built).as_deref(),
+            Some("fixtures define no macro, found `macro_rules!`")
+        );
+        let handed = "m!(#, fn fixture() -> u8 { todo!() });\n";
+        assert_eq!(
+            found(handed).as_deref(),
+            Some("fixtures carry no attribute, found a `#`")
+        );
+        // A fixture that does not lex fails closed.
+        assert!(fixture_violation("fn f( {}\n").is_err());
+    }
+
+    #[test]
+    fn the_lowering_check_covers_every_denied_lint() {
+        for attr in [MODULE_ATTR, FN_ATTR] {
+            let lints = attr
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(lints, _)| lints)
+                .unwrap();
+            for lint in lints.split(',') {
+                assert!(IN_PLAY_LINTS.contains(&lint.trim()), "{lint}");
+            }
+        }
+    }
+
+    #[test]
+    fn in_play_files_lower_no_in_play_lint() {
+        let lowered = |text: &str| lowering_attributes(text.parse().unwrap());
+        // A file-level deny with an impl-level and a statement-level allow.
+        let text = format!(
+            "{MODULE_ATTR}\n\
+             #[allow(clippy::unwrap_used)]\nimpl S {{\n    fn hot(x: Option<u8>) -> u8 {{ x.unwrap() }}\n}}\n\
+             fn cold(v: &[u8]) -> u8 {{\n    #[allow(clippy::indexing_slicing)]\n    let x = v[0];\n    x\n}}\n"
+        );
+        assert_eq!(
+            lowered(&text),
+            [
+                "#[allow(clippy::unwrap_used)]",
+                "#[allow(clippy::indexing_slicing)]"
+            ]
+        );
+        // Each way to lower one: `warn`, a group, inner, `cfg_attr`, in an
+        // expression, among other lints, and in macro input.
+        for attr in [
+            "#[warn(clippy::expect_used)]",
+            "#[allow(clippy::restriction)]",
+            "#[allow(clippy::all)]",
+            "#![allow(dead_code, clippy::unwrap_used)]",
+            "#[cfg_attr(test, allow(clippy::unwrap_used))]",
+            "#[cfg_attr(all(), inline, cfg_attr(any(), warn(clippy::indexing_slicing)))]",
+            "#[allow(clippy::unwrap_used, reason = \"x\")]",
+        ] {
+            assert_eq!(
+                lowered(&format!("fn f() {{ m!({attr} 1); }}\n")).len(),
+                1,
+                "{attr}"
+            );
+        }
+        // `expect` (checked for fulfillment) and other lints stay allowed,
+        // as do attributes in literals.
+        let fine = "#[expect(clippy::indexing_slicing, reason = \"bounded\")]\nfn f() {}\n\
+                    #[allow(dead_code, clippy::cast_sign_loss)]\nfn g() {}\n\
+                    #[deny(clippy::unwrap_used)]\nfn h() {}\nconst S: &str = \"#[allow(clippy::unwrap_used)]\";\n";
+        assert!(lowered(fine).is_empty());
+        // Through the site check, for files and functions alike.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("x.rs"), &text).unwrap();
+        let out = check_site(dir.path(), Site::File("x.rs")).unwrap();
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].contains("lowers an in-play lint"), "{out:?}");
+        let out = check_site(dir.path(), Site::Fns("x.rs", &["S::hot"])).unwrap();
+        assert_eq!(out.len(), 2, "{out:?}");
     }
 
     #[test]
