@@ -801,16 +801,6 @@ mod tests {
     /// no logger, also when that line cannot be written.
     #[test]
     fn an_open_failure_is_one_line_and_never_fails() {
-        struct Broken;
-        impl Write for Broken {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::Error::other("closed"))
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::other("closed"))
-            }
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("logs");
         fs::write(&logs, "").unwrap();
@@ -820,6 +810,6 @@ mod tests {
         assert_eq!(diag.lines().count(), 1, "{diag}");
         let prefix = format!("log: {}: ", logs.display());
         assert!(diag.starts_with(&prefix), "{diag}");
-        assert!(open(&logs, "play", &mut Broken).is_none());
+        assert!(open(&logs, "play", &mut Scripted::new(&[Step::Fail])).is_none());
     }
 }
