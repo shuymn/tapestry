@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
+use eval::JudgeEvent;
 use game::{
     Advance, AudioQueue, Closing, Command, Opening, PlayReport, RenderSide, Rig, Settings, Tuning,
 };
@@ -23,7 +24,9 @@ use crate::audio_side::AudioLink;
 use crate::controls::Controls;
 use crate::end_screen::{self, Hints, LoadTimes};
 use crate::input_side::{InputLink, Request};
-use crate::measure::{Figures, PlayMeasure, StepSample, measure_path, to_toml};
+use crate::measure::{
+    Figures, PlayMeasure, Step, StepSample, judgment_samples, measure_path, to_toml,
+};
 use crate::render_side::{RenderLink, RenderMsg};
 use crate::tuning::{Delivered, SettingsFiles};
 
@@ -77,6 +80,8 @@ pub struct PlayerRig<'a> {
     pub steps: rtrb::Producer<StepSample>,
     /// Step samples of the current play the full queue refused.
     pub steps_dropped: u64,
+    /// The figures of the play just over, until they are written.
+    pub figures: Option<Figures>,
     /// The current play's number, as the audio thread knows it.
     pub generation: u64,
     /// Each saved play's record and figures, kept for the display
@@ -142,8 +147,10 @@ impl PlayerRig<'_> {
 
     /// Takes the ended play's figures from the render thread and writes
     /// them beside its saved record.
+    /// Writes the figures frozen when the play was over beside its saved
+    /// record.
     fn write_measure(&mut self, report: &PlayReport) {
-        let Some(mut fig) = self.render.finish(self.clock.now()) else {
+        let Some(mut fig) = self.figures.take() else {
             eprintln!("measure: no figures for play {}", report.attempt);
             return;
         };
@@ -278,13 +285,17 @@ impl Rig for PlayerRig<'_> {
         let _ = self.audio.control.play(origin, sounds);
         self.generation = self.audio.control.generation();
         self.steps_dropped = 0;
-        let underruns = self.audio.control.underruns();
+        let counters = self.audio.control.counters();
         let measure = PlayMeasure {
             generation: self.generation,
             origin,
             load_from: self.retry_from.unwrap_or(TimeUs(0)),
             retry: self.retry_from.is_some(),
-            underruns: Some((underruns.clone(), underruns.get())),
+            audio: Some((
+                counters.clone(),
+                counters.underruns(),
+                counters.probes_dropped(),
+            )),
         };
         self.render.send(RenderMsg::Play {
             origin,
@@ -294,17 +305,21 @@ impl Rig for PlayerRig<'_> {
         });
     }
 
-    fn measured(&mut self, advance: &Advance) {
-        let sample = StepSample {
-            generation: self.generation,
-            finalization_us: advance.finalization_delay.map(|d| d.0),
-            judgment_us: advance.judgment_latency.map(|d| d.0),
-        };
-        if (sample.finalization_us.is_some() || sample.judgment_us.is_some())
-            && self.steps.push(sample).is_err()
-        {
-            self.steps_dropped += 1;
+    fn measured(&mut self, advance: &Advance, events: &[JudgeEvent], delivered: TimeUs) {
+        let generation = self.generation;
+        let finalization = advance.finalization_delay.map(|d| Step::Finalization(d.0));
+        let judgments = judgment_samples(events, delivered).map(Step::Judgment);
+        for kind in finalization.into_iter().chain(judgments) {
+            if self.steps.push(StepSample { generation, kind }).is_err() {
+                self.steps_dropped += 1;
+            }
         }
+    }
+
+    fn play_over(&mut self) {
+        // Measurement stops at the end of the play, before the save and the
+        // re-evaluation, however long they take.
+        self.figures = self.render.finish(self.clock.now());
     }
 
     fn focus_lost(&self) -> bool {

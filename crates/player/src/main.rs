@@ -132,7 +132,7 @@ fn main() -> ExitCode {
             rig.adjust_on_end = dev_options.adjust_on_end;
         }));
     }
-    report(play(&chart, clock, |_rig| {
+    report(play(&chart, clock, false, |_rig| {
         #[cfg(feature = "dev-tools")]
         {
             if dev_options.auto_retry {
@@ -197,7 +197,7 @@ fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
     let plays = play::MeasuredPlays::default();
     let kept = Arc::clone(&plays);
     // One play: the run quits once its end screen has shown.
-    let ran = play(chart, clock, move |rig| {
+    let ran = play(chart, clock, true, move |rig| {
         rig.measured_plays = Some(kept);
         rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     });
@@ -217,7 +217,7 @@ fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
         };
         let counted = presentmon::count_play(&frames, fig, period);
         println!(
-            "measure: {}: presentmon {:?}, {} presents, {} never displayed",
+            "measure: {}: presentmon {:?}, {:?} presents, {:?} never displayed",
             record.display(),
             counted.count,
             counted.presents,
@@ -398,6 +398,7 @@ fn measure(
     steps: rtrb::Consumer<StepSample>,
     sounds: rtrb::Consumer<game::AudioProbe>,
     controls: &Controls,
+    keep_presents: usize,
 ) -> Measure {
     let audio = AudioInfo {
         period_us: i64::from(opened.period) * 1_000_000 / i64::from(opened.rate.max(1)),
@@ -410,7 +411,25 @@ fn measure(
         steps,
         sounds,
         Arc::clone(controls.overlay()),
+        keep_presents,
     )
+}
+
+/// Presents a play of `chart` can issue, with room to spare, at
+/// `refresh_mhz` (1 kHz when unknown): the countdown, the chart, a tail of
+/// 15 s, a quarter more.
+fn presents_of(chart: &bms_model::Chart, lead_in: TimeUs, refresh_mhz: Option<u32>) -> usize {
+    let last = chart
+        .lanes
+        .iter()
+        .flatten()
+        .map(|n| n.time)
+        .chain(chart.bgm.iter().map(|b| b.time))
+        .max()
+        .unwrap_or(TimeUs(0));
+    let us = u64::try_from(lead_in.0 + last.0 + 15_000_000).unwrap_or(0);
+    let mhz = u64::from(refresh_mhz.unwrap_or(1_000_000));
+    usize::try_from(us * mhz / 1_000_000_000 * 5 / 4).unwrap_or(usize::MAX)
 }
 
 /// The frames' inputs: hi-speed and the display offset as the settings
@@ -459,6 +478,7 @@ fn rig<'a>(
         countdown_at: None,
         steps,
         steps_dropped: 0,
+        figures: None,
         generation: 0,
         #[cfg(feature = "dev-tools")]
         measured_plays: None,
@@ -520,6 +540,7 @@ fn open_window_and_input(
 fn play(
     chart: &Path,
     clock: QpcClock,
+    keep_presents: bool,
     tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> Result<(), String> {
     #[cfg(feature = "dev-tools")]
@@ -572,6 +593,11 @@ fn play(
             .map(|r| Box::new(r) as Box<dyn Screen>)
             .map_err(|e| e.to_string())
     });
+    let keep = if keep_presents {
+        presents_of(loaded.chart(), loaded.config().lead_in, surface.refresh_mhz)
+    } else {
+        0
+    };
     let measure = measure(
         clock,
         surface.refresh_mhz,
@@ -579,6 +605,7 @@ fn play(
         probes.steps.1,
         probes.sounds.1,
         &controls,
+        keep,
     );
     let render = render_side::spawn(
         make,
@@ -676,6 +703,7 @@ fn scripted(
         probes.steps.1,
         probes.sounds.1,
         &controls,
+        0,
     );
     let render = render_side::spawn(
         make,

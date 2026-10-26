@@ -18,7 +18,7 @@ use bms_model::{Chart, TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::RenderSide;
 use input::QpcClock;
-use render::measure::FrameStatistics;
+use render::measure::{FrameStatistics, Presentation};
 use render::{FrameInput, FrameTiming, Renderer};
 
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
@@ -48,6 +48,10 @@ pub trait Screen: Send {
     /// The swap chain's latest frame statistics, raw; `None` without a
     /// swap chain or when the call failed.
     fn statistics(&self) -> Option<FrameStatistics> {
+        None
+    }
+    /// How the swap chain presents; `None` without one.
+    fn presentation(&self) -> Option<Presentation> {
         None
     }
     /// Draws lines of text, as [`frame`](Self::frame).
@@ -80,6 +84,10 @@ impl Screen for Renderer {
 
     fn statistics(&self) -> Option<FrameStatistics> {
         self.frame_statistics()
+    }
+
+    fn presentation(&self) -> Option<Presentation> {
+        Self::presentation(self)
     }
 
     fn text(&mut self, lines: &[&str]) -> Result<bool, String> {
@@ -416,6 +424,7 @@ impl Run {
                         play,
                         timing,
                         statistics: screen.statistics(),
+                        presentation: screen.presentation(),
                         effects: if play.is_some() { &effects } else { &[] },
                         at: self.clock.now(),
                     };
@@ -423,6 +432,10 @@ impl Run {
                     self.frames.frame(screen.as_ref(), &d);
                 }
                 Err(e) => {
+                    // What this frame drew never reached the screen.
+                    if matches!(mode, Mode::Play { .. }) {
+                        self.measure.failed(&effects);
+                    }
                     eprintln!("render: {e}");
                     self.screen = None;
                     self.shared.failed.store(true, Ordering::Release);
@@ -477,7 +490,7 @@ mod tests {
         let (_steps, steps) = rtrb::RingBuffer::new(1);
         let (_sounds, sounds) = rtrb::RingBuffer::new(1);
         let overlay = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        Measure::new(clock, None, None, steps, sounds, overlay)
+        Measure::new(clock, None, None, steps, sounds, overlay, 0)
     }
 
     fn play_measure(origin: TimeUs) -> Box<PlayMeasure> {
@@ -486,7 +499,7 @@ mod tests {
             origin,
             load_from: TimeUs(0),
             retry: false,
-            underruns: None,
+            audio: None,
         })
     }
 

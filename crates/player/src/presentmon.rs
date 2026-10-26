@@ -174,6 +174,10 @@ pub struct PmFrame {
     pub present_us: i64,
     /// When it reached the screen, µs; `None` when it never did.
     pub display_us: Option<i64>,
+    /// `SyncInterval`, when the capture has the column.
+    pub sync_interval: Option<u32>,
+    /// `AllowsTearing`, when the capture has the column.
+    pub tearing: Option<bool>,
 }
 
 /// Why a capture could not be read.
@@ -235,6 +239,7 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
     else {
         return (Vec::new(), Some(PmError::MissingColumn));
     };
+    let (sync_col, tearing_col) = (col("SyncInterval"), col("AllowsTearing"));
     let mut frames = Vec::new();
     let mut error = None;
     for (i, line) in lines.enumerate() {
@@ -248,9 +253,14 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
             let busy = duration(fields[cols[2]])?;
             let change = duration(fields[cols[3]])?;
             let until = duration(fields[cols[4]])?;
-            Ok((app_ok, start, busy, change, until))
+            let flag = |c: Option<usize>| -> Result<Option<u32>, ()> {
+                c.map(|c| fields[c].trim().parse().map_err(|_| ()))
+                    .transpose()
+            };
+            let present = (flag(sync_col)?, flag(tearing_col)?.map(|t| t != 0));
+            Ok((app_ok, start, busy, change, until, present))
         })();
-        let Ok((app_ok, start, busy, change, until)) = row else {
+        let Ok((app_ok, start, busy, change, until, (sync_interval, tearing))) = row else {
             error = Some(PmError::BadRow(i + 2));
             break;
         };
@@ -262,6 +272,8 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
         frames.push(PmFrame {
             present_us,
             display_us,
+            sync_interval,
+            tearing,
         });
     }
     frames.sort_by_key(|f| f.present_us);
@@ -271,41 +283,93 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
 /// One play's figures from the capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlayCapture {
-    /// The counted span, or `None` (N/A) without the evidence.
+    /// The counted span, or `None` (N/A) without the evidence or outside
+    /// the applicable conditions.
     pub count: Option<SpanCount>,
-    /// The capture's presents in the span.
-    pub presents: u64,
-    /// Those never displayed.
-    pub never_displayed: u64,
+    /// The capture's presents from the span's predecessor to its
+    /// successor, when it has both.
+    pub presents: Option<u64>,
+    /// The capture's presents in the span never displayed; `None` (N/A)
+    /// when the capture does not hold every present the game issued.
+    pub never_displayed: Option<u64>,
 }
 
-/// Counts the play span of `fig` over `frames` at one refresh of
-/// `period_ns` and k = 1. The capture covers the play only when it holds
-/// as many presents in the span as the game issued.
+/// Counts the play span `[a, b)` of `fig` over `frames` at one refresh of
+/// `period_ns` and k = 1 (design.md "Frame Pacing in Refreshes").
+///
+/// The evidence must reach from the span's predecessor (the last frame
+/// displayed before `a`) to its successor (the first displayed at or after
+/// `b`), and the capture must hold every present the game issued from the
+/// predecessor's present to the successor's, compared with the game's own
+/// present times (each taken just after its present call, so up to half a
+/// refresh after the capture's). The count applies only when every one of
+/// those presents was made with vsync on every refresh and no tearing, as
+/// the capture's `SyncInterval` and `AllowsTearing` and the game's own
+/// swap chain configuration both confirm. Otherwise the span is N/A.
 pub fn count_play(frames: &[PmFrame], fig: &Figures, period_ns: i64) -> PlayCapture {
     let (a, b) = (fig.span.0.0, fig.span.1.0);
-    let in_span: Vec<&PmFrame> = frames
+    let na = PlayCapture {
+        count: None,
+        presents: None,
+        never_displayed: None,
+    };
+    let shown = |f: &&PmFrame| f.display_us.is_some();
+    let pred = frames
         .iter()
-        .filter(|f| (a..b).contains(&f.present_us))
+        .filter(shown)
+        .filter(|f| f.display_us.is_some_and(|d| d < a))
+        .max_by_key(|f| f.display_us);
+    let succ = frames
+        .iter()
+        .filter(shown)
+        .filter(|f| f.display_us.is_some_and(|d| d >= b))
+        .min_by_key(|f| f.display_us);
+    let (Some(pred), Some(succ)) = (pred, succ) else {
+        return na;
+    };
+    let (from, to) = (pred.present_us, succ.present_us);
+    let window: Vec<&PmFrame> = frames
+        .iter()
+        .filter(|f| (from..=to).contains(&f.present_us))
         .collect();
-    let presents = in_span.len() as u64;
-    let never_displayed = in_span.iter().filter(|f| f.display_us.is_none()).count() as u64;
+    let presents = Some(window.len() as u64);
+    let slack = period_ns / 2_000;
+    let issued = fig
+        .present_times
+        .as_ref()
+        .map(|t| t.iter().filter(|&&g| g > from && g <= to + slack).count() as u64);
+    let covered = issued == Some(window.len() as u64);
+    if !covered {
+        return PlayCapture { presents, ..na };
+    }
+    let never_displayed = Some(
+        window
+            .iter()
+            .filter(|f| (a..b).contains(&f.present_us) && f.display_us.is_none())
+            .count() as u64,
+    );
+    let applicable = fig
+        .presentation
+        .is_some_and(render::measure::Presentation::countable)
+        && window
+            .iter()
+            .all(|f| f.sync_interval == Some(1) && f.tearing == Some(false));
     let mut displayed: Vec<i64> = frames
         .iter()
         .filter_map(|f| f.display_us)
         .map(|us| us * 1_000)
         .collect();
     displayed.sort_unstable();
-    let covered = presents > 0 && presents == fig.presents;
     PlayCapture {
-        count: count_span(&displayed, (a * 1_000, b * 1_000), period_ns, 1, covered),
+        count: count_span(&displayed, (a * 1_000, b * 1_000), period_ns, 1, applicable),
         presents,
         never_displayed,
     }
 }
 
 /// The capture's figures as a TOML table, numbers only (N/A left out),
-/// with the game's own present count and the period they were counted at.
+/// with the game's own present count in the span and the period counted
+/// at.
 pub fn to_toml(c: &PlayCapture, fig: &Figures, period_ns: i64) -> String {
     let mut out = String::from("\n[presentmon]\n");
     let _ = writeln!(
@@ -320,17 +384,20 @@ pub fn to_toml(c: &PlayCapture, fig: &Figures, period_ns: i64) -> String {
             s.lost, s.expected, s.longest, s.off_grid
         );
     }
-    let _ = writeln!(
-        out,
-        "presents = {}\nnever_displayed = {}",
-        c.presents, c.never_displayed
-    );
+    if let Some(n) = c.presents {
+        let _ = writeln!(out, "presents = {n}");
+    }
+    if let Some(n) = c.never_displayed {
+        let _ = writeln!(out, "never_displayed = {n}");
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use bms_model::TimeUs;
+
+    use render::measure::Presentation;
 
     use super::{PlayCapture, PmError, PmFrame, count_play, locate, parse};
     use crate::measure::Figures;
@@ -376,10 +443,14 @@ mod tests {
                 PmFrame {
                     present_us: 16_666 + 1_200,
                     display_us: Some(16_666 + 1_200 + 4_000),
+                    sync_interval: Some(1),
+                    tearing: Some(false),
                 },
                 PmFrame {
                     present_us: 33_333 + 1_200,
                     display_us: None,
+                    sync_interval: Some(1),
+                    tearing: Some(false),
                 },
             ]
         );
@@ -423,39 +494,132 @@ mod tests {
         );
     }
 
-    fn figures(span: (i64, i64), presents: u64) -> Figures {
+    /// A play over `span` whose game issued presents at `presents` (µs,
+    /// each 300 µs after the capture's present time), with vsync on every
+    /// refresh and no tearing.
+    fn figures(span: (i64, i64), presents: &[i64]) -> Figures {
         Figures {
             span: (TimeUs(span.0), TimeUs(span.1)),
-            presents,
+            presentation: Some(Presentation {
+                sync_interval: 1,
+                tearing: false,
+            }),
+            present_times: Some(presents.iter().map(|p| p + 300).collect()),
             ..Figures::default()
         }
     }
 
+    fn frame(present_us: i64, display_us: Option<i64>) -> PmFrame {
+        PmFrame {
+            present_us,
+            display_us,
+            sync_interval: Some(1),
+            tearing: Some(false),
+        }
+    }
+
+    const T: i64 = 4_000_000;
+
     /// Presents 4 ms apart at 250 Hz, each shown 1 ms later, one stalled
     /// a refresh and one never shown: counted over the play span when the
-    /// capture holds every present the game issued, N/A when it lacks one.
+    /// capture holds every present the game issued from the predecessor
+    /// to the successor, N/A when it lacks one.
     #[test]
     fn a_play_span_is_counted_only_with_every_present() {
         let mut frames: Vec<PmFrame> = (0..10)
-            .map(|k| PmFrame {
-                present_us: k * 4_000,
-                display_us: Some(k * 4_000 + 1_000),
-            })
+            .map(|k| frame(k * 4_000, Some(k * 4_000 + 1_000)))
             .collect();
         // Present 5 shows a refresh late (at 25 ms, not 21) and present 6
         // never shows: 17 → 25 is two refreshes (one lost), 25 → 29 one.
         frames[5].display_us = Some(25_000);
         frames[6].display_us = None;
-        // Span [2 ms, 30 ms): presents 1 to 7, the predecessor shown at 1
-        // ms, the successor at 33 ms.
-        let c = count_play(&frames, &figures((2_000, 30_000), 7), 4_000_000);
-        assert_eq!((c.presents, c.never_displayed), (7, 1));
+        let issued: Vec<i64> = (0..10).map(|k| k * 4_000).collect();
+        // Span [2 ms, 30 ms): the predecessor is present 0 (shown at 1 ms),
+        // the successor present 8 (shown at 33 ms): 9 presents.
+        let c = count_play(&frames, &figures((2_000, 30_000), &issued), T);
+        assert_eq!((c.presents, c.never_displayed), (Some(9), Some(1)));
         let s = c.count.expect("counted");
         // Grid 1 + 4j ms inside [2, 30): 5, 9, ..., 29.
         assert_eq!((s.lost, s.longest, s.off_grid, s.expected), (1, 1, 0, 7));
         // The game issued one more present than the capture holds.
-        let c: PlayCapture = count_play(&frames, &figures((2_000, 30_000), 8), 4_000_000);
-        assert_eq!(c.count, None);
+        let mut more = issued.clone();
+        more.push(14_000);
+        let c: PlayCapture = count_play(&frames, &figures((2_000, 30_000), &more), T);
+        assert_eq!((c.count, c.never_displayed), (None, None));
+    }
+
+    /// The review's case: T = 4 ms, span [10, 25), frames shown at 9, 13,
+    /// 17, 21 and 25 ms. A present the game issued at 8 ms, before the
+    /// span, is missing from the capture: the span is N/A, although the
+    /// capture holds every present issued inside the span itself.
+    #[test]
+    fn a_present_missing_before_the_span_makes_it_na() {
+        let frames: Vec<PmFrame> = [5, 9, 13, 17, 21]
+            .map(|p| frame(p * 1_000, Some(p * 1_000 + 4_000)))
+            .to_vec();
+        let all = [5_000, 9_000, 13_000, 17_000, 21_000];
+        let c = count_play(&frames, &figures((10_000, 25_000), &all), T);
+        assert_eq!(c.count.map(|s| s.lost), Some(0));
+        let missing = [5_000, 8_000, 9_000, 13_000, 17_000, 21_000];
+        let c = count_play(&frames, &figures((10_000, 25_000), &missing), T);
+        assert_eq!((c.count, c.never_displayed), (None, None));
+        assert_eq!(c.presents, Some(5));
+    }
+
+    /// An empty capture, or a game without present times, has no figure.
+    #[test]
+    fn an_empty_or_unchecked_capture_has_no_figures() {
+        let none = PlayCapture {
+            count: None,
+            presents: None,
+            never_displayed: None,
+        };
+        assert_eq!(count_play(&[], &figures((0, 10_000), &[1_000]), T), none);
+        let frames: Vec<PmFrame> = (0..5)
+            .map(|k| frame(k * 4_000, Some(k * 4_000 + 1_000)))
+            .collect();
+        let unchecked = Figures {
+            present_times: None,
+            ..figures((2_000, 10_000), &[])
+        };
+        let c = count_play(&frames, &unchecked, T);
+        assert_eq!((c.count, c.never_displayed), (None, None));
+        let toml = super::to_toml(&c, &unchecked, T);
+        assert!(!toml.contains("never_displayed"), "{toml}");
+        assert!(!toml.contains("lost"), "{toml}");
+    }
+
+    /// Counting applies only to vsync on every refresh without tearing,
+    /// confirmed by both the capture and the game: a tearing present, a
+    /// sync interval of 2, a capture without those columns, or a game
+    /// that does not say how it presents make the span N/A.
+    #[test]
+    fn counting_applies_only_where_confirmed() {
+        let frames: Vec<PmFrame> = (0..10)
+            .map(|k| frame(k * 4_000, Some(k * 4_000 + 1_000)))
+            .collect();
+        let issued: Vec<i64> = (0..10).map(|k| k * 4_000).collect();
+        let fig = figures((2_000, 30_000), &issued);
+        assert!(count_play(&frames, &fig, T).count.is_some());
+        let changed = |f: fn(&mut PmFrame)| {
+            let mut v = frames.clone();
+            f(&mut v[4]);
+            count_play(&v, &fig, T)
+        };
+        for c in [
+            changed(|f| f.tearing = Some(true)),
+            changed(|f| f.sync_interval = Some(2)),
+            changed(|f| f.sync_interval = None),
+            changed(|f| f.tearing = None),
+        ] {
+            assert_eq!(c.count, None);
+            assert_eq!(c.never_displayed, Some(0));
+        }
+        let unknown = Figures {
+            presentation: None,
+            ..fig.clone()
+        };
+        assert_eq!(count_play(&frames, &unknown, T).count, None);
     }
 
     #[test]

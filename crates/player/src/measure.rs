@@ -1,5 +1,6 @@
 //! The measurement of D11 on the game's threads: the render thread's
-//! [`Measure`] keeps each play's figures in preallocated rings, fed by its
+//! [`Measure`] keeps each play's figures in preallocated whole-play
+//! histograms, fed by its
 //! own frames (render CPU work, frame statistics, the frame that first drew
 //! each judgment) and by queues from the logic step (input to judgment,
 //! finalization delay) and the audio thread (press to sound scheduled). It
@@ -19,17 +20,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bms_model::{TimeSource, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind};
-use game::{AudioProbe, Probed, Underruns};
+use game::{AudioCounters, AudioProbe, Probed};
 use input::QpcClock;
 use render::FrameTiming;
 use render::measure::{
-    FrameStatistics, OnScreen, RefreshCount, RefreshLedger, Samples, StatsFilter, Summary,
-    display_qpc,
+    FrameStatistics, OnScreen, Presentation, RefreshCount, RefreshLedger, Samples, StatsFilter,
+    Summary, display_qpc,
 };
 
-/// Samples each figure's ring keeps; the percentiles cover the latest
-/// this many, the count and the maximum every sample.
-pub const RING: usize = 8_192;
 /// Judgments in flight in the press → on screen table.
 const IN_FLIGHT: usize = 4_096;
 /// Logic step samples queued for the render thread: four seconds of steps
@@ -46,15 +44,34 @@ const LINE_LEN: usize = 56;
 /// count.
 const RECENT: usize = 16;
 
-/// What one logic step measured, for the render thread.
+/// What the logic step measured, for the render thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepSample {
     /// The play it belongs to.
     pub generation: u64,
-    /// Logic time minus the watermark, µs.
-    pub finalization_us: Option<i64>,
-    /// Logic time minus the oldest origin judged in the step, µs.
-    pub judgment_us: Option<i64>,
+    /// The figure and its value.
+    pub kind: Step,
+}
+
+/// One logic step figure, µs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A step's logic time minus its watermark.
+    Finalization(i64),
+    /// A judgment's delivery time minus its origin, one per judgment.
+    Judgment(i64),
+}
+
+/// The input → judgment samples of one step's `events`, delivered at
+/// play time `delivered`: one per judgment of an input.
+pub fn judgment_samples(
+    events: &[JudgeEvent],
+    delivered: TimeUs,
+) -> impl Iterator<Item = i64> + '_ {
+    events.iter().filter_map(move |e| match (e.kind, e.origin) {
+        (JudgeEventKind::Judged { .. }, Some(o)) => Some(delivered.0 - o.0),
+        _ => None,
+    })
 }
 
 /// The output's sizes, shown beside press → sound.
@@ -78,9 +95,9 @@ pub struct PlayMeasure {
     pub load_from: TimeUs,
     /// Whether the play is a retry.
     pub retry: bool,
-    /// The audio thread's underruns and their count when the play began;
-    /// `None` without an audio thread to ask.
-    pub underruns: Option<(Underruns, u64)>,
+    /// The audio thread's counters, and its underruns and dropped probe
+    /// samples when the play began; `None` without an audio thread.
+    pub audio: Option<(AudioCounters, u64, u64)>,
 }
 
 /// A play's figures, as written to `.measure.toml`.
@@ -100,10 +117,19 @@ pub struct Figures {
     pub press_to_screen_unavailable: u64,
     /// Lost refreshes from frame statistics.
     pub refreshes: RefreshCount,
-    /// Render CPU work per frame, µs.
+    /// Render CPU work per frame, µs: the renderer's update, build and
+    /// submit, waits excluded; the overlay text and the measurement's own
+    /// bookkeeping are not in it.
     pub render_cpu: Option<Summary>,
     /// Audio underruns during the play.
     pub underruns: Option<u64>,
+    /// Press → sound samples the full probe queue dropped during the play.
+    pub sounds_dropped: Option<u64>,
+    /// How the swap chain presented, when known.
+    pub presentation: Option<Presentation>,
+    /// When each presented frame of the play was done, µs on the clock,
+    /// when they were kept (`measure play`) and all fitted.
+    pub present_times: Option<Vec<i64>>,
     /// The play span on the clock, from chart time 0 to the play's end.
     /// The countdown is left out: a display capture misses a swap chain's
     /// first present, which is the countdown's first frame.
@@ -245,7 +271,7 @@ fn write_overlay(fig: &Figures, load: Option<(bool, i64)>, lines: &mut [Line; LI
         None => line(format_args!("LOST REFRESHES N/A ({})", r.unavailable)),
     }
     line(format_args!(
-        "RENDER CPU US {}",
+        "RENDER CPU US (DRAW) {}",
         Percentiles(&fig.render_cpu, false)
     ));
     match fig.underruns {
@@ -274,6 +300,8 @@ pub struct Drawn<'a> {
     pub timing: FrameTiming,
     /// The swap chain's frame statistics, read right after the frame.
     pub statistics: Option<FrameStatistics>,
+    /// How the swap chain presents, when it says.
+    pub presentation: Option<Presentation>,
     /// The effects the frame drew.
     pub effects: &'a [JudgeEvent],
     /// When the frame was done, on the clock.
@@ -291,6 +319,11 @@ pub struct Measure {
     first_sync: Option<(i64, u32)>,
     last_sync: Option<(i64, u32)>,
     audio: Option<AudioInfo>,
+    presentation: Option<Presentation>,
+    /// Present times kept for a display capture; `None` when not kept or
+    /// when they no longer fit.
+    present_log: Option<Vec<i64>>,
+    keep_presents: bool,
     steps: rtrb::Consumer<StepSample>,
     sounds: rtrb::Consumer<AudioProbe>,
     overlay: Arc<AtomicBool>,
@@ -319,7 +352,9 @@ pub struct Measure {
 
 impl Measure {
     /// The measurement, reading the queues `steps` and `sounds`, the
-    /// overlay switch `overlay`, and frame statistics at `refresh_mhz`.
+    /// overlay switch `overlay`, and frame statistics at `refresh_mhz`;
+    /// it keeps the times of up to `keep_presents` presents a play for a
+    /// display capture (none when 0).
     pub fn new(
         clock: QpcClock,
         refresh_mhz: Option<u32>,
@@ -327,6 +362,7 @@ impl Measure {
         steps: rtrb::Consumer<StepSample>,
         sounds: rtrb::Consumer<AudioProbe>,
         overlay: Arc<AtomicBool>,
+        keep_presents: usize,
     ) -> Self {
         let freq = i128::from(clock.frequency().hz());
         let period_qpc = refresh_mhz
@@ -339,15 +375,18 @@ impl Measure {
             first_sync: None,
             last_sync: None,
             audio,
+            presentation: None,
+            present_log: (keep_presents > 0).then(|| Vec::with_capacity(keep_presents)),
+            keep_presents: keep_presents > 0,
             steps,
             sounds,
             overlay,
             play: None,
             frozen: true,
-            input_to_judgment: Samples::with_capacity(RING),
-            finalization: Samples::with_capacity(RING),
-            press_to_sound: Samples::with_capacity(RING),
-            render_cpu: Samples::with_capacity(RING),
+            input_to_judgment: Samples::new(),
+            finalization: Samples::new(),
+            press_to_sound: Samples::new(),
+            render_cpu: Samples::new(),
             on_screen: OnScreen::with_capacity(IN_FLIGHT),
             filter: StatsFilter::default(),
             refreshes: RefreshLedger::default(),
@@ -379,6 +418,12 @@ impl Measure {
         self.presents = 0;
         self.recent = [i64::MIN; RECENT];
         self.refreshed_at = None;
+        self.presentation = None;
+        // A log that overflowed was dropped; it is not made again during
+        // play, so the next plays have none.
+        if let Some(log) = &mut self.present_log {
+            log.clear();
+        }
         self.frozen = false;
         self.alloc_base = allocations();
         self.play = Some(play);
@@ -393,11 +438,9 @@ impl Measure {
             if Some(s.generation) != generation {
                 continue;
             }
-            if let Some(v) = s.judgment_us {
-                self.input_to_judgment.push(v);
-            }
-            if let Some(v) = s.finalization_us {
-                self.finalization.push(v);
+            match s.kind {
+                Step::Judgment(v) => self.input_to_judgment.push(v),
+                Step::Finalization(v) => self.finalization.push(v),
             }
         }
         while let Ok(p) = self.sounds.pop() {
@@ -437,11 +480,10 @@ impl Measure {
 
     /// The figures so far, without freezing (no allocation).
     fn figures_now(&mut self, end: TimeUs) -> Figures {
-        let underruns = self
-            .play
-            .as_ref()
-            .and_then(|p| p.underruns.as_ref())
-            .map(|(u, at_start)| u.get().saturating_sub(*at_start));
+        let audio = self.play.as_ref().and_then(|p| p.audio.as_ref());
+        let underruns = audio.map(|(c, at_start, _)| c.underruns().saturating_sub(*at_start));
+        let sounds_dropped =
+            audio.map(|(c, _, at_start)| c.probes_dropped().saturating_sub(*at_start));
         let start = self.play.as_ref().map_or(TimeUs(0), |p| p.origin);
         let after_end = self.recent.iter().filter(|&&t| t >= end.0).count() as u64;
         Figures {
@@ -454,6 +496,9 @@ impl Measure {
             refreshes: self.refreshes.count(),
             render_cpu: self.render_cpu.summary(),
             underruns,
+            sounds_dropped,
+            presentation: self.presentation,
+            present_times: None,
             span: (start, end),
             presents: self.presents.saturating_sub(after_end),
             allocations: allocations()
@@ -477,9 +522,24 @@ impl Measure {
         }
         self.drain();
         self.on_screen.finish();
-        let fig = self.figures_now(end);
+        let mut fig = self.figures_now(end);
+        fig.present_times = self.present_log.clone();
         self.frozen = true;
         Some(fig)
+    }
+
+    /// The frame being drawn failed (the screen is lost): the judgments it
+    /// drew never reached the screen through it and are N/A.
+    pub fn failed(&mut self, effects: &[JudgeEvent]) {
+        if self.frozen || self.play.is_none() {
+            return;
+        }
+        for ev in effects {
+            if let (JudgeEventKind::Judged { .. }, Some(o)) = (ev.kind, ev.origin) {
+                self.on_screen.drawn(ev.seq, o.0);
+            }
+        }
+        self.on_screen.presented_unknown();
     }
 
     /// One frame drawn.
@@ -491,6 +551,14 @@ impl Measure {
         let origin = play.origin;
         let load_from = play.load_from;
         self.drain();
+        if let Some(count) = d.timing.present_count.filter(|_| d.timing.presented)
+            && self.last_present.is_some_and(|last| count <= last)
+        {
+            // A new swap chain counts again from the start: what the old
+            // one presented and has no sample yet never will.
+            self.on_screen.finish();
+            self.filter.reset();
+        }
         for ev in d.effects {
             if let (JudgeEventKind::Judged { .. }, Some(o)) = (ev.kind, ev.origin) {
                 self.on_screen.drawn(ev.seq, o.0);
@@ -501,6 +569,16 @@ impl Measure {
         if !d.timing.presented {
             return;
         }
+        if d.presentation.is_some() {
+            self.presentation = d.presentation;
+        }
+        if self.keep_presents {
+            match &mut self.present_log {
+                Some(log) if log.len() < log.capacity() => log.push(d.at.0),
+                // Full: the capture cannot be checked against it.
+                _ => self.present_log = None,
+            }
+        }
         if self.load_ms.is_none() {
             self.load_ms = Some((d.at.0 - load_from.0) / 1_000);
         }
@@ -510,19 +588,14 @@ impl Measure {
             self.recent_next = (self.recent_next + 1) % RECENT;
         }
         let Some(count) = d.timing.present_count else {
-            // No present count to pair a sample with: N/A.
-            self.on_screen.finish();
+            // No present count to pair this frame with: what it drew is
+            // N/A; earlier frames keep their pairings.
+            self.on_screen.presented_unknown();
             return;
         };
-        if self.last_present.is_some_and(|last| count <= last) {
-            // A new swap chain counts again from the start.
-            self.on_screen.finish();
-            self.filter.reset();
-        }
         self.last_present = Some(count);
         self.on_screen.presented(count);
         if let Some(s) = self.filter.accept(d.statistics) {
-            self.refreshes.accepted(&s);
             let sync = (s.sync_qpc_time, s.sync_refresh_count);
             let first = *self.first_sync.get_or_insert(sync);
             self.last_sync = Some(sync);
@@ -532,7 +605,12 @@ impl Measure {
             let measured = (PERIOD_SPAN..=u32::MAX / 2)
                 .contains(&refreshes)
                 .then(|| (sync.0 - first.0) / i64::from(refreshes));
-            if let Some(period) = measured.or(self.period_qpc) {
+            let period = measured.or(self.period_qpc);
+            // Lost refreshes count only under a confirmed countable
+            // presentation (vsync every refresh, no tearing).
+            let countable = self.presentation.is_some_and(Presentation::countable);
+            self.refreshes.accepted(&s, period.filter(|_| countable));
+            if let Some(period) = period {
                 let display = self.clock.from_qpc(display_qpc(&s, period));
                 self.on_screen.sample(s.present_count, display.0 - origin.0);
             }
@@ -592,10 +670,21 @@ pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
             let _ = writeln!(out, "queued_periods = {q}");
         }
     }
+    if let Some(n) = fig.sounds_dropped {
+        let _ = writeln!(out, "dropped = {n}");
+    }
     summary_toml(&mut out, "press_to_screen_us", fig.press_to_screen.as_ref());
     let _ = writeln!(out, "unavailable = {}", fig.press_to_screen_unavailable);
     let r = fig.refreshes;
     out.push_str("\n[lost_refreshes_frame_statistics]\n");
+    if let Some(p) = fig.presentation {
+        let _ = writeln!(
+            out,
+            "sync_interval = {}\ntearing = {}",
+            p.sync_interval,
+            u8::from(p.tearing)
+        );
+    }
     if let Some(lost) = r.lost() {
         let _ = writeln!(out, "lost = {lost}\nlongest = {}", r.longest);
     }
@@ -646,7 +735,7 @@ mod tests {
             (4, " PERIOD N/A"),
             (5, "PRESS>SCREEN MS N/A"),
             (7, "LOST REFRESHES N/A (0)"),
-            (8, "RENDER CPU US N/A"),
+            (8, "RENDER CPU US (DRAW) N/A"),
             (9, "UNDERRUNS N/A"),
             (10, "LOAD N/A"),
         ] {
@@ -663,8 +752,8 @@ mod tests {
         use super::AudioInfo;
         use crate::alloc_count::this_thread;
         use render::measure::{RefreshCount, Samples};
-        let mut judge = Samples::with_capacity(super::RING);
-        let mut sound = Samples::with_capacity(super::RING);
+        let mut judge = Samples::new();
+        let mut sound = Samples::new();
         let mut lines = [Line::EMPTY; LINES];
         let before = this_thread();
         // 1..=200 µs and 20.0..=29.9 ms, pushed backwards.
@@ -695,10 +784,12 @@ mod tests {
         let after = this_thread();
         assert_eq!(after - before, 0, "allocations while measuring");
         let shown: Vec<&str> = lines[..n].iter().map(Line::as_str).collect();
-        // Nearest rank of 1..=200: p50 is the 100th, p99 the 198th.
-        assert_eq!(shown[1], "INPUT>JUDGE US P50 100 P99 198 MAX 200");
-        // 20 000 + 100 v: the 50th is 24 900, the 99th 29 800.
-        assert_eq!(shown[3], "PRESS>SOUND MS P50 24.9 P99 29.8 MAX 29.9");
+        // Nearest rank of 1..=200: p50 is 100, p99 198, read as the middle
+        // of their buckets: [100, 102) and [196, 200).
+        assert_eq!(shown[1], "INPUT>JUDGE US P50 101 P99 198 MAX 200");
+        // 20 000 + 100 v: the 50th, 24 900, in [24 576, 25 088); the 99th,
+        // 29 800, in [29 696, 30 208), whose middle is above the maximum.
+        assert_eq!(shown[3], "PRESS>SOUND MS P50 24.8 P99 29.9 MAX 29.9");
         assert_eq!(shown[4], " PERIOD 10.0 MS, 2 QUEUED");
         assert_eq!(shown[7], "LOST REFRESHES 3 IN 1000 LONGEST 2 N/A 4");
         assert_eq!(shown[9], "UNDERRUNS 1");
@@ -717,10 +808,10 @@ mod frame_tests {
     use eval::{JudgeEvent, JudgeEventKind};
     use input::QpcClock;
     use render::FrameTiming;
-    use render::measure::FrameStatistics;
+    use render::measure::{FrameStatistics, Presentation};
     use rules::Judgment;
 
-    use super::{Drawn, Measure, PlayMeasure, StepSample, measured_period_ns};
+    use super::{Drawn, Measure, PlayMeasure, Step, StepSample, measured_period_ns};
 
     /// 59.951 Hz at a 10 MHz QPC: 600 refreshes take 100 082 567 ticks,
     /// 16 680 427 ns each (by hand: 100 082 567 × 100 ÷ 600, floored).
@@ -754,13 +845,18 @@ mod frame_tests {
         }
     }
 
-    fn drawn<'a>(
-        effects: &'a [JudgeEvent],
-        count: u32,
+    const FIFO: Option<Presentation> = Some(Presentation {
+        sync_interval: 1,
+        tearing: false,
+    });
+
+    fn drawn(
+        effects: &[JudgeEvent],
+        count: Option<u32>,
         cpu_us: u64,
         statistics: Option<FrameStatistics>,
         at: i64,
-    ) -> Drawn<'a> {
+    ) -> Drawn<'_> {
         Drawn {
             play: Some(TimeUs(0)),
             timing: FrameTiming {
@@ -768,84 +864,48 @@ mod frame_tests {
                 sprites: 0,
                 dropped: 0,
                 presented: true,
-                present_count: Some(count),
+                present_count: count,
             },
             statistics,
+            presentation: FIFO,
             effects,
             at: TimeUs(at),
         }
     }
 
-    /// The render thread's path: a judgment drawn on the frame presented
-    /// as 10 takes that frame's display time from the sample that arrives
-    /// with the next frame, step samples of the play count and those of
-    /// another play do not, and nothing of it allocates once the play has
-    /// started.
-    #[test]
-    fn frames_pair_judgments_with_their_statistics() {
-        let clock = QpcClock::start();
-        let (mut steps_tx, steps) = rtrb::RingBuffer::new(8);
-        let (_sounds_tx, sounds) = rtrb::RingBuffer::new(8);
-        let overlay = Arc::new(AtomicBool::new(true));
-        // 250 Hz: 4 ms a refresh.
-        let mut m = Measure::new(clock, Some(250_000), None, steps, sounds, overlay);
-        let origin = TimeUs(5_000_000);
-        m.start(PlayMeasure {
-            generation: 3,
+    fn play(generation: u64, origin: TimeUs) -> PlayMeasure {
+        PlayMeasure {
+            generation,
             origin,
             load_from: TimeUs(0),
             retry: false,
-            underruns: None,
-        });
-        for (generation, judgment) in [(3, 120), (2, 999_999)] {
-            let s = StepSample {
-                generation,
-                finalization_us: Some(judgment + 1),
-                judgment_us: Some(judgment),
-            };
-            steps_tx.push(s).unwrap();
+            audio: None,
         }
-        let freq = clock.frequency().hz();
-        let period = freq * 4 / 1_000;
-        // Synced 2 refreshes after present 10 reached the screen.
-        let sync = clock_qpc(&clock, TimeUs(5_100_000)) + 2 * period;
-        let stats = FrameStatistics {
-            present_count: 10,
-            present_refresh_count: 500,
-            sync_refresh_count: 502,
-            sync_qpc_time: sync,
-        };
-        let effects = [judged(7, 60_000)];
-        #[cfg(feature = "dev-tools")]
-        let before = crate::alloc_count::this_thread();
-        m.frame(&drawn(&effects, 10, 300, None, 5_090_000));
-        let _ = m.overlay();
-        m.frame(&drawn(&[], 11, 500, Some(stats), 5_095_000));
-        let _ = m.overlay();
-        #[cfg(feature = "dev-tools")]
-        assert_eq!(crate::alloc_count::this_thread() - before, 0);
-        let fig = m.finish(TimeUs(5_094_000)).unwrap();
-        // Displayed at 5.1 s on the clock, 0.1 s into the chart; pressed at
-        // 60 ms: 40 ms.
-        let s = fig.press_to_screen.unwrap();
-        assert_eq!((s.count, s.p50), (1, 40_000));
-        assert_eq!(fig.press_to_screen_unavailable, 0);
-        let j = fig.input_to_judgment.unwrap();
-        assert_eq!((j.count, j.max), (1, 120));
-        assert_eq!(fig.finalization.unwrap().max, 121);
-        let cpu = fig.render_cpu.unwrap();
-        assert_eq!((cpu.count, cpu.max), (2, 500));
-        // The second present came after the end.
-        assert_eq!(fig.presents, 1);
-        assert_eq!(fig.span, (origin, TimeUs(5_094_000)));
-        // Taken once: nothing more counts.
-        assert_eq!(m.finish(TimeUs(5_200_000)), None);
+    }
+
+    struct Rig {
+        clock: QpcClock,
+        m: Measure,
+        steps: rtrb::Producer<StepSample>,
+    }
+
+    fn rig() -> Rig {
+        let clock = QpcClock::start();
+        let (steps, rx) = rtrb::RingBuffer::new(16);
+        let (_sounds, sounds) = rtrb::RingBuffer::new(8);
+        let overlay = Arc::new(AtomicBool::new(true));
+        // 250 Hz: 4 ms a refresh.
+        let m = Measure::new(clock, Some(250_000), None, rx, sounds, overlay, 8);
+        Rig { clock, m, steps }
+    }
+
+    fn step(generation: u64, kind: Step) -> StepSample {
+        StepSample { generation, kind }
     }
 
     /// The raw QPC value that `clock` reads as `t`.
     fn clock_qpc(clock: &QpcClock, t: TimeUs) -> i64 {
         let freq = clock.frequency().hz();
-        // Search from an estimate: from_qpc floors, so step up to t.
         let base = clock.from_qpc(0).0;
         let mut ticks =
             i64::try_from(i128::from(t.0 - base) * i128::from(freq) / 1_000_000).unwrap();
@@ -856,5 +916,124 @@ mod frame_tests {
             ticks -= 1;
         }
         ticks
+    }
+
+    /// The render thread's path: a judgment drawn on the frame presented
+    /// as 10 takes that frame's display time from the sample that arrives
+    /// with the next frame, step samples of the play count, a late sample
+    /// of an older play does not, and nothing of it allocates once the play
+    /// has started.
+    #[test]
+    fn frames_pair_judgments_with_their_statistics() {
+        let mut r = rig();
+        let origin = TimeUs(5_000_000);
+        r.m.start(play(3, origin));
+        for s in [
+            step(3, Step::Judgment(120)),
+            step(3, Step::Judgment(80)),
+            step(3, Step::Finalization(121)),
+            step(2, Step::Judgment(999_999)),
+        ] {
+            r.steps.push(s).unwrap();
+        }
+        let period = r.clock.frequency().hz() * 4 / 1_000;
+        // Synced 2 refreshes after present 10 reached the screen.
+        let sync = clock_qpc(&r.clock, TimeUs(5_100_000)) + 2 * period;
+        let stats = FrameStatistics {
+            present_count: 10,
+            present_refresh_count: 500,
+            sync_refresh_count: 502,
+            sync_qpc_time: sync,
+        };
+        let effects = [judged(7, 60_000)];
+        #[cfg(feature = "dev-tools")]
+        let before = crate::alloc_count::this_thread();
+        r.m.frame(&drawn(&effects, Some(10), 300, None, 5_090_000));
+        let _ = r.m.overlay();
+        r.m.frame(&drawn(&[], Some(11), 500, Some(stats), 5_095_000));
+        let _ = r.m.overlay();
+        #[cfg(feature = "dev-tools")]
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+        let fig = r.m.finish(TimeUs(5_094_000)).unwrap();
+        // Displayed at 5.1 s on the clock, 0.1 s into the chart; pressed at
+        // 60 ms: 40 ms.
+        let s = fig.press_to_screen.unwrap();
+        assert_eq!((s.count, s.max), (1, 40_000));
+        assert_eq!(fig.press_to_screen_unavailable, 0);
+        // Two judgments of play 3; play 2's late one is dropped.
+        let j = fig.input_to_judgment.unwrap();
+        assert_eq!((j.count, j.max), (2, 120));
+        assert_eq!(fig.finalization.unwrap().max, 121);
+        let cpu = fig.render_cpu.unwrap();
+        assert_eq!((cpu.count, cpu.max), (2, 500));
+        // The second present came after the end.
+        assert_eq!(fig.presents, 1);
+        assert_eq!(fig.span, (origin, TimeUs(5_094_000)));
+        assert_eq!(fig.presentation, FIFO);
+        assert_eq!(
+            fig.present_times.as_deref(),
+            Some(&[5_090_000, 5_095_000][..])
+        );
+        // Taken once: nothing more counts.
+        assert_eq!(r.m.finish(TimeUs(5_200_000)), None);
+    }
+
+    /// Two real play starts: the second starts every figure over and takes
+    /// only its own samples, including ones queued before it started.
+    #[test]
+    fn a_second_play_starts_over() {
+        let mut r = rig();
+        r.m.start(play(1, TimeUs(1_000_000)));
+        r.steps.push(step(1, Step::Judgment(500))).unwrap();
+        r.m.frame(&drawn(&[judged(1, 0)], Some(3), 100, None, 1_100_000));
+        let first = r.m.finish(TimeUs(1_200_000)).unwrap();
+        assert_eq!(first.input_to_judgment.unwrap().count, 1);
+        r.steps.push(step(1, Step::Judgment(600))).unwrap();
+        r.steps.push(step(2, Step::Judgment(700))).unwrap();
+        r.m.start(play(2, TimeUs(2_000_000)));
+        r.m.frame(&drawn(&[], Some(4), 100, None, 2_100_000));
+        let second = r.m.finish(TimeUs(2_200_000)).unwrap();
+        let j = second.input_to_judgment.unwrap();
+        assert_eq!((j.count, j.max), (1, 700));
+        assert_eq!(second.render_cpu.unwrap().count, 1);
+        assert_eq!(second.press_to_screen_unavailable, 0);
+        assert_eq!(second.present_times.as_deref(), Some(&[2_100_000][..]));
+    }
+
+    /// A frame presented without a present count makes only its own
+    /// judgments N/A; a frame that failed makes its judgments N/A; a new
+    /// swap chain (the present count going back) makes the old chain's
+    /// unresolved judgments N/A and starts its frame statistics over.
+    #[test]
+    fn failed_frames_and_new_swap_chains_are_accounted_for() {
+        let mut r = rig();
+        r.m.start(play(1, TimeUs(3_000_000)));
+        let clock = r.clock;
+        let stats = |count: u32, at: i64| FrameStatistics {
+            present_count: count,
+            present_refresh_count: 100 + count,
+            sync_refresh_count: 100 + count,
+            sync_qpc_time: clock_qpc(&clock, TimeUs(at)),
+        };
+        r.m.frame(&drawn(&[judged(1, 10_000)], Some(20), 100, None, 3_050_000));
+        r.m.frame(&drawn(&[judged(2, 20_000)], None, 100, None, 3_054_000));
+        r.m.failed(&[judged(3, 30_000)]);
+        let s20 = stats(20, 3_060_000);
+        r.m.frame(&drawn(&[], Some(21), 100, Some(s20), 3_062_000));
+        let fig = r.m.figures_now(TimeUs(3_063_000));
+        // Judgment 1 kept its pairing: 60 ms − 10 ms.
+        assert_eq!(fig.press_to_screen.map(|s| s.max), Some(50_000));
+        assert_eq!(fig.press_to_screen_unavailable, 2);
+        // A new swap chain: present counts start again.
+        r.m.frame(&drawn(&[judged(4, 40_000)], Some(22), 100, None, 3_066_000));
+        r.m.frame(&drawn(&[judged(5, 50_000)], Some(1), 100, None, 3_070_000));
+        let fig = r.m.figures_now(TimeUs(3_071_000));
+        assert_eq!(fig.press_to_screen_unavailable, 3);
+        // Present 1's sample is taken after the reset: 74 ms − 50 ms.
+        let s1 = stats(1, 3_074_000);
+        r.m.frame(&drawn(&[], Some(2), 100, Some(s1), 3_075_000));
+        let fig = r.m.finish(TimeUs(3_080_000)).unwrap();
+        let s = fig.press_to_screen.unwrap();
+        assert_eq!((s.count, s.max), (2, 50_000));
     }
 }

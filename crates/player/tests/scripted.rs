@@ -236,8 +236,14 @@ fn scripted_play_writes_a_record() {
         int(&m, "press_to_sound_scheduled_us", "queued_periods"),
         Some(2)
     );
-    let judged = int(&m, "input_to_judgment_us", "count").unwrap();
-    assert!((1..=NOTES as i64).contains(&judged), "{judged}");
+    // One input to judgment sample per judged press.
+    assert_eq!(int(&m, "input_to_judgment_us", "count"), Some(NOTES as i64));
+    assert_eq!(int(&m, "press_to_sound_scheduled_us", "dropped"), Some(0));
+    // Offscreen: no swap chain, so no presentation to count refreshes under.
+    assert_eq!(
+        int(&m, "lost_refreshes_frame_statistics", "sync_interval"),
+        None
+    );
     assert!(int(&m, "finalization_delay_us", "count").unwrap() > 0);
     assert_eq!(int(&m, "press_to_screen_us", "count"), Some(0));
     assert_eq!(int(&m, "press_to_screen_us", "p50"), None);
