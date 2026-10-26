@@ -1098,6 +1098,28 @@ fn focus_loss_and_device_removal_cut_the_tail() {
     }
 }
 
+#[test]
+fn a_reconnect_during_play_does_not_hide_a_removal_in_the_tail() {
+    let (_dir, root) = temp_root();
+    let mut s = tail_session(&root, &Events::default());
+    let mut items = busy_items();
+    items.push(connect(1));
+    // Keyboard 0 is removed and connected again during play: from then on
+    // it is a new connection, not the one that took part.
+    items.push(item(500 * MS, Action::Disconnect(DeviceId(0))));
+    items.push(item(
+        500 * MS,
+        Action::Connect(DeviceId(0), DeviceKind::Keyboard),
+    ));
+    // Keyboard 1, the last participant still connected, goes in the tail.
+    items.push(item(2_000 * MS, Action::Disconnect(DeviceId(1))));
+    let one = s.play(script(items, &[])).unwrap();
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.tail_cut, Some(AbortCause::LastSourceRemoved));
+    // Play time 2.0 s is session time 3.0 s, and the audio stops there.
+    assert_eq!(s.now(), TimeUs(3_000 * MS));
+}
+
 /// Moves every note 500 ms later.
 struct Later;
 

@@ -498,6 +498,12 @@ impl<O: AudioOutput + Wakes> Session<O> {
         sources.gate_mut().reset();
         let input_start = sources.open_recording(open_at);
         let kinds: Vec<DeviceKind> = sources.participants().map(|(_, k)| k).collect();
+        // Each participant with its connection at the opening: one removed
+        // and connected again since counts as removed in the tail.
+        let participants: Vec<_> = sources
+            .participants()
+            .map(|(d, _)| (d, sources.connection(d)))
+            .collect();
         let device = settings.device.profile(&kinds);
         let buttons: usize = kinds
             .iter()
@@ -585,12 +591,6 @@ impl<O: AudioOutput + Wakes> Session<O> {
         // Recording closes at the end of evaluation (D13): the input side
         // appends nothing more, and the record is frozen here.
         let arrivals: Vec<Arrival> = sources.arrivals().iter().map(arrival).collect();
-        // Each participant with its connection: one removed and connected
-        // again during the tail counts as removed.
-        let participants: Vec<_> = sources
-            .participants()
-            .map(|(d, _)| (d, sources.connection(d)))
-            .collect();
         let incomplete = Incomplete {
             overflow: logic.overflowed() || sources.overflowed(),
             source_limit: sources.source_limited(),
