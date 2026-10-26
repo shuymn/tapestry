@@ -119,31 +119,44 @@ jobs:
         run: mise exec -- cargo xtask check-lints
       - name: Test (portable crates)
         run: mise exec -- cargo xtask portable test --locked
+      # The fuzz crate is its own workspace (fuzz/Cargo.toml), which the
+      # workspace commands above do not reach.
+      - name: Format (fuzz crate)
+        run: mise exec -- cargo fmt --manifest-path fuzz/Cargo.toml --check
+      - name: Clippy (fuzz crate)
+        run: mise exec -- cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test (fuzz seed smoke cases)
+        run: mise exec -- cargo test --manifest-path fuzz/Cargo.toml --locked
       # An unreadable registry index only warns and skips the yanked check.
       - name: cargo-deny
-        run: mise exec -- cargo deny check --deny index-failure
+        run: |
+          mise exec -- cargo deny check --deny index-failure
+          mise exec -- cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check --deny index-failure
       # `--with-metadata` also covers dev-, build- and target-specific
       # dependencies. cargo-machete exits 0 when it cannot read a manifest or
       # run cargo metadata, so its error lines fail the step; it runs cargo
-      # metadata without `--locked`, so Cargo.lock must stay unchanged.
+      # metadata without `--locked`, so both lockfiles must stay unchanged.
       - name: cargo-machete
         run: |
           set -o pipefail
           mise exec -- cargo machete --with-metadata 2>&1 | tee "$RUNNER_TEMP/machete.log"
           if grep '^error when handling' "$RUNNER_TEMP/machete.log"; then exit 1; fi
-          git diff --exit-code Cargo.lock
+          git diff --exit-code Cargo.lock fuzz/Cargo.lock
       # cargo-audit only logs index failures (on stderr, which the guard scans).
       - name: cargo-audit
         run: |
           set -o pipefail
-          { mise exec -- cargo audit --deny warnings 2>&1 1>&3 | tee "$RUNNER_TEMP/audit.log" >&2; } 3>&1
-          if grep -E "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$RUNNER_TEMP/audit.log"; then exit 1; fi
+          for lock in Cargo.lock fuzz/Cargo.lock; do
+            { mise exec -- cargo audit --file "$lock" --deny warnings 2>&1 1>&3 | tee "$RUNNER_TEMP/audit.log" >&2; } 3>&1
+            if grep -E "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$RUNNER_TEMP/audit.log"; then exit 1; fi
+          done
 
-  # The Nix dev shell used from WSL: the flake evaluates with the Rust version
-  # from mise.lock, and the wrapper's Linux path passes arguments and exit codes.
+  # The Nix dev shells used from WSL: the flake evaluates with the Rust version
+  # from mise.lock, the wrapper's Linux path passes arguments and exit codes,
+  # and short fuzz runs pass in the `fuzz` shell (docs/setup.md "Fuzzing").
   nix:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -155,6 +168,15 @@ jobs:
         run: scripts/wsl.sh cargo xtask portable test --locked
       - name: Wrapper self-test
         run: scripts/wsl-selftest.sh
+      - name: Build fuzz targets
+        run: TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh build
+      # A panic, a hang and each memory limit fail a run, seen from outside
+      # the wrapper.
+      - name: Fuzz self-test
+        run: scripts/fuzz-selftest.sh
+      # A fixed libFuzzer seed keeps the run reproducible.
+      - name: Fuzz (60 s per target, generated seeds)
+        run: TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh run-all 60 --seed 1
 
   lint:
     runs-on: ubuntu-24.04
@@ -179,3 +201,18 @@ jobs:
         run: mise exec -- actionlint
       - name: shellcheck
         run: mise exec -- shellcheck scripts/*.sh
+      # Refused before anything is built, so no Rust is needed here.
+      - name: Fuzz durations out of range are refused
+        run: |
+          for seconds in -1 0 0.5 1801; do
+            for args in "run replay_body $seconds" "run-all $seconds"; do
+              set +e
+              # shellcheck disable=SC2086 # split into arguments on purpose
+              scripts/fuzz.sh $args 2> fuzz.err
+              code=$?
+              set -e
+              cat fuzz.err
+              test "$code" -eq 2
+              grep -q "seconds must be a whole number from 1 to 1800: got '$seconds'" fuzz.err
+            done
+          done

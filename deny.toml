@@ -30,6 +30,7 @@ allow = [
     "MPL-2.0",    # triple_buffer, symphonia (audio decoding); used unmodified
     "Zlib",       # foldhash, under hashbrown in the wgpu graph (render)
     "ISC",        # libloading, which wgpu-hal uses to load the DX12 runtime (render)
+    "NCSA",       # libfuzzer-sys (LLVM libFuzzer), fuzz/ only
 ]
 
 [licenses.private]

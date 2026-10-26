@@ -10,7 +10,7 @@ MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE), at your option:
   bms-model, bms-parser, rules, eval, replay, xtask
 
 GPL-3.0-or-later (LICENSE-GPL), with the additional permission below:
-  input, audio, game, render, player
+  input, audio, game, render, player, fuzz (it links input)
 
 A program built from the GPL crates, such as the player, is a whole
 covered by the GNU General Public License version 3 or later.

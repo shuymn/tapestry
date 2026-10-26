@@ -1,0 +1,80 @@
+# Fuzz targets for the untrusted-input boundaries (docs/setup.md "Fuzzing").
+# Its own workspace with its own lockfile: the targets build with the dated
+# nightly of the Nix `fuzz` shell, outside the workspace's stable commands.
+[package]
+name = "fuzz"
+version = "0.0.0"
+description = "Fuzz targets: chart loading, input log decoding and Raw Input packet decoding."
+edition = "2024"
+# GPL because it links `input` (design.md "Licenses"). Tooling, never shipped.
+license = "GPL-3.0-or-later"
+repository = "https://github.com/shuymn/tapestry"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bms-model = { path = "../crates/bms-model" }
+bms-parser = { path = "../crates/bms-parser" }
+eval = { path = "../crates/eval" }
+input = { path = "../crates/input" }
+replay = { path = "../crates/replay" }
+rules = { path = "../crates/rules" }
+libfuzzer-sys = "0.4.13"
+# The same versions as the workspace's (root Cargo.toml).
+tempfile = "3.27.0"
+zstd = { version = "0.14.3", default-features = false }
+
+[[bin]]
+name = "bms_load"
+path = "fuzz_targets/bms_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replay_file"
+path = "fuzz_targets/replay_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replay_body"
+path = "fuzz_targets/replay_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raw_input"
+path = "fuzz_targets/raw_input.rs"
+test = false
+doc = false
+bench = false
+
+# Proves that a panic, a hang and the memory limits fail a run
+# (scripts/fuzz-selftest.sh). Never fuzzed.
+[[bin]]
+name = "canary"
+path = "fuzz_targets/canary.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+# The workspace's lints (root Cargo.toml), less the cfg only xtask sets.
+# `unsafe_code` is forbidden in src/lib.rs only: `fuzz_target!` expands to
+# `#[no_mangle]`, which that lint flags.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
