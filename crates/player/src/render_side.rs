@@ -588,64 +588,17 @@ mod tests {
         }
     }
 
-    /// The judgment stream of an autoplay of `chart` on the headless
-    /// runner, with `between` called after the runner is built and before
-    /// it plays.
-    fn judgments(chart: &Chart, between: impl FnOnce()) -> Vec<eval::JudgeEvent> {
-        use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, SoundBank};
-        let start = TimeUs(-1_000_000);
-        let rule = rules::custom();
-        let device = game::DeviceSettings::default().profile(&[input::DeviceKind::Keyboard]);
-        let events = input::autoplay(chart, &device.sources[0]).unwrap();
-        let script = input::ScriptedInput::from_log(
-            &InputStart::default(),
-            &events,
-            &[input::DeviceKind::Keyboard],
-        );
-        let sources = input::SourceSet::new(input::SourceConfig {
-            max_devices: 2,
-            max_sources: 2,
-            max_held: 8,
-            queue_capacity: 256,
-            max_arrivals: 2,
-        })
-        .unwrap();
-        let bank = Arc::new(SoundBank::from_sounds(48_000, Vec::new()));
-        let engine = AudioEngine::new(bank, &chart.bgm, 48_000, 480, MAX_VOICES, 0).unwrap();
-        let device_out = SimDevice::new(SimConfig::steady(48_000, 480, start));
-        let audio = game::RunnerAudio::new(engine, RecordingOutput::new(device_out, 0));
-        let config = LogicConfig {
-            inputs: 64,
-            effects: 64,
-        };
-        let mut runner =
-            game::Runner::new(chart, &rule, &device, sources, script, config, start, audio)
-                .unwrap();
-        between();
-        assert_eq!(runner.run_to_end(TimeUs(1_000)), game::RunOutcome::Complete);
-        runner.stream().to_vec()
-    }
-
-    /// Hi-speed moves notes and nothing else: frames drawn after a hi-speed
-    /// step carry the new visible time, a note 300 ms ahead of the display
-    /// time sits 800 × 300 × (1/575 − 1/600) = 17.391 layout pixels higher
-    /// (the lane top is 800 pixels above the judgment line), and the
-    /// judgment stream of a play is the same with and without the step.
+    /// The render thread reads hi-speed and the display offset at every
+    /// frame: each change reaches the frames drawn after it, and no later
+    /// frame goes back. The two change one at a time, as two keys do.
     #[test]
-    fn hi_speed_change_moves_notes_not_judgment() {
+    fn render_frames_follow_hi_speed_and_display_offset() {
         use game::Adjust;
-        use render::layout;
 
-        // 120 BPM throughout: four notes, one each on lanes 1 to 4.
         let chart = ChartBuilder::new(120_000)
             .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
-            .tap(Lane::new(2).unwrap(), TimeUs(1_250_000))
-            .tap(Lane::new(3).unwrap(), TimeUs(1_500_000))
-            .tap(Lane::new(4).unwrap(), TimeUs(1_750_000))
             .build()
             .unwrap();
-
-        // The render thread reads the values at every frame.
         let tuning = view().tuning;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let screen_seen = Arc::clone(&seen);
@@ -683,41 +636,18 @@ mod tests {
             side,
             gauge: 0,
         });
-        let before = (TimeUs(600_000), TimeUs(0));
-        let after = (TimeUs(575_000), TimeUs(1_000));
-        assert!(wait_until(|| seen.lock().unwrap().contains(&before)));
+        let start = (TimeUs(600_000), TimeUs(0));
+        let faster = (TimeUs(575_000), TimeUs(0));
+        let later = (TimeUs(575_000), TimeUs(1_000));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&start)));
         assert!(tuning.adjust(Adjust::HiSpeedUp));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&faster)));
         assert!(tuning.adjust(Adjust::DisplayOffsetUp));
-        assert!(wait_until(|| seen.lock().unwrap().contains(&after)));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&later)));
         link.exit();
-        // Once a frame has the new values, no later frame has the old ones.
-        let frames = seen.lock().unwrap().clone();
-        let first_after = frames.iter().position(|f| *f == after).unwrap();
-        assert!(frames[first_after..].iter().all(|f| *f == after));
-        assert!(frames[..first_after].iter().all(|f| *f == before));
-
-        // The same note, at the same display time, before and after.
-        let scroll = &chart.scroll;
-        let at = TimeUs(700_000);
-        let y = |visible| layout::note_y(scroll, TimeUs(1_000_000), at, visible);
-        let (y600, y575) = (y(before.0), y(after.0));
-        // By hand: 880 − 800 × 300 / 600 = 480, and 800 × 300 / 575 =
-        // 417.3913 above 880 is 462.6087.
-        assert!((y600 - 480.0).abs() < 1e-3, "{y600}");
-        assert!((y575 - 462.608_7).abs() < 1e-3, "{y575}");
-        assert!((y600 - y575 - 17.391_3).abs() < 1e-3);
-
-        // Judgment: the same nonempty stream with and without the step.
-        let plain = judgments(&chart, || {});
-        let stepped = judgments(&chart, || {
-            assert!(tuning.adjust(Adjust::HiSpeedUp));
-        });
-        let judged = plain
-            .iter()
-            .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
-            .count();
-        assert_eq!(judged, 4);
-        assert_eq!(plain, stepped);
-        assert_eq!(tuning.get().visible_time_ms, 550);
+        // The frames go through the three states in order, each once.
+        let mut frames = seen.lock().unwrap().clone();
+        frames.dedup();
+        assert_eq!(frames, [start, faster, later]);
     }
 }

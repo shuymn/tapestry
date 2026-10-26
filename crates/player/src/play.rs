@@ -14,10 +14,7 @@ use std::time::Duration;
 
 use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
-use game::{
-    AudioQueue, Closing, Command, DataRoot, Opening, PlayReport, RenderSide, Rig, Settings, Tuning,
-    save_settings,
-};
+use game::{AudioQueue, Closing, Command, Opening, PlayReport, RenderSide, Rig, Settings, Tuning};
 use input::{QpcClock, SourceReader};
 
 use crate::audio_side::AudioLink;
@@ -25,6 +22,7 @@ use crate::controls::Controls;
 use crate::end_screen::{self, Hints, LoadTimes};
 use crate::input_side::{InputLink, Request};
 use crate::render_side::{RenderLink, RenderMsg};
+use crate::tuning::{Delivered, SettingsFiles};
 
 /// How long the logic step parks at most without a wake from the input
 /// thread; also the pace of the tail and the end screen.
@@ -50,12 +48,10 @@ pub struct PlayerRig<'a> {
     pub lead_in: TimeUs,
     /// The input offset the current play uses.
     pub input_offset_us: i64,
-    /// Where the settings files are.
-    pub root: DataRoot,
-    /// The settings as last written (or loaded): what the files hold.
-    pub settings: Settings,
-    /// The change count of the settings keys' values last acted on.
-    pub seen: u64,
+    /// The settings files.
+    pub files: SettingsFiles,
+    /// The settings keys' values last acted on.
+    pub seen: Delivered,
     /// The end screen's summary, while it shows; the settings lines are
     /// added each time it is drawn.
     pub end_lines: Option<Vec<String>>,
@@ -78,10 +74,12 @@ pub struct PlayerRig<'a> {
     /// Retries still to send by itself at an end screen (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub auto_retries: u32,
-    /// Settings keys pressed by themselves in the first play's countdown
-    /// (dev-tools).
+    /// Settings keys pressed by themselves when the first play reaches
+    /// chart time `adjust_at` (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub adjust_in_play: Vec<game::Adjust>,
+    #[cfg(feature = "dev-tools")]
+    pub adjust_at: TimeUs,
     /// Settings keys pressed by themselves at the first end screen
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -100,36 +98,15 @@ impl PlayerRig<'_> {
     /// `player.toml`, each atomically and only if it changed. Called when a
     /// play ends and when the run ends, never during a play.
     fn persist(&mut self) {
-        let mut next = self.settings.clone();
-        self.controls.tuning().get().apply_to(&mut next);
-        // A file that cannot be written keeps its old values; the next
-        // write tries again.
-        if next.device != self.settings.device {
-            let path = self.root.device_settings();
-            match save_settings(&path, &next.device) {
-                Ok(()) => self.settings.device = next.device,
-                Err(e) => eprintln!("{}: {e}", path.display()),
-            }
-        }
-        if next.player != self.settings.player {
-            let path = self.root.player_settings();
-            match save_settings(&path, &next.player) {
-                Ok(()) => self.settings.player = next.player,
-                Err(e) => eprintln!("{}: {e}", path.display()),
-            }
-        }
+        self.files.write(self.controls.tuning().get());
     }
 
     /// Acts on changed settings keys' values: the volume goes to the
     /// audio thread, and a shown end screen is drawn again.
     fn sync(&mut self) {
-        let tuning = self.controls.tuning();
-        let version = tuning.version();
-        if version == self.seen {
+        let Some(t) = self.seen.take_new(self.controls.tuning()) else {
             return;
-        }
-        self.seen = version;
-        let t = tuning.get();
+        };
         // Always within 0 to unity: `Tuning` keeps it there.
         let _ = self.audio.control.set_volume(t.volume());
         if self.end_lines.is_some() {
@@ -194,6 +171,15 @@ impl Rig for PlayerRig<'_> {
 
     fn wait(&mut self) {
         thread::park_timeout(PARK);
+        #[cfg(feature = "dev-tools")]
+        if let Some(c) = self.countdown_at
+            && !self.adjust_in_play.is_empty()
+            && self.clock.now().0 - c.0 - self.lead_in.0 >= self.adjust_at.0
+        {
+            for a in self.adjust_in_play.drain(..) {
+                self.controls.tuning().adjust(a);
+            }
+        }
         self.sync();
     }
 
@@ -216,7 +202,11 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn prepare_audio(&mut self) -> Result<(), String> {
-        self.audio.control.ready().map_err(|e| e.to_string())
+        self.audio.control.ready().map_err(|e| e.to_string())?;
+        // A volume changed before the first play (during startup) or on
+        // the end screen reaches the engine before the play starts.
+        self.sync();
+        Ok(())
     }
 
     fn prepare_screen(&mut self) -> Result<(), String> {
@@ -235,6 +225,7 @@ impl Rig for PlayerRig<'_> {
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
         self.countdown_at = Some(TimeUs(origin.0 - self.lead_in.0));
+        println!("play started");
         // Audio was readied before recording opened, so this does not
         // wait; a worker gone since shows as the output's failure.
         let _ = self.audio.control.play(origin, sounds);
@@ -243,10 +234,6 @@ impl Rig for PlayerRig<'_> {
             side: screen,
             gauge: self.gauge,
         });
-        #[cfg(feature = "dev-tools")]
-        for a in self.adjust_in_play.drain(..) {
-            self.controls.tuning().adjust(a);
-        }
     }
 
     fn focus_lost(&self) -> bool {
@@ -285,10 +272,8 @@ impl Rig for PlayerRig<'_> {
         // The input offset keys stop working here, so the play is evaluated
         // with the input offset it starts with (D13); the other values
         // are recorded as they are at the start.
-        let tuning = self.controls.tuning();
-        tuning.set_end_screen(false);
         self.end_lines = None;
-        let t = tuning.get();
+        let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
         self.input_offset_us = t.input_offset_us;
     }
@@ -318,7 +303,7 @@ impl Rig for PlayerRig<'_> {
 
     fn show_end(&mut self, report: &PlayReport) {
         let tuning = self.controls.tuning();
-        tuning.set_end_screen(true);
+        tuning.open_end_screen();
         self.end_lines = Some(end_screen::lines(
             report,
             self.input_offset_us,

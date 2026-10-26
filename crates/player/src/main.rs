@@ -42,7 +42,7 @@ use crate::end_screen::{Hints, LoadTimes};
 use crate::input_side::Mode;
 use crate::play::PlayerRig;
 use crate::render_side::{MakeScreen, NoFrames, Screen, View};
-use crate::tuning::LiveTuning;
+use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
 
 const USAGE: &str = "usage: tapestry play <chart.bms> | tapestry keys | tapestry --version";
 
@@ -112,6 +112,7 @@ fn main() -> ExitCode {
         let frames = dev_options.frames.take();
         return report(scripted(&chart, &log, frames, auto, clock, |rig| {
             rig.adjust_in_play = dev_options.adjust_in_play;
+            rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
             rig.adjust_on_end = dev_options.adjust_on_end;
         }));
     }
@@ -123,6 +124,7 @@ fn main() -> ExitCode {
                 _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
             }
             _rig.adjust_in_play = dev_options.adjust_in_play;
+            _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
             _rig.adjust_on_end = dev_options.adjust_on_end;
         }
     }))
@@ -300,9 +302,8 @@ fn rig<'a>(
         recorded: (device.keyboard.recorded(), device.controller.recorded()),
         gauge: loaded.settings().player.displayed_gauge,
         input_offset_us: device.input_offset_us,
-        root: loaded.root().clone(),
-        settings: loaded.settings().clone(),
-        seen: controls.tuning().version(),
+        files: SettingsFiles::new(loaded.root().clone(), loaded.settings().clone()),
+        seen: Delivered::default(),
         end_lines: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
         pending_retry: None,
@@ -318,6 +319,8 @@ fn rig<'a>(
         auto_retries: 0,
         #[cfg(feature = "dev-tools")]
         adjust_in_play: Vec::new(),
+        #[cfg(feature = "dev-tools")]
+        adjust_at: TimeUs(0),
         #[cfg(feature = "dev-tools")]
         adjust_on_end: Vec::new(),
     }

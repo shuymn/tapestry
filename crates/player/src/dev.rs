@@ -47,10 +47,13 @@ pub struct Options {
     /// Retry once at the first end screen and quit at the second, to
     /// measure the retry time without a key press.
     pub auto_retry: bool,
-    /// Settings keys pressed by themselves in the first play's countdown.
+    /// Settings keys pressed by themselves when the first play reaches
+    /// `adjust_at_ms`.
     pub adjust_in_play: Vec<game::Adjust>,
     /// Settings keys pressed by themselves at the first end screen.
     pub adjust_on_end: Vec<game::Adjust>,
+    /// The chart time, ms, at which `adjust_in_play` is pressed.
+    pub adjust_at_ms: i64,
 }
 
 impl Options {
@@ -66,6 +69,16 @@ impl Options {
     ) -> Result<bool, String> {
         if arg == "--dev-auto-retry" {
             self.auto_retry = true;
+            return Ok(true);
+        }
+        if arg == "--dev-adjust-at" {
+            let value = rest
+                .next()
+                .ok_or_else(|| "--dev-adjust-at needs a value".to_owned())?;
+            self.adjust_at_ms = value
+                .to_string_lossy()
+                .parse()
+                .map_err(|_| "--dev-adjust-at takes milliseconds".to_owned())?;
             return Ok(true);
         }
         let adjust = if arg == "--dev-adjust" {

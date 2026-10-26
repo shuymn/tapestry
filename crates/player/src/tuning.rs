@@ -4,9 +4,10 @@
 //! volume to the audio thread, takes the input offset into the next play
 //! and writes the files when a play ends. Lock-free and allocation-free.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
-use game::{Adjust, Tuning};
+use game::{Adjust, DataRoot, Settings, Tuning, save_settings};
 
 /// The four values, shared.
 #[derive(Debug)]
@@ -19,6 +20,10 @@ pub struct LiveTuning {
     version: AtomicU64,
     /// Whether the end screen shows: only it takes the input offset keys.
     end_screen: AtomicBool,
+    /// Held by a step and by closing the end screen, so an input offset
+    /// step is either in the next play's values or refused, never lost
+    /// between the two. The render thread reads without it.
+    step: Mutex<()>,
 }
 
 impl LiveTuning {
@@ -31,6 +36,7 @@ impl LiveTuning {
             input_offset_us: AtomicI64::new(t.input_offset_us),
             version: AtomicU64::new(0),
             end_screen: AtomicBool::new(false),
+            step: Mutex::new(()),
         }
     }
 
@@ -54,6 +60,10 @@ impl LiveTuning {
     /// offset keys work on the end screen only, so a play never changes
     /// its own input offset (D13). Returns whether a value changed.
     pub fn adjust(&self, a: Adjust) -> bool {
+        let _step = self
+            .step
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if a.is_input_offset() && !self.end_screen.load(Ordering::Acquire) {
             return false;
         }
@@ -74,9 +84,92 @@ impl LiveTuning {
         true
     }
 
-    /// The end screen shows, or a play is being prepared.
-    pub fn set_end_screen(&self, shown: bool) {
-        self.end_screen.store(shown, Ordering::Release);
+    /// The end screen shows: the input offset keys work.
+    pub fn open_end_screen(&self) {
+        self.end_screen.store(true, Ordering::Release);
+    }
+
+    /// A play is about to start: the input offset keys stop working, and
+    /// the values the play starts with are returned, in one step with
+    /// respect to [`adjust`](Self::adjust).
+    pub fn close_end_screen(&self) -> Tuning {
+        let _step = self
+            .step
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.end_screen.store(false, Ordering::Release);
+        self.get()
+    }
+}
+
+/// The settings keys' values as last delivered (to the audio thread and the
+/// end screen): nothing, until the first delivery.
+#[derive(Debug, Default)]
+pub struct Delivered(Option<u64>);
+
+impl Delivered {
+    /// The values, if they changed since the last delivery or none was
+    /// made yet.
+    pub fn take_new(&mut self, tuning: &LiveTuning) -> Option<Tuning> {
+        let version = tuning.version();
+        if self.0 == Some(version) {
+            return None;
+        }
+        self.0 = Some(version);
+        Some(tuning.get())
+    }
+}
+
+/// `device.toml` and `player.toml` as the settings keys leave them.
+#[derive(Debug)]
+pub struct SettingsFiles {
+    root: DataRoot,
+    /// What the files hold: as loaded, then as last written.
+    written: Settings,
+}
+
+impl SettingsFiles {
+    /// The files in `root`, holding `loaded`.
+    pub const fn new(root: DataRoot, loaded: Settings) -> Self {
+        Self {
+            root,
+            written: loaded,
+        }
+    }
+
+    /// Writes the values `t` into the file that holds each, atomically and
+    /// only when it changes. Called when a play ends and when the run
+    /// ends, never during a play. A file that cannot be written keeps its
+    /// old content and is tried again at the next call. Returns the files
+    /// written.
+    pub fn write(&mut self, t: Tuning) -> Vec<&'static str> {
+        let mut next = self.written.clone();
+        t.apply_to(&mut next);
+        let mut wrote = Vec::new();
+        if next.device != self.written.device {
+            let path = self.root.device_settings();
+            match save_settings(&path, &next.device) {
+                Ok(()) => {
+                    self.written.device = next.device;
+                    wrote.push("device.toml");
+                }
+                Err(e) => eprintln!("{}: {e}", path.display()),
+            }
+        }
+        if next.player != self.written.player {
+            let path = self.root.player_settings();
+            match save_settings(&path, &next.player) {
+                Ok(()) => {
+                    self.written.player = next.player;
+                    wrote.push("player.toml");
+                }
+                Err(e) => eprintln!("{}: {e}", path.display()),
+            }
+        }
+        for name in &wrote {
+            println!("settings: wrote {name}");
+        }
+        wrote
     }
 }
 
@@ -84,7 +177,7 @@ impl LiveTuning {
 mod tests {
     use game::{Adjust, Tuning};
 
-    use super::LiveTuning;
+    use super::{Delivered, LiveTuning, SettingsFiles};
 
     fn start() -> Tuning {
         Tuning {
@@ -101,13 +194,40 @@ mod tests {
         assert!(!t.adjust(Adjust::InputOffsetUp));
         assert!(!t.adjust(Adjust::InputOffsetDown));
         assert_eq!((t.get(), t.version()), (start(), 0));
-        t.set_end_screen(true);
+        t.open_end_screen();
         assert!(t.adjust(Adjust::InputOffsetUp));
         assert_eq!(t.get().input_offset_us, 3_000);
         assert_eq!(t.version(), 1);
-        t.set_end_screen(false);
+        let _ = t.close_end_screen();
         assert!(!t.adjust(Adjust::InputOffsetDown));
         assert_eq!(t.get().input_offset_us, 3_000);
+    }
+
+    /// A volume changed before the game thread first looks (during
+    /// startup, after the engine took the loaded volume) is delivered at
+    /// the first look; then only a new change is.
+    #[test]
+    fn the_first_look_delivers_a_change_made_before_it() {
+        let t = LiveTuning::new(start());
+        assert!(t.adjust(Adjust::VolumeDown));
+        let mut seen = Delivered::default();
+        assert_eq!(seen.take_new(&t).map(|v| v.volume_percent), Some(95));
+        assert_eq!(seen.take_new(&t), None);
+        assert!(t.adjust(Adjust::VolumeDown));
+        assert_eq!(seen.take_new(&t).map(|v| v.volume_percent), Some(90));
+        assert_eq!(seen.take_new(&t), None);
+    }
+
+    /// Closing the end screen returns the values the play starts with and
+    /// refuses input offset steps from then on.
+    #[test]
+    fn closing_the_end_screen_takes_the_offset_and_stops_its_keys() {
+        let t = LiveTuning::new(start());
+        t.open_end_screen();
+        assert!(t.adjust(Adjust::InputOffsetUp));
+        assert_eq!(t.close_end_screen().input_offset_us, 3_000);
+        assert!(!t.adjust(Adjust::InputOffsetUp));
+        assert_eq!(t.close_end_screen().input_offset_us, 3_000);
     }
 
     #[test]
@@ -127,5 +247,35 @@ mod tests {
             }
         );
         assert_eq!(t.version(), 2);
+    }
+
+    /// Only a changed file is written, and one that cannot be written is
+    /// written at the next call.
+    #[test]
+    fn a_failed_write_is_tried_again_and_unchanged_files_are_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().to_owned());
+        let loaded = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let mut files = SettingsFiles::new(root.clone(), loaded.clone());
+        let t = Tuning::of(&loaded);
+        assert!(files.write(t).is_empty());
+        assert!(!root.device_settings().exists());
+        // `player.toml` cannot be written: a directory is in the way.
+        std::fs::create_dir_all(root.player_settings().join("x")).unwrap();
+        let faster = t.adjust(Adjust::HiSpeedUp);
+        assert!(files.write(faster).is_empty());
+        std::fs::remove_dir_all(root.player_settings()).unwrap();
+        assert_eq!(files.write(faster), ["player.toml"]);
+        assert!(files.write(faster).is_empty());
+        let s = game::Settings::load(&root).unwrap();
+        assert_eq!(s.player.visible_time_ms, 575);
+        assert!(!root.device_settings().exists());
+        assert_eq!(
+            files.write(faster.adjust(Adjust::VolumeDown)),
+            ["device.toml"]
+        );
     }
 }
