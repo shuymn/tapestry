@@ -712,9 +712,9 @@ fn empty_lnobj_and_lntype_without_a_type_are_skipped() {
             kind: WarningKind::IgnoredValue(what),
         }]
     };
-    // An empty #LNOBJ: the 1x notes stay taps.
+    // An empty #LNOBJ: the 1x notes stay taps. Repeated, it is warned once.
     assert_eq!(
-        long("#BPM 120\n#LNOBJ\n#WAV01 click.wav\n#00111:0101\n"),
+        long("#BPM 120\n#LNOBJ\n#WAV01 click.wav\n#LNOBJ \n#00111:0101\n"),
         (vec![(2_000_000, -1), (3_000_000, -1)], ignored("#LNOBJ"))
     );
     // #LNTYPE 0 and ZZ read as 1; 01 is 1 without a warning.
@@ -723,6 +723,8 @@ fn empty_lnobj_and_lntype_without_a_type_are_skipped() {
         ("#LNTYPE 0", ignored("#LNTYPE")),
         ("#LNTYPE ZZ", ignored("#LNTYPE")),
         ("#LNTYPE 01", vec![]),
+        // Repeated defaulted values are warned once.
+        ("#LNTYPE 00\n#LNTYPE ZZ", ignored("#LNTYPE")),
     ] {
         assert_eq!(
             long(&format!("#BPM 120\n{header}\n{pair}")),
@@ -730,11 +732,16 @@ fn empty_lnobj_and_lntype_without_a_type_are_skipped() {
             "{header}"
         );
     }
-    assert_eq!(
-        load_text("#BPM 120\n#LNTYPE 3\n#00111:01\n"),
-        Err(LoadError::Unsupported {
-            line: 2,
-            what: "#LNTYPE 3".to_owned()
-        })
-    );
+    // Any other number is a type the loader does not support, one too
+    // large for u32 included (u32::MAX + 1, and zero-padded).
+    for value in ["3", "4294967296", "0004294967296"] {
+        assert_eq!(
+            load_text(&format!("#BPM 120\n#LNTYPE {value}\n#00111:01\n")),
+            Err(LoadError::Unsupported {
+                line: 2,
+                what: format!("#LNTYPE {value}")
+            }),
+            "{value}"
+        );
+    }
 }

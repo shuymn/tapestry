@@ -41,9 +41,10 @@
 //!   object (21-29, 61-69, E1-E9) is an `Unsupported` error.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane. The end plays no sound. An
-//!   empty `#LNOBJ` is ignored with a warning.
+//!   empty `#LNOBJ` is ignored, with one warning per chart.
 //! - **`#LNTYPE`:** read as an integer (`01` is 1). A value naming no type
-//!   (`0`, or not a number) is read as 1, with a warning.
+//!   (`0`, or not a number) is read as 1, with one warning per chart; any
+//!   other number, even one too large for `u32`, is unsupported.
 //! - **`#LNTYPE 1` pairing:** endpoints at one time in a lane merge first,
 //!   keeping the later object in the file, so a duplicated line does not
 //!   split a long note. The end object's sound is the end sound when its id

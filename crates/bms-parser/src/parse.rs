@@ -63,6 +63,10 @@ pub struct Source {
     pub objects: Vec<RawObject>,
     /// Every `#RANDOM` and `#SETRANDOM` value in a taken branch, in order.
     pub random_results: Vec<u32>,
+    /// An empty `#LNOBJ` was warned about; it is warned once per chart.
+    pub warned_lnobj: bool,
+    /// A defaulted `#LNTYPE` was warned about; it is warned once per chart.
+    pub warned_lntype: bool,
 }
 
 /// Descriptive headers read and ignored without a warning.
@@ -306,7 +310,11 @@ fn parse_header(
             None => ignore(warnings, "#TOTAL"),
         },
         // An empty #LNOBJ names no object, so it changes nothing.
-        "LNOBJ" if value.is_empty() => ignore(warnings, "#LNOBJ"),
+        "LNOBJ" if value.is_empty() => {
+            if !std::mem::replace(&mut source.warned_lnobj, true) {
+                ignore(warnings, "#LNOBJ");
+            }
+        }
         "LNOBJ" => match parse_base36(value.as_bytes()).filter(|&id| id != 0) {
             Some(id) => {
                 source.lnobj.insert(id);
@@ -315,16 +323,25 @@ fn parse_header(
         },
         // Compared as an integer (`01` is 1). A value that names no type
         // (`0`, `ZZ`) is read as the default, 1.
-        "LNTYPE" => match value.parse::<u32>() {
-            Ok(1) => {}
-            Ok(0) | Err(_) => ignore(warnings, "#LNTYPE"),
-            Ok(_) => {
-                return Err(LoadError::Unsupported {
-                    line,
-                    what: format!("#LNTYPE {value}"),
-                });
+        "LNTYPE" => {
+            let digits = value.strip_prefix('+').unwrap_or(value);
+            let number = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+            let unsupported = || LoadError::Unsupported {
+                line,
+                what: format!("#LNTYPE {value}"),
+            };
+            let named = match value.parse::<u32>() {
+                Ok(1) => true,
+                Ok(0) => false,
+                Ok(_) => return Err(unsupported()),
+                // A number too large for `u32` is 2 or more too.
+                Err(_) if number => return Err(unsupported()),
+                Err(_) => false,
+            };
+            if !named && !std::mem::replace(&mut source.warned_lntype, true) {
+                ignore(warnings, "#LNTYPE");
             }
-        },
+        }
         "LNMODE" => {
             if value != "1" {
                 return Err(LoadError::Unsupported {
