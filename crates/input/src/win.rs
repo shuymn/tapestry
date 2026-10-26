@@ -418,7 +418,7 @@ fn is_keyboard(handle: HANDLE) -> bool {
 /// One decoded block to the capture slot and the sources.
 fn deliver(block: &[u8], capture: &Capture, sources: &mut SourceSet) {
     if let Some(packet) = raw::decode_keyboard(block) {
-        capture.offer(&packet, sources.is_recording());
+        capture.offer(&packet, DeviceKind::Keyboard, sources.is_recording());
         sources.packet(&packet);
     }
 }
