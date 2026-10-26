@@ -94,7 +94,7 @@ fn key_sound_starts_at_first_unwritten_frame_two_to_three_periods_after_receipt(
         .collect();
     assert_eq!(starts.len(), 3);
     for i in starts {
-        assert_eq!(left[i], f32::from(KEY_FIRST) / 32_768.0);
+        assert_eq!(left[i], f32::from(KEY_FIRST) / 65_536.0);
     }
 }
 
@@ -271,12 +271,13 @@ fn starts_beyond_the_pending_capacity_wait_for_the_next_step() {
         assert_eq!(if as_bgm { bgm_started } else { commands }, N as u32);
         assert_eq!(e.mixer().dropped_starts(), 0);
         let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
-        let one = 100.0 / 32_768.0;
+        // A sample of 100, halved by the headroom.
+        let one = 100.0 / 65_536.0;
         for s in &starts {
             assert!(left[s.frame as usize] >= one, "frame {}", s.frame);
         }
         if as_bgm {
-            // At most two share a frame, so nothing is limited: the samples
+            // At most two share a frame, so nothing saturates: the samples
             // add up to one per start.
             let total: f32 = left.iter().sum();
             assert!((total - N as f32 * one).abs() < 1e-3, "{total}");

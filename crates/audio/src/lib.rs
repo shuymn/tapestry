@@ -6,8 +6,9 @@
 //!   bank over the caps of [`BankLimits`] before decoding when the files
 //!   declare their length, and while decoding otherwise.
 //! - [`Mixer`] sums preallocated voices in `f32`, steals the oldest voice
-//!   with a short fade when all are busy, applies the volume and a peak
-//!   limiter without look-ahead, so it adds no latency.
+//!   with a short fade when all are busy, applies the volume and a fixed
+//!   headroom, and a static soft clipper that keeps the sum within full
+//!   scale without riding its gain or adding latency.
 //! - [`MixClock`] maps output frames to the judgment timeline from the
 //!   buffer events, re-anchored on every period.
 //! - [`AudioEngine::step`] is one wake of the audio thread: it drains sound
@@ -44,8 +45,8 @@ pub use bank::{
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use engine::{AudioEngine, EngineError, Scheduled, ScheduledKind, SoundCmd, StepReport};
 pub use mixer::{
-    InvalidVolume, LIMITER_CEILING, LIMITER_RELEASE_MS, Limiter, MAX_PENDING_STARTS, MAX_VOICES,
-    MAX_VOLUME, Mixer, STEAL_FADE_MS,
+    HEADROOM, InvalidVolume, MAX_PENDING_STARTS, MAX_VOICES, MAX_VOLUME, Mixer, SOFT_CLIP_KNEE,
+    STEAL_FADE_MS, soft_clip,
 };
 pub use output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, RecordingOutput, Wake};
 pub use run::{RunReport, run_audio};

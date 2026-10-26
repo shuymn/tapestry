@@ -84,11 +84,12 @@ fn a_sealed_play_is_done_once_its_sounds_have_ended() {
         assert!(steps < 100, "never done");
     }
     // Both 10 ms sounds (480 frames each) were heard before it was done,
-    // each at its own level (1000 and 1007 of i16::MAX + 1), the BGM
-    // sound first and the key sound right after it, nothing else.
+    // each at its own level (1000 and 1007 of i16::MAX + 1, halved by the
+    // mixer's headroom), the BGM sound first and the key sound right after
+    // it, nothing else.
     let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
-    let bgm = 1_000.0 / 32_768.0;
-    let key = 1_007.0 / 32_768.0;
+    let bgm = 1_000.0 / 65_536.0;
+    let key = 1_007.0 / 65_536.0;
     let heard: Vec<usize> = (0..left.len()).filter(|&f| left[f] != 0.0).collect();
     assert_eq!(heard.len(), 960);
     let (first, second) = heard.split_at(480);
@@ -160,9 +161,10 @@ fn volume_change_scales_mixed_samples() {
     }
     let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
     let heard: Vec<f32> = left.iter().copied().filter(|&s| s != 0.0).collect();
-    // Exact: each level and each volume is a power-of-two fraction.
-    let bgm = 1_000.0 / 32_768.0;
-    let key = 1_007.0 / 32_768.0;
+    // Exact: each level, each volume and the mixer's headroom (0.5) is a
+    // power-of-two fraction.
+    let bgm = 1_000.0 / 65_536.0;
+    let key = 1_007.0 / 65_536.0;
     let mut expected = vec![bgm; 480];
     expected.extend([key * 0.5; 480]);
     expected.extend([key * 0.25; 480]);

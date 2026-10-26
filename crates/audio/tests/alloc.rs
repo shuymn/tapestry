@@ -1,5 +1,5 @@
 //! Once built, the engine allocates nothing per step: draining commands,
-//! scheduling BGM, stealing voices, mixing, limiting and writing; nor does
+//! scheduling BGM, stealing voices, mixing, soft clipping and writing; nor does
 //! the audio thread loop around it.
 //!
 //! The counting allocator counts only threads that opted in, so the test
@@ -115,6 +115,6 @@ fn mixing_does_not_allocate() {
     assert!(out.inner().underruns() > SHIFT_HISTORY as u64);
     assert_eq!(e.underruns(), 40);
     assert!(e.mixer().steals() > 1_000, "{}", e.mixer().steals());
-    assert!(e.mixer().limiter().limited() > 0);
+    assert!(e.mixer().saturated() > 0);
     assert_eq!(counting::allocations(), 0);
 }

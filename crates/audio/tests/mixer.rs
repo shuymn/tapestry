@@ -1,10 +1,15 @@
 //! The mixer: exact start samples under any block split, stealing with a
-//! fade, and late starts that keep the head of the sound.
+//! fade, late starts that keep the head of the sound, and a mix whose gain
+//! does not ride the program.
 
 use audio::{Mixer, Sound, SoundBank};
 use bms_model::SoundId;
 
 const RATE: u32 = 48_000;
+
+/// The mixer's fixed headroom (-6 dB): a sum of voices `s` below the soft
+/// clipper's knee comes out as `H * s`, exactly, since `H` is a power of 2.
+const H: f32 = 0.5;
 
 fn left(out: &[f32]) -> Vec<f32> {
     out.iter().step_by(2).copied().collect()
@@ -55,22 +60,24 @@ fn render_split(block: usize, total: usize) -> (Vec<f32>, u64) {
         m.render(&bank, &mut out[pos * 2..(pos + n) * 2]);
         pos += n;
     }
-    (out, m.limiter().limited())
+    (out, m.saturated())
 }
 
 #[test]
 fn sound_starts_at_exact_sample_for_any_block_split() {
-    let (reference, limited) = render_split(1, 6_000);
-    // The two loud copies overlap from 500 to 2000: 2 × 30 000 / 32 768 =
-    // 1.83 > 1, so the limiter engaged, and nothing left exceeds full scale.
-    assert!(limited >= 1_500, "{limited}");
+    let (reference, saturated) = render_split(1, 6_000);
+    // The two loud copies overlap from 500 to 2000: 2 × 30 000 / 32 768 ×
+    // 0.5 = 0.92 is above the knee (0.8) in both channels of those 1500
+    // frames, and only there (the small sounds move it by under 0.06), so
+    // the clipper saturated, and nothing left exceeds full scale.
+    assert_eq!(saturated, 3_000);
     assert!(reference.iter().all(|x| x.abs() <= 1.0));
     for block in [2, 7, 64, 441, 480, 1_024, 6_000] {
         assert!(render_split(block, 6_000).0 == reference, "block {block}");
     }
 
     // Each sound alone, in 480-frame blocks: silent before its start, its
-    // first sample exactly at it (sample / 32 768).
+    // first sample exactly at it (sample / 32 768, halved: / 65 536).
     let bank = split_bank();
     let solo = |s: u16, at: u64, frames: usize| {
         let mut m = Mixer::new(8, RATE);
@@ -85,16 +92,16 @@ fn sound_starts_at_exact_sample_for_any_block_split() {
     assert!(out[..2 * 1_000].iter().all(|&x| x == 0.0));
     assert_eq!(
         (out[2 * 1_000], out[2 * 1_000 + 1]),
-        (7.0 / 32_768.0, 7.0 / 32_768.0)
+        (7.0 / 65_536.0, 7.0 / 65_536.0)
     );
-    assert_eq!(out[2 * 1_299], 2_100.0 / 32_768.0);
+    assert_eq!(out[2 * 1_299], 2_100.0 / 65_536.0);
     assert_eq!(out[2 * 1_300], 0.0);
     let (out, _) = solo(1, 1_037, 1_440);
     assert_eq!(out[2 * 1_036..2 * 1_037], [0.0, 0.0]);
-    assert_eq!(out[2 * 1_037..2 * 1_038], [3.0 / 32_768.0, -4.0 / 32_768.0]);
+    assert_eq!(out[2 * 1_037..2 * 1_038], [3.0 / 65_536.0, -4.0 / 65_536.0]);
     assert_eq!(
         out[2 * 1_236..2 * 1_237],
-        [998.0 / 32_768.0, -1_795.0 / 32_768.0]
+        [998.0 / 65_536.0, -1_795.0 / 65_536.0]
     );
     // The click straddles a block boundary (2399 | 2400) and ends inside
     // the next block, freeing its voice.
@@ -103,9 +110,9 @@ fn sound_starts_at_exact_sample_for_any_block_split() {
         left(&out)[2_398..2_403],
         [
             0.0,
-            1_000.0 / 32_768.0,
-            -2_000.0 / 32_768.0,
-            3_000.0 / 32_768.0,
+            1_000.0 / 65_536.0,
+            -2_000.0 / 65_536.0,
+            3_000.0 / 65_536.0,
             0.0
         ]
     );
@@ -124,10 +131,11 @@ fn steal_bank(rate: u32) -> SoundBank {
     )
 }
 
+/// `got` is the mix of the voice sums `want`, each below the knee.
 fn assert_close(got: &[f32], want: &[f32]) {
     assert_eq!(got.len(), want.len());
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        assert!((g - w).abs() < 1e-6, "frame {i}: {g} vs {w}");
+        assert!((g - H * w).abs() < 1e-6, "frame {i}: {g} vs {}", H * w);
     }
 }
 
@@ -225,9 +233,9 @@ fn starts_scheduled_ahead_apply_in_time_order() {
         left(&out)[..480].to_vec()
     };
     let mut want = vec![0.0; 480];
-    want[0] = 0.5;
-    want[100] = 0.25;
-    want[200] = 0.125;
+    want[0] = 0.5 * H;
+    want[100] = 0.25 * H;
+    want[200] = 0.125 * H;
     for block in [1, 7, 100, 150, 480] {
         for ahead in [true, false] {
             assert_eq!(run(block, ahead), want, "block {block}, ahead {ahead}");
@@ -253,17 +261,61 @@ fn late_command_never_cuts_the_head() {
         let out = left(&render(&mut m, &bank, 480));
         let at = (start - 480) as usize;
         assert!(out[..at].iter().all(|&x| x == 0.0));
-        assert_eq!(out[at], 11.0 / 32_768.0, "target {target}");
-        assert_eq!(out[at + 299], 3_300.0 / 32_768.0, "target {target}");
+        assert_eq!(out[at], 11.0 / 65_536.0, "target {target}");
+        assert_eq!(out[at + 299], 3_300.0 / 65_536.0, "target {target}");
         assert_eq!(out[at + 300], 0.0);
     }
 }
 
 #[test]
-fn volume_scales_before_the_limiter() {
+fn volume_scales_before_the_soft_clipper() {
+    // 0.5 of full scale × 0.5 volume × 0.5 headroom.
     let bank = SoundBank::from_sounds(RATE, vec![Sound::mono(vec![16_384; 4])]);
     let mut m = Mixer::new(1, RATE);
     m.set_volume(0.5).unwrap();
     m.trigger(&bank, SoundId(0), 0).unwrap();
-    assert_eq!(left(&render(&mut m, &bank, 4)), [0.25; 4]);
+    assert_eq!(left(&render(&mut m, &bank, 4)), [0.125; 4]);
+}
+
+#[test]
+fn background_level_is_unchanged_by_a_loud_key_sound() {
+    // A background at 0.5 of full scale (left) and 0.375 (right) for 400
+    // frames. One key sound at 0.9 over frames 100 to 150 makes the left
+    // sum 1.4, over full scale, but after the headroom (0.7) below the knee,
+    // so it simply adds. Two at once over frames 250 to 300 make the sums
+    // 2.3 and 2.175, over full scale even after the headroom, and those
+    // frames saturate. Either way the background keeps its level right
+    // after the key sounds end. A gain-riding limiter, before or after the
+    // headroom, would still hold the mix down there while it recovers.
+    let bgm = (0..400).flat_map(|_| [16_384i16, 12_288]).collect();
+    let bank = SoundBank::from_sounds(
+        2_000,
+        vec![Sound::stereo(bgm), Sound::mono(vec![29_491; 50])],
+    );
+    let mut m = Mixer::new(3, 2_000);
+    for (s, at) in [(0, 0), (1, 100), (1, 250), (1, 250)] {
+        m.trigger(&bank, SoundId(s), at).unwrap();
+    }
+    let out = render(&mut m, &bank, 400);
+    let key = 29_491.0 / 32_768.0;
+    let (mut single, mut double) = (0, 0);
+    for (i, f) in out.chunks(2).enumerate() {
+        if (250..300).contains(&i) {
+            double += 1;
+            assert!(f[0] > f[1] && f[1] > 0.8 && f[0] <= 1.0, "frame {i}: {f:?}");
+            continue;
+        }
+        let (l, r) = if (100..150).contains(&i) {
+            single += 1;
+            ((0.5 + key) * H, (0.375 + key) * H)
+        } else {
+            (0.5 * H, 0.375 * H)
+        };
+        assert!(
+            (f[0] - l).abs() < 1e-6 && (f[1] - r).abs() < 1e-6,
+            "frame {i}: {f:?} vs ({l}, {r})"
+        );
+    }
+    assert_eq!((single, double), (50, 50));
+    assert_eq!(m.saturated(), 100);
 }

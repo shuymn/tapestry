@@ -1,5 +1,6 @@
 //! The mixer: preallocated voices summed in `f32`, oldest-voice stealing with
-//! a raised-cosine fade, volume, and a peak limiter without look-ahead.
+//! a raised-cosine fade, volume, a fixed headroom gain and a static soft
+//! clipper.
 //!
 //! A triggered sound waits as a pending start at an absolute output frame,
 //! and rendering applies pending starts in time order as it reaches them, so
@@ -10,6 +11,13 @@
 //! slot and fades out over [`STEAL_FADE_MS`] from the new sound's start,
 //! because an abrupt cut is a broadband click. Only when every release slot
 //! is busy is the most-faded release cut, counted in [`Mixer::hard_cuts`].
+//!
+//! The sum is never gain-ridden: a limiter that lowers the whole mix when a
+//! key sound pushes it over full scale would make the background audibly dip
+//! and pump back with every hit. Instead the sum takes a fixed [`HEADROOM`]
+//! gain and then [`soft_clip`], which is the identity up to [`SOFT_CLIP_KNEE`]
+//! and saturates smoothly to full scale above it, sample by sample, with no
+//! state, look-ahead or latency.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -28,10 +36,11 @@ pub const MAX_PENDING_STARTS: usize = 1024;
 pub const MAX_VOLUME: f32 = 16.0;
 /// Fade applied to a stolen voice.
 pub const STEAL_FADE_MS: u32 = 2;
-/// The limiter's ceiling: full scale.
-pub const LIMITER_CEILING: f32 = 1.0;
-/// Time constant of the limiter's release back to unity gain.
-pub const LIMITER_RELEASE_MS: u32 = 50;
+/// Fixed gain on the sum (-6 dB), so a full-scale background and a
+/// full-scale key sound together just reach full scale.
+pub const HEADROOM: f32 = 0.5;
+/// Level below which [`soft_clip`] passes samples unchanged.
+pub const SOFT_CLIP_KNEE: f32 = 0.8;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Voice {
@@ -56,61 +65,19 @@ impl fmt::Display for InvalidVolume {
 
 impl std::error::Error for InvalidVolume {}
 
-/// A stereo-linked peak limiter without look-ahead.
-///
-/// The gain drops at once to what keeps the louder channel at the ceiling
-/// (so the sample that exceeds it is already limited and nothing is
-/// delayed), and returns to 1 exponentially with [`LIMITER_RELEASE_MS`].
-/// A peak exactly at the ceiling passes unchanged.
-#[derive(Clone, Copy, Debug)]
-pub struct Limiter {
-    gain: f32,
-    release: f32,
-    /// Frames whose peak exceeded the ceiling.
-    limited: u64,
-}
-
-impl Limiter {
-    /// A limiter at unity gain for `rate` frames per second.
-    #[must_use]
-    pub fn new(rate: u32) -> Self {
-        let tau = f64::from(rate) * f64::from(LIMITER_RELEASE_MS) / 1000.0;
-        Self {
-            gain: 1.0,
-            release: (1.0 - (-1.0 / tau.max(1.0)).exp()) as f32,
-            limited: 0,
-        }
+/// The static soft clipper: `x` unchanged while `|x|` is at most
+/// [`SOFT_CLIP_KNEE`]; above it, `knee + (1 - knee) tanh((|x| - knee) /
+/// (1 - knee))` with the sign of `x`, which meets the identity with the
+/// same slope and approaches full scale. It never exceeds full scale:
+/// `knee + (1 - knee)` is exactly 1 in `f32` and `tanh` is at most 1.
+#[must_use]
+pub fn soft_clip(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= SOFT_CLIP_KNEE {
+        return x;
     }
-
-    /// Limits one stereo frame.
-    pub fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
-        let peak = l.abs().max(r.abs());
-        let target = if peak > LIMITER_CEILING {
-            self.limited += 1;
-            LIMITER_CEILING / peak
-        } else {
-            1.0
-        };
-        if target < self.gain {
-            self.gain = target;
-        } else {
-            self.gain += (target - self.gain) * self.release;
-        }
-        let clamp = |x: f32| (x * self.gain).clamp(-LIMITER_CEILING, LIMITER_CEILING);
-        (clamp(l), clamp(r))
-    }
-
-    /// The current gain.
-    #[must_use]
-    pub fn gain(&self) -> f32 {
-        self.gain
-    }
-
-    /// Frames whose peak exceeded the ceiling so far.
-    #[must_use]
-    pub fn limited(&self) -> u64 {
-        self.limited
-    }
+    let span = 1.0 - SOFT_CLIP_KNEE;
+    (SOFT_CLIP_KNEE + span * ((a - SOFT_CLIP_KNEE) / span).tanh()).copysign(x)
 }
 
 /// The mixer. Everything is allocated in [`Mixer::new`]; triggering and
@@ -127,7 +94,8 @@ pub struct Mixer {
     mixed_to: u64,
     seq: u64,
     volume: f32,
-    limiter: Limiter,
+    /// Samples above [`SOFT_CLIP_KNEE`] after the volume and headroom.
+    saturated: u64,
     steals: u64,
     hard_cuts: u64,
     dropped_starts: u64,
@@ -153,7 +121,7 @@ impl Mixer {
             mixed_to: 0,
             seq: 0,
             volume: 1.0,
-            limiter: Limiter::new(rate),
+            saturated: 0,
             steals: 0,
             hard_cuts: 0,
             dropped_starts: 0,
@@ -208,13 +176,15 @@ impl Mixer {
         self.pending.len() < self.pending.capacity()
     }
 
-    /// The limiter's state.
+    /// Output samples so far whose level, after the volume and
+    /// [`HEADROOM`], was above [`SOFT_CLIP_KNEE`] and so saturated.
     #[must_use]
-    pub fn limiter(&self) -> &Limiter {
-        &self.limiter
+    pub fn saturated(&self) -> u64 {
+        self.saturated
     }
 
-    /// Sets the master volume, applied before the limiter.
+    /// Sets the master volume, applied with [`HEADROOM`] before the soft
+    /// clipper.
     ///
     /// # Errors
     ///
@@ -341,7 +311,7 @@ impl Mixer {
     /// Renders the next `out.len() / 2` frames into interleaved stereo
     /// `out` (overwritten), starting at [`Mixer::mixed_to`]: every voice
     /// summed, with each pending start applied when its frame is reached,
-    /// then the volume and the limiter.
+    /// then the volume, [`HEADROOM`] and [`soft_clip`].
     pub fn render(&mut self, bank: &SoundBank, out: &mut [f32]) {
         out.fill(0.0);
         let block_start = self.mixed_to;
@@ -358,8 +328,13 @@ impl Mixer {
             self.pending.pop();
             self.apply(voice);
         }
-        for [l, r] in out.as_chunks_mut::<CHANNELS>().0 {
-            (*l, *r) = self.limiter.process(*l * self.volume, *r * self.volume);
+        let gain = self.volume * HEADROOM;
+        for x in out.iter_mut() {
+            let y = *x * gain;
+            if y.abs() > SOFT_CLIP_KNEE {
+                self.saturated += 1;
+            }
+            *x = soft_clip(y);
         }
         self.mixed_to = block_end;
     }
@@ -370,23 +345,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn limiter_passes_full_scale_and_limits_above_it() {
-        let mut l = Limiter::new(48_000);
-        // Exactly at the ceiling: unchanged, gain stays 1, nothing counted.
-        assert_eq!(l.process(1.0, -1.0), (1.0, -1.0));
-        assert_eq!(l.process(-1.0, 0.25), (-1.0, 0.25));
-        assert_eq!((l.gain(), l.limited()), (1.0, 0));
-        // Above it: the same sample is brought to the ceiling (no
-        // look-ahead), stereo linked by the louder channel.
-        assert_eq!(l.process(2.0, 1.0), (1.0, 0.5));
-        assert_eq!((l.gain(), l.limited()), (0.5, 1));
-        // Release: a quiet frame afterwards is still attenuated, and the gain
-        // recovers toward 1 by the per-frame coefficient
-        // 1 - exp(-1 / (48_000 * 0.05)) = 0.000416580... (by hand).
-        let (x, _) = l.process(0.5, 0.0);
-        let g = 0.5 + 0.5 * 0.000_416_58_f32;
-        assert!((x - 0.5 * g).abs() < 1e-6, "{x}");
-        assert!(l.gain() < 1.0);
+    fn soft_clip_is_the_identity_up_to_the_knee() {
+        let mut checked = 0;
+        for k in -8_000..=8_000 {
+            let x = k as f32 / 10_000.0;
+            assert_eq!(soft_clip(x).to_bits(), x.to_bits(), "{x}");
+            checked += 1;
+        }
+        assert_eq!(checked, 16_001);
+        assert_eq!(soft_clip(SOFT_CLIP_KNEE), SOFT_CLIP_KNEE);
+        assert_eq!(soft_clip(-SOFT_CLIP_KNEE), -SOFT_CLIP_KNEE);
+    }
+
+    #[test]
+    fn soft_clip_saturates_smoothly_within_full_scale() {
+        // 0.8 + 0.2 tanh(0.1 / 0.2) and 0.8 + 0.2 tanh(0.2 / 0.2), by hand
+        // (tanh 0.5 = 0.4621172, tanh 1 = 0.7615942).
+        assert!((soft_clip(0.9) - 0.892_423_4).abs() < 1e-6);
+        assert!((soft_clip(-1.0) + 0.952_318_8).abs() < 1e-6);
+        // Any input level, up to the largest float: within full scale,
+        // nondecreasing, and above the knee once the input is.
+        let mut prev = soft_clip(SOFT_CLIP_KNEE);
+        let mut x = SOFT_CLIP_KNEE;
+        let mut reached_full_scale = false;
+        while x.is_finite() {
+            x = x.next_up() * 1.001;
+            for y in [soft_clip(x), -soft_clip(-x)] {
+                assert!(y > SOFT_CLIP_KNEE && y <= 1.0, "{x}: {y}");
+                assert!(y >= prev, "{x}: {y} < {prev}");
+            }
+            prev = soft_clip(x);
+            reached_full_scale |= prev == 1.0;
+        }
+        assert!(reached_full_scale);
+        assert_eq!(soft_clip(f32::MAX), 1.0);
+        assert_eq!(soft_clip(f32::NEG_INFINITY), -1.0);
     }
 
     #[test]
@@ -399,8 +392,9 @@ mod tests {
         let mut out = [0.0; 12];
         m.render(&bank, &mut out);
         assert_eq!(m.steals(), 1);
+        // 0.25 of full scale, halved by the headroom.
         let left: Vec<f32> = out.iter().step_by(2).copied().collect();
-        assert_eq!(left, [0.25; 6]);
+        assert_eq!(left, [0.125; 6]);
     }
 
     #[test]
@@ -423,7 +417,8 @@ mod tests {
         m.trigger(&bank, SoundId(0), 0).unwrap();
         let mut out = [0.0; 4];
         m.render(&bank, &mut out);
-        assert_eq!(out, [0.125; 4]);
+        // 0.25 × 0.5 volume × 0.5 headroom.
+        assert_eq!(out, [0.0625; 4]);
     }
 
     #[test]
