@@ -28,7 +28,9 @@ mod session;
 mod settings;
 mod sound;
 
-pub use audio_loop::{AudioControl, AudioCtl, AudioWorker, audio_control};
+pub use audio_loop::{
+    AudioControl, AudioCtl, AudioWaitError, AudioWorker, SWITCH_TIMEOUT, audio_control,
+};
 pub use live::{Closing, LiveError, Opening, Rig};
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,

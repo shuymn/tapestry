@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use ::audio::{AudioEngine, AudioOutput, OutputError};
 use bms_model::TimeUs;
@@ -26,6 +27,28 @@ const CONTROL_CAPACITY: usize = 16;
 /// Retired queues waiting for the game thread: one, since a play is
 /// started only once the queue the previous start retired has come back.
 const RETIRED_CAPACITY: usize = 1;
+
+/// How long the game thread waits for the audio thread to take a play
+/// switch: far beyond a period, which is when it takes one.
+pub const SWITCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Why the audio thread did not take a play switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioWaitError {
+    /// The worker is gone.
+    Gone,
+    /// It did not answer within [`SWITCH_TIMEOUT`].
+    Timeout,
+}
+
+impl std::fmt::Display for AudioWaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gone => "the audio thread is gone",
+            Self::Timeout => "the audio thread did not answer",
+        })
+    }
+}
 
 /// What the game thread tells the audio thread.
 #[derive(Debug)]
@@ -116,25 +139,54 @@ impl AudioControl {
         // The worker drains every message each step, even after a failure,
         // so a full queue empties within a period.
         while let Err(rtrb::PushError::Full(m)) = self.ctl.push(msg) {
+            // A worker that is gone takes nothing more.
+            if self.ctl.is_abandoned() {
+                return;
+            }
             msg = m;
             std::thread::yield_now();
         }
     }
 
-    /// Starts a play; the queues retired by earlier plays are dropped here.
-    /// One play switch is in flight at most: the previous start's retired
-    /// queue comes back before the next start is sent, so the return
-    /// queue always has room and the audio thread never frees one.
-    pub fn play(&mut self, origin: TimeUs, queue: AudioQueue) {
-        if self.in_flight {
-            loop {
-                if let Ok(retired) = self.retired.pop() {
-                    drop(retired);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_micros(500));
-            }
+    /// Waits until the audio thread has taken the previous play's switch
+    /// and returned its retired queue, which is dropped here. Call it before
+    /// recording opens, so [`play`](Self::play) does not wait.
+    ///
+    /// # Errors
+    ///
+    /// [`AudioWaitError::Gone`] once the worker is gone, and
+    /// [`AudioWaitError::Timeout`] after [`SWITCH_TIMEOUT`].
+    pub fn ready(&mut self) -> Result<(), AudioWaitError> {
+        if !self.in_flight {
+            return Ok(());
         }
+        let deadline = Instant::now() + SWITCH_TIMEOUT;
+        loop {
+            if let Ok(retired) = self.retired.pop() {
+                drop(retired);
+                self.in_flight = false;
+                return Ok(());
+            }
+            if self.retired.is_abandoned() {
+                return Err(AudioWaitError::Gone);
+            }
+            if Instant::now() >= deadline {
+                return Err(AudioWaitError::Timeout);
+            }
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+
+    /// Starts a play. One play switch is in flight at most: the previous
+    /// start's retired queue comes back first ([`ready`](Self::ready)), so
+    /// the return queue always has room and the audio thread never frees
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// As [`ready`](Self::ready); nothing is sent.
+    pub fn play(&mut self, origin: TimeUs, queue: AudioQueue) -> Result<(), AudioWaitError> {
+        self.ready()?;
         self.in_flight = true;
         self.generation += 1;
         let generation = self.generation;
@@ -143,6 +195,7 @@ impl AudioControl {
             queue,
             generation,
         });
+        Ok(())
     }
 
     /// Stops the play's sounds.
@@ -165,7 +218,8 @@ impl AudioControl {
     /// The output's failure, once it failed.
     #[must_use]
     pub fn failure(&self) -> Option<OutputError> {
-        self.shared.failure.get().copied()
+        let gone = self.ctl.is_abandoned().then_some(OutputError::DeviceLost);
+        self.shared.failure.get().copied().or(gone)
     }
 
     /// Ends the worker's loop.

@@ -10,10 +10,13 @@ use common::{MS, PERIOD, RATE, bank, lane};
 use eval::{JudgeEvent, JudgeEventKind};
 use game::{AudioControl, AudioWorker, EventSink, audio_control, audio_link_at};
 
-/// One sound (480 frames at 48 kHz: 10 ms), played as BGM at chart 0.
+/// Two sounds of 480 frames at 48 kHz (10 ms), sound 0 played as BGM at
+/// chart 0 and sound 1 as the key sound. The bank fills sound `i` with the
+/// constant `1000 + 7 i`.
 fn chart() -> Chart {
     ChartBuilder::new(150_000)
-        .sound("s.wav")
+        .sound("bgm.wav")
+        .sound("key.wav")
         .bgm(TimeUs(0), SoundId(0))
         .tap(lane(1), TimeUs(1_000 * MS))
         .build()
@@ -37,7 +40,7 @@ fn key_sound(origin: i64) -> JudgeEvent {
         origin: Some(TimeUs(origin)),
         kind: JudgeEventKind::PlaySound {
             lane: lane(1),
-            sound: SoundId(0),
+            sound: SoundId(1),
         },
     }
 }
@@ -65,7 +68,7 @@ fn a_sealed_play_is_done_once_its_sounds_have_ended() {
     // Chart time 0 at 50 ms: the BGM sound starts there, and a key sound
     // pressed at 60 ms is queued before the seal.
     let (mut sink, queue) = audio_link_at(4, TimeUs(50 * MS));
-    control.play(TimeUs(50 * MS), queue);
+    control.play(TimeUs(50 * MS), queue).unwrap();
     sink.receive(&key_sound(10 * MS));
     control.seal();
     assert!(
@@ -81,22 +84,46 @@ fn a_sealed_play_is_done_once_its_sounds_have_ended() {
         assert!(steps < 100, "never done");
     }
     // Both 10 ms sounds (480 frames each) were heard before it was done,
-    // in separate regions: the BGM sound from its time, 50 ms = frame
-    // 2 400, and the key sound before it, from the first frame not yet
-    // written when its command was taken.
+    // each at its own level (1000 and 1007 of i16::MAX + 1), the BGM
+    // sound first and the key sound right after it, nothing else.
     let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
-    let bgm = 2_400..2_880;
-    assert!(left[bgm.clone()].iter().all(|&s| s != 0.0));
-    let before = left[..bgm.start].iter().filter(|&&s| s != 0.0).count();
-    let after = left[bgm.end..].iter().filter(|&&s| s != 0.0).count();
-    assert_eq!((before, after), (480, 0));
+    let bgm = 1_000.0 / 32_768.0;
+    let key = 1_007.0 / 32_768.0;
+    let heard: Vec<usize> = (0..left.len()).filter(|&f| left[f] != 0.0).collect();
+    assert_eq!(heard.len(), 960);
+    let (first, second) = heard.split_at(480);
+    assert!(first.iter().all(|&f| left[f] == bgm), "BGM at {first:?}");
+    assert!(second.iter().all(|&f| left[f] == key), "key at {second:?}");
+    // Each a contiguous 10 ms run.
+    assert_eq!(first[479] - first[0], 479);
+    assert_eq!(second[479] - second[0], 479);
     // A play that is not sealed is never done, even when silent: this one
     // is cancelled, which leaves no BGM to come.
     let (_sink, queue) = audio_link_at(4, TimeUs(1_000 * MS));
-    control.play(TimeUs(1_000 * MS), queue);
+    control.play(TimeUs(1_000 * MS), queue).unwrap();
     control.cancel();
     for _ in 0..20 {
         worker.step(&mut out).unwrap();
     }
     assert!(!control.done());
+}
+
+/// The audio thread is gone before it took a play's switch: waiting for
+/// it reports that at once, so the next play gets an error, not a hang.
+#[test]
+fn a_gone_worker_fails_the_next_play() {
+    let chart = chart();
+    let (mut control, worker, _out) = rig(&chart);
+    let (_sink, queue) = audio_link_at(4, TimeUs(50 * MS));
+    control.play(TimeUs(50 * MS), queue).unwrap();
+    drop(worker);
+    let started = std::time::Instant::now();
+    let (_sink, queue) = audio_link_at(4, TimeUs(500 * MS));
+    assert_eq!(
+        control.play(TimeUs(500 * MS), queue),
+        Err(game::AudioWaitError::Gone)
+    );
+    assert_eq!(control.ready(), Err(game::AudioWaitError::Gone));
+    assert!(started.elapsed() < game::SWITCH_TIMEOUT / 2);
+    assert_eq!(control.failure(), Some(audio::OutputError::DeviceLost));
 }
