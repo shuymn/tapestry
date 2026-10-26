@@ -58,7 +58,8 @@ jobs:
           echo "rust=$(jq 'any(.[]; .name == "rust")' "$RUNNER_TEMP/changes.json")" >>"$GITHUB_OUTPUT"
 
       # flake.nix takes the Rust version from mise.lock, so rust-overlay must
-      # know the new version. The eval fails if it does not.
+      # know the new version. The eval fails if it does not, and the fuzz
+      # shell's eval fails if the update lost its dated nightly.
       - if: steps.lock.outputs.rust == 'true'
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
 
@@ -67,6 +68,7 @@ jobs:
         run: |
           nix flake update rust-overlay
           nix eval .#devShells.x86_64-linux.default.drvPath
+          nix eval .#devShells.x86_64-linux.fuzz.drvPath
 
       - name: Check changed files
         if: steps.lock.outputs.changed == 'true'

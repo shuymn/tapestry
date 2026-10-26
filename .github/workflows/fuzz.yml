@@ -1,0 +1,52 @@
+name: Fuzz
+
+# Longer fuzz runs than CI's, one job per target, with the same per-input
+# limits (docs/setup.md "Fuzzing"). Each run starts from the generated seeds;
+# a failing input is printed in the log by scripts/fuzz.sh.
+
+on:
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        type: number
+        default: 900
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/fuzz.yml
+      - scripts/fuzz.sh
+      - flake.nix
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fuzz-long:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [bms_load, replay_file, replay_body, raw_input]
+    env:
+      TAPESTRY_NIX_SHELL: fuzz
+      # 60 s on pull requests, which only check this workflow.
+      SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && 60 || inputs.seconds || 900 }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Build fuzz targets
+        run: scripts/wsl.sh scripts/fuzz.sh build
+      - name: Fuzz
+        run: scripts/wsl.sh scripts/fuzz.sh run "$TARGET" "$SECONDS_PER_TARGET"

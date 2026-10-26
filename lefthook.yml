@@ -11,7 +11,7 @@ pre-commit:
       run: mise exec -- cargo xtask banned-words --staged
     rustfmt:
       glob: "**/*.rs"
-      run: mise exec -- cargo fmt --all --check
+      run: mise exec -- cargo fmt --all --check && mise exec -- cargo fmt --manifest-path fuzz/Cargo.toml --check
     actionlint:
       glob: ".github/workflows/*.{yml,yaml}"
       run: mise exec -- actionlint
