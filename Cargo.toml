@@ -57,6 +57,7 @@ toml = "1.1.8"
 tempfile = "3.27.0"
 
 # player (Windows only)
+lexopt = "0.3.2"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
 # render (Windows only)
