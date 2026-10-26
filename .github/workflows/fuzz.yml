@@ -38,8 +38,10 @@ jobs:
         target: [bms_load, replay_file, replay_body, raw_input]
     env:
       TAPESTRY_NIX_SHELL: fuzz
-      # 60 s on pull requests, which only check this workflow.
-      SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && 60 || inputs.seconds || 900 }}
+      # 60 s on pull requests, which only check this workflow. format() keeps a
+      # dispatched 0 as the string "0", so scripts/fuzz.sh refuses it instead
+      # of the expression falling through to the default.
+      SECONDS_PER_TARGET: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.seconds) || github.event_name == 'pull_request' && '60' || '900' }}
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
