@@ -3,7 +3,9 @@
 //! - R1: the dependency closure of `eval` (normal and build dependencies, all
 //!   features, all platforms) stays inside `bms-model`, `rules`, and
 //!   [`EVAL_ALLOWED_EXTERNAL`]. An allowlist, because a denylist cannot
-//!   foresee every clock or I/O crate. This does not cover `std` APIs.
+//!   foresee every clock or I/O crate. This does not cover `std` APIs;
+//!   `crates/eval/clippy.toml` rejects the listed `std` entry points
+//!   (checked by `cargo xtask check-lints`).
 //! - R2: only packages named in [`WINDOWS_ONLY_ALLOWED`] may set
 //!   `[package.metadata.tapestry] windows-only = true`, and no other package
 //!   may depend on a Windows-only package.

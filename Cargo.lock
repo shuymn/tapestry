@@ -2538,6 +2538,7 @@ dependencies = [
  "cargo_metadata",
  "encoding_rs",
  "tempfile",
+ "toml",
  "unicode-normalization",
 ]
 

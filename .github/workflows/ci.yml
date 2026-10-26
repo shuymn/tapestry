@@ -115,6 +115,8 @@ jobs:
         run: mise exec -- cargo xtask check-arch
       - name: Clippy (portable crates)
         run: mise exec -- cargo xtask portable clippy --all-targets --locked -- -D warnings
+      - name: Lint fixtures
+        run: mise exec -- cargo xtask check-lints
       - name: Test (portable crates)
         run: mise exec -- cargo xtask portable test --locked
       - name: cargo-deny
