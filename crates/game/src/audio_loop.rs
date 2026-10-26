@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ::audio::{AudioEngine, AudioOutput, InvalidVolume, MAX_VOLUME, OutputError};
+use ::audio::{AudioEngine, AudioOutput, InvalidVolume, MAX_VOLUME, OutputError, ScheduledKind};
 use bms_model::TimeUs;
 
 use crate::sound::{AudioQueue, audio_link};
@@ -71,6 +71,41 @@ pub enum AudioCtl {
     Exit,
 }
 
+/// What the audio thread measured for a play (D11), sent to whoever
+/// shows the figures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioProbe {
+    /// The play it belongs to ([`AudioControl::generation`]).
+    pub generation: u64,
+    /// What was measured.
+    pub kind: Probed,
+}
+
+/// One audio measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probed {
+    /// A key sound was scheduled: the mix clock time of its first sample
+    /// minus the receive time of the press behind it (press → sound
+    /// scheduled; the output after the engine is not included).
+    KeyScheduled {
+        /// The latency.
+        latency: TimeUs,
+    },
+}
+
+/// The audio thread's underrun count (wakes that found the buffer empty
+/// after audio had been written), readable from any thread.
+#[derive(Clone, Debug)]
+pub struct Underruns(Arc<Shared>);
+
+impl Underruns {
+    /// Underruns since the engine started.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.underruns.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Shared {
     /// A volume to apply: its `f32` bits with bit 32 set; 0 when none is
@@ -79,6 +114,8 @@ struct Shared {
     volume: AtomicU64,
     /// The generation whose sealed audio has ended.
     done: AtomicU64,
+    /// The engine's underruns so far.
+    underruns: AtomicU64,
     failure: OnceLock<OutputError>,
 }
 
@@ -106,6 +143,8 @@ pub struct AudioWorker {
     exited: bool,
     /// A retired queue the full return queue did not take.
     unreturned: Option<AudioQueue>,
+    /// Where key sound latencies go, if anywhere; a full queue drops them.
+    probe: Option<rtrb::Producer<AudioProbe>>,
 }
 
 /// The two ends around `engine`, which is stopped until the first play.
@@ -134,6 +173,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
             sealed: false,
             exited: false,
             unreturned: None,
+            probe: None,
         },
     )
 }
@@ -245,6 +285,19 @@ impl AudioControl {
         Ok(())
     }
 
+    /// The current play's number: 0 before the first play, then one more
+    /// for each [`play`](Self::play).
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The audio thread's underrun count.
+    #[must_use]
+    pub fn underruns(&self) -> Underruns {
+        Underruns(Arc::clone(&self.shared))
+    }
+
     /// Ends the worker's loop.
     pub fn exit(&mut self) {
         self.send(AudioCtl::Exit);
@@ -308,6 +361,19 @@ impl AudioWorker {
             let _ = self.shared.failure.set(e);
             return Err(e);
         }
+        self.shared
+            .underruns
+            .store(self.engine.underruns(), Ordering::Release);
+        if let Some(p) = self.probe.as_mut() {
+            let generation = self.generation;
+            self.engine.drain_scheduled(|s| {
+                if let (ScheduledKind::Key { origin }, Some(at)) = (s.kind, s.at) {
+                    let latency = TimeUs(at.0.saturating_sub(origin.0));
+                    let kind = Probed::KeyScheduled { latency };
+                    let _ = p.push(AudioProbe { generation, kind });
+                }
+            });
+        }
         let mixer = self.engine.mixer();
         if self.sealed
             && self.queue.is_empty()
@@ -335,6 +401,12 @@ impl AudioWorker {
                 }
             }
         }
+    }
+
+    /// Sends each key sound's press → sound scheduled latency to `probe`.
+    /// The engine must keep scheduled starts (its `schedule_log`).
+    pub fn set_probe(&mut self, probe: rtrb::Producer<AudioProbe>) {
+        self.probe = Some(probe);
     }
 
     /// The engine.

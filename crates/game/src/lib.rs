@@ -31,7 +31,8 @@ mod sound;
 mod tuning;
 
 pub use audio_loop::{
-    AudioControl, AudioCtl, AudioWaitError, AudioWorker, SWITCH_TIMEOUT, audio_control,
+    AudioControl, AudioCtl, AudioProbe, AudioWaitError, AudioWorker, Probed, SWITCH_TIMEOUT,
+    Underruns, audio_control,
 };
 pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, Press, ROLES,
@@ -61,8 +62,8 @@ pub use session::{
     ReloadError, Session, SessionConfig, SessionError, Settings,
 };
 pub use settings::{
-    DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, PlayerSettings, Role, SettingsError,
-    load_settings, reserved_key, save_settings,
+    DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, OVERLAY_KEY, PlayerSettings, Role,
+    SettingsError, load_settings, reserved_key, save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{

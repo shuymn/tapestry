@@ -29,7 +29,7 @@ use eval::InputStart;
 use input::{Arrival, DeviceKind};
 use replay::Incomplete;
 
-use crate::logic::{AbortCause, Logic, LogicError, SourceRead};
+use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::render::RenderSide;
 use crate::session::{Command, Loaded, PlayEnd, PlayOutcome, PlayReport, Settings};
 use crate::sound::{AudioQueue, audio_link_at};
@@ -74,6 +74,12 @@ pub trait Rig {
     /// threads need nothing.
     fn stepped(&mut self, aborted: bool) {
         let _ = aborted;
+    }
+    /// What each logic step of a play measured (D11): its finalization
+    /// delay and input to judgment. Called after every step, before
+    /// [`stepped`](Self::stepped).
+    fn measured(&mut self, advance: &Advance) {
+        let _ = advance;
     }
     /// A pending retry or suspend (or quit, for rigs without a latch),
     /// taken.
@@ -280,6 +286,7 @@ fn play_and_next<R: Rig>(
         }
         let advance = logic.advance_to(TimeUs(rig.now().0 - origin.0));
         live.extend_from_slice(logic.events());
+        rig.measured(&advance);
         rig.stepped(advance.aborted.is_some());
         if let Some(cause) = advance.aborted {
             rig.cancel_audio();

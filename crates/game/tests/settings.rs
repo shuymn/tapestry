@@ -490,8 +490,8 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
         );
     }
 
-    // The settings keys F1 (first) and F8 (last) and the keep key F12, as
-    // a lane, retry and quit; F9 is free.
+    // The settings keys F1 (first) and F8 (last), the overlay key F9 and
+    // the keep key F12, as a lane, retry and quit; F10 is free.
     let reserved = [
         (with(|d| set_lane(d, 1, 0x3b)), 0x3b, "hi-speed"),
         (
@@ -504,6 +504,11 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
             0x58,
             "keeping a binding",
         ),
+        (
+            with(|d| set_lane(d, 4, 0x43)),
+            0x43,
+            "is reserved for the measurement overlay",
+        ),
     ];
     for (d, control, what) in &reserved {
         assert!(matches!(
@@ -512,7 +517,7 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
         ));
         assert_invalid(d, &player, what);
     }
-    assert!(load_written(&with(|d| set_lane(d, 1, 0x43)), &player).is_ok());
+    assert!(load_written(&with(|d| set_lane(d, 1, 0x44)), &player).is_ok());
 
     // A lane the game does not have.
     let lane_8 = with(|d| d.keyboard.lanes[0].lane = 8);
@@ -617,7 +622,13 @@ fn settings_keys_step_and_stop_at_their_bounds() {
         assert_eq!(Adjust::from_key(a.key()), Some(a));
         assert!(game::reserved_key(a.key()).is_some());
     }
-    for free in [0x3a, 0x43, 0x01, 0x0e] {
+    assert_eq!(game::OVERLAY_KEY, 0x43);
+    assert_eq!(
+        game::reserved_key(game::OVERLAY_KEY),
+        Some("the measurement overlay")
+    );
+    assert_eq!(Adjust::from_key(game::OVERLAY_KEY), None);
+    for free in [0x3a, 0x44, 0x01, 0x0e] {
         assert_eq!(Adjust::from_key(free), None);
         assert_eq!(game::reserved_key(free), None);
     }
@@ -825,7 +836,7 @@ fn two_names_of_one_key_cannot_have_two_roles() {
     for code in game::Adjust::ALL
         .iter()
         .map(|a| a.key())
-        .chain([game::KEEP_KEY])
+        .chain([game::KEEP_KEY, game::OVERLAY_KEY])
     {
         for other in (0..=0xFF).chain(0xE000..=0xE1FF) {
             let same = input::raw::key_identity(eval::ControlId(other))

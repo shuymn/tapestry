@@ -130,6 +130,8 @@ struct Fake {
     /// screen: each waits for the next play.
     offset_changes: Vec<(i64, i64)>,
     pending_offset: Option<i64>,
+    /// Every step's measurement, by play.
+    measured: Vec<Vec<game::Advance>>,
 }
 
 impl Fake {
@@ -166,6 +168,7 @@ impl Fake {
             reports: Vec::new(),
             offset_changes: Vec::new(),
             pending_offset: None,
+            measured: Vec::new(),
         }
     }
 
@@ -305,6 +308,13 @@ impl Rig for Fake {
 
     fn ended(&mut self, report: &PlayReport) {
         self.reports.push(report.clone());
+    }
+
+    fn measured(&mut self, advance: &game::Advance) {
+        if self.measured.len() < self.origins.len() {
+            self.measured.push(Vec::new());
+        }
+        self.measured.last_mut().unwrap().push(*advance);
     }
 
     fn show_end(&mut self, _report: &PlayReport) {
@@ -772,4 +782,47 @@ fn input_offset_change_applies_next_play_only() {
     );
     // The change made during play 2 is still waiting.
     assert_eq!(rig.pending_offset, Some(21_000));
+}
+
+/// Every logic step of a play reaches the rig's measurement (D11): each
+/// step that advanced has a finalization delay, and input to judgment
+/// appears exactly in the steps that judged a press, never in the others.
+/// The aborted first play's steps end at its abort.
+#[test]
+fn every_step_is_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![
+        key(9_303_000, Z, 1),
+        key(9_353_000, Z, 0),
+        key(11_503_000, Z, 1),
+        key(11_553_000, Z, 0),
+        key(12_003_000, Z, 1),
+        key(12_053_000, Z, 0),
+    ];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.measured.len(), 2);
+    for (play, steps) in rig.measured.iter().enumerate() {
+        assert!(!steps.is_empty());
+        let advanced = steps.iter().filter(|a| a.watermark.is_some()).count();
+        let delays = steps
+            .iter()
+            .filter_map(|a| a.finalization_delay)
+            .collect::<Vec<_>>();
+        assert_eq!(delays.len(), advanced);
+        assert!(delays.iter().all(|d| d.0 >= 0));
+        // Play 1 judged one press before the retry, play 2 two presses.
+        let judging = steps
+            .iter()
+            .filter(|a| a.judgment_latency.is_some())
+            .count();
+        assert_eq!(judging, [1, 2][play], "play {}", play + 1);
+        // Received at a 1 ms boundary and judged within the next steps.
+        for a in steps.iter().filter_map(|a| a.judgment_latency) {
+            assert!((0..=3 * MS).contains(&a.0), "{a:?}");
+        }
+    }
+    // The aborted play's last step is its abort.
+    assert!(rig.measured[0].last().unwrap().aborted.is_some());
 }

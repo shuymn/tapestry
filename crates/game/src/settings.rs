@@ -192,6 +192,9 @@ impl fmt::Display for KeyError {
 
 impl std::error::Error for KeyError {}
 
+/// F9: shows and hides the measurement overlay during play (D11).
+pub const OVERLAY_KEY: u32 = 0x43;
+
 /// What the game reserves keyboard key `code` (a scan code) for, if
 /// anything: the settings keys and the key config's keep key are never
 /// bound.
@@ -199,6 +202,9 @@ impl std::error::Error for KeyError {}
 pub fn reserved_key(code: u32) -> Option<&'static str> {
     if code == crate::keys::KEEP_KEY {
         return Some("keeping a binding in key config");
+    }
+    if code == OVERLAY_KEY {
+        return Some("the measurement overlay");
     }
     Adjust::from_key(code).map(Adjust::name)
 }

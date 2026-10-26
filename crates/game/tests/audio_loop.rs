@@ -168,3 +168,73 @@ fn volume_change_scales_mixed_samples() {
     expected.extend([key * 0.25; 480]);
     assert_eq!(heard, expected);
 }
+
+/// Each key sound's press → sound scheduled latency reaches the probe,
+/// tagged with its play: the time the device plays the sound's first
+/// frame (found in the recording and timed by the simulated device, not
+/// by the engine's mix clock) minus the press's receive time. The
+/// underrun count is readable from another thread's handle.
+#[test]
+fn the_probe_reports_each_key_sound_with_its_play() {
+    let chart = ChartBuilder::new(150_000)
+        .sound("bgm.wav")
+        .sound("key.wav")
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let engine = AudioEngine::new(bank(&chart), &chart.bgm, RATE, PERIOD, MAX_VOICES, 4).unwrap();
+    let (mut control, mut worker) = audio_control(engine);
+    let mut out = RecordingOutput::new(
+        SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+        RATE as usize,
+    );
+    let (tx, mut rx) = rtrb::RingBuffer::new(8);
+    worker.set_probe(tx);
+    let underruns = control.underruns();
+    for _ in 0..3 {
+        worker.step(&mut out).unwrap();
+    }
+    // Chart time 0 at 30 ms; the press at chart time 3 ms, 33 ms on the
+    // output's timeline.
+    let (mut sink, queue) = audio_link_at(4, TimeUs(30 * MS));
+    control.play(TimeUs(30 * MS), queue).unwrap();
+    assert_eq!(control.generation(), 1);
+    worker.step(&mut out).unwrap();
+    sink.receive(&key_sound(3 * MS));
+    for _ in 0..5 {
+        worker.step(&mut out).unwrap();
+    }
+    let probe = rx.pop().expect("a key sound probe");
+    assert!(rx.pop().is_err(), "one key sound, one probe");
+    assert_eq!(probe.generation, 1);
+    let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+    let first = left.iter().position(|&s| s != 0.0).expect("the key sound") as u64;
+    let played = out.inner().true_time(first);
+    let game::Probed::KeyScheduled { latency } = probe.kind;
+    assert!(latency.0 > 0);
+    assert_eq!(latency, TimeUs(played.0 - 33 * MS));
+    assert_eq!(underruns.get(), 0);
+}
+
+/// Three missed buffer events leave the device without audio: the
+/// handle reads the engine's count of wakes that found the buffer empty
+/// (D11), which sees the starved stretch at least once and at most as
+/// often as the simulated device counted short passes.
+#[test]
+fn underruns_are_counted_as_the_device_saw_them() {
+    let chart = chart();
+    let engine = AudioEngine::new(bank(&chart), &chart.bgm, RATE, PERIOD, MAX_VOICES, 0).unwrap();
+    let (control, mut worker) = audio_control(engine);
+    let config = SimConfig {
+        missed_wakes: vec![5, 6, 7],
+        ..SimConfig::steady(RATE, PERIOD, TimeUs(0))
+    };
+    let mut out = RecordingOutput::new(SimDevice::new(config), RATE as usize);
+    let underruns = control.underruns();
+    for _ in 0..20 {
+        worker.step(&mut out).unwrap();
+    }
+    let seen = out.inner().underruns();
+    assert!((1..=seen).contains(&underruns.get()), "{seen}");
+    assert_eq!(underruns.get(), worker.engine().underruns());
+}
