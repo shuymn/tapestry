@@ -115,6 +115,10 @@ enum MissFile {
 #[serde(deny_unknown_fields)]
 struct EmptyPoorFile {
     ahead_us: i64,
+    /// Absent in a file written before the late side existed, which keeps
+    /// that file's preset and hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    behind_us: Option<i64>,
     breaks_combo: bool,
     counts_bp: bool,
     counted: bool,
@@ -327,6 +331,7 @@ impl From<PresetFile> for RulePreset {
             },
             empty_poor: EmptyPoorRule {
                 ahead: TimeUs(empty_poor.ahead_us),
+                behind: empty_poor.behind_us.map(TimeUs),
                 breaks_combo: empty_poor.breaks_combo,
                 counts_bp: empty_poor.counts_bp,
                 counted: empty_poor.counted,
@@ -436,11 +441,21 @@ impl From<&RulePreset> for PresetFile {
             miss: match miss {
                 MissRule::PoorAfterLateBad => MissFile::PoorAfterLateBad,
             },
-            empty_poor: EmptyPoorFile {
-                ahead_us: empty_poor.ahead.0,
-                breaks_combo: empty_poor.breaks_combo,
-                counts_bp: empty_poor.counts_bp,
-                counted: empty_poor.counted,
+            empty_poor: {
+                let EmptyPoorRule {
+                    ahead,
+                    behind,
+                    breaks_combo,
+                    counts_bp,
+                    counted,
+                } = *empty_poor;
+                EmptyPoorFile {
+                    ahead_us: ahead.0,
+                    behind_us: behind.map(|t| t.0),
+                    breaks_combo,
+                    counts_bp,
+                    counted,
+                }
             },
             ln_break: LnBreakFile {
                 release_margin_us: ln_break.release_margin.0,

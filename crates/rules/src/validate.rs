@@ -22,6 +22,9 @@ impl RulePreset {
         }
         check_windows(&self.windows)?;
         non_negative(self.empty_poor.ahead, "empty_poor.ahead")?;
+        if let Some(behind) = self.empty_poor.behind {
+            non_negative(behind, "empty_poor.behind")?;
+        }
         non_negative(self.ln_break.release_margin, "ln_break.release_margin")?;
         let r = &self.rank_scale;
         if r.rank_milli
@@ -179,6 +182,30 @@ mod tests {
             Err(RuleError::WindowsNotAscending {
                 side: Side::Early,
                 judgment: Judgment::Perfect,
+            })
+        );
+    }
+
+    #[test]
+    fn negative_empty_poor_distances_are_rejected() {
+        let with = |ahead: i64, behind: Option<i64>| {
+            let mut preset = custom();
+            preset.empty_poor.ahead = TimeUs(ahead);
+            preset.empty_poor.behind = behind.map(TimeUs);
+            preset.validate()
+        };
+        assert_eq!(with(0, Some(0)), Ok(()));
+        assert_eq!(with(0, None), Ok(()));
+        assert_eq!(
+            with(0, Some(-1)),
+            Err(RuleError::OutOfRange {
+                field: "empty_poor.behind"
+            })
+        );
+        assert_eq!(
+            with(-1, Some(0)),
+            Err(RuleError::OutOfRange {
+                field: "empty_poor.ahead"
             })
         );
     }
