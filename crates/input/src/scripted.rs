@@ -1,6 +1,6 @@
-//! Fake input: a scenario or a recorded log fed by the clock, and autoplay.
+//! Fake input: a scenario or a recorded log fed by the clock.
 
-use bms_model::{Chart, Lane, NoteKind, TimeUs};
+use bms_model::TimeUs;
 use eval::{
     AxisMode, ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile,
 };
@@ -228,69 +228,4 @@ pub fn declared_axes(profile: &SourceProfile) -> Vec<AxisCap> {
             },
         })
         .collect()
-}
-
-/// How long autoplay holds a tap, unless the lane's next note comes first.
-const TAP_HOLD: TimeUs = TimeUs(50_000);
-
-/// A note time plus the hold or the input offset left the `i64` range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TimeOverflow;
-
-/// Inputs that hit every tap and long note of `chart` on time, as source 0
-/// with `profile`'s bindings and input offset: each note's control is
-/// pressed at the note and released after [`TAP_HOLD`] or at the lane's
-/// next note, whichever is first, or at a long note's end. Mines are left
-/// alone, and lanes without a binding are skipped. The events are in
-/// receive-time order.
-///
-/// # Errors
-///
-/// [`TimeOverflow`] if a receive time (note time plus the hold and the
-/// input offset) is outside the `i64` range.
-pub fn autoplay(
-    chart: &Chart,
-    profile: &SourceProfile,
-) -> Result<Vec<PhysicalInputEvent>, TimeOverflow> {
-    let add = |a: TimeUs, b: TimeUs| a.0.checked_add(b.0).map(TimeUs).ok_or(TimeOverflow);
-    let ev = |at: TimeUs, control: ControlId, value: i32| {
-        Ok(PhysicalInputEvent {
-            received: add(at, profile.input_offset)?,
-            source: SourceId(0),
-            kind: InputKind::Control { control, value },
-        })
-    };
-    let mut events = Vec::new();
-    for lane in Lane::all() {
-        let Some(control) = profile
-            .bindings
-            .iter()
-            .find(|b| b.lane == lane)
-            .map(|b| b.control)
-        else {
-            continue;
-        };
-        let notes = &chart.lanes[lane.index()];
-        for (i, note) in notes.iter().enumerate() {
-            let release = match note.kind {
-                NoteKind::Mine { .. } => continue,
-                NoteKind::Long { end, .. } => end,
-                NoteKind::Tap => {
-                    // The minimum is taken in i128, so a next note before
-                    // an unrepresentable hold end still gives a release.
-                    let held = i128::from(note.time.0) + i128::from(TAP_HOLD.0);
-                    let release = notes
-                        .get(i + 1)
-                        .map_or(held, |next| held.min(i128::from(next.time.0)));
-                    TimeUs(i64::try_from(release).map_err(|_| TimeOverflow)?)
-                }
-            };
-            events.push(ev(note.time, control, 1)?);
-            events.push(ev(release, control, 0)?);
-        }
-    }
-    // Stable: a release and the lane's next press at the same time stay in
-    // that order.
-    events.sort_by_key(|e| e.received);
-    Ok(events)
 }

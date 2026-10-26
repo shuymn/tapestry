@@ -325,6 +325,7 @@ fn a_refused_chart_reports_each_cause_once() {
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
+        autoplay: false,
     };
     let Err(e) = Loaded::load(root, settings, &chart, config, parts) else {
         panic!("the chart loaded");

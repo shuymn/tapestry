@@ -68,6 +68,7 @@ jobs:
           for args in "--dev-tools-probe x" "--dev-scripted-input x" \
               "play x.bms --dev-scripted-input x" "play x.bms --dev-frames x" \
               "play x.bms --dev-auto-retry" "play x.bms --dev-overlay" \
+              "play x.bms --auto --dev-headless" \
               "--dev-adjust-at 1" \
               "play x.bms --dev-adjust-at 1" "play x.bms --dev-adjust F1" \
               "play x.bms --dev-adjust-end F1" "keys --dev-scripted-keys 1" \

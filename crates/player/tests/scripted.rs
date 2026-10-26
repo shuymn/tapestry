@@ -676,3 +676,259 @@ fn keys_cancelled_writes_nothing() {
     assert!(!root.join("player.toml").exists());
     assert!(!root.join("records").exists());
 }
+
+/// The scripted chart with a lane 3 long note from 4.0 s to 5.0 s, which
+/// starts with the BGM sound: 8 notes.
+const AUTO_CHART: &str = "#PLAYER 1\n#TITLE autoplay\n#BPM 120\n#WAV01 click.wav\n\
+                          #00111:01010101\n#00113:00010001\n#00116:01000000\n#00201:01\n\
+                          #00253:0101\n";
+const AUTO_NOTES: usize = 8;
+
+/// A temporary folder with the autoplay chart and its sound; returns it,
+/// the chart's path and the data root's parent.
+fn auto_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let charts = dir.path().join("chart");
+    fs::create_dir_all(&charts).unwrap();
+    let chart_path = charts.join("autoplay.bms");
+    fs::write(&chart_path, AUTO_CHART).unwrap();
+    write_click(&charts.join("click.wav"));
+    let appdata = dir.path().join("appdata");
+    (dir, chart_path, appdata)
+}
+
+/// `play --auto <chart> --dev-headless` with `extra` arguments.
+fn auto_run(chart: &Path, appdata: &Path, extra: &[&std::ffi::OsStr]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("play")
+        .arg("--auto")
+        .arg(chart)
+        .arg("--dev-headless")
+        .args(extra)
+        .env("LOCALAPPDATA", appdata)
+        .output()
+        .expect("run tapestry")
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// H1: autoplay on the game's threads (a clocked input thread, the
+/// merged schedule, WARP) plays the chart to its end with every note
+/// PERFECT, re-evaluates to the live play, shows its end screen and saves
+/// nothing: no record, no measurement, only the settings and the preset
+/// a first start writes.
+#[test]
+fn auto_play_saves_nothing_and_judges_every_note_perfect() {
+    let (dir, chart, appdata) = auto_fixture();
+    let frames = dir.path().join("frames");
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &["--dev-frames".as_ref(), frames.as_os_str()],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    println!("{stdout}{stderr}");
+    assert_eq!(out.status.code(), Some(0));
+    let line = format!(
+        "play 1: Completed; perfect {AUTO_NOTES} great 0 good 0 bad 0 poor 0; {}",
+        "re-evaluation matches live: true"
+    );
+    assert!(stdout.contains(&line), "{line} in {stdout}");
+    assert!(
+        stdout.lines().any(|l| l == "autoplay: not saved"),
+        "{stdout}"
+    );
+    assert!(!stdout.lines().any(|l| l.starts_with("saved:")), "{stdout}");
+    assert!(!stdout.contains("measure:"), "{stdout}");
+    assert!(frames.join("end.png").is_file());
+    // The key sounds came from the merged schedule: a start every 0.5 s
+    // from 2.0 s (the notes, chords on one frame) to 4.0 s (the long note
+    // with the BGM), each exactly 24 000 frames after the last at 48 kHz.
+    let onsets: Vec<i64> = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("dev: audio onsets "))
+        .and_then(|l| l.split_once(": "))
+        .map(|(_, frames)| frames.split(' ').map(|f| f.parse().unwrap()).collect())
+        .unwrap_or_default();
+    let gaps: Vec<i64> = onsets.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(gaps, [24_000; 4], "{onsets:?}");
+    let root = appdata.join("tapestry");
+    assert!(!root.join("records").exists());
+    let mut kept: Vec<String> = files_under(&root)
+        .iter()
+        .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["device.toml", "presets\\custom.toml"], "{kept:?}");
+}
+
+/// H2: retried by itself after ten input offset steps on the end screen
+/// (`F8`, 10 ms), autoplay plays the chart over from its first note with
+/// its own input offset of 0: both plays judge every note PERFECT, neither
+/// is saved, and the new input offset is written to `device.toml`.
+#[test]
+fn auto_retry_ignores_the_changed_input_offset() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let f8 = ["F8"; 10].join(",");
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &[
+            "--dev-auto-retry".as_ref(),
+            "--dev-adjust-end".as_ref(),
+            f8.as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    for play in [1, 2] {
+        let line = format!(
+            "play {play}: Completed; perfect {AUTO_NOTES} great 0 good 0 bad 0 poor 0; {}",
+            "re-evaluation matches live: true"
+        );
+        assert!(stdout.contains(&line), "{line} in {stdout}");
+    }
+    assert_eq!(stdout.matches("autoplay: not saved").count(), 2, "{stdout}");
+    writes_only_between_plays(&stdout);
+    let root = game::DataRoot::new(appdata.join("tapestry"));
+    let s = game::Settings::load(&root).unwrap();
+    assert_eq!(s.device.input_offset_us, 10_000);
+    assert_eq!(s.device.keyboard, DeviceSettings::default().keyboard);
+    assert!(!root.records().exists());
+}
+
+/// Autoplay plays with its own keys whatever `device.toml` binds: with no
+/// keyboard lane bound, every note is still PERFECT, and the settings
+/// written when the run ends (an input offset step on the end screen)
+/// keep `device.toml`'s own bindings.
+#[test]
+fn auto_play_uses_its_own_keys_and_keeps_device_toml() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let device = DeviceSettings {
+        keyboard: game::KeyConfig {
+            lanes: Vec::new(),
+            ..DeviceSettings::default().keyboard
+        },
+        ..DeviceSettings::default()
+    };
+    let path = appdata.join("tapestry").join("device.toml");
+    game::save_settings(&path, &device).unwrap();
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &["--dev-adjust-end".as_ref(), "F8".as_ref()],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let line = format!("play 1: Completed; perfect {AUTO_NOTES} great 0 good 0 bad 0 poor 0;");
+    assert!(stdout.contains(&line), "{line} in {stdout}");
+    assert!(stdout.contains("settings: wrote"), "{stdout}");
+    let written: DeviceSettings = game::load_settings(&path).unwrap();
+    assert_eq!(written.input_offset_us, 1_000);
+    assert_eq!(written.keyboard, device.keyboard);
+}
+
+/// H3: autoplay and an input log are two ways to receive input, refused
+/// together before anything loads; `--dev-headless` is for autoplay
+/// alone.
+#[test]
+fn auto_with_scripted_input_is_refused() {
+    let fx = fixture();
+    let run = |args: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_tapestry"))
+            .args(args)
+            .env("LOCALAPPDATA", &fx.appdata)
+            .output()
+            .expect("run tapestry")
+    };
+    let chart = fx.chart_path.as_os_str();
+    let log = fx.log.as_os_str();
+    let both = "--auto and --dev-scripted-input cannot be used together";
+    let headless = "--dev-headless needs --auto";
+    for (args, refusal) in [
+        (
+            vec![
+                "play".as_ref(),
+                "--auto".as_ref(),
+                chart,
+                "--dev-scripted-input".as_ref(),
+                log,
+            ],
+            both,
+        ),
+        (
+            vec![
+                "play".as_ref(),
+                chart,
+                "--dev-scripted-input".as_ref(),
+                log,
+                "--auto".as_ref(),
+            ],
+            both,
+        ),
+        (
+            vec!["play".as_ref(), chart, "--dev-headless".as_ref()],
+            headless,
+        ),
+        (
+            vec![
+                "play".as_ref(),
+                chart,
+                "--dev-scripted-input".as_ref(),
+                log,
+                "--dev-headless".as_ref(),
+            ],
+            headless,
+        ),
+    ] {
+        let out = run(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.lines().any(|l| l == refusal), "{args:?}: {stderr}");
+        assert!(!fx.appdata.join("tapestry").exists(), "{args:?}");
+    }
+}
+
+/// W1: autoplay on the real window, audio output and renderer, retried
+/// once by itself: both plays judge every note PERFECT and nothing is
+/// saved.
+#[test]
+#[ignore = "opens a fullscreen window and the audio device: needs an interactive desktop"]
+fn auto_play_on_the_window() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("play")
+        .arg("--auto")
+        .arg(&chart)
+        .arg("--dev-auto-retry")
+        .env("LOCALAPPDATA", &appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(
+        stdout
+            .matches(&format!("perfect {AUTO_NOTES} great 0 good 0 bad 0 poor 0"))
+            .count(),
+        2,
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("autoplay: not saved").count(), 2, "{stdout}");
+    assert!(!appdata.join("tapestry").join("records").exists());
+}
