@@ -21,7 +21,7 @@ allow = [
     "MIT",        # most crates (MIT OR Apache-2.0), cargo_metadata
     "Apache-2.0", # most crates (MIT OR Apache-2.0)
     "Unicode-3.0", # unicode-ident, unicode-normalization
-    "BSD-3-Clause", # encoding_rs (together with MIT OR Apache-2.0)
+    "BSD-3-Clause", # encoding_rs (together with MIT OR Apache-2.0), zstd (replay)
     "MPL-2.0",    # triple_buffer, symphonia (audio decoding); used unmodified
     "Zlib",       # foldhash, under hashbrown in the wgpu graph (render)
     "ISC",        # libloading, which wgpu-hal uses to load the DX12 runtime (render)
