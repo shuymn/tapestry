@@ -1,13 +1,14 @@
 //! After warmup, a frame's app work allocates nothing (design.md "Scope of
 //! No Allocation"): [`render::build_frame`], the skin's build into the
 //! preallocated [`SpriteBatch`], with effects, and the staging of the batch
-//! into instances. `Renderer::frame` runs the same function before calling
-//! into wgpu, whose own allocations are out of scope, so the test drives it
-//! without a GPU.
+//! into instances. `Renderer::build` runs the same function before
+//! `Renderer::submit` calls into wgpu, whose own allocations are out of
+//! scope, so the test drives it without a GPU.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
-//! for the same reason.
+//! for the same reason. It runs in the dev and release profiles with the
+//! same bound, and the tracked stretch starts with a positive control.
 
 mod common;
 
@@ -161,7 +162,7 @@ fn frame_does_not_allocate_after_warmup() {
                 seq += 1;
             }
         }
-        // What `Renderer::frame` does before calling into wgpu.
+        // What `Renderer::build` does, before `submit` calls into wgpu.
         let f = input(&v, now, TimeUs(8 * MS), &effects);
         render::build_frame(&mut skin, &f, &mut batch, &mut staging);
         if frame >= WARMUP {
