@@ -84,6 +84,9 @@ pub enum DecodeError {
     TooManySources(u64),
     /// More events than [`DecodeLimits::max_events`](crate::DecodeLimits::max_events).
     TooManyEvents(u64),
+    /// More bindings or axes than the evaluator's limits, per source or in
+    /// all.
+    TooManyBindings,
     /// A list declares more elements than the bytes left could hold.
     CountBeyondData(u64),
     /// An event or held control names a source the record does not have.
@@ -128,6 +131,7 @@ impl fmt::Display for DecodeError {
             Self::NoSources => f.write_str("the record has no source"),
             Self::TooManySources(n) => write!(f, "{n} sources exceed the limit"),
             Self::TooManyEvents(n) => write!(f, "{n} events exceed the limit"),
+            Self::TooManyBindings => f.write_str("the record binds too many controls"),
             Self::CountBeyondData(n) => write!(f, "a list of {n} elements exceeds the data"),
             Self::UnknownSource(s) => write!(f, "unknown source {s}"),
             Self::PresetHashMismatch => f.write_str("the preset hash does not match its bytes"),

@@ -498,6 +498,7 @@ fn autoplay_presses_every_note_and_releases_before_the_next() {
                 lane: lane(l),
             })
             .to_vec(),
+        axes: Vec::new(),
     };
     let events = autoplay(&chart, &profile).unwrap();
     assert_eq!(
@@ -789,6 +790,7 @@ fn autoplay_refuses_times_outside_the_range() {
     let profile = |offset| SourceProfile {
         input_offset: TimeUs(offset),
         bindings: vec![Binding { control: A, lane }],
+        axes: Vec::new(),
     };
     // The release is at 1_050_000: the largest offset that fits.
     let fits = i64::MAX - 1_050_000;

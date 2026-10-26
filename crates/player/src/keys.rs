@@ -7,10 +7,12 @@
 
 use std::sync::Arc;
 
+use eval::ControlId;
 use game::{
-    Bound, DeviceSettings, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError, KeyScreen, ROLES,
-    Refusal, Role, capture_keys, load_settings, save_settings,
+    Bound, DeviceSettings, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError, KeyScreen, Refusal,
+    Role, capture_keys, load_settings, save_settings,
 };
+use input::hid::is_axis;
 use input::{Capture, DeviceKind, QpcClock};
 use render::{AdapterChoice, Renderer, Target};
 
@@ -18,11 +20,20 @@ use crate::controls::Controls;
 use crate::end_screen::key_name;
 
 /// A bound control's name: a keyboard key by its scan code, a controller's
-/// control by its number.
+/// button by its number and its axis by its HID usage, each after its
+/// collection number when it has one (`AXIS 2:0030`).
 fn name(b: Bound) -> String {
+    let collection = match b.control >> 24 {
+        0 => String::new(),
+        c => format!("{c}:"),
+    };
+    let control = b.control & 0x00FF_FFFF;
     match b.kind {
         DeviceKind::Keyboard => key_name(Some(b.control)),
-        DeviceKind::Controller => format!("BUTTON {}", b.control),
+        DeviceKind::Controller if is_axis(ControlId(b.control)) => {
+            format!("AXIS {collection}{:04X}", control & 0xFFFF)
+        }
+        DeviceKind::Controller => format!("BUTTON {collection}{control}"),
     }
 }
 
@@ -64,22 +75,55 @@ fn refusal(r: Refusal) -> String {
 /// The screen's lines for `flow`.
 pub fn lines(flow: &KeyConfigFlow) -> Vec<String> {
     let mut l = vec!["KEY CONFIG".to_owned(), String::new()];
-    match flow.role() {
-        Some(r @ (Role::Retry | Role::Quit)) => {
-            l.push(format!("PRESS THE KEYBOARD KEY FOR {}", role(r)));
+    // The prompt, then one line of detail: a refusal, or the scratch
+    // axis's range being learnt or learnt.
+    let detail = flow.refused().map_or_else(String::new, refusal);
+    if let Some(seen) = flow.learning() {
+        l.push("TURN THE TURNTABLE A FEW FULL TURNS EACH WAY (F12: SKIP)".to_owned());
+        l.push(seen.map_or_else(
+            || "WAITING FOR THE TURNTABLE".to_owned(),
+            |w| {
+                format!(
+                    "DECLARED {}..{}, SEEN {}..{}",
+                    w.cap.min, w.cap.max, w.lo, w.hi
+                )
+            },
+        ));
+    } else {
+        match flow.role() {
+            Some(r @ (Role::Retry | Role::Quit)) => {
+                l.push(format!("PRESS THE KEYBOARD KEY FOR {}", role(r)));
+            }
+            Some(Role::Lane(0)) if flow.other_direction() => l.push(
+                "PRESS THE KEY OR BUTTON FOR THE OTHER SCRATCH DIRECTION (F12: NONE)".to_owned(),
+            ),
+            Some(Role::Lane(0)) => l.push(
+                "PRESS THE KEY OR BUTTON FOR ONE SCRATCH DIRECTION, OR TURN THE AXIS".to_owned(),
+            ),
+            Some(r) => l.push(format!("PRESS THE KEY OR BUTTON FOR {}", role(r))),
+            None => l.push("DONE".to_owned()),
         }
-        Some(r) => l.push(format!("PRESS THE KEY OR BUTTON FOR {}", role(r))),
-        None => l.push("DONE".to_owned()),
+        l.push(match (detail.is_empty(), flow.learnt()) {
+            (true, Some(r)) => format!(
+                "SCRATCH DECLARED {}..{}, SEEN {}..{}, USING {}",
+                r.declared.0, r.declared.1, r.observed.0, r.observed.1, r.wrap
+            ),
+            _ => detail,
+        });
     }
-    l.push(flow.refused().map_or_else(String::new, refusal));
     l.push(String::new());
-    for (i, r) in ROLES.iter().enumerate() {
+    for (i, r) in flow.steps().iter().enumerate() {
         let value = match flow.bound().get(i) {
             Some((_, b)) => names(b),
             None if i == flow.bound().len() => "<".to_owned(),
             None => format!("(NOW {})", names(&flow.current(*r))),
         };
-        l.push(format!("{:<8} {value}", role(*r)));
+        let label = if i == 1 && *r == Role::Lane(0) {
+            "SCRATCH 2".to_owned()
+        } else {
+            role(*r)
+        };
+        l.push(format!("{label:<8} {value}"));
     }
     l.push(String::new());
     l.push("ESCAPE: CANCEL, NOTHING IS SAVED".to_owned());
@@ -174,9 +218,15 @@ pub fn run(
     drop(input);
     window_thread.close();
     match end {
-        KeyConfigEnd::Done(keys) => {
+        KeyConfigEnd::Done(keys, widened) => {
             device.keyboard = keys.keyboard;
             device.controller = keys.controller;
+            if let Some(wrap) = widened {
+                device.scratch.wrap = Some(wrap);
+                println!(
+                    "keys: the scratch axis reported beyond its declared range; its revolution is set to {wrap} values"
+                );
+            }
             save_settings(&path, &device).map_err(|e| format!("{}: {e}", path.display()))?;
             println!("keys: saved to {}", path.display());
         }
@@ -191,7 +241,7 @@ mod tests {
     use game::{Bound, DeviceSettings, KeyConfig, KeyConfigFlow, KeyConfigs};
     use input::DeviceKind;
 
-    use super::lines;
+    use super::{lines, name};
 
     #[test]
     fn the_screen_shows_prompt_refusal_and_bindings() {
@@ -210,13 +260,22 @@ mod tests {
         flow.press(pad);
         flow.press(pad);
         let l = lines(&flow);
-        assert_eq!(l[2], "PRESS THE KEY OR BUTTON FOR KEY 1");
+        assert_eq!(
+            l[2],
+            "PRESS THE KEY OR BUTTON FOR THE OTHER SCRATCH DIRECTION (F12: NONE)"
+        );
         assert_eq!(l[3], "ALREADY BOUND TO SCRATCH: PRESS ANOTHER");
         assert_eq!(l[5], "SCRATCH  BUTTON 12");
-        assert_eq!(l[6], "KEY 1    <");
-        assert_eq!(l[7], "KEY 2    (NOW KEY 001F)");
-        assert_eq!(l[13], "RETRY    (NOW BACKSPACE)");
-        assert_eq!(l[14], "QUIT     (NOW ESCAPE)");
+        assert_eq!(l[6], "SCRATCH 2 <");
+        assert_eq!(l[7], "KEY 1    (NOW KEY 002C)");
+        assert_eq!(l[14], "RETRY    (NOW BACKSPACE)");
+        assert_eq!(l[15], "QUIT     (NOW ESCAPE)");
+        // F12 skips the other direction.
+        flow.press(Bound {
+            kind: DeviceKind::Keyboard,
+            control: game::KEEP_KEY,
+        });
+        assert_eq!(lines(&flow)[6], "SCRATCH 2 UNBOUND");
         for k in [0x2c, 0x1f, 0x2d, 0x20, 0x2e, 0x21, 0x2f] {
             flow.press(Bound {
                 kind: DeviceKind::Keyboard,
@@ -227,5 +286,33 @@ mod tests {
         let l = lines(&flow);
         assert_eq!(l[2], "PRESS THE KEYBOARD KEY FOR RETRY");
         assert_eq!(l[3], "RETRY TAKES KEYBOARD KEYS ONLY: PRESS A KEY");
+    }
+
+    #[test]
+    fn the_scratch_prompt_takes_an_axis_named_by_usage() {
+        let flow = KeyConfigFlow::new(KeyConfigs {
+            keyboard: DeviceSettings::default().keyboard,
+            controller: KeyConfig {
+                lanes: Vec::new(),
+                retry: None,
+                quit: None,
+            },
+        });
+        assert_eq!(
+            lines(&flow)[2],
+            "PRESS THE KEY OR BUTTON FOR ONE SCRATCH DIRECTION, OR TURN THE AXIS"
+        );
+        let axis = Bound {
+            kind: DeviceKind::Controller,
+            control: 0x1_0030,
+        };
+        assert_eq!(name(axis), "AXIS 0030");
+        let second = |control| Bound {
+            kind: DeviceKind::Controller,
+            control,
+        };
+        assert_eq!(name(second(0x0201_0030)), "AXIS 2:0030");
+        assert_eq!(name(second(0x0200_0005)), "BUTTON 2:5");
+        assert_eq!(name(second(5)), "BUTTON 5");
     }
 }

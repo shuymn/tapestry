@@ -254,6 +254,10 @@ impl Hook {
             start,
             readers: sources.take_readers(),
             kinds: sources.participants().map(|(_, k)| k).collect(),
+            axes: sources
+                .participants()
+                .map(|(d, _)| sources.axes(d).to_vec())
+                .collect(),
         }
     }
 
@@ -262,7 +266,16 @@ impl Hook {
             arrivals: sources.arrivals().to_vec(),
             overflowed: sources.overflowed(),
             source_limited: sources.source_limited(),
+            axis_out_of_range: sources.axis_out_of_range().collect(),
         };
+        // Shown once per play: the record keeps the counts.
+        for (i, &n) in closed.axis_out_of_range.iter().enumerate() {
+            if n > 0 {
+                eprintln!(
+                    "input: source {i} reported {n} axis values outside the range its controller declares; set its scratch range in device.toml"
+                );
+            }
+        }
         sources.close_recording();
         self.origin = None;
         closed

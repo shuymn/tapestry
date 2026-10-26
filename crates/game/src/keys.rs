@@ -12,8 +12,17 @@
 //! ([`KEEP_KEY`]) keeps the role's current bindings, which is how Escape
 //! stays the quit key (the default). Escape can also be bound by editing
 //! `device.toml` (scan code 1).
+//!
+//! The scratch has two directions. An axis covers both, and is then
+//! turned a few revolutions so its real range is learnt
+//! ([`capture_keys`]); a button or a key covers one, and the scratch is
+//! prompted for again for the other direction, which F12 skips.
 
-use input::{Capture, DeviceKind};
+use std::time::{Duration, Instant};
+
+use eval::ControlId;
+use input::hid::{is_axis, widened_wrap};
+use input::{Capture, DeviceKind, Watched};
 
 use crate::settings::{KeyConfig, KeyError, LaneKey, Role};
 
@@ -99,29 +108,86 @@ pub enum Press {
     Cancelled,
 }
 
+/// What learning the scratch axis's range found: its declared range,
+/// what it reported, and the revolution used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LearntRange {
+    /// The declared lowest and highest values.
+    pub declared: (i32, i32),
+    /// The lowest and highest values it reported.
+    pub observed: (i32, i32),
+    /// The values in a revolution it is played with.
+    pub wrap: u32,
+    /// Whether that differs from the declared range, so it is saved.
+    pub widened: bool,
+}
+
 /// The key configs being captured, one role at a time.
 #[derive(Clone, Debug)]
 pub struct KeyConfigFlow {
     current: KeyConfigs,
+    /// The roles prompted for, in order; the scratch twice when it is
+    /// bound to a button or a key.
+    steps: Vec<Role>,
     bound: Vec<(Role, Vec<Bound>)>,
     refused: Option<Refusal>,
+    /// While the scratch axis is turned to learn its range: what it has
+    /// shown so far.
+    learning: Option<Option<Watched>>,
+    learnt: Option<LearntRange>,
 }
 
 impl KeyConfigFlow {
     /// A flow that starts at the scratch; `current` is what keep keeps.
     #[must_use]
-    pub const fn new(current: KeyConfigs) -> Self {
+    pub fn new(current: KeyConfigs) -> Self {
         Self {
             current,
+            steps: ROLES.to_vec(),
             bound: Vec::new(),
             refused: None,
+            learning: None,
+            learnt: None,
         }
+    }
+
+    /// The roles prompted for, in order: [`ROLES`], with the scratch
+    /// twice once it is bound to a button or a key.
+    #[must_use]
+    pub fn steps(&self) -> &[Role] {
+        &self.steps
+    }
+
+    /// Whether the prompt is for the scratch's other direction.
+    #[must_use]
+    pub fn other_direction(&self) -> bool {
+        self.bound.len() == 1 && self.role() == Some(Role::Lane(0))
+    }
+
+    /// While the scratch axis is turned to learn its range: what it has
+    /// shown so far (`Some(None)` before it reports).
+    #[must_use]
+    pub const fn learning(&self) -> Option<Option<Watched>> {
+        self.learning
+    }
+
+    /// What learning the scratch axis's range found, once done.
+    #[must_use]
+    pub const fn learnt(&self) -> Option<LearntRange> {
+        self.learnt
+    }
+
+    /// The scratch axis's revolution to save as its override in
+    /// `device.toml`: learnt beyond its declared range.
+    #[must_use]
+    pub fn widened(&self) -> Option<u32> {
+        self.learnt.filter(|l| l.widened).map(|l| l.wrap)
     }
 
     /// The role prompted for; `None` once every role is bound.
     #[must_use]
     pub fn role(&self) -> Option<Role> {
-        ROLES.get(self.bound.len()).copied()
+        self.steps.get(self.bound.len()).copied()
     }
 
     /// The roles bound so far, in order.
@@ -197,7 +263,11 @@ impl KeyConfigFlow {
         if keyboard && pressed.control == CANCEL_KEY {
             return Press::Cancelled;
         }
-        let chosen = if keyboard && pressed.control == KEEP_KEY {
+        let keep = keyboard && pressed.control == KEEP_KEY;
+        let chosen = if keep && self.other_direction() {
+            // Skipped: the scratch keeps the one control it has.
+            Vec::new()
+        } else if keep {
             let kept = self.current(role);
             if kept.is_empty() && matches!(role, Role::Lane(_)) {
                 return self.refuse(Refusal::NothingToKeep(role));
@@ -213,6 +283,13 @@ impl KeyConfigFlow {
             return self.refuse(Refusal::Key(e));
         }
         self.refused = None;
+        // A button or a key for the scratch plays one direction: the
+        // other is prompted for next.
+        let one_direction = !keep
+            && !(pressed.kind == DeviceKind::Controller && is_axis(ControlId(pressed.control)));
+        if role == Role::Lane(0) && self.bound.len() == 1 && one_direction {
+            self.steps.insert(1, Role::Lane(0));
+        }
         if self.role().is_none() {
             return Press::Done(candidate);
         }
@@ -234,22 +311,43 @@ pub trait KeyScreen {
 /// How the key config screen ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyConfigEnd {
-    /// Every role was bound.
-    Done(KeyConfigs),
+    /// Every role was bound; with the scratch axis's revolution to save,
+    /// when it was learnt beyond its declared range
+    /// ([`KeyConfigFlow::widened`]).
+    Done(KeyConfigs, Option<u32>),
     /// Escape was pressed.
     Cancelled,
     /// The window closed.
     Closed,
 }
 
+/// How long the scratch axis is watched at most while it is turned to
+/// learn its range.
+pub const LEARN_TIME: Duration = Duration::from_secs(10);
+
 /// Runs the key config screen: each next press `capture` takes (recording
 /// is closed, so none is recorded) goes to the flow, until every role is
 /// bound, Escape is pressed, or the screen closes. Nothing is written
 /// here; the caller writes a [`KeyConfigEnd::Done`].
+///
+/// When the scratch is bound to an axis, the player turns it a few full
+/// revolutions: its reports are watched until it has crossed its boundary
+/// both ways, [`LEARN_TIME`] has passed, or F12 skips, and the revolution
+/// is decided from what it reported ([`LearntRange`]).
 pub fn capture_keys(
     capture: &Capture,
     screen: &mut impl KeyScreen,
     current: KeyConfigs,
+) -> KeyConfigEnd {
+    capture_keys_within(capture, screen, current, LEARN_TIME)
+}
+
+/// [`capture_keys`] with `limit` for the range learning.
+pub fn capture_keys_within(
+    capture: &Capture,
+    screen: &mut impl KeyScreen,
+    current: KeyConfigs,
+    limit: Duration,
 ) -> KeyConfigEnd {
     let mut flow = KeyConfigFlow::new(current);
     capture.arm();
@@ -267,9 +365,74 @@ pub fn capture_keys(
             control: control.0,
         };
         match flow.press(pressed) {
-            Press::Done(keys) => return KeyConfigEnd::Done(keys),
+            Press::Done(keys) => return KeyConfigEnd::Done(keys, flow.widened()),
             Press::Cancelled => return KeyConfigEnd::Cancelled,
+            Press::Bound(Role::Lane(0), ref chosen)
+                if flow.bound.len() == 1
+                    && chosen.len() == 1
+                    && chosen[0].kind == DeviceKind::Controller
+                    && is_axis(ControlId(chosen[0].control)) =>
+            {
+                if let Some(end) = learn_range(capture, screen, &mut flow, control, limit) {
+                    return end;
+                }
+                capture.arm();
+            }
             Press::Bound(..) | Press::Refused(_) => capture.arm(),
         }
     }
+}
+
+/// Watches the scratch axis `control` while the player turns it, then
+/// decides its revolution: the smallest standard span holding its declared
+/// range and what it reported ([`widened_wrap`]), else the declared one.
+/// Returns how the screen ended if it was cancelled or closed meanwhile.
+fn learn_range(
+    capture: &Capture,
+    screen: &mut impl KeyScreen,
+    flow: &mut KeyConfigFlow,
+    control: ControlId,
+    limit: Duration,
+) -> Option<KeyConfigEnd> {
+    capture.watch(control);
+    capture.arm();
+    let started = Instant::now();
+    let seen = loop {
+        flow.learning = Some(capture.watch_result());
+        screen.show(flow);
+        screen.wait();
+        if screen.closed() {
+            capture.unwatch();
+            return Some(KeyConfigEnd::Closed);
+        }
+        if let Some((key, DeviceKind::Keyboard)) = capture.take() {
+            match key.0 {
+                CANCEL_KEY => {
+                    capture.unwatch();
+                    return Some(KeyConfigEnd::Cancelled);
+                }
+                KEEP_KEY => break capture.watch_result(),
+                _ => {}
+            }
+        }
+        // Anything else captured meanwhile, the turning axis included, is
+        // not a binding.
+        capture.arm();
+        let seen = capture.watch_result();
+        if seen.is_some_and(|w| w.forward && w.backward) || started.elapsed() >= limit {
+            break seen;
+        }
+    };
+    capture.unwatch();
+    flow.learning = None;
+    flow.learnt = seen.map(|w| {
+        let widened = widened_wrap(&w.cap, w.lo, w.hi);
+        LearntRange {
+            declared: (w.cap.min, w.cap.max),
+            observed: (w.lo, w.hi),
+            wrap: widened.unwrap_or(w.cap.wrap),
+            widened: widened.is_some(),
+        }
+    });
+    None
 }

@@ -146,8 +146,12 @@ pub struct View {
     pub effects: usize,
 }
 
-/// How long the game thread waits for a play's figures.
-const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the game thread waits for a play's figures. The render thread
+/// answers between frames, so this bounds only a stalled render thread: a
+/// slow frame, such as a software adapter drawing and the dev-tools frame
+/// dump encoding an image, can take seconds, and the figures are still
+/// wanted after it.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Something that looks at frames as they are drawn: the measurement
 /// (D11) and the dev-tools frame dump. Called after every frame, presented
@@ -349,6 +353,14 @@ impl Run {
                 // through a preparation, which can fail.
                 Ok(RenderMsg::Text(lines)) => mode = Mode::Text(lines),
                 Ok(RenderMsg::Finish { end, reply }) => {
+                    // Judgments still queued were never drawn in this play:
+                    // N/A, not missing from the figures.
+                    if let Mode::Play { side, .. } = &mut mode {
+                        effects.clear();
+                        side.drain_effects(|e| effects.push(*e));
+                        self.measure.never_drawn(&effects);
+                        effects.clear();
+                    }
                     let _ = reply.send(self.measure.finish(end));
                 }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
@@ -810,7 +822,7 @@ mod tests {
             .build()
             .unwrap();
         let rule = rules::custom();
-        let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard]);
+        let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
         let (mut writer, reader) = input::source_queue(16);
         // Z, lane 1's default key, pressed on the note.
         let press = PhysicalInputEvent {

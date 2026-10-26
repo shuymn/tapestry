@@ -15,7 +15,10 @@ use std::time::Instant;
 
 use bms_model::{ChartBuilder, NoteKind, SoundId, TimeUs};
 use common::{MS, device, lane, press, release};
-use eval::{Evaluator, InputStart, JudgeEventKind, PushError};
+use eval::{
+    AxisBinding, ControlId, Evaluator, InputKind, InputStart, JudgeEventKind, PhysicalInputEvent,
+    PushError, ScratchSettings, SourceId,
+};
 use rules::Judgment;
 
 struct Counting;
@@ -55,16 +58,21 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+const AXIS: ControlId = ControlId(0x1_0030);
+
 #[test]
 fn advance_does_not_allocate() {
     const NOTES: i64 = 2_000;
     // Notes every 50 ms over lanes 1-7, so one lane's notes are 350 ms
     // apart. Every 4th is a 200 ms LN, every 8th released early (an LN
-    // break). Every 10th has a held mine on the scratch lane. Some taps get
-    // an empty POOR press 250 ms early. Every note has a sound.
+    // break). Every 10th has a held mine on the scratch lane, held by its
+    // button, and every 10th after the 5th one held by the scratch axis,
+    // turned for 3 ms and released by its deadline 100 ms later. Some taps
+    // get an empty POOR press 250 ms early. Every note has a sound.
     let mut builder = ChartBuilder::new(150_000).sound("k.wav");
     let mut inputs = Vec::new();
     let mut expected_empty_poor = 0;
+    let mut axis_value = 0;
     for i in 0..NOTES {
         let n = u8::try_from(i % 7).unwrap() + 1;
         let t = 1_000 * MS + i * 50 * MS;
@@ -91,6 +99,19 @@ fn advance_does_not_allocate() {
             inputs.push(press(t, 0, 0));
             inputs.push(release(t + 30 * MS, 0, 0));
         }
+        if i % 10 == 5 {
+            for k in 0..3 {
+                axis_value = (axis_value + 1) % 256;
+                inputs.push(PhysicalInputEvent {
+                    received: TimeUs(t + k * MS),
+                    source: SourceId(0),
+                    kind: InputKind::Control {
+                        control: AXIS,
+                        value: axis_value,
+                    },
+                });
+            }
+        }
     }
     inputs.sort_by_key(|e| e.received);
     let mut chart = builder.build().unwrap();
@@ -100,7 +121,15 @@ fn advance_does_not_allocate() {
         }
     }
     let preset = rules::custom();
-    let dev = device(&[0]);
+    let mut dev = device(&[0]);
+    dev.sources[0].axes.push(AxisBinding {
+        control: AXIS,
+        lane: lane(0),
+        scratch: ScratchSettings {
+            mode: eval::AxisMode::Absolute { wrap: 256 },
+            ..ScratchSettings::DEFAULT
+        },
+    });
     let end = 1_000 * MS + NOTES * 50 * MS + 1_000 * MS;
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 64).unwrap();
     let bound = ev.max_events(inputs.len());
@@ -149,7 +178,7 @@ fn advance_does_not_allocate() {
         2_000
     );
     assert_eq!(ev.tally().ln_breaks, 250);
-    assert_eq!(count(|k| matches!(k, JudgeEventKind::MineHit { .. })), 200);
+    assert_eq!(count(|k| matches!(k, JudgeEventKind::MineHit { .. })), 400);
     assert!(expected_empty_poor > 0);
     assert_eq!(
         count(|k| matches!(k, JudgeEventKind::EmptyPoor { .. })),

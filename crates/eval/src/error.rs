@@ -30,6 +30,11 @@ pub enum EvalError {
         /// The control.
         control: ControlId,
     },
+    /// The profile binds more than its limits
+    /// ([`MAX_BINDINGS_PER_SOURCE`](crate::MAX_BINDINGS_PER_SOURCE),
+    /// [`MAX_AXES_PER_SOURCE`](crate::MAX_AXES_PER_SOURCE),
+    /// [`MAX_BINDINGS`](crate::MAX_BINDINGS), [`MAX_AXES`](crate::MAX_AXES)).
+    TooManyBindings,
     /// Batch evaluation could not queue an input of the log.
     Input(PushError),
 }
@@ -47,6 +52,7 @@ impl fmt::Display for EvalError {
             Self::DuplicateBinding { source, control } => {
                 write!(f, "source {} binds control {} twice", source.0, control.0)
             }
+            Self::TooManyBindings => f.write_str("the device profile binds too many controls"),
             Self::Input(e) => write!(f, "the input log cannot be evaluated: {e:?}"),
         }
     }

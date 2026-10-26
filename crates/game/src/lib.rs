@@ -35,8 +35,8 @@ pub use audio_loop::{
     SWITCH_TIMEOUT, audio_control,
 };
 pub use keys::{
-    Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, Press, ROLES,
-    Refusal, capture_keys,
+    Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
+    LearntRange, Press, ROLES, Refusal, capture_keys, capture_keys_within,
 };
 pub use live::{Closing, LiveError, Opening, Rig};
 pub use logic::{
@@ -59,11 +59,12 @@ pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
     Command, Loaded, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart,
-    ReloadError, Session, SessionConfig, SessionError, Settings,
+    RECORDING_MEMORY, ReloadError, Reservation, SMALL_PARTS_BYTES, Session, SessionConfig,
+    SessionError, Settings, TABLE_BYTES_PER_OBJECT,
 };
 pub use settings::{
     DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, OVERLAY_KEY, PlayerSettings, Role,
-    SettingsError, load_settings, reserved_key, save_settings,
+    ScratchConfig, SettingsError, load_settings, reserved_key, save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{

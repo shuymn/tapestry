@@ -53,7 +53,7 @@ fn write_click(path: &Path) {
 /// An input log that hits every note on time from one keyboard with the
 /// default key config: what the scripted run replays.
 fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEvent> {
-    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard]);
+    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
     let events = input::autoplay(chart, &profile.sources[0]).unwrap();
     let rec = PlayRecord {
         versions: Versions {
@@ -69,6 +69,7 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
                 kind: replay::DeviceKind::Keyboard,
                 receive: ReceiveMethod::Scripted,
                 profile: profile.sources[0].clone(),
+                axis_out_of_range: 0,
             }],
             audio_offset: TimeUs(0),
             display_offset: TimeUs(0),

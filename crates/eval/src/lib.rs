@@ -36,7 +36,9 @@ pub use evaluator::{
 };
 pub use gauge::GaugeState;
 pub use input::{
-    Binding, ControlId, DeviceProfile, InputKind, InputStart, PhysicalInputEvent, SourceId,
-    SourceProfile, evaluation_time,
+    AXIS_REPORTS_PER_SEC, AxisBinding, AxisMode, BUTTON_EDGES_PER_SEC, Binding, ControlId,
+    DeviceProfile, InputKind, InputStart, MAX_AXES, MAX_AXES_PER_SOURCE, MAX_BINDINGS,
+    MAX_BINDINGS_PER_SOURCE, PhysicalInputEvent, SOURCE_BUTTON_EDGES_PER_SEC, ScratchSettings,
+    SourceId, SourceProfile, evaluation_time, window_inputs,
 };
 pub use merge::{Published, SourceState, StageError, Staged, merge, watermark};

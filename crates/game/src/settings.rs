@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 
 use ::audio::AudioEngine;
 use bms_model::{Lane, TimeUs};
-use eval::{Binding, ControlId, DeviceProfile, SourceProfile};
+use eval::{
+    AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, ScratchSettings, SourceProfile,
+};
 use input::DeviceKind;
+use input::hid::{AxisCap, is_axis};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -103,7 +106,9 @@ impl std::error::Error for SettingsError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaneKey {
-    /// The control: a keyboard scan code, or a controller's button.
+    /// The control: a keyboard scan code, or a controller's button or axis
+    /// ([`input::hid`]). A controller's axis plays its lane through the
+    /// scratch conversion of [`DeviceSettings::scratch`].
     pub control: u32,
     /// The lane: 0 is the scratch, 1-7 the keys.
     pub lane: u8,
@@ -271,11 +276,13 @@ impl KeyConfig {
     }
 
     /// The lane bindings the evaluator reads; an entry with a lane the
-    /// game does not have is left out.
+    /// game does not have is left out. A controller's axes are left out
+    /// too: they are [`axes`](Self::axes).
     #[must_use]
-    pub fn bindings(&self) -> Vec<Binding> {
+    pub fn bindings(&self, kind: DeviceKind) -> Vec<Binding> {
         self.lanes
             .iter()
+            .filter(|k| !axis_of(kind, k.control))
             .filter_map(|k| {
                 Lane::new(k.lane).map(|lane| Binding {
                     control: ControlId(k.control),
@@ -283,6 +290,100 @@ impl KeyConfig {
                 })
             })
             .collect()
+    }
+
+    /// A controller's axes bound to lanes, each converted by `scratch`
+    /// resolved for the axis as the device declares it in `caps`
+    /// ([`ScratchConfig::settings`]); none for a keyboard.
+    #[must_use]
+    pub fn axes(
+        &self,
+        kind: DeviceKind,
+        scratch: &ScratchConfig,
+        caps: &[AxisCap],
+    ) -> Vec<AxisBinding> {
+        self.lanes
+            .iter()
+            .filter(|k| axis_of(kind, k.control))
+            .filter_map(|k| {
+                let control = ControlId(k.control);
+                Lane::new(k.lane).map(|lane| AxisBinding {
+                    control,
+                    lane,
+                    scratch: scratch.settings(caps.iter().find(|c| c.control == control)),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Whether `control` of a device of `kind` is an axis.
+const fn axis_of(kind: DeviceKind, control: u32) -> bool {
+    matches!(kind, DeviceKind::Controller) && is_axis(ControlId(control))
+}
+
+/// How a controller's axis plays its lane (design.md "Analog Scratch"), in
+/// `device.toml`. Whether the axis is relative and how many values a
+/// revolution has come from the device's declaration unless set here; the
+/// thresholds and release time default to [`ScratchSettings::DEFAULT`],
+/// starting points tuned by playing. The resolved settings are what the
+/// input log records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScratchConfig {
+    /// Whether the axis reports movement rather than position; from the
+    /// device when absent.
+    pub relative: Option<bool>,
+    /// For an absolute axis, the values in one revolution (it wraps from
+    /// its highest back to its lowest), 0 if it does not wrap; from the
+    /// device's declared range when absent.
+    pub wrap: Option<u32>,
+    /// Movement in one direction that presses.
+    pub press_threshold: u32,
+    /// Movement in the pressed direction that keeps the lane pressed.
+    pub hold_threshold: u32,
+    /// How long after the axis stops the lane is released, µs.
+    pub release_after_us: u32,
+}
+
+impl Default for ScratchConfig {
+    fn default() -> Self {
+        let d = ScratchSettings::DEFAULT;
+        Self {
+            relative: None,
+            wrap: None,
+            press_threshold: d.press_threshold,
+            hold_threshold: d.hold_threshold,
+            release_after_us: d.release_after_us,
+        }
+    }
+}
+
+impl ScratchConfig {
+    /// The settings the evaluator reads for an axis the device declares
+    /// as `cap` (`None`: not declared, as for a device not connected): a
+    /// value set here, else the declaration, else the default
+    /// ([`ScratchSettings::DEFAULT`]: absolute, without wraparound).
+    #[must_use]
+    pub fn settings(&self, cap: Option<&AxisCap>) -> ScratchSettings {
+        let default_wrap = match ScratchSettings::DEFAULT.mode {
+            AxisMode::Absolute { wrap } => wrap,
+            AxisMode::Relative => 0,
+        };
+        let relative = self.relative.or(cap.map(|c| c.relative)).unwrap_or(false);
+        let declared = cap.filter(|c| !c.relative).map(|c| c.wrap);
+        ScratchSettings {
+            mode: if relative {
+                AxisMode::Relative
+            } else {
+                AxisMode::Absolute {
+                    wrap: self.wrap.or(declared).unwrap_or(default_wrap),
+                }
+            },
+            press_threshold: self.press_threshold,
+            hold_threshold: self.hold_threshold,
+            release_after_us: self.release_after_us,
+        }
     }
 }
 
@@ -292,8 +393,8 @@ impl KeyConfig {
 pub struct DeviceSettings {
     /// The key config shared by every keyboard.
     pub keyboard: KeyConfig,
-    /// The key config of controllers. Per-device controller bindings
-    /// arrive with HID support.
+    /// The key config shared by every controller: its buttons and axes by
+    /// HID usage ([`input::hid`]).
     pub controller: KeyConfig,
     /// The input latency offset, µs.
     pub input_offset_us: i64,
@@ -308,6 +409,8 @@ pub struct DeviceSettings {
     pub monitor: Option<String>,
     /// The master volume, 0.0 (silent) to 1.0 (unity).
     pub master_volume: f32,
+    /// How controllers' axes play their lanes.
+    pub scratch: ScratchConfig,
 }
 
 impl Default for DeviceSettings {
@@ -335,6 +438,7 @@ impl Default for DeviceSettings {
             audio_device: None,
             monitor: None,
             master_volume: 1.0,
+            scratch: ScratchConfig::default(),
         }
     }
 }
@@ -390,15 +494,22 @@ impl DeviceSettings {
     }
 
     /// The profile the evaluator reads for sources of the given kinds,
-    /// indexed by source id.
+    /// indexed by source id, whose axes are as declared in `axes` (by
+    /// source id; a source past its end declares none).
     #[must_use]
-    pub fn profile(&self, kinds: &[DeviceKind]) -> DeviceProfile {
+    pub fn profile(&self, kinds: &[DeviceKind], axes: &[Vec<AxisCap>]) -> DeviceProfile {
         DeviceProfile {
             sources: kinds
                 .iter()
-                .map(|&kind| SourceProfile {
+                .enumerate()
+                .map(|(i, &kind)| SourceProfile {
                     input_offset: TimeUs(self.input_offset_us),
-                    bindings: self.keys(kind).bindings(),
+                    bindings: self.keys(kind).bindings(kind),
+                    axes: self.keys(kind).axes(
+                        kind,
+                        &self.scratch,
+                        axes.get(i).map_or(&[], Vec::as_slice),
+                    ),
                 })
                 .collect(),
         }

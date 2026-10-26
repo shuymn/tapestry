@@ -268,6 +268,7 @@ impl Rig for Fake {
             start,
             readers: self.sources.take_readers(),
             kinds: self.sources.participants().map(|(_, k)| k).collect(),
+            axes: Vec::new(),
         }
     }
 
@@ -317,6 +318,7 @@ impl Rig for Fake {
             arrivals: self.sources.arrivals().to_vec(),
             overflowed: self.sources.overflowed(),
             source_limited: self.sources.source_limited(),
+            axis_out_of_range: self.sources.axis_out_of_range().collect(),
         };
         self.sources.close_recording();
         closing

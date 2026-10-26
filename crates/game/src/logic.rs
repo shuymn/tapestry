@@ -61,6 +61,14 @@ pub enum LogicError {
     /// A runner start of `i64::MIN` leaves no time before it for the
     /// bootstrap, so the opening could not separate it from the play.
     StartAtMinimum,
+    /// The play's recording window needs more inputs than the recording
+    /// policy reserves (stage1.md D14).
+    RecordingTooLarge {
+        /// The inputs the window needs.
+        needed: usize,
+        /// The most the policy allows for this chart and these sources.
+        allowed: usize,
+    },
 }
 
 impl fmt::Display for LogicError {
@@ -69,6 +77,10 @@ impl fmt::Display for LogicError {
             Self::Eval(e) => write!(f, "evaluation cannot start: {e}"),
             Self::TooManySources(n) => write!(f, "{n} sources exceed the source id range"),
             Self::StartAtMinimum => f.write_str("the play cannot start at the earliest time"),
+            Self::RecordingTooLarge { needed, allowed } => write!(
+                f,
+                "the play is too long to record with these controls: it needs room for {needed} inputs, and {allowed} fit"
+            ),
         }
     }
 }

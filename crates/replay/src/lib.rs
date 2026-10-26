@@ -22,8 +22,21 @@
 //! The layout is written field by field, not derived from struct layout.
 //! Every record struct is destructured in full when encoded, so a new field
 //! fails to compile until it is written; a layout change bumps
-//! [`FORMAT_VERSION`]. Decoders read every version they know and refuse
-//! newer ones.
+//! [`FORMAT_VERSION`]. Before the first release the format may change, and
+//! the decoder refuses every version but [`FORMAT_VERSION`]: older records
+//! are refused, not converted.
+//!
+//! Each source of the devices section is its kind, receive method, input
+//! offset, its bindings (a count, then each control and lane), and its
+//! axis bindings (a count, then each axis's control, lane, mode (0
+//! absolute, followed by its wrap; 1 relative), press threshold, hold
+//! threshold and release time in µs, all unsigned), and the number of
+//! axis values it reported outside their declared range.
+//!
+//! Bindings and axes are bounded per source and in all by the evaluator's
+//! limits ([`eval::MAX_BINDINGS_PER_SOURCE`], [`eval::MAX_AXES_PER_SOURCE`],
+//! [`eval::MAX_BINDINGS`], [`eval::MAX_AXES`]), checked as each count is
+//! read, before anything is allocated for it.
 
 #![forbid(unsafe_code)]
 
@@ -33,7 +46,8 @@ mod wire;
 
 use bms_model::{ChartIdentity, Lane, TimeUs};
 use eval::{
-    Binding, ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile,
+    AxisBinding, AxisMode, Binding, ControlId, InputKind, InputStart, PhysicalInputEvent,
+    ScratchSettings, SourceId, SourceProfile,
 };
 use rules::RulePreset;
 use sha2::{Digest, Sha256};
@@ -47,8 +61,8 @@ pub use record::{
 
 use wire::{Reader, Writer};
 
-/// The format version this crate writes, and the newest it reads.
-pub const FORMAT_VERSION: u16 = 1;
+/// The format version this crate writes, and the only one it reads.
+pub const FORMAT_VERSION: u16 = 3;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -78,15 +92,39 @@ pub struct DecodeLimits {
 
 impl DecodeLimits {
     /// The limits for records the app saves: 64 MiB either side of
-    /// compression, 64 sources, and 4 Mi events (an hour of one 1 kHz axis,
-    /// or of buttons pressed and released 30 times a second across 16
-    /// controls, stays below it).
+    /// compression, 64 sources, and 4 Mi events. The game caps a play's
+    /// recording so that its record always fits (`game`'s recording
+    /// policy, stage1.md D14).
     pub const STANDARD: Self = Self {
         max_compressed: 64 << 20,
         max_uncompressed: 64 << 20,
         max_sources: 64,
         max_events: 4 << 20,
     };
+}
+
+/// The most bytes one input event takes in the body: its source (1 byte
+/// below 128 sources, and [`DecodeLimits::STANDARD`] allows 64), its time
+/// delta (10), its kind tag (1), its control (5) and its value (5). A
+/// disconnect takes 12.
+pub const MAX_EVENT_BYTES: usize = 22;
+
+/// Body bytes kept for everything but the events in
+/// [`max_record_events`]: versions, chart, preset, devices (at most 64
+/// sources, each within the evaluator's binding limits, about 120 KiB),
+/// the snapshot (bounded by the bindings), arrivals and status.
+pub const RECORD_OVERHEAD_BYTES: usize = 1 << 20;
+
+/// The most input events a record may hold and still decode under
+/// `limits`: within its event count, and with every event at
+/// [`MAX_EVENT_BYTES`], within its uncompressed body after
+/// [`RECORD_OVERHEAD_BYTES`].
+#[must_use]
+pub fn max_record_events(limits: &DecodeLimits) -> usize {
+    let bytes = (limits.max_uncompressed as usize).saturating_sub(RECORD_OVERHEAD_BYTES);
+    usize::try_from(limits.max_events)
+        .unwrap_or(usize::MAX)
+        .min(bytes / MAX_EVENT_BYTES)
 }
 
 impl Default for DecodeLimits {
@@ -241,7 +279,9 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
                 SourceProfile {
                     input_offset,
                     bindings,
+                    axes,
                 },
+            axis_out_of_range,
         } = s;
         w.uint(kind_tag(*kind));
         w.uint(match receive {
@@ -254,9 +294,40 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
             w.uint(u64::from(control.0));
             w.len(lane.index());
         }
+        write_axes(w, axes);
+        w.uint(*axis_out_of_range);
     }
     w.int(audio_offset.0);
     w.int(display_offset.0);
+}
+
+fn write_axes(w: &mut Writer, axes: &[AxisBinding]) {
+    w.len(axes.len());
+    for AxisBinding {
+        control,
+        lane,
+        scratch:
+            ScratchSettings {
+                mode,
+                press_threshold,
+                hold_threshold,
+                release_after_us,
+            },
+    } in axes
+    {
+        w.uint(u64::from(control.0));
+        w.len(lane.index());
+        match mode {
+            AxisMode::Absolute { wrap } => {
+                w.uint(0);
+                w.uint(u64::from(*wrap));
+            }
+            AxisMode::Relative => w.uint(1),
+        }
+        w.uint(u64::from(*press_threshold));
+        w.uint(u64::from(*hold_threshold));
+        w.uint(u64::from(*release_after_us));
+    }
 }
 
 fn write_start(w: &mut Writer, s: &InputStart) {
@@ -331,8 +402,8 @@ fn write_status(w: &mut Writer, s: &Status) {
     w.uint(bit(*overflow, OVERFLOW) | bit(*source_limit, SOURCE_LIMIT) | bit(*suspend, SUSPEND));
 }
 
-/// Decodes a file written by [`encode`] of this or an earlier format
-/// version.
+/// Decodes a file written by [`encode`] in [`FORMAT_VERSION`]; every other
+/// version is refused, older ones included.
 ///
 /// # Errors
 ///
@@ -351,7 +422,7 @@ pub fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
         return Err(DecodeError::BadMagic);
     }
     let version = u16::from_le_bytes(r.array()?);
-    if version == 0 || version > FORMAT_VERSION {
+    if version != FORMAT_VERSION {
         return Err(DecodeError::UnsupportedVersion(version));
     }
     let [encoding] = r.array()?;
@@ -509,6 +580,13 @@ fn read_kind(r: &mut Reader<'_>) -> Result<DeviceKind, DecodeError> {
     }
 }
 
+fn read_lane(r: &mut Reader<'_>) -> Result<Lane, DecodeError> {
+    u8::try_from(r.uint()?)
+        .ok()
+        .and_then(Lane::new)
+        .ok_or(DecodeError::InvalidValue("lane"))
+}
+
 fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecord, DecodeError> {
     let n = r.uint()?;
     if n == 0 {
@@ -519,6 +597,7 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
     }
     // Kind, receive method, offset and binding count.
     let mut sources = Vec::with_capacity(r.check_count(n, 4)?);
+    let (mut all_bindings, mut all_axes) = (0, 0);
     for _ in 0..n {
         let kind = read_kind(r)?;
         let receive = match r.uint()? {
@@ -528,22 +607,27 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
         };
         let input_offset = TimeUs(r.int()?);
         let nb = r.count(2)?;
+        all_bindings += nb;
+        if nb > eval::MAX_BINDINGS_PER_SOURCE || all_bindings > eval::MAX_BINDINGS {
+            return Err(DecodeError::TooManyBindings);
+        }
         let mut bindings = Vec::with_capacity(nb);
         for _ in 0..nb {
             let control = ControlId(r.u32()?);
-            let lane = u8::try_from(r.uint()?)
-                .ok()
-                .and_then(Lane::new)
-                .ok_or(DecodeError::InvalidValue("lane"))?;
+            let lane = read_lane(r)?;
             bindings.push(Binding { control, lane });
         }
+        let axes = read_axes(r, &mut all_axes)?;
+        let axis_out_of_range = r.uint()?;
         sources.push(SourceRecord {
             kind,
             receive,
             profile: SourceProfile {
                 input_offset,
                 bindings,
+                axes,
             },
+            axis_out_of_range,
         });
     }
     let audio_offset = TimeUs(r.int()?);
@@ -553,6 +637,38 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
         audio_offset,
         display_offset,
     })
+}
+
+/// One source's axes; `all` counts the axes of every source so far.
+fn read_axes(r: &mut Reader<'_>, all: &mut usize) -> Result<Vec<AxisBinding>, DecodeError> {
+    // Control, lane, mode, two thresholds and the release time.
+    let n = r.count(6)?;
+    *all += n;
+    if n > eval::MAX_AXES_PER_SOURCE || *all > eval::MAX_AXES {
+        return Err(DecodeError::TooManyBindings);
+    }
+    let mut axes = Vec::with_capacity(n);
+    for _ in 0..n {
+        let control = ControlId(r.u32()?);
+        let lane = read_lane(r)?;
+        let mode = match r.uint()? {
+            0 => AxisMode::Absolute { wrap: r.u32()? },
+            1 => AxisMode::Relative,
+            _ => return Err(DecodeError::InvalidValue("axis mode")),
+        };
+        let scratch = ScratchSettings {
+            mode,
+            press_threshold: r.u32()?,
+            hold_threshold: r.u32()?,
+            release_after_us: r.u32()?,
+        };
+        axes.push(AxisBinding {
+            control,
+            lane,
+            scratch,
+        });
+    }
+    Ok(axes)
 }
 
 fn read_source(r: &mut Reader<'_>, n_sources: usize) -> Result<SourceId, DecodeError> {

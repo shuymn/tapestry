@@ -91,12 +91,18 @@ impl FocusGate {
         !self.tripped
     }
 
-    /// Decides one packet. A background packet trips the gate, which
-    /// catches focus changing between [`check`](Self::check) and the batch.
+    /// Input received in the background: trips the gate, which catches
+    /// focus changing between [`check`](Self::check) and the batch.
+    pub fn background(&mut self) {
+        self.latch();
+        self.tripped = true;
+    }
+
+    /// Decides one packet. A background packet trips the gate
+    /// ([`background`](Self::background)).
     pub fn admit(&mut self, packet: &Packet) -> Admit {
         if packet.background {
-            self.latch();
-            self.tripped = true;
+            self.background();
         }
         if self.tripped {
             Admit::Reject

@@ -1,6 +1,7 @@
 use bms_model::{ChartIdentity, Lane, TimeUs};
 use eval::{
-    Binding, ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile,
+    AxisBinding, AxisMode, Binding, ControlId, InputKind, InputStart, PhysicalInputEvent,
+    ScratchSettings, SourceId, SourceProfile,
 };
 use sha2::{Digest, Sha256};
 
@@ -40,8 +41,31 @@ fn source(kind: DeviceKind, offset: i64, bindings: &[(u32, u8)]) -> SourceRecord
                     lane: lane(l),
                 })
                 .collect(),
+            axes: Vec::new(),
         },
+        axis_out_of_range: 0,
     }
+}
+
+/// `s` with an axis per `(control, lane, mode)`; the other settings are
+/// distinct per axis and from every other field.
+fn with_axes(mut s: SourceRecord, axes: &[(u32, u8, AxisMode)]) -> SourceRecord {
+    s.axis_out_of_range = 3;
+    s.profile.axes = axes
+        .iter()
+        .zip(0..)
+        .map(|(&(c, l, mode), i)| AxisBinding {
+            control: ControlId(c),
+            lane: lane(l),
+            scratch: ScratchSettings {
+                mode,
+                press_threshold: 6 + i,
+                hold_threshold: 9 + i,
+                release_after_us: 120_000 + i,
+            },
+        })
+        .collect();
+    s
 }
 
 fn preset_record(bytes: &[u8]) -> PresetRecord {
@@ -104,10 +128,13 @@ fn sample(n_events: usize) -> PlayRecord {
             sources: vec![
                 source(DeviceKind::Keyboard, 3_000, &[(0x1e, 0), (0x1f, 1)]),
                 source(DeviceKind::Keyboard, -1_500, &[(0x20, 2), (0x21, 3)]),
-                SourceRecord {
-                    receive: ReceiveMethod::Scripted,
-                    ..source(DeviceKind::Controller, 0, &[(1, 4), (2, 5), (3, 6), (4, 7)])
-                },
+                with_axes(
+                    SourceRecord {
+                        receive: ReceiveMethod::Scripted,
+                        ..source(DeviceKind::Controller, 0, &[(1, 4), (2, 5), (3, 6), (4, 7)])
+                    },
+                    &[(0x1_0030, 0, AxisMode::Absolute { wrap: 1024 })],
+                ),
             ],
             audio_offset: TimeUs(-12_000),
             display_offset: TimeUs(8_000),
@@ -145,6 +172,35 @@ fn wrap(body: &[u8], level: i32) -> Vec<u8> {
 
 fn limits() -> DecodeLimits {
     DecodeLimits::default()
+}
+
+#[test]
+fn an_event_takes_at_most_max_event_bytes() {
+    // Source 63, a delta from 0 to i64::MIN (zigzag u64::MAX: 10
+    // bytes), the control tag, control u32::MAX (5) and value i32::MIN
+    // (zigzag 0xFFFF_FFFF: 5).
+    let worst = |kind| PhysicalInputEvent {
+        received: TimeUs(i64::MIN),
+        source: SourceId(63),
+        kind,
+    };
+    let control = InputKind::Control {
+        control: ControlId(u32::MAX),
+        value: i32::MIN,
+    };
+    let len = |kind| {
+        let mut w = Writer::default();
+        write_events(&mut w, TimeUs(0), &[worst(kind)]);
+        // Less the event count.
+        w.0.len() - 1
+    };
+    assert_eq!(len(control), crate::MAX_EVENT_BYTES);
+    assert_eq!(len(InputKind::Disconnected), 12);
+    // The standard limits leave room for 3 Mi worst-case events.
+    assert_eq!(
+        crate::max_record_events(&DecodeLimits::STANDARD),
+        ((64 << 20) - (1 << 20)) / 22
+    );
 }
 
 #[test]
@@ -236,7 +292,8 @@ fn events_of_unknown_sources_are_refused() {
 fn newer_version_is_refused() {
     let file = encode(&sample(10));
     assert!(decode(&file, &limits()).is_ok());
-    for v in [FORMAT_VERSION + 1, u16::MAX, 0] {
+    // Before the first release, older versions are refused too.
+    for v in [FORMAT_VERSION + 1, u16::MAX, 0, FORMAT_VERSION - 1] {
         let mut newer = file.clone();
         newer[4..6].copy_from_slice(&v.to_le_bytes());
         assert_eq!(
@@ -244,6 +301,18 @@ fn newer_version_is_refused() {
             Err(DecodeError::UnsupportedVersion(v))
         );
     }
+}
+
+#[test]
+fn a_record_from_before_the_out_of_range_counts_is_refused() {
+    // Format 2 had no out-of-range count per source. Its files are refused
+    // by their version, before the body is read, with no conversion.
+    let mut old = wrap(&body_bytes(&golden()), 3);
+    old[4..6].copy_from_slice(&2_u16.to_le_bytes());
+    assert_eq!(
+        decode(&old, &limits()),
+        Err(DecodeError::UnsupportedVersion(2))
+    );
 }
 
 #[test]
@@ -336,8 +405,8 @@ fn section_length_beyond_remaining_bytes_is_an_error() {
     );
 }
 
-/// A small fixed record whose body is pinned by hash.
-fn golden() -> PlayRecord {
+/// The fixed record of [`golden`], before its axes.
+fn golden_base() -> PlayRecord {
     PlayRecord {
         versions: Versions {
             evaluator: 3,
@@ -404,23 +473,137 @@ fn golden() -> PlayRecord {
     }
 }
 
-/// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
-/// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "5d1e1f8a0d86a6a7b2fb64b90adc1e65d5a1e263f999c2c6e5865e04b3e989ed";
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A small fixed record whose body is pinned by hash: two sources, the
+/// controller with two axes, one absolute and one relative, and a report
+/// of each.
+fn golden() -> PlayRecord {
+    let mut rec = golden_base();
+    let axis = |control, l, mode, press, hold, release| AxisBinding {
+        control: ControlId(control),
+        lane: lane(l),
+        scratch: ScratchSettings {
+            mode,
+            press_threshold: press,
+            hold_threshold: hold,
+            release_after_us: release,
+        },
+    };
+    rec.devices.sources[1].profile.axes = vec![
+        axis(0x1_0030, 0, AxisMode::Absolute { wrap: 256 }, 2, 1, 100_000),
+        axis(0x1_0035, 6, AxisMode::Relative, 3, 2, 150_000),
+    ];
+    rec.events.insert(4, control(1, 1_200_000, 0x1_0030, 131));
+    rec.events.insert(5, control(1, 1_250_000, 0x1_0035, -4));
+    // The absolute axis reported 4 values outside its declared range.
+    rec.devices.sources[1].axis_out_of_range = 4;
+    rec
+}
+
+/// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
+/// written from the layout in the crate documentation.
+const GOLDEN_BODY_SHA256: &str = "568d442b72493dd2c9cdc08175933af28523498ff83e6dbc66446434de284677";
+
 #[test]
-fn v1_golden_body() {
+fn golden_body() {
     let rec = golden();
+    let file = encode(&rec);
+    assert_eq!(file[4..6], FORMAT_VERSION.to_le_bytes());
     let body = body_bytes(&rec);
     assert_eq!(hex(&Sha256::digest(&body)), GOLDEN_BODY_SHA256);
     // Another zstd encoding of the same body decodes to the same record.
     for level in [1, 3, 19] {
         assert_eq!(decode(&wrap(&body, level), &limits()), Ok(rec.clone()));
     }
+}
+
+#[test]
+fn malformed_axes_are_refused() {
+    // The devices section of a single controller with one axis, each
+    // field forgeable: (axis count, lane, mode).
+    let devices = |count: u64, l: u64, mode: u64| {
+        let mut w = Writer::default();
+        // One source: controller, raw input, offset 0, no bindings.
+        w.raw(&[1, 1, 0, 0, 0]);
+        w.uint(count);
+        w.uint(0x1_0030);
+        w.uint(l);
+        w.uint(mode);
+        if mode == 0 {
+            w.uint(256);
+        }
+        w.raw(&[2, 1, 7]);
+        // No value outside the range.
+        w.uint(0);
+        // Audio and display offsets.
+        w.raw(&[0, 0]);
+        w.0
+    };
+    let mut sections = split_sections(&body_bytes(&golden()));
+    let decode_with = |sections: &mut Vec<Vec<u8>>, payload: Vec<u8>| {
+        sections[4] = payload;
+        decode(&wrap(&join_sections(sections), 3), &limits())
+    };
+    // Well formed, the section reads, and the error comes from the events
+    // of source 1, which this single source does not have.
+    assert_eq!(
+        decode_with(&mut sections, devices(1, 0, 1)),
+        Err(DecodeError::UnknownSource(1))
+    );
+    assert_eq!(
+        decode_with(&mut sections, devices(1, 0, 2)),
+        Err(DecodeError::InvalidValue("axis mode"))
+    );
+    assert_eq!(
+        decode_with(&mut sections, devices(1, 8, 1)),
+        Err(DecodeError::InvalidValue("lane"))
+    );
+    assert_eq!(
+        decode_with(&mut sections, devices(2, 0, 1)),
+        Err(DecodeError::CountBeyondData(2))
+    );
+}
+
+#[test]
+fn records_binding_more_than_the_limits_are_refused() {
+    // Well-formed records whose bytes hold every binding they declare.
+    let axis = |i: u32| AxisBinding {
+        control: ControlId(0x1_0000 + i),
+        lane: lane(0),
+        scratch: ScratchSettings::DEFAULT,
+    };
+    let key = |i: u32| Binding {
+        control: ControlId(i),
+        lane: lane(1),
+    };
+    let record = |sources: usize, keys: u32, axes: u32| {
+        let mut rec = golden();
+        rec.events.clear();
+        rec.start.held.clear();
+        let mut s = rec.devices.sources[1].clone();
+        s.profile.bindings = (0..keys).map(key).collect();
+        s.profile.axes = (0..axes).map(axis).collect();
+        rec.devices.sources = vec![s; sources];
+        rec
+    };
+    let decoded = |rec: &PlayRecord| decode(&encode(rec), &limits()).map(|_| ());
+    let refused = Err(DecodeError::TooManyBindings);
+    // Per source: 8 axes and 256 keys fit, one more of either does not.
+    assert_eq!(decoded(&record(1, 256, 8)), Ok(()));
+    assert_eq!(decoded(&record(1, 256, 9)), refused);
+    assert_eq!(decoded(&record(1, 257, 8)), refused);
+    // In all: 16 axes and 1024 keys fit, more do not.
+    assert_eq!(decoded(&record(2, 0, 8)), Ok(()));
+    assert_eq!(decoded(&record(3, 0, 6)), refused);
+    assert_eq!(decoded(&record(4, 256, 1)), Ok(()));
+    assert_eq!(decoded(&record(5, 205, 1)), refused);
+    // A hundred thousand axes in about a megabyte is refused at its count.
+    let huge = record(1, 0, 100_000);
+    assert!(body_bytes(&huge).len() < 2 << 20);
+    assert_eq!(decoded(&huge), refused);
 }
 
 #[test]
