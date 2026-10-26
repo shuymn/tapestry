@@ -12,6 +12,7 @@ rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
 lefthook = "2"
 cargo-deny = "0"
 "aqua:rustsec/rustsec/cargo-audit" = "0"
+"github:bnjbvr/cargo-machete" = "0"
 actionlint = "1"
 shellcheck = "0"
 "github:babarot/gh-infra" = "0"

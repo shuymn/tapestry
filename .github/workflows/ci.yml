@@ -121,6 +121,16 @@ jobs:
         run: mise exec -- cargo xtask portable test --locked
       - name: cargo-deny
         run: mise exec -- cargo deny check
+      # `--with-metadata` also covers dev-, build- and target-specific
+      # dependencies. cargo-machete exits 0 when it cannot read a manifest or
+      # run cargo metadata, so its error lines fail the step; it runs cargo
+      # metadata without `--locked`, so Cargo.lock must stay unchanged.
+      - name: cargo-machete
+        run: |
+          set -o pipefail
+          mise exec -- cargo machete --with-metadata 2>&1 | tee "$RUNNER_TEMP/machete.log"
+          if grep '^error when handling' "$RUNNER_TEMP/machete.log"; then exit 1; fi
+          git diff --exit-code Cargo.lock
       - name: cargo-audit
         run: mise exec -- cargo audit --deny warnings
 
