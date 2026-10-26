@@ -1196,6 +1196,111 @@ pub struct WakeReport {
     pub mmcss: bool,
 }
 
+/// The loop both input threads run until `stop` is set: under MMCSS
+/// "Games", it wakes at 1 kHz on `timer`, reads the clock and calls `wake`
+/// with that read. Wakes keep their phase, and a missed one is skipped
+/// rather than made up in a burst.
+fn wake_loop(
+    clock: QpcClock,
+    timer: &Timer,
+    stop: &AtomicBool,
+    mut wake: impl FnMut(TimeUs),
+) -> WakeReport {
+    let mmcss = Mmcss::games();
+    let mut report = WakeReport {
+        intervals: WakeHistogram::new(),
+        mmcss: mmcss.is_some(),
+    };
+    let mut last = clock.now();
+    let mut next = last;
+    while !stop.load(Ordering::Acquire) {
+        next = TimeUs(next.0 + WAKE_PERIOD.0);
+        timer.wait_until(&clock, next);
+        let now = clock.now();
+        let missed = (now.0 - next.0).div_euclid(WAKE_PERIOD.0).max(0);
+        next = TimeUs(next.0 + missed * WAKE_PERIOD.0);
+        report.intervals.record(now.0.abs_diff(last.0));
+        last = now;
+        wake(now);
+    }
+    drop(mmcss);
+    report
+}
+
+/// A running input thread: the signal that stops it and its handle.
+/// Dropping it stops and joins the thread.
+#[derive(Debug)]
+struct Worker {
+    stop: Arc<AtomicBool>,
+    /// `None` once joined.
+    handle: Option<JoinHandle<WakeReport>>,
+}
+
+impl Worker {
+    /// Signals the thread to stop and joins it. From the thread itself
+    /// (its hook, or a destructor while it unwinds) joining would never
+    /// return, so the thread is detached and ends after its wake.
+    fn shutdown(&mut self) -> Result<WakeReport, InputError> {
+        self.stop.store(true, Ordering::Release);
+        // Only a second call finds the handle gone.
+        let handle = self.handle.take().ok_or(InputError::Panicked)?;
+        if handle.thread().id() == std::thread::current().id() {
+            return Err(InputError::StopFromWorker);
+        }
+        handle.join().map_err(|_| InputError::Panicked)
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+/// What a worker's setup gives its loop: the timer, a value for the
+/// caller, and the wake.
+type Setup<W> = Result<(Timer, usize, W), InputError>;
+
+/// Spawns a thread named `name` that runs `setup`, reports its outcome,
+/// and on success runs [`wake_loop`] with the timer and the wake `setup`
+/// returned. Returns, with the value `setup` gave, once it has reported.
+fn spawn_worker<S, W>(name: &str, clock: QpcClock, setup: S) -> Result<(Worker, usize), InputError>
+where
+    S: FnOnce() -> Setup<W> + Send + 'static,
+    W: FnMut(TimeUs),
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let handle = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || match setup() {
+            Ok((timer, value, wake)) => {
+                let _ = ready_tx.send(Ok(value));
+                wake_loop(clock, &timer, &thread_stop, wake)
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                WakeReport::default()
+            }
+        })
+        .map_err(InputError::Spawn)?;
+    match ready_rx.recv() {
+        Ok(Ok(value)) => Ok((
+            Worker {
+                stop,
+                handle: Some(handle),
+            },
+            value,
+        )),
+        Ok(Err(e)) => {
+            let _ = handle.join();
+            Err(e)
+        }
+        Err(_) => Err(InputError::Panicked),
+    }
+}
+
 /// The input thread: wakes at 1 kHz on a high-resolution timer under MMCSS
 /// "Games", reads QPC, receives everything Raw Input queued as one batch
 /// stamped with that read, publishes, and calls the caller's hook at the
@@ -1203,9 +1308,7 @@ pub struct WakeReport {
 /// dropping it stops and joins the thread, as [`stop`](Self::stop) does.
 #[derive(Debug)]
 pub struct InputThread {
-    stop: Arc<AtomicBool>,
-    /// `None` once joined.
-    handle: Option<JoinHandle<WakeReport>>,
+    worker: Worker,
     /// The receiver window, as a raw value.
     receiver: usize,
 }
@@ -1232,64 +1335,19 @@ impl InputThread {
     where
         F: FnMut(&mut SourceSet, TimeUs) + Send + 'static,
     {
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let handle = std::thread::Builder::new()
-            .name("input".into())
-            .spawn(move || {
-                let setup = RawInput::new(clock, capture).and_then(|mut raw| {
-                    raw.connect_present(&mut sources)?;
-                    Ok((raw, Timer::new()?))
-                });
-                let (mut raw, timer) = match setup {
-                    Ok(ready) => {
-                        let _ = ready_tx.send(Ok(ready.0.hwnd.0 as usize));
-                        ready
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return WakeReport::default();
-                    }
-                };
-                let mmcss = Mmcss::games();
-                let mut report = WakeReport {
-                    intervals: WakeHistogram::new(),
-                    mmcss: mmcss.is_some(),
-                };
-                let mut last = clock.now();
-                let mut next = last;
-                while !thread_stop.load(Ordering::Acquire) {
-                    next = TimeUs(next.0 + WAKE_PERIOD.0);
-                    timer.wait_until(&clock, next);
-                    let now = clock.now();
-                    // Wakes keep their phase, and a missed one is skipped
-                    // rather than made up in a burst.
-                    let missed = (now.0 - next.0).div_euclid(WAKE_PERIOD.0).max(0);
-                    next = TimeUs(next.0 + missed * WAKE_PERIOD.0);
-                    report.intervals.record(now.0.abs_diff(last.0));
-                    last = now;
-                    raw.poll(now, &mut sources);
-                    // Polling may take a while after a scheduling stall;
-                    // the boundary is read after it.
-                    on_wake(&mut sources, clock.now());
-                }
-                drop(mmcss);
-                report
-            })
-            .map_err(InputError::Spawn)?;
-        match ready_rx.recv() {
-            Ok(Ok(receiver)) => Ok(Self {
-                stop,
-                handle: Some(handle),
-                receiver,
-            }),
-            Ok(Err(e)) => {
-                let _ = handle.join();
-                Err(e)
-            }
-            Err(_) => Err(InputError::Panicked),
-        }
+        let (worker, receiver) = spawn_worker("input", clock, move || {
+            let mut raw = RawInput::new(clock, capture)?;
+            raw.connect_present(&mut sources)?;
+            let timer = Timer::new()?;
+            let receiver = raw.hwnd.0 as usize;
+            Ok((timer, receiver, move |now| {
+                raw.poll(now, &mut sources);
+                // Polling may take a while after a scheduling stall; the
+                // boundary is read after it.
+                on_wake(&mut sources, clock.now());
+            }))
+        })?;
+        Ok(Self { worker, receiver })
     }
 
     /// The receiver window the keyboards are registered to, as a raw
@@ -1308,26 +1366,52 @@ impl InputThread {
     /// [`InputError::StopFromWorker`] if called from the input thread
     /// itself, which then ends after its current wake.
     pub fn stop(mut self) -> Result<WakeReport, InputError> {
-        self.shutdown()
-    }
-
-    /// Signals the thread to stop and joins it. From the input thread
-    /// itself (its hook, or a destructor while it unwinds) joining would
-    /// never return, so the thread is detached and ends after its wake.
-    fn shutdown(&mut self) -> Result<WakeReport, InputError> {
-        self.stop.store(true, Ordering::Release);
-        // Only a second call finds the handle gone.
-        let handle = self.handle.take().ok_or(InputError::Panicked)?;
-        if handle.thread().id() == std::thread::current().id() {
-            return Err(InputError::StopFromWorker);
-        }
-        handle.join().map_err(|_| InputError::Panicked)
+        self.worker.shutdown()
     }
 }
 
-impl Drop for InputThread {
-    fn drop(&mut self) {
-        let _ = self.shutdown();
+/// An input thread without Raw Input, for input that comes from no device
+/// (autoplay): the same 1 kHz high-resolution timer under MMCSS "Games" as
+/// [`InputThread`], calling the caller's hook with the clock read at each
+/// wake; the hook feeds the sources and publishes. Nothing is registered,
+/// so no device is received. Dropping the handle stops and joins the
+/// thread, as [`stop`](Self::stop) does.
+#[derive(Debug)]
+pub struct ClockedThread {
+    worker: Worker,
+}
+
+impl ClockedThread {
+    /// Starts the thread with `sources`. `on_wake` runs at every wake with
+    /// the clock read there: it feeds the sources and ends with a
+    /// publication, opens and closes recording and wakes the logic thread,
+    /// and it must not allocate during play.
+    ///
+    /// # Errors
+    ///
+    /// [`InputError`] if the thread or the timer cannot be set up.
+    pub fn spawn<F>(
+        clock: QpcClock,
+        mut sources: SourceSet,
+        mut on_wake: F,
+    ) -> Result<Self, InputError>
+    where
+        F: FnMut(&mut SourceSet, TimeUs) + Send + 'static,
+    {
+        let (worker, _) = spawn_worker("clocked input", clock, move || {
+            Ok((Timer::new()?, 0, move |now| on_wake(&mut sources, now)))
+        })?;
+        Ok(Self { worker })
+    }
+
+    /// Stops the thread after its current wake and returns what it
+    /// measured.
+    ///
+    /// # Errors
+    ///
+    /// As [`InputThread::stop`].
+    pub fn stop(mut self) -> Result<WakeReport, InputError> {
+        self.worker.shutdown()
     }
 }
 
@@ -1371,6 +1455,48 @@ mod qpc_tests {
         assert!(before <= t && t <= after, "{before:?} {t:?} {after:?}");
         let later = clock.from_qpc(ticks + clock.frequency().hz());
         assert_eq!(later.0 - t.0, 1_000_000);
+    }
+}
+
+#[cfg(test)]
+mod clocked_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use bms_model::{TimeSource, TimeUs};
+
+    use super::{ClockedThread, QpcClock};
+    use crate::{AUTOPLAY_DEVICE, DeviceKind, SourceConfig, SourceSet};
+
+    /// The clocked thread wakes about every millisecond with the clock's
+    /// time and the source set it was given, and stops when asked.
+    #[test]
+    fn the_clocked_thread_wakes_with_the_clock_and_its_sources() {
+        let clock = QpcClock::start();
+        let mut set = SourceSet::new(SourceConfig {
+            max_devices: 1,
+            max_sources: 1,
+            max_held: 1,
+            queue_capacity: 1,
+            max_arrivals: 1,
+        })
+        .unwrap();
+        set.connect(AUTOPLAY_DEVICE, DeviceKind::Keyboard);
+        let last = Arc::new(AtomicI64::new(i64::MIN));
+        let seen = Arc::clone(&last);
+        let start = clock.now();
+        let thread = ClockedThread::spawn(clock, set, move |s, now| {
+            assert_eq!(s.devices().count(), 1);
+            seen.store(now.0, Ordering::Release);
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let report = thread.stop().unwrap();
+        let woke = last.load(Ordering::Acquire);
+        assert!(TimeUs(woke) > start && TimeUs(woke) <= clock.now());
+        // About 100 wakes; a loaded machine may skip some.
+        let wakes = report.intervals.count();
+        assert!((20..=150).contains(&wakes), "{wakes}");
     }
 }
 

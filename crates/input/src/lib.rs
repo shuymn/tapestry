@@ -51,8 +51,8 @@ pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, 
 pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
 #[cfg(windows)]
 pub use win::{
-    CollectionInfo, InputError, InputThread, QpcClock, WakeReport, controller_layouts, hid_usages,
-    keyboard_target,
+    ClockedThread, CollectionInfo, InputError, InputThread, QpcClock, WakeReport,
+    controller_layouts, hid_usages, keyboard_target,
 };
 
 /// Something that delivers input to a [`SourceSet`], such as a script in
