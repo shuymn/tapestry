@@ -60,25 +60,24 @@
 //!   [`WarningKind::NoPlayableNotes`] warning; whether to play it is the
 //!   caller's decision.
 //! - **`#RANDOM n`:** draws `next() % n + 1` from SplitMix64 seeded with
-//!   [`LoadOptions::seed`]; `#SETRANDOM n` sets `n`. Every value of a block
-//!   in a taken branch is recorded in [`ChartIdentity::random_results`] in
-//!   file order, whether or not an `#IF` matches it. A block in a branch not
-//!   taken draws nothing. `n` must be a positive integer (an error
-//!   otherwise, since the chart's branches would be undefined).
-//! - **Blocks:** every line inside an `#IF` branch not taken is skipped,
-//!   headers (`#WAVxx`, `#BPMxx`, `#LNOBJ`, ...) included. `#IF k` is taken
-//!   when the nearest enclosing block's value is `k`; `#ELSE` when no
-//!   earlier branch of its `#IF` was. A `#RANDOM` directly inside another
-//!   ends it, since `#ENDRANDOM` is often left out; `#ELSE` and `#ENDIF`
-//!   also close blocks left open inside their `#IF`, and an `#IF` met while
-//!   an `#IF` of the same `#RANDOM` is open stacks on it, with a warning once
-//!   per chart: only the last `#IF` counts, and `#ENDIF` pops one, so the one
-//!   before counts again. Blocks nest only inside a new `#RANDOM`. `#IF`
-//!   outside any block is never taken, and a stray `#ELSE`, `#ENDIF` or
-//!   `#ENDRANDOM` is ignored, each with a warning: the base chart stays
-//!   playable. An `#IF` still open at the end of the file ends there, with
-//!   a warning. Blocks nest at most [`Limits::max_nesting`] deep (an
-//!   error).
+//!   [`LoadOptions::seed`]; `#SETRANDOM n` sets `n`. Each is read wherever
+//!   it is, inside an `#IF` branch not read too, and every value is recorded
+//!   in [`ChartIdentity::random_results`] in file order. `n` must be a
+//!   positive integer (an error otherwise, since the chart's branches would
+//!   be undefined).
+//! - **Blocks**, as charts are written against (the reference is
+//!   jbms-parser's `BMSDecoder`): `#RANDOM` and `#SETRANDOM` push a value
+//!   and `#ENDRANDOM` pops one; `#IF k` pushes a flag, set when the latest
+//!   value is `k`, and `#ENDIF` pops whatever flag is on top. A line is read
+//!   when the top flag is set or no flag is open, headers (`#WAVxx`,
+//!   `#BPMxx`, `#LNOBJ`, ...) included. `#ELSE`, our addition, sets the top
+//!   flag when no earlier branch of its `#IF` was taken and clears it
+//!   otherwise. An `#IF` with no value to test pushes no flag, so its lines
+//!   are read (one warning per chart). An `#IF` met over an open `#IF` of
+//!   the same `#RANDOM` is warned about once per chart; a stray `#ELSE`,
+//!   `#ENDIF` or `#ENDRANDOM` is ignored with a warning, and an `#IF` still
+//!   open at the end of the file is a warning. The stacks are bounded by the
+//!   line limit.
 //! - **Unsupported:** `#LNTYPE` 2 or higher, `#LNMODE` other than 1, negative
 //!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
 //!   The branching ones are refused even inside a branch not taken.
@@ -128,8 +127,6 @@ pub struct Limits {
     pub max_measure: u16,
     /// Longest resolved chart accepted.
     pub max_duration: TimeUs,
-    /// Deepest nesting of open `#RANDOM` and `#IF` blocks, each counting one.
-    pub max_nesting: usize,
     /// Most bits in the denominator of the exact running time (D3).
     pub max_time_bits: u64,
 }
@@ -142,7 +139,6 @@ impl Default for Limits {
             max_objects: 500_000,
             max_measure: 999,
             max_duration: TimeUs(60 * 60 * 1_000_000),
-            max_nesting: 16,
             max_time_bits: 16_384,
         }
     }

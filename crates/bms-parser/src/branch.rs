@@ -29,68 +29,57 @@ impl SplitMix64 {
     }
 }
 
-/// One `#IF` of a block: `active` while its current branch is taken,
-/// `taken` once any branch of it was.
+/// One open `#IF`: `active` while its current branch is read, `taken`
+/// once any branch of it was, and `random` the number of open `#RANDOM`
+/// blocks when it was met.
 #[derive(Clone, Copy, Debug)]
-struct Condition {
+struct Flag {
     active: bool,
     taken: bool,
+    random: usize,
 }
 
-#[derive(Clone, Debug)]
-enum Frame {
-    /// A `#RANDOM` or `#SETRANDOM` block; `value` is `None` exactly when the
-    /// block sits in a branch not taken, so nothing was drawn.
-    Random { value: Option<u32> },
-    /// The `#IF`s open directly inside one block; `parent` is whether that
-    /// block is taken. An `#IF` met while another is open stacks on it and
-    /// only the last one counts; `#ENDIF` pops one, so the one before
-    /// counts again. Never empty. The stack is one nesting level, bounded
-    /// by the line limit.
-    If {
-        parent: bool,
-        conditions: Vec<Condition>,
-    },
-}
-
-impl Frame {
-    fn active(&self) -> bool {
-        match self {
-            Self::Random { value } => value.is_some(),
-            Self::If { conditions, .. } => conditions.last().is_some_and(|c| c.active),
-        }
-    }
-}
-
-/// The open blocks and the values drawn so far.
+/// `#RANDOM` and `#IF` as charts are written against (stage1.md PR3; the
+/// reference is jbms-parser's `BMSDecoder`): two flat stacks, not nested
+/// blocks. `#RANDOM` pushes a value and `#ENDRANDOM` pops one; `#IF k`
+/// pushes a flag, active when the latest value is `k`, and `#ENDIF` pops
+/// whatever flag is on top. A line is read when the top flag is active or
+/// no flag is open. `#ELSE` is our addition: it turns the top flag to the
+/// branch no earlier one took. Each line costs O(1) whatever the stacks
+/// hold, and the line limit bounds them.
 #[derive(Debug)]
 pub struct Branches {
     rng: SplitMix64,
-    frames: Vec<Frame>,
-    max_depth: usize,
-    /// An `#IF` stacked on another was warned about; once per chart.
+    /// The values of the open `#RANDOM` and `#SETRANDOM` blocks.
+    randoms: Vec<u32>,
+    flags: Vec<Flag>,
+    /// An `#IF` stacked on one of the same `#RANDOM` was warned about.
     warned_stacked: bool,
-    /// Every `#RANDOM` and `#SETRANDOM` value in a taken branch, in order.
+    /// An `#IF` without a `#RANDOM` was warned about.
+    warned_orphan: bool,
+    /// Every `#RANDOM` and `#SETRANDOM` value, in order.
     pub results: Vec<u32>,
 }
 
 impl Branches {
-    pub const fn new(seed: u64, max_depth: usize) -> Self {
+    pub const fn new(seed: u64) -> Self {
         Self {
             rng: SplitMix64::new(seed),
-            frames: Vec::new(),
-            max_depth,
+            randoms: Vec::new(),
+            flags: Vec::new(),
             warned_stacked: false,
+            warned_orphan: false,
             results: Vec::new(),
         }
     }
 
     /// Whether lines at this point are read.
     pub fn active(&self) -> bool {
-        self.frames.last().is_none_or(|f| f.active())
+        self.flags.last().is_none_or(|f| f.active)
     }
 
-    /// Handles a branch directive. Returns `Ok(false)` when `name` is not one.
+    /// Handles a branch directive, whether or not lines are read here.
+    /// Returns `Ok(false)` when `name` is not one.
     pub fn directive(
         &mut self,
         name: &str,
@@ -98,7 +87,6 @@ impl Branches {
         line: usize,
         warnings: &mut Vec<Warning>,
     ) -> Result<bool, LoadError> {
-        let active = self.active();
         let warn = |warnings: &mut Vec<Warning>, kind| {
             warnings.push(Warning {
                 line: Some(line),
@@ -106,123 +94,59 @@ impl Branches {
             });
         };
         match name {
-            "RANDOM" | "SETRANDOM" => {
-                // A #RANDOM directly inside another ends it: #ENDRANDOM is
-                // often left out between consecutive blocks.
-                if matches!(self.frames.last(), Some(Frame::Random { .. })) {
-                    self.frames.pop();
-                }
-                let parent = self.active();
-                let value = if parent {
-                    let what = if name == "RANDOM" {
-                        "#RANDOM"
-                    } else {
-                        "#SETRANDOM"
-                    };
-                    let n = positive_integer(value, line, what)?;
-                    let v = if name == "RANDOM" {
-                        self.rng.draw(n)
-                    } else {
-                        n
-                    };
-                    self.results.push(v);
-                    Some(v)
-                } else {
-                    None
-                };
-                self.push(Frame::Random { value }, line)?;
+            // Drawn even inside an #IF branch not read, as charts expect.
+            "RANDOM" => {
+                let n = positive_integer(value, line, "#RANDOM")?;
+                let v = self.rng.draw(n);
+                self.randoms.push(v);
+                self.results.push(v);
+            }
+            "SETRANDOM" => {
+                let v = positive_integer(value, line, "#SETRANDOM")?;
+                self.randoms.push(v);
+                self.results.push(v);
             }
             "IF" => {
-                // An #IF met while an #IF of the same #RANDOM is open stacks
-                // on it, as #ENDIF is often left out between consecutive
-                // branches; its block's activity is the open one's.
-                let stacked = match self.frames.last() {
-                    Some(Frame::If { parent, .. }) => Some(*parent),
-                    _ => None,
-                };
-                let active = stacked.unwrap_or(active);
-                let random = self.frames.iter().rev().find_map(|f| match f {
-                    Frame::Random { value, .. } => Some(*value),
-                    Frame::If { .. } => None,
-                });
-                let taken = if active {
-                    let k = positive_integer(value, line, "#IF")?;
-                    if random.is_none() {
-                        warn(warnings, WarningKind::UnmatchedDirective("#IF"));
+                let k = positive_integer(value, line, "#IF")?;
+                match self.randoms.last() {
+                    // No value to test: no flag, as charts expect, so the
+                    // lines are read and the next #ENDIF pops whatever flag
+                    // is on top.
+                    None => {
+                        if !std::mem::replace(&mut self.warned_orphan, true) {
+                            warn(warnings, WarningKind::UnmatchedDirective("#IF"));
+                        }
                     }
-                    random.flatten() == Some(k)
-                } else {
-                    false
-                };
-                let condition = Condition {
-                    active: taken,
-                    taken,
-                };
-                if let Some(Frame::If { conditions, .. }) = self.frames.last_mut() {
-                    conditions.push(condition);
-                    if !std::mem::replace(&mut self.warned_stacked, true) {
-                        warn(warnings, WarningKind::UnclosedIf);
+                    Some(&v) => {
+                        let random = self.randoms.len();
+                        if self.flags.last().is_some_and(|f| f.random == random)
+                            && !std::mem::replace(&mut self.warned_stacked, true)
+                        {
+                            warn(warnings, WarningKind::UnclosedIf);
+                        }
+                        self.flags.push(Flag {
+                            active: v == k,
+                            taken: v == k,
+                            random,
+                        });
                     }
-                } else {
-                    self.push(
-                        Frame::If {
-                            parent: active,
-                            conditions: vec![condition],
-                        },
-                        line,
-                    )?;
                 }
             }
             "ELSE" => {
-                // The innermost open #IF; a #RANDOM left open inside its
-                // branch ends here.
-                if let Some(i) = self
-                    .frames
-                    .iter()
-                    .rposition(|f| matches!(f, Frame::If { .. }))
-                {
-                    self.frames.truncate(i + 1);
-                    if let Some(Frame::If { parent, conditions }) = self.frames.last_mut()
-                        && let Some(c) = conditions.last_mut()
-                    {
-                        c.active = *parent && !c.taken;
-                        c.taken = true;
-                    }
+                if let Some(f) = self.flags.last_mut() {
+                    f.active = !f.taken;
+                    f.taken = true;
                 } else {
                     warn(warnings, WarningKind::UnmatchedDirective("#ELSE"));
                 }
             }
             "ENDIF" => {
-                if let Some(i) = self
-                    .frames
-                    .iter()
-                    .rposition(|f| matches!(f, Frame::If { .. }))
-                {
-                    // Closes any #RANDOM left open inside the #IF too, and
-                    // the #IF stacked below it counts again.
-                    self.frames.truncate(i + 1);
-                    if let Some(Frame::If { conditions, .. }) = self.frames.last_mut() {
-                        conditions.pop();
-                        if conditions.is_empty() {
-                            self.frames.pop();
-                        }
-                    }
-                } else {
+                if self.flags.pop().is_none() {
                     warn(warnings, WarningKind::UnmatchedDirective("#ENDIF"));
                 }
             }
             "ENDRANDOM" => {
-                if let Some(i) = self
-                    .frames
-                    .iter()
-                    .rposition(|f| matches!(f, Frame::Random { .. }))
-                {
-                    // Every frame above the last #RANDOM is an #IF.
-                    if i + 1 < self.frames.len() {
-                        warn(warnings, WarningKind::UnclosedIf);
-                    }
-                    self.frames.truncate(i);
-                } else {
+                if self.randoms.pop().is_none() {
                     warn(warnings, WarningKind::UnmatchedDirective("#ENDRANDOM"));
                 }
             }
@@ -231,18 +155,10 @@ impl Branches {
         Ok(true)
     }
 
-    fn push(&mut self, frame: Frame, line: usize) -> Result<(), LoadError> {
-        if self.frames.len() >= self.max_depth {
-            return Err(LoadError::NestingTooDeep { line });
-        }
-        self.frames.push(frame);
-        Ok(())
-    }
-
     /// Ends the file: an `#IF` still open is a warning; an open `#RANDOM`
     /// is normal.
     pub fn finish(self, warnings: &mut Vec<Warning>) -> Vec<u32> {
-        if self.frames.iter().any(|f| matches!(f, Frame::If { .. })) {
+        if !self.flags.is_empty() {
             warnings.push(Warning {
                 line: None,
                 kind: WarningKind::UnclosedIf,

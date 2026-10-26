@@ -41,13 +41,6 @@ pub enum LoadError {
         /// Why it was refused.
         reason: &'static str,
     },
-    /// `#RANDOM` and `#IF` blocks nest deeper than
-    /// [`Limits::max_nesting`](crate::Limits).
-    #[error("line {line}: #RANDOM and #IF blocks nest too deep")]
-    NestingTooDeep {
-        /// The line opening the first block past the limit.
-        line: usize,
-    },
     /// A directive whose meaning the loader cannot honor.
     #[error("line {line}: unsupported {what}")]
     Unsupported {

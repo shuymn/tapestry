@@ -3,7 +3,8 @@
 #BPM 120
 #WAV01 click.wav
 
-*  Outer 1 picks key 1 or 2 by the inner value; outer 2 picks key 3 or 4.
+*  Only the top #IF counts: each inner #IF is read by the inner value,
+*  whatever the outer one (inner 1: keys 1 and 3; inner 2: keys 2 and 4).
 #RANDOM 2
 #IF 1
 #RANDOM 2

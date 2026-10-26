@@ -136,7 +136,6 @@ fn category(e: &SessionError) -> &'static str {
             | LoadError::TooManyLines { .. }
             | LoadError::TooManyObjects { .. }
             | LoadError::MeasureOutOfRange { .. }
-            | LoadError::NestingTooDeep { .. }
             | LoadError::DurationExceeded { .. } => "loading limit",
             LoadError::InvalidValue { .. } => "invalid value",
             LoadError::TimeOverflow { .. } => "time overflow",

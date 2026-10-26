@@ -106,7 +106,7 @@ pub fn parse(
     warnings: &mut Vec<Warning>,
 ) -> Result<Source, LoadError> {
     let mut source = Source::default();
-    let mut branches = Branches::new(seed, limits.max_nesting);
+    let mut branches = Branches::new(seed);
     let mut objects = 0_usize;
     for (i, raw_line) in text.lines().enumerate() {
         let line = i + 1;
