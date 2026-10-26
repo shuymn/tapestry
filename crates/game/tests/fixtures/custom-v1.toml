@@ -1,0 +1,141 @@
+id = "custom"
+version = 1
+miss = "poor_after_late_bad"
+default_total_milli = 160000
+denominator = "taps_and_ln_heads"
+same_time_order = "inputs_first"
+assignment = "nearest_ties_earlier"
+total_mode = "scales_increase"
+
+[implementation]
+kind = "standard"
+version = 1
+
+[windows.perfect]
+early_us = 20000
+late_us = 20000
+
+[windows.great]
+early_us = 45000
+late_us = 45000
+
+[windows.good]
+early_us = 100000
+late_us = 100000
+
+[windows.bad]
+early_us = 180000
+late_us = 180000
+
+[empty_poor]
+ahead_us = 300000
+breaks_combo = false
+counts_bp = false
+counted = false
+
+[ln_break]
+release_margin_us = 100000
+breaks_combo = true
+counts_bp = true
+
+[rank_scale]
+rank_milli = [50000, 75000, 100000, 125000]
+absent_milli = 100000
+
+[score.ex]
+perfect = 2
+great = 1
+good = 0
+bad = 0
+poor = 0
+
+[score.breaks_combo]
+perfect = false
+great = false
+good = false
+bad = true
+poor = true
+
+[score.counts_bp]
+perfect = false
+great = false
+good = false
+bad = true
+poor = true
+
+[ln_mode]
+default = "ln"
+late_head = "completes_at_press"
+
+[mine]
+kind = "while_held"
+per_unit = 50000
+
+[[gauges]]
+id = "normal"
+start = 2000000
+min = 200000
+max = 10000000
+
+[gauges.kind]
+kind = "end_threshold"
+clear = 8000000
+
+[gauges.change.perfect.total_share]
+num = 1
+den = 1
+
+[gauges.change.great.total_share]
+num = 1
+den = 1
+
+[gauges.change.good.total_share]
+num = 1
+den = 2
+
+[gauges.change.bad]
+fixed = -200000
+
+[gauges.change.poor]
+fixed = -600000
+
+[gauges.empty_poor]
+fixed = -300000
+
+[gauges.ln_break]
+fixed = -600000
+
+[[gauges]]
+id = "survival"
+start = 10000000
+min = 0
+max = 10000000
+
+[gauges.kind]
+kind = "survival"
+
+[gauges.change.perfect]
+fixed = 16000
+
+[gauges.change.great]
+fixed = 16000
+
+[gauges.change.good]
+fixed = 0
+
+[gauges.change.bad]
+fixed = -500000
+
+[gauges.change.poor]
+fixed = -900000
+
+[gauges.empty_poor]
+fixed = -450000
+
+[gauges.ln_break]
+fixed = -900000
+
+[gauges.low_damage]
+below = 3000000
+num = 1
+den = 2

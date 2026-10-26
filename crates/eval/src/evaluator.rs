@@ -45,7 +45,7 @@ pub enum JudgeEventKind {
         /// The combo after this judgment.
         combo: u32,
     },
-    /// A press judged no note but had one close ahead (an empty POOR).
+    /// A press judged no note but had one close by (an empty POOR).
     EmptyPoor {
         /// The lane pressed.
         lane: Lane,
@@ -319,7 +319,7 @@ impl<'a> Evaluator<'a> {
             .and_then(|scale| rule.windows.scaled(scale))
             .ok_or(EvalError::InvalidRank)?;
         let miss_after = match rule.miss {
-            MissRule::PoorAfterLateBad => windows.bad.late,
+            MissRule::PoorAfterLateBad | MissRule::PoorAfterLateBadOrOvertaken => windows.bad.late,
         };
         match (rule.ln_mode.default, chart.meta.ln_mode) {
             (LnMode::Ln, None | Some(ChartLnMode::Ln)) => {}
@@ -623,10 +623,12 @@ impl<'a> Evaluator<'a> {
         let notes = &self.chart.lanes[lane];
         let state = &self.lanes[lane];
         let at = i128::from(t.0);
+        let time_of = |k: usize| i128::from(notes[state.targets[k]].time.0);
+        let first = (state.cursor < state.targets.len()).then_some(state.cursor);
         // Candidates: unjudged targets with −early ≤ t − note ≤ late (BAD).
         let mut best: Option<(i128, usize)> = None;
         for k in state.cursor..state.targets.len() {
-            let deviation = at - i128::from(notes[state.targets[k]].time.0);
+            let deviation = at - time_of(k);
             if deviation < -i128::from(bad.early.0) {
                 break;
             }
@@ -645,14 +647,26 @@ impl<'a> Evaluator<'a> {
         }
         // The judged note, else the next unjudged one (the cursor: no
         // unjudged note lies inside BAD, and earlier ones are missed).
-        let target = best
-            .map(|(_, k)| k)
-            .or_else(|| (state.cursor < state.targets.len()).then_some(state.cursor));
-        let Some(k) = target else {
-            return;
-        };
-        let note = notes[state.targets[k]];
-        if let Some(sound) = note.sound {
+        let target = best.map(|(_, k)| k).or(first);
+        let rule = self.rule.empty_poor;
+        let empty_poor = best.is_none()
+            && match rule.behind {
+                // Only the next unjudged note, strictly after the press.
+                None => target.is_some_and(|k| {
+                    let gap = time_of(k) - at;
+                    gap > 0 && gap <= i128::from(rule.ahead.0)
+                }),
+                // The first note at or after `t − behind`, judged or not,
+                // lies at or before `t + ahead`.
+                Some(behind) => {
+                    let from = at - i128::from(behind.0);
+                    let k = state
+                        .targets
+                        .partition_point(|&i| i128::from(notes[i].time.0) < from);
+                    k < state.targets.len() && time_of(k) <= at + i128::from(rule.ahead.0)
+                }
+            };
+        if let Some(sound) = target.and_then(|k| notes[state.targets[k]].sound) {
             self.emit(
                 t,
                 Some(origin),
@@ -663,7 +677,21 @@ impl<'a> Evaluator<'a> {
                 out,
             );
         }
-        if let Some((deviation, _)) = best {
+        if let Some((deviation, k)) = best {
+            match self.rule.miss {
+                MissRule::PoorAfterLateBad => {}
+                // The earlier notes are passed: each is missed now, which
+                // also finishes a long note whose head it is, and its miss
+                // deadline is then skipped. All of them are unjudged, since
+                // under this rule a judgment passes every earlier note and
+                // misses come in note order.
+                MissRule::PoorAfterLateBadOrOvertaken => {
+                    for j in self.lanes[lane].cursor..k {
+                        self.judge(lane, j, Judgment::Poor, None, t, Some(origin), out);
+                    }
+                }
+            }
+            let note = self.chart.lanes[lane][self.lanes[lane].targets[k]];
             // Within the BAD window, so it fits in i64.
             let deviation = TimeUs(i64::try_from(deviation).unwrap_or(i64::MAX));
             let judgment = judgment_of(&self.windows, deviation);
@@ -682,9 +710,7 @@ impl<'a> Evaluator<'a> {
             }
             return;
         }
-        let gap = i128::from(note.time.0) - at;
-        let rule = self.rule.empty_poor;
-        if gap > 0 && gap <= i128::from(rule.ahead.0) {
+        if empty_poor {
             self.tally.empty_poor = self.tally.empty_poor.saturating_add(1);
             if rule.counted {
                 let c = self.tally.count_mut(Judgment::Poor);
