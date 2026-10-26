@@ -1,6 +1,7 @@
-use bms_model::{ChartIdentity, Lane, TimeUs};
+use bms_model::{ChartBuilder, ChartIdentity, Lane, TimeUs};
 use eval::{
-    Binding, ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile,
+    AxisBinding, AxisMode, Binding, ControlId, EvalInput, InputKind, InputStart,
+    PhysicalInputEvent, ScratchSettings, SourceId, SourceProfile,
 };
 use sha2::{Digest, Sha256};
 
@@ -43,6 +44,27 @@ fn source(kind: DeviceKind, offset: i64, bindings: &[(u32, u8)]) -> SourceRecord
             axes: Vec::new(),
         },
     }
+}
+
+/// `s` with an axis per `(control, lane, mode)`; the other settings are
+/// distinct per axis and from every other field.
+fn with_axes(mut s: SourceRecord, axes: &[(u32, u8, AxisMode)]) -> SourceRecord {
+    s.profile.axes = axes
+        .iter()
+        .zip(0..)
+        .map(|(&(c, l, mode), i)| AxisBinding {
+            control: ControlId(c),
+            lane: lane(l),
+            scratch: ScratchSettings {
+                mode,
+                invert: i % 2 == 0,
+                press_threshold: 6 + i,
+                hold_threshold: 9 + i,
+                release_after_us: 120_000 + i,
+            },
+        })
+        .collect();
+    s
 }
 
 fn preset_record(bytes: &[u8]) -> PresetRecord {
@@ -105,10 +127,13 @@ fn sample(n_events: usize) -> PlayRecord {
             sources: vec![
                 source(DeviceKind::Keyboard, 3_000, &[(0x1e, 0), (0x1f, 1)]),
                 source(DeviceKind::Keyboard, -1_500, &[(0x20, 2), (0x21, 3)]),
-                SourceRecord {
-                    receive: ReceiveMethod::Scripted,
-                    ..source(DeviceKind::Controller, 0, &[(1, 4), (2, 5), (3, 6), (4, 7)])
-                },
+                with_axes(
+                    SourceRecord {
+                        receive: ReceiveMethod::Scripted,
+                        ..source(DeviceKind::Controller, 0, &[(1, 4), (2, 5), (3, 6), (4, 7)])
+                    },
+                    &[(0x1_0030, 0, AxisMode::Absolute { wrap: 1024 })],
+                ),
             ],
             audio_offset: TimeUs(-12_000),
             display_offset: TimeUs(8_000),
@@ -134,10 +159,16 @@ fn sample(n_events: usize) -> PlayRecord {
     }
 }
 
-/// A file around `body`, as `encode` writes it, at zstd `level`.
+/// A file around `body`, as `encode` writes it, at zstd `level`, in the
+/// newest version.
 fn wrap(body: &[u8], level: i32) -> Vec<u8> {
+    wrap_as(FORMAT_VERSION, body, level)
+}
+
+/// A file around `body` with `version` in its header.
+fn wrap_as(version: u16, body: &[u8], level: i32) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.push(1);
     out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&zstd::bulk::compress(body, level).unwrap());
@@ -420,8 +451,151 @@ fn v1_golden_body() {
     assert_eq!(hex(&Sha256::digest(&body)), GOLDEN_BODY_SHA256);
     // Another zstd encoding of the same body decodes to the same record.
     for level in [1, 3, 19] {
-        assert_eq!(decode(&wrap(&body, level), &limits()), Ok(rec.clone()));
+        assert_eq!(
+            decode(&wrap_as(1, &body, level), &limits()),
+            Ok(rec.clone())
+        );
     }
+}
+
+/// [`golden`] with two axes on the controller, one absolute and one
+/// relative, and a report of each.
+fn golden_v2() -> PlayRecord {
+    let mut rec = golden();
+    let axis = |control, l, mode, invert, press, hold, release| AxisBinding {
+        control: ControlId(control),
+        lane: lane(l),
+        scratch: ScratchSettings {
+            mode,
+            invert,
+            press_threshold: press,
+            hold_threshold: hold,
+            release_after_us: release,
+        },
+    };
+    rec.devices.sources[1].profile.axes = vec![
+        axis(
+            0x1_0030,
+            0,
+            AxisMode::Absolute { wrap: 256 },
+            false,
+            2,
+            1,
+            100_000,
+        ),
+        axis(0x1_0035, 6, AxisMode::Relative, true, 3, 2, 150_000),
+    ];
+    rec.events.insert(4, control(1, 1_200_000, 0x1_0030, 131));
+    rec.events.insert(5, control(1, 1_250_000, 0x1_0035, -4));
+    rec
+}
+
+/// SHA-256 of `body_bytes(&golden_v2())`, computed by the same separate
+/// encoder, which also gives [`GOLDEN_BODY_SHA256`] for [`golden`].
+const GOLDEN_V2_BODY_SHA256: &str =
+    "41f245e4161c8a403e5cc2370d75537e3d43eff8b0c123ddbb6b1e645ece61f3";
+
+#[test]
+fn v2_golden_body() {
+    let rec = golden_v2();
+    let file = encode(&rec);
+    assert_eq!(file[4..6], 2_u16.to_le_bytes());
+    let body = body_bytes(&rec);
+    assert_eq!(hex(&Sha256::digest(&body)), GOLDEN_V2_BODY_SHA256);
+    assert_eq!(decode(&file, &limits()), Ok(rec.clone()));
+    // A version 1 header over the same body reads no axes, so the body
+    // does not parse.
+    assert!(decode(&wrap_as(1, &body, 3), &limits()).is_err());
+}
+
+#[test]
+fn v1_logs_still_decode() {
+    // A record without axes is written as version 1, byte for byte the
+    // pinned version 1 body, and reads back with no axes.
+    let rec = golden();
+    let file = encode(&rec);
+    assert_eq!(file[4..6], 1_u16.to_le_bytes());
+    assert_eq!(hex(&Sha256::digest(body_bytes(&rec))), GOLDEN_BODY_SHA256);
+    let decoded = decode(&file, &limits()).unwrap();
+    assert!(
+        decoded
+            .devices
+            .sources
+            .iter()
+            .all(|s| s.profile.axes.is_empty())
+    );
+    assert_eq!(decoded, rec);
+
+    // It re-evaluates as before: a scratch tap at the keyboard's press
+    // (evaluation 997.5 ms) and a key 7 tap at the controller's (1000.3 ms),
+    // up to the finalized watermark.
+    let chart = ChartBuilder::new(150_000)
+        .tap(lane(0), TimeUs(997_500))
+        .tap(lane(7), TimeUs(1_000_300))
+        .build()
+        .unwrap();
+    let evaluate = |r: &PlayRecord| {
+        let input = EvalInput {
+            events: r.events.clone(),
+            device: r.devices.profile(),
+            start: r.start.clone(),
+            finalized: Some(r.status.finalized),
+        };
+        eval::evaluate(&chart, &input, &rules::custom()).unwrap()
+    };
+    let before = evaluate(&rec);
+    assert_eq!(before.tally.counts.perfect, 2);
+    assert_eq!(evaluate(&decoded), before);
+}
+
+#[test]
+fn malformed_axes_are_refused() {
+    // The devices section of a single controller with one axis, each
+    // field forgeable: (mode, invert, lane, axis count).
+    let devices = |count: u64, l: u64, mode: u64, invert: u64| {
+        let mut w = Writer::default();
+        // One source: controller, raw input, offset 0, no bindings.
+        w.raw(&[1, 1, 0, 0, 0]);
+        w.uint(count);
+        w.uint(0x1_0030);
+        w.uint(l);
+        w.uint(mode);
+        if mode == 0 {
+            w.uint(256);
+        }
+        w.uint(invert);
+        w.raw(&[2, 1, 7]);
+        // Audio and display offsets.
+        w.raw(&[0, 0]);
+        w.0
+    };
+    let mut sections = split_sections(&body_bytes(&golden_v2()));
+    let decode_with = |sections: &mut Vec<Vec<u8>>, payload: Vec<u8>| {
+        sections[4] = payload;
+        decode(&wrap(&join_sections(sections), 3), &limits())
+    };
+    // Well formed, the section reads, and the error comes from the events
+    // of source 1, which this single source does not have.
+    assert_eq!(
+        decode_with(&mut sections, devices(1, 0, 1, 1)),
+        Err(DecodeError::UnknownSource(1))
+    );
+    assert_eq!(
+        decode_with(&mut sections, devices(1, 0, 2, 1)),
+        Err(DecodeError::InvalidValue("axis mode"))
+    );
+    assert_eq!(
+        decode_with(&mut sections, devices(1, 0, 1, 2)),
+        Err(DecodeError::InvalidValue("axis inversion"))
+    );
+    assert_eq!(
+        decode_with(&mut sections, devices(1, 8, 1, 1)),
+        Err(DecodeError::InvalidValue("lane"))
+    );
+    assert_eq!(
+        decode_with(&mut sections, devices(2, 0, 1, 1)),
+        Err(DecodeError::CountBeyondData(2))
+    );
 }
 
 #[test]

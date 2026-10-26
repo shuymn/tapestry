@@ -24,6 +24,20 @@
 //! fails to compile until it is written; a layout change bumps
 //! [`FORMAT_VERSION`]. Decoders read every version they know and refuse
 //! newer ones.
+//!
+//! # Versions
+//!
+//! A record is written in the oldest version that holds it, so a layout
+//! that grows never changes the bytes of a record the old one holds.
+//!
+//! - 1: the sections above. Each source of the devices section is its kind,
+//!   receive method, input offset, then its bindings (a count, then each
+//!   control and lane).
+//! - 2: each source also has its axis bindings after its bindings: a
+//!   count, then each axis's control, lane, mode (0 absolute, followed by
+//!   its wrap; 1 relative), invert (0 or 1), press threshold, hold
+//!   threshold and release time in µs, all unsigned. Written when any
+//!   source binds an axis.
 
 #![forbid(unsafe_code)]
 
@@ -33,7 +47,8 @@ mod wire;
 
 use bms_model::{ChartIdentity, Lane, TimeUs};
 use eval::{
-    Binding, ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile,
+    AxisBinding, AxisMode, Binding, ControlId, InputKind, InputStart, PhysicalInputEvent,
+    ScratchSettings, SourceId, SourceProfile,
 };
 use rules::RulePreset;
 use sha2::{Digest, Sha256};
@@ -47,8 +62,11 @@ pub use record::{
 
 use wire::{Reader, Writer};
 
-/// The format version this crate writes, and the newest it reads.
-pub const FORMAT_VERSION: u16 = 1;
+/// The newest format version this crate writes and reads.
+pub const FORMAT_VERSION: u16 = 2;
+
+/// The first version with axis bindings.
+const AXES_VERSION: u16 = 2;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -78,14 +96,14 @@ pub struct DecodeLimits {
 
 impl DecodeLimits {
     /// The limits for records the app saves: 64 MiB either side of
-    /// compression, 64 sources, and 4 Mi events (an hour of one 1 kHz axis,
-    /// or of buttons pressed and released 30 times a second across 16
-    /// controls, stays below it).
+    /// compression, 64 sources, and 8 Mi events (an hour of one 1 kHz axis
+    /// together with 16 buttons pressed and released 30 times a second,
+    /// 7.1 M, stays below it).
     pub const STANDARD: Self = Self {
         max_compressed: 64 << 20,
         max_uncompressed: 64 << 20,
         max_sources: 64,
-        max_events: 4 << 20,
+        max_events: 8 << 20,
     };
 }
 
@@ -109,19 +127,37 @@ pub fn preset_hash(p: &RulePreset) -> [u8; 32] {
 /// recording capacities rule out.
 #[must_use]
 pub fn encode(rec: &PlayRecord) -> Vec<u8> {
+    let version = version_of(rec);
     let body = body_bytes(rec);
     let compressed = zstd::bulk::compress(&body, ZSTD_LEVEL)
         .expect("zstd compression of an in-memory buffer does not fail");
     let mut out = Vec::with_capacity(HEADER_LEN + compressed.len());
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.push(ENCODING_ZSTD);
     out.extend_from_slice(&u32_len(body.len()).to_le_bytes());
     out.extend_from_slice(&compressed);
     out
 }
 
-/// The canonical uncompressed body of `rec`.
+/// The oldest format version that holds `rec`: 2 if a source binds an
+/// axis, else 1.
+#[must_use]
+pub fn version_of(rec: &PlayRecord) -> u16 {
+    if rec
+        .devices
+        .sources
+        .iter()
+        .any(|s| !s.profile.axes.is_empty())
+    {
+        AXES_VERSION
+    } else {
+        1
+    }
+}
+
+/// The canonical uncompressed body of `rec`, in the version
+/// [`version_of`] gives.
 ///
 /// # Panics
 ///
@@ -140,6 +176,7 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
         arrivals,
         status,
     } = rec;
+    let version = version_of(rec);
     let mut body = Writer::default();
     let mut section = |write: &dyn Fn(&mut Writer)| {
         let mut w = Writer::default();
@@ -156,7 +193,7 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
             PlayType::Full => 0,
         });
     });
-    section(&|w| write_devices(w, devices));
+    section(&|w| write_devices(w, devices, version));
     section(&|w| write_start(w, start));
     section(&|w| write_events(w, start.opened_at, events));
     section(&|w| write_arrivals(w, arrivals));
@@ -226,7 +263,7 @@ const fn kind_tag(k: DeviceKind) -> u64 {
     }
 }
 
-fn write_devices(w: &mut Writer, d: &DeviceRecord) {
+fn write_devices(w: &mut Writer, d: &DeviceRecord, version: u16) {
     let DeviceRecord {
         sources,
         audio_offset,
@@ -241,7 +278,7 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
                 SourceProfile {
                     input_offset,
                     bindings,
-                    axes: _,
+                    axes,
                 },
         } = s;
         w.uint(kind_tag(*kind));
@@ -255,9 +292,43 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
             w.uint(u64::from(control.0));
             w.len(lane.index());
         }
+        if version >= AXES_VERSION {
+            write_axes(w, axes);
+        }
     }
     w.int(audio_offset.0);
     w.int(display_offset.0);
+}
+
+fn write_axes(w: &mut Writer, axes: &[AxisBinding]) {
+    w.len(axes.len());
+    for AxisBinding {
+        control,
+        lane,
+        scratch:
+            ScratchSettings {
+                mode,
+                invert,
+                press_threshold,
+                hold_threshold,
+                release_after_us,
+            },
+    } in axes
+    {
+        w.uint(u64::from(control.0));
+        w.len(lane.index());
+        match mode {
+            AxisMode::Absolute { wrap } => {
+                w.uint(0);
+                w.uint(u64::from(*wrap));
+            }
+            AxisMode::Relative => w.uint(1),
+        }
+        w.uint(u64::from(*invert));
+        w.uint(u64::from(*press_threshold));
+        w.uint(u64::from(*hold_threshold));
+        w.uint(u64::from(*release_after_us));
+    }
 }
 
 fn write_start(w: &mut Writer, s: &InputStart) {
@@ -377,7 +448,7 @@ pub fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
             actual: body.len(),
         });
     }
-    decode_body(&body, limits)
+    decode_body(&body, version, limits)
 }
 
 /// Splits off the next section, checking its length against the bytes left.
@@ -406,7 +477,11 @@ fn read_section<'a, T>(
     Ok(value)
 }
 
-fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeError> {
+fn decode_body(
+    body: &[u8],
+    version: u16,
+    limits: &DecodeLimits,
+) -> Result<PlayRecord, DecodeError> {
     let mut r = Reader::new(body);
     let (versions, loader) = read_section(&mut r, Section::Versions, read_versions)?;
     let chart = read_section(&mut r, Section::Chart, |r| read_chart(r, loader))?;
@@ -419,7 +494,9 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
         };
         Ok((policy, play_type))
     })?;
-    let devices = read_section(&mut r, Section::Devices, |r| read_devices(r, limits))?;
+    let devices = read_section(&mut r, Section::Devices, |r| {
+        read_devices(r, version, limits)
+    })?;
     let n_sources = devices.sources.len();
     let start = read_section(&mut r, Section::Start, |r| read_start(r, n_sources))?;
     let events = read_section(&mut r, Section::Events, |r| {
@@ -510,7 +587,18 @@ fn read_kind(r: &mut Reader<'_>) -> Result<DeviceKind, DecodeError> {
     }
 }
 
-fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecord, DecodeError> {
+fn read_lane(r: &mut Reader<'_>) -> Result<Lane, DecodeError> {
+    u8::try_from(r.uint()?)
+        .ok()
+        .and_then(Lane::new)
+        .ok_or(DecodeError::InvalidValue("lane"))
+}
+
+fn read_devices(
+    r: &mut Reader<'_>,
+    version: u16,
+    limits: &DecodeLimits,
+) -> Result<DeviceRecord, DecodeError> {
     let n = r.uint()?;
     if n == 0 {
         return Err(DecodeError::NoSources);
@@ -532,19 +620,21 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
         let mut bindings = Vec::with_capacity(nb);
         for _ in 0..nb {
             let control = ControlId(r.u32()?);
-            let lane = u8::try_from(r.uint()?)
-                .ok()
-                .and_then(Lane::new)
-                .ok_or(DecodeError::InvalidValue("lane"))?;
+            let lane = read_lane(r)?;
             bindings.push(Binding { control, lane });
         }
+        let axes = if version >= AXES_VERSION {
+            read_axes(r)?
+        } else {
+            Vec::new()
+        };
         sources.push(SourceRecord {
             kind,
             receive,
             profile: SourceProfile {
                 input_offset,
                 bindings,
-                axes: Vec::new(),
+                axes,
             },
         });
     }
@@ -555,6 +645,39 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
         audio_offset,
         display_offset,
     })
+}
+
+fn read_axes(r: &mut Reader<'_>) -> Result<Vec<AxisBinding>, DecodeError> {
+    // Control, lane, mode, invert, two thresholds and the release time.
+    let n = r.count(7)?;
+    let mut axes = Vec::with_capacity(n);
+    for _ in 0..n {
+        let control = ControlId(r.u32()?);
+        let lane = read_lane(r)?;
+        let mode = match r.uint()? {
+            0 => AxisMode::Absolute { wrap: r.u32()? },
+            1 => AxisMode::Relative,
+            _ => return Err(DecodeError::InvalidValue("axis mode")),
+        };
+        let invert = match r.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(DecodeError::InvalidValue("axis inversion")),
+        };
+        let scratch = ScratchSettings {
+            mode,
+            invert,
+            press_threshold: r.u32()?,
+            hold_threshold: r.u32()?,
+            release_after_us: r.u32()?,
+        };
+        axes.push(AxisBinding {
+            control,
+            lane,
+            scratch,
+        });
+    }
+    Ok(axes)
 }
 
 fn read_source(r: &mut Reader<'_>, n_sources: usize) -> Result<SourceId, DecodeError> {
