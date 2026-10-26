@@ -23,6 +23,8 @@ pub struct Wake {
 pub enum OutputError {
     /// The device went away.
     DeviceLost,
+    /// No buffer event came within the output's timeout.
+    Stalled,
     /// Any other device error, with the platform's code.
     Failed(i32),
 }
@@ -31,6 +33,7 @@ impl fmt::Display for OutputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DeviceLost => write!(f, "the audio device went away"),
+            Self::Stalled => write!(f, "the audio device stopped signaling buffer events"),
             Self::Failed(code) => write!(f, "the audio device failed ({code:#010x})"),
         }
     }
