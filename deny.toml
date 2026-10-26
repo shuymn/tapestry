@@ -8,8 +8,17 @@ targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 all-features = true
 
 [advisories]
-# Defaults: vulnerabilities, unmaintained and unsound crates, and yanked
-# versions are errors.
+# Vulnerabilities are errors (cargo-deny has no setting to lower them). The
+# scopes below cover every crate in the graph, not only the workspace's direct
+# dependencies (the pinned default for `unsound` is "workspace"), and a yanked
+# version is an error (the default is a warning).
+#
+# cargo-audit also runs (`cargo audit --deny warnings`): cargo-deny checks the
+# graph configured above (`[graph] targets`, all features), while cargo-audit
+# checks every package in Cargo.lock and fails on any advisory warning.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
 
 [licenses]
 # Check dev-dependencies too, so a third-party GPL crate cannot enter a

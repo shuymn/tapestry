@@ -1,0 +1,42 @@
+name: Audit
+
+# The advisory checks from CI on a schedule, so advisories published while the
+# repository is idle are reported. A failed scheduled run notifies the user who
+# last changed the cron below. Pull requests that change this workflow or
+# deny.toml also run it.
+
+on:
+  schedule:
+    - cron: "41 20 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/audit.yml
+      - deny.toml
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.3
+          install: true
+          cache: true
+      - name: cargo-deny
+        run: mise exec -- cargo deny check advisories
+      - name: cargo-audit
+        run: mise exec -- cargo audit --deny warnings
