@@ -597,6 +597,19 @@ impl Measure {
         self.on_screen.presented(count);
         if let Some(s) = self.filter.accept(d.statistics) {
             let sync = (s.sync_qpc_time, s.sync_refresh_count);
+            // A sync whose refresh count disagrees with the time since the
+            // last one by more than a quarter of the reported refresh (the
+            // count of a composed window and of independent flip differ)
+            // starts the period over from it.
+            if let (Some(last), Some(rough)) = (self.last_sync, self.period_qpc) {
+                let n = i64::from(sync.1.wrapping_sub(last.1));
+                if n <= 0
+                    || n > i64::from(u32::MAX / 2)
+                    || ((sync.0 - last.0) - n * rough).abs() > n * rough / 4
+                {
+                    self.first_sync = Some(sync);
+                }
+            }
             let first = *self.first_sync.get_or_insert(sync);
             self.last_sync = Some(sync);
             // The measured period once the syncs span enough refreshes; the
@@ -998,6 +1011,47 @@ mod frame_tests {
         assert_eq!(second.render_cpu.unwrap().count, 1);
         assert_eq!(second.press_to_screen_unavailable, 0);
         assert_eq!(second.present_times.as_deref(), Some(&[2_100_000][..]));
+    }
+
+    /// A swap chain moving from composition to independent flip changes
+    /// the refresh count's domain (this PC: 8 605 919 to 1 050 175 581
+    /// within one refresh): the period is measured again from there, at
+    /// 4 ms, and refreshes count on it.
+    #[test]
+    fn a_jump_in_refresh_counts_measures_the_period_again() {
+        let mut r = rig();
+        r.m.start(play(1, TimeUs(1_000_000)));
+        let clock = r.clock;
+        let ticks = |us: i64| clock_qpc(&clock, TimeUs(us));
+        let stats = |present: u32, count: u32, us: i64| FrameStatistics {
+            present_count: present,
+            present_refresh_count: count,
+            sync_refresh_count: count,
+            sync_qpc_time: ticks(us),
+        };
+        let mut at = 1_100_000;
+        r.m.frame(&drawn(&[], Some(1), 100, Some(stats(1, 8_605_918, at)), at));
+        at += 4_000;
+        r.m.frame(&drawn(
+            &[],
+            Some(2),
+            100,
+            Some(stats(2, 1_050_175_581, at)),
+            at,
+        ));
+        for k in 3..80_u32 {
+            at += 4_000;
+            let s = stats(k, 1_050_175_579 + k, at);
+            r.m.frame(&drawn(&[], Some(k), 100, Some(s), at));
+        }
+        let fig = r.m.finish(TimeUs(at + 1)).unwrap();
+        // 4 ms within the clock's 1 µs flooring.
+        let period = fig.refresh_period_ns.unwrap();
+        assert!((3_990_000..=4_010_000).contains(&period), "{period}");
+        // The interval across the jump has no evidence; the 77 after it
+        // count, none lost.
+        assert_eq!(fig.refreshes.lost(), Some(0));
+        assert!(fig.refreshes.counted >= 60, "{:?}", fig.refreshes);
     }
 
     /// A frame presented without a present count makes only its own
