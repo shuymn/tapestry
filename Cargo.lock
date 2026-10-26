@@ -1255,8 +1255,10 @@ dependencies = [
  "input",
  "render",
  "replay",
+ "rtrb",
  "rules",
  "tempfile",
+ "toml",
  "windows",
  "winit",
 ]

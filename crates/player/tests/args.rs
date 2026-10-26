@@ -138,3 +138,39 @@ fn dev_options_are_taken_with_the_feature() {
         assert!(stderr.contains("missing."), "{stderr}");
     }
 }
+
+/// `measure` exists only in development builds: production treats it as
+/// any other unknown argument.
+#[cfg(not(feature = "dev-tools"))]
+#[test]
+fn measure_is_unknown_without_feature() {
+    assert_unknown(&["measure", "play", "a.bms"], "measure");
+    assert_unknown(&["measure"], "measure");
+}
+
+/// The positive control: a development build takes `measure play`, and
+/// without PresentMon it fails with the reason before anything starts.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn measure_play_needs_presentmon() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("PresentMon.exe");
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("measure")
+        .arg("play")
+        .arg(dir.path().join("missing.bms"))
+        .env("LOCALAPPDATA", dir.path())
+        .env("TAPESTRY_PRESENTMON", &missing)
+        .output()
+        .expect("run tapestry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("TAPESTRY_PRESENTMON names"), "{stderr}");
+    assert!(!stderr.contains("unknown argument"), "{stderr}");
+    // Nothing was started, so no capture was made.
+    assert!(!dir.path().join("tapestry").join("measure").exists());
+    assert_unknown(&["measure", "run", "a.bms"], "run");
+    assert_unknown(&["measure", "play", "a.bms", "b.bms"], "b.bms");
+    let usage = run(&["measure"]);
+    assert_eq!(usage.status.code(), Some(2));
+}

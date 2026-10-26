@@ -31,6 +31,8 @@ pub struct Controls {
     focused: AtomicBool,
     latch: OnceLock<FocusLatch>,
     tuning: Arc<LiveTuning>,
+    /// Whether the measurement overlay shows (D11).
+    overlay: Arc<AtomicBool>,
 }
 
 impl Controls {
@@ -60,12 +62,23 @@ impl Controls {
             focused: AtomicBool::new(true),
             latch: OnceLock::new(),
             tuning,
+            overlay: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// The values the settings keys step.
     pub const fn tuning(&self) -> &Arc<LiveTuning> {
         &self.tuning
+    }
+
+    /// Whether the measurement overlay shows, for the render thread.
+    pub const fn overlay(&self) -> &Arc<AtomicBool> {
+        &self.overlay
+    }
+
+    /// Shows the measurement overlay if hidden, hides it if shown.
+    pub fn toggle_overlay(&self) {
+        self.overlay.fetch_xor(true, Ordering::AcqRel);
     }
 
     /// Hands over the input side's focus latch, once.

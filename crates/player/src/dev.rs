@@ -24,6 +24,7 @@ use input::{DeviceKind, QpcClock, ScriptedInput, SourceSet};
 use replay::DecodeLimits;
 
 use crate::input_side::Hook;
+use crate::measure::Drawn;
 use crate::render_side::{FrameSink, Screen};
 
 /// Handles a development-only argument, or returns `None` for any other one.
@@ -287,6 +288,7 @@ impl ScriptThread {
         let handle = std::thread::Builder::new()
             .name("scripted input".into())
             .spawn(move || {
+                crate::alloc_count::tag(crate::alloc_count::Tag::Input);
                 while !thread_stop.load(Ordering::Acquire) {
                     hook.wake(&mut sources, clock.now());
                     std::thread::sleep(Duration::from_millis(1));
@@ -317,6 +319,13 @@ pub fn recording_output(clock: QpcClock, seconds: usize) -> Paced<RecordingOutpu
     Paced {
         inner: RecordingOutput::new(device, 48_000 * seconds),
         clock,
+    }
+}
+
+impl Paced<RecordingOutput<SimDevice>> {
+    /// Periods the simulated device keeps queued.
+    pub fn queued_periods(&self) -> u32 {
+        self.inner.inner().config().queue_periods
     }
 }
 
@@ -394,8 +403,11 @@ impl FrameDump {
 }
 
 impl FrameSink for FrameDump {
-    fn frame(&mut self, screen: &dyn Screen, play: Option<TimeUs>) {
-        match play {
+    fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
+        if !drawn.timing.presented {
+            return;
+        }
+        match drawn.play {
             Some(t) if t.0 < 0 && !self.countdown => {
                 self.countdown = true;
                 self.save(screen, "countdown.png");

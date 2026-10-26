@@ -28,6 +28,7 @@ game.workspace = true
 input.workspace = true
 render.workspace = true
 replay.workspace = true
+rtrb.workspace = true
 rules.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
@@ -39,6 +40,7 @@ winit.workspace = true
 [dev-dependencies]
 bms-parser.workspace = true
 tempfile.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

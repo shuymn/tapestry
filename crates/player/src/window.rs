@@ -163,6 +163,8 @@ pub struct Surface {
     pub width: u32,
     /// See `width`.
     pub height: u32,
+    /// The refresh rate of the window's monitor, mHz, when known.
+    pub refresh_mhz: Option<u32>,
 }
 
 fn surface(window: &Window) -> Result<Surface, String> {
@@ -177,6 +179,9 @@ fn surface(window: &Window) -> Result<Surface, String> {
         hwnd: h.hwnd,
         width: size.width,
         height: size.height,
+        refresh_mhz: window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz()),
     })
 }
 
@@ -209,6 +214,7 @@ struct Keys {
     retry: Option<PhysicalKey>,
     quit: Option<PhysicalKey>,
     settings: [(PhysicalKey, Adjust); 8],
+    overlay: PhysicalKey,
 }
 
 impl Keys {
@@ -218,17 +224,21 @@ impl Keys {
             retry: retry.map(window_key),
             quit: quit.map(window_key),
             settings: Adjust::ALL.map(|a| (window_key(a.key()), a)),
+            overlay: window_key(game::OVERLAY_KEY),
         }
     }
 }
 
 /// A key pressed in the window. A settings key steps again while held
-/// (key repeat); retry and quit act on the first press only.
+/// (key repeat); the overlay key, retry and quit act on the first press
+/// only.
 fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &Keys) {
     if let Some(&(_, a)) = keys.settings.iter().find(|(k, _)| *k == key) {
         controls.tuning().adjust(a);
     } else if repeat {
-        // Retry and quit take the first press only.
+        // The others take the first press only.
+    } else if key == keys.overlay {
+        controls.toggle_overlay();
     } else if Some(key) == keys.retry {
         controls.command(Command::Retry);
     } else if Some(key) == keys.quit {
@@ -296,8 +306,9 @@ mod tests {
             }
             let c = Controls::new(QpcClock::start());
             key_pressed(&c, pressed, false, &Keys::new(Some(control), None));
-            // A settings key's scan code steps the setting instead.
-            if Adjust::from_key(control).is_none() {
+            // A settings key's scan code steps the setting instead, and
+            // the overlay key's toggles the overlay.
+            if Adjust::from_key(control).is_none() && control != game::OVERLAY_KEY {
                 assert_eq!(c.take(), Some(Command::Retry), "{control:#x}");
             }
         }
@@ -327,6 +338,26 @@ mod tests {
             &Keys::new(None, None),
         );
         assert_eq!(c.tuning().get().visible_time_ms, 575);
+    }
+
+    /// F9 shows the measurement overlay and hides it again, on first
+    /// presses only, whatever retry and quit are bound to.
+    #[test]
+    fn the_overlay_key_toggles_the_overlay() {
+        use std::sync::atomic::Ordering;
+        let c = Controls::new(QpcClock::start());
+        let keys = Keys::new(Some(0x0E), Some(0x01));
+        let f9 = PhysicalKey::Code(KeyCode::F9);
+        assert_eq!(window_key(game::OVERLAY_KEY), f9);
+        assert!(!c.overlay().load(Ordering::Acquire));
+        key_pressed(&c, f9, false, &keys);
+        assert!(c.overlay().load(Ordering::Acquire));
+        key_pressed(&c, f9, true, &keys);
+        assert!(c.overlay().load(Ordering::Acquire));
+        key_pressed(&c, f9, false, &keys);
+        assert!(!c.overlay().load(Ordering::Acquire));
+        assert_eq!(c.take(), None);
+        assert!(!c.quitting());
     }
 
     /// Two Raw Input controls are one key in the window exactly when they
