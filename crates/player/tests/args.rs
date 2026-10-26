@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn run(args: &[&str]) -> Output {
@@ -68,29 +69,112 @@ fn missing_chart_exits_one() {
     assert!(dir.path().join("tapestry").join("device.toml").is_file());
 }
 
-/// A chart the loader refuses exits 1 with one line: the chart, then each
-/// cause once.
-#[test]
-fn a_refused_chart_prints_each_cause_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let chart = dir.path().join("lntype2.bms");
+/// A chart the loader refuses, written into `dir`, and the line its
+/// refusal prints.
+fn refused_chart(dir: &Path) -> (PathBuf, String) {
+    let chart = dir.join("lntype2.bms");
     std::fs::write(
         &chart,
         "#PLAYER 1\n#BPM 120\n#LNTYPE 2\n#WAV01 click.wav\n#00151:0101\n",
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .args(["play".as_ref(), chart.as_os_str()])
-        .env("LOCALAPPDATA", dir.path())
-        .output()
-        .expect("run tapestry");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{stderr}");
     let line = format!(
         "{}: the chart cannot be loaded: line 3: unsupported #LNTYPE 2",
         chart.display()
     );
+    (chart, line)
+}
+
+/// `tapestry play <chart>` with its data root under `appdata`.
+fn play_in(chart: &Path, appdata: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .args(["play".as_ref(), chart.as_os_str()])
+        .env("LOCALAPPDATA", appdata)
+        .output()
+        .expect("run tapestry")
+}
+
+/// The messages of a log file's lines, after the time and the level.
+fn log_lines(appdata: &Path) -> Vec<String> {
+    let path = appdata.join("tapestry").join("logs").join("tapestry.log");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    text.lines().map(|l| l[15..].to_owned()).collect()
+}
+
+/// A chart the loader refuses exits 1 with one line: the chart, then each
+/// cause once.
+#[test]
+fn a_refused_chart_prints_each_cause_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (chart, line) = refused_chart(dir.path());
+    let out = play_in(&chart, dir.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
+}
+
+/// The log of a failed run: the run's first line, the same diagnostic line
+/// stderr prints, and the exit code. It is also the positive control of
+/// the cases that write no log.
+#[test]
+fn the_log_records_the_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (chart, line) = refused_chart(dir.path());
+    let out = play_in(&chart, dir.path());
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let logged = log_lines(dir.path());
+    assert!(logged[0].starts_with("tapestry "), "{logged:?}");
+    assert!(logged[0].contains(", command play, unix "), "{logged:?}");
+    let failure = logged.iter().position(|l| *l == line);
+    assert!(failure.is_some(), "{line:?} in {logged:?}");
+    assert_eq!(logged.last().map(String::as_str), Some("exit 1"));
+}
+
+/// A log that cannot be opened (`logs` is a file) changes nothing but one
+/// `log:` line first on stderr: the same exit code and the same lines
+/// after it as a run whose log opens.
+#[test]
+fn an_unwritable_log_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (chart, line) = refused_chart(dir.path());
+    let fine = dir.path().join("fine");
+    let baseline = play_in(&chart, &fine);
+    let broken = dir.path().join("broken");
+    std::fs::create_dir_all(broken.join("tapestry")).unwrap();
+    std::fs::write(broken.join("tapestry").join("logs"), "").unwrap();
+    let out = play_in(&chart, &broken);
+    assert_eq!(out.status.code(), baseline.status.code());
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (first, rest) = stderr.split_once('\n').unwrap();
+    let logs = broken.join("tapestry").join("logs");
+    assert!(
+        first.starts_with(&format!("log: {}: ", logs.display())),
+        "{stderr}"
+    );
+    assert_eq!(rest, String::from_utf8_lossy(&baseline.stderr));
+    assert!(rest.lines().any(|l| l == line), "{stderr}");
+    assert_eq!(out.stdout, baseline.stdout);
+}
+
+/// `--version`, and the probe in development builds, exit 0 and write no
+/// log, nor anything else under the data root.
+#[test]
+fn version_and_probe_write_no_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cases = vec![&["--version"][..]];
+    if cfg!(feature = "dev-tools") {
+        cases.push(&["--dev-tools-probe"]);
+    }
+    for args in cases {
+        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+            .args(args)
+            .env("LOCALAPPDATA", dir.path())
+            .output()
+            .expect("run tapestry");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        assert!(!dir.path().join("tapestry").exists(), "{args:?}");
+    }
 }
 
 #[cfg(not(feature = "dev-tools"))]
@@ -141,7 +225,8 @@ fn dev_tools_probe_runs_with_feature() {
 }
 
 /// Usage errors are found before anything is opened: none of them writes
-/// under the data root. This guards writes under the redirected root, not
+/// under the data root, the log included (the positive control is
+/// `the_log_records_the_failure`). This guards writes under the redirected root, not
 /// every access to it; that parsing does no I/O at all is a rule of
 /// `args.rs` itself.
 #[test]
