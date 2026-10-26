@@ -15,8 +15,9 @@ pub struct FrameInput<'a> {
     /// The display latency offset: how much later than `now` the frame is
     /// expected to reach the screen (design.md "Rendering and Skins").
     pub display_offset: TimeUs,
-    /// Hi-speed as the visible time: from a note's appearance at the top of
-    /// the lane to the judgment line (D9).
+    /// Hi-speed as the visible time (D9): how long a note's center takes
+    /// from the top of the lane to the judgment line while the chart scrolls
+    /// at its initial BPM. The note's edge shows slightly earlier.
     pub visible_time: TimeUs,
     /// The newest play state.
     pub view: &'a PlayView,

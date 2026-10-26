@@ -304,9 +304,7 @@ impl Renderer {
     /// fails validation: the renderer must be built again.
     pub fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
         let start = Instant::now();
-        self.batch.clear();
-        self.skin.build(f, &mut self.batch);
-        self.batch.stage(&mut self.staging);
+        build_frame(self.skin.as_mut(), f, &mut self.batch, &mut self.staging);
         let alpha = self.batch.alpha().len() as u32;
         let sprites = self.staging.len();
         let timing = |cpu, presented| FrameTiming {
@@ -432,6 +430,21 @@ impl Renderer {
         }
         out
     }
+}
+
+/// The app's share of a frame, everything [`Renderer::frame`] does before
+/// calling into wgpu: `skin` builds into the emptied `batch`, which is then
+/// staged into `staging` in drawing order. It allocates nothing once `batch`
+/// and `staging` have room for the batch's capacity.
+pub fn build_frame(
+    skin: &mut dyn PlaySkin,
+    f: &FrameInput<'_>,
+    batch: &mut SpriteBatch,
+    staging: &mut Vec<Sprite>,
+) {
+    batch.clear();
+    skin.build(f, batch);
+    batch.stage(staging);
 }
 
 /// Submits every upload queued on `gpu` and waits until the GPU has done

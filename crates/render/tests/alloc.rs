@@ -1,8 +1,9 @@
 //! After warmup, a frame's app work allocates nothing (design.md "Scope of
-//! No Allocation"): the skin's build into the preallocated [`SpriteBatch`],
-//! with effects, and the staging of the batch into instances. This is the
-//! whole of what `Renderer::frame` does outside wgpu, whose own allocations
-//! are out of scope, so the test drives it without a GPU.
+//! No Allocation"): [`render::build_frame`], the skin's build into the
+//! preallocated [`SpriteBatch`], with effects, and the staging of the batch
+//! into instances. `Renderer::frame` runs the same function before calling
+//! into wgpu, whose own allocations are out of scope, so the test drives it
+//! without a GPU.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bms_model::{ChartBuilder, TimeUs};
 use common::{MS, input, lane, view};
 use eval::{JudgeEvent, JudgeEventKind, LnOutcome};
-use render::{MAX_SPRITES, PlaySkin, SimpleSkin, Sprite, SpriteBatch};
+use render::{MAX_SPRITES, SimpleSkin, Sprite, SpriteBatch};
 use rules::Judgment;
 
 struct Counting;
@@ -161,9 +162,8 @@ fn frame_does_not_allocate_after_warmup() {
             }
         }
         // What `Renderer::frame` does before calling into wgpu.
-        batch.clear();
-        skin.build(&input(&v, now, TimeUs(8 * MS), &effects), &mut batch);
-        batch.stage(&mut staging);
+        let f = input(&v, now, TimeUs(8 * MS), &effects);
+        render::build_frame(&mut skin, &f, &mut batch, &mut staging);
         if frame >= WARMUP {
             drawn += staging.len();
         }

@@ -322,11 +322,15 @@ impl SimpleSkin {
         let start = self.bar_lines.partition_point(|&t| t < from);
         for &t in self.bar_lines[start..].iter().take_while(|&&t| t <= to) {
             let y = scale.y(self.scroll.position_at(t).0);
-            if let Some((y0, y1)) = clip(y - BAR_LINE_H / 2.0, y + BAR_LINE_H / 2.0) {
-                let w = LANES_RIGHT - LANE_LEFT;
-                if !push_rect(out, Blend::Alpha, LANE_LEFT, y0, w, y1 - y0, BAR_LINE) {
-                    return;
-                }
+            if !cap(
+                out,
+                LANE_LEFT,
+                LANES_RIGHT - LANE_LEFT,
+                y,
+                BAR_LINE_H,
+                BAR_LINE,
+            ) {
+                return;
             }
         }
     }
@@ -359,7 +363,7 @@ impl SimpleSkin {
                         };
                         let body = shade(color, LN_BODY_SHADE);
                         let body_ok = match clip(tail, head) {
-                            Some((y0, y1)) => push_rect(out, Blend::Alpha, x, y0, w, y1 - y0, body),
+                            Some((y0, y1)) => rect(out, Blend::Alpha, x, y0, w, y1 - y0, body),
                             None => true,
                         };
                         body_ok
@@ -505,12 +509,13 @@ fn clip(y0: f32, y1: f32) -> Option<(f32, f32)> {
 /// lanes. Returns `false` only when the batch is full.
 fn cap(out: &mut SpriteBatch, x: f32, w: f32, y: f32, h: f32, color: Rgba) -> bool {
     match clip(y - h / 2.0, y + h / 2.0) {
-        Some((y0, y1)) => push_rect(out, Blend::Alpha, x, y0, w, y1 - y0, color),
+        Some((y0, y1)) => rect(out, Blend::Alpha, x, y0, w, y1 - y0, color),
         None => true,
     }
 }
 
-fn push_rect(out: &mut SpriteBatch, blend: Blend, x: f32, y: f32, w: f32, h: f32, c: Rgba) -> bool {
+/// Pushes a solid rectangle; `false` when the batch is full.
+fn rect(out: &mut SpriteBatch, blend: Blend, x: f32, y: f32, w: f32, h: f32, c: Rgba) -> bool {
     out.push(
         blend,
         Sprite {
@@ -519,10 +524,6 @@ fn push_rect(out: &mut SpriteBatch, blend: Blend, x: f32, y: f32, w: f32, h: f32
             color: c,
         },
     )
-}
-
-fn rect(out: &mut SpriteBatch, blend: Blend, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
-    push_rect(out, blend, x, y, w, h, c);
 }
 
 fn text_width(chars: usize, scale: f32) -> f32 {
