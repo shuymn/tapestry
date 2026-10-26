@@ -120,6 +120,17 @@ impl Branches {
                 self.push(Frame::Random { value }, line)?;
             }
             "IF" => {
+                // An #IF met while an #IF of the same #RANDOM is open ends
+                // that one, since #ENDIF is often left out between
+                // consecutive branches. A block nests only inside a new
+                // #RANDOM.
+                let active = if matches!(self.frames.last(), Some(Frame::If { .. })) {
+                    self.frames.pop();
+                    warn(warnings, WarningKind::UnclosedIf);
+                    self.active()
+                } else {
+                    active
+                };
                 let random = self.frames.iter().rev().find_map(|f| match f {
                     Frame::Random { value, .. } => Some(*value),
                     Frame::If { .. } => None,

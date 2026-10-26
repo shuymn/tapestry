@@ -265,3 +265,29 @@ fn branch_records_do_not_change_the_resolved_hash() {
     assert_eq!(b.random_results, vec![3]);
     assert_eq!(a.resolved_hash, b.resolved_hash);
 }
+
+#[test]
+fn if_left_open_ends_at_the_next_if_of_its_random() {
+    let warned = |text: &str| {
+        let loaded = load(text).unwrap();
+        let warnings: Vec<_> = loaded.warnings.iter().map(|w| (w.line, &w.kind)).collect();
+        (keys(&loaded), format!("{warnings:?}"))
+    };
+    // #IF 2 ends #IF 1 (line 5), so its branch is read for value 2 and the
+    // line after its #ENDIF is outside every block.
+    let text = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#IF 2\n#00112:01\n#ENDIF\n#00113:01\n#00111:01\n";
+    let expected = vec![(Some(5), &WarningKind::UnclosedIf)];
+    assert_eq!(warned(text), (vec![1, 2, 3], format!("{expected:?}")));
+    // Twenty #IF lines without #ENDIF stay one block deep.
+    let mut open = String::from("#BPM 120\n#WAV01 click.wav\n#SETRANDOM 20\n");
+    for k in 1..=20 {
+        open.push_str(&format!("#IF {k}\n#{:03}11:01\n", k));
+    }
+    let loaded = load(&open).unwrap();
+    assert_eq!(loaded.chart.lanes[1].len(), 1);
+    assert_eq!(loaded.chart.lanes[1][0].time, TimeUs(40_000_000));
+    // An #IF inside a new #RANDOM still nests: the outer #IF 1 stays open,
+    // so the line after the inner block is read only for value 1.
+    let nested = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#SETRANDOM 3\n#IF 3\n#00112:01\n#ENDIF\n#ENDRANDOM\n#00113:01\n#ENDIF\n#00111:01\n";
+    assert_eq!(keys(&load(nested).unwrap()), vec![1]);
+}

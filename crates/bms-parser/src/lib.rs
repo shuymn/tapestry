@@ -63,12 +63,15 @@
 //!   when the nearest enclosing block's value is `k`; `#ELSE` when no
 //!   earlier branch of its `#IF` was. A `#RANDOM` directly inside another
 //!   ends it, since `#ENDRANDOM` is often left out; `#ELSE` and `#ENDIF`
-//!   also close blocks left open inside their `#IF`. `#IF` outside any block is never taken, and
+//!   also close blocks left open inside their `#IF`, and an `#IF` met while
+//!   an `#IF` of the same `#RANDOM` is open ends that one, with a warning,
+//!   so blocks nest only inside a new `#RANDOM`. `#IF` outside any block is
+//!   never taken, and
 //!   a stray `#ELSE`, `#ENDIF` or `#ENDRANDOM` is ignored, each with a
 //!   warning: the base chart stays playable. An `#IF` still open at the end
 //!   of the file ends there, with a warning. Blocks nest at most
 //!   [`Limits::max_nesting`] deep (an error).
-//! - **Unsupported:** `#LNTYPE 2`, `#LNMODE` other than 1, negative
+//! - **Unsupported:** `#LNTYPE` 2 or higher, `#LNMODE` other than 1, negative
 //!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
 //!   The branching ones are refused even inside a branch not taken.
 //! - **Resolved hash:** covers what the chart resolved to, not the
