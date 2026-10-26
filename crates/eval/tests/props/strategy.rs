@@ -132,6 +132,18 @@ fn rank(raw: (u8, u32)) -> Option<JudgeRank> {
     }
 }
 
+/// An `opened_at` before every receive time of `logs` (they can be
+/// negative), else 0.
+fn opened_before<'a>(logs: impl IntoIterator<Item = &'a PhysicalInputEvent>) -> TimeUs {
+    TimeUs(
+        logs.into_iter()
+            .map(|e| e.received.0 - 1)
+            .min()
+            .unwrap_or(0)
+            .min(0),
+    )
+}
+
 fn build_chart(raw: &RawChart) -> Chart {
     let mut b = ChartBuilder::new(150_000);
     for i in 0..raw.sounds {
@@ -868,7 +880,7 @@ fn target(
 pub fn build_play(raw: &RawPlay) -> Play {
     let chart = build_chart(&raw.chart);
     let mut preset = build_preset(&raw.preset);
-    let (mut device, start, mut logs) = build_log(&raw.log);
+    let (mut device, mut start, mut logs) = build_log(&raw.log);
     let n = logs.len();
     let (windows, final_deadline) = {
         let ev = Evaluator::new(&chart, &preset, &device, &start, 0).unwrap();
@@ -923,6 +935,8 @@ pub fn build_play(raw: &RawPlay) -> Play {
         }
         _ => {}
     }
+    // Recording opened before every event, joint ones included.
+    start.opened_at = opened_before(logs.iter().flatten());
     let capacity = logs
         .iter()
         .zip(&raw.log.sources)
@@ -1227,6 +1241,10 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
         log.push(button(at + (i64::from(hold % 40) + 1) * TICK, 0, l, 0));
     }
     log.sort_by_key(|e| e.received);
+    let start = InputStart {
+        opened_at: opened_before(&log),
+        held: Vec::new(),
+    };
     Widening {
         chart,
         narrow,
@@ -1234,7 +1252,7 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
         input: EvalInput {
             events: log,
             device,
-            start: InputStart::default(),
+            start,
             finalized: None,
         },
     }
