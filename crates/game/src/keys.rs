@@ -144,19 +144,11 @@ impl KeyConfigFlow {
     pub fn current(&self, role: Role) -> Vec<Bound> {
         let mut found = Vec::new();
         for kind in [DeviceKind::Keyboard, DeviceKind::Controller] {
-            let keys = self.current.of(kind);
-            let controls: Vec<u32> = match role {
-                Role::Lane(l) => keys
-                    .lanes
-                    .iter()
-                    .filter(|k| k.lane == l)
-                    .map(|k| k.control)
-                    .collect(),
-                _ if kind != DeviceKind::Keyboard => Vec::new(),
-                Role::Retry => keys.retry.into_iter().collect(),
-                Role::Quit => keys.quit.into_iter().collect(),
-            };
-            found.extend(controls.into_iter().map(|control| Bound { kind, control }));
+            if kind != DeviceKind::Keyboard && !matches!(role, Role::Lane(_)) {
+                continue;
+            }
+            let bound = self.current.of(kind).roles().filter(|&(_, r)| r == role);
+            found.extend(bound.map(|(control, _)| Bound { kind, control }));
         }
         found
     }
@@ -215,13 +207,14 @@ impl KeyConfigFlow {
             vec![pressed]
         };
         self.bound.push((role, chosen.clone()));
-        if let Err(e) = Self::configs(&self.bound).check() {
+        let candidate = Self::configs(&self.bound);
+        if let Err(e) = candidate.check() {
             self.bound.pop();
             return self.refuse(Refusal::Key(e));
         }
         self.refused = None;
         if self.role().is_none() {
-            return Press::Done(Self::configs(&self.bound));
+            return Press::Done(candidate);
         }
         Press::Bound(role, chosen)
     }

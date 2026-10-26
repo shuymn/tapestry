@@ -272,8 +272,7 @@ impl Drop for Stop {
 /// The scripted input thread: the input thread's boundary every
 /// millisecond, the script fed by the hook. Stops when dropped.
 pub struct ScriptThread {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    _stop: Stop,
 }
 
 impl ScriptThread {
@@ -295,18 +294,11 @@ impl ScriptThread {
             })
             .map_err(|e| format!("the scripted input thread cannot start: {e}"))?;
         Ok(Self {
-            stop,
-            handle: Some(handle),
+            _stop: Stop {
+                stop,
+                handle: Some(handle),
+            },
         })
-    }
-}
-
-impl Drop for ScriptThread {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
     }
 }
 
