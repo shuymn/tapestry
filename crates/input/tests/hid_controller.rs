@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind};
-use input::hid::{axis_control, button_control, is_axis};
+use input::hid::{axis_control, button_control, in_collection, is_axis};
 use input::{
     Capture, DeviceKind, FocusLatch, InputThread, QpcClock, SourceConfig, SourceReader, SourceSet,
-    controller_axes, hid_usages,
+    controller_layouts, hid_usages,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -103,15 +103,23 @@ fn hid_controller_round_trip() {
         println!("  usage page {page:#06x} usage {usage:#06x} controller {controller}");
     }
     assert!(controllers > 0, "no game controller is connected");
-    for (i, axes) in controller_axes().unwrap().iter().enumerate() {
-        println!("controller {i}: {} axes", axes.len());
-        for a in axes {
+    let layouts = controller_layouts().unwrap();
+    // Declared values per revolution by axis control, for the summary.
+    let mut declared = BTreeMap::new();
+    for l in &layouts {
+        println!(
+            "collection {} of controller source {}: grouped by container {}, {} axes",
+            l.collection,
+            l.source,
+            l.grouped,
+            l.axes.len()
+        );
+        for a in &l.axes {
             println!(
-                "  axis usage {:#06x}: relative {}, values per revolution {}",
-                a.control.0 & 0xFFFF,
-                a.relative,
-                a.wrap
+                "  axis {:#010x}: relative {}, declared values per revolution {}",
+                a.control.0, a.relative, a.wrap
             );
+            declared.insert(a.control.0, a.wrap);
         }
     }
 
@@ -125,8 +133,11 @@ fn hid_controller_round_trip() {
     .unwrap();
     let _ = LATCH.set(sources.gate().handle());
     let window = foreground_window();
-    let mut recorded: Vec<ControlId> = (1..=32).map(button_control).collect();
-    recorded.extend((0x30..=0x38).map(|u| axis_control(0x01, u)));
+    let mut recorded: Vec<ControlId> = Vec::new();
+    for c in layouts.iter().map(|l| l.collection) {
+        recorded.extend((1..=32).map(|b| in_collection(button_control(b), c)));
+        recorded.extend((0x30..=0x38).map(|u| in_collection(axis_control(0x01, u), c)));
+    }
     let (tx, rx) = mpsc::channel::<(Vec<SourceReader>, Vec<DeviceKind>)>();
     let (tripped_tx, tripped_rx) = mpsc::channel::<()>();
     let mut opened = false;
@@ -158,7 +169,8 @@ fn hid_controller_round_trip() {
     println!("press buttons and turn the turntable for 20 s");
     // Per source: button presses by number, and reports per axis.
     let mut buttons: Vec<BTreeMap<u32, usize>> = vec![BTreeMap::new(); readers.len()];
-    let mut axes: Vec<BTreeMap<u32, usize>> = vec![BTreeMap::new(); readers.len()];
+    // Per axis: reports, and the lowest and highest value seen.
+    let mut axes: Vec<BTreeMap<u32, (usize, i32, i32)>> = vec![BTreeMap::new(); readers.len()];
     let end = Instant::now() + Duration::from_secs(20);
     while Instant::now() < end {
         pump();
@@ -167,7 +179,8 @@ fn hid_controller_round_trip() {
                 assert_eq!(e.source.index(), i);
                 if let InputKind::Control { control, value } = e.kind {
                     if is_axis(control) {
-                        *axes[i].entry(control.0).or_default() += 1;
+                        let a = axes[i].entry(control.0).or_insert((0, value, value));
+                        *a = (a.0 + 1, a.1.min(value), a.2.max(value));
                     } else if value != 0 {
                         *buttons[i].entry(control.0).or_default() += 1;
                     }
@@ -191,8 +204,11 @@ fn hid_controller_round_trip() {
         for (b, n) in &buttons[i] {
             println!("  button {b}: {n} presses");
         }
-        for (a, n) in &axes[i] {
-            println!("  axis usage {:#06x}: {n} reports", a & 0xFFFF);
+        for (a, (n, min, max)) in &axes[i] {
+            println!(
+                "  axis {a:#010x}: {n} reports, observed {min}..={max}, declared {} values",
+                declared.get(a).copied().unwrap_or(0)
+            );
         }
         if !buttons[i].is_empty() && !axes[i].is_empty() {
             complete += 1;

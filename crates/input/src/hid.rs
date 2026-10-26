@@ -3,12 +3,15 @@
 //!
 //! The Windows side reads a report's pressed buttons and axis values with
 //! the HID parser and hands them over as a [`HidReport`]; [`HidDevice`]
-//! compares it with the device's last report and turns each change into a
-//! [`Packet`] for the [`SourceSet`], and offers presses and turns to the
-//! key config's [`Capture`].
+//! compares it with the collection's last report and turns each change
+//! into a [`Packet`] for the [`SourceSet`], and offers presses and turns to
+//! the key config's [`Capture`].
 //!
-//! A controller is one device and so one source, owning its buttons and
-//! axes alike (stage1.md D6).
+//! Windows exposes each top-level collection of a controller as a device
+//! of its own. The collections of one physical controller share one
+//! [`DeviceId`], so they are one source owning its buttons and axes alike
+//! (stage1.md D6); each collection's controls carry its collection number
+//! ([`in_collection`]), so they stay distinct within the source.
 
 use eval::ControlId;
 
@@ -26,28 +29,43 @@ pub const AXIS_USAGES: std::ops::RangeInclusive<u16> = 0x30..=0x38;
 
 /// The highest button usage read; higher buttons are ignored.
 pub const MAX_BUTTON: u16 = 128;
-/// The most axes read per device; further ones are ignored.
+/// The most axes read per collection; further ones are ignored.
 pub const MAX_AXES: usize = 16;
+/// The most report ids whose buttons are told apart per collection.
+pub const MAX_REPORT_IDS: usize = 16;
+/// The longest input report read, in bytes. A longer one is not read, and
+/// the recording is marked incomplete ([`SourceSet::input_lost`]).
+pub const MAX_REPORT_BYTES: usize = 4096;
 
-/// The control of button `usage` (page 9): its number, from 1. Buttons are
-/// below `0x1_0000`, axes above.
+/// The control of button `usage` (page 9): its number, from 1, in
+/// collection 0. Within a collection buttons are below `0x1_0000` and axes
+/// above.
 #[must_use]
 pub const fn button_control(usage: u16) -> ControlId {
     ControlId(usage as u32)
 }
 
-/// The control of the axis with usage `usage` on page `page`:
-/// `page << 16 | usage`, so X of the generic desktop page is `0x1_0030`.
+/// The control of the axis with usage `usage` on page `page`, in
+/// collection 0: `page << 16 | usage`, so X of the generic desktop page is
+/// `0x1_0030`.
 #[must_use]
 pub const fn axis_control(page: u16, usage: u16) -> ControlId {
-    ControlId((page as u32) << 16 | usage as u32)
+    ControlId(((page as u32) << 16) | usage as u32)
+}
+
+/// `control` of collection `collection` of a controller: the collection
+/// number in the top 8 bits. Collection 0 is the controller's only
+/// collection, or one Windows did not number.
+#[must_use]
+pub const fn in_collection(control: ControlId, collection: u8) -> ControlId {
+    ControlId((control.0 & 0x00FF_FFFF) | ((collection as u32) << 24))
 }
 
 /// Whether a controller's control is an axis ([`axis_control`]) rather than
-/// a button.
+/// a button, in any collection.
 #[must_use]
 pub const fn is_axis(control: ControlId) -> bool {
-    control.0 >= 0x1_0000
+    control.0 & 0x00FF_FFFF >= 0x1_0000
 }
 
 /// A raw value of `bits` bits as the axis reports it: sign-extended when
@@ -61,15 +79,48 @@ pub const fn axis_value(raw: u32, bits: u16, signed: bool) -> i32 {
     ((raw << shift) as i32) >> shift
 }
 
-/// What a device's axis is.
+/// The values an absolute axis reports, `max − min + 1`, from its declared
+/// logical range: one revolution of a turntable. A field unsigned to its
+/// full width declares its maximum as a negative number (0xFFFF read as
+/// -1), which is read back unsigned. `None` when the count does not fit in
+/// a `u32` (a full 32-bit field) or the range is empty: such an axis is not
+/// read.
+#[must_use]
+pub fn axis_span(min: i32, max: i32, bits: u16) -> Option<u32> {
+    let max = if max < min && (1..32).contains(&bits) {
+        i64::from(max.cast_unsigned() & ((1_u32 << bits) - 1))
+    } else {
+        i64::from(max)
+    };
+    let span = max - i64::from(min) + 1;
+    u32::try_from(span).ok().filter(|&s| s > 0)
+}
+
+/// The collection number Windows gives a controller's top-level collection
+/// in its interface path (`&Col02` is 2), or 0 when the path has none.
+#[must_use]
+pub fn collection_of(path: &[u16]) -> u8 {
+    let lower = |c: u16| u8::try_from(c).map_or(0, |b| b.to_ascii_lowercase());
+    let marker = b"&col";
+    path.windows(marker.len() + 2)
+        .find(|w| w.iter().zip(marker).all(|(&c, &m)| lower(c) == m))
+        .and_then(|w| {
+            let hex = |c: u16| char::from(lower(c)).to_digit(16);
+            Some(hex(w[4])? * 16 + hex(w[5])?)
+        })
+        .and_then(|n| u8::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+/// What a collection's axis is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AxisCap {
-    /// Its control ([`axis_control`]).
+    /// Its control ([`axis_control`] in its collection).
     pub control: ControlId,
     /// Whether each report is a movement rather than a position.
     pub relative: bool,
-    /// For an absolute axis, the number of values it reports (logical
-    /// maximum − minimum + 1), as one revolution; 0 if unknown.
+    /// For an absolute axis, the values it reports ([`axis_span`]), as one
+    /// revolution; 0 for a relative one.
     pub wrap: u32,
 }
 
@@ -79,11 +130,35 @@ const NO_AXIS: AxisCap = AxisCap {
     wrap: 0,
 };
 
+/// The buttons one report id carries: bit `n − 1` is button `n`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ButtonGroup {
+    /// The report id; 0 for a collection without report ids.
+    pub report_id: u8,
+    /// The buttons it carries.
+    pub buttons: u128,
+}
+
+/// What a collection reports, read from its descriptor once.
+#[derive(Clone, Copy, Debug)]
+pub struct HidLayout<'a> {
+    /// Its collection number ([`collection_of`]).
+    pub collection: u8,
+    /// Its axes, with their controls in the collection, at most
+    /// [`MAX_AXES`]; more are ignored.
+    pub axes: &'a [AxisCap],
+    /// Which buttons each report id carries, at most [`MAX_REPORT_IDS`].
+    /// Empty: every report carries every button.
+    pub buttons: &'a [ButtonGroup],
+}
+
 /// One input report as the HID parser read it.
 #[derive(Clone, Copy, Debug)]
 pub struct HidReport<'a> {
+    /// Its report id; 0 for a collection without report ids.
+    pub id: u8,
     /// The pressed button usages, or `None` when this report does not carry
-    /// the buttons (a device with several report ids).
+    /// buttons.
     pub buttons: Option<&'a [u16]>,
     /// Each axis's value, in the order of [`HidDevice::axes`]; `None` for an
     /// axis this report does not carry.
@@ -97,13 +172,16 @@ pub fn capture_travel(cap: &AxisCap) -> i64 {
     i64::from((cap.wrap / 16).max(16))
 }
 
-/// A HID controller's last report, to turn the next into packets. Fixed
-/// size: it allocates nothing.
+/// A collection's last report, to turn the next into packets. Fixed size:
+/// it allocates nothing.
 #[derive(Clone, Debug)]
 pub struct HidDevice {
     device: DeviceId,
+    collection: u8,
     caps: [AxisCap; MAX_AXES],
     n_axes: usize,
+    groups: [ButtonGroup; MAX_REPORT_IDS],
+    n_groups: usize,
     /// Bit `n − 1` is button `n`.
     pressed: u128,
     /// Each absolute axis's last value.
@@ -116,17 +194,26 @@ pub struct HidDevice {
 }
 
 impl HidDevice {
-    /// A device with these axes (at most [`MAX_AXES`]; more are ignored),
-    /// no button pressed and no axis value seen.
+    /// A collection of `device` laid out as `layout`, no button pressed and
+    /// no axis value seen.
     #[must_use]
-    pub fn new(device: DeviceId, axes: &[AxisCap]) -> Self {
+    pub fn new(device: DeviceId, layout: &HidLayout<'_>) -> Self {
         let mut caps = [NO_AXIS; MAX_AXES];
-        let n_axes = axes.len().min(MAX_AXES);
-        caps[..n_axes].copy_from_slice(&axes[..n_axes]);
+        let n_axes = layout.axes.len().min(MAX_AXES);
+        caps[..n_axes].copy_from_slice(&layout.axes[..n_axes]);
+        let mut groups = [ButtonGroup {
+            report_id: 0,
+            buttons: 0,
+        }; MAX_REPORT_IDS];
+        let n_groups = layout.buttons.len().min(MAX_REPORT_IDS);
+        groups[..n_groups].copy_from_slice(&layout.buttons[..n_groups]);
         Self {
             device,
+            collection: layout.collection,
             caps,
             n_axes,
+            groups,
+            n_groups,
             pressed: 0,
             values: [None; MAX_AXES],
             travel: [0; MAX_AXES],
@@ -134,7 +221,7 @@ impl HidDevice {
         }
     }
 
-    /// The device.
+    /// The device, shared by the controller's collections.
     #[must_use]
     pub const fn device(&self) -> DeviceId {
         self.device
@@ -146,12 +233,28 @@ impl HidDevice {
         &self.caps[..self.n_axes]
     }
 
-    /// Turns one report into packets for `sources`, in order: buttons
-    /// released or pressed since the last report, by number, then each axis
-    /// whose position changed or that reported a movement. Button presses
-    /// are offered to `capture`, and so is an axis once it has turned
-    /// [`capture_travel`] since the capture was armed. `background` is the
-    /// packet's Raw Input mark.
+    /// The buttons report `id` carries.
+    fn carried(&self, id: u8) -> u128 {
+        if self.n_groups == 0 {
+            return !0;
+        }
+        self.groups[..self.n_groups]
+            .iter()
+            .filter(|g| g.report_id == id)
+            .fold(0, |bits, g| bits | g.buttons)
+    }
+
+    /// Turns one report into packets for `sources`, in order: the buttons
+    /// it carries released or pressed since the last report, by number,
+    /// then each axis whose position changed or that reported a movement.
+    /// Buttons it does not carry keep their state. Button presses are
+    /// offered to `capture`, and so is an axis once it has turned
+    /// [`capture_travel`] since the capture was armed.
+    ///
+    /// `background` is the packet's Raw Input mark: a background report
+    /// trips the focus gate even when nothing in it changed
+    /// ([`SourceSet::background`]), and the physical state still follows
+    /// it.
     pub fn report(
         &mut self,
         report: &HidReport<'_>,
@@ -159,20 +262,26 @@ impl HidDevice {
         capture: &Capture,
         sources: &mut SourceSet,
     ) {
+        if background {
+            sources.background();
+        }
         let recording = sources.is_recording();
+        let (device, collection) = (self.device, self.collection);
         let packet = |control, value| Packet {
-            device: self.device,
-            control,
+            device,
+            control: in_collection(control, collection),
             value,
             background,
         };
         if let Some(buttons) = report.buttons {
+            let carried = self.carried(report.id);
             let now = buttons
                 .iter()
                 .filter(|&&u| (1..=MAX_BUTTON).contains(&u))
-                .fold(0_u128, |bits, &u| bits | 1 << (u - 1));
-            let mut changed = now ^ self.pressed;
-            self.pressed = now;
+                .fold(0_u128, |bits, &u| bits | 1 << (u - 1))
+                & carried;
+            let mut changed = (now ^ self.pressed) & carried;
+            self.pressed = (self.pressed & !carried) | now;
             while changed != 0 {
                 let bit = changed.trailing_zeros();
                 changed &= changed - 1;
@@ -210,10 +319,26 @@ impl HidDevice {
             *travel = travel.saturating_add(moved);
             if travel.abs() >= capture_travel(&cap) {
                 *travel = 0;
-                capture.offer(&packet(cap.control, 1), DeviceKind::Controller, recording);
+                let offer = Packet { value: 1, ..p };
+                capture.offer(&offer, DeviceKind::Controller, recording);
             }
         }
     }
+}
+
+/// Copies `report` into `buf` to be parsed, if it fits; a report longer
+/// than `buf` is lost input, and marks the recording incomplete.
+pub fn read_report<'a>(
+    report: &[u8],
+    buf: &'a mut [u8],
+    sources: &mut SourceSet,
+) -> Option<&'a mut [u8]> {
+    let Some(copy) = buf.get_mut(..report.len()) else {
+        sources.input_lost();
+        return None;
+    };
+    copy.copy_from_slice(report);
+    Some(copy)
 }
 
 /// `d` the short way round `wrap` values; unchanged when `wrap` is 0.

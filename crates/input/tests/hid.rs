@@ -7,8 +7,8 @@
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use input::hid::{
-    AxisCap, HidDevice, HidReport, axis_control, axis_value, button_control, capture_travel,
-    is_axis,
+    AxisCap, ButtonGroup, HidDevice, HidLayout, HidReport, axis_control, axis_span, axis_value,
+    button_control, capture_travel, collection_of, in_collection, is_axis, read_report,
 };
 use input::{Capture, DeviceId, DeviceKind, SourceConfig, SourceReader, SourceSet};
 
@@ -31,9 +31,18 @@ fn caps() -> [AxisCap; 2] {
     ]
 }
 
-/// A set with the controller connected and recording open, recording
-/// buttons 1-4, X and the dial.
-fn recording() -> (SourceSet, SourceReader) {
+/// Collection 0 with `axes` and buttons in every report.
+fn layout(axes: &[AxisCap]) -> HidLayout<'_> {
+    HidLayout {
+        collection: 0,
+        axes,
+        buttons: &[],
+    }
+}
+
+/// A set with the controller and its axes connected, recording buttons
+/// 1-4, X and the dial; recording closed.
+fn connected() -> SourceSet {
     let mut set = SourceSet::new(SourceConfig {
         max_devices: 4,
         max_sources: 4,
@@ -44,10 +53,18 @@ fn recording() -> (SourceSet, SourceReader) {
     .unwrap();
     set.begin_batch(TimeUs(0));
     set.connect(PAD, DeviceKind::Controller);
+    assert!(set.add_axes(PAD, &caps()));
     let mut recorded: Vec<_> = (1..=4).map(button_control).collect();
     recorded.extend([X, DIAL]);
     set.set_recorded(PAD, recorded);
     set.end_batch(TimeUs(0));
+    set
+}
+
+/// A set with the controller connected and recording open, recording
+/// buttons 1-4, X and the dial.
+fn recording() -> (SourceSet, SourceReader) {
+    let mut set = connected();
     set.open_recording(TimeUs(0));
     let reader = set.take_readers().pop().unwrap();
     (set, reader)
@@ -101,7 +118,7 @@ fn controls_are_named_by_usage() {
 fn reports_become_packets_of_changes() {
     let (mut set, mut reader) = recording();
     let capture = Capture::new();
-    let mut dev = HidDevice::new(PAD, &caps());
+    let mut dev = HidDevice::new(PAD, &layout(&caps()));
     batch(
         &mut dev,
         &mut set,
@@ -110,26 +127,31 @@ fn reports_become_packets_of_changes() {
         &[
             // Buttons 1 and 3 down; X first seen at 200; the dial still.
             HidReport {
+                id: 0,
                 buttons: Some(&[3, 1]),
                 axes: &[Some(200), Some(0)],
             },
             // The same state: nothing.
             HidReport {
+                id: 0,
                 buttons: Some(&[1, 3]),
                 axes: &[Some(200), Some(0)],
             },
             // A report without the buttons leaves them as they are; X
             // moves, the dial turns -2 twice.
             HidReport {
+                id: 0,
                 buttons: None,
                 axes: &[Some(201), Some(-2)],
             },
             HidReport {
+                id: 0,
                 buttons: None,
                 axes: &[None, Some(-2)],
             },
             // Button 1 up, 2 down; out-of-range usages are ignored.
             HidReport {
+                id: 0,
                 buttons: Some(&[0, 2, 3, 129, 300]),
                 axes: &[],
             },
@@ -159,7 +181,7 @@ fn more_axes_than_kept_are_ignored() {
             wrap: 0,
         })
         .collect();
-    let dev = HidDevice::new(PAD, &many);
+    let dev = HidDevice::new(PAD, &layout(&many));
     assert_eq!(dev.axes(), &many[..input::hid::MAX_AXES]);
 }
 
@@ -168,7 +190,7 @@ fn capture_takes_buttons_and_turned_axes() {
     let (mut set, _reader) = recording();
     set.close_recording();
     let capture = Capture::new();
-    let mut dev = HidDevice::new(PAD, &caps());
+    let mut dev = HidDevice::new(PAD, &layout(&caps()));
     capture.arm();
     // X wobbles at rest and then turns 15 positions, one short of a
     // sixteenth of its 256: nothing is captured.
@@ -179,6 +201,7 @@ fn capture_takes_buttons_and_turned_axes() {
     let reports: Vec<_> = wobble
         .iter()
         .map(|a| HidReport {
+            id: 0,
             buttons: None,
             axes: a,
         })
@@ -192,6 +215,7 @@ fn capture_takes_buttons_and_turned_axes() {
         &capture,
         20,
         &[HidReport {
+            id: 0,
             buttons: None,
             axes: &[Some(116), None],
         }],
@@ -207,6 +231,7 @@ fn capture_takes_buttons_and_turned_axes() {
         &capture,
         30,
         &[HidReport {
+            id: 0,
             buttons: None,
             axes: &[Some(124), Some(-8)],
         }],
@@ -218,6 +243,7 @@ fn capture_takes_buttons_and_turned_axes() {
         &capture,
         40,
         &[HidReport {
+            id: 0,
             buttons: None,
             axes: &[Some(132), Some(-8)],
         }],
@@ -229,6 +255,7 @@ fn capture_takes_buttons_and_turned_axes() {
         &capture,
         50,
         &[HidReport {
+            id: 0,
             buttons: None,
             axes: &[None, Some(-8)],
         }],
@@ -243,10 +270,12 @@ fn capture_takes_buttons_and_turned_axes() {
         60,
         &[
             HidReport {
+                id: 0,
                 buttons: Some(&[4]),
                 axes: &[],
             },
             HidReport {
+                id: 0,
                 buttons: Some(&[]),
                 axes: &[],
             },
@@ -260,6 +289,7 @@ fn capture_takes_buttons_and_turned_axes() {
     // which would capture), and 10 then makes 16.
     let (high, low, past) = ([Some(250), None], [Some(4), None], [Some(10), None]);
     let at = |axes| HidReport {
+        id: 0,
         buttons: None,
         axes,
     };
@@ -330,4 +360,236 @@ mod blocks {
         assert_eq!(decode_hid(&keyboard), None);
         assert_eq!(decode_hid(&hid(0x51, 0, 3, 2, &data)[..30]), None);
     }
+}
+
+#[test]
+fn absolute_axis_at_zero_is_in_the_snapshot_across_retry() {
+    let mut set = connected();
+    let capture = Capture::new();
+    let mut dev = HidDevice::new(PAD, &layout(&caps()));
+    // The turntable rests at 0; the dial reported a movement once.
+    batch(
+        &mut dev,
+        &mut set,
+        &capture,
+        10,
+        &[HidReport {
+            id: 0,
+            buttons: Some(&[2]),
+            axes: &[Some(0), Some(3)],
+        }],
+    );
+    let first = set.open_recording(TimeUs(20));
+    set.close_recording();
+    // The retry's snapshot still has it, 0 included; a relative axis has
+    // no position.
+    let start = set.open_recording(TimeUs(30));
+    assert_eq!(first.held, start.held);
+    assert_eq!(
+        start.held,
+        [(SourceId(0), button_control(2), 1), (SourceId(0), X, 0)]
+    );
+    // The evaluator's conversion starts from it: the first turn presses.
+    let profile = eval::DeviceProfile {
+        sources: vec![eval::SourceProfile {
+            axes: vec![eval::AxisBinding {
+                control: X,
+                lane: bms_model::Lane::SCRATCH,
+                scratch: eval::ScratchSettings::DEFAULT,
+            }],
+            ..eval::SourceProfile::default()
+        }],
+    };
+    let mut c = eval::ConversionState::init(&profile, &start).unwrap();
+    let turn = PhysicalInputEvent {
+        received: TimeUs(40),
+        source: SourceId(0),
+        kind: InputKind::Control {
+            control: X,
+            value: 2,
+        },
+    };
+    assert_eq!(
+        c.apply(&turn, turn.received).as_slice(),
+        [eval::LaneEdge::Press(bms_model::Lane::SCRATCH)]
+    );
+}
+
+#[test]
+fn unchanged_background_report_trips_the_gate() {
+    let (mut set, mut reader) = recording();
+    let capture = Capture::new();
+    let mut dev = HidDevice::new(PAD, &layout(&caps()));
+    let still = HidReport {
+        id: 0,
+        buttons: Some(&[]),
+        axes: &[None, None],
+    };
+    let press = HidReport {
+        id: 0,
+        buttons: Some(&[1]),
+        axes: &[None, None],
+    };
+    assert!(set.begin_batch(TimeUs(10)));
+    // Nothing changed in the background report, so it makes no packet.
+    dev.report(&still, true, &capture, &mut set);
+    dev.report(&press, false, &capture, &mut set);
+    set.end_batch(TimeUs(11));
+    assert!(set.gate().is_tripped());
+    assert_eq!(drain(&mut reader), []);
+    // The physical state followed: button 1 is held, so the same report
+    // again changes nothing.
+    set.gate_mut().reset();
+    set.open_recording(TimeUs(20));
+    let mut reader = set.take_readers().pop().unwrap();
+    batch(&mut dev, &mut set, &capture, 30, &[press]);
+    assert_eq!(drain(&mut reader), []);
+}
+
+#[test]
+fn each_report_id_changes_only_its_own_buttons() {
+    let (mut set, mut reader) = recording();
+    let capture = Capture::new();
+    let groups = [
+        ButtonGroup {
+            report_id: 1,
+            buttons: 0b0011,
+        },
+        ButtonGroup {
+            report_id: 2,
+            buttons: 0b1100,
+        },
+    ];
+    let mut dev = HidDevice::new(
+        PAD,
+        &HidLayout {
+            collection: 0,
+            axes: &[],
+            buttons: &groups,
+        },
+    );
+    let r = |id, buttons| HidReport {
+        id,
+        buttons: Some(buttons),
+        axes: &[],
+    };
+    batch(
+        &mut dev,
+        &mut set,
+        &capture,
+        10,
+        &[
+            r(1, &[1]),
+            // Report 2 carries buttons 3 and 4 only: button 1 stays down,
+            // and a button it does not carry is ignored.
+            r(2, &[3, 2]),
+            r(1, &[]),
+            r(2, &[3]),
+            // An id with no buttons changes none.
+            r(7, &[4]),
+        ],
+    );
+    assert_eq!(drain(&mut reader), [(1, 1), (3, 1), (1, 0)]);
+}
+
+#[test]
+fn collections_of_one_controller_are_one_source() {
+    let mut set = connected();
+    let x2 = in_collection(X, 2);
+    let b2 = in_collection(button_control(1), 2);
+    set.set_recorded(PAD, vec![button_control(1), b2, x2]);
+    set.open_recording(TimeUs(5));
+    let mut reader = set.take_readers().pop().unwrap();
+    let capture = Capture::new();
+    let mut first = HidDevice::new(PAD, &layout(&[]));
+    let second_axes = [AxisCap {
+        control: x2,
+        relative: false,
+        wrap: 256,
+    }];
+    let mut second = HidDevice::new(
+        PAD,
+        &HidLayout {
+            collection: 2,
+            axes: &second_axes,
+            buttons: &[],
+        },
+    );
+    assert!(set.begin_batch(TimeUs(10)));
+    let button = HidReport {
+        id: 0,
+        buttons: Some(&[1]),
+        axes: &[],
+    };
+    first.report(&button, false, &capture, &mut set);
+    second.report(
+        &HidReport {
+            axes: &[Some(40)],
+            ..button
+        },
+        false,
+        &capture,
+        &mut set,
+    );
+    set.end_batch(TimeUs(11));
+    assert_eq!(
+        drain(&mut reader),
+        [(1, 1), (0x0200_0001, 1), (0x0201_0030, 40)]
+    );
+    assert_eq!(set.participants().count(), 1);
+}
+
+#[test]
+fn controls_carry_their_collection() {
+    assert_eq!(in_collection(X, 2), ControlId(0x0201_0030));
+    assert!(is_axis(in_collection(X, 255)));
+    assert!(!is_axis(in_collection(button_control(5), 2)));
+    assert_eq!(in_collection(in_collection(X, 3), 0), X);
+    let path = |s: &str| s.encode_utf16().collect::<Vec<_>>();
+    assert_eq!(collection_of(&path("hid#vid_0&pid_0&Col02#7&0&0001")), 2);
+    assert_eq!(collection_of(&path("HID#VID_0&PID_0&COL0A#x")), 10);
+    assert_eq!(collection_of(&path("HID#VID_0&PID_0#x")), 0);
+    assert_eq!(collection_of(&path("&colZ1")), 0);
+    assert_eq!(collection_of(&path("&col")), 0);
+}
+
+#[test]
+fn axis_span_is_the_declared_range() {
+    // 8-bit 0..255 and the 0..254 some controllers declare.
+    assert_eq!(axis_span(0, 255, 8), Some(256));
+    assert_eq!(axis_span(0, 254, 8), Some(255));
+    // A 16-bit field unsigned to its full width declares its maximum as -1.
+    assert_eq!(axis_span(0, -1, 16), Some(65_536));
+    assert_eq!(axis_span(-128, 127, 8), Some(256));
+    // A full 32-bit range does not fit in a u32; an empty one is no range.
+    assert_eq!(axis_span(i32::MIN, i32::MAX, 32), None);
+    assert_eq!(axis_span(0, -1, 32), None);
+    assert_eq!(axis_span(5, 4, 0), None);
+}
+
+#[test]
+fn reports_larger_than_the_buffer_mark_the_recording_incomplete() {
+    let (mut set, _reader) = recording();
+    let mut buf = [0_u8; 4];
+    assert_eq!(
+        read_report(&[1, 2, 3, 4], &mut buf, &mut set).map(|r| r.to_vec()),
+        Some(vec![1, 2, 3, 4])
+    );
+    assert!(!set.overflowed());
+    assert_eq!(read_report(&[0; 5], &mut buf, &mut set), None);
+    assert!(set.overflowed());
+}
+
+#[test]
+fn a_controller_without_room_marks_the_next_recordings() {
+    let mut set = connected();
+    set.connect_unread(DeviceKind::Controller);
+    set.open_recording(TimeUs(5));
+    assert!(set.source_limited());
+    assert_eq!(set.participants().count(), 1);
+    // Its removal is the removal of a device not kept.
+    set.close_recording();
+    set.disconnect(DeviceId(0xdead));
+    set.open_recording(TimeUs(6));
+    assert!(!set.source_limited());
 }

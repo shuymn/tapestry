@@ -6,6 +6,7 @@ use bms_model::TimeUs;
 use eval::{ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId};
 
 use crate::gate::{Admit, DeviceId, FocusGate, Packet};
+use crate::hid::{AxisCap, MAX_AXES};
 use crate::queue::{SourceReader, SourceWriter, source_queue};
 
 /// What kind of device a source is.
@@ -57,8 +58,14 @@ pub struct SourceConfig {
 struct Device {
     id: DeviceId,
     kind: DeviceKind,
-    /// Controls with a nonzero value, at most `max_held`.
+    /// Controls with a nonzero value, at most `max_held`; not absolute
+    /// axes, whose positions are kept in `positions`.
     held: Vec<(ControlId, i32)>,
+    /// A controller's axes, from [`SourceSet::add_axes`].
+    axes: [AxisCap; MAX_AXES],
+    n_axes: usize,
+    /// Each absolute axis's last position, 0 included; `None` until seen.
+    positions: [Option<i32>; MAX_AXES],
     /// Its source while it takes part in the open recording.
     source: Option<SourceId>,
     /// The controls recorded from it: its lane and system bindings, set by
@@ -210,7 +217,15 @@ impl SourceSet {
             return admit;
         };
         let source = device.source;
-        if !track(&mut device.held, max_held, packet.control, packet.value) {
+        let axis = device.axes[..device.n_axes]
+            .iter()
+            .position(|a| a.control == packet.control);
+        if let Some(i) = axis {
+            // A relative axis has no position to keep.
+            if !device.axes[i].relative {
+                device.positions[i] = Some(packet.value);
+            }
+        } else if !track(&mut device.held, max_held, packet.control, packet.value) {
             // The state table is full; snapshots of this device may miss
             // the control from now on.
             device.state_lost = true;
@@ -249,6 +264,13 @@ impl SourceSet {
                 id: device,
                 kind,
                 held,
+                axes: [AxisCap {
+                    control: ControlId(0),
+                    relative: false,
+                    wrap: 0,
+                }; MAX_AXES],
+                n_axes: 0,
+                positions: [None; MAX_AXES],
                 source: None,
                 recorded: Vec::new(),
                 state_lost: false,
@@ -258,6 +280,61 @@ impl SourceSet {
         } else {
             self.untracked += 1;
         }
+        self.arrived(kind);
+    }
+
+    /// A device was found that the adapter has no room to read: like a
+    /// device beyond the state table, it never takes part, and a recording
+    /// opened while it is connected is marked as missing a device (the
+    /// source limit). An arrival during recording is listed as any. Its
+    /// removal is a [`disconnect`](Self::disconnect) of a device not kept.
+    pub fn connect_unread(&mut self, kind: DeviceKind) {
+        self.untracked += 1;
+        self.arrived(kind);
+    }
+
+    /// Adds axes to a connected controller's, for the held-input snapshot:
+    /// an absolute axis's position is kept even at 0, and a relative
+    /// axis's reports are not a state. Axes beyond [`MAX_AXES`] are not
+    /// kept. Returns `false` for a device that is not connected.
+    pub fn add_axes(&mut self, device: DeviceId, axes: &[AxisCap]) -> bool {
+        let Some(d) = self.devices.iter_mut().find(|d| d.id == device) else {
+            return false;
+        };
+        for a in axes {
+            if d.n_axes < MAX_AXES && !d.axes[..d.n_axes].iter().any(|b| b.control == a.control) {
+                d.axes[d.n_axes] = *a;
+                d.n_axes += 1;
+            }
+        }
+        true
+    }
+
+    /// The axes of a connected device ([`add_axes`](Self::add_axes)).
+    #[must_use]
+    pub fn axes(&self, device: DeviceId) -> &[AxisCap] {
+        self.devices
+            .iter()
+            .find(|d| d.id == device)
+            .map_or(&[], |d| &d.axes[..d.n_axes])
+    }
+
+    /// Input received in the background whose packets may all be filtered
+    /// out as unchanged: trips the focus gate all the same.
+    pub fn background(&mut self) {
+        self.gate.background();
+    }
+
+    /// Input that could not be read (a packet larger than the adapter's
+    /// buffers, or a failed read): the open recording is incomplete.
+    pub fn input_lost(&mut self) {
+        if let Some(rec) = &mut self.recording {
+            rec.overflowed = true;
+        }
+    }
+
+    /// Puts an arrival during the open recording on its list.
+    fn arrived(&mut self, kind: DeviceKind) {
         if let Some(rec) = &mut self.recording {
             if rec.arrivals.len() < self.config.max_arrivals {
                 rec.arrivals.push(Arrival {
@@ -372,6 +449,13 @@ impl SourceSet {
                     .iter()
                     .filter(|(c, _)| recorded.contains(c))
                     .map(|&(c, v)| (source, c, v)),
+            );
+            held.extend(
+                device.axes[..device.n_axes]
+                    .iter()
+                    .zip(device.positions)
+                    .filter(|(a, _)| recorded.contains(&a.control))
+                    .filter_map(|(a, p)| p.map(|v| (source, a.control, v))),
             );
             let (writer, reader) = source_queue(self.config.queue_capacity);
             participants.push(Participant {
