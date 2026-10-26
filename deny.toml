@@ -15,7 +15,8 @@ all-features = true
 #
 # cargo-audit also runs (`cargo audit --deny warnings`): cargo-deny checks the
 # graph configured above (`[graph] targets`, all features), while cargo-audit
-# checks every package in Cargo.lock and fails on any advisory warning.
+# checks every package in Cargo.lock and fails on vulnerabilities and on
+# unmaintained, unsound and yanked warnings (informational notices only print).
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
