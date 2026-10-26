@@ -20,14 +20,20 @@ use crate::controls::Controls;
 use crate::end_screen::key_name;
 
 /// A bound control's name: a keyboard key by its scan code, a controller's
-/// button by its number and its axis by its HID usage.
+/// button by its number and its axis by its HID usage, each after its
+/// collection number when it has one (`AXIS 2:0030`).
 fn name(b: Bound) -> String {
+    let collection = match b.control >> 24 {
+        0 => String::new(),
+        c => format!("{c}:"),
+    };
+    let control = b.control & 0x00FF_FFFF;
     match b.kind {
         DeviceKind::Keyboard => key_name(Some(b.control)),
         DeviceKind::Controller if is_axis(ControlId(b.control)) => {
-            format!("AXIS {:04X}", b.control & 0xFFFF)
+            format!("AXIS {collection}{:04X}", control & 0xFFFF)
         }
-        DeviceKind::Controller => format!("BUTTON {}", b.control),
+        DeviceKind::Controller => format!("BUTTON {collection}{control}"),
     }
 }
 
@@ -256,5 +262,12 @@ mod tests {
             control: 0x1_0030,
         };
         assert_eq!(name(axis), "AXIS 0030");
+        let second = |control| Bound {
+            kind: DeviceKind::Controller,
+            control,
+        };
+        assert_eq!(name(second(0x0201_0030)), "AXIS 2:0030");
+        assert_eq!(name(second(0x0200_0005)), "BUTTON 2:5");
+        assert_eq!(name(second(5)), "BUTTON 5");
     }
 }

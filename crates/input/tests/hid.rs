@@ -9,6 +9,7 @@ use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use input::hid::{
     AxisCap, ButtonGroup, HidDevice, HidLayout, HidReport, axis_control, axis_span, axis_value,
     button_control, capture_travel, collection_of, in_collection, is_axis, read_report,
+    remove_collection,
 };
 use input::{Capture, DeviceId, DeviceKind, SourceConfig, SourceReader, SourceSet};
 
@@ -53,7 +54,7 @@ fn connected() -> SourceSet {
     .unwrap();
     set.begin_batch(TimeUs(0));
     set.connect(PAD, DeviceKind::Controller);
-    assert!(set.add_axes(PAD, &caps()));
+    assert_eq!(set.add_axes(PAD, &caps())[..3], [true, true, false]);
     let mut recorded: Vec<_> = (1..=4).map(button_control).collect();
     recorded.extend([X, DIAL]);
     set.set_recorded(PAD, recorded);
@@ -583,13 +584,97 @@ fn reports_larger_than_the_buffer_mark_the_recording_incomplete() {
 #[test]
 fn a_controller_without_room_marks_the_next_recordings() {
     let mut set = connected();
-    set.connect_unread(DeviceKind::Controller);
+    let unread = DeviceId(0xdead);
+    // Found twice, as the device list and its arrival both report it: one
+    // device missing.
+    set.connect_unread(unread, DeviceKind::Controller);
+    set.connect_unread(unread, DeviceKind::Controller);
     set.open_recording(TimeUs(5));
     assert!(set.source_limited());
     assert_eq!(set.participants().count(), 1);
-    // Its removal is the removal of a device not kept.
+    // Its removal clears it; a second removal changes nothing more.
     set.close_recording();
-    set.disconnect(DeviceId(0xdead));
+    set.disconnect(unread);
     set.open_recording(TimeUs(6));
     assert!(!set.source_limited());
+    set.close_recording();
+    set.connect_unread(DeviceId(0xbeef), DeviceKind::Controller);
+    set.disconnect(unread);
+    set.open_recording(TimeUs(7));
+    assert!(set.source_limited(), "another unread device is still there");
+}
+
+#[test]
+fn removing_one_collection_disconnects_the_controller_until_the_next_play() {
+    let (mut set, mut reader) = recording();
+    let capture = Capture::new();
+    let b2 = in_collection(button_control(1), 2);
+    let mut first = HidDevice::new(PAD, &layout(&caps()));
+    let second = HidDevice::new(
+        PAD,
+        &HidLayout {
+            collection: 2,
+            axes: &[],
+            buttons: &[],
+        },
+    );
+    // Button 2 of the first collection is held when that collection goes.
+    batch(
+        &mut first,
+        &mut set,
+        &capture,
+        10,
+        &[HidReport {
+            id: 0,
+            buttons: Some(&[2]),
+            axes: &[Some(7), None],
+        }],
+    );
+    assert!(set.begin_batch(TimeUs(20)));
+    remove_collection(PAD, [&second], &mut set);
+    set.end_batch(TimeUs(21));
+    // The source is disconnected, which releases everything it held, and
+    // the controller arrives again with the collection that remains.
+    let events: Vec<_> = std::iter::from_fn(|| reader.pop()).collect();
+    assert_eq!(events.last().map(|e| e.kind), Some(InputKind::Disconnected));
+    assert_eq!(set.arrivals().len(), 1);
+    // At the next play it takes part, with nothing of the removed
+    // collection: no held button, no axis.
+    set.close_recording();
+    set.set_recorded(PAD, vec![button_control(2), b2, X]);
+    let start = set.open_recording(TimeUs(30));
+    assert_eq!(set.participants().count(), 1);
+    assert!(start.held.is_empty(), "{:?}", start.held);
+    assert_eq!(set.axes(PAD), []);
+    // The last collection's removal disconnects it for good.
+    set.close_recording();
+    remove_collection(PAD, [], &mut set);
+    set.open_recording(TimeUs(40));
+    assert_eq!(set.participants().count(), 0);
+}
+
+#[test]
+fn axes_past_the_table_are_not_kept() {
+    let mut set = connected();
+    // X and the dial are kept; 14 more fill the table of 16, and a 17th
+    // axis, in another collection, does not fit.
+    let more: Vec<AxisCap> = (0..15)
+        .map(|i| AxisCap {
+            control: in_collection(
+                axis_control(1, 0x30 + i % 9),
+                2 + u8::try_from(i / 9).unwrap(),
+            ),
+            relative: false,
+            wrap: 256,
+        })
+        .collect();
+    let kept = set.add_axes(PAD, &more);
+    assert_eq!(kept[..15].iter().filter(|&&k| k).count(), 14);
+    assert!(!kept[14]);
+    assert_eq!(set.axes(PAD).len(), 16);
+    assert!(!set.axes(PAD).contains(&more[14]));
+    // An axis already kept is kept again; a device not connected keeps
+    // none.
+    assert!(set.add_axes(PAD, &caps())[0]);
+    assert_eq!(set.add_axes(DeviceId(1), &caps()), [false; 16]);
 }

@@ -51,7 +51,7 @@ use crate::gate::DeviceId;
 use crate::hid::{
     AXIS_USAGES, AxisCap, ButtonGroup, DESKTOP_PAGE, HidDevice, HidLayout, HidReport, MAX_AXES,
     MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_control, axis_span, axis_value, collection_of,
-    in_collection, read_report,
+    in_collection, read_report, remove_collection,
 };
 use crate::raw;
 use crate::sources::{DeviceKind, SourceSet};
@@ -382,7 +382,7 @@ impl Controllers {
             });
         let collection = collection.unwrap_or(0);
         let Some(slot) = self.slots.iter_mut().find(|s| s.handle.is_none()) else {
-            sources.connect_unread(DeviceKind::Controller);
+            sources.connect_unread(device_id(handle), DeviceKind::Controller);
             return;
         };
         let mut size = (slot.preparsed.len() * 8) as u32;
@@ -396,7 +396,7 @@ impl Controllers {
             )
         };
         if got == 0 || got == u32::MAX {
-            sources.connect_unread(DeviceKind::Controller);
+            sources.connect_unread(device_id(handle), DeviceKind::Controller);
             return;
         }
         let mut caps = [AxisCap {
@@ -412,6 +412,18 @@ impl Controllers {
         let (n_axes, axis_ids) = read_axes(data, collection, &mut slot.reads, &mut caps);
         let (n_groups, button_ids) = read_buttons(data, &mut groups);
         let device = container.map_or(device_id(handle), container_device);
+        sources.connect(device, DeviceKind::Controller);
+        // Only axes the source keeps are read: one beyond the device's
+        // table is never captured or recorded.
+        let kept = sources.add_axes(device, &caps[..n_axes]);
+        let mut n = 0;
+        for i in 0..n_axes {
+            if kept[i] {
+                caps[n] = caps[i];
+                slot.reads[n] = slot.reads[i];
+                n += 1;
+            }
+        }
         slot.handle = Some(key);
         slot.container = container;
         slot.collection = collection;
@@ -420,27 +432,30 @@ impl Controllers {
             device,
             &HidLayout {
                 collection,
-                axes: &caps[..n_axes],
+                axes: &caps[..n],
                 buttons: &groups[..n_groups],
             },
         );
-        sources.connect(device, DeviceKind::Controller);
-        sources.add_axes(device, &caps[..n_axes]);
     }
 
-    /// Forgets the collection `handle`. Returns its source when it was the
-    /// last collection of it, which is then removed; `None` when the
-    /// handle is not a collection read here.
-    fn disconnect(&mut self, handle: HANDLE) -> Option<Option<DeviceId>> {
+    /// Forgets the collection `handle` and disconnects its source
+    /// ([`remove_collection`]): the controller's other collections, if
+    /// any, connect again and take part from the next play. Returns
+    /// `false` when the handle is not a collection read here.
+    fn disconnect(&mut self, handle: HANDLE, sources: &mut SourceSet) -> bool {
         let key = handle.0 as isize;
-        let slot = self.slots.iter_mut().find(|s| s.handle == Some(key))?;
+        let Some(slot) = self.slots.iter_mut().find(|s| s.handle == Some(key)) else {
+            return false;
+        };
         slot.handle = None;
         let device = slot.state.device();
-        let last = !self
+        let remaining = self
             .slots
             .iter()
-            .any(|s| s.handle.is_some() && s.state.device() == device);
-        Some(last.then_some(device))
+            .filter(|s| s.handle.is_some() && s.state.device() == device)
+            .map(|s| &s.state);
+        remove_collection(device, remaining, sources);
+        true
     }
 
     /// Turns a HID block's reports into packets.
@@ -868,12 +883,9 @@ impl RawInput {
     fn device_change(&mut self, change: u32, handle: HANDLE, sources: &mut SourceSet) {
         match change {
             GIDC_ARRIVAL => self.connect(handle, sources),
-            GIDC_REMOVAL => match self.controllers.disconnect(handle) {
-                // The physical controller's last collection.
-                Some(Some(device)) => sources.disconnect(device),
-                Some(None) => {}
-                None => sources.disconnect(device_id(handle)),
-            },
+            GIDC_REMOVAL if !self.controllers.disconnect(handle, sources) => {
+                sources.disconnect(device_id(handle));
+            }
             _ => {}
         }
     }

@@ -129,6 +129,9 @@ pub struct SourceSet {
     spare_held: Vec<Vec<(ControlId, i32)>>,
     /// Connected devices the state table had no room for.
     untracked: usize,
+    /// Devices the adapter has no room to read, connected now; each is
+    /// counted once in `untracked`.
+    unread: Vec<DeviceId>,
     /// The number the next connection gets.
     next_connection: u64,
     gate: FocusGate,
@@ -149,6 +152,7 @@ impl SourceSet {
             return Err(ConfigError::TooManySources(config.max_sources));
         }
         let devices = Vec::with_capacity(config.max_devices);
+        let unread = Vec::with_capacity(config.max_devices);
         let spare_held = (0..config.max_devices)
             .map(|_| Vec::with_capacity(config.max_held))
             .collect();
@@ -157,6 +161,7 @@ impl SourceSet {
             devices,
             spare_held,
             untracked: 0,
+            unread,
             next_connection: 0,
             gate: FocusGate::new(),
             batch_at: TimeUs(i64::MIN),
@@ -278,7 +283,9 @@ impl SourceSet {
             });
             self.next_connection += 1;
         } else {
-            self.untracked += 1;
+            // No room for its state: kept out like an unread device.
+            self.connect_unread(device, kind);
+            return;
         }
         self.arrived(kind);
     }
@@ -286,28 +293,43 @@ impl SourceSet {
     /// A device was found that the adapter has no room to read: like a
     /// device beyond the state table, it never takes part, and a recording
     /// opened while it is connected is marked as missing a device (the
-    /// source limit). An arrival during recording is listed as any. Its
-    /// removal is a [`disconnect`](Self::disconnect) of a device not kept.
-    pub fn connect_unread(&mut self, kind: DeviceKind) {
+    /// source limit). An arrival during recording is listed as any. Finding
+    /// it again changes nothing; its [`disconnect`](Self::disconnect)
+    /// clears it. Beyond `max_devices` unread devices, each is counted
+    /// without being told apart.
+    pub fn connect_unread(&mut self, device: DeviceId, kind: DeviceKind) {
+        if self.unread.contains(&device) {
+            return;
+        }
+        if self.unread.len() < self.config.max_devices {
+            self.unread.push(device);
+        }
         self.untracked += 1;
         self.arrived(kind);
     }
 
-    /// Adds axes to a connected controller's, for the held-input snapshot:
-    /// an absolute axis's position is kept even at 0, and a relative
-    /// axis's reports are not a state. Axes beyond [`MAX_AXES`] are not
-    /// kept. Returns `false` for a device that is not connected.
-    pub fn add_axes(&mut self, device: DeviceId, axes: &[AxisCap]) -> bool {
+    /// Adds axes to a connected controller's, for the held-input snapshot
+    /// and the evaluator's settings: an absolute axis's position is kept
+    /// even at 0, and a relative axis's reports are not a state. At most
+    /// [`MAX_AXES`] are kept per device, over all its collections; the
+    /// adapter does not read an axis that is not kept, so it can be neither
+    /// captured nor recorded. Returns whether each of `axes` is kept, in
+    /// order; none for a device that is not connected.
+    pub fn add_axes(&mut self, device: DeviceId, axes: &[AxisCap]) -> [bool; MAX_AXES] {
+        let mut kept = [false; MAX_AXES];
         let Some(d) = self.devices.iter_mut().find(|d| d.id == device) else {
-            return false;
+            return kept;
         };
-        for a in axes {
-            if d.n_axes < MAX_AXES && !d.axes[..d.n_axes].iter().any(|b| b.control == a.control) {
+        for (a, k) in axes.iter().zip(&mut kept) {
+            if d.axes[..d.n_axes].iter().any(|b| b.control == a.control) {
+                *k = true;
+            } else if d.n_axes < MAX_AXES {
                 d.axes[d.n_axes] = *a;
                 d.n_axes += 1;
+                *k = true;
             }
         }
-        true
+        kept
     }
 
     /// The axes of a connected device ([`add_axes`](Self::add_axes)).
@@ -370,8 +392,17 @@ impl SourceSet {
     /// at the batch time, publishes that time as its final watermark, and
     /// closes; once the gate has tripped, nothing is recorded or published.
     pub fn disconnect(&mut self, device: DeviceId) {
-        let Some(i) = self.devices.iter().position(|d| d.id == device) else {
+        if let Some(i) = self.unread.iter().position(|&d| d == device) {
+            self.unread.swap_remove(i);
             self.untracked = self.untracked.saturating_sub(1);
+            return;
+        }
+        let Some(i) = self.devices.iter().position(|d| d.id == device) else {
+            // Unknown: one of the devices kept out but not told apart, if
+            // there are any; otherwise nothing.
+            if self.untracked > self.unread.len() {
+                self.untracked -= 1;
+            }
             return;
         };
         // `remove` keeps the order devices were found in, which gives
