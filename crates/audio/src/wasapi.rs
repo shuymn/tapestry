@@ -345,6 +345,14 @@ fn widen(periods: &EnginePeriods, buffer: u32, period: u32) -> bool {
     buffer_periods(buffer, period) < MAX_QUEUE_PERIODS && periods.min >= periods.default
 }
 
+/// The opening decision once `IAudioClient3` initialized a stream at
+/// `period` frames with a `buffer`-frame buffer, having offered `offered`:
+/// `Some(period)` to reopen through `IAudioClient` at that same period with
+/// a wider buffer ([`widen`]), `None` to keep the stream.
+fn reopen_wider(offered: Option<EnginePeriods>, period: u32, buffer: u32) -> Option<u32> {
+    offered.filter(|p| widen(p, buffer, period)).map(|_| period)
+}
+
 /// The buffer to ask `IAudioClient::Initialize` for, 100 ns units:
 /// [`MAX_QUEUE_PERIODS`] default periods and half of one more, so rounding
 /// to frames cannot leave it short.
@@ -353,7 +361,9 @@ fn wide_buffer_hns(default_period_hns: i64) -> i64 {
 }
 
 /// A fresh client on `device`, initialized at the default period with a
-/// buffer of [`MAX_QUEUE_PERIODS`] periods, and that period in frames.
+/// buffer of [`MAX_QUEUE_PERIODS`] periods, and that period in frames:
+/// `exact` when the caller knows it in frames, else the default period's
+/// duration rounded to the nearest frame.
 ///
 /// # Safety
 ///
@@ -362,6 +372,7 @@ unsafe fn init_default(
     device: &windows::Win32::Media::Audio::IMMDevice,
     format: *const WAVEFORMATEX,
     rate: u32,
+    exact: Option<u32>,
 ) -> Result<(IAudioClient, u32), WasapiError> {
     let os = WasapiError::os;
     // SAFETY: COM calls on live interfaces; `format` per the contract.
@@ -383,13 +394,20 @@ unsafe fn init_default(
                 None,
             )
             .map_err(|e| os("IAudioClient::Initialize", e))?;
-        Ok((client, hns_to_frames(default, rate)))
+        Ok((
+            client,
+            exact.unwrap_or_else(|| hns_to_frames(default, rate)),
+        ))
     }
 }
 
-/// A duration in 100 ns units as frames at `rate` (floor).
+/// A duration in 100 ns units as frames at `rate`, rounded to the nearest
+/// frame: a period is reported in 100 ns units, which cut most periods
+/// short of a whole frame (448 frames at 44.1 kHz are 101 587 units, 447.998
+/// frames).
 fn hns_to_frames(hns: i64, rate: u32) -> u32 {
-    u32::try_from(i128::from(hns.max(0)) * i128::from(rate) / 10_000_000).unwrap_or(u32::MAX)
+    let scaled = i128::from(hns.max(0)) * i128::from(rate);
+    u32::try_from((scaled + 5_000_000) / 10_000_000).unwrap_or(u32::MAX)
 }
 
 /// Copies interleaved stereo `src` into `dst`, native-endian `f32` frames
@@ -799,20 +817,21 @@ impl<C: TimeSource> WasapiShared<C> {
             let (client, period, fallback, widened) = match shortest {
                 Ok((client, period)) => {
                     let buffer = client.GetBufferSize().map_err(|e| os("GetBufferSize", e))?;
-                    match engine_periods {
-                        Some(p) if widen(&p, buffer, period) => {
+                    match reopen_wider(engine_periods, period, buffer) {
+                        Some(exact) => {
                             // Released before the wider stream opens.
                             drop(client);
-                            let (client, period) = init_default(&device, format.0, rate)?;
+                            let (client, period) =
+                                init_default(&device, format.0, rate, Some(exact))?;
                             (client, period, None, true)
                         }
-                        _ => (client, period, None, false),
+                        None => (client, period, None, false),
                     }
                 }
                 Err(fallback) => {
                     // A fresh client: a refused one cannot be initialized
                     // again.
-                    let (client, period) = init_default(&device, format.0, rate)?;
+                    let (client, period) = init_default(&device, format.0, rate, None)?;
                     (client, period, Some(fallback), false)
                 }
             };
@@ -1043,10 +1062,20 @@ mod tests {
             max: 441,
         };
         let shorter = EnginePeriods { min: 147, ..fixed };
-        // This PC's interface: 970 frames hold two periods of 441.
-        assert!(widen(&fixed, 970, 441));
-        assert!(!widen(&fixed, 1_323, 441));
-        assert!(!widen(&shorter, 400, 147));
+        // The development PC's interface: 970 frames hold two periods of
+        // 441, reopened at exactly 441.
+        assert_eq!(reopen_wider(Some(fixed), 441, 970), Some(441));
+        assert_eq!(reopen_wider(Some(fixed), 441, 1_323), None);
+        assert_eq!(reopen_wider(Some(shorter), 147, 400), None);
+        // A fractional period is kept as `IAudioClient3` gave it.
+        let fractional = EnginePeriods {
+            default: 448,
+            fundamental: 448,
+            min: 448,
+            max: 448,
+        };
+        assert_eq!(reopen_wider(Some(fractional), 448, 970), Some(448));
+        assert_eq!(reopen_wider(None, 441, 970), None);
         // 10 ms: three periods and a half, 35 ms.
         assert_eq!(wide_buffer_hns(100_000), 350_000);
         assert!(hns_to_frames(wide_buffer_hns(100_000), 44_100) >= 3 * 441);
@@ -1064,12 +1093,14 @@ mod tests {
     }
 
     #[test]
-    fn durations_convert_to_frames_by_floor() {
+    fn durations_convert_to_the_nearest_frame() {
         // By hand: 10 ms at 48 kHz is 480 frames, at 44.1 kHz 441;
-        // 10.1587 ms at 48 kHz is 487.6.
+        // 10.1587 ms is 487.6 frames at 48 kHz and 447.998 at 44.1 kHz,
+        // which a floor would cut to 447.
         assert_eq!(hns_to_frames(100_000, 48_000), 480);
         assert_eq!(hns_to_frames(100_000, 44_100), 441);
-        assert_eq!(hns_to_frames(101_587, 48_000), 487);
+        assert_eq!(hns_to_frames(101_587, 48_000), 488);
+        assert_eq!(hns_to_frames(101_587, 44_100), 448);
         assert_eq!(hns_to_frames(-5, 48_000), 0);
     }
 
