@@ -194,8 +194,8 @@ pub fn compute(
         bar_lines: Vec::with_capacity(usize::from(last_measure) + 1),
     };
     let mut us_per_beat = int(US_PER_MINUTE) / &initial_bpm;
-    // µs per measure of the current BPM for one measure, kept while both
-    // stay the same.
+    // A measure's length in µs at the current BPM, kept while neither the
+    // measure nor the BPM changes.
     let mut rate: Option<(u16, Rational)> = None;
     let mut beat = Spot::start(0);
     let mut time = Time::zero();
