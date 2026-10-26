@@ -1,0 +1,50 @@
+name: Audit
+
+# The advisory checks of CI on a schedule, so advisories published while the
+# repository is idle are reported (docs/setup.md "Dependency Checks").
+
+on:
+  schedule:
+    - cron: "41 20 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/audit.yml
+      - deny.toml
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      # Only the tools in install_args are needed; keep `mise exec` from
+      # installing the rest on demand.
+      MISE_EXEC_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.3
+          install: true
+          install_args: rust cargo-deny aqua:rustsec/rustsec/cargo-audit
+          cache: true
+      # An unreadable registry index only warns and skips the yanked check.
+      - name: cargo-deny
+        run: mise exec -- cargo deny check advisories --deny index-failure
+      # cargo-audit only logs index failures (on stderr, which the guard scans).
+      - name: cargo-audit
+        run: |
+          set -o pipefail
+          { mise exec -- cargo audit --deny warnings 2>&1 1>&3 | tee "$RUNNER_TEMP/audit.log" >&2; } 3>&1
+          if grep -E "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$RUNNER_TEMP/audit.log"; then exit 1; fi

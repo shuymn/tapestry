@@ -119,10 +119,25 @@ jobs:
         run: mise exec -- cargo xtask check-lints
       - name: Test (portable crates)
         run: mise exec -- cargo xtask portable test --locked
+      # An unreadable registry index only warns and skips the yanked check.
       - name: cargo-deny
-        run: mise exec -- cargo deny check
+        run: mise exec -- cargo deny check --deny index-failure
+      # `--with-metadata` also covers dev-, build- and target-specific
+      # dependencies. cargo-machete exits 0 when it cannot read a manifest or
+      # run cargo metadata, so its error lines fail the step; it runs cargo
+      # metadata without `--locked`, so Cargo.lock must stay unchanged.
+      - name: cargo-machete
+        run: |
+          set -o pipefail
+          mise exec -- cargo machete --with-metadata 2>&1 | tee "$RUNNER_TEMP/machete.log"
+          if grep '^error when handling' "$RUNNER_TEMP/machete.log"; then exit 1; fi
+          git diff --exit-code Cargo.lock
+      # cargo-audit only logs index failures (on stderr, which the guard scans).
       - name: cargo-audit
-        run: mise exec -- cargo audit --deny warnings
+        run: |
+          set -o pipefail
+          { mise exec -- cargo audit --deny warnings 2>&1 1>&3 | tee "$RUNNER_TEMP/audit.log" >&2; } 3>&1
+          if grep -E "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$RUNNER_TEMP/audit.log"; then exit 1; fi
 
   # The Nix dev shell used from WSL: the flake evaluates with the Rust version
   # from mise.lock, and the wrapper's Linux path passes arguments and exit codes.
