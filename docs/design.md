@@ -286,7 +286,7 @@ During play, only `advance_to(watermark)` is called. Even for a note whose deadl
 
 ## Rule Presets
 
-Rule differences are expressed in three ways: data (numbers in TOML), fixed choices (`enum`), and rule-specific implementations built into the evaluator. All of them are code inside the evaluator, not plugins that users load later. A preset holds the data and choices plus the name and version of the evaluation implementation to use, and can be serialized in full and hashed. This is so that which rule was used for evaluation is reliably recorded.
+Rule differences are expressed in three ways: data (numbers in TOML), fixed choices (`enum`), and rule-specific implementations built into the evaluator. All of them are code inside the evaluator, not plugins that users load later. A preset holds the data and choices plus the name and version of the evaluation implementation to use, and can be serialized in full and hashed. This is so that which rule was used for evaluation is reliably recorded. Before the first release, the preset file and its canonical encoding may change incompatibly: an older one is refused, not converted, as with replays.
 
 | Level | Contents |
 | --- | --- |

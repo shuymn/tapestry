@@ -199,24 +199,18 @@ impl JudgeWindows {
 /// When an unpressed note is missed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissRule {
-    /// A note not pressed by its late BAD edge is a POOR at that edge.
-    PoorAfterLateBad,
-    /// As [`PoorAfterLateBad`](Self::PoorAfterLateBad), and also: a press
-    /// that judges a note first misses every earlier unjudged note of its
-    /// lane, each a POOR at the press's time, in note order. Notes are
+    /// A note not pressed by its late BAD edge is a POOR at that edge, and a
+    /// press that judges a note first misses every earlier unjudged note of
+    /// its lane, each a POOR at the press's time, in note order. Notes are
     /// never judged out of order.
     PoorAfterLateBadOrOvertaken,
 }
 
 /// Empty POOR: a press that judges no note but lies close to one.
 ///
-/// A press that judges no note is an empty POOR when a note of its lane is
-/// close enough, by one of two ranges:
-///
-/// - `behind` is `None`: the lane's next unjudged note lies at most `ahead`
-///   after the press (the range of preset format 1).
-/// - `behind` is `Some`: any note of the lane, judged or not, lies at most
-///   `ahead` after the press or at most `behind` before it.
+/// A press that judges no note is an empty POOR when a note of its lane,
+/// judged or not, lies at most `ahead` after the press or at most `behind`
+/// before it.
 ///
 /// Every such press counts, with no cap. Its gauge change is
 /// [`GaugeRule::empty_poor`]. Neither distance is scaled by the rank, and
@@ -225,9 +219,8 @@ pub enum MissRule {
 pub struct EmptyPoorRule {
     /// How far ahead of the press a note makes it an empty POOR.
     pub ahead: TimeUs,
-    /// How far behind the press a note makes it an empty POOR, judged or
-    /// not; `None` for the next-unjudged-note range.
-    pub behind: Option<TimeUs>,
+    /// How far behind the press a note makes it an empty POOR.
+    pub behind: TimeUs,
     /// Whether it breaks the combo.
     pub breaks_combo: bool,
     /// Whether it adds to BP.

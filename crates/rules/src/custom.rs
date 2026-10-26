@@ -79,7 +79,7 @@ pub fn custom() -> RulePreset {
         miss: MissRule::PoorAfterLateBadOrOvertaken,
         empty_poor: EmptyPoorRule {
             ahead: TimeUs(500 * MS),
-            behind: Some(TimeUs(150 * MS)),
+            behind: TimeUs(150 * MS),
             breaks_combo: false,
             counts_bp: true,
             counted: false,
@@ -175,7 +175,7 @@ mod tests {
             miss: MissRule::PoorAfterLateBadOrOvertaken,
             empty_poor: EmptyPoorRule {
                 ahead: TimeUs(500_000),
-                behind: Some(TimeUs(150_000)),
+                behind: TimeUs(150_000),
                 breaks_combo: false,
                 counts_bp: true,
                 counted: false,

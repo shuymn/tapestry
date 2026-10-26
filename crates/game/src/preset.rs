@@ -4,6 +4,9 @@
 //!
 //! Times are integer µs and gauge values raw units of 1/100000 %, so a file
 //! round-trips to the same canonical bytes and the same hash.
+//!
+//! Before the first release the file's shape may change incompatibly. A file
+//! written by an older version is refused as unreadable, never converted.
 
 use std::fmt;
 
@@ -28,7 +31,10 @@ pub enum PresetError {
 impl fmt::Display for PresetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Parse(e) => write!(f, "the preset file cannot be read: {e}"),
+            Self::Parse(e) => write!(
+                f,
+                "the preset file cannot be read (a file from an older version is refused, not                  converted; deleting it writes the current custom preset again): {e}"
+            ),
             Self::Invalid(e) => write!(f, "the preset is invalid: {e}"),
         }
     }
@@ -108,7 +114,6 @@ struct WindowsFile {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum MissFile {
-    PoorAfterLateBad,
     PoorAfterLateBadOrOvertaken,
 }
 
@@ -116,10 +121,7 @@ enum MissFile {
 #[serde(deny_unknown_fields)]
 struct EmptyPoorFile {
     ahead_us: i64,
-    /// Absent in a file written before the late side existed, which keeps
-    /// that file's preset and hash.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    behind_us: Option<i64>,
+    behind_us: i64,
     breaks_combo: bool,
     counts_bp: bool,
     counted: bool,
@@ -328,12 +330,11 @@ impl From<PresetFile> for RulePreset {
                 bad: window(windows.bad),
             },
             miss: match miss {
-                MissFile::PoorAfterLateBad => MissRule::PoorAfterLateBad,
                 MissFile::PoorAfterLateBadOrOvertaken => MissRule::PoorAfterLateBadOrOvertaken,
             },
             empty_poor: EmptyPoorRule {
                 ahead: TimeUs(empty_poor.ahead_us),
-                behind: empty_poor.behind_us.map(TimeUs),
+                behind: TimeUs(empty_poor.behind_us),
                 breaks_combo: empty_poor.breaks_combo,
                 counts_bp: empty_poor.counts_bp,
                 counted: empty_poor.counted,
@@ -441,7 +442,6 @@ impl From<&RulePreset> for PresetFile {
                 bad: window_file(windows.bad),
             },
             miss: match miss {
-                MissRule::PoorAfterLateBad => MissFile::PoorAfterLateBad,
                 MissRule::PoorAfterLateBadOrOvertaken => MissFile::PoorAfterLateBadOrOvertaken,
             },
             empty_poor: {
@@ -454,7 +454,7 @@ impl From<&RulePreset> for PresetFile {
                 } = *empty_poor;
                 EmptyPoorFile {
                     ahead_us: ahead.0,
-                    behind_us: behind.map(|t| t.0),
+                    behind_us: behind.0,
                     breaks_combo,
                     counts_bp,
                     counted,
