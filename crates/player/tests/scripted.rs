@@ -772,7 +772,18 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
         .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
         .collect();
     kept.sort();
-    assert_eq!(kept, ["device.toml", "presets\\custom.toml"], "{kept:?}");
+    // The settings and the run's log are kept; no play is (design.md
+    // "Autoplay", "Log File").
+    assert_eq!(
+        kept,
+        [
+            "device.toml",
+            "logs\\tapestry.lock",
+            "logs\\tapestry.log",
+            "presets\\custom.toml"
+        ],
+        "{kept:?}"
+    );
 }
 
 /// H2: retried by itself after ten input offset steps on the end screen
