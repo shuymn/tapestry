@@ -383,35 +383,28 @@ impl HidDevice {
             self.armed = armed;
             self.travel = [0; MAX_AXES];
         }
-        for (i, value) in report.axes.iter().take(self.n_axes).enumerate() {
+        let axes = report
+            .axes
+            .iter()
+            .zip(&self.caps)
+            .zip(self.values.iter_mut().zip(self.travel.iter_mut()))
+            .take(self.n_axes);
+        for ((value, &cap), (last, travel)) in axes {
             let Some(value) = *value else {
                 continue;
             };
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "`i` is below `n_axes`, at most MAX_AXES, the length of the per-axis arrays"
-            )]
-            let cap = self.caps[i];
             if !cap.relative && !(cap.min..=cap.max).contains(&value) {
                 // A wrong descriptor: recorded as reported, and counted.
                 sources.axis_value_out_of_range(device);
             }
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "`i` is below `n_axes`, at most MAX_AXES, the length of the per-axis arrays"
-            )]
-            let prev = self.values[i];
+            let prev = *last;
             if !cap.relative && capture.watched() == Some(cap.control) {
                 capture.observe(&cap, prev, value);
             }
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "`i` is below `n_axes`, at most MAX_AXES, the length of the per-axis arrays"
-            )]
             let moved = if cap.relative {
                 i64::from(value)
             } else {
-                match self.values[i].replace(value) {
+                match last.replace(value) {
                     None => 0,
                     Some(prev) if prev == value => continue,
                     Some(prev) => wrapped(i64::from(value) - i64::from(prev), cap.wrap),
@@ -422,11 +415,6 @@ impl HidDevice {
             }
             let p = packet(cap.control, value);
             sources.packet(&p);
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "`i` is below `n_axes`, at most MAX_AXES, the length of the per-axis arrays"
-            )]
-            let travel = &mut self.travel[i];
             *travel = travel.saturating_add(moved);
             if travel.abs() >= capture_travel(&cap) {
                 *travel = 0;

@@ -694,13 +694,16 @@ fn read_axes(
         let axes = min.max(*AXIS_USAGES.start())..=max.min(*AXIS_USAGES.end());
         for usage in axes {
             let control = in_collection(axis_control(v.UsagePage, usage), collection);
-            let cap = axis_cap(control, v.IsAbsolute, v.LogicalMin, v.LogicalMax, v.BitSize);
-            if n == MAX_AXES || caps.iter().take(n).any(|c| c.control == control) || cap.is_none() {
+            let Some(cap) = axis_cap(control, v.IsAbsolute, v.LogicalMin, v.LogicalMax, v.BitSize)
+            else {
+                continue;
+            };
+            if n == MAX_AXES || caps.iter().take(n).any(|c| c.control == control) {
                 continue;
             }
             #[expect(
                 clippy::indexing_slicing,
-                reason = "the check above skips the axis once `n` reaches MAX_AXES"
+                reason = "the check above skips the axis once `n` reaches MAX_AXES, the length of both tables"
             )]
             {
                 reads[n] = AxisRead {
@@ -711,15 +714,6 @@ fn read_axes(
                     min: v.LogicalMin,
                     max: v.LogicalMax,
                 };
-            }
-            let Some(cap) = cap else {
-                continue;
-            };
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "the check above skips the axis once `n` reaches MAX_AXES"
-            )]
-            {
                 caps[n] = cap;
             }
             n += 1;

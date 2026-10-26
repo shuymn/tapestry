@@ -425,16 +425,11 @@ impl ConversionState {
             clippy::indexing_slicing,
             reason = "`i` is a binding's position, and `pressed` has one entry per binding"
         )]
-        if state.pressed[i] == pressed {
+        let was = &mut state.pressed[i];
+        if *was == pressed {
             return None;
         }
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "`i` is a binding's position, and `pressed` has one entry per binding"
-        )]
-        {
-            state.pressed[i] = pressed;
-        }
+        *was = pressed;
         #[expect(clippy::indexing_slicing, reason = "`i` is a binding's position")]
         let lane = state.bindings[i].1;
         if pressed {

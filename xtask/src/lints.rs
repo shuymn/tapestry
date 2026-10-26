@@ -530,7 +530,7 @@ fn is_summary(d: &Diag) -> bool {
             || d.message.ends_with("warnings emitted"))
 }
 
-/// The text checks of the module docs.
+/// The parsed-source site checks of the module docs.
 pub fn check_sites(root: &Path, members: &[PathBuf]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for manifest in members {
@@ -1221,7 +1221,7 @@ mod tests {
         assert!(found("fn f() -> u8 { (#[allow(unused)] 1) }\n").is_some());
         assert!(found("struct S { #[allow(dead_code)] x: u8 }\n").is_some());
         assert!(found("m! { #![deny(clippy::todo)] }\n").is_some());
-        // An item the parser keeps as unparsed tokens.
+        // An attribute on a foreign item, which the token walk finds like any other.
         let foreign = "unsafe extern \"C\" {\n    #[deny(clippy::todo)]\n    safe fn f();\n}\n";
         assert_eq!(found(foreign), Some(attr("#[deny(clippy::todo)]")));
         // A `#` handed to a macro that builds the attribute at expansion.

@@ -279,19 +279,14 @@ impl Mixer {
 
     /// Moves a stolen voice to a release slot fading out from `cut`.
     fn release(&mut self, victim: Voice, cut: u64) {
-        let slot = match self.releases.iter().position(|r| !r.active) {
-            Some(k) => k,
-            None => {
-                self.hard_cuts += 1;
-                // The release furthest into its fade is the quietest.
-                match self.releases.iter().enumerate().min_by_key(|(_, r)| r.cut) {
-                    Some((k, _)) => k,
-                    None => return,
-                }
-            }
-        };
-        if let Some(r) = self.releases.get_mut(slot) {
-            *r = Voice { cut, ..victim };
+        if let Some(free) = self.releases.iter_mut().find(|r| !r.active) {
+            *free = Voice { cut, ..victim };
+            return;
+        }
+        self.hard_cuts += 1;
+        // The release furthest into its fade is the quietest.
+        if let Some(quietest) = self.releases.iter_mut().min_by_key(|r| r.cut) {
+            *quietest = Voice { cut, ..victim };
         }
     }
 
