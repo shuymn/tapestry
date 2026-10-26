@@ -57,7 +57,7 @@ pub enum LoadError {
         /// The first measure with a time past the limit.
         measure: u16,
     },
-    /// Time computation overflowed.
+    /// The exact time grew past [`Limits::max_time_bits`](crate::Limits).
     TimeOverflow {
         /// The measure being computed.
         measure: u16,
@@ -105,7 +105,10 @@ impl fmt::Display for LoadError {
                 )
             }
             Self::TimeOverflow { measure } => {
-                write!(f, "measure {measure}: time computation overflowed")
+                write!(
+                    f,
+                    "measure {measure}: exact time is larger than the size limit"
+                )
             }
             Self::SoundPathRejected { line } => {
                 write!(

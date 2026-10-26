@@ -2,7 +2,7 @@
 //!
 //! Supports `#PLAYER 1` 7-key + scratch charts. Charts and sounds are
 //! untrusted: every limit in [`Limits`] is checked before the work it bounds,
-//! times use exact rationals with checked arithmetic, and sound files are
+//! times use exact rationals whose size is capped, and sound files are
 //! confined to the chart folder. This crate does not use floating point.
 //! The cast lints at the crate root reject `as` casts that may truncate,
 //! wrap, or lose the sign; they cover the library and its unit tests, not
@@ -14,9 +14,11 @@
 //! changes the version.
 //!
 //! - **Time:** each object's time is accumulated in exact rationals and
-//!   floored to µs once. BPM, `#STOPxx` and measure-length values take at
-//!   most 6 fractional digits. A `#STOPxx` value counts 1/192 of a 4/4
-//!   measure (1/48 beat) whatever the measure length.
+//!   floored to µs once; the time's denominator has at most
+//!   [`Limits::max_time_bits`] bits (an error otherwise). BPM, `#STOPxx`
+//!   and measure-length values take at most 6 fractional digits. A
+//!   `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat) whatever
+//!   the measure length.
 //! - **Same position:** a BPM change applies before a STOP, so the STOP uses
 //!   the new BPM; a note at a STOP's position sounds at the STOP's start.
 //!   Channel 08 wins over channel 03; within a channel the later object in
@@ -109,6 +111,8 @@ pub struct Limits {
     pub max_duration: TimeUs,
     /// Deepest nesting of open `#RANDOM` and `#IF` blocks, each counting one.
     pub max_nesting: usize,
+    /// Most bits in the denominator of the exact running time (D3).
+    pub max_time_bits: u64,
 }
 
 impl Default for Limits {
@@ -120,6 +124,7 @@ impl Default for Limits {
             max_measure: 999,
             max_duration: TimeUs(60 * 60 * 1_000_000),
             max_nesting: 16,
+            max_time_bits: 8192,
         }
     }
 }

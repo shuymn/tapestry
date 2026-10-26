@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bms_model::{ChartMeta, JudgeRank, Lane, LnMode};
+use num_bigint::BigInt;
 use num_traits::Signed;
 
 use crate::branch::Branches;
@@ -383,6 +384,6 @@ fn positive_decimal(text: &str, line: usize, what: &'static str) -> Result<Ratio
 /// floor for a non-negative value).
 fn thousandths(value: &str) -> Option<i64> {
     let v = parse_decimal(value).ok().filter(|v| !v.is_negative())?;
-    let milli = (v * Rational::from_integer(1_000)).to_integer();
+    let milli = (v * BigInt::from(1_000)).to_integer();
     i64::try_from(milli).ok()
 }
