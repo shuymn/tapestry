@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ::audio::{AudioEngine, AudioOutput, OutputError};
+use ::audio::{AudioEngine, AudioOutput, InvalidVolume, MAX_VOLUME, OutputError};
 use bms_model::TimeUs;
 
 use crate::sound::{AudioQueue, audio_link};
@@ -73,6 +73,10 @@ pub enum AudioCtl {
 
 #[derive(Debug, Default)]
 struct Shared {
+    /// A volume to apply: its `f32` bits with bit 32 set; 0 when none is
+    /// waiting. Only the newest counts, so volume keys never fill the
+    /// control queue.
+    volume: AtomicU64,
     /// The generation whose sealed audio has ended.
     done: AtomicU64,
     failure: OnceLock<OutputError>,
@@ -225,6 +229,22 @@ impl AudioControl {
         self.shared.failure.get().copied().or(gone)
     }
 
+    /// Sets the master volume from the next engine step on, whatever the
+    /// play's state; a newer volume replaces one not yet taken.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidVolume`] for a volume outside `0.0..=MAX_VOLUME`, which is
+    /// not sent.
+    pub fn set_volume(&self, volume: f32) -> Result<(), InvalidVolume> {
+        if !(0.0..=MAX_VOLUME).contains(&volume) {
+            return Err(InvalidVolume(volume));
+        }
+        let pending = u64::from(volume.to_bits()) | 1 << 32;
+        self.shared.volume.store(pending, Ordering::Release);
+        Ok(())
+    }
+
     /// Ends the worker's loop.
     pub fn exit(&mut self) {
         self.send(AudioCtl::Exit);
@@ -234,6 +254,11 @@ impl AudioControl {
 impl AudioWorker {
     /// Takes every control message; returns `false` once told to exit.
     fn control(&mut self) -> bool {
+        let volume = self.shared.volume.swap(0, Ordering::Acquire);
+        if volume != 0 {
+            // Checked by `set_volume`.
+            let _ = self.engine.set_volume(f32::from_bits(volume as u32));
+        }
         if let Some(old) = self.unreturned.take()
             && let Err(rtrb::PushError::Full(old)) = self.retired.push(old)
         {

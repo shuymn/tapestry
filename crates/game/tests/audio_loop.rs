@@ -127,3 +127,44 @@ fn a_gone_worker_fails_the_next_play() {
     assert!(started.elapsed() < game::SWITCH_TIMEOUT / 2);
     assert_eq!(control.failure(), Some(audio::OutputError::DeviceLost));
 }
+
+/// The master volume set from the game thread scales what the audio
+/// thread mixes from its next step on, during a play: the BGM sound at
+/// unity, then key sounds at one half, at zero and at one quarter. A
+/// volume outside 0 to the mixer's largest is refused and changes nothing.
+#[test]
+fn volume_change_scales_mixed_samples() {
+    let chart = chart();
+    let (mut control, mut worker, mut out) = rig(&chart);
+    let (mut sink, queue) = audio_link_at(8, TimeUs(50 * MS));
+    control.play(TimeUs(50 * MS), queue).unwrap();
+    let steps = |worker: &mut AudioWorker, out: &mut RecordingOutput<SimDevice>| {
+        for _ in 0..15 {
+            worker.step(out).unwrap();
+        }
+    };
+    steps(&mut worker, &mut out);
+    for (volume, pressed) in [(0.5, 150), (0.0, 300), (0.25, 450)] {
+        control.set_volume(volume).unwrap();
+        if volume == 0.25 {
+            for refused in [-0.01, audio::MAX_VOLUME * 2.0, f32::NAN] {
+                assert!(control.set_volume(refused).is_err(), "{refused}");
+            }
+        }
+        sink.receive(&key_sound(pressed * MS));
+        // The sound is playing, even at volume 0.
+        worker.step(&mut out).unwrap();
+        let mixer = worker.engine().mixer();
+        assert!(mixer.pending() + mixer.sounding() > 0, "at volume {volume}");
+        steps(&mut worker, &mut out);
+    }
+    let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+    let heard: Vec<f32> = left.iter().copied().filter(|&s| s != 0.0).collect();
+    // Exact: each level and each volume is a power-of-two fraction.
+    let bgm = 1_000.0 / 32_768.0;
+    let key = 1_007.0 / 32_768.0;
+    let mut expected = vec![bgm; 480];
+    expected.extend([key * 0.5; 480]);
+    expected.extend([key * 0.25; 480]);
+    assert_eq!(heard, expected);
+}
