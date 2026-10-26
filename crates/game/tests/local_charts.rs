@@ -12,17 +12,19 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
 use bms_model::TimeUs;
+use bms_parser::LoadError;
 use common::{PERIOD, RATE, count_judged, judgeable};
-use eval::EvalInput;
+use eval::{EvalError, EvalInput};
 use game::{
-    BmsIngest, ChartIngest, DataRoot, DeviceSettings, Loaded, Parts, PlayEnd, PlayScript,
-    RunnerAudio, SessionConfig, Settings,
+    BmsIngest, ChartIngest, DataRoot, DeviceSettings, IngestError, Loaded, LogicError, Parts,
+    PlayEnd, PlayScript, RunnerAudio, SessionConfig, SessionError, Settings,
 };
 use input::{DeviceKind, ScriptedInput, SourceSet};
 use replay::{BuildProvenance, DecodeLimits, ReceiveMethod};
@@ -44,9 +46,44 @@ fn charts(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Plays one chart; returns its note and warning counts, or `None` when the
-/// loader refuses it.
-fn sweep_one(path: &Path) -> Option<(usize, usize)> {
+/// Why a chart was not played, as a category with no detail of the chart.
+/// Only [`allowed`] ones let the sweep pass.
+fn category(e: &SessionError) -> &'static str {
+    match e {
+        SessionError::Ingest(IngestError::Load(l)) => match l {
+            LoadError::Unsupported { .. } => "unsupported directive",
+            LoadError::FileTooLarge { .. }
+            | LoadError::TooManyLines { .. }
+            | LoadError::TooManyObjects { .. }
+            | LoadError::MeasureOutOfRange { .. }
+            | LoadError::NestingTooDeep { .. }
+            | LoadError::DurationExceeded { .. } => "loading limit",
+            LoadError::InvalidValue { .. } => "invalid value",
+            LoadError::TimeOverflow { .. } => "time overflow",
+            LoadError::SoundPathRejected { .. } | LoadError::SoundPathEscapes { .. } => {
+                "sound path outside the folder"
+            }
+            LoadError::ChartDir { .. } => "chart folder unreadable",
+            LoadError::Model(_) => "loader bug",
+        },
+        SessionError::UnsupportedChart(_) => "unsupported format",
+        SessionError::InvalidStep(_) => "invalid step",
+        SessionError::Io { .. } => "file error",
+        SessionError::Preset(_) => "preset error",
+    }
+}
+
+/// Categories of chart the stage 1 player refuses by design.
+fn allowed(category: &str) -> bool {
+    matches!(
+        category,
+        "unsupported directive" | "unsupported long-note mode" | "no judgeable notes"
+    )
+}
+
+/// Plays one chart; returns its note and warning counts, or why it was not
+/// played.
+fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
     let dir = tempfile::Builder::new()
         .prefix("sweep")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -64,7 +101,7 @@ fn sweep_one(path: &Path) -> Option<(usize, usize)> {
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
     };
-    let loaded = Loaded::load(root, settings, path, config, parts).ok()?;
+    let loaded = Loaded::load(root, settings, path, config, parts).map_err(|e| category(&e))?;
     let chart = loaded.chart().clone();
     let notes = judgeable(&chart);
     let warnings = loaded.warnings().len();
@@ -89,7 +126,12 @@ fn sweep_one(path: &Path) -> Option<(usize, usize)> {
             input,
             commands: Vec::new(),
         })
-        .unwrap();
+        .map_err(|e| match e {
+            LogicError::Eval(EvalError::UnsupportedLnMode(_)) => "unsupported long-note mode",
+            LogicError::Eval(EvalError::NoJudgeableNotes) => "no judgeable notes",
+            LogicError::Eval(_) => "evaluator refusal",
+            _ => "logic refusal",
+        })?;
 
     assert_eq!(report.end, PlayEnd::Completed);
     assert!(notes > 0);
@@ -111,7 +153,7 @@ fn sweep_one(path: &Path) -> Option<(usize, usize)> {
     let saved = &report.saved.as_ref().unwrap().as_ref().unwrap().path;
     let decoded = replay::decode(&fs::read(saved).unwrap(), &DecodeLimits::STANDARD).unwrap();
     assert_eq!(&decoded, record);
-    Some((notes, warnings))
+    Ok((notes, warnings))
 }
 
 #[test]
@@ -121,15 +163,24 @@ fn local_charts_sweep() {
     let mut found = Vec::new();
     charts(Path::new(&dir), &mut found);
     let mut played = 0;
+    let mut refused: BTreeMap<&str, usize> = BTreeMap::new();
     for (i, path) in found.iter().enumerate() {
         match sweep_one(path) {
-            Some((notes, warnings)) => {
+            Ok((notes, warnings)) => {
                 played += 1;
                 println!("chart {}: notes {notes} warnings {warnings}", i + 1);
             }
-            None => println!("chart {}: refused by the loader", i + 1),
+            Err(category) => {
+                println!("chart {}: not played: {category}", i + 1);
+                *refused.entry(category).or_default() += 1;
+            }
         }
     }
     println!("{played} of {} charts played", found.len());
+    for (category, n) in &refused {
+        println!("not played, {category}: {n}");
+    }
+    let unexpected: Vec<_> = refused.keys().filter(|c| !allowed(c)).collect();
+    assert!(unexpected.is_empty(), "unexpected failures: {unexpected:?}");
     assert!(played > 0, "no chart could be played");
 }

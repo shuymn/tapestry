@@ -39,6 +39,10 @@ impl std::error::Error for IngestError {}
 pub trait ChartIngest {
     /// Whether this adapter reads the file at `path`, by its name.
     fn accepts(&self, path: &Path) -> bool;
+    /// The largest file the adapter accepts. The session reads at most one
+    /// byte more, so a larger file reaches the adapter cut there, and the
+    /// adapter refuses it.
+    fn max_bytes(&self) -> usize;
     /// Reads a chart from its file bytes; sounds resolve inside `dir`, and
     /// `seed` resolves any randomness, which is recorded.
     ///
@@ -57,6 +61,10 @@ impl ChartIngest for BmsIngest {
         path.extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("bms") || e.eq_ignore_ascii_case("bme"))
+    }
+
+    fn max_bytes(&self) -> usize {
+        LoadOptions::default().limits.max_file_bytes
     }
 
     fn ingest(&self, bytes: &[u8], dir: &Path, seed: u64) -> Result<Ingested, IngestError> {

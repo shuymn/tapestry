@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -143,6 +143,8 @@ pub struct SessionConfig {
 pub enum SessionError {
     /// No ingestion adapter reads the chart file.
     UnsupportedChart(PathBuf),
+    /// The configured step does not move the clock forward.
+    InvalidStep(TimeUs),
     /// A file could not be read or written.
     Io {
         /// The file.
@@ -160,6 +162,7 @@ impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedChart(_) => f.write_str("no adapter reads this chart format"),
+            Self::InvalidStep(step) => write!(f, "a step of {} us does not move the clock", step.0),
             Self::Io { kind, .. } => write!(f, "a file cannot be used: {kind}"),
             Self::Ingest(e) => e.fmt(f),
             Self::Preset(e) => e.fmt(f),
@@ -234,8 +237,9 @@ pub struct PlayReport {
     pub attempt: u32,
     /// How the play ended.
     pub end: PlayEnd,
-    /// A system control that ended the audio tail of a completed play.
-    pub tail_cut: Option<Command>,
+    /// What ended the audio tail of a completed play early, if anything;
+    /// the play stays complete.
+    pub tail_cut: Option<AbortCause>,
     /// Why the preset file changed at this retry but was not used; the
     /// previous preset played instead.
     pub reload_error: Option<ReloadError>,
@@ -278,8 +282,8 @@ impl Loaded {
     ///
     /// # Errors
     ///
-    /// [`SessionError`] for an unreadable preset or chart, or a chart no
-    /// adapter reads.
+    /// [`SessionError`] for a step that is not positive, an unreadable
+    /// preset or chart, or a chart no adapter reads.
     pub fn load(
         root: DataRoot,
         settings: Settings,
@@ -287,6 +291,9 @@ impl Loaded {
         config: SessionConfig,
         mut parts: Parts,
     ) -> Result<Self, SessionError> {
+        if config.step.0 <= 0 {
+            return Err(SessionError::InvalidStep(config.step));
+        }
         let preset_path = root.preset(&settings.player.preset);
         if !preset_path.exists() {
             if let Some(dir) = preset_path.parent() {
@@ -305,7 +312,14 @@ impl Loaded {
         if !parts.ingest.accepts(chart_path) {
             return Err(SessionError::UnsupportedChart(chart_path.to_owned()));
         }
-        let bytes = fs::read(chart_path).map_err(io_error(chart_path))?;
+        // The file is untrusted: read one byte past the adapter's limit at
+        // most, so a larger file is refused by the adapter without being
+        // read whole.
+        let limit = u64::try_from(parts.ingest.max_bytes()).unwrap_or(u64::MAX);
+        let mut bytes = Vec::new();
+        fs::File::open(chart_path)
+            .and_then(|f| f.take(limit.saturating_add(1)).read_to_end(&mut bytes))
+            .map_err(io_error(chart_path))?;
         let dir = chart_path.parent().unwrap_or_else(|| Path::new("."));
         let ingested = parts
             .ingest
@@ -369,8 +383,13 @@ impl Loaded {
 
 /// Reads and validates a preset file, with its modification time.
 fn read_preset(path: &Path) -> Result<(RulePreset, Option<SystemTime>), ReloadError> {
-    let text = fs::read_to_string(path).map_err(|e| ReloadError::Io(e.kind()))?;
-    let modified = fs::metadata(path).and_then(|m| m.modified()).ok();
+    // Content and time come from one open file, so a save that replaces
+    // the file in between cannot pair old content with the new time.
+    let io = |e: io::Error| ReloadError::Io(e.kind());
+    let mut file = fs::File::open(path).map_err(io)?;
+    let modified = file.metadata().and_then(|m| m.modified()).ok();
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(io)?;
     let preset = load_preset_toml(&text).map_err(ReloadError::Preset)?;
     Ok((preset, modified))
 }
@@ -391,6 +410,12 @@ impl<O: AudioOutput + Wakes> Session<O> {
     #[must_use]
     pub const fn preset(&self) -> &RulePreset {
         &self.loaded.preset
+    }
+
+    /// Calls `f` with each sound start the engine scheduled and kept (the
+    /// engine's schedule log) since the last drain.
+    pub fn drain_scheduled(&mut self, f: impl FnMut(&::audio::Scheduled)) {
+        self.audio.engine_mut().drain_scheduled(f);
     }
 
     /// The session clock: the audio output's timeline.
@@ -528,8 +553,14 @@ impl<O: AudioOutput + Wakes> Session<O> {
             }
             if let Err(e) = audio.step(global, true, &mut sounds) {
                 output_error = Some(e);
-                logic.abort(AbortCause::OutputFailed);
                 audio.cancel(&mut sounds);
+                render.drain_effects(|_| {});
+                // Completion in this step's advance is final; the failure
+                // only ends the tail, which is then not played.
+                if advance.complete {
+                    break PlayEnd::Completed;
+                }
+                logic.abort(AbortCause::OutputFailed);
                 break PlayEnd::Aborted(AbortCause::OutputFailed);
             }
             render.drain_effects(|_| {});
@@ -552,6 +583,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
         // Recording closes at the end of evaluation (D13): the input side
         // appends nothing more, and the record is frozen here.
         let arrivals: Vec<Arrival> = sources.arrivals().iter().map(arrival).collect();
+        let participants: Vec<_> = sources.participants().map(|(d, _)| d).collect();
         let incomplete = Incomplete {
             overflow: logic.overflowed() || sources.overflowed(),
             source_limit: sources.source_limited(),
@@ -564,32 +596,39 @@ impl<O: AudioOutput + Wakes> Session<O> {
         let displayed_gauge = parts.policy.displayed_gauge(&view.gauges);
 
         // The audio tail of a completed play: input still reaches the
-        // devices' state, but nothing is recorded; a system control cuts
-        // it short.
+        // devices' state, but nothing is recorded. A system control, focus
+        // loss, removal of the last participating device or an audio
+        // failure cuts it short; the record stays complete.
         let mut tail_cut = None;
-        if end == PlayEnd::Completed {
-            loop {
-                let silent = sounds.is_empty()
-                    && audio.engine().mixer().pending() == 0
-                    && audio.engine().mixer().sounding() == 0
-                    && audio.engine().bgm_left() == 0;
-                if silent {
-                    break;
-                }
-                clock.advance(config.step);
-                let global = clock.now();
-                let now = TimeUs(global.0 - origin.0);
-                script.input.poll(now, sources);
-                if let Some(c) = due(now) {
-                    tail_cut = Some(c);
-                    audio.cancel(&mut sounds);
-                    break;
-                }
-                if let Err(e) = audio.step(global, true, &mut sounds) {
-                    output_error = Some(e);
-                    audio.cancel(&mut sounds);
-                    break;
-                }
+        if end == PlayEnd::Completed && output_error.is_some() {
+            tail_cut = Some(AbortCause::OutputFailed);
+        }
+        while end == PlayEnd::Completed && tail_cut.is_none() {
+            let silent = sounds.is_empty()
+                && audio.engine().mixer().pending() == 0
+                && audio.engine().mixer().sounding() == 0
+                && audio.engine().bgm_left() == 0;
+            if silent {
+                break;
+            }
+            clock.advance(config.step);
+            let global = clock.now();
+            let now = TimeUs(global.0 - origin.0);
+            script.input.poll(now, sources);
+            tail_cut = if let Some(c) = due(now) {
+                Some(c.cause())
+            } else if sources.gate().is_tripped() {
+                Some(AbortCause::FocusLoss)
+            } else if !participants.iter().any(|&d| sources.is_connected(d)) {
+                Some(AbortCause::LastSourceRemoved)
+            } else if let Err(e) = audio.step(global, true, &mut sounds) {
+                output_error = Some(e);
+                Some(AbortCause::OutputFailed)
+            } else {
+                None
+            };
+            if tail_cut.is_some() {
+                audio.cancel(&mut sounds);
             }
         }
 
@@ -639,7 +678,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
             })
         });
         let retried =
-            end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(Command::Retry);
+            end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
         if retried {
             parts.events.on_event(&SessionEvent::Retry { attempt });
         }

@@ -402,6 +402,13 @@ impl SourceSet {
             .flat_map(|r| r.participants.iter().map(|p| (p.device, p.kind)))
     }
 
+    /// Whether `device` is connected and its state kept, with or without
+    /// an open recording.
+    #[must_use]
+    pub fn is_connected(&self, device: DeviceId) -> bool {
+        self.devices.iter().any(|d| d.id == device)
+    }
+
     /// Devices that arrived during the open recording.
     #[must_use]
     pub fn arrivals(&self) -> &[Arrival] {

@@ -43,7 +43,7 @@ pub use results::{
     ResultExtension, ResultSummary,
 };
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
-pub use save::{LocalRecords, RecordRef, RecordSink, SaveError, write_atomic};
+pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
     Command, Loaded, Parts, PlayEnd, PlayReport, PlayScript, ReloadError, Session, SessionConfig,
     SessionError, Settings,

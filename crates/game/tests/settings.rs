@@ -181,7 +181,104 @@ fn failed_rename_leaves_no_temporary_file() {
     let target = dir.path().join("target");
     fs::create_dir_all(target.join("inside")).unwrap();
     assert!(write_atomic(&target, b"bytes").is_err());
-    assert!(!dir.path().join("target.tmp").exists());
+    assert_eq!(names(dir.path()), ["target"]);
+    // Without its directory, nothing is written.
+    assert!(write_atomic(&dir.path().join("missing").join("file"), b"bytes").is_err());
+}
+
+fn names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn stale_temporary_files_are_left_alone() {
+    let (dir, _root) = temp_root();
+    // Temporary names this process would take next, left by a writer that
+    // stopped: the write moves past them.
+    let target = dir.path().join("file");
+    let pid = std::process::id();
+    for n in 0..2_000 {
+        fs::write(dir.path().join(format!("file.{pid}.{n}.tmp")), b"stale").unwrap();
+    }
+    write_atomic(&target, b"new").unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert_eq!(names(dir.path()).len(), 2_001);
+}
+
+#[test]
+fn two_writers_never_replace_each_others_records() {
+    let (_dir, root) = temp_root();
+    let rec = |writer: usize, i: usize| replay::PlayRecord {
+        versions: replay::Versions {
+            app: format!("writer {writer} play {i}"),
+            ..sample().versions
+        },
+        ..sample()
+    };
+    let saved: Vec<Vec<std::path::PathBuf>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..2)
+            .map(|w| {
+                let dir = root.records();
+                s.spawn(move || {
+                    let mut records = LocalRecords::new(dir);
+                    (0..25)
+                        .map(|i| records.save(&rec(w, i)).unwrap().path)
+                        .collect()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut all: Vec<_> = saved.concat();
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 50);
+    // Each file holds the record its writer saved there.
+    for (w, paths) in saved.iter().enumerate() {
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(fs::read(path).unwrap(), replay::encode(&rec(w, i)));
+        }
+    }
+    let dir = all[0].parent().unwrap();
+    let mut numbers: Vec<u64> = names(dir)
+        .iter()
+        .map(|n| n.trim_end_matches(".tprl").parse().unwrap())
+        .collect();
+    numbers.sort_unstable();
+    assert_eq!(numbers, (1..=50).collect::<Vec<u64>>());
+}
+
+#[test]
+fn saving_gives_up_after_the_bound_of_taken_numbers() {
+    let (_dir, root) = temp_root();
+    let mut records = LocalRecords::new(root.records());
+    let first = records.save(&sample()).unwrap().path;
+    let dir = first.parent().unwrap().to_owned();
+    fs::remove_file(&first).unwrap();
+    // Names taken by something other than a record file: the scan does not
+    // count them, and publishing moves past each.
+    let taken = |n: u64| fs::create_dir(dir.join(format!("{n}.tprl"))).unwrap();
+    for n in 1..game::SAVE_ATTEMPTS {
+        taken(n);
+    }
+    let last = records.save(&sample()).unwrap().path;
+    assert_eq!(last, dir.join(format!("{}.tprl", game::SAVE_ATTEMPTS)));
+    fs::remove_file(&last).unwrap();
+    taken(game::SAVE_ATTEMPTS);
+    assert!(matches!(
+        records.save(&sample()),
+        Err(game::SaveError::Io {
+            kind: std::io::ErrorKind::AlreadyExists,
+            ..
+        })
+    ));
+    // No temporary file is left either way.
+    assert!(names(&dir).iter().all(|n| n.ends_with(".tprl")));
 }
 
 #[test]

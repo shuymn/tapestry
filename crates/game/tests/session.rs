@@ -58,6 +58,10 @@ fn taps(notes: &[(u8, i64)]) -> Chart {
 struct Built(Chart);
 
 impl ChartIngest for Built {
+    fn max_bytes(&self) -> usize {
+        1 << 20
+    }
+
     fn accepts(&self, path: &Path) -> bool {
         path.extension().is_some_and(|e| e == "chart")
     }
@@ -109,7 +113,7 @@ fn chart_file(root: &DataRoot) -> PathBuf {
 }
 
 fn steady_audio(chart: &Chart, bank: Arc<SoundBank>) -> RunnerAudio<Out> {
-    let engine = AudioEngine::new(bank, &chart.bgm, RATE, PERIOD, MAX_VOICES, 0).unwrap();
+    let engine = AudioEngine::new(bank, &chart.bgm, RATE, PERIOD, MAX_VOICES, 64).unwrap();
     let device = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
     RunnerAudio::new(engine, RecordingOutput::new(device, 0))
 }
@@ -561,7 +565,7 @@ fn session_waits_for_audio_tail_after_completion() {
     let two = s
         .play(script(busy_items(), &[(2_500 * MS, Command::Retry)]))
         .unwrap();
-    assert_eq!(two.tail_cut, Some(Command::Retry));
+    assert_eq!(two.tail_cut, Some(AbortCause::Retry));
     assert_eq!(status(&two).0, EndStatus::PlayedToEnd);
     let three = s
         .play(script(Vec::new(), &[(-900 * MS, Command::Quit)]))
@@ -937,4 +941,255 @@ fn standard_parts_are_the_stage_one_set() {
     assert_eq!(parts.transform.id().id, "passthrough");
     assert_eq!(parts.policy.id(), "default");
     let _ = (ReEvaluate, LocalRecords::new(root.records()), Passthrough);
+}
+
+/// Accepts any `.chart` file up to `max` bytes and records how many bytes
+/// it was handed.
+struct Capped {
+    chart: Chart,
+    max: usize,
+    seen: Rc<RefCell<Option<usize>>>,
+}
+
+impl ChartIngest for Capped {
+    fn max_bytes(&self) -> usize {
+        self.max
+    }
+
+    fn accepts(&self, path: &Path) -> bool {
+        path.extension().is_some_and(|e| e == "chart")
+    }
+
+    fn ingest(&self, bytes: &[u8], _dir: &Path, _seed: u64) -> Result<Ingested, IngestError> {
+        *self.seen.borrow_mut() = Some(bytes.len());
+        Ok(Ingested {
+            chart: self.chart.clone(),
+            warnings: Vec::new(),
+        })
+    }
+}
+
+#[test]
+fn chart_is_read_one_byte_past_the_adapter_limit_at_most() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&[(1, 1_000)]);
+    let path = chart_file(&root);
+    fs::write(&path, vec![b'x'; 1_000]).unwrap();
+    for (max, expected) in [(10, 11), (999, 1_000), (1_000, 1_000)] {
+        let seen = Rc::new(RefCell::new(None));
+        let parts = Parts {
+            ingest: Box::new(Capped {
+                chart: chart.clone(),
+                max,
+                seen: Rc::clone(&seen),
+            }),
+            ..parts(&root, &chart, &Events::default())
+        };
+        let settings = Settings::load(&root).unwrap();
+        Loaded::load(root.clone(), settings, &path, config(), parts).unwrap();
+        assert_eq!(*seen.borrow(), Some(expected), "limit {max}");
+    }
+    // The BMS adapter refuses the cut file as too large.
+    let big = root.path().join("big.bms");
+    let limit = game::BmsIngest.max_bytes();
+    fs::write(&big, vec![b'*'; limit + 5]).unwrap();
+    let settings = Settings::load(&root).unwrap();
+    let parts = Parts::standard(&root, &settings.player);
+    assert_eq!(
+        Loaded::load(root.clone(), settings, &big, config(), parts).err(),
+        Some(SessionError::Ingest(IngestError::Load(
+            bms_parser::LoadError::FileTooLarge { bytes: limit + 1 }
+        )))
+    );
+}
+
+#[test]
+fn a_step_that_does_not_move_the_clock_is_refused() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&[(1, 1_000)]);
+    for step in [0, -1] {
+        let config = SessionConfig {
+            step: TimeUs(step),
+            ..config()
+        };
+        let settings = Settings::load(&root).unwrap();
+        let parts = parts(&root, &chart, &Events::default());
+        assert_eq!(
+            Loaded::load(root.clone(), settings, &chart_file(&root), config, parts).err(),
+            Some(SessionError::InvalidStep(TimeUs(step)))
+        );
+    }
+}
+
+#[test]
+fn audio_failure_at_the_completing_step_keeps_the_play_complete() {
+    // The last miss deadline is 0.999 + 0.18 s: evaluation completes at the
+    // step at 1.18 s of play time, session time 2.18 s, where a wake falls.
+    let chart = taps(&[(1, 999)]);
+    let (_dir, root) = temp_root();
+    let mut s = failing_session(&root, &chart, common::bank(&chart), 2_180 * MS, MS);
+    let one = s.play(script(vec![connect(0)], &[])).unwrap();
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(status(&one), (EndStatus::PlayedToEnd, TimeUs(1_179_999)));
+    assert_eq!(one.tail_cut, Some(AbortCause::OutputFailed));
+    assert_eq!(one.output_error, Some(audio::OutputError::DeviceLost));
+    assert!(
+        one.result
+            .as_ref()
+            .unwrap()
+            .evaluation
+            .as_ref()
+            .unwrap()
+            .completed
+    );
+    assert_eq!(s.now(), TimeUs(2_180 * MS));
+}
+
+#[test]
+fn focus_loss_and_device_removal_cut_the_tail() {
+    for (action, cause) in [
+        (Action::FocusLoss, AbortCause::FocusLoss),
+        (
+            Action::Disconnect(DeviceId(0)),
+            AbortCause::LastSourceRemoved,
+        ),
+    ] {
+        let (_dir, root) = temp_root();
+        let mut s = tail_session(&root, &Events::default());
+        let mut items = busy_items();
+        // At 2.0 s of play time, inside the BGM tail (it plays to 4.0 s).
+        items.push(item(2_000 * MS, action));
+        let one = s.play(script(items, &[])).unwrap();
+        assert_eq!(one.end, PlayEnd::Completed);
+        assert_eq!(one.tail_cut, Some(cause));
+        assert_eq!(status(&one), (EndStatus::PlayedToEnd, TimeUs(1_280_999)));
+        // Play time 2.0 s is session time 3.0 s, and the audio stops there.
+        assert_eq!(s.now(), TimeUs(3_000 * MS));
+        assert_eq!(s.audio().engine().mixer().sounding(), 0);
+    }
+}
+
+/// Moves every note 500 ms later.
+struct Later;
+
+impl game::ChartTransform for Later {
+    fn id(&self) -> game::TransformId {
+        game::TransformId {
+            id: "later",
+            version: 3,
+        }
+    }
+
+    fn apply(&self, mut chart: Chart, _seed: u64) -> Chart {
+        for note in chart.lanes.iter_mut().flatten() {
+            note.time = TimeUs(note.time.0 + 500 * MS);
+        }
+        chart
+    }
+}
+
+#[test]
+fn the_transformed_chart_is_played_and_recorded() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&[(1, 1_000)]);
+    let parts = Parts {
+        transform: Box::new(Later),
+        ..parts(&root, &chart, &Events::default())
+    };
+    let mut s = session_with(&root, parts);
+    let mut items = vec![connect(0)];
+    items.extend(presses(&[(1, 1_500)]));
+    let one = s.play(script(items, &[])).unwrap();
+
+    assert_eq!(
+        judgments(&one.live),
+        vec![(1, 0, Judgment::Perfect, Some(0))]
+    );
+    let rec = one.record.as_ref().unwrap();
+    assert_eq!(
+        rec.chart.transform,
+        replay::TransformRecord {
+            id: "later".to_owned(),
+            version: 3
+        }
+    );
+    assert!(one.result.as_ref().unwrap().matches_live);
+}
+
+#[test]
+fn key_sounds_and_bgm_follow_each_play_across_a_retry() {
+    let (_dir, root) = temp_root();
+    // A sounded tap at 1.0 s, an unsounded one at 2.0 s that keeps play 1
+    // going past its retry, and a BGM event at 1.2 s, with a 3 ms input
+    // offset and a 5 ms audio offset.
+    let mut chart = ChartBuilder::new(150_000)
+        .sound("k.wav")
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(2), TimeUs(2_000 * MS))
+        .bgm(TimeUs(1_200 * MS), SoundId(0))
+        .build()
+        .unwrap();
+    chart.lanes[1][0].sound = Some(SoundId(0));
+    let mut settings = Settings::load(&root).unwrap();
+    settings.device.input_offset_us = 3 * MS;
+    settings.device.audio_offset_us = 5 * MS;
+    settings.save(&root).unwrap();
+    let mut s = session(&root, &chart, &Events::default());
+    let press = |items: Vec<ScriptItem>| {
+        let mut v = items;
+        v.push(key(1_003 * MS, 0, 1, 1));
+        v.push(key(1_043 * MS, 0, 1, 0));
+        v
+    };
+    // Play 1's time 0 is session time 1.0 s. The retry at 1.5 s of play
+    // time (session 2.5 s) starts play 2, whose time 0 is session 3.5 s.
+    let one = s
+        .play(script(
+            press(vec![connect(0)]),
+            &[(1_500 * MS, Command::Retry)],
+        ))
+        .unwrap();
+    let mut first = Vec::new();
+    s.drain_scheduled(|x| first.push(*x));
+    let two = s.play(script(press(Vec::new()), &[])).unwrap();
+    let mut second = Vec::new();
+    s.drain_scheduled(|x| second.push(*x));
+
+    for (report, scheduled, origin) in [(&one, &first, 1_000 * MS), (&two, &second, 3_500 * MS)] {
+        assert_eq!(
+            judgments(&report.live)[0],
+            (1, 0, Judgment::Perfect, Some(0))
+        );
+        let keys: Vec<_> = scheduled
+            .iter()
+            .filter_map(|x| match x.kind {
+                audio::ScheduledKind::Key { origin } => Some((origin, x.at.unwrap())),
+                audio::ScheduledKind::Bgm { .. } => None,
+            })
+            .collect();
+        // The press, received 1.003 s into the play, on the session clock;
+        // its sound starts two to three 10 ms periods later.
+        assert_eq!(keys.len(), 1);
+        let (key_origin, key_at) = keys[0];
+        assert_eq!(key_origin, TimeUs(origin + 1_003 * MS));
+        let delay = key_at.0 - key_origin.0;
+        assert!(
+            (20 * MS..=30 * MS).contains(&delay),
+            "key sound {delay} us late"
+        );
+        // The BGM at 1.2 s, 5 ms early for the output latency, within a
+        // frame (1/48 000 s).
+        let bgm: Vec<_> = scheduled
+            .iter()
+            .filter(|x| matches!(x.kind, audio::ScheduledKind::Bgm { .. }))
+            .map(|x| x.at.unwrap().0)
+            .collect();
+        assert_eq!(bgm.len(), 1);
+        let expected = origin + 1_195 * MS;
+        assert!(
+            (bgm[0] - expected).abs() <= 21,
+            "BGM at {} not {expected}",
+            bgm[0]
+        );
+    }
 }

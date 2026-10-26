@@ -490,6 +490,23 @@ fn closed_source_keeps_its_final_watermark() {
 }
 
 #[test]
+fn connection_is_known_with_recording_open_or_closed() {
+    let mut set = keyboards(2);
+    set.open_recording(TimeUs(10));
+    set.begin_batch(TimeUs(20));
+    set.disconnect(DeviceId(1));
+    set.end_batch(TimeUs(21));
+    assert!(set.is_connected(DeviceId(0)));
+    assert!(!set.is_connected(DeviceId(1)));
+    set.close_recording();
+    set.begin_batch(TimeUs(30));
+    set.disconnect(DeviceId(0));
+    set.end_batch(TimeUs(31));
+    assert!(!set.is_connected(DeviceId(0)));
+    assert!(!set.is_connected(DeviceId(7)));
+}
+
+#[test]
 fn reconnecting_a_known_device_adds_no_source() {
     let mut set = keyboards(2);
     set.begin_batch(TimeUs(5));
