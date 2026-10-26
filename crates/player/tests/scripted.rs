@@ -145,6 +145,19 @@ fn measured(record: &Path) -> toml::Table {
     text.parse().unwrap()
 }
 
+/// `tapestry play <chart> --dev-scripted-input <log>` with its data root
+/// under `appdata`; the caller adds its own arguments.
+fn scripted_play(chart: &Path, log: &Path, appdata: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tapestry"));
+    command
+        .arg("play")
+        .arg(chart)
+        .arg("--dev-scripted-input")
+        .arg(log)
+        .env("LOCALAPPDATA", appdata);
+    command
+}
+
 fn int(t: &toml::Table, table: &str, key: &str) -> Option<i64> {
     t.get(table)?.get(key)?.as_integer()
 }
@@ -162,14 +175,9 @@ fn scripted_play_writes_a_record() {
     assert_eq!(events.len(), 2 * NOTES);
     let frames = dir.path().join("frames");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .arg("play")
-        .arg(&chart_path)
-        .arg("--dev-scripted-input")
-        .arg(&log)
+    let out = scripted_play(&chart_path, &log, &appdata)
         .arg("--dev-frames")
         .arg(&frames)
-        .env("LOCALAPPDATA", &appdata)
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -271,13 +279,8 @@ fn scripted_play_writes_a_record() {
 #[test]
 fn render_app_region_does_not_allocate() {
     let fx = fixture();
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .arg("play")
-        .arg(&fx.chart_path)
-        .arg("--dev-scripted-input")
-        .arg(&fx.log)
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
         .arg("--dev-overlay")
-        .env("LOCALAPPDATA", &fx.appdata)
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -324,12 +327,7 @@ fn an_invalid_key_config_exits_nonzero() {
         let mut device = DeviceSettings::default();
         change(&mut device);
         game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-            .arg("play")
-            .arg(&chart_path)
-            .arg("--dev-scripted-input")
-            .arg(&log)
-            .env("LOCALAPPDATA", &appdata)
+        let out = scripted_play(&chart_path, &log, &appdata)
             .output()
             .expect("run tapestry");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -349,14 +347,9 @@ fn an_invalid_key_config_exits_nonzero() {
 /// re-evaluate to their live streams, and both are saved. Returns stdout
 /// and the records in the order they were saved.
 fn run_retried(fx: &Fixture, extra: &[&str]) -> (String, Vec<PlayRecord>) {
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .arg("play")
-        .arg(&fx.chart_path)
-        .arg("--dev-scripted-input")
-        .arg(&fx.log)
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
         .arg("--dev-auto-retry")
         .args(extra)
-        .env("LOCALAPPDATA", &fx.appdata)
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
