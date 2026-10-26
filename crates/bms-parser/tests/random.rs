@@ -32,6 +32,10 @@ fn load(text: &str) -> Result<Loaded, LoadError> {
     load_seeded(text, 0)
 }
 
+fn times(notes: &[bms_model::Note]) -> Vec<i64> {
+    notes.iter().map(|n| n.time.0).collect()
+}
+
 /// The keys (lane indices) holding a note.
 fn keys(loaded: &Loaded) -> Vec<usize> {
     (0..8)
@@ -267,25 +271,36 @@ fn branch_records_do_not_change_the_resolved_hash() {
 }
 
 #[test]
-fn if_left_open_ends_at_the_next_if_of_its_random() {
+fn an_if_left_open_stacks_under_the_next_if_of_its_random() {
     let warned = |text: &str| {
         let loaded = load(text).unwrap();
         let warnings: Vec<_> = loaded.warnings.iter().map(|w| (w.line, &w.kind)).collect();
         (keys(&loaded), format!("{warnings:?}"))
     };
-    // #IF 2 ends #IF 1 (line 5), so its branch is read for value 2 and the
-    // line after its #ENDIF is outside every block.
-    let text = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#IF 2\n#00112:01\n#ENDIF\n#00113:01\n#00111:01\n";
+    // Value 2: #IF 2 (line 5) stacks on #IF 1, so its branch (key 2) is
+    // read; its #ENDIF makes #IF 1 count again, so key 3 is skipped; the
+    // last #ENDIF closes #IF 1 and key 1 is read.
+    let text = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#IF 2\n#00112:01\n#ENDIF\n#00113:01\n#ENDIF\n#00111:01\n";
     let expected = vec![(Some(5), &WarningKind::UnclosedIf)];
-    assert_eq!(warned(text), (vec![1, 2, 3], format!("{expected:?}")));
-    // Twenty #IF lines without #ENDIF stay one block deep.
-    let mut open = String::from("#BPM 120\n#WAV01 click.wav\n#SETRANDOM 20\n");
+    assert_eq!(warned(text), (vec![1, 2], format!("{expected:?}")));
+    // Twenty #IF lines, each over the one before, then one #ENDIF: only
+    // #IF 20's note is read; after the #ENDIF #IF 19 counts again, so the
+    // note of measure 30 is skipped. The stack is one nesting level and is
+    // warned about once.
+    let mut chain = String::from("#BPM 120\n#WAV01 click.wav\n#SETRANDOM 20\n");
     for k in 1..=20 {
-        open.push_str(&format!("#IF {k}\n#{:03}11:01\n", k));
+        chain.push_str(&format!("#IF {k}\n#{k:03}11:01\n"));
     }
-    let loaded = load(&open).unwrap();
-    assert_eq!(loaded.chart.lanes[1].len(), 1);
-    assert_eq!(loaded.chart.lanes[1][0].time, TimeUs(40_000_000));
+    chain.push_str("#ENDIF\n#03011:01\n");
+    let loaded = load(&chain).unwrap();
+    assert_eq!(times(&loaded.chart.lanes[1]), vec![40_000_000]);
+    let stacked: Vec<_> = loaded
+        .warnings
+        .iter()
+        .filter(|w| w.kind == WarningKind::UnclosedIf)
+        .map(|w| w.line)
+        .collect();
+    assert_eq!(stacked, vec![Some(6), None]);
     // An #IF inside a new #RANDOM still nests: the outer #IF 1 stays open,
     // so the line after the inner block is read only for value 1.
     let nested = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#SETRANDOM 3\n#IF 3\n#00112:01\n#ENDIF\n#ENDRANDOM\n#00113:01\n#ENDIF\n#00111:01\n";

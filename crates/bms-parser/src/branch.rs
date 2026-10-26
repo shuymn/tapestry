@@ -29,25 +29,35 @@ impl SplitMix64 {
     }
 }
 
+/// One `#IF` of a block: `active` while its current branch is taken,
+/// `taken` once any branch of it was.
 #[derive(Clone, Copy, Debug)]
+struct Condition {
+    active: bool,
+    taken: bool,
+}
+
+#[derive(Clone, Debug)]
 enum Frame {
     /// A `#RANDOM` or `#SETRANDOM` block; `value` is `None` exactly when the
     /// block sits in a branch not taken, so nothing was drawn.
     Random { value: Option<u32> },
-    /// An `#IF` block: `active` while the current branch is taken, `taken`
-    /// once any branch of it was, `parent` whether its block is taken.
+    /// The `#IF`s open directly inside one block; `parent` is whether that
+    /// block is taken. An `#IF` met while another is open stacks on it and
+    /// only the last one counts; `#ENDIF` pops one, so the one before
+    /// counts again. Never empty. The stack is one nesting level, bounded
+    /// by the line limit.
     If {
-        active: bool,
-        taken: bool,
         parent: bool,
+        conditions: Vec<Condition>,
     },
 }
 
 impl Frame {
-    const fn active(self) -> bool {
+    fn active(&self) -> bool {
         match self {
             Self::Random { value } => value.is_some(),
-            Self::If { active, .. } => active,
+            Self::If { conditions, .. } => conditions.last().is_some_and(|c| c.active),
         }
     }
 }
@@ -58,6 +68,8 @@ pub struct Branches {
     rng: SplitMix64,
     frames: Vec<Frame>,
     max_depth: usize,
+    /// An `#IF` stacked on another was warned about; once per chart.
+    warned_stacked: bool,
     /// Every `#RANDOM` and `#SETRANDOM` value in a taken branch, in order.
     pub results: Vec<u32>,
 }
@@ -68,6 +80,7 @@ impl Branches {
             rng: SplitMix64::new(seed),
             frames: Vec::new(),
             max_depth,
+            warned_stacked: false,
             results: Vec::new(),
         }
     }
@@ -120,17 +133,14 @@ impl Branches {
                 self.push(Frame::Random { value }, line)?;
             }
             "IF" => {
-                // An #IF met while an #IF of the same #RANDOM is open ends
-                // that one, since #ENDIF is often left out between
-                // consecutive branches. A block nests only inside a new
-                // #RANDOM.
-                let active = if matches!(self.frames.last(), Some(Frame::If { .. })) {
-                    self.frames.pop();
-                    warn(warnings, WarningKind::UnclosedIf);
-                    self.active()
-                } else {
-                    active
+                // An #IF met while an #IF of the same #RANDOM is open stacks
+                // on it, as #ENDIF is often left out between consecutive
+                // branches; its block's activity is the open one's.
+                let stacked = match self.frames.last() {
+                    Some(Frame::If { parent, .. }) => Some(*parent),
+                    _ => None,
                 };
+                let active = stacked.unwrap_or(active);
                 let random = self.frames.iter().rev().find_map(|f| match f {
                     Frame::Random { value, .. } => Some(*value),
                     Frame::If { .. } => None,
@@ -144,14 +154,24 @@ impl Branches {
                 } else {
                     false
                 };
-                self.push(
-                    Frame::If {
-                        active: taken,
-                        taken,
-                        parent: active,
-                    },
-                    line,
-                )?;
+                let condition = Condition {
+                    active: taken,
+                    taken,
+                };
+                if let Some(Frame::If { conditions, .. }) = self.frames.last_mut() {
+                    conditions.push(condition);
+                    if !std::mem::replace(&mut self.warned_stacked, true) {
+                        warn(warnings, WarningKind::UnclosedIf);
+                    }
+                } else {
+                    self.push(
+                        Frame::If {
+                            parent: active,
+                            conditions: vec![condition],
+                        },
+                        line,
+                    )?;
+                }
             }
             "ELSE" => {
                 // The innermost open #IF; a #RANDOM left open inside its
@@ -162,14 +182,11 @@ impl Branches {
                     .rposition(|f| matches!(f, Frame::If { .. }))
                 {
                     self.frames.truncate(i + 1);
-                    if let Some(Frame::If {
-                        active,
-                        taken,
-                        parent,
-                    }) = self.frames.last_mut()
+                    if let Some(Frame::If { parent, conditions }) = self.frames.last_mut()
+                        && let Some(c) = conditions.last_mut()
                     {
-                        *active = *parent && !*taken;
-                        *taken = true;
+                        c.active = *parent && !c.taken;
+                        c.taken = true;
                     }
                 } else {
                     warn(warnings, WarningKind::UnmatchedDirective("#ELSE"));
@@ -181,8 +198,15 @@ impl Branches {
                     .iter()
                     .rposition(|f| matches!(f, Frame::If { .. }))
                 {
-                    // Closes any #RANDOM left open inside the #IF too.
-                    self.frames.truncate(i);
+                    // Closes any #RANDOM left open inside the #IF too, and
+                    // the #IF stacked below it counts again.
+                    self.frames.truncate(i + 1);
+                    if let Some(Frame::If { conditions, .. }) = self.frames.last_mut() {
+                        conditions.pop();
+                        if conditions.is_empty() {
+                            self.frames.pop();
+                        }
+                    }
                 } else {
                     warn(warnings, WarningKind::UnmatchedDirective("#ENDIF"));
                 }

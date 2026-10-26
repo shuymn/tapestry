@@ -142,8 +142,8 @@ pub enum WarningKind {
     /// `#IF` outside any `#RANDOM` block (never taken), or `#ELSE`,
     /// `#ENDIF` or `#ENDRANDOM` without its block (ignored).
     UnmatchedDirective(&'static str),
-    /// An `#IF` closed by another `#IF` of its `#RANDOM`, by `#ENDRANDOM`
-    /// or by the end of the file.
+    /// An `#IF` left open under another `#IF` of its `#RANDOM` (once per
+    /// chart), or closed by `#ENDRANDOM` or by the end of the file.
     UnclosedIf,
 }
 
