@@ -974,6 +974,151 @@ mod tests {
         link.exit();
     }
 
+    /// Play frames the [`Stalling`] screen draws before it stalls.
+    const DRAWN_FRAMES: u32 = 2;
+
+    /// A paced screen that lets [`DRAWN_FRAMES`] play frames through and
+    /// then times out every wait; it keeps each frame's effect count and
+    /// how many of them were judgments.
+    struct Stalling {
+        waits: Arc<AtomicU32>,
+        seen: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl Screen for Stalling {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            if self.waits.fetch_add(1, Ordering::AcqRel) < DRAWN_FRAMES {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            false
+        }
+        fn paced(&self) -> bool {
+            true
+        }
+        fn build(&mut self, f: &FrameInput<'_>) {
+            let judged = f
+                .effects
+                .iter()
+                .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
+                .count();
+            self.seen.lock().unwrap().push((f.effects.len(), judged));
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// More effects are queued than a frame's buffer holds: each frame
+    /// draws at most a buffer's worth, and the rest wait in the queue.
+    /// Judgments still queued when the play ends never reached the screen
+    /// and are N/A in its figures, as are the drawn ones offscreen (no
+    /// present count to pair them with).
+    #[test]
+    fn frames_draw_a_buffer_of_effects_and_the_rest_end_na() {
+        use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
+        use game::DeviceSettings;
+        use input::DeviceKind;
+
+        const BUFFER: usize = 2;
+        let mut builder = ChartBuilder::new(120_000);
+        for k in 0..6 {
+            builder = builder.tap(Lane::new(1).unwrap(), TimeUs(1_000_000 + k * 200_000));
+        }
+        let chart = builder.build().unwrap();
+        let rule = rules::custom();
+        let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
+        let (mut writer, reader) = input::source_queue(32);
+        // Z, lane 1's default key, pressed on every note and released.
+        for k in 0..6 {
+            for (at, value) in [(0, 1), (50_000, 0)] {
+                writer
+                    .push(PhysicalInputEvent {
+                        received: TimeUs(1_000_000 + k * 200_000 + at),
+                        source: SourceId(0),
+                        kind: InputKind::Control {
+                            control: ControlId(0x2c),
+                            value,
+                        },
+                    })
+                    .unwrap();
+            }
+        }
+        writer.publish(TimeUs(3_000_000));
+        let (mut logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            vec![reader],
+            LogicConfig {
+                inputs: 32,
+                effects: 64,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        // Every effect is queued before the render thread draws a frame.
+        logic.advance_to(TimeUs(3_000_001));
+        let judged = logic
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
+            .count();
+        assert_eq!(judged, 6);
+        let waits = Arc::new(AtomicU32::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let screen = (Arc::clone(&waits), Arc::clone(&seen));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Stalling {
+                waits: Arc::clone(&screen.0),
+                seen: Arc::clone(&screen.1),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let view = View {
+            effects: BUFFER,
+            ..view()
+        };
+        let link = spawn(
+            make,
+            Arc::new(chart.clone()),
+            clock,
+            view,
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        // Past its last frame: the screen has stalled.
+        assert!(wait_until(|| waits.load(Ordering::Acquire) > DRAWN_FRAMES));
+        let fig = link.finish(clock.now()).expect("the play's figures");
+        link.exit();
+        let frames = seen.lock().unwrap().clone();
+        assert_eq!(frames.len(), DRAWN_FRAMES as usize);
+        // Each frame drew a full buffer, never more.
+        assert!(frames.iter().all(|&(n, _)| n == BUFFER), "{frames:?}");
+        let drawn: usize = frames.iter().map(|&(_, j)| j).sum();
+        assert!(drawn < judged, "{frames:?}");
+        // The drawn judgments and the ones still queued at the end.
+        assert_eq!(fig.press_to_screen_unavailable, judged as u64);
+        assert_eq!(fig.press_to_screen, None);
+    }
+
     /// Something that allocates, kept by `black_box` so no profile elides it.
     #[cfg(feature = "dev-tools")]
     fn allocate() {
