@@ -704,25 +704,64 @@ fn pipelines(
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as _;
+    use std::error::Error;
+
+    use wgpu::wgc::instance as core;
 
     use super::{RenderError, letterbox};
     use crate::SkinError;
 
-    /// The skin's refusal is the source, printed once in the chain; the
-    /// chain ends there.
+    /// Checks that `e` names only its step, and that its source is the
+    /// wrapped `T`, where the chain ends.
+    #[track_caller]
+    fn the_cause<'e, T: Error + 'static>(e: &'e RenderError, step: &str) -> &'e T {
+        assert_eq!(e.to_string(), step);
+        let source = e.source().expect("the wrapped error is the source");
+        assert!(!e.to_string().contains(&source.to_string()));
+        assert!(source.source().is_none());
+        source
+            .downcast_ref::<T>()
+            .expect("the source keeps its type")
+    }
+
+    /// Each wrapped failure is the source, printed once in the chain. The
+    /// device and surface errors are built from their wgpu-core forms,
+    /// which the DX12 backend compiles in.
     #[test]
-    fn a_skin_error_is_the_source() {
+    fn wrapped_failures_are_the_source() {
+        let adapter = RenderError::Adapter(wgpu::RequestAdapterError::EnvNotSet);
+        assert_eq!(
+            the_cause::<wgpu::RequestAdapterError>(&adapter, "adapter"),
+            &wgpu::RequestAdapterError::EnvNotSet
+        );
+
+        let unsupported = core::RequestDeviceError::UnsupportedFeature(wgpu::Features::empty());
+        let text = unsupported.to_string();
+        let device = RenderError::Device(unsupported.into());
+        let source = the_cause::<wgpu::RequestDeviceError>(&device, "device");
+        assert_eq!(source.to_string(), text);
+
+        let poll = RenderError::Poll(wgpu::PollError::Timeout);
+        let source = the_cause::<wgpu::PollError>(&poll, "device");
+        assert!(matches!(source, wgpu::PollError::Timeout));
+
+        let mismatch = core::CreateSurfaceError::MismatchingDisplayHandle;
+        let text = mismatch.to_string();
+        let surface = RenderError::Surface(mismatch.into());
+        let source = the_cause::<wgpu::CreateSurfaceError>(&surface, "surface");
+        assert_eq!(source.to_string(), text);
+
         let skin = SkinError {
             reason: "the chart has too many lanes".to_owned(),
         };
         let e = RenderError::Skin(skin.clone());
-        assert_eq!(e.to_string(), "skin");
-        let source = e.source().expect("the skin error is the source");
-        assert_eq!(source.downcast_ref::<SkinError>(), Some(&skin));
-        assert!(source.source().is_none());
-        assert!(!e.to_string().contains(&source.to_string()));
+        assert_eq!(the_cause::<SkinError>(&e, "skin"), &skin);
+    }
+
+    #[test]
+    fn leaf_failures_name_their_reason() {
         assert!(RenderError::SurfaceLost.source().is_none());
+        assert!(RenderError::SurfaceUnsupported.source().is_none());
         let e = RenderError::NoSoftwareAdapter {
             names: vec!["GPU".to_owned()],
         };
