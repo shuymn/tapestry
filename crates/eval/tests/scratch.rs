@@ -2,9 +2,9 @@
 //! lane, with the release after the axis stops as a deadline in the
 //! evaluator's scan (design.md "Analog Scratch").
 //!
-//! The axis is control `AXIS` of source 0, bound to the scratch with the
-//! default settings unless a test says otherwise: absolute, 256 positions
-//! per revolution, press after 2, hold by 1, release 100 ms after the last
+//! The axis is control `AXIS` of source 0, bound to the scratch as
+//! `TURNTABLE` unless a test says otherwise: absolute, 256 positions per
+//! revolution, press after 2, hold by 1, release 100 ms after the last
 //! press or hold. Evaluation times equal receive times (offset 0).
 
 mod common;
@@ -21,6 +21,13 @@ use rules::Judgment::Perfect;
 const BPM: i64 = 150_000;
 const AXIS: ControlId = ControlId(0x1_0030);
 const SCRATCH: Lane = Lane::SCRATCH;
+
+/// An absolute axis of 256 values a revolution with the default
+/// thresholds.
+const TURNTABLE: ScratchSettings = ScratchSettings {
+    mode: AxisMode::Absolute { wrap: 256 },
+    ..ScratchSettings::DEFAULT
+};
 
 /// Source 0 with the axis on the scratch and keys 1-7 on controls 1-7.
 fn axis_device(scratch: ScratchSettings) -> DeviceProfile {
@@ -121,7 +128,7 @@ fn scratch_ln() -> Chart {
 fn axis_wraparound_is_continuous() {
     // Forward through 255 → 0: one movement of 1 each step. The press comes
     // at 2 positions (2 ms) and nothing releases on the way round.
-    let mut c = Conv::new(ScratchSettings::DEFAULT);
+    let mut c = Conv::new(TURNTABLE);
     let fwd = c.reports(&[(0, 254), (1, 255), (2, 0), (3, 1), (4, 2)]);
     assert_eq!(fwd, [vec![], vec![], vec![P], vec![], vec![]]);
     assert_eq!(c.deadline(), Some(4 + 100 * MS), "each step held it");
@@ -134,20 +141,20 @@ fn axis_wraparound_is_continuous() {
     // Without wraparound, 255 → 0 is 255 positions back: a reversal.
     let no_wrap = ScratchSettings {
         mode: AxisMode::Absolute { wrap: 0 },
-        ..ScratchSettings::DEFAULT
+        ..TURNTABLE
     };
     let mut c = Conv::new(no_wrap);
     let edges = c.reports(&[(0, 254), (1, 255), (2, 256), (3, 0)]);
     assert_eq!(edges, [vec![], vec![], vec![P], vec![R, P]]);
 
     // Half a revolution counts forward; one more is backward.
-    let mut c = Conv::new(ScratchSettings::DEFAULT);
+    let mut c = Conv::new(TURNTABLE);
     // 0 → 128 is +128 (press forward); 128 → 130 holds.
     assert_eq!(
         c.reports(&[(0, 0), (1, 128), (2, 130)]),
         [vec![], vec![P], vec![]]
     );
-    let mut c = Conv::new(ScratchSettings::DEFAULT);
+    let mut c = Conv::new(TURNTABLE);
     // 0 → 129 is −127 (press backward); 129 → 131 reverses.
     assert_eq!(
         c.reports(&[(0, 0), (1, 129), (2, 131)]),
@@ -164,7 +171,7 @@ fn reversal_is_a_new_press() {
         .tap(SCRATCH, TimeUs(1_060 * MS))
         .build()
         .unwrap();
-    let dev = axis_device(ScratchSettings::DEFAULT);
+    let dev = axis_device(TURNTABLE);
     let inputs = [
         report(900 * MS, 100),   // where the axis is
         report(1_000 * MS, 102), // +2: press, the first tap
@@ -177,7 +184,7 @@ fn reversal_is_a_new_press() {
         [(0, 0, Perfect, Some(0)), (0, 1, Perfect, Some(0))]
     );
 
-    let mut c = Conv::new(ScratchSettings::DEFAULT);
+    let mut c = Conv::new(TURNTABLE);
     let edges: Vec<_> = inputs.iter().map(|&e| c.step(e)).collect();
     assert_eq!(edges, [vec![], vec![P], vec![], vec![R, P]]);
 }
@@ -185,7 +192,7 @@ fn reversal_is_a_new_press() {
 #[test]
 fn release_after_stop_is_a_deadline_not_a_frame() {
     let chart = scratch_ln();
-    let dev = axis_device(ScratchSettings::DEFAULT);
+    let dev = axis_device(TURNTABLE);
     let rule = rules::custom();
     let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 8).unwrap();
     ev.push_input(report(900 * MS, 10)).unwrap();
@@ -207,7 +214,7 @@ fn release_deadline_is_on_the_evaluation_timeline() {
     // The source is 5 ms late: received at 1005 ms is 1000 ms for
     // judgment, and the release is due 100 ms after that, at 1100 ms.
     let chart = scratch_ln();
-    let mut dev = axis_device(ScratchSettings::DEFAULT);
+    let mut dev = axis_device(TURNTABLE);
     dev.sources[0].input_offset = TimeUs(5 * MS);
     let events = run(
         &chart,
@@ -222,7 +229,7 @@ fn release_deadline_is_on_the_evaluation_timeline() {
 #[test]
 fn movement_moves_pending_release_deadline() {
     let chart = scratch_ln();
-    let dev = axis_device(ScratchSettings::DEFAULT);
+    let dev = axis_device(TURNTABLE);
     let rule = rules::custom();
     let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 8).unwrap();
     for e in [
@@ -255,7 +262,7 @@ fn hid_disconnect_releases_scratch_and_buttons() {
         .unwrap();
     let slow = ScratchSettings {
         release_after_us: 1_000_000,
-        ..ScratchSettings::DEFAULT
+        ..TURNTABLE
     };
     let dev = axis_device(slow);
     let inputs = [
@@ -304,7 +311,7 @@ fn axis_capacity_holds_a_song_of_1khz_reports() {
         b = b.tap(lane(1), TimeUs(s * 1_000 * MS));
     }
     let chart = b.build().unwrap();
-    let dev = axis_device(ScratchSettings::DEFAULT);
+    let dev = axis_device(TURNTABLE);
     let rule = rules::custom();
     let probe = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 0).unwrap();
     assert_eq!(probe.final_deadline(), TimeUs(180_180 * MS));
@@ -381,7 +388,7 @@ fn window_inputs_rounds_up_and_saturates() {
 
 #[test]
 fn small_movement_and_pauses_do_not_press() {
-    let mut c = Conv::new(ScratchSettings::DEFAULT);
+    let mut c = Conv::new(TURNTABLE);
     // A position's flicker at rest never adds up.
     let edges = c.reports(&[(0, 50), (1, 51), (2, 50), (3, 51), (4, 50)]);
     assert!(edges.iter().all(Vec::is_empty), "{edges:?}");
@@ -392,7 +399,7 @@ fn small_movement_and_pauses_do_not_press() {
     assert_eq!(edges, [vec![], vec![], vec![P]]);
     // A change of direction starts the count again: +1 then -2 presses
     // backward at the -2, where adding up would leave -1.
-    let mut c = Conv::new(ScratchSettings::DEFAULT);
+    let mut c = Conv::new(TURNTABLE);
     let edges = c.reports(&[(0, 50), (1, 51), (2, 49)]);
     assert_eq!(edges, [vec![], vec![], vec![P]]);
 }
@@ -402,7 +409,7 @@ fn hold_threshold_and_reversal_threshold() {
     let s = ScratchSettings {
         press_threshold: 4,
         hold_threshold: 2,
-        ..ScratchSettings::DEFAULT
+        ..TURNTABLE
     };
     let mut c = Conv::new(s);
     assert_eq!(c.reports(&[(0, 0), (10, 4)]), [vec![], vec![P]]);
@@ -429,7 +436,7 @@ fn hold_threshold_and_reversal_threshold() {
     let zero = ScratchSettings {
         press_threshold: 0,
         hold_threshold: 0,
-        ..ScratchSettings::DEFAULT
+        ..TURNTABLE
     };
     let mut c = Conv::new(zero);
     assert_eq!(
@@ -442,7 +449,7 @@ fn hold_threshold_and_reversal_threshold() {
 fn relative_axis_uses_reports_as_movement() {
     let s = ScratchSettings {
         mode: AxisMode::Relative,
-        ..ScratchSettings::DEFAULT
+        ..TURNTABLE
     };
     // A relative axis ignores a value in the snapshot.
     let start = InputStart {
@@ -464,17 +471,17 @@ fn snapshot_sets_where_an_absolute_axis_starts() {
         opened_at: TimeUs(0),
         held: vec![(SourceId(0), AXIS, 200)],
     };
-    let mut c = Conv::with_start(ScratchSettings::DEFAULT, &start);
+    let mut c = Conv::with_start(TURNTABLE, &start);
     assert!(!c.0.is_held(SCRATCH));
     assert_eq!(c.reports(&[(5, 202)]), [vec![P]]);
     // Without the snapshot, the first report only sets where it is.
-    let mut c = Conv::new(ScratchSettings::DEFAULT);
+    let mut c = Conv::new(TURNTABLE);
     assert_eq!(c.reports(&[(5, 202), (6, 203)]), [vec![], vec![]]);
 }
 
 #[test]
 fn button_and_axis_on_one_lane_combine() {
-    let mut dev = axis_device(ScratchSettings::DEFAULT);
+    let mut dev = axis_device(TURNTABLE);
     dev.sources[0].bindings.push(Binding {
         control: ControlId(100),
         lane: SCRATCH,
@@ -502,7 +509,7 @@ fn button_and_axis_on_one_lane_combine() {
 
 #[test]
 fn one_control_bound_twice_is_refused() {
-    let mut dev = axis_device(ScratchSettings::DEFAULT);
+    let mut dev = axis_device(TURNTABLE);
     dev.sources[0].bindings.push(Binding {
         control: AXIS,
         lane: lane(4),
@@ -515,7 +522,7 @@ fn one_control_bound_twice_is_refused() {
         ConversionState::init(&dev, &InputStart::default()).map(|_| ()),
         refused
     );
-    let mut dev = axis_device(ScratchSettings::DEFAULT);
+    let mut dev = axis_device(TURNTABLE);
     let again = dev.sources[0].axes[0];
     dev.sources[0].axes.push(again);
     assert_eq!(
@@ -534,7 +541,7 @@ fn scratch_release_comes_before_a_mine_at_the_same_time() {
         .mine(SCRATCH, TimeUs(1_099 * MS), 10)
         .build()
         .unwrap();
-    let dev = axis_device(ScratchSettings::DEFAULT);
+    let dev = axis_device(TURNTABLE);
     let events = run(
         &chart,
         &dev,
@@ -557,7 +564,7 @@ fn song_end_does_not_wait_for_a_pending_release() {
         .tap(lane(1), TimeUs(1_000 * MS))
         .build()
         .unwrap();
-    let dev = axis_device(ScratchSettings::DEFAULT);
+    let dev = axis_device(TURNTABLE);
     let events = run(
         &chart,
         &dev,
@@ -574,7 +581,7 @@ fn song_end_does_not_wait_for_a_pending_release() {
 
 #[test]
 fn deadline_saturates_at_the_end_of_time() {
-    let mut c = Conv::new(ScratchSettings::DEFAULT);
+    let mut c = Conv::new(TURNTABLE);
     c.reports(&[(i64::MAX - 10, 0), (i64::MAX - 5, 2)]);
     assert_eq!(c.deadline(), Some(i64::MAX));
 }
@@ -589,7 +596,7 @@ fn aborted_and_incremental_scratch_match_batch() {
         .tap(lane(2), TimeUs(2_000 * MS))
         .build()
         .unwrap();
-    let dev = axis_device(ScratchSettings::DEFAULT);
+    let dev = axis_device(TURNTABLE);
     let mut events = vec![report(800 * MS, 30)];
     // Turn forward 2 at 1000 ms (the head), then 1 every 40 ms to 1480 ms
     // (held; released at 1580 ms), then back 3 at 2000 ms (a press at the
@@ -668,7 +675,7 @@ fn axes_are_found_by_source_and_control() {
     let bind = |control, l| AxisBinding {
         control: ControlId(control),
         lane: lane(l),
-        scratch: ScratchSettings::DEFAULT,
+        scratch: TURNTABLE,
     };
     dev.sources[0].axes = vec![bind(0x1_0035, 2), bind(0x1_0030, 5)];
     dev.sources[1].axes = vec![bind(0x1_0030, 6)];
@@ -712,7 +719,7 @@ fn profiles_beyond_the_binding_limits_are_refused() {
     let axis = |i: usize| AxisBinding {
         control: ControlId(0x1_0000 + u32::try_from(i).unwrap()),
         lane: SCRATCH,
-        scratch: ScratchSettings::DEFAULT,
+        scratch: TURNTABLE,
     };
     let key = |i: usize| Binding {
         control: ControlId(u32::try_from(i).unwrap()),
@@ -736,4 +743,31 @@ fn profiles_beyond_the_binding_limits_are_refused() {
     assert_eq!(profile(3, 0, 6), refused);
     assert_eq!(profile(4, 256, 0), Ok(()));
     assert_eq!(profile(5, 205, 0), refused);
+}
+
+#[test]
+fn signed_axis_jitter_at_its_wrap_is_one_position() {
+    // A signed 8-bit turntable reports -128..=127: 256 positions a
+    // revolution. Flicker between 127 and -128 is +1 then -1 the short
+    // way round, never a press; a turn through it is continuous.
+    let mut c = Conv::new(TURNTABLE);
+    let flicker = c.reports(&[(0, 127), (1, -128), (2, 127), (3, -128), (4, 127)]);
+    assert!(flicker.iter().all(Vec::is_empty), "{flicker:?}");
+    let turn = c.reports(&[(10, -128), (11, -127)]);
+    assert_eq!(turn, [vec![], vec![P]]);
+    // With the 255 positions a declared -127..=127 suggests, 127 to -128
+    // is no movement at all, so the same two-position turn is lost: the
+    // wrap must be the field's 256.
+    let mut c = Conv::new(TURNTABLE);
+    assert_eq!(
+        c.reports(&[(0, 127), (1, -128), (2, -127)]),
+        [vec![], vec![], vec![P]]
+    );
+    let short = ScratchSettings {
+        mode: AxisMode::Absolute { wrap: 255 },
+        ..TURNTABLE
+    };
+    let mut c = Conv::new(short);
+    let edges = c.reports(&[(0, 127), (1, -128), (2, -127)]);
+    assert!(edges.iter().all(Vec::is_empty), "{edges:?}");
 }

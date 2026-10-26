@@ -88,6 +88,8 @@ struct Participant {
     closed: bool,
     /// The controls recorded from this source, frozen at the opening.
     recorded: Vec<ControlId>,
+    /// Axis values it reported outside their declared range.
+    out_of_range: u64,
 }
 
 /// The open recording.
@@ -273,6 +275,8 @@ impl SourceSet {
                     control: ControlId(0),
                     relative: false,
                     wrap: 0,
+                    min: 0,
+                    max: 0,
                 }; MAX_AXES],
                 n_axes: 0,
                 positions: [None; MAX_AXES],
@@ -345,6 +349,27 @@ impl SourceSet {
     /// out as unchanged: trips the focus gate all the same.
     pub fn background(&mut self) {
         self.gate.background();
+    }
+
+    /// An absolute axis of `device` reported a value outside its declared
+    /// range: its descriptor is wrong, so its conversion may be off. The
+    /// value is recorded as reported; a participating source counts it,
+    /// and its record says so ([`axis_out_of_range`](Self::axis_out_of_range)).
+    pub fn axis_value_out_of_range(&mut self, device: DeviceId) {
+        if let Some(rec) = &mut self.recording
+            && let Some(p) = rec.participants.iter_mut().find(|p| p.device == device)
+        {
+            p.out_of_range = p.out_of_range.saturating_add(1);
+        }
+    }
+
+    /// How many axis values each participating source of the open
+    /// recording reported outside their declared range, indexed by
+    /// [`SourceId`].
+    pub fn axis_out_of_range(&self) -> impl Iterator<Item = u64> + '_ {
+        self.recording
+            .iter()
+            .flat_map(|r| r.participants.iter().map(|p| p.out_of_range))
     }
 
     /// Input that could not be read (a packet larger than the adapter's
@@ -495,6 +520,7 @@ impl SourceSet {
                 writer,
                 closed: false,
                 recorded,
+                out_of_range: 0,
             });
             readers.push(reader);
         }

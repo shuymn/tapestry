@@ -125,7 +125,10 @@ fn advance_does_not_allocate() {
     dev.sources[0].axes.push(AxisBinding {
         control: AXIS,
         lane: lane(0),
-        scratch: ScratchSettings::DEFAULT,
+        scratch: ScratchSettings {
+            mode: eval::AxisMode::Absolute { wrap: 256 },
+            ..ScratchSettings::DEFAULT
+        },
     });
     let end = 1_000 * MS + NOTES * 50 * MS + 1_000 * MS;
     let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 64).unwrap();

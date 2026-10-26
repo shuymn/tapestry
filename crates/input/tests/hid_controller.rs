@@ -13,16 +13,17 @@
 #![cfg(windows)]
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind};
-use input::hid::{axis_control, button_control, in_collection, is_axis};
+use input::hid::{AxisCap, axis_control, button_control, in_collection, is_axis};
 use input::{
-    Capture, DeviceKind, FocusLatch, InputThread, QpcClock, SourceConfig, SourceReader, SourceSet,
-    controller_layouts, hid_usages,
+    Capture, DeviceId, DeviceKind, FocusLatch, InputThread, QpcClock, SourceConfig, SourceReader,
+    SourceSet, controller_layouts, hid_usages,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -104,24 +105,6 @@ fn hid_controller_round_trip() {
     }
     assert!(controllers > 0, "no game controller is connected");
     let layouts = controller_layouts().unwrap();
-    // Declared values per revolution by axis control, for the summary.
-    let mut declared = BTreeMap::new();
-    for l in &layouts {
-        println!(
-            "collection {} of controller source {}: grouped by container {}, {} axes",
-            l.collection,
-            l.source,
-            l.grouped,
-            l.axes.len()
-        );
-        for a in &l.axes {
-            println!(
-                "  axis {:#010x}: relative {}, declared values per revolution {}",
-                a.control.0, a.relative, a.wrap
-            );
-            declared.insert(a.control.0, a.wrap);
-        }
-    }
 
     let sources = SourceSet::new(SourceConfig {
         max_devices: 16,
@@ -138,8 +121,15 @@ fn hid_controller_round_trip() {
         recorded.extend((1..=32).map(|b| in_collection(button_control(b), c)));
         recorded.extend((0x30..=0x38).map(|u| in_collection(axis_control(0x01, u), c)));
     }
-    let (tx, rx) = mpsc::channel::<(Vec<SourceReader>, Vec<DeviceKind>)>();
+    // What opening gave, by source id: the readers, and each participant's
+    // device, kind and the axes the input thread uses for it.
+    type Opened = (Vec<SourceReader>, Vec<(DeviceId, DeviceKind, Vec<AxisCap>)>);
+    let (tx, rx) = mpsc::channel::<Opened>();
     let (tripped_tx, tripped_rx) = mpsc::channel::<()>();
+    // Each source's count of axis values outside their declared range,
+    // published by the hook at every wake.
+    let out_of_range: Arc<Vec<AtomicU64>> = Arc::new((0..16).map(|_| AtomicU64::new(0)).collect());
+    let counts = Arc::clone(&out_of_range);
     let mut opened = false;
     let thread = InputThread::spawn(
         QpcClock::start(),
@@ -149,6 +139,9 @@ fn hid_controller_round_trip() {
             if opened {
                 if sources.gate().is_tripped() {
                     let _ = tripped_tx.send(());
+                }
+                for (c, n) in counts.iter().zip(sources.axis_out_of_range()) {
+                    c.store(n, Ordering::Release);
                 }
                 return;
             }
@@ -160,12 +153,15 @@ fn hid_controller_round_trip() {
                 }
             }
             sources.open_recording(now);
-            let kinds = sources.participants().map(|(_, k)| k).collect();
-            let _ = tx.send((sources.take_readers(), kinds));
+            let participants = sources
+                .participants()
+                .map(|(d, k)| (d, k, sources.axes(d).to_vec()))
+                .collect();
+            let _ = tx.send((sources.take_readers(), participants));
         },
     )
     .unwrap();
-    let (mut readers, kinds) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (mut readers, participants) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
     println!("press buttons and turn the turntable for 20 s");
     // Per source: button presses by number, and reports per axis.
     let mut buttons: Vec<BTreeMap<u32, usize>> = vec![BTreeMap::new(); readers.len()];
@@ -195,25 +191,81 @@ fn hid_controller_round_trip() {
     if tripped_rx.try_recv().is_ok() {
         println!("the focus gate tripped: input after the focus loss was not recorded");
     }
+    // One numbering: the play's source ids. Each controller source is
+    // labeled by its collections' usages, and each axis compared with the
+    // range the input thread declared for it.
     let mut complete = 0;
-    for (i, kind) in kinds.iter().enumerate() {
+    let mut wrong = Vec::new();
+    for (i, (device, kind, caps)) in participants.iter().enumerate() {
         if *kind != DeviceKind::Controller {
+            println!("source {i}: keyboard");
             continue;
         }
-        println!("source {i}: controller");
+        let own: Vec<_> = layouts.iter().filter(|l| l.device == *device).collect();
+        let label: Vec<String> = own
+            .iter()
+            .map(|l| {
+                format!(
+                    "collection {} usage {:#06x}:{:#06x}{}",
+                    l.collection,
+                    l.usage.0,
+                    l.usage.1,
+                    if l.grouped { "" } else { " (not grouped)" }
+                )
+            })
+            .collect();
+        println!("source {i}: controller, {}", label.join(", "));
+        for cap in caps {
+            let bits = own
+                .iter()
+                .find_map(|l| {
+                    let k = l.axes.iter().position(|a| a.control == cap.control)?;
+                    Some(l.declared[k].2)
+                })
+                .unwrap_or(0);
+            if cap.relative {
+                println!("  axis {:#010x}: relative, {bits} bits", cap.control.0);
+            } else {
+                println!(
+                    "  axis {:#010x}: declared {}..={} in {bits} bits, {} values a revolution",
+                    cap.control.0, cap.min, cap.max, cap.wrap
+                );
+            }
+        }
         for (b, n) in &buttons[i] {
-            println!("  button {b}: {n} presses");
+            println!("  button {b:#x}: {n} presses");
         }
         for (a, (n, min, max)) in &axes[i] {
-            println!(
-                "  axis {a:#010x}: {n} reports, observed {min}..={max}, declared {} values",
-                declared.get(a).copied().unwrap_or(0)
-            );
+            let cap = caps.iter().find(|c| c.control.0 == *a);
+            println!("  axis {a:#010x}: {n} reports, observed {min}..={max}");
+            // Observed against declared, for an absolute axis that moved
+            // enough: inside the declared range, or else counted by the
+            // input thread as a wrong descriptor and marked on the source.
+            if let Some(cap) = cap.filter(|c| !c.relative)
+                && *n >= 20
+            {
+                let inside = (cap.min..=cap.max).contains(min) && (cap.min..=cap.max).contains(max);
+                let counted = out_of_range[i].load(Ordering::Acquire);
+                if inside {
+                    println!("    inside the declared range");
+                } else {
+                    println!(
+                        "    OUTSIDE the declared range: {counted} values counted for the record"
+                    );
+                    if counted == 0 {
+                        wrong.push(format!(
+                            "source {i} axis {a:#010x}: observed {min}..={max} outside {}..={} but not counted",
+                            cap.min, cap.max
+                        ));
+                    }
+                }
+            }
         }
         if !buttons[i].is_empty() && !axes[i].is_empty() {
             complete += 1;
         }
     }
+    assert!(wrong.is_empty(), "axes not handled: {wrong:#?}");
     assert!(
         complete > 0,
         "no controller source delivered both a button and an axis"

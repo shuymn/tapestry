@@ -50,7 +50,7 @@ use crate::capture::Capture;
 use crate::gate::DeviceId;
 use crate::hid::{
     AXIS_USAGES, AxisCap, ButtonGroup, DESKTOP_PAGE, HidDevice, HidLayout, HidReport, MAX_AXES,
-    MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_control, axis_span, axis_value, collection_of,
+    MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_cap, axis_control, axis_value, collection_of,
     in_collection, read_report, remove_collection,
 };
 use crate::raw;
@@ -292,6 +292,9 @@ struct AxisRead {
     usage: u16,
     bits: u16,
     signed: bool,
+    /// The declared logical range.
+    min: i32,
+    max: i32,
 }
 
 /// A connected controller collection: its handle, its source, its
@@ -303,6 +306,8 @@ struct Controller {
     /// it.
     container: Option<u128>,
     collection: u8,
+    /// Its top-level collection's usage page and usage.
+    usage: (u16, u16),
     /// Whether its reports start with a report id.
     report_ids: bool,
     /// 8-byte aligned preparsed data.
@@ -347,6 +352,7 @@ impl Controllers {
                     handle: None,
                     container: None,
                     collection: 0,
+                    usage: (0, 0),
                     report_ids: false,
                     preparsed: vec![0; PREPARSED_WORDS].into_boxed_slice(),
                     reads: [AxisRead::default(); MAX_AXES],
@@ -403,6 +409,8 @@ impl Controllers {
             control: eval::ControlId(0),
             relative: false,
             wrap: 0,
+            min: 0,
+            max: 0,
         }; MAX_AXES];
         let mut groups = [ButtonGroup {
             report_id: 0,
@@ -427,6 +435,7 @@ impl Controllers {
         slot.handle = Some(key);
         slot.container = container;
         slot.collection = collection;
+        slot.usage = hid_usage(handle).unwrap_or((0, 0));
         slot.report_ids = axis_ids || button_ids;
         slot.state = HidDevice::new(
             device,
@@ -593,7 +602,7 @@ fn container_of(path: &[u16], instance: &mut [u16]) -> Option<u128> {
 /// Reads the generic desktop axes ([`AXIS_USAGES`]) of a collection's
 /// input reports into `reads` and `caps`, with controls in `collection`,
 /// without duplicates and without axes whose range cannot be represented
-/// ([`axis_span`]). Returns how many there are, and whether the value
+/// ([`axis_cap`]). Returns how many there are, and whether the value
 /// capabilities name report ids.
 fn read_axes(
     data: PHIDP_PREPARSED_DATA,
@@ -631,11 +640,11 @@ fn read_axes(
         };
         for usage in min..=max {
             let control = in_collection(axis_control(v.UsagePage, usage), collection);
-            let span = axis_span(v.LogicalMin, v.LogicalMax, v.BitSize);
+            let cap = axis_cap(control, v.IsAbsolute, v.LogicalMin, v.LogicalMax, v.BitSize);
             if n == MAX_AXES
                 || !AXIS_USAGES.contains(&usage)
                 || caps[..n].iter().any(|c| c.control == control)
-                || (v.IsAbsolute && span.is_none())
+                || cap.is_none()
             {
                 continue;
             }
@@ -644,12 +653,13 @@ fn read_axes(
                 usage,
                 bits: v.BitSize,
                 signed: v.LogicalMin < 0,
+                min: v.LogicalMin,
+                max: v.LogicalMax,
             };
-            caps[n] = AxisCap {
-                control,
-                relative: !v.IsAbsolute,
-                wrap: if v.IsAbsolute { span.unwrap_or(0) } else { 0 },
+            let Some(cap) = cap else {
+                continue;
             };
+            caps[n] = cap;
             n += 1;
         }
     }
@@ -891,6 +901,30 @@ impl RawInput {
     }
 }
 
+/// The usage page and usage of a HID device's top-level collection.
+fn hid_usage(handle: HANDLE) -> Option<(u16, u16)> {
+    let mut info = RID_DEVICE_INFO {
+        cbSize: size_of::<RID_DEVICE_INFO>() as u32,
+        ..Default::default()
+    };
+    let mut size = info.cbSize;
+    // SAFETY: `info` holds `size` bytes.
+    let got = unsafe {
+        GetRawInputDeviceInfoW(
+            Some(handle),
+            RIDI_DEVICEINFO,
+            Some((&raw mut info).cast::<c_void>()),
+            &mut size,
+        )
+    };
+    if got == u32::MAX || info.dwType != RIM_TYPEHID {
+        return None;
+    }
+    // SAFETY: the system filled the HID variant.
+    let hid = unsafe { info.Anonymous.hid };
+    Some((hid.usUsagePage, hid.usUsage))
+}
+
 /// What a device is: a keyboard, a game controller (a HID joystick or
 /// gamepad), or neither.
 fn device_kind(handle: HANDLE) -> Option<DeviceKind> {
@@ -938,17 +972,23 @@ fn deliver(
 /// A controller collection as the input thread reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionInfo {
-    /// Which source it is part of, numbered from 0 in the order the
-    /// sources are found; collections of one physical device share it.
-    pub source: usize,
     /// Whether it is grouped with its device's other collections by the
     /// device's container; `false` when it is a source of its own.
     pub grouped: bool,
     /// Its collection number in its controls.
     pub collection: u8,
+    /// Its top-level collection's usage page and usage.
+    pub usage: (u16, u16),
     /// Its axes: usages in its collection, whether relative, and the
     /// values in a revolution of an absolute one.
     pub axes: Vec<AxisCap>,
+    /// Each axis's declared logical minimum and maximum and its field's
+    /// bits, as the descriptor states them.
+    pub declared: Vec<(i32, i32, u16)>,
+    /// Its source's device: the collections of one physical controller
+    /// share it, and the input thread's [`SourceSet`] knows the source by
+    /// it.
+    pub device: DeviceId,
 }
 
 /// Every game controller collection present, in the order the OS lists
@@ -987,19 +1027,20 @@ pub fn controller_layouts() -> Result<Vec<CollectionInfo>, InputError> {
             controllers.connect(d.hDevice, &mut sources);
         }
     }
-    let ids: Vec<DeviceId> = sources.devices().map(|(d, _)| d).collect();
     Ok(controllers
         .slots
         .iter()
         .filter(|s| s.handle.is_some())
         .map(|s| CollectionInfo {
-            source: ids
-                .iter()
-                .position(|&d| d == s.state.device())
-                .unwrap_or(usize::MAX),
             grouped: s.container.is_some(),
             collection: s.collection,
+            usage: s.usage,
             axes: s.state.axes().to_vec(),
+            declared: s.reads[..s.state.axes().len()]
+                .iter()
+                .map(|r| (r.min, r.max, r.bits))
+                .collect(),
+            device: s.state.device(),
         })
         .collect())
 }

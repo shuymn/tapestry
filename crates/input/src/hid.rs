@@ -79,21 +79,48 @@ pub const fn axis_value(raw: u32, bits: u16, signed: bool) -> i32 {
     ((raw << shift) as i32) >> shift
 }
 
-/// The values an absolute axis reports, `max − min + 1`, from its declared
-/// logical range: one revolution of a turntable. A field unsigned to its
+/// The capability of an axis with control `control`, from its
+/// descriptor: relative, or absolute with the declared logical range
+/// `min..=max` in a field of `bits` bits, whose `max − min + 1` values are
+/// one revolution. Any signedness and any width: a field unsigned to its
 /// full width declares its maximum as a negative number (0xFFFF read as
-/// -1), which is read back unsigned. `None` when the count does not fit in
-/// a `u32` (a full 32-bit field) or the range is empty: such an axis is not
-/// read.
+/// -1 in 16 bits), which is read back unsigned. `None` for an absolute axis
+/// whose count of values does not fit in a `u32` (a full 32-bit field) or
+/// whose range is empty: such an axis is not read.
+///
+/// A descriptor can be wrong: a value reported outside the declared range
+/// is counted at run time ([`SourceSet::axis_value_out_of_range`]).
 #[must_use]
-pub fn axis_span(min: i32, max: i32, bits: u16) -> Option<u32> {
+pub fn axis_cap(
+    control: ControlId,
+    absolute: bool,
+    min: i32,
+    max: i32,
+    bits: u16,
+) -> Option<AxisCap> {
+    if !absolute {
+        return Some(AxisCap {
+            control,
+            relative: true,
+            wrap: 0,
+            min: 0,
+            max: 0,
+        });
+    }
     let max = if max < min && (1..32).contains(&bits) {
-        i64::from(max.cast_unsigned() & ((1_u32 << bits) - 1))
+        i32::try_from(max.cast_unsigned() & ((1_u32 << bits) - 1)).ok()?
     } else {
-        i64::from(max)
+        max
     };
-    let span = max - i64::from(min) + 1;
-    u32::try_from(span).ok().filter(|&s| s > 0)
+    let span = i64::from(max) - i64::from(min) + 1;
+    let wrap = u32::try_from(span).ok().filter(|&s| s > 0)?;
+    Some(AxisCap {
+        control,
+        relative: false,
+        wrap,
+        min,
+        max,
+    })
 }
 
 /// The collection number Windows gives a controller's top-level collection
@@ -119,15 +146,23 @@ pub struct AxisCap {
     pub control: ControlId,
     /// Whether each report is a movement rather than a position.
     pub relative: bool,
-    /// For an absolute axis, the values it reports ([`axis_span`]), as one
-    /// revolution; 0 for a relative one.
+    /// For an absolute axis, the values it reports ([`axis_cap`]), as
+    /// one revolution; 0 for a relative one.
     pub wrap: u32,
+    /// For an absolute axis, the declared lowest value; 0 for a relative
+    /// one.
+    pub min: i32,
+    /// For an absolute axis, the declared highest value; 0 for a relative
+    /// one.
+    pub max: i32,
 }
 
 const NO_AXIS: AxisCap = AxisCap {
     control: ControlId(0),
     relative: false,
     wrap: 0,
+    min: 0,
+    max: 0,
 };
 
 /// The buttons one report id carries: bit `n − 1` is button `n`.
@@ -301,6 +336,10 @@ impl HidDevice {
                 continue;
             };
             let cap = self.caps[i];
+            if !cap.relative && !(cap.min..=cap.max).contains(&value) {
+                // A wrong descriptor: recorded as reported, and counted.
+                sources.axis_value_out_of_range(device);
+            }
             let moved = if cap.relative {
                 i64::from(value)
             } else {

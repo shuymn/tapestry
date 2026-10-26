@@ -114,13 +114,14 @@ pub struct ScratchSettings {
 }
 
 impl ScratchSettings {
-    /// Defaults for a turntable that reports an 8-bit absolute axis, the
-    /// common controller layout: 256 positions per revolution, a press
-    /// after 2 positions (a single position's flicker at rest never
-    /// presses), held by any further movement, and released 100 ms after
-    /// the movement stops. Starting points, tuned by playing.
+    /// Defaults for the thresholds and the release time: a press after 2
+    /// positions (a single position's flicker at rest never presses), held
+    /// by any further movement, and released 100 ms after the movement
+    /// stops; starting points, tuned by playing. The range is the device's
+    /// to declare, so the default mode is absolute without wraparound,
+    /// which the device's declared range replaces.
     pub const DEFAULT: Self = Self {
-        mode: AxisMode::Absolute { wrap: 256 },
+        mode: AxisMode::Absolute { wrap: 0 },
         press_threshold: 2,
         hold_threshold: 1,
         release_after_us: 100_000,

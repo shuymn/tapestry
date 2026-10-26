@@ -7,7 +7,7 @@
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use input::hid::{
-    AxisCap, ButtonGroup, HidDevice, HidLayout, HidReport, axis_control, axis_span, axis_value,
+    AxisCap, ButtonGroup, HidDevice, HidLayout, HidReport, axis_cap, axis_control, axis_value,
     button_control, capture_travel, collection_of, in_collection, is_axis, read_report,
     remove_collection,
 };
@@ -23,11 +23,15 @@ fn caps() -> [AxisCap; 2] {
             control: X,
             relative: false,
             wrap: 256,
+            min: 0,
+            max: 255,
         },
         AxisCap {
             control: DIAL,
             relative: true,
             wrap: 0,
+            min: 0,
+            max: 0,
         },
     ]
 }
@@ -180,6 +184,8 @@ fn more_axes_than_kept_are_ignored() {
             control: axis_control(1, 0x30 + i),
             relative: false,
             wrap: 0,
+            min: 0,
+            max: 0,
         })
         .collect();
     let dev = HidDevice::new(PAD, &layout(&many));
@@ -308,6 +314,8 @@ fn capture_travel_is_a_sixteenth_turn_at_least_16() {
         control: X,
         relative: false,
         wrap,
+        min: 0,
+        max: 0,
     };
     assert_eq!(capture_travel(&cap(0)), 16);
     assert_eq!(capture_travel(&cap(256)), 16);
@@ -507,6 +515,8 @@ fn collections_of_one_controller_are_one_source() {
         control: x2,
         relative: false,
         wrap: 256,
+        min: 0,
+        max: 255,
     }];
     let mut second = HidDevice::new(
         PAD,
@@ -555,17 +565,101 @@ fn controls_carry_their_collection() {
 }
 
 #[test]
-fn axis_span_is_the_declared_range() {
-    // 8-bit 0..255 and the 0..254 some controllers declare.
-    assert_eq!(axis_span(0, 255, 8), Some(256));
-    assert_eq!(axis_span(0, 254, 8), Some(255));
-    // A 16-bit field unsigned to its full width declares its maximum as -1.
-    assert_eq!(axis_span(0, -1, 16), Some(65_536));
-    assert_eq!(axis_span(-128, 127, 8), Some(256));
+fn axis_cap_takes_the_declared_range_of_any_shape() {
+    let cap = |absolute, min, max, bits| axis_cap(X, absolute, min, max, bits);
+    let absolute = |wrap, min, max| {
+        Some(AxisCap {
+            control: X,
+            relative: false,
+            wrap,
+            min,
+            max,
+        })
+    };
+    // Signed and unsigned 8 bits.
+    assert_eq!(cap(true, -128, 127, 8), absolute(256, -128, 127));
+    assert_eq!(cap(true, 0, 255, 8), absolute(256, 0, 255));
+    // A narrower declaration is taken as declared, whatever the field.
+    assert_eq!(cap(true, -127, 127, 8), absolute(255, -127, 127));
+    assert_eq!(cap(true, 0, 254, 8), absolute(255, 0, 254));
+    // Unsigned 10 and 12 bits, as encoders report them in 16-bit fields.
+    assert_eq!(cap(true, 0, 1023, 16), absolute(1024, 0, 1023));
+    assert_eq!(cap(true, 0, 4095, 12), absolute(4096, 0, 4095));
+    // Signed 16 bits, and unsigned 16 bits declaring its maximum as -1.
+    assert_eq!(
+        cap(true, -32_768, 32_767, 16),
+        absolute(65_536, -32_768, 32_767)
+    );
+    assert_eq!(cap(true, 0, -1, 16), absolute(65_536, 0, 65_535));
+    // A relative axis has no range.
+    assert_eq!(
+        cap(false, -127, 127, 8),
+        Some(AxisCap {
+            control: X,
+            relative: true,
+            wrap: 0,
+            min: 0,
+            max: 0,
+        })
+    );
     // A full 32-bit range does not fit in a u32; an empty one is no range.
-    assert_eq!(axis_span(i32::MIN, i32::MAX, 32), None);
-    assert_eq!(axis_span(0, -1, 32), None);
-    assert_eq!(axis_span(5, 4, 0), None);
+    assert_eq!(cap(true, i32::MIN, i32::MAX, 32), None);
+    assert_eq!(cap(true, 0, -1, 32), None);
+    assert_eq!(cap(true, 5, 4, 0), None);
+}
+
+#[test]
+fn values_outside_the_declared_range_are_recorded_and_counted() {
+    // A descriptor declaring -127..=127 for an axis that also reports
+    // -128: the value is recorded as reported, and counted.
+    let (mut set, mut reader) = recording();
+    let capture = Capture::new();
+    let narrow = [axis_cap(X, true, -127, 127, 8).unwrap()];
+    let mut dev = HidDevice::new(PAD, &layout(&narrow));
+    let at = |v| [Some(v)];
+    let (a, b, c) = (at(127), at(-128), at(-127));
+    let r = |axes| HidReport {
+        id: 0,
+        buttons: None,
+        axes,
+    };
+    batch(
+        &mut dev,
+        &mut set,
+        &capture,
+        10,
+        &[r(&a), r(&b), r(&c), r(&b)],
+    );
+    assert_eq!(
+        drain(&mut reader),
+        [
+            (0x1_0030, 127),
+            (0x1_0030, -128),
+            (0x1_0030, -127),
+            (0x1_0030, -128)
+        ]
+    );
+    assert_eq!(set.axis_out_of_range().sum::<u64>(), 2);
+    // A relative axis is never out of range.
+    let dial = [axis_cap(DIAL, false, 0, 0, 8).unwrap()];
+    let mut dev = HidDevice::new(PAD, &layout(&dial));
+    batch(&mut dev, &mut set, &capture, 20, &[r(&at(-90))]);
+    assert_eq!(set.axis_out_of_range().sum::<u64>(), 2);
+    // A new recording starts the count again.
+    set.close_recording();
+    set.open_recording(TimeUs(30));
+    assert_eq!(set.axis_out_of_range().sum::<u64>(), 0);
+}
+
+#[test]
+fn signed_8_bit_reports_sign_extend_into_their_range() {
+    // The field's raw values read as the axis reports them.
+    let cap = axis_cap(X, true, -128, 127, 8).unwrap();
+    for (raw, value) in [(0x7F, 127), (0x80, -128), (0xFF, -1), (0, 0)] {
+        let v = axis_value(raw, 8, true);
+        assert_eq!(v, value);
+        assert!((cap.min..=cap.max).contains(&v));
+    }
 }
 
 #[test]
@@ -666,6 +760,8 @@ fn axes_past_the_table_are_not_kept() {
             ),
             relative: false,
             wrap: 256,
+            min: 0,
+            max: 255,
         })
         .collect();
     let kept = set.add_axes(PAD, &more);
