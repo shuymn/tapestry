@@ -319,3 +319,25 @@ fn background_level_is_unchanged_by_a_loud_key_sound() {
     assert_eq!((single, double), (50, 50));
     assert_eq!(m.saturated(), 100);
 }
+
+#[test]
+fn a_saturated_channel_leaves_the_other_unchanged() {
+    // Two copies of a sound at 30 000 on the left and 1 000 on the right:
+    // the left sum after the headroom, 0.92, is above the knee and
+    // saturates; the right, 2 000 / 65 536, passes exactly. A stereo-linked
+    // gain would lower the right too.
+    let sound = (0..100).flat_map(|_| [30_000i16, 1_000]).collect();
+    let bank = SoundBank::from_sounds(2_000, vec![Sound::stereo(sound)]);
+    let mut m = Mixer::new(2, 2_000);
+    m.trigger(&bank, SoundId(0), 0).unwrap();
+    m.trigger(&bank, SoundId(0), 0).unwrap();
+    let out = render(&mut m, &bank, 100);
+    let mut frames = 0;
+    for f in out.chunks(2) {
+        assert!(f[0] > 0.8 && f[0] < 60_000.0 / 65_536.0, "{f:?}");
+        assert_eq!(f[1], 2_000.0 / 65_536.0);
+        frames += 1;
+    }
+    assert_eq!(frames, 100);
+    assert_eq!(m.saturated(), 100);
+}

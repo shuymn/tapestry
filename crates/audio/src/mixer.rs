@@ -69,9 +69,13 @@ impl std::error::Error for InvalidVolume {}
 /// [`SOFT_CLIP_KNEE`]; above it, `knee + (1 - knee) tanh((|x| - knee) /
 /// (1 - knee))` with the sign of `x`, which meets the identity with the
 /// same slope and approaches full scale. It never exceeds full scale:
-/// `knee + (1 - knee)` is exactly 1 in `f32` and `tanh` is at most 1.
+/// `knee + (1 - knee)` is exactly 1 in `f32` and `tanh` is at most 1. A
+/// NaN, which no sum of finite samples makes, becomes silence.
 #[must_use]
 pub fn soft_clip(x: f32) -> f32 {
+    if x.is_nan() {
+        return 0.0;
+    }
     let a = x.abs();
     if a <= SOFT_CLIP_KNEE {
         return x;
@@ -380,6 +384,8 @@ mod tests {
         assert!(reached_full_scale);
         assert_eq!(soft_clip(f32::MAX), 1.0);
         assert_eq!(soft_clip(f32::NEG_INFINITY), -1.0);
+        assert_eq!(soft_clip(f32::NAN), 0.0);
+        assert_eq!(soft_clip(-f32::NAN), 0.0);
     }
 
     #[test]
