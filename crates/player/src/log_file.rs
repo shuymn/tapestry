@@ -58,11 +58,7 @@ pub fn start(dir: &Path, command: &str) {
 /// Writes the exit line with `code` into the room kept for it, if logging
 /// is on.
 pub fn finish(code: u8) {
-    if let Ok(mut state) = LOG.state.lock()
-        && let Some(logged) = state.as_mut()
-    {
-        logged.sink.finish(code);
-    }
+    LOG.finish(code);
 }
 
 /// Prints every warning on stderr as `warning: <w>`, as the command always
@@ -119,6 +115,17 @@ impl<W> FileLog<W> {
     const fn new() -> Self {
         Self {
             state: Mutex::new(None),
+        }
+    }
+}
+
+impl<W: Write> FileLog<W> {
+    /// The sink's exit line; the lease stays held.
+    fn finish(&self, code: u8) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(logged) = state.as_mut()
+        {
+            logged.sink.finish(code);
         }
     }
 }
@@ -368,7 +375,7 @@ impl fmt::Write for Cut<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File, OpenOptions, TryLockError};
     use std::io::{self, Write};
     use std::path::Path;
     use std::sync::mpsc;
@@ -377,7 +384,8 @@ mod tests {
     use log::{Level, Log, Metadata, Record};
 
     use super::{
-        Caps, FileLog, LINE_CAP, Logged, Sink, WARNINGS_LOGGED, name, open, taken, warnings_to,
+        Caps, FileLog, LINE_CAP, LOCK, Logged, Sink, WARNINGS_LOGGED, name, open, taken,
+        warnings_to,
     };
 
     fn sink<W: Write>(out: W, caps: Caps) -> Sink<W> {
@@ -727,6 +735,66 @@ mod tests {
         drop(first);
         run(&logs, 1);
         assert!(logs.join(name(2)).exists());
+    }
+
+    /// Whether another handle, opened on its own, finds the lease held.
+    fn leased(logs: &Path) -> bool {
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(logs.join(LOCK))
+            .unwrap();
+        match other.try_lock() {
+            Err(TryLockError::WouldBlock) => true,
+            Ok(()) => false,
+            Err(TryLockError::Error(e)) => panic!("{e}"),
+        }
+    }
+
+    /// The lease outlives the writer: after a failed write turns it off,
+    /// and after the exit line, the process still holds it, until the
+    /// logger goes.
+    #[test]
+    fn the_lease_is_held_after_the_writer_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        // A failed write, through the logger: the file is swapped for a
+        // read-only handle, which refuses the record.
+        let log = FileLog::<File>::new();
+        *log.state.lock().unwrap() = open(&logs, "play", &mut io::sink());
+        let read_only = File::open(logs.join(name(0))).unwrap();
+        log.state.lock().unwrap().as_mut().unwrap().sink.out = Some(read_only);
+        log.log(&record_of("tapestry", Level::Info, format_args!("x")));
+        assert!(
+            log.state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .sink
+                .out
+                .is_none()
+        );
+        assert!(leased(&logs));
+        drop(log);
+        assert!(!leased(&logs));
+        // The exit line, through the logger.
+        let log = FileLog::<File>::new();
+        *log.state.lock().unwrap() = open(&logs, "play", &mut io::sink());
+        log.finish(0);
+        assert!(
+            log.state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .sink
+                .out
+                .is_none()
+        );
+        assert!(leased(&logs));
+        drop(log);
+        assert!(!leased(&logs));
     }
 
     /// A `logs` path that is a file is an open failure: one `log:` line and
