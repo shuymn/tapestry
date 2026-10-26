@@ -182,3 +182,53 @@ impl<'a> Iterator for Blocks<'a> {
         Some(block)
     }
 }
+
+/// `RIM_TYPEHID`.
+pub const RIM_TYPEHID: u32 = 2;
+
+/// The `RAWHID` fields before the reports: `dwSizeHid` and `dwCount`.
+pub const HID_HEADER_SIZE: usize = 8;
+
+/// The input reports of one `RAWINPUT` block of a HID device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HidBlock<'a> {
+    /// The device.
+    pub device: DeviceId,
+    /// The header's `RIM_INPUTSINK`: received in the background.
+    pub background: bool,
+    size: usize,
+    data: &'a [u8],
+}
+
+impl<'a> HidBlock<'a> {
+    /// Each report, in the order received.
+    pub fn reports(&self) -> impl Iterator<Item = &'a [u8]> + use<'a> {
+        self.data.chunks_exact(self.size)
+    }
+}
+
+/// Decodes one `RAWINPUT` block of a HID device: its `dwCount` reports of
+/// `dwSizeHid` bytes each. Returns `None` for a block that is not a HID
+/// device's, a null device handle, reports of size 0, or reports that do
+/// not fit in the block.
+#[must_use]
+pub fn decode_hid(block: &[u8]) -> Option<HidBlock<'_>> {
+    if u32_at(block, 0)? != RIM_TYPEHID {
+        return None;
+    }
+    let device = usize_at(block, 8)?;
+    let wparam = usize_at(block, 8 + PTR)?;
+    let size = u32_at(block, HEADER_SIZE)? as usize;
+    let count = u32_at(block, HEADER_SIZE + 4)? as usize;
+    let start = HEADER_SIZE + HID_HEADER_SIZE;
+    let end = start.checked_add(size.checked_mul(count)?)?;
+    if device == 0 || size == 0 {
+        return None;
+    }
+    Some(HidBlock {
+        device: DeviceId(device as u64),
+        background: wparam & 0xFF == RIM_INPUTSINK,
+        size,
+        data: block.get(start..end)?,
+    })
+}

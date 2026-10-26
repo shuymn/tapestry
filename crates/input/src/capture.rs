@@ -21,6 +21,8 @@ struct Slot {
     /// The captured control in the low 32 bits, with [`PRESENT`] and, for
     /// a controller, [`CONTROLLER`]; 0 while nothing is captured.
     control: AtomicU64,
+    /// How many times the slot was armed.
+    armings: AtomicU64,
 }
 
 /// The capture slot shared by the input thread, which offers packets, and
@@ -37,8 +39,16 @@ impl Capture {
 
     /// Captures the next press, dropping any earlier capture.
     pub fn arm(&self) {
+        self.0.armings.fetch_add(1, Ordering::Relaxed);
         self.0.control.store(0, Ordering::Relaxed);
         self.0.armed.store(true, Ordering::Release);
+    }
+
+    /// How many times the slot was armed: an axis counts its turn toward a
+    /// capture from the latest arming.
+    #[must_use]
+    pub fn armings(&self) -> u64 {
+        self.0.armings.load(Ordering::Relaxed)
     }
 
     /// The captured control and the kind of device it belongs to, if one

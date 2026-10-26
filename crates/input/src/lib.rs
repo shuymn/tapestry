@@ -12,10 +12,11 @@
 //! [`ScriptedInput`] feeds a scenario or a recorded log through the same
 //! path, and [`autoplay`] makes the inputs that hit every note of a chart.
 //!
-//! On Windows, the input thread (`InputThread`) receives keyboards
-//! through Raw Input and stamps each batch with the QPC
-//! read at its wake (`QpcClock`). Decoding the Raw Input packets
-//! ([`raw`]) and converting QPC ticks ([`qpc_to_us`]) are portable.
+//! On Windows, the input thread (`InputThread`) receives keyboards and
+//! HID game controllers through Raw Input and stamps each batch with the
+//! QPC read at its wake (`QpcClock`). Decoding the Raw Input packets
+//! ([`raw`]), turning controller reports into packets ([`hid`]) and
+//! converting QPC ticks ([`qpc_to_us`]) are portable.
 //!
 //! After construction (and after [`SourceSet::open_recording`]), pushing
 //! and publishing allocate nothing.
@@ -26,6 +27,7 @@
 
 mod capture;
 mod gate;
+pub mod hid;
 mod queue;
 pub mod raw;
 mod scripted;
@@ -44,7 +46,9 @@ pub use scripted::{Action, ScriptItem, ScriptedInput, TimeOverflow, autoplay};
 pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, SourceSet};
 pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
 #[cfg(windows)]
-pub use win::{InputError, InputThread, QpcClock, WakeReport, keyboard_target};
+pub use win::{
+    InputError, InputThread, QpcClock, WakeReport, controller_axes, hid_usages, keyboard_target,
+};
 
 /// Something that delivers input to a [`SourceSet`], such as a script in
 /// tests. The Raw Input receiver polls the same way but is not `Send`: it
