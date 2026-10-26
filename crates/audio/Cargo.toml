@@ -3,7 +3,7 @@ name = "audio"
 version = "0.0.0"
 description = "Sound bank, mixer and audio clock; WASAPI output on Windows."
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 

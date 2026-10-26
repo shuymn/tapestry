@@ -3,7 +3,7 @@ name = "render"
 version = "0.0.0"
 description = "The play screen: wgpu on DX12, the sprite batch, the bitmap font, and the skin boundary with the simple skin."
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 

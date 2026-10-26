@@ -3,7 +3,7 @@ name = "rules"
 version = "0.0.0"
 description = "Judgment and gauge rule presets."
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 publish.workspace = true
 

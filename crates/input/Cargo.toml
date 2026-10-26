@@ -3,7 +3,7 @@ name = "input"
 version = "0.0.0"
 description = "Input sources: per-source queues and watermarks, the focus gate, scripted input, and Raw Input keyboards with QPC on Windows."
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
