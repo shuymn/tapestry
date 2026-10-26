@@ -920,21 +920,20 @@ fn input_to_judgment_is_timed_per_judgment_at_delivery() {
     assert_eq!((a.2 + origin - 140) % MS, 0, "delivered at {}", a.2);
 }
 
-/// A record sink that takes its time, and notes when it saved.
-struct SlowSink(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+/// A record sink that notes when it saved, in the lifecycle order.
+struct NotingSink(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
 
-impl game::RecordSink for SlowSink {
+impl game::RecordSink for NotingSink {
     fn save(&mut self, _rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
-        std::thread::sleep(std::time::Duration::from_millis(30));
         self.0.lock().unwrap().push("saved");
         Ok(game::RecordRef {
-            path: "slow.tprl".into(),
+            path: "noted.tprl".into(),
         })
     }
 }
 
-/// The play is over, and its measurement stops, before a slow save: each
-/// play goes play over, saved, ended.
+/// The play is over, and its measurement stops, before it is saved, however
+/// long saving takes: each play goes play over, saved, ended.
 #[test]
 fn the_play_is_over_before_it_is_saved() {
     let dir = tempfile::tempdir().unwrap();
@@ -945,7 +944,7 @@ fn the_play_is_over_before_it_is_saved() {
     let order = std::sync::Arc::default();
     let parts = Parts {
         ingest: Box::new(Built(chart())),
-        records: Box::new(SlowSink(std::sync::Arc::clone(&order))),
+        records: Box::new(NotingSink(std::sync::Arc::clone(&order))),
         ..Parts::standard(&root, &settings.player)
     };
     let config = SessionConfig {

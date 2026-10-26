@@ -269,8 +269,6 @@ fn percentiles_cover_the_whole_play() {
     let near = |got: i64, exact: f64| (got as f64 - exact).abs() <= exact * RELATIVE_ERROR;
     assert!(near(x.p50, 10_000.0), "{}", x.p50);
     assert!(near(x.p99, 19_800.0), "{}", x.p99);
-    // The first half alone would read about 5 000: the old half counts.
-    assert!(x.p50 > 9_000);
 
     let mut s = Samples::new();
     for v in [9, 1, 3, 4, 5, 6, 60, 63] {

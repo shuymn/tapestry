@@ -29,6 +29,8 @@ static COUNTS: [AtomicU64; 5] = [ZERO; 5];
 
 thread_local! {
     static TAG: Cell<u8> = const { Cell::new(0) };
+    /// This thread's allocations, for the allocation tests.
+    #[cfg(test)]
     static MINE: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -49,6 +51,7 @@ pub fn this_thread() -> u64 {
 }
 
 fn note() {
+    #[cfg(test)]
     let _ = MINE.try_with(|m| m.set(m.get() + 1));
     let t = TAG.try_with(Cell::get).unwrap_or(0);
     COUNTS[usize::from(t)].fetch_add(1, Ordering::Relaxed);

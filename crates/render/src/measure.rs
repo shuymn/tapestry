@@ -281,8 +281,8 @@ impl Presentation {
 /// tenth of a refresh (VRR, or a composed window).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RefreshLedger {
-    /// Present count, present refresh count, and the sync (QPC, count).
-    last: Option<(u32, u32, i64, u32)>,
+    /// The last accepted sample.
+    last: Option<FrameStatistics>,
     count: RefreshCount,
 }
 
@@ -301,16 +301,18 @@ impl RefreshLedger {
     /// One accepted sample, in the order they were taken; `period_qpc` is
     /// one refresh when the presentation is countable and the period known.
     pub fn accepted(&mut self, s: &FrameStatistics, period_qpc: Option<i64>) {
-        if let Some((count, refresh, sync_qpc, sync_count)) = self.last {
-            let presents = s.present_count.wrapping_sub(count);
+        if let Some(last) = self.last {
+            let presents = s.present_count.wrapping_sub(last.present_count);
             let on_grid = period_qpc.is_some_and(|t| {
-                let n = i64::from(s.sync_refresh_count.wrapping_sub(sync_count));
-                n > 0 && (s.sync_qpc_time - sync_qpc - n * t).abs() <= t / 10
+                let n = i64::from(s.sync_refresh_count.wrapping_sub(last.sync_refresh_count));
+                n > 0 && (s.sync_qpc_time - last.sync_qpc_time - n * t).abs() <= t / 10
             });
             if presents == 1 && !on_grid {
                 self.count.unavailable += 1;
             } else if presents == 1 {
-                let n = s.present_refresh_count.wrapping_sub(refresh);
+                let n = s
+                    .present_refresh_count
+                    .wrapping_sub(last.present_refresh_count);
                 let lost = u64::from(n.saturating_sub(1));
                 self.count.counted += 1;
                 self.count.lost += lost;
@@ -323,12 +325,7 @@ impl RefreshLedger {
                 self.count.unavailable += 1;
             }
         }
-        self.last = Some((
-            s.present_count,
-            s.present_refresh_count,
-            s.sync_qpc_time,
-            s.sync_refresh_count,
-        ));
+        self.last = Some(*s);
     }
 }
 

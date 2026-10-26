@@ -112,10 +112,9 @@ pub enum RenderMsg {
     /// Ready the screen for a play (build it again if it failed) and
     /// answer when ready.
     Prepare(mpsc::SyncSender<Result<(), String>>),
-    /// A play starts: chart time 0 at `origin` on the clock.
+    /// A play starts: chart time 0 at the measurement's `origin` on the
+    /// clock.
     Play {
-        /// Where chart time 0 lies.
-        origin: TimeUs,
         /// The logic step's effects and play view.
         side: RenderSide,
         /// The gauge to show.
@@ -331,11 +330,11 @@ impl Run {
                     continue;
                 }
                 Ok(RenderMsg::Play {
-                    origin,
                     side,
                     gauge,
                     measure,
                 }) => {
+                    let origin = measure.origin;
                     self.measure.start(*measure);
                     self.shared.first_frame.store(i64::MIN, Ordering::Release);
                     mode = Mode::Play {
@@ -666,7 +665,6 @@ mod tests {
         .unwrap();
         let origin = clock.now();
         link.send(RenderMsg::Play {
-            origin,
             side,
             gauge: 0,
             measure: play_measure(origin),
@@ -755,7 +753,6 @@ mod tests {
         .unwrap();
         let origin = clock.now();
         link.send(RenderMsg::Play {
-            origin,
             side,
             gauge: 0,
             measure: play_measure(origin),
@@ -859,7 +856,6 @@ mod tests {
         .unwrap();
         let origin = clock.now();
         link.send(RenderMsg::Play {
-            origin,
             side,
             gauge: 0,
             measure: play_measure(origin),

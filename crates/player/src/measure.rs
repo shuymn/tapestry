@@ -336,9 +336,9 @@ pub struct Measure {
     steps: rtrb::Consumer<StepSample>,
     sounds: rtrb::Consumer<AudioProbe>,
     overlay: Arc<AtomicBool>,
+    /// The play being measured; `None` before the first play and once the
+    /// game thread took the figures, when nothing counts.
     play: Option<PlayMeasure>,
-    /// Set when the game thread took the figures: nothing more counts.
-    frozen: bool,
     input_to_judgment: Samples,
     finalization: Samples,
     press_to_sound: Samples,
@@ -391,7 +391,6 @@ impl Measure {
             sounds,
             overlay,
             play: None,
-            frozen: true,
             input_to_judgment: Samples::new(),
             finalization: Samples::new(),
             press_to_sound: Samples::new(),
@@ -434,7 +433,6 @@ impl Measure {
             self.present_log_full = false;
         }
         self.measured_qpc = None;
-        self.frozen = false;
         self.alloc_base = allocations();
         self.play = Some(play);
         self.drain();
@@ -442,8 +440,7 @@ impl Measure {
 
     /// Takes the queued samples of the current play; others are dropped.
     fn drain(&mut self) {
-        let current = self.play.as_ref().filter(|_| !self.frozen);
-        let generation = current.map(|p| p.generation);
+        let generation = self.play.as_ref().map(|p| p.generation);
         while let Ok(s) = self.steps.pop() {
             if Some(s.generation) != generation {
                 continue;
@@ -466,7 +463,7 @@ impl Measure {
     /// every quarter second while the overlay shows; empty when hidden.
     pub fn overlay(&mut self) -> [&str; LINES] {
         let mut out = [""; LINES];
-        if !self.overlay.load(Ordering::Acquire) || self.frozen {
+        if !self.overlay.load(Ordering::Acquire) || self.play.is_none() {
             return out;
         }
         let now = self.clock.now();
@@ -535,9 +532,7 @@ impl Measure {
     /// nothing more counts until the next play. Judgments whose frame has
     /// no sample yet are N/A.
     pub fn finish(&mut self, end: TimeUs) -> Option<Figures> {
-        if self.frozen {
-            return None;
-        }
+        self.play.as_ref()?;
         self.drain();
         self.on_screen.finish();
         #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
@@ -547,14 +542,14 @@ impl Measure {
             let kept = self.present_log.capacity() > 0 && !self.present_log_full;
             fig.present_times = kept.then(|| self.present_log.clone());
         }
-        self.frozen = true;
+        self.play = None;
         Some(fig)
     }
 
     /// The frame being drawn failed (the screen is lost): the judgments it
     /// drew never reached the screen through it and are N/A.
     pub fn failed(&mut self, effects: &[JudgeEvent]) {
-        if self.frozen || self.play.is_none() {
+        if self.play.is_none() {
             return;
         }
         for ev in effects {
@@ -568,7 +563,7 @@ impl Measure {
     /// One frame drawn.
     pub fn frame(&mut self, d: &Drawn<'_>) {
         let Some(play) = &self.play else { return };
-        if self.frozen || d.play.is_none() {
+        if d.play.is_none() {
             return;
         }
         let origin = play.origin;

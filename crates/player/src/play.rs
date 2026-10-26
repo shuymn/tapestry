@@ -298,7 +298,6 @@ impl Rig for PlayerRig<'_> {
             )),
         };
         self.render.send(RenderMsg::Play {
-            origin,
             side: screen,
             gauge: self.gauge,
             measure: Box::new(measure),
