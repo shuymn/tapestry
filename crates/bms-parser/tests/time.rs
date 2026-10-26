@@ -1,9 +1,9 @@
-//! Exact time over many BPMs, and the time size cap (D3).
+//! Exact time over many BPMs, decimal forms, and the time size cap (D3).
 
 use std::time::Instant;
 
-use bms_model::{Chart, Note, NoteKind, TimeUs};
-use bms_parser::{LoadError, LoadOptions, Loaded, WarningKind, load_bms};
+use bms_model::{Chart, JudgeRank, Note, NoteKind, TimeUs};
+use bms_parser::{LoadError, LoadOptions, Loaded, Warning, WarningKind, load_bms};
 use sha2::{Digest, Sha256};
 
 /// Loads `text` from an empty folder, dropping the missing-sound warnings
@@ -164,6 +164,94 @@ fn many_distinct_bpms_keep_exact_time() {
             26_807_287, 28_171_319, 29_504_694, 30_795_949, 32_045_983, 33_276_882, 33_886_019
         ]
     );
+}
+
+#[test]
+fn long_decimals_and_exponents_time_exactly() {
+    let text = "\
+#BPM 1.5E+02
+#BPM02 98.7654321
+#BPM03 1.00001E+07
+#STOP01 4.16E-02
+#WAV01 a.wav
+#00011:0101
+#00102:0.0078125
+#00111:0101
+#00208:02
+#00209:01
+#00211:010100
+#00308:03
+#00311:0101
+#00411:01
+";
+    let loaded = load(text).unwrap();
+    let chart = &loaded.chart;
+    // Exact fractions in an independent script. Measure 1 is 0.03125 beats
+    // at 150 (12_500 µs); measure 2 starts at 98.7654321 with a STOP of
+    // 0.0416 units (floor(end) - floor(start) = 526 µs); measure 3 runs at
+    // 10_000_100 BPM, 4 beats in 24 µs.
+    assert_eq!(
+        times(&chart.lanes[1]),
+        vec![
+            0, 800_000, 1_600_000, 1_606_250, 1_612_500, 2_423_026, 4_043_026, 4_043_038, 4_043_050
+        ]
+    );
+    assert_eq!(
+        chart.bar_lines,
+        [0, 1_600_000, 1_612_500, 4_043_026, 4_043_050].map(TimeUs)
+    );
+    assert_eq!(chart.scroll.initial_bpm_micro(), 150_000_000);
+    let pos = |t| chart.scroll.position_at(TimeUs(t));
+    assert_eq!(pos(1_612_500), pos(1_613_026));
+    assert!(pos(1_613_027) > pos(1_613_026));
+    assert_eq!(loaded.warnings, vec![]);
+}
+
+#[test]
+fn total_and_defexrank_take_the_decimal_grammar() {
+    let meta = |header: &str| {
+        let loaded = load(&format!("#BPM 120\n{header}\n#WAV01 a.wav\n#00111:01\n")).unwrap();
+        (loaded.chart.meta, loaded.warnings)
+    };
+    let (m, w) = meta("#TOTAL 312.3456789");
+    assert_eq!((m.total_milli, w), (Some(312_345), vec![]));
+    let (m, w) = meta("#TOTAL 2.5E+02");
+    assert_eq!((m.total_milli, w), (Some(250_000), vec![]));
+    let (m, w) = meta("#DEFEXRANK 1.0000005E+02");
+    assert_eq!(
+        (m.rank, w),
+        (Some(JudgeRank::DefExRankMilli(100_000)), vec![])
+    );
+    // An invalid value stays a warning: it does not change timing.
+    for (header, what) in [("#TOTAL 1e19", "#TOTAL"), ("#DEFEXRANK 7e13", "#DEFEXRANK")] {
+        let (m, w) = meta(header);
+        assert_eq!((m.total_milli, m.rank), (None, None), "{header}");
+        assert_eq!(
+            w,
+            vec![Warning {
+                line: Some(2),
+                kind: WarningKind::IgnoredValue(what)
+            }],
+            "{header}"
+        );
+    }
+}
+
+#[test]
+fn bpm_below_one_millionth_is_refused() {
+    for (text, what) in [
+        ("#BPM 0.0000009\n", "#BPM"),
+        ("#BPM 120\n#BPM01 9E-07\n#00108:01\n", "#BPMxx"),
+    ] {
+        match load(text) {
+            Err(LoadError::InvalidValue {
+                what: w, reason, ..
+            }) => assert_eq!((w, reason), (what, "below 0.000001"), "{text}"),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+    let loaded = load("#BPM 0.000001\n").unwrap();
+    assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 1);
 }
 
 /// A chart whose BPM changes at the start of each measure `m` in

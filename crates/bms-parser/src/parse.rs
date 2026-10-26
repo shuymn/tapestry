@@ -282,7 +282,6 @@ fn parse_header(
     };
     let invalid =
         |what: &'static str, reason: &'static str| LoadError::InvalidValue { line, what, reason };
-    let positive = |what: &'static str| positive_decimal(value, line, what);
     let ignore = |warnings: &mut Vec<Warning>, what: &'static str| {
         warnings.push(Warning {
             line: Some(line),
@@ -292,7 +291,7 @@ fn parse_header(
     match upper {
         "TITLE" => source.meta.title = value.to_owned(),
         "BPM" => {
-            source.bpm = Some(positive("#BPM")?);
+            source.bpm = Some(bpm(value, line, "#BPM")?);
         }
         "RANK" => match value.parse::<i32>() {
             Ok(rank) => source.meta.rank = Some(JudgeRank::Rank(rank)),
@@ -340,7 +339,7 @@ fn parse_header(
         _ if IGNORED_HEADERS.contains(&upper) || defined_id("BMP").is_some() => {}
         _ => {
             if let Some(id) = defined_id("BPM") {
-                source.bpm_defs.insert(id, positive("#BPMxx")?);
+                source.bpm_defs.insert(id, bpm(value, line, "#BPMxx")?);
             } else if let Some(id) = defined_id("STOP") {
                 let v = parse_decimal(value).map_err(|e| invalid("#STOPxx", e.reason()))?;
                 if v.is_negative() {
@@ -380,10 +379,24 @@ fn positive_decimal(text: &str, line: usize, what: &'static str) -> Result<Ratio
     }
 }
 
-/// A non-negative decimal in thousandths, rounded down (truncation is the
-/// floor for a non-negative value).
+/// A BPM of at least 0.000001, so its value in millionths is at least 1
+/// (D3), or an error naming `what`.
+fn bpm(text: &str, line: usize, what: &'static str) -> Result<Rational, LoadError> {
+    let v = positive_decimal(text, line, what)?;
+    if v < Rational::new(BigInt::from(1), BigInt::from(1_000_000)) {
+        return Err(LoadError::InvalidValue {
+            line,
+            what,
+            reason: "below 0.000001",
+        });
+    }
+    Ok(v)
+}
+
+/// A non-negative decimal in thousandths, rounded down, or `None` for a
+/// value that is not one.
 fn thousandths(value: &str) -> Option<i64> {
     let v = parse_decimal(value).ok().filter(|v| !v.is_negative())?;
-    let milli = (v * BigInt::from(1_000)).to_integer();
+    let milli = (v * BigInt::from(1_000)).floor().to_integer();
     i64::try_from(milli).ok()
 }

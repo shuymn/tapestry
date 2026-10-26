@@ -8,17 +8,23 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 1
+//! # Loader version 2
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 1; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 2; changing any of them
 //! changes the version.
 //!
 //! - **Time:** each object's time is accumulated in exact rationals and
 //!   floored to µs once; the time's denominator has at most
-//!   [`Limits::max_time_bits`] bits (an error otherwise). BPM, `#STOPxx`
-//!   and measure-length values take at most 6 fractional digits. A
-//!   `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat) whatever
-//!   the measure length.
+//!   [`Limits::max_time_bits`] bits (an error otherwise). BPM, `#STOPxx`,
+//!   measure-length, `#TOTAL` and `#DEFEXRANK` values are decimals with an
+//!   optional exponent of at most 18 (`1.5`, `.5`, `1.00001E+07`), with at
+//!   most 12 integer and 18 fractional digits once the exponent applies. A
+//!   malformed timing value is an error; a malformed `#TOTAL` or
+//!   `#DEFEXRANK` is ignored with a warning. A BPM is at least 0.000001; the
+//!   scroll map takes it in millionths rounded down, while time uses the
+//!   exact value. `#TOTAL` and `#DEFEXRANK` are kept in thousandths rounded
+//!   down. A `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat)
+//!   whatever the measure length.
 //! - **Same position:** a BPM change applies before a STOP, so the STOP uses
 //!   the new BPM; a note at a STOP's position sounds at the STOP's start.
 //!   Channel 08 wins over channel 03; within a channel the later object in
@@ -93,7 +99,7 @@ use bms_model::{Chart, ChartIdentity, ScrollMap, SoundId, SoundRef, TimeUs};
 pub use error::{LoadError, Warning, WarningKind};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 1;
+pub const LOADER_VERSION: u32 = 2;
 
 /// Bounds on the work a chart may cause (D14). The defaults sit far above
 /// real charts.

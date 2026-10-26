@@ -175,17 +175,19 @@ fn bpm_zero_is_rejected() {
 }
 
 #[test]
-fn bpm_takes_six_fractional_digits_not_seven() {
-    let loaded = load_text("#BPM 120.000001\n#WAV01 click.wav\n#00111:01\n").unwrap();
-    assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 120_000_001);
-    // 4 beats at 120.000001 BPM: floor(240e6 / 120.000001) = 1_999_999.
+fn bpm_takes_eighteen_fractional_digits_not_nineteen() {
+    let loaded = load_text("#BPM 120.000000000000000003\n#WAV01 click.wav\n#00111:01\n").unwrap();
+    // The scroll map takes millionths rounded down; time uses the exact BPM.
+    assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 120_000_000);
+    // 4 beats: floor(240e6 / 120.000000000000000003) = 1_999_999, where
+    // 120 BPM gives exactly 2_000_000.
     assert_eq!(times(&loaded.chart.lanes[1]), vec![1_999_999]);
     assert_eq!(
-        load_text("#BPM 120.0000001\n#00111:01\n"),
+        load_text("#BPM 120.0000000000000000003\n#00111:01\n"),
         Err(LoadError::InvalidValue {
             line: 1,
             what: "#BPM",
-            reason: "more than 6 fractional digits"
+            reason: "more than 18 fractional digits"
         })
     );
 }
@@ -563,10 +565,10 @@ fn long_note_edge_cases() {
 #[test]
 fn resolved_hash_matches_golden() {
     // Computed at authoring time by an independent script encoding the
-    // documented fields of this chart: version 1, 120 BPM, no scroll changes,
+    // documented fields of this chart: version 2, 120 BPM, no scroll changes,
     // one tap at 2 s on key 1 with sound 0, bar lines at 0 and 2 s, the sound
     // name `a.wav`, an empty title and no other values.
-    const GOLDEN: &str = "e86790ddd8254fadbfccacc43e8ef18f37240733004cf019911db730b50477bb";
+    const GOLDEN: &str = "b55f7f6c1e864d386d3339be8a60baf1c3283a6a2ea57439c2d81785cf855d6c";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart
