@@ -490,7 +490,7 @@ mod tests {
         let (_steps, steps) = rtrb::RingBuffer::new(1);
         let (_sounds, sounds) = rtrb::RingBuffer::new(1);
         let overlay = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        Measure::new(clock, None, None, steps, sounds, overlay, 0)
+        Measure::new(clock, None, None, steps, sounds, overlay)
     }
 
     fn play_measure(origin: TimeUs) -> Box<PlayMeasure> {

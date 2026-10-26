@@ -132,21 +132,27 @@ fn main() -> ExitCode {
             rig.adjust_on_end = dev_options.adjust_on_end;
         }));
     }
-    report(play(&chart, clock, false, |_rig| {
+    report(play(
+        &chart,
+        clock,
         #[cfg(feature = "dev-tools")]
-        {
-            if dev_options.auto_retry {
-                _rig.auto_retries = 1;
-                _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+        false,
+        |_rig| {
+            #[cfg(feature = "dev-tools")]
+            {
+                if dev_options.auto_retry {
+                    _rig.auto_retries = 1;
+                    _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+                }
+                if dev_options.overlay {
+                    _rig.controls.toggle_overlay();
+                }
+                _rig.adjust_in_play = dev_options.adjust_in_play;
+                _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
+                _rig.adjust_on_end = dev_options.adjust_on_end;
             }
-            if dev_options.overlay {
-                _rig.controls.toggle_overlay();
-            }
-            _rig.adjust_in_play = dev_options.adjust_in_play;
-            _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
-            _rig.adjust_on_end = dev_options.adjust_on_end;
-        }
-    }))
+        },
+    ))
 }
 
 /// `tapestry measure play <chart>` (dev-tools): one play under a
@@ -398,7 +404,6 @@ fn measure(
     steps: rtrb::Consumer<StepSample>,
     sounds: rtrb::Consumer<game::AudioProbe>,
     controls: &Controls,
-    keep_presents: usize,
 ) -> Measure {
     let audio = AudioInfo {
         period_us: i64::from(opened.period) * 1_000_000 / i64::from(opened.rate.max(1)),
@@ -411,19 +416,19 @@ fn measure(
         steps,
         sounds,
         Arc::clone(controls.overlay()),
-        keep_presents,
     )
 }
 
 /// Presents a play of `chart` can issue, with room to spare, at
-/// `refresh_mhz` (1 kHz when unknown): the countdown, the chart, a tail of
-/// 15 s, a quarter more.
+/// `refresh_mhz` (1 kHz when unknown): the countdown, the chart to its last
+/// long note end or BGM event, a tail of 15 s, a quarter more.
+#[cfg(feature = "dev-tools")]
 fn presents_of(chart: &bms_model::Chart, lead_in: TimeUs, refresh_mhz: Option<u32>) -> usize {
     let last = chart
         .lanes
         .iter()
         .flatten()
-        .map(|n| n.time)
+        .map(bms_model::Note::end)
         .chain(chart.bgm.iter().map(|b| b.time))
         .max()
         .unwrap_or(TimeUs(0));
@@ -540,7 +545,7 @@ fn open_window_and_input(
 fn play(
     chart: &Path,
     clock: QpcClock,
-    keep_presents: bool,
+    #[cfg(feature = "dev-tools")] keep_presents: bool,
     tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> Result<(), String> {
     #[cfg(feature = "dev-tools")]
@@ -593,20 +598,20 @@ fn play(
             .map(|r| Box::new(r) as Box<dyn Screen>)
             .map_err(|e| e.to_string())
     });
-    let keep = if keep_presents {
-        presents_of(loaded.chart(), loaded.config().lead_in, surface.refresh_mhz)
-    } else {
-        0
-    };
-    let measure = measure(
+    #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+    let mut measure = measure(
         clock,
         surface.refresh_mhz,
         opened,
         probes.steps.1,
         probes.sounds.1,
         &controls,
-        keep,
     );
+    #[cfg(feature = "dev-tools")]
+    if keep_presents {
+        let lead_in = loaded.config().lead_in;
+        measure.keep_presents(presents_of(loaded.chart(), lead_in, surface.refresh_mhz));
+    }
     let render = render_side::spawn(
         make,
         Arc::new(loaded.chart().clone()),
@@ -703,7 +708,6 @@ fn scripted(
         probes.steps.1,
         probes.sounds.1,
         &controls,
-        0,
     );
     let render = render_side::spawn(
         make,

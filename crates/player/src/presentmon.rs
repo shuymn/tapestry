@@ -280,6 +280,11 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
     (frames, error)
 }
 
+/// The longest the game's present time may follow the capture's
+/// submission of that present, µs: the present call and the read of the
+/// clock after it.
+pub const MATCH_TOLERANCE_US: i64 = 2_000;
+
 /// One play's figures from the capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlayCapture {
@@ -299,10 +304,13 @@ pub struct PlayCapture {
 ///
 /// The evidence must reach from the span's predecessor (the last frame
 /// displayed before `a`) to its successor (the first displayed at or after
-/// `b`), and the capture must hold every present the game issued from the
-/// predecessor's present to the successor's, compared with the game's own
-/// present times (each taken just after its present call, so up to half a
-/// refresh after the capture's). The count applies only when every one of
+/// `b`), and every present the game issued from the predecessor's present
+/// to the successor's must pair, one to one and in order, with a captured
+/// one: the game's time (taken just after its present call returned) at
+/// most [`MATCH_TOLERANCE_US`] (or half a refresh, if shorter) after the
+/// capture's submission time, and no other captured present that close.
+/// An unmatched or ambiguous present, at the boundaries too, makes the span
+/// N/A. The count applies only when every one of
 /// those presents was made with vsync on every refresh and no tearing, as
 /// the capture's `SyncInterval` and `AllowsTearing` and the game's own
 /// swap chain configuration both confirm. Otherwise the span is N/A.
@@ -333,12 +341,27 @@ pub fn count_play(frames: &[PmFrame], fig: &Figures, period_ns: i64) -> PlayCapt
         .filter(|f| (from..=to).contains(&f.present_us))
         .collect();
     let presents = Some(window.len() as u64);
-    let slack = period_ns / 2_000;
-    let issued = fig
-        .present_times
-        .as_ref()
-        .map(|t| t.iter().filter(|&&g| g > from && g <= to + slack).count() as u64);
-    let covered = issued == Some(window.len() as u64);
+    let tol = MATCH_TOLERANCE_US.min(period_ns / 2_000);
+    let next = frames
+        .iter()
+        .find(|f| f.present_us > to)
+        .map(|f| f.present_us);
+    let covered = fig.present_times.as_ref().is_some_and(|times| {
+        let issued: Vec<i64> = times
+            .iter()
+            .copied()
+            .filter(|&g| g > from && g <= to + tol)
+            .collect();
+        issued.len() == window.len()
+            && issued.iter().enumerate().all(|(i, &g)| {
+                let c = window[i].present_us;
+                let after = window.get(i + 1).map(|f| f.present_us).or(next);
+                let before = i.checked_sub(1).map(|j| window[j].present_us);
+                (0..=tol).contains(&(g - c))
+                    && after.is_none_or(|n| n > g)
+                    && before.is_none_or(|p| g - p > tol)
+            })
+    });
     if !covered {
         return PlayCapture { presents, ..na };
     }
@@ -564,6 +587,33 @@ mod tests {
         let c = count_play(&frames, &figures((10_000, 25_000), &missing), T);
         assert_eq!((c.count, c.never_displayed), (None, None));
         assert_eq!(c.presents, Some(5));
+    }
+
+    /// The confirm review's case: T = 4 ms, captured presents at 0, 4, 12
+    /// and 16 ms (shown 1 ms later), the game's at 0.3, 4.3, 8.3, 12.3 and
+    /// 19 ms, span [2, 14). Counted in aggregate the window holds four and
+    /// four, but 8.3 has no captured present and 16 none issued within the
+    /// tolerance: N/A.
+    #[test]
+    fn presents_pair_one_to_one() {
+        let frames: Vec<PmFrame> = [0, 4, 12, 16]
+            .map(|p| frame(p * 1_000, Some(p * 1_000 + 1_000)))
+            .to_vec();
+        let mut fig = figures((2_000, 14_000), &[]);
+        fig.present_times = Some(vec![300, 4_300, 8_300, 12_300, 19_000]);
+        let c = count_play(&frames, &fig, T);
+        assert_eq!((c.count, c.never_displayed), (None, None));
+        // Paired one to one, it counts: 12 ms is 2 refreshes after 4, and
+        // the game's 16 ms present completes at 16.3.
+        fig.present_times = Some(vec![300, 4_300, 12_300, 16_300]);
+        let c = count_play(&frames, &fig, T);
+        assert_eq!(c.count.map(|s| s.lost), Some(1));
+        // A game present that completes at 12.1 ms, after the capture's
+        // 12 ms submission, could be either: ambiguous, N/A.
+        let mut close = frames.clone();
+        close.insert(2, frame(11_000, None));
+        fig.present_times = Some(vec![300, 4_300, 11_300, 12_100, 16_300]);
+        assert_eq!(count_play(&close, &fig, T).count, None);
     }
 
     /// An empty capture, or a game without present times, has no figure.

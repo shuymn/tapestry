@@ -129,6 +129,7 @@ pub struct Figures {
     pub presentation: Option<Presentation>,
     /// When each presented frame of the play was done, µs on the clock,
     /// when they were kept (`measure play`) and all fitted.
+    #[cfg(feature = "dev-tools")]
     pub present_times: Option<Vec<i64>>,
     /// The play span on the clock, from chart time 0 to the play's end.
     /// The countdown is left out: a display capture misses a swap chain's
@@ -160,7 +161,10 @@ fn measured_period_ns(first: (i64, u32), last: (i64, u32), freq: i64) -> Option<
     }
     let ns =
         i128::from(last.0 - first.0) * 1_000_000_000 / (i128::from(freq) * i128::from(refreshes));
-    i64::try_from(ns).ok().filter(|&ns| ns > 0)
+    // 20 Hz to 1 kHz only.
+    i64::try_from(ns)
+        .ok()
+        .filter(|ns| (1_000_000..=50_000_000).contains(ns))
 }
 
 /// One overlay line in a fixed buffer.
@@ -320,10 +324,15 @@ pub struct Measure {
     last_sync: Option<(i64, u32)>,
     audio: Option<AudioInfo>,
     presentation: Option<Presentation>,
-    /// Present times kept for a display capture; `None` when not kept or
-    /// when they no longer fit.
-    present_log: Option<Vec<i64>>,
-    keep_presents: bool,
+    /// Present times kept for a display capture (`measure play`): none
+    /// kept when its capacity is 0.
+    #[cfg(feature = "dev-tools")]
+    present_log: Vec<i64>,
+    /// Whether the play's presents outgrew the log.
+    #[cfg(feature = "dev-tools")]
+    present_log_full: bool,
+    /// The last plausible measured refresh period, QPC ticks.
+    measured_qpc: Option<i64>,
     steps: rtrb::Consumer<StepSample>,
     sounds: rtrb::Consumer<AudioProbe>,
     overlay: Arc<AtomicBool>,
@@ -352,9 +361,7 @@ pub struct Measure {
 
 impl Measure {
     /// The measurement, reading the queues `steps` and `sounds`, the
-    /// overlay switch `overlay`, and frame statistics at `refresh_mhz`;
-    /// it keeps the times of up to `keep_presents` presents a play for a
-    /// display capture (none when 0).
+    /// overlay switch `overlay`, and frame statistics at `refresh_mhz`.
     pub fn new(
         clock: QpcClock,
         refresh_mhz: Option<u32>,
@@ -362,7 +369,6 @@ impl Measure {
         steps: rtrb::Consumer<StepSample>,
         sounds: rtrb::Consumer<AudioProbe>,
         overlay: Arc<AtomicBool>,
-        keep_presents: usize,
     ) -> Self {
         let freq = i128::from(clock.frequency().hz());
         let period_qpc = refresh_mhz
@@ -376,8 +382,11 @@ impl Measure {
             last_sync: None,
             audio,
             presentation: None,
-            present_log: (keep_presents > 0).then(|| Vec::with_capacity(keep_presents)),
-            keep_presents: keep_presents > 0,
+            #[cfg(feature = "dev-tools")]
+            present_log: Vec::new(),
+            #[cfg(feature = "dev-tools")]
+            present_log_full: false,
+            measured_qpc: None,
             steps,
             sounds,
             overlay,
@@ -419,11 +428,12 @@ impl Measure {
         self.recent = [i64::MIN; RECENT];
         self.refreshed_at = None;
         self.presentation = None;
-        // A log that overflowed was dropped; it is not made again during
-        // play, so the next plays have none.
-        if let Some(log) = &mut self.present_log {
-            log.clear();
+        #[cfg(feature = "dev-tools")]
+        {
+            self.present_log.clear();
+            self.present_log_full = false;
         }
+        self.measured_qpc = None;
         self.frozen = false;
         self.alloc_base = allocations();
         self.play = Some(play);
@@ -498,6 +508,7 @@ impl Measure {
             underruns,
             sounds_dropped,
             presentation: self.presentation,
+            #[cfg(feature = "dev-tools")]
             present_times: None,
             span: (start, end),
             presents: self.presents.saturating_sub(after_end),
@@ -513,6 +524,13 @@ impl Measure {
         }
     }
 
+    /// Keeps the times of up to `capacity` presents a play, for a display
+    /// capture to be checked against (`measure play`).
+    #[cfg(feature = "dev-tools")]
+    pub fn keep_presents(&mut self, capacity: usize) {
+        self.present_log = Vec::with_capacity(capacity);
+    }
+
     /// The play ended at `end` on the clock: its figures, after which
     /// nothing more counts until the next play. Judgments whose frame has
     /// no sample yet are N/A.
@@ -522,8 +540,13 @@ impl Measure {
         }
         self.drain();
         self.on_screen.finish();
+        #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
         let mut fig = self.figures_now(end);
-        fig.present_times = self.present_log.clone();
+        #[cfg(feature = "dev-tools")]
+        {
+            let kept = self.present_log.capacity() > 0 && !self.present_log_full;
+            fig.present_times = kept.then(|| self.present_log.clone());
+        }
         self.frozen = true;
         Some(fig)
     }
@@ -572,12 +595,13 @@ impl Measure {
         if d.presentation.is_some() {
             self.presentation = d.presentation;
         }
-        if self.keep_presents {
-            match &mut self.present_log {
-                Some(log) if log.len() < log.capacity() => log.push(d.at.0),
-                // Full: the capture cannot be checked against it.
-                _ => self.present_log = None,
-            }
+        #[cfg(feature = "dev-tools")]
+        if self.present_log.len() < self.present_log.capacity() {
+            self.present_log.push(d.at.0);
+        } else if self.present_log.capacity() > 0 {
+            // Full: the capture cannot be checked against it. The log stays
+            // for the next play.
+            self.present_log_full = true;
         }
         if self.load_ms.is_none() {
             self.load_ms = Some((d.at.0 - load_from.0) / 1_000);
@@ -587,21 +611,26 @@ impl Measure {
             self.recent[self.recent_next] = d.at.0;
             self.recent_next = (self.recent_next + 1) % RECENT;
         }
-        let Some(count) = d.timing.present_count else {
+        match d.timing.present_count {
+            Some(count) => {
+                self.last_present = Some(count);
+                self.on_screen.presented(count);
+            }
             // No present count to pair this frame with: what it drew is
-            // N/A; earlier frames keep their pairings.
-            self.on_screen.presented_unknown();
-            return;
-        };
-        self.last_present = Some(count);
-        self.on_screen.presented(count);
+            // N/A, while the statistics it carries still resolve earlier
+            // frames.
+            None => self.on_screen.presented_unknown(),
+        }
         if let Some(s) = self.filter.accept(d.statistics) {
             let sync = (s.sync_qpc_time, s.sync_refresh_count);
             // A sync whose refresh count disagrees with the time since the
-            // last one by more than a quarter of the reported refresh (the
-            // count of a composed window and of independent flip differ)
-            // starts the period over from it.
-            if let (Some(last), Some(rough)) = (self.last_sync, self.period_qpc) {
+            // last one by more than a quarter of the reported refresh, or of
+            // the period measured so far without one (the count of a
+            // composed window and of independent flip differ), starts the
+            // period over from it.
+            if let (Some(last), Some(rough)) =
+                (self.last_sync, self.period_qpc.or(self.measured_qpc))
+            {
                 let n = i64::from(sync.1.wrapping_sub(last.1));
                 if n <= 0
                     || n > i64::from(u32::MAX / 2)
@@ -615,10 +644,24 @@ impl Measure {
             // The measured period once the syncs span enough refreshes; the
             // monitor's reported rate may be rounded to a whole hertz.
             let refreshes = sync.1.wrapping_sub(first.1);
+            let freq = self.clock.frequency().hz();
             let measured = (PERIOD_SPAN..=u32::MAX / 2)
                 .contains(&refreshes)
                 .then(|| (sync.0 - first.0) / i64::from(refreshes));
-            let period = measured.or(self.period_qpc);
+            let measured = match measured {
+                // Refresh rates of 20 Hz to 1 kHz only; anything else came
+                // from counts that do not belong together.
+                Some(t) if (freq / 1_000..=freq / 20).contains(&t) => Some(t),
+                Some(_) => {
+                    self.first_sync = Some(sync);
+                    None
+                }
+                None => None,
+            };
+            if measured.is_some() {
+                self.measured_qpc = measured;
+            }
+            let period = measured.or(self.measured_qpc).or(self.period_qpc);
             // Lost refreshes count only under a confirmed countable
             // presentation (vsync every refresh, no tearing).
             let countable = self.presentation.is_some_and(Presentation::countable);
@@ -903,12 +946,19 @@ mod frame_tests {
     }
 
     fn rig() -> Rig {
+        // 250 Hz: 4 ms a refresh.
+        rig_at(Some(250_000))
+    }
+
+    fn rig_at(refresh_mhz: Option<u32>) -> Rig {
         let clock = QpcClock::start();
         let (steps, rx) = rtrb::RingBuffer::new(16);
         let (_sounds, sounds) = rtrb::RingBuffer::new(8);
         let overlay = Arc::new(AtomicBool::new(true));
-        // 250 Hz: 4 ms a refresh.
-        let m = Measure::new(clock, Some(250_000), None, rx, sounds, overlay, 8);
+        #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+        let mut m = Measure::new(clock, refresh_mhz, None, rx, sounds, overlay);
+        #[cfg(feature = "dev-tools")]
+        m.keep_presents(8);
         Rig { clock, m, steps }
     }
 
@@ -983,6 +1033,7 @@ mod frame_tests {
         assert_eq!(fig.presents, 1);
         assert_eq!(fig.span, (origin, TimeUs(5_094_000)));
         assert_eq!(fig.presentation, FIFO);
+        #[cfg(feature = "dev-tools")]
         assert_eq!(
             fig.present_times.as_deref(),
             Some(&[5_090_000, 5_095_000][..])
@@ -1010,16 +1061,23 @@ mod frame_tests {
         assert_eq!((j.count, j.max), (1, 700));
         assert_eq!(second.render_cpu.unwrap().count, 1);
         assert_eq!(second.press_to_screen_unavailable, 0);
+        #[cfg(feature = "dev-tools")]
         assert_eq!(second.present_times.as_deref(), Some(&[2_100_000][..]));
     }
 
     /// A swap chain moving from composition to independent flip changes
     /// the refresh count's domain (this PC: 8 605 919 to 1 050 175 581
     /// within one refresh): the period is measured again from there, at
-    /// 4 ms, and refreshes count on it.
+    /// 4 ms, and refreshes count on it, with the monitor's rate reported
+    /// or not.
     #[test]
     fn a_jump_in_refresh_counts_measures_the_period_again() {
-        let mut r = rig();
+        jump_at(Some(250_000));
+        jump_at(None);
+    }
+
+    fn jump_at(refresh_mhz: Option<u32>) {
+        let mut r = rig_at(refresh_mhz);
         r.m.start(play(1, TimeUs(1_000_000)));
         let clock = r.clock;
         let ticks = |us: i64| clock_qpc(&clock, TimeUs(us));
@@ -1039,19 +1097,82 @@ mod frame_tests {
             Some(stats(2, 1_050_175_581, at)),
             at,
         ));
-        for k in 3..80_u32 {
+        for k in 3..140_u32 {
             at += 4_000;
             let s = stats(k, 1_050_175_579 + k, at);
+            r.m.frame(&drawn(&[], Some(k), 100, Some(s), at));
+        }
+        // A second, small jump of 30 counts in one refresh: still a period
+        // of 4 ms, measured again from it (without a reported rate, judged
+        // against the period measured so far).
+        for k in 140..280_u32 {
+            at += 4_000;
+            let s = stats(k, 1_050_175_609 + k, at);
             r.m.frame(&drawn(&[], Some(k), 100, Some(s), at));
         }
         let fig = r.m.finish(TimeUs(at + 1)).unwrap();
         // 4 ms within the clock's 1 µs flooring.
         let period = fig.refresh_period_ns.unwrap();
         assert!((3_990_000..=4_010_000).contains(&period), "{period}");
-        // The interval across the jump has no evidence; the 77 after it
-        // count, none lost.
+        // The interval across the jump has no evidence; most after it
+        // count (without a reported rate, once 60 refreshes measured the
+        // period), none lost.
         assert_eq!(fig.refreshes.lost(), Some(0));
         assert!(fig.refreshes.counted >= 60, "{:?}", fig.refreshes);
+    }
+
+    /// More presents than the log holds leave the play without present
+    /// times (its capture cannot be checked), and the log, kept, serves
+    /// the next play.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_full_present_log_drops_that_play_only() {
+        let mut r = rig();
+        r.m.start(play(1, TimeUs(1_000_000)));
+        for k in 0..9 {
+            r.m.frame(&drawn(
+                &[],
+                Some(k + 1),
+                100,
+                None,
+                1_100_000 + i64::from(k),
+            ));
+        }
+        assert_eq!(r.m.finish(TimeUs(2_000_000)).unwrap().present_times, None);
+        r.m.start(play(2, TimeUs(3_000_000)));
+        r.m.frame(&drawn(&[], Some(1), 100, None, 3_100_000));
+        let fig = r.m.finish(TimeUs(4_000_000)).unwrap();
+        assert_eq!(fig.present_times.as_deref(), Some(&[3_100_000][..]));
+    }
+
+    /// A frame whose present count cannot be read still carries frame
+    /// statistics for an earlier frame: they resolve that frame's
+    /// judgment, while the unreadable frame's own judgment is N/A.
+    #[test]
+    fn statistics_of_a_frame_without_a_present_count_still_count() {
+        let mut r = rig();
+        r.m.start(play(1, TimeUs(3_000_000)));
+        let s20 = FrameStatistics {
+            present_count: 20,
+            present_refresh_count: 120,
+            sync_refresh_count: 120,
+            sync_qpc_time: clock_qpc(&r.clock, TimeUs(3_060_000)),
+        };
+        r.m.frame(&drawn(&[judged(1, 10_000)], Some(20), 100, None, 3_050_000));
+        r.m.frame(&drawn(
+            &[judged(2, 20_000)],
+            None,
+            100,
+            Some(s20),
+            3_054_000,
+        ));
+        let fig = r.m.finish(TimeUs(3_063_000)).unwrap();
+        // 60 ms − 10 ms.
+        assert_eq!(
+            fig.press_to_screen.map(|s| (s.count, s.max)),
+            Some((1, 50_000))
+        );
+        assert_eq!(fig.press_to_screen_unavailable, 1);
     }
 
     /// A frame presented without a present count makes only its own
