@@ -142,6 +142,7 @@ pub fn run(
         capture.clone(),
         |_, _| {},
         (None, None),
+        device.monitor.clone(),
     )?;
     let target = Target::Window {
         window: surface.into(),

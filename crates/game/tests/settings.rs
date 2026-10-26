@@ -55,6 +55,7 @@ fn changed() -> Settings {
             audio_offset_us: -12_000,
             display_offset_us: 16_700,
             audio_device: Some("device-a".to_owned()),
+            monitor: Some(r"\.\DISPLAY3".to_owned()),
             master_volume: 0.75,
         },
         player: PlayerSettings {

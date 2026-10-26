@@ -303,6 +303,9 @@ pub struct DeviceSettings {
     pub display_offset_us: i64,
     /// The audio device's id; the system default when absent.
     pub audio_device: Option<String>,
+    /// The monitor to play on, by its display device name (for example
+    /// `\.\DISPLAY1`); the system's primary monitor when absent.
+    pub monitor: Option<String>,
     /// The master volume, 0.0 (silent) to 1.0 (unity).
     pub master_volume: f32,
 }
@@ -330,6 +333,7 @@ impl Default for DeviceSettings {
             audio_offset_us: 0,
             display_offset_us: 0,
             audio_device: None,
+            monitor: None,
             master_volume: 1.0,
         }
     }

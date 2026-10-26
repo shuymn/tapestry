@@ -16,6 +16,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
+use winit::monitor::MonitorHandle;
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::raw_window_handle::{
@@ -32,6 +33,8 @@ struct Exit;
 struct App {
     controls: Arc<Controls>,
     keys: Keys,
+    /// The monitor to open on, by name; the primary when `None`.
+    monitor: Option<String>,
     ready: Option<Sender<Result<Surface, String>>>,
     window: Option<Window>,
 }
@@ -41,9 +44,18 @@ impl ApplicationHandler<Exit> for App {
         let Some(ready) = self.ready.take() else {
             return;
         };
+        let monitor = choose_monitor(event_loop, self.monitor.as_deref());
+        if let Some(m) = &monitor {
+            // The console only: monitor names stay out of files.
+            println!(
+                "window: monitor {} at {} mHz",
+                m.name().unwrap_or_default(),
+                m.refresh_rate_millihertz().unwrap_or(0)
+            );
+        }
         let attrs = Window::default_attributes()
             .with_title("tapestry")
-            .with_fullscreen(Some(Fullscreen::Borderless(event_loop.primary_monitor())));
+            .with_fullscreen(Some(Fullscreen::Borderless(monitor)));
         match event_loop.create_window(attrs) {
             Ok(w) => {
                 w.set_cursor_visible(false);
@@ -92,8 +104,36 @@ impl WindowThread {
     }
 }
 
+/// The monitor named `wanted` (`device.toml`'s `monitor`), or the primary
+/// one when it is not set or no monitor has that name; the names there are
+/// printed to the console so the setting can be corrected.
+fn choose_monitor(event_loop: &ActiveEventLoop, wanted: Option<&str>) -> Option<MonitorHandle> {
+    let Some(wanted) = wanted else {
+        return event_loop.primary_monitor();
+    };
+    let mut monitors: Vec<MonitorHandle> = event_loop.available_monitors().collect();
+    let names: Vec<Option<String>> = monitors.iter().map(MonitorHandle::name).collect();
+    if let Some(i) = monitor_index(&names, wanted) {
+        return Some(monitors.swap_remove(i));
+    }
+    let names: Vec<String> = names.into_iter().flatten().collect();
+    eprintln!(
+        "window: no monitor named {} (there are {}); using the primary one",
+        wanted.trim(),
+        names.join(", ")
+    );
+    event_loop.primary_monitor()
+}
+
+/// Which of the monitors named `names` is `wanted`, surrounding spaces
+/// ignored.
+fn monitor_index(names: &[Option<String>], wanted: &str) -> Option<usize> {
+    let wanted = wanted.trim();
+    names.iter().position(|n| n.as_deref() == Some(wanted))
+}
+
 /// Opens the window on its own thread. `retry` and `quit` are the keyboard
-/// scan codes bound to them.
+/// scan codes bound to them; `monitor` names the monitor to open on.
 ///
 /// # Errors
 ///
@@ -102,6 +142,7 @@ pub fn open(
     controls: Arc<Controls>,
     retry: Option<u32>,
     quit: Option<u32>,
+    monitor: Option<String>,
 ) -> Result<(WindowThread, Surface), String> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proxy_tx, proxy_rx) = mpsc::channel();
@@ -123,6 +164,7 @@ pub fn open(
             let mut app = App {
                 controls: Arc::clone(&controls),
                 keys: Keys::new(retry, quit),
+                monitor,
                 ready: Some(ready_tx),
                 window: None,
             };
@@ -338,6 +380,21 @@ mod tests {
             &Keys::new(None, None),
         );
         assert_eq!(c.tuning().get().visible_time_ms, 575);
+    }
+
+    /// `device.toml`'s monitor picks a monitor by its exact device name,
+    /// and nothing for a name no monitor has (the primary one is used).
+    #[test]
+    fn the_monitor_setting_picks_by_device_name() {
+        let names = [
+            Some(r"\.\DISPLAY2".to_owned()),
+            None,
+            Some(r"\.\DISPLAY1".to_owned()),
+        ];
+        assert_eq!(super::monitor_index(&names, r"\.\DISPLAY1"), Some(2));
+        assert_eq!(super::monitor_index(&names, r" \.\DISPLAY2 "), Some(0));
+        assert_eq!(super::monitor_index(&names, r"\.\DISPLAY10"), None);
+        assert_eq!(super::monitor_index(&names, "DISPLAY1"), None);
     }
 
     /// F9 shows the measurement overlay and hides it again, on first

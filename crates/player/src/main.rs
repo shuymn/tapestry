@@ -497,8 +497,9 @@ fn open_window_and_input(
     capture: Capture,
     wake: impl FnMut(&mut SourceSet, TimeUs) + Send + 'static,
     keys: (Option<u32>, Option<u32>),
+    monitor: Option<String>,
 ) -> Result<(window::WindowThread, window::Surface, InputThread), String> {
-    let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1)?;
+    let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1, monitor)?;
     let input = InputThread::spawn(clock, sources, capture, wake);
     let input = match input {
         Ok(i) => i,
@@ -539,8 +540,9 @@ fn play(
     let sources = sources();
     controls.set_latch(sources.gate().handle());
     let (mut hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock);
-    let keys = &loaded.settings().device.keyboard;
-    let keys = (keys.retry, keys.quit);
+    let device = &loaded.settings().device;
+    let keys = (device.keyboard.retry, device.keyboard.quit);
+    let monitor = device.monitor.clone();
     let (window_thread, surface, input_thread) = match open_window_and_input(
         &controls,
         clock,
@@ -552,6 +554,7 @@ fn play(
             hook.wake(s, now);
         },
         keys,
+        monitor,
     ) {
         Ok(opened) => opened,
         Err(e) => {
@@ -724,6 +727,7 @@ mod tests {
             input::Capture::new(),
             move |s, now| hook.wake(s, now),
             (Some(0x0E), Some(0x01)),
+            None,
         )
         .expect("startup");
         assert_eq!(input::keyboard_target(), Some(input.receiver()));
