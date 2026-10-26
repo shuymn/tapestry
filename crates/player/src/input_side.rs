@@ -882,14 +882,14 @@ mod autoplay_tests {
         let participants: Vec<_> = sources.participants().map(|(d, _)| d).collect();
         assert_eq!(participants, [AUTOPLAY_DEVICE]);
         // A press on the other keyboard during the play.
-        sources.begin_batch(TimeUs(1_200 * MS));
+        sources.begin_batch(TimeUs(200 * MS));
         sources.packet(&Packet {
             device: DeviceId(1),
             control: Z,
             value: 1,
             background: false,
         });
-        sources.end_batch(TimeUs(1_200 * MS));
+        sources.end_batch(TimeUs(200 * MS));
         hook.wake(&mut sources, TimeUs(1_600 * MS));
         let reader = &mut opening.readers[0];
         let mut got = Vec::new();
