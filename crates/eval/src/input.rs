@@ -89,7 +89,8 @@ pub enum AxisMode {
 
 /// How an axis's movement becomes presses and releases of its lane
 /// (design.md "Analog Scratch"). Movement is counted in the axis's own
-/// units, after wraparound and inversion.
+/// units, after wraparound. Both directions press alike, so the direction
+/// the axis counts in does not matter.
 ///
 /// Released, the axis presses its lane once it has moved
 /// `press_threshold` in one direction, each movement no more than
@@ -104,8 +105,6 @@ pub enum AxisMode {
 pub struct ScratchSettings {
     /// Absolute or relative, and the wraparound.
     pub mode: AxisMode,
-    /// Whether the axis counts backwards: swaps which way is forward.
-    pub invert: bool,
     /// Movement in one direction that presses.
     pub press_threshold: u32,
     /// Movement in the pressed direction that keeps the lane pressed.
@@ -122,7 +121,6 @@ impl ScratchSettings {
     /// the movement stops. Starting points, tuned by playing.
     pub const DEFAULT: Self = Self {
         mode: AxisMode::Absolute { wrap: 256 },
-        invert: false,
         press_threshold: 2,
         hold_threshold: 1,
         release_after_us: 100_000,
@@ -134,6 +132,15 @@ impl Default for ScratchSettings {
         Self::DEFAULT
     }
 }
+
+/// The most axes one source binds.
+pub const MAX_AXES_PER_SOURCE: usize = 8;
+/// The most axes a play binds, over every source.
+pub const MAX_AXES: usize = 16;
+/// The most buttons and keys one source binds.
+pub const MAX_BINDINGS_PER_SOURCE: usize = 256;
+/// The most buttons and keys a play binds, over every source.
+pub const MAX_BINDINGS: usize = 1024;
 
 /// An axis bound to a lane, with its scratch conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,16 +158,20 @@ pub struct AxisBinding {
 pub struct SourceProfile {
     /// The input latency offset, subtracted from the receive time.
     pub input_offset: TimeUs,
-    /// The source's button and key bindings.
+    /// The source's button and key bindings, at most
+    /// [`MAX_BINDINGS_PER_SOURCE`].
     pub bindings: Vec<Binding>,
-    /// The source's axis bindings. A control appears at most once across
-    /// `bindings` and `axes`.
+    /// The source's axis bindings, at most [`MAX_AXES_PER_SOURCE`]. A
+    /// control appears at most once across `bindings` and `axes`.
     pub axes: Vec<AxisBinding>,
 }
 
 /// How every source of a play is evaluated, indexed by [`SourceId`].
 ///
-/// A source without a profile has no bindings and a zero offset.
+/// A source without a profile has no bindings and a zero offset. Over
+/// every source there are at most [`MAX_BINDINGS`] bindings and
+/// [`MAX_AXES`] axes, so converting an input stays cheap whatever a log
+/// declares.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceProfile {
     /// The sources' profiles.

@@ -57,7 +57,6 @@ fn with_axes(mut s: SourceRecord, axes: &[(u32, u8, AxisMode)]) -> SourceRecord 
             lane: lane(l),
             scratch: ScratchSettings {
                 mode,
-                invert: i % 2 == 0,
                 press_threshold: 6 + i,
                 hold_threshold: 9 + i,
                 release_after_us: 120_000 + i,
@@ -462,28 +461,19 @@ fn v1_golden_body() {
 /// relative, and a report of each.
 fn golden_v2() -> PlayRecord {
     let mut rec = golden();
-    let axis = |control, l, mode, invert, press, hold, release| AxisBinding {
+    let axis = |control, l, mode, press, hold, release| AxisBinding {
         control: ControlId(control),
         lane: lane(l),
         scratch: ScratchSettings {
             mode,
-            invert,
             press_threshold: press,
             hold_threshold: hold,
             release_after_us: release,
         },
     };
     rec.devices.sources[1].profile.axes = vec![
-        axis(
-            0x1_0030,
-            0,
-            AxisMode::Absolute { wrap: 256 },
-            false,
-            2,
-            1,
-            100_000,
-        ),
-        axis(0x1_0035, 6, AxisMode::Relative, true, 3, 2, 150_000),
+        axis(0x1_0030, 0, AxisMode::Absolute { wrap: 256 }, 2, 1, 100_000),
+        axis(0x1_0035, 6, AxisMode::Relative, 3, 2, 150_000),
     ];
     rec.events.insert(4, control(1, 1_200_000, 0x1_0030, 131));
     rec.events.insert(5, control(1, 1_250_000, 0x1_0035, -4));
@@ -493,7 +483,7 @@ fn golden_v2() -> PlayRecord {
 /// SHA-256 of `body_bytes(&golden_v2())`, computed by the same separate
 /// encoder, which also gives [`GOLDEN_BODY_SHA256`] for [`golden`].
 const GOLDEN_V2_BODY_SHA256: &str =
-    "41f245e4161c8a403e5cc2370d75537e3d43eff8b0c123ddbb6b1e645ece61f3";
+    "88a38219c9fc30e02d006da695cd54113410336a241f0181673d5e740ad77edf";
 
 #[test]
 fn v2_golden_body() {
@@ -551,8 +541,8 @@ fn v1_logs_still_decode() {
 #[test]
 fn malformed_axes_are_refused() {
     // The devices section of a single controller with one axis, each
-    // field forgeable: (mode, invert, lane, axis count).
-    let devices = |count: u64, l: u64, mode: u64, invert: u64| {
+    // field forgeable: (axis count, lane, mode).
+    let devices = |count: u64, l: u64, mode: u64| {
         let mut w = Writer::default();
         // One source: controller, raw input, offset 0, no bindings.
         w.raw(&[1, 1, 0, 0, 0]);
@@ -563,7 +553,6 @@ fn malformed_axes_are_refused() {
         if mode == 0 {
             w.uint(256);
         }
-        w.uint(invert);
         w.raw(&[2, 1, 7]);
         // Audio and display offsets.
         w.raw(&[0, 0]);
@@ -577,25 +566,60 @@ fn malformed_axes_are_refused() {
     // Well formed, the section reads, and the error comes from the events
     // of source 1, which this single source does not have.
     assert_eq!(
-        decode_with(&mut sections, devices(1, 0, 1, 1)),
+        decode_with(&mut sections, devices(1, 0, 1)),
         Err(DecodeError::UnknownSource(1))
     );
     assert_eq!(
-        decode_with(&mut sections, devices(1, 0, 2, 1)),
+        decode_with(&mut sections, devices(1, 0, 2)),
         Err(DecodeError::InvalidValue("axis mode"))
     );
     assert_eq!(
-        decode_with(&mut sections, devices(1, 0, 1, 2)),
-        Err(DecodeError::InvalidValue("axis inversion"))
-    );
-    assert_eq!(
-        decode_with(&mut sections, devices(1, 8, 1, 1)),
+        decode_with(&mut sections, devices(1, 8, 1)),
         Err(DecodeError::InvalidValue("lane"))
     );
     assert_eq!(
-        decode_with(&mut sections, devices(2, 0, 1, 1)),
+        decode_with(&mut sections, devices(2, 0, 1)),
         Err(DecodeError::CountBeyondData(2))
     );
+}
+
+#[test]
+fn records_binding_more_than_the_limits_are_refused() {
+    // Well-formed records whose bytes hold every binding they declare.
+    let axis = |i: u32| AxisBinding {
+        control: ControlId(0x1_0000 + i),
+        lane: lane(0),
+        scratch: ScratchSettings::DEFAULT,
+    };
+    let key = |i: u32| Binding {
+        control: ControlId(i),
+        lane: lane(1),
+    };
+    let record = |sources: usize, keys: u32, axes: u32| {
+        let mut rec = golden_v2();
+        rec.events.clear();
+        rec.start.held.clear();
+        let mut s = rec.devices.sources[1].clone();
+        s.profile.bindings = (0..keys).map(key).collect();
+        s.profile.axes = (0..axes).map(axis).collect();
+        rec.devices.sources = vec![s; sources];
+        rec
+    };
+    let decoded = |rec: &PlayRecord| decode(&encode(rec), &limits()).map(|_| ());
+    let refused = Err(DecodeError::TooManyBindings);
+    // Per source: 8 axes and 256 keys fit, one more of either does not.
+    assert_eq!(decoded(&record(1, 256, 8)), Ok(()));
+    assert_eq!(decoded(&record(1, 256, 9)), refused);
+    assert_eq!(decoded(&record(1, 257, 8)), refused);
+    // In all: 16 axes and 1024 keys fit, more do not.
+    assert_eq!(decoded(&record(2, 0, 8)), Ok(()));
+    assert_eq!(decoded(&record(3, 0, 6)), refused);
+    assert_eq!(decoded(&record(4, 256, 1)), Ok(()));
+    assert_eq!(decoded(&record(5, 205, 1)), refused);
+    // A hundred thousand axes in about a megabyte is refused at its count.
+    let huge = record(1, 0, 100_000);
+    assert!(body_bytes(&huge).len() < 2 << 20);
+    assert_eq!(decoded(&huge), refused);
 }
 
 #[test]

@@ -211,12 +211,12 @@ In-play adjustment works in the direction of shrinking judgment deviation, so it
 
 Axis values are recorded raw with timestamps, and the evaluator converts them into scratch presses and releases based on the device settings. The settings include the following, and all of them are recorded in the replay.
 
-- Whether the value is absolute or relative, wraparound on a full revolution, inversion of the rotation direction
+- Whether the value is absolute or relative, and wraparound on a full revolution. Both rotation directions press alike, so there is no inversion setting; one arrives with a rule that tells the directions apart
 - The rotation threshold for counting as a press, and the time after movement stops before counting as a release
 - The rule for combining button input and analog input on the same lane
 - When a device is disconnected, a disconnect event is recorded in the physical input stream. On it, input conversion releases every input of that device that was pressed and clears that device's pending debounce and scratch state, so live play and re-evaluation handle it identically
 
-The conversion, with movement counted in the axis's units after wraparound (a change of more than half a revolution is taken the short way round) and inversion:
+The conversion, with movement counted in the axis's units after wraparound (a change of more than half a revolution is taken the short way round):
 
 - Released, the axis presses its lane once it has moved the press threshold in one direction. The count starts again when the direction changes or the axis pauses longer than the release time, so a position flickering at rest never presses.
 - Pressed, movement of the hold threshold in the pressed direction keeps it pressed (the hysteresis: less movement holds than presses), and movement of the press threshold the other way is a new press. Every press and hold sets the release deadline the release time later; the evaluator releases the lane when the watermark passes it. At equal times inputs still come first, so a report at the deadline moves it; among deadlines a scratch release comes first, as the release input it stands for would.

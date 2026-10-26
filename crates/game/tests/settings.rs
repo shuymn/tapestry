@@ -65,7 +65,6 @@ fn changed() -> Settings {
             scratch: ScratchConfig {
                 relative: false,
                 wrap: 1_024,
-                invert: true,
                 press_threshold: 5,
                 hold_threshold: 3,
                 release_after_us: 80_000,
@@ -202,7 +201,6 @@ fn key_config_gives_profiles_and_recorded_controls() {
                     lane: lane(0),
                     scratch: ScratchSettings {
                         mode: AxisMode::Absolute { wrap: 1_024 },
-                        invert: true,
                         press_threshold: 5,
                         hold_threshold: 3,
                         release_after_us: 80_000,

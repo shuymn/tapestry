@@ -321,8 +321,6 @@ pub struct ScratchConfig {
     /// For an absolute axis, the values in one revolution (it wraps from
     /// its highest back to its lowest); 0 if it does not wrap.
     pub wrap: u32,
-    /// Whether the axis counts backwards.
-    pub invert: bool,
     /// Movement in one direction that presses.
     pub press_threshold: u32,
     /// Movement in the pressed direction that keeps the lane pressed.
@@ -341,7 +339,6 @@ impl Default for ScratchConfig {
         Self {
             relative: matches!(d.mode, AxisMode::Relative),
             wrap,
-            invert: d.invert,
             press_threshold: d.press_threshold,
             hold_threshold: d.hold_threshold,
             release_after_us: d.release_after_us,
@@ -359,7 +356,6 @@ impl ScratchConfig {
             } else {
                 AxisMode::Absolute { wrap: self.wrap }
             },
-            invert: self.invert,
             press_threshold: self.press_threshold,
             hold_threshold: self.hold_threshold,
             release_after_us: self.release_after_us,

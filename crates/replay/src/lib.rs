@@ -35,9 +35,13 @@
 //!   control and lane).
 //! - 2: each source also has its axis bindings after its bindings: a
 //!   count, then each axis's control, lane, mode (0 absolute, followed by
-//!   its wrap; 1 relative), invert (0 or 1), press threshold, hold
-//!   threshold and release time in µs, all unsigned. Written when any
-//!   source binds an axis.
+//!   its wrap; 1 relative), press threshold, hold threshold and release
+//!   time in µs, all unsigned. Written when any source binds an axis.
+//!
+//! Bindings and axes are bounded per source and in all by the evaluator's
+//! limits ([`eval::MAX_BINDINGS_PER_SOURCE`], [`eval::MAX_AXES_PER_SOURCE`],
+//! [`eval::MAX_BINDINGS`], [`eval::MAX_AXES`]), checked as each count is
+//! read, before anything is allocated for it.
 
 #![forbid(unsafe_code)]
 
@@ -96,14 +100,14 @@ pub struct DecodeLimits {
 
 impl DecodeLimits {
     /// The limits for records the app saves: 64 MiB either side of
-    /// compression, 64 sources, and 8 Mi events (an hour of one 1 kHz axis
-    /// together with 16 buttons pressed and released 30 times a second,
-    /// 7.1 M, stays below it).
+    /// compression, 64 sources, and 4 Mi events. The game caps a play's
+    /// recording so that its record always fits (`game`'s recording
+    /// policy, stage1.md D14).
     pub const STANDARD: Self = Self {
         max_compressed: 64 << 20,
         max_uncompressed: 64 << 20,
         max_sources: 64,
-        max_events: 8 << 20,
+        max_events: 4 << 20,
     };
 }
 
@@ -308,7 +312,6 @@ fn write_axes(w: &mut Writer, axes: &[AxisBinding]) {
         scratch:
             ScratchSettings {
                 mode,
-                invert,
                 press_threshold,
                 hold_threshold,
                 release_after_us,
@@ -324,7 +327,6 @@ fn write_axes(w: &mut Writer, axes: &[AxisBinding]) {
             }
             AxisMode::Relative => w.uint(1),
         }
-        w.uint(u64::from(*invert));
         w.uint(u64::from(*press_threshold));
         w.uint(u64::from(*hold_threshold));
         w.uint(u64::from(*release_after_us));
@@ -608,6 +610,7 @@ fn read_devices(
     }
     // Kind, receive method, offset and binding count.
     let mut sources = Vec::with_capacity(r.check_count(n, 4)?);
+    let (mut all_bindings, mut all_axes) = (0, 0);
     for _ in 0..n {
         let kind = read_kind(r)?;
         let receive = match r.uint()? {
@@ -617,6 +620,10 @@ fn read_devices(
         };
         let input_offset = TimeUs(r.int()?);
         let nb = r.count(2)?;
+        all_bindings += nb;
+        if nb > eval::MAX_BINDINGS_PER_SOURCE || all_bindings > eval::MAX_BINDINGS {
+            return Err(DecodeError::TooManyBindings);
+        }
         let mut bindings = Vec::with_capacity(nb);
         for _ in 0..nb {
             let control = ControlId(r.u32()?);
@@ -624,7 +631,7 @@ fn read_devices(
             bindings.push(Binding { control, lane });
         }
         let axes = if version >= AXES_VERSION {
-            read_axes(r)?
+            read_axes(r, &mut all_axes)?
         } else {
             Vec::new()
         };
@@ -647,9 +654,14 @@ fn read_devices(
     })
 }
 
-fn read_axes(r: &mut Reader<'_>) -> Result<Vec<AxisBinding>, DecodeError> {
-    // Control, lane, mode, invert, two thresholds and the release time.
-    let n = r.count(7)?;
+/// One source's axes; `all` counts the axes of every source so far.
+fn read_axes(r: &mut Reader<'_>, all: &mut usize) -> Result<Vec<AxisBinding>, DecodeError> {
+    // Control, lane, mode, two thresholds and the release time.
+    let n = r.count(6)?;
+    *all += n;
+    if n > eval::MAX_AXES_PER_SOURCE || *all > eval::MAX_AXES {
+        return Err(DecodeError::TooManyBindings);
+    }
     let mut axes = Vec::with_capacity(n);
     for _ in 0..n {
         let control = ControlId(r.u32()?);
@@ -659,14 +671,8 @@ fn read_axes(r: &mut Reader<'_>) -> Result<Vec<AxisBinding>, DecodeError> {
             1 => AxisMode::Relative,
             _ => return Err(DecodeError::InvalidValue("axis mode")),
         };
-        let invert = match r.uint()? {
-            0 => false,
-            1 => true,
-            _ => return Err(DecodeError::InvalidValue("axis inversion")),
-        };
         let scratch = ScratchSettings {
             mode,
-            invert,
             press_threshold: r.u32()?,
             hold_threshold: r.u32()?,
             release_after_us: r.u32()?,

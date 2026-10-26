@@ -424,10 +424,9 @@ fn hold_threshold_and_reversal_threshold() {
 }
 
 #[test]
-fn relative_inverted_axis_uses_reports_as_movement() {
+fn relative_axis_uses_reports_as_movement() {
     let s = ScratchSettings {
         mode: AxisMode::Relative,
-        invert: true,
         ..ScratchSettings::DEFAULT
     };
     // A relative axis ignores a value in the snapshot.
@@ -436,8 +435,7 @@ fn relative_inverted_axis_uses_reports_as_movement() {
         held: vec![(SourceId(0), AXIS, 90)],
     };
     let mut c = Conv::with_start(s, &start);
-    // −1 −1 inverted is +2: a press; 0 is no movement; +2 inverted is −2:
-    // a reversal.
+    // -1 -1 is -2: a press; 0 is no movement; +2 is a reversal.
     let edges = c.reports(&[(1, -1), (2, -1), (3, 0), (4, 2)]);
     assert_eq!(edges, [vec![], vec![P], vec![], vec![R, P]]);
 }
@@ -642,4 +640,85 @@ fn aborted_and_incremental_scratch_match_batch() {
     assert_eq!(judged(&aborted.events), [(0, 0, Perfect, Some(0))]);
     assert_eq!(ln_ends(&aborted.events), []);
     assert_eq!(&batch.events[..aborted.events.len()], aborted.events);
+}
+
+#[test]
+fn axes_are_found_by_source_and_control() {
+    // Source 0 binds two axes, source 1 one with the same control as
+    // source 0's second: each report presses its own lane.
+    let mut dev = device(&[0, 0]);
+    for s in &mut dev.sources {
+        s.bindings.clear();
+    }
+    let bind = |control, l| AxisBinding {
+        control: ControlId(control),
+        lane: lane(l),
+        scratch: ScratchSettings::DEFAULT,
+    };
+    dev.sources[0].axes = vec![bind(0x1_0035, 2), bind(0x1_0030, 5)];
+    dev.sources[1].axes = vec![bind(0x1_0030, 6)];
+    let mut c = ConversionState::init(&dev, &InputStart::default()).unwrap();
+    let mut turn = |source, control, t, value| {
+        let e = PhysicalInputEvent {
+            received: TimeUs(t),
+            source: SourceId(source),
+            kind: InputKind::Control {
+                control: ControlId(control),
+                value,
+            },
+        };
+        c.apply(&e, e.received).as_slice().to_vec()
+    };
+    for (source, control) in [(1, 0x1_0030), (0, 0x1_0035), (0, 0x1_0030)] {
+        assert_eq!(turn(source, control, 1, 0), []);
+    }
+    assert_eq!(turn(1, 0x1_0030, 2, 2), [LaneEdge::Press(lane(6))]);
+    assert_eq!(turn(0, 0x1_0030, 3, 2), [LaneEdge::Press(lane(5))]);
+    assert_eq!(turn(0, 0x1_0035, 4, 2), [LaneEdge::Press(lane(2))]);
+    // An unbound control of a source with axes, and a source with no
+    // profile, change nothing.
+    assert_eq!(turn(0, 0x1_0031, 5, 50), []);
+    assert_eq!(turn(7, 0x1_0030, 6, 50), []);
+    // A disconnect releases only its own source's axes.
+    let gone = PhysicalInputEvent {
+        received: TimeUs(7),
+        source: SourceId(0),
+        kind: InputKind::Disconnected,
+    };
+    assert_eq!(
+        c.apply(&gone, gone.received).as_slice(),
+        [LaneEdge::Release(lane(5)), LaneEdge::Release(lane(2))]
+    );
+    assert!(c.is_held(lane(6)));
+}
+
+#[test]
+fn profiles_beyond_the_binding_limits_are_refused() {
+    let axis = |i: usize| AxisBinding {
+        control: ControlId(0x1_0000 + u32::try_from(i).unwrap()),
+        lane: SCRATCH,
+        scratch: ScratchSettings::DEFAULT,
+    };
+    let key = |i: usize| Binding {
+        control: ControlId(u32::try_from(i).unwrap()),
+        lane: lane(1),
+    };
+    let profile = |sources: usize, keys: usize, axes: usize| {
+        let mut d = device(&vec![0; sources]);
+        for s in &mut d.sources {
+            s.bindings = (0..keys).map(key).collect();
+            s.axes = (0..axes).map(axis).collect();
+        }
+        ConversionState::init(&d, &InputStart::default()).map(|_| ())
+    };
+    let refused = Err(EvalError::TooManyBindings);
+    // Per source: 8 axes and 256 keys fit, one more does not.
+    assert_eq!(profile(1, 256, 8), Ok(()));
+    assert_eq!(profile(1, 256, 9), refused);
+    assert_eq!(profile(1, 257, 8), refused);
+    // In all: 16 axes and 1024 keys fit, one more source's worth does not.
+    assert_eq!(profile(2, 0, 8), Ok(()));
+    assert_eq!(profile(3, 0, 6), refused);
+    assert_eq!(profile(4, 256, 0), Ok(()));
+    assert_eq!(profile(5, 205, 0), refused);
 }

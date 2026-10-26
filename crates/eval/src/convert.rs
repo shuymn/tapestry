@@ -5,8 +5,8 @@ use bms_model::{LANE_COUNT, Lane, TimeUs};
 
 use crate::EvalError;
 use crate::input::{
-    AxisMode, ControlId, DeviceProfile, InputKind, InputStart, PhysicalInputEvent, ScratchSettings,
-    SourceId,
+    AxisMode, ControlId, DeviceProfile, InputKind, InputStart, MAX_AXES, MAX_AXES_PER_SOURCE,
+    MAX_BINDINGS, MAX_BINDINGS_PER_SOURCE, PhysicalInputEvent, ScratchSettings, SourceId,
 };
 
 /// A lane's state change.
@@ -56,6 +56,9 @@ impl Edges {
 struct SourceState {
     bindings: Vec<(ControlId, Lane)>,
     pressed: Vec<bool>,
+    /// The source's axes sorted by control, with their index in
+    /// [`ConversionState::axes`].
+    axes: Vec<(ControlId, usize)>,
 }
 
 /// Which way an axis moved.
@@ -68,8 +71,6 @@ enum Direction {
 /// One bound axis's scratch conversion.
 #[derive(Clone, Debug)]
 struct AxisState {
-    source: SourceId,
-    control: ControlId,
     lane: Lane,
     settings: ScratchSettings,
     /// The last absolute report; `None` until the first.
@@ -96,7 +97,7 @@ impl AxisState {
             },
             AxisMode::Relative => i64::from(value),
         };
-        if self.settings.invert { -d } else { d }
+        d
     }
 
     /// Back to released and unknown, as after a disconnect.
@@ -145,9 +146,20 @@ impl ConversionState {
     ///
     /// # Errors
     ///
+    /// [`EvalError::TooManyBindings`] when the profile binds more than the
+    /// limits, checked before anything is allocated for it, and
     /// [`EvalError::DuplicateBinding`] when a source binds one control
     /// twice, as buttons, axes, or both.
     pub fn init(device: &DeviceProfile, start: &InputStart) -> Result<Self, EvalError> {
+        let over = |per: fn(&crate::SourceProfile) -> usize, each: usize, all: usize| {
+            device.sources.iter().any(|s| per(s) > each)
+                || device.sources.iter().map(per).sum::<usize>() > all
+        };
+        if over(|s| s.bindings.len(), MAX_BINDINGS_PER_SOURCE, MAX_BINDINGS)
+            || over(|s| s.axes.len(), MAX_AXES_PER_SOURCE, MAX_AXES)
+        {
+            return Err(EvalError::TooManyBindings);
+        }
         let mut sources = Vec::with_capacity(device.sources.len());
         let mut axes = Vec::new();
         for (index, profile) in device.sources.iter().enumerate() {
@@ -172,10 +184,19 @@ impl ConversionState {
                 .collect();
             bindings.sort_unstable_by_key(|&(control, _)| control);
             let pressed = vec![false; bindings.len()];
-            sources.push(SourceState { bindings, pressed });
+            let mut own: Vec<(ControlId, usize)> = profile
+                .axes
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a.control, axes.len() + i))
+                .collect();
+            own.sort_unstable();
+            sources.push(SourceState {
+                bindings,
+                pressed,
+                axes: own,
+            });
             axes.extend(profile.axes.iter().map(|a| AxisState {
-                source,
-                control: a.control,
                 lane: a.lane,
                 settings: a.scratch,
                 last: None,
@@ -191,13 +212,9 @@ impl ConversionState {
             held: [0; LANE_COUNT],
         };
         for &(source, control, value) in &start.held {
-            if let Some(axis) = state
-                .axes
-                .iter_mut()
-                .find(|a| a.source == source && a.control == control)
-            {
+            if let Some(i) = state.axis_of(source, control) {
                 // Only an absolute axis reads it.
-                axis.last = Some(value);
+                state.axes[i].last = Some(value);
                 continue;
             }
             // Held controls start pressed; no edge is reported for them.
@@ -244,11 +261,7 @@ impl ConversionState {
         let mut edges = Edges::new();
         match ev.kind {
             InputKind::Control { control, value } => {
-                if let Some(i) = self
-                    .axes
-                    .iter()
-                    .position(|a| a.source == ev.source && a.control == control)
-                {
+                if let Some(i) = self.axis_of(ev.source, control) {
                     self.axis_report(i, value, at, &mut edges);
                 } else if let Some(edge) = self.set(ev.source.index(), control, value != 0) {
                     edges.push(edge);
@@ -259,13 +272,22 @@ impl ConversionState {
         edges
     }
 
+    /// The index in `axes` of `control` of `source`, if it is a bound
+    /// axis: a binary search of the source's few axes.
+    fn axis_of(&self, source: SourceId, control: ControlId) -> Option<usize> {
+        let own = &self.sources.get(source.index())?.axes;
+        let k = own.binary_search_by_key(&control, |&(c, _)| c).ok()?;
+        Some(own[k].1)
+    }
+
     /// Releases every control of `source` and clears its axes.
     fn disconnect(&mut self, source: SourceId, edges: &mut Edges) {
-        for i in 0..self.axes.len() {
+        let Some(own) = self.sources.get(source.index()) else {
+            return;
+        };
+        for k in 0..own.axes.len() {
+            let i = self.sources[source.index()].axes[k].1;
             let a = &mut self.axes[i];
-            if a.source != source {
-                continue;
-            }
             let was_pressed = a.pressed.is_some();
             let lane = a.lane;
             a.clear();
