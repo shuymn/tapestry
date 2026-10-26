@@ -279,11 +279,34 @@ fn percentiles_cover_the_whole_play() {
     let x = s.summary().unwrap();
     // Sorted 1 3 4 5 6 9 60 63: rank 4 and rank 8.
     assert_eq!((x.count, x.p50, x.p99, x.max), (8, 5, 63, 63));
-    // A sample beyond 16.8 s reads as the exact maximum; a negative one
-    // counts as 0.
+}
+
+/// Negative samples (a finalization delay can be one) keep their sign and
+/// magnitude, and samples up to 134 s stay within the error: [-9 000,
+/// -1 000] µs has p50 -9 000 by nearest rank, and [20 s, 100 s] has p50
+/// 20 s. Beyond 134 s a sample reads as the exact maximum.
+#[test]
+fn percentiles_keep_negative_and_long_samples() {
+    let near = |got: i64, exact: f64| (got as f64 - exact).abs() <= exact.abs() * RELATIVE_ERROR;
+    let mut s = Samples::new();
+    s.push(-1_000);
+    s.push(-9_000);
+    let x = s.summary().unwrap();
+    assert!(near(x.p50, -9_000.0), "{}", x.p50);
+    assert!(near(x.p99, -1_000.0), "{}", x.p99);
+    assert_eq!(x.max, -1_000);
+
+    let mut s = Samples::new();
+    s.push(100_000_000);
+    s.push(20_000_000);
+    let x = s.summary().unwrap();
+    assert!(near(x.p50, 20_000_000.0), "{}", x.p50);
+    assert!(near(x.p99, 100_000_000.0), "{}", x.p99);
+
+    // Small negatives are exact; beyond 134 s, the exact maximum.
     let mut s = Samples::new();
     s.push(-5);
-    s.push(40_000_000);
+    s.push(200_000_000);
     let x = s.summary().unwrap();
-    assert_eq!((x.p50, x.p99, x.max), (0, 40_000_000, 40_000_000));
+    assert_eq!((x.p50, x.p99, x.max), (-5, 200_000_000, 200_000_000));
 }

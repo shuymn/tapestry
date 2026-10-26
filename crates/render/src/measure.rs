@@ -1,4 +1,4 @@
-//! Pure frame and latency measurement (D11): whole-play sample
+//! Pure frame and latency measurement (D11): whole-play signed sample
 //! histograms with their percentiles, DXGI frame statistics paired to frames by present count,
 //! lost refreshes from the statistics' refresh counts, the table that
 //! gives each judgment the display time of the first presented frame that
@@ -24,30 +24,36 @@ pub struct Summary {
     pub max: i64,
 }
 
-/// Values below this are counted exactly, one bucket each.
+/// Magnitudes below this are counted exactly, one bucket each.
 const EXACT: i64 = 64;
 /// Buckets per power of two above [`EXACT`].
 const SUB_BITS: u32 = 5;
-/// The powers of two with sub-buckets: 2^6 up to 2^24 µs (16.8 s).
+/// The powers of two with sub-buckets: 2^6 up to 2^27 µs (134 s).
 const FIRST_OCTAVE: u32 = 6;
-const LAST_OCTAVE: u32 = 23;
+const LAST_OCTAVE: u32 = 26;
+/// Buckets of one sign; the last holds magnitudes beyond 2^27 µs.
 const BUCKETS: usize = EXACT as usize + ((LAST_OCTAVE - FIRST_OCTAVE + 1) << SUB_BITS) as usize + 1;
 
 /// The largest error of a percentile against the exact one, relative to
-/// it, for samples up to 2^24: half a sub-bucket of 1/32 of its power of
-/// two. Larger samples share the last bucket and read as the maximum.
+/// it, for magnitudes up to 2^27 µs (134 s): half a sub-bucket of 1/32 of
+/// its power of two. Larger ones share the last bucket and read as the
+/// exact maximum (or minimum, for negative samples).
 pub const RELATIVE_ERROR: f64 = 1.0 / 64.0;
 
-/// A whole play's samples as a fixed log-linear histogram: exact below 64,
-/// then 32 buckets per power of two up to 16.8 s, so a percentile is within
-/// [`RELATIVE_ERROR`] of the exact one, while the count and the maximum are
-/// exact. Negative samples count as 0. Recording and summarizing allocate
-/// nothing.
+/// A whole play's samples as a fixed log-linear histogram of each sign:
+/// exact below 64 in magnitude, then 32 buckets per power of two up to
+/// 134 s, so a percentile is within [`RELATIVE_ERROR`] of the exact one,
+/// while the count, the maximum and the minimum are exact. Recording and
+/// summarizing allocate nothing.
 #[derive(Clone, Debug)]
 pub struct Samples {
-    buckets: Box<[u64; BUCKETS]>,
+    /// Samples at or above 0, by magnitude.
+    positive: Box<[u64; BUCKETS]>,
+    /// Samples below 0, by magnitude.
+    negative: Box<[u64; BUCKETS]>,
     count: u64,
     max: i64,
+    min: i64,
 }
 
 impl Default for Samples {
@@ -61,24 +67,33 @@ impl Samples {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            buckets: Box::new([0; BUCKETS]),
+            positive: Box::new([0; BUCKETS]),
+            negative: Box::new([0; BUCKETS]),
             count: 0,
             max: i64::MIN,
+            min: i64::MAX,
         }
     }
 
     /// Forgets every sample.
     pub fn clear(&mut self) {
-        self.buckets.fill(0);
+        self.positive.fill(0);
+        self.negative.fill(0);
         self.count = 0;
         self.max = i64::MIN;
+        self.min = i64::MAX;
     }
 
     /// Adds one sample.
     pub fn push(&mut self, v: i64) {
-        self.buckets[bucket(v)] += 1;
+        if v < 0 {
+            self.negative[bucket(v.unsigned_abs())] += 1;
+        } else {
+            self.positive[bucket(v.unsigned_abs())] += 1;
+        }
         self.count += 1;
         self.max = self.max.max(v);
+        self.min = self.min.min(v);
     }
 
     /// Samples pushed.
@@ -102,36 +117,47 @@ impl Samples {
     }
 
     /// The `p`th percentile by nearest rank: the middle of the bucket that
-    /// holds the sample of that rank, never above the maximum.
+    /// holds the sample of that rank, within the minimum and the maximum.
+    /// Negative buckets come first, the largest magnitude first.
     fn percentile(&self, p: u64) -> i64 {
         let rank = (p * self.count).div_ceil(100).max(1);
         let mut seen = 0;
-        for (i, &n) in self.buckets.iter().enumerate() {
+        let negative = self
+            .negative
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, &n)| (n, -middle(i)));
+        let positive = self
+            .positive
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, middle(i)));
+        for (n, v) in negative.chain(positive) {
             seen += n;
             if seen >= rank {
-                return middle(i).min(self.max);
+                return v.clamp(self.min, self.max);
             }
         }
         self.max
     }
 }
 
-/// The bucket of `v`.
-fn bucket(v: i64) -> usize {
-    let v = v.max(0);
-    if v < EXACT {
-        return v as usize;
+/// The bucket of magnitude `m`.
+fn bucket(m: u64) -> usize {
+    if m < EXACT as u64 {
+        return m as usize;
     }
-    let octave = 63 - v.leading_zeros();
+    let octave = 63 - m.leading_zeros();
     if octave > LAST_OCTAVE {
         return BUCKETS - 1;
     }
-    let sub = (v >> (octave - SUB_BITS)) & ((1 << SUB_BITS) - 1);
+    let sub = (m >> (octave - SUB_BITS)) & ((1 << SUB_BITS) - 1);
     EXACT as usize + (((octave - FIRST_OCTAVE) << SUB_BITS) as usize) + sub as usize
 }
 
-/// The middle of bucket `i`; the last one has none and reads as the
-/// largest value.
+/// The middle magnitude of bucket `i`; the last one has none and reads as
+/// the largest magnitude (clamped to the exact extreme by the caller).
 fn middle(i: usize) -> i64 {
     if i < EXACT as usize {
         return i as i64;
