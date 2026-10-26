@@ -656,10 +656,11 @@ fn each_resolved_field_changes_the_resolved_hash() {
 
 #[test]
 fn trailing_measures_after_the_last_object_are_dropped() {
-    // At 60 BPM each measure lasts 4 s, so measure 999 would start at 66.6
-    // minutes, past the duration cap. Only the bar lines through the last
+    // At 60 BPM each measure lasts 4 s, and from measure 500 (2000 s) the
+    // trailing change to 15 BPM makes it 16 s, so measure 999 would start
+    // at 9984 s, past the 60-minute cap. Only the bar lines through the last
     // note (measure 2) stay, and the BPM change after it is dropped.
-    let text = "#BPM 60\n#WAV01 click.wav\n#00011:01\n#00211:0001\n#50003:78\n#99902:0.5\n";
+    let text = "#BPM 60\n#WAV01 click.wav\n#00011:01\n#00211:0001\n#50003:0F\n#99902:0.5\n";
     let loaded = load_text(text).unwrap();
     assert_eq!(times(&loaded.chart.lanes[1]), vec![0, 10_000_000]);
     assert_eq!(
@@ -667,8 +668,9 @@ fn trailing_measures_after_the_last_object_are_dropped() {
         vec![TimeUs(0), TimeUs(4_000_000), TimeUs(8_000_000)]
     );
     let pos = |t| loaded.chart.scroll.position_at(TimeUs(t));
-    // Still 60 BPM after the last note: 1 beat a second.
-    assert_eq!(pos(11_000_000).0 - pos(10_000_000).0, 1_000_000);
+    // Still 60 BPM after where the dropped change was: 1 beat a second,
+    // not the quarter beat 15 BPM would give.
+    assert_eq!(pos(2_101_000_000).0 - pos(2_100_000_000).0, 1_000_000);
     // A BGM object counts as the last object too.
     let bgm = "#BPM 60\n#WAV01 click.wav\n#00011:01\n#00401:01\n#99902:0.5\n";
     assert_eq!(load_text(bgm).unwrap().chart.bar_lines.len(), 5);
