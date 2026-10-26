@@ -93,16 +93,23 @@ pub enum Probed {
     },
 }
 
-/// The audio thread's underrun count (wakes that found the buffer empty
-/// after audio had been written), readable from any thread.
+/// The audio thread's counters, readable from any thread.
 #[derive(Clone, Debug)]
-pub struct Underruns(Arc<Shared>);
+pub struct AudioCounters(Arc<Shared>);
 
-impl Underruns {
-    /// Underruns since the engine started.
+impl AudioCounters {
+    /// Underruns since the engine started: wakes that found the buffer
+    /// empty after audio had been written.
     #[must_use]
-    pub fn get(&self) -> u64 {
+    pub fn underruns(&self) -> u64 {
         self.0.underruns.load(Ordering::Acquire)
+    }
+
+    /// Probe samples the full probe queue refused since the engine
+    /// started.
+    #[must_use]
+    pub fn probes_dropped(&self) -> u64 {
+        self.0.probes_dropped.load(Ordering::Acquire)
     }
 }
 
@@ -116,6 +123,8 @@ struct Shared {
     done: AtomicU64,
     /// The engine's underruns so far.
     underruns: AtomicU64,
+    /// Probe samples dropped on a full probe queue.
+    probes_dropped: AtomicU64,
     failure: OnceLock<OutputError>,
 }
 
@@ -292,10 +301,10 @@ impl AudioControl {
         self.generation
     }
 
-    /// The audio thread's underrun count.
+    /// The audio thread's counters.
     #[must_use]
-    pub fn underruns(&self) -> Underruns {
-        Underruns(Arc::clone(&self.shared))
+    pub fn counters(&self) -> AudioCounters {
+        AudioCounters(Arc::clone(&self.shared))
     }
 
     /// Ends the worker's loop.
@@ -366,13 +375,21 @@ impl AudioWorker {
             .store(self.engine.underruns(), Ordering::Release);
         if let Some(p) = self.probe.as_mut() {
             let generation = self.generation;
+            let mut dropped = 0;
             self.engine.drain_scheduled(|s| {
                 if let (ScheduledKind::Key { origin }, Some(at)) = (s.kind, s.at) {
                     let latency = TimeUs(at.0.saturating_sub(origin.0));
                     let kind = Probed::KeyScheduled { latency };
-                    let _ = p.push(AudioProbe { generation, kind });
+                    if p.push(AudioProbe { generation, kind }).is_err() {
+                        dropped += 1;
+                    }
                 }
             });
+            if dropped > 0 {
+                self.shared
+                    .probes_dropped
+                    .fetch_add(dropped, Ordering::AcqRel);
+            }
         }
         let mixer = self.engine.mixer();
         if self.sealed

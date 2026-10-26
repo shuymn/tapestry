@@ -190,7 +190,7 @@ fn the_probe_reports_each_key_sound_with_its_play() {
     );
     let (tx, mut rx) = rtrb::RingBuffer::new(8);
     worker.set_probe(tx);
-    let underruns = control.underruns();
+    let counters = control.counters();
     for _ in 0..3 {
         worker.step(&mut out).unwrap();
     }
@@ -213,7 +213,7 @@ fn the_probe_reports_each_key_sound_with_its_play() {
     let game::Probed::KeyScheduled { latency } = probe.kind;
     assert!(latency.0 > 0);
     assert_eq!(latency, TimeUs(played.0 - 33 * MS));
-    assert_eq!(underruns.get(), 0);
+    assert_eq!(counters.underruns(), 0);
 }
 
 /// Three missed buffer events leave the device without audio: the
@@ -230,11 +230,45 @@ fn underruns_are_counted_as_the_device_saw_them() {
         ..SimConfig::steady(RATE, PERIOD, TimeUs(0))
     };
     let mut out = RecordingOutput::new(SimDevice::new(config), RATE as usize);
-    let underruns = control.underruns();
+    let counters = control.counters();
     for _ in 0..20 {
         worker.step(&mut out).unwrap();
     }
     let seen = out.inner().underruns();
-    assert!((1..=seen).contains(&underruns.get()), "{seen}");
-    assert_eq!(underruns.get(), worker.engine().underruns());
+    assert!((1..=seen).contains(&counters.underruns()), "{seen}");
+    assert_eq!(counters.underruns(), worker.engine().underruns());
+}
+
+/// Probe samples the full probe queue refuses are counted, not lost
+/// silently: three key sounds scheduled in one step into a queue of one.
+#[test]
+fn dropped_probe_samples_are_counted() {
+    let chart = ChartBuilder::new(150_000)
+        .sound("bgm.wav")
+        .sound("key.wav")
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let engine = AudioEngine::new(bank(&chart), &chart.bgm, RATE, PERIOD, MAX_VOICES, 8).unwrap();
+    let (mut control, mut worker) = audio_control(engine);
+    let mut out = RecordingOutput::new(
+        SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+        RATE as usize,
+    );
+    let (tx, mut rx) = rtrb::RingBuffer::new(1);
+    worker.set_probe(tx);
+    let counters = control.counters();
+    for _ in 0..3 {
+        worker.step(&mut out).unwrap();
+    }
+    let (mut sink, queue) = audio_link_at(8, TimeUs(30 * MS));
+    control.play(TimeUs(30 * MS), queue).unwrap();
+    worker.step(&mut out).unwrap();
+    for press in [1, 2, 3] {
+        sink.receive(&key_sound(press * MS));
+    }
+    worker.step(&mut out).unwrap();
+    assert!(rx.pop().is_ok());
+    assert!(rx.pop().is_err());
+    assert_eq!(counters.probes_dropped(), 2);
 }

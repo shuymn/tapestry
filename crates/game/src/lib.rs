@@ -31,8 +31,8 @@ mod sound;
 mod tuning;
 
 pub use audio_loop::{
-    AudioControl, AudioCtl, AudioProbe, AudioWaitError, AudioWorker, Probed, SWITCH_TIMEOUT,
-    Underruns, audio_control,
+    AudioControl, AudioCounters, AudioCtl, AudioProbe, AudioWaitError, AudioWorker, Probed,
+    SWITCH_TIMEOUT, audio_control,
 };
 pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, Press, ROLES,
