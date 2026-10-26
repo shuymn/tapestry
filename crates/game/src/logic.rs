@@ -86,6 +86,17 @@ pub enum AbortCause {
     /// An input did not fit the play's input budget, or the evaluator
     /// refused it: the record is incomplete (overflow).
     Overflow,
+    /// The player pressed retry.
+    Retry,
+    /// The player pressed quit.
+    Quit,
+    /// The system suspended: the clock jumped, so the record is incomplete
+    /// (suspend).
+    Suspend,
+    /// The audio output failed.
+    OutputFailed,
+    /// A survival gauge failed and the session policy ends the play.
+    GaugeFailed,
 }
 
 /// What one logic step did.
