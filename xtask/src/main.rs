@@ -5,6 +5,7 @@
 mod arch;
 mod banned_words;
 mod binary;
+mod demo;
 #[cfg(test)]
 mod fixture;
 mod portable;
@@ -22,6 +23,8 @@ commands:
                                           check paths and contents in the index for
                                           terms in banned-words.txt
   portable <cargo-command> [args...]      run cargo on every non-Windows-only package
+  demo-chart <dir>                        write a self-made two-minute chart and its
+                                          generated sounds into <dir>
   check-binary (--absent|--present) <text> <file>
                                           check whether a file contains <text>";
 
@@ -38,6 +41,7 @@ fn main() -> ExitCode {
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
         Some("check-binary") => binary::run(&rest),
+        Some("demo-chart") => demo_chart(&rest),
         Some("-h" | "--help") => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -82,4 +86,21 @@ fn cargo() -> OsString {
 fn usage_error(message: &str) -> ExitCode {
     eprintln!("xtask: {message}\n\n{USAGE}");
     ExitCode::from(2)
+}
+
+/// `demo-chart <dir>`: writes the demo chart and prints its path.
+fn demo_chart(rest: &[OsString]) -> ExitCode {
+    let [dir] = rest else {
+        return usage_error("demo-chart takes one directory");
+    };
+    match demo::write(&PathBuf::from(dir)) {
+        Ok(path) => {
+            println!("{}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("demo-chart: {e}");
+            ExitCode::from(1)
+        }
+    }
 }

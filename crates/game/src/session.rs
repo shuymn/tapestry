@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
 use bms_model::{Chart, TimeSource, TimeUs, VirtualClock};
-use eval::{Evaluator, InputStart, JudgeEvent, Tally};
+use eval::{Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
@@ -27,17 +27,20 @@ use replay::{
 };
 use rules::{GaugeKind, RulePreset};
 
-use crate::logic::{AbortCause, Logic, LogicConfig, LogicError};
+use crate::live::{Closing, LiveError, Opening, Rig};
+use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy,
 };
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
 use crate::preset::{PresetError, load_preset_toml, preset_to_toml};
+use crate::render::PlayView;
+use crate::render::RenderSide;
 use crate::results::{ReEvaluate, ResultContext, ResultExtension, ResultSummary};
 use crate::save::{LocalRecords, RecordRef, RecordSink, SaveError, write_atomic};
 use crate::settings::{DataRoot, DeviceSettings, PlayerSettings, SettingsError};
-use crate::sound::{RunnerAudio, Wakes, audio_link_at};
+use crate::sound::{AudioQueue, RunnerAudio, Wakes};
 
 /// Every extension point the session calls through, each with one
 /// implementation in stage 1.
@@ -191,7 +194,7 @@ pub enum Command {
 }
 
 impl Command {
-    const fn cause(self) -> AbortCause {
+    pub(crate) const fn cause(self) -> AbortCause {
         match self {
             Self::Retry => AbortCause::Retry,
             Self::Quit => AbortCause::Quit,
@@ -257,10 +260,19 @@ pub struct PlayReport {
     pub saved: Option<Result<RecordRef, SaveError>>,
     /// The result extension's summary of a recorded play.
     pub result: Option<ResultSummary>,
+    /// The preset the play was evaluated under: after a reload at a
+    /// retry, the new one.
+    pub preset: RulePreset,
 }
 
 /// A loaded chart, its preset and settings, before audio is attached: the
 /// sound bank is built from [`Loaded::chart`].
+///
+/// It also holds what every play of the chart shares, whichever driver
+/// runs the plays: [`Session::play`] headlessly, or the game's threads.
+/// Each play goes [`begin_play`](Self::begin_play) →
+/// [`plan`](Self::plan) once recording has opened → evaluation →
+/// [`finish_play`](Self::finish_play).
 #[derive(Debug)]
 pub struct Loaded {
     root: DataRoot,
@@ -273,6 +285,56 @@ pub struct Loaded {
     preset: RulePreset,
     preset_path: PathBuf,
     preset_modified: Option<SystemTime>,
+    attempt: u32,
+}
+
+/// The start of one play: its number, and whether the preset file it
+/// should have reloaded was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayStart {
+    /// The play's number in the session, from 1.
+    pub attempt: u32,
+    /// Why the preset file changed at this retry but was not used; the
+    /// previous preset plays instead.
+    pub reload_error: Option<ReloadError>,
+}
+
+/// What one play is sized and evaluated with, once its participating
+/// sources are known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayPlan {
+    /// The device profile, indexed by source id.
+    pub device: eval::DeviceProfile,
+    /// The logic step's sizes: the recording window's capacity (D8).
+    pub logic: LogicConfig,
+}
+
+/// How one play went, as its driver saw it: what
+/// [`Loaded::finish_play`] turns into the record, the saved file and the
+/// result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayOutcome {
+    /// From [`Loaded::begin_play`].
+    pub start: PlayStart,
+    /// How the play ended.
+    pub end: PlayEnd,
+    /// What ended the audio tail of a completed play early, if anything.
+    pub tail_cut: Option<AbortCause>,
+    /// The audio output's failure, if it stopped the play or its tail.
+    pub output_error: Option<OutputError>,
+    /// The live event stream.
+    pub live: Vec<JudgeEvent>,
+    /// The play view after the last step.
+    pub view: PlayView,
+    /// What the logic step recorded.
+    pub record: Record,
+    /// The participating sources' kinds, indexed by source id.
+    pub kinds: Vec<DeviceKind>,
+    /// Devices that arrived while recording was open.
+    pub arrivals: Vec<InputArrival>,
+    /// Why the record may be incomplete. Suspend is set by
+    /// [`Loaded::finish_play`] from `end`.
+    pub incomplete: Incomplete,
 }
 
 impl Loaded {
@@ -344,6 +406,7 @@ impl Loaded {
             preset,
             preset_path,
             preset_modified,
+            attempt: 0,
         })
     }
 
@@ -359,6 +422,30 @@ impl Loaded {
         &self.warnings
     }
 
+    /// The preset plays use now.
+    #[must_use]
+    pub const fn preset(&self) -> &RulePreset {
+        &self.preset
+    }
+
+    /// The settings the session runs with.
+    #[must_use]
+    pub const fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// The session's fixed choices.
+    #[must_use]
+    pub const fn config(&self) -> &SessionConfig {
+        &self.config
+    }
+
+    /// The data root.
+    #[must_use]
+    pub const fn root(&self) -> &DataRoot {
+        &self.root
+    }
+
     /// Attaches audio and the input side, ready to play. The engine takes
     /// the device settings' volume and audio offset.
     #[must_use]
@@ -367,16 +454,173 @@ impl Loaded {
         mut audio: RunnerAudio<O>,
         sources: SourceSet,
     ) -> Session<O> {
-        let engine = audio.engine_mut();
-        // An out-of-range volume is not applied; the engine keeps unity.
-        let _ = engine.set_volume(self.settings.device.master_volume);
-        engine.set_output_offset(TimeUs(self.settings.device.audio_offset_us));
+        self.settings.device.apply_to(audio.engine_mut());
         Session {
             clock: VirtualClock::new(self.config.start),
             loaded: self,
             audio,
             sources,
-            attempt: 0,
+        }
+    }
+
+    /// Starts the next play. Every play after the first is a retry: a
+    /// preset file changed since the previous play is used from this one
+    /// on.
+    pub fn begin_play(&mut self) -> PlayStart {
+        self.attempt += 1;
+        let attempt = self.attempt;
+        let reload_error = if attempt > 1 {
+            self.reload_preset()
+        } else {
+            None
+        };
+        self.parts.events.on_event(&SessionEvent::Start { attempt });
+        PlayStart {
+            attempt,
+            reload_error,
+        }
+    }
+
+    /// At a retry: uses the preset file from now on if its modification
+    /// time changed; a file that fails to load leaves the current preset.
+    fn reload_preset(&mut self) -> Option<ReloadError> {
+        let modified = fs::metadata(&self.preset_path).and_then(|m| m.modified());
+        match modified {
+            Ok(m) if Some(m) == self.preset_modified => None,
+            _ => match read_preset(&self.preset_path) {
+                Ok((preset, modified)) => {
+                    self.preset = preset;
+                    self.preset_modified = modified;
+                    None
+                }
+                Err(e) => Some(e),
+            },
+        }
+    }
+
+    /// The device profile and the logic step's sizes for a play whose
+    /// participating sources have `kinds`, indexed by source id.
+    #[must_use]
+    pub fn plan(&self, kinds: &[DeviceKind]) -> PlayPlan {
+        let device = self.settings.device.profile(kinds);
+        let buttons: usize = kinds
+            .iter()
+            .map(|&k| self.settings.device.keys(k).recorded().len())
+            .sum();
+        let logic = LogicConfig {
+            inputs: window_inputs(
+                &self.chart,
+                &self.preset,
+                &device,
+                self.config.lead_in,
+                buttons,
+            ),
+            effects: self.config.effects,
+        };
+        PlayPlan { device, logic }
+    }
+
+    /// Whether the session policy ends the play with `gauges` (every
+    /// gauge in the preset's order): a survival gauge failed and the policy
+    /// does not keep playing.
+    #[must_use]
+    pub fn ends_play(&self, gauges: &[GaugeState]) -> bool {
+        let failed = gauges
+            .iter()
+            .zip(&self.preset.gauges)
+            .any(|(g, rule)| rule.kind == GaugeKind::Survival && g.failed_at.is_some());
+        failed && self.parts.policy.on_survival_failure() == FailureAction::EndPlay
+    }
+
+    /// Ends a play: builds its record (unless nothing was finalized),
+    /// saves it, summarizes it through the result extension, and reports
+    /// the session events.
+    pub fn finish_play(&mut self, outcome: PlayOutcome) -> PlayReport {
+        let PlayOutcome {
+            start,
+            end,
+            tail_cut,
+            output_error,
+            live,
+            view,
+            record,
+            kinds,
+            arrivals,
+            mut incomplete,
+        } = outcome;
+        incomplete.suspend |= end == PlayEnd::Aborted(AbortCause::Suspend);
+        let PlayStart {
+            attempt,
+            reload_error,
+        } = start;
+        let status = match end {
+            PlayEnd::Completed => EndStatus::PlayedToEnd,
+            PlayEnd::Aborted(_) => EndStatus::EndedMidway,
+        };
+        let (config, settings, preset) = (&self.config, &self.settings, &self.preset);
+        let play_record = record.finalized.map(|finalized| PlayRecord {
+            versions: Versions {
+                evaluator: preset.implementation.version(),
+                app: config.app_version.clone(),
+                provenance: config.provenance,
+            },
+            chart: self.chart_record.clone(),
+            preset: PresetRecord::of(preset),
+            session_policy: self.parts.policy.id().to_owned(),
+            devices: DeviceRecord {
+                sources: kinds
+                    .iter()
+                    .zip(&record.device.sources)
+                    .map(|(&kind, profile)| SourceRecord {
+                        kind: replay_kind(kind),
+                        receive: config.receive,
+                        profile: profile.clone(),
+                    })
+                    .collect(),
+                audio_offset: TimeUs(settings.device.audio_offset_us),
+                display_offset: TimeUs(settings.device.display_offset_us),
+            },
+            play_type: PlayType::Full,
+            start: record.start,
+            events: record.events,
+            arrivals: arrivals.iter().map(arrival).collect(),
+            status: Status {
+                end: status,
+                finalized,
+                incomplete,
+            },
+        });
+        let parts = &mut self.parts;
+        let saved = play_record.as_ref().map(|r| parts.records.save(r));
+        let result = play_record.as_ref().map(|r| {
+            parts.results.on_play_end(&ResultContext {
+                record: r,
+                chart: &self.chart,
+                preset,
+                live: &live,
+            })
+        });
+        let retried =
+            end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
+        if retried {
+            parts.events.on_event(&SessionEvent::Retry { attempt });
+        }
+        parts
+            .events
+            .on_event(&SessionEvent::End { attempt, status });
+        PlayReport {
+            attempt,
+            end,
+            tail_cut,
+            reload_error,
+            output_error,
+            live,
+            tally: view.tally,
+            displayed_gauge: parts.policy.displayed_gauge(&view.gauges),
+            record: play_record,
+            saved,
+            result,
+            preset: preset.clone(),
         }
     }
 }
@@ -395,21 +639,20 @@ fn read_preset(path: &Path) -> Result<(RulePreset, Option<SystemTime>), ReloadEr
 }
 
 /// The session: a loaded chart, its audio and input, played any number of
-/// times.
+/// times without threads, on a virtual clock.
 #[derive(Debug)]
 pub struct Session<O> {
     loaded: Loaded,
     audio: RunnerAudio<O>,
     sources: SourceSet,
     clock: VirtualClock,
-    attempt: u32,
 }
 
 impl<O: AudioOutput + Wakes> Session<O> {
     /// The preset plays use now.
     #[must_use]
     pub const fn preset(&self) -> &RulePreset {
-        &self.loaded.preset
+        self.loaded.preset()
     }
 
     /// Calls `f` with each sound start the engine scheduled and kept (the
@@ -427,7 +670,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
     /// The data root.
     #[must_use]
     pub const fn root(&self) -> &DataRoot {
-        &self.loaded.root
+        self.loaded.root()
     }
 
     /// The audio side.
@@ -436,27 +679,10 @@ impl<O: AudioOutput + Wakes> Session<O> {
         &self.audio
     }
 
-    /// At a retry: uses the preset file from now on if its modification
-    /// time changed; a file that fails to load leaves the current preset.
-    fn reload_preset(&mut self) -> Option<ReloadError> {
-        let l = &mut self.loaded;
-        let modified = fs::metadata(&l.preset_path).and_then(|m| m.modified());
-        match modified {
-            Ok(m) if Some(m) == l.preset_modified => None,
-            _ => match read_preset(&l.preset_path) {
-                Ok((preset, modified)) => {
-                    l.preset = preset;
-                    l.preset_modified = modified;
-                    None
-                }
-                Err(e) => Some(e),
-            },
-        }
-    }
-
     /// Plays the chart once with `script`, from the countdown to the
     /// result, or until a system control, focus loss, removal of the last
-    /// device or an audio failure ends it. Every play after the first is a
+    /// device or an audio failure ends it, through the lifecycle every
+    /// driver shares ([`crate::live`]). Every play after the first is a
     /// retry: a preset file changed since the previous play is used from
     /// this one on.
     ///
@@ -464,252 +690,200 @@ impl<O: AudioOutput + Wakes> Session<O> {
     ///
     /// What [`Logic::new`] refuses (for example a key config binding one
     /// control twice); recording is closed again and nothing is played.
-    #[allow(clippy::too_many_lines)]
-    pub fn play(&mut self, mut script: PlayScript) -> Result<PlayReport, LogicError> {
-        self.attempt += 1;
-        let attempt = self.attempt;
-        let reload_error = if attempt > 1 {
-            self.reload_preset()
-        } else {
-            None
-        };
+    pub fn play(&mut self, script: PlayScript) -> Result<PlayReport, LogicError> {
         let Self {
             loaded,
             audio,
             sources,
             clock,
-            ..
         } = self;
-        let Loaded {
-            settings,
-            config,
-            parts,
-            chart,
-            chart_record,
-            preset,
-            ..
-        } = loaded;
-        parts.events.on_event(&SessionEvent::Start { attempt });
+        let mut rig = SessionRig {
+            step: loaded.config.step,
+            clock,
+            sources,
+            audio,
+            script,
+            next_command: 0,
+            origin: None,
+            participants: Vec::new(),
+            sounds: None,
+            screen: None,
+            failure: None,
+            sealed: false,
+        };
+        match crate::live::play(loaded, &mut rig) {
+            Ok(Some(report)) => Ok(report),
+            Ok(None) => unreachable!("a session never quits before recording opens"),
+            Err(LiveError::Logic(e)) => Err(e),
+            Err(LiveError::Screen(_) | LiveError::Audio(_)) => {
+                unreachable!("a session has no screen or audio thread to fail")
+            }
+        }
+    }
+}
 
+/// The session's rig: one step of the virtual clock per wait, the script
+/// fed on the play's timeline, and the audio stepped through every buffer
+/// event before the step's logic (a buffer event at the step's own time
+/// runs at the next wait, after the logic, as production orders them).
+struct SessionRig<'s, O> {
+    step: TimeUs,
+    clock: &'s mut VirtualClock,
+    sources: &'s mut SourceSet,
+    audio: &'s mut RunnerAudio<O>,
+    script: PlayScript,
+    next_command: usize,
+    origin: Option<TimeUs>,
+    /// Each participant with its connection at the opening.
+    participants: Vec<(input::DeviceId, Option<u64>)>,
+    sounds: Option<AudioQueue>,
+    screen: Option<RenderSide>,
+    failure: Option<OutputError>,
+    sealed: bool,
+}
+
+impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
+    /// Every buffer event due before `now` (with `through`, at `now` too),
+    /// until the output fails.
+    fn step_audio(&mut self, now: TimeUs, through: bool) {
+        if let Some(sounds) = &mut self.sounds
+            && self.failure.is_none()
+            && let Err(e) = self.audio.step(now, through, sounds)
+        {
+            self.failure = Some(e);
+        }
+    }
+}
+
+impl<O> SessionRig<'_, O> {
+    fn play_time(&self) -> Option<TimeUs> {
+        self.origin.map(|o| TimeUs(self.clock.now().0 - o.0))
+    }
+}
+
+impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
+    type Reader = input::SourceReader;
+
+    fn now(&self) -> TimeUs {
+        self.clock.now()
+    }
+
+    fn wait(&mut self) {
+        self.clock.advance(self.step);
+        let global = self.clock.now();
+        if let Some(now) = self.play_time() {
+            self.script.input.poll(now, self.sources);
+        }
+        if !self.sealed {
+            self.step_audio(global, false);
+        }
+        if let Some(screen) = &mut self.screen {
+            screen.drain_effects(|_| {});
+        }
+    }
+
+    fn stepped(&mut self, aborted: bool) {
+        if !aborted {
+            self.step_audio(self.clock.now(), true);
+        }
+    }
+
+    fn take(&mut self) -> Option<Command> {
+        let now = self.play_time()?;
+        let &(at, c) = self.script.commands.get(self.next_command)?;
+        (at <= now).then(|| {
+            self.next_command += 1;
+            c
+        })
+    }
+
+    fn quitting(&self) -> bool {
+        false
+    }
+
+    fn prepare_screen(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn open(&mut self, lead_in: TimeUs) -> Opening<Self::Reader> {
         // The countdown starts now; chart time 0 is `lead_in` later.
-        let origin = TimeUs(clock.now().0 + config.lead_in.0);
-        let open_at = TimeUs(-config.lead_in.0);
-        script.input.poll(TimeUs(open_at.0 - 1), sources);
-        sources.gate_mut().reset();
-        let input_start = sources.open_recording(open_at);
-        let kinds: Vec<DeviceKind> = sources.participants().map(|(_, k)| k).collect();
-        // Each participant with its connection at the opening: one removed
-        // and connected again since counts as removed in the tail.
-        let participants: Vec<_> = sources
+        let origin = TimeUs(self.clock.now().0 + lead_in.0);
+        let open_at = TimeUs(-lead_in.0);
+        self.script.input.poll(TimeUs(open_at.0 - 1), self.sources);
+        self.sources.gate_mut().reset();
+        let start = self.sources.open_recording(open_at);
+        let sources = &*self.sources;
+        // One removed and connected again since counts as removed.
+        self.participants = sources
             .participants()
             .map(|(d, _)| (d, sources.connection(d)))
             .collect();
-        let device = settings.device.profile(&kinds);
-        let buttons: usize = kinds
-            .iter()
-            .map(|&k| settings.device.keys(k).recorded().len())
-            .sum();
-        let logic_config = LogicConfig {
-            inputs: window_inputs(chart, preset, &device, config.lead_in, buttons),
-            effects: config.effects,
-        };
-        let readers = sources.take_readers();
-        let (mut logic, mut render) = match Logic::new(
-            chart,
-            preset,
-            &device,
-            &input_start,
-            readers,
-            logic_config,
-            Vec::new(),
-        ) {
-            Ok(pair) => pair,
-            Err(e) => {
-                sources.close_recording();
-                return Err(e);
-            }
-        };
-        let (sink, mut sounds) = audio_link_at(logic.max_events(), origin);
-        logic.add_sink(Box::new(sink));
-        audio.engine_mut().restart(origin);
-        let mut live = Vec::with_capacity(logic.max_events());
-        let mut commands = script.commands.iter().copied().peekable();
-        let mut output_error = None;
-        let mut due = |now: TimeUs| commands.next_if(|&(at, _)| at <= now).map(|(_, c)| c);
-
-        let end = loop {
-            clock.advance(config.step);
-            let global = clock.now();
-            let now = TimeUs(global.0 - origin.0);
-            script.input.poll(now, sources);
-            if let Some(c) = due(now) {
-                logic.abort(c.cause());
-            } else if sources.gate().is_tripped() {
-                logic.abort(AbortCause::FocusLoss);
-            } else if let Err(e) = audio.step(global, false, &mut sounds) {
-                output_error = Some(e);
-                logic.abort(AbortCause::OutputFailed);
-            }
-            let advance = logic.advance_to(now);
-            live.extend_from_slice(logic.events());
-            let failure = match advance.aborted {
-                Some(_) => None,
-                None => audio.step(global, true, &mut sounds).err(),
-            };
-            let failed = failure.is_some();
-            output_error = failure.or(output_error);
-            if advance.aborted.is_some() || failed {
-                audio.cancel(&mut sounds);
-            }
-            render.drain_effects(|_| {});
-            if let Some(cause) = advance.aborted {
-                break PlayEnd::Aborted(cause);
-            }
-            // Completion is final: an audio failure or a gauge failure in
-            // the same advance does not turn a completed play into an
-            // aborted one; the failure only ends the tail, which is then
-            // not played.
-            if advance.complete {
-                break PlayEnd::Completed;
-            }
-            if failed {
-                logic.abort(AbortCause::OutputFailed);
-                break PlayEnd::Aborted(AbortCause::OutputFailed);
-            }
-            let survival_failed = render
-                .view()
-                .gauges
-                .iter()
-                .zip(&preset.gauges)
-                .any(|(g, rule)| rule.kind == GaugeKind::Survival && g.failed_at.is_some());
-            if survival_failed && parts.policy.on_survival_failure() == FailureAction::EndPlay {
-                logic.abort(AbortCause::GaugeFailed);
-                audio.cancel(&mut sounds);
-                break PlayEnd::Aborted(AbortCause::GaugeFailed);
-            }
-        };
-
-        // Recording closes at the end of evaluation (D13): the input side
-        // appends nothing more, and the record is frozen here.
-        let arrivals: Vec<Arrival> = sources.arrivals().iter().map(arrival).collect();
-        let incomplete = Incomplete {
-            overflow: logic.overflowed() || sources.overflowed(),
-            source_limit: sources.source_limited(),
-            suspend: end == PlayEnd::Aborted(AbortCause::Suspend),
-        };
-        sources.close_recording();
-        let record = logic.record();
-        let view = render.view();
-        let tally = view.tally;
-        let displayed_gauge = parts.policy.displayed_gauge(&view.gauges);
-
-        // The audio tail of a completed play: input still reaches the
-        // devices' state, but nothing is recorded. A system control, focus
-        // loss, removal of the last participating device or an audio
-        // failure cuts it short; the record stays complete.
-        let mut tail_cut = None;
-        if end == PlayEnd::Completed && output_error.is_some() {
-            tail_cut = Some(AbortCause::OutputFailed);
+        let kinds = sources.participants().map(|(_, k)| k).collect();
+        self.origin = Some(origin);
+        Opening {
+            origin,
+            start,
+            readers: self.sources.take_readers(),
+            kinds,
         }
-        while end == PlayEnd::Completed && tail_cut.is_none() {
-            let silent = sounds.is_empty()
-                && audio.engine().mixer().pending() == 0
-                && audio.engine().mixer().sounding() == 0
-                && audio.engine().bgm_left() == 0;
-            if silent {
-                break;
-            }
-            clock.advance(config.step);
-            let global = clock.now();
-            let now = TimeUs(global.0 - origin.0);
-            script.input.poll(now, sources);
-            tail_cut = if let Some(c) = due(now) {
-                Some(c.cause())
-            } else if sources.gate().is_tripped() {
-                Some(AbortCause::FocusLoss)
-            } else if !participants
-                .iter()
-                .any(|&(d, c)| c.is_some() && sources.connection(d) == c)
-            {
-                Some(AbortCause::LastSourceRemoved)
-            } else if let Err(e) = audio.step(global, true, &mut sounds) {
-                output_error = Some(e);
-                Some(AbortCause::OutputFailed)
-            } else {
-                None
-            };
-            if tail_cut.is_some() {
-                audio.cancel(&mut sounds);
-            }
-        }
-
-        let status = match end {
-            PlayEnd::Completed => EndStatus::PlayedToEnd,
-            PlayEnd::Aborted(_) => EndStatus::EndedMidway,
-        };
-        let play_record = record.finalized.map(|finalized| PlayRecord {
-            versions: Versions {
-                evaluator: preset.implementation.version(),
-                app: config.app_version.clone(),
-                provenance: config.provenance,
-            },
-            chart: chart_record.clone(),
-            preset: PresetRecord::of(preset),
-            session_policy: parts.policy.id().to_owned(),
-            devices: DeviceRecord {
-                sources: kinds
-                    .iter()
-                    .zip(&device.sources)
-                    .map(|(&kind, profile)| SourceRecord {
-                        kind: replay_kind(kind),
-                        receive: config.receive,
-                        profile: profile.clone(),
-                    })
-                    .collect(),
-                audio_offset: TimeUs(settings.device.audio_offset_us),
-                display_offset: TimeUs(settings.device.display_offset_us),
-            },
-            play_type: PlayType::Full,
-            start: record.start,
-            events: record.events,
-            arrivals,
-            status: Status {
-                end: status,
-                finalized,
-                incomplete,
-            },
-        });
-        let saved = play_record.as_ref().map(|r| parts.records.save(r));
-        let result = play_record.as_ref().map(|r| {
-            parts.results.on_play_end(&ResultContext {
-                record: r,
-                chart,
-                preset,
-                live: &live,
-            })
-        });
-        let retried =
-            end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
-        if retried {
-            parts.events.on_event(&SessionEvent::Retry { attempt });
-        }
-        parts
-            .events
-            .on_event(&SessionEvent::End { attempt, status });
-        Ok(PlayReport {
-            attempt,
-            end,
-            tail_cut,
-            reload_error,
-            output_error,
-            live,
-            tally,
-            displayed_gauge,
-            record: play_record,
-            saved,
-            result,
-        })
     }
+
+    fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
+        self.audio.engine_mut().restart(origin);
+        self.sounds = Some(sounds);
+        self.screen = Some(screen);
+    }
+
+    fn focus_lost(&self) -> bool {
+        self.sources.gate().is_tripped()
+    }
+
+    fn connected(&self) -> bool {
+        self.participants
+            .iter()
+            .any(|&(d, c)| c.is_some() && self.sources.connection(d) == c)
+    }
+
+    fn audio_failure(&self) -> Option<OutputError> {
+        self.failure
+    }
+
+    fn screen_failed(&self) -> bool {
+        false
+    }
+
+    fn cancel_audio(&mut self) {
+        if let Some(sounds) = &mut self.sounds {
+            self.audio.cancel(sounds);
+        }
+    }
+
+    fn seal_audio(&mut self) {
+        self.sealed = true;
+    }
+
+    fn audio_done(&self) -> bool {
+        let engine = self.audio.engine();
+        self.sealed
+            && self.sounds.as_ref().is_none_or(AudioQueue::is_empty)
+            && engine.mixer().pending() == 0
+            && engine.mixer().sounding() == 0
+            && engine.bgm_left() == 0
+    }
+
+    fn close(&mut self) -> Closing {
+        let closing = Closing {
+            arrivals: self.sources.arrivals().to_vec(),
+            overflowed: self.sources.overflowed(),
+            source_limited: self.sources.source_limited(),
+        };
+        self.sources.close_recording();
+        closing
+    }
+
+    fn ended(&mut self, _report: &PlayReport) {}
+
+    fn show_end(&mut self, _report: &PlayReport) {}
 }
 
 const fn replay_kind(kind: DeviceKind) -> replay::DeviceKind {

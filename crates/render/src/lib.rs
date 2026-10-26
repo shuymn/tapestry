@@ -23,6 +23,6 @@ pub use gpu::{AdapterChoice, Gpu};
 pub use renderer::{
     FrameTiming, MAX_SPRITES, RenderError, Renderer, Target, build_frame, letterbox,
 };
-pub use simple::{SimpleSkin, layout};
+pub use simple::{SimpleSkin, layout, text_screen};
 pub use skin::{FrameInput, PlaySkin, SkinError};
 pub use sprite::{Blend, Sprite, SpriteBatch};

@@ -277,6 +277,55 @@ fn arrival_stays_out_of_stream_and_watermark() {
     assert_eq!(set.participants().count(), 2);
 }
 
+/// Each play's chart time 0 lies `origin` into the batch clock: every time
+/// the play sees is the batch time minus it, worked out by hand below.
+#[test]
+fn play_origin_moves_every_recorded_time_onto_the_play() {
+    let mut set = keyboards(2);
+    // Held before the opening: in the snapshot, which carries no time.
+    batch(&mut set, 3_100_000, &[key(1, C, 1)], 3_100_400);
+    let start = set.open_play(TimeUs(4_000_000), TimeUs(5_000_000));
+    assert_eq!(
+        start,
+        InputStart {
+            opened_at: TimeUs(-1_000_000),
+            held: vec![(SourceId(1), C, 1)],
+        }
+    );
+    let mut readers = set.take_readers();
+    batch(&mut set, 4_200_000, &[key(0, B, 1)], 4_200_300);
+    assert_eq!(drain(&mut readers[0]), [ev(-800_000, 0, B, 1)]);
+    // fresh − origin − 1.
+    assert_eq!(readers[0].published(), Published::open(TimeUs(-799_701)));
+    assert!(set.begin_batch(TimeUs(4_300_000)));
+    plug(&mut set, DeviceId(6), DeviceKind::Controller);
+    set.disconnect(DeviceId(1));
+    set.end_batch(TimeUs(4_300_900));
+    assert_eq!(
+        set.arrivals(),
+        [Arrival {
+            at: TimeUs(-700_000),
+            kind: DeviceKind::Controller,
+        }]
+    );
+    assert_eq!(
+        drain(&mut readers[1]),
+        [PhysicalInputEvent {
+            received: TimeUs(-700_000),
+            source: SourceId(1),
+            kind: InputKind::Disconnected,
+        }]
+    );
+    assert_eq!(readers[1].published(), Published::closed(TimeUs(-700_000)));
+    assert_eq!(readers[0].published(), Published::open(TimeUs(-699_101)));
+    // The next opening without an origin is on the batch clock again.
+    let start = set.open_recording(TimeUs(4_400_000));
+    let mut readers = set.take_readers();
+    batch(&mut set, 4_500_000, &[key(0, A, 1)], 4_500_200);
+    assert_eq!(start.opened_at, TimeUs(4_400_000));
+    assert_eq!(drain(&mut readers[0]), [ev(4_500_000, 0, A, 1)]);
+}
+
 #[test]
 fn full_arrivals_list_drops_and_counts() {
     let mut set = keyboards(1);
