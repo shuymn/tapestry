@@ -61,8 +61,8 @@ pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
     Command, Loaded, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart,
-    RECORDING_MEMORY, ReloadError, Reservation, SMALL_PARTS_BYTES, Session, SessionConfig,
-    SessionError, Settings, TABLE_BYTES_PER_OBJECT,
+    RECORDING_MEMORY, ReloadError, Reservation, SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS, Session,
+    SessionConfig, SessionError, Settings, TABLE_BYTES_PER_OBJECT,
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, OVERLAY_KEY,

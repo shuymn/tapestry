@@ -19,7 +19,8 @@ use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
 use bms_model::{Chart, TimeSource, TimeUs, VirtualClock};
-use eval::{Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
+use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
+use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
@@ -528,13 +529,26 @@ impl Loaded {
         axes: &[Vec<input::hid::AxisCap>],
     ) -> Result<PlayPlan, LogicError> {
         let device = self.settings.device.profile(kinds, axes);
-        // Per source: its recorded buttons and keys, and its axes.
-        let recorded: Vec<(usize, usize)> = kinds
+        // Per source: its recorded lane buttons and keys, its recorded
+        // axes it declares (no other axis is read), and its system
+        // controls.
+        let recorded: Vec<Recorded> = kinds
             .iter()
-            .zip(&device.sources)
-            .map(|(&k, s)| {
-                let all = self.settings.device.keys(k).roles().count();
-                (all - s.axes.len(), s.axes.len())
+            .enumerate()
+            .map(|(i, &k)| {
+                let keys = self.settings.device.keys(k);
+                let declared = axes.get(i).map_or(&[][..], Vec::as_slice);
+                let axis = |c: u32| k == DeviceKind::Controller && is_axis(ControlId(c));
+                Recorded {
+                    buttons: keys.lanes.iter().filter(|l| !axis(l.control)).count(),
+                    axes: keys
+                        .lanes
+                        .iter()
+                        .filter(|l| axis(l.control))
+                        .filter(|l| declared.iter().any(|c| c.control.0 == l.control))
+                        .count(),
+                    system: usize::from(keys.retry.is_some()) + usize::from(keys.quit.is_some()),
+                }
             })
             .collect();
         // One probe sizes both the window and the reservation; a profile
@@ -1060,16 +1074,35 @@ impl Reservation {
     }
 }
 
+/// The inputs each bound system control (retry, quit) of a source gets in
+/// the recording window, whatever its length: a press and a release. Its
+/// first press ends the play, so it is not played at a rate; a key held
+/// across a retry and auto-repeating, which the window takes no further
+/// press from, may overflow the window and mark the log incomplete (D8).
+pub const SYSTEM_CONTROL_INPUTS: usize = 2;
+
+/// What one source records, as the recording window counts it.
+#[derive(Clone, Copy, Debug)]
+struct Recorded {
+    /// Lane-bound buttons and keys.
+    buttons: usize,
+    /// Lane-bound axes the source declares.
+    axes: usize,
+    /// Bound system controls.
+    system: usize,
+}
+
 /// The recording window's input capacity (D8, [`eval::window_inputs`]):
-/// each source's recorded buttons pressed and released 30 times a second
-/// each, up to 240 edges a second together, and its recorded axes
-/// reporting 1000 times a second each, from the countdown to the chart's
-/// final deadline plus the largest input offset, in whole seconds.
+/// each source's lane-bound buttons pressed and released 30 times a second
+/// each, up to 240 edges a second together, and its lane-bound axes it
+/// declares reporting 1000 times a second each, from the countdown to the
+/// chart's final deadline plus the largest input offset, in whole
+/// seconds; plus [`SYSTEM_CONTROL_INPUTS`] per bound system control.
 fn window_inputs(
     device: &eval::DeviceProfile,
     end: TimeUs,
     lead_in: TimeUs,
-    sources: &[(usize, usize)],
+    sources: &[Recorded],
 ) -> usize {
     let offset = device
         .sources
@@ -1082,5 +1115,10 @@ fn window_inputs(
         .0
         .saturating_add(end.0.max(0))
         .saturating_add(offset);
-    eval::window_inputs(TimeUs(span), sources)
+    let rates: Vec<(usize, usize)> = sources.iter().map(|s| (s.buttons, s.axes)).collect();
+    let system = sources
+        .iter()
+        .map(|s| s.system.saturating_mul(SYSTEM_CONTROL_INPUTS))
+        .fold(0_usize, usize::saturating_add);
+    eval::window_inputs(TimeUs(span), &rates).saturating_add(system)
 }
