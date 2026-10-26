@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
+# Its own workspace and lockfile, built with the nightly of the Nix `fuzz`
+# shell (docs/setup.md "Fuzzing").
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
