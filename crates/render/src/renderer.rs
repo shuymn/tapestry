@@ -10,7 +10,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::simple::layout::{HEIGHT, WIDTH};
-use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch, library};
+use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
 
 /// Sprites one frame can draw, across both blends.
 pub const MAX_SPRITES: usize = 8_192;
@@ -81,6 +81,9 @@ pub enum RenderError {
     Surface(String),
     /// The skin cannot draw the chart.
     Skin(SkinError),
+    /// The window's surface was lost or failed validation; the renderer
+    /// must be built again.
+    SurfaceLost,
 }
 
 impl std::fmt::Display for RenderError {
@@ -90,6 +93,7 @@ impl std::fmt::Display for RenderError {
             Self::Device(e) => write!(f, "device: {e}"),
             Self::Surface(e) => write!(f, "surface: {e}"),
             Self::Skin(e) => write!(f, "skin: {e}"),
+            Self::SurfaceLost => f.write_str("surface lost"),
         }
     }
 }
@@ -104,7 +108,8 @@ pub struct FrameTiming {
     pub cpu: Duration,
     /// Sprites drawn.
     pub sprites: usize,
-    /// Sprites the full batch dropped.
+    /// Pushes the full batch refused: an overflow indicator, a lower bound
+    /// on what the frame left out (see [`SpriteBatch::dropped`]).
     pub dropped: u32,
     /// Whether the frame reached the target; `false` when the swap chain
     /// image could not be acquired.
@@ -152,6 +157,8 @@ pub struct Renderer {
     atlas_bind: wgpu::BindGroup,
     instances: wgpu::Buffer,
     batch: SpriteBatch,
+    /// The batch in drawing order, copied into `instances` each frame.
+    staging: Vec<Sprite>,
     skin: Box<dyn PlaySkin>,
 }
 
@@ -224,6 +231,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        finish_uploads(&gpu)?;
         Ok(Self {
             gpu,
             output,
@@ -233,6 +241,7 @@ impl Renderer {
             atlas_bind,
             instances,
             batch: SpriteBatch::with_capacity(MAX_SPRITES),
+            staging: Vec::with_capacity(MAX_SPRITES),
             skin: Box::new(SimpleSkin::new()),
         })
     }
@@ -252,7 +261,8 @@ impl Renderer {
     pub fn load(&mut self, chart: &Chart) -> Result<(), RenderError> {
         self.skin
             .prepare(&self.gpu, chart)
-            .map_err(RenderError::Skin)
+            .map_err(RenderError::Skin)?;
+        finish_uploads(&self.gpu)
     }
 
     /// Waits up to `timeout_ms` for the swap chain to take another frame
@@ -283,12 +293,22 @@ impl Renderer {
     }
 
     /// Builds, submits and presents one frame.
-    pub fn frame(&mut self, f: &FrameInput<'_>) -> FrameTiming {
+    ///
+    /// A frame whose swap chain image times out or is occluded is skipped
+    /// (`presented` is `false`); an outdated swap chain is configured again
+    /// and the frame skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::SurfaceLost`] when the surface is lost or
+    /// fails validation: the renderer must be built again.
+    pub fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
         let start = Instant::now();
         self.batch.clear();
         self.skin.build(f, &mut self.batch);
-        let alpha = self.batch.alpha().len();
-        let sprites = self.batch.len();
+        self.batch.stage(&mut self.staging);
+        let alpha = self.batch.alpha().len() as u32;
+        let sprites = self.staging.len();
         let timing = |cpu, presented| FrameTiming {
             cpu,
             sprites,
@@ -297,78 +317,72 @@ impl Renderer {
         };
         let acquire = Instant::now();
         let (frame, view) = match &mut self.output {
-            Output::Window(w) => match library(|| w.surface.get_current_texture()) {
+            Output::Window(w) => match w.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                    let view = library(|| {
-                        t.texture
-                            .create_view(&wgpu::TextureViewDescriptor::default())
-                    });
+                    let view = t
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
                     (Some(t), view)
                 }
-                _ => {
-                    // Outdated, lost, occluded or timed out: configure again
-                    // and skip this frame.
-                    library(|| w.configure(self.gpu.device()));
-                    return timing(start.elapsed().saturating_sub(acquire.elapsed()), false);
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    let cpu = start.elapsed().saturating_sub(acquire.elapsed());
+                    return Ok(timing(cpu, false));
+                }
+                wgpu::CurrentSurfaceTexture::Outdated => {
+                    w.configure(self.gpu.device());
+                    let cpu = start.elapsed().saturating_sub(acquire.elapsed());
+                    return Ok(timing(cpu, false));
+                }
+                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
+                    return Err(RenderError::SurfaceLost);
                 }
             },
-            Output::Offscreen { view, .. } => (None, library(|| view.clone())),
+            Output::Offscreen { view, .. } => (None, view.clone()),
         };
         let acquired = acquire.elapsed();
-        let view = &view;
         let queue = self.gpu.queue();
-        library(|| {
-            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(self.batch.alpha()));
-            queue.write_buffer(
-                &self.instances,
-                size_of_val(self.batch.alpha()) as u64,
-                bytemuck::cast_slice(self.batch.additive()),
-            );
-        });
+        queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.staging));
         let [x, y, w, h] = letterbox(self.size.0, self.size.1);
-        let cmd = library(|| {
-            let mut encoder = self
-                .gpu
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_viewport(x, y, w, h, 0.0, 1.0);
-                pass.set_bind_group(0, &self.atlas_bind, &[]);
-                pass.set_vertex_buffer(0, self.instances.slice(..));
-                pass.set_pipeline(&self.alpha);
-                pass.draw(0..4, 0..alpha as u32);
-                pass.set_pipeline(&self.additive);
-                pass.draw(0..4, alpha as u32..sprites as u32);
-            }
-            encoder.finish()
-        });
-        library(|| queue.submit([cmd]));
+        let mut encoder = self
+            .gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(x, y, w, h, 0.0, 1.0);
+            pass.set_bind_group(0, &self.atlas_bind, &[]);
+            pass.set_vertex_buffer(0, self.instances.slice(..));
+            pass.set_pipeline(&self.alpha);
+            pass.draw(0..4, 0..alpha);
+            pass.set_pipeline(&self.additive);
+            pass.draw(0..4, alpha..sprites as u32);
+        }
+        queue.submit([encoder.finish()]);
         let cpu = start.elapsed() - acquired;
         match frame {
-            Some(t) => library(|| queue.present(t)),
+            Some(t) => queue.present(t),
             None => {
                 // Offscreen: let the device reclaim finished frames.
-                let _ = library(|| self.gpu.device().poll(wgpu::PollType::Poll));
+                let _ = self.gpu.device().poll(wgpu::PollType::Poll);
             }
         }
-        timing(cpu, true)
+        Ok(timing(cpu, true))
     }
 
     /// The offscreen target's pixels, RGBA8, row by row from the top, after
@@ -418,6 +432,16 @@ impl Renderer {
         }
         out
     }
+}
+
+/// Submits every upload queued on `gpu` and waits until the GPU has done
+/// them, so none is left for the first frame of play (D9).
+fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
+    gpu.queue().submit([]);
+    gpu.device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map(|_| ())
+        .map_err(|e| RenderError::Device(e.to_string()))
 }
 
 /// The viewport `[x, y, width, height]` that fits the 1920×1080 layout

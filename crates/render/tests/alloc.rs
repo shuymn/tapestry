@@ -1,28 +1,28 @@
-//! After warmup, a frame allocates nothing in the app's own code (design.md
-//! "Scope of No Allocation"): the skin's build with effects, the batch, and
-//! the renderer's code around its wgpu calls. Allocations inside wgpu run in
-//! the library scope ([`render::in_library_call`]) and are counted apart.
+//! After warmup, a frame's app work allocates nothing (design.md "Scope of
+//! No Allocation"): the skin's build into the preallocated [`SpriteBatch`],
+//! with effects, and the staging of the batch into instances. This is the
+//! whole of what `Renderer::frame` does outside wgpu, whose own allocations
+//! are out of scope, so the test drives it without a GPU.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
-//! for the same reason. It also prints the render CPU indicator.
+//! for the same reason.
 
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use bms_model::{ChartBuilder, TimeUs};
-use common::{MS, input, lane, view, warp};
-use eval::{JudgeEvent, JudgeEventKind};
+use common::{MS, input, lane, view};
+use eval::{JudgeEvent, JudgeEventKind, LnOutcome};
+use render::{MAX_SPRITES, PlaySkin, SimpleSkin, Sprite, SpriteBatch};
 use rules::Judgment;
 
 struct Counting;
 
-static APP: AtomicU64 = AtomicU64::new(0);
-static LIBRARY: AtomicU64 = AtomicU64::new(0);
+static ALLOCS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
@@ -30,15 +30,11 @@ thread_local! {
 
 fn note() {
     if TRACK.try_with(Cell::get).unwrap_or(false) {
-        if render::in_library_call() {
-            LIBRARY.fetch_add(1, Ordering::Relaxed);
-        } else {
-            APP.fetch_add(1, Ordering::Relaxed);
-        }
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-// SAFETY: delegates to `System`; only adds counters, which never allocate.
+// SAFETY: delegates to `System`; only adds a counter, which never allocates.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         note();
@@ -70,11 +66,11 @@ static GLOBAL: Counting = Counting;
 #[test]
 fn frame_does_not_allocate_after_warmup() {
     const WARMUP: i64 = 10;
-    const FRAMES: i64 = 400;
+    const FRAMES: i64 = 450;
     const FRAME_US: i64 = 16_667;
-    // Taps 25 ms apart over every lane and a long note per key lane, with
-    // BPM changes and a STOP, so every frame draws notes, bodies and the
-    // effects of the judgments fed to it.
+    // Taps 25 ms apart over every lane, then a long note per key lane, with
+    // BPM changes and a STOP, so frames draw notes, long note bodies,
+    // text and the effects of the judgments fed to them.
     let mut b = ChartBuilder::new(150_000)
         .bpm(TimeUs(2_000 * MS), 180_000)
         .stop(TimeUs(3_000 * MS), TimeUs(250 * MS));
@@ -86,34 +82,36 @@ fn frame_does_not_allocate_after_warmup() {
         taps.push((l, t));
     }
     for l in 1..8 {
-        let start = 7_000 + i64::from(l) * 100;
+        let start = 6_500 + i64::from(l) * 50;
         b = b.long(lane(l), TimeUs(start * MS), TimeUs((start + 400) * MS));
     }
     let chart = b.build().unwrap();
-    let mut r = warp(&chart);
+    let mut skin = SimpleSkin::new();
+    skin.load(&chart);
+    let mut batch = SpriteBatch::with_capacity(MAX_SPRITES);
+    let mut staging: Vec<Sprite> = Vec::with_capacity(MAX_SPRITES);
     let v = view(42, 1_234);
     let mut effects: Vec<JudgeEvent> = Vec::with_capacity(64);
-    let mut next = 0;
-    let mut seq = 0;
-    let mut cpu: Vec<Duration> = Vec::with_capacity(FRAMES as usize);
-    let mut drawn = 0;
+    let (mut next, mut seq, mut drawn, mut held, mut ended) = (0, 0, 0, 0, 0);
 
     TRACK.with(|t| t.set(true));
-    // The count works: an allocation here is app code.
+    // The count works: an allocation here is counted.
     drop(std::hint::black_box(vec![1u8; 8]));
-    assert_eq!(APP.swap(0, Ordering::Relaxed), 1);
+    assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1);
     for frame in 0..WARMUP + FRAMES {
         if frame == WARMUP {
-            APP.store(0, Ordering::Relaxed);
-            LIBRARY.store(0, Ordering::Relaxed);
+            ALLOCS.store(0, Ordering::Relaxed);
         }
         let now = TimeUs(frame * FRAME_US);
         effects.clear();
-        // Judge every tap that has reached the line.
-        while next < taps.len() && taps[next].1 <= now && effects.len() < effects.capacity() {
+        // Judge every tap that has reached the line, and hold each long
+        // note from its head, finishing it at its end.
+        while next < taps.len() && taps[next].1 <= now && effects.len() < 32 {
             let (l, t) = taps[next];
-            let lane_notes = &chart.lanes[usize::from(l)];
-            let note = lane_notes.iter().position(|n| n.time == t).unwrap();
+            let note = chart.lanes[usize::from(l)]
+                .iter()
+                .position(|n| n.time == t)
+                .unwrap();
             effects.push(JudgeEvent {
                 seq,
                 time: t,
@@ -129,27 +127,51 @@ fn frame_does_not_allocate_after_warmup() {
             next += 1;
             seq += 1;
         }
-        let timing = r.frame(&input(&v, now, TimeUs(8 * MS), &effects));
-        assert!(timing.presented);
+        for l in 1..8u8 {
+            let notes = &chart.lanes[usize::from(l)];
+            let (index, ln) = (notes.len() - 1, notes[notes.len() - 1]);
+            let end = ln.end();
+            let kind = if ln.time.0 > now.0 - FRAME_US && ln.time <= now {
+                held += 1;
+                Some(JudgeEventKind::Judged {
+                    lane: lane(l),
+                    note: index,
+                    judgment: Judgment::Great,
+                    deviation: Some(TimeUs(0)),
+                    combo: 1,
+                })
+            } else if end.0 > now.0 - FRAME_US && end <= now {
+                ended += 1;
+                Some(JudgeEventKind::LnEnd {
+                    lane: lane(l),
+                    note: index,
+                    outcome: LnOutcome::Completed,
+                })
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                effects.push(JudgeEvent {
+                    seq,
+                    time: now,
+                    origin: None,
+                    kind,
+                });
+                seq += 1;
+            }
+        }
+        // What `Renderer::frame` does before calling into wgpu.
+        batch.clear();
+        skin.build(&input(&v, now, TimeUs(8 * MS), &effects), &mut batch);
+        batch.stage(&mut staging);
         if frame >= WARMUP {
-            cpu.push(timing.cpu);
-            drawn += timing.sprites;
+            drawn += staging.len();
         }
     }
     TRACK.with(|t| t.set(false));
-    let app = APP.load(Ordering::Relaxed);
-    let library = LIBRARY.load(Ordering::Relaxed);
+    let allocs = ALLOCS.load(Ordering::Relaxed);
     assert_eq!(next, taps.len(), "every tap judged");
     assert!(drawn > 0);
-    assert_eq!(cpu.len(), FRAMES as usize);
-    cpu.sort();
-    let pick = |q: usize| cpu[(cpu.len() - 1) * q / 100].as_secs_f64() * 1e6;
-    println!(
-        "render cpu per frame on WARP over {FRAMES} frames: p50 {:.0} us, p99 {:.0} us, max {:.0} us",
-        pick(50),
-        pick(99),
-        pick(100)
-    );
-    println!("allocations after warmup: app {app}, library {library}");
-    assert_eq!(app, 0);
+    assert_eq!((held, ended), (7, 7), "every long note held and finished");
+    assert_eq!(allocs, 0);
 }

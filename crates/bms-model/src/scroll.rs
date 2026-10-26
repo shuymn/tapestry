@@ -185,25 +185,6 @@ impl ScrollMap {
         }
     }
 
-    /// The BPM in effect at `t`, in millionths: the initial BPM before time
-    /// 0, and the new BPM from the time of a change on. During a STOP it is
-    /// the BPM the scroll resumes at after the STOP, so the scroll rate a
-    /// STOP interrupts stays defined through it.
-    #[must_use]
-    pub fn bpm_micro_at(&self, t: TimeUs) -> i64 {
-        if t.0 < 0 {
-            return self.before_zero.bpm_micro;
-        }
-        let from = self.segments.partition_point(|s| s.start <= t.0) - 1;
-        // The last segment is never a STOP: every STOP is followed by the
-        // segment that resumes it.
-        self.segments[from..]
-            .iter()
-            .map(|s| s.bpm_micro)
-            .find(|&b| b > 0)
-            .unwrap_or(self.before_zero.bpm_micro)
-    }
-
     /// The display position at `t`, rounded down. Saturates at the `i64`
     /// bounds far outside any chart.
     #[must_use]
@@ -312,38 +293,6 @@ mod tests {
         }
         assert_eq!(pos(&map, 1_500_001), at_start + 2);
         assert_eq!(pos(&map, 2_500_000), at_start + 2_000_000);
-    }
-
-    #[test]
-    fn bpm_at_changes_stops_and_before_zero() {
-        // 120 BPM, 150 BPM from 1 s, a STOP from 2 s for 0.5 s, then two
-        // back-to-back STOPs at 3 s and 3.1 s, and 90 BPM at their end.
-        let changes = [
-            bpm(1_000_000, 150_000_000),
-            stop(2_000_000, 500_000),
-            stop(3_000_000, 100_000),
-            stop(3_100_000, 200_000),
-            bpm(3_300_000, 90_000_000),
-        ];
-        let map = ScrollMap::new(BPM_120, &changes).unwrap();
-        let cases = [
-            (i64::MIN, BPM_120),
-            (-1, BPM_120),
-            (0, BPM_120),
-            (999_999, BPM_120),
-            (1_000_000, 150_000_000),
-            (2_000_000, 150_000_000),
-            (2_250_000, 150_000_000),
-            (2_500_000, 150_000_000),
-            (3_000_000, 90_000_000),
-            (3_150_000, 90_000_000),
-            (3_299_999, 90_000_000),
-            (3_300_000, 90_000_000),
-            (i64::MAX, 90_000_000),
-        ];
-        for (t, expected) in cases {
-            assert_eq!(map.bpm_micro_at(TimeUs(t)), expected, "t = {t}");
-        }
     }
 
     #[test]

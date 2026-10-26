@@ -93,7 +93,19 @@ impl SpriteBatch {
         self.capacity
     }
 
-    /// Pushes dropped since the last [`clear`](Self::clear).
+    /// Copies the batch into `out` in drawing order, every alpha sprite
+    /// before every additive one, after clearing it. This is the per-frame
+    /// instance staging for the GPU buffer; when `out` has room for
+    /// [`capacity`](Self::capacity) sprites it never allocates.
+    pub fn stage(&self, out: &mut Vec<Sprite>) {
+        out.clear();
+        out.extend_from_slice(&self.alpha);
+        out.extend_from_slice(&self.additive);
+    }
+
+    /// Pushes refused since the last [`clear`](Self::clear). An overflow
+    /// indicator: a skin may stop at its first refused push, so this is a
+    /// lower bound on what the frame left out, never a count of it.
     #[must_use]
     pub const fn dropped(&self) -> u32 {
         self.dropped
@@ -137,6 +149,9 @@ mod tests {
         assert_eq!(batch.dropped(), 2);
         assert_eq!(batch.alpha(), [sprite(1.0), sprite(7.0)]);
         assert_eq!(batch.additive(), [sprite(5.0)]);
+        let mut staged = Vec::with_capacity(3);
+        batch.stage(&mut staged);
+        assert_eq!(staged, [sprite(1.0), sprite(7.0), sprite(5.0)]);
         batch.clear();
         assert!(batch.is_empty());
         assert_eq!(batch.dropped(), 0);

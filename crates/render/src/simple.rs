@@ -2,10 +2,12 @@
 //! scaled by the renderer (D9; design.md "Rendering and Skins").
 //!
 //! Notes are placed from the expected display time through the chart's
-//! [`ScrollMap`] and the hi-speed visible time (the constant-visible-time
-//! method): the lane shows `visible_time` worth of scroll at the BPM in
-//! effect at the display time, so a STOP freezes the notes and a BPM change
-//! rescales the lane. Only notes inside the visible range are visited,
+//! [`ScrollMap`] and the hi-speed visible time (D9): the scale is fixed
+//! from the chart's initial BPM, so a note takes exactly `visible_time` from
+//! the lane top to the judgment line at the start BPM. During play notes
+//! move through scroll positions at that fixed scale, so BPM changes speed
+//! them up or slow them down and STOPs freeze them, as the chart intends,
+//! and nothing ever jumps. Only notes inside the visible range are visited,
 //! found per lane by binary search. A note judged by an effect is hidden
 //! through a per-note bit set sized in `prepare`.
 
@@ -70,12 +72,12 @@ pub mod layout {
         /// visible time below 1 µs counts as 1 µs.
         ///
         /// The lane from [`LANE_TOP`] to [`JUDGE_Y`] holds the scroll of
-        /// `visible_time` at the BPM in effect at `at`; during a STOP that
-        /// is the BPM the scroll resumes at.
+        /// `visible_time` at the chart's initial BPM. The pixels per
+        /// position never change during a play, whatever the BPM at `at`.
         #[must_use]
         pub fn new(scroll: &ScrollMap, at: TimeUs, visible_time: TimeUs) -> Self {
             let visible = visible_time.0.max(1) as f64;
-            let bpm_micro = scroll.bpm_micro_at(at) as f64;
+            let bpm_micro = scroll.initial_bpm_micro() as f64;
             // Position units per µs are bpm_micro / US_PER_MINUTE.
             let span = visible * bpm_micro / US_PER_MINUTE;
             Self {
@@ -479,8 +481,10 @@ impl PlaySkin for SimpleSkin {
         let y = JUDGE_Y - JUDGE_LINE_H / 2.0;
         rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
         self.notes(out, &scale, from, to);
-        self.hud(f, out, at);
-        self.effects(out, at);
+        // Feedback ages on the frame's own clock: the display offset moves
+        // notes only.
+        self.hud(f, out, f.now);
+        self.effects(out, f.now);
     }
 }
 
@@ -808,6 +812,58 @@ mod tests {
             .collect();
         // 40 % of the 544 px bar.
         assert_eq!(fill, [[160.0, 1000.0, 217.6, 24.0]]);
+    }
+
+    #[test]
+    fn display_offset_moves_notes_but_not_feedback() {
+        // A press judged GREAT at 1 s, drawn at 1 s with a 150 ms display
+        // offset: the 100 ms beam and the 200 ms bomb are fresh, though the
+        // display time is past both lifetimes' halves.
+        let chart = ChartBuilder::new(BPM)
+            .tap(lane(3), TimeUs(1_200 * MS))
+            .tap(lane(6), TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
+        let mut s = skin(&chart);
+        let v = view();
+        let press = JudgeEvent {
+            seq: 0,
+            time: TimeUs(1_000 * MS),
+            origin: Some(TimeUs(999 * MS)),
+            kind: JudgeEventKind::Judged {
+                lane: lane(6),
+                note: 0,
+                judgment: Judgment::Great,
+                deviation: Some(TimeUs(0)),
+                combo: 1,
+            },
+        };
+        let effects = [press];
+        let f = FrameInput {
+            display_offset: TimeUs(150 * MS),
+            ..frame(&v, 1_000 * MS, &effects)
+        };
+        let batch = build(&mut s, &f);
+        let (x, _) = layout::lane_x(lane(6));
+        let beam: Vec<f32> = batch
+            .additive()
+            .iter()
+            .filter(|s| s.rect[0] == x && s.color[..3] == BEAM[..3])
+            .map(|s| s.color[3])
+            .collect();
+        assert_eq!(beam, [BEAM[3]]);
+        let bombs: Vec<f32> = batch
+            .additive()
+            .iter()
+            .filter(|s| s.color[..3] == BOMB[..3])
+            .map(|s| s.rect[2])
+            .collect();
+        assert_eq!(bombs, [BOMB_SIDE]);
+        // The lane 3 note is 200 ms ahead of 1 s but 50 ms ahead of the
+        // display time: 66.67 px above the line.
+        let note = in_lane(&batch, lane(3), NOTE_WHITE);
+        assert_eq!(note.len(), 1);
+        assert!((note[0][1] + NOTE_H / 2.0 - (880.0 - 200.0 / 3.0)).abs() < 1e-3);
     }
 
     #[test]

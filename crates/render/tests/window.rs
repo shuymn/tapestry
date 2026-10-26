@@ -1,6 +1,8 @@
 //! The window target on WARP: the swap chain (FIFO, one frame of latency,
 //! the waitable object left to the caller) takes frames, and a window has
-//! nothing to read back.
+//! nothing to read back. Ignored by default: a swap chain needs an
+//! interactive desktop, which a service session (such as a CI runner) may
+//! not have. Run it with `--ignored` on the development PC.
 
 mod common;
 
@@ -76,6 +78,7 @@ impl HasDisplayHandle for Handle {
 }
 
 #[test]
+#[ignore = "requires an interactive desktop"]
 fn window_target_presents_and_reads_back_nothing() {
     let chart = ChartBuilder::new(120_000)
         .tap(lane(7), TimeUs(1_000 * MS))
@@ -99,7 +102,7 @@ fn window_target_presents_and_reads_back_nothing() {
     for frame in 0..10 {
         assert!(r.wait_for_frame(1_000), "frame {frame} waited too long");
         let now = TimeUs(500 * MS + frame * 16_667);
-        if r.frame(&input(&v, now, TimeUs(0), &[])).presented {
+        if r.frame(&input(&v, now, TimeUs(0), &[])).unwrap().presented {
             presented += 1;
         }
     }
