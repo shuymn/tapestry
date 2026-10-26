@@ -17,9 +17,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use audio::{AudioEngine, MAX_VOICES};
-use bms_model::{BgmEvent, Chart, ChartBuilder, SoundId, TimeUs};
+use bms_model::{BgmEvent, Chart, ChartBuilder, JudgeRank, SoundId, TimeUs};
 use common::{MS, lane};
-use eval::PhysicalInputEvent;
+use eval::{EvalError, PhysicalInputEvent};
 use game::{
     AutoplayError, ChartIngest, DataRoot, DeviceSettings, IngestError, Ingested, KeyConfig, Loaded,
     LogicError, Parts, RECORDING_MEMORY, Reservation, SessionConfig, Settings,
@@ -259,4 +259,23 @@ fn autoplay_buffers_are_charged_and_admitted_before_they_exist() {
     assert!(expected(&fits).0 <= RECORDING_MEMORY);
     let session = loaded(dir.path(), &fits);
     assert!(session.plan(&[DeviceKind::Keyboard], &[Vec::new()]).is_ok());
+    drop(session);
+
+    // The same over-budget chart with a rank the evaluator refuses
+    // (`#DEFEXRANK 0`): the refusal comes from the plan too, before the
+    // stream is made, never an admission that skipped the check.
+    let mut unranked = over;
+    unranked.meta.rank = Some(JudgeRank::DefExRankMilli(0));
+    let session = loaded(dir.path(), &unranked);
+    let refusal = LogicError::Eval(EvalError::InvalidRank);
+    let (plan_bytes, plan) = measured(|| session.plan(&[DeviceKind::Keyboard], &[Vec::new()]));
+    assert_eq!(plan.err(), Some(refusal.clone()));
+    let (refused_bytes, refused) = measured(|| session.autoplay());
+    assert_eq!(refused.err(), Some(AutoplayError::Plan(refusal)));
+    assert_eq!(refused_bytes, plan_bytes);
+    let stream = 2 * notes * size_of::<PhysicalInputEvent>();
+    assert!(
+        refused_bytes < stream,
+        "{refused_bytes} of a {stream}-byte stream"
+    );
 }

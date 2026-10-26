@@ -634,18 +634,19 @@ impl Loaded {
         let generated = self.generated();
         let inputs = input::autoplay_count(&self.chart, &generated);
         let schedule = crate::autoplay::schedule_len(&self.chart, &generated);
+        // A profile the evaluator refuses is reported here, before the
+        // session makes its stream: autoplay is never admitted unchecked.
         let probe = Evaluator::new(
             &self.chart,
             &self.preset,
             &device,
             &InputStart::default(),
             0,
-        );
-        if let Ok(probe) = &probe
-            && let r = Reservation::from_probe(probe, &self.chart, &device, self.config.effects)
-                .with_autoplay(inputs, schedule)
-            && !r.fits(inputs)
-        {
+        )
+        .map_err(LogicError::Eval)?;
+        let r = Reservation::from_probe(&probe, &self.chart, &device, self.config.effects)
+            .with_autoplay(inputs, schedule);
+        if !r.fits(inputs) {
             return Err(LogicError::RecordingTooLarge {
                 needed: inputs,
                 allowed: r.capacity(),
@@ -669,7 +670,8 @@ impl Loaded {
     ///
     /// # Errors
     ///
-    /// [`AutoplayError::Plan`] for a chart over the budget, and
+    /// [`AutoplayError::Plan`] for a chart the evaluator refuses or one over
+    /// the budget, and
     /// [`AutoplayError::Time`] for a note too late to press.
     pub fn autoplay(&self) -> Result<Autoplay, AutoplayError> {
         self.autoplay_plan(&[DeviceKind::Keyboard], &[Vec::new()])?;

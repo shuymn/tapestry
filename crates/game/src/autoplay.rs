@@ -26,8 +26,9 @@ pub struct Autoplay {
 /// Why autoplay cannot play a chart.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AutoplayError {
-    /// The play does not fit the recording reservation, autoplay's own
-    /// buffers included.
+    /// The plan is refused: the evaluator refuses the chart, or the play
+    /// does not fit the recording reservation, autoplay's own buffers
+    /// included.
     #[error("autoplay cannot play this chart")]
     Plan(#[source] LogicError),
     /// A note's time is out of the range autoplay can press it in.
