@@ -10,7 +10,6 @@
 //! and the end screen there as PNG files. `--dev-overlay` shows the
 //! measurement overlay from the start.
 
-use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,6 +25,7 @@ use game::Wakes;
 use input::{DeviceKind, QpcClock, ScriptedInput};
 use replay::DecodeLimits;
 
+use crate::args::{Command, UsageError};
 use crate::measure::Drawn;
 use crate::render_side::{FrameSink, Screen};
 
@@ -84,15 +84,37 @@ pub fn print_foreground(now: TimeUs) {
     );
 }
 
-/// Handles a development-only argument, or returns `None` for any other one.
-pub fn handle_arg(arg: &OsStr) -> Option<ExitCode> {
-    if arg == "--dev-tools-probe" {
-        // CI searches release binaries for this exact string to prove the
-        // feature is absent from production builds.
-        println!("tapestry dev-tools enabled");
-        return Some(ExitCode::SUCCESS);
+/// `--dev-tools-probe`: says the build has the development features.
+pub fn probe() -> ExitCode {
+    // CI searches release binaries for this exact string to prove the
+    // feature is absent from production builds.
+    println!("tapestry dev-tools enabled");
+    ExitCode::SUCCESS
+}
+
+/// The arguments of `measure play <chart>`, after `measure`.
+///
+/// # Errors
+///
+/// The usage error for anything but `play` and one chart.
+pub fn measure_args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
+    const MEASURE_USAGE: &str = "usage: tapestry measure play <chart.bms>";
+    match p.next()? {
+        Some(lexopt::Arg::Value(v)) if v == "play" => {}
+        Some(other) => return Err(other.unexpected().into()),
+        None => return Err(UsageError::Usage(MEASURE_USAGE.to_owned())),
     }
-    None
+    let chart = match p.next()? {
+        Some(lexopt::Arg::Value(v)) => PathBuf::from(v),
+        Some(other) => return Err(other.unexpected().into()),
+        None => {
+            return Err(UsageError::Usage(format!(
+                "measure play needs a chart file\n{MEASURE_USAGE}"
+            )));
+        }
+    };
+    crate::args::end(p)?;
+    Ok(Command::Measure { chart })
 }
 
 /// The development options of `play`.
@@ -125,78 +147,49 @@ impl Options {
     ///
     /// # Errors
     ///
-    /// A message for options that cannot go together: an input log with
+    /// A usage error for options that cannot go together: an input log with
     /// autoplay, or `--dev-headless` without autoplay.
-    pub fn play_input(&mut self, input: crate::PlayInput) -> Result<crate::PlayInput, String> {
-        let log = self.scripted_input.take();
+    pub fn play_input(&self, input: crate::PlayInput) -> Result<crate::PlayInput, UsageError> {
+        let log = self.scripted_input.clone();
         match input {
-            crate::PlayInput::Autoplay if log.is_some() => {
-                Err("--auto and --dev-scripted-input cannot be used together".to_owned())
-            }
+            crate::PlayInput::Autoplay if log.is_some() => Err(UsageError::Usage(
+                "--auto and --dev-scripted-input cannot be used together".to_owned(),
+            )),
             crate::PlayInput::Autoplay => Ok(input),
-            _ if self.headless => Err("--dev-headless needs --auto".to_owned()),
+            _ if self.headless => Err(UsageError::Usage("--dev-headless needs --auto".to_owned())),
             _ => Ok(log.map_or(input, crate::PlayInput::Script)),
         }
     }
 
-    /// Takes `arg` and its value if it is a development option of `play`.
+    /// Takes the long option `name` (without its dashes) and its value as a
+    /// development option of `play`.
     ///
     /// # Errors
     ///
-    /// A message for an option without its value.
-    pub fn take(
-        &mut self,
-        arg: &OsStr,
-        rest: &mut impl Iterator<Item = OsString>,
-    ) -> Result<bool, String> {
-        if arg == "--dev-auto-retry" {
-            self.auto_retry = true;
-            return Ok(true);
+    /// An option `play` does not take, or a missing or bad value.
+    pub fn take(&mut self, name: &str, p: &mut lexopt::Parser) -> Result<(), UsageError> {
+        match name {
+            "dev-auto-retry" => self.auto_retry = true,
+            "dev-overlay" => self.overlay = true,
+            "dev-headless" => self.headless = true,
+            "dev-adjust-at" => {
+                self.adjust_at_ms = p.value()?.to_string_lossy().parse().map_err(|_| {
+                    UsageError::Usage("--dev-adjust-at takes milliseconds".to_owned())
+                })?;
+            }
+            "dev-adjust" => {
+                self.adjust_in_play =
+                    adjust_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
+            }
+            "dev-adjust-end" => {
+                self.adjust_on_end =
+                    adjust_keys(&p.value()?.to_string_lossy()).map_err(UsageError::Usage)?;
+            }
+            "dev-scripted-input" => self.scripted_input = Some(PathBuf::from(p.value()?)),
+            "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
+            _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
-        if arg == "--dev-overlay" {
-            self.overlay = true;
-            return Ok(true);
-        }
-        if arg == "--dev-headless" {
-            self.headless = true;
-            return Ok(true);
-        }
-        if arg == "--dev-adjust-at" {
-            let value = rest
-                .next()
-                .ok_or_else(|| "--dev-adjust-at needs a value".to_owned())?;
-            self.adjust_at_ms = value
-                .to_string_lossy()
-                .parse()
-                .map_err(|_| "--dev-adjust-at takes milliseconds".to_owned())?;
-            return Ok(true);
-        }
-        let adjust = if arg == "--dev-adjust" {
-            Some(&mut self.adjust_in_play)
-        } else if arg == "--dev-adjust-end" {
-            Some(&mut self.adjust_on_end)
-        } else {
-            None
-        };
-        if let Some(list) = adjust {
-            let value = rest
-                .next()
-                .ok_or_else(|| format!("{} needs a value", arg.to_string_lossy()))?;
-            *list = adjust_keys(&value.to_string_lossy())?;
-            return Ok(true);
-        }
-        let slot = if arg == "--dev-scripted-input" {
-            &mut self.scripted_input
-        } else if arg == "--dev-frames" {
-            &mut self.frames
-        } else {
-            return Ok(false);
-        };
-        let value = rest
-            .next()
-            .ok_or_else(|| format!("{} needs a value", arg.to_string_lossy()))?;
-        *slot = Some(PathBuf::from(value));
-        Ok(true)
+        Ok(())
     }
 }
 

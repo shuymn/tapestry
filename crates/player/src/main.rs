@@ -17,6 +17,7 @@ compile_error!("player is Windows-only");
 
 #[cfg(feature = "dev-tools")]
 mod alloc_count;
+mod args;
 mod audio_side;
 mod controls;
 #[cfg(feature = "dev-tools")]
@@ -33,7 +34,6 @@ mod render_side;
 mod tuning;
 mod window;
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -52,6 +52,7 @@ use input::{
 use render::{AdapterChoice, Renderer, Target};
 use replay::{BuildProvenance, ReceiveMethod};
 
+use crate::args::Command;
 use crate::controls::Controls;
 use crate::end_screen::{Hints, LoadTimes};
 use crate::input_side::Mode;
@@ -59,9 +60,6 @@ use crate::measure::{AudioInfo, Measure, SOUND_QUEUE, STEP_QUEUE, StepSample};
 use crate::play::PlayerRig;
 use crate::render_side::{MakeScreen, NoFrames, Screen, View};
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
-
-const USAGE: &str =
-    "usage: tapestry play [--auto] <chart.bms> | tapestry keys | tapestry --version";
 
 /// The countdown before chart time 0 (D13).
 const LEAD_IN: TimeUs = TimeUs(1_000_000);
@@ -75,79 +73,37 @@ fn main() -> ExitCode {
     // The clock reads 0 at the start of the process: load times count from
     // here.
     let clock = QpcClock::start();
-    let mut args = std::env::args_os().skip(1);
-    let Some(arg) = args.next() else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
-    };
-
-    #[cfg(feature = "dev-tools")]
-    if let Some(code) = dev::handle_arg(&arg) {
-        return match args.next() {
-            Some(extra) => unknown_argument(&extra),
-            None => code,
-        };
-    }
-
-    if arg == "--version" {
-        if let Some(extra) = args.next() {
-            return unknown_argument(&extra);
-        }
-        println!("tapestry {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
-    }
-    if arg == "keys" {
-        return keys_command(args, clock);
-    }
-    #[cfg(feature = "dev-tools")]
-    if arg == "measure" {
-        return measure_command(args, clock);
-    }
-    if arg != "play" {
-        return unknown_argument(&arg);
-    }
-    let mut chart = None;
-    let mut auto = false;
-    #[cfg(feature = "dev-tools")]
-    let mut dev_options = dev::Options::default();
-    // Development options take their values from `args`.
-    #[cfg_attr(not(feature = "dev-tools"), allow(clippy::while_let_on_iterator))]
-    while let Some(a) = args.next() {
-        #[cfg(feature = "dev-tools")]
-        match dev_options.take(&a, &mut args) {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(2);
-            }
-        }
-        if a == "--auto" && !auto {
-            auto = true;
-            continue;
-        }
-        if chart.is_some() || a.to_string_lossy().starts_with("--") {
-            return unknown_argument(&a);
-        }
-        chart = Some(PathBuf::from(a));
-    }
-    let Some(chart) = chart else {
-        eprintln!("play needs a chart file\n{USAGE}");
-        return ExitCode::from(2);
-    };
-    let input = if auto {
-        PlayInput::Autoplay
-    } else {
-        PlayInput::Devices
-    };
-    #[cfg(feature = "dev-tools")]
-    let input = match dev_options.play_input(input) {
-        Ok(input) => input,
+    // A usage error is found before anything is opened, and exits 2.
+    let command = match args::parse(std::env::args_os().skip(1)) {
+        Ok(command) => command,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
+    match command {
+        Command::Version => {
+            println!("tapestry {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        #[cfg(feature = "dev-tools")]
+        Command::Keys(k) => report(keys::run(clock, k.script)),
+        #[cfg(not(feature = "dev-tools"))]
+        Command::Keys(args::Keys {}) => report(keys::run(clock)),
+        Command::Play(p) => play_command(p, clock),
+        #[cfg(feature = "dev-tools")]
+        Command::DevToolsProbe => dev::probe(),
+        #[cfg(feature = "dev-tools")]
+        Command::Measure { chart } => report(measure_play(&chart, clock)),
+    }
+}
+
+/// `tapestry play [--auto] <chart>`, with its development options.
+fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
+    let chart = p.chart;
+    let input = p.input;
+    #[cfg(feature = "dev-tools")]
+    let mut dev_options = p.dev;
     #[cfg(feature = "dev-tools")]
     if dev_options.headless || matches!(input, PlayInput::Script(_)) {
         let auto = u32::from(dev_options.auto_retry);
@@ -189,27 +145,6 @@ fn main() -> ExitCode {
 /// PresentMon capture, its counts added to each saved play's
 /// `.measure.toml`; the run quits after the end screen shows (retry and
 /// quit still work during the play).
-#[cfg(feature = "dev-tools")]
-fn measure_command(mut args: impl Iterator<Item = OsString>, clock: QpcClock) -> ExitCode {
-    const MEASURE_USAGE: &str = "usage: tapestry measure play <chart.bms>";
-    match args.next() {
-        Some(a) if a == "play" => {}
-        Some(a) => return unknown_argument(&a),
-        None => {
-            eprintln!("{MEASURE_USAGE}");
-            return ExitCode::from(2);
-        }
-    }
-    let Some(chart) = args.next() else {
-        eprintln!("measure play needs a chart file\n{MEASURE_USAGE}");
-        return ExitCode::from(2);
-    };
-    if let Some(extra) = args.next() {
-        return unknown_argument(&extra);
-    }
-    report(measure_play(Path::new(&chart), clock))
-}
-
 #[cfg(feature = "dev-tools")]
 fn measure_play(chart: &Path, clock: QpcClock) -> anyhow::Result<()> {
     let exe = presentmon::locate(std::env::var_os(presentmon::ENV), std::env::var_os("PATH"))?;
@@ -267,41 +202,6 @@ fn measure_play(chart: &Path, clock: QpcClock) -> anyhow::Result<()> {
         game::write_atomic(&path, toml.as_bytes()).with_context(|| path.display().to_string())?;
     }
     Ok(())
-}
-
-/// `tapestry keys`, with the dev-tools option `--dev-scripted-keys <steps>`.
-fn keys_command(args: impl Iterator<Item = OsString>, clock: QpcClock) -> ExitCode {
-    let mut args = args.peekable();
-    #[cfg(feature = "dev-tools")]
-    let mut script = None;
-    #[cfg(feature = "dev-tools")]
-    while args.peek().is_some_and(|a| a == "--dev-scripted-keys") {
-        args.next();
-        let parsed = args
-            .next()
-            .ok_or_else(|| "--dev-scripted-keys needs a value".to_owned())
-            .and_then(|v| dev::KeyScript::parse(&v.to_string_lossy()));
-        match parsed {
-            Ok(s) => script = Some(s),
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(2);
-            }
-        }
-    }
-    if let Some(a) = args.next() {
-        return unknown_argument(&a);
-    }
-    report(keys::run(
-        clock,
-        #[cfg(feature = "dev-tools")]
-        script,
-    ))
-}
-
-fn unknown_argument(arg: &OsString) -> ExitCode {
-    eprintln!("unknown argument: {}", arg.to_string_lossy());
-    ExitCode::from(2)
 }
 
 /// A run's outcome as its exit code: a failure prints [`diagnostic`] and

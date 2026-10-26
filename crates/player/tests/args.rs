@@ -15,7 +15,7 @@ fn version_exits_zero() {
 }
 
 #[track_caller]
-fn assert_unknown(args: &[&str], arg: &str) {
+fn assert_unknown(args: &[&str], arg: &str) -> Output {
     let out = run(args);
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -23,6 +23,7 @@ fn assert_unknown(args: &[&str], arg: &str) {
         stderr.contains(&format!("unknown argument: {arg}")),
         "{stderr}"
     );
+    out
 }
 
 #[test]
@@ -173,6 +174,71 @@ fn dev_tools_probe_runs_with_feature() {
         String::from_utf8_lossy(&out.stdout).trim_end(),
         "tapestry dev-tools enabled"
     );
+    // An extra argument is refused before the probe prints.
+    let out = assert_unknown(&["--dev-tools-probe", "x"], "x");
+    assert!(out.stdout.is_empty(), "{out:?}");
+}
+
+/// Usage errors are found before anything is opened: none of them writes
+/// under the data root. This guards writes under the redirected root, not
+/// every access to it; that parsing does no I/O at all is a rule of
+/// `args.rs` itself.
+#[test]
+fn usage_errors_touch_no_data_root() {
+    const CASES: &[&[&str]] = &[
+        &["--no-such-flag"],
+        &["play"],
+        &["play", "a.bms", "b.bms"],
+        &["keys", "a.bms"],
+    ];
+    #[cfg(feature = "dev-tools")]
+    const DEV_CASES: &[&[&str]] = &[
+        &["play", "a.bms", "--dev-frames"],
+        &["play", "a.bms", "--dev-adjust-at", "x"],
+        &["keys", "--dev-scripted-keys", "zz"],
+        &["measure", "play"],
+    ];
+    #[cfg(not(feature = "dev-tools"))]
+    const DEV_CASES: &[&[&str]] = &[];
+    let dir = tempfile::tempdir().unwrap();
+    for &args in CASES.iter().chain(DEV_CASES) {
+        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+            .args(args)
+            .env("LOCALAPPDATA", dir.path())
+            .output()
+            .expect("run tapestry");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(!dir.path().join("tapestry").exists(), "{args:?}");
+    }
+}
+
+/// A development option without its value, or with a bad one, is a usage
+/// error with its own line.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn dev_option_values_are_usage_errors() {
+    for (args, line) in [
+        (
+            &["play", "a.bms", "--dev-frames"][..],
+            "--dev-frames needs a value",
+        ),
+        (
+            &["play", "a.bms", "--dev-adjust-at", "x"],
+            "--dev-adjust-at takes milliseconds",
+        ),
+        (
+            &["play", "a.bms", "--dev-adjust", "F9"],
+            "F9 is not a settings key (F1 to F8)",
+        ),
+        (
+            &["keys", "--dev-scripted-keys", "zz"],
+            "zz is not a scan code, b<n> or close",
+        ),
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{line}\n"));
+    }
 }
 
 /// The positive control of the production check: a development build
