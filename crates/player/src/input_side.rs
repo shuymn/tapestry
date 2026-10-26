@@ -847,6 +847,23 @@ mod autoplay_tests {
         }
     }
 
+    /// A play that opens while the window has no focus is latched at once,
+    /// and the next one, opened focused, plays.
+    #[test]
+    fn autoplay_hook_latches_a_play_opened_without_focus() {
+        let mut sources = set();
+        let (controls, mut hook, link) = hooked(&sources);
+        controls.focus(false);
+        let _opening = open(&mut hook, &link, &mut sources, 0);
+        hook.wake(&mut sources, TimeUs(MS));
+        assert!(link.tripped());
+        close(&mut hook, &link, &mut sources, 2 * MS);
+        controls.focus(true);
+        let _opening = open(&mut hook, &link, &mut sources, 3 * MS);
+        hook.wake(&mut sources, TimeUs(4 * MS));
+        assert!(!link.tripped());
+    }
+
     /// P2: a keyboard and a controller the set knew before the opening
     /// take no part; only the generated keyboard plays, and a press on the
     /// other keyboard is not recorded.
