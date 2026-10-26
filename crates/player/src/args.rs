@@ -124,9 +124,7 @@ fn play(p: &mut Parser) -> Result<Play, UsageError> {
             Arg::Long(name) => {
                 // The name borrows the parser, which the value needs.
                 let name = name.to_owned();
-                if !options.take(&name, p)? {
-                    return Err(UsageError::Unknown(format!("--{name}")));
-                }
+                options.take(&name, p)?;
             }
             other => return Err(other.unexpected().into()),
         }

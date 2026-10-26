@@ -139,13 +139,13 @@ pub struct Options {
 }
 
 impl Options {
-    /// Takes the long option `name` (without its dashes) and its value if
-    /// it is a development option of `play`.
+    /// Takes the long option `name` (without its dashes) and its value as a
+    /// development option of `play`.
     ///
     /// # Errors
     ///
-    /// A missing or bad value.
-    pub fn take(&mut self, name: &str, p: &mut lexopt::Parser) -> Result<bool, UsageError> {
+    /// An option `play` does not take, or a missing or bad value.
+    pub fn take(&mut self, name: &str, p: &mut lexopt::Parser) -> Result<(), UsageError> {
         match name {
             "dev-auto-retry" => self.auto_retry = true,
             "dev-overlay" => self.overlay = true,
@@ -164,9 +164,9 @@ impl Options {
             }
             "dev-scripted-input" => self.scripted_input = Some(PathBuf::from(p.value()?)),
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
-            _ => return Ok(false),
+            _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
-        Ok(true)
+        Ok(())
     }
 }
 
