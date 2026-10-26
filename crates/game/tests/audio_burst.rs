@@ -8,14 +8,14 @@
 mod common;
 mod counting;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice};
 use bms_model::{ChartBuilder, TimeUs};
 use common::{MS, PERIOD, RATE, bank, lane};
-use game::{audio_control, audio_link_at};
+use game::{AudioWaitError, audio_control, audio_link_at};
 
 #[global_allocator]
 static GLOBAL: counting::Counting = counting::Counting;
@@ -23,7 +23,7 @@ static GLOBAL: counting::Counting = counting::Counting;
 const PLAYS: usize = 10;
 
 /// Sends `PLAYS` starts from a game thread while the audio thread is held
-/// for 100 ms, then lets it run. With `keep`, the test keeps each play's
+/// until the second start is pending, then lets it run. With `keep`, the test keeps each play's
 /// sink and returns how many saw their queue dropped; without, the sinks
 /// go at once, as a finished play's logic step drops them, so the queue's
 /// last owner frees it, and a free on the audio thread is counted.
@@ -41,7 +41,16 @@ fn burst(keep: bool) -> usize {
     );
     let held = AtomicBool::new(true);
     let stop = AtomicBool::new(false);
-    let sinks = thread::scope(|s| {
+    // Starts the game thread attempted, and starts that returned.
+    let attempted = AtomicUsize::new(0);
+    let returned = AtomicUsize::new(0);
+    let (sinks, pending) = thread::scope(|s| {
+        // However the scope's body ends, the audio thread is let go, so
+        // the scope never waits on it forever.
+        let _release = Release {
+            held: &held,
+            stop: &stop,
+        };
         let audio = s.spawn(|| {
             counting::track(true);
             while held.load(Ordering::Acquire) {
@@ -54,7 +63,7 @@ fn burst(keep: bool) -> usize {
             counting::track(false);
             worker
         });
-        let game = s.spawn(|| {
+        let game = s.spawn(|| -> Result<_, AudioWaitError> {
             let mut sinks = Vec::with_capacity(PLAYS);
             for play in 0..PLAYS {
                 let origin = TimeUs(i64::try_from(play).unwrap() * 10 * MS);
@@ -62,21 +71,50 @@ fn burst(keep: bool) -> usize {
                 if keep {
                     sinks.push(sink);
                 }
-                control.play(origin, queue).unwrap();
+                attempted.fetch_add(1, Ordering::AcqRel);
+                control.play(origin, queue)?;
+                returned.fetch_add(1, Ordering::AcqRel);
             }
-            control.ready().unwrap();
-            (sinks, control)
+            control.ready()?;
+            Ok((sinks, control))
         });
-        // Every start but the first waits for the held audio thread.
-        thread::sleep(Duration::from_millis(100));
+        // The game thread has attempted its second start; while the audio
+        // thread is held, that start cannot have returned. A start that
+        // does not wait returns within this bound.
+        while attempted.load(Ordering::Acquire) < 2 {
+            thread::yield_now();
+        }
+        let bound = Instant::now() + Duration::from_millis(50);
+        while returned.load(Ordering::Acquire) < 2 && Instant::now() < bound {
+            thread::yield_now();
+        }
+        let pending = returned.load(Ordering::Acquire) == 1;
         held.store(false, Ordering::Release);
-        let (sinks, control) = game.join().unwrap();
+        let game = game.join();
         stop.store(true, Ordering::Release);
         drop(audio.join().unwrap());
+        let (sinks, control) = game.unwrap().unwrap();
         drop(control);
-        sinks
+        (sinks, pending)
     });
+    assert!(
+        pending,
+        "the second start did not wait for the first switch"
+    );
     sinks.iter().filter(|s| s.is_abandoned()).count()
+}
+
+/// Lets the audio thread go when dropped.
+struct Release<'a> {
+    held: &'a AtomicBool,
+    stop: &'a AtomicBool,
+}
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.held.store(false, Ordering::Release);
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 #[test]
