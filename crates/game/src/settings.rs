@@ -214,7 +214,8 @@ impl KeyConfig {
     }
 
     /// Checks the key config of a kind of device: every lane exists, no
-    /// control has two roles, a keyboard binds no reserved key, and only a
+    /// control has two roles (keyboard keys by
+    /// [`key_identity`](input::raw::key_identity)), a keyboard binds no reserved key, and only a
     /// keyboard binds retry and quit.
     ///
     /// # Errors
@@ -223,6 +224,12 @@ impl KeyConfig {
     pub fn check(&self, kind: DeviceKind) -> Result<(), KeyError> {
         let mut seen: Vec<(u32, Role)> = Vec::new();
         for (control, role) in self.roles() {
+            // Keyboard keys are compared as the window tells them apart,
+            // so two names of one key are one key.
+            let key = match kind {
+                DeviceKind::Keyboard => input::raw::key_identity(ControlId(control)).0,
+                DeviceKind::Controller => control,
+            };
             if kind != DeviceKind::Keyboard && matches!(role, Role::Retry | Role::Quit) {
                 return Err(KeyError::NotAKeyboardKey(role));
             }
@@ -232,21 +239,21 @@ impl KeyConfig {
                 return Err(KeyError::NoSuchLane(l));
             }
             if kind == DeviceKind::Keyboard
-                && let Some(reserved_for) = reserved_key(control)
+                && let Some(reserved_for) = reserved_key(key)
             {
                 return Err(KeyError::Reserved {
                     control,
                     reserved_for,
                 });
             }
-            if let Some(&(_, first)) = seen.iter().find(|(c, _)| *c == control) {
+            if let Some(&(_, first)) = seen.iter().find(|(k, _)| *k == key) {
                 return Err(KeyError::Overlap {
                     control,
                     first,
                     second: role,
                 });
             }
-            seen.push((control, role));
+            seen.push((key, role));
         }
         Ok(())
     }
@@ -254,12 +261,7 @@ impl KeyConfig {
     /// Every recorded control: the lanes and the system controls.
     #[must_use]
     pub fn recorded(&self) -> Vec<ControlId> {
-        self.lanes
-            .iter()
-            .map(|k| ControlId(k.control))
-            .chain(self.retry.map(ControlId))
-            .chain(self.quit.map(ControlId))
-            .collect()
+        self.roles().map(|(c, _)| ControlId(c)).collect()
     }
 
     /// The lane bindings the evaluator reads; an entry with a lane the

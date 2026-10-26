@@ -328,4 +328,28 @@ mod tests {
         );
         assert_eq!(c.tuning().get().visible_time_ms, 575);
     }
+
+    /// Two Raw Input controls are one key in the window exactly when they
+    /// have one identity, the identity key configs are checked on; five
+    /// keys have two names.
+    #[test]
+    fn the_window_tells_keys_apart_as_key_configs_do() {
+        use eval::ControlId;
+        use input::raw::key_identity;
+        let raw: Vec<u32> = (0x01..=0xFE)
+            .chain(0xE001..=0xE0FE)
+            .chain([PAUSE])
+            .collect();
+        let keys: Vec<PhysicalKey> = raw.iter().map(|&c| window_key(c)).collect();
+        let ids: Vec<ControlId> = raw.iter().map(|&c| key_identity(ControlId(c))).collect();
+        let mut pairs = 0;
+        for i in 0..raw.len() {
+            for j in i + 1..raw.len() {
+                let one_key = keys[i] == keys[j];
+                assert_eq!(ids[i] == ids[j], one_key, "{:#x} {:#x}", raw[i], raw[j]);
+                pairs += usize::from(one_key);
+            }
+        }
+        assert_eq!(pairs, 5);
+    }
 }

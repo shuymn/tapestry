@@ -399,9 +399,19 @@ fn load_written(
 
 #[track_caller]
 fn assert_invalid(device: &DeviceSettings, player: &PlayerSettings, says: &str) {
+    assert_invalid_all(device, player, &[says]);
+}
+
+/// Loads once; the refusal holds every piece of `says`.
+#[track_caller]
+fn assert_invalid_all(device: &DeviceSettings, player: &PlayerSettings, says: &[&str]) {
     match load_written(device, player) {
-        Err(SettingsError::Invalid(e)) => assert!(e.contains(says), "{e} lacks {says}"),
-        other => panic!("{other:?} for {says}"),
+        Err(SettingsError::Invalid(e)) => {
+            for s in says {
+                assert!(e.contains(s), "{e} lacks {s}");
+            }
+        }
+        other => panic!("{other:?} for {says:?}"),
     }
 }
 
@@ -473,8 +483,11 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
     ];
     for (d, e) in &cases {
         assert_eq!(d.keyboard.check(DeviceKind::Keyboard), Err(*e));
-        assert_invalid(d, &player, "device.toml: keyboard key config");
-        assert_invalid(d, &player, "is bound to both");
+        assert_invalid_all(
+            d,
+            &player,
+            &["device.toml: keyboard key config", "is bound to both"],
+        );
     }
 
     // The settings keys F1 (first) and F8 (last) and the keep key F12, as
@@ -745,4 +758,79 @@ fn an_untouched_volume_keeps_its_exact_value() {
     let mut moved = s.clone();
     t.adjust(Adjust::VolumeUp).apply_to(&mut moved);
     assert_eq!(moved.device.master_volume, 0.8);
+}
+
+/// Two names of one key (Raw Input names Print Screen 0x54 with Alt and
+/// 0xE037 without, Pause 0xE11D and 0xE046 with Ctrl, Lang1 0x72 and
+/// 0xE0F2) are one key: bound to two roles, lane and system, system and
+/// system, or two lanes, they are refused.
+#[test]
+fn two_names_of_one_key_cannot_have_two_roles() {
+    let player = PlayerSettings::default();
+    let cases = [
+        (
+            with(|d| {
+                set_lane(d, 4, 0x54);
+                d.keyboard.quit = Some(0xE037);
+            }),
+            0xE037,
+            Role::Lane(4),
+            Role::Quit,
+        ),
+        (
+            with(|d| {
+                d.keyboard.retry = Some(0xE046);
+                d.keyboard.quit = Some(0xE11D);
+            }),
+            0xE11D,
+            Role::Retry,
+            Role::Quit,
+        ),
+        (
+            with(|d| {
+                set_lane(d, 2, 0xE0F2);
+                set_lane(d, 6, 0x72);
+            }),
+            0x72,
+            Role::Lane(2),
+            Role::Lane(6),
+        ),
+    ];
+    for (d, control, first, second) in &cases {
+        assert_eq!(
+            d.keyboard.check(DeviceKind::Keyboard),
+            Err(KeyError::Overlap {
+                control: *control,
+                first: *first,
+                second: *second,
+            })
+        );
+        assert_invalid(d, &player, "is bound to both");
+    }
+    // Each name alone is a key like any other; controllers have no names.
+    assert!(load_written(&with(|d| d.keyboard.quit = Some(0x54)), &player).is_ok());
+    let mut pad = with(|_| {});
+    pad.controller.lanes = vec![
+        LaneKey {
+            control: 0x54,
+            lane: 1,
+        },
+        LaneKey {
+            control: 0xE037,
+            lane: 2,
+        },
+    ];
+    assert!(load_written(&pad, &player).is_ok());
+    // The settings keys and the keep key have one name each.
+    for code in game::Adjust::ALL
+        .iter()
+        .map(|a| a.key())
+        .chain([game::KEEP_KEY])
+    {
+        for other in (0..=0xFF).chain(0xE000..=0xE1FF) {
+            let same = input::raw::key_identity(eval::ControlId(other))
+                == input::raw::key_identity(eval::ControlId(code));
+            assert_eq!(same, other == code, "{other:#x} and {code:#x}");
+        }
+    }
 }
