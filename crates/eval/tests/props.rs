@@ -395,7 +395,9 @@ fn count_play(play: &Play, c: &mut Coverage) {
     }
 }
 
-fn count_live(play: &Play, d: &Delivery, run: &Live, c: &mut Coverage) {
+/// Counts the live spots of one delivery and returns whether it reached the
+/// joint watermark spot, which counts once per play.
+fn count_live(play: &Play, d: &Delivery, run: &Live, c: &mut Coverage) -> bool {
     let s = run.stats;
     c.hit("input_at_w", s.inputs_at_w > 0);
     c.hit("queue_full", s.queue_full > 0);
@@ -412,14 +414,13 @@ fn count_live(play: &Play, d: &Delivery, run: &Live, c: &mut Coverage) {
     // An effective input whose evaluation time is a deadline and the W of
     // a step that is not the last.
     let mut from = 0;
-    let joint = run.watermarks.iter().zip(&run.step_ends).any(|(&w, &to)| {
+    run.watermarks.iter().zip(&run.step_ends).any(|(&w, &to)| {
         let events = &run.events[from..to];
         from = to;
         w < d.terminal
             && play.deadlines.binary_search(&w).is_ok()
             && events.iter().any(|e| e.origin.is_some() && e.time == w)
-    });
-    c.hit("joint_input_on_deadline_at_w", joint);
+    })
 }
 
 /// The fragile spots each property depends on, reached by the generators
@@ -427,9 +428,9 @@ fn count_live(play: &Play, d: &Delivery, run: &Live, c: &mut Coverage) {
 #[test]
 fn generators_reach_the_fragile_spots() {
     const SAMPLES: usize = 512;
-    // Random generation alone reaches each joint spot about ten times or
-    // fewer in these samples; its generator branch lifts it well past this
-    // bound, so losing the branch fails here.
+    // Joint spots count once per play. Random generation alone reaches each
+    // in about ten plays or fewer of these samples; its generator branch
+    // lifts it well past this bound, so losing the branch fails here.
     const JOINT: usize = 32;
     let mut runner = TestRunner::deterministic();
     let mut c = Coverage::default();
@@ -437,10 +438,12 @@ fn generators_reach_the_fragile_spots() {
     for _ in 0..SAMPLES {
         let (play, deliveries) = plays.new_tree(&mut runner).unwrap().current();
         count_play(&play, &mut c);
+        let mut joint = false;
         for d in &deliveries {
             let run = live(&play.chart, &play.preset, &play.input, d).unwrap();
-            count_live(&play, d, &run, &mut c);
+            joint |= count_live(&play, d, &run, &mut c);
         }
+        c.hit("joint_input_on_deadline_at_w", joint);
     }
     let widenings = raw_widening();
     for _ in 0..SAMPLES {
