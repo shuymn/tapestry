@@ -43,12 +43,14 @@ fn source(kind: DeviceKind, offset: i64, bindings: &[(u32, u8)]) -> SourceRecord
                 .collect(),
             axes: Vec::new(),
         },
+        axis_out_of_range: 0,
     }
 }
 
 /// `s` with an axis per `(control, lane, mode)`; the other settings are
 /// distinct per axis and from every other field.
 fn with_axes(mut s: SourceRecord, axes: &[(u32, u8, AxisMode)]) -> SourceRecord {
+    s.axis_out_of_range = 3;
     s.profile.axes = axes
         .iter()
         .zip(0..)
@@ -484,12 +486,14 @@ fn golden() -> PlayRecord {
     ];
     rec.events.insert(4, control(1, 1_200_000, 0x1_0030, 131));
     rec.events.insert(5, control(1, 1_250_000, 0x1_0035, -4));
+    // The absolute axis reported 4 values outside its declared range.
+    rec.devices.sources[1].axis_out_of_range = 4;
     rec
 }
 
 /// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
 /// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "88a38219c9fc30e02d006da695cd54113410336a241f0181673d5e740ad77edf";
+const GOLDEN_BODY_SHA256: &str = "568d442b72493dd2c9cdc08175933af28523498ff83e6dbc66446434de284677";
 
 #[test]
 fn golden_body() {
@@ -520,6 +524,8 @@ fn malformed_axes_are_refused() {
             w.uint(256);
         }
         w.raw(&[2, 1, 7]);
+        // No value outside the range.
+        w.uint(0);
         // Audio and display offsets.
         w.raw(&[0, 0]);
         w.0

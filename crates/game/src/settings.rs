@@ -357,7 +357,7 @@ impl ScratchConfig {
     /// The settings the evaluator reads for an axis the device declares
     /// as `cap` (`None`: not declared, as for a device not connected): a
     /// value set here, else the declaration, else the default
-    /// ([`ScratchSettings::DEFAULT`]: absolute, 256 values).
+    /// ([`ScratchSettings::DEFAULT`]: absolute, without wraparound).
     #[must_use]
     pub fn settings(&self, cap: Option<&AxisCap>) -> ScratchSettings {
         let default_wrap = match ScratchSettings::DEFAULT.mode {

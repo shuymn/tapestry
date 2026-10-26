@@ -185,6 +185,8 @@ fn key_config_gives_profiles_and_recorded_controls() {
         control: ControlId(0x1_0030),
         relative: false,
         wrap: 255,
+        min: 0,
+        max: 254,
     }];
     let profile = s.profile(&[DeviceKind::Controller, DeviceKind::Keyboard], &[declared]);
     let lane = |n| Lane::new(n).unwrap();
@@ -251,10 +253,12 @@ fn key_config_gives_profiles_and_recorded_controls() {
 
 #[test]
 fn scratch_settings_resolve_from_the_device_unless_set() {
-    let cap = |relative, wrap| AxisCap {
+    let cap = |relative, wrap: u32| AxisCap {
         control: ControlId(0x1_0030),
         relative,
         wrap,
+        min: 0,
+        max: i32::try_from(wrap).unwrap() - 1,
     };
     let auto = ScratchConfig::default();
     let mode = |c: &ScratchConfig, declared: Option<AxisCap>| c.settings(declared.as_ref()).mode;

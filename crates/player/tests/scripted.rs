@@ -69,6 +69,7 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
                 kind: replay::DeviceKind::Keyboard,
                 receive: ReceiveMethod::Scripted,
                 profile: profile.sources[0].clone(),
+                axis_out_of_range: 0,
             }],
             audio_offset: TimeUs(0),
             display_offset: TimeUs(0),

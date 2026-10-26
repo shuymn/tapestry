@@ -30,7 +30,8 @@
 //! offset, its bindings (a count, then each control and lane), and its
 //! axis bindings (a count, then each axis's control, lane, mode (0
 //! absolute, followed by its wrap; 1 relative), press threshold, hold
-//! threshold and release time in µs, all unsigned).
+//! threshold and release time in µs, all unsigned), and the number of
+//! axis values it reported outside their declared range.
 //!
 //! Bindings and axes are bounded per source and in all by the evaluator's
 //! limits ([`eval::MAX_BINDINGS_PER_SOURCE`], [`eval::MAX_AXES_PER_SOURCE`],
@@ -280,6 +281,7 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
                     bindings,
                     axes,
                 },
+            axis_out_of_range,
         } = s;
         w.uint(kind_tag(*kind));
         w.uint(match receive {
@@ -293,6 +295,7 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
             w.len(lane.index());
         }
         write_axes(w, axes);
+        w.uint(*axis_out_of_range);
     }
     w.int(audio_offset.0);
     w.int(display_offset.0);
@@ -615,6 +618,7 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
             bindings.push(Binding { control, lane });
         }
         let axes = read_axes(r, &mut all_axes)?;
+        let axis_out_of_range = r.uint()?;
         sources.push(SourceRecord {
             kind,
             receive,
@@ -623,6 +627,7 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
                 bindings,
                 axes,
             },
+            axis_out_of_range,
         });
     }
     let audio_offset = TimeUs(r.int()?);

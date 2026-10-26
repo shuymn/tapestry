@@ -339,6 +339,9 @@ pub struct PlayOutcome {
     pub kinds: Vec<DeviceKind>,
     /// Devices that arrived while recording was open.
     pub arrivals: Vec<InputArrival>,
+    /// How many axis values each source reported outside their declared
+    /// range, by source id; recorded with the source.
+    pub axis_out_of_range: Vec<u64>,
     /// Why the record may be incomplete. Suspend is set by
     /// [`Loaded::finish_play`] from `end`.
     pub incomplete: Incomplete,
@@ -582,6 +585,7 @@ impl Loaded {
             record,
             kinds,
             arrivals,
+            axis_out_of_range,
             mut incomplete,
         } = outcome;
         incomplete.suspend |= end == PlayEnd::Aborted(AbortCause::Suspend);
@@ -607,10 +611,12 @@ impl Loaded {
                 sources: kinds
                     .iter()
                     .zip(&record.device.sources)
-                    .map(|(&kind, profile)| SourceRecord {
+                    .enumerate()
+                    .map(|(i, (&kind, profile))| SourceRecord {
                         kind: replay_kind(kind),
                         receive: config.receive,
                         profile: profile.clone(),
+                        axis_out_of_range: axis_out_of_range.get(i).copied().unwrap_or(0),
                     })
                     .collect(),
                 audio_offset: TimeUs(settings.device.audio_offset_us),
@@ -917,6 +923,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             arrivals: self.sources.arrivals().to_vec(),
             overflowed: self.sources.overflowed(),
             source_limited: self.sources.source_limited(),
+            axis_out_of_range: self.sources.axis_out_of_range().collect(),
         };
         self.sources.close_recording();
         closing
