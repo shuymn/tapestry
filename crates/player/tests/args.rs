@@ -8,11 +8,24 @@ fn run(args: &[&str]) -> Output {
         .expect("run tapestry")
 }
 
+/// `run` with the data root under `appdata`.
+fn run_in(args: &[&str], appdata: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .args(args)
+        .env("LOCALAPPDATA", appdata)
+        .output()
+        .expect("run tapestry")
+}
+
+/// `--version` exits 0 and writes nothing under the data root, the log
+/// included.
 #[test]
 fn version_exits_zero() {
-    let out = run(&["--version"]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_in(&["--version"], dir.path());
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("tapestry "));
+    assert!(!dir.path().join("tapestry").exists());
 }
 
 #[track_caller]
@@ -57,11 +70,7 @@ fn play_without_chart_is_an_error() {
 fn missing_chart_exits_one() {
     let dir = tempfile::tempdir().unwrap();
     let chart = dir.path().join("missing.bms");
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .args(["play".as_ref(), chart.as_os_str()])
-        .env("LOCALAPPDATA", dir.path())
-        .output()
-        .expect("run tapestry");
+    let out = play_in(&chart, dir.path());
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("missing.bms"), "{stderr}");
@@ -102,26 +111,17 @@ fn log_lines(appdata: &Path) -> Vec<String> {
 }
 
 /// A chart the loader refuses exits 1 with one line: the chart, then each
-/// cause once.
+/// cause once. The log holds the run's first line, the same line, and the
+/// exit code; it is also the positive control of the cases that write no
+/// log.
 #[test]
-fn a_refused_chart_prints_each_cause_once() {
+fn the_log_records_the_failure() {
     let dir = tempfile::tempdir().unwrap();
     let (chart, line) = refused_chart(dir.path());
     let out = play_in(&chart, dir.path());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
-}
-
-/// The log of a failed run: the run's first line, the same diagnostic line
-/// stderr prints, and the exit code. It is also the positive control of
-/// the cases that write no log.
-#[test]
-fn the_log_records_the_failure() {
-    let dir = tempfile::tempdir().unwrap();
-    let (chart, line) = refused_chart(dir.path());
-    let out = play_in(&chart, dir.path());
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
     let logged = log_lines(dir.path());
     assert!(logged[0].starts_with("tapestry "), "{logged:?}");
     assert!(logged[0].contains(", command play, unix "), "{logged:?}");
@@ -157,26 +157,6 @@ fn an_unwritable_log_changes_nothing() {
     assert_eq!(out.stdout, baseline.stdout);
 }
 
-/// `--version`, and the probe in development builds, exit 0 and write no
-/// log, nor anything else under the data root.
-#[test]
-fn version_and_probe_write_no_log() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut cases = vec![&["--version"][..]];
-    if cfg!(feature = "dev-tools") {
-        cases.push(&["--dev-tools-probe"]);
-    }
-    for args in cases {
-        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-            .args(args)
-            .env("LOCALAPPDATA", dir.path())
-            .output()
-            .expect("run tapestry");
-        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
-        assert!(!dir.path().join("tapestry").exists(), "{args:?}");
-    }
-}
-
 #[cfg(not(feature = "dev-tools"))]
 #[test]
 fn dev_scripted_input_is_unknown_without_feature() {
@@ -210,15 +190,19 @@ fn dev_tools_probe_is_unknown_without_feature() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown argument: --dev-tools-probe"));
 }
 
+/// The probe exits 0 and, like `--version`, writes nothing under the data
+/// root, the log included.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn dev_tools_probe_runs_with_feature() {
-    let out = run(&["--dev-tools-probe"]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_in(&["--dev-tools-probe"], dir.path());
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim_end(),
         "tapestry dev-tools enabled"
     );
+    assert!(!dir.path().join("tapestry").exists());
     // An extra argument is refused before the probe prints.
     let out = assert_unknown(&["--dev-tools-probe", "x"], "x");
     assert!(out.stdout.is_empty(), "{out:?}");
