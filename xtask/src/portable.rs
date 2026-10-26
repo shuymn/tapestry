@@ -7,6 +7,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+use anyhow::bail;
 use cargo_metadata::MetadataCommand;
 
 use crate::arch::is_windows_only;
@@ -32,7 +33,7 @@ pub fn run(manifest: &Path, args: &[OsString]) -> ExitCode {
     let excludes = match windows_only_packages(manifest) {
         Ok(excludes) => excludes,
         Err(e) => {
-            eprintln!("xtask portable: {e}");
+            eprintln!("xtask portable: {e:#}");
             return ExitCode::from(2);
         }
     };
@@ -58,13 +59,8 @@ pub fn run(manifest: &Path, args: &[OsString]) -> ExitCode {
 
 /// Names of the Windows-only workspace packages. Fails if a package in
 /// [`REQUIRED_PORTABLE`] is missing from the portable set.
-fn windows_only_packages(manifest: &Path) -> Result<Vec<String>, String> {
-    let metadata = MetadataCommand::new()
-        .cargo_path(crate::cargo())
-        .manifest_path(manifest)
-        .no_deps()
-        .exec()
-        .map_err(|e| format!("cargo metadata failed: {e}"))?;
+fn windows_only_packages(manifest: &Path) -> anyhow::Result<Vec<String>> {
+    let metadata = crate::metadata(MetadataCommand::new().manifest_path(manifest).no_deps())?;
     let members = metadata.workspace_packages();
     let mut excludes = Vec::new();
     for pkg in &members {
@@ -77,9 +73,7 @@ fn windows_only_packages(manifest: &Path) -> Result<Vec<String>, String> {
             .iter()
             .any(|p| p.name.as_str() == *required && !is_windows_only(p));
         if !portable {
-            return Err(format!(
-                "R2: `{required}` must be a portable (non-Windows-only) workspace package"
-            ));
+            bail!("R2: `{required}` must be a portable (non-Windows-only) workspace package");
         }
     }
     Ok(excludes)
@@ -90,7 +84,7 @@ mod tests {
     use super::windows_only_packages;
     use crate::fixture::{Crate, baseline, set, write_workspace};
 
-    fn excludes(crates: &[Crate]) -> Result<Vec<String>, String> {
+    fn excludes(crates: &[Crate]) -> anyhow::Result<Vec<String>> {
         let dir = tempfile::tempdir().unwrap();
         write_workspace(dir.path(), crates);
         windows_only_packages(&dir.path().join("Cargo.toml"))
@@ -98,7 +92,7 @@ mod tests {
 
     #[test]
     fn excludes_windows_only_packages() {
-        assert_eq!(excludes(&baseline()), Ok(vec!["player".to_owned()]));
+        assert_eq!(excludes(&baseline()).unwrap(), ["player"]);
     }
 
     #[test]
@@ -109,7 +103,7 @@ mod tests {
             "audio",
             "[package.metadata.tapestry]\nwindows-only = true\n",
         );
-        let err = excludes(&crates).unwrap_err();
-        assert!(err.contains("R2: `audio` must be a portable"), "{err}");
+        let err = format!("{:#}", excludes(&crates).unwrap_err());
+        assert!(err.starts_with("R2: `audio` must be a portable"), "{err}");
     }
 }
