@@ -511,28 +511,49 @@ impl Loaded {
     }
 
     /// The device profile and the logic step's sizes for a play whose
-    /// participating sources have `kinds`, indexed by source id.
-    #[must_use]
-    pub fn plan(&self, kinds: &[DeviceKind], axes: &[Vec<input::hid::AxisCap>]) -> PlayPlan {
+    /// participating sources have `kinds` and declare `axes`, indexed by
+    /// source id. The capacity is the recording window's (D8), never cut.
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::RecordingTooLarge`] when the window needs more than
+    /// the recording policy reserves ([`Reservation`]): the play is refused
+    /// before its countdown rather than cut off midway.
+    pub fn plan(
+        &self,
+        kinds: &[DeviceKind],
+        axes: &[Vec<input::hid::AxisCap>],
+    ) -> Result<PlayPlan, LogicError> {
         let device = self.settings.device.profile(kinds, axes);
-        let recorded: usize = kinds
+        // Per source: its recorded buttons and keys, and its axes.
+        let recorded: Vec<(usize, usize)> = kinds
             .iter()
-            .map(|&k| self.settings.device.keys(k).recorded().len())
-            .sum();
-        let axes: usize = device.sources.iter().map(|s| s.axes.len()).sum();
-        let window = window_inputs(
+            .zip(&device.sources)
+            .map(|(&k, s)| {
+                let all = self.settings.device.keys(k).recorded().len();
+                (all - s.axes.len(), s.axes.len())
+            })
+            .collect();
+        let inputs = window_inputs(
             &self.chart,
             &self.preset,
             &device,
             self.config.lead_in,
-            recorded - axes,
-            axes,
+            &recorded,
         );
+        if let Some(r) = Reservation::of(&self.chart, &self.preset, &device, self.config.effects)
+            && inputs > r.capacity()
+        {
+            return Err(LogicError::RecordingTooLarge {
+                needed: inputs,
+                allowed: r.capacity(),
+            });
+        }
         let logic = LogicConfig {
-            inputs: window.min(recording_cap(kinds.len(), self.preset.gauges.len())),
+            inputs,
             effects: self.config.effects,
         };
-        PlayPlan { device, logic }
+        Ok(PlayPlan { device, logic })
     }
 
     /// Whether the session policy ends the play with `gauges` (every
@@ -920,50 +941,102 @@ fn arrival(a: &InputArrival) -> Arrival {
     }
 }
 
-/// The memory a play's recording may reserve: the logic step's buffers and
-/// the evaluator's input ring and output, all sized from the input
-/// capacity (stage1.md D14).
-pub const RECORDING_MEMORY: usize = 256 << 20;
+/// The memory one play may reserve for its recording, before its
+/// countdown (stage1.md D14): what [`Reservation`] counts.
+pub const RECORDING_MEMORY: usize = 512 << 20;
 
-/// The bytes the logic step reserves per input of the capacity, for
-/// `sources` sources and `gauges` gauges: a staging slot per source, the
-/// merge and the record, a slot of the evaluator's ring, and the output
-/// events one input can cause ([`Evaluator::max_events`]: a sound, an
-/// empty POOR, and a gauge report per gauge).
-#[must_use]
-pub fn bytes_per_input(sources: usize, gauges: usize) -> usize {
-    let event = size_of::<eval::PhysicalInputEvent>();
-    sources.saturating_add(2).saturating_mul(event)
-        + size_of::<(TimeUs, eval::PhysicalInputEvent)>()
-        + gauges
-            .saturating_add(2)
-            .saturating_mul(size_of::<JudgeEvent>())
+/// The bytes the evaluator's own tables may take per chart object (its
+/// judgeable notes, their flags and its deadlines), an allowance on top of
+/// what [`Reservation`] counts exactly.
+pub const TABLE_BYTES_PER_OBJECT: usize = 64;
+
+/// An allowance for the logic step's small fixed parts (its per-source
+/// bookkeeping, the play view's buffers and the gauges).
+pub const SMALL_PARTS_BYTES: usize = 64 << 10;
+
+/// What a play reserves before its countdown, as a function of its input
+/// capacity: `fixed + per_input × inputs` bytes (stage1.md D14).
+///
+/// It counts what the constructors reserve: [`Logic::new`](crate::Logic::new)
+/// sizes the evaluator's input ring, the merge and the record for the
+/// input budget (the capacity plus a disconnect per source), each source's
+/// staging for the capacity plus one, and its output for
+/// [`Evaluator::max_events`] of the budget; a live play adds an audio
+/// command queue and a copy of the events, each also of
+/// [`Evaluator::max_events`]. The fixed part holds the chart's share of
+/// those events (its notes, mines and song end), the render effect queue,
+/// and the allowances for tables and small parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reservation {
+    /// Bytes reserved whatever the capacity.
+    pub fixed: usize,
+    /// Bytes reserved per input of the capacity.
+    pub per_input: usize,
 }
 
-/// The recording policy (stage1.md D14): the most inputs one play records,
-/// whatever its window, so its reservation stays within
-/// [`RECORDING_MEMORY`] (one disconnect per source on top). That is below
-/// what [`replay::DecodeLimits::STANDARD`] reads
-/// ([`replay::max_record_events`]), which a test pins, so every record
-/// decodes. A play whose window would hold more is capped, not refused:
-/// only a play that really receives more inputs overflows, and its record
-/// is then marked incomplete.
-#[must_use]
-pub fn recording_cap(sources: usize, gauges: usize) -> usize {
-    (RECORDING_MEMORY / bytes_per_input(sources, gauges).max(1)).saturating_sub(sources)
+impl Reservation {
+    /// The reservation of a play of `chart` under `preset` with the
+    /// sources of `device` and a render effect queue of `effects`; `None`
+    /// when the evaluator refuses them, which the play then reports.
+    #[must_use]
+    pub fn of(
+        chart: &Chart,
+        preset: &RulePreset,
+        device: &eval::DeviceProfile,
+        effects: usize,
+    ) -> Option<Self> {
+        let probe = Evaluator::new(chart, preset, device, &InputStart::default(), 0).ok()?;
+        let sources = device.sources.len();
+        let event = 2 * size_of::<JudgeEvent>() + size_of::<::audio::SoundCmd>();
+        let input = size_of::<eval::PhysicalInputEvent>();
+        let slot = size_of::<(TimeUs, eval::PhysicalInputEvent)>();
+        let total = |inputs: usize| {
+            let budget = inputs + sources;
+            probe.max_events(budget) * event
+                + sources * (inputs + 1) * input
+                + 2 * budget * input
+                + budget * slot
+        };
+        let objects: usize = chart.lanes.iter().map(Vec::len).sum();
+        Some(Self {
+            fixed: total(0)
+                + effects * size_of::<JudgeEvent>()
+                + objects * TABLE_BYTES_PER_OBJECT
+                + SMALL_PARTS_BYTES,
+            per_input: total(1) - total(0),
+        })
+    }
+
+    /// The bytes reserved for a capacity of `inputs`.
+    #[must_use]
+    pub const fn bytes(&self, inputs: usize) -> usize {
+        self.fixed
+            .saturating_add(self.per_input.saturating_mul(inputs))
+    }
+
+    /// The largest capacity within [`RECORDING_MEMORY`].
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        RECORDING_MEMORY.saturating_sub(self.fixed)
+            / if self.per_input == 0 {
+                1
+            } else {
+                self.per_input
+            }
+    }
 }
 
 /// The recording window's input capacity (D8, [`eval::window_inputs`]):
-/// every recorded button pressed and released 30 times a second and every
-/// recorded axis reporting 1000 times a second, from the countdown to the
-/// chart's final deadline plus the largest input offset, in whole seconds.
+/// each source's recorded buttons pressed and released 30 times a second
+/// each, up to 240 edges a second together, and its recorded axes
+/// reporting 1000 times a second each, from the countdown to the chart's
+/// final deadline plus the largest input offset, in whole seconds.
 fn window_inputs(
     chart: &Chart,
     preset: &RulePreset,
     device: &eval::DeviceProfile,
     lead_in: TimeUs,
-    buttons: usize,
-    axes: usize,
+    sources: &[(usize, usize)],
 ) -> usize {
     let end = Evaluator::new(chart, preset, device, &InputStart::default(), 0)
         .map_or(TimeUs(0), |e| e.final_deadline());
@@ -978,5 +1051,5 @@ fn window_inputs(
         .0
         .saturating_add(end.0.max(0))
         .saturating_add(offset);
-    eval::window_inputs(TimeUs(span), buttons, axes)
+    eval::window_inputs(TimeUs(span), sources)
 }

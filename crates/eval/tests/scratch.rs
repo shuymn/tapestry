@@ -298,7 +298,7 @@ fn axis_capacity_holds_a_song_of_1khz_reports() {
     // A three-minute chart: taps on key 1 every second to 180 s, so the
     // final deadline is 180 s + 180 ms. With a 1 s lead-in the window is
     // 181.18 s, 182 whole seconds; 9 buttons (7 keys, retry, quit) and one
-    // axis get 182 × (9 × 60 + 1000) = 280_280 inputs.
+    // axis get 182 × (min(9 × 60, 240) + 1000) = 225_680 inputs.
     let mut b = ChartBuilder::new(BPM).tap(SCRATCH, TimeUs(500 * MS));
     for s in 1..=180 {
         b = b.tap(lane(1), TimeUs(s * 1_000 * MS));
@@ -310,8 +310,8 @@ fn axis_capacity_holds_a_song_of_1khz_reports() {
     assert_eq!(probe.final_deadline(), TimeUs(180_180 * MS));
     let lead_in = 1_000 * MS;
     let span = TimeUs(lead_in + probe.final_deadline().0);
-    let capacity = window_inputs(span, 9, 1);
-    assert_eq!(capacity, 280_280);
+    let capacity = window_inputs(span, &[(9, 1)]);
+    assert_eq!(capacity, 225_680);
 
     // The axis turns forward one position every millisecond from the start
     // of the countdown to the final deadline: 181_181 reports.
@@ -357,11 +357,26 @@ fn axis_capacity_holds_a_song_of_1khz_reports() {
 #[test]
 fn window_inputs_rounds_up_and_saturates() {
     // 1 µs past a whole second is another second.
-    assert_eq!(window_inputs(TimeUs(2_000_001), 1, 0), 3 * 60);
-    assert_eq!(window_inputs(TimeUs(2_000_000), 0, 1), 2 * 1000);
-    assert_eq!(window_inputs(TimeUs(0), 5, 5), 0);
-    assert_eq!(window_inputs(TimeUs(-1), 5, 5), 0);
-    assert_eq!(window_inputs(TimeUs(i64::MAX), usize::MAX, 1), usize::MAX);
+    assert_eq!(window_inputs(TimeUs(2_000_001), &[(1, 0)]), 3 * 60);
+    assert_eq!(window_inputs(TimeUs(2_000_000), &[(0, 1)]), 2 * 1000);
+    // A source's buttons together get at most 240 edges a second: 4 get
+    // 240, 5 get 240 too; each source has its own.
+    assert_eq!(window_inputs(TimeUs(1_000_000), &[(4, 0)]), 240);
+    assert_eq!(window_inputs(TimeUs(1_000_000), &[(5, 0)]), 240);
+    assert_eq!(
+        window_inputs(TimeUs(1_000_000), &[(5, 0), (3, 2)]),
+        240 + 180 + 2000
+    );
+    assert_eq!(window_inputs(TimeUs(0), &[(5, 5)]), 0);
+    assert_eq!(window_inputs(TimeUs(-1), &[(5, 5)]), 0);
+    assert_eq!(
+        window_inputs(TimeUs(i64::MAX), &[(1, usize::MAX)]),
+        usize::MAX
+    );
+    assert_eq!(
+        window_inputs(TimeUs(1), &[(0, usize::MAX), (0, 1)]),
+        usize::MAX
+    );
 }
 
 #[test]

@@ -233,7 +233,13 @@ fn play_and_next<R: Rig>(
     let start = loaded.begin_play();
     let opening = rig.open(loaded.config().lead_in);
     let origin = opening.origin;
-    let plan = loaded.plan(&opening.kinds, &opening.axes);
+    let plan = match loaded.plan(&opening.kinds, &opening.axes) {
+        Ok(plan) => plan,
+        Err(e) => {
+            rig.close();
+            return Err(LiveError::Logic(e));
+        }
+    };
     let (mut logic, screen) = match Logic::new(
         loaded.chart(),
         loaded.preset(),

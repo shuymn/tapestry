@@ -199,22 +199,35 @@ pub fn evaluation_time(ev: &PhysicalInputEvent, device: &DeviceProfile) -> TimeU
 /// press and a release 30 times a second (stage1.md D8).
 pub const BUTTON_EDGES_PER_SEC: usize = 60;
 
+/// The most button edges one source gets per second of the recording
+/// window, whatever its number of buttons: 120 presses and releases a
+/// second, beyond what hands play (stage1.md D8). Input beyond it overflows
+/// and marks the log incomplete.
+pub const SOURCE_BUTTON_EDGES_PER_SEC: usize = 240;
+
 /// Reports each recorded axis gets per second of the recording window:
 /// one per millisecond, a 1 kHz controller reporting without pause
 /// (stage1.md D8).
 pub const AXIS_REPORTS_PER_SEC: usize = 1000;
 
-/// The inputs a recording window of `span` holds (stage1.md D8): each of
-/// `buttons` recorded buttons and keys [`BUTTON_EDGES_PER_SEC`], and each
-/// of `axes` recorded axes [`AXIS_REPORTS_PER_SEC`], over the span in
-/// whole seconds, rounded up. A span that is not positive holds nothing;
-/// the product saturates.
+/// The inputs a recording window of `span` holds (stage1.md D8), for
+/// sources recording `(buttons, axes)` each: per source, its recorded
+/// buttons and keys [`BUTTON_EDGES_PER_SEC`] each, at most
+/// [`SOURCE_BUTTON_EDGES_PER_SEC`] together, and its recorded axes
+/// [`AXIS_REPORTS_PER_SEC`] each, over the span in whole seconds, rounded
+/// up. A span that is not positive holds nothing; the sums saturate.
 #[must_use]
-pub fn window_inputs(span: TimeUs, buttons: usize, axes: usize) -> usize {
+pub fn window_inputs(span: TimeUs, sources: &[(usize, usize)]) -> usize {
     let secs = u64::try_from(span.0).unwrap_or(0).div_ceil(1_000_000);
     let secs = usize::try_from(secs).unwrap_or(usize::MAX);
-    buttons
-        .saturating_mul(BUTTON_EDGES_PER_SEC)
-        .saturating_add(axes.saturating_mul(AXIS_REPORTS_PER_SEC))
+    sources
+        .iter()
+        .map(|&(buttons, axes)| {
+            buttons
+                .saturating_mul(BUTTON_EDGES_PER_SEC)
+                .min(SOURCE_BUTTON_EDGES_PER_SEC)
+                .saturating_add(axes.saturating_mul(AXIS_REPORTS_PER_SEC))
+        })
+        .fold(0_usize, usize::saturating_add)
         .saturating_mul(secs)
 }

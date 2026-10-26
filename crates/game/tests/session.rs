@@ -1249,7 +1249,7 @@ fn key_sounds_and_bgm_follow_each_play_across_a_retry() {
 }
 
 #[test]
-fn plan_sizes_axes_at_1khz_and_buttons_at_30_presses() {
+fn plan_sizes_axes_at_1khz_and_buttons_per_source() {
     let (_dir, root) = temp_root();
     // The final deadline is 1180 ms; with the 1 s lead-in the window is
     // 2.18 s, 3 whole seconds.
@@ -1270,43 +1270,20 @@ fn plan_sizes_axes_at_1khz_and_buttons_at_30_presses() {
         ..Parts::standard(&root, &settings.player)
     };
     let loaded = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap();
-    // The keyboard records its 8 lanes, retry and quit, the controller a
-    // button and an axis: 11 buttons at 60 edges and 1 axis at 1000
-    // reports a second, over 3 s.
-    let plan = loaded.plan(&[DeviceKind::Keyboard, DeviceKind::Controller], &[]);
+    // The keyboard records its 8 lanes, retry and quit: 10 buttons, capped
+    // at 240 edges a second together. The controller records a button (60)
+    // and an axis (1000 reports a second). Over 3 s.
+    let plan = loaded
+        .plan(&[DeviceKind::Keyboard, DeviceKind::Controller], &[])
+        .unwrap();
     assert_eq!(plan.device.sources[1].axes.len(), 1);
-    assert_eq!(plan.logic.inputs, 3 * (11 * 60 + 1000));
+    assert_eq!(plan.logic.inputs, 3 * (240 + 60 + 1000));
 }
 
-#[test]
-fn recording_policy_keeps_memory_and_the_decoder_limits() {
-    let decodable = replay::max_record_events(&replay::DecodeLimits::STANDARD);
-    for sources in 1..=8 {
-        for gauges in 1..=4 {
-            // Memory binds first, so the standard decoder always reads a
-            // record at the cap, with each source's disconnect on top.
-            let memory = game::RECORDING_MEMORY / game::bytes_per_input(sources, gauges);
-            assert!(memory <= decodable, "{sources} sources, {gauges} gauges");
-            let cap = game::recording_cap(sources, gauges);
-            assert_eq!(cap, memory - sources);
-            assert!(cap + sources <= decodable);
-            assert!(cap * game::bytes_per_input(sources, gauges) <= game::RECORDING_MEMORY);
-        }
-    }
-    println!(
-        "indicator: recording cap with 2 sources and 2 gauges: {} inputs",
-        game::recording_cap(2, 2)
-    );
-}
-
-#[test]
-fn a_long_window_is_capped_by_the_recording_policy() {
-    let (_dir, root) = temp_root();
-    // An hour-long chart with three axes would want 3 × 1000 reports a
-    // second for an hour; the play records up to the cap instead.
-    let chart = taps(&[(1, 3_600_000)]);
-    let mut settings = Settings::load(&root).unwrap();
-    settings.device.controller.lanes = (0..3)
+/// A loaded session of `chart` whose controller binds `axes` axes.
+fn loaded_with_axes(root: &DataRoot, chart: Chart, axes: u32) -> Loaded {
+    let mut settings = Settings::load(root).unwrap();
+    settings.device.controller.lanes = (0..axes)
         .map(|i| game::LaneKey {
             control: 0x1_0030 + i,
             lane: u8::try_from(i).unwrap(),
@@ -1314,12 +1291,62 @@ fn a_long_window_is_capped_by_the_recording_policy() {
         .collect();
     let parts = Parts {
         ingest: Box::new(Built(chart)),
-        ..Parts::standard(&root, &settings.player)
+        ..Parts::standard(root, &settings.player)
     };
-    let loaded = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap();
-    let plan = loaded.plan(&[DeviceKind::Keyboard, DeviceKind::Controller], &[]);
-    let preset_gauges = rules::custom().gauges.len();
-    let cap = game::recording_cap(2, preset_gauges);
-    assert!(3 * 1000 * 3_600 > cap);
-    assert_eq!(plan.logic.inputs, cap);
+    Loaded::load(root.clone(), settings, &chart_file(root), config(), parts).unwrap()
+}
+
+#[test]
+fn a_play_too_long_to_record_is_refused_before_it_starts() {
+    let (_dir, root) = temp_root();
+    // A 15-minute chart: final deadline 900.18 s, with the lead-in 902
+    // whole seconds. The keyboard's 10 keys get 240 edges a second, the
+    // controller's axis 1000 reports.
+    let loaded = loaded_with_axes(&root, taps(&[(1, 900_000)]), 1);
+    let both = [DeviceKind::Keyboard, DeviceKind::Controller];
+    let err = loaded.plan(&both, &[]).unwrap_err();
+    let device = DeviceSettings {
+        controller: loaded.settings().device.controller.clone(),
+        ..DeviceSettings::default()
+    }
+    .profile(&both, &[]);
+    let allowed = game::Reservation::of(loaded.chart(), loaded.preset(), &device, config().effects)
+        .unwrap()
+        .capacity();
+    assert_eq!(
+        err,
+        game::LogicError::RecordingTooLarge {
+            needed: 902 * (240 + 1000),
+            allowed,
+        }
+    );
+    // The keyboard alone fits: its 902 × 240 inputs are reserved whole.
+    let plan = loaded.plan(&[DeviceKind::Keyboard], &[]).unwrap();
+    assert_eq!(plan.logic.inputs, 902 * 240);
+}
+
+#[test]
+fn recording_policy_fits_the_standard_decoder() {
+    // For any number of sources the most a play may record, with each
+    // source's disconnect, decodes under the standard limits.
+    let chart = taps(&[(1, 1_000)]);
+    let decodable = replay::max_record_events(&replay::DecodeLimits::STANDARD);
+    for n in 1..=8 {
+        let device = DeviceSettings::default().profile(&vec![DeviceKind::Keyboard; n], &[]);
+        let r = game::Reservation::of(&chart, &rules::custom(), &device, config().effects).unwrap();
+        assert!(r.capacity() + n <= decodable, "{n} sources");
+        assert!(r.bytes(r.capacity()) <= game::RECORDING_MEMORY);
+        assert!(r.bytes(r.capacity() + 1) > game::RECORDING_MEMORY);
+    }
+    // Indicator: how long a play one keyboard, and one keyboard with a
+    // controller's axis, can record.
+    let one = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
+    let r = game::Reservation::of(&chart, &rules::custom(), &one, config().effects).unwrap();
+    println!(
+        "indicator: {} bytes per input, {} inputs: {} s for a keyboard, {} s with an axis",
+        r.per_input,
+        r.capacity(),
+        r.capacity() / 240,
+        r.capacity() / 1240
+    );
 }
