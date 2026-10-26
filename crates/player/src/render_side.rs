@@ -1020,11 +1020,11 @@ mod tests {
     /// present count to pair them with).
     #[test]
     fn frames_draw_a_buffer_of_effects_and_the_rest_end_na() {
-        use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
         use game::DeviceSettings;
         use input::DeviceKind;
 
-        const BUFFER: usize = 2;
+        // The frame buffer the render thread makes for a view of 2 effects.
+        let buffer = Vec::<eval::JudgeEvent>::with_capacity(2).capacity();
         let mut builder = ChartBuilder::new(120_000);
         for k in 0..6 {
             builder = builder.tap(Lane::new(1).unwrap(), TimeUs(1_000_000 + k * 200_000));
@@ -1033,20 +1033,9 @@ mod tests {
         let rule = rules::custom();
         let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
         let (mut writer, reader) = input::source_queue(32);
-        // Z, lane 1's default key, pressed on every note and released.
-        for k in 0..6 {
-            for (at, value) in [(0, 1), (50_000, 0)] {
-                writer
-                    .push(PhysicalInputEvent {
-                        received: TimeUs(1_000_000 + k * 200_000 + at),
-                        source: SourceId(0),
-                        kind: InputKind::Control {
-                            control: ControlId(0x2c),
-                            value,
-                        },
-                    })
-                    .unwrap();
-            }
+        // Every note hit on time.
+        for e in input::autoplay(&chart, &device.sources[0]).unwrap() {
+            writer.push(e).unwrap();
         }
         writer.publish(TimeUs(3_000_000));
         let (mut logic, side) = Logic::<SourceReader>::new(
@@ -1070,6 +1059,8 @@ mod tests {
             .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
             .count();
         assert_eq!(judged, 6);
+        // More than the drawn frames' buffers hold.
+        assert!(logic.events().len() > DRAWN_FRAMES as usize * buffer);
         let waits = Arc::new(AtomicU32::new(0));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let screen = (Arc::clone(&waits), Arc::clone(&seen));
@@ -1081,7 +1072,7 @@ mod tests {
         });
         let clock = QpcClock::start();
         let view = View {
-            effects: BUFFER,
+            effects: buffer,
             ..view()
         };
         let link = spawn(
@@ -1105,7 +1096,7 @@ mod tests {
         let frames = seen.lock().unwrap().clone();
         assert_eq!(frames.len(), DRAWN_FRAMES as usize);
         // Each frame drew a full buffer, never more.
-        assert!(frames.iter().all(|&(n, _)| n == BUFFER), "{frames:?}");
+        assert!(frames.iter().all(|&(n, _)| n == buffer), "{frames:?}");
         let drawn: usize = frames.iter().map(|&(_, j)| j).sum();
         assert!(drawn < judged, "{frames:?}");
         // The drawn judgments and the ones still queued at the end.
