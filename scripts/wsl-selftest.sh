@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Check that scripts/wsl.sh reaches the dev shell, passes arguments verbatim,
-# and returns the command's exit code.
+# Check that scripts/wsl.sh reaches the dev shells (`default` and `fuzz`),
+# passes arguments verbatim, and returns the command's exit code.
 # Usage: scripts/wsl-selftest.sh
 set -uo pipefail
 
@@ -49,6 +49,52 @@ case "$target" in
   "$cache"/tapestry/target/?*) pass "CARGO_TARGET_DIR is $target" ;;
   *) fail "CARGO_TARGET_DIR under $cache/tapestry/target/: got '$target'" ;;
 esac
+
+# The default shell has the Rust version of mise.lock.
+locked=
+in_rust=false
+while IFS= read -r line; do
+  case "$line" in
+    '[[tools.rust]]') in_rust=true ;;
+    '['*) in_rust=false ;;
+    'version = "'*) if [ "$in_rust" = true ] && [ -z "$locked" ]; then
+      locked=${line#version = \"}
+      locked=${locked%\"}
+    fi ;;
+  esac
+done <"$(dirname -- "$wsl")/../mise.lock"
+rustc=$("$wsl" rustc --version)
+case "$rustc" in
+  "rustc $locked "*) pass "default shell: $rustc" ;;
+  *) fail "default shell: rustc $locked from mise.lock: got '$rustc'" ;;
+esac
+
+# The fuzz shell: the pinned nightly, cargo-fuzz, its own directories, and
+# the same exit codes.
+export TAPESTRY_NIX_SHELL=fuzz
+rustc=$("$wsl" rustc --version)
+case "$rustc" in
+  *-nightly*) pass "fuzz shell: $rustc" ;;
+  *) fail "fuzz shell: a nightly rustc: got '$rustc'" ;;
+esac
+if fuzz_version=$("$wsl" cargo fuzz --version); then
+  pass "fuzz shell: $fuzz_version"
+else
+  fail "fuzz shell: cargo fuzz --version"
+fi
+# shellcheck disable=SC2016
+dirs=$("$wsl" sh -c 'echo "$CARGO_TARGET_DIR|$TAPESTRY_FUZZ_CORPUS"')
+case "$dirs" in
+  "$cache"/tapestry/fuzz-target/?*"|$cache"/tapestry/fuzz-corpus/?*) pass "fuzz shell directories: $dirs" ;;
+  *) fail "fuzz shell directories under $cache/tapestry/fuzz-{target,corpus}/: got '$dirs'" ;;
+esac
+"$wsl" false
+code=$?
+if [ "$code" -eq 1 ]; then pass "fuzz shell: exit code 1"; else fail "fuzz shell: exit code 1: got $code"; fi
+"$wsl" sh -c 'exit 42'
+code=$?
+if [ "$code" -eq 42 ]; then pass "fuzz shell: exit code 42"; else fail "fuzz shell: exit code 42: got $code"; fi
+unset TAPESTRY_NIX_SHELL
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures check(s) failed" >&2

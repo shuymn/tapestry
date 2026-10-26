@@ -31,20 +31,43 @@
           "clippy"
         ];
       };
+      # The nightly of the `fuzz` shell (cargo-fuzz needs nightly for the
+      # sanitizers). Bumped by hand, for example when stable passes it; the
+      # date must exist in the locked rust-overlay.
+      fuzzNightly = "2026-10-23";
+      nightly = pkgs.rust-bin.nightly.${fuzzNightly}.minimal;
+      # One directory per working copy (hash of its root), inside the Linux
+      # filesystem, so working copies never share output and nothing is
+      # written over /mnt/c.
+      cacheDir = name: ''"''${XDG_CACHE_HOME:-$HOME/.cache}/tapestry/${name}/$root_hash"'';
+      rootHash = ''
+        root_hash=$(printf %s "$PWD" | sha256sum | cut -c1-16)
+      '';
     in
     {
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [
-          toolchain
-          pkgs.git
-        ];
-        # One target dir per working copy (hash of its root), inside the Linux
-        # filesystem, so working copies never share output and nothing is
-        # written over /mnt/c.
-        shellHook = ''
-          root_hash=$(printf %s "$PWD" | sha256sum | cut -c1-16)
-          export CARGO_TARGET_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/tapestry/target/$root_hash"
-        '';
+      devShells.${system} = {
+        default = pkgs.mkShell {
+          packages = [
+            toolchain
+            pkgs.git
+          ];
+          shellHook = rootHash + ''
+            export CARGO_TARGET_DIR=${cacheDir "target"}
+          '';
+        };
+        # Fuzzing (docs/setup.md "Fuzzing"): the dated nightly and cargo-fuzz.
+        # A separate shell, since stable and nightly cannot share PATH.
+        fuzz = pkgs.mkShell {
+          packages = [
+            nightly
+            pkgs.cargo-fuzz
+            pkgs.git
+          ];
+          shellHook = rootHash + ''
+            export CARGO_TARGET_DIR=${cacheDir "fuzz-target"}
+            export TAPESTRY_FUZZ_CORPUS=${cacheDir "fuzz-corpus"}
+          '';
+        };
       };
     };
 }
