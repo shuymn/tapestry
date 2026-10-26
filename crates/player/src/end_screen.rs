@@ -238,7 +238,8 @@ pub fn lines(
 }
 
 /// The settings keys and their values, under the summary. The input
-/// offset applies from the next play (D13).
+/// offset applies from the next play (D13) of devices; autoplay plays
+/// with 0 whatever it is.
 pub fn settings_lines(t: Tuning) -> Vec<String> {
     vec![
         String::new(),

@@ -635,11 +635,11 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
 }
 
 /// H2: retried by itself after ten input offset steps on the end screen
-/// (`F8`, 10 ms), autoplay plays the chart over from its first note: both
-/// plays judge every note PERFECT, neither is saved, and the new input
-/// offset is written to `device.toml`.
+/// (`F8`, 10 ms), autoplay plays the chart over from its first note with
+/// its own input offset of 0: both plays judge every note PERFECT, neither
+/// is saved, and the new input offset is written to `device.toml`.
 #[test]
-fn auto_retry_starts_over_with_the_new_input_offset() {
+fn auto_retry_ignores_the_changed_input_offset() {
     let (_dir, chart, appdata) = auto_fixture();
     let f8 = ["F8"; 10].join(",");
     let out = auto_run(

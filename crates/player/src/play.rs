@@ -60,7 +60,8 @@ pub struct PlayerRig<'a> {
     pub autoplay: bool,
     /// The countdown's length.
     pub lead_in: TimeUs,
-    /// The input offset the current play uses.
+    /// The input offset the current play uses (a device play; autoplay
+    /// plays with 0 whatever it is).
     pub input_offset_us: i64,
     /// The settings files.
     pub files: SettingsFiles,
