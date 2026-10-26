@@ -2,7 +2,7 @@ name: Audit
 
 # The advisory checks from CI on a schedule, so advisories published while the
 # repository is idle are reported. A failed scheduled run notifies the user who
-# last changed the cron below. Pull requests that change this workflow or
+# last changed the cron below, or who last re-enabled the workflow. Pull requests that change this workflow or
 # deny.toml also run it.
 
 on:
@@ -36,7 +36,16 @@ jobs:
           version: 2026.10.3
           install: true
           cache: true
+      # cargo-deny and cargo-audit only warn when they cannot read the
+      # registry index, and then skip the yanked check, so those lines fail
+      # the step (the same commands as ci.yml).
       - name: cargo-deny
-        run: mise exec -- cargo deny check advisories
+        run: |
+          set -o pipefail
+          mise exec -- cargo deny check advisories 2>&1 | tee "$RUNNER_TEMP/deny.log"
+          if grep 'unable to check for yanked crates' "$RUNNER_TEMP/deny.log"; then exit 1; fi
       - name: cargo-audit
-        run: mise exec -- cargo audit --deny warnings
+        run: |
+          set -o pipefail
+          mise exec -- cargo audit --deny warnings 2>&1 | tee "$RUNNER_TEMP/audit.log"
+          if grep -E "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$RUNNER_TEMP/audit.log"; then exit 1; fi
