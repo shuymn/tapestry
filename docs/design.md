@@ -1056,6 +1056,8 @@ Feel, local dedicated controllers, running alongside OBS (once that variation is
 >
 > Until stage 3 is finished, IR, the distribution registry, anti-cheat, and servers are not touched. The only things decided before then in preparation for a future IR and the like are the input log format and the evaluator boundary, so that these can be added later. The later sections of this design document are designs for building at that point, not reasons to build earlier.
 
+Chart features beyond what a stage shows wait for the stage that shows them; until then the loader ignores them without a warning. Invisible notes (BMS channels 31-39, notes that are judged but not drawn) are one such later feature.
+
 After stage 3, variations (other chart formats, input adapters, skin adapters, settings profiles, other PCs, running alongside other software) are added one at a time as needed, before or alongside the later stages. Between stages 1 and 2, a generous period of playing and fixing is set aside. IR (stage 4 onward) is started once a state that is fun to play exists. The input log format carries a version number from stage 1, and only its core parts (physical input, time, chart identification, and the preset record) are included from the start. Other fields are added while bumping the version. Crates, too, start out consolidated into a few, and are split once the boundaries become clear.
 
 ## Open Questions

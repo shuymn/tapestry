@@ -69,7 +69,8 @@ pub struct Source {
     pub warned_lntype: bool,
 }
 
-/// Descriptive headers read and ignored without a warning.
+/// Headers read and ignored without a warning: descriptive ones, and ones
+/// for what stage 1 does not show or use.
 const IGNORED_HEADERS: &[&str] = &[
     "ARTIST",
     "SUBARTIST",
@@ -83,7 +84,18 @@ const IGNORED_HEADERS: &[&str] = &[
     "VOLWAV",
     "COMMENT",
     "PREVIEW",
+    // Read by other players for things stage 1 does not show or use.
+    "BASEBPM",
+    "CHARFILE",
+    "EXTCHR",
+    "MIDIFILE",
+    "MAKER",
 ];
+
+/// Prefixes of numbered definitions read and ignored without a warning:
+/// images, BGA layers, texts and judge-rank changes (`#EXRANKxx`, which
+/// channel A0 uses; a stage 1 gap, stage1.md D13).
+const IGNORED_DEFINITIONS: &[&str] = &["BMP", "BGA", "TEXT", "EXRANK"];
 
 /// Branching directives the loader does not support.
 const UNSUPPORTED_HEADERS: &[&str] = &[
@@ -96,8 +108,12 @@ const UNSUPPORTED_HEADERS: &[&str] = &[
     "ENDSW",
 ];
 
-/// Channels whose objects are ignored without a warning (BGA, stage 3).
-const SILENT_CHANNELS: &[&str] = &["04", "06", "07"];
+/// Channels whose objects are ignored without a warning: BGA (04, 06,
+/// 07; stage 3) and 1P invisible notes (31-39; a later feature, design.md
+/// "Roadmap").
+const SILENT_CHANNELS: &[&str] = &[
+    "04", "06", "07", "31", "32", "33", "34", "35", "36", "37", "38", "39",
+];
 
 pub fn parse(
     text: &str,
@@ -362,7 +378,10 @@ fn parse_header(
                 });
             }
         }
-        _ if IGNORED_HEADERS.contains(&upper) || defined_id("BMP").is_some() => {}
+        _ if IGNORED_HEADERS.contains(&upper)
+            || IGNORED_DEFINITIONS
+                .iter()
+                .any(|prefix| defined_id(prefix).is_some()) => {}
         _ => {
             if let Some(id) = defined_id("BPM") {
                 source.bpm_defs.insert(id, bpm(value, line, "#BPMxx")?);

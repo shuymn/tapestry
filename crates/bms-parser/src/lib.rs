@@ -37,8 +37,13 @@
 //! - **Lanes:** channels 16 (scratch), 11-15 and 18-19 (keys 1-7); 51-59
 //!   long notes (`#LNTYPE 1`, consecutive objects pair up); D1-D9 mines,
 //!   with the object id as damage. Channel 17 and other unused channels are
-//!   ignored with a warning; BGA channels 04, 06 and 07 silently. A 2P lane
-//!   object (21-29, 61-69, E1-E9) is an `Unsupported` error.
+//!   ignored with a warning; BGA channels 04, 06 and 07 and invisible notes
+//!   (31-39) silently. A 2P lane object (21-29, 61-69, E1-E9) is an
+//!   `Unsupported` error.
+//! - **Headers:** headers for what stage 1 does not show or use (`#BASEBPM`,
+//!   `#CHARFILE`, `#EXTCHR`, `#MIDIFILE`, `#MAKER`, `#BMPxx`, `#BGAxx`,
+//!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
+//!   other unknown header is a warning.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane. The end plays no sound. An
 //!   empty `#LNOBJ` is ignored, with one warning per chart.
