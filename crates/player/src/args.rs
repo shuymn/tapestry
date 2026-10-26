@@ -172,7 +172,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use super::{Command, UsageError, parse};
+    use super::{Command, USAGE, UsageError, parse};
 
     fn parsed(args: &[&str]) -> Result<Command, UsageError> {
         parse(args.iter().map(OsString::from))
@@ -213,6 +213,15 @@ mod tests {
     #[test]
     fn a_double_dash_ends_the_options() {
         assert_eq!(chart(&["play", "--", "-x.bms"]).chart, Path::new("-x.bms"));
+        // A lone `--` is no argument at all.
+        assert_eq!(
+            parsed(&["--"]).unwrap_err(),
+            UsageError::Usage(USAGE.to_owned())
+        );
+        assert_eq!(
+            parsed(&["play", "--"]).unwrap_err(),
+            UsageError::Usage(format!("play needs a chart file\n{USAGE}"))
+        );
     }
 
     #[test]
@@ -235,5 +244,26 @@ mod tests {
         assert_eq!(play.dev.adjust_at_ms, 5);
         let play = chart(&["play", "a.bms", "--dev-adjust-at", "-5"]);
         assert_eq!(play.dev.adjust_at_ms, -5);
+    }
+
+    /// Each development flag and path lands in its own option.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn development_flags_and_paths_are_taken() {
+        let play = chart(&[
+            "play",
+            "a.bms",
+            "--dev-overlay",
+            "--dev-auto-retry",
+            "--dev-frames",
+            "d",
+            "--dev-scripted-input",
+            "l",
+        ]);
+        assert_eq!(play.chart, Path::new("a.bms"));
+        assert!(play.dev.overlay);
+        assert!(play.dev.auto_retry);
+        assert_eq!(play.dev.frames.as_deref(), Some(Path::new("d")));
+        assert_eq!(play.dev.scripted_input.as_deref(), Some(Path::new("l")));
     }
 }
