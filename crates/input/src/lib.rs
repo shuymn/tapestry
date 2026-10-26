@@ -11,8 +11,9 @@
 //!
 //! [`ScriptedInput`] feeds a scenario or a recorded log through the same
 //! path. [`autoplay`] makes the inputs that hit every note of a chart, and
-//! [`AutoplayInput`] feeds them on the input thread so that each is queued
-//! before its source publishes past it.
+//! [`AutoplayInput`] feeds them on the input thread, submitting every due
+//! event before its source publishes past it (the queue is sized for the
+//! whole stream; an overflow marks the recording incomplete).
 //!
 //! On Windows, the input thread (`InputThread`) receives keyboards and
 //! HID game controllers through Raw Input and stamps each batch with the

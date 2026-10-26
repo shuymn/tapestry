@@ -162,11 +162,14 @@ pub fn autoplay(
 }
 
 /// Plays generated events into a [`SourceSet`] from the generated keyboard
-/// [`AUTOPLAY_DEVICE`], on the play's timeline: every poll pushes each
-/// event due by then, a batch per receive time, and then publishes, so an
-/// event is always queued before its source publishes past it. Once the
-/// focus gate has tripped, nothing more is fed. After [`new`](Self::new),
-/// nothing allocates.
+/// [`AUTOPLAY_DEVICE`], on the play's timeline: every poll submits each
+/// event due by then, a batch per receive time, before it publishes, so
+/// the source never publishes past an event still to be submitted. There
+/// is no backpressure: the game sizes the source queue for the whole
+/// stream, and an event that does not fit is dropped and marks the
+/// recording incomplete, as for any source. Once the focus gate has
+/// tripped, nothing more is fed. After [`new`](Self::new), nothing
+/// allocates.
 #[derive(Debug)]
 pub struct AutoplayInput {
     events: Vec<PhysicalInputEvent>,
@@ -419,12 +422,12 @@ mod tests {
         expected: Vec<PhysicalInputEvent>,
         seen: Vec<PhysicalInputEvent>,
         watermark: TimeUs,
-        looks: usize,
+        /// Looks the feeder made, paused before a push.
+        between_pushes: usize,
     }
 
     impl Consumer {
         fn look(&mut self) {
-            self.looks += 1;
             let published = self.reader.published().received_up_to;
             assert!(published >= self.watermark, "the watermark moved back");
             while let Some(ev) = self.reader.pop() {
@@ -470,11 +473,13 @@ mod tests {
                 expected: events.clone(),
                 seen: Vec::new(),
                 watermark: TimeUs(i64::MIN),
-                looks: 0,
+                between_pushes: 0,
             }));
             let between = Arc::clone(&consumer);
             feeder.before_push = Some(BeforePush(Box::new(move || {
-                between.lock().unwrap().look();
+                let mut c = between.lock().unwrap();
+                c.between_pushes += 1;
+                c.look();
             })));
             let mut now = TimeUs(-1_000 * MS);
             while now.0 < 2_200 * MS {
@@ -487,7 +492,7 @@ mod tests {
                 consumer.lock().unwrap().look();
             }
             let consumer = consumer.lock().unwrap();
-            assert!(consumer.looks > events.len(), "seed {seed}");
+            assert_eq!(consumer.between_pushes, events.len(), "seed {seed}");
             assert_eq!(consumer.seen, events, "seed {seed}");
         }
     }
