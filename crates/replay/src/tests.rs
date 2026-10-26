@@ -1,7 +1,7 @@
-use bms_model::{ChartBuilder, ChartIdentity, Lane, TimeUs};
+use bms_model::{ChartIdentity, Lane, TimeUs};
 use eval::{
-    AxisBinding, AxisMode, Binding, ControlId, EvalInput, InputKind, InputStart,
-    PhysicalInputEvent, ScratchSettings, SourceId, SourceProfile,
+    AxisBinding, AxisMode, Binding, ControlId, InputKind, InputStart, PhysicalInputEvent,
+    ScratchSettings, SourceId, SourceProfile,
 };
 use sha2::{Digest, Sha256};
 
@@ -158,16 +158,10 @@ fn sample(n_events: usize) -> PlayRecord {
     }
 }
 
-/// A file around `body`, as `encode` writes it, at zstd `level`, in the
-/// newest version.
+/// A file around `body`, as `encode` writes it, at zstd `level`.
 fn wrap(body: &[u8], level: i32) -> Vec<u8> {
-    wrap_as(FORMAT_VERSION, body, level)
-}
-
-/// A file around `body` with `version` in its header.
-fn wrap_as(version: u16, body: &[u8], level: i32) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
-    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.push(1);
     out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&zstd::bulk::compress(body, level).unwrap());
@@ -176,6 +170,35 @@ fn wrap_as(version: u16, body: &[u8], level: i32) -> Vec<u8> {
 
 fn limits() -> DecodeLimits {
     DecodeLimits::default()
+}
+
+#[test]
+fn an_event_takes_at_most_max_event_bytes() {
+    // Source 63, a delta from 0 to i64::MIN (zigzag u64::MAX: 10
+    // bytes), the control tag, control u32::MAX (5) and value i32::MIN
+    // (zigzag 0xFFFF_FFFF: 5).
+    let worst = |kind| PhysicalInputEvent {
+        received: TimeUs(i64::MIN),
+        source: SourceId(63),
+        kind,
+    };
+    let control = InputKind::Control {
+        control: ControlId(u32::MAX),
+        value: i32::MIN,
+    };
+    let len = |kind| {
+        let mut w = Writer::default();
+        write_events(&mut w, TimeUs(0), &[worst(kind)]);
+        // Less the event count.
+        w.0.len() - 1
+    };
+    assert_eq!(len(control), crate::MAX_EVENT_BYTES);
+    assert_eq!(len(InputKind::Disconnected), 12);
+    // The standard limits leave room for 3 Mi worst-case events.
+    assert_eq!(
+        crate::max_record_events(&DecodeLimits::STANDARD),
+        ((64 << 20) - (1 << 20)) / 22
+    );
 }
 
 #[test]
@@ -267,7 +290,8 @@ fn events_of_unknown_sources_are_refused() {
 fn newer_version_is_refused() {
     let file = encode(&sample(10));
     assert!(decode(&file, &limits()).is_ok());
-    for v in [FORMAT_VERSION + 1, u16::MAX, 0] {
+    // Before the first release, older versions are refused too.
+    for v in [FORMAT_VERSION + 1, u16::MAX, 0, FORMAT_VERSION - 1] {
         let mut newer = file.clone();
         newer[4..6].copy_from_slice(&v.to_le_bytes());
         assert_eq!(
@@ -367,8 +391,8 @@ fn section_length_beyond_remaining_bytes_is_an_error() {
     );
 }
 
-/// A small fixed record whose body is pinned by hash.
-fn golden() -> PlayRecord {
+/// The fixed record of [`golden`], before its axes.
+fn golden_base() -> PlayRecord {
     PlayRecord {
         versions: Versions {
             evaluator: 3,
@@ -435,32 +459,15 @@ fn golden() -> PlayRecord {
     }
 }
 
-/// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
-/// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "5d1e1f8a0d86a6a7b2fb64b90adc1e65d5a1e263f999c2c6e5865e04b3e989ed";
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[test]
-fn v1_golden_body() {
-    let rec = golden();
-    let body = body_bytes(&rec);
-    assert_eq!(hex(&Sha256::digest(&body)), GOLDEN_BODY_SHA256);
-    // Another zstd encoding of the same body decodes to the same record.
-    for level in [1, 3, 19] {
-        assert_eq!(
-            decode(&wrap_as(1, &body, level), &limits()),
-            Ok(rec.clone())
-        );
-    }
-}
-
-/// [`golden`] with two axes on the controller, one absolute and one
-/// relative, and a report of each.
-fn golden_v2() -> PlayRecord {
-    let mut rec = golden();
+/// A small fixed record whose body is pinned by hash: two sources, the
+/// controller with two axes, one absolute and one relative, and a report
+/// of each.
+fn golden() -> PlayRecord {
+    let mut rec = golden_base();
     let axis = |control, l, mode, press, hold, release| AxisBinding {
         control: ControlId(control),
         lane: lane(l),
@@ -480,62 +487,21 @@ fn golden_v2() -> PlayRecord {
     rec
 }
 
-/// SHA-256 of `body_bytes(&golden_v2())`, computed by the same separate
-/// encoder, which also gives [`GOLDEN_BODY_SHA256`] for [`golden`].
-const GOLDEN_V2_BODY_SHA256: &str =
-    "88a38219c9fc30e02d006da695cd54113410336a241f0181673d5e740ad77edf";
+/// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
+/// written from the layout in the crate documentation.
+const GOLDEN_BODY_SHA256: &str = "88a38219c9fc30e02d006da695cd54113410336a241f0181673d5e740ad77edf";
 
 #[test]
-fn v2_golden_body() {
-    let rec = golden_v2();
-    let file = encode(&rec);
-    assert_eq!(file[4..6], 2_u16.to_le_bytes());
-    let body = body_bytes(&rec);
-    assert_eq!(hex(&Sha256::digest(&body)), GOLDEN_V2_BODY_SHA256);
-    assert_eq!(decode(&file, &limits()), Ok(rec.clone()));
-    // A version 1 header over the same body reads no axes, so the body
-    // does not parse.
-    assert!(decode(&wrap_as(1, &body, 3), &limits()).is_err());
-}
-
-#[test]
-fn v1_logs_still_decode() {
-    // A record without axes is written as version 1, byte for byte the
-    // pinned version 1 body, and reads back with no axes.
+fn golden_body() {
     let rec = golden();
     let file = encode(&rec);
-    assert_eq!(file[4..6], 1_u16.to_le_bytes());
-    assert_eq!(hex(&Sha256::digest(body_bytes(&rec))), GOLDEN_BODY_SHA256);
-    let decoded = decode(&file, &limits()).unwrap();
-    assert!(
-        decoded
-            .devices
-            .sources
-            .iter()
-            .all(|s| s.profile.axes.is_empty())
-    );
-    assert_eq!(decoded, rec);
-
-    // It re-evaluates as before: a scratch tap at the keyboard's press
-    // (evaluation 997.5 ms) and a key 7 tap at the controller's (1000.3 ms),
-    // up to the finalized watermark.
-    let chart = ChartBuilder::new(150_000)
-        .tap(lane(0), TimeUs(997_500))
-        .tap(lane(7), TimeUs(1_000_300))
-        .build()
-        .unwrap();
-    let evaluate = |r: &PlayRecord| {
-        let input = EvalInput {
-            events: r.events.clone(),
-            device: r.devices.profile(),
-            start: r.start.clone(),
-            finalized: Some(r.status.finalized),
-        };
-        eval::evaluate(&chart, &input, &rules::custom()).unwrap()
-    };
-    let before = evaluate(&rec);
-    assert_eq!(before.tally.counts.perfect, 2);
-    assert_eq!(evaluate(&decoded), before);
+    assert_eq!(file[4..6], FORMAT_VERSION.to_le_bytes());
+    let body = body_bytes(&rec);
+    assert_eq!(hex(&Sha256::digest(&body)), GOLDEN_BODY_SHA256);
+    // Another zstd encoding of the same body decodes to the same record.
+    for level in [1, 3, 19] {
+        assert_eq!(decode(&wrap(&body, level), &limits()), Ok(rec.clone()));
+    }
 }
 
 #[test]
@@ -558,7 +524,7 @@ fn malformed_axes_are_refused() {
         w.raw(&[0, 0]);
         w.0
     };
-    let mut sections = split_sections(&body_bytes(&golden_v2()));
+    let mut sections = split_sections(&body_bytes(&golden()));
     let decode_with = |sections: &mut Vec<Vec<u8>>, payload: Vec<u8>| {
         sections[4] = payload;
         decode(&wrap(&join_sections(sections), 3), &limits())
@@ -596,7 +562,7 @@ fn records_binding_more_than_the_limits_are_refused() {
         lane: lane(1),
     };
     let record = |sources: usize, keys: u32, axes: u32| {
-        let mut rec = golden_v2();
+        let mut rec = golden();
         rec.events.clear();
         rec.start.held.clear();
         let mut s = rec.devices.sources[1].clone();
