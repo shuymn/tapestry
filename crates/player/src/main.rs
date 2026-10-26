@@ -486,6 +486,7 @@ fn rig<'a>(
         figures: None,
         generation: 0,
         queue: game::QueueChoice::new(device.queued_periods),
+        queue_most: None,
         queued_now: None,
         queue_line: None,
         #[cfg(feature = "dev-tools")]
@@ -559,8 +560,9 @@ fn play(
     let (audio, opened) = audio_side::spawn(
         move || {
             let out = audio::WasapiShared::open(clock).map_err(|e| format!("audio: {e}"))?;
-            let queued = out.grant().queue_periods;
-            Ok((out, Some(queued)))
+            let g = out.grant();
+            let (queued, most) = (g.queue_periods, g.max_queue_periods);
+            Ok((out, Some(queued), Some(most)))
         },
         |_| {},
     )?;
@@ -640,6 +642,7 @@ fn play(
         clock,
         probes.steps.0,
     );
+    rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run(&mut loaded, &mut rig).map_err(|e| e.to_string());
     rig.shut_down();
@@ -675,7 +678,7 @@ fn scripted(
         move || {
             let out = dev::recording_output(clock, 60);
             let queued = out.queued_periods();
-            Ok((out, Some(queued)))
+            Ok((out, Some(queued), Some(audio::MAX_QUEUE_PERIODS)))
         },
         dev::report_audio,
     )?;
@@ -731,6 +734,7 @@ fn scripted(
     );
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.auto_retries = auto_retries;
+    rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run(&mut loaded, &mut rig).map_err(|e| e.to_string());
     rig.shut_down();

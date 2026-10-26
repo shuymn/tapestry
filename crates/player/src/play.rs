@@ -86,6 +86,8 @@ pub struct PlayerRig<'a> {
     pub generation: u64,
     /// The periods the next play queues on the audio output.
     pub queue: game::QueueChoice,
+    /// The most periods the output's queue holds, when it says.
+    pub queue_most: Option<u32>,
     /// The periods the output keeps for the current play, when it says.
     pub queued_now: Option<u32>,
     /// The last ended play's audio queue, for its end screen.
@@ -138,20 +140,22 @@ impl PlayerRig<'_> {
             .control
             .counters()
             .steady_underruns(self.generation);
-        let raised = self.queue.play_ended(steady);
+        self.queue.play_ended(steady);
+        // What the next play will keep: never more than the output holds.
+        let next = end_screen::next_queue(self.queue.periods(), self.queue_most);
         let line = QueueLine {
             played: self.queued_now,
             steady_underruns: steady,
-            next: self.queue.periods(),
+            next,
         };
         println!(
             "audio: queued {} periods, {steady} underruns after the countdown{}",
             self.queued_now
                 .map_or_else(|| "an unknown number of".to_owned(), |q| q.to_string()),
-            if raised {
-                format!("; the next play queues {}", self.queue.periods())
-            } else {
+            if self.queued_now == Some(next) {
                 String::new()
+            } else {
+                format!("; the next play queues {next}")
             }
         );
         self.queue_line = Some(line);
@@ -436,7 +440,7 @@ impl Rig for PlayerRig<'_> {
         let queue = self.queue_line.unwrap_or(QueueLine {
             played: self.queued_now,
             steady_underruns: 0,
-            next: self.queue.periods(),
+            next: end_screen::next_queue(self.queue.periods(), self.queue_most),
         });
         self.end_lines = Some(end_screen::lines(
             report,

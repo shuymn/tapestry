@@ -26,6 +26,13 @@ pub struct QueueLine {
     pub next: u32,
 }
 
+/// The periods the next play will actually queue: the choice, as far as the
+/// output's queue holds (`most`, when it says), so the end screen never
+/// promises more than the output can keep.
+pub fn next_queue(choice: u32, most: Option<u32>) -> u32 {
+    most.map_or(choice, |m| choice.min(m))
+}
+
 /// The audio queue line: what the play queued, its underruns after the
 /// countdown, and the next play's queue when it differs.
 pub fn queue_line(q: QueueLine) -> String {
@@ -302,6 +309,25 @@ mod tests {
         assert_eq!(
             line(None, 1, 3),
             "AUDIO QUEUE N/A PERIODS, 1 UNDERRUNS AFTER THE COUNTDOWN: 3 FROM THE NEXT PLAY"
+        );
+    }
+
+    /// A raised choice the output cannot hold is not promised: a buffer of
+    /// two periods keeps showing two.
+    #[test]
+    fn the_next_queue_is_what_the_output_holds() {
+        assert_eq!(super::next_queue(3, Some(2)), 2);
+        assert_eq!(super::next_queue(3, Some(3)), 3);
+        assert_eq!(super::next_queue(2, Some(3)), 2);
+        assert_eq!(super::next_queue(3, None), 3);
+        let line = super::queue_line(super::QueueLine {
+            played: Some(2),
+            steady_underruns: 9,
+            next: super::next_queue(3, Some(2)),
+        });
+        assert_eq!(
+            line,
+            "AUDIO QUEUE 2 PERIODS, 9 UNDERRUNS AFTER THE COUNTDOWN"
         );
     }
 
