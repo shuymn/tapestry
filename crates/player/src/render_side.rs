@@ -484,7 +484,6 @@ mod tests {
         Box::new(PlayMeasure {
             generation: 1,
             origin,
-            countdown_at: origin,
             load_from: TimeUs(0),
             retry: false,
             underruns: None,

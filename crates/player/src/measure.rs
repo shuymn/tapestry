@@ -73,9 +73,6 @@ pub struct PlayMeasure {
     pub generation: u64,
     /// Where chart time 0 lies on the clock.
     pub origin: TimeUs,
-    /// When the countdown started (recording opened), on the clock: the
-    /// start of the play span.
-    pub countdown_at: TimeUs,
     /// What the load time runs from: the process start (0) for the first
     /// play, the retry's receipt for a retry.
     pub load_from: TimeUs,
@@ -107,7 +104,9 @@ pub struct Figures {
     pub render_cpu: Option<Summary>,
     /// Audio underruns during the play.
     pub underruns: Option<u64>,
-    /// The play span `[countdown start, end)` on the clock.
+    /// The play span on the clock, from chart time 0 to the play's end.
+    /// The countdown is left out: a display capture misses a swap chain's
+    /// first present, which is the countdown's first frame.
     pub span: (TimeUs, TimeUs),
     /// Presents the game issued in the span.
     pub presents: u64,
@@ -117,8 +116,25 @@ pub struct Figures {
     /// Logic step samples the full queue refused: input to judgment and
     /// finalization delay are missing that many.
     pub steps_dropped: u64,
-    /// The display's refresh rate, mHz, when known.
-    pub refresh_mhz: Option<u32>,
+    /// One refresh, ns: measured from the play's accepted frame statistics
+    /// (the sync times over the refreshes between them), else from the
+    /// monitor's reported rate, which may be rounded to a whole hertz.
+    pub refresh_period_ns: Option<i64>,
+}
+
+/// Refreshes two syncs must lie apart before their times give the period.
+const PERIOD_SPAN: u32 = 60;
+
+/// One refresh in ns from two syncs `(QPC ticks, refresh count)` at
+/// `freq` ticks a second, once they lie [`PERIOD_SPAN`] refreshes apart.
+fn measured_period_ns(first: (i64, u32), last: (i64, u32), freq: i64) -> Option<i64> {
+    let refreshes = last.1.wrapping_sub(first.1);
+    if !(PERIOD_SPAN..=u32::MAX / 2).contains(&refreshes) || freq <= 0 {
+        return None;
+    }
+    let ns =
+        i128::from(last.0 - first.0) * 1_000_000_000 / (i128::from(freq) * i128::from(refreshes));
+    i64::try_from(ns).ok().filter(|&ns| ns > 0)
 }
 
 /// One overlay line in a fixed buffer.
@@ -270,6 +286,10 @@ pub struct Measure {
     /// The refresh rate, mHz, and one refresh in QPC ticks, when known.
     refresh_mhz: Option<u32>,
     period_qpc: Option<i64>,
+    /// The play's first and latest accepted syncs: QPC ticks and refresh
+    /// count.
+    first_sync: Option<(i64, u32)>,
+    last_sync: Option<(i64, u32)>,
     audio: Option<AudioInfo>,
     steps: rtrb::Consumer<StepSample>,
     sounds: rtrb::Consumer<AudioProbe>,
@@ -316,6 +336,8 @@ impl Measure {
             clock,
             refresh_mhz: refresh_mhz.filter(|&m| m > 0),
             period_qpc,
+            first_sync: None,
+            last_sync: None,
             audio,
             steps,
             sounds,
@@ -351,6 +373,8 @@ impl Measure {
         self.filter.reset();
         self.refreshes.clear();
         self.last_present = None;
+        self.first_sync = None;
+        self.last_sync = None;
         self.load_ms = None;
         self.presents = 0;
         self.recent = [i64::MIN; RECENT];
@@ -418,7 +442,7 @@ impl Measure {
             .as_ref()
             .and_then(|p| p.underruns.as_ref())
             .map(|(u, at_start)| u.get().saturating_sub(*at_start));
-        let countdown = self.play.as_ref().map_or(TimeUs(0), |p| p.countdown_at);
+        let start = self.play.as_ref().map_or(TimeUs(0), |p| p.origin);
         let after_end = self.recent.iter().filter(|&&t| t >= end.0).count() as u64;
         Figures {
             input_to_judgment: self.input_to_judgment.summary(),
@@ -430,13 +454,17 @@ impl Measure {
             refreshes: self.refreshes.count(),
             render_cpu: self.render_cpu.summary(),
             underruns,
-            span: (countdown, end),
+            span: (start, end),
             presents: self.presents.saturating_sub(after_end),
             allocations: allocations()
                 .zip(self.alloc_base)
                 .map(|(now, base)| std::array::from_fn(|i| now[i].saturating_sub(base[i]))),
             steps_dropped: 0,
-            refresh_mhz: self.refresh_mhz,
+            refresh_period_ns: self
+                .first_sync
+                .zip(self.last_sync)
+                .and_then(|(f, l)| measured_period_ns(f, l, self.clock.frequency().hz()))
+                .or_else(|| self.refresh_mhz.map(|m| 1_000_000_000_000 / i64::from(m))),
         }
     }
 
@@ -476,9 +504,11 @@ impl Measure {
         if self.load_ms.is_none() {
             self.load_ms = Some((d.at.0 - load_from.0) / 1_000);
         }
-        self.presents += 1;
-        self.recent[self.recent_next] = d.at.0;
-        self.recent_next = (self.recent_next + 1) % RECENT;
+        if d.at >= origin {
+            self.presents += 1;
+            self.recent[self.recent_next] = d.at.0;
+            self.recent_next = (self.recent_next + 1) % RECENT;
+        }
         let Some(count) = d.timing.present_count else {
             // No present count to pair a sample with: N/A.
             self.on_screen.finish();
@@ -493,7 +523,16 @@ impl Measure {
         self.on_screen.presented(count);
         if let Some(s) = self.filter.accept(d.statistics) {
             self.refreshes.accepted(&s);
-            if let Some(period) = self.period_qpc {
+            let sync = (s.sync_qpc_time, s.sync_refresh_count);
+            let first = *self.first_sync.get_or_insert(sync);
+            self.last_sync = Some(sync);
+            // The measured period once the syncs span enough refreshes; the
+            // monitor's reported rate may be rounded to a whole hertz.
+            let refreshes = sync.1.wrapping_sub(first.1);
+            let measured = (PERIOD_SPAN..=u32::MAX / 2)
+                .contains(&refreshes)
+                .then(|| (sync.0 - first.0) / i64::from(refreshes));
+            if let Some(period) = measured.or(self.period_qpc) {
                 let display = self.clock.from_qpc(display_qpc(&s, period));
                 self.on_screen.sample(s.present_count, display.0 - origin.0);
             }
@@ -681,7 +720,24 @@ mod frame_tests {
     use render::measure::FrameStatistics;
     use rules::Judgment;
 
-    use super::{Drawn, Measure, PlayMeasure, StepSample};
+    use super::{Drawn, Measure, PlayMeasure, StepSample, measured_period_ns};
+
+    /// 59.951 Hz at a 10 MHz QPC: 600 refreshes take 100 082 567 ticks,
+    /// 16 680 427 ns each (by hand: 100 082 567 × 100 ÷ 600, floored).
+    /// Syncs closer than 60 refreshes give no period.
+    #[test]
+    fn the_refresh_period_is_measured_from_syncs() {
+        let f = 10_000_000;
+        assert_eq!(
+            measured_period_ns((5_000, 1_000), (5_000 + 100_082_567, 1_600), f),
+            Some(16_680_427)
+        );
+        assert_eq!(measured_period_ns((0, 1_000), (980_000, 1_059), f), None);
+        assert_eq!(
+            measured_period_ns((0, 1_000), (1_000_000, 1_060), f),
+            Some(1_666_666)
+        );
+    }
 
     fn judged(seq: u64, origin: i64) -> JudgeEvent {
         JudgeEvent {
@@ -737,7 +793,6 @@ mod frame_tests {
         m.start(PlayMeasure {
             generation: 3,
             origin,
-            countdown_at: TimeUs(4_000_000),
             load_from: TimeUs(0),
             retry: false,
             underruns: None,
@@ -782,7 +837,7 @@ mod frame_tests {
         assert_eq!((cpu.count, cpu.max), (2, 500));
         // The second present came after the end.
         assert_eq!(fig.presents, 1);
-        assert_eq!(fig.span, (TimeUs(4_000_000), TimeUs(5_094_000)));
+        assert_eq!(fig.span, (origin, TimeUs(5_094_000)));
         // Taken once: nothing more counts.
         assert_eq!(m.finish(TimeUs(5_200_000)), None);
     }

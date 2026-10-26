@@ -6,7 +6,8 @@
 //! audio engine plays into a recording of a simulated device paced by the
 //! clock, and the renderer draws offscreen on WARP. `--dev-frames <dir>`
 //! also writes a countdown frame, a play frame and the end screen there as
-//! PNG files.
+//! PNG files. `--dev-overlay` shows the measurement overlay from the
+//! start.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -55,6 +56,8 @@ pub struct Options {
     pub adjust_on_end: Vec<game::Adjust>,
     /// The chart time, ms, at which `adjust_in_play` is pressed.
     pub adjust_at_ms: i64,
+    /// Show the measurement overlay from the start, without its key.
+    pub overlay: bool,
 }
 
 impl Options {
@@ -70,6 +73,10 @@ impl Options {
     ) -> Result<bool, String> {
         if arg == "--dev-auto-retry" {
             self.auto_retry = true;
+            return Ok(true);
+        }
+        if arg == "--dev-overlay" {
+            self.overlay = true;
             return Ok(true);
         }
         if arg == "--dev-adjust-at" {

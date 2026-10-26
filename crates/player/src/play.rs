@@ -282,7 +282,6 @@ impl Rig for PlayerRig<'_> {
         let measure = PlayMeasure {
             generation: self.generation,
             origin,
-            countdown_at,
             load_from: self.retry_from.unwrap_or(TimeUs(0)),
             retry: self.retry_from.is_some(),
             underruns: Some((underruns.clone(), underruns.get())),

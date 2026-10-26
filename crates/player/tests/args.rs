@@ -77,6 +77,7 @@ fn dev_scripted_input_is_unknown_without_feature() {
     );
     assert_unknown(&["play", "a.bms", "--dev-frames", "x"], "--dev-frames");
     assert_unknown(&["play", "a.bms", "--dev-auto-retry"], "--dev-auto-retry");
+    assert_unknown(&["play", "a.bms", "--dev-overlay"], "--dev-overlay");
     assert_unknown(&["--dev-adjust-at", "1"], "--dev-adjust-at");
     for opt in ["--dev-adjust-at", "--dev-adjust", "--dev-adjust-end"] {
         assert_unknown(&["play", "a.bms", opt, "1"], opt);
@@ -121,6 +122,7 @@ fn dev_options_are_taken_with_the_feature() {
         vec!["--dev-scripted-input".as_ref(), log.as_os_str()],
         vec!["--dev-frames".as_ref(), dir.path().as_os_str()],
         vec!["--dev-auto-retry".as_ref()],
+        vec!["--dev-overlay".as_ref()],
         vec!["--dev-adjust-at".as_ref(), "1".as_ref()],
         vec!["--dev-adjust".as_ref(), "F1".as_ref()],
         vec!["--dev-adjust-end".as_ref(), "F1".as_ref()],

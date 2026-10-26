@@ -221,7 +221,8 @@ fn ms_to_us(ms: f64) -> i64 {
 ///
 /// On a bad row the rows read so far come back with the error.
 pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>, Option<PmError>) {
-    let mut lines = text.lines();
+    // PresentMon 2.6 starts its file with a byte order mark.
+    let mut lines = text.strip_prefix('\u{feff}').unwrap_or(text).lines();
     let Some(header) = lines.next() else {
         return (Vec::new(), Some(PmError::BadRow(1)));
     };
@@ -278,10 +279,10 @@ pub struct PlayCapture {
     pub never_displayed: u64,
 }
 
-/// Counts the play span of `fig` over `frames` at refresh rate
-/// `refresh_mhz` and k = 1. The capture covers the play only when it holds
+/// Counts the play span of `fig` over `frames` at one refresh of
+/// `period_ns` and k = 1. The capture covers the play only when it holds
 /// as many presents in the span as the game issued.
-pub fn count_play(frames: &[PmFrame], fig: &Figures, refresh_mhz: u32) -> PlayCapture {
+pub fn count_play(frames: &[PmFrame], fig: &Figures, period_ns: i64) -> PlayCapture {
     let (a, b) = (fig.span.0.0, fig.span.1.0);
     let in_span: Vec<&PmFrame> = frames
         .iter()
@@ -295,7 +296,6 @@ pub fn count_play(frames: &[PmFrame], fig: &Figures, refresh_mhz: u32) -> PlayCa
         .map(|us| us * 1_000)
         .collect();
     displayed.sort_unstable();
-    let period_ns = 1_000_000_000_000 / i64::from(refresh_mhz.max(1));
     let covered = presents > 0 && presents == fig.presents;
     PlayCapture {
         count: count_span(&displayed, (a * 1_000, b * 1_000), period_ns, 1, covered),
@@ -304,10 +304,15 @@ pub fn count_play(frames: &[PmFrame], fig: &Figures, refresh_mhz: u32) -> PlayCa
     }
 }
 
-/// The capture's figures as a TOML table, numbers only (N/A left out).
-pub fn to_toml(c: &PlayCapture, refresh_mhz: u32) -> String {
+/// The capture's figures as a TOML table, numbers only (N/A left out),
+/// with the game's own present count and the period they were counted at.
+pub fn to_toml(c: &PlayCapture, fig: &Figures, period_ns: i64) -> String {
     let mut out = String::from("\n[presentmon]\n");
-    let _ = writeln!(out, "refresh_mhz = {refresh_mhz}\nk = 1");
+    let _ = writeln!(
+        out,
+        "refresh_period_ns = {period_ns}\nk = 1\ngame_presents = {}",
+        fig.presents
+    );
     if let Some(s) = c.count {
         let _ = writeln!(
             out,
@@ -358,6 +363,11 @@ mod tests {
         );
         let (frames, err) = parse(&csv, "tapestry.exe", to_us);
         assert_eq!(err, None);
+        // PresentMon 2.6 writes a byte order mark first.
+        assert_eq!(
+            parse(&format!("\u{feff}{csv}"), "tapestry.exe", to_us),
+            (frames.clone(), None)
+        );
         // 166 667 ticks = 16 666 µs, plus 1.2 ms of CPU work, then
         // displayed 4 ms later; the NA row is kept, never displayed.
         assert_eq!(
@@ -438,13 +448,13 @@ mod tests {
         frames[6].display_us = None;
         // Span [2 ms, 30 ms): presents 1 to 7, the predecessor shown at 1
         // ms, the successor at 33 ms.
-        let c = count_play(&frames, &figures((2_000, 30_000), 7), 250_000);
+        let c = count_play(&frames, &figures((2_000, 30_000), 7), 4_000_000);
         assert_eq!((c.presents, c.never_displayed), (7, 1));
         let s = c.count.expect("counted");
         // Grid 1 + 4j ms inside [2, 30): 5, 9, ..., 29.
         assert_eq!((s.lost, s.longest, s.off_grid, s.expected), (1, 1, 0, 7));
         // The game issued one more present than the capture holds.
-        let c: PlayCapture = count_play(&frames, &figures((2_000, 30_000), 8), 250_000);
+        let c: PlayCapture = count_play(&frames, &figures((2_000, 30_000), 8), 4_000_000);
         assert_eq!(c.count, None);
     }
 

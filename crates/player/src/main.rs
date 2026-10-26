@@ -124,6 +124,9 @@ fn main() -> ExitCode {
         let auto = u32::from(dev_options.auto_retry);
         let frames = dev_options.frames.take();
         return report(scripted(&chart, &log, frames, auto, clock, |rig| {
+            if dev_options.overlay {
+                rig.controls.toggle_overlay();
+            }
             rig.adjust_in_play = dev_options.adjust_in_play;
             rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
             rig.adjust_on_end = dev_options.adjust_on_end;
@@ -136,6 +139,9 @@ fn main() -> ExitCode {
                 _rig.auto_retries = 1;
                 _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
             }
+            if dev_options.overlay {
+                _rig.controls.toggle_overlay();
+            }
             _rig.adjust_in_play = dev_options.adjust_in_play;
             _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
             _rig.adjust_on_end = dev_options.adjust_on_end;
@@ -143,9 +149,10 @@ fn main() -> ExitCode {
     }))
 }
 
-/// `tapestry measure play <chart>` (dev-tools): the play under a
+/// `tapestry measure play <chart>` (dev-tools): one play under a
 /// PresentMon capture, its counts added to each saved play's
-/// `.measure.toml`.
+/// `.measure.toml`; the run quits after the end screen shows (retry and
+/// quit still work during the play).
 #[cfg(feature = "dev-tools")]
 fn measure_command(mut args: impl Iterator<Item = OsString>, clock: QpcClock) -> ExitCode {
     const MEASURE_USAGE: &str = "usage: tapestry measure play <chart.bms>";
@@ -189,7 +196,11 @@ fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
     let capture = presentmon::Capture::start(&exe, &process, &csv, &log)?;
     let plays = play::MeasuredPlays::default();
     let kept = Arc::clone(&plays);
-    let ran = play(chart, clock, move |rig| rig.measured_plays = Some(kept));
+    // One play: the run quits once its end screen has shown.
+    let ran = play(chart, clock, move |rig| {
+        rig.measured_plays = Some(kept);
+        rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+    });
     let stopped = capture.stop();
     ran?;
     stopped?;
@@ -200,11 +211,11 @@ fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
     }
     let plays = plays.lock().map_err(|_| "the measured plays were lost")?;
     for (record, fig) in plays.iter() {
-        let Some(refresh) = fig.refresh_mhz else {
+        let Some(period) = fig.refresh_period_ns else {
             eprintln!("measure: no refresh rate for {}", record.display());
             continue;
         };
-        let counted = presentmon::count_play(&frames, fig, refresh);
+        let counted = presentmon::count_play(&frames, fig, period);
         println!(
             "measure: {}: presentmon {:?}, {} presents, {} never displayed",
             record.display(),
@@ -214,7 +225,7 @@ fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
         );
         let path = measure::measure_path(record);
         let mut toml = std::fs::read_to_string(&path).unwrap_or_default();
-        toml.push_str(&presentmon::to_toml(&counted, refresh));
+        toml.push_str(&presentmon::to_toml(&counted, fig, period));
         game::write_atomic(&path, toml.as_bytes())
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
