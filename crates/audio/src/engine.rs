@@ -124,6 +124,24 @@ impl AudioEngine {
         voices: usize,
         schedule_log: usize,
     ) -> Result<Self, EngineError> {
+        Self::with_schedule(bank, bgm.to_vec(), rate, period, voices, schedule_log)
+    }
+
+    /// [`new`](Self::new) with the schedule moved in rather than copied:
+    /// for a schedule built for this engine alone, such as an autoplay
+    /// session's BGM merged with its key sounds.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new).
+    pub fn with_schedule(
+        bank: Arc<SoundBank>,
+        bgm: Vec<BgmEvent>,
+        rate: u32,
+        period: u32,
+        voices: usize,
+        schedule_log: usize,
+    ) -> Result<Self, EngineError> {
         if rate == 0 || period == 0 {
             return Err(EngineError::ZeroRateOrPeriod);
         }
@@ -138,7 +156,7 @@ impl AudioEngine {
             mixer: Mixer::new(voices, rate),
             clock: MixClock::new(rate, period),
             period_us: i64::from(period) * 1_000_000 / i64::from(rate),
-            bgm: bgm.to_vec(),
+            bgm,
             next_bgm: 0,
             output_offset: TimeUs(0),
             play_origin: TimeUs(0),

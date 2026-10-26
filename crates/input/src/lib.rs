@@ -10,7 +10,10 @@
 //! The [`FocusGate`] keeps input received after focus loss out of the log.
 //!
 //! [`ScriptedInput`] feeds a scenario or a recorded log through the same
-//! path, and [`autoplay`] makes the inputs that hit every note of a chart.
+//! path. [`autoplay`] makes the inputs that hit every note of a chart, and
+//! [`AutoplayInput`] feeds them on the input thread, submitting every due
+//! event before its source publishes past it (the queue is sized for the
+//! whole stream; an overflow marks the recording incomplete).
 //!
 //! On Windows, the input thread (`InputThread`) receives keyboards and
 //! HID game controllers through Raw Input and stamps each batch with the
@@ -25,6 +28,7 @@
 #![cfg_attr(not(windows), forbid(unsafe_code))]
 #![cfg_attr(windows, deny(unsafe_code))]
 
+mod autoplay;
 mod capture;
 mod gate;
 pub mod hid;
@@ -39,16 +43,17 @@ mod win;
 
 use bms_model::TimeUs;
 
+pub use autoplay::{AUTOPLAY_DEVICE, AutoplayInput, TimeOverflow, autoplay, autoplay_count};
 pub use capture::{Capture, Watched};
 pub use gate::{Admit, DeviceId, FocusGate, FocusLatch, Packet};
 pub use queue::{Overflow, SourceReader, SourceWriter, source_queue};
-pub use scripted::{Action, ScriptItem, ScriptedInput, TimeOverflow, autoplay, declared_axes};
+pub use scripted::{Action, ScriptItem, ScriptedInput, declared_axes};
 pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, SourceSet};
 pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
 #[cfg(windows)]
 pub use win::{
-    CollectionInfo, InputError, InputThread, QpcClock, WakeReport, controller_layouts, hid_usages,
-    keyboard_target,
+    ClockedThread, CollectionInfo, InputError, InputThread, QpcClock, WakeReport,
+    controller_layouts, hid_usages, keyboard_target,
 };
 
 /// Something that delivers input to a [`SourceSet`], such as a script in

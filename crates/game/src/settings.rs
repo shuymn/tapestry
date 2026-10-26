@@ -287,6 +287,18 @@ impl KeyConfig {
         Ok(())
     }
 
+    /// The generated keyboard's key config in an autoplay session
+    /// (design.md "Autoplay"): the default keyboard lanes, and no retry or
+    /// quit binding, which the window's keys keep doing.
+    #[must_use]
+    pub fn autoplay() -> Self {
+        Self {
+            retry: None,
+            quit: None,
+            ..DeviceSettings::default().keyboard
+        }
+    }
+
     /// Every recorded control: the lanes and the system controls.
     #[must_use]
     pub fn recorded(&self) -> Vec<ControlId> {
