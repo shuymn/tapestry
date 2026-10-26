@@ -3,7 +3,7 @@ name = "game"
 version = "0.0.0"
 description = "Game core: the logic step, its outputs, the session and its extension points, settings, and the headless runner."
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 

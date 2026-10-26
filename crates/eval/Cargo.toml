@@ -3,7 +3,7 @@ name = "eval"
 version = "0.0.0"
 description = "Pure evaluator: (chart, input log, preset) to judgment event stream."
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 publish.workspace = true
 
