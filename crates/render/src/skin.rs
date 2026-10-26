@@ -25,6 +25,9 @@ pub struct FrameInput<'a> {
     pub effects: &'a [JudgeEvent],
     /// Index into [`PlayView::gauges`] of the gauge to show.
     pub gauge: usize,
+    /// Lines of the measurement overlay (D11), drawn over the play; empty
+    /// when it is hidden.
+    pub overlay: &'a [&'a str],
 }
 
 impl FrameInput<'_> {

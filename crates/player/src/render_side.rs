@@ -335,6 +335,7 @@ impl Run {
                         view: side.view(),
                         effects: &effects,
                         gauge: *gauge,
+                        overlay: &[],
                     };
                     let drawn = screen.frame(&f).map(|presented| (presented, Some(now)));
                     // The first frame that reached the screen.

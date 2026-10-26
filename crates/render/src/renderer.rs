@@ -5,10 +5,12 @@ use std::time::{Duration, Instant};
 
 use bms_model::Chart;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::{self, AdapterChoice, Gpu};
+use crate::measure::FrameStatistics;
 use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::text_screen;
 use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
@@ -115,6 +117,10 @@ pub struct FrameTiming {
     /// Whether the frame reached the target; `false` when the swap chain
     /// image could not be acquired.
     pub presented: bool,
+    /// The swap chain's present count of this frame, read right after its
+    /// present; `None` offscreen, for a frame not presented, or when the
+    /// call failed. It pairs the frame with its frame statistics (D11).
+    pub present_count: Option<u32>,
 }
 
 struct Window {
@@ -123,6 +129,8 @@ struct Window {
     /// The swap chain's frame latency waitable object, as a raw value so
     /// the renderer stays `Send`.
     waitable: Option<usize>,
+    /// The swap chain itself, for its present count and frame statistics.
+    chain: Option<IDXGISwapChain3>,
 }
 
 impl Window {
@@ -130,12 +138,13 @@ impl Window {
         self.surface.configure(device, &self.config);
         // SAFETY: the handle is only read here; it belongs to the swap chain
         // just configured, which lives as long as the surface.
-        self.waitable = unsafe {
-            self.surface
-                .as_hal::<wgpu_hal::api::Dx12>()
-                .and_then(|s| s.waitable_handle())
-                .map(|h| h.0 as usize)
-        };
+        let hal = unsafe { self.surface.as_hal::<wgpu_hal::api::Dx12>() };
+        // SAFETY: as above; the swap chain reference is counted.
+        self.waitable = hal
+            .as_ref()
+            .and_then(|s| unsafe { s.waitable_handle() })
+            .map(|h| h.0 as usize);
+        self.chain = hal.and_then(|s| s.swap_chain());
     }
 }
 
@@ -205,6 +214,7 @@ impl Renderer {
                     surface,
                     config,
                     waitable: None,
+                    chain: None,
                 };
                 w.configure(device);
                 (Output::Window(w), format)
@@ -340,6 +350,7 @@ impl Renderer {
             sprites,
             dropped: self.batch.dropped(),
             presented,
+            present_count: None,
         };
         let acquire = Instant::now();
         let (frame, view) = match &mut self.output {
@@ -401,14 +412,46 @@ impl Renderer {
         }
         queue.submit([encoder.finish()]);
         let cpu = start.elapsed() - acquired;
+        let mut out = timing(cpu, true);
         match frame {
-            Some(t) => queue.present(t),
+            Some(t) => {
+                queue.present(t);
+                out.present_count = self.chain().and_then(|c| {
+                    // SAFETY: a plain query of the live swap chain.
+                    unsafe { c.GetLastPresentCount() }.ok()
+                });
+            }
             None => {
                 // Offscreen: let the device reclaim finished frames.
                 let _ = self.gpu.device().poll(wgpu::PollType::Poll);
             }
         }
-        Ok(timing(cpu, true))
+        Ok(out)
+    }
+
+    fn chain(&self) -> Option<&IDXGISwapChain3> {
+        match &self.output {
+            Output::Window(w) => w.chain.as_ref(),
+            Output::Offscreen { .. } => None,
+        }
+    }
+
+    /// The swap chain's latest DXGI frame statistics (D11; design.md:136),
+    /// raw: `None` offscreen or when the call fails. Pair them with frames
+    /// through [`FrameTiming::present_count`] and filter them with
+    /// [`StatsFilter`](crate::measure::StatsFilter).
+    #[must_use]
+    pub fn frame_statistics(&self) -> Option<FrameStatistics> {
+        let chain = self.chain()?;
+        let mut s = DXGI_FRAME_STATISTICS::default();
+        // SAFETY: the live swap chain writes one struct.
+        unsafe { chain.GetFrameStatistics(&raw mut s) }.ok()?;
+        Some(FrameStatistics {
+            present_count: s.PresentCount,
+            present_refresh_count: s.PresentRefreshCount,
+            sync_refresh_count: s.SyncRefreshCount,
+            sync_qpc_time: s.SyncQPCTime,
+        })
     }
 
     /// The offscreen target's pixels, RGBA8, row by row from the top, after
