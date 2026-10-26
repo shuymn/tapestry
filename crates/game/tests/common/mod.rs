@@ -168,6 +168,29 @@ pub fn left<O: audio::AudioOutput + Wakes>(runner: &Runner<'_, RecordingOutput<O
         .collect()
 }
 
+/// Writes a small self-made BMS chart into `dir` and returns its path: at
+/// 120 BPM (2 s a measure), four lane 1 notes and two lane 2 notes in
+/// measure 1, and a scratch note and a lane 3 long note (`#LNOBJ`) in
+/// measure 2: 4 + 2 + 1 + 1 = 8 judgeable notes.
+pub fn write_bms(dir: &std::path::Path) -> std::path::PathBuf {
+    let text = "#PLAYER 1\n#TITLE generated\n#BPM 120\n#LNOBJ ZZ\n#WAV01 kick.wav\n\
+                #00111:01010101\n#00112:00010001\n#00216:01000000\n#00213:0100ZZ00\n";
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("generated.bms");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// The judgeable notes of `chart`: taps and long-note heads.
+pub fn judgeable(chart: &Chart) -> usize {
+    chart
+        .lanes
+        .iter()
+        .flatten()
+        .filter(|n| !matches!(n.kind, bms_model::NoteKind::Mine { .. }))
+        .count()
+}
+
 /// The frames where sound starts after silence.
 pub fn onsets(left: &[f32]) -> Vec<usize> {
     (1..left.len())

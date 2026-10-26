@@ -15,13 +15,41 @@
 #![forbid(unsafe_code)]
 
 mod logic;
+mod policy;
+mod prepare;
+mod preset;
 mod render;
+mod results;
 mod runner;
+mod save;
+mod session;
+mod settings;
 mod sound;
 
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };
+pub use policy::{
+    DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
+    SessionPolicy,
+};
+pub use prepare::{
+    BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,
+};
+pub use preset::{PresetError, load_preset_toml, preset_to_toml};
 pub use render::{PlayView, RenderSide, RenderSink};
+pub use results::{
+    MIN_OFFSET_SAMPLES, ReEvaluate, ReEvaluationError, RecommendedOffset, ResultContext,
+    ResultExtension, ResultSummary,
+};
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
-pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link};
+pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
+pub use session::{
+    Command, Loaded, Parts, PlayEnd, PlayReport, PlayScript, ReloadError, Session, SessionConfig,
+    SessionError, Settings,
+};
+pub use settings::{
+    DataRoot, DeviceSettings, KeyConfig, LaneKey, PlayerSettings, SettingsError, load_settings,
+    save_settings,
+};
+pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};

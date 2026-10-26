@@ -36,6 +36,19 @@ pub struct ChartRecord {
     pub identity: ChartIdentity,
     /// The seed `#RANDOM` was resolved with.
     pub random_seed: u64,
+    /// The transform applied to the resolved chart before evaluation.
+    pub transform: TransformRecord,
+}
+
+/// A chart transformation (design.md "Extension Boundaries"): which one,
+/// and the version of its rules, so a replay transforms the chart the same
+/// way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransformRecord {
+    /// The transform's id.
+    pub id: String,
+    /// The version of its rules.
+    pub version: u32,
 }
 
 /// The preset a play was evaluated under.

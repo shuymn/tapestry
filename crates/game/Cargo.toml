@@ -1,7 +1,7 @@
 [package]
 name = "game"
 version = "0.0.0"
-description = "Game core: the logic step, its outputs to rendering, and the headless runner."
+description = "Game core: the logic step, its outputs, the session and its extension points, settings, and the headless runner."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,12 +10,19 @@ publish.workspace = true
 [dependencies]
 audio.workspace = true
 bms-model.workspace = true
+bms-parser.workspace = true
 eval.workspace = true
 input.workspace = true
 replay.workspace = true
 rules.workspace = true
 rtrb.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+toml.workspace = true
 triple_buffer.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sha2.workspace = true

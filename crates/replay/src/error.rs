@@ -7,7 +7,7 @@ use std::fmt;
 pub enum Section {
     /// Evaluator, loader and app versions, and the build provenance.
     Versions,
-    /// Chart identity and `#RANDOM` seed and results.
+    /// Chart identity, `#RANDOM` seed and results, and the chart transform.
     Chart,
     /// The preset record.
     Preset,

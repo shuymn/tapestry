@@ -42,6 +42,11 @@ windows = "0.62.2"
 
 # game
 triple_buffer = "9.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+
+# game and xtask
+tempfile = "3.27.0"
 
 # render (Windows only)
 bytemuck = { version = "1.25.2", features = ["derive"] }
@@ -54,7 +59,6 @@ encoding_rs = "0.8.42"
 
 # xtask (dev tooling, never shipped)
 cargo_metadata = "0.23.1"
-tempfile = "3.27.0"
 unicode-normalization = "0.1.26"
 
 # Used by the `cargo xtask` alias (.cargo/config.toml).

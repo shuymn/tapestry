@@ -23,6 +23,8 @@ use crate::logic::EventSink;
 pub struct AudioSink {
     cmds: rtrb::Producer<SoundCmd>,
     dropped: Arc<AtomicU64>,
+    /// Where the play's time 0 lies on the output's timeline.
+    shift: TimeUs,
 }
 
 impl EventSink for AudioSink {
@@ -30,11 +32,12 @@ impl EventSink for AudioSink {
         let JudgeEventKind::PlaySound { sound, .. } = ev.kind else {
             return;
         };
+        // A key sound always comes from a press; the event time stands in
+        // only if an origin is ever missing.
+        let origin = ev.origin.unwrap_or(ev.time);
         let cmd = SoundCmd {
             sound,
-            // A key sound always comes from a press; the event time stands
-            // in only if an origin is ever missing.
-            origin: ev.origin.unwrap_or(ev.time),
+            origin: TimeUs(origin.0.saturating_add(self.shift.0)),
         };
         if self.cmds.push(cmd).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -75,15 +78,23 @@ impl AudioQueue {
 }
 
 /// The link between logic and audio: a command queue holding `capacity`
-/// sounds.
+/// sounds, for a play whose time is the output's.
 #[must_use]
 pub fn audio_link(capacity: usize) -> (AudioSink, AudioQueue) {
+    audio_link_at(capacity, TimeUs(0))
+}
+
+/// [`audio_link`] for a play whose time 0 lies at `origin` on the output's
+/// timeline: each command's origin is moved onto that timeline.
+#[must_use]
+pub fn audio_link_at(capacity: usize, origin: TimeUs) -> (AudioSink, AudioQueue) {
     let (producer, consumer) = rtrb::RingBuffer::new(capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     (
         AudioSink {
             cmds: producer,
             dropped: Arc::clone(&dropped),
+            shift: origin,
         },
         AudioQueue {
             cmds: consumer,
@@ -113,6 +124,11 @@ impl<O: AudioOutput + Wakes> RunnerAudio<O> {
     #[must_use]
     pub fn engine(&self) -> &AudioEngine {
         &self.engine
+    }
+
+    /// The engine, to restart or adjust it between plays.
+    pub(crate) fn engine_mut(&mut self) -> &mut AudioEngine {
+        &mut self.engine
     }
 
     /// The output.
@@ -222,5 +238,23 @@ mod tests {
         // Without an origin, the event time stands in.
         sink.receive(&event(play, None));
         assert_eq!(queue.commands().pop().unwrap().origin, TimeUs(5_000));
+    }
+
+    #[test]
+    fn a_play_away_from_the_output_origin_moves_each_origin_onto_it() {
+        // The play's time 0 is at 2.5 s on the output's timeline.
+        let (mut sink, mut queue) = audio_link_at(2, TimeUs(2_500_000));
+        let play = JudgeEventKind::PlaySound {
+            lane: Lane::SCRATCH,
+            sound: SoundId(3),
+        };
+        sink.receive(&event(play, Some(TimeUs(-4_321))));
+        assert_eq!(
+            queue.commands().pop(),
+            Ok(SoundCmd {
+                sound: SoundId(3),
+                origin: TimeUs(2_495_679)
+            })
+        );
     }
 }

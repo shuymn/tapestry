@@ -8,8 +8,8 @@ use crate::wire::Writer;
 use crate::{
     Arrival, BuildProvenance, ChartRecord, DecodeError, DecodeLimits, DeviceKind, DeviceRecord,
     EndStatus, FORMAT_VERSION, Incomplete, MAGIC, PlayRecord, PlayType, PresetRecord,
-    ReceiveMethod, Section, SourceRecord, Status, Versions, body_bytes, decode, encode,
-    preset_hash, write_events, write_status,
+    ReceiveMethod, Section, SourceRecord, Status, TransformRecord, Versions, body_bytes, decode,
+    encode, preset_hash, write_events, write_status,
 };
 
 fn lane(i: u8) -> Lane {
@@ -93,6 +93,10 @@ fn sample(n_events: usize) -> PlayRecord {
                 random_results: vec![2, 1, 7],
             },
             random_seed: 0x0123_4567_89ab_cdef,
+            transform: TransformRecord {
+                id: "mirror".to_owned(),
+                version: 2,
+            },
         },
         preset: PresetRecord::of(&rules::custom()),
         session_policy: "default".to_owned(),
@@ -149,6 +153,7 @@ fn round_trip_preserves_every_field() {
     assert_eq!(rec.events.len(), 5000);
     assert_eq!(rec.devices.sources.len(), 3);
     assert!(rec.events.iter().any(|e| e.kind == InputKind::Disconnected));
+    assert_eq!(rec.chart.transform.version, 2);
     assert!(rec.status.incomplete.any());
     assert_eq!(decode(&encode(&rec), &limits()), Ok(rec));
 }
@@ -167,12 +172,14 @@ fn extreme_and_empty_values_round_trip() {
     ];
     rec.start.opened_at = TimeUs(i64::MAX);
     rec.status.finalized = TimeUs(i64::MIN);
+    rec.chart.transform.version = u32::MAX;
     assert_eq!(decode(&encode(&rec), &limits()), Ok(rec.clone()));
 
     rec.events.clear();
     rec.arrivals.clear();
     rec.start.held.clear();
     rec.chart.identity.random_results.clear();
+    rec.chart.transform.id.clear();
     rec.devices.sources.truncate(1);
     rec.devices.sources[0].profile.bindings.clear();
     rec.status.incomplete = Incomplete::default();
@@ -346,6 +353,10 @@ fn golden() -> PlayRecord {
                 random_results: vec![3, 1],
             },
             random_seed: 42,
+            transform: TransformRecord {
+                id: "passthrough".to_owned(),
+                version: 4,
+            },
         },
         preset: preset_record(b"canonical preset bytes"),
         session_policy: "default".to_owned(),
@@ -395,7 +406,7 @@ fn golden() -> PlayRecord {
 
 /// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
 /// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "76fb2f3e8da15b092e4359fc07f3a78574bda0cafa48ddbb7a41435fbb49815e";
+const GOLDEN_BODY_SHA256: &str = "5d1e1f8a0d86a6a7b2fb64b90adc1e65d5a1e263f999c2c6e5865e04b3e989ed";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
