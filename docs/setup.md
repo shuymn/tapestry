@@ -94,13 +94,20 @@ PRs created with `GITHUB_TOKEN` do not run CI unattended, so auto-merge would ne
 | Runner | What it does |
 | --- | --- |
 | Windows (label with an explicit OS version) | Production build (pinned to a configuration with `dev-tools` disabled), verifying that development features are not included, rendering image comparison with WARP, Windows tests |
-| Linux | Builds and tests of crates that do not depend on Windows, WASM build, short fuzzing runs, banned-word check, lint fixtures (`cargo xtask check-lints`), dependency checks (`cargo-deny`, `cargo-audit`), tests in the Nix development shell through `scripts/wsl.sh` |
+| Linux | Builds and tests of crates that do not depend on Windows, WASM build, short fuzzing runs, banned-word check, lint fixtures (`cargo xtask check-lints`), dependency checks (`cargo-deny`, `cargo-audit`, `cargo-machete`; "Dependency Checks" below), tests in the Nix development shell through `scripts/wsl.sh` |
 
 - Both runners install tools from the same `mise.lock` (`jdx/mise-action`). Run the install step even after restoring the cache, and verify the Rust version in use.
 - GitHub Actions are pinned by commit SHA.
 - Windows runner images keep being updated even when the version is specified by label. Record the runner image version, the adapter used, and the available features. When an image update changes image comparison results, review the diff images before updating the expected images.
 - On the `windows-2025` runner, a WARP device can be created explicitly (D3D12, `IDXGIFactory4::EnumWarpAdapter`) and a rendered target read back exactly. Verified on image `win25-vs2026 20261021.278.1` (the `windows-2025` label currently maps to the Visual Studio 2026 image): Microsoft Basic Render Driver, driver 10.0.26100.33648, maximum feature level 12_1.
 - Repository settings (merge methods, the `main` rulesets with the required CI checks, allowed Actions, security features) are declared in `.github/infra.yaml`. Change them there and run `mise exec -- gh-infra plan .github/infra.yaml`, then `apply`.
+
+### Dependency Checks
+
+- `cargo deny check` checks the graph configured in `deny.toml` (`[graph] targets`, all features). Its `[advisories]` section makes vulnerabilities, unmaintained and unsound advisories against any crate in that graph, and yanked versions, errors (the pinned cargo-deny defaults check unsound advisories only for direct dependencies of workspace crates and only warn on yanked versions).
+- `cargo audit --deny warnings` checks every package in `Cargo.lock` and fails on any advisory, including warnings. Both tools stay because their scopes and defaults differ.
+- `cargo machete --with-metadata` (Linux CI) fails when a crate declares a dependency whose library name its source files never mention, in every dependency table (normal, dev, build, and target-specific). Findings are reviewed, not removed with `--fix`: remove a dependency that is unused, or list a false positive (a dependency used only through a macro or a feature) in the crate's `[package.metadata.cargo-machete] ignored` with a comment saying why. A package whose library name differs from the package name goes in `[package.metadata.cargo-machete.renamed]`, so plain `cargo machete` agrees. It runs `cargo metadata` without `--locked`, and it exits 0 when it cannot read a manifest, so the CI step also fails on its error lines and on a changed `Cargo.lock`.
+- `.github/workflows/audit.yml` runs `cargo deny check advisories` and `cargo audit --deny warnings` daily, on manual dispatch, and on pull requests that change the workflow or `deny.toml`, so advisories published while the repository is idle are reported. A failed scheduled run notifies the user who last changed the workflow's cron (the owner, under the default Actions notification settings). GitHub disables scheduled workflows in a public repository after 60 days without repository activity and emails the owner before it does; the daily audit covers idle periods up to that limit, and the owner re-enables the workflow from the Actions tab. CI's cargo-deny and cargo-audit steps still run on every push and pull request.
 
 ## Measurement Conditions
 
