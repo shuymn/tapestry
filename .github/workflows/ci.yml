@@ -201,3 +201,18 @@ jobs:
         run: mise exec -- actionlint
       - name: shellcheck
         run: mise exec -- shellcheck scripts/*.sh
+      # Refused before anything is built, so no Rust is needed here.
+      - name: Fuzz durations out of range are refused
+        run: |
+          for seconds in -1 0 0.5 1801; do
+            for args in "run replay_body $seconds" "run-all $seconds"; do
+              set +e
+              # shellcheck disable=SC2086 # split into arguments on purpose
+              scripts/fuzz.sh $args 2> fuzz.err
+              code=$?
+              set -e
+              cat fuzz.err
+              test "$code" -eq 2
+              grep -q "seconds must be a whole number from 1 to 1800: got '$seconds'" fuzz.err
+            done
+          done

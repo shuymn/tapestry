@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: Seconds per target
+        description: Seconds per target (1 to 1800, checked by scripts/fuzz.sh)
         type: number
         default: 900
   pull_request:

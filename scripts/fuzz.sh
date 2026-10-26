@@ -24,6 +24,9 @@ limits=(-timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=2048)
 # printed in full.
 dump_files=4
 dump_bytes=65536
+# The most seconds per target: one target's run must fit in fuzz.yml's
+# 45-minute job with the Nix setup and the build.
+max_seconds=1800
 
 usage() {
   sed -n '5,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
@@ -45,6 +48,15 @@ parse_options() {
       *) echo "unknown option: $1" >&2; usage ;;
     esac
   done
+}
+
+# A whole number of seconds from 1 to $max_seconds: libFuzzer reads -1 as no
+# deadline and 0.5 as 0.
+check_seconds() {
+  if ! [[ "$1" =~ ^[1-9][0-9]{0,5}$ ]] || [ "$1" -gt "$max_seconds" ]; then
+    echo "seconds must be a whole number from 1 to $max_seconds: got '$1'" >&2
+    exit 2
+  fi
 }
 
 need_corpus() {
@@ -181,6 +193,7 @@ case "$command" in
     target=$1 seconds=$2
     shift 2
     is_target "$target" || { echo "unknown target: $target" >&2; usage; }
+    check_seconds "$seconds"
     parse_options "$@"
     need_corpus
     fetch
@@ -191,6 +204,7 @@ case "$command" in
     [ "$#" -ge 1 ] || usage
     seconds=$1
     shift
+    check_seconds "$seconds"
     parse_options "$@"
     need_corpus
     fetch
