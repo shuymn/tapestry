@@ -73,7 +73,7 @@ fn config() -> SessionConfig {
     }
 }
 
-/// Every lane: taps, a chord on lanes 1, 2 and 5 at 1.2 s, long notes on
+/// Every lane: taps, a chord on lanes 1, 2 and 5 at 1.6 s, long notes on
 /// the scratch and lane 3, a mine on lane 4 between its taps, and a
 /// soundless tap on lane 6; three sounds, each note sounded by its lane,
 /// and BGM at 1.0 s and 2.0 s.

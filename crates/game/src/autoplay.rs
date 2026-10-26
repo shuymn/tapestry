@@ -2,8 +2,8 @@
 //! (design.md "Autoplay"): the generated input and the audio schedule with
 //! the key sounds merged into the BGM.
 
-use bms_model::{BgmEvent, Chart, LANE_COUNT, Lane, Note, NoteKind, SoundId, TimeUs};
-use eval::{ControlId, PhysicalInputEvent, SourceProfile};
+use bms_model::{BgmEvent, Chart, LANE_COUNT, Note, NoteKind, SoundId, TimeUs};
+use eval::{ControlId, PhysicalInputEvent};
 use input::TimeOverflow;
 
 use crate::logic::LogicError;
@@ -30,13 +30,13 @@ pub enum AutoplayError {
     /// does not fit the recording reservation, autoplay's own buffers
     /// included.
     #[error("autoplay cannot play this chart")]
-    Plan(#[source] LogicError),
+    Plan(#[from] LogicError),
     /// A note's time is out of the range autoplay can press it in.
     #[error("autoplay cannot play this chart")]
-    Time(#[source] TimeOverflow),
+    Time(#[from] TimeOverflow),
 }
 
-/// The key sounds of `lane` autoplay plays: one per pressed note with a
+/// The key sounds of a lane autoplay plays: one per pressed note with a
 /// sound, at the note's time.
 fn lane_sounds(notes: &[Note]) -> impl Iterator<Item = (TimeUs, SoundId)> + '_ {
     notes
@@ -45,38 +45,28 @@ fn lane_sounds(notes: &[Note]) -> impl Iterator<Item = (TimeUs, SoundId)> + '_ {
         .filter_map(|n| n.sound.map(|s| (n.time, s)))
 }
 
-/// The lanes `profile` binds, as slices of `chart`'s notes; empty for an
-/// unbound lane.
-fn bound_lanes<'c>(chart: &'c Chart, profile: &SourceProfile) -> [&'c [Note]; LANE_COUNT] {
-    let mut lanes: [&[Note]; LANE_COUNT] = [&[]; LANE_COUNT];
-    for (lane, slot) in Lane::all().zip(&mut lanes) {
-        if profile.bindings.iter().any(|b| b.lane == lane) {
-            *slot = chart.lanes.get(lane.index()).map_or(&[], Vec::as_slice);
-        }
-    }
-    lanes
-}
-
 /// How many entries [`schedule`] makes: the chart's BGM events and one key
-/// sound per pressed note with a sound on a lane `profile` binds.
+/// sound per pressed note with a sound. The generated keyboard binds every
+/// lane.
 #[must_use]
-pub fn schedule_len(chart: &Chart, profile: &SourceProfile) -> usize {
-    bound_lanes(chart, profile)
+pub fn schedule_len(chart: &Chart) -> usize {
+    chart
+        .lanes
         .iter()
         .map(|notes| lane_sounds(notes).count())
         .fold(chart.bgm.len(), usize::saturating_add)
 }
 
 /// The audio schedule of an autoplay session: `chart`'s BGM merged in time
-/// order with the key sound of every note autoplay presses with
-/// `profile`'s bindings (taps and long note heads, at the note's time, with
-/// the sound the evaluator plays for an on-time press). At equal times BGM
-/// comes first, then the key sounds in lane order. It is built in a vector
-/// of exactly [`schedule_len`] entries, without sorting.
+/// order with the key sound of every note autoplay presses (taps and long
+/// note heads, at the note's time, with the sound the evaluator plays for
+/// an on-time press). At equal times BGM comes first, then the key sounds
+/// in lane order. It is built in a vector of exactly [`schedule_len`]
+/// entries, without sorting.
 #[must_use]
-pub fn schedule(chart: &Chart, profile: &SourceProfile) -> Vec<BgmEvent> {
-    let mut out = Vec::with_capacity(schedule_len(chart, profile));
-    let mut lanes = bound_lanes(chart, profile).map(lane_sounds);
+pub fn schedule(chart: &Chart) -> Vec<BgmEvent> {
+    let mut out = Vec::with_capacity(schedule_len(chart));
+    let mut lanes = chart.lanes.each_ref().map(|notes| lane_sounds(notes));
     let mut heads: [Option<(TimeUs, SoundId)>; LANE_COUNT] = [None; LANE_COUNT];
     for (head, lane) in heads.iter_mut().zip(&mut lanes) {
         *head = lane.next();
@@ -108,17 +98,5 @@ pub fn schedule(chart: &Chart, profile: &SourceProfile) -> Vec<BgmEvent> {
                 *head = lane.next();
             }
         }
-    }
-}
-
-impl From<LogicError> for AutoplayError {
-    fn from(e: LogicError) -> Self {
-        Self::Plan(e)
-    }
-}
-
-impl From<TimeOverflow> for AutoplayError {
-    fn from(e: TimeOverflow) -> Self {
-        Self::Time(e)
     }
 }

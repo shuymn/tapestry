@@ -614,16 +614,6 @@ impl Loaded {
         }
     }
 
-    /// The generated keyboard's profile.
-    fn generated(&self) -> eval::SourceProfile {
-        let device = self.autoplay_device();
-        eval::SourceProfile {
-            input_offset: TimeUs(device.input_offset_us),
-            bindings: device.keyboard.bindings(DeviceKind::Keyboard),
-            axes: Vec::new(),
-        }
-    }
-
     /// [`plan`](Self::plan) for an autoplay session.
     fn autoplay_plan(
         &self,
@@ -631,9 +621,9 @@ impl Loaded {
         axes: &[Vec<input::hid::AxisCap>],
     ) -> Result<PlayPlan, LogicError> {
         let device = self.autoplay_device().profile(kinds, axes);
-        let generated = self.generated();
+        let generated = generated();
         let inputs = input::autoplay_count(&self.chart, &generated);
-        let schedule = crate::autoplay::schedule_len(&self.chart, &generated);
+        let schedule = crate::autoplay::schedule_len(&self.chart);
         // A profile the evaluator refuses is reported here, before the
         // session makes its stream: autoplay is never admitted unchecked.
         let probe = Evaluator::new(
@@ -675,11 +665,11 @@ impl Loaded {
     /// [`AutoplayError::Time`] for a note too late to press.
     pub fn autoplay(&self) -> Result<Autoplay, AutoplayError> {
         self.autoplay_plan(&[DeviceKind::Keyboard], &[Vec::new()])?;
-        let generated = self.generated();
+        let generated = generated();
         let events = input::autoplay(&self.chart, &generated)?;
         Ok(Autoplay {
             events,
-            schedule: crate::autoplay::schedule(&self.chart, &generated),
+            schedule: crate::autoplay::schedule(&self.chart),
             recorded: KeyConfig::autoplay().recorded(),
         })
     }
@@ -794,6 +784,16 @@ impl Loaded {
             result,
             preset: preset.clone(),
         }
+    }
+}
+
+/// The generated keyboard's profile: the built-in key config and an input
+/// offset of 0.
+fn generated() -> eval::SourceProfile {
+    eval::SourceProfile {
+        input_offset: TimeUs(0),
+        bindings: KeyConfig::autoplay().bindings(DeviceKind::Keyboard),
+        axes: Vec::new(),
     }
 }
 
