@@ -1455,3 +1455,26 @@ fn a_chart_too_large_to_reserve_is_refused_without_inputs() {
         }
     );
 }
+
+#[test]
+fn bms_ingest_leaves_missing_sounds_to_the_sound_table() {
+    let dir = tempfile::tempdir().unwrap();
+    // The loader only resolves the path; the bytes need not be audio.
+    fs::write(dir.path().join("kick.wav"), b"RIFF").unwrap();
+    let text =
+        "#BPM 120\n#WAV01 kick.wav\n#WAV02 snare.wav\n#WAV03 hat.wav\n#FOO 1\n#00111:010203\n";
+    let ingested = game::BmsIngest
+        .ingest(text.as_bytes(), dir.path(), 0)
+        .unwrap();
+    // One warning, the unknown header; none per missing file.
+    assert_eq!(ingested.warnings.len(), 1);
+    assert!(ingested.warnings[0].contains("UnknownHeader"));
+    let missing: Vec<&str> = ingested
+        .chart
+        .sounds
+        .iter()
+        .filter(|s| s.path.is_none())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(missing, ["snare.wav", "hat.wav"]);
+}
