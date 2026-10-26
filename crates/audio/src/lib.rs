@@ -15,15 +15,27 @@
 //!   [`AudioOutput`]. [`SimDevice`] and [`RecordingOutput`] stand in for the
 //!   device in tests and headless runs.
 //!
+//! [`run_audio`] is the audio thread loop: one step per buffer event until
+//! asked to stop. On Windows, `WasapiShared` is the device: WASAPI shared
+//! mode, event-driven, at the shortest engine period the endpoint offers.
+//!
 //! Output buffers are two interleaved `f32` channels (left, right). Nothing
 //! on the step path allocates once the engine is built.
+
+// Only the Windows OS calls use `unsafe`, in the `wasapi` module.
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))]
 
 mod bank;
 mod clock;
 mod engine;
 mod mixer;
 mod output;
+mod run;
 mod sim;
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod wasapi;
 
 pub use bank::{
     BankError, BankLimits, BankWarning, Cap, Found, LoadStats, MAX_RATE, MIN_RATE, Sound,
@@ -36,7 +48,13 @@ pub use mixer::{
     MAX_VOLUME, Mixer, STEAL_FADE_MS,
 };
 pub use output::{AudioOutput, OutputError, RecordingOutput, Wake};
+pub use run::{RunReport, run_audio};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
+#[cfg(windows)]
+pub use wasapi::{
+    EVENT_TIMEOUT_MS, EnginePeriods, Fallback, Grant, QUEUE_PERIODS, WakeTrace, WasapiError,
+    WasapiShared, WasapiStats,
+};
 
 /// Channels of every output buffer (interleaved left, right).
 pub const CHANNELS: usize = 2;

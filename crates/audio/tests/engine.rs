@@ -380,3 +380,58 @@ fn a_simulated_device_that_queues_nothing_is_refused() {
     }
     let _ = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
 }
+
+/// A simulated device whose first wake is marked priming.
+struct Priming {
+    inner: SimDevice,
+    primed: bool,
+}
+
+impl AudioOutput for Priming {
+    fn rate(&self) -> u32 {
+        self.inner.rate()
+    }
+
+    fn period(&self) -> u32 {
+        self.inner.period()
+    }
+
+    fn wait(&mut self) -> audio::Wake {
+        let mut w = self.inner.wait();
+        w.priming = !std::mem::replace(&mut self.primed, true);
+        w
+    }
+
+    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), audio::OutputError> {
+        self.inner.write(f)
+    }
+}
+
+#[test]
+fn a_priming_wake_fills_silence_and_leaves_timing_to_the_first_timed_wake() {
+    let mut e = engine(&[BgmEvent {
+        time: TimeUs(0),
+        sound: CLICK,
+    }]);
+    let dev = Priming {
+        inner: SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+        primed: false,
+    };
+    let mut out = RecordingOutput::new(dev, 4 * PERIOD as usize);
+    let (mut tx, mut rx) = queue();
+    tx.push(SoundCmd {
+        sound: KEY,
+        origin: TimeUs(0),
+    })
+    .unwrap();
+    let r = e.step(&mut out, &mut rx).unwrap();
+    // Two silent periods, no command taken, no BGM started, no clock.
+    assert_eq!((r.frames, r.commands, r.bgm_started), (960, 0, 0));
+    assert_eq!(e.clock().time_at(0), None);
+    assert_eq!(e.written(), 960);
+    assert_eq!(out.samples().len(), 1_920);
+    assert!(out.samples().iter().all(|&x| x == 0.0));
+    let r = e.step(&mut out, &mut rx).unwrap();
+    assert_eq!((r.frames, r.commands, r.bgm_started), (480, 1, 1));
+    assert!(e.clock().time_at(0).is_some());
+}

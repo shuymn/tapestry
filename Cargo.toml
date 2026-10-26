@@ -48,6 +48,12 @@ toml = "1.1.8"
 # game and xtask
 tempfile = "3.27.0"
 
+# render (Windows only)
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "1.0.1"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+wgpu-hal = { version = "30.0.1", features = ["dx12"] }
+
 # bms-parser and xtask
 encoding_rs = "0.8.42"
 

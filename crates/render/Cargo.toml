@@ -1,0 +1,36 @@
+[package]
+name = "render"
+version = "0.0.0"
+description = "The play screen: wgpu on DX12, the sprite batch, the bitmap font, and the skin boundary with the simple skin."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Excluded from `cargo xtask portable`; checked by `cargo xtask check-arch` (R2).
+[package.metadata.tapestry]
+windows-only = true
+
+[dependencies]
+bms-model.workspace = true
+bytemuck.workspace = true
+eval.workspace = true
+game.workspace = true
+pollster.workspace = true
+rules.workspace = true
+wgpu.workspace = true
+wgpu-hal.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# A plain Win32 window for the swap chain test.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true
