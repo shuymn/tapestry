@@ -15,7 +15,7 @@ fn version_exits_zero() {
 }
 
 #[track_caller]
-fn assert_unknown(args: &[&str], arg: &str) {
+fn assert_unknown(args: &[&str], arg: &str) -> Output {
     let out = run(args);
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -23,6 +23,7 @@ fn assert_unknown(args: &[&str], arg: &str) {
         stderr.contains(&format!("unknown argument: {arg}")),
         "{stderr}"
     );
+    out
 }
 
 #[test]
@@ -135,9 +136,8 @@ fn dev_tools_probe_runs_with_feature() {
         "tapestry dev-tools enabled"
     );
     // An extra argument is refused before the probe prints.
-    let out = run(&["--dev-tools-probe", "x"]);
+    let out = assert_unknown(&["--dev-tools-probe", "x"], "x");
     assert!(out.stdout.is_empty(), "{out:?}");
-    assert_unknown(&["--dev-tools-probe", "x"], "x");
 }
 
 /// Usage errors are found before anything is opened: none of them writes
