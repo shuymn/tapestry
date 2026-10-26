@@ -16,6 +16,7 @@ replay = { path = "crates/replay" }
 input = { path = "crates/input" }
 game = { path = "crates/game" }
 audio = { path = "crates/audio" }
+render = { path = "crates/render" }
 
 # bms-parser
 chardetng = "1.0.0"
@@ -46,6 +47,9 @@ toml = "1.1.8"
 
 # game and xtask
 tempfile = "3.27.0"
+
+# player (Windows only)
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
 # render (Windows only)
 bytemuck = { version = "1.25.2", features = ["derive"] }

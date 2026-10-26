@@ -5,8 +5,8 @@ use std::fmt;
 
 use bms_model::{Chart, TimeUs};
 use eval::{
-    DeviceProfile, EvalError, EvalInput, Evaluator, InputStart, JudgeEvent, PhysicalInputEvent,
-    Published, SourceId, SourceState, Staged, merge, watermark,
+    DeviceProfile, EvalError, EvalInput, Evaluator, GaugeState, InputStart, JudgeEvent,
+    PhysicalInputEvent, Published, SourceId, SourceState, Staged, merge, watermark,
 };
 use input::SourceReader;
 use rules::RulePreset;
@@ -97,6 +97,8 @@ pub enum AbortCause {
     OutputFailed,
     /// A survival gauge failed and the session policy ends the play.
     GaugeFailed,
+    /// The screen could not be drawn.
+    ScreenFailed,
 }
 
 /// What one logic step did.
@@ -406,6 +408,22 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
         self.aborted = Some(cause);
         self.overflowed |= cause == AbortCause::Overflow;
+        self.drain_queues();
+    }
+
+    /// After recording has closed: an aborted play's record takes every
+    /// event still queued, unevaluated, so input that arrived between the
+    /// abort and the closing is kept (D13: the abort's suffix stays in the
+    /// record). Nothing happens for a play that was not aborted, whose
+    /// record ends at its completion.
+    pub fn drain_after_close(&mut self) {
+        if self.aborted.is_some() {
+            self.drain_queues();
+        }
+    }
+
+    /// Pops every queued event into the record, while the budget lasts.
+    fn drain_queues(&mut self) {
         for (s, p) in self.sources.iter_mut().zip(&self.published) {
             if p.state == SourceState::Retired {
                 continue;
@@ -462,6 +480,37 @@ impl<'a, R: SourceRead> Logic<'a, R> {
     #[must_use]
     pub const fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    /// Every gauge, in the preset's order, as of the last step.
+    #[must_use]
+    pub fn gauges(&self) -> &[GaugeState] {
+        self.evaluator.gauges()
+    }
+
+    /// The play view as of the last step: what the render side's newest
+    /// view holds, read on the logic side (it allocates).
+    #[must_use]
+    pub fn view(&self) -> PlayView {
+        PlayView {
+            finalized: self.finalized,
+            tally: *self.evaluator.tally(),
+            gauges: self.evaluator.gauges().to_vec(),
+            complete: self.evaluator.is_complete(),
+            events: self.emitted,
+        }
+    }
+
+    /// The record, taking the step apart: its events move rather than
+    /// being copied.
+    #[must_use]
+    pub fn into_record(self) -> Record {
+        Record {
+            events: self.record,
+            device: self.device.clone(),
+            start: self.start,
+            finalized: self.finalized,
+        }
     }
 
     /// The play as recorded so far.

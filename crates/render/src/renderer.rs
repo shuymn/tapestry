@@ -10,6 +10,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::simple::layout::{HEIGHT, WIDTH};
+use crate::simple::text_screen;
 use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
 
 /// Sprites one frame can draw, across both blends.
@@ -246,6 +247,12 @@ impl Renderer {
         })
     }
 
+    /// The target's size in pixels.
+    #[must_use]
+    pub const fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
     /// The device, queue and adapter in use.
     #[must_use]
     pub const fn gpu(&self) -> &Gpu {
@@ -305,6 +312,27 @@ impl Renderer {
     pub fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
         let start = Instant::now();
         build_frame(self.skin.as_mut(), f, &mut self.batch, &mut self.staging);
+        self.draw(start)
+    }
+
+    /// Draws a screen of text lines in the bitmap font instead of the skin
+    /// (the end screen; see [`text_screen`]), as [`frame`](Self::frame)
+    /// draws.
+    ///
+    /// # Errors
+    ///
+    /// As [`frame`](Self::frame).
+    pub fn text_frame(&mut self, lines: &[&str]) -> Result<FrameTiming, RenderError> {
+        let start = Instant::now();
+        self.batch.clear();
+        text_screen(lines, &mut self.batch);
+        self.batch.stage(&mut self.staging);
+        self.draw(start)
+    }
+
+    /// Submits and presents the staged batch; `start` is when the frame's
+    /// work began.
+    fn draw(&mut self, start: Instant) -> Result<FrameTiming, RenderError> {
         let alpha = self.batch.alpha().len() as u32;
         let sprites = self.staging.len();
         let timing = |cpu, presented| FrameTiming {

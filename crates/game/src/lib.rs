@@ -14,6 +14,8 @@
 
 #![forbid(unsafe_code)]
 
+mod audio_loop;
+pub mod live;
 mod logic;
 mod policy;
 mod prepare;
@@ -26,6 +28,10 @@ mod session;
 mod settings;
 mod sound;
 
+pub use audio_loop::{
+    AudioControl, AudioCtl, AudioWaitError, AudioWorker, SWITCH_TIMEOUT, audio_control,
+};
+pub use live::{Closing, LiveError, Opening, Rig};
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };
@@ -45,8 +51,8 @@ pub use results::{
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
-    Command, Loaded, Parts, PlayEnd, PlayReport, PlayScript, ReloadError, Session, SessionConfig,
-    SessionError, Settings,
+    Command, Loaded, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart,
+    ReloadError, Session, SessionConfig, SessionError, Settings,
 };
 pub use settings::{
     DataRoot, DeviceSettings, KeyConfig, LaneKey, PlayerSettings, SettingsError, load_settings,
