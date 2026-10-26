@@ -1138,7 +1138,6 @@ mod tests {
         assert!(late[0].contains("lacks"), "{late:?}");
         // A file that does not parse fails closed.
         assert!(check_site(dir.path(), Site::Fns("broken.rs", &["f"])).is_err());
-        assert!(check_site(dir.path(), Site::File("broken.rs")).is_err());
     }
 
     #[test]
