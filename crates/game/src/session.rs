@@ -564,6 +564,11 @@ impl<O: AudioOutput + Wakes> Session<O> {
                 break PlayEnd::Aborted(AbortCause::OutputFailed);
             }
             render.drain_effects(|_| {});
+            // Completion is final: a failure in the same advance does not
+            // turn a completed play into an aborted one.
+            if advance.complete {
+                break PlayEnd::Completed;
+            }
             let survival_failed = render
                 .view()
                 .gauges
@@ -575,15 +580,17 @@ impl<O: AudioOutput + Wakes> Session<O> {
                 audio.cancel(&mut sounds);
                 break PlayEnd::Aborted(AbortCause::GaugeFailed);
             }
-            if advance.complete {
-                break PlayEnd::Completed;
-            }
         };
 
         // Recording closes at the end of evaluation (D13): the input side
         // appends nothing more, and the record is frozen here.
         let arrivals: Vec<Arrival> = sources.arrivals().iter().map(arrival).collect();
-        let participants: Vec<_> = sources.participants().map(|(d, _)| d).collect();
+        // Each participant with its connection: one removed and connected
+        // again during the tail counts as removed.
+        let participants: Vec<_> = sources
+            .participants()
+            .map(|(d, _)| (d, sources.connection(d)))
+            .collect();
         let incomplete = Incomplete {
             overflow: logic.overflowed() || sources.overflowed(),
             source_limit: sources.source_limited(),
@@ -619,7 +626,10 @@ impl<O: AudioOutput + Wakes> Session<O> {
                 Some(c.cause())
             } else if sources.gate().is_tripped() {
                 Some(AbortCause::FocusLoss)
-            } else if !participants.iter().any(|&d| sources.is_connected(d)) {
+            } else if !participants
+                .iter()
+                .any(|&(d, c)| c.is_some() && sources.connection(d) == c)
+            {
                 Some(AbortCause::LastSourceRemoved)
             } else if let Err(e) = audio.step(global, true, &mut sounds) {
                 output_error = Some(e);

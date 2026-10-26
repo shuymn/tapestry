@@ -490,20 +490,23 @@ fn closed_source_keeps_its_final_watermark() {
 }
 
 #[test]
-fn connection_is_known_with_recording_open_or_closed() {
+fn each_connection_is_numbered_with_recording_open_or_closed() {
     let mut set = keyboards(2);
+    assert_eq!(set.connection(DeviceId(0)), Some(0));
+    assert_eq!(set.connection(DeviceId(1)), Some(1));
     set.open_recording(TimeUs(10));
     set.begin_batch(TimeUs(20));
     set.disconnect(DeviceId(1));
     set.end_batch(TimeUs(21));
-    assert!(set.is_connected(DeviceId(0)));
-    assert!(!set.is_connected(DeviceId(1)));
+    assert_eq!(set.connection(DeviceId(1)), None);
     set.close_recording();
+    // Removed and connected again in one batch: a new connection.
     set.begin_batch(TimeUs(30));
     set.disconnect(DeviceId(0));
+    plug(&mut set, DeviceId(0), DeviceKind::Keyboard);
     set.end_batch(TimeUs(31));
-    assert!(!set.is_connected(DeviceId(0)));
-    assert!(!set.is_connected(DeviceId(7)));
+    assert_eq!(set.connection(DeviceId(0)), Some(2));
+    assert_eq!(set.connection(DeviceId(7)), None);
 }
 
 #[test]

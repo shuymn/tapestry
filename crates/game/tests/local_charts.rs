@@ -30,16 +30,25 @@ use input::{DeviceKind, ScriptedInput, SourceSet};
 use replay::{BuildProvenance, DecodeLimits, ReceiveMethod};
 use rules::Judgment;
 
-/// Every file under `dir` the BMS adapter reads, in a stable order.
-fn charts(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Every file under `dir` the BMS adapter reads, in a stable order. A
+/// folder or entry that cannot be read counts in `unreadable`, so no part
+/// of the collection is skipped silently.
+fn charts(dir: &Path, out: &mut Vec<PathBuf>, unreadable: &mut usize) {
     let Ok(entries) = fs::read_dir(dir) else {
+        *unreadable += 1;
         return;
     };
-    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry.and_then(|e| Ok((e.path(), e.file_type()?.is_dir()))) {
+            Ok(p) => paths.push(p),
+            Err(_) => *unreadable += 1,
+        }
+    }
     paths.sort();
-    for path in paths {
-        if path.is_dir() {
-            charts(&path, out);
+    for (path, is_dir) in paths {
+        if is_dir {
+            charts(&path, out, unreadable);
         } else if BmsIngest.accepts(&path) {
             out.push(path);
         }
@@ -161,9 +170,13 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
 fn local_charts_sweep() {
     let dir = std::env::var_os("TAPESTRY_CHARTS_DIR").expect("set TAPESTRY_CHARTS_DIR");
     let mut found = Vec::new();
-    charts(Path::new(&dir), &mut found);
+    let mut unreadable = 0;
+    charts(Path::new(&dir), &mut found, &mut unreadable);
     let mut played = 0;
     let mut refused: BTreeMap<&str, usize> = BTreeMap::new();
+    if unreadable > 0 {
+        refused.insert("folder or entry unreadable", unreadable);
+    }
     for (i, path) in found.iter().enumerate() {
         match sweep_one(path) {
             Ok((notes, warnings)) => {

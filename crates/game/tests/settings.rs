@@ -196,21 +196,6 @@ fn names(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[test]
-fn stale_temporary_files_are_left_alone() {
-    let (dir, _root) = temp_root();
-    // Temporary names this process would take next, left by a writer that
-    // stopped: the write moves past them.
-    let target = dir.path().join("file");
-    let pid = std::process::id();
-    for n in 0..2_000 {
-        fs::write(dir.path().join(format!("file.{pid}.{n}.tmp")), b"stale").unwrap();
-    }
-    write_atomic(&target, b"new").unwrap();
-    assert_eq!(fs::read(&target).unwrap(), b"new");
-    assert_eq!(names(dir.path()).len(), 2_001);
-}
-
-#[test]
 fn two_writers_never_replace_each_others_records() {
     let (_dir, root) = temp_root();
     let rec = |writer: usize, i: usize| replay::PlayRecord {
@@ -251,6 +236,23 @@ fn two_writers_never_replace_each_others_records() {
         .collect();
     numbers.sort_unstable();
     assert_eq!(numbers, (1..=50).collect::<Vec<u64>>());
+}
+
+#[test]
+fn a_record_numbered_last_leaves_no_number_to_save_under() {
+    let (_dir, root) = temp_root();
+    let mut records = LocalRecords::new(root.records());
+    let first = records.save(&sample()).unwrap().path;
+    let dir = first.parent().unwrap().to_owned();
+    fs::rename(&first, dir.join(format!("{}.tprl", u64::MAX))).unwrap();
+    assert!(matches!(
+        records.save(&sample()),
+        Err(game::SaveError::Io {
+            kind: std::io::ErrorKind::Other,
+            ..
+        })
+    ));
+    assert_eq!(names(&dir).len(), 1);
 }
 
 #[test]

@@ -681,6 +681,34 @@ fn policy_decides_what_a_survival_failure_does() {
 }
 
 #[test]
+fn a_failure_in_the_completing_advance_leaves_the_play_complete() {
+    // Fifteen unpressed notes: the fifteenth miss, at 2.58 s, fails the
+    // survival gauge and is the chart's last deadline, so SongEnd comes in
+    // the same advance. Completion wins over the policy's end.
+    let notes: Vec<(u8, i64)> = (0..15).map(|i| (1, 1_000 + i * 100)).collect();
+    let chart = taps(&notes);
+    let (_dir, root) = temp_root();
+    let strict = Parts {
+        policy: Box::new(Strict),
+        ..parts(&root, &chart, &Events::default())
+    };
+    let mut s = session_with(&root, strict);
+    let one = s.play(script(vec![connect(0)], &[])).unwrap();
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(status(&one), (EndStatus::PlayedToEnd, TimeUs(2_580_999)));
+    assert_eq!(count_judged(&one.live, Judgment::Poor), 15);
+    let survival = &one
+        .result
+        .as_ref()
+        .unwrap()
+        .evaluation
+        .as_ref()
+        .unwrap()
+        .gauges[1];
+    assert_eq!(survival.failed_at, Some(TimeUs(2_580_000)));
+}
+
+#[test]
 fn default_policy_shows_the_chosen_gauge_or_the_first() {
     let gauges = vec![
         eval::GaugeState {
@@ -1047,18 +1075,19 @@ fn audio_failure_at_the_completing_step_keeps_the_play_complete() {
 
 #[test]
 fn focus_loss_and_device_removal_cut_the_tail() {
-    for (action, cause) in [
-        (Action::FocusLoss, AbortCause::FocusLoss),
-        (
-            Action::Disconnect(DeviceId(0)),
-            AbortCause::LastSourceRemoved,
-        ),
+    let gone = Action::Disconnect(DeviceId(0));
+    let back = Action::Connect(DeviceId(0), DeviceKind::Keyboard);
+    for (actions, cause) in [
+        (vec![Action::FocusLoss], AbortCause::FocusLoss),
+        (vec![gone], AbortCause::LastSourceRemoved),
+        // Removed and back in one poll: still a removal.
+        (vec![gone, back], AbortCause::LastSourceRemoved),
     ] {
         let (_dir, root) = temp_root();
         let mut s = tail_session(&root, &Events::default());
         let mut items = busy_items();
         // At 2.0 s of play time, inside the BGM tail (it plays to 4.0 s).
-        items.push(item(2_000 * MS, action));
+        items.extend(actions.into_iter().map(|a| item(2_000 * MS, a)));
         let one = s.play(script(items, &[])).unwrap();
         assert_eq!(one.end, PlayEnd::Completed);
         assert_eq!(one.tail_cut, Some(cause));

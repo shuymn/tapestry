@@ -67,6 +67,9 @@ struct Device {
     /// A held control did not fit, so `held` may miss one. Kept until the
     /// device is removed; every play it takes part in is incomplete.
     state_lost: bool,
+    /// Which connection this is: a reconnect of the same device gets a new
+    /// number.
+    connection: u64,
 }
 
 /// One participating source of the open recording.
@@ -109,6 +112,8 @@ pub struct SourceSet {
     spare_held: Vec<Vec<(ControlId, i32)>>,
     /// Connected devices the state table had no room for.
     untracked: usize,
+    /// The number the next connection gets.
+    next_connection: u64,
     gate: FocusGate,
     batch_at: TimeUs,
     recording: Option<Recording>,
@@ -135,6 +140,7 @@ impl SourceSet {
             devices,
             spare_held,
             untracked: 0,
+            next_connection: 0,
             gate: FocusGate::new(),
             batch_at: TimeUs(i64::MIN),
             recording: None,
@@ -235,7 +241,9 @@ impl SourceSet {
                 source: None,
                 recorded: Vec::new(),
                 state_lost: false,
+                connection: self.next_connection,
             });
+            self.next_connection += 1;
         } else {
             self.untracked += 1;
         }
@@ -402,11 +410,16 @@ impl SourceSet {
             .flat_map(|r| r.participants.iter().map(|p| (p.device, p.kind)))
     }
 
-    /// Whether `device` is connected and its state kept, with or without
-    /// an open recording.
+    /// Which connection of `device` is current, if it is connected and its
+    /// state kept, with or without an open recording. Each connection gets
+    /// a new number, so a device removed and connected again between two
+    /// looks is seen as removed.
     #[must_use]
-    pub fn is_connected(&self, device: DeviceId) -> bool {
-        self.devices.iter().any(|d| d.id == device)
+    pub fn connection(&self, device: DeviceId) -> Option<u64> {
+        self.devices
+            .iter()
+            .find(|d| d.id == device)
+            .map(|d| d.connection)
     }
 
     /// Devices that arrived during the open recording.
