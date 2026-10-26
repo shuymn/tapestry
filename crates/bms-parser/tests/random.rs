@@ -38,9 +38,11 @@ fn times(notes: &[bms_model::Note]) -> Vec<i64> {
 
 /// The keys (lane indices) holding a note.
 fn keys(loaded: &Loaded) -> Vec<usize> {
-    (0..8)
-        .filter(|&l| !loaded.chart.lanes[l].is_empty())
-        .collect()
+    keys_of(&loaded.chart.lanes)
+}
+
+fn keys_of(lanes: &[Vec<bms_model::Note>; 8]) -> Vec<usize> {
+    (0..8).filter(|&l| !lanes[l].is_empty()).collect()
 }
 
 #[test]
@@ -302,51 +304,39 @@ fn branch_records_do_not_change_the_resolved_hash() {
 fn if_flags_stack_as_charts_expect() {
     let warned = |text: &str| {
         let loaded = load(text).unwrap();
-        let warnings: Vec<_> = loaded.warnings.iter().map(|w| (w.line, &w.kind)).collect();
-        (keys(&loaded), format!("{warnings:?}"))
+        let warnings: Vec<_> = loaded
+            .warnings
+            .into_iter()
+            .map(|w| (w.line, w.kind))
+            .collect();
+        (keys_of(&loaded.chart.lanes), warnings)
     };
     // Value 2: #IF 2 (line 5) stacks on #IF 1, so its branch (key 2) is
     // read; its #ENDIF makes #IF 1 count again, so key 3 is skipped; the
     // last #ENDIF closes #IF 1 and key 1 is read.
     let text = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#IF 2\n#00112:01\n#ENDIF\n#00113:01\n#ENDIF\n#00111:01\n";
-    let expected = vec![(Some(5), &WarningKind::UnclosedIf)];
-    assert_eq!(warned(text), (vec![1, 2], format!("{expected:?}")));
-    // Twenty #IF lines, each over the one before, then one #ENDIF: only
-    // #IF 20's note is read; after the #ENDIF #IF 19 counts again, so the
-    // note of measure 30 is skipped. The stack is one nesting level and is
-    // warned about once.
-    let mut chain = String::from("#BPM 120\n#WAV01 click.wav\n#SETRANDOM 20\n");
-    for k in 1..=20 {
-        chain.push_str(&format!("#IF {k}\n#{k:03}11:01\n"));
-    }
-    chain.push_str("#ENDIF\n#03011:01\n");
-    let loaded = load(&chain).unwrap();
+    assert_eq!(
+        warned(text),
+        (vec![1, 2], vec![(Some(5), WarningKind::UnclosedIf)])
+    );
     // The same values in two #RANDOM blocks are still two blocks: an #IF of
     // the second over one of the first is not warned about.
     let two =
         "#BPM 120\n#WAV01 click.wav\n#RANDOM 1\n#IF 1\n#ENDRANDOM\n#RANDOM 1\n#IF 1\n#00111:01\n";
-    let w: Vec<_> = load(two)
-        .unwrap()
-        .warnings
-        .into_iter()
-        .map(|w| (w.line, w.kind))
-        .collect();
-    assert_eq!(w, vec![(None, WarningKind::UnclosedIf)]);
-    assert_eq!(times(&loaded.chart.lanes[1]), vec![40_000_000]);
-    let stacked: Vec<_> = loaded
-        .warnings
-        .iter()
-        .filter(|w| w.kind == WarningKind::UnclosedIf)
-        .map(|w| w.line)
-        .collect();
-    assert_eq!(stacked, vec![Some(6), None]);
+    assert_eq!(
+        warned(two),
+        (vec![1], vec![(None, WarningKind::UnclosedIf)])
+    );
     // An #IF inside a new #RANDOM tests that value alone: its branch is
     // read though the outer #IF 1 is not; after it the outer flag counts
     // again.
     let nested = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#SETRANDOM 3\n#IF 3\n#00112:01\n#ENDIF\n#ENDRANDOM\n#00113:01\n#ENDIF\n#00111:01\n";
-    assert_eq!(keys(&load(nested).unwrap()), vec![1, 2]);
+    assert_eq!(warned(nested).0, vec![1, 2]);
     // Thirty 45-way blocks, each closed by a single #ENDIF and none by
-    // #ENDRANDOM: every block is read by its own value.
+    // #ENDRANDOM: every block is read by its own value. After the last
+    // #ENDIF the last block's #IF 44 counts again, and its value is 31, so
+    // the note of measure 31 is skipped. The stacked #IFs are warned about
+    // once (line 6, the first #IF 2), and the ones left open at the end.
     let mut blocks = String::from("#BPM 120\n#WAV01 click.wav\n");
     let mut expected = Vec::new();
     for b in 1..=30_usize {
@@ -362,6 +352,19 @@ fn if_flags_stack_as_charts_expect() {
         let n = |x: usize| i64::try_from(x).unwrap();
         expected.push(2_000_000 * n(b) + 2_000_000 * n(value - 1) / 45);
     }
+    blocks.push_str("#03111:01\n");
     let loaded = load(&blocks).unwrap();
     assert_eq!(times(&loaded.chart.lanes[1]), expected);
+    let warnings: Vec<_> = loaded
+        .warnings
+        .into_iter()
+        .map(|w| (w.line, w.kind))
+        .collect();
+    assert_eq!(
+        warnings,
+        vec![
+            (Some(6), WarningKind::UnclosedIf),
+            (None, WarningKind::UnclosedIf)
+        ]
+    );
 }

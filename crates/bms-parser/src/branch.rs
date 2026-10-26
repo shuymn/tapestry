@@ -50,9 +50,9 @@ struct Flag {
 #[derive(Debug)]
 pub struct Branches {
     rng: SplitMix64,
-    /// The open `#RANDOM` and `#SETRANDOM` blocks: each value and its
-    /// position in `results`, which tells the blocks apart.
-    randoms: Vec<(u32, usize)>,
+    /// The open `#RANDOM` and `#SETRANDOM` blocks, by the position of their
+    /// value in `results`, which also tells the blocks apart.
+    randoms: Vec<usize>,
     flags: Vec<Flag>,
     /// An `#IF` stacked on one of the same `#RANDOM` was warned about.
     warned_stacked: bool,
@@ -96,20 +96,17 @@ impl Branches {
         };
         match name {
             // Drawn even inside an #IF branch not read, as charts expect.
-            "RANDOM" => {
-                let n = positive_integer(value, line, "#RANDOM")?;
-                let v = self.rng.draw(n);
-                self.randoms.push((v, self.results.len()));
-                self.results.push(v);
-            }
-            "SETRANDOM" => {
-                let v = positive_integer(value, line, "#SETRANDOM")?;
-                self.randoms.push((v, self.results.len()));
+            "RANDOM" | "SETRANDOM" => {
+                let random = name == "RANDOM";
+                let what = if random { "#RANDOM" } else { "#SETRANDOM" };
+                let n = positive_integer(value, line, what)?;
+                let v = if random { self.rng.draw(n) } else { n };
+                self.randoms.push(self.results.len());
                 self.results.push(v);
             }
             "IF" => {
                 let k = positive_integer(value, line, "#IF")?;
-                match self.randoms.last() {
+                match self.randoms.last().map(|&i| (self.results[i], i)) {
                     // No value to test: no flag, as charts expect. The flag
                     // on top, if any, still decides which lines are read,
                     // and the next #ENDIF pops it.
@@ -118,7 +115,7 @@ impl Branches {
                             warn(warnings, WarningKind::UnmatchedDirective("#IF"));
                         }
                     }
-                    Some(&(v, random)) => {
+                    Some((v, random)) => {
                         if self.flags.last().is_some_and(|f| f.random == random)
                             && !std::mem::replace(&mut self.warned_stacked, true)
                         {

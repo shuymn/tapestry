@@ -324,8 +324,6 @@ fn parse_header(
         // Compared as an integer (`01` is 1). A value that names no type
         // (`0`, `ZZ`) is read as the default, 1.
         "LNTYPE" => {
-            let digits = value.strip_prefix('+').unwrap_or(value);
-            let number = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
             let unsupported = || LoadError::Unsupported {
                 line,
                 what: format!("#LNTYPE {value}"),
@@ -334,9 +332,14 @@ fn parse_header(
                 Ok(1) => true,
                 Ok(0) => false,
                 Ok(_) => return Err(unsupported()),
-                // A number too large for `u32` is 2 or more too.
-                Err(_) if number => return Err(unsupported()),
-                Err(_) => false,
+                Err(_) => {
+                    // A number too large for `u32` is 2 or more too.
+                    let digits = value.strip_prefix('+').unwrap_or(value);
+                    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(unsupported());
+                    }
+                    false
+                }
             };
             if !named && !std::mem::replace(&mut source.warned_lntype, true) {
                 ignore(warnings, "#LNTYPE");
