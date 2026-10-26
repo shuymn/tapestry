@@ -20,6 +20,8 @@ allow = [
     "Unicode-3.0", # unicode-ident, unicode-normalization
     "BSD-3-Clause", # encoding_rs (together with MIT OR Apache-2.0)
     "MPL-2.0",    # triple_buffer, symphonia (audio decoding); used unmodified
+    "Zlib",       # foldhash, under hashbrown in the wgpu graph (render)
+    "ISC",        # libloading, which wgpu-hal uses to load the DX12 runtime (render)
 ]
 
 [bans]
@@ -30,7 +32,17 @@ deny = [
     # The Windows API crate only inside the Windows-only crates (AGENTS.md).
     # `windows-sys` is not banned: portable crates such as tempfile use it
     # under cfg(windows).
-    { crate = "windows", wrappers = ["input", "audio", "render", "player"] },
+    # Third-party direct parents, reviewed for the pinned wgpu graph (render):
+    # - wgpu-hal: its DX12 backend (device, swap chain, waitable object).
+    # - gpu-allocator: the D3D12 memory allocator of wgpu-hal's DX12 backend.
+    { crate = "windows", wrappers = [
+        "input",
+        "audio",
+        "render",
+        "player",
+        "wgpu-hal",
+        "gpu-allocator",
+    ] },
 ]
 
 [sources]
