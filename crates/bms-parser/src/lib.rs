@@ -130,7 +130,7 @@ impl Default for Limits {
             max_measure: 999,
             max_duration: TimeUs(60 * 60 * 1_000_000),
             max_nesting: 16,
-            max_time_bits: 8192,
+            max_time_bits: 16_384,
         }
     }
 }

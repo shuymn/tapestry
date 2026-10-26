@@ -277,30 +277,30 @@ fn growing(last: usize, notes: usize) -> String {
 
 #[test]
 fn time_size_cap_is_reached_at_the_computed_measure() {
-    // An independent script sums the exact fractions: entering measure 386
-    // the time's denominator has exactly 8192 bits, the cap, and entering
-    // 387 it has 8212.
-    let loaded = load(&growing(386, 0)).unwrap();
-    assert_eq!(times(&loaded.chart.lanes[1]), vec![926]);
+    // An independent script sums the exact fractions: entering measure 808
+    // the time's denominator has 16371 bits, within the 16384-bit cap, and
+    // entering 809 it has 16386.
+    let loaded = load(&growing(808, 0)).unwrap();
+    assert_eq!(times(&loaded.chart.lanes[1]), vec![1_939]);
     assert_eq!(
-        load(&growing(387, 0)),
-        Err(LoadError::TimeOverflow { measure: 387 })
+        load(&growing(809, 0)),
+        Err(LoadError::TimeOverflow { measure: 809 })
     );
 }
 
 /// The worst case the cap allows, timed: the time's denominator reaches
-/// 8192 bits first, then each of 491,200 notes (800 to a measure through
+/// 16371 bits first, then each of 480,000 notes (2500 to a measure through
 /// measure 999) adds a segment at a BPM already in it, the path that takes
-/// both greatest common divisors. The notes sit about 0.003 µs apart, so
+/// both greatest common divisors. The notes sit far below 1 µs apart, so
 /// most are dropped as conflicts, each with a warning; that work counts in
 /// the load time too.
 #[test]
-#[ignore = "timing run of about 490,000 objects: cargo test --release -p bms-parser --test time -- --ignored --nocapture"]
+#[ignore = "timing run of about 480,000 objects: cargo test --release -p bms-parser --test time -- --ignored --nocapture"]
 fn time_size_cap_worst_case_load_time() {
-    // The BPM changes stop at measure 385, so measure 386 enters at 8192
-    // bits; a note step of 4/800 beat adds 300_000 / BPM µs, whose
+    // The BPM changes stop at measure 807, so measure 808 enters at 16371
+    // bits; a note step of 4/2500 beat adds 96_000 / BPM µs, whose
     // denominator divides the BPM.
-    let text = growing(385, 800);
+    let text = growing(807, 2500);
     let start = Instant::now();
     let loaded = load(&text).unwrap();
     let elapsed = start.elapsed();
