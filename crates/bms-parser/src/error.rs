@@ -154,15 +154,6 @@ mod tests {
 
     use super::LoadError;
 
-    /// No error in the chain prints the Display of its source.
-    fn assert_causes_printed_once(mut e: &(dyn Error + 'static)) {
-        while let Some(source) = e.source() {
-            let (outer, inner) = (e.to_string(), source.to_string());
-            assert!(!outer.contains(&inner), "{outer:?} repeats {inner:?}");
-            e = source;
-        }
-    }
-
     #[test]
     fn model_error_is_the_source() {
         let e = LoadError::Model(ModelError::Overflow);
@@ -176,7 +167,10 @@ mod tests {
             source.source().is_none(),
             "the chain ends at the model error"
         );
-        assert_causes_printed_once(&e);
+        assert!(
+            !e.to_string().contains(&source.to_string()),
+            "the message leaves the cause to the chain"
+        );
     }
 
     #[test]

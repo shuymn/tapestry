@@ -18,17 +18,6 @@ use game::{
 use replay::{BuildProvenance, ReceiveMethod};
 use rules::RuleError;
 
-/// No error in the chain prints the message of its source.
-#[track_caller]
-fn assert_causes_printed_once(e: &(dyn Error + 'static)) {
-    let mut e = e;
-    while let Some(source) = e.source() {
-        let (outer, inner) = (e.to_string(), source.to_string());
-        assert!(!outer.contains(&inner), "{outer:?} repeats {inner:?}");
-        e = source;
-    }
-}
-
 /// `e`'s source as a `T`, which must be what `source()` returns.
 #[track_caller]
 fn source<'a, T: Error + 'static>(e: &'a (dyn Error + 'static)) -> &'a T {
@@ -61,8 +50,13 @@ fn assert_chain<T: Error + PartialEq + Debug + 'static>(
     chain: &[&str],
 ) {
     assert_eq!(source::<T>(e), expected);
-    assert_eq!(messages(e), chain);
-    assert_causes_printed_once(e);
+    let messages = messages(e);
+    assert_eq!(messages, chain);
+    for pair in messages.windows(2) {
+        if let [outer, inner] = pair {
+            assert!(!outer.contains(inner), "{outer:?} repeats {inner:?}");
+        }
+    }
 }
 
 #[test]
@@ -292,18 +286,15 @@ fn transparent_wrappers_forward_message_and_source() {
 /// errors and through a transparent wrapper.
 #[test]
 fn chain_formats_as_anyhow_alternate() {
-    let errors: Vec<Box<dyn Fn() -> anyhow::Error>> = vec![
-        Box::new(|| SettingsError::InvalidDevice(DeviceSettingsError::ControllerUnnamed).into()),
-        Box::new(|| IngestError::Load(LoadError::Model(ModelError::Overflow)).into()),
-        Box::new(|| {
-            SessionError::Ingest(IngestError::Load(LoadError::TooManyLines { line: 4 })).into()
-        }),
-        Box::new(|| LogicError::Eval(EvalError::InvalidPreset(RuleError::NoGauges)).into()),
-        Box::new(|| AudioWaitError::Timeout.into()),
-        Box::new(|| LiveError::Screen(SurfaceLost).into()),
+    let errors: [anyhow::Error; 6] = [
+        SettingsError::InvalidDevice(DeviceSettingsError::ControllerUnnamed).into(),
+        IngestError::Load(LoadError::Model(ModelError::Overflow)).into(),
+        SessionError::Ingest(IngestError::Load(LoadError::TooManyLines { line: 4 })).into(),
+        LogicError::Eval(EvalError::InvalidPreset(RuleError::NoGauges)).into(),
+        AudioWaitError::Timeout.into(),
+        LiveError::Screen(SurfaceLost).into(),
     ];
-    for make in errors {
-        let e = make();
+    for e in errors {
         let chained = Chain(e.as_ref()).to_string();
         assert_eq!(chained, format!("{e:#}"));
         assert_eq!(chained, messages(e.as_ref()).join(": "));

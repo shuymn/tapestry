@@ -275,32 +275,21 @@ fn an_invalid_key_config_exits_nonzero() {
         ..
     } = fixture();
     type Change = fn(&mut DeviceSettings);
-    let reserved = game::KeyError::Reserved {
-        control: 0x3d,
-        reserved_for: game::reserved_key(0x3d).unwrap(),
-    };
-    let bad: [(Change, &str, game::KeyError); 3] = [
+    let bad: [(Change, &str); 3] = [
         (
             |d| d.keyboard.lanes[2].control = d.keyboard.lanes[1].control,
             "control 0x2c is bound to both key 1 and key 2",
-            game::KeyError::Overlap {
-                control: 0x2c,
-                first: game::Role::Lane(1),
-                second: game::Role::Lane(2),
-            },
         ),
         (
             |d| d.keyboard.lanes[3].control = 0x3d,
             "key 0x3d is reserved for volume",
-            reserved,
         ),
         (
             |d| d.keyboard.lanes[4].lane = 9,
-            "lane 9 does not exist",
-            game::KeyError::NoSuchLane(9),
+            "lane 9 does not exist (lanes are 0 to 7)",
         ),
     ];
-    for (change, says, refusal) in bad {
+    for (change, refusal) in bad {
         let mut device = DeviceSettings::default();
         change(&mut device);
         game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
@@ -314,11 +303,6 @@ fn an_invalid_key_config_exits_nonzero() {
             .expect("run tapestry");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{stderr}");
-        assert!(
-            stderr.contains("device.toml: keyboard key config"),
-            "{stderr}"
-        );
-        assert!(stderr.contains(says), "{stderr}");
         // The whole diagnostic: the data folder, then each cause once.
         let line = format!(
             "{}: the settings cannot be used: device.toml: keyboard key config: {refusal}",
