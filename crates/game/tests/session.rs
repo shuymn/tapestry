@@ -771,11 +771,23 @@ fn bad_key_config_refuses_to_play_and_closes_recording() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
     let mut settings = Settings::load(&root).unwrap();
-    // Lanes 1 and 2 on one key.
+    // Lanes 1 and 2 on one key: loading the file refuses it, and a
+    // session given it all the same refuses to play.
     settings.device.keyboard.lanes[2].control = settings.device.keyboard.lanes[1].control;
     settings.save(&root).unwrap();
+    assert!(matches!(
+        Settings::load(&root),
+        Err(game::SettingsError::Invalid(_))
+    ));
     let events = Events::default();
-    let mut s = session(&root, &chart, &events);
+    let parts = Parts {
+        ingest: Box::new(Built(chart.clone())),
+        events: Box::new(events.clone()),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap();
+    let audio = steady_audio(loaded.chart(), common::bank(loaded.chart()));
+    let mut s = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
     let err = s.play(script(vec![connect(0)], &[])).unwrap_err();
     assert!(matches!(
         err,

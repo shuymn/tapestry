@@ -51,6 +51,41 @@ pub const fn key_control(make_code: u8, flags: u16) -> ControlId {
     ControlId(prefix | make_code as u32)
 }
 
+/// The scan code a window's keyboard message carries for the key with
+/// Raw Input control `control` ([`key_control`]): the same, `E0` keys
+/// included, except for two. The window names Pause `0x45` (the make code
+/// that follows its `E1 1D`, where Raw Input gives `0xE11D`) and NumLock
+/// `0xE045` (Raw Input: `0x45`). A window turns this into its key (winit's
+/// `PhysicalKey::from_scancode`), so a key bound through Raw Input is the
+/// same key in the window.
+///
+/// Aliases go to one key first ([`key_identity`]).
+#[must_use]
+pub const fn window_scan_code(control: ControlId) -> u32 {
+    match key_identity(control).0 {
+        0xE11D => 0x45,
+        0x45 => 0xE045,
+        c => c,
+    }
+}
+
+/// One identity for the controls that are one key in a window: Raw Input
+/// names a few keys two ways (Print Screen is `0x54` with Alt held and
+/// `0xE037` without; Pause is `0xE046` with Ctrl), and the window (winit)
+/// names each pair as one key. Key configs are checked on this identity,
+/// so two roles never share a key the window cannot tell apart.
+#[must_use]
+pub const fn key_identity(control: ControlId) -> ControlId {
+    ControlId(match control.0 {
+        0x54 => 0xE037,
+        0xE046 => 0xE11D,
+        0xE045 => 0x45,
+        0xE0F1 => 0x71,
+        0xE0F2 => 0x72,
+        c => c,
+    })
+}
+
 fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
     let b = bytes.get(at..at + 2)?;
     Some(u16::from_ne_bytes([b[0], b[1]]))

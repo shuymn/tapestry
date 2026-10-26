@@ -20,6 +20,8 @@ use game::RenderSide;
 use input::QpcClock;
 use render::{FrameInput, Renderer};
 
+use crate::tuning::LiveTuning;
+
 /// What draws: the renderer, or a double in tests.
 pub trait Screen: Send {
     /// Prepares `chart` and resets the play state.
@@ -107,13 +109,12 @@ pub enum RenderMsg {
     Exit,
 }
 
-/// The fixed inputs of every play's frames.
-#[derive(Clone, Copy, Debug)]
+/// The inputs of every play's frames.
+#[derive(Clone, Debug)]
 pub struct View {
-    /// The display latency offset.
-    pub display_offset: TimeUs,
-    /// Hi-speed as the visible time.
-    pub visible_time: TimeUs,
+    /// Hi-speed (the visible time) and the display offset, read at every
+    /// frame.
+    pub tuning: Arc<LiveTuning>,
     /// The effect queue's capacity: the most effects one frame drains.
     pub effects: usize,
 }
@@ -320,10 +321,17 @@ impl Run {
                     effects.clear();
                     side.drain_effects(|e| effects.push(*e));
                     let now = TimeUs(self.clock.now().0 - origin.0);
+                    // Hi-speed and the display offset change anytime and move
+                    // the notes only: they reach the screen here and nowhere
+                    // near judgment. Hi-speed changes are not in the v1 log;
+                    // they arrive with the separate hi-speed stream and a
+                    // format version bump (design.md "Operations unrelated to
+                    // judgment go in a separate stream").
+                    let t = self.view.tuning.get();
                     let f = FrameInput {
                         now,
-                        display_offset: self.view.display_offset,
-                        visible_time: self.view.visible_time,
+                        display_offset: TimeUs(t.display_offset_us),
+                        visible_time: t.visible_time(),
                         view: side.view(),
                         effects: &effects,
                         gauge: *gauge,
@@ -444,8 +452,12 @@ mod tests {
 
     fn view() -> View {
         View {
-            display_offset: TimeUs(0),
-            visible_time: TimeUs(600_000),
+            tuning: Arc::new(crate::tuning::LiveTuning::new(game::Tuning {
+                visible_time_ms: 600,
+                volume_percent: 100,
+                display_offset_us: 0,
+                input_offset_us: 0,
+            })),
             effects: 16,
         }
     }
@@ -544,5 +556,98 @@ mod tests {
         assert_ne!(at, i64::MIN);
         assert!(first >= at, "first frame at {first}, presented at {at}");
         link.exit();
+    }
+
+    /// A screen that keeps each play frame's visible time and display
+    /// offset.
+    struct Inputs(Arc<std::sync::Mutex<Vec<(TimeUs, TimeUs)>>>);
+
+    impl Screen for Inputs {
+        fn load(&mut self, _chart: &Chart) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn frame(&mut self, f: &FrameInput<'_>) -> Result<bool, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((f.visible_time, f.display_offset));
+            Ok(true)
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The render thread reads hi-speed and the display offset at every
+    /// frame: each change reaches the frames drawn after it, and no later
+    /// frame goes back. The two change one at a time, as two keys do.
+    #[test]
+    fn render_frames_follow_hi_speed_and_display_offset() {
+        use game::Adjust;
+
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let tuning = view().tuning;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let screen_seen = Arc::clone(&seen);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(Inputs(Arc::clone(&screen_seen))) as Box<dyn Screen>));
+        let clock = QpcClock::start();
+        let view = View {
+            tuning: Arc::clone(&tuning),
+            effects: 16,
+        };
+        let link = spawn(
+            make,
+            Arc::new(chart.clone()),
+            clock,
+            view,
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let (rule, device) = (rules::custom(), DeviceProfile::default());
+        let (_logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        link.send(RenderMsg::Play {
+            origin: clock.now(),
+            side,
+            gauge: 0,
+        });
+        let start = (TimeUs(600_000), TimeUs(0));
+        let faster = (TimeUs(575_000), TimeUs(0));
+        let later = (TimeUs(575_000), TimeUs(1_000));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&start)));
+        assert!(tuning.adjust(Adjust::HiSpeedUp));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&faster)));
+        assert!(tuning.adjust(Adjust::DisplayOffsetUp));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&later)));
+        link.exit();
+        // The frames go through the three states in order, each once.
+        let mut frames = seen.lock().unwrap().clone();
+        frames.dedup();
+        assert_eq!(frames, [start, faster, later]);
     }
 }

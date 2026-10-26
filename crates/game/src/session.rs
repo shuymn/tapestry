@@ -101,12 +101,19 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// The first file that exists but cannot be read.
+    /// The first file that exists but cannot be read, then
+    /// [`SettingsError::Invalid`] for a value that cannot be used
+    /// ([`DeviceSettings::validate`], [`PlayerSettings::validate`]).
     pub fn load(root: &DataRoot) -> Result<Self, SettingsError> {
-        Ok(Self {
+        let s = Self {
             device: crate::settings::load_settings(&root.device_settings())?,
             player: crate::settings::load_settings(&root.player_settings())?,
-        })
+        };
+        let device = |e| SettingsError::Invalid(format!("device.toml: {e}"));
+        s.device.validate().map_err(device)?;
+        let player = |e| SettingsError::Invalid(format!("player.toml: {e}"));
+        s.player.validate().map_err(player)?;
+        Ok(s)
     }
 
     /// Writes both files to `root`, each atomically.
@@ -432,6 +439,11 @@ impl Loaded {
     #[must_use]
     pub const fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// The settings, to change between plays.
+    pub(crate) const fn settings_mut(&mut self) -> &mut Settings {
+        &mut self.settings
     }
 
     /// The session's fixed choices.

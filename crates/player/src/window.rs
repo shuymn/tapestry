@@ -1,8 +1,8 @@
 //! The window thread: the winit window and its events (D9). The window is
 //! borderless fullscreen on the primary monitor and takes no device events
 //! (Raw Input has one target window per device type per process, and the
-//! input thread owns it). Focus, the retry and quit keys and closing go to
-//! [`Controls`]. The event loop runs on a thread of its own, so the game
+//! input thread owns it). Focus, the retry and quit keys, the settings
+//! keys F1 to F8 and closing go to [`Controls`]. The event loop runs on a thread of its own, so the game
 //! keeps the main thread and the loaded chart never has to move.
 
 use std::num::NonZeroIsize;
@@ -10,10 +10,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
-use game::Command;
+use eval::ControlId;
+use game::{Adjust, Command};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
+use winit::keyboard::PhysicalKey;
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::raw_window_handle::{
@@ -29,8 +31,7 @@ struct Exit;
 
 struct App {
     controls: Arc<Controls>,
-    retry: Option<u32>,
-    quit: Option<u32>,
+    keys: Keys,
     ready: Option<Sender<Result<Surface, String>>>,
     window: Option<Window>,
 }
@@ -61,15 +62,8 @@ impl ApplicationHandler<Exit> for App {
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::Focused(focused) => self.controls.focus(focused),
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed && !event.repeat =>
-            {
-                let code = event.physical_key.to_scancode();
-                if code.is_some() && code == self.retry {
-                    self.controls.command(Command::Retry);
-                } else if code.is_some() && code == self.quit {
-                    self.controls.command(Command::Quit);
-                }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                key_pressed(&self.controls, event.physical_key, event.repeat, &self.keys);
             }
             WindowEvent::CloseRequested => self.controls.close(),
             _ => {}
@@ -128,8 +122,7 @@ pub fn open(
             let _ = proxy_tx.send(event_loop.create_proxy());
             let mut app = App {
                 controls: Arc::clone(&controls),
-                retry,
-                quit,
+                keys: Keys::new(retry, quit),
                 ready: Some(ready_tx),
                 window: None,
             };
@@ -199,5 +192,164 @@ impl HasWindowHandle for Surface {
 impl HasDisplayHandle for Surface {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
         Ok(DisplayHandle::windows())
+    }
+}
+
+/// The window's key for a keyboard control as Raw Input names it: through
+/// the scan code the window's messages carry for it
+/// ([`input::raw::window_scan_code`]), so a key bound by `tapestry keys` is
+/// the same key here, aliases included (winit names several scan codes as
+/// one key).
+fn window_key(control: u32) -> PhysicalKey {
+    PhysicalKey::from_scancode(input::raw::window_scan_code(ControlId(control)))
+}
+
+/// The keys the window acts on, as winit names them.
+struct Keys {
+    retry: Option<PhysicalKey>,
+    quit: Option<PhysicalKey>,
+    settings: [(PhysicalKey, Adjust); 8],
+}
+
+impl Keys {
+    /// The keys for the retry and quit controls and the settings keys.
+    fn new(retry: Option<u32>, quit: Option<u32>) -> Self {
+        Self {
+            retry: retry.map(window_key),
+            quit: quit.map(window_key),
+            settings: Adjust::ALL.map(|a| (window_key(a.key()), a)),
+        }
+    }
+}
+
+/// A key pressed in the window. A settings key steps again while held
+/// (key repeat); retry and quit act on the first press only.
+fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &Keys) {
+    if let Some(&(_, a)) = keys.settings.iter().find(|(k, _)| *k == key) {
+        controls.tuning().adjust(a);
+    } else if repeat {
+        // Retry and quit take the first press only.
+    } else if Some(key) == keys.retry {
+        controls.command(Command::Retry);
+    } else if Some(key) == keys.quit {
+        controls.command(Command::Quit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use game::{Adjust, Command, DeviceSettings};
+    use input::{DeviceKind, QpcClock};
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    use winit::platform::scancode::PhysicalKeyExtScancode;
+
+    use super::{Keys, key_pressed, window_key};
+    use crate::controls::Controls;
+
+    /// Raw Input's controls for Pause and NumLock (`input::raw::key_control`).
+    const PAUSE: u32 = 0xE11D;
+    const NUM_LOCK: u32 = 0x45;
+
+    /// Pause bound to retry and NumLock to quit, as `tapestry keys`
+    /// captures them: the key config is valid, and in the window Pause
+    /// retries and NumLock quits, never the other way round.
+    #[test]
+    fn pause_and_num_lock_mean_the_same_keys_in_the_window() {
+        let mut config = DeviceSettings::default().keyboard;
+        config.retry = Some(PAUSE);
+        config.quit = Some(NUM_LOCK);
+        assert_eq!(config.check(DeviceKind::Keyboard), Ok(()));
+        let keys = Keys::new(config.retry, config.quit);
+
+        let c = Controls::new(QpcClock::start());
+        let pause = PhysicalKey::Code(KeyCode::Pause);
+        key_pressed(&c, pause, false, &keys);
+        assert_eq!(c.take(), Some(Command::Retry));
+        assert!(!c.quitting());
+        // A held Pause repeats nothing.
+        key_pressed(&c, pause, true, &keys);
+        assert_eq!(c.take(), None);
+        key_pressed(&c, PhysicalKey::Code(KeyCode::NumLock), false, &keys);
+        assert_eq!(c.take(), None);
+        assert!(c.quitting());
+    }
+
+    /// Every key Raw Input can name (set 1 make codes, with `E0`, and
+    /// Pause), bound to retry, retries when the window reports the key
+    /// winit makes of the scan code its messages carry for it; and the
+    /// settings keys are F1 to F8 in the window too.
+    #[test]
+    fn every_raw_input_key_bound_to_retry_retries_in_the_window() {
+        let raw = (0x01..=0xFE).chain(0xE001..=0xE0FE).chain([PAUSE]);
+        let mut known = 0;
+        for control in raw {
+            // What the window's message carries for that key: winit then
+            // names it from this scan code.
+            let carried = match control {
+                PAUSE => 0x45,
+                NUM_LOCK => 0xE045,
+                c => c,
+            };
+            let pressed = PhysicalKey::from_scancode(carried);
+            if matches!(pressed, PhysicalKey::Code(_)) {
+                known += 1;
+            }
+            let c = Controls::new(QpcClock::start());
+            key_pressed(&c, pressed, false, &Keys::new(Some(control), None));
+            // A settings key's scan code steps the setting instead.
+            if Adjust::from_key(control).is_none() {
+                assert_eq!(c.take(), Some(Command::Retry), "{control:#x}");
+            }
+        }
+        assert!(known > 100, "{known} keys known to winit");
+        assert_eq!(window_key(PAUSE), PhysicalKey::Code(KeyCode::Pause));
+        assert_eq!(window_key(NUM_LOCK), PhysicalKey::Code(KeyCode::NumLock));
+        let f = [
+            KeyCode::F1,
+            KeyCode::F2,
+            KeyCode::F3,
+            KeyCode::F4,
+            KeyCode::F5,
+            KeyCode::F6,
+            KeyCode::F7,
+            KeyCode::F8,
+        ];
+        for (a, k) in Adjust::ALL.into_iter().zip(f) {
+            assert_eq!(window_key(a.key()), PhysicalKey::Code(k));
+            assert_eq!(PhysicalKey::Code(k).to_scancode(), Some(a.key()));
+        }
+        // F2 (hi-speed up) steps the visible time in the window.
+        let c = Controls::new(QpcClock::start());
+        key_pressed(
+            &c,
+            PhysicalKey::Code(KeyCode::F2),
+            true,
+            &Keys::new(None, None),
+        );
+        assert_eq!(c.tuning().get().visible_time_ms, 575);
+    }
+
+    /// Two Raw Input controls are one key in the window exactly when they
+    /// have one identity, the identity key configs are checked on; five
+    /// keys have two names.
+    #[test]
+    fn the_window_tells_keys_apart_as_key_configs_do() {
+        use eval::ControlId;
+        use input::raw::key_identity;
+        let raw: Vec<u32> = (0x01..=0xFE)
+            .chain(0xE001..=0xE0FE)
+            .chain([PAUSE])
+            .collect();
+        let keys: Vec<PhysicalKey> = raw.iter().map(|&c| window_key(c)).collect();
+        let ids: Vec<ControlId> = raw.iter().map(|&c| key_identity(ControlId(c))).collect();
+        let mut pairs = 0;
+        for i in 0..raw.len() {
+            for j in i + 1..raw.len() {
+                let one_key = keys[i] == keys[j];
+                assert_eq!(ids[i] == ids[j], one_key, "{:#x} {:#x}", raw[i], raw[j]);
+                pairs += usize::from(one_key);
+            }
+        }
+        assert_eq!(pairs, 5);
     }
 }

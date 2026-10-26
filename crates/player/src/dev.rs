@@ -47,6 +47,13 @@ pub struct Options {
     /// Retry once at the first end screen and quit at the second, to
     /// measure the retry time without a key press.
     pub auto_retry: bool,
+    /// Settings keys pressed by themselves when the first play reaches
+    /// `adjust_at_ms`.
+    pub adjust_in_play: Vec<game::Adjust>,
+    /// Settings keys pressed by themselves at the first end screen.
+    pub adjust_on_end: Vec<game::Adjust>,
+    /// The chart time, ms, at which `adjust_in_play` is pressed.
+    pub adjust_at_ms: i64,
 }
 
 impl Options {
@@ -62,6 +69,30 @@ impl Options {
     ) -> Result<bool, String> {
         if arg == "--dev-auto-retry" {
             self.auto_retry = true;
+            return Ok(true);
+        }
+        if arg == "--dev-adjust-at" {
+            let value = rest
+                .next()
+                .ok_or_else(|| "--dev-adjust-at needs a value".to_owned())?;
+            self.adjust_at_ms = value
+                .to_string_lossy()
+                .parse()
+                .map_err(|_| "--dev-adjust-at takes milliseconds".to_owned())?;
+            return Ok(true);
+        }
+        let adjust = if arg == "--dev-adjust" {
+            Some(&mut self.adjust_in_play)
+        } else if arg == "--dev-adjust-end" {
+            Some(&mut self.adjust_on_end)
+        } else {
+            None
+        };
+        if let Some(list) = adjust {
+            let value = rest
+                .next()
+                .ok_or_else(|| format!("{} needs a value", arg.to_string_lossy()))?;
+            *list = adjust_keys(&value.to_string_lossy())?;
             return Ok(true);
         }
         let slot = if arg == "--dev-scripted-input" {
@@ -126,11 +157,122 @@ fn read_limited(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>, Str
     Ok(bytes)
 }
 
+/// Settings keys by name, comma-separated: `F1` to `F8`.
+///
+/// # Errors
+///
+/// A name that is not a settings key.
+pub fn adjust_keys(list: &str) -> Result<Vec<game::Adjust>, String> {
+    list.split(',')
+        .map(|name| {
+            name.strip_prefix('F')
+                .and_then(|n| n.parse::<u32>().ok())
+                .and_then(|n| game::Adjust::from_key(0x3A + n))
+                .ok_or_else(|| format!("{name} is not a settings key (F1 to F8)"))
+        })
+        .collect()
+}
+
+/// One step of a scripted key config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyStep {
+    /// A keyboard key pressed and released, by scan code.
+    Key(u32),
+    /// A controller's control pressed and released.
+    Button(u32),
+    /// The window closes.
+    Close,
+}
+
+/// `keys --dev-scripted-keys <steps>`: presses offered to the capture slot
+/// in place of a person, one every 300 ms, comma-separated: a keyboard
+/// scan code in hex (`2a`), `b<n>` for a controller's control `n`, or
+/// `close` to close the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyScript(Vec<KeyStep>);
+
+impl KeyScript {
+    /// Reads the steps.
+    ///
+    /// # Errors
+    ///
+    /// A step that is none of the three forms.
+    pub fn parse(list: &str) -> Result<Self, String> {
+        list.split(',')
+            .map(|s| {
+                if s == "close" {
+                    Ok(KeyStep::Close)
+                } else if let Some(n) = s.strip_prefix('b') {
+                    n.parse().map(KeyStep::Button).map_err(|_| s.to_owned())
+                } else {
+                    u32::from_str_radix(s, 16)
+                        .map(KeyStep::Key)
+                        .map_err(|_| s.to_owned())
+                }
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+            .map_err(|s| format!("{s} is not a scan code, b<n> or close"))
+    }
+
+    /// Plays the steps on a thread of its own, as the input thread offers
+    /// presses; dropping the handle stops it.
+    pub fn spawn(self, capture: input::Capture, controls: Arc<crate::controls::Controls>) -> Stop {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            for step in self.0 {
+                for _ in 0..30 {
+                    if thread_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let (kind, control) = match step {
+                    KeyStep::Key(c) => (DeviceKind::Keyboard, c),
+                    KeyStep::Button(c) => (DeviceKind::Controller, c),
+                    KeyStep::Close => {
+                        controls.close();
+                        return;
+                    }
+                };
+                for value in [1, 0] {
+                    let packet = input::Packet {
+                        device: input::DeviceId(1),
+                        control: eval::ControlId(control),
+                        value,
+                        background: false,
+                    };
+                    capture.offer(&packet, kind, false);
+                }
+            }
+        });
+        Stop {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+/// Stops a scripted thread when dropped.
+pub struct Stop {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// The scripted input thread: the input thread's boundary every
 /// millisecond, the script fed by the hook. Stops when dropped.
 pub struct ScriptThread {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    _stop: Stop,
 }
 
 impl ScriptThread {
@@ -152,18 +294,11 @@ impl ScriptThread {
             })
             .map_err(|e| format!("the scripted input thread cannot start: {e}"))?;
         Ok(Self {
-            stop,
-            handle: Some(handle),
+            _stop: Stop {
+                stop,
+                handle: Some(handle),
+            },
         })
-    }
-}
-
-impl Drop for ScriptThread {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
     }
 }
 

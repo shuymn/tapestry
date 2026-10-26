@@ -31,7 +31,7 @@ use replay::Incomplete;
 
 use crate::logic::{AbortCause, Logic, LogicError, SourceRead};
 use crate::render::RenderSide;
-use crate::session::{Command, Loaded, PlayEnd, PlayOutcome, PlayReport};
+use crate::session::{Command, Loaded, PlayEnd, PlayOutcome, PlayReport, Settings};
 use crate::sound::{AudioQueue, audio_link_at};
 
 /// What opening recording gave.
@@ -122,6 +122,13 @@ pub trait Rig {
     fn ended(&mut self, report: &PlayReport);
     /// Shows the end screen of a play that neither quit nor retried.
     fn show_end(&mut self, report: &PlayReport);
+    /// Before each play opens recording: settings changed since the
+    /// previous play are written into `settings`, which the play is
+    /// evaluated and recorded with. The input offset changes only here, so
+    /// a change takes effect from the next play (D13).
+    fn before_play(&mut self, settings: &mut Settings) {
+        let _ = settings;
+    }
 }
 
 /// Why the run of plays stopped short.
@@ -220,6 +227,7 @@ fn play_and_next<R: Rig>(
     if rig.quitting() || rig.take() == Some(Command::Quit) {
         return Ok(None);
     }
+    rig.before_play(loaded.settings_mut());
     let start = loaded.begin_play();
     let opening = rig.open(loaded.config().lead_in);
     let origin = opening.origin;

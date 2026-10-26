@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use game::{AbortCause, PlayEnd, PlayReport};
+use game::{AbortCause, PlayEnd, PlayReport, Tuning};
 use rules::GaugeValue;
 
 /// How long loading took, shown on the end screen (D11).
@@ -196,6 +196,24 @@ pub fn lines(
     l
 }
 
+/// The settings keys and their values, under the summary. The input
+/// offset applies from the next play (D13).
+pub fn settings_lines(t: Tuning) -> Vec<String> {
+    vec![
+        String::new(),
+        format!("F1/F2 HI-SPEED: VISIBLE TIME {} MS", t.visible_time_ms),
+        format!(
+            "F3/F4 VOLUME {}%    F5/F6 DISPLAY OFFSET {} MS",
+            t.volume_percent,
+            ms(t.display_offset_us)
+        ),
+        format!(
+            "F7/F8 INPUT OFFSET {} MS FROM THE NEXT PLAY",
+            ms(t.input_offset_us)
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{key_name, ms};
@@ -208,6 +226,25 @@ mod tests {
         assert_eq!(key_name(Some(0x44)), "F10");
         assert_eq!(key_name(Some(0x2C)), "KEY 002C");
         assert_eq!(key_name(None), "UNBOUND");
+    }
+
+    #[test]
+    fn settings_lines_show_each_value_and_its_keys() {
+        let lines = super::settings_lines(game::Tuning {
+            visible_time_ms: 575,
+            volume_percent: 35,
+            display_offset_us: -2_000,
+            input_offset_us: 4_000,
+        });
+        assert_eq!(
+            lines,
+            [
+                "",
+                "F1/F2 HI-SPEED: VISIBLE TIME 575 MS",
+                "F3/F4 VOLUME 35%    F5/F6 DISPLAY OFFSET -2.0 MS",
+                "F7/F8 INPUT OFFSET +4.0 MS FROM THE NEXT PLAY",
+            ]
+        );
     }
 
     #[test]
