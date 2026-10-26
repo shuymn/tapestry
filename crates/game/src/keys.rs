@@ -144,9 +144,8 @@ pub struct KeyConfigFlow {
     steps: Vec<Role>,
     bound: Vec<(Role, Vec<Bound>)>,
     refused: Option<Refusal>,
-    /// Once a controller's control is bound: its product (`None` when
-    /// unknown).
-    device: Option<Option<HidProduct>>,
+    /// Once a controller's control is bound: its product.
+    device: Option<HidProduct>,
     /// While the scratch axis is turned to learn its range: what it has
     /// shown so far.
     learning: Option<Option<Watched>>,
@@ -238,7 +237,7 @@ impl KeyConfigFlow {
 
     /// The key configs of the roles bound so far, the controller's bound
     /// to `device`.
-    fn configs(bound: &[(Role, Vec<Bound>)], device: Option<Option<HidProduct>>) -> KeyConfigs {
+    fn configs(bound: &[(Role, Vec<Bound>)], device: Option<HidProduct>) -> KeyConfigs {
         let empty = || KeyConfig {
             lanes: Vec::new(),
             retry: None,
@@ -266,7 +265,7 @@ impl KeyConfigFlow {
             }
         }
         if !c.controller.lanes.is_empty() {
-            c.controller_device = device.flatten();
+            c.controller_device = device;
         }
         c
     }
@@ -312,13 +311,17 @@ impl KeyConfigFlow {
             (vec![pressed], product)
         };
         let controller = chosen.iter().any(|b| b.kind == DeviceKind::Controller);
-        if controller && from.is_none() {
-            return self.refuse(Refusal::UnknownController);
-        }
-        if controller && self.device.is_some_and(|d| d != from) {
-            return self.refuse(Refusal::OtherController);
-        }
-        let device = if controller { Some(from) } else { self.device };
+        let device = if controller {
+            let Some(from) = from else {
+                return self.refuse(Refusal::UnknownController);
+            };
+            if self.device.is_some_and(|d| d != from) {
+                return self.refuse(Refusal::OtherController);
+            }
+            Some(from)
+        } else {
+            self.device
+        };
         self.bound.push((role, chosen.clone()));
         let candidate = Self::configs(&self.bound, device);
         if let Err(e) = candidate.check() {

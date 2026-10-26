@@ -552,62 +552,66 @@ impl SourceSet {
     /// `now − origin`.
     pub fn open_play(&mut self, now: TimeUs, origin: TimeUs) -> InputStart {
         self.close_recording();
-        // Controllers first, so keyboards' many handles never push a
-        // controller out at the limit; each kind in the order found.
-        let mut order: Vec<usize> = (0..self.devices.len())
-            .filter(|&i| self.devices[i].takes_part)
-            .collect();
-        order.sort_by_key(|&i| self.devices[i].kind != DeviceKind::Controller);
-        let n = order.len().min(self.config.max_sources);
-        let left_out = order.len() - n + self.untracked;
+        let taking = self.devices.iter().filter(|d| d.takes_part).count();
+        let n = taking.min(self.config.max_sources);
+        let left_out = taking - n + self.untracked;
+        let capacity = self.config.queue_capacity;
         let mut overflowed = false;
         let mut participants = Vec::with_capacity(n);
         let mut readers = Vec::with_capacity(n);
         let mut held = Vec::new();
-        for (i, &d) in order.iter().take(n).enumerate() {
-            let device = &mut self.devices[d];
-            // `SourceSet::new` bounds `max_sources` by `SOURCE_LIMIT`.
-            let source = SourceId(u16::try_from(i).expect("source ids fit in u16"));
-            device.source = Some(source);
-            overflowed |= device.state_lost;
-            // An axis is recorded only if the device declares it now: the
-            // recording window was sized for these, and an axis a late
-            // collection adds is not recorded in this play.
-            let declared = &device.axes[..device.n_axes];
-            let recorded: Vec<ControlId> = device
-                .recorded
-                .iter()
-                .copied()
-                .filter(|&c| {
-                    device.kind != DeviceKind::Controller
-                        || !is_axis(c)
-                        || declared.iter().any(|a| a.control == c)
-                })
-                .collect();
-            held.extend(
-                device
-                    .held
+        // Controllers first, so keyboards' many handles never push a
+        // controller out at the limit; each kind in the order found.
+        for kind in [DeviceKind::Controller, DeviceKind::Keyboard] {
+            let devices = self.devices.iter_mut();
+            for device in devices.filter(|d| d.takes_part && d.kind == kind) {
+                let i = participants.len();
+                if i == n {
+                    break;
+                }
+                // `SourceSet::new` bounds `max_sources` by `SOURCE_LIMIT`.
+                let source = SourceId(u16::try_from(i).expect("source ids fit in u16"));
+                device.source = Some(source);
+                overflowed |= device.state_lost;
+                // An axis is recorded only if the device declares it now: the
+                // recording window was sized for these, and an axis a late
+                // collection adds is not recorded in this play.
+                let declared = &device.axes[..device.n_axes];
+                let recorded: Vec<ControlId> = device
+                    .recorded
                     .iter()
-                    .filter(|(c, _)| recorded.contains(c))
-                    .map(|&(c, v)| (source, c, v)),
-            );
-            held.extend(
-                device.axes[..device.n_axes]
-                    .iter()
-                    .zip(device.positions)
-                    .filter(|(a, _)| recorded.contains(&a.control))
-                    .filter_map(|(a, p)| p.map(|v| (source, a.control, v))),
-            );
-            let (writer, reader) = source_queue(self.config.queue_capacity);
-            participants.push(Participant {
-                device: device.id,
-                kind: device.kind,
-                writer,
-                closed: false,
-                recorded,
-                out_of_range: 0,
-            });
-            readers.push(reader);
+                    .copied()
+                    .filter(|&c| {
+                        device.kind != DeviceKind::Controller
+                            || !is_axis(c)
+                            || declared.iter().any(|a| a.control == c)
+                    })
+                    .collect();
+                held.extend(
+                    device
+                        .held
+                        .iter()
+                        .filter(|(c, _)| recorded.contains(c))
+                        .map(|&(c, v)| (source, c, v)),
+                );
+                held.extend(
+                    device.axes[..device.n_axes]
+                        .iter()
+                        .zip(device.positions)
+                        .filter(|(a, _)| recorded.contains(&a.control))
+                        .filter_map(|(a, p)| p.map(|v| (source, a.control, v))),
+                );
+                let (writer, reader) = source_queue(capacity);
+                participants.push(Participant {
+                    device: device.id,
+                    kind: device.kind,
+                    writer,
+                    closed: false,
+                    recorded,
+                    out_of_range: 0,
+                });
+                readers.push(reader);
+            }
         }
         self.recording = Some(Recording {
             participants,

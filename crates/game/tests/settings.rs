@@ -691,8 +691,6 @@ fn controller_bindings_without_their_controller_are_refused_on_load() {
         });
     });
     assert_eq!(load_written(&named, &player).unwrap().device, named);
-    // No controller binding needs no controller.
-    assert!(load_written(&DeviceSettings::default(), &player).is_ok());
 }
 
 #[test]

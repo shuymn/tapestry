@@ -234,8 +234,13 @@ impl Hook {
                 }
                 reset_gate(sources, &self.controls);
                 let start = sources.open_play(now, origin);
-                if let Some(note) = left_out_note(sources) {
-                    eprintln!("{note}");
+                // Devices the source limit left out: keyboards, when any
+                // is (controllers come first), possibly one with lanes.
+                let n = sources.left_out();
+                if n > 0 {
+                    eprintln!(
+                        "input: {n} connected device(s) take no part in this play: more devices than sources; a keyboard left out records nothing, and the log is marked incomplete"
+                    );
                 }
                 start
             }
@@ -319,18 +324,6 @@ fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
     matched || recorded.controller_device.is_none()
 }
 
-/// What the console says before a play that left devices out at the
-/// source limit: keyboards, when any is (controllers come first), and
-/// possibly one whose keys play lanes.
-fn left_out_note(sources: &SourceSet) -> Option<String> {
-    let n = sources.left_out();
-    (n > 0).then(|| {
-        format!(
-            "input: {n} connected device(s) take no part in this play: more devices than sources; a keyboard left out records nothing, and the log is marked incomplete"
-        )
-    })
-}
-
 /// Opens the gate for a new play; a window without focus latches it again
 /// at once, so a play never records while the game is in the background.
 fn reset_gate(sources: &mut SourceSet, controls: &Controls) {
@@ -347,7 +340,7 @@ mod tests {
     use input::hid::HidProduct;
     use input::{DeviceId, DeviceKind, Packet, SourceConfig, SourceSet};
 
-    use super::{Recorded, left_out_note, take_part};
+    use super::{Recorded, take_part};
 
     /// The configured controller: function 1 of a composite device.
     const CONFIGURED: HidProduct = HidProduct {
@@ -478,10 +471,11 @@ mod tests {
         }
     }
 
-    /// The console says how many devices the source limit left out before
-    /// the play, and nothing when none was.
+    /// At the source limit the configured controller takes part and the
+    /// keyboards beyond it are counted as left out, which the console
+    /// reports before the play; nothing is left out below the limit.
     #[test]
-    fn devices_left_out_at_the_limit_are_reported() {
+    fn devices_left_out_at_the_limit_are_counted() {
         let mut set = set_of(2);
         set.begin_batch(TimeUs(0));
         for d in [1, 2, 3] {
@@ -491,14 +485,12 @@ mod tests {
         set.set_product(DeviceId(10), CONFIGURED);
         assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
         set.open_recording(TimeUs(1));
-        let note = left_out_note(&set).unwrap();
-        assert!(
-            note.starts_with("input: 2 connected device(s) take no part"),
-            "{note}"
-        );
+        assert_eq!(set.left_out(), 2);
+        let sources: Vec<u64> = set.participants().map(|(d, _)| d.0).collect();
+        assert_eq!(sources, [10, 1]);
         let mut set = devices(&[(10, CONFIGURED)]);
         assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
         set.open_recording(TimeUs(1));
-        assert_eq!(left_out_note(&set), None);
+        assert_eq!(set.left_out(), 0);
     }
 }

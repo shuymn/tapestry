@@ -583,14 +583,10 @@ fn utf16(s: &str) -> Vec<u16> {
 fn place_all(paths: &[&str]) -> Vec<Placement> {
     let mut placed: Vec<Placement> = Vec::new();
     for path in paths {
-        let connected: Vec<_> = placed.iter().map(|p| (p.group, p.collection)).collect();
         let path = utf16(path);
-        placed.push(place_collection(
-            Some(&path),
-            Some(BOX),
-            Some(IDS),
-            connected,
-        ));
+        let connected = placed.iter().map(|p| (p.group, p.collection));
+        let placement = place_collection(Some(&path), Some(BOX), Some(IDS), connected);
+        placed.push(placement);
     }
     placed
 }
