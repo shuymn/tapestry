@@ -126,3 +126,54 @@ fn recommend(events: &[JudgeEvent]) -> Option<RecommendedOffset> {
         samples: n,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use bms_model::{Lane, TimeUs};
+    use eval::{JudgeEvent, JudgeEventKind};
+    use rules::Judgment;
+
+    use super::{MIN_OFFSET_SAMPLES, RecommendedOffset, recommend};
+
+    fn judged(deviation: Option<i64>) -> JudgeEvent {
+        JudgeEvent {
+            seq: 0,
+            time: TimeUs(0),
+            origin: None,
+            kind: JudgeEventKind::Judged {
+                lane: Lane::SCRATCH,
+                note: 0,
+                judgment: Judgment::Great,
+                deviation: deviation.map(TimeUs),
+                combo: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn recommendation_needs_enough_presses_and_takes_median_and_quartiles() {
+        // Deviations -15 to +16 ms, out of order, plus a miss and an event
+        // that is not a judgment, which do not count.
+        let mut events: Vec<JudgeEvent> = (0..32)
+            .map(|i| judged(Some((((i * 13) % 32) - 15) * 1_000)))
+            .collect();
+        events.push(judged(None));
+        events.push(JudgeEvent {
+            kind: JudgeEventKind::SongEnd,
+            ..judged(None)
+        });
+        assert_eq!(MIN_OFFSET_SAMPLES, 32);
+        // Sorted, value i is (i − 15) ms: the median is value 16, the
+        // quartiles values 8 and 24.
+        assert_eq!(
+            recommend(&events),
+            Some(RecommendedOffset {
+                median: TimeUs(1_000),
+                spread: TimeUs(9_000 - -7_000),
+                samples: 32,
+            })
+        );
+        events.remove(0);
+        assert_eq!(recommend(&events), None);
+    }
+}

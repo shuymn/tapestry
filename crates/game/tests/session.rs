@@ -4,6 +4,8 @@
 mod common;
 
 use std::cell::RefCell;
+
+use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -748,6 +750,184 @@ fn bad_key_config_refuses_to_play_and_closes_recording() {
         err,
         game::LogicError::Eval(eval::EvalError::DuplicateBinding { .. })
     ));
+}
+
+#[test]
+fn passthrough_transform_is_recorded() {
+    let (_dir, root) = temp_root();
+    let path = common::write_bms(&root.path().join("charts"));
+    let bytes = fs::read(&path).unwrap();
+    let settings = Settings::load(&root).unwrap();
+    let parts = Parts::standard(&root, &settings.player);
+    let loaded = Loaded::load(root.clone(), settings, &path, config(), parts).unwrap();
+    // The chart is the loader's, unchanged.
+    let direct = bms_parser::load_bms(
+        &bytes,
+        path.parent().unwrap(),
+        &bms_parser::LoadOptions {
+            seed: 7,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(*loaded.chart(), direct.chart);
+    assert_eq!(common::judgeable(loaded.chart()), 8);
+    let chart = loaded.chart().clone();
+    let audio = steady_audio(&chart, common::bank(&chart));
+    let mut s = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
+    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard]);
+    let events = input::autoplay(&chart, &profile.sources[0]).unwrap();
+    let input = ScriptedInput::from_log(&Default::default(), &events, &[DeviceKind::Keyboard]);
+    let one = s
+        .play(PlayScript {
+            input,
+            commands: Vec::new(),
+        })
+        .unwrap();
+
+    assert_eq!(count_judged(&one.live, Judgment::Perfect), 8);
+    let saved = &one.saved.as_ref().unwrap().as_ref().unwrap().path;
+    let rec = replay::decode(&fs::read(saved).unwrap(), &DecodeLimits::STANDARD).unwrap();
+    assert_eq!(
+        rec.chart.transform,
+        replay::TransformRecord {
+            id: "passthrough".to_owned(),
+            version: 1
+        }
+    );
+    assert_eq!(rec.chart.random_seed, 7);
+    let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+    assert_eq!(rec.chart.identity.sha256, sha);
+}
+
+/// A steady simulated device whose writes fail from the wake at `fail_from`
+/// on.
+struct Failing {
+    inner: SimDevice,
+    last: TimeUs,
+    fail_from: TimeUs,
+}
+
+impl audio::AudioOutput for Failing {
+    fn rate(&self) -> u32 {
+        self.inner.rate()
+    }
+    fn period(&self) -> u32 {
+        self.inner.period()
+    }
+    fn wait(&mut self) -> audio::Wake {
+        let w = self.inner.wait();
+        self.last = w.at;
+        w
+    }
+    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), audio::OutputError> {
+        if self.last >= self.fail_from {
+            return Err(audio::OutputError::DeviceLost);
+        }
+        self.inner.write(f)
+    }
+}
+
+impl game::Wakes for Failing {
+    fn next_wake(&self) -> TimeUs {
+        self.inner.next_wake()
+    }
+}
+
+/// A session over `chart` and `bank` whose output fails from `fail_from`
+/// (session time), stepping `step`.
+fn failing_session(
+    root: &DataRoot,
+    chart: &Chart,
+    bank: Arc<SoundBank>,
+    fail_from: i64,
+    step: i64,
+) -> Session<Failing> {
+    let settings = Settings::load(root).unwrap();
+    let config = SessionConfig {
+        step: TimeUs(step),
+        ..config()
+    };
+    let parts = parts(root, chart, &Events::default());
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config, parts).unwrap();
+    let engine = AudioEngine::new(bank, &chart.bgm, RATE, PERIOD, MAX_VOICES, 0).unwrap();
+    let out = Failing {
+        inner: SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+        last: TimeUs(i64::MIN),
+        fail_from: TimeUs(fail_from),
+    };
+    loaded.start(
+        RunnerAudio::new(engine, out),
+        SourceSet::new(common::sources()).unwrap(),
+    )
+}
+
+#[test]
+fn audio_failure_ends_the_play_where_it_is_seen() {
+    let chart = taps(&NOTES);
+    let bank = common::bank(&chart);
+    // Steps of 3 ms and wakes every 10 ms; play 1's chart time 0 is at
+    // session time 1 s. The wake at 1.51 s falls between the steps at
+    // 1.509 and 1.512 s, so the step at 1.512 s runs it before advancing:
+    // the play ends at the watermark of the step at 1.509 s,
+    // 1 509 000 − 1 000 000 − 1.
+    let (_dir, root) = temp_root();
+    let mut s = failing_session(&root, &chart, bank.clone(), 1_510 * MS, 3 * MS);
+    let one = s.play(script(vec![connect(0)], &[])).unwrap();
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::OutputFailed));
+    assert_eq!(one.output_error, Some(audio::OutputError::DeviceLost));
+    assert_eq!(status(&one), (EndStatus::EndedMidway, TimeUs(508_999)));
+    assert_eq!(s.now(), TimeUs(1_512 * MS));
+
+    // The wake at 1.5 s falls on a step: it runs after that step advanced,
+    // and the play ends in that same step.
+    let (_dir, root) = temp_root();
+    let mut s = failing_session(&root, &chart, bank, 1_500 * MS, 3 * MS);
+    let two = s.play(script(vec![connect(0)], &[])).unwrap();
+    assert_eq!(two.end, PlayEnd::Aborted(AbortCause::OutputFailed));
+    assert_eq!(status(&two), (EndStatus::EndedMidway, TimeUs(499_999)));
+    assert_eq!(s.now(), TimeUs(1_500 * MS));
+}
+
+#[test]
+fn audio_failure_in_the_tail_keeps_the_play_complete() {
+    let (chart, bank) = tail_chart();
+    let (_dir, root) = temp_root();
+    // The BGM plays until 5.0 s; the device fails at 3.0 s.
+    let mut s = failing_session(&root, &chart, bank, 3_000 * MS, MS);
+    let mut items = vec![connect(0)];
+    items.extend(presses(&[(1, 1_000), (1, 1_100)]));
+    let one = s.play(script(items, &[])).unwrap();
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(status(&one).0, EndStatus::PlayedToEnd);
+    assert_eq!(one.output_error, Some(audio::OutputError::DeviceLost));
+    assert_eq!(s.now(), TimeUs(3_000 * MS));
+}
+
+#[test]
+fn reevaluation_refuses_a_record_of_another_preset() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&[(1, 1_000)]);
+    let mut s = session(&root, &chart, &Events::default());
+    let mut items = vec![connect(0)];
+    items.extend(presses(&[(1, 1_000)]));
+    let one = s.play(script(items, &[])).unwrap();
+    let other = wide_perfect();
+    let summary = game::ResultExtension::on_play_end(
+        &mut ReEvaluate,
+        &game::ResultContext {
+            record: one.record.as_ref().unwrap(),
+            chart: &chart,
+            preset: &other,
+            live: &one.live,
+        },
+    );
+    assert_eq!(
+        summary.evaluation,
+        Err(game::ReEvaluationError::PresetMismatch)
+    );
+    assert!(!summary.matches_live);
+    assert_eq!(summary.recommended_offset, None);
 }
 
 #[test]

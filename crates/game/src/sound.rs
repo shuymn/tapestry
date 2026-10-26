@@ -239,4 +239,22 @@ mod tests {
         sink.receive(&event(play, None));
         assert_eq!(queue.commands().pop().unwrap().origin, TimeUs(5_000));
     }
+
+    #[test]
+    fn a_play_away_from_the_output_origin_moves_each_origin_onto_it() {
+        // The play's time 0 is at 2.5 s on the output's timeline.
+        let (mut sink, mut queue) = audio_link_at(2, TimeUs(2_500_000));
+        let play = JudgeEventKind::PlaySound {
+            lane: Lane::SCRATCH,
+            sound: SoundId(3),
+        };
+        sink.receive(&event(play, Some(TimeUs(-4_321))));
+        assert_eq!(
+            queue.commands().pop(),
+            Ok(SoundCmd {
+                sound: SoundId(3),
+                origin: TimeUs(2_495_679)
+            })
+        );
+    }
 }

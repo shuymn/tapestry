@@ -263,6 +263,7 @@ dependencies = [
  "rtrb",
  "rules",
  "serde",
+ "sha2",
  "tempfile",
  "toml",
  "triple_buffer",
