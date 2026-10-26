@@ -434,21 +434,21 @@ impl OnScreen {
 
     /// The frame built since the last call was presented with
     /// `present_count`: it is the first presented frame of what it drew.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "`slot` reduces `seq` modulo the slot count"
-    )]
     pub fn presented(&mut self, present_count: u32) {
-        for k in (0..self.order.len()).rev() {
-            let seq = self.order[k];
+        for &seq in self.order.iter().rev() {
             let i = self.slot(seq);
-            if self.slots[i].seq != seq {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`slot` reduces `seq` modulo the slot count, which is at least 1"
+            )]
+            let slot = &mut self.slots[i];
+            if slot.seq != seq {
                 continue;
             }
-            if self.slots[i].frame.is_some() {
+            if slot.frame.is_some() {
                 break;
             }
-            self.slots[i].frame = Some(present_count);
+            slot.frame = Some(present_count);
         }
     }
 
@@ -486,18 +486,21 @@ impl OnScreen {
     /// The frame built since the last call failed, or was presented
     /// without a present count to pair it with: what it drew is N/A, while
     /// earlier frames keep their pairings.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "`slot` reduces `seq` modulo the slot count"
-    )]
     pub fn presented_unknown(&mut self) {
         for k in (0..self.order.len()).rev() {
-            let seq = self.order[k];
+            // `k` is below the length, which this loop (and `give_up`)
+            // does not change.
+            let Some(&seq) = self.order.get(k) else { break };
             let i = self.slot(seq);
-            if self.slots[i].seq != seq {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`slot` reduces `seq` modulo the slot count, which is at least 1"
+            )]
+            let slot = self.slots[i];
+            if slot.seq != seq {
                 continue;
             }
-            if self.slots[i].frame.is_some() {
+            if slot.frame.is_some() {
                 break;
             }
             self.give_up(seq);
