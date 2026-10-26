@@ -8,8 +8,13 @@
 //! [`Grant::fallback`]. The output keeps two periods queued at first (fewer
 //! only if the buffer cannot hold them); between plays the queue can be
 //! deepened up to [`MAX_QUEUE_PERIODS`] that the buffer holds
-//! ([`AudioOutput::set_queue_periods`]). The thread that opens it joins the
-//! MMCSS "Pro Audio" task.
+//! ([`AudioOutput::set_queue_periods`]). `IAudioClient3` chooses its own
+//! buffer, often just over two periods; when its shortest period is also
+//! the default one, nothing is gained from it, and `IAudioClient` is
+//! initialized at that period with a buffer of [`MAX_QUEUE_PERIODS`]
+//! instead ([`Grant::widened`]). The buffer's size adds no latency: only
+//! the queued frames do. The thread that opens it joins the MMCSS "Pro
+//! Audio" task.
 //!
 //! The mix clock is taken from the buffer events by the engine.
 //! `IAudioClock::GetPosition` is read at each wake only as a diagnostic
@@ -143,6 +148,10 @@ pub struct Grant {
     pub engine_periods: Option<EnginePeriods>,
     /// Why the default period was used instead of the shortest, if it was.
     pub fallback: Option<Fallback>,
+    /// Whether `IAudioClient3`'s buffer held fewer than
+    /// [`MAX_QUEUE_PERIODS`] at a shortest period equal to the default, so
+    /// `IAudioClient` was initialized at that period with a wider buffer.
+    pub widened: bool,
     /// Whether the opening thread joined MMCSS "Pro Audio".
     pub mmcss: bool,
 }
@@ -326,6 +335,56 @@ fn buffer_periods(buffer: u32, period: u32) -> u32 {
 fn room(queue: u32, padding: u32, period: u32) -> u32 {
     let period = period.max(1);
     queue.saturating_sub(padding) / period * period
+}
+
+/// Whether to give up `IAudioClient3`'s stream for `IAudioClient` at the
+/// default period with a wider buffer: its buffer holds fewer than
+/// [`MAX_QUEUE_PERIODS`] of its periods and its shortest period is the
+/// default, so the shorter period it exists for is not there to lose.
+fn widen(periods: &EnginePeriods, buffer: u32, period: u32) -> bool {
+    buffer_periods(buffer, period) < MAX_QUEUE_PERIODS && periods.min >= periods.default
+}
+
+/// The buffer to ask `IAudioClient::Initialize` for, 100 ns units:
+/// [`MAX_QUEUE_PERIODS`] default periods and half of one more, so rounding
+/// to frames cannot leave it short.
+fn wide_buffer_hns(default_period_hns: i64) -> i64 {
+    default_period_hns * i64::from(MAX_QUEUE_PERIODS) + default_period_hns / 2
+}
+
+/// A fresh client on `device`, initialized at the default period with a
+/// buffer of [`MAX_QUEUE_PERIODS`] periods, and that period in frames.
+///
+/// # Safety
+///
+/// `format` is the endpoint's mix format.
+unsafe fn init_default(
+    device: &windows::Win32::Media::Audio::IMMDevice,
+    format: *const WAVEFORMATEX,
+    rate: u32,
+) -> Result<(IAudioClient, u32), WasapiError> {
+    let os = WasapiError::os;
+    // SAFETY: COM calls on live interfaces; `format` per the contract.
+    unsafe {
+        let client: IAudioClient = device
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|e| os("Activate(IAudioClient)", e))?;
+        let mut default = 0;
+        client
+            .GetDevicePeriod(Some(&mut default), None)
+            .map_err(|e| os("GetDevicePeriod", e))?;
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                wide_buffer_hns(default),
+                0,
+                format,
+                None,
+            )
+            .map_err(|e| os("IAudioClient::Initialize", e))?;
+        Ok((client, hns_to_frames(default, rate)))
+    }
 }
 
 /// A duration in 100 ns units as frames at `rate` (floor).
@@ -737,29 +796,24 @@ impl<C: TimeSource> WasapiShared<C> {
                 Some(f) => Err(f),
                 None => init_shortest(&probe, format.0, &mut engine_periods),
             };
-            let (client, period, fallback) = match shortest {
-                Ok((client, period)) => (client, period, None),
+            let (client, period, fallback, widened) = match shortest {
+                Ok((client, period)) => {
+                    let buffer = client.GetBufferSize().map_err(|e| os("GetBufferSize", e))?;
+                    match engine_periods {
+                        Some(p) if widen(&p, buffer, period) => {
+                            // Released before the wider stream opens.
+                            drop(client);
+                            let (client, period) = init_default(&device, format.0, rate)?;
+                            (client, period, None, true)
+                        }
+                        _ => (client, period, None, false),
+                    }
+                }
                 Err(fallback) => {
                     // A fresh client: a refused one cannot be initialized
                     // again.
-                    let client: IAudioClient = device
-                        .Activate(CLSCTX_ALL, None)
-                        .map_err(|e| os("Activate(IAudioClient)", e))?;
-                    client
-                        .Initialize(
-                            AUDCLNT_SHAREMODE_SHARED,
-                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                            0,
-                            0,
-                            format.0,
-                            None,
-                        )
-                        .map_err(|e| os("IAudioClient::Initialize", e))?;
-                    let mut default = 0;
-                    client
-                        .GetDevicePeriod(Some(&mut default), None)
-                        .map_err(|e| os("GetDevicePeriod", e))?;
-                    (client, hns_to_frames(default, rate), Some(fallback))
+                    let (client, period) = init_default(&device, format.0, rate)?;
+                    (client, period, Some(fallback), false)
                 }
             };
             let buffer = client.GetBufferSize().map_err(|e| os("GetBufferSize", e))?;
@@ -782,6 +836,7 @@ impl<C: TimeSource> WasapiShared<C> {
                 max_queue_periods: buffer_periods(buffer, period),
                 engine_periods,
                 fallback,
+                widened,
                 mmcss: mmcss.is_some(),
             };
             (client, grant, render, position)
@@ -975,6 +1030,26 @@ mod tests {
         assert_eq!(buffer_periods(4_800, 480), 3);
         assert_eq!(buffer_periods(959, 480), 1);
         assert_eq!(buffer_periods(100, 480), 1);
+    }
+
+    /// `IAudioClient3` is given up only for a buffer short of three periods
+    /// at a shortest period that is the default one.
+    #[test]
+    fn a_short_buffer_is_widened_only_when_no_shorter_period_is_lost() {
+        let fixed = EnginePeriods {
+            default: 441,
+            fundamental: 441,
+            min: 441,
+            max: 441,
+        };
+        let shorter = EnginePeriods { min: 147, ..fixed };
+        // This PC's interface: 970 frames hold two periods of 441.
+        assert!(widen(&fixed, 970, 441));
+        assert!(!widen(&fixed, 1_323, 441));
+        assert!(!widen(&shorter, 400, 147));
+        // 10 ms: three periods and a half, 35 ms.
+        assert_eq!(wide_buffer_hns(100_000), 350_000);
+        assert!(hns_to_frames(wide_buffer_hns(100_000), 44_100) >= 3 * 441);
     }
 
     #[test]
