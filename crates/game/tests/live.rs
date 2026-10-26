@@ -119,8 +119,9 @@ struct Fake {
     /// Waits after the seal before the audio is done.
     tail_waits: usize,
     waits_since_seal: usize,
-    /// A suspend arrives while the close request is handled.
-    suspend_in_close: bool,
+    /// A command that arrives while the close request is handled.
+    in_close: Option<Command>,
+    cancels: usize,
     shows: usize,
     reports: Vec<PlayReport>,
 }
@@ -152,7 +153,8 @@ impl Fake {
             sealed: false,
             tail_waits: 0,
             waits_since_seal: 0,
-            suspend_in_close: false,
+            in_close: None,
+            cancels: 0,
             shows: 0,
             reports: Vec::new(),
         }
@@ -254,6 +256,7 @@ impl Rig for Fake {
     }
 
     fn cancel_audio(&mut self) {
+        self.cancels += 1;
         self.drain_sounds();
     }
 
@@ -267,8 +270,8 @@ impl Rig for Fake {
 
     fn close(&mut self) -> Closing {
         // Batches the input thread received before it took the request.
-        if self.suspend_in_close {
-            self.commands.push((i64::MIN, Command::Suspend));
+        if let Some(c) = self.in_close.take() {
+            self.commands.push((i64::MIN, c));
         }
         let lag = TimeUs(self.clock.now().0 + self.close_lag);
         self.script.poll(lag, &mut self.sources);
@@ -504,7 +507,7 @@ fn a_suspend_during_the_close_marks_the_record() {
     let mut loaded = loaded(dir.path());
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[], 9_500_000);
-    rig.suspend_in_close = true;
+    rig.in_close = Some(Command::Suspend);
     game::live::run(&mut loaded, &mut rig).unwrap();
     let one = &rig.reports[0];
     assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
@@ -591,4 +594,66 @@ fn each_report_carries_the_preset_its_play_used() {
     assert_ne!(old, new);
     assert_eq!(ids(&rig.reports[0]), old);
     assert_eq!(ids(&rig.reports[1]), new);
+}
+
+fn status(report: &PlayReport) -> replay::Status {
+    report.record.as_ref().unwrap().status
+}
+
+/// A retry that arrives as a completed play's recording closes, its audio
+/// already done: the run retries, and the record stays complete.
+#[test]
+fn a_retry_during_close_with_the_audio_done_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    rig.in_close = Some(Command::Retry);
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    // Retried without an end screen; the quit comes during play 2.
+    assert_eq!(rig.reports.len(), 2);
+    assert_eq!(rig.shows, 0);
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.tail_cut, Some(AbortCause::Retry));
+    // Complete at the step whose watermark passed the last miss deadline,
+    // 1.68 s after the 3 ms offset.
+    let s = status(one);
+    assert_eq!(s.end, replay::EndStatus::PlayedToEnd);
+    assert!(s.finalized >= TimeUs(1_680_000));
+}
+
+/// A retry that arrives as an aborted play's recording closes is the
+/// run's next step: it retries without the end screen.
+#[test]
+fn a_retry_during_close_after_an_abort_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Suspend)], 12_500_000);
+    rig.in_close = Some(Command::Retry);
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.reports[0].end, PlayEnd::Aborted(AbortCause::Suspend));
+    assert_eq!(rig.reports.len(), 2);
+    assert_eq!(rig.origins.len(), 2);
+}
+
+/// A suspend that arrives as a completed play's recording closes, with a
+/// long tail still to play: the tail is cut and the record marked.
+#[test]
+fn a_suspend_during_close_cuts_a_long_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    rig.tail_waits = 2_000;
+    rig.in_close = Some(Command::Suspend);
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.tail_cut, Some(AbortCause::Suspend));
+    assert_eq!(rig.cancels, 1);
+    let s = status(one);
+    assert_eq!(s.end, replay::EndStatus::PlayedToEnd);
+    assert!(s.incomplete.suspend);
 }

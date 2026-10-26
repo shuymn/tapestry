@@ -715,7 +715,9 @@ impl<O: AudioOutput + Wakes> Session<O> {
             Ok(Some(report)) => Ok(report),
             Ok(None) => unreachable!("a session never quits before recording opens"),
             Err(LiveError::Logic(e)) => Err(e),
-            Err(LiveError::Screen(_)) => unreachable!("a session has no screen to fail"),
+            Err(LiveError::Screen(_) | LiveError::Audio(_)) => {
+                unreachable!("a session has no screen or audio thread to fail")
+            }
         }
     }
 }

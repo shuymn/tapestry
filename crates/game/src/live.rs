@@ -88,6 +88,15 @@ pub trait Rig {
     ///
     /// Why the screen cannot draw a play, which ends the run.
     fn prepare_screen(&mut self) -> Result<(), String>;
+    /// Waits until audio is ready for a play: the previous play's switch
+    /// taken. Before recording opens.
+    ///
+    /// # Errors
+    ///
+    /// Why audio cannot play, which ends the run.
+    fn prepare_audio(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// Opens recording at the next input boundary, with chart time 0
     /// `lead_in` after it.
     fn open(&mut self, lead_in: TimeUs) -> Opening<Self::Reader>;
@@ -123,6 +132,8 @@ pub enum LiveError {
     Logic(LogicError),
     /// The screen cannot draw a play.
     Screen(String),
+    /// Audio cannot play.
+    Audio(String),
 }
 
 impl fmt::Display for LiveError {
@@ -130,6 +141,7 @@ impl fmt::Display for LiveError {
         match self {
             Self::Logic(e) => write!(f, "the play cannot start: {e}"),
             Self::Screen(e) => write!(f, "the screen cannot draw the play: {e}"),
+            Self::Audio(e) => write!(f, "audio cannot play: {e}"),
         }
     }
 }
@@ -145,11 +157,15 @@ impl std::error::Error for LiveError {}
 /// [`LiveError`] when a play cannot start; the plays before it are saved.
 pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError> {
     loop {
-        let Some(report) = play(loaded, rig)? else {
+        let Some((report, next)) = play_and_next(loaded, rig)? else {
             return Ok(());
         };
         rig.ended(&report);
-        let by = |c| report.end == PlayEnd::Aborted(c) || report.tail_cut == Some(c);
+        let by = |c: AbortCause| {
+            report.end == PlayEnd::Aborted(c)
+                || report.tail_cut == Some(c)
+                || next.map(Command::cause) == Some(c)
+        };
         if rig.quitting() || by(AbortCause::Quit) {
             return Ok(());
         }
@@ -186,10 +202,20 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError> {
 /// [`LiveError`] when the screen or the logic step cannot start; recording
 /// is closed again.
 pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayReport>, LiveError> {
+    Ok(play_and_next(loaded, rig)?.map(|(report, _)| report))
+}
+
+/// [`play`], with the command that arrived as recording closed after an
+/// abort: the run's next step (a completed play's tail takes it).
+fn play_and_next<R: Rig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+) -> Result<Option<(PlayReport, Option<Command>)>, LiveError> {
     if rig.quitting() {
         return Ok(None);
     }
     rig.prepare_screen().map_err(LiveError::Screen)?;
+    rig.prepare_audio().map_err(LiveError::Audio)?;
     // A retry or suspend from before this play belongs to no play.
     if rig.quitting() || rig.take() == Some(Command::Quit) {
         return Ok(None);
@@ -273,14 +299,13 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
     // Recording closes at the end of evaluation (D13); an aborted play
     // then takes what reached its queues after the abort.
     let closing = rig.close();
-    // A suspend that arrived during the close handshake still happened
-    // while recording was open.
+    // A command that arrived during the close handshake is kept for what
+    // follows: it cuts the tail, or, after an abort, it is the run's next
+    // step. A suspend there still happened while recording was open.
     let mut carried = None;
     while let Some(c) = rig.take() {
         suspended |= c == Command::Suspend;
-        if c != Command::Suspend {
-            carried = carried.or(Some(c));
-        }
+        carried = carried.or(Some(c));
     }
     logic.drain_after_close();
     let incomplete = Incomplete {
@@ -288,15 +313,19 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
         source_limit: closing.source_limited,
         suspend: suspended,
     };
-    let record = logic.record();
     let view = logic.view();
-    drop(logic);
+    let record = logic.into_record();
 
     // The audio tail of a completed play: nothing is recorded, and a
     // control, focus loss, removal of the last device, an audio failure or
     // a screen failure cuts it short; the record stays complete.
     let mut tail_cut = None;
     if end == PlayEnd::Completed
+        && let Some(c) = carried
+    {
+        tail_cut = Some(c.cause());
+        rig.cancel_audio();
+    } else if end == PlayEnd::Completed
         && let Some(e) = rig.audio_failure()
     {
         output_error = Some(e);
@@ -307,7 +336,7 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
         rig.wait();
         tail_cut = if rig.quitting() {
             Some(AbortCause::Quit)
-        } else if let Some(c) = carried.take().or_else(|| rig.take()) {
+        } else if let Some(c) = rig.take() {
             Some(c.cause())
         } else if rig.focus_lost() {
             Some(AbortCause::FocusLoss)
@@ -333,7 +362,7 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
         }
     }
 
-    Ok(Some(loaded.finish_play(PlayOutcome {
+    let report = loaded.finish_play(PlayOutcome {
         start,
         end,
         tail_cut,
@@ -344,5 +373,8 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
         kinds: opening.kinds,
         arrivals: closing.arrivals,
         incomplete,
-    })))
+    });
+    // A completed play's tail took the carried command.
+    let next = carried.filter(|_| end != PlayEnd::Completed);
+    Ok(Some((report, next)))
 }

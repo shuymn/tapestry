@@ -501,6 +501,18 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
     }
 
+    /// The record, taking the step apart: its events move rather than
+    /// being copied.
+    #[must_use]
+    pub fn into_record(self) -> Record {
+        Record {
+            events: self.record,
+            device: self.device.clone(),
+            start: self.start,
+            finalized: self.finalized,
+        }
+    }
+
     /// The play as recorded so far.
     #[must_use]
     pub fn record(&self) -> Record {
