@@ -30,4 +30,4 @@ mise exec -- cargo xtask check-lints
 
 `cargo xtask portable <command>` runs a cargo command on every crate except the Windows-only ones (what Linux CI builds and tests). `cargo xtask check-arch` checks the rules above that can be checked mechanically. `cargo xtask check-lints` checks that the lints enforcing them are configured (workspace lints, `eval`'s `clippy.toml`, the crate-root cast lines, the in-play attributes) and still fire on one fixture per lint.
 
-Linux-side tools (fuzzing, Linux builds) run inside `nix develop` via the WSL wrapper script (docs/setup.md "Linux-Side Tools (WSL)"). The fuzz crate `fuzz/` is outside the workspace: check it with `--manifest-path fuzz/Cargo.toml` (fmt, clippy, test), and fuzz in its own shell with `TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh run-all 60` (docs/setup.md "Fuzzing").
+Linux-side tools (fuzzing, Linux builds) run inside `nix develop` via the WSL wrapper script (docs/setup.md "Linux-Side Tools (WSL)"). The fuzz crate `fuzz/` is outside the workspace: check it with `--manifest-path fuzz/Cargo.toml` (fmt, clippy, test); running the fuzzer is in docs/setup.md "Fuzzing".
