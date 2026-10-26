@@ -156,7 +156,7 @@ jobs:
   # and short fuzz runs pass in the `fuzz` shell (docs/setup.md "Fuzzing").
   nix:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
