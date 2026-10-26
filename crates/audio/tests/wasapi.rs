@@ -66,6 +66,19 @@ impl TimeSource for Elapsed {
     }
 }
 
+/// Wakes traced one by one at startup.
+const TRACED: usize = 8;
+
+/// One startup wake.
+#[derive(Clone, Copy, Debug, Default)]
+struct Traced {
+    woke_us: Option<i64>,
+    read_us: Option<i64>,
+    padding: Option<u32>,
+    frames: u32,
+    underrun: bool,
+}
+
 /// A 440 Hz sine at -20 dBFS (amplitude 0.1 of full scale, 3277 of 32767),
 /// with 10 ms linear fades so it starts and ends without a click.
 fn tone(rate: u32, len: usize) -> Vec<i16> {
@@ -101,11 +114,24 @@ fn wasapi_plays_a_scheduled_tone() {
     let stop = AtomicBool::new(false);
 
     let started = Instant::now();
+    let mut trace = [Traced::default(); TRACED];
     let report: RunReport = std::thread::scope(|s| {
         s.spawn(|| {
             std::thread::sleep(RUN);
             stop.store(true, Ordering::Release);
         });
+        // The first wakes one by one, for the startup trace.
+        for t in &mut trace {
+            let step = engine.step(&mut out, &mut rx).unwrap();
+            let last = out.stats().last;
+            *t = Traced {
+                woke_us: last.map(|l| l.woke.0),
+                read_us: last.map(|l| l.read.0),
+                padding: last.map(|l| l.padding),
+                frames: step.frames,
+                underrun: step.underrun,
+            };
+        }
         TRACK.set(true);
         let r = run_audio(&mut out, &mut engine, &mut rx, &stop);
         TRACK.set(false);
@@ -113,7 +139,15 @@ fn wasapi_plays_a_scheduled_tone() {
     });
     let ran = started.elapsed();
     let stats = *out.stats();
+    let traced_frames: u64 = trace.iter().map(|t| u64::from(t.frames)).sum();
 
+    println!("startup (time in us since open; none for the priming wake):");
+    for (k, t) in trace.iter().enumerate() {
+        println!(
+            "  wake {k}: woke {:?}, padding read {:?}, padding {:?}, wrote {} frames, underrun {}",
+            t.woke_us, t.read_us, t.padding, t.frames, t.underrun
+        );
+    }
     println!(
         "granted period: {} frames ({} us) at {} Hz, {} channels; buffer {} frames, {} queued periods; engine periods {:?}",
         g.period,
@@ -130,12 +164,13 @@ fn wasapi_plays_a_scheduled_tone() {
         g.fallback,
         g.mmcss
     );
+    let frames = traced_frames + report.frames;
     println!(
         "underruns: {}; steps {}, wakes {}, frames {} in {:?}; device position {:?} frames ({} read failures), mix clock rebases {}",
         engine.underruns(),
-        report.steps,
+        TRACED as u64 + report.steps,
         stats.wakes,
-        report.frames,
+        frames,
         ran,
         stats.position,
         stats.position_failures,
@@ -145,10 +180,14 @@ fn wasapi_plays_a_scheduled_tone() {
     // Every period of the run was written: the device took what the engine
     // rendered, and that covers the 2 s (less the 5 % a late stop or start
     // can take).
-    assert_eq!(report.frames, engine.written());
-    assert_eq!(report.frames, stats.frames);
+    let frames = traced_frames + report.frames;
+    assert_eq!(frames, engine.written());
+    assert_eq!(frames, stats.frames);
     let expected = u64::from(g.rate) * RUN.as_millis() as u64 / 1_000;
-    assert!(report.frames >= expected * 95 / 100, "{report:?}");
+    assert!(frames >= expected * 95 / 100, "{report:?}");
+    // The priming wake is the only untimed one.
+    assert_eq!(trace[0].woke_us, None);
+    assert!(trace[1..].iter().all(|t| t.woke_us.is_some()));
     assert!(stats.wakes >= expected / u64::from(g.period) * 95 / 100);
     // The tone was scheduled once, on the mix clock.
     let mut tones = 0;

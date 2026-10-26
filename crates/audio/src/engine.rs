@@ -252,7 +252,9 @@ impl AudioEngine {
     /// One wake: waits for the output's buffer event, re-anchors the mix
     /// clock on it, starts every queued key sound at the first frame not
     /// yet written, starts the BGM events that fall in the block, and
-    /// renders the block.
+    /// renders the block. A [priming](crate::Wake::priming) wake only fills
+    /// the queue: the clock, the commands and the BGM wait for the first
+    /// timed wake.
     ///
     /// # Errors
     ///
@@ -264,6 +266,16 @@ impl AudioEngine {
     ) -> Result<StepReport, OutputError> {
         let wake = out.wait();
         let mut report = StepReport::default();
+        if wake.priming {
+            // No engine pass to time a start against yet: silence.
+            out.write(|buf| {
+                report.frames = (buf.len() / CHANNELS) as u32;
+                self.mixer.render(&self.bank, buf);
+            })?;
+            report.active_voices = self.mixer.sounding();
+            report.bgm_left = self.bgm.len() - self.next_bgm;
+            return Ok(report);
+        }
         if wake.padding == 0 && self.written() > 0 {
             // The engine may have played silence: the frame/time relation
             // moved.

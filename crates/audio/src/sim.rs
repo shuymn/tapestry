@@ -210,6 +210,7 @@ impl AudioOutput for SimDevice {
                 queued_from: 0,
                 at: self.cfg.start,
                 padding: 0,
+                priming: false,
             };
         }
         let p = u64::from(self.cfg.period);
@@ -236,6 +237,7 @@ impl AudioOutput for SimDevice {
                 queued_from: self.consumed,
                 at,
                 padding: (self.written - self.consumed) as u32,
+                priming: false,
             };
         }
     }

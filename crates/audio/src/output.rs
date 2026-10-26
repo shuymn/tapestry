@@ -16,6 +16,10 @@ pub struct Wake {
     pub at: TimeUs,
     /// Frames written but not yet read by the engine.
     pub padding: u32,
+    /// The wake only asks for the queue to be filled before the stream
+    /// starts: `queued_from` and `at` describe no engine pass, so the engine
+    /// takes no timing from it and fills the queue with silence.
+    pub priming: bool,
 }
 
 /// A device failure.
@@ -48,7 +52,8 @@ pub trait AudioOutput {
     /// Frames per engine pass.
     fn period(&self) -> u32;
     /// Waits for the next buffer event. The first wake comes before
-    /// anything is written, so the engine can fill the queue.
+    /// anything is written, so the engine can fill the queue; an output
+    /// that cannot time it marks it [`Wake::priming`].
     fn wait(&mut self) -> Wake;
     /// Calls `f` with the interleaved stereo frames to fill next, as many
     /// as the queue has room for (possibly none).

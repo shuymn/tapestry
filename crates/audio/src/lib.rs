@@ -52,8 +52,8 @@ pub use run::{RunReport, run_audio};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
 #[cfg(windows)]
 pub use wasapi::{
-    EVENT_TIMEOUT_MS, EnginePeriods, Fallback, Grant, QUEUE_PERIODS, WasapiError, WasapiShared,
-    WasapiStats,
+    EVENT_TIMEOUT_MS, EnginePeriods, Fallback, Grant, QUEUE_PERIODS, WakeTrace, WasapiError,
+    WasapiShared, WasapiStats,
 };
 
 /// Channels of every output buffer (interleaved left, right).

@@ -17,7 +17,7 @@ use std::fmt;
 
 use bms_model::{TimeSource, TimeUs};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_NOT_FOUND, HANDLE, RPC_E_CHANGED_MODE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_NOT_FOUND, HANDLE, RPC_E_CHANGED_MODE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
     AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -163,6 +163,23 @@ pub struct WasapiStats {
     pub position: Option<u64>,
     /// Wakes whose position read failed.
     pub position_failures: u64,
+    /// Wakes whose padding was read more than half a period after the
+    /// event returned. Their observation stays valid (the time is read
+    /// after the padding) but is looser.
+    pub slow_padding_reads: u64,
+    /// The latest timed wake.
+    pub last: Option<WakeTrace>,
+}
+
+/// One timed wake, for diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeTrace {
+    /// When the wait for the buffer event returned.
+    pub woke: TimeUs,
+    /// When the padding read returned: the wake's [`Wake::at`].
+    pub read: TimeUs,
+    /// The padding read, frames.
+    pub padding: u32,
 }
 
 /// Balances a successful `CoInitializeEx` on the thread that made it.
@@ -209,6 +226,29 @@ impl Drop for Mmcss {
     }
 }
 
+/// How a wait for a buffer event ended.
+#[derive(Debug)]
+enum Signal {
+    /// The event was signaled.
+    Event,
+    /// The timeout passed first.
+    Timeout,
+    /// The wait itself failed, with the thread's last error.
+    Failed(windows::core::Error),
+}
+
+fn wait_handle(handle: HANDLE, timeout_ms: u32) -> Signal {
+    // SAFETY: the wait only reads the handle; an invalid one fails.
+    let r = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    if r == WAIT_OBJECT_0 {
+        Signal::Event
+    } else if r == WAIT_TIMEOUT {
+        Signal::Timeout
+    } else {
+        Signal::Failed(windows::core::Error::from_thread())
+    }
+}
+
 struct Event(HANDLE);
 
 impl Event {
@@ -217,12 +257,6 @@ impl Event {
         unsafe { CreateEventW(None, false, false, None) }
             .map(Self)
             .map_err(|e| WasapiError::os("CreateEventW", e))
-    }
-
-    /// Waits for the event; false on a timeout or failure.
-    fn wait(&self, timeout_ms: u32) -> bool {
-        // SAFETY: a valid event handle.
-        unsafe { WaitForSingleObject(self.0, timeout_ms) == WAIT_OBJECT_0 }
     }
 }
 
@@ -382,6 +416,242 @@ unsafe fn init_shortest(
     Ok((client, period))
 }
 
+/// The calls the output makes on its stream: the endpoint makes them with
+/// COM, and tests with a scripted device.
+trait Device {
+    /// Starts the stream.
+    fn start(&mut self) -> windows::core::Result<()>;
+    /// Waits for the next buffer event.
+    fn wait(&mut self, timeout_ms: u32) -> Signal;
+    /// Frames queued and not yet read by the engine.
+    fn padding(&mut self) -> windows::core::Result<u32>;
+    /// Gets a buffer of `frames` frames, lets `f` fill its bytes, and
+    /// releases it. `f` is not called when getting the buffer fails.
+    fn fill(&mut self, frames: u32, f: impl FnOnce(&mut [u8])) -> windows::core::Result<()>;
+    /// The device's playback position in frames, if it reports one.
+    fn position(&mut self) -> Option<windows::core::Result<u64>>;
+    /// Stops the stream.
+    fn stop(&mut self) -> windows::core::Result<()>;
+}
+
+/// The COM side of an initialized shared-mode stream.
+struct Endpoint {
+    render: IAudioRenderClient,
+    /// The clock service and its frequency, for the diagnostic position.
+    position: Option<(IAudioClock, u64)>,
+    client: IAudioClient,
+    event: Event,
+    rate: u32,
+    frame_bytes: usize,
+}
+
+impl Device for Endpoint {
+    fn start(&mut self) -> windows::core::Result<()> {
+        // SAFETY: starting the initialized stream.
+        unsafe { self.client.Start() }
+    }
+
+    fn wait(&mut self, timeout_ms: u32) -> Signal {
+        wait_handle(self.event.0, timeout_ms)
+    }
+
+    fn padding(&mut self) -> windows::core::Result<u32> {
+        // SAFETY: a query on the initialized stream.
+        unsafe { self.client.GetCurrentPadding() }
+    }
+
+    fn fill(&mut self, frames: u32, f: impl FnOnce(&mut [u8])) -> windows::core::Result<()> {
+        // SAFETY: the caller asks for at most the queue, which the buffer
+        // holds; GetBuffer returns room for `frames` frames of the mix
+        // format, valid until the release, which releases exactly them.
+        unsafe {
+            let data = self.render.GetBuffer(frames)?;
+            f(std::slice::from_raw_parts_mut(
+                data,
+                frames as usize * self.frame_bytes,
+            ));
+            self.render.ReleaseBuffer(frames, 0)
+        }
+    }
+
+    fn position(&mut self) -> Option<windows::core::Result<u64>> {
+        let (clock, hz) = self.position.as_ref()?;
+        let mut pos = 0;
+        // SAFETY: an out pointer; the QPC position is not asked for.
+        let read = unsafe { clock.GetPosition(&mut pos, None) };
+        Some(read.map(|()| position_frames(pos, *hz, self.rate).unwrap_or(u64::MAX)))
+    }
+
+    fn stop(&mut self) -> windows::core::Result<()> {
+        // SAFETY: stopping the stream.
+        unsafe { self.client.Stop() }
+    }
+}
+
+/// Where the stream is in its startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Nothing asked for yet: the next wait primes.
+    Unprimed,
+    /// The priming wake was given: the stream starts at the next wait,
+    /// once the queue holds the prefill.
+    Primed,
+    /// Started.
+    Running,
+}
+
+/// The output's logic over a [`Device`]: startup order, the timing of
+/// each wake, the queue, and faults. Allocates only in [`Stream::new`].
+struct Stream<D, C> {
+    dev: D,
+    clock: C,
+    rate: u32,
+    period: u32,
+    queue: u32,
+    channels: usize,
+    period_us: i64,
+    /// The engine's stereo block, spread into the device buffer.
+    scratch: Vec<f32>,
+    /// Queued frames as of the latest wake, plus those written since.
+    padding: u32,
+    phase: Phase,
+    fault: Option<OutputError>,
+    stats: WasapiStats,
+}
+
+impl<D: Device, C: TimeSource> Stream<D, C> {
+    fn new(dev: D, clock: C, rate: u32, period: u32, queue_periods: u32, channels: u16) -> Self {
+        let queue = queue_periods * period;
+        Self {
+            dev,
+            clock,
+            rate,
+            period,
+            queue,
+            channels: usize::from(channels),
+            period_us: i64::from(period) * 1_000_000 / i64::from(rate.max(1)),
+            scratch: vec![0.0; queue as usize * CHANNELS],
+            padding: 0,
+            phase: Phase::Unprimed,
+            fault: None,
+            stats: WasapiStats::default(),
+        }
+    }
+
+    /// A wake the engine takes no timing from.
+    fn priming(&self) -> Wake {
+        Wake {
+            queued_from: self.stats.frames.saturating_sub(u64::from(self.padding)),
+            at: self.clock.now(),
+            padding: self.padding,
+            priming: true,
+        }
+    }
+
+    fn fail(&mut self, e: OutputError) -> Wake {
+        self.fault = Some(e);
+        self.priming()
+    }
+
+    /// Stops the stream if it was started.
+    fn stop(&mut self) -> windows::core::Result<()> {
+        if self.phase != Phase::Running {
+            return Ok(());
+        }
+        self.phase = Phase::Primed;
+        self.dev.stop()
+    }
+}
+
+impl<D: Device, C: TimeSource> AudioOutput for Stream<D, C> {
+    fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn period(&self) -> u32 {
+        self.period
+    }
+
+    /// The first wake is a priming one, for the first write to fill the
+    /// queue; the next starts the stream, once the queue holds that fill,
+    /// and waits for its first buffer event. A timed wake's time is read
+    /// right after the padding, so the pass that reads its first queued
+    /// frame comes after it, within a period. A failed or timed-out wait or
+    /// a failed call makes the next write fail.
+    fn wait(&mut self) -> Wake {
+        if self.fault.is_some() {
+            return self.priming();
+        }
+        match self.phase {
+            Phase::Unprimed => {
+                self.phase = Phase::Primed;
+                return self.priming();
+            }
+            Phase::Primed if self.stats.frames == 0 => return self.priming(),
+            Phase::Primed => {
+                if let Err(e) = self.dev.start() {
+                    return self.fail(output_error(&e));
+                }
+                self.phase = Phase::Running;
+            }
+            Phase::Running => {}
+        }
+        match self.dev.wait(EVENT_TIMEOUT_MS) {
+            Signal::Event => {}
+            Signal::Timeout => return self.fail(OutputError::Stalled),
+            Signal::Failed(e) => return self.fail(output_error(&e)),
+        }
+        let woke = self.clock.now();
+        self.stats.wakes += 1;
+        match self.dev.padding() {
+            Ok(padding) => self.padding = padding,
+            Err(e) => return self.fail(output_error(&e)),
+        }
+        let read = self.clock.now();
+        if read.0 - woke.0 > self.period_us / 2 {
+            self.stats.slow_padding_reads += 1;
+        }
+        self.stats.last = Some(WakeTrace {
+            woke,
+            read,
+            padding: self.padding,
+        });
+        match self.dev.position() {
+            Some(Ok(frames)) => self.stats.position = Some(frames),
+            Some(Err(_)) => self.stats.position_failures += 1,
+            None => {}
+        }
+        Wake {
+            queued_from: self.stats.frames.saturating_sub(u64::from(self.padding)),
+            at: read,
+            padding: self.padding,
+            priming: false,
+        }
+    }
+
+    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
+        if let Some(e) = self.fault {
+            return Err(e);
+        }
+        let frames = room(self.queue, self.padding, self.period);
+        if frames == 0 {
+            f(&mut []);
+            return Ok(());
+        }
+        let block = &mut self.scratch[..frames as usize * CHANNELS];
+        let channels = self.channels;
+        self.dev
+            .fill(frames, |dst| {
+                f(block);
+                spread(block, dst, channels);
+            })
+            .map_err(|e| output_error(&e))?;
+        self.padding += frames;
+        self.stats.frames += u64::from(frames);
+        Ok(())
+    }
+}
+
 /// The WASAPI shared-mode output on the default render endpoint.
 ///
 /// It is used on the thread that opened it, which is the audio thread: the
@@ -389,21 +659,9 @@ unsafe fn init_shortest(
 /// type is not `Send`. Wake times are read from `C`. Waiting and writing
 /// allocate nothing.
 pub struct WasapiShared<C> {
-    // COM objects first: fields drop in order, and COM must outlive them.
-    render: IAudioRenderClient,
-    position: Option<(IAudioClock, u64)>,
-    client: IAudioClient,
-    event: Event,
-    clock: C,
+    // The stream first: fields drop in order, and COM must outlive it.
+    stream: Stream<Endpoint, C>,
     grant: Grant,
-    /// The engine's stereo block, spread into the device buffer.
-    scratch: Vec<f32>,
-    /// Queued frames as of the latest wake, plus those written since.
-    padding: u32,
-    woken: bool,
-    started: bool,
-    fault: Option<OutputError>,
-    stats: WasapiStats,
     _mmcss: Option<Mmcss>,
     _com: Option<Com>,
 }
@@ -411,8 +669,8 @@ pub struct WasapiShared<C> {
 impl<C: TimeSource> WasapiShared<C> {
     /// Opens the default render endpoint in shared mode, at the shortest
     /// engine period `IAudioClient3` offers, else at the default period.
-    /// The stream starts at the second [`AudioOutput::wait`], after the
-    /// first write has filled the queue.
+    /// The first [`AudioOutput::wait`] is a priming one; the stream starts
+    /// at the second, after the first write has filled the queue.
     ///
     /// # Errors
     ///
@@ -499,20 +757,24 @@ impl<C: TimeSource> WasapiShared<C> {
         let event = Event::new()?;
         // SAFETY: a valid event handle, kept until the client is released.
         unsafe { client.SetEventHandle(event.0) }.map_err(|e| os("SetEventHandle", e))?;
-        let queue = grant.queue_periods * grant.period;
-        Ok(Self {
+        let endpoint = Endpoint {
             render,
             position,
             client,
             event,
-            clock,
+            rate: grant.rate,
+            frame_bytes: usize::from(grant.channels) * size_of::<f32>(),
+        };
+        Ok(Self {
+            stream: Stream::new(
+                endpoint,
+                clock,
+                grant.rate,
+                grant.period,
+                grant.queue_periods,
+                grant.channels,
+            ),
             grant,
-            scratch: vec![0.0; queue as usize * CHANNELS],
-            padding: 0,
-            woken: false,
-            started: false,
-            fault: None,
-            stats: WasapiStats::default(),
             _mmcss: mmcss,
             _com: com,
         })
@@ -527,7 +789,7 @@ impl<C: TimeSource> WasapiShared<C> {
     /// The counters so far.
     #[must_use]
     pub fn stats(&self) -> &WasapiStats {
-        &self.stats
+        &self.stream.stats
     }
 
     /// Stops the stream and releases the device.
@@ -536,115 +798,37 @@ impl<C: TimeSource> WasapiShared<C> {
     ///
     /// `IAudioClient::Stop`'s failure; the device is released anyway.
     pub fn close(mut self) -> Result<WasapiStats, WasapiError> {
-        let stats = self.stats;
-        if self.started {
-            self.started = false;
-            // SAFETY: stopping the stream this output started.
-            unsafe { self.client.Stop() }.map_err(|e| WasapiError::os("IAudioClient::Stop", e))?;
-        }
+        let stats = self.stream.stats;
+        self.stream
+            .stop()
+            .map_err(|e| WasapiError::os("IAudioClient::Stop", e))?;
         Ok(stats)
-    }
-
-    /// The buffer state as of the latest wake and writes, at `at`.
-    fn wake_at(&self, at: TimeUs) -> Wake {
-        Wake {
-            queued_from: self.stats.frames.saturating_sub(u64::from(self.padding)),
-            at,
-            padding: self.padding,
-        }
-    }
-
-    fn wake_now(&self) -> Wake {
-        self.wake_at(self.clock.now())
     }
 }
 
 impl<C: TimeSource> AudioOutput for WasapiShared<C> {
     fn rate(&self) -> u32 {
-        self.grant.rate
+        self.stream.rate()
     }
 
     fn period(&self) -> u32 {
-        self.grant.period
+        self.stream.period()
     }
 
-    /// The first wake returns at once, for the first write to fill the
-    /// queue; the next starts the stream. A wait that times out or a
-    /// failed call makes the next write fail.
     fn wait(&mut self) -> Wake {
-        if self.fault.is_some() {
-            return self.wake_now();
-        }
-        if !self.woken {
-            self.woken = true;
-            return self.wake_now();
-        }
-        if !self.started {
-            // SAFETY: starting the initialized stream.
-            if let Err(e) = unsafe { self.client.Start() } {
-                self.fault = Some(output_error(&e));
-                return self.wake_now();
-            }
-            self.started = true;
-        }
-        let signaled = self.event.wait(EVENT_TIMEOUT_MS);
-        let at = self.clock.now();
-        if !signaled {
-            self.fault = Some(OutputError::Stalled);
-            return self.wake_now();
-        }
-        self.stats.wakes += 1;
-        // SAFETY: a query on the running stream.
-        match unsafe { self.client.GetCurrentPadding() } {
-            Ok(padding) => self.padding = padding,
-            Err(e) => {
-                self.fault = Some(output_error(&e));
-                return self.wake_now();
-            }
-        }
-        if let Some((clock, hz)) = &self.position {
-            let mut pos = 0;
-            // SAFETY: an out pointer; the QPC position is not asked for.
-            match unsafe { clock.GetPosition(&mut pos, None) } {
-                Ok(()) => self.stats.position = position_frames(pos, *hz, self.grant.rate),
-                Err(_) => self.stats.position_failures += 1,
-            }
-        }
-        self.wake_at(at)
+        self.stream.wait()
     }
 
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
-        if let Some(e) = self.fault {
-            return Err(e);
-        }
-        let g = &self.grant;
-        let frames = room(g.queue_periods * g.period, self.padding, g.period);
-        if frames == 0 {
-            f(&mut []);
-            return Ok(());
-        }
-        let block = &mut self.scratch[..frames as usize * CHANNELS];
-        // SAFETY: `frames` is at most the queue, which the buffer holds.
-        let data = unsafe { self.render.GetBuffer(frames) }.map_err(|e| output_error(&e))?;
-        f(block);
-        let bytes = frames as usize * usize::from(g.channels) * size_of::<f32>();
-        // SAFETY: GetBuffer returned room for `frames` frames of the mix
-        // format, `channels` 32-bit samples each, valid until the release.
-        let dst = unsafe { std::slice::from_raw_parts_mut(data, bytes) };
-        spread(block, dst, usize::from(g.channels));
-        // SAFETY: releases exactly the frames obtained, all written.
-        unsafe { self.render.ReleaseBuffer(frames, 0) }.map_err(|e| output_error(&e))?;
-        self.padding += frames;
-        self.stats.frames += u64::from(frames);
-        Ok(())
+        self.stream.write(f)
     }
 }
 
 impl<C> Drop for WasapiShared<C> {
     fn drop(&mut self) {
-        if self.started {
+        if self.stream.phase == Phase::Running {
             // SAFETY: stopping the stream this output started.
-            let _ = unsafe { self.client.Stop() };
+            let _ = unsafe { self.stream.dev.client.Stop() };
         }
     }
 }
@@ -653,18 +837,19 @@ impl<C> fmt::Debug for WasapiShared<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WasapiShared")
             .field("grant", &self.grant)
-            .field("stats", &self.stats)
-            .field("started", &self.started)
-            .field("fault", &self.fault)
+            .field("stats", &self.stream.stats)
+            .field("phase", &self.stream.phase)
+            .field("fault", &self.stream.fault)
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
     use std::time::{Duration, Instant};
 
-    use bms_model::TimeUs;
     use windows::Win32::Foundation::{E_FAIL, E_NOINTERFACE};
     use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
     use windows::core::GUID;
@@ -845,7 +1030,10 @@ mod tests {
     fn play_silence(out: &mut WasapiShared<Elapsed>, wakes: u32) {
         let queue = out.grant().queue_periods * out.grant().period;
         let first = out.wait();
-        assert_eq!((first.queued_from, first.padding), (0, 0));
+        assert_eq!(
+            (first.queued_from, first.padding, first.priming),
+            (0, 0, true)
+        );
         let mut filled = 0;
         out.write(|b| {
             filled = b.len();
@@ -884,7 +1072,7 @@ mod tests {
         play_silence(&mut out, 3);
         // Wait on an event the device never signals; the device's own
         // event stays open until the end.
-        let _signaled = std::mem::replace(&mut out.event, Event::new().unwrap());
+        let _signaled = std::mem::replace(&mut out.stream.dev.event, Event::new().unwrap());
         let start = Instant::now();
         out.wait();
         let waited = start.elapsed();
@@ -898,5 +1086,284 @@ mod tests {
         out.wait();
         assert!(start.elapsed() < Duration::from_millis(u64::from(EVENT_TIMEOUT_MS)));
         out.close().unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Call {
+        Start,
+        Wait,
+        Padding,
+        Fill(u32),
+    }
+
+    /// Reads the fake device's virtual time.
+    struct FakeClock(Arc<AtomicI64>);
+
+    impl TimeSource for FakeClock {
+        fn now(&self) -> TimeUs {
+            TimeUs(self.0.load(Ordering::Relaxed))
+        }
+    }
+
+    /// A shared-mode device on a virtual timeline (µs). Once started at
+    /// time `s`, pass `k` takes a period from the buffer at
+    /// `s + first_pass_us + k × period_us` and signals the event. A wait
+    /// returns at the event plus that wake's lateness. Every call is
+    /// logged.
+    struct Fake {
+        now: Arc<AtomicI64>,
+        period: u64,
+        period_us: i64,
+        queue: u64,
+        first_pass_us: i64,
+        started: Option<i64>,
+        passes: u64,
+        released: u64,
+        consumed: u64,
+        /// Passes that found less than a period.
+        short_passes: u64,
+        signaled: bool,
+        /// Each wake's lateness after its event, µs, by wake (0 past the end).
+        late: Vec<i64>,
+        /// A wake whose padding read takes this long, µs.
+        slow_read: Option<(u64, i64)>,
+        /// How long the first fill takes, µs.
+        prefill_us: i64,
+        /// What every wait returns instead, if set.
+        forced: Option<fn() -> Signal>,
+        wakes: u64,
+        calls: Vec<Call>,
+        buf: Vec<u8>,
+    }
+
+    impl Fake {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(AtomicI64::new(0)),
+                period: 480,
+                period_us: 10_000,
+                queue: 960,
+                first_pass_us: 1_000,
+                started: None,
+                passes: 0,
+                released: 0,
+                consumed: 0,
+                short_passes: 0,
+                signaled: false,
+                late: Vec::new(),
+                slow_read: None,
+                prefill_us: 0,
+                forced: None,
+                wakes: 0,
+                calls: Vec::new(),
+                buf: vec![0; 960 * 8],
+            }
+        }
+
+        fn now(&self) -> i64 {
+            self.now.load(Ordering::Relaxed)
+        }
+
+        fn pass_at(&self, k: u64) -> Option<i64> {
+            Some(self.started? + self.first_pass_us + k as i64 * self.period_us)
+        }
+
+        /// Moves time to `t`, running the passes due by then.
+        fn advance_to(&mut self, t: i64) {
+            while let Some(at) = self.pass_at(self.passes)
+                && at <= t
+            {
+                let take = self.period.min(self.released - self.consumed);
+                self.short_passes += u64::from(take < self.period);
+                self.consumed += take;
+                self.passes += 1;
+                self.signaled = true;
+            }
+            self.now.store(t, Ordering::Relaxed);
+        }
+
+        /// The oracle: when the pass that reads `frame` runs (valid while
+        /// no pass came up short).
+        fn read_at(&self, frame: u64) -> i64 {
+            self.pass_at(frame / self.period).unwrap()
+        }
+    }
+
+    impl Device for Fake {
+        fn start(&mut self) -> windows::core::Result<()> {
+            self.calls.push(Call::Start);
+            self.started = Some(self.now());
+            Ok(())
+        }
+
+        fn wait(&mut self, timeout_ms: u32) -> Signal {
+            self.calls.push(Call::Wait);
+            if let Some(forced) = self.forced {
+                return forced();
+            }
+            if !self.signaled {
+                match self.pass_at(self.passes) {
+                    Some(at) => self.advance_to(at),
+                    None => {
+                        self.advance_to(self.now() + i64::from(timeout_ms) * 1_000);
+                        return Signal::Timeout;
+                    }
+                }
+            }
+            self.signaled = false;
+            let late = self.late.get(self.wakes as usize).copied().unwrap_or(0);
+            self.wakes += 1;
+            self.advance_to(self.now() + late);
+            Signal::Event
+        }
+
+        fn padding(&mut self) -> windows::core::Result<u32> {
+            self.calls.push(Call::Padding);
+            if let Some((wake, us)) = self.slow_read
+                && wake + 1 == self.wakes
+            {
+                self.advance_to(self.now() + us);
+            }
+            Ok((self.released - self.consumed) as u32)
+        }
+
+        fn fill(&mut self, frames: u32, f: impl FnOnce(&mut [u8])) -> windows::core::Result<()> {
+            self.calls.push(Call::Fill(frames));
+            if self.released - self.consumed + u64::from(frames) > self.queue {
+                return Err(windows::core::Error::from_hresult(HRESULT(
+                    0x8889_0006_u32 as i32,
+                )));
+            }
+            f(&mut self.buf[..frames as usize * 8]);
+            let first = self.released == 0;
+            self.released += u64::from(frames);
+            if first {
+                self.advance_to(self.now() + self.prefill_us);
+            }
+            Ok(())
+        }
+
+        fn position(&mut self) -> Option<windows::core::Result<u64>> {
+            None
+        }
+
+        fn stop(&mut self) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stream(fake: Fake) -> Stream<Fake, FakeClock> {
+        let clock = FakeClock(Arc::clone(&fake.now));
+        Stream::new(fake, clock, 48_000, 480, 2, 2)
+    }
+
+    #[test]
+    fn the_stream_starts_after_the_prefill_and_times_wakes_after_the_padding() {
+        let mut s = stream(Fake::new());
+        let w = s.wait();
+        assert!(w.priming);
+        assert!(s.dev.calls.is_empty());
+        // A wait before anything was written primes again, unstarted.
+        assert!(s.wait().priming);
+        assert!(s.dev.calls.is_empty());
+        s.write(|b| b.fill(0.0)).unwrap();
+        let w = s.wait();
+        assert!(!w.priming);
+        assert_eq!(
+            s.dev.calls,
+            [Call::Fill(960), Call::Start, Call::Wait, Call::Padding]
+        );
+    }
+
+    #[test]
+    fn a_timed_wake_precedes_the_pass_reading_its_first_queued_frame_by_at_most_a_period() {
+        let mut fake = Fake::new();
+        fake.late = vec![0, 3_000, 700, 9_000, 50, 4_000, 0, 2_500, 9_900, 10];
+        // At wake 5 the padding read ends 4 + 7 ms after the event: the
+        // next pass runs in between.
+        fake.slow_read = Some((5, 7_000));
+        let mut s = stream(fake);
+        assert!(s.wait().priming);
+        s.write(|b| b.fill(0.25)).unwrap();
+        let mut timed = 0;
+        for _ in 0..40 {
+            let w = s.wait();
+            assert!(!w.priming);
+            let pass = s.dev.read_at(w.queued_from);
+            assert!(
+                w.at.0 < pass && pass <= w.at.0 + 10_000,
+                "{w:?} read at {pass}"
+            );
+            assert_eq!(w.padding, s.stats.last.unwrap().padding);
+            timed += 1;
+            s.write(|b| b.fill(0.25)).unwrap();
+        }
+        assert_eq!(timed, 40);
+        assert_eq!(s.dev.short_passes, 0);
+        assert_eq!(s.stats.slow_padding_reads, 1);
+    }
+
+    #[test]
+    fn a_delayed_prefill_does_not_shift_the_mix_clock() {
+        // The prefill takes 12 ms; the first pass runs 1 ms after Start.
+        let mut fake = Fake::new();
+        fake.prefill_us = 12_000;
+        let mut s = stream(fake);
+        let bank = Arc::new(crate::SoundBank::from_sounds(
+            48_000,
+            vec![crate::Sound::mono(vec![100; 16])],
+        ));
+        let mut e = crate::AudioEngine::new(bank, &[], 48_000, 480, 4, 4).unwrap();
+        let (_tx, mut rx) = rtrb::RingBuffer::<crate::SoundCmd>::new(4);
+        for _ in 0..30 {
+            e.step(&mut s, &mut rx).unwrap();
+        }
+        assert_eq!(s.dev.started, Some(12_000));
+        assert_eq!(s.dev.short_passes, 0);
+        for frame in [0, 480 * 7, 480 * 29] {
+            // By hand: pass k runs at 12 000 + 1 000 + 10 000 k µs.
+            let pass = 13_000 + (frame / 480) as i64 * 10_000;
+            assert_eq!(s.dev.read_at(frame), pass);
+            assert_eq!(e.clock().time_at(frame), Some(TimeUs(pass)), "{frame}");
+        }
+    }
+
+    #[test]
+    fn a_failed_wait_keeps_the_os_error_and_a_timeout_stalls() {
+        let mut fake = Fake::new();
+        fake.forced = Some(|| {
+            Signal::Failed(windows::core::Error::from_hresult(HRESULT(
+                0x8007_0006_u32 as i32,
+            )))
+        });
+        let mut s = stream(fake);
+        s.wait();
+        s.write(|b| b.fill(0.0)).unwrap();
+        assert!(s.wait().priming);
+        let mut called = false;
+        assert_eq!(
+            s.write(|_| called = true),
+            Err(OutputError::Failed(0x8007_0006_u32 as i32))
+        );
+        assert!(!called);
+
+        let mut fake = Fake::new();
+        fake.forced = Some(|| Signal::Timeout);
+        let mut s = stream(fake);
+        s.wait();
+        s.write(|b| b.fill(0.0)).unwrap();
+        s.wait();
+        assert_eq!(s.write(|_| {}), Err(OutputError::Stalled));
+    }
+
+    #[test]
+    fn waiting_on_a_bad_handle_fails_with_the_thread_error() {
+        // By hand: HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE) is 0x8007_0006.
+        match wait_handle(HANDLE::default(), 0) {
+            Signal::Failed(e) => assert_eq!(e.code(), HRESULT(0x8007_0006_u32 as i32)),
+            other => panic!("{other:?}"),
+        }
+        let event = Event::new().unwrap();
+        assert!(matches!(wait_handle(event.0, 1), Signal::Timeout));
     }
 }
