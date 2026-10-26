@@ -1,6 +1,6 @@
-//! The mixer: preallocated voices summed in `f32`, oldest-voice stealing with
-//! a raised-cosine fade, volume, a fixed headroom gain and a static soft
-//! clipper.
+//! The mixer: preallocated voices summed in `f32`, one sounding instance per
+//! sound id, oldest-voice stealing with a raised-cosine fade, volume, a fixed
+//! headroom gain and a static soft clipper.
 //!
 //! A triggered sound waits as a pending start at an absolute output frame,
 //! and rendering applies pending starts in time order as it reaches them, so
@@ -11,6 +11,13 @@
 //! slot and fades out over [`STEAL_FADE_MS`] from the new sound's start,
 //! because an abrupt cut is a broadband click. Only when every release slot
 //! is busy is the most-faded release cut, counted in [`Mixer::hard_cuts`].
+//!
+//! A sound id sounds at most once at a time, as BMS charts are written for:
+//! a start stops the voice or release already playing its id at the new
+//! start's first frame, without a fade, and takes that voice's slot, counted
+//! in [`Mixer::cuts`]; starts of one id at the same frame therefore sound
+//! once. The rule keys on the id, not on the stored sound: ids whose files
+//! have identical contents share a stored sound but still overlap.
 //!
 //! The sum is never gain-ridden: a limiter that lowers the whole mix when a
 //! key sound pushes it over full scale would make the background audibly dip
@@ -40,15 +47,29 @@ pub const HEADROOM: f32 = 0.5;
 /// Level below which [`soft_clip`] passes samples unchanged.
 pub const SOFT_CLIP_KNEE: f32 = 0.8;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Voice {
     active: bool,
+    /// The sound id it was triggered as.
+    id: SoundId,
     /// Index into the bank's stored sounds.
     sound: u32,
     start: u64,
     seq: u64,
     /// Fade-out start for a released voice; `u64::MAX` while playing.
     cut: u64,
+}
+
+impl Voice {
+    /// An unused slot.
+    const IDLE: Self = Self {
+        active: false,
+        id: SoundId(0),
+        sound: 0,
+        start: 0,
+        seq: 0,
+        cut: u64::MAX,
+    };
 }
 
 /// A volume outside `0.0..=MAX_VOLUME` (NaN included).
@@ -92,6 +113,7 @@ pub struct Mixer {
     /// Samples above [`SOFT_CLIP_KNEE`] after the volume and headroom.
     saturated: u64,
     steals: u64,
+    cuts: u64,
     hard_cuts: u64,
     dropped_starts: u64,
 }
@@ -109,8 +131,8 @@ impl Mixer {
             })
             .collect();
         Self {
-            voices: vec![Voice::default(); voices],
-            releases: vec![Voice::default(); voices],
+            voices: vec![Voice::IDLE; voices],
+            releases: vec![Voice::IDLE; voices],
             pending: Vec::with_capacity(MAX_PENDING_STARTS),
             fade,
             mixed_to: 0,
@@ -118,6 +140,7 @@ impl Mixer {
             volume: 1.0,
             saturated: 0,
             steals: 0,
+            cuts: 0,
             hard_cuts: 0,
             dropped_starts: 0,
         }
@@ -141,10 +164,16 @@ impl Mixer {
         self.active() + self.releases.iter().filter(|v| v.active).count() + self.pending.len()
     }
 
-    /// Voices stolen so far.
+    /// Voices stolen so far because every voice was busy.
     #[must_use]
     pub fn steals(&self) -> u64 {
         self.steals
+    }
+
+    /// Voices and releases stopped so far by a start of their own sound id.
+    #[must_use]
+    pub fn cuts(&self) -> u64 {
+        self.cuts
     }
 
     /// Fading releases cut off because every release slot was busy.
@@ -203,10 +232,12 @@ impl Mixer {
 
     /// Schedules sound `id` of `bank` to start at output frame `at`, or at
     /// the first frame not yet rendered if `at` is already rendered, and
-    /// returns that frame. When the start is reached and every voice is
-    /// busy, the oldest playing voice (earliest start, then earliest
-    /// trigger) is stolen and fades out from it. Returns `None` if the bank
-    /// holds no sound for `id` or [`MAX_PENDING_STARTS`] are waiting.
+    /// returns that frame. When the start is reached, the voice or release
+    /// still playing `id` stops there without a fade; otherwise, when every
+    /// voice is busy, the oldest playing voice (earliest start, then
+    /// earliest trigger) is stolen and fades out from it, or is dropped if
+    /// it starts there too. Returns `None` if the bank holds no sound for
+    /// `id` or [`MAX_PENDING_STARTS`] are waiting.
     pub fn trigger(&mut self, bank: &SoundBank, id: SoundId, at: u64) -> Option<u64> {
         let sound = bank.slot(id)?;
         let start = at.max(self.mixed_to);
@@ -217,6 +248,7 @@ impl Mixer {
         self.seq += 1;
         let voice = Voice {
             active: true,
+            id,
             sound,
             start,
             seq: self.seq,
@@ -228,9 +260,25 @@ impl Mixer {
         Some(start)
     }
 
-    /// Puts a pending start into a voice slot, at its start frame.
+    /// Puts a pending start into a voice slot, at its start frame: the slot
+    /// of the voice its id stops, else a free one, else the oldest voice's.
     fn apply(&mut self, voice: Voice) {
-        if let Some(free) = self.voices.iter_mut().find(|v| !v.active) {
+        let mut slot = None;
+        for (i, v) in self.voices.iter_mut().enumerate() {
+            if v.active && v.id == voice.id {
+                v.active = false;
+                self.cuts += 1;
+                slot.get_or_insert(i);
+            }
+        }
+        for r in &mut self.releases {
+            if r.active && r.id == voice.id {
+                r.active = false;
+                self.cuts += 1;
+            }
+        }
+        let slot = slot.or_else(|| self.voices.iter().position(|v| !v.active));
+        if let Some(free) = slot.and_then(|i| self.voices.get_mut(i)) {
             *free = voice;
             return;
         }
@@ -239,7 +287,10 @@ impl Mixer {
         };
         let victim = std::mem::replace(oldest, voice);
         self.steals += 1;
-        self.release(victim, voice.start);
+        // A victim starting here too has not sounded: it is dropped.
+        if victim.start < voice.start {
+            self.release(victim, voice.start);
+        }
     }
 
     /// Moves a stolen voice to a release slot fading out from `cut`.
@@ -383,10 +434,11 @@ mod tests {
     #[test]
     fn a_fade_of_zero_frames_still_steals() {
         // Rate 400 Hz: 2 ms is 0.8 frames, floored to no fade at all.
-        let bank = SoundBank::from_sounds(400, vec![crate::Sound::mono(vec![8_192; 4])]);
+        let sound = || crate::Sound::mono(vec![8_192; 4]);
+        let bank = SoundBank::from_sounds(400, vec![sound(), sound()]);
         let mut m = Mixer::new(1, 400);
         m.trigger(&bank, SoundId(0), 0).unwrap();
-        m.trigger(&bank, SoundId(0), 2).unwrap();
+        m.trigger(&bank, SoundId(1), 2).unwrap();
         let mut out = [0.0; 12];
         m.render(&bank, &mut out);
         assert_eq!(m.steals(), 1);

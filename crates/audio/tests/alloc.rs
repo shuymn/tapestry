@@ -1,5 +1,6 @@
 //! Once built, the engine allocates nothing per step: draining commands,
-//! scheduling BGM, stealing voices, mixing, soft clipping and writing; nor does
+//! scheduling BGM, cutting a sound's earlier instance, stealing voices,
+//! mixing, soft clipping and writing; nor does
 //! the audio thread loop around it.
 //!
 //! The counting allocator counts only threads that opted in, so the test
@@ -55,18 +56,20 @@ impl<O: AudioOutput> AudioOutput for StopAfter<'_, O> {
 fn mixing_does_not_allocate() {
     const RATE: u32 = 48_000;
     const STEPS: u32 = 3_000;
-    let bank = Arc::new(SoundBank::from_sounds(
-        RATE,
-        vec![
-            Sound::mono(vec![20_000; 9_000]),
-            Sound::stereo((0..4_000).map(|i| (i % 7_000) as i16 - 3_500).collect()),
-        ],
+    // Key sounds 0 to 15 and BGM sound 16.
+    const KEYS: u16 = 16;
+    let mut sounds: Vec<Sound> = (0..KEYS)
+        .map(|_| Sound::mono(vec![20_000; 9_000]))
+        .collect();
+    sounds.push(Sound::stereo(
+        (0..4_000).map(|i| (i % 7_000) as i16 - 3_500).collect(),
     ));
-    // BGM every 20 ms over the 30 s run; 8 voices, so voices are stolen.
+    let bank = Arc::new(SoundBank::from_sounds(RATE, sounds));
+    // BGM every 20 ms over the 30 s run, each start cutting the last.
     let bgm: Vec<BgmEvent> = (0..1_500)
         .map(|k| BgmEvent {
             time: TimeUs(k * 20_000),
-            sound: SoundId(1),
+            sound: SoundId(KEYS),
         })
         .collect();
     let mut e = AudioEngine::new(bank, &bgm, RATE, 480, 8, 64).unwrap();
@@ -89,11 +92,15 @@ fn mixing_does_not_allocate() {
     let mut commands = 0u32;
     counting::track(true);
     counting::self_check();
+    // Three key commands a step on two sounds, the third repeating the
+    // second at its frame, which cuts it. Sixteen keys of 9000 frames
+    // started two a step outnumber the 8 voices, so voices are stolen.
     for step in 0..STEPS {
-        for k in 0..3 {
+        for k in 0..3u16 {
+            let key = (2 * step as u16 + k.min(1)) % KEYS;
             tx.push(SoundCmd {
-                sound: SoundId(0),
-                origin: TimeUs(i64::from(step) * 10_000 + k),
+                sound: SoundId(key),
+                origin: TimeUs(i64::from(step) * 10_000 + i64::from(k)),
             })
             .unwrap();
         }
@@ -117,6 +124,7 @@ fn mixing_does_not_allocate() {
     assert!(out.inner().underruns() > SHIFT_HISTORY as u64);
     assert_eq!(e.underruns(), 40);
     assert!(e.mixer().steals() > 1_000, "{}", e.mixer().steals());
+    assert!(e.mixer().cuts() >= u64::from(STEPS), "{}", e.mixer().cuts());
     assert!(e.mixer().saturated() > 0);
     assert_eq!(counting::allocations(), 0);
 }

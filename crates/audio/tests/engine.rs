@@ -231,29 +231,36 @@ fn starts_beyond_the_pending_capacity_wait_for_the_next_step() {
     // 1100 one-frame sounds within the first two-period fill at 96 kHz
     // (frame 0 plays at 10 ms), once as BGM 10 µs apart from 10 ms and once
     // as key commands in one step: more than the 1024 starts the mixer
-    // holds. Every one still sounds, each with its sample, none dropped.
+    // holds. Each is its own sound (a start of the same one would stop the
+    // last), and every one still sounds, each with its sample, none
+    // dropped.
     const N: usize = 1_100;
     const RATE96: u32 = 96_000;
-    let bank = || Arc::new(SoundBank::from_sounds(RATE96, vec![Sound::mono(vec![100])]));
+    let bank = || {
+        Arc::new(SoundBank::from_sounds(
+            RATE96,
+            (0..N).map(|_| Sound::mono(vec![100])).collect(),
+        ))
+    };
     for as_bgm in [true, false] {
         let bgm: Vec<BgmEvent> = if as_bgm {
             (0..N as i64)
                 .map(|k| BgmEvent {
                     time: TimeUs(10_000 + k * 10),
-                    sound: SoundId(0),
+                    sound: SoundId(k as u16),
                 })
                 .collect()
         } else {
             Vec::new()
         };
-        let mut e = AudioEngine::new(bank(), &bgm, RATE96, 960, 64, 2 * N).unwrap();
+        let mut e = AudioEngine::new(bank(), &bgm, RATE96, 960, 128, 2 * N).unwrap();
         let dev = SimDevice::new(SimConfig::steady(RATE96, 960, TimeUs(0)));
         let mut out = RecordingOutput::new(dev, 96_000);
         let (mut tx, mut rx) = RingBuffer::new(2 * N);
         if !as_bgm {
             for k in 0..N as i64 {
                 tx.push(SoundCmd {
-                    sound: SoundId(0),
+                    sound: SoundId(k as u16),
                     origin: TimeUs(k),
                 })
                 .unwrap();
@@ -270,6 +277,7 @@ fn starts_beyond_the_pending_capacity_wait_for_the_next_step() {
         assert_eq!(starts.len(), N, "bgm {as_bgm}");
         assert_eq!(if as_bgm { bgm_started } else { commands }, N as u32);
         assert_eq!(e.mixer().dropped_starts(), 0);
+        assert_eq!(e.mixer().cuts(), 0);
         let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
         // A sample of 100, halved by the headroom.
         let one = 100.0 / 65_536.0;
@@ -277,8 +285,11 @@ fn starts_beyond_the_pending_capacity_wait_for_the_next_step() {
             assert!(left[s.frame as usize] >= one, "frame {}", s.frame);
         }
         if as_bgm {
-            // At most two share a frame, so nothing saturates: the samples
-            // add up to one per start.
+            // At most two share a frame, except the 76 that waited, which
+            // all start at the first frame of the next block. The 128
+            // voices hold them, so nothing is stolen or saturates, and the
+            // samples add up to one per start.
+            assert_eq!(e.mixer().steals(), 0);
             let total: f32 = left.iter().sum();
             assert!((total - N as f32 * one).abs() < 1e-3, "{total}");
         } else {
@@ -290,6 +301,38 @@ fn starts_beyond_the_pending_capacity_wait_for_the_next_step() {
             assert!(starts[1_024..].iter().all(|s| s.frame == first + 1_920));
         }
     }
+}
+
+#[test]
+fn a_bgm_event_and_a_scheduled_key_sound_at_one_time_sound_once() {
+    // Autoplay merges its key sounds into the BGM schedule: a BGM event and
+    // a key entry on the same sound at 100 ms are two scheduled starts at
+    // one frame but a single instance, sample for sample.
+    let event = BgmEvent {
+        time: TimeUs(100_000),
+        sound: KEY,
+    };
+    let mut e =
+        AudioEngine::with_schedule(bank(), vec![event; 2], RATE, PERIOD, 64, 1_024).unwrap();
+    let dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let mut out = RecordingOutput::new(dev, 48_000);
+    let (_tx, mut rx) = queue();
+    let mut starts = Vec::new();
+    while out.inner().next_wake() <= TimeUs(300_000) {
+        e.step(&mut out, &mut rx).unwrap();
+        drain(&mut e, &mut starts);
+    }
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[0].frame, starts[1].frame);
+    let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+    let first = starts[0].frame as usize;
+    assert!(left[..first].iter().all(|&x| x == 0.0));
+    for (i, &x) in left[first..first + 300].iter().enumerate() {
+        let want = f32::from(KEY_FIRST - 17 * i as i16) / 65_536.0;
+        assert_eq!(x, want, "frame {}", first + i);
+    }
+    assert!(left[first + 300..].iter().all(|&x| x == 0.0));
+    assert_eq!(e.mixer().cuts(), 1);
 }
 
 #[test]
@@ -310,10 +353,11 @@ fn engine_refuses_zero_rate_or_period_and_a_bank_at_another_rate() {
 #[test]
 fn report_tracks_voices_bgm_and_a_full_schedule_log() {
     let bgm = bgm_every_half_second(1, 2);
-    // Sound 0 outlasts a block (2000 frames); sound 1 is the click.
+    // Sounds 0 and 2 outlast a block (2000 frames); sound 1 is the click.
+    let long = || Sound::mono(vec![100; 2_000]);
     let bank = Arc::new(SoundBank::from_sounds(
         RATE,
-        vec![Sound::mono(vec![100; 2_000]), Sound::mono(vec![-100; 48])],
+        vec![long(), Sound::mono(vec![-100; 48]), long()],
     ));
     let mut e = AudioEngine::new(bank, &bgm, RATE, PERIOD, 4, 1).unwrap();
     let mut dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
@@ -322,7 +366,7 @@ fn report_tracks_voices_bgm_and_a_full_schedule_log() {
     assert_eq!((r.frames, r.bgm_left, r.active_voices), (960, 2, 0));
     // Two key sounds and one the bank lacks: two voices, one log entry
     // kept (capacity 1), one dropped, the unknown sound ignored.
-    for sound in [KEY, KEY, SoundId(9)] {
+    for sound in [KEY, SoundId(2), SoundId(9)] {
         tx.push(SoundCmd {
             sound,
             origin: TimeUs(0),

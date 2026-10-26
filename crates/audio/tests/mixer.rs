@@ -1,9 +1,12 @@
-//! The mixer: exact start samples under any block split, stealing with a
-//! fade, late starts that keep the head of the sound, and a mix whose gain
-//! does not ride the program.
+//! The mixer: exact start samples under any block split, one sounding
+//! instance per sound id, stealing with a fade, late starts that keep the
+//! head of the sound, and a mix whose gain does not ride the program.
 
-use audio::{Mixer, Sound, SoundBank};
+mod common;
+
+use audio::{BankLimits, Mixer, Sound, SoundBank, load_bank};
 use bms_model::SoundId;
+use common::{chart_of, put, tmp, wav};
 
 const RATE: u32 = 48_000;
 
@@ -23,57 +26,77 @@ fn render(m: &mut Mixer, bank: &SoundBank, frames: usize) -> Vec<f32> {
 
 /// A mono ramp 7, 14, … (300 frames), a stereo sound with distinct
 /// channels (200 frames), a 3-frame click (shorter than any block below but
-/// 1 and 2), and a loud constant (2000 frames at 30 000) that two
-/// overlapping copies push over full scale.
+/// 1 and 2), and a loud constant (2000 frames at 30 000) under two ids, 3
+/// and 4, whose overlap pushes the sum over full scale.
 fn split_bank() -> SoundBank {
     let stereo = (0..200i16).flat_map(|i| [5 * i + 3, -9 * i - 4]).collect();
+    let loud = || Sound::mono(vec![30_000; 2_000]);
     SoundBank::from_sounds(
         RATE,
         vec![
             Sound::mono((1..=300).map(|i| i * 7).collect()),
             Sound::stereo(stereo),
             Sound::mono(vec![1_000, -2_000, 3_000]),
-            Sound::mono(vec![30_000; 2_000]),
+            loud(),
+            loud(),
         ],
     )
 }
 
-const SPLIT_TRIGGERS: [(u16, u64); 6] = [
+/// The solo starts checked below, and three cuts: sounds 0 and 1 started
+/// again while they play, and the click a second time at 2399.
+const SPLIT_TRIGGERS: [(u16, u64); 9] = [
     (0, 1_000),
     (1, 1_037),
     (2, 2_399),
     (3, 0),
-    (3, 500),
+    (4, 500),
     (0, 4_321),
+    (0, 1_100),
+    (1, 1_200),
+    (2, 2_399),
 ];
 
-fn render_split(block: usize, total: usize) -> (Vec<f32>, u64) {
+/// The split triggers rendered in `block`-frame blocks, each triggered
+/// `ahead` frames before its start (all before the first block if `None`),
+/// with the saturated sample and cut counts.
+fn render_split(block: usize, ahead: Option<u64>, total: usize) -> (Vec<f32>, u64, u64) {
     let bank = split_bank();
     let mut m = Mixer::new(8, RATE);
-    for (s, at) in SPLIT_TRIGGERS {
-        m.trigger(&bank, SoundId(s), at).unwrap();
-    }
+    let mut pending: Vec<(u16, u64)> = SPLIT_TRIGGERS.to_vec();
     let mut out = vec![0.0f32; total * 2];
     let mut pos = 0;
     while pos < total {
         let n = block.min(total - pos);
+        let end = (pos + n) as u64;
+        pending.retain(|&(s, at)| {
+            if ahead.is_some_and(|a| at >= end + a) {
+                return true;
+            }
+            assert_eq!(m.trigger(&bank, SoundId(s), at), Some(at));
+            false
+        });
         m.render(&bank, &mut out[pos * 2..(pos + n) * 2]);
         pos += n;
     }
-    (out, m.saturated())
+    (out, m.saturated(), m.cuts())
 }
 
 #[test]
 fn sound_starts_at_exact_sample_for_any_block_split() {
-    let (reference, saturated) = render_split(1, 6_000);
-    // The two loud copies overlap from 500 to 2000: 2 × 30 000 / 32 768 ×
+    let (reference, saturated, cuts) = render_split(1, None, 6_000);
+    // The two loud sounds overlap from 500 to 2000: 2 × 30 000 / 32 768 ×
     // 0.5 = 0.92 is above the knee (0.8) in both channels of those 1500
     // frames, and only there (the small sounds move it by under 0.06), so
     // the clipper saturated, and nothing left exceeds full scale.
-    assert_eq!(saturated, 3_000);
+    assert_eq!((saturated, cuts), (3_000, 3));
     assert!(reference.iter().all(|x| x.abs() <= 1.0));
     for block in [2, 7, 64, 441, 480, 1_024, 6_000] {
-        assert!(render_split(block, 6_000).0 == reference, "block {block}");
+        for ahead in [None, Some(0), Some(1), Some(150)] {
+            let (out, _, cuts) = render_split(block, ahead, 6_000);
+            assert!(out == reference, "block {block}, ahead {ahead:?}");
+            assert_eq!(cuts, 3, "block {block}, ahead {ahead:?}");
+        }
     }
 
     // Each sound alone, in 480-frame blocks: silent before its start, its
@@ -203,6 +226,130 @@ fn exhausted_release_slots_cut_the_most_faded() {
 }
 
 #[test]
+fn a_retrigger_stops_the_earlier_instance_at_the_new_start() {
+    // A ramp 7, 14, … (300 frames) at 10 and again at 110: the output is
+    // the first instance up to frame 109 and the second from 110, sample
+    // for sample, with no fade and no release slot used.
+    let bank = SoundBank::from_sounds(RATE, vec![Sound::mono((1..=300).map(|i| i * 7).collect())]);
+    let mut m = Mixer::new(4, RATE);
+    m.trigger(&bank, SoundId(0), 10).unwrap();
+    m.trigger(&bank, SoundId(0), 110).unwrap();
+    let mut out = left(&render(&mut m, &bank, 200));
+    assert_eq!(m.sounding(), 1);
+    out.extend(left(&render(&mut m, &bank, 300)));
+    let mut want = vec![0.0f32; 500];
+    for (f, w) in want.iter_mut().enumerate() {
+        let k = match f {
+            10..110 => f - 9,
+            110..410 => f - 109,
+            _ => continue,
+        };
+        *w = (k * 7) as f32 / 65_536.0;
+    }
+    assert_eq!(out, want);
+    assert_eq!((m.cuts(), m.steals(), m.hard_cuts()), (1, 0, 0));
+    assert_eq!(m.sounding(), 0);
+}
+
+#[test]
+fn starts_of_one_id_at_the_same_frame_sound_once() {
+    let bank = steal_bank(2_000);
+    let mut m = Mixer::new(4, 2_000);
+    for _ in 0..3 {
+        m.trigger(&bank, SoundId(1), 5).unwrap();
+    }
+    let out = left(&render(&mut m, &bank, 50));
+    assert_eq!(m.sounding(), 1);
+    let mut want = vec![0.0; 50];
+    want[5..].fill(0.25 * H);
+    assert_eq!(out, want);
+    assert_eq!((m.cuts(), m.steals()), (2, 0));
+}
+
+#[test]
+fn ids_sharing_one_stored_sound_still_overlap() {
+    // Two files with the same contents are stored once, but their ids are
+    // separate sounds: started together they add up (8 kHz, the lowest
+    // rate the bank decodes).
+    let dir = tmp();
+    let samples = vec![8_192i16; 100];
+    let a = put(dir.path(), "a.wav", &wav(8_000, 1, &samples));
+    let b = put(dir.path(), "b.wav", &wav(8_000, 1, &samples));
+    let bank = load_bank(
+        &chart_of(&[Some(a), Some(b)]),
+        8_000,
+        &BankLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(bank.stored_count(), 1);
+    assert_eq!(bank.slot(SoundId(0)), bank.slot(SoundId(1)));
+    let mut m = Mixer::new(4, 8_000);
+    m.trigger(&bank, SoundId(0), 0).unwrap();
+    m.trigger(&bank, SoundId(1), 0).unwrap();
+    m.trigger(&bank, SoundId(1), 50).unwrap();
+    let out = left(&render(&mut m, &bank, 160));
+    let mut want = vec![0.0; 160];
+    want[..100].fill(0.5 * H);
+    want[100..150].fill(0.25 * H);
+    assert_eq!(out, want);
+    assert_eq!((m.cuts(), m.steals()), (1, 0));
+}
+
+#[test]
+fn over_the_cap_a_victim_that_has_not_sounded_is_dropped() {
+    // Two voices; A (0.5), B (0.25), C (0.125) and A again, all at 0. C
+    // steals A, which has not sounded, so it is dropped, not faded; the
+    // second A steals B the same way. One A and one C sound.
+    let bank = steal_bank(2_000);
+    let mut m = Mixer::new(2, 2_000);
+    for s in [0, 1, 2, 0] {
+        m.trigger(&bank, SoundId(s), 0).unwrap();
+    }
+    let out = left(&render(&mut m, &bank, 10));
+    assert_eq!(m.sounding(), 2);
+    assert_eq!(out, [0.625 * H; 10]);
+    assert_eq!((m.steals(), m.cuts(), m.hard_cuts()), (2, 0, 0));
+}
+
+#[test]
+fn a_retrigger_stops_its_fading_release() {
+    // Two voices. A (0.5) and B (0.25) at 0; C (0.125) at 10 steals A,
+    // which fades from 10; A again at 11 stops that tail and steals B,
+    // which fades from 11.
+    let bank = steal_bank(2_000);
+    let mut m = Mixer::new(2, 2_000);
+    for (s, at) in [(0, 0), (1, 0), (2, 10), (0, 11)] {
+        m.trigger(&bank, SoundId(s), at).unwrap();
+    }
+    let out = left(&render(&mut m, &bank, 40));
+    let mut want = vec![0.0; 40];
+    want[..10].fill(0.75);
+    want[10] = 0.5 * F1 + 0.25 + 0.125;
+    want[11] = 0.5 + 0.25 * F1 + 0.125;
+    want[12] = 0.5 + 0.25 * 0.5 + 0.125;
+    want[13] = 0.5 + 0.25 * F3 + 0.125;
+    want[14..].fill(0.625);
+    assert_close(&out, &want);
+    assert_eq!((m.steals(), m.cuts(), m.hard_cuts()), (2, 1, 0));
+}
+
+#[test]
+fn retriggers_of_one_id_never_steal() {
+    // 300 starts of one long sound, a frame apart: each stops the one
+    // before, so one voice of the 256 is ever busy and none is stolen.
+    let bank = SoundBank::from_sounds(RATE, vec![Sound::mono(vec![8_192; 1_000])]);
+    let mut m = Mixer::new(256, RATE);
+    for at in 0..300 {
+        m.trigger(&bank, SoundId(0), at).unwrap();
+    }
+    let out = left(&render(&mut m, &bank, 1_400));
+    assert_eq!((m.steals(), m.cuts(), m.hard_cuts()), (0, 299, 0));
+    let mut want = vec![0.0; 1_400];
+    want[..1_299].fill(0.25 * H);
+    assert_eq!(out, want);
+}
+
+#[test]
 fn starts_scheduled_ahead_apply_in_time_order() {
     // One voice; one-frame sounds at 0, 100 and 200 never overlap, so none
     // is stolen, whether all three are scheduled before the first block or
@@ -288,12 +435,10 @@ fn background_level_is_unchanged_by_a_loud_key_sound() {
     // after the key sounds end. A gain-riding limiter, before or after the
     // headroom, would still hold the mix down there while it recovers.
     let bgm = (0..400).flat_map(|_| [16_384i16, 12_288]).collect();
-    let bank = SoundBank::from_sounds(
-        2_000,
-        vec![Sound::stereo(bgm), Sound::mono(vec![29_491; 50])],
-    );
+    let key = || Sound::mono(vec![29_491; 50]);
+    let bank = SoundBank::from_sounds(2_000, vec![Sound::stereo(bgm), key(), key()]);
     let mut m = Mixer::new(3, 2_000);
-    for (s, at) in [(0, 0), (1, 100), (1, 250), (1, 250)] {
+    for (s, at) in [(0, 0), (1, 100), (1, 250), (2, 250)] {
         m.trigger(&bank, SoundId(s), at).unwrap();
     }
     let out = render(&mut m, &bank, 400);
@@ -322,15 +467,15 @@ fn background_level_is_unchanged_by_a_loud_key_sound() {
 
 #[test]
 fn a_saturated_channel_leaves_the_other_unchanged() {
-    // Two copies of a sound at 30 000 on the left and 1 000 on the right:
-    // the left sum after the headroom, 0.92, is above the knee and
-    // saturates; the right, 2 000 / 65 536, passes exactly. A stereo-linked
-    // gain would lower the right too.
-    let sound = (0..100).flat_map(|_| [30_000i16, 1_000]).collect();
-    let bank = SoundBank::from_sounds(2_000, vec![Sound::stereo(sound)]);
+    // Two sounds at 30 000 on the left and 1 000 on the right: the left
+    // sum after the headroom, 0.92, is above the knee and saturates; the
+    // right, 2 000 / 65 536, passes exactly. A stereo-linked gain would
+    // lower the right too.
+    let sound = || Sound::stereo((0..100).flat_map(|_| [30_000i16, 1_000]).collect());
+    let bank = SoundBank::from_sounds(2_000, vec![sound(), sound()]);
     let mut m = Mixer::new(2, 2_000);
     m.trigger(&bank, SoundId(0), 0).unwrap();
-    m.trigger(&bank, SoundId(0), 0).unwrap();
+    m.trigger(&bank, SoundId(1), 0).unwrap();
     let out = render(&mut m, &bank, 100);
     let mut frames = 0;
     for f in out.chunks(2) {
