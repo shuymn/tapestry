@@ -14,8 +14,20 @@ use crate::session::Settings;
 pub const DEFAULT_VISIBLE_TIME_MS: u32 = 600;
 /// The visible times a player can choose, ms.
 pub const VISIBLE_TIME_MS: RangeInclusive<u32> = 100..=4_000;
-/// One hi-speed step, ms of visible time.
-pub const VISIBLE_TIME_STEP_MS: u32 = 25;
+/// The visible times the hi-speed keys step through, ms, shortest first:
+/// `round(100 × 6^(k/34))` for k = 0 to 70. Each step changes the scroll
+/// speed by the same ratio, `6^(1/34)` ≈ 1.054 (5.4 %), within rounding to a
+/// whole ms, so a press feels alike at any speed. The ratio puts the range's
+/// ends (100 and 4000 ms, `6^(70/34)` ≈ 40) and the default (600 ms, k = 34)
+/// on the ladder.
+pub const VISIBLE_TIME_STEPS_MS: [u32; 71] = [
+    100, 105, 111, 117, 123, 130, 137, 145, 152, 161, 169, 179, //
+    188, 198, 209, 220, 232, 245, 258, 272, 287, 302, 319, 336, //
+    354, 373, 394, 415, 437, 461, 486, 512, 540, 569, 600, 632, //
+    667, 703, 741, 781, 823, 868, 915, 964, 1_016, 1_071, 1_129, 1_190, //
+    1_255, 1_323, 1_394, 1_470, 1_549, 1_633, 1_721, 1_815, 1_913, 2_016, 2_125, 2_240, //
+    2_362, 2_489, 2_624, 2_766, 2_916, 3_074, 3_240, 3_415, 3_600, 3_795, 4_000,
+];
 /// One volume step, percent of unity.
 pub const VOLUME_STEP_PERCENT: u32 = 5;
 /// The largest volume, percent: unity.
@@ -116,18 +128,27 @@ impl Tuning {
         }
     }
 
-    /// One step of `adjust`, held within its range.
+    /// One step of `adjust`, held within its range. Hi-speed moves to the
+    /// next visible time of [`VISIBLE_TIME_STEPS_MS`], from a value on it or
+    /// between two of its steps.
     #[must_use]
     pub fn adjust(self, adjust: Adjust) -> Self {
-        let visible = |ms: u32| ms.clamp(*VISIBLE_TIME_MS.start(), *VISIBLE_TIME_MS.end());
+        let steps = VISIBLE_TIME_STEPS_MS;
         let offset = |us: i64| us.clamp(-OFFSET_LIMIT_US, OFFSET_LIMIT_US);
         let mut t = self;
         match adjust {
             Adjust::HiSpeedDown => {
-                t.visible_time_ms = visible(t.visible_time_ms.saturating_add(VISIBLE_TIME_STEP_MS));
+                t.visible_time_ms = steps
+                    .into_iter()
+                    .find(|&ms| ms > t.visible_time_ms)
+                    .unwrap_or(steps[steps.len() - 1]);
             }
             Adjust::HiSpeedUp => {
-                t.visible_time_ms = visible(t.visible_time_ms.saturating_sub(VISIBLE_TIME_STEP_MS));
+                t.visible_time_ms = steps
+                    .into_iter()
+                    .rev()
+                    .find(|&ms| ms < t.visible_time_ms)
+                    .unwrap_or(steps[0]);
             }
             Adjust::VolumeDown => {
                 t.volume_percent = t.volume_percent.saturating_sub(VOLUME_STEP_PERCENT);

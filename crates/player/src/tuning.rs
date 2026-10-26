@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(
             t.get(),
             Tuning {
-                visible_time_ms: 575,
+                visible_time_ms: 569,
                 display_offset_us: -1_000,
                 ..start()
             }
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(files.write(faster), ["player.toml"]);
         assert!(files.write(faster).is_empty());
         let s = game::Settings::load(&root).unwrap();
-        assert_eq!(s.player.visible_time_ms, 575);
+        assert_eq!(s.player.visible_time_ms, 569);
         assert!(!root.device_settings().exists());
         assert_eq!(
             files.write(faster.adjust(Adjust::VolumeDown)),

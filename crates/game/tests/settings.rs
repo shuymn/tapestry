@@ -111,8 +111,9 @@ fn device_and_player_settings_round_trip() {
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
 
     // The settings keys' values, stepped and written as the game does at
-    // the end of a play, come back the same: hi-speed up twice (2350 −
-    // 2 × 25 = 2300 ms), volume down once (75 − 5 = 70 %), display offset
+    // the end of a play, come back the same: hi-speed up twice (2350 ms
+    // lies between the steps 2240 and 2362, so 2240 and then 2125 ms),
+    // volume down once (75 − 5 = 70 %), display offset
     // up once (16.7 + 1 = 17.7 ms) and input offset down three times
     // (4.5 − 3 = 1.5 ms).
     let mut t = Tuning::of(&s);
@@ -132,7 +133,7 @@ fn device_and_player_settings_round_trip() {
     stepped.save(&root).unwrap();
     let back = Settings::load(&root).unwrap();
     assert_eq!(back, stepped);
-    assert_eq!(back.player.visible_time_ms, 2_300);
+    assert_eq!(back.player.visible_time_ms, 2_125);
     assert_eq!(back.device.master_volume, 0.7);
     assert_eq!(back.device.display_offset_us, 17_700);
     assert_eq!(back.device.input_offset_us, 1_500);
@@ -741,14 +742,14 @@ fn settings_keys_step_and_stop_at_their_bounds() {
         (
             Adjust::HiSpeedDown,
             Tuning {
-                visible_time_ms: 625,
+                visible_time_ms: 632,
                 ..t
             },
         ),
         (
             Adjust::HiSpeedUp,
             Tuning {
-                visible_time_ms: 575,
+                visible_time_ms: 569,
                 ..t
             },
         ),
@@ -800,13 +801,13 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     }
 
     // Hi-speed stops at 100 ms (fastest) and 4000 ms (slowest), also from
-    // values off the 25 ms grid.
+    // values between two steps.
     let vis = |ms| Tuning {
         visible_time_ms: ms,
         ..t
     };
     assert_eq!(vis(100).adjust(Adjust::HiSpeedUp).visible_time_ms, 100);
-    assert_eq!(vis(110).adjust(Adjust::HiSpeedUp).visible_time_ms, 100);
+    assert_eq!(vis(103).adjust(Adjust::HiSpeedUp).visible_time_ms, 100);
     assert_eq!(
         vis(4_000).adjust(Adjust::HiSpeedDown).visible_time_ms,
         4_000
@@ -850,6 +851,49 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     );
 }
 
+/// Each hi-speed press changes the scroll speed (the inverse of the visible
+/// time) by one ratio, `6^(1/34)`, within rounding to a whole ms, from the
+/// fastest bound to the slowest and back; the default lies on the way and
+/// both bounds clamp.
+#[test]
+fn hi_speed_steps_change_speed_by_an_equal_ratio() {
+    let ratio = 6f64.powf(1.0 / 34.0);
+    let at = |ms| Tuning {
+        visible_time_ms: ms,
+        volume_percent: 40,
+        display_offset_us: 2_000,
+        input_offset_us: -3_000,
+    };
+    let walk = |from: u32, adjust: Adjust| {
+        let mut seen = vec![from];
+        loop {
+            let next = at(*seen.last().unwrap()).adjust(adjust).visible_time_ms;
+            if next == *seen.last().unwrap() {
+                return seen;
+            }
+            seen.push(next);
+        }
+    };
+    let slower = walk(100, Adjust::HiSpeedDown);
+    assert_eq!(slower.len(), 71);
+    assert_eq!(slower[70], 4_000);
+    assert!(slower.contains(&600));
+    for pair in slower.windows(2) {
+        let (a, b) = (f64::from(pair[0]), f64::from(pair[1]));
+        // Each value is an exact step rounded by at most 0.5 ms.
+        assert!(
+            (b - ratio * a).abs() <= 0.5 * (1.0 + ratio),
+            "{a} -> {b} is not one step of {ratio}"
+        );
+    }
+    // At both ends the ratio is the same, not the 25 ms of a fixed step.
+    let speed_ratio = |a: u32, b: u32| f64::from(b) / f64::from(a);
+    assert!((speed_ratio(100, slower[1]) - speed_ratio(slower[69], 4_000)).abs() < 0.01);
+    let mut faster = walk(4_000, Adjust::HiSpeedUp);
+    faster.reverse();
+    assert_eq!(faster, slower);
+}
+
 /// A volume between whole percents is written back as it was until a
 /// volume key moves it; then it is the step's whole percent.
 #[test]
@@ -861,7 +905,7 @@ fn an_untouched_volume_keeps_its_exact_value() {
     let mut kept = s.clone();
     t.adjust(Adjust::HiSpeedDown).apply_to(&mut kept);
     assert_eq!(kept.device.master_volume, 0.754);
-    assert_eq!(kept.player.visible_time_ms, 2_375);
+    assert_eq!(kept.player.visible_time_ms, 2_362);
     let mut moved = s.clone();
     t.adjust(Adjust::VolumeUp).apply_to(&mut moved);
     assert_eq!(moved.device.master_volume, 0.8);

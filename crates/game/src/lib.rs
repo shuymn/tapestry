@@ -69,5 +69,5 @@ pub use settings::{
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{
     Adjust, DEFAULT_VISIBLE_TIME_MS, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, Tuning,
-    VISIBLE_TIME_MS, VISIBLE_TIME_STEP_MS, VOLUME_STEP_PERCENT,
+    VISIBLE_TIME_MS, VISIBLE_TIME_STEPS_MS, VOLUME_STEP_PERCENT,
 };

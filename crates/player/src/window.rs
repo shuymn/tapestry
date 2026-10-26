@@ -385,7 +385,7 @@ mod tests {
             true,
             &Keys::new(None, None),
         );
-        assert_eq!(c.tuning().get().visible_time_ms, 575);
+        assert_eq!(c.tuning().get().visible_time_ms, 569);
     }
 
     /// `device.toml`'s monitor picks a monitor by its exact device name,
