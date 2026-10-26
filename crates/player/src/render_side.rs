@@ -774,4 +774,100 @@ mod tests {
         frames.dedup();
         assert_eq!(frames, [start, faster, later]);
     }
+
+    /// A screen whose every play frame fails, as a lost surface does.
+    struct Lost;
+
+    impl Screen for Lost {
+        fn load(&mut self, _chart: &Chart) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, String> {
+            Err("surface lost".to_owned())
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A judgment drawn on a play frame that fails never reaches the screen
+    /// through it: the render thread counts it N/A in the play's figures.
+    #[test]
+    fn a_failed_play_frame_makes_its_judgments_na() {
+        use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
+        use game::DeviceSettings;
+        use input::DeviceKind;
+
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let rule = rules::custom();
+        let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard]);
+        let (mut writer, reader) = input::source_queue(16);
+        // Z, lane 1's default key, pressed on the note.
+        let press = PhysicalInputEvent {
+            received: TimeUs(1_000_000),
+            source: SourceId(0),
+            kind: InputKind::Control {
+                control: ControlId(0x2c),
+                value: 1,
+            },
+        };
+        writer.push(press).unwrap();
+        writer.publish(TimeUs(1_000_001));
+        let (mut logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            vec![reader],
+            LogicConfig {
+                inputs: 16,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        logic.advance_to(TimeUs(1_000_002));
+        assert!(
+            logic
+                .events()
+                .iter()
+                .any(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
+        );
+        let clock = QpcClock::start();
+        let make: MakeScreen = Box::new(|| Ok(Box::new(Lost) as Box<dyn Screen>));
+        let link = spawn(
+            make,
+            Arc::new(chart.clone()),
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let origin = clock.now();
+        link.send(RenderMsg::Play {
+            origin,
+            side,
+            gauge: 0,
+            measure: play_measure(origin),
+        });
+        assert!(wait_until(|| link.failed()));
+        let fig = link.finish(clock.now()).expect("the play's figures");
+        assert_eq!(fig.press_to_screen_unavailable, 1);
+        assert_eq!(fig.press_to_screen, None);
+        link.exit();
+    }
 }
