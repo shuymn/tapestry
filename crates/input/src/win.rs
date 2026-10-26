@@ -20,10 +20,10 @@ use windows::Win32::System::Threading::{
     TIMER_ALL_ACCESS, WaitForSingleObject,
 };
 use windows::Win32::UI::Input::{
-    GetRawInputBuffer, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT,
-    RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWINPUTHEADER, RAWKEYBOARD, RID_DEVICE_INFO,
-    RID_INPUT, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_DEVICEINFO, RIM_TYPEKEYBOARD,
-    RegisterRawInputDevices,
+    GetRawInputBuffer, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList,
+    GetRegisteredRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST,
+    RAWINPUTHEADER, RAWKEYBOARD, RID_DEVICE_INFO, RID_INPUT, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK,
+    RIDEV_REMOVE, RIDI_DEVICEINFO, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL,
@@ -493,6 +493,8 @@ pub struct InputThread {
     stop: Arc<AtomicBool>,
     /// `None` once joined.
     handle: Option<JoinHandle<WakeReport>>,
+    /// The receiver window, as a raw value.
+    receiver: usize,
 }
 
 impl InputThread {
@@ -528,7 +530,7 @@ impl InputThread {
                 });
                 let (mut raw, timer) = match setup {
                     Ok(ready) => {
-                        let _ = ready_tx.send(Ok(()));
+                        let _ = ready_tx.send(Ok(ready.0.hwnd.0 as usize));
                         ready
                     }
                     Err(e) => {
@@ -563,9 +565,10 @@ impl InputThread {
             })
             .map_err(InputError::Spawn)?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(receiver)) => Ok(Self {
                 stop,
                 handle: Some(handle),
+                receiver,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -573,6 +576,13 @@ impl InputThread {
             }
             Err(_) => Err(InputError::Panicked),
         }
+    }
+
+    /// The receiver window the keyboards are registered to, as a raw
+    /// `HWND` value, for comparing with [`keyboard_target`].
+    #[must_use]
+    pub const fn receiver(&self) -> usize {
+        self.receiver
     }
 
     /// Stops the thread after its current wake and returns what it
@@ -605,4 +615,26 @@ impl Drop for InputThread {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
+}
+
+/// The window this process's keyboard Raw Input registration targets, as a
+/// raw `HWND` value; `None` when keyboards are not registered (or are
+/// registered without a target window). Registration is per process, so
+/// another registration of keyboards, such as a window library's, replaces
+/// the input thread's: compare with [`InputThread::receiver`].
+#[must_use]
+pub fn keyboard_target() -> Option<usize> {
+    let entry = size_of::<RAWINPUTDEVICE>() as u32;
+    let mut list = [RAWINPUTDEVICE::default(); 16];
+    let mut count = list.len() as u32;
+    // SAFETY: `list` holds `count` entries.
+    let got = unsafe { GetRegisteredRawInputDevices(Some(list.as_mut_ptr()), &mut count, entry) };
+    if got == u32::MAX {
+        return None;
+    }
+    list.iter()
+        .take(got as usize)
+        .find(|d| d.usUsagePage == 0x01 && d.usUsage == 0x06)
+        .map(|d| d.hwndTarget.0 as usize)
+        .filter(|&h| h != 0)
 }
