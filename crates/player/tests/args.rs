@@ -14,11 +14,63 @@ fn version_exits_zero() {
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("tapestry "));
 }
 
-#[test]
-fn unknown_argument_exits_two() {
-    let out = run(&["--no-such-flag"]);
+#[track_caller]
+fn assert_unknown(args: &[&str], arg: &str) {
+    let out = run(args);
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown argument: --no-such-flag"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("unknown argument: {arg}")),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn unknown_argument_still_exits_two() {
+    assert_unknown(&["--no-such-flag"], "--no-such-flag");
+    // After `play` too, before or after the chart, and a second chart.
+    assert_unknown(&["play", "--no-such-flag", "a.bms"], "--no-such-flag");
+    assert_unknown(&["play", "a.bms", "--no-such-flag"], "--no-such-flag");
+    assert_unknown(&["play", "a.bms", "b.bms"], "b.bms");
+}
+
+#[test]
+fn play_without_chart_is_an_error() {
+    for args in [&["play"][..], &[]] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("usage: tapestry play"));
+    }
+    let out = run(&["play"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("play needs a chart file"));
+}
+
+/// A chart that does not exist is refused before any window opens, in a
+/// data root of its own.
+#[test]
+fn missing_chart_exits_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let chart = dir.path().join("missing.bms");
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .args(["play".as_ref(), chart.as_os_str()])
+        .env("LOCALAPPDATA", dir.path())
+        .output()
+        .expect("run tapestry");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing.bms"), "{stderr}");
+    // The first start wrote the default key config.
+    assert!(dir.path().join("tapestry").join("device.toml").is_file());
+}
+
+#[cfg(not(feature = "dev-tools"))]
+#[test]
+fn dev_scripted_input_is_unknown_without_feature() {
+    assert_unknown(&["--dev-scripted-input", "x"], "--dev-scripted-input");
+    assert_unknown(
+        &["play", "a.bms", "--dev-scripted-input", "x"],
+        "--dev-scripted-input",
+    );
 }
 
 #[test]

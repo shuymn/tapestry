@@ -21,9 +21,24 @@ default = []
 dev-tools = []
 
 [dependencies]
+audio.workspace = true
 bms-model.workspace = true
 eval.workspace = true
+game.workspace = true
+input.workspace = true
+render.workspace = true
+replay.workspace = true
 rules.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging",
+] }
+winit.workspace = true
+
+[dev-dependencies]
+bms-parser.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -1,7 +1,31 @@
 //! Development features, compiled only with the `dev-tools` feature.
+//!
+//! `play <chart> --dev-scripted-input <log>` plays the chart on the same
+//! threads as the game, without a window or devices: the input log's
+//! events drive the input side as a script on the play's timeline, the
+//! audio engine plays into a recording of a simulated device paced by the
+//! clock, and the renderer draws offscreen on WARP. `--dev-frames <dir>`
+//! also writes a countdown frame, a play frame and the end screen there as
+//! PNG files.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use audio::{AudioOutput, OutputError, RecordingOutput, SimConfig, SimDevice, Wake};
+use bms_model::{TimeSource, TimeUs};
+use game::Wakes;
+use input::{DeviceKind, QpcClock, ScriptedInput, SourceSet};
+use render::Renderer;
+use replay::DecodeLimits;
+
+use crate::input_side::Hook;
+use crate::render_side::FrameSink;
 
 /// Handles a development-only argument, or returns `None` for any other one.
 pub fn handle_arg(arg: &OsStr) -> Option<ExitCode> {
@@ -12,4 +36,300 @@ pub fn handle_arg(arg: &OsStr) -> Option<ExitCode> {
         return Some(ExitCode::SUCCESS);
     }
     None
+}
+
+/// The development options of `play`.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// The input log to play.
+    pub scripted_input: Option<PathBuf>,
+    /// Where to write frames.
+    pub frames: Option<PathBuf>,
+}
+
+impl Options {
+    /// Takes `arg` and its value if it is a development option of `play`.
+    ///
+    /// # Errors
+    ///
+    /// A message for an option without its value.
+    pub fn take(
+        &mut self,
+        arg: &OsStr,
+        rest: &mut impl Iterator<Item = OsString>,
+    ) -> Result<bool, String> {
+        let slot = if arg == "--dev-scripted-input" {
+            &mut self.scripted_input
+        } else if arg == "--dev-frames" {
+            &mut self.frames
+        } else {
+            return Ok(false);
+        };
+        let value = rest
+            .next()
+            .ok_or_else(|| format!("{} needs a value", arg.to_string_lossy()))?;
+        *slot = Some(PathBuf::from(value));
+        Ok(true)
+    }
+}
+
+/// The scripted play's input: the log's events as a script, one device per
+/// source.
+///
+/// # Errors
+///
+/// Why the log cannot be read.
+pub fn script(log: &Path) -> Result<ScriptedInput, String> {
+    let bytes = fs::read(log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let rec = replay::decode(&bytes, &DecodeLimits::default())
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    let kinds: Vec<DeviceKind> = rec
+        .devices
+        .sources
+        .iter()
+        .map(|s| match s.kind {
+            replay::DeviceKind::Keyboard => DeviceKind::Keyboard,
+            replay::DeviceKind::Controller => DeviceKind::Controller,
+        })
+        .collect();
+    Ok(ScriptedInput::from_log(&rec.start, &rec.events, &kinds))
+}
+
+/// The scripted input thread: the input thread's boundary every
+/// millisecond, the script fed by the hook. Stops when dropped.
+pub struct ScriptThread {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ScriptThread {
+    /// Starts it with `sources` and `hook` (in script mode).
+    ///
+    /// # Errors
+    ///
+    /// If the thread cannot start.
+    pub fn spawn(clock: QpcClock, mut sources: SourceSet, mut hook: Hook) -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("scripted input".into())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    hook.wake(&mut sources, clock.now());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+            .map_err(|e| format!("the scripted input thread cannot start: {e}"))?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for ScriptThread {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// A simulated device paced by the clock: each wait sleeps until the
+/// device's next buffer event is due on the clock, so the engine runs in
+/// real time as it does with WASAPI.
+pub struct Paced<O> {
+    inner: O,
+    clock: QpcClock,
+}
+
+/// The recording output of a scripted run: 48 kHz, 10 ms periods, waking
+/// first now, recording up to `seconds` of audio.
+pub fn recording_output(clock: QpcClock, seconds: usize) -> Paced<RecordingOutput<SimDevice>> {
+    let device = SimDevice::new(SimConfig::steady(48_000, 480, clock.now()));
+    Paced {
+        inner: RecordingOutput::new(device, 48_000 * seconds),
+        clock,
+    }
+}
+
+impl<O: AudioOutput + Wakes> AudioOutput for Paced<O> {
+    fn rate(&self) -> u32 {
+        self.inner.rate()
+    }
+
+    fn period(&self) -> u32 {
+        self.inner.period()
+    }
+
+    fn wait(&mut self) -> Wake {
+        let left = self.inner.next_wake().0 - self.clock.now().0;
+        if left > 0 {
+            std::thread::sleep(Duration::from_micros(left.unsigned_abs()));
+        }
+        self.inner.wait()
+    }
+
+    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
+        self.inner.write(f)
+    }
+}
+
+/// Prints what the recording output kept.
+pub fn report_audio(out: &Paced<RecordingOutput<SimDevice>>) {
+    let samples = out.inner.samples();
+    let peak = samples.iter().fold(0.0_f32, |p, s| p.max(s.abs()));
+    println!(
+        "dev: audio recorded {} frames, peak {peak:.3}",
+        samples.len() / audio::CHANNELS
+    );
+}
+
+/// Writes frames as PNG files: `countdown.png` at the first frame of the
+/// lead-in, `play.png` at the first frame at or after `play_at`, and
+/// `end.png` at the first end screen frame.
+pub struct FrameDump {
+    dir: PathBuf,
+    play_at: TimeUs,
+    countdown: bool,
+    play: bool,
+    end: bool,
+}
+
+impl FrameDump {
+    /// Frames into `dir`, the play frame at chart time `play_at`.
+    pub const fn new(dir: PathBuf, play_at: TimeUs) -> Self {
+        Self {
+            dir,
+            play_at,
+            countdown: false,
+            play: false,
+            end: false,
+        }
+    }
+
+    fn save(&self, renderer: &Renderer, name: &str) {
+        let (w, h) = renderer.size();
+        let path = self.dir.join(name);
+        let written = fs::create_dir_all(&self.dir)
+            .and_then(|()| fs::write(&path, png(w, h, &renderer.read_back())));
+        match written {
+            Ok(()) => println!("dev: frame {}", path.display()),
+            Err(e) => eprintln!("dev: {}: {e}", path.display()),
+        }
+    }
+}
+
+impl FrameSink for FrameDump {
+    fn frame(&mut self, renderer: &Renderer, play: Option<TimeUs>) {
+        match play {
+            Some(t) if t.0 < 0 && !self.countdown => {
+                self.countdown = true;
+                self.save(renderer, "countdown.png");
+            }
+            Some(t) if t >= self.play_at && !self.play => {
+                self.play = true;
+                self.save(renderer, "play.png");
+            }
+            None if !self.end => {
+                self.end = true;
+                self.save(renderer, "end.png");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// An RGBA8 image as a PNG file, stored without compression (deflate's
+/// stored blocks): enough for a few development screenshots without an
+/// image library.
+fn png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let row = width as usize * 4;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgba.chunks(row) {
+        raw.push(0); // no filter
+        raw.extend_from_slice(line);
+    }
+    let mut z = vec![0x78, 0x01];
+    let mut blocks = raw.chunks(0xFFFF).peekable();
+    while let Some(b) = blocks.next() {
+        z.push(u8::from(blocks.peek().is_none()));
+        // `chunks(0xFFFF)` keeps every block within u16.
+        let len = b.len() as u16;
+        z.extend_from_slice(&len.to_le_bytes());
+        z.extend_from_slice(&(!len).to_le_bytes());
+        z.extend_from_slice(b);
+    }
+    z.extend_from_slice(&adler32(&raw).to_be_bytes());
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    for (kind, data) in [(b"IHDR", &ihdr[..]), (b"IDAT", &z[..]), (b"IEND", &[][..])] {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+    out
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for &x in data {
+        a = (a + u32::from(x)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    b << 16 | a
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0_u32;
+    for &x in data {
+        c ^= u32::from(x);
+        for _ in 0..8 {
+            c = if c & 1 == 1 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adler32, crc32, png};
+
+    #[test]
+    fn checksums_match_their_reference_values() {
+        // The published check values: CRC-32 of "123456789" is CBF43926,
+        // Adler-32 of "Wikipedia" is 11E60398.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
+    }
+
+    #[test]
+    fn png_splits_rows_into_stored_blocks() {
+        // 20 000 px × 1 row: 80 001 raw bytes, more than one stored block.
+        let out = png(20_000, 1, &vec![7_u8; 80_000]);
+        assert_eq!(&out[..8], b"\x89PNG\r\n\x1a\n");
+        // IDAT follows the signature and the 25-byte IHDR chunk.
+        let idat = &out[33..];
+        let len = u32::from_be_bytes(idat[..4].try_into().unwrap()) as usize;
+        assert_eq!(&idat[4..8], b"IDAT");
+        let z = &idat[8..8 + len];
+        // The zlib header, a non-final block of 65 535 bytes, a final one
+        // of 80 001 − 65 535 = 14 466, then the Adler-32.
+        assert_eq!(&z[..7], [0x78, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
+        let second = 2 + 5 + 65_535;
+        assert_eq!(z[second], 1);
+        assert_eq!(z[second + 1..second + 3], 14_466_u16.to_le_bytes());
+        assert_eq!(z.len(), second + 5 + 14_466 + 4);
+    }
 }
