@@ -57,18 +57,23 @@ jobs:
       - name: Production excludes dev-tools
         run: |
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
-          set +e
-          target/release/tapestry.exe --dev-tools-probe 2> probe.err
-          code=$?
-          set -e
-          cat probe.err
-          test "$code" -eq 2
-          grep -q "unknown argument" probe.err
+          for arg in --dev-tools-probe --dev-scripted-input; do
+            set +e
+            target/release/tapestry.exe "$arg" x 2> probe.err
+            code=$?
+            set -e
+            cat probe.err
+            test "$code" -eq 2
+            grep -q "unknown argument: $arg" probe.err
+          done
       - name: Development build includes dev-tools (positive control)
         run: |
           mise exec -- cargo build --locked -p player --features dev-tools
           mise exec -- cargo xtask check-binary --present "tapestry dev-tools enabled" target/debug/tapestry.exe
           target/debug/tapestry.exe --dev-tools-probe
+      # The game on its threads, driven by a scripted input log, on WARP.
+      - name: Test (dev-tools)
+        run: mise exec -- cargo test -p player --features dev-tools --locked
 
   linux:
     runs-on: ubuntu-24.04
