@@ -709,7 +709,7 @@ fn controllers_take_part_before_keyboards_at_the_limit() {
 }
 
 #[test]
-fn a_controller_keeps_its_products_until_it_is_removed() {
+fn a_controller_keeps_its_product_until_it_is_removed() {
     let product = |interface| input::hid::HidProduct {
         vendor_id: 0x1234,
         product_id: 0x5678,
@@ -717,25 +717,13 @@ fn a_controller_keeps_its_products_until_it_is_removed() {
     };
     let mut set = SourceSet::new(config()).unwrap();
     set.begin_batch(TimeUs(0));
-    assert!(!set.add_product(DeviceId(7), product(Some(1))));
+    assert!(!set.set_product(DeviceId(7), product(Some(1))));
     set.connect(DeviceId(7), DeviceKind::Controller);
     assert!(!set.has_product(DeviceId(7), product(Some(1))));
-    // Two functions of one controller: both are its products, a third
-    // interface or none is not.
-    assert!(set.add_product(DeviceId(7), product(Some(1))));
-    assert!(set.add_product(DeviceId(7), product(Some(2))));
-    assert!(set.add_product(DeviceId(7), product(Some(2))));
+    assert!(set.set_product(DeviceId(7), product(Some(1))));
     assert!(set.has_product(DeviceId(7), product(Some(1))));
-    assert!(set.has_product(DeviceId(7), product(Some(2))));
-    assert!(!set.has_product(DeviceId(7), product(Some(3))));
+    assert!(!set.has_product(DeviceId(7), product(Some(2))));
     assert!(!set.has_product(DeviceId(7), product(None)));
-    // At most MAX_PRODUCTS: the two above and six more, then no room.
-    for i in 3..=8 {
-        assert!(set.add_product(DeviceId(7), product(Some(i))));
-    }
-    assert_eq!(input::MAX_PRODUCTS, 8);
-    assert!(!set.add_product(DeviceId(7), product(Some(9))));
-    assert!(!set.has_product(DeviceId(7), product(Some(9))));
     set.disconnect(DeviceId(7));
     set.connect(DeviceId(7), DeviceKind::Controller);
     assert!(!set.has_product(DeviceId(7), product(Some(1))));

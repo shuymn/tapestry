@@ -43,9 +43,7 @@ pub use capture::{Capture, Watched};
 pub use gate::{Admit, DeviceId, FocusGate, FocusLatch, Packet};
 pub use queue::{Overflow, SourceReader, SourceWriter, source_queue};
 pub use scripted::{Action, ScriptItem, ScriptedInput, TimeOverflow, autoplay, declared_axes};
-pub use sources::{
-    Arrival, ConfigError, DeviceKind, MAX_PRODUCTS, SOURCE_LIMIT, SourceConfig, SourceSet,
-};
+pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, SourceSet};
 pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
 #[cfg(windows)]
 pub use win::{

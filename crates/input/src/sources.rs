@@ -28,10 +28,6 @@ pub struct Arrival {
     pub kind: DeviceKind,
 }
 
-/// The most products one device keeps ([`SourceSet::add_product`]): its
-/// functions with controller collections.
-pub const MAX_PRODUCTS: usize = 8;
-
 /// The most sources a play can have: one per [`SourceId`].
 pub const SOURCE_LIMIT: usize = 1 << 16;
 
@@ -75,9 +71,8 @@ struct Device {
     /// The controls recorded from it: its lane and system bindings, set by
     /// [`SourceSet::set_recorded`].
     recorded: Vec<ControlId>,
-    /// A controller's products, one per function of its collections
-    /// ([`SourceSet::add_product`]).
-    products: [Option<HidProduct>; MAX_PRODUCTS],
+    /// A controller's product ([`SourceSet::set_product`]).
+    product: Option<HidProduct>,
     /// Whether it is a source of the next opening
     /// ([`SourceSet::set_takes_part`]).
     takes_part: bool,
@@ -298,7 +293,7 @@ impl SourceSet {
                 positions: [None; MAX_AXES],
                 source: None,
                 recorded: Vec::new(),
-                products: [None; MAX_PRODUCTS],
+                product: None,
                 takes_part: true,
                 state_lost: false,
                 connection: self.next_connection,
@@ -441,35 +436,27 @@ impl SourceSet {
         }
     }
 
-    /// Adds a product of the connected controller `device`, as the
-    /// adapter reads it from one of its collections: a controller whose
-    /// collections belong to several functions has one per function, at
-    /// most [`MAX_PRODUCTS`]. Returns `false` for a device that is not
-    /// connected or has no room left.
-    pub fn add_product(&mut self, device: DeviceId, product: HidProduct) -> bool {
-        let Some(d) = self.devices.iter_mut().find(|d| d.id == device) else {
-            return false;
-        };
-        if d.products.contains(&Some(product)) {
-            return true;
-        }
-        match d.products.iter_mut().find(|p| p.is_none()) {
-            Some(free) => {
-                *free = Some(product);
+    /// Sets the product of the connected controller `device`, as the
+    /// adapter reads it: a source holds the collections of one function,
+    /// so it has one. Returns `false` for a device that is not connected.
+    pub fn set_product(&mut self, device: DeviceId, product: HidProduct) -> bool {
+        match self.devices.iter_mut().find(|d| d.id == device) {
+            Some(d) => {
+                d.product = Some(product);
                 true
             }
             None => false,
         }
     }
 
-    /// Whether the connected controller `device` has `product`
-    /// ([`add_product`](Self::add_product)).
+    /// Whether the connected controller `device` is of `product`
+    /// ([`set_product`](Self::set_product)).
     #[must_use]
     pub fn has_product(&self, device: DeviceId, product: HidProduct) -> bool {
         self.devices
             .iter()
             .find(|d| d.id == device)
-            .is_some_and(|d| d.products.contains(&Some(product)))
+            .is_some_and(|d| d.product == Some(product))
     }
 
     /// Sets whether `device` is a source of the next opening. A device

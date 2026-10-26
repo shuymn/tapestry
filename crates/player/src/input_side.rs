@@ -399,7 +399,7 @@ mod tests {
         }
         for &(d, product) in controllers {
             set.connect(DeviceId(d), DeviceKind::Controller);
-            set.add_product(DeviceId(d), product);
+            set.set_product(DeviceId(d), product);
         }
         set.end_batch(TimeUs(0));
         set
@@ -488,7 +488,7 @@ mod tests {
             set.connect(DeviceId(d), DeviceKind::Keyboard);
         }
         set.connect(DeviceId(10), DeviceKind::Controller);
-        set.add_product(DeviceId(10), CONFIGURED);
+        set.set_product(DeviceId(10), CONFIGURED);
         assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
         set.open_recording(TimeUs(1));
         let note = left_out_note(&set).unwrap();

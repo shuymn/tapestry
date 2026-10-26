@@ -8,9 +8,9 @@
 //! the key config's [`Capture`].
 //!
 //! Windows exposes each top-level collection of a controller as a device
-//! of its own. The collections of one physical controller share one
-//! [`DeviceId`], so they are one source owning its buttons and axes alike
-//! (stage1.md D6); each collection's controls carry its collection number
+//! of its own. The collections of one function of a physical controller
+//! share one [`DeviceId`] ([`place_collection`]), so they are one source
+//! owning its buttons and axes alike (stage1.md D6); each collection's controls carry its collection number
 //! ([`in_collection`]), so they stay distinct within the source.
 
 use eval::ControlId;
@@ -166,6 +166,87 @@ pub fn collection_of(path: &[u16]) -> u8 {
 #[must_use]
 pub fn interface_of(path: &[u16]) -> Option<u8> {
     hex_after(path, b"&mi_")
+}
+
+/// The interface path a device-name read left in `buf`: the characters
+/// before its first nul; `None` without one. A buffer reused for several
+/// reads holds the rest of a longer earlier path after that nul.
+#[must_use]
+pub fn until_nul(buf: &[u16]) -> Option<&[u16]> {
+    let len = buf.iter().position(|&c| c == 0)?;
+    Some(&buf[..len])
+}
+
+/// Which group of collections a controller collection's source is: the
+/// physical device's container and the function's interface number, so a
+/// source never holds two functions of a composite device.
+pub type Group = (u128, Option<u8>);
+
+/// Where a newly found controller collection goes ([`place_collection`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    /// The group whose source it joins; `None`: a source of its own.
+    pub group: Option<Group>,
+    /// Its collection number ([`collection_of`]); 0 when its path is
+    /// unknown.
+    pub collection: u8,
+    /// Its product; `None` when its path or its ids are unknown, so key
+    /// config can never bind it to an identity that may later not match.
+    pub product: Option<HidProduct>,
+}
+
+/// Places a controller collection whose interface path is `path` (`None`
+/// when it could not be read), whose physical device's container is
+/// `container` (`None` when unknown or none), and whose device declares
+/// the vendor and product ids `ids`, beside the collections `connected`
+/// already has, each as its group and collection number. The collection
+/// number and the interface number come from `path` alone. It joins the
+/// source of its group, the container and the interface, unless a
+/// collection of that group with its number is connected already: then
+/// it keeps a source of its own.
+pub fn place_collection(
+    path: Option<&[u16]>,
+    container: Option<u128>,
+    ids: Option<(u16, u16)>,
+    connected: impl IntoIterator<Item = (Option<Group>, u8)>,
+) -> Placement {
+    let Some(path) = path else {
+        return Placement {
+            group: None,
+            collection: 0,
+            product: None,
+        };
+    };
+    let collection = collection_of(path);
+    let interface = interface_of(path);
+    let group = container.map(|c| (c, interface));
+    let taken = group.is_some_and(|g| {
+        connected
+            .into_iter()
+            .any(|(other, number)| other == Some(g) && number == collection)
+    });
+    Placement {
+        group: group.filter(|_| !taken),
+        collection,
+        product: ids.map(|(vendor_id, product_id)| HidProduct {
+            vendor_id,
+            product_id,
+            interface,
+        }),
+    }
+}
+
+/// The source of the collections of `group`: one per function of a
+/// physical device. Handles are pointers, below 2^63; these ids are
+/// above.
+#[must_use]
+pub const fn group_device(group: Group) -> DeviceId {
+    let (container, interface) = group;
+    let function = match interface {
+        Some(i) => (i as u64 + 1) << 48,
+        None => 0,
+    };
+    DeviceId((container as u64 ^ (container >> 64) as u64 ^ function) | 1 << 63)
 }
 
 /// The two hex digits after the first `marker` (lowercase ASCII) in
