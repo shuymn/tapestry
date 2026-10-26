@@ -304,6 +304,18 @@ fn newer_version_is_refused() {
 }
 
 #[test]
+fn a_record_from_before_the_out_of_range_counts_is_refused() {
+    // Format 2 had no out-of-range count per source. Its files are refused
+    // by their version, before the body is read, with no conversion.
+    let mut old = wrap(&body_bytes(&golden()), 3);
+    old[4..6].copy_from_slice(&2_u16.to_le_bytes());
+    assert_eq!(
+        decode(&old, &limits()),
+        Err(DecodeError::UnsupportedVersion(2))
+    );
+}
+
+#[test]
 fn truncated_body_is_an_error_not_a_panic() {
     let rec = sample(60);
     let body = body_bytes(&rec);

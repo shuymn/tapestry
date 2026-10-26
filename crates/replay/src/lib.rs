@@ -62,7 +62,7 @@ pub use record::{
 use wire::{Reader, Writer};
 
 /// The format version this crate writes, and the only one it reads.
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 3;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -402,8 +402,8 @@ fn write_status(w: &mut Writer, s: &Status) {
     w.uint(bit(*overflow, OVERFLOW) | bit(*source_limit, SOURCE_LIMIT) | bit(*suspend, SUSPEND));
 }
 
-/// Decodes a file written by [`encode`] of this or an earlier format
-/// version.
+/// Decodes a file written by [`encode`] in [`FORMAT_VERSION`]; every other
+/// version is refused, older ones included.
 ///
 /// # Errors
 ///
