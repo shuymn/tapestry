@@ -175,19 +175,16 @@ fn bpm_zero_is_rejected() {
 }
 
 #[test]
-fn bpm_takes_six_fractional_digits_not_seven() {
-    let loaded = load_text("#BPM 120.000001\n#WAV01 click.wav\n#00111:01\n").unwrap();
-    assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 120_000_001);
-    // 4 beats at 120.000001 BPM: floor(240e6 / 120.000001) = 1_999_999.
+fn bpm_keeps_eighteen_fractional_digits_and_cuts_the_rest() {
+    let loaded = load_text("#BPM 120.000000000000000003\n#WAV01 click.wav\n#00111:01\n").unwrap();
+    // The scroll map takes millionths rounded down; time uses the exact BPM.
+    assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 120_000_000);
+    // 4 beats: floor(240e6 / 120.000000000000000003) = 1_999_999, where
+    // 120 BPM gives exactly 2_000_000.
     assert_eq!(times(&loaded.chart.lanes[1]), vec![1_999_999]);
-    assert_eq!(
-        load_text("#BPM 120.0000001\n#00111:01\n"),
-        Err(LoadError::InvalidValue {
-            line: 1,
-            what: "#BPM",
-            reason: "more than 6 fractional digits"
-        })
-    );
+    // A 19th fractional digit is cut off: exactly 120 BPM.
+    let loaded = load_text("#BPM 120.0000000000000000007\n#WAV01 click.wav\n#00111:01\n").unwrap();
+    assert_eq!(times(&loaded.chart.lanes[1]), vec![2_000_000]);
 }
 
 #[test]
@@ -279,6 +276,27 @@ fn chart_ending_exactly_at_duration_cap_loads() {
         load_text(past),
         Err(LoadError::DurationExceeded { measure: 900 })
     );
+}
+
+#[test]
+fn time_past_the_duration_cap_by_less_than_a_microsecond_is_refused() {
+    // A 0.000001-unit STOP at 120 BPM lasts 1.25 / 120 µs: the time floors
+    // to 0, the cap, but lies past it.
+    let dir = folder(&["click.wav"]);
+    let opts = LoadOptions {
+        limits: Limits {
+            max_duration: TimeUs(0),
+            ..Limits::default()
+        },
+        ..LoadOptions::default()
+    };
+    let text = "#BPM 120\n#STOP01 0.000001\n#00009:01\n";
+    assert_eq!(
+        load_bms(text.as_bytes(), dir.path(), &opts),
+        Err(LoadError::DurationExceeded { measure: 0 })
+    );
+    // Without the STOP the chart ends at 0 and loads.
+    assert!(load_bms(b"#BPM 120\n", dir.path(), &opts).is_ok());
 }
 
 #[test]
@@ -563,10 +581,10 @@ fn long_note_edge_cases() {
 #[test]
 fn resolved_hash_matches_golden() {
     // Computed at authoring time by an independent script encoding the
-    // documented fields of this chart: version 1, 120 BPM, no scroll changes,
+    // documented fields of this chart: version 2, 120 BPM, no scroll changes,
     // one tap at 2 s on key 1 with sound 0, bar lines at 0 and 2 s, the sound
     // name `a.wav`, an empty title and no other values.
-    const GOLDEN: &str = "e86790ddd8254fadbfccacc43e8ef18f37240733004cf019911db730b50477bb";
+    const GOLDEN: &str = "b55f7f6c1e864d386d3339be8a60baf1c3283a6a2ea57439c2d81785cf855d6c";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart

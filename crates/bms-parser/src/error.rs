@@ -63,8 +63,8 @@ pub enum LoadError {
         /// The first measure with a time past the limit.
         measure: u16,
     },
-    /// Time computation overflowed.
-    #[error("measure {measure}: time computation overflowed")]
+    /// The exact time grew past [`Limits::max_time_bits`](crate::Limits).
+    #[error("measure {measure}: exact time is larger than the size limit")]
     TimeOverflow {
         /// The measure being computed.
         measure: u16,

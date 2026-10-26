@@ -2,21 +2,31 @@
 //!
 //! Supports `#PLAYER 1` 7-key + scratch charts. Charts and sounds are
 //! untrusted: every limit in [`Limits`] is checked before the work it bounds,
-//! times use exact rationals with checked arithmetic, and sound files are
+//! times use exact rationals whose size is capped, and sound files are
 //! confined to the chart folder. This crate does not use floating point.
 //! The cast lints at the crate root reject `as` casts that may truncate,
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 1
+//! # Loader version 2
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 1; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 2; changing any of them
 //! changes the version.
 //!
 //! - **Time:** each object's time is accumulated in exact rationals and
-//!   floored to µs once. BPM, `#STOPxx` and measure-length values take at
-//!   most 6 fractional digits. A `#STOPxx` value counts 1/192 of a 4/4
-//!   measure (1/48 beat) whatever the measure length.
+//!   floored to µs once; the time's denominator has at most
+//!   [`Limits::max_time_bits`] bits (an error otherwise). BPM, `#STOPxx`,
+//!   measure-length, `#TOTAL` and `#DEFEXRANK` values are decimals with an
+//!   optional exponent (`1.5`, `.5`, `1.00001E+07`), positive at most 18,
+//!   with at most 12 integer digits once the exponent applies; digits past
+//!   the 18th fractional one are cut off toward zero. A malformed timing
+//!   value is an error, and so is a measure length of 0, as written or cut
+//!   off to it; a malformed `#TOTAL` or `#DEFEXRANK` is ignored with a
+//!   warning. A BPM is at least 0.000001; the
+//!   scroll map takes it in millionths rounded down, while time uses the
+//!   exact value. `#TOTAL` and `#DEFEXRANK` are kept in thousandths rounded
+//!   down. A `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat)
+//!   whatever the measure length.
 //! - **Same position:** a BPM change applies before a STOP, so the STOP uses
 //!   the new BPM; a note at a STOP's position sounds at the STOP's start.
 //!   Channel 08 wins over channel 03; within a channel the later object in
@@ -91,7 +101,7 @@ use bms_model::{Chart, ChartIdentity, ScrollMap, SoundId, SoundRef, TimeUs};
 pub use error::{LoadError, Warning, WarningKind};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 1;
+pub const LOADER_VERSION: u32 = 2;
 
 /// Bounds on the work a chart may cause (D14). The defaults sit far above
 /// real charts.
@@ -109,6 +119,8 @@ pub struct Limits {
     pub max_duration: TimeUs,
     /// Deepest nesting of open `#RANDOM` and `#IF` blocks, each counting one.
     pub max_nesting: usize,
+    /// Most bits in the denominator of the exact running time (D3).
+    pub max_time_bits: u64,
 }
 
 impl Default for Limits {
@@ -120,6 +132,7 @@ impl Default for Limits {
             max_measure: 999,
             max_duration: TimeUs(60 * 60 * 1_000_000),
             max_nesting: 16,
+            max_time_bits: 16_384,
         }
     }
 }
