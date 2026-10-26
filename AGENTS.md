@@ -9,6 +9,7 @@ A Windows-only BMS player (a 7-key + scratch music game). The authoritative desi
 - **Confine Windows-dependent code to `input`, `audio`, `render`, and `player`:** Keep every other crate building and passing tests on Linux.
 - **Development features live only in the `dev-tools` feature:** Do not include the code itself in production builds. Do not hide it behind runtime flags.
 - **Do not allocate memory in in-play processing:** This covers input, logic, the audio callback, and per-frame rendering work (design.md "Key Libraries and Algorithms").
+- **The license follows the layer:** L0–L2 crates, `eval-cli`, and `xtask` are `MIT OR Apache-2.0`; L3 and above and `player` are `GPL-3.0-or-later`. Each crate states its license in its own `Cargo.toml`, and a permissive crate never depends on a GPL crate (design.md "Licenses").
 - **Do not put copyrighted charts or audio in the repository:** Build test charts in test code, or write them as small self-made BMS text.
 
 ## Commands

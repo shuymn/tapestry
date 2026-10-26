@@ -3,7 +3,7 @@ name = "replay"
 version = "0.0.0"
 description = "Input log format: the play record and its binary encoding."
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 publish.workspace = true
 

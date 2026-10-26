@@ -4,6 +4,8 @@
 use std::fs;
 use std::path::Path;
 
+use crate::arch::expected_license;
+
 /// `(package, Cargo.toml body after [package], source file)`.
 pub type Crate = (&'static str, String, &'static str);
 
@@ -71,6 +73,8 @@ pub fn set(crates: &mut [Crate], name: &str, body: &str) {
     crates.iter_mut().find(|c| c.0 == name).unwrap().1 = body.to_owned();
 }
 
+/// Writes the workspace. Each package named in [`crate::arch::LICENSES`] gets
+/// the license R4 expects for it.
 pub fn write_workspace(dir: &Path, crates: &[Crate]) {
     fs::write(
         dir.join("Cargo.toml"),
@@ -80,11 +84,14 @@ pub fn write_workspace(dir: &Path, crates: &[Crate]) {
     for (name, body, src) in crates {
         let root = dir.join("crates").join(name);
         fs::create_dir_all(root.join("src")).unwrap();
+        let license = expected_license(name)
+            .map(|l| format!("license = \"{l}\"\n"))
+            .unwrap_or_default();
         fs::write(
             root.join("Cargo.toml"),
             format!(
                 "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
-                 publish = false\n{body}"
+                 {license}publish = false\n{body}"
             ),
         )
         .unwrap();

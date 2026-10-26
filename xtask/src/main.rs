@@ -18,7 +18,7 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  check-arch                              check the architecture rules (R1-R3)
+  check-arch                              check the architecture rules (R1-R4)
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt

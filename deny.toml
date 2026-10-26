@@ -12,6 +12,9 @@ all-features = true
 # versions are errors.
 
 [licenses]
+# Check dev-dependencies too, so a third-party GPL crate cannot enter a
+# permissive crate as a test dependency (design.md "Licenses").
+include-dev = true
 # Only what the dependency graph needs. Add a license together with the
 # crate that brings it in.
 allow = [
@@ -23,6 +26,12 @@ allow = [
     "Zlib",       # foldhash, under hashbrown in the wgpu graph (render)
     "ISC",        # libloading, which wgpu-hal uses to load the DX12 runtime (render)
 ]
+
+[licenses.private]
+# Skip the workspace's own crates (all `publish = false`): some are GPL, and
+# `cargo xtask check-arch` (R4) checks their licenses. GPL stays out of
+# `allow`, so a third-party GPL crate is still rejected (design.md "Licenses").
+ignore = true
 
 [bans]
 multiple-versions = "warn"

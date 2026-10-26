@@ -1,0 +1,39 @@
+tapestry
+Copyright (c) 2026 Shu YAMANI and the tapestry contributors
+
+Licenses by crate
+-----------------
+
+The license of each crate is the `license` field of its `Cargo.toml`.
+
+MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE), at your option:
+  bms-model, bms-parser, rules, eval, replay, xtask
+
+GPL-3.0-or-later (LICENSE-GPL), with the additional permission below:
+  input, audio, game, render, player
+
+A program built from the GPL crates, such as the player, is a whole
+covered by the GNU General Public License version 3 or later.
+
+Additional permission under GNU GPL version 3 section 7
+-------------------------------------------------------
+
+If you modify this Program, or any covered work, by linking or combining
+it with the BASS audio library or its add-ons (such as BASSmix,
+BASSWASAPI, BASS_FX and BASSASIO) distributed by Un4seen Developments, or
+a modified version of those libraries, containing parts covered by the
+terms of their licenses, the licensors of this Program grant you
+additional permission to convey the resulting work. Corresponding Source
+for a non-source form of such a combination need not include the source
+code of those libraries. This permission does not grant any right to
+redistribute those libraries; their own terms apply. It does not apply to
+third-party code covered by the GPL that is combined into the same work.
+
+Works that are not covered by the GPL
+-------------------------------------
+
+Independently authored skins (including Lua skins), charts, presets and
+other data that the player loads, and independently authored programs
+that interact with the player only through its local event endpoint, are
+separate works and are not covered by the GPL. Code copied from the GPL
+crates keeps its license.
