@@ -209,13 +209,20 @@ case "$command" in
     need_corpus
     fetch
     write_seeds "$corpus/seeds"
+    # Every target runs; the exit status is the first failing one's.
     failed=()
+    first_status=0
     for target in "${targets[@]}"; do
-      run_target "$target" "$seconds" || failed+=("$target")
+      status=0
+      run_target "$target" "$seconds" || status=$?
+      if [ "$status" -ne 0 ]; then
+        failed+=("$target")
+        [ "$first_status" -ne 0 ] || first_status=$status
+      fi
     done
     if [ "${#failed[@]}" -ne 0 ]; then
       echo "failed: ${failed[*]}" >&2
-      exit 1
+      exit "$first_status"
     fi
     ;;
   repro)
