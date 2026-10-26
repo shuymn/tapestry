@@ -12,6 +12,15 @@ fail() {
   echo "FAIL: $1" >&2
   failures=$((failures + 1))
 }
+# expect_status <status> <label> <command> [args...]: the wrapper returns the
+# command's exit status.
+expect_status() {
+  local expected=$1 label=$2 code
+  shift 2
+  "$wsl" "$@"
+  code=$?
+  if [ "$code" -eq "$expected" ]; then pass "$label"; else fail "$label: got $code"; fi
+}
 
 # Preflight: Nix must be able to open this repository. Worktrees with relative
 # paths need Nix linked to libgit2 >= 1.9.4. Every later check depends on this.
@@ -22,13 +31,8 @@ else
   exit 1
 fi
 
-"$wsl" false
-code=$?
-if [ "$code" -eq 1 ]; then pass "exit code 1"; else fail "exit code 1: got $code"; fi
-
-"$wsl" sh -c 'exit 42'
-code=$?
-if [ "$code" -eq 42 ]; then pass "exit code 42"; else fail "exit code 42: got $code"; fi
+expect_status 1 "exit code 1" false
+expect_status 42 "exit code 42" sh -c 'exit 42'
 
 # shellcheck disable=SC2016
 args=('a b' '' '"q"' '$HOME' '*' '/usr/bin' 'C:\x y')
@@ -88,12 +92,8 @@ case "$dirs" in
   "$cache"/tapestry/fuzz-target/?*"|$cache"/tapestry/fuzz-corpus/?*) pass "fuzz shell directories: $dirs" ;;
   *) fail "fuzz shell directories under $cache/tapestry/fuzz-{target,corpus}/: got '$dirs'" ;;
 esac
-"$wsl" false
-code=$?
-if [ "$code" -eq 1 ]; then pass "fuzz shell: exit code 1"; else fail "fuzz shell: exit code 1: got $code"; fi
-"$wsl" sh -c 'exit 42'
-code=$?
-if [ "$code" -eq 42 ]; then pass "fuzz shell: exit code 42"; else fail "fuzz shell: exit code 42: got $code"; fi
+expect_status 1 "fuzz shell: exit code 1" false
+expect_status 42 "fuzz shell: exit code 42" sh -c 'exit 42'
 unset TAPESTRY_NIX_SHELL
 
 if [ "$failures" -ne 0 ]; then
