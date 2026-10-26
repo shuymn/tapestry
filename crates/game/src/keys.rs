@@ -105,6 +105,7 @@ pub struct KeyConfigFlow {
     current: KeyConfigs,
     bound: Vec<(Role, Vec<Bound>)>,
     refused: Option<Refusal>,
+    widened: Option<u32>,
 }
 
 impl KeyConfigFlow {
@@ -115,7 +116,16 @@ impl KeyConfigFlow {
             current,
             bound: Vec::new(),
             refused: None,
+            widened: None,
         }
+    }
+
+    /// The scratch axis's revolution, widened from what it reported while
+    /// it was captured beyond its declared range; written to
+    /// `device.toml` as its override.
+    #[must_use]
+    pub const fn widened(&self) -> Option<u32> {
+        self.widened
     }
 
     /// The role prompted for; `None` once every role is bound.
@@ -234,8 +244,10 @@ pub trait KeyScreen {
 /// How the key config screen ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyConfigEnd {
-    /// Every role was bound.
-    Done(KeyConfigs),
+    /// Every role was bound; with the scratch axis's widened revolution,
+    /// if its capture saw it report beyond its declared range
+    /// ([`KeyConfigFlow::widened`]).
+    Done(KeyConfigs, Option<u32>),
     /// Escape was pressed.
     Cancelled,
     /// The window closed.
@@ -266,9 +278,17 @@ pub fn capture_keys(
             kind,
             control: control.0,
         };
+        // Taken with the press, so it never outlives its capture.
+        let widened = capture.take_widened();
         match flow.press(pressed) {
-            Press::Done(keys) => return KeyConfigEnd::Done(keys),
+            Press::Done(keys) => return KeyConfigEnd::Done(keys, flow.widened),
             Press::Cancelled => return KeyConfigEnd::Cancelled,
+            Press::Bound(Role::Lane(0), _) => {
+                // The scratch is prompted for once: its capture decides the
+                // widening, which only a turned axis carries.
+                flow.widened = widened;
+                capture.arm();
+            }
             Press::Bound(..) | Press::Refused(_) => capture.arm(),
         }
     }

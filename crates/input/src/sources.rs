@@ -268,10 +268,7 @@ impl SourceSet {
         }
         // An unread device is not connected: read now, it leaves the
         // exclusion table.
-        if let Some(i) = self.unread.iter().position(|&d| d == device) {
-            self.unread.swap_remove(i);
-            self.untracked = self.untracked.saturating_sub(1);
-        }
+        self.forget_unread(device);
         if let Some(held) = self.spare_held.pop() {
             self.devices.push(Device {
                 id: device,
@@ -283,6 +280,7 @@ impl SourceSet {
                     wrap: 0,
                     min: 0,
                     max: 0,
+                    bits: 0,
                 }; MAX_AXES],
                 n_axes: 0,
                 positions: [None; MAX_AXES],
@@ -383,6 +381,16 @@ impl SourceSet {
     pub fn input_lost(&mut self) {
         if let Some(rec) = &mut self.recording {
             rec.overflowed = true;
+        }
+    }
+
+    /// Takes `device` out of the unread devices, if it is there: the
+    /// adapter reads it now, possibly as part of a source with another id
+    /// (a controller's collections grouped into one physical device).
+    pub fn forget_unread(&mut self, device: DeviceId) {
+        if let Some(i) = self.unread.iter().position(|&d| d == device) {
+            self.unread.swap_remove(i);
+            self.untracked = self.untracked.saturating_sub(1);
         }
     }
 

@@ -23,6 +23,9 @@ struct Slot {
     control: AtomicU64,
     /// How many times the slot was armed.
     armings: AtomicU64,
+    /// For a captured axis whose reports went outside its declared range,
+    /// the revolution they call for, plus [`PRESENT`]; 0 otherwise.
+    wrap: AtomicU64,
 }
 
 /// The capture slot shared by the input thread, which offers packets, and
@@ -40,6 +43,7 @@ impl Capture {
     /// Captures the next press, dropping any earlier capture.
     pub fn arm(&self) {
         self.0.armings.fetch_add(1, Ordering::Relaxed);
+        self.0.wrap.store(0, Ordering::Relaxed);
         self.0.control.store(0, Ordering::Relaxed);
         self.0.armed.store(true, Ordering::Release);
     }
@@ -66,6 +70,29 @@ impl Capture {
             DeviceKind::Controller
         };
         Some((ControlId(stored as u32), kind))
+    }
+
+    /// For the axis last captured, the revolution its reports during the
+    /// capture call for, when they went outside its declared range
+    /// ([`hid::widened_wrap`](crate::hid::widened_wrap)); taking it clears
+    /// it. Read it after [`take`](Self::take).
+    #[must_use]
+    pub fn take_widened(&self) -> Option<u32> {
+        let stored = self.0.wrap.swap(0, Ordering::Acquire);
+        (stored & PRESENT != 0).then_some(stored as u32)
+    }
+
+    /// Offers a turned controller axis, as [`offer`](Self::offer) offers a
+    /// press, with the revolution `widened` its reports call for, if any.
+    pub fn offer_axis(&self, packet: &Packet, recording_open: bool, widened: Option<u32>) {
+        if recording_open || packet.background {
+            return;
+        }
+        if self.0.armed.load(Ordering::Acquire) {
+            let wrap = widened.map_or(0, |w| u64::from(w) | PRESENT);
+            self.0.wrap.store(wrap, Ordering::Release);
+        }
+        self.offer(packet, DeviceKind::Controller, recording_open);
     }
 
     /// Offers a packet from a device of `kind` on the input thread. The

@@ -533,18 +533,23 @@ impl Loaded {
             .iter()
             .zip(&device.sources)
             .map(|(&k, s)| {
-                let all = self.settings.device.keys(k).recorded().len();
+                let all = self.settings.device.keys(k).roles().count();
                 (all - s.axes.len(), s.axes.len())
             })
             .collect();
-        let inputs = window_inputs(
+        // One probe sizes both the window and the reservation; a profile
+        // the evaluator refuses is left for the play to report.
+        let probe = Evaluator::new(
             &self.chart,
             &self.preset,
             &device,
-            self.config.lead_in,
-            &recorded,
+            &InputStart::default(),
+            0,
         );
-        if let Some(r) = Reservation::of(&self.chart, &self.preset, &device, self.config.effects)
+        let end = probe.as_ref().map_or(TimeUs(0), Evaluator::final_deadline);
+        let inputs = window_inputs(&device, end, self.config.lead_in, &recorded);
+        if let Ok(probe) = &probe
+            && let r = Reservation::from_probe(probe, &self.chart, &device, self.config.effects)
             && !r.fits(inputs)
         {
             return Err(LogicError::RecordingTooLarge {
@@ -993,6 +998,18 @@ impl Reservation {
         effects: usize,
     ) -> Option<Self> {
         let probe = Evaluator::new(chart, preset, device, &InputStart::default(), 0).ok()?;
+        Some(Self::from_probe(&probe, chart, device, effects))
+    }
+
+    /// [`of`](Self::of), with an evaluator built for the play with no
+    /// input capacity.
+    #[must_use]
+    pub fn from_probe(
+        probe: &Evaluator<'_>,
+        chart: &Chart,
+        device: &eval::DeviceProfile,
+        effects: usize,
+    ) -> Self {
         let sources = device.sources.len();
         let event = 2 * size_of::<JudgeEvent>() + size_of::<::audio::SoundCmd>();
         let input = size_of::<eval::PhysicalInputEvent>();
@@ -1005,13 +1022,14 @@ impl Reservation {
                 + budget * slot
         };
         let objects: usize = chart.lanes.iter().map(Vec::len).sum();
-        Some(Self {
-            fixed: total(0)
+        let empty = total(0);
+        Self {
+            fixed: empty
                 + effects * size_of::<JudgeEvent>()
                 + objects * TABLE_BYTES_PER_OBJECT
                 + SMALL_PARTS_BYTES,
-            per_input: total(1) - total(0),
-        })
+            per_input: total(1) - empty,
+        }
     }
 
     /// The bytes reserved for a capacity of `inputs`.
@@ -1048,14 +1066,11 @@ impl Reservation {
 /// reporting 1000 times a second each, from the countdown to the chart's
 /// final deadline plus the largest input offset, in whole seconds.
 fn window_inputs(
-    chart: &Chart,
-    preset: &RulePreset,
     device: &eval::DeviceProfile,
+    end: TimeUs,
     lead_in: TimeUs,
     sources: &[(usize, usize)],
 ) -> usize {
-    let end = Evaluator::new(chart, preset, device, &InputStart::default(), 0)
-        .map_or(TimeUs(0), |e| e.final_deadline());
     let offset = device
         .sources
         .iter()

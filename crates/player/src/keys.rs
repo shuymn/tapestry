@@ -87,6 +87,11 @@ pub fn lines(flow: &KeyConfigFlow) -> Vec<String> {
         None => l.push("DONE".to_owned()),
     }
     l.push(flow.refused().map_or_else(String::new, refusal));
+    if let Some(wrap) = flow.widened() {
+        l.push(format!(
+            "SCRATCH AXIS WENT BEYOND ITS DECLARED RANGE: {wrap} VALUES A TURN WILL BE SAVED"
+        ));
+    }
     l.push(String::new());
     for (i, r) in ROLES.iter().enumerate() {
         let value = match flow.bound().get(i) {
@@ -188,9 +193,15 @@ pub fn run(
     drop(input);
     window_thread.close();
     match end {
-        KeyConfigEnd::Done(keys) => {
+        KeyConfigEnd::Done(keys, widened) => {
             device.keyboard = keys.keyboard;
             device.controller = keys.controller;
+            if let Some(wrap) = widened {
+                device.scratch.wrap = Some(wrap);
+                println!(
+                    "keys: the scratch axis reported beyond its declared range; its revolution is set to {wrap} values"
+                );
+            }
             save_settings(&path, &device).map_err(|e| format!("{}: {e}", path.display()))?;
             println!("keys: saved to {}", path.display());
         }

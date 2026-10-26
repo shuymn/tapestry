@@ -88,13 +88,9 @@ pub const fn axis_value(raw: u32, bits: u16, signed: bool) -> i32 {
 /// whose count of values does not fit in a `u32` (a full 32-bit field) or
 /// whose range is empty: such an axis is not read.
 ///
-/// One descriptor habit is read as what it means: a signed range of
-/// exactly ±(2^(n−1) − 1) in an n-bit field (-127..=127 in 8 bits) is the
-/// field's full two's-complement range, -2^(n−1)..=2^(n−1) − 1, with
-/// 2^n values, because such controllers report -2^(n−1) too.
-///
-/// A descriptor can be wrong otherwise: a value reported outside the
-/// declared range is counted at run time ([`SourceSet::axis_value_out_of_range`]).
+/// A descriptor can be wrong: a value reported outside the declared range
+/// is counted at run time ([`SourceSet::axis_value_out_of_range`]), and key
+/// config can widen the range from what it observes ([`widened_wrap`]).
 #[must_use]
 pub fn axis_cap(
     control: ControlId,
@@ -110,17 +106,13 @@ pub fn axis_cap(
             wrap: 0,
             min: 0,
             max: 0,
+            bits,
         });
     }
     let max = if max < min && (1..32).contains(&bits) {
         i32::try_from(max.cast_unsigned() & ((1_u32 << bits) - 1)).ok()?
     } else {
         max
-    };
-    let half = (2..32).contains(&bits).then(|| (1_i64 << (bits - 1)) - 1);
-    let min = match half {
-        Some(h) if i64::from(max) == h && i64::from(min) == -h => min - 1,
-        _ => min,
     };
     let span = i64::from(max) - i64::from(min) + 1;
     let wrap = u32::try_from(span).ok().filter(|&s| s > 0)?;
@@ -130,6 +122,35 @@ pub fn axis_cap(
         wrap,
         min,
         max,
+        bits,
+    })
+}
+
+/// The revolution of an absolute axis that reported `lo..=hi` while key
+/// config captured it, when that lies outside its declared range: the
+/// smallest standard span holding both, the full two's-complement range of
+/// `k` bits (-2^(k−1)..=2^(k−1) − 1) for a signed field, 0..=2^k − 1 for an
+/// unsigned one, with 2^k values; `k` never exceeds the field's width, nor
+/// 31 bits (2^32 values do not fit in a `u32`). `None` when the observed
+/// values lie inside the declared range, when no such span holds them, or
+/// for a relative axis.
+#[must_use]
+pub fn widened_wrap(cap: &AxisCap, lo: i32, hi: i32) -> Option<u32> {
+    if cap.relative || (cap.min <= lo && hi <= cap.max) {
+        return None;
+    }
+    let (lo, hi) = (i64::from(lo.min(cap.min)), i64::from(hi.max(cap.max)));
+    let signed = cap.min < 0;
+    (1..=cap.bits.min(31)).find_map(|k| {
+        let size = 1_i64 << k;
+        let (low, high) = if signed {
+            (-size / 2, size / 2 - 1)
+        } else {
+            (0, size - 1)
+        };
+        (low <= lo && hi <= high)
+            .then(|| u32::try_from(size).ok())
+            .flatten()
     })
 }
 
@@ -165,6 +186,8 @@ pub struct AxisCap {
     /// For an absolute axis, the declared highest value; 0 for a relative
     /// one.
     pub max: i32,
+    /// The width of its report field.
+    pub bits: u16,
 }
 
 const NO_AXIS: AxisCap = AxisCap {
@@ -173,6 +196,7 @@ const NO_AXIS: AxisCap = AxisCap {
     wrap: 0,
     min: 0,
     max: 0,
+    bits: 0,
 };
 
 /// The buttons one report id carries: bit `n − 1` is button `n`.
@@ -234,6 +258,9 @@ pub struct HidDevice {
     /// Each axis's net movement since the key config last armed its
     /// capture.
     travel: [i64; MAX_AXES],
+    /// Each axis's lowest and highest value since the key config last
+    /// armed its capture.
+    seen: [Option<(i32, i32)>; MAX_AXES],
     /// The capture's arming the travel counts from.
     armed: u64,
 }
@@ -262,6 +289,7 @@ impl HidDevice {
             pressed: 0,
             values: [None; MAX_AXES],
             travel: [0; MAX_AXES],
+            seen: [None; MAX_AXES],
             armed: 0,
         }
     }
@@ -340,6 +368,7 @@ impl HidDevice {
         if armed != self.armed {
             self.armed = armed;
             self.travel = [0; MAX_AXES];
+            self.seen = [None; MAX_AXES];
         }
         for (i, value) in report.axes.iter().take(self.n_axes).enumerate() {
             let Some(value) = *value else {
@@ -350,6 +379,8 @@ impl HidDevice {
                 // A wrong descriptor: recorded as reported, and counted.
                 sources.axis_value_out_of_range(device);
             }
+            let seen = &mut self.seen[i];
+            *seen = Some(seen.map_or((value, value), |(lo, hi)| (lo.min(value), hi.max(value))));
             let moved = if cap.relative {
                 i64::from(value)
             } else {
@@ -369,7 +400,9 @@ impl HidDevice {
             if travel.abs() >= capture_travel(&cap) {
                 *travel = 0;
                 let offer = Packet { value: 1, ..p };
-                capture.offer(&offer, DeviceKind::Controller, recording);
+                // What it reported while being turned may widen its range.
+                let widened = self.seen[i].and_then(|(lo, hi)| widened_wrap(&cap, lo, hi));
+                capture.offer_axis(&offer, recording, widened);
             }
         }
     }

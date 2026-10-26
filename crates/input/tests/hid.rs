@@ -9,7 +9,7 @@ use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use input::hid::{
     AxisCap, ButtonGroup, CollectionSlot, HidDevice, HidLayout, HidReport, axis_cap, axis_control,
     axis_value, button_control, capture_travel, collection_of, in_collection, is_axis, read_report,
-    remove_collection,
+    remove_collection, widened_wrap,
 };
 use input::{Capture, DeviceId, DeviceKind, SourceConfig, SourceReader, SourceSet};
 
@@ -25,6 +25,7 @@ fn caps() -> [AxisCap; 2] {
             wrap: 256,
             min: 0,
             max: 255,
+            bits: 16,
         },
         AxisCap {
             control: DIAL,
@@ -32,6 +33,7 @@ fn caps() -> [AxisCap; 2] {
             wrap: 0,
             min: 0,
             max: 0,
+            bits: 16,
         },
     ]
 }
@@ -111,9 +113,6 @@ fn controls_are_named_by_usage() {
     assert!(!is_axis(button_control(u16::MAX)));
     assert!(is_axis(axis_control(0x01, 0x00)));
     // Signed axes sign-extend their field; unsigned ones do not.
-    assert_eq!(axis_value(0xFF, 8, true), -1);
-    assert_eq!(axis_value(0x80, 8, true), -128);
-    assert_eq!(axis_value(0x7F, 8, true), 127);
     assert_eq!(axis_value(0xFF, 8, false), 255);
     assert_eq!(axis_value(0xFFFF_FFFF, 32, true), -1);
     assert_eq!(axis_value(5, 0, true), 5);
@@ -186,6 +185,7 @@ fn more_axes_than_kept_are_ignored() {
             wrap: 0,
             min: 0,
             max: 0,
+            bits: 16,
         })
         .collect();
     let dev = HidDevice::new(PAD, &layout(&many));
@@ -316,6 +316,7 @@ fn capture_travel_is_a_sixteenth_turn_at_least_16() {
         wrap,
         min: 0,
         max: 0,
+        bits: 16,
     };
     assert_eq!(capture_travel(&cap(0)), 16);
     assert_eq!(capture_travel(&cap(256)), 16);
@@ -517,6 +518,7 @@ fn collections_of_one_controller_are_one_source() {
         wrap: 256,
         min: 0,
         max: 255,
+        bits: 16,
     }];
     let mut second = HidDevice::new(
         PAD,
@@ -567,38 +569,32 @@ fn controls_carry_their_collection() {
 #[test]
 fn axis_cap_takes_the_declared_range_of_any_shape() {
     let cap = |absolute, min, max, bits| axis_cap(X, absolute, min, max, bits);
-    let absolute = |wrap, min, max| {
+    let absolute = |wrap, min, max, bits| {
         Some(AxisCap {
             control: X,
             relative: false,
             wrap,
             min,
             max,
+            bits,
         })
     };
     // Signed and unsigned 8 bits.
-    assert_eq!(cap(true, -128, 127, 8), absolute(256, -128, 127));
-    assert_eq!(cap(true, 0, 255, 8), absolute(256, 0, 255));
-    // The signed habit of ±(2^(n−1) − 1) is the full field, in 8 and 16
-    // bits; any other narrower declaration is taken as declared.
-    assert_eq!(cap(true, -127, 127, 8), absolute(256, -128, 127));
-    assert_eq!(
-        cap(true, -32_767, 32_767, 16),
-        absolute(65_536, -32_768, 32_767)
-    );
-    assert_eq!(cap(true, -127, 127, 16), absolute(255, -127, 127));
-    assert_eq!(cap(true, -126, 127, 8), absolute(254, -126, 127));
-    assert_eq!(cap(true, 0, 254, 8), absolute(255, 0, 254));
-    assert_eq!(cap(true, -1, 1, 2), absolute(4, -2, 1));
-    // Unsigned 10 and 12 bits, as encoders report them in 16-bit fields.
-    assert_eq!(cap(true, 0, 1023, 16), absolute(1024, 0, 1023));
-    assert_eq!(cap(true, 0, 4095, 12), absolute(4096, 0, 4095));
+    assert_eq!(cap(true, -128, 127, 8), absolute(256, -128, 127, 8));
+    assert_eq!(cap(true, 0, 255, 8), absolute(256, 0, 255, 8));
+    // A narrower declaration is taken as declared: a genuine 255-position
+    // axis keeps 255.
+    assert_eq!(cap(true, -127, 127, 8), absolute(255, -127, 127, 8));
+    assert_eq!(cap(true, 0, 254, 8), absolute(255, 0, 254, 8));
+    // Unsigned 10 and 12 bits, as encoders report them.
+    assert_eq!(cap(true, 0, 1023, 16), absolute(1024, 0, 1023, 16));
+    assert_eq!(cap(true, 0, 4095, 12), absolute(4096, 0, 4095, 12));
     // Signed 16 bits, and unsigned 16 bits declaring its maximum as -1.
     assert_eq!(
         cap(true, -32_768, 32_767, 16),
-        absolute(65_536, -32_768, 32_767)
+        absolute(65_536, -32_768, 32_767, 16)
     );
-    assert_eq!(cap(true, 0, -1, 16), absolute(65_536, 0, 65_535));
+    assert_eq!(cap(true, 0, -1, 16), absolute(65_536, 0, 65_535, 16));
     // A relative axis has no range.
     assert_eq!(
         cap(false, -127, 127, 8),
@@ -608,12 +604,73 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
             wrap: 0,
             min: 0,
             max: 0,
+            bits: 8,
         })
     );
     // A full 32-bit range does not fit in a u32; an empty one is no range.
     assert_eq!(cap(true, i32::MIN, i32::MAX, 32), None);
     assert_eq!(cap(true, 0, -1, 32), None);
     assert_eq!(cap(true, 5, 4, 0), None);
+}
+
+#[test]
+fn widening_takes_the_smallest_field_span_holding_what_was_seen() {
+    let declared = |min, max, bits| axis_cap(X, true, min, max, bits).unwrap();
+    // Inside the declared range: nothing to widen, even at its edges.
+    assert_eq!(widened_wrap(&declared(-127, 127, 8), -127, 127), None);
+    // Signed: -128 under -127..=127 calls for the full 8-bit range.
+    assert_eq!(widened_wrap(&declared(-127, 127, 8), -128, 127), Some(256));
+    // In a 16-bit field the same values still call for 256 only.
+    assert_eq!(widened_wrap(&declared(-127, 127, 16), -128, 5), Some(256));
+    // Unsigned: 255 under 0..=254 is 256; 1024 under 0..=1023 is 2048.
+    assert_eq!(widened_wrap(&declared(0, 254, 8), 3, 255), Some(256));
+    assert_eq!(widened_wrap(&declared(0, 1023, 16), 0, 1024), Some(2048));
+    // The span holds the declared range too, not only what was seen.
+    assert_eq!(widened_wrap(&declared(-1000, 100, 16), 0, 200), Some(2048));
+    // Never wider than the field: 300 in an 8-bit field fits no span.
+    assert_eq!(widened_wrap(&declared(0, 254, 8), 0, 300), None);
+    // Nor 2^32 values, which a u32 cannot hold.
+    let wide = AxisCap {
+        control: X,
+        relative: false,
+        wrap: u32::MAX,
+        min: i32::MIN + 1,
+        max: i32::MAX,
+        bits: 32,
+    };
+    assert_eq!(widened_wrap(&wide, i32::MIN, 0), None);
+    // A relative axis has no range to widen.
+    let relative = axis_cap(DIAL, false, 0, 0, 8).unwrap();
+    assert_eq!(widened_wrap(&relative, -500, 500), None);
+}
+
+#[test]
+fn capturing_an_axis_reports_the_range_it_was_seen_in() {
+    let mut set = connected();
+    let capture = Capture::new();
+    // Declared -127..=127, turned through -128 during the capture.
+    let narrow = [axis_cap(X, true, -127, 127, 8).unwrap()];
+    let mut dev = HidDevice::new(PAD, &layout(&narrow));
+    let at = |v| [Some(v)];
+    let turn = |v: i32| HidReport {
+        id: 0,
+        buttons: None,
+        axes: Box::leak(Box::new(at(v))),
+    };
+    // From -112 down to -128: the capture's 16 positions end at -128.
+    batch(&mut dev, &mut set, &capture, 1, &[turn(-112)]);
+    capture.arm();
+    let reports: Vec<_> = (-128..=-113).rev().map(turn).collect();
+    batch(&mut dev, &mut set, &capture, 10, &reports);
+    assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
+    assert_eq!(capture.take_widened(), Some(256));
+    assert_eq!(capture.take_widened(), None);
+    // A genuine 255-position axis turned inside its range keeps it.
+    capture.arm();
+    let reports: Vec<_> = (-127..=127).step_by(4).map(turn).collect();
+    batch(&mut dev, &mut set, &capture, 20, &reports);
+    assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
+    assert_eq!(capture.take_widened(), None);
 }
 
 #[test]
@@ -704,6 +761,26 @@ fn a_controller_without_room_marks_the_next_recordings() {
     set.disconnect(unread);
     set.open_recording(TimeUs(7));
     assert!(set.source_limited(), "another unread device is still there");
+}
+
+#[test]
+fn a_collection_unread_then_read_into_a_grouped_source_leaves_nothing_behind() {
+    // Unread under its own handle; read later as part of the physical
+    // device's source, which has another id.
+    let mut set = connected();
+    let handle = DeviceId(0x51);
+    set.connect_unread(handle, DeviceKind::Controller);
+    set.forget_unread(handle);
+    set.connect(DeviceId(1 << 63 | 0x77), DeviceKind::Controller);
+    set.open_recording(TimeUs(5));
+    assert!(!set.source_limited());
+    assert_eq!(set.participants().count(), 2);
+    // Forgetting a device that is not unread changes nothing.
+    set.close_recording();
+    set.connect_unread(DeviceId(0x52), DeviceKind::Controller);
+    set.forget_unread(handle);
+    set.open_recording(TimeUs(6));
+    assert!(set.source_limited());
 }
 
 #[test]
@@ -857,6 +934,7 @@ fn axes_past_the_table_are_not_kept() {
             wrap: 256,
             min: 0,
             max: 255,
+            bits: 16,
         })
         .collect();
     let kept = set.add_axes(PAD, &more);

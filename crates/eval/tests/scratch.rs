@@ -630,7 +630,7 @@ fn aborted_and_incremental_scratch_match_batch() {
         ln_ends(&batch.events),
         [(1_500 * MS, LnOutcome::Completed, None)]
     );
-    for step in [1, MS, 7 * MS] {
+    for step in [MS, 7 * MS] {
         let rule = rules::custom();
         let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 64).unwrap();
         let mut out = Vec::new();

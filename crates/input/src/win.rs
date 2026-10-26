@@ -434,6 +434,7 @@ impl Controllers {
             wrap: 0,
             min: 0,
             max: 0,
+            bits: 0,
         }; MAX_AXES];
         let mut groups = [ButtonGroup {
             report_id: 0,
@@ -443,6 +444,8 @@ impl Controllers {
         let (n_axes, axis_ids) = read_axes(data, collection, &mut slot.reads, &mut caps);
         let (n_groups, button_ids) = read_buttons(data, &mut groups);
         let device = container.map_or(device_id(handle), container_device);
+        // A collection unread before is read now, under its source's id.
+        sources.forget_unread(device_id(handle));
         sources.connect(device, DeviceKind::Controller);
         // Only axes the source keeps are read: one beyond the device's
         // table is never captured or recorded.
@@ -649,14 +652,11 @@ fn read_axes(
                 (v.Anonymous.NotRange.Usage, v.Anonymous.NotRange.Usage)
             }
         };
-        for usage in min..=max {
+        let axes = min.max(*AXIS_USAGES.start())..=max.min(*AXIS_USAGES.end());
+        for usage in axes {
             let control = in_collection(axis_control(v.UsagePage, usage), collection);
             let cap = axis_cap(control, v.IsAbsolute, v.LogicalMin, v.LogicalMax, v.BitSize);
-            if n == MAX_AXES
-                || !AXIS_USAGES.contains(&usage)
-                || caps[..n].iter().any(|c| c.control == control)
-                || cap.is_none()
-            {
+            if n == MAX_AXES || caps[..n].iter().any(|c| c.control == control) || cap.is_none() {
                 continue;
             }
             reads[n] = AxisRead {
@@ -819,24 +819,7 @@ impl RawInput {
     ///
     /// [`InputError::Os`] if the device list cannot be read.
     fn connect_present(&mut self, sources: &mut SourceSet) -> Result<(), InputError> {
-        let entry = size_of::<RAWINPUTDEVICELIST>() as u32;
-        let failed =
-            || InputError::os("GetRawInputDeviceList", windows::core::Error::from_thread());
-        let mut count = 0;
-        // SAFETY: a null list asks for the count only.
-        let asked = unsafe { GetRawInputDeviceList(None, &mut count, entry) };
-        if asked == u32::MAX {
-            return Err(failed());
-        }
-        // Room for devices that arrive between the two calls.
-        count += 8;
-        let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize];
-        // SAFETY: `list` holds `count` entries.
-        let got = unsafe { GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, entry) };
-        if got == u32::MAX {
-            return Err(failed());
-        }
-        for d in list.iter().take(got as usize) {
+        for d in device_list()? {
             self.connect(d.hDevice, sources);
         }
         Ok(())
@@ -1010,20 +993,7 @@ pub struct CollectionInfo {
 ///
 /// [`InputError::Os`] if the device list cannot be read.
 pub fn controller_layouts() -> Result<Vec<CollectionInfo>, InputError> {
-    let entry = size_of::<RAWINPUTDEVICELIST>() as u32;
-    let failed = || InputError::os("GetRawInputDeviceList", windows::core::Error::from_thread());
-    let mut count = 0;
-    // SAFETY: a null list asks for the count only.
-    if unsafe { GetRawInputDeviceList(None, &mut count, entry) } == u32::MAX {
-        return Err(failed());
-    }
-    let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize + 8];
-    let mut count = list.len() as u32;
-    // SAFETY: `list` holds `count` entries.
-    let got = unsafe { GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, entry) };
-    if got == u32::MAX {
-        return Err(failed());
-    }
+    let list = device_list()?;
     let mut controllers = Controllers::new();
     let mut sources = SourceSet::new(crate::SourceConfig {
         max_devices: MAX_CONTROLLERS,
@@ -1033,7 +1003,7 @@ pub fn controller_layouts() -> Result<Vec<CollectionInfo>, InputError> {
         max_arrivals: 1,
     })
     .expect("the controllers are within the limit");
-    for d in list.iter().take(got as usize) {
+    for d in &list {
         if device_kind(d.hDevice) == Some(DeviceKind::Controller) {
             controllers.connect(d.hDevice, &mut sources);
         }
@@ -1064,6 +1034,16 @@ pub fn controller_layouts() -> Result<Vec<CollectionInfo>, InputError> {
 ///
 /// [`InputError::Os`] if the device list cannot be read.
 pub fn hid_usages() -> Result<Vec<(u16, u16, bool)>, InputError> {
+    Ok(device_list()?
+        .iter()
+        .filter(|d| d.dwType == RIM_TYPEHID)
+        .filter_map(|d| hid_usage(d.hDevice))
+        .map(|(page, usage)| (page, usage, is_controller(page, usage)))
+        .collect())
+}
+
+/// The devices present, in the order the OS lists them. It allocates.
+fn device_list() -> Result<Vec<RAWINPUTDEVICELIST>, InputError> {
     let entry = size_of::<RAWINPUTDEVICELIST>() as u32;
     let failed = || InputError::os("GetRawInputDeviceList", windows::core::Error::from_thread());
     let mut count = 0;
@@ -1071,6 +1051,7 @@ pub fn hid_usages() -> Result<Vec<(u16, u16, bool)>, InputError> {
     if unsafe { GetRawInputDeviceList(None, &mut count, entry) } == u32::MAX {
         return Err(failed());
     }
+    // Room for devices that arrive between the two calls.
     let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize + 8];
     let mut count = list.len() as u32;
     // SAFETY: `list` holds `count` entries.
@@ -1078,37 +1059,8 @@ pub fn hid_usages() -> Result<Vec<(u16, u16, bool)>, InputError> {
     if got == u32::MAX {
         return Err(failed());
     }
-    let mut out = Vec::new();
-    for d in list.iter().take(got as usize) {
-        if d.dwType != RIM_TYPEHID {
-            continue;
-        }
-        let mut info = RID_DEVICE_INFO {
-            cbSize: size_of::<RID_DEVICE_INFO>() as u32,
-            ..Default::default()
-        };
-        let mut size = info.cbSize;
-        // SAFETY: `info` holds `size` bytes.
-        let read = unsafe {
-            GetRawInputDeviceInfoW(
-                Some(d.hDevice),
-                RIDI_DEVICEINFO,
-                Some((&raw mut info).cast::<c_void>()),
-                &mut size,
-            )
-        };
-        if read == u32::MAX || info.dwType != RIM_TYPEHID {
-            continue;
-        }
-        // SAFETY: the system filled the HID variant.
-        let hid = unsafe { info.Anonymous.hid };
-        out.push((
-            hid.usUsagePage,
-            hid.usUsage,
-            is_controller(hid.usUsagePage, hid.usUsage),
-        ));
-    }
-    Ok(out)
+    list.truncate(got as usize);
+    Ok(list)
 }
 
 impl RawInput {

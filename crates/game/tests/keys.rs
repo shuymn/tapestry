@@ -16,10 +16,13 @@ use input::{Capture, DeviceId, DeviceKind, Packet};
 #[derive(Clone, Copy)]
 enum Step {
     Offer(DeviceKind, u32, bool, bool),
+    /// A controller axis turned far enough to be captured, with the
+    /// revolution its reports during the capture call for.
+    Turn(Option<u32>),
     Close,
 }
 
-use Step::{Close, Offer};
+use Step::{Close, Offer, Turn};
 
 const KB: DeviceKind = DeviceKind::Keyboard;
 const PAD: DeviceKind = DeviceKind::Controller;
@@ -68,6 +71,15 @@ impl KeyScreen for Scripted {
                     background: false,
                 };
                 self.capture.offer(&packet, kind, recording);
+            }
+            Some(Turn(widened)) => {
+                let packet = Packet {
+                    device: DeviceId(3),
+                    control: ControlId(0x1_0030),
+                    value: 1,
+                    background: false,
+                };
+                self.capture.offer_axis(&packet, false, widened);
             }
             Some(Close) => self.closed = true,
             // A script that runs out never ends the screen: fail instead.
@@ -141,25 +153,28 @@ fn key_config_capture_binds_next_press() {
     let lane = |control, lane| LaneKey { control, lane };
     assert_eq!(
         end,
-        KeyConfigEnd::Done(KeyConfigs {
-            keyboard: KeyConfig {
-                lanes: vec![
-                    lane(0x1e, 1),
-                    lane(0x1f, 2),
-                    lane(0x20, 3),
-                    lane(0x21, 4),
-                    lane(0x22, 5),
-                    lane(0x23, 6),
-                ],
-                retry: Some(0x1c),
-                quit: Some(0x39),
+        KeyConfigEnd::Done(
+            KeyConfigs {
+                keyboard: KeyConfig {
+                    lanes: vec![
+                        lane(0x1e, 1),
+                        lane(0x1f, 2),
+                        lane(0x20, 3),
+                        lane(0x21, 4),
+                        lane(0x22, 5),
+                        lane(0x23, 6),
+                    ],
+                    retry: Some(0x1c),
+                    quit: Some(0x39),
+                },
+                controller: KeyConfig {
+                    lanes: vec![lane(30, 0), lane(31, 7)],
+                    retry: None,
+                    quit: None,
+                },
             },
-            controller: KeyConfig {
-                lanes: vec![lane(30, 0), lane(31, 7)],
-                retry: None,
-                quit: None,
-            },
-        })
+            None
+        )
     );
     // What the screen showed after each wait: the prompt and the refusal.
     let overlap = |control, first, second| {
@@ -297,4 +312,37 @@ fn keep_keeps_the_current_bindings() {
     };
     assert_eq!((keys.controller.retry, keys.controller.quit), (None, None));
     assert_eq!(keys.keyboard.quit, Some(0x01));
+}
+
+/// F12 for every role after the scratch: keep the current bindings.
+fn keep_the_rest() -> Vec<Step> {
+    vec![key(0x58); 9]
+}
+
+#[test]
+fn a_scratch_axis_seen_beyond_its_range_widens_its_revolution() {
+    // Captured for the scratch while reporting beyond its declared range:
+    // the key config ends with the widened revolution to save.
+    let mut steps = vec![Turn(Some(256))];
+    steps.extend(keep_the_rest());
+    let (end, _) = run(&steps);
+    let KeyConfigEnd::Done(keys, widened) = end else {
+        panic!("{end:?}");
+    };
+    assert_eq!(keys.controller.lanes[0].control, 0x1_0030);
+    assert_eq!(widened, Some(256));
+    // Inside its range, or a button at the scratch prompt: nothing.
+    let mut steps = vec![Turn(None)];
+    steps.extend(keep_the_rest());
+    assert!(matches!(run(&steps).0, KeyConfigEnd::Done(_, None)));
+    // An axis captured for another lane widens nothing: only the scratch
+    // prompt decides.
+    let mut steps = vec![button(30), Turn(Some(256))];
+    steps.extend(vec![key(0x58); 8]);
+    let (end, _) = run(&steps);
+    let KeyConfigEnd::Done(keys, widened) = end else {
+        panic!("{end:?}");
+    };
+    assert_eq!(keys.controller.lanes[1].control, 0x1_0030);
+    assert_eq!(widened, None);
 }
