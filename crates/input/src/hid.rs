@@ -158,29 +158,44 @@ pub fn widened_wrap(cap: &AxisCap, lo: i32, hi: i32) -> Option<u32> {
 /// in its interface path (`&Col02` is 2), or 0 when the path has none.
 #[must_use]
 pub fn collection_of(path: &[u16]) -> u8 {
+    hex_after(path, b"&col").unwrap_or(0)
+}
+
+/// The interface number of a composite device's function in its interface
+/// path (`&MI_01` is 1), or `None` when the path has none.
+#[must_use]
+pub fn interface_of(path: &[u16]) -> Option<u8> {
+    hex_after(path, b"&mi_")
+}
+
+/// The two hex digits after the first `marker` (lowercase ASCII) in
+/// `path`, matched without case.
+fn hex_after(path: &[u16], marker: &[u8]) -> Option<u8> {
     let lower = |c: u16| u8::try_from(c).map_or(0, |b| b.to_ascii_lowercase());
-    let marker = b"&col";
     path.windows(marker.len() + 2)
         .find(|w| w.iter().zip(marker).all(|(&c, &m)| lower(c) == m))
         .and_then(|w| {
             let hex = |c: u16| char::from(lower(c)).to_digit(16);
-            Some(hex(w[4])? * 16 + hex(w[5])?)
+            Some(hex(w[marker.len()])? * 16 + hex(w[marker.len() + 1])?)
         })
         .and_then(|n| u8::try_from(n).ok())
-        .unwrap_or(0)
 }
 
-/// Which model a controller is: the vendor and product ids its HID
-/// collections declare. It is the same in every USB port and after
-/// replugging, and it names no single unit, so two controllers of one
-/// model share it. Key config binds a controller's controls to it; it
-/// never enters the input log.
+/// Which function of which model a controller collection is: the vendor
+/// and product ids its device declares, and the interface number of the
+/// function it belongs to on a composite device. It is the same in every
+/// USB port and after replugging, and it names no single unit, so two
+/// controllers of one model share it. Key config binds a controller's
+/// controls to it; it never enters the input log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HidProduct {
     /// The vendor id.
     pub vendor_id: u16,
     /// The product id.
     pub product_id: u16,
+    /// The interface number ([`interface_of`]); `None` for a device that
+    /// is not composite.
+    pub interface: Option<u8>,
 }
 
 /// What a collection's axis is.
@@ -273,6 +288,8 @@ pub struct HidDevice {
     travel: [i64; MAX_AXES],
     /// The capture's arming the travel counts from.
     armed: u64,
+    /// The collection's product, offered with its captures.
+    product: Option<HidProduct>,
 }
 
 impl HidDevice {
@@ -300,7 +317,15 @@ impl HidDevice {
             values: [None; MAX_AXES],
             travel: [0; MAX_AXES],
             armed: 0,
+            product: None,
         }
+    }
+
+    /// Sets the collection's product, which key config captures it with.
+    #[must_use]
+    pub const fn with_product(mut self, product: Option<HidProduct>) -> Self {
+        self.product = product;
+        self
     }
 
     /// The device, shared by the controller's collections.
@@ -348,7 +373,7 @@ impl HidDevice {
             sources.background();
         }
         let recording = sources.is_recording();
-        let product = sources.product(self.device);
+        let product = self.product;
         let (device, collection) = (self.device, self.collection);
         let packet = |control, value| Packet {
             device,

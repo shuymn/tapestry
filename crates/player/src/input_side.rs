@@ -233,7 +233,11 @@ impl Hook {
                     );
                 }
                 reset_gate(sources, &self.controls);
-                sources.open_play(now, origin)
+                let start = sources.open_play(now, origin);
+                if let Some(note) = left_out_note(sources) {
+                    eprintln!("{note}");
+                }
+                start
             }
             #[cfg(feature = "dev-tools")]
             Mode::Script(script) => {
@@ -302,8 +306,9 @@ fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
             DeviceKind::Keyboard => (&recorded.keyboard, true),
             DeviceKind::Controller => {
                 let mine = !matched
-                    && recorded.controller_device.is_some()
-                    && sources.product(d) == recorded.controller_device;
+                    && recorded
+                        .controller_device
+                        .is_some_and(|p| sources.has_product(d, p));
                 matched |= mine;
                 (&recorded.controller, mine)
             }
@@ -312,6 +317,18 @@ fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
         sources.set_takes_part(d, takes_part);
     }
     matched || recorded.controller_device.is_none()
+}
+
+/// What the console says before a play that left devices out at the
+/// source limit: keyboards, when any is (controllers come first), and
+/// possibly one whose keys play lanes.
+fn left_out_note(sources: &SourceSet) -> Option<String> {
+    let n = sources.left_out();
+    (n > 0).then(|| {
+        format!(
+            "input: {n} connected device(s) take no part in this play: more devices than sources; a keyboard left out records nothing, and the log is marked incomplete"
+        )
+    })
 }
 
 /// Opens the gate for a new play; a window without focus latches it again
@@ -330,46 +347,59 @@ mod tests {
     use input::hid::HidProduct;
     use input::{DeviceId, DeviceKind, Packet, SourceConfig, SourceSet};
 
-    use super::{Recorded, take_part};
+    use super::{Recorded, left_out_note, take_part};
 
-    const TURNTABLE: HidProduct = HidProduct {
+    /// The configured controller: function 1 of a composite device.
+    const CONFIGURED: HidProduct = HidProduct {
         vendor_id: 0x1A2B,
         product_id: 0x3C4D,
+        interface: Some(1),
     };
+    /// Function 0 of the same device: the same ids and, here, the same
+    /// control numbers, another interface.
+    const OTHER_FUNCTION: HidProduct = HidProduct {
+        interface: Some(0),
+        ..CONFIGURED
+    };
+    /// Another model.
     const GAMEPAD: HidProduct = HidProduct {
         vendor_id: 0x5E6F,
         product_id: 0x7081,
+        interface: None,
     };
     /// Button 1 plays key 1 on the controller; retry and quit are keys.
     const BUTTON: ControlId = ControlId(1);
-    const RETRY: ControlId = ControlId(0x0e);
 
     fn recorded(device: Option<HidProduct>) -> Recorded {
         Recorded {
-            keyboard: vec![RETRY, ControlId(0x01)],
+            keyboard: vec![ControlId(0x0e), ControlId(0x01)],
             controller: vec![BUTTON],
             controller_device: device,
         }
     }
 
-    /// Keyboards 1 and 2, then a gamepad (10), the turntable (11) and a
-    /// second turntable of the same model (12), each with its product.
-    fn devices() -> SourceSet {
-        let mut set = SourceSet::new(SourceConfig {
+    fn set_of(max_sources: usize) -> SourceSet {
+        SourceSet::new(SourceConfig {
             max_devices: 8,
-            max_sources: 8,
+            max_sources,
             max_held: 8,
             queue_capacity: 64,
             max_arrivals: 2,
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Keyboards 1 and 2, then `controllers` in order, each with its
+    /// product.
+    fn devices(controllers: &[(u64, HidProduct)]) -> SourceSet {
+        let mut set = set_of(8);
         set.begin_batch(TimeUs(0));
         for d in [1, 2] {
             set.connect(DeviceId(d), DeviceKind::Keyboard);
         }
-        for (d, product) in [(10, GAMEPAD), (11, TURNTABLE), (12, TURNTABLE)] {
+        for &(d, product) in controllers {
             set.connect(DeviceId(d), DeviceKind::Controller);
-            set.set_product(DeviceId(d), product);
+            set.add_product(DeviceId(d), product);
         }
         set.end_batch(TimeUs(0));
         set
@@ -384,43 +414,91 @@ mod tests {
         }
     }
 
-    /// Only the first controller of the configured model plays: a gamepad
-    /// and a second controller of that model, with the same control ids,
-    /// take no part and record nothing.
-    #[test]
-    fn only_the_configured_controller_takes_part() {
-        let mut set = devices();
-        assert!(take_part(&mut set, &recorded(Some(TURNTABLE))));
+    /// Opens a play and presses button 1 on every device of `pressed`:
+    /// the sources' devices, and those whose press was recorded.
+    fn play(set: &mut SourceSet, pressed: &[u64]) -> (Vec<u64>, Vec<u64>) {
         set.open_recording(TimeUs(10));
         let mut readers = set.take_readers();
-        let sources: Vec<_> = set.participants().map(|(d, _)| d.0).collect();
-        assert_eq!(sources, [11, 1, 2]);
-        assert!(!set.source_limited());
+        let sources: Vec<u64> = set.participants().map(|(d, _)| d.0).collect();
         set.begin_batch(TimeUs(20));
-        for d in [10, 11, 12] {
+        for &d in pressed {
             set.packet(&press(d));
         }
         set.end_batch(TimeUs(21));
-        let events: Vec<_> = std::iter::from_fn(|| readers[0].pop()).collect();
-        assert_eq!(events.len(), 1);
-        assert!(readers[1..].iter_mut().all(|r| r.pop().is_none()));
+        let recorded = readers
+            .iter_mut()
+            .zip(&sources)
+            .filter_map(|(r, &d)| r.pop().map(|_| d))
+            .collect();
+        (sources, recorded)
     }
 
-    /// With the configured model not connected, or no controller
+    /// Only the first controller of the configured model and function
+    /// plays: a gamepad, the device's other function with the same ids and
+    /// control numbers, and a second unit of the model take no part and
+    /// record nothing, whichever order they are found in.
+    #[test]
+    fn only_the_configured_controller_takes_part() {
+        let found: [&[(u64, HidProduct)]; 2] = [
+            &[
+                (10, GAMEPAD),
+                (11, OTHER_FUNCTION),
+                (12, CONFIGURED),
+                (13, CONFIGURED),
+            ],
+            &[
+                (13, CONFIGURED),
+                (12, CONFIGURED),
+                (11, OTHER_FUNCTION),
+                (10, GAMEPAD),
+            ],
+        ];
+        for (controllers, first) in found.into_iter().zip([12, 13]) {
+            let mut set = devices(controllers);
+            assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
+            let (sources, pressed) = play(&mut set, &[10, 11, 12, 13]);
+            assert_eq!(sources, [first, 1, 2]);
+            assert_eq!(pressed, [first]);
+            assert!(!set.source_limited());
+        }
+    }
+
+    /// With the configured controller not connected, or no controller
     /// configured, only keyboards take part; only the first case is
     /// reported as missing.
     #[test]
     fn without_the_configured_controller_only_keyboards_take_part() {
-        let other = HidProduct {
-            vendor_id: 0x0A0B,
-            product_id: 0x0C0D,
-        };
-        for (device, found) in [(Some(other), false), (None, true)] {
-            let mut set = devices();
+        let controllers = [(10, GAMEPAD), (11, OTHER_FUNCTION)];
+        for (device, found) in [(Some(CONFIGURED), false), (None, true)] {
+            let mut set = devices(&controllers);
             assert_eq!(take_part(&mut set, &recorded(device)), found);
-            set.open_recording(TimeUs(10));
-            let sources: Vec<_> = set.participants().map(|(d, _)| d.0).collect();
+            let (sources, pressed) = play(&mut set, &[10, 11]);
             assert_eq!(sources, [1, 2]);
+            assert!(pressed.is_empty());
         }
+    }
+
+    /// The console says how many devices the source limit left out before
+    /// the play, and nothing when none was.
+    #[test]
+    fn devices_left_out_at_the_limit_are_reported() {
+        let mut set = set_of(2);
+        set.begin_batch(TimeUs(0));
+        for d in [1, 2, 3] {
+            set.connect(DeviceId(d), DeviceKind::Keyboard);
+        }
+        set.connect(DeviceId(10), DeviceKind::Controller);
+        set.add_product(DeviceId(10), CONFIGURED);
+        assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
+        set.open_recording(TimeUs(1));
+        let note = left_out_note(&set).unwrap();
+        assert!(
+            note.starts_with("input: 2 connected device(s) take no part"),
+            "{note}"
+        );
+        let mut set = devices(&[(10, CONFIGURED)]);
+        assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
+        set.open_recording(TimeUs(1));
+        assert_eq!(left_out_note(&set), None);
     }
 }

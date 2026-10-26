@@ -51,7 +51,7 @@ use crate::gate::DeviceId;
 use crate::hid::{
     AXIS_USAGES, AxisCap, ButtonGroup, CollectionSlot, DESKTOP_PAGE, HidDevice, HidLayout,
     HidProduct, HidReport, MAX_AXES, MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_cap, axis_control,
-    axis_value, collection_of, in_collection, read_report, remove_collection,
+    axis_value, collection_of, in_collection, interface_of, read_report, remove_collection,
 };
 use crate::raw;
 use crate::sources::{DeviceKind, SourceSet};
@@ -406,6 +406,7 @@ impl Controllers {
             return;
         }
         let collection = read_path(handle, &mut self.path).map(collection_of);
+        let interface = collection.and_then(|_| interface_of(&self.path));
         let container = collection
             .and_then(|_| container_of(&self.path, &mut self.instance))
             .filter(|&c| c != NO_CONTAINER)
@@ -454,8 +455,9 @@ impl Controllers {
         // A collection unread before is read now, under its source's id.
         sources.forget_unread(device_id(handle));
         sources.connect(device, DeviceKind::Controller);
-        if let Some(product) = hid_product(handle) {
-            sources.set_product(device, product);
+        let product = hid_product(handle, interface);
+        if let Some(product) = product {
+            sources.add_product(device, product);
         }
         // Only axes the source keeps are read: one beyond the device's
         // table is never captured or recorded.
@@ -480,7 +482,8 @@ impl Controllers {
                 axes: &caps[..n],
                 buttons: &groups[..n_groups],
             },
-        );
+        )
+        .with_product(product);
     }
 
     /// Forgets the collection `handle` and disconnects its source
@@ -910,12 +913,14 @@ fn hid_usage(handle: HANDLE) -> Option<(u16, u16)> {
     hid_info(handle).map(|hid| (hid.usUsagePage, hid.usUsage))
 }
 
-/// The vendor and product ids a HID device declares.
-fn hid_product(handle: HANDLE) -> Option<HidProduct> {
+/// The vendor and product ids a HID device declares, for its function
+/// `interface`.
+fn hid_product(handle: HANDLE, interface: Option<u8>) -> Option<HidProduct> {
     let hid = hid_info(handle)?;
     Some(HidProduct {
         vendor_id: u16::try_from(hid.dwVendorId).ok()?,
         product_id: u16::try_from(hid.dwProductId).ok()?,
+        interface,
     })
 }
 

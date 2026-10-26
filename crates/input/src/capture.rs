@@ -16,15 +16,36 @@ const PRESENT: u64 = 1 << 33;
 /// Set in a stored capture: the control is a controller's.
 const CONTROLLER: u64 = 1 << 32;
 
+/// Set in a stored product: a product is stored.
+const PRODUCT: u64 = 1 << 48;
+/// Set in a stored product: it has an interface number.
+const INTERFACE: u64 = 1 << 49;
+
+/// A product in one word: the product id in bits 0-15, the vendor id in
+/// bits 16-31, the interface number in bits 32-39 with [`INTERFACE`], and
+/// [`PRODUCT`].
+fn pack_product(p: HidProduct) -> u64 {
+    let interface = p.interface.map_or(0, |i| (u64::from(i) << 32) | INTERFACE);
+    u64::from(p.product_id) | (u64::from(p.vendor_id) << 16) | interface | PRODUCT
+}
+
+/// The product [`pack_product`] stored; `None` for 0.
+fn unpack_product(stored: u64) -> Option<HidProduct> {
+    (stored & PRODUCT != 0).then_some(HidProduct {
+        vendor_id: (stored >> 16) as u16,
+        product_id: stored as u16,
+        interface: (stored & INTERFACE != 0).then_some((stored >> 32) as u8),
+    })
+}
+
 #[derive(Debug, Default)]
 struct Slot {
     armed: AtomicBool,
     /// The captured control in the low 32 bits, with [`PRESENT`] and, for
     /// a controller, [`CONTROLLER`]; 0 while nothing is captured.
     control: AtomicU64,
-    /// The captured controller press's product (vendor id in bits 16-31,
-    /// product id in the low 16 bits) with [`PRESENT`]; 0 for a keyboard
-    /// key or a controller whose product is unknown.
+    /// The captured controller press's product ([`pack_product`]); 0 for
+    /// a keyboard key or a controller whose product is unknown.
     product: AtomicU64,
     /// How many times the slot was armed.
     armings: AtomicU64,
@@ -112,11 +133,7 @@ impl Capture {
     /// product is unknown. It stays until the next capture.
     #[must_use]
     pub fn product(&self) -> Option<HidProduct> {
-        let stored = self.0.product.load(Ordering::Acquire);
-        (stored & PRESENT != 0).then_some(HidProduct {
-            vendor_id: (stored >> 16) as u16,
-            product_id: stored as u16,
-        })
+        unpack_product(self.0.product.load(Ordering::Acquire))
     }
 
     /// Watches the absolute axis `control`: the input thread notes the
@@ -237,10 +254,9 @@ impl Capture {
                 DeviceKind::Keyboard => 0,
                 DeviceKind::Controller => CONTROLLER,
             };
-            let product = product.map_or(0, |p| {
-                (u64::from(p.vendor_id) << 16) | u64::from(p.product_id) | PRESENT
-            });
-            self.0.product.store(product, Ordering::Relaxed);
+            self.0
+                .product
+                .store(product.map_or(0, pack_product), Ordering::Relaxed);
             let stored = u64::from(packet.control.0) | kind | PRESENT;
             self.0.control.store(stored, Ordering::Release);
         }
@@ -332,10 +348,16 @@ mod tests {
     #[test]
     fn capture_keeps_the_controller_product() {
         let capture = Capture::new();
-        for (vendor_id, product_id) in [(0x1A2B, 0x3C4D), (0xFFFF, 0), (0, 0xFFFF)] {
+        for (vendor_id, product_id, interface) in [
+            (0x1A2B, 0x3C4D, Some(0x5E)),
+            (0xFFFF, 0, None),
+            (0, 0xFFFF, Some(0xFF)),
+            (0x6F70, 0x8192, Some(0)),
+        ] {
             let product = HidProduct {
                 vendor_id,
                 product_id,
+                interface,
             };
             capture.arm();
             capture.offer_controller(&press(3), Some(product), false);

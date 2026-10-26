@@ -64,8 +64,8 @@ pub struct KeyConfigs {
     pub keyboard: KeyConfig,
     /// The controller's.
     pub controller: KeyConfig,
-    /// The controller `controller` belongs to, when it binds a lane and
-    /// the controller's product is known.
+    /// The controller `controller` belongs to; known whenever it binds a
+    /// lane in a key config the flow finished.
     pub controller_device: Option<HidProduct>,
 }
 
@@ -101,6 +101,10 @@ pub enum Refusal {
     /// A control of a controller other than the one already bound: the
     /// controller key config belongs to one controller.
     OtherController,
+    /// A control of a controller whose model is unknown, or current
+    /// controller bindings that name no controller: `device.toml` could not
+    /// say which controller plays them.
+    UnknownController,
 }
 
 /// What a press did.
@@ -279,10 +283,13 @@ impl KeyConfigFlow {
     }
 
     /// Takes a pressed control for the role prompted for; a controller's
-    /// comes from a controller of `product` (`None`: unknown). Once a
-    /// controller's control is bound, a control of a controller of
-    /// another product is refused, and so is keeping the current
-    /// controller bindings when they belong to another controller.
+    /// comes from a controller of `product` (`None`: unknown). A
+    /// controller's control of unknown product is refused, and so is
+    /// keeping current controller bindings that name no controller, so a
+    /// finished key config always names the controller it binds. Once a
+    /// controller's control is bound, a control of a controller of another
+    /// product is refused, and so is keeping the current controller
+    /// bindings when they belong to another controller.
     pub fn press_from(&mut self, pressed: Bound, product: Option<HidProduct>) -> Press {
         let Some(role) = self.role() else {
             return Press::Done(Self::configs(&self.bound, self.device));
@@ -305,6 +312,9 @@ impl KeyConfigFlow {
             (vec![pressed], product)
         };
         let controller = chosen.iter().any(|b| b.kind == DeviceKind::Controller);
+        if controller && from.is_none() {
+            return self.refuse(Refusal::UnknownController);
+        }
         if controller && self.device.is_some_and(|d| d != from) {
             return self.refuse(Refusal::OtherController);
         }

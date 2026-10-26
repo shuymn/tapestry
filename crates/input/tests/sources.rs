@@ -480,6 +480,38 @@ fn scripted_log_first_event_at_opened_at_is_recorded() {
     assert_eq!(stream, log);
 }
 
+/// A replayed controller declares the axes its record binds, so its axis
+/// events are recorded again; without them they would not be.
+#[test]
+fn scripted_controller_declares_its_recorded_axes() {
+    let x = ControlId(0x1_0030);
+    let profile = SourceProfile {
+        axes: vec![eval::AxisBinding {
+            control: x,
+            lane: Lane::new(0).unwrap(),
+            scratch: eval::ScratchSettings::DEFAULT,
+        }],
+        ..SourceProfile::default()
+    };
+    let declared = input::declared_axes(&profile);
+    assert_eq!(declared.len(), 1);
+    assert_eq!(declared[0].control, x);
+    let log = [ev(1_000, 0, x, 40), ev(1_100, 0, A, 1)];
+    let run = |script: ScriptedInput| {
+        let mut script = script;
+        let mut set = SourceSet::new(config()).unwrap();
+        script.poll(TimeUs(999), &mut set);
+        set.open_recording(TimeUs(999));
+        let mut readers = set.take_readers();
+        script.poll(TimeUs(1_200), &mut set);
+        drain(&mut readers[0])
+    };
+    let kinds = [DeviceKind::Controller];
+    let script = ScriptedInput::from_log(&InputStart::default(), &log, &kinds);
+    assert_eq!(run(script.clone()), [log[1]]);
+    assert_eq!(run(script.with_axes(DeviceId(0), &declared)), log);
+}
+
 #[test]
 fn autoplay_presses_every_note_and_releases_before_the_next() {
     let lane = |i| Lane::new(i).unwrap();
@@ -677,22 +709,101 @@ fn controllers_take_part_before_keyboards_at_the_limit() {
 }
 
 #[test]
-fn a_controller_keeps_its_product_until_it_is_removed() {
-    let product = input::hid::HidProduct {
+fn a_controller_keeps_its_products_until_it_is_removed() {
+    let product = |interface| input::hid::HidProduct {
         vendor_id: 0x1234,
         product_id: 0x5678,
+        interface,
     };
     let mut set = SourceSet::new(config()).unwrap();
     set.begin_batch(TimeUs(0));
-    assert!(!set.set_product(DeviceId(7), product));
+    assert!(!set.add_product(DeviceId(7), product(Some(1))));
     set.connect(DeviceId(7), DeviceKind::Controller);
-    assert_eq!(set.product(DeviceId(7)), None);
-    assert!(set.set_product(DeviceId(7), product));
-    assert_eq!(set.product(DeviceId(7)), Some(product));
+    assert!(!set.has_product(DeviceId(7), product(Some(1))));
+    // Two functions of one controller: both are its products, a third
+    // interface or none is not.
+    assert!(set.add_product(DeviceId(7), product(Some(1))));
+    assert!(set.add_product(DeviceId(7), product(Some(2))));
+    assert!(set.add_product(DeviceId(7), product(Some(2))));
+    assert!(set.has_product(DeviceId(7), product(Some(1))));
+    assert!(set.has_product(DeviceId(7), product(Some(2))));
+    assert!(!set.has_product(DeviceId(7), product(Some(3))));
+    assert!(!set.has_product(DeviceId(7), product(None)));
+    // At most MAX_PRODUCTS: the two above and six more, then no room.
+    for i in 3..=8 {
+        assert!(set.add_product(DeviceId(7), product(Some(i))));
+    }
+    assert_eq!(input::MAX_PRODUCTS, 8);
+    assert!(!set.add_product(DeviceId(7), product(Some(9))));
+    assert!(!set.has_product(DeviceId(7), product(Some(9))));
     set.disconnect(DeviceId(7));
-    assert_eq!(set.product(DeviceId(7)), None);
     set.connect(DeviceId(7), DeviceKind::Controller);
-    assert_eq!(set.product(DeviceId(7)), None);
+    assert!(!set.has_product(DeviceId(7), product(Some(1))));
+}
+
+#[test]
+fn devices_left_out_by_the_source_limit_are_counted() {
+    // Two controllers that take part, one that does not, and three
+    // keyboards; three sources: both controllers and the first keyboard
+    // take part, two keyboards are left out.
+    let mut set = SourceSet::new(SourceConfig {
+        max_sources: 3,
+        ..config()
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    for d in [4, 5, 6] {
+        plug(&mut set, DeviceId(d), DeviceKind::Keyboard);
+    }
+    for d in [7, 8, 9] {
+        plug(&mut set, DeviceId(d), DeviceKind::Controller);
+    }
+    set.set_takes_part(DeviceId(9), false);
+    assert_eq!(set.left_out(), 0, "nothing is open yet");
+    set.open_recording(TimeUs(1));
+    assert_eq!(set.left_out(), 2);
+    assert!(set.source_limited());
+    let devices: Vec<_> = set.participants().map(|(d, _)| d.0).collect();
+    assert_eq!(devices, [7, 8, 4]);
+    set.close_recording();
+    assert_eq!(set.left_out(), 0);
+}
+
+/// An axis is recorded in a play only if its device declared it when
+/// recording opened: an axis a collection connected later adds to the
+/// source, and an axis never declared, are not recorded, while a declared
+/// one and the buttons are.
+#[test]
+fn only_axes_declared_at_the_opening_are_recorded() {
+    let x = ControlId(0x1_0030);
+    let y = ControlId(0x1_0031);
+    let z = ControlId(0x1_0032);
+    let button = ControlId(3);
+    let cap = |control| input::hid::axis_cap(control, true, 0, 255, 8).unwrap();
+    let mut set = SourceSet::new(config()).unwrap();
+    set.begin_batch(TimeUs(0));
+    set.connect(DeviceId(7), DeviceKind::Controller);
+    set.set_recorded(DeviceId(7), vec![button, x, y, z]);
+    set.add_axes(DeviceId(7), &[cap(x)]);
+    set.end_batch(TimeUs(0));
+    set.open_recording(TimeUs(10));
+    let mut readers = set.take_readers();
+    // A collection connected during the play declares y.
+    set.begin_batch(TimeUs(20));
+    set.add_axes(DeviceId(7), &[cap(y)]);
+    for c in [x, y, z, button] {
+        set.packet(&key(7, c, 5));
+    }
+    set.end_batch(TimeUs(21));
+    assert_eq!(
+        drain(&mut readers[0]),
+        [ev(20, 0, x, 5), ev(20, 0, button, 5)]
+    );
+    // From the next opening y is declared, so it is recorded.
+    set.open_recording(TimeUs(30));
+    let mut readers = set.take_readers();
+    batch(&mut set, 40, &[key(7, y, 6), key(7, z, 6)], 41);
+    assert_eq!(drain(&mut readers[0]), [ev(40, 0, y, 6)]);
 }
 
 #[test]

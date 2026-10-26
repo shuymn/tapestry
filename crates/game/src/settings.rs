@@ -388,7 +388,8 @@ impl ScratchConfig {
     }
 }
 
-/// The controller a controller key config belongs to: its model
+/// The controller a controller key config belongs to: its model and, on a
+/// composite device, the function whose controls are bound
 /// ([`HidProduct`]), the same in every port and after replugging. It names
 /// no single unit and no port, and it never enters the input log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +399,10 @@ pub struct ControllerDevice {
     pub vendor_id: u16,
     /// The product id.
     pub product_id: u16,
+    /// The interface number of the function on a composite device; absent
+    /// for a device that is not composite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<u8>,
 }
 
 impl From<HidProduct> for ControllerDevice {
@@ -405,6 +410,7 @@ impl From<HidProduct> for ControllerDevice {
         Self {
             vendor_id: p.vendor_id,
             product_id: p.product_id,
+            interface: p.interface,
         }
     }
 }
@@ -414,6 +420,7 @@ impl From<ControllerDevice> for HidProduct {
         Self {
             vendor_id: d.vendor_id,
             product_id: d.product_id,
+            interface: d.interface,
         }
     }
 }

@@ -61,6 +61,7 @@ fn changed() -> Settings {
             controller_device: Some(ControllerDevice {
                 vendor_id: 0x0A1B,
                 product_id: 0x2C3D,
+                interface: Some(7),
             }),
             input_offset_us: 4_500,
             audio_offset_us: -12_000,
@@ -645,6 +646,7 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
             d.controller_device = Some(ControllerDevice {
                 vendor_id: 1,
                 product_id: 2,
+                interface: None,
             });
         })
     };
@@ -685,6 +687,7 @@ fn controller_bindings_without_their_controller_are_refused_on_load() {
         d.controller_device = Some(ControllerDevice {
             vendor_id: 0x4E5F,
             product_id: 0x6A7B,
+            interface: None,
         });
     });
     assert_eq!(load_written(&named, &player).unwrap().device, named);
@@ -1010,6 +1013,7 @@ fn two_names_of_one_key_cannot_have_two_roles() {
         d.controller_device = Some(ControllerDevice {
             vendor_id: 3,
             product_id: 4,
+            interface: None,
         });
     });
     pad.controller.lanes = vec![

@@ -1078,7 +1078,8 @@ impl Reservation {
 /// the recording window, whatever its length: a press and a release. Its
 /// first press ends the play, so it is not played at a rate; a key held
 /// across a retry and auto-repeating, which the window takes no further
-/// press from, may overflow the window and mark the log incomplete (D8).
+/// press from, may use up the window, which ends the play at its last
+/// finalized watermark with the log incomplete (D8).
 pub const SYSTEM_CONTROL_INPUTS: usize = 2;
 
 /// What one source records, as the recording window counts it.

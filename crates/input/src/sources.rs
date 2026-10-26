@@ -6,7 +6,7 @@ use bms_model::TimeUs;
 use eval::{ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId};
 
 use crate::gate::{Admit, DeviceId, FocusGate, Packet};
-use crate::hid::{AxisCap, HidProduct, MAX_AXES};
+use crate::hid::{AxisCap, HidProduct, MAX_AXES, is_axis};
 use crate::queue::{SourceReader, SourceWriter, source_queue};
 
 /// What kind of device a source is.
@@ -27,6 +27,10 @@ pub struct Arrival {
     /// What kind of device it is.
     pub kind: DeviceKind,
 }
+
+/// The most products one device keeps ([`SourceSet::add_product`]): its
+/// functions with controller collections.
+pub const MAX_PRODUCTS: usize = 8;
 
 /// The most sources a play can have: one per [`SourceId`].
 pub const SOURCE_LIMIT: usize = 1 << 16;
@@ -71,8 +75,9 @@ struct Device {
     /// The controls recorded from it: its lane and system bindings, set by
     /// [`SourceSet::set_recorded`].
     recorded: Vec<ControlId>,
-    /// A controller's product, from [`SourceSet::set_product`].
-    product: Option<HidProduct>,
+    /// A controller's products, one per function of its collections
+    /// ([`SourceSet::add_product`]).
+    products: [Option<HidProduct>; MAX_PRODUCTS],
     /// Whether it is a source of the next opening
     /// ([`SourceSet::set_takes_part`]).
     takes_part: bool,
@@ -105,7 +110,9 @@ struct Recording {
     arrivals: Vec<Arrival>,
     arrivals_dropped: usize,
     overflowed: bool,
-    source_limited: bool,
+    /// Devices taking part that got no source: beyond `max_sources`, or
+    /// not tracked at all.
+    left_out: usize,
     /// Where the play's time 0 lies on the batch clock: every time recorded
     /// or published is the batch time minus this.
     origin: TimeUs,
@@ -291,7 +298,7 @@ impl SourceSet {
                 positions: [None; MAX_AXES],
                 source: None,
                 recorded: Vec::new(),
-                product: None,
+                products: [None; MAX_PRODUCTS],
                 takes_part: true,
                 state_lost: false,
                 connection: self.next_connection,
@@ -434,26 +441,35 @@ impl SourceSet {
         }
     }
 
-    /// Sets the product of the connected controller `device`, as the
-    /// adapter reads it. Returns `false` for a device that is not
-    /// connected.
-    pub fn set_product(&mut self, device: DeviceId, product: HidProduct) -> bool {
-        match self.devices.iter_mut().find(|d| d.id == device) {
-            Some(d) => {
-                d.product = Some(product);
+    /// Adds a product of the connected controller `device`, as the
+    /// adapter reads it from one of its collections: a controller whose
+    /// collections belong to several functions has one per function, at
+    /// most [`MAX_PRODUCTS`]. Returns `false` for a device that is not
+    /// connected or has no room left.
+    pub fn add_product(&mut self, device: DeviceId, product: HidProduct) -> bool {
+        let Some(d) = self.devices.iter_mut().find(|d| d.id == device) else {
+            return false;
+        };
+        if d.products.contains(&Some(product)) {
+            return true;
+        }
+        match d.products.iter_mut().find(|p| p.is_none()) {
+            Some(free) => {
+                *free = Some(product);
                 true
             }
             None => false,
         }
     }
 
-    /// The product of a connected controller, if the adapter set it.
+    /// Whether the connected controller `device` has `product`
+    /// ([`add_product`](Self::add_product)).
     #[must_use]
-    pub fn product(&self, device: DeviceId) -> Option<HidProduct> {
+    pub fn has_product(&self, device: DeviceId, product: HidProduct) -> bool {
         self.devices
             .iter()
             .find(|d| d.id == device)
-            .and_then(|d| d.product)
+            .is_some_and(|d| d.products.contains(&Some(product)))
     }
 
     /// Sets whether `device` is a source of the next opening. A device
@@ -556,7 +572,7 @@ impl SourceSet {
             .collect();
         order.sort_by_key(|&i| self.devices[i].kind != DeviceKind::Controller);
         let n = order.len().min(self.config.max_sources);
-        let source_limited = order.len() > n || self.untracked > 0;
+        let left_out = order.len() - n + self.untracked;
         let mut overflowed = false;
         let mut participants = Vec::with_capacity(n);
         let mut readers = Vec::with_capacity(n);
@@ -567,7 +583,20 @@ impl SourceSet {
             let source = SourceId(u16::try_from(i).expect("source ids fit in u16"));
             device.source = Some(source);
             overflowed |= device.state_lost;
-            let recorded = device.recorded.clone();
+            // An axis is recorded only if the device declares it now: the
+            // recording window was sized for these, and an axis a late
+            // collection adds is not recorded in this play.
+            let declared = &device.axes[..device.n_axes];
+            let recorded: Vec<ControlId> = device
+                .recorded
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    device.kind != DeviceKind::Controller
+                        || !is_axis(c)
+                        || declared.iter().any(|a| a.control == c)
+                })
+                .collect();
             held.extend(
                 device
                     .held
@@ -599,7 +628,7 @@ impl SourceSet {
             arrivals: Vec::with_capacity(self.config.max_arrivals),
             arrivals_dropped: 0,
             overflowed,
-            source_limited,
+            left_out,
             origin,
         });
         InputStart {
@@ -681,7 +710,16 @@ impl SourceSet {
     /// limit: the log is incomplete.
     #[must_use]
     pub fn source_limited(&self) -> bool {
-        self.recording.as_ref().is_some_and(|r| r.source_limited)
+        self.left_out() > 0
+    }
+
+    /// How many devices that take part got no source in the open
+    /// recording: beyond `max_sources` (controllers come first, so these
+    /// are keyboards when any is), or beyond what the adapter or the
+    /// state table can track.
+    #[must_use]
+    pub fn left_out(&self) -> usize {
+        self.recording.as_ref().map_or(0, |r| r.left_out)
     }
 }
 

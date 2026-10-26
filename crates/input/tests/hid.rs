@@ -8,8 +8,8 @@ use bms_model::TimeUs;
 use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use input::hid::{
     AxisCap, ButtonGroup, CollectionSlot, HidDevice, HidLayout, HidReport, axis_cap, axis_control,
-    axis_value, button_control, capture_travel, collection_of, in_collection, is_axis, read_report,
-    remove_collection, widened_wrap,
+    axis_value, button_control, capture_travel, collection_of, in_collection, interface_of,
+    is_axis, read_report, remove_collection, widened_wrap,
 };
 use input::{Capture, DeviceId, DeviceKind, SourceConfig, SourceReader, SourceSet};
 
@@ -508,10 +508,6 @@ fn collections_of_one_controller_are_one_source() {
     let x2 = in_collection(X, 2);
     let b2 = in_collection(button_control(1), 2);
     set.set_recorded(PAD, vec![button_control(1), b2, x2]);
-    set.open_recording(TimeUs(5));
-    let mut reader = set.take_readers().pop().unwrap();
-    let capture = Capture::new();
-    let mut first = HidDevice::new(PAD, &layout(&[]));
     let second_axes = [AxisCap {
         control: x2,
         relative: false,
@@ -520,6 +516,12 @@ fn collections_of_one_controller_are_one_source() {
         max: 255,
         bits: 16,
     }];
+    // The adapter declares the second collection's axis as it connects.
+    set.add_axes(PAD, &second_axes);
+    set.open_recording(TimeUs(5));
+    let mut reader = set.take_readers().pop().unwrap();
+    let capture = Capture::new();
+    let mut first = HidDevice::new(PAD, &layout(&[]));
     let mut second = HidDevice::new(
         PAD,
         &HidLayout {
@@ -564,6 +566,22 @@ fn controls_carry_their_collection() {
     assert_eq!(collection_of(&path("HID#VID_0&PID_0#x")), 0);
     assert_eq!(collection_of(&path("&colZ1")), 0);
     assert_eq!(collection_of(&path("&col")), 0);
+}
+
+#[test]
+fn interface_of_reads_the_function_number() {
+    let path = |s: &str| s.encode_utf16().collect::<Vec<_>>();
+    assert_eq!(
+        interface_of(&path("HID#VID_0&PID_0&MI_01#7&0&0000")),
+        Some(1)
+    );
+    assert_eq!(
+        interface_of(&path("hid#vid_0&pid_0&mi_1f&col02#x")),
+        Some(0x1F)
+    );
+    assert_eq!(interface_of(&path("HID#VID_0&PID_0&COL02#x")), None);
+    assert_eq!(interface_of(&path("&mi_g1")), None);
+    assert_eq!(interface_of(&path("&mi_")), None);
 }
 
 #[test]
