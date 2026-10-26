@@ -237,6 +237,9 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    // The development builds' counting allocator, which every allocation
+    // calls, and the render thread's app region marks.
+    Site::File("crates/player/src/alloc_count.rs"),
     // A failed frame's report.
     Site::Fns("crates/game/src/error.rs", &["Chain::fmt"]),
 ];
