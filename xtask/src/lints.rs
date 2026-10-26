@@ -15,7 +15,7 @@
 //!   `unwrap`, `expect` and indexing; the test allowances of the two
 //!   `clippy.toml` files match; `crates/eval/clippy.toml` lists every path
 //!   in [`REQUIRED_DISALLOWED`]; and the fixture files are exactly
-//!   [`LINTS`], with no lint attribute in them.
+//!   [`LINTS`], with no attribute in them.
 //!
 //! The site check is partial, like R1's allowlist: it checks the listed
 //! sites, and the in-play list is a reviewed table (design.md "Scope of No
@@ -23,9 +23,8 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use cargo_metadata::diagnostic::DiagnosticLevel;
 use cargo_metadata::{Message, MetadataCommand};
@@ -81,9 +80,10 @@ pub const MODULE_ATTR: &str =
 pub const FN_ATTR: &str =
     "#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]";
 
-/// An in-play site: a whole module file, or functions of a file. Every
-/// definition of a named function outside the file's test module must
-/// carry [`FN_ATTR`].
+/// An in-play site: a whole module file, or functions of a file, each
+/// named `Type::name` inside an `impl Type` or `trait Type` block and
+/// `name` outside one. Every definition of a named function outside the
+/// file's test modules must carry [`FN_ATTR`].
 #[derive(Clone, Copy, Debug)]
 pub enum Site {
     File(&'static str),
@@ -103,18 +103,35 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/eval/src/merge.rs"),
     Site::Fns(
         "crates/rules/src/preset.rs",
-        &["get", "table", "applies_at", "reduce", "change"],
+        &[
+            "PerJudgment::get",
+            "JudgeWindows::table",
+            "LowDamage::applies_at",
+            "LowDamage::reduce",
+            "MineRule::change",
+        ],
     ),
-    Site::Fns("crates/bms-model/src/chart.rs", &["new", "index", "end"]),
+    Site::Fns(
+        "crates/bms-model/src/lib.rs",
+        &["TimeUs::checked_add", "TimeUs::checked_sub"],
+    ),
+    Site::Fns(
+        "crates/bms-model/src/chart.rs",
+        &["Lane::new", "Lane::index", "Lane::all", "Note::end"],
+    ),
     Site::Fns(
         "crates/bms-model/src/scroll.rs",
         &[
-            "at",
-            "position",
-            "earliest_at_or_past",
-            "segment_at",
-            "position_at",
-            "time_range",
+            "ScrollChange::at",
+            "Segment::position",
+            "Segment::earliest_at_or_past",
+            "ScrollMap::initial_bpm_micro",
+            "ScrollMap::segment_at",
+            "ScrollMap::position_at",
+            "ScrollMap::time_range",
+            "ScrollMap::earliest_at_or_past",
+            "ceil_div",
+            "saturate",
         ],
     ),
     // The input thread.
@@ -131,33 +148,55 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/game/src/logic.rs"),
     Site::File("crates/game/src/render.rs"),
     Site::File("crates/game/src/sound.rs"),
-    Site::Fns("crates/game/src/live.rs", &["play_and_next"]),
-    Site::Fns("crates/game/src/session.rs", &["ends_play"]),
+    Site::Fns(
+        "crates/game/src/live.rs",
+        &["play_and_next", "Rig::stepped"],
+    ),
+    Site::Fns(
+        "crates/game/src/session.rs",
+        &["Loaded::ends_play", "Command::cause"],
+    ),
+    Site::Fns(
+        "crates/game/src/policy.rs",
+        &["DefaultPolicy::on_survival_failure"],
+    ),
     Site::Fns(
         "crates/game/src/tuning.rs",
-        &["adjust", "volume", "visible_time"],
+        &[
+            "Adjust::is_input_offset",
+            "Tuning::adjust",
+            "Tuning::volume",
+            "Tuning::visible_time",
+        ],
     ),
     Site::Fns(
         "crates/player/src/play.rs",
         &[
-            "now",
-            "wait",
-            "sync",
-            "take",
-            "quitting",
-            "measured",
-            "focus_lost",
-            "connected",
-            "audio_failure",
-            "screen_failed",
-            "cancel_audio",
-            "seal_audio",
-            "audio_done",
+            "PlayerRig::sync",
+            "PlayerRig::send_end",
+            "PlayerRig::now",
+            "PlayerRig::wait",
+            "PlayerRig::take",
+            "PlayerRig::quitting",
+            "PlayerRig::measured",
+            "PlayerRig::focus_lost",
+            "PlayerRig::connected",
+            "PlayerRig::audio_failure",
+            "PlayerRig::screen_failed",
+            "PlayerRig::cancel_audio",
+            "PlayerRig::seal_audio",
+            "PlayerRig::audio_done",
         ],
     ),
     Site::Fns(
         "crates/player/src/controls.rs",
-        &["take", "retry_at", "quitting"],
+        &[
+            "Controls::tuning",
+            "Controls::take",
+            "Controls::retry_at",
+            "Controls::quitting",
+            "Controls::focused",
+        ],
     ),
     Site::File("crates/player/src/tuning.rs"),
     // The audio thread.
@@ -169,7 +208,13 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/audio/src/wasapi.rs"),
     Site::Fns(
         "crates/audio/src/bank.rs",
-        &["frame", "frames", "channels", "slot", "stored"],
+        &[
+            "Sound::frame",
+            "Sound::frames",
+            "Sound::channels",
+            "SoundBank::slot",
+            "SoundBank::stored",
+        ],
     ),
     Site::File("crates/player/src/audio_side.rs"),
     // The render thread's frame.
@@ -182,6 +227,7 @@ pub const IN_PLAY: &[Site] = &[
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
     ),
+    Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
 ];
@@ -285,7 +331,7 @@ pub fn run(manifest: &Path) -> Result<Vec<String>, String> {
         .map(|p| p.manifest_path.clone().into_std_path_buf())
         .collect();
     let mut diagnostics = check_sites(&root, &members)?;
-    let messages = fixture_run(manifest)?;
+    let messages = fixture_run(manifest, &root)?;
     diagnostics.extend(classify(&messages));
     Ok(diagnostics)
 }
@@ -301,7 +347,7 @@ pub struct Diag {
 }
 
 /// Runs clippy on the fixture packages with the fixture cfg.
-fn fixture_run(manifest: &Path) -> Result<Vec<Diag>, String> {
+fn fixture_run(manifest: &Path, root: &Path) -> Result<Vec<Diag>, String> {
     let mut cmd = Command::new(crate::cargo());
     cmd.arg("clippy").arg("--manifest-path").arg(manifest);
     for p in FIXTURE_PACKAGES {
@@ -309,24 +355,19 @@ fn fixture_run(manifest: &Path) -> Result<Vec<Diag>, String> {
     }
     // Every fixture package is compiled even though each fails.
     cmd.args(["--locked", "--keep-going", "--message-format=json", "--"])
-        .args(["--cfg", FIXTURE_CFG])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to run cargo clippy: {e}"))?;
-    let stdout = child.stdout.take().ok_or("cargo clippy has no stdout")?;
+        .args(["--cfg", FIXTURE_CFG]);
+    let (messages, stderr) = json_messages(&mut cmd)?;
     let mut diags = Vec::new();
     let mut finished = false;
-    for message in Message::parse_stream(BufReader::new(stdout)) {
-        match message.map_err(|e| format!("reading cargo clippy output: {e}"))? {
+    for message in messages {
+        match message {
             Message::CompilerMessage(m) => {
                 let d = &m.message;
                 let file = d
                     .spans
                     .iter()
                     .find(|s| s.is_primary)
-                    .map(|s| lexical(&s.file_name));
+                    .map(|s| workspace_relative(root, &s.file_name));
                 diags.push(Diag {
                     file,
                     code: d.code.as_ref().map(|c| c.code.clone()),
@@ -338,16 +379,27 @@ fn fixture_run(manifest: &Path) -> Result<Vec<Diag>, String> {
             _ => {}
         }
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("waiting for cargo clippy: {e}"))?;
     if !finished {
         return Err(format!(
             "cargo clippy did not finish a build:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stderr)
         ));
     }
     Ok(diags)
+}
+
+/// Runs `cmd` to its end and parses its standard output as cargo's JSON
+/// messages; also returns its standard error. `Command::output` drains both
+/// pipes at once, so a child that fills one while the other is read does
+/// not block.
+fn json_messages(cmd: &mut Command) -> Result<(Vec<Message>, Vec<u8>), String> {
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run cargo clippy: {e}"))?;
+    let messages = Message::parse_stream(output.stdout.as_slice())
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("reading cargo clippy output: {e}"))?;
+    Ok((messages, output.stderr))
 }
 
 /// Checks the fixture run's diagnostics: each fixture in [`LINTS`] gives
@@ -422,6 +474,44 @@ fn lexical(path: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// A diagnostic's `file`, relative to the workspace `root` with `/`
+/// separators. Cargo reports workspace files relative to the root, but a
+/// path may also come absolute: POSIX, drive letter, UNC, or verbatim
+/// (`\\?\`). Such a path below `root` loses the root's prefix; any other
+/// path stays absolute (and so matches no fixture).
+fn workspace_relative(root: &Path, file: &str) -> String {
+    /// Drops the verbatim prefix, so `\\?\C:\x` reads `C:/x` and
+    /// `\\?\UNC\srv\x` reads `//srv/x`.
+    fn plain(path: String) -> String {
+        if let Some(rest) = path.strip_prefix("//?/UNC/") {
+            format!("//{rest}")
+        } else if let Some(rest) = path.strip_prefix("//?/") {
+            rest.to_owned()
+        } else {
+            path
+        }
+    }
+    let file = plain(lexical(file));
+    let root = plain(lexical(&root.to_string_lossy()));
+    let root = root.trim_end_matches('/');
+    // Windows paths compare without case; POSIX ones exactly.
+    let windows = root.starts_with("//") || root.get(1..2) == Some(":");
+    let head = file.get(..root.len());
+    let below = head.is_some_and(|h| {
+        if windows {
+            h.eq_ignore_ascii_case(root)
+        } else {
+            h == root
+        }
+    });
+    match file.get(root.len()..) {
+        Some(rest) if below && !root.is_empty() && rest.starts_with('/') => {
+            rest.trim_start_matches('/').to_owned()
+        }
+        _ => file,
+    }
 }
 
 /// The compiler's closing summary ("aborting due to ...", "... warnings
@@ -536,7 +626,7 @@ fn check_clippy_toml(root: &Path) -> Result<Vec<String>, String> {
 }
 
 /// The fixture directories hold exactly a `mod.rs` and one file per lint of
-/// [`LINTS`], and no fixture file carries a lint attribute.
+/// [`LINTS`], and no fixture file carries an attribute.
 fn check_fixture_files(root: &Path) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let dirs: BTreeSet<&str> = LINTS.iter().map(|&(_, dir)| dir).collect();
@@ -553,9 +643,9 @@ fn check_fixture_files(root: &Path) -> Result<Vec<String>, String> {
             let entry = entry.map_err(|e| format!("reading {dir}: {e}"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let text = read(&entry.path())?;
-            if let Some(attr) = lint_attribute(&text) {
+            if let Some(attr) = any_attribute(&text) {
                 out.push(format!(
-                    "{dir}/{name}: fixtures carry no lint attribute, found `{attr}`"
+                    "{dir}/{name}: fixtures carry no attribute, found `{attr}`"
                 ));
             }
             found.insert(name);
@@ -668,30 +758,239 @@ fn inner_attributes(text: &str) -> Vec<String> {
     out
 }
 
-/// Each function definition before the file's test module, with its outer
-/// attributes, normalized.
+/// Each function definition outside `#[cfg(test)]` modules, named as
+/// [`Site::Fns`] names it (`Type::name` inside an `impl` or `trait` block,
+/// `name` elsewhere), with its outer attributes, normalized. A test
+/// module's body is skipped and the items after it are read.
 fn fn_attributes(text: &str) -> Vec<(String, Vec<String>)> {
+    let masked = mask(text);
+    let lines: Vec<&str> = text.lines().collect();
+    let code: Vec<&str> = masked.lines().collect();
     let mut out = Vec::new();
     let mut pending: Vec<String> = Vec::new();
-    for line in logical_lines(text) {
+    // Open `impl`/`trait` blocks: the type and the depth outside the block.
+    let mut blocks: Vec<(String, i32)> = Vec::new();
+    // A block header seen whose `{` has not opened yet.
+    let mut header: Option<String> = None;
+    // The depth a skipped test module's body returns to.
+    let mut skip_to: Option<i32> = None;
+    let mut depth = 0;
+    let mut i = 0;
+    while let (Some(&line), Some(&masked_line)) = (lines.get(i), code.get(i)) {
+        i += 1;
+        let before = depth;
+        depth += brace_depth(masked_line);
+        if let Some(target) = skip_to {
+            if depth <= target {
+                skip_to = None;
+            }
+            continue;
+        }
+        while blocks.last().is_some_and(|&(_, outside)| depth <= outside) {
+            blocks.pop();
+        }
         let trimmed = line.trim();
-        if trimmed.starts_with("#[") {
-            pending.push(normalize(trimmed));
+        if masked_line.trim().is_empty() {
+            // A comment or a blank line.
             continue;
         }
-        if trimmed.is_empty() || trimmed.starts_with("//") {
+        if is_attribute(trimmed) {
+            // Join a wrapped attribute; its brackets are balanced in code.
+            let mut attr = trimmed.to_owned();
+            let mut open = bracket_depth(masked_line);
+            while open > 0 {
+                let (Some(&next), Some(&next_code)) = (lines.get(i), code.get(i)) else {
+                    break;
+                };
+                i += 1;
+                depth += brace_depth(next_code);
+                attr.push_str(next);
+                open += bracket_depth(next_code);
+            }
+            pending.push(normalize(&attr));
             continue;
         }
-        if trimmed.starts_with("mod ") && pending.iter().any(|a| a == "#[cfg(test)]") {
-            break;
+        let attrs = std::mem::take(&mut pending);
+        if let Some(name) = block_type(trimmed) {
+            header = Some(name);
+        }
+        // A `{` ends the header: its block opens here, or opens and closes.
+        if masked_line.contains('{')
+            && let Some(name) = header.take()
+            && depth > before
+        {
+            blocks.push((name, before));
+        }
+        if trimmed.starts_with("mod ") && attrs.iter().any(|a| a == "#[cfg(test)]") {
+            if depth > before {
+                skip_to = Some(before);
+            }
+            continue;
         }
         if let Some(name) = fn_name(trimmed) {
-            out.push((name.to_owned(), std::mem::take(&mut pending)));
-        } else {
-            pending.clear();
+            let name = match blocks.last() {
+                Some((ty, _)) => format!("{ty}::{name}"),
+                None => name.to_owned(),
+            };
+            out.push((name, attrs));
         }
     }
     out
+}
+
+/// `text` with the contents of comments, string literals and character
+/// literals replaced by spaces (line breaks kept), so braces and brackets
+/// in it are code. Raw strings are handled; a lifetime is not a literal.
+fn mask(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        let next = chars.get(i + 1).copied();
+        // The end (exclusive) of a comment or literal starting at `i`.
+        let end = if c == '/' && next == Some('/') {
+            (i..chars.len())
+                .find(|&k| chars.get(k) == Some(&'\n'))
+                .unwrap_or(chars.len())
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0;
+            let mut k = i;
+            loop {
+                match (chars.get(k), chars.get(k + 1)) {
+                    (Some('/'), Some('*')) => {
+                        depth += 1;
+                        k += 2;
+                    }
+                    (Some('*'), Some('/')) => {
+                        depth -= 1;
+                        k += 2;
+                        if depth == 0 {
+                            break k;
+                        }
+                    }
+                    (Some(_), _) => k += 1,
+                    (None, _) => break k,
+                }
+            }
+        } else if c == '"' {
+            let mut k = i + 1;
+            loop {
+                match chars.get(k) {
+                    Some('\\') => k += 2,
+                    Some('"') => break k + 1,
+                    Some(_) => k += 1,
+                    None => break k,
+                }
+            }
+        } else if c == 'r'
+            && (next == Some('"') || next == Some('#'))
+            && !chars
+                .get(i.wrapping_sub(1))
+                .is_some_and(|p| p.is_alphanumeric() || *p == '_')
+        {
+            let hashes = chars
+                .get(i + 1..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|&&h| h == '#')
+                .count();
+            if chars.get(i + 1 + hashes) == Some(&'"') {
+                let mut k = i + 2 + hashes;
+                loop {
+                    if chars.get(k).is_none() {
+                        break k;
+                    }
+                    if chars.get(k) == Some(&'"')
+                        && (1..=hashes).all(|h| chars.get(k + h) == Some(&'#'))
+                    {
+                        break k + 1 + hashes;
+                    }
+                    k += 1;
+                }
+            } else {
+                i + 1
+            }
+        } else if c == '\'' {
+            // `'x'` or `'\n'`-style: a literal; anything else is a lifetime.
+            match (next, chars.get(i + 2)) {
+                // The escape takes at least `i + 2`, so `'\''` ends at `i + 3`.
+                (Some('\\'), _) => (i + 3..chars.len())
+                    .find(|&k| chars.get(k) == Some(&'\''))
+                    .map_or(chars.len(), |k| k + 1),
+                (Some(_), Some('\'')) => i + 3,
+                _ => i + 1,
+            }
+        } else {
+            i + 1
+        };
+        if end == i + 1 {
+            out.push(c);
+        } else {
+            out.extend(
+                chars
+                    .get(i..end)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&c| blank(c)),
+            );
+        }
+        i = end;
+    }
+    out
+}
+
+/// The change in brace depth over code `s` (masked by [`mask`]).
+fn brace_depth(s: &str) -> i32 {
+    s.chars()
+        .map(|c| match c {
+            '{' => 1,
+            '}' => -1,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The type an `impl` or `trait` header line names: `S` for `impl S`,
+/// `impl<T> S<T>`, `impl Trait for S<'_>` and `unsafe impl Send for S`;
+/// `T` for `pub trait T: Send`.
+fn block_type(line: &str) -> Option<String> {
+    let mut rest = line;
+    for prefix in ["pub(crate) ", "pub(super) ", "pub ", "unsafe "] {
+        if let Some(r) = rest.strip_prefix(prefix) {
+            rest = r;
+        }
+    }
+    let rest = if let Some(r) = rest.strip_prefix("trait ") {
+        r
+    } else {
+        let r = rest.strip_prefix("impl")?;
+        let r = if r.starts_with('<') {
+            // Skip the generics, which may nest.
+            let mut depth = 0;
+            let end = r.char_indices().find_map(|(k, c)| {
+                match c {
+                    '<' => depth += 1,
+                    '>' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(k + 1)
+            })?;
+            r.get(end..)?
+        } else if r.starts_with(' ') {
+            r
+        } else {
+            return None;
+        };
+        let r = r.trim_start();
+        r.split_once(" for ").map_or(r, |(_, ty)| ty)
+    };
+    let path = rest
+        .trim_start()
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+        .next()?;
+    let name = path.trim_end_matches(':').rsplit("::").next()?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// The name of the function `line` defines, if it starts a definition.
@@ -721,37 +1020,29 @@ fn fn_name(line: &str) -> Option<&str> {
     (next.starts_with('(') || next.starts_with('<')).then(|| rest.get(..end))?
 }
 
-/// The first attribute of `text` that sets a lint level, if any (also
-/// inside `cfg_attr`).
-fn lint_attribute(text: &str) -> Option<String> {
-    logical_lines(text).into_iter().find_map(|line| {
-        let trimmed = line.trim();
-        if !is_attribute(trimmed) {
-            return None;
-        }
-        let compact = normalize(trimmed);
-        ["allow(", "warn(", "deny(", "forbid(", "expect("]
-            .iter()
-            .any(|level| {
-                compact.match_indices(level).any(|(i, _)| {
-                    // A whole word: not the tail of a longer name.
-                    compact
-                        .get(..i)
-                        .and_then(|before| before.chars().last())
-                        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
-                })
-            })
-            .then(|| trimmed.to_owned())
-    })
+/// The first line of `text` holding `#[` or `#![` anywhere, if any.
+/// Fixtures need no attribute, and an attribute anywhere (in a nested
+/// module, after code on a line, kept by `#[rustfmt::skip]`) could set a
+/// lint level, so any one is rejected without parsing.
+fn any_attribute(text: &str) -> Option<String> {
+    text.lines()
+        .find(|line| line.contains("#[") || line.contains("#!["))
+        .map(|line| line.trim().to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write as _;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use super::{
-        Diag, LINTS, MODULE_ATTR, Site, check_site, classify, fn_attributes, inner_attributes,
-        lint_attribute, normalize,
+        Diag, FN_ATTR, LINTS, MODULE_ATTR, Site, any_attribute, check_site, classify,
+        fn_attributes, inner_attributes, json_messages, normalize, workspace_relative,
     };
 
     fn diag(file: &str, code: &str, error: bool) -> Diag {
@@ -879,41 +1170,151 @@ mod tests {
         let file = |name: &str, text: &str| fs::write(dir.path().join(name), text).unwrap();
         file("ok.rs", &format!("{MODULE_ATTR}\nfn f() {{}}\n"));
         file("missing.rs", "fn f() {}\n");
-        let fn_attr = super::FN_ATTR;
         file(
             "fns.rs",
             &format!(
-                "/// Doc.\n#[must_use]\n{fn_attr}\npub(crate) const fn hot() -> u8 {{ 0 }}\n\
-                 impl S {{\n    {fn_attr}\n    fn twice(&self) {{}}\n}}\n\
-                 impl T {{\n    fn twice(&self) {{}}\n}}\n\
+                "/// Doc.\n#[must_use]\n{FN_ATTR}\npub(crate) const fn hot() -> u8 {{ 0 }}\n\
+                 impl S {{\n    {FN_ATTR}\n    fn twice(&self) {{}}\n}}\n\
+                 impl<T: Copy> fmt::Debug for U<T>\nwhere\n    T: Send,\n{{\n    fn twice(&self) {{}}\n}}\n\
                  fn cold() {{}}\n\
-                 #[cfg(test)]\nmod tests {{\n    fn hot() {{}}\n}}\n"
+                 #[cfg(test)]\nmod tests {{\n    fn hot() {{ let _ = \"}}\"; let _ = '}}'; }}\n}}\n\
+                 impl Late {{\n    // }}\n    fn after(&self) {{}}\n}}\n"
             ),
         );
         let check = |site| check_site(dir.path(), site).unwrap();
         assert!(check(Site::File("ok.rs")).is_empty());
         assert_eq!(check(Site::File("missing.rs")).len(), 1);
         assert!(check(Site::Fns("fns.rs", &["hot"])).is_empty());
-        // One of two definitions lacks it.
+        // Each name binds to its own block: one carries it, one does not,
+        // and neither is a free function.
+        assert!(check(Site::Fns("fns.rs", &["S::twice"])).is_empty());
+        assert_eq!(check(Site::Fns("fns.rs", &["U::twice"])).len(), 1);
         assert_eq!(check(Site::Fns("fns.rs", &["twice"])).len(), 1);
         assert_eq!(check(Site::Fns("fns.rs", &["cold"])).len(), 1);
         assert_eq!(check(Site::Fns("fns.rs", &["absent"])).len(), 1);
+        // A production item after the test module is read, and lacks it.
+        let late = check(Site::Fns("fns.rs", &["Late::after"]));
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert!(late[0].contains("lacks"), "{late:?}");
     }
 
     #[test]
-    fn functions_after_the_test_module_are_not_definitions() {
-        let fns = fn_attributes("fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() {}\n}\n");
+    fn test_modules_are_skipped_and_scanning_resumes() {
+        let text = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() {\n        \
+                    let _ = r#\"}\"#;\n        /* } */\n    }\n}\n\
+                    pub trait R: Send {\n    fn c(&self) {}\n}\n\
+                    #[cfg(test)]\nmod more;\nunsafe impl Send for V {}\nfn d<'a>(x: &'a u8) {}\n\
+                    impl W {\n    const C: [(char, char); 2] = [('\\'','{'), ('\\\\','}')];\n    \
+                    fn e() {}\n}\nfn f() {}\n";
+        let fns = fn_attributes(text);
         let names: Vec<_> = fns.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["a"]);
+        assert_eq!(names, ["a", "R::c", "d", "W::e", "f"]);
     }
 
     #[test]
-    fn fixture_files_reject_lint_attributes() {
-        assert_eq!(lint_attribute("fn f() {}\n"), None);
-        assert!(lint_attribute("#[allow(dead_code)]\nfn f() {}\n").is_some());
-        assert!(lint_attribute("#![expect(clippy::todo)]\n").is_some());
-        assert!(lint_attribute("#[cfg_attr(all(), deny(clippy::todo))]\nfn f() {}\n").is_some());
-        assert!(lint_attribute("#[forbid(\n    clippy::todo\n)]\nfn f() {}\n").is_some());
-        assert_eq!(lint_attribute("//! Docs that allow(x).\nmod a;\n"), None);
+    fn wrapped_function_attributes_are_joined() {
+        let text = "impl S {\n    #[deny(\n        clippy::expect_used,\n        clippy::indexing_slicing,\n        clippy::unwrap_used,\n    )]\n    #[expect(\n        clippy::indexing_slicing,\n        reason = \"[x]\"\n    )]\n    fn f(&self) {}\n}\n";
+        let fns = fn_attributes(text);
+        assert_eq!(fns.len(), 1);
+        let (name, attrs) = &fns[0];
+        assert_eq!(name, "S::f");
+        assert!(attrs.contains(&normalize(FN_ATTR)), "{attrs:?}");
+    }
+
+    #[test]
+    fn fixture_files_reject_any_attribute() {
+        assert_eq!(any_attribute("fn f() {}\n"), None);
+        assert_eq!(any_attribute("//! Docs that allow(x).\nmod a;\n"), None);
+        assert!(any_attribute("#[allow(dead_code)]\nfn f() {}\n").is_some());
+        assert!(any_attribute("#![expect(clippy::todo)]\n").is_some());
+        assert!(any_attribute("#[inline]\nfn f() {}\n").is_some());
+        // Kept on one line by `#[rustfmt::skip]`: a lint level in a nested
+        // module, not at the start of a line.
+        let nested =
+            "#[rustfmt::skip]\nmod inner { #[deny(clippy::todo)] fn f() -> u8 { todo!() } }\n";
+        assert!(any_attribute(nested).is_some());
+        let inline = "mod inner { #[deny(clippy::todo)] fn f() -> u8 { todo!() } }\n";
+        assert_eq!(any_attribute(inline).as_deref(), Some(inline.trim()));
+    }
+
+    #[test]
+    fn absolute_diagnostic_paths_lose_the_workspace_root() {
+        let rel = "xtask/lint-fixtures/todo.rs";
+        let cases = [
+            ("/home/u/ws", "/home/u/ws/xtask/lint-fixtures/todo.rs"),
+            (
+                "/home/u/ws/",
+                "/home/u/ws/xtask/src/../lint-fixtures/todo.rs",
+            ),
+            ("C:\\ws", "C:\\ws\\xtask\\lint-fixtures\\todo.rs"),
+            ("C:\\ws", "c:/ws/xtask/lint-fixtures/todo.rs"),
+            ("\\\\?\\C:\\ws", "C:\\ws\\xtask\\lint-fixtures\\todo.rs"),
+            ("C:\\ws", "\\\\?\\C:\\ws\\xtask\\lint-fixtures\\todo.rs"),
+            (
+                "\\\\srv\\share\\ws",
+                "\\\\srv\\share\\ws\\xtask\\lint-fixtures\\todo.rs",
+            ),
+            (
+                "\\\\srv\\share\\ws",
+                "\\\\?\\UNC\\srv\\share\\ws\\xtask\\lint-fixtures\\todo.rs",
+            ),
+            ("/home/u/ws", rel),
+        ];
+        for (root, file) in cases {
+            assert_eq!(
+                workspace_relative(Path::new(root), file),
+                rel,
+                "{root} {file}"
+            );
+        }
+        // Outside the root, or sharing only a prefix of its last name.
+        for file in [
+            "/home/u/wsx/a.rs",
+            "/HOME/u/ws/a.rs",
+            "/rustc/abc/library/core/src/lib.rs",
+        ] {
+            assert_eq!(workspace_relative(Path::new("/home/u/ws"), file), file);
+        }
+    }
+
+    /// Set by [`a_child_flooding_stderr_does_not_block`] for the child.
+    const FLOOD: &str = "XTASK_LINTS_FLOOD";
+
+    /// The child of [`a_child_flooding_stderr_does_not_block`]: more than
+    /// any pipe buffer on stderr, then a message on stdout. Does nothing in
+    /// a normal test run.
+    #[test]
+    fn flood_child() {
+        if std::env::var_os(FLOOD).is_none() {
+            return;
+        }
+        // Written to the handles, not through the test harness's capture.
+        std::io::stderr().write_all(&vec![b'x'; 4 << 20]).unwrap();
+        let mut out = std::io::stdout();
+        out.write_all(b"{\"reason\":\"build-finished\",\"success\":false}\n")
+            .unwrap();
+        out.flush().unwrap();
+    }
+
+    #[test]
+    fn a_child_flooding_stderr_does_not_block() {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "lints::tests::flood_child", "--nocapture", "-q"])
+                .env(FLOOD, "1");
+            let _ = tx.send(json_messages(&mut cmd));
+        });
+        let (messages, stderr) = rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the child's pipes were not drained")
+            .unwrap();
+        assert!(stderr.len() > 1 << 20, "{}", stderr.len());
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, cargo_metadata::Message::BuildFinished(_))),
+            "{messages:?}"
+        );
     }
 }
