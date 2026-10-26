@@ -10,7 +10,6 @@ publish.workspace = true
 [dependencies]
 bms-model.workspace = true
 chardetng.workspace = true
-encoding_rs.workspace = true
 md-5.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true
@@ -21,3 +20,8 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+# The `md-5` package's library is named `md5`; `--with-metadata` reads that from
+# cargo metadata, and this mapping gives plain `cargo machete` the same name.
+[package.metadata.cargo-machete.renamed]
+md-5 = "md5"

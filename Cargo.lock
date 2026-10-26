@@ -152,7 +152,6 @@ version = "0.0.0"
 dependencies = [
  "bms-model",
  "chardetng",
- "encoding_rs",
  "md-5",
  "num-rational",
  "num-traits",
