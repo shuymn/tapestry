@@ -2,9 +2,8 @@
 //! play's command queue goes back to the game thread to be dropped there,
 //! and the control messages travel through a preallocated queue. Only the
 //! audio loop's steps are counted (see `counting`); this file holds a
-//! single test. It runs in the dev and release profiles with the same
-//! bound, and each tracked stretch starts with the positive control
-//! (design.md "Scope of No Allocation").
+//! single test. Profiles and the positive control: design.md "Scope of No
+//! Allocation".
 
 mod common;
 mod counting;

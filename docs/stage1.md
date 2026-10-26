@@ -184,7 +184,7 @@ Stage 0 found that `IAudioClock::GetPosition` on the development PC's interface 
 - **Debounce** is not implemented. Keyboards do not bounce, and controller firmware usually debounces. The device profile gains it with a format version bump when a device needs it (design.md:201, 871).
 - **`#RANDOM`** uses our own SplitMix64 with the seed recorded. Alternative: `rand`, whose output streams may change across versions and would break replays.
 - **Offsets:** input latency can change only between plays (the log has no offset change segments; design.md:183-191). Display latency and volume change anytime, since they do not affect judgment.
-- **Allocation check:** the counting allocator (design.md:860) is our own, ported from spike/app/src/alloc.rs:1-10. It is a `#[global_allocator]` in the allocation test binaries and, under `dev-tools`, in `player`. The selected test binaries run in both the dev and release profiles, and in `player` it also counts the render thread's app region, which the scripted plays require to be 0 (design.md "Scope of No Allocation").
+- **Allocation check:** the counting allocator (design.md:860) is our own, ported from spike/app/src/alloc.rs:1-10. It is a `#[global_allocator]` in the allocation test binaries and, under `dev-tools`, in `player`. Which binaries run in release, and the render thread's app region count in `player`: design.md "Scope of No Allocation".
 
 ### D14. Loading limits and file confinement
 

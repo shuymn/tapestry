@@ -7,8 +7,8 @@
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
-//! for the same reason. It runs in the dev and release profiles with the
-//! same bound, and the tracked stretch starts with a positive control.
+//! for the same reason. Profiles and the positive control: design.md
+//! "Scope of No Allocation".
 
 mod common;
 

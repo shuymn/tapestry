@@ -4,9 +4,8 @@
 //!
 //! The counting allocator counts only threads that opted in, so the test
 //! harness's own threads do not disturb the count. This file holds a single
-//! test for the same reason. It runs in the dev and release profiles with
-//! the same bound, and the tracked stretch starts with the positive control
-//! (design.md "Scope of No Allocation").
+//! test for the same reason. Profiles and the positive control: design.md
+//! "Scope of No Allocation".
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

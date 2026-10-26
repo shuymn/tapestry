@@ -6,9 +6,7 @@
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
 //! disturb the count. This file holds a single test for the same reason.
-//! It runs in the dev and release profiles with the same bound, and the
-//! tracked stretch starts with a positive control (design.md "Scope of No
-//! Allocation").
+//! Profiles and the positive control: design.md "Scope of No Allocation".
 
 mod common;
 
