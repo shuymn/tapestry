@@ -1,312 +1,255 @@
-//! The game thread: plays the loaded chart on the real threads, from the
-//! countdown to the end screen, until the player quits (D8, D13).
+//! The game thread's rig: the play lifecycle of `game::live` on the real
+//! threads (D8, D13).
 //!
-//! Each play has its own timeline (`game::Session` does the same over a
-//! virtual clock): the input thread opens recording at a boundary and puts
-//! chart time 0 `lead_in` after it on the QPC clock. The source set moves
-//! every recorded time onto the play's timeline, the logic step advances
-//! to the clock minus that origin, the audio engine and the key sounds'
-//! origins sit on the clock with the play's origin, and the render thread
-//! draws at the clock minus the origin. This thread runs the logic step,
-//! woken by the input thread after each publication.
+//! Each play has its own timeline: the input thread opens recording at a
+//! boundary and puts chart time 0 `lead_in` after it on the QPC clock. The
+//! source set moves every recorded time onto the play's timeline, the logic
+//! step advances to the clock minus that origin, the audio engine and the
+//! key sounds' origins sit on the clock with the play's origin, and the
+//! render thread draws at the clock minus the origin. This thread runs the
+//! logic step, woken by the input thread after each publication.
 
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
-use game::{AbortCause, Command, Loaded, Logic, PlayEnd, PlayOutcome, PlayReport, audio_link_at};
-use input::QpcClock;
-use replay::Incomplete;
+use game::{AudioQueue, Closing, Command, Opening, PlayReport, RenderSide, Rig};
+use input::{QpcClock, SourceReader};
 
-use crate::audio_side::{AudioLink, AudioMsg};
+use crate::audio_side::AudioLink;
 use crate::controls::Controls;
-use crate::end_screen::{self, LoadTimes};
+use crate::end_screen::{self, Hints, LoadTimes};
 use crate::input_side::{InputLink, Request};
 use crate::render_side::{RenderLink, RenderMsg};
 
 /// How long the logic step parks at most without a wake from the input
-/// thread.
+/// thread; also the pace of the tail and the end screen.
 const PARK: Duration = Duration::from_millis(2);
-/// How often the tail and the end screen look at the controls.
-const POLL: Duration = Duration::from_millis(2);
 
-/// The threads a run plays through.
-pub struct Threads {
+/// The game's threads as a rig.
+pub struct PlayerRig<'a> {
     /// The input thread.
     pub input: InputLink,
     /// The audio thread.
     pub audio: AudioLink,
     /// The render thread.
     pub render: RenderLink,
+    /// The window's controls.
+    pub controls: &'a Controls,
+    /// The clock, started with the process.
+    pub clock: QpcClock,
+    /// The controls recorded from keyboards and from controllers.
+    pub recorded: (Vec<eval::ControlId>, Vec<eval::ControlId>),
+    /// The gauge to show.
+    pub gauge: usize,
+    /// The countdown's length.
+    pub lead_in: TimeUs,
+    /// The input offset the plays use.
+    pub input_offset_us: i64,
+    /// The end screen's key names.
+    pub hints: Hints,
+    /// The preset's gauges, for the end screen.
+    pub preset: rules::RulePreset,
+    /// The latest retry taken, by its receipt time: the next play starts
+    /// from it.
+    pub pending_retry: Option<TimeUs>,
+    /// The retry the current play started from.
+    pub retry_from: Option<TimeUs>,
+    /// Load times shown on the end screen.
+    pub times: LoadTimes,
+    /// When the current play's countdown started, on the clock.
+    pub countdown_at: Option<TimeUs>,
+    /// Quit once the end screen has shown this long (scripted runs).
+    #[cfg(feature = "dev-tools")]
+    pub quit_after_end: Option<Duration>,
+    #[cfg(feature = "dev-tools")]
+    pub end_shown: Option<std::time::Instant>,
+    /// Retries still to send by itself at an end screen (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub auto_retries: u32,
 }
 
-impl Threads {
-    /// Ends the render and audio threads; the input side stops with its
-    /// owner.
+impl PlayerRig<'_> {
+    /// Ends the render and audio threads.
     pub fn shut_down(self) {
         self.render.exit();
         self.audio.exit();
     }
-}
 
-/// How the run ends after a play's end screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AfterEnd {
-    /// Wait for retry or quit.
-    Wait,
-    /// Quit once the end screen has been shown for this long (scripted
-    /// runs).
-    #[cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
-    QuitAfter(Duration),
-}
-
-/// What the run reports per play, for the console.
-fn print_report(report: &PlayReport) {
-    let result = report.result.as_ref();
-    let counts = result
-        .and_then(|r| r.evaluation.as_ref().ok())
-        .map(|e| e.tally.counts);
-    match counts {
-        Some(c) => println!(
-            "play {}: {:?}; perfect {} great {} good {} bad {} poor {}; re-evaluation matches live: {}",
-            report.attempt,
-            report.end,
-            c.perfect,
-            c.great,
-            c.good,
-            c.bad,
-            c.poor,
-            result.is_some_and(|r| r.matches_live)
-        ),
-        None => println!(
-            "play {}: {:?}; nothing recorded",
-            report.attempt, report.end
-        ),
-    }
-    match &report.saved {
-        Some(Ok(r)) => println!("saved: {}", r.path.display()),
-        Some(Err(e)) => eprintln!("not saved: {e}"),
-        None => {}
-    }
-}
-
-/// Plays until the player quits or the window closes. `started` is when
-/// the process started, for the first load time.
-pub fn run(
-    loaded: &mut Loaded,
-    threads: &Threads,
-    controls: &Controls,
-    clock: QpcClock,
-    started: Instant,
-    after_end: AfterEnd,
-) {
-    let lead_in = loaded.config().lead_in;
-    let device = loaded.settings().device.clone();
-    let gauge = loaded.settings().player.displayed_gauge;
-    let mut times = LoadTimes::default();
-    let mut retry_at: Option<Instant> = None;
-    let mut generation = 0;
-    loop {
-        controls.clear();
-        generation += 1;
-        let Some(report) = play_once(
-            loaded,
-            threads,
-            controls,
-            clock,
-            Once {
-                lead_in,
-                gauge,
-                generation,
-            },
-            |opened_at| match retry_at {
-                Some(t) => times.retry = Some(opened_at.duration_since(t)),
-                None => times.first = opened_at.duration_since(started),
-            },
-        ) else {
-            return;
-        };
-        print_report(&report);
+    fn print(&self, report: &PlayReport) {
+        let result = report.result.as_ref();
+        let counts = result
+            .and_then(|r| r.evaluation.as_ref().ok())
+            .map(|e| e.tally.counts);
+        match counts {
+            Some(c) => println!(
+                "play {}: {:?}; perfect {} great {} good {} bad {} poor {}; re-evaluation matches live: {}",
+                report.attempt,
+                report.end,
+                c.perfect,
+                c.great,
+                c.good,
+                c.bad,
+                c.poor,
+                result.is_some_and(|r| r.matches_live)
+            ),
+            None => println!(
+                "play {}: {:?}; nothing recorded",
+                report.attempt, report.end
+            ),
+        }
+        match &report.saved {
+            Some(Ok(r)) => println!("saved: {}", r.path.display()),
+            Some(Err(e)) => eprintln!("not saved: {e}"),
+            None => {}
+        }
+        let ms = |d: Duration| format!("{} ms", d.as_millis());
         println!(
-            "load: first {} ms, retry {}",
-            times.first.as_millis(),
-            times
-                .retry
-                .map_or_else(|| "-".to_owned(), |d| format!("{} ms", d.as_millis()))
+            "load: first {}, retry {}",
+            self.times.first.map_or_else(|| "-".to_owned(), ms),
+            self.times.retry.map_or_else(|| "-".to_owned(), ms)
         );
-        if controls.closing() {
-            return;
-        }
-        let ended_by = |c| report.end == PlayEnd::Aborted(c) || report.tail_cut == Some(c);
-        if ended_by(AbortCause::Quit) {
-            return;
-        }
-        if ended_by(AbortCause::Retry) {
-            retry_at = Some(Instant::now());
-            continue;
-        }
-        let lines = end_screen::lines(&report, loaded.preset(), device.input_offset_us, times);
-        threads.render.send(RenderMsg::Text(lines));
-        let shown = Instant::now();
-        loop {
-            thread::sleep(POLL);
-            match controls.take() {
-                Some(Command::Retry) => {
-                    retry_at = Some(Instant::now());
-                    break;
-                }
-                Some(Command::Quit) => return,
-                _ => {}
-            }
-            if let AfterEnd::QuitAfter(d) = after_end
-                && shown.elapsed() >= d
-            {
-                return;
-            }
-        }
     }
 }
 
-struct Once {
-    lead_in: TimeUs,
-    gauge: usize,
-    generation: u64,
+fn since(from: TimeUs, to: TimeUs) -> Duration {
+    Duration::from_micros(u64::try_from(to.0 - from.0).unwrap_or(0))
 }
 
-/// One play, from opening the recording to its report; `None` if the logic
-/// step could not start (the reason is printed).
-fn play_once(
-    loaded: &mut Loaded,
-    threads: &Threads,
-    controls: &Controls,
-    clock: QpcClock,
-    once: Once,
-    mut on_open: impl FnMut(Instant),
-) -> Option<PlayReport> {
-    let start = loaded.begin_play();
-    let keys = &loaded.settings().device;
-    let opened = threads.input.open(Request::Open {
-        lead_in: once.lead_in,
-        logic: thread::current(),
-        keyboard: keys.keyboard.recorded(),
-        controller: keys.controller.recorded(),
-    });
-    on_open(Instant::now());
-    let origin = opened.origin;
-    let plan = loaded.plan(&opened.kinds);
-    let (mut logic, render) = match Logic::new(
-        loaded.chart(),
-        loaded.preset(),
-        &plan.device,
-        &opened.start,
-        opened.readers,
-        plan.logic,
-        Vec::new(),
-    ) {
-        Ok(pair) => pair,
-        Err(e) => {
-            threads.input.close();
-            eprintln!("the play cannot start: {e}");
-            return None;
-        }
-    };
-    let (sink, queue) = audio_link_at(logic.max_events(), origin);
-    logic.add_sink(Box::new(sink));
-    threads.audio.send(AudioMsg::Play {
-        origin,
-        queue,
-        generation: once.generation,
-    });
-    threads.render.send(RenderMsg::Play {
-        origin,
-        side: render,
-        gauge: once.gauge,
-    });
-    let mut live = Vec::with_capacity(logic.max_events());
-    let mut output_error = None;
-    let now = || TimeUs(clock.now().0 - origin.0);
+impl Rig for PlayerRig<'_> {
+    type Reader = SourceReader;
 
-    let end = loop {
+    fn now(&self) -> TimeUs {
+        self.clock.now()
+    }
+
+    fn wait(&mut self) {
         thread::park_timeout(PARK);
-        // A system control, focus loss, suspend or audio failure seen in a
-        // step is handled before the step advances (D13).
-        if let Some(c) = controls.take() {
-            logic.abort(abort_cause(c));
-        } else if threads.input.tripped() {
-            logic.abort(AbortCause::FocusLoss);
-        } else if let Some(e) = threads.audio.failure() {
-            output_error = Some(e);
-            logic.abort(AbortCause::OutputFailed);
-        }
-        let advance = logic.advance_to(now());
-        live.extend_from_slice(logic.events());
-        if let Some(cause) = advance.aborted {
-            threads.audio.send(AudioMsg::Cancel);
-            break PlayEnd::Aborted(cause);
-        }
-        if advance.complete {
-            break PlayEnd::Completed;
-        }
-        if loaded.ends_play(logic.gauges()) {
-            logic.abort(AbortCause::GaugeFailed);
-            threads.audio.send(AudioMsg::Cancel);
-            break PlayEnd::Aborted(AbortCause::GaugeFailed);
-        }
-    };
-
-    // Recording closes at the end of evaluation (D13).
-    let closed = threads.input.close();
-    let incomplete = Incomplete {
-        overflow: logic.overflowed() || closed.overflowed,
-        source_limit: closed.source_limited,
-        suspend: false,
-    };
-    let record = logic.record();
-    let view = logic.view();
-    drop(logic);
-
-    // The audio tail of a completed play: nothing is recorded; a system
-    // control, focus loss, removal of the last device or an audio failure
-    // cuts it short, and the record stays complete.
-    let mut tail_cut = None;
-    while end == PlayEnd::Completed && !threads.audio.silent(once.generation) {
-        tail_cut = if let Some(c) = controls.take() {
-            Some(abort_cause(c))
-        } else if threads.input.tripped() {
-            Some(AbortCause::FocusLoss)
-        } else if !threads.input.connected() {
-            Some(AbortCause::LastSourceRemoved)
-        } else if let Some(e) = threads.audio.failure() {
-            output_error = Some(e);
-            Some(AbortCause::OutputFailed)
-        } else {
-            None
-        };
-        if tail_cut.is_some() {
-            threads.audio.send(AudioMsg::Cancel);
-            break;
-        }
-        thread::sleep(POLL);
     }
 
-    Some(loaded.finish_play(PlayOutcome {
-        start,
-        end,
-        tail_cut,
-        output_error,
-        live,
-        view,
-        record,
-        kinds: opened.kinds,
-        arrivals: closed.arrivals,
-        incomplete,
-    }))
-}
+    fn take(&mut self) -> Option<Command> {
+        let c = self.controls.take();
+        if c == Some(Command::Retry) {
+            self.pending_retry = self.controls.retry_at();
+        }
+        c
+    }
 
-const fn abort_cause(c: Command) -> AbortCause {
-    match c {
-        Command::Retry => AbortCause::Retry,
-        Command::Quit => AbortCause::Quit,
-        Command::Suspend => AbortCause::Suspend,
+    fn quitting(&self) -> bool {
+        #[cfg(feature = "dev-tools")]
+        if let (Some(after), Some(shown)) = (self.quit_after_end, self.end_shown)
+            && shown.elapsed() >= after
+        {
+            return true;
+        }
+        self.controls.quitting()
+    }
+
+    fn prepare_screen(&mut self) -> Result<(), String> {
+        self.retry_from = self.pending_retry.take();
+        self.render.prepare()
+    }
+
+    fn open(&mut self, lead_in: TimeUs) -> Opening<SourceReader> {
+        let o = self.input.open(Request::Open {
+            lead_in,
+            logic: thread::current(),
+            keyboard: self.recorded.0.clone(),
+            controller: self.recorded.1.clone(),
+        });
+        Opening {
+            origin: o.origin,
+            start: o.start,
+            readers: o.readers,
+            kinds: o.kinds,
+        }
+    }
+
+    fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
+        self.countdown_at = Some(TimeUs(origin.0 - self.lead_in.0));
+        self.audio.control.play(origin, sounds);
+        self.render.send(RenderMsg::Play {
+            origin,
+            side: screen,
+            gauge: self.gauge,
+        });
+    }
+
+    fn focus_lost(&self) -> bool {
+        self.input.tripped()
+    }
+
+    fn connected(&self) -> bool {
+        self.input.connected()
+    }
+
+    fn audio_failure(&self) -> Option<OutputError> {
+        self.audio.control.failure()
+    }
+
+    fn screen_failed(&self) -> bool {
+        self.render.failed()
+    }
+
+    fn cancel_audio(&mut self) {
+        self.audio.control.cancel();
+    }
+
+    fn seal_audio(&mut self) {
+        self.audio.control.seal();
+    }
+
+    fn audio_done(&self) -> bool {
+        self.audio.control.done()
+    }
+
+    fn close(&mut self) -> Closing {
+        let c = self.input.close();
+        Closing {
+            arrivals: c.arrivals,
+            overflowed: c.overflowed,
+            source_limited: c.source_limited,
+        }
+    }
+
+    fn ended(&mut self, report: &PlayReport) {
+        // Load times run to the play's first frame: from the process start
+        // (the clock's 0) for the first play, from the retry's receipt for
+        // a retry.
+        if let Some(frame) = self.render.first_frame() {
+            if let Some(c) = self.countdown_at {
+                println!(
+                    "countdown: first frame {} us after it started",
+                    frame.0 - c.0
+                );
+            }
+            match self.retry_from.take() {
+                Some(from) => self.times.retry = Some(since(from, frame)),
+                None if self.times.first.is_none() => {
+                    self.times.first = Some(since(TimeUs(0), frame));
+                }
+                None => {}
+            }
+        }
+        self.print(report);
+    }
+
+    fn show_end(&mut self, report: &PlayReport) {
+        let lines = end_screen::lines(
+            report,
+            &self.preset,
+            self.input_offset_us,
+            self.times,
+            &self.hints,
+        );
+        self.render.send(RenderMsg::Text(lines));
+        #[cfg(feature = "dev-tools")]
+        if self.auto_retries > 0 {
+            self.auto_retries -= 1;
+            self.controls.command(Command::Retry);
+        } else {
+            self.end_shown = Some(std::time::Instant::now());
+        }
     }
 }

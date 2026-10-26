@@ -71,6 +71,7 @@ fn dev_scripted_input_is_unknown_without_feature() {
         &["play", "a.bms", "--dev-scripted-input", "x"],
         "--dev-scripted-input",
     );
+    assert_unknown(&["play", "a.bms", "--dev-frames", "x"], "--dev-frames");
 }
 
 #[test]
@@ -97,4 +98,29 @@ fn dev_tools_probe_runs_with_feature() {
         String::from_utf8_lossy(&out.stdout).trim_end(),
         "tapestry dev-tools enabled"
     );
+}
+
+/// The positive control of the production check: a development build
+/// takes the same forms and fails on the missing files instead.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn dev_options_are_taken_with_the_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("missing.tprl");
+    for extra in [
+        vec!["--dev-scripted-input".as_ref(), log.as_os_str()],
+        vec!["--dev-frames".as_ref(), dir.path().as_os_str()],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+            .arg("play")
+            .arg(dir.path().join("missing.bms"))
+            .args(&extra)
+            .env("LOCALAPPDATA", dir.path())
+            .output()
+            .expect("run tapestry");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(!stderr.contains("unknown argument"), "{stderr}");
+        assert!(stderr.contains("missing."), "{stderr}");
+    }
 }

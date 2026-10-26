@@ -1,13 +1,15 @@
 //! The system's suspend notification (design.md "Handling QPC"): a
 //! suspend aborts the play and marks its record incomplete (D13). The
 //! callback form needs no window, so it works whatever winit does with its
-//! own messages.
+//! own messages. Without it a suspend would go unnoticed and the record
+//! would carry the jumped clock as if nothing happened, so the game refuses
+//! to start when the registration fails.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 
 use game::Command;
-use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, WIN32_ERROR};
 use windows::Win32::System::Power::{
     DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, HPOWERNOTIFY, PowerRegisterSuspendResumeNotification,
     PowerUnregisterSuspendResumeNotification,
@@ -39,8 +41,26 @@ unsafe extern "system" fn on_power(
 
 impl SuspendWatch {
     /// Sends [`Command::Suspend`] to `controls` when the system suspends.
-    /// `None` if the registration is refused; play then goes on without it.
-    pub fn register(controls: Arc<Controls>) -> Option<Self> {
+    ///
+    /// # Errors
+    ///
+    /// The system's refusal.
+    pub fn register(controls: Arc<Controls>) -> Result<Self, String> {
+        Self::register_with(controls, |recipient, handle| {
+            // SAFETY: the recipient points to parameters the watch keeps
+            // until it unregisters.
+            unsafe {
+                PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, recipient, handle)
+            }
+        })
+    }
+
+    /// [`register`](Self::register) through `register`, which a test
+    /// replaces to make it fail.
+    fn register_with(
+        controls: Arc<Controls>,
+        register: impl FnOnce(HANDLE, *mut *mut c_void) -> WIN32_ERROR,
+    ) -> Result<Self, String> {
         let mut context = Box::new((controls, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS::default()));
         let ptr: *const Arc<Controls> = &raw const context.0;
         context.1 = DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
@@ -49,12 +69,15 @@ impl SuspendWatch {
         };
         let mut handle = std::ptr::null_mut();
         let recipient = HANDLE((&raw const context.1).cast_mut().cast());
-        // SAFETY: the parameters and their context live in the box, which
-        // the watch keeps until it unregisters.
-        let status = unsafe {
-            PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, recipient, &mut handle)
-        };
-        (status == ERROR_SUCCESS).then_some(Self {
+        let status = register(recipient, &mut handle);
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "the suspend notification cannot be registered (error {}), so a suspend could \
+                 not end the play",
+                status.0
+            ));
+        }
+        Ok(Self {
             handle,
             _context: context,
         })
@@ -66,5 +89,39 @@ impl Drop for SuspendWatch {
         // SAFETY: the handle came from the registration above.
         let _ =
             unsafe { PowerUnregisterSuspendResumeNotification(HPOWERNOTIFY(self.handle as isize)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use game::Command;
+    use input::QpcClock;
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows::Win32::UI::WindowsAndMessaging::{PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND};
+
+    use super::{SuspendWatch, on_power};
+    use crate::controls::Controls;
+
+    #[test]
+    fn a_refused_registration_is_an_error() {
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        let refused = SuspendWatch::register_with(controls, |_, _| ERROR_ACCESS_DENIED);
+        let e = refused.err().expect("refused");
+        assert!(e.contains("error 5"), "{e}");
+    }
+
+    #[test]
+    fn the_registered_callback_sends_suspend_only() {
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        let watch = SuspendWatch::register(Arc::clone(&controls)).expect("registration");
+        let context = watch._context.1.Context;
+        // SAFETY: the context the registration passes to the callback.
+        unsafe { on_power(context, PBT_APMRESUMEAUTOMATIC, std::ptr::null()) };
+        assert_eq!(controls.take(), None);
+        // SAFETY: as above.
+        unsafe { on_power(context, PBT_APMSUSPEND, std::ptr::null()) };
+        assert_eq!(controls.take(), Some(Command::Suspend));
     }
 }

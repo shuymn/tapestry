@@ -16,7 +16,7 @@ use std::thread::Thread;
 
 use bms_model::TimeUs;
 use eval::{ControlId, InputStart};
-use input::{Arrival, DeviceId, DeviceKind, InputAdapter, ScriptedInput, SourceReader, SourceSet};
+use input::{Arrival, DeviceId, DeviceKind, SourceReader, SourceSet};
 
 use crate::controls::Controls;
 
@@ -129,8 +129,8 @@ pub enum Mode {
     /// the play's origin, so the source set moves them onto the play.
     Clock,
     /// A script on the play's timeline, polled with the play's time.
-    #[cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
-    Script(ScriptedInput),
+    #[cfg(feature = "dev-tools")]
+    Script(input::ScriptedInput),
 }
 
 /// The input thread's end: called at every boundary between batches.
@@ -175,8 +175,9 @@ impl Hook {
     /// One boundary, `now` being the clock read there. A script is first
     /// fed up to the play's time.
     pub fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) {
+        #[cfg(feature = "dev-tools")]
         if let (Mode::Script(script), Some(origin)) = (&mut self.mode, self.origin) {
-            script.poll(TimeUs(now.0 - origin.0), sources);
+            input::InputAdapter::poll(script, TimeUs(now.0 - origin.0), sources);
         }
         while let Ok(request) = self.requests.try_recv() {
             let reply = match request {
@@ -237,11 +238,12 @@ impl Hook {
                 reset_gate(sources, &self.controls);
                 sources.open_play(now, origin)
             }
+            #[cfg(feature = "dev-tools")]
             Mode::Script(script) => {
                 // The script's devices connect, with their recorded
                 // controls, before the opening.
                 let open_at = TimeUs(-lead_in.0);
-                script.poll(TimeUs(open_at.0 - 1), sources);
+                input::InputAdapter::poll(script, TimeUs(open_at.0 - 1), sources);
                 reset_gate(sources, &self.controls);
                 sources.open_recording(open_at)
             }

@@ -1,39 +1,14 @@
-//! The audio thread (D8): the engine steps once per buffer event of its
-//! output for the whole run, playing each play's sounds on the output's
-//! timeline. The game thread starts and stops plays through a channel the
-//! thread polls between steps (an empty poll allocates nothing), and reads
-//! the thread's state from atomics: whether the current play's audio is
-//! silent (the end of its tail, D13) and whether the output failed.
+//! The audio thread (D8): it opens the output on itself (WASAPI objects
+//! stay on the thread that made them), waits for the engine built from the
+//! bank at the output's rate, then runs `game`'s audio loop until the end
+//! of the run.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, OnceLock};
+use std::sync::mpsc::{self, SyncSender};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use audio::{AudioEngine, AudioOutput, OutputError};
-use bms_model::TimeUs;
-use game::{AudioQueue, audio_link};
-
-/// What the game thread tells the audio thread.
-pub enum AudioMsg {
-    /// The engine to run, once, after the bank is loaded at the output's
-    /// rate.
-    Engine(Box<AudioEngine>),
-    /// A play starts: chart time 0 at `origin` on the clock, key sounds
-    /// from `queue`.
-    Play {
-        /// Where chart time 0 lies.
-        origin: TimeUs,
-        /// The play's key sounds.
-        queue: AudioQueue,
-        /// The play's number, echoed in the state.
-        generation: u64,
-    },
-    /// The play was aborted: every sound stops.
-    Cancel,
-    /// The run ends.
-    Exit,
-}
+use audio::{AudioEngine, AudioOutput};
+use game::{AudioControl, AudioWorker, audio_control};
 
 /// The output's sizes, sent once it is open.
 #[derive(Clone, Copy, Debug)]
@@ -44,63 +19,56 @@ pub struct Opened {
     pub period: u32,
 }
 
-#[derive(Debug, Default)]
-struct AudioState {
-    /// `generation << 1 | silent` after the latest step.
-    play: AtomicU64,
-    failure: OnceLock<OutputError>,
+/// The audio thread before its engine arrives.
+pub struct AudioThread {
+    worker: SyncSender<AudioWorker>,
+    handle: JoinHandle<()>,
 }
 
-/// The game thread's end of the audio thread.
+/// The running audio thread and its control.
 pub struct AudioLink {
-    tx: Sender<AudioMsg>,
-    state: Arc<AudioState>,
+    /// The play control.
+    pub control: AudioControl,
     handle: Option<JoinHandle<()>>,
 }
 
+impl AudioThread {
+    /// Hands the engine to the thread, which starts stepping it, stopped
+    /// until the first play.
+    pub fn start(self, engine: AudioEngine) -> AudioLink {
+        let (control, worker) = audio_control(engine);
+        let _ = self.worker.send(worker);
+        AudioLink {
+            control,
+            handle: Some(self.handle),
+        }
+    }
+}
+
 impl AudioLink {
-    /// Sends a message; a thread that already ended ignores it.
-    pub fn send(&self, msg: AudioMsg) {
-        let _ = self.tx.send(msg);
-    }
-
-    /// Whether play `generation`'s audio has stopped: no key sound queued
-    /// or pending, no voice sounding, no BGM event left.
-    pub fn silent(&self, generation: u64) -> bool {
-        self.state.play.load(Ordering::Acquire) == (generation << 1 | 1)
-    }
-
-    /// The output's failure, once it failed.
-    pub fn failure(&self) -> Option<OutputError> {
-        self.state.failure.get().copied()
-    }
-
     /// Ends the thread and waits for it.
     pub fn exit(mut self) {
-        self.send(AudioMsg::Exit);
+        self.control.exit();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 }
 
-/// Starts the audio thread: `open` makes the output on it (WASAPI objects
-/// stay on the thread that made them), then it waits for the engine and
-/// runs. `done` sees the output when the thread ends.
+/// Starts the audio thread: `open` makes the output on it. `done` sees the
+/// output when the thread ends.
 ///
 /// # Errors
 ///
 /// What `open` returned, or a message if the thread could not start.
-pub fn spawn<O, F, D>(open: F, done: D) -> Result<(AudioLink, Opened), String>
+pub fn spawn<O, F, D>(open: F, done: D) -> Result<(AudioThread, Opened), String>
 where
     O: AudioOutput,
     F: FnOnce() -> Result<O, String> + Send + 'static,
     D: FnOnce(&O) + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel();
+    let (worker_tx, worker_rx) = mpsc::sync_channel::<AudioWorker>(1);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let state = Arc::new(AudioState::default());
-    let thread_state = Arc::clone(&state);
     let handle = std::thread::Builder::new()
         .name("audio".into())
         .spawn(move || {
@@ -115,16 +83,17 @@ where
                 rate: out.rate(),
                 period: out.period(),
             }));
-            run(&mut out, &rx, &thread_state);
+            if let Ok(mut worker) = worker_rx.recv() {
+                worker.run(&mut out, Duration::from_millis(10));
+            }
             done(&out);
         })
         .map_err(|e| format!("the audio thread cannot start: {e}"))?;
     match ready_rx.recv() {
         Ok(Ok(opened)) => Ok((
-            AudioLink {
-                tx,
-                state,
-                handle: Some(handle),
+            AudioThread {
+                worker: worker_tx,
+                handle,
             },
             opened,
         )),
@@ -133,52 +102,5 @@ where
             Err(e)
         }
         Err(_) => Err("the audio thread ended while opening the output".to_owned()),
-    }
-}
-
-fn run(out: &mut impl AudioOutput, rx: &Receiver<AudioMsg>, state: &AudioState) {
-    let mut engine = loop {
-        match rx.recv() {
-            Ok(AudioMsg::Engine(e)) => break e,
-            Ok(AudioMsg::Exit) | Err(_) => return,
-            Ok(_) => {}
-        }
-    };
-    // Before the first play: a queue nothing sends to.
-    let mut queue = audio_link(1).1;
-    let mut generation = 0;
-    loop {
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                AudioMsg::Play {
-                    origin,
-                    queue: q,
-                    generation: g,
-                } => {
-                    engine.restart(origin);
-                    queue = q;
-                    generation = g;
-                }
-                AudioMsg::Cancel => {
-                    engine.stop();
-                    while queue.commands().pop().is_ok() {}
-                }
-                AudioMsg::Exit => return,
-                AudioMsg::Engine(_) => {}
-            }
-        }
-        if let Err(e) = engine.step(out, queue.commands()) {
-            let _ = state.failure.set(e);
-            // The output is gone: wait for the end of the run.
-            while !matches!(rx.recv(), Ok(AudioMsg::Exit) | Err(_)) {}
-            return;
-        }
-        let silent = queue.is_empty()
-            && engine.mixer().pending() == 0
-            && engine.mixer().sounding() == 0
-            && engine.bgm_left() == 0;
-        state
-            .play
-            .store(generation << 1 | u64::from(silent), Ordering::Release);
     }
 }

@@ -168,6 +168,7 @@ pub fn open(
 /// read on the window thread, because winit hands out the handle only
 /// there. The window outlives the renderer: [`WindowThread::close`] comes
 /// after the render thread has ended.
+#[derive(Clone, Copy, Debug)]
 pub struct Surface {
     hwnd: NonZeroIsize,
     /// The client size in pixels.

@@ -174,3 +174,37 @@ fn scripted_play_writes_a_record() {
         .count();
     assert_eq!(perfect, NOTES);
 }
+
+/// A key config binding one control to two lanes cannot be evaluated: the
+/// run ends with the reason and a nonzero exit, and nothing is recorded.
+#[test]
+fn an_invalid_key_config_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let charts = dir.path().join("chart");
+    fs::create_dir_all(&charts).unwrap();
+    let chart_path = charts.join("scripted.bms");
+    fs::write(&chart_path, CHART).unwrap();
+    write_click(&charts.join("click.wav"));
+    let chart = bms_parser::load_bms(CHART.as_bytes(), &charts, &Default::default())
+        .unwrap()
+        .chart;
+    let log = dir.path().join("input.tprl");
+    write_log(&chart, &log);
+    let appdata = dir.path().join("appdata");
+    let mut device = DeviceSettings::default();
+    device.keyboard.lanes[2].control = device.keyboard.lanes[1].control;
+    game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("play")
+        .arg(&chart_path)
+        .arg("--dev-scripted-input")
+        .arg(&log)
+        .env("LOCALAPPDATA", &appdata)
+        .output()
+        .expect("run tapestry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("the play cannot start"), "{stderr}");
+    assert!(!appdata.join("tapestry").join("records").exists());
+}

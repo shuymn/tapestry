@@ -24,7 +24,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
 use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank};
 use bms_model::TimeUs;
@@ -33,11 +33,11 @@ use input::{Capture, InputThread, QpcClock, SourceConfig, SourceSet};
 use render::{AdapterChoice, Renderer, Target};
 use replay::{BuildProvenance, ReceiveMethod};
 
-use crate::audio_side::AudioMsg;
 use crate::controls::Controls;
+use crate::end_screen::{Hints, LoadTimes};
 use crate::input_side::Mode;
-use crate::play::{AfterEnd, Threads};
-use crate::render_side::{NoFrames, View};
+use crate::play::PlayerRig;
+use crate::render_side::{MakeScreen, NoFrames, Screen, View};
 
 const USAGE: &str = "usage: tapestry play <chart.bms> | tapestry --version";
 
@@ -49,7 +49,9 @@ const VISIBLE_TIME_US: i64 = 600_000;
 const EFFECTS: usize = 1 << 14;
 
 fn main() -> ExitCode {
-    let started = Instant::now();
+    // The clock reads 0 at the start of the process: load times count from
+    // here.
+    let clock = QpcClock::start();
     let mut args = std::env::args_os().skip(1);
     let Some(arg) = args.next() else {
         eprintln!("{USAGE}");
@@ -100,9 +102,18 @@ fn main() -> ExitCode {
     };
     #[cfg(feature = "dev-tools")]
     if let Some(log) = dev_options.scripted_input.take() {
-        return report(scripted(&chart, &log, dev_options.frames, started));
+        let auto = u32::from(dev_options.auto_retry);
+        return report(scripted(&chart, &log, dev_options.frames, auto, clock));
     }
-    report(play(&chart, started))
+    #[cfg(feature = "dev-tools")]
+    let auto_retry = dev_options.auto_retry;
+    report(play(&chart, clock, |_rig| {
+        #[cfg(feature = "dev-tools")]
+        if auto_retry {
+            _rig.auto_retries = 1;
+            _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+        }
+    }))
 }
 
 fn unknown_argument(arg: &OsString) -> ExitCode {
@@ -185,12 +196,12 @@ fn sources() -> SourceSet {
 }
 
 /// Loads the bank at the output's rate and hands the engine to the audio
-/// thread.
+/// thread, which keeps it silent until the first play.
 fn start_engine(
     loaded: &Loaded,
-    audio: &audio_side::AudioLink,
+    audio: audio_side::AudioThread,
     opened: audio_side::Opened,
-) -> Result<(), String> {
+) -> Result<audio_side::AudioLink, String> {
     let chart = loaded.chart();
     let bank = load_bank(chart, opened.rate, &BankLimits::default())
         .map_err(|e| format!("the sounds cannot be loaded: {e}"))?;
@@ -207,8 +218,7 @@ fn start_engine(
     )
     .map_err(|e| format!("the audio engine cannot start: {e}"))?;
     loaded.settings().device.apply_to(&mut engine);
-    audio.send(AudioMsg::Engine(Box::new(engine)));
-    Ok(())
+    Ok(audio.start(engine))
 }
 
 /// The display offset and the visible time from the settings.
@@ -222,34 +232,118 @@ fn view(loaded: &Loaded) -> View {
     }
 }
 
+/// The game thread's rig around the started threads.
+fn rig<'a>(
+    loaded: &Loaded,
+    input: input_side::InputLink,
+    audio: audio_side::AudioLink,
+    render: render_side::RenderLink,
+    controls: &'a Controls,
+    clock: QpcClock,
+) -> PlayerRig<'a> {
+    let device = &loaded.settings().device;
+    PlayerRig {
+        input,
+        audio,
+        render,
+        controls,
+        clock,
+        recorded: (device.keyboard.recorded(), device.controller.recorded()),
+        gauge: loaded.settings().player.displayed_gauge,
+        input_offset_us: device.input_offset_us,
+        hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
+        preset: loaded.preset().clone(),
+        pending_retry: None,
+        retry_from: None,
+        times: LoadTimes::default(),
+        countdown_at: None,
+        lead_in: loaded.config().lead_in,
+        #[cfg(feature = "dev-tools")]
+        quit_after_end: None,
+        #[cfg(feature = "dev-tools")]
+        end_shown: None,
+        #[cfg(feature = "dev-tools")]
+        auto_retries: 0,
+    }
+}
+
+/// Opens the window, then starts the input thread, and checks that the
+/// keyboards' Raw Input registration targets the input thread.
+///
+/// The order matters: winit registers keyboards to its own window when its
+/// event loop is built, and `listen_device_events(Never)` then removes the
+/// keyboard registration. Registration is per process, so the input
+/// thread must register after both, or it would receive nothing.
+///
+/// # Errors
+///
+/// Why the window or the input thread cannot start, or a registration
+/// that does not target the input thread.
+fn open_window_and_input(
+    controls: &Arc<Controls>,
+    clock: QpcClock,
+    sources: SourceSet,
+    mut hook: input_side::Hook,
+    keys: (Option<u32>, Option<u32>),
+) -> Result<(window::WindowThread, window::Surface, InputThread), String> {
+    let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1)?;
+    let input = InputThread::spawn(clock, sources, Capture::new(), move |s, now| {
+        hook.wake(s, now);
+    });
+    let input = match input {
+        Ok(i) => i,
+        Err(e) => {
+            window_thread.close();
+            return Err(format!("input: {e}"));
+        }
+    };
+    if input::keyboard_target() != Some(input.receiver()) {
+        window_thread.close();
+        return Err("input: keyboards are not registered to the input thread".to_owned());
+    }
+    println!("input: keyboard Raw Input targets the input thread's window");
+    Ok((window_thread, surface, input))
+}
+
 /// The game: Raw Input, WASAPI and a window.
-fn play(chart: &Path, started: Instant) -> Result<(), String> {
+fn play(
+    chart: &Path,
+    clock: QpcClock,
+    tune: impl FnOnce(&mut PlayerRig<'_>),
+) -> Result<(), String> {
     let mut loaded = load(chart, ReceiveMethod::RawInput)?;
-    let clock = QpcClock::start();
-    let controls = Arc::new(Controls::new());
-    let _suspend = power::SuspendWatch::register(Arc::clone(&controls));
+    let controls = Arc::new(Controls::new(clock));
+    let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
     let (audio, opened) = audio_side::spawn(
         move || audio::WasapiShared::open(clock).map_err(|e| format!("audio: {e}")),
         |_| {},
     )?;
-    start_engine(&loaded, &audio, opened)?;
+    let audio = start_engine(&loaded, audio, opened)?;
     let sources = sources();
     controls.set_latch(sources.gate().handle());
-    let (mut hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock);
-    let input_thread = InputThread::spawn(clock, sources, Capture::new(), move |s, now| {
-        hook.wake(s, now);
-    })
-    .map_err(|e| format!("input: {e}"))?;
+    let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock);
     let keys = &loaded.settings().device.keyboard;
-    let (window_thread, window) = window::open(Arc::clone(&controls), keys.retry, keys.quit)?;
-    let (width, height) = (window.width, window.height);
-    let target = Target::Window {
-        window: window.into(),
-        width,
-        height,
-    };
+    let keys = (keys.retry, keys.quit);
+    let (window_thread, surface, input_thread) =
+        match open_window_and_input(&controls, clock, sources, hook, keys) {
+            Ok(opened) => opened,
+            Err(e) => {
+                audio.exit();
+                return Err(e);
+            }
+        };
+    let make: MakeScreen = Box::new(move || {
+        let target = Target::Window {
+            window: surface.into(),
+            width: surface.width,
+            height: surface.height,
+        };
+        Renderer::new(target, AdapterChoice::HighPerformance)
+            .map(|r| Box::new(r) as Box<dyn Screen>)
+            .map_err(|e| e.to_string())
+    });
     let render = render_side::spawn(
-        move || Renderer::new(target, AdapterChoice::HighPerformance).map_err(|e| e.to_string()),
+        make,
         Arc::new(loaded.chart().clone()),
         clock,
         view(&loaded),
@@ -258,27 +352,18 @@ fn play(chart: &Path, started: Instant) -> Result<(), String> {
     let render = match render {
         Ok(r) => r,
         Err(e) => {
+            audio.exit();
             window_thread.close();
             return Err(e);
         }
     };
-    let threads = Threads {
-        input,
-        audio,
-        render,
-    };
-    play::run(
-        &mut loaded,
-        &threads,
-        &controls,
-        clock,
-        started,
-        AfterEnd::Wait,
-    );
-    threads.shut_down();
+    let mut rig = rig(&loaded, input, audio, render, &controls, clock);
+    tune(&mut rig);
+    let ran = game::live::run(&mut loaded, &mut rig).map_err(|e| e.to_string());
+    rig.shut_down();
     window_thread.close();
     drop(input_thread);
-    Ok(())
+    ran
 }
 
 /// A scripted run (dev-tools): the input log as input, a recording of a
@@ -288,12 +373,12 @@ fn scripted(
     chart: &Path,
     log: &Path,
     frames: Option<PathBuf>,
-    started: Instant,
+    auto_retries: u32,
+    clock: QpcClock,
 ) -> Result<(), String> {
     let script = dev::script(log)?;
     let mut loaded = load(chart, ReceiveMethod::Scripted)?;
-    let clock = QpcClock::start();
-    let controls = Arc::new(Controls::new());
+    let controls = Arc::new(Controls::new(clock));
     let last_note = loaded
         .chart()
         .lanes
@@ -306,7 +391,7 @@ fn scripted(
         move || Ok(dev::recording_output(clock, 60)),
         dev::report_audio,
     )?;
-    start_engine(&loaded, &audio, opened)?;
+    let audio = start_engine(&loaded, audio, opened)?;
     let sources = sources();
     controls.set_latch(sources.gate().handle());
     let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Script(script));
@@ -315,36 +400,53 @@ fn scripted(
         Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(last_note.0 / 2))),
         None => Box::new(NoFrames),
     };
-    let render = render_side::spawn(
-        || {
-            Renderer::new(
-                Target::Offscreen {
-                    width: 1280,
-                    height: 720,
-                },
-                AdapterChoice::Warp,
-            )
+    let make: MakeScreen = Box::new(|| {
+        let target = Target::Offscreen {
+            width: 1280,
+            height: 720,
+        };
+        Renderer::new(target, AdapterChoice::Warp)
+            .map(|r| Box::new(r) as Box<dyn Screen>)
             .map_err(|e| e.to_string())
-        },
+    });
+    let render = render_side::spawn(
+        make,
         Arc::new(loaded.chart().clone()),
         clock,
         view(&loaded),
         dump,
     )?;
-    let threads = Threads {
-        input,
-        audio,
-        render,
-    };
-    play::run(
-        &mut loaded,
-        &threads,
-        &controls,
-        clock,
-        started,
-        AfterEnd::QuitAfter(std::time::Duration::from_millis(300)),
-    );
-    threads.shut_down();
+    let mut rig = rig(&loaded, input, audio, render, &controls, clock);
+    rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+    rig.auto_retries = auto_retries;
+    let ran = game::live::run(&mut loaded, &mut rig).map_err(|e| e.to_string());
+    rig.shut_down();
     drop(script_thread);
-    Ok(())
+    ran
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use input::QpcClock;
+
+    use super::{Controls, Mode, input_side, open_window_and_input, sources};
+
+    /// The real startup order leaves the keyboards registered to the input
+    /// thread. Opening the input thread before the window fails it: winit
+    /// takes the registration and then removes it.
+    #[test]
+    #[ignore = "opens a window: needs an interactive desktop"]
+    fn keyboards_stay_registered_to_the_input_thread() {
+        let clock = QpcClock::start();
+        let controls = Arc::new(Controls::new(clock));
+        let (hook, _link) = input_side::link(Arc::clone(&controls), Mode::Clock);
+        let (window, _surface, input) =
+            open_window_and_input(&controls, clock, sources(), hook, (Some(0x0E), Some(0x01)))
+                .expect("startup");
+        assert_eq!(input::keyboard_target(), Some(input.receiver()));
+        drop(input);
+        window.close();
+    }
 }

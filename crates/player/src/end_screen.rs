@@ -9,10 +9,54 @@ use rules::{GaugeValue, RulePreset};
 /// How long loading took, shown on the end screen (D11).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadTimes {
-    /// From the start of the process to the first countdown.
-    pub first: Duration,
-    /// From the latest retry to its countdown.
+    /// From the start of the process to the first play's first frame.
+    pub first: Option<Duration>,
+    /// From the latest retry's receipt to its play's first frame.
     pub retry: Option<Duration>,
+}
+
+/// The names of the keys bound to retry and quit, for the end screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hints {
+    /// The retry key.
+    pub retry: String,
+    /// The quit key.
+    pub quit: String,
+}
+
+impl Hints {
+    /// The names of the keys with these scan codes.
+    pub fn new(retry: Option<u32>, quit: Option<u32>) -> Self {
+        Self {
+            retry: key_name(retry),
+            quit: key_name(quit),
+        }
+    }
+}
+
+/// A keyboard scan code's name in the bitmap font: the keys a system
+/// control is likely bound to by name, any other by its code; an unbound
+/// control is "UNBOUND".
+pub fn key_name(code: Option<u32>) -> String {
+    let Some(code) = code else {
+        return "UNBOUND".to_owned();
+    };
+    let name = match code {
+        0x01 => "ESCAPE",
+        0x0E => "BACKSPACE",
+        0x0F => "TAB",
+        0x1C => "ENTER",
+        0x39 => "SPACE",
+        0x3B..=0x44 => return format!("F{}", code - 0x3A),
+        0x57 => "F11",
+        0x58 => "F12",
+        0xE01C => "NUMPAD ENTER",
+        0xE053 => "DELETE",
+        0xE047 => "HOME",
+        0xE04F => "END",
+        _ => return format!("KEY {code:04X}"),
+    };
+    name.to_owned()
 }
 
 /// `us` as signed milliseconds with one decimal, truncated toward zero.
@@ -32,6 +76,7 @@ fn cause(c: AbortCause) -> &'static str {
         AbortCause::Suspend => "SUSPEND",
         AbortCause::OutputFailed => "AUDIO OUTPUT FAILED",
         AbortCause::GaugeFailed => "GAUGE FAILED",
+        AbortCause::ScreenFailed => "SCREEN FAILED",
     }
 }
 
@@ -42,6 +87,7 @@ pub fn lines(
     preset: &RulePreset,
     input_offset_us: i64,
     times: LoadTimes,
+    hints: &Hints,
 ) -> Vec<String> {
     let mut l = Vec::new();
     l.push(match report.end {
@@ -139,21 +185,30 @@ pub fn lines(
     if let Some(e) = report.output_error {
         l.push(format!("AUDIO: {e}").to_uppercase());
     }
-    let retry = times
-        .retry
-        .map_or_else(|| "-".to_owned(), |d| d.as_millis().to_string());
+    let ms = |d: Option<Duration>| d.map_or_else(|| "-".to_owned(), |d| d.as_millis().to_string());
     l.push(format!(
-        "LOAD {} MS  RETRY {retry} MS",
-        times.first.as_millis()
+        "LOAD {} MS  RETRY {} MS",
+        ms(times.first),
+        ms(times.retry)
     ));
     l.push(String::new());
-    l.push("BACKSPACE: RETRY    ESCAPE: QUIT".to_owned());
+    l.push(format!("{}: RETRY    {}: QUIT", hints.retry, hints.quit));
     l
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ms;
+    use super::{key_name, ms};
+
+    #[test]
+    fn key_names_follow_the_scan_code() {
+        assert_eq!(key_name(Some(0x0E)), "BACKSPACE");
+        assert_eq!(key_name(Some(0x01)), "ESCAPE");
+        assert_eq!(key_name(Some(0x3B)), "F1");
+        assert_eq!(key_name(Some(0x44)), "F10");
+        assert_eq!(key_name(Some(0x2C)), "KEY 002C");
+        assert_eq!(key_name(None), "UNBOUND");
+    }
 
     #[test]
     fn milliseconds_keep_the_sign_and_truncate_tenths() {

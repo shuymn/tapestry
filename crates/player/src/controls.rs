@@ -1,38 +1,48 @@
 //! What the window and the system tell the game thread: system controls,
-//! focus, and closing. Lock-free, so the game thread reads it each step.
+//! focus, and quitting. Lock-free, so the game thread reads it each step.
+//!
+//! Quitting (the quit key or closing the window) is a latch that is never
+//! cleared, so a quit that arrives while the game is between states (during
+//! startup, while a play is prepared) still ends the run. Retry and suspend
+//! are taken once, each by the play it arrives in.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 
+use bms_model::{TimeSource, TimeUs};
 use game::Command;
-use input::FocusLatch;
+use input::{FocusLatch, QpcClock};
 
-/// The shared state between the window (main thread), the power
-/// notification and the game thread.
-#[derive(Debug, Default)]
+const NONE: u8 = 0;
+const RETRY: u8 = 1;
+const SUSPEND: u8 = 2;
+
+/// The shared state between the window thread, the power notification and
+/// the game thread.
+#[derive(Debug)]
 pub struct Controls {
-    /// The pending command: 0 none, else [`code`] of a [`Command`].
+    clock: QpcClock,
     command: AtomicU8,
-    closing: AtomicBool,
+    /// When the latest retry was received, on the clock.
+    retry_at: AtomicI64,
+    quit: AtomicBool,
     focused: AtomicBool,
     latch: OnceLock<FocusLatch>,
 }
 
-const fn code(c: Command) -> u8 {
-    match c {
-        Command::Retry => 1,
-        Command::Quit => 2,
-        Command::Suspend => 3,
-    }
-}
-
 impl Controls {
-    /// Controls with the window focused and nothing pending.
+    /// Controls with the window focused and nothing pending; receipt times
+    /// are read from `clock`.
     #[must_use]
-    pub fn new() -> Self {
-        let c = Self::default();
-        c.focused.store(true, Ordering::Release);
-        c
+    pub fn new(clock: QpcClock) -> Self {
+        Self {
+            clock,
+            command: AtomicU8::new(NONE),
+            retry_at: AtomicI64::new(i64::MIN),
+            quit: AtomicBool::new(false),
+            focused: AtomicBool::new(true),
+            latch: OnceLock::new(),
+        }
     }
 
     /// Hands over the input side's focus latch, once.
@@ -40,41 +50,51 @@ impl Controls {
         let _ = self.latch.set(latch);
     }
 
-    /// A system control or the system's suspend. A suspend is never
-    /// replaced by a later control, so it always aborts the play.
+    /// A system control or the system's suspend. Quit latches; a suspend is
+    /// never replaced by a later retry, so it always aborts the play.
     pub fn command(&self, c: Command) {
-        let new = code(c);
+        let new = match c {
+            Command::Quit => {
+                self.quit.store(true, Ordering::Release);
+                return;
+            }
+            Command::Retry => {
+                self.retry_at.store(self.clock.now().0, Ordering::Release);
+                RETRY
+            }
+            Command::Suspend => SUSPEND,
+        };
         let _ = self
             .command
             .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                (old != code(Command::Suspend)).then_some(new)
+                (old != SUSPEND).then_some(new)
             });
     }
 
-    /// Takes the pending command.
+    /// Takes the pending retry or suspend.
     pub fn take(&self) -> Option<Command> {
-        match self.command.swap(0, Ordering::AcqRel) {
-            1 => Some(Command::Retry),
-            2 => Some(Command::Quit),
-            3 => Some(Command::Suspend),
+        match self.command.swap(NONE, Ordering::AcqRel) {
+            RETRY => Some(Command::Retry),
+            SUSPEND => Some(Command::Suspend),
             _ => None,
         }
     }
 
-    /// Drops a pending command, at the start of a play.
-    pub fn clear(&self) {
-        self.command.store(0, Ordering::Release);
+    /// When the latest retry was received.
+    pub fn retry_at(&self) -> Option<TimeUs> {
+        let t = self.retry_at.load(Ordering::Acquire);
+        (t != i64::MIN).then_some(TimeUs(t))
     }
 
-    /// The window was asked to close: the game quits.
+    /// The window was asked to close, or its event loop ended: the game
+    /// quits.
     pub fn close(&self) {
-        self.closing.store(true, Ordering::Release);
         self.command(Command::Quit);
     }
 
-    /// Whether the window was asked to close.
-    pub fn closing(&self) -> bool {
-        self.closing.load(Ordering::Acquire)
+    /// Whether the player quit or the window is closing.
+    pub fn quitting(&self) -> bool {
+        self.quit.load(Ordering::Acquire)
     }
 
     /// The window gained or lost focus; a loss sets the input side's
@@ -95,22 +115,31 @@ impl Controls {
 #[cfg(test)]
 mod tests {
     use game::Command;
+    use input::QpcClock;
 
     use super::Controls;
 
     #[test]
     fn suspend_is_never_replaced_and_take_empties() {
-        let c = Controls::new();
+        let c = Controls::new(QpcClock::start());
         assert_eq!(c.take(), None);
         c.command(Command::Retry);
-        c.command(Command::Quit);
-        assert_eq!(c.take(), Some(Command::Quit));
+        assert_eq!(c.take(), Some(Command::Retry));
         assert_eq!(c.take(), None);
         c.command(Command::Suspend);
         c.command(Command::Retry);
         assert_eq!(c.take(), Some(Command::Suspend));
+        assert!(c.retry_at().is_some());
+    }
+
+    #[test]
+    fn a_close_stays_latched_through_takes() {
+        let c = Controls::new(QpcClock::start());
+        assert!(!c.quitting());
+        c.close();
         c.command(Command::Retry);
-        c.clear();
+        assert_eq!(c.take(), Some(Command::Retry));
         assert_eq!(c.take(), None);
+        assert!(c.quitting());
     }
 }

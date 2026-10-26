@@ -21,11 +21,10 @@ use audio::{AudioOutput, OutputError, RecordingOutput, SimConfig, SimDevice, Wak
 use bms_model::{TimeSource, TimeUs};
 use game::Wakes;
 use input::{DeviceKind, QpcClock, ScriptedInput, SourceSet};
-use render::Renderer;
 use replay::DecodeLimits;
 
 use crate::input_side::Hook;
-use crate::render_side::FrameSink;
+use crate::render_side::{FrameSink, Screen};
 
 /// Handles a development-only argument, or returns `None` for any other one.
 pub fn handle_arg(arg: &OsStr) -> Option<ExitCode> {
@@ -45,6 +44,9 @@ pub struct Options {
     pub scripted_input: Option<PathBuf>,
     /// Where to write frames.
     pub frames: Option<PathBuf>,
+    /// Retry once at the first end screen and quit at the second, to
+    /// measure the retry time without a key press.
+    pub auto_retry: bool,
 }
 
 impl Options {
@@ -58,6 +60,10 @@ impl Options {
         arg: &OsStr,
         rest: &mut impl Iterator<Item = OsString>,
     ) -> Result<bool, String> {
+        if arg == "--dev-auto-retry" {
+            self.auto_retry = true;
+            return Ok(true);
+        }
         let slot = if arg == "--dev-scripted-input" {
             &mut self.scripted_input
         } else if arg == "--dev-frames" {
@@ -80,9 +86,9 @@ impl Options {
 ///
 /// Why the log cannot be read.
 pub fn script(log: &Path) -> Result<ScriptedInput, String> {
-    let bytes = fs::read(log).map_err(|e| format!("{}: {e}", log.display()))?;
-    let rec = replay::decode(&bytes, &DecodeLimits::default())
-        .map_err(|e| format!("{}: {e}", log.display()))?;
+    let limits = DecodeLimits::default();
+    let bytes = read_bounded(log, limits.max_compressed)?;
+    let rec = replay::decode(&bytes, &limits).map_err(|e| format!("{}: {e}", log.display()))?;
     let kinds: Vec<DeviceKind> = rec
         .devices
         .sources
@@ -93,6 +99,24 @@ pub fn script(log: &Path) -> Result<ScriptedInput, String> {
         })
         .collect();
     Ok(ScriptedInput::from_log(&rec.start, &rec.events, &kinds))
+}
+
+/// Reads `path` if it holds at most `limit` bytes, reading no more than one
+/// byte past the limit: an input log is untrusted (D14).
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let fail = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|f| f.take(limit as u64 + 1).read_to_end(&mut bytes))
+        .map_err(fail)?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "{}: larger than {limit} bytes, the largest input log accepted",
+            path.display()
+        ));
+    }
+    Ok(bytes)
 }
 
 /// The scripted input thread: the input thread's boundary every
@@ -209,11 +233,17 @@ impl FrameDump {
         }
     }
 
-    fn save(&self, renderer: &Renderer, name: &str) {
-        let (w, h) = renderer.size();
+    fn save(&self, screen: &dyn Screen, name: &str) {
         let path = self.dir.join(name);
-        let written = fs::create_dir_all(&self.dir)
-            .and_then(|()| fs::write(&path, png(w, h, &renderer.read_back())));
+        let Some((w, h, pixels)) = screen.read_back() else {
+            eprintln!(
+                "dev: {}: the screen has nothing to read back",
+                path.display()
+            );
+            return;
+        };
+        let written =
+            fs::create_dir_all(&self.dir).and_then(|()| fs::write(&path, png(w, h, &pixels)));
         match written {
             Ok(()) => println!("dev: frame {}", path.display()),
             Err(e) => eprintln!("dev: {}: {e}", path.display()),
@@ -222,19 +252,19 @@ impl FrameDump {
 }
 
 impl FrameSink for FrameDump {
-    fn frame(&mut self, renderer: &Renderer, play: Option<TimeUs>) {
+    fn frame(&mut self, screen: &dyn Screen, play: Option<TimeUs>) {
         match play {
             Some(t) if t.0 < 0 && !self.countdown => {
                 self.countdown = true;
-                self.save(renderer, "countdown.png");
+                self.save(screen, "countdown.png");
             }
             Some(t) if t >= self.play_at && !self.play => {
                 self.play = true;
-                self.save(renderer, "play.png");
+                self.save(screen, "play.png");
             }
             None if !self.end => {
                 self.end = true;
-                self.save(renderer, "end.png");
+                self.save(screen, "end.png");
             }
             _ => {}
         }
@@ -304,7 +334,17 @@ fn crc32(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{adler32, crc32, png};
+    use super::{adler32, crc32, png, read_bounded};
+
+    #[test]
+    fn a_log_over_the_limit_is_refused_after_reading_one_byte_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.tprl");
+        std::fs::write(&path, [7_u8; 11]).unwrap();
+        assert_eq!(read_bounded(&path, 11).unwrap().len(), 11);
+        let e = read_bounded(&path, 10).unwrap_err();
+        assert!(e.contains("larger than 10 bytes"), "{e}");
+    }
 
     #[test]
     fn checksums_match_their_reference_values() {
