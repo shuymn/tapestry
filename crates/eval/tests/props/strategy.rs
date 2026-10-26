@@ -122,6 +122,16 @@ fn jitter(raw: u8) -> i64 {
     }
 }
 
+/// No rank, `#RANK -1` to `#RANK 4` (outside 0-3 counts as absent), or a
+/// `#DEFEXRANK` up to 200 %.
+fn rank(raw: (u8, u32)) -> Option<JudgeRank> {
+    match raw.0 % 3 {
+        0 => None,
+        1 => Some(JudgeRank::Rank(i32::try_from(below(raw.1, 6)).unwrap() - 1)),
+        _ => Some(JudgeRank::DefExRankMilli(below(raw.1, 200_000) + 1)),
+    }
+}
+
 fn build_chart(raw: &RawChart) -> Chart {
     let mut b = ChartBuilder::new(150_000);
     for i in 0..raw.sounds {
@@ -181,13 +191,7 @@ fn build_chart(raw: &RawChart) -> Chart {
             }
         }
     }
-    chart.meta.rank = match raw.rank.0 % 3 {
-        0 => None,
-        1 => Some(JudgeRank::Rank(
-            i32::try_from(below(raw.rank.1, 6)).unwrap() - 1,
-        )),
-        _ => Some(JudgeRank::DefExRankMilli(below(raw.rank.1, 200_000) + 1)),
-    };
+    chart.meta.rank = rank(raw.rank);
     chart.meta.total_milli = raw.total.map(|t| below(t, 400_002) - 1);
     chart.meta.ln_mode = raw.ln.then_some(LnMode::Ln);
     chart.validate().unwrap();
@@ -1190,26 +1194,9 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
         planned.push((l, t, press));
     }
     let mut chart = b.build().unwrap();
-    chart.meta.rank = match raw.rank.0 % 3 {
-        0 => None,
-        1 => Some(JudgeRank::Rank(
-            i32::try_from(below(raw.rank.1, 6)).unwrap() - 1,
-        )),
-        _ => Some(JudgeRank::DefExRankMilli(below(raw.rank.1, 200_000) + 1)),
-    };
+    chart.meta.rank = rank(raw.rank);
     let off = offset(raw.offset);
-    let device = DeviceProfile {
-        sources: vec![SourceProfile {
-            input_offset: TimeUs(off),
-            bindings: (0..LANE_COUNT)
-                .map(|l| Binding {
-                    control: ControlId(u32::try_from(l).unwrap()),
-                    lane: lane(l),
-                })
-                .collect(),
-            axes: Vec::new(),
-        }],
-    };
+    let device = crate::common::device(&[off]);
     let scaled = |p: &RulePreset| {
         *Evaluator::new(&chart, p, &device, &InputStart::default(), 0)
             .unwrap()

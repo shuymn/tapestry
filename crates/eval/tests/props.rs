@@ -10,6 +10,7 @@
 
 // A crate root's modules sit beside it, so the paths name the directory
 // that keeps them out of Cargo's test discovery.
+mod common;
 #[path = "props/live.rs"]
 mod live;
 #[path = "props/strategy.rs"]
