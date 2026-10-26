@@ -25,11 +25,11 @@ use std::fmt;
 
 use ::audio::OutputError;
 use bms_model::TimeUs;
-use eval::InputStart;
+use eval::{InputStart, JudgeEvent};
 use input::{Arrival, DeviceKind};
 use replay::Incomplete;
 
-use crate::logic::{AbortCause, Logic, LogicError, SourceRead};
+use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::render::RenderSide;
 use crate::session::{Command, Loaded, PlayEnd, PlayOutcome, PlayReport, Settings};
 use crate::sound::{AudioQueue, audio_link_at};
@@ -80,6 +80,18 @@ pub trait Rig {
     fn stepped(&mut self, aborted: bool) {
         let _ = aborted;
     }
+    /// What each logic step of a play measured (D11): the step itself
+    /// (its finalization delay), the events it delivered, and `delivered`,
+    /// the play time read once the step had handed them to its sinks, so
+    /// input to judgment covers the step's processing. Called after every
+    /// step, before [`stepped`](Self::stepped).
+    fn measured(&mut self, advance: &Advance, events: &[JudgeEvent], delivered: TimeUs) {
+        let _ = (advance, events, delivered);
+    }
+    /// The play is over (evaluation and the audio tail ended, or it was
+    /// aborted), before it is saved and re-evaluated: what measures the
+    /// play stops here.
+    fn play_over(&mut self) {}
     /// A pending retry or suspend (or quit, for rigs without a latch),
     /// taken.
     fn take(&mut self) -> Option<Command>;
@@ -291,6 +303,8 @@ fn play_and_next<R: Rig>(
         }
         let advance = logic.advance_to(TimeUs(rig.now().0 - origin.0));
         live.extend_from_slice(logic.events());
+        let delivered = TimeUs(rig.now().0 - origin.0);
+        rig.measured(&advance, logic.events(), delivered);
         rig.stepped(advance.aborted.is_some());
         if let Some(cause) = advance.aborted {
             rig.cancel_audio();
@@ -381,6 +395,7 @@ fn play_and_next<R: Rig>(
         }
     }
 
+    rig.play_over();
     let report = loaded.finish_play(PlayOutcome {
         start,
         end,

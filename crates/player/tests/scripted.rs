@@ -53,7 +53,7 @@ fn write_click(path: &Path) {
 /// An input log that hits every note on time from one keyboard with the
 /// default key config: what the scripted run replays.
 fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEvent> {
-    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard]);
+    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
     let events = input::autoplay(chart, &profile.sources[0]).unwrap();
     let rec = PlayRecord {
         versions: Versions {
@@ -129,10 +129,24 @@ fn records(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for chart in fs::read_dir(root.join("tapestry").join("records")).unwrap() {
         for f in fs::read_dir(chart.unwrap().path()).unwrap() {
-            found.push(f.unwrap().path());
+            let path = f.unwrap().path();
+            if path.extension().is_some_and(|e| e == "tprl") {
+                found.push(path);
+            }
         }
     }
     found
+}
+
+/// The `.measure.toml` beside `record`, parsed.
+fn measured(record: &Path) -> toml::Table {
+    let path = record.with_extension("measure.toml");
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    text.parse().unwrap()
+}
+
+fn int(t: &toml::Table, table: &str, key: &str) -> Option<i64> {
+    t.get(table)?.get(key)?.as_integer()
 }
 
 #[test]
@@ -204,6 +218,47 @@ fn scripted_play_writes_a_record() {
         })
         .count();
     assert_eq!(perfect, NOTES);
+
+    // The play's measurement (D11) beside the record: one press → sound
+    // per key sound, input → judgment for the steps that judged presses,
+    // and every judgment's on-screen latency N/A offscreen, where no frame
+    // statistics exist; never a 0.
+    let m = measured(&saved[0]);
+    assert_eq!(
+        int(&m, "press_to_sound_scheduled_us", "count"),
+        Some(NOTES as i64)
+    );
+    // The simulated device: 10 ms periods, two queued.
+    assert_eq!(
+        int(&m, "press_to_sound_scheduled_us", "device_period_us"),
+        Some(10_000)
+    );
+    assert_eq!(
+        int(&m, "press_to_sound_scheduled_us", "queued_periods"),
+        Some(2)
+    );
+    // One input to judgment sample per judged press.
+    assert_eq!(int(&m, "input_to_judgment_us", "count"), Some(NOTES as i64));
+    assert_eq!(int(&m, "press_to_sound_scheduled_us", "dropped"), Some(0));
+    // Offscreen: no swap chain, so no presentation to count refreshes under.
+    assert_eq!(
+        int(&m, "lost_refreshes_frame_statistics", "sync_interval"),
+        None
+    );
+    assert!(int(&m, "finalization_delay_us", "count").unwrap() > 0);
+    assert_eq!(int(&m, "press_to_screen_us", "count"), Some(0));
+    assert_eq!(int(&m, "press_to_screen_us", "p50"), None);
+    assert_eq!(
+        int(&m, "press_to_screen_us", "unavailable"),
+        Some(NOTES as i64)
+    );
+    let refreshes = "lost_refreshes_frame_statistics";
+    assert_eq!(int(&m, refreshes, "lost"), None);
+    assert_eq!(int(&m, refreshes, "intervals"), Some(0));
+    assert!(int(&m, "render_cpu_us", "count").unwrap() > 0);
+    assert!(int(&m, "audio", "underruns").is_some());
+    assert!(int(&m, "load_ms", "first").is_some());
+    assert!(int(&m, "allocations", "render").is_some());
 }
 
 /// A `device.toml` binding one control to two lanes, binding a reserved

@@ -130,6 +130,18 @@ struct Fake {
     /// screen: each waits for the next play.
     offset_changes: Vec<(i64, i64)>,
     pending_offset: Option<i64>,
+    /// Every step's measurement, by play.
+    measured: Vec<Vec<game::Advance>>,
+    /// Each step's judgments with an origin and its delivery time, as
+    /// (seq, origin, delivered), by play.
+    judged_at: Vec<Vec<(u64, i64, i64)>>,
+    /// Each reading of the clock moves it this much further, as real
+    /// processing would.
+    read_cost: i64,
+    reads: std::cell::Cell<i64>,
+    /// The lifecycle order: `play_over`, `ended`, and what the record sink
+    /// adds.
+    order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 impl Fake {
@@ -166,6 +178,11 @@ impl Fake {
             reports: Vec::new(),
             offset_changes: Vec::new(),
             pending_offset: None,
+            measured: Vec::new(),
+            judged_at: Vec::new(),
+            read_cost: 0,
+            reads: std::cell::Cell::new(0),
+            order: std::sync::Arc::default(),
         }
     }
 
@@ -180,10 +197,12 @@ impl Rig for Fake {
     type Reader = SourceReader;
 
     fn now(&self) -> TimeUs {
-        self.clock.now()
+        self.reads.set(self.reads.get() + self.read_cost);
+        TimeUs(self.clock.now().0 + self.reads.get())
     }
 
     fn wait(&mut self) {
+        self.reads.set(0);
         self.clock.advance(TimeUs(MS));
         // A run that never ends fails instead of hanging.
         assert!(
@@ -306,7 +325,33 @@ impl Rig for Fake {
     }
 
     fn ended(&mut self, report: &PlayReport) {
+        self.order.lock().unwrap().push("ended");
         self.reports.push(report.clone());
+    }
+
+    fn play_over(&mut self) {
+        self.order.lock().unwrap().push("play over");
+    }
+
+    fn measured(
+        &mut self,
+        advance: &game::Advance,
+        events: &[eval::JudgeEvent],
+        delivered: TimeUs,
+    ) {
+        if self.measured.len() < self.origins.len() {
+            self.measured.push(Vec::new());
+            self.judged_at.push(Vec::new());
+        }
+        self.measured.last_mut().unwrap().push(*advance);
+        for e in events {
+            if let (JudgeEventKind::Judged { .. }, Some(o)) = (e.kind, e.origin) {
+                self.judged_at
+                    .last_mut()
+                    .unwrap()
+                    .push((e.seq, o.0, delivered.0));
+            }
+        }
     }
 
     fn show_end(&mut self, _report: &PlayReport) {
@@ -774,4 +819,154 @@ fn input_offset_change_applies_next_play_only() {
     );
     // The change made during play 2 is still waiting.
     assert_eq!(rig.pending_offset, Some(21_000));
+}
+
+/// Every logic step of a play reaches the rig's measurement (D11): each
+/// step that advanced has a finalization delay, and input to judgment
+/// appears exactly in the steps that judged a press, never in the others.
+/// The aborted first play's steps end at its abort.
+#[test]
+fn every_step_is_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![
+        key(9_303_000, Z, 1),
+        key(9_353_000, Z, 0),
+        key(11_503_000, Z, 1),
+        key(11_553_000, Z, 0),
+        key(12_003_000, Z, 1),
+        key(12_053_000, Z, 0),
+    ];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.measured.len(), 2);
+    for (play, steps) in rig.measured.iter().enumerate() {
+        assert!(!steps.is_empty());
+        let advanced = steps.iter().filter(|a| a.watermark.is_some()).count();
+        let delays = steps
+            .iter()
+            .filter_map(|a| a.finalization_delay)
+            .collect::<Vec<_>>();
+        assert_eq!(delays.len(), advanced);
+        assert!(delays.iter().all(|d| d.0 >= 0));
+        // Play 1 judged one press before the retry, play 2 two presses.
+        let judging = steps
+            .iter()
+            .filter(|a| a.judgment_latency.is_some())
+            .count();
+        assert_eq!(judging, [1, 2][play], "play {}", play + 1);
+        // Received at a 1 ms boundary and judged within the next steps.
+        for a in steps.iter().filter_map(|a| a.judgment_latency) {
+            assert!((0..=3 * MS).contains(&a.0), "{a:?}");
+        }
+    }
+    // The aborted play's last step is its abort.
+    assert!(rig.measured[0].last().unwrap().aborted.is_some());
+}
+
+/// The chart of `loaded` with a second note on lane 3 at the time of the
+/// first, so one step can judge two presses.
+fn chord_loaded(dir: &Path) -> Loaded {
+    let root = DataRoot::new(dir.to_owned());
+    let settings = Settings::load(&root).unwrap();
+    let chart_path = dir.join("chord.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    let chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let parts = Parts {
+        ingest: Box::new(Built(chart)),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let config = SessionConfig {
+        lead_in: TimeUs(1_000 * MS),
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 11,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: BuildProvenance::Development,
+        receive: ReceiveMethod::Scripted,
+    };
+    Loaded::load(root, settings, &chart_path, config, parts).unwrap()
+}
+
+/// Input to judgment is one sample per judgment, timed when the step has
+/// delivered it: two presses 300 µs apart judged in one step give two
+/// samples 300 µs apart, and each reading of the clock costing 70 µs puts
+/// the delivery 140 µs past the step's whole-millisecond clock (two
+/// readings), not 70 µs (the reading the step started with).
+#[test]
+fn input_to_judgment_is_timed_per_judgment_at_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = chord_loaded(dir.path());
+    let items = vec![
+        key(9_303_000, Z, 1),
+        key(9_303_300, X, 1),
+        key(9_353_000, Z, 0),
+        key(9_353_000, X, 0),
+    ];
+    let mut rig = Fake::new(items, &[], 10_500_000);
+    rig.read_cost = 70;
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    let origin = rig.origins[0].0;
+    let judged = &rig.judged_at[0];
+    assert_eq!(judged.len(), 2, "{judged:?}");
+    let (a, b) = (judged[0], judged[1]);
+    assert_eq!(a.2, b.2, "one step");
+    let mut origins = [a.1, b.1];
+    origins.sort_unstable();
+    assert_eq!(origins, [1_003_000, 1_003_300]);
+    assert_eq!((a.2 + origin - 140) % MS, 0, "delivered at {}", a.2);
+}
+
+/// A record sink that notes when it saved, in the lifecycle order.
+struct NotingSink(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+impl game::RecordSink for NotingSink {
+    fn save(&mut self, _rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        self.0.lock().unwrap().push("saved");
+        Ok(game::RecordRef {
+            path: "noted.tprl".into(),
+        })
+    }
+}
+
+/// The play is over, and its measurement stops, before it is saved, however
+/// long saving takes: each play goes play over, saved, ended.
+#[test]
+fn the_play_is_over_before_it_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    let settings = Settings::load(&root).unwrap();
+    let chart_path = dir.path().join("play.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    let order = std::sync::Arc::default();
+    let parts = Parts {
+        ingest: Box::new(Built(chart())),
+        records: Box::new(NotingSink(std::sync::Arc::clone(&order))),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let config = SessionConfig {
+        lead_in: TimeUs(1_000 * MS),
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 11,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: BuildProvenance::Development,
+        receive: ReceiveMethod::Scripted,
+    };
+    let mut loaded = Loaded::load(root, settings, &chart_path, config, parts).unwrap();
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
+    rig.order = std::sync::Arc::clone(&order);
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    let order = order.lock().unwrap().clone();
+    assert_eq!(
+        order,
+        ["play over", "saved", "ended", "play over", "saved", "ended"]
+    );
 }

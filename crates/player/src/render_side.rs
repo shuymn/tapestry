@@ -18,8 +18,10 @@ use bms_model::{Chart, TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::RenderSide;
 use input::QpcClock;
-use render::{FrameInput, Renderer};
+use render::measure::{FrameStatistics, Presentation};
+use render::{FrameInput, FrameTiming, Renderer};
 
+use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::tuning::LiveTuning;
 
 /// What draws: the renderer, or a double in tests.
@@ -35,13 +37,23 @@ pub trait Screen: Send {
     fn wait(&self) -> bool;
     /// Whether [`wait`](Self::wait) paces frames.
     fn paced(&self) -> bool;
-    /// Draws one play frame; `Ok(false)` when it was not presented (the
-    /// swap chain image timed out or the window is occluded).
+    /// Draws one play frame; [`FrameTiming::presented`] is `false` when it
+    /// was not presented (the swap chain image timed out or the window is
+    /// occluded).
     ///
     /// # Errors
     ///
     /// Why the frame failed: the screen must be built again.
-    fn frame(&mut self, f: &FrameInput<'_>) -> Result<bool, String>;
+    fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, String>;
+    /// The swap chain's latest frame statistics, raw; `None` without a
+    /// swap chain or when the call failed.
+    fn statistics(&self) -> Option<FrameStatistics> {
+        None
+    }
+    /// How the swap chain presents; `None` without one.
+    fn presentation(&self) -> Option<Presentation> {
+        None
+    }
     /// Draws lines of text, as [`frame`](Self::frame).
     ///
     /// # Errors
@@ -66,10 +78,16 @@ impl Screen for Renderer {
         self.has_frame_waitable()
     }
 
-    fn frame(&mut self, f: &FrameInput<'_>) -> Result<bool, String> {
-        Self::frame(self, f)
-            .map(|t| t.presented)
-            .map_err(|e| e.to_string())
+    fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, String> {
+        Self::frame(self, f).map_err(|e| e.to_string())
+    }
+
+    fn statistics(&self) -> Option<FrameStatistics> {
+        self.frame_statistics()
+    }
+
+    fn presentation(&self) -> Option<Presentation> {
+        Self::presentation(self)
     }
 
     fn text(&mut self, lines: &[&str]) -> Result<bool, String> {
@@ -94,14 +112,23 @@ pub enum RenderMsg {
     /// Ready the screen for a play (build it again if it failed) and
     /// answer when ready.
     Prepare(mpsc::SyncSender<Result<(), String>>),
-    /// A play starts: chart time 0 at `origin` on the clock.
+    /// A play starts: chart time 0 at the measurement's `origin` on the
+    /// clock.
     Play {
-        /// Where chart time 0 lies.
-        origin: TimeUs,
         /// The logic step's effects and play view.
         side: RenderSide,
         /// The gauge to show.
         gauge: usize,
+        /// What its measurement needs.
+        measure: Box<PlayMeasure>,
+    },
+    /// The play ended at `end` on the clock: answer with its measured
+    /// figures, and count nothing more until the next play.
+    Finish {
+        /// When it ended.
+        end: TimeUs,
+        /// Where the figures go.
+        reply: mpsc::SyncSender<Option<Figures>>,
     },
     /// Draw these lines instead of a play.
     Text(Vec<String>),
@@ -119,19 +146,28 @@ pub struct View {
     pub effects: usize,
 }
 
-/// Something that looks at frames as they are drawn: the dev-tools frame
-/// dump. `play` is the chart time of a play frame, `None` for the end
-/// screen.
+/// How long the game thread waits for a play's figures.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Something that looks at frames as they are drawn: the measurement
+/// (D11) and the dev-tools frame dump. Called after every frame, presented
+/// or not.
 pub trait FrameSink: Send {
     /// Called after each frame.
-    fn frame(&mut self, screen: &dyn Screen, play: Option<TimeUs>);
+    fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>);
+}
+
+impl FrameSink for Measure {
+    fn frame(&mut self, _screen: &dyn Screen, drawn: &Drawn<'_>) {
+        Self::frame(self, drawn);
+    }
 }
 
 /// No frame sink.
 pub struct NoFrames;
 
 impl FrameSink for NoFrames {
-    fn frame(&mut self, _screen: &dyn Screen, _play: Option<TimeUs>) {}
+    fn frame(&mut self, _screen: &dyn Screen, _drawn: &Drawn<'_>) {}
 }
 
 #[derive(Debug)]
@@ -171,6 +207,14 @@ impl RenderLink {
         self.shared.failed.load(Ordering::Acquire)
     }
 
+    /// The figures of the play that ended at `end`; `None` when the render
+    /// thread did not answer or had no play to measure.
+    pub fn finish(&self, end: TimeUs) -> Option<Figures> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::Finish { end, reply });
+        rx.recv_timeout(FINISH_TIMEOUT).ok().flatten()
+    }
+
     /// When the current play's first frame was drawn.
     pub fn first_frame(&self) -> Option<TimeUs> {
         let t = self.shared.first_frame.load(Ordering::Acquire);
@@ -196,6 +240,7 @@ pub fn spawn(
     chart: Arc<Chart>,
     clock: QpcClock,
     view: View,
+    measure: Measure,
     frames: Box<dyn FrameSink>,
 ) -> Result<RenderLink, String> {
     let (tx, rx) = mpsc::channel();
@@ -208,6 +253,8 @@ pub fn spawn(
     let handle = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
+            #[cfg(feature = "dev-tools")]
+            crate::alloc_count::tag(crate::alloc_count::Tag::Render);
             let screen = build(&mut make, &chart);
             let ready = screen.as_ref().map(|_| ()).map_err(Clone::clone);
             let _ = ready_tx.send(ready);
@@ -218,6 +265,7 @@ pub fn spawn(
                     chart,
                     clock,
                     view,
+                    measure,
                     frames,
                     shared: thread_shared,
                 };
@@ -258,6 +306,7 @@ struct Run {
     chart: Arc<Chart>,
     clock: QpcClock,
     view: View,
+    measure: Measure,
     frames: Box<dyn FrameSink>,
     shared: Arc<Shared>,
 }
@@ -281,10 +330,12 @@ impl Run {
                     continue;
                 }
                 Ok(RenderMsg::Play {
-                    origin,
                     side,
                     gauge,
+                    measure,
                 }) => {
+                    let origin = measure.origin;
+                    self.measure.start(*measure);
                     self.shared.first_frame.store(i64::MIN, Ordering::Release);
                     mode = Mode::Play {
                         origin,
@@ -297,6 +348,9 @@ impl Run {
                 // and nothing is drawn: the game builds the screen again
                 // through a preparation, which can fail.
                 Ok(RenderMsg::Text(lines)) => mode = Mode::Text(lines),
+                Ok(RenderMsg::Finish { end, reply }) => {
+                    let _ = reply.send(self.measure.finish(end));
+                }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
@@ -328,6 +382,8 @@ impl Run {
                     // format version bump (design.md "Operations unrelated to
                     // judgment go in a separate stream").
                     let t = self.view.tuning.get();
+                    let overlay = self.measure.overlay();
+                    let shown = overlay.iter().take_while(|l| !l.is_empty()).count();
                     let f = FrameInput {
                         now,
                         display_offset: TimeUs(t.display_offset_us),
@@ -335,10 +391,11 @@ impl Run {
                         view: side.view(),
                         effects: &effects,
                         gauge: *gauge,
+                        overlay: &overlay[..shown],
                     };
-                    let drawn = screen.frame(&f).map(|presented| (presented, Some(now)));
+                    let drawn = screen.frame(&f).map(|timing| (timing, Some(now)));
                     // The first frame that reached the screen.
-                    if matches!(drawn, Ok((true, _))) && *first {
+                    if matches!(&drawn, Ok((t, _)) if t.presented) && *first {
                         *first = false;
                         self.shared
                             .first_frame
@@ -348,13 +405,36 @@ impl Run {
                 }
                 Mode::Text(lines) => {
                     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-                    screen.text(&refs).map(|presented| (presented, None))
+                    screen.text(&refs).map(|presented| {
+                        let timing = FrameTiming {
+                            cpu: Duration::ZERO,
+                            sprites: 0,
+                            dropped: 0,
+                            presented,
+                            present_count: None,
+                        };
+                        (timing, None)
+                    })
                 }
             };
             match drawn {
-                Ok((true, play)) => self.frames.frame(screen.as_ref(), play),
-                Ok((false, _)) => {}
+                Ok((timing, play)) => {
+                    let d = Drawn {
+                        play,
+                        timing,
+                        statistics: screen.statistics(),
+                        presentation: screen.presentation(),
+                        effects: if play.is_some() { &effects } else { &[] },
+                        at: self.clock.now(),
+                    };
+                    FrameSink::frame(&mut self.measure, screen.as_ref(), &d);
+                    self.frames.frame(screen.as_ref(), &d);
+                }
                 Err(e) => {
+                    // What this frame drew never reached the screen.
+                    if matches!(mode, Mode::Play { .. }) {
+                        self.measure.failed(&effects);
+                    }
                     eprintln!("render: {e}");
                     self.screen = None;
                     self.shared.failed.store(true, Ordering::Release);
@@ -389,9 +469,38 @@ mod tests {
     use eval::{DeviceProfile, InputStart};
     use game::{Logic, LogicConfig};
     use input::{QpcClock, SourceReader};
-    use render::FrameInput;
+    use render::{FrameInput, FrameTiming};
 
     use super::{MakeScreen, NoFrames, RenderMsg, Screen, View, spawn};
+    use crate::measure::{Measure, PlayMeasure};
+
+    fn timing(presented: bool) -> FrameTiming {
+        FrameTiming {
+            cpu: Duration::from_micros(50),
+            sprites: 0,
+            dropped: 0,
+            presented,
+            present_count: None,
+        }
+    }
+
+    /// A measurement whose queues nothing feeds.
+    fn measure(clock: QpcClock) -> Measure {
+        let (_steps, steps) = rtrb::RingBuffer::new(1);
+        let (_sounds, sounds) = rtrb::RingBuffer::new(1);
+        let overlay = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Measure::new(clock, None, None, steps, sounds, overlay)
+    }
+
+    fn play_measure(origin: TimeUs) -> Box<PlayMeasure> {
+        Box::new(PlayMeasure {
+            generation: 1,
+            origin,
+            load_from: TimeUs(0),
+            retry: false,
+            audio: None,
+        })
+    }
 
     /// A screen whose third text frame fails, and whose play frames are
     /// presented only from the fourth on, when it notes the clock.
@@ -412,7 +521,7 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<bool, String> {
+        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, String> {
             self.play_frames += 1;
             let presented = self.play_frames >= 4;
             if presented {
@@ -423,7 +532,7 @@ mod tests {
                     Ordering::Acquire,
                 );
             }
-            Ok(presented)
+            Ok(timing(presented))
         }
         fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
             self.text_frames += 1;
@@ -493,7 +602,15 @@ mod tests {
         let clock = QpcClock::start();
         let presented = Arc::new(AtomicI64::new(i64::MIN));
         let (builds, make) = factory(2, clock, &presented);
-        let link = spawn(make, chart, clock, view(), Box::new(NoFrames)).unwrap();
+        let link = spawn(
+            make,
+            chart,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
         assert!(!link.failed());
         link.send(RenderMsg::Text(vec!["A".to_owned()]));
         assert!(wait_until(|| link.failed()), "the failure was not reported");
@@ -542,13 +659,15 @@ mod tests {
             Arc::new(chart.clone()),
             clock,
             view(),
+            measure(clock),
             Box::new(NoFrames),
         )
         .unwrap();
+        let origin = clock.now();
         link.send(RenderMsg::Play {
-            origin: clock.now(),
             side,
             gauge: 0,
+            measure: play_measure(origin),
         });
         assert!(wait_until(|| link.first_frame().is_some()));
         let first = link.first_frame().unwrap().0;
@@ -572,12 +691,12 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, f: &FrameInput<'_>) -> Result<bool, String> {
+        fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, String> {
             self.0
                 .lock()
                 .unwrap()
                 .push((f.visible_time, f.display_offset));
-            Ok(true)
+            Ok(timing(true))
         }
         fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
             Ok(true)
@@ -614,6 +733,7 @@ mod tests {
             Arc::new(chart.clone()),
             clock,
             view,
+            measure(clock),
             Box::new(NoFrames),
         )
         .unwrap();
@@ -631,10 +751,11 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
+        let origin = clock.now();
         link.send(RenderMsg::Play {
-            origin: clock.now(),
             side,
             gauge: 0,
+            measure: play_measure(origin),
         });
         let start = (TimeUs(600_000), TimeUs(0));
         let faster = (TimeUs(575_000), TimeUs(0));
@@ -649,5 +770,100 @@ mod tests {
         let mut frames = seen.lock().unwrap().clone();
         frames.dedup();
         assert_eq!(frames, [start, faster, later]);
+    }
+
+    /// A screen whose every play frame fails, as a lost surface does.
+    struct Lost;
+
+    impl Screen for Lost {
+        fn load(&mut self, _chart: &Chart) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, String> {
+            Err("surface lost".to_owned())
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A judgment drawn on a play frame that fails never reaches the screen
+    /// through it: the render thread counts it N/A in the play's figures.
+    #[test]
+    fn a_failed_play_frame_makes_its_judgments_na() {
+        use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
+        use game::DeviceSettings;
+        use input::DeviceKind;
+
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let rule = rules::custom();
+        let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
+        let (mut writer, reader) = input::source_queue(16);
+        // Z, lane 1's default key, pressed on the note.
+        let press = PhysicalInputEvent {
+            received: TimeUs(1_000_000),
+            source: SourceId(0),
+            kind: InputKind::Control {
+                control: ControlId(0x2c),
+                value: 1,
+            },
+        };
+        writer.push(press).unwrap();
+        writer.publish(TimeUs(1_000_001));
+        let (mut logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            vec![reader],
+            LogicConfig {
+                inputs: 16,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        logic.advance_to(TimeUs(1_000_002));
+        assert!(
+            logic
+                .events()
+                .iter()
+                .any(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
+        );
+        let clock = QpcClock::start();
+        let make: MakeScreen = Box::new(|| Ok(Box::new(Lost) as Box<dyn Screen>));
+        let link = spawn(
+            make,
+            Arc::new(chart.clone()),
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let origin = clock.now();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(origin),
+        });
+        assert!(wait_until(|| link.failed()));
+        let fig = link.finish(clock.now()).expect("the play's figures");
+        assert_eq!(fig.press_to_screen_unavailable, 1);
+        assert_eq!(fig.press_to_screen, None);
+        link.exit();
     }
 }

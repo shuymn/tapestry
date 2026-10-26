@@ -146,7 +146,7 @@ TOML (design.md:849) in two files, as design.md:646 requires: `device.toml` (key
 
 **Origin of every figure.** Each `PhysicalInputEvent` carries its raw receive time. The evaluator copies it, unchanged and not offset-adjusted, into the events an input produces (`JudgeEvent::origin: Option<TimeUs>`; `None` for deadline events). Sound commands and render effects carry it on. This is data passed through; the evaluator still reads no clock. `origin` is used only for subtraction, never as an identifier: every event of one batch shares it, so the two judgments of a chord have the same origin. Events are identified by `JudgeEvent::seq`.
 
-An overlay toggled by a key shows p50, p99 and max over the current play. Values sit in preallocated sample rings, so nothing allocates. The same figures are written next to each saved log as `<record>.measure.toml`, numbers only.
+An overlay toggled by a key shows p50, p99 and max over the current play. Values sit in preallocated whole-play histograms (exact below 64 µs, then 32 buckets per power of two, so a percentile is within 1/64 of the exact one; count and max exact), so nothing allocates. The same figures are written next to each saved log as `<record>.measure.toml`, numbers only.
 
 | Figure | How | Notes |
 | --- | --- | --- |

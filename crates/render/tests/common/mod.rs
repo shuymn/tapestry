@@ -82,6 +82,7 @@ pub fn input<'a>(
         view,
         effects,
         gauge: 0,
+        overlay: &[],
     }
 }
 

@@ -6,7 +6,8 @@
 //! audio engine plays into a recording of a simulated device paced by the
 //! clock, and the renderer draws offscreen on WARP. `--dev-frames <dir>`
 //! also writes a countdown frame, a play frame and the end screen there as
-//! PNG files.
+//! PNG files. `--dev-overlay` shows the measurement overlay from the
+//! start.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -24,7 +25,63 @@ use input::{DeviceKind, QpcClock, ScriptedInput, SourceSet};
 use replay::DecodeLimits;
 
 use crate::input_side::Hook;
+use crate::measure::Drawn;
 use crate::render_side::{FrameSink, Screen};
+
+/// Prints, to the console only, which window took the foreground when the
+/// game's window lost focus: its process's executable name and its window
+/// class, with the time on the game's clock (µs since start). A focus loss
+/// aborts the play (D13), so this tells what did it.
+pub fn print_foreground(now: TimeUs) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    use windows::core::PWSTR;
+
+    // SAFETY: plain queries of the foreground window and its process; the
+    // buffers outlive the calls and the process handle is closed.
+    let (class, process) = unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut class = [0_u16; 256];
+        let n = usize::try_from(GetClassNameW(hwnd, &mut class)).unwrap_or(0);
+        let class = String::from_utf16_lossy(&class[..n]);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .ok()
+            .and_then(|h| {
+                let mut buf = [0_u16; 1024];
+                let mut len = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(
+                    h,
+                    PROCESS_NAME_WIN32,
+                    PWSTR(buf.as_mut_ptr()),
+                    &raw mut len,
+                )
+                .is_ok();
+                let _ = CloseHandle(h);
+                ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
+            });
+        (class, process)
+    };
+    // The executable's name only: its path may hold the user's name.
+    let name = process
+        .as_deref()
+        .and_then(|p| Path::new(p).file_name())
+        .map_or_else(
+            || "unknown".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+    println!(
+        "dev: focus lost at {} us to {name} (window class {class})",
+        now.0
+    );
+}
 
 /// Handles a development-only argument, or returns `None` for any other one.
 pub fn handle_arg(arg: &OsStr) -> Option<ExitCode> {
@@ -54,6 +111,8 @@ pub struct Options {
     pub adjust_on_end: Vec<game::Adjust>,
     /// The chart time, ms, at which `adjust_in_play` is pressed.
     pub adjust_at_ms: i64,
+    /// Show the measurement overlay from the start, without its key.
+    pub overlay: bool,
 }
 
 impl Options {
@@ -69,6 +128,10 @@ impl Options {
     ) -> Result<bool, String> {
         if arg == "--dev-auto-retry" {
             self.auto_retry = true;
+            return Ok(true);
+        }
+        if arg == "--dev-overlay" {
+            self.overlay = true;
             return Ok(true);
         }
         if arg == "--dev-adjust-at" {
@@ -287,6 +350,7 @@ impl ScriptThread {
         let handle = std::thread::Builder::new()
             .name("scripted input".into())
             .spawn(move || {
+                crate::alloc_count::tag(crate::alloc_count::Tag::Input);
                 while !thread_stop.load(Ordering::Acquire) {
                     hook.wake(&mut sources, clock.now());
                     std::thread::sleep(Duration::from_millis(1));
@@ -317,6 +381,13 @@ pub fn recording_output(clock: QpcClock, seconds: usize) -> Paced<RecordingOutpu
     Paced {
         inner: RecordingOutput::new(device, 48_000 * seconds),
         clock,
+    }
+}
+
+impl Paced<RecordingOutput<SimDevice>> {
+    /// Periods the simulated device keeps queued.
+    pub fn queued_periods(&self) -> u32 {
+        self.inner.inner().config().queue_periods
     }
 }
 
@@ -394,8 +465,11 @@ impl FrameDump {
 }
 
 impl FrameSink for FrameDump {
-    fn frame(&mut self, screen: &dyn Screen, play: Option<TimeUs>) {
-        match play {
+    fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
+        if !drawn.timing.presented {
+            return;
+        }
+        match drawn.play {
             Some(t) if t.0 < 0 && !self.countdown => {
                 self.countdown = true;
                 self.save(screen, "countdown.png");

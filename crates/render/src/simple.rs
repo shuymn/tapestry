@@ -493,6 +493,23 @@ impl PlaySkin for SimpleSkin {
         // notes only.
         self.hud(f, out, f.now);
         self.effects(out, f.now);
+        overlay(f.overlay, out);
+    }
+}
+
+/// Left edge and top of the measurement overlay's first line, its glyph
+/// scale and the distance between its lines, in layout pixels: right of
+/// the lanes, glyphs 15×21, up to 50 characters a line.
+const OVERLAY_LEFT: f32 = 1000.0;
+const OVERLAY_TOP: f32 = 80.0;
+const OVERLAY_SCALE: f32 = 3.0;
+const OVERLAY_LINE: f32 = 28.0;
+
+/// The measurement overlay (D11): lines of text right of the lanes.
+fn overlay(lines: &[&str], out: &mut SpriteBatch) {
+    for (i, line) in lines.iter().enumerate() {
+        let y = OVERLAY_TOP + i as f32 * OVERLAY_LINE;
+        text(out, OVERLAY_LEFT, y, OVERLAY_SCALE, TEXT, line.as_bytes());
     }
 }
 
@@ -679,6 +696,7 @@ mod tests {
             view,
             effects,
             gauge: 0,
+            overlay: &[],
         }
     }
 
@@ -961,6 +979,33 @@ mod tests {
         let ys: Vec<f32> = batch.alpha().iter().map(|s| s.rect[1]).collect();
         assert_eq!(ys.len(), 25);
         assert_eq!(ys[24], 1040.0);
+    }
+
+    #[test]
+    fn overlay_lines_draw_right_of_the_lanes() {
+        let chart = ChartBuilder::new(120_000).build().unwrap();
+        let mut s = skin(&chart);
+        let v = view();
+        let plain = build(&mut s, &frame(&v, 0, &[]));
+        let lines = ["P5", "9"];
+        let f = FrameInput {
+            overlay: &lines,
+            ..frame(&v, 0, &[])
+        };
+        let batch = build(&mut s, &f);
+        let added: Vec<_> = batch.alpha()[plain.alpha().len()..]
+            .iter()
+            .map(|s| (s.rect, s.uv))
+            .collect();
+        // 3 px per texel: glyphs 15 × 21, advancing 18; lines 28 apart.
+        assert_eq!(
+            added,
+            [
+                ([1000.0, 80.0, 15.0, 21.0], glyph_uv(b'P')),
+                ([1018.0, 80.0, 15.0, 21.0], glyph_uv(b'5')),
+                ([1000.0, 108.0, 15.0, 21.0], glyph_uv(b'9')),
+            ]
+        );
     }
 
     #[test]

@@ -211,6 +211,7 @@ pub fn settings_lines(t: Tuning) -> Vec<String> {
             "F7/F8 INPUT OFFSET {} MS FROM THE NEXT PLAY",
             ms(t.input_offset_us)
         ),
+        "F9 MEASUREMENT OVERLAY IN PLAY".to_owned(),
     ]
 }
 
@@ -243,6 +244,7 @@ mod tests {
                 "F1/F2 HI-SPEED: VISIBLE TIME 575 MS",
                 "F3/F4 VOLUME 35%    F5/F6 DISPLAY OFFSET -2.0 MS",
                 "F7/F8 INPUT OFFSET +4.0 MS FROM THE NEXT PLAY",
+                "F9 MEASUREMENT OVERLAY IN PLAY",
             ]
         );
     }

@@ -9,6 +9,8 @@
 #[cfg(not(windows))]
 compile_error!("player is Windows-only");
 
+#[cfg(feature = "dev-tools")]
+mod alloc_count;
 mod audio_side;
 mod controls;
 #[cfg(feature = "dev-tools")]
@@ -16,8 +18,11 @@ mod dev;
 mod end_screen;
 mod input_side;
 mod keys;
+mod measure;
 mod play;
 mod power;
+#[cfg(feature = "dev-tools")]
+mod presentmon;
 mod render_side;
 mod tuning;
 mod window;
@@ -40,6 +45,7 @@ use replay::{BuildProvenance, ReceiveMethod};
 use crate::controls::Controls;
 use crate::end_screen::{Hints, LoadTimes};
 use crate::input_side::Mode;
+use crate::measure::{AudioInfo, Measure, SOUND_QUEUE, STEP_QUEUE, StepSample};
 use crate::play::PlayerRig;
 use crate::render_side::{MakeScreen, NoFrames, Screen, View};
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
@@ -50,6 +56,9 @@ const USAGE: &str = "usage: tapestry play <chart.bms> | tapestry keys | tapestry
 const LEAD_IN: TimeUs = TimeUs(1_000_000);
 /// Effects the render queue holds.
 const EFFECTS: usize = 1 << 14;
+/// Scheduled sound starts the audio engine keeps between two drains (one
+/// engine step).
+const SCHEDULE_LOG: usize = 256;
 
 fn main() -> ExitCode {
     // The clock reads 0 at the start of the process: load times count from
@@ -78,6 +87,10 @@ fn main() -> ExitCode {
     }
     if arg == "keys" {
         return keys_command(args, clock);
+    }
+    #[cfg(feature = "dev-tools")]
+    if arg == "measure" {
+        return measure_command(args, clock);
     }
     if arg != "play" {
         return unknown_argument(&arg);
@@ -111,23 +124,118 @@ fn main() -> ExitCode {
         let auto = u32::from(dev_options.auto_retry);
         let frames = dev_options.frames.take();
         return report(scripted(&chart, &log, frames, auto, clock, |rig| {
+            if dev_options.overlay {
+                rig.controls.toggle_overlay();
+            }
             rig.adjust_in_play = dev_options.adjust_in_play;
             rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
             rig.adjust_on_end = dev_options.adjust_on_end;
         }));
     }
-    report(play(&chart, clock, |_rig| {
+    report(play(
+        &chart,
+        clock,
         #[cfg(feature = "dev-tools")]
-        {
-            if dev_options.auto_retry {
-                _rig.auto_retries = 1;
-                _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+        false,
+        |_rig| {
+            #[cfg(feature = "dev-tools")]
+            {
+                if dev_options.auto_retry {
+                    _rig.auto_retries = 1;
+                    _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+                }
+                if dev_options.overlay {
+                    _rig.controls.toggle_overlay();
+                }
+                _rig.adjust_in_play = dev_options.adjust_in_play;
+                _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
+                _rig.adjust_on_end = dev_options.adjust_on_end;
             }
-            _rig.adjust_in_play = dev_options.adjust_in_play;
-            _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
-            _rig.adjust_on_end = dev_options.adjust_on_end;
+        },
+    ))
+}
+
+/// `tapestry measure play <chart>` (dev-tools): one play under a
+/// PresentMon capture, its counts added to each saved play's
+/// `.measure.toml`; the run quits after the end screen shows (retry and
+/// quit still work during the play).
+#[cfg(feature = "dev-tools")]
+fn measure_command(mut args: impl Iterator<Item = OsString>, clock: QpcClock) -> ExitCode {
+    const MEASURE_USAGE: &str = "usage: tapestry measure play <chart.bms>";
+    match args.next() {
+        Some(a) if a == "play" => {}
+        Some(a) => return unknown_argument(&a),
+        None => {
+            eprintln!("{MEASURE_USAGE}");
+            return ExitCode::from(2);
         }
-    }))
+    }
+    let Some(chart) = args.next() else {
+        eprintln!("measure play needs a chart file\n{MEASURE_USAGE}");
+        return ExitCode::from(2);
+    };
+    if let Some(extra) = args.next() {
+        return unknown_argument(&extra);
+    }
+    report(measure_play(Path::new(&chart), clock))
+}
+
+#[cfg(feature = "dev-tools")]
+fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
+    let exe = presentmon::locate(std::env::var_os(presentmon::ENV), std::env::var_os("PATH"))?;
+    let process = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .ok_or("the game's own executable name is unknown")?;
+    let dir = data_root()?.path().join("measure");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let csv = dir.join(format!("{stamp}.presentmon.csv"));
+    let log = dir.join(format!("{stamp}.presentmon.log"));
+    println!(
+        "measure: PresentMon {} into {}",
+        exe.display(),
+        csv.display()
+    );
+    let capture = presentmon::Capture::start(&exe, &process, &csv, &log)?;
+    let plays = play::MeasuredPlays::default();
+    let kept = Arc::clone(&plays);
+    // One play: the run quits once its end screen has shown.
+    let ran = play(chart, clock, true, move |rig| {
+        rig.measured_plays = Some(kept);
+        rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+    });
+    let stopped = capture.stop();
+    ran?;
+    stopped?;
+    let text = std::fs::read_to_string(&csv).map_err(|e| format!("{}: {e}", csv.display()))?;
+    let (frames, error) = presentmon::parse(&text, &process, |t| clock.from_qpc(t).0);
+    if let Some(e) = error {
+        return Err(format!("{}: {e:?}", csv.display()));
+    }
+    let plays = plays.lock().map_err(|_| "the measured plays were lost")?;
+    for (record, fig) in plays.iter() {
+        let Some(period) = fig.refresh_period_ns else {
+            eprintln!("measure: no refresh rate for {}", record.display());
+            continue;
+        };
+        let counted = presentmon::count_play(&frames, fig, period);
+        println!(
+            "measure: {}: presentmon {:?}, {:?} presents, {:?} never displayed",
+            record.display(),
+            counted.count,
+            counted.presents,
+            counted.never_displayed
+        );
+        let path = measure::measure_path(record);
+        let mut toml = std::fs::read_to_string(&path).unwrap_or_default();
+        toml.push_str(&presentmon::to_toml(&counted, fig, period));
+        game::write_atomic(&path, toml.as_bytes())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// `tapestry keys`, with the dev-tools option `--dev-scripted-keys <steps>`.
@@ -248,6 +356,7 @@ fn start_engine(
     loaded: &Loaded,
     audio: audio_side::AudioThread,
     opened: audio_side::Opened,
+    probe: rtrb::Producer<game::AudioProbe>,
 ) -> Result<audio_side::AudioLink, String> {
     let chart = loaded.chart();
     let bank = load_bank(chart, opened.rate, &BankLimits::default())
@@ -261,11 +370,71 @@ fn start_engine(
         opened.rate,
         opened.period,
         MAX_VOICES,
-        0,
+        SCHEDULE_LOG,
     )
     .map_err(|e| format!("the audio engine cannot start: {e}"))?;
     loaded.settings().device.apply_to(&mut engine);
-    Ok(audio.start(engine))
+    Ok(audio.start(engine, probe))
+}
+
+/// The measurement's queues: logic steps and key sounds to the render
+/// thread's [`Measure`].
+struct Probes {
+    steps: (rtrb::Producer<StepSample>, rtrb::Consumer<StepSample>),
+    sounds: (
+        rtrb::Producer<game::AudioProbe>,
+        rtrb::Consumer<game::AudioProbe>,
+    ),
+}
+
+impl Probes {
+    fn new() -> Self {
+        Self {
+            steps: rtrb::RingBuffer::new(STEP_QUEUE),
+            sounds: rtrb::RingBuffer::new(SOUND_QUEUE),
+        }
+    }
+}
+
+/// The render thread's measurement of each play.
+fn measure(
+    clock: QpcClock,
+    refresh_mhz: Option<u32>,
+    opened: audio_side::Opened,
+    steps: rtrb::Consumer<StepSample>,
+    sounds: rtrb::Consumer<game::AudioProbe>,
+    controls: &Controls,
+) -> Measure {
+    let audio = AudioInfo {
+        period_us: i64::from(opened.period) * 1_000_000 / i64::from(opened.rate.max(1)),
+        queued_periods: opened.queued_periods,
+    };
+    Measure::new(
+        clock,
+        refresh_mhz,
+        Some(audio),
+        steps,
+        sounds,
+        Arc::clone(controls.overlay()),
+    )
+}
+
+/// Presents a play of `chart` can issue, with room to spare, at
+/// `refresh_mhz` (1 kHz when unknown): the countdown, the chart to its last
+/// long note end or BGM event, a tail of 15 s, a quarter more.
+#[cfg(feature = "dev-tools")]
+fn presents_of(chart: &bms_model::Chart, lead_in: TimeUs, refresh_mhz: Option<u32>) -> usize {
+    let last = chart
+        .lanes
+        .iter()
+        .flatten()
+        .map(bms_model::Note::end)
+        .chain(chart.bgm.iter().map(|b| b.time))
+        .max()
+        .unwrap_or(TimeUs(0));
+    let us = u64::try_from(lead_in.0 + last.0 + 15_000_000).unwrap_or(0);
+    let mhz = u64::from(refresh_mhz.unwrap_or(1_000_000));
+    usize::try_from(us * mhz / 1_000_000_000 * 5 / 4).unwrap_or(usize::MAX)
 }
 
 /// The frames' inputs: hi-speed and the display offset as the settings
@@ -292,6 +461,7 @@ fn rig<'a>(
     render: render_side::RenderLink,
     controls: &'a Controls,
     clock: QpcClock,
+    steps: rtrb::Producer<StepSample>,
 ) -> PlayerRig<'a> {
     let device = &loaded.settings().device;
     PlayerRig {
@@ -311,6 +481,12 @@ fn rig<'a>(
         retry_from: None,
         times: LoadTimes::default(),
         countdown_at: None,
+        steps,
+        steps_dropped: 0,
+        figures: None,
+        generation: 0,
+        #[cfg(feature = "dev-tools")]
+        measured_plays: None,
         lead_in: loaded.config().lead_in,
         #[cfg(feature = "dev-tools")]
         quit_after_end: None,
@@ -346,8 +522,9 @@ fn open_window_and_input(
     capture: Capture,
     wake: impl FnMut(&mut SourceSet, TimeUs) + Send + 'static,
     keys: (Option<u32>, Option<u32>),
+    monitor: Option<String>,
 ) -> Result<(window::WindowThread, window::Surface, InputThread), String> {
-    let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1)?;
+    let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1, monitor)?;
     let input = InputThread::spawn(clock, sources, capture, wake);
     let input = match input {
         Ok(i) => i,
@@ -368,28 +545,42 @@ fn open_window_and_input(
 fn play(
     chart: &Path,
     clock: QpcClock,
+    #[cfg(feature = "dev-tools")] keep_presents: bool,
     tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> Result<(), String> {
+    #[cfg(feature = "dev-tools")]
+    alloc_count::tag(alloc_count::Tag::Logic);
     let mut loaded = load(chart, ReceiveMethod::RawInput)?;
     let controls = controls(&loaded, clock);
     let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
     let (audio, opened) = audio_side::spawn(
-        move || audio::WasapiShared::open(clock).map_err(|e| format!("audio: {e}")),
+        move || {
+            let out = audio::WasapiShared::open(clock).map_err(|e| format!("audio: {e}"))?;
+            let queued = out.grant().queue_periods;
+            Ok((out, Some(queued)))
+        },
         |_| {},
     )?;
-    let audio = start_engine(&loaded, audio, opened)?;
+    let probes = Probes::new();
+    let audio = start_engine(&loaded, audio, opened, probes.sounds.0)?;
     let sources = sources();
     controls.set_latch(sources.gate().handle());
     let (mut hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock);
-    let keys = &loaded.settings().device.keyboard;
-    let keys = (keys.retry, keys.quit);
+    let device = &loaded.settings().device;
+    let keys = (device.keyboard.retry, device.keyboard.quit);
+    let monitor = device.monitor.clone();
     let (window_thread, surface, input_thread) = match open_window_and_input(
         &controls,
         clock,
         sources,
         Capture::new(),
-        move |s, now| hook.wake(s, now),
+        move |s, now| {
+            #[cfg(feature = "dev-tools")]
+            alloc_count::tag(alloc_count::Tag::Input);
+            hook.wake(s, now);
+        },
         keys,
+        monitor,
     ) {
         Ok(opened) => opened,
         Err(e) => {
@@ -407,11 +598,26 @@ fn play(
             .map(|r| Box::new(r) as Box<dyn Screen>)
             .map_err(|e| e.to_string())
     });
+    #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+    let mut measure = measure(
+        clock,
+        surface.refresh_mhz,
+        opened,
+        probes.steps.1,
+        probes.sounds.1,
+        &controls,
+    );
+    #[cfg(feature = "dev-tools")]
+    if keep_presents {
+        let lead_in = loaded.config().lead_in;
+        measure.keep_presents(presents_of(loaded.chart(), lead_in, surface.refresh_mhz));
+    }
     let render = render_side::spawn(
         make,
         Arc::new(loaded.chart().clone()),
         clock,
         view(&controls),
+        measure,
         Box::new(NoFrames),
     );
     let render = match render {
@@ -422,7 +628,15 @@ fn play(
             return Err(e);
         }
     };
-    let mut rig = rig(&loaded, input, audio, render, &controls, clock);
+    let mut rig = rig(
+        &loaded,
+        input,
+        audio,
+        render,
+        &controls,
+        clock,
+        probes.steps.0,
+    );
     tune(&mut rig);
     let ran = game::live::run(&mut loaded, &mut rig).map_err(|e| e.to_string());
     rig.shut_down();
@@ -442,6 +656,7 @@ fn scripted(
     clock: QpcClock,
     tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> Result<(), String> {
+    alloc_count::tag(alloc_count::Tag::Logic);
     let script = dev::script(log)?;
     let mut loaded = load(chart, ReceiveMethod::Scripted)?;
     let controls = controls(&loaded, clock);
@@ -454,10 +669,15 @@ fn scripted(
         .max()
         .unwrap_or(TimeUs(0));
     let (audio, opened) = audio_side::spawn(
-        move || Ok(dev::recording_output(clock, 60)),
+        move || {
+            let out = dev::recording_output(clock, 60);
+            let queued = out.queued_periods();
+            Ok((out, Some(queued)))
+        },
         dev::report_audio,
     )?;
-    let audio = start_engine(&loaded, audio, opened)?;
+    let probes = Probes::new();
+    let audio = start_engine(&loaded, audio, opened, probes.sounds.0)?;
     let sources = sources();
     controls.set_latch(sources.gate().handle());
     let script = input_side::Script {
@@ -480,14 +700,32 @@ fn scripted(
             .map(|r| Box::new(r) as Box<dyn Screen>)
             .map_err(|e| e.to_string())
     });
+    // Offscreen: no refresh rate and no frame statistics.
+    let measure = measure(
+        clock,
+        None,
+        opened,
+        probes.steps.1,
+        probes.sounds.1,
+        &controls,
+    );
     let render = render_side::spawn(
         make,
         Arc::new(loaded.chart().clone()),
         clock,
         view(&controls),
+        measure,
         dump,
     )?;
-    let mut rig = rig(&loaded, input, audio, render, &controls, clock);
+    let mut rig = rig(
+        &loaded,
+        input,
+        audio,
+        render,
+        &controls,
+        clock,
+        probes.steps.0,
+    );
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.auto_retries = auto_retries;
     tune(&mut rig);
@@ -521,6 +759,7 @@ mod tests {
             input::Capture::new(),
             move |s, now| hook.wake(s, now),
             (Some(0x0E), Some(0x01)),
+            None,
         )
         .expect("startup");
         assert_eq!(input::keyboard_target(), Some(input.receiver()));

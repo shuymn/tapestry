@@ -461,3 +461,25 @@ fn a_button_or_key_scratch_is_asked_for_both_directions() {
     assert!(matches!(flow.press(b), Press::Refused(_)));
     assert!(flow.other_direction());
 }
+
+#[test]
+fn the_overlay_key_is_refused_for_either_scratch_direction() {
+    let mut flow = KeyConfigFlow::new(current());
+    let f9 = Bound {
+        kind: KB,
+        control: game::OVERLAY_KEY,
+    };
+    let refused = Press::Refused(Refusal::Key(KeyError::Reserved {
+        control: game::OVERLAY_KEY,
+        reserved_for: "the measurement overlay",
+    }));
+    assert_eq!(flow.press(f9), refused);
+    let b = Bound {
+        kind: PAD,
+        control: 40,
+    };
+    assert!(matches!(flow.press(b), Press::Bound(..)));
+    assert!(flow.other_direction());
+    assert_eq!(flow.press(f9), refused);
+    assert!(flow.other_direction());
+}
