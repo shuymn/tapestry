@@ -9,10 +9,9 @@ use std::path::{Path, PathBuf};
 use replay::PlayRecord;
 use tempfile::NamedTempFile;
 
-/// A complete temporary file beside `path`, under a name no other writer
-/// uses; it is removed if dropped before it is published.
-fn temp_beside(path: &Path, bytes: &[u8]) -> io::Result<NamedTempFile> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+/// A complete temporary file in `dir`, under a name no other writer uses; it
+/// is removed if dropped before it is published.
+fn temp_in(dir: &Path, bytes: &[u8]) -> io::Result<NamedTempFile> {
     let mut tmp = NamedTempFile::new_in(dir)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
@@ -28,7 +27,7 @@ fn temp_beside(path: &Path, bytes: &[u8]) -> io::Result<NamedTempFile> {
 /// The I/O error of the write or the rename; the temporary file is removed
 /// either way.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    temp_beside(path, bytes)?
+    temp_in(path.parent().unwrap_or_else(|| Path::new(".")), bytes)?
         .persist(path)
         .map(|_| ())
         .map_err(|e| e.error)
@@ -145,7 +144,7 @@ impl RecordSink for LocalRecords {
 /// Writes `bytes` as `<first>.tprl` in `dir`, or the next number free when
 /// that one is taken, never replacing a file.
 fn publish(dir: &Path, bytes: &[u8], first: u64) -> io::Result<PathBuf> {
-    let mut tmp = temp_beside(&dir.join("record"), bytes)?;
+    let mut tmp = temp_in(dir, bytes)?;
     let mut n = first;
     for _ in 0..SAVE_ATTEMPTS {
         let path = dir.join(format!("{n}.tprl"));
