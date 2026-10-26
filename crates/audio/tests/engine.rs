@@ -428,6 +428,7 @@ fn a_priming_wake_fills_silence_and_leaves_timing_to_the_first_timed_wake() {
     // Two silent periods, no command taken, no BGM started, no clock.
     assert_eq!((r.frames, r.commands, r.bgm_started), (960, 0, 0));
     assert_eq!(e.clock().time_at(0), None);
+    assert_eq!(e.written(), 960);
     assert_eq!(out.samples().len(), 1_920);
     assert!(out.samples().iter().all(|&x| x == 0.0));
     let r = e.step(&mut out, &mut rx).unwrap();

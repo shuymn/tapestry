@@ -2,14 +2,12 @@
 //! scheduling BGM, stealing voices, mixing, limiting and writing; nor does
 //! the audio thread loop around it.
 //!
-//! A counting global allocator counts allocations made on threads that opted
-//! in (a thread-local flag), so the test harness's own threads do not
-//! disturb the count. This file holds a single test for the same reason.
+//! The counting allocator counts only threads that opted in, so the test
+//! harness's own threads do not disturb the count. This file holds a single
+//! test for the same reason.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use audio::{
     AudioEngine, AudioOutput, OutputError, RecordingOutput, SHIFT_HISTORY, SimConfig, SimDevice,
@@ -18,42 +16,10 @@ use audio::{
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::RingBuffer;
 
-struct Counting;
-
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    static TRACK: Cell<bool> = const { Cell::new(false) };
-}
-
-fn note() {
-    if TRACK.try_with(Cell::get).unwrap_or(false) {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-// SAFETY: delegates to `System`; only adds a counter, which never allocates.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note();
-        // SAFETY: same contract as the caller's.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: same contract as the caller's.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note();
-        // SAFETY: same contract as the caller's.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+mod counting;
 
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: counting::Counting = counting::Counting;
 
 /// Sets `stop` during its `left`th wait from now.
 struct StopAfter<'a, O> {
@@ -120,7 +86,7 @@ fn mixing_does_not_allocate() {
 
     let mut frames = 0u64;
     let mut commands = 0u32;
-    TRACK.set(true);
+    counting::track(true);
     for step in 0..STEPS {
         for k in 0..3 {
             tx.push(SoundCmd {
@@ -141,7 +107,7 @@ fn mixing_does_not_allocate() {
         stop: &stop,
     };
     let run = run_audio(&mut looped, &mut e, &mut rx, &stop).unwrap();
-    TRACK.set(false);
+    counting::track(false);
 
     assert_eq!(run.steps, 500);
     assert_eq!(commands, 3 * STEPS);
@@ -150,5 +116,5 @@ fn mixing_does_not_allocate() {
     assert_eq!(e.underruns(), 40);
     assert!(e.mixer().steals() > 1_000, "{}", e.mixer().steals());
     assert!(e.mixer().limiter().limited() > 0);
-    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
+    assert_eq!(counting::allocations(), 0);
 }

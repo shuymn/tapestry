@@ -552,7 +552,9 @@ impl<D: Device, C: TimeSource> Stream<D, C> {
         self.fault = Some(e);
         self.priming()
     }
+}
 
+impl<D: Device, C> Stream<D, C> {
     /// Stops the stream if it was started.
     fn stop(&mut self) -> windows::core::Result<()> {
         if self.phase != Phase::Running {
@@ -826,10 +828,7 @@ impl<C: TimeSource> AudioOutput for WasapiShared<C> {
 
 impl<C> Drop for WasapiShared<C> {
     fn drop(&mut self) {
-        if self.stream.phase == Phase::Running {
-            // SAFETY: stopping the stream this output started.
-            let _ = unsafe { self.stream.dev.client.Stop() };
-        }
+        let _ = self.stream.stop();
     }
 }
 

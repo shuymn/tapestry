@@ -2,59 +2,26 @@
 //! test is ignored; run it with `--ignored --nocapture`. It plays a quiet
 //! tone for about 2 s.
 //!
-//! A counting global allocator counts allocations made on threads that
-//! opted in (a thread-local flag), so the audio loop can be checked for
-//! allocations without the harness's threads disturbing the count.
+//! The counting allocator checks that the audio loop allocates nothing,
+//! from the priming wake on.
 
 #![cfg(windows)]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::f64::consts::TAU;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use audio::{AudioEngine, RunReport, ScheduledKind, SoundBank, SoundCmd, WasapiShared, run_audio};
+use audio::{
+    AudioEngine, RunReport, ScheduledKind, SoundBank, SoundCmd, WakeTrace, WasapiShared, run_audio,
+};
 use bms_model::{BgmEvent, SoundId, TimeSource, TimeUs};
 use rtrb::RingBuffer;
 
-struct Counting;
-
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    static TRACK: Cell<bool> = const { Cell::new(false) };
-}
-
-fn note() {
-    if TRACK.try_with(Cell::get).unwrap_or(false) {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-// SAFETY: delegates to `System`; only adds a counter, which never allocates.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note();
-        // SAFETY: same contract as the caller's.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: same contract as the caller's.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note();
-        // SAFETY: same contract as the caller's.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+mod counting;
 
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: counting::Counting = counting::Counting;
 
 /// µs since the clock was made; copies share the origin.
 #[derive(Clone, Copy)]
@@ -69,12 +36,11 @@ impl TimeSource for Elapsed {
 /// Wakes traced one by one at startup.
 const TRACED: usize = 8;
 
-/// One startup wake.
+/// One startup wake: the output's trace (none for the priming wake) and
+/// what the step did.
 #[derive(Clone, Copy, Debug, Default)]
 struct Traced {
-    woke_us: Option<i64>,
-    read_us: Option<i64>,
-    padding: Option<u32>,
+    wake: Option<WakeTrace>,
     frames: u32,
     underrun: bool,
 }
@@ -120,21 +86,18 @@ fn wasapi_plays_a_scheduled_tone() {
             std::thread::sleep(RUN);
             stop.store(true, Ordering::Release);
         });
+        counting::track(true);
         // The first wakes one by one, for the startup trace.
         for t in &mut trace {
             let step = engine.step(&mut out, &mut rx).unwrap();
-            let last = out.stats().last;
             *t = Traced {
-                woke_us: last.map(|l| l.woke.0),
-                read_us: last.map(|l| l.read.0),
-                padding: last.map(|l| l.padding),
+                wake: out.stats().last,
                 frames: step.frames,
                 underrun: step.underrun,
             };
         }
-        TRACK.set(true);
         let r = run_audio(&mut out, &mut engine, &mut rx, &stop);
-        TRACK.set(false);
+        counting::track(false);
         r.unwrap()
     });
     let ran = started.elapsed();
@@ -145,7 +108,11 @@ fn wasapi_plays_a_scheduled_tone() {
     for (k, t) in trace.iter().enumerate() {
         println!(
             "  wake {k}: woke {:?}, padding read {:?}, padding {:?}, wrote {} frames, underrun {}",
-            t.woke_us, t.read_us, t.padding, t.frames, t.underrun
+            t.wake.map(|w| w.woke.0),
+            t.wake.map(|w| w.read.0),
+            t.wake.map(|w| w.padding),
+            t.frames,
+            t.underrun
         );
     }
     println!(
@@ -186,8 +153,8 @@ fn wasapi_plays_a_scheduled_tone() {
     let expected = u64::from(g.rate) * RUN.as_millis() as u64 / 1_000;
     assert!(frames >= expected * 95 / 100, "{report:?}");
     // The priming wake is the only untimed one.
-    assert_eq!(trace[0].woke_us, None);
-    assert!(trace[1..].iter().all(|t| t.woke_us.is_some()));
+    assert_eq!(trace[0].wake, None);
+    assert!(trace[1..].iter().all(|t| t.wake.is_some()));
     assert!(stats.wakes >= expected / u64::from(g.period) * 95 / 100);
     // The tone was scheduled once, on the mix clock.
     let mut tones = 0;
@@ -198,10 +165,6 @@ fn wasapi_plays_a_scheduled_tone() {
     });
     assert_eq!(tones, 1);
     assert_eq!(engine.bgm_left(), 0);
-    assert_eq!(
-        ALLOCS.load(Ordering::Relaxed),
-        0,
-        "the audio loop allocated"
-    );
+    assert_eq!(counting::allocations(), 0, "the audio loop allocated");
     out.close().unwrap();
 }
