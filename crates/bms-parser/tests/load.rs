@@ -175,21 +175,16 @@ fn bpm_zero_is_rejected() {
 }
 
 #[test]
-fn bpm_takes_eighteen_fractional_digits_not_nineteen() {
+fn bpm_keeps_eighteen_fractional_digits_and_cuts_the_rest() {
     let loaded = load_text("#BPM 120.000000000000000003\n#WAV01 click.wav\n#00111:01\n").unwrap();
     // The scroll map takes millionths rounded down; time uses the exact BPM.
     assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 120_000_000);
     // 4 beats: floor(240e6 / 120.000000000000000003) = 1_999_999, where
     // 120 BPM gives exactly 2_000_000.
     assert_eq!(times(&loaded.chart.lanes[1]), vec![1_999_999]);
-    assert_eq!(
-        load_text("#BPM 120.0000000000000000003\n#00111:01\n"),
-        Err(LoadError::InvalidValue {
-            line: 1,
-            what: "#BPM",
-            reason: "more than 18 fractional digits"
-        })
-    );
+    // A 19th fractional digit is cut off: exactly 120 BPM.
+    let loaded = load_text("#BPM 120.0000000000000000007\n#WAV01 click.wav\n#00111:01\n").unwrap();
+    assert_eq!(times(&loaded.chart.lanes[1]), vec![2_000_000]);
 }
 
 #[test]

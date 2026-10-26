@@ -208,6 +208,27 @@ fn long_decimals_and_exponents_time_exactly() {
 }
 
 #[test]
+fn digits_past_eighteen_are_cut_off_and_a_length_cut_to_zero_is_refused() {
+    // 40 fractional digits; the time uses the first 18: floor(4 beats ×
+    // 0.765432109876543210 × 60e6 / 150) = 1_224_691 (an independent
+    // script).
+    let text = "#BPM 150\n#00002:0.7654321098765432109876543210987654321098\n#00111:01\n";
+    let loaded = load(text).unwrap();
+    assert_eq!(times(&loaded.chart.lanes[1]), vec![1_224_691]);
+    for (text, line) in [("#00102:1E-100\n", 1), ("#BPM 120\n#00302:0\n", 2)] {
+        assert_eq!(
+            load(text),
+            Err(LoadError::InvalidValue {
+                line,
+                what: "measure length",
+                reason: "the measure has no length, so its timing is undefined"
+            }),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn total_and_defexrank_take_the_decimal_grammar() {
     let meta = |header: &str| {
         let loaded = load(&format!("#BPM 120\n{header}\n#WAV01 a.wav\n#00111:01\n")).unwrap();

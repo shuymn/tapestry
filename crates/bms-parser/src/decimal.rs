@@ -6,24 +6,27 @@ use num_rational::Ratio;
 /// An exact rational of arbitrary-precision integers (D3).
 pub type Rational = Ratio<BigInt>;
 
-/// At most this many fractional digits, counted after the exponent applies
-/// and without trailing zeros (D3).
+/// Fractional digits kept, counted after the exponent applies; further
+/// digits are cut off, rounding toward zero (D3).
 pub const MAX_FRACTION_DIGITS: i64 = 18;
 /// At most this many integer digits, counted after the exponent applies and
 /// without leading zeros, so every value times 10^6 fits `i64`.
 pub const MAX_INTEGER_DIGITS: i64 = 12;
-/// The largest exponent magnitude.
+/// The largest positive exponent. A negative one only moves digits past
+/// the kept fractional digits, so it may be larger.
 pub const MAX_EXPONENT: i64 = 18;
+/// The most significant digits a negative exponent may have, so it fits
+/// `i64` with room to spare.
+const MAX_EXPONENT_DIGITS: usize = 18;
 
 /// Why a decimal was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecimalError {
     /// Not a decimal number.
     Malformed,
-    /// An exponent beyond [`MAX_EXPONENT`] in magnitude.
+    /// A positive exponent beyond [`MAX_EXPONENT`], or a negative one of
+    /// more than 18 digits.
     ExponentOutOfRange,
-    /// More than [`MAX_FRACTION_DIGITS`] fractional digits.
-    TooManyFractionDigits,
     /// More than [`MAX_INTEGER_DIGITS`] integer digits.
     TooManyIntegerDigits,
 }
@@ -32,8 +35,7 @@ impl DecimalError {
     pub const fn reason(self) -> &'static str {
         match self {
             Self::Malformed => "not a decimal number",
-            Self::ExponentOutOfRange => "exponent beyond 18",
-            Self::TooManyFractionDigits => "more than 18 fractional digits",
+            Self::ExponentOutOfRange => "exponent out of range",
             Self::TooManyIntegerDigits => "more than 12 integer digits",
         }
     }
@@ -56,9 +58,10 @@ fn all_digits(text: &str) -> bool {
 ///
 /// The value is `digits × 10^(exponent - fractional digits written)`. Its
 /// digits are counted without the leading and trailing zeros that do not
-/// change it: `0012.50e1` has 3 integer digits and none fractional. Every
-/// bound is checked on these counts before any number is built, so a long
-/// run of zeros costs a scan and nothing more.
+/// change it: `0012.50e1` has 3 integer digits and none fractional. Digits
+/// past the 18th fractional one are cut off (toward zero), so a value may
+/// become 0. Every bound is checked on these counts before any number is
+/// built, so a long run of digits costs a scan and nothing more.
 pub fn parse_decimal(text: &str) -> Result<Rational, DecimalError> {
     let (negative, body) = split_sign(text);
     let (mantissa, exponent) = match body.split_once(['e', 'E']) {
@@ -77,9 +80,8 @@ pub fn parse_decimal(text: &str) -> Result<Rational, DecimalError> {
                 return Err(DecimalError::Malformed);
             }
             let digits = digits.trim_start_matches('0');
-            // Two digits hold every allowed magnitude; a longer run is
-            // refused before it is read.
-            if digits.len() > 2 {
+            // A longer run is refused before it is read.
+            if digits.len() > MAX_EXPONENT_DIGITS {
                 return Err(DecimalError::ExponentOutOfRange);
             }
             let magnitude: i64 = if digits.is_empty() {
@@ -87,7 +89,7 @@ pub fn parse_decimal(text: &str) -> Result<Rational, DecimalError> {
             } else {
                 digits.parse().map_err(|_| DecimalError::Malformed)?
             };
-            if magnitude > MAX_EXPONENT {
+            if !negative && magnitude > MAX_EXPONENT {
                 return Err(DecimalError::ExponentOutOfRange);
             }
             if negative { -magnitude } else { magnitude }
@@ -102,18 +104,24 @@ pub fn parse_decimal(text: &str) -> Result<Rational, DecimalError> {
     let trailing = digits().rev().take_while(|&b| b == b'0').count();
     let count = |n: usize| i64::try_from(n).map_err(|_| DecimalError::Malformed);
     let significant = count(total - leading - trailing)?;
-    // The value is `significant digits × 10^scale`.
+    // The value is `significant digits × 10^scale`. Within `i64`: the
+    // exponent has at most 18 digits and the text is far shorter than
+    // 10^18 bytes.
     let scale = exponent - count(frac.len())? + count(trailing)?;
     if significant + scale > MAX_INTEGER_DIGITS {
         return Err(DecimalError::TooManyIntegerDigits);
     }
-    if -scale > MAX_FRACTION_DIGITS {
-        return Err(DecimalError::TooManyFractionDigits);
+    // Digits past the 18th fractional one are cut off.
+    let cut = (-scale - MAX_FRACTION_DIGITS).max(0);
+    if cut >= significant {
+        return Ok(Rational::from_integer(BigInt::from(0)));
     }
+    let scale = scale + cut;
+    let kept = usize::try_from(significant - cut).map_err(|_| DecimalError::Malformed)?;
     // At most 12 + 18 = 30 digits, below 10^30 < 2^100.
     let coefficient = digits()
         .skip(leading)
-        .take(total - leading - trailing)
+        .take(kept)
         .fold(0_u128, |n, d| n * 10 + u128::from(d - b'0'));
     let power = |e: i64| BigInt::from(10_u64.pow(u32::try_from(e).unwrap_or(0)));
     let numer = BigInt::from(coefficient) * power(scale.max(0));
@@ -190,24 +198,51 @@ mod tests {
     }
 
     #[test]
+    fn digits_past_the_eighteenth_fractional_one_are_cut_off() {
+        let e18 = 10_i128.pow(18);
+        let ones = "1".repeat(100_000);
+        for (text, value) in [
+            (
+                "0.7654321098765432109876543210987654321098",
+                r(765_432_109_876_543_210, e18),
+            ),
+            // Toward zero for a negative value.
+            ("-2.1234567890123456789", r(-2_123_456_789_012_345_678, e18)),
+            (&format!("0.{ones}"), r(111_111_111_111_111_111, e18)),
+            (&format!("1{}e-100018", "0".repeat(100_000)), r(1, e18)),
+            // Values below 10^-18 become 0.
+            ("0.0000000000000000001", r(0, 1)),
+            ("-0.0000000000000000009", r(0, 1)),
+            ("0.1e-18", r(0, 1)),
+            ("1e-19", r(0, 1)),
+            ("1E-100", r(0, 1)),
+            ("9e-999999999999999999", r(0, 1)),
+        ] {
+            assert_eq!(
+                parse_decimal(text),
+                Ok(value),
+                "{}",
+                &text[..text.len().min(40)]
+            );
+        }
+    }
+
+    #[test]
     fn decimals_out_of_bounds_are_refused_before_they_are_built() {
         let zeros = "0".repeat(100_000);
         for (text, error) in [
-            ("0.0000000000000000001", DecimalError::TooManyFractionDigits),
-            ("1e-19", DecimalError::ExponentOutOfRange),
-            ("0.1e-18", DecimalError::TooManyFractionDigits),
             ("1000000000000", DecimalError::TooManyIntegerDigits),
             ("1e12", DecimalError::TooManyIntegerDigits),
             ("1e19", DecimalError::ExponentOutOfRange),
+            ("0e19", DecimalError::ExponentOutOfRange),
             ("1e100", DecimalError::ExponentOutOfRange),
-            // An exponent too long to read as a number.
-            ("1e100000000000000000000", DecimalError::ExponentOutOfRange),
-            // Both digit bounds broken: the integer one is reported.
+            // Exponents too long to read as a number.
+            ("1e1000000000000000000", DecimalError::ExponentOutOfRange),
+            ("1e-1000000000000000000", DecimalError::ExponentOutOfRange),
             (
                 "1234567890123.0000000000000000001",
                 DecimalError::TooManyIntegerDigits,
             ),
-            (&format!("0.{zeros}9"), DecimalError::TooManyFractionDigits),
             (&format!("4{zeros}"), DecimalError::TooManyIntegerDigits),
             (&format!("5{zeros}e-18"), DecimalError::TooManyIntegerDigits),
         ] {

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bms_model::{ChartMeta, JudgeRank, Lane, LnMode};
 use num_bigint::BigInt;
-use num_traits::Signed;
+use num_traits::{Signed, Zero};
 
 use crate::branch::Branches;
 use crate::decimal::{Rational, parse_base36, parse_decimal, parse_hex};
@@ -195,7 +195,7 @@ fn parse_channel(
 ) -> Result<(), LoadError> {
     let name = String::from_utf8_lossy(&channel).into_owned();
     if channel == *b"02" {
-        let length = positive_decimal(data, line, "measure length")?;
+        let length = measure_length(data, line)?;
         source.measure_lengths.insert(measure, length);
         return Ok(());
     }
@@ -373,6 +373,26 @@ fn positive_decimal(text: &str, line: usize, what: &'static str) -> Result<Ratio
     let invalid = |reason| LoadError::InvalidValue { line, what, reason };
     let v = parse_decimal(text).map_err(|e| invalid(e.reason()))?;
     if v.is_positive() {
+        Ok(v)
+    } else {
+        Err(invalid("not positive"))
+    }
+}
+
+/// A positive measure length. Zero, as written or cut off to it, is its own
+/// error.
+fn measure_length(text: &str, line: usize) -> Result<Rational, LoadError> {
+    let invalid = |reason| LoadError::InvalidValue {
+        line,
+        what: "measure length",
+        reason,
+    };
+    let v = parse_decimal(text).map_err(|e| invalid(e.reason()))?;
+    if v.is_zero() {
+        Err(invalid(
+            "the measure has no length, so its timing is undefined",
+        ))
+    } else if v.is_positive() {
         Ok(v)
     } else {
         Err(invalid("not positive"))

@@ -17,10 +17,12 @@
 //!   floored to µs once; the time's denominator has at most
 //!   [`Limits::max_time_bits`] bits (an error otherwise). BPM, `#STOPxx`,
 //!   measure-length, `#TOTAL` and `#DEFEXRANK` values are decimals with an
-//!   optional exponent of at most 18 (`1.5`, `.5`, `1.00001E+07`), with at
-//!   most 12 integer and 18 fractional digits once the exponent applies. A
-//!   malformed timing value is an error; a malformed `#TOTAL` or
-//!   `#DEFEXRANK` is ignored with a warning. A BPM is at least 0.000001; the
+//!   optional exponent (`1.5`, `.5`, `1.00001E+07`), positive at most 18,
+//!   with at most 12 integer digits once the exponent applies; digits past
+//!   the 18th fractional one are cut off toward zero. A malformed timing
+//!   value is an error, and so is a measure length of 0, as written or cut
+//!   off to it; a malformed `#TOTAL` or `#DEFEXRANK` is ignored with a
+//!   warning. A BPM is at least 0.000001; the
 //!   scroll map takes it in millionths rounded down, while time uses the
 //!   exact value. `#TOTAL` and `#DEFEXRANK` are kept in thousandths rounded
 //!   down. A `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat)
