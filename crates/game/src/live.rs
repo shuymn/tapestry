@@ -162,6 +162,13 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError> {
             if rig.quitting() {
                 return Ok(());
             }
+            // The screen failed during the play, its tail or this wait: it
+            // is built again, acknowledged, before the end screen shows
+            // again; if it cannot be, the run ends with the reason.
+            if rig.screen_failed() {
+                rig.prepare_screen().map_err(LiveError::Screen)?;
+                rig.show_end(&report);
+            }
             match rig.take() {
                 Some(Command::Retry) => break,
                 Some(Command::Quit) => return Ok(()),
@@ -211,13 +218,23 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
     let mut output_error = None;
+    // A suspend while recording is open marks the record incomplete,
+    // whichever cause ends the play (D13).
+    let mut suspended = false;
 
     let end = loop {
         rig.wait();
         // Anything seen in a step is handled before the step advances.
+        // Every pending command is taken, so a suspend is never left behind
+        // a quit or a retry.
+        let mut command = None;
+        while let Some(c) = rig.take() {
+            suspended |= c == Command::Suspend;
+            command = command.or(Some(c));
+        }
         if rig.quitting() {
             logic.abort(AbortCause::Quit);
-        } else if let Some(c) = rig.take() {
+        } else if let Some(c) = command {
             logic.abort(c.cause());
         } else if rig.focus_lost() {
             logic.abort(AbortCause::FocusLoss);
@@ -256,19 +273,28 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
     // Recording closes at the end of evaluation (D13); an aborted play
     // then takes what reached its queues after the abort.
     let closing = rig.close();
+    // A suspend that arrived during the close handshake still happened
+    // while recording was open.
+    let mut carried = None;
+    while let Some(c) = rig.take() {
+        suspended |= c == Command::Suspend;
+        if c != Command::Suspend {
+            carried = carried.or(Some(c));
+        }
+    }
     logic.drain_after_close();
     let incomplete = Incomplete {
         overflow: logic.overflowed() || closing.overflowed,
         source_limit: closing.source_limited,
-        suspend: false,
+        suspend: suspended,
     };
     let record = logic.record();
     let view = logic.view();
     drop(logic);
 
     // The audio tail of a completed play: nothing is recorded, and a
-    // control, focus loss, removal of the last device or an audio failure
-    // cuts it short; the record stays complete.
+    // control, focus loss, removal of the last device, an audio failure or
+    // a screen failure cuts it short; the record stays complete.
     let mut tail_cut = None;
     if end == PlayEnd::Completed
         && let Some(e) = rig.audio_failure()
@@ -281,7 +307,7 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
         rig.wait();
         tail_cut = if rig.quitting() {
             Some(AbortCause::Quit)
-        } else if let Some(c) = rig.take() {
+        } else if let Some(c) = carried.take().or_else(|| rig.take()) {
             Some(c.cause())
         } else if rig.focus_lost() {
             Some(AbortCause::FocusLoss)
@@ -290,6 +316,8 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
         } else if let Some(e) = rig.audio_failure() {
             output_error = Some(e);
             Some(AbortCause::OutputFailed)
+        } else if rig.screen_failed() {
+            Some(AbortCause::ScreenFailed)
         } else {
             None
         };

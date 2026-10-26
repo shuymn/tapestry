@@ -260,6 +260,9 @@ pub struct PlayReport {
     pub saved: Option<Result<RecordRef, SaveError>>,
     /// The result extension's summary of a recorded play.
     pub result: Option<ResultSummary>,
+    /// The preset the play was evaluated under: after a reload at a
+    /// retry, the new one.
+    pub preset: RulePreset,
 }
 
 /// A loaded chart, its preset and settings, before audio is attached: the
@@ -617,6 +620,7 @@ impl Loaded {
             record: play_record,
             saved,
             result,
+            preset: preset.clone(),
         }
     }
 }

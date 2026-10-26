@@ -116,6 +116,12 @@ struct Fake {
     origins: Vec<TimeUs>,
     sounds: Option<AudioQueue>,
     sealed: bool,
+    /// Waits after the seal before the audio is done.
+    tail_waits: usize,
+    waits_since_seal: usize,
+    /// A suspend arrives while the close request is handled.
+    suspend_in_close: bool,
+    shows: usize,
     reports: Vec<PlayReport>,
 }
 
@@ -144,6 +150,10 @@ impl Fake {
             origins: Vec::new(),
             sounds: None,
             sealed: false,
+            tail_waits: 0,
+            waits_since_seal: 0,
+            suspend_in_close: false,
+            shows: 0,
             reports: Vec::new(),
         }
     }
@@ -164,6 +174,14 @@ impl Rig for Fake {
 
     fn wait(&mut self) {
         self.clock.advance(TimeUs(MS));
+        // A run that never ends fails instead of hanging.
+        assert!(
+            self.clock.now().0 < CLOCK_START + 60_000_000,
+            "the run did not end within a minute of its clock"
+        );
+        if self.sealed {
+            self.waits_since_seal += 1;
+        }
         self.script.poll(self.clock.now(), &mut self.sources);
         self.drain_sounds();
     }
@@ -186,6 +204,10 @@ impl Rig for Fake {
         }
         if self.prepares >= self.prepare_fails_from {
             return Err("the surface cannot be made again".to_owned());
+        }
+        // Built again: no longer failed.
+        if self.clock.now().0 >= self.screen_fails_at {
+            self.screen_fails_at = i64::MAX;
         }
         Ok(())
     }
@@ -212,6 +234,7 @@ impl Rig for Fake {
     fn start(&mut self, _origin: TimeUs, sounds: AudioQueue, _screen: RenderSide) {
         self.sounds = Some(sounds);
         self.sealed = false;
+        self.waits_since_seal = 0;
     }
 
     fn focus_lost(&self) -> bool {
@@ -239,11 +262,14 @@ impl Rig for Fake {
     }
 
     fn audio_done(&self) -> bool {
-        self.sealed
+        self.sealed && self.waits_since_seal >= self.tail_waits
     }
 
     fn close(&mut self) -> Closing {
         // Batches the input thread received before it took the request.
+        if self.suspend_in_close {
+            self.commands.push((i64::MIN, Command::Suspend));
+        }
         let lag = TimeUs(self.clock.now().0 + self.close_lag);
         self.script.poll(lag, &mut self.sources);
         let closing = Closing {
@@ -259,7 +285,9 @@ impl Rig for Fake {
         self.reports.push(report.clone());
     }
 
-    fn show_end(&mut self, _report: &PlayReport) {}
+    fn show_end(&mut self, _report: &PlayReport) {
+        self.shows += 1;
+    }
 }
 
 /// The judgments in `report`'s live stream: (note, judgment, deviation).
@@ -445,4 +473,122 @@ fn a_screen_failure_ends_the_play_and_a_failed_recovery_the_run() {
     assert_eq!(one.end, PlayEnd::Aborted(AbortCause::ScreenFailed));
     assert!(matches!(one.saved, Some(Ok(_))));
     assert_eq!(judged(one), [(0, Judgment::Perfect, Some(0))]);
+}
+
+fn incomplete(report: &PlayReport) -> replay::Incomplete {
+    report.record.as_ref().unwrap().status.incomplete
+}
+
+/// A suspend and a quit before the same step, after the first note was
+/// finalized: the quit ends the play and the run, and the record is still
+/// marked suspended.
+#[test]
+fn a_suspend_with_a_quit_in_one_step_marks_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Suspend)], 9_500_000);
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert_eq!(judged(one), [(0, Judgment::Perfect, Some(0))]);
+    assert!(incomplete(one).suspend);
+}
+
+/// A suspend that arrives while recording closes after a quit.
+#[test]
+fn a_suspend_during_the_close_marks_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 9_500_000);
+    rig.suspend_in_close = true;
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert!(incomplete(one).suspend);
+}
+
+/// The screen fails during a completed play's audio tail: the tail is cut
+/// and the play stays complete; the end screen's wait builds the screen
+/// again, which fails, so the run ends with that error.
+#[test]
+fn a_screen_failure_in_the_tail_cuts_it_and_a_failed_rebuild_ends_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], i64::MAX);
+    // Complete at play time 1.683 s (9.983 s on the clock), with a 200 ms
+    // tail; the screen fails inside it.
+    rig.tail_waits = 200;
+    rig.screen_fails_at = 10_100_000;
+    rig.prepare_fails_from = 2;
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::Screen(_))), "{ran:?}");
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.tail_cut, Some(AbortCause::ScreenFailed));
+    assert_eq!(
+        one.record.as_ref().unwrap().status.end,
+        replay::EndStatus::PlayedToEnd
+    );
+    assert_eq!(rig.prepares, 2);
+}
+
+/// The screen fails while the end screen waits: it is built again, with
+/// an acknowledgement, and the end screen shows again.
+#[test]
+fn a_screen_failure_on_the_end_screen_is_rebuilt_and_shown_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 10_600_000);
+    rig.screen_fails_at = 10_400_000;
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.reports[0].end, PlayEnd::Completed);
+    assert_eq!(rig.reports[0].tail_cut, None);
+    assert_eq!((rig.prepares, rig.shows), (2, 2));
+}
+
+/// The gauges change in the preset file before a retry: each play's report
+/// carries the preset it was evaluated under.
+#[test]
+fn each_report_carries_the_preset_its_play_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut renamed = rules::custom();
+    for g in &mut renamed.gauges {
+        g.id = format!("{}-renamed", g.id);
+    }
+    let path = dir.path().join("presets").join("custom.toml");
+    std::fs::write(&path, game::preset_to_toml(&renamed)).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 12_500_000);
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    let ids = |r: &PlayReport| {
+        r.preset
+            .gauges
+            .iter()
+            .map(|g| g.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let old: Vec<_> = rules::custom()
+        .gauges
+        .iter()
+        .map(|g| g.id.clone())
+        .collect();
+    let new: Vec<_> = renamed.gauges.iter().map(|g| g.id.clone()).collect();
+    assert_ne!(old, new);
+    assert_eq!(ids(&rig.reports[0]), old);
+    assert_eq!(ids(&rig.reports[1]), new);
 }
