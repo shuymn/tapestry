@@ -118,7 +118,7 @@ impl Spot {
 /// One position's worth of work: a bar line or an object.
 #[derive(Clone, Copy)]
 enum Event {
-    Bar(u16),
+    Bar,
     Object(usize),
 }
 
@@ -139,9 +139,9 @@ pub fn compute(
     let cap = BigInt::from(limits.max_duration.0);
     let max_bits = limits.max_time_bits;
 
-    // Each measure's starting beat and length in beats. These values and
-    // the segments below are bounded by the text limits (D3), so only the
-    // running time needs a cap.
+    // Each measure's length in beats. These values and the segments below
+    // are bounded by the text limits (D3), so only the running time needs a
+    // cap.
     let last_measure = source
         .objects
         .iter()
@@ -149,31 +149,20 @@ pub fn compute(
         .chain(source.measure_lengths.keys().copied())
         .max()
         .unwrap_or(0);
-    let mut starts = Vec::with_capacity(usize::from(last_measure) + 1);
-    let mut spans = Vec::with_capacity(usize::from(last_measure) + 1);
-    let mut start = Rational::zero();
-    for m in 0..=last_measure {
-        let length = source
-            .measure_lengths
-            .get(&m)
-            .cloned()
-            .unwrap_or_else(|| int(1));
-        let span = length * BigInt::from(4);
-        starts.push(start.clone());
-        start += &span;
-        spans.push(span);
-    }
-    // The beat position of a spot.
-    let position = |spot: &Spot| {
-        let m = usize::from(spot.measure);
-        // `count` is at least 1: a line without pairs has no objects.
-        let fraction = Rational::new(BigInt::from(spot.index), BigInt::from(spot.count));
-        &starts[m] + fraction * &spans[m]
-    };
+    let spans: Vec<Rational> = (0..=last_measure)
+        .map(|m| {
+            let length = source
+                .measure_lengths
+                .get(&m)
+                .cloned()
+                .unwrap_or_else(|| int(1));
+            length * BigInt::from(4)
+        })
+        .collect();
 
     let mut events = Vec::with_capacity(source.objects.len() + usize::from(last_measure) + 1);
     for m in 0..=last_measure {
-        events.push((Spot::start(m), Event::Bar(m)));
+        events.push((Spot::start(m), Event::Bar));
     }
     for (i, o) in source.objects.iter().enumerate() {
         let spot = Spot {
@@ -194,9 +183,9 @@ pub fn compute(
         bar_lines: Vec::with_capacity(usize::from(last_measure) + 1),
     };
     let mut us_per_beat = int(US_PER_MINUTE) / &initial_bpm;
-    // A measure's length in µs at the current BPM, kept while neither the
-    // measure nor the BPM changes.
-    let mut rate: Option<(u16, Rational)> = None;
+    // The current measure's length in µs at the current BPM, cleared when
+    // either changes.
+    let mut measure_us: Option<Rational> = None;
     let mut beat = Spot::start(0);
     let mut time = Time::zero();
     let mut rest = events.as_slice();
@@ -210,35 +199,35 @@ pub fn compute(
         let objects = || {
             group.iter().filter_map(|(_, e)| match *e {
                 Event::Object(i) => Some(&source.objects[i]),
-                Event::Bar(_) => None,
+                Event::Bar => None,
             })
         };
-        let measure = objects().next().map_or_else(
-            || match group[0].1 {
-                Event::Bar(m) => m,
-                Event::Object(_) => 0,
-            },
-            |o| o.measure,
-        );
+        let measure = spot.measure;
         let overflow = || LoadError::TimeOverflow { measure };
 
-        let segment = if spot.measure == beat.measure {
-            // Within one measure: the fraction between, of the measure's µs.
-            // Below 2^46 each, and not negative in sorted order.
-            let numer = u64::from(spot.index) * u64::from(beat.count)
-                - u64::from(beat.index) * u64::from(spot.count);
-            let denom = u64::from(spot.count) * u64::from(beat.count);
-            if rate.as_ref().is_none_or(|(m, _)| *m != spot.measure) {
-                let span = &spans[usize::from(spot.measure)];
-                rate = Some((spot.measure, span * &us_per_beat));
-            }
-            let fraction = Rational::new(BigInt::from(numer), BigInt::from(denom));
-            rate.as_ref()
-                .map_or_else(Rational::zero, |(_, measure_us)| fraction * measure_us)
+        // The fraction of the previous position's measure up to this
+        // position. Every measure has a bar line at its start, so a group in
+        // another measure is the start of the next one, and the fraction is
+        // the rest of the previous measure. Each term is below 2^46 and not
+        // negative in sorted order; `count` is at least 1, since a line
+        // without pairs has no objects.
+        let (numer, denom) = if measure == beat.measure {
+            (
+                u64::from(spot.index) * u64::from(beat.count)
+                    - u64::from(beat.index) * u64::from(spot.count),
+                u64::from(spot.count) * u64::from(beat.count),
+            )
         } else {
-            (position(spot) - position(&beat)) * &us_per_beat
+            (u64::from(beat.count - beat.index), u64::from(beat.count))
         };
-        time.add(&segment, max_bits).map_err(|()| overflow())?;
+        let fraction = Rational::new(BigInt::from(numer), BigInt::from(denom));
+        let rate =
+            measure_us.get_or_insert_with(|| &spans[usize::from(beat.measure)] * &us_per_beat);
+        time.add(&(fraction * &*rate), max_bits)
+            .map_err(|()| overflow())?;
+        if measure != beat.measure {
+            measure_us = None;
+        }
         beat = *spot;
         let at = to_micros(&time, &cap, measure)?;
 
@@ -269,12 +258,12 @@ pub fn compute(
                 bpm_micro: bpm_micro(&v),
             });
             us_per_beat = int(US_PER_MINUTE) / v;
-            rate = None;
+            measure_us = None;
         }
 
         for (_, event) in group {
             match *event {
-                Event::Bar(_) => timeline.bar_lines.push(at),
+                Event::Bar => timeline.bar_lines.push(at),
                 Event::Object(i) => {
                     let o = &source.objects[i];
                     if !matches!(
