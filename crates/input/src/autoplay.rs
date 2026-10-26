@@ -171,6 +171,21 @@ pub fn autoplay(
 pub struct AutoplayInput {
     events: Vec<PhysicalInputEvent>,
     next: usize,
+    /// Called before each push (tests): the queue as a consumer between
+    /// two pushes finds it.
+    #[cfg(test)]
+    before_push: Option<BeforePush>,
+}
+
+/// A test's look at the queue between two pushes.
+#[cfg(test)]
+struct BeforePush(Box<dyn FnMut() + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for BeforePush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BeforePush")
+    }
 }
 
 impl AutoplayInput {
@@ -178,7 +193,12 @@ impl AutoplayInput {
     /// them), from its first event.
     #[must_use]
     pub const fn new(events: Vec<PhysicalInputEvent>) -> Self {
-        Self { events, next: 0 }
+        Self {
+            events,
+            next: 0,
+            #[cfg(test)]
+            before_push: None,
+        }
     }
 
     /// Starts over for a new play, before recording opens: the next poll
@@ -220,6 +240,10 @@ impl InputAdapter for AutoplayInput {
                 && ev.received == at
             {
                 self.next += 1;
+                #[cfg(test)]
+                if let Some(look) = &mut self.before_push {
+                    (look.0)();
+                }
                 if let InputKind::Control { control, value } = ev.kind {
                     sources.packet(&Packet {
                         device: AUTOPLAY_DEVICE,
@@ -239,7 +263,12 @@ mod tests {
     use bms_model::{Chart, ChartBuilder, Lane, NoteKind, TimeUs};
     use eval::{Binding, ControlId, InputKind, PhysicalInputEvent, SourceId, SourceProfile};
 
-    use super::{AUTOPLAY_DEVICE, AutoplayInput, TimeOverflow, autoplay, autoplay_count};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        AUTOPLAY_DEVICE, AutoplayInput, BeforePush, TimeOverflow, autoplay, autoplay_count,
+    };
     use crate::{DeviceId, DeviceKind, InputAdapter, SourceConfig, SourceReader, SourceSet};
 
     const MS: i64 = 1_000;
@@ -381,11 +410,52 @@ mod tests {
         }
     }
 
+    /// The logic step's end of a queue: each look reads the watermark,
+    /// then pops, and checks that every event at or below the watermark
+    /// is already poppable and that nothing arrives below a watermark read
+    /// before.
+    struct Consumer {
+        reader: SourceReader,
+        expected: Vec<PhysicalInputEvent>,
+        seen: Vec<PhysicalInputEvent>,
+        watermark: TimeUs,
+        looks: usize,
+    }
+
+    impl Consumer {
+        fn look(&mut self) {
+            self.looks += 1;
+            let published = self.reader.published().received_up_to;
+            assert!(published >= self.watermark, "the watermark moved back");
+            while let Some(ev) = self.reader.pop() {
+                assert!(
+                    ev.received > self.watermark,
+                    "{ev:?} below {:?}",
+                    self.watermark
+                );
+                self.seen.push(ev);
+            }
+            self.watermark = published;
+            let due = self
+                .expected
+                .iter()
+                .filter(|e| e.received <= published)
+                .count();
+            assert!(
+                self.seen.len() >= due,
+                "{} popped, {due} at or below {published:?}",
+                self.seen.len()
+            );
+        }
+    }
+
     /// I1: under poll schedules with 1 ms wakes, random delays and 50 ms
     /// stalls that leave several simultaneous events behind the poll, a
-    /// consumer reading after each poll finds every event at or below the
-    /// published watermark already poppable, and nothing below a watermark
-    /// it saw arrives later. Every event arrives once, in order.
+    /// consumer that looks before every single push, while the feeder is
+    /// paused inside its poll, and again after each poll, finds every
+    /// event at or below the published watermark already poppable, and
+    /// nothing below a watermark it saw arrives later. Every event arrives
+    /// once, in order, within the schedule's bounded number of polls.
     #[test]
     fn autoplay_input_pushes_each_event_before_publishing_past_it() {
         let chart = chart();
@@ -394,9 +464,18 @@ mod tests {
             let mut rng = Lcg(seed);
             let mut feeder = AutoplayInput::new(events.clone());
             let mut set = set();
-            let mut reader = opened(&mut feeder, &mut set);
-            let mut seen = Vec::new();
-            let mut watermark = TimeUs(i64::MIN);
+            let reader = opened(&mut feeder, &mut set);
+            let consumer = Arc::new(Mutex::new(Consumer {
+                reader,
+                expected: events.clone(),
+                seen: Vec::new(),
+                watermark: TimeUs(i64::MIN),
+                looks: 0,
+            }));
+            let between = Arc::clone(&consumer);
+            feeder.before_push = Some(BeforePush(Box::new(move || {
+                between.lock().unwrap().look();
+            })));
             let mut now = TimeUs(-1_000 * MS);
             while now.0 < 2_200 * MS {
                 now.0 += match rng.below(10) {
@@ -405,20 +484,11 @@ mod tests {
                     _ => MS,
                 };
                 feeder.poll(now, &mut set);
-                let published = reader.published().received_up_to;
-                assert!(published >= watermark, "the watermark moved back");
-                while let Some(ev) = reader.pop() {
-                    assert!(ev.received > watermark, "{ev:?} below {watermark:?}");
-                    seen.push(ev);
-                }
-                watermark = published;
-                let due = events.iter().filter(|e| e.received <= watermark).count();
-                assert!(
-                    seen.len() >= due,
-                    "seed {seed}: the prefix up to {watermark:?}"
-                );
+                consumer.lock().unwrap().look();
             }
-            assert_eq!(seen, events, "seed {seed}");
+            let consumer = consumer.lock().unwrap();
+            assert!(consumer.looks > events.len(), "seed {seed}");
+            assert_eq!(consumer.seen, events, "seed {seed}");
         }
     }
 
@@ -446,12 +516,16 @@ mod tests {
         .unwrap();
         let mut reader = opened(&mut feeder, &mut set);
         let expected = events.clone();
-        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let go = std::sync::Arc::clone(&ready);
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let go = Arc::clone(&ready);
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&done);
         let consumer = std::thread::spawn(move || {
             go.wait();
             let (mut seen, mut due) = (0, 0);
-            while seen < expected.len() {
+            loop {
+                // Read before the last look: once set, every push is done.
+                let last = finished.load(Ordering::Acquire);
                 let watermark = reader.published().received_up_to;
                 while expected.get(due).is_some_and(|e| e.received <= watermark) {
                     due += 1;
@@ -463,12 +537,16 @@ mod tests {
                     seen >= due,
                     "{seen} popped, {due} at or below {watermark:?}"
                 );
+                if last {
+                    return seen;
+                }
             }
         });
         ready.wait();
         let mut rng = Lcg(7);
         let mut now = TimeUs(-1_000 * MS);
-        while !feeder.is_done() {
+        // Past the last event: a bounded schedule, whatever is fed.
+        while now.0 < 6_100 * MS {
             now.0 += 1 + i64::try_from(rng.below(2 * MS as u64)).unwrap();
             feeder.poll(now, &mut set);
             // Time for the consumer to look between polls, as the logic
@@ -477,7 +555,9 @@ mod tests {
                 std::hint::spin_loop();
             }
         }
-        consumer.join().unwrap();
+        done.store(true, Ordering::Release);
+        assert_eq!(consumer.join().unwrap(), events.len());
+        assert!(feeder.is_done());
     }
 
     /// I2: with no event due, every poll still publishes `now − 1`: before
