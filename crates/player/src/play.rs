@@ -127,6 +127,13 @@ pub fn run(
             return;
         };
         print_report(&report);
+        println!(
+            "load: first {} ms, retry {}",
+            times.first.as_millis(),
+            times
+                .retry
+                .map_or_else(|| "-".to_owned(), |d| format!("{} ms", d.as_millis()))
+        );
         if controls.closing() {
             return;
         }

@@ -242,11 +242,11 @@ fn play(chart: &Path, started: Instant) -> Result<(), String> {
     .map_err(|e| format!("input: {e}"))?;
     let keys = &loaded.settings().device.keyboard;
     let (window_thread, window) = window::open(Arc::clone(&controls), keys.retry, keys.quit)?;
-    let size = window.inner_size();
+    let (width, height) = (window.width, window.height);
     let target = Target::Window {
         window: window.into(),
-        width: size.width,
-        height: size.height,
+        width,
+        height,
     };
     let render = render_side::spawn(
         move || Renderer::new(target, AdapterChoice::HighPerformance).map_err(|e| e.to_string()),

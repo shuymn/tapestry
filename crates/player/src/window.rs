@@ -5,6 +5,7 @@
 //! [`Controls`]. The event loop runs on a thread of its own, so the game
 //! keeps the main thread and the loaded chart never has to move.
 
+use std::num::NonZeroIsize;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
@@ -15,6 +16,10 @@ use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::platform::windows::EventLoopBuilderExtWindows;
+use winit::raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle,
+    Win32WindowHandle, WindowHandle,
+};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::controls::Controls;
@@ -26,8 +31,8 @@ struct App {
     controls: Arc<Controls>,
     retry: Option<u32>,
     quit: Option<u32>,
-    ready: Option<Sender<Result<Arc<Window>, String>>>,
-    window: Option<Arc<Window>>,
+    ready: Option<Sender<Result<Surface, String>>>,
+    window: Option<Window>,
 }
 
 impl ApplicationHandler<Exit> for App {
@@ -40,11 +45,11 @@ impl ApplicationHandler<Exit> for App {
             .with_fullscreen(Some(Fullscreen::Borderless(event_loop.primary_monitor())));
         match event_loop.create_window(attrs) {
             Ok(w) => {
-                let window = Arc::new(w);
-                window.set_cursor_visible(false);
-                self.controls.focus(window.has_focus());
-                self.window = Some(Arc::clone(&window));
-                let _ = ready.send(Ok(window));
+                w.set_cursor_visible(false);
+                self.controls.focus(w.has_focus());
+                let surface = surface(&w);
+                let _ = ready.send(surface);
+                self.window = Some(w);
             }
             Err(e) => {
                 let _ = ready.send(Err(format!("the window cannot be created: {e}")));
@@ -105,7 +110,7 @@ pub fn open(
     controls: Arc<Controls>,
     retry: Option<u32>,
     quit: Option<u32>,
-) -> Result<(WindowThread, Arc<Window>), String> {
+) -> Result<(WindowThread, Surface), String> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proxy_tx, proxy_rx) = mpsc::channel();
     let handle = std::thread::Builder::new()
@@ -157,4 +162,46 @@ pub fn open(
     };
     let _ = handle.join();
     window
+}
+
+/// The window as the render thread's surface target: its handle and size,
+/// read on the window thread, because winit hands out the handle only
+/// there. The window outlives the renderer: [`WindowThread::close`] comes
+/// after the render thread has ended.
+pub struct Surface {
+    hwnd: NonZeroIsize,
+    /// The client size in pixels.
+    pub width: u32,
+    /// See `width`.
+    pub height: u32,
+}
+
+fn surface(window: &Window) -> Result<Surface, String> {
+    let handle = window
+        .window_handle()
+        .map_err(|e| format!("the window has no handle: {e}"))?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return Err("the window is not a Win32 window".to_owned());
+    };
+    let size = window.inner_size();
+    Ok(Surface {
+        hwnd: h.hwnd,
+        width: size.width,
+        height: size.height,
+    })
+}
+
+impl HasWindowHandle for Surface {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let raw = RawWindowHandle::Win32(Win32WindowHandle::new(self.hwnd));
+        // SAFETY: the window stays open until the renderer using this
+        // handle is gone (see `Surface`).
+        Ok(unsafe { WindowHandle::borrow_raw(raw) })
+    }
+}
+
+impl HasDisplayHandle for Surface {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        Ok(DisplayHandle::windows())
+    }
 }
