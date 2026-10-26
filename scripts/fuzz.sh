@@ -81,11 +81,18 @@ fetch() {
   cargo fetch --manifest-path fuzz/Cargo.toml --locked
 }
 
+# Sets fuzz_args, the cargo-fuzz options of every build and run, once the
+# options are parsed.
+set_fuzz_args() {
+  fuzz_args=(--fuzz-dir fuzz --sanitizer "$sanitizer" --debug-assertions
+    --target-dir "${CARGO_TARGET_DIR:?the fuzz shell sets CARGO_TARGET_DIR}")
+}
+
 cargo_fuzz() {
   local command=$1
   shift
-  cargo fuzz "$command" --fuzz-dir fuzz --sanitizer "$sanitizer" --debug-assertions \
-    --target-dir "${CARGO_TARGET_DIR:?the fuzz shell sets CARGO_TARGET_DIR}" "$@"
+  set_fuzz_args
+  cargo fuzz "$command" "${fuzz_args[@]}" "$@"
 }
 
 write_seeds() {
@@ -158,13 +165,13 @@ run_canary() {
   rm -rf "$dir"
   mkdir -p "$dir/corpus" "$dir/artifacts"
   printf %s "$case" > "$dir/corpus/$case"
+  # Built outside the deadline, which bounds only the run.
   cargo_fuzz build canary
+  set_fuzz_args
   status=0
   # -runs=1: the seed always runs in full; no mutated input runs after it.
   # `timeout` signals the whole process group, the fuzzer included.
-  timeout --kill-after=10 120 \
-    cargo fuzz run --fuzz-dir fuzz --sanitizer "$sanitizer" --debug-assertions \
-    --target-dir "$CARGO_TARGET_DIR" canary "$dir/corpus" -- \
+  timeout --kill-after=10 120 cargo fuzz run "${fuzz_args[@]}" canary "$dir/corpus" -- \
     -runs=1 "${case_limits[@]}" -artifact_prefix="$dir/artifacts/" || status=$?
   for file in "$dir"/artifacts/*; do
     [ -f "$file" ] && echo "artifact: $(basename -- "$file")"
