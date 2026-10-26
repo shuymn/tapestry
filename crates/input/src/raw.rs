@@ -51,6 +51,22 @@ pub const fn key_control(make_code: u8, flags: u16) -> ControlId {
     ControlId(prefix | make_code as u32)
 }
 
+/// The scan code a window's keyboard message carries for the key with
+/// Raw Input control `control` ([`key_control`]): the same, `E0` keys
+/// included, except for two. The window names Pause `0x45` (the make code
+/// that follows its `E1 1D`, where Raw Input gives `0xE11D`) and NumLock
+/// `0xE045` (Raw Input: `0x45`). A window turns this into its key (winit's
+/// `PhysicalKey::from_scancode`), so a key bound through Raw Input is the
+/// same key in the window.
+#[must_use]
+pub const fn window_scan_code(control: ControlId) -> u32 {
+    match control.0 {
+        0xE11D => 0x45,
+        0x45 => 0xE045,
+        c => c,
+    }
+}
+
 fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
     let b = bytes.get(at..at + 2)?;
     Some(u16::from_ne_bytes([b[0], b[1]]))
