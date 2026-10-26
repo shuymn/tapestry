@@ -18,10 +18,9 @@ use common::{MS, PERIOD, RATE, count_judged, judgments, lane};
 use eval::{ControlId, InputKind, SourceId};
 use game::{
     AbortCause, ChartIngest, Command, DataRoot, DefaultPolicy, DeviceSettings, FailureAction,
-    GaugeIndex, IngestError, Ingested, Loaded, LocalRecords, Parts, Passthrough, PlayEnd,
-    PlayReport, PlayScript, PresetError, ReEvaluate, ReloadError, RunnerAudio, SaveError, Session,
-    SessionConfig, SessionError, SessionEvent, SessionEventSink, SessionPolicy, Settings,
-    preset_to_toml,
+    GaugeIndex, IngestError, Ingested, Loaded, Parts, PlayEnd, PlayReport, PlayScript, PresetError,
+    ReEvaluate, ReloadError, RunnerAudio, SaveError, Session, SessionConfig, SessionError,
+    SessionEvent, SessionEventSink, SessionPolicy, Settings, preset_to_toml,
 };
 use input::{Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceSet};
 use replay::{BuildProvenance, DecodeLimits, EndStatus, ReceiveMethod};
@@ -827,6 +826,7 @@ fn passthrough_transform_is_recorded() {
             version: 1
         }
     );
+    assert_eq!(rec.session_policy, "default");
     assert_eq!(rec.chart.random_seed, 7);
     let sha: [u8; 32] = sha2::Sha256::digest(&bytes).into();
     assert_eq!(rec.chart.identity.sha256, sha);
@@ -960,15 +960,6 @@ fn reevaluation_refuses_a_record_of_another_preset() {
     );
     assert!(!summary.matches_live);
     assert_eq!(summary.recommended_offset, None);
-}
-
-#[test]
-fn standard_parts_are_the_stage_one_set() {
-    let (_dir, root) = temp_root();
-    let parts = Parts::standard(&root, &game::PlayerSettings::default());
-    assert_eq!(parts.transform.id().id, "passthrough");
-    assert_eq!(parts.policy.id(), "default");
-    let _ = (ReEvaluate, LocalRecords::new(root.records()), Passthrough);
 }
 
 /// Accepts any `.chart` file up to `max` bytes and records how many bytes
