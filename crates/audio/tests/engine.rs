@@ -232,8 +232,8 @@ fn starts_beyond_the_pending_capacity_wait_for_the_next_step() {
     // (frame 0 plays at 10 ms), once as BGM 10 µs apart from 10 ms and once
     // as key commands in one step: more than the 1024 starts the mixer
     // holds. Each is its own sound (a start of the same one would stop the
-    // last), and every one still sounds, each with its sample, none
-    // dropped.
+    // last). None is dropped: every start is applied at its frame, where as
+    // many sound as the 128 voices hold.
     const N: usize = 1_100;
     const RATE96: u32 = 96_000;
     let bank = || {
@@ -279,26 +279,35 @@ fn starts_beyond_the_pending_capacity_wait_for_the_next_step() {
         assert_eq!(e.mixer().dropped_starts(), 0);
         assert_eq!(e.mixer().cuts(), 0);
         let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
-        // A sample of 100, halved by the headroom.
+        // A sample of 100, halved by the headroom; 128 of them, 0.2, stay
+        // below the clipper's knee, and every such sum is exact in f32.
         let one = 100.0 / 65_536.0;
+        let mut per_frame = vec![0usize; left.len()];
         for s in &starts {
-            assert!(left[s.frame as usize] >= one, "frame {}", s.frame);
+            per_frame[s.frame as usize] += 1;
         }
+        let first = starts[0].frame as usize;
         if as_bgm {
             // At most two share a frame, except the 76 that waited, which
-            // all start at the first frame of the next block. The 128
-            // voices hold them, so nothing is stolen or saturates, and the
-            // samples add up to one per start.
+            // all start at the first frame of the next block: nothing is
+            // stolen.
+            assert_eq!(per_frame[first + 1_920], 76);
             assert_eq!(e.mixer().steals(), 0);
-            let total: f32 = left.iter().sum();
-            assert!((total - N as f32 * one).abs() < 1e-3, "{total}");
         } else {
             // Key sounds start at the first unwritten frame: 1024 in the
-            // first fill, the other 76 at the start of the next block.
-            let first = starts[0].frame;
-            let at_first = starts.iter().filter(|s| s.frame == first).count();
-            assert_eq!(at_first, 1_024);
-            assert!(starts[1_024..].iter().all(|s| s.frame == first + 1_920));
+            // first fill, of which the 128 voices sound 128 (each other
+            // start steals a voice that has not sounded: 896 steals), and
+            // the other 76 at the start of the next block.
+            assert_eq!(per_frame[first], 1_024);
+            assert_eq!(per_frame[first + 1_920], 76);
+            assert_eq!(left[first], 128.0 * one);
+            assert_eq!(left[first + 1_920], 76.0 * one);
+            assert_eq!(e.mixer().steals(), 896);
+        }
+        // Each frame holds one sample per start there, up to the 128 voices,
+        // and is silent elsewhere.
+        for (f, (&x, &n)) in left.iter().zip(&per_frame).enumerate() {
+            assert_eq!(x, n.min(128) as f32 * one, "bgm {as_bgm}, frame {f}");
         }
     }
 }
