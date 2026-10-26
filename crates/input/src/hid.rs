@@ -146,18 +146,11 @@ pub fn widened_wrap(cap: &AxisCap, lo: i32, hi: i32) -> Option<u32> {
     if cap.relative || (cap.min <= lo && hi <= cap.max) {
         return None;
     }
-    let (lo, hi) = (i64::from(lo.min(cap.min)), i64::from(hi.max(cap.max)));
-    let signed = cap.signed;
+    let (lo, hi) = (lo.min(cap.min), hi.max(cap.max));
     (1..=cap.bits.min(31)).find_map(|k| {
-        let size = 1_i64 << k;
-        let (low, high) = if signed {
-            (-size / 2, size / 2 - 1)
-        } else {
-            (0, size - 1)
-        };
-        (low <= lo && hi <= high)
-            .then(|| u32::try_from(size).ok())
-            .flatten()
+        let size = 1_u32 << k;
+        let (low, high) = wrap_range(cap, size)?;
+        (low <= lo && hi <= high).then_some(size)
     })
 }
 

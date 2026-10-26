@@ -374,12 +374,13 @@ mod tests {
         let mut reached_full_scale = false;
         while x.is_finite() {
             x = x.next_up() * 1.001;
-            for y in [soft_clip(x), -soft_clip(-x)] {
+            let y = soft_clip(x);
+            for y in [y, -soft_clip(-x)] {
                 assert!(y > SOFT_CLIP_KNEE && y <= 1.0, "{x}: {y}");
                 assert!(y >= prev, "{x}: {y} < {prev}");
             }
-            prev = soft_clip(x);
-            reached_full_scale |= prev == 1.0;
+            prev = y;
+            reached_full_scale |= y == 1.0;
         }
         assert!(reached_full_scale);
         assert_eq!(soft_clip(f32::MAX), 1.0);
