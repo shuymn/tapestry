@@ -57,9 +57,15 @@ jobs:
       - name: Production excludes dev-tools
         run: |
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
-          for arg in --dev-tools-probe --dev-scripted-input; do
+          # Each development argument, alone and in the `play` form a
+          # development build takes (the dev-tools tests are the positive
+          # control).
+          for args in "--dev-tools-probe x" "--dev-scripted-input x" \
+              "play x.bms --dev-scripted-input x" "play x.bms --dev-frames x"; do
+            arg=$(echo "$args" | grep -o -- "--dev-[a-z-]*")
             set +e
-            target/release/tapestry.exe "$arg" x 2> probe.err
+            # shellcheck disable=SC2086 # split into arguments on purpose
+            target/release/tapestry.exe $args 2> probe.err
             code=$?
             set -e
             cat probe.err
