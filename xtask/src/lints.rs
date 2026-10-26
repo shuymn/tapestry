@@ -8,7 +8,8 @@
 //!   exactly its own lint (`dead_code` aside), so removing a lint from its
 //!   configuration, or lowering it to a warning, fails the check. The cfg
 //!   is set only here, so no build ever contains the fixtures.
-//! - Site check (text, so it also covers the Windows-only files): every
+//! - Site check (parsed source, so it also covers the Windows-only
+//!   files, which are not compiled here): every
 //!   workspace member inherits `[workspace.lints]`; the cast and
 //!   disallowed-API lines stand at the crate roots in [`CRATE_ROOT_LINES`];
 //!   every in-play site in [`IN_PLAY`] carries the attribute denying
@@ -28,6 +29,8 @@ use std::process::Command;
 
 use cargo_metadata::diagnostic::DiagnosticLevel;
 use cargo_metadata::{Message, MetadataCommand};
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use quote::ToTokens as _;
 
 /// The cfg that compiles the fixtures.
 const FIXTURE_CFG: &str = "tapestry_lint_fixtures";
@@ -541,8 +544,7 @@ pub fn check_sites(root: &Path, members: &[PathBuf]) -> Result<Vec<String>, Stri
         }
     }
     for &(file, lines) in CRATE_ROOT_LINES {
-        let text = read(&root.join(file))?;
-        let attrs = inner_attributes(&text);
+        let attrs = inner_attributes(&parse_source(root, file)?);
         for line in lines {
             if !attrs.contains(&normalize(line)) {
                 out.push(format!("{file}: crate root lacks `{line}`"));
@@ -562,16 +564,16 @@ fn check_site(root: &Path, site: Site) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     match site {
         Site::File(file) => {
-            let text = read(&root.join(file))?;
-            if !inner_attributes(&text).contains(&normalize(MODULE_ATTR)) {
+            if !has_module_attr(&parse_source(root, file)?) {
                 out.push(format!(
                     "{file}: in-play module lacks `{MODULE_ATTR}` before its first item"
                 ));
             }
         }
         Site::Fns(file, names) => {
-            let text = read(&root.join(file))?;
-            let fns = fn_attributes(&text);
+            let source = parse_source(root, file)?;
+            let whole = has_module_attr(&source);
+            let fns = fn_attributes(&source);
             let fn_attr = normalize(FN_ATTR);
             for name in names {
                 let defs: Vec<_> = fns.iter().filter(|(n, _)| n == name).collect();
@@ -579,7 +581,7 @@ fn check_site(root: &Path, site: Site) -> Result<Vec<String>, String> {
                     out.push(format!("{file}: in-play function `{name}` not found"));
                 }
                 for (_, attrs) in defs {
-                    if !attrs.contains(&fn_attr) {
+                    if !whole && !attrs.contains(&fn_attr) {
                         out.push(format!(
                             "{file}: in-play function `{name}` lacks `{FN_ATTR}`"
                         ));
@@ -643,7 +645,8 @@ fn check_fixture_files(root: &Path) -> Result<Vec<String>, String> {
             let entry = entry.map_err(|e| format!("reading {dir}: {e}"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let text = read(&entry.path())?;
-            if let Some(attr) = any_attribute(&text) {
+            let attr = any_attribute(&text).map_err(|e| format!("parsing {dir}/{name}: {e}"))?;
+            if let Some(attr) = attr {
                 out.push(format!(
                     "{dir}/{name}: fixtures carry no attribute, found `{attr}`"
                 ));
@@ -685,349 +688,175 @@ fn normalize(attr: &str) -> String {
     compact.replace(",)", ")")
 }
 
-/// Whether `line` starts an outer or inner attribute.
-fn is_attribute(line: &str) -> bool {
-    line.starts_with("#[") || line.starts_with("#![")
+/// `attr` as source text, normalized.
+fn attr_text(attr: &syn::Attribute) -> String {
+    normalize(&attr.to_token_stream().to_string())
 }
 
-/// Splits `text` into lines and joins each attribute (from `#[` or `#![`
-/// at the start of a line to its closing bracket) into one entry. Other
-/// lines stay as they are. Brackets inside string literals are skipped.
-fn logical_lines(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut lines = text.lines();
-    while let Some(line) = lines.next() {
-        let trimmed = line.trim_start();
-        if !is_attribute(trimmed) {
-            out.push(line.to_owned());
-            continue;
-        }
-        let mut attr = trimmed.to_owned();
-        let mut depth = bracket_depth(trimmed);
-        while depth > 0 {
-            let Some(next) = lines.next() else { break };
-            attr.push('\n');
-            attr.push_str(next);
-            depth += bracket_depth(next);
-        }
-        out.push(attr);
-    }
-    out
+/// Parses the Rust source file `path`. A file that does not parse fails
+/// the check: it cannot be shown to carry its attributes.
+fn parse_source(root: &Path, path: &str) -> Result<syn::File, String> {
+    let text = read(&root.join(path))?;
+    syn::parse_file(&text).map_err(|e| format!("parsing {path}: {e}"))
 }
 
-/// The change in bracket depth over `s`, outside string literals.
-fn bracket_depth(s: &str) -> i32 {
-    let mut depth = 0;
-    let mut in_str = false;
-    let mut escaped = false;
-    for c in s.chars() {
-        if in_str {
-            match (escaped, c) {
-                (true, _) => escaped = false,
-                (false, '\\') => escaped = true,
-                (false, '"') => in_str = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => in_str = true,
-            '[' => depth += 1,
-            ']' => depth -= 1,
-            _ => {}
-        }
-    }
-    depth
+/// The file's inner attributes (those before its first item), normalized.
+fn inner_attributes(file: &syn::File) -> Vec<String> {
+    file.attrs.iter().map(attr_text).collect()
 }
 
-/// The inner attributes before the first item, normalized. Comments and
-/// blank lines are skipped; anything else ends them.
-fn inner_attributes(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in logical_lines(text) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") {
-            continue;
-        }
-        if trimmed.starts_with("#![") {
-            out.push(normalize(trimmed));
-            continue;
-        }
-        break;
-    }
-    out
+/// Whether the file carries [`MODULE_ATTR`], which covers all its code.
+fn has_module_attr(file: &syn::File) -> bool {
+    inner_attributes(file).contains(&normalize(MODULE_ATTR))
 }
 
 /// Each function definition outside `#[cfg(test)]` modules, named as
 /// [`Site::Fns`] names it (`Type::name` inside an `impl` or `trait` block,
-/// `name` elsewhere), with its outer attributes, normalized. A test
-/// module's body is skipped and the items after it are read.
-fn fn_attributes(text: &str) -> Vec<(String, Vec<String>)> {
-    let masked = mask(text);
-    let lines: Vec<&str> = text.lines().collect();
-    let code: Vec<&str> = masked.lines().collect();
+/// `name` elsewhere), with its outer attributes, normalized. Functions in
+/// nested modules are named the same way; functions inside function
+/// bodies are not items of the file and are left out.
+fn fn_attributes(file: &syn::File) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
-    let mut pending: Vec<String> = Vec::new();
-    // Open `impl`/`trait` blocks: the type and the depth outside the block.
-    let mut blocks: Vec<(String, i32)> = Vec::new();
-    // A block header seen whose `{` has not opened yet.
-    let mut header: Option<String> = None;
-    // The depth a skipped test module's body returns to.
-    let mut skip_to: Option<i32> = None;
-    let mut depth = 0;
-    let mut i = 0;
-    while let (Some(&line), Some(&masked_line)) = (lines.get(i), code.get(i)) {
-        i += 1;
-        let before = depth;
-        depth += brace_depth(masked_line);
-        if let Some(target) = skip_to {
-            if depth <= target {
-                skip_to = None;
+    collect_fns(&file.items, &mut out);
+    out
+}
+
+fn collect_fns(items: &[syn::Item], out: &mut Vec<(String, Vec<String>)>) {
+    let texts = |attrs: &[syn::Attribute]| attrs.iter().map(attr_text).collect::<Vec<_>>();
+    for item in items {
+        match item {
+            syn::Item::Fn(f) => out.push((f.sig.ident.to_string(), texts(&f.attrs))),
+            syn::Item::Impl(block) => {
+                let ty = type_name(&block.self_ty);
+                for item in &block.items {
+                    if let syn::ImplItem::Fn(f) = item {
+                        out.push((format!("{ty}::{}", f.sig.ident), texts(&f.attrs)));
+                    }
+                }
             }
-            continue;
+            syn::Item::Trait(block) => {
+                for item in &block.items {
+                    if let syn::TraitItem::Fn(f) = item {
+                        out.push((format!("{}::{}", block.ident, f.sig.ident), texts(&f.attrs)));
+                    }
+                }
+            }
+            syn::Item::Mod(m) if !is_test_module(&m.attrs) => {
+                if let Some((_, items)) = &m.content {
+                    collect_fns(items, out);
+                }
+            }
+            _ => {}
         }
-        while blocks.last().is_some_and(|&(_, outside)| depth <= outside) {
-            blocks.pop();
+    }
+}
+
+/// Whether a module's attributes include `#[cfg(test)]`.
+fn is_test_module(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| attr_text(a) == "#[cfg(test)]")
+}
+
+/// The name an `impl` block's type gives its functions: the last path
+/// segment (`S` for `S<T>`, `&S` or `crate::m::S`), or the whole type,
+/// normalized, for any other type.
+fn type_name(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map_or_else(String::new, |s| s.ident.to_string()),
+        syn::Type::Reference(r) => type_name(&r.elem),
+        syn::Type::Paren(p) => type_name(&p.elem),
+        syn::Type::Group(g) => type_name(&g.elem),
+        other => normalize(&other.to_token_stream().to_string()),
+    }
+}
+
+/// The first attribute anywhere in fixture source `text`, normalized, if
+/// any: outer or inner, on any item, statement, expression or field, and
+/// in macro input (where the parser sees only tokens). Doc comments
+/// (`#[doc = "..."]`) set no lint and are allowed. `Err` when `text` does
+/// not parse.
+fn any_attribute(text: &str) -> Result<Option<String>, syn::Error> {
+    let file = syn::parse_file(text)?;
+    let mut found = FirstAttribute(None);
+    syn::visit::visit_file(&mut found, &file);
+    Ok(found.0)
+}
+
+struct FirstAttribute(Option<String>);
+
+impl<'ast> syn::visit::Visit<'ast> for FirstAttribute {
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        if self.0.is_none() {
+            self.0 = token_attribute(attr.to_token_stream());
         }
-        let trimmed = line.trim();
-        if masked_line.trim().is_empty() {
-            // A comment or a blank line.
-            continue;
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if self.0.is_none() {
+            self.0 = token_attribute(mac.tokens.clone());
         }
-        if is_attribute(trimmed) {
-            // Join a wrapped attribute; its brackets are balanced in code.
-            let mut attr = trimmed.to_owned();
-            let mut open = bracket_depth(masked_line);
-            while open > 0 {
-                let (Some(&next), Some(&next_code)) = (lines.get(i), code.get(i)) else {
-                    break;
+        syn::visit::visit_macro(self, mac);
+    }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if let syn::Item::Verbatim(tokens) = item
+            && self.0.is_none()
+        {
+            self.0 = token_attribute(tokens.clone());
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if let syn::Expr::Verbatim(tokens) = expr
+            && self.0.is_none()
+        {
+            self.0 = token_attribute(tokens.clone());
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+}
+
+/// The first attribute (`#` and `[...]`, or `#`, `!` and `[...]`) in
+/// `tokens`, at any depth, other than a doc comment (`doc = "..."`),
+/// normalized.
+fn token_attribute(tokens: TokenStream) -> Option<String> {
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    for (k, tree) in trees.iter().enumerate() {
+        match tree {
+            TokenTree::Punct(p) if p.as_char() == '#' => {
+                let (bang, group) = match trees.get(k + 1..).unwrap_or_default() {
+                    [TokenTree::Punct(b), TokenTree::Group(g), ..] if b.as_char() == '!' => {
+                        ("!", g)
+                    }
+                    [TokenTree::Group(g), ..] => ("", g),
+                    _ => continue,
                 };
-                i += 1;
-                depth += brace_depth(next_code);
-                attr.push_str(next);
-                open += bracket_depth(next_code);
-            }
-            pending.push(normalize(&attr));
-            continue;
-        }
-        let attrs = std::mem::take(&mut pending);
-        if let Some(name) = block_type(trimmed) {
-            header = Some(name);
-        }
-        // A `{` ends the header: its block opens here, or opens and closes.
-        if masked_line.contains('{')
-            && let Some(name) = header.take()
-            && depth > before
-        {
-            blocks.push((name, before));
-        }
-        if trimmed.starts_with("mod ") && attrs.iter().any(|a| a == "#[cfg(test)]") {
-            if depth > before {
-                skip_to = Some(before);
-            }
-            continue;
-        }
-        if let Some(name) = fn_name(trimmed) {
-            let name = match blocks.last() {
-                Some((ty, _)) => format!("{ty}::{name}"),
-                None => name.to_owned(),
-            };
-            out.push((name, attrs));
-        }
-    }
-    out
-}
-
-/// `text` with the contents of comments, string literals and character
-/// literals replaced by spaces (line breaks kept), so braces and brackets
-/// in it are code. Raw strings are handled; a lifetime is not a literal.
-fn mask(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
-    let mut i = 0;
-    while let Some(&c) = chars.get(i) {
-        let next = chars.get(i + 1).copied();
-        // The end (exclusive) of a comment or literal starting at `i`.
-        let end = if c == '/' && next == Some('/') {
-            (i..chars.len())
-                .find(|&k| chars.get(k) == Some(&'\n'))
-                .unwrap_or(chars.len())
-        } else if c == '/' && next == Some('*') {
-            let mut depth = 0;
-            let mut k = i;
-            loop {
-                match (chars.get(k), chars.get(k + 1)) {
-                    (Some('/'), Some('*')) => {
-                        depth += 1;
-                        k += 2;
-                    }
-                    (Some('*'), Some('/')) => {
-                        depth -= 1;
-                        k += 2;
-                        if depth == 0 {
-                            break k;
-                        }
-                    }
-                    (Some(_), _) => k += 1,
-                    (None, _) => break k,
+                if group.delimiter() != Delimiter::Bracket {
+                    continue;
+                }
+                let body: Vec<TokenTree> = group.stream().into_iter().collect();
+                let doc = matches!(
+                    body.as_slice(),
+                    [TokenTree::Ident(i), TokenTree::Punct(eq), TokenTree::Literal(l)]
+                        if *i == "doc" && eq.as_char() == '=' && l.to_string().starts_with('"')
+                );
+                if !doc {
+                    return Some(normalize(&format!("#{bang}{group}")));
                 }
             }
-        } else if c == '"' {
-            let mut k = i + 1;
-            loop {
-                match chars.get(k) {
-                    Some('\\') => k += 2,
-                    Some('"') => break k + 1,
-                    Some(_) => k += 1,
-                    None => break k,
+            TokenTree::Group(g) => {
+                if let Some(found) = token_attribute(g.stream()) {
+                    return Some(found);
                 }
             }
-        } else if c == 'r'
-            && (next == Some('"') || next == Some('#'))
-            && !chars
-                .get(i.wrapping_sub(1))
-                .is_some_and(|p| p.is_alphanumeric() || *p == '_')
-        {
-            let hashes = chars
-                .get(i + 1..)
-                .unwrap_or_default()
-                .iter()
-                .take_while(|&&h| h == '#')
-                .count();
-            if chars.get(i + 1 + hashes) == Some(&'"') {
-                let mut k = i + 2 + hashes;
-                loop {
-                    if chars.get(k).is_none() {
-                        break k;
-                    }
-                    if chars.get(k) == Some(&'"')
-                        && (1..=hashes).all(|h| chars.get(k + h) == Some(&'#'))
-                    {
-                        break k + 1 + hashes;
-                    }
-                    k += 1;
-                }
-            } else {
-                i + 1
-            }
-        } else if c == '\'' {
-            // `'x'` or `'\n'`-style: a literal; anything else is a lifetime.
-            match (next, chars.get(i + 2)) {
-                // The escape takes at least `i + 2`, so `'\''` ends at `i + 3`.
-                (Some('\\'), _) => (i + 3..chars.len())
-                    .find(|&k| chars.get(k) == Some(&'\''))
-                    .map_or(chars.len(), |k| k + 1),
-                (Some(_), Some('\'')) => i + 3,
-                _ => i + 1,
-            }
-        } else {
-            i + 1
-        };
-        if end == i + 1 {
-            out.push(c);
-        } else {
-            out.extend(
-                chars
-                    .get(i..end)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|&c| blank(c)),
-            );
-        }
-        i = end;
-    }
-    out
-}
-
-/// The change in brace depth over code `s` (masked by [`mask`]).
-fn brace_depth(s: &str) -> i32 {
-    s.chars()
-        .map(|c| match c {
-            '{' => 1,
-            '}' => -1,
-            _ => 0,
-        })
-        .sum()
-}
-
-/// The type an `impl` or `trait` header line names: `S` for `impl S`,
-/// `impl<T> S<T>`, `impl Trait for S<'_>` and `unsafe impl Send for S`;
-/// `T` for `pub trait T: Send`.
-fn block_type(line: &str) -> Option<String> {
-    let mut rest = line;
-    for prefix in ["pub(crate) ", "pub(super) ", "pub ", "unsafe "] {
-        if let Some(r) = rest.strip_prefix(prefix) {
-            rest = r;
+            _ => {}
         }
     }
-    let rest = if let Some(r) = rest.strip_prefix("trait ") {
-        r
-    } else {
-        let r = rest.strip_prefix("impl")?;
-        let r = if r.starts_with('<') {
-            // Skip the generics, which may nest.
-            let mut depth = 0;
-            let end = r.char_indices().find_map(|(k, c)| {
-                match c {
-                    '<' => depth += 1,
-                    '>' => depth -= 1,
-                    _ => {}
-                }
-                (depth == 0).then_some(k + 1)
-            })?;
-            r.get(end..)?
-        } else if r.starts_with(' ') {
-            r
-        } else {
-            return None;
-        };
-        let r = r.trim_start();
-        r.split_once(" for ").map_or(r, |(_, ty)| ty)
-    };
-    let path = rest
-        .trim_start()
-        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
-        .next()?;
-    let name = path.trim_end_matches(':').rsplit("::").next()?;
-    (!name.is_empty()).then(|| name.to_owned())
-}
-
-/// The name of the function `line` defines, if it starts a definition.
-fn fn_name(line: &str) -> Option<&str> {
-    let mut rest = line;
-    if let Some(r) = rest.strip_prefix("pub") {
-        rest = r.trim_start();
-        if rest.starts_with('(') {
-            let close = rest.find(')')?;
-            rest = rest.get(close + 1..)?.trim_start();
-        }
-    }
-    for qualifier in [
-        "const ",
-        "async ",
-        "unsafe ",
-        "extern \"C\" ",
-        "extern \"system\" ",
-    ] {
-        if let Some(r) = rest.strip_prefix(qualifier) {
-            rest = r.trim_start();
-        }
-    }
-    let rest = rest.strip_prefix("fn ")?;
-    let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
-    let next = rest.get(end..)?;
-    (next.starts_with('(') || next.starts_with('<')).then(|| rest.get(..end))?
-}
-
-/// The first line of `text` holding `#[` or `#![` anywhere, if any.
-/// Fixtures need no attribute, and an attribute anywhere (in a nested
-/// module, after code on a line, kept by `#[rustfmt::skip]`) could set a
-/// lint level, so any one is rejected without parsing.
-fn any_attribute(text: &str) -> Option<String> {
-    text.lines()
-        .find(|line| line.contains("#[") || line.contains("#!["))
-        .map(|line| line.trim().to_owned())
+    None
 }
 
 #[cfg(test)]
@@ -1042,7 +871,7 @@ mod tests {
 
     use super::{
         Diag, FN_ATTR, LINTS, MODULE_ATTR, Site, any_attribute, check_site, classify,
-        fn_attributes, inner_attributes, json_messages, normalize, workspace_relative,
+        fn_attributes, has_module_attr, json_messages, normalize, workspace_relative,
     };
 
     fn diag(file: &str, code: &str, error: bool) -> Diag {
@@ -1150,18 +979,39 @@ mod tests {
         assert_eq!(classify(&diags).len(), 2);
     }
 
+    fn parsed(text: &str) -> syn::File {
+        syn::parse_file(text).unwrap()
+    }
+
+    fn fn_names(text: &str) -> Vec<String> {
+        fn_attributes(&parsed(text))
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    }
+
     #[test]
     fn module_attribute_is_found_only_before_the_first_item() {
-        let ok = format!("//! Docs.\n\n{MODULE_ATTR}\n\nuse std::fmt;\n");
-        assert!(inner_attributes(&ok).contains(&normalize(MODULE_ATTR)));
-        let wrapped = "//! Docs.\n#![deny(\n    clippy::expect_used,\n    clippy::indexing_slicing,\n    clippy::unwrap_used\n)]\nuse std::fmt;\n";
-        assert!(inner_attributes(wrapped).contains(&normalize(MODULE_ATTR)));
-        let late = format!("//! Docs.\nuse std::fmt;\n{MODULE_ATTR}\n");
-        assert!(!inner_attributes(&late).contains(&normalize(MODULE_ATTR)));
-        let commented = format!("//! Docs.\n// {MODULE_ATTR}\nuse std::fmt;\n");
-        assert!(!inner_attributes(&commented).contains(&normalize(MODULE_ATTR)));
+        let has = |text: &str| has_module_attr(&parsed(text));
+        assert!(has(&format!(
+            "//! Docs.\n\n{MODULE_ATTR}\n\nuse std::fmt;\n"
+        )));
+        let wrapped = "//! Docs.\n#![deny(\n    clippy::expect_used,\n    clippy::indexing_slicing,\n    clippy::unwrap_used,\n)]\nuse std::fmt;\n";
+        assert!(has(wrapped));
+        assert!(!has(&format!(
+            "//! Docs.\n// {MODULE_ATTR}\nuse std::fmt;\n"
+        )));
         let cfg_attr = "#![cfg_attr(any(), deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used))]\nuse std::fmt;\n";
-        assert!(!inner_attributes(cfg_attr).contains(&normalize(MODULE_ATTR)));
+        assert!(!has(cfg_attr));
+        // Not before the first item: the file does not parse, and fails
+        // the check.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("late.rs"),
+            format!("use std::fmt;\n{MODULE_ATTR}\n"),
+        )
+        .unwrap();
+        assert!(check_site(dir.path(), Site::File("late.rs")).is_err());
     }
 
     #[test]
@@ -1171,19 +1021,25 @@ mod tests {
         file("ok.rs", &format!("{MODULE_ATTR}\nfn f() {{}}\n"));
         file("missing.rs", "fn f() {}\n");
         file(
+            "whole.rs",
+            &format!("{MODULE_ATTR}\nimpl S {{\n    fn hot() {{}}\n}}\n"),
+        );
+        file("broken.rs", "fn f( {}\n");
+        file(
             "fns.rs",
             &format!(
                 "/// Doc.\n#[must_use]\n{FN_ATTR}\npub(crate) const fn hot() -> u8 {{ 0 }}\n\
                  impl S {{\n    {FN_ATTR}\n    fn twice(&self) {{}}\n}}\n\
                  impl<T: Copy> fmt::Debug for U<T>\nwhere\n    T: Send,\n{{\n    fn twice(&self) {{}}\n}}\n\
                  fn cold() {{}}\n\
-                 #[cfg(test)]\nmod tests {{\n    fn hot() {{ let _ = \"}}\"; let _ = '}}'; }}\n}}\n\
-                 impl Late {{\n    // }}\n    fn after(&self) {{}}\n}}\n"
+                 #[cfg(test)]\nmod tests {{\n    fn hot() {{}}\n}}\n\
+                 impl Late {{\n    fn after(&self) {{}}\n}}\n"
             ),
         );
         let check = |site| check_site(dir.path(), site).unwrap();
         assert!(check(Site::File("ok.rs")).is_empty());
         assert_eq!(check(Site::File("missing.rs")).len(), 1);
+        assert!(check(Site::Fns("whole.rs", &["S::hot"])).is_empty());
         assert!(check(Site::Fns("fns.rs", &["hot"])).is_empty());
         // Each name binds to its own block: one carries it, one does not,
         // and neither is a free function.
@@ -1196,45 +1052,114 @@ mod tests {
         let late = check(Site::Fns("fns.rs", &["Late::after"]));
         assert_eq!(late.len(), 1, "{late:?}");
         assert!(late[0].contains("lacks"), "{late:?}");
+        // A file that does not parse fails closed.
+        assert!(check_site(dir.path(), Site::Fns("broken.rs", &["f"])).is_err());
+        assert!(check_site(dir.path(), Site::File("broken.rs")).is_err());
     }
 
     #[test]
     fn test_modules_are_skipped_and_scanning_resumes() {
-        let text = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() {\n        \
-                    let _ = r#\"}\"#;\n        /* } */\n    }\n}\n\
-                    pub trait R: Send {\n    fn c(&self) {}\n}\n\
+        let text = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() {}\n}\n\
+                    pub trait R: Send {\n    fn c(&self) {}\n    fn decl(&self);\n}\n\
                     #[cfg(test)]\nmod more;\nunsafe impl Send for V {}\nfn d<'a>(x: &'a u8) {}\n\
-                    impl W {\n    const C: [(char, char); 2] = [('\\'','{'), ('\\\\','}')];\n    \
-                    fn e() {}\n}\nfn f() {}\n";
-        let fns = fn_attributes(text);
-        let names: Vec<_> = fns.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["a", "R::c", "d", "W::e", "f"]);
+                    mod nested {\n    impl W {\n        fn e() {}\n    }\n}\nfn f() {}\n";
+        assert_eq!(fn_names(text), ["a", "R::c", "R::decl", "d", "W::e", "f"]);
     }
 
     #[test]
     fn wrapped_function_attributes_are_joined() {
         let text = "impl S {\n    #[deny(\n        clippy::expect_used,\n        clippy::indexing_slicing,\n        clippy::unwrap_used,\n    )]\n    #[expect(\n        clippy::indexing_slicing,\n        reason = \"[x]\"\n    )]\n    fn f(&self) {}\n}\n";
-        let fns = fn_attributes(text);
+        let fns = fn_attributes(&parsed(text));
         assert_eq!(fns.len(), 1);
         let (name, attrs) = &fns[0];
         assert_eq!(name, "S::f");
         assert!(attrs.contains(&normalize(FN_ATTR)), "{attrs:?}");
     }
 
+    /// Writes `text` as `x.rs` and checks the in-play functions `names`.
+    fn check_fns(text: &str, names: &'static [&'static str]) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("x.rs"), text).unwrap();
+        check_site(dir.path(), Site::Fns("x.rs", names)).unwrap()
+    }
+
+    #[test]
+    fn a_raw_byte_string_hides_no_definition() {
+        // An annotated copy inside the literal is not a definition, and the
+        // real one after it is read.
+        let text = format!(
+            "const FAKE: &[u8] = br#\"\nimpl S {{\n    {FN_ATTR}\n    fn hot() {{}}\n}}\n\"#;\n\
+             const FAKE_C: &core::ffi::CStr = cr#\"\nimpl S {{ fn hot() {{}} }}\n\"#;\n\
+             impl S {{\n    fn hot() {{}}\n}}\n"
+        );
+        let out = check_fns(&text, &["S::hot"]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("`S::hot` lacks"), "{out:?}");
+    }
+
+    #[test]
+    fn an_arrow_in_impl_generics_keeps_the_type() {
+        // `F: Fn() -> u8` does not end the generics: both blocks are `S`'s,
+        // and the unprotected one fails.
+        let text = format!(
+            "impl<F: Fn() -> u8> S<F> {{\n    fn hot() {{}}\n}}\n\
+             impl S<fn() -> u8> {{\n    {FN_ATTR}\n    fn hot() {{}}\n}}\n"
+        );
+        let out = check_fns(&text, &["S::hot"]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("`S::hot` lacks"), "{out:?}");
+    }
+
+    #[test]
+    fn a_test_module_of_any_visibility_is_skipped() {
+        let text = format!(
+            "{FN_ATTR}\nfn hot() {{}}\n\
+             #[cfg(test)]\npub(crate) mod tests {{\n    fn hot() {{}}\n}}\n\
+             #[cfg(test)]\npub mod more_tests {{\n    fn hot() {{}}\n}}\n\
+             fn cold() {{}}\n"
+        );
+        // The test copies of `hot` do not count; `cold` after them lacks it.
+        assert!(check_fns(&text, &["hot"]).is_empty());
+        let out = check_fns(&text, &["cold"]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("`cold` lacks"), "{out:?}");
+        // `cfg(not(test))` is production code.
+        let not_test = "#[cfg(not(test))]\nmod prod {\n    fn cold() {}\n}\n";
+        assert_eq!(check_fns(not_test, &["cold"]).len(), 1);
+    }
+
     #[test]
     fn fixture_files_reject_any_attribute() {
-        assert_eq!(any_attribute("fn f() {}\n"), None);
-        assert_eq!(any_attribute("//! Docs that allow(x).\nmod a;\n"), None);
-        assert!(any_attribute("#[allow(dead_code)]\nfn f() {}\n").is_some());
-        assert!(any_attribute("#![expect(clippy::todo)]\n").is_some());
-        assert!(any_attribute("#[inline]\nfn f() {}\n").is_some());
+        let found = |text: &str| any_attribute(text).unwrap();
+        assert_eq!(found("fn f() {}\n"), None);
+        assert_eq!(
+            found("//! Docs that allow(x).\n/// Doc.\nfn f() {}\n"),
+            None
+        );
+        assert!(found("#[allow(dead_code)]\nfn f() {}\n").is_some());
+        assert!(found("#![expect(clippy::todo)]\n").is_some());
+        assert!(found("#[inline]\nfn f() {}\n").is_some());
+        assert!(found("#[doc(hidden)]\nfn f() {}\n").is_some());
         // Kept on one line by `#[rustfmt::skip]`: a lint level in a nested
-        // module, not at the start of a line.
+        // module.
         let nested =
             "#[rustfmt::skip]\nmod inner { #[deny(clippy::todo)] fn f() -> u8 { todo!() } }\n";
-        assert!(any_attribute(nested).is_some());
+        assert_eq!(found(nested).as_deref(), Some("#[rustfmt::skip]"));
         let inline = "mod inner { #[deny(clippy::todo)] fn f() -> u8 { todo!() } }\n";
-        assert_eq!(any_attribute(inline).as_deref(), Some(inline.trim()));
+        assert_eq!(found(inline).as_deref(), Some("#[deny(clippy::todo)]"));
+        // Attribute tokens split by whitespace and comments.
+        let split = "fn g() -> u8 {\n    0\n}\n# /* c */ [deny(clippy::todo)]\nfn f() -> u8 {\n    todo!()\n}\n";
+        assert_eq!(found(split).as_deref(), Some("#[deny(clippy::todo)]"));
+        // On a statement, an expression and a field.
+        assert!(found("fn f() { #[deny(clippy::todo)] let x = 1; }\n").is_some());
+        assert!(found("fn f() -> u8 { (#[allow(unused)] 1) }\n").is_some());
+        assert!(found("struct S { #[allow(dead_code)] x: u8 }\n").is_some());
+        // In macro input, which the parser does not read as items.
+        let in_macro = "macro_rules! m {\n    () => {\n        #[deny(clippy::todo)]\n        fn f() -> u8 { todo!() }\n    };\n}\nm!();\n";
+        assert_eq!(found(in_macro).as_deref(), Some("#[deny(clippy::todo)]"));
+        assert!(found("m! { #![deny(clippy::todo)] }\n").is_some());
+        // A fixture that does not parse fails closed.
+        assert!(any_attribute("fn f( {}\n").is_err());
     }
 
     #[test]

@@ -63,6 +63,10 @@ encoding_rs = "0.8.42"
 # xtask (dev tooling, never shipped)
 cargo_metadata = "0.23.1"
 unicode-normalization = "0.1.26"
+# The lint site check parses Rust source.
+proc-macro2 = { version = "1.0.107", default-features = false }
+quote = { version = "1.0.47", default-features = false }
+syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 
 # Used by the `cargo xtask` alias (.cargo/config.toml).
 [profile.xtask]
