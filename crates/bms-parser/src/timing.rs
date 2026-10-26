@@ -365,6 +365,33 @@ mod tests {
     }
 
     #[test]
+    fn time_sums_take_zero_equal_negative_and_cancelling_terms() {
+        let mut time = Time::zero();
+        let mut expected = r(0, 1);
+        // A zero term; equal denominators (1/6 + 1/6 = 1/3); cancellation
+        // to zero (1/3 - 1/3); a negative term; cancellation of a negative
+        // sum (-2/5 + 2/5); and a zero term onto a fraction.
+        for term in [
+            r(0, 1),
+            r(1, 6),
+            r(1, 6),
+            r(-1, 3),
+            r(-2, 5),
+            r(2, 5),
+            r(7, 4),
+            r(0, 1),
+        ] {
+            time.add(&term, 64).unwrap();
+            expected += &term;
+            assert_eq!(
+                (&time.numer, &time.denom),
+                (expected.numer(), expected.denom()),
+                "{term}"
+            );
+        }
+    }
+
+    #[test]
     fn time_denominator_cap_is_inclusive() {
         // 1/255 has an 8-bit denominator; adding 1/257 makes it 16 bits.
         let mut time = Time::zero();

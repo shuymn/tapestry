@@ -279,6 +279,27 @@ fn chart_ending_exactly_at_duration_cap_loads() {
 }
 
 #[test]
+fn time_past_the_duration_cap_by_less_than_a_microsecond_is_refused() {
+    // A 0.000001-unit STOP at 120 BPM lasts 1.25 / 120 µs: the time floors
+    // to 0, the cap, but lies past it.
+    let dir = folder(&["click.wav"]);
+    let opts = LoadOptions {
+        limits: Limits {
+            max_duration: TimeUs(0),
+            ..Limits::default()
+        },
+        ..LoadOptions::default()
+    };
+    let text = "#BPM 120\n#STOP01 0.000001\n#00009:01\n";
+    assert_eq!(
+        load_bms(text.as_bytes(), dir.path(), &opts),
+        Err(LoadError::DurationExceeded { measure: 0 })
+    );
+    // Without the STOP the chart ends at 0 and loads.
+    assert!(load_bms(b"#BPM 120\n", dir.path(), &opts).is_ok());
+}
+
+#[test]
 fn unsupported_lnmode_and_switch_are_errors() {
     let dir = folder(&["click.wav"]);
     for (name, line, what) in [

@@ -3,14 +3,23 @@
 use std::time::Instant;
 
 use bms_model::{Chart, JudgeRank, Note, NoteKind, TimeUs};
-use bms_parser::{LoadError, LoadOptions, Loaded, Warning, WarningKind, load_bms};
+use bms_parser::{Limits, LoadError, LoadOptions, Loaded, Warning, WarningKind, load_bms};
 use sha2::{Digest, Sha256};
 
 /// Loads `text` from an empty folder, dropping the missing-sound warnings
 /// that follow.
 fn load(text: &str) -> Result<Loaded, LoadError> {
+    load_with(text, Limits::default())
+}
+
+/// [`load`] with other limits.
+fn load_with(text: &str, limits: Limits) -> Result<Loaded, LoadError> {
     let dir = tempfile::tempdir().unwrap();
-    let mut loaded = load_bms(text.as_bytes(), dir.path(), &LoadOptions::default())?;
+    let opts = LoadOptions {
+        limits,
+        ..LoadOptions::default()
+    };
+    let mut loaded = load_bms(text.as_bytes(), dir.path(), &opts)?;
     loaded
         .warnings
         .retain(|w| w.kind != WarningKind::MissingSoundFile);
@@ -96,12 +105,15 @@ fn cycling() -> String {
         "#BPM 147.123456\n#BPM01 333.333333\n#BPM02 98.765432\n#BPM03 222.222\n\
          #STOP01 7.654321\n#STOP02 0.000003\n#WAV01 a.wav\n",
     );
+    let sevenths = "01".repeat(7);
+    let ninths = "0100".repeat(9);
+    let elevenths = "000001".repeat(11);
     for m in 0..60 {
         let bpm = ["01", "02", "03"][m % 3];
         text.push_str(&format!("#{m:03}08:00{bpm}00\n"));
-        text.push_str(&format!("#{m:03}11:{}\n", "01".repeat(7)));
-        text.push_str(&format!("#{m:03}14:{}\n", "0100".repeat(9)));
-        text.push_str(&format!("#{m:03}19:{}\n", "000001".repeat(11)));
+        text.push_str(&format!("#{m:03}11:{sevenths}\n"));
+        text.push_str(&format!("#{m:03}14:{ninths}\n"));
+        text.push_str(&format!("#{m:03}19:{elevenths}\n"));
         if m % 4 == 1 {
             text.push_str(&format!("#{m:03}09:0001000200\n"));
         }
@@ -289,8 +301,9 @@ fn growing(last: usize, notes: usize) -> String {
     }
     text.push_str(&format!("#{last:03}11:01\n"));
     if notes > 0 {
+        let line = "01".repeat(notes);
         for m in last + 1..=999 {
-            text.push_str(&format!("#{m:03}11:{}\n", "01".repeat(notes)));
+            text.push_str(&format!("#{m:03}11:{line}\n"));
         }
     }
     text
@@ -309,12 +322,33 @@ fn time_size_cap_is_reached_at_the_computed_measure() {
     );
 }
 
-/// The worst case the cap allows, timed: the time's denominator reaches
-/// 16371 bits first, then each of 480,000 notes (2500 to a measure through
+#[test]
+fn a_stop_that_overflows_the_time_cap_is_refused() {
+    // Measure 0 starts with a 1-unit STOP at BPM 3: 1_250_000 / 3 µs, a
+    // 2-bit denominator. Measure 1 adds 80_000_000 µs (4 beats at 3), then
+    // turns to BPM 7 and stops 1_250_000 / 7 µs: the denominator becomes
+    // 21, 5 bits, on the STOP's addition.
+    let text = "#BPM 3\n#BPM01 7\n#STOP01 1\n#00009:01\n#00108:01\n#00109:01\n";
+    let with_bits = |max_time_bits| {
+        load_with(
+            text,
+            Limits {
+                max_time_bits,
+                ..Limits::default()
+            },
+        )
+    };
+    assert!(with_bits(5).is_ok());
+    assert_eq!(with_bits(4), Err(LoadError::TimeOverflow { measure: 1 }));
+}
+
+/// A heavy load at the cap, timed: the time's denominator reaches 16371
+/// bits first, then each of 480,000 notes (2500 to a measure through
 /// measure 999) adds a segment at a BPM already in it, the path that takes
 /// both greatest common divisors. The notes sit far below 1 µs apart, so
 /// most are dropped as conflicts, each with a warning; that work counts in
-/// the load time too.
+/// the load time too. The time measured here describes this fixture, not
+/// every chart the limits allow.
 #[test]
 #[ignore = "timing run of about 480,000 objects: cargo test --release -p bms-parser --test time -- --ignored --nocapture"]
 fn time_size_cap_worst_case_load_time() {
@@ -326,5 +360,16 @@ fn time_size_cap_worst_case_load_time() {
     let loaded = load(&text).unwrap();
     let elapsed = start.elapsed();
     assert_eq!(loaded.chart.bar_lines.len(), 1000);
-    println!("worst-case load: {elapsed:?}");
+    // Every note was timed: kept in its lane or dropped with a warning.
+    let dropped = loaded
+        .warnings
+        .iter()
+        .filter(|w| w.kind == WarningKind::SameTimeNoteDropped)
+        .count();
+    assert_eq!(loaded.chart.lanes[1].len() + dropped, 1 + 192 * 2500);
+    assert!(dropped > 0);
+    println!(
+        "heavy load: {elapsed:?}, {} notes kept, {dropped} dropped",
+        loaded.chart.lanes[1].len()
+    );
 }
