@@ -4,7 +4,8 @@
 //!
 //! The counting allocator counts only threads that opted in, so the test
 //! harness's own threads do not disturb the count. This file holds a single
-//! test for the same reason.
+//! test for the same reason. Profiles and the positive control: design.md
+//! "Scope of No Allocation".
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,6 +88,7 @@ fn mixing_does_not_allocate() {
     let mut frames = 0u64;
     let mut commands = 0u32;
     counting::track(true);
+    counting::self_check();
     for step in 0..STEPS {
         for k in 0..3 {
             tx.push(SoundCmd {

@@ -4,6 +4,7 @@
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
 //! disturb the count. This file holds a single test for the same reason.
+//! Profiles and the positive control: design.md "Scope of No Allocation".
 //! It also prints the evaluator time per input, an indicator only.
 
 #![expect(
@@ -148,6 +149,9 @@ fn advance_does_not_allocate() {
     let mut burst_out = Vec::with_capacity(burst.max_events(BURST + 1));
 
     TRACK.with(|t| t.set(true));
+    // The count works: an allocation that escapes is counted in any profile.
+    drop(std::hint::black_box(vec![1u8; 8]));
+    assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1);
     let started = Instant::now();
     let mut next = 0;
     let mut w = 0;

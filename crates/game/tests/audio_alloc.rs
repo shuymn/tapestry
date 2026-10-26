@@ -2,7 +2,8 @@
 //! play's command queue goes back to the game thread to be dropped there,
 //! and the control messages travel through a preallocated queue. Only the
 //! audio loop's steps are counted (see `counting`); this file holds a
-//! single test.
+//! single test. Profiles and the positive control: design.md "Scope of No
+//! Allocation".
 
 mod common;
 mod counting;
@@ -32,6 +33,7 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
     );
     let mut steps = |worker: &mut game::AudioWorker, n: usize| {
         counting::track(true);
+        counting::self_check();
         for _ in 0..n {
             worker.step(&mut out).unwrap();
         }

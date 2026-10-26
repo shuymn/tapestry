@@ -143,8 +143,13 @@ pub struct Figures {
     /// Presents the game issued in the span.
     pub presents: u64,
     /// Allocations per thread during the play: input, logic, audio,
-    /// render (dev-tools).
+    /// render (dev-tools). Whole threads, diagnostic only: the render
+    /// thread's include wgpu, the end screen and the frame dump.
     pub allocations: Option<[u64; 4]>,
+    /// Allocations inside the render thread's app region during the play
+    /// (dev-tools): its own per-frame work, which allocates nothing
+    /// (design.md "Scope of No Allocation").
+    pub render_app_allocations: Option<u64>,
     /// Logic step samples the full queue refused: input to judgment and
     /// finalization delay are missing that many.
     pub steps_dropped: u64,
@@ -376,6 +381,13 @@ pub struct Measure {
     refreshed_at: Option<TimeUs>,
     /// The allocation counts when the play started.
     alloc_base: Option<[u64; 4]>,
+    /// This thread's app-region allocations when the play started: the
+    /// render thread starts and finishes each play.
+    app_base: Option<u64>,
+    /// Whether each play frame's measurement allocates, for the render
+    /// thread's app region tests.
+    #[cfg(all(test, feature = "dev-tools"))]
+    allocate_in_frames: bool,
 }
 
 impl Measure {
@@ -426,6 +438,9 @@ impl Measure {
             shown: 0,
             refreshed_at: None,
             alloc_base: None,
+            app_base: None,
+            #[cfg(all(test, feature = "dev-tools"))]
+            allocate_in_frames: false,
         }
     }
 
@@ -453,6 +468,7 @@ impl Measure {
         }
         self.measured_qpc = None;
         self.alloc_base = allocations();
+        self.app_base = app_allocations();
         if let (Some(audio), Some(q)) = (self.audio.as_mut(), play.queued_periods) {
             audio.queued_periods = Some(q);
         }
@@ -538,6 +554,9 @@ impl Measure {
                 }
                 delta
             }),
+            render_app_allocations: app_allocations()
+                .zip(self.app_base)
+                .map(|(now, base)| now.saturating_sub(base)),
             steps_dropped: 0,
             refresh_period_ns: self
                 .first_sync
@@ -545,6 +564,13 @@ impl Measure {
                 .and_then(|(f, l)| measured_period_ns(f, l, self.clock.frequency().hz()))
                 .or_else(|| self.refresh_mhz.map(|m| 1_000_000_000_000 / i64::from(m))),
         }
+    }
+
+    /// Makes each play frame's measurement allocate, as a fault for the
+    /// render thread's app region tests to find.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn allocate_in_frames(&mut self) {
+        self.allocate_in_frames = true;
     }
 
     /// Keeps the times of up to `capacity` presents a play, for a display
@@ -602,6 +628,10 @@ impl Measure {
         }
         let origin = play.origin;
         let load_from = play.load_from;
+        #[cfg(all(test, feature = "dev-tools"))]
+        if self.allocate_in_frames {
+            drop(std::hint::black_box(vec![0u8; 8]));
+        }
         self.drain();
         if let Some(count) = d.timing.present_count.filter(|_| d.timing.presented)
             && self.last_present.is_some_and(|last| count <= last)
@@ -719,6 +749,16 @@ const fn allocations() -> Option<[u64; 4]> {
     None
 }
 
+#[cfg(feature = "dev-tools")]
+fn app_allocations() -> Option<u64> {
+    Some(crate::alloc_count::app_allocations())
+}
+
+#[cfg(not(feature = "dev-tools"))]
+const fn app_allocations() -> Option<u64> {
+    None
+}
+
 /// `<record>.measure.toml` beside the record at `record`.
 pub fn measure_path(record: &Path) -> PathBuf {
     record.with_extension("measure.toml")
@@ -801,6 +841,9 @@ pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
             out,
             "\n[allocations]\ninput = {i}\nlogic = {l}\naudio = {a}\nrender = {r}"
         );
+        if let Some(app) = fig.render_app_allocations {
+            let _ = writeln!(out, "render_app = {app}");
+        }
     }
     out
 }

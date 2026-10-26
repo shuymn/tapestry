@@ -39,14 +39,17 @@ pub trait Screen: Send {
     fn wait(&self) -> bool;
     /// Whether [`wait`](Self::wait) paces frames.
     fn paced(&self) -> bool;
-    /// Draws one play frame; [`FrameTiming::presented`] is `false` when it
-    /// was not presented (the swap chain image timed out or the window is
-    /// occluded).
+    /// Builds one play frame from `f`: the app's own work, which calls
+    /// nothing in wgpu. [`draw`](Self::draw) follows.
+    fn build(&mut self, f: &FrameInput<'_>);
+    /// Draws the play frame [`build`](Self::build) built;
+    /// [`FrameTiming::presented`] is `false` when it was not presented (the
+    /// swap chain image timed out or the window is occluded).
     ///
     /// # Errors
     ///
     /// Why the frame failed: the screen must be built again.
-    fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError>;
+    fn draw(&mut self) -> Result<FrameTiming, RenderError>;
     /// The swap chain's latest frame statistics, raw; `None` without a
     /// swap chain or when the call failed.
     fn statistics(&self) -> Option<FrameStatistics> {
@@ -56,11 +59,11 @@ pub trait Screen: Send {
     fn presentation(&self) -> Option<Presentation> {
         None
     }
-    /// Draws lines of text, as [`frame`](Self::frame).
+    /// Draws lines of text, as [`draw`](Self::draw).
     ///
     /// # Errors
     ///
-    /// As [`frame`](Self::frame).
+    /// As [`draw`](Self::draw).
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError>;
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
@@ -80,8 +83,12 @@ impl Screen for Renderer {
         self.has_frame_waitable()
     }
 
-    fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
-        Self::frame(self, f)
+    fn build(&mut self, f: &FrameInput<'_>) {
+        Self::build(self, f);
+    }
+
+    fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+        self.submit()
     }
 
     fn statistics(&self) -> Option<FrameStatistics> {
@@ -170,18 +177,12 @@ pub struct View {
 /// wanted after it.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Something that looks at frames as they are drawn: the measurement
-/// (D11) and the dev-tools frame dump. Called after every frame, presented
-/// or not.
+/// Something that looks at frames as they are drawn, after the
+/// measurement (D11): the dev-tools frame dump. Called after every frame,
+/// presented or not.
 pub trait FrameSink: Send {
     /// Called after each frame.
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>);
-}
-
-impl FrameSink for Measure {
-    fn frame(&mut self, _screen: &dyn Screen, drawn: &Drawn<'_>) {
-        Self::frame(self, drawn);
-    }
 }
 
 /// No frame sink.
@@ -406,8 +407,17 @@ impl Run {
                     gauge,
                     first,
                 } => {
+                    // The app region's first interval (design.md "Scope of
+                    // No Allocation"): this frame's own work up to the
+                    // build, before anything calls into wgpu.
+                    #[cfg(feature = "dev-tools")]
+                    crate::alloc_count::app_region(true);
                     effects.clear();
-                    side.drain_effects(|e| effects.push(*e));
+                    // At most what the buffer holds: the logic step can push
+                    // during the drain, and the rest waits for the next
+                    // frame.
+                    let room = effects.capacity();
+                    side.drain_effects_up_to(room, |e| effects.push(*e));
                     let now = TimeUs(self.clock.now().0 - origin.0);
                     // Hi-speed and the display offset change anytime and move
                     // the notes only: they reach the screen here and nowhere
@@ -431,7 +441,10 @@ impl Run {
                         gauge: *gauge,
                         overlay: &overlay[..shown],
                     };
-                    let drawn = screen.frame(&f).map(|timing| (timing, Some(now)));
+                    screen.build(&f);
+                    #[cfg(feature = "dev-tools")]
+                    crate::alloc_count::app_region(false);
+                    let drawn = screen.draw().map(|timing| (timing, Some(now)));
                     // The first frame that reached the screen.
                     if matches!(&drawn, Ok((t, _)) if t.presented) && *first {
                         *first = false;
@@ -465,7 +478,14 @@ impl Run {
                         effects: if play.is_some() { &effects } else { &[] },
                         at: self.clock.now(),
                     };
-                    FrameSink::frame(&mut self.measure, screen.as_ref(), &d);
+                    // The app region's second interval: a play frame's
+                    // measurement. The frame sink (the frame dump) stays
+                    // outside it.
+                    #[cfg(feature = "dev-tools")]
+                    crate::alloc_count::app_region(play.is_some());
+                    self.measure.frame(&d);
+                    #[cfg(feature = "dev-tools")]
+                    crate::alloc_count::app_region(false);
                     self.frames.frame(screen.as_ref(), &d);
                 }
                 Err(e) => {
@@ -560,7 +580,8 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             self.play_frames += 1;
             let presented = self.play_frames >= 4;
             if presented {
@@ -768,11 +789,13 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
+        fn build(&mut self, f: &FrameInput<'_>) {
             self.0
                 .lock()
                 .unwrap()
                 .push((f.visible_time, f.display_offset));
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Ok(timing(true))
         }
         fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
@@ -862,7 +885,8 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
             Err(RenderError::SurfaceLost)
         }
         fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
@@ -942,5 +966,291 @@ mod tests {
         assert_eq!(fig.press_to_screen_unavailable, 1);
         assert_eq!(fig.press_to_screen, None);
         link.exit();
+    }
+
+    /// Play frames the [`Stalling`] screen draws before it stalls.
+    const DRAWN_FRAMES: u32 = 2;
+
+    /// A paced screen that lets [`DRAWN_FRAMES`] play frames through and
+    /// then times out every wait; it keeps each frame's effect count and
+    /// how many of them were judgments.
+    struct Stalling {
+        waits: Arc<AtomicU32>,
+        seen: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl Screen for Stalling {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            if self.waits.fetch_add(1, Ordering::AcqRel) < DRAWN_FRAMES {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            false
+        }
+        fn paced(&self) -> bool {
+            true
+        }
+        fn build(&mut self, f: &FrameInput<'_>) {
+            let judged = f
+                .effects
+                .iter()
+                .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
+                .count();
+            self.seen.lock().unwrap().push((f.effects.len(), judged));
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// More effects are queued than a frame's buffer holds: each frame
+    /// draws at most a buffer's worth, and the rest wait in the queue.
+    /// Judgments still queued when the play ends never reached the screen
+    /// and are N/A in its figures, as are the drawn ones offscreen (no
+    /// present count to pair them with).
+    #[test]
+    fn frames_draw_a_buffer_of_effects_and_the_rest_end_na() {
+        use game::DeviceSettings;
+        use input::DeviceKind;
+
+        // The frame buffer the render thread makes for a view of 2 effects.
+        let buffer = Vec::<eval::JudgeEvent>::with_capacity(2).capacity();
+        let mut builder = ChartBuilder::new(120_000);
+        for k in 0..6 {
+            builder = builder.tap(Lane::new(1).unwrap(), TimeUs(1_000_000 + k * 200_000));
+        }
+        let chart = builder.build().unwrap();
+        let rule = rules::custom();
+        let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
+        let (mut writer, reader) = input::source_queue(32);
+        // Every note hit on time.
+        for e in input::autoplay(&chart, &device.sources[0]).unwrap() {
+            writer.push(e).unwrap();
+        }
+        writer.publish(TimeUs(3_000_000));
+        let (mut logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            vec![reader],
+            LogicConfig {
+                inputs: 32,
+                effects: 64,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        // Every effect is queued before the render thread draws a frame.
+        logic.advance_to(TimeUs(3_000_001));
+        let judged = logic
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
+            .count();
+        assert_eq!(judged, 6);
+        // More than the drawn frames' buffers hold.
+        assert!(logic.events().len() > DRAWN_FRAMES as usize * buffer);
+        let waits = Arc::new(AtomicU32::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let screen = (Arc::clone(&waits), Arc::clone(&seen));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Stalling {
+                waits: Arc::clone(&screen.0),
+                seen: Arc::clone(&screen.1),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let view = View {
+            effects: buffer,
+            ..view()
+        };
+        let link = spawn(
+            make,
+            Arc::new(chart.clone()),
+            clock,
+            view,
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        // Past its last frame: the screen has stalled.
+        assert!(wait_until(|| waits.load(Ordering::Acquire) > DRAWN_FRAMES));
+        let fig = link.finish(clock.now()).expect("the play's figures");
+        link.exit();
+        let frames = seen.lock().unwrap().clone();
+        assert_eq!(frames.len(), DRAWN_FRAMES as usize);
+        // Each frame drew a full buffer, never more.
+        assert!(frames.iter().all(|&(n, _)| n == buffer), "{frames:?}");
+        let drawn: usize = frames.iter().map(|&(_, j)| j).sum();
+        assert!(drawn < judged, "{frames:?}");
+        // The drawn judgments and the ones still queued at the end.
+        assert_eq!(fig.press_to_screen_unavailable, judged as u64);
+        assert_eq!(fig.press_to_screen, None);
+    }
+
+    /// Something that allocates, kept by `black_box` so no profile elides it.
+    #[cfg(feature = "dev-tools")]
+    fn allocate() {
+        drop(std::hint::black_box(vec![0u8; 8]));
+    }
+
+    /// A screen that allocates in every draw and read-back, and in every
+    /// build when `in_build`, as wgpu, the readback and a faulty skin would;
+    /// it counts its draws and read-backs.
+    #[cfg(feature = "dev-tools")]
+    struct Allocating {
+        in_build: bool,
+        draws: Arc<AtomicU32>,
+        read_backs: Arc<AtomicU32>,
+    }
+
+    #[cfg(feature = "dev-tools")]
+    impl Screen for Allocating {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {
+            if self.in_build {
+                allocate();
+            }
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            allocate();
+            self.draws.fetch_add(1, Ordering::AcqRel);
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            self.read_backs.fetch_add(1, Ordering::AcqRel);
+            Some((1, 1, vec![0; 4]))
+        }
+    }
+
+    /// A frame sink that reads every frame back and allocates, as the frame
+    /// dump does; it counts its frames.
+    #[cfg(feature = "dev-tools")]
+    struct Dumping(Arc<AtomicU32>);
+
+    #[cfg(feature = "dev-tools")]
+    impl super::FrameSink for Dumping {
+        fn frame(&mut self, screen: &dyn Screen, _drawn: &crate::measure::Drawn<'_>) {
+            drop(std::hint::black_box(screen.read_back()));
+            allocate();
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A play drawn on [`Allocating`] into [`Dumping`], whose build
+    /// allocates when `in_build` and whose measurement when `in_measure`:
+    /// its app region count, and how many draws, read-backs and sunk frames
+    /// ran.
+    #[cfg(feature = "dev-tools")]
+    fn app_region_count(in_build: bool, in_measure: bool) -> (Option<u64>, [u32; 3]) {
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let (rule, device) = (rules::custom(), DeviceProfile::default());
+        let (_logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let counters = [(); 3].map(|()| Arc::new(AtomicU32::new(0)));
+        let [draws, read_backs, sunk] = counters.clone();
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Allocating {
+                in_build,
+                draws: Arc::clone(&draws),
+                read_backs: Arc::clone(&read_backs),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let mut m = measure(clock);
+        if in_measure {
+            m.allocate_in_frames();
+        }
+        let link = spawn(
+            make,
+            Arc::new(chart.clone()),
+            clock,
+            view(),
+            m,
+            Box::new(Dumping(sunk)),
+        )
+        .unwrap();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        let [_, _, sunk] = &counters;
+        assert!(wait_until(|| sunk.load(Ordering::Acquire) >= 5));
+        let fig = link.finish(clock.now()).expect("the play's figures");
+        link.exit();
+        (
+            fig.render_app_allocations,
+            counters.map(|c| c.load(Ordering::Acquire)),
+        )
+    }
+
+    /// What the screen draws, reads back and the frame sink does allocates
+    /// outside the app region: the region counts none of it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_app_region_leaves_out_drawing_and_the_frame_sink() {
+        let (count, [draws, read_backs, sunk]) = app_region_count(false, false);
+        assert_eq!(count, Some(0));
+        assert!(draws >= 5 && read_backs >= 5 && sunk >= 5);
+    }
+
+    /// An allocation in the frame's build, the region's first interval, is
+    /// counted.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_app_region_counts_the_frame_build() {
+        let (count, _) = app_region_count(true, false);
+        assert!(count.is_some_and(|n| n > 0), "{count:?}");
+    }
+
+    /// An allocation in a play frame's measurement, the region's second
+    /// interval, is counted; the build allocates nothing here.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_app_region_counts_the_frame_measurement() {
+        let (count, _) = app_region_count(false, true);
+        assert!(count.is_some_and(|n| n > 0), "{count:?}");
     }
 }
