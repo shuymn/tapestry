@@ -3,7 +3,9 @@
 //! thread runs again every retired command queue comes back to the game
 //! thread to be dropped there, none is leaked, and the audio thread
 //! neither allocates nor frees. Only the audio thread is counted (see
-//! `counting`); this file holds a single test.
+//! `counting`); this file holds a single test. It runs in the dev and
+//! release profiles with the same bound, and the audio thread starts with
+//! the positive control (design.md "Scope of No Allocation").
 
 mod common;
 mod counting;
@@ -53,6 +55,7 @@ fn burst(keep: bool) -> usize {
         };
         let audio = s.spawn(|| {
             counting::track(true);
+            counting::self_check();
             while held.load(Ordering::Acquire) {
                 thread::yield_now();
             }
