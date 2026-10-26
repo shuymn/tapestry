@@ -54,6 +54,11 @@ jobs:
         run: mise exec -- cargo xtask check-arch
       - name: Production build
         run: mise exec -- cargo build --release --locked -p player --no-default-features
+      # The allocation contracts also hold with optimizations (design.md
+      # "Scope of No Allocation"); after the production build, whose release
+      # dependencies it reuses.
+      - name: Render staging allocation test (release)
+        run: mise exec -- cargo test --release --locked -p render --test alloc
       - name: Production excludes dev-tools
         run: |
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
@@ -119,6 +124,10 @@ jobs:
         run: mise exec -- cargo xtask check-lints
       - name: Test (portable crates)
         run: mise exec -- cargo xtask portable test --locked
+      # The allocation contracts also hold with optimizations (design.md
+      # "Scope of No Allocation").
+      - name: Allocation tests (release)
+        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio --test alloc --test audio_alloc --test audio_burst
       # The fuzz crate is its own workspace (fuzz/Cargo.toml), which the
       # workspace commands above do not reach.
       - name: Format (fuzz crate)
