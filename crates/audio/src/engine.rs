@@ -38,7 +38,10 @@ pub enum ScheduledKind {
     },
 }
 
-/// A sound start the engine scheduled.
+/// A sound start the engine scheduled: one per start the mixer accepted.
+/// A start of the same sound at the same frame is logged too, but sounds as
+/// the one instance (design.md "Audio"), so the log can hold more starts
+/// than were heard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scheduled {
     /// The sound.
