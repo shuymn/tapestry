@@ -281,6 +281,7 @@ During play, only `advance_to(watermark)` is called. Even for a note whose deadl
 ### Determinism
 
 - Time is integer µs, and the gauge is fixed-point (the rounding rules are fixed by the evaluator version). No floating point is used.
+- The evaluator's purity is checked in part: `cargo xtask check-arch` (R1) bounds its dependencies, and `crates/eval/clippy.toml` rejects the named `std` entry points for the clock, the file system, the environment, threads and printing, and `std`'s randomly ordered hash collections. Anything outside those lists stays a reviewed invariant. In `eval`, `rules` and `bms-parser`, clippy rejects `as` casts that may truncate, wrap, or lose the sign.
 - The processing order of events at the same time is made explicit as a preset item.
 - Anything that uses randomness (`#RANDOM` branches, RANDOM-type options) is decided at the step that resolves the chart before evaluation, and the result is recorded. The evaluator itself uses no randomness.
 - Even for the same chart file, a change in the loader version can change its interpretation. So the loader version and the hash of the resolved chart are recorded.
@@ -910,6 +911,8 @@ Code from GPL projects (beatoraja, bmz-player, etc.) and tables ported from them
 ### Scope of No Allocation
 
 The input thread, the logic thread, the audio callback, and the per-frame work of the render thread (app-side code) do not allocate memory during play. The regions for evaluator output, the input log, and effect events are allocated in advance, and what happens on reaching the limit is decided (for the input log, it is recorded as "incomplete"). Background work such as decoding and read-ahead, and allocations inside the GPU driver, are out of scope. The check is done with a test global allocator, which can also be enabled in release builds.
+
+The modules and functions that code runs also deny `unwrap`, `expect` and indexing outside tests (clippy's `unwrap_used`, `expect_used` and `indexing_slicing`); where an invariant makes one safe, an `#[expect]` states it as its reason. The list of those sites is the `IN_PLAY` table in `xtask/src/lints.rs`, which `cargo xtask check-lints` checks.
 
 ### Algorithms
 

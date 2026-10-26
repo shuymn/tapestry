@@ -51,6 +51,7 @@ rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
 - On both Windows and Linux (locally and in CI), mise selects the version in `mise.lock` with the `minimal` profile plus `rustfmt` and `clippy`.
 - Without mise, install the version written in `mise.lock` with rustup and call `cargo +<version> ...`.
 - Additional targets (such as `wasm32-unknown-unknown`) are added in the stage that uses them.
+- Clippy reads the nearest `clippy.toml`: the workspace root's sets the test allowances, and `crates/eval/clippy.toml` repeats them and adds the evaluator's disallowed `std` APIs. `cargo xtask check-lints` checks that the two agree.
 
 ### Hooks
 
@@ -93,7 +94,7 @@ PRs created with `GITHUB_TOKEN` do not run CI unattended, so auto-merge would ne
 | Runner | What it does |
 | --- | --- |
 | Windows (label with an explicit OS version) | Production build (pinned to a configuration with `dev-tools` disabled), verifying that development features are not included, rendering image comparison with WARP, Windows tests |
-| Linux | Builds and tests of crates that do not depend on Windows, WASM build, short fuzzing runs, banned-word check, dependency checks (`cargo-deny`, `cargo-audit`), tests in the Nix development shell through `scripts/wsl.sh` |
+| Linux | Builds and tests of crates that do not depend on Windows, WASM build, short fuzzing runs, banned-word check, lint fixtures (`cargo xtask check-lints`), dependency checks (`cargo-deny`, `cargo-audit`), tests in the Nix development shell through `scripts/wsl.sh` |
 
 - Both runners install tools from the same `mise.lock` (`jdx/mise-action`). Run the install step even after restoring the cache, and verify the Rust version in use.
 - GitHub Actions are pinned by commit SHA.
