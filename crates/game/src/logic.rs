@@ -5,8 +5,8 @@ use std::fmt;
 
 use bms_model::{Chart, TimeUs};
 use eval::{
-    DeviceProfile, EvalError, EvalInput, Evaluator, InputStart, JudgeEvent, PhysicalInputEvent,
-    Published, SourceId, SourceState, Staged, merge, watermark,
+    DeviceProfile, EvalError, EvalInput, Evaluator, GaugeState, InputStart, JudgeEvent,
+    PhysicalInputEvent, Published, SourceId, SourceState, Staged, merge, watermark,
 };
 use input::SourceReader;
 use rules::RulePreset;
@@ -462,6 +462,12 @@ impl<'a, R: SourceRead> Logic<'a, R> {
     #[must_use]
     pub const fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    /// Every gauge, in the preset's order, as of the last step.
+    #[must_use]
+    pub fn gauges(&self) -> &[GaugeState] {
+        self.evaluator.gauges()
     }
 
     /// The play view as of the last step: what the render side's newest

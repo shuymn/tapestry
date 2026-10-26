@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
 use bms_model::{Chart, TimeSource, TimeUs, VirtualClock};
-use eval::{Evaluator, InputStart, JudgeEvent, Tally};
+use eval::{Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
@@ -515,12 +515,12 @@ impl Loaded {
         PlayPlan { device, logic }
     }
 
-    /// Whether the session policy ends the play at `view`: a survival
-    /// gauge failed and the policy does not keep playing.
+    /// Whether the session policy ends the play with `gauges` (every
+    /// gauge in the preset's order): a survival gauge failed and the policy
+    /// does not keep playing.
     #[must_use]
-    pub fn ends_play(&self, view: &PlayView) -> bool {
-        let failed = view
-            .gauges
+    pub fn ends_play(&self, gauges: &[GaugeState]) -> bool {
+        let failed = gauges
             .iter()
             .zip(&self.preset.gauges)
             .any(|(g, rule)| rule.kind == GaugeKind::Survival && g.failed_at.is_some());
@@ -772,7 +772,7 @@ impl<O: AudioOutput + Wakes> Session<O> {
                 logic.abort(AbortCause::OutputFailed);
                 break PlayEnd::Aborted(AbortCause::OutputFailed);
             }
-            if loaded.ends_play(render.view()) {
+            if loaded.ends_play(&render.view().gauges) {
                 logic.abort(AbortCause::GaugeFailed);
                 audio.cancel(&mut sounds);
                 break PlayEnd::Aborted(AbortCause::GaugeFailed);
