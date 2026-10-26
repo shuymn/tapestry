@@ -10,6 +10,9 @@
 //! - R3: no package's `default` feature enables `dev-tools`, directly or by
 //!   forwarding, and the resolved production build of each package in
 //!   [`PRODUCTION`] enables `dev-tools` on no workspace package.
+//! - R4: every workspace package's `license` is its entry in [`LICENSES`]
+//!   (a package missing from the table fails), and no [`PERMISSIVE`] package
+//!   declares a dependency of any kind on a [`GPL`] package.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -32,6 +35,33 @@ const DEV_TOOLS: &str = "dev-tools";
 /// Production binaries and the target they ship for. Built with
 /// `--no-default-features`.
 const PRODUCTION: &[(&str, &str)] = &[("player", "x86_64-pc-windows-msvc")];
+/// License of the L0-L2 crates and the development tooling.
+const PERMISSIVE: &str = "MIT OR Apache-2.0";
+/// License of L3 and above and `player`.
+const GPL: &str = "GPL-3.0-or-later";
+/// Every workspace package and its license (design.md "Licenses"). A new
+/// package is added here with the license of its layer.
+pub const LICENSES: &[(&str, &str)] = &[
+    ("bms-model", PERMISSIVE),
+    ("bms-parser", PERMISSIVE),
+    ("rules", PERMISSIVE),
+    ("eval", PERMISSIVE),
+    ("replay", PERMISSIVE),
+    ("xtask", PERMISSIVE),
+    ("input", GPL),
+    ("audio", GPL),
+    ("game", GPL),
+    ("render", GPL),
+    ("player", GPL),
+];
+
+/// The license [`LICENSES`] gives package `name`.
+pub fn expected_license(name: &str) -> Option<&'static str> {
+    LICENSES
+        .iter()
+        .find(|(package, _)| *package == name)
+        .map(|&(_, license)| license)
+}
 
 /// Whether a package sets `[package.metadata.tapestry] windows-only = true`.
 pub fn is_windows_only(pkg: &Package) -> bool {
@@ -67,7 +97,7 @@ pub fn run(manifest: &Path, cargo_args: &[&str]) -> Result<Vec<String>, String> 
     Ok(diagnostics)
 }
 
-/// R1, R2, and the static half of R3.
+/// R1, R2, the static half of R3, and R4.
 fn check_metadata(metadata: &Metadata) -> Result<Vec<String>, String> {
     let resolve = metadata
         .resolve
@@ -138,6 +168,37 @@ fn check_metadata(metadata: &Metadata) -> Result<Vec<String>, String> {
                 pkg.name,
                 chain.join(" -> "),
             ));
+        }
+    }
+
+    // R4
+    for pkg in &members {
+        let name = pkg.name.as_str();
+        let expected = expected_license(name);
+        match (expected, pkg.license.as_deref()) {
+            (None, _) => diagnostics.push(format!(
+                "R4: workspace package `{name}` is not in LICENSES in xtask/src/arch.rs"
+            )),
+            (Some(expected), None) => diagnostics.push(format!(
+                "R4: package `{name}` has no `license`; expected `{expected}`"
+            )),
+            (Some(expected), Some(actual)) if actual != expected => diagnostics.push(format!(
+                "R4: package `{name}` has license `{actual}`; expected `{expected}`"
+            )),
+            _ => {}
+        }
+        if expected != Some(PERMISSIVE) {
+            continue;
+        }
+        // Declared dependencies, so optional and target-specific ones count
+        // whether or not they resolve.
+        for dep in &pkg.dependencies {
+            if dep.path.is_some() && expected_license(&dep.name) == Some(GPL) {
+                diagnostics.push(format!(
+                    "R4: permissive package `{name}` has a {} dependency on GPL package `{}`",
+                    dep.kind, dep.name,
+                ));
+            }
         }
     }
     Ok(diagnostics)
@@ -333,13 +394,34 @@ mod tests {
     //! Each test writes a fixture workspace (see `crate::fixture`), changes one
     //! thing, and runs the real `cargo metadata` / `cargo tree` on it.
 
+    use std::path::Path;
+
     use super::run;
     use crate::fixture::{Crate, baseline, lib, set, write_workspace};
 
     fn check(crates: &[Crate]) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         write_workspace(dir.path(), crates);
-        run(&dir.path().join("Cargo.toml"), &["--offline"]).unwrap()
+        run_fixture(dir.path())
+    }
+
+    fn run_fixture(dir: &Path) -> Vec<String> {
+        run(&dir.join("Cargo.toml"), &["--offline"]).unwrap()
+    }
+
+    /// Like `check`, with the `license` of package `name` set to `license`
+    /// (`None` removes it) after the fixture writes the expected one.
+    fn check_with_license(crates: &[Crate], name: &str, license: Option<&str>) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        write_workspace(dir.path(), crates);
+        let manifest = dir.path().join("crates").join(name).join("Cargo.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        let line = text.lines().find(|l| l.starts_with("license = ")).unwrap();
+        let replacement = license
+            .map(|l| format!("license = \"{l}\""))
+            .unwrap_or_default();
+        std::fs::write(&manifest, text.replacen(line, &replacement, 1)).unwrap();
+        run_fixture(dir.path())
     }
 
     fn assert_single(diagnostics: &[String], expected: &[&str]) {
@@ -360,42 +442,43 @@ mod tests {
     #[test]
     fn r1_rejects_optional_target_specific_dependency_of_eval() {
         let mut crates = baseline();
-        crates.push(lib("clock", ""));
         set(
             &mut crates,
             "eval",
             "[dependencies]\nbms-model = { path = \"../bms-model\" }\n\
              rules = { path = \"../rules\" }\n\
              [target.'cfg(target_os = \"none\")'.dependencies]\n\
-             clock = { path = \"../clock\", optional = true }\n",
+             bms-parser = { path = \"../bms-parser\", optional = true }\n",
         );
         assert_single(
             &check(&crates),
-            &["R1:", "`eval` depends on `clock`", "via eval -> clock"],
+            &[
+                "R1:",
+                "`eval` depends on `bms-parser`",
+                "via eval -> bms-parser",
+            ],
         );
     }
 
     #[test]
     fn r1_rejects_transitive_dependency_of_eval() {
         let mut crates = baseline();
-        crates.push(lib("clock", ""));
         set(
             &mut crates,
             "rules",
-            "[build-dependencies]\nclock = { path = \"../clock\" }\n",
+            "[build-dependencies]\nbms-parser = { path = \"../bms-parser\" }\n",
         );
-        assert_single(&check(&crates), &["R1:", "via eval -> rules -> clock"]);
+        assert_single(&check(&crates), &["R1:", "via eval -> rules -> bms-parser"]);
     }
 
     #[test]
     fn r1_ignores_dev_dependencies_of_eval() {
         let mut crates = baseline();
-        crates.push(lib("clock", ""));
         set(
             &mut crates,
             "eval",
             "[dependencies]\nrules = { path = \"../rules\" }\n\
-             [dev-dependencies]\nclock = { path = \"../clock\" }\n",
+             [dev-dependencies]\nbms-parser = { path = \"../bms-parser\" }\n",
         );
         assert_eq!(check(&crates), Vec::<String>::new());
     }
@@ -423,14 +506,14 @@ mod tests {
         ));
         set(
             &mut crates,
-            "xtask",
+            "game",
             "[dependencies]\nrender = { path = \"../render\" }\n",
         );
         assert_single(
             &check(&crates),
             &[
                 "R2:",
-                "portable package `xtask` depends on Windows-only package `render`",
+                "portable package `game` depends on Windows-only package `render`",
             ],
         );
     }
@@ -444,12 +527,12 @@ mod tests {
         ));
         set(
             &mut crates,
-            "xtask",
+            "game",
             "[dev-dependencies]\nrender = { path = \"../render\" }\n",
         );
         assert_single(
             &check(&crates),
-            &["R2:", "`xtask` depends on Windows-only package `render`"],
+            &["R2:", "`game` depends on Windows-only package `render`"],
         );
     }
 
@@ -562,5 +645,82 @@ mod tests {
                 "enables `dev-tools` on `render`",
             ],
         );
+    }
+
+    #[test]
+    fn r4_rejects_wrong_license() {
+        assert_single(
+            &check_with_license(&baseline(), "eval", Some("GPL-3.0-or-later")),
+            &[
+                "R4:",
+                "package `eval` has license `GPL-3.0-or-later`; expected `MIT OR Apache-2.0`",
+            ],
+        );
+    }
+
+    #[test]
+    fn r4_rejects_missing_license() {
+        assert_single(
+            &check_with_license(&baseline(), "game", None),
+            &["R4:", "package `game` has no `license`"],
+        );
+    }
+
+    #[test]
+    fn r4_rejects_package_missing_from_table() {
+        let mut crates = baseline();
+        crates.push(lib("tool", "license = \"MIT OR Apache-2.0\"\n"));
+        assert_single(
+            &check(&crates),
+            &["R4:", "workspace package `tool` is not in LICENSES"],
+        );
+    }
+
+    /// `xtask` (permissive) declaring `game` (GPL) in each way R4 must see.
+    #[test]
+    fn r4_rejects_permissive_package_depending_on_gpl_package() {
+        let cases = [
+            ("[dependencies]\ngame = { path = \"../game\" }\n", "normal"),
+            (
+                "[build-dependencies]\ngame = { path = \"../game\" }\n",
+                "build",
+            ),
+            ("[dev-dependencies]\ngame = { path = \"../game\" }\n", "dev"),
+            (
+                "[dependencies]\ngame = { path = \"../game\", optional = true }\n",
+                "normal",
+            ),
+            (
+                "[target.'cfg(target_os = \"none\")'.dependencies]\n\
+                 game = { path = \"../game\" }\n",
+                "normal",
+            ),
+        ];
+        for (body, kind) in cases {
+            let mut crates = baseline();
+            set(&mut crates, "xtask", body);
+            assert_single(
+                &check(&crates),
+                &[
+                    "R4:",
+                    &format!(
+                        "permissive package `xtask` has a {kind} dependency on GPL package `game`"
+                    ),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn r4_allows_gpl_package_depending_on_permissive_package() {
+        let mut crates = baseline();
+        set(
+            &mut crates,
+            "audio",
+            "[dependencies]\nbms-model = { path = \"../bms-model\" }\n\
+             [build-dependencies]\nbms-parser = { path = \"../bms-parser\" }\n\
+             [dev-dependencies]\nxtask = { path = \"../xtask\" }\n",
+        );
+        assert_eq!(check(&crates), Vec::<String>::new());
     }
 }

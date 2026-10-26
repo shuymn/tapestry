@@ -3,7 +3,7 @@ name = "xtask"
 version = "0.0.0"
 description = "Repository checks and helpers (dev tooling, never shipped)."
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 publish.workspace = true
 

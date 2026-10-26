@@ -3,7 +3,7 @@ name = "bms-parser"
 version = "0.0.0"
 description = "BMS chart loader: text to a resolved chart model."
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 publish.workspace = true
 

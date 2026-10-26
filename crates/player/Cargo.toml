@@ -3,7 +3,7 @@ name = "player"
 version = "0.0.0"
 description = "The Windows game executable."
 edition.workspace = true
-license.workspace = true
+license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
