@@ -26,6 +26,7 @@ pub enum ScrollChange {
 }
 
 impl ScrollChange {
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     const fn at(self) -> TimeUs {
         match self {
             Self::Bpm { at, .. } | Self::Stop { at, .. } => at,
@@ -53,12 +54,14 @@ impl Segment {
     /// The position at `t`, unbounded. Cannot overflow: segments start at or
     /// after time 0 (`before_zero` at 0), so `|t - start| <= 2^63`, the
     /// product stays within `2^126`, and anchors stay within `2^89`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn position(self, t: i64) -> i128 {
         let advance = (i128::from(t) - i128::from(self.start)) * i128::from(self.bpm_micro);
         (self.scaled + advance).div_euclid(RATE_DIVISOR)
     }
 
     /// The smallest `t` with `position(t) >= p`. Needs `bpm_micro > 0`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn earliest_at_or_past(self, p: i128) -> i128 {
         i128::from(self.start)
             + ceil_div(p * RATE_DIVISOR - self.scaled, i128::from(self.bpm_micro))
@@ -150,6 +153,7 @@ impl ScrollMap {
 
     /// The BPM at time 0 before any change, in millionths.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn initial_bpm_micro(&self) -> i64 {
         self.before_zero.bpm_micro
     }
@@ -177,17 +181,24 @@ impl ScrollMap {
     }
 
     /// The segment that holds `t`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn segment_at(&self, t: i64) -> Segment {
         if t < 0 {
             self.before_zero
         } else {
-            self.segments[self.segments.partition_point(|s| s.start <= t) - 1]
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the first segment starts at time 0 <= t, so the partition point is at least 1"
+            )]
+            let segment = self.segments[self.segments.partition_point(|s| s.start <= t) - 1];
+            segment
         }
     }
 
     /// The display position at `t`, rounded down. Saturates at the `i64`
     /// bounds far outside any chart.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn position_at(&self, t: TimeUs) -> Position {
         Position(saturate(self.segment_at(t.0).position(t.0)))
     }
@@ -203,6 +214,7 @@ impl ScrollMap {
     /// microseconds, `from > to`, or a range beyond every `i64` time),
     /// `earliest > latest`.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn time_range(&self, from: Position, to: Position) -> (TimeUs, TimeUs) {
         let lo = if from.0 == i64::MIN {
             i128::MIN
@@ -232,21 +244,25 @@ impl ScrollMap {
     /// time 0 when none is. That segment is never a STOP, because the segment
     /// after a STOP has the same exact anchor, and the answer never passes
     /// the next anchor, because anchors are exact.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn earliest_at_or_past(&self, p: i128) -> i128 {
         let next = self
             .segments
             .partition_point(|s| s.scaled < p * RATE_DIVISOR);
         next.checked_sub(1)
-            .map_or(self.before_zero, |i| self.segments[i])
+            .and_then(|i| self.segments.get(i).copied())
+            .unwrap_or(self.before_zero)
             .earliest_at_or_past(p)
     }
 }
 
 /// `ceil(a / b)` for `b > 0`.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn ceil_div(a: i128, b: i128) -> i128 {
     -(-a).div_euclid(b)
 }
 
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn saturate(v: i128) -> i64 {
     i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
 }

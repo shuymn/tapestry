@@ -18,6 +18,7 @@ impl Lane {
     /// Returns the lane with `index`, or `None` if it is not below
     /// [`LANE_COUNT`].
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn new(index: u8) -> Option<Self> {
         if (index as usize) < LANE_COUNT {
             Some(Self(index))
@@ -28,11 +29,13 @@ impl Lane {
 
     /// The lane's index into [`Chart::lanes`].
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
 
     /// Every lane, scratch first.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn all() -> impl Iterator<Item = Self> {
         (0..LANE_COUNT as u8).map(Self)
     }
@@ -57,6 +60,7 @@ impl Note {
     /// The last time the note occupies its lane: the end of a long note,
     /// otherwise its time.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn end(&self) -> TimeUs {
         match self.kind {
             NoteKind::Long { end, .. } => end,

@@ -8,6 +8,11 @@ mod binary;
 mod demo;
 #[cfg(test)]
 mod fixture;
+// Lint fixtures under the workspace lints: `cargo xtask check-lints`.
+#[cfg(tapestry_lint_fixtures)]
+#[path = "../lint-fixtures/mod.rs"]
+mod lint_fixtures;
+mod lints;
 mod portable;
 
 use std::ffi::OsString;
@@ -19,6 +24,8 @@ usage: cargo xtask <command>
 
 commands:
   check-arch                              check the architecture rules (R1-R4)
+  check-lints                             check that the lints enforcing the design
+                                          rules are configured and fire on their fixtures
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt
@@ -35,8 +42,12 @@ fn main() -> ExitCode {
     };
     let rest: Vec<OsString> = args.collect();
     match command.to_str() {
-        Some("check-arch") if rest.is_empty() => {
-            report(arch::run(&workspace_manifest(), &["--locked"]))
+        Some("check-arch") if rest.is_empty() => report(
+            "check-arch",
+            arch::run(&workspace_manifest(), &["--locked"]),
+        ),
+        Some("check-lints") if rest.is_empty() => {
+            report("check-lints", lints::run(&workspace_manifest()))
         }
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
@@ -50,21 +61,21 @@ fn main() -> ExitCode {
     }
 }
 
-fn report(result: Result<Vec<String>, String>) -> ExitCode {
+fn report(name: &str, result: Result<Vec<String>, String>) -> ExitCode {
     match result {
         Ok(diagnostics) if diagnostics.is_empty() => {
-            eprintln!("check-arch: ok");
+            eprintln!("{name}: ok");
             ExitCode::SUCCESS
         }
         Ok(diagnostics) => {
             for d in &diagnostics {
-                eprintln!("check-arch: {d}");
+                eprintln!("{name}: {d}");
             }
-            eprintln!("check-arch: {} violation(s)", diagnostics.len());
+            eprintln!("{name}: {} violation(s)", diagnostics.len());
             ExitCode::from(1)
         }
         Err(e) => {
-            eprintln!("check-arch: error: {e}");
+            eprintln!("{name}: error: {e}");
             ExitCode::from(2)
         }
     }

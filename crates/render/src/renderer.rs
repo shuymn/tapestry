@@ -1,6 +1,8 @@
 //! The renderer: one instanced sprite pipeline per blend over the atlas,
 //! drawing a skin's batch into a swap chain or an offscreen target.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::time::{Duration, Instant};
 
 use bms_model::Chart;
@@ -485,6 +487,11 @@ impl Renderer {
     /// every submitted frame finished. A window target has none and gives
     /// an empty vector.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        reason = "read-back for frame dumps and tests, outside play: a failed map is a GPU fault, and each row lies inside the padded buffer"
+    )]
     pub fn read_back(&self) -> Vec<u8> {
         let Output::Offscreen { texture, .. } = &self.output else {
             return Vec::new();

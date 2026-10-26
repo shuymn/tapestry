@@ -9,6 +9,8 @@
 //! it is an `Option`, `None` meaning N/A. Nothing here allocates after
 //! construction.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::collections::VecDeque;
 
 /// p50, p99 and max of a play's samples.
@@ -86,6 +88,10 @@ impl Samples {
 
     /// Adds one sample.
     pub fn push(&mut self, v: i64) {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`bucket` returns an index below BUCKETS"
+        )]
         if v < 0 {
             self.negative[bucket(v.unsigned_abs())] += 1;
         } else {
@@ -403,6 +409,10 @@ impl OnScreen {
     }
 
     /// Judgment `seq` with `origin` (µs) is drawn in the frame being built.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`slot` reduces `seq` modulo the slot count"
+    )]
     pub fn drawn(&mut self, seq: u64, origin: i64) {
         let i = self.slot(seq);
         if self.slots[i].state == OnScreenLatency::Pending {
@@ -425,22 +435,30 @@ impl OnScreen {
     /// The frame built since the last call was presented with
     /// `present_count`: it is the first presented frame of what it drew.
     pub fn presented(&mut self, present_count: u32) {
-        for k in (0..self.order.len()).rev() {
-            let seq = self.order[k];
+        for &seq in self.order.iter().rev() {
             let i = self.slot(seq);
-            if self.slots[i].seq != seq {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`slot` reduces `seq` modulo the slot count, which is at least 1"
+            )]
+            let slot = &mut self.slots[i];
+            if slot.seq != seq {
                 continue;
             }
-            if self.slots[i].frame.is_some() {
+            if slot.frame.is_some() {
                 break;
             }
-            self.slots[i].frame = Some(present_count);
+            slot.frame = Some(present_count);
         }
     }
 
     /// An accepted sample: present `present_count` was displayed at
     /// `display_us` (on the origins' timeline). Judgments of earlier
     /// frames still unresolved have no sample and are N/A.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`slot` reduces `seq` modulo the slot count"
+    )]
     pub fn sample(&mut self, present_count: u32, display_us: i64) {
         while let Some(&seq) = self.order.front() {
             let i = self.slot(seq);
@@ -470,12 +488,19 @@ impl OnScreen {
     /// earlier frames keep their pairings.
     pub fn presented_unknown(&mut self) {
         for k in (0..self.order.len()).rev() {
-            let seq = self.order[k];
+            // `k` is below the length, which this loop (and `give_up`)
+            // does not change.
+            let Some(&seq) = self.order.get(k) else { break };
             let i = self.slot(seq);
-            if self.slots[i].seq != seq {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`slot` reduces `seq` modulo the slot count, which is at least 1"
+            )]
+            let slot = self.slots[i];
+            if slot.seq != seq {
                 continue;
             }
-            if self.slots[i].frame.is_some() {
+            if slot.frame.is_some() {
                 break;
             }
             self.give_up(seq);
@@ -490,6 +515,10 @@ impl OnScreen {
         }
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`slot` reduces `seq` modulo the slot count"
+    )]
     fn give_up(&mut self, seq: u64) {
         let i = self.slot(seq);
         if self.slots[i].seq == seq && self.slots[i].state == OnScreenLatency::Pending {
@@ -500,6 +529,10 @@ impl OnScreen {
 
     /// What the table knows of judgment `seq`.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`slot` reduces `seq` modulo the slot count"
+    )]
     pub fn latency(&self, seq: u64) -> OnScreenLatency {
         let slot = self.slots[self.slot(seq)];
         if slot.seq == seq {
@@ -548,6 +581,10 @@ pub struct SpanCount {
 /// (the first at or after `b`), or when `covered` says it lacks a present
 /// the game issued in the span.
 #[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "capture analysis after play: `pred` and `succ` are positions in `displayed`, `pred` below `succ`, and each window holds two"
+)]
 pub fn count_span(
     displayed: &[i64],
     (a, b): (i64, i64),

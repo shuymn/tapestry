@@ -1,6 +1,8 @@
 //! Input conversion: physical control changes to lane press and release
 //! edges, including the analog scratch conversion of axes.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bms_model::{LANE_COUNT, Lane, TimeUs};
 
 use crate::EvalError;
@@ -46,6 +48,10 @@ impl Edges {
 
     /// The edges as a slice.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`push` keeps `len` at most the capacity"
+    )]
     pub fn as_slice(&self) -> &[LaneEdge] {
         &self.items[..self.len]
     }
@@ -170,11 +176,11 @@ impl ConversionState {
                 .chain(profile.axes.iter().map(|a| a.control))
                 .collect();
             controls.sort_unstable();
-            if let Some(w) = controls.windows(2).find(|w| w[0] == w[1]) {
-                return Err(EvalError::DuplicateBinding {
-                    source,
-                    control: w[0],
-                });
+            if let Some(control) = controls.windows(2).find_map(|w| match w {
+                [a, b] if a == b => Some(*a),
+                _ => None,
+            }) {
+                return Err(EvalError::DuplicateBinding { source, control });
             }
             let mut bindings: Vec<(ControlId, Lane)> = profile
                 .bindings
@@ -213,7 +219,13 @@ impl ConversionState {
         for &(source, control, value) in &start.held {
             if let Some(i) = state.axis_of(source, control) {
                 // Only an absolute axis reads it.
-                state.axes[i].last = Some(value);
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "construction: `axis_of` returns an index into `axes`"
+                )]
+                {
+                    state.axes[i].last = Some(value);
+                }
                 continue;
             }
             // Held controls start pressed; no edge is reported for them.
@@ -224,6 +236,10 @@ impl ConversionState {
 
     /// Whether `lane` is held.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`Lane::index` is below LANE_COUNT, the length of `held`"
+    )]
     pub fn is_held(&self, lane: Lane) -> bool {
         self.held[lane.index()] > 0
     }
@@ -276,7 +292,7 @@ impl ConversionState {
     fn axis_of(&self, source: SourceId, control: ControlId) -> Option<usize> {
         let own = &self.sources.get(source.index())?.axes;
         let k = own.binary_search_by_key(&control, |&(c, _)| c).ok()?;
-        Some(own[k].1)
+        own.get(k).map(|&(_, i)| i)
     }
 
     /// Releases every control of `source` and clears its axes.
@@ -285,7 +301,15 @@ impl ConversionState {
             return;
         };
         for k in 0..own.axes.len() {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`source` was found above and the loop keeps `k` below its axis count"
+            )]
             let i = self.sources[source.index()].axes[k].1;
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`axis_of` returns, and the evaluator passes, an index built into `axes` at construction"
+            )]
             let a = &mut self.axes[i];
             let was_pressed = a.pressed.is_some();
             let lane = a.lane;
@@ -297,9 +321,12 @@ impl ConversionState {
         let Some(state) = self.sources.get_mut(source.index()) else {
             return;
         };
-        for (i, pressed) in state.pressed.iter_mut().enumerate() {
+        for (pressed, &(_, lane)) in state.pressed.iter_mut().zip(&state.bindings) {
             if std::mem::replace(pressed, false) {
-                let lane = state.bindings[i].1;
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "`Lane::index` is below LANE_COUNT, the length of `held`"
+                )]
                 let held = &mut self.held[lane.index()];
                 *held -= 1;
                 if *held == 0 {
@@ -311,6 +338,10 @@ impl ConversionState {
 
     /// One report of axis `i` at `at`.
     fn axis_report(&mut self, i: usize, value: i32, at: TimeUs, edges: &mut Edges) {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`axis_of` returns, and the evaluator passes, an index built into `axes` at construction"
+        )]
         let a = &mut self.axes[i];
         let d = a.movement(value);
         if d == 0 {
@@ -363,6 +394,10 @@ impl ConversionState {
 
     /// One more control holds `lane`: a press edge if it was released.
     fn hold(&mut self, lane: Lane) -> Option<LaneEdge> {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`Lane::index` is below LANE_COUNT, the length of `held`"
+        )]
         let held = &mut self.held[lane.index()];
         *held += 1;
         (*held == 1).then_some(LaneEdge::Press(lane))
@@ -370,6 +405,10 @@ impl ConversionState {
 
     /// One control fewer holds `lane`: a release edge if none is left.
     fn unhold(&mut self, lane: Lane) -> Option<LaneEdge> {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`Lane::index` is below LANE_COUNT, the length of `held`"
+        )]
         let held = &mut self.held[lane.index()];
         *held -= 1;
         (*held == 0).then_some(LaneEdge::Release(lane))
@@ -382,10 +421,16 @@ impl ConversionState {
             .bindings
             .binary_search_by_key(&control, |&(c, _)| c)
             .ok()?;
-        if state.pressed[i] == pressed {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`i` is a binding's position, and `pressed` has one entry per binding"
+        )]
+        let was = &mut state.pressed[i];
+        if *was == pressed {
             return None;
         }
-        state.pressed[i] = pressed;
+        *was = pressed;
+        #[expect(clippy::indexing_slicing, reason = "`i` is a binding's position")]
         let lane = state.bindings[i].1;
         if pressed {
             self.hold(lane)

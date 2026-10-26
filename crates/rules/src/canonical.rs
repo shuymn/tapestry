@@ -99,6 +99,10 @@ impl Writer {
 
     fn int(&mut self, v: i64) {
         // Zigzag: 0, -1, 1, -2, … map to 0, 1, 2, 3, …
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "zigzag reinterprets the bits on purpose"
+        )]
         self.uint(((v << 1) ^ (v >> 63)) as u64);
     }
 

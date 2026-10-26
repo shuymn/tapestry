@@ -1,6 +1,8 @@
 //! What the logic thread hands to rendering: effects through a queue, and
 //! the latest play state through a triple buffer.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

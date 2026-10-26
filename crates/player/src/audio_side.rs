@@ -3,6 +3,8 @@
 //! bank at the output's rate, then runs `game`'s audio loop until the end
 //! of the run.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::JoinHandle;
 use std::time::Duration;

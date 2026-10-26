@@ -4,6 +4,9 @@
 //! untrusted: every limit in [`Limits`] is checked before the work it bounds,
 //! times use exact rationals with checked arithmetic, and sound files are
 //! confined to the chart folder. This crate does not use floating point.
+//! The cast lints at the crate root reject `as` casts that may truncate,
+//! wrap, or lose the sign; they cover the library and its unit tests, not
+//! the integration tests.
 //!
 //! # Loader version 1
 //!
@@ -64,6 +67,11 @@
 
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
+#![deny(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 
 mod branch;
 mod decimal;

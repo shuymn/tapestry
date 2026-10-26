@@ -19,6 +19,8 @@
 //! period below the window's earliest, or [`MIX_CLOCK_REBASE_AFTER`] in a
 //! row lie more than half a period above it (a jump such as resume).
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bms_model::TimeUs;
 
 /// Observations in the sliding window.
@@ -92,7 +94,7 @@ impl MixClock {
     }
 
     fn earliest(&self) -> Option<i64> {
-        self.residuals[..self.len].iter().copied().min()
+        self.residuals.iter().take(self.len).copied().min()
     }
 
     /// Frame `queued_from` is mixed at `mixed_at` or earlier. Residuals
@@ -112,7 +114,13 @@ impl MixClock {
                 self.above = 0;
             }
         }
-        self.residuals[self.next] = r;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`next` is kept below the window length by the modulo below"
+        )]
+        {
+            self.residuals[self.next] = r;
+        }
         self.next = (self.next + 1) % self.residuals.len();
         self.len = (self.len + 1).min(self.residuals.len());
         let min = self.earliest().unwrap_or(r);

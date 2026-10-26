@@ -1,0 +1,7 @@
+# Test code may unwrap, expect and index: the in-play modules deny those
+# lints for production code only (design.md "Scope of No Allocation").
+# Clippy reads only the nearest clippy.toml: keep these lines in sync with
+# crates/eval/clippy.toml (`cargo xtask check-lints` compares them).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true

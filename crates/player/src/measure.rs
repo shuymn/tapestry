@@ -13,6 +13,8 @@
 //! allocates while a play is measured; the figures handed over at its end
 //! are built then.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -183,6 +185,10 @@ impl Line {
         len: 0,
     };
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`write_str` keeps `len` at most LINE_LEN"
+    )]
     fn as_str(&self) -> &str {
         // Only ASCII is written.
         std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
@@ -193,7 +199,13 @@ impl fmt::Write for Line {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for &b in s.as_bytes() {
             if self.len < LINE_LEN {
-                self.buf[self.len] = b;
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "the check above keeps `len` below LINE_LEN"
+                )]
+                {
+                    self.buf[self.len] = b;
+                }
                 self.len += 1;
             }
         }
@@ -234,6 +246,10 @@ fn write_overlay(fig: &Figures, load: Option<(bool, i64)>, lines: &mut [Line; LI
     let mut n = 0;
     let mut line = |args: fmt::Arguments<'_>| {
         if n < LINES {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the check above keeps `n` below LINES"
+            )]
             let _ = lines[n].write_fmt(args);
             n += 1;
         }
@@ -485,7 +501,7 @@ impl Measure {
                 .map(|ms| (self.play.as_ref().is_some_and(|p| p.retry), ms));
             self.shown = write_overlay(&fig, load, &mut self.lines);
         }
-        for (o, l) in out.iter_mut().zip(&self.lines[..self.shown]) {
+        for (o, l) in out.iter_mut().zip(self.lines.iter().take(self.shown)) {
             *o = l.as_str();
         }
         out
@@ -515,9 +531,13 @@ impl Measure {
             present_times: None,
             span: (start, end),
             presents: self.presents.saturating_sub(after_end),
-            allocations: allocations()
-                .zip(self.alloc_base)
-                .map(|(now, base)| std::array::from_fn(|i| now[i].saturating_sub(base[i]))),
+            allocations: allocations().zip(self.alloc_base).map(|(now, base)| {
+                let mut delta = now;
+                for (d, b) in delta.iter_mut().zip(base) {
+                    *d = d.saturating_sub(b);
+                }
+                delta
+            }),
             steps_dropped: 0,
             refresh_period_ns: self
                 .first_sync
@@ -617,7 +637,13 @@ impl Measure {
         }
         if d.at >= origin {
             self.presents += 1;
-            self.recent[self.recent_next] = d.at.0;
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the modulo below keeps `recent_next` below RECENT"
+            )]
+            {
+                self.recent[self.recent_next] = d.at.0;
+            }
             self.recent_next = (self.recent_next + 1) % RECENT;
         }
         match d.timing.present_count {

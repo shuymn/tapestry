@@ -1,6 +1,8 @@
 //! The audio thread loop (stage1.md D8): one engine step per buffer event
 //! until asked to stop.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rtrb::Consumer;

@@ -73,6 +73,7 @@ impl Controls {
     }
 
     /// The values the settings keys step.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn tuning(&self) -> &Arc<LiveTuning> {
         &self.tuning
     }
@@ -114,6 +115,7 @@ impl Controls {
     }
 
     /// Takes the pending retry or suspend.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take(&self) -> Option<Command> {
         match self.command.swap(NONE, Ordering::AcqRel) {
             RETRY => Some(Command::Retry),
@@ -123,6 +125,7 @@ impl Controls {
     }
 
     /// When the latest retry was received.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn retry_at(&self) -> Option<TimeUs> {
         let t = self.retry_at.load(Ordering::Acquire);
         (t != i64::MIN).then_some(TimeUs(t))
@@ -135,6 +138,7 @@ impl Controls {
     }
 
     /// Whether the player quit or the window is closing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn quitting(&self) -> bool {
         self.quit.load(Ordering::Acquire)
     }
@@ -149,6 +153,7 @@ impl Controls {
     }
 
     /// Whether the window has focus.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn focused(&self) -> bool {
         self.focused.load(Ordering::Acquire)
     }

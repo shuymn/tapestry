@@ -11,6 +11,8 @@
 //! found per lane by binary search. A note judged by an effect is hidden
 //! through a per-note bit set sized in `prepare`.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, ScrollMap, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::{GaugeValue, Judgment};
@@ -213,6 +215,10 @@ impl Default for SimpleSkin {
 impl SimpleSkin {
     /// A skin with no chart loaded: it draws the empty lanes.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "construction: 120 BPM without changes is a valid scroll"
+    )]
     pub fn new() -> Self {
         Self {
             lanes: Default::default(),
@@ -228,6 +234,10 @@ impl SimpleSkin {
 
     /// Takes `chart`'s notes, bar lines and scroll, and resets the play
     /// state. This is all of `prepare`; the skin needs nothing from the GPU.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "loading before play: `from_fn` passes lane indices below LANE_COUNT"
+    )]
     pub fn load(&mut self, chart: &Chart) {
         self.lanes = chart.lanes.clone();
         self.bar_lines = chart.bar_lines.clone();
@@ -239,6 +249,10 @@ impl SimpleSkin {
         self.judgment = None;
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "every index is a `Lane::index`, below LANE_COUNT, the length of the per-lane arrays"
+    )]
     fn apply(&mut self, ev: &JudgeEvent) {
         match ev.kind {
             JudgeEventKind::Judged {
@@ -321,7 +335,7 @@ impl SimpleSkin {
 
     fn bar_lines(&self, out: &mut SpriteBatch, scale: &Scale, from: TimeUs, to: TimeUs) {
         let start = self.bar_lines.partition_point(|&t| t < from);
-        for &t in self.bar_lines[start..].iter().take_while(|&&t| t <= to) {
+        for &t in self.bar_lines.iter().skip(start).take_while(|&&t| t <= to) {
             let y = scale.y(self.scroll.position_at(t).0);
             if !cap(
                 out,
@@ -339,6 +353,10 @@ impl SimpleSkin {
     fn notes(&self, out: &mut SpriteBatch, scale: &Scale, from: TimeUs, to: TimeUs) {
         for lane in Lane::all() {
             let l = lane.index();
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`l` is a `Lane::index`, below LANE_COUNT"
+            )]
             let notes = &self.lanes[l];
             let (x, w) = layout::lane_x(lane);
             let color = note_color(lane);
@@ -347,6 +365,10 @@ impl SimpleSkin {
                 if note.time > to {
                     break;
                 }
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "`l` is a `Lane::index`, below LANE_COUNT"
+                )]
                 if self.done[l].get(i) {
                     continue;
                 }
@@ -357,6 +379,10 @@ impl SimpleSkin {
                     NoteKind::Long { end, .. } => {
                         let tail = scale.y(self.scroll.position_at(end).0);
                         // A held head stays on the judgment line.
+                        #[expect(
+                            clippy::indexing_slicing,
+                            reason = "`l` is a `Lane::index`, below LANE_COUNT"
+                        )]
                         let (head, tail) = if self.held[l].get(i) {
                             (head.min(JUDGE_Y), tail.min(JUDGE_Y))
                         } else {
@@ -384,10 +410,12 @@ impl SimpleSkin {
     fn effects(&self, out: &mut SpriteBatch, at: TimeUs) {
         for lane in Lane::all() {
             let (x, w) = layout::lane_x(lane);
+            #[expect(clippy::indexing_slicing, reason = "`Lane::index` is below LANE_COUNT")]
             if let Some(f) = self.pressed[lane.index()].and_then(|t| fade(at, t, BEAM_US)) {
                 let c = [BEAM[0], BEAM[1], BEAM[2], BEAM[3] * f];
                 rect(out, Blend::Additive, x, LANE_TOP, w, JUDGE_Y - LANE_TOP, c);
             }
+            #[expect(clippy::indexing_slicing, reason = "`Lane::index` is below LANE_COUNT")]
             if let Some(f) = self.hit[lane.index()].and_then(|t| fade(at, t, BOMB_US)) {
                 let side = BOMB_SIDE * (0.5 + 0.5 * f);
                 let cx = x + w / 2.0;
@@ -613,6 +641,10 @@ fn countdown(out: &mut SpriteBatch, now: TimeUs) {
 }
 
 /// `n` in decimal, written at the end of `buf`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "`i` counts down from the buffer's length, and a u32 has at most 10 digits"
+)]
 fn decimal(mut n: u32, buf: &mut [u8; 10]) -> &[u8] {
     let mut i = buf.len();
     loop {

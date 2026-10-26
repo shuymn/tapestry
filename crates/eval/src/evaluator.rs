@@ -1,6 +1,8 @@
 //! The incremental evaluator: inputs and chart deadlines processed in one
 //! fixed order, finalized only up to the watermark.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::collections::VecDeque;
 
 use bms_model::{Chart, LANE_COUNT, Lane, LnMode as ChartLnMode, NoteKind, SoundId, TimeUs};
@@ -210,7 +212,13 @@ struct LaneState {
 
 impl LaneState {
     fn mark_judged(&mut self, target: usize) {
-        self.judged[target] = true;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "callers pass a position in `targets`, and `judged` has one entry per target"
+        )]
+        {
+            self.judged[target] = true;
+        }
         while self.judged.get(self.cursor) == Some(&true) {
             self.cursor += 1;
         }
@@ -222,6 +230,10 @@ impl LaneState {
     /// never skipped.
     fn head(&mut self) -> Option<Deadline> {
         while let Some(&d) = self.deadlines.get(self.next) {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "miss and LN end deadlines hold a position in `targets`, which `judged` matches in length"
+            )]
             let skip = match d.kind {
                 DeadlineKind::Miss => self.judged[d.index],
                 DeadlineKind::LnEnd => self.judged[d.index] && self.holding != Some(d.index),
@@ -345,6 +357,10 @@ impl<'a> Evaluator<'a> {
             state.judged = vec![false; state.targets.len()];
             let mut deadlines = Vec::with_capacity(notes.len() * 2);
             for (target, &i) in state.targets.iter().enumerate() {
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "construction: `targets` holds indices into this lane's notes"
+                )]
                 let note = notes[i];
                 let miss = note
                     .time
@@ -602,8 +618,16 @@ impl<'a> Evaluator<'a> {
             }
             DeadlineKind::Miss | DeadlineKind::LnEnd | DeadlineKind::Mine => {}
         }
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+        )]
         let state = &mut self.lanes[lane];
         state.next += 1;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` is below LANE_COUNT; a miss or LN end deadline holds a position in `targets`, a mine one an index into the chart lane"
+        )]
         match d.kind {
             DeadlineKind::Miss => {
                 // A missed head is judged, which finishes its long note too.
@@ -652,9 +676,21 @@ impl<'a> Evaluator<'a> {
     /// A press edge on `lane` at evaluation time `t`.
     fn press(&mut self, lane: usize, t: TimeUs, origin: TimeUs, out: &mut Vec<JudgeEvent>) {
         let bad = self.windows.bad;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+        )]
         let notes = &self.chart.lanes[lane];
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+        )]
         let state = &self.lanes[lane];
         let at = i128::from(t.0);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "callers pass a position below `targets.len()`, and `targets` holds indices into the lane's notes"
+        )]
         let time_of = |k: usize| i128::from(notes[state.targets[k]].time.0);
         let first = (state.cursor < state.targets.len()).then_some(state.cursor);
         // Candidates: unjudged targets with −early ≤ t − note ≤ late (BAD).
@@ -664,6 +700,10 @@ impl<'a> Evaluator<'a> {
             if deviation < -i128::from(bad.early.0) {
                 break;
             }
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the loop keeps `k` below `targets.len()`, which `judged` matches"
+            )]
             if state.judged[k] || deviation > i128::from(bad.late.0) {
                 continue;
             }
@@ -685,11 +725,19 @@ impl<'a> Evaluator<'a> {
         // before `t + ahead`.
         let empty_poor = best.is_none() && {
             let from = at - i128::from(rule.behind.0);
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`targets` holds indices into the lane's notes"
+            )]
             let k = state
                 .targets
                 .partition_point(|&i| i128::from(notes[i].time.0) < from);
             k < state.targets.len() && time_of(k) <= at + i128::from(rule.ahead.0)
         };
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`target` is a candidate or the cursor, both below `targets.len()`"
+        )]
         if let Some(sound) = target.and_then(|k| notes[state.targets[k]].sound) {
             self.emit(
                 t,
@@ -708,12 +756,21 @@ impl<'a> Evaluator<'a> {
                 // deadline is then skipped. All of them are unjudged, since
                 // under this rule a judgment passes every earlier note and
                 // misses come in note order.
-                MissRule::PoorAfterLateBadOrOvertaken => {
+                MissRule::PoorAfterLateBadOrOvertaken =>
+                {
+                    #[expect(
+                        clippy::indexing_slicing,
+                        reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+                    )]
                     for j in self.lanes[lane].cursor..k {
                         self.judge(lane, j, Judgment::Poor, None, t, Some(origin), out);
                     }
                 }
             }
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`lane` is below LANE_COUNT, `k` is a candidate below `targets.len()`, and `targets` indexes the lane's notes"
+            )]
             let note = self.chart.lanes[lane][self.lanes[lane].targets[k]];
             // Within the BAD window, so it fits in i64.
             let deviation = TimeUs(i64::try_from(deviation).unwrap_or(i64::MAX));
@@ -728,7 +785,13 @@ impl<'a> Evaluator<'a> {
                 if completed {
                     self.ln_end(lane, k, LnOutcome::Completed, t, Some(origin), out);
                 } else {
-                    self.lanes[lane].holding = Some(k);
+                    #[expect(
+                        clippy::indexing_slicing,
+                        reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+                    )]
+                    {
+                        self.lanes[lane].holding = Some(k);
+                    }
                 }
             }
             return;
@@ -767,10 +830,18 @@ impl<'a> Evaluator<'a> {
         origin: Option<TimeUs>,
         out: &mut Vec<JudgeEvent>,
     ) {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+        )]
         let state = &mut self.lanes[lane];
         let Some(k) = state.holding.take() else {
             return;
         };
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` is below LANE_COUNT, `holding` is a position in `targets`, and `targets` indexes the lane's notes"
+        )]
         let end = self.chart.lanes[lane][state.targets[k]].end();
         let rule = self.rule.ln_break;
         let broken = i128::from(t.0) < i128::from(end.0) - i128::from(rule.release_margin.0);
@@ -799,6 +870,10 @@ impl<'a> Evaluator<'a> {
         origin: Option<TimeUs>,
         out: &mut Vec<JudgeEvent>,
     ) {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` is below LANE_COUNT and callers pass a position in `targets`"
+        )]
         let kind = JudgeEventKind::LnEnd {
             lane: lane_of(lane),
             note: self.lanes[lane].targets[target],
@@ -818,7 +893,15 @@ impl<'a> Evaluator<'a> {
         origin: Option<TimeUs>,
         out: &mut Vec<JudgeEvent>,
     ) {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+        )]
         let state = &mut self.lanes[lane];
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "callers pass a position in `targets`"
+        )]
         let note = state.targets[target];
         state.mark_judged(target);
         let score = &self.rule.score;
@@ -851,6 +934,10 @@ impl<'a> Evaluator<'a> {
         self.gauges
             .apply(&self.rule.gauges, &self.rule.mine, cause, time);
         for gauge in 0..self.gauges.states().len() {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the loop keeps `gauge` below the number of states"
+            )]
             let s = self.gauges.states()[gauge];
             let kind = JudgeEventKind::Gauge {
                 gauge,
@@ -893,3 +980,8 @@ fn lane_of(index: usize) -> Lane {
         .and_then(Lane::new)
         .unwrap_or(Lane::SCRATCH)
 }
+
+// Lint fixtures under this module's attribute: `cargo xtask check-lints`.
+#[cfg(tapestry_lint_fixtures)]
+#[path = "../lint-fixtures/in_play/mod.rs"]
+mod lint_fixtures;

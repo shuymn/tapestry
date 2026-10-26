@@ -231,6 +231,7 @@ impl Sound {
 
     /// Length in frames.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn frames(&self) -> u64 {
         (self.samples.len() / self.channels()) as u64
     }
@@ -241,11 +242,17 @@ impl Sound {
         self.samples.len() as u64 * 2
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn channels(&self) -> usize {
         if self.stereo { 2 } else { 1 }
     }
 
     /// Frame `i` as left, right in `[-1, 1)`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the mixer reads only frames below `frames()`, so every sample index is in bounds"
+    )]
     pub(crate) fn frame(&self, i: usize) -> (f32, f32) {
         let to_f32 = |s: i16| f32::from(s) / 32_768.0;
         if self.stereo {
@@ -295,12 +302,14 @@ impl SoundBank {
     /// The stored index for `id`; ids whose files have identical contents
     /// share one.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn slot(&self, id: SoundId) -> Option<u32> {
         self.slots.get(usize::from(id.0)).copied().flatten()
     }
 
     /// Stored sound `index`.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn stored(&self, index: u32) -> Option<&Sound> {
         self.sounds.get(index as usize)
     }

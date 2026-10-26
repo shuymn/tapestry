@@ -86,6 +86,7 @@ pub const fn glyph_rows(c: u8) -> [u8; 7] {
 
 /// The cell `c` draws from: its own, its uppercase letter's, or the
 /// space's.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 const fn cell_of(c: u8) -> u32 {
     let c = c.to_ascii_uppercase();
     if c < FIRST || c > LAST {
@@ -97,6 +98,7 @@ const fn cell_of(c: u8) -> u32 {
 
 /// The texture coordinates of `c`'s glyph: left, top, right, bottom.
 #[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 pub(crate) fn glyph_uv(c: u8) -> [f32; 4] {
     let cell = cell_of(c);
     let x = (cell % CELLS_PER_ROW) * CELL;
@@ -107,11 +109,13 @@ pub(crate) fn glyph_uv(c: u8) -> [f32; 4] {
 /// The texture coordinates of the middle of the solid block, as a
 /// zero-size rectangle, so every sample is white.
 #[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 pub(crate) fn solid_uv() -> [f32; 4] {
     let c = (SOLID as f32 + CELL as f32 / 2.0) / ATLAS_SIZE as f32;
     [c, c, c, c]
 }
 
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn texels(x0: u32, y0: u32, x1: u32, y1: u32) -> [f32; 4] {
     let s = ATLAS_SIZE as f32;
     [x0 as f32 / s, y0 as f32 / s, x1 as f32 / s, y1 as f32 / s]

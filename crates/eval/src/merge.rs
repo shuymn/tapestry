@@ -1,6 +1,8 @@
 //! The watermark over all sources, and the merge of staged events into one
 //! stream in evaluation-time order.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::collections::VecDeque;
 
 use bms_model::TimeUs;
@@ -169,7 +171,7 @@ pub fn merge(
         let Some((_, _, i)) = best else {
             return;
         };
-        if let Some(ev) = staged[i].events.pop_front() {
+        if let Some(ev) = staged.get_mut(i).and_then(|s| s.events.pop_front()) {
             out.push(ev);
         }
     }

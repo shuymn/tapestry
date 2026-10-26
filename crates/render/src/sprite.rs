@@ -1,5 +1,7 @@
 //! Sprites and the per-frame batch a skin fills.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bytemuck::{Pod, Zeroable};
 
 /// One instanced quad, in layout pixels (1920×1080, origin at the top

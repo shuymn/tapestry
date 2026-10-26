@@ -202,6 +202,7 @@ pub enum Command {
 }
 
 impl Command {
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) const fn cause(self) -> AbortCause {
         match self {
             Self::Retry => AbortCause::Retry,
@@ -584,6 +585,7 @@ impl Loaded {
     /// gauge in the preset's order): a survival gauge failed and the policy
     /// does not keep playing.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn ends_play(&self, gauges: &[GaugeState]) -> bool {
         let failed = gauges
             .iter()

@@ -2,6 +2,8 @@
 //! publishes how far the source has been received; the logic thread reads
 //! the publication first and pops after it.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 

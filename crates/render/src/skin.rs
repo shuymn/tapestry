@@ -1,6 +1,8 @@
 //! The skin boundary (section 2, "Skins"): what a skin is given each frame
 //! and what it must do.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bms_model::{Chart, TimeUs};
 use eval::JudgeEvent;
 use game::PlayView;

@@ -13,6 +13,8 @@
 //! owning its buttons and axes alike (stage1.md D6); each collection's controls carry its collection number
 //! ([`in_collection`]), so they stay distinct within the source.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use eval::ControlId;
 
 use crate::capture::Capture;
@@ -174,7 +176,7 @@ pub fn interface_of(path: &[u16]) -> Option<u8> {
 #[must_use]
 pub fn until_nul(buf: &[u16]) -> Option<&[u16]> {
     let len = buf.iter().position(|&c| c == 0)?;
-    Some(&buf[..len])
+    buf.get(..len)
 }
 
 /// Which group of collections a controller collection's source is: the
@@ -257,7 +259,10 @@ fn hex_after(path: &[u16], marker: &[u8]) -> Option<u8> {
         .find(|w| w.iter().zip(marker).all(|(&c, &m)| lower(c) == m))
         .and_then(|w| {
             let hex = |c: u16| char::from(lower(c)).to_digit(16);
-            Some(hex(w[marker.len()])? * 16 + hex(w[marker.len() + 1])?)
+            match w {
+                [.., high, low] => Some(hex(*high)? * 16 + hex(*low)?),
+                _ => None,
+            }
         })
         .and_then(|n| u8::try_from(n).ok())
 }
@@ -380,12 +385,20 @@ impl HidDevice {
     pub fn new(device: DeviceId, layout: &HidLayout<'_>) -> Self {
         let mut caps = [NO_AXIS; MAX_AXES];
         let n_axes = layout.axes.len().min(MAX_AXES);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "construction: `n_axes` is at most both lengths"
+        )]
         caps[..n_axes].copy_from_slice(&layout.axes[..n_axes]);
         let mut groups = [ButtonGroup {
             report_id: 0,
             buttons: 0,
         }; MAX_REPORT_IDS];
         let n_groups = layout.buttons.len().min(MAX_REPORT_IDS);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "construction: `n_groups` is at most both lengths"
+        )]
         groups[..n_groups].copy_from_slice(&layout.buttons[..n_groups]);
         Self {
             device,
@@ -417,6 +430,10 @@ impl HidDevice {
 
     /// Its axes.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`new` keeps `n_axes` at most MAX_AXES"
+    )]
     pub fn axes(&self) -> &[AxisCap] {
         &self.caps[..self.n_axes]
     }
@@ -426,8 +443,9 @@ impl HidDevice {
         if self.n_groups == 0 {
             return !0;
         }
-        self.groups[..self.n_groups]
+        self.groups
             .iter()
+            .take(self.n_groups)
             .filter(|g| g.report_id == id)
             .fold(0, |bits, g| bits | g.buttons)
     }
@@ -485,23 +503,28 @@ impl HidDevice {
             self.armed = armed;
             self.travel = [0; MAX_AXES];
         }
-        for (i, value) in report.axes.iter().take(self.n_axes).enumerate() {
+        let axes = report
+            .axes
+            .iter()
+            .zip(&self.caps)
+            .zip(self.values.iter_mut().zip(self.travel.iter_mut()))
+            .take(self.n_axes);
+        for ((value, &cap), (last, travel)) in axes {
             let Some(value) = *value else {
                 continue;
             };
-            let cap = self.caps[i];
             if !cap.relative && !(cap.min..=cap.max).contains(&value) {
                 // A wrong descriptor: recorded as reported, and counted.
                 sources.axis_value_out_of_range(device);
             }
-            let prev = self.values[i];
+            let prev = *last;
             if !cap.relative && capture.watched() == Some(cap.control) {
                 capture.observe(&cap, prev, value);
             }
             let moved = if cap.relative {
                 i64::from(value)
             } else {
-                match self.values[i].replace(value) {
+                match last.replace(value) {
                     None => 0,
                     Some(prev) if prev == value => continue,
                     Some(prev) => wrapped(i64::from(value) - i64::from(prev), cap.wrap),
@@ -512,7 +535,6 @@ impl HidDevice {
             }
             let p = packet(cap.control, value);
             sources.packet(&p);
-            let travel = &mut self.travel[i];
             *travel = travel.saturating_add(moved);
             if travel.abs() >= capture_travel(&cap) {
                 *travel = 0;

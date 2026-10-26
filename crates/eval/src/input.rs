@@ -2,6 +2,8 @@
 //! that maps them to lanes, and the snapshot of controls held when recording
 //! opened.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bms_model::{Lane, TimeUs};
 
 /// A source: one physical device, with its own queue and input offset.

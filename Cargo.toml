@@ -63,13 +63,25 @@ encoding_rs = "0.8.42"
 # xtask (dev tooling, never shipped)
 cargo_metadata = "0.23.1"
 unicode-normalization = "0.1.26"
+# The lint site check parses Rust source.
+proc-macro2 = { version = "1.0.107", default-features = false }
+quote = { version = "1.0.47", default-features = false }
+syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing"] }
 
 # Used by the `cargo xtask` alias (.cargo/config.toml).
 [profile.xtask]
 inherits = "dev"
 
+# Lint configuration and the fixtures that prove each lint fires:
+# `cargo xtask check-lints` (xtask/src/lints.rs).
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# `tapestry_lint_fixtures` is set only by `cargo xtask check-lints`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tapestry_lint_fixtures)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

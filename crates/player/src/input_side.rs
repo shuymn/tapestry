@@ -9,6 +9,8 @@
 //! and whether a participating device is still connected, for the abort
 //! checks of the play and its audio tail.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -78,6 +80,10 @@ impl InputLink {
     /// # Panics
     ///
     /// If the input thread is gone.
+    #[expect(
+        clippy::expect_used,
+        reason = "the documented panic: the input thread outlives every play"
+    )]
     pub fn open(&self, request: Request) -> Opening<SourceReader> {
         self.requests.send(request).expect("the input thread runs");
         match self.replies.recv().expect("the input thread runs") {
@@ -91,6 +97,10 @@ impl InputLink {
     /// # Panics
     ///
     /// If the input thread is gone.
+    #[expect(
+        clippy::expect_used,
+        reason = "the documented panic: the input thread outlives every play"
+    )]
     pub fn close(&self) -> Closing {
         self.requests
             .send(Request::Close)
@@ -250,8 +260,14 @@ impl Hook {
                 // before it: they connect, with their recorded controls,
                 // before the opening.
                 script.current = script.log.clone();
-                *sources = SourceSet::new(script.sources.clone())
-                    .expect("the run's source set was made with these sizes");
+                #[expect(
+                    clippy::expect_used,
+                    reason = "the run's source set was made with these sizes"
+                )]
+                {
+                    *sources = SourceSet::new(script.sources.clone())
+                        .expect("the run's source set was made with these sizes");
+                }
                 let open_at = TimeUs(-lead_in.0);
                 input::InputAdapter::poll(&mut script.current, TimeUs(open_at.0 - 1), sources);
                 reset_gate(sources, &self.controls);

@@ -97,6 +97,7 @@ impl Adjust {
     /// Whether it changes the input offset, which only the end screen
     /// takes.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn is_input_offset(self) -> bool {
         matches!(self, Self::InputOffsetDown | Self::InputOffsetUp)
     }
@@ -132,15 +133,24 @@ impl Tuning {
     /// next visible time of [`VISIBLE_TIME_STEPS_MS`], from a value on it or
     /// between two of its steps.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn adjust(self, adjust: Adjust) -> Self {
         let steps = &VISIBLE_TIME_STEPS_MS;
         let offset = |us: i64| us.clamp(-OFFSET_LIMIT_US, OFFSET_LIMIT_US);
         let mut t = self;
         match adjust {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the step table is a non-empty constant, and `next` is a valid step or the last"
+            )]
             Adjust::HiSpeedDown => {
                 let next = steps.partition_point(|&ms| ms <= t.visible_time_ms);
                 t.visible_time_ms = steps.get(next).copied().unwrap_or(steps[steps.len() - 1]);
             }
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the step table is a non-empty constant, and `i` is below the partition point"
+            )]
             Adjust::HiSpeedUp => {
                 let below = steps.partition_point(|&ms| ms < t.visible_time_ms);
                 t.visible_time_ms = below.checked_sub(1).map_or(steps[0], |i| steps[i]);
@@ -172,12 +182,14 @@ impl Tuning {
 
     /// The master volume as the mixer takes it.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn volume(self) -> f32 {
         self.volume_percent as f32 / 100.0
     }
 
     /// The visible time.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn visible_time(self) -> TimeUs {
         TimeUs(i64::from(self.visible_time_ms) * 1_000)
     }
