@@ -1,6 +1,8 @@
 //! The input side of the focus policy: losing focus aborts the play, and
 //! nothing received after that is recorded.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

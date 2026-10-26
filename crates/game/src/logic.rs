@@ -1,6 +1,8 @@
 //! The logic step: read every source's watermark, pop what it guarantees,
 //! merge through the global watermark, and advance the evaluator there.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::fmt;
 
 use bms_model::{Chart, TimeUs};
@@ -328,7 +330,12 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             return self.idle();
         };
         // (2) Then each source's guaranteed prefix, within the budget.
-        for (i, (s, p)) in self.sources.iter_mut().zip(&self.published).enumerate() {
+        for ((s, p), staged) in self
+            .sources
+            .iter_mut()
+            .zip(&self.published)
+            .zip(&mut self.staged)
+        {
             let up_to = p.received_up_to;
             if p.state == SourceState::Retired {
                 continue;
@@ -348,7 +355,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
                     break;
                 }
                 self.record.push(ev);
-                if self.staged[i].push(ev).is_err() {
+                if staged.push(ev).is_err() {
                     // Another source's event, which cannot be ordered here, or
                     // more than this source's share of the window.
                     self.overflowed = true;

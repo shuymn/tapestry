@@ -2,6 +2,8 @@
 //! the frozen set of sources while recording is open, and the arrivals
 //! list.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId};
 
@@ -224,11 +226,17 @@ impl SourceSet {
             return admit;
         };
         let source = device.source;
-        let axis = device.axes[..device.n_axes]
+        let axis = device
+            .axes
             .iter()
+            .take(device.n_axes)
             .position(|a| a.control == packet.control);
         if let Some(i) = axis {
             // A relative axis has no position to keep.
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`i` is a position below `n_axes`, at most MAX_AXES"
+            )]
             if !device.axes[i].relative {
                 device.positions[i] = Some(packet.value);
             }
@@ -242,6 +250,10 @@ impl SourceSet {
                 rec.overflowed = true;
             }
         }
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "a source id is its device's position in `participants`, set when recording opens"
+        )]
         if admit == Admit::Record
             && let Some(source) = source
             && let Some(rec) = &self.recording
@@ -329,10 +341,16 @@ impl SourceSet {
             return kept;
         };
         for (a, k) in axes.iter().zip(&mut kept) {
-            if d.axes[..d.n_axes].iter().any(|b| b.control == a.control) {
+            if d.axes.iter().take(d.n_axes).any(|b| b.control == a.control) {
                 *k = true;
             } else if d.n_axes < MAX_AXES {
-                d.axes[d.n_axes] = *a;
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "the branch requires `n_axes` below MAX_AXES"
+                )]
+                {
+                    d.axes[d.n_axes] = *a;
+                }
                 d.n_axes += 1;
                 *k = true;
             }
@@ -342,6 +360,10 @@ impl SourceSet {
 
     /// The axes of a connected device ([`add_axes`](Self::add_axes)).
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`add_axes` keeps `n_axes` at most MAX_AXES"
+    )]
     pub fn axes(&self, device: DeviceId) -> &[AxisCap] {
         self.devices
             .iter()
@@ -458,6 +480,10 @@ impl SourceSet {
         self.push(source, InputKind::Disconnected);
         if let Some(rec) = &mut self.recording {
             let at = rec.play_time(self.batch_at);
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "a source id is its device's position in `participants`, set when recording opens"
+            )]
             let p = &mut rec.participants[source.index()];
             p.writer.close(at);
             p.closed = true;
@@ -474,6 +500,10 @@ impl SourceSet {
             source,
             kind,
         };
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "a source id is its device's position in `participants`, set when recording opens"
+        )]
         if rec.participants[source.index()].writer.push(ev).is_err() {
             rec.overflowed = true;
         }
@@ -509,6 +539,10 @@ impl SourceSet {
         let mut held = Vec::new();
         for (i, device) in self.devices.iter_mut().take(n).enumerate() {
             // `SourceSet::new` bounds `max_sources` by `SOURCE_LIMIT`.
+            #[expect(
+                clippy::expect_used,
+                reason = "`SourceSet::new` bounds `max_sources` by SOURCE_LIMIT, which fits in u16"
+            )]
             let source = SourceId(u16::try_from(i).expect("source ids fit in u16"));
             device.source = Some(source);
             overflowed |= device.state_lost;
@@ -521,8 +555,10 @@ impl SourceSet {
                     .map(|&(c, v)| (source, c, v)),
             );
             held.extend(
-                device.axes[..device.n_axes]
+                device
+                    .axes
                     .iter()
+                    .take(device.n_axes)
                     .zip(device.positions)
                     .filter(|(a, _)| recorded.contains(&a.control))
                     .filter_map(|(a, p)| p.map(|v| (source, a.control, v))),
@@ -637,6 +673,7 @@ fn track(held: &mut Vec<(ControlId, i32)>, max: usize, control: ControlId, value
         Some(i) if value == 0 => {
             held.swap_remove(i);
         }
+        #[expect(clippy::indexing_slicing, reason = "`i` was just found by `position`")]
         Some(i) => held[i].1 = value,
         None if value == 0 => {}
         None if held.len() < max => held.push((control, value)),

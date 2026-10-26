@@ -1,6 +1,8 @@
 //! What the logic thread hands to audio: key sounds through a queue to the
 //! audio thread's [`AudioEngine`].
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

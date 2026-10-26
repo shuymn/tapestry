@@ -8,10 +8,17 @@
 //!
 //! Times are integer µs and gauges are fixed-point; this crate does not use
 //! floating point. The float lints below are partial checks: they catch float
-//! arithmetic and comparisons, not every use of a float type.
+//! arithmetic and comparisons, not every use of a float type. The cast lints
+//! below reject `as` casts that may truncate, wrap, or lose the sign; they
+//! cover the library and its unit tests, not integration tests.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
+#![deny(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 
 mod canonical;
 mod custom;

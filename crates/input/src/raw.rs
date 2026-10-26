@@ -7,6 +7,8 @@
 //! fields (`dwType`, `dwSize`) followed by two pointer-sized fields
 //! (`hDevice`, `wParam`), and `RAWKEYBOARD` follows it.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use eval::ControlId;
 
 use crate::gate::{DeviceId, Packet};
@@ -87,13 +89,13 @@ pub const fn key_identity(control: ControlId) -> ControlId {
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
-    let b = bytes.get(at..at + 2)?;
-    Some(u16::from_ne_bytes([b[0], b[1]]))
+    let b = bytes.get(at..at + 2)?.try_into().ok()?;
+    Some(u16::from_ne_bytes(b))
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-    let b = bytes.get(at..at + 4)?;
-    Some(u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+    let b = bytes.get(at..at + 4)?.try_into().ok()?;
+    Some(u32::from_ne_bytes(b))
 }
 
 fn usize_at(bytes: &[u8], at: usize) -> Option<usize> {
@@ -176,7 +178,7 @@ impl<'a> Iterator for Blocks<'a> {
             self.left = 0;
             return None;
         }
-        let block = &self.bytes[self.at..end];
+        let block = self.bytes.get(self.at..end)?;
         self.left -= 1;
         self.at = end.next_multiple_of(PTR);
         Some(block)

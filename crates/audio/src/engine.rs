@@ -1,6 +1,8 @@
 //! One wake of the audio thread (stage1.md D12): observe the buffer event,
 //! drain sound commands, schedule BGM that falls in the block, render it.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::fmt;
 use std::sync::Arc;
 

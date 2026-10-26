@@ -5,6 +5,8 @@
 //! makes the OS calls that fill the buffers. The layout the decoder assumes
 //! is checked against the `windows` crate's definitions at compile time.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::ffi::c_void;
 use std::fmt;
 use std::mem::{offset_of, size_of};
@@ -123,11 +125,19 @@ fn read_qpc() -> i64 {
     // SAFETY: writes one i64.
     let read = unsafe { QueryPerformanceCounter(&mut ticks) };
     // It cannot fail on Windows XP and later.
+    #[expect(
+        clippy::expect_used,
+        reason = "QueryPerformanceCounter cannot fail on Windows XP and later"
+    )]
     read.expect("QueryPerformanceCounter");
     ticks
 }
 
 /// The QPC frequency, read once per process.
+#[expect(
+    clippy::expect_used,
+    reason = "QueryPerformanceFrequency cannot fail and gives a positive frequency on Windows XP and later"
+)]
 fn qpc_frequency() -> QpcFrequency {
     static FREQUENCY: OnceLock<QpcFrequency> = OnceLock::new();
     *FREQUENCY.get_or_init(|| {
@@ -456,8 +466,16 @@ impl Controllers {
         sources.connect(device, DeviceKind::Controller);
         // Only axes the source keeps are read: one beyond the device's
         // table is never captured or recorded.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`read_axes` returns at most MAX_AXES, the table's length"
+        )]
         let kept = sources.add_axes(device, &caps[..n_axes]);
         let mut n = 0;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`read_axes` returns at most MAX_AXES, the length of these tables, and `n` stays at most `i`"
+        )]
         for i in 0..n_axes {
             if kept[i] {
                 caps[n] = caps[i];
@@ -470,14 +488,20 @@ impl Controllers {
         slot.collection = collection;
         slot.usage = hid_usage(handle).unwrap_or((0, 0));
         slot.report_ids = axis_ids || button_ids;
-        slot.state = HidDevice::new(
-            device,
-            &HidLayout {
-                collection,
-                axes: &caps[..n],
-                buttons: &groups[..n_groups],
-            },
-        );
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`n` is at most `n_axes`, and `read_buttons` returns at most MAX_REPORT_IDS, the tables' lengths"
+        )]
+        {
+            slot.state = HidDevice::new(
+                device,
+                &HidLayout {
+                    collection,
+                    axes: &caps[..n],
+                    buttons: &groups[..n_groups],
+                },
+            );
+        }
     }
 
     /// Forgets the collection `handle` and disconnects its source
@@ -542,6 +566,10 @@ impl Controllers {
                     *value = Some(axis_value(raw_value, read.bits, read.signed));
                 }
             }
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the state's axes are at most MAX_AXES, the length of `values`"
+            )]
             let report = HidReport {
                 id,
                 buttons,
@@ -570,7 +598,7 @@ fn read_path(handle: HANDLE, buf: &mut [u16]) -> Option<&[u16]> {
         return None;
     }
     let len = buf.iter().position(|&c| c == 0)?;
-    Some(&buf[..len])
+    buf.get(..len)
 }
 
 /// The container id of the physical device the interface `path`
@@ -644,6 +672,10 @@ fn read_axes(
     if status != HIDP_STATUS_SUCCESS {
         return (0, false);
     }
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`len` starts at most MAX_CAPS, the table's length, and the call only lowers it"
+    )]
     let values = &values[..usize::from(len)];
     let ids = values.iter().any(|v| v.ReportID != 0);
     let mut n = 0;
@@ -663,21 +695,33 @@ fn read_axes(
         for usage in axes {
             let control = in_collection(axis_control(v.UsagePage, usage), collection);
             let cap = axis_cap(control, v.IsAbsolute, v.LogicalMin, v.LogicalMax, v.BitSize);
-            if n == MAX_AXES || caps[..n].iter().any(|c| c.control == control) || cap.is_none() {
+            if n == MAX_AXES || caps.iter().take(n).any(|c| c.control == control) || cap.is_none() {
                 continue;
             }
-            reads[n] = AxisRead {
-                page: v.UsagePage,
-                usage,
-                bits: v.BitSize,
-                signed: v.LogicalMin < 0,
-                min: v.LogicalMin,
-                max: v.LogicalMax,
-            };
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the check above skips the axis once `n` reaches MAX_AXES"
+            )]
+            {
+                reads[n] = AxisRead {
+                    page: v.UsagePage,
+                    usage,
+                    bits: v.BitSize,
+                    signed: v.LogicalMin < 0,
+                    min: v.LogicalMin,
+                    max: v.LogicalMax,
+                };
+            }
             let Some(cap) = cap else {
                 continue;
             };
-            caps[n] = cap;
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the check above skips the axis once `n` reaches MAX_AXES"
+            )]
+            {
+                caps[n] = cap;
+            }
             n += 1;
         }
     }
@@ -704,6 +748,10 @@ fn read_buttons(
     if status != HIDP_STATUS_SUCCESS {
         return (0, false);
     }
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`len` starts at most MAX_CAPS, the table's length, and the call only lowers it"
+    )]
     let buttons = &buttons[..usize::from(len)];
     let ids = buttons.iter().any(|b| b.ReportID != 0);
     let mut n = 0;
@@ -721,13 +769,23 @@ fn read_buttons(
         };
         let bits = (min.max(1)..=max.min(crate::hid::MAX_BUTTON))
             .fold(0_u128, |bits, u| bits | 1 << (u - 1));
-        if let Some(g) = groups[..n].iter_mut().find(|g| g.report_id == b.ReportID) {
+        if let Some(g) = groups
+            .iter_mut()
+            .take(n)
+            .find(|g| g.report_id == b.ReportID)
+        {
             g.buttons |= bits;
         } else if n < MAX_REPORT_IDS {
-            groups[n] = ButtonGroup {
-                report_id: b.ReportID,
-                buttons: bits,
-            };
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the branch requires `n` below MAX_REPORT_IDS"
+            )]
+            {
+                groups[n] = ButtonGroup {
+                    report_id: b.ReportID,
+                    buttons: bits,
+                };
+            }
             n += 1;
         }
     }
@@ -1002,6 +1060,10 @@ pub struct CollectionInfo {
 pub fn controller_layouts() -> Result<Vec<CollectionInfo>, InputError> {
     let list = device_list()?;
     let mut controllers = Controllers::new();
+    #[expect(
+        clippy::expect_used,
+        reason = "listing outside play: MAX_CONTROLLERS is within the source limit"
+    )]
     let mut sources = SourceSet::new(crate::SourceConfig {
         max_devices: MAX_CONTROLLERS,
         max_sources: MAX_CONTROLLERS,
@@ -1024,8 +1086,10 @@ pub fn controller_layouts() -> Result<Vec<CollectionInfo>, InputError> {
             collection: s.collection,
             usage: s.usage,
             axes: s.state.axes().to_vec(),
-            declared: s.reads[..s.state.axes().len()]
+            declared: s
+                .reads
                 .iter()
+                .take(s.state.axes().len())
                 .map(|r| (r.min, r.max, r.bits))
                 .collect(),
             device: s.state.device(),

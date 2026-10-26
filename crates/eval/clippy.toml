@@ -1,0 +1,72 @@
+# The evaluator is pure (AGENTS.md): these lists reject the std entry points
+# for the clock, the file system, the environment, threads and printing,
+# and std's randomly ordered hash collections. A partial check: see the
+# crate docs. `cargo xtask check-lints` requires every entry below.
+# `allow-invalid` stays unset, so a mistyped path is reported.
+
+# Clippy reads only the nearest clippy.toml: keep the test allowances in
+# sync with ../../clippy.toml (`cargo xtask check-lints` compares them).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "the evaluator reads no clock" },
+    { path = "std::time::SystemTime::now", reason = "the evaluator reads no clock" },
+    { path = "std::fs::read", reason = "the evaluator does no I/O" },
+    { path = "std::fs::read_to_string", reason = "the evaluator does no I/O" },
+    { path = "std::fs::write", reason = "the evaluator does no I/O" },
+    { path = "std::fs::read_dir", reason = "the evaluator does no I/O" },
+    { path = "std::fs::metadata", reason = "the evaluator does no I/O" },
+    { path = "std::fs::create_dir", reason = "the evaluator does no I/O" },
+    { path = "std::fs::create_dir_all", reason = "the evaluator does no I/O" },
+    { path = "std::fs::remove_file", reason = "the evaluator does no I/O" },
+    { path = "std::fs::remove_dir", reason = "the evaluator does no I/O" },
+    { path = "std::fs::remove_dir_all", reason = "the evaluator does no I/O" },
+    { path = "std::fs::rename", reason = "the evaluator does no I/O" },
+    { path = "std::fs::copy", reason = "the evaluator does no I/O" },
+    { path = "std::fs::canonicalize", reason = "the evaluator does no I/O" },
+    { path = "std::fs::File::open", reason = "the evaluator does no I/O" },
+    { path = "std::fs::File::create", reason = "the evaluator does no I/O" },
+    { path = "std::env::var", reason = "the evaluator reads no environment" },
+    { path = "std::env::var_os", reason = "the evaluator reads no environment" },
+    { path = "std::env::vars", reason = "the evaluator reads no environment" },
+    { path = "std::env::vars_os", reason = "the evaluator reads no environment" },
+    { path = "std::env::args", reason = "the evaluator reads no environment" },
+    { path = "std::env::args_os", reason = "the evaluator reads no environment" },
+    { path = "std::env::current_dir", reason = "the evaluator reads no environment" },
+    { path = "std::env::current_exe", reason = "the evaluator reads no environment" },
+    { path = "std::env::temp_dir", reason = "the evaluator reads no environment" },
+    { path = "std::thread::spawn", reason = "the evaluator starts no thread" },
+    { path = "std::thread::scope", reason = "the evaluator starts no thread" },
+    { path = "std::thread::sleep", reason = "the evaluator does not wait" },
+    { path = "std::thread::yield_now", reason = "the evaluator does not wait" },
+    { path = "std::thread::park", reason = "the evaluator does not wait" },
+    { path = "std::thread::park_timeout", reason = "the evaluator does not wait" },
+    { path = "std::thread::current", reason = "the result must not depend on the thread" },
+    { path = "std::thread::available_parallelism", reason = "the result must not depend on the machine" },
+    { path = "std::io::stdin", reason = "the evaluator does no I/O" },
+    { path = "std::io::stdout", reason = "the evaluator does no I/O" },
+    { path = "std::io::stderr", reason = "the evaluator does no I/O" },
+]
+
+disallowed-types = [
+    { path = "std::time::Instant", reason = "the evaluator reads no clock" },
+    { path = "std::time::SystemTime", reason = "the evaluator reads no clock" },
+    { path = "std::fs::File", reason = "the evaluator does no I/O" },
+    { path = "std::fs::OpenOptions", reason = "the evaluator does no I/O" },
+    { path = "std::fs::ReadDir", reason = "the evaluator does no I/O" },
+    { path = "std::thread::Builder", reason = "the evaluator starts no thread" },
+    { path = "std::thread::JoinHandle", reason = "the evaluator starts no thread" },
+    { path = "std::collections::HashMap", reason = "per-process random iteration order; use BTreeMap or Vec" },
+    { path = "std::collections::HashSet", reason = "per-process random iteration order; use BTreeSet or Vec" },
+    { path = "std::hash::RandomState", reason = "per-process random iteration order; use BTreeMap or Vec" },
+]
+
+disallowed-macros = [
+    { path = "std::print", reason = "the evaluator does no I/O" },
+    { path = "std::println", reason = "the evaluator does no I/O" },
+    { path = "std::eprint", reason = "the evaluator does no I/O" },
+    { path = "std::eprintln", reason = "the evaluator does no I/O" },
+    { path = "std::dbg", reason = "the evaluator does no I/O" },
+]

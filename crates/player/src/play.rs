@@ -163,6 +163,7 @@ impl PlayerRig<'_> {
 
     /// Acts on changed settings keys' values: the volume goes to the
     /// audio thread, and a shown end screen is drawn again.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn sync(&mut self) {
         let Some(t) = self.seen.take_new(self.controls.tuning()) else {
             return;
@@ -256,10 +257,12 @@ fn since(from: TimeUs, to: TimeUs) -> Duration {
 impl Rig for PlayerRig<'_> {
     type Reader = SourceReader;
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn now(&self) -> TimeUs {
         self.clock.now()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn wait(&mut self) {
         thread::park_timeout(PARK);
         #[cfg(feature = "dev-tools")]
@@ -274,6 +277,7 @@ impl Rig for PlayerRig<'_> {
         self.sync();
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn take(&mut self) -> Option<Command> {
         let c = self.controls.take();
         if c == Some(Command::Retry) {
@@ -282,6 +286,7 @@ impl Rig for PlayerRig<'_> {
         c
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn quitting(&self) -> bool {
         #[cfg(feature = "dev-tools")]
         if let (Some(after), Some(shown)) = (self.quit_after_end, self.end_shown)
@@ -350,6 +355,7 @@ impl Rig for PlayerRig<'_> {
         });
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn measured(&mut self, advance: &Advance, events: &[JudgeEvent], delivered: TimeUs) {
         let generation = self.generation;
         let finalization = advance.finalization_delay.map(|d| Step::Finalization(d.0));
@@ -367,30 +373,37 @@ impl Rig for PlayerRig<'_> {
         self.figures = self.render.finish(self.clock.now());
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn focus_lost(&self) -> bool {
         self.input.tripped()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn connected(&self) -> bool {
         self.input.connected()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn audio_failure(&self) -> Option<OutputError> {
         self.audio.control.failure()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn screen_failed(&self) -> bool {
         self.render.failed()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn cancel_audio(&mut self) {
         self.audio.control.cancel();
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn seal_audio(&mut self) {
         self.audio.control.seal();
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn audio_done(&self) -> bool {
         self.audio.control.done()
     }

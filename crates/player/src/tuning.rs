@@ -4,6 +4,8 @@
 //! volume to the audio thread, takes the input offset into the next play
 //! and writes the files when a play ends. Lock-free and allocation-free.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 

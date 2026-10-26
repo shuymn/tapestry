@@ -6,6 +6,13 @@
 //! disturb the count. This file holds a single test for the same reason.
 //! It also prints the evaluator time per input, an indicator only.
 
+#![expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::disallowed_macros,
+    reason = "the test prints an indicator timing; purity applies to the library"
+)]
+
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};

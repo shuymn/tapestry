@@ -71,6 +71,7 @@ pub struct PerJudgment<T> {
 
 impl<T> PerJudgment<T> {
     /// The value for `j`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn get(&self, j: Judgment) -> &T {
         match j {
             Judgment::Perfect => &self.perfect,
@@ -155,6 +156,7 @@ pub struct JudgeWindows {
 impl JudgeWindows {
     /// The windows best first, each with its judgment.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn table(&self) -> [(Judgment, Window); 4] {
         [
             (Judgment::Perfect, self.perfect),
@@ -265,6 +267,7 @@ impl RankScale {
     #[must_use]
     pub fn scale_milli(&self, rank: Option<JudgeRank>) -> Option<i64> {
         match rank {
+            #[expect(clippy::cast_sign_loss, reason = "the pattern bounds `r` to 0-3")]
             Some(JudgeRank::Rank(r @ 0..=3)) => Some(self.rank_milli[r as usize]),
             Some(JudgeRank::DefExRankMilli(v)) => (v > 0).then_some(v),
             None | Some(JudgeRank::Rank(_)) => Some(self.absent_milli),
@@ -327,6 +330,7 @@ pub struct LowDamage {
 impl LowDamage {
     /// Whether the reduction applies to a change from `before`.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn applies_at(&self, before: GaugeValue) -> bool {
         before < self.below
     }
@@ -334,6 +338,7 @@ impl LowDamage {
     /// The reduced form of `damage` (a negative change); other changes are
     /// returned as they are.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn reduce(&self, damage: GaugeValue) -> GaugeValue {
         if damage.0 >= 0 {
             return damage;
@@ -451,6 +456,7 @@ impl MineRule {
     /// The gauge change of a mine whose chart damage value is
     /// `chart_damage`, computed in `i128` and saturated to `i64`.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn change(&self, chart_damage: i32) -> GaugeValue {
         let Self::WhileHeld { per_unit } = *self;
         let v = -(i128::from(chart_damage) * i128::from(per_unit.0));

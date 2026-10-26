@@ -1,6 +1,8 @@
 //! Gauges in fixed point: every gauge of the preset is computed side by
 //! side, each change computed in `i128`, reduced, clamped, then narrowed.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bms_model::TimeUs;
 use rules::{GaugeDelta, GaugeKind, GaugeRule, GaugeValue, Judgment, MineRule};
 

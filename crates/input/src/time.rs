@@ -1,5 +1,7 @@
 //! QPC ticks to µs, and the input thread's wake interval distribution.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bms_model::TimeUs;
 
 /// A QPC frequency in ticks per second; always positive.

@@ -15,6 +15,8 @@
 //! command sent before the seal and every voice and BGM event has ended:
 //! the end of the audio tail (D13).
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};

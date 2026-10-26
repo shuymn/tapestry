@@ -13,6 +13,8 @@
 //! (stage1.md D6); each collection's controls carry its collection number
 //! ([`in_collection`]), so they stay distinct within the source.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use eval::ControlId;
 
 use crate::capture::Capture;
@@ -164,7 +166,10 @@ pub fn collection_of(path: &[u16]) -> u8 {
         .find(|w| w.iter().zip(marker).all(|(&c, &m)| lower(c) == m))
         .and_then(|w| {
             let hex = |c: u16| char::from(lower(c)).to_digit(16);
-            Some(hex(w[4])? * 16 + hex(w[5])?)
+            match w {
+                [.., high, low] => Some(hex(*high)? * 16 + hex(*low)?),
+                _ => None,
+            }
         })
         .and_then(|n| u8::try_from(n).ok())
         .unwrap_or(0)
@@ -269,12 +274,20 @@ impl HidDevice {
     pub fn new(device: DeviceId, layout: &HidLayout<'_>) -> Self {
         let mut caps = [NO_AXIS; MAX_AXES];
         let n_axes = layout.axes.len().min(MAX_AXES);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "construction: `n_axes` is at most both lengths"
+        )]
         caps[..n_axes].copy_from_slice(&layout.axes[..n_axes]);
         let mut groups = [ButtonGroup {
             report_id: 0,
             buttons: 0,
         }; MAX_REPORT_IDS];
         let n_groups = layout.buttons.len().min(MAX_REPORT_IDS);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "construction: `n_groups` is at most both lengths"
+        )]
         groups[..n_groups].copy_from_slice(&layout.buttons[..n_groups]);
         Self {
             device,
@@ -298,6 +311,10 @@ impl HidDevice {
 
     /// Its axes.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`new` keeps `n_axes` at most MAX_AXES"
+    )]
     pub fn axes(&self) -> &[AxisCap] {
         &self.caps[..self.n_axes]
     }
@@ -307,8 +324,9 @@ impl HidDevice {
         if self.n_groups == 0 {
             return !0;
         }
-        self.groups[..self.n_groups]
+        self.groups
             .iter()
+            .take(self.n_groups)
             .filter(|g| g.report_id == id)
             .fold(0, |bits, g| bits | g.buttons)
     }
@@ -369,15 +387,27 @@ impl HidDevice {
             let Some(value) = *value else {
                 continue;
             };
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`i` is below `n_axes`, at most MAX_AXES, the length of the per-axis arrays"
+            )]
             let cap = self.caps[i];
             if !cap.relative && !(cap.min..=cap.max).contains(&value) {
                 // A wrong descriptor: recorded as reported, and counted.
                 sources.axis_value_out_of_range(device);
             }
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`i` is below `n_axes`, at most MAX_AXES, the length of the per-axis arrays"
+            )]
             let prev = self.values[i];
             if !cap.relative && capture.watched() == Some(cap.control) {
                 capture.observe(&cap, prev, value);
             }
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`i` is below `n_axes`, at most MAX_AXES, the length of the per-axis arrays"
+            )]
             let moved = if cap.relative {
                 i64::from(value)
             } else {
@@ -392,6 +422,10 @@ impl HidDevice {
             }
             let p = packet(cap.control, value);
             sources.packet(&p);
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`i` is below `n_axes`, at most MAX_AXES, the length of the per-axis arrays"
+            )]
             let travel = &mut self.travel[i];
             *travel = travel.saturating_add(moved);
             if travel.abs() >= capture_travel(&cap) {

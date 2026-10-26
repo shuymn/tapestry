@@ -11,6 +11,8 @@
 //! because an abrupt cut is a broadband click. Only when every release slot
 //! is busy is the most-faded release cut, counted in [`Mixer::hard_cuts`].
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::fmt;
 
 use bms_model::SoundId;
@@ -263,16 +265,14 @@ impl Mixer {
 
     /// Puts a pending start into a voice slot, at its start frame.
     fn apply(&mut self, voice: Voice) {
-        if let Some(i) = self.voices.iter().position(|v| !v.active) {
-            self.voices[i] = voice;
+        if let Some(free) = self.voices.iter_mut().find(|v| !v.active) {
+            *free = voice;
             return;
         }
-        let Some(i) =
-            (0..self.voices.len()).min_by_key(|&i| (self.voices[i].start, self.voices[i].seq))
-        else {
+        let Some(oldest) = self.voices.iter_mut().min_by_key(|v| (v.start, v.seq)) else {
             return;
         };
-        let victim = std::mem::replace(&mut self.voices[i], voice);
+        let victim = std::mem::replace(oldest, voice);
         self.steals += 1;
         self.release(victim, voice.start);
     }
@@ -284,13 +284,15 @@ impl Mixer {
             None => {
                 self.hard_cuts += 1;
                 // The release furthest into its fade is the quietest.
-                match (0..self.releases.len()).min_by_key(|&k| self.releases[k].cut) {
-                    Some(k) => k,
+                match self.releases.iter().enumerate().min_by_key(|(_, r)| r.cut) {
+                    Some((k, _)) => k,
                     None => return,
                 }
             }
         };
-        self.releases[slot] = Voice { cut, ..victim };
+        if let Some(r) = self.releases.get_mut(slot) {
+            *r = Voice { cut, ..victim };
+        }
     }
 
     /// Adds every voice and release into `out` (whose first frame is
@@ -315,6 +317,10 @@ impl Mixer {
             let src_end = (v.start + sound.frames()).min(v.cut.saturating_add(fade.len() as u64));
             let last = src_end.min(to);
             for s in first..last {
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "`s` is below `cut` plus the fade length, so the fade index is in bounds"
+                )]
                 let g = if s < v.cut {
                     1.0
                 } else {
@@ -322,8 +328,14 @@ impl Mixer {
                 };
                 let (l, r) = sound.frame((s - v.start) as usize);
                 let o = (s - block_start) as usize * CHANNELS;
-                out[o] += l * g;
-                out[o + 1] += r * g;
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "`s` is below `to`, at most the block's end, so the frame is inside `out`"
+                )]
+                {
+                    out[o] += l * g;
+                    out[o + 1] += r * g;
+                }
             }
             if src_end <= to {
                 v.active = false;

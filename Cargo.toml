@@ -68,8 +68,16 @@ unicode-normalization = "0.1.26"
 [profile.xtask]
 inherits = "dev"
 
+# Lint configuration and the fixtures that prove each lint fires:
+# `cargo xtask check-lints` (xtask/src/lints.rs).
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# `tapestry_lint_fixtures` is set only by `cargo xtask check-lints`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tapestry_lint_fixtures)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

@@ -2,6 +2,8 @@
 //! of any device is offered to the key config screen. Nothing captured is
 //! recorded.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 

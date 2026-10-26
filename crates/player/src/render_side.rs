@@ -8,6 +8,8 @@
 //! the game thread, which ends the play; the next play's preparation builds
 //! the screen again, and if that fails the run ends with the error.
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -396,6 +398,10 @@ impl Run {
                     let t = self.view.tuning.get();
                     let overlay = self.measure.overlay();
                     let shown = overlay.iter().take_while(|l| !l.is_empty()).count();
+                    #[expect(
+                        clippy::indexing_slicing,
+                        reason = "`shown` counts a prefix of `overlay`"
+                    )]
                     let f = FrameInput {
                         now,
                         display_offset: TimeUs(t.display_offset_us),

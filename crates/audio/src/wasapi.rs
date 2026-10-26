@@ -20,6 +20,8 @@
 //! `IAudioClock::GetPosition` is read at each wake only as a diagnostic
 //! ([`WasapiStats::position`]).
 
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::fmt;
 
 use bms_model::{TimeSource, TimeUs};
@@ -743,6 +745,10 @@ impl<D: Device, C: TimeSource> AudioOutput for Stream<D, C> {
             f(&mut []);
             return Ok(());
         }
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`room` is at most `queue`, which stays within the `max_queue_periods` periods `scratch` holds"
+        )]
         let block = &mut self.scratch[..frames as usize * CHANNELS];
         let channels = self.channels;
         self.dev

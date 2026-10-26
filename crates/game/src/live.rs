@@ -231,6 +231,7 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
 
 /// [`play`], with the command that arrived as recording closed after an
 /// abort: the run's next step (a completed play's tail takes it).
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn play_and_next<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
