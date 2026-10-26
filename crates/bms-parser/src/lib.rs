@@ -225,7 +225,9 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
 fn decode<'a>(bytes: &'a [u8], warnings: &mut Vec<Warning>) -> Cow<'a, str> {
     let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
     detector.feed(bytes, true);
-    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
+    // chardetng depends on encoding_rs without default features; the direct
+    // dependency turns on the `alloc` feature that `decode` needs.
+    let encoding: &encoding_rs::Encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
     let (text, _, had_errors) = encoding.decode(bytes);
     if had_errors {
         warnings.push(Warning {

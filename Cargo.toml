@@ -57,9 +57,11 @@ pollster = "1.0.1"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
 wgpu-hal = { version = "30.0.1", features = ["dx12"] }
 
+# bms-parser and xtask
+encoding_rs = "0.8.42"
+
 # xtask (dev tooling, never shipped)
 cargo_metadata = "0.23.1"
-encoding_rs = "0.8.42"
 unicode-normalization = "0.1.26"
 # The lint site check parses Rust source.
 proc-macro2 = { version = "1.0.107", default-features = false }
