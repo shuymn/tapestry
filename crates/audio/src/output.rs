@@ -16,6 +16,10 @@ pub struct Wake {
     pub at: TimeUs,
     /// Frames written but not yet read by the engine.
     pub padding: u32,
+    /// The wake only asks for the queue to be filled before the stream
+    /// starts: `queued_from` and `at` describe no engine pass, so the engine
+    /// takes no timing from it and fills the queue with silence.
+    pub priming: bool,
 }
 
 /// A device failure.
@@ -23,6 +27,8 @@ pub struct Wake {
 pub enum OutputError {
     /// The device went away.
     DeviceLost,
+    /// No buffer event came within the output's timeout.
+    Stalled,
     /// Any other device error, with the platform's code.
     Failed(i32),
 }
@@ -31,6 +37,7 @@ impl fmt::Display for OutputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DeviceLost => write!(f, "the audio device went away"),
+            Self::Stalled => write!(f, "the audio device stopped signaling buffer events"),
             Self::Failed(code) => write!(f, "the audio device failed ({code:#010x})"),
         }
     }
@@ -45,7 +52,8 @@ pub trait AudioOutput {
     /// Frames per engine pass.
     fn period(&self) -> u32;
     /// Waits for the next buffer event. The first wake comes before
-    /// anything is written, so the engine can fill the queue.
+    /// anything is written, so the engine can fill the queue; an output
+    /// that cannot time it marks it [`Wake::priming`].
     fn wait(&mut self) -> Wake;
     /// Calls `f` with the interleaved stereo frames to fill next, as many
     /// as the queue has room for (possibly none).

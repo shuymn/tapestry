@@ -24,6 +24,7 @@ dependencies = [
  "sha2",
  "symphonia",
  "tempfile",
+ "windows",
 ]
 
 [[package]]
