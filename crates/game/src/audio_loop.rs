@@ -39,21 +39,14 @@ const RETIRED_CAPACITY: usize = 1;
 pub const SWITCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Why the audio thread did not take a play switch or a queue change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AudioWaitError {
     /// The worker is gone.
+    #[error("the audio thread is gone")]
     Gone,
     /// It did not answer within [`SWITCH_TIMEOUT`].
+    #[error("the audio thread did not answer")]
     Timeout,
-}
-
-impl std::fmt::Display for AudioWaitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Gone => "the audio thread is gone",
-            Self::Timeout => "the audio thread did not answer",
-        })
-    }
 }
 
 /// What the game thread tells the audio thread.

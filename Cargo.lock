@@ -34,6 +34,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -55,6 +61,7 @@ dependencies = [
  "sha2",
  "symphonia",
  "tempfile",
+ "thiserror 2.0.21",
  "windows",
 ]
 
@@ -158,6 +165,7 @@ dependencies = [
  "num-traits",
  "sha2",
  "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -553,6 +561,7 @@ dependencies = [
 name = "game"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "audio",
  "bms-model",
  "bms-parser",
@@ -564,6 +573,7 @@ dependencies = [
  "serde",
  "sha2",
  "tempfile",
+ "thiserror 2.0.21",
  "toml",
  "triple_buffer",
 ]
@@ -657,6 +667,7 @@ dependencies = [
  "bms-model",
  "eval",
  "rtrb",
+ "thiserror 2.0.21",
  "windows",
 ]
 
@@ -1260,6 +1271,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "player"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "audio",
  "bms-model",
  "bms-parser",
@@ -1271,6 +1283,7 @@ dependencies = [
  "rtrb",
  "rules",
  "tempfile",
+ "thiserror 2.0.21",
  "toml",
  "windows",
  "winit",
@@ -1476,6 +1489,7 @@ dependencies = [
  "game",
  "pollster",
  "rules",
+ "thiserror 2.0.21",
  "wgpu",
  "wgpu-hal",
  "windows",
@@ -1496,6 +1510,7 @@ dependencies = [
  "proptest",
  "rules",
  "sha2",
+ "thiserror 2.0.21",
  "zstd",
 ]
 

@@ -18,6 +18,7 @@ use input::hid::{AxisCap, HidProduct, is_axis, wrap_range};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::error::IoFailure;
 use crate::queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS};
 use crate::save::write_atomic;
 use crate::tuning::{Adjust, DEFAULT_VISIBLE_TIME_MS, OFFSET_LIMIT_US, VISIBLE_TIME_MS};
@@ -65,43 +66,78 @@ impl DataRoot {
 }
 
 /// Why a settings file could not be read or written.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SettingsError {
     /// The file system refused.
-    Io {
-        /// The kind of failure.
-        kind: io::ErrorKind,
-        /// The error, as the system reported it.
-        message: String,
-    },
+    #[error("the settings file cannot be used")]
+    Io(#[source] IoFailure),
     /// The file is not TOML of the settings' shape.
-    Parse(String),
-    /// The file reads, but a value cannot be used: a key config binding
-    /// one control to two roles or a reserved key, a lane the game does
-    /// not have, or a setting outside its range.
-    Invalid(String),
+    #[error("the settings file cannot be read")]
+    Parse(#[source] toml::de::Error),
+    /// `device.toml` reads, but a value cannot be used.
+    #[error("the settings cannot be used: device.toml")]
+    InvalidDevice(#[source] DeviceSettingsError),
+    /// `player.toml` reads, but a value cannot be used.
+    #[error("the settings cannot be used: player.toml")]
+    InvalidPlayer(#[source] PlayerSettingsError),
 }
 
 impl From<io::Error> for SettingsError {
     fn from(e: io::Error) -> Self {
-        Self::Io {
-            kind: e.kind(),
-            message: e.to_string(),
-        }
+        Self::Io(e.into())
     }
 }
 
-impl fmt::Display for SettingsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { message, .. } => write!(f, "the settings file cannot be used: {message}"),
-            Self::Parse(e) => write!(f, "the settings file cannot be read: {e}"),
-            Self::Invalid(e) => write!(f, "the settings cannot be used: {e}"),
-        }
-    }
+/// Why [`DeviceSettings::validate`] refused a value.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DeviceSettingsError {
+    /// The keyboard key config cannot be used.
+    #[error("keyboard key config")]
+    KeyboardKeys(#[source] KeyError),
+    /// The controller key config cannot be used.
+    #[error("controller key config")]
+    ControllerKeys(#[source] KeyError),
+    /// The controller key config binds lanes but names no controller.
+    #[error(
+        "controller key config: it does not say which controller it belongs to; \
+         run `tapestry keys` again"
+    )]
+    ControllerUnnamed,
+    /// An offset outside ±[`OFFSET_LIMIT_US`].
+    #[error("{name} {value} is outside -{OFFSET_LIMIT_US} to {OFFSET_LIMIT_US}")]
+    Offset {
+        /// The setting.
+        name: &'static str,
+        /// Its value, µs.
+        value: i64,
+    },
+    /// A master volume outside 0.0 to 1.0, as the bits of the `f32`
+    /// ([`f32::to_bits`]), so the error stays `Eq`.
+    #[error("master_volume {} is outside 0.0 to 1.0", f32::from_bits(*.bits))]
+    MasterVolume {
+        /// The volume's bits.
+        bits: u32,
+    },
+    /// Queued periods outside [`QUEUED_PERIODS`].
+    #[error(
+        "queued_periods {0} is outside {start} to {end}",
+        start = QUEUED_PERIODS.start(),
+        end = QUEUED_PERIODS.end()
+    )]
+    QueuedPeriods(u32),
 }
 
-impl std::error::Error for SettingsError {}
+/// Why [`PlayerSettings::validate`] refused a value.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PlayerSettingsError {
+    /// A visible time outside [`VISIBLE_TIME_MS`].
+    #[error(
+        "visible_time_ms {0} is outside {start} to {end}",
+        start = VISIBLE_TIME_MS.start(),
+        end = VISIBLE_TIME_MS.end()
+    )]
+    VisibleTime(u32),
+}
 
 /// A control bound to a lane, in a settings file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,9 +186,10 @@ impl fmt::Display for Role {
 }
 
 /// Why a key config cannot be used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
     /// One control bound to two roles.
+    #[error("control {control:#x} is bound to both {first} and {second}")]
     Overlap {
         /// The control.
         control: u32,
@@ -162,6 +199,7 @@ pub enum KeyError {
         second: Role,
     },
     /// A keyboard key the game reserves for something else.
+    #[error("key {control:#x} is reserved for {reserved_for}")]
     Reserved {
         /// The key's scan code.
         control: u32,
@@ -169,34 +207,13 @@ pub enum KeyError {
         reserved_for: &'static str,
     },
     /// A lane the game does not have.
+    #[error("lane {0} does not exist (lanes are 0 to 7)")]
     NoSuchLane(u8),
     /// Retry or quit bound to something other than a keyboard key: stage 1
     /// reads them from the window's keyboard messages only.
+    #[error("{0} takes keyboard keys only")]
     NotAKeyboardKey(Role),
 }
-
-impl fmt::Display for KeyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Overlap {
-                control,
-                first,
-                second,
-            } => write!(
-                f,
-                "control {control:#x} is bound to both {first} and {second}"
-            ),
-            Self::Reserved {
-                control,
-                reserved_for,
-            } => write!(f, "key {control:#x} is reserved for {reserved_for}"),
-            Self::NoSuchLane(l) => write!(f, "lane {l} does not exist (lanes are 0 to 7)"),
-            Self::NotAKeyboardKey(r) => write!(f, "{r} takes keyboard keys only"),
-        }
-    }
-}
-
-impl std::error::Error for KeyError {}
 
 /// F9: shows and hides the measurement overlay during play (D11).
 pub const OVERLAY_KEY: u32 = 0x43;
@@ -528,43 +545,31 @@ impl DeviceSettings {
     /// # Errors
     ///
     /// The first value that cannot be used, for the player.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), DeviceSettingsError> {
         self.keyboard
             .check(DeviceKind::Keyboard)
-            .map_err(|e| format!("keyboard key config: {e}"))?;
+            .map_err(DeviceSettingsError::KeyboardKeys)?;
         self.controller
             .check(DeviceKind::Controller)
-            .map_err(|e| format!("controller key config: {e}"))?;
+            .map_err(DeviceSettingsError::ControllerKeys)?;
         if !self.controller.lanes.is_empty() && self.controller_device.is_none() {
-            return Err(
-                "controller key config: it does not say which controller it belongs to; \
-                 run `tapestry keys` again"
-                    .to_owned(),
-            );
+            return Err(DeviceSettingsError::ControllerUnnamed);
         }
-        for (name, us) in [
+        for (name, value) in [
             ("input_offset_us", self.input_offset_us),
             ("display_offset_us", self.display_offset_us),
         ] {
-            if !(-OFFSET_LIMIT_US..=OFFSET_LIMIT_US).contains(&us) {
-                return Err(format!(
-                    "{name} {us} is outside -{OFFSET_LIMIT_US} to {OFFSET_LIMIT_US}"
-                ));
+            if !(-OFFSET_LIMIT_US..=OFFSET_LIMIT_US).contains(&value) {
+                return Err(DeviceSettingsError::Offset { name, value });
             }
         }
         if !(0.0..=1.0).contains(&self.master_volume) {
-            return Err(format!(
-                "master_volume {} is outside 0.0 to 1.0",
-                self.master_volume
-            ));
+            return Err(DeviceSettingsError::MasterVolume {
+                bits: self.master_volume.to_bits(),
+            });
         }
         if !QUEUED_PERIODS.contains(&self.queued_periods) {
-            return Err(format!(
-                "queued_periods {} is outside {} to {}",
-                self.queued_periods,
-                QUEUED_PERIODS.start(),
-                QUEUED_PERIODS.end()
-            ));
+            return Err(DeviceSettingsError::QueuedPeriods(self.queued_periods));
         }
         Ok(())
     }
@@ -628,14 +633,9 @@ impl PlayerSettings {
     /// # Errors
     ///
     /// The value outside its range, for the player.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), PlayerSettingsError> {
         if !VISIBLE_TIME_MS.contains(&self.visible_time_ms) {
-            return Err(format!(
-                "visible_time_ms {} is outside {} to {}",
-                self.visible_time_ms,
-                VISIBLE_TIME_MS.start(),
-                VISIBLE_TIME_MS.end()
-            ));
+            return Err(PlayerSettingsError::VisibleTime(self.visible_time_ms));
         }
         Ok(())
     }
@@ -650,7 +650,7 @@ impl PlayerSettings {
 /// unknown key.
 pub fn load_settings<T: DeserializeOwned + Default>(path: &Path) -> Result<T, SettingsError> {
     match fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(|e| SettingsError::Parse(e.to_string())),
+        Ok(text) => toml::from_str(&text).map_err(SettingsError::Parse),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e.into()),
     }

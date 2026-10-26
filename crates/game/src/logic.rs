@@ -54,17 +54,23 @@ pub struct LogicConfig {
 }
 
 /// Why [`Logic::new`] refused to start.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LogicError {
     /// The evaluator refused the chart, preset or device profile.
-    Eval(EvalError),
+    #[error("evaluation cannot start")]
+    Eval(#[source] EvalError),
     /// More readers than [`SourceId`]s.
+    #[error("{0} sources exceed the source id range")]
     TooManySources(usize),
     /// A runner start of `i64::MIN` leaves no time before it for the
     /// bootstrap, so the opening could not separate it from the play.
+    #[error("the play cannot start at the earliest time")]
     StartAtMinimum,
     /// The play's recording window needs more inputs than the recording
     /// policy reserves (stage1.md D14).
+    #[error(
+        "the play is too long to record with these controls: it needs room for {needed} inputs, and {allowed} fit"
+    )]
     RecordingTooLarge {
         /// The inputs the window needs.
         needed: usize,
@@ -72,22 +78,6 @@ pub enum LogicError {
         allowed: usize,
     },
 }
-
-impl fmt::Display for LogicError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Eval(e) => write!(f, "evaluation cannot start: {e}"),
-            Self::TooManySources(n) => write!(f, "{n} sources exceed the source id range"),
-            Self::StartAtMinimum => f.write_str("the play cannot start at the earliest time"),
-            Self::RecordingTooLarge { needed, allowed } => write!(
-                f,
-                "the play is too long to record with these controls: it needs room for {needed} inputs, and {allowed} fit"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for LogicError {}
 
 /// Why a play was aborted. It ends at the watermark already finalized
 /// (D13).

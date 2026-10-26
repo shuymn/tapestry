@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use render::measure::{SpanCount, count_span};
 
 use crate::measure::Figures;
@@ -36,24 +37,22 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 /// # Errors
 ///
 /// A setting that names no file, or no PresentMon anywhere.
-pub fn locate(setting: Option<OsString>, path: Option<OsString>) -> Result<PathBuf, String> {
+pub fn locate(setting: Option<OsString>, path: Option<OsString>) -> anyhow::Result<PathBuf> {
     if let Some(s) = setting.filter(|s| !s.is_empty()) {
         let exe = PathBuf::from(s);
-        return if exe.is_file() {
-            Ok(exe)
-        } else {
-            Err(format!(
-                "{ENV} names {}, which is not a file",
-                exe.display()
-            ))
-        };
+        anyhow::ensure!(
+            exe.is_file(),
+            "{ENV} names {}, which is not a file",
+            exe.display()
+        );
+        return Ok(exe);
     }
     path.iter()
         .flat_map(std::env::split_paths)
         .map(|dir| dir.join("PresentMon.exe"))
         .find(|exe| exe.is_file())
         .ok_or_else(|| {
-            format!(
+            anyhow::anyhow!(
                 "PresentMon was not found: set {ENV} to its executable or put PresentMon.exe on \
                  PATH (it is installed by hand, never downloaded)"
             )
@@ -96,15 +95,15 @@ impl Capture {
     /// # Errors
     ///
     /// Why it did not start, or that it exited while starting.
-    pub fn start(exe: &Path, process: &str, csv: &Path, log: &Path) -> Result<Self, String> {
-        let out = std::fs::File::create(log).map_err(|e| format!("{}: {e}", log.display()))?;
-        let err = out.try_clone().map_err(|e| e.to_string())?;
+    pub fn start(exe: &Path, process: &str, csv: &Path, log: &Path) -> anyhow::Result<Self> {
+        let out = std::fs::File::create(log).with_context(|| log.display().to_string())?;
+        let err = out.try_clone()?;
         let child = Command::new(exe)
             .args(args(process, csv))
             .stdout(out)
             .stderr(err)
             .spawn()
-            .map_err(|e| format!("PresentMon ({}) cannot start: {e}", exe.display()))?;
+            .with_context(|| format!("PresentMon ({}) cannot start", exe.display()))?;
         let mut capture = Self {
             exe: exe.to_owned(),
             child: Some(child),
@@ -115,10 +114,10 @@ impl Capture {
                 && let Ok(Some(status)) = c.try_wait()
             {
                 capture.child = None;
-                return Err(format!(
+                anyhow::bail!(
                     "PresentMon exited while starting ({status}); see {}",
                     log.display()
-                ));
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -130,18 +129,18 @@ impl Capture {
     /// # Errors
     ///
     /// When it had to be killed, or had exited during the run.
-    pub fn stop(mut self) -> Result<(), String> {
+    pub fn stop(mut self) -> anyhow::Result<()> {
         self.shut_down()
     }
 
-    fn shut_down(&mut self) -> Result<(), String> {
+    fn shut_down(&mut self) -> anyhow::Result<()> {
         let Some(mut child) = self.child.take() else {
             return Ok(());
         };
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!(
+            anyhow::bail!(
                 "PresentMon exited before the run ended ({status}): the capture is incomplete"
-            ));
+            );
         }
         let _ = Command::new(&self.exe)
             .args(["--terminate_existing_session", "--session_name", SESSION])
@@ -157,7 +156,7 @@ impl Capture {
         }
         let _ = child.kill();
         let _ = child.wait();
-        Err("PresentMon did not stop and was killed".to_owned())
+        Err(anyhow::anyhow!("PresentMon did not stop and was killed"))
     }
 }
 
@@ -180,13 +179,16 @@ pub struct PmFrame {
     pub tearing: Option<bool>,
 }
 
-/// Why a capture could not be read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why a capture could not be read. Its message is the variant as written
+/// here, such as `BadRow(3)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PmError {
     /// A required column is missing from the header.
+    #[error("MissingColumn")]
     MissingColumn,
     /// A row has the wrong field count or an unreadable value (a file cut
     /// off mid-row), at this 1-based line.
+    #[error("BadRow({0})")]
     BadRow(usize),
 }
 
@@ -497,6 +499,16 @@ mod tests {
         );
     }
 
+    /// A capture error reads as its variant, after the file it is about.
+    #[test]
+    fn capture_errors_read_as_their_variant() {
+        assert_eq!(PmError::MissingColumn.to_string(), "MissingColumn");
+        assert_eq!(PmError::BadRow(3).to_string(), "BadRow(3)");
+        assert!(std::error::Error::source(&PmError::BadRow(3)).is_none());
+        let e = anyhow::Error::new(PmError::BadRow(3)).context("1.presentmon.csv".to_owned());
+        assert_eq!(format!("{e:#}"), "1.presentmon.csv: BadRow(3)");
+    }
+
     #[test]
     fn non_finite_or_negative_durations_are_malformed() {
         for bad in ["inf", "NaN", "-1.0"] {
@@ -680,12 +692,14 @@ mod tests {
         let found = locate(Some(named.clone().into_os_string()), None).unwrap();
         assert_eq!(found, named);
         let e = locate(Some(dir.path().join("none.exe").into_os_string()), None).unwrap_err();
+        let e = format!("{e:#}");
         assert!(e.contains("not a file"), "{e}");
         let on_path = dir.path().join("PresentMon.exe");
         std::fs::write(&on_path, b"").unwrap();
         let path = std::env::join_paths([dir.path().join("empty"), dir.path().to_owned()]).unwrap();
         assert_eq!(locate(Some("".into()), Some(path)).unwrap(), on_path);
         let e = locate(None, Some(dir.path().join("empty").into_os_string())).unwrap_err();
+        let e = format!("{e:#}");
         assert!(e.contains("PresentMon was not found"), "{e}");
     }
 }

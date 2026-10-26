@@ -11,6 +11,7 @@ publish.workspace = true
 bms-model.workspace = true
 eval.workspace = true
 rtrb.workspace = true
+thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

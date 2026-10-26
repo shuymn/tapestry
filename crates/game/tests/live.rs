@@ -12,9 +12,9 @@ use bms_model::{Chart, ChartBuilder, TimeSource, TimeUs, VirtualClock};
 use common::{MS, lane};
 use eval::{ControlId, InputKind, JudgeEventKind, SourceId};
 use game::{
-    AbortCause, AudioQueue, ChartIngest, Closing, Command, DataRoot, DeviceSettings, IngestError,
-    Ingested, LiveError, Loaded, Opening, Parts, PlayEnd, PlayReport, RenderSide, Rig,
-    SessionConfig, Settings,
+    AbortCause, AudioControl, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
+    DeviceSettings, IngestError, Ingested, LiveError, Loaded, Opening, Parts, PlayEnd, PlayReport,
+    RenderSide, Rig, SessionConfig, Settings,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -94,6 +94,11 @@ fn key(at: i64, control: ControlId, value: i32) -> ScriptItem {
         }),
     }
 }
+
+/// The screen double's failure to build again.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the surface cannot be made again")]
+struct SurfaceLost;
 
 /// A rig on a virtual clock: each wait moves it 1 ms and feeds the
 /// script's batches at their clock times, as the input thread receives
@@ -195,6 +200,7 @@ impl Fake {
 
 impl Rig for Fake {
     type Reader = SourceReader;
+    type ScreenError = SurfaceLost;
 
     fn now(&self) -> TimeUs {
         self.reads.set(self.reads.get() + self.read_cost);
@@ -230,14 +236,14 @@ impl Rig for Fake {
         self.quitting || self.clock.now().0 >= self.quit_at
     }
 
-    fn prepare_screen(&mut self) -> Result<(), String> {
+    fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
         self.prepares += 1;
         if self.quit_in_prepare {
             // The window closes while the screen gets ready.
             self.quitting = true;
         }
         if self.prepares >= self.prepare_fails_from {
-            return Err("the surface cannot be made again".to_owned());
+            return Err(SurfaceLost);
         }
         // Built again: no longer failed.
         if self.clock.now().0 >= self.screen_fails_at {
@@ -246,10 +252,8 @@ impl Rig for Fake {
         Ok(())
     }
 
-    fn prepare_audio(&mut self) -> Result<(), String> {
-        self.audio
-            .as_mut()
-            .map_or(Ok(()), |a| a.ready().map_err(|e| e.to_string()))
+    fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
+        self.audio.as_mut().map_or(Ok(()), AudioControl::ready)
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Opening<SourceReader> {
@@ -539,7 +543,7 @@ fn a_screen_failure_ends_the_play_and_a_failed_recovery_the_run() {
     rig.prepare_fails_from = 2;
     let ran = game::live::run(&mut loaded, &mut rig);
     assert!(
-        matches!(&ran, Err(LiveError::Screen(e)) if e == "the surface cannot be made again"),
+        matches!(&ran, Err(LiveError::Screen(SurfaceLost))),
         "{ran:?}"
     );
     let [one] = &rig.reports[..] else {
@@ -769,7 +773,7 @@ fn a_gone_audio_thread_fails_the_preparation() {
         rig.audio = Some(gone_audio(took_a_play));
         let ran = game::live::run(&mut loaded, &mut rig);
         assert!(
-            matches!(&ran, Err(LiveError::Audio(e)) if e == "the audio thread is gone"),
+            matches!(&ran, Err(LiveError::Audio(AudioWaitError::Gone))),
             "{took_a_play}: {ran:?}"
         );
         assert!(rig.origins.is_empty(), "{took_a_play}");

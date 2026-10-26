@@ -1,7 +1,6 @@
 //! Preparing a chart for play: the ingestion and chart transformation
 //! extension points (design.md "Extension Boundaries").
 
-use std::fmt;
 use std::path::Path;
 
 use bms_model::Chart;
@@ -18,21 +17,12 @@ pub struct Ingested {
 }
 
 /// Why a chart could not be ingested.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IngestError {
     /// The loader refused the chart.
-    Load(LoadError),
+    #[error("the chart cannot be loaded")]
+    Load(#[source] LoadError),
 }
-
-impl fmt::Display for IngestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Load(e) => write!(f, "the chart cannot be loaded: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for IngestError {}
 
 /// The ingestion extension point: reads one chart format into the common
 /// chart model.

@@ -42,7 +42,7 @@ pub enum EvalError {
 impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPreset(e) => write!(f, "invalid preset: {e}"),
+            Self::InvalidPreset(_) => f.write_str("invalid preset"),
             Self::InvalidRank => f.write_str("the chart's rank gives no usable judgment window"),
             Self::UnsupportedLnMode(mode) => {
                 write!(f, "the chart's long-note mode {mode:?} is not supported")
@@ -53,9 +53,49 @@ impl fmt::Display for EvalError {
                 write!(f, "source {} binds control {} twice", source.0, control.0)
             }
             Self::TooManyBindings => f.write_str("the device profile binds too many controls"),
+            // `PushError` is a plain value, not an `Error`, so it is printed
+            // here and is no source.
             Self::Input(e) => write!(f, "the input log cannot be evaluated: {e:?}"),
         }
     }
 }
 
-impl std::error::Error for EvalError {}
+impl std::error::Error for EvalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPreset(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use rules::RuleError;
+
+    use super::EvalError;
+
+    #[test]
+    fn invalid_preset_has_the_rule_error_as_source() {
+        let rule = RuleError::NoGauges;
+        let e = EvalError::InvalidPreset(rule.clone());
+        assert_eq!(e.to_string(), "invalid preset");
+        let source = e.source().expect("the rule error is the source");
+        assert_eq!(source.downcast_ref::<RuleError>(), Some(&rule));
+        assert!(
+            source.source().is_none(),
+            "the chain ends at the rule error"
+        );
+        assert!(!e.to_string().contains(&source.to_string()));
+    }
+
+    #[test]
+    fn other_errors_have_no_source() {
+        assert!(EvalError::InvalidRank.source().is_none());
+        let e = EvalError::Input(crate::PushError::Full);
+        assert_eq!(e.to_string(), "the input log cannot be evaluated: Full");
+        assert!(e.source().is_none());
+    }
+}

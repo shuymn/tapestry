@@ -21,6 +21,7 @@ default = []
 dev-tools = []
 
 [dependencies]
+anyhow.workspace = true
 audio.workspace = true
 bms-model.workspace = true
 eval.workspace = true
@@ -30,6 +31,7 @@ render.workspace = true
 replay.workspace = true
 rtrb.workspace = true
 rules.workspace = true
+thiserror.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Power",

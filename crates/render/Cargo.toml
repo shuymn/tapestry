@@ -18,6 +18,7 @@ eval.workspace = true
 game.workspace = true
 pollster.workspace = true
 rules.workspace = true
+thiserror.workspace = true
 wgpu.workspace = true
 wgpu-hal.workspace = true
 windows = { workspace = true, features = [

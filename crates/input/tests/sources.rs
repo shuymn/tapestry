@@ -958,10 +958,12 @@ fn too_many_sources_are_refused_at_construction() {
         max_sources: input::SOURCE_LIMIT + 1,
         ..at_limit
     };
-    assert_eq!(
-        SourceSet::new(over).err(),
-        Some(input::ConfigError::TooManySources(65_537))
-    );
+    let refused = SourceSet::new(over).err();
+    assert_eq!(refused, Some(input::ConfigError::TooManySources(65_537)));
+    // A leaf: the message is the whole diagnostic.
+    let e = refused.unwrap();
+    assert_eq!(e.to_string(), "65537 sources exceed the limit of 65536");
+    assert!(std::error::Error::source(&e).is_none());
 }
 
 #[test]

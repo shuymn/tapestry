@@ -21,8 +21,6 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::fmt;
-
 use bms_model::SoundId;
 
 use crate::CHANNELS;
@@ -54,16 +52,9 @@ struct Voice {
 }
 
 /// A volume outside `0.0..=MAX_VOLUME` (NaN included).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+#[error("volume {0} is outside 0 to {MAX_VOLUME}")]
 pub struct InvalidVolume(pub f32);
-
-impl fmt::Display for InvalidVolume {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "volume {} is outside 0 to {MAX_VOLUME}", self.0)
-    }
-}
-
-impl std::error::Error for InvalidVolume {}
 
 /// The static soft clipper: `x` unchanged while `|x|` is at most
 /// [`SOFT_CLIP_KNEE`]; above it, `knee + (1 - knee) tanh((|x| - knee) /

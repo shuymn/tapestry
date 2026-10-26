@@ -1,7 +1,5 @@
 //! The output boundary: a device the engine waits on and writes to.
 
-use std::fmt;
-
 use bms_model::TimeUs;
 
 use crate::CHANNELS;
@@ -23,27 +21,18 @@ pub struct Wake {
 }
 
 /// A device failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OutputError {
     /// The device went away.
+    #[error("the audio device went away")]
     DeviceLost,
     /// No buffer event came within the output's timeout.
+    #[error("the audio device stopped signaling buffer events")]
     Stalled,
     /// Any other device error, with the platform's code.
+    #[error("the audio device failed ({0:#010x})")]
     Failed(i32),
 }
-
-impl fmt::Display for OutputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DeviceLost => write!(f, "the audio device went away"),
-            Self::Stalled => write!(f, "the audio device stopped signaling buffer events"),
-            Self::Failed(code) => write!(f, "the audio device failed ({code:#010x})"),
-        }
-    }
-}
-
-impl std::error::Error for OutputError {}
 
 /// The most periods an output keeps queued ahead of playback. Outputs size
 /// their buffers for it when they are made, so changing the queue between

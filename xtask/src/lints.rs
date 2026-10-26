@@ -237,6 +237,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    // A failed frame's report.
+    Site::Fns("crates/game/src/error.rs", &["Chain::fmt"]),
 ];
 
 /// The workspace `clippy.toml` and `eval`'s, which must agree on
@@ -568,6 +570,11 @@ fn check_site(root: &Path, site: Site) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let (Site::File(file) | Site::Fns(file, _)) = site;
     let (source, tokens) = parse_and_lex(root, file)?;
+    if names_anyhow(tokens.clone()) {
+        out.push(format!(
+            "{file}: in-play code names `anyhow`; it keeps typed errors (design.md \"Errors\")"
+        ));
+    }
     for attr in lowering_attributes(tokens) {
         out.push(format!(
             "{file}: `{attr}` lowers an in-play lint; state the invariant in an `#[expect]`"
@@ -896,6 +903,21 @@ fn lowering_attributes(tokens: TokenStream) -> Vec<String> {
         }
     });
     out
+}
+
+/// Whether source `tokens` name `anyhow` anywhere, test modules included:
+/// no in-play file needs it, so a [`Site::Fns`] file is scanned whole too.
+/// Comments are dropped and each literal is one token, so only code counts.
+fn names_anyhow(tokens: TokenStream) -> bool {
+    let mut found = false;
+    for_each_tree(tokens, &mut |tree, _| {
+        if let TokenTree::Ident(i) = tree
+            && (*i == "anyhow" || *i == "r#anyhow")
+        {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Whether `meta` is `allow(..)` or `warn(..)` naming an in-play lint, or a
@@ -1301,6 +1323,46 @@ mod tests {
         assert!(out[0].contains("lowers an in-play lint"), "{out:?}");
         let out = check_site(dir.path(), Site::Fns("x.rs", &["S::hot"])).unwrap();
         assert_eq!(out.len(), 2, "{out:?}");
+    }
+
+    #[test]
+    fn in_play_files_name_no_anyhow() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = |text: &str, site: Site| {
+            fs::write(dir.path().join("x.rs"), text).unwrap();
+            check_site(dir.path(), site).unwrap()
+        };
+        let file = Site::File("x.rs");
+        let fns = Site::Fns("x.rs", &["hot"]);
+        // A module-level import, used inside a listed function: both a
+        // whole file and a file of listed functions fail, once each.
+        let imported = format!(
+            "{MODULE_ATTR}\nuse anyhow::Error as Report;\n\
+             {FN_ATTR}\nfn hot() -> Result<(), Report> {{ Ok(()) }}\n"
+        );
+        for site in [file, fns] {
+            let out = check(&imported, site);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(out[0].contains("`anyhow`"), "{out:?}");
+        }
+        // The whole file is scanned: outside the listed functions, in a
+        // test module, and as a raw identifier, it fails too.
+        for text in [
+            format!("{FN_ATTR}\nfn hot() {{}}\nfn cold() -> anyhow::Result<()> {{ Ok(()) }}\n"),
+            format!(
+                "{FN_ATTR}\nfn hot() {{}}\n#[cfg(test)]\nmod tests {{\n    use anyhow::Context;\n}}\n"
+            ),
+            format!("{FN_ATTR}\nfn hot() {{ let _ = r#anyhow::anyhow!(\"x\"); }}\n"),
+        ] {
+            assert_eq!(check(&text, fns).len(), 1, "{text}");
+        }
+        // Comments, doc comments and strings name nothing.
+        let fine = format!(
+            "{MODULE_ATTR}\n// anyhow\n/// Not `anyhow`.\n\
+             {FN_ATTR}\nfn hot() -> &'static str {{ /* anyhow */ \"anyhow\" }}\n"
+        );
+        assert!(check(&fine, file).is_empty());
+        assert!(check(&fine, fns).is_empty());
     }
 
     #[test]

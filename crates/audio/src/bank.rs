@@ -28,7 +28,6 @@
 //! folder lacks.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, ErrorKind, Read};
 use std::panic::{self, AssertUnwindSafe};
@@ -95,6 +94,18 @@ pub enum Cap {
     FileSize,
 }
 
+impl Cap {
+    /// What the cap limits, with its unit, as a [`BankError`] names it.
+    #[must_use]
+    pub const fn what(self) -> &'static str {
+        match self {
+            Self::SoundLength => "sound length in frames",
+            Self::BankMemory => "decoded sound memory in bytes",
+            Self::FileSize => "sound file size in bytes",
+        }
+    }
+}
+
 /// How the excess was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Found {
@@ -105,16 +116,34 @@ pub enum Found {
     WhileDecoding,
 }
 
+impl Found {
+    /// When the excess was found, as a [`BankError`] says it.
+    #[must_use]
+    pub const fn how(self) -> &'static str {
+        match self {
+            Self::Declared => "before decoding",
+            Self::WhileDecoding => "while decoding",
+        }
+    }
+}
+
 /// Why a bank was refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BankError {
     /// The device rate is outside [`MIN_RATE`]..=[`MAX_RATE`].
+    #[error("the device rate {rate} Hz is outside {MIN_RATE}-{MAX_RATE} Hz")]
     RateOutOfRange {
         /// The rate.
         rate: u32,
     },
     /// A cap was exceeded at `sound`: `amount` (frames or bytes, by `cap`)
     /// is over `limit`.
+    #[error(
+        "sound {:02} exceeds the {} cap {}: {amount} > {limit}",
+        .sound.0,
+        .cap.what(),
+        .found.how()
+    )]
     OverCap {
         /// The cap.
         cap: Cap,
@@ -129,41 +158,6 @@ pub enum BankError {
         limit: u64,
     },
 }
-
-impl fmt::Display for BankError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RateOutOfRange { rate } => write!(
-                f,
-                "the device rate {rate} Hz is outside {MIN_RATE}-{MAX_RATE} Hz"
-            ),
-            Self::OverCap {
-                cap,
-                found,
-                sound,
-                amount,
-                limit,
-            } => {
-                let what = match cap {
-                    Cap::SoundLength => "sound length in frames",
-                    Cap::BankMemory => "decoded sound memory in bytes",
-                    Cap::FileSize => "sound file size in bytes",
-                };
-                let how = match found {
-                    Found::Declared => "before decoding",
-                    Found::WhileDecoding => "while decoding",
-                };
-                write!(
-                    f,
-                    "sound {:02} exceeds the {what} cap {how}: {amount} > {limit}",
-                    sound.0
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for BankError {}
 
 /// A referenced sound left silent.
 #[derive(Clone, Debug, PartialEq, Eq)]

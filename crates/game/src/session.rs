@@ -103,17 +103,16 @@ impl Settings {
     /// # Errors
     ///
     /// The first file that exists but cannot be read, then
-    /// [`SettingsError::Invalid`] for a value that cannot be used
+    /// [`SettingsError::InvalidDevice`] or
+    /// [`SettingsError::InvalidPlayer`] for a value that cannot be used
     /// ([`DeviceSettings::validate`], [`PlayerSettings::validate`]).
     pub fn load(root: &DataRoot) -> Result<Self, SettingsError> {
         let s = Self {
             device: crate::settings::load_settings(&root.device_settings())?,
             player: crate::settings::load_settings(&root.player_settings())?,
         };
-        let device = |e| SettingsError::Invalid(format!("device.toml: {e}"));
-        s.device.validate().map_err(device)?;
-        let player = |e| SettingsError::Invalid(format!("player.toml: {e}"));
-        s.player.validate().map_err(player)?;
+        s.device.validate().map_err(SettingsError::InvalidDevice)?;
+        s.player.validate().map_err(SettingsError::InvalidPlayer)?;
         Ok(s)
     }
 
@@ -150,13 +149,16 @@ pub struct SessionConfig {
 }
 
 /// Why a session could not be prepared.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SessionError {
     /// No ingestion adapter reads the chart file.
+    #[error("no adapter reads this chart format")]
     UnsupportedChart(PathBuf),
     /// The configured step does not move the clock forward.
+    #[error("a step of {} us does not move the clock", .0.0)]
     InvalidStep(TimeUs),
     /// A file could not be read or written.
+    #[error("a file cannot be used: {kind}")]
     Io {
         /// The file.
         path: PathBuf,
@@ -164,24 +166,12 @@ pub enum SessionError {
         kind: io::ErrorKind,
     },
     /// The chart could not be ingested.
+    #[error(transparent)]
     Ingest(IngestError),
     /// The preset file could not be used.
+    #[error(transparent)]
     Preset(PresetError),
 }
-
-impl fmt::Display for SessionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedChart(_) => f.write_str("no adapter reads this chart format"),
-            Self::InvalidStep(step) => write!(f, "a step of {} us does not move the clock", step.0),
-            Self::Io { kind, .. } => write!(f, "a file cannot be used: {kind}"),
-            Self::Ingest(e) => e.fmt(f),
-            Self::Preset(e) => e.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for SessionError {}
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> SessionError + '_ {
     move |e| SessionError::Io {
@@ -234,11 +224,13 @@ pub enum PlayEnd {
 }
 
 /// Why a reload of the preset at a retry was not used.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReloadError {
     /// The file could not be read.
+    #[error("the preset file cannot be read: {0}")]
     Io(io::ErrorKind),
     /// The file is not a valid preset.
+    #[error(transparent)]
     Preset(PresetError),
 }
 
@@ -780,8 +772,9 @@ impl<O: AudioOutput + Wakes> Session<O> {
             Ok(Some(report)) => Ok(report),
             Ok(None) => unreachable!("a session never quits before recording opens"),
             Err(LiveError::Logic(e)) => Err(e),
-            Err(LiveError::Screen(_) | LiveError::Audio(_)) => {
-                unreachable!("a session has no screen or audio thread to fail")
+            Err(LiveError::Screen(e)) => match e {},
+            Err(LiveError::Audio(_)) => {
+                unreachable!("a session has no audio thread to fail")
             }
         }
     }
@@ -828,6 +821,7 @@ impl<O> SessionRig<'_, O> {
 
 impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     type Reader = input::SourceReader;
+    type ScreenError = std::convert::Infallible;
 
     fn now(&self) -> TimeUs {
         self.clock.now()
@@ -866,7 +860,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         false
     }
 
-    fn prepare_screen(&mut self) -> Result<(), String> {
+    fn prepare_screen(&mut self) -> Result<(), Self::ScreenError> {
         Ok(())
     }
 

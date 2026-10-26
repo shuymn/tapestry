@@ -907,6 +907,7 @@ Where there is no reason to build our own, established libraries are used. We bu
 | WASM | `wasm-bindgen` | Calls the evaluator from Workers |
 | Measurement and testing | `tracy-client`, `criterion` | Span measurement, benchmarks |
 | Property tests | `proptest` | A dev-dependency of `eval` and `replay`: the evaluator's properties over generated charts, presets, input logs and delivery schedules, and the input log's round trip. Generators map independent raw values to valid ones, so shrinking keeps cases valid. Not used: `quickcheck`, whose type-driven generation and value shrinking fit valid-by-construction generators poorly and which keeps no failures; `bolero`, whose engines overlap `cargo-fuzz`; `arbitrary`-driven generation, which suits the fuzz targets that take bytes |
+| Errors | `thiserror` (libraries), `anyhow` (`player`, `xtask`) | `thiserror` derives the library error types and `anyhow` carries the player's and `xtask`'s reports; `eval`, `rules` and `bms-model` keep hand-written impls, since they take no external dependencies. How errors are built and printed is in "Errors" below. Not used: `snafu`, `error-stack` and `color-eyre`, which overlap these at more weight (panic hooks are out of scope); `miette`, to be reconsidered for `eval-cli` diagnostics |
 
 Code from GPL projects (beatoraja, bmz-player, etc.) and tables ported from them are not used. Behavior is determined from public information and hand-written tests, and the sources of the information behind tables and tests are recorded.
 
@@ -915,6 +916,10 @@ Code from GPL projects (beatoraja, bmz-player, etc.) and tables ported from them
 The input thread, the logic thread, the audio callback, and the per-frame work of the render thread (app-side code) do not allocate memory during play. The regions for evaluator output, the input log, and effect events are allocated in advance, and what happens on reaching the limit is decided (for the input log, it is recorded as "incomplete"). Background work such as decoding and read-ahead, and allocations inside the GPU driver, are out of scope. The check is done with a test global allocator, which can also be enabled in release builds.
 
 The modules and functions that code runs also deny `unwrap`, `expect` and indexing outside tests (clippy's `unwrap_used`, `expect_used` and `indexing_slicing`); where an invariant makes one safe, an `#[expect]` states it as its reason. The list of those sites is the `IN_PLAY` table in `xtask/src/lints.rs`, which `cargo xtask check-lints` checks.
+
+### Errors
+
+Each error states its own step and leaves the cause to `source()`; a wrapper that adds nothing forwards the inner message (`#[error(transparent)]`). Errors that cross a thread or are compared in tests keep I/O failures as `game::IoFailure`, the kind and the OS message. A report prints the whole chain once, joined with `: `: the player's top level prints `{:#}` of an `anyhow::Error`, which only the setup, loading, persistence and shutdown paths build, and the in-play and between-play prints (a lost frame, an unsaved record) use `game::Chain`, which formats the same line without allocating. Usage errors exit 2 and runtime errors exit 1. The `IN_PLAY` files never name `anyhow`, so in-play code keeps typed errors; `cargo xtask check-lints` checks it.
 
 ### Algorithms
 

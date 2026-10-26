@@ -3,7 +3,6 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::fmt;
 use std::sync::Arc;
 
 use bms_model::{BgmEvent, SoundId, TimeUs};
@@ -74,11 +73,13 @@ pub struct StepReport {
 }
 
 /// Why an engine could not be built.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EngineError {
     /// The output's rate or period is zero.
+    #[error("the output's rate or period is zero")]
     ZeroRateOrPeriod,
     /// The bank was decoded at a rate other than the output's.
+    #[error("the sound bank is at {bank} Hz but the output runs at {output} Hz")]
     RateMismatch {
         /// The bank's rate.
         bank: u32,
@@ -86,20 +87,6 @@ pub enum EngineError {
         output: u32,
     },
 }
-
-impl fmt::Display for EngineError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroRateOrPeriod => write!(f, "the output's rate or period is zero"),
-            Self::RateMismatch { bank, output } => write!(
-                f,
-                "the sound bank is at {bank} Hz but the output runs at {output} Hz"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EngineError {}
 
 /// The audio engine: mixer, mix clock and BGM schedule. Everything is
 /// allocated in [`AudioEngine::new`]; [`AudioEngine::step`] allocates

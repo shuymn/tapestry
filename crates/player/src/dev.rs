@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use audio::{AudioOutput, OutputError, RecordingOutput, SimConfig, SimDevice, Wake};
 use bms_model::{TimeSource, TimeUs};
 use game::Wakes;
@@ -179,10 +180,10 @@ impl Options {
 /// # Errors
 ///
 /// Why the log cannot be read.
-pub fn script(log: &Path) -> Result<ScriptedInput, String> {
+pub fn script(log: &Path) -> anyhow::Result<ScriptedInput> {
     let limits = DecodeLimits::default();
     let bytes = read_bounded(log, limits.max_compressed)?;
-    let rec = replay::decode(&bytes, &limits).map_err(|e| format!("{}: {e}", log.display()))?;
+    let rec = replay::decode(&bytes, &limits).with_context(|| log.display().to_string())?;
     let kinds: Vec<DeviceKind> = rec
         .devices
         .sources
@@ -207,26 +208,21 @@ pub fn script(log: &Path) -> Result<ScriptedInput, String> {
 
 /// Reads `path` if it holds at most `limit` bytes, reading no more than one
 /// byte past the limit: an input log is untrusted (D14).
-fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
-    let fail = |e: String| format!("{}: {e}", path.display());
-    let file = fs::File::open(path).map_err(|e| fail(e.to_string()))?;
-    read_limited(file, limit).map_err(fail)
+fn read_bounded(path: &Path, limit: usize) -> anyhow::Result<Vec<u8>> {
+    let read = || read_limited(fs::File::open(path)?, limit);
+    read().with_context(|| path.display().to_string())
 }
 
 /// Everything `reader` holds if it is at most `limit` bytes, reading at most
 /// one byte past the limit.
-fn read_limited(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>, String> {
+fn read_limited(reader: impl std::io::Read, limit: usize) -> anyhow::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
-    reader
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > limit {
-        return Err(format!(
-            "larger than {limit} bytes, the largest input log accepted"
-        ));
-    }
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= limit,
+        "larger than {limit} bytes, the largest input log accepted"
+    );
     Ok(bytes)
 }
 
@@ -369,7 +365,7 @@ impl ScriptThread {
     /// # Errors
     ///
     /// If the thread cannot start.
-    pub fn spawn(clock: QpcClock, mut sources: SourceSet, mut hook: Hook) -> Result<Self, String> {
+    pub fn spawn(clock: QpcClock, mut sources: SourceSet, mut hook: Hook) -> anyhow::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
@@ -381,7 +377,7 @@ impl ScriptThread {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             })
-            .map_err(|e| format!("the scripted input thread cannot start: {e}"))?;
+            .context("the scripted input thread cannot start")?;
         Ok(Self {
             _stop: Stop {
                 stop,
@@ -594,14 +590,14 @@ mod tests {
     #[test]
     fn a_log_over_the_limit_is_refused_after_reading_one_byte_more() {
         let taken = std::cell::Cell::new(0);
-        let e = read_limited(Counted(&taken), 10).unwrap_err();
+        let e = format!("{:#}", read_limited(Counted(&taken), 10).unwrap_err());
         assert!(e.contains("larger than 10 bytes"), "{e}");
         assert_eq!(taken.get(), 11);
         assert_eq!(read_limited(&[7_u8; 11][..], 11).unwrap().len(), 11);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.tprl");
         std::fs::write(&path, [7_u8; 11]).unwrap();
-        let e = read_bounded(&path, 10).unwrap_err();
+        let e = format!("{:#}", read_bounded(&path, 10).unwrap_err());
         assert!(e.contains("big.tprl: larger than 10 bytes"), "{e}");
     }
 
