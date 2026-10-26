@@ -318,12 +318,13 @@ fn play_origin_moves_every_recorded_time_onto_the_play() {
     );
     assert_eq!(readers[1].published(), Published::closed(TimeUs(-700_000)));
     assert_eq!(readers[0].published(), Published::open(TimeUs(-699_101)));
-    // The next opening without an origin is on the batch clock again.
+    // The next opening without an origin is on the batch clock again; the
+    // controller that arrived is source 0, keyboard 0 source 1.
     let start = set.open_recording(TimeUs(4_400_000));
     let mut readers = set.take_readers();
     batch(&mut set, 4_500_000, &[key(0, A, 1)], 4_500_200);
     assert_eq!(start.opened_at, TimeUs(4_400_000));
-    assert_eq!(drain(&mut readers[0]), [ev(4_500_000, 0, A, 1)]);
+    assert_eq!(drain(&mut readers[1]), [ev(4_500_000, 1, A, 1)]);
 }
 
 #[test]
@@ -608,6 +609,90 @@ fn source_and_device_limits_mark_the_log_incomplete() {
     set.disconnect(DeviceId(6));
     set.open_recording(TimeUs(2));
     assert!(!set.source_limited());
+}
+
+#[test]
+fn a_device_that_takes_no_part_is_not_a_source() {
+    // A controller and three keyboards, three sources: the controller (8)
+    // takes no part, so the keyboards fit and the play is not limited.
+    let mut set = SourceSet::new(SourceConfig {
+        max_sources: 3,
+        ..config()
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    plug(&mut set, DeviceId(8), DeviceKind::Controller);
+    for d in [4, 5, 6] {
+        plug(&mut set, DeviceId(d), DeviceKind::Keyboard);
+    }
+    assert!(set.set_takes_part(DeviceId(8), false));
+    assert!(!set.set_takes_part(DeviceId(9), false));
+    set.end_batch(TimeUs(0));
+    batch(&mut set, 10, &[key(8, A, 1), key(5, B, 1)], 11);
+    let start = set.open_recording(TimeUs(20));
+    let mut readers = set.take_readers();
+    assert!(!set.source_limited());
+    let devices: Vec<_> = set.participants().map(|(d, _)| d.0).collect();
+    assert_eq!(devices, [4, 5, 6]);
+    // Its held control is not in the snapshot, and its presses are not
+    // recorded.
+    assert_eq!(start.held, [(SourceId(1), B, 1)]);
+    batch(&mut set, 30, &[key(8, C, 1), key(6, C, 1)], 31);
+    let recorded: Vec<_> = readers.iter_mut().map(drain).collect();
+    assert_eq!(recorded, [vec![], vec![], vec![ev(30, 2, C, 1)]]);
+    // Reconnected, it takes part again, first as a controller, and the
+    // third keyboard is left out.
+    set.disconnect(DeviceId(8));
+    plug(&mut set, DeviceId(8), DeviceKind::Controller);
+    set.open_recording(TimeUs(40));
+    assert!(set.source_limited());
+    let devices: Vec<_> = set.participants().map(|(d, _)| d.0).collect();
+    assert_eq!(devices, [8, 4, 5]);
+}
+
+#[test]
+fn controllers_take_part_before_keyboards_at_the_limit() {
+    // Three keyboard handles found before the controller, two sources: the
+    // controller is source 0, then the first keyboard found.
+    let mut set = SourceSet::new(SourceConfig {
+        max_sources: 2,
+        ..config()
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    for d in [4, 5, 6] {
+        plug(&mut set, DeviceId(d), DeviceKind::Keyboard);
+    }
+    plug(&mut set, DeviceId(7), DeviceKind::Controller);
+    set.open_recording(TimeUs(1));
+    assert!(set.source_limited());
+    let sources: Vec<_> = set.participants().collect();
+    assert_eq!(
+        sources,
+        [
+            (DeviceId(7), DeviceKind::Controller),
+            (DeviceId(4), DeviceKind::Keyboard)
+        ]
+    );
+}
+
+#[test]
+fn a_controller_keeps_its_product_until_it_is_removed() {
+    let product = input::hid::HidProduct {
+        vendor_id: 0x1234,
+        product_id: 0x5678,
+    };
+    let mut set = SourceSet::new(config()).unwrap();
+    set.begin_batch(TimeUs(0));
+    assert!(!set.set_product(DeviceId(7), product));
+    set.connect(DeviceId(7), DeviceKind::Controller);
+    assert_eq!(set.product(DeviceId(7)), None);
+    assert!(set.set_product(DeviceId(7), product));
+    assert_eq!(set.product(DeviceId(7)), Some(product));
+    set.disconnect(DeviceId(7));
+    assert_eq!(set.product(DeviceId(7)), None);
+    set.connect(DeviceId(7), DeviceKind::Controller);
+    assert_eq!(set.product(DeviceId(7)), None);
 }
 
 #[test]

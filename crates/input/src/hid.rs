@@ -17,7 +17,7 @@ use eval::ControlId;
 
 use crate::capture::Capture;
 use crate::gate::{DeviceId, Packet};
-use crate::sources::{DeviceKind, SourceSet};
+use crate::sources::SourceSet;
 
 /// The HID usage page of buttons.
 pub const BUTTON_PAGE: u16 = 0x09;
@@ -168,6 +168,19 @@ pub fn collection_of(path: &[u16]) -> u8 {
         })
         .and_then(|n| u8::try_from(n).ok())
         .unwrap_or(0)
+}
+
+/// Which model a controller is: the vendor and product ids its HID
+/// collections declare. It is the same in every USB port and after
+/// replugging, and it names no single unit, so two controllers of one
+/// model share it. Key config binds a controller's controls to it; it
+/// never enters the input log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HidProduct {
+    /// The vendor id.
+    pub vendor_id: u16,
+    /// The product id.
+    pub product_id: u16,
 }
 
 /// What a collection's axis is.
@@ -335,6 +348,7 @@ impl HidDevice {
             sources.background();
         }
         let recording = sources.is_recording();
+        let product = sources.product(self.device);
         let (device, collection) = (self.device, self.collection);
         let packet = |control, value| Packet {
             device,
@@ -356,7 +370,7 @@ impl HidDevice {
                 changed &= changed - 1;
                 let usage = u16::try_from(bit + 1).unwrap_or(MAX_BUTTON);
                 let p = packet(button_control(usage), i32::from(now >> bit & 1 == 1));
-                capture.offer(&p, DeviceKind::Controller, recording);
+                capture.offer_controller(&p, product, recording);
                 sources.packet(&p);
             }
         }
@@ -397,7 +411,7 @@ impl HidDevice {
             if travel.abs() >= capture_travel(&cap) {
                 *travel = 0;
                 let offer = Packet { value: 1, ..p };
-                capture.offer(&offer, DeviceKind::Controller, recording);
+                capture.offer_controller(&offer, product, recording);
             }
         }
     }

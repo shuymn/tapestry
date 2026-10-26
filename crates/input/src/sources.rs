@@ -6,7 +6,7 @@ use bms_model::TimeUs;
 use eval::{ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId};
 
 use crate::gate::{Admit, DeviceId, FocusGate, Packet};
-use crate::hid::{AxisCap, MAX_AXES};
+use crate::hid::{AxisCap, HidProduct, MAX_AXES};
 use crate::queue::{SourceReader, SourceWriter, source_queue};
 
 /// What kind of device a source is.
@@ -71,6 +71,11 @@ struct Device {
     /// The controls recorded from it: its lane and system bindings, set by
     /// [`SourceSet::set_recorded`].
     recorded: Vec<ControlId>,
+    /// A controller's product, from [`SourceSet::set_product`].
+    product: Option<HidProduct>,
+    /// Whether it is a source of the next opening
+    /// ([`SourceSet::set_takes_part`]).
+    takes_part: bool,
     /// A held control did not fit, so `held` may miss one. Kept until the
     /// device is removed; every play it takes part in is incomplete.
     state_lost: bool,
@@ -286,6 +291,8 @@ impl SourceSet {
                 positions: [None; MAX_AXES],
                 source: None,
                 recorded: Vec::new(),
+                product: None,
+                takes_part: true,
                 state_lost: false,
                 connection: self.next_connection,
             });
@@ -427,6 +434,46 @@ impl SourceSet {
         }
     }
 
+    /// Sets the product of the connected controller `device`, as the
+    /// adapter reads it. Returns `false` for a device that is not
+    /// connected.
+    pub fn set_product(&mut self, device: DeviceId, product: HidProduct) -> bool {
+        match self.devices.iter_mut().find(|d| d.id == device) {
+            Some(d) => {
+                d.product = Some(product);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The product of a connected controller, if the adapter set it.
+    #[must_use]
+    pub fn product(&self, device: DeviceId) -> Option<HidProduct> {
+        self.devices
+            .iter()
+            .find(|d| d.id == device)
+            .and_then(|d| d.product)
+    }
+
+    /// Sets whether `device` is a source of the next opening. A device
+    /// that takes no part is left out of the play as if it were not
+    /// connected: nothing of it is recorded, it is not counted against
+    /// `max_sources`, and it does not make the play source limited. Every
+    /// device takes part until this is set; like
+    /// [`set_recorded`](Self::set_recorded) it is set before recording
+    /// opens, and a reconnected device starts taking part again. Returns
+    /// `false` for a device that is not connected.
+    pub fn set_takes_part(&mut self, device: DeviceId, takes_part: bool) -> bool {
+        match self.devices.iter_mut().find(|d| d.id == device) {
+            Some(d) => {
+                d.takes_part = takes_part;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A device was removed. A participating source records `Disconnected`
     /// at the batch time, publishes that time as its final watermark, and
     /// closes; once the gate has tripped, nothing is recorded or published.
@@ -480,9 +527,10 @@ impl SourceSet {
     }
 
     /// Opens recording at a boundary between two batches: the connected
-    /// devices become the sources, in the order they were found, up to
-    /// `max_sources`, and the recorded controls they hold are copied into
-    /// the returned snapshot. Everything after this call, in stream order,
+    /// devices that take part ([`set_takes_part`](Self::set_takes_part))
+    /// become the sources, controllers first and each kind in the order
+    /// they were found, up to `max_sources`, and the recorded controls
+    /// they hold are copied into the returned snapshot. Everything after this call, in stream order,
     /// belongs to the play. `now` is the clock read at the boundary.
     /// Readers for the logic thread are then taken with
     /// [`take_readers`](Self::take_readers). The batch clock is the play's
@@ -501,13 +549,20 @@ impl SourceSet {
     /// `now − origin`.
     pub fn open_play(&mut self, now: TimeUs, origin: TimeUs) -> InputStart {
         self.close_recording();
-        let n = self.devices.len().min(self.config.max_sources);
-        let source_limited = self.devices.len() > n || self.untracked > 0;
+        // Controllers first, so keyboards' many handles never push a
+        // controller out at the limit; each kind in the order found.
+        let mut order: Vec<usize> = (0..self.devices.len())
+            .filter(|&i| self.devices[i].takes_part)
+            .collect();
+        order.sort_by_key(|&i| self.devices[i].kind != DeviceKind::Controller);
+        let n = order.len().min(self.config.max_sources);
+        let source_limited = order.len() > n || self.untracked > 0;
         let mut overflowed = false;
         let mut participants = Vec::with_capacity(n);
         let mut readers = Vec::with_capacity(n);
         let mut held = Vec::new();
-        for (i, device) in self.devices.iter_mut().take(n).enumerate() {
+        for (i, &d) in order.iter().take(n).enumerate() {
+            let device = &mut self.devices[d];
             // `SourceSet::new` bounds `max_sources` by `SOURCE_LIMIT`.
             let source = SourceId(u16::try_from(i).expect("source ids fit in u16"));
             device.source = Some(source);
@@ -577,7 +632,7 @@ impl SourceSet {
     }
 
     /// The connected devices whose state is kept, in the order they were
-    /// found, which is the order of source ids at the next opening.
+    /// found ([`open_play`](Self::open_play) numbers sources from it).
     pub fn devices(&self) -> impl Iterator<Item = (DeviceId, DeviceKind)> + '_ {
         self.devices.iter().map(|d| (d.id, d.kind))
     }

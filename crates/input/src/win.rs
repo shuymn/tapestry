@@ -35,9 +35,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::{
     GetRawInputBuffer, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList,
     GetRegisteredRawInputDevices, HRAWINPUT, RAWHID, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST,
-    RAWINPUTHEADER, RAWKEYBOARD, RID_DEVICE_INFO, RID_INPUT, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK,
-    RIDEV_REMOVE, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA, RIM_TYPEHID,
-    RIM_TYPEKEYBOARD, RegisterRawInputDevices,
+    RAWINPUTHEADER, RAWKEYBOARD, RID_DEVICE_INFO, RID_DEVICE_INFO_HID, RID_INPUT, RIDEV_DEVNOTIFY,
+    RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA,
+    RIM_TYPEHID, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL,
@@ -50,8 +50,8 @@ use crate::capture::Capture;
 use crate::gate::DeviceId;
 use crate::hid::{
     AXIS_USAGES, AxisCap, ButtonGroup, CollectionSlot, DESKTOP_PAGE, HidDevice, HidLayout,
-    HidReport, MAX_AXES, MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_cap, axis_control, axis_value,
-    collection_of, in_collection, read_report, remove_collection,
+    HidProduct, HidReport, MAX_AXES, MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_cap, axis_control,
+    axis_value, collection_of, in_collection, read_report, remove_collection,
 };
 use crate::raw;
 use crate::sources::{DeviceKind, SourceSet};
@@ -454,6 +454,9 @@ impl Controllers {
         // A collection unread before is read now, under its source's id.
         sources.forget_unread(device_id(handle));
         sources.connect(device, DeviceKind::Controller);
+        if let Some(product) = hid_product(handle) {
+            sources.set_product(device, product);
+        }
         // Only axes the source keeps are read: one beyond the device's
         // table is never captured or recorded.
         let kept = sources.add_axes(device, &caps[..n_axes]);
@@ -904,6 +907,20 @@ impl RawInput {
 
 /// The usage page and usage of a HID device's top-level collection.
 fn hid_usage(handle: HANDLE) -> Option<(u16, u16)> {
+    hid_info(handle).map(|hid| (hid.usUsagePage, hid.usUsage))
+}
+
+/// The vendor and product ids a HID device declares.
+fn hid_product(handle: HANDLE) -> Option<HidProduct> {
+    let hid = hid_info(handle)?;
+    Some(HidProduct {
+        vendor_id: u16::try_from(hid.dwVendorId).ok()?,
+        product_id: u16::try_from(hid.dwProductId).ok()?,
+    })
+}
+
+/// What Raw Input says of a HID device; `None` for another device.
+fn hid_info(handle: HANDLE) -> Option<RID_DEVICE_INFO_HID> {
     let mut info = RID_DEVICE_INFO {
         cbSize: size_of::<RID_DEVICE_INFO>() as u32,
         ..Default::default()
@@ -922,8 +939,7 @@ fn hid_usage(handle: HANDLE) -> Option<(u16, u16)> {
         return None;
     }
     // SAFETY: the system filled the HID variant.
-    let hid = unsafe { info.Anonymous.hid };
-    Some((hid.usUsagePage, hid.usUsage))
+    Some(unsafe { info.Anonymous.hid })
 }
 
 /// What a device is: a keyboard, a game controller (a HID joystick or
