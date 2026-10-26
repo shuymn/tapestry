@@ -4,7 +4,7 @@
 //! the capture over its play span, by the counting rules of design.md
 //! "Frame Pacing in Refreshes", added to its `.measure.toml`.
 //!
-//! PresentMon is an external tool the owner installs; it is never
+//! PresentMon is an external tool the user installs; it is never
 //! downloaded. It is found through the `TAPESTRY_PRESENTMON` setting (the
 //! path of its executable) or as `PresentMon.exe` on `PATH`, and runs
 //! unelevated with the stage 0 flags (spike `measure.rs`): the user must

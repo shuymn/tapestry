@@ -1207,7 +1207,7 @@ pub struct WakeReport {
 
 /// The input thread: wakes at 1 kHz on a high-resolution timer under MMCSS
 /// "Games", reads QPC, receives everything Raw Input queued as one batch
-/// stamped with that read, publishes, and calls the owner's hook at the
+/// stamped with that read, publishes, and calls the caller's hook at the
 /// boundary after the batch. This handle may move between threads;
 /// dropping it stops and joins the thread, as [`stop`](Self::stop) does.
 #[derive(Debug)]
@@ -1224,7 +1224,7 @@ impl InputThread {
     /// controllers present.
     /// `on_wake` runs after each batch's publication with a clock read
     /// taken after it, which is the QPC read of that boundary (the batch
-    /// itself keeps its wake time); it is the boundary where the owner opens and closes recording, sets
+    /// itself keeps its wake time); it is the boundary where the caller opens and closes recording, sets
     /// recorded controls and wakes the logic thread, and it must not
     /// allocate during play.
     ///
