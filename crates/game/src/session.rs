@@ -341,8 +341,8 @@ pub struct PlayOutcome {
     pub kinds: Vec<DeviceKind>,
     /// Devices that arrived while recording was open.
     pub arrivals: Vec<InputArrival>,
-    /// How many axis values each source reported outside their declared
-    /// range, by source id; recorded with the source.
+    /// How many axis values each source reported outside the range their
+    /// conversion uses, by source id; recorded with the source.
     pub axis_out_of_range: Vec<u64>,
     /// Why the record may be incomplete. Suspend is set by
     /// [`Loaded::finish_play`] from `end`.

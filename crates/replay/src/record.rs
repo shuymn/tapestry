@@ -102,8 +102,10 @@ pub struct SourceRecord {
     pub receive: ReceiveMethod,
     /// Its input offset and bindings.
     pub profile: SourceProfile,
-    /// How many values its absolute axes reported outside their declared
-    /// range: a wrong descriptor, so their conversion may be off. The
+    /// How many values its absolute axes reported outside the range their
+    /// conversion uses (the revolution `device.toml` sets, else the
+    /// declared range): that range is wrong, so their conversion may be
+    /// off. The
     /// values are recorded as reported, and re-evaluation converts them
     /// as live play did.
     pub axis_out_of_range: u64,

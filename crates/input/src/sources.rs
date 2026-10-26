@@ -73,6 +73,9 @@ struct Device {
     /// The controls recorded from it: its lane and system bindings, set by
     /// [`SourceSet::set_recorded`].
     recorded: Vec<ControlId>,
+    /// Axes converted with a range other than the declared one
+    /// ([`SourceSet::set_axis_ranges`]).
+    axis_ranges: Vec<(ControlId, Option<(i32, i32)>)>,
     /// A controller's product ([`SourceSet::set_product`]).
     product: Option<HidProduct>,
     /// Whether it is a source of the next opening
@@ -95,7 +98,9 @@ struct Participant {
     closed: bool,
     /// The controls recorded from this source, frozen at the opening.
     recorded: Vec<ControlId>,
-    /// Axis values it reported outside their declared range.
+    /// Its axis ranges other than the declared ones, frozen at the opening.
+    axis_ranges: Vec<(ControlId, Option<(i32, i32)>)>,
+    /// Axis values it reported outside the range their conversion uses.
     out_of_range: u64,
 }
 
@@ -305,6 +310,7 @@ impl SourceSet {
                 positions: [None; MAX_AXES],
                 source: None,
                 recorded: Vec::new(),
+                axis_ranges: Vec::new(),
                 product: None,
                 takes_part: true,
                 state_lost: false,
@@ -386,21 +392,49 @@ impl SourceSet {
         self.gate.background();
     }
 
-    /// An absolute axis of `device` reported a value outside its declared
-    /// range: its descriptor is wrong, so its conversion may be off. The
-    /// value is recorded as reported; a participating source counts it,
-    /// and its record says so ([`axis_out_of_range`](Self::axis_out_of_range)).
-    pub fn axis_value_out_of_range(&mut self, device: DeviceId) {
+    /// Axis `cap` of `device` reported `value`. A value outside the range
+    /// its conversion uses (from [`set_axis_ranges`](Self::set_axis_ranges),
+    /// else the declared one; none for a relative axis) means that range is
+    /// wrong, so the conversion may be off. The value is recorded as
+    /// reported; a participating source counts it, and its record says so
+    /// ([`axis_out_of_range`](Self::axis_out_of_range)).
+    pub fn axis_value(&mut self, device: DeviceId, cap: &AxisCap, value: i32) {
         if let Some(rec) = &mut self.recording
             && let Some(p) = rec.participants.iter_mut().find(|p| p.device == device)
         {
-            p.out_of_range = p.out_of_range.saturating_add(1);
+            let range = match p.axis_ranges.iter().find(|(c, _)| *c == cap.control) {
+                Some(&(_, range)) => range,
+                None => (!cap.relative).then_some((cap.min, cap.max)),
+            };
+            if range.is_some_and(|(min, max)| !(min..=max).contains(&value)) {
+                p.out_of_range = p.out_of_range.saturating_add(1);
+            }
+        }
+    }
+
+    /// Sets the axes of the connected `device` that the conversion takes
+    /// with a range other than the declared one: each control with its
+    /// range, `None` for one with no range (relative, or not wrapping).
+    /// The next opening freezes them; [`axis_value`](Self::axis_value)
+    /// counts against them. Returns `false` for a device that is not
+    /// connected.
+    pub fn set_axis_ranges(
+        &mut self,
+        device: DeviceId,
+        ranges: Vec<(ControlId, Option<(i32, i32)>)>,
+    ) -> bool {
+        match self.devices.iter_mut().find(|d| d.id == device) {
+            Some(d) => {
+                d.axis_ranges = ranges;
+                true
+            }
+            None => false,
         }
     }
 
     /// How many axis values each participating source of the open
-    /// recording reported outside their declared range, indexed by
-    /// [`SourceId`].
+    /// recording reported outside the range their conversion uses,
+    /// indexed by [`SourceId`].
     pub fn axis_out_of_range(&self) -> impl Iterator<Item = u64> + '_ {
         self.recording
             .iter()
@@ -643,6 +677,7 @@ impl SourceSet {
                     writer,
                     closed: false,
                     recorded,
+                    axis_ranges: device.axis_ranges.clone(),
                     out_of_range: 0,
                 });
                 readers.push(reader);

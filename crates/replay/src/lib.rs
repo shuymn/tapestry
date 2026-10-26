@@ -31,7 +31,7 @@
 //! axis bindings (a count, then each axis's control, lane, mode (0
 //! absolute, followed by its wrap; 1 relative), press threshold, hold
 //! threshold and release time in µs, all unsigned), and the number of
-//! axis values it reported outside their declared range.
+//! axis values it reported outside the range their conversion uses.
 //!
 //! Bindings and axes are bounded per source and in all by the evaluator's
 //! limits ([`eval::MAX_BINDINGS_PER_SOURCE`], [`eval::MAX_AXES_PER_SOURCE`],

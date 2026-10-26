@@ -14,7 +14,7 @@ use eval::{
     AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, ScratchSettings, SourceProfile,
 };
 use input::DeviceKind;
-use input::hid::{AxisCap, HidProduct, is_axis};
+use input::hid::{AxisCap, HidProduct, is_axis, wrap_range};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -385,6 +385,28 @@ impl ScratchConfig {
             hold_threshold: self.hold_threshold,
             release_after_us: self.release_after_us,
         }
+    }
+
+    /// The values the conversion of an axis declared as `cap` takes as one
+    /// revolution, as [`settings`](Self::settings) resolves it: the range
+    /// of a revolution set here ([`wrap_range`]), else the declared range.
+    /// `None` when it has none: relative, or not wrapping.
+    #[must_use]
+    pub fn range(&self, cap: &AxisCap) -> Option<(i32, i32)> {
+        if self.relative.unwrap_or(cap.relative) {
+            return None;
+        }
+        match self.wrap {
+            Some(wrap) => wrap_range(cap, wrap),
+            None => (!cap.relative).then_some((cap.min, cap.max)),
+        }
+    }
+
+    /// Whether the axis's mode or revolution is set here rather than taken
+    /// from the device.
+    #[must_use]
+    pub fn overrides_range(&self) -> bool {
+        self.relative.is_some() || self.wrap.is_some()
     }
 }
 

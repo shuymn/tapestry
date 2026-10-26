@@ -18,7 +18,7 @@ use std::thread::Thread;
 
 use bms_model::TimeUs;
 use eval::ControlId;
-use game::{Closing, Opening};
+use game::{Closing, Opening, ScratchConfig};
 use input::hid::HidProduct;
 use input::{DeviceId, DeviceKind, SourceReader, SourceSet};
 
@@ -50,6 +50,9 @@ pub struct Recorded {
     /// The controller they belong to; `None` when no controller binds a
     /// lane.
     pub controller_device: Option<HidProduct>,
+    /// How the controller's bound axes are converted, for the range their
+    /// values are counted against.
+    pub scratch: ScratchConfig,
 }
 
 /// The input thread's answers.
@@ -157,6 +160,10 @@ pub struct Hook {
     origin: Option<TimeUs>,
     /// The last recording's participants and their connections.
     participants: Vec<(DeviceId, Option<u64>)>,
+    /// Whether `device.toml` sets the range the controller's axis values
+    /// are counted against in the open recording. Only the controller has
+    /// axes, so only its values are counted.
+    range_set: bool,
 }
 
 /// A linked hook and link.
@@ -174,6 +181,7 @@ pub fn link(controls: Arc<Controls>, mode: Mode) -> (Hook, InputLink) {
             logic: None,
             origin: None,
             participants: Vec::new(),
+            range_set: false,
         },
         InputLink {
             requests: req_tx,
@@ -276,6 +284,7 @@ impl Hook {
         };
         self.origin = Some(origin);
         self.logic = Some(logic);
+        self.range_set = matches!(self.mode, Mode::Clock) && recorded.scratch.overrides_range();
         self.participants = sources
             .participants()
             .map(|(d, _)| (d, sources.connection(d)))
@@ -301,10 +310,8 @@ impl Hook {
         };
         // Shown once per play: the record keeps the counts.
         for (i, &n) in closed.axis_out_of_range.iter().enumerate() {
-            if n > 0 {
-                eprintln!(
-                    "input: source {i} reported {n} axis values outside the range its controller declares; set its scratch range in device.toml"
-                );
+            if let Some(line) = out_of_range_warning(i, n, self.range_set) {
+                eprintln!("{line}");
             }
         }
         sources.close_recording();
@@ -313,12 +320,32 @@ impl Hook {
     }
 }
 
+/// The console line for source `source` having reported `n` axis values
+/// outside the range their conversion uses, naming where that range comes
+/// from: `device.toml` when `set`, else the controller's declaration.
+/// `None` when nothing was outside.
+fn out_of_range_warning(source: usize, n: u64, set: bool) -> Option<String> {
+    if n == 0 {
+        return None;
+    }
+    Some(if set {
+        format!(
+            "input: source {source} reported {n} axis values outside the scratch range device.toml sets; correct it there or capture the scratch again in `tapestry keys`"
+        )
+    } else {
+        format!(
+            "input: source {source} reported {n} axis values outside the range its controller declares; set its scratch range in device.toml"
+        )
+    })
+}
+
 /// Sets what each connected device records and whether it takes part:
 /// every keyboard records the keyboard controls, and the first controller
 /// of the configured model ([`Recorded::controller_device`]) the
 /// controller's; any other controller, a second of that model included,
-/// takes no part. Returns `false` when a controller is configured and none
-/// of its model is connected.
+/// takes no part. The controller's bound axes are counted against the
+/// range their conversion uses ([`ScratchConfig::range`]). Returns `false`
+/// when a controller is configured and none of its model is connected.
 fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
     let devices: Vec<_> = sources.devices().collect();
     let mut matched = false;
@@ -331,6 +358,17 @@ fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
                         .controller_device
                         .is_some_and(|p| sources.has_product(d, p));
                 matched |= mine;
+                let ranges = if mine {
+                    sources
+                        .axes(d)
+                        .iter()
+                        .filter(|c| recorded.controller.contains(&c.control))
+                        .map(|c| (c.control, recorded.scratch.range(c)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                sources.set_axis_ranges(d, ranges);
                 (&recorded.controller, mine)
             }
         };
@@ -353,10 +391,11 @@ fn reset_gate(sources: &mut SourceSet, controls: &Controls) {
 mod tests {
     use bms_model::TimeUs;
     use eval::ControlId;
-    use input::hid::HidProduct;
+    use game::ScratchConfig;
+    use input::hid::{HidProduct, axis_cap, axis_control};
     use input::{DeviceId, DeviceKind, Packet, SourceConfig, SourceSet};
 
-    use super::{Recorded, take_part};
+    use super::{Recorded, out_of_range_warning, take_part};
 
     /// The configured controller: function 1 of a composite device.
     const CONFIGURED: HidProduct = HidProduct {
@@ -384,6 +423,7 @@ mod tests {
             keyboard: vec![ControlId(0x0e), ControlId(0x01)],
             controller: vec![BUTTON],
             controller_device: device,
+            scratch: ScratchConfig::default(),
         }
     }
 
@@ -508,5 +548,64 @@ mod tests {
         assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
         set.open_recording(TimeUs(1));
         assert_eq!(set.left_out(), 0);
+    }
+
+    /// The configured controller's bound axis is counted against the range
+    /// its conversion uses: the declared 0..=127 without an override, the
+    /// 256-value revolution `device.toml` sets (0..=255) with one, and no
+    /// range when it sets the axis relative. An unbound axis keeps its
+    /// declared range (0..=99).
+    #[test]
+    fn axis_values_are_counted_against_the_range_conversion_uses() {
+        let x = axis_control(0x01, 0x30);
+        let y = axis_control(0x01, 0x31);
+        let caps = [
+            axis_cap(x, true, 0, 127, 8).unwrap(),
+            axis_cap(y, true, 0, 99, 8).unwrap(),
+        ];
+        let count = |scratch: ScratchConfig, values: &[(usize, i32)]| {
+            let mut set = devices(&[(10, CONFIGURED)]);
+            assert_eq!(set.add_axes(DeviceId(10), &caps)[..2], [true, true]);
+            let mut recorded = recorded(Some(CONFIGURED));
+            recorded.controller.push(x);
+            recorded.scratch = scratch;
+            assert!(take_part(&mut set, &recorded));
+            set.open_recording(TimeUs(1));
+            for &(axis, value) in values {
+                set.axis_value(DeviceId(10), &caps[axis], value);
+            }
+            set.axis_out_of_range().collect::<Vec<_>>()
+        };
+        let x_values = [(0, 127), (0, 128), (0, 200), (0, 255), (0, 3)];
+        let declared = ScratchConfig::default();
+        let wrap = ScratchConfig {
+            wrap: Some(256),
+            ..ScratchConfig::default()
+        };
+        let relative = ScratchConfig {
+            relative: Some(true),
+            ..ScratchConfig::default()
+        };
+        // Sources: the controller, then keyboards 1 and 2.
+        assert_eq!(count(declared, &x_values), [3, 0, 0]);
+        assert_eq!(count(wrap, &x_values), [0, 0, 0]);
+        assert_eq!(count(wrap, &[(0, 256), (0, -1)]), [2, 0, 0]);
+        assert_eq!(count(relative, &x_values), [0, 0, 0]);
+        assert_eq!(count(wrap, &[(1, 99), (1, 100), (1, 101)]), [2, 0, 0]);
+    }
+
+    /// The warning names where the range came from, and there is none
+    /// for a source with nothing outside it.
+    #[test]
+    fn the_out_of_range_warning_names_the_range_used() {
+        assert_eq!(out_of_range_warning(0, 0, true), None);
+        assert_eq!(out_of_range_warning(0, 0, false), None);
+        let declared = out_of_range_warning(2, 11, false).unwrap();
+        assert!(declared.contains("source 2 reported 11 axis values"));
+        assert!(declared.contains("the range its controller declares"));
+        let set = out_of_range_warning(1, 7, true).unwrap();
+        assert!(set.contains("source 1 reported 7 axis values"));
+        assert!(set.contains("the scratch range device.toml sets"));
+        assert!(!set.contains("declares"));
     }
 }

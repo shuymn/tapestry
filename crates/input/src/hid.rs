@@ -90,9 +90,10 @@ pub const fn axis_value(raw: u32, bits: u16, signed: bool) -> i32 {
 /// whose count of values does not fit in a `u32` (a full 32-bit field) or
 /// whose range is empty: such an axis is not read.
 ///
-/// A descriptor can be wrong: a value reported outside the declared range
-/// is counted at run time ([`SourceSet::axis_value_out_of_range`]), and key
-/// config can widen the range from what it observes ([`widened_wrap`]).
+/// A descriptor can be wrong: a value reported outside the range the
+/// conversion uses, the declared one unless `device.toml` sets another, is
+/// counted at run time ([`SourceSet::axis_value`]), and key config can
+/// widen the range from what it observes ([`widened_wrap`]).
 #[must_use]
 pub fn axis_cap(
     control: ControlId,
@@ -154,6 +155,25 @@ pub fn widened_wrap(cap: &AxisCap, lo: i32, hi: i32) -> Option<u32> {
             .then(|| u32::try_from(size).ok())
             .flatten()
     })
+}
+
+/// The values of one revolution of `wrap` values set for an absolute axis
+/// declared as `cap`: the standard span [`widened_wrap`] uses,
+/// `-(wrap / 2)..` for a signed field (one declaring a negative minimum)
+/// and `0..` for an unsigned one, `wrap` values long and cut at
+/// `i32::MAX`. `None` for a `wrap` of 0, an axis that does not wrap.
+#[must_use]
+pub fn wrap_range(cap: &AxisCap, wrap: u32) -> Option<(i32, i32)> {
+    if wrap == 0 {
+        return None;
+    }
+    let low = if cap.min < 0 { -i64::from(wrap / 2) } else { 0 };
+    let high = low + i64::from(wrap) - 1;
+    // `wrap / 2` is below 2^31, so `low` fits.
+    Some((
+        i32::try_from(low).unwrap_or(i32::MIN),
+        i32::try_from(high).unwrap_or(i32::MAX),
+    ))
 }
 
 /// The collection number Windows gives a controller's top-level collection
@@ -513,10 +533,9 @@ impl HidDevice {
             let Some(value) = *value else {
                 continue;
             };
-            if !cap.relative && !(cap.min..=cap.max).contains(&value) {
-                // A wrong descriptor: recorded as reported, and counted.
-                sources.axis_value_out_of_range(device);
-            }
+            // Outside the range the conversion uses: recorded as reported,
+            // and counted.
+            sources.axis_value(device, &cap, value);
             let prev = *last;
             if !cap.relative && capture.watched() == Some(cap.control) {
                 capture.observe(&cap, prev, value);
