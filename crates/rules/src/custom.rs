@@ -68,7 +68,7 @@ pub fn custom() -> RulePreset {
     };
     RulePreset {
         id: "custom".to_owned(),
-        version: 1,
+        version: 2,
         implementation: Implementation::Standard { version: 1 },
         windows: JudgeWindows {
             perfect: Window::symmetric(20 * MS),
@@ -76,11 +76,12 @@ pub fn custom() -> RulePreset {
             good: Window::symmetric(100 * MS),
             bad: Window::symmetric(180 * MS),
         },
-        miss: MissRule::PoorAfterLateBad,
+        miss: MissRule::PoorAfterLateBadOrOvertaken,
         empty_poor: EmptyPoorRule {
-            ahead: TimeUs(300 * MS),
+            ahead: TimeUs(500 * MS),
+            behind: Some(TimeUs(150 * MS)),
             breaks_combo: false,
-            counts_bp: false,
+            counts_bp: true,
             counted: false,
         },
         ln_break: LnBreakRule {
@@ -163,7 +164,7 @@ mod tests {
         let g = |v| GaugeDelta::Fixed(GaugeValue(v));
         let expected = RulePreset {
             id: "custom".to_owned(),
-            version: 1,
+            version: 2,
             implementation: Implementation::Standard { version: 1 },
             windows: JudgeWindows {
                 perfect: w(20_000),
@@ -171,11 +172,12 @@ mod tests {
                 good: w(100_000),
                 bad: w(180_000),
             },
-            miss: MissRule::PoorAfterLateBad,
+            miss: MissRule::PoorAfterLateBadOrOvertaken,
             empty_poor: EmptyPoorRule {
-                ahead: TimeUs(300_000),
+                ahead: TimeUs(500_000),
+                behind: Some(TimeUs(150_000)),
                 breaks_combo: false,
-                counts_bp: false,
+                counts_bp: true,
                 counted: false,
             },
             ln_break: LnBreakRule {

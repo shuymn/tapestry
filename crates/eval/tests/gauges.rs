@@ -94,7 +94,7 @@ fn ln_early_release_after_perfect_head() {
         vec![
             press(1_000 * MS, 0, 1),   // head PERFECT: 10_000_000 (capped), 10_000_000
             release(1_700 * MS, 0, 1), // 300 ms early: break, POOR damage: 9_400_000, 9_100_000
-            press(1_850 * MS, 0, 1),   // 250 ms before the tap: empty POOR: 9_100_000, 8_650_000
+            press(1_850 * MS, 0, 1), // 250 ms before the tap: empty POOR, BP: 9_100_000, 8_650_000
             release(1_860 * MS, 0, 1),
             press(2_100 * MS, 0, 1), // tap PERFECT: 10_000_000 (capped), 8_666_000
         ],
@@ -106,7 +106,7 @@ fn ln_early_release_after_perfect_head() {
             combo: 1,
             max_combo: 1,
             ex: 4,
-            bp: 1,
+            bp: 2,
             ln_breaks: 1,
             empty_poor: 1,
             normal: 10_000_000,
@@ -271,7 +271,8 @@ fn mine_damages_only_when_held() {
 #[test]
 fn mine_after_unhit_tap_uses_chronological_deadlines() {
     // Tap at 1000 ms (misses at 1180 ms) and a mine at 1100 ms on one lane.
-    // The lane is held from 500 ms (too early to judge) to 1150 ms.
+    // The lane is held from 450 ms (550 ms early: no judgment and no empty
+    // POOR) to 1150 ms.
     let chart = ChartBuilder::new(BPM)
         .tap(lane(6), TimeUs(1_000 * MS))
         .mine(lane(6), TimeUs(1_100 * MS), 10)
@@ -279,7 +280,7 @@ fn mine_after_unhit_tap_uses_chronological_deadlines() {
         .unwrap();
     let e = play(
         &chart,
-        vec![press(500 * MS, 0, 6), release(1_150 * MS, 0, 6)],
+        vec![press(450 * MS, 0, 6), release(1_150 * MS, 0, 6)],
     );
     // Mine while held: 1_500_000, 9_500_000. POOR: 900_000, 8_600_000.
     assert_eq!(
@@ -312,7 +313,7 @@ fn empty_poor_full_result() {
         vec![
             press(1_000 * MS, 0, 7), // 10_000_000, 10_000_000
             release(1_010 * MS, 0, 7),
-            press(1_700 * MS, 0, 7), // 9_700_000, 9_550_000
+            press(1_700 * MS, 0, 7), // BP: 9_700_000, 9_550_000
             release(1_710 * MS, 0, 7),
             press(2_000 * MS, 0, 7), // 10_000_000, 9_566_000
         ],
@@ -324,7 +325,7 @@ fn empty_poor_full_result() {
             combo: 2,
             max_combo: 2,
             ex: 4,
-            bp: 0,
+            bp: 1,
             ln_breaks: 0,
             empty_poor: 1,
             normal: 10_000_000,

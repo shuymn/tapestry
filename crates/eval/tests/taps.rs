@@ -1,11 +1,15 @@
 //! Hand examples for tap judgment: "this input gives this judgment".
 //! The preset is the custom preset (windows ±20/45/100/180 ms at #RANK 2,
-//! empty POOR up to 300 ms ahead).
+//! empty POOR up to 500 ms before and 150 ms after a note), except where a
+//! test names version 1 (empty POOR up to 300 ms before the next unjudged
+//! note).
 
 mod common;
 
 use bms_model::{ChartBuilder, JudgeRank, SoundId, TimeUs};
-use common::{MS, device, empty_poors, judgments, lane, press, release, run, set};
+use common::{
+    MS, custom_v1, device, empty_poors, judgments, lane, press, release, run, run_with, set,
+};
 use eval::{AdvanceError, ControlId, Evaluator, InputStart, JudgeEventKind, PushError, SourceId};
 use rules::Judgment::{Bad, Good, Great, Perfect, Poor};
 
@@ -176,9 +180,9 @@ fn nearest_note_wins_and_early_press_does_not_steal() {
     assert_eq!(
         judgments(&events),
         [
-            // Nearer (−10 ms) beats older (+90 ms).
-            (2, 1, Perfect, Some(-10 * MS)),
+            // Nearer (−10 ms) beats older (+90 ms), which is passed.
             (2, 0, Poor, None),
+            (2, 1, Perfect, Some(-10 * MS)),
             // A tie (±50 ms) goes to the earlier note.
             (2, 2, Good, Some(50 * MS)),
             (2, 3, Poor, None),
@@ -187,6 +191,326 @@ fn nearest_note_wins_and_early_press_does_not_steal() {
             (2, 5, Poor, None),
         ]
     );
+}
+
+/// Version 1's range: only the next unjudged note, up to 300 ms ahead.
+/// The time and note index of each judgment in `events`.
+fn judged_at(events: &[eval::JudgeEvent]) -> Vec<(i64, usize)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            JudgeEventKind::Judged { note, .. } => Some((e.time.0, note)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The time of each empty POOR in `events`.
+fn empty_poor_times(events: &[eval::JudgeEvent]) -> Vec<i64> {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. }))
+        .map(|e| e.time.0)
+        .collect()
+}
+
+/// Notes at 1000 and 1060 ms; presses at 1040 and 1050 ms.
+fn overtaking(preset: &rules::RulePreset) -> (Vec<eval::JudgeEvent>, eval::Tally) {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(1), TimeUs(1_060 * MS))
+        .build()
+        .unwrap();
+    let inputs = [
+        press(1_040 * MS, 0, 1),
+        release(1_045 * MS, 0, 1),
+        press(1_050 * MS, 0, 1),
+        release(1_055 * MS, 0, 1),
+    ];
+    run_with(
+        &chart,
+        preset,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    )
+}
+
+#[test]
+fn overtaking_press_misses_the_earlier_note() {
+    // 1040 ms lies inside the first note's GOOD window (+40 ms), but the
+    // second note is nearer (-20 ms): it is judged, and the first note is
+    // passed, a POOR at the press, before the press's own judgment.
+    let (events, tally) = overtaking(&rules::custom());
+    assert_eq!(
+        judgments(&events),
+        [(1, 0, Poor, None), (1, 1, Perfect, Some(-20 * MS))]
+    );
+    assert_eq!(judged_at(&events), [(1_040 * MS, 0), (1_040 * MS, 1)]);
+    // The press at 1050 ms has no unjudged note left, but lies 50 ms after
+    // the first note: an empty POOR.
+    assert_eq!(empty_poor_times(&events), [1_050 * MS]);
+    // The POOR and the empty POOR add to BP; the POOR came first, so the
+    // PERFECT starts a combo the empty POOR keeps.
+    assert_eq!(
+        (tally.counts.perfect, tally.counts.good, tally.counts.poor),
+        (1, 0, 1)
+    );
+    assert_eq!((tally.bp, tally.combo, tally.max_combo), (2, 1, 1));
+}
+
+#[test]
+fn version_1_judges_an_overtaken_note_out_of_order() {
+    let (events, tally) = overtaking(&custom_v1());
+    // The first note stays open after the later one is judged, and the
+    // second press takes it as GOOD (+50 ms).
+    assert_eq!(
+        judgments(&events),
+        [(1, 1, Perfect, Some(-20 * MS)), (1, 0, Good, Some(50 * MS))]
+    );
+    assert_eq!(empty_poors(&events), 0);
+    assert_eq!((tally.bp, tally.combo), (0, 2));
+
+    // With the first press only, the first note is missed at its deadline.
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(1), TimeUs(1_060 * MS))
+        .build()
+        .unwrap();
+    let inputs = [press(1_040 * MS, 0, 1), release(1_045 * MS, 0, 1)];
+    let (events, _) = run_with(
+        &chart,
+        &custom_v1(),
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    );
+    assert_eq!(judged_at(&events), [(1_040 * MS, 1), (1_180 * MS, 0)]);
+}
+
+#[test]
+fn overtaking_misses_every_earlier_note_in_order() {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .tap(lane(3), TimeUs(1_050 * MS))
+        .tap(lane(3), TimeUs(1_100 * MS))
+        .build()
+        .unwrap();
+    let inputs = [press(1_100 * MS, 0, 3), release(1_110 * MS, 0, 3)];
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    );
+    // Both POORs at the press, in note order, then the press's PERFECT;
+    // their deadlines (1180 and 1230 ms) add nothing.
+    assert_eq!(
+        judgments(&events),
+        [
+            (3, 0, Poor, None),
+            (3, 1, Poor, None),
+            (3, 2, Perfect, Some(0))
+        ]
+    );
+    assert_eq!(
+        judged_at(&events),
+        [(1_100 * MS, 0), (1_100 * MS, 1), (1_100 * MS, 2)]
+    );
+    assert_eq!((tally.counts.poor, tally.bp, tally.combo), (2, 2, 1));
+}
+
+#[test]
+fn overtaken_ln_head_loses_its_ln() {
+    // An LN 1000-1050 ms and a tap at 1100 ms; the press at 1095 ms is
+    // nearer the tap (-5 ms) than the head (+95 ms).
+    let chart = ChartBuilder::new(BPM)
+        .long(lane(6), TimeUs(1_000 * MS), TimeUs(1_050 * MS))
+        .tap(lane(6), TimeUs(1_100 * MS))
+        .build()
+        .unwrap();
+    let inputs = [press(1_095 * MS, 0, 6), release(1_120 * MS, 0, 6)];
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    );
+    assert_eq!(
+        judgments(&events),
+        [(6, 0, Poor, None), (6, 1, Perfect, Some(-5 * MS))]
+    );
+    assert_eq!(judged_at(&events), [(1_095 * MS, 0), (1_095 * MS, 1)]);
+    // The missed head finishes its LN without an end event or a break.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, JudgeEventKind::LnEnd { .. }))
+    );
+    assert_eq!((tally.ln_breaks, tally.bp, tally.combo), (0, 1, 1));
+}
+
+#[test]
+fn overtaken_ln_head_skips_its_future_end() {
+    // An LN 1000-1150 ms and a tap at 1200 ms; the press at 1140 ms is
+    // nearer the tap (-60 ms, GOOD) than the head (+140 ms). The LN's end
+    // deadline at 1150 ms comes after the press and must do nothing.
+    let chart = ChartBuilder::new(BPM)
+        .long(lane(7), TimeUs(1_000 * MS), TimeUs(1_150 * MS))
+        .tap(lane(7), TimeUs(1_200 * MS))
+        .build()
+        .unwrap();
+    let inputs = [press(1_140 * MS, 0, 7), release(1_160 * MS, 0, 7)];
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    );
+    assert_eq!(
+        judgments(&events),
+        [(7, 0, Poor, None), (7, 1, Good, Some(-60 * MS))]
+    );
+    assert_eq!(judged_at(&events), [(1_140 * MS, 0), (1_140 * MS, 1)]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, JudgeEventKind::LnEnd { .. }))
+    );
+    assert_eq!((tally.ln_breaks, tally.bp, tally.combo), (0, 1, 1));
+}
+
+#[test]
+fn empty_poor_before_an_already_judged_note() {
+    // The tap at 1000 ms is judged early (BAD, -150 ms) at 850 ms; a press
+    // at 900 ms has no unjudged note left, but the judged note lies 100 ms
+    // ahead: an empty POOR.
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let inputs = [
+        press(850 * MS, 0, 1),
+        release(860 * MS, 0, 1),
+        press(900 * MS, 0, 1),
+        release(910 * MS, 0, 1),
+    ];
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    );
+    assert_eq!(judgments(&events), [(1, 0, Bad, Some(-150 * MS))]);
+    assert_eq!(empty_poor_times(&events), [900 * MS]);
+    // BAD and the empty POOR each add to BP; BAD broke the combo.
+    assert_eq!((tally.empty_poor, tally.bp, tally.combo), (1, 2, 0));
+}
+
+#[test]
+fn empty_poor_reaches_behind_judged_notes() {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(2), TimeUs(1_000 * MS))
+        .tap(lane(2), TimeUs(3_000 * MS))
+        .build()
+        .unwrap();
+    let inputs = [
+        press(1_000 * MS, 0, 2),
+        release(1_010 * MS, 0, 2),
+        // 100 ms after the judged note: an empty POOR.
+        press(1_100 * MS, 0, 2),
+        release(1_110 * MS, 0, 2),
+        // Exactly 150 ms after: an empty POOR.
+        press(1_150 * MS, 0, 2),
+        release(1_150 * MS, 0, 2),
+        // 150 ms + 1 µs and 200 ms after: nothing.
+        press(1_150 * MS + 1, 0, 2),
+        release(1_150 * MS + 1, 0, 2),
+        press(1_200 * MS, 0, 2),
+        release(1_210 * MS, 0, 2),
+        press(3_000 * MS, 0, 2),
+        release(3_010 * MS, 0, 2),
+        // After the last note, with no unjudged note left: an empty POOR.
+        press(3_100 * MS, 0, 2),
+        release(3_110 * MS, 0, 2),
+    ];
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        4_000 * MS,
+    );
+    assert_eq!(
+        judgments(&events),
+        [(2, 0, Perfect, Some(0)), (2, 1, Perfect, Some(0))]
+    );
+    assert_eq!(
+        empty_poor_times(&events),
+        [1_100 * MS, 1_150 * MS, 3_100 * MS]
+    );
+    assert_eq!((tally.empty_poor, tally.bp), (3, 3));
+    // Not counted and not breaking the combo.
+    assert_eq!((tally.counts.poor, tally.combo, tally.max_combo), (0, 2, 2));
+}
+
+#[test]
+fn empty_poor_reaches_ahead_of_unjudged_notes() {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(4), TimeUs(2_000 * MS))
+        .build()
+        .unwrap();
+    let inputs = [
+        // 500 ms + 1 µs before the note: nothing.
+        press(1_500 * MS - 1, 0, 4),
+        release(1_500 * MS - 1, 0, 4),
+        // Exactly 500 ms and 400 ms before: empty POORs.
+        press(1_500 * MS, 0, 4),
+        release(1_510 * MS, 0, 4),
+        press(1_600 * MS, 0, 4),
+        release(1_610 * MS, 0, 4),
+        press(2_000 * MS, 0, 4),
+    ];
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        3_000 * MS,
+    );
+    assert_eq!(judgments(&events), [(4, 0, Perfect, Some(0))]);
+    assert_eq!(empty_poor_times(&events), [1_500 * MS, 1_600 * MS]);
+    assert_eq!((tally.empty_poor, tally.bp, tally.combo), (2, 2, 1));
+}
+
+#[test]
+fn mashing_after_a_judged_note_counts_every_press() {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(5), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let mut inputs = vec![press(1_000 * MS, 0, 5), release(1_010 * MS, 0, 5)];
+    // Five presses 30 ms apart, the last exactly 150 ms after the note.
+    for i in 1..=5 {
+        inputs.push(press((1_000 + 30 * i) * MS, 0, 5));
+        inputs.push(release((1_000 + 30 * i) * MS + 10 * MS, 0, 5));
+    }
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    );
+    assert_eq!(judgments(&events), [(5, 0, Perfect, Some(0))]);
+    assert_eq!(empty_poors(&events), 5);
+    assert_eq!((tally.empty_poor, tally.bp, tally.combo), (5, 5, 1));
 }
 
 #[test]
@@ -208,7 +532,14 @@ fn empty_poor_keeps_combo_and_bp() {
         release(1_710 * MS, 0, 3),
         press(2_000 * MS, 0, 3),
     ];
-    let (events, tally) = run(&chart, &dev, &InputStart::default(), &inputs, 3_000 * MS);
+    let (events, tally) = run_with(
+        &chart,
+        &custom_v1(),
+        &dev,
+        &InputStart::default(),
+        &inputs,
+        3_000 * MS,
+    );
     assert_eq!(
         judgments(&events),
         [(3, 0, Perfect, Some(0)), (3, 1, Perfect, Some(0))]
@@ -361,7 +692,7 @@ fn rank_scaled_window_edges_are_inclusive() {
         (-90_000, Some(Bad)),
         (90_000, Some(Bad)),
         // Outside BAD: too early is an empty POOR and the note is missed;
-        // too late comes after the miss.
+        // too late comes after the miss, an empty POOR on the missed note.
         (-90_001, None),
         (90_001, None),
     ];
@@ -391,5 +722,5 @@ fn rank_scaled_window_edges_are_inclusive() {
         })
         .collect();
     assert_eq!(judgments(&events), expected);
-    assert_eq!(empty_poors(&events), 1);
+    assert_eq!(empty_poors(&events), 2);
 }

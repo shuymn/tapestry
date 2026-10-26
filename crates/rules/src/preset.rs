@@ -201,18 +201,33 @@ impl JudgeWindows {
 pub enum MissRule {
     /// A note not pressed by its late BAD edge is a POOR at that edge.
     PoorAfterLateBad,
+    /// As [`PoorAfterLateBad`](Self::PoorAfterLateBad), and also: a press
+    /// that judges a note first misses every earlier unjudged note of its
+    /// lane, each a POOR at the press's time, in note order. Notes are
+    /// never judged out of order.
+    PoorAfterLateBadOrOvertaken,
 }
 
-/// Empty POOR: a press that judges no note but has one close ahead.
+/// Empty POOR: a press that judges no note but lies close to one.
 ///
-/// A press is an empty POOR when no unjudged note of its lane lies inside the
-/// BAD window but one lies at most `ahead` after the press. Its gauge change
-/// is [`GaugeRule::empty_poor`].
+/// A press that judges no note is an empty POOR when a note of its lane is
+/// close enough, by one of two ranges:
+///
+/// - `behind` is `None`: the lane's next unjudged note lies at most `ahead`
+///   after the press (the range of preset format 1).
+/// - `behind` is `Some`: any note of the lane, judged or not, lies at most
+///   `ahead` after the press or at most `behind` before it.
+///
+/// Every such press counts, with no cap. Its gauge change is
+/// [`GaugeRule::empty_poor`]. Neither distance is scaled by the rank, and
+/// a note exactly `ahead` or `behind` away counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EmptyPoorRule {
-    /// How far ahead of the press a note makes it an empty POOR (inclusive).
-    /// Not scaled by the rank.
+    /// How far ahead of the press a note makes it an empty POOR.
     pub ahead: TimeUs,
+    /// How far behind the press a note makes it an empty POOR, judged or
+    /// not; `None` for the next-unjudged-note range.
+    pub behind: Option<TimeUs>,
     /// Whether it breaks the combo.
     pub breaks_combo: bool,
     /// Whether it adds to BP.
@@ -387,8 +402,9 @@ pub enum SameTimeOrder {
 /// How a press is assigned to a note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Assignment {
-    /// The nearest unjudged note inside the window; at equal distance, the
-    /// earlier note.
+    /// The nearest unjudged note inside the BAD window; at equal distance,
+    /// the earlier note. A late press therefore moves on to the next note
+    /// once it is past the midpoint between the two.
     NearestTiesEarlier,
 }
 
