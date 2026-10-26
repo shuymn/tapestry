@@ -50,6 +50,7 @@ impl SessionPolicy for DefaultPolicy {
         })
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn on_survival_failure(&self) -> FailureAction {
         FailureAction::KeepPlaying
     }

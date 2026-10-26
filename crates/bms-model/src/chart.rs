@@ -35,6 +35,7 @@ impl Lane {
     }
 
     /// Every lane, scratch first.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn all() -> impl Iterator<Item = Self> {
         (0..LANE_COUNT as u8).map(Self)
     }

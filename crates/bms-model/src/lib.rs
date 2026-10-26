@@ -29,6 +29,7 @@ pub struct TimeUs(pub i64);
 impl TimeUs {
     /// Adds `rhs`, returning `None` on overflow.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn checked_add(self, rhs: Self) -> Option<Self> {
         match self.0.checked_add(rhs.0) {
             Some(v) => Some(Self(v)),
@@ -38,6 +39,7 @@ impl TimeUs {
 
     /// Subtracts `rhs`, returning `None` on overflow.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
         match self.0.checked_sub(rhs.0) {
             Some(v) => Some(Self(v)),

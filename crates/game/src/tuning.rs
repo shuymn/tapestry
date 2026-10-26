@@ -97,6 +97,7 @@ impl Adjust {
     /// Whether it changes the input offset, which only the end screen
     /// takes.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn is_input_offset(self) -> bool {
         matches!(self, Self::InputOffsetDown | Self::InputOffsetUp)
     }

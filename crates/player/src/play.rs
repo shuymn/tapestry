@@ -176,6 +176,7 @@ impl PlayerRig<'_> {
         self.send_end(t);
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn send_end(&self, t: Tuning) {
         if let Some(lines) = &self.end_lines {
             let mut all = lines.clone();

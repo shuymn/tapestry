@@ -73,6 +73,7 @@ impl Controls {
     }
 
     /// The values the settings keys step.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn tuning(&self) -> &Arc<LiveTuning> {
         &self.tuning
     }
@@ -152,6 +153,7 @@ impl Controls {
     }
 
     /// Whether the window has focus.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn focused(&self) -> bool {
         self.focused.load(Ordering::Acquire)
     }

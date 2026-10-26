@@ -153,6 +153,7 @@ impl ScrollMap {
 
     /// The BPM at time 0 before any change, in millionths.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn initial_bpm_micro(&self) -> i64 {
         self.before_zero.bpm_micro
     }
@@ -256,10 +257,12 @@ impl ScrollMap {
 }
 
 /// `ceil(a / b)` for `b > 0`.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn ceil_div(a: i128, b: i128) -> i128 {
     -(-a).div_euclid(b)
 }
 
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn saturate(v: i128) -> i64 {
     i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
 }

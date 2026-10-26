@@ -77,6 +77,7 @@ pub trait Rig {
     /// After a step's decisions (`aborted`: the step ended the play).
     /// A virtual rig steps its audio through the step's own time here;
     /// threads need nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn stepped(&mut self, aborted: bool) {
         let _ = aborted;
     }

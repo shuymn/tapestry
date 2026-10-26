@@ -201,6 +201,7 @@ pub enum Command {
 }
 
 impl Command {
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) const fn cause(self) -> AbortCause {
         match self {
             Self::Retry => AbortCause::Retry,

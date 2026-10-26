@@ -25,12 +25,14 @@ pub struct Gpu {
 impl Gpu {
     /// The device.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
     /// The queue.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
