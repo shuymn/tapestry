@@ -1146,10 +1146,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("broken.rs"), "fn f( {}\n").unwrap();
         let e = check_site(dir.path(), Site::File("broken.rs")).unwrap_err();
-        assert!(format!("{e:#}").starts_with("parsing broken.rs: "), "{e:#}");
-        assert!(
-            e.root_cause().downcast_ref::<syn::Error>().is_some(),
-            "{e:?}"
+        let syn = e.root_cause().downcast_ref::<syn::Error>();
+        assert!(syn.is_some(), "{e:?}");
+        assert_eq!(
+            format!("{e:#}"),
+            format!("parsing broken.rs: {}", syn.unwrap())
         );
 
         let e = check_site(dir.path(), Site::File("absent.rs")).unwrap_err();

@@ -98,10 +98,7 @@ fn check(mode: Mode, list: Option<&Path>) -> anyhow::Result<(Vec<String>, usize)
     let entries = git::index_entries(&root)?;
 
     let (list_name, list_bytes) = match list {
-        Some(path) => (
-            path.display().to_string(),
-            std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?,
-        ),
+        Some(path) => (path.display().to_string(), read_list_file(path)?),
         None => {
             let entry = entries
                 .iter()
@@ -148,6 +145,11 @@ fn check(mode: Mode, list: Option<&Path>) -> anyhow::Result<(Vec<String>, usize)
         ));
     }
     Ok((diagnostics, selected.len()))
+}
+
+/// The list file `--list` names.
+fn read_list_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))
 }
 
 fn is_content_exempt(path: &str) -> bool {
@@ -386,6 +388,23 @@ mod tests {
         let mut late = vec![b'a'; BINARY_SNIFF];
         late.extend_from_slice(b"\nzorblax\0\n");
         assert_eq!(check("late.txt", Some(&late)).len(), 1);
+    }
+
+    #[test]
+    fn unreadable_list_file_keeps_the_io_error_as_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.txt");
+        let e = read_list_file(&path).unwrap_err();
+        let io = e.root_cause().downcast_ref::<std::io::Error>();
+        assert_eq!(
+            io.map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "{e:?}"
+        );
+        assert_eq!(
+            format!("{e:#}"),
+            format!("cannot read {}: {}", path.display(), io.unwrap())
+        );
     }
 
     #[test]
