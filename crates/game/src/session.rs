@@ -513,22 +513,23 @@ impl Loaded {
     /// The device profile and the logic step's sizes for a play whose
     /// participating sources have `kinds`, indexed by source id.
     #[must_use]
-    pub fn plan(&self, kinds: &[DeviceKind]) -> PlayPlan {
-        let device = self.settings.device.profile(kinds);
+    pub fn plan(&self, kinds: &[DeviceKind], axes: &[Vec<input::hid::AxisCap>]) -> PlayPlan {
+        let device = self.settings.device.profile(kinds, axes);
         let recorded: usize = kinds
             .iter()
             .map(|&k| self.settings.device.keys(k).recorded().len())
             .sum();
         let axes: usize = device.sources.iter().map(|s| s.axes.len()).sum();
+        let window = window_inputs(
+            &self.chart,
+            &self.preset,
+            &device,
+            self.config.lead_in,
+            recorded - axes,
+            axes,
+        );
         let logic = LogicConfig {
-            inputs: window_inputs(
-                &self.chart,
-                &self.preset,
-                &device,
-                self.config.lead_in,
-                recorded - axes,
-                axes,
-            ),
+            inputs: window.min(recording_cap(kinds.len(), self.preset.gauges.len())),
             effects: self.config.effects,
         };
         PlayPlan { device, logic }
@@ -833,12 +834,17 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             .map(|(d, _)| (d, sources.connection(d)))
             .collect();
         let kinds = sources.participants().map(|(_, k)| k).collect();
+        let axes = sources
+            .participants()
+            .map(|(d, _)| sources.axes(d).to_vec())
+            .collect();
         self.origin = Some(origin);
         Opening {
             origin,
             start,
             readers: self.sources.take_readers(),
             kinds,
+            axes,
         }
     }
 
@@ -912,6 +918,39 @@ fn arrival(a: &InputArrival) -> Arrival {
         at: a.at,
         kind: replay_kind(a.kind),
     }
+}
+
+/// The memory a play's recording may reserve: the logic step's buffers and
+/// the evaluator's input ring and output, all sized from the input
+/// capacity (stage1.md D14).
+pub const RECORDING_MEMORY: usize = 256 << 20;
+
+/// The bytes the logic step reserves per input of the capacity, for
+/// `sources` sources and `gauges` gauges: a staging slot per source, the
+/// merge and the record, a slot of the evaluator's ring, and the output
+/// events one input can cause ([`Evaluator::max_events`]: a sound, an
+/// empty POOR, and a gauge report per gauge).
+#[must_use]
+pub fn bytes_per_input(sources: usize, gauges: usize) -> usize {
+    let event = size_of::<eval::PhysicalInputEvent>();
+    sources.saturating_add(2).saturating_mul(event)
+        + size_of::<(TimeUs, eval::PhysicalInputEvent)>()
+        + gauges
+            .saturating_add(2)
+            .saturating_mul(size_of::<JudgeEvent>())
+}
+
+/// The recording policy (stage1.md D14): the most inputs one play records,
+/// whatever its window, so its reservation stays within
+/// [`RECORDING_MEMORY`] (one disconnect per source on top). That is below
+/// what [`replay::DecodeLimits::STANDARD`] reads
+/// ([`replay::max_record_events`]), which a test pins, so every record
+/// decodes. A play whose window would hold more is capped, not refused:
+/// only a play that really receives more inputs overflows, and its record
+/// is then marked incomplete.
+#[must_use]
+pub fn recording_cap(sources: usize, gauges: usize) -> usize {
+    (RECORDING_MEMORY / bytes_per_input(sources, gauges).max(1)).saturating_sub(sources)
 }
 
 /// The recording window's input capacity (D8, [`eval::window_inputs`]):

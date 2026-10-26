@@ -818,7 +818,7 @@ fn passthrough_transform_is_recorded() {
     let chart = loaded.chart().clone();
     let audio = steady_audio(&chart, common::bank(&chart));
     let mut s = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
-    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard]);
+    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
     let events = input::autoplay(&chart, &profile.sources[0]).unwrap();
     let input = ScriptedInput::from_log(&Default::default(), &events, &[DeviceKind::Keyboard]);
     let one = s
@@ -1273,7 +1273,53 @@ fn plan_sizes_axes_at_1khz_and_buttons_at_30_presses() {
     // The keyboard records its 8 lanes, retry and quit, the controller a
     // button and an axis: 11 buttons at 60 edges and 1 axis at 1000
     // reports a second, over 3 s.
-    let plan = loaded.plan(&[DeviceKind::Keyboard, DeviceKind::Controller]);
+    let plan = loaded.plan(&[DeviceKind::Keyboard, DeviceKind::Controller], &[]);
     assert_eq!(plan.device.sources[1].axes.len(), 1);
     assert_eq!(plan.logic.inputs, 3 * (11 * 60 + 1000));
+}
+
+#[test]
+fn recording_policy_keeps_memory_and_the_decoder_limits() {
+    let decodable = replay::max_record_events(&replay::DecodeLimits::STANDARD);
+    for sources in 1..=8 {
+        for gauges in 1..=4 {
+            // Memory binds first, so the standard decoder always reads a
+            // record at the cap, with each source's disconnect on top.
+            let memory = game::RECORDING_MEMORY / game::bytes_per_input(sources, gauges);
+            assert!(memory <= decodable, "{sources} sources, {gauges} gauges");
+            let cap = game::recording_cap(sources, gauges);
+            assert_eq!(cap, memory - sources);
+            assert!(cap + sources <= decodable);
+            assert!(cap * game::bytes_per_input(sources, gauges) <= game::RECORDING_MEMORY);
+        }
+    }
+    println!(
+        "indicator: recording cap with 2 sources and 2 gauges: {} inputs",
+        game::recording_cap(2, 2)
+    );
+}
+
+#[test]
+fn a_long_window_is_capped_by_the_recording_policy() {
+    let (_dir, root) = temp_root();
+    // An hour-long chart with three axes would want 3 × 1000 reports a
+    // second for an hour; the play records up to the cap instead.
+    let chart = taps(&[(1, 3_600_000)]);
+    let mut settings = Settings::load(&root).unwrap();
+    settings.device.controller.lanes = (0..3)
+        .map(|i| game::LaneKey {
+            control: 0x1_0030 + i,
+            lane: u8::try_from(i).unwrap(),
+        })
+        .collect();
+    let parts = Parts {
+        ingest: Box::new(Built(chart)),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap();
+    let plan = loaded.plan(&[DeviceKind::Keyboard, DeviceKind::Controller], &[]);
+    let preset_gauges = rules::custom().gauges.len();
+    let cap = game::recording_cap(2, preset_gauges);
+    assert!(3 * 1000 * 3_600 > cap);
+    assert_eq!(plan.logic.inputs, cap);
 }

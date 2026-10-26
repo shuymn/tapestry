@@ -87,17 +87,16 @@ struct AxisState {
 }
 
 impl AxisState {
-    /// The movement a report means, forward positive.
+    /// The movement a report means.
     fn movement(&mut self, value: i32) -> i64 {
-        let d = match self.settings.mode {
+        match self.settings.mode {
             AxisMode::Absolute { wrap } => match self.last.replace(value) {
                 // The first report only says where the axis is.
                 None => 0,
                 Some(prev) => wrapped(i64::from(value) - i64::from(prev), wrap),
             },
             AxisMode::Relative => i64::from(value),
-        };
-        d
+        }
     }
 
     /// Back to released and unknown, as after a disconnect.

@@ -10,6 +10,7 @@ use game::{
     write_atomic,
 };
 use input::DeviceKind;
+use input::hid::AxisCap;
 
 fn temp_root() -> (tempfile::TempDir, DataRoot) {
     let dir = tempfile::Builder::new()
@@ -63,8 +64,8 @@ fn changed() -> Settings {
             audio_device: Some("device-a".to_owned()),
             master_volume: 0.75,
             scratch: ScratchConfig {
-                relative: false,
-                wrap: 1_024,
+                relative: None,
+                wrap: Some(1_024),
                 press_threshold: 5,
                 hold_threshold: 3,
                 release_after_us: 80_000,
@@ -179,7 +180,13 @@ fn key_config_gives_profiles_and_recorded_controls() {
         s.controller.recorded(),
         vec![ControlId(7), ControlId(9), ControlId(0x1_0030)]
     );
-    let profile = s.profile(&[DeviceKind::Controller, DeviceKind::Keyboard]);
+    // The controller declares X with 255 values; the file's 1024 wins.
+    let declared = vec![AxisCap {
+        control: ControlId(0x1_0030),
+        relative: false,
+        wrap: 255,
+    }];
+    let profile = s.profile(&[DeviceKind::Controller, DeviceKind::Keyboard], &[declared]);
     let lane = |n| Lane::new(n).unwrap();
     assert_eq!(
         profile.sources,
@@ -237,19 +244,54 @@ fn key_config_gives_profiles_and_recorded_controls() {
     });
     assert_eq!(keys.bindings(DeviceKind::Keyboard).len(), 3);
     assert_eq!(
-        keys.axes(DeviceKind::Keyboard, ScratchSettings::DEFAULT),
+        keys.axes(DeviceKind::Keyboard, &ScratchConfig::default(), &[]),
         []
     );
-    // A relative axis, from the file's settings.
-    let relative = ScratchConfig {
-        relative: true,
-        ..ScratchConfig::default()
+}
+
+#[test]
+fn scratch_settings_resolve_from_the_device_unless_set() {
+    let cap = |relative, wrap| AxisCap {
+        control: ControlId(0x1_0030),
+        relative,
+        wrap,
     };
-    assert_eq!(relative.settings().mode, AxisMode::Relative);
+    let auto = ScratchConfig::default();
+    let mode = |c: &ScratchConfig, declared: Option<AxisCap>| c.settings(declared.as_ref()).mode;
+    // Nothing declared: the defaults.
+    assert_eq!(auto.settings(None), ScratchSettings::DEFAULT);
+    // A 0..254 axis has 255 values a revolution, a 16-bit one 65536.
     assert_eq!(
-        ScratchConfig::default().settings(),
-        ScratchSettings::DEFAULT
+        mode(&auto, Some(cap(false, 255))),
+        AxisMode::Absolute { wrap: 255 }
     );
+    assert_eq!(
+        mode(&auto, Some(cap(false, 65_536))),
+        AxisMode::Absolute { wrap: 65_536 }
+    );
+    assert_eq!(mode(&auto, Some(cap(true, 0))), AxisMode::Relative);
+    // The file overrides each.
+    let set = ScratchConfig {
+        relative: Some(false),
+        wrap: Some(300),
+        ..auto
+    };
+    assert_eq!(
+        mode(&set, Some(cap(true, 0))),
+        AxisMode::Absolute { wrap: 300 }
+    );
+    let relative = ScratchConfig {
+        relative: Some(true),
+        ..auto
+    };
+    assert_eq!(mode(&relative, Some(cap(false, 255))), AxisMode::Relative);
+    // The thresholds always come from the file.
+    let s = ScratchConfig {
+        press_threshold: 7,
+        ..auto
+    }
+    .settings(Some(&cap(false, 255)));
+    assert_eq!(s.press_threshold, 7);
 }
 
 #[test]

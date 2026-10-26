@@ -249,6 +249,7 @@ impl Rig for Fake {
             start,
             readers: self.sources.take_readers(),
             kinds: self.sources.participants().map(|(_, k)| k).collect(),
+            axes: Vec::new(),
         }
     }
 

@@ -14,7 +14,7 @@ use eval::{
     AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, ScratchSettings, SourceProfile,
 };
 use input::DeviceKind;
-use input::hid::is_axis;
+use input::hid::{AxisCap, is_axis};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -286,18 +286,25 @@ impl KeyConfig {
             .collect()
     }
 
-    /// A controller's axes bound to lanes, each converted by `scratch`;
-    /// none for a keyboard.
+    /// A controller's axes bound to lanes, each converted by `scratch`
+    /// resolved for the axis as the device declares it in `caps`
+    /// ([`ScratchConfig::settings`]); none for a keyboard.
     #[must_use]
-    pub fn axes(&self, kind: DeviceKind, scratch: ScratchSettings) -> Vec<AxisBinding> {
+    pub fn axes(
+        &self,
+        kind: DeviceKind,
+        scratch: &ScratchConfig,
+        caps: &[AxisCap],
+    ) -> Vec<AxisBinding> {
         self.lanes
             .iter()
             .filter(|k| axis_of(kind, k.control))
             .filter_map(|k| {
+                let control = ControlId(k.control);
                 Lane::new(k.lane).map(|lane| AxisBinding {
-                    control: ControlId(k.control),
+                    control,
                     lane,
-                    scratch,
+                    scratch: scratch.settings(caps.iter().find(|c| c.control == control)),
                 })
             })
             .collect()
@@ -310,17 +317,21 @@ const fn axis_of(kind: DeviceKind, control: u32) -> bool {
 }
 
 /// How a controller's axis plays its lane (design.md "Analog Scratch"), in
-/// `device.toml`. The defaults suit a turntable that reports an 8-bit
-/// absolute axis ([`ScratchSettings::DEFAULT`]); they are starting points,
-/// tuned by playing.
+/// `device.toml`. Whether the axis is relative and how many values a
+/// revolution has come from the device's declaration unless set here; the
+/// thresholds and release time default to [`ScratchSettings::DEFAULT`],
+/// starting points tuned by playing. The resolved settings are what the
+/// input log records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ScratchConfig {
-    /// Whether the axis reports movement rather than position.
-    pub relative: bool,
+    /// Whether the axis reports movement rather than position; from the
+    /// device when absent.
+    pub relative: Option<bool>,
     /// For an absolute axis, the values in one revolution (it wraps from
-    /// its highest back to its lowest); 0 if it does not wrap.
-    pub wrap: u32,
+    /// its highest back to its lowest), 0 if it does not wrap; from the
+    /// device's declared range when absent.
+    pub wrap: Option<u32>,
     /// Movement in one direction that presses.
     pub press_threshold: u32,
     /// Movement in the pressed direction that keeps the lane pressed.
@@ -332,13 +343,9 @@ pub struct ScratchConfig {
 impl Default for ScratchConfig {
     fn default() -> Self {
         let d = ScratchSettings::DEFAULT;
-        let wrap = match d.mode {
-            AxisMode::Absolute { wrap } => wrap,
-            AxisMode::Relative => 0,
-        };
         Self {
-            relative: matches!(d.mode, AxisMode::Relative),
-            wrap,
+            relative: None,
+            wrap: None,
             press_threshold: d.press_threshold,
             hold_threshold: d.hold_threshold,
             release_after_us: d.release_after_us,
@@ -347,14 +354,25 @@ impl Default for ScratchConfig {
 }
 
 impl ScratchConfig {
-    /// The settings the evaluator reads.
+    /// The settings the evaluator reads for an axis the device declares
+    /// as `cap` (`None`: not declared, as for a device not connected): a
+    /// value set here, else the declaration, else the default
+    /// ([`ScratchSettings::DEFAULT`]: absolute, 256 values).
     #[must_use]
-    pub const fn settings(&self) -> ScratchSettings {
+    pub fn settings(&self, cap: Option<&AxisCap>) -> ScratchSettings {
+        let default_wrap = match ScratchSettings::DEFAULT.mode {
+            AxisMode::Absolute { wrap } => wrap,
+            AxisMode::Relative => 0,
+        };
+        let relative = self.relative.or(cap.map(|c| c.relative)).unwrap_or(false);
+        let declared = cap.filter(|c| !c.relative).map(|c| c.wrap);
         ScratchSettings {
-            mode: if self.relative {
+            mode: if relative {
                 AxisMode::Relative
             } else {
-                AxisMode::Absolute { wrap: self.wrap }
+                AxisMode::Absolute {
+                    wrap: self.wrap.or(declared).unwrap_or(default_wrap),
+                }
             },
             press_threshold: self.press_threshold,
             hold_threshold: self.hold_threshold,
@@ -466,16 +484,22 @@ impl DeviceSettings {
     }
 
     /// The profile the evaluator reads for sources of the given kinds,
-    /// indexed by source id.
+    /// indexed by source id, whose axes are as declared in `axes` (by
+    /// source id; a source past its end declares none).
     #[must_use]
-    pub fn profile(&self, kinds: &[DeviceKind]) -> DeviceProfile {
+    pub fn profile(&self, kinds: &[DeviceKind], axes: &[Vec<AxisCap>]) -> DeviceProfile {
         DeviceProfile {
             sources: kinds
                 .iter()
-                .map(|&kind| SourceProfile {
+                .enumerate()
+                .map(|(i, &kind)| SourceProfile {
                     input_offset: TimeUs(self.input_offset_us),
                     bindings: self.keys(kind).bindings(kind),
-                    axes: self.keys(kind).axes(kind, self.scratch.settings()),
+                    axes: self.keys(kind).axes(
+                        kind,
+                        &self.scratch,
+                        axes.get(i).map_or(&[], Vec::as_slice),
+                    ),
                 })
                 .collect(),
         }

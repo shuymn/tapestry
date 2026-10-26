@@ -45,6 +45,8 @@ pub struct Opening<R> {
     pub readers: Vec<R>,
     /// The participants' kinds, by source id.
     pub kinds: Vec<DeviceKind>,
+    /// The axes each participant declares, by source id.
+    pub axes: Vec<Vec<input::hid::AxisCap>>,
 }
 
 /// What closing recording gave. Once the rig returns it, nothing more is
@@ -231,7 +233,7 @@ fn play_and_next<R: Rig>(
     let start = loaded.begin_play();
     let opening = rig.open(loaded.config().lead_in);
     let origin = opening.origin;
-    let plan = loaded.plan(&opening.kinds);
+    let plan = loaded.plan(&opening.kinds, &opening.axes);
     let (mut logic, screen) = match Logic::new(
         loaded.chart(),
         loaded.preset(),

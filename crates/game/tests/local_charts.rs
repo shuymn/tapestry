@@ -198,7 +198,7 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
     let device = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
     let audio = RunnerAudio::new(engine, RecordingOutput::new(device, 0));
     let mut session = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
-    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard]);
+    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
     let events = input::autoplay(&chart, &profile.sources[0]).unwrap();
     let input = ScriptedInput::from_log(&Default::default(), &events, &[DeviceKind::Keyboard]);
     let report = session

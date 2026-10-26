@@ -254,6 +254,10 @@ impl Hook {
             start,
             readers: sources.take_readers(),
             kinds: sources.participants().map(|(_, k)| k).collect(),
+            axes: sources
+                .participants()
+                .map(|(d, _)| sources.axes(d).to_vec())
+                .collect(),
         }
     }
 
