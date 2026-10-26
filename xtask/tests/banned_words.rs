@@ -209,6 +209,12 @@ fn missing_list_and_bad_usage_exit_2() {
         err.contains("banned-words.txt is not in the index"),
         "{err}"
     );
+    let missing = repo.dir.path().join("missing-list.txt");
+    let (code, err) = repo.check(&["--all", "--list", missing.to_str().unwrap()]);
+    assert_eq!(code, 2, "{err}");
+    let prefix = format!("banned-words: error: cannot read {}: ", missing.display());
+    assert!(err.starts_with(&prefix), "{err}");
+    assert_eq!(err.matches("(os error").count(), 1, "{err}");
     assert_eq!(repo.check(&[]).0, 2);
     assert_eq!(repo.check(&["--staged", "--all"]).0, 2);
     assert_eq!(repo.check(&["--all", "--list"]).0, 2);

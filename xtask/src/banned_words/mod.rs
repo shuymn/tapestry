@@ -22,6 +22,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use anyhow::Context as _;
 use matcher::{Hit, Term};
 use normalize::nfkc;
 
@@ -80,7 +81,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
             ExitCode::from(1)
         }
         Err(e) => {
-            eprintln!("banned-words: error: {e}");
+            eprintln!("banned-words: error: {e:#}");
             ExitCode::from(2)
         }
     }
@@ -92,27 +93,24 @@ fn usage() -> ExitCode {
 }
 
 /// Returns the diagnostics and the number of files checked.
-fn check(mode: Mode, list: Option<&Path>) -> Result<(Vec<String>, usize), String> {
+fn check(mode: Mode, list: Option<&Path>) -> anyhow::Result<(Vec<String>, usize)> {
     let root = git::toplevel()?;
     let entries = git::index_entries(&root)?;
 
     let (list_name, list_bytes) = match list {
-        Some(path) => (
-            path.display().to_string(),
-            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
-        ),
+        Some(path) => (path.display().to_string(), read_list_file(path)?),
         None => {
             let entry = entries
                 .iter()
                 .find(|e| e.stage == 0 && e.path == LIST_PATH)
-                .ok_or(format!("{LIST_PATH} is not in the index"))?;
+                .with_context(|| format!("{LIST_PATH} is not in the index"))?;
             let mut blobs = git::read_blobs(&root, &[entry.oid.as_str()])?;
             (LIST_PATH.to_owned(), blobs.remove(0))
         }
     };
     let list_text =
-        String::from_utf8(list_bytes).map_err(|_| format!("{list_name} is not UTF-8"))?;
-    let terms = matcher::parse_list(&list_name, &list_text)?;
+        String::from_utf8(list_bytes).with_context(|| format!("{list_name} is not UTF-8"))?;
+    let terms = matcher::parse_list(&list_name, &list_text).map_err(anyhow::Error::msg)?;
 
     let selected: Vec<&git::Entry> = match mode {
         Mode::All => entries.iter().collect(),
@@ -147,6 +145,11 @@ fn check(mode: Mode, list: Option<&Path>) -> Result<(Vec<String>, usize), String
         ));
     }
     Ok((diagnostics, selected.len()))
+}
+
+/// The list file `--list` names.
+fn read_list_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))
 }
 
 fn is_content_exempt(path: &str) -> bool {
@@ -385,6 +388,23 @@ mod tests {
         let mut late = vec![b'a'; BINARY_SNIFF];
         late.extend_from_slice(b"\nzorblax\0\n");
         assert_eq!(check("late.txt", Some(&late)).len(), 1);
+    }
+
+    #[test]
+    fn unreadable_list_file_keeps_the_io_error_as_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.txt");
+        let e = read_list_file(&path).unwrap_err();
+        let io = e.root_cause().downcast_ref::<std::io::Error>();
+        assert_eq!(
+            io.map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "{e:?}"
+        );
+        assert_eq!(
+            format!("{e:#}"),
+            format!("cannot read {}: {}", path.display(), io.unwrap())
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr as _;
 
+use anyhow::{Context as _, bail};
 use cargo_metadata::diagnostic::DiagnosticLevel;
 use cargo_metadata::{Message, MetadataCommand};
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
@@ -325,14 +326,13 @@ pub const REQUIRED_DISALLOWED: &[(&str, &[&str])] = &[
 
 /// Runs the site check, then the fixture run. Returns one diagnostic per
 /// violation; `Err` when the check could not run.
-pub fn run(manifest: &Path) -> Result<Vec<String>, String> {
-    let metadata = MetadataCommand::new()
-        .cargo_path(crate::cargo())
-        .manifest_path(manifest)
-        .no_deps()
-        .other_options(vec!["--locked".to_owned()])
-        .exec()
-        .map_err(|e| format!("cargo metadata failed: {e}"))?;
+pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
+    let metadata = crate::metadata(
+        MetadataCommand::new()
+            .manifest_path(manifest)
+            .no_deps()
+            .other_options(vec!["--locked".to_owned()]),
+    )?;
     let root = metadata.workspace_root.clone().into_std_path_buf();
     let members: Vec<PathBuf> = metadata
         .workspace_packages()
@@ -356,7 +356,7 @@ pub struct Diag {
 }
 
 /// Runs clippy on the fixture packages with the fixture cfg.
-fn fixture_run(manifest: &Path, root: &Path) -> Result<Vec<Diag>, String> {
+fn fixture_run(manifest: &Path, root: &Path) -> anyhow::Result<Vec<Diag>> {
     let mut cmd = Command::new(crate::cargo());
     cmd.arg("clippy").arg("--manifest-path").arg(manifest);
     for p in FIXTURE_PACKAGES {
@@ -389,10 +389,10 @@ fn fixture_run(manifest: &Path, root: &Path) -> Result<Vec<Diag>, String> {
         }
     }
     if !finished {
-        return Err(format!(
+        bail!(
             "cargo clippy did not finish a build:\n{}",
             String::from_utf8_lossy(&stderr)
-        ));
+        );
     }
     Ok(diags)
 }
@@ -401,13 +401,11 @@ fn fixture_run(manifest: &Path, root: &Path) -> Result<Vec<Diag>, String> {
 /// messages; also returns its standard error. `Command::output` drains both
 /// pipes at once, so a child that fills one while the other is read does
 /// not block.
-fn json_messages(cmd: &mut Command) -> Result<(Vec<Message>, Vec<u8>), String> {
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to run cargo clippy: {e}"))?;
+fn json_messages(cmd: &mut Command) -> anyhow::Result<(Vec<Message>, Vec<u8>)> {
+    let output = cmd.output().context("failed to run cargo clippy")?;
     let messages = Message::parse_stream(output.stdout.as_slice())
         .collect::<Result<_, _>>()
-        .map_err(|e| format!("reading cargo clippy output: {e}"))?;
+        .context("reading cargo clippy output")?;
     Ok((messages, output.stderr))
 }
 
@@ -533,7 +531,7 @@ fn is_summary(d: &Diag) -> bool {
 }
 
 /// The parsed-source site checks of the module docs.
-pub fn check_sites(root: &Path, members: &[PathBuf]) -> Result<Vec<String>, String> {
+pub fn check_sites(root: &Path, members: &[PathBuf]) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     for manifest in members {
         let table = read_toml(manifest)?;
@@ -566,7 +564,7 @@ pub fn check_sites(root: &Path, members: &[PathBuf]) -> Result<Vec<String>, Stri
 }
 
 /// One [`IN_PLAY`] entry.
-fn check_site(root: &Path, site: Site) -> Result<Vec<String>, String> {
+fn check_site(root: &Path, site: Site) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     let (Site::File(file) | Site::Fns(file, _)) = site;
     let (source, tokens) = parse_and_lex(root, file)?;
@@ -612,7 +610,7 @@ fn check_site(root: &Path, site: Site) -> Result<Vec<String>, String> {
 
 /// The two `clippy.toml` files: the same test allowances, all on, and
 /// `eval`'s lists hold every [`REQUIRED_DISALLOWED`] path.
-fn check_clippy_toml(root: &Path) -> Result<Vec<String>, String> {
+fn check_clippy_toml(root: &Path) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     let workspace = read_toml(&root.join(ROOT_CLIPPY_TOML))?;
     let eval = read_toml(&root.join(EVAL_CLIPPY_TOML))?;
@@ -646,7 +644,7 @@ fn check_clippy_toml(root: &Path) -> Result<Vec<String>, String> {
 
 /// The fixture directories hold exactly a `mod.rs` and one file per lint of
 /// [`LINTS`], and no fixture file holds what [`fixture_violation`] rejects.
-fn check_fixture_files(root: &Path) -> Result<Vec<String>, String> {
+fn check_fixture_files(root: &Path) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     let dirs: BTreeSet<&str> = LINTS.iter().map(|&(_, dir)| dir).collect();
     for dir in dirs {
@@ -656,14 +654,14 @@ fn check_fixture_files(root: &Path) -> Result<Vec<String>, String> {
             .map(|&(lint, _)| format!("{lint}.rs"))
             .chain(["mod.rs".to_owned()])
             .collect();
-        let entries = fs::read_dir(root.join(dir)).map_err(|e| format!("reading {dir}: {e}"))?;
+        let entries = fs::read_dir(root.join(dir)).with_context(|| format!("reading {dir}"))?;
         let mut found = BTreeSet::new();
         for entry in entries {
-            let entry = entry.map_err(|e| format!("reading {dir}: {e}"))?;
+            let entry = entry.with_context(|| format!("reading {dir}"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let text = read(&entry.path())?;
             let violation =
-                fixture_violation(&text).map_err(|e| format!("parsing {dir}/{name}: {e}"))?;
+                fixture_violation(&text).with_context(|| format!("parsing {dir}/{name}"))?;
             if let Some(violation) = violation {
                 out.push(format!("{dir}/{name}: {violation}"));
             }
@@ -679,14 +677,14 @@ fn check_fixture_files(root: &Path) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn read(path: &Path) -> Result<String, String> {
-    fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))
+fn read(path: &Path) -> anyhow::Result<String> {
+    fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
 }
 
-fn read_toml(path: &Path) -> Result<toml::Table, String> {
+fn read_toml(path: &Path) -> anyhow::Result<toml::Table> {
     read(path)?
         .parse()
-        .map_err(|e| format!("parsing {}: {e}", path.display()))
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
 fn relative(root: &Path, path: &Path) -> String {
@@ -711,15 +709,15 @@ fn attr_text(attr: &syn::Attribute) -> String {
 
 /// Parses the Rust source file `path`. A file that does not parse fails
 /// the check: it cannot be shown to carry its attributes.
-fn parse_source(root: &Path, path: &str) -> Result<syn::File, String> {
+fn parse_source(root: &Path, path: &str) -> anyhow::Result<syn::File> {
     Ok(parse_and_lex(root, path)?.0)
 }
 
 /// [`parse_source`], and the file's tokens.
-fn parse_and_lex(root: &Path, path: &str) -> Result<(syn::File, TokenStream), String> {
+fn parse_and_lex(root: &Path, path: &str) -> anyhow::Result<(syn::File, TokenStream)> {
     let text = read(&root.join(path))?;
-    let file = syn::parse_file(&text).map_err(|e| format!("parsing {path}: {e}"))?;
-    let tokens = lex(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    let file = syn::parse_file(&text).with_context(|| format!("parsing {path}"))?;
+    let tokens = lex(&text).with_context(|| format!("parsing {path}"))?;
     Ok((file, tokens))
 }
 
@@ -799,8 +797,10 @@ fn type_name(ty: &syn::Type) -> String {
 /// Lexes Rust source `text` into tokens. Comments are dropped, doc comments
 /// become `#[doc = "..."]` attributes, and every literal is one token, so
 /// nothing inside a string or comment is seen as code.
-fn lex(text: &str) -> Result<TokenStream, String> {
-    TokenStream::from_str(text).map_err(|e| e.to_string())
+fn lex(text: &str) -> anyhow::Result<TokenStream> {
+    // `LexError` is neither `Send` nor `Sync`, so `anyhow` cannot hold it as
+    // a source; its text becomes the error.
+    TokenStream::from_str(text).map_err(|e| anyhow::Error::msg(e.to_string()))
 }
 
 /// Calls `f` on every token tree of `tokens`, at any depth, with the trees
@@ -849,7 +849,7 @@ fn is_doc(group: &Group) -> bool {
 /// attribute, or one being built from pieces) other than a doc comment, or
 /// a `macro_rules!` definition, whose expansion could build one. `Err` when
 /// `text` does not lex.
-fn fixture_violation(text: &str) -> Result<Option<String>, String> {
+fn fixture_violation(text: &str) -> anyhow::Result<Option<String>> {
     let mut found = None;
     for_each_tree(lex(text)?, &mut |tree, rest| {
         if found.is_some() {
@@ -1138,7 +1138,32 @@ mod tests {
         assert!(late[0].contains("lacks"), "{late:?}");
         // A file that does not parse fails closed.
         assert!(check_site(dir.path(), Site::Fns("broken.rs", &["f"])).is_err());
-        assert!(check_site(dir.path(), Site::File("broken.rs")).is_err());
+    }
+
+    #[test]
+    fn site_errors_keep_their_cause_as_source() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("broken.rs"), "fn f( {}\n").unwrap();
+        let e = check_site(dir.path(), Site::File("broken.rs")).unwrap_err();
+        let syn = e.root_cause().downcast_ref::<syn::Error>();
+        assert!(syn.is_some(), "{e:?}");
+        assert_eq!(
+            format!("{e:#}"),
+            format!("parsing broken.rs: {}", syn.unwrap())
+        );
+
+        let e = check_site(dir.path(), Site::File("absent.rs")).unwrap_err();
+        let io = e.root_cause().downcast_ref::<std::io::Error>();
+        assert_eq!(
+            io.map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "{e:?}"
+        );
+        let path = dir.path().join("absent.rs");
+        assert_eq!(
+            format!("{e:#}"),
+            format!("reading {}: {}", path.display(), io.unwrap())
+        );
     }
 
     #[test]

@@ -19,6 +19,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use anyhow::Context as _;
+use cargo_metadata::{Metadata, MetadataCommand};
+
 const USAGE: &str = "\
 usage: cargo xtask <command>
 
@@ -61,7 +64,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn report(name: &str, result: Result<Vec<String>, String>) -> ExitCode {
+fn report(name: &str, result: anyhow::Result<Vec<String>>) -> ExitCode {
     match result {
         Ok(diagnostics) if diagnostics.is_empty() => {
             eprintln!("{name}: ok");
@@ -75,7 +78,7 @@ fn report(name: &str, result: Result<Vec<String>, String>) -> ExitCode {
             ExitCode::from(1)
         }
         Err(e) => {
-            eprintln!("{name}: error: {e}");
+            eprintln!("{name}: error: {e:#}");
             ExitCode::from(2)
         }
     }
@@ -92,6 +95,34 @@ fn workspace_manifest() -> PathBuf {
 /// toolchain is used for nested commands.
 fn cargo() -> OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+}
+
+/// Runs `cmd` with [`cargo`], its errors normalized by [`metadata_error`].
+fn metadata(cmd: &mut MetadataCommand) -> anyhow::Result<Metadata> {
+    cmd.cargo_path(cargo())
+        .exec()
+        .map_err(metadata_error)
+        .context("cargo metadata failed")
+}
+
+/// `e` as a chain that prints each cause once. The variants that wrap
+/// another error also write it into their own text, so `{:#}` would print
+/// it twice; they become their own text with the wrapped error as source.
+fn metadata_error(e: cargo_metadata::Error) -> anyhow::Error {
+    use cargo_metadata::Error;
+    match e {
+        Error::Io(e) => anyhow::Error::new(e).context("failed to start `cargo metadata`"),
+        Error::Utf8(e) => {
+            anyhow::Error::new(e).context("cannot convert the stdout of `cargo metadata`")
+        }
+        Error::ErrUtf8(e) => {
+            anyhow::Error::new(e).context("cannot convert the stderr of `cargo metadata`")
+        }
+        Error::Json(e) => {
+            anyhow::Error::new(e).context("failed to interpret `cargo metadata`'s json")
+        }
+        e @ (Error::CargoMetadata { .. } | Error::NoJson) => anyhow::Error::new(e),
+    }
 }
 
 fn usage_error(message: &str) -> ExitCode {
@@ -113,5 +144,28 @@ fn demo_chart(rest: &[OsString]) -> ExitCode {
             eprintln!("demo-chart: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::metadata_error;
+
+    #[test]
+    fn metadata_io_error_prints_its_cause_once() {
+        let io = io::Error::new(io::ErrorKind::NotFound, "no cargo here");
+        let e = metadata_error(cargo_metadata::Error::Io(io)).context("cargo metadata failed");
+        assert_eq!(
+            format!("{e:#}"),
+            "cargo metadata failed: failed to start `cargo metadata`: no cargo here"
+        );
+        assert_eq!(
+            e.root_cause()
+                .downcast_ref::<io::Error>()
+                .map(io::Error::kind),
+            Some(io::ErrorKind::NotFound)
+        );
     }
 }

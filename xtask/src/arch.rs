@@ -20,6 +20,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
 
+use anyhow::{Context as _, bail};
 use cargo_metadata::{
     CargoOpt, DependencyKind, Metadata, MetadataCommand, Package, PackageId, Resolve,
 };
@@ -77,19 +78,18 @@ pub fn is_windows_only(pkg: &Package) -> bool {
 /// Runs every rule against the workspace at `manifest`. `cargo_args` are
 /// passed to each nested cargo call (`--locked`, or `--offline` in tests).
 /// Returns one diagnostic per violation.
-pub fn run(manifest: &Path, cargo_args: &[&str]) -> Result<Vec<String>, String> {
-    let metadata = MetadataCommand::new()
-        .cargo_path(crate::cargo())
-        .manifest_path(manifest)
-        .features(CargoOpt::AllFeatures)
-        .other_options(
-            cargo_args
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect::<Vec<_>>(),
-        )
-        .exec()
-        .map_err(|e| format!("cargo metadata failed: {e}"))?;
+pub fn run(manifest: &Path, cargo_args: &[&str]) -> anyhow::Result<Vec<String>> {
+    let metadata = crate::metadata(
+        MetadataCommand::new()
+            .manifest_path(manifest)
+            .features(CargoOpt::AllFeatures)
+            .other_options(
+                cargo_args
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+    )?;
     let mut diagnostics = check_metadata(&metadata)?;
     for &(package, target) in PRODUCTION {
         diagnostics.extend(check_production_features(
@@ -100,11 +100,11 @@ pub fn run(manifest: &Path, cargo_args: &[&str]) -> Result<Vec<String>, String> 
 }
 
 /// R1, R2, the static half of R3, and R4.
-fn check_metadata(metadata: &Metadata) -> Result<Vec<String>, String> {
+fn check_metadata(metadata: &Metadata) -> anyhow::Result<Vec<String>> {
     let resolve = metadata
         .resolve
         .as_ref()
-        .ok_or("cargo metadata returned no dependency graph")?;
+        .context("cargo metadata returned no dependency graph")?;
     let graph = Graph::new(resolve);
     let members: Vec<&Package> = metadata.workspace_packages();
     let mut diagnostics = Vec::new();
@@ -339,7 +339,7 @@ fn check_production_features(
     package: &str,
     target: &str,
     cargo_args: &[&str],
-) -> Result<Vec<String>, String> {
+) -> anyhow::Result<Vec<String>> {
     let members: HashSet<&str> = metadata
         .workspace_packages()
         .iter()
@@ -359,12 +359,12 @@ fn check_production_features(
         .args(["--format", "{p}|{f}"])
         .args(cargo_args)
         .output()
-        .map_err(|e| format!("failed to run cargo tree: {e}"))?;
+        .context("failed to run cargo tree")?;
     if !output.status.success() {
-        return Err(format!(
+        bail!(
             "cargo tree failed: {}",
             String::from_utf8_lossy(&output.stderr)
-        ));
+        );
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut offenders = BTreeSet::new();
@@ -439,6 +439,24 @@ mod tests {
     #[test]
     fn baseline_is_clean() {
         assert_eq!(check(&baseline()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn missing_manifest_error_keeps_the_cargo_metadata_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = run(&dir.path().join("Cargo.toml"), &["--offline"]).unwrap_err();
+        let text = format!("{e:#}");
+        assert!(
+            text.starts_with("cargo metadata failed: `cargo metadata` exited with an error: "),
+            "{text}"
+        );
+        assert!(
+            matches!(
+                e.root_cause().downcast_ref(),
+                Some(cargo_metadata::Error::CargoMetadata { .. })
+            ),
+            "{e:?}"
+        );
     }
 
     #[test]
