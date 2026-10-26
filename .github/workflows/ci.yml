@@ -61,7 +61,8 @@ jobs:
           # development build takes (the dev-tools tests are the positive
           # control).
           for args in "--dev-tools-probe x" "--dev-scripted-input x" \
-              "play x.bms --dev-scripted-input x" "play x.bms --dev-frames x"; do
+              "play x.bms --dev-scripted-input x" "play x.bms --dev-frames x" \
+              "play x.bms --dev-auto-retry"; do
             arg=$(echo "$args" | grep -o -- "--dev-[a-z-]*")
             set +e
             # shellcheck disable=SC2086 # split into arguments on purpose
