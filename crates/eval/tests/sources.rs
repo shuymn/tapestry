@@ -189,3 +189,38 @@ fn lane_stays_held_while_any_control_holds_it() {
     assert_eq!(step(release(9, 0, 1)), [LaneEdge::Release(l1)]);
     assert!(!c.is_held(l1));
 }
+
+#[test]
+fn two_scratch_controls_held_across_a_retry_combine() {
+    // The scratch's two directions on two controls of one source, both
+    // held when the next play's recording opened: the lane starts held
+    // with no press edge, stays held while either is, and releases with
+    // the second.
+    let mut dev = device(&[0]);
+    dev.sources[0].bindings.push(Binding {
+        control: ControlId(100),
+        lane: lane(0),
+    });
+    let start = InputStart {
+        opened_at: TimeUs(0),
+        held: vec![
+            (SourceId(0), ControlId(0), 1),
+            (SourceId(0), ControlId(100), 1),
+        ],
+    };
+    let mut c = ConversionState::init(&dev, &start).unwrap();
+    let s = lane(0);
+    assert!(c.is_held(s));
+    let set = |control, value| PhysicalInputEvent {
+        received: TimeUs(1),
+        source: SourceId(0),
+        kind: InputKind::Control {
+            control: ControlId(control),
+            value,
+        },
+    };
+    let mut step = |e: PhysicalInputEvent| c.apply(&e, e.received).as_slice().to_vec();
+    assert_eq!(step(set(100, 0)), [], "the other direction still holds it");
+    assert_eq!(step(set(0, 0)), [LaneEdge::Release(s)]);
+    assert_eq!(step(set(100, 1)), [LaneEdge::Press(s)]);
+}

@@ -34,8 +34,8 @@ pub use audio_loop::{
     AudioControl, AudioCtl, AudioWaitError, AudioWorker, SWITCH_TIMEOUT, audio_control,
 };
 pub use keys::{
-    Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, Press, ROLES,
-    Refusal, capture_keys,
+    Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
+    LearntRange, Press, ROLES, Refusal, capture_keys, capture_keys_within,
 };
 pub use live::{Closing, LiveError, Opening, Rig};
 pub use logic::{

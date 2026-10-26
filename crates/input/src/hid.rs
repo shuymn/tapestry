@@ -258,9 +258,6 @@ pub struct HidDevice {
     /// Each axis's net movement since the key config last armed its
     /// capture.
     travel: [i64; MAX_AXES],
-    /// Each axis's lowest and highest value since the key config last
-    /// armed its capture.
-    seen: [Option<(i32, i32)>; MAX_AXES],
     /// The capture's arming the travel counts from.
     armed: u64,
 }
@@ -289,7 +286,6 @@ impl HidDevice {
             pressed: 0,
             values: [None; MAX_AXES],
             travel: [0; MAX_AXES],
-            seen: [None; MAX_AXES],
             armed: 0,
         }
     }
@@ -368,7 +364,6 @@ impl HidDevice {
         if armed != self.armed {
             self.armed = armed;
             self.travel = [0; MAX_AXES];
-            self.seen = [None; MAX_AXES];
         }
         for (i, value) in report.axes.iter().take(self.n_axes).enumerate() {
             let Some(value) = *value else {
@@ -379,8 +374,10 @@ impl HidDevice {
                 // A wrong descriptor: recorded as reported, and counted.
                 sources.axis_value_out_of_range(device);
             }
-            let seen = &mut self.seen[i];
-            *seen = Some(seen.map_or((value, value), |(lo, hi)| (lo.min(value), hi.max(value))));
+            let prev = self.values[i];
+            if !cap.relative && capture.watched() == Some(cap.control) {
+                capture.observe(&cap, prev, value);
+            }
             let moved = if cap.relative {
                 i64::from(value)
             } else {
@@ -400,9 +397,7 @@ impl HidDevice {
             if travel.abs() >= capture_travel(&cap) {
                 *travel = 0;
                 let offer = Packet { value: 1, ..p };
-                // What it reported while being turned may widen its range.
-                let widened = self.seen[i].and_then(|(lo, hi)| widened_wrap(&cap, lo, hi));
-                capture.offer_axis(&offer, recording, widened);
+                capture.offer(&offer, DeviceKind::Controller, recording);
             }
         }
     }
@@ -464,7 +459,7 @@ pub fn read_report<'a>(
 }
 
 /// `d` the short way round `wrap` values; unchanged when `wrap` is 0.
-fn wrapped(d: i64, wrap: u32) -> i64 {
+pub(crate) fn wrapped(d: i64, wrap: u32) -> i64 {
     if wrap == 0 {
         return d;
     }

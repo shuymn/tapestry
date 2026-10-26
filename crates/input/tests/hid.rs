@@ -645,32 +645,61 @@ fn widening_takes_the_smallest_field_span_holding_what_was_seen() {
 }
 
 #[test]
-fn capturing_an_axis_reports_the_range_it_was_seen_in() {
+fn watching_an_axis_learns_its_range_and_its_crossings() {
     let mut set = connected();
     let capture = Capture::new();
-    // Declared -127..=127, turned through -128 during the capture.
+    // Declared -127..=127 in 8 bits; the turntable also reports -128.
     let narrow = [axis_cap(X, true, -127, 127, 8).unwrap()];
     let mut dev = HidDevice::new(PAD, &layout(&narrow));
-    let at = |v| [Some(v)];
-    let turn = |v: i32| HidReport {
-        id: 0,
-        buttons: None,
-        axes: Box::leak(Box::new(at(v))),
+    let values = |vs: &[i32]| -> Vec<[Option<i32>; 1]> { vs.iter().map(|&v| [Some(v)]).collect() };
+    let feed = |dev: &mut HidDevice, set: &mut SourceSet, at, vs: &[[Option<i32>; 1]]| {
+        let reports: Vec<_> = vs
+            .iter()
+            .map(|a| HidReport {
+                id: 0,
+                buttons: None,
+                axes: a,
+            })
+            .collect();
+        batch(dev, set, &capture, at, &reports);
     };
-    // From -112 down to -128: the capture's 16 positions end at -128.
-    batch(&mut dev, &mut set, &capture, 1, &[turn(-112)]);
-    capture.arm();
-    let reports: Vec<_> = (-128..=-113).rev().map(turn).collect();
-    batch(&mut dev, &mut set, &capture, 10, &reports);
-    assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
-    assert_eq!(capture.take_widened(), Some(256));
-    assert_eq!(capture.take_widened(), None);
-    // A genuine 255-position axis turned inside its range keeps it.
-    capture.arm();
-    let reports: Vec<_> = (-127..=127).step_by(4).map(turn).collect();
-    batch(&mut dev, &mut set, &capture, 20, &reports);
-    assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
-    assert_eq!(capture.take_widened(), None);
+    // Not watched: nothing is learnt.
+    feed(&mut dev, &mut set, 1, &values(&[100, 120]));
+    assert_eq!(capture.watch_result(), None);
+    capture.watch(X);
+    assert_eq!(capture.watch_result(), None, "no report since the watch");
+    // Turned forward through the boundary: 127 to -128 to -127.
+    feed(
+        &mut dev,
+        &mut set,
+        2,
+        &values(&[125, 127, -128, -127, -100]),
+    );
+    let w = capture.watch_result().unwrap();
+    assert_eq!(
+        (w.lo, w.hi, w.forward, w.backward),
+        (-128, 127, true, false)
+    );
+    assert_eq!((w.cap.min, w.cap.max, w.cap.bits), (-127, 127, 8));
+    // And back, late: -100 up to -128, then 127.
+    feed(&mut dev, &mut set, 3, &values(&[-120, -128, 127, 120]));
+    let w = capture.watch_result().unwrap();
+    assert!(w.forward && w.backward);
+    assert_eq!(widened_wrap(&w.cap, w.lo, w.hi), Some(256));
+    // A genuine 255-position axis: 127 to -127 is a crossing too, and its
+    // range stays as declared.
+    capture.watch(X);
+    feed(&mut dev, &mut set, 4, &values(&[127, -127, 127]));
+    let w = capture.watch_result().unwrap();
+    assert!(w.forward && w.backward);
+    assert_eq!((w.lo, w.hi), (-127, 127));
+    assert_eq!(widened_wrap(&w.cap, w.lo, w.hi), None);
+    // Another axis, or none watched, is not noted.
+    capture.watch(DIAL);
+    feed(&mut dev, &mut set, 5, &values(&[0, 50]));
+    assert_eq!(capture.watch_result(), None);
+    capture.unwatch();
+    assert_eq!(capture.watched(), None);
 }
 
 #[test]

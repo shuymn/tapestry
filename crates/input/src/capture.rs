@@ -3,11 +3,12 @@
 //! recorded.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use eval::ControlId;
 
 use crate::gate::Packet;
+use crate::hid::{AxisCap, wrapped};
 use crate::sources::DeviceKind;
 
 /// Set in a stored capture: something was captured.
@@ -23,9 +24,40 @@ struct Slot {
     control: AtomicU64,
     /// How many times the slot was armed.
     armings: AtomicU64,
-    /// For a captured axis whose reports went outside its declared range,
-    /// the revolution they call for, plus [`PRESENT`]; 0 otherwise.
-    wrap: AtomicU64,
+    /// The axis watched, plus [`PRESENT`]; 0 when none.
+    watch: AtomicU64,
+    /// Its declared range and field width, from its reports.
+    declared_min: AtomicI64,
+    declared_max: AtomicI64,
+    bits: AtomicU64,
+    /// The lowest and highest values it reported while watched.
+    lo: AtomicI64,
+    hi: AtomicI64,
+    /// [`SEEN`], [`FORWARD`] and [`BACKWARD`].
+    flags: AtomicU64,
+}
+
+/// Set in a watch's flags: the axis reported while watched.
+const SEEN: u64 = 1;
+/// Set in a watch's flags: it crossed its boundary going forward (highest
+/// value to lowest).
+const FORWARD: u64 = 1 << 1;
+/// Set in a watch's flags: it crossed its boundary going backward.
+const BACKWARD: u64 = 1 << 2;
+
+/// What a watched axis showed ([`Capture::watch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Watched {
+    /// Its declared range and field.
+    pub cap: AxisCap,
+    /// The lowest value it reported.
+    pub lo: i32,
+    /// The highest value it reported.
+    pub hi: i32,
+    /// Whether it crossed its boundary going forward.
+    pub forward: bool,
+    /// Whether it crossed its boundary going backward.
+    pub backward: bool,
 }
 
 /// The capture slot shared by the input thread, which offers packets, and
@@ -43,7 +75,6 @@ impl Capture {
     /// Captures the next press, dropping any earlier capture.
     pub fn arm(&self) {
         self.0.armings.fetch_add(1, Ordering::Relaxed);
-        self.0.wrap.store(0, Ordering::Relaxed);
         self.0.control.store(0, Ordering::Relaxed);
         self.0.armed.store(true, Ordering::Release);
     }
@@ -72,27 +103,89 @@ impl Capture {
         Some((ControlId(stored as u32), kind))
     }
 
-    /// For the axis last captured, the revolution its reports during the
-    /// capture call for, when they went outside its declared range
-    /// ([`hid::widened_wrap`](crate::hid::widened_wrap)); taking it clears
-    /// it. Read it after [`take`](Self::take).
-    #[must_use]
-    pub fn take_widened(&self) -> Option<u32> {
-        let stored = self.0.wrap.swap(0, Ordering::Acquire);
-        (stored & PRESENT != 0).then_some(stored as u32)
+    /// Watches the absolute axis `control`: the input thread notes the
+    /// values it reports and whether it crosses its boundary (from its
+    /// highest value to its lowest, or back), so key config learns the
+    /// range it really reports. Watching again starts over.
+    pub fn watch(&self, control: ControlId) {
+        self.0.flags.store(0, Ordering::Relaxed);
+        self.0.lo.store(i64::MAX, Ordering::Relaxed);
+        self.0.hi.store(i64::MIN, Ordering::Relaxed);
+        self.0
+            .watch
+            .store(u64::from(control.0) | PRESENT, Ordering::Release);
     }
 
-    /// Offers a turned controller axis, as [`offer`](Self::offer) offers a
-    /// press, with the revolution `widened` its reports call for, if any.
-    pub fn offer_axis(&self, packet: &Packet, recording_open: bool, widened: Option<u32>) {
-        if recording_open || packet.background {
-            return;
+    /// Stops watching.
+    pub fn unwatch(&self) {
+        self.0.watch.store(0, Ordering::Release);
+    }
+
+    /// The axis watched, if any.
+    #[must_use]
+    pub fn watched(&self) -> Option<ControlId> {
+        let w = self.0.watch.load(Ordering::Acquire);
+        (w & PRESENT != 0).then_some(ControlId(w as u32))
+    }
+
+    /// One report of the watched axis, declared as `cap`, on the input
+    /// thread: `value`, after `prev`. A move the short way round its field
+    /// (2^bits values) that goes the other way than its raw difference
+    /// crossed the boundary.
+    pub fn observe(&self, cap: &AxisCap, prev: Option<i32>, value: i32) {
+        let slot = &self.0;
+        slot.declared_min
+            .store(i64::from(cap.min), Ordering::Relaxed);
+        slot.declared_max
+            .store(i64::from(cap.max), Ordering::Relaxed);
+        slot.bits.store(u64::from(cap.bits), Ordering::Relaxed);
+        slot.lo.fetch_min(i64::from(value), Ordering::Relaxed);
+        slot.hi.fetch_max(i64::from(value), Ordering::Relaxed);
+        let mut flags = SEEN;
+        if let Some(prev) = prev {
+            let raw = i64::from(value) - i64::from(prev);
+            let field = if (1..32).contains(&cap.bits) {
+                1_u32 << cap.bits
+            } else {
+                cap.wrap
+            };
+            let short = wrapped(raw, field);
+            if short > 0 && raw < 0 {
+                flags |= FORWARD;
+            }
+            if short < 0 && raw > 0 {
+                flags |= BACKWARD;
+            }
         }
-        if self.0.armed.load(Ordering::Acquire) {
-            let wrap = widened.map_or(0, |w| u64::from(w) | PRESENT);
-            self.0.wrap.store(wrap, Ordering::Release);
+        slot.flags.fetch_or(flags, Ordering::Release);
+    }
+
+    /// What the watched axis has shown so far; `None` before its first
+    /// report.
+    #[must_use]
+    pub fn watch_result(&self) -> Option<Watched> {
+        let slot = &self.0;
+        let flags = slot.flags.load(Ordering::Acquire);
+        let control = self.watched()?;
+        if flags & SEEN == 0 {
+            return None;
         }
-        self.offer(packet, DeviceKind::Controller, recording_open);
+        let narrow = |a: &AtomicI64| i32::try_from(a.load(Ordering::Relaxed)).unwrap_or(0);
+        let (min, max) = (narrow(&slot.declared_min), narrow(&slot.declared_max));
+        Some(Watched {
+            cap: AxisCap {
+                control,
+                relative: false,
+                wrap: u32::try_from(i64::from(max) - i64::from(min) + 1).unwrap_or(0),
+                min,
+                max,
+                bits: u16::try_from(slot.bits.load(Ordering::Relaxed)).unwrap_or(0),
+            },
+            lo: narrow(&slot.lo),
+            hi: narrow(&slot.hi),
+            forward: flags & FORWARD != 0,
+            backward: flags & BACKWARD != 0,
+        })
     }
 
     /// Offers a packet from a device of `kind` on the input thread. The

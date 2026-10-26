@@ -39,7 +39,7 @@ mod win;
 
 use bms_model::TimeUs;
 
-pub use capture::Capture;
+pub use capture::{Capture, Watched};
 pub use gate::{Admit, DeviceId, FocusGate, FocusLatch, Packet};
 pub use queue::{Overflow, SourceReader, SourceWriter, source_queue};
 pub use scripted::{Action, ScriptItem, ScriptedInput, TimeOverflow, autoplay};

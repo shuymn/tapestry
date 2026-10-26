@@ -5,10 +5,13 @@
 use std::collections::VecDeque;
 
 use eval::ControlId;
+use std::time::Duration;
+
 use game::{
     Bound, DeviceSettings, KeyConfig, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError, KeyScreen,
-    LaneKey, Press, Refusal, Role, capture_keys,
+    LaneKey, Press, Refusal, Role, capture_keys, capture_keys_within,
 };
+use input::hid::axis_cap;
 use input::{Capture, DeviceId, DeviceKind, Packet};
 
 /// One step of the script: a packet offered (kind, control, pressed,
@@ -16,13 +19,17 @@ use input::{Capture, DeviceId, DeviceKind, Packet};
 #[derive(Clone, Copy)]
 enum Step {
     Offer(DeviceKind, u32, bool, bool),
-    /// A controller axis turned far enough to be captured, with the
-    /// revolution its reports during the capture call for.
-    Turn(Option<u32>),
+    /// The scratch axis turned far enough to be captured.
+    Turn,
+    /// A report of the scratch axis, as the input thread passes it to a
+    /// watch.
+    Report(i32),
     Close,
 }
 
-use Step::{Close, Offer, Turn};
+use Step::{Close, Offer, Report, Turn};
+
+const AXIS: u32 = 0x1_0030;
 
 const KB: DeviceKind = DeviceKind::Keyboard;
 const PAD: DeviceKind = DeviceKind::Controller;
@@ -43,6 +50,10 @@ struct Scripted {
     closed: bool,
     /// The role prompted for and the refusal at each show.
     shown: Vec<(Option<Role>, Option<Refusal>)>,
+    /// The scratch axis's last report.
+    last: Option<i32>,
+    /// What the flow had learnt of the scratch axis's range at the end.
+    learnt: Option<game::LearntRange>,
 }
 
 impl Scripted {
@@ -52,6 +63,8 @@ impl Scripted {
             steps: steps.iter().copied().collect(),
             closed: false,
             shown: Vec::new(),
+            last: None,
+            learnt: None,
         }
     }
 }
@@ -59,6 +72,7 @@ impl Scripted {
 impl KeyScreen for Scripted {
     fn show(&mut self, flow: &KeyConfigFlow) {
         self.shown.push((flow.role(), flow.refused()));
+        self.learnt = flow.learnt();
     }
 
     fn wait(&mut self) {
@@ -72,14 +86,22 @@ impl KeyScreen for Scripted {
                 };
                 self.capture.offer(&packet, kind, recording);
             }
-            Some(Turn(widened)) => {
+            Some(Turn) => {
                 let packet = Packet {
                     device: DeviceId(3),
-                    control: ControlId(0x1_0030),
+                    control: ControlId(AXIS),
                     value: 1,
                     background: false,
                 };
-                self.capture.offer_axis(&packet, false, widened);
+                self.capture.offer(&packet, PAD, false);
+            }
+            Some(Report(value)) => {
+                // Declared -127..=127 in 8 bits.
+                let cap = axis_cap(ControlId(AXIS), true, -127, 127, 8).unwrap();
+                if self.capture.watched() == Some(cap.control) {
+                    self.capture.observe(&cap, self.last, value);
+                }
+                self.last = Some(value);
             }
             Some(Close) => self.closed = true,
             // A script that runs out never ends the screen: fail instead.
@@ -123,10 +145,13 @@ fn run(steps: &[Step]) -> (KeyConfigEnd, Scripted) {
 fn key_config_capture_binds_next_press() {
     let steps = [
         // Scratch: a release and a press while recording is open are not
-        // captured; then a controller button.
+        // captured; then a controller button, one direction. Its other
+        // direction: the same button again is refused; another binds.
         Offer(KB, 0x10, false, false),
         Offer(KB, 0x11, true, true),
         button(30),
+        button(30),
+        button(29),
         // Key 1: the same button again is refused; a keyboard key binds.
         button(30),
         key(0x1e),
@@ -168,7 +193,7 @@ fn key_config_capture_binds_next_press() {
                     quit: Some(0x39),
                 },
                 controller: KeyConfig {
-                    lanes: vec![lane(30, 0), lane(31, 7)],
+                    lanes: vec![lane(30, 0), lane(29, 0), lane(31, 7)],
                     retry: None,
                     quit: None,
                 },
@@ -197,6 +222,8 @@ fn key_config_capture_binds_next_press() {
             (Some(l(0)), None),
             (Some(l(0)), None),
             (Some(l(0)), None),
+            (Some(l(0)), None),
+            (Some(l(0)), overlap(30, l(0), l(0))),
             (Some(l(1)), None),
             (Some(l(1)), overlap(30, l(0), l(1))),
             (Some(l(2)), None),
@@ -319,30 +346,118 @@ fn keep_the_rest() -> Vec<Step> {
     vec![key(0x58); 9]
 }
 
+/// Runs `steps` with `limit` for the range learning.
+fn run_within(steps: &[Step], limit: Duration) -> (KeyConfigEnd, Scripted) {
+    let capture = Capture::new();
+    let mut screen = Scripted::new(&capture, steps);
+    let end = capture_keys_within(&capture, &mut screen, current(), limit);
+    (end, screen)
+}
+
+const HOUR: Duration = Duration::from_secs(3_600);
+
 #[test]
-fn a_scratch_axis_seen_beyond_its_range_widens_its_revolution() {
-    // Captured for the scratch while reporting beyond its declared range:
-    // the key config ends with the widened revolution to save.
-    let mut steps = vec![Turn(Some(256))];
+fn an_axis_covers_both_directions_and_learns_its_range() {
+    // Turned for the scratch: no second prompt. Then turned through its
+    // boundary forward, and only late backward; it reported -128 under
+    // its declared -127..=127, so it is played with 256 values.
+    let mut steps = vec![Report(100), Turn];
+    steps.extend([110, 127, -128, -120, -60, 0, 60].map(Report));
+    steps.extend([-90, -127, -128, 127, 110].map(Report));
     steps.extend(keep_the_rest());
-    let (end, _) = run(&steps);
+    let (end, screen) = run_within(&steps, HOUR);
     let KeyConfigEnd::Done(keys, widened) = end else {
         panic!("{end:?}");
     };
-    assert_eq!(keys.controller.lanes[0].control, 0x1_0030);
+    assert_eq!(
+        keys.controller.lanes,
+        [LaneKey {
+            control: AXIS,
+            lane: 0
+        }]
+    );
     assert_eq!(widened, Some(256));
-    // Inside its range, or a button at the scratch prompt: nothing.
-    let mut steps = vec![Turn(None)];
+    assert_eq!(
+        screen.learnt,
+        Some(game::LearntRange {
+            declared: (-127, 127),
+            observed: (-128, 127),
+            wrap: 256,
+            widened: true,
+        })
+    );
+}
+
+#[test]
+fn a_genuine_255_position_axis_keeps_its_range() {
+    // Crossing 127 to -127 both ways, never beyond: nothing to save.
+    let mut steps = vec![Report(0), Turn];
+    steps.extend([100, 127, -127, -100, -127, 127].map(Report));
     steps.extend(keep_the_rest());
-    assert!(matches!(run(&steps).0, KeyConfigEnd::Done(_, None)));
-    // An axis captured for another lane widens nothing: only the scratch
-    // prompt decides.
-    let mut steps = vec![button(30), Turn(Some(256))];
-    steps.extend(vec![key(0x58); 8]);
+    let (end, screen) = run_within(&steps, HOUR);
+    assert!(matches!(end, KeyConfigEnd::Done(_, None)), "{end:?}");
+    assert_eq!(
+        screen.learnt.map(|l| (l.wrap, l.widened)),
+        Some((255, false))
+    );
+}
+
+#[test]
+fn learning_ends_on_f12_or_at_its_time_limit() {
+    // F12 while turning: decided from what it reported so far.
+    let mut steps = vec![Report(0), Turn, Report(-128), key(0x58)];
+    steps.extend(keep_the_rest());
+    let (end, screen) = run_within(&steps, HOUR);
+    assert!(matches!(end, KeyConfigEnd::Done(_, Some(256))), "{end:?}");
+    assert_eq!(screen.learnt.map(|l| l.observed), Some((-128, -128)));
+    // Out of time at once: decided after one wait, from nothing seen.
+    let mut steps = vec![Report(0), Turn, Close];
+    steps.extend(keep_the_rest());
+    let (end, _) = run_within(&steps[..3], Duration::ZERO);
+    assert_eq!(end, KeyConfigEnd::Closed);
+    let mut steps = vec![Report(0), Turn, Report(5)];
+    steps.extend(keep_the_rest());
+    let (end, screen) = run_within(&steps, Duration::ZERO);
+    assert!(matches!(end, KeyConfigEnd::Done(_, None)), "{end:?}");
+    assert_eq!(
+        screen.learnt.map(|l| (l.observed, l.wrap)),
+        Some(((5, 5), 255))
+    );
+    // Escape while turning cancels.
+    let (end, _) = run_within(&[Report(0), Turn, key(0x01)], HOUR);
+    assert_eq!(end, KeyConfigEnd::Cancelled);
+}
+
+#[test]
+fn a_button_or_key_scratch_is_asked_for_both_directions() {
+    // Two buttons: both on lane 0.
+    let mut steps = vec![button(40), button(41)];
+    steps.extend(vec![key(0x58); 9]);
     let (end, _) = run(&steps);
-    let KeyConfigEnd::Done(keys, widened) = end else {
+    let KeyConfigEnd::Done(keys, None) = end else {
         panic!("{end:?}");
     };
-    assert_eq!(keys.controller.lanes[1].control, 0x1_0030);
-    assert_eq!(widened, None);
+    let lane = |control, lane| LaneKey { control, lane };
+    assert_eq!(keys.controller.lanes, [lane(40, 0), lane(41, 0)]);
+    // A key, then F12 for none: one direction only.
+    let mut steps = vec![key(0x36), key(0x58)];
+    steps.extend(vec![key(0x58); 9]);
+    let (end, _) = run(&steps);
+    let KeyConfigEnd::Done(keys, None) = end else {
+        panic!("{end:?}");
+    };
+    assert_eq!(
+        keys.keyboard.lanes.iter().filter(|k| k.lane == 0).count(),
+        1
+    );
+    // A duplicate in the second prompt is refused.
+    let mut flow = KeyConfigFlow::new(current());
+    let b = Bound {
+        kind: PAD,
+        control: 40,
+    };
+    assert_eq!(flow.press(b), Press::Bound(Role::Lane(0), vec![b]));
+    assert!(flow.other_direction());
+    assert!(matches!(flow.press(b), Press::Refused(_)));
+    assert!(flow.other_direction());
 }
