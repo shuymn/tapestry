@@ -72,6 +72,7 @@ fn dev_scripted_input_is_unknown_without_feature() {
         "--dev-scripted-input",
     );
     assert_unknown(&["play", "a.bms", "--dev-frames", "x"], "--dev-frames");
+    assert_unknown(&["play", "a.bms", "--dev-auto-retry"], "--dev-auto-retry");
 }
 
 #[test]
@@ -110,6 +111,7 @@ fn dev_options_are_taken_with_the_feature() {
     for extra in [
         vec!["--dev-scripted-input".as_ref(), log.as_os_str()],
         vec!["--dev-frames".as_ref(), dir.path().as_os_str()],
+        vec!["--dev-auto-retry".as_ref()],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
             .arg("play")

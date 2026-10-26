@@ -104,16 +104,23 @@ pub fn script(log: &Path) -> Result<ScriptedInput, String> {
 /// Reads `path` if it holds at most `limit` bytes, reading no more than one
 /// byte past the limit: an input log is untrusted (D14).
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    let fail = |e: String| format!("{}: {e}", path.display());
+    let file = fs::File::open(path).map_err(|e| fail(e.to_string()))?;
+    read_limited(file, limit).map_err(fail)
+}
+
+/// Everything `reader` holds if it is at most `limit` bytes, reading at most
+/// one byte past the limit.
+fn read_limited(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-    let fail = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|f| f.take(limit as u64 + 1).read_to_end(&mut bytes))
-        .map_err(fail)?;
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
     if bytes.len() > limit {
         return Err(format!(
-            "{}: larger than {limit} bytes, the largest input log accepted",
-            path.display()
+            "larger than {limit} bytes, the largest input log accepted"
         ));
     }
     Ok(bytes)
@@ -334,16 +341,33 @@ fn crc32(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{adler32, crc32, png, read_bounded};
+    use super::{adler32, crc32, png, read_bounded, read_limited};
+
+    /// A 1 MB source that counts the bytes taken from it.
+    struct Counted<'a>(&'a std::cell::Cell<u64>);
+
+    impl std::io::Read for Counted<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = 1_000_000 - self.0.get();
+            let n = buf.len().min(usize::try_from(left).unwrap());
+            buf[..n].fill(7);
+            self.0.set(self.0.get() + n as u64);
+            Ok(n)
+        }
+    }
 
     #[test]
     fn a_log_over_the_limit_is_refused_after_reading_one_byte_more() {
+        let taken = std::cell::Cell::new(0);
+        let e = read_limited(Counted(&taken), 10).unwrap_err();
+        assert!(e.contains("larger than 10 bytes"), "{e}");
+        assert_eq!(taken.get(), 11);
+        assert_eq!(read_limited(&[7_u8; 11][..], 11).unwrap().len(), 11);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.tprl");
         std::fs::write(&path, [7_u8; 11]).unwrap();
-        assert_eq!(read_bounded(&path, 11).unwrap().len(), 11);
         let e = read_bounded(&path, 10).unwrap_err();
-        assert!(e.contains("larger than 10 bytes"), "{e}");
+        assert!(e.contains("big.tprl: larger than 10 bytes"), "{e}");
     }
 
     #[test]

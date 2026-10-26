@@ -208,3 +208,40 @@ fn an_invalid_key_config_exits_nonzero() {
     assert!(stderr.contains("the play cannot start"), "{stderr}");
     assert!(!appdata.join("tapestry").join("records").exists());
 }
+
+/// With `--dev-auto-retry` the run retries once by itself: the retried
+/// play replays the log from its start on devices in their first state, so
+/// both plays hit every note, and both are saved.
+#[test]
+fn an_auto_retried_scripted_play_replays_the_log_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let charts = dir.path().join("chart");
+    fs::create_dir_all(&charts).unwrap();
+    let chart_path = charts.join("scripted.bms");
+    fs::write(&chart_path, CHART).unwrap();
+    write_click(&charts.join("click.wav"));
+    let chart = bms_parser::load_bms(CHART.as_bytes(), &charts, &Default::default())
+        .unwrap()
+        .chart;
+    let log = dir.path().join("input.tprl");
+    write_log(&chart, &log);
+    let appdata = dir.path().join("appdata");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("play")
+        .arg(&chart_path)
+        .arg("--dev-scripted-input")
+        .arg(&log)
+        .arg("--dev-auto-retry")
+        .env("LOCALAPPDATA", &appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    for play in [1, 2] {
+        let line = format!("play {play}: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0");
+        assert!(stdout.contains(&line), "{line} in {stdout}");
+    }
+    assert!(stdout.contains("retry "), "{stdout}");
+    assert_eq!(records(&appdata).len(), 2);
+}

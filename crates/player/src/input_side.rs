@@ -130,7 +130,19 @@ pub enum Mode {
     Clock,
     /// A script on the play's timeline, polled with the play's time.
     #[cfg(feature = "dev-tools")]
-    Script(input::ScriptedInput),
+    Script(Box<Script>),
+}
+
+/// A recorded play replayed by every play of the run: each play starts from
+/// the log's first item, on a source set in its initial state.
+#[cfg(feature = "dev-tools")]
+pub struct Script {
+    /// The log as a script, never polled.
+    pub log: input::ScriptedInput,
+    /// The current play's copy.
+    pub current: input::ScriptedInput,
+    /// The source set's sizes, for a fresh one at each play.
+    pub sources: input::SourceConfig,
 }
 
 /// The input thread's end: called at every boundary between batches.
@@ -177,7 +189,7 @@ impl Hook {
     pub fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) {
         #[cfg(feature = "dev-tools")]
         if let (Mode::Script(script), Some(origin)) = (&mut self.mode, self.origin) {
-            input::InputAdapter::poll(script, TimeUs(now.0 - origin.0), sources);
+            input::InputAdapter::poll(&mut script.current, TimeUs(now.0 - origin.0), sources);
         }
         while let Ok(request) = self.requests.try_recv() {
             let reply = match request {
@@ -240,10 +252,14 @@ impl Hook {
             }
             #[cfg(feature = "dev-tools")]
             Mode::Script(script) => {
-                // The script's devices connect, with their recorded
-                // controls, before the opening.
+                // The log again from its start, on devices as they were
+                // before it: they connect, with their recorded controls,
+                // before the opening.
+                script.current = script.log.clone();
+                *sources = SourceSet::new(script.sources.clone())
+                    .expect("the run's source set was made with these sizes");
                 let open_at = TimeUs(-lead_in.0);
-                input::InputAdapter::poll(script, TimeUs(open_at.0 - 1), sources);
+                input::InputAdapter::poll(&mut script.current, TimeUs(open_at.0 - 1), sources);
                 reset_gate(sources, &self.controls);
                 sources.open_recording(open_at)
             }

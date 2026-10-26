@@ -33,18 +33,19 @@ pub trait Screen: Send {
     fn wait(&self) -> bool;
     /// Whether [`wait`](Self::wait) paces frames.
     fn paced(&self) -> bool;
-    /// Draws one play frame.
+    /// Draws one play frame; `Ok(false)` when it was not presented (the
+    /// swap chain image timed out or the window is occluded).
     ///
     /// # Errors
     ///
     /// Why the frame failed: the screen must be built again.
-    fn frame(&mut self, f: &FrameInput<'_>) -> Result<(), String>;
-    /// Draws lines of text.
+    fn frame(&mut self, f: &FrameInput<'_>) -> Result<bool, String>;
+    /// Draws lines of text, as [`frame`](Self::frame).
     ///
     /// # Errors
     ///
     /// As [`frame`](Self::frame).
-    fn text(&mut self, lines: &[&str]) -> Result<(), String>;
+    fn text(&mut self, lines: &[&str]) -> Result<bool, String>;
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
@@ -63,13 +64,15 @@ impl Screen for Renderer {
         self.has_frame_waitable()
     }
 
-    fn frame(&mut self, f: &FrameInput<'_>) -> Result<(), String> {
-        Self::frame(self, f).map(|_| ()).map_err(|e| e.to_string())
+    fn frame(&mut self, f: &FrameInput<'_>) -> Result<bool, String> {
+        Self::frame(self, f)
+            .map(|t| t.presented)
+            .map_err(|e| e.to_string())
     }
 
-    fn text(&mut self, lines: &[&str]) -> Result<(), String> {
+    fn text(&mut self, lines: &[&str]) -> Result<bool, String> {
         self.text_frame(lines)
-            .map(|_| ())
+            .map(|t| t.presented)
             .map_err(|e| e.to_string())
     }
 
@@ -295,12 +298,10 @@ impl Run {
                         first: true,
                     };
                 }
-                Ok(RenderMsg::Text(lines)) => {
-                    if self.screen.is_none() {
-                        self.screen = build(&mut self.make, &self.chart).ok();
-                    }
-                    mode = Mode::Text(lines);
-                }
+                // Without a screen (it failed), the failure stays reported
+                // and nothing is drawn: the game builds the screen again
+                // through a preparation, which can fail.
+                Ok(RenderMsg::Text(lines)) => mode = Mode::Text(lines),
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
@@ -333,8 +334,9 @@ impl Run {
                         effects: &effects,
                         gauge: *gauge,
                     };
-                    let drawn = screen.frame(&f).map(|()| Some(now));
-                    if drawn.is_ok() && *first {
+                    let drawn = screen.frame(&f).map(|presented| (presented, Some(now)));
+                    // The first frame that reached the screen.
+                    if matches!(drawn, Ok((true, _))) && *first {
                         *first = false;
                         self.shared
                             .first_frame
@@ -344,11 +346,12 @@ impl Run {
                 }
                 Mode::Text(lines) => {
                     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-                    screen.text(&refs).map(|()| None)
+                    screen.text(&refs).map(|presented| (presented, None))
                 }
             };
             match drawn {
-                Ok(play) => self.frames.frame(screen.as_ref(), play),
+                Ok((true, play)) => self.frames.frame(screen.as_ref(), play),
+                Ok((false, _)) => {}
                 Err(e) => {
                     eprintln!("render: {e}");
                     self.screen = None;
@@ -377,18 +380,24 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    use bms_model::{Chart, ChartBuilder, TimeUs};
-    use input::QpcClock;
+    use bms_model::{Chart, ChartBuilder, Lane, TimeSource, TimeUs};
+    use eval::{DeviceProfile, InputStart};
+    use game::{Logic, LogicConfig};
+    use input::{QpcClock, SourceReader};
     use render::FrameInput;
 
-    use super::{NoFrames, RenderMsg, Screen, View, spawn};
+    use super::{MakeScreen, NoFrames, RenderMsg, Screen, View, spawn};
 
-    /// A screen whose third text frame fails.
+    /// A screen whose third text frame fails, and whose play frames are
+    /// presented only from the fourth on, when it notes the clock.
     struct Flaky {
-        frames: u32,
+        text_frames: u32,
+        play_frames: u32,
+        clock: QpcClock,
+        presented_at: Arc<AtomicI64>,
     }
 
     impl Screen for Flaky {
@@ -401,15 +410,25 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<(), String> {
-            Ok(())
+        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<bool, String> {
+            self.play_frames += 1;
+            let presented = self.play_frames >= 4;
+            if presented {
+                let _ = self.presented_at.compare_exchange(
+                    i64::MIN,
+                    self.clock.now().0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            Ok(presented)
         }
-        fn text(&mut self, _lines: &[&str]) -> Result<(), String> {
-            self.frames += 1;
-            if self.frames == 3 {
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
+            self.text_frames += 1;
+            if self.text_frames == 3 {
                 Err("surface lost".to_owned())
             } else {
-                Ok(())
+                Ok(true)
             }
         }
         #[cfg(feature = "dev-tools")]
@@ -429,32 +448,55 @@ mod tests {
         false
     }
 
-    #[test]
-    fn a_failed_frame_is_reported_and_the_screen_built_again_or_the_run_ends() {
-        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
-        // Builds: the first at startup, the second after the failure; the
-        // third build fails.
+    fn view() -> View {
+        View {
+            display_offset: TimeUs(0),
+            visible_time: TimeUs(600_000),
+            effects: 16,
+        }
+    }
+
+    /// Builds up to `ok` screens, then fails; counts the builds.
+    fn factory(
+        ok: u32,
+        clock: QpcClock,
+        presented_at: &Arc<AtomicI64>,
+    ) -> (Arc<AtomicU32>, MakeScreen) {
         let builds = Arc::new(AtomicU32::new(0));
         let counter = Arc::clone(&builds);
+        let presented_at = Arc::clone(presented_at);
         let make = Box::new(move || {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if n <= 2 {
-                Ok(Box::new(Flaky { frames: 0 }) as Box<dyn Screen>)
+            if n <= ok {
+                Ok(Box::new(Flaky {
+                    text_frames: 0,
+                    play_frames: 0,
+                    clock,
+                    presented_at: Arc::clone(&presented_at),
+                }) as Box<dyn Screen>)
             } else {
                 Err(format!("build {n} failed"))
             }
         });
-        let view = View {
-            display_offset: TimeUs(0),
-            visible_time: TimeUs(600_000),
-            effects: 16,
-        };
-        let link = spawn(make, chart, QpcClock::start(), view, Box::new(NoFrames)).unwrap();
+        (builds, make)
+    }
+
+    #[test]
+    fn a_failed_frame_is_reported_and_only_a_preparation_builds_again() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let clock = QpcClock::start();
+        let presented = Arc::new(AtomicI64::new(i64::MIN));
+        let (builds, make) = factory(2, clock, &presented);
+        let link = spawn(make, chart, clock, view(), Box::new(NoFrames)).unwrap();
         assert!(!link.failed());
         link.send(RenderMsg::Text(vec!["A".to_owned()]));
         assert!(wait_until(|| link.failed()), "the failure was not reported");
+        // More text without a screen builds nothing and stays failed.
+        link.send(RenderMsg::Text(vec!["A".to_owned()]));
+        std::thread::sleep(Duration::from_millis(100));
         assert_eq!(builds.load(Ordering::SeqCst), 1);
-        // The next play's preparation builds the screen again.
+        assert!(link.failed());
+        // The next preparation builds the screen again.
         assert_eq!(link.prepare(), Ok(()));
         assert!(!link.failed());
         assert_eq!(builds.load(Ordering::SeqCst), 2);
@@ -462,6 +504,51 @@ mod tests {
         assert!(wait_until(|| link.failed()));
         // Building again fails: the preparation reports it.
         assert_eq!(link.prepare(), Err("build 3 failed".to_owned()));
+        link.exit();
+    }
+
+    #[test]
+    fn the_first_frame_is_the_first_presented_one() {
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let rule = rules::custom();
+        let device = DeviceProfile::default();
+        let (_logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let clock = QpcClock::start();
+        let presented = Arc::new(AtomicI64::new(i64::MIN));
+        let (_builds, make) = factory(1, clock, &presented);
+        let link = spawn(
+            make,
+            Arc::new(chart.clone()),
+            clock,
+            view(),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.send(RenderMsg::Play {
+            origin: clock.now(),
+            side,
+            gauge: 0,
+        });
+        assert!(wait_until(|| link.first_frame().is_some()));
+        let first = link.first_frame().unwrap().0;
+        let at = presented.load(Ordering::Acquire);
+        assert_ne!(at, i64::MIN);
+        assert!(first >= at, "first frame at {first}, presented at {at}");
         link.exit();
     }
 }

@@ -49,8 +49,6 @@ pub struct PlayerRig<'a> {
     pub input_offset_us: i64,
     /// The end screen's key names.
     pub hints: Hints,
-    /// The preset's gauges, for the end screen.
-    pub preset: rules::RulePreset,
     /// The latest retry taken, by its receipt time: the next play starts
     /// from it.
     pub pending_retry: Option<TimeUs>,
@@ -236,13 +234,7 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn show_end(&mut self, report: &PlayReport) {
-        let lines = end_screen::lines(
-            report,
-            &self.preset,
-            self.input_offset_us,
-            self.times,
-            &self.hints,
-        );
+        let lines = end_screen::lines(report, self.input_offset_us, self.times, &self.hints);
         self.render.send(RenderMsg::Text(lines));
         #[cfg(feature = "dev-tools")]
         if self.auto_retries > 0 {

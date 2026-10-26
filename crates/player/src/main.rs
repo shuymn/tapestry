@@ -184,15 +184,18 @@ fn load(chart: &Path, receive: ReceiveMethod) -> Result<Loaded, String> {
 }
 
 /// The source set: up to 16 devices kept, 8 taking part in a play.
-fn sources() -> SourceSet {
-    SourceSet::new(SourceConfig {
+fn source_config() -> SourceConfig {
+    SourceConfig {
         max_devices: 16,
         max_sources: 8,
         max_held: 32,
         queue_capacity: 4_096,
         max_arrivals: 16,
-    })
-    .expect("8 sources are within the limit")
+    }
+}
+
+fn sources() -> SourceSet {
+    SourceSet::new(source_config()).expect("8 sources are within the limit")
 }
 
 /// Loads the bank at the output's rate and hands the engine to the audio
@@ -252,7 +255,6 @@ fn rig<'a>(
         gauge: loaded.settings().player.displayed_gauge,
         input_offset_us: device.input_offset_us,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
-        preset: loaded.preset().clone(),
         pending_retry: None,
         retry_from: None,
         times: LoadTimes::default(),
@@ -394,7 +396,12 @@ fn scripted(
     let audio = start_engine(&loaded, audio, opened)?;
     let sources = sources();
     controls.set_latch(sources.gate().handle());
-    let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Script(script));
+    let script = input_side::Script {
+        log: script.clone(),
+        current: script,
+        sources: source_config(),
+    };
+    let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Script(Box::new(script)));
     let script_thread = dev::ScriptThread::spawn(clock, sources, hook)?;
     let dump: Box<dyn render_side::FrameSink> = match frames {
         Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(last_note.0 / 2))),

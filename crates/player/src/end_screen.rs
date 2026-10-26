@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use game::{AbortCause, PlayEnd, PlayReport};
-use rules::{GaugeValue, RulePreset};
+use rules::GaugeValue;
 
 /// How long loading took, shown on the end screen (D11).
 #[derive(Clone, Copy, Debug, Default)]
@@ -80,11 +80,11 @@ fn cause(c: AbortCause) -> &'static str {
     }
 }
 
-/// The end screen's lines. `input_offset_us` is the input offset the play
+/// The end screen's lines, the gauges named by the preset the play was
+/// evaluated under. `input_offset_us` is the input offset the play
 /// used, to which the recommendation adds the median deviation.
 pub fn lines(
     report: &PlayReport,
-    preset: &RulePreset,
     input_offset_us: i64,
     times: LoadTimes,
     hints: &Hints,
@@ -112,7 +112,7 @@ pub fn lines(
                 "EMPTY POOR {}  LN BREAKS {}",
                 t.empty_poor, t.ln_breaks
             ));
-            for (g, rule) in e.gauges.iter().zip(&preset.gauges) {
+            for (g, rule) in e.gauges.iter().zip(&report.preset.gauges) {
                 let v = g.value.0;
                 l.push(format!(
                     "GAUGE {} {}.{:03}%  {}",
@@ -217,5 +217,81 @@ mod tests {
         assert_eq!(ms(-3_249), "-3.2");
         assert_eq!(ms(-999), "-0.9");
         assert_eq!(ms(12_000), "+12.0");
+    }
+
+    /// A completed play's report under `preset`, with one gauge result per
+    /// preset gauge at 61.234 %.
+    fn report(preset: rules::RulePreset) -> game::PlayReport {
+        use eval::{Evaluation, GaugeResult, Tally};
+        use rules::{GaugeValue, PerJudgment};
+        let tally = Tally {
+            counts: PerJudgment {
+                perfect: 3,
+                great: 5,
+                good: 7,
+                bad: 11,
+                poor: 13,
+            },
+            ex_score: 11,
+            bp: 24,
+            combo: 2,
+            max_combo: 4,
+            empty_poor: 6,
+            ln_breaks: 8,
+        };
+        let gauges = preset
+            .gauges
+            .iter()
+            .map(|_| GaugeResult {
+                value: GaugeValue(6_123_400),
+                reference: GaugeValue(6_123_400),
+                failed_at: None,
+                cleared: false,
+                history: Vec::new(),
+            })
+            .collect();
+        game::PlayReport {
+            attempt: 2,
+            end: game::PlayEnd::Completed,
+            tail_cut: None,
+            reload_error: None,
+            output_error: None,
+            live: Vec::new(),
+            tally,
+            displayed_gauge: game::GaugeIndex(0),
+            record: None,
+            saved: None,
+            result: Some(game::ResultSummary {
+                evaluation: Ok(Evaluation {
+                    events: Vec::new(),
+                    tally,
+                    gauges,
+                    completed: true,
+                }),
+                matches_live: true,
+                recommended_offset: None,
+            }),
+            preset,
+        }
+    }
+
+    #[test]
+    fn gauges_are_named_by_the_preset_the_play_used() {
+        let mut preset = rules::custom();
+        let ids: Vec<String> = preset.gauges.iter().map(|g| g.id.clone()).collect();
+        assert!(!ids.is_empty());
+        for g in &mut preset.gauges {
+            g.id = format!("{}-renamed", g.id);
+        }
+        let hints = super::Hints::new(Some(0x0E), Some(0x01));
+        let lines = super::lines(&report(preset), 0, super::LoadTimes::default(), &hints);
+        for id in &ids {
+            let named = format!("GAUGE {}-RENAMED 61.234%", id.to_uppercase());
+            assert!(
+                lines.iter().any(|l| l.starts_with(&named)),
+                "{named} in {lines:?}"
+            );
+        }
+        assert_eq!(lines.last().unwrap(), "BACKSPACE: RETRY    ESCAPE: QUIT");
     }
 }
