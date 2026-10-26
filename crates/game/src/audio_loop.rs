@@ -23,8 +23,9 @@ use crate::sound::{AudioQueue, audio_link};
 /// Control messages a play sends at most (start, cancel or seal, and one
 /// to spare), times the plays that may queue before the audio thread wakes.
 const CONTROL_CAPACITY: usize = 16;
-/// Retired queues waiting for the game thread.
-const RETIRED_CAPACITY: usize = 8;
+/// Retired queues waiting for the game thread: one, since a play is
+/// started only once the queue the previous start retired has come back.
+const RETIRED_CAPACITY: usize = 1;
 
 /// What the game thread tells the audio thread.
 #[derive(Debug)]
@@ -59,6 +60,8 @@ struct Shared {
 pub struct AudioControl {
     ctl: rtrb::Producer<AudioCtl>,
     retired: rtrb::Consumer<AudioQueue>,
+    /// Whether a start was sent whose retired queue has not come back.
+    in_flight: bool,
     shared: Arc<Shared>,
     generation: u64,
 }
@@ -74,6 +77,8 @@ pub struct AudioWorker {
     generation: u64,
     sealed: bool,
     exited: bool,
+    /// A retired queue the full return queue did not take.
+    unreturned: Option<AudioQueue>,
 }
 
 /// The two ends around `engine`, which is stopped until the first play.
@@ -87,6 +92,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         AudioControl {
             ctl: ctl_tx,
             retired: ret_rx,
+            in_flight: false,
             shared: Arc::clone(&shared),
             generation: 0,
         },
@@ -100,6 +106,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
             generation: 0,
             sealed: false,
             exited: false,
+            unreturned: None,
         },
     )
 }
@@ -115,8 +122,20 @@ impl AudioControl {
     }
 
     /// Starts a play; the queues retired by earlier plays are dropped here.
+    /// One play switch is in flight at most: the previous start's retired
+    /// queue comes back before the next start is sent, so the return
+    /// queue always has room and the audio thread never frees one.
     pub fn play(&mut self, origin: TimeUs, queue: AudioQueue) {
-        while self.retired.pop().is_ok() {}
+        if self.in_flight {
+            loop {
+                if let Ok(retired) = self.retired.pop() {
+                    drop(retired);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+        }
+        self.in_flight = true;
         self.generation += 1;
         let generation = self.generation;
         self.send(AudioCtl::Play {
@@ -158,6 +177,11 @@ impl AudioControl {
 impl AudioWorker {
     /// Takes every control message; returns `false` once told to exit.
     fn control(&mut self) -> bool {
+        if let Some(old) = self.unreturned.take()
+            && let Err(rtrb::PushError::Full(old)) = self.retired.push(old)
+        {
+            self.unreturned = Some(old);
+        }
         while let Ok(msg) = self.ctl.pop() {
             match msg {
                 AudioCtl::Play {
@@ -167,11 +191,12 @@ impl AudioWorker {
                 } => {
                     self.engine.restart(origin);
                     let old = std::mem::replace(&mut self.queue, queue);
-                    // The game thread drains the return queue at every play,
-                    // so it has room; if not, the queue is leaked rather
-                    // than freed here.
+                    // The return queue has room: the game thread took the
+                    // previous start's queue before sending this one. Were
+                    // it full, the queue would wait here, still owned,
+                    // rather than be freed on this thread.
                     if let Err(rtrb::PushError::Full(old)) = self.retired.push(old) {
-                        std::mem::forget(old);
+                        self.unreturned = Some(old);
                     }
                     self.generation = generation;
                     self.sealed = false;

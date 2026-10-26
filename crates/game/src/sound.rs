@@ -27,6 +27,14 @@ pub struct AudioSink {
     shift: TimeUs,
 }
 
+impl AudioSink {
+    /// Whether the audio side's end of the queue has been dropped.
+    #[must_use]
+    pub fn is_abandoned(&self) -> bool {
+        self.cmds.is_abandoned()
+    }
+}
+
 impl EventSink for AudioSink {
     fn receive(&mut self, ev: &JudgeEvent) {
         let JudgeEventKind::PlaySound { sound, .. } = ev.kind else {

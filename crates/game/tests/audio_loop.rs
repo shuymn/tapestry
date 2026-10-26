@@ -80,11 +80,16 @@ fn a_sealed_play_is_done_once_its_sounds_have_ended() {
         steps += 1;
         assert!(steps < 100, "never done");
     }
-    // Both 10 ms sounds were heard before it was done: the key sound
-    // starts at the first frame not yet written (≈ 30 ms on), the BGM at
-    // 50 ms.
-    let heard = out.samples().iter().filter(|&&s| s != 0.0).count();
-    assert!(heard >= 2 * 480, "{heard} samples heard");
+    // Both 10 ms sounds (480 frames each) were heard before it was done,
+    // in separate regions: the BGM sound from its time, 50 ms = frame
+    // 2 400, and the key sound before it, from the first frame not yet
+    // written when its command was taken.
+    let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+    let bgm = 2_400..2_880;
+    assert!(left[bgm.clone()].iter().all(|&s| s != 0.0));
+    let before = left[..bgm.start].iter().filter(|&&s| s != 0.0).count();
+    let after = left[bgm.end..].iter().filter(|&&s| s != 0.0).count();
+    assert_eq!((before, after), (480, 0));
     // A play that is not sealed is never done, even when silent: this one
     // is cancelled, which leaves no BGM to come.
     let (_sink, queue) = audio_link_at(4, TimeUs(1_000 * MS));
