@@ -1,13 +1,14 @@
 //! The saving extension point and local records, and the atomic file writes
 //! that settings and records share.
 
-use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use replay::PlayRecord;
 use tempfile::NamedTempFile;
+
+use crate::error::IoFailure;
 
 /// A complete temporary file in `dir`, under a name no other writer uses; it
 /// is removed if dropped before it is published.
@@ -41,35 +42,18 @@ pub struct RecordRef {
 }
 
 /// Why a record could not be saved.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SaveError {
     /// The file system refused.
-    Io {
-        /// The kind of failure.
-        kind: io::ErrorKind,
-        /// The error, as the system reported it.
-        message: String,
-    },
+    #[error("the record cannot be saved")]
+    Io(#[source] IoFailure),
 }
 
 impl From<io::Error> for SaveError {
     fn from(e: io::Error) -> Self {
-        Self::Io {
-            kind: e.kind(),
-            message: e.to_string(),
-        }
+        Self::Io(e.into())
     }
 }
-
-impl fmt::Display for SaveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { message, .. } => write!(f, "the record cannot be saved: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for SaveError {}
 
 /// The saving extension point: receives each finished play's record. A
 /// failure is reported, and the play itself is unaffected.

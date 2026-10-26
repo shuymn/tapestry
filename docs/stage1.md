@@ -239,7 +239,7 @@ New dependencies. Each license not yet in `deny.toml:17-22` is added in the PR t
 
 MPL-2.0 obligations (design.md:834) are met by not modifying those crates. A transitive license the graph brings (for example Zlib under `winit`) is added with a comment naming its crate. `deny.toml`'s `windows` ban names its direct parents (`wrappers`, deny.toml:32); the DX12 graph adds third-party parents such as `wgpu-hal` and `gpu-allocator`, which PR14 reviews and lists. If `cargo audit` flags an unmaintained transitive crate of `wgpu` or `winit`, the PR records an advisory ignore with its reason instead of pinning around it.
 
-Deferred, each with the stage that needs it: `egui` and `cosmic-text`/`glyphon` (stage 2 screens), `ffmpeg-next` and `image` (BGA, stage 3), `ebur128` (volume normalization), `rusqlite` (library), `midir` (MIDI variation), `proptest` and `criterion` (stage 2 property tests and benchmarks), `tracy-client` (when an investigation needs spans).
+Deferred, each with the stage that needs it: `egui` and `cosmic-text`/`glyphon` (stage 2 screens), `ffmpeg-next` and `image` (BGA, stage 3), `ebur128` (volume normalization), `rusqlite` (library), `midir` (MIDI variation), `criterion` (stage 2 benchmarks), `tracy-client` (when an investigation needs spans).
 
 ## 4. Pull requests in merge order
 

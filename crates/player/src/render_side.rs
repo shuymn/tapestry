@@ -18,10 +18,10 @@ use std::time::Duration;
 
 use bms_model::{Chart, TimeSource, TimeUs};
 use eval::JudgeEvent;
-use game::RenderSide;
+use game::{Chain, RenderSide};
 use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
-use render::{FrameInput, FrameTiming, Renderer};
+use render::{FrameInput, FrameTiming, RenderError, Renderer};
 
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::tuning::LiveTuning;
@@ -33,7 +33,7 @@ pub trait Screen: Send {
     /// # Errors
     ///
     /// Why it cannot draw the chart.
-    fn load(&mut self, chart: &Chart) -> Result<(), String>;
+    fn load(&mut self, chart: &Chart) -> Result<(), RenderError>;
     /// Waits until a frame may start; `false` on a timeout. Returns at
     /// once without a frame latency waitable object.
     fn wait(&self) -> bool;
@@ -46,7 +46,7 @@ pub trait Screen: Send {
     /// # Errors
     ///
     /// Why the frame failed: the screen must be built again.
-    fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, String>;
+    fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError>;
     /// The swap chain's latest frame statistics, raw; `None` without a
     /// swap chain or when the call failed.
     fn statistics(&self) -> Option<FrameStatistics> {
@@ -61,15 +61,15 @@ pub trait Screen: Send {
     /// # Errors
     ///
     /// As [`frame`](Self::frame).
-    fn text(&mut self, lines: &[&str]) -> Result<bool, String>;
+    fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError>;
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
 }
 
 impl Screen for Renderer {
-    fn load(&mut self, chart: &Chart) -> Result<(), String> {
-        Self::load(self, chart).map_err(|e| e.to_string())
+    fn load(&mut self, chart: &Chart) -> Result<(), RenderError> {
+        Self::load(self, chart)
     }
 
     fn wait(&self) -> bool {
@@ -80,8 +80,8 @@ impl Screen for Renderer {
         self.has_frame_waitable()
     }
 
-    fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, String> {
-        Self::frame(self, f).map_err(|e| e.to_string())
+    fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
+        Self::frame(self, f)
     }
 
     fn statistics(&self) -> Option<FrameStatistics> {
@@ -92,10 +92,8 @@ impl Screen for Renderer {
         Self::presentation(self)
     }
 
-    fn text(&mut self, lines: &[&str]) -> Result<bool, String> {
-        self.text_frame(lines)
-            .map(|t| t.presented)
-            .map_err(|e| e.to_string())
+    fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
+        self.text_frame(lines).map(|t| t.presented)
     }
 
     #[cfg(feature = "dev-tools")]
@@ -107,13 +105,30 @@ impl Screen for Renderer {
 }
 
 /// Builds the screen on the render thread, at startup and after a failure.
-pub type MakeScreen = Box<dyn FnMut() -> Result<Box<dyn Screen>, String> + Send>;
+pub type MakeScreen = Box<dyn FnMut() -> Result<Box<dyn Screen>, RenderError> + Send>;
+
+/// Why the screen cannot draw a play.
+#[derive(Debug, thiserror::Error)]
+pub enum ScreenError {
+    /// The renderer could not be built or cannot draw the chart.
+    #[error(transparent)]
+    Render(#[from] RenderError),
+    /// The render thread could not be spawned.
+    #[error("the render thread cannot start")]
+    Spawn(#[source] std::io::Error),
+    /// The render thread ended before it answered a preparation.
+    #[error("the render thread ended")]
+    Ended,
+    /// The render thread ended before its screen was built.
+    #[error("the render thread ended while starting")]
+    EndedWhileStarting,
+}
 
 /// What the game thread tells the render thread.
 pub enum RenderMsg {
     /// Ready the screen for a play (build it again if it failed) and
     /// answer when ready.
-    Prepare(mpsc::SyncSender<Result<(), String>>),
+    Prepare(mpsc::SyncSender<Result<(), RenderError>>),
     /// A play starts: chart time 0 at the measurement's `origin` on the
     /// clock.
     Play {
@@ -201,11 +216,11 @@ impl RenderLink {
     /// # Errors
     ///
     /// Why the screen cannot be built or cannot draw the chart.
-    pub fn prepare(&self) -> Result<(), String> {
+    pub fn prepare(&self) -> Result<(), ScreenError> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Prepare(tx));
-        rx.recv()
-            .unwrap_or_else(|_| Err("the render thread ended".to_owned()))
+        rx.recv().map_err(|_| ScreenError::Ended)??;
+        Ok(())
     }
 
     /// Whether a frame failed since the last preparation.
@@ -248,7 +263,7 @@ pub fn spawn(
     view: View,
     measure: Measure,
     frames: Box<dyn FrameSink>,
-) -> Result<RenderLink, String> {
+) -> Result<RenderLink, ScreenError> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let shared = Arc::new(Shared {
@@ -261,35 +276,40 @@ pub fn spawn(
         .spawn(move || {
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
-            let screen = build(&mut make, &chart);
-            let ready = screen.as_ref().map(|_| ()).map_err(Clone::clone);
-            let _ = ready_tx.send(ready);
-            if let Ok(screen) = screen {
-                let mut r = Run {
-                    screen: Some(screen),
-                    make,
-                    chart,
-                    clock,
-                    view,
-                    measure,
-                    frames,
-                    shared: thread_shared,
-                };
-                r.run(&rx);
-            }
+            let screen = match build(&mut make, &chart) {
+                Ok(screen) => {
+                    let _ = ready_tx.send(Ok(()));
+                    screen
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            let mut r = Run {
+                screen: Some(screen),
+                make,
+                chart,
+                clock,
+                view,
+                measure,
+                frames,
+                shared: thread_shared,
+            };
+            r.run(&rx);
         })
-        .map_err(|e| format!("the render thread cannot start: {e}"))?;
+        .map_err(ScreenError::Spawn)?;
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(RenderLink { tx, shared, handle }),
         Ok(Err(e)) => {
             let _ = handle.join();
-            Err(e)
+            Err(e.into())
         }
-        Err(_) => Err("the render thread ended while starting".to_owned()),
+        Err(_) => Err(ScreenError::EndedWhileStarting),
     }
 }
 
-fn build(make: &mut MakeScreen, chart: &Chart) -> Result<Box<dyn Screen>, String> {
+fn build(make: &mut MakeScreen, chart: &Chart) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make()?;
     s.load(chart)?;
     Ok(s)
@@ -453,7 +473,7 @@ impl Run {
                     if matches!(mode, Mode::Play { .. }) {
                         self.measure.failed(&effects);
                     }
-                    eprintln!("render: {e}");
+                    eprintln!("render: {}", Chain(&e));
                     self.screen = None;
                     self.shared.failed.store(true, Ordering::Release);
                     mode = Mode::Idle;
@@ -463,7 +483,7 @@ impl Run {
     }
 
     /// Resets the screen's play state, building it again after a failure.
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> Result<(), RenderError> {
         let ready = match &mut self.screen {
             Some(s) => s.load(&self.chart),
             None => build(&mut self.make, &self.chart).map(|s| self.screen = Some(s)),
@@ -487,9 +507,9 @@ mod tests {
     use eval::{DeviceProfile, InputStart};
     use game::{Logic, LogicConfig};
     use input::{QpcClock, SourceReader};
-    use render::{FrameInput, FrameTiming};
+    use render::{FrameInput, FrameTiming, RenderError, SkinError};
 
-    use super::{MakeScreen, NoFrames, RenderMsg, Screen, View, spawn};
+    use super::{MakeScreen, NoFrames, RenderMsg, Screen, ScreenError, View, spawn};
     use crate::measure::{Measure, PlayMeasure};
 
     fn timing(presented: bool) -> FrameTiming {
@@ -531,7 +551,7 @@ mod tests {
     }
 
     impl Screen for Flaky {
-        fn load(&mut self, _chart: &Chart) -> Result<(), String> {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -540,7 +560,7 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, String> {
+        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
             self.play_frames += 1;
             let presented = self.play_frames >= 4;
             if presented {
@@ -553,10 +573,10 @@ mod tests {
             }
             Ok(timing(presented))
         }
-        fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
             self.text_frames += 1;
             if self.text_frames == 3 {
-                Err("surface lost".to_owned())
+                Err(RenderError::SurfaceLost)
             } else {
                 Ok(true)
             }
@@ -609,10 +629,40 @@ mod tests {
                     presented_at: Arc::clone(&presented_at),
                 }) as Box<dyn Screen>)
             } else {
-                Err(format!("build {n} failed"))
+                Err(RenderError::Skin(SkinError {
+                    reason: format!("build {n} failed"),
+                }))
             }
         });
         (builds, make)
+    }
+
+    /// A render error passes through transparently: its text and its
+    /// source are the renderer's. The thread's own failures keep theirs.
+    #[test]
+    fn screen_errors_keep_their_sources() {
+        use std::error::Error as _;
+
+        let skin = SkinError {
+            reason: "no lanes".to_owned(),
+        };
+        let e = ScreenError::from(RenderError::Skin(skin.clone()));
+        assert_eq!(e.to_string(), "skin");
+        let source = e.source().expect("the skin error is the source");
+        assert_eq!(source.downcast_ref::<SkinError>(), Some(&skin));
+        assert!(source.source().is_none());
+        assert_eq!(game::Chain(&e).to_string(), "skin: no lanes");
+
+        let e = ScreenError::Spawn(std::io::Error::other("no threads"));
+        assert_eq!(e.to_string(), "the render thread cannot start");
+        let source = e.source().expect("the spawn error is the source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(
+            game::Chain(&e).to_string(),
+            "the render thread cannot start: no threads"
+        );
+        assert!(ScreenError::Ended.source().is_none());
+        assert!(ScreenError::EndedWhileStarting.source().is_none());
     }
 
     #[test]
@@ -639,13 +689,21 @@ mod tests {
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         assert!(link.failed());
         // The next preparation builds the screen again.
-        assert_eq!(link.prepare(), Ok(()));
+        assert!(link.prepare().is_ok());
         assert!(!link.failed());
         assert_eq!(builds.load(Ordering::SeqCst), 2);
         link.send(RenderMsg::Text(vec!["B".to_owned()]));
         assert!(wait_until(|| link.failed()));
         // Building again fails: the preparation reports it.
-        assert_eq!(link.prepare(), Err("build 3 failed".to_owned()));
+        let refused = link.prepare();
+        assert!(
+            matches!(
+                &refused,
+                Err(ScreenError::Render(RenderError::Skin(SkinError { reason })))
+                    if reason == "build 3 failed"
+            ),
+            "{refused:?}"
+        );
         link.exit();
     }
 
@@ -701,7 +759,7 @@ mod tests {
     struct Inputs(Arc<std::sync::Mutex<Vec<(TimeUs, TimeUs)>>>);
 
     impl Screen for Inputs {
-        fn load(&mut self, _chart: &Chart) -> Result<(), String> {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -710,14 +768,14 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, String> {
+        fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
             self.0
                 .lock()
                 .unwrap()
                 .push((f.visible_time, f.display_offset));
             Ok(timing(true))
         }
-        fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
             Ok(true)
         }
         #[cfg(feature = "dev-tools")]
@@ -795,7 +853,7 @@ mod tests {
     struct Lost;
 
     impl Screen for Lost {
-        fn load(&mut self, _chart: &Chart) -> Result<(), String> {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -804,10 +862,10 @@ mod tests {
         fn paced(&self) -> bool {
             false
         }
-        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, String> {
-            Err("surface lost".to_owned())
+        fn frame(&mut self, _f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
+            Err(RenderError::SurfaceLost)
         }
-        fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
             Ok(true)
         }
         #[cfg(feature = "dev-tools")]

@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use game::{AbortCause, PlayEnd, PlayReport, Tuning};
+use game::{AbortCause, Chain, PlayEnd, PlayReport, Tuning};
 use rules::GaugeValue;
 
 /// How long loading took, shown on the end screen (D11).
@@ -156,7 +156,7 @@ pub fn lines(
                 ));
             }
         }
-        Some(Err(e)) => l.push(format!("NO RE-EVALUATION: {e}").to_uppercase()),
+        Some(Err(e)) => l.push(format!("NO RE-EVALUATION: {}", Chain(e)).to_uppercase()),
         None => l.push("NOTHING WAS RECORDED".to_owned()),
     }
     if let Some(s) = summary {
@@ -212,7 +212,7 @@ pub fn lines(
                 .map_or_else(String::new, |n| n.to_string_lossy().to_uppercase());
             l.push(format!("SAVED AS RECORD {name}"));
         }
-        Some(Err(e)) => l.push(format!("NOT SAVED: {e}").to_uppercase()),
+        Some(Err(e)) => l.push(format!("NOT SAVED: {}", Chain(e)).to_uppercase()),
         None => {}
     }
     if let Some(e) = report.output_error {

@@ -57,12 +57,18 @@ pub const QUEUE_PERIODS: u32 = 2;
 pub const EVENT_TIMEOUT_MS: u32 = 500;
 
 /// Why the output could not be opened or closed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WasapiError {
     /// There is no default render endpoint.
+    #[error("there is no default audio output device")]
     NoEndpoint,
     /// The endpoint's mix format is not 32-bit float with at least two
     /// channels.
+    #[error(
+        "the audio device's shared format is not supported \
+         (tag {tag:#06x}, {bits} bits, {channels} channels; \
+         32-bit float with at least 2 channels is required)"
+    )]
     UnsupportedFormat {
         /// `wFormatTag`.
         tag: u16,
@@ -72,10 +78,12 @@ pub enum WasapiError {
         channels: u16,
     },
     /// An OS call failed.
+    #[error("{call} failed")]
     Os {
         /// The call.
         call: &'static str,
         /// Its error.
+        #[source]
         error: windows::core::Error,
     },
 }
@@ -85,27 +93,6 @@ impl WasapiError {
         Self::Os { call, error }
     }
 }
-
-impl fmt::Display for WasapiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoEndpoint => f.write_str("there is no default audio output device"),
-            Self::UnsupportedFormat {
-                tag,
-                bits,
-                channels,
-            } => write!(
-                f,
-                "the audio device's shared format is not supported \
-                 (tag {tag:#06x}, {bits} bits, {channels} channels; \
-                 32-bit float with at least 2 channels is required)"
-            ),
-            Self::Os { call, error } => write!(f, "{call} failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for WasapiError {}
 
 /// The shared-mode engine periods an endpoint offers, in frames
 /// (`IAudioClient3::GetSharedModeEnginePeriod`).
@@ -1155,6 +1142,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn an_os_failure_is_the_source_and_its_text_is_printed_once() {
+        use std::error::Error as _;
+        let error = windows::core::Error::from_hresult(E_FAIL);
+        let e = WasapiError::os("IAudioClient::Start", error.clone());
+        assert_eq!(e.to_string(), "IAudioClient::Start failed");
+        let source = e.source().expect("the OS error is the source");
+        assert_eq!(
+            source
+                .downcast_ref::<windows::core::Error>()
+                .map(windows::core::Error::code),
+            Some(error.code())
+        );
+        assert!(!e.to_string().contains(&source.to_string()));
+        assert!(WasapiError::NoEndpoint.source().is_none());
     }
 
     #[test]

@@ -284,9 +284,12 @@ fn an_invalid_key_config_exits_nonzero() {
             |d| d.keyboard.lanes[3].control = 0x3d,
             "key 0x3d is reserved for volume",
         ),
-        (|d| d.keyboard.lanes[4].lane = 9, "lane 9 does not exist"),
+        (
+            |d| d.keyboard.lanes[4].lane = 9,
+            "lane 9 does not exist (lanes are 0 to 7)",
+        ),
     ];
-    for (change, says) in bad {
+    for (change, refusal) in bad {
         let mut device = DeviceSettings::default();
         change(&mut device);
         game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
@@ -300,11 +303,12 @@ fn an_invalid_key_config_exits_nonzero() {
             .expect("run tapestry");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{stderr}");
-        assert!(
-            stderr.contains("device.toml: keyboard key config"),
-            "{stderr}"
+        // The whole diagnostic: the data folder, then each cause once.
+        let line = format!(
+            "{}: the settings cannot be used: device.toml: keyboard key config: {refusal}",
+            appdata.join("tapestry").display()
         );
-        assert!(stderr.contains(says), "{stderr}");
+        assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
         assert!(!appdata.join("tapestry").join("records").exists());
     }
 }

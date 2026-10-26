@@ -34,9 +34,10 @@ pub struct Arrival {
 pub const SOURCE_LIMIT: usize = 1 << 16;
 
 /// Why [`SourceSet::new`] refused a configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
     /// `max_sources` exceeds [`SOURCE_LIMIT`].
+    #[error("{0} sources exceed the limit of {SOURCE_LIMIT}")]
     TooManySources(usize),
 }
 

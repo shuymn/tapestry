@@ -1,1 +1,4 @@
 /target
+# proptest failure persistence: local only (docs/setup.md "Property Tests")
+proptest-regressions/
+*.proptest-regressions

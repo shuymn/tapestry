@@ -5,8 +5,8 @@ use std::fs;
 use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::{
-    Adjust, ControllerDevice, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, LocalRecords,
-    PlayerSettings, RecordSink, Role, ScratchConfig, Settings, SettingsError, Tuning,
+    Adjust, Chain, ControllerDevice, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey,
+    LocalRecords, PlayerSettings, RecordSink, Role, ScratchConfig, Settings, SettingsError, Tuning,
     load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
@@ -164,7 +164,7 @@ fn unreadable_settings_are_errors_not_defaults() {
     fs::write(root.player_settings(), "volume = 3\n").unwrap();
     assert!(matches!(
         load_settings::<PlayerSettings>(&root.player_settings()),
-        Err(SettingsError::Parse(e)) if e.contains("volume")
+        Err(SettingsError::Parse(e)) if e.message().contains("volume")
     ));
     // A directory where the file should be.
     fs::create_dir_all(root.device_settings()).unwrap();
@@ -445,10 +445,10 @@ fn a_record_numbered_last_leaves_no_number_to_save_under() {
     fs::rename(&first, dir.join(format!("{}.tprl", u64::MAX))).unwrap();
     assert!(matches!(
         records.save(&sample()),
-        Err(game::SaveError::Io {
+        Err(game::SaveError::Io(game::IoFailure {
             kind: std::io::ErrorKind::Other,
             ..
-        })
+        }))
     ));
     assert_eq!(names(&dir).len(), 1);
 }
@@ -472,10 +472,10 @@ fn saving_gives_up_after_the_bound_of_taken_numbers() {
     taken(game::SAVE_ATTEMPTS);
     assert!(matches!(
         records.save(&sample()),
-        Err(game::SaveError::Io {
+        Err(game::SaveError::Io(game::IoFailure {
             kind: std::io::ErrorKind::AlreadyExists,
             ..
-        })
+        }))
     ));
     // No temporary file is left either way.
     assert!(names(&dir).iter().all(|n| n.ends_with(".tprl")));
@@ -559,7 +559,8 @@ fn assert_invalid(device: &DeviceSettings, player: &PlayerSettings, says: &str) 
 #[track_caller]
 fn assert_invalid_all(device: &DeviceSettings, player: &PlayerSettings, says: &[&str]) {
     match load_written(device, player) {
-        Err(SettingsError::Invalid(e)) => {
+        Err(e @ (SettingsError::InvalidDevice(_) | SettingsError::InvalidPlayer(_))) => {
+            let e = Chain(&e).to_string();
             for s in says {
                 assert!(e.contains(s), "{e} lacks {s}");
             }

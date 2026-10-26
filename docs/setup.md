@@ -106,6 +106,14 @@ The fuzz targets are in `fuzz/`, a crate outside the workspace with its own `fuz
 - A failing run writes its inputs to a fresh `artifacts/<target>-<time>-<pid>/` under the corpus root and prints them in base64 (at most four, each at most 64 KiB; the others by size and SHA-256), so a CI log is enough to reproduce a failure.
 - The `canary` target proves the limits are in force: `scripts/fuzz-selftest.sh` runs a panic, a hang, one 128 MiB allocation and 512 MiB of held memory through `scripts/wsl.sh`, each with only the limit it must trip lowered, and requires a non-zero exit, libFuzzer's diagnostic and no other error class, and the reproducer.
 
+## Property Tests
+
+The property tests (`crates/eval/tests/props.rs`, `crates/replay/tests/round_trip.rs`) are ordinary tests: `cargo test` runs them on every runner with proptest's 256 cases per property and a random seed.
+
+- For a longer local run, set `PROPTEST_CASES`, for example `PROPTEST_CASES=4096 mise exec -- cargo test --test props`.
+- A failure prints the shrunk input. proptest saves its seed beside the test (`*.proptest-regressions`, ignored by git) and replays it first on the next local run. Turn the case into a named hand-written test in the regular test files; regression files are not committed, since a generator change makes their seeds mean other cases.
+- `generators_reach_the_fragile_spots` and `generator_reaches_ten_byte_varints_and_empty_lists` sample the generators with a fixed seed and fail when a generator change stops reaching a case a property depends on.
+
 ## CI
 
 | Runner | What it does |

@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 mod audio_loop;
+mod error;
 mod keys;
 pub mod live;
 mod logic;
@@ -35,6 +36,7 @@ pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioProbe, AudioWaitError, AudioWorker, Probed,
     SWITCH_TIMEOUT, audio_control,
 };
+pub use error::{Chain, IoFailure};
 pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
     LearntRange, Press, ROLES, Refusal, capture_keys, capture_keys_within,
@@ -65,8 +67,9 @@ pub use session::{
     SessionConfig, SessionError, Settings, TABLE_BYTES_PER_OBJECT,
 };
 pub use settings::{
-    ControllerDevice, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, OVERLAY_KEY,
-    PlayerSettings, Role, ScratchConfig, SettingsError, load_settings, reserved_key, save_settings,
+    ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,
+    OVERLAY_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig, SettingsError,
+    load_settings, reserved_key, save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{

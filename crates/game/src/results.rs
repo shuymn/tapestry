@@ -1,8 +1,6 @@
 //! The results extension point and its built-in extension, re-evaluation
 //! of the saved record.
 
-use std::fmt;
-
 use bms_model::{Chart, TimeUs};
 use eval::{EvalError, EvalInput, Evaluation, JudgeEvent, JudgeEventKind};
 use replay::PlayRecord;
@@ -38,24 +36,15 @@ pub struct RecommendedOffset {
 pub const MIN_OFFSET_SAMPLES: usize = 32;
 
 /// Why a record could not be re-evaluated.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReEvaluationError {
     /// The record names a preset other than the one given.
+    #[error("the record names another preset")]
     PresetMismatch,
     /// The evaluator refused the record.
-    Eval(EvalError),
+    #[error("the record cannot be evaluated")]
+    Eval(#[source] EvalError),
 }
-
-impl fmt::Display for ReEvaluationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PresetMismatch => f.write_str("the record names another preset"),
-            Self::Eval(e) => write!(f, "the record cannot be evaluated: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ReEvaluationError {}
 
 /// What the end screen shows.
 #[derive(Clone, Debug, PartialEq, Eq)]

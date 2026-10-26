@@ -34,6 +34,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -55,6 +61,7 @@ dependencies = [
  "sha2",
  "symphonia",
  "tempfile",
+ "thiserror 2.0.21",
  "windows",
 ]
 
@@ -160,6 +167,7 @@ dependencies = [
  "num-traits",
  "sha2",
  "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -264,6 +272,17 @@ name = "cfg_aliases"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "rand_core",
+]
 
 [[package]]
 name = "chardetng"
@@ -461,6 +480,7 @@ name = "eval"
 version = "0.0.0"
 dependencies = [
  "bms-model",
+ "proptest",
  "rules",
 ]
 
@@ -543,6 +563,7 @@ dependencies = [
 name = "game"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "audio",
  "bms-model",
  "bms-parser",
@@ -554,6 +575,7 @@ dependencies = [
  "serde",
  "sha2",
  "tempfile",
+ "thiserror 2.0.21",
  "toml",
  "triple_buffer",
 ]
@@ -567,6 +589,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
+ "rand_core",
 ]
 
 [[package]]
@@ -646,6 +669,7 @@ dependencies = [
  "bms-model",
  "eval",
  "rtrb",
+ "thiserror 2.0.21",
  "windows",
 ]
 
@@ -1260,6 +1284,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "player"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "audio",
  "bms-model",
  "bms-parser",
@@ -1271,6 +1296,7 @@ dependencies = [
  "rtrb",
  "rules",
  "tempfile",
+ "thiserror 2.0.21",
  "toml",
  "windows",
  "winit",
@@ -1351,6 +1377,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bitflags 2.13.2",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand",
+ "rand_xorshift",
+ "regex-syntax",
+ "unarray",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1364,6 +1406,31 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rand"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+dependencies = [
+ "getrandom",
+ "rand_core",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
+dependencies = [
+ "rand_core",
+]
 
 [[package]]
 name = "range-alloc"
@@ -1420,6 +1487,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
 name = "render"
 version = "0.0.0"
 dependencies = [
@@ -1429,6 +1502,7 @@ dependencies = [
  "game",
  "pollster",
  "rules",
+ "thiserror 2.0.21",
  "wgpu",
  "wgpu-hal",
  "windows",
@@ -1446,8 +1520,10 @@ version = "0.0.0"
 dependencies = [
  "bms-model",
  "eval",
+ "proptest",
  "rules",
  "sha2",
+ "thiserror 2.0.21",
  "zstd",
 ]
 
@@ -1999,6 +2075,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "unicode-ident"

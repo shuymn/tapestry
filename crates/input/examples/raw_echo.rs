@@ -43,6 +43,18 @@ mod app {
     static LATCH: OnceLock<FocusLatch> = OnceLock::new();
     static CLOSED: AtomicBool = AtomicBool::new(false);
 
+    /// `e` and each of its sources on one line, `root: source: ...`.
+    fn chain(e: &dyn std::error::Error) -> String {
+        let mut text = e.to_string();
+        let mut cause = e.source();
+        while let Some(c) = cause {
+            text.push_str(": ");
+            text.push_str(&c.to_string());
+            cause = c.source();
+        }
+        text
+    }
+
     unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
         match msg {
             WM_ACTIVATEAPP if w.0 == 0 => latch(),
@@ -193,7 +205,7 @@ mod app {
         }) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("{e}");
+                eprintln!("{}", chain(&e));
                 return ExitCode::FAILURE;
             }
         };
@@ -218,7 +230,7 @@ mod app {
         let report = match stopped {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("{e}");
+                eprintln!("{}", chain(&e));
                 return ExitCode::FAILURE;
             }
         };

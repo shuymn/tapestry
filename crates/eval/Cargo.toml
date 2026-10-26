@@ -7,11 +7,15 @@ license = "MIT OR Apache-2.0"
 repository.workspace = true
 publish.workspace = true
 
-# `cargo xtask check-arch` (R1) rejects any dependency outside `bms-model`,
-# `rules`, and the reviewed allowlist in `xtask/src/arch.rs`.
+# `cargo xtask check-arch` (R1) rejects any normal or build dependency
+# outside `bms-model`, `rules`, and the reviewed allowlist in
+# `xtask/src/arch.rs`. Dev-dependencies are test-only and outside R1.
 [dependencies]
 bms-model.workspace = true
 rules.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

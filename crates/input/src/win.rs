@@ -8,7 +8,6 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::ffi::c_void;
-use std::fmt;
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -84,21 +83,26 @@ const _: () = {
 };
 
 /// Why the input thread could not start or stopped abnormally.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum InputError {
     /// An OS call failed.
+    #[error("{call} failed")]
     Os {
         /// The call.
         call: &'static str,
         /// Its error.
+        #[source]
         error: windows::core::Error,
     },
     /// The thread could not be spawned.
-    Spawn(std::io::Error),
+    #[error("spawning the input thread failed")]
+    Spawn(#[source] std::io::Error),
     /// The thread panicked.
+    #[error("the input thread panicked")]
     Panicked,
     /// [`InputThread::stop`] was called from the input thread itself; the
     /// thread ends after its current wake without being joined.
+    #[error("the input thread cannot join itself")]
     StopFromWorker,
 }
 
@@ -107,19 +111,6 @@ impl InputError {
         Self::Os { call, error }
     }
 }
-
-impl fmt::Display for InputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Os { call, error } => write!(f, "{call} failed: {error}"),
-            Self::Spawn(e) => write!(f, "spawning the input thread failed: {e}"),
-            Self::Panicked => f.write_str("the input thread panicked"),
-            Self::StopFromWorker => f.write_str("the input thread cannot join itself"),
-        }
-    }
-}
-
-impl std::error::Error for InputError {}
 
 fn read_qpc() -> i64 {
     let mut ticks = 0;
@@ -1380,5 +1371,45 @@ mod qpc_tests {
         assert!(before <= t && t <= after, "{before:?} {t:?} {after:?}");
         let later = clock.from_qpc(ticks + clock.frequency().hz());
         assert_eq!(later.0 - t.0, 1_000_000);
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use std::error::Error as _;
+
+    use windows::Win32::Foundation::E_FAIL;
+
+    use super::InputError;
+
+    /// The OS error and the spawn error are sources, and each wrapper's
+    /// text leaves them out.
+    #[test]
+    fn os_and_spawn_failures_are_sources_printed_once() {
+        let error = windows::core::Error::from_hresult(E_FAIL);
+        let e = InputError::os("RegisterRawInputDevices", error.clone());
+        assert_eq!(e.to_string(), "RegisterRawInputDevices failed");
+        let source = e.source().expect("the OS error is the source");
+        assert_eq!(
+            source
+                .downcast_ref::<windows::core::Error>()
+                .map(windows::core::Error::code),
+            Some(error.code())
+        );
+        assert!(!e.to_string().contains(&source.to_string()));
+
+        let e = InputError::Spawn(std::io::Error::other("no threads"));
+        assert_eq!(e.to_string(), "spawning the input thread failed");
+        let source = e.source().expect("the spawn error is the source");
+        assert_eq!(
+            source
+                .downcast_ref::<std::io::Error>()
+                .map(ToString::to_string),
+            Some("no threads".to_owned())
+        );
+        assert!(!e.to_string().contains(&source.to_string()));
+
+        assert!(InputError::Panicked.source().is_none());
+        assert!(InputError::StopFromWorker.source().is_none());
     }
 }

@@ -42,19 +42,12 @@ impl FrameInput<'_> {
 }
 
 /// A skin that cannot draw a chart.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
 pub struct SkinError {
     /// Why, for the player.
     pub reason: String,
 }
-
-impl std::fmt::Display for SkinError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.reason)
-    }
-}
-
-impl std::error::Error for SkinError {}
 
 /// A play screen layout. The renderer calls `prepare` before the countdown
 /// and `build` once per frame. `build` must not allocate: everything it

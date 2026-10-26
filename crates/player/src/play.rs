@@ -16,7 +16,8 @@ use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
-    Advance, AudioQueue, Closing, Command, Opening, PlayReport, RenderSide, Rig, Settings, Tuning,
+    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, Opening, PlayReport, RenderSide,
+    Rig, Settings, Tuning,
 };
 use input::{QpcClock, SourceReader};
 
@@ -27,7 +28,7 @@ use crate::input_side::{InputLink, Recorded, Request};
 use crate::measure::{
     Figures, PlayMeasure, Step, StepSample, judgment_samples, measure_path, to_toml,
 };
-use crate::render_side::{RenderLink, RenderMsg};
+use crate::render_side::{RenderLink, RenderMsg, ScreenError};
 use crate::tuning::{Delivered, SettingsFiles};
 
 /// How long the logic step parks at most without a wake from the input
@@ -239,7 +240,7 @@ impl PlayerRig<'_> {
         }
         match &report.saved {
             Some(Ok(r)) => println!("saved: {}", r.path.display()),
-            Some(Err(e)) => eprintln!("not saved: {e}"),
+            Some(Err(e)) => eprintln!("not saved: {}", Chain(e)),
             None => {}
         }
         let ms = |d: Duration| format!("{} ms", d.as_millis());
@@ -257,6 +258,7 @@ fn since(from: TimeUs, to: TimeUs) -> Duration {
 
 impl Rig for PlayerRig<'_> {
     type Reader = SourceReader;
+    type ScreenError = ScreenError;
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn now(&self) -> TimeUs {
@@ -298,22 +300,21 @@ impl Rig for PlayerRig<'_> {
         self.controls.quitting()
     }
 
-    fn prepare_audio(&mut self) -> Result<(), String> {
-        self.audio.control.ready().map_err(|e| e.to_string())?;
+    fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
+        self.audio.control.ready()?;
         // Between plays, before recording opens: the change never lands
         // inside a play or its countdown.
         self.queued_now = self
             .audio
             .control
-            .set_queued_periods(self.queue.periods())
-            .map_err(|e| e.to_string())?;
+            .set_queued_periods(self.queue.periods())?;
         // A volume changed before the first play (during startup) or on
         // the end screen reaches the engine before the play starts.
         self.sync();
         Ok(())
     }
 
-    fn prepare_screen(&mut self) -> Result<(), String> {
+    fn prepare_screen(&mut self) -> Result<(), ScreenError> {
         self.retry_from = self.pending_retry.take();
         self.render.prepare()
     }

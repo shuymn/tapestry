@@ -21,14 +21,13 @@
 //! - A completed play seals its key sounds; the tail ends when the audio
 //!   side reports the sealed audio done.
 
-use std::fmt;
-
 use ::audio::OutputError;
 use bms_model::TimeUs;
 use eval::{InputStart, JudgeEvent};
 use input::{Arrival, DeviceKind};
 use replay::Incomplete;
 
+use crate::audio_loop::AudioWaitError;
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::render::RenderSide;
 use crate::session::{Command, Loaded, PlayEnd, PlayOutcome, PlayReport, Settings};
@@ -69,6 +68,8 @@ pub struct Closing {
 pub trait Rig {
     /// The source queues' read side.
     type Reader: SourceRead;
+    /// Why the screen cannot draw a play.
+    type ScreenError: std::error::Error + Send + Sync + 'static;
 
     /// The clock every play's origin is on.
     fn now(&self) -> TimeUs;
@@ -106,14 +107,14 @@ pub trait Rig {
     /// # Errors
     ///
     /// Why the screen cannot draw a play, which ends the run.
-    fn prepare_screen(&mut self) -> Result<(), String>;
+    fn prepare_screen(&mut self) -> Result<(), Self::ScreenError>;
     /// Waits until audio is ready for a play: the previous play's switch
     /// taken. Before recording opens.
     ///
     /// # Errors
     ///
     /// Why audio cannot play, which ends the run.
-    fn prepare_audio(&mut self) -> Result<(), String> {
+    fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
         Ok(())
     }
     /// Opens recording at the next input boundary, with chart time 0
@@ -151,28 +152,19 @@ pub trait Rig {
 }
 
 /// Why the run of plays stopped short.
-#[derive(Debug)]
-pub enum LiveError {
+#[derive(Debug, thiserror::Error)]
+pub enum LiveError<S> {
     /// The logic step refused to start (for example a key config binding
     /// one control twice).
-    Logic(LogicError),
-    /// The screen cannot draw a play.
-    Screen(String),
+    #[error("the play cannot start")]
+    Logic(#[source] LogicError),
+    /// The screen cannot draw a play: the rig's [`Rig::ScreenError`].
+    #[error("the screen cannot draw the play")]
+    Screen(#[source] S),
     /// Audio cannot play.
-    Audio(String),
+    #[error("audio cannot play")]
+    Audio(#[source] AudioWaitError),
 }
-
-impl fmt::Display for LiveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Logic(e) => write!(f, "the play cannot start: {e}"),
-            Self::Screen(e) => write!(f, "the screen cannot draw the play: {e}"),
-            Self::Audio(e) => write!(f, "audio cannot play: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for LiveError {}
 
 /// Plays until the player quits: every play's report goes to
 /// [`Rig::ended`]; a play that neither quit nor retried shows its end
@@ -181,7 +173,7 @@ impl std::error::Error for LiveError {}
 /// # Errors
 ///
 /// [`LiveError`] when a play cannot start; the plays before it are saved.
-pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError> {
+pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::ScreenError>> {
     loop {
         let Some((report, next)) = play_and_next(loaded, rig)? else {
             return Ok(());
@@ -227,9 +219,15 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError> {
 ///
 /// [`LiveError`] when the screen or the logic step cannot start; recording
 /// is closed again.
-pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayReport>, LiveError> {
+pub fn play<R: Rig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+) -> Result<Option<PlayReport>, LiveError<R::ScreenError>> {
     Ok(play_and_next(loaded, rig)?.map(|(report, _)| report))
 }
+
+/// A play's report and the command that arrived as recording closed.
+type Played = (PlayReport, Option<Command>);
 
 /// [`play`], with the command that arrived as recording closed after an
 /// abort: the run's next step (a completed play's tail takes it).
@@ -237,7 +235,7 @@ pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayRepor
 fn play_and_next<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
-) -> Result<Option<(PlayReport, Option<Command>)>, LiveError> {
+) -> Result<Option<Played>, LiveError<R::ScreenError>> {
     if rig.quitting() {
         return Ok(None);
     }

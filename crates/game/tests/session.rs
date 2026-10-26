@@ -777,7 +777,9 @@ fn bad_key_config_refuses_to_play_and_closes_recording() {
     settings.save(&root).unwrap();
     assert!(matches!(
         Settings::load(&root),
-        Err(game::SettingsError::Invalid(_))
+        Err(game::SettingsError::InvalidDevice(
+            game::DeviceSettingsError::KeyboardKeys(game::KeyError::Overlap { .. })
+        ))
     ));
     let events = Events::default();
     let parts = Parts {

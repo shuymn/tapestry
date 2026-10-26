@@ -66,7 +66,7 @@ pub(crate) fn adapter(
             compatible_surface: surface,
             apply_limit_buckets: false,
         }))
-        .map_err(|e| RenderError::Adapter(e.to_string()))
+        .map_err(RenderError::Adapter)
     };
     match choice {
         AdapterChoice::HighPerformance => request(wgpu::PowerPreference::HighPerformance),
@@ -76,12 +76,9 @@ pub(crate) fn adapter(
             let infos: Vec<wgpu::AdapterInfo> = all.iter().map(wgpu::Adapter::get_info).collect();
             match first_software(infos.iter().map(|i| i.device_type)) {
                 Some(i) => Ok(all.swap_remove(i)),
-                None => {
-                    let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
-                    Err(RenderError::Adapter(format!(
-                        "no WARP adapter among {names:?}"
-                    )))
-                }
+                None => Err(RenderError::NoSoftwareAdapter {
+                    names: infos.into_iter().map(|i| i.name).collect(),
+                }),
             }
         }
     }
@@ -97,7 +94,7 @@ fn first_software(types: impl Iterator<Item = wgpu::DeviceType>) -> Option<usize
 pub(crate) fn device(adapter: &wgpu::Adapter) -> Result<Gpu, RenderError> {
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-            .map_err(|e| RenderError::Device(e.to_string()))?;
+            .map_err(RenderError::Device)?;
     Ok(Gpu {
         device,
         queue,

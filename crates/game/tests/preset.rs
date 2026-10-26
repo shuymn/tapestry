@@ -52,7 +52,7 @@ fn malformed_unknown_and_invalid_presets_are_refused() {
     let unknown = format!("speed = 2\n{text}");
     assert!(matches!(
         load_preset_toml(&unknown),
-        Err(PresetError::Parse(e)) if e.contains("speed")
+        Err(PresetError::Parse(e)) if e.message().contains("speed")
     ));
     let mut preset = rules::custom();
     preset.gauges.clear();
@@ -71,7 +71,7 @@ fn older_preset_files_are_refused() {
         assert_ne!(old, text, "the edit did not apply");
         let e = load_preset_toml(old).unwrap_err();
         assert!(
-            matches!(&e, PresetError::Parse(m) if m.contains(missing)),
+            matches!(&e, PresetError::Parse(m) if m.message().contains(missing)),
             "{e}"
         );
         assert!(e.to_string().contains("older version"), "{e}");

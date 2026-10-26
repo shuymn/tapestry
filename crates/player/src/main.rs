@@ -33,6 +33,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use anyhow::Context as _;
 use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank};
 use bms_model::TimeUs;
 use game::{
@@ -181,14 +182,14 @@ fn measure_command(mut args: impl Iterator<Item = OsString>, clock: QpcClock) ->
 }
 
 #[cfg(feature = "dev-tools")]
-fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
+fn measure_play(chart: &Path, clock: QpcClock) -> anyhow::Result<()> {
     let exe = presentmon::locate(std::env::var_os(presentmon::ENV), std::env::var_os("PATH"))?;
     let process = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .ok_or("the game's own executable name is unknown")?;
+        .context("the game's own executable name is unknown")?;
     let dir = data_root()?.path().join("measure");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -210,12 +211,14 @@ fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
     let stopped = capture.stop();
     ran?;
     stopped?;
-    let text = std::fs::read_to_string(&csv).map_err(|e| format!("{}: {e}", csv.display()))?;
+    let text = std::fs::read_to_string(&csv).with_context(|| csv.display().to_string())?;
     let (frames, error) = presentmon::parse(&text, &process, |t| clock.from_qpc(t).0);
     if let Some(e) = error {
-        return Err(format!("{}: {e:?}", csv.display()));
+        return Err(anyhow::Error::new(e).context(csv.display().to_string()));
     }
-    let plays = plays.lock().map_err(|_| "the measured plays were lost")?;
+    let plays = plays
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the measured plays were lost"))?;
     for (record, fig) in plays.iter() {
         let Some(period) = fig.refresh_period_ns else {
             eprintln!("measure: no refresh rate for {}", record.display());
@@ -232,8 +235,7 @@ fn measure_play(chart: &Path, clock: QpcClock) -> Result<(), String> {
         let path = measure::measure_path(record);
         let mut toml = std::fs::read_to_string(&path).unwrap_or_default();
         toml.push_str(&presentmon::to_toml(&counted, fig, period));
-        game::write_atomic(&path, toml.as_bytes())
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        game::write_atomic(&path, toml.as_bytes()).with_context(|| path.display().to_string())?;
     }
     Ok(())
 }
@@ -273,38 +275,45 @@ fn unknown_argument(arg: &OsString) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn report(result: Result<(), String>) -> ExitCode {
+/// A run's outcome as its exit code: a failure prints [`diagnostic`] and
+/// exits 1.
+fn report(result: anyhow::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{}", diagnostic(&e));
             ExitCode::from(1)
         }
     }
 }
 
+/// A failure and each of its causes, once, on one line.
+fn diagnostic(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
 /// `%LOCALAPPDATA%\tapestry\`.
-fn data_root() -> Result<DataRoot, String> {
+fn data_root() -> anyhow::Result<DataRoot> {
     let base = std::env::var_os("LOCALAPPDATA")
         .filter(|v| !v.is_empty())
-        .ok_or("LOCALAPPDATA is not set, so the data folder cannot be found")?;
+        .context("LOCALAPPDATA is not set, so the data folder cannot be found")?;
     Ok(DataRoot::new(PathBuf::from(base).join("tapestry")))
 }
 
 /// The settings, writing `device.toml` with the default key config on the
 /// first start.
-fn settings(root: &DataRoot) -> Result<Settings, String> {
+fn settings(root: &DataRoot) -> anyhow::Result<Settings> {
     let device = root.device_settings();
     if !device.exists() {
         save_settings(&device, &DeviceSettings::default())
-            .map_err(|e| format!("{}: {e}", device.display()))?;
+            .with_context(|| device.display().to_string())?;
     }
-    Settings::load(root).map_err(|e| format!("{}: {e}", root.path().display()))
+    Settings::load(root).with_context(|| root.path().display().to_string())
 }
 
 /// Settings, the chart through ingestion and the transform, and the
 /// session's fixed choices.
-fn load(chart: &Path, receive: ReceiveMethod) -> Result<Loaded, String> {
+fn load(chart: &Path, receive: ReceiveMethod) -> anyhow::Result<Loaded> {
     let root = data_root()?;
     let settings = settings(&root)?;
     // `#RANDOM` is resolved with a seed that differs per run; it is
@@ -328,7 +337,7 @@ fn load(chart: &Path, receive: ReceiveMethod) -> Result<Loaded, String> {
     };
     let parts = Parts::standard(&root, &settings.player);
     let loaded = Loaded::load(root, settings, chart, config, parts)
-        .map_err(|e| format!("{}: {e}", chart.display()))?;
+        .with_context(|| chart.display().to_string())?;
     for w in loaded.warnings() {
         eprintln!("warning: {w}");
     }
@@ -357,10 +366,10 @@ fn start_engine(
     audio: audio_side::AudioThread,
     opened: audio_side::Opened,
     probe: rtrb::Producer<game::AudioProbe>,
-) -> Result<audio_side::AudioLink, String> {
+) -> anyhow::Result<audio_side::AudioLink> {
     let chart = loaded.chart();
     let bank = load_bank(chart, opened.rate, &BankLimits::default())
-        .map_err(|e| format!("the sounds cannot be loaded: {e}"))?;
+        .context("the sounds cannot be loaded")?;
     for w in bank.warnings() {
         eprintln!("warning: {w:?}");
     }
@@ -372,7 +381,7 @@ fn start_engine(
         MAX_VOICES,
         SCHEDULE_LOG,
     )
-    .map_err(|e| format!("the audio engine cannot start: {e}"))?;
+    .context("the audio engine cannot start")?;
     loaded.settings().device.apply_to(&mut engine);
     Ok(audio.start(engine, probe))
 }
@@ -532,19 +541,19 @@ fn open_window_and_input(
     wake: impl FnMut(&mut SourceSet, TimeUs) + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-) -> Result<(window::WindowThread, window::Surface, InputThread), String> {
+) -> anyhow::Result<(window::WindowThread, window::Surface, InputThread)> {
     let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1, monitor)?;
     let input = InputThread::spawn(clock, sources, capture, wake);
     let input = match input {
         Ok(i) => i,
         Err(e) => {
             window_thread.close();
-            return Err(format!("input: {e}"));
+            return Err(anyhow::Error::new(e).context("input"));
         }
     };
     if input::keyboard_target() != Some(input.receiver()) {
         window_thread.close();
-        return Err("input: keyboards are not registered to the input thread".to_owned());
+        anyhow::bail!("input: keyboards are not registered to the input thread");
     }
     println!("input: keyboard Raw Input targets the input thread's window");
     Ok((window_thread, surface, input))
@@ -556,15 +565,15 @@ fn play(
     clock: QpcClock,
     #[cfg(feature = "dev-tools")] keep_presents: bool,
     tune: impl FnOnce(&mut PlayerRig<'_>),
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     alloc_count::tag(alloc_count::Tag::Logic);
     let mut loaded = load(chart, ReceiveMethod::RawInput)?;
     let controls = controls(&loaded, clock);
     let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
     let (audio, opened) = audio_side::spawn(
-        move || {
-            let out = audio::WasapiShared::open(clock).map_err(|e| format!("audio: {e}"))?;
+        move || -> Result<_, audio::WasapiError> {
+            let out = audio::WasapiShared::open(clock)?;
             let most = out.grant().max_queue_periods;
             Ok((out, Some(most)))
         },
@@ -605,7 +614,6 @@ fn play(
         };
         Renderer::new(target, AdapterChoice::HighPerformance)
             .map(|r| Box::new(r) as Box<dyn Screen>)
-            .map_err(|e| e.to_string())
     });
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
     let mut measure = measure(
@@ -634,7 +642,7 @@ fn play(
         Err(e) => {
             audio.exit();
             window_thread.close();
-            return Err(e);
+            return Err(e.into());
         }
     };
     let mut rig = rig(
@@ -648,11 +656,12 @@ fn play(
     );
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
-    let ran = game::live::run(&mut loaded, &mut rig).map_err(|e| e.to_string());
+    let ran = game::live::run(&mut loaded, &mut rig);
     rig.shut_down();
     window_thread.close();
     drop(input_thread);
-    ran
+    ran?;
+    Ok(())
 }
 
 /// A scripted run (dev-tools): the input log as input, a recording of a
@@ -665,7 +674,7 @@ fn scripted(
     auto_retries: u32,
     clock: QpcClock,
     tune: impl FnOnce(&mut PlayerRig<'_>),
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     alloc_count::tag(alloc_count::Tag::Logic);
     let script = dev::script(log)?;
     let mut loaded = load(chart, ReceiveMethod::Scripted)?;
@@ -679,7 +688,8 @@ fn scripted(
         .max()
         .unwrap_or(TimeUs(0));
     let (audio, opened) = audio_side::spawn(
-        move || {
+        // The simulated output always opens.
+        move || -> Result<_, std::convert::Infallible> {
             let out = dev::recording_output(clock, 60);
             Ok((out, Some(audio::MAX_QUEUE_PERIODS)))
         },
@@ -705,9 +715,7 @@ fn scripted(
             width: 1280,
             height: 720,
         };
-        Renderer::new(target, AdapterChoice::Warp)
-            .map(|r| Box::new(r) as Box<dyn Screen>)
-            .map_err(|e| e.to_string())
+        Renderer::new(target, AdapterChoice::Warp).map(|r| Box::new(r) as Box<dyn Screen>)
     });
     // Offscreen: no refresh rate and no frame statistics.
     let measure = measure(
@@ -739,10 +747,11 @@ fn scripted(
     rig.auto_retries = auto_retries;
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
-    let ran = game::live::run(&mut loaded, &mut rig).map_err(|e| e.to_string());
+    let ran = game::live::run(&mut loaded, &mut rig);
     rig.shut_down();
     drop(script_thread);
-    ran
+    ran?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -751,7 +760,24 @@ mod tests {
 
     use input::QpcClock;
 
-    use super::{Controls, Mode, input_side, open_window_and_input, sources};
+    use super::{Controls, Mode, diagnostic, input_side, open_window_and_input, sources};
+
+    /// The report prints the failure and each cause once, on one line: a
+    /// chart that cannot be loaded names the file, then the session's and
+    /// the loader's reasons.
+    #[test]
+    fn the_report_prints_every_cause_once() {
+        let load = bms_parser::LoadError::Unsupported {
+            line: 2,
+            what: "#LNTYPE 2".to_owned(),
+        };
+        let e = game::SessionError::Ingest(game::IngestError::Load(load));
+        let e = anyhow::Error::new(e).context("song.bms".to_owned());
+        assert_eq!(
+            diagnostic(&e),
+            "song.bms: the chart cannot be loaded: line 2: unsupported #LNTYPE 2"
+        );
+    }
 
     /// The real startup order leaves the keyboards registered to the input
     /// thread. Opening the input thread before the window fails it: winit

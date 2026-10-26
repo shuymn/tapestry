@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
+use anyhow::Context as _;
 use eval::ControlId;
 use game::{Adjust, Command};
 use winit::application::ApplicationHandler;
@@ -35,7 +36,7 @@ struct App {
     keys: Keys,
     /// The monitor to open on, by name; the primary when `None`.
     monitor: Option<String>,
-    ready: Option<Sender<Result<Surface, String>>>,
+    ready: Option<Sender<anyhow::Result<Surface>>>,
     window: Option<Window>,
 }
 
@@ -65,7 +66,7 @@ impl ApplicationHandler<Exit> for App {
                 self.window = Some(w);
             }
             Err(e) => {
-                let _ = ready.send(Err(format!("the window cannot be created: {e}")));
+                let _ = ready.send(Err(e).context("the window cannot be created"));
                 event_loop.exit();
             }
         }
@@ -149,7 +150,7 @@ pub fn open(
     retry: Option<u32>,
     quit: Option<u32>,
     monitor: Option<String>,
-) -> Result<(WindowThread, Surface), String> {
+) -> anyhow::Result<(WindowThread, Surface)> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proxy_tx, proxy_rx) = mpsc::channel();
     let handle = std::thread::Builder::new()
@@ -161,7 +162,7 @@ pub fn open(
             {
                 Ok(l) => l,
                 Err(e) => {
-                    let _ = ready_tx.send(Err(format!("the event loop cannot start: {e}")));
+                    let _ = ready_tx.send(Err(e).context("the event loop cannot start"));
                     return;
                 }
             };
@@ -180,8 +181,8 @@ pub fn open(
             // However the loop ended, the game quits.
             controls.close();
         })
-        .map_err(|e| format!("the window thread cannot start: {e}"))?;
-    let ended = || "the window thread ended".to_owned();
+        .context("the window thread cannot start")?;
+    let ended = || anyhow::anyhow!("the window thread ended");
     let window = ready_rx.recv().map_err(|_| ended()).and_then(|r| r);
     // The loop sends its proxy before it makes the window.
     let proxy = proxy_rx.recv().map_err(|_| ended());
@@ -215,12 +216,10 @@ pub struct Surface {
     pub refresh_mhz: Option<u32>,
 }
 
-fn surface(window: &Window) -> Result<Surface, String> {
-    let handle = window
-        .window_handle()
-        .map_err(|e| format!("the window has no handle: {e}"))?;
+fn surface(window: &Window) -> anyhow::Result<Surface> {
+    let handle = window.window_handle().context("the window has no handle")?;
     let RawWindowHandle::Win32(h) = handle.as_raw() else {
-        return Err("the window is not a Win32 window".to_owned());
+        anyhow::bail!("the window is not a Win32 window");
     };
     let size = window.inner_size();
     Ok(Surface {
