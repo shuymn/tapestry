@@ -15,6 +15,9 @@
 //!   [`AudioOutput`]. [`SimDevice`] and [`RecordingOutput`] stand in for the
 //!   device in tests and headless runs.
 //!
+//! [`run_audio`] is the audio thread loop: one step per buffer event until
+//! asked to stop.
+//!
 //! Output buffers are two interleaved `f32` channels (left, right). Nothing
 //! on the step path allocates once the engine is built.
 
@@ -23,6 +26,7 @@ mod clock;
 mod engine;
 mod mixer;
 mod output;
+mod run;
 mod sim;
 
 pub use bank::{
@@ -36,6 +40,7 @@ pub use mixer::{
     MAX_VOLUME, Mixer, STEAL_FADE_MS,
 };
 pub use output::{AudioOutput, OutputError, RecordingOutput, Wake};
+pub use run::{RunReport, run_audio};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
 
 /// Channels of every output buffer (interleaved left, right).

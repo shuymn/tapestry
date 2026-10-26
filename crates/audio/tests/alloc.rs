@@ -1,5 +1,6 @@
 //! Once built, the engine allocates nothing per step: draining commands,
-//! scheduling BGM, stealing voices, mixing, limiting and writing.
+//! scheduling BGM, stealing voices, mixing, limiting and writing; nor does
+//! the audio thread loop around it.
 //!
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -8,10 +9,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use audio::{
-    AudioEngine, RecordingOutput, SHIFT_HISTORY, SimConfig, SimDevice, Sound, SoundBank, SoundCmd,
+    AudioEngine, AudioOutput, OutputError, RecordingOutput, SHIFT_HISTORY, SimConfig, SimDevice,
+    Sound, SoundBank, SoundCmd, Wake, run_audio,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::RingBuffer;
@@ -52,6 +54,35 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
+
+/// Sets `stop` during its `left`th wait from now.
+struct StopAfter<'a, O> {
+    inner: &'a mut O,
+    left: u32,
+    stop: &'a AtomicBool,
+}
+
+impl<O: AudioOutput> AudioOutput for StopAfter<'_, O> {
+    fn rate(&self) -> u32 {
+        self.inner.rate()
+    }
+
+    fn period(&self) -> u32 {
+        self.inner.period()
+    }
+
+    fn wait(&mut self) -> Wake {
+        self.left -= 1;
+        if self.left == 0 {
+            self.stop.store(true, Ordering::Release);
+        }
+        self.inner.wait()
+    }
+
+    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
+        self.inner.write(f)
+    }
+}
 
 #[test]
 fn mixing_does_not_allocate() {
@@ -103,8 +134,16 @@ fn mixing_does_not_allocate() {
         commands += r.commands;
         e.drain_scheduled(|_| {});
     }
+    let stop = AtomicBool::new(false);
+    let mut looped = StopAfter {
+        inner: &mut out,
+        left: 500,
+        stop: &stop,
+    };
+    let run = run_audio(&mut looped, &mut e, &mut rx, &stop).unwrap();
     TRACK.set(false);
 
+    assert_eq!(run.steps, 500);
     assert_eq!(commands, 3 * STEPS);
     assert!(frames > u64::from(STEPS) * 480, "{frames}");
     assert!(out.inner().underruns() > SHIFT_HISTORY as u64);
