@@ -177,18 +177,12 @@ pub struct View {
 /// wanted after it.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Something that looks at frames as they are drawn: the measurement
-/// (D11) and the dev-tools frame dump. Called after every frame, presented
-/// or not.
+/// Something that looks at frames as they are drawn, after the
+/// measurement (D11): the dev-tools frame dump. Called after every frame,
+/// presented or not.
 pub trait FrameSink: Send {
     /// Called after each frame.
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>);
-}
-
-impl FrameSink for Measure {
-    fn frame(&mut self, _screen: &dyn Screen, drawn: &Drawn<'_>) {
-        Self::frame(self, drawn);
-    }
 }
 
 /// No frame sink.
@@ -489,7 +483,7 @@ impl Run {
                     // outside it.
                     #[cfg(feature = "dev-tools")]
                     crate::alloc_count::app_region(play.is_some());
-                    FrameSink::frame(&mut self.measure, screen.as_ref(), &d);
+                    self.measure.frame(&d);
                     #[cfg(feature = "dev-tools")]
                     crate::alloc_count::app_region(false);
                     self.frames.frame(screen.as_ref(), &d);
