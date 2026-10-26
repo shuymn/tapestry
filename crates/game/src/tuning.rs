@@ -166,10 +166,14 @@ impl Tuning {
         TimeUs(i64::from(self.visible_time_ms) * 1_000)
     }
 
-    /// Writes the values into `settings`.
+    /// Writes the values into `settings`. A volume still at the whole
+    /// percent `settings` rounds to keeps its exact value (0.754 stays
+    /// 0.754 until a volume key moves it).
     pub fn apply_to(self, settings: &mut Settings) {
         settings.player.visible_time_ms = self.visible_time_ms;
-        settings.device.master_volume = self.volume();
+        if self.volume_percent != Self::of(settings).volume_percent {
+            settings.device.master_volume = self.volume();
+        }
         settings.device.display_offset_us = self.display_offset_us;
         settings.device.input_offset_us = self.input_offset_us;
     }

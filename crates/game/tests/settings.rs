@@ -729,3 +729,20 @@ fn settings_keys_step_and_stop_at_their_bounds() {
         -1_000_000
     );
 }
+
+/// A volume between whole percents is written back as it was until a
+/// volume key moves it; then it is the step's whole percent.
+#[test]
+fn an_untouched_volume_keeps_its_exact_value() {
+    let mut s = changed();
+    s.device.master_volume = 0.754;
+    let t = Tuning::of(&s);
+    assert_eq!(t.volume_percent, 75);
+    let mut kept = s.clone();
+    t.adjust(Adjust::HiSpeedDown).apply_to(&mut kept);
+    assert_eq!(kept.device.master_volume, 0.754);
+    assert_eq!(kept.player.visible_time_ms, 2_375);
+    let mut moved = s.clone();
+    t.adjust(Adjust::VolumeUp).apply_to(&mut moved);
+    assert_eq!(moved.device.master_volume, 0.8);
+}
