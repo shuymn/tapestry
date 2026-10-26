@@ -126,6 +126,10 @@ struct Fake {
     /// An audio control whose readiness the play waits for.
     audio: Option<game::AudioControl>,
     reports: Vec<PlayReport>,
+    /// Input offsets the player sets at these clock times, as on the end
+    /// screen: each waits for the next play.
+    offset_changes: Vec<(i64, i64)>,
+    pending_offset: Option<i64>,
 }
 
 impl Fake {
@@ -160,6 +164,8 @@ impl Fake {
             shows: 0,
             audio: None,
             reports: Vec::new(),
+            offset_changes: Vec::new(),
+            pending_offset: None,
         }
     }
 
@@ -189,6 +195,10 @@ impl Rig for Fake {
         }
         self.script.poll(self.clock.now(), &mut self.sources);
         self.drain_sounds();
+        let now = self.clock.now().0;
+        while let Some(i) = self.offset_changes.iter().position(|&(at, _)| at <= now) {
+            self.pending_offset = Some(self.offset_changes.remove(i).1);
+        }
     }
 
     fn take(&mut self) -> Option<Command> {
@@ -299,6 +309,12 @@ impl Rig for Fake {
 
     fn show_end(&mut self, _report: &PlayReport) {
         self.shows += 1;
+    }
+
+    fn before_play(&mut self, settings: &mut Settings) {
+        if let Some(o) = self.pending_offset.take() {
+            settings.device.input_offset_us = o;
+        }
     }
 }
 
@@ -711,4 +727,49 @@ fn a_gone_audio_thread_fails_the_preparation() {
         );
         assert!(rig.origins.is_empty(), "{took_a_play}");
     }
+}
+
+/// The input offset is changed from 3 ms to 8 ms during play 1, which is
+/// then retried: play 1 is evaluated and recorded with 3 ms, play 2 with
+/// 8 ms. A change during play 2 waits for a play after it.
+#[test]
+fn input_offset_change_applies_next_play_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    // Presses 3 ms after each note on the clock, as in
+    // `two_plays_at_nonzero_origins_with_an_input_offset`.
+    let items = vec![
+        key(9_303_000, Z, 1),
+        key(9_353_000, Z, 0),
+        key(11_503_000, Z, 1),
+        key(11_553_000, Z, 0),
+        key(12_003_000, Z, 1),
+        key(12_053_000, Z, 0),
+    ];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
+    rig.offset_changes = vec![(9_400_000, 8_000), (11_600_000, 21_000)];
+    game::live::run(&mut loaded, &mut rig).unwrap();
+
+    let [one, two] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    let offset = |r: &PlayReport| {
+        let sources = &r.record.as_ref().unwrap().devices.sources;
+        assert_eq!(sources.len(), 1);
+        sources[0].profile.input_offset
+    };
+    assert_eq!(offset(one), TimeUs(OFFSET));
+    assert_eq!(offset(two), TimeUs(8_000));
+    // Play 1 hits exactly with 3 ms. Play 2's presses, 3 ms late on the
+    // clock, are 8 − 3 = 5 ms early with 8 ms.
+    assert_eq!(judged(one), [(0, Judgment::Perfect, Some(0))]);
+    assert_eq!(
+        judged(two),
+        [
+            (0, Judgment::Perfect, Some(-5_000)),
+            (1, Judgment::Perfect, Some(-5_000))
+        ]
+    );
+    // The change made during play 2 is still waiting.
+    assert_eq!(rig.pending_offset, Some(21_000));
 }

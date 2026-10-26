@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 mod audio_loop;
+mod keys;
 pub mod live;
 mod logic;
 mod policy;
@@ -27,9 +28,14 @@ mod save;
 mod session;
 mod settings;
 mod sound;
+mod tuning;
 
 pub use audio_loop::{
     AudioControl, AudioCtl, AudioWaitError, AudioWorker, SWITCH_TIMEOUT, audio_control,
+};
+pub use keys::{
+    Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, Press, ROLES,
+    Refusal, capture_keys,
 };
 pub use live::{Closing, LiveError, Opening, Rig};
 pub use logic::{
@@ -55,7 +61,11 @@ pub use session::{
     ReloadError, Session, SessionConfig, SessionError, Settings,
 };
 pub use settings::{
-    DataRoot, DeviceSettings, KeyConfig, LaneKey, PlayerSettings, SettingsError, load_settings,
-    save_settings,
+    DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, PlayerSettings, Role, SettingsError,
+    load_settings, reserved_key, save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
+pub use tuning::{
+    Adjust, DEFAULT_VISIBLE_TIME_MS, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, Tuning,
+    VISIBLE_TIME_MS, VISIBLE_TIME_STEP_MS, VOLUME_STEP_PERCENT,
+};

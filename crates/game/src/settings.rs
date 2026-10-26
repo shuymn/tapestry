@@ -16,6 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::save::write_atomic;
+use crate::tuning::{Adjust, DEFAULT_VISIBLE_TIME_MS, OFFSET_LIMIT_US, VISIBLE_TIME_MS};
 
 /// The directory holding every settings file, the presets and the records.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +72,10 @@ pub enum SettingsError {
     },
     /// The file is not TOML of the settings' shape.
     Parse(String),
+    /// The file reads, but a value cannot be used: a key config binding
+    /// one control to two roles or a reserved key, a lane the game does
+    /// not have, or a setting outside its range.
+    Invalid(String),
 }
 
 impl From<io::Error> for SettingsError {
@@ -87,6 +92,7 @@ impl fmt::Display for SettingsError {
         match self {
             Self::Io { message, .. } => write!(f, "the settings file cannot be used: {message}"),
             Self::Parse(e) => write!(f, "the settings file cannot be read: {e}"),
+            Self::Invalid(e) => write!(f, "the settings cannot be used: {e}"),
         }
     }
 }
@@ -115,7 +121,136 @@ pub struct KeyConfig {
     pub quit: Option<u32>,
 }
 
+/// What a control is bound to in a key config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// A lane: 0 is the scratch, 1-7 the keys.
+    Lane(u8),
+    /// Retry.
+    Retry,
+    /// Quit.
+    Quit,
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lane(0) => f.write_str("scratch"),
+            Self::Lane(n) => write!(f, "key {n}"),
+            Self::Retry => f.write_str("retry"),
+            Self::Quit => f.write_str("quit"),
+        }
+    }
+}
+
+/// Why a key config cannot be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyError {
+    /// One control bound to two roles.
+    Overlap {
+        /// The control.
+        control: u32,
+        /// The role it was bound to first.
+        first: Role,
+        /// The role it was bound to again.
+        second: Role,
+    },
+    /// A keyboard key the game reserves for something else.
+    Reserved {
+        /// The key's scan code.
+        control: u32,
+        /// What the game uses it for.
+        reserved_for: &'static str,
+    },
+    /// A lane the game does not have.
+    NoSuchLane(u8),
+    /// Retry or quit bound to something other than a keyboard key: stage 1
+    /// reads them from the window's keyboard messages only.
+    NotAKeyboardKey(Role),
+}
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Overlap {
+                control,
+                first,
+                second,
+            } => write!(
+                f,
+                "control {control:#x} is bound to both {first} and {second}"
+            ),
+            Self::Reserved {
+                control,
+                reserved_for,
+            } => write!(f, "key {control:#x} is reserved for {reserved_for}"),
+            Self::NoSuchLane(l) => write!(f, "lane {l} does not exist (lanes are 0 to 7)"),
+            Self::NotAKeyboardKey(r) => write!(f, "{r} takes keyboard keys only"),
+        }
+    }
+}
+
+impl std::error::Error for KeyError {}
+
+/// What the game reserves keyboard key `code` (a scan code) for, if
+/// anything: the settings keys and the key config's keep key are never
+/// bound.
+#[must_use]
+pub fn reserved_key(code: u32) -> Option<&'static str> {
+    if code == crate::keys::KEEP_KEY {
+        return Some("keeping a binding in key config");
+    }
+    Adjust::from_key(code).map(Adjust::name)
+}
+
 impl KeyConfig {
+    /// Every binding with its role: the lanes, then retry and quit.
+    pub fn roles(&self) -> impl Iterator<Item = (u32, Role)> + '_ {
+        self.lanes
+            .iter()
+            .map(|k| (k.control, Role::Lane(k.lane)))
+            .chain(self.retry.map(|c| (c, Role::Retry)))
+            .chain(self.quit.map(|c| (c, Role::Quit)))
+    }
+
+    /// Checks the key config of a kind of device: every lane exists, no
+    /// control has two roles, a keyboard binds no reserved key, and only a
+    /// keyboard binds retry and quit.
+    ///
+    /// # Errors
+    ///
+    /// The first binding that breaks a rule.
+    pub fn check(&self, kind: DeviceKind) -> Result<(), KeyError> {
+        let mut seen: Vec<(u32, Role)> = Vec::new();
+        for (control, role) in self.roles() {
+            if kind != DeviceKind::Keyboard && matches!(role, Role::Retry | Role::Quit) {
+                return Err(KeyError::NotAKeyboardKey(role));
+            }
+            if let Role::Lane(l) = role
+                && Lane::new(l).is_none()
+            {
+                return Err(KeyError::NoSuchLane(l));
+            }
+            if kind == DeviceKind::Keyboard
+                && let Some(reserved_for) = reserved_key(control)
+            {
+                return Err(KeyError::Reserved {
+                    control,
+                    reserved_for,
+                });
+            }
+            if let Some(&(_, first)) = seen.iter().find(|(c, _)| *c == control) {
+                return Err(KeyError::Overlap {
+                    control,
+                    first,
+                    second: role,
+                });
+            }
+            seen.push((control, role));
+        }
+        Ok(())
+    }
+
     /// Every recorded control: the lanes and the system controls.
     #[must_use]
     pub fn recorded(&self) -> Vec<ControlId> {
@@ -160,7 +295,7 @@ pub struct DeviceSettings {
     pub display_offset_us: i64,
     /// The audio device's id; the system default when absent.
     pub audio_device: Option<String>,
-    /// The master volume, 0.0 to 1.0 being unity or below.
+    /// The master volume, 0.0 (silent) to 1.0 (unity).
     pub master_volume: f32,
 }
 
@@ -202,6 +337,39 @@ impl DeviceSettings {
         }
     }
 
+    /// Checks what [`Settings::load`] cannot leave to the types: both key
+    /// configs ([`KeyConfig::check`]), the input and display offsets within
+    /// ±[`OFFSET_LIMIT_US`], and the master volume from 0.0 to 1.0.
+    ///
+    /// # Errors
+    ///
+    /// The first value that cannot be used, for the player.
+    pub fn validate(&self) -> Result<(), String> {
+        self.keyboard
+            .check(DeviceKind::Keyboard)
+            .map_err(|e| format!("keyboard key config: {e}"))?;
+        self.controller
+            .check(DeviceKind::Controller)
+            .map_err(|e| format!("controller key config: {e}"))?;
+        for (name, us) in [
+            ("input_offset_us", self.input_offset_us),
+            ("display_offset_us", self.display_offset_us),
+        ] {
+            if !(-OFFSET_LIMIT_US..=OFFSET_LIMIT_US).contains(&us) {
+                return Err(format!(
+                    "{name} {us} is outside -{OFFSET_LIMIT_US} to {OFFSET_LIMIT_US}"
+                ));
+            }
+        }
+        if !(0.0..=1.0).contains(&self.master_volume) {
+            return Err(format!(
+                "master_volume {} is outside 0.0 to 1.0",
+                self.master_volume
+            ));
+        }
+        Ok(())
+    }
+
     /// Gives `engine` the master volume and the audio output offset. An
     /// out-of-range volume is not applied; the engine keeps unity.
     pub fn apply_to(&self, engine: &mut AudioEngine) {
@@ -229,8 +397,9 @@ impl DeviceSettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PlayerSettings {
-    /// The scroll speed, in thousandths.
-    pub hi_speed_milli: u32,
+    /// Hi-speed as the visible time, ms: how long a note takes from the
+    /// top of the lane to the judgment line at the chart's start BPM (D9).
+    pub visible_time_ms: u32,
     /// The preset file in `presets/`.
     pub preset: String,
     /// The gauge shown, by its index in the preset.
@@ -240,10 +409,29 @@ pub struct PlayerSettings {
 impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
-            hi_speed_milli: 1_000,
+            visible_time_ms: DEFAULT_VISIBLE_TIME_MS,
             preset: "custom.toml".to_owned(),
             displayed_gauge: 0,
         }
+    }
+}
+
+impl PlayerSettings {
+    /// Checks the visible time is within [`VISIBLE_TIME_MS`].
+    ///
+    /// # Errors
+    ///
+    /// The value outside its range, for the player.
+    pub fn validate(&self) -> Result<(), String> {
+        if !VISIBLE_TIME_MS.contains(&self.visible_time_ms) {
+            return Err(format!(
+                "visible_time_ms {} is outside {} to {}",
+                self.visible_time_ms,
+                VISIBLE_TIME_MS.start(),
+                VISIBLE_TIME_MS.end()
+            ));
+        }
+        Ok(())
     }
 }
 

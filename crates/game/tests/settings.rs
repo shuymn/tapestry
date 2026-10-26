@@ -5,8 +5,8 @@ use std::fs;
 use bms_model::{Lane, TimeUs};
 use eval::{Binding, ControlId, SourceProfile};
 use game::{
-    DataRoot, DeviceSettings, KeyConfig, LaneKey, LocalRecords, PlayerSettings, RecordSink,
-    Settings, SettingsError, load_settings, save_settings, write_atomic,
+    Adjust, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, LocalRecords, PlayerSettings,
+    RecordSink, Role, Settings, SettingsError, Tuning, load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 
@@ -38,12 +38,18 @@ fn changed() -> Settings {
                 quit: None,
             },
             controller: KeyConfig {
-                lanes: vec![LaneKey {
-                    control: 7,
-                    lane: 4,
-                }],
+                lanes: vec![
+                    LaneKey {
+                        control: 7,
+                        lane: 4,
+                    },
+                    LaneKey {
+                        control: 9,
+                        lane: 6,
+                    },
+                ],
                 retry: None,
-                quit: Some(9),
+                quit: None,
             },
             input_offset_us: 4_500,
             audio_offset_us: -12_000,
@@ -52,7 +58,7 @@ fn changed() -> Settings {
             master_volume: 0.75,
         },
         player: PlayerSettings {
-            hi_speed_milli: 2_350,
+            visible_time_ms: 2_350,
             preset: "wide.toml".to_owned(),
             displayed_gauge: 1,
         },
@@ -69,7 +75,7 @@ fn missing_files_give_the_defaults() {
 }
 
 #[test]
-fn settings_round_trip_atomically() {
+fn device_and_player_settings_round_trip() {
     let (_dir, root) = temp_root();
     let s = changed();
     s.save(&root).unwrap();
@@ -84,17 +90,50 @@ fn settings_round_trip_atomically() {
     // A hand-written file in the same units reads the same.
     fs::write(
         root.player_settings(),
-        "hi_speed_milli = 2350\npreset = \"wide.toml\"\ndisplayed_gauge = 1\n",
+        "visible_time_ms = 2350\npreset = \"wide.toml\"\ndisplayed_gauge = 1\n",
     )
     .unwrap();
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
+
+    // The settings keys' values, stepped and written as the game does at
+    // the end of a play, come back the same: hi-speed up twice (2350 −
+    // 2 × 25 = 2300 ms), volume down once (75 − 5 = 70 %), display offset
+    // up once (16.7 + 1 = 17.7 ms) and input offset down three times
+    // (4.5 − 3 = 1.5 ms).
+    let mut t = Tuning::of(&s);
+    for a in [
+        Adjust::HiSpeedUp,
+        Adjust::HiSpeedUp,
+        Adjust::VolumeDown,
+        Adjust::DisplayOffsetUp,
+        Adjust::InputOffsetDown,
+        Adjust::InputOffsetDown,
+        Adjust::InputOffsetDown,
+    ] {
+        t = t.adjust(a);
+    }
+    let mut stepped = s.clone();
+    t.apply_to(&mut stepped);
+    stepped.save(&root).unwrap();
+    let back = Settings::load(&root).unwrap();
+    assert_eq!(back, stepped);
+    assert_eq!(back.player.visible_time_ms, 2_300);
+    assert_eq!(back.device.master_volume, 0.7);
+    assert_eq!(back.device.display_offset_us, 17_700);
+    assert_eq!(back.device.input_offset_us, 1_500);
+    // Everything else is as it was.
+    assert_eq!(back.device.keyboard, s.device.keyboard);
+    assert_eq!(back.device.controller, s.device.controller);
+    assert_eq!(back.device.audio_offset_us, -12_000);
+    assert_eq!(back.player.preset, "wide.toml");
+    assert_eq!(Tuning::of(&back), t);
 }
 
 #[test]
 fn unreadable_settings_are_errors_not_defaults() {
     let (_dir, root) = temp_root();
     fs::create_dir_all(root.path()).unwrap();
-    fs::write(root.player_settings(), "hi_speed_milli = \"fast\"").unwrap();
+    fs::write(root.player_settings(), "visible_time_ms = \"fast\"").unwrap();
     assert!(matches!(
         load_settings::<PlayerSettings>(&root.player_settings()),
         Err(SettingsError::Parse(_))
@@ -131,10 +170,16 @@ fn key_config_gives_profiles_and_recorded_controls() {
         vec![
             SourceProfile {
                 input_offset: TimeUs(4_500),
-                bindings: vec![Binding {
-                    control: ControlId(7),
-                    lane: lane(4)
-                }],
+                bindings: vec![
+                    Binding {
+                        control: ControlId(7),
+                        lane: lane(4)
+                    },
+                    Binding {
+                        control: ControlId(9),
+                        lane: lane(6)
+                    },
+                ],
             },
             SourceProfile {
                 input_offset: TimeUs(4_500),
@@ -339,4 +384,348 @@ fn sample() -> replay::PlayRecord {
             incomplete: replay::Incomplete::default(),
         },
     }
+}
+
+/// Writes both files and loads them as the game does.
+fn load_written(
+    device: &DeviceSettings,
+    player: &PlayerSettings,
+) -> Result<Settings, SettingsError> {
+    let (_dir, root) = temp_root();
+    save_settings(&root.device_settings(), device).unwrap();
+    save_settings(&root.player_settings(), player).unwrap();
+    Settings::load(&root)
+}
+
+#[track_caller]
+fn assert_invalid(device: &DeviceSettings, player: &PlayerSettings, says: &str) {
+    match load_written(device, player) {
+        Err(SettingsError::Invalid(e)) => assert!(e.contains(says), "{e} lacks {says}"),
+        other => panic!("{other:?} for {says}"),
+    }
+}
+
+fn with(f: impl Fn(&mut DeviceSettings)) -> DeviceSettings {
+    let mut d = DeviceSettings::default();
+    f(&mut d);
+    d
+}
+
+fn lane_key(lane: u8) -> u32 {
+    DeviceSettings::default()
+        .keyboard
+        .lanes
+        .iter()
+        .find(|k| k.lane == lane)
+        .unwrap()
+        .control
+}
+
+fn set_lane(d: &mut DeviceSettings, lane: u8, control: u32) {
+    d.keyboard
+        .lanes
+        .iter_mut()
+        .find(|k| k.lane == lane)
+        .unwrap()
+        .control = control;
+}
+
+#[test]
+fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load() {
+    let player = PlayerSettings::default();
+    assert!(load_written(&DeviceSettings::default(), &player).is_ok());
+
+    // One key on two lanes, on a lane and retry, on a lane and quit, and
+    // on retry and quit.
+    let cases = [
+        (
+            with(|d| set_lane(d, 5, lane_key(2))),
+            KeyError::Overlap {
+                control: lane_key(2),
+                first: Role::Lane(2),
+                second: Role::Lane(5),
+            },
+        ),
+        (
+            with(|d| d.keyboard.retry = Some(lane_key(3))),
+            KeyError::Overlap {
+                control: lane_key(3),
+                first: Role::Lane(3),
+                second: Role::Retry,
+            },
+        ),
+        (
+            with(|d| d.keyboard.quit = Some(lane_key(0))),
+            KeyError::Overlap {
+                control: lane_key(0),
+                first: Role::Lane(0),
+                second: Role::Quit,
+            },
+        ),
+        (
+            with(|d| d.keyboard.quit = d.keyboard.retry),
+            KeyError::Overlap {
+                control: 0x0e,
+                first: Role::Retry,
+                second: Role::Quit,
+            },
+        ),
+    ];
+    for (d, e) in &cases {
+        assert_eq!(d.keyboard.check(DeviceKind::Keyboard), Err(*e));
+        assert_invalid(d, &player, "device.toml: keyboard key config");
+        assert_invalid(d, &player, "is bound to both");
+    }
+
+    // The settings keys F1 (first) and F8 (last) and the keep key F12, as
+    // a lane, retry and quit; F9 is free.
+    let reserved = [
+        (with(|d| set_lane(d, 1, 0x3b)), 0x3b, "hi-speed"),
+        (
+            with(|d| d.keyboard.retry = Some(0x42)),
+            0x42,
+            "input offset",
+        ),
+        (
+            with(|d| d.keyboard.quit = Some(0x58)),
+            0x58,
+            "keeping a binding",
+        ),
+    ];
+    for (d, control, what) in &reserved {
+        assert!(matches!(
+            d.keyboard.check(DeviceKind::Keyboard),
+            Err(KeyError::Reserved { control: c, .. }) if c == *control
+        ));
+        assert_invalid(d, &player, what);
+    }
+    assert!(load_written(&with(|d| set_lane(d, 1, 0x43)), &player).is_ok());
+
+    // A lane the game does not have.
+    let lane_8 = with(|d| d.keyboard.lanes[0].lane = 8);
+    assert_eq!(
+        lane_8.keyboard.check(DeviceKind::Keyboard),
+        Err(KeyError::NoSuchLane(8))
+    );
+    assert_invalid(&lane_8, &player, "lane 8 does not exist");
+
+    // Controllers: lanes may use any control, F1's and F12's numbers
+    // included, but not one control twice, and never retry or quit.
+    let pad = |lanes: &[(u32, u8)], retry, quit| {
+        with(|d| {
+            d.controller = KeyConfig {
+                lanes: lanes
+                    .iter()
+                    .map(|&(control, lane)| LaneKey { control, lane })
+                    .collect(),
+                retry,
+                quit,
+            };
+        })
+    };
+    assert!(load_written(&pad(&[(0x3b, 1), (0x58, 2)], None, None), &player).is_ok());
+    assert_invalid(
+        &pad(&[(4, 1), (4, 6)], None, None),
+        &player,
+        "device.toml: controller key config: control 0x4 is bound to both key 1 and key 6",
+    );
+    assert_invalid(
+        &pad(&[(4, 1)], Some(5), None),
+        &player,
+        "retry takes keyboard keys only",
+    );
+    assert_invalid(
+        &pad(&[(4, 1)], None, Some(6)),
+        &player,
+        "quit takes keyboard keys only",
+    );
+}
+
+#[test]
+fn settings_outside_their_ranges_are_refused_on_load() {
+    let player = PlayerSettings::default();
+    let device = DeviceSettings::default();
+    let p = |ms: u32| PlayerSettings {
+        visible_time_ms: ms,
+        ..player.clone()
+    };
+    // The edges load; one step past each does not.
+    for ok in [
+        with(|d| d.input_offset_us = 1_000_000),
+        with(|d| d.input_offset_us = -1_000_000),
+        with(|d| d.display_offset_us = 1_000_000),
+        with(|d| d.display_offset_us = -1_000_000),
+        with(|d| d.master_volume = 0.0),
+        with(|d| d.master_volume = 1.0),
+    ] {
+        assert!(load_written(&ok, &player).is_ok(), "{ok:?}");
+    }
+    let refused = [
+        (
+            with(|d| d.input_offset_us = 1_000_001),
+            "input_offset_us 1000001",
+        ),
+        (
+            with(|d| d.input_offset_us = -1_000_001),
+            "input_offset_us -1000001",
+        ),
+        (
+            with(|d| d.display_offset_us = 1_000_001),
+            "display_offset_us 1000001",
+        ),
+        (
+            with(|d| d.display_offset_us = -1_000_001),
+            "display_offset_us -1000001",
+        ),
+        (with(|d| d.master_volume = 1.01), "master_volume 1.01"),
+        (with(|d| d.master_volume = -0.01), "master_volume -0.01"),
+        (with(|d| d.master_volume = f32::NAN), "master_volume NaN"),
+    ];
+    for (d, says) in &refused {
+        assert_invalid(d, &player, says);
+    }
+    for ok in [100, 4_000] {
+        assert!(load_written(&device, &p(ok)).is_ok(), "{ok}");
+    }
+    assert_invalid(
+        &device,
+        &p(99),
+        "player.toml: visible_time_ms 99 is outside 100 to 4000",
+    );
+    assert_invalid(&device, &p(4_001), "visible_time_ms 4001");
+}
+
+#[test]
+fn settings_keys_step_and_stop_at_their_bounds() {
+    // F1 to F8, nothing either side; F12 is reserved too.
+    let keys: Vec<u32> = Adjust::ALL.iter().map(|a| a.key()).collect();
+    assert_eq!(keys, [0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42]);
+    for a in Adjust::ALL {
+        assert_eq!(Adjust::from_key(a.key()), Some(a));
+        assert!(game::reserved_key(a.key()).is_some());
+    }
+    for free in [0x3a, 0x43, 0x01, 0x0e] {
+        assert_eq!(Adjust::from_key(free), None);
+        assert_eq!(game::reserved_key(free), None);
+    }
+    assert!(game::reserved_key(game::KEEP_KEY).is_some());
+
+    let t = Tuning {
+        visible_time_ms: 600,
+        volume_percent: 40,
+        display_offset_us: 2_000,
+        input_offset_us: -3_000,
+    };
+    // Each key moves its own value only.
+    let steps = [
+        (
+            Adjust::HiSpeedDown,
+            Tuning {
+                visible_time_ms: 625,
+                ..t
+            },
+        ),
+        (
+            Adjust::HiSpeedUp,
+            Tuning {
+                visible_time_ms: 575,
+                ..t
+            },
+        ),
+        (
+            Adjust::VolumeDown,
+            Tuning {
+                volume_percent: 35,
+                ..t
+            },
+        ),
+        (
+            Adjust::VolumeUp,
+            Tuning {
+                volume_percent: 45,
+                ..t
+            },
+        ),
+        (
+            Adjust::DisplayOffsetDown,
+            Tuning {
+                display_offset_us: 1_000,
+                ..t
+            },
+        ),
+        (
+            Adjust::DisplayOffsetUp,
+            Tuning {
+                display_offset_us: 3_000,
+                ..t
+            },
+        ),
+        (
+            Adjust::InputOffsetDown,
+            Tuning {
+                input_offset_us: -4_000,
+                ..t
+            },
+        ),
+        (
+            Adjust::InputOffsetUp,
+            Tuning {
+                input_offset_us: -2_000,
+                ..t
+            },
+        ),
+    ];
+    for (a, after) in steps {
+        assert_eq!(t.adjust(a), after, "{a:?}");
+    }
+
+    // Hi-speed stops at 100 ms (fastest) and 4000 ms (slowest), also from
+    // values off the 25 ms grid.
+    let vis = |ms| Tuning {
+        visible_time_ms: ms,
+        ..t
+    };
+    assert_eq!(vis(100).adjust(Adjust::HiSpeedUp).visible_time_ms, 100);
+    assert_eq!(vis(110).adjust(Adjust::HiSpeedUp).visible_time_ms, 100);
+    assert_eq!(
+        vis(4_000).adjust(Adjust::HiSpeedDown).visible_time_ms,
+        4_000
+    );
+    assert_eq!(
+        vis(3_990).adjust(Adjust::HiSpeedDown).visible_time_ms,
+        4_000
+    );
+    assert_eq!(vis(600).visible_time(), TimeUs(600_000));
+    // Volume stops at 0 % and at unity.
+    let vol = |p| Tuning {
+        volume_percent: p,
+        ..t
+    };
+    assert_eq!(vol(0).adjust(Adjust::VolumeDown).volume_percent, 0);
+    assert_eq!(vol(3).adjust(Adjust::VolumeDown).volume_percent, 0);
+    assert_eq!(vol(100).adjust(Adjust::VolumeUp).volume_percent, 100);
+    assert_eq!(vol(98).adjust(Adjust::VolumeUp).volume_percent, 100);
+    assert_eq!(vol(0).volume(), 0.0);
+    assert_eq!(vol(100).volume(), 1.0);
+    // Offsets stop at ±1 s.
+    let off = |us| Tuning {
+        display_offset_us: us,
+        input_offset_us: us,
+        ..t
+    };
+    let top = off(999_500);
+    assert_eq!(
+        top.adjust(Adjust::DisplayOffsetUp).display_offset_us,
+        1_000_000
+    );
+    assert_eq!(top.adjust(Adjust::InputOffsetUp).input_offset_us, 1_000_000);
+    let bottom = off(-999_500);
+    assert_eq!(
+        bottom.adjust(Adjust::DisplayOffsetDown).display_offset_us,
+        -1_000_000
+    );
+    assert_eq!(
+        bottom.adjust(Adjust::InputOffsetDown).input_offset_us,
+        -1_000_000
+    );
 }
