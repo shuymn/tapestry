@@ -992,8 +992,17 @@ impl CollectionSlot for Slot {
 }
 
 #[test]
-fn removing_one_collection_removes_the_whole_controller() {
-    let (mut set, mut reader) = recording();
+fn removing_one_collection_removes_its_function() {
+    // Another function of the same device in the same container: a source
+    // of its own, with button 1 recorded.
+    const OTHER: DeviceId = DeviceId(0x7b2);
+    let mut set = connected();
+    set.connect(OTHER, DeviceKind::Controller);
+    set.set_recorded(OTHER, vec![button_control(1)]);
+    set.open_recording(TimeUs(0));
+    let mut readers = set.take_readers();
+    let mut other_reader = readers.pop().unwrap();
+    let mut reader = readers.pop().unwrap();
     let capture = Capture::new();
     let second = HidLayout {
         collection: 2,
@@ -1008,6 +1017,10 @@ fn removing_one_collection_removes_the_whole_controller() {
         Slot {
             key: Some(20),
             state: HidDevice::new(PAD, &second),
+        },
+        Slot {
+            key: Some(30),
+            state: HidDevice::new(OTHER, &layout(&[])),
         },
     ];
     // X rests at 0 on the first collection; button 1 of the second is
@@ -1036,13 +1049,28 @@ fn removing_one_collection_removes_the_whole_controller() {
     // The source is disconnected, and every slot of it is free.
     let events: Vec<_> = std::iter::from_fn(|| reader.pop()).collect();
     assert_eq!(events.last().map(|e| e.kind), Some(InputKind::Disconnected));
-    assert!(slots.iter().all(|s| s.key.is_none()));
+    assert!(slots[..2].iter().all(|s| s.key.is_none()));
+    // The other function stays connected and still records.
+    assert_eq!(slots[2].key, Some(30));
+    batch(&mut slots[2].state, &mut set, &capture, 22, &[press(&[1])]);
+    let other: Vec<_> = std::iter::from_fn(|| other_reader.pop()).collect();
+    assert_eq!(
+        other.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [InputKind::Control {
+            control: button_control(1),
+            value: 1
+        }]
+    );
     // The other collection's removal finds nothing more.
     assert!(!remove_collection(&mut slots, 20, &mut set));
     set.close_recording();
     set.open_recording(TimeUs(25));
-    assert_eq!(set.participants().count(), 0);
+    let sources: Vec<_> = set.participants().map(|(d, _)| d).collect();
+    assert_eq!(sources, [OTHER]);
     set.close_recording();
+    assert!(set.begin_batch(TimeUs(26)));
+    assert!(remove_collection(&mut slots, 30, &mut set));
+    set.end_batch(TimeUs(27));
 
     // Rediscovered: a new device with empty state, like a first
     // connection. Only what it reports after that is in the next

@@ -535,12 +535,14 @@ pub trait CollectionSlot {
     fn free(&mut self);
 }
 
-/// The collection `key` was removed. Its whole physical device leaves:
-/// every slot of it is freed, its cached button and position state
-/// dropped, and its source disconnected, releasing everything it held as
-/// any disconnect does. The device comes back only through fresh
-/// discovery of its collections, as a new device with empty state, like a
-/// first connection. Returns `false` when no slot reads `key`.
+/// The collection `key` was removed. Its source leaves, the function of
+/// the physical device it belongs to ([`place_collection`]): every slot of
+/// it is freed, its cached button and position state dropped, and its
+/// source disconnected, releasing everything it held as any disconnect
+/// does. Another function of the device stays. The function comes back
+/// only through fresh discovery of its collections, as a new device with
+/// empty state, like a first connection. Returns `false` when no slot
+/// reads `key`.
 pub fn remove_collection<S: CollectionSlot>(
     slots: &mut [S],
     key: u64,
