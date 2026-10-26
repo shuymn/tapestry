@@ -23,10 +23,34 @@ const fn is_envelope_error(e: &DecodeError) -> bool {
     )
 }
 
+/// Every seed in `expected` is generated, and no other: a deleted seed
+/// fails the test instead of going unchecked.
+fn assert_names(seeds: &[seeds::Seed], expected: &[&str]) {
+    let mut names: Vec<&str> = seeds.iter().map(|(name, _)| *name).collect();
+    let mut expected = expected.to_vec();
+    names.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(names, expected);
+}
+
 #[test]
 fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
-    let mut ok = 0;
-    for (name, body) in seeds::replay_bodies() {
+    let seeds = seeds::replay_bodies();
+    assert_names(
+        &seeds,
+        &[
+            "two_sources",
+            "no_events",
+            "extremes",
+            "section_past_end",
+            "count_beyond_data",
+            "too_many_events",
+            "zero_sources",
+            "trailing_bytes",
+            "truncated",
+        ],
+    );
+    for (name, body) in seeds {
         let result = replay_body(&body);
         if let Err(e) = &result {
             assert!(!is_envelope_error(e), "{name}: {e:?}");
@@ -35,7 +59,6 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
         match name {
             "two_sources" | "no_events" | "extremes" => {
                 assert_eq!(result, Ok(()), "{name}");
-                ok += 1;
             }
             "section_past_end" => assert!(
                 matches!(
@@ -59,12 +82,27 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
             _ => panic!("no expectation for seed {name}"),
         }
     }
-    assert_eq!(ok, 3);
 }
 
 #[test]
 fn replay_file_seeds_decode_or_fail_at_the_envelope() {
-    for (name, file) in seeds::replay_files() {
+    let seeds = seeds::replay_files();
+    assert_names(
+        &seeds,
+        &[
+            "two_sources",
+            "no_events",
+            "extremes",
+            "bad_magic",
+            "unsupported_version",
+            "unsupported_encoding",
+            "declared_too_large",
+            "decompress",
+            "header_only",
+            "length_mismatch",
+        ],
+    );
+    for (name, file) in seeds {
         let result = replay_file(&file).map(|_| ());
         let expected = match name {
             "two_sources" | "no_events" | "extremes" => Ok(()),
@@ -102,7 +140,18 @@ fn raw_input_seeds_reach_packets_reports_and_early_stops() {
         hid_blocks,
         reports,
     };
-    for (name, data) in seeds::raw_inputs() {
+    let seeds = seeds::raw_inputs();
+    assert_names(
+        &seeds,
+        &[
+            "keyboard_press",
+            "hid_reports",
+            "mixed_padded",
+            "truncated",
+            "count_beyond",
+        ],
+    );
+    for (name, data) in seeds {
         let expected = match name {
             "keyboard_press" => summary(1, 1, 1, 0, 0),
             "hid_reports" => summary(1, 1, 0, 1, 3),
