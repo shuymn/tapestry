@@ -328,7 +328,7 @@ fn a_stop_that_overflows_the_time_cap_is_refused() {
     // 2-bit denominator. Measure 1 adds 80_000_000 µs (4 beats at 3), then
     // turns to BPM 7 and stops 1_250_000 / 7 µs: the denominator becomes
     // 21, 5 bits, on the STOP's addition.
-    let text = "#BPM 3\n#BPM01 7\n#STOP01 1\n#00009:01\n#00108:01\n#00109:01\n";
+    let text = "#BPM 3\n#BPM01 7\n#STOP01 1\n#00009:01\n#00108:01\n#00109:01\n#00111:01\n";
     let with_bits = |max_time_bits| {
         load_with(
             text,

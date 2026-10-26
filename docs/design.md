@@ -758,7 +758,7 @@ Built in a later roadmap stage, as an extension at the saving extension point. T
 
 | Attack vector | Threat | Mitigation | Stage |
 | --- | --- | --- | --- |
-| Chart files | Computation breakdown or DoS from a huge note count, extreme BPM or STOP, deeply nested `#RANDOM` | Cap the note count, nesting depth, and time range. Time computation is exact with arbitrary-precision integers, caps their size, and rejects loading when exceeded. The same caps are applied on the server | 1 |
+| Chart files | Computation breakdown or DoS from a huge note count, extreme BPM or STOP, deeply nested `#RANDOM` | Cap the note count, line count, and time range (`#RANDOM` blocks cost O(1) a line whatever their depth). Time computation is exact with arbitrary-precision integers, caps their size, and rejects loading when exceeded. The same caps are applied on the server | 1 |
 | Audio and video | Decoder vulnerabilities | Use maintained decoders and narrow the supported codecs. Accept the remaining risk and keep dependencies up to date. Decoding in a separate process with restricted privileges is decided after measuring whether it is worth the handoff cost | 1 |
 | Archives | zip slip, zip bomb | Do not allow writes outside the extraction directory. Cap the extracted size and file count | 1 |
 | Dependencies | Supply chain attacks | Run `cargo-deny` and `cargo-audit` in CI and on a daily schedule, check for unused dependencies with `cargo-machete`, and pin the lockfile | 1 |

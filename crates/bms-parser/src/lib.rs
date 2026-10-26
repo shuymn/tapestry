@@ -8,9 +8,9 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 2
+//! # Loader version 3
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 2; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 3; changing any of them
 //! changes the version.
 //!
 //! - **Time:** each object's time is accumulated in exact rationals and
@@ -22,22 +22,29 @@
 //!   the 18th fractional one are cut off toward zero. A malformed timing
 //!   value is an error, and so is a measure length of 0, as written or cut
 //!   off to it; a malformed `#TOTAL` or `#DEFEXRANK` is ignored with a
-//!   warning. A BPM is at least 0.000001; the
-//!   scroll map takes it in millionths rounded down, while time uses the
-//!   exact value. `#TOTAL` and `#DEFEXRANK` are kept in thousandths rounded
+//!   warning. A BPM is at least 0.000001, and a negative one is an error,
+//!   since reverse scroll is not supported yet; the scroll map takes a BPM
+//!   in millionths rounded down, while time uses the exact value. `#TOTAL` and `#DEFEXRANK` are kept in thousandths rounded
 //!   down. A `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat)
 //!   whatever the measure length.
 //! - **Same position:** a BPM change applies before a STOP, so the STOP uses
 //!   the new BPM; a note at a STOP's position sounds at the STOP's start.
 //!   Channel 08 wins over channel 03; within a channel the later object in
 //!   the file wins. STOPs at one position add up.
+//! - **End:** the chart ends with its last note, mine or BGM object. Bar
+//!   lines, BPM changes and STOPs after it are dropped, and the duration
+//!   limit applies up to it.
 //! - **Lanes:** channels 16 (scratch), 11-15 and 18-19 (keys 1-7); 51-59
 //!   long notes (`#LNTYPE 1`, consecutive objects pair up); D1-D9 mines,
 //!   with the object id as damage. Channel 17 and other unused channels are
 //!   ignored with a warning; BGA channels 04, 06 and 07 silently. A 2P lane
 //!   object (21-29, 61-69, E1-E9) is an `Unsupported` error.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
-//!   by the previous plain note in its lane. The end plays no sound.
+//!   by the previous plain note in its lane. The end plays no sound. An
+//!   empty `#LNOBJ` is ignored, with one warning per chart.
+//! - **`#LNTYPE`:** read as an integer (`01` is 1). A value naming no type
+//!   (`0`, or not a number) is read as 1, with one warning per chart; any
+//!   other number, even one too large for `u32`, is unsupported.
 //! - **`#LNTYPE 1` pairing:** endpoints at one time in a lane merge first,
 //!   keeping the later object in the file, so a duplicated line does not
 //!   split a long note. The end object's sound is the end sound when its id
@@ -53,22 +60,25 @@
 //!   [`WarningKind::NoPlayableNotes`] warning; whether to play it is the
 //!   caller's decision.
 //! - **`#RANDOM n`:** draws `next() % n + 1` from SplitMix64 seeded with
-//!   [`LoadOptions::seed`]; `#SETRANDOM n` sets `n`. Every value of a block
-//!   in a taken branch is recorded in [`ChartIdentity::random_results`] in
-//!   file order, whether or not an `#IF` matches it. A block in a branch not
-//!   taken draws nothing. `n` must be a positive integer (an error
-//!   otherwise, since the chart's branches would be undefined).
-//! - **Blocks:** every line inside an `#IF` branch not taken is skipped,
-//!   headers (`#WAVxx`, `#BPMxx`, `#LNOBJ`, ...) included. `#IF k` is taken
-//!   when the nearest enclosing block's value is `k`; `#ELSE` when no
-//!   earlier branch of its `#IF` was. A `#RANDOM` directly inside another
-//!   ends it, since `#ENDRANDOM` is often left out; `#ELSE` and `#ENDIF`
-//!   also close blocks left open inside their `#IF`. `#IF` outside any block is never taken, and
-//!   a stray `#ELSE`, `#ENDIF` or `#ENDRANDOM` is ignored, each with a
-//!   warning: the base chart stays playable. An `#IF` still open at the end
-//!   of the file ends there, with a warning. Blocks nest at most
-//!   [`Limits::max_nesting`] deep (an error).
-//! - **Unsupported:** `#LNTYPE 2`, `#LNMODE` other than 1, negative
+//!   [`LoadOptions::seed`]; `#SETRANDOM n` sets `n`. Each is read wherever
+//!   it is, inside an `#IF` branch not read too, and every value is recorded
+//!   in [`ChartIdentity::random_results`] in file order. `n` must be a
+//!   positive integer (an error otherwise, since the chart's branches would
+//!   be undefined).
+//! - **Blocks**, as charts are written against (the reference is
+//!   jbms-parser's `BMSDecoder`): `#RANDOM` and `#SETRANDOM` push a value
+//!   and `#ENDRANDOM` pops one; `#IF k` pushes a flag, set when the latest
+//!   value is `k`, and `#ENDIF` pops whatever flag is on top. A line is read
+//!   when the top flag is set or no flag is open, headers (`#WAVxx`,
+//!   `#BPMxx`, `#LNOBJ`, ...) included. `#ELSE`, our addition, sets the top
+//!   flag when no earlier branch of its `#IF` was taken and clears it
+//!   otherwise. An `#IF` with no value to test pushes no flag, so the flag
+//!   already on top still decides (one warning per chart). An `#IF` met over an open `#IF` of
+//!   the same `#RANDOM` is warned about once per chart; a stray `#ELSE`,
+//!   `#ENDIF` or `#ENDRANDOM` is ignored with a warning, and an `#IF` still
+//!   open at the end of the file is a warning. The stacks are bounded by the
+//!   line limit.
+//! - **Unsupported:** `#LNTYPE` 2 or higher, `#LNMODE` other than 1, negative
 //!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
 //!   The branching ones are refused even inside a branch not taken.
 //! - **Resolved hash:** covers what the chart resolved to, not the
@@ -101,7 +111,7 @@ use bms_model::{Chart, ChartIdentity, ScrollMap, SoundId, SoundRef, TimeUs};
 pub use error::{LoadError, Warning, WarningKind};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 2;
+pub const LOADER_VERSION: u32 = 3;
 
 /// Bounds on the work a chart may cause (D14). The defaults sit far above
 /// real charts.
@@ -117,8 +127,6 @@ pub struct Limits {
     pub max_measure: u16,
     /// Longest resolved chart accepted.
     pub max_duration: TimeUs,
-    /// Deepest nesting of open `#RANDOM` and `#IF` blocks, each counting one.
-    pub max_nesting: usize,
     /// Most bits in the denominator of the exact running time (D3).
     pub max_time_bits: u64,
 }
@@ -131,7 +139,6 @@ impl Default for Limits {
             max_objects: 500_000,
             max_measure: 999,
             max_duration: TimeUs(60 * 60 * 1_000_000),
-            max_nesting: 16,
             max_time_bits: 16_384,
         }
     }

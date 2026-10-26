@@ -32,11 +32,17 @@ fn load(text: &str) -> Result<Loaded, LoadError> {
     load_seeded(text, 0)
 }
 
+fn times(notes: &[bms_model::Note]) -> Vec<i64> {
+    notes.iter().map(|n| n.time.0).collect()
+}
+
 /// The keys (lane indices) holding a note.
 fn keys(loaded: &Loaded) -> Vec<usize> {
-    (0..8)
-        .filter(|&l| !loaded.chart.lanes[l].is_empty())
-        .collect()
+    keys_of(&loaded.chart.lanes)
+}
+
+fn keys_of(lanes: &[Vec<bms_model::Note>; 8]) -> Vec<usize> {
+    (0..8).filter(|&l| !lanes[l].is_empty()).collect()
 }
 
 #[test]
@@ -74,60 +80,61 @@ fn seeded_branches_match_reference_values() {
 }
 
 #[test]
-fn nested_if_selects_inner_branch() {
+fn nested_blocks_read_by_the_top_flag_only() {
     let text = chart("random_nested.bms");
-    for (outer, inner, key) in [(1, 1, 1), (1, 2, 2), (2, 1, 3), (2, 2, 4)] {
+    for (outer, inner, read) in [
+        (1, 1, vec![1, 3]),
+        (1, 2, vec![2, 4]),
+        (2, 1, vec![1, 3]),
+        (2, 2, vec![2, 4]),
+    ] {
         // The first #RANDOM is the outer block; both inner ones get `inner`.
+        // Each inner #IF is the top flag inside its outer branch, so it is
+        // read by the inner value whatever the outer one, as charts expect.
         let fixed = text
             .replacen("#RANDOM 2", &format!("#SETRANDOM {outer}"), 1)
             .replace("#RANDOM 2", &format!("#SETRANDOM {inner}"));
         let loaded = load(&fixed).unwrap();
-        assert_eq!(keys(&loaded), vec![key], "outer {outer}, inner {inner}");
-        // The inner block of the branch not taken is never read.
-        assert_eq!(loaded.chart.identity.random_results, vec![outer, inner]);
+        assert_eq!(keys(&loaded), read, "outer {outer}, inner {inner}");
+        // Both inner blocks are drawn.
+        assert_eq!(
+            loaded.chart.identity.random_results,
+            vec![outer, inner, inner]
+        );
         assert_eq!(loaded.warnings, vec![]);
     }
 }
 
 #[test]
 fn branch_results_are_recorded_in_order() {
-    // Seed 1 draws 10451216379200822465, 13757245211066428519, then a third
-    // and fourth value (an independent computation): % 5 + 1 gives 1, then
-    // 5. The second block has no matching #IF and is recorded anyway;
-    // #SETRANDOM values are recorded too; the block inside the branch not
-    // taken draws nothing, so the final #RANDOM 7 takes the third value
-    // (% 7 + 1 = 2) rather than the fourth (1).
+    // Seed 1 draws 10451216379200822465, 13757245211066428519,
+    // 17911839290282890590 and 8196980753821780235 (an independent
+    // computation): % 5 + 1 gives 1, then 5; the #RANDOM 9 inside the branch
+    // not read is drawn too (% 9 + 1 = 4), so the final #RANDOM 7 takes the
+    // fourth value (% 7 + 1 = 1). The second block has no matching #IF and
+    // is recorded anyway; #SETRANDOM values are recorded too.
     let text = "#BPM 120\n#WAV01 click.wav\n\
                 #RANDOM 5\n#IF 1\n#00111:01\n#ENDIF\n#ENDRANDOM\n\
                 #RANDOM 5\n#IF 1\n#00112:01\n#ENDIF\n\
                 #SETRANDOM 7\n#IF 3\n#RANDOM 9\n#ENDIF\n#ENDRANDOM\n\
                 #RANDOM 7\n";
     let loaded = load_seeded(text, 1).unwrap();
-    assert_eq!(loaded.chart.identity.random_results, vec![1, 5, 7, 2]);
+    assert_eq!(loaded.chart.identity.random_results, vec![1, 5, 7, 4, 1]);
     assert_eq!(keys(&loaded), vec![1]);
 }
 
 #[test]
-fn nesting_deeper_than_cap_is_rejected() {
-    // Each level opens a #RANDOM and an #IF: 8 levels are 16 blocks.
-    let nested = |levels: usize| {
-        let mut text = String::from("#BPM 120\n#WAV01 click.wav\n#00111:01\n");
-        for _ in 0..levels {
-            text.push_str("#SETRANDOM 1\n#IF 1\n");
-        }
-        text
-    };
-    assert_eq!(
-        load(&nested(8))
-            .unwrap()
-            .chart
-            .identity
-            .random_results
-            .len(),
-        8
-    );
-    let too_deep = nested(8) + "#RANDOM 2\n";
-    assert_eq!(load(&too_deep), Err(LoadError::NestingTooDeep { line: 20 }));
+fn deep_blocks_are_bounded_only_by_the_line_limit() {
+    // 100 levels of #RANDOM and #IF, never closed: each line costs the same
+    // whatever the depth, so nothing refuses it; the note after them is read.
+    let mut text = String::from("#BPM 120\n#WAV01 click.wav\n");
+    for _ in 0..100 {
+        text.push_str("#SETRANDOM 1\n#IF 1\n");
+    }
+    text.push_str("#00111:01\n");
+    let loaded = load(&text).unwrap();
+    assert_eq!(loaded.chart.identity.random_results.len(), 100);
+    assert_eq!(keys(&loaded), vec![1]);
 }
 
 #[test]
@@ -174,9 +181,27 @@ fn stray_directives_warn_and_bad_values_fail() {
                 .collect::<Vec<_>>(),
         )
     };
-    // #IF without #RANDOM: never taken; #ELSE takes over.
+    // #IF without #RANDOM pushes no flag, so both branches are read and
+    // #ELSE and #ENDIF find no flag. A second such #IF is not warned again.
     assert_eq!(
-        warned("#BPM 120\n#WAV01 click.wav\n#IF 1\n#00111:01\n#ELSE\n#00112:01\n#ENDIF\n"),
+        warned(
+            "#BPM 120\n#WAV01 click.wav\n#IF 1\n#00111:01\n#ELSE\n#00112:01\n#ENDIF\n#IF 2\n#00113:01\n"
+        ),
+        (
+            vec![1, 2, 3],
+            vec![
+                WarningKind::UnmatchedDirective("#IF"),
+                WarningKind::UnmatchedDirective("#ELSE"),
+                WarningKind::UnmatchedDirective("#ENDIF"),
+            ]
+        )
+    );
+    // The #ENDIF after a flagless #IF pops whatever flag is on top: here
+    // the #IF 2 of value 1, so the last note is read.
+    assert_eq!(
+        warned(
+            "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 1\n#IF 2\n#ENDRANDOM\n#IF 1\n#00111:01\n#ENDIF\n#00112:01\n"
+        ),
         (vec![2], vec![WarningKind::UnmatchedDirective("#IF")])
     );
     // #ENDIF, #ELSE and #ENDRANDOM without a block: ignored.
@@ -210,7 +235,15 @@ fn stray_directives_warn_and_bad_values_fail() {
             .len(),
         40
     );
-    for bad in ["#RANDOM 0", "#RANDOM -1", "#RANDOM x", "#SETRANDOM 0"] {
+    for bad in [
+        "#RANDOM 0",
+        "#RANDOM -1",
+        "#RANDOM x",
+        "#RANDOM 2147483648",
+        "#SETRANDOM 0",
+        "#IF 0",
+        "#IF x",
+    ] {
         let text = format!("#BPM 120\n{bad}\n#00111:01\n");
         assert!(
             matches!(load(&text), Err(LoadError::InvalidValue { line: 2, .. })),
@@ -220,15 +253,16 @@ fn stray_directives_warn_and_bad_values_fail() {
 }
 
 #[test]
-fn else_closes_a_random_left_open_in_its_branch() {
-    // The inner block has no #ENDRANDOM; #ELSE still belongs to the outer #IF.
-    for (outer, key, results) in [(1, 1, vec![1, 1]), (2, 2, vec![2])] {
+fn a_random_inside_a_branch_not_read_still_draws_and_tests() {
+    // The inner #RANDOM is drawn whatever the outer value, and its #IF tests
+    // it on its own, as charts expect; #ELSE then turns the outer flag.
+    for (outer, keys_read, results) in [(1, vec![1], vec![1, 1]), (2, vec![1, 2], vec![2, 1])] {
         let text = format!(
             "#BPM 120\n#WAV01 click.wav\n#SETRANDOM {outer}\n#IF 1\n#RANDOM 1\n#IF 1\n\
              #00111:01\n#ENDIF\n#ELSE\n#00112:01\n#ENDIF\n"
         );
         let loaded = load(&text).unwrap();
-        assert_eq!(keys(&loaded), vec![key], "outer {outer}");
+        assert_eq!(keys(&loaded), keys_read, "outer {outer}");
         assert_eq!(
             loaded.chart.identity.random_results, results,
             "outer {outer}"
@@ -264,4 +298,73 @@ fn branch_records_do_not_change_the_resolved_hash() {
     assert_eq!(a.random_results, vec![2]);
     assert_eq!(b.random_results, vec![3]);
     assert_eq!(a.resolved_hash, b.resolved_hash);
+}
+
+#[test]
+fn if_flags_stack_as_charts_expect() {
+    let warned = |text: &str| {
+        let loaded = load(text).unwrap();
+        let warnings: Vec<_> = loaded
+            .warnings
+            .into_iter()
+            .map(|w| (w.line, w.kind))
+            .collect();
+        (keys_of(&loaded.chart.lanes), warnings)
+    };
+    // Value 2: #IF 2 (line 5) stacks on #IF 1, so its branch (key 2) is
+    // read; its #ENDIF makes #IF 1 count again, so key 3 is skipped; the
+    // last #ENDIF closes #IF 1 and key 1 is read.
+    let text = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#IF 2\n#00112:01\n#ENDIF\n#00113:01\n#ENDIF\n#00111:01\n";
+    assert_eq!(
+        warned(text),
+        (vec![1, 2], vec![(Some(5), WarningKind::UnclosedIf)])
+    );
+    // The same values in two #RANDOM blocks are still two blocks: an #IF of
+    // the second over one of the first is not warned about.
+    let two =
+        "#BPM 120\n#WAV01 click.wav\n#RANDOM 1\n#IF 1\n#ENDRANDOM\n#RANDOM 1\n#IF 1\n#00111:01\n";
+    assert_eq!(
+        warned(two),
+        (vec![1], vec![(None, WarningKind::UnclosedIf)])
+    );
+    // An #IF inside a new #RANDOM tests that value alone: its branch is
+    // read though the outer #IF 1 is not; after it the outer flag counts
+    // again.
+    let nested = "#BPM 120\n#WAV01 click.wav\n#SETRANDOM 2\n#IF 1\n#SETRANDOM 3\n#IF 3\n#00112:01\n#ENDIF\n#ENDRANDOM\n#00113:01\n#ENDIF\n#00111:01\n";
+    assert_eq!(warned(nested).0, vec![1, 2]);
+    // Thirty 45-way blocks, each closed by a single #ENDIF and none by
+    // #ENDRANDOM: every block is read by its own value. After the last
+    // #ENDIF the last block's #IF 44 counts again, and its value is 31, so
+    // the note of measure 31 is skipped. The stacked #IFs are warned about
+    // once (line 6, the first #IF 2), and the ones left open at the end.
+    let mut blocks = String::from("#BPM 120\n#WAV01 click.wav\n");
+    let mut expected = Vec::new();
+    for b in 1..=30_usize {
+        let value = (b * 7) % 45 + 1;
+        blocks.push_str(&format!("#SETRANDOM {value}\n"));
+        for k in 1..=45 {
+            let slots: String = (1..=45).map(|s| if s == k { "01" } else { "00" }).collect();
+            blocks.push_str(&format!("#IF {k}\n#{b:03}11:{slots}\n"));
+        }
+        blocks.push_str("#ENDIF\n");
+        // Measure b starts at 2 s × b; slot value - 1 of 45 is that many
+        // 45ths of a 2 s measure later.
+        let n = |x: usize| i64::try_from(x).unwrap();
+        expected.push(2_000_000 * n(b) + 2_000_000 * n(value - 1) / 45);
+    }
+    blocks.push_str("#03111:01\n");
+    let loaded = load(&blocks).unwrap();
+    assert_eq!(times(&loaded.chart.lanes[1]), expected);
+    let warnings: Vec<_> = loaded
+        .warnings
+        .into_iter()
+        .map(|w| (w.line, w.kind))
+        .collect();
+    assert_eq!(
+        warnings,
+        vec![
+            (Some(6), WarningKind::UnclosedIf),
+            (None, WarningKind::UnclosedIf)
+        ]
+    );
 }
