@@ -546,6 +546,14 @@ impl Measure {
         Some(fig)
     }
 
+    /// The play ended with `effects` not yet drawn: they never reached the
+    /// screen in it, and are N/A as a failed frame's are.
+    pub fn never_drawn(&mut self, effects: &[JudgeEvent]) {
+        if !effects.is_empty() {
+            self.failed(effects);
+        }
+    }
+
     /// The frame being drawn failed (the screen is lost): the judgments it
     /// drew never reached the screen through it and are N/A.
     pub fn failed(&mut self, effects: &[JudgeEvent]) {
