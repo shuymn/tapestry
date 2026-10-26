@@ -956,7 +956,7 @@ From the IR stage on, agreement between the native and WASM builds is verified e
 
 In addition, each preset has a few dozen small hand-written examples of "this input gives this judgment", to detect unintended changes when presets are tuned. Hand-written examples stay alongside the property tests, because live and batch evaluation share code and can share a bug.
 
-The properties above are property tests over generated charts, presets, input logs and delivery schedules, except the section excerpt, which comes with practice (stage 2). Live evaluation in them is a model of the logic thread's consumer (stage1.md D8) over bounded producer queues. Seeds are random on every run; a deterministic test checks that the generators still reach the fragile spots, including joint ones such as an input on a deadline at an intermediate watermark. A failure found becomes a named hand-written test; proptest's regression files stay local.
+The properties above are property tests over generated charts, presets, input logs and delivery schedules, except the section excerpt, which comes with practice (stage 2). Live evaluation in them is a model of the logic thread's consumer (stage1.md D8) over bounded producer queues. A deterministic test checks that the generators still reach the fragile spots, including joint ones such as an input on a deadline at an intermediate watermark, which random generation alone rarely reaches. Seeds and failures are handled as in [setup.md "Property Tests"](setup.md#property-tests).
 
 ### Verifying Without Launching the UI
 
