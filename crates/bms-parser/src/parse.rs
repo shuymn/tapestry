@@ -305,20 +305,26 @@ fn parse_header(
             Some(v) => source.meta.total_milli = Some(v),
             None => ignore(warnings, "#TOTAL"),
         },
+        // An empty #LNOBJ names no object, so it changes nothing.
+        "LNOBJ" if value.is_empty() => ignore(warnings, "#LNOBJ"),
         "LNOBJ" => match parse_base36(value.as_bytes()).filter(|&id| id != 0) {
             Some(id) => {
                 source.lnobj.insert(id);
             }
             None => return Err(invalid("#LNOBJ", "not an object id")),
         },
-        "LNTYPE" => {
-            if value != "1" {
+        // Compared as an integer (`01` is 1). A value that names no type
+        // (`0`, `ZZ`) is read as the default, 1.
+        "LNTYPE" => match value.parse::<u32>() {
+            Ok(1) => {}
+            Ok(0) | Err(_) => ignore(warnings, "#LNTYPE"),
+            Ok(_) => {
                 return Err(LoadError::Unsupported {
                     line,
                     what: format!("#LNTYPE {value}"),
                 });
             }
-        }
+        },
         "LNMODE" => {
             if value != "1" {
                 return Err(LoadError::Unsupported {
@@ -368,17 +374,6 @@ fn parse_header(
     Ok(())
 }
 
-/// A positive decimal, or an error naming `what`.
-fn positive_decimal(text: &str, line: usize, what: &'static str) -> Result<Rational, LoadError> {
-    let invalid = |reason| LoadError::InvalidValue { line, what, reason };
-    let v = parse_decimal(text).map_err(|e| invalid(e.reason()))?;
-    if v.is_positive() {
-        Ok(v)
-    } else {
-        Err(invalid("not positive"))
-    }
-}
-
 /// A positive measure length. Zero, as written or cut off to it, is its own
 /// error.
 fn measure_length(text: &str, line: usize) -> Result<Rational, LoadError> {
@@ -402,15 +397,18 @@ fn measure_length(text: &str, line: usize) -> Result<Rational, LoadError> {
 /// A BPM of at least 0.000001, so its value in millionths is at least 1
 /// (D3), or an error naming `what`.
 fn bpm(text: &str, line: usize, what: &'static str) -> Result<Rational, LoadError> {
-    let v = positive_decimal(text, line, what)?;
-    if v < Rational::new(BigInt::from(1), BigInt::from(1_000_000)) {
-        return Err(LoadError::InvalidValue {
-            line,
-            what,
-            reason: "below 0.000001",
-        });
+    let invalid = |reason| LoadError::InvalidValue { line, what, reason };
+    let v = parse_decimal(text).map_err(|e| invalid(e.reason()))?;
+    if v.is_negative() {
+        // Some charts scroll backwards on purpose; that is a later feature.
+        Err(invalid("negative BPM: reverse scroll is not supported yet"))
+    } else if v.is_zero() {
+        Err(invalid("not positive"))
+    } else if v < Rational::new(BigInt::from(1), BigInt::from(1_000_000)) {
+        Err(invalid("below 0.000001"))
+    } else {
+        Ok(v)
     }
-    Ok(v)
 }
 
 /// A non-negative decimal in thousandths, rounded down, or `None` for a

@@ -581,10 +581,10 @@ fn long_note_edge_cases() {
 #[test]
 fn resolved_hash_matches_golden() {
     // Computed at authoring time by an independent script encoding the
-    // documented fields of this chart: version 2, 120 BPM, no scroll changes,
+    // documented fields of this chart: version 3, 120 BPM, no scroll changes,
     // one tap at 2 s on key 1 with sound 0, bar lines at 0 and 2 s, the sound
     // name `a.wav`, an empty title and no other values.
-    const GOLDEN: &str = "b55f7f6c1e864d386d3339be8a60baf1c3283a6a2ea57439c2d81785cf855d6c";
+    const GOLDEN: &str = "d803be9cac54b7059f1671ef0818cae2cd8aab53bc6b6bde7c006b012f36a4a9";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart
@@ -612,6 +612,8 @@ fn each_resolved_field_changes_the_resolved_hash() {
         // A silent tap (undefined sound) and a mine.
         "#00114:05",
         "#001D5:05",
+        // A last note, so bar lines in between are kept.
+        "#00412:01",
     ];
     type Variant<'a> = (&'a str, &'a [(usize, &'a str)], &'a [&'a str]);
     // Each variant replaces a line or adds lines to change one field.
@@ -628,7 +630,8 @@ fn each_resolved_field_changes_the_resolved_hash() {
         ("BGM sound", &[(8, "#00101:01")], &[]),
         ("STOP", &[], &["#STOP01 48", "#00209:0001"]),
         ("BPM change", &[], &["#00203:00F0"]),
-        ("bar line", &[], &["#00302:0.5"]),
+        // Measures 2 and 3 keep 8 beats together: only bar line 3 moves.
+        ("bar line", &[], &["#00202:0.5", "#00302:1.5"]),
         ("title", &[(0, "#TITLE u")], &[]),
         ("rank", &[(2, "#RANK 3")], &[]),
         ("total", &[(3, "#TOTAL 201")], &[]),
@@ -649,4 +652,89 @@ fn each_resolved_field_changes_the_resolved_hash() {
         seen.push((name, hash));
     }
     assert_eq!(seen.len(), 17);
+}
+
+#[test]
+fn trailing_measures_after_the_last_object_are_dropped() {
+    // At 60 BPM each measure lasts 4 s, so measure 999 would start at 66.6
+    // minutes, past the duration cap. Only the bar lines through the last
+    // note (measure 2) stay, and the BPM change after it is dropped.
+    let text = "#BPM 60\n#WAV01 click.wav\n#00011:01\n#00211:0001\n#50003:78\n#99902:0.5\n";
+    let loaded = load_text(text).unwrap();
+    assert_eq!(times(&loaded.chart.lanes[1]), vec![0, 10_000_000]);
+    assert_eq!(
+        loaded.chart.bar_lines,
+        vec![TimeUs(0), TimeUs(4_000_000), TimeUs(8_000_000)]
+    );
+    let pos = |t| loaded.chart.scroll.position_at(TimeUs(t));
+    // Still 60 BPM after the last note: 1 beat a second.
+    assert_eq!(pos(11_000_000).0 - pos(10_000_000).0, 1_000_000);
+    // A BGM object counts as the last object too.
+    let bgm = "#BPM 60\n#WAV01 click.wav\n#00011:01\n#00401:01\n#99902:0.5\n";
+    assert_eq!(load_text(bgm).unwrap().chart.bar_lines.len(), 5);
+}
+
+#[test]
+fn negative_bpm_is_refused_as_reverse_scroll() {
+    for (text, what) in [
+        ("#BPM -150\n#00111:01\n", "#BPM"),
+        ("#BPM 120\n#BPM01 -7.5\n#00108:01\n", "#BPMxx"),
+    ] {
+        match load_text(text) {
+            Err(LoadError::InvalidValue {
+                what: w, reason, ..
+            }) => assert_eq!(
+                (w, reason),
+                (what, "negative BPM: reverse scroll is not supported yet"),
+                "{text}"
+            ),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn empty_lnobj_and_lntype_without_a_type_are_skipped() {
+    let long = |text: &str| {
+        let loaded = load_text(text).unwrap();
+        let ends: Vec<_> = loaded.chart.lanes[1]
+            .iter()
+            .map(|n| match n.kind {
+                NoteKind::Long { end, .. } => (n.time.0, end.0),
+                _ => (n.time.0, -1),
+            })
+            .collect();
+        (ends, loaded.warnings)
+    };
+    let ignored = |what| {
+        vec![bms_parser::Warning {
+            line: Some(2),
+            kind: WarningKind::IgnoredValue(what),
+        }]
+    };
+    // An empty #LNOBJ: the 1x notes stay taps.
+    assert_eq!(
+        long("#BPM 120\n#LNOBJ\n#WAV01 click.wav\n#00111:0101\n"),
+        (vec![(2_000_000, -1), (3_000_000, -1)], ignored("#LNOBJ"))
+    );
+    // #LNTYPE 0 and ZZ read as 1; 01 is 1 without a warning.
+    let pair = "#WAV01 click.wav\n#00151:0101\n";
+    for (header, warnings) in [
+        ("#LNTYPE 0", ignored("#LNTYPE")),
+        ("#LNTYPE ZZ", ignored("#LNTYPE")),
+        ("#LNTYPE 01", vec![]),
+    ] {
+        assert_eq!(
+            long(&format!("#BPM 120\n{header}\n{pair}")),
+            (vec![(2_000_000, 3_000_000)], warnings),
+            "{header}"
+        );
+    }
+    assert_eq!(
+        load_text("#BPM 120\n#LNTYPE 3\n#00111:01\n"),
+        Err(LoadError::Unsupported {
+            line: 2,
+            what: "#LNTYPE 3".to_owned()
+        })
+    );
 }

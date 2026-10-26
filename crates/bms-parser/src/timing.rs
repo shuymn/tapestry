@@ -175,6 +175,21 @@ pub fn compute(
     // Stable: equal positions keep bar lines first, then file order. The
     // time cap is checked on this canonical order of additions.
     events.sort_by(|a, b| a.0.order(&b.0));
+    // The chart ends with its last note, mine or BGM object: bar lines and
+    // BPM changes or STOPs after it are dropped, so empty trailing measures
+    // neither count toward the duration cap nor draw bar lines (D14).
+    let end = events
+        .iter()
+        .rev()
+        .find(|(_, e)| match *e {
+            Event::Object(i) => !matches!(
+                source.objects[i].kind,
+                ObjectKind::BpmHex(_) | ObjectKind::BpmRef(_) | ObjectKind::StopRef(_)
+            ),
+            Event::Bar => false,
+        })
+        .map_or_else(|| Spot::start(0), |(spot, _)| *spot);
+    events.truncate(events.partition_point(|e| e.0.order(&end) != Ordering::Greater));
 
     let mut timeline = Timeline {
         objects: Vec::with_capacity(source.objects.len()),
