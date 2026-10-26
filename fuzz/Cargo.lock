@@ -163,7 +163,7 @@ dependencies = [
  "input",
  "libfuzzer-sys",
  "replay",
- "sha2",
+ "rules",
  "tempfile",
  "zstd",
 ]

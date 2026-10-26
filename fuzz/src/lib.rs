@@ -112,14 +112,6 @@ pub struct RawSummary {
     pub reports: usize,
 }
 
-impl RawSummary {
-    /// Whether the walk stopped before `count` blocks.
-    #[must_use]
-    pub const fn stopped_early(&self) -> bool {
-        self.blocks < self.count
-    }
-}
-
 /// Target `raw_input`: a block count byte, then a `GetRawInputBuffer`
 /// buffer. Each block the walk returns is decoded as a keyboard and as a
 /// HID block, and so is the whole buffer.

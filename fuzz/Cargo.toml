@@ -20,9 +20,9 @@ bms-parser = { path = "../crates/bms-parser" }
 eval = { path = "../crates/eval" }
 input = { path = "../crates/input" }
 replay = { path = "../crates/replay" }
+rules = { path = "../crates/rules" }
 libfuzzer-sys = "0.4.13"
 # The same versions as the workspace's (root Cargo.toml).
-sha2 = { version = "0.11.1", default-features = false }
 tempfile = "3.27.0"
 zstd = { version = "0.14.3", default-features = false }
 

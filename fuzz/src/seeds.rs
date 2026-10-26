@@ -10,11 +10,10 @@ use eval::{
 };
 use input::raw;
 use replay::{
-    Arrival, BuildProvenance, ChartRecord, DeviceKind, DeviceRecord, EndStatus, FORMAT_VERSION,
-    Incomplete, MAGIC, PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status,
-    TransformRecord, Versions,
+    Arrival, BuildProvenance, ChartRecord, DecodeLimits, DeviceKind, DeviceRecord, EndStatus,
+    FORMAT_VERSION, Incomplete, MAGIC, PlayRecord, PlayType, PresetRecord, ReceiveMethod,
+    SourceRecord, Status, TransformRecord, Versions,
 };
-use sha2::{Digest, Sha256};
 
 /// A named seed.
 pub type Seed = (&'static str, Vec<u8>);
@@ -76,16 +75,6 @@ fn axis(control: u32, l: u8, mode: AxisMode, press: u32) -> AxisBinding {
     }
 }
 
-/// A preset record whose hash matches its bytes, so a mutated body gets
-/// past the preset check while those bytes stay intact.
-fn preset(bytes: &[u8]) -> PresetRecord {
-    PresetRecord {
-        id: "custom".to_owned(),
-        sha256: Sha256::digest(bytes).into(),
-        canonical_bytes: bytes.to_vec(),
-    }
-}
-
 /// A keyboard and a controller with an absolute and a relative axis, a
 /// held key, key and axis events, a disconnect and an arrival.
 fn two_sources() -> PlayRecord {
@@ -118,7 +107,9 @@ fn two_sources() -> PlayRecord {
                 version: 4,
             },
         },
-        preset: preset(b"canonical preset bytes"),
+        // Its hash matches its bytes, so a mutated body gets past the preset
+        // check while those bytes stay intact.
+        preset: PresetRecord::of(&rules::custom()),
         session_policy: "default".to_owned(),
         devices: DeviceRecord {
             sources: vec![
@@ -321,7 +312,11 @@ pub fn replay_files() -> Vec<Seed> {
     ));
     seeds.push((
         "declared_too_large",
-        with_header(header(FORMAT_VERSION, 1, (64 << 20) + 1)),
+        with_header(header(
+            FORMAT_VERSION,
+            1,
+            DecodeLimits::STANDARD.max_uncompressed + 1,
+        )),
     ));
     // Declared one byte short, so the body does not fit.
     seeds.push((

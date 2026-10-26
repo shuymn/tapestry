@@ -4,24 +4,9 @@
 
 use std::path::Path;
 
-use replay::{DecodeError, Section};
+use replay::{DecodeError, DecodeLimits, Section};
 
 use crate::{RawSummary, bms_load, raw_input, replay_body, replay_file, seeds};
-
-/// Whether `e` is refused before the body: what `replay_body` must never
-/// see, since it builds a valid file around every input.
-const fn is_envelope_error(e: &DecodeError) -> bool {
-    matches!(
-        e,
-        DecodeError::FileTooLarge { .. }
-            | DecodeError::BadMagic
-            | DecodeError::UnsupportedVersion(_)
-            | DecodeError::UnsupportedEncoding(_)
-            | DecodeError::DeclaredLengthTooLarge { .. }
-            | DecodeError::Decompress
-            | DecodeError::LengthMismatch { .. }
-    )
-}
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
 /// fails the test instead of going unchecked.
@@ -51,11 +36,7 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
         ],
     );
     for (name, body) in seeds {
-        let result = replay_body(&body);
-        if let Err(e) = &result {
-            assert!(!is_envelope_error(e), "{name}: {e:?}");
-        }
-        let result = result.map(|_| ());
+        let result = replay_body(&body).map(|_| ());
         match name {
             "two_sources" | "no_events" | "extremes" => {
                 assert_eq!(result, Ok(()), "{name}");
@@ -112,8 +93,8 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
             )),
             "unsupported_encoding" => Err(DecodeError::UnsupportedEncoding(2)),
             "declared_too_large" => Err(DecodeError::DeclaredLengthTooLarge {
-                declared: (64 << 20) + 1,
-                max: 64 << 20,
+                declared: DecodeLimits::STANDARD.max_uncompressed + 1,
+                max: DecodeLimits::STANDARD.max_uncompressed,
             }),
             "decompress" => Err(DecodeError::Decompress),
             // An empty frame decompresses to the declared empty body.
@@ -160,13 +141,7 @@ fn raw_input_seeds_reach_packets_reports_and_early_stops() {
             "count_beyond" => summary(5, 2, 2, 0, 0),
             _ => panic!("no expectation for seed {name}"),
         };
-        let found = raw_input(&data);
-        assert_eq!(found, expected, "{name}");
-        assert_eq!(
-            found.stopped_early(),
-            matches!(name, "truncated" | "count_beyond"),
-            "{name}"
-        );
+        assert_eq!(raw_input(&data), expected, "{name}");
     }
     assert_eq!(raw_input(&[]), RawSummary::default());
 }
