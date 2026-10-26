@@ -114,6 +114,8 @@ Performance and latency are measured in a state kept separate from everyday deve
 
 Keep separate baselines without OBS and with OBS (encoder, resolution, and fps fixed). Verify absolute audio latency not only with the game's internal times but also with the test input device ([design.md](design.md), "Testing Strategy").
 
+The game's own figures (stage1.md D11) show in an overlay that F9 toggles during play and are written after each saved play as `<record>.measure.toml` beside the record, numbers only, with a figure that lacks evidence left out (N/A, never 0). The development command `tapestry measure play <chart>` (built with `dev-tools`) also captures the play's presents with PresentMon and adds the lost refreshes, off-grid and never-displayed counts of the play span to that file. PresentMon is installed by hand and never downloaded: set `TAPESTRY_PRESENTMON` to the path of its executable, or put `PresentMon.exe` on `PATH`. It runs unelevated, so the user must be in the Performance Log Users group; its capture goes to `measure\` under the data root.
+
 ## Other
 
 - Antivirus exclusions are not configured by default. Only if builds are actually confirmed to be slow, exclude the build output directory and nothing else.
