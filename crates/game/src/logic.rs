@@ -464,6 +464,19 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.overflowed
     }
 
+    /// The play view as of the last step: what the render side's newest
+    /// view holds, read on the logic side (it allocates).
+    #[must_use]
+    pub fn view(&self) -> PlayView {
+        PlayView {
+            finalized: self.finalized,
+            tally: *self.evaluator.tally(),
+            gauges: self.evaluator.gauges().to_vec(),
+            complete: self.evaluator.is_complete(),
+            events: self.emitted,
+        }
+    }
+
     /// The play as recorded so far.
     #[must_use]
     pub fn record(&self) -> Record {

@@ -45,8 +45,8 @@ pub use results::{
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
-    Command, Loaded, Parts, PlayEnd, PlayReport, PlayScript, ReloadError, Session, SessionConfig,
-    SessionError, Settings,
+    Command, Loaded, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart,
+    ReloadError, Session, SessionConfig, SessionError, Settings,
 };
 pub use settings::{
     DataRoot, DeviceSettings, KeyConfig, LaneKey, PlayerSettings, SettingsError, load_settings,

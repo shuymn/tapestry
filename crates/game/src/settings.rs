@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ::audio::AudioEngine;
 use bms_model::{Lane, TimeUs};
 use eval::{Binding, ControlId, DeviceProfile, SourceProfile};
 use input::DeviceKind;
@@ -199,6 +200,13 @@ impl DeviceSettings {
             DeviceKind::Keyboard => &self.keyboard,
             DeviceKind::Controller => &self.controller,
         }
+    }
+
+    /// Gives `engine` the master volume and the audio output offset. An
+    /// out-of-range volume is not applied; the engine keeps unity.
+    pub fn apply_to(&self, engine: &mut AudioEngine) {
+        let _ = engine.set_volume(self.master_volume);
+        engine.set_output_offset(TimeUs(self.audio_offset_us));
     }
 
     /// The profile the evaluator reads for sources of the given kinds,
