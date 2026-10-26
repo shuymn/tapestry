@@ -74,48 +74,45 @@ pub fn warnings(what: &str, items: impl ExactSizeIterator<Item = impl Display>) 
 /// first [`MISSING_NAMED`] names with control characters escaped, on
 /// stderr and in the log like any chart warning. Nothing when none is
 /// missing.
-pub fn missing_sounds<'a>(names: impl ExactSizeIterator<Item = &'a str>) {
+pub fn missing_sounds<'a>(names: impl Iterator<Item = &'a str>) {
     missing_sounds_to(names, &mut io::stderr().lock(), log::logger());
 }
 
 fn missing_sounds_to<'a>(
-    names: impl ExactSizeIterator<Item = &'a str>,
+    mut names: impl Iterator<Item = &'a str>,
     err: &mut impl Write,
     log: &dyn Log,
 ) {
-    let n = names.len();
-    if n == 0 {
+    let shown: Vec<&str> = names.by_ref().take(MISSING_NAMED).collect();
+    if shown.is_empty() {
         return;
     }
-    let count = if n == 1 {
-        "1 sound file is missing".to_owned()
+    let more = names.count();
+    let n = shown.len() + more;
+    let mut line = if n == 1 {
+        "1 sound file is missing: ".to_owned()
     } else {
-        format!("{n} sound files are missing")
+        format!("{n} sound files are missing: ")
     };
-    let shown: Vec<String> = names.take(MISSING_NAMED).map(escaped).collect();
-    let more = n - shown.len();
-    let rest = if more > 0 {
-        format!(" and {more} more")
-    } else {
-        String::new()
-    };
-    let line = format!("{count}: {}{rest}", shown.join(", "));
-    let _ = writeln!(err, "warning: {line}");
-    log.log(&own(Level::Warn, format_args!("chart: {line}")));
-}
-
-/// A chart-written name with its control characters (a carriage return, an
-/// escape) as `\u{..}`, so it cannot rewrite the terminal or split a line.
-fn escaped(name: &str) -> String {
-    name.chars()
-        .map(|c| {
+    for (i, name) in shown.into_iter().enumerate() {
+        if i > 0 {
+            line.push_str(", ");
+        }
+        // Control characters (a carriage return, an escape) as `\u{..}`,
+        // so a chart-written name cannot rewrite the terminal or split a
+        // line.
+        for c in name.chars() {
             if c.is_control() {
-                c.escape_unicode().to_string()
+                line.extend(c.escape_unicode());
             } else {
-                c.to_string()
+                line.push(c);
             }
-        })
-        .collect()
+        }
+    }
+    if more > 0 {
+        let _ = write!(line, " and {more} more");
+    }
+    warnings_to("chart", std::iter::once(line), err, log);
 }
 
 fn warnings_to(
@@ -757,6 +754,15 @@ mod tests {
             format!("warning: {line}\n")
         );
         assert_eq!(kept.0.into_inner().unwrap(), [format!("chart: {line}")]);
+        // DEL and a C1 control are escaped too; text that only looks like
+        // an escape is left as written, not escaped twice.
+        let mut err = Vec::new();
+        let odd = ["d\u{7f}.wav", "e\u{85}.wav", "f\\u{41}.wav"];
+        missing_sounds_to(odd.into_iter(), &mut err, &Kept::default());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: 3 sound files are missing: d\\u{7f}.wav, e\\u{85}.wav, f\\u{41}.wav\n"
+        );
         // None missing: nothing at all.
         let kept = Kept::default();
         let mut err = Vec::new();
