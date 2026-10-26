@@ -18,7 +18,10 @@ use bms_model::{ChartBuilder, SoundId, TimeUs};
 use common::{MS, count_judged, device, lane, press, window_capacity};
 use eval::{InputKind, InputStart, JudgeEventKind, PhysicalInputEvent, SourceId};
 use game::{AbortCause, Logic, LogicConfig, RunOutcome, Runner};
-use input::{DeviceKind, ScriptedInput, SourceSet, autoplay, source_queue};
+use input::{
+    AutoplayInput, DeviceKind, InputAdapter, ScriptedInput, SourceConfig, SourceSet, autoplay,
+    autoplay_count, source_queue,
+};
 use rules::Judgment;
 
 struct Counting;
@@ -184,5 +187,35 @@ fn logic_does_not_allocate_during_play() {
     assert_eq!(engine.scheduled_dropped(), sounds as u64);
     assert_eq!(runner.dropped_sounds(), 0);
     assert!(engine.written() >= 48 * 11_000, "{}", engine.written());
+
+    // The autoplay feeder (design.md "Autoplay"): starting a play over and
+    // feeding it whole, as the clocked input thread does, allocate nothing.
+    let mut feeder = AutoplayInput::new(autoplay(&chart, &dev.sources[0]).unwrap());
+    let total = autoplay_count(&chart, &dev.sources[0]);
+    let mut set = SourceSet::new(SourceConfig {
+        queue_capacity: total,
+        ..common::sources()
+    })
+    .unwrap();
+    let recorded: Vec<_> = dev.sources[0].bindings.iter().map(|b| b.control).collect();
+    let again = recorded.clone();
+    TRACK.with(|t| t.set(true));
+    feeder.restart(&mut set, recorded);
+    TRACK.with(|t| t.set(false));
+    set.open_recording(START);
+    let mut reader = set.take_readers().pop().unwrap();
+    let mut fed = 0;
+    TRACK.with(|t| t.set(true));
+    for ms in START.0 / MS..11_000 {
+        feeder.poll(TimeUs(ms * MS), &mut set);
+        while reader.pop().is_some() {
+            fed += 1;
+        }
+    }
+    set.close_recording();
+    feeder.restart(&mut set, again);
+    TRACK.with(|t| t.set(false));
+    assert_eq!(fed, total);
+    assert_eq!(feeder.fed(), 0);
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 }

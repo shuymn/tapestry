@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
-use bms_model::{Chart, TimeSource, TimeUs, VirtualClock};
+use bms_model::{BgmEvent, Chart, TimeSource, TimeUs, VirtualClock};
 use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
 use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
@@ -28,6 +28,7 @@ use replay::{
 };
 use rules::{GaugeKind, RulePreset};
 
+use crate::autoplay::{Autoplay, AutoplayError};
 use crate::live::{Closing, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
@@ -40,7 +41,7 @@ use crate::render::PlayView;
 use crate::render::RenderSide;
 use crate::results::{ReEvaluate, ResultContext, ResultExtension, ResultSummary};
 use crate::save::{LocalRecords, RecordRef, RecordSink, SaveError, write_atomic};
-use crate::settings::{DataRoot, DeviceSettings, PlayerSettings, SettingsError};
+use crate::settings::{DataRoot, DeviceSettings, KeyConfig, PlayerSettings, SettingsError};
 use crate::sound::{AudioQueue, RunnerAudio, Wakes};
 
 /// Every extension point the session calls through, each with one
@@ -56,8 +57,9 @@ pub struct Parts {
     pub events: Box<dyn SessionEventSink>,
     /// Summarizes each play.
     pub results: Box<dyn ResultExtension>,
-    /// Saves each play's record.
-    pub records: Box<dyn RecordSink>,
+    /// Saves each play's record; `None` for a session that saves nothing
+    /// (autoplay), whose records stay in memory for the result.
+    pub records: Option<Box<dyn RecordSink>>,
 }
 
 impl fmt::Debug for Parts {
@@ -76,6 +78,17 @@ impl Parts {
     #[must_use]
     pub fn standard(root: &DataRoot, player: &PlayerSettings) -> Self {
         Self {
+            records: Some(Box::new(LocalRecords::new(root.records()))),
+            ..Self::unsaved(player)
+        }
+    }
+
+    /// The stage 1 parts without a record sink: nothing a play records is
+    /// saved, and each record is still re-evaluated for its result
+    /// (design.md "Autoplay").
+    #[must_use]
+    pub fn unsaved(player: &PlayerSettings) -> Self {
+        Self {
             ingest: Box::new(BmsIngest),
             transform: Box::new(Passthrough),
             policy: Box::new(DefaultPolicy {
@@ -83,7 +96,7 @@ impl Parts {
             }),
             events: Box::new(NoSessionEvents),
             results: Box::new(ReEvaluate),
-            records: Box::new(LocalRecords::new(root.records())),
+            records: None,
         }
     }
 }
@@ -146,6 +159,13 @@ pub struct SessionConfig {
     pub provenance: BuildProvenance,
     /// How the sources' input is received, as recorded.
     pub receive: ReceiveMethod,
+    /// Whether the session plays by itself (design.md "Autoplay"): every
+    /// play is planned for the generated keyboard, with the built-in key
+    /// config ([`KeyConfig::autoplay`]) and an input offset of 0 whatever
+    /// the settings say, a recording window of exactly its events, and its
+    /// key sounds scheduled ahead with the BGM rather than sent from
+    /// judgments.
+    pub autoplay: bool,
 }
 
 /// Why a session could not be prepared.
@@ -257,7 +277,8 @@ pub struct PlayReport {
     pub displayed_gauge: GaugeIndex,
     /// The record, unless the play ended before anything was finalized.
     pub record: Option<PlayRecord>,
-    /// Where the record was saved, or why it was not.
+    /// Where the record was saved, or why it was not; `None` when there is
+    /// no record or the session saves nothing.
     pub saved: Option<Result<RecordRef, SaveError>>,
     /// The result extension's summary of a recorded play.
     pub result: Option<ResultSummary>,
@@ -516,11 +537,20 @@ impl Loaded {
     /// [`LogicError::RecordingTooLarge`] when the window needs more than
     /// the recording policy reserves ([`Reservation`]): the play is refused
     /// before its countdown rather than cut off midway.
+    ///
+    /// An autoplay session ([`SessionConfig::autoplay`]) plans with the
+    /// built-in keyboard key config and an input offset of 0, whatever the
+    /// settings hold, and its window holds exactly the generated events;
+    /// the reservation also counts the session's own buffers
+    /// ([`Reservation::with_autoplay`]).
     pub fn plan(
         &self,
         kinds: &[DeviceKind],
         axes: &[Vec<input::hid::AxisCap>],
     ) -> Result<PlayPlan, LogicError> {
+        if self.config.autoplay {
+            return self.autoplay_plan(kinds, axes);
+        }
         let device = self.settings.device.profile(kinds, axes);
         // Per source: its recorded lane buttons and keys, and its recorded
         // axes it declares (no other axis is read), played at their rates;
@@ -571,6 +601,85 @@ impl Loaded {
             effects: self.config.effects,
         };
         Ok(PlayPlan { device, logic })
+    }
+
+    /// The device settings an autoplay play is planned with: the loaded
+    /// ones with the built-in keyboard key config and an input offset of 0.
+    /// The loaded settings, and so `device.toml`, keep their own.
+    fn autoplay_device(&self) -> DeviceSettings {
+        DeviceSettings {
+            keyboard: KeyConfig::autoplay(),
+            input_offset_us: 0,
+            ..self.settings.device.clone()
+        }
+    }
+
+    /// The generated keyboard's profile.
+    fn generated(&self) -> eval::SourceProfile {
+        let device = self.autoplay_device();
+        eval::SourceProfile {
+            input_offset: TimeUs(device.input_offset_us),
+            bindings: device.keyboard.bindings(DeviceKind::Keyboard),
+            axes: Vec::new(),
+        }
+    }
+
+    /// [`plan`](Self::plan) for an autoplay session.
+    fn autoplay_plan(
+        &self,
+        kinds: &[DeviceKind],
+        axes: &[Vec<input::hid::AxisCap>],
+    ) -> Result<PlayPlan, LogicError> {
+        let device = self.autoplay_device().profile(kinds, axes);
+        let generated = self.generated();
+        let inputs = input::autoplay_count(&self.chart, &generated);
+        let schedule = crate::autoplay::schedule_len(&self.chart, &generated);
+        let probe = Evaluator::new(
+            &self.chart,
+            &self.preset,
+            &device,
+            &InputStart::default(),
+            0,
+        );
+        if let Ok(probe) = &probe
+            && let r = Reservation::from_probe(probe, &self.chart, &device, self.config.effects)
+                .with_autoplay(inputs, schedule)
+            && !r.fits(inputs)
+        {
+            return Err(LogicError::RecordingTooLarge {
+                needed: inputs,
+                allowed: r.capacity(),
+            });
+        }
+        let logic = LogicConfig {
+            inputs,
+            effects: self.config.effects,
+        };
+        Ok(PlayPlan { device, logic })
+    }
+
+    /// What an autoplay session plays (design.md "Autoplay"), made once
+    /// before its first play: the generated input of the built-in keyboard
+    /// key config with an input offset of 0, and the chart's BGM merged with
+    /// the key sounds it presses. Its plays are planned as
+    /// [`plan`](Self::plan) plans an autoplay session's, and the plan is
+    /// checked first, so a chart whose recording reservation (autoplay's
+    /// own buffers included) is over budget is refused before anything of
+    /// it is allocated.
+    ///
+    /// # Errors
+    ///
+    /// [`AutoplayError::Plan`] for a chart over the budget, and
+    /// [`AutoplayError::Time`] for a note too late to press.
+    pub fn autoplay(&self) -> Result<Autoplay, AutoplayError> {
+        self.autoplay_plan(&[DeviceKind::Keyboard], &[Vec::new()])?;
+        let generated = self.generated();
+        let events = input::autoplay(&self.chart, &generated)?;
+        Ok(Autoplay {
+            events,
+            schedule: crate::autoplay::schedule(&self.chart, &generated),
+            recorded: KeyConfig::autoplay().recorded(),
+        })
     }
 
     /// Whether the session policy ends the play with `gauges` (every
@@ -648,7 +757,11 @@ impl Loaded {
             },
         });
         let parts = &mut self.parts;
-        let saved = play_record.as_ref().map(|r| parts.records.save(r));
+        let saved = parts
+            .records
+            .as_mut()
+            .zip(play_record.as_ref())
+            .map(|(sink, r)| sink.save(r));
         let result = play_record.as_ref().map(|r| {
             parts.results.on_play_end(&ResultContext {
                 record: r,
@@ -1049,6 +1162,24 @@ impl Reservation {
     pub const fn bytes(&self, inputs: usize) -> usize {
         self.fixed
             .saturating_add(self.per_input.saturating_mul(inputs))
+    }
+
+    /// This reservation with an autoplay session's own buffers added to
+    /// its fixed part (design.md "Autoplay"): the source queue holding the
+    /// whole stream of `events`, the generated events kept for every play,
+    /// and the merged audio schedule of `schedule` entries. All three are
+    /// allocated at once while the session starts, so this is also their
+    /// peak.
+    #[must_use]
+    pub const fn with_autoplay(self, events: usize, schedule: usize) -> Self {
+        let event = size_of::<eval::PhysicalInputEvent>();
+        let own = events
+            .saturating_mul(2 * event)
+            .saturating_add(schedule.saturating_mul(size_of::<BgmEvent>()));
+        Self {
+            fixed: self.fixed.saturating_add(own),
+            per_input: self.per_input,
+        }
     }
 
     /// Whether a capacity of `inputs` fits in [`RECORDING_MEMORY`], fixed

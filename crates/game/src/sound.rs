@@ -27,6 +27,9 @@ pub struct AudioSink {
     dropped: Arc<AtomicU64>,
     /// Where the play's time 0 lies on the output's timeline.
     shift: TimeUs,
+    /// Whether key sounds are sent; not when they are scheduled ahead with
+    /// the BGM.
+    keys: bool,
 }
 
 impl AudioSink {
@@ -35,6 +38,16 @@ impl AudioSink {
     pub fn is_abandoned(&self) -> bool {
         self.cmds.is_abandoned()
     }
+
+    /// The sink of a session that schedules its key sounds ahead with the
+    /// BGM (autoplay, design.md "Autoplay"): it sends nothing.
+    #[must_use]
+    pub fn without_key_sounds(self) -> Self {
+        Self {
+            keys: false,
+            ..self
+        }
+    }
 }
 
 impl EventSink for AudioSink {
@@ -42,6 +55,9 @@ impl EventSink for AudioSink {
         let JudgeEventKind::PlaySound { sound, .. } = ev.kind else {
             return;
         };
+        if !self.keys {
+            return;
+        }
         // A key sound always comes from a press; the event time stands in
         // only if an origin is ever missing.
         let origin = ev.origin.unwrap_or(ev.time);
@@ -105,6 +121,7 @@ pub fn audio_link_at(capacity: usize, origin: TimeUs) -> (AudioSink, AudioQueue)
             cmds: producer,
             dropped: Arc::clone(&dropped),
             shift: origin,
+            keys: true,
         },
         AudioQueue {
             cmds: consumer,
