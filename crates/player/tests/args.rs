@@ -92,6 +92,41 @@ fn a_refused_chart_prints_each_cause_once() {
     assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
 }
 
+/// `--auto` is a production option of `play`, before or after the chart:
+/// a chart that does not exist is refused naming it, before any window
+/// opens. Without a chart it is a usage error, and given twice the second
+/// is an unknown argument.
+#[test]
+fn auto_is_a_play_option() {
+    let dir = tempfile::tempdir().unwrap();
+    let chart = dir.path().join("missing.bms");
+    for args in [
+        ["play".as_ref(), "--auto".as_ref(), chart.as_os_str()],
+        ["play".as_ref(), chart.as_os_str(), "--auto".as_ref()],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+            .args(args)
+            .env("LOCALAPPDATA", dir.path())
+            .output()
+            .expect("run tapestry");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("missing.bms"), "{stderr}");
+        assert!(!stderr.contains("unknown argument"), "{stderr}");
+    }
+    let out = run(&["play", "--auto"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("play needs a chart file"), "{stderr}");
+    assert!(
+        stderr.contains("usage: tapestry play [--auto] <chart.bms>"),
+        "{stderr}"
+    );
+    assert_unknown(&["play", "--auto", "--auto", "a.bms"], "--auto");
+    assert_unknown(&["play", "--auto", "a.bms", "--auto"], "--auto");
+    assert_unknown(&["--auto", "play", "a.bms"], "--auto");
+}
+
 #[cfg(not(feature = "dev-tools"))]
 #[test]
 fn dev_scripted_input_is_unknown_without_feature() {
@@ -103,6 +138,10 @@ fn dev_scripted_input_is_unknown_without_feature() {
     assert_unknown(&["play", "a.bms", "--dev-frames", "x"], "--dev-frames");
     assert_unknown(&["play", "a.bms", "--dev-auto-retry"], "--dev-auto-retry");
     assert_unknown(&["play", "a.bms", "--dev-overlay"], "--dev-overlay");
+    assert_unknown(
+        &["play", "a.bms", "--auto", "--dev-headless"],
+        "--dev-headless",
+    );
     assert_unknown(&["--dev-adjust-at", "1"], "--dev-adjust-at");
     for opt in ["--dev-adjust-at", "--dev-adjust", "--dev-adjust-end"] {
         assert_unknown(&["play", "a.bms", opt, "1"], opt);
@@ -151,6 +190,7 @@ fn dev_options_are_taken_with_the_feature() {
         vec!["--dev-adjust-at".as_ref(), "1".as_ref()],
         vec!["--dev-adjust".as_ref(), "F1".as_ref()],
         vec!["--dev-adjust-end".as_ref(), "F1".as_ref()],
+        vec!["--auto".as_ref(), "--dev-headless".as_ref()],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
             .arg("play")

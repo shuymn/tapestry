@@ -55,6 +55,9 @@ pub struct PlayerRig<'a> {
     pub recorded: Recorded,
     /// The gauge to show.
     pub gauge: usize,
+    /// Whether the session plays by itself and saves nothing (design.md
+    /// "Autoplay").
+    pub autoplay: bool,
     /// The countdown's length.
     pub lead_in: TimeUs,
     /// The input offset the current play uses.
@@ -241,6 +244,7 @@ impl PlayerRig<'_> {
         match &report.saved {
             Some(Ok(r)) => println!("saved: {}", r.path.display()),
             Some(Err(e)) => eprintln!("not saved: {}", Chain(e)),
+            None if self.autoplay => println!("autoplay: not saved"),
             None => {}
         }
         let ms = |d: Duration| format!("{} ms", d.as_millis());
@@ -462,6 +466,7 @@ impl Rig for PlayerRig<'_> {
             self.times,
             queue,
             &self.hints,
+            self.autoplay,
         ));
         self.send_end(tuning.get());
         #[cfg(feature = "dev-tools")]

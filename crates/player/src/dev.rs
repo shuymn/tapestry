@@ -2,12 +2,13 @@
 //!
 //! `play <chart> --dev-scripted-input <log>` plays the chart on the same
 //! threads as the game, without a window or devices: the input log's
-//! events drive the input side as a script on the play's timeline, the
-//! audio engine plays into a recording of a simulated device paced by the
-//! clock, and the renderer draws offscreen on WARP. `--dev-frames <dir>`
-//! also writes a countdown frame, a play frame and the end screen there as
-//! PNG files. `--dev-overlay` shows the measurement overlay from the
-//! start.
+//! events drive the input side as a script on the play's timeline, fed by
+//! the clocked input thread, the audio engine plays into a recording of a
+//! simulated device paced by the clock, and the renderer draws offscreen
+//! on WARP. `play --auto <chart> --dev-headless` runs autoplay the same
+//! way. `--dev-frames <dir>` also writes a countdown frame, a play frame
+//! and the end screen there as PNG files. `--dev-overlay` shows the
+//! measurement overlay from the start.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -22,10 +23,9 @@ use anyhow::Context as _;
 use audio::{AudioOutput, OutputError, RecordingOutput, SimConfig, SimDevice, Wake};
 use bms_model::{TimeSource, TimeUs};
 use game::Wakes;
-use input::{DeviceKind, QpcClock, ScriptedInput, SourceSet};
+use input::{DeviceKind, QpcClock, ScriptedInput};
 use replay::DecodeLimits;
 
-use crate::input_side::Hook;
 use crate::measure::Drawn;
 use crate::render_side::{FrameSink, Screen};
 
@@ -114,9 +114,31 @@ pub struct Options {
     pub adjust_at_ms: i64,
     /// Show the measurement overlay from the start, without its key.
     pub overlay: bool,
+    /// Run autoplay headless: a recording of a simulated audio device and
+    /// WARP offscreen, as a scripted run.
+    pub headless: bool,
 }
 
 impl Options {
+    /// The session's input with the development options applied: an input
+    /// log in place of the devices.
+    ///
+    /// # Errors
+    ///
+    /// A message for options that cannot go together: an input log with
+    /// autoplay, or `--dev-headless` without autoplay.
+    pub fn play_input(&mut self, input: crate::PlayInput) -> Result<crate::PlayInput, String> {
+        let log = self.scripted_input.take();
+        match input {
+            crate::PlayInput::Autoplay if log.is_some() => {
+                Err("--auto and --dev-scripted-input cannot be used together".to_owned())
+            }
+            crate::PlayInput::Autoplay => Ok(input),
+            _ if self.headless => Err("--dev-headless needs --auto".to_owned()),
+            _ => Ok(log.map_or(input, crate::PlayInput::Script)),
+        }
+    }
+
     /// Takes `arg` and its value if it is a development option of `play`.
     ///
     /// # Errors
@@ -133,6 +155,10 @@ impl Options {
         }
         if arg == "--dev-overlay" {
             self.overlay = true;
+            return Ok(true);
+        }
+        if arg == "--dev-headless" {
+            self.headless = true;
             return Ok(true);
         }
         if arg == "--dev-adjust-at" {
@@ -350,40 +376,6 @@ impl Drop for Stop {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-    }
-}
-
-/// The scripted input thread: the input thread's boundary every
-/// millisecond, the script fed by the hook. Stops when dropped.
-pub struct ScriptThread {
-    _stop: Stop,
-}
-
-impl ScriptThread {
-    /// Starts it with `sources` and `hook` (in script mode).
-    ///
-    /// # Errors
-    ///
-    /// If the thread cannot start.
-    pub fn spawn(clock: QpcClock, mut sources: SourceSet, mut hook: Hook) -> anyhow::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let handle = std::thread::Builder::new()
-            .name("scripted input".into())
-            .spawn(move || {
-                crate::alloc_count::tag(crate::alloc_count::Tag::Input);
-                while !thread_stop.load(Ordering::Acquire) {
-                    hook.wake(&mut sources, clock.now());
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            })
-            .context("the scripted input thread cannot start")?;
-        Ok(Self {
-            _stop: Stop {
-                stop,
-                handle: Some(handle),
-            },
-        })
     }
 }
 

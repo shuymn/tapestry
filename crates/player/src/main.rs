@@ -5,6 +5,12 @@
 //! opens a borderless fullscreen window whose render thread prepares the
 //! GPU resources, and plays the chart until the player quits. The data
 //! root is `%LOCALAPPDATA%\tapestry\` (D10).
+//!
+//! `tapestry play --auto <chart.bms>` plays the chart by itself on the same
+//! window, audio output and renderer (design.md "Autoplay"): the input that
+//! hits every note is generated before the window opens and fed by an
+//! input thread without Raw Input, its key sounds are scheduled with the
+//! BGM, and nothing it plays is saved.
 
 #[cfg(not(windows))]
 compile_error!("player is Windows-only");
@@ -35,11 +41,14 @@ use std::time::SystemTime;
 
 use anyhow::Context as _;
 use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank};
-use bms_model::TimeUs;
+use bms_model::{BgmEvent, TimeUs};
+use eval::ControlId;
 use game::{
     DataRoot, DeviceSettings, Loaded, Parts, SessionConfig, Settings, Tuning, save_settings,
 };
-use input::{Capture, InputThread, QpcClock, SourceConfig, SourceSet};
+use input::{
+    AutoplayInput, Capture, ClockedThread, InputThread, QpcClock, SourceConfig, SourceSet,
+};
 use render::{AdapterChoice, Renderer, Target};
 use replay::{BuildProvenance, ReceiveMethod};
 
@@ -51,7 +60,8 @@ use crate::play::PlayerRig;
 use crate::render_side::{MakeScreen, NoFrames, Screen, View};
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
 
-const USAGE: &str = "usage: tapestry play <chart.bms> | tapestry keys | tapestry --version";
+const USAGE: &str =
+    "usage: tapestry play [--auto] <chart.bms> | tapestry keys | tapestry --version";
 
 /// The countdown before chart time 0 (D13).
 const LEAD_IN: TimeUs = TimeUs(1_000_000);
@@ -97,6 +107,7 @@ fn main() -> ExitCode {
         return unknown_argument(&arg);
     }
     let mut chart = None;
+    let mut auto = false;
     #[cfg(feature = "dev-tools")]
     let mut dev_options = dev::Options::default();
     // Development options take their values from `args`.
@@ -111,6 +122,10 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+        if a == "--auto" && !auto {
+            auto = true;
+            continue;
+        }
         if chart.is_some() || a.to_string_lossy().starts_with("--") {
             return unknown_argument(&a);
         }
@@ -120,11 +135,24 @@ fn main() -> ExitCode {
         eprintln!("play needs a chart file\n{USAGE}");
         return ExitCode::from(2);
     };
+    let input = if auto {
+        PlayInput::Autoplay
+    } else {
+        PlayInput::Devices
+    };
     #[cfg(feature = "dev-tools")]
-    if let Some(log) = dev_options.scripted_input.take() {
+    let input = match dev_options.play_input(input) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    #[cfg(feature = "dev-tools")]
+    if dev_options.headless || matches!(input, PlayInput::Script(_)) {
         let auto = u32::from(dev_options.auto_retry);
         let frames = dev_options.frames.take();
-        return report(scripted(&chart, &log, frames, auto, clock, |rig| {
+        return report(headless(&chart, input, frames, auto, clock, |rig| {
             if dev_options.overlay {
                 rig.controls.toggle_overlay();
             }
@@ -135,6 +163,7 @@ fn main() -> ExitCode {
     }
     report(play(
         &chart,
+        input,
         clock,
         #[cfg(feature = "dev-tools")]
         false,
@@ -204,7 +233,7 @@ fn measure_play(chart: &Path, clock: QpcClock) -> anyhow::Result<()> {
     let plays = play::MeasuredPlays::default();
     let kept = Arc::clone(&plays);
     // One play: the run quits once its end screen has shown.
-    let ran = play(chart, clock, true, move |rig| {
+    let ran = play(chart, PlayInput::Devices, clock, true, move |rig| {
         rig.measured_plays = Some(kept);
         rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     });
@@ -311,11 +340,47 @@ fn settings(root: &DataRoot) -> anyhow::Result<Settings> {
     Settings::load(root).with_context(|| root.path().display().to_string())
 }
 
+/// How a session's input is received, chosen once from the command line.
+/// It decides together the receive method, whether plays are saved and
+/// the session's overrides (design.md "Autoplay").
+#[derive(Debug)]
+enum PlayInput {
+    /// Raw Input from the devices, with the configured keys; plays are
+    /// saved.
+    Devices,
+    /// Generated input that hits every note, with the built-in keys and an
+    /// input offset of 0, its key sounds scheduled with the BGM; nothing
+    /// is saved.
+    Autoplay,
+    /// An input log replayed as a script, with the configured keys; plays
+    /// are saved (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    Script(PathBuf),
+}
+
 /// Settings, the chart through ingestion and the transform, and the
-/// session's fixed choices.
-fn load(chart: &Path, receive: ReceiveMethod) -> anyhow::Result<Loaded> {
+/// session's fixed choices, as `input` decides them.
+fn load(chart: &Path, input: &PlayInput) -> anyhow::Result<Loaded> {
     let root = data_root()?;
     let settings = settings(&root)?;
+    let (receive, parts, autoplay) = match input {
+        PlayInput::Devices => (
+            ReceiveMethod::RawInput,
+            Parts::standard(&root, &settings.player),
+            false,
+        ),
+        PlayInput::Autoplay => (
+            ReceiveMethod::Scripted,
+            Parts::unsaved(&settings.player),
+            true,
+        ),
+        #[cfg(feature = "dev-tools")]
+        PlayInput::Script(_) => (
+            ReceiveMethod::Scripted,
+            Parts::standard(&root, &settings.player),
+            false,
+        ),
+    };
     // `#RANDOM` is resolved with a seed that differs per run; it is
     // recorded.
     let seed = SystemTime::now()
@@ -334,8 +399,8 @@ fn load(chart: &Path, receive: ReceiveMethod) -> anyhow::Result<Loaded> {
             BuildProvenance::Production
         },
         receive,
+        autoplay,
     };
-    let parts = Parts::standard(&root, &settings.player);
     let loaded = Loaded::load(root, settings, chart, config, parts)
         .with_context(|| chart.display().to_string())?;
     for w in loaded.warnings() {
@@ -359,10 +424,76 @@ fn sources() -> SourceSet {
     SourceSet::new(source_config()).expect("8 sources are within the limit")
 }
 
-/// Loads the bank at the output's rate and hands the engine to the audio
-/// thread, which keeps it silent until the first play.
+/// A loaded session and what its input side starts with.
+struct Prepared {
+    loaded: Loaded,
+    /// How the input thread feeds each play.
+    mode: Mode,
+    /// The source set the input thread keeps.
+    sources: SourceSet,
+    /// The audio schedule, when it is not the chart's BGM (autoplay).
+    schedule: Option<Vec<BgmEvent>>,
+    /// The controls every keyboard records, when they are not the key
+    /// config's (autoplay).
+    keyboard: Option<Vec<ControlId>>,
+}
+
+/// Loads the session `input` chooses and makes what its input side
+/// starts with. Autoplay's input and schedule are made here, before
+/// anything opens; a chart over the recording budget is refused here.
+fn prepare(chart: &Path, input: &PlayInput) -> anyhow::Result<Prepared> {
+    let loaded = load(chart, input)?;
+    match input {
+        PlayInput::Devices => Ok(Prepared {
+            loaded,
+            mode: Mode::Clock,
+            sources: sources(),
+            schedule: None,
+            keyboard: None,
+        }),
+        PlayInput::Autoplay => {
+            let made = loaded
+                .autoplay()
+                .with_context(|| chart.display().to_string())?;
+            // The queue holds the whole generated stream: the input side
+            // never waits for the logic step.
+            let config = SourceConfig {
+                queue_capacity: made.events.len(),
+                ..source_config()
+            };
+            Ok(Prepared {
+                loaded,
+                mode: Mode::Autoplay(AutoplayInput::new(made.events)),
+                sources: SourceSet::new(config).expect("8 sources are within the limit"),
+                schedule: Some(made.schedule),
+                keyboard: Some(made.recorded),
+            })
+        }
+        #[cfg(feature = "dev-tools")]
+        PlayInput::Script(log) => {
+            let script = dev::script(log)?;
+            let script = input_side::Script {
+                log: script.clone(),
+                current: script,
+                sources: source_config(),
+            };
+            Ok(Prepared {
+                loaded,
+                mode: Mode::Script(Box::new(script)),
+                sources: sources(),
+                schedule: None,
+                keyboard: None,
+            })
+        }
+    }
+}
+
+/// Loads the bank at the output's rate and hands the engine, playing
+/// `schedule` or else the chart's BGM, to the audio thread, which keeps it
+/// silent until the first play.
 fn start_engine(
     loaded: &Loaded,
+    schedule: Option<Vec<BgmEvent>>,
     audio: audio_side::AudioThread,
     opened: audio_side::Opened,
     probe: rtrb::Producer<game::AudioProbe>,
@@ -373,9 +504,9 @@ fn start_engine(
     for w in bank.warnings() {
         eprintln!("warning: {w:?}");
     }
-    let mut engine = AudioEngine::new(
+    let mut engine = AudioEngine::with_schedule(
         Arc::new(bank),
-        &chart.bgm,
+        schedule.unwrap_or_else(|| chart.bgm.clone()),
         opened.rate,
         opened.period,
         MAX_VOICES,
@@ -486,6 +617,7 @@ fn rig<'a>(
             scratch: device.scratch,
         },
         gauge: loaded.settings().player.displayed_gauge,
+        autoplay: loaded.config().autoplay,
         input_offset_us: device.input_offset_us,
         files: SettingsFiles::new(loaded.root().clone(), loaded.settings().clone()),
         seen: Delivered::default(),
@@ -559,16 +691,48 @@ fn open_window_and_input(
     Ok((window_thread, surface, input))
 }
 
-/// The game: Raw Input, WASAPI and a window.
+/// Opens the window, then starts the clocked input thread (autoplay),
+/// which registers no Raw Input.
+///
+/// # Errors
+///
+/// Why the window or the input thread cannot start.
+fn open_window_and_clocked(
+    controls: &Arc<Controls>,
+    clock: QpcClock,
+    sources: SourceSet,
+    wake: impl FnMut(&mut SourceSet, TimeUs) + Send + 'static,
+    keys: (Option<u32>, Option<u32>),
+    monitor: Option<String>,
+) -> anyhow::Result<(window::WindowThread, window::Surface, ClockedThread)> {
+    let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1, monitor)?;
+    match ClockedThread::spawn(clock, sources, wake) {
+        Ok(input) => Ok((window_thread, surface, input)),
+        Err(e) => {
+            window_thread.close();
+            Err(anyhow::Error::new(e).context("input"))
+        }
+    }
+}
+
+/// The game: WASAPI and a window, with the devices' input through Raw
+/// Input, or generated input on a clocked input thread (autoplay).
 fn play(
     chart: &Path,
+    input: PlayInput,
     clock: QpcClock,
     #[cfg(feature = "dev-tools")] keep_presents: bool,
     tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> anyhow::Result<()> {
     #[cfg(feature = "dev-tools")]
     alloc_count::tag(alloc_count::Tag::Logic);
-    let mut loaded = load(chart, ReceiveMethod::RawInput)?;
+    let Prepared {
+        mut loaded,
+        mode,
+        sources,
+        schedule,
+        keyboard,
+    } = prepare(chart, &input)?;
     let controls = controls(&loaded, clock);
     let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
     let (audio, opened) = audio_side::spawn(
@@ -580,27 +744,35 @@ fn play(
         |_| {},
     )?;
     let probes = Probes::new();
-    let audio = start_engine(&loaded, audio, opened, probes.sounds.0)?;
-    let sources = sources();
+    let audio = start_engine(&loaded, schedule, audio, opened, probes.sounds.0)?;
     controls.set_latch(sources.gate().handle());
-    let (mut hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock);
+    let raw_input = matches!(mode, Mode::Clock);
+    let (mut hook, input) = input_side::link(Arc::clone(&controls), mode);
     let device = &loaded.settings().device;
     let keys = (device.keyboard.retry, device.keyboard.quit);
     let monitor = device.monitor.clone();
-    let (window_thread, surface, input_thread) = match open_window_and_input(
-        &controls,
-        clock,
-        sources,
-        Capture::new(),
-        move |s, now| {
-            #[cfg(feature = "dev-tools")]
-            alloc_count::tag(alloc_count::Tag::Input);
-            hook.wake(s, now);
-        },
-        keys,
-        monitor,
-    ) {
-        Ok(opened) => opened,
+    let wake = move |s: &mut SourceSet, now| {
+        #[cfg(feature = "dev-tools")]
+        alloc_count::tag(alloc_count::Tag::Input);
+        hook.wake(s, now);
+    };
+    let started = if raw_input {
+        open_window_and_input(
+            &controls,
+            clock,
+            sources,
+            Capture::new(),
+            wake,
+            keys,
+            monitor,
+        )
+        .map(|(w, s, t)| (w, s, Some(t), None))
+    } else {
+        open_window_and_clocked(&controls, clock, sources, wake, keys, monitor)
+            .map(|(w, s, t)| (w, s, None, Some(t)))
+    };
+    let (window_thread, surface, raw_thread, clocked_thread) = match started {
+        Ok(started) => started,
         Err(e) => {
             audio.exit();
             return Err(e);
@@ -654,30 +826,40 @@ fn play(
         clock,
         probes.steps.0,
     );
+    if let Some(keyboard) = keyboard {
+        rig.recorded.keyboard = keyboard;
+    }
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run(&mut loaded, &mut rig);
     rig.shut_down();
     window_thread.close();
-    drop(input_thread);
+    drop((raw_thread, clocked_thread));
     ran?;
     Ok(())
 }
 
-/// A scripted run (dev-tools): the input log as input, a recording of a
-/// simulated device as output, WARP offscreen as the screen.
+/// A headless run (dev-tools): an input log replayed as a script, or
+/// autoplay (`--auto --dev-headless`), on a clocked input thread, a
+/// recording of a simulated device as output, WARP offscreen as the
+/// screen.
 #[cfg(feature = "dev-tools")]
-fn scripted(
+fn headless(
     chart: &Path,
-    log: &Path,
+    input: PlayInput,
     frames: Option<PathBuf>,
     auto_retries: u32,
     clock: QpcClock,
     tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> anyhow::Result<()> {
     alloc_count::tag(alloc_count::Tag::Logic);
-    let script = dev::script(log)?;
-    let mut loaded = load(chart, ReceiveMethod::Scripted)?;
+    let Prepared {
+        mut loaded,
+        mode,
+        sources,
+        schedule,
+        keyboard,
+    } = prepare(chart, &input)?;
     let controls = controls(&loaded, clock);
     let last_note = loaded
         .chart()
@@ -696,16 +878,14 @@ fn scripted(
         dev::report_audio,
     )?;
     let probes = Probes::new();
-    let audio = start_engine(&loaded, audio, opened, probes.sounds.0)?;
-    let sources = sources();
+    let audio = start_engine(&loaded, schedule, audio, opened, probes.sounds.0)?;
     controls.set_latch(sources.gate().handle());
-    let script = input_side::Script {
-        log: script.clone(),
-        current: script,
-        sources: source_config(),
-    };
-    let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Script(Box::new(script)));
-    let script_thread = dev::ScriptThread::spawn(clock, sources, hook)?;
+    let (mut hook, input) = input_side::link(Arc::clone(&controls), mode);
+    let input_thread = ClockedThread::spawn(clock, sources, move |s, now| {
+        alloc_count::tag(alloc_count::Tag::Input);
+        hook.wake(s, now);
+    })
+    .context("input")?;
     let dump: Box<dyn render_side::FrameSink> = match frames {
         Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(last_note.0 / 2))),
         None => Box::new(NoFrames),
@@ -743,13 +923,16 @@ fn scripted(
         clock,
         probes.steps.0,
     );
+    if let Some(keyboard) = keyboard {
+        rig.recorded.keyboard = keyboard;
+    }
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.auto_retries = auto_retries;
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run(&mut loaded, &mut rig);
     rig.shut_down();
-    drop(script_thread);
+    drop(input_thread);
     ran?;
     Ok(())
 }

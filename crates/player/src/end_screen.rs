@@ -114,13 +114,17 @@ fn cause(c: AbortCause) -> &'static str {
 
 /// The end screen's lines, the gauges named by the preset the play was
 /// evaluated under. `input_offset_us` is the input offset the play
-/// used, to which the recommendation adds the median deviation.
+/// used, to which the recommendation adds the median deviation. An
+/// `autoplay` play (design.md "Autoplay") says it was not saved in place
+/// of the saved line and recommends no input offset: its deviations say
+/// nothing about the player's.
 pub fn lines(
     report: &PlayReport,
     input_offset_us: i64,
     times: LoadTimes,
     queue: QueueLine,
     hints: &Hints,
+    autoplay: bool,
 ) -> Vec<String> {
     let mut l = Vec::new();
     l.push(match report.end {
@@ -168,6 +172,8 @@ pub fn lines(
             }
             .to_owned(),
         );
+    }
+    if let Some(s) = summary.filter(|_| !autoplay) {
         l.push(match s.recommended_offset {
             Some(r) => format!(
                 "RECOMMENDED INPUT OFFSET {} MS (NOW {} MS)",
@@ -213,6 +219,7 @@ pub fn lines(
             l.push(format!("SAVED AS RECORD {name}"));
         }
         Some(Err(e)) => l.push(format!("NOT SAVED: {}", Chain(e)).to_uppercase()),
+        None if autoplay => l.push("AUTOPLAY: NOT SAVED".to_owned()),
         None => {}
     }
     if let Some(e) = report.output_error {
@@ -416,6 +423,7 @@ mod tests {
             super::LoadTimes::default(),
             queue,
             &hints,
+            false,
         );
         assert!(lines.contains(&super::queue_line(queue)), "{lines:?}");
         for id in &ids {
@@ -426,5 +434,53 @@ mod tests {
             );
         }
         assert_eq!(lines.last().unwrap(), "BACKSPACE: RETRY    ESCAPE: QUIT");
+    }
+
+    /// P3: an autoplay play's end screen says it was not saved and shows
+    /// the result, but neither recommendation line, even with a
+    /// recommendation; the same report from a saved session shows both
+    /// and no such line.
+    #[test]
+    fn autoplay_end_screen_says_not_saved() {
+        let mut played = report(rules::custom());
+        played.result.as_mut().unwrap().recommended_offset = Some(game::RecommendedOffset {
+            median: bms_model::TimeUs(0),
+            spread: bms_model::TimeUs(0),
+            samples: 40,
+        });
+        let hints = super::Hints::new(Some(0x0E), Some(0x01));
+        let queue = super::QueueLine {
+            played: Some(2),
+            steady_underruns: 0,
+            next: 2,
+        };
+        let lines = |autoplay| {
+            super::lines(
+                &played,
+                0,
+                super::LoadTimes::default(),
+                queue,
+                &hints,
+                autoplay,
+            )
+        };
+        let recommends = |l: &[String]| {
+            l.iter()
+                .filter(|l| {
+                    l.contains("RECOMMENDED INPUT OFFSET") || l.contains("MEDIAN DEVIATION")
+                })
+                .count()
+        };
+        let auto = lines(true);
+        assert!(auto.iter().any(|l| l == "AUTOPLAY: NOT SAVED"), "{auto:?}");
+        assert!(auto.iter().any(|l| l.starts_with("PERFECT 3")), "{auto:?}");
+        assert!(
+            auto.iter()
+                .any(|l| l == "RE-EVALUATION MATCHES THE LIVE PLAY")
+        );
+        assert_eq!(recommends(&auto), 0, "{auto:?}");
+        let saved = lines(false);
+        assert!(!saved.iter().any(|l| l.contains("AUTOPLAY")), "{saved:?}");
+        assert_eq!(recommends(&saved), 2, "{saved:?}");
     }
 }
