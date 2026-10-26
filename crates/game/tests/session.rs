@@ -1350,3 +1350,55 @@ fn recording_policy_fits_the_standard_decoder() {
         r.capacity() / 1240
     );
 }
+
+#[test]
+fn fixed_costs_alone_can_refuse_a_play() {
+    let r = game::Reservation {
+        fixed: game::RECORDING_MEMORY - 10,
+        per_input: 5,
+    };
+    assert!(r.fits(0));
+    assert!(r.fits(2));
+    assert!(!r.fits(3));
+    // A chart whose fixed part alone is beyond the budget fits nothing,
+    // not even a play that records no input.
+    let r = game::Reservation {
+        fixed: game::RECORDING_MEMORY + 1,
+        per_input: 5,
+    };
+    assert!(!r.fits(0));
+    assert_eq!(r.capacity(), 0);
+}
+
+#[test]
+fn a_chart_too_large_to_reserve_is_refused_without_inputs() {
+    let (_dir, root) = temp_root();
+    // 600 thousand notes: their share of the output alone is beyond the
+    // budget. No control is recorded, so the window needs no input.
+    let mut b = ChartBuilder::new(150_000);
+    for i in 0..600_000_i64 {
+        b = b.tap(
+            lane(u8::try_from(i % 7).unwrap() + 1),
+            TimeUs(1_000 * MS + i * MS),
+        );
+    }
+    let mut settings = Settings::load(&root).unwrap();
+    settings.device.keyboard = game::KeyConfig {
+        lanes: Vec::new(),
+        retry: None,
+        quit: None,
+    };
+    let parts = Parts {
+        ingest: Box::new(Built(b.build().unwrap())),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap();
+    let err = loaded.plan(&[DeviceKind::Keyboard], &[]).unwrap_err();
+    assert_eq!(
+        err,
+        game::LogicError::RecordingTooLarge {
+            needed: 0,
+            allowed: 0,
+        }
+    );
+}

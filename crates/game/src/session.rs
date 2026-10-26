@@ -545,7 +545,7 @@ impl Loaded {
             &recorded,
         );
         if let Some(r) = Reservation::of(&self.chart, &self.preset, &device, self.config.effects)
-            && inputs > r.capacity()
+            && !r.fits(inputs)
         {
             return Err(LogicError::RecordingTooLarge {
                 needed: inputs,
@@ -1021,7 +1021,16 @@ impl Reservation {
             .saturating_add(self.per_input.saturating_mul(inputs))
     }
 
-    /// The largest capacity within [`RECORDING_MEMORY`].
+    /// Whether a capacity of `inputs` fits in [`RECORDING_MEMORY`], fixed
+    /// costs included: a chart whose fixed part alone exceeds it fits no
+    /// capacity, not even 0.
+    #[must_use]
+    pub const fn fits(&self, inputs: usize) -> bool {
+        self.bytes(inputs) <= RECORDING_MEMORY
+    }
+
+    /// The largest capacity within [`RECORDING_MEMORY`]; 0 also when not
+    /// even 0 fits ([`fits`](Self::fits)).
     #[must_use]
     pub const fn capacity(&self) -> usize {
         RECORDING_MEMORY.saturating_sub(self.fixed)

@@ -331,12 +331,17 @@ impl<'a> Evaluator<'a> {
         }
         let mut lanes: [LaneState; LANE_COUNT] = Default::default();
         for (state, notes) in lanes.iter_mut().zip(&chart.lanes) {
-            state.targets = notes
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| matches!(n.kind, NoteKind::Tap | NoteKind::Long { .. }))
-                .map(|(i, _)| i)
-                .collect();
+            // Reserved at its exact size, which the recording policy counts.
+            let judgeable =
+                |n: &bms_model::Note| matches!(n.kind, NoteKind::Tap | NoteKind::Long { .. });
+            state.targets = Vec::with_capacity(notes.iter().filter(|n| judgeable(n)).count());
+            state.targets.extend(
+                notes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| judgeable(n))
+                    .map(|(i, _)| i),
+            );
             state.judged = vec![false; state.targets.len()];
             let mut deadlines = Vec::with_capacity(notes.len() * 2);
             for (target, &i) in state.targets.iter().enumerate() {

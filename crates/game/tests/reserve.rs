@@ -117,6 +117,26 @@ fn reservation_matches_what_a_play_allocates() {
         "{} unaccounted",
         r.bytes(small) - at_small
     );
+    // The evaluator's tables grow by the same bytes per note across a
+    // power of two (127, 128, 129 notes on one lane), within the per-object
+    // allowance: reserved at their size, never grown by doubling.
+    let tables = |notes: i64| {
+        let mut b = ChartBuilder::new(150_000);
+        for i in 0..notes {
+            b = b.tap(lane(1), TimeUs(1_000 * MS + i * 50 * MS));
+        }
+        let chart = b.build().unwrap();
+        let one = device(&[0]);
+        BYTES.store(0, Ordering::Relaxed);
+        TRACK.with(|t| t.set(true));
+        let ev = eval::Evaluator::new(&chart, &rule, &one, &InputStart::default(), 0).unwrap();
+        TRACK.with(|t| t.set(false));
+        drop(ev);
+        BYTES.load(Ordering::Relaxed)
+    };
+    let (a, b, c) = (tables(127), tables(128), tables(129));
+    assert_eq!(c - b, b - a, "{a} {b} {c}");
+    assert!(c - b <= TABLE_BYTES_PER_OBJECT, "{} bytes a note", c - b);
     println!(
         "indicator: {} bytes per input; fixed {} bytes, measured fixed {}",
         r.per_input,
