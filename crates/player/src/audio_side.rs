@@ -129,3 +129,37 @@ where
         Err(_) => Err(AudioStartError::Ended),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::AudioStartError;
+
+    #[derive(Debug, PartialEq, thiserror::Error)]
+    #[error("no device")]
+    struct NoDevice;
+
+    /// The output's error and the spawn failure are the sources, printed
+    /// once in the chain; the chain ends there.
+    #[test]
+    fn start_errors_keep_their_sources() {
+        let e = AudioStartError::Open(NoDevice);
+        assert_eq!(e.to_string(), "audio");
+        let source = e.source().expect("the output error is the source");
+        assert_eq!(source.downcast_ref::<NoDevice>(), Some(&NoDevice));
+        assert!(source.source().is_none());
+        assert_eq!(game::Chain(&e).to_string(), "audio: no device");
+
+        let e = AudioStartError::<NoDevice>::Spawn(std::io::Error::other("no threads"));
+        assert_eq!(e.to_string(), "the audio thread cannot start");
+        let source = e.source().expect("the spawn error is the source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert!(source.source().is_none());
+        assert_eq!(
+            game::Chain(&e).to_string(),
+            "the audio thread cannot start: no threads"
+        );
+        assert!(AudioStartError::<NoDevice>::Ended.source().is_none());
+    }
+}
