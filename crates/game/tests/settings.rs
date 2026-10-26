@@ -197,6 +197,7 @@ fn key_config_gives_profiles_and_recorded_controls() {
         min: 0,
         max: 254,
         bits: 16,
+        signed: false,
     }];
     let profile = s.profile(&[DeviceKind::Controller, DeviceKind::Keyboard], &[declared]);
     let lane = |n| Lane::new(n).unwrap();
@@ -270,6 +271,7 @@ fn scratch_settings_resolve_from_the_device_unless_set() {
         min: 0,
         max: i32::try_from(wrap).unwrap() - 1,
         bits: 16,
+        signed: false,
     };
     let auto = ScratchConfig::default();
     let mode = |c: &ScratchConfig, declared: Option<AxisCap>| c.settings(declared.as_ref()).mode;
@@ -322,6 +324,7 @@ fn scratch_range_is_the_one_its_conversion_uses() {
         min,
         max,
         bits: 16,
+        signed: min < 0,
     };
     let auto = ScratchConfig::default();
     let wrap = |w| ScratchConfig {
@@ -329,10 +332,8 @@ fn scratch_range_is_the_one_its_conversion_uses() {
         ..auto
     };
     // As declared, unless the file sets a revolution.
-    assert!(!auto.overrides_range());
     assert_eq!(auto.range(&cap(false, 3, 200)), Some((3, 200)));
     assert_eq!(auto.range(&cap(true, 0, 0)), None);
-    assert!(wrap(256).overrides_range());
     assert_eq!(wrap(256).range(&cap(false, 3, 200)), Some((0, 255)));
     assert_eq!(wrap(1_024).range(&cap(false, -100, 100)), Some((-512, 511)));
     // A revolution of 0 does not wrap, and a relative axis has no range,
@@ -342,7 +343,6 @@ fn scratch_range_is_the_one_its_conversion_uses() {
         relative: Some(true),
         ..auto
     };
-    assert!(relative.overrides_range());
     assert_eq!(relative.range(&cap(false, 3, 200)), None);
     // Set absolute: the declared relative axis has no declared revolution,
     // so only a set one gives it a range.

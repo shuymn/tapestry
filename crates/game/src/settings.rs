@@ -401,13 +401,6 @@ impl ScratchConfig {
             None => (!cap.relative).then_some((cap.min, cap.max)),
         }
     }
-
-    /// Whether the axis's mode or revolution is set here rather than taken
-    /// from the device.
-    #[must_use]
-    pub fn overrides_range(&self) -> bool {
-        self.relative.is_some() || self.wrap.is_some()
-    }
 }
 
 /// The controller a controller key config belongs to: its model and, on a

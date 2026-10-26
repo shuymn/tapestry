@@ -88,7 +88,9 @@ pub const fn axis_value(raw: u32, bits: u16, signed: bool) -> i32 {
 /// full width declares its maximum as a negative number (0xFFFF read as
 /// -1 in 16 bits), which is read back unsigned. `None` for an absolute axis
 /// whose count of values does not fit in a `u32` (a full 32-bit field) or
-/// whose range is empty: such an axis is not read.
+/// whose range is empty: such an axis is not read. The field is signed
+/// when the declared minimum is negative, as Windows decodes it, for a
+/// relative axis too.
 ///
 /// A descriptor can be wrong: a value reported outside the range the
 /// conversion uses, the declared one unless `device.toml` sets another, is
@@ -110,6 +112,7 @@ pub fn axis_cap(
             min: 0,
             max: 0,
             bits,
+            signed: min < 0,
         });
     }
     let max = if max < min && (1..32).contains(&bits) {
@@ -126,6 +129,7 @@ pub fn axis_cap(
         min,
         max,
         bits,
+        signed: min < 0,
     })
 }
 
@@ -143,7 +147,7 @@ pub fn widened_wrap(cap: &AxisCap, lo: i32, hi: i32) -> Option<u32> {
         return None;
     }
     let (lo, hi) = (i64::from(lo.min(cap.min)), i64::from(hi.max(cap.max)));
-    let signed = cap.min < 0;
+    let signed = cap.signed;
     (1..=cap.bits.min(31)).find_map(|k| {
         let size = 1_i64 << k;
         let (low, high) = if signed {
@@ -159,15 +163,16 @@ pub fn widened_wrap(cap: &AxisCap, lo: i32, hi: i32) -> Option<u32> {
 
 /// The values of one revolution of `wrap` values set for an absolute axis
 /// declared as `cap`: the standard span [`widened_wrap`] uses,
-/// `-(wrap / 2)..` for a signed field (one declaring a negative minimum)
-/// and `0..` for an unsigned one, `wrap` values long and cut at
+/// `-(wrap / 2)..` for a signed field ([`AxisCap::signed`], kept even for
+/// an axis declared relative) and `0..` for an unsigned one, `wrap` values
+/// long and cut at
 /// `i32::MAX`. `None` for a `wrap` of 0, an axis that does not wrap.
 #[must_use]
 pub fn wrap_range(cap: &AxisCap, wrap: u32) -> Option<(i32, i32)> {
     if wrap == 0 {
         return None;
     }
-    let low = if cap.min < 0 { -i64::from(wrap / 2) } else { 0 };
+    let low = if cap.signed { -i64::from(wrap / 2) } else { 0 };
     let high = low + i64::from(wrap) - 1;
     // `wrap / 2` is below 2^31, so `low` fits.
     Some((
@@ -322,6 +327,10 @@ pub struct AxisCap {
     pub max: i32,
     /// The width of its report field.
     pub bits: u16,
+    /// Whether its field is signed (its descriptor declares a negative
+    /// minimum), as its values are decoded; kept for a relative axis too,
+    /// in case `device.toml` sets it absolute.
+    pub signed: bool,
 }
 
 const NO_AXIS: AxisCap = AxisCap {
@@ -331,6 +340,7 @@ const NO_AXIS: AxisCap = AxisCap {
     min: 0,
     max: 0,
     bits: 0,
+    signed: false,
 };
 
 /// The buttons one report id carries: bit `n − 1` is button `n`.

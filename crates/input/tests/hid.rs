@@ -27,6 +27,7 @@ fn caps() -> [AxisCap; 2] {
             min: 0,
             max: 255,
             bits: 16,
+            signed: false,
         },
         AxisCap {
             control: DIAL,
@@ -35,6 +36,7 @@ fn caps() -> [AxisCap; 2] {
             min: 0,
             max: 0,
             bits: 16,
+            signed: false,
         },
     ]
 }
@@ -187,6 +189,7 @@ fn more_axes_than_kept_are_ignored() {
             min: 0,
             max: 0,
             bits: 16,
+            signed: false,
         })
         .collect();
     let dev = HidDevice::new(PAD, &layout(&many));
@@ -318,6 +321,7 @@ fn capture_travel_is_a_sixteenth_turn_at_least_16() {
         min: 0,
         max: 0,
         bits: 16,
+        signed: false,
     };
     assert_eq!(capture_travel(&cap(0)), 16);
     assert_eq!(capture_travel(&cap(256)), 16);
@@ -516,6 +520,7 @@ fn collections_of_one_controller_are_one_source() {
         min: 0,
         max: 255,
         bits: 16,
+        signed: false,
     }];
     // The adapter declares the second collection's axis as it connects.
     set.add_axes(PAD, &second_axes);
@@ -700,6 +705,7 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
             min,
             max,
             bits,
+            signed: min < 0,
         })
     };
     // Signed and unsigned 8 bits.
@@ -718,7 +724,7 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
         absolute(65_536, -32_768, 32_767, 16)
     );
     assert_eq!(cap(true, 0, -1, 16), absolute(65_536, 0, 65_535, 16));
-    // A relative axis has no range.
+    // A relative axis has no range, but keeps its field's signedness.
     assert_eq!(
         cap(false, -127, 127, 8),
         Some(AxisCap {
@@ -728,6 +734,7 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
             min: 0,
             max: 0,
             bits: 8,
+            signed: true,
         })
     );
     // A full 32-bit range does not fit in a u32; an empty one is no range.
@@ -760,6 +767,7 @@ fn widening_takes_the_smallest_field_span_holding_what_was_seen() {
         min: i32::MIN + 1,
         max: i32::MAX,
         bits: 32,
+        signed: true,
     };
     assert_eq!(widened_wrap(&wide, i32::MIN, 0), None);
     // A relative axis has no range to widen.
@@ -1136,6 +1144,7 @@ fn axes_past_the_table_are_not_kept() {
             min: 0,
             max: 255,
             bits: 16,
+            signed: false,
         })
         .collect();
     let kept = set.add_axes(PAD, &more);

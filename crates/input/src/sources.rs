@@ -102,6 +102,9 @@ struct Participant {
     axis_ranges: Vec<(ControlId, Option<(i32, i32)>)>,
     /// Axis values it reported outside the range their conversion uses.
     out_of_range: u64,
+    /// Those of them counted against a range from
+    /// [`SourceSet::set_axis_ranges`] rather than the declared one.
+    out_of_set_range: u64,
 }
 
 /// The open recording.
@@ -305,6 +308,7 @@ impl SourceSet {
                     min: 0,
                     max: 0,
                     bits: 0,
+                    signed: false,
                 }; MAX_AXES],
                 n_axes: 0,
                 positions: [None; MAX_AXES],
@@ -402,12 +406,16 @@ impl SourceSet {
         if let Some(rec) = &mut self.recording
             && let Some(p) = rec.participants.iter_mut().find(|p| p.device == device)
         {
-            let range = match p.axis_ranges.iter().find(|(c, _)| *c == cap.control) {
+            let set = p.axis_ranges.iter().find(|(c, _)| *c == cap.control);
+            let range = match set {
                 Some(&(_, range)) => range,
                 None => (!cap.relative).then_some((cap.min, cap.max)),
             };
             if range.is_some_and(|(min, max)| !(min..=max).contains(&value)) {
                 p.out_of_range = p.out_of_range.saturating_add(1);
+                if set.is_some() {
+                    p.out_of_set_range = p.out_of_set_range.saturating_add(1);
+                }
             }
         }
     }
@@ -439,6 +447,16 @@ impl SourceSet {
         self.recording
             .iter()
             .flat_map(|r| r.participants.iter().map(|p| p.out_of_range))
+    }
+
+    /// Of [`axis_out_of_range`](Self::axis_out_of_range), how many each
+    /// source's axes counted against a range from
+    /// [`set_axis_ranges`](Self::set_axis_ranges); the rest were outside
+    /// a declared range.
+    pub fn axis_out_of_set_range(&self) -> impl Iterator<Item = u64> + '_ {
+        self.recording
+            .iter()
+            .flat_map(|r| r.participants.iter().map(|p| p.out_of_set_range))
     }
 
     /// Input that could not be read (a packet larger than the adapter's
@@ -679,6 +697,7 @@ impl SourceSet {
                     recorded,
                     axis_ranges: device.axis_ranges.clone(),
                     out_of_range: 0,
+                    out_of_set_range: 0,
                 });
                 readers.push(reader);
             }

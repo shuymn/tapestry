@@ -215,6 +215,7 @@ pub fn declared_axes(profile: &SourceProfile) -> Vec<AxisCap> {
                 min: 0,
                 max: 0,
                 bits: 0,
+                signed: false,
             },
             AxisMode::Absolute { wrap } => AxisCap {
                 control: a.control,
@@ -223,6 +224,7 @@ pub fn declared_axes(profile: &SourceProfile) -> Vec<AxisCap> {
                 min: 0,
                 max: i32::try_from(wrap.wrapping_sub(1)).unwrap_or(i32::MAX),
                 bits: 0,
+                signed: false,
             },
         })
         .collect()
