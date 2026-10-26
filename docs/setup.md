@@ -154,5 +154,6 @@ The game's own figures (stage1.md D11) show in an overlay that F9 toggles during
 
 ## Other
 
+- The game's log is `%LOCALAPPDATA%\tapestry\logs\tapestry.log`, with the two runs before it in `tapestry.1.log` and `tapestry.2.log` (design.md "Log File").
 - Antivirus exclusions are not configured by default. Only if builds are actually confirmed to be slow, exclude the build output directory and nothing else.
 - Code signing is prepared before public distribution. It is not needed during development.

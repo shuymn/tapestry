@@ -4,7 +4,8 @@
 //! audio device and loads the sound bank, starts the input thread, then
 //! opens a borderless fullscreen window whose render thread prepares the
 //! GPU resources, and plays the chart until the player quits. The data
-//! root is `%LOCALAPPDATA%\tapestry\` (D10).
+//! root is `%LOCALAPPDATA%\tapestry\` (D10); the commands that do work log
+//! their loading and outcome to `logs\tapestry.log` in it ([`log_file`]).
 //!
 //! `tapestry play --auto <chart.bms>` plays the chart by itself on the same
 //! window, audio output and renderer (design.md "Autoplay"): the input that
@@ -25,6 +26,7 @@ mod dev;
 mod end_screen;
 mod input_side;
 mod keys;
+mod log_file;
 mod measure;
 mod play;
 mod power;
@@ -81,6 +83,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Only a command that does work logs, from here on; without a data
+    // root, the command reports that itself.
+    if let Some(name) = logged(&command)
+        && let Ok(root) = data_root()
+    {
+        log_file::start(&root.path().join("logs"), name);
+    }
     match command {
         Command::Version => {
             println!("tapestry {}", env!("CARGO_PKG_VERSION"));
@@ -95,6 +104,20 @@ fn main() -> ExitCode {
         Command::DevToolsProbe => dev::probe(),
         #[cfg(feature = "dev-tools")]
         Command::Measure { chart } => report(measure_play(&chart, clock)),
+    }
+}
+
+/// The name the log gives `command`, or `None` for one that writes no log:
+/// `--version` and the probe only print.
+fn logged(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Version => None,
+        #[cfg(feature = "dev-tools")]
+        Command::DevToolsProbe => None,
+        Command::Keys(_) => Some("keys"),
+        Command::Play(_) => Some("play"),
+        #[cfg(feature = "dev-tools")]
+        Command::Measure { .. } => Some("measure"),
     }
 }
 
@@ -204,16 +227,21 @@ fn measure_play(chart: &Path, clock: QpcClock) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A run's outcome as its exit code: a failure prints [`diagnostic`] and
-/// exits 1.
+/// A run's outcome as its exit code: a failure prints [`diagnostic`], logs
+/// it, and exits 1. The log's exit line is written here, the one exit of
+/// every command that logs.
 fn report(result: anyhow::Result<()>) -> ExitCode {
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    let code = match result {
+        Ok(()) => 0,
         Err(e) => {
-            eprintln!("{}", diagnostic(&e));
-            ExitCode::from(1)
+            let line = diagnostic(&e);
+            eprintln!("{line}");
+            log::error!("{line}");
+            1
         }
-    }
+    };
+    log_file::finish(code);
+    ExitCode::from(code)
 }
 
 /// A failure and each of its causes, once, on one line.
@@ -303,9 +331,9 @@ fn load(chart: &Path, input: &PlayInput) -> anyhow::Result<Loaded> {
     };
     let loaded = Loaded::load(root, settings, chart, config, parts)
         .with_context(|| chart.display().to_string())?;
-    for w in loaded.warnings() {
-        eprintln!("warning: {w}");
-    }
+    let warnings = loaded.warnings();
+    log::info!("loaded {} ({} warnings)", chart.display(), warnings.len());
+    log_file::warnings("chart", warnings.iter());
     Ok(loaded)
 }
 
@@ -401,9 +429,7 @@ fn start_engine(
     let chart = loaded.chart();
     let bank = load_bank(chart, opened.rate, &BankLimits::default())
         .context("the sounds cannot be loaded")?;
-    for w in bank.warnings() {
-        eprintln!("warning: {w:?}");
-    }
+    log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
     let mut engine = AudioEngine::with_schedule(
         Arc::new(bank),
         schedule.unwrap_or_else(|| chart.bgm.clone()),

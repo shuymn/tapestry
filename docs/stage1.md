@@ -139,7 +139,7 @@ wgpu on DX12 directly (design.md:410, 839), reusing what the spike proved: `Dx12
 
 ### D10. Settings persistence
 
-TOML (design.md:849) in two files, as design.md:646 requires: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, audio device, master volume, queued audio periods) and `player.toml` (hi-speed, preset file, displayed gauge). Both live in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\custom.toml` and `records\`.
+TOML (design.md:849) in two files, as design.md:646 requires: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, audio device, master volume, queued audio periods) and `player.toml` (hi-speed, preset file, displayed gauge). Both live in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\custom.toml`, `records\` and `logs\` (design.md "Log File").
 
 - The design says nothing about location. Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large. One root keeps backup simple, and the scopes stay separated by file.
 - On first start `custom.toml` is written by serializing `rules::custom()`. At each retry the session checks the file's modification time, and a changed preset is used from that retry on. design.md:632 says files are reloaded "immediately"; stage 1 reloads at the next retry only, which is the earliest point a reloaded preset may be used in play (design.md:633), and no result screen re-evaluates under it yet. PR10 records this stage 1 behavior in design.md "Tuning Without Restart". File watching arrives with the result screen in stage 2.
