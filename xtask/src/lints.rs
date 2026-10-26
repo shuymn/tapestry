@@ -13,10 +13,12 @@
 //!   workspace member inherits `[workspace.lints]`; the cast and
 //!   disallowed-API lines stand at the crate roots in [`CRATE_ROOT_LINES`];
 //!   every in-play site in [`IN_PLAY`] carries the attribute denying
-//!   `unwrap`, `expect` and indexing, and no attribute in its file lowers
-//!   them to `allow` or `warn`; the test allowances of the two
-//!   `clippy.toml` files match; `crates/eval/clippy.toml` lists every path
-//!   in [`REQUIRED_DISALLOWED`]; and the fixture files are exactly
+//!   `unwrap`, `expect` and indexing, no attribute in its file lowers
+//!   them to `allow` or `warn`, and its file names neither `anyhow` nor
+//!   the `log` facade (both scans partial, see [`names_log`]); the test
+//!   allowances of the two `clippy.toml` files match;
+//!   `crates/eval/clippy.toml` lists every path in [`REQUIRED_DISALLOWED`];
+//!   and the fixture files are exactly
 //!   [`LINTS`], with no attribute (doc comments aside) and no macro
 //!   definition in them.
 //!
@@ -33,8 +35,9 @@ use std::str::FromStr as _;
 use anyhow::{Context as _, bail};
 use cargo_metadata::diagnostic::DiagnosticLevel;
 use cargo_metadata::{Message, MetadataCommand};
-use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, Spacing, TokenStream, TokenTree};
 use quote::ToTokens as _;
+use syn::ext::IdentExt as _;
 use syn::punctuated::Punctuated;
 
 /// The cfg that compiles the fixtures.
@@ -101,6 +104,8 @@ pub enum Site {
 /// The code the in-play threads run (design.md "Scope of No Allocation"):
 /// the input thread's loop and device arrival, the logic step, the audio
 /// callback, and per-frame rendering, with what they call in other crates.
+/// Each listed file, a [`Site::Fns`] file whole, names neither `anyhow`
+/// nor the `log` facade: in-play code keeps typed errors and never logs.
 /// The pull request that changes this table lists the call paths.
 pub const IN_PLAY: &[Site] = &[
     // The logic step's evaluator.
@@ -577,6 +582,11 @@ fn check_site(root: &Path, site: Site) -> anyhow::Result<Vec<String>> {
             "{file}: in-play code names `anyhow`; it keeps typed errors (design.md \"Errors\")"
         ));
     }
+    if names_log(tokens.clone()) {
+        out.push(format!(
+            "{file}: in-play code names the `log` facade; only loading and lifecycle code logs (design.md \"Log File\")"
+        ));
+    }
     for attr in lowering_attributes(tokens) {
         out.push(format!(
             "{file}: `{attr}` lowers an in-play lint; state the invariant in an `#[expect]`"
@@ -916,8 +926,52 @@ fn names_anyhow(tokens: TokenStream) -> bool {
     let mut found = false;
     for_each_tree(tokens, &mut |tree, _| {
         if let TokenTree::Ident(i) = tree
-            && (*i == "anyhow" || *i == "r#anyhow")
+            && i.unraw() == "anyhow"
         {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The `log` facade's macros, which `#[macro_use]` can bring in unnamed.
+const LOG_MACROS: &[&str] = &[
+    "error",
+    "warn",
+    "info",
+    "debug",
+    "trace",
+    "log",
+    "log_enabled",
+];
+
+/// Whether source `tokens` name the `log` facade anywhere, test modules
+/// included, as [`names_anyhow`] scans: the identifier `log` before `::`,
+/// `use log` or `crate log` (`extern crate`), or a call of one of
+/// [`LOG_MACROS`] (the name, `!`, then a group). Raw identifiers count as
+/// their names.
+///
+/// The check is partial. It flags an unrelated macro of one of those names
+/// and a local `log` module named with `::`. It misses an alias made by a
+/// grouped or absolute import (`use {log as l};`, `use ::log as l;`) and
+/// used only through the alias, an alias re-exported from another module, a
+/// wrapper defined outside the file, and generated code.
+fn names_log(tokens: TokenStream) -> bool {
+    let mut found = false;
+    for_each_tree(tokens, &mut |tree, rest| {
+        let TokenTree::Ident(i) = tree else {
+            return;
+        };
+        let name = i.unraw();
+        let path = name == "log"
+            && matches!(rest, [TokenTree::Punct(a), TokenTree::Punct(b), ..]
+                if a.as_char() == ':' && a.spacing() == Spacing::Joint && b.as_char() == ':');
+        let import = (name == "use" || name == "crate")
+            && matches!(rest.first(), Some(TokenTree::Ident(n)) if n.unraw() == "log");
+        let call = LOG_MACROS.iter().any(|m| name == m)
+            && matches!(rest, [TokenTree::Punct(bang), TokenTree::Group(_), ..]
+                if bang.as_char() == '!');
+        if path || import || call {
             found = true;
         }
     });
@@ -1392,6 +1446,55 @@ mod tests {
         );
         assert!(check(&fine, file).is_empty());
         assert!(check(&fine, fns).is_empty());
+    }
+
+    #[test]
+    fn in_play_files_name_no_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = |text: &str, site: Site| {
+            fs::write(dir.path().join("x.rs"), text).unwrap();
+            check_site(dir.path(), site).unwrap()
+        };
+        let file = Site::File("x.rs");
+        let fns = Site::Fns("x.rs", &["hot"]);
+        let named = "x.rs: in-play code names the `log` facade; only loading and lifecycle code logs (design.md \"Log File\")";
+        // Each form, in a whole file and in a file of listed functions,
+        // outside the listed function and in a test module too: exactly the
+        // one diagnostic.
+        for form in [
+            "use log::warn;",
+            "fn f() { log::info!(\"x\"); }",
+            "fn f() { warn!(\"x\"); }",
+            "fn f() { r#warn!(\"x\"); }",
+            "fn f(_: log::Level) {}",
+            "fn f() { r#log::logger().flush(); }",
+            "extern crate log;",
+            "use log as l;",
+            "fn f() { log_enabled!(log::Level::Info); }",
+            "fn f() { error![\"x\"]; trace!{\"x\"} }",
+        ] {
+            for text in [
+                format!("{MODULE_ATTR}\n{FN_ATTR}\nfn hot() {{}}\n{form}\n"),
+                format!(
+                    "{MODULE_ATTR}\n{FN_ATTR}\nfn hot() {{}}\n#[cfg(test)]\nmod tests {{\n    {form}\n}}\n"
+                ),
+            ] {
+                for site in [file, fns] {
+                    assert_eq!(check(&text, site), [named], "{text}");
+                }
+            }
+        }
+        // Other uses of the names, comments and strings name nothing.
+        let fine = format!(
+            "{MODULE_ATTR}\n// log::warn!(\"x\")\n/// `use log;`\n\
+             {FN_ATTR}\nfn hot() -> &'static str {{ \"warn!\" }}\n\
+             fn log() {{}}\nstruct InputLog {{ log: u8 }}\n\
+             fn f(s: &InputLog) -> u8 {{ let log = 1; let _ = s.log; log + 1 }}\n\
+             fn g(a: bool) -> bool {{ let warn = a; warn != a }}\n\
+             #[warn(unused)]\nfn h() {{}}\n"
+        );
+        assert_eq!(check(&fine, file), Vec::<String>::new());
+        assert_eq!(check(&fine, fns), Vec::<String>::new());
     }
 
     #[test]

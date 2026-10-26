@@ -103,13 +103,20 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_of(CHART)
+}
+
+/// The fixture with chart `text`; its sounds folder also holds
+/// `broken.wav`, which is not a sound.
+fn fixture_of(text: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let charts = dir.path().join("chart");
     fs::create_dir_all(&charts).unwrap();
     let chart_path = charts.join("scripted.bms");
-    fs::write(&chart_path, CHART).unwrap();
+    fs::write(&chart_path, text).unwrap();
     write_click(&charts.join("click.wav"));
-    let chart = bms_parser::load_bms(CHART.as_bytes(), &charts, &Default::default())
+    fs::write(charts.join("broken.wav"), b"not a sound").unwrap();
+    let chart = bms_parser::load_bms(text.as_bytes(), &charts, &Default::default())
         .unwrap()
         .chart;
     let log = dir.path().join("input.tprl");
@@ -513,6 +520,140 @@ fn settings_keys_persist_and_the_input_offset_waits_for_the_next_play() {
     assert_eq!(offsets, [(0, 0), (2_000, 3_000)]);
 }
 
+/// The chart with `unknown` unknown headers, each a loading warning, and,
+/// with `broken`, a BGM sound whose file does not decode, a sound bank
+/// warning.
+fn warned_chart(unknown: usize, broken: bool) -> String {
+    let mut text = CHART.to_owned();
+    for i in 0..unknown {
+        text.push_str(&format!("#XUNKNOWN{i:04} 1\n"));
+    }
+    if broken {
+        // Beside the BGM sound at 4.0 s: the play's times stay the same.
+        text.push_str("#WAV02 broken.wav\n#00201:02\n");
+    }
+    text
+}
+
+/// The messages of the run's log, after the time and the level.
+fn log_lines(appdata: &Path) -> Vec<String> {
+    let text = fs::read_to_string(log_path(appdata)).unwrap();
+    text.lines().map(|l| l[15..].to_owned()).collect()
+}
+
+fn log_path(appdata: &Path) -> PathBuf {
+    appdata.join("tapestry").join("logs").join("tapestry.log")
+}
+
+/// The text of each `warning:` line on stderr.
+fn stderr_warnings(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("warning: "))
+        .collect()
+}
+
+/// Loading and sound bank warnings within the cap go to the log, each as
+/// stderr prints it, and stderr still prints them all.
+#[test]
+fn chart_and_sound_warnings_are_logged() {
+    let fx = fixture_of(&warned_chart(3, true));
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let warned = stderr_warnings(&stderr);
+    let (sounds, chart): (Vec<&str>, Vec<&str>) = warned
+        .iter()
+        .copied()
+        .partition(|w| w.starts_with("Undecodable"));
+    assert_eq!(sounds.len(), 1, "{stderr}");
+    assert_eq!(
+        chart.iter().filter(|w| w.contains("XUNKNOWN")).count(),
+        3,
+        "{stderr}"
+    );
+    let logged = log_lines(&fx.appdata);
+    let loaded = format!(
+        "loaded {} ({} warnings)",
+        fx.chart_path.display(),
+        chart.len()
+    );
+    assert!(logged.contains(&loaded), "{loaded:?} in {logged:?}");
+    let of = |what: &str| -> Vec<String> {
+        logged
+            .iter()
+            .filter_map(|l| l.strip_prefix(what).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(of("chart: "), chart);
+    assert_eq!(of("sounds: "), sounds);
+    assert_eq!(logged.last().map(String::as_str), Some("exit 0"));
+}
+
+/// Past the cap, the log keeps the first 100 warnings and a count of the
+/// rest within its size budget; stderr still prints every one.
+#[test]
+fn warnings_past_the_cap_are_counted() {
+    let fx = fixture_of(&warned_chart(1_000, false));
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .output()
+        .expect("run tapestry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let warned = stderr_warnings(&stderr);
+    let unknown = warned.iter().filter(|w| w.contains("XUNKNOWN")).count();
+    assert_eq!(unknown, 1_000, "{stderr}");
+    let n = warned.len();
+    let logged = log_lines(&fx.appdata);
+    let summary = format!("chart: {} more warnings not logged ({n} in all)", n - 100);
+    assert_eq!(
+        logged.iter().filter(|l| **l == summary).count(),
+        1,
+        "{summary:?} in {logged:?}"
+    );
+    let records = logged
+        .iter()
+        .filter(|l| l.starts_with("chart: ") && **l != summary)
+        .count();
+    assert_eq!(records, 100);
+    assert_eq!(logged.last().map(String::as_str), Some("exit 0"));
+    let size = fs::metadata(log_path(&fx.appdata)).unwrap().len();
+    assert!(size <= 1 << 20, "{size}");
+}
+
+/// A log that cannot be opened (`logs` is a file) leaves the play as it
+/// is: the same exit code, one saved record, the same judgment.
+#[test]
+fn an_unwritable_log_does_not_change_the_play() {
+    let fx = fixture();
+    let root = fx.appdata.join("tapestry");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("logs"), "").unwrap();
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let logs = root.join("logs");
+    let prefix = format!("log: {}: ", logs.display());
+    assert_eq!(
+        stderr.lines().filter(|l| l.starts_with("log: ")).count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.starts_with(&prefix), "{stderr}");
+    assert!(
+        stdout.contains(&format!("perfect {NOTES} great 0 good 0 bad 0 poor 0")),
+        "{stdout}"
+    );
+    assert_eq!(records(&fx.appdata).len(), 1);
+    assert!(logs.is_file());
+}
+
 /// `tapestry keys` cancelled with Escape through the real command writes
 /// no settings file and opens no recording: no records either.
 #[test]
@@ -631,7 +772,18 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
         .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
         .collect();
     kept.sort();
-    assert_eq!(kept, ["device.toml", "presets\\custom.toml"], "{kept:?}");
+    // The settings and the run's log are kept; no play is (design.md
+    // "Autoplay", "Log File").
+    assert_eq!(
+        kept,
+        [
+            "device.toml",
+            "logs\\tapestry.lock",
+            "logs\\tapestry.log",
+            "presets\\custom.toml"
+        ],
+        "{kept:?}"
+    );
 }
 
 /// H2: retried by itself after ten input offset steps on the end screen
