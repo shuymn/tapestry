@@ -247,6 +247,12 @@ impl Renderer {
         })
     }
 
+    /// The target's size in pixels.
+    #[must_use]
+    pub const fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
     /// The device, queue and adapter in use.
     #[must_use]
     pub const fn gpu(&self) -> &Gpu {
