@@ -131,6 +131,7 @@ const LN_BODY_SHADE: f32 = 0.6;
 const GAUGE_BG: Rgba = [0.12, 0.12, 0.12, 1.0];
 const GAUGE_FILL: Rgba = [0.2, 0.85, 0.3, 1.0];
 const TEXT: Rgba = [0.9, 0.9, 0.9, 1.0];
+const COUNTDOWN: Rgba = [1.0, 0.9, 0.4, 1.0];
 const BEAM: Rgba = [0.25, 0.3, 0.55, 0.8];
 const BOMB: Rgba = [1.0, 0.6, 0.15, 1.0];
 
@@ -433,6 +434,9 @@ impl SimpleSkin {
                 );
             }
         }
+        if f.now.0 < 0 {
+            countdown(out, f.now);
+        }
         let mut buf = [0; 10];
         text(out, SCORE_X, SCORE_Y, SCORE_SCALE, TEXT, b"EX");
         let score = decimal(f.view.tally.ex_score, &mut buf);
@@ -550,6 +554,45 @@ fn text(out: &mut SpriteBatch, x: f32, y: f32, scale: f32, color: Rgba, s: &[u8]
             },
         );
     }
+}
+
+/// Left edge and top of a text screen's first line, in layout pixels.
+const SCREEN_LEFT: f32 = 80.0;
+const SCREEN_TOP: f32 = 80.0;
+/// Scale of a text screen's glyphs, and the distance between its lines.
+const SCREEN_SCALE: f32 = 4.0;
+const SCREEN_LINE: f32 = 40.0;
+
+/// A screen of text lines in the bitmap font, top left, one line every 40
+/// layout pixels (glyphs 20×28): the end screen. Characters the font does
+/// not have draw as spaces, and lines below the layout are left out.
+pub fn text_screen(lines: &[&str], out: &mut SpriteBatch) {
+    for (i, line) in lines.iter().enumerate() {
+        let y = SCREEN_TOP + i as f32 * SCREEN_LINE;
+        if y >= layout::HEIGHT {
+            return;
+        }
+        text(out, SCREEN_LEFT, y, SCREEN_SCALE, TEXT, line.as_bytes());
+    }
+}
+
+/// The countdown before chart time 0 (the lead-in, D13): "READY" where the
+/// judgment shows, and under it the time left in seconds, tenths rounded
+/// up, so it reads 0.1 until the chart starts.
+fn countdown(out: &mut SpriteBatch, now: TimeUs) {
+    let width = text_width(5, JUDGMENT_SCALE);
+    let x = JUDGMENT_X - width / 2.0;
+    text(out, x, JUDGMENT_Y, JUDGMENT_SCALE, COUNTDOWN, b"READY");
+    let tenths = now.0.unsigned_abs().div_ceil(100_000);
+    let mut buf = [0; 10];
+    let whole = decimal(u32::try_from(tenths / 10).unwrap_or(u32::MAX), &mut buf);
+    let n = whole.len();
+    let width = text_width(n + 2, JUDGMENT_SCALE);
+    let x = JUDGMENT_X - width / 2.0;
+    text(out, x, COMBO_Y, JUDGMENT_SCALE, COUNTDOWN, whole);
+    let fraction = [b'.', b'0' + (tenths % 10) as u8];
+    let x = x + text_width(n, JUDGMENT_SCALE);
+    text(out, x, COMBO_Y, JUDGMENT_SCALE, COUNTDOWN, &fraction);
 }
 
 /// `n` in decimal, written at the end of `buf`.
@@ -865,6 +908,59 @@ mod tests {
         let note = in_lane(&batch, lane(3), NOTE_WHITE);
         assert_eq!(note.len(), 1);
         assert!((note[0][1] + NOTE_H / 2.0 - (880.0 - 200.0 / 3.0)).abs() < 1e-3);
+    }
+
+    /// The glyphs drawn in `color`, in drawing order.
+    fn glyphs(batch: &SpriteBatch, color: Rgba) -> Vec<[f32; 4]> {
+        batch
+            .alpha()
+            .iter()
+            .filter(|s| s.color == color)
+            .map(|s| s.uv)
+            .collect()
+    }
+
+    fn uvs(s: &[u8]) -> Vec<[f32; 4]> {
+        s.iter().map(|&c| glyph_uv(c)).collect()
+    }
+
+    #[test]
+    fn countdown_shows_the_time_left_before_chart_zero() {
+        let chart = ChartBuilder::new(BPM).build().unwrap();
+        let mut s = skin(&chart);
+        let v = view();
+        // 350 ms left: 0.4 s, tenths rounded up; 1 µs left still 0.1.
+        for (now, left) in [(-350 * MS, b"0.4"), (-1, b"0.1"), (-1_000 * MS, b"1.0")] {
+            let batch = build(&mut s, &frame(&v, now, &[]));
+            let mut expected = uvs(b"READY");
+            expected.extend(uvs(left));
+            assert_eq!(glyphs(&batch, COUNTDOWN), expected, "at {now}");
+        }
+        let batch = build(&mut s, &frame(&v, 0, &[]));
+        assert!(glyphs(&batch, COUNTDOWN).is_empty());
+    }
+
+    #[test]
+    fn text_screen_draws_lines_down_to_the_layout_bottom() {
+        let mut batch = SpriteBatch::with_capacity(256);
+        text_screen(&["AB", "C"], &mut batch);
+        let rects: Vec<_> = batch.alpha().iter().map(|s| (s.rect, s.uv)).collect();
+        // 4 px per texel: glyphs 20 × 28, advancing 24.
+        assert_eq!(
+            rects,
+            [
+                ([80.0, 80.0, 20.0, 28.0], glyph_uv(b'A')),
+                ([104.0, 80.0, 20.0, 28.0], glyph_uv(b'B')),
+                ([80.0, 120.0, 20.0, 28.0], glyph_uv(b'C')),
+            ]
+        );
+        // Line 25 would start at y = 1080: lines 0 to 24 fit.
+        let lines = ["Z"; 30];
+        let mut batch = SpriteBatch::with_capacity(256);
+        text_screen(&lines, &mut batch);
+        let ys: Vec<f32> = batch.alpha().iter().map(|s| s.rect[1]).collect();
+        assert_eq!(ys.len(), 25);
+        assert_eq!(ys[24], 1040.0);
     }
 
     #[test]
