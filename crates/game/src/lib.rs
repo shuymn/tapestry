@@ -14,6 +14,8 @@
 
 #![forbid(unsafe_code)]
 
+mod audio_loop;
+pub mod live;
 mod logic;
 mod policy;
 mod prepare;
@@ -26,6 +28,8 @@ mod session;
 mod settings;
 mod sound;
 
+pub use audio_loop::{AudioControl, AudioCtl, AudioWorker, audio_control};
+pub use live::{Closing, LiveError, Opening, Rig};
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };

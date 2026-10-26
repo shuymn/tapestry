@@ -97,6 +97,8 @@ pub enum AbortCause {
     OutputFailed,
     /// A survival gauge failed and the session policy ends the play.
     GaugeFailed,
+    /// The screen could not be drawn.
+    ScreenFailed,
 }
 
 /// What one logic step did.
@@ -406,6 +408,22 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
         self.aborted = Some(cause);
         self.overflowed |= cause == AbortCause::Overflow;
+        self.drain_queues();
+    }
+
+    /// After recording has closed: an aborted play's record takes every
+    /// event still queued, unevaluated, so input that arrived between the
+    /// abort and the closing is kept (D13: the abort's suffix stays in the
+    /// record). Nothing happens for a play that was not aborted, whose
+    /// record ends at its completion.
+    pub fn drain_after_close(&mut self) {
+        if self.aborted.is_some() {
+            self.drain_queues();
+        }
+    }
+
+    /// Pops every queued event into the record, while the budget lasts.
+    fn drain_queues(&mut self) {
         for (s, p) in self.sources.iter_mut().zip(&self.published) {
             if p.state == SourceState::Retired {
                 continue;

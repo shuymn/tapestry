@@ -1,0 +1,320 @@
+//! The play lifecycle every driver shares (D13): prepare → open recording
+//! (the countdown starts) → play → evaluation complete → audio tail → save
+//! → result, with retry, quit, focus loss, removal of the last device,
+//! suspend, an audio or screen failure, and a session policy failure
+//! ending the play from any state.
+//!
+//! The world around the play is a [`Rig`]: the game's threads in the
+//! player, a virtual clock and scripted input in [`crate::Session`] and in
+//! tests. The rig owns the clock and every wait; the transitions here only
+//! ask it what happened and tell it what to do.
+//!
+//! - The screen is prepared, and acknowledges it, before recording opens,
+//!   so the countdown origin is chosen only once the work before play is
+//!   done; what follows the opening (the logic step's construction and the
+//!   handoff to audio and the screen) is bounded by the chart's size.
+//! - A quit is latched by the rig and checked before recording opens and in
+//!   every wait, so it is never lost to a transition.
+//! - An aborted play closes recording and only then drains what is left in
+//!   the source queues into its record, unevaluated, so input that arrived
+//!   after the abort is kept (D13).
+//! - A completed play seals its key sounds; the tail ends when the audio
+//!   side reports the sealed audio done.
+
+use std::fmt;
+
+use ::audio::OutputError;
+use bms_model::TimeUs;
+use eval::InputStart;
+use input::{Arrival, DeviceKind};
+use replay::Incomplete;
+
+use crate::logic::{AbortCause, Logic, LogicError, SourceRead};
+use crate::render::RenderSide;
+use crate::session::{Command, Loaded, PlayEnd, PlayOutcome, PlayReport};
+use crate::sound::{AudioQueue, audio_link_at};
+
+/// What opening recording gave.
+#[derive(Debug)]
+pub struct Opening<R> {
+    /// Where the play's chart time 0 lies on the rig's clock.
+    pub origin: TimeUs,
+    /// The controls held at the opening.
+    pub start: InputStart,
+    /// The logic step's ends of the source queues, by source id.
+    pub readers: Vec<R>,
+    /// The participants' kinds, by source id.
+    pub kinds: Vec<DeviceKind>,
+}
+
+/// What closing recording gave. Once the rig returns it, nothing more is
+/// pushed into the play's queues.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Closing {
+    /// Devices that arrived while recording was open.
+    pub arrivals: Vec<Arrival>,
+    /// Whether a queue overflowed or a device's held state was lost.
+    pub overflowed: bool,
+    /// Whether a device did not take part because of the source limit.
+    pub source_limited: bool,
+}
+
+/// The world a play runs in.
+pub trait Rig {
+    /// The source queues' read side.
+    type Reader: SourceRead;
+
+    /// The clock every play's origin is on.
+    fn now(&self) -> TimeUs;
+    /// Waits for the next step: production parks until the input thread
+    /// publishes or a short timeout; a virtual rig moves its clock.
+    fn wait(&mut self);
+    /// After a step's decisions (`aborted`: the step ended the play).
+    /// A virtual rig steps its audio through the step's own time here;
+    /// threads need nothing.
+    fn stepped(&mut self, aborted: bool) {
+        let _ = aborted;
+    }
+    /// A pending retry or suspend (or quit, for rigs without a latch),
+    /// taken.
+    fn take(&mut self) -> Option<Command>;
+    /// Whether the player quit or the window is closing: latched, never
+    /// cleared.
+    fn quitting(&self) -> bool;
+    /// Readies the screen for a play (its play state reset) and waits for
+    /// it to acknowledge.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen cannot draw a play, which ends the run.
+    fn prepare_screen(&mut self) -> Result<(), String>;
+    /// Opens recording at the next input boundary, with chart time 0
+    /// `lead_in` after it.
+    fn open(&mut self, lead_in: TimeUs) -> Opening<Self::Reader>;
+    /// Hands the play to audio and to the screen.
+    fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide);
+    /// Whether the focus gate has tripped since recording opened.
+    fn focus_lost(&self) -> bool;
+    /// Whether a device that took part is still connected.
+    fn connected(&self) -> bool;
+    /// The audio output's failure, if it failed.
+    fn audio_failure(&self) -> Option<OutputError>;
+    /// Whether the screen failed during the play.
+    fn screen_failed(&self) -> bool;
+    /// Stops the play's sounds.
+    fn cancel_audio(&mut self);
+    /// No key sound follows.
+    fn seal_audio(&mut self);
+    /// Whether the sealed play's audio has ended.
+    fn audio_done(&self) -> bool;
+    /// Closes recording and waits until nothing more is pushed.
+    fn close(&mut self) -> Closing;
+    /// The play ended: its report, before any end screen.
+    fn ended(&mut self, report: &PlayReport);
+    /// Shows the end screen of a play that neither quit nor retried.
+    fn show_end(&mut self, report: &PlayReport);
+}
+
+/// Why the run of plays stopped short.
+#[derive(Debug)]
+pub enum LiveError {
+    /// The logic step refused to start (for example a key config binding
+    /// one control twice).
+    Logic(LogicError),
+    /// The screen cannot draw a play.
+    Screen(String),
+}
+
+impl fmt::Display for LiveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Logic(e) => write!(f, "the play cannot start: {e}"),
+            Self::Screen(e) => write!(f, "the screen cannot draw the play: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LiveError {}
+
+/// Plays until the player quits: every play's report goes to
+/// [`Rig::ended`]; a play that neither quit nor retried shows its end
+/// screen, which waits for retry or quit.
+///
+/// # Errors
+///
+/// [`LiveError`] when a play cannot start; the plays before it are saved.
+pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError> {
+    loop {
+        let Some(report) = play(loaded, rig)? else {
+            return Ok(());
+        };
+        rig.ended(&report);
+        let by = |c| report.end == PlayEnd::Aborted(c) || report.tail_cut == Some(c);
+        if rig.quitting() || by(AbortCause::Quit) {
+            return Ok(());
+        }
+        if by(AbortCause::Retry) {
+            continue;
+        }
+        rig.show_end(&report);
+        loop {
+            rig.wait();
+            if rig.quitting() {
+                return Ok(());
+            }
+            match rig.take() {
+                Some(Command::Retry) => break,
+                Some(Command::Quit) => return Ok(()),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// One play, from preparing the screen to its report. `None` when the
+/// player quit before recording opened.
+///
+/// # Errors
+///
+/// [`LiveError`] when the screen or the logic step cannot start; recording
+/// is closed again.
+pub fn play<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<Option<PlayReport>, LiveError> {
+    if rig.quitting() {
+        return Ok(None);
+    }
+    rig.prepare_screen().map_err(LiveError::Screen)?;
+    // A retry or suspend from before this play belongs to no play.
+    if rig.quitting() || rig.take() == Some(Command::Quit) {
+        return Ok(None);
+    }
+    let start = loaded.begin_play();
+    let opening = rig.open(loaded.config().lead_in);
+    let origin = opening.origin;
+    let plan = loaded.plan(&opening.kinds);
+    let (mut logic, screen) = match Logic::new(
+        loaded.chart(),
+        loaded.preset(),
+        &plan.device,
+        &opening.start,
+        opening.readers,
+        plan.logic,
+        Vec::new(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            rig.close();
+            return Err(LiveError::Logic(e));
+        }
+    };
+    let (sink, sounds) = audio_link_at(logic.max_events(), origin);
+    logic.add_sink(Box::new(sink));
+    let mut live = Vec::with_capacity(logic.max_events());
+    rig.start(origin, sounds, screen);
+    let mut output_error = None;
+
+    let end = loop {
+        rig.wait();
+        // Anything seen in a step is handled before the step advances.
+        if rig.quitting() {
+            logic.abort(AbortCause::Quit);
+        } else if let Some(c) = rig.take() {
+            logic.abort(c.cause());
+        } else if rig.focus_lost() {
+            logic.abort(AbortCause::FocusLoss);
+        } else if let Some(e) = rig.audio_failure() {
+            output_error = Some(e);
+            logic.abort(AbortCause::OutputFailed);
+        } else if rig.screen_failed() {
+            logic.abort(AbortCause::ScreenFailed);
+        }
+        let advance = logic.advance_to(TimeUs(rig.now().0 - origin.0));
+        live.extend_from_slice(logic.events());
+        rig.stepped(advance.aborted.is_some());
+        if let Some(cause) = advance.aborted {
+            rig.cancel_audio();
+            break PlayEnd::Aborted(cause);
+        }
+        if advance.complete {
+            rig.seal_audio();
+            break PlayEnd::Completed;
+        }
+        // An audio failure after a step that did not complete ends the play
+        // there; a completed play stays complete and only loses its tail.
+        if let Some(e) = rig.audio_failure() {
+            output_error = Some(e);
+            logic.abort(AbortCause::OutputFailed);
+            rig.cancel_audio();
+            break PlayEnd::Aborted(AbortCause::OutputFailed);
+        }
+        if loaded.ends_play(logic.gauges()) {
+            logic.abort(AbortCause::GaugeFailed);
+            rig.cancel_audio();
+            break PlayEnd::Aborted(AbortCause::GaugeFailed);
+        }
+    };
+
+    // Recording closes at the end of evaluation (D13); an aborted play
+    // then takes what reached its queues after the abort.
+    let closing = rig.close();
+    logic.drain_after_close();
+    let incomplete = Incomplete {
+        overflow: logic.overflowed() || closing.overflowed,
+        source_limit: closing.source_limited,
+        suspend: false,
+    };
+    let record = logic.record();
+    let view = logic.view();
+    drop(logic);
+
+    // The audio tail of a completed play: nothing is recorded, and a
+    // control, focus loss, removal of the last device or an audio failure
+    // cuts it short; the record stays complete.
+    let mut tail_cut = None;
+    if end == PlayEnd::Completed
+        && let Some(e) = rig.audio_failure()
+    {
+        output_error = Some(e);
+        tail_cut = Some(AbortCause::OutputFailed);
+        rig.cancel_audio();
+    }
+    while end == PlayEnd::Completed && tail_cut.is_none() && !rig.audio_done() {
+        rig.wait();
+        tail_cut = if rig.quitting() {
+            Some(AbortCause::Quit)
+        } else if let Some(c) = rig.take() {
+            Some(c.cause())
+        } else if rig.focus_lost() {
+            Some(AbortCause::FocusLoss)
+        } else if !rig.connected() {
+            Some(AbortCause::LastSourceRemoved)
+        } else if let Some(e) = rig.audio_failure() {
+            output_error = Some(e);
+            Some(AbortCause::OutputFailed)
+        } else {
+            None
+        };
+        if tail_cut.is_none() {
+            rig.stepped(false);
+            if let Some(e) = rig.audio_failure() {
+                output_error = Some(e);
+                tail_cut = Some(AbortCause::OutputFailed);
+            }
+        }
+        if tail_cut.is_some() {
+            rig.cancel_audio();
+        }
+    }
+
+    Ok(Some(loaded.finish_play(PlayOutcome {
+        start,
+        end,
+        tail_cut,
+        output_error,
+        live,
+        view,
+        record,
+        kinds: opening.kinds,
+        arrivals: closing.arrivals,
+        incomplete,
+    })))
+}

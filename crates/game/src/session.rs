@@ -27,7 +27,8 @@ use replay::{
 };
 use rules::{GaugeKind, RulePreset};
 
-use crate::logic::{AbortCause, Logic, LogicConfig, LogicError, Record};
+use crate::live::{Closing, LiveError, Opening, Rig};
+use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy,
@@ -35,10 +36,11 @@ use crate::policy::{
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
 use crate::preset::{PresetError, load_preset_toml, preset_to_toml};
 use crate::render::PlayView;
+use crate::render::RenderSide;
 use crate::results::{ReEvaluate, ResultContext, ResultExtension, ResultSummary};
 use crate::save::{LocalRecords, RecordRef, RecordSink, SaveError, write_atomic};
 use crate::settings::{DataRoot, DeviceSettings, PlayerSettings, SettingsError};
-use crate::sound::{RunnerAudio, Wakes, audio_link_at};
+use crate::sound::{AudioQueue, RunnerAudio, Wakes};
 
 /// Every extension point the session calls through, each with one
 /// implementation in stage 1.
@@ -192,7 +194,7 @@ pub enum Command {
 }
 
 impl Command {
-    const fn cause(self) -> AbortCause {
+    pub(crate) const fn cause(self) -> AbortCause {
         match self {
             Self::Retry => AbortCause::Retry,
             Self::Quit => AbortCause::Quit,
@@ -675,7 +677,8 @@ impl<O: AudioOutput + Wakes> Session<O> {
 
     /// Plays the chart once with `script`, from the countdown to the
     /// result, or until a system control, focus loss, removal of the last
-    /// device or an audio failure ends it. Every play after the first is a
+    /// device or an audio failure ends it, through the lifecycle every
+    /// driver shares ([`crate::live`]). Every play after the first is a
     /// retry: a preset file changed since the previous play is used from
     /// this one on.
     ///
@@ -683,168 +686,198 @@ impl<O: AudioOutput + Wakes> Session<O> {
     ///
     /// What [`Logic::new`] refuses (for example a key config binding one
     /// control twice); recording is closed again and nothing is played.
-    #[allow(clippy::too_many_lines)]
-    pub fn play(&mut self, mut script: PlayScript) -> Result<PlayReport, LogicError> {
-        let start = self.loaded.begin_play();
+    pub fn play(&mut self, script: PlayScript) -> Result<PlayReport, LogicError> {
         let Self {
             loaded,
             audio,
             sources,
             clock,
         } = self;
-        let lead_in = loaded.config.lead_in;
-        let step = loaded.config.step;
+        let mut rig = SessionRig {
+            step: loaded.config.step,
+            clock,
+            sources,
+            audio,
+            script,
+            next_command: 0,
+            origin: None,
+            participants: Vec::new(),
+            sounds: None,
+            screen: None,
+            failure: None,
+            sealed: false,
+        };
+        match crate::live::play(loaded, &mut rig) {
+            Ok(Some(report)) => Ok(report),
+            Ok(None) => unreachable!("a session never quits before recording opens"),
+            Err(LiveError::Logic(e)) => Err(e),
+            Err(LiveError::Screen(_)) => unreachable!("a session has no screen to fail"),
+        }
+    }
+}
 
+/// The session's rig: one step of the virtual clock per wait, the script
+/// fed on the play's timeline, and the audio stepped through every buffer
+/// event before the step's logic (a buffer event at the step's own time
+/// runs at the next wait, after the logic, as production orders them).
+struct SessionRig<'s, O> {
+    step: TimeUs,
+    clock: &'s mut VirtualClock,
+    sources: &'s mut SourceSet,
+    audio: &'s mut RunnerAudio<O>,
+    script: PlayScript,
+    next_command: usize,
+    origin: Option<TimeUs>,
+    /// Each participant with its connection at the opening.
+    participants: Vec<(input::DeviceId, Option<u64>)>,
+    sounds: Option<AudioQueue>,
+    screen: Option<RenderSide>,
+    failure: Option<OutputError>,
+    sealed: bool,
+}
+
+impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
+    /// Every buffer event due before `now` (with `through`, at `now` too),
+    /// until the output fails.
+    fn step_audio(&mut self, now: TimeUs, through: bool) {
+        if let Some(sounds) = &mut self.sounds
+            && self.failure.is_none()
+            && let Err(e) = self.audio.step(now, through, sounds)
+        {
+            self.failure = Some(e);
+        }
+    }
+}
+
+impl<O> SessionRig<'_, O> {
+    fn play_time(&self) -> Option<TimeUs> {
+        self.origin.map(|o| TimeUs(self.clock.now().0 - o.0))
+    }
+}
+
+impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
+    type Reader = input::SourceReader;
+
+    fn now(&self) -> TimeUs {
+        self.clock.now()
+    }
+
+    fn wait(&mut self) {
+        self.clock.advance(self.step);
+        let global = self.clock.now();
+        if let Some(now) = self.play_time() {
+            self.script.input.poll(now, self.sources);
+        }
+        if !self.sealed {
+            self.step_audio(global, false);
+        }
+        if let Some(screen) = &mut self.screen {
+            screen.drain_effects(|_| {});
+        }
+    }
+
+    fn stepped(&mut self, aborted: bool) {
+        if !aborted {
+            self.step_audio(self.clock.now(), true);
+        }
+    }
+
+    fn take(&mut self) -> Option<Command> {
+        let now = self.play_time()?;
+        let &(at, c) = self.script.commands.get(self.next_command)?;
+        (at <= now).then(|| {
+            self.next_command += 1;
+            c
+        })
+    }
+
+    fn quitting(&self) -> bool {
+        false
+    }
+
+    fn prepare_screen(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn open(&mut self, lead_in: TimeUs) -> Opening<Self::Reader> {
         // The countdown starts now; chart time 0 is `lead_in` later.
-        let origin = TimeUs(clock.now().0 + lead_in.0);
+        let origin = TimeUs(self.clock.now().0 + lead_in.0);
         let open_at = TimeUs(-lead_in.0);
-        script.input.poll(TimeUs(open_at.0 - 1), sources);
-        sources.gate_mut().reset();
-        let input_start = sources.open_recording(open_at);
-        let kinds: Vec<DeviceKind> = sources.participants().map(|(_, k)| k).collect();
-        // Each participant with its connection at the opening: one removed
-        // and connected again since counts as removed in the tail.
-        let participants: Vec<_> = sources
+        self.script.input.poll(TimeUs(open_at.0 - 1), self.sources);
+        self.sources.gate_mut().reset();
+        let start = self.sources.open_recording(open_at);
+        let sources = &*self.sources;
+        // One removed and connected again since counts as removed.
+        self.participants = sources
             .participants()
             .map(|(d, _)| (d, sources.connection(d)))
             .collect();
-        let plan = loaded.plan(&kinds);
-        let readers = sources.take_readers();
-        let (mut logic, mut render) = match Logic::new(
-            &loaded.chart,
-            &loaded.preset,
-            &plan.device,
-            &input_start,
-            readers,
-            plan.logic,
-            Vec::new(),
-        ) {
-            Ok(pair) => pair,
-            Err(e) => {
-                sources.close_recording();
-                return Err(e);
-            }
-        };
-        let (sink, mut sounds) = audio_link_at(logic.max_events(), origin);
-        logic.add_sink(Box::new(sink));
-        audio.engine_mut().restart(origin);
-        let mut live = Vec::with_capacity(logic.max_events());
-        let mut commands = script.commands.iter().copied().peekable();
-        let mut output_error = None;
-        let mut due = |now: TimeUs| commands.next_if(|&(at, _)| at <= now).map(|(_, c)| c);
-
-        let end = loop {
-            clock.advance(step);
-            let global = clock.now();
-            let now = TimeUs(global.0 - origin.0);
-            script.input.poll(now, sources);
-            if let Some(c) = due(now) {
-                logic.abort(c.cause());
-            } else if sources.gate().is_tripped() {
-                logic.abort(AbortCause::FocusLoss);
-            } else if let Err(e) = audio.step(global, false, &mut sounds) {
-                output_error = Some(e);
-                logic.abort(AbortCause::OutputFailed);
-            }
-            let advance = logic.advance_to(now);
-            live.extend_from_slice(logic.events());
-            let failure = match advance.aborted {
-                Some(_) => None,
-                None => audio.step(global, true, &mut sounds).err(),
-            };
-            let failed = failure.is_some();
-            output_error = failure.or(output_error);
-            if advance.aborted.is_some() || failed {
-                audio.cancel(&mut sounds);
-            }
-            render.drain_effects(|_| {});
-            if let Some(cause) = advance.aborted {
-                break PlayEnd::Aborted(cause);
-            }
-            // Completion is final: an audio failure or a gauge failure in
-            // the same advance does not turn a completed play into an
-            // aborted one; the failure only ends the tail, which is then
-            // not played.
-            if advance.complete {
-                break PlayEnd::Completed;
-            }
-            if failed {
-                logic.abort(AbortCause::OutputFailed);
-                break PlayEnd::Aborted(AbortCause::OutputFailed);
-            }
-            if loaded.ends_play(&render.view().gauges) {
-                logic.abort(AbortCause::GaugeFailed);
-                audio.cancel(&mut sounds);
-                break PlayEnd::Aborted(AbortCause::GaugeFailed);
-            }
-        };
-
-        // Recording closes at the end of evaluation (D13): the input side
-        // appends nothing more, and the record is frozen here.
-        let arrivals = sources.arrivals().to_vec();
-        let incomplete = Incomplete {
-            overflow: logic.overflowed() || sources.overflowed(),
-            source_limit: sources.source_limited(),
-            suspend: false,
-        };
-        sources.close_recording();
-        let record = logic.record();
-        let view = render.view().clone();
-        drop(logic);
-
-        // The audio tail of a completed play: input still reaches the
-        // devices' state, but nothing is recorded. A system control, focus
-        // loss, removal of the last participating device or an audio
-        // failure cuts it short; the record stays complete.
-        let mut tail_cut = None;
-        if end == PlayEnd::Completed && output_error.is_some() {
-            tail_cut = Some(AbortCause::OutputFailed);
-        }
-        while end == PlayEnd::Completed && tail_cut.is_none() {
-            let silent = sounds.is_empty()
-                && audio.engine().mixer().pending() == 0
-                && audio.engine().mixer().sounding() == 0
-                && audio.engine().bgm_left() == 0;
-            if silent {
-                break;
-            }
-            clock.advance(step);
-            let global = clock.now();
-            let now = TimeUs(global.0 - origin.0);
-            script.input.poll(now, sources);
-            tail_cut = if let Some(c) = due(now) {
-                Some(c.cause())
-            } else if sources.gate().is_tripped() {
-                Some(AbortCause::FocusLoss)
-            } else if !participants
-                .iter()
-                .any(|&(d, c)| c.is_some() && sources.connection(d) == c)
-            {
-                Some(AbortCause::LastSourceRemoved)
-            } else if let Err(e) = audio.step(global, true, &mut sounds) {
-                output_error = Some(e);
-                Some(AbortCause::OutputFailed)
-            } else {
-                None
-            };
-            if tail_cut.is_some() {
-                audio.cancel(&mut sounds);
-            }
-        }
-
-        Ok(loaded.finish_play(PlayOutcome {
+        let kinds = sources.participants().map(|(_, k)| k).collect();
+        self.origin = Some(origin);
+        Opening {
+            origin,
             start,
-            end,
-            tail_cut,
-            output_error,
-            live,
-            view,
-            record,
+            readers: self.sources.take_readers(),
             kinds,
-            arrivals,
-            incomplete,
-        }))
+        }
     }
+
+    fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
+        self.audio.engine_mut().restart(origin);
+        self.sounds = Some(sounds);
+        self.screen = Some(screen);
+    }
+
+    fn focus_lost(&self) -> bool {
+        self.sources.gate().is_tripped()
+    }
+
+    fn connected(&self) -> bool {
+        self.participants
+            .iter()
+            .any(|&(d, c)| c.is_some() && self.sources.connection(d) == c)
+    }
+
+    fn audio_failure(&self) -> Option<OutputError> {
+        self.failure
+    }
+
+    fn screen_failed(&self) -> bool {
+        false
+    }
+
+    fn cancel_audio(&mut self) {
+        if let Some(sounds) = &mut self.sounds {
+            self.audio.cancel(sounds);
+        }
+    }
+
+    fn seal_audio(&mut self) {
+        self.sealed = true;
+    }
+
+    fn audio_done(&self) -> bool {
+        let engine = self.audio.engine();
+        self.sealed
+            && self.sounds.as_ref().is_none_or(AudioQueue::is_empty)
+            && engine.mixer().pending() == 0
+            && engine.mixer().sounding() == 0
+            && engine.bgm_left() == 0
+    }
+
+    fn close(&mut self) -> Closing {
+        let closing = Closing {
+            arrivals: self.sources.arrivals().to_vec(),
+            overflowed: self.sources.overflowed(),
+            source_limited: self.sources.source_limited(),
+        };
+        self.sources.close_recording();
+        closing
+    }
+
+    fn ended(&mut self, _report: &PlayReport) {}
+
+    fn show_end(&mut self, _report: &PlayReport) {}
 }
 
 const fn replay_kind(kind: DeviceKind) -> replay::DeviceKind {
