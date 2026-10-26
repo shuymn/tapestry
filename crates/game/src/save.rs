@@ -166,10 +166,7 @@ mod tests {
     use super::publish;
 
     fn dir() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("publish")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR").to_owned() + "/../../target")
-            .unwrap()
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
