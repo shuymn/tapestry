@@ -28,6 +28,61 @@ use crate::input_side::Hook;
 use crate::measure::Drawn;
 use crate::render_side::{FrameSink, Screen};
 
+/// Prints, to the console only, which window took the foreground when the
+/// game's window lost focus: its process's executable name and its window
+/// class, with the time on the game's clock (µs since start). A focus loss
+/// aborts the play (D13), so this tells what did it.
+pub fn print_foreground(now: TimeUs) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    use windows::core::PWSTR;
+
+    // SAFETY: plain queries of the foreground window and its process; the
+    // buffers outlive the calls and the process handle is closed.
+    let (class, process) = unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut class = [0_u16; 256];
+        let n = usize::try_from(GetClassNameW(hwnd, &mut class)).unwrap_or(0);
+        let class = String::from_utf16_lossy(&class[..n]);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .ok()
+            .and_then(|h| {
+                let mut buf = [0_u16; 1024];
+                let mut len = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(
+                    h,
+                    PROCESS_NAME_WIN32,
+                    PWSTR(buf.as_mut_ptr()),
+                    &raw mut len,
+                )
+                .is_ok();
+                let _ = CloseHandle(h);
+                ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
+            });
+        (class, process)
+    };
+    // The executable's name only: its path may hold the user's name.
+    let name = process
+        .as_deref()
+        .and_then(|p| Path::new(p).file_name())
+        .map_or_else(
+            || "unknown".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+    println!(
+        "dev: focus lost at {} us to {name} (window class {class})",
+        now.0
+    );
+}
+
 /// Handles a development-only argument, or returns `None` for any other one.
 pub fn handle_arg(arg: &OsStr) -> Option<ExitCode> {
     if arg == "--dev-tools-probe" {

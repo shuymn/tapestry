@@ -66,6 +66,12 @@ impl Controls {
         }
     }
 
+    /// The clock's time now.
+    #[cfg(feature = "dev-tools")]
+    pub fn now(&self) -> TimeUs {
+        self.clock.now()
+    }
+
     /// The values the settings keys step.
     pub const fn tuning(&self) -> &Arc<LiveTuning> {
         &self.tuning

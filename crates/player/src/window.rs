@@ -73,7 +73,13 @@ impl ApplicationHandler<Exit> for App {
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::Focused(focused) => self.controls.focus(focused),
+            WindowEvent::Focused(focused) => {
+                self.controls.focus(focused);
+                #[cfg(feature = "dev-tools")]
+                if !focused {
+                    crate::dev::print_foreground(self.controls.now());
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 key_pressed(&self.controls, event.physical_key, event.repeat, &self.keys);
             }
