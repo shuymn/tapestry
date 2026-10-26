@@ -1,5 +1,5 @@
-//! Pure frame and latency measurement (D11): sample rings with their
-//! percentiles, DXGI frame statistics paired to frames by present count,
+//! Pure frame and latency measurement (D11): whole-play sample
+//! histograms with their percentiles, DXGI frame statistics paired to frames by present count,
 //! lost refreshes from the statistics' refresh counts, the table that
 //! gives each judgment the display time of the first presented frame that
 //! drew it, and the counting rules of design.md "Frame Pacing in Refreshes"
@@ -11,62 +11,72 @@
 
 use std::collections::VecDeque;
 
-/// p50, p99 and max of some samples.
+/// p50, p99 and max of a play's samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Summary {
-    /// Every sample pushed, kept or not.
+    /// Every sample, exact.
     pub count: u64,
-    /// The median of the kept samples (nearest rank).
+    /// The median (nearest rank), within [`RELATIVE_ERROR`].
     pub p50: i64,
-    /// The 99th percentile of the kept samples (nearest rank).
+    /// The 99th percentile (nearest rank), within [`RELATIVE_ERROR`].
     pub p99: i64,
-    /// The largest sample pushed, kept or not.
+    /// The largest sample, exact.
     pub max: i64,
 }
 
-/// A preallocated ring of samples. When it is full the oldest sample is
-/// replaced, so the percentiles cover the latest `capacity` samples while
-/// the count and the maximum cover all of them.
+/// Values below this are counted exactly, one bucket each.
+const EXACT: i64 = 64;
+/// Buckets per power of two above [`EXACT`].
+const SUB_BITS: u32 = 5;
+/// The powers of two with sub-buckets: 2^6 up to 2^24 µs (16.8 s).
+const FIRST_OCTAVE: u32 = 6;
+const LAST_OCTAVE: u32 = 23;
+const BUCKETS: usize = EXACT as usize + ((LAST_OCTAVE - FIRST_OCTAVE + 1) << SUB_BITS) as usize + 1;
+
+/// The largest error of a percentile against the exact one, relative to
+/// it, for samples up to 2^24: half a sub-bucket of 1/32 of its power of
+/// two. Larger samples share the last bucket and read as the maximum.
+pub const RELATIVE_ERROR: f64 = 1.0 / 64.0;
+
+/// A whole play's samples as a fixed log-linear histogram: exact below 64,
+/// then 32 buckets per power of two up to 16.8 s, so a percentile is within
+/// [`RELATIVE_ERROR`] of the exact one, while the count and the maximum are
+/// exact. Negative samples count as 0. Recording and summarizing allocate
+/// nothing.
 #[derive(Clone, Debug)]
 pub struct Samples {
-    ring: Vec<i64>,
-    next: usize,
+    buckets: Box<[u64; BUCKETS]>,
     count: u64,
     max: i64,
-    /// Where the percentiles sort a copy of the ring.
-    scratch: Vec<i64>,
+}
+
+impl Default for Samples {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Samples {
-    /// A ring of `capacity` samples (at least one).
+    /// No samples.
     #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
+    pub fn new() -> Self {
         Self {
-            ring: Vec::with_capacity(capacity),
-            next: 0,
+            buckets: Box::new([0; BUCKETS]),
             count: 0,
             max: i64::MIN,
-            scratch: Vec::with_capacity(capacity),
         }
     }
 
     /// Forgets every sample.
     pub fn clear(&mut self) {
-        self.ring.clear();
-        self.next = 0;
+        self.buckets.fill(0);
         self.count = 0;
         self.max = i64::MIN;
     }
 
     /// Adds one sample.
     pub fn push(&mut self, v: i64) {
-        if self.ring.len() < self.ring.capacity() {
-            self.ring.push(v);
-        } else {
-            self.ring[self.next] = v;
-            self.next = (self.next + 1) % self.ring.len();
-        }
+        self.buckets[bucket(v)] += 1;
         self.count += 1;
         self.max = self.max.max(v);
     }
@@ -78,27 +88,62 @@ impl Samples {
     }
 
     /// The summary, or `None` (N/A) without any sample.
-    pub fn summary(&mut self) -> Option<Summary> {
-        if self.ring.is_empty() {
+    #[must_use]
+    pub fn summary(&self) -> Option<Summary> {
+        if self.count == 0 {
             return None;
         }
-        self.scratch.clear();
-        self.scratch.extend_from_slice(&self.ring);
-        self.scratch.sort_unstable();
         Some(Summary {
             count: self.count,
-            p50: nearest_rank(&self.scratch, 50),
-            p99: nearest_rank(&self.scratch, 99),
+            p50: self.percentile(50),
+            p99: self.percentile(99),
             max: self.max,
         })
     }
+
+    /// The `p`th percentile by nearest rank: the middle of the bucket that
+    /// holds the sample of that rank, never above the maximum.
+    fn percentile(&self, p: u64) -> i64 {
+        let rank = (p * self.count).div_ceil(100).max(1);
+        let mut seen = 0;
+        for (i, &n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= rank {
+                return middle(i).min(self.max);
+            }
+        }
+        self.max
+    }
 }
 
-/// The `p`th percentile of sorted, non-empty `v`: the smallest value with
-/// at least `p` percent of the values at or below it.
-fn nearest_rank(v: &[i64], p: usize) -> i64 {
-    let rank = (p * v.len()).div_ceil(100).max(1);
-    v[rank - 1]
+/// The bucket of `v`.
+fn bucket(v: i64) -> usize {
+    let v = v.max(0);
+    if v < EXACT {
+        return v as usize;
+    }
+    let octave = 63 - v.leading_zeros();
+    if octave > LAST_OCTAVE {
+        return BUCKETS - 1;
+    }
+    let sub = (v >> (octave - SUB_BITS)) & ((1 << SUB_BITS) - 1);
+    EXACT as usize + (((octave - FIRST_OCTAVE) << SUB_BITS) as usize) + sub as usize
+}
+
+/// The middle of bucket `i`; the last one has none and reads as the
+/// largest value.
+fn middle(i: usize) -> i64 {
+    if i < EXACT as usize {
+        return i as i64;
+    }
+    if i == BUCKETS - 1 {
+        return i64::MAX;
+    }
+    let k = (i - EXACT as usize) as u32;
+    let octave = FIRST_OCTAVE + (k >> SUB_BITS);
+    let sub = i64::from(k & ((1 << SUB_BITS) - 1));
+    let width = 1_i64 << (octave - SUB_BITS);
+    (1_i64 << octave) + sub * width + width / 2
 }
 
 /// One `IDXGISwapChain::GetFrameStatistics` result, raw.
@@ -181,13 +226,37 @@ impl RefreshCount {
     }
 }
 
+/// How the swap chain presents, as configured: the conditions under which
+/// lost refreshes can be counted (design.md "Applicability").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Presentation {
+    /// Vblanks per present: 1 for vsync on every refresh, 0 without vsync.
+    pub sync_interval: u32,
+    /// Whether presents may tear.
+    pub tearing: bool,
+}
+
+impl Presentation {
+    /// Whether refreshes can be counted at k = 1: vsync on every refresh
+    /// and no tearing. A fixed refresh rate (no VRR) is checked per
+    /// interval from the syncs instead.
+    #[must_use]
+    pub const fn countable(self) -> bool {
+        self.sync_interval == 1 && !self.tearing
+    }
+}
+
 /// Counts lost refreshes from accepted samples: an interval of `n`
 /// refreshes between consecutive present counts loses `n − 1`
 /// (design.md "Counting a displayed interval", k = 1). Intervals whose two
-/// ends do not both have accepted samples are N/A.
+/// ends do not both have accepted samples are N/A, and so are intervals
+/// without a verified fixed refresh grid: no refresh period known, or two
+/// syncs whose times disagree with their refresh counts by more than a
+/// tenth of a refresh (VRR, or a composed window).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RefreshLedger {
-    last: Option<(u32, u32)>,
+    /// Present count, present refresh count, and the sync (QPC, count).
+    last: Option<(u32, u32, i64, u32)>,
     count: RefreshCount,
 }
 
@@ -203,11 +272,18 @@ impl RefreshLedger {
         self.count
     }
 
-    /// One accepted sample, in the order they were taken.
-    pub fn accepted(&mut self, s: &FrameStatistics) {
-        if let Some((count, refresh)) = self.last {
+    /// One accepted sample, in the order they were taken; `period_qpc` is
+    /// one refresh when the presentation is countable and the period known.
+    pub fn accepted(&mut self, s: &FrameStatistics, period_qpc: Option<i64>) {
+        if let Some((count, refresh, sync_qpc, sync_count)) = self.last {
             let presents = s.present_count.wrapping_sub(count);
-            if presents == 1 {
+            let on_grid = period_qpc.is_some_and(|t| {
+                let n = i64::from(s.sync_refresh_count.wrapping_sub(sync_count));
+                n > 0 && (s.sync_qpc_time - sync_qpc - n * t).abs() <= t / 10
+            });
+            if presents == 1 && !on_grid {
+                self.count.unavailable += 1;
+            } else if presents == 1 {
                 let n = s.present_refresh_count.wrapping_sub(refresh);
                 let lost = u64::from(n.saturating_sub(1));
                 self.count.counted += 1;
@@ -221,7 +297,12 @@ impl RefreshLedger {
                 self.count.unavailable += 1;
             }
         }
-        self.last = Some((s.present_count, s.present_refresh_count));
+        self.last = Some((
+            s.present_count,
+            s.present_refresh_count,
+            s.sync_qpc_time,
+            s.sync_refresh_count,
+        ));
     }
 }
 
@@ -281,7 +362,7 @@ impl OnScreen {
         Self {
             slots: vec![EMPTY; capacity],
             order: VecDeque::with_capacity(capacity),
-            latencies: Samples::with_capacity(capacity),
+            latencies: Samples::new(),
             unavailable: 0,
         }
     }
@@ -358,6 +439,23 @@ impl OnScreen {
                 }
             }
             self.order.pop_front();
+        }
+    }
+
+    /// The frame built since the last call failed, or was presented
+    /// without a present count to pair it with: what it drew is N/A, while
+    /// earlier frames keep their pairings.
+    pub fn presented_unknown(&mut self) {
+        for k in (0..self.order.len()).rev() {
+            let seq = self.order[k];
+            let i = self.slot(seq);
+            if self.slots[i].seq != seq {
+                continue;
+            }
+            if self.slots[i].frame.is_some() {
+                break;
+            }
+            self.give_up(seq);
         }
     }
 

@@ -4,8 +4,8 @@
 //! comments.
 
 use render::measure::{
-    FrameStatistics, OnScreen, OnScreenLatency, RefreshLedger, Samples, StatsFilter, count_span,
-    display_qpc,
+    FrameStatistics, OnScreen, OnScreenLatency, Presentation, RELATIVE_ERROR, RefreshLedger,
+    Samples, StatsFilter, count_span, display_qpc,
 };
 
 const MS_NS: i64 = 1_000_000;
@@ -94,8 +94,7 @@ fn chord_judgments_drawn_on_different_frames_get_their_own_latency() {
     t.sample(11, 34_167);
     assert_eq!(t.latency(8), OnScreenLatency::Shown(29_167));
     let s = t.latencies().summary().unwrap();
-    // Nearest rank of two values: p50 is the first, p99 the second.
-    assert_eq!((s.count, s.p50, s.p99, s.max), (2, 25_000, 29_167, 29_167));
+    assert_eq!((s.count, s.max), (2, 29_167));
     assert_eq!(t.unavailable(), 0);
 }
 
@@ -113,6 +112,21 @@ fn a_frame_not_presented_passes_its_judgments_to_the_next_presented_one() {
     assert_eq!(t.latency(2), OnScreenLatency::Shown(9_400));
 }
 
+/// A frame that failed, or was presented without a present count, makes
+/// what it drew N/A and leaves the earlier frame's pairing alone.
+#[test]
+fn a_frame_without_a_present_count_is_na_alone() {
+    let mut t = OnScreen::with_capacity(16);
+    t.drawn(1, 1_000);
+    t.presented(40);
+    t.drawn(2, 2_000);
+    t.presented_unknown();
+    t.sample(40, 50_000);
+    assert_eq!(t.latency(1), OnScreenLatency::Shown(49_000));
+    assert_eq!(t.latency(2), OnScreenLatency::Unavailable);
+    assert_eq!(t.unavailable(), 1);
+}
+
 #[test]
 fn judgments_beyond_the_table_are_na() {
     // Two slots: seq 3 takes the slot of seq 1 while 1 is unresolved, and
@@ -127,27 +141,39 @@ fn judgments_beyond_the_table_are_na() {
     assert_eq!(t.unavailable(), 2);
 }
 
+/// A sample whose sync lies on a fixed grid of 1 000 QPC ticks a refresh.
+fn synced(present: u32, present_refresh: u32) -> FrameStatistics {
+    stats(
+        present,
+        present_refresh,
+        present_refresh,
+        i64::from(present_refresh) * 1_000,
+    )
+}
+
+const GRID: Option<i64> = Some(1_000);
+
 #[test]
 fn refresh_count_deltas_to_lost_refreshes() {
     // Consecutive present counts 100 and 101 three refreshes apart: 2 lost.
     let mut l = RefreshLedger::default();
-    l.accepted(&stats(100, 1_000, 1_000, 0));
-    l.accepted(&stats(101, 1_003, 1_003, 0));
+    l.accepted(&synced(100, 1_000), GRID);
+    l.accepted(&synced(101, 1_003), GRID);
     let c = l.count();
     assert_eq!(
         (c.lost(), c.counted, c.unavailable, c.longest),
         (Some(2), 1, 0, 2)
     );
     // One refresh apart: none lost.
-    l.accepted(&stats(102, 1_004, 1_004, 0));
+    l.accepted(&synced(102, 1_004), GRID);
     assert_eq!((l.count().lost(), l.count().counted), (Some(2), 2));
 
     // Samples only for 100 and 102, displayed on consecutive refreshes:
     // the intervals 100-101 and 101-102 have no evidence, so N/A, not a
     // lost refresh and not 0.
     let mut l = RefreshLedger::default();
-    l.accepted(&stats(100, 1_000, 1_000, 0));
-    l.accepted(&stats(102, 1_001, 1_001, 0));
+    l.accepted(&synced(100, 1_000), GRID);
+    l.accepted(&synced(102, 1_001), GRID);
     let c = l.count();
     assert_eq!(
         (c.lost(), c.lost, c.counted, c.unavailable),
@@ -155,10 +181,36 @@ fn refresh_count_deltas_to_lost_refreshes() {
     );
     // A present count that goes back (a new swap chain) is one interval
     // without evidence.
-    l.accepted(&stats(1, 5, 5, 0));
+    l.accepted(&synced(1, 1_005), GRID);
     assert_eq!(l.count().unavailable, 3);
-    l.accepted(&stats(2, 6, 6, 0));
+    l.accepted(&synced(2, 1_006), GRID);
     assert_eq!(l.count().lost(), Some(0));
+}
+
+/// Lost refreshes count only on a verified fixed refresh grid: syncs 3
+/// refreshes apart but 3.2 refreshes of time apart (more than a tenth
+/// off, as under VRR), or no refresh period at all, make the interval
+/// N/A; and only vsync on every refresh without tearing is countable.
+#[test]
+fn refreshes_count_only_where_applicable() {
+    let mut l = RefreshLedger::default();
+    l.accepted(&synced(10, 500), GRID);
+    l.accepted(&stats(11, 503, 503, 503_200), GRID);
+    assert_eq!((l.count().lost(), l.count().unavailable), (None, 1));
+    // 3.09 refreshes of time: within a tenth, counted.
+    l.accepted(&stats(12, 506, 506, 506_290), GRID);
+    assert_eq!(l.count().lost(), Some(2));
+    l.accepted(&synced(13, 507), None);
+    assert_eq!(l.count().unavailable, 2);
+
+    let p = |sync_interval, tearing| Presentation {
+        sync_interval,
+        tearing,
+    };
+    assert!(p(1, false).countable());
+    assert!(!p(1, true).countable());
+    assert!(!p(0, false).countable());
+    assert!(!p(2, false).countable());
 }
 
 #[test]
@@ -201,21 +253,37 @@ fn lost_refresh_counting_matches_rules() {
     assert_eq!(c.lost, 1);
 }
 
+/// Percentiles cover the whole play, far beyond any ring: 20 000 samples
+/// 1 to 20 000 µs, pushed backwards, give p50 10 000 and p99 19 800 by
+/// nearest rank, within the stated error; the count and the maximum are
+/// exact. Below 64 µs every value is exact.
 #[test]
-fn percentiles_are_nearest_rank_over_the_ring() {
-    let mut s = Samples::with_capacity(100);
+fn percentiles_cover_the_whole_play() {
+    let mut s = Samples::new();
     assert_eq!(s.summary(), None);
-    for v in (1..=100).rev() {
+    for v in (1..=20_000).rev() {
         s.push(v);
     }
     let x = s.summary().unwrap();
-    assert_eq!((x.count, x.p50, x.p99, x.max), (100, 50, 99, 100));
-    // Four kept of six: 3, 4, 5, 6; p50 is the second, max the largest
-    // ever pushed.
-    let mut s = Samples::with_capacity(4);
-    for v in [9, 1, 3, 4, 5, 6] {
+    assert_eq!((x.count, x.max), (20_000, 20_000));
+    let near = |got: i64, exact: f64| (got as f64 - exact).abs() <= exact * RELATIVE_ERROR;
+    assert!(near(x.p50, 10_000.0), "{}", x.p50);
+    assert!(near(x.p99, 19_800.0), "{}", x.p99);
+    // The first half alone would read about 5 000: the old half counts.
+    assert!(x.p50 > 9_000);
+
+    let mut s = Samples::new();
+    for v in [9, 1, 3, 4, 5, 6, 60, 63] {
         s.push(v);
     }
     let x = s.summary().unwrap();
-    assert_eq!((x.count, x.p50, x.p99, x.max), (6, 4, 6, 9));
+    // Sorted 1 3 4 5 6 9 60 63: rank 4 and rank 8.
+    assert_eq!((x.count, x.p50, x.p99, x.max), (8, 5, 63, 63));
+    // A sample beyond 16.8 s reads as the exact maximum; a negative one
+    // counts as 0.
+    let mut s = Samples::new();
+    s.push(-5);
+    s.push(40_000_000);
+    let x = s.summary().unwrap();
+    assert_eq!((x.p50, x.p99, x.max), (0, 40_000_000, 40_000_000));
 }

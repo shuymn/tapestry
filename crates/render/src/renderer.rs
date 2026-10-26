@@ -10,7 +10,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::{self, AdapterChoice, Gpu};
-use crate::measure::FrameStatistics;
+use crate::measure::{FrameStatistics, Presentation};
 use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::text_screen;
 use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
@@ -434,6 +434,33 @@ impl Renderer {
             Output::Window(w) => w.chain.as_ref(),
             Output::Offscreen { .. } => None,
         }
+    }
+
+    /// How the swap chain presents, from its configuration; `None`
+    /// offscreen.
+    #[must_use]
+    pub fn presentation(&self) -> Option<Presentation> {
+        let Output::Window(w) = &self.output else {
+            return None;
+        };
+        Some(match w.config.present_mode {
+            wgpu::PresentMode::Fifo => Presentation {
+                sync_interval: 1,
+                tearing: false,
+            },
+            wgpu::PresentMode::FifoRelaxed => Presentation {
+                sync_interval: 1,
+                tearing: true,
+            },
+            wgpu::PresentMode::Immediate => Presentation {
+                sync_interval: 0,
+                tearing: true,
+            },
+            _ => Presentation {
+                sync_interval: 0,
+                tearing: false,
+            },
+        })
     }
 
     /// The swap chain's latest DXGI frame statistics (D11; design.md:136),
