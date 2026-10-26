@@ -5,9 +5,9 @@ use std::fs;
 use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::{
-    Adjust, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, LocalRecords, PlayerSettings,
-    RecordSink, Role, ScratchConfig, Settings, SettingsError, Tuning, load_settings, save_settings,
-    write_atomic,
+    Adjust, ControllerDevice, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, LocalRecords,
+    PlayerSettings, RecordSink, Role, ScratchConfig, Settings, SettingsError, Tuning,
+    load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -58,6 +58,10 @@ fn changed() -> Settings {
                 retry: None,
                 quit: None,
             },
+            controller_device: Some(ControllerDevice {
+                vendor_id: 0x0A1B,
+                product_id: 0x2C3D,
+            }),
             input_offset_us: 4_500,
             audio_offset_us: -12_000,
             display_offset_us: 16_700,
@@ -141,6 +145,7 @@ fn device_and_player_settings_round_trip() {
     // Everything else is as it was.
     assert_eq!(back.device.keyboard, s.device.keyboard);
     assert_eq!(back.device.controller, s.device.controller);
+    assert_eq!(back.device.controller_device, s.device.controller_device);
     assert_eq!(back.device.audio_offset_us, -12_000);
     assert_eq!(back.player.preset, "wide.toml");
     assert_eq!(Tuning::of(&back), t);
@@ -637,6 +642,10 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
                 retry,
                 quit,
             };
+            d.controller_device = Some(ControllerDevice {
+                vendor_id: 1,
+                product_id: 2,
+            });
         })
     };
     assert!(load_written(&pad(&[(0x3b, 1), (0x58, 2)], None, None), &player).is_ok());
@@ -655,6 +664,32 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
         &player,
         "quit takes keyboard keys only",
     );
+}
+
+#[test]
+fn controller_bindings_without_their_controller_are_refused_on_load() {
+    let player = PlayerSettings::default();
+    let bound = |d: &mut DeviceSettings| {
+        d.controller.lanes = vec![LaneKey {
+            control: 3,
+            lane: 2,
+        }];
+    };
+    assert_invalid(
+        &with(bound),
+        &player,
+        "device.toml: controller key config: it does not say which controller it belongs to; run `tapestry keys` again",
+    );
+    let named = with(|d| {
+        bound(d);
+        d.controller_device = Some(ControllerDevice {
+            vendor_id: 0x4E5F,
+            product_id: 0x6A7B,
+        });
+    });
+    assert_eq!(load_written(&named, &player).unwrap().device, named);
+    // No controller binding needs no controller.
+    assert!(load_written(&DeviceSettings::default(), &player).is_ok());
 }
 
 #[test]
@@ -971,7 +1006,12 @@ fn two_names_of_one_key_cannot_have_two_roles() {
     }
     // Each name alone is a key like any other; controllers have no names.
     assert!(load_written(&with(|d| d.keyboard.quit = Some(0x54)), &player).is_ok());
-    let mut pad = with(|_| {});
+    let mut pad = with(|d| {
+        d.controller_device = Some(ControllerDevice {
+            vendor_id: 3,
+            product_id: 4,
+        });
+    });
     pad.controller.lanes = vec![
         LaneKey {
             control: 0x54,

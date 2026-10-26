@@ -8,6 +8,9 @@
 //! A control already bound to another role, a key the game reserves
 //! ([`reserved_key`](crate::reserved_key)), or a controller's control at
 //! the retry or quit prompt is refused with a prompt to press another.
+//! The controller key config belongs to one controller, the first whose
+//! control is bound: a control of a controller of another product is
+//! refused too, and `device.toml` saves the product with the bindings.
 //! Escape ([`CANCEL_KEY`]) cancels and nothing is written; F12
 //! ([`KEEP_KEY`]) keeps the role's current bindings, which is how Escape
 //! stays the quit key (the default). Escape can also be bound by editing
@@ -21,7 +24,7 @@
 use std::time::{Duration, Instant};
 
 use eval::ControlId;
-use input::hid::{is_axis, widened_wrap};
+use input::hid::{HidProduct, is_axis, widened_wrap};
 use input::{Capture, DeviceKind, Watched};
 
 use crate::settings::{KeyConfig, KeyError, LaneKey, Role};
@@ -59,8 +62,11 @@ pub struct Bound {
 pub struct KeyConfigs {
     /// Every keyboard's.
     pub keyboard: KeyConfig,
-    /// Controllers'.
+    /// The controller's.
     pub controller: KeyConfig,
+    /// The controller `controller` belongs to, when it binds a lane and
+    /// the controller's product is known.
+    pub controller_device: Option<HidProduct>,
 }
 
 impl KeyConfigs {
@@ -92,6 +98,9 @@ pub enum Refusal {
     Key(KeyError),
     /// Keep was pressed for a lane the current key configs do not bind.
     NothingToKeep(Role),
+    /// A control of a controller other than the one already bound: the
+    /// controller key config belongs to one controller.
+    OtherController,
 }
 
 /// What a press did.
@@ -131,6 +140,9 @@ pub struct KeyConfigFlow {
     steps: Vec<Role>,
     bound: Vec<(Role, Vec<Bound>)>,
     refused: Option<Refusal>,
+    /// Once a controller's control is bound: its product (`None` when
+    /// unknown).
+    device: Option<Option<HidProduct>>,
     /// While the scratch axis is turned to learn its range: what it has
     /// shown so far.
     learning: Option<Option<Watched>>,
@@ -146,6 +158,7 @@ impl KeyConfigFlow {
             steps: ROLES.to_vec(),
             bound: Vec::new(),
             refused: None,
+            device: None,
             learning: None,
             learnt: None,
         }
@@ -219,8 +232,9 @@ impl KeyConfigFlow {
         found
     }
 
-    /// The key configs of the roles bound so far.
-    fn configs(bound: &[(Role, Vec<Bound>)]) -> KeyConfigs {
+    /// The key configs of the roles bound so far, the controller's bound
+    /// to `device`.
+    fn configs(bound: &[(Role, Vec<Bound>)], device: Option<Option<HidProduct>>) -> KeyConfigs {
         let empty = || KeyConfig {
             lanes: Vec::new(),
             retry: None,
@@ -229,6 +243,7 @@ impl KeyConfigFlow {
         let mut c = KeyConfigs {
             keyboard: empty(),
             controller: empty(),
+            controller_device: None,
         };
         for (role, controls) in bound {
             for b in controls {
@@ -246,6 +261,9 @@ impl KeyConfigFlow {
                 }
             }
         }
+        if !c.controller.lanes.is_empty() {
+            c.controller_device = device.flatten();
+        }
         c
     }
 
@@ -254,34 +272,50 @@ impl KeyConfigFlow {
         Press::Refused(r)
     }
 
-    /// Takes a pressed control for the role prompted for.
+    /// Takes a pressed control for the role prompted for, a controller's
+    /// of unknown product ([`press_from`](Self::press_from)).
     pub fn press(&mut self, pressed: Bound) -> Press {
+        self.press_from(pressed, None)
+    }
+
+    /// Takes a pressed control for the role prompted for; a controller's
+    /// comes from a controller of `product` (`None`: unknown). Once a
+    /// controller's control is bound, a control of a controller of
+    /// another product is refused, and so is keeping the current
+    /// controller bindings when they belong to another controller.
+    pub fn press_from(&mut self, pressed: Bound, product: Option<HidProduct>) -> Press {
         let Some(role) = self.role() else {
-            return Press::Done(Self::configs(&self.bound));
+            return Press::Done(Self::configs(&self.bound, self.device));
         };
         let keyboard = pressed.kind == DeviceKind::Keyboard;
         if keyboard && pressed.control == CANCEL_KEY {
             return Press::Cancelled;
         }
         let keep = keyboard && pressed.control == KEEP_KEY;
-        let chosen = if keep && self.other_direction() {
+        let (chosen, from) = if keep && self.other_direction() {
             // Skipped: the scratch keeps the one control it has.
-            Vec::new()
+            (Vec::new(), None)
         } else if keep {
             let kept = self.current(role);
             if kept.is_empty() && matches!(role, Role::Lane(_)) {
                 return self.refuse(Refusal::NothingToKeep(role));
             }
-            kept
+            (kept, self.current.controller_device)
         } else {
-            vec![pressed]
+            (vec![pressed], product)
         };
+        let controller = chosen.iter().any(|b| b.kind == DeviceKind::Controller);
+        if controller && self.device.is_some_and(|d| d != from) {
+            return self.refuse(Refusal::OtherController);
+        }
+        let device = if controller { Some(from) } else { self.device };
         self.bound.push((role, chosen.clone()));
-        let candidate = Self::configs(&self.bound);
+        let candidate = Self::configs(&self.bound, device);
         if let Err(e) = candidate.check() {
             self.bound.pop();
             return self.refuse(Refusal::Key(e));
         }
+        self.device = device;
         self.refused = None;
         // A button or a key for the scratch plays one direction: the
         // other is prompted for next.
@@ -364,7 +398,11 @@ pub fn capture_keys_within(
             kind,
             control: control.0,
         };
-        match flow.press(pressed) {
+        let product = match kind {
+            DeviceKind::Keyboard => None,
+            DeviceKind::Controller => capture.product(),
+        };
+        match flow.press_from(pressed, product) {
             Press::Done(keys) => return KeyConfigEnd::Done(keys, flow.widened()),
             Press::Cancelled => return KeyConfigEnd::Cancelled,
             Press::Bound(Role::Lane(0), ref chosen)

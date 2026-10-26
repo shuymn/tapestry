@@ -69,6 +69,7 @@ fn refusal(r: Refusal) -> String {
         Refusal::NothingToKeep(r) => {
             format!("{} HAS NO BINDING TO KEEP: PRESS A CONTROL", role(r))
         }
+        Refusal::OtherController => "ANOTHER CONTROLLER IS BOUND: USE THE SAME ONE".to_owned(),
     }
 }
 
@@ -210,6 +211,7 @@ pub fn run(
     let current = KeyConfigs {
         keyboard: device.keyboard.clone(),
         controller: device.controller.clone(),
+        controller_device: device.controller_device.map(Into::into),
     };
     let end = capture_keys(&capture, &mut screen, current);
     drop(screen);
@@ -221,6 +223,7 @@ pub fn run(
         KeyConfigEnd::Done(keys, widened) => {
             device.keyboard = keys.keyboard;
             device.controller = keys.controller;
+            device.controller_device = keys.controller_device.map(Into::into);
             if let Some(wrap) = widened {
                 device.scratch.wrap = Some(wrap);
                 println!(
@@ -252,6 +255,7 @@ mod tests {
                 retry: None,
                 quit: None,
             },
+            controller_device: None,
         });
         let pad = Bound {
             kind: DeviceKind::Controller,
@@ -297,6 +301,7 @@ mod tests {
                 retry: None,
                 quit: None,
             },
+            controller_device: None,
         });
         assert_eq!(
             lines(&flow)[2],

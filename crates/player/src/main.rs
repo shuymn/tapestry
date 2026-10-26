@@ -470,7 +470,11 @@ fn rig<'a>(
         render,
         controls,
         clock,
-        recorded: (device.keyboard.recorded(), device.controller.recorded()),
+        recorded: input_side::Recorded {
+            keyboard: device.keyboard.recorded(),
+            controller: device.controller.recorded(),
+            controller_device: device.controller_device.map(Into::into),
+        },
         gauge: loaded.settings().player.displayed_gauge,
         input_offset_us: device.input_offset_us,
         files: SettingsFiles::new(loaded.root().clone(), loaded.settings().clone()),

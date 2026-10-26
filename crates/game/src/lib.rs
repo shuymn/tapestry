@@ -65,8 +65,8 @@ pub use session::{
     SessionError, Settings, TABLE_BYTES_PER_OBJECT,
 };
 pub use settings::{
-    DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, OVERLAY_KEY, PlayerSettings, Role,
-    ScratchConfig, SettingsError, load_settings, reserved_key, save_settings,
+    ControllerDevice, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, OVERLAY_KEY,
+    PlayerSettings, Role, ScratchConfig, SettingsError, load_settings, reserved_key, save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{

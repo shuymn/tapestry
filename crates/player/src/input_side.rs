@@ -17,6 +17,7 @@ use std::thread::Thread;
 use bms_model::TimeUs;
 use eval::ControlId;
 use game::{Closing, Opening};
+use input::hid::HidProduct;
 use input::{DeviceId, DeviceKind, SourceReader, SourceSet};
 
 use crate::controls::Controls;
@@ -30,13 +31,23 @@ pub enum Request {
         lead_in: TimeUs,
         /// The thread to wake after each publication.
         logic: Thread,
-        /// The controls recorded from keyboards and from controllers.
-        keyboard: Vec<ControlId>,
-        /// See `keyboard`.
-        controller: Vec<ControlId>,
+        /// What the play records.
+        recorded: Recorded,
     },
     /// Close recording at the next boundary.
     Close,
+}
+
+/// What a play records, from the key configs.
+#[derive(Clone, Debug)]
+pub struct Recorded {
+    /// The controls recorded from every keyboard.
+    pub keyboard: Vec<ControlId>,
+    /// The controls recorded from the controller.
+    pub controller: Vec<ControlId>,
+    /// The controller they belong to; `None` when no controller binds a
+    /// lane.
+    pub controller_device: Option<HidProduct>,
 }
 
 /// The input thread's answers.
@@ -175,9 +186,8 @@ impl Hook {
                 Request::Open {
                     lead_in,
                     logic,
-                    keyboard,
-                    controller,
-                } => Reply::Opened(self.open(sources, now, lead_in, logic, &keyboard, &controller)),
+                    recorded,
+                } => Reply::Opened(self.open(sources, now, lead_in, logic, &recorded)),
                 Request::Close => Reply::Closed(self.close(sources)),
             };
             // Published before the reply, so the game thread never reads
@@ -212,19 +222,15 @@ impl Hook {
         now: TimeUs,
         lead_in: TimeUs,
         logic: Thread,
-        keyboard: &[ControlId],
-        controller: &[ControlId],
+        recorded: &Recorded,
     ) -> Opening<SourceReader> {
         let origin = TimeUs(now.0 + lead_in.0);
         let start = match &mut self.mode {
             Mode::Clock => {
-                let devices: Vec<_> = sources.devices().collect();
-                for (d, kind) in devices {
-                    let list = match kind {
-                        DeviceKind::Keyboard => keyboard,
-                        DeviceKind::Controller => controller,
-                    };
-                    sources.set_recorded(d, list.to_vec());
+                if !take_part(sources, recorded) {
+                    eprintln!(
+                        "input: the controller set up in `tapestry keys` is not connected; this play uses the keyboard bindings only"
+                    );
                 }
                 reset_gate(sources, &self.controls);
                 sources.open_play(now, origin)
@@ -282,11 +288,139 @@ impl Hook {
     }
 }
 
+/// Sets what each connected device records and whether it takes part:
+/// every keyboard records the keyboard controls, and the first controller
+/// of the configured model ([`Recorded::controller_device`]) the
+/// controller's; any other controller, a second of that model included,
+/// takes no part. Returns `false` when a controller is configured and none
+/// of its model is connected.
+fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
+    let devices: Vec<_> = sources.devices().collect();
+    let mut matched = false;
+    for (d, kind) in devices {
+        let (list, takes_part) = match kind {
+            DeviceKind::Keyboard => (&recorded.keyboard, true),
+            DeviceKind::Controller => {
+                let mine = !matched
+                    && recorded.controller_device.is_some()
+                    && sources.product(d) == recorded.controller_device;
+                matched |= mine;
+                (&recorded.controller, mine)
+            }
+        };
+        sources.set_recorded(d, list.clone());
+        sources.set_takes_part(d, takes_part);
+    }
+    matched || recorded.controller_device.is_none()
+}
+
 /// Opens the gate for a new play; a window without focus latches it again
 /// at once, so a play never records while the game is in the background.
 fn reset_gate(sources: &mut SourceSet, controls: &Controls) {
     sources.gate_mut().reset();
     if !controls.focused() {
         sources.gate().latch();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bms_model::TimeUs;
+    use eval::ControlId;
+    use input::hid::HidProduct;
+    use input::{DeviceId, DeviceKind, Packet, SourceConfig, SourceSet};
+
+    use super::{Recorded, take_part};
+
+    const TURNTABLE: HidProduct = HidProduct {
+        vendor_id: 0x1A2B,
+        product_id: 0x3C4D,
+    };
+    const GAMEPAD: HidProduct = HidProduct {
+        vendor_id: 0x5E6F,
+        product_id: 0x7081,
+    };
+    /// Button 1 plays key 1 on the controller; retry and quit are keys.
+    const BUTTON: ControlId = ControlId(1);
+    const RETRY: ControlId = ControlId(0x0e);
+
+    fn recorded(device: Option<HidProduct>) -> Recorded {
+        Recorded {
+            keyboard: vec![RETRY, ControlId(0x01)],
+            controller: vec![BUTTON],
+            controller_device: device,
+        }
+    }
+
+    /// Keyboards 1 and 2, then a gamepad (10), the turntable (11) and a
+    /// second turntable of the same model (12), each with its product.
+    fn devices() -> SourceSet {
+        let mut set = SourceSet::new(SourceConfig {
+            max_devices: 8,
+            max_sources: 8,
+            max_held: 8,
+            queue_capacity: 64,
+            max_arrivals: 2,
+        })
+        .unwrap();
+        set.begin_batch(TimeUs(0));
+        for d in [1, 2] {
+            set.connect(DeviceId(d), DeviceKind::Keyboard);
+        }
+        for (d, product) in [(10, GAMEPAD), (11, TURNTABLE), (12, TURNTABLE)] {
+            set.connect(DeviceId(d), DeviceKind::Controller);
+            set.set_product(DeviceId(d), product);
+        }
+        set.end_batch(TimeUs(0));
+        set
+    }
+
+    fn press(device: u64) -> Packet {
+        Packet {
+            device: DeviceId(device),
+            control: BUTTON,
+            value: 1,
+            background: false,
+        }
+    }
+
+    /// Only the first controller of the configured model plays: a gamepad
+    /// and a second controller of that model, with the same control ids,
+    /// take no part and record nothing.
+    #[test]
+    fn only_the_configured_controller_takes_part() {
+        let mut set = devices();
+        assert!(take_part(&mut set, &recorded(Some(TURNTABLE))));
+        set.open_recording(TimeUs(10));
+        let mut readers = set.take_readers();
+        let sources: Vec<_> = set.participants().map(|(d, _)| d.0).collect();
+        assert_eq!(sources, [11, 1, 2]);
+        assert!(!set.source_limited());
+        set.begin_batch(TimeUs(20));
+        for d in [10, 11, 12] {
+            set.packet(&press(d));
+        }
+        set.end_batch(TimeUs(21));
+        let events: Vec<_> = std::iter::from_fn(|| readers[0].pop()).collect();
+        assert_eq!(events.len(), 1);
+        assert!(readers[1..].iter_mut().all(|r| r.pop().is_none()));
+    }
+
+    /// With the configured model not connected, or no controller
+    /// configured, only keyboards take part; only the first case is
+    /// reported as missing.
+    #[test]
+    fn without_the_configured_controller_only_keyboards_take_part() {
+        let other = HidProduct {
+            vendor_id: 0x0A0B,
+            product_id: 0x0C0D,
+        };
+        for (device, found) in [(Some(other), false), (None, true)] {
+            let mut set = devices();
+            assert_eq!(take_part(&mut set, &recorded(device)), found);
+            set.open_recording(TimeUs(10));
+            let sources: Vec<_> = set.participants().map(|(d, _)| d.0).collect();
+            assert_eq!(sources, [1, 2]);
+        }
     }
 }
