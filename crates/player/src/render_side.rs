@@ -20,6 +20,8 @@ use game::RenderSide;
 use input::QpcClock;
 use render::{FrameInput, Renderer};
 
+use crate::tuning::LiveTuning;
+
 /// What draws: the renderer, or a double in tests.
 pub trait Screen: Send {
     /// Prepares `chart` and resets the play state.
@@ -107,13 +109,12 @@ pub enum RenderMsg {
     Exit,
 }
 
-/// The fixed inputs of every play's frames.
-#[derive(Clone, Copy, Debug)]
+/// The inputs of every play's frames.
+#[derive(Clone, Debug)]
 pub struct View {
-    /// The display latency offset.
-    pub display_offset: TimeUs,
-    /// Hi-speed as the visible time.
-    pub visible_time: TimeUs,
+    /// Hi-speed (the visible time) and the display offset, read at every
+    /// frame.
+    pub tuning: Arc<LiveTuning>,
     /// The effect queue's capacity: the most effects one frame drains.
     pub effects: usize,
 }
@@ -320,10 +321,17 @@ impl Run {
                     effects.clear();
                     side.drain_effects(|e| effects.push(*e));
                     let now = TimeUs(self.clock.now().0 - origin.0);
+                    // Hi-speed and the display offset change anytime and move
+                    // the notes only: they reach the screen here and nowhere
+                    // near judgment. Hi-speed changes are not in the v1 log;
+                    // they arrive with the separate hi-speed stream and a
+                    // format version bump (design.md "Operations unrelated to
+                    // judgment go in a separate stream").
+                    let t = self.view.tuning.get();
                     let f = FrameInput {
                         now,
-                        display_offset: self.view.display_offset,
-                        visible_time: self.view.visible_time,
+                        display_offset: TimeUs(t.display_offset_us),
+                        visible_time: t.visible_time(),
                         view: side.view(),
                         effects: &effects,
                         gauge: *gauge,
@@ -444,8 +452,12 @@ mod tests {
 
     fn view() -> View {
         View {
-            display_offset: TimeUs(0),
-            visible_time: TimeUs(600_000),
+            tuning: Arc::new(crate::tuning::LiveTuning::new(game::Tuning {
+                visible_time_ms: 600,
+                volume_percent: 100,
+                display_offset_us: 0,
+                input_offset_us: 0,
+            })),
             effects: 16,
         }
     }
@@ -544,5 +556,168 @@ mod tests {
         assert_ne!(at, i64::MIN);
         assert!(first >= at, "first frame at {first}, presented at {at}");
         link.exit();
+    }
+
+    /// A screen that keeps each play frame's visible time and display
+    /// offset.
+    struct Inputs(Arc<std::sync::Mutex<Vec<(TimeUs, TimeUs)>>>);
+
+    impl Screen for Inputs {
+        fn load(&mut self, _chart: &Chart) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn frame(&mut self, f: &FrameInput<'_>) -> Result<bool, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((f.visible_time, f.display_offset));
+            Ok(true)
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, String> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The judgment stream of an autoplay of `chart` on the headless
+    /// runner, with `between` called after the runner is built and before
+    /// it plays.
+    fn judgments(chart: &Chart, between: impl FnOnce()) -> Vec<eval::JudgeEvent> {
+        use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, SoundBank};
+        let start = TimeUs(-1_000_000);
+        let rule = rules::custom();
+        let device = game::DeviceSettings::default().profile(&[input::DeviceKind::Keyboard]);
+        let events = input::autoplay(chart, &device.sources[0]).unwrap();
+        let script = input::ScriptedInput::from_log(
+            &InputStart::default(),
+            &events,
+            &[input::DeviceKind::Keyboard],
+        );
+        let sources = input::SourceSet::new(input::SourceConfig {
+            max_devices: 2,
+            max_sources: 2,
+            max_held: 8,
+            queue_capacity: 256,
+            max_arrivals: 2,
+        })
+        .unwrap();
+        let bank = Arc::new(SoundBank::from_sounds(48_000, Vec::new()));
+        let engine = AudioEngine::new(bank, &chart.bgm, 48_000, 480, MAX_VOICES, 0).unwrap();
+        let device_out = SimDevice::new(SimConfig::steady(48_000, 480, start));
+        let audio = game::RunnerAudio::new(engine, RecordingOutput::new(device_out, 0));
+        let config = LogicConfig {
+            inputs: 64,
+            effects: 64,
+        };
+        let mut runner =
+            game::Runner::new(chart, &rule, &device, sources, script, config, start, audio)
+                .unwrap();
+        between();
+        assert_eq!(runner.run_to_end(TimeUs(1_000)), game::RunOutcome::Complete);
+        runner.stream().to_vec()
+    }
+
+    /// Hi-speed moves notes and nothing else: frames drawn after a hi-speed
+    /// step carry the new visible time, a note 300 ms ahead of the display
+    /// time sits 800 × 300 × (1/575 − 1/600) = 17.391 layout pixels higher
+    /// (the lane top is 800 pixels above the judgment line), and the
+    /// judgment stream of a play is the same with and without the step.
+    #[test]
+    fn hi_speed_change_moves_notes_not_judgment() {
+        use game::Adjust;
+        use render::layout;
+
+        // 120 BPM throughout: four notes, one each on lanes 1 to 4.
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .tap(Lane::new(2).unwrap(), TimeUs(1_250_000))
+            .tap(Lane::new(3).unwrap(), TimeUs(1_500_000))
+            .tap(Lane::new(4).unwrap(), TimeUs(1_750_000))
+            .build()
+            .unwrap();
+
+        // The render thread reads the values at every frame.
+        let tuning = view().tuning;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let screen_seen = Arc::clone(&seen);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(Inputs(Arc::clone(&screen_seen))) as Box<dyn Screen>));
+        let clock = QpcClock::start();
+        let view = View {
+            tuning: Arc::clone(&tuning),
+            effects: 16,
+        };
+        let link = spawn(
+            make,
+            Arc::new(chart.clone()),
+            clock,
+            view,
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let (rule, device) = (rules::custom(), DeviceProfile::default());
+        let (_logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        link.send(RenderMsg::Play {
+            origin: clock.now(),
+            side,
+            gauge: 0,
+        });
+        let before = (TimeUs(600_000), TimeUs(0));
+        let after = (TimeUs(575_000), TimeUs(1_000));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&before)));
+        assert!(tuning.adjust(Adjust::HiSpeedUp));
+        assert!(tuning.adjust(Adjust::DisplayOffsetUp));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&after)));
+        link.exit();
+        // Once a frame has the new values, no later frame has the old ones.
+        let frames = seen.lock().unwrap().clone();
+        let first_after = frames.iter().position(|f| *f == after).unwrap();
+        assert!(frames[first_after..].iter().all(|f| *f == after));
+        assert!(frames[..first_after].iter().all(|f| *f == before));
+
+        // The same note, at the same display time, before and after.
+        let scroll = &chart.scroll;
+        let at = TimeUs(700_000);
+        let y = |visible| layout::note_y(scroll, TimeUs(1_000_000), at, visible);
+        let (y600, y575) = (y(before.0), y(after.0));
+        // By hand: 880 − 800 × 300 / 600 = 480, and 800 × 300 / 575 =
+        // 417.3913 above 880 is 462.6087.
+        assert!((y600 - 480.0).abs() < 1e-3, "{y600}");
+        assert!((y575 - 462.608_7).abs() < 1e-3, "{y575}");
+        assert!((y600 - y575 - 17.391_3).abs() < 1e-3);
+
+        // Judgment: the same nonempty stream with and without the step.
+        let plain = judgments(&chart, || {});
+        let stepped = judgments(&chart, || {
+            assert!(tuning.adjust(Adjust::HiSpeedUp));
+        });
+        let judged = plain
+            .iter()
+            .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { .. }))
+            .count();
+        assert_eq!(judged, 4);
+        assert_eq!(plain, stepped);
+        assert_eq!(tuning.get().visible_time_ms, 550);
     }
 }

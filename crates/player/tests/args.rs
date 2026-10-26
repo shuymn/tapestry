@@ -32,6 +32,8 @@ fn unknown_argument_still_exits_two() {
     assert_unknown(&["play", "--no-such-flag", "a.bms"], "--no-such-flag");
     assert_unknown(&["play", "a.bms", "--no-such-flag"], "--no-such-flag");
     assert_unknown(&["play", "a.bms", "b.bms"], "b.bms");
+    assert_unknown(&["keys", "--no-such-flag"], "--no-such-flag");
+    assert_unknown(&["keys", "a.bms"], "a.bms");
 }
 
 #[test]

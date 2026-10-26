@@ -15,9 +15,11 @@ mod controls;
 mod dev;
 mod end_screen;
 mod input_side;
+mod keys;
 mod play;
 mod power;
 mod render_side;
+mod tuning;
 mod window;
 
 use std::ffi::OsString;
@@ -28,7 +30,9 @@ use std::time::SystemTime;
 
 use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank};
 use bms_model::TimeUs;
-use game::{DataRoot, DeviceSettings, Loaded, Parts, SessionConfig, Settings, save_settings};
+use game::{
+    DataRoot, DeviceSettings, Loaded, Parts, SessionConfig, Settings, Tuning, save_settings,
+};
 use input::{Capture, InputThread, QpcClock, SourceConfig, SourceSet};
 use render::{AdapterChoice, Renderer, Target};
 use replay::{BuildProvenance, ReceiveMethod};
@@ -38,13 +42,12 @@ use crate::end_screen::{Hints, LoadTimes};
 use crate::input_side::Mode;
 use crate::play::PlayerRig;
 use crate::render_side::{MakeScreen, NoFrames, Screen, View};
+use crate::tuning::LiveTuning;
 
-const USAGE: &str = "usage: tapestry play <chart.bms> | tapestry --version";
+const USAGE: &str = "usage: tapestry play <chart.bms> | tapestry keys | tapestry --version";
 
 /// The countdown before chart time 0 (D13).
 const LEAD_IN: TimeUs = TimeUs(1_000_000);
-/// The visible time at hi-speed 1.0 (D9; tuned by playing).
-const VISIBLE_TIME_US: i64 = 600_000;
 /// Effects the render queue holds.
 const EFFECTS: usize = 1 << 14;
 
@@ -72,6 +75,9 @@ fn main() -> ExitCode {
         }
         println!("tapestry {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+    if arg == "keys" {
+        return keys_command(args, clock);
     }
     if arg != "play" {
         return unknown_argument(&arg);
@@ -103,17 +109,53 @@ fn main() -> ExitCode {
     #[cfg(feature = "dev-tools")]
     if let Some(log) = dev_options.scripted_input.take() {
         let auto = u32::from(dev_options.auto_retry);
-        return report(scripted(&chart, &log, dev_options.frames, auto, clock));
+        let frames = dev_options.frames.take();
+        return report(scripted(&chart, &log, frames, auto, clock, |rig| {
+            rig.adjust_in_play = dev_options.adjust_in_play;
+            rig.adjust_on_end = dev_options.adjust_on_end;
+        }));
     }
-    #[cfg(feature = "dev-tools")]
-    let auto_retry = dev_options.auto_retry;
     report(play(&chart, clock, |_rig| {
         #[cfg(feature = "dev-tools")]
-        if auto_retry {
-            _rig.auto_retries = 1;
-            _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+        {
+            if dev_options.auto_retry {
+                _rig.auto_retries = 1;
+                _rig.quit_after_end = Some(std::time::Duration::from_millis(300));
+            }
+            _rig.adjust_in_play = dev_options.adjust_in_play;
+            _rig.adjust_on_end = dev_options.adjust_on_end;
         }
     }))
+}
+
+/// `tapestry keys`, with the dev-tools option `--dev-scripted-keys <steps>`.
+fn keys_command(args: impl Iterator<Item = OsString>, clock: QpcClock) -> ExitCode {
+    let mut args = args.peekable();
+    #[cfg(feature = "dev-tools")]
+    let mut script = None;
+    #[cfg(feature = "dev-tools")]
+    while args.peek().is_some_and(|a| a == "--dev-scripted-keys") {
+        args.next();
+        let parsed = args
+            .next()
+            .ok_or_else(|| "--dev-scripted-keys needs a value".to_owned())
+            .and_then(|v| dev::KeyScript::parse(&v.to_string_lossy()));
+        match parsed {
+            Ok(s) => script = Some(s),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if let Some(a) = args.next() {
+        return unknown_argument(&a);
+    }
+    report(keys::run(
+        clock,
+        #[cfg(feature = "dev-tools")]
+        script,
+    ))
 }
 
 fn unknown_argument(arg: &OsString) -> ExitCode {
@@ -224,15 +266,19 @@ fn start_engine(
     Ok(audio.start(engine))
 }
 
-/// The display offset and the visible time from the settings.
-fn view(loaded: &Loaded) -> View {
-    let s = loaded.settings();
-    let hi_speed = i64::from(s.player.hi_speed_milli.max(1));
+/// The frames' inputs: hi-speed and the display offset as the settings
+/// keys leave them.
+fn view(controls: &Controls) -> View {
     View {
-        display_offset: TimeUs(s.device.display_offset_us),
-        visible_time: TimeUs(VISIBLE_TIME_US * 1_000 / hi_speed),
+        tuning: Arc::clone(controls.tuning()),
         effects: EFFECTS,
     }
+}
+
+/// The controls, with the settings keys starting from the loaded values.
+fn controls(loaded: &Loaded, clock: QpcClock) -> Arc<Controls> {
+    let tuning = LiveTuning::new(Tuning::of(loaded.settings()));
+    Arc::new(Controls::with_tuning(clock, Arc::new(tuning)))
 }
 
 /// The game thread's rig around the started threads.
@@ -254,6 +300,10 @@ fn rig<'a>(
         recorded: (device.keyboard.recorded(), device.controller.recorded()),
         gauge: loaded.settings().player.displayed_gauge,
         input_offset_us: device.input_offset_us,
+        root: loaded.root().clone(),
+        settings: loaded.settings().clone(),
+        seen: controls.tuning().version(),
+        end_lines: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
         pending_retry: None,
         retry_from: None,
@@ -266,6 +316,10 @@ fn rig<'a>(
         end_shown: None,
         #[cfg(feature = "dev-tools")]
         auto_retries: 0,
+        #[cfg(feature = "dev-tools")]
+        adjust_in_play: Vec::new(),
+        #[cfg(feature = "dev-tools")]
+        adjust_on_end: Vec::new(),
     }
 }
 
@@ -285,13 +339,12 @@ fn open_window_and_input(
     controls: &Arc<Controls>,
     clock: QpcClock,
     sources: SourceSet,
-    mut hook: input_side::Hook,
+    capture: Capture,
+    wake: impl FnMut(&mut SourceSet, TimeUs) + Send + 'static,
     keys: (Option<u32>, Option<u32>),
 ) -> Result<(window::WindowThread, window::Surface, InputThread), String> {
     let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1)?;
-    let input = InputThread::spawn(clock, sources, Capture::new(), move |s, now| {
-        hook.wake(s, now);
-    });
+    let input = InputThread::spawn(clock, sources, capture, wake);
     let input = match input {
         Ok(i) => i,
         Err(e) => {
@@ -314,7 +367,7 @@ fn play(
     tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> Result<(), String> {
     let mut loaded = load(chart, ReceiveMethod::RawInput)?;
-    let controls = Arc::new(Controls::new(clock));
+    let controls = controls(&loaded, clock);
     let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
     let (audio, opened) = audio_side::spawn(
         move || audio::WasapiShared::open(clock).map_err(|e| format!("audio: {e}")),
@@ -323,17 +376,23 @@ fn play(
     let audio = start_engine(&loaded, audio, opened)?;
     let sources = sources();
     controls.set_latch(sources.gate().handle());
-    let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock);
+    let (mut hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock);
     let keys = &loaded.settings().device.keyboard;
     let keys = (keys.retry, keys.quit);
-    let (window_thread, surface, input_thread) =
-        match open_window_and_input(&controls, clock, sources, hook, keys) {
-            Ok(opened) => opened,
-            Err(e) => {
-                audio.exit();
-                return Err(e);
-            }
-        };
+    let (window_thread, surface, input_thread) = match open_window_and_input(
+        &controls,
+        clock,
+        sources,
+        Capture::new(),
+        move |s, now| hook.wake(s, now),
+        keys,
+    ) {
+        Ok(opened) => opened,
+        Err(e) => {
+            audio.exit();
+            return Err(e);
+        }
+    };
     let make: MakeScreen = Box::new(move || {
         let target = Target::Window {
             window: surface.into(),
@@ -348,7 +407,7 @@ fn play(
         make,
         Arc::new(loaded.chart().clone()),
         clock,
-        view(&loaded),
+        view(&controls),
         Box::new(NoFrames),
     );
     let render = match render {
@@ -377,10 +436,11 @@ fn scripted(
     frames: Option<PathBuf>,
     auto_retries: u32,
     clock: QpcClock,
+    tune: impl FnOnce(&mut PlayerRig<'_>),
 ) -> Result<(), String> {
     let script = dev::script(log)?;
     let mut loaded = load(chart, ReceiveMethod::Scripted)?;
-    let controls = Arc::new(Controls::new(clock));
+    let controls = controls(&loaded, clock);
     let last_note = loaded
         .chart()
         .lanes
@@ -420,12 +480,13 @@ fn scripted(
         make,
         Arc::new(loaded.chart().clone()),
         clock,
-        view(&loaded),
+        view(&controls),
         dump,
     )?;
     let mut rig = rig(&loaded, input, audio, render, &controls, clock);
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.auto_retries = auto_retries;
+    tune(&mut rig);
     let ran = game::live::run(&mut loaded, &mut rig).map_err(|e| e.to_string());
     rig.shut_down();
     drop(script_thread);
@@ -448,10 +509,16 @@ mod tests {
     fn keyboards_stay_registered_to_the_input_thread() {
         let clock = QpcClock::start();
         let controls = Arc::new(Controls::new(clock));
-        let (hook, _link) = input_side::link(Arc::clone(&controls), Mode::Clock);
-        let (window, _surface, input) =
-            open_window_and_input(&controls, clock, sources(), hook, (Some(0x0E), Some(0x01)))
-                .expect("startup");
+        let (mut hook, _link) = input_side::link(Arc::clone(&controls), Mode::Clock);
+        let (window, _surface, input) = open_window_and_input(
+            &controls,
+            clock,
+            sources(),
+            input::Capture::new(),
+            move |s, now| hook.wake(s, now),
+            (Some(0x0E), Some(0x01)),
+        )
+        .expect("startup");
         assert_eq!(input::keyboard_target(), Some(input.receiver()));
         drop(input);
         window.close();

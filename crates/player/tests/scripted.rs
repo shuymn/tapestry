@@ -205,8 +205,10 @@ fn scripted_play_writes_a_record() {
     assert_eq!(perfect, NOTES);
 }
 
-/// A key config binding one control to two lanes cannot be evaluated: the
-/// run ends with the reason and a nonzero exit, and nothing is recorded.
+/// A `device.toml` binding one control to two lanes, binding a reserved
+/// settings key, or naming a lane the game does not have is refused when
+/// it is loaded: the run ends with the reason and a nonzero exit, and
+/// nothing is recorded.
 #[test]
 fn an_invalid_key_config_exits_nonzero() {
     let Fixture {
@@ -216,22 +218,39 @@ fn an_invalid_key_config_exits_nonzero() {
         appdata,
         ..
     } = fixture();
-    let mut device = DeviceSettings::default();
-    device.keyboard.lanes[2].control = device.keyboard.lanes[1].control;
-    game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .arg("play")
-        .arg(&chart_path)
-        .arg("--dev-scripted-input")
-        .arg(&log)
-        .env("LOCALAPPDATA", &appdata)
-        .output()
-        .expect("run tapestry");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("the play cannot start"), "{stderr}");
-    assert!(!appdata.join("tapestry").join("records").exists());
+    type Change = fn(&mut DeviceSettings);
+    let bad: [(Change, &str); 3] = [
+        (
+            |d| d.keyboard.lanes[2].control = d.keyboard.lanes[1].control,
+            "control 0x2c is bound to both key 1 and key 2",
+        ),
+        (
+            |d| d.keyboard.lanes[3].control = 0x3d,
+            "key 0x3d is reserved for volume",
+        ),
+        (|d| d.keyboard.lanes[4].lane = 9, "lane 9 does not exist"),
+    ];
+    for (change, says) in bad {
+        let mut device = DeviceSettings::default();
+        change(&mut device);
+        game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+            .arg("play")
+            .arg(&chart_path)
+            .arg("--dev-scripted-input")
+            .arg(&log)
+            .env("LOCALAPPDATA", &appdata)
+            .output()
+            .expect("run tapestry");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("device.toml: keyboard key config"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(says), "{stderr}");
+        assert!(!appdata.join("tapestry").join("records").exists());
+    }
 }
 
 /// With `--dev-auto-retry` the run retries once by itself: the retried
@@ -264,4 +283,67 @@ fn an_auto_retried_scripted_play_replays_the_log_again() {
     }
     assert!(stdout.contains("retry "), "{stdout}");
     assert_eq!(records(&appdata).len(), 2);
+}
+
+/// Settings keys pressed in the first play (hi-speed up twice, volume down,
+/// display offset up three times) and on its end screen (input offset up
+/// twice) are written to `player.toml` and `device.toml` when the plays
+/// end. Each play is recorded with the offsets it started with: the input
+/// offset changed on the end screen is the retried play's, never the
+/// first one's.
+#[test]
+fn settings_keys_persist_and_the_input_offset_waits_for_the_next_play() {
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("play")
+        .arg(&chart_path)
+        .arg("--dev-scripted-input")
+        .arg(&log)
+        .arg("--dev-auto-retry")
+        .args(["--dev-adjust", "F2,F2,F3,F6,F6,F6,F8"])
+        .args(["--dev-adjust-end", "F8,F8"])
+        .env("LOCALAPPDATA", &appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    for play in [1, 2] {
+        let line = format!("play {play}: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0");
+        assert!(stdout.contains(&line), "{line} in {stdout}");
+    }
+
+    let root = game::DataRoot::new(appdata.join("tapestry"));
+    let s = game::Settings::load(&root).unwrap();
+    // 600 − 2 × 25 ms; 100 − 5 %; 3 × 1 ms; F8 during play does nothing,
+    // 2 × 1 ms on the end screen.
+    assert_eq!(s.player.visible_time_ms, 550);
+    assert_eq!(s.device.master_volume, 0.95);
+    assert_eq!(s.device.display_offset_us, 3_000);
+    assert_eq!(s.device.input_offset_us, 2_000);
+    assert_eq!(s.device.keyboard, DeviceSettings::default().keyboard);
+
+    let mut recs: Vec<PlayRecord> = records(&appdata)
+        .iter()
+        .map(|p| replay::decode(&fs::read(p).unwrap(), &DecodeLimits::default()).unwrap())
+        .collect();
+    assert_eq!(recs.len(), 2);
+    recs.sort_by_key(|r| r.devices.sources[0].profile.input_offset);
+    let offsets: Vec<(i64, i64)> = recs
+        .iter()
+        .map(|r| {
+            (
+                r.devices.sources[0].profile.input_offset.0,
+                r.devices.display_offset.0,
+            )
+        })
+        .collect();
+    // Play 1 starts before any key; play 2 starts with both offsets.
+    assert_eq!(offsets, [(0, 0), (2_000, 3_000)]);
 }

@@ -6,12 +6,14 @@
 //! startup, while a play is prepared) still ends the run. Retry and suspend
 //! are taken once, each by the play it arrives in.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bms_model::{TimeSource, TimeUs};
 use game::Command;
 use input::{FocusLatch, QpcClock};
+
+use crate::tuning::LiveTuning;
 
 const NONE: u8 = 0;
 const RETRY: u8 = 1;
@@ -28,6 +30,7 @@ pub struct Controls {
     quit: AtomicBool,
     focused: AtomicBool,
     latch: OnceLock<FocusLatch>,
+    tuning: Arc<LiveTuning>,
 }
 
 impl Controls {
@@ -35,6 +38,20 @@ impl Controls {
     /// are read from `clock`.
     #[must_use]
     pub fn new(clock: QpcClock) -> Self {
+        let defaults = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        Self::with_tuning(
+            clock,
+            Arc::new(LiveTuning::new(game::Tuning::of(&defaults))),
+        )
+    }
+
+    /// Controls as [`new`](Self::new), with the settings keys stepping
+    /// `tuning`.
+    #[must_use]
+    pub fn with_tuning(clock: QpcClock, tuning: Arc<LiveTuning>) -> Self {
         Self {
             clock,
             command: AtomicU8::new(NONE),
@@ -42,7 +59,13 @@ impl Controls {
             quit: AtomicBool::new(false),
             focused: AtomicBool::new(true),
             latch: OnceLock::new(),
+            tuning,
         }
+    }
+
+    /// The values the settings keys step.
+    pub const fn tuning(&self) -> &Arc<LiveTuning> {
+        &self.tuning
     }
 
     /// Hands over the input side's focus latch, once.

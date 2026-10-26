@@ -1,8 +1,8 @@
 //! The window thread: the winit window and its events (D9). The window is
 //! borderless fullscreen on the primary monitor and takes no device events
 //! (Raw Input has one target window per device type per process, and the
-//! input thread owns it). Focus, the retry and quit keys and closing go to
-//! [`Controls`]. The event loop runs on a thread of its own, so the game
+//! input thread owns it). Focus, the retry and quit keys, the settings
+//! keys F1 to F8 and closing go to [`Controls`]. The event loop runs on a thread of its own, so the game
 //! keeps the main thread and the loaded chart never has to move.
 
 use std::num::NonZeroIsize;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
-use game::Command;
+use game::{Adjust, Command};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
@@ -61,11 +61,15 @@ impl ApplicationHandler<Exit> for App {
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::Focused(focused) => self.controls.focus(focused),
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed && !event.repeat =>
-            {
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let code = event.physical_key.to_scancode();
-                if code.is_some() && code == self.retry {
+                // A settings key steps again while held (key repeat);
+                // retry and quit act on the first press only.
+                if let Some(a) = code.and_then(Adjust::from_key) {
+                    self.controls.tuning().adjust(a);
+                } else if event.repeat {
+                    // Retry and quit take the first press only.
+                } else if code.is_some() && code == self.retry {
                     self.controls.command(Command::Retry);
                 } else if code.is_some() && code == self.quit {
                     self.controls.command(Command::Quit);
