@@ -560,9 +560,8 @@ fn play(
     let (audio, opened) = audio_side::spawn(
         move || {
             let out = audio::WasapiShared::open(clock).map_err(|e| format!("audio: {e}"))?;
-            let g = out.grant();
-            let (queued, most) = (g.queue_periods, g.max_queue_periods);
-            Ok((out, Some(queued), Some(most)))
+            let most = out.grant().max_queue_periods;
+            Ok((out, Some(most)))
         },
         |_| {},
     )?;
@@ -677,8 +676,7 @@ fn scripted(
     let (audio, opened) = audio_side::spawn(
         move || {
             let out = dev::recording_output(clock, 60);
-            let queued = out.queued_periods();
-            Ok((out, Some(queued), Some(audio::MAX_QUEUE_PERIODS)))
+            Ok((out, Some(audio::MAX_QUEUE_PERIODS)))
         },
         dev::report_audio,
     )?;

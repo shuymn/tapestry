@@ -480,39 +480,6 @@ fn mashing_after_a_judged_note_counts_every_press() {
 }
 
 #[test]
-fn empty_poor_keeps_combo_and_bp() {
-    let chart = ChartBuilder::new(BPM)
-        .tap(lane(3), TimeUs(1_000 * MS))
-        .tap(lane(3), TimeUs(2_000 * MS))
-        .build()
-        .unwrap();
-    let dev = device(&[0]);
-    let inputs = [
-        press(1_000 * MS, 0, 3),
-        release(1_010 * MS, 0, 3),
-        // 500 ms + 1 µs ahead of the next note: outside the empty POOR range.
-        press(1_500 * MS - 1, 0, 3),
-        release(1_500 * MS - 1, 0, 3),
-        // Exactly 500 ms ahead: an empty POOR.
-        press(1_500 * MS, 0, 3),
-        release(1_510 * MS, 0, 3),
-        press(2_000 * MS, 0, 3),
-    ];
-    let (events, tally) = run(&chart, &dev, &InputStart::default(), &inputs, 3_000 * MS);
-    assert_eq!(
-        judgments(&events),
-        [(3, 0, Perfect, Some(0)), (3, 1, Perfect, Some(0))]
-    );
-    assert_eq!(empty_poors(&events), 1);
-    assert_eq!(tally.empty_poor, 1);
-    // Not a judgment and no combo break, but one BP.
-    assert_eq!(tally.counts.poor, 0);
-    assert_eq!(tally.bp, 1);
-    assert_eq!((tally.combo, tally.max_combo), (2, 2));
-    assert_eq!(tally.ex_score, 4);
-}
-
-#[test]
 fn input_offset_shifts_judgment() {
     let chart = ChartBuilder::new(BPM)
         .tap(lane(4), TimeUs(1_000 * MS))

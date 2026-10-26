@@ -337,20 +337,17 @@ fn room(queue: u32, padding: u32, period: u32) -> u32 {
     queue.saturating_sub(padding) / period * period
 }
 
-/// Whether to give up `IAudioClient3`'s stream for `IAudioClient` at the
-/// default period with a wider buffer: its buffer holds fewer than
-/// [`MAX_QUEUE_PERIODS`] of its periods and its shortest period is the
-/// default, so the shorter period it exists for is not there to lose.
-fn widen(periods: &EnginePeriods, buffer: u32, period: u32) -> bool {
-    buffer_periods(buffer, period) < MAX_QUEUE_PERIODS && periods.min >= periods.default
-}
-
 /// The opening decision once `IAudioClient3` initialized a stream at
 /// `period` frames with a `buffer`-frame buffer, having offered `offered`:
 /// `Some(period)` to reopen through `IAudioClient` at that same period with
-/// a wider buffer ([`widen`]), `None` to keep the stream.
+/// a wider buffer, `None` to keep the stream. It reopens when the buffer
+/// holds fewer than [`MAX_QUEUE_PERIODS`] periods and the shortest period
+/// is the default, so the shorter period `IAudioClient3` exists for is not
+/// there to lose.
 fn reopen_wider(offered: Option<EnginePeriods>, period: u32, buffer: u32) -> Option<u32> {
-    offered.filter(|p| widen(p, buffer, period)).map(|_| period)
+    offered
+        .filter(|p| buffer_periods(buffer, period) < MAX_QUEUE_PERIODS && p.min >= p.default)
+        .map(|_| period)
 }
 
 /// The buffer to ask `IAudioClient::Initialize` for, 100 ns units:

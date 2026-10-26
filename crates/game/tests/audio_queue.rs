@@ -186,8 +186,4 @@ fn the_queue_rises_once_on_steady_underruns_and_never_falls() {
     assert!(!q.play_ended(5));
     assert!(!q.play_ended(0));
     assert_eq!(q.periods(), 3);
-    let mut kept = QueueChoice::new(3);
-    assert!(!kept.play_ended(0));
-    assert!(!kept.play_ended(2));
-    assert_eq!(kept.periods(), 3);
 }

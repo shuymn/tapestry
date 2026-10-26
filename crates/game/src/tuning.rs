@@ -133,22 +133,17 @@ impl Tuning {
     /// between two of its steps.
     #[must_use]
     pub fn adjust(self, adjust: Adjust) -> Self {
-        let steps = VISIBLE_TIME_STEPS_MS;
+        let steps = &VISIBLE_TIME_STEPS_MS;
         let offset = |us: i64| us.clamp(-OFFSET_LIMIT_US, OFFSET_LIMIT_US);
         let mut t = self;
         match adjust {
             Adjust::HiSpeedDown => {
-                t.visible_time_ms = steps
-                    .into_iter()
-                    .find(|&ms| ms > t.visible_time_ms)
-                    .unwrap_or(steps[steps.len() - 1]);
+                let next = steps.partition_point(|&ms| ms <= t.visible_time_ms);
+                t.visible_time_ms = steps.get(next).copied().unwrap_or(steps[steps.len() - 1]);
             }
             Adjust::HiSpeedUp => {
-                t.visible_time_ms = steps
-                    .into_iter()
-                    .rev()
-                    .find(|&ms| ms < t.visible_time_ms)
-                    .unwrap_or(steps[0]);
+                let below = steps.partition_point(|&ms| ms < t.visible_time_ms);
+                t.visible_time_ms = below.checked_sub(1).map_or(steps[0], |i| steps[i]);
             }
             Adjust::VolumeDown => {
                 t.volume_percent = t.volume_percent.saturating_sub(VOLUME_STEP_PERCENT);

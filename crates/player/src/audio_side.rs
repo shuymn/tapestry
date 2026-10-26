@@ -58,9 +58,9 @@ impl AudioLink {
     }
 }
 
-/// Starts the audio thread: `open` makes the output on it, with the
-/// periods it keeps queued and the most it can, if it says. `done` sees
-/// the output when the thread ends.
+/// Starts the audio thread: `open` makes the output on it, with the most
+/// periods its queue holds, if it says. `done` sees the output when the
+/// thread ends.
 ///
 /// # Errors
 ///
@@ -68,7 +68,7 @@ impl AudioLink {
 pub fn spawn<O, F, D>(open: F, done: D) -> Result<(AudioThread, Opened), String>
 where
     O: AudioOutput,
-    F: FnOnce() -> Result<(O, Option<u32>, Option<u32>), String> + Send + 'static,
+    F: FnOnce() -> Result<(O, Option<u32>), String> + Send + 'static,
     D: FnOnce(&O) + Send + 'static,
 {
     let (worker_tx, worker_rx) = mpsc::sync_channel::<AudioWorker>(1);
@@ -78,7 +78,7 @@ where
         .spawn(move || {
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Audio);
-            let (mut out, queued_periods, most_queued_periods) = match open() {
+            let (mut out, most_queued_periods) = match open() {
                 Ok(out) => out,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -88,7 +88,7 @@ where
             let _ = ready_tx.send(Ok(Opened {
                 rate: out.rate(),
                 period: out.period(),
-                queued_periods,
+                queued_periods: out.queue_periods(),
                 most_queued_periods,
             }));
             if let Ok(mut worker) = worker_rx.recv() {
