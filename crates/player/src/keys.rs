@@ -69,6 +69,10 @@ fn refusal(r: Refusal) -> String {
         Refusal::NothingToKeep(r) => {
             format!("{} HAS NO BINDING TO KEEP: PRESS A CONTROL", role(r))
         }
+        Refusal::OtherController => "ANOTHER CONTROLLER IS BOUND: USE THE SAME ONE".to_owned(),
+        Refusal::UnknownController => {
+            "THIS CONTROLLER CANNOT BE TOLD APART: PRESS ANOTHER".to_owned()
+        }
     }
 }
 
@@ -210,6 +214,7 @@ pub fn run(
     let current = KeyConfigs {
         keyboard: device.keyboard.clone(),
         controller: device.controller.clone(),
+        controller_device: device.controller_device.map(Into::into),
     };
     let end = capture_keys(&capture, &mut screen, current);
     drop(screen);
@@ -221,6 +226,7 @@ pub fn run(
         KeyConfigEnd::Done(keys, widened) => {
             device.keyboard = keys.keyboard;
             device.controller = keys.controller;
+            device.controller_device = keys.controller_device.map(Into::into);
             if let Some(wrap) = widened {
                 device.scratch.wrap = Some(wrap);
                 println!(
@@ -252,13 +258,25 @@ mod tests {
                 retry: None,
                 quit: None,
             },
+            controller_device: None,
         });
         let pad = Bound {
             kind: DeviceKind::Controller,
             control: 12,
         };
+        let model = Some(input::hid::HidProduct {
+            vendor_id: 0x1A2B,
+            product_id: 0x3C4D,
+            interface: None,
+        });
+        // A controller that cannot be told apart is refused.
         flow.press(pad);
-        flow.press(pad);
+        assert_eq!(
+            lines(&flow)[3],
+            "THIS CONTROLLER CANNOT BE TOLD APART: PRESS ANOTHER"
+        );
+        flow.press_from(pad, model);
+        flow.press_from(pad, model);
         let l = lines(&flow);
         assert_eq!(
             l[2],
@@ -282,7 +300,7 @@ mod tests {
                 control: k,
             });
         }
-        flow.press(pad);
+        flow.press_from(pad, model);
         let l = lines(&flow);
         assert_eq!(l[2], "PRESS THE KEYBOARD KEY FOR RETRY");
         assert_eq!(l[3], "RETRY TAKES KEYBOARD KEYS ONLY: PRESS A KEY");
@@ -297,6 +315,7 @@ mod tests {
                 retry: None,
                 quit: None,
             },
+            controller_device: None,
         });
         assert_eq!(
             lines(&flow)[2],

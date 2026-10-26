@@ -11,7 +11,7 @@ use game::{
     Bound, DeviceSettings, KeyConfig, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError, KeyScreen,
     LaneKey, Press, Refusal, Role, capture_keys, capture_keys_within,
 };
-use input::hid::axis_cap;
+use input::hid::{HidProduct, axis_cap};
 use input::{Capture, DeviceId, DeviceKind, Packet};
 
 /// One step of the script: a packet offered (kind, control, pressed,
@@ -33,6 +33,25 @@ const AXIS: u32 = 0x1_0030;
 
 const KB: DeviceKind = DeviceKind::Keyboard;
 const PAD: DeviceKind = DeviceKind::Controller;
+
+/// The model of the controller the script presses.
+const MODEL_A: HidProduct = HidProduct {
+    vendor_id: 0x1A2B,
+    product_id: 0x3C4D,
+    interface: Some(2),
+};
+/// Another model.
+const MODEL_B: HidProduct = HidProduct {
+    vendor_id: 0x5E6F,
+    product_id: 0x7081,
+    interface: None,
+};
+/// The model the current key configs belong to.
+const MODEL_C: HidProduct = HidProduct {
+    vendor_id: 0x92A3,
+    product_id: 0xB4C5,
+    interface: Some(5),
+};
 
 fn key(control: u32) -> Step {
     Offer(KB, control, true, false)
@@ -84,7 +103,12 @@ impl KeyScreen for Scripted {
                     value: i32::from(pressed),
                     background: false,
                 };
-                self.capture.offer(&packet, kind, recording);
+                match kind {
+                    KB => self.capture.offer(&packet, kind, recording),
+                    PAD => self
+                        .capture
+                        .offer_controller(&packet, Some(MODEL_A), recording),
+                }
             }
             Some(Turn) => {
                 let packet = Packet {
@@ -93,7 +117,7 @@ impl KeyScreen for Scripted {
                     value: 1,
                     background: false,
                 };
-                self.capture.offer(&packet, PAD, false);
+                self.capture.offer_controller(&packet, Some(MODEL_A), false);
             }
             Some(Report(value)) => {
                 // Declared -127..=127 in 8 bits.
@@ -126,6 +150,7 @@ fn current() -> KeyConfigs {
             retry: None,
             quit: None,
         },
+        controller_device: Some(MODEL_C),
     }
 }
 
@@ -133,7 +158,23 @@ fn run(steps: &[Step]) -> (KeyConfigEnd, Scripted) {
     let capture = Capture::new();
     let mut screen = Scripted::new(&capture, steps);
     let end = capture_keys(&capture, &mut screen, current());
+    if let KeyConfigEnd::Done(keys, _) = &end {
+        saves(keys);
+    }
     (end, screen)
+}
+
+/// A finished key config, written to `device.toml` as `tapestry keys`
+/// writes it, is one the player accepts.
+#[track_caller]
+fn saves(keys: &KeyConfigs) {
+    let device = DeviceSettings {
+        keyboard: keys.keyboard.clone(),
+        controller: keys.controller.clone(),
+        controller_device: keys.controller_device.map(Into::into),
+        ..DeviceSettings::default()
+    };
+    assert_eq!(device.validate(), Ok(()), "{keys:?}");
 }
 
 /// Each prompt binds the next press, of a keyboard or a controller for a
@@ -197,6 +238,7 @@ fn key_config_capture_binds_next_press() {
                     retry: None,
                     quit: None,
                 },
+                controller_device: Some(MODEL_A),
             },
             None
         )
@@ -291,8 +333,10 @@ fn keep_keeps_the_current_bindings() {
     let Press::Done(keys) = flow.press(keep) else {
         panic!("not done");
     };
+    saves(&keys);
     assert_eq!(keys.keyboard, DeviceSettings::default().keyboard);
     assert_eq!(keys.controller, current().controller);
+    assert_eq!(keys.controller_device, Some(MODEL_C));
     // Done stays done.
     assert_eq!(flow.press(kb(0x30)), Press::Done(keys));
 
@@ -304,6 +348,7 @@ fn keep_keeps_the_current_bindings() {
             quit: None,
         },
         controller: current().controller,
+        controller_device: current().controller_device,
     });
     assert_eq!(
         flow.press(keep),
@@ -337,8 +382,121 @@ fn keep_keeps_the_current_bindings() {
     let Press::Done(keys) = flow.press(keep) else {
         panic!("not done");
     };
+    saves(&keys);
     assert_eq!((keys.controller.retry, keys.controller.quit), (None, None));
     assert_eq!(keys.keyboard.quit, Some(0x01));
+}
+
+/// The controller key config belongs to one controller: once a control
+/// of one model is bound, a control of another model is refused, and so is
+/// keeping current controller bindings of another model; a keyboard key
+/// still binds. The result names the model; with no controller binding
+/// it names none.
+#[test]
+fn controller_bindings_belong_to_one_controller() {
+    let pad = |control| Bound { kind: PAD, control };
+    let kb = |control| Bound { kind: KB, control };
+    let keep = kb(game::KEEP_KEY);
+    let mut flow = KeyConfigFlow::new(current());
+    assert!(matches!(
+        flow.press_from(pad(5), Some(MODEL_A)),
+        Press::Bound(..)
+    ));
+    assert_eq!(
+        flow.press_from(pad(6), Some(MODEL_B)),
+        Press::Refused(Refusal::OtherController)
+    );
+    assert_eq!(
+        flow.press_from(pad(6), None),
+        Press::Refused(Refusal::UnknownController)
+    );
+    // The scratch's other direction: keeping skips it.
+    assert!(matches!(flow.press(keep), Press::Bound(..)));
+    // Key 1: keeping the current bindings is fine without a controller
+    // binding among them.
+    assert!(matches!(flow.press(keep), Press::Bound(..)));
+    assert_eq!(flow.refused(), None);
+    for control in [0x1f, 0x2d, 0x20, 0x2e, 0x21] {
+        assert!(matches!(flow.press(kb(control)), Press::Bound(..)));
+    }
+    assert!(matches!(
+        flow.press_from(pad(7), Some(MODEL_A)),
+        Press::Bound(..)
+    ));
+    assert!(matches!(flow.press(keep), Press::Bound(..)));
+    let Press::Done(keys) = flow.press(keep) else {
+        panic!("not done");
+    };
+    saves(&keys);
+    assert_eq!(keys.controller_device, Some(MODEL_A));
+    assert_eq!(keys.controller.lanes.len(), 2);
+
+    // Current key configs binding key 1 to control 22 of model C: after
+    // a control of model A, keeping key 1 is refused.
+    let mut flow = KeyConfigFlow::new(KeyConfigs {
+        keyboard: current().keyboard,
+        controller: KeyConfig {
+            lanes: vec![LaneKey {
+                control: 22,
+                lane: 1,
+            }],
+            retry: None,
+            quit: None,
+        },
+        controller_device: Some(MODEL_C),
+    });
+    assert!(matches!(
+        flow.press_from(pad(5), Some(MODEL_A)),
+        Press::Bound(..)
+    ));
+    assert_eq!(flow.press(keep), Press::Bound(Role::Lane(0), Vec::new()));
+    assert_eq!(flow.press(keep), Press::Refused(Refusal::OtherController));
+
+    // Keyboard keys only: no model.
+    let mut flow = KeyConfigFlow::new(current());
+    for control in 0x10..=0x19 {
+        assert!(matches!(flow.press(kb(control)), Press::Bound(..)));
+    }
+    let Press::Done(keys) = flow.press(keep) else {
+        panic!("not done");
+    };
+    saves(&keys);
+    assert!(keys.controller.lanes.is_empty());
+    assert_eq!(keys.controller_device, None);
+}
+
+/// Current controller bindings that name no controller (a file written
+/// before, or by hand) cannot be kept: F12 on every role would otherwise
+/// write a `device.toml` the player refuses. Pressing the role's controls
+/// again finishes a key config the player accepts.
+#[test]
+fn controller_bindings_without_a_controller_are_not_kept() {
+    let unnamed = KeyConfigs {
+        controller_device: None,
+        ..current()
+    };
+    let kb = |control| Bound { kind: KB, control };
+    let keep = kb(game::KEEP_KEY);
+    let mut flow = KeyConfigFlow::new(unnamed);
+    assert_eq!(flow.press(keep), Press::Refused(Refusal::UnknownController));
+    assert!(matches!(
+        flow.press_from(
+            Bound {
+                kind: PAD,
+                control: 21
+            },
+            Some(MODEL_B)
+        ),
+        Press::Bound(..)
+    ));
+    for _ in 0..10 {
+        if let Press::Done(keys) = flow.press(keep) {
+            saves(&keys);
+            assert_eq!(keys.controller_device, Some(MODEL_B));
+            return;
+        }
+    }
+    panic!("not done");
 }
 
 /// F12 for every role after the scratch: keep the current bindings.
@@ -351,6 +509,9 @@ fn run_within(steps: &[Step], limit: Duration) -> (KeyConfigEnd, Scripted) {
     let capture = Capture::new();
     let mut screen = Scripted::new(&capture, steps);
     let end = capture_keys_within(&capture, &mut screen, current(), limit);
+    if let KeyConfigEnd::Done(keys, _) = &end {
+        saves(keys);
+    }
     (end, screen)
 }
 
@@ -456,9 +617,15 @@ fn a_button_or_key_scratch_is_asked_for_both_directions() {
         kind: PAD,
         control: 40,
     };
-    assert_eq!(flow.press(b), Press::Bound(Role::Lane(0), vec![b]));
+    assert_eq!(
+        flow.press_from(b, Some(MODEL_A)),
+        Press::Bound(Role::Lane(0), vec![b])
+    );
     assert!(flow.other_direction());
-    assert!(matches!(flow.press(b), Press::Refused(_)));
+    assert!(matches!(
+        flow.press_from(b, Some(MODEL_A)),
+        Press::Refused(Refusal::Key(_))
+    ));
     assert!(flow.other_direction());
 }
 
@@ -478,7 +645,10 @@ fn the_overlay_key_is_refused_for_either_scratch_direction() {
         kind: PAD,
         control: 40,
     };
-    assert!(matches!(flow.press(b), Press::Bound(..)));
+    assert!(matches!(
+        flow.press_from(b, Some(MODEL_A)),
+        Press::Bound(..)
+    ));
     assert!(flow.other_direction());
     assert_eq!(flow.press(f9), refused);
     assert!(flow.other_direction());

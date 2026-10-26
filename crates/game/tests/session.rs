@@ -1270,14 +1270,62 @@ fn plan_sizes_axes_at_1khz_and_buttons_per_source() {
         ..Parts::standard(&root, &settings.player)
     };
     let loaded = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap();
-    // The keyboard records its 8 lanes, retry and quit: 10 buttons, capped
-    // at 240 edges a second together. The controller records a button (60)
-    // and an axis (1000 reports a second). Over 3 s.
-    let plan = loaded
-        .plan(&[DeviceKind::Keyboard, DeviceKind::Controller], &[])
-        .unwrap();
+    // The keyboard records its 8 lanes, capped at 240 edges a second
+    // together, and retry and quit, a press and a release each in all. The
+    // controller records a button (60) and the axis it declares (1000
+    // reports a second). Over 3 s.
+    let kinds = [DeviceKind::Keyboard, DeviceKind::Controller];
+    let plan = loaded.plan(&kinds, &[vec![], vec![x_axis()]]).unwrap();
     assert_eq!(plan.device.sources[1].axes.len(), 1);
-    assert_eq!(plan.logic.inputs, 3 * (240 + 60 + 1000));
+    assert_eq!(plan.logic.inputs, 3 * (240 + 60 + 1000) + 2 * 2);
+    // An axis the controller does not declare is never read: no room.
+    let plan = loaded.plan(&kinds, &[]).unwrap();
+    assert_eq!(plan.logic.inputs, 3 * (240 + 60) + 2 * 2);
+}
+
+/// The X axis, declared absolute 0..=255 in 8 bits.
+fn x_axis() -> input::hid::AxisCap {
+    input::hid::axis_cap(ControlId(0x1_0030), true, 0, 255, 8).unwrap()
+}
+
+#[test]
+fn keyboards_bound_only_to_retry_and_quit_add_no_rate() {
+    let (_dir, root) = temp_root();
+    // The controller plays: 7 buttons (min(7 × 60, 240) = 240 edges a
+    // second) and the axis (1000 reports a second). Keyboards bind only
+    // retry and quit: a press and a release each per keyboard, whatever
+    // the window's length.
+    let window = |chart: Chart, keyboards: usize| {
+        let mut settings = Settings::load(&root).unwrap();
+        settings.device.keyboard.lanes = Vec::new();
+        settings.device.controller.lanes = (1..=7)
+            .map(|lane| game::LaneKey {
+                control: u32::from(lane),
+                lane,
+            })
+            .chain([game::LaneKey {
+                control: 0x1_0030,
+                lane: 0,
+            }])
+            .collect();
+        let parts = Parts {
+            ingest: Box::new(Built(chart)),
+            ..Parts::standard(&root, &settings.player)
+        };
+        let loaded =
+            Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap();
+        let mut kinds = vec![DeviceKind::Controller];
+        kinds.extend(vec![DeviceKind::Keyboard; keyboards]);
+        let mut axes = vec![vec![x_axis()]];
+        axes.extend(vec![vec![]; keyboards]);
+        loaded.plan(&kinds, &axes).unwrap().logic.inputs
+    };
+    // Final deadline 1.18 s, 3 whole seconds with the lead-in; 100.18 s,
+    // 102 whole seconds.
+    assert_eq!(window(taps(&[(1, 1_000)]), 1), 3 * 1240 + 4);
+    assert_eq!(window(taps(&[(1, 1_000)]), 14), 3 * 1240 + 14 * 4);
+    assert_eq!(window(taps(&[(1, 100_000)]), 1), 102 * 1240 + 4);
+    assert_eq!(window(taps(&[(1, 100_000)]), 14), 102 * 1240 + 14 * 4);
 }
 
 /// A loaded session of `chart` whose controller binds `axes` axes.
@@ -1304,25 +1352,27 @@ fn a_play_too_long_to_record_is_refused_before_it_starts() {
     // controller's axis 1000 reports.
     let loaded = loaded_with_axes(&root, taps(&[(1, 900_000)]), 1);
     let both = [DeviceKind::Keyboard, DeviceKind::Controller];
-    let err = loaded.plan(&both, &[]).unwrap_err();
+    let axes = [vec![], vec![x_axis()]];
+    let err = loaded.plan(&both, &axes).unwrap_err();
     let device = DeviceSettings {
         controller: loaded.settings().device.controller.clone(),
         ..DeviceSettings::default()
     }
-    .profile(&both, &[]);
+    .profile(&both, &axes);
     let allowed = game::Reservation::of(loaded.chart(), loaded.preset(), &device, config().effects)
         .unwrap()
         .capacity();
     assert_eq!(
         err,
         game::LogicError::RecordingTooLarge {
-            needed: 902 * (240 + 1000),
+            needed: 902 * (240 + 1000) + 2 * 2,
             allowed,
         }
     );
-    // The keyboard alone fits: its 902 × 240 inputs are reserved whole.
+    // The keyboard alone fits: its 902 × 240 + 4 inputs are reserved
+    // whole.
     let plan = loaded.plan(&[DeviceKind::Keyboard], &[]).unwrap();
-    assert_eq!(plan.logic.inputs, 902 * 240);
+    assert_eq!(plan.logic.inputs, 902 * 240 + 4);
 }
 
 #[test]

@@ -23,7 +23,7 @@ use input::{QpcClock, SourceReader};
 use crate::audio_side::AudioLink;
 use crate::controls::Controls;
 use crate::end_screen::{self, Hints, LoadTimes, QueueLine};
-use crate::input_side::{InputLink, Request};
+use crate::input_side::{InputLink, Recorded, Request};
 use crate::measure::{
     Figures, PlayMeasure, Step, StepSample, judgment_samples, measure_path, to_toml,
 };
@@ -50,8 +50,8 @@ pub struct PlayerRig<'a> {
     pub controls: &'a Controls,
     /// The clock, started with the process.
     pub clock: QpcClock,
-    /// The controls recorded from keyboards and from controllers.
-    pub recorded: (Vec<eval::ControlId>, Vec<eval::ControlId>),
+    /// What each play records.
+    pub recorded: Recorded,
     /// The gauge to show.
     pub gauge: usize,
     /// The countdown's length.
@@ -316,8 +316,7 @@ impl Rig for PlayerRig<'_> {
         self.input.open(Request::Open {
             lead_in,
             logic: thread::current(),
-            keyboard: self.recorded.0.clone(),
-            controller: self.recorded.1.clone(),
+            recorded: self.recorded.clone(),
         })
     }
 

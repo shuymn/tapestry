@@ -8,16 +8,16 @@
 //! the key config's [`Capture`].
 //!
 //! Windows exposes each top-level collection of a controller as a device
-//! of its own. The collections of one physical controller share one
-//! [`DeviceId`], so they are one source owning its buttons and axes alike
-//! (stage1.md D6); each collection's controls carry its collection number
+//! of its own. The collections of one function of a physical controller
+//! share one [`DeviceId`] ([`place_collection`]), so they are one source
+//! owning its buttons and axes alike (stage1.md D6); each collection's controls carry its collection number
 //! ([`in_collection`]), so they stay distinct within the source.
 
 use eval::ControlId;
 
 use crate::capture::Capture;
 use crate::gate::{DeviceId, Packet};
-use crate::sources::{DeviceKind, SourceSet};
+use crate::sources::SourceSet;
 
 /// The HID usage page of buttons.
 pub const BUTTON_PAGE: u16 = 0x09;
@@ -158,16 +158,125 @@ pub fn widened_wrap(cap: &AxisCap, lo: i32, hi: i32) -> Option<u32> {
 /// in its interface path (`&Col02` is 2), or 0 when the path has none.
 #[must_use]
 pub fn collection_of(path: &[u16]) -> u8 {
+    hex_after(path, b"&col").unwrap_or(0)
+}
+
+/// The interface number of a composite device's function in its interface
+/// path (`&MI_01` is 1), or `None` when the path has none.
+#[must_use]
+pub fn interface_of(path: &[u16]) -> Option<u8> {
+    hex_after(path, b"&mi_")
+}
+
+/// The interface path a device-name read left in `buf`: the characters
+/// before its first nul; `None` without one. A buffer reused for several
+/// reads holds the rest of a longer earlier path after that nul.
+#[must_use]
+pub fn until_nul(buf: &[u16]) -> Option<&[u16]> {
+    let len = buf.iter().position(|&c| c == 0)?;
+    Some(&buf[..len])
+}
+
+/// Which group of collections a controller collection's source is: the
+/// physical device's container and the function's interface number, so a
+/// source never holds two functions of a composite device.
+pub type Group = (u128, Option<u8>);
+
+/// Where a newly found controller collection goes ([`place_collection`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    /// The group whose source it joins; `None`: a source of its own.
+    pub group: Option<Group>,
+    /// Its collection number ([`collection_of`]); 0 when its path is
+    /// unknown.
+    pub collection: u8,
+    /// Its product; `None` when its path or its ids are unknown, so key
+    /// config can never bind it to an identity that may later not match.
+    pub product: Option<HidProduct>,
+}
+
+/// Places a controller collection whose interface path is `path` (`None`
+/// when it could not be read), whose physical device's container is
+/// `container` (`None` when unknown or none), and whose device declares
+/// the vendor and product ids `ids`, beside the collections `connected`
+/// already has, each as its group and collection number. The collection
+/// number and the interface number come from `path` alone. It joins the
+/// source of its group, the container and the interface, unless a
+/// collection of that group with its number is connected already: then
+/// it keeps a source of its own.
+pub fn place_collection(
+    path: Option<&[u16]>,
+    container: Option<u128>,
+    ids: Option<(u16, u16)>,
+    connected: impl IntoIterator<Item = (Option<Group>, u8)>,
+) -> Placement {
+    let Some(path) = path else {
+        return Placement {
+            group: None,
+            collection: 0,
+            product: None,
+        };
+    };
+    let collection = collection_of(path);
+    let interface = interface_of(path);
+    let group = container.map(|c| (c, interface));
+    let taken = group.is_some_and(|g| {
+        connected
+            .into_iter()
+            .any(|(other, number)| other == Some(g) && number == collection)
+    });
+    Placement {
+        group: group.filter(|_| !taken),
+        collection,
+        product: ids.map(|(vendor_id, product_id)| HidProduct {
+            vendor_id,
+            product_id,
+            interface,
+        }),
+    }
+}
+
+/// The source of the collections of `group`: one per function of a
+/// physical device. Handles are pointers, below 2^63; these ids are
+/// above.
+#[must_use]
+pub const fn group_device(group: Group) -> DeviceId {
+    let (container, interface) = group;
+    let function = match interface {
+        Some(i) => (i as u64 + 1) << 48,
+        None => 0,
+    };
+    DeviceId((container as u64 ^ (container >> 64) as u64 ^ function) | 1 << 63)
+}
+
+/// The two hex digits after the first `marker` (lowercase ASCII) in
+/// `path`, matched without case.
+fn hex_after(path: &[u16], marker: &[u8]) -> Option<u8> {
     let lower = |c: u16| u8::try_from(c).map_or(0, |b| b.to_ascii_lowercase());
-    let marker = b"&col";
     path.windows(marker.len() + 2)
         .find(|w| w.iter().zip(marker).all(|(&c, &m)| lower(c) == m))
         .and_then(|w| {
             let hex = |c: u16| char::from(lower(c)).to_digit(16);
-            Some(hex(w[4])? * 16 + hex(w[5])?)
+            Some(hex(w[marker.len()])? * 16 + hex(w[marker.len() + 1])?)
         })
         .and_then(|n| u8::try_from(n).ok())
-        .unwrap_or(0)
+}
+
+/// Which function of which model a controller collection is: the vendor
+/// and product ids its device declares, and the interface number of the
+/// function it belongs to on a composite device. It is the same in every
+/// USB port and after replugging, and it names no single unit, so two
+/// controllers of one model share it. Key config binds a controller's
+/// controls to it; it never enters the input log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HidProduct {
+    /// The vendor id.
+    pub vendor_id: u16,
+    /// The product id.
+    pub product_id: u16,
+    /// The interface number ([`interface_of`]); `None` for a device that
+    /// is not composite.
+    pub interface: Option<u8>,
 }
 
 /// What a collection's axis is.
@@ -260,6 +369,8 @@ pub struct HidDevice {
     travel: [i64; MAX_AXES],
     /// The capture's arming the travel counts from.
     armed: u64,
+    /// The collection's product, offered with its captures.
+    product: Option<HidProduct>,
 }
 
 impl HidDevice {
@@ -287,7 +398,15 @@ impl HidDevice {
             values: [None; MAX_AXES],
             travel: [0; MAX_AXES],
             armed: 0,
+            product: None,
         }
+    }
+
+    /// Sets the collection's product, which key config captures it with.
+    #[must_use]
+    pub const fn with_product(mut self, product: Option<HidProduct>) -> Self {
+        self.product = product;
+        self
     }
 
     /// The device, shared by the controller's collections.
@@ -335,6 +454,7 @@ impl HidDevice {
             sources.background();
         }
         let recording = sources.is_recording();
+        let product = self.product;
         let (device, collection) = (self.device, self.collection);
         let packet = |control, value| Packet {
             device,
@@ -356,7 +476,7 @@ impl HidDevice {
                 changed &= changed - 1;
                 let usage = u16::try_from(bit + 1).unwrap_or(MAX_BUTTON);
                 let p = packet(button_control(usage), i32::from(now >> bit & 1 == 1));
-                capture.offer(&p, DeviceKind::Controller, recording);
+                capture.offer_controller(&p, product, recording);
                 sources.packet(&p);
             }
         }
@@ -397,7 +517,7 @@ impl HidDevice {
             if travel.abs() >= capture_travel(&cap) {
                 *travel = 0;
                 let offer = Packet { value: 1, ..p };
-                capture.offer(&offer, DeviceKind::Controller, recording);
+                capture.offer_controller(&offer, product, recording);
             }
         }
     }
@@ -415,12 +535,14 @@ pub trait CollectionSlot {
     fn free(&mut self);
 }
 
-/// The collection `key` was removed. Its whole physical device leaves:
-/// every slot of it is freed, its cached button and position state
-/// dropped, and its source disconnected, releasing everything it held as
-/// any disconnect does. The device comes back only through fresh
-/// discovery of its collections, as a new device with empty state, like a
-/// first connection. Returns `false` when no slot reads `key`.
+/// The collection `key` was removed. Its source leaves, the function of
+/// the physical device it belongs to ([`place_collection`]): every slot of
+/// it is freed, its cached button and position state dropped, and its
+/// source disconnected, releasing everything it held as any disconnect
+/// does. Another function of the device stays. The function comes back
+/// only through fresh discovery of its collections, as a new device with
+/// empty state, like a first connection. Returns `false` when no slot
+/// reads `key`.
 pub fn remove_collection<S: CollectionSlot>(
     slots: &mut [S],
     key: u64,

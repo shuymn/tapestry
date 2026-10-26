@@ -17,6 +17,7 @@ use std::thread::Thread;
 use bms_model::TimeUs;
 use eval::ControlId;
 use game::{Closing, Opening};
+use input::hid::HidProduct;
 use input::{DeviceId, DeviceKind, SourceReader, SourceSet};
 
 use crate::controls::Controls;
@@ -30,13 +31,23 @@ pub enum Request {
         lead_in: TimeUs,
         /// The thread to wake after each publication.
         logic: Thread,
-        /// The controls recorded from keyboards and from controllers.
-        keyboard: Vec<ControlId>,
-        /// See `keyboard`.
-        controller: Vec<ControlId>,
+        /// What the play records.
+        recorded: Recorded,
     },
     /// Close recording at the next boundary.
     Close,
+}
+
+/// What a play records, from the key configs.
+#[derive(Clone, Debug)]
+pub struct Recorded {
+    /// The controls recorded from every keyboard.
+    pub keyboard: Vec<ControlId>,
+    /// The controls recorded from the controller.
+    pub controller: Vec<ControlId>,
+    /// The controller they belong to; `None` when no controller binds a
+    /// lane.
+    pub controller_device: Option<HidProduct>,
 }
 
 /// The input thread's answers.
@@ -175,9 +186,8 @@ impl Hook {
                 Request::Open {
                     lead_in,
                     logic,
-                    keyboard,
-                    controller,
-                } => Reply::Opened(self.open(sources, now, lead_in, logic, &keyboard, &controller)),
+                    recorded,
+                } => Reply::Opened(self.open(sources, now, lead_in, logic, &recorded)),
                 Request::Close => Reply::Closed(self.close(sources)),
             };
             // Published before the reply, so the game thread never reads
@@ -212,22 +222,27 @@ impl Hook {
         now: TimeUs,
         lead_in: TimeUs,
         logic: Thread,
-        keyboard: &[ControlId],
-        controller: &[ControlId],
+        recorded: &Recorded,
     ) -> Opening<SourceReader> {
         let origin = TimeUs(now.0 + lead_in.0);
         let start = match &mut self.mode {
             Mode::Clock => {
-                let devices: Vec<_> = sources.devices().collect();
-                for (d, kind) in devices {
-                    let list = match kind {
-                        DeviceKind::Keyboard => keyboard,
-                        DeviceKind::Controller => controller,
-                    };
-                    sources.set_recorded(d, list.to_vec());
+                if !take_part(sources, recorded) {
+                    eprintln!(
+                        "input: the controller set up in `tapestry keys` is not connected; this play uses the keyboard bindings only"
+                    );
                 }
                 reset_gate(sources, &self.controls);
-                sources.open_play(now, origin)
+                let start = sources.open_play(now, origin);
+                // Devices the source limit left out: keyboards, when any
+                // is (controllers come first), possibly one with lanes.
+                let n = sources.left_out();
+                if n > 0 {
+                    eprintln!(
+                        "input: {n} connected device(s) take no part in this play: more devices than sources; a keyboard left out records nothing, and the log is marked incomplete"
+                    );
+                }
+                start
             }
             #[cfg(feature = "dev-tools")]
             Mode::Script(script) => {
@@ -282,11 +297,200 @@ impl Hook {
     }
 }
 
+/// Sets what each connected device records and whether it takes part:
+/// every keyboard records the keyboard controls, and the first controller
+/// of the configured model ([`Recorded::controller_device`]) the
+/// controller's; any other controller, a second of that model included,
+/// takes no part. Returns `false` when a controller is configured and none
+/// of its model is connected.
+fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
+    let devices: Vec<_> = sources.devices().collect();
+    let mut matched = false;
+    for (d, kind) in devices {
+        let (list, takes_part) = match kind {
+            DeviceKind::Keyboard => (&recorded.keyboard, true),
+            DeviceKind::Controller => {
+                let mine = !matched
+                    && recorded
+                        .controller_device
+                        .is_some_and(|p| sources.has_product(d, p));
+                matched |= mine;
+                (&recorded.controller, mine)
+            }
+        };
+        sources.set_recorded(d, list.clone());
+        sources.set_takes_part(d, takes_part);
+    }
+    matched || recorded.controller_device.is_none()
+}
+
 /// Opens the gate for a new play; a window without focus latches it again
 /// at once, so a play never records while the game is in the background.
 fn reset_gate(sources: &mut SourceSet, controls: &Controls) {
     sources.gate_mut().reset();
     if !controls.focused() {
         sources.gate().latch();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bms_model::TimeUs;
+    use eval::ControlId;
+    use input::hid::HidProduct;
+    use input::{DeviceId, DeviceKind, Packet, SourceConfig, SourceSet};
+
+    use super::{Recorded, take_part};
+
+    /// The configured controller: function 1 of a composite device.
+    const CONFIGURED: HidProduct = HidProduct {
+        vendor_id: 0x1A2B,
+        product_id: 0x3C4D,
+        interface: Some(1),
+    };
+    /// Function 0 of the same device: the same ids and, here, the same
+    /// control numbers, another interface.
+    const OTHER_FUNCTION: HidProduct = HidProduct {
+        interface: Some(0),
+        ..CONFIGURED
+    };
+    /// Another model.
+    const GAMEPAD: HidProduct = HidProduct {
+        vendor_id: 0x5E6F,
+        product_id: 0x7081,
+        interface: None,
+    };
+    /// Button 1 plays key 1 on the controller; retry and quit are keys.
+    const BUTTON: ControlId = ControlId(1);
+
+    fn recorded(device: Option<HidProduct>) -> Recorded {
+        Recorded {
+            keyboard: vec![ControlId(0x0e), ControlId(0x01)],
+            controller: vec![BUTTON],
+            controller_device: device,
+        }
+    }
+
+    fn set_of(max_sources: usize) -> SourceSet {
+        SourceSet::new(SourceConfig {
+            max_devices: 8,
+            max_sources,
+            max_held: 8,
+            queue_capacity: 64,
+            max_arrivals: 2,
+        })
+        .unwrap()
+    }
+
+    /// Keyboards 1 and 2, then `controllers` in order, each with its
+    /// product.
+    fn devices(controllers: &[(u64, HidProduct)]) -> SourceSet {
+        let mut set = set_of(8);
+        set.begin_batch(TimeUs(0));
+        for d in [1, 2] {
+            set.connect(DeviceId(d), DeviceKind::Keyboard);
+        }
+        for &(d, product) in controllers {
+            set.connect(DeviceId(d), DeviceKind::Controller);
+            set.set_product(DeviceId(d), product);
+        }
+        set.end_batch(TimeUs(0));
+        set
+    }
+
+    fn press(device: u64) -> Packet {
+        Packet {
+            device: DeviceId(device),
+            control: BUTTON,
+            value: 1,
+            background: false,
+        }
+    }
+
+    /// Opens a play and presses button 1 on every device of `pressed`:
+    /// the sources' devices, and those whose press was recorded.
+    fn play(set: &mut SourceSet, pressed: &[u64]) -> (Vec<u64>, Vec<u64>) {
+        set.open_recording(TimeUs(10));
+        let mut readers = set.take_readers();
+        let sources: Vec<u64> = set.participants().map(|(d, _)| d.0).collect();
+        set.begin_batch(TimeUs(20));
+        for &d in pressed {
+            set.packet(&press(d));
+        }
+        set.end_batch(TimeUs(21));
+        let recorded = readers
+            .iter_mut()
+            .zip(&sources)
+            .filter_map(|(r, &d)| r.pop().map(|_| d))
+            .collect();
+        (sources, recorded)
+    }
+
+    /// Only the first controller of the configured model and function
+    /// plays: a gamepad, the device's other function with the same ids and
+    /// control numbers, and a second unit of the model take no part and
+    /// record nothing, whichever order they are found in.
+    #[test]
+    fn only_the_configured_controller_takes_part() {
+        let found: [&[(u64, HidProduct)]; 2] = [
+            &[
+                (10, GAMEPAD),
+                (11, OTHER_FUNCTION),
+                (12, CONFIGURED),
+                (13, CONFIGURED),
+            ],
+            &[
+                (13, CONFIGURED),
+                (12, CONFIGURED),
+                (11, OTHER_FUNCTION),
+                (10, GAMEPAD),
+            ],
+        ];
+        for (controllers, first) in found.into_iter().zip([12, 13]) {
+            let mut set = devices(controllers);
+            assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
+            let (sources, pressed) = play(&mut set, &[10, 11, 12, 13]);
+            assert_eq!(sources, [first, 1, 2]);
+            assert_eq!(pressed, [first]);
+            assert!(!set.source_limited());
+        }
+    }
+
+    /// With the configured controller not connected, or no controller
+    /// configured, only keyboards take part; only the first case is
+    /// reported as missing.
+    #[test]
+    fn without_the_configured_controller_only_keyboards_take_part() {
+        let controllers = [(10, GAMEPAD), (11, OTHER_FUNCTION)];
+        for (device, found) in [(Some(CONFIGURED), false), (None, true)] {
+            let mut set = devices(&controllers);
+            assert_eq!(take_part(&mut set, &recorded(device)), found);
+            let (sources, pressed) = play(&mut set, &[10, 11]);
+            assert_eq!(sources, [1, 2]);
+            assert!(pressed.is_empty());
+        }
+    }
+
+    /// At the source limit the configured controller takes part and the
+    /// keyboards beyond it are counted as left out, which the console
+    /// reports before the play; nothing is left out below the limit.
+    #[test]
+    fn devices_left_out_at_the_limit_are_counted() {
+        let mut set = set_of(2);
+        set.begin_batch(TimeUs(0));
+        for d in [1, 2, 3] {
+            set.connect(DeviceId(d), DeviceKind::Keyboard);
+        }
+        set.connect(DeviceId(10), DeviceKind::Controller);
+        set.set_product(DeviceId(10), CONFIGURED);
+        assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
+        set.open_recording(TimeUs(1));
+        assert_eq!(set.left_out(), 2);
+        let sources: Vec<u64> = set.participants().map(|(d, _)| d.0).collect();
+        assert_eq!(sources, [10, 1]);
+        let mut set = devices(&[(10, CONFIGURED)]);
+        assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
+        set.open_recording(TimeUs(1));
+        assert_eq!(set.left_out(), 0);
     }
 }

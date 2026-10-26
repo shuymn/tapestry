@@ -1,10 +1,13 @@
 //! Fake input: a scenario or a recorded log fed by the clock, and autoplay.
 
 use bms_model::{Chart, Lane, NoteKind, TimeUs};
-use eval::{ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile};
+use eval::{
+    AxisMode, ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile,
+};
 
 use crate::InputAdapter;
 use crate::gate::{DeviceId, Packet};
+use crate::hid::AxisCap;
 use crate::sources::{DeviceKind, SourceSet};
 
 /// Something that happens to the input side.
@@ -42,6 +45,8 @@ pub struct ScriptedInput {
     next: usize,
     /// The recorded controls for each `Connect` item, by item index.
     connect_lists: Vec<Option<Vec<ControlId>>>,
+    /// The axes each `Connect` item declares, by item index.
+    connect_axes: Vec<Vec<AxisCap>>,
 }
 
 impl ScriptedInput {
@@ -51,11 +56,27 @@ impl ScriptedInput {
     pub fn new(mut items: Vec<ScriptItem>) -> Self {
         items.sort_by_key(|i| i.at);
         let connect_lists = vec![None; items.len()];
+        let connect_axes = vec![Vec::new(); items.len()];
         Self {
             items,
             next: 0,
             connect_lists,
+            connect_axes,
         }
+    }
+
+    /// Declares `axes` for `device` each time the script connects it, as
+    /// the adapter declares a controller's axes
+    /// ([`SourceSet::add_axes`]): only declared axes are recorded.
+    #[must_use]
+    pub fn with_axes(mut self, device: DeviceId, axes: &[AxisCap]) -> Self {
+        for (item, list) in self.items.iter().zip(&mut self.connect_axes) {
+            if matches!(item.action, Action::Connect(d, _) if d == device) {
+                list.clear();
+                list.extend_from_slice(axes);
+            }
+        }
+        self
     }
 
     /// Records `controls` from `device` each time the script connects it.
@@ -160,6 +181,7 @@ impl InputAdapter for ScriptedInput {
                         if let Some(controls) = self.connect_lists[index].take() {
                             sources.set_recorded(device, controls);
                         }
+                        sources.add_axes(device, &self.connect_axes[index]);
                     }
                     Action::Disconnect(device) => sources.disconnect(device),
                     Action::Packet(p) => {
@@ -174,6 +196,36 @@ impl InputAdapter for ScriptedInput {
         }
         sources.end_batch(now);
     }
+}
+
+/// The axes a recorded source with `profile` declared, as far as its
+/// evaluation reads them: each bound axis, relative or absolute with the
+/// revolution its scratch settings resolved to ([`ScriptedInput::with_axes`]
+/// for a replay).
+#[must_use]
+pub fn declared_axes(profile: &SourceProfile) -> Vec<AxisCap> {
+    profile
+        .axes
+        .iter()
+        .map(|a| match a.scratch.mode {
+            AxisMode::Relative => AxisCap {
+                control: a.control,
+                relative: true,
+                wrap: 0,
+                min: 0,
+                max: 0,
+                bits: 0,
+            },
+            AxisMode::Absolute { wrap } => AxisCap {
+                control: a.control,
+                relative: false,
+                wrap,
+                min: 0,
+                max: i32::try_from(wrap.wrapping_sub(1)).unwrap_or(i32::MAX),
+                bits: 0,
+            },
+        })
+        .collect()
 }
 
 /// How long autoplay holds a tap, unless the lane's next note comes first.
