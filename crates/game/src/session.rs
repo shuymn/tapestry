@@ -515,17 +515,19 @@ impl Loaded {
     #[must_use]
     pub fn plan(&self, kinds: &[DeviceKind]) -> PlayPlan {
         let device = self.settings.device.profile(kinds);
-        let buttons: usize = kinds
+        let recorded: usize = kinds
             .iter()
             .map(|&k| self.settings.device.keys(k).recorded().len())
             .sum();
+        let axes: usize = device.sources.iter().map(|s| s.axes.len()).sum();
         let logic = LogicConfig {
             inputs: window_inputs(
                 &self.chart,
                 &self.preset,
                 &device,
                 self.config.lead_in,
-                buttons,
+                recorded - axes,
+                axes,
             ),
             effects: self.config.effects,
         };
@@ -912,8 +914,9 @@ fn arrival(a: &InputArrival) -> Arrival {
     }
 }
 
-/// The recording window's input capacity (D8): every recorded control
-/// pressed and released 30 times a second, from the countdown to the
+/// The recording window's input capacity (D8, [`eval::window_inputs`]):
+/// every recorded button pressed and released 30 times a second and every
+/// recorded axis reporting 1000 times a second, from the countdown to the
 /// chart's final deadline plus the largest input offset, in whole seconds.
 fn window_inputs(
     chart: &Chart,
@@ -921,6 +924,7 @@ fn window_inputs(
     device: &eval::DeviceProfile,
     lead_in: TimeUs,
     buttons: usize,
+    axes: usize,
 ) -> usize {
     let end = Evaluator::new(chart, preset, device, &InputStart::default(), 0)
         .map_or(TimeUs(0), |e| e.final_deadline());
@@ -935,8 +939,5 @@ fn window_inputs(
         .0
         .saturating_add(end.0.max(0))
         .saturating_add(offset);
-    let secs = u64::try_from(span).unwrap_or(0).div_ceil(1_000_000);
-    buttons
-        .saturating_mul(60)
-        .saturating_mul(usize::try_from(secs).unwrap_or(usize::MAX))
+    eval::window_inputs(TimeUs(span), buttons, axes)
 }

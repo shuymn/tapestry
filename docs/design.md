@@ -216,6 +216,14 @@ Axis values are recorded raw with timestamps, and the evaluator converts them in
 - The rule for combining button input and analog input on the same lane
 - When a device is disconnected, a disconnect event is recorded in the physical input stream. On it, input conversion releases every input of that device that was pressed and clears that device's pending debounce and scratch state, so live play and re-evaluation handle it identically
 
+The conversion, with movement counted in the axis's units after wraparound (a change of more than half a revolution is taken the short way round) and inversion:
+
+- Released, the axis presses its lane once it has moved the press threshold in one direction. The count starts again when the direction changes or the axis pauses longer than the release time, so a position flickering at rest never presses.
+- Pressed, movement of the hold threshold in the pressed direction keeps it pressed (the hysteresis: less movement holds than presses), and movement of the press threshold the other way is a new press. Every press and hold sets the release deadline the release time later; the evaluator releases the lane when the watermark passes it. At equal times inputs still come first, so a report at the deadline moves it; among deadlines a scratch release comes first, as the release input it stands for would.
+- A button and an axis on one lane combine like two buttons: the lane is held while either holds it. An absolute axis whose position is unknown (its first report, when the held-input snapshot does not list it) only learns where it is. The axis is never pressed at the start of a play: the snapshot holds positions, not presses.
+- Defaults, for a turntable reporting an 8-bit absolute axis: 256 values per revolution, press threshold 2, hold threshold 1, release 100 ms after the last press or hold. They are starting points, tuned by playing, and live in `device.toml`; the log records them from format version 2, which is written only when an axis is bound, so a log without one stays version 1.
+- HID controls are named by usage: a button by its number (page 9), an axis as `page << 16 | usage` (X is `0x1_0030`). In stage 1 every controller shares one key config, as keyboards do; bindings per device (vendor, product, usage) come when two different controllers are used on one PC.
+
 ### Watermark
 
 The watermark is the boundary that "no input with an earlier evaluation time will arrive from now on". The evaluation time is the receive time minus the input latency, converted to the chart's timeline.

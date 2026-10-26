@@ -61,8 +61,8 @@ pub use session::{
     ReloadError, Session, SessionConfig, SessionError, Settings,
 };
 pub use settings::{
-    DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, PlayerSettings, Role, SettingsError,
-    load_settings, reserved_key, save_settings,
+    DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, PlayerSettings, Role, ScratchConfig,
+    SettingsError, load_settings, reserved_key, save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{

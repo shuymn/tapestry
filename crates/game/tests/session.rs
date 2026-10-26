@@ -1247,3 +1247,33 @@ fn key_sounds_and_bgm_follow_each_play_across_a_retry() {
         );
     }
 }
+
+#[test]
+fn plan_sizes_axes_at_1khz_and_buttons_at_30_presses() {
+    let (_dir, root) = temp_root();
+    // The final deadline is 1180 ms; with the 1 s lead-in the window is
+    // 2.18 s, 3 whole seconds.
+    let chart = taps(&[(1, 1_000)]);
+    let mut settings = Settings::load(&root).unwrap();
+    settings.device.controller.lanes = vec![
+        game::LaneKey {
+            control: 7,
+            lane: 1,
+        },
+        game::LaneKey {
+            control: 0x1_0030,
+            lane: 0,
+        },
+    ];
+    let parts = Parts {
+        ingest: Box::new(Built(chart)),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap();
+    // The keyboard records its 8 lanes, retry and quit, the controller a
+    // button and an axis: 11 buttons at 60 edges and 1 axis at 1000
+    // reports a second, over 3 s.
+    let plan = loaded.plan(&[DeviceKind::Keyboard, DeviceKind::Controller]);
+    assert_eq!(plan.device.sources[1].axes.len(), 1);
+    assert_eq!(plan.logic.inputs, 3 * (11 * 60 + 1000));
+}

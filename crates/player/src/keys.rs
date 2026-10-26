@@ -7,10 +7,12 @@
 
 use std::sync::Arc;
 
+use eval::ControlId;
 use game::{
     Bound, DeviceSettings, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError, KeyScreen, ROLES,
     Refusal, Role, capture_keys, load_settings, save_settings,
 };
+use input::hid::is_axis;
 use input::{Capture, DeviceKind, QpcClock};
 use render::{AdapterChoice, Renderer, Target};
 
@@ -18,10 +20,13 @@ use crate::controls::Controls;
 use crate::end_screen::key_name;
 
 /// A bound control's name: a keyboard key by its scan code, a controller's
-/// control by its number.
+/// button by its number and its axis by its HID usage.
 fn name(b: Bound) -> String {
     match b.kind {
         DeviceKind::Keyboard => key_name(Some(b.control)),
+        DeviceKind::Controller if is_axis(ControlId(b.control)) => {
+            format!("AXIS {:04X}", b.control & 0xFFFF)
+        }
         DeviceKind::Controller => format!("BUTTON {}", b.control),
     }
 }
@@ -68,6 +73,10 @@ pub fn lines(flow: &KeyConfigFlow) -> Vec<String> {
         Some(r @ (Role::Retry | Role::Quit)) => {
             l.push(format!("PRESS THE KEYBOARD KEY FOR {}", role(r)));
         }
+        Some(r @ Role::Lane(0)) => l.push(format!(
+            "PRESS THE KEY OR BUTTON, OR TURN THE AXIS, FOR {}",
+            role(r)
+        )),
         Some(r) => l.push(format!("PRESS THE KEY OR BUTTON FOR {}", role(r))),
         None => l.push("DONE".to_owned()),
     }
@@ -190,7 +199,7 @@ mod tests {
     use game::{Bound, DeviceSettings, KeyConfig, KeyConfigFlow, KeyConfigs};
     use input::DeviceKind;
 
-    use super::lines;
+    use super::{lines, name};
 
     #[test]
     fn the_screen_shows_prompt_refusal_and_bindings() {
@@ -226,5 +235,26 @@ mod tests {
         let l = lines(&flow);
         assert_eq!(l[2], "PRESS THE KEYBOARD KEY FOR RETRY");
         assert_eq!(l[3], "RETRY TAKES KEYBOARD KEYS ONLY: PRESS A KEY");
+    }
+
+    #[test]
+    fn the_scratch_prompt_takes_an_axis_named_by_usage() {
+        let flow = KeyConfigFlow::new(KeyConfigs {
+            keyboard: DeviceSettings::default().keyboard,
+            controller: KeyConfig {
+                lanes: Vec::new(),
+                retry: None,
+                quit: None,
+            },
+        });
+        assert_eq!(
+            lines(&flow)[2],
+            "PRESS THE KEY OR BUTTON, OR TURN THE AXIS, FOR SCRATCH"
+        );
+        let axis = Bound {
+            kind: DeviceKind::Controller,
+            control: 0x1_0030,
+        };
+        assert_eq!(name(axis), "AXIS 0030");
     }
 }

@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 
 use ::audio::AudioEngine;
 use bms_model::{Lane, TimeUs};
-use eval::{Binding, ControlId, DeviceProfile, SourceProfile};
+use eval::{
+    AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, ScratchSettings, SourceProfile,
+};
 use input::DeviceKind;
+use input::hid::is_axis;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -103,7 +106,9 @@ impl std::error::Error for SettingsError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaneKey {
-    /// The control: a keyboard scan code, or a controller's button.
+    /// The control: a keyboard scan code, or a controller's button or axis
+    /// ([`input::hid`]). A controller's axis plays its lane through the
+    /// scratch conversion of [`DeviceSettings::scratch`].
     pub control: u32,
     /// The lane: 0 is the scratch, 1-7 the keys.
     pub lane: u8,
@@ -265,11 +270,13 @@ impl KeyConfig {
     }
 
     /// The lane bindings the evaluator reads; an entry with a lane the
-    /// game does not have is left out.
+    /// game does not have is left out. A controller's axes are left out
+    /// too: they are [`axes`](Self::axes).
     #[must_use]
-    pub fn bindings(&self) -> Vec<Binding> {
+    pub fn bindings(&self, kind: DeviceKind) -> Vec<Binding> {
         self.lanes
             .iter()
+            .filter(|k| !axis_of(kind, k.control))
             .filter_map(|k| {
                 Lane::new(k.lane).map(|lane| Binding {
                     control: ControlId(k.control),
@@ -277,6 +284,86 @@ impl KeyConfig {
                 })
             })
             .collect()
+    }
+
+    /// A controller's axes bound to lanes, each converted by `scratch`;
+    /// none for a keyboard.
+    #[must_use]
+    pub fn axes(&self, kind: DeviceKind, scratch: ScratchSettings) -> Vec<AxisBinding> {
+        self.lanes
+            .iter()
+            .filter(|k| axis_of(kind, k.control))
+            .filter_map(|k| {
+                Lane::new(k.lane).map(|lane| AxisBinding {
+                    control: ControlId(k.control),
+                    lane,
+                    scratch,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Whether `control` of a device of `kind` is an axis.
+const fn axis_of(kind: DeviceKind, control: u32) -> bool {
+    matches!(kind, DeviceKind::Controller) && is_axis(ControlId(control))
+}
+
+/// How a controller's axis plays its lane (design.md "Analog Scratch"), in
+/// `device.toml`. The defaults suit a turntable that reports an 8-bit
+/// absolute axis ([`ScratchSettings::DEFAULT`]); they are starting points,
+/// tuned by playing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ScratchConfig {
+    /// Whether the axis reports movement rather than position.
+    pub relative: bool,
+    /// For an absolute axis, the values in one revolution (it wraps from
+    /// its highest back to its lowest); 0 if it does not wrap.
+    pub wrap: u32,
+    /// Whether the axis counts backwards.
+    pub invert: bool,
+    /// Movement in one direction that presses.
+    pub press_threshold: u32,
+    /// Movement in the pressed direction that keeps the lane pressed.
+    pub hold_threshold: u32,
+    /// How long after the axis stops the lane is released, µs.
+    pub release_after_us: u32,
+}
+
+impl Default for ScratchConfig {
+    fn default() -> Self {
+        let d = ScratchSettings::DEFAULT;
+        let wrap = match d.mode {
+            AxisMode::Absolute { wrap } => wrap,
+            AxisMode::Relative => 0,
+        };
+        Self {
+            relative: matches!(d.mode, AxisMode::Relative),
+            wrap,
+            invert: d.invert,
+            press_threshold: d.press_threshold,
+            hold_threshold: d.hold_threshold,
+            release_after_us: d.release_after_us,
+        }
+    }
+}
+
+impl ScratchConfig {
+    /// The settings the evaluator reads.
+    #[must_use]
+    pub const fn settings(&self) -> ScratchSettings {
+        ScratchSettings {
+            mode: if self.relative {
+                AxisMode::Relative
+            } else {
+                AxisMode::Absolute { wrap: self.wrap }
+            },
+            invert: self.invert,
+            press_threshold: self.press_threshold,
+            hold_threshold: self.hold_threshold,
+            release_after_us: self.release_after_us,
+        }
     }
 }
 
@@ -286,8 +373,8 @@ impl KeyConfig {
 pub struct DeviceSettings {
     /// The key config shared by every keyboard.
     pub keyboard: KeyConfig,
-    /// The key config of controllers. Per-device controller bindings
-    /// arrive with HID support.
+    /// The key config shared by every controller: its buttons and axes by
+    /// HID usage ([`input::hid`]).
     pub controller: KeyConfig,
     /// The input latency offset, µs.
     pub input_offset_us: i64,
@@ -299,6 +386,8 @@ pub struct DeviceSettings {
     pub audio_device: Option<String>,
     /// The master volume, 0.0 (silent) to 1.0 (unity).
     pub master_volume: f32,
+    /// How controllers' axes play their lanes.
+    pub scratch: ScratchConfig,
 }
 
 impl Default for DeviceSettings {
@@ -325,6 +414,7 @@ impl Default for DeviceSettings {
             display_offset_us: 0,
             audio_device: None,
             master_volume: 1.0,
+            scratch: ScratchConfig::default(),
         }
     }
 }
@@ -388,8 +478,8 @@ impl DeviceSettings {
                 .iter()
                 .map(|&kind| SourceProfile {
                     input_offset: TimeUs(self.input_offset_us),
-                    bindings: self.keys(kind).bindings(),
-                    axes: Vec::new(),
+                    bindings: self.keys(kind).bindings(kind),
+                    axes: self.keys(kind).axes(kind, self.scratch.settings()),
                 })
                 .collect(),
         }

@@ -3,10 +3,11 @@
 use std::fs;
 
 use bms_model::{Lane, TimeUs};
-use eval::{Binding, ControlId, SourceProfile};
+use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::{
     Adjust, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey, LocalRecords, PlayerSettings,
-    RecordSink, Role, Settings, SettingsError, Tuning, load_settings, save_settings, write_atomic,
+    RecordSink, Role, ScratchConfig, Settings, SettingsError, Tuning, load_settings, save_settings,
+    write_atomic,
 };
 use input::DeviceKind;
 
@@ -47,6 +48,11 @@ fn changed() -> Settings {
                         control: 9,
                         lane: 6,
                     },
+                    // The X axis plays the scratch.
+                    LaneKey {
+                        control: 0x1_0030,
+                        lane: 0,
+                    },
                 ],
                 retry: None,
                 quit: None,
@@ -56,6 +62,14 @@ fn changed() -> Settings {
             display_offset_us: 16_700,
             audio_device: Some("device-a".to_owned()),
             master_volume: 0.75,
+            scratch: ScratchConfig {
+                relative: false,
+                wrap: 1_024,
+                invert: true,
+                press_threshold: 5,
+                hold_threshold: 3,
+                release_after_us: 80_000,
+            },
         },
         player: PlayerSettings {
             visible_time_ms: 2_350,
@@ -162,7 +176,10 @@ fn key_config_gives_profiles_and_recorded_controls() {
         s.keyboard.recorded(),
         vec![ControlId(0x1e), ControlId(0x39), ControlId(0x13)]
     );
-    assert_eq!(s.controller.recorded(), vec![ControlId(7), ControlId(9)]);
+    assert_eq!(
+        s.controller.recorded(),
+        vec![ControlId(7), ControlId(9), ControlId(0x1_0030)]
+    );
     let profile = s.profile(&[DeviceKind::Controller, DeviceKind::Keyboard]);
     let lane = |n| Lane::new(n).unwrap();
     assert_eq!(
@@ -180,7 +197,17 @@ fn key_config_gives_profiles_and_recorded_controls() {
                         lane: lane(6)
                     },
                 ],
-                axes: Vec::new(),
+                axes: vec![AxisBinding {
+                    control: ControlId(0x1_0030),
+                    lane: lane(0),
+                    scratch: ScratchSettings {
+                        mode: AxisMode::Absolute { wrap: 1_024 },
+                        invert: true,
+                        press_threshold: 5,
+                        hold_threshold: 3,
+                        release_after_us: 80_000,
+                    },
+                }],
             },
             SourceProfile {
                 input_offset: TimeUs(4_500),
@@ -204,7 +231,27 @@ fn key_config_gives_profiles_and_recorded_controls() {
         control: 0x50,
         lane: 8,
     });
-    assert_eq!(keys.bindings().len(), 2);
+    assert_eq!(keys.bindings(DeviceKind::Keyboard).len(), 2);
+    // A keyboard has no axes: a scan code that looks like one is a key.
+    keys.lanes.push(LaneKey {
+        control: 0x1_0031,
+        lane: 2,
+    });
+    assert_eq!(keys.bindings(DeviceKind::Keyboard).len(), 3);
+    assert_eq!(
+        keys.axes(DeviceKind::Keyboard, ScratchSettings::DEFAULT),
+        []
+    );
+    // A relative axis, from the file's settings.
+    let relative = ScratchConfig {
+        relative: true,
+        ..ScratchConfig::default()
+    };
+    assert_eq!(relative.settings().mode, AxisMode::Relative);
+    assert_eq!(
+        ScratchConfig::default().settings(),
+        ScratchSettings::DEFAULT
+    );
 }
 
 #[test]
