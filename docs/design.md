@@ -860,7 +860,7 @@ Windows-dependent code is confined to `input`, `audio`, `render`, and `player`. 
 
 ### Licenses
 
-The license follows the layer. L0 through L2 (`bms-model`, `bms-parser`, `rules`, `eval`, `replay`), `eval-cli`, and the development tooling (`xtask`) are `MIT OR Apache-2.0`. L3 and above (`input`, `audio`, `game`, `render`, `skin-*`, `ui`) and `player` are `GPL-3.0-or-later`. The license of `ir-server` and `pkg` is decided when they are built.
+The license follows the layer. L0 through L2 (`bms-model`, `bms-parser`, `rules`, `eval`, `replay`), `eval-cli`, and the development tooling (`xtask`) are `MIT OR Apache-2.0`. L3 and above (`input`, `audio`, `game`, `render`, `skin-*`, `ui`) and `player` are `GPL-3.0-or-later`. The fuzz targets (`fuzz`, outside the workspace) are also GPL, because they link `input`; they are tooling and never shipped. The license of `ir-server` and `pkg` is decided when they are built.
 
 - **Why split:** The game itself is copyleft so that a modified player cannot be redistributed with its source closed. Chart loading, the evaluator, and the replay format stay permissive so that other players, tools, and IR servers can load charts and verify replays with the same code. This means the judgment logic can be reused in closed products; that is accepted. The license does not lower the trademark, trade dress, or patent risk of a game modeled on a commercial one; that is handled by what goes into the code (the banned-word list, no copied assets).
 - **One-way dependencies:** A permissive crate never depends on a GPL crate, for any dependency kind. The layer order already guarantees this. `cargo xtask check-arch` (R4) enforces it, and also checks each crate's `license` against an explicit crate-to-license table, so a crate missing from the table or carrying the other license fails. The workspace has no default license, so a new crate has to choose.
@@ -898,6 +898,7 @@ Where there is no reason to build our own, established libraries are used. We bu
 | Chart loading | Our own (with `bms-rs` as a point of comparison) | Time handling and safe bounded loading are directly tied to the correctness of judgment, so we own it. BMSON is read with `serde_json` |
 | Rational numbers | `num-rational` (`i128`) | Used for time computation. Operations always use the checked versions to detect overflow |
 | Library DB | `rusqlite` (bundled SQLite, FTS5) | Song information, scores, search index |
+| Fuzzing | `cargo-fuzz`, `libfuzzer-sys` (LLVM libFuzzer, NCSA) | Coverage-guided fuzzing of the decoders of untrusted input, with AddressSanitizer on a dated nightly. The targets take bytes, as the decoders do. Not used: `afl.rs` (AFL++), which needs its own toolchain and pays off in long campaigns; `honggfuzz-rs`; `bolero`, whose several engines overlap the property tests (`proptest`); typed `arbitrary` inputs, since the decoders take bytes |
 | Archives | `zip`, `sevenz-rust2` | The extraction target and the size caps are always checked. RAR support is postponed because the usable decoders have license constraints |
 | Settings and presets | `serde`, `toml` | Files written by people are TOML |
 | Replays | Custom binary format, `zstd` | The version number goes first, time deltas are laid out as variable-length integers, and the result is compressed with zstd |
@@ -959,7 +960,7 @@ So that each check does not require launching the app and operating it by hand, 
 | Target | Method | What it verifies |
 | --- | --- | --- |
 | Evaluator, chart loading, presets | Unit tests, property tests, hand-written examples, `eval-cli` | Judgment, gauge, time computation |
-| Chart loading | Fuzzing with `cargo-fuzz` | Safety against broken files |
+| Chart loading, input log decoding, Raw Input packet decoding | Fuzzing with `cargo-fuzz`: short runs on pull requests, long runs daily | No panic, timeout, or out-of-memory on broken input |
 | Whole game (headless) | Run one song through at maximum speed, with a virtual clock and a fed input log | Screen transitions, judgment events, sound scheduling positions, retry, practice sections |
 | Audio | Generate waveforms offscreen with the same processing as production, with the input PCM, sample rate, initial state, and block length fixed. The sample positions where sounds were scheduled are compared exactly, and waveform values within a tolerance, against the expected output. Including flushing the tail, also verify that changing how the blocks are divided does not change the result | Mixing, soft clipper, volume normalization |
 | Rendering | Render the screen at a given time offscreen and compare it with the expected image within a tolerance. On Windows CI, the DX12 adapter that renders in software (WARP) is explicitly selected, and the adapter used is recorded. If it cannot be obtained, the test fails rather than being silently skipped. WARP results can also vary by version, so the Windows image, wgpu and the shader translator, fonts, and rendering settings are pinned, and the diff images are reviewed on updates. Presentation mode, VRR, and display latency cannot be verified this way | Skins, note positions, effects |
