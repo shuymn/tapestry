@@ -552,28 +552,29 @@ impl<O: AudioOutput + Wakes> Session<O> {
             }
             let advance = logic.advance_to(now);
             live.extend_from_slice(logic.events());
-            if let Some(cause) = advance.aborted {
+            let failure = match advance.aborted {
+                Some(_) => None,
+                None => audio.step(global, true, &mut sounds).err(),
+            };
+            let failed = failure.is_some();
+            output_error = failure.or(output_error);
+            if advance.aborted.is_some() || failed {
                 audio.cancel(&mut sounds);
-                render.drain_effects(|_| {});
-                break PlayEnd::Aborted(cause);
-            }
-            if let Err(e) = audio.step(global, true, &mut sounds) {
-                output_error = Some(e);
-                audio.cancel(&mut sounds);
-                render.drain_effects(|_| {});
-                // Completion in this step's advance is final; the failure
-                // only ends the tail, which is then not played.
-                if advance.complete {
-                    break PlayEnd::Completed;
-                }
-                logic.abort(AbortCause::OutputFailed);
-                break PlayEnd::Aborted(AbortCause::OutputFailed);
             }
             render.drain_effects(|_| {});
-            // Completion is final: a failure in the same advance does not
-            // turn a completed play into an aborted one.
+            if let Some(cause) = advance.aborted {
+                break PlayEnd::Aborted(cause);
+            }
+            // Completion is final: an audio failure or a gauge failure in
+            // the same advance does not turn a completed play into an
+            // aborted one; the failure only ends the tail, which is then
+            // not played.
             if advance.complete {
                 break PlayEnd::Completed;
+            }
+            if failed {
+                logic.abort(AbortCause::OutputFailed);
+                break PlayEnd::Aborted(AbortCause::OutputFailed);
             }
             let survival_failed = render
                 .view()
