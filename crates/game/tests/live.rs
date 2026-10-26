@@ -123,6 +123,8 @@ struct Fake {
     in_close: Option<Command>,
     cancels: usize,
     shows: usize,
+    /// An audio control whose readiness the play waits for.
+    audio: Option<game::AudioControl>,
     reports: Vec<PlayReport>,
 }
 
@@ -156,6 +158,7 @@ impl Fake {
             in_close: None,
             cancels: 0,
             shows: 0,
+            audio: None,
             reports: Vec::new(),
         }
     }
@@ -212,6 +215,12 @@ impl Rig for Fake {
             self.screen_fails_at = i64::MAX;
         }
         Ok(())
+    }
+
+    fn prepare_audio(&mut self) -> Result<(), String> {
+        self.audio
+            .as_mut()
+            .map_or(Ok(()), |a| a.ready().map_err(|e| e.to_string()))
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Opening<SourceReader> {
@@ -656,4 +665,50 @@ fn a_suspend_during_close_cuts_a_long_tail() {
     let s = status(one);
     assert_eq!(s.end, replay::EndStatus::PlayedToEnd);
     assert!(s.incomplete.suspend);
+}
+
+/// An audio control whose worker is gone: dropped before it took any play,
+/// or after it took one and returned its retired queue.
+fn gone_audio(took_a_play: bool) -> game::AudioControl {
+    let chart = chart();
+    let engine = audio::AudioEngine::new(
+        common::bank(&chart),
+        &chart.bgm,
+        common::RATE,
+        common::PERIOD,
+        audio::MAX_VOICES,
+        0,
+    )
+    .unwrap();
+    let (mut control, mut worker) = game::audio_control(engine);
+    if took_a_play {
+        let mut out = audio::SimDevice::new(audio::SimConfig::steady(
+            common::RATE,
+            common::PERIOD,
+            TimeUs(0),
+        ));
+        let (_sink, queue) = game::audio_link_at(4, TimeUs(0));
+        control.play(TimeUs(0), queue).unwrap();
+        worker.step(&mut out).unwrap();
+        // The switch was taken and acknowledged.
+        control.ready().unwrap();
+    }
+    drop(worker);
+    control
+}
+
+#[test]
+fn a_gone_audio_thread_fails_the_preparation() {
+    for took_a_play in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Fake::new(Vec::new(), &[], i64::MAX);
+        rig.audio = Some(gone_audio(took_a_play));
+        let ran = game::live::run(&mut loaded, &mut rig);
+        assert!(
+            matches!(&ran, Err(LiveError::Audio(e)) if e == "the audio thread is gone"),
+            "{took_a_play}: {ran:?}"
+        );
+        assert!(rig.origins.is_empty(), "{took_a_play}");
+    }
 }

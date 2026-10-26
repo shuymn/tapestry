@@ -157,18 +157,21 @@ impl AudioControl {
     /// [`AudioWaitError::Gone`] once the worker is gone, and
     /// [`AudioWaitError::Timeout`] after [`SWITCH_TIMEOUT`].
     pub fn ready(&mut self) -> Result<(), AudioWaitError> {
-        if !self.in_flight {
-            return Ok(());
-        }
         let deadline = Instant::now() + SWITCH_TIMEOUT;
         loop {
-            if let Ok(retired) = self.retired.pop() {
+            if self.in_flight
+                && let Ok(retired) = self.retired.pop()
+            {
                 drop(retired);
                 self.in_flight = false;
-                return Ok(());
             }
+            // A worker that is gone is never ready, whether or not it took
+            // the last switch.
             if self.retired.is_abandoned() {
                 return Err(AudioWaitError::Gone);
+            }
+            if !self.in_flight {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(AudioWaitError::Timeout);
