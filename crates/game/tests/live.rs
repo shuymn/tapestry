@@ -79,6 +79,7 @@ fn loaded(dir: &Path) -> Loaded {
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
+        autoplay: false,
     };
     Loaded::load(root, settings, &chart_path, config, parts).unwrap()
 }
@@ -893,6 +894,7 @@ fn chord_loaded(dir: &Path) -> Loaded {
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
+        autoplay: false,
     };
     Loaded::load(root, settings, &chart_path, config, parts).unwrap()
 }
@@ -950,7 +952,7 @@ fn the_play_is_over_before_it_is_saved() {
     let order = std::sync::Arc::default();
     let parts = Parts {
         ingest: Box::new(Built(chart())),
-        records: Box::new(NotingSink(std::sync::Arc::clone(&order))),
+        records: Some(Box::new(NotingSink(std::sync::Arc::clone(&order)))),
         ..Parts::standard(&root, &settings.player)
     };
     let config = SessionConfig {
@@ -962,6 +964,7 @@ fn the_play_is_over_before_it_is_saved() {
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
+        autoplay: false,
     };
     let mut loaded = Loaded::load(root, settings, &chart_path, config, parts).unwrap();
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];

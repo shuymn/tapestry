@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use lexopt::{Arg, Parser};
 
-pub const USAGE: &str = "usage: tapestry play <chart.bms> | tapestry keys | tapestry --version";
+pub const USAGE: &str =
+    "usage: tapestry play [--auto] <chart.bms> | tapestry keys | tapestry --version";
 
 /// What the command line asks for.
 #[derive(Debug)]
@@ -33,6 +34,9 @@ pub enum Command {
 #[derive(Debug)]
 pub struct Play {
     pub chart: PathBuf,
+    /// How the session's input is received: the devices, autoplay
+    /// (`--auto`), or an input log (`--dev-scripted-input`).
+    pub input: crate::PlayInput,
     #[cfg(feature = "dev-tools")]
     pub dev: crate::dev::Options,
 }
@@ -115,11 +119,14 @@ pub(crate) fn end(p: &mut Parser) -> Result<(), UsageError> {
 
 fn play(p: &mut Parser) -> Result<Play, UsageError> {
     let mut chart = None;
+    let mut auto = false;
     #[cfg(feature = "dev-tools")]
     let mut options = crate::dev::Options::default();
     while let Some(arg) = p.next()? {
         match arg {
             Arg::Value(v) if chart.is_none() => chart = Some(PathBuf::from(v)),
+            // A second `--auto` is unknown, as a second chart is.
+            Arg::Long("auto") if !auto => auto = true,
             #[cfg(feature = "dev-tools")]
             Arg::Long(name) => {
                 // The name borrows the parser, which the value needs.
@@ -134,8 +141,17 @@ fn play(p: &mut Parser) -> Result<Play, UsageError> {
             "play needs a chart file\n{USAGE}"
         )));
     };
+    let input = if auto {
+        crate::PlayInput::Autoplay
+    } else {
+        crate::PlayInput::Devices
+    };
+    // An input log replaces the devices, and refuses autoplay.
+    #[cfg(feature = "dev-tools")]
+    let input = options.play_input(input)?;
     Ok(Play {
         chart,
+        input,
         #[cfg(feature = "dev-tools")]
         dev: options,
     })
@@ -171,6 +187,7 @@ mod tests {
     use std::path::Path;
 
     use super::{Command, USAGE, UsageError, parse};
+    use crate::PlayInput;
 
     fn parsed(args: &[&str]) -> Result<Command, UsageError> {
         parse(args.iter().map(OsString::from))
@@ -233,6 +250,87 @@ mod tests {
         let bad = OsString::from_wide(&[u16::from(b'a'), 0xD800]);
         let args = ["play".into(), "a.bms".into(), bad];
         assert_eq!(parse(args).unwrap_err(), unknown("a\u{FFFD}"));
+    }
+
+    /// `--auto` is a production option of `play`, before or after the
+    /// chart; a second one is unknown, as a second chart is.
+    #[test]
+    fn auto_chooses_autoplay_once() {
+        for args in [["play", "--auto", "a.bms"], ["play", "a.bms", "--auto"]] {
+            let play = chart(&args);
+            assert_eq!(play.chart, Path::new("a.bms"));
+            assert!(matches!(play.input, PlayInput::Autoplay), "{args:?}");
+        }
+        assert!(matches!(
+            chart(&["play", "a.bms"]).input,
+            PlayInput::Devices
+        ));
+        assert_eq!(
+            parsed(&["play", "--auto", "--auto", "a.bms"]).unwrap_err(),
+            unknown("--auto")
+        );
+        assert_eq!(
+            parsed(&["play", "--auto", "a.bms", "--auto"]).unwrap_err(),
+            unknown("--auto")
+        );
+        assert_eq!(parsed(&["--auto", "play"]).unwrap_err(), unknown("--auto"));
+        assert_eq!(
+            parsed(&["play", "--auto=1", "a.bms"]).unwrap_err(),
+            unknown("--auto=1")
+        );
+        assert_eq!(
+            parsed(&["play", "--auto"]).unwrap_err(),
+            UsageError::Usage(format!("play needs a chart file\n{USAGE}"))
+        );
+    }
+
+    /// Autoplay and an input log are two ways to receive input: refused
+    /// together, in either order; `--dev-headless` is for autoplay alone.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn autoplay_refuses_an_input_log_and_takes_headless() {
+        let both =
+            UsageError::Usage("--auto and --dev-scripted-input cannot be used together".to_owned());
+        let headless = UsageError::Usage("--dev-headless needs --auto".to_owned());
+        for (args, refusal) in [
+            (
+                &["play", "--auto", "a.bms", "--dev-scripted-input", "l"][..],
+                &both,
+            ),
+            (
+                &["play", "a.bms", "--dev-scripted-input", "l", "--auto"],
+                &both,
+            ),
+            (&["play", "a.bms", "--dev-headless"], &headless),
+            (
+                &[
+                    "play",
+                    "a.bms",
+                    "--dev-scripted-input",
+                    "l",
+                    "--dev-headless",
+                ],
+                &headless,
+            ),
+        ] {
+            assert_eq!(&parsed(args).unwrap_err(), refusal, "{args:?}");
+        }
+        let play = chart(&["play", "--auto", "a.bms", "--dev-headless"]);
+        assert!(matches!(play.input, PlayInput::Autoplay));
+        assert!(play.dev.headless);
+        let play = chart(&["play", "a.bms", "--dev-scripted-input", "l"]);
+        assert!(matches!(play.input, PlayInput::Script(ref l) if l == Path::new("l")));
+    }
+
+    /// A production build does not know `--dev-headless`, with `--auto`
+    /// or without.
+    #[cfg(not(feature = "dev-tools"))]
+    #[test]
+    fn headless_is_unknown_in_production() {
+        assert_eq!(
+            parsed(&["play", "a.bms", "--auto", "--dev-headless"]).unwrap_err(),
+            unknown("--dev-headless")
+        );
     }
 
     #[cfg(feature = "dev-tools")]

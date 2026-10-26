@@ -143,6 +143,7 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     // The input thread.
+    Site::File("crates/input/src/autoplay.rs"),
     Site::File("crates/input/src/capture.rs"),
     Site::File("crates/input/src/gate.rs"),
     Site::File("crates/input/src/hid.rs"),

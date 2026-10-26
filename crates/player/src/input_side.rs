@@ -131,6 +131,12 @@ pub enum Mode {
     /// Raw Input: batches carry the clock's time, and recording opens with
     /// the play's origin, so the source set moves them onto the play.
     Clock,
+    /// Autoplay (design.md "Autoplay"): the generated input on the play's
+    /// timeline, fed at every wake with the play's time, on the one source
+    /// set the clocked input thread keeps for the session. Each play feeds
+    /// it from its first event on the generated keyboard connected again,
+    /// and no other device takes part.
+    Autoplay(input::AutoplayInput),
     /// A script on the play's timeline, polled with the play's time.
     #[cfg(feature = "dev-tools")]
     Script(Box<Script>),
@@ -187,12 +193,21 @@ pub fn link(controls: Arc<Controls>, mode: Mode) -> (Hook, InputLink) {
 }
 
 impl Hook {
-    /// One boundary, `now` being the clock read there. A script is first
-    /// fed up to the play's time.
+    /// One boundary, `now` being the clock read there. Generated input or
+    /// a script is first fed up to the play's time; between plays,
+    /// autoplay's wake still checks the focus gate, so a focus loss during
+    /// the audio tail or on the end screen is published.
     pub fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) {
-        #[cfg(feature = "dev-tools")]
-        if let (Mode::Script(script), Some(origin)) = (&mut self.mode, self.origin) {
-            input::InputAdapter::poll(&mut script.current, TimeUs(now.0 - origin.0), sources);
+        match (&mut self.mode, self.origin) {
+            (Mode::Autoplay(feeder), Some(origin)) => {
+                input::InputAdapter::poll(feeder, TimeUs(now.0 - origin.0), sources);
+            }
+            (Mode::Autoplay(_), None) => sources.end_batch(now),
+            #[cfg(feature = "dev-tools")]
+            (Mode::Script(script), Some(origin)) => {
+                input::InputAdapter::poll(&mut script.current, TimeUs(now.0 - origin.0), sources);
+            }
+            _ => {}
         }
         while let Ok(request) = self.requests.try_recv() {
             let reply = match request {
@@ -256,6 +271,21 @@ impl Hook {
                     );
                 }
                 start
+            }
+            Mode::Autoplay(feeder) => {
+                feeder.restart(sources, recorded.keyboard.clone());
+                // No device but the generated keyboard plays, whatever the
+                // set has seen.
+                let others: Vec<DeviceId> = sources
+                    .devices()
+                    .map(|(d, _)| d)
+                    .filter(|&d| d != input::AUTOPLAY_DEVICE)
+                    .collect();
+                for d in others {
+                    sources.set_takes_part(d, false);
+                }
+                reset_gate(sources, &self.controls);
+                sources.open_recording(TimeUs(-lead_in.0))
             }
             #[cfg(feature = "dev-tools")]
             Mode::Script(script) => {
@@ -683,5 +713,189 @@ mod tests {
         let (counts, lines) = hid_play(&caps, set, &[&[Some(-129)], &[Some(128)]]);
         assert_eq!(counts, [2, 0, 0]);
         assert_eq!(lines, [set_line(2)]);
+    }
+}
+
+#[cfg(test)]
+mod autoplay_tests {
+    use std::sync::Arc;
+
+    use bms_model::TimeUs;
+    use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
+    use game::ScratchConfig;
+    use input::{
+        AUTOPLAY_DEVICE, AutoplayInput, DeviceId, DeviceKind, Packet, QpcClock, SourceConfig,
+        SourceSet,
+    };
+
+    use super::{Hook, InputLink, Mode, Recorded, Reply, Request, link};
+    use crate::controls::Controls;
+
+    const MS: i64 = 1_000;
+    const LEAD_IN: TimeUs = TimeUs(1_000 * MS);
+    /// Lane 1's key in the built-in key config.
+    const Z: ControlId = ControlId(0x2c);
+
+    /// Z pressed at 0.5 s and released at 0.55 s, on the play's timeline.
+    fn events() -> Vec<PhysicalInputEvent> {
+        [(500, 1), (550, 0)]
+            .map(|(ms, value)| PhysicalInputEvent {
+                received: TimeUs(ms * MS),
+                source: SourceId(0),
+                kind: InputKind::Control { control: Z, value },
+            })
+            .to_vec()
+    }
+
+    fn recorded() -> Recorded {
+        Recorded {
+            keyboard: vec![Z],
+            controller: vec![ControlId(1)],
+            controller_device: None,
+            scratch: ScratchConfig::default(),
+        }
+    }
+
+    fn set() -> SourceSet {
+        SourceSet::new(SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 8,
+            max_arrivals: 2,
+        })
+        .unwrap()
+    }
+
+    /// The hook of an autoplay session and its link, with the window's
+    /// controls holding the source set's latch before any play opens.
+    fn hooked(sources: &SourceSet) -> (Arc<Controls>, Hook, InputLink) {
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (hook, link) = link(
+            Arc::clone(&controls),
+            Mode::Autoplay(AutoplayInput::new(events())),
+        );
+        (controls, hook, link)
+    }
+
+    /// Opens recording at clock time `at` through the request channel, as
+    /// the game thread does.
+    fn open(
+        hook: &mut Hook,
+        link: &InputLink,
+        sources: &mut SourceSet,
+        at: i64,
+    ) -> game::Opening<input::SourceReader> {
+        link.requests
+            .send(Request::Open {
+                lead_in: LEAD_IN,
+                logic: std::thread::current(),
+                recorded: recorded(),
+            })
+            .unwrap();
+        hook.wake(sources, TimeUs(at));
+        match link.replies.try_recv().unwrap() {
+            Reply::Opened(o) => o,
+            Reply::Closed(_) => panic!("an open is answered by an opening"),
+        }
+    }
+
+    fn close(hook: &mut Hook, link: &InputLink, sources: &mut SourceSet, at: i64) {
+        link.requests.send(Request::Close).unwrap();
+        hook.wake(sources, TimeUs(at));
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Closed(_))));
+    }
+
+    /// P1: the latch the controls got before the first play still trips
+    /// the gate after a retry: a focus loss in play is published on the
+    /// first play and on the next.
+    #[test]
+    fn autoplay_hook_keeps_the_focus_latch_across_plays() {
+        let mut sources = set();
+        let (controls, mut hook, link) = hooked(&sources);
+        for play in 0..2_i64 {
+            let t = play * 10_000 * MS;
+            controls.focus(true);
+            let _opening = open(&mut hook, &link, &mut sources, t);
+            hook.wake(&mut sources, TimeUs(t + MS));
+            assert!(!link.tripped(), "play {play}");
+            controls.focus(false);
+            hook.wake(&mut sources, TimeUs(t + 2 * MS));
+            assert!(link.tripped(), "play {play}");
+            close(&mut hook, &link, &mut sources, t + 3 * MS);
+        }
+    }
+
+    /// A3: with recording closed (the audio tail, the end screen), every
+    /// wake still checks the gate: a focus loss then is published, on the
+    /// first play and after a retry.
+    #[test]
+    fn autoplay_hook_sees_a_focus_loss_after_recording_closes() {
+        let mut sources = set();
+        let (controls, mut hook, link) = hooked(&sources);
+        for play in 0..2_i64 {
+            let t = play * 10_000 * MS;
+            controls.focus(true);
+            let _opening = open(&mut hook, &link, &mut sources, t);
+            hook.wake(&mut sources, TimeUs(t + 2_000 * MS));
+            close(&mut hook, &link, &mut sources, t + 2_001 * MS);
+            assert!(!link.tripped(), "play {play}");
+            controls.focus(false);
+            hook.wake(&mut sources, TimeUs(t + 2_002 * MS));
+            assert!(link.tripped(), "play {play}");
+        }
+    }
+
+    /// A play that opens while the window has no focus is latched at once,
+    /// and the next one, opened focused, plays.
+    #[test]
+    fn autoplay_hook_latches_a_play_opened_without_focus() {
+        let mut sources = set();
+        let (controls, mut hook, link) = hooked(&sources);
+        controls.focus(false);
+        let _opening = open(&mut hook, &link, &mut sources, 0);
+        hook.wake(&mut sources, TimeUs(MS));
+        assert!(link.tripped());
+        close(&mut hook, &link, &mut sources, 2 * MS);
+        controls.focus(true);
+        let _opening = open(&mut hook, &link, &mut sources, 3 * MS);
+        hook.wake(&mut sources, TimeUs(4 * MS));
+        assert!(!link.tripped());
+    }
+
+    /// P2: a keyboard and a controller the set knew before the opening
+    /// take no part; only the generated keyboard plays, and a press on the
+    /// other keyboard is not recorded.
+    #[test]
+    fn autoplay_hook_takes_only_the_generated_source() {
+        let mut sources = set();
+        sources.begin_batch(TimeUs(0));
+        sources.connect(DeviceId(1), DeviceKind::Keyboard);
+        sources.set_recorded(DeviceId(1), vec![Z]);
+        sources.connect(DeviceId(10), DeviceKind::Controller);
+        sources.set_recorded(DeviceId(10), vec![ControlId(1)]);
+        sources.end_batch(TimeUs(0));
+        let (_controls, mut hook, link) = hooked(&sources);
+        let mut opening = open(&mut hook, &link, &mut sources, 0);
+        assert_eq!(opening.kinds, [DeviceKind::Keyboard]);
+        let participants: Vec<_> = sources.participants().map(|(d, _)| d).collect();
+        assert_eq!(participants, [AUTOPLAY_DEVICE]);
+        // A press on the other keyboard during the play.
+        sources.begin_batch(TimeUs(200 * MS));
+        sources.packet(&Packet {
+            device: DeviceId(1),
+            control: Z,
+            value: 1,
+            background: false,
+        });
+        sources.end_batch(TimeUs(200 * MS));
+        hook.wake(&mut sources, TimeUs(1_600 * MS));
+        let reader = &mut opening.readers[0];
+        let mut got = Vec::new();
+        while let Some(e) = reader.pop() {
+            got.push(e.received);
+        }
+        assert_eq!(got, [TimeUs(500 * MS), TimeUs(550 * MS)]);
     }
 }

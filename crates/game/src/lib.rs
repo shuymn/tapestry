@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 mod audio_loop;
+mod autoplay;
 mod error;
 mod keys;
 pub mod live;
@@ -36,6 +37,7 @@ pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioProbe, AudioWaitError, AudioWorker, Probed,
     SWITCH_TIMEOUT, audio_control,
 };
+pub use autoplay::{Autoplay, AutoplayError};
 pub use error::{Chain, IoFailure};
 pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,

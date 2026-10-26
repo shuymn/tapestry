@@ -2,12 +2,13 @@
 //!
 //! `play <chart> --dev-scripted-input <log>` plays the chart on the same
 //! threads as the game, without a window or devices: the input log's
-//! events drive the input side as a script on the play's timeline, the
-//! audio engine plays into a recording of a simulated device paced by the
-//! clock, and the renderer draws offscreen on WARP. `--dev-frames <dir>`
-//! also writes a countdown frame, a play frame and the end screen there as
-//! PNG files. `--dev-overlay` shows the measurement overlay from the
-//! start.
+//! events drive the input side as a script on the play's timeline, fed by
+//! the clocked input thread, the audio engine plays into a recording of a
+//! simulated device paced by the clock, and the renderer draws offscreen
+//! on WARP. `play --auto <chart> --dev-headless` runs autoplay the same
+//! way. `--dev-frames <dir>` also writes a countdown frame, a play frame
+//! and the end screen there as PNG files. `--dev-overlay` shows the
+//! measurement overlay from the start.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,11 +22,10 @@ use anyhow::Context as _;
 use audio::{AudioOutput, OutputError, RecordingOutput, SimConfig, SimDevice, Wake};
 use bms_model::{TimeSource, TimeUs};
 use game::Wakes;
-use input::{DeviceKind, QpcClock, ScriptedInput, SourceSet};
+use input::{DeviceKind, QpcClock, ScriptedInput};
 use replay::DecodeLimits;
 
 use crate::args::{Command, UsageError};
-use crate::input_side::Hook;
 use crate::measure::Drawn;
 use crate::render_side::{FrameSink, Screen};
 
@@ -136,9 +136,31 @@ pub struct Options {
     pub adjust_at_ms: i64,
     /// Show the measurement overlay from the start, without its key.
     pub overlay: bool,
+    /// Run autoplay headless: a recording of a simulated audio device and
+    /// WARP offscreen, as a scripted run.
+    pub headless: bool,
 }
 
 impl Options {
+    /// The session's input with the development options applied: an input
+    /// log in place of the devices.
+    ///
+    /// # Errors
+    ///
+    /// A usage error for options that cannot go together: an input log with
+    /// autoplay, or `--dev-headless` without autoplay.
+    pub fn play_input(&self, input: crate::PlayInput) -> Result<crate::PlayInput, UsageError> {
+        let log = self.scripted_input.clone();
+        match input {
+            crate::PlayInput::Autoplay if log.is_some() => Err(UsageError::Usage(
+                "--auto and --dev-scripted-input cannot be used together".to_owned(),
+            )),
+            crate::PlayInput::Autoplay => Ok(input),
+            _ if self.headless => Err(UsageError::Usage("--dev-headless needs --auto".to_owned())),
+            _ => Ok(log.map_or(input, crate::PlayInput::Script)),
+        }
+    }
+
     /// Takes the long option `name` (without its dashes) and its value as a
     /// development option of `play`.
     ///
@@ -149,6 +171,7 @@ impl Options {
         match name {
             "dev-auto-retry" => self.auto_retry = true,
             "dev-overlay" => self.overlay = true,
+            "dev-headless" => self.headless = true,
             "dev-adjust-at" => {
                 self.adjust_at_ms = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-adjust-at takes milliseconds".to_owned())
@@ -349,40 +372,6 @@ impl Drop for Stop {
     }
 }
 
-/// The scripted input thread: the input thread's boundary every
-/// millisecond, the script fed by the hook. Stops when dropped.
-pub struct ScriptThread {
-    _stop: Stop,
-}
-
-impl ScriptThread {
-    /// Starts it with `sources` and `hook` (in script mode).
-    ///
-    /// # Errors
-    ///
-    /// If the thread cannot start.
-    pub fn spawn(clock: QpcClock, mut sources: SourceSet, mut hook: Hook) -> anyhow::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let handle = std::thread::Builder::new()
-            .name("scripted input".into())
-            .spawn(move || {
-                crate::alloc_count::tag(crate::alloc_count::Tag::Input);
-                while !thread_stop.load(Ordering::Acquire) {
-                    hook.wake(&mut sources, clock.now());
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            })
-            .context("the scripted input thread cannot start")?;
-        Ok(Self {
-            _stop: Stop {
-                stop,
-                handle: Some(handle),
-            },
-        })
-    }
-}
-
 /// A simulated device paced by the clock: each wait sleeps until the
 /// device's next buffer event is due on the clock, so the engine runs in
 /// real time as it does with WASAPI.
@@ -439,6 +428,29 @@ pub fn report_audio(out: &Paced<RecordingOutput<SimDevice>>) {
         "dev: audio recorded {} frames, peak {peak:.3}",
         samples.len() / audio::CHANNELS
     );
+    let onsets = onsets(samples);
+    let listed: Vec<String> = onsets.iter().take(64).map(ToString::to_string).collect();
+    println!("dev: audio onsets {}: {}", onsets.len(), listed.join(" "));
+}
+
+/// The frames where sound starts after at least 10 ms (at 48 kHz) of
+/// silence on the left channel: when sounds started, to compare with the
+/// chart's times.
+fn onsets(samples: &[f32]) -> Vec<usize> {
+    const QUIET: usize = 480;
+    let mut found = Vec::new();
+    let mut silent = QUIET;
+    for (frame, s) in samples.iter().step_by(audio::CHANNELS).enumerate() {
+        if s.abs() > 1e-3 {
+            if silent >= QUIET {
+                found.push(frame);
+            }
+            silent = 0;
+        } else {
+            silent += 1;
+        }
+    }
+    found
 }
 
 /// Writes frames as PNG files: `countdown.png` at the first frame of the
