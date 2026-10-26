@@ -49,9 +49,9 @@ use windows::core::{PCWSTR, w};
 use crate::capture::Capture;
 use crate::gate::DeviceId;
 use crate::hid::{
-    AXIS_USAGES, AxisCap, ButtonGroup, DESKTOP_PAGE, HidDevice, HidLayout, HidReport, MAX_AXES,
-    MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_cap, axis_control, axis_value, collection_of,
-    in_collection, read_report, remove_collection,
+    AXIS_USAGES, AxisCap, ButtonGroup, CollectionSlot, DESKTOP_PAGE, HidDevice, HidLayout,
+    HidReport, MAX_AXES, MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_cap, axis_control, axis_value,
+    collection_of, in_collection, read_report, remove_collection,
 };
 use crate::raw;
 use crate::sources::{DeviceKind, SourceSet};
@@ -316,6 +316,29 @@ struct Controller {
     state: HidDevice,
 }
 
+impl CollectionSlot for Controller {
+    fn key(&self) -> Option<u64> {
+        self.handle.map(|h| h as u64)
+    }
+
+    fn state(&self) -> &HidDevice {
+        &self.state
+    }
+
+    fn free(&mut self) {
+        self.handle = None;
+        self.container = None;
+        self.state = HidDevice::new(DeviceId(0), &EMPTY_LAYOUT);
+    }
+}
+
+/// The layout of a free slot.
+const EMPTY_LAYOUT: HidLayout<'static> = HidLayout {
+    collection: 0,
+    axes: &[],
+    buttons: &[],
+};
+
 impl Controller {
     fn data(&self) -> PHIDP_PREPARSED_DATA {
         PHIDP_PREPARSED_DATA(self.preparsed.as_ptr() as isize)
@@ -452,19 +475,7 @@ impl Controllers {
     /// any, connect again and take part from the next play. Returns
     /// `false` when the handle is not a collection read here.
     fn disconnect(&mut self, handle: HANDLE, sources: &mut SourceSet) -> bool {
-        let key = handle.0 as isize;
-        let Some(slot) = self.slots.iter_mut().find(|s| s.handle == Some(key)) else {
-            return false;
-        };
-        slot.handle = None;
-        let device = slot.state.device();
-        let remaining = self
-            .slots
-            .iter()
-            .filter(|s| s.handle.is_some() && s.state.device() == device)
-            .map(|s| &s.state);
-        remove_collection(device, remaining, sources);
-        true
+        remove_collection(&mut self.slots, handle.0 as isize as u64, sources)
     }
 
     /// Turns a HID block's reports into packets.

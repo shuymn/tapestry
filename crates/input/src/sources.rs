@@ -266,6 +266,12 @@ impl SourceSet {
         if self.devices.iter().any(|d| d.id == device) {
             return;
         }
+        // An unread device is not connected: read now, it leaves the
+        // exclusion table.
+        if let Some(i) = self.unread.iter().position(|&d| d == device) {
+            self.unread.swap_remove(i);
+            self.untracked = self.untracked.saturating_sub(1);
+        }
         if let Some(held) = self.spare_held.pop() {
             self.devices.push(Device {
                 id: device,
@@ -302,7 +308,7 @@ impl SourceSet {
     /// clears it. Beyond `max_devices` unread devices, each is counted
     /// without being told apart.
     pub fn connect_unread(&mut self, device: DeviceId, kind: DeviceKind) {
-        if self.unread.contains(&device) {
+        if self.unread.contains(&device) || self.devices.iter().any(|d| d.id == device) {
             return;
         }
         if self.unread.len() < self.config.max_devices {

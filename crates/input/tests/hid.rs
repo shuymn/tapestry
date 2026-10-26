@@ -7,8 +7,8 @@
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use input::hid::{
-    AxisCap, ButtonGroup, HidDevice, HidLayout, HidReport, axis_cap, axis_control, axis_value,
-    button_control, capture_travel, collection_of, in_collection, is_axis, read_report,
+    AxisCap, ButtonGroup, CollectionSlot, HidDevice, HidLayout, HidReport, axis_cap, axis_control,
+    axis_value, button_control, capture_travel, collection_of, in_collection, is_axis, read_report,
     remove_collection,
 };
 use input::{Capture, DeviceId, DeviceKind, SourceConfig, SourceReader, SourceSet};
@@ -579,9 +579,17 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
     // Signed and unsigned 8 bits.
     assert_eq!(cap(true, -128, 127, 8), absolute(256, -128, 127));
     assert_eq!(cap(true, 0, 255, 8), absolute(256, 0, 255));
-    // A narrower declaration is taken as declared, whatever the field.
-    assert_eq!(cap(true, -127, 127, 8), absolute(255, -127, 127));
+    // The signed habit of ±(2^(n−1) − 1) is the full field, in 8 and 16
+    // bits; any other narrower declaration is taken as declared.
+    assert_eq!(cap(true, -127, 127, 8), absolute(256, -128, 127));
+    assert_eq!(
+        cap(true, -32_767, 32_767, 16),
+        absolute(65_536, -32_768, 32_767)
+    );
+    assert_eq!(cap(true, -127, 127, 16), absolute(255, -127, 127));
+    assert_eq!(cap(true, -126, 127, 8), absolute(254, -126, 127));
     assert_eq!(cap(true, 0, 254, 8), absolute(255, 0, 254));
+    assert_eq!(cap(true, -1, 1, 2), absolute(4, -2, 1));
     // Unsigned 10 and 12 bits, as encoders report them in 16-bit fields.
     assert_eq!(cap(true, 0, 1023, 16), absolute(1024, 0, 1023));
     assert_eq!(cap(true, 0, 4095, 12), absolute(4096, 0, 4095));
@@ -610,11 +618,11 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
 
 #[test]
 fn values_outside_the_declared_range_are_recorded_and_counted() {
-    // A descriptor declaring -127..=127 for an axis that also reports
+    // A descriptor declaring -126..=127 for an axis that also reports
     // -128: the value is recorded as reported, and counted.
     let (mut set, mut reader) = recording();
     let capture = Capture::new();
-    let narrow = [axis_cap(X, true, -127, 127, 8).unwrap()];
+    let narrow = [axis_cap(X, true, -126, 127, 8).unwrap()];
     let mut dev = HidDevice::new(PAD, &layout(&narrow));
     let at = |v| [Some(v)];
     let (a, b, c) = (at(127), at(-128), at(-127));
@@ -639,12 +647,12 @@ fn values_outside_the_declared_range_are_recorded_and_counted() {
             (0x1_0030, -128)
         ]
     );
-    assert_eq!(set.axis_out_of_range().sum::<u64>(), 2);
+    assert_eq!(set.axis_out_of_range().sum::<u64>(), 3);
     // A relative axis is never out of range.
     let dial = [axis_cap(DIAL, false, 0, 0, 8).unwrap()];
     let mut dev = HidDevice::new(PAD, &layout(&dial));
     batch(&mut dev, &mut set, &capture, 20, &[r(&at(-90))]);
-    assert_eq!(set.axis_out_of_range().sum::<u64>(), 2);
+    assert_eq!(set.axis_out_of_range().sum::<u64>(), 3);
     // A new recording starts the count again.
     set.close_recording();
     set.open_recording(TimeUs(30));
@@ -699,52 +707,139 @@ fn a_controller_without_room_marks_the_next_recordings() {
 }
 
 #[test]
-fn removing_one_collection_disconnects_the_controller_until_the_next_play() {
+fn an_unread_device_read_later_is_connected_once() {
+    // Unread first, then read: it leaves the exclusion table and takes
+    // part; its removal leaves nothing behind.
+    let mut set = connected();
+    let late = DeviceId(0xcafe);
+    set.connect_unread(late, DeviceKind::Controller);
+    set.connect(late, DeviceKind::Controller);
+    set.open_recording(TimeUs(5));
+    assert!(!set.source_limited());
+    assert_eq!(set.participants().count(), 2);
+    set.close_recording();
+    set.disconnect(late);
+    set.open_recording(TimeUs(6));
+    assert!(!set.source_limited());
+    assert_eq!(set.participants().count(), 1);
+    set.close_recording();
+    // Read first, then reported unread: it stays connected, not excluded;
+    // its removal clears it.
+    set.connect(late, DeviceKind::Controller);
+    set.connect_unread(late, DeviceKind::Controller);
+    set.open_recording(TimeUs(7));
+    assert!(!set.source_limited());
+    assert_eq!(set.participants().count(), 2);
+    set.close_recording();
+    set.disconnect(late);
+    set.open_recording(TimeUs(8));
+    assert!(!set.source_limited());
+    assert_eq!(set.participants().count(), 1);
+}
+
+/// A collection slot as an adapter keeps one.
+struct Slot {
+    key: Option<u64>,
+    state: HidDevice,
+}
+
+impl CollectionSlot for Slot {
+    fn key(&self) -> Option<u64> {
+        self.key
+    }
+
+    fn state(&self) -> &HidDevice {
+        &self.state
+    }
+
+    fn free(&mut self) {
+        self.key = None;
+        self.state = HidDevice::new(DeviceId(0), &layout(&[]));
+    }
+}
+
+#[test]
+fn removing_one_collection_removes_the_whole_controller() {
     let (mut set, mut reader) = recording();
     let capture = Capture::new();
-    let b2 = in_collection(button_control(1), 2);
-    let mut first = HidDevice::new(PAD, &layout(&caps()));
-    let second = HidDevice::new(
-        PAD,
-        &HidLayout {
-            collection: 2,
-            axes: &[],
-            buttons: &[],
+    let second = HidLayout {
+        collection: 2,
+        axes: &[],
+        buttons: &[],
+    };
+    let mut slots = [
+        Slot {
+            key: Some(10),
+            state: HidDevice::new(PAD, &layout(&caps())),
         },
-    );
-    // Button 2 of the first collection is held when that collection goes.
+        Slot {
+            key: Some(20),
+            state: HidDevice::new(PAD, &second),
+        },
+    ];
+    // X rests at 0 on the first collection; button 1 of the second is
+    // held when the first goes.
+    let press = |buttons| HidReport {
+        id: 0,
+        buttons: Some(buttons),
+        axes: &[],
+    };
+    let x0 = [Some(0), None];
     batch(
-        &mut first,
+        &mut slots[0].state,
         &mut set,
         &capture,
         10,
         &[HidReport {
             id: 0,
-            buttons: Some(&[2]),
-            axes: &[Some(7), None],
+            buttons: None,
+            axes: &x0,
         }],
     );
+    batch(&mut slots[1].state, &mut set, &capture, 11, &[press(&[1])]);
     assert!(set.begin_batch(TimeUs(20)));
-    remove_collection(PAD, [&second], &mut set);
+    assert!(remove_collection(&mut slots, 10, &mut set));
     set.end_batch(TimeUs(21));
-    // The source is disconnected, which releases everything it held, and
-    // the controller arrives again with the collection that remains.
+    // The source is disconnected, and every slot of it is free.
     let events: Vec<_> = std::iter::from_fn(|| reader.pop()).collect();
     assert_eq!(events.last().map(|e| e.kind), Some(InputKind::Disconnected));
-    assert_eq!(set.arrivals().len(), 1);
-    // At the next play it takes part, with nothing of the removed
-    // collection: no held button, no axis.
+    assert!(slots.iter().all(|s| s.key.is_none()));
+    // The other collection's removal finds nothing more.
+    assert!(!remove_collection(&mut slots, 20, &mut set));
     set.close_recording();
-    set.set_recorded(PAD, vec![button_control(2), b2, X]);
-    let start = set.open_recording(TimeUs(30));
-    assert_eq!(set.participants().count(), 1);
-    assert!(start.held.is_empty(), "{:?}", start.held);
-    assert_eq!(set.axes(PAD), []);
-    // The last collection's removal disconnects it for good.
-    set.close_recording();
-    remove_collection(PAD, [], &mut set);
-    set.open_recording(TimeUs(40));
+    set.open_recording(TimeUs(25));
     assert_eq!(set.participants().count(), 0);
+    set.close_recording();
+
+    // Rediscovered: a new device with empty state, like a first
+    // connection. Only what it reports after that is in the next
+    // snapshot: button 3, and no stale hold or zero position.
+    assert!(set.begin_batch(TimeUs(30)));
+    set.connect(PAD, DeviceKind::Controller);
+    set.add_axes(PAD, &caps());
+    set.set_recorded(
+        PAD,
+        vec![
+            button_control(1),
+            button_control(3),
+            X,
+            in_collection(button_control(1), 2),
+        ],
+    );
+    slots[0] = Slot {
+        key: Some(11),
+        state: HidDevice::new(PAD, &layout(&caps())),
+    };
+    slots[1] = Slot {
+        key: Some(21),
+        state: HidDevice::new(PAD, &second),
+    };
+    slots[0]
+        .state
+        .report(&press(&[3]), false, &capture, &mut set);
+    set.end_batch(TimeUs(31));
+    let start = set.open_recording(TimeUs(40));
+    assert_eq!(start.held, [(SourceId(0), button_control(3), 1)]);
 }
 
 #[test]

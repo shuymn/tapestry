@@ -88,8 +88,13 @@ pub const fn axis_value(raw: u32, bits: u16, signed: bool) -> i32 {
 /// whose count of values does not fit in a `u32` (a full 32-bit field) or
 /// whose range is empty: such an axis is not read.
 ///
-/// A descriptor can be wrong: a value reported outside the declared range
-/// is counted at run time ([`SourceSet::axis_value_out_of_range`]).
+/// One descriptor habit is read as what it means: a signed range of
+/// exactly ±(2^(n−1) − 1) in an n-bit field (-127..=127 in 8 bits) is the
+/// field's full two's-complement range, -2^(n−1)..=2^(n−1) − 1, with
+/// 2^n values, because such controllers report -2^(n−1) too.
+///
+/// A descriptor can be wrong otherwise: a value reported outside the
+/// declared range is counted at run time ([`SourceSet::axis_value_out_of_range`]).
 #[must_use]
 pub fn axis_cap(
     control: ControlId,
@@ -111,6 +116,11 @@ pub fn axis_cap(
         i32::try_from(max.cast_unsigned() & ((1_u32 << bits) - 1)).ok()?
     } else {
         max
+    };
+    let half = (2..32).contains(&bits).then(|| (1_i64 << (bits - 1)) - 1);
+    let min = match half {
+        Some(h) if i64::from(max) == h && i64::from(min) == -h => min - 1,
+        _ => min,
     };
     let span = i64::from(max) - i64::from(min) + 1;
     let wrap = u32::try_from(span).ok().filter(|&s| s > 0)?;
@@ -365,27 +375,44 @@ impl HidDevice {
     }
 }
 
-/// One collection of the controller `device` was removed while
-/// `remaining` collections of it stay connected. The whole source is
-/// disconnected, releasing everything it held as any disconnect does, and
-/// the removed collection's state and axes go with it; when collections
-/// remain, the device connects again with their axes, as an arrival, so
-/// it takes part from the next play. The remaining collections' controls
-/// start released in the source's state.
-pub fn remove_collection<'a>(
-    device: DeviceId,
-    remaining: impl IntoIterator<Item = &'a HidDevice>,
+/// A slot of an adapter's collection table: the collection it reads, if
+/// any, and that collection's state.
+pub trait CollectionSlot {
+    /// The handle of the collection it reads; `None` when free.
+    fn key(&self) -> Option<u64>;
+    /// The collection's state.
+    fn state(&self) -> &HidDevice;
+    /// Frees the slot and drops its state: a later collection starts
+    /// empty.
+    fn free(&mut self);
+}
+
+/// The collection `key` was removed. Its whole physical device leaves:
+/// every slot of it is freed, its cached button and position state
+/// dropped, and its source disconnected, releasing everything it held as
+/// any disconnect does. The device comes back only through fresh
+/// discovery of its collections, as a new device with empty state, like a
+/// first connection. Returns `false` when no slot reads `key`.
+pub fn remove_collection<S: CollectionSlot>(
+    slots: &mut [S],
+    key: u64,
     sources: &mut SourceSet,
-) {
-    sources.disconnect(device);
-    let mut connected = false;
-    for collection in remaining {
-        if !connected {
-            sources.connect(device, DeviceKind::Controller);
-            connected = true;
-        }
-        sources.add_axes(device, collection.axes());
+) -> bool {
+    let Some(device) = slots
+        .iter()
+        .find(|s| s.key() == Some(key))
+        .map(|s| s.state().device())
+    else {
+        return false;
+    };
+    for s in slots
+        .iter_mut()
+        .filter(|s| s.key().is_some() && s.state().device() == device)
+    {
+        s.free();
     }
+    sources.disconnect(device);
+    true
 }
 
 /// Copies `report` into `buf` to be parsed, if it fits; a report longer
