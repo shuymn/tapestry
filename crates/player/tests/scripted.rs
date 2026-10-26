@@ -252,41 +252,11 @@ fn an_invalid_key_config_exits_nonzero() {
         assert!(!appdata.join("tapestry").join("records").exists());
     }
 }
-
-/// With `--dev-auto-retry` the run retries once by itself: the retried
-/// play replays the log from its start on devices in their first state, so
-/// both plays hit every note, and both are saved.
-#[test]
-fn an_auto_retried_scripted_play_replays_the_log_again() {
-    let Fixture {
-        dir: _dir,
-        chart_path,
-        log,
-        appdata,
-        ..
-    } = fixture();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .arg("play")
-        .arg(&chart_path)
-        .arg("--dev-scripted-input")
-        .arg(&log)
-        .arg("--dev-auto-retry")
-        .env("LOCALAPPDATA", &appdata)
-        .output()
-        .expect("run tapestry");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "{stdout}");
-    for play in [1, 2] {
-        let line = format!("play {play}: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0");
-        assert!(stdout.contains(&line), "{line} in {stdout}");
-    }
-    assert!(stdout.contains("retry "), "{stdout}");
-    assert_eq!(records(&appdata).len(), 2);
-}
-
-/// A scripted run that retries once by itself, with `extra` arguments: its
-/// stdout, and its records in the order they were saved.
+/// A scripted run that retries once by itself (`--dev-auto-retry`), with
+/// `extra` arguments: the retried play replays the log from its start on
+/// devices in their first state, so both plays hit every note, both
+/// re-evaluate to their live streams, and both are saved. Returns stdout
+/// and the records in the order they were saved.
 fn run_retried(fx: &Fixture, extra: &[&str]) -> (String, Vec<PlayRecord>) {
     let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
         .arg("play")
@@ -302,7 +272,10 @@ fn run_retried(fx: &Fixture, extra: &[&str]) -> (String, Vec<PlayRecord>) {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
     for play in [1, 2] {
-        let line = format!("play {play}: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0");
+        let line = format!(
+            "play {play}: Completed; perfect {NOTES} great 0 good 0 bad 0 poor 0; {}",
+            "re-evaluation matches live: true"
+        );
         assert!(stdout.contains(&line), "{line} in {stdout}");
     }
     let mut paths = records(&fx.appdata);
@@ -363,7 +336,9 @@ fn writes_only_between_plays(stdout: &str) {
 #[test]
 fn hi_speed_change_moves_notes_not_judgment() {
     let plain = fixture();
-    let (_, without) = run_retried(&plain, &[]);
+    let (plain_out, without) = run_retried(&plain, &[]);
+    // The retried play's load time is reported.
+    assert!(plain_out.contains("retry "), "{plain_out}");
     let changed = fixture();
     let (stdout, with) = run_retried(
         &changed,

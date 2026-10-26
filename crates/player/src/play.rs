@@ -107,11 +107,12 @@ impl PlayerRig<'_> {
         let Some(t) = self.seen.take_new(self.controls.tuning()) else {
             return;
         };
-        // Always within 0 to unity: `Tuning` keeps it there.
-        let _ = self.audio.control.set_volume(t.volume());
-        if self.end_lines.is_some() {
-            self.send_end(t);
-        }
+        // Always within 0 to unity: loading and `Tuning` keep it there.
+        let _ = self
+            .audio
+            .control
+            .set_volume(self.controls.tuning().volume());
+        self.send_end(t);
     }
 
     fn send_end(&self, t: Tuning) {

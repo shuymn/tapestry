@@ -279,7 +279,8 @@ fn view(controls: &Controls) -> View {
 
 /// The controls, with the settings keys starting from the loaded values.
 fn controls(loaded: &Loaded, clock: QpcClock) -> Arc<Controls> {
-    let tuning = LiveTuning::new(Tuning::of(loaded.settings()));
+    let s = loaded.settings();
+    let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volume(s.device.master_volume);
     Arc::new(Controls::with_tuning(clock, Arc::new(tuning)))
 }
 

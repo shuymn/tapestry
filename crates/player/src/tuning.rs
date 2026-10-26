@@ -14,6 +14,11 @@ use game::{Adjust, DataRoot, Settings, Tuning, save_settings};
 pub struct LiveTuning {
     visible_time_ms: AtomicU32,
     volume_percent: AtomicU32,
+    /// The volume as loaded, exact (`f32` bits), which plays until a
+    /// volume key moves it to a whole percent.
+    loaded_volume: AtomicU32,
+    /// Whether a volume key has moved the volume.
+    volume_moved: AtomicBool,
     display_offset_us: AtomicI64,
     input_offset_us: AtomicI64,
     /// Counts the changes, so readers notice one.
@@ -28,15 +33,34 @@ pub struct LiveTuning {
 
 impl LiveTuning {
     /// The values `t`, with no end screen shown.
-    pub const fn new(t: Tuning) -> Self {
+    pub fn new(t: Tuning) -> Self {
         Self {
             visible_time_ms: AtomicU32::new(t.visible_time_ms),
             volume_percent: AtomicU32::new(t.volume_percent),
+            loaded_volume: AtomicU32::new(t.volume().to_bits()),
+            volume_moved: AtomicBool::new(false),
             display_offset_us: AtomicI64::new(t.display_offset_us),
             input_offset_us: AtomicI64::new(t.input_offset_us),
             version: AtomicU64::new(0),
             end_screen: AtomicBool::new(false),
             step: Mutex::new(()),
+        }
+    }
+
+    /// The values `t`, with the volume as loaded, `volume` (between whole
+    /// percents, as `Tuning` keeps it), playing until a volume key moves it.
+    pub fn with_loaded_volume(self, volume: f32) -> Self {
+        self.loaded_volume
+            .store(volume.to_bits(), Ordering::Release);
+        self
+    }
+
+    /// The master volume to play: as loaded until a volume key moves it.
+    pub fn volume(&self) -> f32 {
+        if self.volume_moved.load(Ordering::Acquire) {
+            self.get().volume()
+        } else {
+            f32::from_bits(self.loaded_volume.load(Ordering::Acquire))
         }
     }
 
@@ -74,8 +98,11 @@ impl LiveTuning {
         }
         self.visible_time_ms
             .store(new.visible_time_ms, Ordering::Release);
-        self.volume_percent
-            .store(new.volume_percent, Ordering::Release);
+        if new.volume_percent != old.volume_percent {
+            self.volume_percent
+                .store(new.volume_percent, Ordering::Release);
+            self.volume_moved.store(true, Ordering::Release);
+        }
         self.display_offset_us
             .store(new.display_offset_us, Ordering::Release);
         self.input_offset_us
@@ -198,8 +225,12 @@ mod tests {
         assert!(t.adjust(Adjust::InputOffsetUp));
         assert_eq!(t.get().input_offset_us, 3_000);
         assert_eq!(t.version(), 1);
-        let _ = t.close_end_screen();
+        // Closing it returns the values the next play starts with, and
+        // refuses input offset steps from then on.
+        assert_eq!(t.close_end_screen().input_offset_us, 3_000);
         assert!(!t.adjust(Adjust::InputOffsetDown));
+        assert!(!t.adjust(Adjust::InputOffsetUp));
+        assert_eq!(t.close_end_screen().input_offset_us, 3_000);
         assert_eq!(t.get().input_offset_us, 3_000);
     }
 
@@ -218,16 +249,24 @@ mod tests {
         assert_eq!(seen.take_new(&t), None);
     }
 
-    /// Closing the end screen returns the values the play starts with and
-    /// refuses input offset steps from then on.
+    /// A volume between whole percents plays as loaded until a volume key
+    /// moves it; other keys leave it.
     #[test]
-    fn closing_the_end_screen_takes_the_offset_and_stops_its_keys() {
-        let t = LiveTuning::new(start());
-        t.open_end_screen();
-        assert!(t.adjust(Adjust::InputOffsetUp));
-        assert_eq!(t.close_end_screen().input_offset_us, 3_000);
-        assert!(!t.adjust(Adjust::InputOffsetUp));
-        assert_eq!(t.close_end_screen().input_offset_us, 3_000);
+    fn the_loaded_volume_plays_until_a_volume_key_moves_it() {
+        let quiet = Tuning {
+            volume_percent: 0,
+            ..start()
+        };
+        let t = LiveTuning::new(quiet).with_loaded_volume(0.004);
+        assert_eq!(t.volume(), 0.004);
+        assert!(t.adjust(Adjust::HiSpeedUp));
+        assert_eq!(t.volume(), 0.004);
+        assert!(t.adjust(Adjust::VolumeUp));
+        assert_eq!(t.volume(), 0.05);
+        assert!(t.adjust(Adjust::VolumeDown));
+        assert_eq!(t.volume(), 0.0);
+        // Without a loaded volume, the whole percent plays.
+        assert_eq!(LiveTuning::new(start()).volume(), 1.0);
     }
 
     #[test]
