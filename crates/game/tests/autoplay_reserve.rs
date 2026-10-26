@@ -5,7 +5,9 @@
 //! it just over the budget is refused before any of them is allocated.
 //!
 //! A global allocator sums the bytes allocated on threads that opted in;
-//! this file holds a single test.
+//! this file holds a single test. It runs in the dev profile only: it
+//! measures buffers that are built and dropped unread, which an optimized
+//! build may leave out.
 
 mod common;
 

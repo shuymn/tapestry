@@ -187,9 +187,15 @@ fn logic_does_not_allocate_during_play() {
     assert_eq!(engine.scheduled_dropped(), sounds as u64);
     assert_eq!(runner.dropped_sounds(), 0);
     assert!(engine.written() >= 48 * 11_000, "{}", engine.written());
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 
     // The autoplay feeder (design.md "Autoplay"): starting a play over and
     // feeding it whole, as the clocked input thread does, allocate nothing.
+    // Each stretch starts with the positive control.
+    let counted = || {
+        drop(std::hint::black_box(vec![1u8; 8]));
+        assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1);
+    };
     let mut feeder = AutoplayInput::new(autoplay(&chart, &dev.sources[0]).unwrap());
     let total = autoplay_count(&chart, &dev.sources[0]);
     let mut set = SourceSet::new(SourceConfig {
@@ -200,12 +206,15 @@ fn logic_does_not_allocate_during_play() {
     let recorded: Vec<_> = dev.sources[0].bindings.iter().map(|b| b.control).collect();
     let again = recorded.clone();
     TRACK.with(|t| t.set(true));
+    counted();
     feeder.restart(&mut set, recorded);
     TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
     set.open_recording(START);
     let mut reader = set.take_readers().pop().unwrap();
     let mut fed = 0;
     TRACK.with(|t| t.set(true));
+    counted();
     for ms in START.0 / MS..11_000 {
         feeder.poll(TimeUs(ms * MS), &mut set);
         while reader.pop().is_some() {
