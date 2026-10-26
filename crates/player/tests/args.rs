@@ -67,6 +67,31 @@ fn missing_chart_exits_one() {
     assert!(dir.path().join("tapestry").join("device.toml").is_file());
 }
 
+/// A chart the loader refuses exits 1 with one line: the chart, then each
+/// cause once.
+#[test]
+fn a_refused_chart_prints_each_cause_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let chart = dir.path().join("lntype2.bms");
+    std::fs::write(
+        &chart,
+        "#PLAYER 1\n#BPM 120\n#LNTYPE 2\n#WAV01 click.wav\n#00151:0101\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .args(["play".as_ref(), chart.as_os_str()])
+        .env("LOCALAPPDATA", dir.path())
+        .output()
+        .expect("run tapestry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let line = format!(
+        "{}: the chart cannot be loaded: line 3: unsupported #LNTYPE 2",
+        chart.display()
+    );
+    assert!(stderr.lines().any(|l| l == line), "{line:?} in {stderr}");
+}
+
 #[cfg(not(feature = "dev-tools"))]
 #[test]
 fn dev_scripted_input_is_unknown_without_feature() {

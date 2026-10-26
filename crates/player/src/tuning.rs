@@ -9,7 +9,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
-use game::{Adjust, DataRoot, Settings, Tuning, save_settings};
+use game::{Adjust, Chain, DataRoot, Settings, Tuning, save_settings};
 
 /// The four values, shared.
 #[derive(Debug)]
@@ -183,7 +183,7 @@ impl SettingsFiles {
                     self.written.device = next.device;
                     wrote.push("device.toml");
                 }
-                Err(e) => eprintln!("{}: {e}", path.display()),
+                Err(e) => eprintln!("{}: {}", path.display(), Chain(&e)),
             }
         }
         if next.player != self.written.player {
@@ -193,7 +193,7 @@ impl SettingsFiles {
                     self.written.player = next.player;
                     wrote.push("player.toml");
                 }
-                Err(e) => eprintln!("{}: {e}", path.display()),
+                Err(e) => eprintln!("{}: {}", path.display(), Chain(&e)),
             }
         }
         for name in &wrote {

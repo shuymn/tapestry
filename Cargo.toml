@@ -69,6 +69,9 @@ encoding_rs = "0.8.42"
 # bms-parser, replay, game, audio, input, render and player (error types)
 thiserror = "2.0.21"
 
+# player (error reports) and game (tests)
+anyhow = "1.0.104"
+
 # xtask (dev tooling, never shipped)
 cargo_metadata = "0.23.1"
 unicode-normalization = "0.1.26"

@@ -76,34 +76,37 @@ pub enum Target {
 }
 
 /// Why the renderer could not start or load a chart.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RenderError {
     /// No adapter matched the choice.
-    Adapter(String),
+    #[error("adapter")]
+    Adapter(#[source] wgpu::RequestAdapterError),
+    /// The WARP adapter was chosen, and none of the adapters is one.
+    #[error("adapter: no WARP adapter among {names:?}")]
+    NoSoftwareAdapter {
+        /// The adapters found.
+        names: Vec<String>,
+    },
     /// The adapter refused the device.
-    Device(String),
-    /// The window's surface could not be created or configured.
-    Surface(String),
+    #[error("device")]
+    Device(#[source] wgpu::RequestDeviceError),
+    /// The device failed waiting for its uploads.
+    #[error("device")]
+    Poll(#[source] wgpu::PollError),
+    /// The window's surface could not be created.
+    #[error("surface")]
+    Surface(#[source] wgpu::CreateSurfaceError),
+    /// The adapter cannot configure the window's surface.
+    #[error("surface: unsupported by the adapter")]
+    SurfaceUnsupported,
     /// The skin cannot draw the chart.
-    Skin(SkinError),
+    #[error("skin")]
+    Skin(#[source] SkinError),
     /// The window's surface was lost or failed validation; the renderer
     /// must be built again.
+    #[error("surface lost")]
     SurfaceLost,
 }
-
-impl std::fmt::Display for RenderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Adapter(e) => write!(f, "adapter: {e}"),
-            Self::Device(e) => write!(f, "device: {e}"),
-            Self::Surface(e) => write!(f, "surface: {e}"),
-            Self::Skin(e) => write!(f, "skin: {e}"),
-            Self::SurfaceLost => f.write_str("surface lost"),
-        }
-    }
-}
-
-impl std::error::Error for RenderError {}
 
 /// What one frame cost and drew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,7 +195,7 @@ impl Renderer {
             } => {
                 let s = instance
                     .create_surface(window)
-                    .map_err(|e| RenderError::Surface(e.to_string()))?;
+                    .map_err(RenderError::Surface)?;
                 (Some(s), (width.max(1), height.max(1)))
             }
             Target::Offscreen { width, height } => (None, (width.max(1), height.max(1))),
@@ -204,7 +207,7 @@ impl Renderer {
             Some(surface) => {
                 let mut config = surface
                     .get_default_config(&adapter, size.0, size.1)
-                    .ok_or_else(|| RenderError::Surface("unsupported by the adapter".into()))?;
+                    .ok_or(RenderError::SurfaceUnsupported)?;
                 let caps = surface.get_capabilities(&adapter);
                 if caps.formats.contains(&wgpu::TextureFormat::Bgra8Unorm) {
                     config.format = wgpu::TextureFormat::Bgra8Unorm;
@@ -559,7 +562,7 @@ fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
     gpu.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .map(|_| ())
-        .map_err(|e| RenderError::Device(e.to_string()))
+        .map_err(RenderError::Poll)
 }
 
 /// The viewport `[x, y, width, height]` that fits the 1920×1080 layout
@@ -701,7 +704,30 @@ fn pipelines(
 
 #[cfg(test)]
 mod tests {
-    use super::letterbox;
+    use std::error::Error as _;
+
+    use super::{RenderError, letterbox};
+    use crate::SkinError;
+
+    /// The skin's refusal is the source, printed once in the chain; the
+    /// chain ends there.
+    #[test]
+    fn a_skin_error_is_the_source() {
+        let skin = SkinError {
+            reason: "the chart has too many lanes".to_owned(),
+        };
+        let e = RenderError::Skin(skin.clone());
+        assert_eq!(e.to_string(), "skin");
+        let source = e.source().expect("the skin error is the source");
+        assert_eq!(source.downcast_ref::<SkinError>(), Some(&skin));
+        assert!(source.source().is_none());
+        assert!(!e.to_string().contains(&source.to_string()));
+        assert!(RenderError::SurfaceLost.source().is_none());
+        let e = RenderError::NoSoftwareAdapter {
+            names: vec!["GPU".to_owned()],
+        };
+        assert_eq!(e.to_string(), "adapter: no WARP adapter among [\"GPU\"]");
+    }
 
     #[test]
     fn letterbox_fits_the_layout_centered() {

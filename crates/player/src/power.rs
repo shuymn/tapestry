@@ -45,7 +45,7 @@ impl SuspendWatch {
     /// # Errors
     ///
     /// The system's refusal.
-    pub fn register(controls: Arc<Controls>) -> Result<Self, String> {
+    pub fn register(controls: Arc<Controls>) -> anyhow::Result<Self> {
         Self::register_with(controls, |recipient, handle| {
             // SAFETY: the recipient points to parameters the watch keeps
             // until it unregisters.
@@ -60,7 +60,7 @@ impl SuspendWatch {
     fn register_with(
         controls: Arc<Controls>,
         register: impl FnOnce(HANDLE, *mut *mut c_void) -> WIN32_ERROR,
-    ) -> Result<Self, String> {
+    ) -> anyhow::Result<Self> {
         let mut context = Box::new((controls, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS::default()));
         let ptr: *const Arc<Controls> = &raw const context.0;
         context.1 = DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
@@ -71,11 +71,11 @@ impl SuspendWatch {
         let recipient = HANDLE((&raw const context.1).cast_mut().cast());
         let status = register(recipient, &mut handle);
         if status != ERROR_SUCCESS {
-            return Err(format!(
+            anyhow::bail!(
                 "the suspend notification cannot be registered (error {}), so a suspend could \
                  not end the play",
                 status.0
-            ));
+            );
         }
         Ok(Self {
             handle,
@@ -108,7 +108,7 @@ mod tests {
     fn a_refused_registration_is_an_error() {
         let controls = Arc::new(Controls::new(QpcClock::start()));
         let refused = SuspendWatch::register_with(controls, |_, _| ERROR_ACCESS_DENIED);
-        let e = refused.err().expect("refused");
+        let e = format!("{:#}", refused.err().expect("refused"));
         assert!(e.contains("error 5"), "{e}");
     }
 

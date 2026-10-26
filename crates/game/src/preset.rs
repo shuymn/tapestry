@@ -8,8 +8,6 @@
 //! Before the first release the file's shape may change incompatibly. A file
 //! written by an older version is refused as unreadable, never converted.
 
-use std::fmt;
-
 use bms_model::TimeUs;
 use rules::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
@@ -20,27 +18,18 @@ use rules::{
 use serde::{Deserialize, Serialize};
 
 /// Why a preset file could not be used.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PresetError {
     /// The text is not TOML of the preset's shape.
-    Parse(String),
+    #[error(
+        "the preset file cannot be read (a file from an older version is refused, not \
+         converted; deleting it writes the current custom preset again)"
+    )]
+    Parse(#[source] toml::de::Error),
     /// The preset failed its validation.
-    Invalid(RuleError),
+    #[error("the preset is invalid")]
+    Invalid(#[source] RuleError),
 }
-
-impl fmt::Display for PresetError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Parse(e) => write!(
-                f,
-                "the preset file cannot be read (a file from an older version is refused, not                  converted; deleting it writes the current custom preset again): {e}"
-            ),
-            Self::Invalid(e) => write!(f, "the preset is invalid: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for PresetError {}
 
 /// Reads a preset from TOML and validates it.
 ///
@@ -50,7 +39,7 @@ impl std::error::Error for PresetError {}
 /// unknown key; [`PresetError::Invalid`] for a preset that fails
 /// [`RulePreset::validate`].
 pub fn load_preset_toml(text: &str) -> Result<RulePreset, PresetError> {
-    let file: PresetFile = toml::from_str(text).map_err(|e| PresetError::Parse(e.to_string()))?;
+    let file: PresetFile = toml::from_str(text).map_err(PresetError::Parse)?;
     let preset = RulePreset::from(file);
     preset.validate().map_err(PresetError::Invalid)?;
     Ok(preset)

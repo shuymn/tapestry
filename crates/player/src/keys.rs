@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use eval::ControlId;
 use game::{
     Bound, DeviceSettings, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyError, KeyScreen, Refusal,
@@ -148,7 +149,7 @@ impl KeyScreen for Screen<'_> {
         if let Err(e) = self.renderer.text_frame(&refs) {
             // The screen is lost: nothing more can be shown, so the key
             // config ends as if the window closed.
-            eprintln!("render: {e}");
+            eprintln!("render: {}", game::Chain(&e));
             self.controls.close();
         }
     }
@@ -174,13 +175,13 @@ impl KeyScreen for Screen<'_> {
 pub fn run(
     clock: QpcClock,
     #[cfg(feature = "dev-tools")] script: Option<crate::dev::KeyScript>,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let root = crate::data_root()?;
     let path = root.device_settings();
     // Read without the key config checks, so a key config that `play`
     // refuses can be set again here.
     let mut device: DeviceSettings =
-        load_settings(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        load_settings(&path).with_context(|| path.display().to_string())?;
     let controls = Arc::new(Controls::new(clock));
     let capture = Capture::new();
     let (window_thread, surface, input) = crate::open_window_and_input(
@@ -202,7 +203,7 @@ pub fn run(
         Err(e) => {
             drop(input);
             window_thread.close();
-            return Err(e.to_string());
+            return Err(e.into());
         }
     };
     #[cfg(feature = "dev-tools")]
@@ -233,7 +234,7 @@ pub fn run(
                     "keys: the scratch axis reported beyond its declared range; its revolution is set to {wrap} values"
                 );
             }
-            save_settings(&path, &device).map_err(|e| format!("{}: {e}", path.display()))?;
+            save_settings(&path, &device).with_context(|| path.display().to_string())?;
             println!("keys: saved to {}", path.display());
         }
         KeyConfigEnd::Cancelled => println!("keys: cancelled, nothing written"),

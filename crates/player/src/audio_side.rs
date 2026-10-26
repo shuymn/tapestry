@@ -60,17 +60,32 @@ impl AudioLink {
     }
 }
 
+/// Why the audio thread did not start, with `E`, the output's error.
+#[derive(Debug, thiserror::Error)]
+pub enum AudioStartError<E> {
+    /// The output could not be opened.
+    #[error("audio")]
+    Open(#[source] E),
+    /// The thread could not be spawned.
+    #[error("the audio thread cannot start")]
+    Spawn(#[source] std::io::Error),
+    /// The thread ended before it opened the output.
+    #[error("the audio thread ended while opening the output")]
+    Ended,
+}
+
 /// Starts the audio thread: `open` makes the output on it, with the most
 /// periods its queue holds, if it says. `done` sees the output when the
 /// thread ends.
 ///
 /// # Errors
 ///
-/// What `open` returned, or a message if the thread could not start.
-pub fn spawn<O, F, D>(open: F, done: D) -> Result<(AudioThread, Opened), String>
+/// What `open` returned, or why the thread did not start.
+pub fn spawn<O, E, F, D>(open: F, done: D) -> Result<(AudioThread, Opened), AudioStartError<E>>
 where
     O: AudioOutput,
-    F: FnOnce() -> Result<(O, Option<u32>), String> + Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Result<(O, Option<u32>), E> + Send + 'static,
     D: FnOnce(&O) + Send + 'static,
 {
     let (worker_tx, worker_rx) = mpsc::sync_channel::<AudioWorker>(1);
@@ -98,7 +113,7 @@ where
             }
             done(&out);
         })
-        .map_err(|e| format!("the audio thread cannot start: {e}"))?;
+        .map_err(AudioStartError::Spawn)?;
     match ready_rx.recv() {
         Ok(Ok(opened)) => Ok((
             AudioThread {
@@ -109,8 +124,8 @@ where
         )),
         Ok(Err(e)) => {
             let _ = handle.join();
-            Err(e)
+            Err(AudioStartError::Open(e))
         }
-        Err(_) => Err("the audio thread ended while opening the output".to_owned()),
+        Err(_) => Err(AudioStartError::Ended),
     }
 }
