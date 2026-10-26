@@ -215,6 +215,7 @@ impl Capture {
                 min,
                 max,
                 bits: u16::try_from(slot.bits.load(Ordering::Relaxed)).unwrap_or(0),
+                signed: min < 0,
             },
             lo: narrow(&slot.lo),
             hi: narrow(&slot.hi),

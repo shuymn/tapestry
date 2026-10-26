@@ -10,7 +10,7 @@ use input::hid::{
     AxisCap, ButtonGroup, CollectionSlot, HidDevice, HidLayout, HidReport, Placement, axis_cap,
     axis_control, axis_value, button_control, capture_travel, collection_of, group_device,
     in_collection, interface_of, is_axis, place_collection, read_report, remove_collection,
-    until_nul, widened_wrap,
+    until_nul, widened_wrap, wrap_range,
 };
 use input::{Capture, DeviceId, DeviceKind, SourceConfig, SourceReader, SourceSet};
 
@@ -27,6 +27,7 @@ fn caps() -> [AxisCap; 2] {
             min: 0,
             max: 255,
             bits: 16,
+            signed: false,
         },
         AxisCap {
             control: DIAL,
@@ -35,6 +36,7 @@ fn caps() -> [AxisCap; 2] {
             min: 0,
             max: 0,
             bits: 16,
+            signed: false,
         },
     ]
 }
@@ -187,6 +189,7 @@ fn more_axes_than_kept_are_ignored() {
             min: 0,
             max: 0,
             bits: 16,
+            signed: false,
         })
         .collect();
     let dev = HidDevice::new(PAD, &layout(&many));
@@ -318,6 +321,7 @@ fn capture_travel_is_a_sixteenth_turn_at_least_16() {
         min: 0,
         max: 0,
         bits: 16,
+        signed: false,
     };
     assert_eq!(capture_travel(&cap(0)), 16);
     assert_eq!(capture_travel(&cap(256)), 16);
@@ -516,6 +520,7 @@ fn collections_of_one_controller_are_one_source() {
         min: 0,
         max: 255,
         bits: 16,
+        signed: false,
     }];
     // The adapter declares the second collection's axis as it connects.
     set.add_axes(PAD, &second_axes);
@@ -700,6 +705,7 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
             min,
             max,
             bits,
+            signed: min < 0,
         })
     };
     // Signed and unsigned 8 bits.
@@ -718,7 +724,7 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
         absolute(65_536, -32_768, 32_767, 16)
     );
     assert_eq!(cap(true, 0, -1, 16), absolute(65_536, 0, 65_535, 16));
-    // A relative axis has no range.
+    // A relative axis has no range, but keeps its field's signedness.
     assert_eq!(
         cap(false, -127, 127, 8),
         Some(AxisCap {
@@ -728,6 +734,7 @@ fn axis_cap_takes_the_declared_range_of_any_shape() {
             min: 0,
             max: 0,
             bits: 8,
+            signed: true,
         })
     );
     // A full 32-bit range does not fit in a u32; an empty one is no range.
@@ -760,11 +767,33 @@ fn widening_takes_the_smallest_field_span_holding_what_was_seen() {
         min: i32::MIN + 1,
         max: i32::MAX,
         bits: 32,
+        signed: true,
     };
     assert_eq!(widened_wrap(&wide, i32::MIN, 0), None);
     // A relative axis has no range to widen.
     let relative = axis_cap(DIAL, false, 0, 0, 8).unwrap();
     assert_eq!(widened_wrap(&relative, -500, 500), None);
+}
+
+#[test]
+fn a_set_revolution_spans_the_standard_range() {
+    let unsigned = axis_cap(X, true, 0, 127, 8).unwrap();
+    let signed = axis_cap(X, true, -127, 127, 8).unwrap();
+    // What key config writes: 0..=255 unsigned, -128..=127 signed.
+    assert_eq!(wrap_range(&unsigned, 256), Some((0, 255)));
+    assert_eq!(wrap_range(&signed, 256), Some((-128, 127)));
+    // Any other count of values, odd ones centered low.
+    assert_eq!(wrap_range(&unsigned, 360), Some((0, 359)));
+    assert_eq!(wrap_range(&signed, 255), Some((-127, 127)));
+    // The largest revolution: signed it ends at i32::MAX exactly
+    // (-(2^31 - 1) + 2^32 - 2), unsigned it is cut there.
+    assert_eq!(
+        wrap_range(&signed, u32::MAX),
+        Some((-2_147_483_647, i32::MAX))
+    );
+    assert_eq!(wrap_range(&unsigned, u32::MAX), Some((0, i32::MAX)));
+    // An axis that does not wrap has no range.
+    assert_eq!(wrap_range(&unsigned, 0), None);
 }
 
 #[test]
@@ -1115,6 +1144,7 @@ fn axes_past_the_table_are_not_kept() {
             min: 0,
             max: 255,
             bits: 16,
+            signed: false,
         })
         .collect();
     let kept = set.add_axes(PAD, &more);

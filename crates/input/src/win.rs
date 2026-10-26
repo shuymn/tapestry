@@ -461,6 +461,7 @@ impl Controllers {
             min: 0,
             max: 0,
             bits: 0,
+            signed: false,
         }; MAX_AXES];
         let mut groups = [ButtonGroup {
             report_id: 0,

@@ -197,6 +197,7 @@ fn key_config_gives_profiles_and_recorded_controls() {
         min: 0,
         max: 254,
         bits: 16,
+        signed: false,
     }];
     let profile = s.profile(&[DeviceKind::Controller, DeviceKind::Keyboard], &[declared]);
     let lane = |n| Lane::new(n).unwrap();
@@ -270,6 +271,7 @@ fn scratch_settings_resolve_from_the_device_unless_set() {
         min: 0,
         max: i32::try_from(wrap).unwrap() - 1,
         bits: 16,
+        signed: false,
     };
     let auto = ScratchConfig::default();
     let mode = |c: &ScratchConfig, declared: Option<AxisCap>| c.settings(declared.as_ref()).mode;
@@ -307,6 +309,53 @@ fn scratch_settings_resolve_from_the_device_unless_set() {
     }
     .settings(Some(&cap(false, 255)));
     assert_eq!(s.press_threshold, 7);
+}
+
+#[test]
+fn scratch_range_is_the_one_its_conversion_uses() {
+    let cap = |relative, min, max| AxisCap {
+        control: ControlId(0x1_0030),
+        relative,
+        wrap: if relative {
+            0
+        } else {
+            u32::try_from(max - min + 1).unwrap()
+        },
+        min,
+        max,
+        bits: 16,
+        signed: min < 0,
+    };
+    let auto = ScratchConfig::default();
+    let wrap = |w| ScratchConfig {
+        wrap: Some(w),
+        ..auto
+    };
+    // As declared, unless the file sets a revolution.
+    assert_eq!(auto.range(&cap(false, 3, 200)), Some((3, 200)));
+    assert_eq!(auto.range(&cap(true, 0, 0)), None);
+    assert_eq!(wrap(256).range(&cap(false, 3, 200)), Some((0, 255)));
+    assert_eq!(wrap(1_024).range(&cap(false, -100, 100)), Some((-512, 511)));
+    // A revolution of 0 does not wrap, and a relative axis has no range,
+    // whichever way it is relative.
+    assert_eq!(wrap(0).range(&cap(false, 3, 200)), None);
+    let relative = ScratchConfig {
+        relative: Some(true),
+        ..auto
+    };
+    assert_eq!(relative.range(&cap(false, 3, 200)), None);
+    // Set absolute: the declared relative axis has no declared revolution,
+    // so only a set one gives it a range.
+    let absolute = ScratchConfig {
+        relative: Some(false),
+        ..auto
+    };
+    assert_eq!(absolute.range(&cap(true, 0, 0)), None);
+    let absolute_300 = ScratchConfig {
+        wrap: Some(300),
+        ..absolute
+    };
+    assert_eq!(absolute_300.range(&cap(true, 0, 0)), Some((0, 299)));
 }
 
 #[test]

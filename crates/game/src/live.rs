@@ -59,8 +59,9 @@ pub struct Closing {
     pub overflowed: bool,
     /// Whether a device did not take part because of the source limit.
     pub source_limited: bool,
-    /// How many axis values each source reported outside their declared
-    /// range, by source id ([`input::SourceSet::axis_out_of_range`]).
+    /// How many axis values each source reported outside the range their
+    /// conversion uses, by source id
+    /// ([`input::SourceSet::axis_out_of_range`]).
     pub axis_out_of_range: Vec<u64>,
 }
 

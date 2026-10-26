@@ -18,7 +18,7 @@ use std::thread::Thread;
 
 use bms_model::TimeUs;
 use eval::ControlId;
-use game::{Closing, Opening};
+use game::{Closing, Opening, ScratchConfig};
 use input::hid::HidProduct;
 use input::{DeviceId, DeviceKind, SourceReader, SourceSet};
 
@@ -50,6 +50,9 @@ pub struct Recorded {
     /// The controller they belong to; `None` when no controller binds a
     /// lane.
     pub controller_device: Option<HidProduct>,
+    /// How the controller's bound axes are converted, for the range their
+    /// values are counted against.
+    pub scratch: ScratchConfig,
 }
 
 /// The input thread's answers.
@@ -300,12 +303,8 @@ impl Hook {
             axis_out_of_range: sources.axis_out_of_range().collect(),
         };
         // Shown once per play: the record keeps the counts.
-        for (i, &n) in closed.axis_out_of_range.iter().enumerate() {
-            if n > 0 {
-                eprintln!(
-                    "input: source {i} reported {n} axis values outside the range its controller declares; set its scratch range in device.toml"
-                );
-            }
+        for line in out_of_range_warnings(sources) {
+            eprintln!("{line}");
         }
         sources.close_recording();
         self.origin = None;
@@ -313,12 +312,39 @@ impl Hook {
     }
 }
 
+/// The console lines for the open recording's axis values outside the
+/// range their conversion uses: per source, one for the values counted
+/// against a range `device.toml` sets and one for those counted against a
+/// declared range, each only when there are any.
+fn out_of_range_warnings(sources: &SourceSet) -> Vec<String> {
+    let mut lines = Vec::new();
+    let counts = sources
+        .axis_out_of_range()
+        .zip(sources.axis_out_of_set_range());
+    for (i, (n, set)) in counts.enumerate() {
+        if set > 0 {
+            lines.push(format!(
+                "input: source {i} reported {set} axis values outside the scratch range device.toml sets; correct it there or capture the scratch again in `tapestry keys`"
+            ));
+        }
+        let declared = n - set;
+        if declared > 0 {
+            lines.push(format!(
+                "input: source {i} reported {declared} axis values outside the range its controller declares; set its scratch range in device.toml"
+            ));
+        }
+    }
+    lines
+}
+
 /// Sets what each connected device records and whether it takes part:
 /// every keyboard records the keyboard controls, and the first controller
 /// of the configured model ([`Recorded::controller_device`]) the
 /// controller's; any other controller, a second of that model included,
-/// takes no part. Returns `false` when a controller is configured and none
-/// of its model is connected.
+/// takes no part. The controller's bound axes to which `device.toml`
+/// gives a range other than the declared one ([`ScratchConfig::range`])
+/// are counted against it. Returns `false`
+/// when a controller is configured and none of its model is connected.
 fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
     let devices: Vec<_> = sources.devices().collect();
     let mut matched = false;
@@ -331,6 +357,19 @@ fn take_part(sources: &mut SourceSet, recorded: &Recorded) -> bool {
                         .controller_device
                         .is_some_and(|p| sources.has_product(d, p));
                 matched |= mine;
+                let ranges = if mine {
+                    sources
+                        .axes(d)
+                        .iter()
+                        .filter(|c| recorded.controller.contains(&c.control))
+                        .map(|c| (c.control, recorded.scratch.range(c), c))
+                        .filter(|&(_, range, c)| range != (!c.relative).then_some((c.min, c.max)))
+                        .map(|(control, range, _)| (control, range))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                sources.set_axis_ranges(d, ranges);
                 (&recorded.controller, mine)
             }
         };
@@ -353,10 +392,13 @@ fn reset_gate(sources: &mut SourceSet, controls: &Controls) {
 mod tests {
     use bms_model::TimeUs;
     use eval::ControlId;
-    use input::hid::HidProduct;
-    use input::{DeviceId, DeviceKind, Packet, SourceConfig, SourceSet};
+    use game::ScratchConfig;
+    use input::hid::{
+        AxisCap, HidDevice, HidLayout, HidProduct, HidReport, axis_cap, axis_control,
+    };
+    use input::{Capture, DeviceId, DeviceKind, Packet, SourceConfig, SourceSet};
 
-    use super::{Recorded, take_part};
+    use super::{Recorded, out_of_range_warnings, take_part};
 
     /// The configured controller: function 1 of a composite device.
     const CONFIGURED: HidProduct = HidProduct {
@@ -384,6 +426,7 @@ mod tests {
             keyboard: vec![ControlId(0x0e), ControlId(0x01)],
             controller: vec![BUTTON],
             controller_device: device,
+            scratch: ScratchConfig::default(),
         }
     }
 
@@ -508,5 +551,137 @@ mod tests {
         assert!(take_part(&mut set, &recorded(Some(CONFIGURED))));
         set.open_recording(TimeUs(1));
         assert_eq!(set.left_out(), 0);
+    }
+
+    const X: ControlId = axis_control(0x01, 0x30);
+    const Y: ControlId = axis_control(0x01, 0x31);
+
+    /// A play on the configured controller, with axes `caps`, X bound to a
+    /// lane, and `scratch` from `device.toml`: each of `reports` (a value
+    /// per axis of `caps`) goes through the controller's HID reader.
+    /// Returns each source's count (the controller, then keyboards 1 and
+    /// 2) and the warnings closing prints.
+    fn hid_play(
+        caps: &[AxisCap],
+        scratch: ScratchConfig,
+        reports: &[&[Option<i32>]],
+    ) -> (Vec<u64>, Vec<String>) {
+        let mut set = devices(&[(10, CONFIGURED)]);
+        set.add_axes(DeviceId(10), caps);
+        let mut recorded = recorded(Some(CONFIGURED));
+        recorded.controller.push(X);
+        recorded.scratch = scratch;
+        assert!(take_part(&mut set, &recorded));
+        set.open_recording(TimeUs(1));
+        let layout = HidLayout {
+            collection: 0,
+            axes: caps,
+            buttons: &[],
+        };
+        let mut pad = HidDevice::new(DeviceId(10), &layout);
+        let capture = Capture::new();
+        assert!(set.begin_batch(TimeUs(2)));
+        for &axes in reports {
+            let report = HidReport {
+                id: 0,
+                buttons: None,
+                axes,
+            };
+            pad.report(&report, false, &capture, &mut set);
+        }
+        set.end_batch(TimeUs(3));
+        (
+            set.axis_out_of_range().collect(),
+            out_of_range_warnings(&set),
+        )
+    }
+
+    fn wrap(n: u32) -> ScratchConfig {
+        ScratchConfig {
+            wrap: Some(n),
+            ..ScratchConfig::default()
+        }
+    }
+
+    fn set_line(n: u64) -> String {
+        format!(
+            "input: source 0 reported {n} axis values outside the scratch range device.toml sets; correct it there or capture the scratch again in `tapestry keys`"
+        )
+    }
+
+    fn declared_line(n: u64) -> String {
+        format!(
+            "input: source 0 reported {n} axis values outside the range its controller declares; set its scratch range in device.toml"
+        )
+    }
+
+    /// The bound axis is counted against the range its conversion uses:
+    /// the declared 0..=255, or the 128-value revolution `device.toml`
+    /// sets (0..=127), which the warning names; none when it sets the axis
+    /// relative.
+    #[test]
+    fn axis_values_are_counted_against_the_range_conversion_uses() {
+        let caps = [axis_cap(X, true, 0, 255, 8).unwrap()];
+        let reports: [&[Option<i32>]; 3] = [&[Some(200)], &[Some(255)], &[Some(100)]];
+        let (counts, lines) = hid_play(&caps, ScratchConfig::default(), &reports);
+        assert_eq!((counts, lines.len()), (vec![0, 0, 0], 0));
+        let (counts, lines) = hid_play(&caps, wrap(128), &reports);
+        assert_eq!(counts, [2, 0, 0]);
+        assert_eq!(lines, [set_line(2)]);
+        let outside: [&[Option<i32>]; 2] = [&[Some(-5)], &[Some(300)]];
+        let (counts, lines) = hid_play(&caps, ScratchConfig::default(), &outside);
+        assert_eq!(counts, [2, 0, 0]);
+        assert_eq!(lines, [declared_line(2)]);
+        let relative = ScratchConfig {
+            relative: Some(true),
+            ..ScratchConfig::default()
+        };
+        let (counts, lines) = hid_play(&caps, relative, &outside);
+        assert_eq!((counts, lines.len()), (vec![0, 0, 0], 0));
+    }
+
+    /// The warning names the range each value fell outside: with X's
+    /// revolution set, an unbound Y declaring 0..=99 is still checked
+    /// against its declaration, and so is X when `device.toml` sets it
+    /// absolute without changing its range.
+    #[test]
+    fn the_warning_names_the_range_the_values_fell_outside() {
+        let caps = [
+            axis_cap(X, true, 0, 127, 8).unwrap(),
+            axis_cap(Y, true, 0, 99, 8).unwrap(),
+        ];
+        let reports: [&[Option<i32>]; 2] = [&[Some(200), Some(100)], &[Some(201), Some(5)]];
+        let (counts, lines) = hid_play(&caps, wrap(256), &reports);
+        assert_eq!(counts, [1, 0, 0]);
+        assert_eq!(lines, [declared_line(1)]);
+        let (counts, lines) = hid_play(&caps, wrap(64), &reports);
+        assert_eq!(counts, [3, 0, 0]);
+        assert_eq!(lines, [set_line(2), declared_line(1)]);
+        let absolute = ScratchConfig {
+            relative: Some(false),
+            ..ScratchConfig::default()
+        };
+        let (counts, lines) = hid_play(&caps, absolute, &reports);
+        assert_eq!(counts, [3, 0, 0]);
+        assert_eq!(lines, [declared_line(3)]);
+    }
+
+    /// A signed 8-bit position field its descriptor declares relative,
+    /// set absolute with 256 values in `device.toml`: its revolution is
+    /// -128..=127, so valid negative positions are not counted, and values
+    /// beyond it are.
+    #[test]
+    fn a_signed_field_declared_relative_keeps_its_signedness() {
+        let caps = [axis_cap(X, false, -127, 127, 8).unwrap()];
+        let set = ScratchConfig {
+            relative: Some(false),
+            ..wrap(256)
+        };
+        let inside: [&[Option<i32>]; 4] = [&[Some(-100)], &[Some(-128)], &[Some(127)], &[Some(5)]];
+        let (counts, lines) = hid_play(&caps, set, &inside);
+        assert_eq!((counts, lines.len()), (vec![0, 0, 0], 0));
+        let (counts, lines) = hid_play(&caps, set, &[&[Some(-129)], &[Some(128)]]);
+        assert_eq!(counts, [2, 0, 0]);
+        assert_eq!(lines, [set_line(2)]);
     }
 }

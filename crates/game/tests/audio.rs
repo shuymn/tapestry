@@ -395,9 +395,10 @@ fn an_abort_stops_the_sounds_and_the_bgm_to_come() {
         Flaky::new(TimeUs(990 * MS), 1),
     );
     assert_eq!(outcome, RunOutcome::Aborted(AbortCause::FocusLoss));
-    // The long sound was playing (0.25 of full scale), nothing else.
-    assert!(samples.contains(&0.25));
-    assert!(samples.iter().all(|&x| x <= 0.25), "the click sounded");
+    // The long sound was playing (0.25 of full scale, 0.125 after the
+    // mixer's headroom), nothing else.
+    assert!(samples.contains(&0.125));
+    assert!(samples.iter().all(|&x| x <= 0.125), "the click sounded");
     assert_eq!((sounding, bgm_left, queued), (0, 0, 0));
 }
 
@@ -425,8 +426,8 @@ fn a_focus_loss_between_coarse_steps_stops_audio_before_its_overdue_wakes() {
     let (outcome, samples, sounding, bgm_left, _) =
         abort_run(100 * MS, 1_050 * MS, 1_105 * MS, &[], Flaky::new(START, 0));
     assert_eq!(outcome, RunOutcome::Aborted(AbortCause::FocusLoss));
-    assert!(samples.contains(&0.25));
-    assert!(samples.iter().all(|&x| x <= 0.25), "the click sounded");
+    assert!(samples.contains(&0.125));
+    assert!(samples.iter().all(|&x| x <= 0.125), "the click sounded");
     assert_eq!((sounding, bgm_left), (0, 0));
 }
 
@@ -465,8 +466,9 @@ fn bgm_starts_at_its_chart_time_frames_across_the_lead_in() {
     let samples = left(&runner);
     assert_eq!(onsets(&samples), [23_520, 47_520, 59_520]);
     for (k, f) in [23_520, 47_520, 59_520].into_iter().enumerate() {
-        // Sound k is the constant 1000 + 7 k (common::bank).
-        let want = f32::from(1_000 + 7 * i16::try_from(k).unwrap()) / 32_768.0;
+        // Sound k is the constant 1000 + 7 k (common::bank), halved by the
+        // mixer's headroom.
+        let want = f32::from(1_000 + 7 * i16::try_from(k).unwrap()) / 65_536.0;
         assert_eq!(samples[f], want);
     }
 }

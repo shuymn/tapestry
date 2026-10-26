@@ -109,8 +109,9 @@ fn autoplay_key_sounds_land_at_their_frames() {
         .collect();
     assert_eq!(common::onsets(&left), expected);
     for (i, &f) in expected.iter().enumerate() {
-        // Sound k is the constant 1000 + 7 k (common::bank).
-        let first = f32::from(1_000 + 7 * i16::try_from(i % 3).unwrap()) / 32_768.0;
+        // Sound k is the constant 1000 + 7 k (common::bank), halved by
+        // the mixer's headroom.
+        let first = f32::from(1_000 + 7 * i16::try_from(i % 3).unwrap()) / 65_536.0;
         assert_eq!(left[f], first, "note {i}");
     }
 }

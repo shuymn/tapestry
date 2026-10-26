@@ -474,6 +474,7 @@ fn rig<'a>(
             keyboard: device.keyboard.recorded(),
             controller: device.controller.recorded(),
             controller_device: device.controller_device.map(Into::into),
+            scratch: device.scratch,
         },
         gauge: loaded.settings().player.displayed_gauge,
         input_offset_us: device.input_offset_us,
