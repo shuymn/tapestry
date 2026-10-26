@@ -750,16 +750,19 @@ fn empty_lnobj_and_lntype_without_a_type_are_skipped() {
 
 #[test]
 fn headers_and_channels_stage_1_does_not_use_are_silent() {
-    let quiet = "#BPM 120\n#BASEBPM 150\n#CHARFILE c.chp\n#EXTCHR 01 02\n#MIDIFILE m.mid\n\
-                 #MAKER someone\n#BGA01 01 0 0 8 8 0 0\n#TEXT01 hello\n#EXRANK01 50\n\
+    // Header names are case-insensitive.
+    let quiet = "#BPM 120\n#BASEBPM 150\n#CharFile c.chp\n#EXTCHR 01 02\n\
+                 #maker someone\n#BGA01 01 0 0 8 8 0 0\n#Text0z hello\n#EXRANK01 50\n\
                  #WAV01 click.wav\n#00111:01\n#00131:01\n#00135:01\n#00139:01\n";
     let loaded = load_text(quiet).unwrap();
     assert_eq!(loaded.warnings, vec![]);
     // Invisible notes are not notes.
     assert_eq!(loaded.chart.lanes.iter().map(Vec::len).sum::<usize>(), 1);
     // Other unknown headers and channels, judge-rank changes (A0) included,
-    // still warn.
-    let loud = "#BPM 120\n#WAV01 click.wav\n#FOO 1\n#00111:01\n#001A0:01\n#00117:01\n";
+    // still warn: a background MIDI file (its music would be missing), and
+    // numbered definitions without a two-character id.
+    let loud = "#BPM 120\n#WAV01 click.wav\n#FOO 1\n#MIDIFILE m.mid\n#EXRANK 50\n\
+                #BGA001 01 0 0 8 8 0 0\n#TEXT0! hi\n#00111:01\n#001A0:01\n#00117:01\n";
     assert_eq!(
         load_text(loud)
             .unwrap()
@@ -769,6 +772,10 @@ fn headers_and_channels_stage_1_does_not_use_are_silent() {
             .collect::<Vec<_>>(),
         vec![
             WarningKind::UnknownHeader("FOO".to_owned()),
+            WarningKind::UnknownHeader("MIDIFILE".to_owned()),
+            WarningKind::UnknownHeader("EXRANK".to_owned()),
+            WarningKind::UnknownHeader("BGA001".to_owned()),
+            WarningKind::UnknownHeader("TEXT0!".to_owned()),
             WarningKind::IgnoredChannel("A0".to_owned()),
             WarningKind::IgnoredChannel("17".to_owned()),
         ]

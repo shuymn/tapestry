@@ -943,3 +943,29 @@ fn auto_play_on_the_window() {
     assert_eq!(stdout.matches("autoplay: not saved").count(), 2, "{stdout}");
     assert!(!appdata.join("tapestry").join("records").exists());
 }
+
+/// A chart's missing sound files are one warning line, on stderr and in the
+/// log alike.
+#[test]
+fn missing_sounds_are_summed_up_once() {
+    let mut text = CHART.to_owned();
+    text.push_str("#WAV03 gone1.wav\n#WAV04 gone2.wav\n#WAV05 gone3.wav\n#WAV06 gone4.wav\n");
+    let fx = fixture_of(&text);
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let line = "4 sound files are missing: gone1.wav, gone2.wav, gone3.wav and 1 more";
+    let missing: Vec<&str> = stderr_warnings(&stderr)
+        .into_iter()
+        .filter(|w| w.contains("missing"))
+        .collect();
+    assert_eq!(missing, [line], "{stderr}");
+    let logged = log_lines(&fx.appdata);
+    assert!(
+        logged.contains(&format!("chart: {line}")),
+        "{line:?} in {logged:?}"
+    );
+}

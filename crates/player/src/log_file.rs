@@ -70,9 +70,10 @@ pub fn warnings(what: &str, items: impl ExactSizeIterator<Item = impl Display>) 
     warnings_to(what, items, &mut io::stderr().lock(), log::logger());
 }
 
-/// Sums up a chart's missing sound files in one line: on stderr the count
-/// and the first [`MISSING_NAMED`] names, in the log the count alone, so
-/// the chart's file names stay off the disk. Nothing when none is missing.
+/// Sums up a chart's missing sound files in one line, the count and the
+/// first [`MISSING_NAMED`] names with control characters escaped, on
+/// stderr and in the log like any chart warning. Nothing when none is
+/// missing.
 pub fn missing_sounds<'a>(names: impl ExactSizeIterator<Item = &'a str>) {
     missing_sounds_to(names, &mut io::stderr().lock(), log::logger());
 }
@@ -91,15 +92,30 @@ fn missing_sounds_to<'a>(
     } else {
         format!("{n} sound files are missing")
     };
-    let shown: Vec<&str> = names.take(MISSING_NAMED).collect();
+    let shown: Vec<String> = names.take(MISSING_NAMED).map(escaped).collect();
     let more = n - shown.len();
     let rest = if more > 0 {
         format!(" and {more} more")
     } else {
         String::new()
     };
-    let _ = writeln!(err, "warning: {count}: {}{rest}", shown.join(", "));
-    log.log(&own(Level::Warn, format_args!("chart: {count}")));
+    let line = format!("{count}: {}{rest}", shown.join(", "));
+    let _ = writeln!(err, "warning: {line}");
+    log.log(&own(Level::Warn, format_args!("chart: {line}")));
+}
+
+/// A chart-written name with its control characters (a carriage return, an
+/// escape) as `\u{..}`, so it cannot rewrite the terminal or split a line.
+fn escaped(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 fn warnings_to(
@@ -702,37 +718,45 @@ mod tests {
     }
 
     #[test]
-    fn missing_sounds_are_one_line_with_names_on_stderr_only() {
+    fn missing_sounds_are_one_line_on_stderr_and_in_the_log() {
         let names = ["kick.wav", "snare.ogg", "hat.wav", "bass.flac", "pad.wav"];
         let kept = Kept::default();
         let mut err = Vec::new();
         missing_sounds_to(names.iter().copied(), &mut err, &kept);
+        let line = "5 sound files are missing: kick.wav, snare.ogg, hat.wav and 2 more";
         assert_eq!(
             String::from_utf8(err).unwrap(),
-            "warning: 5 sound files are missing: kick.wav, snare.ogg, hat.wav and 2 more\n"
+            format!("warning: {line}\n")
         );
-        assert_eq!(
-            kept.0.into_inner().unwrap(),
-            ["chart: 5 sound files are missing"]
-        );
+        assert_eq!(kept.0.into_inner().unwrap(), [format!("chart: {line}")]);
         // Up to the named count, no remainder; one file reads as one.
         let kept = Kept::default();
         let mut err = Vec::new();
         missing_sounds_to(["kick.wav"].into_iter(), &mut err, &kept);
+        let line = "1 sound file is missing: kick.wav";
         assert_eq!(
             String::from_utf8(err).unwrap(),
-            "warning: 1 sound file is missing: kick.wav\n"
+            format!("warning: {line}\n")
         );
-        assert_eq!(
-            kept.0.into_inner().unwrap(),
-            ["chart: 1 sound file is missing"]
-        );
+        assert_eq!(kept.0.into_inner().unwrap(), [format!("chart: {line}")]);
         let mut err = Vec::new();
         missing_sounds_to(names[..3].iter().copied(), &mut err, &Kept::default());
         assert_eq!(
             String::from_utf8(err).unwrap(),
             "warning: 3 sound files are missing: kick.wav, snare.ogg, hat.wav\n"
         );
+        // Control characters in a name are escaped, a carriage return and an
+        // escape included; other characters stay as they are.
+        let kept = Kept::default();
+        let mut err = Vec::new();
+        let odd = ["a\rb.wav", "\u{1b}[2Jc.wav", "\u{97f3}.wav"];
+        missing_sounds_to(odd.into_iter(), &mut err, &kept);
+        let line = "3 sound files are missing: a\\u{d}b.wav, \\u{1b}[2Jc.wav, \u{97f3}.wav";
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!("warning: {line}\n")
+        );
+        assert_eq!(kept.0.into_inner().unwrap(), [format!("chart: {line}")]);
         // None missing: nothing at all.
         let kept = Kept::default();
         let mut err = Vec::new();

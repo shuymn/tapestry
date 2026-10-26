@@ -88,7 +88,6 @@ const IGNORED_HEADERS: &[&str] = &[
     "BASEBPM",
     "CHARFILE",
     "EXTCHR",
-    "MIDIFILE",
     "MAKER",
 ];
 

@@ -41,7 +41,7 @@
 //!   (31-39) silently. A 2P lane object (21-29, 61-69, E1-E9) is an
 //!   `Unsupported` error.
 //! - **Headers:** headers for what stage 1 does not show or use (`#BASEBPM`,
-//!   `#CHARFILE`, `#EXTCHR`, `#MIDIFILE`, `#MAKER`, `#BMPxx`, `#BGAxx`,
+//!   `#CHARFILE`, `#EXTCHR`, `#MAKER`, `#BMPxx`, `#BGAxx`,
 //!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
 //!   other unknown header is a warning.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
