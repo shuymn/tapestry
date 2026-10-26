@@ -4,11 +4,10 @@
 //! lengths and booleans are LEB128 varints; signed integers are zigzag
 //! varints; strings are a length then UTF-8 bytes. Every struct is
 //! destructured in full, so adding a field fails to compile until it is
-//! encoded. A change of layout adds a format version.
-//!
-//! Format 2 adds the empty POOR's `behind` distance after `ahead`. A preset
-//! without it is still written in format 1, so the bytes, and the hash a
-//! record holds, of a preset made before format 2 do not change.
+//! encoded. The first byte is the format version. Before the first release
+//! a change of layout bumps it and only the current layout is written, so a
+//! record made under an older layout no longer matches any preset and is
+//! refused when re-evaluated.
 
 use bms_model::TimeUs;
 
@@ -19,10 +18,9 @@ use crate::{
     Window,
 };
 
-/// The first encoding layout, for presets without an empty POOR `behind`.
-const FORMAT_V1: u64 = 1;
-/// The layout with the empty POOR's `behind` distance.
-const FORMAT_V2: u64 = 2;
+/// The encoding layout. Version 3 has a single miss rule and always the
+/// empty POOR's `behind` distance.
+const FORMAT_VERSION: u64 = 3;
 
 impl RulePreset {
     /// The preset's canonical bytes: equal presets give equal bytes, and any
@@ -30,11 +28,7 @@ impl RulePreset {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
-        w.uint(if self.empty_poor.behind.is_some() {
-            FORMAT_V2
-        } else {
-            FORMAT_V1
-        });
+        w.uint(FORMAT_VERSION);
         let Self {
             id,
             version,
@@ -59,8 +53,7 @@ impl RulePreset {
         w.implementation(*implementation);
         w.windows(windows);
         w.uint(match miss {
-            MissRule::PoorAfterLateBad => 0,
-            MissRule::PoorAfterLateBadOrOvertaken => 1,
+            MissRule::PoorAfterLateBadOrOvertaken => 0,
         });
         w.empty_poor(empty_poor);
         w.ln_break(ln_break);
@@ -157,10 +150,7 @@ impl Writer {
             counted,
         } = *rule;
         self.time(ahead);
-        // Format 2 only; format 1 is chosen by its absence.
-        if let Some(behind) = behind {
-            self.time(behind);
-        }
+        self.time(behind);
         self.bool(breaks_combo);
         self.bool(counts_bp);
         self.bool(counted);
@@ -345,18 +335,10 @@ mod tests {
         assert_ne!(changed(|p| p.gauges[1].low_damage = None), base);
         assert_ne!(changed(|p| p.gauges.swap(0, 1)), base);
         assert_ne!(changed(|p| p.empty_poor.counted = true), base);
-        assert_ne!(
-            changed(|p| p.empty_poor.behind = Some(TimeUs(150_001))),
-            base
-        );
-        assert_ne!(
-            changed(|p| p.miss = crate::MissRule::PoorAfterLateBad),
-            base
-        );
+        assert_ne!(changed(|p| p.empty_poor.behind = TimeUs(150_001)), base);
     }
 
-    /// A preset with every field distinct from its neighbours, in format 1:
-    /// no empty POOR `behind`.
+    /// A preset with every field distinct from its neighbours.
     fn representative() -> crate::RulePreset {
         let mut p = custom();
         p.id = "rep".to_owned();
@@ -373,10 +355,9 @@ mod tests {
             bad: w(170_000, 200_000),
         };
         p.empty_poor.ahead = TimeUs(250_000);
-        p.empty_poor.behind = None;
+        p.empty_poor.behind = TimeUs(120_000);
         p.empty_poor.counts_bp = false;
         p.empty_poor.counted = true;
-        p.miss = crate::MissRule::PoorAfterLateBad;
         p.ln_break.release_margin = TimeUs(80_000);
         p.ln_break.counts_bp = false;
         p.rank_scale = crate::RankScale {
@@ -387,48 +368,36 @@ mod tests {
         p
     }
 
-    /// The format 1 bytes of [`representative`].
-    const FORMAT_1: [u8; 198] = [
-        0x01, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+    /// The bytes of [`representative`], written by hand from the module docs
+    /// field by field: the format version 3, then `rep`, version 7, the
+    /// implementation, the windows, the miss rule (0), the empty POOR
+    /// (`ahead` 250 ms is zigzag 500000 = `a0 c2 1e`, `behind` 120 ms is
+    /// zigzag 240000 = `80 d3 0e`), and the rest in declaration order.
+    const PINNED: [u8; 201] = [
+        0x03, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x03, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
-        0x14, 0x80, 0xb5, 0x18, 0x00, 0xa0, 0xc2, 0x1e, 0x00, 0x00, 0x01, 0x80, //
-        0xe2, 0x09, 0x01, 0x00, 0x04, 0x80, 0xf1, 0x04, 0xe0, 0xc5, 0x08, 0xc0, //
-        0x9a, 0x0c, 0xa0, 0xef, 0x0f, 0xa0, 0xfe, 0x0a, 0x80, 0x89, 0x0f, 0x00, //
-        0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, 0x6c, 0x00, 0x80, 0xc8, 0xd0, //
-        0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, 0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, //
-        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x00, 0xff, 0xb4, //
-        0x18, 0x00, 0xff, 0x9e, 0x49, 0x00, 0xbf, 0xcf, 0x24, 0x00, 0xff, 0x9e, //
-        0x49, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, 0x61, 0x6c, 0x01, //
-        0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xfa, //
-        0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, 0x00, 0xbf, 0x84, 0x3d, 0x00, //
-        0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x00, 0xbf, 0xee, 0x6d, 0x01, //
-        0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0xa0, 0x8d, 0x06,
+        0x14, 0x80, 0xb5, 0x18, 0x00, 0xa0, 0xc2, 0x1e, 0x80, 0xd3, 0x0e, 0x00, //
+        0x00, 0x01, 0x80, 0xe2, 0x09, 0x01, 0x00, 0x04, 0x80, 0xf1, 0x04, 0xe0, //
+        0xc5, 0x08, 0xc0, 0x9a, 0x0c, 0xa0, 0xef, 0x0f, 0xa0, 0xfe, 0x0a, 0x80, //
+        0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, 0x6c, 0x00, //
+        0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, 0xb5, 0x18, 0x80, //
+        0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, //
+        0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, 0x00, 0xbf, 0xcf, 0x24, //
+        0x00, 0xff, 0x9e, 0x49, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, //
+        0x61, 0x6c, 0x01, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, 0xc4, 0x09, //
+        0x00, 0x80, 0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, 0x00, 0xbf, //
+        0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x00, 0xbf, //
+        0xee, 0x6d, 0x01, 0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, //
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, //
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa0, 0x8d, 0x06,
     ];
 
-    /// The layout of format version 1, pinned. The expected bytes were
-    /// computed by a separate encoder written from the module docs, so a
-    /// reordered or dropped field fails here; an intended layout change adds
-    /// a format version and a fixture of its own.
+    /// The layout, pinned, so a reordered or dropped field fails here; an
+    /// intended layout change bumps the format version and this fixture.
     #[test]
     fn canonical_bytes_match_pinned_layout() {
-        let p = representative();
-        assert_eq!(p.canonical_bytes(), FORMAT_1);
-    }
-
-    /// Format 2, pinned: format 1's bytes with the version byte 2 and
-    /// `behind` 120 ms (zigzag 240000 = `80 d3 0e`, by hand) inserted after
-    /// `ahead` (`a0 c2 1e`, offsets 41-43).
-    #[test]
-    fn canonical_bytes_with_behind_use_format_2() {
-        let mut p = representative();
-        p.empty_poor.behind = Some(TimeUs(120_000));
-        let mut expected = FORMAT_1.to_vec();
-        expected[0] = 0x02;
-        expected.splice(44..44, [0x80, 0xd3, 0x0e]);
-        assert_eq!(p.canonical_bytes(), expected);
+        assert_eq!(representative().canonical_bytes(), PINNED);
     }
 
     #[test]

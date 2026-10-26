@@ -511,6 +511,7 @@ mod tests {
             load_from: TimeUs(0),
             retry: false,
             audio: None,
+            queued_periods: None,
         })
     }
 
@@ -770,8 +771,8 @@ mod tests {
             measure: play_measure(origin),
         });
         let start = (TimeUs(600_000), TimeUs(0));
-        let faster = (TimeUs(575_000), TimeUs(0));
-        let later = (TimeUs(575_000), TimeUs(1_000));
+        let faster = (TimeUs(569_000), TimeUs(0));
+        let later = (TimeUs(569_000), TimeUs(1_000));
         assert!(wait_until(|| seen.lock().unwrap().contains(&start)));
         assert!(tuning.adjust(Adjust::HiSpeedUp));
         assert!(wait_until(|| seen.lock().unwrap().contains(&faster)));

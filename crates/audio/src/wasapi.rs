@@ -5,9 +5,16 @@
 //! format, event-driven. `IAudioClient3` initializes it at the shortest
 //! engine period; if the endpoint refuses that, a fresh `IAudioClient`
 //! initializes it at the default period, and the refusal is recorded in
-//! [`Grant::fallback`]. The output keeps two periods queued (fewer only if
-//! the buffer cannot hold them), and the thread that opens it joins the
-//! MMCSS "Pro Audio" task.
+//! [`Grant::fallback`]. The output keeps two periods queued at first (fewer
+//! only if the buffer cannot hold them); between plays the queue can be
+//! deepened up to [`MAX_QUEUE_PERIODS`] that the buffer holds
+//! ([`AudioOutput::set_queue_periods`]). `IAudioClient3` chooses its own
+//! buffer, often just over two periods; when its shortest period is also
+//! the default one, nothing is gained from it, and `IAudioClient` is
+//! initialized at that period with a buffer of [`MAX_QUEUE_PERIODS`]
+//! instead ([`Grant::widened`]). The buffer's size adds no latency: only
+//! the queued frames do. The thread that opens it joins the MMCSS "Pro
+//! Audio" task.
 //!
 //! The mix clock is taken from the buffer events by the engine.
 //! `IAudioClock::GetPosition` is read at each wake only as a diagnostic
@@ -37,10 +44,10 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, Interface, w};
 
 use crate::CHANNELS;
-use crate::output::{AudioOutput, OutputError, Wake};
+use crate::output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, Wake};
 
-/// Periods kept queued on the device (design.md "Path from Press to
-/// Sound": with one, audio dropped out repeatedly).
+/// Periods kept queued on the device when it opens (design.md "Path from
+/// Press to Sound": with one, audio dropped out repeatedly).
 pub const QUEUE_PERIODS: u32 = 2;
 
 /// How long a wait for a buffer event may take before the output reports
@@ -132,12 +139,19 @@ pub struct Grant {
     pub period: u32,
     /// The device buffer, frames.
     pub buffer: u32,
-    /// Periods kept queued.
+    /// Periods kept queued when it opened.
     pub queue_periods: u32,
+    /// The most periods the queue can hold: what the buffer holds, at most
+    /// [`MAX_QUEUE_PERIODS`].
+    pub max_queue_periods: u32,
     /// The periods `IAudioClient3` offered, when it answered.
     pub engine_periods: Option<EnginePeriods>,
     /// Why the default period was used instead of the shortest, if it was.
     pub fallback: Option<Fallback>,
+    /// Whether `IAudioClient3`'s buffer held fewer than
+    /// [`MAX_QUEUE_PERIODS`] at a shortest period equal to the default, so
+    /// `IAudioClient` was initialized at that period with a wider buffer.
+    pub widened: bool,
     /// Whether the opening thread joined MMCSS "Pro Audio".
     pub mmcss: bool,
 }
@@ -311,9 +325,10 @@ unsafe fn check_format(format: *const WAVEFORMATEX) -> Result<(u32, u16), Wasapi
     Ok((f.nSamplesPerSec, channels))
 }
 
-/// Periods to keep queued in a buffer of `buffer` frames.
-fn queue_periods(buffer: u32, period: u32) -> u32 {
-    (buffer / period.max(1)).clamp(1, QUEUE_PERIODS)
+/// Periods a buffer of `buffer` frames can keep queued, at least one and at
+/// most [`MAX_QUEUE_PERIODS`].
+fn buffer_periods(buffer: u32, period: u32) -> u32 {
+    (buffer / period.max(1)).clamp(1, MAX_QUEUE_PERIODS)
 }
 
 /// Frames to write: whole periods up to `queue` frames queued.
@@ -322,9 +337,74 @@ fn room(queue: u32, padding: u32, period: u32) -> u32 {
     queue.saturating_sub(padding) / period * period
 }
 
-/// A duration in 100 ns units as frames at `rate` (floor).
+/// The opening decision once `IAudioClient3` initialized a stream at
+/// `period` frames with a `buffer`-frame buffer, having offered `offered`:
+/// `Some(period)` to reopen through `IAudioClient` at that same period with
+/// a wider buffer, `None` to keep the stream. It reopens when the buffer
+/// holds fewer than [`MAX_QUEUE_PERIODS`] periods and the shortest period
+/// is the default, so the shorter period `IAudioClient3` exists for is not
+/// there to lose.
+fn reopen_wider(offered: Option<EnginePeriods>, period: u32, buffer: u32) -> Option<u32> {
+    offered
+        .filter(|p| buffer_periods(buffer, period) < MAX_QUEUE_PERIODS && p.min >= p.default)
+        .map(|_| period)
+}
+
+/// The buffer to ask `IAudioClient::Initialize` for, 100 ns units:
+/// [`MAX_QUEUE_PERIODS`] default periods and half of one more, so rounding
+/// to frames cannot leave it short.
+fn wide_buffer_hns(default_period_hns: i64) -> i64 {
+    default_period_hns * i64::from(MAX_QUEUE_PERIODS) + default_period_hns / 2
+}
+
+/// A fresh client on `device`, initialized at the default period with a
+/// buffer of [`MAX_QUEUE_PERIODS`] periods, and that period in frames:
+/// `exact` when the caller knows it in frames, else the default period's
+/// duration rounded to the nearest frame.
+///
+/// # Safety
+///
+/// `format` is the endpoint's mix format.
+unsafe fn init_default(
+    device: &windows::Win32::Media::Audio::IMMDevice,
+    format: *const WAVEFORMATEX,
+    rate: u32,
+    exact: Option<u32>,
+) -> Result<(IAudioClient, u32), WasapiError> {
+    let os = WasapiError::os;
+    // SAFETY: COM calls on live interfaces; `format` per the contract.
+    unsafe {
+        let client: IAudioClient = device
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|e| os("Activate(IAudioClient)", e))?;
+        let mut default = 0;
+        client
+            .GetDevicePeriod(Some(&mut default), None)
+            .map_err(|e| os("GetDevicePeriod", e))?;
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                wide_buffer_hns(default),
+                0,
+                format,
+                None,
+            )
+            .map_err(|e| os("IAudioClient::Initialize", e))?;
+        Ok((
+            client,
+            exact.unwrap_or_else(|| hns_to_frames(default, rate)),
+        ))
+    }
+}
+
+/// A duration in 100 ns units as frames at `rate`, rounded to the nearest
+/// frame: a period is reported in 100 ns units, which cut most periods
+/// short of a whole frame (448 frames at 44.1 kHz are 101 587 units, 447.998
+/// frames).
 fn hns_to_frames(hns: i64, rate: u32) -> u32 {
-    u32::try_from(i128::from(hns.max(0)) * i128::from(rate) / 10_000_000).unwrap_or(u32::MAX)
+    let scaled = i128::from(hns.max(0)) * i128::from(rate);
+    u32::try_from((scaled + 5_000_000) / 10_000_000).unwrap_or(u32::MAX)
 }
 
 /// Copies interleaved stereo `src` into `dst`, native-endian `f32` frames
@@ -507,7 +587,10 @@ struct Stream<D, C> {
     clock: C,
     rate: u32,
     period: u32,
+    /// Frames to keep queued: whole periods.
     queue: u32,
+    /// The most periods the queue may hold.
+    max_queue_periods: u32,
     channels: usize,
     period_us: i64,
     /// The engine's stereo block, spread into the device buffer.
@@ -520,17 +603,27 @@ struct Stream<D, C> {
 }
 
 impl<D: Device, C: TimeSource> Stream<D, C> {
-    fn new(dev: D, clock: C, rate: u32, period: u32, queue_periods: u32, channels: u16) -> Self {
-        let queue = queue_periods * period;
+    /// A stream of `(rate, period, channels)` keeping `queue_periods`
+    /// queued, which may later change up to `max_queue_periods`; its block
+    /// is sized for the most.
+    fn new(
+        dev: D,
+        clock: C,
+        (rate, period, channels): (u32, u32, u16),
+        queue_periods: u32,
+        max_queue_periods: u32,
+    ) -> Self {
+        let max_queue_periods = max_queue_periods.max(1);
         Self {
             dev,
             clock,
             rate,
             period,
-            queue,
+            queue: queue_periods.clamp(1, max_queue_periods) * period,
+            max_queue_periods,
             channels: usize::from(channels),
             period_us: i64::from(period) * 1_000_000 / i64::from(rate.max(1)),
-            scratch: vec![0.0; queue as usize * CHANNELS],
+            scratch: vec![0.0; (max_queue_periods * period) as usize * CHANNELS],
             padding: 0,
             phase: Phase::Unprimed,
             fault: None,
@@ -631,6 +724,16 @@ impl<D: Device, C: TimeSource> AudioOutput for Stream<D, C> {
         }
     }
 
+    fn queue_periods(&self) -> Option<u32> {
+        Some(self.queue / self.period.max(1))
+    }
+
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        let periods = periods.clamp(1, self.max_queue_periods);
+        self.queue = periods * self.period;
+        Some(periods)
+    }
+
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
         if let Some(e) = self.fault {
             return Err(e);
@@ -708,29 +811,25 @@ impl<C: TimeSource> WasapiShared<C> {
                 Some(f) => Err(f),
                 None => init_shortest(&probe, format.0, &mut engine_periods),
             };
-            let (client, period, fallback) = match shortest {
-                Ok((client, period)) => (client, period, None),
+            let (client, period, fallback, widened) = match shortest {
+                Ok((client, period)) => {
+                    let buffer = client.GetBufferSize().map_err(|e| os("GetBufferSize", e))?;
+                    match reopen_wider(engine_periods, period, buffer) {
+                        Some(exact) => {
+                            // Released before the wider stream opens.
+                            drop(client);
+                            let (client, period) =
+                                init_default(&device, format.0, rate, Some(exact))?;
+                            (client, period, None, true)
+                        }
+                        None => (client, period, None, false),
+                    }
+                }
                 Err(fallback) => {
                     // A fresh client: a refused one cannot be initialized
                     // again.
-                    let client: IAudioClient = device
-                        .Activate(CLSCTX_ALL, None)
-                        .map_err(|e| os("Activate(IAudioClient)", e))?;
-                    client
-                        .Initialize(
-                            AUDCLNT_SHAREMODE_SHARED,
-                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                            0,
-                            0,
-                            format.0,
-                            None,
-                        )
-                        .map_err(|e| os("IAudioClient::Initialize", e))?;
-                    let mut default = 0;
-                    client
-                        .GetDevicePeriod(Some(&mut default), None)
-                        .map_err(|e| os("GetDevicePeriod", e))?;
-                    (client, hns_to_frames(default, rate), Some(fallback))
+                    let (client, period) = init_default(&device, format.0, rate, None)?;
+                    (client, period, Some(fallback), false)
                 }
             };
             let buffer = client.GetBufferSize().map_err(|e| os("GetBufferSize", e))?;
@@ -749,9 +848,11 @@ impl<C: TimeSource> WasapiShared<C> {
                 channels,
                 period,
                 buffer,
-                queue_periods: queue_periods(buffer, period),
+                queue_periods: QUEUE_PERIODS.min(buffer_periods(buffer, period)),
+                max_queue_periods: buffer_periods(buffer, period),
                 engine_periods,
                 fallback,
+                widened,
                 mmcss: mmcss.is_some(),
             };
             (client, grant, render, position)
@@ -771,10 +872,9 @@ impl<C: TimeSource> WasapiShared<C> {
             stream: Stream::new(
                 endpoint,
                 clock,
-                grant.rate,
-                grant.period,
+                (grant.rate, grant.period, grant.channels),
                 grant.queue_periods,
-                grant.channels,
+                grant.max_queue_periods,
             ),
             grant,
             _mmcss: mmcss,
@@ -823,6 +923,14 @@ impl<C: TimeSource> AudioOutput for WasapiShared<C> {
 
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
         self.stream.write(f)
+    }
+
+    fn queue_periods(&self) -> Option<u32> {
+        self.stream.queue_periods()
+    }
+
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        self.stream.set_queue_periods(periods)
     }
 }
 
@@ -932,11 +1040,42 @@ mod tests {
     }
 
     #[test]
-    fn two_periods_are_queued_when_the_buffer_holds_them() {
-        assert_eq!(queue_periods(1_056, 480), 2);
-        assert_eq!(queue_periods(4_800, 480), 2);
-        assert_eq!(queue_periods(959, 480), 1);
-        assert_eq!(queue_periods(100, 480), 1);
+    fn the_queue_holds_what_the_buffer_holds_up_to_three_periods() {
+        assert_eq!(buffer_periods(1_056, 480), 2);
+        assert_eq!(buffer_periods(1_440, 480), 3);
+        assert_eq!(buffer_periods(4_800, 480), 3);
+        assert_eq!(buffer_periods(959, 480), 1);
+        assert_eq!(buffer_periods(100, 480), 1);
+    }
+
+    /// `IAudioClient3` is given up only for a buffer short of three periods
+    /// at a shortest period that is the default one.
+    #[test]
+    fn a_short_buffer_is_widened_only_when_no_shorter_period_is_lost() {
+        let fixed = EnginePeriods {
+            default: 441,
+            fundamental: 441,
+            min: 441,
+            max: 441,
+        };
+        let shorter = EnginePeriods { min: 147, ..fixed };
+        // The development PC's interface: 970 frames hold two periods of
+        // 441, reopened at exactly 441.
+        assert_eq!(reopen_wider(Some(fixed), 441, 970), Some(441));
+        assert_eq!(reopen_wider(Some(fixed), 441, 1_323), None);
+        assert_eq!(reopen_wider(Some(shorter), 147, 400), None);
+        // A fractional period is kept as `IAudioClient3` gave it.
+        let fractional = EnginePeriods {
+            default: 448,
+            fundamental: 448,
+            min: 448,
+            max: 448,
+        };
+        assert_eq!(reopen_wider(Some(fractional), 448, 970), Some(448));
+        assert_eq!(reopen_wider(None, 441, 970), None);
+        // 10 ms: three periods and a half, 35 ms.
+        assert_eq!(wide_buffer_hns(100_000), 350_000);
+        assert!(hns_to_frames(wide_buffer_hns(100_000), 44_100) >= 3 * 441);
     }
 
     #[test]
@@ -951,12 +1090,14 @@ mod tests {
     }
 
     #[test]
-    fn durations_convert_to_frames_by_floor() {
+    fn durations_convert_to_the_nearest_frame() {
         // By hand: 10 ms at 48 kHz is 480 frames, at 44.1 kHz 441;
-        // 10.1587 ms at 48 kHz is 487.6.
+        // 10.1587 ms is 487.6 frames at 48 kHz and 447.998 at 44.1 kHz,
+        // which a floor would cut to 447.
         assert_eq!(hns_to_frames(100_000, 48_000), 480);
         assert_eq!(hns_to_frames(100_000, 44_100), 441);
-        assert_eq!(hns_to_frames(101_587, 48_000), 487);
+        assert_eq!(hns_to_frames(101_587, 48_000), 488);
+        assert_eq!(hns_to_frames(101_587, 44_100), 448);
         assert_eq!(hns_to_frames(-5, 48_000), 0);
     }
 
@@ -1253,7 +1394,7 @@ mod tests {
 
     fn stream(fake: Fake) -> Stream<Fake, FakeClock> {
         let clock = FakeClock(Arc::clone(&fake.now));
-        Stream::new(fake, clock, 48_000, 480, 2, 2)
+        Stream::new(fake, clock, (48_000, 480, 2), 2, 2)
     }
 
     #[test]
@@ -1272,6 +1413,59 @@ mod tests {
             s.dev.calls,
             [Call::Fill(960), Call::Start, Call::Wait, Call::Padding]
         );
+    }
+
+    /// A queue deepened between plays is filled at the next write, never past
+    /// what the buffer holds; a buffer of two periods keeps two.
+    #[test]
+    fn a_deeper_queue_is_filled_at_the_next_write_up_to_the_buffer() {
+        let mut fake = Fake::new();
+        fake.queue = 1_440;
+        fake.buf = vec![0; 1_440 * 8];
+        let clock = FakeClock(Arc::clone(&fake.now));
+        let mut s = Stream::new(fake, clock, (48_000, 480, 2), 2, 3);
+        assert_eq!(s.queue_periods(), Some(2));
+        let mut step = || {
+            s.wait();
+            s.write(|b| b.fill(0.0)).unwrap();
+        };
+        // Prime (960), then a timed wake after one pass (480 left: 480 more).
+        step();
+        step();
+        assert_eq!(s.set_queue_periods(3), Some(3));
+        assert_eq!(s.queue_periods(), Some(3));
+        // After the next pass 480 are left: 960 more fill three periods,
+        // then each pass is refilled by one.
+        let mut step = || {
+            s.wait();
+            s.write(|b| b.fill(0.0)).unwrap();
+        };
+        step();
+        step();
+        let fills: Vec<Call> = s
+            .dev
+            .calls
+            .iter()
+            .copied()
+            .filter(|c| matches!(c, Call::Fill(_)))
+            .collect();
+        assert_eq!(
+            fills,
+            [
+                Call::Fill(960),
+                Call::Fill(480),
+                Call::Fill(960),
+                Call::Fill(480)
+            ]
+        );
+        assert_eq!(s.dev.short_passes, 0);
+        // Asked for more than the buffer holds, or for none, it keeps what
+        // fits.
+        assert_eq!(s.set_queue_periods(5), Some(3));
+        assert_eq!(s.set_queue_periods(0), Some(1));
+        let mut two = stream(Fake::new());
+        assert_eq!(two.set_queue_periods(3), Some(2));
+        assert_eq!(two.queue_periods(), Some(2));
     }
 
     #[test]

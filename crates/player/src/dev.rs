@@ -384,13 +384,6 @@ pub fn recording_output(clock: QpcClock, seconds: usize) -> Paced<RecordingOutpu
     }
 }
 
-impl Paced<RecordingOutput<SimDevice>> {
-    /// Periods the simulated device keeps queued.
-    pub fn queued_periods(&self) -> u32 {
-        self.inner.inner().config().queue_periods
-    }
-}
-
 impl<O: AudioOutput + Wakes> AudioOutput for Paced<O> {
     fn rate(&self) -> u32 {
         self.inner.rate()
@@ -410,6 +403,14 @@ impl<O: AudioOutput + Wakes> AudioOutput for Paced<O> {
 
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
         self.inner.write(f)
+    }
+
+    fn queue_periods(&self) -> Option<u32> {
+        self.inner.queue_periods()
+    }
+
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        self.inner.set_queue_periods(periods)
     }
 }
 

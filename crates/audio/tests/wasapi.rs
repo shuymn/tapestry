@@ -116,13 +116,15 @@ fn wasapi_plays_a_scheduled_tone() {
         );
     }
     println!(
-        "granted period: {} frames ({} us) at {} Hz, {} channels; buffer {} frames, {} queued periods; engine periods {:?}",
+        "granted period: {} frames ({} us) at {} Hz, {} channels; buffer {} frames, {} queued periods (at most {}, widened {}); engine periods {:?}",
         g.period,
         g.period_us(),
         g.rate,
         g.channels,
         g.buffer,
         g.queue_periods,
+        g.max_queue_periods,
+        g.widened,
         g.engine_periods
     );
     println!(

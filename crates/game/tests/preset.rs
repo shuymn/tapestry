@@ -61,3 +61,28 @@ fn malformed_unknown_and_invalid_presets_are_refused() {
         Err(PresetError::Invalid(RuleError::NoGauges))
     );
 }
+
+/// Before the first release an older preset file is refused, not converted:
+/// version 1's miss rule and a file without the empty POOR's `behind_us`.
+#[test]
+fn older_preset_files_are_refused() {
+    let text = preset_to_toml(&rules::custom());
+    let refused = |old: &str, missing: &str| {
+        assert_ne!(old, text, "the edit did not apply");
+        let e = load_preset_toml(old).unwrap_err();
+        assert!(
+            matches!(&e, PresetError::Parse(m) if m.contains(missing)),
+            "{e}"
+        );
+        assert!(e.to_string().contains("older version"), "{e}");
+    };
+    refused(
+        &text.replacen(
+            "miss = \"poor_after_late_bad_or_overtaken\"",
+            "miss = \"poor_after_late_bad\"",
+            1,
+        ),
+        "poor_after_late_bad",
+    );
+    refused(&text.replacen("behind_us = 150000\n", "", 1), "behind_us");
+}

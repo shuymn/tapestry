@@ -15,7 +15,7 @@
 use bms_model::TimeUs;
 
 use crate::CHANNELS;
-use crate::output::{AudioOutput, OutputError, Wake};
+use crate::output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, Wake};
 
 /// From pass `at_pass` on, every pass comes `gap_us` later (a resume).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +33,8 @@ pub struct SimConfig {
     pub rate: u32,
     /// Frames per engine pass.
     pub period: u32,
-    /// Periods the engine keeps queued.
+    /// Periods the engine keeps queued, 1 to [`MAX_QUEUE_PERIODS`];
+    /// [`AudioOutput::set_queue_periods`] changes it.
     pub queue_periods: u32,
     /// Time of the first wake.
     pub start: TimeUs,
@@ -99,14 +100,15 @@ impl SimDevice {
     /// # Panics
     ///
     /// If `cfg` queues no frames (`queue_periods` or `period` is zero) or
-    /// its rate is zero: such a device could never be written to.
+    /// more than [`MAX_QUEUE_PERIODS`], or its rate is zero: such a device
+    /// could never be written to.
     #[must_use]
     pub fn new(cfg: SimConfig) -> Self {
         assert!(
-            cfg.queue_periods > 0 && cfg.period > 0 && cfg.rate > 0,
-            "a simulated device needs a nonzero rate, period and queue"
+            (1..=MAX_QUEUE_PERIODS).contains(&cfg.queue_periods) && cfg.period > 0 && cfg.rate > 0,
+            "a simulated device needs a nonzero rate and period and a queue of 1 to {MAX_QUEUE_PERIODS} periods"
         );
-        let buf = vec![0.0; (cfg.queue_periods * cfg.period) as usize * CHANNELS];
+        let buf = vec![0.0; (MAX_QUEUE_PERIODS * cfg.period) as usize * CHANNELS];
         let mut dev = Self {
             rng: cfg.seed,
             cfg,
@@ -240,6 +242,15 @@ impl AudioOutput for SimDevice {
                 priming: false,
             };
         }
+    }
+
+    fn queue_periods(&self) -> Option<u32> {
+        Some(self.cfg.queue_periods)
+    }
+
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        self.cfg.queue_periods = periods.clamp(1, MAX_QUEUE_PERIODS);
+        Some(self.cfg.queue_periods)
     }
 
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {

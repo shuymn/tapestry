@@ -1,15 +1,11 @@
 //! Hand examples for tap judgment: "this input gives this judgment".
 //! The preset is the custom preset (windows ±20/45/100/180 ms at #RANK 2,
-//! empty POOR up to 500 ms before and 150 ms after a note), except where a
-//! test names version 1 (empty POOR up to 300 ms before the next unjudged
-//! note).
+//! empty POOR up to 500 ms before and 150 ms after a note).
 
 mod common;
 
 use bms_model::{ChartBuilder, JudgeRank, SoundId, TimeUs};
-use common::{
-    MS, custom_v1, device, empty_poors, judgments, lane, press, release, run, run_with, set,
-};
+use common::{MS, device, empty_poors, judgments, lane, press, release, run, run_with, set};
 use eval::{AdvanceError, ControlId, Evaluator, InputStart, JudgeEventKind, PushError, SourceId};
 use rules::Judgment::{Bad, Good, Great, Perfect, Poor};
 
@@ -261,36 +257,6 @@ fn overtaking_press_misses_the_earlier_note() {
 }
 
 #[test]
-fn version_1_judges_an_overtaken_note_out_of_order() {
-    let (events, tally) = overtaking(&custom_v1());
-    // The first note stays open after the later one is judged, and the
-    // second press takes it as GOOD (+50 ms).
-    assert_eq!(
-        judgments(&events),
-        [(1, 1, Perfect, Some(-20 * MS)), (1, 0, Good, Some(50 * MS))]
-    );
-    assert_eq!(empty_poors(&events), 0);
-    assert_eq!((tally.bp, tally.combo), (0, 2));
-
-    // With the first press only, the first note is missed at its deadline.
-    let chart = ChartBuilder::new(BPM)
-        .tap(lane(1), TimeUs(1_000 * MS))
-        .tap(lane(1), TimeUs(1_060 * MS))
-        .build()
-        .unwrap();
-    let inputs = [press(1_040 * MS, 0, 1), release(1_045 * MS, 0, 1)];
-    let (events, _) = run_with(
-        &chart,
-        &custom_v1(),
-        &device(&[0]),
-        &InputStart::default(),
-        &inputs,
-        2_000 * MS,
-    );
-    assert_eq!(judged_at(&events), [(1_040 * MS, 1), (1_180 * MS, 0)]);
-}
-
-#[test]
 fn overtaking_misses_every_earlier_note_in_order() {
     let chart = ChartBuilder::new(BPM)
         .tap(lane(3), TimeUs(1_000 * MS))
@@ -511,45 +477,6 @@ fn mashing_after_a_judged_note_counts_every_press() {
     assert_eq!(judgments(&events), [(5, 0, Perfect, Some(0))]);
     assert_eq!(empty_poors(&events), 5);
     assert_eq!((tally.empty_poor, tally.bp, tally.combo), (5, 5, 1));
-}
-
-#[test]
-fn empty_poor_keeps_combo_and_bp() {
-    let chart = ChartBuilder::new(BPM)
-        .tap(lane(3), TimeUs(1_000 * MS))
-        .tap(lane(3), TimeUs(2_000 * MS))
-        .build()
-        .unwrap();
-    let dev = device(&[0]);
-    let inputs = [
-        press(1_000 * MS, 0, 3),
-        release(1_010 * MS, 0, 3),
-        // 300 ms + 1 µs ahead: outside the empty POOR range.
-        press(1_700 * MS - 1, 0, 3),
-        release(1_700 * MS - 1, 0, 3),
-        // Exactly 300 ms ahead: an empty POOR.
-        press(1_700 * MS, 0, 3),
-        release(1_710 * MS, 0, 3),
-        press(2_000 * MS, 0, 3),
-    ];
-    let (events, tally) = run_with(
-        &chart,
-        &custom_v1(),
-        &dev,
-        &InputStart::default(),
-        &inputs,
-        3_000 * MS,
-    );
-    assert_eq!(
-        judgments(&events),
-        [(3, 0, Perfect, Some(0)), (3, 1, Perfect, Some(0))]
-    );
-    assert_eq!(empty_poors(&events), 1);
-    assert_eq!(tally.empty_poor, 1);
-    assert_eq!(tally.counts.poor, 0);
-    assert_eq!(tally.bp, 0);
-    assert_eq!((tally.combo, tally.max_combo), (2, 2));
-    assert_eq!(tally.ex_score, 4);
 }
 
 #[test]

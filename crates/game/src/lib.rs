@@ -21,6 +21,7 @@ mod logic;
 mod policy;
 mod prepare;
 mod preset;
+mod queue;
 mod render;
 mod results;
 mod runner;
@@ -50,6 +51,7 @@ pub use prepare::{
     BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,
 };
 pub use preset::{PresetError, load_preset_toml, preset_to_toml};
+pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
 pub use render::{PlayView, RenderSide, RenderSink};
 pub use results::{
     MIN_OFFSET_SAMPLES, ReEvaluate, ReEvaluationError, RecommendedOffset, ResultContext,
@@ -69,5 +71,5 @@ pub use settings::{
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{
     Adjust, DEFAULT_VISIBLE_TIME_MS, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, Tuning,
-    VISIBLE_TIME_MS, VISIBLE_TIME_STEP_MS, VOLUME_STEP_PERCENT,
+    VISIBLE_TIME_MS, VISIBLE_TIME_STEPS_MS, VOLUME_STEP_PERCENT,
 };

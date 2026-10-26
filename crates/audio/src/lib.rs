@@ -47,7 +47,7 @@ pub use mixer::{
     InvalidVolume, LIMITER_CEILING, LIMITER_RELEASE_MS, Limiter, MAX_PENDING_STARTS, MAX_VOICES,
     MAX_VOLUME, Mixer, STEAL_FADE_MS,
 };
-pub use output::{AudioOutput, OutputError, RecordingOutput, Wake};
+pub use output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, RecordingOutput, Wake};
 pub use run::{RunReport, run_audio};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
 #[cfg(windows)]

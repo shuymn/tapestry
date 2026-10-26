@@ -22,7 +22,7 @@ use input::{QpcClock, SourceReader};
 
 use crate::audio_side::AudioLink;
 use crate::controls::Controls;
-use crate::end_screen::{self, Hints, LoadTimes};
+use crate::end_screen::{self, Hints, LoadTimes, QueueLine};
 use crate::input_side::{InputLink, Request};
 use crate::measure::{
     Figures, PlayMeasure, Step, StepSample, judgment_samples, measure_path, to_toml,
@@ -84,6 +84,14 @@ pub struct PlayerRig<'a> {
     pub figures: Option<Figures>,
     /// The current play's number, as the audio thread knows it.
     pub generation: u64,
+    /// The periods the next play queues on the audio output.
+    pub queue: game::QueueChoice,
+    /// The most periods the output's queue holds, when it says.
+    pub queue_most: Option<u32>,
+    /// The periods the output keeps for the current play, when it says.
+    pub queued_now: Option<u32>,
+    /// The last ended play's audio queue, for its end screen.
+    pub queue_line: Option<QueueLine>,
     /// Each saved play's record and figures, kept for the display
     /// capture of `measure play` (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -120,7 +128,37 @@ impl PlayerRig<'_> {
     /// `player.toml`, each atomically and only if it changed. Called when a
     /// play ends and when the run ends, never during a play.
     fn persist(&mut self) {
-        self.files.write(self.controls.tuning().get());
+        self.files
+            .write(self.controls.tuning().get(), self.queue.periods());
+    }
+
+    /// Counts the ended play's underruns after its countdown, raises the
+    /// next play's queue on any, and keeps the end screen's line.
+    fn judge_queue(&mut self) {
+        let steady = self
+            .audio
+            .control
+            .counters()
+            .steady_underruns(self.generation);
+        self.queue.play_ended(steady);
+        // What the next play will keep: never more than the output holds.
+        let next = end_screen::next_queue(self.queue.periods(), self.queue_most);
+        let line = QueueLine {
+            played: self.queued_now,
+            steady_underruns: steady,
+            next,
+        };
+        println!(
+            "audio: queued {} periods, {steady} underruns after the countdown{}",
+            self.queued_now
+                .map_or_else(|| "an unknown number of".to_owned(), |q| q.to_string()),
+            if self.queued_now == Some(next) {
+                String::new()
+            } else {
+                format!("; the next play queues {next}")
+            }
+        );
+        self.queue_line = Some(line);
     }
 
     /// Acts on changed settings keys' values: the volume goes to the
@@ -256,6 +294,13 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_audio(&mut self) -> Result<(), String> {
         self.audio.control.ready().map_err(|e| e.to_string())?;
+        // Between plays, before recording opens: the change never lands
+        // inside a play or its countdown.
+        self.queued_now = self
+            .audio
+            .control
+            .set_queued_periods(self.queue.periods())
+            .map_err(|e| e.to_string())?;
         // A volume changed before the first play (during startup) or on
         // the end screen reaches the engine before the play starts.
         self.sync();
@@ -296,6 +341,7 @@ impl Rig for PlayerRig<'_> {
                 counters.underruns(),
                 counters.probes_dropped(),
             )),
+            queued_periods: self.queued_now,
         };
         self.render.send(RenderMsg::Play {
             side: screen,
@@ -383,6 +429,7 @@ impl Rig for PlayerRig<'_> {
             }
         }
         self.print(report);
+        self.judge_queue();
         self.write_measure(report);
         self.persist();
     }
@@ -390,10 +437,16 @@ impl Rig for PlayerRig<'_> {
     fn show_end(&mut self, report: &PlayReport) {
         let tuning = self.controls.tuning();
         tuning.open_end_screen();
+        let queue = self.queue_line.unwrap_or(QueueLine {
+            played: self.queued_now,
+            steady_underruns: 0,
+            next: end_screen::next_queue(self.queue.periods(), self.queue_most),
+        });
         self.end_lines = Some(end_screen::lines(
             report,
             self.input_offset_us,
             self.times,
+            queue,
             &self.hints,
         ));
         self.send_end(tuning.get());

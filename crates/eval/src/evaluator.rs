@@ -323,7 +323,7 @@ impl<'a> Evaluator<'a> {
             .and_then(|scale| rule.windows.scaled(scale))
             .ok_or(EvalError::InvalidRank)?;
         let miss_after = match rule.miss {
-            MissRule::PoorAfterLateBad | MissRule::PoorAfterLateBadOrOvertaken => windows.bad.late,
+            MissRule::PoorAfterLateBadOrOvertaken => windows.bad.late,
         };
         match (rule.ln_mode.default, chart.meta.ln_mode) {
             (LnMode::Ln, None | Some(ChartLnMode::Ln)) => {}
@@ -681,23 +681,15 @@ impl<'a> Evaluator<'a> {
         // unjudged note lies inside BAD, and earlier ones are missed).
         let target = best.map(|(_, k)| k).or(first);
         let rule = self.rule.empty_poor;
-        let empty_poor = best.is_none()
-            && match rule.behind {
-                // Only the next unjudged note, strictly after the press.
-                None => target.is_some_and(|k| {
-                    let gap = time_of(k) - at;
-                    gap > 0 && gap <= i128::from(rule.ahead.0)
-                }),
-                // The first note at or after `t − behind`, judged or not,
-                // lies at or before `t + ahead`.
-                Some(behind) => {
-                    let from = at - i128::from(behind.0);
-                    let k = state
-                        .targets
-                        .partition_point(|&i| i128::from(notes[i].time.0) < from);
-                    k < state.targets.len() && time_of(k) <= at + i128::from(rule.ahead.0)
-                }
-            };
+        // The first note at or after `t − behind`, judged or not, lies at or
+        // before `t + ahead`.
+        let empty_poor = best.is_none() && {
+            let from = at - i128::from(rule.behind.0);
+            let k = state
+                .targets
+                .partition_point(|&i| i128::from(notes[i].time.0) < from);
+            k < state.targets.len() && time_of(k) <= at + i128::from(rule.ahead.0)
+        };
         if let Some(sound) = target.and_then(|k| notes[state.targets[k]].sound) {
             self.emit(
                 t,
@@ -711,7 +703,6 @@ impl<'a> Evaluator<'a> {
         }
         if let Some((deviation, k)) = best {
             match self.rule.miss {
-                MissRule::PoorAfterLateBad => {}
                 // The earlier notes are passed: each is missed now, which
                 // also finishes a long note whose head it is, and its miss
                 // deadline is then skipped. All of them are unjudged, since

@@ -19,6 +19,8 @@ pub struct Opened {
     pub period: u32,
     /// Periods the output keeps queued, when it says.
     pub queued_periods: Option<u32>,
+    /// The most periods its queue can hold, when it says.
+    pub most_queued_periods: Option<u32>,
 }
 
 /// The audio thread before its engine arrives.
@@ -56,8 +58,8 @@ impl AudioLink {
     }
 }
 
-/// Starts the audio thread: `open` makes the output on it, with the
-/// periods it keeps queued if it says. `done` sees the output when the
+/// Starts the audio thread: `open` makes the output on it, with the most
+/// periods its queue holds, if it says. `done` sees the output when the
 /// thread ends.
 ///
 /// # Errors
@@ -76,7 +78,7 @@ where
         .spawn(move || {
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Audio);
-            let (mut out, queued_periods) = match open() {
+            let (mut out, most_queued_periods) = match open() {
                 Ok(out) => out,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -86,7 +88,8 @@ where
             let _ = ready_tx.send(Ok(Opened {
                 rate: out.rate(),
                 period: out.period(),
-                queued_periods,
+                queued_periods: out.queue_periods(),
+                most_queued_periods,
             }));
             if let Ok(mut worker) = worker_rx.recv() {
                 worker.run(&mut out, Duration::from_millis(10));

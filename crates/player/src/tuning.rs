@@ -164,14 +164,15 @@ impl SettingsFiles {
         }
     }
 
-    /// Writes the values `t` into the file that holds each, atomically and
-    /// only when it changes. Called when a play ends and when the run
-    /// ends, never during a play. A file that cannot be written keeps its
-    /// old content and is tried again at the next call. Returns the files
-    /// written.
-    pub fn write(&mut self, t: Tuning) -> Vec<&'static str> {
+    /// Writes the values `t` and the periods the audio output queues into
+    /// the file that holds each, atomically and only when it changes.
+    /// Called when a play ends and when the run ends, never during a play.
+    /// A file that cannot be written keeps its old content and is tried
+    /// again at the next call. Returns the files written.
+    pub fn write(&mut self, t: Tuning, queued_periods: u32) -> Vec<&'static str> {
         let mut next = self.written.clone();
         t.apply_to(&mut next);
+        next.device.queued_periods = queued_periods;
         let mut wrote = Vec::new();
         if next.device != self.written.device {
             let path = self.root.device_settings();
@@ -280,7 +281,7 @@ mod tests {
         assert_eq!(
             t.get(),
             Tuning {
-                visible_time_ms: 575,
+                visible_time_ms: 569,
                 display_offset_us: -1_000,
                 ..start()
             }
@@ -300,21 +301,50 @@ mod tests {
         };
         let mut files = SettingsFiles::new(root.clone(), loaded.clone());
         let t = Tuning::of(&loaded);
-        assert!(files.write(t).is_empty());
+        assert!(files.write(t, 2).is_empty());
         assert!(!root.device_settings().exists());
         // `player.toml` cannot be written: a directory is in the way.
         std::fs::create_dir_all(root.player_settings().join("x")).unwrap();
         let faster = t.adjust(Adjust::HiSpeedUp);
-        assert!(files.write(faster).is_empty());
+        assert!(files.write(faster, 2).is_empty());
         std::fs::remove_dir_all(root.player_settings()).unwrap();
-        assert_eq!(files.write(faster), ["player.toml"]);
-        assert!(files.write(faster).is_empty());
+        assert_eq!(files.write(faster, 2), ["player.toml"]);
+        assert!(files.write(faster, 2).is_empty());
         let s = game::Settings::load(&root).unwrap();
-        assert_eq!(s.player.visible_time_ms, 575);
+        assert_eq!(s.player.visible_time_ms, 569);
         assert!(!root.device_settings().exists());
         assert_eq!(
-            files.write(faster.adjust(Adjust::VolumeDown)),
+            files.write(faster.adjust(Adjust::VolumeDown), 2),
             ["device.toml"]
+        );
+    }
+
+    /// A raised audio queue goes to `device.toml` alone; a write that fails
+    /// is tried again at the next call, and the choice is not lost.
+    #[test]
+    fn a_raised_queue_is_written_to_device_toml_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().to_owned());
+        let loaded = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let mut files = SettingsFiles::new(root.clone(), loaded.clone());
+        let t = Tuning::of(&loaded);
+        // `device.toml` cannot be written: a directory is in the way.
+        std::fs::create_dir_all(root.device_settings().join("x")).unwrap();
+        assert!(files.write(t, 3).is_empty());
+        std::fs::remove_dir_all(root.device_settings()).unwrap();
+        assert_eq!(files.write(t, 3), ["device.toml"]);
+        assert!(files.write(t, 3).is_empty());
+        let s = game::Settings::load(&root).unwrap();
+        assert_eq!(s.device.queued_periods, 3);
+        assert!(!root.player_settings().exists());
+        // Set back by hand and loaded again, the default is written as is.
+        assert_eq!(files.write(t, 2), ["device.toml"]);
+        assert_eq!(
+            game::Settings::load(&root).unwrap().device.queued_periods,
+            2
         );
     }
 }

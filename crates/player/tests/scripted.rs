@@ -403,7 +403,7 @@ fn hi_speed_change_moves_notes_not_judgment() {
     writes_only_between_plays(&stdout);
     let root = game::DataRoot::new(changed.appdata.join("tapestry"));
     let s = game::Settings::load(&root).unwrap();
-    assert_eq!(s.player.visible_time_ms, 575);
+    assert_eq!(s.player.visible_time_ms, 569);
     assert_eq!(s.device.display_offset_us, 1_000);
 
     assert_eq!((without.len(), with.len()), (2, 2));
@@ -418,7 +418,7 @@ fn hi_speed_change_moves_notes_not_judgment() {
     assert_eq!(display(&with[0]), TimeUs(0));
     assert_eq!(display(&with[1]), TimeUs(1_000));
 
-    // The same note at the same display time with 600 and 575 ms.
+    // The same note at the same display time with 600 and 569 ms.
     let scroll = &changed.chart.scroll;
     let y = |visible| {
         render::layout::note_y(
@@ -428,10 +428,11 @@ fn hi_speed_change_moves_notes_not_judgment() {
             TimeUs(visible),
         )
     };
-    // By hand: 880 - 800 * 300 / 600 = 480; 800 * 300 / 575 = 417.3913.
+    // By hand: 880 - 800 * 300 / 600 = 480; 880 - 800 * 300 / 569 =
+    // 458.2074.
     assert!((y(600_000) - 480.0).abs() < 1e-3);
     let after = i64::from(s.player.visible_time_ms) * 1_000;
-    assert!((y(after) - 462.608_7).abs() < 1e-3);
+    assert!((y(after) - 458.207_4).abs() < 1e-3);
 }
 
 /// Settings keys pressed in the first play (hi-speed up twice, volume down,
@@ -463,9 +464,9 @@ fn settings_keys_persist_and_the_input_offset_waits_for_the_next_play() {
 
     let root = game::DataRoot::new(fx.appdata.join("tapestry"));
     let s = game::Settings::load(&root).unwrap();
-    // 600 - 2 * 25 ms; 100 - 5 %; 3 * 1 ms; F8 during play does nothing,
+    // Two hi-speed steps from 600 ms (569, then 540 ms); 100 - 5 %; 3 * 1 ms; F8 during play does nothing,
     // 2 * 1 ms on the end screen.
-    assert_eq!(s.player.visible_time_ms, 550);
+    assert_eq!(s.player.visible_time_ms, 540);
     assert_eq!(s.device.master_volume, 0.95);
     assert_eq!(s.device.display_offset_us, 3_000);
     assert_eq!(s.device.input_offset_us, 2_000);
