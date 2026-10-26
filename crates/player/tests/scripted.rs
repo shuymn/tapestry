@@ -613,6 +613,17 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
     assert!(!stdout.lines().any(|l| l.starts_with("saved:")), "{stdout}");
     assert!(!stdout.contains("measure:"), "{stdout}");
     assert!(frames.join("end.png").is_file());
+    // The key sounds came from the merged schedule: a start every 0.5 s
+    // from 2.0 s (the notes, chords on one frame) to 4.0 s (the long note
+    // with the BGM), each exactly 24 000 frames after the last at 48 kHz.
+    let onsets: Vec<i64> = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("dev: audio onsets "))
+        .and_then(|l| l.split_once(": "))
+        .map(|(_, frames)| frames.split(' ').map(|f| f.parse().unwrap()).collect())
+        .unwrap_or_default();
+    let gaps: Vec<i64> = onsets.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(gaps, [24_000; 4], "{onsets:?}");
     let root = appdata.join("tapestry");
     assert!(!root.join("records").exists());
     let mut kept: Vec<String> = files_under(&root)
@@ -657,6 +668,38 @@ fn auto_retry_starts_over_with_the_new_input_offset() {
     assert_eq!(s.device.input_offset_us, 10_000);
     assert_eq!(s.device.keyboard, DeviceSettings::default().keyboard);
     assert!(!root.records().exists());
+}
+
+/// Autoplay plays with its own keys whatever `device.toml` binds: with no
+/// keyboard lane bound, every note is still PERFECT, and the settings
+/// written when the run ends (an input offset step on the end screen)
+/// keep `device.toml`'s own bindings.
+#[test]
+fn auto_play_uses_its_own_keys_and_keeps_device_toml() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let device = DeviceSettings {
+        keyboard: game::KeyConfig {
+            lanes: Vec::new(),
+            ..DeviceSettings::default().keyboard
+        },
+        ..DeviceSettings::default()
+    };
+    let path = appdata.join("tapestry").join("device.toml");
+    game::save_settings(&path, &device).unwrap();
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &["--dev-adjust-end".as_ref(), "F8".as_ref()],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let line = format!("play 1: Completed; perfect {AUTO_NOTES} great 0 good 0 bad 0 poor 0;");
+    assert!(stdout.contains(&line), "{line} in {stdout}");
+    assert!(stdout.contains("settings: wrote"), "{stdout}");
+    let written: DeviceSettings = game::load_settings(&path).unwrap();
+    assert_eq!(written.input_offset_us, 1_000);
+    assert_eq!(written.keyboard, device.keyboard);
 }
 
 /// H3: autoplay and an input log are two ways to receive input, refused

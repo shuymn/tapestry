@@ -435,6 +435,29 @@ pub fn report_audio(out: &Paced<RecordingOutput<SimDevice>>) {
         "dev: audio recorded {} frames, peak {peak:.3}",
         samples.len() / audio::CHANNELS
     );
+    let onsets = onsets(samples);
+    let listed: Vec<String> = onsets.iter().take(64).map(ToString::to_string).collect();
+    println!("dev: audio onsets {}: {}", onsets.len(), listed.join(" "));
+}
+
+/// The frames where sound starts after at least 10 ms (at 48 kHz) of
+/// silence on the left channel: when sounds started, to compare with the
+/// chart's times.
+fn onsets(samples: &[f32]) -> Vec<usize> {
+    const QUIET: usize = 480;
+    let mut found = Vec::new();
+    let mut silent = QUIET;
+    for (frame, s) in samples.iter().step_by(audio::CHANNELS).enumerate() {
+        if s.abs() > 1e-3 {
+            if silent >= QUIET {
+                found.push(frame);
+            }
+            silent = 0;
+        } else {
+            silent += 1;
+        }
+    }
+    found
 }
 
 /// Writes frames as PNG files: `countdown.png` at the first frame of the
