@@ -241,6 +241,7 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
                 SourceProfile {
                     input_offset,
                     bindings,
+                    axes: _,
                 },
         } = s;
         w.uint(kind_tag(*kind));
@@ -543,6 +544,7 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
             profile: SourceProfile {
                 input_offset,
                 bindings,
+                axes: Vec::new(),
             },
         });
     }

@@ -163,6 +163,10 @@ impl Tally {
 /// Kinds of deadline; at equal times they are processed in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum DeadlineKind {
+    /// A pending scratch release (input-dependent, not stored per lane).
+    /// It stands for the release the player made by stopping, so it comes
+    /// first among deadlines, as a release input would.
+    ScratchRelease,
     /// The late edge of an unjudged note's miss window.
     Miss,
     /// The end of a long note not yet finished.
@@ -180,7 +184,7 @@ struct Deadline {
     time: TimeUs,
     kind: DeadlineKind,
     /// Index into the lane's targets for `Miss` and `LnEnd`; into the chart
-    /// lane for `Mine`.
+    /// lane for `Mine`; the axis for `ScratchRelease`.
     index: usize,
 }
 
@@ -221,7 +225,7 @@ impl LaneState {
             let skip = match d.kind {
                 DeadlineKind::Miss => self.judged[d.index],
                 DeadlineKind::LnEnd => self.judged[d.index] && self.holding != Some(d.index),
-                DeadlineKind::Mine | DeadlineKind::SongEnd => false,
+                DeadlineKind::Mine | DeadlineKind::ScratchRelease | DeadlineKind::SongEnd => false,
             };
             if !skip {
                 return Some(d);
@@ -444,9 +448,11 @@ impl<'a> Evaluator<'a> {
     ///
     /// Each judgeable note is judged once (1 event plus one per gauge),
     /// finishes as a long note once, and breaks at most once (one per
-    /// gauge). Each input causes at most one press, which plays a sound and
-    /// may be an empty POOR (1 plus one per gauge). Each mine hits at most
-    /// once (1 plus one per gauge). The song ends once.
+    /// gauge). Each input causes at most one press (an axis reversing
+    /// releases first, which only finishes long notes), which plays a sound
+    /// and may be an empty POOR (1 plus one per gauge). A scratch release
+    /// deadline only finishes long notes. Each mine hits at most once (1
+    /// plus one per gauge). The song ends once.
     #[must_use]
     pub fn max_events(&self, inputs: usize) -> usize {
         let g = self.gauges.states().len();
@@ -542,33 +548,54 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// The earliest pending deadline over all lanes, by (time, kind, lane);
-    /// once every lane deadline is done, the song end.
+    /// The earliest pending deadline by (time, kind, lane): the lanes'
+    /// chart deadlines, the pending scratch releases, and the song end,
+    /// which comes after every chart deadline (none is later than it).
     fn next_deadline(&mut self) -> Option<(Deadline, usize)> {
         let mut best: Option<(Deadline, usize)> = None;
-        for (lane, state) in self.lanes.iter_mut().enumerate() {
-            if let Some(d) = state.head()
-                && best.is_none_or(|(b, bl)| (d.time, d.kind, lane) < (b.time, b.kind, bl))
-            {
+        let mut offer = |d: Deadline, lane: usize| {
+            if best.is_none_or(|(b, bl)| (d.time, d.kind, lane) < (b.time, b.kind, bl)) {
                 best = Some((d, lane));
             }
+        };
+        for (lane, state) in self.lanes.iter_mut().enumerate() {
+            if let Some(d) = state.head() {
+                offer(d, lane);
+            }
         }
-        if best.is_none() && !self.ended {
+        if let Some((time, lane, axis)) = self.conversion.next_release() {
+            let d = Deadline {
+                time,
+                kind: DeadlineKind::ScratchRelease,
+                index: axis,
+            };
+            offer(d, lane.index());
+        }
+        if !self.ended {
             let end = Deadline {
                 time: self.final_deadline,
                 kind: DeadlineKind::SongEnd,
                 index: 0,
             };
-            return Some((end, 0));
+            offer(end, 0);
         }
         best
     }
 
     fn process_deadline(&mut self, d: Deadline, lane: usize, out: &mut Vec<JudgeEvent>) {
-        if d.kind == DeadlineKind::SongEnd {
-            self.ended = true;
-            self.emit(d.time, None, JudgeEventKind::SongEnd, out);
-            return;
+        match d.kind {
+            DeadlineKind::SongEnd => {
+                self.ended = true;
+                self.emit(d.time, None, JudgeEventKind::SongEnd, out);
+                return;
+            }
+            DeadlineKind::ScratchRelease => {
+                if let Some(LaneEdge::Release(lane)) = self.conversion.release_due(d.index) {
+                    self.release(lane.index(), d.time, None, out);
+                }
+                return;
+            }
+            DeadlineKind::Miss | DeadlineKind::LnEnd | DeadlineKind::Mine => {}
         }
         let state = &mut self.lanes[lane];
         state.next += 1;
@@ -600,7 +627,7 @@ impl<'a> Evaluator<'a> {
                     self.change_gauges(Cause::Mine(damage), d.time, None, out);
                 }
             }
-            DeadlineKind::SongEnd => {}
+            DeadlineKind::ScratchRelease | DeadlineKind::SongEnd => {}
         }
     }
 
@@ -608,11 +635,11 @@ impl<'a> Evaluator<'a> {
         let Some((t, ev)) = self.inputs.pop_front() else {
             return;
         };
-        let edges = self.conversion.apply(&ev);
+        let edges = self.conversion.apply(&ev, t);
         for &edge in edges.as_slice() {
             match edge {
                 LaneEdge::Press(lane) => self.press(lane.index(), t, ev.received, out),
-                LaneEdge::Release(lane) => self.release(lane.index(), t, ev.received, out),
+                LaneEdge::Release(lane) => self.release(lane.index(), t, Some(ev.received), out),
             }
         }
     }
@@ -736,8 +763,14 @@ impl<'a> Evaluator<'a> {
 
     /// A release edge on `lane` at evaluation time `t`: finishes the held
     /// long note, as a break if strictly earlier than its end minus the
-    /// margin.
-    fn release(&mut self, lane: usize, t: TimeUs, origin: TimeUs, out: &mut Vec<JudgeEvent>) {
+    /// margin. `origin` is `None` for a scratch release deadline.
+    fn release(
+        &mut self,
+        lane: usize,
+        t: TimeUs,
+        origin: Option<TimeUs>,
+        out: &mut Vec<JudgeEvent>,
+    ) {
         let state = &mut self.lanes[lane];
         let Some(k) = state.holding.take() else {
             return;
@@ -746,7 +779,7 @@ impl<'a> Evaluator<'a> {
         let rule = self.rule.ln_break;
         let broken = i128::from(t.0) < i128::from(end.0) - i128::from(rule.release_margin.0);
         if !broken {
-            self.ln_end(lane, k, LnOutcome::Completed, t, Some(origin), out);
+            self.ln_end(lane, k, LnOutcome::Completed, t, origin, out);
             return;
         }
         // The head's judgment, counts and EX score stay.
@@ -757,8 +790,8 @@ impl<'a> Evaluator<'a> {
         if rule.counts_bp {
             self.tally.bp = self.tally.bp.saturating_add(1);
         }
-        self.ln_end(lane, k, LnOutcome::Broken, t, Some(origin), out);
-        self.change_gauges(Cause::LnBreak, t, Some(origin), out);
+        self.ln_end(lane, k, LnOutcome::Broken, t, origin, out);
+        self.change_gauges(Cause::LnBreak, t, origin, out);
     }
 
     fn ln_end(

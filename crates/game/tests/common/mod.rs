@@ -35,6 +35,7 @@ pub fn device(offsets: &[i64]) -> DeviceProfile {
                         lane: l,
                     })
                     .collect(),
+                axes: Vec::new(),
             })
             .collect(),
     }

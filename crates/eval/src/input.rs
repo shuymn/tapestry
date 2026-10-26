@@ -27,7 +27,7 @@ pub struct ControlId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputKind {
     /// A control changed. For a button, a nonzero value is pressed and zero
-    /// is released.
+    /// is released; for an axis, the value is its report ([`AxisMode`]).
     Control {
         /// The control.
         control: ControlId,
@@ -58,6 +58,8 @@ pub struct InputStart {
     /// The QPC read at the boundary.
     pub opened_at: TimeUs,
     /// Each held control with its value; a control not listed is released.
+    /// An absolute axis listed here starts at its value; one not listed
+    /// starts unknown, and its first report only sets where it is.
     pub held: Vec<(SourceId, ControlId, i32)>,
 }
 
@@ -70,13 +72,90 @@ pub struct Binding {
     pub lane: Lane,
 }
 
+/// How an axis reports where it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AxisMode {
+    /// Each report is the position. `wrap` is the number of positions in
+    /// one revolution: the axis goes from its highest value back to its
+    /// lowest, so a change by more than half a revolution is taken the
+    /// short way round (exactly half counts forward). 0: it does not wrap.
+    Absolute {
+        /// Positions per revolution, or 0.
+        wrap: u32,
+    },
+    /// Each report is the movement since the previous report, used as is.
+    Relative,
+}
+
+/// How an axis's movement becomes presses and releases of its lane
+/// (design.md "Analog Scratch"). Movement is counted in the axis's own
+/// units, after wraparound and inversion.
+///
+/// Released, the axis presses its lane once it has moved
+/// `press_threshold` in one direction, each movement no more than
+/// `release_after_us` after the previous one. Pressed, movement of
+/// `hold_threshold` in the same direction keeps it pressed (the
+/// hysteresis: less movement holds than presses), and movement of
+/// `press_threshold` the other way is a new press in that direction.
+/// Every press and every hold sets the release deadline `release_after_us`
+/// later; when the watermark passes it, the lane is released. A threshold
+/// of 0 counts as 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScratchSettings {
+    /// Absolute or relative, and the wraparound.
+    pub mode: AxisMode,
+    /// Whether the axis counts backwards: swaps which way is forward.
+    pub invert: bool,
+    /// Movement in one direction that presses.
+    pub press_threshold: u32,
+    /// Movement in the pressed direction that keeps the lane pressed.
+    pub hold_threshold: u32,
+    /// How long after the last press or hold the lane is released, µs.
+    pub release_after_us: u32,
+}
+
+impl ScratchSettings {
+    /// Defaults for a turntable that reports an 8-bit absolute axis, the
+    /// common controller layout: 256 positions per revolution, a press
+    /// after 2 positions (a single position's flicker at rest never
+    /// presses), held by any further movement, and released 100 ms after
+    /// the movement stops. Starting points, tuned by playing.
+    pub const DEFAULT: Self = Self {
+        mode: AxisMode::Absolute { wrap: 256 },
+        invert: false,
+        press_threshold: 2,
+        hold_threshold: 1,
+        release_after_us: 100_000,
+    };
+}
+
+impl Default for ScratchSettings {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// An axis bound to a lane, with its scratch conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AxisBinding {
+    /// The axis.
+    pub control: ControlId,
+    /// The lane it plays, usually the scratch.
+    pub lane: Lane,
+    /// How its movement becomes presses and releases.
+    pub scratch: ScratchSettings,
+}
+
 /// How one source is evaluated.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourceProfile {
     /// The input latency offset, subtracted from the receive time.
     pub input_offset: TimeUs,
-    /// The source's lane bindings; each control appears at most once.
+    /// The source's button and key bindings.
     pub bindings: Vec<Binding>,
+    /// The source's axis bindings. A control appears at most once across
+    /// `bindings` and `axes`.
+    pub axes: Vec<AxisBinding>,
 }
 
 /// How every source of a play is evaluated, indexed by [`SourceId`].
@@ -103,4 +182,28 @@ impl DeviceProfile {
 #[must_use]
 pub fn evaluation_time(ev: &PhysicalInputEvent, device: &DeviceProfile) -> TimeUs {
     TimeUs(ev.received.0.saturating_sub(device.offset(ev.source).0))
+}
+
+/// Edges each recorded button gets per second of the recording window: a
+/// press and a release 30 times a second (stage1.md D8).
+pub const BUTTON_EDGES_PER_SEC: usize = 60;
+
+/// Reports each recorded axis gets per second of the recording window:
+/// one per millisecond, a 1 kHz controller reporting without pause
+/// (stage1.md D8).
+pub const AXIS_REPORTS_PER_SEC: usize = 1000;
+
+/// The inputs a recording window of `span` holds (stage1.md D8): each of
+/// `buttons` recorded buttons and keys [`BUTTON_EDGES_PER_SEC`], and each
+/// of `axes` recorded axes [`AXIS_REPORTS_PER_SEC`], over the span in
+/// whole seconds, rounded up. A span that is not positive holds nothing;
+/// the product saturates.
+#[must_use]
+pub fn window_inputs(span: TimeUs, buttons: usize, axes: usize) -> usize {
+    let secs = u64::try_from(span.0).unwrap_or(0).div_ceil(1_000_000);
+    let secs = usize::try_from(secs).unwrap_or(usize::MAX);
+    buttons
+        .saturating_mul(BUTTON_EDGES_PER_SEC)
+        .saturating_add(axes.saturating_mul(AXIS_REPORTS_PER_SEC))
+        .saturating_mul(secs)
 }

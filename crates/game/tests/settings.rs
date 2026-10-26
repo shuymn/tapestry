@@ -180,6 +180,7 @@ fn key_config_gives_profiles_and_recorded_controls() {
                         lane: lane(6)
                     },
                 ],
+                axes: Vec::new(),
             },
             SourceProfile {
                 input_offset: TimeUs(4_500),
@@ -193,6 +194,7 @@ fn key_config_gives_profiles_and_recorded_controls() {
                         lane: lane(0)
                     },
                 ],
+                axes: Vec::new(),
             },
         ]
     );

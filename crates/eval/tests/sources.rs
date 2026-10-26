@@ -175,7 +175,7 @@ fn lane_stays_held_while_any_control_holds_it() {
     };
     let mut c = ConversionState::init(&dev, &InputStart::default()).unwrap();
     let l1 = lane(1);
-    let mut step = |e| c.apply(&e).as_slice().to_vec();
+    let mut step = |e: PhysicalInputEvent| c.apply(&e, e.received).as_slice().to_vec();
     assert_eq!(step(press(1, 0, 1)), [LaneEdge::Press(l1)]);
     assert_eq!(step(extra(2, 1)), []);
     // Releasing one of two held controls keeps the lane held.

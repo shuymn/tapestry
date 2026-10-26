@@ -389,6 +389,7 @@ impl DeviceSettings {
                 .map(|&kind| SourceProfile {
                     input_offset: TimeUs(self.input_offset_us),
                     bindings: self.keys(kind).bindings(),
+                    axes: Vec::new(),
                 })
                 .collect(),
         }

@@ -40,6 +40,7 @@ fn source(kind: DeviceKind, offset: i64, bindings: &[(u32, u8)]) -> SourceRecord
                     lane: lane(l),
                 })
                 .collect(),
+            axes: Vec::new(),
         },
     }
 }
