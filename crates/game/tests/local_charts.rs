@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,17 +30,39 @@ use input::{DeviceKind, ScriptedInput, SourceSet};
 use replay::{BuildProvenance, DecodeLimits, ReceiveMethod};
 use rules::Judgment;
 
-/// Every file under `dir` the BMS adapter reads, in a stable order. A
+/// Every file under `dir` the BMS adapter reads, in a stable order. Linked
+/// folders are followed, each folder at most once, so a link cycle ends. A
 /// folder or entry that cannot be read counts in `unreadable`, so no part
 /// of the collection is skipped silently.
 fn charts(dir: &Path, out: &mut Vec<PathBuf>, unreadable: &mut usize) {
+    charts_in(dir, &mut BTreeSet::new(), out, unreadable);
+}
+
+fn charts_in(
+    dir: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+    unreadable: &mut usize,
+) {
+    let Ok(real) = fs::canonicalize(dir) else {
+        *unreadable += 1;
+        return;
+    };
+    if !visited.insert(real) {
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         *unreadable += 1;
         return;
     };
     let mut paths = Vec::new();
     for entry in entries {
-        match entry.and_then(|e| Ok((e.path(), e.file_type()?.is_dir()))) {
+        // `metadata` follows links, so a linked folder counts as a folder.
+        match entry.and_then(|e| {
+            let path = e.path();
+            let is_dir = fs::metadata(&path)?.is_dir();
+            Ok((path, is_dir))
+        }) {
             Ok(p) => paths.push(p),
             Err(_) => *unreadable += 1,
         }
@@ -48,11 +70,60 @@ fn charts(dir: &Path, out: &mut Vec<PathBuf>, unreadable: &mut usize) {
     paths.sort();
     for (path, is_dir) in paths {
         if is_dir {
-            charts(&path, out, unreadable);
+            charts_in(&path, visited, out, unreadable);
         } else if BmsIngest.accepts(&path) {
             out.push(path);
         }
     }
+}
+
+/// Links `link` to the folder `target`, or `None` when this system does not
+/// let the test create links.
+fn link_dir(target: &Path, link: &Path) -> Option<()> {
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(target, link);
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    match made {
+        Ok(()) => Some(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+        // ERROR_PRIVILEGE_NOT_HELD: links need Developer Mode or elevation.
+        Err(e) if cfg!(windows) && e.raw_os_error() == Some(1314) => None,
+        Err(e) => panic!("cannot create a folder link: {e}"),
+    }
+}
+
+#[test]
+fn linked_folders_are_followed_once() {
+    let base = tempfile::Builder::new()
+        .prefix("links")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = base.path().join("root");
+    let outside = base.path().join("outside");
+    fs::create_dir_all(root.join("plain")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(root.join("plain").join("a.bms"), b"").unwrap();
+    fs::write(outside.join("b.bme"), b"").unwrap();
+    fs::write(outside.join("notes.txt"), b"").unwrap();
+    if link_dir(&outside, &root.join("linked")).is_none() {
+        println!("skipped: this system does not allow creating folder links");
+        return;
+    }
+    // A link back to the root would recurse without end if followed again.
+    link_dir(&root, &root.join("plain").join("loop")).unwrap();
+
+    let mut found = Vec::new();
+    let mut unreadable = 0;
+    charts(&root, &mut found, &mut unreadable);
+    assert_eq!(
+        found,
+        [
+            root.join("linked").join("b.bme"),
+            root.join("plain").join("a.bms")
+        ]
+    );
+    assert_eq!(unreadable, 0);
 }
 
 /// Why a chart was not played, as a category with no detail of the chart.
