@@ -1,7 +1,8 @@
 //! A counting global allocator for allocation tests. It counts allocations
 //! made on threads that opted in (a thread-local flag), so the test
 //! harness's own threads do not disturb the count. Each test binary
-//! registers it with `#[global_allocator]`.
+//! registers it with `#[global_allocator]` and calls [`self_check`] where
+//! it starts tracking.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -24,6 +25,18 @@ pub fn track(on: bool) {
 /// Allocations counted so far.
 pub fn allocations() -> u64 {
     ALLOCS.load(Ordering::Relaxed)
+}
+
+/// The positive control, called while this thread is tracked: one
+/// allocation that escapes through `black_box`, so no profile elides it,
+/// must be counted. It is taken back out of the count, so a test's bound
+/// stays zero, and a build whose count never moves fails here instead of
+/// passing.
+pub fn self_check() {
+    let before = allocations();
+    drop(std::hint::black_box(vec![1u8; 8]));
+    assert_eq!(allocations() - before, 1, "the allocation was not counted");
+    ALLOCS.fetch_sub(1, Ordering::Relaxed);
 }
 
 fn note() {

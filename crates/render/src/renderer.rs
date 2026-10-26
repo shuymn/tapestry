@@ -175,6 +175,9 @@ pub struct Renderer {
     /// The batch in drawing order, copied into `instances` each frame.
     staging: Vec<Sprite>,
     skin: Box<dyn PlaySkin>,
+    /// When the built frame's work began, until [`submit`](Self::submit)
+    /// takes it.
+    started: Option<Instant>,
 }
 
 impl Renderer {
@@ -259,6 +262,7 @@ impl Renderer {
             batch: SpriteBatch::with_capacity(MAX_SPRITES),
             staging: Vec::with_capacity(MAX_SPRITES),
             skin: Box::new(SimpleSkin::new()),
+            started: None,
         })
     }
 
@@ -314,7 +318,28 @@ impl Renderer {
         matches!(&self.output, Output::Window(w) if w.waitable.is_some())
     }
 
-    /// Builds, submits and presents one frame.
+    /// Builds, submits and presents one frame: [`build`](Self::build), then
+    /// [`submit`](Self::submit).
+    ///
+    /// # Errors
+    ///
+    /// As [`submit`](Self::submit).
+    pub fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
+        self.build(f);
+        self.submit()
+    }
+
+    /// The app's share of a frame ([`build_frame`]): the skin builds `f`
+    /// and the batch is staged, with no call into wgpu. The frame's CPU
+    /// time starts here; [`submit`](Self::submit) must follow.
+    pub fn build(&mut self, f: &FrameInput<'_>) {
+        self.started = Some(Instant::now());
+        build_frame(self.skin.as_mut(), f, &mut self.batch, &mut self.staging);
+    }
+
+    /// Submits and presents the frame [`build`](Self::build) staged.
+    /// Submitting without a build first is a logic error (a debug build
+    /// asserts it); the staged batch is drawn again, timed from here.
     ///
     /// A frame whose swap chain image times out or is occluded is skipped
     /// (`presented` is `false`); an outdated swap chain is configured again
@@ -324,9 +349,9 @@ impl Renderer {
     ///
     /// Returns [`RenderError::SurfaceLost`] when the surface is lost or
     /// fails validation: the renderer must be built again.
-    pub fn frame(&mut self, f: &FrameInput<'_>) -> Result<FrameTiming, RenderError> {
-        let start = Instant::now();
-        build_frame(self.skin.as_mut(), f, &mut self.batch, &mut self.staging);
+    pub fn submit(&mut self) -> Result<FrameTiming, RenderError> {
+        debug_assert!(self.started.is_some(), "submit without a build");
+        let start = self.started.take().unwrap_or_else(Instant::now);
         self.draw(start)
     }
 
@@ -540,8 +565,8 @@ impl Renderer {
     }
 }
 
-/// The app's share of a frame, everything [`Renderer::frame`] does before
-/// calling into wgpu: `skin` builds into the emptied `batch`, which is then
+/// The app's share of a frame, everything [`Renderer::build`] does before
+/// [`Renderer::submit`] calls into wgpu: `skin` builds into the emptied `batch`, which is then
 /// staged into `staging` in drawing order. It allocates nothing once `batch`
 /// and `staging` have room for the batch's capacity.
 pub fn build_frame(

@@ -5,6 +5,7 @@
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
 //! disturb the count. This file holds a single test for the same reason.
+//! Profiles and the positive control: design.md "Scope of No Allocation".
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -81,6 +82,9 @@ fn batches_do_not_allocate() {
     };
 
     TRACK.with(|t| t.set(true));
+    // The count works: an allocation that escapes is counted in any profile.
+    drop(std::hint::black_box(vec![1u8; 8]));
+    assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1);
     let mut popped = 0;
     for t in 1..=1_000_i64 {
         set.begin_batch(TimeUs(t * 10));

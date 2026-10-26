@@ -6,6 +6,7 @@
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
 //! disturb the count. This file holds a single test for the same reason.
+//! Profiles and the positive control: design.md "Scope of No Allocation".
 
 mod common;
 
@@ -152,6 +153,9 @@ fn logic_does_not_allocate_during_play() {
     .unwrap();
 
     TRACK.with(|t| t.set(true));
+    // The count works: an allocation that escapes is counted in any profile.
+    drop(std::hint::black_box(vec![1u8; 8]));
+    assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1);
     let outcome = runner.run_to_end(TimeUs(MS));
     let overflow = overflowing.advance_to(TimeUs(1_000_500));
     TRACK.with(|t| t.set(false));

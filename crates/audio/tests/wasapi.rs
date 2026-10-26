@@ -87,6 +87,7 @@ fn wasapi_plays_a_scheduled_tone() {
             stop.store(true, Ordering::Release);
         });
         counting::track(true);
+        counting::self_check();
         // The first wakes one by one, for the startup trace.
         for t in &mut trace {
             let step = engine.step(&mut out, &mut rx).unwrap();

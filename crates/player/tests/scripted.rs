@@ -145,6 +145,19 @@ fn measured(record: &Path) -> toml::Table {
     text.parse().unwrap()
 }
 
+/// `tapestry play <chart> --dev-scripted-input <log>` with its data root
+/// under `appdata`; the caller adds its own arguments.
+fn scripted_play(chart: &Path, log: &Path, appdata: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tapestry"));
+    command
+        .arg("play")
+        .arg(chart)
+        .arg("--dev-scripted-input")
+        .arg(log)
+        .env("LOCALAPPDATA", appdata);
+    command
+}
+
 fn int(t: &toml::Table, table: &str, key: &str) -> Option<i64> {
     t.get(table)?.get(key)?.as_integer()
 }
@@ -162,14 +175,9 @@ fn scripted_play_writes_a_record() {
     assert_eq!(events.len(), 2 * NOTES);
     let frames = dir.path().join("frames");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .arg("play")
-        .arg(&chart_path)
-        .arg("--dev-scripted-input")
-        .arg(&log)
+    let out = scripted_play(&chart_path, &log, &appdata)
         .arg("--dev-frames")
         .arg(&frames)
-        .env("LOCALAPPDATA", &appdata)
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -259,6 +267,32 @@ fn scripted_play_writes_a_record() {
     assert!(int(&m, "audio", "underruns").is_some());
     assert!(int(&m, "load_ms", "first").is_some());
     assert!(int(&m, "allocations", "render").is_some());
+    // The frame dump reads back, encodes and writes files, outside the
+    // render thread's app region, which allocates nothing.
+    assert_eq!(int(&m, "allocations", "render_app"), Some(0));
+}
+
+/// A scripted play with the overlay shown and no frame dump: the render
+/// thread's app region (design.md "Scope of No Allocation") allocates
+/// nothing in any frame of the play. The whole-thread counts are printed,
+/// not checked: they include wgpu and the driver.
+#[test]
+fn render_app_region_does_not_allocate() {
+    let fx = fixture();
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .arg("--dev-overlay")
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let saved = records(&fx.appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let m = measured(&saved[0]);
+    println!("allocations: {:?}", m.get("allocations"));
+    // Play frames were drawn, so the count covers them.
+    assert!(int(&m, "render_cpu_us", "count").unwrap() > 0);
+    assert_eq!(int(&m, "allocations", "render_app"), Some(0));
 }
 
 /// A `device.toml` binding one control to two lanes, binding a reserved
@@ -293,12 +327,7 @@ fn an_invalid_key_config_exits_nonzero() {
         let mut device = DeviceSettings::default();
         change(&mut device);
         game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-            .arg("play")
-            .arg(&chart_path)
-            .arg("--dev-scripted-input")
-            .arg(&log)
-            .env("LOCALAPPDATA", &appdata)
+        let out = scripted_play(&chart_path, &log, &appdata)
             .output()
             .expect("run tapestry");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -318,14 +347,9 @@ fn an_invalid_key_config_exits_nonzero() {
 /// re-evaluate to their live streams, and both are saved. Returns stdout
 /// and the records in the order they were saved.
 fn run_retried(fx: &Fixture, extra: &[&str]) -> (String, Vec<PlayRecord>) {
-    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
-        .arg("play")
-        .arg(&fx.chart_path)
-        .arg("--dev-scripted-input")
-        .arg(&fx.log)
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
         .arg("--dev-auto-retry")
         .args(extra)
-        .env("LOCALAPPDATA", &fx.appdata)
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

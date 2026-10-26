@@ -1,7 +1,8 @@
 //! A counting global allocator for the audio allocation tests: it counts
 //! allocations and frees made on threads that opted in (a thread-local
 //! flag), so the harness's threads and the game-side work between steps
-//! are not counted. Each test binary installs it itself:
+//! are not counted. Each test binary installs it itself, and calls
+//! [`self_check`] on each thread it tracks:
 //!
 //! ```ignore
 //! #[global_allocator]
@@ -37,6 +38,18 @@ pub fn track(on: bool) {
 /// Allocations and frees counted so far, on every tracked thread.
 pub fn calls() -> u64 {
     CALLS.load(Ordering::Relaxed)
+}
+
+/// The positive control, called while this thread is tracked and no other
+/// thread is: one allocation that escapes through `black_box`, so no
+/// profile elides it, and its free must both be counted. They are taken
+/// back out of the count, so a test's bound stays zero, and a build whose
+/// count never moves fails here instead of passing.
+pub fn self_check() {
+    let before = calls();
+    drop(std::hint::black_box(vec![1u8; 8]));
+    assert_eq!(calls() - before, 2, "the allocation was not counted");
+    CALLS.fetch_sub(2, Ordering::Relaxed);
 }
 
 // SAFETY: delegates to `System`; only adds a counter, which never allocates.
