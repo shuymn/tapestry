@@ -205,6 +205,15 @@ fn judged_at(events: &[eval::JudgeEvent]) -> Vec<(i64, usize)> {
         .collect()
 }
 
+/// The time of each empty POOR in `events`.
+fn empty_poor_times(events: &[eval::JudgeEvent]) -> Vec<i64> {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. }))
+        .map(|e| e.time.0)
+        .collect()
+}
+
 /// Notes at 1000 and 1060 ms; presses at 1040 and 1050 ms.
 fn overtaking(preset: &rules::RulePreset) -> (Vec<eval::JudgeEvent>, eval::Tally) {
     let chart = ChartBuilder::new(BPM)
@@ -241,12 +250,7 @@ fn overtaking_press_misses_the_earlier_note() {
     assert_eq!(judged_at(&events), [(1_040 * MS, 0), (1_040 * MS, 1)]);
     // The press at 1050 ms has no unjudged note left, but lies 50 ms after
     // the first note: an empty POOR.
-    let empty: Vec<i64> = events
-        .iter()
-        .filter(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. }))
-        .map(|e| e.time.0)
-        .collect();
-    assert_eq!(empty, [1_050 * MS]);
+    assert_eq!(empty_poor_times(&events), [1_050 * MS]);
     // The POOR and the empty POOR add to BP; the POOR came first, so the
     // PERFECT starts a combo the empty POOR keeps.
     assert_eq!(
@@ -351,6 +355,65 @@ fn overtaken_ln_head_loses_its_ln() {
 }
 
 #[test]
+fn overtaken_ln_head_skips_its_future_end() {
+    // An LN 1000-1150 ms and a tap at 1200 ms; the press at 1140 ms is
+    // nearer the tap (-60 ms, GOOD) than the head (+140 ms). The LN's end
+    // deadline at 1150 ms comes after the press and must do nothing.
+    let chart = ChartBuilder::new(BPM)
+        .long(lane(7), TimeUs(1_000 * MS), TimeUs(1_150 * MS))
+        .tap(lane(7), TimeUs(1_200 * MS))
+        .build()
+        .unwrap();
+    let inputs = [press(1_140 * MS, 0, 7), release(1_160 * MS, 0, 7)];
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    );
+    assert_eq!(
+        judgments(&events),
+        [(7, 0, Poor, None), (7, 1, Good, Some(-60 * MS))]
+    );
+    assert_eq!(judged_at(&events), [(1_140 * MS, 0), (1_140 * MS, 1)]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, JudgeEventKind::LnEnd { .. }))
+    );
+    assert_eq!((tally.ln_breaks, tally.bp, tally.combo), (0, 1, 1));
+}
+
+#[test]
+fn empty_poor_before_an_already_judged_note() {
+    // The tap at 1000 ms is judged early (BAD, -150 ms) at 850 ms; a press
+    // at 900 ms has no unjudged note left, but the judged note lies 100 ms
+    // ahead: an empty POOR.
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let inputs = [
+        press(850 * MS, 0, 1),
+        release(860 * MS, 0, 1),
+        press(900 * MS, 0, 1),
+        release(910 * MS, 0, 1),
+    ];
+    let (events, tally) = run(
+        &chart,
+        &device(&[0]),
+        &InputStart::default(),
+        &inputs,
+        2_000 * MS,
+    );
+    assert_eq!(judgments(&events), [(1, 0, Bad, Some(-150 * MS))]);
+    assert_eq!(empty_poor_times(&events), [900 * MS]);
+    // BAD and the empty POOR each add to BP; BAD broke the combo.
+    assert_eq!((tally.empty_poor, tally.bp, tally.combo), (1, 2, 0));
+}
+
+#[test]
 fn empty_poor_reaches_behind_judged_notes() {
     let chart = ChartBuilder::new(BPM)
         .tap(lane(2), TimeUs(1_000 * MS))
@@ -388,12 +451,10 @@ fn empty_poor_reaches_behind_judged_notes() {
         judgments(&events),
         [(2, 0, Perfect, Some(0)), (2, 1, Perfect, Some(0))]
     );
-    let at: Vec<i64> = events
-        .iter()
-        .filter(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. }))
-        .map(|e| e.time.0)
-        .collect();
-    assert_eq!(at, [1_100 * MS, 1_150 * MS, 3_100 * MS]);
+    assert_eq!(
+        empty_poor_times(&events),
+        [1_100 * MS, 1_150 * MS, 3_100 * MS]
+    );
     assert_eq!((tally.empty_poor, tally.bp), (3, 3));
     // Not counted and not breaking the combo.
     assert_eq!((tally.counts.poor, tally.combo, tally.max_combo), (0, 2, 2));
@@ -424,12 +485,7 @@ fn empty_poor_reaches_ahead_of_unjudged_notes() {
         3_000 * MS,
     );
     assert_eq!(judgments(&events), [(4, 0, Perfect, Some(0))]);
-    let at: Vec<i64> = events
-        .iter()
-        .filter(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. }))
-        .map(|e| e.time.0)
-        .collect();
-    assert_eq!(at, [1_500 * MS, 1_600 * MS]);
+    assert_eq!(empty_poor_times(&events), [1_500 * MS, 1_600 * MS]);
     assert_eq!((tally.empty_poor, tally.bp, tally.combo), (2, 2, 1));
 }
 
