@@ -669,8 +669,8 @@ impl<O: AudioOutput + Wakes> Session<O> {
                 display_offset: TimeUs(settings.device.display_offset_us),
             },
             play_type: PlayType::Full,
-            start: record.start.clone(),
-            events: record.events.clone(),
+            start: record.start,
+            events: record.events,
             arrivals,
             status: Status {
                 end: status,
