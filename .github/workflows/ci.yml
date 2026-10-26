@@ -58,14 +58,16 @@ jobs:
         run: |
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
           # Each development argument, alone and in the `play` form a
-          # development build takes (the dev-tools tests are the positive
-          # control).
+          # development build takes, and the `measure` command (the
+          # dev-tools tests are the positive control).
           for args in "--dev-tools-probe x" "--dev-scripted-input x" \
               "play x.bms --dev-scripted-input x" "play x.bms --dev-frames x" \
-              "play x.bms --dev-auto-retry" "--dev-adjust-at 1" \
+              "play x.bms --dev-auto-retry" "play x.bms --dev-overlay" \
+              "--dev-adjust-at 1" \
               "play x.bms --dev-adjust-at 1" "play x.bms --dev-adjust F1" \
-              "play x.bms --dev-adjust-end F1" "keys --dev-scripted-keys 1"; do
-            arg=$(echo "$args" | grep -o -- "--dev-[a-z-]*")
+              "play x.bms --dev-adjust-end F1" "keys --dev-scripted-keys 1" \
+              "measure play x.bms"; do
+            arg=$(echo "$args" | grep -o -e "--dev-[a-z-]*" -e "^measure")
             set +e
             # shellcheck disable=SC2086 # split into arguments on purpose
             target/release/tapestry.exe $args 2> probe.err

@@ -139,6 +139,13 @@ impl QpcClock {
     pub const fn frequency(&self) -> QpcFrequency {
         self.frequency
     }
+
+    /// A raw QPC value another API reported (DXGI frame statistics, a
+    /// display capture) as this clock's time.
+    #[must_use]
+    pub fn from_qpc(&self, ticks: i64) -> TimeUs {
+        qpc_to_us(ticks, self.origin, self.frequency)
+    }
 }
 
 impl TimeSource for QpcClock {
@@ -637,4 +644,25 @@ pub fn keyboard_target() -> Option<usize> {
         .find(|d| d.usUsagePage == 0x01 && d.usUsage == 0x06)
         .map(|d| d.hwndTarget.0 as usize)
         .filter(|&h| h != 0)
+}
+
+#[cfg(test)]
+mod qpc_tests {
+    use bms_model::TimeSource;
+
+    use super::{QpcClock, read_qpc};
+
+    /// A QPC value read between two clock reads converts to a time between
+    /// them; one second of ticks later is one second later.
+    #[test]
+    fn raw_qpc_converts_onto_the_clock() {
+        let clock = QpcClock::start();
+        let before = clock.now();
+        let ticks = read_qpc();
+        let after = clock.now();
+        let t = clock.from_qpc(ticks);
+        assert!(before <= t && t <= after, "{before:?} {t:?} {after:?}");
+        let later = clock.from_qpc(ticks + clock.frequency().hz());
+        assert_eq!(later.0 - t.0, 1_000_000);
+    }
 }

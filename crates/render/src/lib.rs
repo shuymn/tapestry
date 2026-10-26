@@ -10,9 +10,14 @@
 //!
 //! The app's per-frame work, the skin's build into the preallocated
 //! [`SpriteBatch`] and its staging into instances, allocates nothing.
+//!
+//! [`measure`] holds the pure frame and latency measurement of D11, and
+//! [`Renderer::frame_statistics`] reads the swap chain's DXGI frame
+//! statistics it pairs to frames.
 
 mod atlas;
 mod gpu;
+pub mod measure;
 mod renderer;
 mod simple;
 mod skin;

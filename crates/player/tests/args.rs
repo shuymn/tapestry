@@ -77,6 +77,7 @@ fn dev_scripted_input_is_unknown_without_feature() {
     );
     assert_unknown(&["play", "a.bms", "--dev-frames", "x"], "--dev-frames");
     assert_unknown(&["play", "a.bms", "--dev-auto-retry"], "--dev-auto-retry");
+    assert_unknown(&["play", "a.bms", "--dev-overlay"], "--dev-overlay");
     assert_unknown(&["--dev-adjust-at", "1"], "--dev-adjust-at");
     for opt in ["--dev-adjust-at", "--dev-adjust", "--dev-adjust-end"] {
         assert_unknown(&["play", "a.bms", opt, "1"], opt);
@@ -121,6 +122,7 @@ fn dev_options_are_taken_with_the_feature() {
         vec!["--dev-scripted-input".as_ref(), log.as_os_str()],
         vec!["--dev-frames".as_ref(), dir.path().as_os_str()],
         vec!["--dev-auto-retry".as_ref()],
+        vec!["--dev-overlay".as_ref()],
         vec!["--dev-adjust-at".as_ref(), "1".as_ref()],
         vec!["--dev-adjust".as_ref(), "F1".as_ref()],
         vec!["--dev-adjust-end".as_ref(), "F1".as_ref()],
@@ -137,4 +139,40 @@ fn dev_options_are_taken_with_the_feature() {
         assert!(!stderr.contains("unknown argument"), "{stderr}");
         assert!(stderr.contains("missing."), "{stderr}");
     }
+}
+
+/// `measure` exists only in development builds: production treats it as
+/// any other unknown argument.
+#[cfg(not(feature = "dev-tools"))]
+#[test]
+fn measure_is_unknown_without_feature() {
+    assert_unknown(&["measure", "play", "a.bms"], "measure");
+    assert_unknown(&["measure"], "measure");
+}
+
+/// The positive control: a development build takes `measure play`, and
+/// without PresentMon it fails with the reason before anything starts.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn measure_play_needs_presentmon() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("PresentMon.exe");
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("measure")
+        .arg("play")
+        .arg(dir.path().join("missing.bms"))
+        .env("LOCALAPPDATA", dir.path())
+        .env("TAPESTRY_PRESENTMON", &missing)
+        .output()
+        .expect("run tapestry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("TAPESTRY_PRESENTMON names"), "{stderr}");
+    assert!(!stderr.contains("unknown argument"), "{stderr}");
+    // Nothing was started, so no capture was made.
+    assert!(!dir.path().join("tapestry").join("measure").exists());
+    assert_unknown(&["measure", "run", "a.bms"], "run");
+    assert_unknown(&["measure", "play", "a.bms", "b.bms"], "b.bms");
+    let usage = run(&["measure"]);
+    assert_eq!(usage.status.code(), Some(2));
 }

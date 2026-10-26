@@ -192,6 +192,9 @@ impl fmt::Display for KeyError {
 
 impl std::error::Error for KeyError {}
 
+/// F9: shows and hides the measurement overlay during play (D11).
+pub const OVERLAY_KEY: u32 = 0x43;
+
 /// What the game reserves keyboard key `code` (a scan code) for, if
 /// anything: the settings keys and the key config's keep key are never
 /// bound.
@@ -199,6 +202,9 @@ impl std::error::Error for KeyError {}
 pub fn reserved_key(code: u32) -> Option<&'static str> {
     if code == crate::keys::KEEP_KEY {
         return Some("keeping a binding in key config");
+    }
+    if code == OVERLAY_KEY {
+        return Some("the measurement overlay");
     }
     Adjust::from_key(code).map(Adjust::name)
 }
@@ -297,6 +303,9 @@ pub struct DeviceSettings {
     pub display_offset_us: i64,
     /// The audio device's id; the system default when absent.
     pub audio_device: Option<String>,
+    /// The monitor to play on, by its display device name (for example
+    /// `\.\DISPLAY1`); the system's primary monitor when absent.
+    pub monitor: Option<String>,
     /// The master volume, 0.0 (silent) to 1.0 (unity).
     pub master_volume: f32,
 }
@@ -324,6 +333,7 @@ impl Default for DeviceSettings {
             audio_offset_us: 0,
             display_offset_us: 0,
             audio_device: None,
+            monitor: None,
             master_volume: 1.0,
         }
     }
