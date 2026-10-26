@@ -27,6 +27,7 @@ bms-model.workspace = true
 eval.workspace = true
 game.workspace = true
 input.workspace = true
+lexopt.workspace = true
 render.workspace = true
 replay.workspace = true
 rtrb.workspace = true
