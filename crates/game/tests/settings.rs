@@ -71,6 +71,7 @@ fn changed() -> Settings {
                 hold_threshold: 3,
                 release_after_us: 80_000,
             },
+            queued_periods: 3,
         },
         player: PlayerSettings {
             visible_time_ms: 2_350,
@@ -672,6 +673,8 @@ fn settings_outside_their_ranges_are_refused_on_load() {
         with(|d| d.display_offset_us = -1_000_000),
         with(|d| d.master_volume = 0.0),
         with(|d| d.master_volume = 1.0),
+        with(|d| d.queued_periods = 2),
+        with(|d| d.queued_periods = 3),
     ] {
         assert!(load_written(&ok, &player).is_ok(), "{ok:?}");
     }
@@ -695,6 +698,14 @@ fn settings_outside_their_ranges_are_refused_on_load() {
         (with(|d| d.master_volume = 1.01), "master_volume 1.01"),
         (with(|d| d.master_volume = -0.01), "master_volume -0.01"),
         (with(|d| d.master_volume = f32::NAN), "master_volume NaN"),
+        (
+            with(|d| d.queued_periods = 1),
+            "queued_periods 1 is outside 2 to 3",
+        ),
+        (
+            with(|d| d.queued_periods = 4),
+            "queued_periods 4 is outside 2 to 3",
+        ),
     ];
     for (d, says) in &refused {
         assert_invalid(d, &player, says);

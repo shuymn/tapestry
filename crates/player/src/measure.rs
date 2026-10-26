@@ -98,6 +98,9 @@ pub struct PlayMeasure {
     /// The audio thread's counters, and its underruns and dropped probe
     /// samples when the play began; `None` without an audio thread.
     pub audio: Option<(AudioCounters, u64, u64)>,
+    /// Periods the output keeps queued for this play, when it says; it
+    /// replaces the figure the output opened with.
+    pub queued_periods: Option<u32>,
 }
 
 /// A play's figures, as written to `.measure.toml`.
@@ -434,6 +437,9 @@ impl Measure {
         }
         self.measured_qpc = None;
         self.alloc_base = allocations();
+        if let (Some(audio), Some(q)) = (self.audio.as_mut(), play.queued_periods) {
+            audio.queued_periods = Some(q);
+        }
         self.play = Some(play);
         self.drain();
     }
@@ -939,7 +945,51 @@ mod frame_tests {
             load_from: TimeUs(0),
             retry: false,
             audio: None,
+            queued_periods: None,
         }
+    }
+
+    /// Each play shows the periods its output keeps queued, which may
+    /// differ from what the output opened with.
+    #[test]
+    fn each_play_shows_the_queue_it_played_with() {
+        use super::AudioInfo;
+        let clock = QpcClock::start();
+        let (_steps, steps) = rtrb::RingBuffer::new(1);
+        let (_sounds, sounds) = rtrb::RingBuffer::new(1);
+        let opened = AudioInfo {
+            period_us: 9_166,
+            queued_periods: Some(2),
+        };
+        let overlay = Arc::new(AtomicBool::new(true));
+        let mut m = Measure::new(clock, None, Some(opened), steps, sounds, overlay);
+        let mut first = play(1, TimeUs(1_000_000));
+        first.queued_periods = Some(3);
+        m.start(first);
+        let fig = m.finish(TimeUs(1_100_000)).unwrap();
+        assert_eq!(
+            fig.audio,
+            Some(AudioInfo {
+                period_us: 9_166,
+                queued_periods: Some(3),
+            })
+        );
+        let mut lines = [super::Line::EMPTY; super::LINES];
+        let n = super::write_overlay(&fig, None, &mut lines);
+        assert!(
+            lines[..n]
+                .iter()
+                .any(|l| l.as_str() == " PERIOD 9.1 MS, 3 QUEUED"),
+            "{:?}",
+            lines[..n]
+                .iter()
+                .map(super::Line::as_str)
+                .collect::<Vec<_>>()
+        );
+        // A play whose output cannot say keeps the last figure.
+        m.start(play(2, TimeUs(2_000_000)));
+        let fig = m.finish(TimeUs(2_100_000)).unwrap();
+        assert_eq!(fig.audio.unwrap().queued_periods, Some(3));
     }
 
     struct Rig {

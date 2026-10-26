@@ -5,8 +5,10 @@
 //! format, event-driven. `IAudioClient3` initializes it at the shortest
 //! engine period; if the endpoint refuses that, a fresh `IAudioClient`
 //! initializes it at the default period, and the refusal is recorded in
-//! [`Grant::fallback`]. The output keeps two periods queued (fewer only if
-//! the buffer cannot hold them), and the thread that opens it joins the
+//! [`Grant::fallback`]. The output keeps two periods queued at first (fewer
+//! only if the buffer cannot hold them); between plays the queue can be
+//! deepened up to [`MAX_QUEUE_PERIODS`] that the buffer holds
+//! ([`AudioOutput::set_queue_periods`]). The thread that opens it joins the
 //! MMCSS "Pro Audio" task.
 //!
 //! The mix clock is taken from the buffer events by the engine.
@@ -37,10 +39,10 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, Interface, w};
 
 use crate::CHANNELS;
-use crate::output::{AudioOutput, OutputError, Wake};
+use crate::output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, Wake};
 
-/// Periods kept queued on the device (design.md "Path from Press to
-/// Sound": with one, audio dropped out repeatedly).
+/// Periods kept queued on the device when it opens (design.md "Path from
+/// Press to Sound": with one, audio dropped out repeatedly).
 pub const QUEUE_PERIODS: u32 = 2;
 
 /// How long a wait for a buffer event may take before the output reports
@@ -132,8 +134,11 @@ pub struct Grant {
     pub period: u32,
     /// The device buffer, frames.
     pub buffer: u32,
-    /// Periods kept queued.
+    /// Periods kept queued when it opened.
     pub queue_periods: u32,
+    /// The most periods the queue can hold: what the buffer holds, at most
+    /// [`MAX_QUEUE_PERIODS`].
+    pub max_queue_periods: u32,
     /// The periods `IAudioClient3` offered, when it answered.
     pub engine_periods: Option<EnginePeriods>,
     /// Why the default period was used instead of the shortest, if it was.
@@ -311,9 +316,10 @@ unsafe fn check_format(format: *const WAVEFORMATEX) -> Result<(u32, u16), Wasapi
     Ok((f.nSamplesPerSec, channels))
 }
 
-/// Periods to keep queued in a buffer of `buffer` frames.
-fn queue_periods(buffer: u32, period: u32) -> u32 {
-    (buffer / period.max(1)).clamp(1, QUEUE_PERIODS)
+/// Periods a buffer of `buffer` frames can keep queued, at least one and at
+/// most [`MAX_QUEUE_PERIODS`].
+fn buffer_periods(buffer: u32, period: u32) -> u32 {
+    (buffer / period.max(1)).clamp(1, MAX_QUEUE_PERIODS)
 }
 
 /// Frames to write: whole periods up to `queue` frames queued.
@@ -507,7 +513,10 @@ struct Stream<D, C> {
     clock: C,
     rate: u32,
     period: u32,
+    /// Frames to keep queued: whole periods.
     queue: u32,
+    /// The most periods the queue may hold.
+    max_queue_periods: u32,
     channels: usize,
     period_us: i64,
     /// The engine's stereo block, spread into the device buffer.
@@ -520,17 +529,27 @@ struct Stream<D, C> {
 }
 
 impl<D: Device, C: TimeSource> Stream<D, C> {
-    fn new(dev: D, clock: C, rate: u32, period: u32, queue_periods: u32, channels: u16) -> Self {
-        let queue = queue_periods * period;
+    /// A stream of `(rate, period, channels)` keeping `queue_periods`
+    /// queued, which may later change up to `max_queue_periods`; its block
+    /// is sized for the most.
+    fn new(
+        dev: D,
+        clock: C,
+        (rate, period, channels): (u32, u32, u16),
+        queue_periods: u32,
+        max_queue_periods: u32,
+    ) -> Self {
+        let max_queue_periods = max_queue_periods.max(1);
         Self {
             dev,
             clock,
             rate,
             period,
-            queue,
+            queue: queue_periods.clamp(1, max_queue_periods) * period,
+            max_queue_periods,
             channels: usize::from(channels),
             period_us: i64::from(period) * 1_000_000 / i64::from(rate.max(1)),
-            scratch: vec![0.0; queue as usize * CHANNELS],
+            scratch: vec![0.0; (max_queue_periods * period) as usize * CHANNELS],
             padding: 0,
             phase: Phase::Unprimed,
             fault: None,
@@ -629,6 +648,16 @@ impl<D: Device, C: TimeSource> AudioOutput for Stream<D, C> {
             padding: self.padding,
             priming: false,
         }
+    }
+
+    fn queue_periods(&self) -> Option<u32> {
+        Some(self.queue / self.period.max(1))
+    }
+
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        let periods = periods.clamp(1, self.max_queue_periods);
+        self.queue = periods * self.period;
+        Some(periods)
     }
 
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
@@ -749,7 +778,8 @@ impl<C: TimeSource> WasapiShared<C> {
                 channels,
                 period,
                 buffer,
-                queue_periods: queue_periods(buffer, period),
+                queue_periods: QUEUE_PERIODS.min(buffer_periods(buffer, period)),
+                max_queue_periods: buffer_periods(buffer, period),
                 engine_periods,
                 fallback,
                 mmcss: mmcss.is_some(),
@@ -771,10 +801,9 @@ impl<C: TimeSource> WasapiShared<C> {
             stream: Stream::new(
                 endpoint,
                 clock,
-                grant.rate,
-                grant.period,
+                (grant.rate, grant.period, grant.channels),
                 grant.queue_periods,
-                grant.channels,
+                grant.max_queue_periods,
             ),
             grant,
             _mmcss: mmcss,
@@ -823,6 +852,14 @@ impl<C: TimeSource> AudioOutput for WasapiShared<C> {
 
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
         self.stream.write(f)
+    }
+
+    fn queue_periods(&self) -> Option<u32> {
+        self.stream.queue_periods()
+    }
+
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        self.stream.set_queue_periods(periods)
     }
 }
 
@@ -932,11 +969,12 @@ mod tests {
     }
 
     #[test]
-    fn two_periods_are_queued_when_the_buffer_holds_them() {
-        assert_eq!(queue_periods(1_056, 480), 2);
-        assert_eq!(queue_periods(4_800, 480), 2);
-        assert_eq!(queue_periods(959, 480), 1);
-        assert_eq!(queue_periods(100, 480), 1);
+    fn the_queue_holds_what_the_buffer_holds_up_to_three_periods() {
+        assert_eq!(buffer_periods(1_056, 480), 2);
+        assert_eq!(buffer_periods(1_440, 480), 3);
+        assert_eq!(buffer_periods(4_800, 480), 3);
+        assert_eq!(buffer_periods(959, 480), 1);
+        assert_eq!(buffer_periods(100, 480), 1);
     }
 
     #[test]
@@ -1253,7 +1291,7 @@ mod tests {
 
     fn stream(fake: Fake) -> Stream<Fake, FakeClock> {
         let clock = FakeClock(Arc::clone(&fake.now));
-        Stream::new(fake, clock, 48_000, 480, 2, 2)
+        Stream::new(fake, clock, (48_000, 480, 2), 2, 2)
     }
 
     #[test]
@@ -1272,6 +1310,59 @@ mod tests {
             s.dev.calls,
             [Call::Fill(960), Call::Start, Call::Wait, Call::Padding]
         );
+    }
+
+    /// A queue deepened between plays is filled at the next write, never past
+    /// what the buffer holds; a buffer of two periods keeps two.
+    #[test]
+    fn a_deeper_queue_is_filled_at_the_next_write_up_to_the_buffer() {
+        let mut fake = Fake::new();
+        fake.queue = 1_440;
+        fake.buf = vec![0; 1_440 * 8];
+        let clock = FakeClock(Arc::clone(&fake.now));
+        let mut s = Stream::new(fake, clock, (48_000, 480, 2), 2, 3);
+        assert_eq!(s.queue_periods(), Some(2));
+        let mut step = || {
+            s.wait();
+            s.write(|b| b.fill(0.0)).unwrap();
+        };
+        // Prime (960), then a timed wake after one pass (480 left: 480 more).
+        step();
+        step();
+        assert_eq!(s.set_queue_periods(3), Some(3));
+        assert_eq!(s.queue_periods(), Some(3));
+        // After the next pass 480 are left: 960 more fill three periods,
+        // then each pass is refilled by one.
+        let mut step = || {
+            s.wait();
+            s.write(|b| b.fill(0.0)).unwrap();
+        };
+        step();
+        step();
+        let fills: Vec<Call> = s
+            .dev
+            .calls
+            .iter()
+            .copied()
+            .filter(|c| matches!(c, Call::Fill(_)))
+            .collect();
+        assert_eq!(
+            fills,
+            [
+                Call::Fill(960),
+                Call::Fill(480),
+                Call::Fill(960),
+                Call::Fill(480)
+            ]
+        );
+        assert_eq!(s.dev.short_passes, 0);
+        // Asked for more than the buffer holds, or for none, it keeps what
+        // fits.
+        assert_eq!(s.set_queue_periods(5), Some(3));
+        assert_eq!(s.set_queue_periods(0), Some(1));
+        let mut two = stream(Fake::new());
+        assert_eq!(two.set_queue_periods(3), Some(2));
+        assert_eq!(two.queue_periods(), Some(2));
     }
 
     #[test]

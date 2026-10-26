@@ -6,7 +6,11 @@
 //! thread through a second preallocated queue and is dropped there.
 //!
 //! Before the first play the engine is stopped, so it writes silence and no
-//! BGM sounds during setup. A sealed play (evaluation complete, no more key
+//! BGM sounds during setup. Between plays the game thread may change the
+//! periods the output keeps queued; the audio thread applies the change at
+//! its next step and answers with what the output keeps. It also counts each
+//! play's underruns from its chart time 0 on, the steady state after the
+//! countdown. A sealed play (evaluation complete, no more key
 //! sounds) is reported done only once the audio thread has taken every
 //! command sent before the seal and every voice and BGM event has ended:
 //! the end of the audio tail (D13).
@@ -32,7 +36,7 @@ const RETIRED_CAPACITY: usize = 1;
 /// switch: far beyond a period, which is when it takes one.
 pub const SWITCH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Why the audio thread did not take a play switch.
+/// Why the audio thread did not take a play switch or a queue change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioWaitError {
     /// The worker is gone.
@@ -105,6 +109,18 @@ impl AudioCounters {
         self.0.underruns.load(Ordering::Acquire)
     }
 
+    /// Underruns of play `generation` from its chart time 0 until it was
+    /// cancelled or its sealed audio ended; 0 for any other play.
+    #[must_use]
+    pub fn steady_underruns(&self, generation: u64) -> u64 {
+        let packed = self.0.steady.load(Ordering::Acquire);
+        if packed >> 32 == generation & u64::from(u32::MAX) {
+            packed & u64::from(u32::MAX)
+        } else {
+            0
+        }
+    }
+
     /// Probe samples the full probe queue refused since the engine
     /// started.
     #[must_use]
@@ -123,6 +139,15 @@ struct Shared {
     done: AtomicU64,
     /// The engine's underruns so far.
     underruns: AtomicU64,
+    /// The current play's underruns from its chart time 0: the play's
+    /// generation in the high 32 bits, the count in the low 32.
+    steady: AtomicU64,
+    /// The latest queue change asked for: its number in the high 32 bits,
+    /// the periods in the low 32.
+    queue_request: AtomicU64,
+    /// The answer to a queue change: its number in the high 32 bits, the
+    /// periods the output now keeps in the low 32 (0: it cannot say).
+    queue_answer: AtomicU64,
     /// Probe samples dropped on a full probe queue.
     probes_dropped: AtomicU64,
     failure: OnceLock<OutputError>,
@@ -137,6 +162,8 @@ pub struct AudioControl {
     in_flight: bool,
     shared: Arc<Shared>,
     generation: u64,
+    /// The number of the latest queue change asked for.
+    queue_change: u32,
 }
 
 /// The audio thread's end: the engine and the play it is playing.
@@ -154,6 +181,12 @@ pub struct AudioWorker {
     unreturned: Option<AudioQueue>,
     /// Where key sound latencies go, if anywhere; a full queue drops them.
     probe: Option<rtrb::Producer<AudioProbe>>,
+    /// The number of the latest queue change applied.
+    queue_change: u32,
+    /// While the play's underruns are counted: its chart time 0.
+    steady_from: Option<TimeUs>,
+    /// The play's underruns counted so far.
+    steady: u32,
 }
 
 /// The two ends around `engine`, which is stopped until the first play.
@@ -170,6 +203,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
             in_flight: false,
             shared: Arc::clone(&shared),
             generation: 0,
+            queue_change: 0,
         },
         AudioWorker {
             engine,
@@ -183,6 +217,9 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
             exited: false,
             unreturned: None,
             probe: None,
+            queue_change: 0,
+            steady_from: None,
+            steady: 0,
         },
     )
 }
@@ -252,6 +289,55 @@ impl AudioControl {
             generation,
         });
         Ok(())
+    }
+
+    /// Keeps `periods` periods queued on the output from the audio thread's
+    /// next step on, and waits for its answer: the periods the output now
+    /// keeps, `None` when it cannot say. Call it between plays, before
+    /// recording opens, so a change never lands inside a play. An output
+    /// that already failed is not asked: `Ok(None)`, and the next play ends
+    /// on the failure as any would.
+    ///
+    /// # Errors
+    ///
+    /// [`AudioWaitError::Gone`] once the worker is gone, and
+    /// [`AudioWaitError::Timeout`] after [`SWITCH_TIMEOUT`].
+    pub fn set_queued_periods(&mut self, periods: u32) -> Result<Option<u32>, AudioWaitError> {
+        self.request_queued_periods(periods);
+        let deadline = Instant::now() + SWITCH_TIMEOUT;
+        loop {
+            if let Some(answer) = self.queued_periods() {
+                return Ok(answer);
+            }
+            if self.ctl.is_abandoned() {
+                return Err(AudioWaitError::Gone);
+            }
+            if self.shared.failure.get().is_some() {
+                return Ok(None);
+            }
+            if Instant::now() >= deadline {
+                return Err(AudioWaitError::Timeout);
+            }
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+
+    /// Asks for `periods` periods queued from the audio thread's next step
+    /// on, without waiting ([`set_queued_periods`](Self::set_queued_periods)
+    /// waits).
+    pub fn request_queued_periods(&mut self, periods: u32) {
+        self.queue_change = self.queue_change.wrapping_add(1);
+        let request = u64::from(self.queue_change) << 32 | u64::from(periods);
+        self.shared.queue_request.store(request, Ordering::Release);
+    }
+
+    /// The answer to the latest queue change, once the audio thread gave
+    /// it: `Some(None)` when the output cannot say what it keeps.
+    #[must_use]
+    pub fn queued_periods(&self) -> Option<Option<u32>> {
+        let answer = self.shared.queue_answer.load(Ordering::Acquire);
+        ((answer >> 32) as u32 == self.queue_change)
+            .then(|| Some(answer as u32).filter(|&p| p != 0))
     }
 
     /// Stops the play's sounds.
@@ -344,8 +430,12 @@ impl AudioWorker {
                     }
                     self.generation = generation;
                     self.sealed = false;
+                    self.steady_from = Some(origin);
+                    self.steady = 0;
+                    self.publish_steady();
                 }
                 AudioCtl::Cancel => {
+                    self.steady_from = None;
                     self.engine.stop();
                     while self.queue.commands().pop().is_ok() {}
                 }
@@ -356,8 +446,26 @@ impl AudioWorker {
         !self.exited
     }
 
-    /// One wake: control messages, then one engine step into `out`.
-    /// Returns `Ok(false)` once told to exit.
+    fn publish_steady(&self) {
+        let packed = (self.generation & u64::from(u32::MAX)) << 32 | u64::from(self.steady);
+        self.shared.steady.store(packed, Ordering::Release);
+    }
+
+    /// Applies a queue change asked for since the last step, and answers.
+    fn change_queue(&mut self, out: &mut impl AudioOutput) {
+        let request = self.shared.queue_request.load(Ordering::Acquire);
+        let change = (request >> 32) as u32;
+        if change == self.queue_change {
+            return;
+        }
+        self.queue_change = change;
+        let kept = out.set_queue_periods(request as u32).unwrap_or(0);
+        let answer = u64::from(change) << 32 | u64::from(kept);
+        self.shared.queue_answer.store(answer, Ordering::Release);
+    }
+
+    /// One wake: control messages and a queue change, then one engine step
+    /// into `out`. Returns `Ok(false)` once told to exit.
     ///
     /// # Errors
     ///
@@ -366,13 +474,24 @@ impl AudioWorker {
         if !self.control() {
             return Ok(false);
         }
-        if let Err(e) = self.engine.step(out, self.queue.commands()) {
-            let _ = self.shared.failure.set(e);
-            return Err(e);
-        }
+        self.change_queue(out);
+        let report = match self.engine.step(out, self.queue.commands()) {
+            Ok(report) => report,
+            Err(e) => {
+                let _ = self.shared.failure.set(e);
+                return Err(e);
+            }
+        };
         self.shared
             .underruns
             .store(self.engine.underruns(), Ordering::Release);
+        if report.underrun
+            && let (Some(from), Some(at)) = (self.steady_from, report.at)
+            && at >= from
+        {
+            self.steady = self.steady.saturating_add(1);
+            self.publish_steady();
+        }
         if let Some(p) = self.probe.as_mut() {
             let generation = self.generation;
             let mut dropped = 0;
@@ -398,6 +517,7 @@ impl AudioWorker {
             && mixer.sounding() == 0
             && self.engine.bgm_left() == 0
         {
+            self.steady_from = None;
             self.shared.done.store(self.generation, Ordering::Release);
         }
         Ok(true)

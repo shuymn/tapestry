@@ -411,6 +411,14 @@ impl<O: AudioOutput + Wakes> AudioOutput for Paced<O> {
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
         self.inner.write(f)
     }
+
+    fn queue_periods(&self) -> Option<u32> {
+        self.inner.queue_periods()
+    }
+
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        self.inner.set_queue_periods(periods)
+    }
 }
 
 /// Prints what the recording output kept.

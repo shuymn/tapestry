@@ -42,6 +42,8 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
     // cancelled and the last sealed.
     for play in 0..4_i64 {
         let origin = TimeUs((100 + play * 400) * MS);
+        // Between plays the queue deepens to three periods and back.
+        control.request_queued_periods(if play % 2 == 0 { 3 } else { 2 });
         let (mut sink, queue) = audio_link_at(64, origin);
         control.play(origin, queue).unwrap();
         for k in 0..3 {
@@ -63,5 +65,6 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         steps(&mut worker, 40);
     }
     assert!(control.done());
+    assert_eq!(control.queued_periods(), Some(Some(2)));
     assert_eq!(counting::calls(), 0);
 }

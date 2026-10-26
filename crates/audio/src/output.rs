@@ -45,6 +45,11 @@ impl fmt::Display for OutputError {
 
 impl std::error::Error for OutputError {}
 
+/// The most periods an output keeps queued ahead of playback. Outputs size
+/// their buffers for it when they are made, so changing the queue between
+/// plays allocates nothing.
+pub const MAX_QUEUE_PERIODS: u32 = 3;
+
 /// An audio device in shared, event-driven operation.
 pub trait AudioOutput {
     /// Frames per second.
@@ -62,6 +67,19 @@ pub trait AudioOutput {
     ///
     /// The device's failure; nothing was written.
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError>;
+    /// Periods kept queued ahead of playback, when the output can say.
+    fn queue_periods(&self) -> Option<u32> {
+        None
+    }
+    /// Keeps `periods` periods queued from the next write on, as many as
+    /// the output holds and at least one, and returns the periods it now
+    /// keeps; `None` for an output whose queue is fixed. A deeper queue is
+    /// filled at the next write, a shallower one drains as the device reads
+    /// it. Call it between plays: a change moves where key sounds start.
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        let _ = periods;
+        None
+    }
 }
 
 /// An output that keeps a copy of everything written to the output it wraps,
@@ -115,6 +133,14 @@ impl<O: AudioOutput> AudioOutput for RecordingOutput<O> {
 
     fn wait(&mut self) -> Wake {
         self.inner.wait()
+    }
+
+    fn queue_periods(&self) -> Option<u32> {
+        self.inner.queue_periods()
+    }
+
+    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
+        self.inner.set_queue_periods(periods)
     }
 
     fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {

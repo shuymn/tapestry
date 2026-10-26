@@ -15,6 +15,31 @@ pub struct LoadTimes {
     pub retry: Option<Duration>,
 }
 
+/// A play's audio queue, for the end screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueLine {
+    /// Periods the play queued, when the output said.
+    pub played: Option<u32>,
+    /// Its underruns from chart time 0 on, after the countdown.
+    pub steady_underruns: u64,
+    /// Periods the next play queues.
+    pub next: u32,
+}
+
+/// The audio queue line: what the play queued, its underruns after the
+/// countdown, and the next play's queue when it differs.
+pub fn queue_line(q: QueueLine) -> String {
+    let played = q.played.map_or_else(|| "N/A".to_owned(), |p| p.to_string());
+    let mut line = format!(
+        "AUDIO QUEUE {played} PERIODS, {} UNDERRUNS AFTER THE COUNTDOWN",
+        q.steady_underruns
+    );
+    if q.played != Some(q.next) {
+        line.push_str(&format!(": {} FROM THE NEXT PLAY", q.next));
+    }
+    line
+}
+
 /// The names of the keys bound to retry and quit, for the end screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hints {
@@ -87,6 +112,7 @@ pub fn lines(
     report: &PlayReport,
     input_offset_us: i64,
     times: LoadTimes,
+    queue: QueueLine,
     hints: &Hints,
 ) -> Vec<String> {
     let mut l = Vec::new();
@@ -185,6 +211,7 @@ pub fn lines(
     if let Some(e) = report.output_error {
         l.push(format!("AUDIO: {e}").to_uppercase());
     }
+    l.push(queue_line(queue));
     let ms = |d: Option<Duration>| d.map_or_else(|| "-".to_owned(), |d| d.as_millis().to_string());
     l.push(format!(
         "LOAD {} MS  RETRY {} MS",
@@ -246,6 +273,35 @@ mod tests {
                 "F7/F8 INPUT OFFSET +4.0 MS FROM THE NEXT PLAY",
                 "F9 MEASUREMENT OVERLAY IN PLAY",
             ]
+        );
+    }
+
+    /// The queue line says what the play queued and, when the next play
+    /// queues another number, that number.
+    #[test]
+    fn the_queue_line_names_the_next_play_only_when_it_changes() {
+        let line = |played, steady_underruns, next| {
+            super::queue_line(super::QueueLine {
+                played,
+                steady_underruns,
+                next,
+            })
+        };
+        assert_eq!(
+            line(Some(2), 0, 2),
+            "AUDIO QUEUE 2 PERIODS, 0 UNDERRUNS AFTER THE COUNTDOWN"
+        );
+        assert_eq!(
+            line(Some(2), 4, 3),
+            "AUDIO QUEUE 2 PERIODS, 4 UNDERRUNS AFTER THE COUNTDOWN: 3 FROM THE NEXT PLAY"
+        );
+        assert_eq!(
+            line(Some(3), 7, 3),
+            "AUDIO QUEUE 3 PERIODS, 7 UNDERRUNS AFTER THE COUNTDOWN"
+        );
+        assert_eq!(
+            line(None, 1, 3),
+            "AUDIO QUEUE N/A PERIODS, 1 UNDERRUNS AFTER THE COUNTDOWN: 3 FROM THE NEXT PLAY"
         );
     }
 
@@ -323,7 +379,19 @@ mod tests {
             g.id = format!("{}-renamed", g.id);
         }
         let hints = super::Hints::new(Some(0x0E), Some(0x01));
-        let lines = super::lines(&report(preset), 0, super::LoadTimes::default(), &hints);
+        let queue = super::QueueLine {
+            played: Some(2),
+            steady_underruns: 0,
+            next: 2,
+        };
+        let lines = super::lines(
+            &report(preset),
+            0,
+            super::LoadTimes::default(),
+            queue,
+            &hints,
+        );
+        assert!(lines.contains(&super::queue_line(queue)), "{lines:?}");
         for id in &ids {
             let named = format!("GAUGE {}-RENAMED 61.234%", id.to_uppercase());
             assert!(

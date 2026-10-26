@@ -511,6 +511,7 @@ mod tests {
             load_from: TimeUs(0),
             retry: false,
             audio: None,
+            queued_periods: None,
         })
     }
 

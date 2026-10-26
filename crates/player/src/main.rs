@@ -485,6 +485,9 @@ fn rig<'a>(
         steps_dropped: 0,
         figures: None,
         generation: 0,
+        queue: game::QueueChoice::new(device.queued_periods),
+        queued_now: None,
+        queue_line: None,
         #[cfg(feature = "dev-tools")]
         measured_plays: None,
         lead_in: loaded.config().lead_in,

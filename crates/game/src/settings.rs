@@ -18,6 +18,7 @@ use input::hid::{AxisCap, is_axis};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS};
 use crate::save::write_atomic;
 use crate::tuning::{Adjust, DEFAULT_VISIBLE_TIME_MS, OFFSET_LIMIT_US, VISIBLE_TIME_MS};
 
@@ -411,6 +412,10 @@ pub struct DeviceSettings {
     pub master_volume: f32,
     /// How controllers' axes play their lanes.
     pub scratch: ScratchConfig,
+    /// Periods the audio output keeps queued ahead of playback, 2 or 3
+    /// ([`QUEUED_PERIODS`]). A play with underruns after its countdown sets
+    /// it to 3; only the player sets it back.
+    pub queued_periods: u32,
 }
 
 impl Default for DeviceSettings {
@@ -439,6 +444,7 @@ impl Default for DeviceSettings {
             monitor: None,
             master_volume: 1.0,
             scratch: ScratchConfig::default(),
+            queued_periods: DEFAULT_QUEUED_PERIODS,
         }
     }
 }
@@ -455,7 +461,8 @@ impl DeviceSettings {
 
     /// Checks what [`Settings::load`] cannot leave to the types: both key
     /// configs ([`KeyConfig::check`]), the input and display offsets within
-    /// ±[`OFFSET_LIMIT_US`], and the master volume from 0.0 to 1.0.
+    /// ±[`OFFSET_LIMIT_US`], the master volume from 0.0 to 1.0, and the
+    /// queued periods within [`QUEUED_PERIODS`].
     ///
     /// # Errors
     ///
@@ -481,6 +488,14 @@ impl DeviceSettings {
             return Err(format!(
                 "master_volume {} is outside 0.0 to 1.0",
                 self.master_volume
+            ));
+        }
+        if !QUEUED_PERIODS.contains(&self.queued_periods) {
+            return Err(format!(
+                "queued_periods {} is outside {} to {}",
+                self.queued_periods,
+                QUEUED_PERIODS.start(),
+                QUEUED_PERIODS.end()
             ));
         }
         Ok(())

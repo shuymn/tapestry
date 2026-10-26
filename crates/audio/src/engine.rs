@@ -62,6 +62,9 @@ pub struct StepReport {
     /// Whether the wake found the buffer empty after audio had been
     /// written (an underrun).
     pub underrun: bool,
+    /// When the wake happened; `None` for a priming wake, which has no
+    /// time.
+    pub at: Option<TimeUs>,
     /// Voices and fading releases still to sound after the block.
     pub active_voices: usize,
     /// BGM events not yet started.
@@ -276,6 +279,7 @@ impl AudioEngine {
             report.bgm_left = self.bgm.len() - self.next_bgm;
             return Ok(report);
         }
+        report.at = Some(wake.at);
         if wake.padding == 0 && self.written() > 0 {
             // The engine may have played silence: the frame/time relation
             // moved.
