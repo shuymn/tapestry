@@ -1,4 +1,4 @@
-//! The local chart sweep (stage1.md section 5), on the owner's PC only:
+//! The local chart sweep (stage1.md section 5), on the development PC only:
 //!
 //! ```sh
 //! TAPESTRY_CHARTS_DIR=<dir> mise exec -- cargo test -p game --test local_charts -- --ignored --nocapture
@@ -237,7 +237,7 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
 }
 
 #[test]
-#[ignore = "reads the owner's charts from TAPESTRY_CHARTS_DIR"]
+#[ignore = "reads local charts from TAPESTRY_CHARTS_DIR"]
 fn local_charts_sweep() {
     let dir = std::env::var_os("TAPESTRY_CHARTS_DIR").expect("set TAPESTRY_CHARTS_DIR");
     let mut found = Vec::new();
