@@ -144,29 +144,29 @@ impl Rig for PlayerRig<'_> {
         self.controls.quitting()
     }
 
+    fn prepare_audio(&mut self) -> Result<(), String> {
+        self.audio.control.ready().map_err(|e| e.to_string())
+    }
+
     fn prepare_screen(&mut self) -> Result<(), String> {
         self.retry_from = self.pending_retry.take();
         self.render.prepare()
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Opening<SourceReader> {
-        let o = self.input.open(Request::Open {
+        self.input.open(Request::Open {
             lead_in,
             logic: thread::current(),
             keyboard: self.recorded.0.clone(),
             controller: self.recorded.1.clone(),
-        });
-        Opening {
-            origin: o.origin,
-            start: o.start,
-            readers: o.readers,
-            kinds: o.kinds,
-        }
+        })
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
         self.countdown_at = Some(TimeUs(origin.0 - self.lead_in.0));
-        self.audio.control.play(origin, sounds);
+        // Audio was readied before recording opened, so this does not
+        // wait; a worker gone since shows as the output's failure.
+        let _ = self.audio.control.play(origin, sounds);
         self.render.send(RenderMsg::Play {
             origin,
             side: screen,
@@ -203,12 +203,7 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn close(&mut self) -> Closing {
-        let c = self.input.close();
-        Closing {
-            arrivals: c.arrivals,
-            overflowed: c.overflowed,
-            source_limited: c.source_limited,
-        }
+        self.input.close()
     }
 
     fn ended(&mut self, report: &PlayReport) {

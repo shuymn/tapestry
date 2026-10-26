@@ -15,8 +15,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::Thread;
 
 use bms_model::TimeUs;
-use eval::{ControlId, InputStart};
-use input::{Arrival, DeviceId, DeviceKind, SourceReader, SourceSet};
+use eval::ControlId;
+use game::{Closing, Opening};
+use input::{DeviceId, DeviceKind, SourceReader, SourceSet};
 
 use crate::controls::Controls;
 
@@ -41,31 +42,9 @@ pub enum Request {
 /// The input thread's answers.
 pub enum Reply {
     /// Recording is open.
-    Opened(Opened),
+    Opened(Opening<SourceReader>),
     /// Recording is closed.
-    Closed(Closed),
-}
-
-/// An opened recording.
-pub struct Opened {
-    /// Where chart time 0 lies on the clock.
-    pub origin: TimeUs,
-    /// The controls held at the opening.
-    pub start: InputStart,
-    /// The logic step's ends of the source queues.
-    pub readers: Vec<SourceReader>,
-    /// The participants' kinds, indexed by source id.
-    pub kinds: Vec<DeviceKind>,
-}
-
-/// A closed recording.
-pub struct Closed {
-    /// Devices that arrived while it was open.
-    pub arrivals: Vec<Arrival>,
-    /// Whether a queue overflowed or a device's held state was lost.
-    pub overflowed: bool,
-    /// Whether a device did not take part because of the source limit.
-    pub source_limited: bool,
+    Closed(Closing),
 }
 
 /// What the input thread publishes between requests.
@@ -88,7 +67,7 @@ impl InputLink {
     /// # Panics
     ///
     /// If the input thread is gone.
-    pub fn open(&self, request: Request) -> Opened {
+    pub fn open(&self, request: Request) -> Opening<SourceReader> {
         self.requests.send(request).expect("the input thread runs");
         match self.replies.recv().expect("the input thread runs") {
             Reply::Opened(o) => o,
@@ -101,7 +80,7 @@ impl InputLink {
     /// # Panics
     ///
     /// If the input thread is gone.
-    pub fn close(&self) -> Closed {
+    pub fn close(&self) -> Closing {
         self.requests
             .send(Request::Close)
             .expect("the input thread runs");
@@ -235,7 +214,7 @@ impl Hook {
         logic: Thread,
         keyboard: &[ControlId],
         controller: &[ControlId],
-    ) -> Opened {
+    ) -> Opening<SourceReader> {
         let origin = TimeUs(now.0 + lead_in.0);
         let start = match &mut self.mode {
             Mode::Clock => {
@@ -270,7 +249,7 @@ impl Hook {
             .participants()
             .map(|(d, _)| (d, sources.connection(d)))
             .collect();
-        Opened {
+        Opening {
             origin,
             start,
             readers: sources.take_readers(),
@@ -278,8 +257,8 @@ impl Hook {
         }
     }
 
-    fn close(&mut self, sources: &mut SourceSet) -> Closed {
-        let closed = Closed {
+    fn close(&mut self, sources: &mut SourceSet) -> Closing {
+        let closed = Closing {
             arrivals: sources.arrivals().to_vec(),
             overflowed: sources.overflowed(),
             source_limited: sources.source_limited(),

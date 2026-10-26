@@ -29,7 +29,7 @@ pub struct AudioThread {
 pub struct AudioLink {
     /// The play control.
     pub control: AudioControl,
-    handle: Option<JoinHandle<()>>,
+    handle: JoinHandle<()>,
 }
 
 impl AudioThread {
@@ -40,7 +40,7 @@ impl AudioThread {
         let _ = self.worker.send(worker);
         AudioLink {
             control,
-            handle: Some(self.handle),
+            handle: self.handle,
         }
     }
 }
@@ -49,9 +49,7 @@ impl AudioLink {
     /// Ends the thread and waits for it.
     pub fn exit(mut self) {
         self.control.exit();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let _ = self.handle.join();
     }
 }
 

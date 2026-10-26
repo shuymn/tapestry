@@ -86,17 +86,15 @@ impl ApplicationHandler<Exit> for App {
 /// The running window: ends its thread when closed.
 pub struct WindowThread {
     proxy: EventLoopProxy<Exit>,
-    handle: Option<JoinHandle<()>>,
+    handle: JoinHandle<()>,
 }
 
 impl WindowThread {
     /// Closes the window and waits for its thread. Call it after every user
     /// of the window (the render thread) is done.
-    pub fn close(mut self) {
+    pub fn close(self) {
         let _ = self.proxy.send_event(Exit);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let _ = self.handle.join();
     }
 }
 
@@ -148,10 +146,7 @@ pub fn open(
     let proxy = proxy_rx.recv().map_err(|_| ended());
     let window = match (window, proxy) {
         (Ok(w), Ok(proxy)) => {
-            let thread = WindowThread {
-                proxy,
-                handle: Some(handle),
-            };
+            let thread = WindowThread { proxy, handle };
             return Ok((thread, w));
         }
         (Err(e), Ok(proxy)) => {

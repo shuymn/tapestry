@@ -39,10 +39,12 @@ fn play_without_chart_is_an_error() {
     for args in [&["play"][..], &[]] {
         let out = run(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("usage: tapestry play"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("usage: tapestry play"), "{stderr}");
+        if !args.is_empty() {
+            assert!(stderr.contains("play needs a chart file"), "{stderr}");
+        }
     }
-    let out = run(&["play"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("play needs a chart file"));
 }
 
 /// A chart that does not exist is refused before any window opens, in a

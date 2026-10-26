@@ -90,6 +90,40 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
     events
 }
 
+/// A temporary folder with the chart, its sound, and an input log that hits
+/// every note; `appdata` is the data root's parent for the run.
+struct Fixture {
+    dir: tempfile::TempDir,
+    chart: bms_model::Chart,
+    chart_path: PathBuf,
+    log: PathBuf,
+    events: Vec<eval::PhysicalInputEvent>,
+    appdata: PathBuf,
+}
+
+fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let charts = dir.path().join("chart");
+    fs::create_dir_all(&charts).unwrap();
+    let chart_path = charts.join("scripted.bms");
+    fs::write(&chart_path, CHART).unwrap();
+    write_click(&charts.join("click.wav"));
+    let chart = bms_parser::load_bms(CHART.as_bytes(), &charts, &Default::default())
+        .unwrap()
+        .chart;
+    let log = dir.path().join("input.tprl");
+    let events = write_log(&chart, &log);
+    let appdata = dir.path().join("appdata");
+    Fixture {
+        dir,
+        chart,
+        chart_path,
+        log,
+        events,
+        appdata,
+    }
+}
+
 fn records(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for chart in fs::read_dir(root.join("tapestry").join("records")).unwrap() {
@@ -102,20 +136,16 @@ fn records(root: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn scripted_play_writes_a_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let charts = dir.path().join("chart");
-    fs::create_dir_all(&charts).unwrap();
-    let chart_path = charts.join("scripted.bms");
-    fs::write(&chart_path, CHART).unwrap();
-    write_click(&charts.join("click.wav"));
-    let chart = bms_parser::load_bms(CHART.as_bytes(), &charts, &Default::default())
-        .unwrap()
-        .chart;
-    let log = dir.path().join("input.tprl");
-    let events = write_log(&chart, &log);
+    let Fixture {
+        dir,
+        chart,
+        chart_path,
+        log,
+        events,
+        appdata,
+    } = fixture();
     assert_eq!(events.len(), 2 * NOTES);
     let frames = dir.path().join("frames");
-    let appdata = dir.path().join("appdata");
 
     let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
         .arg("play")
@@ -179,18 +209,13 @@ fn scripted_play_writes_a_record() {
 /// run ends with the reason and a nonzero exit, and nothing is recorded.
 #[test]
 fn an_invalid_key_config_exits_nonzero() {
-    let dir = tempfile::tempdir().unwrap();
-    let charts = dir.path().join("chart");
-    fs::create_dir_all(&charts).unwrap();
-    let chart_path = charts.join("scripted.bms");
-    fs::write(&chart_path, CHART).unwrap();
-    write_click(&charts.join("click.wav"));
-    let chart = bms_parser::load_bms(CHART.as_bytes(), &charts, &Default::default())
-        .unwrap()
-        .chart;
-    let log = dir.path().join("input.tprl");
-    write_log(&chart, &log);
-    let appdata = dir.path().join("appdata");
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
     let mut device = DeviceSettings::default();
     device.keyboard.lanes[2].control = device.keyboard.lanes[1].control;
     game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
@@ -214,18 +239,13 @@ fn an_invalid_key_config_exits_nonzero() {
 /// both plays hit every note, and both are saved.
 #[test]
 fn an_auto_retried_scripted_play_replays_the_log_again() {
-    let dir = tempfile::tempdir().unwrap();
-    let charts = dir.path().join("chart");
-    fs::create_dir_all(&charts).unwrap();
-    let chart_path = charts.join("scripted.bms");
-    fs::write(&chart_path, CHART).unwrap();
-    write_click(&charts.join("click.wav"));
-    let chart = bms_parser::load_bms(CHART.as_bytes(), &charts, &Default::default())
-        .unwrap()
-        .chart;
-    let log = dir.path().join("input.tprl");
-    write_log(&chart, &log);
-    let appdata = dir.path().join("appdata");
+    let Fixture {
+        dir: _dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
 
     let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
         .arg("play")

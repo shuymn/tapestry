@@ -144,7 +144,7 @@ struct Shared {
 pub struct RenderLink {
     tx: Sender<RenderMsg>,
     shared: Arc<Shared>,
-    handle: Option<JoinHandle<()>>,
+    handle: JoinHandle<()>,
 }
 
 impl RenderLink {
@@ -177,11 +177,9 @@ impl RenderLink {
     }
 
     /// Ends the thread and waits for it.
-    pub fn exit(mut self) {
+    pub fn exit(self) {
         self.send(RenderMsg::Exit);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let _ = self.handle.join();
     }
 }
 
@@ -227,11 +225,7 @@ pub fn spawn(
         })
         .map_err(|e| format!("the render thread cannot start: {e}"))?;
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(RenderLink {
-            tx,
-            shared,
-            handle: Some(handle),
-        }),
+        Ok(Ok(())) => Ok(RenderLink { tx, shared, handle }),
         Ok(Err(e)) => {
             let _ = handle.join();
             Err(e)
