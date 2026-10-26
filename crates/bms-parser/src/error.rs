@@ -132,11 +132,12 @@ pub enum WarningKind {
     NoteInsideLongNoteDropped,
     /// The chart has no note to judge.
     NoPlayableNotes,
-    /// `#IF` outside any `#RANDOM` block (never taken), or `#ELSE`,
-    /// `#ENDIF` or `#ENDRANDOM` without its block (ignored).
+    /// `#IF` with no `#RANDOM` value to test (it pushes no flag; once per
+    /// chart), or `#ELSE`, `#ENDIF` or `#ENDRANDOM` with nothing to act on
+    /// (ignored).
     UnmatchedDirective(&'static str),
-    /// An `#IF` left open under another `#IF` of its `#RANDOM` (once per
-    /// chart), or closed by `#ENDRANDOM` or by the end of the file.
+    /// An `#IF` left open under another `#IF` of the same `#RANDOM` (once
+    /// per chart), or still open at the end of the file.
     UnclosedIf,
 }
 

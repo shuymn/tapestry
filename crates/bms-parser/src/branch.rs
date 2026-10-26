@@ -30,8 +30,8 @@ impl SplitMix64 {
 }
 
 /// One open `#IF`: `active` while its current branch is read, `taken`
-/// once any branch of it was, and `random` the number of open `#RANDOM`
-/// blocks when it was met.
+/// once any branch of it was, and `random` the `#RANDOM` it tests, by its
+/// position in [`Branches::results`].
 #[derive(Clone, Copy, Debug)]
 struct Flag {
     active: bool,
@@ -50,8 +50,9 @@ struct Flag {
 #[derive(Debug)]
 pub struct Branches {
     rng: SplitMix64,
-    /// The values of the open `#RANDOM` and `#SETRANDOM` blocks.
-    randoms: Vec<u32>,
+    /// The open `#RANDOM` and `#SETRANDOM` blocks: each value and its
+    /// position in `results`, which tells the blocks apart.
+    randoms: Vec<(u32, usize)>,
     flags: Vec<Flag>,
     /// An `#IF` stacked on one of the same `#RANDOM` was warned about.
     warned_stacked: bool,
@@ -98,27 +99,26 @@ impl Branches {
             "RANDOM" => {
                 let n = positive_integer(value, line, "#RANDOM")?;
                 let v = self.rng.draw(n);
-                self.randoms.push(v);
+                self.randoms.push((v, self.results.len()));
                 self.results.push(v);
             }
             "SETRANDOM" => {
                 let v = positive_integer(value, line, "#SETRANDOM")?;
-                self.randoms.push(v);
+                self.randoms.push((v, self.results.len()));
                 self.results.push(v);
             }
             "IF" => {
                 let k = positive_integer(value, line, "#IF")?;
                 match self.randoms.last() {
-                    // No value to test: no flag, as charts expect, so the
-                    // lines are read and the next #ENDIF pops whatever flag
-                    // is on top.
+                    // No value to test: no flag, as charts expect. The flag
+                    // on top, if any, still decides which lines are read,
+                    // and the next #ENDIF pops it.
                     None => {
                         if !std::mem::replace(&mut self.warned_orphan, true) {
                             warn(warnings, WarningKind::UnmatchedDirective("#IF"));
                         }
                     }
-                    Some(&v) => {
-                        let random = self.randoms.len();
+                    Some(&(v, random)) => {
                         if self.flags.last().is_some_and(|f| f.random == random)
                             && !std::mem::replace(&mut self.warned_stacked, true)
                         {
@@ -168,11 +168,13 @@ impl Branches {
     }
 }
 
-/// A decimal integer in `1..=u32::MAX`, or an error naming `what`.
+/// A positive 32-bit integer (`1..=i32::MAX`, the operands the reference
+/// reads), or an error naming `what`.
 fn positive_integer(text: &str, line: usize, what: &'static str) -> Result<u32, LoadError> {
-    text.parse::<u32>()
+    text.parse::<i32>()
         .ok()
         .filter(|&n| n > 0)
+        .and_then(|n| u32::try_from(n).ok())
         .ok_or(LoadError::InvalidValue {
             line,
             what,

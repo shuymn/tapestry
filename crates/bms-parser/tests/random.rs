@@ -233,7 +233,15 @@ fn stray_directives_warn_and_bad_values_fail() {
             .len(),
         40
     );
-    for bad in ["#RANDOM 0", "#RANDOM -1", "#RANDOM x", "#SETRANDOM 0"] {
+    for bad in [
+        "#RANDOM 0",
+        "#RANDOM -1",
+        "#RANDOM x",
+        "#RANDOM 2147483648",
+        "#SETRANDOM 0",
+        "#IF 0",
+        "#IF x",
+    ] {
         let text = format!("#BPM 120\n{bad}\n#00111:01\n");
         assert!(
             matches!(load(&text), Err(LoadError::InvalidValue { line: 2, .. })),
@@ -313,6 +321,17 @@ fn if_flags_stack_as_charts_expect() {
     }
     chain.push_str("#ENDIF\n#03011:01\n");
     let loaded = load(&chain).unwrap();
+    // The same values in two #RANDOM blocks are still two blocks: an #IF of
+    // the second over one of the first is not warned about.
+    let two =
+        "#BPM 120\n#WAV01 click.wav\n#RANDOM 1\n#IF 1\n#ENDRANDOM\n#RANDOM 1\n#IF 1\n#00111:01\n";
+    let w: Vec<_> = load(two)
+        .unwrap()
+        .warnings
+        .into_iter()
+        .map(|w| (w.line, w.kind))
+        .collect();
+    assert_eq!(w, vec![(None, WarningKind::UnclosedIf)]);
     assert_eq!(times(&loaded.chart.lanes[1]), vec![40_000_000]);
     let stacked: Vec<_> = loaded
         .warnings

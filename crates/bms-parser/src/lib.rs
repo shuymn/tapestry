@@ -72,8 +72,8 @@
 //!   when the top flag is set or no flag is open, headers (`#WAVxx`,
 //!   `#BPMxx`, `#LNOBJ`, ...) included. `#ELSE`, our addition, sets the top
 //!   flag when no earlier branch of its `#IF` was taken and clears it
-//!   otherwise. An `#IF` with no value to test pushes no flag, so its lines
-//!   are read (one warning per chart). An `#IF` met over an open `#IF` of
+//!   otherwise. An `#IF` with no value to test pushes no flag, so the flag
+//!   already on top still decides (one warning per chart). An `#IF` met over an open `#IF` of
 //!   the same `#RANDOM` is warned about once per chart; a stray `#ELSE`,
 //!   `#ENDIF` or `#ENDRANDOM` is ignored with a warning, and an `#IF` still
 //!   open at the end of the file is a warning. The stacks are bounded by the
