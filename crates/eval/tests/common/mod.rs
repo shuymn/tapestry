@@ -80,10 +80,12 @@ pub fn run(
 }
 
 /// Version 1 of the custom preset: empty POOR only up to 300 ms before the
-/// next unjudged note, without BP. Its tests keep that range covered.
+/// next unjudged note, without BP, and notes missed only at their deadline.
+/// Its tests keep those rules covered.
 pub fn custom_v1() -> RulePreset {
     let mut p = rules::custom();
     p.version = 1;
+    p.miss = rules::MissRule::PoorAfterLateBad;
     p.empty_poor.ahead = TimeUs(300 * MS);
     p.empty_poor.behind = None;
     p.empty_poor.counts_bp = false;

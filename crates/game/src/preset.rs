@@ -109,6 +109,7 @@ struct WindowsFile {
 #[serde(rename_all = "snake_case")]
 enum MissFile {
     PoorAfterLateBad,
+    PoorAfterLateBadOrOvertaken,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -328,6 +329,7 @@ impl From<PresetFile> for RulePreset {
             },
             miss: match miss {
                 MissFile::PoorAfterLateBad => MissRule::PoorAfterLateBad,
+                MissFile::PoorAfterLateBadOrOvertaken => MissRule::PoorAfterLateBadOrOvertaken,
             },
             empty_poor: EmptyPoorRule {
                 ahead: TimeUs(empty_poor.ahead_us),
@@ -440,6 +442,7 @@ impl From<&RulePreset> for PresetFile {
             },
             miss: match miss {
                 MissRule::PoorAfterLateBad => MissFile::PoorAfterLateBad,
+                MissRule::PoorAfterLateBadOrOvertaken => MissFile::PoorAfterLateBadOrOvertaken,
             },
             empty_poor: {
                 let EmptyPoorRule {

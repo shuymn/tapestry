@@ -60,6 +60,7 @@ impl RulePreset {
         w.windows(windows);
         w.uint(match miss {
             MissRule::PoorAfterLateBad => 0,
+            MissRule::PoorAfterLateBadOrOvertaken => 1,
         });
         w.empty_poor(empty_poor);
         w.ln_break(ln_break);
@@ -348,6 +349,10 @@ mod tests {
             changed(|p| p.empty_poor.behind = Some(TimeUs(150_001))),
             base
         );
+        assert_ne!(
+            changed(|p| p.miss = crate::MissRule::PoorAfterLateBad),
+            base
+        );
     }
 
     /// A preset with every field distinct from its neighbours, in format 1:
@@ -371,6 +376,7 @@ mod tests {
         p.empty_poor.behind = None;
         p.empty_poor.counts_bp = false;
         p.empty_poor.counted = true;
+        p.miss = crate::MissRule::PoorAfterLateBad;
         p.ln_break.release_margin = TimeUs(80_000);
         p.ln_break.counts_bp = false;
         p.rank_scale = crate::RankScale {

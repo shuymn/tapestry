@@ -76,7 +76,7 @@ pub fn custom() -> RulePreset {
             good: Window::symmetric(100 * MS),
             bad: Window::symmetric(180 * MS),
         },
-        miss: MissRule::PoorAfterLateBad,
+        miss: MissRule::PoorAfterLateBadOrOvertaken,
         empty_poor: EmptyPoorRule {
             ahead: TimeUs(500 * MS),
             behind: Some(TimeUs(150 * MS)),
@@ -172,7 +172,7 @@ mod tests {
                 good: w(100_000),
                 bad: w(180_000),
             },
-            miss: MissRule::PoorAfterLateBad,
+            miss: MissRule::PoorAfterLateBadOrOvertaken,
             empty_poor: EmptyPoorRule {
                 ahead: TimeUs(500_000),
                 behind: Some(TimeUs(150_000)),

@@ -201,6 +201,11 @@ impl JudgeWindows {
 pub enum MissRule {
     /// A note not pressed by its late BAD edge is a POOR at that edge.
     PoorAfterLateBad,
+    /// As [`PoorAfterLateBad`](Self::PoorAfterLateBad), and also: a press
+    /// that judges a note first misses every earlier unjudged note of its
+    /// lane, each a POOR at the press's time, in note order. Notes are
+    /// never judged out of order.
+    PoorAfterLateBadOrOvertaken,
 }
 
 /// Empty POOR: a press that judges no note but lies close to one.
