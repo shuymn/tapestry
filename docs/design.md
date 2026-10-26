@@ -204,6 +204,7 @@ In-play adjustment works in the direction of shrinking judgment deviation, so it
 - **What is recorded**: Only controls bound in the key config (lanes and system controls), and only while play recording is open. Unbound controls cannot affect evaluation, so an input log never holds typed text. While recording is closed, the key config screen may capture any control to bind it; nothing captured there is recorded.
 - **Held-input snapshot**: The input thread keeps each device's physical state (pressed controls, last axis values) for the whole run of the game, across retries. A control of a device not seen since the game started counts as released. Recording opens at a boundary between two batches: the held state of the participating sources is copied into the start snapshot of the play, and every event pushed after that point, in stream order, belongs to the play. Input conversion starts a held control as pressed with no press edge, so nothing is judged from it, and its later release is a plain release. A release of a control that is not held changes nothing.
 - **Removal**: Removing a participating device records a disconnect event for its source (see "Analog Scratch" for what input conversion does with it). The source publishes the removal time as its final watermark and is closed. It stays in the watermark minimum until all its queued and staged events are merged, and is retired only then, so a removed device neither stalls the watermark nor loses an event. Removing the last participating device aborts the play.
+- **Roles of controls**: A bound control has exactly one role: a lane (judged), a system control (retry, quit), or a play adjustment (hi-speed, volume, display offset; never judged). One control bound to two roles is refused. Stage 1 reads system controls and adjustments from window keyboard messages, so only keyboard keys can serve them. Later the input thread classifies every control from the Raw Input stream, so controller buttons can serve them too, and modifier combinations become possible: while a modifier such as a start button is held, lane presses act as adjustments and are excluded from judgment. The modifier is a recorded control and the rule is recorded with the bindings, so re-evaluation gives the same result; it arrives with a log version bump.
 - **Focus loss**: Losing focus during play aborts the play. The window's focus-loss notification sets a latch that the input thread checks before each batch, and any Raw Input packet received while the game was in the background is rejected before it can be recorded and trips the latch too. Once the latch is set, nothing more is appended; the play ends at the last finalized watermark and is saved as "ended midway".
 
 ### Analog Scratch
@@ -280,12 +281,24 @@ Rule differences are expressed in three ways: data (numbers in TOML), fixed choi
 | Level | Contents |
 | --- | --- |
 | Data | Judgment windows (per judgment, early and late sides separately; separate tables for normal notes, scratch, and LN ends)<br>Conversion table from `#RANK` / `#DEFEXRANK` to judgment window multipliers, default value when `#TOTAL` is absent<br>Empty POOR range<br>Gauge (initial value, lower limit, clear threshold, per-judgment increase and decrease, reduction at low remaining gauge)<br>Score weights (EX score), what counts toward BP, processing order of events at the same time |
-| Choices | How a press is assigned: nearest note / oldest unprocessed note / combo priority<br>LN judgment mode: LN / CN / HCN (the default when the chart does not specify one, and whether it overrides the chart's specification)<br>How `#TOTAL` applies: multiplies the increase / also corrects damage<br>Mine condition: held while it passes / pressed at its time |
+| Choices | How a press is assigned: nearest note / oldest unprocessed note / combo priority<br>How `#TOTAL` applies: multiplies the increase / also corrects damage<br>Mine condition: held while it passes / pressed at its time |
 | Fixed | Judge by input time, process in time order, survival gauges never recover once they reach 0, time is integer µs |
 
 > **LN "notation" and "judgment mode" are different things**
 >
-> `#LNTYPE` and `#LNOBJ` express how LNs are written in the chart. The loader interprets them and reconstructs the LN spans (start and end). Whether to judge them as LN, CN, or HCN is decided separately. If the chart specifies a judgment mode (such as beatoraja's `#LNMODE`), that value is used; otherwise the preset's default is used. Only when the preset is set to "override the chart's specification" is the preset's value used.
+> `#LNTYPE` and `#LNOBJ` express how LNs are written in the chart. The loader interprets them and reconstructs the LN spans (start and end). Whether to judge them as LN, CN, or HCN is decided separately: it is a play option the player chooses, not a preset item, so one preset serves all three modes. If the chart specifies a judgment mode (such as beatoraja's `#LNMODE`), the chart's mode is used. The mode actually used is recorded in the input log, and best scores and clear lamps are kept per chart, preset and mode in effect.
+
+### LN Judgment Modes
+
+LN, CN, and HCN are one long-note rule with different settings, not three separate implementations. The preset holds the windows and gauge amounts each setting reads.
+
+| Item | LN | CN | HCN |
+| --- | --- | --- | --- |
+| End window | Pass or break: a release earlier than the end minus the release margin breaks the LN; any later release, or holding past the end, passes | Graded, with its own LN end windows | As CN |
+| End judgment counted | No (only a break affects combo and BP) | Yes | Yes |
+| Gauge while held | None | None | At a fixed interval, increases while held and decreases while released; pressing again during the body resumes the increase |
+
+Stage 1 judges LN only, and a chart whose `#LNMODE` asks for CN or HCN is refused. Its preset still carries an `ln_mode` item with the LN variant alone; that item leaves the preset when CN and HCN arrive, together with the log version that records the mode.
 
 ### Standard Presets
 
@@ -654,7 +667,7 @@ Built with the screen transition and session events, as a later variation. A gen
 | Device | This PC and this device | The three offsets, debounce, polling, audio device, buffer; with their variations, the OBS connection target (the password is kept in the OS credential store) and whether the local event endpoint is enabled |
 | Player | The person playing | Hi-speed, lane cover, the presets and skins used, session policy |
 | Preset | The person who authors rules | Judgment windows, gauge, `#RANK` conversion |
-| Chart | The chart author | `#RANK`, `#TOTAL`, specification of the LN judgment mode (the preset decides the interpretation and precedence) |
+| Chart | The chart author | `#RANK`, `#TOTAL`, specification of the LN judgment mode (it takes precedence over the player's choice) |
 
 Device and player settings go in separate files, so that latency settings do not get mixed up when several people share one PC or when a device is replaced. There is no team or organization scope. Anything to be shared is distributed as preset or skin files.
 
@@ -879,7 +892,7 @@ The input thread, the logic thread, the audio callback, and the per-frame work o
 | Process | Method |
 | --- | --- |
 | Chart time | Measure positions (rational numbers) are accumulated into time, segment by segment between BPM changes and STOPs. Values with a BPM of 0 or less, a zero denominator, or too many decimal digits are rejected. The order of a BPM change and a STOP at the same position, and how negative values are rounded, are fixed as rules. Rounding to µs is done only once, at the end |
-| Scroll position | From BPM, STOP, and scroll speed changes, a piecewise linear function from time to display position is built at load time. STOP segments have a slope of 0. Reverse scrolling is out of scope; on the premise that the display position never decreases with time, the visible range is found per segment by binary search |
+| Scroll position | From BPM, STOP, and scroll speed changes, a piecewise linear function from time to display position is built at load time. STOP segments have a slope of 0. Stage 1 assumes the display position never decreases with time and finds the visible range per segment by binary search; scroll and speed change channels are ignored with a warning, which changes the look but not the judgment. Reverse scrolling and notes overtaking each other drop that assumption: each note's display position is fixed at load time, so a note index sorted by display position finds the visible notes at any slope, and the per-frame sprite cap still bounds the work. Only the scroll map and the renderer's note lookup change |
 | Hi-speed | The setting is the green number (the time a note is visible). The scale is fixed at play start from a base BPM, the start BPM in stage 1, so the visible time is exact at that BPM. Notes then move through the scroll positions at that fixed scale, so BPM changes and STOPs show as the chart intends and nothing jumps. Scaling by the BPM in effect (a constant green number) is not used, because the notes jump at every BPM change, and neither is placing notes by time alone, which erases the chart's speed changes. Lane cover and lift positions are included in the visible range calculation |
 | Evaluation event processing | Per-lane note deadlines, deadlines for scratch release, debounce, HCN, and song end, and the input stream are taken out in a fixed total order by time. At equal times, inputs come before deadlines (a preset item); inputs keep the merged stream's order (source index, then the order within the source), and deadlines are ordered by kind, then lane, then sequence number. The per-lane streams are already in time order, so this is lighter than pushing everything into a priority queue |
 | Note assignment | Each lane keeps a position pointing at its first unprocessed note, and only notes within the judgment window are candidates. How to choose among candidates is decided by a preset choice |
