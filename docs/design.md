@@ -905,7 +905,8 @@ Where there is no reason to build our own, established libraries are used. We bu
 | Hashing and signing | `sha2`, `md-5`, `minisign-verify` | Identification and verification use SHA-256, and MD5 is used only for compatibility with existing difficulty tables. Signatures are unified on the minisign format (distribution registry, auto-update). No cryptography is implemented ourselves |
 | Lua (for compatibility) | `mlua` (Lua 5.4) | Used only to convert beatoraja Lua skins at load time. `mlua`'s `sandbox()` is Luau-only, so for Lua 5.4 the allowlist-style environment is built ourselves |
 | WASM | `wasm-bindgen` | Calls the evaluator from Workers |
-| Measurement and testing | `tracy-client`, `criterion`, `proptest` | Span measurement, benchmarks, property tests of the evaluator |
+| Measurement and testing | `tracy-client`, `criterion` | Span measurement, benchmarks |
+| Property tests | `proptest` | A dev-dependency of `eval` and `replay`: the evaluator's properties over generated charts, presets, input logs and delivery schedules, and the input log's round trip. Generators map independent raw values to valid ones, so shrinking keeps cases valid. Not used: `quickcheck`, whose type-driven generation and value shrinking fit valid-by-construction generators poorly and which keeps no failures; `bolero`, whose engines overlap `cargo-fuzz`; `arbitrary`-driven generation, which suits the fuzz targets that take bytes |
 
 Code from GPL projects (beatoraja, bmz-player, etc.) and tables ported from them are not used. Behavior is determined from public information and hand-written tests, and the sources of the information behind tables and tests are recorded.
 
@@ -945,13 +946,17 @@ Verify the properties the evaluator must satisfy, not agreement with the results
 - With the order of inputs preserved, changing the steps by which the watermark advances does not change the result
 - In single-note judgment with a fixed mapping between input and note, widening the judgment window never makes the judgment worse (in whole-chart evaluation this does not hold, because an earlier input can take a different note)
 - Survival gauges never recover once they reach 0
+- Gauges stay within their bounds
+- The order of inputs at the same time does not depend on how the sources' events were recorded or staged
 - Given the same section, the same input conversion state at the start of the lead-in, the same lead-in input, the same time mapping, and the same offset changes, the evaluation of a section excerpted from a full input log matches the evaluation of a mid-chart start
 
 Whole-chart evaluation focuses on the fragile spots: inputs exactly on a judgment window boundary, the processing order of events at the same time, mashing, LN release and re-press, and inputs that arrive exactly at the watermark boundary.
 
 From the IR stage on, agreement between the native and WASM builds is verified end to end, not just for the evaluator. From the chart file's bytes and the input log, the resolved chart hash and the judgment event stream are computed on both the native build and the actually deployed Workers, and compared. The loader, evaluator, and preset versions are fixed, and overflow handling and the order of events at the same time follow explicit rules from stage 1. Agreement between incremental and batch evaluation is also verified with input logs that include offset changes and events at the same time.
 
-In addition, each preset has a few dozen small hand-written examples of "this input gives this judgment", to detect unintended changes when presets are tuned. The evaluator is also checked with property tests (generating random input logs).
+In addition, each preset has a few dozen small hand-written examples of "this input gives this judgment", to detect unintended changes when presets are tuned. Hand-written examples stay alongside the property tests, because live and batch evaluation share code and can share a bug.
+
+The properties above are property tests over generated charts, presets, input logs and delivery schedules, except the section excerpt, which comes with practice (stage 2). Live evaluation in them is a model of the logic thread's consumer (stage1.md D8) over bounded producer queues. Seeds are random on every run; a deterministic test checks that the generators still reach the fragile spots, including joint ones such as an input on a deadline at an intermediate watermark. A failure found becomes a named hand-written test; proptest's regression files stay local.
 
 ### Verifying Without Launching the UI
 
