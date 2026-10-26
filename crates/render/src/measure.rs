@@ -128,7 +128,10 @@ pub fn display_qpc(s: &FrameStatistics, period_qpc: i64) -> i64 {
 
 /// Keeps the frame statistics samples D11 accepts: the call succeeded,
 /// `PresentCount` advanced since the last accepted sample, and the refresh
-/// count gap is at most [`MAX_REFRESH_GAP`].
+/// count gap is at most [`MAX_REFRESH_GAP`]. A sample with no sync yet
+/// (`SyncQPCTime` 0, as a new swap chain's first samples on the
+/// development PC read) is rejected too: its refresh counts are zeros,
+/// not counts.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StatsFilter {
     last: Option<u32>,
@@ -139,7 +142,7 @@ impl StatsFilter {
     pub fn accept(&mut self, read: Option<FrameStatistics>) -> Option<FrameStatistics> {
         let s = read?;
         let gap = s.sync_refresh_count.wrapping_sub(s.present_refresh_count);
-        if self.last == Some(s.present_count) || gap > MAX_REFRESH_GAP {
+        if self.last == Some(s.present_count) || gap > MAX_REFRESH_GAP || s.sync_qpc_time == 0 {
             return None;
         }
         self.last = Some(s.present_count);

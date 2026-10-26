@@ -47,8 +47,10 @@ fn missing_statistics_give_na_not_a_value() {
     assert_eq!(f.accept(Some(first)), Some(first));
     // PresentCount did not advance: rejected, whatever else changed.
     assert_eq!(f.accept(Some(stats(20, 502, 503, 9_500))), None);
-    // A failed call is no sample.
+    // A failed call is no sample, nor is one without a sync, whose zero
+    // refresh counts would otherwise count every refresh since boot.
     assert_eq!(f.accept(None), None);
+    assert_eq!(f.accept(Some(stats(30, 0, 0, 0))), None);
     // The next present count is accepted again.
     let next = stats(21, 502, 503, 9_900);
     assert_eq!(f.accept(Some(next)), Some(next));
