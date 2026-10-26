@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use eval::ControlId;
 
 use crate::gate::Packet;
-use crate::hid::{AxisCap, wrapped};
+use crate::hid::{AxisCap, HidProduct, wrapped};
 use crate::sources::DeviceKind;
 
 /// Set in a stored capture: something was captured.
@@ -18,12 +18,37 @@ const PRESENT: u64 = 1 << 33;
 /// Set in a stored capture: the control is a controller's.
 const CONTROLLER: u64 = 1 << 32;
 
+/// Set in a stored product: a product is stored.
+const PRODUCT: u64 = 1 << 48;
+/// Set in a stored product: it has an interface number.
+const INTERFACE: u64 = 1 << 49;
+
+/// A product in one word: the product id in bits 0-15, the vendor id in
+/// bits 16-31, the interface number in bits 32-39 with [`INTERFACE`], and
+/// [`PRODUCT`].
+fn pack_product(p: HidProduct) -> u64 {
+    let interface = p.interface.map_or(0, |i| (u64::from(i) << 32) | INTERFACE);
+    u64::from(p.product_id) | (u64::from(p.vendor_id) << 16) | interface | PRODUCT
+}
+
+/// The product [`pack_product`] stored; `None` for 0.
+fn unpack_product(stored: u64) -> Option<HidProduct> {
+    (stored & PRODUCT != 0).then_some(HidProduct {
+        vendor_id: (stored >> 16) as u16,
+        product_id: stored as u16,
+        interface: (stored & INTERFACE != 0).then_some((stored >> 32) as u8),
+    })
+}
+
 #[derive(Debug, Default)]
 struct Slot {
     armed: AtomicBool,
     /// The captured control in the low 32 bits, with [`PRESENT`] and, for
     /// a controller, [`CONTROLLER`]; 0 while nothing is captured.
     control: AtomicU64,
+    /// The captured controller press's product ([`pack_product`]); 0 for
+    /// a keyboard key or a controller whose product is unknown.
+    product: AtomicU64,
     /// How many times the slot was armed.
     armings: AtomicU64,
     /// The axis watched, plus [`PRESENT`]; 0 when none.
@@ -103,6 +128,14 @@ impl Capture {
             DeviceKind::Controller
         };
         Some((ControlId(stored as u32), kind))
+    }
+
+    /// The product of the controller whose press [`take`](Self::take)
+    /// returned last; `None` for a keyboard key or a controller whose
+    /// product is unknown. It stays until the next capture.
+    #[must_use]
+    pub fn product(&self) -> Option<HidProduct> {
+        unpack_product(self.0.product.load(Ordering::Acquire))
     }
 
     /// Watches the absolute axis `control`: the input thread notes the
@@ -194,6 +227,27 @@ impl Capture {
     /// first press while armed is captured, unless recording is open or the
     /// packet was received in the background; releases are not captured.
     pub fn offer(&self, packet: &Packet, kind: DeviceKind, recording_open: bool) {
+        self.offer_from(packet, kind, None, recording_open);
+    }
+
+    /// [`offer`](Self::offer) for a controller of `product` (`None`:
+    /// unknown), which [`product`](Self::product) then returns.
+    pub fn offer_controller(
+        &self,
+        packet: &Packet,
+        product: Option<HidProduct>,
+        recording_open: bool,
+    ) {
+        self.offer_from(packet, DeviceKind::Controller, product, recording_open);
+    }
+
+    fn offer_from(
+        &self,
+        packet: &Packet,
+        kind: DeviceKind,
+        product: Option<HidProduct>,
+        recording_open: bool,
+    ) {
         if recording_open || packet.background || packet.value == 0 {
             return;
         }
@@ -202,6 +256,9 @@ impl Capture {
                 DeviceKind::Keyboard => 0,
                 DeviceKind::Controller => CONTROLLER,
             };
+            self.0
+                .product
+                .store(product.map_or(0, pack_product), Ordering::Relaxed);
             let stored = u64::from(packet.control.0) | kind | PRESENT;
             self.0.control.store(stored, Ordering::Release);
         }
@@ -214,6 +271,7 @@ mod tests {
 
     use super::Capture;
     use crate::gate::{DeviceId, Packet};
+    use crate::hid::HidProduct;
     use crate::sources::DeviceKind;
 
     fn press(control: u32) -> Packet {
@@ -285,5 +343,36 @@ mod tests {
             assert_eq!(capture.take(), Some((ControlId(control), kind)));
             assert_eq!(capture.take(), None);
         }
+    }
+
+    /// A controller press brings its product, extreme ids included; a
+    /// keyboard key or a controller of unknown product clears it.
+    #[test]
+    fn capture_keeps_the_controller_product() {
+        let capture = Capture::new();
+        for (vendor_id, product_id, interface) in [
+            (0x1A2B, 0x3C4D, Some(0x5E)),
+            (0xFFFF, 0, None),
+            (0, 0xFFFF, Some(0xFF)),
+            (0x6F70, 0x8192, Some(0)),
+        ] {
+            let product = HidProduct {
+                vendor_id,
+                product_id,
+                interface,
+            };
+            capture.arm();
+            capture.offer_controller(&press(3), Some(product), false);
+            assert_eq!(capture.take(), Some((ControlId(3), DeviceKind::Controller)));
+            assert_eq!(capture.product(), Some(product));
+        }
+        capture.arm();
+        capture.offer(&press(0x1E), DeviceKind::Keyboard, false);
+        assert!(capture.take().is_some());
+        assert_eq!(capture.product(), None);
+        capture.arm();
+        capture.offer_controller(&press(4), None, false);
+        assert!(capture.take().is_some());
+        assert_eq!(capture.product(), None);
     }
 }

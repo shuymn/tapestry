@@ -19,7 +19,8 @@ use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
 use bms_model::{Chart, TimeSource, TimeUs, VirtualClock};
-use eval::{Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
+use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
+use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
@@ -529,13 +530,27 @@ impl Loaded {
         axes: &[Vec<input::hid::AxisCap>],
     ) -> Result<PlayPlan, LogicError> {
         let device = self.settings.device.profile(kinds, axes);
-        // Per source: its recorded buttons and keys, and its axes.
-        let recorded: Vec<(usize, usize)> = kinds
+        // Per source: its recorded lane buttons and keys, and its recorded
+        // axes it declares (no other axis is read), played at their rates;
+        // and its system controls, a fixed allowance each.
+        let mut system = 0_usize;
+        let rates: Vec<(usize, usize)> = kinds
             .iter()
-            .zip(&device.sources)
-            .map(|(&k, s)| {
-                let all = self.settings.device.keys(k).roles().count();
-                (all - s.axes.len(), s.axes.len())
+            .enumerate()
+            .map(|(i, &k)| {
+                let keys = self.settings.device.keys(k);
+                let declared = axes.get(i).map_or(&[][..], Vec::as_slice);
+                let axis = |c: u32| k == DeviceKind::Controller && is_axis(ControlId(c));
+                let bound = usize::from(keys.retry.is_some()) + usize::from(keys.quit.is_some());
+                system = system.saturating_add(bound.saturating_mul(SYSTEM_CONTROL_INPUTS));
+                (
+                    keys.lanes.iter().filter(|l| !axis(l.control)).count(),
+                    keys.lanes
+                        .iter()
+                        .filter(|l| axis(l.control))
+                        .filter(|l| declared.iter().any(|c| c.control.0 == l.control))
+                        .count(),
+                )
             })
             .collect();
         // One probe sizes both the window and the reservation; a profile
@@ -548,7 +563,8 @@ impl Loaded {
             0,
         );
         let end = probe.as_ref().map_or(TimeUs(0), Evaluator::final_deadline);
-        let inputs = window_inputs(&device, end, self.config.lead_in, &recorded);
+        let inputs =
+            window_inputs(&device, end, self.config.lead_in, &rates).saturating_add(system);
         if let Ok(probe) = &probe
             && let r = Reservation::from_probe(probe, &self.chart, &device, self.config.effects)
             && !r.fits(inputs)
@@ -1062,11 +1078,21 @@ impl Reservation {
     }
 }
 
+/// The inputs each bound system control (retry, quit) of a source gets in
+/// the recording window, whatever its length: a press and a release. Its
+/// first press ends the play, so it is not played at a rate; a key held
+/// across a retry and auto-repeating, which the window takes no further
+/// press from, may use up the window, which ends the play at its last
+/// finalized watermark with the log incomplete (D8).
+pub const SYSTEM_CONTROL_INPUTS: usize = 2;
+
 /// The recording window's input capacity (D8, [`eval::window_inputs`]):
-/// each source's recorded buttons pressed and released 30 times a second
-/// each, up to 240 edges a second together, and its recorded axes
-/// reporting 1000 times a second each, from the countdown to the chart's
-/// final deadline plus the largest input offset, in whole seconds.
+/// each source's lane-bound buttons pressed and released 30 times a second
+/// each, up to 240 edges a second together, and its lane-bound axes it
+/// declares reporting 1000 times a second each, from the countdown to the
+/// chart's final deadline plus the largest input offset, in whole
+/// seconds, for sources recording `(buttons, axes)` each. The caller adds
+/// [`SYSTEM_CONTROL_INPUTS`] per bound system control.
 fn window_inputs(
     device: &eval::DeviceProfile,
     end: TimeUs,

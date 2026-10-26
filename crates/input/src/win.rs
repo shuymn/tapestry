@@ -37,9 +37,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::{
     GetRawInputBuffer, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList,
     GetRegisteredRawInputDevices, HRAWINPUT, RAWHID, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST,
-    RAWINPUTHEADER, RAWKEYBOARD, RID_DEVICE_INFO, RID_INPUT, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK,
-    RIDEV_REMOVE, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA, RIM_TYPEHID,
-    RIM_TYPEKEYBOARD, RegisterRawInputDevices,
+    RAWINPUTHEADER, RAWKEYBOARD, RID_DEVICE_INFO, RID_DEVICE_INFO_HID, RID_INPUT, RIDEV_DEVNOTIFY,
+    RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA,
+    RIM_TYPEHID, RIM_TYPEKEYBOARD, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL,
@@ -51,9 +51,10 @@ use windows::core::{PCWSTR, w};
 use crate::capture::Capture;
 use crate::gate::DeviceId;
 use crate::hid::{
-    AXIS_USAGES, AxisCap, ButtonGroup, CollectionSlot, DESKTOP_PAGE, HidDevice, HidLayout,
-    HidReport, MAX_AXES, MAX_REPORT_BYTES, MAX_REPORT_IDS, axis_cap, axis_control, axis_value,
-    collection_of, in_collection, read_report, remove_collection,
+    AXIS_USAGES, AxisCap, ButtonGroup, CollectionSlot, DESKTOP_PAGE, Group, HidDevice, HidLayout,
+    HidReport, MAX_AXES, MAX_REPORT_BYTES, MAX_REPORT_IDS, Placement, axis_cap, axis_control,
+    axis_value, group_device, in_collection, place_collection, read_report, remove_collection,
+    until_nul,
 };
 use crate::raw;
 use crate::sources::{DeviceKind, SourceSet};
@@ -319,9 +320,9 @@ struct AxisRead {
 #[derive(Debug)]
 struct Controller {
     handle: Option<isize>,
-    /// The physical device's container, when the collection is grouped by
-    /// it.
-    container: Option<u128>,
+    /// The physical device's container and the function's interface,
+    /// when the collection is grouped by them.
+    group: Option<Group>,
     collection: u8,
     /// Its top-level collection's usage page and usage.
     usage: (u16, u16),
@@ -344,7 +345,7 @@ impl CollectionSlot for Controller {
 
     fn free(&mut self) {
         self.handle = None;
-        self.container = None;
+        self.group = None;
         self.state = HidDevice::new(DeviceId(0), &EMPTY_LAYOUT);
     }
 }
@@ -360,12 +361,6 @@ impl Controller {
     fn data(&self) -> PHIDP_PREPARSED_DATA {
         PHIDP_PREPARSED_DATA(self.preparsed.as_ptr() as isize)
     }
-}
-
-/// The source of a controller in `container`: one per physical device.
-/// Handles are pointers, below 2^63; these ids are above.
-const fn container_device(container: u128) -> DeviceId {
-    DeviceId((container as u64 ^ (container >> 64) as u64) | 1 << 63)
 }
 
 /// The controller collections, with every buffer allocated up front so a
@@ -390,7 +385,7 @@ impl Controllers {
             slots: (0..MAX_CONTROLLERS)
                 .map(|_| Controller {
                     handle: None,
-                    container: None,
+                    group: None,
                     collection: 0,
                     usage: (0, 0),
                     report_ids: false,
@@ -415,18 +410,32 @@ impl Controllers {
         if self.slots.iter().any(|s| s.handle == Some(key)) {
             return;
         }
-        let collection = read_path(handle, &mut self.path).map(collection_of);
-        let container = collection
+        // The collection number, the interface and the container all come
+        // from this read's path, never from what an earlier read left in
+        // the buffer.
+        let len = read_path(handle, &mut self.path).map(<[u16]>::len);
+        let container = len
             .and_then(|_| container_of(&self.path, &mut self.instance))
-            .filter(|&c| c != NO_CONTAINER)
-            // Two collections of one device with one number cannot share
-            // a source: each keeps its own.
-            .filter(|&c| {
-                !self.slots.iter().any(|s| {
-                    s.handle.is_some() && s.container == Some(c) && Some(s.collection) == collection
-                })
-            });
-        let collection = collection.unwrap_or(0);
+            .filter(|&c| c != NO_CONTAINER);
+        let ids = hid_info(handle).and_then(|hid| {
+            Some((
+                u16::try_from(hid.dwVendorId).ok()?,
+                u16::try_from(hid.dwProductId).ok()?,
+            ))
+        });
+        let Placement {
+            group,
+            collection,
+            product,
+        } = place_collection(
+            len.and_then(|n| self.path.get(..n)),
+            container,
+            ids,
+            self.slots
+                .iter()
+                .filter(|s| s.handle.is_some())
+                .map(|s| (s.group, s.collection)),
+        );
         let Some(slot) = self.slots.iter_mut().find(|s| s.handle.is_none()) else {
             sources.connect_unread(device_id(handle), DeviceKind::Controller);
             return;
@@ -460,10 +469,13 @@ impl Controllers {
         let data = slot.data();
         let (n_axes, axis_ids) = read_axes(data, collection, &mut slot.reads, &mut caps);
         let (n_groups, button_ids) = read_buttons(data, &mut groups);
-        let device = container.map_or(device_id(handle), container_device);
+        let device = group.map_or(device_id(handle), group_device);
         // A collection unread before is read now, under its source's id.
         sources.forget_unread(device_id(handle));
         sources.connect(device, DeviceKind::Controller);
+        if let Some(product) = product {
+            sources.set_product(device, product);
+        }
         // Only axes the source keeps are read: one beyond the device's
         // table is never captured or recorded.
         #[expect(
@@ -484,7 +496,7 @@ impl Controllers {
             }
         }
         slot.handle = Some(key);
-        slot.container = container;
+        slot.group = group;
         slot.collection = collection;
         slot.usage = hid_usage(handle).unwrap_or((0, 0));
         slot.report_ids = axis_ids || button_ids;
@@ -500,7 +512,8 @@ impl Controllers {
                     axes: &caps[..n],
                     buttons: &groups[..n_groups],
                 },
-            );
+            )
+            .with_product(product);
         }
     }
 
@@ -597,8 +610,7 @@ fn read_path(handle: HANDLE, buf: &mut [u16]) -> Option<&[u16]> {
     if got == 0 || got == u32::MAX {
         return None;
     }
-    let len = buf.iter().position(|&c| c == 0)?;
-    buf.get(..len)
+    until_nul(buf)
 }
 
 /// The container id of the physical device the interface `path`
@@ -956,6 +968,11 @@ impl RawInput {
 
 /// The usage page and usage of a HID device's top-level collection.
 fn hid_usage(handle: HANDLE) -> Option<(u16, u16)> {
+    hid_info(handle).map(|hid| (hid.usUsagePage, hid.usUsage))
+}
+
+/// What Raw Input says of a HID device; `None` for another device.
+fn hid_info(handle: HANDLE) -> Option<RID_DEVICE_INFO_HID> {
     let mut info = RID_DEVICE_INFO {
         cbSize: size_of::<RID_DEVICE_INFO>() as u32,
         ..Default::default()
@@ -974,8 +991,7 @@ fn hid_usage(handle: HANDLE) -> Option<(u16, u16)> {
         return None;
     }
     // SAFETY: the system filled the HID variant.
-    let hid = unsafe { info.Anonymous.hid };
-    Some((hid.usUsagePage, hid.usUsage))
+    Some(unsafe { info.Anonymous.hid })
 }
 
 /// What a device is: a keyboard, a game controller (a HID joystick or
@@ -1076,7 +1092,7 @@ pub fn controller_layouts() -> Result<Vec<CollectionInfo>, InputError> {
         .iter()
         .filter(|s| s.handle.is_some())
         .map(|s| CollectionInfo {
-            grouped: s.container.is_some(),
+            grouped: s.group.is_some(),
             collection: s.collection,
             usage: s.usage,
             axes: s.state.axes().to_vec(),

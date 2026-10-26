@@ -192,7 +192,17 @@ pub fn script(log: &Path) -> Result<ScriptedInput, String> {
             replay::DeviceKind::Controller => DeviceKind::Controller,
         })
         .collect();
-    Ok(ScriptedInput::from_log(&rec.start, &rec.events, &kinds))
+    // Each controller declares the axes its record binds, as the adapter
+    // would: only declared axes are recorded.
+    let script = ScriptedInput::from_log(&rec.start, &rec.events, &kinds);
+    Ok(rec
+        .devices
+        .sources
+        .iter()
+        .enumerate()
+        .fold(script, |script, (i, s)| {
+            script.with_axes(input::DeviceId(i as u64), &input::declared_axes(&s.profile))
+        }))
 }
 
 /// Reads `path` if it holds at most `limit` bytes, reading no more than one
@@ -247,10 +257,20 @@ enum KeyStep {
     Close,
 }
 
+/// The model a scripted controller press comes from: made up, so a key
+/// config scripted with controller controls names a controller and
+/// `device.toml` accepts it.
+const SCRIPTED_CONTROLLER: input::hid::HidProduct = input::hid::HidProduct {
+    vendor_id: 0xFFFE,
+    product_id: 0x0001,
+    interface: None,
+};
+
 /// `keys --dev-scripted-keys <steps>`: presses offered to the capture slot
 /// in place of a person, one every 300 ms, comma-separated: a keyboard
 /// scan code in hex (`2a`), `b<n>` for a controller's control `n`, or
-/// `close` to close the window.
+/// `close` to close the window. Controller presses come from
+/// [`SCRIPTED_CONTROLLER`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyScript(Vec<KeyStep>);
 
@@ -306,7 +326,12 @@ impl KeyScript {
                         value,
                         background: false,
                     };
-                    capture.offer(&packet, kind, false);
+                    match kind {
+                        DeviceKind::Keyboard => capture.offer(&packet, kind, false),
+                        DeviceKind::Controller => {
+                            capture.offer_controller(&packet, Some(SCRIPTED_CONTROLLER), false);
+                        }
+                    }
                 }
             }
         });

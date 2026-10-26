@@ -14,7 +14,7 @@ use eval::{
     AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, ScratchSettings, SourceProfile,
 };
 use input::DeviceKind;
-use input::hid::{AxisCap, is_axis};
+use input::hid::{AxisCap, HidProduct, is_axis};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -388,15 +388,58 @@ impl ScratchConfig {
     }
 }
 
+/// The controller a controller key config belongs to: its model and, on a
+/// composite device, the function whose controls are bound
+/// ([`HidProduct`]), the same in every port and after replugging. It names
+/// no single unit and no port, and it never enters the input log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerDevice {
+    /// The vendor id.
+    pub vendor_id: u16,
+    /// The product id.
+    pub product_id: u16,
+    /// The interface number of the function on a composite device; absent
+    /// for a device that is not composite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<u8>,
+}
+
+impl From<HidProduct> for ControllerDevice {
+    fn from(p: HidProduct) -> Self {
+        Self {
+            vendor_id: p.vendor_id,
+            product_id: p.product_id,
+            interface: p.interface,
+        }
+    }
+}
+
+impl From<ControllerDevice> for HidProduct {
+    fn from(d: ControllerDevice) -> Self {
+        Self {
+            vendor_id: d.vendor_id,
+            product_id: d.product_id,
+            interface: d.interface,
+        }
+    }
+}
+
 /// `device.toml`: what belongs to this PC and its devices.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeviceSettings {
     /// The key config shared by every keyboard.
     pub keyboard: KeyConfig,
-    /// The key config shared by every controller: its buttons and axes by
-    /// HID usage ([`input::hid`]).
+    /// The controller key config: its buttons and axes by HID usage
+    /// ([`input::hid`]), of one controller
+    /// ([`controller_device`](Self::controller_device)).
     pub controller: KeyConfig,
+    /// The controller [`controller`](Self::controller) belongs to, as
+    /// `tapestry keys` captured it; set whenever it binds a lane. Only a
+    /// connected controller of this model plays; other controllers take no
+    /// part.
+    pub controller_device: Option<ControllerDevice>,
     /// The input latency offset, µs.
     pub input_offset_us: i64,
     /// The audio output latency offset, µs.
@@ -437,6 +480,7 @@ impl Default for DeviceSettings {
                 retry: None,
                 quit: None,
             },
+            controller_device: None,
             input_offset_us: 0,
             audio_offset_us: 0,
             display_offset_us: 0,
@@ -460,9 +504,11 @@ impl DeviceSettings {
     }
 
     /// Checks what [`Settings::load`] cannot leave to the types: both key
-    /// configs ([`KeyConfig::check`]), the input and display offsets within
-    /// ±[`OFFSET_LIMIT_US`], the master volume from 0.0 to 1.0, and the
-    /// queued periods within [`QUEUED_PERIODS`].
+    /// configs ([`KeyConfig::check`]), a controller key config binding a
+    /// lane only with its [`controller_device`](Self::controller_device),
+    /// the input and display offsets within ±[`OFFSET_LIMIT_US`], the
+    /// master volume from 0.0 to 1.0, and the queued periods within
+    /// [`QUEUED_PERIODS`].
     ///
     /// # Errors
     ///
@@ -474,6 +520,13 @@ impl DeviceSettings {
         self.controller
             .check(DeviceKind::Controller)
             .map_err(|e| format!("controller key config: {e}"))?;
+        if !self.controller.lanes.is_empty() && self.controller_device.is_none() {
+            return Err(
+                "controller key config: it does not say which controller it belongs to; \
+                 run `tapestry keys` again"
+                    .to_owned(),
+            );
+        }
         for (name, us) in [
             ("input_offset_us", self.input_offset_us),
             ("display_offset_us", self.display_offset_us),

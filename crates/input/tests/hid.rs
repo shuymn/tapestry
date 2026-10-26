@@ -7,9 +7,10 @@
 use bms_model::TimeUs;
 use eval::{ControlId, InputKind, PhysicalInputEvent, SourceId};
 use input::hid::{
-    AxisCap, ButtonGroup, CollectionSlot, HidDevice, HidLayout, HidReport, axis_cap, axis_control,
-    axis_value, button_control, capture_travel, collection_of, in_collection, is_axis, read_report,
-    remove_collection, widened_wrap,
+    AxisCap, ButtonGroup, CollectionSlot, HidDevice, HidLayout, HidReport, Placement, axis_cap,
+    axis_control, axis_value, button_control, capture_travel, collection_of, group_device,
+    in_collection, interface_of, is_axis, place_collection, read_report, remove_collection,
+    until_nul, widened_wrap,
 };
 use input::{Capture, DeviceId, DeviceKind, SourceConfig, SourceReader, SourceSet};
 
@@ -508,10 +509,6 @@ fn collections_of_one_controller_are_one_source() {
     let x2 = in_collection(X, 2);
     let b2 = in_collection(button_control(1), 2);
     set.set_recorded(PAD, vec![button_control(1), b2, x2]);
-    set.open_recording(TimeUs(5));
-    let mut reader = set.take_readers().pop().unwrap();
-    let capture = Capture::new();
-    let mut first = HidDevice::new(PAD, &layout(&[]));
     let second_axes = [AxisCap {
         control: x2,
         relative: false,
@@ -520,6 +517,12 @@ fn collections_of_one_controller_are_one_source() {
         max: 255,
         bits: 16,
     }];
+    // The adapter declares the second collection's axis as it connects.
+    set.add_axes(PAD, &second_axes);
+    set.open_recording(TimeUs(5));
+    let mut reader = set.take_readers().pop().unwrap();
+    let capture = Capture::new();
+    let mut first = HidDevice::new(PAD, &layout(&[]));
     let mut second = HidDevice::new(
         PAD,
         &HidLayout {
@@ -564,6 +567,126 @@ fn controls_carry_their_collection() {
     assert_eq!(collection_of(&path("HID#VID_0&PID_0#x")), 0);
     assert_eq!(collection_of(&path("&colZ1")), 0);
     assert_eq!(collection_of(&path("&col")), 0);
+}
+
+/// The ids the tests' device declares.
+const IDS: (u16, u16) = (0x1A2B, 0x3C4D);
+/// Its container.
+const BOX: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
+
+fn utf16(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// Places the collections at `paths` one after another, as the adapter
+/// connects them: each beside the ones placed before it, all in [`BOX`].
+fn place_all(paths: &[&str]) -> Vec<Placement> {
+    let mut placed: Vec<Placement> = Vec::new();
+    for path in paths {
+        let path = utf16(path);
+        let connected = placed.iter().map(|p| (p.group, p.collection));
+        let placement = place_collection(Some(&path), Some(BOX), Some(IDS), connected);
+        placed.push(placement);
+    }
+    placed
+}
+
+/// Two functions of one device in one container, each with collections
+/// 1 and 2, found interleaved: each function is one source of its own,
+/// with its own identity, whatever the order.
+#[test]
+fn collections_group_by_container_and_function() {
+    let a1 = "HID#VID_1A2B&PID_3C4D&MI_00&Col01#x";
+    let a2 = "HID#VID_1A2B&PID_3C4D&MI_00&Col02#x";
+    let b1 = "HID#VID_1A2B&PID_3C4D&MI_01&Col01#x";
+    let b2 = "HID#VID_1A2B&PID_3C4D&MI_01&Col02#x";
+    for order in [[a1, b1, b2, a2], [b2, a1, a2, b1]] {
+        let placed = place_all(&order);
+        let of = |path: &str| placed[order.iter().position(|&q| q == path).unwrap()];
+        let device = |path: &str| of(path).group.map(group_device);
+        assert!(device(a1).is_some() && device(b1).is_some());
+        assert_eq!(device(a2), device(a1));
+        assert_eq!(device(b2), device(b1));
+        assert_ne!(device(a1), device(b1));
+        for (path, interface) in [(a1, 0), (a2, 0), (b1, 1), (b2, 1)] {
+            let product = of(path).product.unwrap();
+            assert_eq!(product.interface, Some(interface), "{path}");
+            assert_eq!((product.vendor_id, product.product_id), IDS);
+        }
+    }
+    // Two collections of one function with one number: the second keeps a
+    // source of its own.
+    let placed = place_all(&[a1, a1]);
+    assert!(placed[0].group.is_some());
+    assert_eq!(placed[1].group, None);
+}
+
+/// The collection and interface numbers come from the path of this read
+/// only: a shorter path read into a buffer that held a longer one does not
+/// take its `&MI_` or `&Col` from what is left after the nul.
+#[test]
+fn a_reused_path_buffer_gives_only_the_new_path() {
+    let mut buf = utf16("HID#VID_1A2B&PID_3C4D&REV_0100&MI_03&Col05#7&0&0000");
+    buf.push(0);
+    let short = utf16("HID#VID_1A2B&PID_3C4D#7&0");
+    buf[..short.len()].copy_from_slice(&short);
+    buf[short.len()] = 0;
+    assert_eq!(
+        interface_of(&buf),
+        Some(3),
+        "the whole buffer still holds it"
+    );
+    let path = until_nul(&buf).unwrap();
+    assert_eq!(path, &short[..]);
+    let placed = place_collection(Some(path), Some(BOX), Some(IDS), []);
+    assert_eq!(placed.collection, 0);
+    assert_eq!(placed.product.unwrap().interface, None);
+    assert_eq!(until_nul(&[0x41, 0x42]), None);
+}
+
+/// A collection whose path cannot be read has no identity, so key config
+/// cannot bind it to one, and no group; a genuine path without `&MI_` has
+/// an identity without an interface.
+#[test]
+fn an_unread_path_leaves_the_identity_unknown() {
+    let unread = place_collection(None, Some(BOX), Some(IDS), []);
+    assert_eq!(
+        unread,
+        Placement {
+            group: None,
+            collection: 0,
+            product: None,
+        }
+    );
+    let plain = utf16("HID#VID_1A2B&PID_3C4D#7&0&0000");
+    let placed = place_collection(Some(&plain), Some(BOX), Some(IDS), []);
+    assert_eq!(placed.group, Some((BOX, None)));
+    assert_eq!(
+        placed.product,
+        Some(input::hid::HidProduct {
+            vendor_id: IDS.0,
+            product_id: IDS.1,
+            interface: None,
+        })
+    );
+    // Ids that cannot be read: no identity either.
+    assert_eq!(place_collection(Some(&plain), None, None, []).product, None);
+}
+
+#[test]
+fn interface_of_reads_the_function_number() {
+    let path = |s: &str| s.encode_utf16().collect::<Vec<_>>();
+    assert_eq!(
+        interface_of(&path("HID#VID_0&PID_0&MI_01#7&0&0000")),
+        Some(1)
+    );
+    assert_eq!(
+        interface_of(&path("hid#vid_0&pid_0&mi_1f&col02#x")),
+        Some(0x1F)
+    );
+    assert_eq!(interface_of(&path("HID#VID_0&PID_0&COL02#x")), None);
+    assert_eq!(interface_of(&path("&mi_g1")), None);
+    assert_eq!(interface_of(&path("&mi_")), None);
 }
 
 #[test]
@@ -865,8 +988,17 @@ impl CollectionSlot for Slot {
 }
 
 #[test]
-fn removing_one_collection_removes_the_whole_controller() {
-    let (mut set, mut reader) = recording();
+fn removing_one_collection_removes_its_function() {
+    // Another function of the same device in the same container: a source
+    // of its own, with button 1 recorded.
+    const OTHER: DeviceId = DeviceId(0x7b2);
+    let mut set = connected();
+    set.connect(OTHER, DeviceKind::Controller);
+    set.set_recorded(OTHER, vec![button_control(1)]);
+    set.open_recording(TimeUs(0));
+    let mut readers = set.take_readers();
+    let mut other_reader = readers.pop().unwrap();
+    let mut reader = readers.pop().unwrap();
     let capture = Capture::new();
     let second = HidLayout {
         collection: 2,
@@ -881,6 +1013,10 @@ fn removing_one_collection_removes_the_whole_controller() {
         Slot {
             key: Some(20),
             state: HidDevice::new(PAD, &second),
+        },
+        Slot {
+            key: Some(30),
+            state: HidDevice::new(OTHER, &layout(&[])),
         },
     ];
     // X rests at 0 on the first collection; button 1 of the second is
@@ -909,13 +1045,28 @@ fn removing_one_collection_removes_the_whole_controller() {
     // The source is disconnected, and every slot of it is free.
     let events: Vec<_> = std::iter::from_fn(|| reader.pop()).collect();
     assert_eq!(events.last().map(|e| e.kind), Some(InputKind::Disconnected));
-    assert!(slots.iter().all(|s| s.key.is_none()));
+    assert!(slots[..2].iter().all(|s| s.key.is_none()));
+    // The other function stays connected and still records.
+    assert_eq!(slots[2].key, Some(30));
+    batch(&mut slots[2].state, &mut set, &capture, 22, &[press(&[1])]);
+    let other: Vec<_> = std::iter::from_fn(|| other_reader.pop()).collect();
+    assert_eq!(
+        other.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [InputKind::Control {
+            control: button_control(1),
+            value: 1
+        }]
+    );
     // The other collection's removal finds nothing more.
     assert!(!remove_collection(&mut slots, 20, &mut set));
     set.close_recording();
     set.open_recording(TimeUs(25));
-    assert_eq!(set.participants().count(), 0);
+    let sources: Vec<_> = set.participants().map(|(d, _)| d).collect();
+    assert_eq!(sources, [OTHER]);
     set.close_recording();
+    assert!(set.begin_batch(TimeUs(26)));
+    assert!(remove_collection(&mut slots, 30, &mut set));
+    set.end_batch(TimeUs(27));
 
     // Rediscovered: a new device with empty state, like a first
     // connection. Only what it reports after that is in the next
