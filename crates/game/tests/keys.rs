@@ -281,4 +281,20 @@ fn keep_keeps_the_current_bindings() {
         assert!(matches!(flow.press(kb(control)), Press::Bound(..)));
     }
     assert_eq!(flow.press(keep), Press::Bound(Role::Retry, Vec::new()));
+
+    // A hand-edited file with a controller's retry and quit: keep keeps
+    // the keyboard keys only, which `device.toml` accepts.
+    let mut edited = current();
+    edited.controller.retry = Some(8);
+    edited.controller.quit = Some(9);
+    let mut flow = KeyConfigFlow::new(edited);
+    for _ in 0..8 {
+        assert!(matches!(flow.press(keep), Press::Bound(..)));
+    }
+    assert_eq!(flow.press(keep), Press::Bound(Role::Retry, vec![kb(0x0e)]));
+    let Press::Done(keys) = flow.press(keep) else {
+        panic!("not done");
+    };
+    assert_eq!((keys.controller.retry, keys.controller.quit), (None, None));
+    assert_eq!(keys.keyboard.quit, Some(0x01));
 }

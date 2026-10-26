@@ -137,7 +137,9 @@ impl KeyConfigFlow {
     }
 
     /// The controls the current key configs bind to `role`: keyboard
-    /// keys, then controllers' controls.
+    /// keys, then controllers' controls. Retry and quit have keyboard keys
+    /// only, whatever a hand-edited file says, so keeping them never keeps
+    /// what `device.toml` refuses.
     #[must_use]
     pub fn current(&self, role: Role) -> Vec<Bound> {
         let mut found = Vec::new();
@@ -150,6 +152,7 @@ impl KeyConfigFlow {
                     .filter(|k| k.lane == l)
                     .map(|k| k.control)
                     .collect(),
+                _ if kind != DeviceKind::Keyboard => Vec::new(),
                 Role::Retry => keys.retry.into_iter().collect(),
                 Role::Quit => keys.quit.into_iter().collect(),
             };
