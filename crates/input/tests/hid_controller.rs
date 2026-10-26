@@ -1,7 +1,7 @@
 //! A real HID game controller through Raw Input, on the development PC
-//! (`--ignored`): its buttons and its axis arrive as one source. One test
-//! per process: Raw Input has one registration per device type per
-//! process.
+//! (`--ignored`): its buttons and its axis arrive as one source. Only that
+//! test uses Raw Input in this process, which has one registration per
+//! device type; the other checks the printed summary.
 //!
 //! Run it with the controller connected, then press a few buttons and turn
 //! the turntable during the 20 seconds it records. A small window takes the
@@ -196,9 +196,14 @@ fn hid_controller_round_trip() {
     // range the input thread declared for it.
     let mut complete = 0;
     let mut wrong = Vec::new();
+    let mut blocks = Vec::new();
     for (i, (device, kind, caps)) in participants.iter().enumerate() {
         if *kind != DeviceKind::Controller {
-            println!("source {i}: keyboard");
+            blocks.push(Block {
+                source: i,
+                header: "keyboard".to_owned(),
+                lines: Vec::new(),
+            });
             continue;
         }
         let own: Vec<_> = layouts.iter().filter(|l| l.device == *device).collect();
@@ -214,7 +219,8 @@ fn hid_controller_round_trip() {
                 )
             })
             .collect();
-        println!("source {i}: controller, {}", label.join(", "));
+        let header = format!("controller, {}", label.join(", "));
+        let mut lines = Vec::new();
         for cap in caps {
             let bits = own
                 .iter()
@@ -224,20 +230,25 @@ fn hid_controller_round_trip() {
                 })
                 .unwrap_or(0);
             if cap.relative {
-                println!("  axis {:#010x}: relative, {bits} bits", cap.control.0);
+                lines.push(format!(
+                    "axis {:#010x}: relative, {bits} bits",
+                    cap.control.0
+                ));
             } else {
-                println!(
-                    "  axis {:#010x}: declared {}..={} in {bits} bits, {} values a revolution",
+                lines.push(format!(
+                    "axis {:#010x}: declared {}..={} in {bits} bits, {} values a revolution",
                     cap.control.0, cap.min, cap.max, cap.wrap
-                );
+                ));
             }
         }
         for (b, n) in &buttons[i] {
-            println!("  button {b:#x}: {n} presses");
+            lines.push(format!("button {b:#x}: {n} presses"));
         }
         for (a, (n, min, max)) in &axes[i] {
             let cap = caps.iter().find(|c| c.control.0 == *a);
-            println!("  axis {a:#010x}: {n} reports, observed {min}..={max}");
+            lines.push(format!(
+                "axis {a:#010x}: {n} reports, observed {min}..={max}"
+            ));
             // Observed against declared, for an absolute axis that moved
             // enough: inside the declared range, or else counted by the
             // input thread as a wrong descriptor and marked on the source.
@@ -247,11 +258,11 @@ fn hid_controller_round_trip() {
                 let inside = (cap.min..=cap.max).contains(min) && (cap.min..=cap.max).contains(max);
                 let counted = out_of_range[i].load(Ordering::Acquire);
                 if inside {
-                    println!("    inside the declared range");
+                    lines.push("  inside the declared range".to_owned());
                 } else {
-                    println!(
-                        "    OUTSIDE the declared range: {counted} values counted for the record"
-                    );
+                    lines.push(format!(
+                        "  OUTSIDE the declared range: {counted} values counted for the record"
+                    ));
                     if counted == 0 {
                         wrong.push(format!(
                             "source {i} axis {a:#010x}: observed {min}..={max} outside {}..={} but not counted",
@@ -264,10 +275,64 @@ fn hid_controller_round_trip() {
         if !buttons[i].is_empty() && !axes[i].is_empty() {
             complete += 1;
         }
+        blocks.push(Block {
+            source: i,
+            header,
+            lines,
+        });
     }
+    print!("{}", summary(&blocks));
     assert!(wrong.is_empty(), "axes not handled: {wrong:#?}");
     assert!(
         complete > 0,
         "no controller source delivered both a button and an axis"
+    );
+}
+
+/// One source's part of the summary: its header and its lines.
+struct Block {
+    source: usize,
+    header: String,
+    lines: Vec<String>,
+}
+
+/// The summary of every source, each once, in source order: its header,
+/// then its lines indented.
+fn summary(blocks: &[Block]) -> String {
+    let mut sorted: Vec<&Block> = blocks.iter().collect();
+    sorted.sort_by_key(|b| b.source);
+    sorted.dedup_by_key(|b| b.source);
+    let mut out = String::new();
+    for b in sorted {
+        out.push_str(&format!("source {}: {}\n", b.source, b.header));
+        for l in &b.lines {
+            out.push_str(&format!("  {l}\n"));
+        }
+    }
+    out
+}
+
+#[test]
+fn summary_prints_each_source_once_in_order() {
+    let block = |source, header: &str, lines: &[&str]| Block {
+        source,
+        header: header.to_owned(),
+        lines: lines.iter().map(|&l| l.to_owned()).collect(),
+    };
+    let blocks = [
+        block(
+            2,
+            "controller, collection 2",
+            &["axis 0x02010030", "button 0x1"],
+        ),
+        block(0, "controller, collection 0", &["axis 0x00010030"]),
+        block(1, "keyboard", &[]),
+        block(2, "controller, collection 2", &["axis 0x02010030"]),
+    ];
+    assert_eq!(
+        summary(&blocks),
+        "source 0: controller, collection 0\n  axis 0x00010030\n\
+         source 1: keyboard\n\
+         source 2: controller, collection 2\n  axis 0x02010030\n  button 0x1\n"
     );
 }
