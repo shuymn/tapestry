@@ -689,7 +689,11 @@ An overlay toggled during play shows p50, p99 and max over the current play, fro
 | Lost refreshes (frame statistics) | `PresentRefreshCount` deltas between accepted samples of consecutive present counts, counted with the rules of "Frame Pacing in Refreshes" at k = 1. An interval without accepted samples at both ends is N/A, never lost | Diagnostic; N/A under VRR or tearing. PresentMon (`tapestry measure play`) is the recorded evidence |
 | Render CPU work per frame | QPC around update, build and submit, waits excluded | |
 | Audio underruns | Wakes with zero padding | |
+| Sprite cap | Play frames whose sprite batch filled (8,192 sprites), so the rest of the frame was not drawn | Frames, not sprites: the skin stops building at the first refused push, so the HUD, effects and this overlay vanish from such a frame too |
+| Deferred starts, stolen voices | Over the play: audio wakes that left a due key sound or BGM start for a later wake because 1,024 starts already waited (those sounds start late, head intact), and voices stolen at the 256-voice limit | Neither is reported anywhere else |
 | Load time | First load and retry, separately | |
+
+At each play's end the console prints the sprite cap, deferred-start and stolen-voice counts in one `limits:` line, since an autoplay play keeps no `.measure.toml`.
 
 GPU time and the presented-frame interval distribution are not built yet. The current play screen is light, and lost refreshes already show any presentation stall; GPU timestamp queries arrive with the effects of stage 3, which add GPU load. Until then PresentMon's capture holds the presented intervals.
 

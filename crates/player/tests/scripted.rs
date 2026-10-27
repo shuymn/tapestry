@@ -272,6 +272,12 @@ fn scripted_play_writes_a_record() {
     assert_eq!(int(&m, refreshes, "intervals"), Some(0));
     assert!(int(&m, "render_cpu_us", "count").unwrap() > 0);
     assert!(int(&m, "audio", "underruns").is_some());
+    assert_eq!(int(&m, "audio", "deferred_wakes"), Some(0));
+    assert_eq!(int(&m, "audio", "voices_stolen"), Some(0));
+    assert_eq!(int(&m, "sprite_cap", "full_frames"), Some(0));
+    assert!(stdout.contains(
+        "limits: sprite cap full in 0 frames; starts deferred in 0 audio wakes; 0 voices stolen"
+    ));
     assert!(int(&m, "load_ms", "first").is_some());
     assert!(int(&m, "allocations", "render").is_some());
     // The frame dump reads back, encodes and writes files, outside the
