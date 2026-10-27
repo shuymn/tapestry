@@ -18,7 +18,7 @@ windows-only = true
 [features]
 default = []
 # Development features. Never enabled in production builds (R3).
-dev-tools = []
+dev-tools = ["game/dev-tools"]
 
 [dependencies]
 anyhow.workspace = true

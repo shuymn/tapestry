@@ -275,7 +275,7 @@ fn play_and_next<R: Rig>(
     let (mut sink, sounds) = audio_link_at(logic.max_events(), origin);
     // Autoplay's key sounds are on the engine's schedule, ahead of their
     // judgments.
-    if loaded.config().autoplay {
+    if loaded.config().autoplay == Some(crate::AutoKeySounds::Scheduled) {
         sink = sink.without_key_sounds();
     }
     logic.add_sink(Box::new(sink));

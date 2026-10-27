@@ -47,7 +47,8 @@ use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank};
 use bms_model::{BgmEvent, TimeUs};
 use eval::ControlId;
 use game::{
-    DataRoot, DeviceSettings, Loaded, Parts, SessionConfig, Settings, Tuning, save_settings,
+    AutoKeySounds, DataRoot, DeviceSettings, Loaded, Parts, SessionConfig, Settings, Tuning,
+    save_settings,
 };
 use input::{
     AutoplayInput, Capture, ClockedThread, InputThread, QpcClock, SourceConfig, SourceSet,
@@ -69,8 +70,8 @@ const LEAD_IN: TimeUs = TimeUs(1_000_000);
 /// Effects the render queue holds.
 const EFFECTS: usize = 1 << 14;
 /// Scheduled sound starts the audio engine keeps between two drains (one
-/// engine step).
-const SCHEDULE_LOG: usize = 256;
+/// engine step), which starts at most this many: none is lost.
+const SCHEDULE_LOG: usize = audio::MAX_PENDING_STARTS;
 
 fn main() -> ExitCode {
     // The clock reads 0 at the start of the process: load times count from
@@ -104,7 +105,7 @@ fn main() -> ExitCode {
         #[cfg(feature = "dev-tools")]
         Command::DevToolsProbe => dev::probe(),
         #[cfg(feature = "dev-tools")]
-        Command::Measure { chart } => report(measure_play(&chart, clock)),
+        Command::Measure { chart, perfect } => report(measure_play(&chart, perfect, clock)),
     }
 }
 
@@ -165,12 +166,13 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
     ))
 }
 
-/// `tapestry measure play <chart>` (dev-tools): one play under a
-/// PresentMon capture, its counts added to each saved play's
+/// `tapestry measure play [--perfect] <chart>` (dev-tools): one play
+/// under a PresentMon capture, its counts added to each saved play's
 /// `.measure.toml`; the run quits after the end screen shows (retry and
-/// quit still work during the play).
+/// quit still work during the play). The devices play it, or with
+/// `perfect` generated input that hits every note.
 #[cfg(feature = "dev-tools")]
-fn measure_play(chart: &Path, clock: QpcClock) -> anyhow::Result<()> {
+fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<()> {
     let exe = presentmon::locate(std::env::var_os(presentmon::ENV), std::env::var_os("PATH"))?;
     let process = std::env::current_exe()
         .ok()
@@ -192,7 +194,12 @@ fn measure_play(chart: &Path, clock: QpcClock) -> anyhow::Result<()> {
     let plays = play::MeasuredPlays::default();
     let kept = Arc::clone(&plays);
     // One play: the run quits once its end screen has shown.
-    let ran = play(chart, PlayInput::Devices, clock, true, move |rig| {
+    let input = if perfect {
+        PlayInput::Perfect
+    } else {
+        PlayInput::Devices
+    };
+    let ran = play(chart, input, clock, true, move |rig| {
         rig.measured_plays = Some(kept);
         rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     });
@@ -285,6 +292,11 @@ enum PlayInput {
     /// are saved (dev-tools).
     #[cfg(feature = "dev-tools")]
     Script(PathBuf),
+    /// Autoplay's generated input, keys and planning, with key sounds sent
+    /// from judgments; plays are saved: the perfect measurement
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    Perfect,
 }
 
 /// Settings, the chart through ingestion and the transform, and the
@@ -296,18 +308,24 @@ fn load(chart: &Path, input: &PlayInput) -> anyhow::Result<Loaded> {
         PlayInput::Devices => (
             ReceiveMethod::RawInput,
             Parts::standard(&root, &settings.player),
-            false,
+            None,
         ),
         PlayInput::Autoplay => (
             ReceiveMethod::Scripted,
             Parts::unsaved(&settings.player),
-            true,
+            Some(AutoKeySounds::Scheduled),
         ),
         #[cfg(feature = "dev-tools")]
         PlayInput::Script(_) => (
             ReceiveMethod::Scripted,
             Parts::standard(&root, &settings.player),
-            false,
+            None,
+        ),
+        #[cfg(feature = "dev-tools")]
+        PlayInput::Perfect => (
+            ReceiveMethod::Scripted,
+            Parts::standard(&root, &settings.player),
+            Some(AutoKeySounds::Judged),
         ),
     };
     // `#RANDOM` is resolved with a seed that differs per run; it is
@@ -388,21 +406,11 @@ fn prepare(chart: &Path, input: &PlayInput) -> anyhow::Result<Prepared> {
             schedule: None,
             keyboard: None,
         }),
-        PlayInput::Autoplay => {
-            let made = loaded
-                .autoplay()
-                .with_context(|| chart.display().to_string())?;
-            let config = SourceConfig {
-                queue_capacity: made.queue_capacity(),
-                ..source_config()
-            };
-            Ok(Prepared {
-                loaded,
-                mode: Mode::Autoplay(AutoplayInput::new(made.events)),
-                sources: SourceSet::new(config).expect("8 sources are within the limit"),
-                schedule: Some(made.schedule),
-                keyboard: Some(made.recorded),
-            })
+        PlayInput::Autoplay => generated(loaded, chart),
+        #[cfg(feature = "dev-tools")]
+        PlayInput::Perfect => {
+            println!("input: generated, every note hit on time (perfect measurement)");
+            generated(loaded, chart)
         }
         #[cfg(feature = "dev-tools")]
         PlayInput::Script(log) => {
@@ -421,6 +429,25 @@ fn prepare(chart: &Path, input: &PlayInput) -> anyhow::Result<Prepared> {
             })
         }
     }
+}
+
+/// The session of generated input (autoplay, the perfect measurement): its
+/// input, audio schedule and recorded controls, made before anything opens.
+fn generated(loaded: Loaded, chart: &Path) -> anyhow::Result<Prepared> {
+    let made = loaded
+        .autoplay()
+        .with_context(|| chart.display().to_string())?;
+    let config = SourceConfig {
+        queue_capacity: made.queue_capacity(),
+        ..source_config()
+    };
+    Ok(Prepared {
+        loaded,
+        mode: Mode::Autoplay(AutoplayInput::new(made.events)),
+        sources: SourceSet::new(config).expect("8 sources are within the limit"),
+        schedule: Some(made.schedule),
+        keyboard: Some(made.recorded),
+    })
 }
 
 /// Loads the bank at the output's rate and hands the engine, playing
@@ -550,7 +577,7 @@ fn rig<'a>(
             scratch: device.scratch,
         },
         gauge: loaded.settings().player.displayed_gauge,
-        autoplay: loaded.config().autoplay,
+        autoplay: loaded.config().autoplay.is_some(),
         input_offset_us: device.input_offset_us,
         files: SettingsFiles::new(loaded.root().clone(), loaded.settings().clone()),
         seen: Delivered::default(),

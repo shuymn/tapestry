@@ -25,9 +25,9 @@ pub enum Command {
     /// `--dev-tools-probe`.
     #[cfg(feature = "dev-tools")]
     DevToolsProbe,
-    /// `measure play <chart>`.
+    /// `measure play [--perfect] <chart>`.
     #[cfg(feature = "dev-tools")]
-    Measure { chart: PathBuf },
+    Measure { chart: PathBuf, perfect: bool },
 }
 
 /// `play`'s arguments.
@@ -284,15 +284,31 @@ mod tests {
         );
     }
 
-    /// Autoplay and an input log are two ways to receive input: refused
-    /// together, in either order; `--dev-headless` is for autoplay alone.
+    /// Autoplay, an input log and the perfect measurement are three ways to
+    /// receive input: any two are refused together, in either order;
+    /// `--dev-headless` is for generated input alone.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn autoplay_refuses_an_input_log_and_takes_headless() {
         let both =
             UsageError::Usage("--auto and --dev-scripted-input cannot be used together".to_owned());
-        let headless = UsageError::Usage("--dev-headless needs --auto".to_owned());
+        let perfect = UsageError::Usage(
+            "--dev-perfect cannot be used with --auto or --dev-scripted-input".to_owned(),
+        );
+        let headless = UsageError::Usage("--dev-headless needs --auto or --dev-perfect".to_owned());
         for (args, refusal) in [
+            (&["play", "--auto", "a.bms", "--dev-perfect"][..], &perfect),
+            (&["play", "a.bms", "--dev-perfect", "--auto"], &perfect),
+            (
+                &[
+                    "play",
+                    "a.bms",
+                    "--dev-perfect",
+                    "--dev-scripted-input",
+                    "l",
+                ],
+                &perfect,
+            ),
             (
                 &["play", "--auto", "a.bms", "--dev-scripted-input", "l"][..],
                 &both,
@@ -320,6 +336,50 @@ mod tests {
         assert!(play.dev.headless);
         let play = chart(&["play", "a.bms", "--dev-scripted-input", "l"]);
         assert!(matches!(play.input, PlayInput::Script(ref l) if l == Path::new("l")));
+        let play = chart(&["play", "--dev-perfect", "a.bms", "--dev-headless"]);
+        assert!(matches!(play.input, PlayInput::Perfect));
+        assert!(play.dev.headless);
+        assert!(matches!(
+            chart(&["play", "a.bms", "--dev-perfect"]).input,
+            PlayInput::Perfect
+        ));
+    }
+
+    /// `measure play` takes one chart and `--perfect`, in either order,
+    /// once each.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn measure_play_takes_perfect() {
+        for (args, want) in [
+            (&["measure", "play", "a.bms"][..], false),
+            (&["measure", "play", "--perfect", "a.bms"], true),
+            (&["measure", "play", "a.bms", "--perfect"], true),
+        ] {
+            match parsed(args).unwrap() {
+                Command::Measure { chart, perfect } => {
+                    assert_eq!((chart.as_path(), perfect), (Path::new("a.bms"), want));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        for (args, refusal) in [
+            (
+                &["measure", "play", "--perfect", "a.bms", "--perfect"][..],
+                unknown("--perfect"),
+            ),
+            (&["measure", "play", "a.bms", "b.bms"], unknown("b.bms")),
+            (&["measure", "play", "a.bms", "--auto"], unknown("--auto")),
+            (
+                &["measure", "play", "--perfect"],
+                UsageError::Usage(
+                    "measure play needs a chart file\n\
+                     usage: tapestry measure play [--perfect] <chart.bms>"
+                        .to_owned(),
+                ),
+            ),
+        ] {
+            assert_eq!(parsed(args).unwrap_err(), refusal, "{args:?}");
+        }
     }
 
     /// A production build does not know `--dev-headless`, with `--auto`

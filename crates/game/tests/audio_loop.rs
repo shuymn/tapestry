@@ -274,3 +274,33 @@ fn dropped_probe_samples_are_counted() {
     assert!(rx.pop().is_err());
     assert_eq!(counters.probes_dropped(), 2);
 }
+
+/// The handle reads the engine's deferred wakes and stolen voices: 1,100
+/// BGM sounds at one time overflow the mixer's 1,024 pending starts, and
+/// two voices take them in turn.
+#[test]
+fn deferred_starts_and_stolen_voices_are_counted() {
+    let mut builder = ChartBuilder::new(150_000).sound("key.wav");
+    for i in 1..=1_100 {
+        builder = builder
+            .sound(&format!("bgm{i}.wav"))
+            .bgm(TimeUs(0), SoundId(i));
+    }
+    let chart = builder.tap(lane(1), TimeUs(1_000 * MS)).build().unwrap();
+    let engine = AudioEngine::new(bank(&chart), &chart.bgm, RATE, PERIOD, 2, 0).unwrap();
+    let (mut control, mut worker) = audio_control(engine);
+    let mut out = RecordingOutput::new(
+        SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+        RATE as usize,
+    );
+    let counters = control.counters();
+    let (_sink, queue) = audio_link_at(4, TimeUs(30 * MS));
+    control.play(TimeUs(30 * MS), queue).unwrap();
+    for _ in 0..10 {
+        worker.step(&mut out).unwrap();
+    }
+    assert!(counters.deferred_wakes() >= 1);
+    assert_eq!(counters.deferred_wakes(), worker.engine().deferred_wakes());
+    assert!(counters.steals() >= 1_000, "{}", counters.steals());
+    assert_eq!(counters.steals(), worker.engine().mixer().steals());
+}

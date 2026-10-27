@@ -16,8 +16,9 @@ pub struct Autoplay {
     /// The generated input, in receive-time order, for the input side's
     /// feeder ([`input::AutoplayInput`]).
     pub events: Vec<PhysicalInputEvent>,
-    /// The chart's BGM merged with the key sounds autoplay presses, for
-    /// the audio engine to take ([`::audio::AudioEngine::with_schedule`]).
+    /// The chart's BGM, merged with the key sounds autoplay presses when
+    /// they are scheduled ([`crate::AutoKeySounds`]), for the audio engine
+    /// to take ([`::audio::AudioEngine::with_schedule`]).
     pub schedule: Vec<BgmEvent>,
     /// The controls the generated keyboard records.
     pub recorded: Vec<ControlId>,

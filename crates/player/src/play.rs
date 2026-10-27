@@ -26,7 +26,8 @@ use crate::controls::Controls;
 use crate::end_screen::{self, Hints, LoadTimes, QueueLine};
 use crate::input_side::{InputLink, Recorded, Request};
 use crate::measure::{
-    Figures, PlayMeasure, Step, StepSample, judgment_samples, measure_path, to_toml,
+    AudioBase, Figures, PlayMeasure, Step, StepSample, judgment_samples, limits_line, measure_path,
+    to_toml,
 };
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
 use crate::tuning::{Delivered, SettingsFiles};
@@ -55,8 +56,8 @@ pub struct PlayerRig<'a> {
     pub recorded: Recorded,
     /// The gauge to show.
     pub gauge: usize,
-    /// Whether the session plays by itself and saves nothing (design.md
-    /// "Autoplay").
+    /// Whether the session plays generated input (design.md "Autoplay"):
+    /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
     /// The countdown's length.
     pub lead_in: TimeUs,
@@ -200,6 +201,7 @@ impl PlayerRig<'_> {
             return;
         };
         fig.steps_dropped = std::mem::take(&mut self.steps_dropped);
+        println!("{}", limits_line(&fig));
         let Some(Ok(saved)) = &report.saved else {
             return;
         };
@@ -336,22 +338,20 @@ impl Rig for PlayerRig<'_> {
         let countdown_at = TimeUs(origin.0 - self.lead_in.0);
         self.countdown_at = Some(countdown_at);
         println!("play started");
+        // Before the play is sent: the audio thread may mix its first wake
+        // before this thread runs again.
+        let audio = AudioBase::new(self.audio.control.counters());
         // Audio was readied before recording opened, so this does not
         // wait; a worker gone since shows as the output's failure.
         let _ = self.audio.control.play(origin, sounds);
         self.generation = self.audio.control.generation();
         self.steps_dropped = 0;
-        let counters = self.audio.control.counters();
         let measure = PlayMeasure {
             generation: self.generation,
             origin,
             load_from: self.retry_from.unwrap_or(TimeUs(0)),
             retry: self.retry_from.is_some(),
-            audio: Some((
-                counters.clone(),
-                counters.underruns(),
-                counters.probes_dropped(),
-            )),
+            audio: Some(audio),
             queued_periods: self.queued_now,
         };
         self.render.send(RenderMsg::Play {

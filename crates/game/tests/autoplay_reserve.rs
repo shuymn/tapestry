@@ -137,7 +137,7 @@ fn loaded(dir: &Path, chart: &Chart) -> Loaded {
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
-        autoplay: true,
+        autoplay: Some(game::AutoKeySounds::Scheduled),
     };
     Loaded::load(root, settings, &path, config, parts).unwrap()
 }

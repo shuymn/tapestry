@@ -39,7 +39,7 @@ pub const SOUND_QUEUE: usize = 1_024;
 /// How often the shown overlay's numbers are worked out again, µs.
 const OVERLAY_REFRESH_US: i64 = 250_000;
 /// Overlay lines, and characters per line.
-const LINES: usize = 12;
+const LINES: usize = 13;
 const LINE_LEN: usize = 56;
 /// Presents remembered to take the ones after a play's end back out of its
 /// count.
@@ -96,12 +96,36 @@ pub struct PlayMeasure {
     pub load_from: TimeUs,
     /// Whether the play is a retry.
     pub retry: bool,
-    /// The audio thread's counters, and its underruns and dropped probe
-    /// samples when the play began; `None` without an audio thread.
-    pub audio: Option<(AudioCounters, u64, u64)>,
+    /// The audio thread's counters when the play began; `None` without an
+    /// audio thread.
+    pub audio: Option<AudioBase>,
     /// Periods the output keeps queued for this play, when it says; it
     /// replaces the figure the output opened with.
     pub queued_periods: Option<u32>,
+}
+
+/// The audio thread's counters and what they held when a play began, so
+/// the play's figures are their growth since.
+#[derive(Clone, Debug)]
+pub struct AudioBase {
+    counters: AudioCounters,
+    underruns: u64,
+    probes_dropped: u64,
+    deferred_wakes: u64,
+    steals: u64,
+}
+
+impl AudioBase {
+    /// The counters' values now.
+    pub fn new(counters: AudioCounters) -> Self {
+        Self {
+            underruns: counters.underruns(),
+            probes_dropped: counters.probes_dropped(),
+            deferred_wakes: counters.deferred_wakes(),
+            steals: counters.steals(),
+            counters,
+        }
+    }
 }
 
 /// A play's figures, as written to `.measure.toml`.
@@ -129,6 +153,14 @@ pub struct Figures {
     pub underruns: Option<u64>,
     /// Press → sound samples the full probe queue dropped during the play.
     pub sounds_dropped: Option<u64>,
+    /// Audio wakes during the play that left a due start for a later wake,
+    /// the mixer's pending starts full: those sounds started late.
+    pub deferred_wakes: Option<u64>,
+    /// Voices the mixer stole at its voice limit during the play.
+    pub voices_stolen: Option<u64>,
+    /// Play frames whose sprite batch filled, leaving the rest of the frame
+    /// undrawn.
+    pub sprite_full_frames: u64,
     /// How the swap chain presented, when known.
     pub presentation: Option<Presentation>,
     /// When each presented frame of the play was done, µs on the clock,
@@ -301,9 +333,15 @@ fn write_overlay(fig: &Figures, load: Option<(bool, i64)>, lines: &mut [Line; LI
         "RENDER CPU US (DRAW) {}",
         Percentiles(&fig.render_cpu, false)
     ));
-    match fig.underruns {
-        Some(n) => line(format_args!("UNDERRUNS {n}")),
-        None => line(format_args!("UNDERRUNS N/A")),
+    line(format_args!(
+        " SPRITE CAP FULL {} FRAMES",
+        fig.sprite_full_frames
+    ));
+    match (fig.underruns, fig.deferred_wakes, fig.voices_stolen) {
+        (Some(n), Some(d), Some(s)) => {
+            line(format_args!("UNDERRUNS {n} DEFERRED {d} STOLEN {s}"));
+        }
+        _ => line(format_args!("UNDERRUNS N/A")),
     }
     match load {
         Some((false, ms)) => line(format_args!("LOAD FIRST {ms} MS")),
@@ -366,6 +404,7 @@ pub struct Measure {
     finalization: Samples,
     press_to_sound: Samples,
     render_cpu: Samples,
+    sprite_full_frames: u64,
     on_screen: OnScreen,
     filter: StatsFilter,
     refreshes: RefreshLedger,
@@ -425,6 +464,7 @@ impl Measure {
             finalization: Samples::new(),
             press_to_sound: Samples::new(),
             render_cpu: Samples::new(),
+            sprite_full_frames: 0,
             on_screen: OnScreen::with_capacity(IN_FLIGHT),
             filter: StatsFilter::default(),
             refreshes: RefreshLedger::default(),
@@ -449,6 +489,7 @@ impl Measure {
         self.finalization.clear();
         self.press_to_sound.clear();
         self.render_cpu.clear();
+        self.sprite_full_frames = 0;
         self.on_screen.clear();
         self.filter.reset();
         self.refreshes.clear();
@@ -525,9 +566,12 @@ impl Measure {
     /// The figures so far, without freezing (no allocation).
     fn figures_now(&mut self, end: TimeUs) -> Figures {
         let audio = self.play.as_ref().and_then(|p| p.audio.as_ref());
-        let underruns = audio.map(|(c, at_start, _)| c.underruns().saturating_sub(*at_start));
+        let underruns = audio.map(|a| a.counters.underruns().saturating_sub(a.underruns));
         let sounds_dropped =
-            audio.map(|(c, _, at_start)| c.probes_dropped().saturating_sub(*at_start));
+            audio.map(|a| a.counters.probes_dropped().saturating_sub(a.probes_dropped));
+        let deferred_wakes =
+            audio.map(|a| a.counters.deferred_wakes().saturating_sub(a.deferred_wakes));
+        let voices_stolen = audio.map(|a| a.counters.steals().saturating_sub(a.steals));
         let start = self.play.as_ref().map_or(TimeUs(0), |p| p.origin);
         let after_end = self.recent.iter().filter(|&&t| t >= end.0).count() as u64;
         Figures {
@@ -541,6 +585,9 @@ impl Measure {
             render_cpu: self.render_cpu.summary(),
             underruns,
             sounds_dropped,
+            deferred_wakes,
+            voices_stolen,
+            sprite_full_frames: self.sprite_full_frames,
             presentation: self.presentation,
             #[cfg(feature = "dev-tools")]
             present_times: None,
@@ -647,6 +694,9 @@ impl Measure {
         }
         self.render_cpu
             .push(i64::try_from(d.timing.cpu.as_micros()).unwrap_or(i64::MAX));
+        if d.timing.dropped > 0 {
+            self.sprite_full_frames += 1;
+        }
         if !d.timing.presented {
             return;
         }
@@ -758,6 +808,18 @@ const fn app_allocations() -> Option<u64> {
     None
 }
 
+/// The console's line of what a play lost to the sprite and mixer caps
+/// (design.md "Latency Figures"); N/A without an audio thread.
+pub fn limits_line(fig: &Figures) -> String {
+    let na = |n: Option<u64>| n.map_or_else(|| "N/A".to_owned(), |n| n.to_string());
+    format!(
+        "limits: sprite cap full in {} frames; starts deferred in {} audio wakes; {} voices stolen",
+        fig.sprite_full_frames,
+        na(fig.deferred_wakes),
+        na(fig.voices_stolen)
+    )
+}
+
 /// `<record>.measure.toml` beside the record at `record`.
 pub fn measure_path(record: &Path) -> PathBuf {
     record.with_extension("measure.toml")
@@ -826,9 +888,20 @@ pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
         r.counted, r.unavailable
     );
     summary_toml(&mut out, "render_cpu_us", fig.render_cpu.as_ref());
+    let _ = writeln!(
+        out,
+        "\n[sprite_cap]\nfull_frames = {}",
+        fig.sprite_full_frames
+    );
     out.push_str("\n[audio]\n");
     if let Some(n) = fig.underruns {
         let _ = writeln!(out, "underruns = {n}");
+    }
+    if let Some(n) = fig.deferred_wakes {
+        let _ = writeln!(out, "deferred_wakes = {n}");
+    }
+    if let Some(n) = fig.voices_stolen {
+        let _ = writeln!(out, "voices_stolen = {n}");
     }
     out.push_str("\n[load_ms]\n");
     if let Some(ms) = load.0 {
@@ -871,8 +944,9 @@ mod tests {
             (5, "PRESS>SCREEN MS N/A"),
             (7, "LOST REFRESHES N/A (0)"),
             (8, "RENDER CPU US (DRAW) N/A"),
-            (9, "UNDERRUNS N/A"),
-            (10, "LOAD N/A"),
+            (9, " SPRITE CAP FULL 0 FRAMES"),
+            (10, "UNDERRUNS N/A"),
+            (11, "LOAD N/A"),
         ] {
             assert_eq!(lines[i], want);
         }
@@ -912,6 +986,9 @@ mod tests {
                 longest: 2,
             },
             underruns: Some(1),
+            deferred_wakes: Some(2),
+            voices_stolen: Some(3),
+            sprite_full_frames: 4,
             allocations: Some([0, 1, 2, 3]),
             ..Figures::default()
         };
@@ -927,9 +1004,10 @@ mod tests {
         assert_eq!(shown[3], "PRESS>SOUND MS P50 24.8 P99 29.9 MAX 29.9");
         assert_eq!(shown[4], " PERIOD 10.0 MS, 2 QUEUED");
         assert_eq!(shown[7], "LOST REFRESHES 3 IN 1000 LONGEST 2 N/A 4");
-        assert_eq!(shown[9], "UNDERRUNS 1");
-        assert_eq!(shown[10], "LOAD RETRY 85 MS");
-        assert_eq!(shown[11], "ALLOC IN 0 LOGIC 1 AUDIO 2 RENDER 3");
+        assert_eq!(shown[9], " SPRITE CAP FULL 4 FRAMES");
+        assert_eq!(shown[10], "UNDERRUNS 1 DEFERRED 2 STOLEN 3");
+        assert_eq!(shown[11], "LOAD RETRY 85 MS");
+        assert_eq!(shown[12], "ALLOC IN 0 LOGIC 1 AUDIO 2 RENDER 3");
     }
 }
 
@@ -1172,14 +1250,21 @@ mod frame_tests {
         let mut r = rig();
         r.m.start(play(1, TimeUs(1_000_000)));
         r.steps.push(step(1, Step::Judgment(500))).unwrap();
-        r.m.frame(&drawn(&[judged(1, 0)], Some(3), 100, None, 1_100_000));
+        let effects = [judged(1, 0)];
+        let mut full = drawn(&effects, Some(3), 100, None, 1_100_000);
+        full.timing.dropped = 5;
+        r.m.frame(&full);
+        r.m.frame(&drawn(&[], Some(4), 100, None, 1_150_000));
         let first = r.m.finish(TimeUs(1_200_000)).unwrap();
         assert_eq!(first.input_to_judgment.unwrap().count, 1);
+        // Frames, not refused pushes.
+        assert_eq!(first.sprite_full_frames, 1);
         r.steps.push(step(1, Step::Judgment(600))).unwrap();
         r.steps.push(step(2, Step::Judgment(700))).unwrap();
         r.m.start(play(2, TimeUs(2_000_000)));
-        r.m.frame(&drawn(&[], Some(4), 100, None, 2_100_000));
+        r.m.frame(&drawn(&[], Some(5), 100, None, 2_100_000));
         let second = r.m.finish(TimeUs(2_200_000)).unwrap();
+        assert_eq!(second.sprite_full_frames, 0);
         let j = second.input_to_judgment.unwrap();
         assert_eq!((j.count, j.max), (1, 700));
         assert_eq!(second.render_cpu.unwrap().count, 1);

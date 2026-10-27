@@ -79,7 +79,7 @@ fn loaded(dir: &Path) -> Loaded {
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
-        autoplay: false,
+        autoplay: None,
     };
     Loaded::load(root, settings, &chart_path, config, parts).unwrap()
 }
@@ -894,7 +894,7 @@ fn chord_loaded(dir: &Path) -> Loaded {
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
-        autoplay: false,
+        autoplay: None,
     };
     Loaded::load(root, settings, &chart_path, config, parts).unwrap()
 }
@@ -964,7 +964,7 @@ fn the_play_is_over_before_it_is_saved() {
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
-        autoplay: false,
+        autoplay: None,
     };
     let mut loaded = Loaded::load(root, settings, &chart_path, config, parts).unwrap();
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];

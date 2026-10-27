@@ -110,6 +110,7 @@ pub struct AudioEngine {
     scheduled: Vec<Scheduled>,
     scheduled_dropped: u64,
     underruns: u64,
+    deferred_wakes: u64,
 }
 
 impl AudioEngine {
@@ -168,6 +169,7 @@ impl AudioEngine {
             scheduled: Vec::with_capacity(schedule_log),
             scheduled_dropped: 0,
             underruns: 0,
+            deferred_wakes: 0,
         })
     }
 
@@ -193,6 +195,13 @@ impl AudioEngine {
     #[must_use]
     pub fn underruns(&self) -> u64 {
         self.underruns
+    }
+
+    /// Wakes that left a due key sound or BGM start waiting for a later
+    /// wake because the mixer's pending starts were full.
+    #[must_use]
+    pub fn deferred_wakes(&self) -> u64 {
+        self.deferred_wakes
     }
 
     /// Scheduled starts not kept because the log was full.
@@ -311,12 +320,17 @@ impl AudioEngine {
             let kind = ScheduledKind::Key { origin: cmd.origin };
             self.start(cmd.sound, kind, target);
         }
+        let mut deferred = !self.mixer.can_start() && !cmds.is_empty();
         out.write(|buf| {
             let block_end = self.written() + (buf.len() / CHANNELS) as u64;
             while let Some(&event) = self.bgm.get(self.next_bgm) {
                 let at = TimeUs(self.play_origin.0 + event.time.0 - self.output_offset.0);
                 let target = self.clock.frame_at(at).unwrap_or(0);
-                if target >= block_end || !self.mixer.can_start() {
+                if target >= block_end {
+                    break;
+                }
+                if !self.mixer.can_start() {
+                    deferred = true;
                     break;
                 }
                 self.next_bgm += 1;
@@ -326,6 +340,9 @@ impl AudioEngine {
             report.frames = (buf.len() / CHANNELS) as u32;
             self.mixer.render(&self.bank, buf);
         })?;
+        if deferred {
+            self.deferred_wakes += 1;
+        }
         report.active_voices = self.mixer.sounding();
         report.bgm_left = self.bgm.len() - self.next_bgm;
         Ok(report)

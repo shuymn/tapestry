@@ -122,6 +122,19 @@ impl AudioCounters {
     pub fn probes_dropped(&self) -> u64 {
         self.0.probes_dropped.load(Ordering::Acquire)
     }
+
+    /// Wakes since the engine started that left a due start for a later
+    /// wake, the mixer's pending starts full.
+    #[must_use]
+    pub fn deferred_wakes(&self) -> u64 {
+        self.0.deferred_wakes.load(Ordering::Acquire)
+    }
+
+    /// Voices the mixer stole at its voice limit since the engine started.
+    #[must_use]
+    pub fn steals(&self) -> u64 {
+        self.0.steals.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +158,10 @@ struct Shared {
     queue_answer: AtomicU64,
     /// Probe samples dropped on a full probe queue.
     probes_dropped: AtomicU64,
+    /// The engine's wakes that deferred a start so far.
+    deferred_wakes: AtomicU64,
+    /// The mixer's stolen voices so far.
+    steals: AtomicU64,
     failure: OnceLock<OutputError>,
 }
 
@@ -470,7 +487,15 @@ impl AudioWorker {
             return Ok(false);
         }
         self.change_queue(out);
-        let report = match self.engine.step(out, self.queue.commands()) {
+        let stepped = self.engine.step(out, self.queue.commands());
+        // A failed write may have mixed, and stolen voices, first.
+        self.shared
+            .deferred_wakes
+            .store(self.engine.deferred_wakes(), Ordering::Release);
+        self.shared
+            .steals
+            .store(self.engine.mixer().steals(), Ordering::Release);
+        let report = match stepped {
             Ok(report) => report,
             Err(e) => {
                 let _ = self.shared.failure.set(e);
