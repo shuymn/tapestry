@@ -5,10 +5,12 @@
 //! ```
 //!
 //! Every BMS/BME chart under the directory is loaded and played headlessly
-//! with autoplay through a whole session. Each must judge every judgeable
-//! note PERFECT, live evaluation must equal batch evaluation, and the saved
-//! log must decode to the record. One line per chart is printed with its
-//! number, note count and warning count; titles and paths never are.
+//! as an autoplay session (design.md "Autoplay"), so its generated input is
+//! planned and budgeted as production autoplay's is, whatever its density.
+//! Each must judge every judgeable note PERFECT, live evaluation must equal
+//! batch evaluation, and the record's log must decode to the record. One
+//! line per chart is printed with its number, note count and warning
+//! count; titles and paths never are.
 
 mod common;
 
@@ -23,7 +25,7 @@ use bms_parser::LoadError;
 use common::{PERIOD, RATE, count_judged, judgeable};
 use eval::{EvalError, EvalInput};
 use game::{
-    BmsIngest, ChartIngest, DataRoot, DeviceSettings, IngestError, Loaded, LogicError, Parts,
+    AutoplayError, BmsIngest, ChartIngest, DataRoot, IngestError, Loaded, LogicError, Parts,
     PlayEnd, PlayScript, RunnerAudio, SessionConfig, SessionError, Settings,
 };
 use input::{DeviceKind, ScriptedInput, SourceSet};
@@ -160,6 +162,17 @@ fn allowed(category: &str) -> bool {
     )
 }
 
+/// Why the logic refused a play, as a category.
+fn logic_category(e: &LogicError) -> &'static str {
+    match e {
+        LogicError::Eval(EvalError::UnsupportedLnMode(_)) => "unsupported long-note mode",
+        LogicError::Eval(EvalError::NoJudgeableNotes) => "no judgeable notes",
+        LogicError::Eval(_) => "evaluator refusal",
+        LogicError::RecordingTooLarge { .. } => "over the recording budget",
+        _ => "logic refusal",
+    }
+}
+
 /// Plays one chart; returns its note and warning counts, or why it was not
 /// played.
 fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
@@ -169,7 +182,8 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
         .unwrap();
     let root = DataRoot::new(dir.path().to_owned());
     let settings = Settings::load(&root).unwrap();
-    let parts = Parts::standard(&root, &settings.player);
+    // An autoplay session saves nothing; its record stays in memory.
+    let parts = Parts::unsaved(&settings.player);
     let config = SessionConfig {
         lead_in: TimeUs(1_000_000),
         step: TimeUs(1_000),
@@ -179,7 +193,7 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
         app_version: "sweep".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
-        autoplay: false,
+        autoplay: true,
     };
     let loaded = Loaded::load(root, settings, path, config, parts).map_err(|e| category(&e))?;
     let chart = loaded.chart().clone();
@@ -194,24 +208,23 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
             .map(|_| Sound::mono(vec![0; 1]))
             .collect(),
     );
-    let engine = AudioEngine::new(Arc::new(bank), &chart.bgm, RATE, PERIOD, MAX_VOICES, 0).unwrap();
+    let made = loaded.autoplay().map_err(|e| match e {
+        AutoplayError::Plan(e) => logic_category(&e),
+        AutoplayError::Time(_) => "autoplay time out of range",
+    })?;
+    let engine =
+        AudioEngine::with_schedule(Arc::new(bank), made.schedule, RATE, PERIOD, MAX_VOICES, 0)
+            .unwrap();
     let device = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
     let audio = RunnerAudio::new(engine, RecordingOutput::new(device, 0));
     let mut session = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
-    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
-    let events = input::autoplay(&chart, &profile.sources[0]).unwrap();
-    let input = ScriptedInput::from_log(&Default::default(), &events, &[DeviceKind::Keyboard]);
+    let input = ScriptedInput::from_log(&Default::default(), &made.events, &[DeviceKind::Keyboard]);
     let report = session
         .play(PlayScript {
             input,
             commands: Vec::new(),
         })
-        .map_err(|e| match e {
-            LogicError::Eval(EvalError::UnsupportedLnMode(_)) => "unsupported long-note mode",
-            LogicError::Eval(EvalError::NoJudgeableNotes) => "no judgeable notes",
-            LogicError::Eval(_) => "evaluator refusal",
-            _ => "logic refusal",
-        })?;
+        .map_err(|e| logic_category(&e))?;
 
     assert_eq!(report.end, PlayEnd::Completed);
     assert!(notes > 0);
@@ -230,8 +243,8 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
     .unwrap();
     assert_eq!(batch.events, report.live);
     assert!(report.result.as_ref().unwrap().matches_live);
-    let saved = &report.saved.as_ref().unwrap().as_ref().unwrap().path;
-    let decoded = replay::decode(&fs::read(saved).unwrap(), &DecodeLimits::STANDARD).unwrap();
+    assert!(report.saved.is_none());
+    let decoded = replay::decode(&replay::encode(record), &DecodeLimits::STANDARD).unwrap();
     assert_eq!(&decoded, record);
     Ok((notes, warnings))
 }
