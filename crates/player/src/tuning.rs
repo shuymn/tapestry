@@ -1,8 +1,8 @@
-//! The settings keys' values while the game runs (stage1.md PR16): the
-//! window thread steps them on F1 to F8, the render thread reads hi-speed
-//! and the display offset every frame, and the game thread forwards the
-//! volume to the audio thread, takes the input offset into the next play
-//! and writes the files when a play ends. Lock-free and allocation-free.
+//! The settings keys' values while the game runs (design.md "Input"): the
+//! window thread steps them on F1 to F8, the render thread reads hi-speed and
+//! the display offset every frame, and the game thread forwards the volume to
+//! the audio thread, takes the input offset into the next play and writes the
+//! files when a play ends. Lock-free and allocation-free.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -82,9 +82,10 @@ impl LiveTuning {
         self.version.load(Ordering::Acquire)
     }
 
-    /// One step of a settings key, from the window thread. The input
-    /// offset keys work on the end screen only, so a play never changes
-    /// its own input offset (D13). Returns whether a value changed.
+    /// One step of a settings key, from the window thread. The input offset
+    /// keys work on the end screen only, so a play never changes its own input
+    /// offset (design.md "Offset Changes and the Watermark"). Returns whether a
+    /// value changed.
     pub fn adjust(&self, a: Adjust) -> bool {
         let _step = self
             .step

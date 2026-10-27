@@ -1,5 +1,5 @@
 //! The game thread's rig: the play lifecycle of `game::live` on the real
-//! threads (D8, D13).
+//! threads (design.md "Overall Architecture", "Play Lifecycle").
 //!
 //! Each play has its own timeline: the input thread opens recording at a
 //! boundary and puts chart time 0 `lead_in` after it on the QPC clock. The
@@ -420,8 +420,9 @@ impl Rig for PlayerRig<'_> {
 
     fn before_play(&mut self, settings: &mut Settings) {
         // The input offset keys stop working here, so the play is evaluated
-        // with the input offset it starts with (D13); the other values
-        // are recorded as they are at the start.
+        // with the input offset it starts with (design.md "Offset Changes and
+        // the Watermark"); the other values are recorded as they are at the
+        // start.
         self.end_lines = None;
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);

@@ -13,8 +13,8 @@ use eval::{JudgeEvent, JudgeEventKind};
 use crate::logic::EventSink;
 
 /// Sends each key sound (`PlaySound`) to the audio command queue, with the
-/// receive time of the press behind it as the command's origin (stage1.md
-/// D11). Other events are not audio's concern.
+/// receive time of the press behind it as the command's origin (design.md
+/// "Latency Figures"). Other events are not audio's concern.
 ///
 /// The queue is sized from the play's event bound ([`Logic::max_events`]),
 /// so it cannot fill within a play; if it ever did, the sound would be

@@ -484,8 +484,8 @@ fn retry_with_a_key_held_down() {
     );
 }
 
-/// Input that reaches the queues after the abort, before recording closes,
-/// is kept in the record and not evaluated (D13).
+/// Input that reaches the queues after the abort, before recording closes, is
+/// kept in the record and not evaluated (design.md "Play Lifecycle").
 #[test]
 fn abort_and_close_drain_late_input_into_the_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -826,10 +826,10 @@ fn input_offset_change_applies_next_play_only() {
     assert_eq!(rig.pending_offset, Some(21_000));
 }
 
-/// Every logic step of a play reaches the rig's measurement (D11): each
-/// step that advanced has a finalization delay, and input to judgment
-/// appears exactly in the steps that judged a press, never in the others.
-/// The aborted first play's steps end at its abort.
+/// Every logic step of a play reaches the rig's measurement (design.md "Latency
+/// Figures"): each step that advanced has a finalization delay, and input to
+/// judgment appears exactly in the steps that judged a press, never in the
+/// others. The aborted first play's steps end at its abort.
 #[test]
 fn every_step_is_measured() {
     let dir = tempfile::tempdir().unwrap();

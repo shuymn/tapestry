@@ -1,9 +1,10 @@
-//! The window thread: the winit window and its events (D9). The window is
-//! borderless fullscreen on the primary monitor and takes no device events
-//! (Raw Input has one target window per device type per process, and the
-//! input thread owns it). Focus, the retry and quit keys, the settings
-//! keys F1 to F8 and closing go to [`Controls`]. The event loop runs on a thread of its own, so the game
-//! keeps the main thread and the loaded chart never has to move.
+//! The window thread: the winit window and its events (design.md "Rendering and
+//! Skins"). The window is borderless fullscreen on the primary monitor and
+//! takes no device events (Raw Input has one target window per device type per
+//! process, and the input thread owns it). Focus, the retry and quit keys, the
+//! settings keys F1 to F8 and closing go to [`Controls`]. The event loop runs
+//! on a thread of its own, so the game keeps the main thread and the loaded
+//! chart never has to move.
 
 use std::num::NonZeroIsize;
 use std::sync::Arc;

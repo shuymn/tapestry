@@ -1,8 +1,9 @@
-//! The settings changed from the keyboard while playing (stage1.md PR16):
+//! The settings changed from the keyboard while playing (design.md "Input"):
 //! hi-speed as the visible time, the master volume and the display offset
 //! anytime, and the input offset on the end screen, from the next play
-//! (D13). Each has a reserved key ([`Adjust`]) that no key config may bind,
-//! a step and a range; [`Tuning`] holds the four values and steps them.
+//! (design.md "Offset Changes and the Watermark"). Each has a reserved key
+//! ([`Adjust`]) that no key config may bind, a step and a range; [`Tuning`]
+//! holds the four values and steps them.
 
 use std::ops::RangeInclusive;
 
@@ -10,7 +11,7 @@ use bms_model::TimeUs;
 
 use crate::session::Settings;
 
-/// The visible time at first (D9; tuned by playing).
+/// The visible time at first (design.md "Algorithms"; tuned by playing).
 pub const DEFAULT_VISIBLE_TIME_MS: u32 = 600;
 /// The visible times a player can choose, ms.
 pub const VISIBLE_TIME_MS: RangeInclusive<u32> = 100..=4_000;

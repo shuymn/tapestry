@@ -1,6 +1,7 @@
-//! The play screen (D9): wgpu on DX12 with one instanced sprite pipeline
-//! over a texture atlas, an ASCII bitmap font baked into that atlas, and the
-//! skin boundary [`PlaySkin`] with its one implementation, [`SimpleSkin`].
+//! The play screen (design.md "Rendering and Skins"): wgpu on DX12 with one
+//! instanced sprite pipeline over a texture atlas, an ASCII bitmap font baked
+//! into that atlas, and the skin boundary [`PlaySkin`] with its one
+//! implementation, [`SimpleSkin`].
 //!
 //! [`Renderer`] draws into a borderless window's swap chain (FIFO, one frame
 //! of latency, the render thread waiting on the waitable object itself) or
@@ -11,9 +12,9 @@
 //! The app's per-frame work, the skin's build into the preallocated
 //! [`SpriteBatch`] and its staging into instances, allocates nothing.
 //!
-//! [`measure`] holds the pure frame and latency measurement of D11, and
-//! [`Renderer::frame_statistics`] reads the swap chain's DXGI frame
-//! statistics it pairs to frames.
+//! [`measure`] holds the pure frame and latency measurement of design.md
+//! "Latency Figures", and [`Renderer::frame_statistics`] reads the swap chain's
+//! DXGI frame statistics it pairs to frames.
 
 mod atlas;
 mod gpu;

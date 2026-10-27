@@ -1,19 +1,19 @@
-//! The audio thread's loop and its control (D8): the engine steps once
-//! per buffer event of its output for the whole run, and the game thread
-//! starts, cancels and seals each play through a preallocated SPSC queue.
-//! Nothing on the audio thread allocates or frees after construction: a
-//! play's command queue, retired at the next play, goes back to the game
-//! thread through a second preallocated queue and is dropped there.
+//! The audio thread's loop and its control (design.md "Overall Architecture"):
+//! the engine steps once per buffer event of its output for the whole run, and
+//! the game thread starts, cancels and seals each play through a preallocated
+//! SPSC queue. Nothing on the audio thread allocates or frees after
+//! construction: a play's command queue, retired at the next play, goes back to
+//! the game thread through a second preallocated queue and is dropped there.
 //!
-//! Before the first play the engine is stopped, so it writes silence and no
-//! BGM sounds during setup. Between plays the game thread may change the
-//! periods the output keeps queued; the audio thread applies the change at
-//! its next step and answers with what the output keeps. It also counts each
-//! play's underruns from its chart time 0 on, the steady state after the
-//! countdown. A sealed play (evaluation complete, no more key
-//! sounds) is reported done only once the audio thread has taken every
-//! command sent before the seal and every voice and BGM event has ended:
-//! the end of the audio tail (D13).
+//! Before the first play the engine is stopped, so it writes silence and no BGM
+//! sounds during setup. Between plays the game thread may change the periods
+//! the output keeps queued; the audio thread applies the change at its next
+//! step and answers with what the output keeps. It also counts each play's
+//! underruns from its chart time 0 on, the steady state after the countdown. A
+//! sealed play (evaluation complete, no more key sounds) is reported done only
+//! once the audio thread has taken every command sent before the seal and every
+//! voice and BGM event has ended: the end of the audio tail (design.md "Play
+//! Lifecycle").
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -70,8 +70,8 @@ pub enum AudioCtl {
     Exit,
 }
 
-/// What the audio thread measured for a play (D11), sent to whoever
-/// shows the figures.
+/// What the audio thread measured for a play (design.md "Latency Figures"),
+/// sent to whoever shows the figures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioProbe {
     /// The play it belongs to ([`AudioControl::generation`]).

@@ -119,8 +119,8 @@ pub use error::{LoadError, Warning, WarningKind};
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
 pub const LOADER_VERSION: u32 = 4;
 
-/// Bounds on the work a chart may cause (D14). The defaults sit far above
-/// real charts.
+/// Bounds on the work a chart may cause (design.md "Loading Limits"). The
+/// defaults sit far above real charts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Largest file accepted, in bytes.
@@ -133,7 +133,8 @@ pub struct Limits {
     pub max_measure: u16,
     /// Longest resolved chart accepted.
     pub max_duration: TimeUs,
-    /// Most bits in the denominator of the exact running time (D3).
+    /// Most bits in the denominator of the exact running time (design.md "Chart
+    /// Time").
     pub max_time_bits: u64,
 }
 

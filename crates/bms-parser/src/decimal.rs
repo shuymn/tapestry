@@ -3,11 +3,11 @@
 use num_bigint::BigInt;
 use num_rational::Ratio;
 
-/// An exact rational of arbitrary-precision integers (D3).
+/// An exact rational of arbitrary-precision integers (design.md "Chart Time").
 pub type Rational = Ratio<BigInt>;
 
-/// Fractional digits kept, counted after the exponent applies; further
-/// digits are cut off, rounding toward zero (D3).
+/// Fractional digits kept, counted after the exponent applies; further digits
+/// are cut off, rounding toward zero (design.md "Chart Time").
 pub const MAX_FRACTION_DIGITS: i64 = 18;
 /// At most this many integer digits, counted after the exponent applies and
 /// without leading zeros, so every value times 10^6 fits `i64`.

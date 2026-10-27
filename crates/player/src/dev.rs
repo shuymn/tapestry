@@ -32,7 +32,7 @@ use crate::render_side::{FrameSink, Screen};
 /// Prints, to the console only, which window took the foreground when the
 /// game's window lost focus: its process's executable name and its window
 /// class, with the time on the game's clock (µs since start). A focus loss
-/// aborts the play (D13), so this tells what did it.
+/// aborts the play (design.md "Play Lifecycle"), so this tells what did it.
 pub fn print_foreground(now: TimeUs) {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
@@ -226,7 +226,8 @@ pub fn script(log: &Path) -> anyhow::Result<ScriptedInput> {
 }
 
 /// Reads `path` if it holds at most `limit` bytes, reading no more than one
-/// byte past the limit: an input log is untrusted (D14).
+/// byte past the limit: an input log is untrusted (design.md "Input Log
+/// Format").
 fn read_bounded(path: &Path, limit: usize) -> anyhow::Result<Vec<u8>> {
     let read = || read_limited(fs::File::open(path)?, limit);
     read().with_context(|| path.display().to_string())

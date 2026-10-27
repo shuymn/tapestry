@@ -1,5 +1,5 @@
-//! The mix clock: which judgment-timeline time each output frame is mixed
-//! at (design.md "Aligning Audio to the Judgment Timeline"; stage1.md D12).
+//! The mix clock: which judgment-timeline time each output frame is mixed at
+//! (design.md "Aligning Audio to the Judgment Timeline").
 //!
 //! At each buffer event the audio thread observes the first frame still
 //! queued (frames written minus padding) and the time of the engine pass

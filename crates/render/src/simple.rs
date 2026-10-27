@@ -1,15 +1,15 @@
-//! The simple skin: a hard-coded 16:9 layout authored at 1920×1080 and
-//! scaled by the renderer (D9; design.md "Rendering and Skins").
+//! The simple skin: a hard-coded 16:9 layout authored at 1920×1080 and scaled
+//! by the renderer (design.md "Rendering and Skins").
 //!
 //! Notes are placed from the expected display time through the chart's
-//! [`ScrollMap`] and the hi-speed visible time (D9): the scale is fixed
-//! from the chart's initial BPM, so a note takes exactly `visible_time` from
-//! the lane top to the judgment line at the start BPM. During play notes
-//! move through scroll positions at that fixed scale, so BPM changes speed
-//! them up or slow them down and STOPs freeze them, as the chart intends,
-//! and nothing ever jumps. Only notes inside the visible range are visited,
-//! found per lane by binary search. A note judged by an effect is hidden
-//! through a per-note bit set sized in `prepare`.
+//! [`ScrollMap`] and the hi-speed visible time (design.md "Algorithms"): the
+//! scale is fixed from the chart's initial BPM, so a note takes exactly
+//! `visible_time` from the lane top to the judgment line at the start BPM.
+//! During play notes move through scroll positions at that fixed scale, so BPM
+//! changes speed them up or slow them down and STOPs freeze them, as the chart
+//! intends, and nothing ever jumps. Only notes inside the visible range are
+//! visited, found per lane by binary search. A note judged by an effect is
+//! hidden through a per-note bit set sized in `prepare`.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -533,7 +533,8 @@ const OVERLAY_TOP: f32 = 80.0;
 const OVERLAY_SCALE: f32 = 3.0;
 const OVERLAY_LINE: f32 = 28.0;
 
-/// The measurement overlay (D11): lines of text right of the lanes.
+/// The measurement overlay (design.md "Latency Figures"): lines of text right
+/// of the lanes.
 fn overlay(lines: &[&str], out: &mut SpriteBatch) {
     for (i, line) in lines.iter().enumerate() {
         let y = OVERLAY_TOP + i as f32 * OVERLAY_LINE;
@@ -621,9 +622,9 @@ pub fn text_screen(lines: &[&str], out: &mut SpriteBatch) {
     }
 }
 
-/// The countdown before chart time 0 (the lead-in, D13): "READY" where the
-/// judgment shows, and under it the time left in seconds, tenths rounded
-/// up, so it reads 0.1 until the chart starts.
+/// The countdown before chart time 0 (the lead-in, design.md "Play Lifecycle"):
+/// "READY" where the judgment shows, and under it the time left in seconds,
+/// tenths rounded up, so it reads 0.1 until the chart starts.
 fn countdown(out: &mut SpriteBatch, now: TimeUs) {
     let width = text_width(5, JUDGMENT_SCALE);
     let x = JUDGMENT_X - width / 2.0;

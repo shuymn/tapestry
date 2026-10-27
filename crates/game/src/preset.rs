@@ -1,6 +1,7 @@
-//! Rule presets as TOML files (stage1.md D1, D10). `rules` stays free of
-//! dependencies, so the file's shape lives here as a separate set of types
-//! that convert to and from [`RulePreset`] field by field.
+//! Rule presets as TOML files (design.md "Language and Crate Structure",
+//! "Settings Files"). `rules` stays free of dependencies, so the file's shape
+//! lives here as a separate set of types that convert to and from
+//! [`RulePreset`] field by field.
 //!
 //! Times are integer µs and gauge values raw units of 1/100000 %, so a file
 //! round-trips to the same canonical bytes and the same hash.

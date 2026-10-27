@@ -218,10 +218,10 @@ fn the_probe_reports_each_key_sound_with_its_play() {
     assert_eq!(counters.underruns(), 0);
 }
 
-/// Three missed buffer events leave the device without audio: the
-/// handle reads the engine's count of wakes that found the buffer empty
-/// (D11), which sees the starved stretch at least once and at most as
-/// often as the simulated device counted short passes.
+/// Three missed buffer events leave the device without audio: the handle reads
+/// the engine's count of wakes that found the buffer empty (design.md "Latency
+/// Figures"), which sees the starved stretch at least once and at most as often
+/// as the simulated device counted short passes.
 #[test]
 fn underruns_are_counted_as_the_device_saw_them() {
     let chart = chart();

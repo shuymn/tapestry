@@ -55,9 +55,10 @@ fn fs(v: VOut) -> @location(0) vec4f {
 
 /// Where frames go.
 pub enum Target {
-    /// A window's swap chain: FIFO, one frame of latency, the waitable
-    /// object left to [`Renderer::wait_for_frame`] (D9). The window is
-    /// borderless fullscreen; making it so is the window owner's job.
+    /// A window's swap chain: FIFO, one frame of latency, the waitable object
+    /// left to [`Renderer::wait_for_frame`] (design.md "Display Latency and
+    /// Stutter"). The window is borderless fullscreen; making it so is the
+    /// window owner's job.
     Window {
         /// The window to draw into.
         window: wgpu::SurfaceTarget<'static>,
@@ -111,8 +112,9 @@ pub enum RenderError {
 /// What one frame cost and drew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameTiming {
-    /// CPU time of update, build and submit, waits excluded: acquiring the
-    /// swap chain image and presenting are not counted (D11).
+    /// CPU time of update, build and submit, waits excluded: acquiring the swap
+    /// chain image and presenting are not counted (design.md "Latency
+    /// Figures").
     pub cpu: Duration,
     /// Sprites drawn.
     pub sprites: usize,
@@ -123,8 +125,9 @@ pub struct FrameTiming {
     /// image could not be acquired.
     pub presented: bool,
     /// The swap chain's present count of this frame, read right after its
-    /// present; `None` offscreen, for a frame not presented, or when the
-    /// call failed. It pairs the frame with its frame statistics (D11).
+    /// present; `None` offscreen, for a frame not presented, or when the call
+    /// failed. It pairs the frame with its frame statistics (design.md "Latency
+    /// Figures").
     pub present_count: Option<u32>,
 }
 
@@ -493,10 +496,10 @@ impl Renderer {
         })
     }
 
-    /// The swap chain's latest DXGI frame statistics (D11; design.md:136),
-    /// raw: `None` offscreen or when the call fails. Pair them with frames
-    /// through [`FrameTiming::present_count`] and filter them with
-    /// [`StatsFilter`](crate::measure::StatsFilter).
+    /// The swap chain's latest DXGI frame statistics (design.md "Latency
+    /// Figures", "Mapping the Three Clocks"), raw: `None` offscreen or when the
+    /// call fails. Pair them with frames through [`FrameTiming::present_count`]
+    /// and filter them with [`StatsFilter`](crate::measure::StatsFilter).
     #[must_use]
     pub fn frame_statistics(&self) -> Option<FrameStatistics> {
         let chain = self.chain()?;
@@ -580,8 +583,9 @@ pub fn build_frame(
     batch.stage(staging);
 }
 
-/// Submits every upload queued on `gpu` and waits until the GPU has done
-/// them, so none is left for the first frame of play (D9).
+/// Submits every upload queued on `gpu` and waits until the GPU has done them,
+/// so none is left for the first frame of play (design.md "Display Latency and
+/// Stutter").
 fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
     gpu.queue().submit([]);
     gpu.device()

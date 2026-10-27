@@ -6,7 +6,8 @@ use std::time::Duration;
 use game::{AbortCause, Chain, PlayEnd, PlayReport, Tuning};
 use rules::GaugeValue;
 
-/// How long loading took, shown on the end screen (D11).
+/// How long loading took, shown on the end screen (design.md "Latency
+/// Figures").
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadTimes {
     /// From the start of the process to the first play's first frame.
@@ -237,9 +238,9 @@ pub fn lines(
     l
 }
 
-/// The settings keys and their values, under the summary. The input
-/// offset applies from the next play (D13) of devices; autoplay plays
-/// with 0 whatever it is.
+/// The settings keys and their values, under the summary. The input offset
+/// applies from the next play (design.md "Offset Changes and the Watermark") of
+/// devices; autoplay plays with 0 whatever it is.
 pub fn settings_lines(t: Tuning) -> Vec<String> {
     vec![
         String::new(),

@@ -1,5 +1,5 @@
-//! Windows: WASAPI shared-mode output (design.md "Audio", "Path from Press
-//! to Sound"; stage1.md D12).
+//! Windows: WASAPI shared-mode output (design.md "Audio", "Path from Press to
+//! Sound").
 //!
 //! The stream runs on the default render endpoint in the endpoint's mix
 //! format, event-driven. `IAudioClient3` initializes it at the shortest

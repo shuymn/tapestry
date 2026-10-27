@@ -1,5 +1,6 @@
-//! One wake of the audio thread (stage1.md D12): observe the buffer event,
-//! drain sound commands, schedule BGM that falls in the block, render it.
+//! One wake of the audio thread (design.md "Aligning Audio to the Judgment
+//! Timeline"): observe the buffer event, drain sound commands, schedule BGM
+//! that falls in the block, render it.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -19,7 +20,8 @@ use crate::output::{AudioOutput, OutputError};
 pub struct SoundCmd {
     /// The sound.
     pub sound: SoundId,
-    /// The raw receive time of the input behind it (stage1.md D11).
+    /// The raw receive time of the input behind it (design.md "Latency
+    /// Figures").
     pub origin: TimeUs,
 }
 

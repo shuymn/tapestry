@@ -625,14 +625,13 @@ impl SourceSet {
         self.open_play(now, TimeUs(0))
     }
 
-    /// [`open_recording`](Self::open_recording) for a play whose time 0
-    /// lies at `origin` on the batch clock. Until recording closes, every
-    /// receive time recorded, every publication, every final watermark and
-    /// every arrival is the batch time minus `origin`: the logic thread
-    /// sees the play's timeline while the input thread keeps reading one
-    /// clock across plays (stage1.md D13: each play's chart time 0 lies
-    /// `lead_in` after its countdown starts). The snapshot's `opened_at` is
-    /// `now − origin`.
+    /// [`open_recording`](Self::open_recording) for a play whose time 0 lies at
+    /// `origin` on the batch clock. Until recording closes, every receive time
+    /// recorded, every publication, every final watermark and every arrival is
+    /// the batch time minus `origin`: the logic thread sees the play's timeline
+    /// while the input thread keeps reading one clock across plays (design.md
+    /// "Play Lifecycle": each play's chart time 0 lies `lead_in` after its
+    /// countdown starts). The snapshot's `opened_at` is `now − origin`.
     pub fn open_play(&mut self, now: TimeUs, origin: TimeUs) -> InputStart {
         self.close_recording();
         let taking = self.devices.iter().filter(|d| d.takes_part).count();

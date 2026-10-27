@@ -1,7 +1,7 @@
-//! The audio thread (D8): it opens the output on itself (WASAPI objects
-//! stay on the thread that made them), waits for the engine built from the
-//! bank at the output's rate, then runs `game`'s audio loop until the end
-//! of the run.
+//! The audio thread (design.md "Overall Architecture"): it opens the output on
+//! itself (WASAPI objects stay on the thread that made them), waits for the
+//! engine built from the bank at the output's rate, then runs `game`'s audio
+//! loop until the end of the run.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 

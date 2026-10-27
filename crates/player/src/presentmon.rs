@@ -1,8 +1,8 @@
-//! `tapestry measure play <chart>` (dev-tools, PR17): the play of
-//! `tapestry play` under a PresentMon capture of this process, then each
-//! saved play's lost refreshes, off-grid and never-displayed counts from
-//! the capture over its play span, by the counting rules of design.md
-//! "Frame Pacing in Refreshes", added to its `.measure.toml`.
+//! `tapestry measure play <chart>` (dev-tools, design.md "Latency Figures"):
+//! the play of `tapestry play` under a PresentMon capture of this process, then
+//! each saved play's lost refreshes, off-grid and never-displayed counts from
+//! the capture over its play span, by the counting rules of design.md "Frame
+//! Pacing in Refreshes", added to its `.measure.toml`.
 //!
 //! PresentMon is an external tool the user installs; it is never
 //! downloaded. It is found through the `TAPESTRY_PRESENTMON` setting (the

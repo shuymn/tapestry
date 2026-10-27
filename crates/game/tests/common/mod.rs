@@ -61,8 +61,9 @@ pub fn chart(count: i64, gap: i64, long: i64) -> Chart {
     b.build().unwrap()
 }
 
-/// The recording window's input capacity (D8): every bound button pressed
-/// and released 30 times a second from `start` to `end`, whole seconds up.
+/// The recording window's input capacity (design.md "Recording Capacity"):
+/// every bound button pressed and released 30 times a second from `start` to
+/// `end`, whole seconds up.
 pub fn window_capacity(start: TimeUs, end: TimeUs, buttons: usize) -> usize {
     let secs = u64::try_from(end.0 - start.0).unwrap().div_ceil(1_000_000);
     let secs = usize::try_from(secs).unwrap();

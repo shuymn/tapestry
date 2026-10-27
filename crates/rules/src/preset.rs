@@ -288,7 +288,7 @@ pub enum GaugeDelta {
     /// A fixed amount (negative for damage).
     Fixed(GaugeValue),
     /// A share of the per-note increment `floor(total_milli × 100 / notes)`
-    /// (D5): `floor(increment × num / den)`.
+    /// (design.md "Gauges and Session Policy"): `floor(increment × num / den)`.
     TotalShare {
         /// Numerator.
         num: u32,

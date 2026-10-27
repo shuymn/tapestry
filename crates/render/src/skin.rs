@@ -17,9 +17,10 @@ pub struct FrameInput<'a> {
     /// The display latency offset: how much later than `now` the frame is
     /// expected to reach the screen (design.md "Rendering and Skins").
     pub display_offset: TimeUs,
-    /// Hi-speed as the visible time (D9): how long a note's center takes
-    /// from the top of the lane to the judgment line while the chart scrolls
-    /// at its initial BPM. The note's edge shows slightly earlier.
+    /// Hi-speed as the visible time (design.md "Algorithms"): how long a note's
+    /// center takes from the top of the lane to the judgment line while the
+    /// chart scrolls at its initial BPM. The note's edge shows slightly
+    /// earlier.
     pub visible_time: TimeUs,
     /// The newest play state.
     pub view: &'a PlayView,
@@ -27,8 +28,8 @@ pub struct FrameInput<'a> {
     pub effects: &'a [JudgeEvent],
     /// Index into [`PlayView::gauges`] of the gauge to show.
     pub gauge: usize,
-    /// Lines of the measurement overlay (D11), drawn over the play; empty
-    /// when it is hidden.
+    /// Lines of the measurement overlay (design.md "Latency Figures"), drawn
+    /// over the play; empty when it is hidden.
     pub overlay: &'a [&'a str],
 }
 
