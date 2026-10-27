@@ -162,7 +162,7 @@ impl AutoRig {
     fn new(loaded: &Loaded) -> Self {
         let made = loaded.autoplay().unwrap();
         let sources = SourceSet::new(SourceConfig {
-            queue_capacity: made.events.len(),
+            queue_capacity: made.queue_capacity(),
             ..common::sources()
         })
         .unwrap();

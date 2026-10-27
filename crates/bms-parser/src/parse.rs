@@ -316,9 +316,11 @@ fn parse_header(
             Ok(rank) => source.meta.rank = Some(JudgeRank::Rank(rank)),
             Err(_) => ignore(warnings, "#RANK"),
         },
+        // A value below 1 is ignored, so an earlier #RANK stays, as in
+        // jbms-parser's BMSDecoder (its #DEFEXRANK handler: `if (rank >= 1)`).
         "DEFEXRANK" => match thousandths(value) {
-            Some(v) => source.meta.rank = Some(JudgeRank::DefExRankMilli(v)),
-            None => ignore(warnings, "#DEFEXRANK"),
+            Some(v) if v >= 1_000 => source.meta.rank = Some(JudgeRank::DefExRankMilli(v)),
+            _ => ignore(warnings, "#DEFEXRANK"),
         },
         "TOTAL" => match thousandths(value) {
             Some(v) => source.meta.total_milli = Some(v),

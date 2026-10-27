@@ -8,9 +8,9 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 3
+//! # Loader version 4
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 3; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 4; changing any of them
 //! changes the version.
 //!
 //! - **Time:** each object's time is accumulated in exact rationals and
@@ -25,7 +25,8 @@
 //!   warning. A BPM is at least 0.000001, and a negative one is an error,
 //!   since reverse scroll is not supported yet; the scroll map takes a BPM
 //!   in millionths rounded down, while time uses the exact value. `#TOTAL` and `#DEFEXRANK` are kept in thousandths rounded
-//!   down. A `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat)
+//!   down; a `#DEFEXRANK` below 1 is ignored with a warning, so an earlier
+//!   `#RANK` stays. A `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat)
 //!   whatever the measure length.
 //! - **Same position:** a BPM change applies before a STOP, so the STOP uses
 //!   the new BPM; a note at a STOP's position sounds at the STOP's start.
@@ -116,7 +117,7 @@ use bms_model::{Chart, ChartIdentity, ScrollMap, SoundId, SoundRef, TimeUs};
 pub use error::{LoadError, Warning, WarningKind};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 3;
+pub const LOADER_VERSION: u32 = 4;
 
 /// Bounds on the work a chart may cause (D14). The defaults sit far above
 /// real charts.

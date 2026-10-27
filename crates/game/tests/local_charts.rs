@@ -5,10 +5,12 @@
 //! ```
 //!
 //! Every BMS/BME chart under the directory is loaded and played headlessly
-//! with autoplay through a whole session. Each must judge every judgeable
-//! note PERFECT, live evaluation must equal batch evaluation, and the saved
-//! log must decode to the record. One line per chart is printed with its
-//! number, note count and warning count; titles and paths never are.
+//! as an autoplay session (design.md "Autoplay"), so its generated input is
+//! planned and budgeted as production autoplay's is, whatever its density.
+//! Each must judge every judgeable note PERFECT, live evaluation must equal
+//! batch evaluation, and the record's log must decode to the record. One
+//! line per chart is printed with its number, note count and warning
+//! count; titles and paths never are.
 
 mod common;
 
@@ -23,10 +25,10 @@ use bms_parser::LoadError;
 use common::{PERIOD, RATE, count_judged, judgeable};
 use eval::{EvalError, EvalInput};
 use game::{
-    BmsIngest, ChartIngest, DataRoot, DeviceSettings, IngestError, Loaded, LogicError, Parts,
+    AutoplayError, BmsIngest, ChartIngest, DataRoot, IngestError, Loaded, LogicError, Parts,
     PlayEnd, PlayScript, RunnerAudio, SessionConfig, SessionError, Settings,
 };
-use input::{DeviceKind, ScriptedInput, SourceSet};
+use input::{DeviceKind, ScriptedInput, SourceConfig, SourceSet};
 use replay::{BuildProvenance, DecodeLimits, ReceiveMethod};
 use rules::Judgment;
 
@@ -136,9 +138,9 @@ fn category(e: &SessionError) -> &'static str {
             | LoadError::TooManyLines { .. }
             | LoadError::TooManyObjects { .. }
             | LoadError::MeasureOutOfRange { .. }
-            | LoadError::DurationExceeded { .. } => "loading limit",
-            LoadError::InvalidValue { .. } => "invalid value",
-            LoadError::TimeOverflow { .. } => "time overflow",
+            | LoadError::DurationExceeded { .. }
+            | LoadError::TimeOverflow { .. } => "loading limit",
+            LoadError::InvalidValue { what, reason, .. } => invalid_value(what, reason),
             LoadError::SoundPathRejected { .. } | LoadError::SoundPathEscapes { .. } => {
                 "sound path outside the folder"
             }
@@ -152,12 +154,50 @@ fn category(e: &SessionError) -> &'static str {
     }
 }
 
+/// An invalid value's category: the refusals by policy by name, any other
+/// as "invalid value".
+fn invalid_value(what: &str, reason: &str) -> &'static str {
+    match (what, reason) {
+        ("#BPM" | "#BPMxx", r) if r.starts_with("negative BPM") => "negative BPM",
+        ("measure length", r) if r.starts_with("the measure has no length") => {
+            "zero-length measure"
+        }
+        ("#RANDOM" | "#SETRANDOM" | "#IF", "not a positive integer") => {
+            "malformed #RANDOM or #IF operand"
+        }
+        _ => "invalid value",
+    }
+}
+
 /// Categories of chart the stage 1 player refuses by design.
 fn allowed(category: &str) -> bool {
     matches!(
         category,
-        "unsupported directive" | "unsupported long-note mode" | "no judgeable notes"
+        "unsupported directive"
+            | "unsupported long-note mode"
+            | "no judgeable notes"
+            // Timing values are never replaced silently (stage1.md D3, PR3):
+            // reverse scroll is not supported yet, a measure of no length
+            // (as written or cut off to it) has no timing, and a malformed
+            // operand would decide which notes exist.
+            | "negative BPM"
+            | "zero-length measure"
+            | "malformed #RANDOM or #IF operand"
+            // The D14 limits: longer than 60 minutes, a file over 16 MiB, a
+            // measure past 999, an exact time past its size cap.
+            | "loading limit"
     )
+}
+
+/// Why the logic refused a play, as a category.
+fn logic_category(e: &LogicError) -> &'static str {
+    match e {
+        LogicError::Eval(EvalError::UnsupportedLnMode(_)) => "unsupported long-note mode",
+        LogicError::Eval(EvalError::NoJudgeableNotes) => "no judgeable notes",
+        LogicError::Eval(_) => "evaluator refusal",
+        LogicError::RecordingTooLarge { .. } => "over the recording budget",
+        _ => "logic refusal",
+    }
 }
 
 /// Plays one chart; returns its note and warning counts, or why it was not
@@ -169,7 +209,8 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
         .unwrap();
     let root = DataRoot::new(dir.path().to_owned());
     let settings = Settings::load(&root).unwrap();
-    let parts = Parts::standard(&root, &settings.player);
+    // An autoplay session saves nothing; its record stays in memory.
+    let parts = Parts::unsaved(&settings.player);
     let config = SessionConfig {
         lead_in: TimeUs(1_000_000),
         step: TimeUs(1_000),
@@ -179,7 +220,7 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
         app_version: "sweep".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
-        autoplay: false,
+        autoplay: true,
     };
     let loaded = Loaded::load(root, settings, path, config, parts).map_err(|e| category(&e))?;
     let chart = loaded.chart().clone();
@@ -194,24 +235,29 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
             .map(|_| Sound::mono(vec![0; 1]))
             .collect(),
     );
-    let engine = AudioEngine::new(Arc::new(bank), &chart.bgm, RATE, PERIOD, MAX_VOICES, 0).unwrap();
+    let made = loaded.autoplay().map_err(|e| match e {
+        AutoplayError::Plan(e) => logic_category(&e),
+        AutoplayError::Time(_) => "autoplay time out of range",
+    })?;
+    // The queue sized as production autoplay sizes it.
+    let sources = SourceSet::new(SourceConfig {
+        queue_capacity: made.queue_capacity(),
+        ..common::sources()
+    })
+    .unwrap();
+    let engine =
+        AudioEngine::with_schedule(Arc::new(bank), made.schedule, RATE, PERIOD, MAX_VOICES, 0)
+            .unwrap();
     let device = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
     let audio = RunnerAudio::new(engine, RecordingOutput::new(device, 0));
-    let mut session = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
-    let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
-    let events = input::autoplay(&chart, &profile.sources[0]).unwrap();
-    let input = ScriptedInput::from_log(&Default::default(), &events, &[DeviceKind::Keyboard]);
+    let mut session = loaded.start(audio, sources);
+    let input = ScriptedInput::from_log(&Default::default(), &made.events, &[DeviceKind::Keyboard]);
     let report = session
         .play(PlayScript {
             input,
             commands: Vec::new(),
         })
-        .map_err(|e| match e {
-            LogicError::Eval(EvalError::UnsupportedLnMode(_)) => "unsupported long-note mode",
-            LogicError::Eval(EvalError::NoJudgeableNotes) => "no judgeable notes",
-            LogicError::Eval(_) => "evaluator refusal",
-            _ => "logic refusal",
-        })?;
+        .map_err(|e| logic_category(&e))?;
 
     assert_eq!(report.end, PlayEnd::Completed);
     assert!(notes > 0);
@@ -230,8 +276,8 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
     .unwrap();
     assert_eq!(batch.events, report.live);
     assert!(report.result.as_ref().unwrap().matches_live);
-    let saved = &report.saved.as_ref().unwrap().as_ref().unwrap().path;
-    let decoded = replay::decode(&fs::read(saved).unwrap(), &DecodeLimits::STANDARD).unwrap();
+    assert!(report.saved.is_none());
+    let decoded = replay::decode(&replay::encode(record), &DecodeLimits::STANDARD).unwrap();
     assert_eq!(&decoded, record);
     Ok((notes, warnings))
 }
@@ -267,4 +313,26 @@ fn local_charts_sweep() {
     let unexpected: Vec<_> = refused.keys().filter(|c| !allowed(c)).collect();
     assert!(unexpected.is_empty(), "unexpected failures: {unexpected:?}");
     assert!(played > 0, "no chart could be played");
+}
+
+/// A burst denser than the test sources' queue between two polls: at 240
+/// thousand BPM a measure lasts 1 ms, and 72 notes on each of 8 lanes make
+/// 1,144 edges in it, of 1,152 in all (each lane's last release comes 50 ms
+/// later). Played as the sweep plays a chart, every note is PERFECT, so no
+/// generated event was dropped.
+#[test]
+fn a_burst_past_a_fixed_queue_is_played_whole() {
+    let dir = tempfile::Builder::new()
+        .prefix("burst")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let mut text = String::from("#BPM 240000\n#WAV01 click.wav\n");
+    let line = "01".repeat(72);
+    for channel in [11, 12, 13, 14, 15, 18, 19, 16] {
+        text.push_str(&format!("#001{channel}:{line}\n"));
+    }
+    let path = dir.path().join("burst.bms");
+    fs::write(&path, text).unwrap();
+    assert!(common::sources().queue_capacity < 2 * 8 * 72);
+    assert_eq!(sweep_one(&path), Ok((8 * 72, 0)));
 }
