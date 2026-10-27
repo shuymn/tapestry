@@ -152,6 +152,11 @@ dependencies = [
 [[package]]
 name = "bms-model"
 version = "0.0.0"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "proptest",
+]
 
 [[package]]
 name = "bms-parser"
@@ -1505,11 +1510,13 @@ name = "render"
 version = "0.0.0"
 dependencies = [
  "bms-model",
+ "bms-parser",
  "bytemuck",
  "eval",
  "game",
  "pollster",
  "rules",
+ "tempfile",
  "thiserror 2.0.21",
  "wgpu",
  "wgpu-hal",

@@ -69,7 +69,7 @@ fn ingest_load_and_model_errors_chain_to_the_model() {
         &[
             "the chart cannot be loaded",
             "resolved chart is invalid",
-            "time or position overflowed i64",
+            "time overflowed i64",
         ],
     );
     assert_eq!(source::<ModelError>(&load), &ModelError::Overflow);

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bms_model::{BgmEvent, LANE_COUNT, Note, NoteKind, SoundId, TimeUs};
+use bms_model::{BgmEvent, LANE_COUNT, Note, NoteKind, Position, SoundId, TimeUs};
 
 use crate::parse::ObjectKind;
 use crate::timing::Timed;
@@ -55,6 +55,7 @@ pub struct Resolved {
 #[derive(Clone, Copy)]
 struct Endpoint {
     time: TimeUs,
+    pos: Position,
     id: u16,
     seq: usize,
     line: usize,
@@ -100,6 +101,7 @@ pub fn resolve(
                     Some(start) => {
                         start.note.kind = NoteKind::Long {
                             end: obj.time,
+                            end_pos: obj.pos,
                             end_sound: None,
                         };
                     }
@@ -113,6 +115,7 @@ pub fn resolve(
                 candidates[l].push(Candidate {
                     note: Note {
                         time: obj.time,
+                        pos: obj.pos,
                         sound,
                         kind: NoteKind::Tap,
                     },
@@ -122,6 +125,7 @@ pub fn resolve(
             }
             ObjectKind::Long(lane, id) => endpoints[lane.index()].push(Endpoint {
                 time: obj.time,
+                pos: obj.pos,
                 id,
                 seq: obj.seq,
                 line: obj.line,
@@ -130,6 +134,7 @@ pub fn resolve(
                 candidates[lane.index()].push(Candidate {
                     note: Note {
                         time: obj.time,
+                        pos: obj.pos,
                         sound: None,
                         kind: NoteKind::Mine {
                             damage: i32::from(id),
@@ -183,9 +188,11 @@ fn pair_long_notes(
         out.push(Candidate {
             note: Note {
                 time: start.time,
+                pos: start.pos,
                 sound,
                 kind: NoteKind::Long {
                     end: end.time,
+                    end_pos: end.pos,
                     end_sound,
                 },
             },
@@ -232,7 +239,7 @@ fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Note> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use bms_model::{Lane, NoteKind, SoundId, TimeUs};
+    use bms_model::{Lane, NoteKind, Position, SoundId, TimeUs};
 
     use super::{Sounds, resolve};
     use crate::WarningKind;
@@ -242,6 +249,7 @@ mod tests {
     fn at(time: i64, kind: ObjectKind) -> Timed {
         Timed {
             time: TimeUs(time),
+            pos: Position(i128::from(time)),
             kind,
             line: usize::try_from(time).unwrap(),
             seq: 0,
@@ -289,6 +297,7 @@ mod tests {
                     Some(SoundId(0)),
                     NoteKind::Long {
                         end: TimeUs(20),
+                        end_pos: Position(20),
                         end_sound: None
                     }
                 ),

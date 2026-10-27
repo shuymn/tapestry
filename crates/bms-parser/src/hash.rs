@@ -1,6 +1,6 @@
 //! File hashes and the resolved-chart hash.
 
-use bms_model::{Chart, JudgeRank, LnMode, NoteKind, ScrollChange, SoundId};
+use bms_model::{Chart, JudgeRank, LnMode, NoteKind, SoundId};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 
@@ -10,41 +10,40 @@ pub fn file_hashes(bytes: &[u8]) -> ([u8; 32], [u8; 16]) {
 }
 
 /// SHA-256 over a canonical encoding of the resolved chart: loader version,
-/// scroll changes, notes, BGM, bar lines, sound names as written and header
+/// the scroll map (initial rate and segments), notes with their display
+/// positions, BGM, bar-line positions, sound names as written and header
 /// values. Resolved sound paths are left out, so moving the chart folder
 /// keeps the hash, and so are the `#RANDOM` results, which identify how the
 /// chart was resolved rather than what it resolved to; they stay in
 /// `ChartIdentity` beside the hash.
-pub fn resolved_hash(chart: &Chart, scroll: &[ScrollChange]) -> [u8; 32] {
+pub fn resolved_hash(chart: &Chart) -> [u8; 32] {
     let mut h = Encoder(Sha256::new());
     h.bytes(b"tapestry resolved chart");
     h.u64(u64::from(chart.identity.loader_version));
-    h.i64(chart.scroll.initial_bpm_micro());
-    h.len(scroll.len());
-    for change in scroll {
-        match *change {
-            ScrollChange::Bpm { at, bpm_micro } => {
-                h.u8(0);
-                h.i64(at.0);
-                h.i64(bpm_micro);
-            }
-            ScrollChange::Stop { at, len } => {
-                h.u8(1);
-                h.i64(at.0);
-                h.i64(len.0);
-            }
-        }
+    h.i128(chart.scroll.initial_rate());
+    let segments = chart.scroll.segments();
+    h.len(segments.len());
+    for s in segments {
+        h.i64(s.start.0);
+        h.i128(s.anchor.0);
+        h.i128(s.slope);
     }
     for lane in &chart.lanes {
         h.len(lane.len());
         for note in lane {
             h.i64(note.time.0);
+            h.i128(note.pos.0);
             h.sound(note.sound);
             match note.kind {
                 NoteKind::Tap => h.u8(0),
-                NoteKind::Long { end, end_sound } => {
+                NoteKind::Long {
+                    end,
+                    end_pos,
+                    end_sound,
+                } => {
                     h.u8(1);
                     h.i64(end.0);
+                    h.i128(end_pos.0);
                     h.sound(end_sound);
                 }
                 NoteKind::Mine { damage } => {
@@ -61,7 +60,7 @@ pub fn resolved_hash(chart: &Chart, scroll: &[ScrollChange]) -> [u8; 32] {
     }
     h.len(chart.bar_lines.len());
     for bar in &chart.bar_lines {
-        h.i64(bar.0);
+        h.i128(bar.0);
     }
     h.len(chart.sounds.len());
     for sound in &chart.sounds {
@@ -108,6 +107,10 @@ impl Encoder {
     }
 
     fn i64(&mut self, v: i64) {
+        self.0.update(v.to_le_bytes());
+    }
+
+    fn i128(&mut self, v: i128) {
         self.0.update(v.to_le_bytes());
     }
 

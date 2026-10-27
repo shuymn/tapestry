@@ -139,7 +139,8 @@ fn category(e: &SessionError) -> &'static str {
             | LoadError::TooManyObjects { .. }
             | LoadError::MeasureOutOfRange { .. }
             | LoadError::DurationExceeded { .. }
-            | LoadError::TimeOverflow { .. } => "loading limit",
+            | LoadError::TimeOverflow { .. }
+            | LoadError::PositionOverflow { .. } => "loading limit",
             LoadError::InvalidValue { what, reason, .. } => invalid_value(what, reason),
             LoadError::SoundPathRejected { .. } | LoadError::SoundPathEscapes { .. } => {
                 "sound path outside the folder"
@@ -151,6 +152,7 @@ fn category(e: &SessionError) -> &'static str {
         SessionError::InvalidStep(_) => "invalid step",
         SessionError::Io { .. } => "file error",
         SessionError::Preset(_) => "preset error",
+        SessionError::Transform(_) => "transform bug",
     }
 }
 

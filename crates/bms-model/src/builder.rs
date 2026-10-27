@@ -2,11 +2,13 @@
 
 use crate::{
     BgmEvent, Chart, ChartIdentity, ChartMeta, LANE_COUNT, Lane, ModelError, Note, NoteKind,
-    ScrollChange, ScrollMap, SoundId, SoundRef, TimeUs,
+    Position, ScrollChange, ScrollMap, SoundId, SoundRef, TimeUs,
 };
 
 /// Builds a [`Chart`] from notes, sounds and scroll changes given in any
-/// order. Notes and BGM are sorted by time, and the result is validated.
+/// order. Notes and BGM are sorted by time, each note head and long-note end
+/// is placed where the scroll map puts its time, and the result is
+/// validated.
 #[derive(Clone, Debug)]
 pub struct ChartBuilder {
     bpm_milli: i64,
@@ -35,6 +37,7 @@ impl ChartBuilder {
     fn note(mut self, lane: Lane, time: TimeUs, kind: NoteKind) -> Self {
         self.lanes[lane.index()].push(Note {
             time,
+            pos: Position(0),
             sound: None,
             kind,
         });
@@ -55,6 +58,7 @@ impl ChartBuilder {
             at,
             NoteKind::Long {
                 end,
+                end_pos: Position(0),
                 end_sound: None,
             },
         )
@@ -116,12 +120,19 @@ impl ChartBuilder {
                 *bpm_micro = to_micro(*bpm_micro)?;
             }
         }
+        let scroll = ScrollMap::new(to_micro(self.bpm_milli)?, &self.scroll)?;
+        for note in self.lanes.iter_mut().flatten() {
+            note.pos = scroll.position_at(note.time);
+            if let NoteKind::Long { end, end_pos, .. } = &mut note.kind {
+                *end_pos = scroll.position_at(*end);
+            }
+        }
         let chart = Chart {
             lanes: self.lanes,
             bgm: self.bgm,
             sounds: self.sounds,
             bar_lines: Vec::new(),
-            scroll: ScrollMap::new(to_micro(self.bpm_milli)?, &self.scroll)?,
+            scroll,
             meta: ChartMeta::default(),
             identity: ChartIdentity::default(),
         };
@@ -133,7 +144,7 @@ impl ChartBuilder {
 #[cfg(test)]
 mod tests {
     use super::ChartBuilder;
-    use crate::{Lane, ModelError, NoteKind, Position, SoundId, TimeUs};
+    use crate::{BEAT, Lane, ModelError, NoteKind, Position, SoundId, TimeUs};
 
     const BPM_150: i64 = 150_000;
 
@@ -160,9 +171,13 @@ mod tests {
             lane1[0].kind,
             NoteKind::Long {
                 end: TimeUs(1_500),
+                end_pos: chart.scroll.position_at(TimeUs(1_500)),
                 end_sound: None
             }
         );
+        // Each note sits where the map puts its time.
+        assert_eq!(lane1[0].pos, chart.scroll.position_at(TimeUs(500)));
+        assert_eq!(lane1[1].pos, chart.scroll.position_at(TimeUs(2_000)));
         assert_eq!(lane1[1].kind, NoteKind::Tap);
         assert_eq!(chart.lanes[0][0].kind, NoteKind::Mine { damage: 20 });
         assert_eq!(chart.bgm.len(), 2);
@@ -172,7 +187,11 @@ mod tests {
             chart.scroll.position_at(TimeUs(1_000)),
             chart.scroll.position_at(TimeUs(1_250))
         );
-        assert_eq!(chart.scroll.position_at(TimeUs(1_000)), Position(2_500));
+        // 1 ms at 150 BPM: 0.0025 beat.
+        assert_eq!(
+            chart.scroll.position_at(TimeUs(1_000)),
+            Position(BEAT / 400)
+        );
     }
 
     #[test]
@@ -258,7 +277,44 @@ mod tests {
         ] {
             chart.lanes[6][0].kind = NoteKind::Long {
                 end: TimeUs(20),
+                end_pos: chart.lanes[6][0].end_pos(),
                 end_sound: Some(end_sound),
+            };
+            assert_eq!(chart.validate(), expected);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_positions_before_the_previous_end() {
+        let lane = key(4);
+        let mut chart = ChartBuilder::new(BPM_150)
+            .long(lane, TimeUs(1_000), TimeUs(2_000))
+            .tap(lane, TimeUs(3_000))
+            .build()
+            .unwrap();
+        let end = chart.lanes[4][0].end_pos();
+        // Equal positions are kept (a STOP holds them); a head before the
+        // previous end, or an end before its head, is not.
+        chart.lanes[4][1].pos = end;
+        assert_eq!(chart.validate(), Ok(()));
+        chart.lanes[4][1].pos = Position(end.0 - 1);
+        assert_eq!(
+            chart.validate(),
+            Err(ModelError::PositionsUnsorted { lane, index: 1 })
+        );
+        chart.lanes[4][1].pos = end;
+        let head = chart.lanes[4][0].pos;
+        for (end_pos, expected) in [
+            (head, Ok(())),
+            (
+                Position(head.0 - 1),
+                Err(ModelError::PositionsUnsorted { lane, index: 0 }),
+            ),
+        ] {
+            chart.lanes[4][0].kind = NoteKind::Long {
+                end: TimeUs(2_000),
+                end_pos,
+                end_sound: None,
             };
             assert_eq!(chart.validate(), expected);
         }
@@ -276,9 +332,9 @@ mod tests {
         assert_eq!(chart.validate(), Err(ModelError::BgmUnsorted { index: 1 }));
         chart.bgm.swap(0, 1);
 
-        chart.bar_lines = vec![TimeUs(10), TimeUs(10), TimeUs(20)];
+        chart.bar_lines = vec![Position(10), Position(10), Position(20)];
         assert_eq!(chart.validate(), Ok(()));
-        chart.bar_lines = vec![TimeUs(10), TimeUs(30), TimeUs(20)];
+        chart.bar_lines = vec![Position(10), Position(30), Position(20)];
         assert_eq!(
             chart.validate(),
             Err(ModelError::BarLinesUnsorted { index: 2 })
@@ -292,13 +348,17 @@ mod tests {
             .bpm(TimeUs(1_000), 60_500)
             .build()
             .unwrap();
-        assert_eq!(chart.scroll.initial_bpm_micro(), 150_000_000);
-        assert_eq!(chart.scroll.position_at(TimeUs(1_000)), Position(2_500));
-        // 120_000 µs at 60.5 BPM: 120_000 * 60_500_000 / 60_000_000 = 121_000.
+        // floor(2^80 × 2.5e-6) units per µs.
+        assert_eq!(chart.scroll.initial_rate(), BEAT / 400_000);
         assert_eq!(
-            chart.scroll.position_at(TimeUs(121_000)),
-            Position(2_500 + 121_000)
+            chart.scroll.position_at(TimeUs(1_000)),
+            Position(BEAT / 400)
         );
+        // 120_000 µs at 60.5 BPM is 0.121 beat, 0.1235 beat in all; the
+        // map stays at or below it, within a unit per µs since the change.
+        let exact = BEAT * 247 / 2_000;
+        let d = exact - chart.scroll.position_at(TimeUs(121_000)).0;
+        assert!((0..=120_000).contains(&d), "{d}");
         assert_eq!(
             ChartBuilder::new(i64::MAX).build(),
             Err(ModelError::Overflow)

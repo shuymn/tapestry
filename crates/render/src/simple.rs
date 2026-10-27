@@ -1,15 +1,16 @@
 //! The simple skin: a hard-coded 16:9 layout authored at 1920×1080 and scaled
 //! by the renderer (design.md "Rendering and Skins").
 //!
-//! Notes are placed from the expected display time through the chart's
-//! [`ScrollMap`] and the hi-speed visible time (design.md "Algorithms"): the
-//! scale is fixed from the chart's initial BPM, so a note takes exactly
-//! `visible_time` from the lane top to the judgment line at the start BPM.
-//! During play notes move through scroll positions at that fixed scale, so BPM
-//! changes speed them up or slow them down and STOPs freeze them, as the chart
-//! intends, and nothing ever jumps. Only notes inside the visible range are
-//! visited, found per lane by binary search. A note judged by an effect is
-//! hidden through a per-note bit set sized in `prepare`.
+//! Notes and bar lines sit at their stored display positions, and the
+//! chart's [`ScrollMap`] gives the playhead at the expected display time
+//! (design.md "Algorithms"). The hi-speed scale is fixed from the chart's
+//! initial rate, so a note takes exactly `visible_time` from the lane top to
+//! the judgment line at the start BPM. During play notes move through scroll
+//! positions at that fixed scale, so BPM changes speed them up or slow them
+//! down and STOPs freeze them, as the chart intends, and nothing ever jumps.
+//! Only notes whose positions meet the visible range are visited, found per
+//! lane by binary search on positions. A note judged by an effect is hidden
+//! through a per-note bit set sized in `prepare`.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -23,7 +24,7 @@ use crate::{Blend, FrameInput, Gpu, PlaySkin, SkinError, Sprite, SpriteBatch};
 /// The layout, in layout pixels of the 1920×1080 base resolution, and the
 /// placement of notes in it.
 pub mod layout {
-    use bms_model::{Lane, ScrollMap, TimeUs};
+    use bms_model::{Lane, Position, ScrollMap, TimeUs};
 
     /// Base width the layout is authored at.
     pub const WIDTH: f32 = 1920.0;
@@ -47,8 +48,6 @@ pub mod layout {
     pub const LANE_BOTTOM: f32 = 960.0;
     /// Height of a note; a note's position is its vertical center.
     pub const NOTE_H: f32 = 16.0;
-    /// Microseconds per minute, which turns a BPM into a scroll rate.
-    const US_PER_MINUTE: f64 = 60_000_000.0;
 
     /// Left edge and width of `lane`.
     #[must_use]
@@ -59,13 +58,13 @@ pub mod layout {
         }
     }
 
-    /// Where the scroll stands for one frame: the display position at the
-    /// display time and the pixels per unit of position.
+    /// Where the scroll stands for one frame: the playhead at the display
+    /// time and the pixels per unit of position.
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct Scale {
         /// The display position at the judgment line.
-        pub at_line: i64,
-        /// Pixels per millionth of a beat.
+        pub at_line: Position,
+        /// Pixels per unit of position (2^-80 beat).
         pub px_per_pos: f64,
     }
 
@@ -74,24 +73,22 @@ pub mod layout {
         /// visible time below 1 µs counts as 1 µs.
         ///
         /// The lane from [`LANE_TOP`] to [`JUDGE_Y`] holds the scroll of
-        /// `visible_time` at the chart's initial BPM. The pixels per
+        /// `visible_time` at the chart's initial rate. The pixels per
         /// position never change during a play, whatever the BPM at `at`.
         #[must_use]
         pub fn new(scroll: &ScrollMap, at: TimeUs, visible_time: TimeUs) -> Self {
             let visible = visible_time.0.max(1) as f64;
-            let bpm_micro = scroll.initial_bpm_micro() as f64;
-            // Position units per µs are bpm_micro / US_PER_MINUTE.
-            let span = visible * bpm_micro / US_PER_MINUTE;
+            let span = visible * scroll.initial_rate() as f64;
             Self {
-                at_line: scroll.position_at(at).0,
+                at_line: scroll.position_at(at),
                 px_per_pos: f64::from(JUDGE_Y - LANE_TOP) / span,
             }
         }
 
         /// The vertical center of something at display position `p`.
         #[must_use]
-        pub fn y(&self, p: i64) -> f32 {
-            let ahead = (i128::from(p) - i128::from(self.at_line)) as f64;
+        pub fn y(&self, p: Position) -> f32 {
+            let ahead = p.minus(self.at_line) as f64;
             (f64::from(JUDGE_Y) - ahead * self.px_per_pos) as f32
         }
 
@@ -99,20 +96,20 @@ pub mod layout {
         /// the judgment line through `above` pixels over it, widened to
         /// whole units.
         #[must_use]
-        pub fn positions(&self, below: f32, above: f32) -> (i64, i64) {
-            let units = |px: f32| (f64::from(px) / self.px_per_pos).ceil() as i64;
+        pub fn positions(&self, below: f32, above: f32) -> (Position, Position) {
+            let units = |px: f32| (f64::from(px) / self.px_per_pos).ceil() as i128;
             (
-                self.at_line.saturating_sub(units(below)),
-                self.at_line.saturating_add(units(above)),
+                Position(self.at_line.0.saturating_sub(units(below))),
+                Position(self.at_line.0.saturating_add(units(above))),
             )
         }
     }
 
-    /// The vertical center of a note at `time` in a frame displayed at `at`
-    /// with hi-speed `visible_time`.
+    /// The vertical center of something at display position `pos` in a
+    /// frame displayed at `at` with hi-speed `visible_time`.
     #[must_use]
-    pub fn note_y(scroll: &ScrollMap, time: TimeUs, at: TimeUs, visible_time: TimeUs) -> f32 {
-        Scale::new(scroll, at, visible_time).y(scroll.position_at(time).0)
+    pub fn note_y(scroll: &ScrollMap, pos: Position, at: TimeUs, visible_time: TimeUs) -> f32 {
+        Scale::new(scroll, at, visible_time).y(pos)
     }
 }
 
@@ -191,7 +188,7 @@ impl Bits {
 #[derive(Debug)]
 pub struct SimpleSkin {
     lanes: [Vec<Note>; LANE_COUNT],
-    bar_lines: Vec<TimeUs>,
+    bar_lines: Vec<Position>,
     scroll: ScrollMap,
     /// Heads of long notes judged and held.
     held: [Bits; LANE_COUNT],
@@ -333,10 +330,10 @@ impl SimpleSkin {
         );
     }
 
-    fn bar_lines(&self, out: &mut SpriteBatch, scale: &Scale, from: TimeUs, to: TimeUs) {
-        let start = self.bar_lines.partition_point(|&t| t < from);
-        for &t in self.bar_lines.iter().skip(start).take_while(|&&t| t <= to) {
-            let y = scale.y(self.scroll.position_at(t).0);
+    fn bar_lines(&self, out: &mut SpriteBatch, scale: &Scale, from: Position, to: Position) {
+        let start = self.bar_lines.partition_point(|&p| p < from);
+        for &p in self.bar_lines.iter().skip(start).take_while(|&&p| p <= to) {
+            let y = scale.y(p);
             if !cap(
                 out,
                 LANE_LEFT,
@@ -350,7 +347,7 @@ impl SimpleSkin {
         }
     }
 
-    fn notes(&self, out: &mut SpriteBatch, scale: &Scale, from: TimeUs, to: TimeUs) {
+    fn notes(&self, out: &mut SpriteBatch, scale: &Scale, from: Position, to: Position) {
         for lane in Lane::all() {
             let l = lane.index();
             #[expect(
@@ -360,9 +357,11 @@ impl SimpleSkin {
             let notes = &self.lanes[l];
             let (x, w) = layout::lane_x(lane);
             let color = note_color(lane);
-            let start = notes.partition_point(|n| n.end() < from);
+            // Positions never decrease along a lane (`Chart::validate`), so
+            // the notes meeting [from, to] are one run.
+            let start = notes.partition_point(|n| n.end_pos() < from);
             for (i, note) in notes.iter().enumerate().skip(start) {
-                if note.time > to {
+                if note.pos > to {
                     break;
                 }
                 #[expect(
@@ -372,12 +371,12 @@ impl SimpleSkin {
                 if self.done[l].get(i) {
                     continue;
                 }
-                let head = scale.y(self.scroll.position_at(note.time).0);
+                let head = scale.y(note.pos);
                 let pushed = match note.kind {
                     NoteKind::Tap => cap(out, x, w, head, NOTE_H, color),
                     NoteKind::Mine { .. } => cap(out, x, w, head, MINE_H, MINE),
-                    NoteKind::Long { end, .. } => {
-                        let tail = scale.y(self.scroll.position_at(end).0);
+                    NoteKind::Long { end_pos, .. } => {
+                        let tail = scale.y(end_pos);
                         // A held head stays on the judgment line.
                         #[expect(
                             clippy::indexing_slicing,
@@ -509,8 +508,7 @@ impl PlaySkin for SimpleSkin {
         let at = f.display_time();
         let scale = Scale::new(&self.scroll, at, f.visible_time);
         let half = NOTE_H / 2.0;
-        let (lo, hi) = scale.positions(LANE_BOTTOM - JUDGE_Y + half, JUDGE_Y - LANE_TOP + half);
-        let (from, to) = self.scroll.time_range(Position(lo), Position(hi));
+        let (from, to) = scale.positions(LANE_BOTTOM - JUDGE_Y + half, JUDGE_Y - LANE_TOP + half);
         Self::lanes_and_lines(out);
         self.bar_lines(out, &scale, from, to);
         let w = LANES_RIGHT - LANE_LEFT;
@@ -861,12 +859,158 @@ mod tests {
         assert_eq!(in_lane(&roomy, lane(7), NOTE_WHITE).len(), 3_000);
     }
 
+    /// Loads BMS `text` as a session does: the loader, then the transform
+    /// and the validation of its output.
+    fn loaded(text: &str) -> Chart {
+        use game::ChartTransform;
+        let dir = tempfile::tempdir().unwrap();
+        let opts = bms_parser::LoadOptions::default();
+        let chart = bms_parser::load_bms(text.as_bytes(), dir.path(), &opts)
+            .unwrap()
+            .chart;
+        let chart = game::Passthrough.apply(chart, 0);
+        chart.validate().unwrap();
+        chart
+    }
+
+    #[test]
+    fn loaded_notes_and_bar_lines_sit_at_their_exact_beats() {
+        // Quarter-beat measures at 9,990,400 BPM: measure k starts at beat
+        // k/4, k × 1.5014416... µs, so its notes sound on floored µs (1, 3,
+        // 4, ...). Taps on key 1 at measures 1-6, a long note on key 2 from
+        // measure 2 to 5, a last tap on key 3 at measure 9.
+        let mut text = String::from("#BPM 9990400\n#LNTYPE 1\n#WAV01 a.wav\n");
+        for m in 0..=9 {
+            text.push_str(&format!("#{m:03}02:0.0625\n"));
+        }
+        for m in 1..=6 {
+            text.push_str(&format!("#{m:03}11:01\n"));
+        }
+        text.push_str("#00252:01\n#00552:01\n#00913:01\n");
+        let chart = loaded(&text);
+        let mut s = skin(&chart);
+        let v = view();
+        // The playhead at 1 µs, 10 µs visible: 800 px over 10 µs of the
+        // start BPM, so 80 px per µs of scroll at 9,990,400 BPM.
+        let f = FrameInput {
+            visible_time: TimeUs(10),
+            ..frame(&v, 1, &[])
+        };
+        let batch = build(&mut s, &f);
+        // By hand: beat k/4 is k × 15e6 / 9_990_400 µs of scroll, drawn
+        // 80 px per µs above the line once past the playhead's 1 µs:
+        // measure 1 at 880 - 80 × 0.5014416... = 839.8847 px, where its
+        // floored time (1 µs) would put it on the line.
+        let y = |k: i32| 880.0 - 80.0 * (f64::from(k) * 15e6 / 9_990_400.0 - 1.0);
+        assert!((y(1) - 839.884_7).abs() < 1e-3);
+        let centers = |rects: Vec<[f32; 4]>| -> Vec<f64> {
+            rects.iter().map(|r| f64::from(r[1] + r[3] / 2.0)).collect()
+        };
+        let close = |got: Vec<f64>, want: Vec<f64>| {
+            assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-3, "{got:?} vs {want:?}");
+            }
+        };
+        close(
+            centers(in_lane(&batch, lane(1), NOTE_WHITE)),
+            (1..=6).map(y).collect(),
+        );
+        // The long note's end cap (measure 5), then its head (measure 2).
+        close(
+            centers(in_lane(&batch, lane(2), NOTE_BLUE)),
+            vec![y(5), y(2)],
+        );
+        let bars: Vec<[f32; 4]> = batch
+            .alpha()
+            .iter()
+            .filter(|s| s.color == BAR_LINE && s.rect[3] == BAR_LINE_H)
+            .map(|s| s.rect)
+            .collect();
+        // Bar lines 1-7 lie wholly inside the lanes (y from 80 to 960).
+        close(centers(bars), (1..=7).map(y).collect());
+    }
+
+    #[test]
+    fn bar_lines_of_equal_measures_are_drawn_evenly() {
+        // Quarter-beat measures at 9,990,400 BPM last 1.5014... µs each, so
+        // their floored times step by 1 or 2 µs; their positions are
+        // exactly a quarter beat apart. Over a 10 µs visible time a quarter
+        // beat is 120.1... px.
+        let mut text = String::from("#BPM 9990400\n#WAV01 a.wav\n");
+        for m in 0..=64 {
+            text.push_str(&format!("#{m:03}02:0.0625\n"));
+        }
+        text.push_str("#06411:01\n");
+        let chart = loaded(&text);
+        let mut s = skin(&chart);
+        let v = view();
+        let f = FrameInput {
+            visible_time: TimeUs(10),
+            ..frame(&v, 40, &[])
+        };
+        let batch = build(&mut s, &f);
+        let ys: Vec<f32> = batch
+            .alpha()
+            .iter()
+            .filter(|s| s.color == BAR_LINE && s.rect[3] == BAR_LINE_H)
+            .map(|s| s.rect[1])
+            .collect();
+        assert!(ys.len() >= 6, "{ys:?}");
+        let quarter = 800.0 / (10.0 * 9_990_400.0 / 60_000_000.0) / 4.0;
+        for w in ys.windows(2) {
+            let gap = w[0] - w[1];
+            assert!((gap - quarter).abs() < 1e-2, "{ys:?}");
+        }
+    }
+
+    #[test]
+    fn drawn_notes_are_those_whose_span_meets_the_visible_range() {
+        // 150 BPM: a beat is 400 ms, 1.5 beats over 800 px at 600 ms. Taps
+        // every sixteenth beat on key 1 for 8 measures; a long note on key
+        // 2 from measure 1 to measure 6; a tap on key 3 in measure 7.
+        let mut text = String::from("#BPM 150\n#LNTYPE 1\n#WAV01 a.wav\n");
+        let sixteenths = "01".repeat(64);
+        for m in 0..8 {
+            text.push_str(&format!("#{m:03}11:{sixteenths}\n"));
+        }
+        text.push_str("#00152:01\n#00652:01\n#00713:01\n");
+        let chart = loaded(&text);
+        let mut s = skin(&chart);
+        let v = view();
+        // Display at 3.31 s, beat 8.275: the judgment line is past measure
+        // 2's start and the long note covers the lanes.
+        let now = 3_310 * MS;
+        let batch = build(&mut s, &frame(&v, now, &[]));
+        // Independently: tap k sits at k/16 beat; its center is drawn
+        // 800 px per 1.5 beats above the line for each beat ahead, and it
+        // shows while its center is within half a note of the lanes.
+        let playhead = 8.275;
+        let expected = (0..8 * 64)
+            .filter(|&k| {
+                let ahead = f64::from(k) / 16.0 - playhead;
+                let y = 880.0 - ahead * 800.0 / 1.5;
+                y > f64::from(LANE_TOP - NOTE_H / 2.0) && y < f64::from(LANE_BOTTOM + NOTE_H / 2.0)
+            })
+            .count();
+        assert!(expected > 20);
+        assert_eq!(in_lane(&batch, lane(1), NOTE_WHITE).len(), expected);
+        let body = shade(NOTE_BLUE, LN_BODY_SHADE);
+        assert_eq!(
+            in_lane(&batch, lane(2), body),
+            [[320.0, LANE_TOP, 64.0, LANE_BOTTOM - LANE_TOP]]
+        );
+        assert!(in_lane(&batch, lane(2), NOTE_BLUE).is_empty());
+        assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());
+    }
+
     #[test]
     fn visible_time_below_a_microsecond_counts_as_one() {
         let chart = ChartBuilder::new(BPM).build().unwrap();
         let one = layout::Scale::new(&chart.scroll, TimeUs(0), TimeUs(1));
-        // 1 µs of 150 BPM is 2.5 millionths of a beat on 800 px.
-        assert!((one.px_per_pos - 320.0).abs() < 1e-9);
+        // 1 µs of 150 BPM (2.5 millionths of a beat) on 800 px.
+        let beat = (1_u128 << 80) as f64;
+        assert!((one.px_per_pos * beat * 2.5e-6 - 800.0).abs() < 1e-6);
         for v in [0, -5, i64::MIN] {
             assert_eq!(layout::Scale::new(&chart.scroll, TimeUs(0), TimeUs(v)), one);
         }

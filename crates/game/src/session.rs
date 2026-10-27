@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
-use bms_model::{BgmEvent, Chart, TimeSource, TimeUs, VirtualClock};
+use bms_model::{BgmEvent, Chart, ModelError, TimeSource, TimeUs, VirtualClock};
 use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
 use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
@@ -203,6 +203,10 @@ pub enum SessionError {
     /// The preset file could not be used.
     #[error(transparent)]
     Preset(PresetError),
+    /// The chart transform's output breaks a chart invariant
+    /// ([`Chart::validate`]).
+    #[error("the transformed chart is invalid")]
+    Transform(#[source] ModelError),
 }
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> SessionError + '_ {
@@ -427,6 +431,10 @@ impl Loaded {
             .map_err(SessionError::Ingest)?;
         let identity = ingested.chart.identity.clone();
         let chart = parts.transform.apply(ingested.chart, config.seed);
+        // Rendering culls by position and evaluation walks lanes in time
+        // order: a transform must keep both orders (design.md "Chart
+        // Model").
+        chart.validate().map_err(SessionError::Transform)?;
         let chart_record = ChartRecord {
             identity,
             random_seed: config.seed,

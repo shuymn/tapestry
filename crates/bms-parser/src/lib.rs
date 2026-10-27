@@ -1,4 +1,5 @@
-//! BMS chart loader: chart text to a resolved [`Chart`] in integer µs.
+//! BMS chart loader: chart text to a resolved [`Chart`], with judgment times
+//! in integer µs and display positions in fractions of a beat.
 //!
 //! Supports `#PLAYER 1` 7-key + scratch charts. Charts and sounds are
 //! untrusted: every limit in [`Limits`] is checked before the work it bounds,
@@ -8,9 +9,9 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 4
+//! # Loader version 5
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 4; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 5; changing any of them
 //! changes the version.
 //!
 //! - **Time:** each object's time is accumulated in exact rationals and
@@ -23,11 +24,19 @@
 //!   value is an error, and so is a measure length of 0, as written or cut
 //!   off to it; a malformed `#TOTAL` or `#DEFEXRANK` is ignored with a
 //!   warning. A BPM is at least 0.000001, and a negative one is an error,
-//!   since reverse scroll is not supported yet; the scroll map takes a BPM
-//!   in millionths rounded down, while time uses the exact value. `#TOTAL` and `#DEFEXRANK` are kept in thousandths rounded
-//!   down; a `#DEFEXRANK` below 1 is ignored with a warning, so an earlier
-//!   `#RANK` stays. A `#STOPxx` value counts 1/192 of a 4/4 measure (1/48 beat)
-//!   whatever the measure length.
+//!   since reverse scroll is not supported yet. `#TOTAL` and `#DEFEXRANK`
+//!   are kept in thousandths rounded down; a `#DEFEXRANK` below 1 is ignored
+//!   with a warning, so an earlier `#RANK` stays. A `#STOPxx` value counts
+//!   1/192 of a 4/4 measure (1/48 beat) whatever the measure length.
+//! - **Display:** a note head, long-note end or bar line sits at its exact
+//!   beat count floored once to 2^-80 beat; STOPs and BPM changes add no
+//!   beats. The scroll map has a segment per BPM change, STOP start and STOP
+//!   end, starting at the first whole µs at or after its exact time, anchored
+//!   on the exact curve there (both floored to 2^-80 beat) with the exact
+//!   BPM's rate floored as its slope; segments with one start keep the later
+//!   change. Before time 0 it runs at the `#BPM` header's rate. A position
+//!   or retained time beyond what the map holds (±2^32 µs) is a
+//!   [`LoadError::PositionOverflow`].
 //! - **Same position:** a BPM change applies before a STOP, so the STOP uses
 //!   the new BPM; a note at a STOP's position sounds at the STOP's start.
 //!   Channel 08 wins over channel 03; within a channel the later object in
@@ -87,7 +96,8 @@
 //! - **Unsupported:** `#LNTYPE` 2 or higher, `#LNMODE` other than 1, negative
 //!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
 //!   The branching ones are refused even inside a branch not taken.
-//! - **Resolved hash:** covers what the chart resolved to, not the
+//! - **Resolved hash:** covers what the chart resolved to, display
+//!   positions and the scroll map included, not the
 //!   `#RANDOM` results that chose it, so two draws resolving to the same
 //!   objects share one hash.
 
@@ -112,12 +122,12 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use bms_model::{Chart, ChartIdentity, ScrollMap, SoundId, SoundRef, TimeUs};
+use bms_model::{Chart, ChartIdentity, ModelError, ScrollMap, SoundId, SoundRef, TimeUs};
 
 pub use error::{LoadError, Warning, WarningKind};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 4;
+pub const LOADER_VERSION: u32 = 5;
 
 /// Bounds on the work a chart may cause (design.md "Loading Limits"). The
 /// defaults sit far above real charts.
@@ -227,13 +237,19 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
     }
 
     let (sha256, md5) = hash::file_hashes(bytes);
+    let measure = timeline.last_measure;
+    let scroll = ScrollMap::from_segments(timeline.initial_rate, timeline.segments).map_err(
+        |e| match e {
+            ModelError::PositionOverflow => LoadError::PositionOverflow { measure },
+            e => LoadError::Model(e),
+        },
+    )?;
     let mut chart = Chart {
         lanes: resolved.lanes,
         bgm: resolved.bgm,
         sounds,
         bar_lines: timeline.bar_lines,
-        scroll: ScrollMap::new(timeline.initial_bpm_micro, &timeline.scroll)
-            .map_err(LoadError::Model)?,
+        scroll,
         meta: source.meta,
         identity: ChartIdentity {
             sha256,
@@ -244,7 +260,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         },
     };
     chart.validate().map_err(LoadError::Model)?;
-    chart.identity.resolved_hash = hash::resolved_hash(&chart, &timeline.scroll);
+    chart.identity.resolved_hash = hash::resolved_hash(&chart);
     Ok(Loaded { chart, warnings })
 }
 

@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use bms_model::{Chart, JudgeRank, Note, NoteKind, TimeUs};
+use bms_model::{BEAT, Chart, JudgeRank, Note, NoteKind, Position, TimeUs};
 use bms_parser::{Limits, LoadError, LoadOptions, Loaded, Warning, WarningKind, load_bms};
 use sha2::{Digest, Sha256};
 
@@ -38,9 +38,8 @@ fn id(n: usize) -> String {
     String::from_utf8(vec![DIGITS[n / 36], DIGITS[n % 36]]).unwrap()
 }
 
-/// Every time the chart holds, and the scroll position at each, in one list:
-/// per lane each note's time (and a long note's end), then BGM, bar lines,
-/// the initial BPM, and the scroll position at every listed time.
+/// Every time the chart holds that a clock is compared with, in one list:
+/// per lane each note's time (and a long note's end), then the BGM.
 fn fingerprint(chart: &Chart) -> Vec<i64> {
     let mut times = Vec::new();
     for lane in &chart.lanes {
@@ -54,15 +53,6 @@ fn fingerprint(chart: &Chart) -> Vec<i64> {
     }
     times.extend(chart.bgm.iter().map(|e| e.time.0));
     times.push(-1);
-    times.extend(chart.bar_lines.iter().map(|t| t.0));
-    times.push(-1);
-    let positions: Vec<i64> = times
-        .iter()
-        .filter(|&&t| t >= 0)
-        .map(|&t| chart.scroll.position_at(TimeUs(t)).0)
-        .collect();
-    times.push(chart.scroll.initial_bpm_micro());
-    times.extend(positions);
     times
 }
 
@@ -125,28 +115,118 @@ fn cycling() -> String {
     text
 }
 
+/// What the evaluator and the audio see of a load, as text: the outcome,
+/// then per lane each note's time, kind, mine damage, sound and long-note
+/// end and end sound, the BGM, the sound names, rank, TOTAL and LN mode, and
+/// the warnings in order. Display geometry is left out.
+fn projection(result: &Result<Loaded, LoadError>) -> String {
+    use std::fmt::Write;
+    let loaded = match result {
+        Ok(loaded) => loaded,
+        Err(e) => return format!("error {e:?}\n"),
+    };
+    let chart = &loaded.chart;
+    let mut out = String::from("ok\n");
+    for (l, lane) in chart.lanes.iter().enumerate() {
+        write!(out, "lane {l}:").unwrap();
+        for note in lane {
+            write!(out, " {} {:?}", note.time.0, note.sound).unwrap();
+            match note.kind {
+                NoteKind::Tap => write!(out, " tap"),
+                NoteKind::Long { end, end_sound, .. } => {
+                    write!(out, " long {} {end_sound:?}", end.0)
+                }
+                NoteKind::Mine { damage } => write!(out, " mine {damage}"),
+            }
+            .unwrap();
+        }
+        out.push('\n');
+    }
+    for e in &chart.bgm {
+        writeln!(out, "bgm {} {}", e.time.0, e.sound.0).unwrap();
+    }
+    for s in &chart.sounds {
+        writeln!(out, "sound {:?}", s.name).unwrap();
+    }
+    let meta = &chart.meta;
+    writeln!(
+        out,
+        "meta {:?} {:?} {:?}",
+        meta.rank, meta.total_milli, meta.ln_mode
+    )
+    .unwrap();
+    for w in &loaded.warnings {
+        writeln!(out, "warning {w:?}").unwrap();
+    }
+    out
+}
+
+/// Every chart this file and `tests/charts` hold, by name.
+fn fixtures() -> Vec<(String, Vec<u8>)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/charts");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    let mut out: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .map(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read(p).unwrap())
+        })
+        .collect();
+    for (name, text) in [
+        ("mixed", MIXED.to_owned()),
+        ("cycling", cycling()),
+        ("primes", primes()),
+        ("long decimals", LONG_DECIMALS.to_owned()),
+        ("growing", growing(40, 3)),
+    ] {
+        out.push((name.to_owned(), text.into_bytes()));
+    }
+    out
+}
+
+/// The evaluator-visible projection of every fixture is what loader
+/// version 4 produced before display positions entered the chart model.
+#[test]
+fn every_fixture_keeps_its_judgment_projection() {
+    let mut h = Sha256::new();
+    let fixtures = fixtures();
+    for (name, bytes) in &fixtures {
+        let dir = tempfile::tempdir().unwrap();
+        let result = load_bms(bytes, dir.path(), &LoadOptions::default());
+        h.update(name.as_bytes());
+        h.update(projection(&result).as_bytes());
+    }
+    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(fixtures.len(), 25);
+    assert_eq!(
+        digest,
+        "37922a6eb2fabb55672e19099ed30c7b6eac8b374f5d189fe42d71089c084e94"
+    );
+}
+
 #[test]
 fn few_bpm_charts_keep_their_old_times() {
     // Both expectations were produced by loader version 1 (checked `i128`
     // rationals) on these exact charts before the time representation
-    // changed.
+    // changed, and kept since.
     let mixed = fingerprint(&load(MIXED).unwrap().chart);
     assert_eq!(
         mixed,
         vec![
             5706286, 6628400, 7362754, 8097107, 8831460, -1, 1745454, 2072727, 2400000, 3600000,
             4727272, 5172211, 9565813, 10417884, -1, -1, 10701908, -1, -1, -1, -1, -1, 10474689,
-            -1, 0, 1745454, 3927272, 5706286, 9565813, 10701908, -1, 137500000, 10999999, 12099998,
-            13199999, 14299999, 15399998, 3999998, 4749999, 5500000, 6250000, 9399998, 10199999,
-            16499998, 19499998, 20499999, 19699999, 0, 3999998, 6999998, 10999999, 16499998,
-            20499999
+            -1
         ]
     );
     let cycling = fingerprint(&load(&cycling()).unwrap().chart);
-    assert_eq!(cycling.len(), 3371);
+    assert_eq!(cycling.len(), 1629);
     assert_eq!(
         digest(&cycling),
-        "b3db3cebf6af0a3a005800a04223d80fb1246d37df65211e0de7b1f2de2a477d"
+        "39aef5203823109c6c050ff3e9c43062a512e9c7f79b6e9798435abfcff44100"
     );
 }
 
@@ -157,15 +237,21 @@ const PRIMES: [u32; 20] = [
     197,
 ];
 
-#[test]
-fn many_distinct_bpms_keep_exact_time() {
+/// One measure at each of [`PRIMES`], a note at the half of each, and one
+/// at measure 20.
+fn primes() -> String {
     let mut text = String::from("#BPM 199\n#WAV01 a.wav\n");
     for (m, bpm) in PRIMES.iter().enumerate() {
         let id = id(m + 1);
         text.push_str(&format!("#BPM{id} {bpm}\n#{m:03}08:{id}\n#{m:03}11:0001\n"));
     }
     text.push_str("#02011:01\n");
-    let loaded = load(&text).unwrap();
+    text
+}
+
+#[test]
+fn many_distinct_bpms_keep_exact_time() {
+    let loaded = load(&primes()).unwrap();
     // Exact fractions in an independent script: a note at the half of each
     // measure (2 beats at its BPM after the 4-beat measures before), and
     // one at measure 20.
@@ -179,9 +265,9 @@ fn many_distinct_bpms_keep_exact_time() {
     );
 }
 
-#[test]
-fn long_decimals_and_exponents_time_exactly() {
-    let text = "\
+/// Decimals with exponents and many digits, a sub-measure STOP, and a
+/// measure 4 beats in 24 µs.
+const LONG_DECIMALS: &str = "\
 #BPM 1.5E+02
 #BPM02 98.7654321
 #BPM03 1.00001E+07
@@ -197,24 +283,31 @@ fn long_decimals_and_exponents_time_exactly() {
 #00311:0101
 #00411:01
 ";
-    let loaded = load(text).unwrap();
+
+#[test]
+fn long_decimals_and_exponents_time_exactly() {
+    let loaded = load(LONG_DECIMALS).unwrap();
     let chart = &loaded.chart;
     // Exact fractions in an independent script. Measure 1 is 0.03125 beats
     // at 150 (12_500 µs); measure 2 starts at 98.7654321 with a STOP of
-    // 0.0416 units (floor(end) - floor(start) = 526 µs); measure 3 runs at
-    // 10_000_100 BPM, 4 beats in 24 µs.
+    // 0.0416 units (526.5... µs); measure 3 runs at 10_000_100 BPM, 4
+    // beats in 24 µs.
     assert_eq!(
         times(&chart.lanes[1]),
         vec![
             0, 800_000, 1_600_000, 1_606_250, 1_612_500, 2_423_026, 4_043_026, 4_043_038, 4_043_050
         ]
     );
+    // Bar lines at 0, 4, 4.03125, 8.03125 and 12.03125 beats.
     assert_eq!(
         chart.bar_lines,
-        [0, 1_600_000, 1_612_500, 4_043_026, 4_043_050].map(TimeUs)
+        [0, 128, 129, 257, 385].map(|n| Position(BEAT * n / 32))
     );
-    assert_eq!(chart.scroll.initial_bpm_micro(), 150_000_000);
+    // floor(2^80 × 150 / 60e6) units per µs.
+    assert_eq!(chart.scroll.initial_rate(), BEAT / 400_000);
+    // Flat from the STOP's start through the last µs before its exact end.
     let pos = |t| chart.scroll.position_at(TimeUs(t));
+    assert_eq!(pos(1_612_500), Position(BEAT * 129 / 32));
     assert_eq!(pos(1_612_500), pos(1_613_026));
     assert!(pos(1_613_027) > pos(1_613_026));
     assert_eq!(loaded.warnings, vec![]);
@@ -285,7 +378,10 @@ fn bpm_below_one_millionth_is_refused() {
         }
     }
     let loaded = load("#BPM 0.000001\n").unwrap();
-    assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 1);
+    assert_eq!(
+        loaded.chart.scroll.initial_rate(),
+        BEAT / 60_000_000_000_000
+    );
 }
 
 /// A chart whose BPM changes at the start of each measure `m` in
@@ -373,4 +469,47 @@ fn time_size_cap_worst_case_load_time() {
         "heavy load: {elapsed:?}, {} notes kept, {dropped} dropped",
         loaded.chart.lanes[1].len()
     );
+}
+
+/// The heavy load's notes at one BPM, so the time's denominator stays
+/// small: the same events without the cost of a large running time.
+#[test]
+#[ignore = "timing run of about 480,000 objects: cargo test --release -p bms-parser --test time -- --ignored --nocapture"]
+fn small_denominator_load_time() {
+    let mut text = String::from("#BPM 99998385\n#WAV01 a.wav\n#80711:01\n");
+    let line = "01".repeat(2500);
+    for m in 808..=999 {
+        text.push_str(&format!("#{m:03}11:{line}\n"));
+    }
+    let start = Instant::now();
+    let loaded = load(&text).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(loaded.chart.bar_lines.len(), 1000);
+    println!(
+        "small denominator: {elapsed:?}, {} notes kept",
+        loaded.chart.lanes[1].len()
+    );
+}
+
+/// The scroll map's anchors at the cap, timed: the time's denominator
+/// reaches 16371 bits first, then 240,000 BPM changes alternating 150 and
+/// 151 BPM, each with a note, 1.6 ms apart, so every change anchors a
+/// segment on the running time and every note is kept.
+#[test]
+#[ignore = "timing run of about 480,000 objects: cargo test --release -p bms-parser --test time -- --ignored --nocapture"]
+fn anchor_heavy_load_time() {
+    let mut text = growing(807, 0);
+    text.push_str("#BPMZY 150\n#BPMZZ 151\n");
+    let changes = "ZYZZ".repeat(625);
+    let notes = "01".repeat(1250);
+    for m in 808..=999 {
+        text.push_str(&format!("#{m:03}08:{changes}\n#{m:03}11:{notes}\n"));
+    }
+    let start = Instant::now();
+    let loaded = load(&text).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(loaded.chart.lanes[1].len(), 1 + 192 * 1250);
+    let segments = loaded.chart.scroll.segments().len();
+    assert!(segments > 192 * 1250, "{segments}");
+    println!("anchor heavy: {elapsed:?}, {segments} segments");
 }

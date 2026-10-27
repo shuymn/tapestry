@@ -510,7 +510,7 @@ fn hi_speed_change_moves_notes_not_judgment() {
     let y = |visible| {
         render::layout::note_y(
             scroll,
-            TimeUs(2_300_000),
+            scroll.position_at(TimeUs(2_300_000)),
             TimeUs(2_000_000),
             TimeUs(visible),
         )

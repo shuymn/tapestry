@@ -1,12 +1,38 @@
-//! Display position as a piecewise linear function of chart time.
+//! Display positions and the map from chart time to the playhead (design.md
+//! "Chart Time").
 
 use crate::{ModelError, TimeUs};
 
-/// A display position, in millionths of a beat.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Position(pub i64);
+/// Fractional bits of a [`Position`].
+pub const FRAC_BITS: u32 = 80;
 
-/// A change that shapes the scroll map.
+/// One beat, in [`Position`] units.
+pub const BEAT: i128 = 1 << FRAC_BITS;
+
+/// The map's domain: queries are clamped to `±DOMAIN` µs, and segments start
+/// within it.
+pub const DOMAIN: i64 = 1 << 32;
+
+/// Microseconds per minute times millionths per unit of BPM: a BPM in
+/// millionths over this is beats per microsecond.
+const MICRO_BPM_PER_BEAT_PER_US: i128 = 60_000_000_000_000;
+
+/// A display position, in units of 2^-80 beat.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Position(pub i128);
+
+impl Position {
+    /// `self - other` in units, saturating at the `i128` bounds, which no
+    /// two positions of one chart reach.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn minus(self, other: Self) -> i128 {
+        self.0.saturating_sub(other.0)
+    }
+}
+
+/// A change in integer microseconds, the input of [`ScrollMap::new`] for
+/// charts built in code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollChange {
     /// From `at` on, the chart scrolls at `bpm_micro` millionths of a BPM.
@@ -26,7 +52,6 @@ pub enum ScrollChange {
 }
 
 impl ScrollChange {
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     const fn at(self) -> TimeUs {
         match self {
             Self::Bpm { at, .. } | Self::Stop { at, .. } => at,
@@ -34,57 +59,111 @@ impl ScrollChange {
     }
 }
 
-/// A segment at `bpm_micro` advances `bpm_micro / RATE_DIVISOR` millionths of
-/// a beat per microsecond: 60 seconds in microseconds, times millionths of a
-/// BPM, over millionths of a beat.
-const RATE_DIVISOR: i128 = 60_000_000;
-
-/// One linear piece. From `start` on, the scaled position (position times
-/// [`RATE_DIVISOR`]) grows from `scaled` by `bpm_micro` per microsecond. A
-/// STOP has `bpm_micro == 0`. Scaled positions are exact, so no rounding
-/// carries from one segment to the next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Segment {
-    start: i64,
-    scaled: i128,
-    bpm_micro: i64,
+/// One linear piece of a [`ScrollMap`]: from `start` on, the playhead
+/// grows from `anchor` by `slope` units per microsecond.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScrollSegment {
+    /// The first microsecond the segment covers.
+    pub start: TimeUs,
+    /// The position at `start`.
+    pub anchor: Position,
+    /// Units per microsecond; 0 during a STOP.
+    pub slope: i128,
 }
 
-impl Segment {
-    /// The position at `t`, unbounded. Cannot overflow: segments start at or
-    /// after time 0 (`before_zero` at 0), so `|t - start| <= 2^63`, the
-    /// product stays within `2^126`, and anchors stay within `2^89`.
+impl ScrollSegment {
+    /// The position at `t`, for `t` from `start` to the last microsecond the
+    /// segment covers, where [`ScrollMap::from_segments`] checked it fits.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn position(self, t: i64) -> i128 {
-        let advance = (i128::from(t) - i128::from(self.start)) * i128::from(self.bpm_micro);
-        (self.scaled + advance).div_euclid(RATE_DIVISOR)
+    fn value(self, t: i64) -> i128 {
+        self.anchor.0 + self.slope * (i128::from(t) - i128::from(self.start.0))
     }
 
-    /// The smallest `t` with `position(t) >= p`. Needs `bpm_micro > 0`.
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn earliest_at_or_past(self, p: i128) -> i128 {
-        i128::from(self.start)
-            + ceil_div(p * RATE_DIVISOR - self.scaled, i128::from(self.bpm_micro))
+    /// The position at `t`, or `None` if it leaves `i128`.
+    fn checked_value(self, t: i64) -> Option<i128> {
+        let dt = i128::from(t) - i128::from(self.start.0);
+        self.slope
+            .checked_mul(dt)
+            .and_then(|v| v.checked_add(self.anchor.0))
     }
 }
 
-/// The piecewise linear map from chart time to display position.
+/// The piecewise linear map from integer chart time to the playhead's
+/// display position.
 ///
-/// Position 0 is at time 0. Before time 0 the map extends at the initial BPM;
-/// after the last change it extends at the last BPM. STOP segments are flat,
-/// and the map never decreases. Positions are exact up to one final floor,
-/// so splitting a segment with a redundant BPM change moves nothing.
+/// Position 0 is at time 0. Before time 0 the map runs at the initial rate;
+/// from 0 on it follows its segments, each covering the microseconds up to
+/// the next one's start. The map never decreases. It is defined on
+/// `±DOMAIN` µs and clamps a query outside.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScrollMap {
-    /// The scroll before time 0.
-    before_zero: Segment,
-    /// Sorted by strictly increasing `start`; the first starts at time 0.
-    segments: Vec<Segment>,
+    /// Units per microsecond before time 0, positive.
+    initial_rate: i128,
+    /// Strictly increasing starts; the first is `{0, 0, _}`.
+    segments: Vec<ScrollSegment>,
 }
 
 impl ScrollMap {
-    /// Builds the map from the initial BPM and the BPM changes and STOPs,
-    /// with BPMs in millionths.
+    /// Takes a compiled map: the rate before time 0 and the segments.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::InitialRateNotPositive`] for an initial rate of 0 or
+    /// less; [`ModelError::ScrollNotMonotone`] for a missing first segment
+    /// or one not at time 0 and position 0, starts that do not strictly
+    /// increase, a negative slope, or a segment that passes the next
+    /// anchor by the last microsecond it covers; and
+    /// [`ModelError::PositionOverflow`] for a start beyond `DOMAIN` or a
+    /// position within the domain that leaves `i128`.
+    pub fn from_segments(
+        initial_rate: i128,
+        segments: Vec<ScrollSegment>,
+    ) -> Result<Self, ModelError> {
+        if initial_rate <= 0 {
+            return Err(ModelError::InitialRateNotPositive);
+        }
+        initial_rate
+            .checked_mul(i128::from(DOMAIN))
+            .ok_or(ModelError::PositionOverflow)?;
+        match segments.first() {
+            Some(first) if first.start == TimeUs(0) && first.anchor == Position(0) => {}
+            _ => return Err(ModelError::ScrollNotMonotone { index: 0 }),
+        }
+        let mut prev: Option<ScrollSegment> = None;
+        for (index, &s) in segments.iter().enumerate() {
+            if s.slope < 0 {
+                return Err(ModelError::ScrollNotMonotone { index });
+            }
+            if s.start.0 > DOMAIN {
+                return Err(ModelError::PositionOverflow);
+            }
+            if let Some(p) = prev {
+                if s.start <= p.start {
+                    return Err(ModelError::ScrollNotMonotone { index });
+                }
+                let reach = p
+                    .checked_value(s.start.0 - 1)
+                    .ok_or(ModelError::PositionOverflow)?;
+                if reach > s.anchor.0 {
+                    return Err(ModelError::ScrollNotMonotone { index });
+                }
+            }
+            prev = Some(s);
+        }
+        if let Some(last) = prev {
+            last.checked_value(DOMAIN)
+                .ok_or(ModelError::PositionOverflow)?;
+        }
+        Ok(Self {
+            initial_rate,
+            segments,
+        })
+    }
+
+    /// Builds the map from an initial BPM and BPM changes and STOPs in
+    /// integer microseconds, with BPMs in millionths. Each segment is
+    /// anchored on the exact curve at its start, and its slope is the
+    /// BPM's rate floored to units.
     ///
     /// The changes may come in any order. At one time, BPM changes apply
     /// before a STOP, so the scroll after the STOP uses the new BPM; of
@@ -94,8 +173,8 @@ impl ScrollMap {
     /// # Errors
     ///
     /// Returns an error for a non-positive BPM or STOP length, a change before
-    /// time 0, a change strictly inside a STOP, or a time or segment start
-    /// position outside `i64`.
+    /// time 0, a change strictly inside a STOP, a time overflow, or a change
+    /// beyond `DOMAIN`.
     pub fn new(initial_bpm_micro: i64, changes: &[ScrollChange]) -> Result<Self, ModelError> {
         if initial_bpm_micro <= 0 {
             return Err(ModelError::InvalidBpm {
@@ -106,14 +185,12 @@ impl ScrollMap {
         let mut sorted = changes.to_vec();
         sorted.sort_by_key(|c| (c.at(), matches!(c, ScrollChange::Stop { .. })));
 
-        let first = Segment {
-            start: 0,
-            scaled: 0,
-            bpm_micro: initial_bpm_micro,
-        };
-        let mut map = Self {
-            before_zero: first,
-            segments: vec![first],
+        // Breakpoints of (start, BPM in millionths), the last one at a time
+        // winning.
+        let mut points: Vec<(i64, i64)> = vec![(0, initial_bpm_micro)];
+        let mut push = |start: i64, bpm_micro: i64| match points.last_mut() {
+            Some(last) if last.0 == start => last.1 = bpm_micro,
+            _ => points.push((start, bpm_micro)),
         };
         let mut bpm_micro = initial_bpm_micro;
         let mut resume_at: Option<i64> = None;
@@ -126,7 +203,7 @@ impl ScrollMap {
                 if at.0 < resume {
                     return Err(ModelError::ChangeDuringStop { at });
                 }
-                map.push(resume, bpm_micro)?;
+                push(resume, bpm_micro);
             }
             match change {
                 ScrollChange::Bpm { bpm_micro: b, .. } => {
@@ -134,154 +211,106 @@ impl ScrollMap {
                         return Err(ModelError::InvalidBpm { at, bpm_micro: b });
                     }
                     bpm_micro = b;
-                    map.push(at.0, b)?;
+                    push(at.0, b);
                 }
                 ScrollChange::Stop { len, .. } => {
                     if len.0 <= 0 {
                         return Err(ModelError::InvalidStop { at, len });
                     }
-                    map.push(at.0, 0)?;
+                    push(at.0, 0);
                     resume_at = Some(at.checked_add(len).ok_or(ModelError::Overflow)?.0);
                 }
             }
         }
         if let Some(resume) = resume_at {
-            map.push(resume, bpm_micro)?;
+            push(resume, bpm_micro);
         }
-        Ok(map)
+
+        // The exact position in beats times MICRO_BPM_PER_BEAT_PER_US.
+        let mut scaled: i128 = 0;
+        let mut segments = Vec::with_capacity(points.len());
+        let mut last: Option<(i64, i64)> = None;
+        for &(start, bpm_micro) in &points {
+            if start > DOMAIN {
+                return Err(ModelError::PositionOverflow);
+            }
+            if let Some((s, b)) = last {
+                scaled = (i128::from(start) - i128::from(s))
+                    .checked_mul(i128::from(b))
+                    .and_then(|advance| scaled.checked_add(advance))
+                    .ok_or(ModelError::PositionOverflow)?;
+            }
+            segments.push(ScrollSegment {
+                start: TimeUs(start),
+                anchor: Position(
+                    to_units(scaled, MICRO_BPM_PER_BEAT_PER_US)
+                        .ok_or(ModelError::PositionOverflow)?,
+                ),
+                slope: to_units(i128::from(bpm_micro), MICRO_BPM_PER_BEAT_PER_US)
+                    .ok_or(ModelError::PositionOverflow)?,
+            });
+            last = Some((start, bpm_micro));
+        }
+        let initial_rate = to_units(i128::from(initial_bpm_micro), MICRO_BPM_PER_BEAT_PER_US)
+            .ok_or(ModelError::PositionOverflow)?;
+        Self::from_segments(initial_rate, segments)
     }
 
-    /// The BPM at time 0 before any change, in millionths.
+    /// Units per microsecond before time 0: the start BPM's rate, which
+    /// sets the hi-speed scale.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub const fn initial_bpm_micro(&self) -> i64 {
-        self.before_zero.bpm_micro
+    pub const fn initial_rate(&self) -> i128 {
+        self.initial_rate
     }
 
-    /// Starts a segment at `start`, or retunes the last one if it starts there.
-    fn push(&mut self, start: i64, bpm_micro: i64) -> Result<(), ModelError> {
-        let last = self.segments.last_mut().ok_or(ModelError::Overflow)?;
-        if last.start == start {
-            last.bpm_micro = bpm_micro;
-            return Ok(());
-        }
-        let scaled = (i128::from(start) - i128::from(last.start))
-            .checked_mul(i128::from(last.bpm_micro))
-            .and_then(|advance| last.scaled.checked_add(advance))
-            .ok_or(ModelError::Overflow)?;
-        if i64::try_from(scaled.div_euclid(RATE_DIVISOR)).is_err() {
-            return Err(ModelError::Overflow);
-        }
-        self.segments.push(Segment {
-            start,
-            scaled,
-            bpm_micro,
-        });
-        Ok(())
+    /// The segments, by strictly increasing start.
+    #[must_use]
+    pub fn segments(&self) -> &[ScrollSegment] {
+        &self.segments
     }
 
-    /// The segment that holds `t`.
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn segment_at(&self, t: i64) -> Segment {
-        if t < 0 {
-            self.before_zero
-        } else {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "the first segment starts at time 0 <= t, so the partition point is at least 1"
-            )]
-            let segment = self.segments[self.segments.partition_point(|s| s.start <= t) - 1];
-            segment
-        }
-    }
-
-    /// The display position at `t`, rounded down. Saturates at the `i64`
-    /// bounds far outside any chart.
+    /// The playhead at `t`, clamped to `±DOMAIN` µs.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn position_at(&self, t: TimeUs) -> Position {
-        Position(saturate(self.segment_at(t.0).position(t.0)))
-    }
-
-    /// The times whose position lies in `[from, to]`, as an inclusive pair
-    /// `(earliest, latest)`.
-    ///
-    /// `earliest` is the first time whose [`position_at`](Self::position_at)
-    /// is at or past `from`, and `latest` the last time whose position is not
-    /// past `to`, both including the saturated tails. A flat STOP segment
-    /// inside the range contributes its whole span, both ends included. When
-    /// no time maps into the range (a position skipped between two
-    /// microseconds, `from > to`, or a range beyond every `i64` time),
-    /// `earliest > latest`.
-    #[must_use]
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn time_range(&self, from: Position, to: Position) -> (TimeUs, TimeUs) {
-        let lo = if from.0 == i64::MIN {
-            i128::MIN
-        } else {
-            self.earliest_at_or_past(i128::from(from.0))
-        };
-        let hi = if to.0 == i64::MAX {
-            i128::MAX
-        } else {
-            self.earliest_at_or_past(i128::from(to.0) + 1) - 1
-        };
-        let (min, max) = (i128::from(i64::MIN), i128::from(i64::MAX));
-        let (lo, hi) = if lo > max {
-            (max, max - 1)
-        } else if hi < min {
-            (min + 1, min)
-        } else {
-            (lo.max(min), hi.min(max))
-        };
-        (TimeUs(saturate(lo)), TimeUs(saturate(hi)))
-    }
-
-    /// The smallest `t` with an unbounded position at or past `p`; the
-    /// latest time not past `p` is one before that for `p + 1`.
-    ///
-    /// The answer lies in the last segment anchored below `p`, or before
-    /// time 0 when none is. That segment is never a STOP, because the segment
-    /// after a STOP has the same exact anchor, and the answer never passes
-    /// the next anchor, because anchors are exact.
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn earliest_at_or_past(&self, p: i128) -> i128 {
-        let next = self
-            .segments
-            .partition_point(|s| s.scaled < p * RATE_DIVISOR);
-        next.checked_sub(1)
-            .and_then(|i| self.segments.get(i).copied())
-            .unwrap_or(self.before_zero)
-            .earliest_at_or_past(p)
+        let t = t.0.clamp(-DOMAIN, DOMAIN);
+        if t < 0 {
+            // `from_segments` checked `initial_rate × DOMAIN`.
+            return Position(self.initial_rate * i128::from(t));
+        }
+        let next = self.segments.partition_point(|s| s.start.0 <= t);
+        // The first segment starts at 0 <= t, so `next` is at least 1, and
+        // `from_segments` checked that each segment fits up to the next.
+        match next.checked_sub(1).and_then(|i| self.segments.get(i)) {
+            Some(s) => Position(s.value(t)),
+            None => Position(0),
+        }
     }
 }
 
-/// `ceil(a / b)` for `b > 0`.
-#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn ceil_div(a: i128, b: i128) -> i128 {
-    -(-a).div_euclid(b)
-}
-
-#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn saturate(v: i128) -> i64 {
-    i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
+/// `floor(numer × 2^80 / denom)` for `numer >= 0` and `denom > 0`, split
+/// into quotient and remainder so no intermediate leaves `i128` while the
+/// result fits; `None` otherwise. `denom` must be below 2^47.
+fn to_units(numer: i128, denom: i128) -> Option<i128> {
+    let (q, r) = (numer.div_euclid(denom), numer.rem_euclid(denom));
+    q.checked_mul(BEAT)?.checked_add((r << FRAC_BITS) / denom)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Position, ScrollChange, ScrollMap};
+    use num_bigint::BigInt;
+    use num_integer::Integer;
+    use proptest::prelude::*;
+
+    use super::{BEAT, DOMAIN, Position, ScrollChange, ScrollMap, ScrollSegment};
     use crate::{ModelError, TimeUs};
 
-    /// 120 BPM: 2 millionths of a beat per microsecond.
+    /// 120 BPM in millionths.
     const BPM_120: i64 = 120_000_000;
 
-    fn pos(map: &ScrollMap, t: i64) -> i64 {
+    fn pos(map: &ScrollMap, t: i64) -> i128 {
         map.position_at(TimeUs(t)).0
-    }
-
-    fn range(map: &ScrollMap, from: i64, to: i64) -> (i64, i64) {
-        let (a, b) = map.time_range(Position(from), Position(to));
-        (a.0, b.0)
     }
 
     fn stop(at: i64, len: i64) -> ScrollChange {
@@ -298,27 +327,96 @@ mod tests {
         }
     }
 
+    fn seg(start: i64, anchor: i128, slope: i128) -> ScrollSegment {
+        ScrollSegment {
+            start: TimeUs(start),
+            anchor: Position(anchor),
+            slope,
+        }
+    }
+
+    /// `floor(2^80 × n / d)` in big integers.
+    fn floor_units(n: &BigInt, d: &BigInt) -> i128 {
+        i128::try_from((n << 80u32).div_floor(d)).unwrap()
+    }
+
+    /// The exact curve of integer-µs changes, in beats times 6e13 (BPM in
+    /// millionths times µs): the BPM in effect over each µs summed, STOPs
+    /// flat. `changes` are sorted, at distinct times, inside no STOP.
+    fn exact_scaled(initial: i64, changes: &[ScrollChange], t: i64) -> BigInt {
+        let rate_at = |u: i64| {
+            let mut rate = initial;
+            let mut last = initial;
+            for c in changes {
+                match *c {
+                    ScrollChange::Bpm { at, bpm_micro } if at.0 <= u => {
+                        rate = bpm_micro;
+                        last = bpm_micro;
+                    }
+                    ScrollChange::Stop { at, len } if at.0 <= u => {
+                        rate = if u < at.0 + len.0 { 0 } else { last };
+                    }
+                    _ => {}
+                }
+            }
+            rate
+        };
+        if t < 0 {
+            return BigInt::from(initial) * t;
+        }
+        // Piecewise: the rate is constant between change boundaries.
+        let mut cuts: Vec<i64> = vec![0, t];
+        for c in changes {
+            match *c {
+                ScrollChange::Bpm { at, .. } => cuts.push(at.0),
+                ScrollChange::Stop { at, len } => {
+                    cuts.push(at.0);
+                    cuts.push(at.0 + len.0);
+                }
+            }
+        }
+        cuts.retain(|&c| (0..=t).contains(&c));
+        cuts.sort_unstable();
+        cuts.dedup();
+        cuts.windows(2)
+            .map(|w| BigInt::from(rate_at(w[0])) * (w[1] - w[0]))
+            .sum()
+    }
+
+    fn exact_units(initial: i64, changes: &[ScrollChange], t: i64) -> i128 {
+        floor_units(
+            &exact_scaled(initial, changes, t),
+            &BigInt::from(60_000_000_000_000_i64),
+        )
+    }
+
     #[test]
     fn scroll_position_is_flat_during_stop() {
         let map = ScrollMap::new(BPM_120, &[stop(1_000_000, 500_000)]).unwrap();
+        // 120 BPM is 2 beats a second.
         let at_start = pos(&map, 1_000_000);
-        assert_eq!(at_start, 2_000_000);
+        assert_eq!(at_start, 2 * BEAT);
         assert!(pos(&map, 999_999) < at_start);
         for t in [1_000_001, 1_250_000, 1_499_999, 1_500_000] {
             assert_eq!(pos(&map, t), at_start, "t = {t}");
         }
-        assert_eq!(pos(&map, 1_500_001), at_start + 2);
-        assert_eq!(pos(&map, 2_500_000), at_start + 2_000_000);
+        assert!(pos(&map, 1_500_001) > at_start);
+        // One more second of scroll: 4 beats exactly, reached from the
+        // anchor at the STOP's end at the floored rate.
+        let d = 4 * BEAT - pos(&map, 2_500_000);
+        assert!((0..=1_000_000).contains(&d), "{d}");
     }
 
     #[test]
-    fn stop_at_time_zero_holds_position_zero() {
+    fn stop_at_time_zero_holds_position_zero_and_runs_at_the_initial_rate_before() {
         let map = ScrollMap::new(BPM_120, &[stop(0, 100)]).unwrap();
-        assert_eq!(pos(&map, -1), -2);
+        assert_eq!(map.segments()[0].slope, 0);
+        let rate = map.initial_rate();
+        assert!(rate > 0);
+        assert_eq!(pos(&map, -1), -rate);
         assert_eq!(pos(&map, 0), 0);
         assert_eq!(pos(&map, 100), 0);
-        assert_eq!(pos(&map, 101), 2);
-        assert_eq!(range(&map, 0, 0), (0, 100));
+        assert_eq!(pos(&map, 101), rate);
     }
 
     #[test]
@@ -329,96 +427,143 @@ mod tests {
             bpm(1_000, 240_000_000),
         ];
         let map = ScrollMap::new(BPM_120, &changes).unwrap();
-        assert_eq!(pos(&map, 1_000), 2_000);
-        assert_eq!(pos(&map, 1_500), 2_000);
-        assert_eq!(pos(&map, 1_501), 2_004);
+        let at = pos(&map, 1_000);
+        assert_eq!(pos(&map, 1_500), at);
+        // 240 BPM after the STOP: 4 beats a second, 4e-6 beats a µs.
+        let rate_240 = map.segments().last().unwrap().slope;
+        assert_eq!(rate_240, (4 * BEAT) / 1_000_000);
+        assert_eq!(pos(&map, 1_501), at + rate_240);
     }
 
     #[test]
-    fn redundant_bpm_changes_keep_the_distance() {
-        // 123.456 BPM covers 123_456_000 / 60_000_000 millionths of a beat
-        // per microsecond, so time t sits at floor(t * 123_456 / 60_000).
+    fn redundant_bpm_changes_stay_within_a_unit_per_microsecond_of_the_exact_curve() {
+        // Each segment is anchored exactly and runs at the floored rate, so
+        // splitting one BPM into many segments moves the playhead by less
+        // than a unit per µs since the last anchor, never past the exact
+        // curve.
         const BPM: i64 = 123_456_000;
         let changes: Vec<_> = (1..=60_000).map(|k| bpm(k * 1_001, BPM)).collect();
         let split = ScrollMap::new(BPM, &changes).unwrap();
         let plain = ScrollMap::new(BPM, &[]).unwrap();
-        let end = 60_000 * 1_001;
-        assert_eq!(pos(&split, end), 123_579_456);
         let mut checked = 0;
-        for t in (0..=end).step_by(997) {
-            let expected = i64::try_from(i128::from(t) * 123_456 / 60_000).unwrap();
-            assert_eq!(pos(&split, t), expected, "t = {t}");
-            assert_eq!(pos(&plain, t), expected, "t = {t}");
+        for t in (0..=60_000 * 1_001).step_by(997) {
+            let exact = exact_units(BPM, &[], t);
+            let since = t % 1_001;
+            let d = exact - pos(&split, t);
+            assert!((0..=i128::from(since)).contains(&d), "t = {t}: {d}");
+            let d = exact - pos(&plain, t);
+            assert!((0..=i128::from(t)).contains(&d), "t = {t}: {d}");
             checked += 1;
         }
         assert!(checked > 60_000);
     }
 
     #[test]
-    fn bpm_keeps_six_fractional_digits() {
-        // 0.0005 BPM: 500 / 60_000_000 millionths of a beat per microsecond.
-        let map = ScrollMap::new(500, &[]).unwrap();
-        assert_eq!(pos(&map, 479_999), 3);
-        assert_eq!(pos(&map, 480_000), 4);
-        assert_eq!(range(&map, 4, 4), (480_000, 599_999));
+    fn negative_queries_run_at_the_initial_rate_within_a_unit_per_microsecond() {
+        // 0.000001 BPM: 2^80 / 6e13 units per µs, about 20 billion; at
+        // -5 µs the floored rate sits 2 units above the exact curve.
+        let map = ScrollMap::new(1, &[]).unwrap();
+        let exact = floor_units(&BigInt::from(-5), &BigInt::from(60_000_000_000_000_i64));
+        assert_eq!(pos(&map, -5) - exact, 2);
+        // The domain boundary, and a query past it clamped there.
+        let edge = floor_units(
+            &BigInt::from(-DOMAIN),
+            &BigInt::from(60_000_000_000_000_i64),
+        );
+        let d = pos(&map, -DOMAIN) - edge;
+        assert!((0..=i128::from(DOMAIN)).contains(&d), "{d}");
+        assert_eq!(pos(&map, i64::MIN), pos(&map, -DOMAIN));
+        assert_eq!(pos(&map, i64::MAX), pos(&map, DOMAIN));
     }
 
     #[test]
-    fn time_range_maps_a_stop_back_to_its_whole_span() {
-        let map = ScrollMap::new(BPM_120, &[stop(1_000_000, 500_000)]).unwrap();
-        assert_eq!(range(&map, 2_000_000, 2_000_000), (1_000_000, 1_500_000));
-        assert_eq!(range(&map, 1_999_998, 2_000_002), (999_999, 1_500_001));
-        assert_eq!(range(&map, 0, 4_000_000), (0, 2_500_000));
+    fn largest_bpm_reaches_the_domain_end() {
+        // Just under 10^12 BPM, the most the loader takes, in millionths.
+        let top = 999_999_999_999_999_999;
+        let map = ScrollMap::new(top, &[]).unwrap();
+        let exact = exact_units(top, &[], DOMAIN);
+        let d = exact - pos(&map, DOMAIN);
+        assert!((0..=i128::from(DOMAIN)).contains(&d), "{d}");
+        assert!(pos(&map, DOMAIN) > 0);
     }
 
     #[test]
-    fn time_range_of_a_single_position() {
-        let map = ScrollMap::new(BPM_120, &[]).unwrap();
-        assert_eq!(range(&map, 4, 4), (2, 2));
-        // Position 3 falls between microseconds 1 and 2.
-        assert_eq!(range(&map, 3, 3), (2, 1));
-        let slow = ScrollMap::new(30_000_000, &[]).unwrap();
-        assert_eq!(range(&slow, 3, 3), (6, 7));
-        assert_eq!(range(&slow, -3, -3), (-6, -5));
-    }
-
-    #[test]
-    fn time_range_inverts_the_saturated_tails() {
-        let map = ScrollMap::new(BPM_120, &[]).unwrap();
-        let half = 1_i64 << 62;
-        assert_eq!(pos(&map, half - 1), i64::MAX - 1);
-        assert_eq!(pos(&map, half), i64::MAX);
-        assert_eq!(range(&map, i64::MAX, i64::MAX), (half, i64::MAX));
-        assert_eq!(pos(&map, -half), i64::MIN);
-        assert_eq!(range(&map, i64::MIN, i64::MIN), (i64::MIN, -half));
-        // 0.000001 BPM never reaches the top within i64 time.
-        let crawl = ScrollMap::new(1, &[]).unwrap();
-        let (lo, hi) = crawl.time_range(Position(i64::MAX), Position(i64::MAX));
-        assert!(lo > hi);
-        let (lo, hi) = crawl.time_range(Position(i64::MIN), Position(i64::MIN));
-        assert!(lo > hi);
-    }
-
-    #[test]
-    fn time_range_inverts_position_at() {
-        let changes = [
-            bpm(10_000, 155_555_555),
-            stop(20_000, 7_777),
-            bpm(27_777, 33_333_333),
-            stop(27_777, 1),
-            stop(27_778, 3),
+    fn from_segments_rejects_malformed_maps_and_takes_their_corrected_forms() {
+        let rate = BEAT / 1_000_000;
+        let ok = ScrollMap::from_segments(rate, vec![seg(0, 0, rate), seg(10, 10 * rate, 0)]);
+        assert!(ok.is_ok());
+        let cases: [(i128, Vec<ScrollSegment>, ModelError); 8] = [
+            (0, vec![seg(0, 0, rate)], ModelError::InitialRateNotPositive),
+            (rate, vec![], ModelError::ScrollNotMonotone { index: 0 }),
+            (
+                rate,
+                vec![seg(1, 0, rate)],
+                ModelError::ScrollNotMonotone { index: 0 },
+            ),
+            (
+                rate,
+                vec![seg(0, 1, rate)],
+                ModelError::ScrollNotMonotone { index: 0 },
+            ),
+            (
+                rate,
+                vec![seg(0, 0, rate), seg(0, 0, rate)],
+                ModelError::ScrollNotMonotone { index: 1 },
+            ),
+            (
+                rate,
+                vec![seg(0, 0, -1)],
+                ModelError::ScrollNotMonotone { index: 0 },
+            ),
+            // Covering 0..=9, the first reaches 9 × rate; an anchor below it
+            // would step back.
+            (
+                rate,
+                vec![seg(0, 0, rate), seg(10, 9 * rate - 1, 0)],
+                ModelError::ScrollNotMonotone { index: 1 },
+            ),
+            (
+                rate,
+                vec![seg(0, 0, rate), seg(DOMAIN + 1, 0, 0)],
+                ModelError::PositionOverflow,
+            ),
         ];
-        let map = ScrollMap::new(BPM_120, &changes).unwrap();
-        let mut checked = 0;
-        for t in -2_000..60_000 {
-            let p = map.position_at(TimeUs(t));
-            let (lo, hi) = map.time_range(p, p);
-            assert!(lo.0 <= t && t <= hi.0, "t = {t}");
-            assert!(map.position_at(TimeUs(lo.0 - 1)) < p, "t = {t}");
-            assert!(map.position_at(TimeUs(hi.0 + 1)) > p, "t = {t}");
-            checked += 1;
+        for (initial, segments, err) in cases {
+            assert_eq!(
+                ScrollMap::from_segments(initial, segments.clone()),
+                Err(err),
+                "{segments:?}"
+            );
         }
-        assert_eq!(checked, 62_000);
+        // The matching accepted forms: a flat first segment, an anchor
+        // exactly where the previous segment reaches, a start at the
+        // domain's end.
+        for segments in [
+            vec![seg(0, 0, 0)],
+            vec![seg(0, 0, rate), seg(10, 9 * rate, 0)],
+            vec![seg(0, 0, rate), seg(DOMAIN, i128::from(DOMAIN) * rate, 0)],
+        ] {
+            assert!(
+                ScrollMap::from_segments(rate, segments.clone()).is_ok(),
+                "{segments:?}"
+            );
+        }
+        // A slope whose product leaves `i128` within the domain.
+        assert_eq!(
+            ScrollMap::from_segments(rate, vec![seg(0, 0, i128::MAX / i128::from(DOMAIN) + 1)]),
+            Err(ModelError::PositionOverflow)
+        );
+        assert_eq!(
+            ScrollMap::from_segments(i128::MAX / i128::from(DOMAIN) + 1, vec![seg(0, 0, 0)]),
+            Err(ModelError::PositionOverflow)
+        );
+        assert!(
+            ScrollMap::from_segments(
+                i128::MAX / i128::from(DOMAIN),
+                vec![seg(0, 0, i128::MAX / i128::from(DOMAIN))]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -453,5 +598,71 @@ mod tests {
             ScrollMap::new(BPM_120, &[stop(i64::MAX, 1)]),
             Err(ModelError::Overflow)
         );
+        assert_eq!(
+            ScrollMap::new(BPM_120, &[stop(DOMAIN, 1)]),
+            Err(ModelError::PositionOverflow)
+        );
+        assert!(ScrollMap::new(BPM_120, &[stop(DOMAIN - 1, 1)]).is_ok());
+    }
+
+    fn changes() -> impl Strategy<Value = (i64, Vec<ScrollChange>)> {
+        let bpm_micro = 1..1_000_000_000_000_000_000_i64;
+        (
+            bpm_micro.clone(),
+            prop::collection::vec(
+                (1..2_000_000_i64, bpm_micro, 0..3_000_i64, any::<bool>()),
+                0..8,
+            ),
+        )
+            .prop_map(|(initial, steps)| {
+                let mut at = 0;
+                let mut out = Vec::new();
+                for (gap, b, len, is_stop) in steps {
+                    at += gap;
+                    if is_stop && len > 0 {
+                        out.push(stop(at, len));
+                        at += len;
+                    } else {
+                        out.push(bpm(at, b));
+                    }
+                }
+                (initial, out)
+            })
+    }
+
+    proptest! {
+        /// The playhead never decreases, stays at or below the exact curve
+        /// from time 0 within a unit per µs since the last anchor (at most
+        /// the time itself), and above it before time 0 within a unit per
+        /// µs.
+        #[test]
+        fn position_at_brackets_the_exact_curve(
+            (initial, changes) in changes(),
+            queries in prop::collection::vec(-3_000_000_i64..20_000_000, 1..64),
+        ) {
+            let map = ScrollMap::new(initial, &changes).unwrap();
+            let mut queries = queries;
+            queries.sort_unstable();
+            let mut prev = i128::MIN;
+            for t in queries {
+                let p = pos(&map, t);
+                prop_assert!(p >= prev, "t = {}", t);
+                prev = p;
+                let exact = exact_units(initial, &changes, t);
+                let d = exact - p;
+                let span = if t < 0 { -i128::from(t) } else { i128::from(t) };
+                if t < 0 {
+                    prop_assert!((-span..=0).contains(&d), "t = {}: {}", t, d);
+                } else {
+                    let anchor = map
+                        .segments()
+                        .iter()
+                        .rev()
+                        .find(|s| s.start.0 <= t)
+                        .map_or(0, |s| s.start.0);
+                    prop_assert!((0..=i128::from(t - anchor)).contains(&d), "t = {}: {}", t, d);
+                }
+            }
+        }
     }
 }

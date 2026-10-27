@@ -9,3 +9,8 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+num-bigint.workspace = true
+num-integer.workspace = true
+proptest.workspace = true
