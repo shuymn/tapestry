@@ -658,7 +658,7 @@ How games usually keep the GPU out of low performance states is taken from commo
 
 Budgets are set for each of decoded audio (about 115 MB per 10 minutes at 2 channels, 48 kHz, i16), temporary usage during loading, textures, and BGA display surfaces. The number of parallel decodes is capped. If it is known before play that the budget will be exceeded, it is brought within budget by switching to read-ahead for long sounds or lowering BGA quality; if it still does not fit, the reason is shown and play does not start.
 
-The chart's display geometry is fixed at load time and bounded by the source: an `i128` position per note head, long-note end and bar line, and a 40-byte scroll segment (start, anchor, slope) per BPM change, STOP start and STOP end.
+The chart's display geometry is fixed at load time and bounded by the source: an `i128` position per note head, long-note end and bar line, and a 48-byte scroll segment (an `i64` start, an `i128` anchor and slope, aligned to 16 bytes) per BPM change, STOP start and STOP end.
 
 ### Recording Capacity
 
