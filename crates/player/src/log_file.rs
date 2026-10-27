@@ -32,6 +32,8 @@ const LINE_CAP: usize = 1 << 10;
 const RESERVE: u64 = 256;
 /// Warnings logged per source and load; the rest are a count.
 const WARNINGS_LOGGED: usize = 100;
+/// Missing sound files named on stderr; the rest are a count.
+const MISSING_NAMED: usize = 3;
 /// The target of this crate's records: the binary's crate name.
 const TARGET: &str = env!("CARGO_CRATE_NAME");
 /// The lease file, never rotated or removed.
@@ -66,6 +68,51 @@ pub fn finish(code: u8) {
 /// many more there were.
 pub fn warnings(what: &str, items: impl ExactSizeIterator<Item = impl Display>) {
     warnings_to(what, items, &mut io::stderr().lock(), log::logger());
+}
+
+/// Sums up a chart's missing sound files in one line, the count and the
+/// first [`MISSING_NAMED`] names with control characters escaped, on
+/// stderr and in the log like any chart warning. Nothing when none is
+/// missing.
+pub fn missing_sounds<'a>(names: impl Iterator<Item = &'a str>) {
+    missing_sounds_to(names, &mut io::stderr().lock(), log::logger());
+}
+
+fn missing_sounds_to<'a>(
+    mut names: impl Iterator<Item = &'a str>,
+    err: &mut impl Write,
+    log: &dyn Log,
+) {
+    let shown: Vec<&str> = names.by_ref().take(MISSING_NAMED).collect();
+    if shown.is_empty() {
+        return;
+    }
+    let more = names.count();
+    let n = shown.len() + more;
+    let mut line = if n == 1 {
+        "1 sound file is missing: ".to_owned()
+    } else {
+        format!("{n} sound files are missing: ")
+    };
+    for (i, name) in shown.into_iter().enumerate() {
+        if i > 0 {
+            line.push_str(", ");
+        }
+        // Control characters (a carriage return, an escape) as `\u{..}`,
+        // so a chart-written name cannot rewrite the terminal or split a
+        // line.
+        for c in name.chars() {
+            if c.is_control() {
+                line.extend(c.escape_unicode());
+            } else {
+                line.push(c);
+            }
+        }
+    }
+    if more > 0 {
+        let _ = write!(line, " and {more} more");
+    }
+    warnings_to("chart", std::iter::once(line), err, log);
 }
 
 fn warnings_to(
@@ -384,8 +431,8 @@ mod tests {
     use log::{Level, Log, Metadata, Record};
 
     use super::{
-        Caps, FileLog, LINE_CAP, LOCK, Logged, Sink, WARNINGS_LOGGED, name, open, taken,
-        warnings_to,
+        Caps, FileLog, LINE_CAP, LOCK, Logged, Sink, WARNINGS_LOGGED, missing_sounds_to, name,
+        open, taken, warnings_to,
     };
 
     fn sink<W: Write>(out: W, caps: Caps) -> Sink<W> {
@@ -665,6 +712,63 @@ mod tests {
         let kept = Kept::default();
         warnings_to("sounds", ["a", "b"].iter(), &mut Vec::new(), &kept);
         assert_eq!(kept.0.into_inner().unwrap(), ["sounds: a", "sounds: b"]);
+    }
+
+    #[test]
+    fn missing_sounds_are_one_line_on_stderr_and_in_the_log() {
+        let names = ["kick.wav", "snare.ogg", "hat.wav", "bass.flac", "pad.wav"];
+        let kept = Kept::default();
+        let mut err = Vec::new();
+        missing_sounds_to(names.iter().copied(), &mut err, &kept);
+        let line = "5 sound files are missing: kick.wav, snare.ogg, hat.wav and 2 more";
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!("warning: {line}\n")
+        );
+        assert_eq!(kept.0.into_inner().unwrap(), [format!("chart: {line}")]);
+        // Up to the named count, no remainder; one file reads as one.
+        let kept = Kept::default();
+        let mut err = Vec::new();
+        missing_sounds_to(["kick.wav"].into_iter(), &mut err, &kept);
+        let line = "1 sound file is missing: kick.wav";
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!("warning: {line}\n")
+        );
+        assert_eq!(kept.0.into_inner().unwrap(), [format!("chart: {line}")]);
+        let mut err = Vec::new();
+        missing_sounds_to(names[..3].iter().copied(), &mut err, &Kept::default());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: 3 sound files are missing: kick.wav, snare.ogg, hat.wav\n"
+        );
+        // Control characters in a name are escaped, a carriage return and an
+        // escape included; other characters stay as they are.
+        let kept = Kept::default();
+        let mut err = Vec::new();
+        let odd = ["a\rb.wav", "\u{1b}[2Jc.wav", "\u{97f3}.wav"];
+        missing_sounds_to(odd.into_iter(), &mut err, &kept);
+        let line = "3 sound files are missing: a\\u{d}b.wav, \\u{1b}[2Jc.wav, \u{97f3}.wav";
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!("warning: {line}\n")
+        );
+        assert_eq!(kept.0.into_inner().unwrap(), [format!("chart: {line}")]);
+        // DEL and a C1 control are escaped too; text that only looks like
+        // an escape is left as written, not escaped twice.
+        let mut err = Vec::new();
+        let odd = ["d\u{7f}.wav", "e\u{85}.wav", "f\\u{41}.wav"];
+        missing_sounds_to(odd.into_iter(), &mut err, &Kept::default());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: 3 sound files are missing: d\\u{7f}.wav, e\\u{85}.wav, f\\u{41}.wav\n"
+        );
+        // None missing: nothing at all.
+        let kept = Kept::default();
+        let mut err = Vec::new();
+        missing_sounds_to(std::iter::empty(), &mut err, &kept);
+        assert!(err.is_empty());
+        assert!(kept.0.into_inner().unwrap().is_empty());
     }
 
     fn files(dir: &Path) -> Vec<String> {

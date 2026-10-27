@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use bms_model::Chart;
-use bms_parser::{LoadError, LoadOptions};
+use bms_parser::{LoadError, LoadOptions, WarningKind};
 use replay::TransformRecord;
 
 /// A chart read by an ingestion adapter, in the common chart model.
@@ -12,7 +12,9 @@ use replay::TransformRecord;
 pub struct Ingested {
     /// The resolved chart, with its identity.
     pub chart: Chart,
-    /// What the adapter skipped or assumed, one line each.
+    /// What the adapter skipped or assumed, one line each. Missing sound
+    /// files are not among them: the chart's sound table has each one,
+    /// without a path, for the caller to sum up.
     pub warnings: Vec<String>,
 }
 
@@ -65,7 +67,12 @@ impl ChartIngest for BmsIngest {
         let loaded = bms_parser::load_bms(bytes, dir, &opts).map_err(IngestError::Load)?;
         Ok(Ingested {
             chart: loaded.chart,
-            warnings: loaded.warnings.iter().map(|w| format!("{w:?}")).collect(),
+            warnings: loaded
+                .warnings
+                .iter()
+                .filter(|w| w.kind != WarningKind::MissingSoundFile)
+                .map(|w| format!("{w:?}"))
+                .collect(),
         })
     }
 }

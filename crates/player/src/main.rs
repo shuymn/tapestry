@@ -334,6 +334,14 @@ fn load(chart: &Path, input: &PlayInput) -> anyhow::Result<Loaded> {
     let warnings = loaded.warnings();
     log::info!("loaded {} ({} warnings)", chart.display(), warnings.len());
     log_file::warnings("chart", warnings.iter());
+    log_file::missing_sounds(
+        loaded
+            .chart()
+            .sounds
+            .iter()
+            .filter(|s| s.path.is_none())
+            .map(|s| s.name.as_str()),
+    );
     Ok(loaded)
 }
 
