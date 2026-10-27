@@ -203,11 +203,21 @@ mod tests {
             .build();
         assert_eq!(overlapping, Err(ModelError::Overlap { lane, index: 1 }));
 
+        let early = ChartBuilder::new(BPM_150)
+            .long(lane, TimeUs(1_000), TimeUs(2_000))
+            .tap(lane, TimeUs(1_999))
+            .build();
+        assert_eq!(early, Err(ModelError::Overlap { lane, index: 1 }));
+
+        // A note may start at the µs the previous one ends, and several
+        // notes may share a µs.
         let touching = ChartBuilder::new(BPM_150)
             .long(lane, TimeUs(1_000), TimeUs(2_000))
             .tap(lane, TimeUs(2_000))
-            .build();
-        assert_eq!(touching, Err(ModelError::Overlap { lane, index: 1 }));
+            .tap(lane, TimeUs(2_000))
+            .build()
+            .unwrap();
+        assert_eq!(touching.lanes[lane.index()].len(), 3);
 
         let apart = ChartBuilder::new(BPM_150)
             .long(lane, TimeUs(1_000), TimeUs(2_000))
@@ -219,17 +229,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_long_notes_ending_at_or_before_start() {
+    fn validate_rejects_long_notes_ending_before_start() {
         let lane = key(2);
-        for end in [999, 1_000] {
-            let chart = ChartBuilder::new(BPM_150)
-                .long(lane, TimeUs(1_000), TimeUs(end))
-                .build();
-            assert_eq!(
-                chart,
-                Err(ModelError::LongEndNotAfterStart { lane, index: 0 })
-            );
-        }
+        let chart = ChartBuilder::new(BPM_150)
+            .long(lane, TimeUs(1_000), TimeUs(999))
+            .build();
+        assert_eq!(
+            chart,
+            Err(ModelError::LongEndBeforeStart { lane, index: 0 })
+        );
+        // A long note may start and end in one µs.
+        let one_us = ChartBuilder::new(BPM_150)
+            .long(lane, TimeUs(1_000), TimeUs(1_000))
+            .build()
+            .unwrap();
+        assert_eq!(one_us.lanes[lane.index()][0].end(), TimeUs(1_000));
     }
 
     #[test]

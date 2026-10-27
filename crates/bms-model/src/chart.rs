@@ -197,8 +197,8 @@ impl Chart {
     /// # Errors
     ///
     /// Returns the first violation: a lane out of time order, a long note
-    /// that does not end after it starts, a note starting at or before the
-    /// end of the previous note in its lane, a display position before the
+    /// that ends before it starts, a note starting before the end of the
+    /// previous note in its lane, a display position before the
     /// end position of the previous note or a long note's end position
     /// before its head's, BGM out of time order, bar lines out of position
     /// order, or a sound outside the sound table.
@@ -206,8 +206,8 @@ impl Chart {
         for lane in Lane::all() {
             let notes = &self.lanes[lane.index()];
             for (index, note) in notes.iter().enumerate() {
-                if matches!(note.kind, NoteKind::Long { end, .. } if end <= note.time) {
-                    return Err(ModelError::LongEndNotAfterStart { lane, index });
+                if matches!(note.kind, NoteKind::Long { end, .. } if end < note.time) {
+                    return Err(ModelError::LongEndBeforeStart { lane, index });
                 }
                 if note.end_pos() < note.pos {
                     return Err(ModelError::PositionsUnsorted { lane, index });
@@ -216,7 +216,7 @@ impl Chart {
                     if note.time < prev.time {
                         return Err(ModelError::Unsorted { lane, index });
                     }
-                    if note.time <= prev.end() {
+                    if note.time < prev.end() {
                         return Err(ModelError::Overlap { lane, index });
                     }
                     if note.pos < prev.end_pos() {
