@@ -698,7 +698,7 @@ An overlay toggled during play shows p50, p99 and max over the current play, fro
 | Audio underruns | Wakes with zero padding | |
 | Sprite cap | Play frames whose sprite batch filled (8,192 sprites), so the rest of the frame was not drawn | Frames, not sprites: the skin stops building at the first refused push, so the HUD, effects and this overlay vanish from such a frame too |
 | Deferred starts, stolen voices | Over the play: audio wakes that left a due key sound or BGM start for a later wake because 1,024 starts already waited (those sounds start late, head intact), and voices stolen at the 256-voice limit | Neither is reported anywhere else |
-| Load time | First load and retry, separately | |
+| Load time | First load and retry, separately, each to the clock read once the play's first frame was presented (not its display time): the first load from the process start (under `measure play`, from when its PresentMon capture has settled), a retry from its receipt | |
 
 At each play's end the console prints the sprite cap, deferred-start and stolen-voice counts in one `limits:` line, since an autoplay play keeps no `.measure.toml`.
 
