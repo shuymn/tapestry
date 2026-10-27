@@ -151,7 +151,7 @@ fn frame_does_not_allocate_after_warmup() {
             } else if release.0 > now.0 - FRAME_US && release <= now {
                 ended += 1;
                 &[
-                    JudgeEventKind::LnReleased {
+                    JudgeEventKind::LnHoldEnded {
                         lane: lane(l),
                         note: index,
                     },

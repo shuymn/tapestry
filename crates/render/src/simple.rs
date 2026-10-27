@@ -201,8 +201,9 @@ pub struct SimpleSkin {
     /// hidden; it is drawn until its end passes the judgment line.
     done: [Bits; LANE_COUNT],
     /// Per lane, the long note whose body is active: its head was pressed
-    /// (held, or decided at a press before its end) and its lane has not
-    /// been released since. Every other body is inactive.
+    /// (held, or decided at a press before its end) and its visual hold has
+    /// not ended ([`JudgeEventKind::LnHoldEnded`]). Every other body is
+    /// inactive.
     active: [Option<usize>; LANE_COUNT],
     /// Latest press per lane, for the key beam.
     pressed: [Option<TimeUs>; LANE_COUNT],
@@ -306,7 +307,7 @@ impl SimpleSkin {
                 self.judgment = Some((judgment, ev.time));
                 self.feedback(l, judgment, true, ev.time);
             }
-            JudgeEventKind::LnReleased { lane, note } => {
+            JudgeEventKind::LnHoldEnded { lane, note } => {
                 let l = lane.index();
                 if self.active[l] == Some(note) {
                     self.active[l] = None;
@@ -863,8 +864,8 @@ mod tests {
         event(0, at, Some(at), kind)
     }
 
-    fn ln_released(at: i64, note: usize) -> JudgeEvent {
-        let kind = JudgeEventKind::LnReleased {
+    fn ln_hold_ended(at: i64, note: usize) -> JudgeEvent {
+        let kind = JudgeEventKind::LnHoldEnded {
             lane: lane(2),
             note,
         };
@@ -922,7 +923,7 @@ mod tests {
                 "released early",
                 vec![
                     ln_held(1_000 * MS, 0),
-                    ln_released(1_100 * MS, 0),
+                    ln_hold_ended(1_100 * MS, 0),
                     ln_judged(
                         1_100 * MS,
                         0,
@@ -957,7 +958,7 @@ mod tests {
                         None,
                         Some(850 * MS),
                     ),
-                    ln_released(1_100 * MS, 0),
+                    ln_hold_ended(1_100 * MS, 0),
                 ],
                 false,
             ),
@@ -1037,7 +1038,7 @@ mod tests {
             Some(-50 * MS),
             Some(1_250 * MS),
         );
-        let released = ln_released(1_250 * MS, 0);
+        let released = ln_hold_ended(1_250 * MS, 0);
         let batch = build(&mut s, &frame(&v, 1_250 * MS, &[released, judged]));
         assert_eq!(bombs(&batch), 0);
         assert_eq!(
@@ -1062,6 +1063,76 @@ mod tests {
             .iter()
             .map(Vec::len)
             .sum()
+    }
+
+    /// The events the evaluator emits up to logic time `to` for key 2
+    /// pressed at `press` and released at `release` (µs), with the custom
+    /// preset and one keyboard source.
+    fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent> {
+        let device = eval::DeviceProfile {
+            sources: vec![eval::SourceProfile {
+                input_offset: TimeUs(0),
+                bindings: vec![eval::Binding {
+                    control: eval::ControlId(2),
+                    lane: lane(2),
+                }],
+                axes: Vec::new(),
+            }],
+        };
+        let preset = rules::custom();
+        let key = |at: i64, value: i32| eval::PhysicalInputEvent {
+            received: TimeUs(at),
+            source: eval::SourceId(0),
+            kind: eval::InputKind::Control {
+                control: eval::ControlId(2),
+                value,
+            },
+        };
+        let mut ev =
+            eval::Evaluator::new(chart, &preset, &device, &eval::InputStart::default(), 4).unwrap();
+        ev.push_input(key(press, 1)).unwrap();
+        ev.push_input(key(release, 0)).unwrap();
+        let mut out = Vec::new();
+        ev.advance_to(TimeUs(to), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_long_note_turns_inactive_at_its_logic_end_while_its_tail_still_shows() {
+        // The long note from 1 s to 1.3 s, drawn with a display offset of
+        // −100 ms, so its tail is still 100 ms ahead of the line when its
+        // logic end passes. A GOOD-or-better head (on time) and a BAD head
+        // (150 ms early), each released exactly at the end or held through
+        // it (released at 1.5 s, judged by the end deadline): the body is
+        // active at logic 1.29 s, and inactive from the logic end on, with
+        // the tail drawn (at 1.31 s, 90 ms ahead: y 760).
+        let chart = long_note();
+        let v = view();
+        let end = 1_300 * MS;
+        let offset = -100 * MS;
+        let tail = [320.0, 752.0, 64.0, 16.0];
+        for press in [1_000 * MS, 850 * MS] {
+            for release in [end, 1_500 * MS] {
+                for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
+                    let effects = evaluated(&chart, press, release, now);
+                    let mut s = skin(&chart);
+                    let f = FrameInput {
+                        display_offset: TimeUs(offset),
+                        ..frame(&v, now, &effects)
+                    };
+                    let [on, off, caps] = long_parts(&build(&mut s, &f), lane(2));
+                    let case = format!("press {press}, release {release}, at {now}");
+                    assert_eq!(
+                        (on.len(), off.len()),
+                        (usize::from(active), usize::from(!active)),
+                        "{case}"
+                    );
+                    if now == end + 10 * MS {
+                        assert_eq!(caps[0], tail, "{case}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

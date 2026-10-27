@@ -192,7 +192,7 @@ fn advance_does_not_allocate() {
     assert_eq!(ev.tally().counts.great, 250);
     assert_eq!(count(|k| matches!(k, JudgeEventKind::LnHeld { .. })), 500);
     assert_eq!(
-        count(|k| matches!(k, JudgeEventKind::LnReleased { .. })),
+        count(|k| matches!(k, JudgeEventKind::LnHoldEnded { .. })),
         500
     );
     assert_eq!(count(|k| matches!(k, JudgeEventKind::MineHit { .. })), 400);

@@ -66,14 +66,15 @@ fn notes_where(chart: &Chart, pick: fn(&NoteKind) -> bool) -> Vec<(usize, usize)
 }
 
 /// Every note judged once, PERFECT and on time, nothing else judged or
-/// missed. A long note of positive length is held at its head and judged
-/// by its release exactly at its end; a zero-length one is decided at its
-/// press, never held.
+/// missed. A long note of positive length is held at its head, and its
+/// release exactly at its end ends its visual hold and judges it; a
+/// zero-length one is decided at its press, never held.
 #[track_caller]
 fn all_perfect(chart: &Chart) {
     let events = autoplayed(chart);
     let mut judged = Vec::new();
     let mut held = Vec::new();
+    let mut ended = Vec::new();
     for e in &events {
         match e.kind {
             JudgeEventKind::Judged {
@@ -103,9 +104,8 @@ fn all_perfect(chart: &Chart) {
                 assert_eq!((judgment, deviation), (Judgment::Perfect, TimeUs(0)));
                 held.push((lane.index(), note));
             }
-            JudgeEventKind::EmptyPoor { .. }
-            | JudgeEventKind::MineHit { .. }
-            | JudgeEventKind::LnReleased { .. } => {
+            JudgeEventKind::LnHoldEnded { lane, note } => ended.push((lane.index(), note)),
+            JudgeEventKind::EmptyPoor { .. } | JudgeEventKind::MineHit { .. } => {
                 panic!("{e:?}");
             }
             _ => {}
@@ -125,6 +125,8 @@ fn all_perfect(chart: &Chart) {
         })
         .collect();
     assert_eq!(held, positive);
+    ended.sort_unstable();
+    assert_eq!(ended, positive);
 }
 
 /// Measure 0 lasts 2 µs at 120 BPM (4e-6 beat), measure 1 is ordinary.

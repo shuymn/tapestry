@@ -234,7 +234,7 @@ fn release_after_stop_is_a_deadline_not_a_frame() {
     // The timeout ends the visual hold too, before the end.
     let ended: Vec<_> = out
         .iter()
-        .filter(|e| matches!(e.kind, JudgeEventKind::LnReleased { .. }))
+        .filter(|e| matches!(e.kind, JudgeEventKind::LnHoldEnded { .. }))
         .map(|e| (e.time.0, e.origin))
         .collect();
     assert_eq!(ended, [(1_100 * MS, None)]);

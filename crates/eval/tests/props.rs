@@ -153,9 +153,10 @@ fn check_gauges(preset: &RulePreset, e: &Evaluation) -> Result<(), TestCaseError
 /// has exactly one judgment, and only a judgment, an empty POOR or a mine
 /// hit changes the gauges. A held head comes at most once per long note,
 /// before its judgment, with the judgment's deviation and never worse
-/// than it; while it is held, its lane sees no press. A visual hold ends
-/// early at most once per long note, before its end. A release distance is
-/// given only for a long note, and never positive.
+/// than it; while it is held, its lane sees no press. Every long note whose
+/// head a press took before its end (held, or a BAD) ends its visual hold
+/// exactly once, at or before its end and before a held one's judgment. A
+/// release distance is given only for a long note, and never positive.
 fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
     use eval::JudgeEventKind as K;
     use std::collections::BTreeSet;
@@ -164,6 +165,8 @@ fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
     let mut judged = BTreeSet::new();
     let mut held: BTreeMap<(usize, usize), (rules::Judgment, TimeUs)> = BTreeMap::new();
     let mut released = BTreeSet::new();
+    // Long notes whose head a press took before their end.
+    let mut visual = BTreeSet::new();
     // Per lane, the long note held and not yet judged.
     let mut holding: [Option<usize>; bms_model::LANE_COUNT] = [None; bms_model::LANE_COUNT];
     let mut scoring = false;
@@ -190,9 +193,22 @@ fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
                 let long = matches!(note_of(lane, note).kind, bms_model::NoteKind::Long { .. });
                 prop_assert!(release.is_none() || long);
                 prop_assert!(release.is_none_or(|r| r.0 <= 0));
+                if long
+                    && deviation.is_some()
+                    && release.is_none()
+                    && ev.time < note_of(lane, note).end()
+                    && !held.contains_key(&(l, note))
+                {
+                    visual.insert((l, note));
+                }
                 if let Some(&(head, d)) = held.get(&(l, note)) {
                     prop_assert!(head <= judgment, "{:?} held, then {:?}", head, ev);
                     prop_assert_eq!(deviation, Some(d));
+                    prop_assert!(
+                        released.contains(&(l, note)),
+                        "judged before its hold ended: {:?}",
+                        ev
+                    );
                     prop_assert_eq!(holding[l], Some(note));
                     holding[l] = None;
                 } else {
@@ -208,13 +224,15 @@ fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
                 let l = lane.index();
                 prop_assert!(holding[l].is_none(), "a press while held: {:?}", ev);
                 prop_assert!(held.insert((l, note), (judgment, deviation)).is_none());
+                visual.insert((l, note));
                 prop_assert!(judgment < rules::Judgment::Bad);
                 prop_assert!(ev.time < note_of(lane, note).end());
                 holding[l] = Some(note);
             }
-            K::LnReleased { lane, note } => {
+            K::LnHoldEnded { lane, note } => {
                 prop_assert!(released.insert((lane.index(), note)));
-                prop_assert!(ev.time < note_of(lane, note).end());
+                prop_assert!(visual.contains(&(lane.index(), note)), "{:?}", ev);
+                prop_assert!(ev.time <= note_of(lane, note).end());
             }
             K::EmptyPoor { lane } | K::PlaySound { lane, .. } => {
                 prop_assert!(
@@ -238,6 +256,7 @@ fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
         })
         .collect();
     prop_assert_eq!(judged, notes);
+    prop_assert_eq!(released, visual);
     Ok(())
 }
 
@@ -498,8 +517,8 @@ fn count_play(play: &Play, c: &mut Coverage) {
         }),
     );
     c.hit(
-        "ln_released",
-        has(&|k| matches!(k, JudgeEventKind::LnReleased { .. })),
+        "ln_hold_ended",
+        has(&|k| matches!(k, JudgeEventKind::LnHoldEnded { .. })),
     );
     c.hit(
         "empty_poor",
@@ -623,7 +642,7 @@ fn generators_reach_the_fragile_spots() {
         ("mine_hit", 1),
         ("ln_release_downgrades", 1),
         ("ln_held_through", 1),
-        ("ln_released", 1),
+        ("ln_hold_ended", 1),
         ("empty_poor", 1),
         ("play_sound", 1),
         ("gauge_at_max", 1),

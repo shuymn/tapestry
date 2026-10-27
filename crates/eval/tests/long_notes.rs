@@ -72,12 +72,12 @@ fn held(events: &[JudgeEvent]) -> Vec<(i64, Judgment, i64)> {
         .collect()
 }
 
-/// Visual holds ended early: (time, note, origin).
-fn released(events: &[JudgeEvent]) -> Vec<(i64, usize, Option<i64>)> {
+/// Visual holds ended: (time, note, origin).
+fn hold_ended(events: &[JudgeEvent]) -> Vec<(i64, usize, Option<i64>)> {
     events
         .iter()
         .filter_map(|e| match e.kind {
-            JudgeEventKind::LnReleased { note, .. } => {
+            JudgeEventKind::LnHoldEnded { note, .. } => {
                 Some((e.time.0, note, e.origin.map(|o| o.0)))
             }
             _ => None,
@@ -361,13 +361,14 @@ fn t9_a_release_at_the_end_and_a_press_at_the_end() {
     let chart = ln(50 * MS);
     let end = T + 50 * MS;
     // Regression: released exactly at the end, the release judges it (its
-    // origin, a release distance of 0) and the end deadline adds nothing.
+    // origin, a release distance of 0) and ends the visual hold; the end
+    // deadline adds nothing.
     let (events, _) = play(&chart, &[press(T, 0, 1), release(end, 0, 1)]);
     assert_eq!(
         judged(&events),
         [(end, Perfect, Some(0), Some(0), Some(end))]
     );
-    assert_eq!(released(&events), [], "a release at the end is not early");
+    assert_eq!(hold_ended(&events), [(end, 0, Some(end))]);
     // Pressed at the end: decided at the press. 1 µs before: held.
     let (events, _) = play(&chart, &[press(end, 0, 1), release(end + 10 * MS, 0, 1)]);
     assert_eq!(held(&events), []);
@@ -572,7 +573,7 @@ fn l1_2_scaled_edges_beyond_2_pow_32_refuse_the_rank() {
 }
 
 #[test]
-fn l2_2_a_released_lane_ends_the_visual_hold_early() {
+fn l2_2_every_end_of_a_visual_hold_is_reported_once() {
     // A 500 ms note. Released early after a held head: the visual hold
     // ends at the release, then the release judges the long note.
     let chart = ln(500 * MS);
@@ -584,29 +585,50 @@ fn l2_2_a_released_lane_ends_the_visual_hold_early() {
         .collect();
     assert!(matches!(
         kinds[0],
-        JudgeEventKind::LnReleased { note: 0, .. }
+        JudgeEventKind::LnHoldEnded { note: 0, .. }
     ));
     assert!(matches!(kinds[1], JudgeEventKind::Judged { .. }));
-    assert_eq!(released(&events), [(T + 300 * MS, 0, Some(T + 300 * MS))]);
+    assert_eq!(hold_ended(&events), [(T + 300 * MS, 0, Some(T + 300 * MS))]);
     // A BAD head is decided at its press but stays visually held until the
     // lane is released: that release ends it and scores nothing.
     let (events, tally) = play(
         &chart,
         &[press(T - 150 * MS, 0, 1), release(T + 100 * MS, 0, 1)],
     );
-    assert_eq!(released(&events), [(T + 100 * MS, 0, Some(T + 100 * MS))]);
+    assert_eq!(hold_ended(&events), [(T + 100 * MS, 0, Some(T + 100 * MS))]);
     let at_release: Vec<_> = events
         .iter()
         .filter(|e| e.time == TimeUs(T + 100 * MS))
         .collect();
     assert_eq!(at_release.len(), 1, "no judgment or gauge at the release");
     assert_eq!((tally.counts.bad, tally.bp), (1, 1));
-    // Held through the end, or released after it: no early release.
-    for until in [T + 500 * MS, T + 600 * MS] {
-        let (events, _) = play(&chart, &[press(T, 0, 1), release(until, 0, 1)]);
-        assert_eq!(released(&events), [], "released at {until}");
-        let (events, _) = play(&chart, &[press(T - 150 * MS, 0, 1), release(until, 0, 1)]);
-        assert_eq!(released(&events), [], "BAD head released at {until}");
+    // Released exactly at the end: the release ends it, as an input. Held
+    // through the end: the end deadline ends it, with no input as origin,
+    // and the later release adds nothing. Either way once, for a held head
+    // and a BAD one alike, and before the held one's judgment.
+    let end = T + 500 * MS;
+    for (until, ended) in [(end, (end, 0, Some(end))), (end + 100 * MS, (end, 0, None))] {
+        for head in [0, -150 * MS] {
+            let (events, _) = play(&chart, &[press(T + head, 0, 1), release(until, 0, 1)]);
+            assert_eq!(
+                hold_ended(&events),
+                [ended],
+                "head {head}, released at {until}"
+            );
+            let at_end: Vec<_> = events.iter().filter(|e| e.time == TimeUs(end)).collect();
+            assert!(
+                matches!(at_end[0].kind, JudgeEventKind::LnHoldEnded { .. }),
+                "{at_end:?}"
+            );
+            let judged_at_end = usize::from(head == 0);
+            assert_eq!(
+                at_end
+                    .iter()
+                    .filter(|e| matches!(e.kind, JudgeEventKind::Judged { .. }))
+                    .count(),
+                judged_at_end
+            );
+        }
     }
 }
 
@@ -624,7 +646,7 @@ fn l2_2_another_binding_keeps_the_lane_held_until_a_disconnect() {
         disconnect(T + 350 * MS, 1),
     ];
     let (events, tally) = run(&chart, &dev, &InputStart::default(), &inputs, AFTER);
-    assert_eq!(released(&events), [(T + 350 * MS, 0, Some(T + 350 * MS))]);
+    assert_eq!(hold_ended(&events), [(T + 350 * MS, 0, Some(T + 350 * MS))]);
     // 150 ms before the end: GREAT.
     assert_eq!(
         judged(&events),
@@ -639,7 +661,7 @@ fn l2_2_another_binding_keeps_the_lane_held_until_a_disconnect() {
     assert_eq!((tally.counts.great, tally.bp, tally.combo), (1, 0, 1));
     // Without the disconnect, source 1 holds it through the end.
     let (events, _) = run(&chart, &dev, &InputStart::default(), &inputs[..3], AFTER);
-    assert_eq!(released(&events), []);
+    assert_eq!(hold_ended(&events), [(T + 500 * MS, 0, None)]);
     assert_eq!(
         judged(&events),
         [(T + 500 * MS, Perfect, Some(0), None, None)]

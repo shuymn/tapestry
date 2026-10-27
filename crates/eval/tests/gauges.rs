@@ -366,7 +366,8 @@ fn empty_poor_full_result() {
 
 #[test]
 fn ln_end_tap_miss_and_held_mine_at_one_time() {
-    // Regression for the deadline order: at 2180 ms a held LN ends (lane 2),
+    // Regression for the deadline order: at 2180 ms a held LN ends (lane 2:
+    // its visual hold ends, then it is judged),
     // a tap misses (lane 3), and a held 10-unit mine passes (lane 4). The
     // long note is judged first, then the miss, then the mine. 2 notes:
     // increment 8_000_000. The 66 % mine at 500 ms takes the normal gauge
@@ -416,6 +417,10 @@ fn ln_end_tap_miss_and_held_mine_at_one_time() {
     assert_eq!(
         at,
         [
+            JudgeEventKind::LnHoldEnded {
+                lane: lane(2),
+                note: 0,
+            },
             JudgeEventKind::Judged {
                 lane: lane(2),
                 note: 0,

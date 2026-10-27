@@ -314,7 +314,7 @@ fn overtaken_ln_head_loses_its_ln() {
     // The missed head is its long note's one POOR, never held.
     assert!(!events.iter().any(|e| matches!(
         e.kind,
-        JudgeEventKind::LnHeld { .. } | JudgeEventKind::LnReleased { .. }
+        JudgeEventKind::LnHeld { .. } | JudgeEventKind::LnHoldEnded { .. }
     )));
     assert_eq!((tally.counts.poor, tally.bp, tally.combo), (1, 1, 1));
 }
@@ -344,7 +344,7 @@ fn overtaken_ln_head_skips_its_future_end() {
     assert_eq!(judged_at(&events), [(1_140 * MS, 0), (1_140 * MS, 1)]);
     assert!(!events.iter().any(|e| matches!(
         e.kind,
-        JudgeEventKind::LnHeld { .. } | JudgeEventKind::LnReleased { .. }
+        JudgeEventKind::LnHeld { .. } | JudgeEventKind::LnHoldEnded { .. }
     )));
     assert_eq!((tally.counts.poor, tally.bp, tally.combo), (1, 1, 1));
 }

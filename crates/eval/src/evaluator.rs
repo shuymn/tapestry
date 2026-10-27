@@ -72,10 +72,12 @@ pub enum JudgeEventKind {
         /// Press time minus note time.
         deviation: TimeUs,
     },
-    /// The lane of a long note whose head press started or decided it
-    /// before its end was released before that end: the long note is no
-    /// longer held. Feedback only: it changes nothing scored.
-    LnReleased {
+    /// The visual hold of a long note whose head press started or decided
+    /// it before its end ended: its lane was released (at or before the
+    /// end) or its end passed while held. Emitted once per such long note,
+    /// before the long note's judgment when both come together. Feedback
+    /// only: it changes nothing scored.
+    LnHoldEnded {
         /// The note's lane.
         lane: Lane,
         /// The note's index in its lane of [`Chart::lanes`].
@@ -230,8 +232,8 @@ struct LaneState {
     holding: Option<Held>,
     /// The long note whose head press started or decided it before its
     /// end, while its lane stays held and its end has not passed: the
-    /// visual hold, reported by [`JudgeEventKind::LnReleased`] when a
-    /// release ends it early. It scores nothing.
+    /// visual hold, reported by [`JudgeEventKind::LnHoldEnded`] when a
+    /// release or the end ends it. It scores nothing.
     visual: Option<usize>,
     /// The first unjudged target.
     cursor: usize,
@@ -528,12 +530,13 @@ impl<'a> Evaluator<'a> {
     ///
     /// Each judgeable note is judged once (1 event plus one per gauge); a
     /// long note is held at most once (1) and its visual hold, set only by
-    /// the press that takes its head, ends early at most once (1). Each
-    /// input causes at most one press (an axis reversing releases first,
-    /// which only judges long notes and ends visual holds), which plays a
-    /// sound and may be an empty POOR (1 plus one per gauge). A scratch
-    /// release deadline only judges long notes and ends visual holds. Each
-    /// mine hits at most once (1 plus one per gauge). The song ends once.
+    /// the press that takes its head, ends at most once (1), at a release
+    /// or at its end. Each input causes at most one press (an axis
+    /// reversing releases first, which only judges long notes and ends
+    /// visual holds), which plays a sound and may be an empty POOR (1 plus
+    /// one per gauge). A scratch release deadline only judges long notes
+    /// and ends visual holds. Each mine hits at most once (1 plus one per
+    /// gauge). The song ends once.
     #[must_use]
     pub fn max_events(&self, inputs: usize) -> usize {
         let g = self.gauges.states().len();
@@ -698,11 +701,23 @@ impl<'a> Evaluator<'a> {
                 // taken one is still held here, since a release would have
                 // ended both holds: the visual hold ends, and a long note
                 // held through its end keeps its head's judgment.
-                if state.visual == Some(d.index) {
+                let visual = state.visual == Some(d.index);
+                let held = state.holding.filter(|h| h.target == d.index);
+                let note = state.targets[d.index];
+                if visual {
                     state.visual = None;
                 }
-                if let Some(held) = state.holding.filter(|h| h.target == d.index) {
+                if held.is_some() {
                     state.holding = None;
+                }
+                if visual {
+                    let kind = JudgeEventKind::LnHoldEnded {
+                        lane: lane_of(lane),
+                        note,
+                    };
+                    self.emit(d.time, None, kind, out);
+                }
+                if let Some(held) = held {
                     self.score(
                         lane,
                         d.index,
@@ -916,7 +931,7 @@ impl<'a> Evaluator<'a> {
     }
 
     /// A release edge on `lane` at evaluation time `t`: ends the visual
-    /// hold, reporting it when before the long note's end, and judges the
+    /// hold, reporting it, and judges the
     /// held long note, the worse of its head's judgment and the release's
     /// by the LN-end edges when before its end. `origin` is `None` for a
     /// scratch release deadline.
@@ -944,10 +959,10 @@ impl<'a> Evaluator<'a> {
         };
         let visual = visual.map(note_of);
         let held = held.map(|h| (h, note_of(h.target).1));
-        if let Some((note, end)) = visual
-            && t < end
-        {
-            let kind = JudgeEventKind::LnReleased {
+        // A visual hold still set is at or before its end: the end
+        // deadline clears it, and inputs come first at equal µs.
+        if let Some((note, _)) = visual {
+            let kind = JudgeEventKind::LnHoldEnded {
                 lane: lane_of(lane),
                 note,
             };

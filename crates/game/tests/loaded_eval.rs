@@ -129,7 +129,7 @@ fn loaded_charts_evaluate_as_before() {
     let expected: [(&str, &str); 6] = [
         (
             "mixed",
-            "2f91e39b5da901d9b59f8178abe99100f83e02cadc3da44128abdce266e0f4f5",
+            "80b0ded801ee42fc63ef04201bcba57c7edf33e5c195e14b938bed7792457ad8",
         ),
         (
             "cycling",
@@ -141,15 +141,15 @@ fn loaded_charts_evaluate_as_before() {
         ),
         (
             "mines",
-            "1413dd903a23aa92a4c9413df67efbd70f7835c85b315b058af3c5856e5a0b73",
+            "d32e299a25954153b2a23d8f2c4aed9a7fda41f3593c343d301dce5bbc8e7b2c",
         ),
         (
             "lntype1",
-            "d68598f7aec5778c5ab3c8775d26684c138d9ae9c1c6eaae2bab24d52b088227",
+            "24f849ebf621993349ee410e17fd06de4dc03ff042f4bfebd9e47b8bad212821",
         ),
         (
             "lnobj",
-            "d68598f7aec5778c5ab3c8775d26684c138d9ae9c1c6eaae2bab24d52b088227",
+            "24f849ebf621993349ee410e17fd06de4dc03ff042f4bfebd9e47b8bad212821",
         ),
     ];
     let got: Vec<(&str, &str)> = got.iter().map(|(n, d)| (*n, d.as_str())).collect();
