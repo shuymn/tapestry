@@ -158,7 +158,19 @@ fn category(e: &SessionError) -> &'static str {
 fn allowed(category: &str) -> bool {
     matches!(
         category,
-        "unsupported directive" | "unsupported long-note mode" | "no judgeable notes"
+        "unsupported directive"
+            | "unsupported long-note mode"
+            | "no judgeable notes"
+            // Timing values are never replaced silently: a negative BPM, a
+            // measure length of 0 (as written or cut off to it), a malformed
+            // #RANDOM or #IF operand (stage1.md D3, PR3).
+            | "invalid value"
+            // The D14 limits: longer than 60 minutes, a file over 16 MiB, a
+            // measure past 999.
+            | "loading limit"
+            // A #DEFEXRANK below 1, which the reference ignores in favor of
+            // #RANK while the loader keeps it; a known gap.
+            | "rank gives no judgment window"
     )
 }
 
@@ -167,6 +179,7 @@ fn logic_category(e: &LogicError) -> &'static str {
     match e {
         LogicError::Eval(EvalError::UnsupportedLnMode(_)) => "unsupported long-note mode",
         LogicError::Eval(EvalError::NoJudgeableNotes) => "no judgeable notes",
+        LogicError::Eval(EvalError::InvalidRank) => "rank gives no judgment window",
         LogicError::Eval(_) => "evaluator refusal",
         LogicError::RecordingTooLarge { .. } => "over the recording budget",
         _ => "logic refusal",
