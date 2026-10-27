@@ -9,9 +9,9 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 5
+//! # Loader version 6
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 5; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 6; changing any of them
 //! changes the version.
 //!
 //! - **Time:** each object's time is accumulated in exact rationals and
@@ -37,6 +37,10 @@
 //!   change. Before time 0 it runs at the `#BPM` header's rate. A position
 //!   or retained time beyond what the map holds (±2^32 µs) is a
 //!   [`LoadError::PositionOverflow`].
+//! - **Identity:** which objects are the same, which survives a conflict,
+//!   long-note pairing and a note inside a long note are decided on exact
+//!   source positions, never on floored µs: objects at distinct positions
+//!   that floor to one µs stay distinct, in position order.
 //! - **Same position:** a BPM change applies before a STOP, so the STOP uses
 //!   the new BPM; a note at a STOP's position sounds at the STOP's start.
 //!   Channel 08 wins over channel 03; within a channel the later object in
@@ -55,18 +59,19 @@
 //!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
 //!   other unknown header is a warning.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
-//!   by the previous plain note in its lane. The end plays no sound. An
-//!   empty `#LNOBJ` is ignored, with one warning per chart.
+//!   by the previous plain note in its lane, if that note sits at an
+//!   earlier position. The end plays no sound. An empty `#LNOBJ` is
+//!   ignored, with one warning per chart.
 //! - **`#LNTYPE`:** read as an integer (`01` is 1). A value naming no type
 //!   (`0`, or not a number) is read as 1, with one warning per chart; any
 //!   other number, even one too large for `u32`, is unsupported.
-//! - **`#LNTYPE 1` pairing:** endpoints at one time in a lane merge first,
-//!   keeping the later object in the file, so a duplicated line does not
-//!   split a long note. The end object's sound is the end sound when its id
+//! - **`#LNTYPE 1` pairing:** endpoints at one position in a lane merge
+//!   first, keeping the later object in the file, so a duplicated line does
+//!   not split a long note. The end object's sound is the end sound when its id
 //!   differs from the start's, otherwise there is none.
-//! - **Conflicts in a lane:** at one time one note is kept: a long note over
-//!   a tap over a mine, and the later object in the file among equals. A note
-//!   at or inside the span of an earlier long note in its lane, mines
+//! - **Conflicts in a lane:** at one position one note is kept: a long note
+//!   over a tap over a mine, and the later object in the file among equals.
+//!   A note at or inside the span of an earlier long note in its lane, mines
 //!   included, is dropped. Each dropped note is a warning.
 //! - **Sounds:** the table holds every `#WAV` in id order. A reference to an
 //!   undefined id plays nothing (BGM events are dropped). A name is tried as
@@ -127,7 +132,7 @@ use bms_model::{Chart, ChartIdentity, ModelError, ScrollMap, SoundId, SoundRef, 
 pub use error::{LoadError, Warning, WarningKind};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 5;
+pub const LOADER_VERSION: u32 = 6;
 
 /// Bounds on the work a chart may cause (design.md "Loading Limits"). The
 /// defaults sit far above real charts.

@@ -61,14 +61,14 @@ pub enum ModelError {
         /// Index of the note in its lane.
         index: usize,
     },
-    /// A long note did not end after it started.
-    LongEndNotAfterStart {
+    /// A long note ended before it started.
+    LongEndBeforeStart {
         /// Lane of the note.
         lane: Lane,
         /// Index of the note in its lane.
         index: usize,
     },
-    /// A note started at or before the end of the previous note in its lane.
+    /// A note started before the end of the previous note in its lane.
     Overlap {
         /// Lane of the note.
         lane: Lane,
@@ -125,10 +125,10 @@ impl fmt::Display for ModelError {
                     lane.index()
                 )
             }
-            Self::LongEndNotAfterStart { lane, index } => {
+            Self::LongEndBeforeStart { lane, index } => {
                 write!(
                     f,
-                    "lane {} long note {index} does not end after it starts",
+                    "lane {} long note {index} ends before it starts",
                     lane.index()
                 )
             }

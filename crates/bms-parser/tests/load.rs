@@ -485,7 +485,7 @@ fn mines_and_conflicts_follow_loader_rules() {
     let kinds: Vec<_> = loaded.warnings.iter().map(|w| &w.kind).collect();
     let count = |k: &WarningKind| kinds.iter().filter(|&&w| w == k).count();
     assert_eq!(count(&WarningKind::NoteInsideLongNoteDropped), 2);
-    assert_eq!(count(&WarningKind::SameTimeNoteDropped), 3);
+    assert_eq!(count(&WarningKind::SamePositionNoteDropped), 3);
     assert_eq!(kinds.len(), 5);
 }
 
@@ -520,27 +520,29 @@ fn duplicated_lntype1_line_keeps_one_long_note() {
     );
     assert_eq!(
         loaded.warnings.iter().map(|w| &w.kind).collect::<Vec<_>>(),
-        vec![&WarningKind::SameTimeNoteDropped; 2]
+        vec![&WarningKind::SamePositionNoteDropped; 2]
     );
 }
 
 #[test]
-fn notes_rounded_to_one_time_keep_the_later_line() {
-    // Measure 0 lasts 2 µs: the first line's note sits at 0.5 µs and the
-    // second line's at 0 µs; both floor to 0, and the later line wins even
-    // though its note comes first in time.
+fn notes_rounded_to_one_time_stay_in_position_order() {
+    // Measure 0 lasts 2 µs: the first line's note sits at 0.5 µs (1e-6
+    // beat) and the second line's at 0 µs; both floor to 0, and both stay,
+    // in position order whatever the file order.
     let text = "#BPM 120\n#WAV01 click.wav\n#WAV02 click.wav\n#00002:0.000001\n\
                 #00011:00010000\n#00011:02\n";
     let loaded = load_text(text).unwrap();
+    let tap = |pos, sound| Note {
+        time: TimeUs(0),
+        pos,
+        sound: Some(SoundId(sound)),
+        kind: NoteKind::Tap,
+    };
     assert_eq!(
         loaded.chart.lanes[1],
-        vec![Note {
-            time: TimeUs(0),
-            pos: beats(0),
-            sound: Some(SoundId(1)),
-            kind: NoteKind::Tap
-        }]
+        vec![tap(beats(0), 1), tap(Position(BEAT / 1_000_000), 0)]
     );
+    assert_eq!(loaded.warnings, vec![]);
 }
 
 #[test]
@@ -599,12 +601,12 @@ fn long_note_edge_cases() {
 #[test]
 fn resolved_hash_matches_golden() {
     // Computed at authoring time by an independent script encoding the
-    // documented fields of this chart: version 5, the 120 BPM rate
+    // documented fields of this chart: version 6, the 120 BPM rate
     // (floor(2^80 / 500_000) units per µs) before time 0 and as the one
     // segment from 0, one tap at 2 s and 4 beats on key 1 with sound 0, bar
     // lines at 0 and 4 beats, the sound name `a.wav`, an empty title and no
     // other values.
-    const GOLDEN: &str = "b7cab4b435c8a5ff08dbefecc536620b7b338527c2a2023a322b4154b2c0d2c8";
+    const GOLDEN: &str = "5c221ebe62813986a773f2f521d0be8741f2dfa956be5a5743536fc383352cce";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart
