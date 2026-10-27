@@ -38,9 +38,8 @@ fn id(n: usize) -> String {
     String::from_utf8(vec![DIGITS[n / 36], DIGITS[n % 36]]).unwrap()
 }
 
-/// Every time the chart holds, and the scroll position at each, in one list:
-/// per lane each note's time (and a long note's end), then BGM, bar lines,
-/// the initial BPM, and the scroll position at every listed time.
+/// Every time the chart holds that a clock is compared with, in one list:
+/// per lane each note's time (and a long note's end), then the BGM.
 fn fingerprint(chart: &Chart) -> Vec<i64> {
     let mut times = Vec::new();
     for lane in &chart.lanes {
@@ -54,15 +53,6 @@ fn fingerprint(chart: &Chart) -> Vec<i64> {
     }
     times.extend(chart.bgm.iter().map(|e| e.time.0));
     times.push(-1);
-    times.extend(chart.bar_lines.iter().map(|t| t.0));
-    times.push(-1);
-    let positions: Vec<i64> = times
-        .iter()
-        .filter(|&&t| t >= 0)
-        .map(|&t| chart.scroll.position_at(TimeUs(t)).0)
-        .collect();
-    times.push(chart.scroll.initial_bpm_micro());
-    times.extend(positions);
     times
 }
 
@@ -125,28 +115,118 @@ fn cycling() -> String {
     text
 }
 
+/// What the evaluator and the audio see of a load, as text: the outcome,
+/// then per lane each note's time, kind, mine damage, sound and long-note
+/// end and end sound, the BGM, the sound names, rank, TOTAL and LN mode, and
+/// the warnings in order. Display geometry is left out.
+fn projection(result: &Result<Loaded, LoadError>) -> String {
+    use std::fmt::Write;
+    let loaded = match result {
+        Ok(loaded) => loaded,
+        Err(e) => return format!("error {e:?}\n"),
+    };
+    let chart = &loaded.chart;
+    let mut out = String::from("ok\n");
+    for (l, lane) in chart.lanes.iter().enumerate() {
+        write!(out, "lane {l}:").unwrap();
+        for note in lane {
+            write!(out, " {} {:?}", note.time.0, note.sound).unwrap();
+            match note.kind {
+                NoteKind::Tap => write!(out, " tap"),
+                NoteKind::Long { end, end_sound, .. } => {
+                    write!(out, " long {} {end_sound:?}", end.0)
+                }
+                NoteKind::Mine { damage } => write!(out, " mine {damage}"),
+            }
+            .unwrap();
+        }
+        out.push('\n');
+    }
+    for e in &chart.bgm {
+        writeln!(out, "bgm {} {}", e.time.0, e.sound.0).unwrap();
+    }
+    for s in &chart.sounds {
+        writeln!(out, "sound {:?}", s.name).unwrap();
+    }
+    let meta = &chart.meta;
+    writeln!(
+        out,
+        "meta {:?} {:?} {:?}",
+        meta.rank, meta.total_milli, meta.ln_mode
+    )
+    .unwrap();
+    for w in &loaded.warnings {
+        writeln!(out, "warning {w:?}").unwrap();
+    }
+    out
+}
+
+/// Every chart this file and `tests/charts` hold, by name.
+fn fixtures() -> Vec<(String, Vec<u8>)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/charts");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    let mut out: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .map(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read(p).unwrap())
+        })
+        .collect();
+    for (name, text) in [
+        ("mixed", MIXED.to_owned()),
+        ("cycling", cycling()),
+        ("primes", primes()),
+        ("long decimals", LONG_DECIMALS.to_owned()),
+        ("growing", growing(40, 3)),
+    ] {
+        out.push((name.to_owned(), text.into_bytes()));
+    }
+    out
+}
+
+/// The evaluator-visible projection of every fixture is what loader
+/// version 4 produced before display positions entered the chart model.
+#[test]
+fn every_fixture_keeps_its_judgment_projection() {
+    let mut h = Sha256::new();
+    let fixtures = fixtures();
+    for (name, bytes) in &fixtures {
+        let dir = tempfile::tempdir().unwrap();
+        let result = load_bms(bytes, dir.path(), &LoadOptions::default());
+        h.update(name.as_bytes());
+        h.update(projection(&result).as_bytes());
+    }
+    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(fixtures.len(), 25);
+    assert_eq!(
+        digest,
+        "37922a6eb2fabb55672e19099ed30c7b6eac8b374f5d189fe42d71089c084e94"
+    );
+}
+
 #[test]
 fn few_bpm_charts_keep_their_old_times() {
     // Both expectations were produced by loader version 1 (checked `i128`
     // rationals) on these exact charts before the time representation
-    // changed.
+    // changed, and kept since.
     let mixed = fingerprint(&load(MIXED).unwrap().chart);
     assert_eq!(
         mixed,
         vec![
             5706286, 6628400, 7362754, 8097107, 8831460, -1, 1745454, 2072727, 2400000, 3600000,
             4727272, 5172211, 9565813, 10417884, -1, -1, 10701908, -1, -1, -1, -1, -1, 10474689,
-            -1, 0, 1745454, 3927272, 5706286, 9565813, 10701908, -1, 137500000, 10999999, 12099998,
-            13199999, 14299999, 15399998, 3999998, 4749999, 5500000, 6250000, 9399998, 10199999,
-            16499998, 19499998, 20499999, 19699999, 0, 3999998, 6999998, 10999999, 16499998,
-            20499999
+            -1
         ]
     );
     let cycling = fingerprint(&load(&cycling()).unwrap().chart);
-    assert_eq!(cycling.len(), 3371);
+    assert_eq!(cycling.len(), 1629);
     assert_eq!(
         digest(&cycling),
-        "b3db3cebf6af0a3a005800a04223d80fb1246d37df65211e0de7b1f2de2a477d"
+        "39aef5203823109c6c050ff3e9c43062a512e9c7f79b6e9798435abfcff44100"
     );
 }
 
@@ -157,15 +237,21 @@ const PRIMES: [u32; 20] = [
     197,
 ];
 
-#[test]
-fn many_distinct_bpms_keep_exact_time() {
+/// One measure at each of [`PRIMES`], a note at the half of each, and one
+/// at measure 20.
+fn primes() -> String {
     let mut text = String::from("#BPM 199\n#WAV01 a.wav\n");
     for (m, bpm) in PRIMES.iter().enumerate() {
         let id = id(m + 1);
         text.push_str(&format!("#BPM{id} {bpm}\n#{m:03}08:{id}\n#{m:03}11:0001\n"));
     }
     text.push_str("#02011:01\n");
-    let loaded = load(&text).unwrap();
+    text
+}
+
+#[test]
+fn many_distinct_bpms_keep_exact_time() {
+    let loaded = load(&primes()).unwrap();
     // Exact fractions in an independent script: a note at the half of each
     // measure (2 beats at its BPM after the 4-beat measures before), and
     // one at measure 20.
@@ -179,9 +265,9 @@ fn many_distinct_bpms_keep_exact_time() {
     );
 }
 
-#[test]
-fn long_decimals_and_exponents_time_exactly() {
-    let text = "\
+/// Decimals with exponents and many digits, a sub-measure STOP, and a
+/// measure 4 beats in 24 µs.
+const LONG_DECIMALS: &str = "\
 #BPM 1.5E+02
 #BPM02 98.7654321
 #BPM03 1.00001E+07
@@ -197,7 +283,10 @@ fn long_decimals_and_exponents_time_exactly() {
 #00311:0101
 #00411:01
 ";
-    let loaded = load(text).unwrap();
+
+#[test]
+fn long_decimals_and_exponents_time_exactly() {
+    let loaded = load(LONG_DECIMALS).unwrap();
     let chart = &loaded.chart;
     // Exact fractions in an independent script. Measure 1 is 0.03125 beats
     // at 150 (12_500 µs); measure 2 starts at 98.7654321 with a STOP of
