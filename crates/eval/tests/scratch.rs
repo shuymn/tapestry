@@ -223,12 +223,8 @@ fn release_after_stop_is_a_deadline_not_a_frame() {
     // deadline, 100 ms after the last movement, not at the step. It is
     // 900 ms before the end, past every LN-end edge: one BAD, with no
     // input as its origin.
-    out.clear();
     ev.advance_to(TimeUs(1_900 * MS), &mut out).unwrap();
-    assert_eq!(
-        ln_ends(&[held_event(), out.clone()].concat()),
-        [(1_100 * MS, Bad, Some(-900 * MS), None)]
-    );
+    assert_eq!(ln_ends(&out), [(1_100 * MS, Bad, Some(-900 * MS), None)]);
     assert_eq!(judged(&out), [(0, 0, Bad, Some(0))]);
     assert_eq!((ev.tally().counts.bad, ev.tally().bp), (1, 1));
     // The timeout ends the visual hold too, before the end.
@@ -238,21 +234,6 @@ fn release_after_stop_is_a_deadline_not_a_frame() {
         .map(|e| (e.time.0, e.origin))
         .collect();
     assert_eq!(ended, [(1_100 * MS, None)]);
-}
-
-/// The scratch LN's head held, for [`ln_ends`] over a later step's events.
-fn held_event() -> Vec<JudgeEvent> {
-    vec![JudgeEvent {
-        seq: 0,
-        time: TimeUs(1_000 * MS),
-        origin: None,
-        kind: JudgeEventKind::LnHeld {
-            lane: SCRATCH,
-            note: 0,
-            judgment: Perfect,
-            deviation: TimeUs(0),
-        },
-    }]
 }
 
 #[test]
@@ -290,12 +271,8 @@ fn movement_moves_pending_release_deadline() {
     let mut out = Vec::new();
     ev.advance_to(TimeUs(1_340 * MS - 1), &mut out).unwrap();
     assert_eq!(judged(&out), [], "no release at any earlier deadline");
-    out.clear();
     ev.advance_to(TimeUs(1_340 * MS), &mut out).unwrap();
-    assert_eq!(
-        ln_ends(&[held_event(), out].concat()),
-        [(1_340 * MS, Bad, Some(-660 * MS), None)]
-    );
+    assert_eq!(ln_ends(&out), [(1_340 * MS, Bad, Some(-660 * MS), None)]);
 }
 
 #[test]
