@@ -348,7 +348,7 @@ During play, only `advance_to(watermark)` is called. Even for a note whose deadl
 - The evaluator's purity is checked in part: `cargo xtask check-arch` (R1) bounds its dependencies, and `crates/eval/clippy.toml` rejects the named `std` entry points for the clock, the file system, the environment, threads and printing, and `std`'s randomly ordered hash collections. Anything outside those lists stays a reviewed invariant. In `eval`, `rules` and `bms-parser`, clippy rejects `as` casts that may truncate, wrap, or lose the sign.
 - The processing order of events at the same time is made explicit as a preset item.
 - Anything that uses randomness (`#RANDOM` branches, RANDOM-type options) is decided at the step that resolves the chart before evaluation, and the result is recorded. The evaluator itself uses no randomness.
-- Even for the same chart file, a change in the loader version can change its interpretation. So the loader version and the hash of the resolved chart are recorded.
+- Even for the same chart file, a change in the loader version can change its interpretation. So the loader version and the hash of the resolved chart are recorded, and re-evaluating a saved record against a freshly loaded chart (`eval-cli`, local input logs) refuses a record whose loader version or resolved-chart hash differs from that chart's, as it refuses another evaluator version.
 
 ## Rule Presets
 
