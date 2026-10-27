@@ -951,38 +951,36 @@ impl<'a> Evaluator<'a> {
         let held = state.holding.take();
         #[expect(
             clippy::indexing_slicing,
-            reason = "`lane` is below LANE_COUNT, both holds are positions in `targets`, and `targets` indexes the lane's notes"
+            reason = "the visual hold is a position in `targets`"
         )]
-        let note_of = |k: usize| {
-            let i = self.lanes[lane].targets[k];
-            (i, self.chart.lanes[lane][i].end())
-        };
-        let visual = visual.map(note_of);
-        let held = held.map(|h| (h, note_of(h.target).1));
-        // A visual hold still set is at or before its end: the end
-        // deadline clears it, and inputs come first at equal µs.
-        if let Some((note, _)) = visual {
+        let visual = visual.map(|k| state.targets[k]);
+        if let Some(note) = visual {
             let kind = JudgeEventKind::LnHoldEnded {
                 lane: lane_of(lane),
                 note,
             };
             self.emit(t, origin, kind, out);
         }
-        let Some((held, end)) = held else {
+        let Some(held) = held else {
             return;
         };
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` is below LANE_COUNT, `held.target` is a position in `targets`, and `targets` indexes the lane's notes"
+        )]
+        let end = self.chart.lanes[lane][self.lanes[lane].targets[held.target]].end();
         // A held long note is judged by its end deadline, which comes after
-        // every input of its µs, so `t` is at most `end`.
-        let before = i64::try_from(i128::from(t.0) - i128::from(end.0))
-            .unwrap_or(i64::MIN)
-            .min(0);
-        let judgment = held.judgment.max(self.ln_end.judgment_of(TimeUs(before)));
+        // every input of its µs, so `t` is at most `end`. It is at least
+        // the head minus the BAD window, so with note times and LN ends in
+        // ±2^32 µs and edges at most 2^32 µs, −3·2^32 ≤ t − end ≤ 0.
+        let before = TimeUs(t.0 - end.0);
+        let judgment = held.judgment.max(self.ln_end.judgment_of(before));
         self.score(
             lane,
             held.target,
             judgment,
             Some(held.deviation),
-            Some(TimeUs(before)),
+            Some(before),
             t,
             origin,
             out,
