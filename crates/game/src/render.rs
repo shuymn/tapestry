@@ -162,7 +162,6 @@ mod tests {
                 combo: 0,
                 max_combo: 0,
                 empty_poor: 0,
-                ln_breaks: 0,
             },
             gauges: Vec::new(),
             complete: false,

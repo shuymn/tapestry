@@ -9,7 +9,7 @@ use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
 use common::{MS, device, lane, press, release};
 use eval::{
     AxisBinding, AxisMode, ControlId, EvalInput, Evaluation, InputKind, JudgeEvent, JudgeEventKind,
-    LnOutcome, PhysicalInputEvent, ScratchSettings, SourceId, evaluate,
+    PhysicalInputEvent, ScratchSettings, SourceId, evaluate,
 };
 use rules::{GaugeValue, Judgment, RulePreset};
 
@@ -41,16 +41,6 @@ fn judged(events: &[JudgeEvent]) -> Vec<Judged> {
         .collect()
 }
 
-fn ln_ends(events: &[JudgeEvent]) -> Vec<(usize, LnOutcome, i64)> {
-    events
-        .iter()
-        .filter_map(|e| match e.kind {
-            JudgeEventKind::LnEnd { note, outcome, .. } => Some((note, outcome, e.time.0)),
-            _ => None,
-        })
-        .collect()
-}
-
 fn mine_hits(events: &[JudgeEvent]) -> Vec<(usize, i64)> {
     events
         .iter()
@@ -75,12 +65,6 @@ fn eval_with(chart: &Chart, preset: &RulePreset, inputs: Vec<PhysicalInputEvent>
 
 fn eval(chart: &Chart, inputs: Vec<PhysicalInputEvent>) -> Evaluation {
     eval_with(chart, &rules::custom(), inputs)
-}
-
-fn with_margin(us: i64) -> RulePreset {
-    let mut p = rules::custom();
-    p.ln_break.release_margin = TimeUs(us);
-    p
 }
 
 /// The final value of gauge `g` (0 normal, 1 survival).
@@ -141,6 +125,7 @@ fn presses_at_one_microsecond_take_its_notes_in_order() {
 }
 
 /// A long note whose head and end are both at `T`, on key 1.
+/// A long note whose head and end are both at `T`, on key 1.
 fn zero_length_ln() -> Chart {
     ChartBuilder::new(BPM)
         .long(lane(1), TimeUs(T), TimeUs(T))
@@ -148,38 +133,82 @@ fn zero_length_ln() -> Chart {
         .unwrap()
 }
 
-#[test]
-fn an_early_release_of_a_zero_length_ln_breaks_only_past_the_margin() {
-    let chart = zero_length_ln();
-    let inputs = || vec![press(T - 1, 0, 1), release(T - 1, 0, 1)];
-    // Margin 0: a release at T - 1 is before T - 0, a break.
-    let broken = eval_with(&chart, &with_margin(0), inputs());
-    // Margin 1 µs: T - 1 is not before T - 1, so the LN completes.
-    let completed = eval_with(&chart, &with_margin(1), inputs());
-    for e in [&broken, &completed] {
-        assert_eq!(
-            judged(&e.events),
-            vec![(1, 0, Judgment::Perfect, Some(-1), T - 1)]
-        );
-        assert_eq!(e.tally.counts.perfect, 1);
-    }
-    assert_eq!(ln_ends(&broken.events), vec![(0, LnOutcome::Broken, T - 1)]);
-    assert_eq!(
-        ln_ends(&completed.events),
-        vec![(0, LnOutcome::Completed, T - 1)]
-    );
-    assert_eq!((broken.tally.ln_breaks, broken.tally.bp), (1, 1));
-    assert_eq!((completed.tally.ln_breaks, completed.tally.bp), (0, 0));
-    assert_eq!(broken.tally.combo, 0);
-    // The break costs the normal gauge 6 % and the survival gauge 9 %
-    // (from 100 %, after the PERFECT's gain is capped there).
-    assert_eq!(gauge(&completed, 0) - gauge(&broken, 0), pct(6));
-    assert_eq!(gauge(&completed, 1), pct(100));
-    assert_eq!(gauge(&broken, 1), pct(91));
+/// The long-note heads held: (note, judgment, deviation, time).
+fn held(events: &[JudgeEvent]) -> Vec<(usize, Judgment, i64, i64)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            JudgeEventKind::LnHeld {
+                note,
+                judgment,
+                deviation,
+                ..
+            } => Some((note, judgment, deviation.0, e.time.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each judgment's release distance from its end, and its origin.
+fn releases(events: &[JudgeEvent]) -> Vec<(Option<i64>, Option<i64>)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            JudgeEventKind::Judged { release, .. } => {
+                Some((release.map(|r| r.0), e.origin.map(|o| o.0)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
-fn a_zero_length_ln_pressed_on_time_or_late_completes_at_the_press() {
+fn a_zero_length_ln_pressed_early_is_held_to_its_end() {
+    // Regression: an early head of a zero-length long note is held, and
+    // judged at its end (a deadline) or at the release that ends it.
+    let chart = zero_length_ln();
+    // Held through the end: the head's judgment at the end deadline.
+    for (h, judgment) in [(-20 * MS, Judgment::Perfect), (-45 * MS, Judgment::Great)] {
+        let e = eval(&chart, vec![press(T + h, 0, 1)]);
+        assert_eq!(held(&e.events), vec![(0, judgment, h, T + h)], "{h}");
+        assert_eq!(judged(&e.events), vec![(1, 0, judgment, Some(h), T)], "{h}");
+        assert_eq!(releases(&e.events), vec![(None, None)], "{h}");
+    }
+    // Pressed 1 µs early, released at the end: judged at the release, which
+    // is exactly at the end.
+    let e = eval(&chart, vec![press(T - 1, 0, 1), release(T, 0, 1)]);
+    assert_eq!(
+        judged(&e.events),
+        vec![(1, 0, Judgment::Perfect, Some(-1), T)]
+    );
+    assert_eq!(releases(&e.events), vec![(Some(0), Some(T))]);
+    // Pressed and released 1 µs early: the release is 1 µs before the
+    // end, inside the PERFECT edge (100 ms).
+    let e = eval(&chart, vec![press(T - 1, 0, 1), release(T - 1, 0, 1)]);
+    assert_eq!(
+        judged(&e.events),
+        vec![(1, 0, Judgment::Perfect, Some(-1), T - 1)]
+    );
+    assert_eq!(releases(&e.events), vec![(Some(-1), Some(T - 1))]);
+    // A GOOD head (−100 ms) released 50 ms early (a PERFECT release): the
+    // worse, GOOD, at the release.
+    let e = eval(
+        &chart,
+        vec![press(T - 100 * MS, 0, 1), release(T - 50 * MS, 0, 1)],
+    );
+    assert_eq!(
+        judged(&e.events),
+        vec![(1, 0, Judgment::Good, Some(-100 * MS), T - 50 * MS)]
+    );
+    assert_eq!(
+        releases(&e.events),
+        vec![(Some(-50 * MS), Some(T - 50 * MS))]
+    );
+    assert_eq!((e.tally.combo, e.tally.bp), (1, 0));
+}
+
+#[test]
+fn a_zero_length_ln_pressed_on_time_or_late_is_decided_at_the_press() {
     let chart = zero_length_ln();
     for (at, judgment) in [(T, Judgment::Perfect), (T + 30 * MS, Judgment::Great)] {
         let e = eval(&chart, vec![press(at, 0, 1), release(at + 200 * MS, 0, 1)]);
@@ -188,32 +217,35 @@ fn a_zero_length_ln_pressed_on_time_or_late_completes_at_the_press() {
             vec![(1, 0, judgment, Some(at - T), at)],
             "{at}"
         );
-        // One completion at the press; the later release adds nothing.
-        assert_eq!(ln_ends(&e.events), vec![(0, LnOutcome::Completed, at)]);
-        assert_eq!((e.tally.ln_breaks, e.tally.bp), (0, 0));
+        // Decided at the press, never held; the later release adds nothing.
+        assert_eq!(held(&e.events), vec![], "{at}");
+        assert_eq!(releases(&e.events), vec![(None, Some(at))], "{at}");
+        assert_eq!(e.tally.bp, 0);
     }
 }
 
 #[test]
-fn a_missed_zero_length_ln_is_one_poor_without_an_end() {
+fn a_missed_zero_length_ln_is_one_poor() {
     let chart = zero_length_ln();
     let e = eval(&chart, vec![]);
     assert_eq!(
         judged(&e.events),
         vec![(1, 0, Judgment::Poor, None, T + 180 * MS)]
     );
-    assert_eq!(ln_ends(&e.events), vec![]);
-    assert_eq!((e.tally.ln_breaks, e.tally.bp), (0, 1));
+    assert_eq!(held(&e.events), vec![]);
+    assert_eq!(e.tally.bp, 1);
 }
 
 #[test]
 fn a_head_at_the_microsecond_its_previous_ln_ends() {
+    // Regression for the judgment time: LN A from T to T + 200 ms and a tap
+    // B at its end. Held through the end, released and pressed again at
+    // that µs: A is judged by the release, exactly at its end, then B.
     let chart = ChartBuilder::new(BPM)
         .long(lane(1), TimeUs(T), TimeUs(T + 200 * MS))
         .tap(lane(1), TimeUs(T + 200 * MS))
         .build()
         .unwrap();
-    // Held through the end, released and pressed again at that µs.
     let inputs = vec![
         press(T, 0, 1),
         release(T + 200 * MS, 0, 1),
@@ -221,18 +253,19 @@ fn a_head_at_the_microsecond_its_previous_ln_ends() {
         release(T + 250 * MS, 0, 1),
     ];
     let e = eval(&chart, inputs);
+    assert_eq!(held(&e.events), vec![(0, Judgment::Perfect, 0, T)]);
     assert_eq!(
         judged(&e.events),
         vec![
-            (1, 0, Judgment::Perfect, Some(0), T),
+            (1, 0, Judgment::Perfect, Some(0), T + 200 * MS),
             (1, 1, Judgment::Perfect, Some(0), T + 200 * MS),
         ]
     );
     assert_eq!(
-        ln_ends(&e.events),
-        vec![(0, LnOutcome::Completed, T + 200 * MS)]
+        releases(&e.events),
+        vec![(Some(0), Some(T + 200 * MS)), (None, Some(T + 200 * MS))]
     );
-    assert_eq!((e.tally.bp, e.tally.empty_poor), (0, 0));
+    assert_eq!((e.tally.bp, e.tally.empty_poor, e.tally.combo), (0, 0, 2));
 }
 
 /// Source 0 with an absolute axis (256 a revolution, default thresholds) on

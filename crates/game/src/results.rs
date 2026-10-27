@@ -38,6 +38,10 @@ pub const MIN_OFFSET_SAMPLES: usize = 32;
 /// Why a record could not be re-evaluated.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReEvaluationError {
+    /// The record was made by an evaluator version other than the one the
+    /// preset runs on, so its rules are not this build's.
+    #[error("the record was made by evaluator version {0}, which this build does not run")]
+    UnsupportedEvaluator(u32),
     /// The record names a preset other than the one given.
     #[error("the record names another preset")]
     PresetMismatch,
@@ -72,7 +76,13 @@ pub struct ReEvaluate;
 impl ResultExtension for ReEvaluate {
     fn on_play_end(&mut self, ctx: &ResultContext<'_>) -> ResultSummary {
         let rec = ctx.record;
-        let evaluation = if replay::preset_hash(ctx.preset) == rec.preset.sha256 {
+        // The evaluator version first: a record of another version is
+        // refused whatever preset it names.
+        let evaluation = if rec.versions.evaluator != ctx.preset.implementation.version() {
+            Err(ReEvaluationError::UnsupportedEvaluator(
+                rec.versions.evaluator,
+            ))
+        } else if replay::preset_hash(ctx.preset) == rec.preset.sha256 {
             let input = EvalInput {
                 events: rec.events.clone(),
                 device: rec.devices.profile(),
@@ -134,6 +144,7 @@ mod tests {
                 note: 0,
                 judgment: Judgment::Great,
                 deviation: deviation.map(TimeUs),
+                release: None,
                 combo: 0,
             },
         }

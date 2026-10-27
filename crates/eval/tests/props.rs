@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 
 use bms_model::TimeUs;
 use eval::{
-    EvalInput, Evaluation, Evaluator, JudgeEventKind, LnOutcome, PhysicalInputEvent, SourceId,
-    Staged, evaluate, evaluation_time, merge,
+    EvalInput, Evaluation, Evaluator, JudgeEventKind, PhysicalInputEvent, SourceId, Staged,
+    evaluate, evaluation_time, merge,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -32,8 +32,8 @@ use rules::{GaugeKind, GaugeValue, RulePreset};
 
 use live::{Delivery, Live, live};
 use strategy::{
-    Play, build_delivery, build_play, build_widening, end_of, interleave, raw_delivery, raw_play,
-    raw_widening,
+    Play, build_delivery, build_held_through, build_play, build_widening, end_of, interleave,
+    raw_delivery, raw_held_through, raw_play, raw_widening,
 };
 
 /// A generated play and 1 to 4 delivery schedules for it.
@@ -149,6 +149,140 @@ fn check_gauges(preset: &RulePreset, e: &Evaluation) -> Result<(), TestCaseError
     Ok(())
 }
 
+/// The long-note rules on one completed evaluation: every judgeable note
+/// has exactly one judgment, and only a judgment, an empty POOR or a mine
+/// hit changes the gauges. A held head comes at most once per long note,
+/// before its judgment, with the judgment's deviation and never worse
+/// than it; while it is held, its lane sees no press. A visual hold ends
+/// early at most once per long note, before its end. A release distance is
+/// given only for a long note, and never positive.
+fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
+    use eval::JudgeEventKind as K;
+    use std::collections::BTreeSet;
+    prop_assert!(e.completed);
+    let note_of = |lane: bms_model::Lane, note: usize| play.chart.lanes[lane.index()][note];
+    let mut judged = BTreeSet::new();
+    let mut held: BTreeMap<(usize, usize), (rules::Judgment, TimeUs)> = BTreeMap::new();
+    let mut released = BTreeSet::new();
+    // Per lane, the long note held and not yet judged.
+    let mut holding: [Option<usize>; bms_model::LANE_COUNT] = [None; bms_model::LANE_COUNT];
+    let mut scoring = false;
+    for ev in &e.events {
+        if let K::Gauge { .. } = ev.kind {
+            prop_assert!(scoring, "a gauge change after {:?}", ev);
+            continue;
+        }
+        scoring = matches!(
+            ev.kind,
+            K::Judged { .. } | K::EmptyPoor { .. } | K::MineHit { .. }
+        );
+        match ev.kind {
+            K::Judged {
+                lane,
+                note,
+                judgment,
+                deviation,
+                release,
+                ..
+            } => {
+                let l = lane.index();
+                prop_assert!(judged.insert((l, note)), "judged twice: {:?}", ev);
+                let long = matches!(note_of(lane, note).kind, bms_model::NoteKind::Long { .. });
+                prop_assert!(release.is_none() || long);
+                prop_assert!(release.is_none_or(|r| r.0 <= 0));
+                if let Some(&(head, d)) = held.get(&(l, note)) {
+                    prop_assert!(head <= judgment, "{:?} held, then {:?}", head, ev);
+                    prop_assert_eq!(deviation, Some(d));
+                    prop_assert_eq!(holding[l], Some(note));
+                    holding[l] = None;
+                } else {
+                    prop_assert!(holding[l].is_none(), "a press while held: {:?}", ev);
+                }
+            }
+            K::LnHeld {
+                lane,
+                note,
+                judgment,
+                deviation,
+            } => {
+                let l = lane.index();
+                prop_assert!(holding[l].is_none(), "a press while held: {:?}", ev);
+                prop_assert!(held.insert((l, note), (judgment, deviation)).is_none());
+                prop_assert!(judgment < rules::Judgment::Bad);
+                prop_assert!(ev.time < note_of(lane, note).end());
+                holding[l] = Some(note);
+            }
+            K::LnReleased { lane, note } => {
+                prop_assert!(released.insert((lane.index(), note)));
+                prop_assert!(ev.time < note_of(lane, note).end());
+            }
+            K::EmptyPoor { lane } | K::PlaySound { lane, .. } => {
+                prop_assert!(
+                    holding[lane.index()].is_none(),
+                    "a press while held: {:?}",
+                    ev
+                );
+            }
+            K::MineHit { .. } | K::Gauge { .. } | K::SongEnd => {}
+        }
+    }
+    let notes: BTreeSet<(usize, usize)> = play
+        .chart
+        .lanes
+        .iter()
+        .enumerate()
+        .flat_map(|(l, notes)| {
+            notes.iter().enumerate().filter_map(move |(i, n)| {
+                (!matches!(n.kind, bms_model::NoteKind::Mine { .. })).then_some((l, i))
+            })
+        })
+        .collect();
+    prop_assert_eq!(judged, notes);
+    Ok(())
+}
+
+proptest! {
+    /// Long notes: one judgment each, held heads and visual holds as the
+    /// rule says, no scoring outside a judgment, and no press while held.
+    #[test]
+    fn every_judgeable_note_is_judged_once(play in play()) {
+        check_play(&play)?;
+        let whole = eval_ok(&play, &play.input)?;
+        check_long_notes(&play, &whole)?;
+    }
+
+    /// A long note pressed inside its scaled BAD window and held at least
+    /// as long as it lasts gets exactly its head's judgment, under any
+    /// valid preset and rank scale: its release is at or after `h` from
+    /// its end, which the LN-end edges grade no worse than the head.
+    #[test]
+    fn holding_as_long_as_the_long_note_keeps_the_head_judgment(raw in raw_held_through()) {
+        let p = build_held_through(&raw);
+        prop_assert_eq!(p.preset.validate(), Ok(()));
+        let e = evaluate(&p.chart, &p.input, &p.preset)
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+        // The head's judgment by the scaled windows, by hand.
+        let scaled = |edge: TimeUs| edge.0 * p.scale / 100_000;
+        let expected = p
+            .preset
+            .windows
+            .table()
+            .into_iter()
+            .find(|(_, w)| -scaled(w.early) <= p.deviation && p.deviation <= scaled(w.late))
+            .map(|(j, _)| j)
+            .unwrap();
+        let judgments: Vec<_> = e
+            .events
+            .iter()
+            .filter_map(|ev| match ev.kind {
+                JudgeEventKind::Judged { judgment, deviation, .. } => Some((judgment, deviation)),
+                _ => None,
+            })
+            .collect();
+        prop_assert_eq!(judgments, vec![(expected, Some(TimeUs(p.deviation)))]);
+    }
+}
+
 proptest! {
     /// P1: any legal delivery schedule ending in a common terminal
     /// watermark gives the batch result.
@@ -228,9 +362,9 @@ proptest! {
         check_gauges(&play.preset, &whole)?;
     }
 
-    /// P5: widening only the judgment windows never worsens a note's
-    /// judgment when each lane holds one judgeable note and gets at most
-    /// one press.
+    /// P5: widening the judgment windows and the LN-end edges never
+    /// worsens a note's judgment when each lane holds one judgeable note
+    /// and gets at most one press.
     #[test]
     fn widening_the_windows_never_worsens_a_judgment(raw in raw_widening()) {
         let w = build_widening(&raw);
@@ -336,17 +470,36 @@ fn count_play(play: &Play, c: &mut Coverage) {
         "mine_hit",
         has(&|k| matches!(k, JudgeEventKind::MineHit { .. })),
     );
+    // A long note released before its end, judged by its LN-end edges
+    // worse than its head.
     c.hit(
-        "ln_break",
-        has(&|k| {
-            matches!(
-                k,
-                JudgeEventKind::LnEnd {
-                    outcome: LnOutcome::Broken,
-                    ..
-                }
-            )
+        "ln_release_downgrades",
+        whole.events.iter().any(|e| match e.kind {
+            JudgeEventKind::Judged {
+                lane,
+                note,
+                judgment,
+                release: Some(r),
+                ..
+            } if r.0 < 0 => whole.events.iter().any(|h| {
+                matches!(h.kind, JudgeEventKind::LnHeld { lane: hl, note: hn, judgment: hj, .. }
+                    if hl == lane && hn == note && hj < judgment)
+            }),
+            _ => false,
         }),
+    );
+    // A long note held through its end, judged by its end deadline.
+    c.hit(
+        "ln_held_through",
+        whole.events.iter().any(|e| {
+            e.origin.is_none()
+                && matches!(e.kind, JudgeEventKind::Judged { lane, note, deviation: Some(_), release: None, .. }
+                if play.chart.lanes[lane.index()][note].end() == e.time)
+        }),
+    );
+    c.hit(
+        "ln_released",
+        has(&|k| matches!(k, JudgeEventKind::LnReleased { .. })),
     );
     c.hit(
         "empty_poor",
@@ -356,13 +509,12 @@ fn count_play(play: &Play, c: &mut Coverage) {
         "play_sound",
         has(&|k| matches!(k, JudgeEventKind::PlaySound { .. })),
     );
-    // A scratch release deadline finishing a long note before its end.
+    // A scratch release deadline judging a long note before its end.
     c.hit(
         "scratch_release",
         whole.events.iter().any(|e| {
             e.origin.is_none()
-                && matches!(e.kind, JudgeEventKind::LnEnd { lane, note, .. }
-                if play.chart.lanes[lane.index()][note].end() != e.time)
+                && matches!(e.kind, JudgeEventKind::Judged { release: Some(r), .. } if r.0 < 0)
         }),
     );
     c.hit(
@@ -469,7 +621,9 @@ fn generators_reach_the_fragile_spots() {
         ("terminal_before_final_deadline", 1),
         ("scratch_release", 1),
         ("mine_hit", 1),
-        ("ln_break", 1),
+        ("ln_release_downgrades", 1),
+        ("ln_held_through", 1),
+        ("ln_released", 1),
         ("empty_poor", 1),
         ("play_sound", 1),
         ("gauge_at_max", 1),

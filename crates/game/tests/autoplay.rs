@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, ScheduledKind, SimConfig, SimDevice};
 use bms_model::{Chart, ChartBuilder, SoundId, TimeSource, TimeUs, VirtualClock};
 use common::{MS, PERIOD, RATE, lane};
-use eval::{ControlId, EvalInput, InputStart, JudgeEventKind, LnOutcome};
+use eval::{ControlId, EvalInput, InputStart, JudgeEventKind};
 use game::{
     Adjust, AudioQueue, ChartIngest, Closing, Command, ControllerDevice, DataRoot, DeviceSettings,
     IngestError, Ingested, KeyConfig, LaneKey, Loaded, Opening, Parts, PlayEnd, PlayReport,
@@ -333,13 +333,16 @@ fn assert_all_perfect(report: &PlayReport, notes: usize) {
         evaluation.tally.counts.perfect,
         u32::try_from(notes).unwrap()
     );
-    assert_eq!(evaluation.tally.ln_breaks, 0);
+    assert_eq!(
+        (evaluation.tally.bp, evaluation.tally.max_combo),
+        (0, u32::try_from(notes).unwrap())
+    );
 }
 
 /// G1: an unsaved session keeps its record in memory, re-evaluates it to
-/// the live play (every note PERFECT, both long notes completed, no LN
-/// break), and writes no records folder; the same session with the
-/// standard parts saves (the positive control).
+/// the live play (every note PERFECT, both long notes held and judged by
+/// their release at their end), and writes no records folder; the same
+/// session with the standard parts saves (the positive control).
 #[test]
 fn unsaved_session_keeps_no_records_and_judges_every_note_perfect() {
     let chart = chart();
@@ -354,20 +357,32 @@ fn unsaved_session_keeps_no_records_and_judges_every_note_perfect() {
         let record = report.record.as_ref().unwrap();
         assert_eq!(record.events.len(), 2 * notes);
         let evaluation = report.result.as_ref().unwrap().evaluation.as_ref().unwrap();
-        let completed = evaluation
-            .events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    JudgeEventKind::LnEnd {
-                        outcome: LnOutcome::Completed,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(completed, 2);
+        // Each long note is held, then judged by its release exactly at
+        // its end.
+        let count = |f: fn(&JudgeEventKind) -> bool| {
+            evaluation.events.iter().filter(|e| f(&e.kind)).count()
+        };
+        assert_eq!(
+            count(|k| matches!(
+                k,
+                JudgeEventKind::LnHeld {
+                    judgment: Judgment::Perfect,
+                    ..
+                }
+            )),
+            2
+        );
+        assert_eq!(
+            count(|k| matches!(
+                k,
+                JudgeEventKind::Judged {
+                    judgment: Judgment::Perfect,
+                    release: Some(TimeUs(0)),
+                    ..
+                }
+            )),
+            2
+        );
         if saved {
             assert!(matches!(report.saved, Some(Ok(_))), "{:?}", report.saved);
             assert!(root.records().is_dir());

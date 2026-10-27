@@ -3,7 +3,7 @@
 //! Each choice enum has only the variants a preset in use needs; a later
 //! preset adds the variant it needs.
 
-use bms_model::{JudgeRank, TimeUs};
+use bms_model::{DOMAIN, JudgeRank, TimeUs};
 
 /// A gauge amount in units of 1/100000 % (1 % = `100_000`, 100 % =
 /// `10_000_000`).
@@ -94,6 +94,10 @@ pub enum Implementation {
 }
 
 impl Implementation {
+    /// The version of the standard evaluator this build runs. A preset or
+    /// record naming another version is refused, never evaluated.
+    pub const STANDARD_VERSION: u32 = 2;
+
     /// The implementation's name as recorded.
     #[must_use]
     pub const fn name(&self) -> &'static str {
@@ -107,6 +111,15 @@ impl Implementation {
     pub const fn version(&self) -> u32 {
         match self {
             Self::Standard { version } => *version,
+        }
+    }
+
+    /// Whether this build runs it: the standard evaluator at
+    /// [`STANDARD_VERSION`](Self::STANDARD_VERSION).
+    #[must_use]
+    pub const fn is_supported(&self) -> bool {
+        match self {
+            Self::Standard { version } => *version == Self::STANDARD_VERSION,
         }
     }
 }
@@ -166,27 +179,14 @@ impl JudgeWindows {
         ]
     }
 
-    /// Every edge multiplied by `scale_milli` (thousandths of a percent, see
-    /// [`RankScale::scale_milli`]).
-    ///
-    /// Each edge is `floor(edge × scale_milli / 100_000)`, computed in
-    /// `i128`, so a fractional µs is dropped and the window never grows by
-    /// rounding. `None` when the scale is not positive or an edge leaves the
-    /// `i64` range.
+    /// Every edge scaled by `scale_milli` with [`scale_edge`]. `None` when
+    /// the scale is not positive or an edge leaves `0..=`[`MAX_WINDOW_EDGE`].
     #[must_use]
     pub fn scaled(&self, scale_milli: i64) -> Option<Self> {
-        if scale_milli <= 0 {
-            return None;
-        }
-        let edge = |t: TimeUs| -> Option<TimeUs> {
-            let v = (i128::from(t.0) * i128::from(scale_milli))
-                .div_euclid(i128::from(SCALE_FULL_MILLI));
-            i64::try_from(v).ok().map(TimeUs)
-        };
         let window = |w: Window| -> Option<Window> {
             Some(Window {
-                early: edge(w.early)?,
-                late: edge(w.late)?,
+                early: scale_edge(w.early, scale_milli)?,
+                late: scale_edge(w.late, scale_milli)?,
             })
         };
         Some(Self {
@@ -195,6 +195,80 @@ impl JudgeWindows {
             good: window(self.good)?,
             bad: window(self.bad)?,
         })
+    }
+}
+
+/// The widest a window or LN-end edge may be, before and after the rank
+/// scale: the chart time domain, `2^32` µs. With note times and LN ends
+/// inside `±2^32` µs, a press deviation and a release's distance from its
+/// long note's end fit in `i64`.
+pub const MAX_WINDOW_EDGE: TimeUs = TimeUs(DOMAIN);
+
+/// `edge` multiplied by `scale_milli` (thousandths of a percent, see
+/// [`RankScale::scale_milli`]): `floor(edge × scale_milli / 100_000)`,
+/// computed in `i128`, so a fractional µs is dropped and a window never
+/// grows by rounding. `None` when the scale is not positive or the result
+/// lies outside `0..=`[`MAX_WINDOW_EDGE`].
+#[must_use]
+pub fn scale_edge(edge: TimeUs, scale_milli: i64) -> Option<TimeUs> {
+    if scale_milli <= 0 {
+        return None;
+    }
+    let v = (i128::from(edge.0) * i128::from(scale_milli)).div_euclid(i128::from(SCALE_FULL_MILLI));
+    let v = i64::try_from(v).ok()?;
+    (0..=MAX_WINDOW_EDGE.0).contains(&v).then_some(TimeUs(v))
+}
+
+/// The early edges of a long note's end, as distances before the end.
+///
+/// A release at `d = release − end`, before the end, gets the best judgment
+/// whose edge holds `−edge ≤ d` (inclusive, like a note window), else BAD.
+/// The long note's judgment is the worse of its head's and its release's,
+/// so a release at or after the end leaves the head's judgment. LN mode
+/// reads no late side, and a BAD edge would decide nothing, so neither is
+/// held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LnEndWindows {
+    /// PERFECT.
+    pub perfect: TimeUs,
+    /// GREAT.
+    pub great: TimeUs,
+    /// GOOD.
+    pub good: TimeUs,
+}
+
+impl LnEndWindows {
+    /// The edges best first, each with its judgment.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn table(&self) -> [(Judgment, TimeUs); 3] {
+        [
+            (Judgment::Perfect, self.perfect),
+            (Judgment::Great, self.great),
+            (Judgment::Good, self.good),
+        ]
+    }
+
+    /// Every edge scaled by `scale_milli` with [`scale_edge`], the factor
+    /// the note windows take. `None` as for [`JudgeWindows::scaled`].
+    #[must_use]
+    pub fn scaled(&self, scale_milli: i64) -> Option<Self> {
+        Some(Self {
+            perfect: scale_edge(self.perfect, scale_milli)?,
+            great: scale_edge(self.great, scale_milli)?,
+            good: scale_edge(self.good, scale_milli)?,
+        })
+    }
+
+    /// The judgment of a release at `d = release − end`: the best whose
+    /// edge holds `−edge ≤ d`, else BAD. Compared in `i128`.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn judgment_of(&self, d: TimeUs) -> Judgment {
+        self.table()
+            .into_iter()
+            .find(|&(_, edge)| -i128::from(edge.0) <= i128::from(d.0))
+            .map_or(Judgment::Bad, |(j, _)| j)
     }
 }
 
@@ -231,24 +305,8 @@ pub struct EmptyPoorRule {
     pub counted: bool,
 }
 
-/// LN break: releasing a long note too early after its head was scored.
-///
-/// A release strictly earlier than `end − release_margin` breaks the LN: the
-/// head's judgment, counts and EX score stay, `ln_breaks` grows by one, and
-/// the gauge takes [`GaugeRule::ln_break`]. The LN is finished, and a later
-/// press on the lane is an ordinary press.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LnBreakRule {
-    /// How long before the LN's end a release is still not a break.
-    pub release_margin: TimeUs,
-    /// Whether a break breaks the combo.
-    pub breaks_combo: bool,
-    /// Whether a break adds to BP.
-    pub counts_bp: bool,
-}
-
-/// How `#RANK` and `#DEFEXRANK` scale every window, in thousandths of a
-/// percent (`100_000` = unchanged).
+/// How `#RANK` and `#DEFEXRANK` scale every window and LN-end edge, in
+/// thousandths of a percent (`100_000` = unchanged).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RankScale {
     /// The scale for `#RANK 0` to `#RANK 3`.
@@ -278,7 +336,7 @@ impl RankScale {
 /// Which notes make up the gauge denominator (the `notes` of `TOTAL/notes`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Denominator {
-    /// Taps and LN heads; mines are excluded.
+    /// Taps and long notes, one judgment each; mines are excluded.
     TapsAndLnHeads,
 }
 
@@ -372,8 +430,6 @@ pub struct GaugeRule {
     pub change: PerJudgment<GaugeDelta>,
     /// Change for an empty POOR.
     pub empty_poor: GaugeDelta,
-    /// Change for an LN break.
-    pub ln_break: GaugeDelta,
     /// Reduced damage while low, if any. Applies to every negative change
     /// except mines.
     pub low_damage: Option<LowDamage>,
@@ -409,16 +465,17 @@ pub enum Assignment {
 /// How long notes are judged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LnMode {
-    /// Only the head is judged, as a tap; holding to the end (see
-    /// [`LnBreakRule`]) completes it.
+    /// One judgment per long note: the worse of its head's (by the note
+    /// windows) and its release's (by [`LnEndWindows`]). A head graded BAD
+    /// decides the long note at the press, and a missed head is one POOR.
     Ln,
 }
 
 /// What a head pressed after its LN's end does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LateHeadRule {
-    /// A head pressed inside its late window but after the LN's end is judged
-    /// by its deviation, the LN counts as completed at the press, and the
+    /// A head pressed inside its late window at or after the LN's end
+    /// decides the long note at the press with the head's judgment, and the
     /// following release is ignored.
     CompletesAtPress,
 }
@@ -479,8 +536,8 @@ pub struct RulePreset {
     pub miss: MissRule,
     /// Empty POOR.
     pub empty_poor: EmptyPoorRule,
-    /// LN break.
-    pub ln_break: LnBreakRule,
+    /// The early edges of a long note's end at scale 100 %.
+    pub ln_end: LnEndWindows,
     /// Window scale per rank.
     pub rank_scale: RankScale,
     /// `#TOTAL` when the chart declares none, in thousandths.
@@ -505,7 +562,7 @@ pub struct RulePreset {
 
 #[cfg(test)]
 mod tests {
-    use bms_model::JudgeRank;
+    use bms_model::{JudgeRank, TimeUs};
 
     use super::{GaugeValue, LowDamage, RankScale, Window};
     use crate::custom;
@@ -528,6 +585,44 @@ mod tests {
         let third = preset.windows.scaled(33_333).unwrap();
         assert_eq!(third.perfect, Window::symmetric(6_666));
         assert_eq!(third.bad, Window::symmetric(59_999));
+    }
+
+    #[test]
+    fn ln_end_edges_scale_like_note_windows_and_grade_inclusively() {
+        let ln_end = custom().ln_end;
+        // 100, 150, 200 ms at 33.333 %: 33_333, 49_999.5 and 66_666 µs,
+        // floored.
+        let third = ln_end.scaled(33_333).unwrap();
+        assert_eq!(
+            (third.perfect, third.great, third.good),
+            (TimeUs(33_333), TimeUs(49_999), TimeUs(66_666))
+        );
+        assert_eq!(ln_end.scaled(100_000), Some(ln_end));
+        assert_eq!(ln_end.scaled(0), None);
+        // A 1 µs edge at 50 % floors to 0.
+        let tiny = super::LnEndWindows {
+            perfect: TimeUs(1),
+            great: TimeUs(2),
+            good: TimeUs(3),
+        };
+        let half = tiny.scaled(50_000).unwrap();
+        assert_eq!(
+            (half.perfect, half.great, half.good),
+            (TimeUs(0), TimeUs(1), TimeUs(1))
+        );
+        use crate::Judgment::{Bad, Good, Great, Perfect};
+        for (d, j) in [
+            (0, Perfect),
+            (-100_000, Perfect),
+            (-100_001, Great),
+            (-150_000, Great),
+            (-150_001, Good),
+            (-200_000, Good),
+            (-200_001, Bad),
+            (i64::MIN, Bad),
+        ] {
+            assert_eq!(ln_end.judgment_of(TimeUs(d)), j, "release at {d}");
+        }
     }
 
     #[test]

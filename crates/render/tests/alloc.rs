@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{ChartBuilder, TimeUs};
 use common::{MS, input, lane, view};
-use eval::{JudgeEvent, JudgeEventKind, LnOutcome};
+use eval::{JudgeEvent, JudgeEventKind};
 use render::{MAX_SPRITES, SimpleSkin, Sprite, SpriteBatch};
 use rules::Judgment;
 
@@ -123,6 +123,7 @@ fn frame_does_not_allocate_after_warmup() {
                     note,
                     judgment: Judgment::ALL[next % 5],
                     deviation: Some(TimeUs(0)),
+                    release: None,
                     combo: u32::try_from(next).unwrap(),
                 },
             });
@@ -133,26 +134,42 @@ fn frame_does_not_allocate_after_warmup() {
             let notes = &chart.lanes[usize::from(l)];
             let (index, ln) = (notes.len() - 1, notes[notes.len() - 1]);
             let end = ln.end();
-            let kind = if ln.time.0 > now.0 - FRAME_US && ln.time <= now {
+            // Odd lanes are released 100 ms early, even lanes at the end.
+            let release = if l % 2 == 1 {
+                TimeUs(end.0 - 100 * MS)
+            } else {
+                end
+            };
+            let kinds: &[JudgeEventKind] = if ln.time.0 > now.0 - FRAME_US && ln.time <= now {
                 held += 1;
-                Some(JudgeEventKind::Judged {
+                &[JudgeEventKind::LnHeld {
                     lane: lane(l),
                     note: index,
                     judgment: Judgment::Great,
-                    deviation: Some(TimeUs(0)),
-                    combo: 1,
-                })
-            } else if end.0 > now.0 - FRAME_US && end <= now {
+                    deviation: TimeUs(0),
+                }]
+            } else if release.0 > now.0 - FRAME_US && release <= now {
                 ended += 1;
-                Some(JudgeEventKind::LnEnd {
-                    lane: lane(l),
-                    note: index,
-                    outcome: LnOutcome::Completed,
-                })
+                &[
+                    JudgeEventKind::LnReleased {
+                        lane: lane(l),
+                        note: index,
+                    },
+                    JudgeEventKind::Judged {
+                        lane: lane(l),
+                        note: index,
+                        judgment: Judgment::Great,
+                        deviation: Some(TimeUs(0)),
+                        release: Some(TimeUs(release.0 - end.0)),
+                        combo: 1,
+                    },
+                ]
             } else {
-                None
+                &[]
             };
-            if let Some(kind) = kind {
+            // A release at the end does not end the visual hold early.
+            let skip = usize::from(release == end && kinds.len() == 2);
+            for &kind in &kinds[skip..] {
                 effects.push(JudgeEvent {
                     seq,
                     time: now,

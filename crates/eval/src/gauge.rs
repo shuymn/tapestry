@@ -13,8 +13,6 @@ pub(crate) enum Cause {
     Judged(Judgment),
     /// An empty POOR.
     EmptyPoor,
-    /// An LN break.
-    LnBreak,
     /// A mine passed a held lane; the chart's damage value.
     Mine(i32),
 }
@@ -44,7 +42,6 @@ fn delta(rule: &GaugeRule, mine: &MineRule, cause: Cause, increment: i128) -> i1
     let d = match cause {
         Cause::Judged(j) => *rule.change.get(j),
         Cause::EmptyPoor => rule.empty_poor,
-        Cause::LnBreak => rule.ln_break,
         Cause::Mine(damage) => return i128::from(mine.change(damage).0),
     };
     match d {

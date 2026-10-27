@@ -85,4 +85,51 @@ fn older_preset_files_are_refused() {
         "poor_after_late_bad",
     );
     refused(&text.replacen("behind_us = 150000\n", "", 1), "behind_us");
+    // An LN break table where the LN-end edges are: a file of the earlier
+    // LN rule.
+    let ln_end =
+        "[ln_end]\nperfect_early_us = 100000\ngreat_early_us = 150000\ngood_early_us = 200000\n";
+    assert!(text.contains(ln_end), "{text}");
+    refused(
+        &text.replacen(
+            ln_end,
+            "[ln_break]\nrelease_margin_us = 100000\nbreaks_combo = true\ncounts_bp = true\n",
+            1,
+        ),
+        "ln_break",
+    );
+}
+
+#[test]
+fn ln_end_edges_and_the_implementation_version_read_back_and_validate() {
+    let text = preset_to_toml(&rules::custom());
+    // The GOOD LN-end edge widened to 250 ms, by hand in µs.
+    let p = load_preset_toml(&text.replacen("good_early_us = 200000", "good_early_us = 250000", 1))
+        .unwrap();
+    assert_eq!(p.ln_end.good.0, 250_000);
+    // Narrower than the PERFECT window's early edge (20 ms): invalid.
+    assert_eq!(
+        load_preset_toml(&text.replacen(
+            "perfect_early_us = 100000",
+            "perfect_early_us = 19999",
+            1
+        )),
+        Err(PresetError::Invalid(RuleError::LnEndNarrowerThanNote {
+            judgment: rules::Judgment::Perfect
+        }))
+    );
+    // The standard evaluator's version 1, the earlier LN rule, is refused.
+    let v1 = text.replacen(
+        "[implementation]\nkind = \"standard\"\nversion = 2",
+        "[implementation]\nkind = \"standard\"\nversion = 1",
+        1,
+    );
+    assert_ne!(v1, text, "the edit did not apply");
+    assert_eq!(
+        load_preset_toml(&v1),
+        Err(PresetError::Invalid(RuleError::UnsupportedImplementation {
+            name: "standard",
+            version: 1
+        }))
+    );
 }

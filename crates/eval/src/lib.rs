@@ -59,9 +59,7 @@ mod lint_fixtures;
 pub use batch::{EvalInput, Evaluation, GaugePoint, GaugeResult, evaluate};
 pub use convert::{ConversionState, Edges, LaneEdge};
 pub use error::EvalError;
-pub use evaluator::{
-    AdvanceError, Evaluator, JudgeEvent, JudgeEventKind, LnOutcome, PushError, Tally,
-};
+pub use evaluator::{AdvanceError, Evaluator, JudgeEvent, JudgeEventKind, PushError, Tally};
 pub use gauge::GaugeState;
 pub use input::{
     AXIS_REPORTS_PER_SEC, AxisBinding, AxisMode, BUTTON_EDGES_PER_SEC, Binding, ControlId,

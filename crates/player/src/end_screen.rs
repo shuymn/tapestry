@@ -146,10 +146,7 @@ pub fn lines(
                 "EX SCORE {}  MAX COMBO {}  BP {}",
                 t.ex_score, t.max_combo, t.bp
             ));
-            l.push(format!(
-                "EMPTY POOR {}  LN BREAKS {}",
-                t.empty_poor, t.ln_breaks
-            ));
+            l.push(format!("EMPTY POOR {}", t.empty_poor));
             for (g, rule) in e.gauges.iter().zip(&report.preset.gauges) {
                 let v = g.value.0;
                 l.push(format!(
@@ -367,7 +364,6 @@ mod tests {
             combo: 2,
             max_combo: 4,
             empty_poor: 6,
-            ln_breaks: 8,
         };
         let gauges = preset
             .gauges

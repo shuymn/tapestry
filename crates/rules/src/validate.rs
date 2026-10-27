@@ -5,30 +5,46 @@ use std::collections::HashSet;
 use bms_model::TimeUs;
 
 use crate::{
-    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeWindows, Judgment, MineRule, RuleError,
-    RulePreset, Side,
+    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeWindows, Judgment, LnEndWindows, MineRule,
+    RuleError, RulePreset, SCALE_FULL_MILLI, Side,
 };
 
 impl RulePreset {
-    /// Checks that the windows ascend, gauge values stay within their bounds,
-    /// and every factor and scale is usable.
+    /// Checks that this build runs the preset's implementation, the windows
+    /// and LN-end edges ascend and stay within
+    /// [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE) at every rank scale of
+    /// the preset, gauge values stay within their bounds, and every factor
+    /// and scale is usable.
     ///
     /// # Errors
     ///
     /// The first problem found.
     pub fn validate(&self) -> Result<(), RuleError> {
+        if !self.implementation.is_supported() {
+            return Err(RuleError::UnsupportedImplementation {
+                name: self.implementation.name(),
+                version: self.implementation.version(),
+            });
+        }
         if self.id.is_empty() {
             return Err(RuleError::EmptyName { field: "id" });
         }
         check_windows(&self.windows)?;
+        if self.windows.scaled(SCALE_FULL_MILLI).is_none() {
+            return Err(RuleError::OutOfRange { field: "windows" });
+        }
+        check_ln_end(&self.ln_end, &self.windows)?;
+        if self.ln_end.scaled(SCALE_FULL_MILLI).is_none() {
+            return Err(RuleError::OutOfRange { field: "ln_end" });
+        }
         non_negative(self.empty_poor.ahead, "empty_poor.ahead")?;
         non_negative(self.empty_poor.behind, "empty_poor.behind")?;
-        non_negative(self.ln_break.release_margin, "ln_break.release_margin")?;
         let r = &self.rank_scale;
+        // Every scale is positive and keeps every edge within the cap.
         if r.rank_milli
             .iter()
             .chain([&r.absent_milli])
-            .any(|&s| s <= 0)
+            .any(|&s| self.windows.scaled(s).is_none() || self.ln_end.scaled(s).is_none())
         {
             return Err(RuleError::OutOfRange {
                 field: "rank_scale",
@@ -79,6 +95,26 @@ fn check_windows(windows: &JudgeWindows) -> Result<(), RuleError> {
     Ok(())
 }
 
+/// The LN-end edges are not negative, strictly widen from PERFECT to GOOD,
+/// and are each at least the note window's early edge of the same judgment:
+/// a press held at least as long as its long note releases at `d = h + hold
+/// − length ≥ h` from its end, which then never grades below the head.
+fn check_ln_end(ln_end: &LnEndWindows, windows: &JudgeWindows) -> Result<(), RuleError> {
+    let mut previous = -1;
+    for (judgment, edge) in ln_end.table() {
+        if edge.0 <= previous {
+            return Err(RuleError::LnEndNotAscending { judgment });
+        }
+        previous = edge.0;
+    }
+    for ((judgment, edge), (_, window)) in ln_end.table().into_iter().zip(windows.table()) {
+        if edge < window.early {
+            return Err(RuleError::LnEndNarrowerThanNote { judgment });
+        }
+    }
+    Ok(())
+}
+
 fn non_negative(t: TimeUs, field: &'static str) -> Result<(), RuleError> {
     if t.0 < 0 {
         return Err(RuleError::OutOfRange { field });
@@ -119,10 +155,7 @@ fn check_gauge(gauge: &GaugeRule) -> Result<(), RuleError> {
     let deltas = Judgment::ALL
         .iter()
         .map(|&j| (*gauge.change.get(j), "change"))
-        .chain([
-            (gauge.empty_poor, "empty_poor"),
-            (gauge.ln_break, "ln_break"),
-        ]);
+        .chain([(gauge.empty_poor, "empty_poor")]);
     for (delta, field) in deltas {
         let usable = match delta {
             GaugeDelta::Fixed(v) => (-GaugeValue::FULL.0..=GaugeValue::FULL.0).contains(&v.0),
@@ -182,6 +215,122 @@ mod tests {
                 judgment: Judgment::Perfect,
             })
         );
+    }
+
+    #[test]
+    fn only_the_supported_standard_version_validates() {
+        let with = |version| {
+            let mut preset = custom();
+            preset.implementation = crate::Implementation::Standard { version };
+            preset.validate()
+        };
+        assert_eq!(with(2), Ok(()));
+        for version in [0, 1, 3, u32::MAX] {
+            assert_eq!(
+                with(version),
+                Err(RuleError::UnsupportedImplementation {
+                    name: "standard",
+                    version
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn ln_end_edges_must_ascend_from_zero() {
+        let with = |p: i64, g: i64, d: i64| {
+            let mut preset = custom();
+            preset.ln_end.perfect = TimeUs(p);
+            preset.ln_end.great = TimeUs(g);
+            preset.ln_end.good = TimeUs(d);
+            preset.validate()
+        };
+        let not = |judgment| Err(RuleError::LnEndNotAscending { judgment });
+        // The note windows' early edges are 20, 45 and 100 ms.
+        assert_eq!(with(100_000, 150_000, 200_000), Ok(()));
+        assert_eq!(with(100_000, 100_001, 100_002), Ok(()));
+        assert_eq!(with(100_000, 100_000, 200_000), not(Judgment::Great));
+        assert_eq!(with(100_000, 150_000, 150_000), not(Judgment::Good));
+        assert_eq!(with(100_000, 150_000, 149_999), not(Judgment::Good));
+        assert_eq!(with(-1, 150_000, 200_000), not(Judgment::Perfect));
+    }
+
+    #[test]
+    fn ln_end_edges_are_at_least_the_note_windows_early_edges() {
+        let mut preset = custom();
+        preset.windows.perfect.early = TimeUs(0);
+        let with = |p: i64, g: i64, d: i64| {
+            let mut preset = preset.clone();
+            preset.ln_end.perfect = TimeUs(p);
+            preset.ln_end.great = TimeUs(g);
+            preset.ln_end.good = TimeUs(d);
+            preset.validate()
+        };
+        let narrower = |judgment| Err(RuleError::LnEndNarrowerThanNote { judgment });
+        // Note early edges: PERFECT 0, GREAT 45 ms, GOOD 100 ms. Equal is
+        // accepted, 1 µs narrower refused; the late edges do not matter.
+        assert_eq!(with(0, 45_000, 100_000), Ok(()));
+        assert_eq!(with(0, 44_999, 100_000), narrower(Judgment::Great));
+        assert_eq!(with(0, 45_000, 99_999), narrower(Judgment::Good));
+        let mut wide = preset.clone();
+        wide.windows.perfect.early = TimeUs(30_000);
+        wide.ln_end.perfect = TimeUs(29_999);
+        assert_eq!(wide.validate(), narrower(Judgment::Perfect));
+        wide.ln_end.perfect = TimeUs(30_000);
+        assert_eq!(wide.validate(), Ok(()));
+    }
+
+    #[test]
+    fn edges_are_capped_at_2_pow_32_before_and_after_the_rank_scale() {
+        let cap: i64 = 1 << 32;
+        // The BAD late edge or the GOOD LN-end edge at `top`, with no rank
+        // widening it.
+        let unscaled = || {
+            let mut preset = custom();
+            preset.rank_scale.rank_milli = [100_000; 4];
+            preset
+        };
+        let with_bad = |top: i64| {
+            let mut preset = unscaled();
+            preset.windows.bad.late = TimeUs(top);
+            preset.validate()
+        };
+        assert_eq!(with_bad(cap), Ok(()));
+        assert_eq!(
+            with_bad(cap + 1),
+            Err(RuleError::OutOfRange { field: "windows" })
+        );
+        let with_good_end = |top: i64| {
+            let mut preset = unscaled();
+            preset.ln_end.good = TimeUs(top);
+            preset.validate()
+        };
+        assert_eq!(with_good_end(cap), Ok(()));
+        assert_eq!(
+            with_good_end(cap + 1),
+            Err(RuleError::OutOfRange { field: "ln_end" })
+        );
+        // #RANK 3 scales by 125 %: floor(3_435_973_837 × 1.25) =
+        // 4_294_967_296, the cap; floor(3_435_973_838 × 1.25) =
+        // 4_294_967_297, past it.
+        let scaled = |edge: i64, ln_end: bool| {
+            let mut preset = custom();
+            if ln_end {
+                preset.ln_end.good = TimeUs(edge);
+            } else {
+                preset.windows.bad.early = TimeUs(edge);
+            }
+            preset.validate()
+        };
+        let rank = Err(RuleError::OutOfRange {
+            field: "rank_scale",
+        });
+        assert_eq!(cap * 4 / 5, 3_435_973_836);
+        for ln_end in [false, true] {
+            assert_eq!(scaled(3_435_973_836, ln_end), Ok(()));
+            assert_eq!(scaled(3_435_973_837, ln_end), Ok(()));
+            assert_eq!(scaled(3_435_973_838, ln_end), rank);
+        }
     }
 
     #[test]

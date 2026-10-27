@@ -30,7 +30,7 @@ pub use custom::custom;
 pub use error::{RuleError, Side};
 pub use preset::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, Judgment, LateHeadRule, LnBreakRule, LnMode, LnModeRule,
-    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SCALE_FULL_MILLI,
-    SameTimeOrder, ScoreWeights, TotalMode, Window,
+    Implementation, JudgeWindows, Judgment, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
+    LowDamage, MAX_WINDOW_EDGE, MineRule, MissRule, PerJudgment, RankScale, RulePreset,
+    SCALE_FULL_MILLI, SameTimeOrder, ScoreWeights, TotalMode, Window, scale_edge,
 };

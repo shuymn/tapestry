@@ -196,6 +196,7 @@ fn judged_note_disappears() {
             note: 0,
             judgment: Judgment::Perfect,
             deviation: Some(TimeUs(-210 * MS)),
+            release: None,
             combo: 1,
         },
     };

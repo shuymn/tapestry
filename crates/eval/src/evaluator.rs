@@ -5,10 +5,12 @@
 
 use std::collections::VecDeque;
 
-use bms_model::{Chart, LANE_COUNT, Lane, LnMode as ChartLnMode, NoteKind, SoundId, TimeUs};
+use bms_model::{
+    Chart, DOMAIN, LANE_COUNT, Lane, LnMode as ChartLnMode, NoteKind, SoundId, TimeUs,
+};
 use rules::{
-    Assignment, Denominator, GaugeValue, JudgeWindows, Judgment, LateHeadRule, LnMode, MissRule,
-    PerJudgment, RulePreset, SameTimeOrder, TotalMode,
+    Assignment, Denominator, GaugeValue, JudgeWindows, Judgment, LateHeadRule, LnEndWindows,
+    LnMode, MissRule, PerJudgment, RulePreset, SameTimeOrder, TotalMode,
 };
 
 use crate::EvalError;
@@ -34,7 +36,9 @@ pub struct JudgeEvent {
 /// What a [`JudgeEvent`] reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JudgeEventKind {
-    /// A note was judged.
+    /// A note was judged: the only event that scores a note, emitted once
+    /// per judgeable note. A long note is judged once, at the press that
+    /// decides it, at the release that finishes it, or at its end.
     Judged {
         /// The note's lane.
         lane: Lane,
@@ -42,10 +46,40 @@ pub enum JudgeEventKind {
         note: usize,
         /// The judgment.
         judgment: Judgment,
-        /// Press time minus note time, or `None` for a miss.
+        /// Press time minus note time (a long note's head press), or `None`
+        /// for a miss.
         deviation: Option<TimeUs>,
+        /// For a long note finished by a release, release time minus its
+        /// end (not positive; `Some(0)` for a release exactly at the end);
+        /// otherwise `None`.
+        release: Option<TimeUs>,
         /// The combo after this judgment.
         combo: u32,
+    },
+    /// A long note's head was pressed before its end and graded GOOD or
+    /// better, and the long note is held now. Feedback only: it changes no
+    /// count, combo, EX score, BP or gauge; the long note's [`Judged`]
+    /// follows at its release or end.
+    ///
+    /// [`Judged`]: JudgeEventKind::Judged
+    LnHeld {
+        /// The note's lane.
+        lane: Lane,
+        /// The note's index in its lane of [`Chart::lanes`].
+        note: usize,
+        /// The head's judgment.
+        judgment: Judgment,
+        /// Press time minus note time.
+        deviation: TimeUs,
+    },
+    /// The lane of a long note whose head press started or decided it
+    /// before its end was released before that end: the long note is no
+    /// longer held. Feedback only: it changes nothing scored.
+    LnReleased {
+        /// The note's lane.
+        lane: Lane,
+        /// The note's index in its lane of [`Chart::lanes`].
+        note: usize,
     },
     /// A press judged no note but had one close by (an empty POOR).
     EmptyPoor {
@@ -58,15 +92,6 @@ pub enum JudgeEventKind {
         lane: Lane,
         /// The sound.
         sound: SoundId,
-    },
-    /// A long note whose head was judged finished.
-    LnEnd {
-        /// The note's lane.
-        lane: Lane,
-        /// The note's index in its lane of [`Chart::lanes`].
-        note: usize,
-        /// How it finished.
-        outcome: LnOutcome,
     },
     /// A mine passed while its lane was held.
     MineHit {
@@ -90,16 +115,6 @@ pub enum JudgeEventKind {
     SongEnd,
 }
 
-/// How a long note finished.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LnOutcome {
-    /// Held to its end, released within the margin, or its head was pressed
-    /// at or after its end.
-    Completed,
-    /// Released too early: an LN break.
-    Broken,
-}
-
 /// Running totals of a play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tally {
@@ -116,8 +131,6 @@ pub struct Tally {
     pub max_combo: u32,
     /// Number of empty POORs.
     pub empty_poor: u32,
-    /// Number of LN breaks.
-    pub ln_breaks: u32,
 }
 
 impl Tally {
@@ -135,7 +148,6 @@ impl Tally {
             combo: 0,
             max_combo: 0,
             empty_poor: 0,
-            ln_breaks: 0,
         }
     }
 
@@ -169,10 +181,12 @@ enum DeadlineKind {
     /// It stands for the release the player made by stopping, so it comes
     /// first among deadlines, as a release input would.
     ScratchRelease,
+    /// The end of a long note not yet finished. Before misses, so the notes
+    /// of a lane are judged in note order even when a scaled late window
+    /// puts a later note's miss at this µs.
+    LnEnd,
     /// The late edge of an unjudged note's miss window.
     Miss,
-    /// The end of a long note not yet finished.
-    LnEnd,
     /// A mine passing.
     Mine,
     /// The chart's final deadline, after every lane deadline (not stored per
@@ -190,18 +204,35 @@ struct Deadline {
     index: usize,
 }
 
+/// A long note whose head was pressed before its end and graded GOOD or
+/// better, held now and not yet judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Held {
+    /// Its position in the lane's targets.
+    target: usize,
+    /// The head's judgment.
+    judgment: Judgment,
+    /// The head's press time minus note time.
+    deviation: TimeUs,
+}
+
 /// One lane's notes to judge and its deadlines.
 #[derive(Clone, Debug, Default)]
 struct LaneState {
-    /// Indices into the chart lane of the judgeable notes (taps and LN
-    /// heads), in time order.
+    /// Indices into the chart lane of the judgeable notes (taps and long
+    /// notes), in time order.
     targets: Vec<usize>,
-    /// Whether each target is judged.
+    /// Whether each target's head is taken: judged, or held as [`Held`].
+    /// It drives assignment and the cursor; a long note is scored once it
+    /// is taken and it is not `holding`.
     judged: Vec<bool>,
-    /// The long note whose head was judged and which is held now. A long
-    /// note is finished (completed, broken, or its head missed) once its
-    /// head is judged and it is not this one.
-    holding: Option<usize>,
+    /// The long note held and not yet judged.
+    holding: Option<Held>,
+    /// The long note whose head press started or decided it before its
+    /// end, while its lane stays held and its end has not passed: the
+    /// visual hold, reported by [`JudgeEventKind::LnReleased`] when a
+    /// release ends it early. It scores nothing.
+    visual: Option<usize>,
     /// The first unjudged target.
     cursor: usize,
     /// Deadlines sorted by `(time, kind, index)`.
@@ -225,9 +256,9 @@ impl LaneState {
     }
 
     /// The first deadline still to process, skipping those whose own
-    /// condition says so: a miss deadline of a judged note, and an LN end of
-    /// a finished long note (a judged head does not finish it). A mine is
-    /// never skipped.
+    /// condition says so: a miss deadline of a taken note, and an LN end of
+    /// a taken long note neither held nor visually held. A mine is never
+    /// skipped.
     fn head(&mut self) -> Option<Deadline> {
         while let Some(&d) = self.deadlines.get(self.next) {
             #[expect(
@@ -236,7 +267,11 @@ impl LaneState {
             )]
             let skip = match d.kind {
                 DeadlineKind::Miss => self.judged[d.index],
-                DeadlineKind::LnEnd => self.judged[d.index] && self.holding != Some(d.index),
+                DeadlineKind::LnEnd => {
+                    self.judged[d.index]
+                        && self.holding.map(|h| h.target) != Some(d.index)
+                        && self.visual != Some(d.index)
+                }
                 DeadlineKind::Mine | DeadlineKind::ScratchRelease | DeadlineKind::SongEnd => false,
             };
             if !skip {
@@ -258,6 +293,7 @@ pub struct Evaluator<'a> {
     rule: &'a RulePreset,
     device: &'a DeviceProfile,
     windows: JudgeWindows,
+    ln_end: LnEndWindows,
     lanes: [LaneState; LANE_COUNT],
     conversion: ConversionState,
     inputs: VecDeque<(TimeUs, PhysicalInputEvent)>,
@@ -311,16 +347,19 @@ pub enum AdvanceError {
 }
 
 impl<'a> Evaluator<'a> {
-    /// Prepares evaluation: scales the windows by the chart's rank, builds
-    /// each lane's deadlines, computes the gauge increment, and sets up input
-    /// conversion from `start`. `input_capacity` sizes the ring of inputs
-    /// pushed but not yet processed.
+    /// Prepares evaluation: scales the windows and LN-end edges by the
+    /// chart's rank, builds each lane's deadlines, computes the gauge
+    /// increment, and sets up input conversion from `start`.
+    /// `input_capacity` sizes the ring of inputs pushed but not yet
+    /// processed.
     ///
     /// # Errors
     ///
-    /// An invalid preset, a rank whose scale is unusable, a long-note mode
-    /// the preset cannot judge, a chart without judgeable notes, a deadline
-    /// outside the `i64` range, or a source binding one control twice.
+    /// An invalid preset (including an implementation version this build
+    /// does not run), a rank whose scale is unusable, a long-note mode the
+    /// preset cannot judge, a note time or long-note end outside `±2^32` µs,
+    /// a chart without judgeable notes, or a source binding one control
+    /// twice.
     pub fn new(
         chart: &'a Chart,
         rule: &'a RulePreset,
@@ -329,11 +368,24 @@ impl<'a> Evaluator<'a> {
         input_capacity: usize,
     ) -> Result<Self, EvalError> {
         rule.validate().map_err(EvalError::InvalidPreset)?;
-        let windows = rule
+        let scale = rule
             .rank_scale
             .scale_milli(chart.meta.rank)
-            .and_then(|scale| rule.windows.scaled(scale))
             .ok_or(EvalError::InvalidRank)?;
+        let windows = rule.windows.scaled(scale).ok_or(EvalError::InvalidRank)?;
+        let ln_end = rule.ln_end.scaled(scale).ok_or(EvalError::InvalidRank)?;
+        // With every edge within 2^32 µs (`MAX_WINDOW_EDGE`), times within
+        // ±2^32 µs keep a press deviation and a release's distance from its
+        // long note's end inside `i64`.
+        let in_domain = |t: TimeUs| (-DOMAIN..=DOMAIN).contains(&t.0);
+        if chart
+            .lanes
+            .iter()
+            .flatten()
+            .any(|n| !in_domain(n.time) || !in_domain(n.end()))
+        {
+            return Err(EvalError::TimeOverflow);
+        }
         let miss_after = match rule.miss {
             MissRule::PoorAfterLateBadOrOvertaken => windows.bad.late,
         };
@@ -418,6 +470,7 @@ impl<'a> Evaluator<'a> {
             rule,
             device,
             windows,
+            ln_end,
             lanes,
             conversion: ConversionState::init(device, start)?,
             inputs: VecDeque::with_capacity(input_capacity),
@@ -435,6 +488,12 @@ impl<'a> Evaluator<'a> {
     #[must_use]
     pub const fn windows(&self) -> &JudgeWindows {
         &self.windows
+    }
+
+    /// The LN-end edges after the rank scale.
+    #[must_use]
+    pub const fn ln_end(&self) -> &LnEndWindows {
+        &self.ln_end
     }
 
     /// The running totals.
@@ -467,13 +526,14 @@ impl<'a> Evaluator<'a> {
     /// An output reserved to this capacity (and cleared between steps, never
     /// shrunk) never reallocates in [`advance_to`](Self::advance_to).
     ///
-    /// Each judgeable note is judged once (1 event plus one per gauge),
-    /// finishes as a long note once, and breaks at most once (one per
-    /// gauge). Each input causes at most one press (an axis reversing
-    /// releases first, which only finishes long notes), which plays a sound
-    /// and may be an empty POOR (1 plus one per gauge). A scratch release
-    /// deadline only finishes long notes. Each mine hits at most once (1
-    /// plus one per gauge). The song ends once.
+    /// Each judgeable note is judged once (1 event plus one per gauge); a
+    /// long note is held at most once (1) and its visual hold, set only by
+    /// the press that takes its head, ends early at most once (1). Each
+    /// input causes at most one press (an axis reversing releases first,
+    /// which only judges long notes and ends visual holds), which plays a
+    /// sound and may be an empty POOR (1 plus one per gauge). A scratch
+    /// release deadline only judges long notes and ends visual holds. Each
+    /// mine hits at most once (1 plus one per gauge). The song ends once.
     #[must_use]
     pub fn max_events(&self, inputs: usize) -> usize {
         let g = self.gauges.states().len();
@@ -485,7 +545,7 @@ impl<'a> Evaluator<'a> {
             .filter(|d| d.kind == DeadlineKind::Mine)
             .count();
         notes
-            .saturating_mul(2 + 2 * g)
+            .saturating_mul(3 + g)
             .saturating_add(inputs.saturating_mul(2 + g))
             .saturating_add(mines.saturating_mul(1 + g))
             .saturating_add(1)
@@ -630,16 +690,29 @@ impl<'a> Evaluator<'a> {
         )]
         match d.kind {
             DeadlineKind::Miss => {
-                // A missed head is judged, which finishes its long note too.
+                // A missed head is the long note's one judgment.
                 self.judge(lane, d.index, Judgment::Poor, None, d.time, None, out);
             }
             DeadlineKind::LnEnd => {
                 // An unjudged head still waits for its press or its miss. A
-                // judged one is held here, since a release would have
-                // finished it.
-                if state.judged[d.index] {
+                // taken one is still held here, since a release would have
+                // ended both holds: the visual hold ends, and a long note
+                // held through its end keeps its head's judgment.
+                if state.visual == Some(d.index) {
+                    state.visual = None;
+                }
+                if let Some(held) = state.holding.filter(|h| h.target == d.index) {
                     state.holding = None;
-                    self.ln_end(lane, d.index, LnOutcome::Completed, d.time, None, out);
+                    self.score(
+                        lane,
+                        d.index,
+                        held.judgment,
+                        Some(held.deviation),
+                        None,
+                        d.time,
+                        None,
+                        out,
+                    );
                 }
             }
             DeadlineKind::Mine => {
@@ -771,29 +844,51 @@ impl<'a> Evaluator<'a> {
                 clippy::indexing_slicing,
                 reason = "`lane` is below LANE_COUNT, `k` is a candidate below `targets.len()`, and `targets` indexes the lane's notes"
             )]
-            let note = self.chart.lanes[lane][self.lanes[lane].targets[k]];
-            // Within the BAD window, so it fits in i64.
+            let (index, note) = {
+                let i = self.lanes[lane].targets[k];
+                (i, self.chart.lanes[lane][i])
+            };
+            // Within the BAD window, at most 2^32 µs, so it fits in i64.
             let deviation = TimeUs(i64::try_from(deviation).unwrap_or(i64::MAX));
             let judgment = judgment_of(&self.windows, deviation);
-            self.judge(lane, k, judgment, Some(deviation), t, Some(origin), out);
-            if let NoteKind::Long { end, .. } = note.kind {
-                let completed = match self.rule.ln_mode.late_head {
-                    // A head pressed at or after its end completes the LN at
-                    // the press; the following release is ignored.
-                    LateHeadRule::CompletesAtPress => t >= end,
-                };
-                if completed {
-                    self.ln_end(lane, k, LnOutcome::Completed, t, Some(origin), out);
-                } else {
-                    #[expect(
-                        clippy::indexing_slicing,
-                        reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
-                    )]
-                    {
-                        self.lanes[lane].holding = Some(k);
-                    }
-                }
+            let before_end = match note.kind {
+                NoteKind::Long { end, .. } => match self.rule.ln_mode.late_head {
+                    // A head pressed at or after its end decides the long
+                    // note at the press; the following release is ignored.
+                    LateHeadRule::CompletesAtPress => t < end,
+                },
+                NoteKind::Tap | NoteKind::Mine { .. } => false,
+            };
+            if !before_end {
+                self.judge(lane, k, judgment, Some(deviation), t, Some(origin), out);
+                return;
             }
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+            )]
+            let state = &mut self.lanes[lane];
+            // A press edge needs the lane released, and every release ends
+            // both holds, so neither is set here.
+            state.visual = Some(k);
+            if judgment == Judgment::Bad {
+                // No release can better a BAD head: decided at the press.
+                self.judge(lane, k, judgment, Some(deviation), t, Some(origin), out);
+                return;
+            }
+            state.mark_judged(k);
+            state.holding = Some(Held {
+                target: k,
+                judgment,
+                deviation,
+            });
+            let kind = JudgeEventKind::LnHeld {
+                lane: lane_of(lane),
+                note: index,
+                judgment,
+                deviation,
+            };
+            self.emit(t, Some(origin), kind, out);
             return;
         }
         if empty_poor {
@@ -820,9 +915,11 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// A release edge on `lane` at evaluation time `t`: finishes the held
-    /// long note, as a break if strictly earlier than its end minus the
-    /// margin. `origin` is `None` for a scratch release deadline.
+    /// A release edge on `lane` at evaluation time `t`: ends the visual
+    /// hold, reporting it when before the long note's end, and judges the
+    /// held long note, the worse of its head's judgment and the release's
+    /// by the LN-end edges when before its end. `origin` is `None` for a
+    /// scratch release deadline.
     fn release(
         &mut self,
         lane: usize,
@@ -835,53 +932,50 @@ impl<'a> Evaluator<'a> {
             reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
         )]
         let state = &mut self.lanes[lane];
-        let Some(k) = state.holding.take() else {
-            return;
-        };
+        let visual = state.visual.take();
+        let held = state.holding.take();
         #[expect(
             clippy::indexing_slicing,
-            reason = "`lane` is below LANE_COUNT, `holding` is a position in `targets`, and `targets` indexes the lane's notes"
+            reason = "`lane` is below LANE_COUNT, both holds are positions in `targets`, and `targets` indexes the lane's notes"
         )]
-        let end = self.chart.lanes[lane][state.targets[k]].end();
-        let rule = self.rule.ln_break;
-        let broken = i128::from(t.0) < i128::from(end.0) - i128::from(rule.release_margin.0);
-        if !broken {
-            self.ln_end(lane, k, LnOutcome::Completed, t, origin, out);
-            return;
-        }
-        // The head's judgment, counts and EX score stay.
-        self.tally.ln_breaks = self.tally.ln_breaks.saturating_add(1);
-        if rule.breaks_combo {
-            self.tally.combo = 0;
-        }
-        if rule.counts_bp {
-            self.tally.bp = self.tally.bp.saturating_add(1);
-        }
-        self.ln_end(lane, k, LnOutcome::Broken, t, origin, out);
-        self.change_gauges(Cause::LnBreak, t, origin, out);
-    }
-
-    fn ln_end(
-        &mut self,
-        lane: usize,
-        target: usize,
-        outcome: LnOutcome,
-        time: TimeUs,
-        origin: Option<TimeUs>,
-        out: &mut Vec<JudgeEvent>,
-    ) {
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "`lane` is below LANE_COUNT and callers pass a position in `targets`"
-        )]
-        let kind = JudgeEventKind::LnEnd {
-            lane: lane_of(lane),
-            note: self.lanes[lane].targets[target],
-            outcome,
+        let note_of = |k: usize| {
+            let i = self.lanes[lane].targets[k];
+            (i, self.chart.lanes[lane][i].end())
         };
-        self.emit(time, origin, kind, out);
+        let visual = visual.map(note_of);
+        let held = held.map(|h| (h, note_of(h.target).1));
+        if let Some((note, end)) = visual
+            && t < end
+        {
+            let kind = JudgeEventKind::LnReleased {
+                lane: lane_of(lane),
+                note,
+            };
+            self.emit(t, origin, kind, out);
+        }
+        let Some((held, end)) = held else {
+            return;
+        };
+        // A held long note is judged by its end deadline, which comes after
+        // every input of its µs, so `t` is at most `end`.
+        let before = i64::try_from(i128::from(t.0) - i128::from(end.0))
+            .unwrap_or(i64::MIN)
+            .min(0);
+        let judgment = held.judgment.max(self.ln_end.judgment_of(TimeUs(before)));
+        self.score(
+            lane,
+            held.target,
+            judgment,
+            Some(held.deviation),
+            Some(TimeUs(before)),
+            t,
+            origin,
+            out,
+        );
     }
 
+    /// Takes and scores a target whose judgment is decided now: a tap, a
+    /// missed head, or a long note decided at its head's press.
     #[allow(clippy::too_many_arguments)]
     fn judge(
         &mut self,
@@ -897,13 +991,29 @@ impl<'a> Evaluator<'a> {
             clippy::indexing_slicing,
             reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
         )]
-        let state = &mut self.lanes[lane];
+        self.lanes[lane].mark_judged(target);
+        self.score(lane, target, judgment, deviation, None, time, origin, out);
+    }
+
+    /// Scores a taken target: counts, EX score, combo, BP, its
+    /// [`JudgeEventKind::Judged`] and the gauges.
+    #[allow(clippy::too_many_arguments)]
+    fn score(
+        &mut self,
+        lane: usize,
+        target: usize,
+        judgment: Judgment,
+        deviation: Option<TimeUs>,
+        release: Option<TimeUs>,
+        time: TimeUs,
+        origin: Option<TimeUs>,
+        out: &mut Vec<JudgeEvent>,
+    ) {
         #[expect(
             clippy::indexing_slicing,
-            reason = "callers pass a position in `targets`"
+            reason = "`lane` comes from `Lane::index`, below LANE_COUNT, and callers pass a position in `targets`"
         )]
-        let note = state.targets[target];
-        state.mark_judged(target);
+        let note = self.lanes[lane].targets[target];
         let score = &self.rule.score;
         let c = self.tally.count_mut(judgment);
         *c = c.saturating_add(1);
@@ -917,6 +1027,7 @@ impl<'a> Evaluator<'a> {
             note,
             judgment,
             deviation,
+            release,
             combo: self.tally.combo,
         };
         self.emit(time, origin, kind, out);

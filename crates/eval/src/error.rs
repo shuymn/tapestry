@@ -15,13 +15,14 @@ pub enum EvalError {
     /// The preset failed its validation.
     InvalidPreset(RuleError),
     /// The chart's rank gives no usable window scale (a `#DEFEXRANK` that is
-    /// not positive, or windows scaled beyond the `i64` range).
+    /// not positive, or a window or LN-end edge scaled beyond 2^32 µs).
     InvalidRank,
     /// The chart declares a long-note mode the preset cannot judge.
     UnsupportedLnMode(LnMode),
     /// The chart has no note to judge, so the gauge has no denominator.
     NoJudgeableNotes,
-    /// A deadline left the `i64` range.
+    /// A note time or long-note end lies outside `±2^32` µs, the chart time
+    /// domain.
     TimeOverflow,
     /// A source binds one control twice.
     DuplicateBinding {
@@ -48,7 +49,7 @@ impl fmt::Display for EvalError {
                 write!(f, "the chart's long-note mode {mode:?} is not supported")
             }
             Self::NoJudgeableNotes => f.write_str("the chart has no notes to play"),
-            Self::TimeOverflow => f.write_str("a deadline is outside the time range"),
+            Self::TimeOverflow => f.write_str("a note is outside the time range"),
             Self::DuplicateBinding { source, control } => {
                 write!(f, "source {} binds control {} twice", source.0, control.0)
             }

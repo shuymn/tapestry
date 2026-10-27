@@ -72,11 +72,12 @@ const AXIS: ControlId = ControlId(0x1_0030);
 fn advance_does_not_allocate() {
     const NOTES: i64 = 2_000;
     // Notes every 50 ms over lanes 1-7, so one lane's notes are 350 ms
-    // apart. Every 4th is a 200 ms LN, every 8th released early (an LN
-    // break). Every 10th has a held mine on the scratch lane, held by its
-    // button, and every 10th after the 5th one held by the scratch axis,
-    // turned for 3 ms and released by its deadline 100 ms later. Some taps
-    // get an empty POOR press 250 ms early. Every note has a sound.
+    // apart. Every 4th is a 200 ms LN, every 8th released 150 ms early (a
+    // GREAT), the others 80 ms early (PERFECT). Every 10th has a held mine
+    // on the scratch lane, held by its button, and every 10th after the
+    // 5th one held by the scratch axis, turned for 3 ms and released by its
+    // deadline 100 ms later. Some taps get an empty POOR press 250 ms
+    // early. Every note has a sound.
     let mut builder = ChartBuilder::new(150_000).sound("k.wav");
     let mut inputs = Vec::new();
     let mut expected_empty_poor = 0;
@@ -186,9 +187,14 @@ fn advance_does_not_allocate() {
                 ..
             }
         )),
-        2_000
+        1_750
     );
-    assert_eq!(ev.tally().ln_breaks, 250);
+    assert_eq!(ev.tally().counts.great, 250);
+    assert_eq!(count(|k| matches!(k, JudgeEventKind::LnHeld { .. })), 500);
+    assert_eq!(
+        count(|k| matches!(k, JudgeEventKind::LnReleased { .. })),
+        500
+    );
     assert_eq!(count(|k| matches!(k, JudgeEventKind::MineHit { .. })), 400);
     assert!(expected_empty_poor > 0);
     assert_eq!(
