@@ -874,6 +874,64 @@ mod tests {
     }
 
     #[test]
+    fn loaded_notes_and_bar_lines_sit_at_their_exact_beats() {
+        // Quarter-beat measures at 9,990,400 BPM: measure k starts at beat
+        // k/4, k × 1.5014416... µs, so its notes sound on floored µs (1, 3,
+        // 4, ...). Taps on key 1 at measures 1-6, a long note on key 2 from
+        // measure 2 to 5, a last tap on key 3 at measure 9.
+        let mut text = String::from("#BPM 9990400\n#LNTYPE 1\n#WAV01 a.wav\n");
+        for m in 0..=9 {
+            text.push_str(&format!("#{m:03}02:0.0625\n"));
+        }
+        for m in 1..=6 {
+            text.push_str(&format!("#{m:03}11:01\n"));
+        }
+        text.push_str("#00252:01\n#00552:01\n#00913:01\n");
+        let chart = loaded(&text);
+        let mut s = skin(&chart);
+        let v = view();
+        // The playhead at 1 µs, 10 µs visible: 800 px over 10 µs of the
+        // start BPM, so 80 px per µs of scroll at 9,990,400 BPM.
+        let f = FrameInput {
+            visible_time: TimeUs(10),
+            ..frame(&v, 1, &[])
+        };
+        let batch = build(&mut s, &f);
+        // By hand: beat k/4 is k × 15e6 / 9_990_400 µs of scroll, drawn
+        // 80 px per µs above the line once past the playhead's 1 µs:
+        // measure 1 at 880 - 80 × 0.5014416... = 839.8847 px, where its
+        // floored time (1 µs) would put it on the line.
+        let y = |k: i32| 880.0 - 80.0 * (f64::from(k) * 15e6 / 9_990_400.0 - 1.0);
+        assert!((y(1) - 839.884_7).abs() < 1e-3);
+        let centers = |rects: Vec<[f32; 4]>| -> Vec<f64> {
+            rects.iter().map(|r| f64::from(r[1] + r[3] / 2.0)).collect()
+        };
+        let close = |got: Vec<f64>, want: Vec<f64>| {
+            assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-3, "{got:?} vs {want:?}");
+            }
+        };
+        close(
+            centers(in_lane(&batch, lane(1), NOTE_WHITE)),
+            (1..=6).map(y).collect(),
+        );
+        // The long note's end cap (measure 5), then its head (measure 2).
+        close(
+            centers(in_lane(&batch, lane(2), NOTE_BLUE)),
+            vec![y(5), y(2)],
+        );
+        let bars: Vec<[f32; 4]> = batch
+            .alpha()
+            .iter()
+            .filter(|s| s.color == BAR_LINE && s.rect[3] == BAR_LINE_H)
+            .map(|s| s.rect)
+            .collect();
+        // Bar lines 1-7 lie wholly inside the lanes (y from 80 to 960).
+        close(centers(bars), (1..=7).map(y).collect());
+    }
+
+    #[test]
     fn bar_lines_of_equal_measures_are_drawn_evenly() {
         // Quarter-beat measures at 9,990,400 BPM last 1.5014... µs each, so
         // their floored times step by 1 or 2 µs; their positions are

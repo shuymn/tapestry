@@ -186,8 +186,9 @@ fn bpm_zero_is_rejected() {
 #[test]
 fn bpm_keeps_eighteen_fractional_digits_and_cuts_the_rest() {
     let loaded = load_text("#BPM 120.000000000000000003\n#WAV01 click.wav\n#00111:01\n").unwrap();
-    // Time and the scroll rate use the exact BPM: 2^80 × 2.000...00005e-6
-    // units per µs, floored, one more than 120 gives.
+    // The scroll rate floors the exact 2^80 × 2.000...00005e-6 units per
+    // µs: the extra 3e-18 BPM adds about 0.06 unit to a fraction of 0.41,
+    // so it floors to the rate of exactly 120 BPM.
     let rate = loaded.chart.scroll.initial_rate();
     assert_eq!(rate, BEAT / 500_000);
     // 4 beats: floor(240e6 / 120.000000000000000003) = 1_999_999, where
