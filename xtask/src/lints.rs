@@ -119,6 +119,8 @@ pub const IN_PLAY: &[Site] = &[
         &[
             "PerJudgment::get",
             "JudgeWindows::table",
+            "LnEndWindows::table",
+            "LnEndWindows::judgment_of",
             "LowDamage::applies_at",
             "LowDamage::reduce",
             "MineRule::change",
