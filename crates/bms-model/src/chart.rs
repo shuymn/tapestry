@@ -1,8 +1,9 @@
-//! The resolved chart: notes per lane, BGM, sounds and scroll, in integer µs.
+//! The resolved chart: notes per lane, BGM, sounds and scroll, with times in
+//! integer µs and display positions in 2^-80 beat.
 
 use std::path::PathBuf;
 
-use crate::{ModelError, ScrollMap, TimeUs};
+use crate::{ModelError, Position, ScrollMap, TimeUs};
 
 /// Number of lanes: the scratch and seven keys.
 pub const LANE_COUNT: usize = 8;
@@ -50,6 +51,8 @@ pub struct SoundId(pub u16);
 pub struct Note {
     /// Time of the note (the start, for a long note).
     pub time: TimeUs,
+    /// Display position of the note (the head, for a long note).
+    pub pos: Position,
     /// Sound played when the note is hit, if any.
     pub sound: Option<SoundId>,
     /// What kind of note this is.
@@ -67,6 +70,17 @@ impl Note {
             NoteKind::Tap | NoteKind::Mine { .. } => self.time,
         }
     }
+
+    /// The last display position the note occupies: the end of a long
+    /// note, otherwise its position.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn end_pos(&self) -> Position {
+        match self.kind {
+            NoteKind::Long { end_pos, .. } => end_pos,
+            NoteKind::Tap | NoteKind::Mine { .. } => self.pos,
+        }
+    }
 }
 
 /// The kind of a note.
@@ -78,6 +92,8 @@ pub enum NoteKind {
     Long {
         /// Time the long note ends.
         end: TimeUs,
+        /// Display position of the end.
+        end_pos: Position,
         /// Sound played at the end, if any.
         end_sound: Option<SoundId>,
     },
@@ -165,9 +181,9 @@ pub struct Chart {
     pub bgm: Vec<BgmEvent>,
     /// The sound table, indexed by [`SoundId`].
     pub sounds: Vec<SoundRef>,
-    /// Times of the bar lines, sorted.
-    pub bar_lines: Vec<TimeUs>,
-    /// Display position over time.
+    /// Display positions of the bar lines, sorted.
+    pub bar_lines: Vec<Position>,
+    /// The playhead's display position over time.
     pub scroll: ScrollMap,
     /// Header values.
     pub meta: ChartMeta,
@@ -182,7 +198,9 @@ impl Chart {
     ///
     /// Returns the first violation: a lane out of time order, a long note
     /// that does not end after it starts, a note starting at or before the
-    /// end of the previous note in its lane, BGM or bar lines out of time
+    /// end of the previous note in its lane, a display position before the
+    /// end position of the previous note or a long note's end position
+    /// before its head's, BGM out of time order, bar lines out of position
     /// order, or a sound outside the sound table.
     pub fn validate(&self) -> Result<(), ModelError> {
         for lane in Lane::all() {
@@ -191,12 +209,18 @@ impl Chart {
                 if matches!(note.kind, NoteKind::Long { end, .. } if end <= note.time) {
                     return Err(ModelError::LongEndNotAfterStart { lane, index });
                 }
+                if note.end_pos() < note.pos {
+                    return Err(ModelError::PositionsUnsorted { lane, index });
+                }
                 if let Some(prev) = index.checked_sub(1).map(|i| notes[i]) {
                     if note.time < prev.time {
                         return Err(ModelError::Unsorted { lane, index });
                     }
                     if note.time <= prev.end() {
                         return Err(ModelError::Overlap { lane, index });
+                    }
+                    if note.pos < prev.end_pos() {
+                        return Err(ModelError::PositionsUnsorted { lane, index });
                     }
                 }
                 let end_sound = match note.kind {

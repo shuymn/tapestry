@@ -100,7 +100,9 @@ impl TransformId {
 
 /// The chart transformation extension point: changes the resolved chart
 /// before evaluation (later RANDOM or MIRROR options). Any randomness comes
-/// from `seed`, which is recorded.
+/// from `seed`, which is recorded. A note moved in time moves its display
+/// positions with it; the session validates the output
+/// ([`Chart::validate`]) and refuses a chart that breaks an invariant.
 pub trait ChartTransform {
     /// Which transform this is.
     fn id(&self) -> TransformId;

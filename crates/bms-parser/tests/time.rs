@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use bms_model::{Chart, JudgeRank, Note, NoteKind, TimeUs};
+use bms_model::{BEAT, Chart, JudgeRank, Note, NoteKind, Position, TimeUs};
 use bms_parser::{Limits, LoadError, LoadOptions, Loaded, Warning, WarningKind, load_bms};
 use sha2::{Digest, Sha256};
 
@@ -290,20 +290,24 @@ fn long_decimals_and_exponents_time_exactly() {
     let chart = &loaded.chart;
     // Exact fractions in an independent script. Measure 1 is 0.03125 beats
     // at 150 (12_500 µs); measure 2 starts at 98.7654321 with a STOP of
-    // 0.0416 units (floor(end) - floor(start) = 526 µs); measure 3 runs at
-    // 10_000_100 BPM, 4 beats in 24 µs.
+    // 0.0416 units (526.5... µs); measure 3 runs at 10_000_100 BPM, 4
+    // beats in 24 µs.
     assert_eq!(
         times(&chart.lanes[1]),
         vec![
             0, 800_000, 1_600_000, 1_606_250, 1_612_500, 2_423_026, 4_043_026, 4_043_038, 4_043_050
         ]
     );
+    // Bar lines at 0, 4, 4.03125, 8.03125 and 12.03125 beats.
     assert_eq!(
         chart.bar_lines,
-        [0, 1_600_000, 1_612_500, 4_043_026, 4_043_050].map(TimeUs)
+        [0, 128, 129, 257, 385].map(|n| Position(BEAT * n / 32))
     );
-    assert_eq!(chart.scroll.initial_bpm_micro(), 150_000_000);
+    // floor(2^80 × 150 / 60e6) units per µs.
+    assert_eq!(chart.scroll.initial_rate(), BEAT / 400_000);
+    // Flat from the STOP's start through the last µs before its exact end.
     let pos = |t| chart.scroll.position_at(TimeUs(t));
+    assert_eq!(pos(1_612_500), Position(BEAT * 129 / 32));
     assert_eq!(pos(1_612_500), pos(1_613_026));
     assert!(pos(1_613_027) > pos(1_613_026));
     assert_eq!(loaded.warnings, vec![]);
@@ -374,7 +378,10 @@ fn bpm_below_one_millionth_is_refused() {
         }
     }
     let loaded = load("#BPM 0.000001\n").unwrap();
-    assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 1);
+    assert_eq!(
+        loaded.chart.scroll.initial_rate(),
+        BEAT / 60_000_000_000_000
+    );
 }
 
 /// A chart whose BPM changes at the start of each measure `m` in

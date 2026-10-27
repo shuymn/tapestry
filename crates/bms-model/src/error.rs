@@ -31,8 +31,29 @@ pub enum ModelError {
         /// Time of the change.
         at: TimeUs,
     },
-    /// A time or position left the `i64` range.
+    /// A time left the `i64` range.
     Overflow,
+    /// A display position or scroll segment left the map's domain or
+    /// `i128`.
+    PositionOverflow,
+    /// The scroll map's initial rate was zero or negative.
+    InitialRateNotPositive,
+    /// A scroll segment broke the map's shape: the first must start at time
+    /// 0 at position 0, starts increase strictly, slopes are not negative,
+    /// and each segment reaches the next anchor without passing it.
+    ScrollNotMonotone {
+        /// Index of the segment.
+        index: usize,
+    },
+    /// A note's display position came before the end position of the note
+    /// before it in its lane, or a long note's end position before its
+    /// head's.
+    PositionsUnsorted {
+        /// Lane of the note.
+        lane: Lane,
+        /// Index of the note in its lane.
+        index: usize,
+    },
     /// A note came earlier than the note before it in its lane.
     Unsorted {
         /// Lane of the note.
@@ -59,7 +80,7 @@ pub enum ModelError {
         /// Index of the event.
         index: usize,
     },
-    /// A bar line came earlier than the bar line before it.
+    /// A bar line came before the bar line before it.
     BarLinesUnsorted {
         /// Index of the bar line.
         index: usize,
@@ -84,7 +105,19 @@ impl fmt::Display for ModelError {
             Self::ChangeDuringStop { at } => {
                 write!(f, "scroll change at {} µs falls inside a STOP", at.0)
             }
-            Self::Overflow => f.write_str("time or position overflowed i64"),
+            Self::Overflow => f.write_str("time overflowed i64"),
+            Self::PositionOverflow => f.write_str("display position is out of range"),
+            Self::InitialRateNotPositive => f.write_str("initial scroll rate is not positive"),
+            Self::ScrollNotMonotone { index } => {
+                write!(f, "scroll segment {index} breaks the map's order")
+            }
+            Self::PositionsUnsorted { lane, index } => {
+                write!(
+                    f,
+                    "lane {} note {index} is displayed before the note before it ends",
+                    lane.index()
+                )
+            }
             Self::Unsorted { lane, index } => {
                 write!(
                     f,
@@ -110,7 +143,7 @@ impl fmt::Display for ModelError {
                 write!(f, "BGM event {index} is earlier than the event before it")
             }
             Self::BarLinesUnsorted { index } => {
-                write!(f, "bar line {index} is earlier than the bar line before it")
+                write!(f, "bar line {index} is before the bar line before it")
             }
             Self::UnknownSound { sound } => {
                 write!(f, "sound {} is not in the sound table", sound.0)

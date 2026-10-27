@@ -130,21 +130,21 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::Fns(
         "crates/bms-model/src/chart.rs",
-        &["Lane::new", "Lane::index", "Lane::all", "Note::end"],
+        &[
+            "Lane::new",
+            "Lane::index",
+            "Lane::all",
+            "Note::end",
+            "Note::end_pos",
+        ],
     ),
     Site::Fns(
         "crates/bms-model/src/scroll.rs",
         &[
-            "ScrollChange::at",
-            "Segment::position",
-            "Segment::earliest_at_or_past",
-            "ScrollMap::initial_bpm_micro",
-            "ScrollMap::segment_at",
+            "Position::minus",
+            "ScrollSegment::value",
+            "ScrollMap::initial_rate",
             "ScrollMap::position_at",
-            "ScrollMap::time_range",
-            "ScrollMap::earliest_at_or_past",
-            "ceil_div",
-            "saturate",
         ],
     ),
     // The input thread.

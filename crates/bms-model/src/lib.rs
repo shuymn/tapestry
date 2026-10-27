@@ -1,6 +1,7 @@
 //! Chart model shared by the parser, the evaluator, and the player.
 //!
-//! Times are integer microseconds; this crate does not use floating point.
+//! Times are integer microseconds and display positions integer counts of
+//! 2^-80 beat; this crate does not use floating point.
 //! The float lints below are partial checks: they catch float arithmetic and
 //! comparisons, not every use of a float type.
 
@@ -20,7 +21,7 @@ pub use chart::{
 };
 pub use clock::{TimeSource, VirtualClock};
 pub use error::ModelError;
-pub use scroll::{Position, ScrollChange, ScrollMap};
+pub use scroll::{BEAT, DOMAIN, FRAC_BITS, Position, ScrollChange, ScrollMap, ScrollSegment};
 
 /// A point in chart time, in integer microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

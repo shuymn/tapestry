@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use bms_model::{JudgeRank, Note, NoteKind, SoundId, TimeUs};
+use bms_model::{BEAT, JudgeRank, Note, NoteKind, Position, SoundId, TimeUs};
 use bms_parser::{LOADER_VERSION, Limits, LoadError, LoadOptions, Loaded, WarningKind, load_bms};
 use tempfile::TempDir;
 
@@ -63,6 +63,11 @@ fn times(notes: &[Note]) -> Vec<i64> {
     notes.iter().map(|n| n.time.0).collect()
 }
 
+/// The display position `beats` beats in.
+fn beats(beats: i128) -> Position {
+    Position(beats * BEAT)
+}
+
 #[test]
 fn bpm_change_and_stop_at_one_position_use_new_bpm() {
     let dir = folder(&["click.wav"]);
@@ -81,20 +86,21 @@ fn bpm_change_and_stop_at_one_position_use_new_bpm() {
     );
     assert_eq!(chart.bgm.len(), 1);
     assert_eq!(chart.bgm[0].time, TimeUs(4_581_024));
-    assert_eq!(
-        chart.bar_lines,
-        vec![
-            TimeUs(0),
-            TimeUs(2_000_000),
-            TimeUs(3_500_000),
-            TimeUs(4_581_024)
-        ]
-    );
-    // The scroll is flat through each STOP.
+    // Bar lines at 0, 4, 8 and 11 beats: STOPs and BPM changes add none.
+    assert_eq!(chart.bar_lines, [0, 4, 8, 11].map(beats));
+    let positions: Vec<_> = chart.lanes[1].iter().map(|n| n.pos).collect();
+    assert_eq!(positions, [4, 6, 10, 11].map(beats));
+    // The scroll is flat through each STOP, from the first whole µs of its
+    // exact start (4_082_409.97... for the second) to the last before its
+    // exact end (4_248_614.95...), on the STOP's beat.
     let pos = |t| chart.scroll.position_at(TimeUs(t));
-    assert_eq!(pos(2_000_000), pos(2_500_000));
+    assert_eq!(pos(2_000_000), beats(4));
+    assert_eq!(pos(2_500_000), beats(4));
     assert!(pos(2_500_001) > pos(2_500_000));
-    assert_eq!(pos(4_082_409), pos(4_248_614));
+    assert!(pos(4_082_409) < beats(10));
+    assert_eq!(pos(4_082_410), beats(10));
+    assert_eq!(pos(4_248_614), beats(10));
+    assert!(pos(4_248_615) > beats(10));
     assert_eq!(chart.meta.title, "BPM and STOP");
     assert_eq!(chart.meta.rank, Some(JudgeRank::Rank(2)));
     assert_eq!(chart.meta.total_milli, Some(250_500));
@@ -121,11 +127,14 @@ fn rational_time_does_not_drift() {
 
 #[test]
 fn lnobj_and_lntype1_build_the_same_spans() {
+    // 120 BPM: 2 beats a second, every endpoint on a whole beat.
     let long = |start: i64, end: i64| Note {
         time: TimeUs(start),
+        pos: beats(i128::from(start / 500_000)),
         sound: Some(SoundId(0)),
         kind: NoteKind::Long {
             end: TimeUs(end),
+            end_pos: beats(i128::from(end / 500_000)),
             end_sound: None,
         },
     };
@@ -177,8 +186,10 @@ fn bpm_zero_is_rejected() {
 #[test]
 fn bpm_keeps_eighteen_fractional_digits_and_cuts_the_rest() {
     let loaded = load_text("#BPM 120.000000000000000003\n#WAV01 click.wav\n#00111:01\n").unwrap();
-    // The scroll map takes millionths rounded down; time uses the exact BPM.
-    assert_eq!(loaded.chart.scroll.initial_bpm_micro(), 120_000_000);
+    // Time and the scroll rate use the exact BPM: 2^80 × 2.000...00005e-6
+    // units per µs, floored, one more than 120 gives.
+    let rate = loaded.chart.scroll.initial_rate();
+    assert_eq!(rate, BEAT / 500_000);
     // 4 beats: floor(240e6 / 120.000000000000000003) = 1_999_999, where
     // 120 BPM gives exactly 2_000_000.
     assert_eq!(times(&loaded.chart.lanes[1]), vec![1_999_999]);
@@ -455,6 +466,7 @@ fn mines_and_conflicts_follow_loader_rules() {
         lanes[1][0].kind,
         NoteKind::Long {
             end: TimeUs(3_000_000),
+            end_pos: beats(6),
             end_sound: None
         }
     );
@@ -496,9 +508,11 @@ fn duplicated_lntype1_line_keeps_one_long_note() {
         loaded.chart.lanes[1],
         vec![Note {
             time: TimeUs(2_000_000),
+            pos: beats(4),
             sound: Some(SoundId(1)),
             kind: NoteKind::Long {
                 end: TimeUs(3_000_000),
+                end_pos: beats(6),
                 end_sound: None
             }
         }]
@@ -521,6 +535,7 @@ fn notes_rounded_to_one_time_keep_the_later_line() {
         loaded.chart.lanes[1],
         vec![Note {
             time: TimeUs(0),
+            pos: beats(0),
             sound: Some(SoundId(1)),
             kind: NoteKind::Tap
         }]
@@ -545,6 +560,7 @@ fn long_note_edge_cases() {
         lanes[3][0].kind,
         NoteKind::Long {
             end: TimeUs(3_000_000),
+            end_pos: beats(6),
             end_sound: Some(SoundId(1))
         }
     );
@@ -554,6 +570,7 @@ fn long_note_edge_cases() {
         lanes[4][0].kind,
         NoteKind::Long {
             end: TimeUs(4_000_000),
+            end_pos: beats(8),
             end_sound: None
         }
     );
@@ -581,10 +598,12 @@ fn long_note_edge_cases() {
 #[test]
 fn resolved_hash_matches_golden() {
     // Computed at authoring time by an independent script encoding the
-    // documented fields of this chart: version 4, 120 BPM, no scroll changes,
-    // one tap at 2 s on key 1 with sound 0, bar lines at 0 and 2 s, the sound
-    // name `a.wav`, an empty title and no other values.
-    const GOLDEN: &str = "524686e9c57de604a1db36cb1ea748eb210fedeb5a113032a89ade56dde1f78a";
+    // documented fields of this chart: version 5, the 120 BPM rate
+    // (floor(2^80 / 500_000) units per µs) before time 0 and as the one
+    // segment from 0, one tap at 2 s and 4 beats on key 1 with sound 0, bar
+    // lines at 0 and 4 beats, the sound name `a.wav`, an empty title and no
+    // other values.
+    const GOLDEN: &str = "b7cab4b435c8a5ff08dbefecc536620b7b338527c2a2023a322b4154b2c0d2c8";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart
@@ -594,6 +613,27 @@ fn resolved_hash_matches_golden() {
         .map(|x| format!("{x:02x}"))
         .collect();
     assert_eq!(hex, GOLDEN);
+}
+
+#[test]
+fn equal_times_on_other_beats_hash_differently() {
+    // Measure 0 is 1e-12 longer and the BPM 1e-12 faster in proportion, so
+    // the note at measure 1 sounds at exactly the same time and the one at
+    // measure 2 within the same µs, but both sit on other beats; the BPM
+    // differs below a millionth.
+    let base = load_text("#BPM 7\n#WAV01 a.wav\n#00111:01\n#00211:01\n").unwrap();
+    let moved = load_text(
+        "#BPM 7.000000000007\n#WAV01 a.wav\n#00002:1.000000000001\n#00111:01\n#00211:01\n",
+    )
+    .unwrap();
+    let (a, b) = (&base.chart.lanes[1], &moved.chart.lanes[1]);
+    assert_eq!(times(a), times(b));
+    assert_eq!(a[0].pos, beats(4));
+    assert!(b[0].pos > a[0].pos);
+    assert_ne!(
+        base.chart.identity.resolved_hash,
+        moved.chart.identity.resolved_hash
+    );
 }
 
 #[test]
@@ -632,6 +672,13 @@ fn each_resolved_field_changes_the_resolved_hash() {
         ("BPM change", &[], &["#00203:00F0"]),
         // Measures 2 and 3 keep 8 beats together: only bar line 3 moves.
         ("bar line", &[], &["#00202:0.5", "#00302:1.5"]),
+        // Measure 1 runs 8 beats at 240 BPM: every time stays, positions
+        // after measure 0 move.
+        (
+            "same times, other beats",
+            &[],
+            &["#00103:F0", "#00102:2", "#00203:78"],
+        ),
         ("title", &[(0, "#TITLE u")], &[]),
         ("rank", &[(2, "#RANK 3")], &[]),
         ("total", &[(3, "#TOTAL 201")], &[]),
@@ -651,7 +698,7 @@ fn each_resolved_field_changes_the_resolved_hash() {
         }
         seen.push((name, hash));
     }
-    assert_eq!(seen.len(), 17);
+    assert_eq!(seen.len(), 18);
 }
 
 #[test]
@@ -663,14 +710,14 @@ fn trailing_measures_after_the_last_object_are_dropped() {
     let text = "#BPM 60\n#WAV01 click.wav\n#00011:01\n#00211:0001\n#50003:0F\n#99902:0.5\n";
     let loaded = load_text(text).unwrap();
     assert_eq!(times(&loaded.chart.lanes[1]), vec![0, 10_000_000]);
-    assert_eq!(
-        loaded.chart.bar_lines,
-        vec![TimeUs(0), TimeUs(4_000_000), TimeUs(8_000_000)]
-    );
+    assert_eq!(loaded.chart.bar_lines, [0, 4, 8].map(beats));
     let pos = |t| loaded.chart.scroll.position_at(TimeUs(t));
-    // Still 60 BPM after where the dropped change was: 1 beat a second,
-    // not the quarter beat 15 BPM would give.
-    assert_eq!(pos(2_101_000_000).0 - pos(2_100_000_000).0, 1_000_000);
+    // Still 60 BPM after where the dropped change was: 1 beat a second at
+    // the floored rate, not the quarter beat 15 BPM would give.
+    assert_eq!(
+        pos(2_101_000_000).0 - pos(2_100_000_000).0,
+        BEAT / 1_000_000 * 1_000_000
+    );
     // A BGM object counts as the last object too.
     let bgm = "#BPM 60\n#WAV01 click.wav\n#00011:01\n#00401:01\n#99902:0.5\n";
     assert_eq!(load_text(bgm).unwrap().chart.bar_lines.len(), 5);

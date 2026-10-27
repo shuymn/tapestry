@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
-use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
+use bms_model::{Chart, ChartBuilder, ModelError, SoundId, TimeUs};
 use common::{MS, PERIOD, RATE, count_judged, judgments, lane};
 use eval::{ControlId, InputKind, SourceId};
 use game::{
@@ -1126,7 +1126,7 @@ fn a_reconnect_during_play_does_not_hide_a_removal_in_the_tail() {
     assert_eq!(s.now(), TimeUs(3_000 * MS));
 }
 
-/// Moves every note 500 ms later.
+/// Moves every note 500 ms later, its display position with it.
 struct Later;
 
 impl game::ChartTransform for Later {
@@ -1140,9 +1140,53 @@ impl game::ChartTransform for Later {
     fn apply(&self, mut chart: Chart, _seed: u64) -> Chart {
         for note in chart.lanes.iter_mut().flatten() {
             note.time = TimeUs(note.time.0 + 500 * MS);
+            note.pos = chart.scroll.position_at(note.time);
         }
         chart
     }
+}
+
+/// Moves the first note of lane 1 past the second's display position but
+/// keeps its time: the lane's positions run backwards.
+struct Backwards;
+
+impl game::ChartTransform for Backwards {
+    fn id(&self) -> game::TransformId {
+        game::TransformId {
+            id: "backwards",
+            version: 1,
+        }
+    }
+
+    fn apply(&self, mut chart: Chart, _seed: u64) -> Chart {
+        let lane = &mut chart.lanes[1];
+        lane[0].pos = lane[1].pos;
+        lane[0].pos.0 += 1;
+        chart
+    }
+}
+
+#[test]
+fn a_transformed_chart_that_breaks_an_invariant_is_refused() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&[(1, 1_000), (1, 2_000)]);
+    let load = |transform: Box<dyn game::ChartTransform>| {
+        let parts = Parts {
+            transform,
+            ..parts(&root, &chart, &Events::default())
+        };
+        let settings = Settings::load(&root).unwrap();
+        Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).err()
+    };
+    assert_eq!(
+        load(Box::new(Backwards)),
+        Some(SessionError::Transform(ModelError::PositionsUnsorted {
+            lane: lane(1),
+            index: 1
+        }))
+    );
+    // The same chart moved whole, times and positions together, loads.
+    assert_eq!(load(Box::new(Later)), None);
 }
 
 #[test]

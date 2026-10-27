@@ -28,6 +28,9 @@ windows = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# Charts loaded from BMS text in the simple skin's tests.
+bms-parser.workspace = true
+tempfile.workspace = true
 # A plain Win32 window for the swap chain test.
 windows = { workspace = true, features = [
     "Win32_Foundation",

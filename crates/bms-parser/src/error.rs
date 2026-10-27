@@ -62,6 +62,13 @@ pub enum LoadError {
         /// The measure being computed.
         measure: u16,
     },
+    /// A display position or a kept time lies beyond what the scroll map
+    /// holds (±2^32 µs). Charts within the default limits never reach it.
+    #[error("measure {measure}: display position is out of range")]
+    PositionOverflow {
+        /// The measure being computed.
+        measure: u16,
+    },
     /// A `#WAV` name is absolute, rooted, drive-prefixed, UNC, or contains
     /// `..`.
     #[error("line {line}: sound path must stay relative to the chart folder")]

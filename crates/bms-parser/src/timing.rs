@@ -1,9 +1,9 @@
-//! Measure positions to integer microseconds with exact rationals (design.md
-//! "Chart Time").
+//! Measure positions to integer microseconds and display positions with exact
+//! rationals (design.md "Chart Time").
 
 use std::cmp::Ordering;
 
-use bms_model::{ScrollChange, TimeUs};
+use bms_model::{DOMAIN, FRAC_BITS, Position, ScrollSegment, TimeUs};
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
@@ -67,6 +67,8 @@ impl Time {
 #[derive(Clone, Copy, Debug)]
 pub struct Timed {
     pub time: TimeUs,
+    /// The display position: the exact beat count floored to 2^-80 beat.
+    pub pos: Position,
     pub kind: ObjectKind,
     pub line: usize,
     /// Position of the object in the file, the tie-breaker among objects
@@ -74,7 +76,7 @@ pub struct Timed {
     pub seq: usize,
 }
 
-/// The chart's objects in time order with the scroll changes.
+/// The chart's objects in time order with the scroll map's parts.
 #[derive(Debug)]
 pub struct Timeline {
     /// Notes, long-note objects, mines and BGM in measure-position order,
@@ -82,9 +84,14 @@ pub struct Timeline {
     /// keep position order; file order travels in [`Timed::seq`]. Timing
     /// objects are consumed.
     pub objects: Vec<Timed>,
-    pub initial_bpm_micro: i64,
-    pub scroll: Vec<ScrollChange>,
-    pub bar_lines: Vec<TimeUs>,
+    /// The scroll rate before time 0, from the `#BPM` header.
+    pub initial_rate: i128,
+    /// The scroll map's segments, coalesced by start in exact event order.
+    pub segments: Vec<ScrollSegment>,
+    pub bar_lines: Vec<Position>,
+    /// The measure of the last position kept, which errors from compiling
+    /// the scroll map name.
+    pub last_measure: u16,
 }
 
 /// Where an event sits: `index / count` of the way through `measure`.
@@ -160,6 +167,17 @@ pub fn compute(
             length * BigInt::from(4)
         })
         .collect();
+    // Each measure's start in beats, exact: positions are narrowed only for
+    // what the chart keeps (design.md "Chart Time").
+    let mut sum = Rational::zero();
+    let starts: Vec<Rational> = spans
+        .iter()
+        .map(|span| {
+            let start = sum.clone();
+            sum += span;
+            start
+        })
+        .collect();
 
     let mut events = Vec::with_capacity(source.objects.len() + usize::from(last_measure) + 1);
     for m in 0..=last_measure {
@@ -193,13 +211,20 @@ pub fn compute(
         .map_or_else(|| Spot::start(0), |(spot, _)| *spot);
     events.truncate(events.partition_point(|e| e.0.order(&end) != Ordering::Greater));
 
+    let mut us_per_beat = int(US_PER_MINUTE) / &initial_bpm;
+    let initial_rate = slope(&us_per_beat).ok_or(LoadError::PositionOverflow { measure: 0 })?;
+    let mut scroll_rate = initial_rate;
     let mut timeline = Timeline {
         objects: Vec::with_capacity(source.objects.len()),
-        initial_bpm_micro: bpm_micro(&initial_bpm),
-        scroll: Vec::new(),
+        initial_rate,
+        segments: vec![ScrollSegment {
+            start: TimeUs(0),
+            anchor: Position(0),
+            slope: initial_rate,
+        }],
         bar_lines: Vec::with_capacity(usize::from(last_measure) + 1),
+        last_measure: 0,
     };
-    let mut us_per_beat = int(US_PER_MINUTE) / &initial_bpm;
     // The current measure's length in µs at the current BPM, cleared when
     // either changes.
     let mut measure_us: Option<Rational> = None;
@@ -221,6 +246,8 @@ pub fn compute(
         };
         let measure = spot.measure;
         let overflow = || LoadError::TimeOverflow { measure };
+        let out_of_range = || LoadError::PositionOverflow { measure };
+        timeline.last_measure = measure;
 
         // The fraction of the previous position's measure up to this
         // position. Every measure has a bar line at its start, so a group in
@@ -247,6 +274,11 @@ pub fn compute(
         }
         beat = *spot;
         let at = to_micros(&time, &cap, measure)?;
+        // The exact beat count, which BPM changes and STOPs do not move.
+        let beats = &starts[usize::from(measure)]
+            + &spans[usize::from(measure)]
+                * Rational::new(BigInt::from(spot.index), BigInt::from(spot.count));
+        let pos = to_position(&beats).ok_or_else(out_of_range)?;
 
         // A BPM change applies first; channel 08 wins over 03; the later
         // object in the file wins within a channel.
@@ -270,17 +302,17 @@ pub fn compute(
             }
         }
         if let Some(v) = new_bpm {
-            timeline.scroll.push(ScrollChange::Bpm {
-                at,
-                bpm_micro: bpm_micro(&v),
-            });
             us_per_beat = int(US_PER_MINUTE) / v;
             measure_us = None;
+            scroll_rate = slope(&us_per_beat).ok_or_else(out_of_range)?;
+            let segment =
+                segment(&time, &beats, pos, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
+            push(&mut timeline.segments, segment);
         }
 
         for (_, event) in group {
             match *event {
-                Event::Bar => timeline.bar_lines.push(at),
+                Event::Bar => timeline.bar_lines.push(pos),
                 Event::Object(i) => {
                     let o = &source.objects[i];
                     if !matches!(
@@ -289,6 +321,7 @@ pub fn compute(
                     ) {
                         timeline.objects.push(Timed {
                             time: at,
+                            pos,
                             kind: o.kind,
                             line: o.line,
                             seq: i,
@@ -317,26 +350,32 @@ pub fn compute(
             }
         }
         if units.is_positive() {
+            // Flat from the STOP's start, then the current rate again from
+            // its end, each anchored on the exact curve.
+            let stop = segment(&time, &beats, pos, &us_per_beat, 0).ok_or_else(out_of_range)?;
+            push(&mut timeline.segments, stop);
             let length = units * &us_per_beat / BigInt::from(STOP_UNITS_PER_BEAT);
             time.add(&length, max_bits).map_err(|()| overflow())?;
-            let end = to_micros(&time, &cap, measure)?;
-            if end > at {
-                timeline.scroll.push(ScrollChange::Stop {
-                    at,
-                    len: TimeUs(end.0 - at.0),
-                });
-            }
+            to_micros(&time, &cap, measure)?;
+            let resume =
+                segment(&time, &beats, pos, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
+            push(&mut timeline.segments, resume);
         }
     }
     Ok(timeline)
 }
 
 /// Floors the time to microseconds (mathematical floor) after checking the
-/// duration cap, so nothing is sized from a time past it.
+/// duration cap, so nothing is sized from a time past it, and the scroll
+/// map's domain, which a raised duration cap may pass.
 fn to_micros(time: &Time, cap: &BigInt, measure: u16) -> Result<TimeUs, LoadError> {
     let (floor, rest) = time.numer.div_mod_floor(&time.denom);
-    if floor > *cap || (floor == *cap && !rest.is_zero()) {
+    let past = |bound: &BigInt| floor > *bound || (floor == *bound && !rest.is_zero());
+    if past(cap) {
         return Err(LoadError::DurationExceeded { measure });
+    }
+    if past(&BigInt::from(DOMAIN)) {
+        return Err(LoadError::PositionOverflow { measure });
     }
     // The floor is at most the cap, an `i64`, so this never fails.
     i64::try_from(floor)
@@ -344,12 +383,60 @@ fn to_micros(time: &Time, cap: &BigInt, measure: u16) -> Result<TimeUs, LoadErro
         .map_err(|_| LoadError::TimeOverflow { measure })
 }
 
-/// A BPM in millionths, rounded down. Every BPM is two hex digits, the
-/// default, or a decimal of at most 12 integer digits and at least
-/// 0.000001, so the value is from 1 to below 10^18. Saturates if that ever
-/// changes.
-fn bpm_micro(bpm: &Rational) -> i64 {
-    i64::try_from((bpm * BigInt::from(1_000_000)).floor().to_integer()).unwrap_or(i64::MAX)
+/// `floor(2^80 × beats)`, or `None` outside `i128`.
+fn to_position(beats: &Rational) -> Option<Position> {
+    let units = (beats.numer() << FRAC_BITS).div_floor(beats.denom());
+    i128::try_from(units).ok().map(Position)
+}
+
+/// The scroll rate in units per µs, floored: `2^80` beats over the µs per
+/// beat.
+fn slope(us_per_beat: &Rational) -> Option<i128> {
+    i128::try_from((us_per_beat.denom() << FRAC_BITS).div_floor(us_per_beat.numer())).ok()
+}
+
+/// The segment of a change at exact time `time` and beat count `beats`
+/// (display position `pos`), after which the chart scrolls at
+/// `us_per_beat` (`rate` units per µs, 0 for a STOP): it starts at
+/// `ceil(time)`, anchored on the exact curve there. The time was checked
+/// against the domain, so the start fits.
+fn segment(
+    time: &Time,
+    beats: &Rational,
+    pos: Position,
+    us_per_beat: &Rational,
+    rate: i128,
+) -> Option<ScrollSegment> {
+    let (floor, rest) = time.numer.div_mod_floor(&time.denom);
+    let (start, anchor) = if rest.is_zero() {
+        (floor, pos)
+    } else if rate == 0 {
+        (floor + 1, pos)
+    } else {
+        // beats + (ceil(time) - time) / us_per_beat, with the gap
+        // `(denom - rest) / denom` and `us_per_beat = a / b`: one product
+        // of the running time's denominator, never reduced.
+        let gap = &time.denom - &rest;
+        let (a, b) = (us_per_beat.numer(), us_per_beat.denom());
+        let (bn, bd) = (beats.numer(), beats.denom());
+        let numer = (bn * &time.denom * a + gap * b * bd) << FRAC_BITS;
+        let units = numer.div_floor(&(bd * &time.denom * a));
+        (floor + 1, Position(i128::try_from(units).ok()?))
+    };
+    Some(ScrollSegment {
+        start: TimeUs(i64::try_from(start).ok()?),
+        anchor,
+        slope: rate,
+    })
+}
+
+/// Appends `segment`, replacing the last one if it starts at the same µs:
+/// changes coalesce in exact event order, the later winning.
+fn push(segments: &mut Vec<ScrollSegment>, segment: ScrollSegment) {
+    match segments.last_mut() {
+        Some(last) if last.start == segment.start => *last = segment,
+        _ => segments.push(segment),
+    }
 }
 
 #[cfg(test)]
