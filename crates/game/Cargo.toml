@@ -22,6 +22,11 @@ thiserror.workspace = true
 toml.workspace = true
 triple_buffer.workspace = true
 
+[features]
+default = []
+# Development features. Never enabled in production builds (R3).
+dev-tools = []
+
 [lints]
 workspace = true
 

@@ -56,8 +56,8 @@ pub struct PlayerRig<'a> {
     pub recorded: Recorded,
     /// The gauge to show.
     pub gauge: usize,
-    /// Whether the session plays by itself and saves nothing (design.md
-    /// "Autoplay").
+    /// Whether the session plays generated input (design.md "Autoplay"):
+    /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
     /// The countdown's length.
     pub lead_in: TimeUs,

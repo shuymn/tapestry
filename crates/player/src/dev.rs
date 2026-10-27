@@ -92,29 +92,34 @@ pub fn probe() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The arguments of `measure play <chart>`, after `measure`.
+/// The arguments of `measure play [--perfect] <chart>`, after `measure`.
 ///
 /// # Errors
 ///
-/// The usage error for anything but `play` and one chart.
+/// The usage error for anything but `play`, one chart and `--perfect`.
 pub fn measure_args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
-    const MEASURE_USAGE: &str = "usage: tapestry measure play <chart.bms>";
+    const MEASURE_USAGE: &str = "usage: tapestry measure play [--perfect] <chart.bms>";
     match p.next()? {
         Some(lexopt::Arg::Value(v)) if v == "play" => {}
         Some(other) => return Err(other.unexpected().into()),
         None => return Err(UsageError::Usage(MEASURE_USAGE.to_owned())),
     }
-    let chart = match p.next()? {
-        Some(lexopt::Arg::Value(v)) => PathBuf::from(v),
-        Some(other) => return Err(other.unexpected().into()),
-        None => {
-            return Err(UsageError::Usage(format!(
-                "measure play needs a chart file\n{MEASURE_USAGE}"
-            )));
+    let mut chart = None;
+    let mut perfect = false;
+    while let Some(arg) = p.next()? {
+        match arg {
+            lexopt::Arg::Value(v) if chart.is_none() => chart = Some(PathBuf::from(v)),
+            // A second `--perfect` is unknown, as a second chart is.
+            lexopt::Arg::Long("perfect") if !perfect => perfect = true,
+            other => return Err(other.unexpected().into()),
         }
+    }
+    let Some(chart) = chart else {
+        return Err(UsageError::Usage(format!(
+            "measure play needs a chart file\n{MEASURE_USAGE}"
+        )));
     };
-    crate::args::end(p)?;
-    Ok(Command::Measure { chart })
+    Ok(Command::Measure { chart, perfect })
 }
 
 /// The development options of `play`.
@@ -139,24 +144,35 @@ pub struct Options {
     /// Run autoplay headless: a recording of a simulated audio device and
     /// WARP offscreen, as a scripted run.
     pub headless: bool,
+    /// Play generated input that hits every note, with key sounds sent from
+    /// judgments, and save the play: the perfect measurement.
+    pub perfect: bool,
 }
 
 impl Options {
     /// The session's input with the development options applied: an input
-    /// log in place of the devices.
+    /// log or the perfect measurement in place of the devices.
     ///
     /// # Errors
     ///
-    /// A usage error for options that cannot go together: an input log with
-    /// autoplay, or `--dev-headless` without autoplay.
+    /// A usage error for options that cannot go together: two of autoplay,
+    /// an input log and the perfect measurement, or `--dev-headless`
+    /// without generated input.
     pub fn play_input(&self, input: crate::PlayInput) -> Result<crate::PlayInput, UsageError> {
         let log = self.scripted_input.clone();
+        let auto = matches!(input, crate::PlayInput::Autoplay);
         match input {
             crate::PlayInput::Autoplay if log.is_some() => Err(UsageError::Usage(
                 "--auto and --dev-scripted-input cannot be used together".to_owned(),
             )),
+            _ if self.perfect && (auto || log.is_some()) => Err(UsageError::Usage(
+                "--dev-perfect cannot be used with --auto or --dev-scripted-input".to_owned(),
+            )),
             crate::PlayInput::Autoplay => Ok(input),
-            _ if self.headless => Err(UsageError::Usage("--dev-headless needs --auto".to_owned())),
+            _ if self.perfect => Ok(crate::PlayInput::Perfect),
+            _ if self.headless => Err(UsageError::Usage(
+                "--dev-headless needs --auto or --dev-perfect".to_owned(),
+            )),
             _ => Ok(log.map_or(input, crate::PlayInput::Script)),
         }
     }
@@ -172,6 +188,7 @@ impl Options {
             "dev-auto-retry" => self.auto_retry = true,
             "dev-overlay" => self.overlay = true,
             "dev-headless" => self.headless = true,
+            "dev-perfect" => self.perfect = true,
             "dev-adjust-at" => {
                 self.adjust_at_ms = p.value()?.to_string_lossy().parse().map_err(|_| {
                     UsageError::Usage("--dev-adjust-at takes milliseconds".to_owned())

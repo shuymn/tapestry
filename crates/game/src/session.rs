@@ -160,13 +160,24 @@ pub struct SessionConfig {
     pub provenance: BuildProvenance,
     /// How the sources' input is received, as recorded.
     pub receive: ReceiveMethod,
-    /// Whether the session plays by itself (design.md "Autoplay"): every
-    /// play is planned for the generated keyboard, with the built-in key
-    /// config ([`KeyConfig::autoplay`]) and an input offset of 0 whatever
-    /// the settings say, a recording window of exactly its events, and its
-    /// key sounds scheduled ahead with the BGM rather than sent from
-    /// judgments.
-    pub autoplay: bool,
+    /// Whether the session plays by itself (design.md "Autoplay"), and
+    /// how its key sounds reach the mixer: every play is planned for the
+    /// generated keyboard, with the built-in key config
+    /// ([`KeyConfig::autoplay`]) and an input offset of 0 whatever the
+    /// settings say, and a recording window of exactly its events.
+    pub autoplay: Option<AutoKeySounds>,
+}
+
+/// How an autoplay session's key sounds reach the mixer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoKeySounds {
+    /// Scheduled ahead, merged with the BGM, and none sent from judgments:
+    /// `play --auto`.
+    Scheduled,
+    /// Sent from judgments as in a device play, the engine playing the
+    /// chart's own BGM: the perfect measurement (design.md "Autoplay").
+    #[cfg(feature = "dev-tools")]
+    Judged,
 }
 
 /// Why a session could not be prepared.
@@ -551,7 +562,7 @@ impl Loaded {
         kinds: &[DeviceKind],
         axes: &[Vec<input::hid::AxisCap>],
     ) -> Result<PlayPlan, LogicError> {
-        if self.config.autoplay {
+        if self.config.autoplay.is_some() {
             return self.autoplay_plan(kinds, axes);
         }
         let device = self.settings.device.profile(kinds, axes);
@@ -626,7 +637,11 @@ impl Loaded {
         let device = self.autoplay_device().profile(kinds, axes);
         let generated = generated();
         let inputs = input::autoplay_count(&self.chart, &generated);
-        let schedule = crate::autoplay::schedule_len(&self.chart);
+        let schedule = match self.config.autoplay {
+            None | Some(AutoKeySounds::Scheduled) => crate::autoplay::schedule_len(&self.chart),
+            #[cfg(feature = "dev-tools")]
+            Some(AutoKeySounds::Judged) => self.chart.bgm.len(),
+        };
         // A profile the evaluator refuses is reported here, before the
         // session makes its stream: autoplay is never admitted unchecked.
         let probe = Evaluator::new(
@@ -654,8 +669,9 @@ impl Loaded {
 
     /// What an autoplay session plays (design.md "Autoplay"), made once
     /// before its first play: the generated input of the built-in keyboard
-    /// key config with an input offset of 0, and the chart's BGM merged with
-    /// the key sounds it presses. Its plays are planned as
+    /// key config with an input offset of 0, and the audio schedule: the
+    /// chart's BGM, merged with the key sounds it presses unless they are
+    /// judged ([`AutoKeySounds`]). Its plays are planned as
     /// [`plan`](Self::plan) plans an autoplay session's, and the plan is
     /// checked first, so a chart whose recording reservation (autoplay's
     /// own buffers included) is over budget is refused before anything of
@@ -672,7 +688,11 @@ impl Loaded {
         let events = input::autoplay(&self.chart, &generated)?;
         Ok(Autoplay {
             events,
-            schedule: crate::autoplay::schedule(&self.chart),
+            schedule: match self.config.autoplay {
+                None | Some(AutoKeySounds::Scheduled) => crate::autoplay::schedule(&self.chart),
+                #[cfg(feature = "dev-tools")]
+                Some(AutoKeySounds::Judged) => self.chart.bgm.clone(),
+            },
             recorded: KeyConfig::autoplay().recorded(),
         })
     }

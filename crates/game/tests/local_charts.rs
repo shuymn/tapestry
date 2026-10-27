@@ -221,7 +221,7 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
         app_version: "sweep".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
-        autoplay: true,
+        autoplay: Some(game::AutoKeySounds::Scheduled),
     };
     let loaded = Loaded::load(root, settings, path, config, parts).map_err(|e| category(&e))?;
     let chart = loaded.chart().clone();

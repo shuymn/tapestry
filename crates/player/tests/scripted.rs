@@ -308,6 +308,52 @@ fn render_app_region_does_not_allocate() {
     assert_eq!(int(&m, "allocations", "render_app"), Some(0));
 }
 
+/// The perfect measurement (`--dev-perfect`, headless here): with a
+/// `device.toml` whose keys and input offset differ from the built-in ones,
+/// every note is still PERFECT, each key sound is sent from its judgment
+/// (press → sound has a sample per note), and the play is saved as
+/// generated input with the built-in profile and its `.measure.toml`.
+#[test]
+fn perfect_measurement_judges_key_sounds_and_saves() {
+    let fx = fixture();
+    let mut device = DeviceSettings {
+        input_offset_us: 30_000,
+        ..DeviceSettings::default()
+    };
+    // Other physical keys (Q, W): the generated keys must still be the
+    // ones recorded.
+    let lanes = &mut device.keyboard.lanes;
+    (lanes[1].control, lanes[2].control) = (0x10, 0x11);
+    game::save_settings(&fx.appdata.join("tapestry").join("device.toml"), &device).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("play")
+        .arg(&fx.chart_path)
+        .args(["--dev-perfect", "--dev-headless"])
+        .env("LOCALAPPDATA", &fx.appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("input: generated, every note hit on time"));
+    assert!(
+        stdout.contains(&format!("perfect {NOTES} great 0 good 0 bad 0 poor 0")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("re-evaluation matches live: true"));
+    let saved = records(&fx.appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    let source = &rec.devices.sources[0];
+    assert_eq!(source.receive, ReceiveMethod::Scripted);
+    assert_eq!(source.profile.input_offset, TimeUs(0));
+    let m = measured(&saved[0]);
+    assert_eq!(
+        int(&m, "press_to_sound_scheduled_us", "count"),
+        Some(NOTES as i64)
+    );
+}
+
 /// A `device.toml` binding one control to two lanes, binding a reserved
 /// settings key, or naming a lane the game does not have is refused when
 /// it is loaded: the run ends with the reason and a nonzero exit, and
@@ -876,7 +922,7 @@ fn auto_with_scripted_input_is_refused() {
     let chart = fx.chart_path.as_os_str();
     let log = fx.log.as_os_str();
     let both = "--auto and --dev-scripted-input cannot be used together";
-    let headless = "--dev-headless needs --auto";
+    let headless = "--dev-headless needs --auto or --dev-perfect";
     for (args, refusal) in [
         (
             vec![
