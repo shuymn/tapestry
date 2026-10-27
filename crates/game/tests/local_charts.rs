@@ -317,8 +317,9 @@ fn local_charts_sweep() {
 
 /// A burst denser than the test sources' queue between two polls: at 240
 /// thousand BPM a measure lasts 1 ms, and 72 notes on each of 8 lanes make
-/// 1,152 edges in it. Played as the sweep plays a chart, every note is
-/// PERFECT, so no generated event was dropped.
+/// 1,144 edges in it, of 1,152 in all (each lane's last release comes 50 ms
+/// later). Played as the sweep plays a chart, every note is PERFECT, so no
+/// generated event was dropped.
 #[test]
 fn a_burst_past_a_fixed_queue_is_played_whole() {
     let dir = tempfile::Builder::new()
