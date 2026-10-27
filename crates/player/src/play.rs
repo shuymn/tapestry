@@ -73,6 +73,10 @@ pub struct PlayerRig<'a> {
     pub end_lines: Option<Vec<String>>,
     /// The end screen's key names.
     pub hints: Hints,
+    /// What the first play's load time runs from: the process start (the
+    /// clock's 0), or the end of what the command set up first (a
+    /// measurement's PresentMon capture).
+    pub load_start: TimeUs,
     /// The latest retry taken, by its receipt time: the next play starts
     /// from it.
     pub pending_retry: Option<TimeUs>,
@@ -349,7 +353,7 @@ impl Rig for PlayerRig<'_> {
         let measure = PlayMeasure {
             generation: self.generation,
             origin,
-            load_from: self.retry_from.unwrap_or(TimeUs(0)),
+            load_from: self.retry_from.unwrap_or(self.load_start),
             retry: self.retry_from.is_some(),
             audio: Some(audio),
             queued_periods: self.queued_now,
@@ -430,9 +434,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn ended(&mut self, report: &PlayReport) {
-        // Load times run to the play's first frame: from the process start
-        // (the clock's 0) for the first play, from the retry's receipt for
-        // a retry.
+        // Load times run to the play's first frame: from the load's start
+        // for the first play, from the retry's receipt for a retry.
         if let Some(frame) = self.render.first_frame() {
             if let Some(c) = self.countdown_at {
                 println!(
@@ -443,7 +446,7 @@ impl Rig for PlayerRig<'_> {
             match self.retry_from.take() {
                 Some(from) => self.times.retry = Some(since(from, frame)),
                 None if self.times.first.is_none() => {
-                    self.times.first = Some(since(TimeUs(0), frame));
+                    self.times.first = Some(since(self.load_start, frame));
                 }
                 None => {}
             }
