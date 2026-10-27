@@ -794,6 +794,31 @@ fn defexrank_below_one_is_ignored_so_rank_stays() {
             kind: WarningKind::IgnoredValue("#DEFEXRANK")
         }]
     );
+    // Fractional below 1, negative and non-numeric values are ignored the
+    // same way, before or after #RANK, and each is warned.
+    let rank = |text: &str| {
+        let loaded =
+            load_text(&format!("{text}\n#BPM 120\n#WAV01 click.wav\n#00111:01\n")).unwrap();
+        let warned = loaded
+            .warnings
+            .iter()
+            .filter(|w| w.kind == WarningKind::IgnoredValue("#DEFEXRANK"))
+            .count();
+        (loaded.chart.meta.rank, warned)
+    };
+    for (text, expected) in [
+        ("#RANK 3\n#DEFEXRANK 0.999", (Some(JudgeRank::Rank(3)), 1)),
+        ("#RANK 3\n#DEFEXRANK -2", (Some(JudgeRank::Rank(3)), 1)),
+        ("#RANK 3\n#DEFEXRANK easy", (Some(JudgeRank::Rank(3)), 1)),
+        ("#DEFEXRANK 0\n#RANK 2", (Some(JudgeRank::Rank(2)), 1)),
+        ("#DEFEXRANK 0", (None, 1)),
+        (
+            "#DEFEXRANK 120\n#DEFEXRANK 0\n#DEFEXRANK 0.5",
+            (Some(JudgeRank::DefExRankMilli(120_000)), 2),
+        ),
+    ] {
+        assert_eq!(rank(text), expected, "{text}");
+    }
     // 1 and above replace it, as before.
     let loaded =
         load_text("#RANK 3\n#DEFEXRANK 1\n#BPM 120\n#WAV01 click.wav\n#00111:01\n").unwrap();

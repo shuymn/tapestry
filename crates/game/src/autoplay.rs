@@ -23,6 +23,16 @@ pub struct Autoplay {
     pub recorded: Vec<ControlId>,
 }
 
+impl Autoplay {
+    /// The source queue an autoplay play's input side needs: room for the
+    /// whole generated stream, so the feeder never waits for the logic
+    /// step however dense a moment of the chart is.
+    #[must_use]
+    pub const fn queue_capacity(&self) -> usize {
+        self.events.len()
+    }
+}
+
 /// Why autoplay cannot play a chart.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AutoplayError {

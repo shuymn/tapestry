@@ -391,10 +391,8 @@ fn prepare(chart: &Path, input: &PlayInput) -> anyhow::Result<Prepared> {
             let made = loaded
                 .autoplay()
                 .with_context(|| chart.display().to_string())?;
-            // The queue holds the whole generated stream: the input side
-            // never waits for the logic step.
             let config = SourceConfig {
-                queue_capacity: made.events.len(),
+                queue_capacity: made.queue_capacity(),
                 ..source_config()
             };
             Ok(Prepared {

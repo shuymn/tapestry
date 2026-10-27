@@ -28,7 +28,7 @@ use game::{
     AutoplayError, BmsIngest, ChartIngest, DataRoot, IngestError, Loaded, LogicError, Parts,
     PlayEnd, PlayScript, RunnerAudio, SessionConfig, SessionError, Settings,
 };
-use input::{DeviceKind, ScriptedInput, SourceSet};
+use input::{DeviceKind, ScriptedInput, SourceConfig, SourceSet};
 use replay::{BuildProvenance, DecodeLimits, ReceiveMethod};
 use rules::Judgment;
 
@@ -138,9 +138,9 @@ fn category(e: &SessionError) -> &'static str {
             | LoadError::TooManyLines { .. }
             | LoadError::TooManyObjects { .. }
             | LoadError::MeasureOutOfRange { .. }
-            | LoadError::DurationExceeded { .. } => "loading limit",
-            LoadError::InvalidValue { .. } => "invalid value",
-            LoadError::TimeOverflow { .. } => "time overflow",
+            | LoadError::DurationExceeded { .. }
+            | LoadError::TimeOverflow { .. } => "loading limit",
+            LoadError::InvalidValue { what, reason, .. } => invalid_value(what, reason),
             LoadError::SoundPathRejected { .. } | LoadError::SoundPathEscapes { .. } => {
                 "sound path outside the folder"
             }
@@ -154,6 +154,21 @@ fn category(e: &SessionError) -> &'static str {
     }
 }
 
+/// An invalid value's category: the refusals by policy by name, any other
+/// as "invalid value".
+fn invalid_value(what: &str, reason: &str) -> &'static str {
+    match (what, reason) {
+        ("#BPM" | "#BPMxx", r) if r.starts_with("negative BPM") => "negative BPM",
+        ("measure length", r) if r.starts_with("the measure has no length") => {
+            "zero-length measure"
+        }
+        ("#RANDOM" | "#SETRANDOM" | "#IF", "not a positive integer") => {
+            "malformed #RANDOM or #IF operand"
+        }
+        _ => "invalid value",
+    }
+}
+
 /// Categories of chart the stage 1 player refuses by design.
 fn allowed(category: &str) -> bool {
     matches!(
@@ -161,12 +176,15 @@ fn allowed(category: &str) -> bool {
         "unsupported directive"
             | "unsupported long-note mode"
             | "no judgeable notes"
-            // Timing values are never replaced silently: a negative BPM, a
-            // measure length of 0 (as written or cut off to it), a malformed
-            // #RANDOM or #IF operand (stage1.md D3, PR3).
-            | "invalid value"
+            // Timing values are never replaced silently (stage1.md D3, PR3):
+            // reverse scroll is not supported yet, a measure of no length
+            // (as written or cut off to it) has no timing, and a malformed
+            // operand would decide which notes exist.
+            | "negative BPM"
+            | "zero-length measure"
+            | "malformed #RANDOM or #IF operand"
             // The D14 limits: longer than 60 minutes, a file over 16 MiB, a
-            // measure past 999.
+            // measure past 999, an exact time past its size cap.
             | "loading limit"
     )
 }
@@ -221,12 +239,18 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
         AutoplayError::Plan(e) => logic_category(&e),
         AutoplayError::Time(_) => "autoplay time out of range",
     })?;
+    // The queue sized as production autoplay sizes it.
+    let sources = SourceSet::new(SourceConfig {
+        queue_capacity: made.queue_capacity(),
+        ..common::sources()
+    })
+    .unwrap();
     let engine =
         AudioEngine::with_schedule(Arc::new(bank), made.schedule, RATE, PERIOD, MAX_VOICES, 0)
             .unwrap();
     let device = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
     let audio = RunnerAudio::new(engine, RecordingOutput::new(device, 0));
-    let mut session = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
+    let mut session = loaded.start(audio, sources);
     let input = ScriptedInput::from_log(&Default::default(), &made.events, &[DeviceKind::Keyboard]);
     let report = session
         .play(PlayScript {
@@ -289,4 +313,25 @@ fn local_charts_sweep() {
     let unexpected: Vec<_> = refused.keys().filter(|c| !allowed(c)).collect();
     assert!(unexpected.is_empty(), "unexpected failures: {unexpected:?}");
     assert!(played > 0, "no chart could be played");
+}
+
+/// A burst denser than the test sources' queue between two polls: at 240
+/// thousand BPM a measure lasts 1 ms, and 72 notes on each of 8 lanes make
+/// 1,152 edges in it. Played as the sweep plays a chart, every note is
+/// PERFECT, so no generated event was dropped.
+#[test]
+fn a_burst_past_a_fixed_queue_is_played_whole() {
+    let dir = tempfile::Builder::new()
+        .prefix("burst")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let mut text = String::from("#BPM 240000\n#WAV01 click.wav\n");
+    let line = "01".repeat(72);
+    for channel in [11, 12, 13, 14, 15, 18, 19, 16] {
+        text.push_str(&format!("#001{channel}:{line}\n"));
+    }
+    let path = dir.path().join("burst.bms");
+    fs::write(&path, text).unwrap();
+    assert!(common::sources().queue_capacity < 2 * 8 * 72);
+    assert_eq!(sweep_one(&path), Ok((8 * 72, 0)));
 }
