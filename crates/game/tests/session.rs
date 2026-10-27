@@ -1057,7 +1057,22 @@ fn reevaluation_refuses_a_record_of_another_evaluator_version() {
             Err(game::ReEvaluationError::UnsupportedEvaluator(version))
         );
         assert!(!summary.matches_live);
+        // With its preset hash not matching either, the version is still
+        // what is reported: it is checked first.
+        other.preset.sha256[0] ^= 1;
+        assert_eq!(
+            reevaluate(&other).evaluation,
+            Err(game::ReEvaluationError::UnsupportedEvaluator(version))
+        );
     }
+    // A supported version with a hash that does not match is the preset
+    // mismatch.
+    let mut other = record.clone();
+    other.preset.sha256[0] ^= 1;
+    assert_eq!(
+        reevaluate(&other).evaluation,
+        Err(game::ReEvaluationError::PresetMismatch)
+    );
 }
 
 /// Accepts any `.chart` file up to `max` bytes and records how many bytes
