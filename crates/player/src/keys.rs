@@ -1,9 +1,8 @@
-//! `tapestry keys`: the key config screen (stage1.md PR16). It opens the
-//! window and the input thread as a play does, but never opens recording:
-//! the input thread offers each press to the capture slot, `game`'s flow
-//! binds it, and the screen is drawn with the bitmap font. Every role
-//! bound writes `device.toml` atomically; Escape or closing the window
-//! writes nothing.
+//! `tapestry keys`: the key config screen (design.md "Input"). It opens the
+//! window and the input thread as a play does, but never opens recording: the
+//! input thread offers each press to the capture slot, `game`'s flow binds it,
+//! and the screen is drawn with the bitmap font. Every role bound writes
+//! `device.toml` atomically; Escape or closing the window writes nothing.
 
 use std::sync::Arc;
 

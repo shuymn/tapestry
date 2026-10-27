@@ -44,10 +44,11 @@ impl SourceRead for SourceReader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogicConfig {
     /// The control events of the whole play: the capacity of the recording
-    /// window (D8). The input budget is this plus one disconnect per
-    /// source. Every popped input spends one unit, whatever its source; the
-    /// budget sizes the record, the staging, the merge, the evaluator's
-    /// input ring, and through [`Evaluator::max_events`] the output.
+    /// window (design.md "Recording Capacity"). The input budget is this plus
+    /// one disconnect per source. Every popped input spends one unit, whatever
+    /// its source; the budget sizes the record, the staging, the merge, the
+    /// evaluator's input ring, and through [`Evaluator::max_events`] the
+    /// output.
     pub inputs: usize,
     /// The effects the render queue holds.
     pub effects: usize,
@@ -66,8 +67,8 @@ pub enum LogicError {
     /// bootstrap, so the opening could not separate it from the play.
     #[error("the play cannot start at the earliest time")]
     StartAtMinimum,
-    /// The play's recording window needs more inputs than the recording
-    /// policy reserves (stage1.md D14).
+    /// The play's recording window needs more inputs than the recording policy
+    /// reserves (design.md "Recording Capacity").
     #[error(
         "the play is too long to record with these controls: it needs room for {needed} inputs, and {allowed} fit"
     )]
@@ -80,7 +81,7 @@ pub enum LogicError {
 }
 
 /// Why a play was aborted. It ends at the watermark already finalized
-/// (D13).
+/// (design.md "Play Lifecycle").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbortCause {
     /// The window lost focus.
@@ -229,7 +230,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             return Err(LogicError::TooManySources(n));
         }
         // The control events of the window, plus one `Disconnected` per
-        // participant, which D8's rate does not count.
+        // participant, which the rates of design.md "Recording Capacity" do not
+        // count.
         let budget = config.inputs.saturating_add(n);
         let evaluator =
             Evaluator::new(chart, rule, device, start, budget).map_err(LogicError::Eval)?;
@@ -285,14 +287,13 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         Ok((logic, side))
     }
 
-    /// One step at logic time `now`, in the order of D8: (1) read every
-    /// source's watermark; (2) pop each source's events up to it into its
-    /// staging, stopping after the first event beyond it; (3) take the
-    /// global watermark `W`; (4) merge the staged events at or before `W`
-    /// into the evaluator, leaving later ones staged; (5) advance to `W`
-    /// and hand the events to the sinks. Reading the watermarks after
-    /// popping would let an event pushed in between be skipped while its
-    /// miss is finalized.
+    /// One step at logic time `now`, in the order of design.md "Watermark": (1)
+    /// read every source's watermark; (2) pop each source's events up to it
+    /// into its staging, stopping after the first event beyond it; (3) take the
+    /// global watermark `W`; (4) merge the staged events at or before `W` into
+    /// the evaluator, leaving later ones staged; (5) advance to `W` and hand
+    /// the events to the sinks. Reading the watermarks after popping would let
+    /// an event pushed in between be skipped while its miss is finalized.
     ///
     /// `W` depends only on the publications, so it is taken right after
     /// (1). The play is aborted instead of advancing when no source is
@@ -408,9 +409,9 @@ impl<'a, R: SourceRead> Logic<'a, R> {
     }
 
     /// Ends the play at the watermark already finalized, with no further
-    /// advance (D13). Every event still queued is popped into the record,
-    /// while the budget lasts; staged ones are there already. None of them
-    /// is evaluated. Only the first cause is kept.
+    /// advance (design.md "Play Lifecycle"). Every event still queued is popped
+    /// into the record, while the budget lasts; staged ones are there already.
+    /// None of them is evaluated. Only the first cause is kept.
     pub fn abort(&mut self, cause: AbortCause) {
         if self.aborted.is_some() {
             return;
@@ -420,11 +421,11 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.drain_queues();
     }
 
-    /// After recording has closed: an aborted play's record takes every
-    /// event still queued, unevaluated, so input that arrived between the
-    /// abort and the closing is kept (D13: the abort's suffix stays in the
-    /// record). Nothing happens for a play that was not aborted, whose
-    /// record ends at its completion.
+    /// After recording has closed: an aborted play's record takes every event
+    /// still queued, unevaluated, so input that arrived between the abort and
+    /// the closing is kept (design.md "Play Lifecycle": the abort's suffix
+    /// stays in the record). Nothing happens for a play that was not aborted,
+    /// whose record ends at its completion.
     pub fn drain_after_close(&mut self) {
         if self.aborted.is_some() {
             self.drain_queues();

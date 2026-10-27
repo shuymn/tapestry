@@ -1,4 +1,5 @@
-//! Text to headers and raw objects, with the text limits of D14.
+//! Text to headers and raw objects, with the text limits of design.md "Loading
+//! Limits".
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -91,9 +92,9 @@ const IGNORED_HEADERS: &[&str] = &[
     "MAKER",
 ];
 
-/// Prefixes of numbered definitions read and ignored without a warning:
-/// images, BGA layers, texts and judge-rank changes (`#EXRANKxx`, which
-/// channel A0 uses; a stage 1 gap, stage1.md D13).
+/// Prefixes of numbered definitions read and ignored without a warning: images,
+/// BGA layers, texts and judge-rank changes (`#EXRANKxx`, which channel A0
+/// uses; a stage 1 gap, design.md "What the Loader Reads").
 const IGNORED_DEFINITIONS: &[&str] = &["BMP", "BGA", "TEXT", "EXRANK"];
 
 /// Branching directives the loader does not support.
@@ -435,7 +436,7 @@ fn measure_length(text: &str, line: usize) -> Result<Rational, LoadError> {
 }
 
 /// A BPM of at least 0.000001, so its value in millionths is at least 1
-/// (D3), or an error naming `what`.
+/// (design.md "Chart Time"), or an error naming `what`.
 fn bpm(text: &str, line: usize, what: &'static str) -> Result<Rational, LoadError> {
     let invalid = |reason| LoadError::InvalidValue { line, what, reason };
     let v = parse_decimal(text).map_err(|e| invalid(e.reason()))?;

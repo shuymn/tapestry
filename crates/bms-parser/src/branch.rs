@@ -2,7 +2,8 @@
 
 use crate::{LoadError, Warning, WarningKind};
 
-/// SplitMix64, our own so the stream never changes with a dependency (D13).
+/// SplitMix64, our own so the stream never changes with a dependency (design.md
+/// "`#RANDOM`").
 #[derive(Clone, Copy, Debug)]
 pub struct SplitMix64 {
     state: u64,
@@ -39,14 +40,14 @@ struct Flag {
     random: usize,
 }
 
-/// `#RANDOM` and `#IF` as charts are written against (stage1.md PR3; the
-/// reference is jbms-parser's `BMSDecoder`): two flat stacks, not nested
-/// blocks. `#RANDOM` pushes a value and `#ENDRANDOM` pops one; `#IF k`
-/// pushes a flag, active when the latest value is `k`, and `#ENDIF` pops
-/// whatever flag is on top. A line is read when the top flag is active or
-/// no flag is open. `#ELSE` is our addition: it turns the top flag to the
-/// branch no earlier one took. Each line costs O(1) whatever the stacks
-/// hold, and the line limit bounds them.
+/// `#RANDOM` and `#IF` as charts are written against (design.md "`#RANDOM`";
+/// the reference is jbms-parser's `BMSDecoder`): two flat stacks, not nested
+/// blocks. `#RANDOM` pushes a value and `#ENDRANDOM` pops one; `#IF k` pushes a
+/// flag, active when the latest value is `k`, and `#ENDIF` pops whatever flag
+/// is on top. A line is read when the top flag is active or no flag is open.
+/// `#ELSE` is our addition: it turns the top flag to the branch no earlier one
+/// took. Each line costs O(1) whatever the stacks hold, and the line limit
+/// bounds them.
 #[derive(Debug)]
 pub struct Branches {
     rng: SplitMix64,

@@ -1,4 +1,5 @@
-//! `#WAV` names to files confined to the chart folder (D14).
+//! `#WAV` names to files confined to the chart folder (design.md "Loading
+//! Limits").
 
 use std::path::{Path, PathBuf};
 

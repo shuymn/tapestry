@@ -1,4 +1,4 @@
-//! Sound bank loading: dedupe, the caps of stage1.md D14, decoding and rate
+//! Sound bank loading: dedupe, the caps of design.md "Audio", decoding and rate
 //! conversion. Every sound is generated here as WAV bytes.
 
 mod common;

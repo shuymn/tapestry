@@ -1,8 +1,8 @@
-//! An autoplay session's own buffers in the recording reservation
-//! (design.md "Autoplay", stage1.md D14), measured: the source queue that
-//! holds the whole stream, the generated events and the merged schedule
-//! are charged as allocated, at their peak, and a chart whose charges take
-//! it just over the budget is refused before any of them is allocated.
+//! An autoplay session's own buffers in the recording reservation (design.md
+//! "Autoplay", "Recording Capacity"), measured: the source queue that holds the
+//! whole stream, the generated events and the merged schedule are charged as
+//! allocated, at their peak, and a chart whose charges take it just over the
+//! budget is refused before any of them is allocated.
 //!
 //! A global allocator sums the bytes allocated on threads that opted in;
 //! this file holds a single test. It runs in the dev profile only: it

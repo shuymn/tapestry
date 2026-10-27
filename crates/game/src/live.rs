@@ -1,7 +1,7 @@
-//! The play lifecycle every driver shares (D13): prepare → open recording
-//! (the countdown starts) → play → evaluation complete → audio tail → save
-//! → result, with retry, quit, focus loss, removal of the last device,
-//! suspend, an audio or screen failure, and a session policy failure
+//! The play lifecycle every driver shares (design.md "Play Lifecycle"): prepare
+//! → open recording (the countdown starts) → play → evaluation complete → audio
+//! tail → save → result, with retry, quit, focus loss, removal of the last
+//! device, suspend, an audio or screen failure, and a session policy failure
 //! ending the play from any state.
 //!
 //! The world around the play is a [`Rig`]: the game's threads in the
@@ -15,9 +15,9 @@
 //!   handoff to audio and the screen) is bounded by the chart's size.
 //! - A quit is latched by the rig and checked before recording opens and in
 //!   every wait, so it is never lost to a transition.
-//! - An aborted play closes recording and only then drains what is left in
-//!   the source queues into its record, unevaluated, so input that arrived
-//!   after the abort is kept (D13).
+//! - An aborted play closes recording and only then drains what is left in the
+//!   source queues into its record, unevaluated, so input that arrived after
+//!   the abort is kept (design.md "Play Lifecycle").
 //! - A completed play seals its key sounds; the tail ends when the audio
 //!   side reports the sealed audio done.
 
@@ -83,11 +83,11 @@ pub trait Rig {
     fn stepped(&mut self, aborted: bool) {
         let _ = aborted;
     }
-    /// What each logic step of a play measured (D11): the step itself
-    /// (its finalization delay), the events it delivered, and `delivered`,
-    /// the play time read once the step had handed them to its sinks, so
-    /// input to judgment covers the step's processing. Called after every
-    /// step, before [`stepped`](Self::stepped).
+    /// What each logic step of a play measured (design.md "Latency Figures"):
+    /// the step itself (its finalization delay), the events it delivered, and
+    /// `delivered`, the play time read once the step had handed them to its
+    /// sinks, so input to judgment covers the step's processing. Called after
+    /// every step, before [`stepped`](Self::stepped).
     fn measured(&mut self, advance: &Advance, events: &[JudgeEvent], delivered: TimeUs) {
         let _ = (advance, events, delivered);
     }
@@ -142,10 +142,11 @@ pub trait Rig {
     fn ended(&mut self, report: &PlayReport);
     /// Shows the end screen of a play that neither quit nor retried.
     fn show_end(&mut self, report: &PlayReport);
-    /// Before each play opens recording: settings changed since the
-    /// previous play are written into `settings`, which the play is
-    /// evaluated and recorded with. The input offset changes only here, so
-    /// a change takes effect from the next play (D13).
+    /// Before each play opens recording: settings changed since the previous
+    /// play are written into `settings`, which the play is evaluated and
+    /// recorded with. The input offset changes only here, so a change takes
+    /// effect from the next play (design.md "Offset Changes and the
+    /// Watermark").
     fn before_play(&mut self, settings: &mut Settings) {
         let _ = settings;
     }
@@ -281,8 +282,8 @@ fn play_and_next<R: Rig>(
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
     let mut output_error = None;
-    // A suspend while recording is open marks the record incomplete,
-    // whichever cause ends the play (D13).
+    // A suspend while recording is open marks the record incomplete, whichever
+    // cause ends the play (design.md "Play Lifecycle").
     let mut suspended = false;
 
     let end = loop {
@@ -335,8 +336,8 @@ fn play_and_next<R: Rig>(
         }
     };
 
-    // Recording closes at the end of evaluation (D13); an aborted play
-    // then takes what reached its queues after the abort.
+    // Recording closes at the end of evaluation (design.md "Play Lifecycle");
+    // an aborted play then takes what reached its queues after the abort.
     let closing = rig.close();
     // A command that arrived during the close handshake is kept for what
     // follows: it cuts the tail, or, after an abort, it is the run's next

@@ -1,6 +1,7 @@
 //! What a play reserves before its countdown, measured: the bytes the
-//! constructors allocate for the logic step and the live play's buffers
-//! match [`Reservation`], the recording policy's account (stage1.md D14).
+//! constructors allocate for the logic step and the live play's buffers match
+//! [`Reservation`], the recording policy's account (design.md "Recording
+//! Capacity").
 //!
 //! A global allocator sums the bytes allocated on threads that opted in;
 //! this file holds a single test. It runs in the dev profile only: it

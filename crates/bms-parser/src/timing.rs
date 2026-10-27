@@ -1,4 +1,5 @@
-//! Measure positions to integer microseconds with exact rationals (D3).
+//! Measure positions to integer microseconds with exact rationals (design.md
+//! "Chart Time").
 
 use std::cmp::Ordering;
 
@@ -21,10 +22,10 @@ fn int(v: i64) -> Rational {
     Rational::from_integer(BigInt::from(v))
 }
 
-/// The running time in µs as a reduced fraction whose denominator is
-/// capped (D3). An addition takes greatest common divisors only against the
-/// added term's denominator, which the text limits keep small, and builds
-/// the reduced sum without normalizing it again (Knuth, TAOCP vol. 2,
+/// The running time in µs as a reduced fraction whose denominator is capped
+/// (design.md "Chart Time"). An addition takes greatest common divisors only
+/// against the added term's denominator, which the text limits keep small, and
+/// builds the reduced sum without normalizing it again (Knuth, TAOCP vol. 2,
 /// 4.5.1), so its cost grows linearly with the time's size.
 struct Time {
     numer: BigInt,
@@ -139,9 +140,9 @@ pub fn compute(
     let cap = BigInt::from(limits.max_duration.0);
     let max_bits = limits.max_time_bits;
 
-    // Each measure's length in beats. These values and the segments below
-    // are bounded by the text limits (D3), so only the running time needs a
-    // cap.
+    // Each measure's length in beats. These values and the segments below are
+    // bounded by the text limits (design.md "Chart Time"), so only the running
+    // time needs a cap.
     let last_measure = source
         .objects
         .iter()
@@ -175,9 +176,10 @@ pub fn compute(
     // Stable: equal positions keep bar lines first, then file order. The
     // time cap is checked on this canonical order of additions.
     events.sort_by(|a, b| a.0.order(&b.0));
-    // The chart ends with its last note, mine or BGM object: bar lines and
-    // BPM changes or STOPs after it are dropped, so empty trailing measures
-    // neither count toward the duration cap nor draw bar lines (D14).
+    // The chart ends with its last note, mine or BGM object: bar lines and BPM
+    // changes or STOPs after it are dropped, so empty trailing measures neither
+    // count toward the duration cap nor draw bar lines (design.md "Loading
+    // Limits").
     let end = events
         .iter()
         .rev()

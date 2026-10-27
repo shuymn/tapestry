@@ -1,9 +1,9 @@
-//! Pure frame and latency measurement (D11): whole-play signed sample
-//! histograms with their percentiles, DXGI frame statistics paired to frames by present count,
-//! lost refreshes from the statistics' refresh counts, the table that
-//! gives each judgment the display time of the first presented frame that
-//! drew it, and the counting rules of design.md "Frame Pacing in Refreshes"
-//! for a display capture.
+//! Pure frame and latency measurement (design.md "Latency Figures"): whole-play
+//! signed sample histograms with their percentiles, DXGI frame statistics
+//! paired to frames by present count, lost refreshes from the statistics'
+//! refresh counts, the table that gives each judgment the display time of the
+//! first presented frame that drew it, and the counting rules of design.md
+//! "Frame Pacing in Refreshes" for a display capture.
 //!
 //! Missing or invalid evidence is never a value: every figure that may lack
 //! it is an `Option`, `None` meaning N/A. Nothing here allocates after
@@ -191,24 +191,23 @@ pub struct FrameStatistics {
     pub sync_qpc_time: i64,
 }
 
-/// A refresh count gap above this rejects a sample (spike
-/// `window.rs`; D11).
+/// A refresh count gap above this rejects a sample (spike `window.rs`;
+/// design.md "Latency Figures").
 pub const MAX_REFRESH_GAP: u32 = 4;
 
-/// The display time of the sample's present in QPC ticks:
-/// `SyncQPCTime − (SyncRefreshCount − PresentRefreshCount) × period`.
+/// The display time of the sample's present in QPC ticks: `SyncQPCTime −
+/// (SyncRefreshCount − PresentRefreshCount) × period`.
 #[must_use]
 pub fn display_qpc(s: &FrameStatistics, period_qpc: i64) -> i64 {
     let gap = s.sync_refresh_count.wrapping_sub(s.present_refresh_count);
     s.sync_qpc_time - i64::from(gap) * period_qpc
 }
 
-/// Keeps the frame statistics samples D11 accepts: the call succeeded,
-/// `PresentCount` advanced since the last accepted sample, and the refresh
-/// count gap is at most [`MAX_REFRESH_GAP`]. A sample with no sync yet
-/// (`SyncQPCTime` 0, as a new swap chain's first samples on the
-/// development PC read) is rejected too: its refresh counts are zeros,
-/// not counts.
+/// Keeps the frame statistics samples design.md "Latency Figures" accepts: the
+/// call succeeded, `PresentCount` advanced since the last accepted sample, and
+/// the refresh count gap is at most [`MAX_REFRESH_GAP`]. A sample with no sync
+/// yet (`SyncQPCTime` 0, as a new swap chain's first samples on the development
+/// PC read) is rejected too: its refresh counts are zeros, not counts.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StatsFilter {
     last: Option<u32>,
@@ -232,7 +231,7 @@ impl StatsFilter {
     }
 }
 
-/// Lost refreshes from frame statistics (D11) at k = 1.
+/// Lost refreshes from frame statistics (design.md "Latency Figures") at k = 1.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RefreshCount {
     /// Refresh opportunities lost over the counted intervals.
@@ -365,10 +364,10 @@ const EMPTY: Slot = Slot {
     state: OnScreenLatency::Unknown,
 };
 
-/// The press → on screen table (D11), keyed by `JudgeEvent::seq`: each
-/// judgment gets the present count of the first presented frame that drew
-/// it, and then that frame's display time from its accepted frame
-/// statistics sample, or N/A when it has none. Never predicted.
+/// The press → on screen table (design.md "Latency Figures"), keyed by
+/// `JudgeEvent::seq`: each judgment gets the present count of the first
+/// presented frame that drew it, and then that frame's display time from its
+/// accepted frame statistics sample, or N/A when it has none. Never predicted.
 ///
 /// The table holds `capacity` judgments by `seq` modulo the capacity, in
 /// the order they were drawn. A judgment still unresolved when its slot is

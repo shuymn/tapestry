@@ -1,5 +1,5 @@
-//! The sound bank: every sound a chart references, decoded before play into
-//! i16 at the device rate (design.md "Audio"; stage1.md D12, D14).
+//! The sound bank: every sound a chart references, decoded before play into i16
+//! at the device rate (design.md "Audio").
 //!
 //! A pool of at most `min(available cores, BankLimits::max_decode_threads)`
 //! workers takes one distinct file at a time and finishes it before taking
@@ -53,7 +53,7 @@ pub const MIN_RATE: u32 = 8_000;
 /// Highest sample rate accepted, for sources and the device.
 pub const MAX_RATE: u32 = 384_000;
 
-/// Caps on decoding (stage1.md D14). They bound work on untrusted files and
+/// Caps on decoding (design.md "Audio"). They bound work on untrusted files and
 /// sit far beyond real charts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BankLimits {

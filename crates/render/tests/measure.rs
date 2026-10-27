@@ -1,7 +1,7 @@
-//! The pure measurement of D11: frame statistics, the press → on screen
-//! table, lost refreshes and the counting rules of design.md "Frame Pacing
-//! in Refreshes". Every expected value is worked out by hand in the
-//! comments.
+//! The pure measurement of design.md "Latency Figures": frame statistics, the
+//! press → on screen table, lost refreshes and the counting rules of design.md
+//! "Frame Pacing in Refreshes". Every expected value is worked out by hand in
+//! the comments.
 
 use render::measure::{
     FrameStatistics, OnScreen, OnScreenLatency, Presentation, RELATIVE_ERROR, RefreshLedger,

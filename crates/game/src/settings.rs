@@ -1,5 +1,5 @@
-//! Settings files (stage1.md D10): `device.toml` for this PC and its
-//! devices, `player.toml` for the person playing, both in one data root
+//! Settings files (design.md "Settings Files"): `device.toml` for this PC and
+//! its devices, `player.toml` for the person playing, both in one data root
 //! with `presets/` and `records/`. The data root is a parameter; the player
 //! resolves the real one.
 
@@ -215,7 +215,8 @@ pub enum KeyError {
     NotAKeyboardKey(Role),
 }
 
-/// F9: shows and hides the measurement overlay during play (D11).
+/// F9: shows and hides the measurement overlay during play (design.md "Latency
+/// Figures").
 pub const OVERLAY_KEY: u32 = 0x43;
 
 /// What the game reserves keyboard key `code` (a scan code) for, if
@@ -620,8 +621,9 @@ impl DeviceSettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PlayerSettings {
-    /// Hi-speed as the visible time, ms: how long a note takes from the
-    /// top of the lane to the judgment line at the chart's start BPM (D9).
+    /// Hi-speed as the visible time, ms: how long a note takes from the top of
+    /// the lane to the judgment line at the chart's start BPM (design.md
+    /// "Algorithms").
     pub visible_time_ms: u32,
     /// The preset file in `presets/`.
     pub preset: String,

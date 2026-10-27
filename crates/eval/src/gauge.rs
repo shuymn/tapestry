@@ -31,8 +31,9 @@ pub struct GaugeState {
     pub failed_at: Option<TimeUs>,
 }
 
-/// The per-note increment of D5: `floor(total_milli × 100 / notes)`, in
-/// `i128` so an extreme `#TOTAL` cannot overflow. `notes` is not zero.
+/// The per-note increment of design.md "Gauges and Session Policy":
+/// `floor(total_milli × 100 / notes)`, in `i128` so an extreme `#TOTAL` cannot
+/// overflow. `notes` is not zero.
 pub(crate) fn increment(total_milli: i64, notes: usize) -> i128 {
     let notes = i128::try_from(notes).unwrap_or(i128::MAX);
     (i128::from(total_milli) * 100).div_euclid(notes.max(1))

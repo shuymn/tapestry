@@ -45,7 +45,8 @@ impl Gpu {
 }
 
 /// A DX12-only instance whose swap chains leave the frame latency waitable
-/// object to the render thread, which waits on it itself (D9).
+/// object to the render thread, which waits on it itself (design.md "Display
+/// Latency and Stutter").
 pub(crate) fn instance() -> wgpu::Instance {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = wgpu::Backends::DX12;

@@ -1,4 +1,5 @@
-//! Exact time over many BPMs, decimal forms, and the time size cap (D3).
+//! Exact time over many BPMs, decimal forms, and the time size cap (design.md
+//! "Chart Time").
 
 use std::time::Instant;
 

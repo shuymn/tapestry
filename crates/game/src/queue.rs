@@ -1,7 +1,7 @@
-//! How many periods the audio output keeps queued ahead of playback
-//! (stage1.md D12). Two by default; a play with underruns after its
-//! countdown makes the next play queue three, a choice kept in
-//! `device.toml` that only the player lowers again, by editing the file.
+//! How many periods the audio output keeps queued ahead of playback (design.md
+//! "Path from Press to Sound"). Two by default; a play with underruns after its
+//! countdown makes the next play queue three, a choice kept in `device.toml`
+//! that only the player lowers again, by editing the file.
 //!
 //! Some drivers deliver blocks whose size beats against the engine period,
 //! and a stream can lock into a phase where two queued periods underrun

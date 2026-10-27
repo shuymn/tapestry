@@ -234,10 +234,10 @@ fn scripted_play_writes_a_record() {
         .count();
     assert_eq!(perfect, NOTES);
 
-    // The play's measurement (D11) beside the record: one press → sound
-    // per key sound, input → judgment for the steps that judged presses,
-    // and every judgment's on-screen latency N/A offscreen, where no frame
-    // statistics exist; never a 0.
+    // The play's measurement (design.md "Latency Figures") beside the record:
+    // one press → sound per key sound, input → judgment for the steps that
+    // judged presses, and every judgment's on-screen latency N/A offscreen,
+    // where no frame statistics exist; never a 0.
     let m = measured(&saved[0]);
     assert_eq!(
         int(&m, "press_to_sound_scheduled_us", "count"),

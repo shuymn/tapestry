@@ -1,8 +1,9 @@
-//! The render thread (D8, D9): it owns the screen, readies it for each
-//! play on request and says when it is ready, draws each play from the
-//! logic step's effects and play view at the play's chart time, and draws
-//! the end screen between plays. A window target paces frames on the swap
-//! chain's waitable object; an offscreen one at about 60 Hz.
+//! The render thread (design.md "Overall Architecture", "Rendering and Skins"):
+//! it owns the screen, readies it for each play on request and says when it is
+//! ready, draws each play from the logic step's effects and play view at the
+//! play's chart time, and draws the end screen between plays. A window target
+//! paces frames on the swap chain's waitable object; an offscreen one at about
+//! 60 Hz.
 //!
 //! A frame that fails (the surface was lost) drops the screen and tells
 //! the game thread, which ends the play; the next play's preparation builds
@@ -177,9 +178,9 @@ pub struct View {
 /// wanted after it.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Something that looks at frames as they are drawn, after the
-/// measurement (D11): the dev-tools frame dump. Called after every frame,
-/// presented or not.
+/// Something that looks at frames as they are drawn, after the measurement
+/// (design.md "Latency Figures"): the dev-tools frame dump. Called after every
+/// frame, presented or not.
 pub trait FrameSink: Send {
     /// Called after each frame.
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>);
@@ -250,9 +251,9 @@ impl RenderLink {
     }
 }
 
-/// Starts the render thread; `make` builds the screen on it, and the chart
-/// is prepared before this returns, so every upload is done before the
-/// first countdown (D9).
+/// Starts the render thread; `make` builds the screen on it, and the chart is
+/// prepared before this returns, so every upload is done before the first
+/// countdown (design.md "Display Latency and Stutter").
 ///
 /// # Errors
 ///

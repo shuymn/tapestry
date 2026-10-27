@@ -1,8 +1,8 @@
-//! The audio output's queue between plays (stage1.md D12): a change asked
-//! for between plays is applied at the audio thread's next step and
-//! answered, each play's underruns are counted from its chart time 0 until
-//! it ends, and a play with any raises the next play's queue to three
-//! periods, never lowering it.
+//! The audio output's queue between plays (design.md "Path from Press to
+//! Sound"): a change asked for between plays is applied at the audio thread's
+//! next step and answered, each play's underruns are counted from its chart
+//! time 0 until it ends, and a play with any raises the next play's queue to
+//! three periods, never lowering it.
 
 mod common;
 

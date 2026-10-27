@@ -1,7 +1,6 @@
-//! The key config screen's flow (stage1.md PR16, D6): it prompts for each
-//! lane, the scratch first, then retry and quit, and binds the next
-//! control pressed, captured while play recording is closed, so nothing
-//! captured is recorded.
+//! The key config screen's flow (design.md "Input"): it prompts for each lane,
+//! the scratch first, then retry and quit, and binds the next control pressed,
+//! captured while play recording is closed, so nothing captured is recorded.
 //!
 //! A lane takes a control of any device; retry and quit take keyboard keys
 //! only, because stage 1 reads them from the window's keyboard messages.

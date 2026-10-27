@@ -31,7 +31,7 @@ pub struct Controls {
     focused: AtomicBool,
     latch: OnceLock<FocusLatch>,
     tuning: Arc<LiveTuning>,
-    /// Whether the measurement overlay shows (D11).
+    /// Whether the measurement overlay shows (design.md "Latency Figures").
     overlay: Arc<AtomicBool>,
 }
 
@@ -143,8 +143,8 @@ impl Controls {
         self.quit.load(Ordering::Acquire)
     }
 
-    /// The window gained or lost focus; a loss sets the input side's
-    /// latch (D6).
+    /// The window gained or lost focus; a loss sets the input side's latch
+    /// (design.md "Input").
     pub fn focus(&self, focused: bool) {
         self.focused.store(focused, Ordering::Release);
         if !focused && let Some(l) = self.latch.get() {

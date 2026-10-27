@@ -1,11 +1,12 @@
 //! The game executable.
 //!
 //! `tapestry play <chart.bms>` loads the settings and the chart, opens the
-//! audio device and loads the sound bank, starts the input thread, then
-//! opens a borderless fullscreen window whose render thread prepares the
-//! GPU resources, and plays the chart until the player quits. The data
-//! root is `%LOCALAPPDATA%\tapestry\` (D10); the commands that do work log
-//! their loading and outcome to `logs\tapestry.log` in it ([`log_file`]).
+//! audio device and loads the sound bank, starts the input thread, then opens a
+//! borderless fullscreen window whose render thread prepares the GPU resources,
+//! and plays the chart until the player quits. The data root is
+//! `%LOCALAPPDATA%\tapestry\` (design.md "Settings Files"); the commands that
+//! do work log their loading and outcome to `logs\tapestry.log` in it
+//! ([`log_file`]).
 //!
 //! `tapestry play --auto <chart.bms>` plays the chart by itself on the same
 //! window, audio output and renderer (design.md "Autoplay"): the input that
@@ -63,7 +64,7 @@ use crate::play::PlayerRig;
 use crate::render_side::{MakeScreen, NoFrames, Screen, View};
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
 
-/// The countdown before chart time 0 (D13).
+/// The countdown before chart time 0 (design.md "Play Lifecycle").
 const LEAD_IN: TimeUs = TimeUs(1_000_000);
 /// Effects the render queue holds.
 const EFFECTS: usize = 1 << 14;

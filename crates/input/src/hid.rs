@@ -7,11 +7,12 @@
 //! into a [`Packet`] for the [`SourceSet`], and offers presses and turns to
 //! the key config's [`Capture`].
 //!
-//! Windows exposes each top-level collection of a controller as a device
-//! of its own. The collections of one function of a physical controller
-//! share one [`DeviceId`] ([`place_collection`]), so they are one source
-//! owning its buttons and axes alike (stage1.md D6); each collection's controls carry its collection number
-//! ([`in_collection`]), so they stay distinct within the source.
+//! Windows exposes each top-level collection of a controller as a device of its
+//! own. The collections of one function of a physical controller share one
+//! [`DeviceId`] ([`place_collection`]), so they are one source owning its
+//! buttons and axes alike (design.md "Input"); each collection's controls carry
+//! its collection number ([`in_collection`]), so they stay distinct within the
+//! source.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 

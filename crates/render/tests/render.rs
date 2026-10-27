@@ -229,8 +229,9 @@ fn zero_size_target_is_one_pixel() {
 
 #[test]
 fn render_cpu_indicator() {
-    // Render CPU work per frame on WARP (D11), printed, never compared:
-    // 400 frames at 60 Hz over a dense chart with BPM changes and a STOP.
+    // Render CPU work per frame on WARP (design.md "Latency Figures"), printed,
+    // never compared: 400 frames at 60 Hz over a dense chart with BPM changes
+    // and a STOP.
     const FRAMES: i64 = 400;
     let mut b = ChartBuilder::new(150_000)
         .bpm(TimeUs(2_000 * MS), 180_000)

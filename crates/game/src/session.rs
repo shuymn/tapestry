@@ -1,5 +1,5 @@
-//! The session: one chart played any number of times, through the
-//! extension points (stage1.md D13; design.md "Extension Boundaries").
+//! The session: one chart played any number of times, through the extension
+//! points (design.md "Play Lifecycle", "Extension Boundaries").
 //!
 //! Each play runs prepare → countdown → play → evaluation complete → audio
 //! tail → save → result. Retry, quit, focus loss, removal of the last
@@ -143,7 +143,8 @@ impl Settings {
 /// Fixed choices of a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionConfig {
-    /// How long the countdown runs before chart time 0 (D13).
+    /// How long the countdown runs before chart time 0 (design.md "Play
+    /// Lifecycle").
     pub lead_in: TimeUs,
     /// How far the clock moves per step.
     pub step: TimeUs,
@@ -327,7 +328,8 @@ pub struct PlayStart {
 pub struct PlayPlan {
     /// The device profile, indexed by source id.
     pub device: eval::DeviceProfile,
-    /// The logic step's sizes: the recording window's capacity (D8).
+    /// The logic step's sizes: the recording window's capacity (design.md
+    /// "Recording Capacity").
     pub logic: LogicConfig,
 }
 
@@ -529,8 +531,9 @@ impl Loaded {
     }
 
     /// The device profile and the logic step's sizes for a play whose
-    /// participating sources have `kinds` and declare `axes`, indexed by
-    /// source id. The capacity is the recording window's (D8), never cut.
+    /// participating sources have `kinds` and declare `axes`, indexed by source
+    /// id. The capacity is the recording window's (design.md "Recording
+    /// Capacity"), never cut.
     ///
     /// # Errors
     ///
@@ -1080,8 +1083,8 @@ fn arrival(a: &InputArrival) -> Arrival {
     }
 }
 
-/// The memory one play may reserve for its recording, before its
-/// countdown (stage1.md D14): what [`Reservation`] counts.
+/// The memory one play may reserve for its recording, before its countdown
+/// (design.md "Recording Capacity"): what [`Reservation`] counts.
 pub const RECORDING_MEMORY: usize = 512 << 20;
 
 /// The bytes the evaluator's own tables may take per chart object (its
@@ -1094,7 +1097,8 @@ pub const TABLE_BYTES_PER_OBJECT: usize = 64;
 pub const SMALL_PARTS_BYTES: usize = 64 << 10;
 
 /// What a play reserves before its countdown, as a function of its input
-/// capacity: `fixed + per_input × inputs` bytes (stage1.md D14).
+/// capacity: `fixed + per_input × inputs` bytes (design.md "Recording
+/// Capacity").
 ///
 /// It counts what the constructors reserve: [`Logic::new`](crate::Logic::new)
 /// sizes the evaluator's input ring, the merge and the record for the
@@ -1205,20 +1209,20 @@ impl Reservation {
     }
 }
 
-/// The inputs each bound system control (retry, quit) of a source gets in
-/// the recording window, whatever its length: a press and a release. Its
-/// first press ends the play, so it is not played at a rate; a key held
-/// across a retry and auto-repeating, which the window takes no further
-/// press from, may use up the window, which ends the play at its last
-/// finalized watermark with the log incomplete (D8).
+/// The inputs each bound system control (retry, quit) of a source gets in the
+/// recording window, whatever its length: a press and a release. Its first
+/// press ends the play, so it is not played at a rate; a key held across a
+/// retry and auto-repeating, which the window takes no further press from, may
+/// use up the window, which ends the play at its last finalized watermark with
+/// the log incomplete (design.md "Recording Capacity").
 pub const SYSTEM_CONTROL_INPUTS: usize = 2;
 
-/// The recording window's input capacity (D8, [`eval::window_inputs`]):
-/// each source's lane-bound buttons pressed and released 30 times a second
-/// each, up to 240 edges a second together, and its lane-bound axes it
-/// declares reporting 1000 times a second each, from the countdown to the
-/// chart's final deadline plus the largest input offset, in whole
-/// seconds, for sources recording `(buttons, axes)` each. The caller adds
+/// The recording window's input capacity (design.md "Recording Capacity",
+/// [`eval::window_inputs`]): each source's lane-bound buttons pressed and
+/// released 30 times a second each, up to 240 edges a second together, and its
+/// lane-bound axes it declares reporting 1000 times a second each, from the
+/// countdown to the chart's final deadline plus the largest input offset, in
+/// whole seconds, for sources recording `(buttons, axes)` each. The caller adds
 /// [`SYSTEM_CONTROL_INPUTS`] per bound system control.
 fn window_inputs(
     device: &eval::DeviceProfile,

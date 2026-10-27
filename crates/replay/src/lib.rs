@@ -91,10 +91,10 @@ pub struct DecodeLimits {
 }
 
 impl DecodeLimits {
-    /// The limits for records the app saves: 64 MiB either side of
-    /// compression, 64 sources, and 4 Mi events. The game caps a play's
-    /// recording so that its record always fits (`game`'s recording
-    /// policy, stage1.md D14).
+    /// The limits for records the app saves: 64 MiB either side of compression,
+    /// 64 sources, and 4 Mi events. The game caps a play's recording so that
+    /// its record always fits (`game`'s recording policy, design.md "Recording
+    /// Capacity").
     pub const STANDARD: Self = Self {
         max_compressed: 64 << 20,
         max_uncompressed: 64 << 20,

@@ -1,4 +1,4 @@
-//! The local chart sweep (stage1.md section 5), on the development PC only:
+//! The local chart sweep (setup.md "Other"), on the development PC only:
 //!
 //! ```sh
 //! TAPESTRY_CHARTS_DIR=<dir> mise exec -- cargo test -p game --test local_charts -- --ignored --nocapture
@@ -176,15 +176,16 @@ fn allowed(category: &str) -> bool {
         "unsupported directive"
             | "unsupported long-note mode"
             | "no judgeable notes"
-            // Timing values are never replaced silently (stage1.md D3, PR3):
-            // reverse scroll is not supported yet, a measure of no length
-            // (as written or cut off to it) has no timing, and a malformed
-            // operand would decide which notes exist.
+            // Timing values are never replaced silently (design.md "Chart
+            // Time", "`#RANDOM`"): reverse scroll is not supported yet, a
+            // measure of no length (as written or cut off to it) has no timing,
+            // and a malformed operand would decide which notes exist.
             | "negative BPM"
             | "zero-length measure"
             | "malformed #RANDOM or #IF operand"
-            // The D14 limits: longer than 60 minutes, a file over 16 MiB, a
-            // measure past 999, an exact time past its size cap.
+            // The limits of design.md "Loading Limits": longer than 60 minutes,
+            // a file over 16 MiB, a measure past 999, an exact time past its
+            // size cap.
             | "loading limit"
     )
 }

@@ -1,6 +1,7 @@
 //! The input thread's side of each play: recording opens and closes at a
-//! boundary between two batches, on request from the game thread, and the
-//! input thread wakes the logic step after every publication (D8).
+//! boundary between two batches, on request from the game thread, and the input
+//! thread wakes the logic step after every publication (design.md "Overall
+//! Architecture").
 //!
 //! The requests go through a channel the hook polls at every wake (an
 //! empty poll allocates nothing); the replies carry what only the input

@@ -1,5 +1,6 @@
-//! The texture atlas, built in code at startup: an ASCII 5×7 bitmap font
-//! and one solid white block for untextured sprites (D9).
+//! The texture atlas, built in code at startup: an ASCII 5×7 bitmap font and
+//! one solid white block for untextured sprites (design.md "Rendering and
+//! Skins").
 //!
 //! The atlas is `ATLAS_SIZE` square, RGBA8. Glyphs for the codes 0x20 to
 //! 0x5F sit in 8×8 cells, 16 to a row from the top left; each glyph's

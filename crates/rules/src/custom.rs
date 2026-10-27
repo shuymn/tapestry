@@ -153,8 +153,8 @@ mod tests {
         }
     }
 
-    /// D7's values, written out in raw units (µs; 1/100000 %), independent
-    /// of the helpers `custom` uses.
+    /// The values of design.md "Custom Preset", written out in raw units (µs;
+    /// 1/100000 %), independent of the helpers `custom` uses.
     #[test]
     fn custom_preset_has_d7_values() {
         let w = |us| Window {

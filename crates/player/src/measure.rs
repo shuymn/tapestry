@@ -1,12 +1,11 @@
-//! The measurement of D11 on the game's threads: the render thread's
-//! [`Measure`] keeps each play's figures in preallocated whole-play
-//! histograms, fed by its
-//! own frames (render CPU work, frame statistics, the frame that first drew
-//! each judgment) and by queues from the logic step (input to judgment,
-//! finalization delay) and the audio thread (press to sound scheduled). It
-//! draws them in the overlay while the overlay key shows it and hands them
-//! to the game thread when the play ends, which writes them next to the
-//! saved record as `<record>.measure.toml`.
+//! The measurement of design.md "Latency Figures" on the game's threads: the
+//! render thread's [`Measure`] keeps each play's figures in preallocated
+//! whole-play histograms, fed by its own frames (render CPU work, frame
+//! statistics, the frame that first drew each judgment) and by queues from the
+//! logic step (input to judgment, finalization delay) and the audio thread
+//! (press to sound scheduled). It draws them in the overlay while the overlay
+//! key shows it and hands them to the game thread when the play ends, which
+//! writes them next to the saved record as `<record>.measure.toml`.
 //!
 //! Every sample carries the play's generation, and samples of another
 //! play are dropped, so a play never counts its neighbor's. Nothing here
@@ -781,7 +780,9 @@ fn summary_toml(out: &mut String, table: &str, s: Option<&Summary>) {
 /// The figures as TOML, numbers only; a figure without evidence (N/A)
 /// has no key. `load` is the first load and the latest retry, ms.
 pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
-    let mut out = String::from("# Measurement of the play (D11): numbers only, N/A left out.\n");
+    let mut out = String::from(
+        "# Measurement of the play (design.md \"Latency Figures\"): numbers only, N/A left out.\n",
+    );
     summary_toml(
         &mut out,
         "input_to_judgment_us",

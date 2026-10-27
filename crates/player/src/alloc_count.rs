@@ -1,12 +1,12 @@
-//! The counting allocator of development builds (D13; design.md:860,
-//! ported from the stage 0 spike's `alloc.rs`): every allocation is
-//! counted against the thread that made it, by the tag the thread gave
-//! itself, so the measurement overlay shows each play's allocations per
-//! thread (PR17). A thread also counts what it allocates inside its app
-//! region apart, which the render thread marks around its own per-frame
-//! work (design.md "Scope of No Allocation"). The allocator itself never
-//! allocates: the tag, the region flag and its count are const-initialized
-//! thread-locals and the counters are atomics.
+//! The counting allocator of development builds (design.md "Scope of No
+//! Allocation", ported from the stage 0 spike's `alloc.rs`): every allocation
+//! is counted against the thread that made it, by the tag the thread gave
+//! itself, so the measurement overlay shows each play's allocations per thread.
+//! A thread also counts what it allocates inside its app region apart, which
+//! the render thread marks around its own per-frame work (design.md "Scope of
+//! No Allocation"). The allocator itself never allocates: the tag, the region
+//! flag and its count are const-initialized thread-locals and the counters are
+//! atomics.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 

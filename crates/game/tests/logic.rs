@@ -1,6 +1,6 @@
-//! The logic step against source queues: D8's consumer order, staging,
-//! retirement, the input budget, abort, and the guards that keep the
-//! record honest.
+//! The logic step against source queues: the consumer order of design.md
+//! "Watermark", staging, retirement, the input budget, abort, and the guards
+//! that keep the record honest.
 
 mod common;
 
@@ -427,8 +427,9 @@ fn disconnect_after_a_full_d8_window_fits_the_budget() {
     let chart = taps(&[(1, 3_000)]);
     let rule = rules::custom();
     let dev = device(&[0, 0]);
-    // D8: one bound button per source, pressed and released 30 times a
-    // second over a 2 s window: 2 × 60 × 2 = 240 control events.
+    // design.md "Recording Capacity": one bound button per source, pressed and
+    // released 30 times a second over a 2 s window: 2 × 60 × 2 = 240 control
+    // events.
     let inputs = common::window_capacity(TimeUs(0), TimeUs(2_000_000), 2);
     assert_eq!(inputs, 240);
     let (mut w0, r0) = source_queue(256);

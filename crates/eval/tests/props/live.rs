@@ -1,12 +1,12 @@
 //! A model of live evaluation driven by a delivery schedule: producers that
-//! push into bounded queues and publish what they have queued, and the
-//! logic thread's consumer step of D8, built from the crate's public
-//! pieces.
+//! push into bounded queues and publish what they have queued, and the logic
+//! thread's consumer step of design.md "Watermark", built from the crate's
+//! public pieces.
 //!
 //! The consumer mirrors `game::Logic::advance_to` (crates/game/src/logic.rs)
-//! step for step; `eval` may not depend on `game` (design.md "Licenses"),
-//! so the model lives here. Each step of the model cites the step of D8 it
-//! mirrors.
+//! step for step; `eval` may not depend on `game` (design.md "Licenses"), so
+//! the model lives here. Each step of the model cites the step of that consumer
+//! it mirrors.
 
 use std::collections::VecDeque;
 

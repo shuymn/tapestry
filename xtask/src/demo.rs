@@ -1,6 +1,6 @@
-//! `cargo xtask demo-chart <dir>`: a self-made chart of about two minutes
-//! with generated sounds, for manual runs of the game (stage1.md section
-//! 5). Nothing here ships, and nothing it writes enters the repository.
+//! `cargo xtask demo-chart <dir>`: a self-made chart of about two minutes with
+//! generated sounds, for manual runs of the game (design.md "Testing
+//! Strategy"). Nothing here ships, and nothing it writes enters the repository.
 //!
 //! The chart runs at 150 BPM, 1.6 s a measure, measures 1 to 75 (the last
 //! note at 121.4 s). Measures 1-16 hold quarter notes, 17-48 eighth notes,

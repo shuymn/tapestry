@@ -1,5 +1,5 @@
-//! The audio thread loop (stage1.md D8): one engine step per buffer event
-//! until asked to stop.
+//! The audio thread loop (design.md "Overall Architecture"): one engine step
+//! per buffer event until asked to stop.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 

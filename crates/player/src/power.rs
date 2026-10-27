@@ -1,9 +1,9 @@
-//! The system's suspend notification (design.md "Handling QPC"): a
-//! suspend aborts the play and marks its record incomplete (D13). The
-//! callback form needs no window, so it works whatever winit does with its
-//! own messages. Without it a suspend would go unnoticed and the record
-//! would carry the jumped clock as if nothing happened, so the game refuses
-//! to start when the registration fails.
+//! The system's suspend notification (design.md "Handling QPC"): a suspend
+//! aborts the play and marks its record incomplete (design.md "Play
+//! Lifecycle"). The callback form needs no window, so it works whatever winit
+//! does with its own messages. Without it a suspend would go unnoticed and the
+//! record would carry the jumped clock as if nothing happened, so the game
+//! refuses to start when the registration fails.
 
 use std::ffi::c_void;
 use std::sync::Arc;
