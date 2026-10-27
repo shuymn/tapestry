@@ -311,13 +311,12 @@ fn overtaken_ln_head_loses_its_ln() {
         [(6, 0, Poor, None), (6, 1, Perfect, Some(-5 * MS))]
     );
     assert_eq!(judged_at(&events), [(1_095 * MS, 0), (1_095 * MS, 1)]);
-    // The missed head finishes its LN without an end event or a break.
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e.kind, JudgeEventKind::LnEnd { .. }))
-    );
-    assert_eq!((tally.ln_breaks, tally.bp, tally.combo), (0, 1, 1));
+    // The missed head is its long note's one POOR, never held.
+    assert!(!events.iter().any(|e| matches!(
+        e.kind,
+        JudgeEventKind::LnHeld { .. } | JudgeEventKind::LnHoldEnded { .. }
+    )));
+    assert_eq!((tally.counts.poor, tally.bp, tally.combo), (1, 1, 1));
 }
 
 #[test]
@@ -343,12 +342,11 @@ fn overtaken_ln_head_skips_its_future_end() {
         [(7, 0, Poor, None), (7, 1, Good, Some(-60 * MS))]
     );
     assert_eq!(judged_at(&events), [(1_140 * MS, 0), (1_140 * MS, 1)]);
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e.kind, JudgeEventKind::LnEnd { .. }))
-    );
-    assert_eq!((tally.ln_breaks, tally.bp, tally.combo), (0, 1, 1));
+    assert!(!events.iter().any(|e| matches!(
+        e.kind,
+        JudgeEventKind::LnHeld { .. } | JudgeEventKind::LnHoldEnded { .. }
+    )));
+    assert_eq!((tally.counts.poor, tally.bp, tally.combo), (1, 1, 1));
 }
 
 #[test]

@@ -19,8 +19,8 @@ use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
 use rules::{
-    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeWindows, LowDamage, MineRule, PerJudgment,
-    RulePreset, Window,
+    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeWindows, LnEndWindows, LowDamage, MineRule,
+    PerJudgment, RulePreset, Window,
 };
 
 use super::live::{Delivery, Publish, SourceStep};
@@ -216,7 +216,7 @@ fn build_chart(raw: &RawChart) -> Chart {
 struct RawGauge {
     survival: bool,
     bounds: [u32; 4],
-    deltas: [(u8, u32); 7],
+    deltas: [(u8, u32); 6],
     low: Option<(u8, u8, u32)>,
 }
 
@@ -224,7 +224,7 @@ fn raw_gauge() -> impl Strategy<Value = RawGauge> {
     (
         any::<bool>(),
         any::<[u32; 4]>(),
-        any::<[(u8, u32); 7]>(),
+        any::<[(u8, u32); 6]>(),
         option::of(any::<(u8, u8, u32)>()),
     )
         .prop_map(|(survival, bounds, deltas, low)| RawGauge {
@@ -241,7 +241,7 @@ struct RawPreset {
     late: [u32; 4],
     symmetric: bool,
     empty_poor: (u32, u32),
-    margin: u32,
+    ln_end: [u32; 3],
     flags: u16,
     rank: [u32; 5],
     total: u32,
@@ -253,7 +253,7 @@ struct RawPreset {
 fn raw_preset() -> impl Strategy<Value = RawPreset> {
     (
         (any::<[u32; 4]>(), any::<[u32; 4]>(), any::<bool>()),
-        (any::<(u32, u32)>(), any::<u32>(), any::<u16>()),
+        (any::<(u32, u32)>(), any::<[u32; 3]>(), any::<u16>()),
         (any::<[u32; 5]>(), any::<u32>()),
         vec(raw_gauge(), 1..=3),
         (any::<[u8; 5]>(), any::<u32>()),
@@ -261,7 +261,7 @@ fn raw_preset() -> impl Strategy<Value = RawPreset> {
         .prop_map(
             |(
                 (early, late, symmetric),
-                (empty_poor, margin, flags),
+                (empty_poor, ln_end, flags),
                 (rank, total),
                 gauges,
                 (ex, per_unit),
@@ -270,7 +270,7 @@ fn raw_preset() -> impl Strategy<Value = RawPreset> {
                 late,
                 symmetric,
                 empty_poor,
-                margin,
+                ln_end,
                 flags,
                 rank,
                 total,
@@ -358,7 +358,7 @@ fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
             max,
         )
     };
-    let [p, g, gd, bd, pr, ep, lb] = raw.deltas.map(|(s, v)| delta(s, v));
+    let [p, g, gd, bd, pr, ep] = raw.deltas.map(|(s, v)| delta(s, v));
     let low_damage = raw.low.map(|(num, den, below_raw)| {
         let den = u32::from(den % 4) + 1;
         LowDamage {
@@ -381,7 +381,6 @@ fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
             poor: pr,
         },
         empty_poor: ep,
-        ln_break: lb,
         low_damage,
     }
 }
@@ -405,6 +404,29 @@ fn scale(raw: u32) -> i64 {
     }
 }
 
+/// Valid LN-end edges for the note windows' `early` edges: each at least
+/// its judgment's early edge and wider than the better one, by 0, a grid
+/// multiple, or any µs count more.
+fn ln_end_of(raw: [u32; 3], early: [i64; 4]) -> LnEndWindows {
+    let mut e = [0; 3];
+    let mut floor = 0;
+    for (k, r) in raw.iter().enumerate() {
+        let v = u64::from(r / 3);
+        let extra = match r % 3 {
+            0 => 0,
+            1 => below(v, 10) * TICK,
+            _ => below(v, 200_000),
+        };
+        e[k] = floor.max(early[k]) + extra;
+        floor = e[k] + 1;
+    }
+    LnEndWindows {
+        perfect: TimeUs(e[0]),
+        great: TimeUs(e[1]),
+        good: TimeUs(e[2]),
+    }
+}
+
 fn build_preset(raw: &RawPreset) -> RulePreset {
     let mut p = rules::custom();
     let late = edges(raw.late);
@@ -420,9 +442,7 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     p.empty_poor.breaks_combo = flag(0);
     p.empty_poor.counts_bp = flag(1);
     p.empty_poor.counted = flag(2);
-    p.ln_break.release_margin = TimeUs(below(raw.margin, 21) * TICK / 2);
-    p.ln_break.breaks_combo = flag(3);
-    p.ln_break.counts_bp = flag(4);
+    p.ln_end = ln_end_of(raw.ln_end, early);
     p.rank_scale.rank_milli = [0, 1, 2, 3].map(|k| scale(raw.rank[k]));
     p.rank_scale.absent_milli = scale(raw.rank[4]);
     p.default_total_milli = below(raw.total, 400_000) + 1;
@@ -1123,7 +1143,7 @@ pub struct RawWidening {
     notes: Vec<RawWideNote>,
     rank: (u8, u32),
     preset: RawPreset,
-    widen: ([u32; 4], [u32; 4]),
+    widen: ([u32; 4], [u32; 4], [u32; 3]),
     offset: (u8, u16),
 }
 
@@ -1140,7 +1160,7 @@ pub fn raw_widening() -> impl Strategy<Value = RawWidening> {
         ),
         (any::<u8>(), any::<u32>()),
         raw_preset(),
-        any::<([u32; 4], [u32; 4])>(),
+        any::<([u32; 4], [u32; 4], [u32; 3])>(),
         any::<(u8, u16)>(),
     )
         .prop_map(|(notes, rank, preset, widen, offset)| RawWidening {
@@ -1184,6 +1204,23 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
         widen(side(&narrow, true), raw.widen.0),
         widen(side(&narrow, false), raw.widen.1),
     );
+    // The LN-end edges widen too, by their own steps, and at least as far
+    // as the widened early edges they must cover; each stays wider than
+    // the better one.
+    let early = side(&wide, true);
+    let mut floor = 0;
+    let mut add = 0;
+    let mut end = [0; 3];
+    for (k, (_, edge)) in narrow.ln_end.table().into_iter().enumerate() {
+        add += widen_step(raw.widen.2[k]);
+        end[k] = (edge.0 + add).max(early[k]).max(floor);
+        floor = end[k] + 1;
+    }
+    wide.ln_end = LnEndWindows {
+        perfect: TimeUs(end[0]),
+        great: TimeUs(end[1]),
+        good: TimeUs(end[2]),
+    };
     // Distinct lanes, one judgeable note each.
     let mut used = [false; LANE_COUNT];
     let mut b = ChartBuilder::new(150_000);
@@ -1255,5 +1292,97 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
             start,
             finalized: None,
         },
+    }
+}
+
+// -------------------------------------------------------- held through
+
+/// A play for the held-duration property: one long note on key 1, pressed
+/// inside the scaled BAD window and held at least as long as the long note.
+#[derive(Clone, Debug)]
+pub struct HeldThrough {
+    pub chart: Chart,
+    pub preset: RulePreset,
+    pub input: EvalInput,
+    /// The press's deviation from the head.
+    pub deviation: i64,
+    /// The scale the chart's rank gives, in thousandths of a percent.
+    pub scale: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RawHeldThrough {
+    preset: RawPreset,
+    rank: (u8, u32),
+    length: u32,
+    deviation: u32,
+    extra: u32,
+}
+
+pub fn raw_held_through() -> impl Strategy<Value = RawHeldThrough> {
+    (
+        raw_preset(),
+        (any::<u8>(), any::<u32>()),
+        any::<(u32, u32, u32)>(),
+    )
+        .prop_map(
+            |(preset, rank, (length, deviation, extra))| RawHeldThrough {
+                preset,
+                rank,
+                length,
+                deviation,
+                extra,
+            },
+        )
+}
+
+pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
+    let preset = build_preset(&raw.preset);
+    // A zero-length, a 1 µs, a grid or any long note up to 2 s.
+    let length = match raw.length % 4 {
+        0 => 0,
+        1 => 1,
+        2 => (below(raw.length / 4, 200) + 1) * TICK,
+        _ => below(raw.length / 4, 2_000_001),
+    };
+    let head = 1_000 * MS;
+    let mut chart = ChartBuilder::new(150_000)
+        .long(lane(1), TimeUs(head), TimeUs(head + length))
+        .build()
+        .unwrap();
+    chart.meta.rank = rank(raw.rank);
+    // The scaled BAD window, by hand: floor(edge × scale / 100 %).
+    let scale = preset.rank_scale.scale_milli(chart.meta.rank).unwrap();
+    let scaled = |edge: TimeUs| edge.0 * scale / 100_000;
+    let (early, late) = (
+        scaled(preset.windows.bad.early),
+        scaled(preset.windows.bad.late),
+    );
+    let deviation = below(raw.deviation, early + late + 1) - early;
+    // Held exactly as long as the long note, a little or much longer.
+    let extra = match raw.extra % 3 {
+        0 => 0,
+        1 => below(raw.extra / 3, 3),
+        _ => below(raw.extra / 3, 1_000_000),
+    };
+    let press = head + deviation;
+    let events = vec![
+        button(press, 0, 1, 1),
+        button(press + length + extra, 0, 1, 0),
+    ];
+    HeldThrough {
+        chart,
+        preset,
+        input: EvalInput {
+            start: InputStart {
+                opened_at: opened_before(&events),
+                held: Vec::new(),
+            },
+            events,
+            device: crate::common::device(&[0]),
+            finalized: None,
+        },
+        deviation,
+        scale,
     }
 }

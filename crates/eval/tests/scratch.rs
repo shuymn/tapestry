@@ -13,10 +13,10 @@ use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
 use common::{MS, device, disconnect, lane, press, release};
 use eval::{
     AxisBinding, AxisMode, Binding, ControlId, ConversionState, DeviceProfile, EvalError,
-    EvalInput, Evaluator, InputKind, InputStart, JudgeEvent, JudgeEventKind, LaneEdge, LnOutcome,
+    EvalInput, Evaluator, InputKind, InputStart, JudgeEvent, JudgeEventKind, LaneEdge,
     PhysicalInputEvent, PushError, ScratchSettings, SourceId, evaluate, window_inputs,
 };
-use rules::Judgment::Perfect;
+use rules::Judgment::{self, Bad, Perfect};
 
 const BPM: i64 = 150_000;
 const AXIS: ControlId = ControlId(0x1_0030);
@@ -98,14 +98,29 @@ fn run(
     out
 }
 
-/// `(time, outcome, origin)` of each long note's end.
-fn ln_ends(events: &[JudgeEvent]) -> Vec<(i64, LnOutcome, Option<i64>)> {
+/// `(time, judgment, release, origin)` of each long note judged after its
+/// head was held.
+fn ln_ends(events: &[JudgeEvent]) -> Vec<(i64, Judgment, Option<i64>, Option<i64>)> {
+    let mut held = Vec::new();
     events
         .iter()
         .filter_map(|e| match e.kind {
-            JudgeEventKind::LnEnd { outcome, .. } => {
-                Some((e.time.0, outcome, e.origin.map(|o| o.0)))
+            JudgeEventKind::LnHeld { lane, note, .. } => {
+                held.push((lane, note));
+                None
             }
+            JudgeEventKind::Judged {
+                lane,
+                note,
+                judgment,
+                release,
+                ..
+            } if held.contains(&(lane, note)) => Some((
+                e.time.0,
+                judgment,
+                release.map(|r| r.0),
+                e.origin.map(|o| o.0),
+            )),
             _ => None,
         })
         .collect()
@@ -199,14 +214,26 @@ fn release_after_stop_is_a_deadline_not_a_frame() {
     ev.push_input(report(1_000 * MS, 12)).unwrap(); // press: head PERFECT
     let mut out = Vec::new();
     ev.advance_to(TimeUs(1_100 * MS - 1), &mut out).unwrap();
-    assert_eq!(judged(&out), [(0, 0, Perfect, Some(0))]);
-    assert_eq!(ln_ends(&out), [], "the release waits for the watermark");
+    assert!(
+        out.iter()
+            .any(|e| matches!(e.kind, JudgeEventKind::LnHeld { .. }))
+    );
+    assert_eq!(judged(&out), [], "the release waits for the watermark");
     // One jump far past the deadline: the release happens at the
-    // deadline, 100 ms after the last movement, not at the step.
-    out.clear();
+    // deadline, 100 ms after the last movement, not at the step. It is
+    // 900 ms before the end, past every LN-end edge: one BAD, with no
+    // input as its origin.
     ev.advance_to(TimeUs(1_900 * MS), &mut out).unwrap();
-    assert_eq!(ln_ends(&out), [(1_100 * MS, LnOutcome::Broken, None)]);
-    assert_eq!(ev.tally().ln_breaks, 1);
+    assert_eq!(ln_ends(&out), [(1_100 * MS, Bad, Some(-900 * MS), None)]);
+    assert_eq!(judged(&out), [(0, 0, Bad, Some(0))]);
+    assert_eq!((ev.tally().counts.bad, ev.tally().bp), (1, 1));
+    // The timeout ends the visual hold too, before the end.
+    let ended: Vec<_> = out
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::LnHoldEnded { .. }))
+        .map(|e| (e.time.0, e.origin))
+        .collect();
+    assert_eq!(ended, [(1_100 * MS, None)]);
 }
 
 #[test]
@@ -222,8 +249,8 @@ fn release_deadline_is_on_the_evaluation_timeline() {
         &[report(905 * MS, 10), report(1_005 * MS, 12)],
         1_900 * MS,
     );
-    assert_eq!(judged(&events), [(0, 0, Perfect, Some(0))]);
-    assert_eq!(ln_ends(&events), [(1_100 * MS, LnOutcome::Broken, None)]);
+    assert_eq!(judged(&events), [(0, 0, Bad, Some(0))]);
+    assert_eq!(ln_ends(&events), [(1_100 * MS, Bad, Some(-900 * MS), None)]);
 }
 
 #[test]
@@ -243,11 +270,9 @@ fn movement_moves_pending_release_deadline() {
     }
     let mut out = Vec::new();
     ev.advance_to(TimeUs(1_340 * MS - 1), &mut out).unwrap();
-    assert_eq!(judged(&out).len(), 1);
-    assert_eq!(ln_ends(&out), [], "no release at any earlier deadline");
-    out.clear();
+    assert_eq!(judged(&out), [], "no release at any earlier deadline");
     ev.advance_to(TimeUs(1_340 * MS), &mut out).unwrap();
-    assert_eq!(ln_ends(&out), [(1_340 * MS, LnOutcome::Broken, None)]);
+    assert_eq!(ln_ends(&out), [(1_340 * MS, Bad, Some(-660 * MS), None)]);
 }
 
 #[test]
@@ -274,12 +299,13 @@ fn hid_disconnect_releases_scratch_and_buttons() {
     ];
     let events = run(&chart, &dev, &inputs, 3_000 * MS);
     assert_eq!(judged(&events).len(), 2);
-    // Both break at the removal, as inputs; the pending release is gone.
+    // Both are released at the removal, as inputs, 500 ms before their
+    // end: BAD. The pending release is gone.
     assert_eq!(
         ln_ends(&events),
         [
-            (1_500 * MS, LnOutcome::Broken, Some(1_500 * MS)),
-            (1_500 * MS, LnOutcome::Broken, Some(1_500 * MS)),
+            (1_500 * MS, Bad, Some(-500 * MS), Some(1_500 * MS)),
+            (1_500 * MS, Bad, Some(-500 * MS), Some(1_500 * MS)),
         ]
     );
 
@@ -616,7 +642,7 @@ fn aborted_and_incremental_scratch_match_batch() {
     };
     let rule = rules::custom();
     let batch = evaluate(&chart, &input, &rule).unwrap();
-    // Head PERFECT, completed at its end by a deadline that comes before
+    // Head PERFECT, held, judged at its end by a deadline that comes before
     // the release (1580 ms), and both taps PERFECT.
     assert_eq!(
         judged(&batch.events),
@@ -626,10 +652,7 @@ fn aborted_and_incremental_scratch_match_batch() {
             (2, 0, Perfect, Some(0))
         ]
     );
-    assert_eq!(
-        ln_ends(&batch.events),
-        [(1_500 * MS, LnOutcome::Completed, None)]
-    );
+    assert_eq!(ln_ends(&batch.events), [(1_500 * MS, Perfect, None, None)]);
     for step in [MS, 7 * MS] {
         let rule = rules::custom();
         let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 64).unwrap();
@@ -649,7 +672,7 @@ fn aborted_and_incremental_scratch_match_batch() {
     }
 
     // Aborted at 1050 ms, with the release pending at 1140 ms: the head is
-    // judged and nothing after the finalized watermark is.
+    // held and its long note is not judged or counted.
     let aborted = evaluate(
         &chart,
         &EvalInput {
@@ -659,7 +682,8 @@ fn aborted_and_incremental_scratch_match_batch() {
         &rule,
     )
     .unwrap();
-    assert_eq!(judged(&aborted.events), [(0, 0, Perfect, Some(0))]);
+    assert_eq!(judged(&aborted.events), []);
+    assert_eq!(aborted.tally.counts.perfect, 0);
     assert_eq!(ln_ends(&aborted.events), []);
     assert_eq!(&batch.events[..aborted.events.len()], aborted.events);
 }

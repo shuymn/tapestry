@@ -13,14 +13,14 @@ use bms_model::TimeUs;
 
 use crate::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, LateHeadRule, LnBreakRule, LnMode, LnModeRule, LowDamage,
+    Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
     MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode,
     Window,
 };
 
-/// The encoding layout. Version 3 has a single miss rule and always the
-/// empty POOR's `behind` distance.
-const FORMAT_VERSION: u64 = 3;
+/// The encoding layout. Version 4 has the LN-end edges after the windows
+/// and no LN break.
+const FORMAT_VERSION: u64 = 4;
 
 impl RulePreset {
     /// The preset's canonical bytes: equal presets give equal bytes, and any
@@ -36,7 +36,7 @@ impl RulePreset {
             windows,
             miss,
             empty_poor,
-            ln_break,
+            ln_end,
             rank_scale,
             default_total_milli,
             denominator,
@@ -52,11 +52,11 @@ impl RulePreset {
         w.uint(u64::from(*version));
         w.implementation(*implementation);
         w.windows(windows);
+        w.ln_end(ln_end);
         w.uint(match miss {
             MissRule::PoorAfterLateBadOrOvertaken => 0,
         });
         w.empty_poor(empty_poor);
-        w.ln_break(ln_break);
         w.rank_scale(rank_scale);
         w.int(*default_total_milli);
         w.uint(match denominator {
@@ -160,15 +160,15 @@ impl Writer {
         self.bool(counted);
     }
 
-    fn ln_break(&mut self, rule: &LnBreakRule) {
-        let LnBreakRule {
-            release_margin,
-            breaks_combo,
-            counts_bp,
-        } = *rule;
-        self.time(release_margin);
-        self.bool(breaks_combo);
-        self.bool(counts_bp);
+    fn ln_end(&mut self, ln_end: &LnEndWindows) {
+        let LnEndWindows {
+            perfect,
+            great,
+            good,
+        } = *ln_end;
+        for edge in [perfect, great, good] {
+            self.time(edge);
+        }
     }
 
     fn rank_scale(&mut self, scale: &RankScale) {
@@ -223,7 +223,6 @@ impl Writer {
             max,
             change,
             empty_poor,
-            ln_break,
             low_damage,
         } = gauge;
         self.str(id);
@@ -239,7 +238,6 @@ impl Writer {
         self.gauge_value(*max);
         self.per_judgment(change, Self::delta);
         self.delta(*empty_poor);
-        self.delta(*ln_break);
         match low_damage {
             None => self.uint(0),
             Some(LowDamage { below, num, den }) => {
@@ -323,6 +321,27 @@ mod tests {
     }
 
     #[test]
+    fn canonical_bytes_start_with_format_4_and_change_with_any_ln_end_edge() {
+        let base = custom();
+        let base_bytes = base.canonical_bytes();
+        assert_eq!(base_bytes.first(), Some(&4));
+        let edges: [fn(&mut crate::LnEndWindows) -> &mut TimeUs; 3] =
+            [|w| &mut w.perfect, |w| &mut w.great, |w| &mut w.good];
+        let mut seen = HashSet::from([base_bytes]);
+        for edge in edges {
+            for step in [-1, 1] {
+                let mut preset = base.clone();
+                edge(&mut preset.ln_end).0 += step;
+                assert!(
+                    seen.insert(preset.canonical_bytes()),
+                    "a 1 µs change of an LN-end edge left the bytes unchanged or equal to another edge's"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 1 + 3 * 2);
+    }
+
+    #[test]
     fn canonical_bytes_cover_identity_and_gauges() {
         let base = custom().canonical_bytes();
         let changed = |edit: fn(&mut crate::RulePreset)| {
@@ -333,7 +352,7 @@ mod tests {
         assert_ne!(changed(|p| p.id.push('x')), base);
         assert_ne!(changed(|p| p.version += 1), base);
         assert_ne!(
-            changed(|p| p.implementation = crate::Implementation::Standard { version: 2 }),
+            changed(|p| p.implementation = crate::Implementation::Standard { version: 3 }),
             base
         );
         assert_ne!(changed(|p| p.gauges[1].low_damage = None), base);
@@ -362,8 +381,11 @@ mod tests {
         p.empty_poor.behind = TimeUs(120_000);
         p.empty_poor.counts_bp = false;
         p.empty_poor.counted = true;
-        p.ln_break.release_margin = TimeUs(80_000);
-        p.ln_break.counts_bp = false;
+        p.ln_end = crate::LnEndWindows {
+            perfect: TimeUs(90_000),
+            great: TimeUs(140_000),
+            good: TimeUs(210_000),
+        };
         p.rank_scale = crate::RankScale {
             rank_milli: [40_000, 70_000, 100_000, 130_000],
             absent_milli: 90_000,
@@ -373,28 +395,30 @@ mod tests {
     }
 
     /// The bytes of [`representative`], written by hand from the module docs
-    /// field by field: the format version 3, then `rep`, version 7, the
-    /// implementation, the windows, the miss rule (0), the empty POOR
-    /// (`ahead` 250 ms is zigzag 500000 = `a0 c2 1e`, `behind` 120 ms is
-    /// zigzag 240000 = `80 d3 0e`), and the rest in declaration order.
-    const PINNED: [u8; 201] = [
-        0x03, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+    /// field by field: the format version 4, then `rep`, version 7, the
+    /// implementation, the windows, the LN-end edges (90 ms is zigzag 180000
+    /// = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1 19`), the miss
+    /// rule (0), the empty POOR (`ahead` 250 ms is zigzag 500000 = `a0 c2
+    /// 1e`, `behind` 120 ms is zigzag 240000 = `80 d3 0e`), and the rest in
+    /// declaration order.
+    const PINNED: [u8; 197] = [
+        0x04, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x03, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
-        0x14, 0x80, 0xb5, 0x18, 0x00, 0xa0, 0xc2, 0x1e, 0x80, 0xd3, 0x0e, 0x00, //
-        0x00, 0x01, 0x80, 0xe2, 0x09, 0x01, 0x00, 0x04, 0x80, 0xf1, 0x04, 0xe0, //
-        0xc5, 0x08, 0xc0, 0x9a, 0x0c, 0xa0, 0xef, 0x0f, 0xa0, 0xfe, 0x0a, 0x80, //
-        0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, 0x6c, 0x00, //
-        0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, 0xb5, 0x18, 0x80, //
-        0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, //
-        0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, 0x00, 0xbf, 0xcf, 0x24, //
-        0x00, 0xff, 0x9e, 0x49, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, //
+        0x14, 0x80, 0xb5, 0x18, 0xa0, 0xfe, 0x0a, 0xc0, 0x8b, 0x11, 0xa0, 0xd1, //
+        0x19, 0x00, 0xa0, 0xc2, 0x1e, 0x80, 0xd3, 0x0e, 0x00, 0x00, 0x01, 0x04, //
+        0x80, 0xf1, 0x04, 0xe0, 0xc5, 0x08, 0xc0, 0x9a, 0x0c, 0xa0, 0xef, 0x0f, //
+        0xa0, 0xfe, 0x0a, 0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, //
+        0x6d, 0x61, 0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, //
+        0x80, 0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, //
+        0x01, 0x01, 0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, //
+        0x00, 0xbf, 0xcf, 0x24, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, //
         0x61, 0x6c, 0x01, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, 0xc4, 0x09, //
         0x00, 0x80, 0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, 0x00, 0xbf, //
-        0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x00, 0xbf, //
-        0xee, 0x6d, 0x01, 0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, //
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, //
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa0, 0x8d, 0x06,
+        0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x01, 0x80, //
+        0x9b, 0xee, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0xa0, 0x8d, 0x06,
     ];
 
     /// The layout, pinned, so a reordered or dropped field fails here; an

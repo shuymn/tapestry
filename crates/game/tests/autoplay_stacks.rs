@@ -8,7 +8,7 @@ mod common;
 use bms_model::{Chart, NoteKind, TimeUs};
 use bms_parser::{LoadOptions, load_bms};
 use common::device;
-use eval::{Evaluator, InputStart, JudgeEvent, JudgeEventKind, LnOutcome};
+use eval::{Evaluator, InputStart, JudgeEvent, JudgeEventKind};
 use rules::{GaugeValue, Judgment};
 
 fn load(text: &str) -> Chart {
@@ -65,32 +65,46 @@ fn notes_where(chart: &Chart, pick: fn(&NoteKind) -> bool) -> Vec<(usize, usize)
         .collect()
 }
 
-/// Every note judged once and PERFECT, every long note completed once,
-/// nothing else judged or missed.
+/// Every note judged once, PERFECT and on time, nothing else judged or
+/// missed. A long note of positive length is held at its head, and its
+/// release exactly at its end ends its visual hold and judges it; a
+/// zero-length one is decided at its press, never held.
 #[track_caller]
 fn all_perfect(chart: &Chart) {
     let events = autoplayed(chart);
     let mut judged = Vec::new();
-    let mut completed = Vec::new();
+    let mut held = Vec::new();
+    let mut ended = Vec::new();
     for e in &events {
         match e.kind {
             JudgeEventKind::Judged {
                 lane,
                 note,
                 judgment,
+                deviation,
+                release,
                 ..
             } => {
-                assert_eq!(judgment, Judgment::Perfect, "{e:?}");
+                assert_eq!(
+                    (judgment, deviation),
+                    (Judgment::Perfect, Some(TimeUs(0))),
+                    "{e:?}"
+                );
+                let n = chart.lanes[lane.index()][note];
+                let expected = (n.end() > n.time).then_some(TimeUs(0));
+                assert_eq!(release, expected, "{e:?}");
                 judged.push((lane.index(), note));
             }
-            JudgeEventKind::LnEnd {
+            JudgeEventKind::LnHeld {
                 lane,
                 note,
-                outcome,
+                judgment,
+                deviation,
             } => {
-                assert_eq!(outcome, LnOutcome::Completed, "{e:?}");
-                completed.push((lane.index(), note));
+                assert_eq!((judgment, deviation), (Judgment::Perfect, TimeUs(0)));
+                held.push((lane.index(), note));
             }
+            JudgeEventKind::LnHoldEnded { lane, note } => ended.push((lane.index(), note)),
             JudgeEventKind::EmptyPoor { .. } | JudgeEventKind::MineHit { .. } => {
                 panic!("{e:?}");
             }
@@ -98,15 +112,21 @@ fn all_perfect(chart: &Chart) {
         }
     }
     judged.sort_unstable();
-    completed.sort_unstable();
+    held.sort_unstable();
     assert_eq!(
         judged,
         notes_where(chart, |k| !matches!(k, NoteKind::Mine { .. }))
     );
-    assert_eq!(
-        completed,
-        notes_where(chart, |k| matches!(k, NoteKind::Long { .. }))
-    );
+    let positive: Vec<_> = notes_where(chart, |k| matches!(k, NoteKind::Long { .. }))
+        .into_iter()
+        .filter(|&(l, i)| {
+            let n = chart.lanes[l][i];
+            n.end() > n.time
+        })
+        .collect();
+    assert_eq!(held, positive);
+    ended.sort_unstable();
+    assert_eq!(ended, positive);
 }
 
 /// Measure 0 lasts 2 µs at 120 BPM (4e-6 beat), measure 1 is ordinary.

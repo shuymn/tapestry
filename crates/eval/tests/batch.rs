@@ -113,7 +113,7 @@ fn scenario() -> (Chart, EvalInput) {
         press(598 * MS, 2, 4),
         press(600 * MS, 0, 1),
         release(610 * MS, 0, 1),
-        release(553 * MS, 1, 2), // evaluation 550 ms, before 700 - 100: LN break
+        release(553 * MS, 1, 2), // evaluation 550 ms, 150 ms before the end: GREAT
         disconnect(678 * MS, 2), // releases lane 4 after the mine at 650 ms
         press(800 * MS, 0, 5),
         release(810 * MS, 0, 5),
@@ -154,10 +154,10 @@ fn incremental_matches_batch_for_every_watermark_step() {
     let (chart, input) = scenario();
     let rule = rules::custom();
     let batch = evaluate(&chart, &input, &rule).unwrap();
-    // Counted by hand: lane 1's three taps, the LN head, lane 3's tap, and
+    // Counted by hand: lane 1's three taps, the LN, lane 3's tap, and
     // lane 5's two taps.
     assert_eq!(judged(&batch.events), 7);
-    assert_eq!(batch.tally.ln_breaks, 1);
+    assert_eq!(batch.tally.counts.great, 1);
     assert!(
         batch
             .events

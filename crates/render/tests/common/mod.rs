@@ -57,7 +57,6 @@ pub fn view(combo: u32, ex_score: u32) -> PlayView {
             combo,
             max_combo: combo + 19,
             empty_poor: 23,
-            ln_breaks: 29,
         },
         gauges: vec![GaugeState {
             value: GaugeValue(GaugeValue::PERCENT * 62),

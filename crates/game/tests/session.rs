@@ -937,6 +937,50 @@ fn audio_failure_ends_the_play_where_it_is_seen() {
 }
 
 #[test]
+fn a_play_aborted_while_a_long_note_is_held_reevaluates_to_live() {
+    // The output fails at session 1.5 s, stepping 1 ms: the play ends at
+    // watermark 499 999. A long note on key 1 from 300 ms is pressed on
+    // time and released at 700 ms, after the abort. Ending at 500 000, it
+    // is still held at the watermark (its end − 1): not judged or counted.
+    // Ending at 499 999, its end deadline judges it PERFECT at the
+    // watermark. A tap at 2 s keeps the play going. The re-evaluation of
+    // the record matches live either way.
+    for (end, judged) in [(500_000, 0), (499_999, 1)] {
+        let chart = ChartBuilder::new(150_000)
+            .long(lane(1), TimeUs(300 * MS), TimeUs(end))
+            .tap(lane(2), TimeUs(2_000 * MS))
+            .build()
+            .unwrap();
+        let bank = common::bank(&chart);
+        let (_dir, root) = temp_root();
+        let mut s = failing_session(&root, &chart, bank, 1_500 * MS, MS);
+        let items = vec![connect(0), key(300 * MS, 0, 1, 1), key(700 * MS, 0, 1, 0)];
+        let one = s.play(script(items, &[])).unwrap();
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::OutputFailed));
+        assert_eq!(status(&one), (EndStatus::EndedMidway, TimeUs(499_999)));
+        let count =
+            |f: fn(&eval::JudgeEventKind) -> bool| one.live.iter().filter(|e| f(&e.kind)).count();
+        assert_eq!(
+            count(|k| matches!(k, eval::JudgeEventKind::LnHeld { .. })),
+            1
+        );
+        assert_eq!(
+            count(|k| matches!(k, eval::JudgeEventKind::Judged { .. })),
+            judged,
+            "end {end}"
+        );
+        let summary = one.result.as_ref().unwrap();
+        assert!(summary.matches_live, "end {end}");
+        let evaluation = summary.evaluation.as_ref().unwrap();
+        assert_eq!(
+            evaluation.tally.counts.perfect,
+            u32::try_from(judged).unwrap()
+        );
+        assert_eq!(evaluation.tally, one.tally);
+    }
+}
+
+#[test]
 fn audio_failure_in_the_tail_keeps_the_play_complete() {
     let (chart, bank) = tail_chart();
     let (_dir, root) = temp_root();
@@ -975,6 +1019,60 @@ fn reevaluation_refuses_a_record_of_another_preset() {
     );
     assert!(!summary.matches_live);
     assert_eq!(summary.recommended_offset, None);
+}
+
+#[test]
+fn reevaluation_refuses_a_record_of_another_evaluator_version() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&[(1, 1_000)]);
+    let mut s = session(&root, &chart, &Events::default());
+    let mut items = vec![connect(0)];
+    items.extend(presses(&[(1, 1_000)]));
+    let one = s.play(script(items, &[])).unwrap();
+    let preset = rules::custom();
+    let record = one.record.as_ref().unwrap();
+    // The session records the version the preset runs on, and its preset.
+    assert_eq!(record.versions.evaluator, 2);
+    assert_eq!(record.preset.sha256, replay::preset_hash(&preset));
+    let reevaluate = |record: &replay::PlayRecord| {
+        game::ResultExtension::on_play_end(
+            &mut ReEvaluate,
+            &game::ResultContext {
+                record,
+                chart: &chart,
+                preset: &preset,
+                live: &one.live,
+            },
+        )
+    };
+    assert!(reevaluate(record).matches_live);
+    // The same record under another evaluator version, its preset hash
+    // still matching: refused before the hash is compared.
+    for version in [1, 3] {
+        let mut other = record.clone();
+        other.versions.evaluator = version;
+        let summary = reevaluate(&other);
+        assert_eq!(
+            summary.evaluation,
+            Err(game::ReEvaluationError::UnsupportedEvaluator(version))
+        );
+        assert!(!summary.matches_live);
+        // With its preset hash not matching either, the version is still
+        // what is reported: it is checked first.
+        other.preset.sha256[0] ^= 1;
+        assert_eq!(
+            reevaluate(&other).evaluation,
+            Err(game::ReEvaluationError::UnsupportedEvaluator(version))
+        );
+    }
+    // A supported version with a hash that does not match is the preset
+    // mismatch.
+    let mut other = record.clone();
+    other.preset.sha256[0] ^= 1;
+    assert_eq!(
+        reevaluate(&other).evaluation,
+        Err(game::ReEvaluationError::PresetMismatch)
+    );
 }
 
 /// Accepts any `.chart` file up to `max` bytes and records how many bytes

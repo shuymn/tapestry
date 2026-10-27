@@ -12,7 +12,7 @@
 use bms_model::TimeUs;
 use rules::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, LateHeadRule, LnBreakRule, LnMode, LnModeRule, LowDamage,
+    Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
     MineRule, MissRule, PerJudgment, RankScale, RuleError, RulePreset, SameTimeOrder, ScoreWeights,
     TotalMode, Window,
 };
@@ -64,9 +64,9 @@ struct PresetFile {
     version: u32,
     implementation: ImplementationFile,
     windows: WindowsFile,
+    ln_end: LnEndFile,
     miss: MissFile,
     empty_poor: EmptyPoorFile,
-    ln_break: LnBreakFile,
     rank_scale: RankScaleFile,
     default_total_milli: i64,
     denominator: DenominatorFile,
@@ -119,10 +119,10 @@ struct EmptyPoorFile {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LnBreakFile {
-    release_margin_us: i64,
-    breaks_combo: bool,
-    counts_bp: bool,
+struct LnEndFile {
+    perfect_early_us: i64,
+    great_early_us: i64,
+    good_early_us: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -253,7 +253,6 @@ struct GaugeFile {
     max: i64,
     change: PerJudgmentFile<DeltaFile>,
     empty_poor: DeltaFile,
-    ln_break: DeltaFile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     low_damage: Option<LowDamageFile>,
 }
@@ -293,9 +292,9 @@ impl From<PresetFile> for RulePreset {
             version,
             implementation,
             windows,
+            ln_end,
             miss,
             empty_poor,
-            ln_break,
             rank_scale,
             default_total_milli,
             denominator,
@@ -329,10 +328,10 @@ impl From<PresetFile> for RulePreset {
                 counts_bp: empty_poor.counts_bp,
                 counted: empty_poor.counted,
             },
-            ln_break: LnBreakRule {
-                release_margin: TimeUs(ln_break.release_margin_us),
-                breaks_combo: ln_break.breaks_combo,
-                counts_bp: ln_break.counts_bp,
+            ln_end: LnEndWindows {
+                perfect: TimeUs(ln_end.perfect_early_us),
+                great: TimeUs(ln_end.great_early_us),
+                good: TimeUs(ln_end.good_early_us),
             },
             rank_scale: RankScale {
                 rank_milli: rank_scale.rank_milli,
@@ -357,7 +356,6 @@ impl From<PresetFile> for RulePreset {
                     max: GaugeValue(g.max),
                     change: g.change.map(delta),
                     empty_poor: delta(g.empty_poor),
-                    ln_break: delta(g.ln_break),
                     low_damage: g.low_damage.map(|l| LowDamage {
                         below: GaugeValue(l.below),
                         num: l.num,
@@ -407,7 +405,7 @@ impl From<&RulePreset> for PresetFile {
             windows,
             miss,
             empty_poor,
-            ln_break,
+            ln_end,
             rank_scale,
             default_total_milli,
             denominator,
@@ -450,10 +448,17 @@ impl From<&RulePreset> for PresetFile {
                     counted,
                 }
             },
-            ln_break: LnBreakFile {
-                release_margin_us: ln_break.release_margin.0,
-                breaks_combo: ln_break.breaks_combo,
-                counts_bp: ln_break.counts_bp,
+            ln_end: {
+                let LnEndWindows {
+                    perfect,
+                    great,
+                    good,
+                } = *ln_end;
+                LnEndFile {
+                    perfect_early_us: perfect.0,
+                    great_early_us: great.0,
+                    good_early_us: good.0,
+                }
             },
             rank_scale: RankScaleFile {
                 rank_milli: rank_scale.rank_milli,
@@ -505,7 +510,6 @@ impl From<&RulePreset> for PresetFile {
                     max: g.max.0,
                     change: PerJudgmentFile::of(&g.change, delta_file),
                     empty_poor: delta_file(g.empty_poor),
-                    ln_break: delta_file(g.ln_break),
                     low_damage: g.low_damage.map(|l| LowDamageFile {
                         below: l.below.0,
                         num: l.num,

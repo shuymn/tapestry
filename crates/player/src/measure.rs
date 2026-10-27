@@ -59,20 +59,30 @@ pub struct StepSample {
 pub enum Step {
     /// A step's logic time minus its watermark.
     Finalization(i64),
-    /// A judgment's delivery time minus its origin, one per judgment.
+    /// A judgment's delivery time minus its press's origin, one per judgment
+    /// of a press.
     Judgment(i64),
 }
 
 /// The input → judgment samples of one step's `events`, delivered at
-/// play time `delivered`: one per judgment of an input.
+/// play time `delivered`: one per judgment of a press.
 pub fn judgment_samples(
     events: &[JudgeEvent],
     delivered: TimeUs,
 ) -> impl Iterator<Item = i64> + '_ {
-    events.iter().filter_map(move |e| match (e.kind, e.origin) {
-        (JudgeEventKind::Judged { .. }, Some(o)) => Some(delivered.0 - o.0),
+    events
+        .iter()
+        .filter_map(move |e| press_origin(e).map(|o| delivered.0 - o.0))
+}
+
+/// The receive time of the press `e` judges: a judgment a press made, or a
+/// long note's head held. A long note judged by its release or its end is
+/// no press's judgment, so it gives no press latency.
+fn press_origin(e: &JudgeEvent) -> Option<TimeUs> {
+    match e.kind {
+        JudgeEventKind::Judged { release: None, .. } | JudgeEventKind::LnHeld { .. } => e.origin,
         _ => None,
-    })
+    }
 }
 
 /// The output's sizes, shown beside press → sound.
@@ -659,7 +669,7 @@ impl Measure {
             return;
         }
         for ev in effects {
-            if let (JudgeEventKind::Judged { .. }, Some(o)) = (ev.kind, ev.origin) {
+            if let Some(o) = press_origin(ev) {
                 self.on_screen.drawn(ev.seq, o.0);
             }
         }
@@ -688,7 +698,7 @@ impl Measure {
             self.filter.reset();
         }
         for ev in d.effects {
-            if let (JudgeEventKind::Judged { .. }, Some(o)) = (ev.kind, ev.origin) {
+            if let Some(o) = press_origin(ev) {
                 self.on_screen.drawn(ev.seq, o.0);
             }
         }
@@ -1053,9 +1063,62 @@ mod frame_tests {
                 note: 0,
                 judgment: Judgment::Great,
                 deviation: Some(TimeUs(0)),
+                release: None,
                 combo: 1,
             },
         }
+    }
+
+    #[test]
+    fn press_samples_come_from_held_heads_and_press_judgments_only() {
+        let lane = Lane::new(1).unwrap();
+        let with = |e: JudgeEvent, origin: Option<i64>, kind| JudgeEvent {
+            origin: origin.map(TimeUs),
+            kind,
+            ..e
+        };
+        let events = [
+            // A long note's head held, pressed at 10 ms.
+            with(
+                judged(0, 10_000),
+                Some(10_000),
+                JudgeEventKind::LnHeld {
+                    lane,
+                    note: 0,
+                    judgment: Judgment::Great,
+                    deviation: TimeUs(0),
+                },
+            ),
+            // Its judgment at the release (20 ms): no press latency.
+            with(
+                judged(1, 20_000),
+                Some(20_000),
+                JudgeEventKind::Judged {
+                    lane,
+                    note: 0,
+                    judgment: Judgment::Good,
+                    deviation: Some(TimeUs(0)),
+                    release: Some(TimeUs(-150_000)),
+                    combo: 1,
+                },
+            ),
+            // A tap pressed at 30 ms, and a miss with no origin.
+            judged(2, 30_000),
+            with(
+                judged(3, 40_000),
+                None,
+                JudgeEventKind::Judged {
+                    lane,
+                    note: 1,
+                    judgment: Judgment::Poor,
+                    deviation: None,
+                    release: None,
+                    combo: 0,
+                },
+            ),
+        ];
+        let samples: Vec<i64> = super::judgment_samples(&events, TimeUs(50_000)).collect();
+        assert_eq!(samples, [40_000, 20_000]);
     }
 
     const FIFO: Option<Presentation> = Some(Presentation {

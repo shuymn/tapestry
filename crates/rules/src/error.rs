@@ -30,7 +30,29 @@ pub enum RuleError {
         /// The judgment whose edge is out of order.
         judgment: Judgment,
     },
-    /// A value that must be positive (or, for times, not negative) was not.
+    /// The preset names an evaluation implementation or version this build
+    /// does not run.
+    UnsupportedImplementation {
+        /// The implementation's name.
+        name: &'static str,
+        /// Its version.
+        version: u32,
+    },
+    /// An LN-end edge was negative, or not wider than the better judgment's.
+    LnEndNotAscending {
+        /// The judgment whose edge is out of order.
+        judgment: Judgment,
+    },
+    /// An LN-end edge was narrower than the note window's early edge of the
+    /// same judgment, so a press held as long as its long note could lose
+    /// its head's judgment.
+    LnEndNarrowerThanNote {
+        /// The judgment.
+        judgment: Judgment,
+    },
+    /// A value that must be positive (or, for times, not negative) was not,
+    /// or a window edge, before or after a rank scale, passed
+    /// [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE).
     OutOfRange {
         /// The field.
         field: &'static str,
@@ -58,6 +80,19 @@ impl fmt::Display for RuleError {
             Self::WindowsNotAscending { side, judgment } => write!(
                 f,
                 "the {side:?} edge of the {judgment:?} window is negative or not wider than the better judgment's"
+            ),
+            Self::UnsupportedImplementation { name, version } => write!(
+                f,
+                "the {name} evaluator version {version} is not supported (this build runs version {})",
+                crate::Implementation::STANDARD_VERSION
+            ),
+            Self::LnEndNotAscending { judgment } => write!(
+                f,
+                "the {judgment:?} LN-end edge is negative or not wider than the better judgment's"
+            ),
+            Self::LnEndNarrowerThanNote { judgment } => write!(
+                f,
+                "the {judgment:?} LN-end edge is narrower than the {judgment:?} window's early edge"
             ),
             Self::OutOfRange { field } => write!(f, "{field} is out of range"),
             Self::NoGauges => f.write_str("the preset has no gauge"),

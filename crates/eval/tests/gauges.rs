@@ -1,5 +1,5 @@
 //! Hand-computed whole results with the custom preset: counts, combo, EX
-//! score, BP, LN breaks and both gauges.
+//! score, BP, empty POORs and both gauges.
 //!
 //! Gauges are in 1/100000 %: the normal gauge starts at 2_000_000 (20 %),
 //! floors at 200_000 (2 %), and caps at 10_000_000; the survival gauge starts
@@ -10,8 +10,8 @@ mod common;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{MS, device, lane, press, release};
-use eval::{EvalError, EvalInput, Evaluation, InputStart, JudgeEventKind, LnOutcome, evaluate};
-use rules::{GaugeDelta, GaugeValue, RulePreset};
+use eval::{EvalError, EvalInput, Evaluation, InputStart, JudgeEventKind, evaluate};
+use rules::{GaugeDelta, GaugeValue, Judgment, RulePreset};
 
 const BPM: i64 = 150_000;
 
@@ -24,7 +24,6 @@ struct Summary {
     max_combo: u32,
     ex: u32,
     bp: u32,
-    ln_breaks: u32,
     empty_poor: u32,
     normal: i64,
     survival: i64,
@@ -39,7 +38,6 @@ fn summary(e: &Evaluation) -> Summary {
         max_combo: t.max_combo,
         ex: t.ex_score,
         bp: t.bp,
-        ln_breaks: t.ln_breaks,
         empty_poor: t.empty_poor,
         normal: e.gauges[0].value.0,
         survival: e.gauges[1].value.0,
@@ -71,19 +69,41 @@ fn history(e: &Evaluation, gauge: usize) -> Vec<i64> {
     e.gauges[gauge].history.iter().map(|p| p.value.0).collect()
 }
 
-fn ln_ends(e: &Evaluation) -> Vec<(i64, LnOutcome)> {
+/// The times a gauge changed at.
+fn changed_at(e: &Evaluation, gauge: usize) -> Vec<i64> {
+    e.gauges[gauge].history.iter().map(|p| p.time.0).collect()
+}
+
+/// Each judgment: (time, judgment, deviation, release, origin).
+type Row = (i64, Judgment, Option<i64>, Option<i64>, Option<i64>);
+
+fn judged(e: &Evaluation) -> Vec<Row> {
     e.events
         .iter()
         .filter_map(|ev| match ev.kind {
-            JudgeEventKind::LnEnd { outcome, .. } => Some((ev.time.0, outcome)),
+            JudgeEventKind::Judged {
+                judgment,
+                deviation,
+                release,
+                ..
+            } => Some((
+                ev.time.0,
+                judgment,
+                deviation.map(|d| d.0),
+                release.map(|d| d.0),
+                ev.origin.map(|o| o.0),
+            )),
             _ => None,
         })
         .collect()
 }
 
 #[test]
-fn ln_early_release_after_perfect_head() {
-    // LN 1000-2000 ms and a tap at 2100 ms: 2 notes, increment 8_000_000.
+fn ln_early_release_grades_the_long_note_bad() {
+    // Regression: one judgment per long note. LN 1000-2000 ms and a tap at
+    // 2100 ms: 2 notes, increment 8_000_000. The head is PERFECT, the
+    // release 300 ms early is past every LN-end edge (200 ms): the long
+    // note is one BAD, scored at the release.
     let chart = ChartBuilder::new(BPM)
         .long(lane(1), TimeUs(1_000 * MS), TimeUs(2_000 * MS))
         .tap(lane(1), TimeUs(2_100 * MS))
@@ -92,61 +112,53 @@ fn ln_early_release_after_perfect_head() {
     let e = play(
         &chart,
         vec![
-            press(1_000 * MS, 0, 1),   // head PERFECT: 10_000_000 (capped), 10_000_000
-            release(1_700 * MS, 0, 1), // 300 ms early: break, POOR damage: 9_400_000, 9_100_000
-            press(1_850 * MS, 0, 1), // 250 ms before the tap: empty POOR, BP: 9_100_000, 8_650_000
+            press(1_000 * MS, 0, 1),   // head PERFECT, held: no change
+            release(1_700 * MS, 0, 1), // BAD: 1_800_000, 9_500_000
+            press(1_850 * MS, 0, 1),   // 250 ms before the tap: empty POOR: 1_500_000, 9_050_000
             release(1_860 * MS, 0, 1),
-            press(2_100 * MS, 0, 1), // tap PERFECT: 10_000_000 (capped), 8_666_000
+            press(2_100 * MS, 0, 1), // tap PERFECT: 9_500_000, 9_066_000
         ],
     );
     assert_eq!(
         summary(&e),
         Summary {
-            counts: [2, 0, 0, 0, 0],
+            counts: [1, 0, 0, 1, 0],
             combo: 1,
             max_combo: 1,
-            ex: 4,
+            ex: 2,
             bp: 2,
-            ln_breaks: 1,
             empty_poor: 1,
-            normal: 10_000_000,
-            survival: 8_666_000,
+            normal: 9_500_000,
+            survival: 9_066_000,
         }
     );
-    assert_eq!(ln_ends(&e), [(1_700 * MS, LnOutcome::Broken)]);
-}
-
-#[test]
-fn ln_release_margin_is_end_minus_100_ms() {
-    // Released exactly at end − 100 ms completes; 1 µs earlier breaks.
-    let chart = ChartBuilder::new(BPM)
-        .long(lane(1), TimeUs(1_000 * MS), TimeUs(2_000 * MS))
-        .long(lane(2), TimeUs(1_000 * MS), TimeUs(2_000 * MS))
-        .build()
-        .unwrap();
-    let e = play(
-        &chart,
-        vec![
-            press(1_000 * MS, 0, 1),
-            press(1_000 * MS, 0, 2),
-            release(1_900 * MS - 1, 0, 2),
-            release(1_900 * MS, 0, 1),
-        ],
-    );
     assert_eq!(
-        ln_ends(&e),
+        judged(&e),
         [
-            (1_900 * MS - 1, LnOutcome::Broken),
-            (1_900 * MS, LnOutcome::Completed)
+            (
+                1_700 * MS,
+                Judgment::Bad,
+                Some(0),
+                Some(-300 * MS),
+                Some(1_700 * MS)
+            ),
+            (
+                2_100 * MS,
+                Judgment::Perfect,
+                Some(0),
+                None,
+                Some(2_100 * MS)
+            ),
         ]
     );
-    assert_eq!(e.tally.ln_breaks, 1);
+    assert_eq!(history(&e, 0), [1_800_000, 1_500_000, 9_500_000]);
+    assert_eq!(changed_at(&e, 0), [1_700 * MS, 1_850 * MS, 2_100 * MS]);
 }
 
 #[test]
 fn late_head_after_short_ln_end() {
     // LN 1000-1050 ms, head pressed at 1100 ms (+100 ms, GOOD), after its
-    // end: completed at the press. One note: GOOD gives 8_000_000.
+    // end: decided at the press. One note: GOOD gives 8_000_000.
     let chart = ChartBuilder::new(BPM)
         .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_050 * MS))
         .build()
@@ -163,19 +175,25 @@ fn late_head_after_short_ln_end() {
             max_combo: 1,
             ex: 0,
             bp: 0,
-            ln_breaks: 0,
             empty_poor: 0,
             normal: 10_000_000,
             survival: 10_000_000,
         }
     );
-    assert_eq!(ln_ends(&e), [(1_100 * MS, LnOutcome::Completed)]);
+    assert_eq!(
+        judged(&e),
+        [(
+            1_100 * MS,
+            Judgment::Good,
+            Some(100 * MS),
+            None,
+            Some(1_100 * MS)
+        )]
+    );
 
-    // Pressed exactly at the end (+50 ms, GOOD): completed at the press.
-    // The press itself ends it, right after its judgment and gauges, not
-    // the LN end deadline at the same time.
+    // Pressed exactly at the end (+50 ms, GOOD): decided at the press, by
+    // the press itself, not the LN end deadline at the same time.
     let e = play(&chart, vec![press(1_050 * MS, 0, 2)]);
-    assert_eq!(ln_ends(&e), [(1_050 * MS, LnOutcome::Completed)]);
     assert_eq!(e.tally.counts.good, 1);
     let at_end: Vec<_> = e
         .events
@@ -183,7 +201,15 @@ fn late_head_after_short_ln_end() {
         .filter(|ev| ev.time == TimeUs(1_050 * MS))
         .map(|ev| (ev.kind, ev.origin))
         .collect();
-    assert!(matches!(at_end[0].0, JudgeEventKind::Judged { .. }));
+    assert!(matches!(
+        at_end[0].0,
+        JudgeEventKind::Judged {
+            judgment: Judgment::Good,
+            release: None,
+            ..
+        }
+    ));
+    assert_eq!(at_end[0].1, Some(TimeUs(1_050 * MS)));
     assert!(matches!(
         at_end[1].0,
         JudgeEventKind::Gauge { gauge: 0, .. }
@@ -192,14 +218,14 @@ fn late_head_after_short_ln_end() {
         at_end[2].0,
         JudgeEventKind::Gauge { gauge: 1, .. }
     ));
-    assert!(matches!(at_end[3].0, JudgeEventKind::LnEnd { .. }));
-    assert_eq!(at_end[3].1, Some(TimeUs(1_050 * MS)));
-    assert_eq!(at_end.len(), 4);
+    assert_eq!(at_end.len(), 3);
 }
 
 #[test]
-fn ln_tail_deadline_survives_judged_head() {
-    // Head PERFECT and never released: only the LN end deadline completes it.
+fn ln_held_through_its_end_is_scored_at_the_end() {
+    // Regression for the scoring time: the head PERFECT is held and never
+    // released, so the gauges change once, at the end deadline, not at
+    // the press.
     let chart = ChartBuilder::new(BPM)
         .long(lane(3), TimeUs(1_000 * MS), TimeUs(2_000 * MS))
         .build()
@@ -213,13 +239,17 @@ fn ln_tail_deadline_survives_judged_head() {
             max_combo: 1,
             ex: 2,
             bp: 0,
-            ln_breaks: 0,
             empty_poor: 0,
             normal: 10_000_000,
             survival: 10_000_000,
         }
     );
-    assert_eq!(ln_ends(&e), [(2_000 * MS, LnOutcome::Completed)]);
+    assert_eq!(
+        judged(&e),
+        [(2_000 * MS, Judgment::Perfect, Some(0), None, None)]
+    );
+    assert_eq!(changed_at(&e, 0), [2_000 * MS]);
+    assert_eq!(changed_at(&e, 1), [2_000 * MS]);
 }
 
 #[test]
@@ -253,7 +283,6 @@ fn mine_damages_only_when_held() {
             max_combo: 0,
             ex: 0,
             bp: 1,
-            ln_breaks: 0,
             empty_poor: 0,
             normal: 900_000,
             survival: 8_600_000,
@@ -291,7 +320,6 @@ fn mine_after_unhit_tap_uses_chronological_deadlines() {
             max_combo: 0,
             ex: 0,
             bp: 1,
-            ln_breaks: 0,
             empty_poor: 0,
             normal: 900_000,
             survival: 8_600_000,
@@ -326,7 +354,6 @@ fn empty_poor_full_result() {
             max_combo: 2,
             ex: 4,
             bp: 1,
-            ln_breaks: 0,
             empty_poor: 1,
             normal: 10_000_000,
             survival: 9_566_000,
@@ -338,11 +365,15 @@ fn empty_poor_full_result() {
 }
 
 #[test]
-fn poor_ln_end_and_held_mine_at_one_time() {
-    // At 2180 ms a tap misses (lane 3), a held LN ends (lane 2), and a held
-    // 10-unit mine passes (lane 4). Survival is at 34 % before them: the
-    // POOR takes full damage (34 → 25 %), then the mine its full 5 %
-    // (→ 20 %). A halved mine would leave 22.5 %; the mine first, 24.5 %.
+fn ln_end_tap_miss_and_held_mine_at_one_time() {
+    // Regression for the deadline order: at 2180 ms a held LN ends (lane 2:
+    // its visual hold ends, then it is judged),
+    // a tap misses (lane 3), and a held 10-unit mine passes (lane 4). The
+    // long note is judged first, then the miss, then the mine. 2 notes:
+    // increment 8_000_000. The 66 % mine at 500 ms takes the normal gauge
+    // to its 2 % floor and survival to 34 %; the LN's PERFECT then gives
+    // 8_200_000 and 34.16 %. The POOR takes full survival damage (34.16 →
+    // 25.16 %), then the mine its full 5 % (→ 20.16 %).
     let chart = ChartBuilder::new(BPM)
         .long(lane(2), TimeUs(300 * MS), TimeUs(2_180 * MS))
         .mine(lane(1), TimeUs(500 * MS), 132)
@@ -353,8 +384,8 @@ fn poor_ln_end_and_held_mine_at_one_time() {
     let e = play(
         &chart,
         vec![
-            press(300 * MS, 0, 2), // head PERFECT: 10_000_000 (capped) both
-            press(400 * MS, 0, 1), // mine of 66 %: 3_400_000 both
+            press(300 * MS, 0, 2), // head PERFECT, held: no change
+            press(400 * MS, 0, 1), // mine of 66 %: 200_000, 3_400_000
             release(600 * MS, 0, 1),
             press(2_100 * MS, 0, 4),
         ],
@@ -367,10 +398,9 @@ fn poor_ln_end_and_held_mine_at_one_time() {
             max_combo: 1,
             ex: 2,
             bp: 1,
-            ln_breaks: 0,
             empty_poor: 0,
-            normal: 2_300_000,
-            survival: 2_000_000,
+            normal: 7_100_000,
+            survival: 2_016_000,
         }
     );
     let at: Vec<_> = e
@@ -387,26 +417,36 @@ fn poor_ln_end_and_held_mine_at_one_time() {
     assert_eq!(
         at,
         [
+            JudgeEventKind::LnHoldEnded {
+                lane: lane(2),
+                note: 0,
+            },
+            JudgeEventKind::Judged {
+                lane: lane(2),
+                note: 0,
+                judgment: Judgment::Perfect,
+                deviation: Some(TimeUs(0)),
+                release: None,
+                combo: 1,
+            },
+            g(0, 8_200_000),
+            g(1, 3_416_000),
             JudgeEventKind::Judged {
                 lane: lane(3),
                 note: 0,
-                judgment: rules::Judgment::Poor,
+                judgment: Judgment::Poor,
                 deviation: None,
+                release: None,
                 combo: 0,
             },
-            g(0, 2_800_000),
-            g(1, 2_500_000),
-            JudgeEventKind::LnEnd {
-                lane: lane(2),
-                note: 0,
-                outcome: LnOutcome::Completed,
-            },
+            g(0, 7_600_000),
+            g(1, 2_516_000),
             JudgeEventKind::MineHit {
                 lane: lane(4),
                 note: 0,
             },
-            g(0, 2_300_000),
-            g(1, 2_000_000),
+            g(0, 7_100_000),
+            g(1, 2_016_000),
             JudgeEventKind::SongEnd,
         ]
     );
@@ -467,7 +507,6 @@ fn survival_damage_halves_below_30_percent() {
         max_combo: 0,
         ex: 0,
         bp: 1,
-        ln_breaks: 0,
         empty_poor: 0,
         normal,
         survival,
@@ -506,7 +545,6 @@ fn gauge_rounding_is_floor_in_i128() {
             max_combo: 2,
             ex: 1,
             bp: 1,
-            ln_breaks: 0,
             empty_poor: 0,
             normal: 6_400_049,
             survival: 9_100_000,
@@ -521,8 +559,9 @@ fn gauge_rounding_is_floor_in_i128() {
 }
 
 #[test]
-fn mines_and_ln_heads_in_denominator() {
-    // 3 taps, 2 LNs and 4 mines: 5 judgeable notes, increment 3_200_000.
+fn mines_left_out_and_long_notes_counted_once_in_denominator() {
+    // Preservation: 3 taps, 2 LNs and 4 mines: 5 judgeable notes, one
+    // judgment each, increment 3_200_000.
     let chart = ChartBuilder::new(BPM)
         .tap(lane(1), TimeUs(1_000 * MS))
         .tap(lane(2), TimeUs(2_000 * MS))
@@ -545,7 +584,6 @@ fn mines_and_ln_heads_in_denominator() {
             max_combo: 1,
             ex: 2,
             bp: 4,
-            ln_breaks: 0,
             empty_poor: 0,
             normal: 2_800_000,
             survival: 6_400_000,

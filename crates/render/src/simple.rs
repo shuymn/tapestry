@@ -126,7 +126,11 @@ const NOTE_WHITE: Rgba = [0.95, 0.95, 0.95, 1.0];
 const NOTE_BLUE: Rgba = [0.35, 0.55, 1.0, 1.0];
 const NOTE_SCRATCH: Rgba = [1.0, 0.35, 0.35, 1.0];
 const MINE: Rgba = [0.6, 0.1, 0.1, 1.0];
-const LN_BODY_SHADE: f32 = 0.6;
+/// A long note's body has two parts: active while its head was pressed and
+/// the lane stays held, inactive otherwise (missed head, released, never
+/// pressed), drawn darker.
+const LN_BODY_ACTIVE: f32 = 0.6;
+const LN_BODY_INACTIVE: f32 = 0.3;
 const GAUGE_BG: Rgba = [0.12, 0.12, 0.12, 1.0];
 const GAUGE_FILL: Rgba = [0.2, 0.85, 0.3, 1.0];
 const TEXT: Rgba = [0.9, 0.9, 0.9, 1.0];
@@ -190,11 +194,17 @@ pub struct SimpleSkin {
     lanes: [Vec<Note>; LANE_COUNT],
     bar_lines: Vec<Position>,
     scroll: ScrollMap,
-    /// Heads of long notes judged and held.
+    /// Long notes whose head was held ([`JudgeEventKind::LnHeld`]): their
+    /// press gave the feedback, so their judgment adds only its text.
     held: [Bits; LANE_COUNT],
-    /// Notes finished: judged taps, missed heads, finished long notes and
-    /// mines hit.
+    /// Notes hidden: judged taps and mines hit. A long note is never
+    /// hidden; it is drawn until its end passes the judgment line.
     done: [Bits; LANE_COUNT],
+    /// Per lane, the long note whose body is active: its head was pressed
+    /// (held, or decided at a press before its end) and its visual hold has
+    /// not ended ([`JudgeEventKind::LnHoldEnded`]). Every other body is
+    /// inactive.
+    active: [Option<usize>; LANE_COUNT],
     /// Latest press per lane, for the key beam.
     pressed: [Option<TimeUs>; LANE_COUNT],
     /// Latest hit per lane, for the bomb.
@@ -223,6 +233,7 @@ impl SimpleSkin {
             scroll: ScrollMap::new(120_000_000, &[]).expect("120 BPM is a valid scroll"),
             held: Default::default(),
             done: Default::default(),
+            active: [None; LANE_COUNT],
             pressed: [None; LANE_COUNT],
             hit: [None; LANE_COUNT],
             judgment: None,
@@ -241,6 +252,7 @@ impl SimpleSkin {
         self.scroll = chart.scroll.clone();
         self.held = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
         self.done = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
+        self.active = [None; LANE_COUNT];
         self.pressed = [None; LANE_COUNT];
         self.hit = [None; LANE_COUNT];
         self.judgment = None;
@@ -257,28 +269,51 @@ impl SimpleSkin {
                 note,
                 judgment,
                 deviation,
+                release,
                 ..
             } => {
                 let l = lane.index();
-                let long = matches!(
-                    self.lanes[l].get(note).map(|n| n.kind),
-                    Some(NoteKind::Long { .. })
-                );
-                // A missed head finishes its long note too.
-                if long && judgment != Judgment::Poor {
-                    self.held[l].set(note);
-                } else {
-                    self.done[l].set(note);
-                }
-                if judgment != Judgment::Poor {
-                    self.hit[l] = Some(ev.time);
-                }
-                if deviation.is_some() {
-                    self.pressed[l] = Some(ev.time);
-                }
+                let end = match self.lanes[l].get(note).map(|n| n.kind) {
+                    Some(NoteKind::Long { end, .. }) => Some(end),
+                    Some(NoteKind::Tap | NoteKind::Mine { .. }) | None => None,
+                };
                 self.judgment = Some((judgment, ev.time));
+                let Some(end) = end else {
+                    self.done[l].set(note);
+                    self.feedback(l, judgment, deviation.is_some(), ev.time);
+                    return;
+                };
+                // A long note stays drawn when judged. Held earlier, its
+                // press already gave its feedback; decided at a press
+                // before its end (a BAD head), its body is active while the
+                // lane stays held.
+                if self.held[l].get(note) {
+                    return;
+                }
+                if deviation.is_some() && release.is_none() && ev.time < end {
+                    self.active[l] = Some(note);
+                }
+                self.feedback(l, judgment, deviation.is_some(), ev.time);
             }
-            JudgeEventKind::LnEnd { lane, note, .. } | JudgeEventKind::MineHit { lane, note } => {
+            JudgeEventKind::LnHeld {
+                lane,
+                note,
+                judgment,
+                ..
+            } => {
+                let l = lane.index();
+                self.held[l].set(note);
+                self.active[l] = Some(note);
+                self.judgment = Some((judgment, ev.time));
+                self.feedback(l, judgment, true, ev.time);
+            }
+            JudgeEventKind::LnHoldEnded { lane, note } => {
+                let l = lane.index();
+                if self.active[l] == Some(note) {
+                    self.active[l] = None;
+                }
+            }
+            JudgeEventKind::MineHit { lane, note } => {
                 self.done[lane.index()].set(note);
             }
             JudgeEventKind::EmptyPoor { lane } => {
@@ -289,6 +324,21 @@ impl SimpleSkin {
                 self.pressed[lane.index()] = Some(ev.time);
             }
             JudgeEventKind::Gauge { .. } | JudgeEventKind::SongEnd => {}
+        }
+    }
+
+    /// A judgment's key beam and bomb on lane `l`: the bomb unless it is a
+    /// POOR, the beam when a press made it.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "callers pass a `Lane::index`, below LANE_COUNT"
+    )]
+    fn feedback(&mut self, l: usize, judgment: Judgment, pressed: bool, at: TimeUs) {
+        if judgment != Judgment::Poor {
+            self.hit[l] = Some(at);
+        }
+        if pressed {
+            self.pressed[l] = Some(at);
         }
     }
 
@@ -376,18 +426,23 @@ impl SimpleSkin {
                     NoteKind::Tap => cap(out, x, w, head, NOTE_H, color),
                     NoteKind::Mine { .. } => cap(out, x, w, head, MINE_H, MINE),
                     NoteKind::Long { end_pos, .. } => {
+                        // Judged or not, a long note is drawn until its end
+                        // passes the judgment line, and once its head's time
+                        // has passed the head stays on the line.
+                        if end_pos < scale.at_line {
+                            continue;
+                        }
                         let tail = scale.y(end_pos);
-                        // A held head stays on the judgment line.
+                        let head = head.min(JUDGE_Y);
                         #[expect(
                             clippy::indexing_slicing,
                             reason = "`l` is a `Lane::index`, below LANE_COUNT"
                         )]
-                        let (head, tail) = if self.held[l].get(i) {
-                            (head.min(JUDGE_Y), tail.min(JUDGE_Y))
+                        let body = if self.active[l] == Some(i) {
+                            shade(color, LN_BODY_ACTIVE)
                         } else {
-                            (head, tail)
+                            shade(color, LN_BODY_INACTIVE)
                         };
-                        let body = shade(color, LN_BODY_SHADE);
                         let body_ok = match clip(tail, head) {
                             Some((y0, y1)) => rect(out, Blend::Alpha, x, y0, w, y1 - y0, body),
                             None => true,
@@ -711,7 +766,6 @@ mod tests {
                 combo: 0,
                 max_combo: 0,
                 empty_poor: 0,
-                ln_breaks: 0,
             },
             gauges: Vec::new(),
             complete: false,
@@ -781,55 +835,333 @@ mod tests {
         assert_eq!(in_lane(&above, lane(3), NOTE_WHITE), Vec::<[f32; 4]>::new());
     }
 
-    #[test]
-    fn held_long_note_head_stays_on_the_line() {
-        // An LN from 1 s to 1.3 s, displayed at 1.15 s: the head is 150 ms
-        // past the line (200 px below, y = 1080, out of the lanes), the
-        // tail 150 ms ahead (y = 680).
-        let chart = ChartBuilder::new(BPM)
+    /// A long note's sprites in `lane`: active body, inactive body, caps.
+    fn long_parts(batch: &SpriteBatch, l: Lane) -> [Vec<[f32; 4]>; 3] {
+        let color = note_color(l);
+        [
+            in_lane(batch, l, shade(color, LN_BODY_ACTIVE)),
+            in_lane(batch, l, shade(color, LN_BODY_INACTIVE)),
+            in_lane(batch, l, color),
+        ]
+    }
+
+    fn event(seq: u64, at: i64, origin: Option<i64>, kind: JudgeEventKind) -> JudgeEvent {
+        JudgeEvent {
+            seq,
+            time: TimeUs(at),
+            origin: origin.map(TimeUs),
+            kind,
+        }
+    }
+
+    fn ln_held(at: i64, note: usize) -> JudgeEvent {
+        let kind = JudgeEventKind::LnHeld {
+            lane: lane(2),
+            note,
+            judgment: Judgment::Great,
+            deviation: TimeUs(0),
+        };
+        event(0, at, Some(at), kind)
+    }
+
+    fn ln_hold_ended(at: i64, note: usize) -> JudgeEvent {
+        let kind = JudgeEventKind::LnHoldEnded {
+            lane: lane(2),
+            note,
+        };
+        event(1, at, Some(at), kind)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ln_judged(
+        at: i64,
+        note: usize,
+        judgment: Judgment,
+        deviation: Option<i64>,
+        release: Option<i64>,
+        origin: Option<i64>,
+    ) -> JudgeEvent {
+        let kind = JudgeEventKind::Judged {
+            lane: lane(2),
+            note,
+            judgment,
+            deviation: deviation.map(TimeUs),
+            release: release.map(TimeUs),
+            combo: 1,
+        };
+        event(2, at, origin, kind)
+    }
+
+    /// A long note on key 2 from 1 s to 1.3 s.
+    fn long_note() -> Chart {
+        ChartBuilder::new(BPM)
             .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
             .build()
-            .unwrap();
-        let mut s = skin(&chart);
+            .unwrap()
+    }
+
+    #[test]
+    fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
+        // Displayed at 1.15 s, 800 px per 600 ms: the head 150 ms past the
+        // line is pinned to it (y 880), the tail 150 ms ahead at y 680. The
+        // body from 680 to 880 is active only while its head was pressed
+        // and the lane stays held, whatever the judgment.
+        let chart = long_note();
         let v = view();
-        let body = shade(NOTE_BLUE, LN_BODY_SHADE);
-        let free = build(&mut s, &frame(&v, 1_150 * MS, &[]));
-        assert_eq!(in_lane(&free, lane(2), body), [[320.0, 680.0, 64.0, 280.0]]);
+        let caps = vec![[320.0, 672.0, 64.0, 16.0], [320.0, 872.0, 64.0, 16.0]];
+        let body = vec![[320.0, 680.0, 64.0, 200.0]];
+        let none = Vec::<[f32; 4]>::new();
+        let cases: [(&str, Vec<JudgeEvent>, bool); 6] = [
+            ("never pressed", vec![], false),
+            (
+                "head missed",
+                vec![ln_judged(1_180 * MS, 0, Judgment::Poor, None, None, None)],
+                false,
+            ),
+            ("held", vec![ln_held(1_000 * MS, 0)], true),
+            (
+                "released early",
+                vec![
+                    ln_held(1_000 * MS, 0),
+                    ln_hold_ended(1_100 * MS, 0),
+                    ln_judged(
+                        1_100 * MS,
+                        0,
+                        Judgment::Bad,
+                        Some(0),
+                        Some(-200 * MS),
+                        Some(1_100 * MS),
+                    ),
+                ],
+                false,
+            ),
+            (
+                "a BAD head decided at its press",
+                vec![ln_judged(
+                    850 * MS,
+                    0,
+                    Judgment::Bad,
+                    Some(-150 * MS),
+                    None,
+                    Some(850 * MS),
+                )],
+                true,
+            ),
+            (
+                "a BAD head released",
+                vec![
+                    ln_judged(
+                        850 * MS,
+                        0,
+                        Judgment::Bad,
+                        Some(-150 * MS),
+                        None,
+                        Some(850 * MS),
+                    ),
+                    ln_hold_ended(1_100 * MS, 0),
+                ],
+                false,
+            ),
+        ];
+        for (name, effects, active) in cases {
+            let mut s = skin(&chart);
+            let batch = build(&mut s, &frame(&v, 1_150 * MS, &effects));
+            let expected = if active {
+                [body.clone(), none.clone(), caps.clone()]
+            } else {
+                [none.clone(), body.clone(), caps.clone()]
+            };
+            assert_eq!(long_parts(&batch, lane(2)), expected, "{name}");
+        }
+        // Before its head reaches the line, the head is drawn where it is:
+        // at 0.85 s the head is 150 ms ahead (y 680) and the tail 450 ms
+        // (y 280).
+        let mut s = skin(&chart);
+        let batch = build(&mut s, &frame(&v, 850 * MS, &[]));
         assert_eq!(
-            in_lane(&free, lane(2), NOTE_BLUE),
-            [[320.0, 672.0, 64.0, 16.0]]
+            long_parts(&batch, lane(2)),
+            [
+                none.clone(),
+                vec![[320.0, 280.0, 64.0, 400.0]],
+                vec![[320.0, 272.0, 64.0, 16.0], [320.0, 672.0, 64.0, 16.0]]
+            ]
         );
-        let judged = JudgeEvent {
-            seq: 0,
-            time: TimeUs(1_000 * MS),
-            origin: Some(TimeUs(999 * MS)),
-            kind: JudgeEventKind::Judged {
-                lane: lane(2),
+        // A tap still disappears when judged.
+        let tap = ChartBuilder::new(BPM)
+            .tap(lane(3), TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
+        let mut s = skin(&tap);
+        let judged = event(
+            0,
+            1_000 * MS,
+            Some(1_000 * MS),
+            JudgeEventKind::Judged {
+                lane: lane(3),
                 note: 0,
                 judgment: Judgment::Great,
                 deviation: Some(TimeUs(0)),
+                release: None,
                 combo: 1,
             },
-        };
-        let held = build(&mut s, &frame(&v, 1_150 * MS, &[judged]));
-        assert_eq!(in_lane(&held, lane(2), body), [[320.0, 680.0, 64.0, 200.0]]);
-        assert_eq!(
-            in_lane(&held, lane(2), NOTE_BLUE),
-            [[320.0, 672.0, 64.0, 16.0], [320.0, 872.0, 64.0, 16.0]]
         );
-        let end = JudgeEvent {
-            seq: 1,
-            time: TimeUs(1_300 * MS),
-            origin: None,
-            kind: JudgeEventKind::LnEnd {
-                lane: lane(2),
-                note: 0,
-                outcome: eval::LnOutcome::Completed,
+        let batch = build(&mut s, &frame(&v, 1_000 * MS, &[judged]));
+        assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());
+    }
+
+    #[test]
+    fn a_held_long_notes_judgment_adds_its_text_but_no_second_bomb() {
+        let chart = long_note();
+        let v = view();
+        let mut s = skin(&chart);
+        let bombs = |batch: &SpriteBatch| {
+            batch
+                .additive()
+                .iter()
+                .filter(|s| s.color[..3] == BOMB[..3])
+                .count()
+        };
+        let held = build(&mut s, &frame(&v, 1_000 * MS, &[ln_held(1_000 * MS, 0)]));
+        assert_eq!(bombs(&held), 1);
+        assert_eq!(
+            glyphs(&held, judgment_text(Judgment::Great).1),
+            uvs(b"GREAT")
+        );
+        // Judged by its release 250 ms later: the press's bomb (200 ms) has
+        // faded and no new one starts; the text shows the judgment, and the
+        // note is still drawn, inactive.
+        let judged = ln_judged(
+            1_250 * MS,
+            0,
+            Judgment::Good,
+            Some(0),
+            Some(-50 * MS),
+            Some(1_250 * MS),
+        );
+        let released = ln_hold_ended(1_250 * MS, 0);
+        let batch = build(&mut s, &frame(&v, 1_250 * MS, &[released, judged]));
+        assert_eq!(bombs(&batch), 0);
+        assert_eq!(
+            glyphs(&batch, judgment_text(Judgment::Good).1),
+            uvs(b"GOOD")
+        );
+        let [active, inactive, caps] = long_parts(&batch, lane(2));
+        assert!(active.is_empty());
+        assert_eq!(inactive.len(), 1);
+        assert_eq!(caps.len(), 2);
+    }
+
+    /// The long note's sprites drawn at `now` with `offset`, after `effects`.
+    fn drawn(chart: &Chart, now: i64, offset: i64, effects: &[JudgeEvent]) -> usize {
+        let v = view();
+        let mut s = skin(chart);
+        let f = FrameInput {
+            display_offset: TimeUs(offset),
+            ..frame(&v, now, effects)
+        };
+        long_parts(&build(&mut s, &f), lane(2))
+            .iter()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// The events the evaluator emits up to logic time `to` for key 2
+    /// pressed at `press` and released at `release` (µs), with the custom
+    /// preset and one keyboard source.
+    fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent> {
+        let device = eval::DeviceProfile {
+            sources: vec![eval::SourceProfile {
+                input_offset: TimeUs(0),
+                bindings: vec![eval::Binding {
+                    control: eval::ControlId(2),
+                    lane: lane(2),
+                }],
+                axes: Vec::new(),
+            }],
+        };
+        let preset = rules::custom();
+        let key = |at: i64, value: i32| eval::PhysicalInputEvent {
+            received: TimeUs(at),
+            source: eval::SourceId(0),
+            kind: eval::InputKind::Control {
+                control: eval::ControlId(2),
+                value,
             },
         };
-        let finished = build(&mut s, &frame(&v, 1_150 * MS, &[end]));
-        assert!(in_lane(&finished, lane(2), body).is_empty());
-        assert!(in_lane(&finished, lane(2), NOTE_BLUE).is_empty());
+        let mut ev =
+            eval::Evaluator::new(chart, &preset, &device, &eval::InputStart::default(), 4).unwrap();
+        ev.push_input(key(press, 1)).unwrap();
+        ev.push_input(key(release, 0)).unwrap();
+        let mut out = Vec::new();
+        ev.advance_to(TimeUs(to), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_long_note_turns_inactive_at_its_logic_end_while_its_tail_still_shows() {
+        // The long note from 1 s to 1.3 s, drawn with a display offset of
+        // −100 ms, so its tail is still 100 ms ahead of the line when its
+        // logic end passes. A GOOD-or-better head (on time) and a BAD head
+        // (150 ms early), each released exactly at the end or held through
+        // it (released at 1.5 s, judged by the end deadline): the body is
+        // active at logic 1.29 s, and inactive from the logic end on, with
+        // the tail drawn (at 1.31 s, 90 ms ahead: y 760).
+        let chart = long_note();
+        let v = view();
+        let end = 1_300 * MS;
+        let offset = -100 * MS;
+        let tail = [320.0, 752.0, 64.0, 16.0];
+        for press in [1_000 * MS, 850 * MS] {
+            for release in [end, 1_500 * MS] {
+                for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
+                    let effects = evaluated(&chart, press, release, now);
+                    let mut s = skin(&chart);
+                    let f = FrameInput {
+                        display_offset: TimeUs(offset),
+                        ..frame(&v, now, &effects)
+                    };
+                    let [on, off, caps] = long_parts(&build(&mut s, &f), lane(2));
+                    let case = format!("press {press}, release {release}, at {now}");
+                    assert_eq!(
+                        (on.len(), off.len()),
+                        (usize::from(active), usize::from(!active)),
+                        "{case}"
+                    );
+                    if now == end + 10 * MS {
+                        assert_eq!(caps[0], tail, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_note_is_culled_once_its_tail_passes_below_the_line() {
+        let chart = long_note();
+        let end = 1_300 * MS;
+        // Before the crossing: body and caps; at it, the tail on the line
+        // and no body left: both caps; 1 µs after: nothing, judged or not.
+        assert_eq!(drawn(&chart, end - 1, 0, &[]), 3);
+        assert_eq!(drawn(&chart, end, 0, &[]), 2);
+        assert_eq!(drawn(&chart, end + 1, 0, &[]), 0);
+        let held = [ln_held(1_000 * MS, 0)];
+        assert_eq!(drawn(&chart, end, 0, &held), 2);
+        assert_eq!(drawn(&chart, end + 1, 0, &held), 0);
+        // The display offset moves the crossing: 150 ms later on screen,
+        // so 150 ms earlier on the frame's clock.
+        let offset = 150 * MS;
+        assert_eq!(drawn(&chart, end - offset, offset, &[]), 2);
+        assert_eq!(drawn(&chart, end - offset + 1, offset, &[]), 0);
+        // A STOP of 200 ms at the end holds the tail on the line for it.
+        let stopped = ChartBuilder::new(BPM)
+            .long(lane(2), TimeUs(1_000 * MS), TimeUs(end))
+            .stop(TimeUs(end), TimeUs(200 * MS))
+            .build()
+            .unwrap();
+        assert_eq!(drawn(&stopped, end - 1, 0, &[]), 3);
+        assert_eq!(drawn(&stopped, end + 100 * MS, 0, &[]), 2);
+        assert_eq!(drawn(&stopped, end + 200 * MS, 0, &[]), 2);
+        assert_eq!(drawn(&stopped, end + 200 * MS + 1, 0, &[]), 0);
     }
 
     #[test]
@@ -995,12 +1327,17 @@ mod tests {
             .count();
         assert!(expected > 20);
         assert_eq!(in_lane(&batch, lane(1), NOTE_WHITE).len(), expected);
-        let body = shade(NOTE_BLUE, LN_BODY_SHADE);
+        // The long note's head has passed the line, so it is pinned there:
+        // its body runs from the lane top to the line, under its head cap.
+        let body = shade(NOTE_BLUE, LN_BODY_INACTIVE);
         assert_eq!(
             in_lane(&batch, lane(2), body),
-            [[320.0, LANE_TOP, 64.0, LANE_BOTTOM - LANE_TOP]]
+            [[320.0, LANE_TOP, 64.0, JUDGE_Y - LANE_TOP]]
         );
-        assert!(in_lane(&batch, lane(2), NOTE_BLUE).is_empty());
+        assert_eq!(
+            in_lane(&batch, lane(2), NOTE_BLUE),
+            [[320.0, JUDGE_Y - NOTE_H / 2.0, 64.0, NOTE_H]]
+        );
         assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());
     }
 
@@ -1074,6 +1411,7 @@ mod tests {
                 note: 0,
                 judgment: Judgment::Great,
                 deviation: Some(TimeUs(0)),
+                release: None,
                 combo: 1,
             },
         };

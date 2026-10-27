@@ -20,7 +20,8 @@ pub struct EvalInput {
     /// The controls held when recording opened.
     pub start: InputStart,
     /// For an aborted play, the watermark finalized before the abort;
-    /// evaluation stops there. `None` evaluates the whole chart.
+    /// evaluation stops there, and a long note still held there is not
+    /// judged or counted. `None` evaluates the whole chart.
     pub finalized: Option<TimeUs>,
 }
 
@@ -57,7 +58,7 @@ pub struct GaugeResult {
 pub struct Evaluation {
     /// Every event, as live play emits them.
     pub events: Vec<JudgeEvent>,
-    /// Counts, EX score, BP, combo, empty POORs and LN breaks.
+    /// Counts, EX score, BP, combo and empty POORs.
     pub tally: Tally,
     /// Every gauge, in the preset's order.
     pub gauges: Vec<GaugeResult>,

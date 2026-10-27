@@ -5,7 +5,7 @@ use bms_model::TimeUs;
 
 use crate::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, LateHeadRule, LnBreakRule, LnMode, LnModeRule, LowDamage,
+    Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
     MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode,
     Window,
 };
@@ -42,7 +42,6 @@ pub fn custom() -> RulePreset {
             poor: damage(pct(6)),
         },
         empty_poor: damage(pct(3)),
-        ln_break: damage(pct(6)),
         low_damage: None,
     };
     let survival = GaugeRule {
@@ -59,7 +58,6 @@ pub fn custom() -> RulePreset {
             poor: damage(pct(9)),
         },
         empty_poor: damage(GaugeValue::centi_percent(450)),
-        ln_break: damage(pct(9)),
         low_damage: Some(LowDamage {
             below: pct(30),
             num: 1,
@@ -68,8 +66,8 @@ pub fn custom() -> RulePreset {
     };
     RulePreset {
         id: "custom".to_owned(),
-        version: 2,
-        implementation: Implementation::Standard { version: 1 },
+        version: 3,
+        implementation: Implementation::Standard { version: 2 },
         windows: JudgeWindows {
             perfect: Window::symmetric(20 * MS),
             great: Window::symmetric(45 * MS),
@@ -84,10 +82,10 @@ pub fn custom() -> RulePreset {
             counts_bp: true,
             counted: false,
         },
-        ln_break: LnBreakRule {
-            release_margin: TimeUs(100 * MS),
-            breaks_combo: true,
-            counts_bp: true,
+        ln_end: LnEndWindows {
+            perfect: TimeUs(100 * MS),
+            great: TimeUs(150 * MS),
+            good: TimeUs(200 * MS),
         },
         rank_scale: RankScale {
             rank_milli: [50_000, 75_000, 100_000, 125_000],
@@ -138,7 +136,7 @@ mod tests {
 
     use crate::{
         Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-        Implementation, JudgeWindows, LateHeadRule, LnBreakRule, LnMode, LnModeRule, LowDamage,
+        Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
         MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights,
         TotalMode, Window,
     };
@@ -164,8 +162,8 @@ mod tests {
         let g = |v| GaugeDelta::Fixed(GaugeValue(v));
         let expected = RulePreset {
             id: "custom".to_owned(),
-            version: 2,
-            implementation: Implementation::Standard { version: 1 },
+            version: 3,
+            implementation: Implementation::Standard { version: 2 },
             windows: JudgeWindows {
                 perfect: w(20_000),
                 great: w(45_000),
@@ -180,10 +178,10 @@ mod tests {
                 counts_bp: true,
                 counted: false,
             },
-            ln_break: LnBreakRule {
-                release_margin: TimeUs(100_000),
-                breaks_combo: true,
-                counts_bp: true,
+            ln_end: LnEndWindows {
+                perfect: TimeUs(100_000),
+                great: TimeUs(150_000),
+                good: TimeUs(200_000),
             },
             rank_scale: RankScale {
                 rank_milli: [50_000, 75_000, 100_000, 125_000],
@@ -208,7 +206,6 @@ mod tests {
                         g(-600_000),
                     ),
                     empty_poor: g(-300_000),
-                    ln_break: g(-600_000),
                     low_damage: None,
                 },
                 GaugeRule {
@@ -219,7 +216,6 @@ mod tests {
                     max: GaugeValue(10_000_000),
                     change: pj(g(16_000), g(16_000), g(0), g(-500_000), g(-900_000)),
                     empty_poor: g(-450_000),
-                    ln_break: g(-900_000),
                     low_damage: Some(LowDamage {
                         below: GaugeValue(3_000_000),
                         num: 1,
