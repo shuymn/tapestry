@@ -12,12 +12,16 @@ use crate::{Warning, WarningKind};
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
     note: Note,
+    /// The exact position of the note's head ([`Timed::rank`]).
+    rank: usize,
+    /// The exact position of its end: a long note's end, else `rank`.
+    end_rank: usize,
     /// File order of the object, the tie-breaker (later wins).
     seq: usize,
     line: usize,
 }
 
-/// Long note 2, tap 1, mine 0: the winner at one time and lane.
+/// Long note 2, tap 1, mine 0: the winner at one position and lane.
 const fn priority(kind: NoteKind) -> u8 {
     match kind {
         NoteKind::Long { .. } => 2,
@@ -56,12 +60,15 @@ pub struct Resolved {
 struct Endpoint {
     time: TimeUs,
     pos: Position,
+    rank: usize,
     id: u16,
     seq: usize,
     line: usize,
 }
 
-/// Builds lanes from objects sorted by time.
+/// Builds lanes from objects sorted by position. Identity, conflicts and
+/// pairing are decided on exact positions ([`Timed::rank`]), so objects at
+/// distinct positions that floor to one µs stay distinct.
 pub fn resolve(
     objects: &[Timed],
     lnobj: &BTreeSet<u16>,
@@ -96,7 +103,7 @@ pub fn resolve(
                 let start = last_plain[l]
                     .take()
                     .map(|i| &mut candidates[l][i])
-                    .filter(|c| c.note.time < obj.time);
+                    .filter(|c| c.rank < obj.rank);
                 match start {
                     Some(start) => {
                         start.note.kind = NoteKind::Long {
@@ -104,6 +111,7 @@ pub fn resolve(
                             end_pos: obj.pos,
                             end_sound: None,
                         };
+                        start.end_rank = obj.rank;
                     }
                     None => warn(warnings, WarningKind::UnpairedLongNoteEnd),
                 }
@@ -119,6 +127,8 @@ pub fn resolve(
                         sound,
                         kind: NoteKind::Tap,
                     },
+                    rank: obj.rank,
+                    end_rank: obj.rank,
                     seq: obj.seq,
                     line: obj.line,
                 });
@@ -126,6 +136,7 @@ pub fn resolve(
             ObjectKind::Long(lane, id) => endpoints[lane.index()].push(Endpoint {
                 time: obj.time,
                 pos: obj.pos,
+                rank: obj.rank,
                 id,
                 seq: obj.seq,
                 line: obj.line,
@@ -140,6 +151,8 @@ pub fn resolve(
                             damage: i32::from(id),
                         },
                     },
+                    rank: obj.rank,
+                    end_rank: obj.rank,
                     seq: obj.seq,
                     line: obj.line,
                 });
@@ -155,22 +168,22 @@ pub fn resolve(
     Resolved { lanes, bgm }
 }
 
-/// Pairs one lane's `#LNTYPE 1` endpoints in time order. Endpoints at one
-/// time merge first, keeping the later object in the file, so a duplicated
-/// line does not split a long note.
+/// Pairs one lane's `#LNTYPE 1` endpoints in position order. Endpoints at
+/// one position merge first, keeping the later object in the file, so a
+/// duplicated line does not split a long note.
 fn pair_long_notes(
     mut lane: Vec<Endpoint>,
     out: &mut Vec<Candidate>,
     sounds: &mut Sounds<'_>,
     warnings: &mut Vec<Warning>,
 ) {
-    lane.sort_unstable_by_key(|e| (e.time, e.seq));
+    lane.sort_unstable_by_key(|e| (e.rank, e.seq));
     let mut merged: Vec<Endpoint> = Vec::with_capacity(lane.len());
     for e in lane {
-        if let Some(last) = merged.last_mut().filter(|last| last.time == e.time) {
+        if let Some(last) = merged.last_mut().filter(|last| last.rank == e.rank) {
             warnings.push(Warning {
                 line: Some(last.line),
-                kind: WarningKind::SameTimeNoteDropped,
+                kind: WarningKind::SamePositionNoteDropped,
             });
             *last = e;
         } else {
@@ -196,6 +209,8 @@ fn pair_long_notes(
                     end_sound,
                 },
             },
+            rank: start.rank,
+            end_rank: end.rank,
             seq: start.seq,
             line: start.line,
         });
@@ -208,12 +223,14 @@ fn pair_long_notes(
     }
 }
 
-/// Settles one lane: at one time the highest priority wins, then the later
-/// object in the file; a note at or inside an earlier long note's span is
-/// dropped.
+/// Settles one lane: at one position the highest priority wins, then the
+/// later object in the file; a note at or inside an earlier long note's span
+/// is dropped.
 fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Note> {
-    lane.sort_unstable_by_key(|c| (c.note.time, priority(c.note.kind), c.seq));
+    lane.sort_unstable_by_key(|c| (c.rank, priority(c.note.kind), c.seq));
     let mut kept: Vec<Note> = Vec::with_capacity(lane.len());
+    // The end position of the last note kept.
+    let mut last_end_rank: Option<usize> = None;
     for (i, c) in lane.iter().enumerate() {
         let drop = |warnings: &mut Vec<Warning>, kind| {
             warnings.push(Warning {
@@ -221,15 +238,13 @@ fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Note> {
                 kind,
             });
         };
-        if lane
-            .get(i + 1)
-            .is_some_and(|next| next.note.time == c.note.time)
-        {
-            drop(warnings, WarningKind::SameTimeNoteDropped);
-        } else if kept.last().is_some_and(|prev| c.note.time <= prev.end()) {
+        if lane.get(i + 1).is_some_and(|next| next.rank == c.rank) {
+            drop(warnings, WarningKind::SamePositionNoteDropped);
+        } else if last_end_rank.is_some_and(|end| c.rank <= end) {
             drop(warnings, WarningKind::NoteInsideLongNoteDropped);
         } else {
             kept.push(c.note);
+            last_end_rank = Some(c.end_rank);
         }
     }
     kept
@@ -253,6 +268,7 @@ mod tests {
             kind,
             line: usize::try_from(time).unwrap(),
             seq: 0,
+            rank: usize::try_from(time).unwrap(),
         }
     }
 
@@ -314,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn same_time_notes_keep_long_then_tap_then_later() {
+    fn same_position_notes_keep_long_then_tap_then_later() {
         let (notes, warnings) = run(&[
             // A tap and a long-note start at one time: the long note wins.
             at(10, ObjectKind::Note(K1, 2)),
@@ -334,6 +350,6 @@ mod tests {
         ));
         assert_eq!(notes[1], (30, Some(SoundId(1)), NoteKind::Tap));
         assert_eq!(notes[2], (40, Some(SoundId(0)), NoteKind::Tap));
-        assert_eq!(warnings, vec![WarningKind::SameTimeNoteDropped; 3]);
+        assert_eq!(warnings, vec![WarningKind::SamePositionNoteDropped; 3]);
     }
 }

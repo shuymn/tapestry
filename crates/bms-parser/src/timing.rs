@@ -72,17 +72,22 @@ pub struct Timed {
     pub kind: ObjectKind,
     pub line: usize,
     /// Position of the object in the file, the tie-breaker among objects
-    /// that share a time.
+    /// that share a position.
     pub seq: usize,
+    /// The ordinal of the object's exact position among the chart's
+    /// positions: equal for objects at one position, ordered as positions
+    /// and times are. Identity is decided on it, never on the floored time
+    /// or the quantized position, which may merge distinct positions.
+    pub rank: usize,
 }
 
 /// The chart's objects in time order with the scroll map's parts.
 #[derive(Debug)]
 pub struct Timeline {
     /// Notes, long-note objects, mines and BGM in measure-position order,
-    /// file order within one position. Positions that floor to the same µs
-    /// keep position order; file order travels in [`Timed::seq`]. Timing
-    /// objects are consumed.
+    /// file order within one position. The position travels in
+    /// [`Timed::rank`] and file order in [`Timed::seq`]. Timing objects are
+    /// consumed.
     pub objects: Vec<Timed>,
     /// The scroll rate before time 0, from the `#BPM` header.
     pub initial_rate: i128,
@@ -231,7 +236,9 @@ pub fn compute(
     let mut beat = Spot::start(0);
     let mut time = Time::zero();
     let mut rest = events.as_slice();
+    let mut rank = 0;
     while let Some((spot, _)) = rest.first() {
+        rank += 1;
         let len = rest
             .iter()
             .take_while(|e| e.0.order(spot) == Ordering::Equal)
@@ -334,6 +341,7 @@ pub fn compute(
                             kind: o.kind,
                             line: o.line,
                             seq: i,
+                            rank,
                         });
                     }
                 }

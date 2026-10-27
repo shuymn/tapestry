@@ -188,23 +188,141 @@ fn fixtures() -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// The evaluator-visible projection of every fixture is what loader
-/// version 4 produced before display positions entered the chart model.
+/// The evaluator-visible projection of each fixture, pinned. Display
+/// geometry never changes it; identity on exact positions changes only
+/// `growing`, whose notes sit 0.8 µs apart (see below).
 #[test]
 fn every_fixture_keeps_its_judgment_projection() {
-    let mut h = Sha256::new();
-    let fixtures = fixtures();
-    for (name, bytes) in &fixtures {
-        let dir = tempfile::tempdir().unwrap();
-        let result = load_bms(bytes, dir.path(), &LoadOptions::default());
-        h.update(name.as_bytes());
-        h.update(projection(&result).as_bytes());
-    }
-    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(fixtures.len(), 25);
-    assert_eq!(
-        digest,
-        "37922a6eb2fabb55672e19099ed30c7b6eac8b374f5d189fe42d71089c084e94"
+    let got: Vec<(String, String)> = fixtures()
+        .into_iter()
+        .map(|(name, bytes)| {
+            let dir = tempfile::tempdir().unwrap();
+            let result = load_bms(&bytes, dir.path(), &LoadOptions::default());
+            let digest = Sha256::digest(projection(&result).as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            (name, digest)
+        })
+        .collect();
+    let expected = [
+        (
+            "bpm_stop.bms",
+            "4e5e2428b3d80ab8a6fc1cc1ea7da0227e4080bd6f59f6f55902b4cf175dd1c8",
+        ),
+        (
+            "case_variant.bms",
+            "5cbf4dc33d7ce569561f9cc8d00d665d9d14e3a8cd15a89697915d6358cdbc96",
+        ),
+        (
+            "escape_drive.bms",
+            "18fa27ca0ef8f057157b1b82f7065791caa20003f1fd503ada7245667e4d4cee",
+        ),
+        (
+            "escape_fallback.bms",
+            "102f0f06d65b7b96b43376e0efc3b80d9b2c3ec06cc458ec2129b399bb437dee",
+        ),
+        (
+            "escape_junction.bms",
+            "decc289c2df6aac281754a31b89bd96412c9efaf847a8b3ffd707e709e939b9c",
+        ),
+        (
+            "escape_parent.bms",
+            "18fa27ca0ef8f057157b1b82f7065791caa20003f1fd503ada7245667e4d4cee",
+        ),
+        (
+            "escape_rooted.bms",
+            "18fa27ca0ef8f057157b1b82f7065791caa20003f1fd503ada7245667e4d4cee",
+        ),
+        (
+            "escape_unc.bms",
+            "18fa27ca0ef8f057157b1b82f7065791caa20003f1fd503ada7245667e4d4cee",
+        ),
+        (
+            "fallback.bms",
+            "3e085b4c6c898277778b0b422ebdab0780923d250d9f6a1368e3c8ad313b2475",
+        ),
+        (
+            "limits_measure.bms",
+            "f33415d0511ba6dda75b2072409cda1a79a64695692d5264fafd7e6af1cd4a90",
+        ),
+        (
+            "limits_tiny_bpm.bms",
+            "25f1f9e92b83aadd436d8dd715163acd4169b48f8670787ff3d1943b98c06f6f",
+        ),
+        (
+            "long_notes_lnobj.bms",
+            "df36e6434f2082610f425f5be7fda5677d8fc01e1e6747bf0755a8bfb94521c3",
+        ),
+        (
+            "long_notes_lntype1.bms",
+            "df36e6434f2082610f425f5be7fda5677d8fc01e1e6747bf0755a8bfb94521c3",
+        ),
+        (
+            "mines.bms",
+            "214e44342cbdfc11e18ab8befb21932837ffc6c96513996895cbe267ce4754ab",
+        ),
+        (
+            "random_branches.bms",
+            "d5822813f3d42775b09f9547a713e52987e64634b0cab81eaaa03c5085e48681",
+        ),
+        (
+            "random_nested.bms",
+            "f4bf838f7c6a97c773acee2e94a9f9db948017306ac7715d39ad51c8e538e4f5",
+        ),
+        (
+            "shift_jis_title.bms",
+            "24e193fbca9ab172637044f62d9b750677db7865406b4ab15e73837ca5cd2e15",
+        ),
+        (
+            "unsupported_lnmode.bms",
+            "3989f302a72f1119f48b90987b61b7fae4640e0b523593b29d5e88c85b3acd5b",
+        ),
+        (
+            "unsupported_lntype2.bms",
+            "11b5c0c9d411711797adb3d95e07c231116fbb75ca6c9e3abd822f91ae28b7a1",
+        ),
+        (
+            "unsupported_switch.bms",
+            "fbb98aebd1cfa59e2ca89ba65df7fa3a74a9bfbed73ee9f0ccff7c4def5e9f6a",
+        ),
+        (
+            "mixed",
+            "3df1b2a74949eacae2d9e50175c076678a6985f3eba6a562624c0e83afb33e94",
+        ),
+        (
+            "cycling",
+            "9222e9a5bea6c6ed2791bbd102df1c0d9b124018fd5634539159b38c8ab98e39",
+        ),
+        (
+            "primes",
+            "5bf97bc7cf5155759cc572063a587e63879f4e826a462912195fb02dd8e22381",
+        ),
+        (
+            "long decimals",
+            "d33bbac52272bb60112eb78f5f134fa20efef7f6d5902c534e536c0096a6c185",
+        ),
+        (
+            "growing",
+            "00d4849032bc440e20d8815a3aa8b0b6837ec5879538a51f4ca627e1e38d45b3",
+        ),
+    ];
+    let got: Vec<(&str, &str)> = got.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn notes_closer_than_a_microsecond_all_stay() {
+    // Measures 41-999 of `growing(40, 3)` run near 10^8 BPM, 2.4 µs each,
+    // with notes a third of a measure apart: every one of their 3 × 959
+    // distinct positions, and the note at measure 40, is kept.
+    let loaded = load(&growing(40, 3)).unwrap();
+    assert_eq!(loaded.chart.lanes[1].len(), 1 + 3 * 959);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .all(|w| w.kind != WarningKind::SamePositionNoteDropped)
     );
 }
 
@@ -442,10 +560,9 @@ fn a_stop_that_overflows_the_time_cap_is_refused() {
 /// A heavy load at the cap, timed: the time's denominator reaches 16371
 /// bits first, then each of 480,000 notes (2500 to a measure through
 /// measure 999) adds a segment at a BPM already in it, the path that takes
-/// both greatest common divisors. The notes sit far below 1 µs apart, so
-/// most are dropped as conflicts, each with a warning; that work counts in
-/// the load time too. The time measured here describes this fixture, not
-/// every chart the limits allow.
+/// both greatest common divisors. The notes sit far below 1 µs apart, many
+/// in one µs, but each at its own position, so every one is kept. The time
+/// measured here describes this fixture, not every chart the limits allow.
 #[test]
 #[ignore = "timing run of about 480,000 objects: cargo test --release -p bms-parser --test time -- --ignored --nocapture"]
 fn time_size_cap_worst_case_load_time() {
@@ -457,18 +574,11 @@ fn time_size_cap_worst_case_load_time() {
     let loaded = load(&text).unwrap();
     let elapsed = start.elapsed();
     assert_eq!(loaded.chart.bar_lines.len(), 1000);
-    // Every note was timed: kept in its lane or dropped with a warning.
-    let dropped = loaded
-        .warnings
-        .iter()
-        .filter(|w| w.kind == WarningKind::SameTimeNoteDropped)
-        .count();
-    assert_eq!(loaded.chart.lanes[1].len() + dropped, 1 + 192 * 2500);
-    assert!(dropped > 0);
-    println!(
-        "heavy load: {elapsed:?}, {} notes kept, {dropped} dropped",
-        loaded.chart.lanes[1].len()
-    );
+    // Every note was timed and kept.
+    assert_eq!(loaded.chart.lanes[1].len(), 1 + 192 * 2500);
+    let lane = &loaded.chart.lanes[1];
+    assert!(lane.windows(2).any(|w| w[0].time == w[1].time));
+    println!("heavy load: {elapsed:?}, {} notes kept", lane.len());
 }
 
 /// The heavy load's notes at one BPM, so the time's denominator stays
