@@ -91,8 +91,8 @@ pub struct PlayMeasure {
     pub generation: u64,
     /// Where chart time 0 lies on the clock.
     pub origin: TimeUs,
-    /// What the load time runs from: the process start (0) for the first
-    /// play, the retry's receipt for a retry.
+    /// What the load time runs from: the load's start for the first play,
+    /// the retry's receipt for a retry.
     pub load_from: TimeUs,
     /// Whether the play is a retry.
     pub retry: bool,

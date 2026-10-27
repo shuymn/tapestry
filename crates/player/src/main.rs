@@ -75,7 +75,7 @@ const SCHEDULE_LOG: usize = audio::MAX_PENDING_STARTS;
 
 fn main() -> ExitCode {
     // The clock reads 0 at the start of the process: load times count from
-    // here.
+    // here unless the command sets something up first.
     let clock = QpcClock::start();
     // A usage error is found before anything is opened, and exits 2.
     let command = match args::parse(std::env::args_os().skip(1)) {
@@ -191,6 +191,9 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
         csv.display()
     );
     let capture = presentmon::Capture::start(&exe, &process, &csv, &log)?;
+    // The capture's start waits for PresentMon to settle: the first load
+    // runs from after it.
+    let load_start = bms_model::TimeSource::now(&clock);
     let plays = play::MeasuredPlays::default();
     let kept = Arc::clone(&plays);
     // One play: the run quits once its end screen has shown.
@@ -201,6 +204,7 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
     };
     let ran = play(chart, input, clock, true, move |rig| {
         rig.measured_plays = Some(kept);
+        rig.load_start = load_start;
         rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     });
     let stopped = capture.stop();
@@ -583,6 +587,7 @@ fn rig<'a>(
         seen: Delivered::default(),
         end_lines: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
+        load_start: TimeUs(0),
         pending_retry: None,
         retry_from: None,
         times: LoadTimes::default(),

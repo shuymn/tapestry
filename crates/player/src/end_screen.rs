@@ -10,7 +10,7 @@ use rules::GaugeValue;
 /// Figures").
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadTimes {
-    /// From the start of the process to the first play's first frame.
+    /// From the start of loading to the first play's first frame.
     pub first: Option<Duration>,
     /// From the latest retry's receipt to its play's first frame.
     pub retry: Option<Duration>,
