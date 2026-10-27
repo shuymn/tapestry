@@ -223,7 +223,7 @@ pub fn compute(
             slope: initial_rate,
         }],
         bar_lines: Vec::with_capacity(usize::from(last_measure) + 1),
-        last_measure: 0,
+        last_measure: end.measure,
     };
     // The current measure's length in µs at the current BPM, cleared when
     // either changes.
@@ -247,7 +247,6 @@ pub fn compute(
         let measure = spot.measure;
         let overflow = || LoadError::TimeOverflow { measure };
         let out_of_range = || LoadError::PositionOverflow { measure };
-        timeline.last_measure = measure;
 
         // The fraction of the previous position's measure up to this
         // position. Every measure has a bar line at its start, so a group in
@@ -273,12 +272,23 @@ pub fn compute(
             measure_us = None;
         }
         beat = *spot;
-        let at = to_micros(&time, &cap, measure)?;
+        let (at, remainder) = to_micros(&time, &cap, measure)?;
         // The exact beat count, which BPM changes and STOPs do not move.
-        let beats = &starts[usize::from(measure)]
-            + &spans[usize::from(measure)]
-                * Rational::new(BigInt::from(spot.index), BigInt::from(spot.count));
-        let pos = to_position(&beats).ok_or_else(out_of_range)?;
+        let beats = Beats::at(
+            &starts[usize::from(measure)],
+            &spans[usize::from(measure)],
+            spot,
+        );
+        let (pos, pos_rest) = beats.quantize().ok_or_else(out_of_range)?;
+        // Where a BPM change or a STOP's start at this position happens.
+        let here = Change {
+            at,
+            rest: &remainder,
+            denom: &time.denom,
+            beats: &beats,
+            pos,
+            pos_rest: &pos_rest,
+        };
 
         // A BPM change applies first; channel 08 wins over 03; the later
         // object in the file wins within a channel.
@@ -305,8 +315,7 @@ pub fn compute(
             us_per_beat = int(US_PER_MINUTE) / v;
             measure_us = None;
             scroll_rate = slope(&us_per_beat).ok_or_else(out_of_range)?;
-            let segment =
-                segment(&time, &beats, pos, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
+            let segment = segment(&here, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
             push(&mut timeline.segments, segment);
         }
 
@@ -352,13 +361,20 @@ pub fn compute(
         if units.is_positive() {
             // Flat from the STOP's start, then the current rate again from
             // its end, each anchored on the exact curve.
-            let stop = segment(&time, &beats, pos, &us_per_beat, 0).ok_or_else(out_of_range)?;
+            let stop = segment(&here, &us_per_beat, 0).ok_or_else(out_of_range)?;
             push(&mut timeline.segments, stop);
             let length = units * &us_per_beat / BigInt::from(STOP_UNITS_PER_BEAT);
             time.add(&length, max_bits).map_err(|()| overflow())?;
-            to_micros(&time, &cap, measure)?;
-            let resume =
-                segment(&time, &beats, pos, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
+            let (end, remainder) = to_micros(&time, &cap, measure)?;
+            let change = Change {
+                at: end,
+                rest: &remainder,
+                denom: &time.denom,
+                beats: &beats,
+                pos,
+                pos_rest: &pos_rest,
+            };
+            let resume = segment(&change, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
             push(&mut timeline.segments, resume);
         }
     }
@@ -367,26 +383,48 @@ pub fn compute(
 
 /// Floors the time to microseconds (mathematical floor) after checking the
 /// duration cap, so nothing is sized from a time past it, and the scroll
-/// map's domain, which a raised duration cap may pass.
-fn to_micros(time: &Time, cap: &BigInt, measure: u16) -> Result<TimeUs, LoadError> {
+/// map's domain, which a raised duration cap may pass. Returns the floor and
+/// the remainder over the time's denominator.
+fn to_micros(time: &Time, cap: &BigInt, measure: u16) -> Result<(TimeUs, BigInt), LoadError> {
     let (floor, rest) = time.numer.div_mod_floor(&time.denom);
-    let past = |bound: &BigInt| floor > *bound || (floor == *bound && !rest.is_zero());
-    if past(cap) {
+    if floor > *cap || (floor == *cap && !rest.is_zero()) {
         return Err(LoadError::DurationExceeded { measure });
     }
-    if past(&BigInt::from(DOMAIN)) {
+    // The floor is at most the cap, an `i64`, so this never fails.
+    let floor = i64::try_from(floor).map_err(|_| LoadError::TimeOverflow { measure })?;
+    if floor > DOMAIN || (floor == DOMAIN && !rest.is_zero()) {
         return Err(LoadError::PositionOverflow { measure });
     }
-    // The floor is at most the cap, an `i64`, so this never fails.
-    i64::try_from(floor)
-        .map(TimeUs)
-        .map_err(|_| LoadError::TimeOverflow { measure })
+    Ok((TimeUs(floor), rest))
 }
 
-/// `floor(2^80 × beats)`, or `None` outside `i128`.
-fn to_position(beats: &Rational) -> Option<Position> {
-    let units = (beats.numer() << FRAC_BITS).div_floor(beats.denom());
-    i128::try_from(units).ok().map(Position)
+/// A beat count as a fraction left unreduced: it is only narrowed to a
+/// position or used in an anchor, so no greatest common divisor is worth
+/// taking.
+struct Beats {
+    numer: BigInt,
+    /// Positive.
+    denom: BigInt,
+}
+
+impl Beats {
+    /// `start + span × index / count`.
+    fn at(start: &Rational, span: &Rational, spot: &Spot) -> Self {
+        let count = BigInt::from(spot.count);
+        let numer = start.numer() * span.denom() * &count
+            + span.numer() * BigInt::from(spot.index) * start.denom();
+        Self {
+            numer,
+            denom: start.denom() * span.denom() * count,
+        }
+    }
+
+    /// `floor(2^80 × beats)` and the remainder over `denom`, or `None`
+    /// outside `i128`.
+    fn quantize(&self) -> Option<(Position, BigInt)> {
+        let (units, rest) = (&self.numer << FRAC_BITS).div_mod_floor(&self.denom);
+        Some((Position(i128::try_from(units).ok()?), rest))
+    }
 }
 
 /// The scroll rate in units per µs, floored: `2^80` beats over the µs per
@@ -395,36 +433,50 @@ fn slope(us_per_beat: &Rational) -> Option<i128> {
     i128::try_from((us_per_beat.denom() << FRAC_BITS).div_floor(us_per_beat.numer())).ok()
 }
 
-/// The segment of a change at exact time `time` and beat count `beats`
-/// (display position `pos`), after which the chart scrolls at
-/// `us_per_beat` (`rate` units per µs, 0 for a STOP): it starts at
-/// `ceil(time)`, anchored on the exact curve there. The time was checked
-/// against the domain, so the start fits.
-fn segment(
-    time: &Time,
-    beats: &Rational,
+/// Where a scroll change happens: the exact time `at + rest / denom` and the
+/// beat count `beats`, whose display position is `pos` with `pos_rest` left
+/// over `beats.denom`.
+struct Change<'a> {
+    at: TimeUs,
+    rest: &'a BigInt,
+    denom: &'a BigInt,
+    beats: &'a Beats,
     pos: Position,
-    us_per_beat: &Rational,
-    rate: i128,
-) -> Option<ScrollSegment> {
-    let (floor, rest) = time.numer.div_mod_floor(&time.denom);
-    let (start, anchor) = if rest.is_zero() {
-        (floor, pos)
+    pos_rest: &'a BigInt,
+}
+
+/// The segment of `change`, after which the chart scrolls at `us_per_beat`
+/// (`rate` units per µs, 0 for a STOP): it starts at the first whole µs,
+/// anchored on the exact curve there. The time was checked against the
+/// domain, so the start fits.
+fn segment(change: &Change<'_>, us_per_beat: &Rational, rate: i128) -> Option<ScrollSegment> {
+    let at = change.at.0;
+    let (start, anchor) = if change.rest.is_zero() {
+        (at, change.pos)
     } else if rate == 0 {
-        (floor + 1, pos)
+        (at + 1, change.pos)
     } else {
-        // beats + (ceil(time) - time) / us_per_beat, with the gap
-        // `(denom - rest) / denom` and `us_per_beat = a / b`: one product
-        // of the running time's denominator, never reduced.
-        let gap = &time.denom - &rest;
+        // floor(2^80 × (beats + gap / us_per_beat)) for the gap
+        // `(denom - rest) / denom` to the next µs and `us_per_beat = a / b`,
+        // as the position of the beats plus the floor of the advance, plus
+        // one where their fractions carry: one division by a product of the
+        // running time's denominator.
         let (a, b) = (us_per_beat.numer(), us_per_beat.denom());
-        let (bn, bd) = (beats.numer(), beats.denom());
-        let numer = (bn * &time.denom * a + gap * b * bd) << FRAC_BITS;
-        let units = numer.div_floor(&(bd * &time.denom * a));
-        (floor + 1, Position(i128::try_from(units).ok()?))
+        let bd = &change.beats.denom;
+        let whole = a * change.denom;
+        let gap = change.denom - change.rest;
+        let (advance, advance_rest) = ((gap * b) << FRAC_BITS).div_mod_floor(&whole);
+        let carry = (bd - change.pos_rest) * &whole <= advance_rest * bd;
+        let units = i128::try_from(advance).ok()?;
+        let anchor = change
+            .pos
+            .0
+            .checked_add(units)?
+            .checked_add(i128::from(carry))?;
+        (at + 1, Position(anchor))
     };
     Some(ScrollSegment {
-        start: TimeUs(i64::try_from(start).ok()?),
+        start: TimeUs(start),
         anchor,
         slope: rate,
     })

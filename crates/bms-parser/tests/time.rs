@@ -470,3 +470,46 @@ fn time_size_cap_worst_case_load_time() {
         loaded.chart.lanes[1].len()
     );
 }
+
+/// The heavy load's notes at one BPM, so the time's denominator stays
+/// small: the same events without the cost of a large running time.
+#[test]
+#[ignore = "timing run of about 480,000 objects: cargo test --release -p bms-parser --test time -- --ignored --nocapture"]
+fn small_denominator_load_time() {
+    let mut text = String::from("#BPM 99998385\n#WAV01 a.wav\n#80711:01\n");
+    let line = "01".repeat(2500);
+    for m in 808..=999 {
+        text.push_str(&format!("#{m:03}11:{line}\n"));
+    }
+    let start = Instant::now();
+    let loaded = load(&text).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(loaded.chart.bar_lines.len(), 1000);
+    println!(
+        "small denominator: {elapsed:?}, {} notes kept",
+        loaded.chart.lanes[1].len()
+    );
+}
+
+/// The scroll map's anchors at the cap, timed: the time's denominator
+/// reaches 16371 bits first, then 240,000 BPM changes alternating 150 and
+/// 151 BPM, each with a note, 1.6 ms apart, so every change anchors a
+/// segment on the running time and every note is kept.
+#[test]
+#[ignore = "timing run of about 480,000 objects: cargo test --release -p bms-parser --test time -- --ignored --nocapture"]
+fn anchor_heavy_load_time() {
+    let mut text = growing(807, 0);
+    text.push_str("#BPMZY 150\n#BPMZZ 151\n");
+    let changes = "ZYZZ".repeat(625);
+    let notes = "01".repeat(1250);
+    for m in 808..=999 {
+        text.push_str(&format!("#{m:03}08:{changes}\n#{m:03}11:{notes}\n"));
+    }
+    let start = Instant::now();
+    let loaded = load(&text).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(loaded.chart.lanes[1].len(), 1 + 192 * 1250);
+    let segments = loaded.chart.scroll.segments().len();
+    assert!(segments > 192 * 1250, "{segments}");
+    println!("anchor heavy: {elapsed:?}, {segments} segments");
+}

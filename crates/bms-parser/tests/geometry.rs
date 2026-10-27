@@ -324,3 +324,40 @@ fn notes_in_one_microsecond_keep_their_own_positions() {
     assert_eq!(chart.lanes[1][0].pos, Position(units(&q(3, 1_000_000))));
     assert_eq!(chart.lanes[2][0].pos, Position(units(&q(2, 1_000_000))));
 }
+
+#[test]
+fn every_anchor_lies_on_the_exact_curve_at_its_first_microsecond() {
+    // BPM changes on every seventh of 20 measures, cycling 133, 177 and
+    // 211 BPM: beats that are no whole number of units, and change times
+    // inside microseconds.
+    let bpms = [133, 177, 211];
+    let mut text = String::from("#BPM 120\n#WAV01 a.wav\n");
+    for m in 0..20 {
+        text.push_str(&format!("#{m:03}03:85B1D385B1D385\n"));
+    }
+    text.push_str("#02011:01\n");
+    let chart = load(&text);
+    let mut time = Q::from_integer(BigInt::from(0));
+    let mut fractional = 0;
+    for j in 0..20 * 7 {
+        let beats = q(4 * j, 7);
+        let bpm = bpms[usize::try_from(j % 7 % 3).unwrap()];
+        let per_beat = us_per_beat(&q(bpm, 1));
+        let first = time.ceil();
+        if first != time {
+            fractional += 1;
+        }
+        let anchor = units(&(&beats + (&first - &time) / &per_beat));
+        let start = i64::try_from(first.to_integer()).unwrap();
+        let segment = chart
+            .scroll
+            .segments()
+            .iter()
+            .find(|s| s.start.0 == start)
+            .unwrap();
+        assert_eq!(segment.anchor, Position(anchor), "change {j}");
+        assert_eq!(segment.slope, units(&(q(1, 1) / &per_beat)), "change {j}");
+        time += q(4, 7) * per_beat;
+    }
+    assert!(fractional > 130, "{fractional}");
+}
