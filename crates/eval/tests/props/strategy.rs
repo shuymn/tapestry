@@ -449,42 +449,38 @@ fn distance(raw: u32) -> TimeUs {
     })
 }
 
-/// A rank scale: the usual ones, or anything up to 200 %, 0 included.
+/// A rank scale: the usual ones, or anything up to 200 %.
 fn scale(raw: u32) -> i64 {
     match raw % 3 {
         0 => [50_000, 75_000, 100_000, 125_000][pick(raw / 3, 4)],
         1 => 100_000,
-        _ => below(raw / 3, 200_001),
+        _ => below(raw / 3, 200_000) + 1,
     }
 }
 
-/// A whole-percent rank scale: the usual ones, or anything up to 200 %, 0
-/// included.
+/// A whole-percent rank scale: the usual ones, or anything up to 200 %.
 fn percent(raw: u32) -> u32 {
     let p = match raw % 3 {
         0 => [25, 50, 75, 100, 125][pick(raw / 3, 5)],
         1 => 100,
-        _ => below(raw / 3, 201),
+        _ => below(raw / 3, 200) + 1,
     };
     u32::try_from(p).unwrap()
 }
 
-/// The scale `p`'s window policy gives the rank its header policy reads
-/// from `headers`, in thousandths of a percent, by hand.
-pub fn scale_of(p: &RulePreset, headers: &[JudgmentHeader]) -> i64 {
+/// The factor `p`'s window policy scales edges by for the rank its header
+/// policy reads from `headers`, as `(num, den)`, by hand.
+pub fn scale_of(p: &RulePreset, headers: &[JudgmentHeader]) -> (i64, i64) {
     let rank = p.headers.read(headers).rank;
     match p.window_policy {
-        WindowPolicy::Thousandths(s) => s.scale_milli(rank).unwrap(),
-        WindowPolicy::Scaled(s) => {
-            let percent = match rank {
-                Some(JudgeRank::Rank(r @ 0..=4)) => s.rank_percent[r as usize],
-                Some(JudgeRank::DefExRankMilli(v)) if v > 0 => {
-                    u32::try_from(v * i64::from(s.defexrank_percent) / 100_000).unwrap()
-                }
-                _ => s.absent_percent,
-            };
-            i64::from(percent) * 1_000
-        }
+        WindowPolicy::Thousandths(s) => (s.scale_milli(rank).unwrap(), 100_000),
+        WindowPolicy::Scaled(s) => match rank {
+            Some(JudgeRank::Rank(r @ 0..=4)) => (i64::from(s.rank_percent[r as usize]), 100),
+            Some(JudgeRank::DefExRankMilli(v)) if v > 0 => {
+                (v * i64::from(s.defexrank_percent), 10_000_000)
+            }
+            _ => (i64::from(s.absent_percent), 100),
+        },
     }
 }
 
@@ -544,7 +540,7 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     p.empty_poor.counts_bp = flag(1);
     p.empty_poor.counted = flag(2);
     p.headers = if flag(3) {
-        HeaderPolicy::IntegerRanks
+        HeaderPolicy::DefExRankFirst
     } else {
         HeaderPolicy::Decimals
     };
@@ -1767,8 +1763,8 @@ pub struct HeldThrough {
     pub input: EvalInput,
     /// The press's deviation from the head.
     pub deviation: i64,
-    /// The scale the chart's rank gives, in thousandths of a percent.
-    pub scale: i64,
+    /// The factor the chart's rank scales edges by, as `(num, den)`.
+    pub scale: (i64, i64),
 }
 
 #[derive(Clone, Debug)]
@@ -1814,7 +1810,7 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
     chart.meta.judgment_headers = rank(raw.rank);
     // The scaled BAD window, by hand: floor(edge × scale / 100 %).
     let scale = scale_of(&preset, &chart.meta.judgment_headers);
-    let scaled = |edge: TimeUs| edge.0 * scale / 100_000;
+    let scaled = |edge: TimeUs| edge.0 * scale.0 / scale.1;
     let bad = preset.tables.keys.windows.bad;
     let (early, late) = (scaled(bad.early), scaled(bad.late));
     let deviation = below(raw.deviation, early + late + 1) - early;

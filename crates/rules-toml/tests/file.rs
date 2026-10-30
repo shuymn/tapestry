@@ -87,7 +87,10 @@ fn file_without_a_header_policy_is_refused() {
     let custom = preset_to_toml(&rules::custom());
     let style = preset_to_toml(&rules::beatoraja_style());
     assert!(custom.contains("headers = \"decimals\"\n"), "{custom}");
-    assert!(style.contains("headers = \"integer_ranks\"\n"), "{style}");
+    assert!(
+        style.contains("headers = \"def_ex_rank_first\"\n"),
+        "{style}"
+    );
     // A file from before the judgment-header model has no `headers` key.
     let old = custom.replacen("headers = \"decimals\"\n", "", 1);
     let e = load_preset_toml(&old).unwrap_err();

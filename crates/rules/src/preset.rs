@@ -182,13 +182,20 @@ impl JudgeWindows {
     }
 
     /// Every edge scaled by `scale_milli` with [`scale_edge`]. `None` when
-    /// the scale is negative or an edge leaves `0..=`[`MAX_WINDOW_EDGE`].
+    /// the scale is not positive or an edge leaves
+    /// `0..=`[`MAX_WINDOW_EDGE`].
     #[must_use]
     pub fn scaled(&self, scale_milli: i64) -> Option<Self> {
+        self.scaled_by(i128::from(scale_milli), i128::from(SCALE_FULL_MILLI))
+    }
+
+    /// Every edge scaled by `num / den` with [`scale_edge_by`].
+    #[must_use]
+    pub fn scaled_by(&self, num: i128, den: i128) -> Option<Self> {
         let window = |w: Window| -> Option<Window> {
             Some(Window {
-                early: scale_edge(w.early, scale_milli)?,
-                late: scale_edge(w.late, scale_milli)?,
+                early: scale_edge_by(w.early, num, den)?,
+                late: scale_edge_by(w.late, num, den)?,
             })
         };
         Some(Self {
@@ -207,16 +214,23 @@ impl JudgeWindows {
 pub const MAX_WINDOW_EDGE: TimeUs = TimeUs(DOMAIN);
 
 /// `edge` multiplied by `scale_milli` (thousandths of a percent, see
-/// [`RankScale::scale_milli`]): `floor(edge × scale_milli / 100_000)`,
-/// computed in `i128`, so a fractional µs is dropped and a window never
-/// grows by rounding. A scale of 0 gives a zero-width edge. `None` when the
-/// scale is negative or the result lies outside `0..=`[`MAX_WINDOW_EDGE`].
+/// [`RankScale::scale_milli`]): [`scale_edge_by`] with `scale_milli /
+/// 100_000`.
 #[must_use]
 pub fn scale_edge(edge: TimeUs, scale_milli: i64) -> Option<TimeUs> {
-    if scale_milli < 0 {
+    scale_edge_by(edge, i128::from(scale_milli), i128::from(SCALE_FULL_MILLI))
+}
+
+/// `edge` multiplied by `num / den`: `floor(edge × num / den)`, computed in
+/// `i128`, so a fractional µs is dropped and a window never grows by
+/// rounding. `None` when the factor is not positive, the product does not
+/// fit `i128`, or the result lies outside `0..=`[`MAX_WINDOW_EDGE`].
+#[must_use]
+pub fn scale_edge_by(edge: TimeUs, num: i128, den: i128) -> Option<TimeUs> {
+    if num <= 0 || den <= 0 {
         return None;
     }
-    let v = (i128::from(edge.0) * i128::from(scale_milli)).div_euclid(i128::from(SCALE_FULL_MILLI));
+    let v = i128::from(edge.0).checked_mul(num)?.div_euclid(den);
     let v = i64::try_from(v).ok()?;
     (0..=MAX_WINDOW_EDGE.0).contains(&v).then_some(TimeUs(v))
 }
@@ -255,10 +269,16 @@ impl LnEndWindows {
     /// the note windows take. `None` as for [`JudgeWindows::scaled`].
     #[must_use]
     pub fn scaled(&self, scale_milli: i64) -> Option<Self> {
+        self.scaled_by(i128::from(scale_milli), i128::from(SCALE_FULL_MILLI))
+    }
+
+    /// Every edge scaled by `num / den` with [`scale_edge_by`].
+    #[must_use]
+    pub fn scaled_by(&self, num: i128, den: i128) -> Option<Self> {
         Some(Self {
-            perfect: scale_edge(self.perfect, scale_milli)?,
-            great: scale_edge(self.great, scale_milli)?,
-            good: scale_edge(self.good, scale_milli)?,
+            perfect: scale_edge_by(self.perfect, num, den)?,
+            great: scale_edge_by(self.great, num, den)?,
+            good: scale_edge_by(self.good, num, den)?,
         })
     }
 
@@ -599,13 +619,7 @@ mod tests {
             (TimeUs(33_333), TimeUs(49_999), TimeUs(66_666))
         );
         assert_eq!(ln_end.scaled(100_000), Some(ln_end));
-        // A scale of 0 gives zero-width edges; a negative one is unusable.
-        let zero = ln_end.scaled(0).unwrap();
-        assert_eq!(
-            (zero.perfect, zero.great, zero.good),
-            (TimeUs(0), TimeUs(0), TimeUs(0))
-        );
-        assert_eq!(ln_end.scaled(-1), None);
+        assert_eq!(ln_end.scaled(0), None);
         // A 1 µs edge at 50 % floors to 0.
         let tiny = super::LnEndWindows {
             perfect: TimeUs(1),
@@ -654,8 +668,13 @@ mod tests {
             bad: w,
         };
         assert_eq!(windows.scaled(200_000), None);
-        assert_eq!(windows.scaled(-1), None);
-        assert_eq!(windows.scaled(0).map(|w| w.bad), Some(Window::symmetric(0)));
+        assert_eq!(windows.scaled(0), None);
+        // 0.75 % of 20 ms, as a fraction: 150 µs.
+        assert_eq!(
+            super::scale_edge_by(TimeUs(20_000), 75, 10_000),
+            Some(TimeUs(150))
+        );
+        assert_eq!(super::scale_edge_by(TimeUs(1 << 40), i128::MAX, 1), None);
     }
 
     #[test]

@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scale_of_0_validates() {
+    fn a_scale_not_positive_is_refused() {
         let with_rank_0 = |milli| {
             let mut preset = custom();
             let WindowPolicy::Thousandths(scale) = &mut preset.window_policy else {
@@ -265,19 +265,26 @@ mod tests {
             scale.rank_milli[0] = milli;
             preset.validate()
         };
-        assert_eq!(with_rank_0(0), Ok(()));
-        assert_eq!(
-            with_rank_0(-1),
-            Err(RuleError::OutOfRange {
-                field: "rank_scale"
-            })
-        );
+        assert_eq!(with_rank_0(1), Ok(()));
+        for milli in [0, -1] {
+            assert_eq!(
+                with_rank_0(milli),
+                Err(RuleError::OutOfRange {
+                    field: "rank_scale"
+                })
+            );
+        }
         let mut preset = crate::beatoraja_style();
         let WindowPolicy::Scaled(scale) = &mut preset.window_policy else {
-            panic!("beatoraja-style scales by whole percentages");
+            panic!("beatoraja-style scales by percentages");
         };
         scale.absent_percent = 0;
-        assert_eq!(preset.validate(), Ok(()));
+        assert_eq!(
+            preset.validate(),
+            Err(RuleError::OutOfRange {
+                field: "rank_percent"
+            })
+        );
     }
 
     #[test]

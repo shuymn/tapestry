@@ -70,7 +70,7 @@ impl RulePreset {
         w.empty_poor(empty_poor);
         w.uint(match headers {
             HeaderPolicy::Decimals => 0,
-            HeaderPolicy::IntegerRanks => 1,
+            HeaderPolicy::DefExRankFirst => 1,
         });
         w.window_policy(window_policy);
         w.int(*default_total_milli);
@@ -127,7 +127,7 @@ impl RulePreset {
         let empty_poor = r.empty_poor()?;
         let headers = r.tag("headers", |t| match t {
             0 => Some(HeaderPolicy::Decimals),
-            1 => Some(HeaderPolicy::IntegerRanks),
+            1 => Some(HeaderPolicy::DefExRankFirst),
             _ => None,
         })?;
         let window_policy = r.window_policy()?;
@@ -841,7 +841,7 @@ mod tests {
         p.tables.scratch.empty_poor.behind = TimeUs(160_000);
         p.empty_poor.counts_bp = false;
         p.empty_poor.counted = true;
-        p.headers = crate::HeaderPolicy::IntegerRanks;
+        p.headers = crate::HeaderPolicy::DefExRankFirst;
         p.window_policy = crate::WindowPolicy::Scaled(crate::ScaledRank {
             rank_percent: [25, 50, 75, 100, 125],
             absent_percent: 80,
@@ -858,7 +858,7 @@ mod tests {
     /// 19`) and the empty POOR range (`ahead` 250 ms is zigzag 500000 = `a0
     /// c2 1e`, `behind` 120 ms is zigzag 240000 = `80 d3 0e`); the scratch's
     /// table, custom's but 160 ms behind (`80 c4 13`); the miss rule (0),
-    /// the empty POOR's three flags, the header policy (`IntegerRanks`, 1),
+    /// the empty POOR's three flags, the header policy (`DefExRankFirst`, 1),
     /// the window policy (`Scaled`, 1: five percentages `19 32 4b 64 7d`, 80
     /// `50`, 70 `46`), and the rest in declaration order.
     const PINNED: [u8; 230] = [
@@ -976,7 +976,7 @@ mod tests {
         let style = crate::beatoraja_style();
         assert_eq!(decode(&style.canonical_bytes()), Ok(style));
         let mut p = custom();
-        p.headers = crate::HeaderPolicy::IntegerRanks;
+        p.headers = crate::HeaderPolicy::DefExRankFirst;
         assert_ne!(p.canonical_bytes(), custom().canonical_bytes());
         assert_eq!(decode(&p.canonical_bytes()), Ok(p));
     }

@@ -287,7 +287,7 @@ proptest! {
         let e = evaluate(&p.chart, &p.input, &p.preset)
             .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
         // The head's judgment by the scaled windows, by hand.
-        let scaled = |edge: TimeUs| edge.0 * p.scale / 100_000;
+        let scaled = |edge: TimeUs| edge.0 * p.scale.0 / p.scale.1;
         let expected = p
             .preset
             .tables
@@ -517,8 +517,8 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
     );
     c.hit("headers_decimals", p.headers == HeaderPolicy::Decimals);
     c.hit(
-        "headers_integer_ranks",
-        p.headers == HeaderPolicy::IntegerRanks,
+        "headers_def_ex_rank_first",
+        p.headers == HeaderPolicy::DefExRankFirst,
     );
     let bad = p.tables.keys.windows.bad;
     c.hit("asymmetric_bad", bad.early != bad.late);
@@ -544,7 +544,7 @@ fn count_play(play: &Play, c: &mut Coverage) {
     let declared = &play.chart.meta.judgment_headers;
     c.hit(
         "header_policies_differ",
-        HeaderPolicy::Decimals.read(declared) != HeaderPolicy::IntegerRanks.read(declared),
+        HeaderPolicy::Decimals.read(declared) != HeaderPolicy::DefExRankFirst.read(declared),
     );
     let device = &play.input.device;
     let times: Vec<(TimeUs, SourceId)> = play
@@ -835,7 +835,7 @@ fn generators_reach_the_fragile_spots() {
         ("choices_of_custom", SAMPLES),
         ("choices_of_beatoraja_style", SAMPLES),
         ("headers_decimals", 1),
-        ("headers_integer_ranks", 1),
+        ("headers_def_ex_rank_first", 1),
         ("header_policies_differ", 1),
         ("asymmetric_bad", 1),
         ("scratch_own_table", 1),

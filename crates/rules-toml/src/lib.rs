@@ -114,7 +114,7 @@ struct WindowsFile {
 #[serde(rename_all = "snake_case")]
 enum HeadersFile {
     Decimals,
-    IntegerRanks,
+    DefExRankFirst,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -425,7 +425,7 @@ impl From<PresetFile> for RulePreset {
             },
             headers: match headers {
                 HeadersFile::Decimals => HeaderPolicy::Decimals,
-                HeadersFile::IntegerRanks => HeaderPolicy::IntegerRanks,
+                HeadersFile::DefExRankFirst => HeaderPolicy::DefExRankFirst,
             },
             window_policy: match window_policy {
                 WindowPolicyFile::Thousandths {
@@ -555,7 +555,7 @@ impl From<&RulePreset> for PresetFile {
             },
             headers: match headers {
                 HeaderPolicy::Decimals => HeadersFile::Decimals,
-                HeaderPolicy::IntegerRanks => HeadersFile::IntegerRanks,
+                HeaderPolicy::DefExRankFirst => HeadersFile::DefExRankFirst,
             },
             window_policy: match *window_policy {
                 WindowPolicy::Thousandths(RankScale {

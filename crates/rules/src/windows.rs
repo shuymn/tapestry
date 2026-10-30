@@ -1,7 +1,6 @@
 //! Window preparation: each lane class's table, and the window policy that
-//! derives a chart's windows, LN-end edges, empty POOR ranges and scan
-//! envelopes from the rank the header policy read (design.md "Evaluation
-//! Stages", preparation).
+//! derives a chart's windows and LN-end edges from the rank the header
+//! policy read (design.md "Evaluation Stages", preparation).
 
 use bms_model::{Lane, TimeUs};
 
@@ -121,27 +120,28 @@ pub struct ScaledRank {
 }
 
 impl ScaledRank {
-    /// The scale of `rank` in percent; `None` when it does not fit `i64`.
-    /// A `#DEFEXRANK` not positive takes the absent scale.
+    /// The factor `rank` scales every edge by, as `(num, den)`: a rank's
+    /// percentage over 100, or `#DEFEXRANK n` as `n × defexrank_percent /
+    /// 100` %, applied to each edge as it is, never rounded to a whole
+    /// percent first. A `#DEFEXRANK` not positive takes the absent scale.
     #[must_use]
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn percent(&self, rank: Option<JudgeRank>) -> Option<i64> {
-        let rank_percent = |r: i32| {
-            usize::try_from(r)
+    pub fn factor(&self, rank: Option<JudgeRank>) -> (i128, i128) {
+        let percent = match rank {
+            Some(JudgeRank::Rank(r)) => usize::try_from(r)
                 .ok()
                 .and_then(|r| self.rank_percent.get(r))
                 .copied()
-        };
-        let percent = match rank {
-            Some(JudgeRank::Rank(r)) => rank_percent(r).unwrap_or(self.absent_percent),
-            // `v` is `n` in thousandths: floor(v × p / (100 × 1000)).
+                .unwrap_or(self.absent_percent),
+            // `v` is `n` in thousandths: v × p / (1000 × 100 × 100).
             Some(JudgeRank::DefExRankMilli(v)) if v > 0 => {
-                let p = (i128::from(v) * i128::from(self.defexrank_percent)).div_euclid(100_000);
-                return i64::try_from(p).ok();
+                return (
+                    i128::from(v) * i128::from(self.defexrank_percent),
+                    100 * 100 * 1_000,
+                );
             }
             None | Some(JudgeRank::DefExRankMilli(_)) => self.absent_percent,
         };
-        Some(i64::from(percent))
+        (i128::from(percent), 100)
     }
 }
 
@@ -153,18 +153,17 @@ pub enum WindowPolicy {
     /// of a percent, `#DEFEXRANK n` by `n` %; the empty POOR range is not
     /// scaled.
     Thousandths(RankScale),
-    /// Every window and LN-end edge scaled by a whole percentage from
-    /// [`ScaledRank`], each edge `floor(edge × percent / 100)` in µs; the
-    /// empty POOR range is not scaled.
+    /// Every window and LN-end edge scaled by the factor of
+    /// [`ScaledRank::factor`], each edge `floor(edge × num / den)` in µs;
+    /// the empty POOR range is not scaled.
     Scaled(ScaledRank),
 }
 
 impl WindowPolicy {
     /// Each lane class's table for `rank`. Press resolution looks at a note
     /// inside the class's own BAD window or empty POOR range, each with its
-    /// own bounds (design.md "Evaluation Stages", scan envelopes). A scale
-    /// of 0 gives zero-width windows; scaled edges may tie. `None` when the
-    /// scale is unusable (negative, or not fitting) or a scaled edge passes
+    /// own bounds (design.md "Evaluation Stages"). Scaled edges may tie.
+    /// `None` when the scale is not positive or a scaled edge passes
     /// [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE).
     #[must_use]
     pub fn prepare(
@@ -172,15 +171,18 @@ impl WindowPolicy {
         tables: &PerLaneClass<LaneTable>,
         rank: Option<JudgeRank>,
     ) -> Option<PerLaneClass<LaneTable>> {
-        let milli = match self {
-            Self::Thousandths(scale) => scale.scale_milli(rank)?,
-            Self::Scaled(scale) => scale.percent(rank)?.checked_mul(1_000)?,
+        let (num, den) = match self {
+            Self::Thousandths(scale) => (
+                i128::from(scale.scale_milli(rank)?),
+                i128::from(crate::SCALE_FULL_MILLI),
+            ),
+            Self::Scaled(scale) => scale.factor(rank),
         };
         // The empty POOR range is never scaled.
         let scaled = |t: &LaneTable| -> Option<LaneTable> {
             Some(LaneTable {
-                windows: t.windows.scaled(milli)?,
-                ln_end: t.ln_end.scaled(milli)?,
+                windows: t.windows.scaled_by(num, den)?,
+                ln_end: t.ln_end.scaled_by(num, den)?,
                 empty_poor: t.empty_poor,
             })
         };
@@ -202,30 +204,34 @@ mod tests {
 
     fn scaled() -> ScaledRank {
         let WindowPolicy::Scaled(s) = beatoraja_style().window_policy else {
-            panic!("beatoraja-style scales by whole percentages");
+            panic!("beatoraja-style scales by percentages");
         };
         s
     }
 
     #[test]
-    fn scaled_ranks_are_whole_percentages() {
+    fn defexrank_scales_by_its_own_fraction() {
         let s = scaled();
-        let percent = |rank| s.percent(Some(rank));
-        assert_eq!(percent(JudgeRank::Rank(0)), Some(25));
-        assert_eq!(percent(JudgeRank::Rank(4)), Some(125));
-        assert_eq!(percent(JudgeRank::Rank(5)), Some(75));
-        assert_eq!(percent(JudgeRank::Rank(-1)), Some(75));
-        assert_eq!(s.percent(None), Some(75));
-        // n × 75 / 100, floored: 100 → 75, 101 → 75.75 → 75, 1 → 0.
-        let defex = |n: i64| percent(JudgeRank::DefExRankMilli(n * 1_000));
-        assert_eq!(defex(100), Some(75));
-        assert_eq!(defex(101), Some(75));
-        assert_eq!(defex(102), Some(76));
-        assert_eq!(defex(1), Some(0));
-        // A fraction, as a decimal-reading header policy gives it:
-        // 120.5 × 75 / 100 = 90.375 → 90.
-        assert_eq!(percent(JudgeRank::DefExRankMilli(120_500)), Some(90));
-        assert_eq!(percent(JudgeRank::DefExRankMilli(0)), Some(75));
+        let preset = beatoraja_style();
+        // The keys' PERFECT edge (20 ms) at `rank`.
+        let perfect = |rank| {
+            WindowPolicy::Scaled(s)
+                .prepare(&preset.tables, rank)
+                .map(|t| t.keys.windows.perfect.early)
+        };
+        assert_eq!(perfect(Some(JudgeRank::Rank(0))), Some(TimeUs(5 * MS)));
+        assert_eq!(perfect(Some(JudgeRank::Rank(4))), Some(TimeUs(25 * MS)));
+        assert_eq!(perfect(Some(JudgeRank::Rank(5))), Some(TimeUs(15 * MS)));
+        assert_eq!(perfect(None), Some(TimeUs(15 * MS)));
+        // n × 75 / 100 %, not rounded to a whole percent: 1 → 0.75 %,
+        // 101 → 75.75 %, 120.5 → 90.375 %.
+        let defex = |milli| perfect(Some(JudgeRank::DefExRankMilli(milli)));
+        assert_eq!(defex(1_000), Some(TimeUs(150)));
+        assert_eq!(defex(101_000), Some(TimeUs(15_150)));
+        assert_eq!(defex(120_500), Some(TimeUs(18_075)));
+        // A thousandth: 0.00075 % of 20 ms floors to 0 µs, a tie.
+        assert_eq!(defex(1), Some(TimeUs(0)));
+        assert_eq!(defex(0), Some(TimeUs(15 * MS)));
         // A scale whose edges pass 2^32 µs is unusable.
         let tables = beatoraja_style().tables;
         let policy = WindowPolicy::Scaled(s);

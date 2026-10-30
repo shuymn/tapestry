@@ -97,13 +97,13 @@ fn windows_and_ln_end() -> impl Strategy<Value = (JudgeWindows, LnEndWindows)> {
         })
 }
 
-/// A scale up to 200 %, 0 included.
+/// A scale up to 200 %.
 fn scale() -> impl Strategy<Value = i64> {
-    prop_oneof![0_i64..64, 0_i64..=200_000]
+    prop_oneof![1_i64..64, 1_i64..=200_000]
 }
 
 fn percent() -> impl Strategy<Value = u32> {
-    prop_oneof![0_u32..8, 0_u32..=200]
+    prop_oneof![1_u32..8, 1_u32..=200]
 }
 
 fn window_policy() -> impl Strategy<Value = WindowPolicy> {
@@ -226,7 +226,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
         (
             prop_oneof![
                 Just(HeaderPolicy::Decimals),
-                Just(HeaderPolicy::IntegerRanks)
+                Just(HeaderPolicy::DefExRankFirst)
             ],
             window_policy(),
         ),
@@ -335,7 +335,7 @@ fn generator_reaches_every_variant_and_length_class() {
             p.gauges.len() >= 128,
             p.gauges.iter().any(|g| g.id.len() >= 128),
             p.headers == HeaderPolicy::Decimals,
-            p.headers == HeaderPolicy::IntegerRanks,
+            p.headers == HeaderPolicy::DefExRankFirst,
         ];
         for (count, hit) in counts.iter_mut().zip(reached) {
             *count += usize::from(hit);

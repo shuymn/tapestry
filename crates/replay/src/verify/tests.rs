@@ -205,7 +205,7 @@ fn old_preset_copy_is_refused_even_with_an_override() {
 /// The decoder refuses it at the version byte, before any other field.
 fn encoding_4(bytes: &[u8]) -> Vec<u8> {
     let mut other = rules::custom();
-    other.headers = rules::HeaderPolicy::IntegerRanks;
+    other.headers = rules::HeaderPolicy::DefExRankFirst;
     let tag = bytes
         .iter()
         .zip(other.canonical_bytes())
