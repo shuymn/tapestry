@@ -41,6 +41,23 @@ fn older_preset_file_is_refused_with_the_hint() {
 }
 
 #[test]
+fn file_without_a_header_policy_is_refused() {
+    // Each standard preset names its own policy.
+    let custom = preset_to_toml(&rules::custom());
+    let style = preset_to_toml(&rules::beatoraja_style());
+    assert!(custom.contains("headers = \"decimals\"\n"), "{custom}");
+    assert!(style.contains("headers = \"integer_ranks\"\n"), "{style}");
+    // A file from before the judgment-header model has no `headers` key.
+    let old = custom.replacen("headers = \"decimals\"\n", "", 1);
+    let e = load_preset_toml(&old).unwrap_err();
+    assert!(
+        matches!(&e, PresetError::Parse(m) if m.message().contains("headers")),
+        "{e}"
+    );
+    assert!(e.to_string().contains("older version"), "{e}");
+}
+
+#[test]
 fn the_largest_generated_presets_fit_the_file_limit() {
     let mut p = rules::custom();
     // Ids of 136 characters that TOML escapes, the longest the property

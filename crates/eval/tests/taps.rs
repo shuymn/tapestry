@@ -4,7 +4,7 @@
 
 mod common;
 
-use bms_model::{ChartBuilder, JudgeRank, SoundId, TimeUs};
+use bms_model::{ChartBuilder, SoundId, TimeUs};
 use common::{MS, device, empty_poors, judgments, lane, press, release, run, run_with, set};
 use eval::{AdvanceError, ControlId, Evaluator, InputStart, JudgeEventKind, PushError, SourceId};
 use rules::Judgment::{Bad, Good, Great, Perfect, Poor};
@@ -630,7 +630,7 @@ fn rank_scaled_window_edges_are_inclusive() {
         inputs.push(set(note + d + 1, 0, 1, 0));
     }
     let mut chart = builder.build().unwrap();
-    chart.meta.rank = Some(JudgeRank::Rank(0));
+    chart.meta.judgment_headers = vec![common::rank(0)];
     let (events, _) = run(
         &chart,
         &device(&[0]),

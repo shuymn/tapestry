@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use bms_model::{Chart, Lane, TimeUs};
+use bms_model::{Chart, HeaderValue, JudgmentHeader, JudgmentHeaderName, Lane, TimeUs};
 use eval::{
     Binding, ControlId, DeviceProfile, Evaluator, InputKind, InputStart, JudgeEvent,
     JudgeEventKind, PhysicalInputEvent, SourceId, SourceProfile, Tally,
@@ -10,6 +10,31 @@ use eval::{
 use rules::{Judgment, RulePreset};
 
 pub const MS: i64 = 1_000;
+
+/// The declaration `#RANK n`, an integer token.
+pub fn rank(n: i64) -> JudgmentHeader {
+    JudgmentHeader {
+        name: JudgmentHeaderName::Rank,
+        value: HeaderValue::integer(n),
+    }
+}
+
+/// The declaration `#DEFEXRANK` of `milli` thousandths, written as a
+/// decimal (`120.5`).
+pub fn defexrank_decimal(milli: i64) -> JudgmentHeader {
+    JudgmentHeader {
+        name: JudgmentHeaderName::DefExRank,
+        value: HeaderValue::decimal_milli(milli),
+    }
+}
+
+/// The declaration `#TOTAL` of `milli` thousandths, written as a decimal.
+pub fn total(milli: i64) -> JudgmentHeader {
+    JudgmentHeader {
+        name: JudgmentHeaderName::Total,
+        value: HeaderValue::decimal_milli(milli),
+    }
+}
 
 /// Key lane `n` (1-7); 0 is the scratch.
 pub fn lane(n: u8) -> Lane {

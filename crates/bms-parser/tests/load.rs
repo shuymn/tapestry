@@ -4,7 +4,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use bms_model::{BEAT, JudgeRank, Note, NoteKind, Position, SoundId, TimeUs};
+use bms_model::{
+    BEAT, HeaderValue, JudgmentHeader, JudgmentHeaderName, Note, NoteKind, Position, SoundId,
+    TimeUs,
+};
 use bms_parser::{LOADER_VERSION, Limits, LoadError, LoadOptions, Loaded, WarningKind, load_bms};
 use tempfile::TempDir;
 
@@ -102,8 +105,19 @@ fn bpm_change_and_stop_at_one_position_use_new_bpm() {
     assert_eq!(pos(4_248_614), beats(10));
     assert!(pos(4_248_615) > beats(10));
     assert_eq!(chart.meta.title, "BPM and STOP");
-    assert_eq!(chart.meta.rank, Some(JudgeRank::Rank(2)));
-    assert_eq!(chart.meta.total_milli, Some(250_500));
+    assert_eq!(
+        chart.meta.judgment_headers,
+        [
+            JudgmentHeader {
+                name: JudgmentHeaderName::Rank,
+                value: HeaderValue::integer(2),
+            },
+            JudgmentHeader {
+                name: JudgmentHeaderName::Total,
+                value: HeaderValue::decimal_milli(250_500),
+            },
+        ]
+    );
     assert_eq!(chart.identity.loader_version, LOADER_VERSION);
     assert_eq!(loaded.warnings, vec![]);
 }
@@ -601,12 +615,12 @@ fn long_note_edge_cases() {
 #[test]
 fn resolved_hash_matches_golden() {
     // Computed at authoring time by an independent script encoding the
-    // documented fields of this chart: version 6, the 120 BPM rate
+    // documented fields of this chart: version 7, the 120 BPM rate
     // (floor(2^80 / 500_000) units per µs) before time 0 and as the one
     // segment from 0, one tap at 2 s and 4 beats on key 1 with sound 0, bar
     // lines at 0 and 4 beats, the sound name `a.wav`, an empty title and no
-    // other values.
-    const GOLDEN: &str = "5c221ebe62813986a773f2f521d0be8741f2dfa956be5a5743536fc383352cce";
+    // other values (no judgment-header declarations, no LN mode).
+    const GOLDEN: &str = "8389c3821cf1dda5921d67bbcd21862fab56bbe6d85c3478290d4bb8ea6be3fa";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart
@@ -829,51 +843,5 @@ fn headers_and_channels_stage_1_does_not_use_are_silent() {
             WarningKind::IgnoredChannel("A0".to_owned()),
             WarningKind::IgnoredChannel("17".to_owned()),
         ]
-    );
-}
-
-#[test]
-fn defexrank_below_one_is_ignored_so_rank_stays() {
-    let loaded =
-        load_text("#RANK 3\n#DEFEXRANK 0\n#BPM 120\n#WAV01 click.wav\n#00111:01\n").unwrap();
-    assert_eq!(loaded.chart.meta.rank, Some(JudgeRank::Rank(3)));
-    assert_eq!(
-        loaded.warnings,
-        vec![bms_parser::Warning {
-            line: Some(2),
-            kind: WarningKind::IgnoredValue("#DEFEXRANK")
-        }]
-    );
-    // Fractional below 1, negative and non-numeric values are ignored the
-    // same way, before or after #RANK, and each is warned.
-    let rank = |text: &str| {
-        let loaded =
-            load_text(&format!("{text}\n#BPM 120\n#WAV01 click.wav\n#00111:01\n")).unwrap();
-        let warned = loaded
-            .warnings
-            .iter()
-            .filter(|w| w.kind == WarningKind::IgnoredValue("#DEFEXRANK"))
-            .count();
-        (loaded.chart.meta.rank, warned)
-    };
-    for (text, expected) in [
-        ("#RANK 3\n#DEFEXRANK 0.999", (Some(JudgeRank::Rank(3)), 1)),
-        ("#RANK 3\n#DEFEXRANK -2", (Some(JudgeRank::Rank(3)), 1)),
-        ("#RANK 3\n#DEFEXRANK easy", (Some(JudgeRank::Rank(3)), 1)),
-        ("#DEFEXRANK 0\n#RANK 2", (Some(JudgeRank::Rank(2)), 1)),
-        ("#DEFEXRANK 0", (None, 1)),
-        (
-            "#DEFEXRANK 120\n#DEFEXRANK 0\n#DEFEXRANK 0.5",
-            (Some(JudgeRank::DefExRankMilli(120_000)), 2),
-        ),
-    ] {
-        assert_eq!(rank(text), expected, "{text}");
-    }
-    // 1 and above replace it, as before.
-    let loaded =
-        load_text("#RANK 3\n#DEFEXRANK 1\n#BPM 120\n#WAV01 click.wav\n#00111:01\n").unwrap();
-    assert_eq!(
-        loaded.chart.meta.rank,
-        Some(JudgeRank::DefExRankMilli(1_000))
     );
 }

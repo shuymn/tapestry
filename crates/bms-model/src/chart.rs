@@ -123,13 +123,68 @@ pub struct SoundRef {
     pub path: Option<PathBuf>,
 }
 
-/// The judgment rank a chart declares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JudgeRank {
-    /// `#RANK`, as written.
-    Rank(i32),
-    /// `#DEFEXRANK`, in thousandths of a percent.
-    DefExRankMilli(i64),
+/// A judgment header: `#RANK`, `#DEFEXRANK` or `#TOTAL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JudgmentHeaderName {
+    /// `#RANK`.
+    Rank,
+    /// `#DEFEXRANK`.
+    DefExRank,
+    /// `#TOTAL`.
+    Total,
+}
+
+/// A judgment header's value in canonical form: its lexical class and, for
+/// a number, its exact value in units of `10^-18` ([`HeaderValue::ONE`])
+/// within the decimal bounds of design.md "Chart Time" (`|n| < 10^30`). The
+/// text, its whitespace and its line are not kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeaderValue {
+    /// An integer token, `[+-]?[0-9]+` (`120`, `+3`, `007`).
+    Integer(i128),
+    /// Any other decimal, written with a point or an exponent (`120.0`,
+    /// `120.5`, `1E2`). Its value says whether it has a fractional part.
+    Decimal(i128),
+    /// Text that is not a number within the decimal bounds.
+    NotANumber,
+}
+
+impl HeaderValue {
+    /// The value 1 in the units of [`Integer`](Self::Integer) and
+    /// [`Decimal`](Self::Decimal).
+    pub const ONE: i128 = 1_000_000_000_000_000_000;
+
+    /// The integer token `n`.
+    #[must_use]
+    pub fn integer(n: i64) -> Self {
+        Self::Integer(i128::from(n) * Self::ONE)
+    }
+
+    /// A decimal of `milli` thousandths (`120.5` is
+    /// `decimal_milli(120_500)`).
+    #[must_use]
+    pub fn decimal_milli(milli: i64) -> Self {
+        Self::Decimal(i128::from(milli) * (Self::ONE / 1_000))
+    }
+
+    /// The exact value in units of `10^-18`, or `None` for
+    /// [`NotANumber`](Self::NotANumber).
+    #[must_use]
+    pub const fn number(self) -> Option<i128> {
+        match self {
+            Self::Integer(v) | Self::Decimal(v) => Some(v),
+            Self::NotANumber => None,
+        }
+    }
+}
+
+/// One judgment-header declaration a chart keeps (design.md "Chart Model").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JudgmentHeader {
+    /// Which header.
+    pub name: JudgmentHeaderName,
+    /// Its value in canonical form.
+    pub value: HeaderValue,
 }
 
 /// The long-note judgment mode a chart declares.
@@ -148,10 +203,10 @@ pub enum LnMode {
 pub struct ChartMeta {
     /// `#TITLE`.
     pub title: String,
-    /// `#RANK` or `#DEFEXRANK`, if declared.
-    pub rank: Option<JudgeRank>,
-    /// `#TOTAL` in thousandths, if declared.
-    pub total_milli: Option<i64>,
+    /// The active `#RANK`, `#DEFEXRANK` and `#TOTAL` declarations, those
+    /// left after `#RANDOM`/`#IF` resolution, in file order. Which one
+    /// counts, and what it means, is a preset's header policy.
+    pub judgment_headers: Vec<JudgmentHeader>,
     /// The long-note judgment mode, if declared.
     pub ln_mode: Option<LnMode>,
 }

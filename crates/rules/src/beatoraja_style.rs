@@ -25,6 +25,7 @@
 //! | BAD and POOR break the combo and add to BP | `play/JudgeProperty.java:29`, `BMSPlayer.java:915` |
 //! | Missed once its late BAD edge has passed (timing: see H below) | `play/JudgeManager.java:594-598` |
 //! | `#RANK` 0-3: 25, 50, 75, 100 %; no rank or an unknown `#RANK`: 75 % | `play/JudgeProperty.java:210`, `play/BMSPlayerRule.java:62`; jbms-parser `BMSModel.java:67,71` (default rank 2), `BMSDecoder.java:702-713` |
+//! | Judgment headers ([`HeaderPolicy::IntegerRanks`]): `#RANK` an integer token 0-4, `#DEFEXRANK` an integer token of at least 1, `#TOTAL` any number above 0; a later accepted one replaces an earlier one, and a refused one keeps it | jbms-parser `BMSDecoder.java:702-713`, `:716-727`, `:730-743` |
 //! | Each edge scaled by `edge × rate / 100`, in µs | `play/JudgeProperty.java:234` |
 //! | Empty POOR distances not scaled | `play/JudgeProperty.java:210` (`fixjudge`) |
 //! | `#TOTAL` absent: 260 (see E below) | `play/BMSPlayerRule.java:75-78`, `:85`; jbms-parser `BMSModel.java:75,79` (a chart without `#TOTAL` keeps the bmson total type) |
@@ -92,14 +93,37 @@
 //!   comes first (NORMAL 100 %, combo 1). The time of the POOR, and of a
 //!   survival gauge's failure it causes, differs too.
 //!
+//! # Known differences
+//!
+//! - **Number syntax of judgment headers.** The header policy reads the
+//!   loader's decimal grammar (design.md "Chart Time"), not Java's:
+//!   `Double.parseDouble` also reads `200f`, `0x1p8`, `Infinity` and values
+//!   beyond 12 integer digits, and `Integer.parseInt` non-ASCII digits. Such
+//!   a declaration is not a number here, so `#TOTAL 200` then `#TOTAL 300f`
+//!   keeps 200 here and takes 300 there. `#TOTAL` is also used in
+//!   thousandths rounded down, not as a `double`.
+//! - **Digits past the 18th fractional one.** They are cut off here, so a
+//!   positive value below 10^-18 is 0 and not above 0: `#TOTAL 200` then
+//!   `#TOTAL 1e-19` keeps 200 here, while `Double.parseDouble` keeps the
+//!   second positive and jbms-parser takes it (`BMSDecoder.java:730-743`).
+//! - **Whitespace around a value.** Non-ASCII whitespace (U+00A0, U+3000)
+//!   is trimmed here, so `#RANK 3` then `#RANK` with U+00A0 around `2`
+//!   reads rank 2 here; Java's `trim` removes only characters up to U+0020,
+//!   so `Integer.parseInt` throws and rank 3 stays there
+//!   (`BMSDecoder.java:367-368`, `:702-713`).
+//!
+//! Each of the last two is an example in
+//! `crates/bms-parser/tests/judgment_headers.rs`.
+//!
 //! The CLASS gauges (course play only) are not included.
 
 use bms_model::TimeUs;
 
 use crate::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, MineRule,
-    MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window,
+    HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
+    MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode,
+    Window,
 };
 
 const MS: i64 = 1_000;
@@ -197,6 +221,7 @@ pub fn beatoraja_style() -> RulePreset {
             great: TimeUs(160 * MS),
             good: TimeUs(200 * MS),
         },
+        headers: HeaderPolicy::IntegerRanks,
         rank_scale: RankScale {
             rank_milli: [25_000, 50_000, 75_000, 100_000],
             absent_milli: 75_000,

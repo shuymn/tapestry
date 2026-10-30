@@ -19,7 +19,7 @@
 
 mod common;
 
-use bms_model::{Chart, ChartBuilder, JudgeRank, TimeUs};
+use bms_model::{Chart, ChartBuilder, JudgmentHeader, TimeUs};
 use common::{MS, device, empty_poors, judgments, lane, press, release};
 use eval::{EvalInput, Evaluation, InputStart, JudgeEventKind, PhysicalInputEvent, evaluate};
 use rules::Judgment::{self, Bad, Good, Great, Perfect, Poor};
@@ -42,17 +42,17 @@ const HARD: usize = 3;
 const EX_HARD: usize = 4;
 const HAZARD: usize = 5;
 
-fn with_rank(mut chart: Chart, rank: Option<JudgeRank>) -> Chart {
-    chart.meta.rank = rank;
+fn with_rank(mut chart: Chart, rank: Option<JudgmentHeader>) -> Chart {
+    chart.meta.judgment_headers = rank.into_iter().collect();
     chart
 }
 
 /// Taps on key 1 at `times` (µs), at `#RANK 3`.
 fn taps(times: &[i64]) -> Chart {
-    taps_ranked(times, Some(JudgeRank::Rank(3)))
+    taps_ranked(times, Some(common::rank(3)))
 }
 
-fn taps_ranked(times: &[i64], rank: Option<JudgeRank>) -> Chart {
+fn taps_ranked(times: &[i64], rank: Option<JudgmentHeader>) -> Chart {
     let mut b = ChartBuilder::new(BPM);
     for &t in times {
         b = b.tap(lane(1), TimeUs(t));
@@ -61,7 +61,7 @@ fn taps_ranked(times: &[i64], rank: Option<JudgeRank>) -> Chart {
 }
 
 /// One long note on key 1 from `T` lasting `length`, at `rank`.
-fn long(length: i64, rank: Option<JudgeRank>) -> Chart {
+fn long(length: i64, rank: Option<JudgmentHeader>) -> Chart {
     let chart = ChartBuilder::new(BPM)
         .long(lane(1), TimeUs(T), TimeUs(T + length))
         .build()
@@ -209,7 +209,7 @@ fn an_unpressed_note_is_a_poor_at_its_late_bad_edge() {
 /// 100).
 #[test]
 fn rank_2_scales_every_window_to_75_percent() {
-    let chart = taps_ranked(&[T], Some(JudgeRank::Rank(2)));
+    let chart = taps_ranked(&[T], Some(common::rank(2)));
     for (d, j) in [
         (15 * MS, Perfect),
         (15 * MS + 1, Great),
@@ -233,21 +233,40 @@ fn rank_2_scales_every_window_to_75_percent() {
 /// play/BMSPlayerRule.java:62: both scale by 75 %.
 #[test]
 fn absent_and_unknown_ranks_scale_to_75_percent() {
-    for rank in [None, Some(JudgeRank::Rank(7)), Some(JudgeRank::Rank(-1))] {
+    for rank in [None, Some(common::rank(7)), Some(common::rank(-1))] {
         let chart = taps_ranked(&[T], rank);
         assert_eq!(judge_tap(&chart, 15 * MS), Some(Perfect), "{rank:?}");
         assert_eq!(judge_tap(&chart, 15 * MS + 1), Some(Great), "{rank:?}");
     }
 }
 
+/// Source: jbms-parser BMSDecoder.java:716-727 (`#DEFEXRANK` read with
+/// `Integer.parseInt`, so `120.5` throws and the earlier #RANK stays), then
+/// play/JudgeProperty.java:210 (#RANK 3, rate 100).
+#[test]
+fn rejected_defexrank_keeps_the_earlier_rank() {
+    let mut chart = taps(&[T]);
+    chart
+        .meta
+        .judgment_headers
+        .push(common::defexrank_decimal(120_500));
+    assert_eq!(judge_tap(&chart, 20 * MS), Some(Perfect));
+    assert_eq!(judge_tap(&chart, 20 * MS + 1), Some(Great));
+    assert_eq!(judge_tap(&chart, 280 * MS), Some(Bad));
+    assert_eq!(
+        judged_at(&play(&chart, Vec::new())),
+        vec![(T + MISSED, Poor)]
+    );
+}
+
 /// Source: play/JudgeProperty.java:210 (rates 25 and 50 for #RANK 0 and 1).
 #[test]
 fn ranks_0_and_1_scale_to_25_and_50_percent() {
-    let very_hard = taps_ranked(&[T], Some(JudgeRank::Rank(0)));
+    let very_hard = taps_ranked(&[T], Some(common::rank(0)));
     assert_eq!(judge_tap(&very_hard, 5 * MS), Some(Perfect));
     assert_eq!(judge_tap(&very_hard, 5 * MS + 1), Some(Great));
     assert_eq!(judge_tap(&very_hard, 70 * MS), Some(Bad));
-    let hard = taps_ranked(&[T], Some(JudgeRank::Rank(1)));
+    let hard = taps_ranked(&[T], Some(common::rank(1)));
     assert_eq!(judge_tap(&hard, -10 * MS), Some(Perfect));
     assert_eq!(judge_tap(&hard, -30 * MS - 1), Some(Good));
 }
@@ -256,7 +275,7 @@ fn ranks_0_and_1_scale_to_25_and_50_percent() {
 /// empty POOR distances do not scale with the rank.
 #[test]
 fn empty_poor_distances_do_not_scale() {
-    let chart = taps_ranked(&[T], Some(JudgeRank::Rank(0)));
+    let chart = taps_ranked(&[T], Some(common::rank(0)));
     let e = play(&chart, tap_at(T - 500 * MS + 1));
     assert_eq!(empty_poors(&e.events), 1);
 }
@@ -332,7 +351,7 @@ fn ex_score_combo_and_bp() {
 #[test]
 fn ln_release_edges_are_120_160_and_200_ms_before_the_end() {
     let length = 1_000 * MS;
-    let chart = long(length, Some(JudgeRank::Rank(3)));
+    let chart = long(length, Some(common::rank(3)));
     let end = T + length;
     for (before, j) in [
         (120 * MS, Perfect),
@@ -372,7 +391,7 @@ fn ln_release_edges_scale_with_the_rank() {
 #[test]
 fn ln_takes_the_worse_of_head_and_release() {
     let length = 1_000 * MS;
-    let chart = long(length, Some(JudgeRank::Rank(3)));
+    let chart = long(length, Some(common::rank(3)));
     let end = T + length;
     for (head, before, j) in [
         // A GREAT head, a PERFECT release.
@@ -395,7 +414,7 @@ fn ln_takes_the_worse_of_head_and_release() {
 #[test]
 fn ln_held_through_its_end_keeps_the_head_judgment() {
     let length = 500 * MS;
-    let chart = long(length, Some(JudgeRank::Rank(3)));
+    let chart = long(length, Some(common::rank(3)));
     let e = play(
         &chart,
         vec![press(T + 50 * MS, 0, 1), release(T + 900 * MS, 0, 1)],
@@ -409,7 +428,7 @@ fn ln_held_through_its_end_keeps_the_head_judgment() {
 /// TimeLine.java:143-148).
 #[test]
 fn a_missed_ln_head_is_one_poor() {
-    let chart = long(1_000 * MS, Some(JudgeRank::Rank(3)));
+    let chart = long(1_000 * MS, Some(common::rank(3)));
     let e = play(&chart, Vec::new());
     assert_eq!(judged_at(&e), vec![(T + MISSED, Poor)]);
     assert_eq!(e.tally.bp, 1);
@@ -421,7 +440,7 @@ fn a_missed_ln_head_is_one_poor() {
 /// the gauges decided at the end, a GOOD 15 %.
 fn three_taps() -> Chart {
     let mut chart = taps(&[T, T + 1_000 * MS, T + 2_000 * MS]);
-    chart.meta.total_milli = Some(90_000);
+    chart.meta.judgment_headers.push(common::total(90_000));
     chart
 }
 
@@ -494,7 +513,7 @@ fn normal_floors_at_2_percent() {
 #[test]
 fn survival_increases_per_judgment() {
     let mut chart = taps(&[T, T + 1_000 * MS, T + 2_000 * MS, T + 3_000 * MS]);
-    chart.meta.total_milli = Some(300_000);
+    chart.meta.judgment_headers.push(common::total(300_000));
     // POOR, PERFECT, GREAT, GOOD.
     let e = play(
         &chart,
@@ -539,7 +558,7 @@ fn a_lethal_mine_fails_every_survival_gauge_for_good() {
             .tap(lane(1), TimeUs(T + 2_000 * MS))
             .build()
             .unwrap(),
-        Some(JudgeRank::Rank(3)),
+        Some(common::rank(3)),
     );
     let mut events = vec![press(T - 100 * MS, 0, 1), release(T + 100 * MS, 0, 1)];
     events.extend(taps_at(&[T + 1_000 * MS, T + 2_000 * MS]));
@@ -579,7 +598,7 @@ fn a_held_mine_damages_one_percent_per_unit() {
             .tap(lane(1), TimeUs(T + 1_000 * MS))
             .build()
             .unwrap(),
-        Some(JudgeRank::Rank(3)),
+        Some(common::rank(3)),
     );
     let mut events = vec![press(T - 100 * MS, 0, 1), release(T + 100 * MS, 0, 1)];
     events.extend(tap_at(T + 1_000 * MS));
@@ -603,4 +622,30 @@ fn absent_total_is_260() {
     let chart = taps(&[T, T + 1_000 * MS, T + 2_000 * MS, T + 3_000 * MS]);
     let e = play(&chart, tap_at(T + 100 * MS));
     assert_eq!(e.gauges[NORMAL].history[0].value.0, 5_250_000);
+}
+
+/// Source: jbms-parser BMSDecoder.java:730-743 (`if (total > 0)`, else a
+/// warning and the earlier `#TOTAL` stays). The custom preset reads the same
+/// declarations as loader version 6 did: the later `#TOTAL 0` counts, and a
+/// `#TOTAL` that is not positive leaves its default, 160.
+#[test]
+fn zero_total_after_a_total() {
+    let mut chart = taps(&[T, T + 1_000 * MS, T + 2_000 * MS, T + 3_000 * MS]);
+    chart
+        .meta
+        .judgment_headers
+        .extend([common::total(200_000), common::total(0)]);
+    // 200 % over 4 notes: a PERFECT adds 50 %.
+    let e = play(&chart, tap_at(T));
+    assert_eq!(e.gauges[NORMAL].history[0].value.0, 70 * PCT);
+    // Custom: 160 % over 4 notes adds 40 %.
+    let input = EvalInput {
+        events: tap_at(T),
+        device: device(&[0]),
+        start: InputStart::default(),
+        finalized: None,
+        section: None,
+    };
+    let custom = evaluate(&chart, &input, &rules::custom()).unwrap();
+    assert_eq!(custom.gauges[0].history[0].value.0, 60 * PCT);
 }

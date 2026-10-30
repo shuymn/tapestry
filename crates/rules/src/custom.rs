@@ -5,9 +5,9 @@ use bms_model::TimeUs;
 
 use crate::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
-    MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode,
-    Window,
+    HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
+    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights,
+    TotalMode, Window,
 };
 
 const MS: i64 = 1_000;
@@ -87,6 +87,7 @@ pub fn custom() -> RulePreset {
             great: TimeUs(150 * MS),
             good: TimeUs(200 * MS),
         },
+        headers: HeaderPolicy::Decimals,
         rank_scale: RankScale {
             rank_milli: [50_000, 75_000, 100_000, 125_000],
             absent_milli: 100_000,
@@ -183,6 +184,7 @@ mod tests {
                 great: TimeUs(150_000),
                 good: TimeUs(200_000),
             },
+            headers: crate::HeaderPolicy::Decimals,
             rank_scale: RankScale {
                 rank_milli: [50_000, 75_000, 100_000, 125_000],
                 absent_milli: 100_000,

@@ -200,6 +200,87 @@ fn old_preset_copy_is_refused_even_with_an_override() {
     );
 }
 
+/// `bytes` (a current preset copy) in canonical encoding 4, the layout
+/// before the judgment-header model: without the header policy's tag.
+fn encoding_4(bytes: &[u8]) -> Vec<u8> {
+    let mut other = rules::custom();
+    other.headers = rules::HeaderPolicy::IntegerRanks;
+    let tag = bytes
+        .iter()
+        .zip(other.canonical_bytes())
+        .position(|(&a, b)| a != b)
+        .unwrap();
+    let mut old = bytes.to_vec();
+    old.remove(tag);
+    assert_eq!(old[0], 5, "the current encoding");
+    old[0] = 4;
+    old
+}
+
+/// Verifies as `eval-cli` does: loads the chart, then evaluates the record
+/// under `preset_override` or its own preset.
+fn verify(
+    record: &PlayRecord,
+    dir: &std::path::Path,
+    preset_override: Option<&RulePreset>,
+) -> Result<(), VerifyError> {
+    let chart = load_recorded_chart(record, CHART.as_bytes(), dir)?;
+    evaluate_record(record, &chart, preset_override).map(|_| ())
+}
+
+#[test]
+fn record_before_the_header_model_is_refused_at_its_first_failing_check() {
+    let (dir, record) = played();
+    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
+    // As made before the judgment-header model: the preset copy in encoding
+    // 4, loader version 6 and that loader's resolved-chart hash.
+    let bytes = encoding_4(&record.preset.canonical_bytes);
+    let mut old = with_preset_bytes(record, bytes);
+    old.chart.identity.loader_version = 6;
+    old.chart.identity.resolved_hash[0] ^= 1;
+    // It decodes: the preset hash matches its bytes.
+    let old = decode(&encode(&old), &DecodeLimits::STANDARD).unwrap();
+    // The copy fails to decode before the loader version is compared, on
+    // every path and under any override.
+    let refused = VerifyError::PresetCopy(CanonicalError::UnsupportedVersion(4));
+    let style = rules::beatoraja_style();
+    for preset_override in [None, Some(&rules::custom()), Some(&style)] {
+        assert_eq!(
+            verify(&old, dir.path(), preset_override),
+            Err(refused.clone())
+        );
+        assert_eq!(
+            evaluate_record(&old, &chart, preset_override).map(|_| ()),
+            Err(refused.clone())
+        );
+    }
+    assert_eq!(
+        load_recorded_chart(&old, UNLOADABLE, dir.path()),
+        Err(refused)
+    );
+}
+
+#[test]
+fn refuses_loader_version_6_with_current_fields() {
+    let (dir, record) = played();
+    // The evaluator version and the preset copy are current.
+    let mut old = record;
+    old.chart.identity.loader_version = 6;
+    let refused = VerifyError::UnsupportedLoader(6);
+    let style = rules::beatoraja_style();
+    for preset_override in [None, Some(&rules::custom()), Some(&style)] {
+        assert_eq!(
+            verify(&old, dir.path(), preset_override),
+            Err(refused.clone())
+        );
+    }
+    // Before the load and the resolved-chart hash.
+    assert_eq!(
+        load_recorded_chart(&old, UNLOADABLE, dir.path()),
+        Err(refused)
+    );
+}
+
 #[test]
 fn refuses_another_loader_version() {
     let (dir, record) = played();

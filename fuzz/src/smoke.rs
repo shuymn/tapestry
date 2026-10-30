@@ -154,6 +154,7 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
         &seeds,
         &[
             "custom",
+            "beatoraja_style",
             "long",
             "other_version",
             "non_minimal_varint",
@@ -172,8 +173,8 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
     for (name, bytes) in seeds {
         let result = preset_canonical(&bytes).map(|_| ());
         let expected = match name {
-            "custom" | "long" => Ok(()),
-            "other_version" => Err(CanonicalError::UnsupportedVersion(5)),
+            "custom" | "beatoraja_style" | "long" => Ok(()),
+            "other_version" => Err(CanonicalError::UnsupportedVersion(6)),
             "non_minimal_varint" => Err(CanonicalError::NonMinimalVarint),
             "count_beyond_data" => Err(CanonicalError::CountBeyondData {
                 field: "gauges",
