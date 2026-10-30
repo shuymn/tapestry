@@ -291,7 +291,7 @@ fn other_schema_version_is_rebuilt() {
 }
 
 #[test]
-fn thread_start_hook_runs_on_every_scan_thread() {
+fn thread_start_hook_runs_first_on_the_scan_thread() {
     use std::sync::{Arc, Mutex};
     let fx = Fixture::new();
     fx.write("a.bms", chart_text("Alpha").as_bytes());
@@ -299,26 +299,14 @@ fn thread_start_hook_runs_on_every_scan_thread() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&seen);
     let options = ScanOptions {
-        on_thread_start: Some(Arc::new(move |worker| {
+        on_thread_start: Some(Arc::new(move || {
             let name = std::thread::current().name().map(str::to_owned);
-            record.lock().unwrap().push((worker, name));
+            record.lock().unwrap().push(name);
         })),
     };
     lib.scan(std::slice::from_ref(&fx.root), options)
         .unwrap()
         .finish()
         .unwrap();
-    let mut seen = seen.lock().unwrap().clone();
-    seen.sort_by_key(|(_, name)| name.clone());
-    let workers: Vec<_> = seen.iter().map(|(w, _)| *w).collect();
-    assert_eq!(
-        workers,
-        [
-            library::Worker::Parser(0),
-            library::Worker::Parser(1),
-            library::Worker::Walker,
-            library::Worker::Writer,
-        ]
-    );
-    assert!(seen.iter().all(|(_, name)| name.is_some()));
+    assert_eq!(*seen.lock().unwrap(), [Some("library-scan".to_owned())]);
 }

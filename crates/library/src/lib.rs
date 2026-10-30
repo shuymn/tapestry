@@ -18,16 +18,18 @@
 //! the old file. [`Library::open`] says so in [`Opened::Rebuilt`] for the
 //! caller to log, since this crate never logs.
 //!
-//! The database is in WAL mode. A scan's writer thread owns the one writer
+//! The database is in WAL mode. The scan's one thread owns the writer
 //! connection; [`Library`] holds the reader connection of the thread that
-//! queries it. Both come from the [`Library`], which holds an exclusive OS
-//! lock on `<file name>.lock` beside the database for as long as it or its
-//! scan lives: a second [`Library`] of the file, in this process or
-//! another, is refused, and one scan runs at a time. A rebuild happens in
-//! [`Library::open`] after the lock is taken and before any connection
-//! exists. The lock file is left in place; the database file itself is
-//! never locked, since SQLite locks it. Each stored header value is cut to
-//! [`HEADER_FIELD_BYTES`], so a batch has a fixed bound in bytes.
+//! queries it. Both come from the [`Library`], which resolves the file
+//! (links followed) and holds an exclusive OS lock on `<file name>.lock`
+//! beside it for as long as it or its scan lives: a second [`Library`] of
+//! the file, in this process or another, is refused, and one scan runs at a
+//! time. Hard links are not supported: another hard-linked name selects
+//! another lock. A rebuild happens in [`Library::open`] after the lock is
+//! taken and before any connection exists. The lock file is left in place;
+//! the database file itself is never locked, since SQLite locks it. Each
+//! stored header value is cut to [`HEADER_FIELD_BYTES`], so a batch has a
+//! fixed bound in bytes.
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -40,7 +42,7 @@ mod db;
 mod scan;
 
 use std::fmt;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,10 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rusqlite::Connection;
 
 pub use bms_parser::Header;
-pub use scan::{
-    BATCH, HEADER_FIELD_BYTES, PARSERS, Scan, ScanError, ScanOptions, ScanReport, ThreadStart,
-    Worker,
-};
+pub use scan::{BATCH, HEADER_FIELD_BYTES, Scan, ScanError, ScanOptions, ScanReport, ThreadStart};
 
 /// The schema version this build reads and writes.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -190,7 +189,7 @@ impl Owner {
 }
 
 /// The right to run the one scan of a [`Library`], released when the scan's
-/// writer thread ends, however it ends. It keeps the lock beside the file
+/// thread ends, however it ends. It keeps the lock beside the file
 /// while the scan outlives its library.
 #[derive(Debug)]
 pub(crate) struct ScanLease(Arc<Owner>);
@@ -201,12 +200,34 @@ impl Drop for ScanLease {
     }
 }
 
-/// The library database. It locks `<file name>.lock` beside the file for
-/// as long as it or its scan lives, so a second [`Library`] of the file, in
-/// this process or another and by any name of it, is refused. Every
-/// connection to the file comes from it: its own reader connection, and
-/// the writer connection of its scan. A rebuild in [`open`](Self::open)
-/// therefore never deletes a file under a live connection.
+/// The database file `path` resolves to: the file itself, links followed,
+/// when it exists, or else its resolved folder and its name.
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let name = path
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+            let dir = match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir,
+                _ => Path::new("."),
+            };
+            Ok(fs::canonicalize(dir)?.join(name))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The library database. It resolves its file, links followed, and locks
+/// `<file name>.lock` beside the resolved file for as long as it or its
+/// scan lives, so a second [`Library`] of the file, in this process or
+/// another, by a case alias or through a symbolic link, is refused. Hard
+/// links are not supported: a second name of the file by a hard link
+/// selects another lock. Every connection to the file comes from it, on the
+/// resolved path: its own reader connection, and the writer connection of
+/// its scan. A rebuild in [`open`](Self::open) therefore never deletes a
+/// file under a live connection.
 #[derive(Debug)]
 pub struct Library {
     path: PathBuf,
@@ -228,6 +249,11 @@ impl Library {
     /// SQLite refuses the file; and [`LibraryError::Remove`] when a file of
     /// another version cannot be deleted.
     pub fn open(path: &Path) -> Result<(Self, Opened), LibraryError> {
+        let resolved = resolve(path).map_err(|source| LibraryError::Lock {
+            path: path.to_owned(),
+            source,
+        })?;
+        let path = resolved.as_path();
         let owner = Owner::take(path)?;
         let database = |source| LibraryError::Database {
             path: path.to_owned(),
