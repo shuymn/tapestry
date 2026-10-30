@@ -579,9 +579,9 @@ Analysis runs at 1× and its result is reused at every speed.
   - The stem is what `player.toml` and the shelf look a preset up by, and the file system keeps it unique in `presets\`, so it is the name's one source. A name field would be a second name that could disagree with the file's, and two files could claim one name.
   - Renaming the file renames the preset; records then see another preset, since the ID is part of the hash.
   - A file with an `id` field, as every file from an older version has, is refused as unreadable, not converted.
-- **No passing for a built-in.** A user preset whose stem is a built-in's name is refused, with an error naming the file and the built-in, so no file can pass for a built-in in records. The check is in `rules-toml`'s loader, so `eval-cli --preset` refuses such a file too.
+- **No passing for a built-in.** A user preset whose stem is a built-in's name is refused, with an error naming the file and the built-in, so no file can pass for a built-in in records. The check is in `rules-toml`'s loader, so `eval-cli --preset` refuses such a file too; `--preset` also takes a built-in's name.
 - **`player.toml`'s `preset`** names a built-in or a user preset; its default is `beatoraja-style`. `PlayerSettings` stays `#[serde(default)]`, so a file without `preset` takes the default. Any other value, an older version's file name such as `custom.toml` or `beatoraja-style.toml` among them, is refused with an error naming it and the built-ins; it is not converted (AGENTS.md "No compatibility code before the first release"), and nothing is written.
-- **Creating a user preset, for now.** `eval-cli preset export <built-in> <name>` (for example `eval-cli preset export beatoraja-style my-rules`) writes that built-in as `<name>.toml` in the data root's `presets\`. It refuses a name that is a built-in's and a name whose file exists, and writes nothing then. Creating and editing presets in a game screen is not built yet: it arrives later with an in-game settings screen, whose renderer is not decided (D4).
+- **Creating a user preset, for now.** `eval-cli preset export <built-in> <path>` (for example `eval-cli preset export beatoraja-style my-rules.toml`) writes that built-in to a new TOML file, which the player puts in `presets\`. `eval-cli` is portable and does not locate the data root, so it takes a path. It refuses a path whose file exists and one whose stem is a built-in's name, and writes nothing then. Creating and editing presets in a game screen is not built yet: it arrives later with an in-game settings screen, whose renderer is not decided (D4).
 - **What goes away.** `standard_preset` and the writing of a missing preset file. Nothing writes a preset file at first start or at any other time, except the export command.
 - **Where it lands.** PR7 made beatoraja-style the default. PR16 makes the rename, the built-ins and the user presets, and adds the export command: the export is how a player gets an editable file once the game stops writing them, so it lands in the PR that stops the writing, which is also the first PR with all three built-ins (after PR8) and the stem-named file.
 - **design.md** carries this ("Standard Presets", "User Presets", "The tapestry Preset", "Settings Files", "Tuning Without Restart"), marked not built yet until PR16.
@@ -917,7 +917,7 @@ Each one holds the behavior D5 and D6 state.
 - `rules`: `rules::custom()` becomes `rules::tapestry()` with the ID `tapestry` (custom.rs becomes tapestry.rs, and every caller and test follows), and the list of built-ins by name (D24).
 - `rules-toml`: the file loses `id`; the loader takes the name from the file stem and refuses a built-in's name; the refusal hint for an older file points to the export command.
 - `game`: settings.rs (`preset` is a name, by default `beatoraja-style`), session.rs (a built-in or a user preset; `standard_preset` and the writing of a missing file go), presets.rs (the shelf of the built-ins and the user preset files, which alone are polled), and PR7's preset-naming tests.
-- `eval-cli`: `preset export <built-in> <name>` (D24).
+- `eval-cli`: `preset export <built-in> <path>`, and `--preset` taking a built-in's name (D24).
 - design.md: "Standard Presets", "User Presets", "The tapestry Preset" and "Settings Files" drop their "not built yet", and "Tuning Without Restart" its "For now" box.
 
 **Depends on.** PR8.
@@ -929,7 +929,7 @@ Each one holds the behavior D5 and D6 state.
 - If a user preset's stem is a built-in's name, then loading it shall be refused with an error naming the file and the built-in, in the game and in `eval-cli --preset` (`user_preset_named_like_a_built_in_is_refused`).
 - If `player.toml` names neither a built-in nor an existing user preset, `custom.toml` included, then loading shall be refused with an error naming the value and the built-ins, and nothing shall be written (`unknown_preset_name_is_refused`).
 - If a preset file has an `id` field, then it shall be refused as a file from an older version (`older_preset_file_is_refused_with_the_hint`).
-- When `eval-cli preset export beatoraja-style my-rules` runs, it shall write `presets\my-rules.toml`, which loads as `rules::beatoraja_style()` with the ID `my-rules`, and exit 0 (`export_writes_a_user_preset`).
+- When `eval-cli preset export beatoraja-style my-rules.toml` runs, it shall write `my-rules.toml`, which loads as `rules::beatoraja_style()` with the ID `my-rules`, and exit 0 (`export_writes_a_user_preset`).
 - If the export's name is a built-in's or its file exists, then it shall write nothing and exit 1 (`export_refuses_a_built_in_name_and_an_existing_file`).
 - `changed_user_preset_reloads_within_a_poll`;
 - `failed_reload_keeps_the_previous_preset`;
@@ -1130,7 +1130,7 @@ Each one holds the behavior D5 and D6 state.
    - Choose a chart; play starts within 1-2 s.
    - Play to the end, step through the three presets, retry several times, go back and change charts. Do this with both keyboard and controller.
    - A refused chart shows why, and new charts still appear.
-4. **Preset reload.** Export LR2-style as a user preset (`eval-cli preset export lr2-style my-rules`), choose it, and edit `presets\my-rules.toml` while it is shown; it updates at the next poll.
+4. **Preset reload.** Export LR2-style as a user preset (`eval-cli preset export lr2-style %LOCALAPPDATA%\tapestry\presets\my-rules.toml`), choose it, and edit `presets\my-rules.toml` while it is shown; it updates at the next poll.
 5. **Practice.** Practice a section at 75 % with repeat. After the section is judged the BGM plays on briefly without notes and fades out, the next round starts, and long BGM is already playing at its start.
 6. **eval-cli.** Run it over saved records with two presets, and see a refusal for a record from before a version bump.
 7. **Idle input thread.** It barely wakes on menus, and the play overlay figures are unchanged.

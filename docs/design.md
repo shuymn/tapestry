@@ -459,7 +459,7 @@ A preset the player changes is the player's own: a user preset, a TOML file in `
 
 - **Name:** the file stem. The file has no name field; the loader gives the preset its stem as its preset ID, so the file name is the name's one source and two user presets cannot share a name. Renaming the file renames the preset, and records then see another preset, since the ID is part of the hash.
 - **No passing for a built-in:** a file whose stem is a built-in's name is refused, with an error naming the file and the built-in it conflicts with, so no file can pass for a built-in in records.
-- **Creating one:** `eval-cli preset export <built-in> <name>` writes that built-in as `<name>.toml` in the data root's `presets\`, and refuses a name whose file exists or that is a built-in's. Creating and editing presets in a game screen is not built yet: it arrives with an in-game settings screen, whose renderer is not decided.
+- **Creating one:** `eval-cli preset export <built-in> <path>` writes that built-in to a new TOML file, and refuses a path whose file exists or whose stem is a built-in's name; the player puts the file in `presets\`. `eval-cli` is portable and does not locate the data root, so it takes the path. Its `--preset` takes a built-in's name or a user preset file. Creating and editing presets in a game screen is not built yet: it arrives with an in-game settings screen, whose renderer is not decided.
 
 ### The tapestry Preset
 
