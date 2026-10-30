@@ -15,7 +15,7 @@ Build a BMS player that plays like beatoraja or Lunatic Rave 2. Its biggest dist
 - Fair judgment based on input timestamps, robust enough for play that competes over a single point of score
 - Judgment, gauge, and scoring rules switchable via presets (data)
 - The same input log and the same preset produce the same result on any environment
-- Existing skin assets (LR2 CSV, beatoraja JSON and Lua) usable through adapters
+- Existing skin assets (beatoraja JSON and Lua, then LR2 CSV) usable through importers, and a skin of tapestry's own format that also builds a beatoraja skin
 
 ### Non-goals
 
@@ -81,7 +81,7 @@ This is a game, and the correctness of judgment is merely the foundation for "be
 
 ## Overall Architecture
 
-*Figure: The input thread appends to the input log, and the evaluator on the logic thread, together with the rule preset, evaluates up to the input watermark and emits the judgment event stream. The audio thread, the render thread, and results and replays receive it; rendering goes through the skin adapter.*
+*Figure: The input thread appends to the input log, and the evaluator on the logic thread, together with the rule preset, evaluates up to the input watermark and emits the judgment event stream. The audio thread, the render thread, and results and replays receive it; rendering goes through the skin runtime model.*
 
 | Thread | Role | Must not |
 | --- | --- | --- |
@@ -666,31 +666,37 @@ If a "sound to play" event arrives too late for the current buffer write, the so
 - The presentation mode (vsync on or off, `present_mode`) and the number of frames rendered ahead (`desired_maximum_frame_latency`) are settings. The defaults favor lower latency.
 - Note positions are computed from the time the frame is expected to appear on screen, not the time it is rendered. The expected time is predicted from QPC and the display latency offset, and DXGI frame statistics are used as an aid when valid (the "Time Base (QPC)" section).
 - The logic thread publishes a typed state snapshot (for example `PlayView`) through a triple buffer. The render thread only reads it and never writes.
-- The play screen today is `SimpleSkin`, the one implementation of the skin boundary `render::PlaySkin`: a hard-coded 16:9 layout authored at 1920×1080 and scaled, drawn with one instanced sprite pipeline (alpha and additive blending) over a texture atlas, and text in a 5×7 ASCII bitmap font baked into the atlas at startup. The declarative skin of stage 3 is a second implementation behind the same trait. There is no BGA yet; it returns with stage 3, starting from the stage 0 spike's decoder.
-- Menu screens draw Japanese text with `render::text`: `cosmic-text` lays a string out once into a text block, and `glyphon` rasterizes its glyphs into an atlas and draws them in a pass of their own after the sprite pass (`Renderer::menu_frame`), at the letterboxed layout's scale and on the target's own pixels, clipped to the letterbox. Each screen owns its atlas, freed with the screen: a glyph already in it is not rasterized again by later prepares. The atlas starts at 256×256 and doubles when its glyphs do not fit, and glyphon then rasterizes the glyphs already in it once more; that happens while a menu prepares its text, where allocation is allowed. A screen's text belongs to the renderer it was made for and to one set of fonts: using it with another is a typed error, so after the renderer is replaced the screen makes and prepares its text again. The font is the first present of Yu Gothic UI (`YuGothM.ttc`), Meiryo and MS Gothic in the Windows fonts folder; only that file is read, never a scan of the installed fonts. Text is laid out and prepared only on menus, where allocation is allowed; the play screen keeps the bitmap font and never calls into `render::text`. No screen draws this text yet; song selection is the first. `egui` arrives with the settings screens; until then key config is drawn with the play screen's sprites, and hi-speed, volume and display offset are keys during play.
+- The play screen today is `SimpleSkin`, the one implementation of the skin boundary `render::PlaySkin`: a hard-coded 16:9 layout authored at 1920×1080 and scaled, drawn with one instanced sprite pipeline (alpha and additive blending) over a texture atlas, and text in a 5×7 ASCII bitmap font baked into the atlas at startup. Stage 3 replaces it with the declarative skin behind the same trait (docs/stage3.md). There is no BGA yet; it returns with stage 3, starting from the stage 0 spike's decoder.
+- Menu screens draw Japanese text with `render::text`: `cosmic-text` lays a string out once into a text block, and `glyphon` rasterizes its glyphs into an atlas and draws them in a pass of their own after the sprite pass (`Renderer::menu_frame`), at the letterboxed layout's scale and on the target's own pixels, clipped to the letterbox. Each screen owns its atlas, freed with the screen: a glyph already in it is not rasterized again by later prepares. The atlas starts at 256×256 and doubles when its glyphs do not fit, and glyphon then rasterizes the glyphs already in it once more; that happens while a menu prepares its text, where allocation is allowed. A screen's text belongs to the renderer it was made for and to one set of fonts: using it with another is a typed error, so after the renderer is replaced the screen makes and prepares its text again. The font is the first present of Yu Gothic UI (`YuGothM.ttc`), Meiryo and MS Gothic in the Windows fonts folder; only that file is read, never a scan of the installed fonts. Text is laid out and prepared only on menus, where allocation is allowed; the play screen keeps the bitmap font and never calls into `render::text`. The declarative skin's text (stage 3) is rasterized once in the skin's `prepare`, before the countdown, into the skin's own atlas. No screen draws this text yet; song selection is the first. `egui` arrives with the settings screens; until then key config is drawn with the play screen's sprites, and hi-speed, volume and display offset are keys during play.
 - A tap disappears when it is judged; a long note never does. It is drawn until its end passes below the judgment line on the display timeline, and once its head's time has passed, the head stays on the line and the body shrinks. Its body has two parts that a skin draws as it chooses (it may make the inactive one transparent): active while its head has been pressed (held, or decided at a press before its end, BAD included) until its visual hold ends at the release of its lane or its end on the logic timeline, so a tail still on screen after the logic end (a negative display offset) is drawn inactive; inactive otherwise (head missed, released, never pressed). The state follows the events alone (`LnHeld`, a head's judgment at a press before its end, `LnHoldEnded`), never the judgment's value. `SimpleSkin` draws the inactive body darker.
 - Short effects such as bombs and the judgment display can be missed with the snapshot alone. Sequence-numbered judgment events are also passed to the render thread through a queue, and the render thread receives everything it has not yet processed as effects.
-- Conversion to LR2 IDs or beatoraja property IDs happens only inside each skin's adapter. The game's internal structures are not shaped to fit a skin's ID system.
+- Conversion from LR2 IDs or beatoraja property IDs happens only inside each skin's importer, and to beatoraja's only inside the exporter. The game's internal structures are not shaped to fit a skin's ID system.
+- **Two levels** (stage 3; `SimpleSkin` until then). The player draws from a compiled runtime model. Importers of existing skins and the compiler of the custom format both target it; the runtime model is broader than the custom format, which stays small. Every skin number comes from the play view, never from counting effects, and the logic thread knows nothing about skins.
 - Skin buttons and sliders do not modify state directly; they send commands.
-- **Screen resolution and aspect ratio**: Output resolutions from FHD to 4K are the realistic range. The render resolution is independent of the display: players may run below the native resolution to keep performance stable, and it is scaled to the output. Only 16:9 is supported for now, because skins are authored for it, but layout and skin coordinates are not hard-coded to 16:9: a skin declares its base resolution and aspect ratio, so other ratios such as 21:9 can be added later by skins designed for them.
+- **Screen resolution and aspect ratio**: Output resolutions from FHD to 4K are the realistic range. The render resolution is independent of the display: players may run below the native resolution to keep performance stable, and it is scaled to the output. Skins are authored at 1920×1080 reference pixels. The canvas is 1080 tall and `1080 × aspect` wide, and on screens narrower than 16:9 it is 1920 wide and grows taller; it is scaled uniformly to the target, never stretched. Elements sit in a fixed set of anchored regions (the playfield, the judgment display, edge HUD groups, the screen), so a skin authored at 16:9 adapts to 21:9 and wider without the author doing more than tagging HUD elements. Imported skins are pillarboxed.
+- **The player adjusts the composition**, not only the scale: the position and scale of the playfield, the judgment display and the edge regions, their visibility where the skin allows it, the lane width, and a side inset for very wide screens, in an adjust mode drawn with the play screen's sprites. A home setup is not a cabinet, and players otherwise move their monitor or seat to fit a skin. The judgment line's height is the playfield's position, so the visible time stays the same; lift stays a play setting. Adjustments are device settings, kept per skin and aspect class outside the skin, so skin updates keep them. Imported skins have no regions to adjust.
+- **Scaling quality** is handled at load: frame-aware mipmaps with premultiplied alpha, a nearest filter for pixel art, text rasterized at its final pixel size, and @2x images and nine-slice frames in the custom format.
 
 ### Custom Skin Format
 
 The standard skin does not use a scripting language with GC. It uses a declarative format with no scripts.
 
-- Layout, images, animations, and display conditions are written as data (TOML, etc.).
-- Numbers and conditions are written as small expressions that reference `PlayView` fields (e.g. `combo >= 100`, `gauge.value`). Expressions are type-checked and compiled at load time, and per-frame evaluation does not allocate memory.
-- **Branching by settings**: The skin declares options (display toggles, replacement images, position adjustment values), and depending on the player's choices, parts are included or omitted and images are switched at load time.
-- **Repetition**: Definitions where the same shape repeats, such as the lanes for 7 keys, number digits, and sequentially numbered animation frames, are made with templates and repetition specifications.
+Few people author skins, so the format stays small: every concept an author learns has to pay off for them. The concepts are images (with grid frames and their own timer), elements, regions, expressions, timers, keyframes and options.
+
+- Layout, images, animations, and display conditions are written as data in TOML (`skin.toml`, "tapestry skin"); a file of another format version is refused. Errors point at the line and column.
+- Numbers and conditions are written as small expressions over named state (e.g. `combo >= 100`, `gauge >= 800`, with the gauge in ‰). Expressions are typed integers, booleans and enumerations, range-checked so that no subexpression leaves the 32-bit signed range; there is no floating point. They are compiled at load time, and per-frame evaluation does not allocate memory. They decide visibility, numbers, text, frame index and bar ratio, never geometry or color, which come from keyframes and regions.
+- **Branching by settings**: The skin declares options (toggles and one-of choices, replacement images), folded at load time. Position adjustment is not a skin option: the player adjusts regions the format defines ("Rendering and Skins").
+- **Repetition**: An element marked per-lane repeats over the lanes; number digits, gauge segments and animation frames are covered by widgets and image grids. There are no generic templates.
+- **One source, two skins**: a custom skin also builds a beatoraja skin (a generated `.luaskin` at 1920×1080 using what beatoraja and LR2oraja Endless Dream share), so an author's work reaches both players. The beatoraja skin is a faithful subset: a construct enters the format only with its export rule, what beatoraja cannot express (other aspects, the side inset, mipmaps; each region exports as one offset) degrades and is reported, and the elements the play depends on may read only exportable state, so the export never breaks. An authoring CLI checks, previews (PNGs on any OS) and builds both in one command.
 - When a visual behavior that the declarative format cannot represent becomes necessary, it is first handled by adding expressions or parts. No general-purpose scripting is added.
 
 The main reason beatoraja uses Lua is to do these two things (branching by settings and generating repetition) at load time. Both are load-time processing, so building them into the declarative format removes the need for both scripts and GC. Free-form per-frame computation is limited to what expressions can cover.
 
 ### beatoraja Lua Skins
 
-- Lua is used only inside the adapter for reading beatoraja Lua skins, on the loading thread.
-- Lua is run once with the skin settings, and once the returned definition has been converted into the custom skin's declarative format, the Lua state is discarded. When the settings change, the conversion is redone. Lua does not run during play, so Lua's GC does not affect play.
-- Lua functions that are expected to be called every frame are analyzed and converted into custom skin expressions. Functions that cannot be converted (those with internal state, those that read the clock, etc.) are treated as constants, and a warning is issued at load time.
+- Lua is used only inside the beatoraja importer, on the loading thread.
+- Lua is run once with the skin settings, and once the returned definition has been converted into the runtime model, the Lua state is discarded. When the settings change, the conversion is redone. Lua does not run during play, so Lua's GC does not affect play.
+- Lua functions that are expected to be called every frame are analyzed and converted into expressions, from a finite listed subset (including the boolean-observer timer pattern), and only when the converted form computes what Lua would. A decorative function that cannot be converted (internal state, reading the clock, etc.) is treated as a constant with a warning at load time; one that controls what the play depends on (the notes' drawing, the judgment display, the gauge, combo and score) makes the skin refused instead, since a frozen judgment or score would load and look broken.
 - A tool is provided that tries the conversion on commonly used skins and lists the functions that could not be turned into expressions, and it is used to decide on widening the range of expressions supported.
 
 The render CPU work per frame (not just the average, but also the slowest frames) and the latency from input to judgment are measured and displayed; the presented-frame interval distribution is not built yet ("Latency Figures").
@@ -887,7 +893,7 @@ The built-in result extension re-evaluates a record's input under any preset (`R
 | Feature | Reason | Where it lives |
 | --- | --- | --- |
 | Chart formats | Formats multiply, but all can be converted to the common chart model | Ingestion adapters |
-| Skins | The structure differs greatly per compatibility target | Skin adapters |
+| Skins | The structure differs greatly per compatibility target | Skin importers and exporters around the runtime model |
 | Input devices | Devices differ from one another | Input adapters |
 | Statistics and analysis screens | What people want to see differs from person to person | Result extensions |
 | Integration with streaming and external tools (OBS, Discord, etc.) | Each integration target has a different communication mechanism, and targets increase and change | Extensions that receive screen transition and session events |
@@ -910,7 +916,7 @@ The extension points exist from the first version as named interfaces in code, a
 | Screen transition and session events | None | The event stream, the local event endpoint, and integrations built on them (OBS, Discord, overlays) |
 | Results | Re-evaluation under other presets (the game's core feature, shipped as the built-in result extension) | Other analysis screens |
 | Saving | Local saving of play records and input logs | Sending to IR, export |
-| Skins (through the skin adapter) | The declarative custom skin | LR2 and beatoraja skin adapters |
+| Skins (through the runtime model) | The beatoraja importer, the declarative custom skin and its beatoraja exporter | The LR2 importer |
 
 Settings profiles follow the same rule: the first version ships the standard profile, and the low-latency priority and streaming profiles come later.
 
@@ -936,10 +942,10 @@ Built with the screen transition and session events, as a later variation. A gen
 
 ### Tuning Without Restart
 
-- When preset or skin files change, they are reloaded immediately.
+- When preset files change, they are reloaded immediately; skin files are checked between plays.
 - A reloaded preset is used for play from the next retry on. If the rule changed in the middle of play, the play could no longer be reproduced with a single preset.
 - Re-evaluation on the result screen may use the reloaded preset immediately. Combined with `eval-cli`, the cycle of writing a preset, recomputing with local input logs, comparing the results, and fixing it runs without a restart.
-- Skin reloading is done on a separate thread, and the fully assembled result is swapped in between plays. This is so that render work during play does not allocate memory.
+- Skin reloading is done on a separate thread, and the fully assembled result is swapped in between plays. This is so that render work during play does not allocate memory. A failed reload keeps the current skin, and skin files are not polled during play.
 
 > **For now: the preset reloads at the next retry**
 >
@@ -949,8 +955,8 @@ Built with the screen transition and session events, as a later variation. A gen
 
 | Scope | Owner | Examples |
 | --- | --- | --- |
-| Device | This PC and this device | The three offsets, debounce, polling, audio device, buffer; with their variations, the OBS connection target (the password is kept in the OS credential store) and whether the local event endpoint is enabled |
-| Player | The person playing | Hi-speed, lane cover, the presets and skins used, the preferred LN judgment mode, session policy |
+| Device | This PC and this device | The three offsets, debounce, polling, audio device, buffer, the skin layout adjustments (per skin and aspect class, since they depend on the monitor and the seat); with their variations, the OBS connection target (the password is kept in the OS credential store) and whether the local event endpoint is enabled |
+| Player | The person playing | Hi-speed, lane cover, the scratch side, the presets and skins used, the preferred LN judgment mode, session policy |
 | Preset | The person who authors rules | Judgment windows, gauge, `#RANK` conversion |
 | Chart | The chart author | `#RANK`, `#TOTAL`, specification of the LN judgment mode (it takes precedence over the player's choice) |
 
@@ -960,9 +966,9 @@ Results and replays display and record where the values used came from ("preset 
 
 ### Settings Files
 
-- Settings are TOML in two files: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor, and the library roots under `[library] roots`, since they are per PC) and `player.toml` (hi-speed, the preset file, by default `beatoraja-style.toml`, and the displayed gauge). A `player.toml` without a `preset` keeps the default; one that names a preset keeps that choice. Files are written atomically: to a temporary file, then renamed.
+- Settings are TOML in two files, and from stage 3 one file of skin layout adjustments per skin: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor, and the library roots under `[library] roots`, since they are per PC) and `player.toml` (hi-speed, the preset file, by default `beatoraja-style.toml`, and the displayed gauge). A `player.toml` without a `preset` keeps the default; one that names a preset keeps that choice. Files are written atomically: to a temporary file, then renamed.
 - A missing preset file is written only for a standard preset: `custom.toml` with the custom preset and `beatoraja-style.toml` with beatoraja-style. Any other missing name is refused, naming the file, and nothing is written.
-- Everything lives in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\`, `records\`, `logs\` and `measure\`. Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large; one root keeps backup simple, and the scopes stay separated by file. The registry is not used: it is not human-editable and does not fit presets distributed as files.
+- Everything lives in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\`, `records\`, `logs\`, `measure\` and `layouts\` (one file of layout adjustments per skin, from stage 3). Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large; one root keeps backup simple, and the scopes stay separated by file. The registry is not used: it is not human-editable and does not fit presets distributed as files.
 
 ## IR (Rankings)
 
@@ -1058,7 +1064,7 @@ Built in a later roadmap stage, as an extension at the saving extension point. T
 | Development features | Abuse of scenario launch or external control left in production builds | Remove the code entirely from production builds with Cargo features, and verify the removal in CI (the "Testing Strategy" section) | 1 |
 | Auto-update | Distribution of malicious code to all users | Sign update files and verify them. Use Windows code signing | 2 |
 | Skins | Resource exhaustion, reading outside the skin | Expressions in the declarative format have caps on size and evaluation cost. Cap image dimensions and decoded size, and restrict the files that skins and charts reference to within their respective folders | 3 |
-| Lua skins | Code execution via Lua, infinite loops | Run Lua only at load time. Build the environment allowlist-style, without `io`, `os`, `dofile`, `loadfile`, `debug`, unrestricted `package`, or module loading. Cap memory, instruction count including coroutines, and calls to host functions | With the beatoraja skin adapter |
+| Lua skins | Code execution via Lua, infinite loops | Run Lua only at load time. Build the environment allowlist-style, without `io`, `os`, `dofile`, `loadfile`, `debug`, unrestricted `package`, or module loading beyond a loader confined to the skin's folder and the same caps. Cap memory, instruction count including coroutines, and calls to host functions | 3 |
 | Modified clients | Fabricated input logs | Assume it cannot be prevented, and rely on detection and human review (the "Countermeasures Against Cheating and Piracy" section) | 4 |
 | Others' logs | Resubmission of someone else's record | Bind start tokens to accounts. The hash of the submission is only a hint of duplication and cannot identify modified copies | 4 |
 | Evaluator version | Claiming an old version with bugs | The server computes only with its own evaluator. The client's version is treated as informational only | 4 |
@@ -1153,7 +1159,7 @@ When an author fixes a chart, its hash changes. Rankings stay separate per chart
 
 ## Language and Crate Structure
 
-Rust is recommended as the core language. The evaluator can be shared between the client and the IR server, deterministic computation and testing are easy, and libraries such as Shift\_JIS conversion (`encoding_rs`) are available. Odin is also a strong option: miniaudio, D3D, and Lua bindings come standard, and the game part can take shape quickly. However, it would mean accepting that it is pre-1.0 and has few libraries. The standard skin uses a declarative format with no scripts, and Lua is used only in the beatoraja Lua skin adapter.
+Rust is recommended as the core language. The evaluator can be shared between the client and the IR server, deterministic computation and testing are easy, and libraries such as Shift\_JIS conversion (`encoding_rs`) are available. Odin is also a strong option: miniaudio, D3D, and Lua bindings come standard, and the game part can take shape quickly. However, it would mean accepting that it is pre-1.0 and has few libraries. The standard skin uses a declarative format with no scripts, and Lua is used only in the beatoraja skin importer.
 
 | Layer | crate | Role |
 | --- | --- | --- |
@@ -1166,7 +1172,7 @@ Rust is recommended as the core language. The evaluator can be shared between th
 | L3 | `input`, `audio` | Raw Input/HID/MIDI, WASAPI/ASIO and the mixer |
 | L4 | `game` | Logic thread, session policy, publishing the state snapshot |
 | L4 | `library` | The library database (SQLite) and its background scan; `game` does not depend on it, and the caller hands it the roots |
-| L5 | `render`, `skin-*`, `ui` | wgpu rendering, the adapter for each skin, egui screens |
+| L5 | `render`, `skin-*`, `ui` | wgpu rendering; the skin runtime model, importers, the custom format and its exporter; egui screens |
 | apps | `player`, `eval-cli` | The player itself, and a headless CLI that evaluates replays |
 | Later | `ir-server`, `pkg` | IR server (shares `eval`), distribution registry and installer |
 
@@ -1175,7 +1181,7 @@ Dependencies go only one way, from upper layers to lower layers. `eval` cannot d
 Windows-dependent code is confined to `input`, `audio`, `render`, and `player`. Linux CI verifies that every other crate builds and passes tests on platforms other than Windows. Therefore, no dependency (including indirect dependencies) from those other crates on these Windows-only implementations is created either.
 
 - `input` and `audio` are portable crates with their Windows parts under `#[cfg(windows)]`, and `windows` as a `cfg(windows)` dependency, so the queue, watermark and mixer logic that `game` builds on is tested on Linux. `render` and `player` are Windows-only. If a `cfg(windows)` dependency leaks into the Linux build, the Windows part moves into a Windows-only crate behind the same traits.
-- There is no `ui` or `skin-*` crate yet: the skin boundary sits in `render` until the declarative skin needs its own crate.
+- There is no `ui` or `skin-*` crate yet: the skin boundary sits in `render` until stage 3 adds the portable `skin-model`, `skin-beatoraja`, `skin-toml`, `skin-export` and `skin-cli` (docs/stage3.md), which build and test on every platform.
 - A new portable crate goes into `REQUIRED_PORTABLE` (`xtask/src/portable.rs`) and the baseline workspace of `xtask/src/fixture.rs` in the same change. `cargo xtask portable` enforces the list; `check-arch` does not.
 
 ### Licenses
@@ -1223,6 +1229,9 @@ Where there is no reason to build our own, established libraries are used. We bu
 | Settings and presets | `serde`, `toml` | Files written by people are TOML |
 | Replays | Custom binary format, `zstd` | The version number goes first, time deltas are laid out as variable-length integers, and the result is compressed with zstd |
 | Hashing and signing | `sha2`, `md-5`, `minisign-verify` | Identification and verification use SHA-256, and MD5 is used only for compatibility with existing difficulty tables. Signatures are unified on the minisign format (distribution registry, auto-update). No cryptography is implemented ourselves |
+| Skin files | `toml` with `serde_spanned`, `annotate-snippets` | The custom format, with spans for errors. Not used: KDL (no maintained derive layer), YAML (implicit typing hurts hand authors) |
+| Skin expressions | Our own | A hand-written Pratt parser compiled to a postfix program on a fixed stack. Not used: `evalexpr` (AGPL since 12.0, allocates), `rhai` and `cel-interpreter` (dynamic, allocating), `fasteval` (unmaintained, float), `exmex` (untyped) |
+| Skin atlas and preview | `etagere`, `tiny-skia` | Packing skin images into atlas pages at load; the authoring CLI's CPU preview, so the player does not link it |
 | Lua (for compatibility) | `mlua` (Lua 5.4) | Used only to convert beatoraja Lua skins at load time. `mlua`'s `sandbox()` is Luau-only, so for Lua 5.4 the allowlist-style environment is built ourselves |
 | WASM | `wasm-bindgen` | Calls the evaluator from Workers |
 | Measurement and testing | `tracy-client`, `criterion` | Span measurement, benchmarks |
@@ -1358,7 +1367,7 @@ Feel, local dedicated controllers, running alongside OBS (once that variation is
 | 0 | A short technical spike (meant to be thrown away) on the development PC at WQHD 240 Hz: run high-speed scrolling with 10,000+ notes, 100+ simultaneous voices, 1080p BGA, and effects on all lanes at the same time. When done, move to stage 1 immediately | The rendering and audio approach runs on the real path on the development PC. Each player-visible problem found has a cause and a design response, or is recorded as an open question or a later variation. The indicators the spike can measure are implemented, and their stage 0 values are recorded as a baseline; the others are recorded as not yet measured |
 | 1 | The minimal setup for playing one song: chart loading, input, audio, a simple play screen, an evaluator with one custom preset, saving the input log. Also includes key config, volume, offset, hi-speed, and instant retry. The testing mechanisms (swappable clock and I/O, processing that can advance without threads) are also put in here | One chart on hand can be played to the end without feeling latency or stutter. Key sound and frame latency can be measured and displayed |
 | 2 | One full gameplay loop: song selection, results, retry, practice (section repeat and speed change), beatoraja-style and LR2-style presets with switching on the result screen, `eval-cli`, and development features such as scenario launch. | Song selection through play, results, and retry can be played repeatedly. The property tests pass |
-| 3 | Look and effects: the declarative custom skin format and polished effects. The LR2 and beatoraja skin adapters come after this, as variations ("Extension Boundaries") | Playing with the standard skin is fun |
+| 3 | Look and effects: existing beatoraja skins playable through the importer first, then the declarative custom skin format with its beatoraja export, the standard skin, and polished effects. The LR2 importer comes right after this, as a variation ("Extension Boundaries") | An existing beatoraja skin and the standard skin both play, and playing with the standard skin is fun |
 | 4 | Weft, the custom IR (server-side computation, start registration, impossible-input detection, allowlist), for what only tapestry's input logs make possible ("IR (Rankings)") | Input logs can be sent, and statistics and rankings by tapestry-only metrics can be viewed for multiple presets |
 | 5 | Chart registry (catalog only) and installer | Difficulty tables can be installed in one go, and derivative chart dependencies can be resolved |
 | 6 | Connecting to existing IRs | Scores computed with the specified preset can be sent in the existing format |
@@ -1369,13 +1378,12 @@ Feel, local dedicated controllers, running alongside OBS (once that variation is
 
 Chart features beyond what a stage shows wait for the stage that shows them ("What the Loader Reads").
 
-After stage 3, variations (other chart formats, input adapters, skin adapters, settings profiles, other PCs, running alongside other software) are added one at a time as needed, before or alongside the later stages. Between stages 1 and 2, a generous period of playing and fixing is set aside. IR (stage 4 onward) is started once a state that is fun to play exists. The input log format carries a version number from stage 1, and only its core parts (physical input, time, chart identification, and the preset record) are included from the start. Other fields are added while bumping the version. Crates, too, start out consolidated into a few, and are split once the boundaries become clear.
+After stage 3, variations (other chart formats, input adapters, skin importers, settings profiles, other PCs, running alongside other software) are added one at a time as needed, before or alongside the later stages. Between stages 1 and 2, a generous period of playing and fixing is set aside. IR (stage 4 onward) is started once a state that is fun to play exists. The input log format carries a version number from stage 1, and only its core parts (physical input, time, chart identification, and the preset record) are included from the start. Other fields are added while bumping the version. Crates, too, start out consolidated into a few, and are split once the boundaries become clear.
 
 ## Open Questions
 
 - In the IR rankings, when presets or the evaluator change, whether to create new rankings or recompute and replace them
 - When replays are published, how much of the input log to show to others
-- How much expressiveness (computation, conditions, changes over time) the custom skin expressions should cover
 - How far LR2 skin support should go
 - In chart distribution, how to record authors' distribution terms and how to obtain consent for hosting (requires consultation with event organizers and difficulty table maintainers)
 - The criteria for inclusion in the allowlist, and the takedown request procedure (including legal judgment)
@@ -1398,5 +1406,5 @@ Points read from the source code of beatoraja (Java) and Lunatic Vibes F (C++, a
 | Replays | Neither saves the judgment rank or the version. beatoraja's playback results fluctuate depending on frames | Record every input needed for evaluation |
 | Gauge | Both compute all gauges side by side, but in floating point. beatoraja records the history every 0.5 seconds | Fixed point, recorded per judgment event |
 | Offsets | Both have only a display offset, and their automatic adjustment rewrites the settings during play | Three offsets. Suggestion of a recommended value, and in-play adjustment that is recorded and verifiable |
-| Skins | beatoraja uses 968 ID constants, and LVF uses global arrays directly as LR2 IDs | The state snapshot, and conversion inside adapters |
+| Skins | beatoraja uses 968 ID constants, and LVF uses global arrays directly as LR2 IDs | The state snapshot, and conversion inside importers and the exporter |
 | Tests | beatoraja has none, and LVF has one judgment test | Property tests and hand-written examples |
