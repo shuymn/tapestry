@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use audio::{
-    AudioEngine, AudioOutput, OutputError, RecordingOutput, SHIFT_HISTORY, SimConfig, SimDevice,
-    Sound, SoundBank, SoundCmd, Wake, run_audio,
+    AudioEngine, AudioOutput, OutputError, RecordingOutput, SHIFT_HISTORY, SeekPlan, SimConfig,
+    SimDevice, Sound, SoundBank, SoundCmd, Wake, run_audio,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::RingBuffer;
@@ -72,7 +72,7 @@ fn mixing_does_not_allocate() {
             sound: SoundId(KEYS),
         })
         .collect();
-    let mut e = AudioEngine::new(bank, &bgm, RATE, 480, 8, 64).unwrap();
+    let mut e = AudioEngine::new(bank.clone(), &bgm, RATE, 480, 8, 64).unwrap();
     // 40 stalls of three missed wakes, two underruns each: more than the
     // simulator's shift history holds.
     let missed_wakes = (0..40u64)
@@ -113,7 +113,11 @@ fn mixing_does_not_allocate() {
     // BGM sound; the play goes on from there.
     let now = out.inner().next_wake();
     e.restart(TimeUs(now.0 - 15_000_000 + 100_000));
-    e.seek(TimeUs(15_000_000));
+    // The plan is made where the play is prepared, which may allocate.
+    counting::track(false);
+    let plan = SeekPlan::new(&bank, &bgm, 8, e.frame_line(), TimeUs(15_000_000));
+    counting::track(true);
+    e.seek(&plan).unwrap();
     let sought = e.bgm_left();
     let mut entered = false;
     for _ in 0..50 {

@@ -146,14 +146,11 @@ impl MixClock {
         Some(u64::try_from(us * i128::from(self.rate) / 1_000_000).unwrap_or(u64::MAX))
     }
 
-    /// [`frame_at`](Self::frame_at) without its floor at frame 0, before
-    /// any observation as if frame 0 were mixed at time 0; saturating at
-    /// the `i64` range.
+    /// When frame 0 is mixed, by the least-late observation in the window;
+    /// `None` before any observation.
     #[must_use]
-    pub(crate) fn frame_line(&self, t: TimeUs) -> i64 {
-        let us = i128::from(t.0) - i128::from(self.anchor().unwrap_or(0));
-        let frame = (us * i128::from(self.rate)).div_euclid(1_000_000);
-        frame.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    pub(crate) fn anchor_us(&self) -> Option<i64> {
+        self.anchor()
     }
 
     /// The device clock's speed against the judgment timeline, in ppm

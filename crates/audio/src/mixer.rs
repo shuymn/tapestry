@@ -19,12 +19,12 @@
 //! once. The rule keys on the id, not on the stored sound: ids whose files
 //! have identical contents share a stored sound but still overlap.
 //!
-//! A seek (design.md "Audio") starts the output partway into a schedule: it
-//! decides every start, stop, cut and steal before the seek's frame as
-//! rendering would, without summing samples, and the voices left sounding
-//! there enter at that frame partway into their sounds and fades, in the
-//! slots rendering would have put them in. The output from that frame on is
-//! the output of rendering the whole schedule, sample for sample.
+//! A seek (design.md "Audio") starts the output partway into a schedule. A
+//! [`SeekPlan`](crate::SeekPlan), made off the audio thread with the same
+//! slot rules, holds the voices left sounding at the seek's frame; the
+//! mixer parks a copy and, at that frame, puts them in the slots rendering
+//! would have put them in, partway into their sounds and fades. No start is
+//! put before that frame while they wait.
 //!
 //! The sum is never gain-ridden: a limiter that lowers the whole mix when a
 //! key sound pushes it over full scale would make the background audibly dip
@@ -55,18 +55,18 @@ pub const HEADROOM: f32 = 0.5;
 pub const SOFT_CLIP_KNEE: f32 = 0.8;
 
 #[derive(Clone, Copy, Debug)]
-struct Voice {
-    active: bool,
+pub(crate) struct Voice {
+    pub(crate) active: bool,
     /// The sound id it was triggered as.
-    id: SoundId,
+    pub(crate) id: SoundId,
     /// Index into the bank's stored sounds.
-    sound: u32,
+    pub(crate) sound: u32,
     /// Output frame of its first sample: before frame 0 for a voice a seek
     /// placed after a stream's first frames.
-    start: i64,
-    seq: u64,
+    pub(crate) start: i64,
+    pub(crate) seq: u64,
     /// Fade-out start for a released voice; `i64::MAX` while playing.
-    cut: i64,
+    pub(crate) cut: i64,
 }
 
 impl Voice {
@@ -106,13 +106,18 @@ impl Voice {
 
 /// An output frame as a voice frame (output frames stay far below
 /// `i64::MAX`: 6 million years at 48 kHz).
-fn signed(frame: u64) -> i64 {
+pub(crate) fn signed(frame: u64) -> i64 {
     i64::try_from(frame).unwrap_or(i64::MAX)
+}
+
+/// Frames of the steal fade at `rate`.
+pub(crate) fn fade_frames(rate: u32) -> usize {
+    (u64::from(rate) * u64::from(STEAL_FADE_MS) / 1000) as usize
 }
 
 /// What starting voices counted.
 #[derive(Clone, Copy, Debug, Default)]
-struct Counts {
+pub(crate) struct Counts {
     steals: u64,
     cuts: u64,
     hard_cuts: u64,
@@ -121,20 +126,20 @@ struct Counts {
 /// Voice slots and as many release slots. Which slot a voice takes decides
 /// the order the mix adds voices in, so a seek keeps it.
 #[derive(Clone, Debug)]
-struct Slots {
-    voices: Vec<Voice>,
+pub(crate) struct Slots {
+    pub(crate) voices: Vec<Voice>,
     releases: Vec<Voice>,
 }
 
 impl Slots {
-    fn new(voices: usize) -> Self {
+    pub(crate) fn new(voices: usize) -> Self {
         Self {
             voices: vec![Voice::IDLE; voices],
             releases: vec![Voice::IDLE; voices],
         }
     }
 
-    fn all(&self) -> impl Iterator<Item = &Voice> {
+    pub(crate) fn all(&self) -> impl Iterator<Item = &Voice> {
         self.voices.iter().chain(&self.releases)
     }
 
@@ -154,7 +159,7 @@ impl Slots {
 
     /// Puts a start into a voice slot, at its start frame: the slot of the
     /// voice its id stops, else a free one, else the oldest voice's.
-    fn apply(&mut self, voice: Voice, counts: &mut Counts) {
+    pub(crate) fn apply(&mut self, voice: Voice, counts: &mut Counts) {
         let mut slot = None;
         for (i, v) in self.voices.iter_mut().enumerate() {
             if v.active && v.id == voice.id {
@@ -201,7 +206,7 @@ impl Slots {
     /// Frees what [`Mixer::render`] frees when it mixes up to `to`: every
     /// voice and release started before `to` that has ended by it or whose
     /// sound is missing.
-    fn retire(&mut self, bank: &SoundBank, fade: usize, to: i64) {
+    pub(crate) fn retire(&mut self, bank: &SoundBank, fade: usize, to: i64) {
         for v in self.all_mut().filter(|v| v.active && v.start < to) {
             match bank.stored(v.sound) {
                 Some(sound) if v.end(sound, fade) > to => {}
@@ -274,7 +279,7 @@ impl Mixer {
     /// `rate`, whose stolen voices fade over [`STEAL_FADE_MS`].
     #[must_use]
     pub fn new(voices: usize, rate: u32) -> Self {
-        let fade_frames = (u64::from(rate) * u64::from(STEAL_FADE_MS) / 1000) as usize;
+        let fade_frames = fade_frames(rate);
         let fade = (1..=fade_frames)
             .map(|k| {
                 let x = k as f64 / fade_frames as f64;
@@ -306,6 +311,11 @@ impl Mixer {
     #[must_use]
     pub fn active(&self) -> usize {
         self.live.voices.iter().filter(|v| v.active).count()
+    }
+
+    /// Voice slots.
+    pub(crate) fn voices(&self) -> usize {
+        self.live.voices.len()
     }
 
     /// Voices, fading releases, pending starts and a seek's waiting voices
@@ -349,7 +359,7 @@ impl Mixer {
     /// Whether another start can wait to be applied.
     #[must_use]
     pub fn can_start(&self) -> bool {
-        self.pending.len() < self.pending.capacity()
+        self.pending.len() < MAX_PENDING_STARTS
     }
 
     /// Output samples so far whose level, after the volume and
@@ -389,11 +399,16 @@ impl Mixer {
     /// voice is busy, the oldest playing voice (earliest start, then
     /// earliest trigger) is stolen and fades out from it, or is dropped if
     /// it starts there too. Returns `None` if the bank holds no sound for
-    /// `id` or [`MAX_PENDING_STARTS`] are waiting.
+    /// `id` or [`MAX_PENDING_STARTS`] are waiting. While a placed seek waits
+    /// to enter, no start is put before its frame.
     pub fn trigger(&mut self, bank: &SoundBank, id: SoundId, at: u64) -> Option<u64> {
         let sound = bank.slot(id)?;
-        let start = at.max(self.mixed_to);
-        if self.pending.len() == self.pending.capacity() {
+        let mut start = at.max(self.mixed_to);
+        if let Seek::Placed { from, .. } = self.seek {
+            // The seek's voices replace whatever starts before them.
+            start = start.max(u64::try_from(from).unwrap_or(0));
+        }
+        if self.pending.len() >= MAX_PENDING_STARTS {
             self.dropped_starts += 1;
             return None;
         }
@@ -412,55 +427,27 @@ impl Mixer {
         Some(start)
     }
 
-    /// Prepares a seek to frame `at`: stops everything, then works out the
-    /// voices and releases that `starts` (ids at frames, in time order,
-    /// each before `at`, on a frame line of the caller's) leave sounding at
-    /// `at`, and where each is in its sound or fade. Every start, stop,
-    /// cut and steal is decided as [`Mixer::render`] decides it, voice slots
-    /// included, but no sample is summed, and these steals and cuts are not
-    /// counted. Nothing sounds until [`Mixer::place`] puts frame `at` on
-    /// the output.
-    pub fn seek(
-        &mut self,
-        bank: &SoundBank,
-        starts: impl IntoIterator<Item = (SoundId, i64)>,
-        at: i64,
-    ) {
+    /// Stops everything and parks a seek's voices and releases, sounding at
+    /// frame `at` of the seek's frame line, with `seq` the last trigger
+    /// order they used. Nothing sounds until [`place`](Self::place) puts
+    /// `at` on the output. Copies at most the voice slots; slots beyond the
+    /// mixer's are ignored (the engine checks the counts first).
+    pub(crate) fn park(&mut self, slots: &Slots, seq: u64, at: i64) {
         self.stop_all();
-        let fade = self.fade.len();
-        let mut unheard = Counts::default();
-        let mut pos = i64::MIN;
-        for (id, frame) in starts {
-            if frame >= at {
-                break;
-            }
-            let Some(sound) = bank.slot(id) else { continue };
-            if frame > pos {
-                self.parked.retire(bank, fade, frame);
-                pos = frame;
-            }
-            self.seq += 1;
-            let voice = Voice {
-                active: true,
-                id,
-                sound,
-                start: frame,
-                seq: self.seq,
-                cut: i64::MAX,
-            };
-            self.parked.apply(voice, &mut unheard);
+        for (p, s) in self.parked.all_mut().zip(slots.all()) {
+            *p = *s;
         }
-        self.parked.retire(bank, fade, at);
+        self.seq = self.seq.max(seq);
         self.seek = Seek::Parked { at };
     }
 
-    /// Puts the frame a [`seek`](Mixer::seek) prepared at output frame
-    /// `frame`: its voices enter there, each partway into its sound or fade
-    /// as far as that frame is past its start, or at the first frame not
-    /// yet rendered if `frame` is already rendered. Starts pending before
-    /// that frame still apply, and what they start stops there. Does
-    /// nothing without a prepared seek.
-    pub fn place(&mut self, frame: i64) {
+    /// Puts the frame a seek parked at output frame `frame`: its voices
+    /// enter there, each partway into its sound or fade as far as that
+    /// frame is past its start, or at the first frame not yet rendered if
+    /// `frame` is already rendered. Until they enter, no start is put
+    /// before that frame. Starts pending before it still apply, and what
+    /// they start stops there. Does nothing without a parked seek.
+    pub(crate) fn place(&mut self, frame: i64) {
         if let Seek::Parked { at } = self.seek {
             self.seek = Seek::Placed {
                 from: frame.max(signed(self.mixed_to)),

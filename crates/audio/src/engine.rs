@@ -14,6 +14,7 @@ use crate::bank::SoundBank;
 use crate::clock::MixClock;
 use crate::mixer::{InvalidVolume, Mixer};
 use crate::output::{AudioOutput, OutputError};
+use crate::seek::{FrameLine, SeekPlan};
 
 /// A key sound to play, from the logic thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +94,33 @@ pub enum EngineError {
     },
 }
 
+/// Why an engine did not take a [`SeekPlan`]; nothing changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SeekError {
+    /// The plan was made for another voice count.
+    #[error("the seek was planned for {plan} voices but the engine has {engine}")]
+    Voices {
+        /// The plan's.
+        plan: usize,
+        /// The engine's.
+        engine: usize,
+    },
+    /// The plan was made for a schedule of another length or rate.
+    #[error(
+        "the seek was planned for {plan} starts at {plan_rate} Hz but the engine plays {engine} at {engine_rate} Hz"
+    )]
+    Schedule {
+        /// The plan's schedule length.
+        plan: usize,
+        /// The plan's rate.
+        plan_rate: u32,
+        /// The engine's schedule length.
+        engine: usize,
+        /// The engine's rate.
+        engine_rate: u32,
+    },
+}
+
 /// Where chart time `t` of a play whose chart time 0 lies at `origin` is due
 /// on the output's timeline, `offset` early.
 fn output_time(origin: TimeUs, offset: TimeUs, t: TimeUs) -> TimeUs {
@@ -107,14 +135,17 @@ pub struct AudioEngine {
     bank: Arc<SoundBank>,
     mixer: Mixer,
     clock: MixClock,
+    rate: u32,
+    period: u32,
     period_us: i64,
     bgm: Vec<BgmEvent>,
     next_bgm: usize,
     output_offset: TimeUs,
     /// Where chart time 0 lies on the output's timeline.
     play_origin: TimeUs,
-    /// The chart time a seek starts at, until its frame is placed.
-    seek_to: Option<TimeUs>,
+    /// The chart time a seek starts at and the starts the pass reaching it
+    /// may still admit, until its frame is placed.
+    seek_to: Option<(TimeUs, usize)>,
     scheduled: Vec<Scheduled>,
     scheduled_dropped: u64,
     underruns: u64,
@@ -169,6 +200,8 @@ impl AudioEngine {
             bank,
             mixer: Mixer::new(voices, rate),
             clock: MixClock::new(rate, period),
+            rate,
+            period,
             period_us: i64::from(period) * 1_000_000 / i64::from(rate),
             bgm,
             next_bgm: 0,
@@ -245,28 +278,59 @@ impl AudioEngine {
         self.play_origin = origin;
     }
 
-    /// Starts the play at chart time `t` instead of its beginning, for a
-    /// mid-chart start (design.md "Audio"); call it after
-    /// [`restart`](Self::restart). From the output frame of `t` on, the
-    /// output is what playing the schedule from chart time 0 gives there,
-    /// sample for sample, as long as the mix clock's mapping holds from
-    /// this call until that frame. The schedule's starts
-    /// before that frame are worked out here without summing a sample
-    /// ([`Mixer::seek`]), so they are neither logged nor counted as BGM
-    /// started; the voices still sounding at it, each partway into its
-    /// sound, enter at it. Starts from that frame on play as usual. Nothing
-    /// sounds before it, and a key sound started before it stops there. The
-    /// work grows with the starts before `t` times the voices; it allocates
-    /// nothing.
-    pub fn seek(&mut self, t: TimeUs) {
-        let (clock, origin, offset) = (&self.clock, self.play_origin, self.output_offset);
-        let at = |x: TimeUs| clock.frame_line(output_time(origin, offset, x));
-        let to = at(t);
-        let split = self.bgm.partition_point(|e| at(e.time) < to);
-        let starts = self.bgm.iter().take(split).map(|e| (e.sound, at(e.time)));
-        self.mixer.seek(&self.bank, starts, to);
-        self.next_bgm = split;
-        self.seek_to = Some(t);
+    /// Where the current play's chart times fall on the output now, for
+    /// planning a seek ([`SeekPlan::new`]).
+    #[must_use]
+    pub fn frame_line(&self) -> FrameLine {
+        let anchor = self.clock.anchor_us().unwrap_or(0);
+        FrameLine {
+            rate: self.rate,
+            period: self.period,
+            block_start: self.written(),
+            base_us: self
+                .play_origin
+                .0
+                .saturating_sub(self.output_offset.0)
+                .saturating_sub(anchor),
+        }
+    }
+
+    /// Starts the play at the chart time `plan` was made for instead of its
+    /// beginning, for a mid-chart start (design.md "Audio"); call it after
+    /// [`restart`](Self::restart). The plan's voices and releases are
+    /// copied in, which costs at most the voice slots and allocates
+    /// nothing, and enter at the frame the mix clock gives that time, each
+    /// partway into its sound or fade; the plan's starts are neither logged
+    /// nor counted as BGM started. When the clock maps that time to the
+    /// frame the plan's line did, the output from that frame on is what
+    /// playing the schedule from chart time 0 gives there, sample for
+    /// sample; otherwise the voices move with the new frame, and no later
+    /// start is put before it. Nothing sounds before that frame, and a key
+    /// sound started before it stops there.
+    ///
+    /// # Errors
+    ///
+    /// [`SeekError`] for a plan made for another voice count, schedule
+    /// length or rate; nothing changes.
+    pub fn seek(&mut self, plan: &SeekPlan) -> Result<(), SeekError> {
+        if plan.voices() != self.mixer.voices() {
+            return Err(SeekError::Voices {
+                plan: plan.voices(),
+                engine: self.mixer.voices(),
+            });
+        }
+        if plan.events() != self.bgm.len() || plan.line().rate != self.rate {
+            return Err(SeekError::Schedule {
+                plan: plan.events(),
+                plan_rate: plan.line().rate,
+                engine: self.bgm.len(),
+                engine_rate: self.rate,
+            });
+        }
+        self.mixer.park(plan.slots(), plan.seq(), plan.at());
+        self.next_bgm = plan.split();
+        self.seek_to = Some((plan.time(), plan.budget()));
+        Ok(())
     }
 
     /// BGM events not yet started.
@@ -291,10 +355,11 @@ impl AudioEngine {
     }
 
     /// Starts `sound` at output frame `target` (or the first unwritten
-    /// frame) and logs where it started.
-    fn start(&mut self, sound: SoundId, kind: ScheduledKind, target: u64) {
+    /// frame) and logs where it started; `false` if the mixer took no
+    /// start.
+    fn start(&mut self, sound: SoundId, kind: ScheduledKind, target: u64) -> bool {
         let Some(frame) = self.mixer.trigger(&self.bank, sound, target) else {
-            return;
+            return false;
         };
         if self.scheduled.len() < self.scheduled.capacity() {
             self.scheduled.push(Scheduled {
@@ -306,6 +371,7 @@ impl AudioEngine {
         } else {
             self.scheduled_dropped += 1;
         }
+        true
     }
 
     /// One wake: waits for the output's buffer event, re-anchors the mix
@@ -358,29 +424,38 @@ impl AudioEngine {
         let mut deferred = !self.mixer.can_start() && !cmds.is_empty();
         out.write(|buf| {
             let block_end = self.written() + (buf.len() / CHANNELS) as u64;
-            if let Some(t) = self.seek_to {
-                // Placed by the clock of the block that reaches it, as a
-                // BGM event at `t` is.
-                let at = output_time(self.play_origin, self.output_offset, t);
-                let frame = self.clock.frame_line(at);
+            // Starts the pass may still admit: fewer in the pass that
+            // places a seek, by what its plan admitted there.
+            let mut budget = usize::MAX;
+            let mut held = false;
+            if let Some((t, left)) = self.seek_to {
+                // Placed by the clock of the pass that reaches it, as a BGM
+                // event at `t` is. Until then the schedule after the plan
+                // waits, so none of it starts before the seek's voices.
+                let frame = self.frame_line().frame(t);
                 if frame < i64::try_from(block_end).unwrap_or(i64::MAX) {
                     self.mixer.place(frame);
                     self.seek_to = None;
+                    budget = left;
+                } else {
+                    held = true;
                 }
             }
-            while let Some(&event) = self.bgm.get(self.next_bgm) {
+            while let Some(&event) = self.bgm.get(self.next_bgm).filter(|_| !held) {
                 let at = output_time(self.play_origin, self.output_offset, event.time);
                 let target = self.clock.frame_at(at).unwrap_or(0);
                 if target >= block_end {
                     break;
                 }
-                if !self.mixer.can_start() {
+                if !self.mixer.can_start() || budget == 0 {
                     deferred = true;
                     break;
                 }
                 self.next_bgm += 1;
                 report.bgm_started += 1;
-                self.start(event.sound, ScheduledKind::Bgm { time: event.time }, target);
+                if self.start(event.sound, ScheduledKind::Bgm { time: event.time }, target) {
+                    budget -= 1;
+                }
             }
             report.frames = (buf.len() / CHANNELS) as u32;
             self.mixer.render(&self.bank, buf);

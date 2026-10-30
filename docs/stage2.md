@@ -389,7 +389,13 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 
 **Restore.**
 - **Schedule.** The BGM plus autoplay key sounds for every note that is not a target: before the section, after its end, and long notes crossing either edge.
-- **Audio.** `AudioEngine::seek(t)` advances the engine's scheduling (starts, stops, steals, positions) without summing samples. A property test checks it against mixing.
+- **Audio.** The seek is split by thread.
+  - **Planning, before the countdown, off the audio thread.** `SeekPlan::new` takes the bank, the schedule, the voice count, the play's `FrameLine` and `t`. It decides the schedule's starts, stops, steals and positions before `t`'s frame without summing samples, admitting at most `MAX_PENDING_STARTS` starts per engine pass as playing does. It costs O(starts before `t` × voices): about 2 ms for a dense 2-minute chart and 0.2 s for 500,000 starts with 256 voices.
+  - **The plan.** It holds the sounding voices and releases: two 32-byte slots per voice, 16 KiB at 256 voices, whatever the chart. It travels with the play command.
+  - **On the audio thread.** `AudioEngine::seek(&plan)` copies the slots into slots preallocated with the mixer, bounded by the voice count, and allocates nothing.
+  - **Placement.** At the pass that reaches `t`'s frame on its own mix clock, the voices enter partway into their sounds. The plan's own admissions there count toward that pass's limit.
+  - **A moved clock.** If the clock moved since planning, the voices move with `t`'s frame. A start the plan left out waits until the voices enter and never starts before that frame.
+  - **Tests.** A property test checks the output against mixing from the start, sample for sample, under a steady clock.
 - **Notes.** Only the section's targets are drawn. Notes before the section and after its end, and long notes that cross either edge (which D13 excludes), are not drawn, so the first note on screen is the first one to press. Those notes still sound, as autoplay key sounds on their own times (above), before the section and after it alike.
 - **Long notes across an edge** get no special rule: they are neither judged nor drawn. A player who wants one judged moves the section's edge to include it.
 

@@ -7,8 +7,8 @@ mod common;
 use std::sync::{Arc, OnceLock};
 
 use audio::{
-    AudioEngine, BankLimits, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank, Speed,
-    load_bank_at,
+    AudioEngine, BankLimits, RecordingOutput, SeekPlan, SimConfig, SimDevice, Sound, SoundBank,
+    Speed, load_bank_at,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use proptest::prelude::*;
@@ -56,7 +56,8 @@ fn play(case: &Case, seek: bool) -> (Vec<f32>, u64, u64) {
     let restarted = e.written();
     e.restart(case.origin);
     if seek {
-        e.seek(case.t);
+        let plan = SeekPlan::new(&case.bank, &case.bgm, case.voices, e.frame_line(), case.t);
+        e.seek(&plan).unwrap();
     }
     while out.samples().len() < frames * 2 {
         e.step(&mut out, &mut rx).unwrap();
@@ -331,38 +332,168 @@ fn a_seek_restores_steals_fades_and_cuts_at_the_edges() {
     }
 }
 
-/// What a seek costs on the audio thread, where it runs: a 2-minute chart
-/// at 48 kHz with 256 voices, a 120 s BGM sound and 50 starts a second over
-/// 64 sounds of 0.1 to 2 s (6,000 starts), sought to 119 s. Run with
-/// `cargo test --release -p audio --test seek -- --ignored --nocapture`.
 #[test]
-#[ignore = "timing; run in release"]
-fn seek_cost_into_a_dense_two_minute_chart() {
-    const DEVICE: u32 = 48_000;
-    let mut sounds = vec![sound(120 * DEVICE as usize, true, 0, 1)];
-    sounds.extend((0..64).map(|i| sound(4_800 + i * 1_425, false, i as i16, 3)));
-    let bank = Arc::new(SoundBank::from_sounds(DEVICE, sounds));
-    let mut bgm = events(&[(0, 0)]);
-    bgm.extend((0..6_000u32).map(|k| BgmEvent {
-        time: TimeUs(i64::from(k) * 20_000),
-        sound: SoundId(1 + (k * 7 % 64) as u16),
-    }));
-    let mut e = AudioEngine::new(bank, &bgm, DEVICE, 480, audio::MAX_VOICES, 0).unwrap();
-    let mut times: Vec<std::time::Duration> = (0..21)
+fn a_seek_admits_starts_per_pass_as_playing_does() {
+    // 1,025 starts of one long sound at one frame: a pass admits 1,024,
+    // and the last waits for the next pass's first frame, where it starts
+    // the sound over. 2,100 at one frame: two passes fill, and the last 52
+    // start at the third. 600 at 102 ms and 600 at 103 ms, with t between
+    // them in that pass: the play admits 424 of the second burst there and
+    // the seek's pass only as many. A seek restores the voice from where
+    // the last start put it, at t in the burst's pass, at the next pass's
+    // first frame and after it.
+    let long = sound(16_000, false, 1_000, 1);
+    let bank = Arc::new(SoundBank::from_sounds(RATE, vec![long]));
+    let bursts: [&[(usize, i64)]; 3] = [
+        &[(1_025, 103_000)],
+        &[(2_100, 103_000)],
+        &[(600, 102_000), (600, 103_000)],
+    ];
+    for burst in bursts {
+        let bgm: Vec<BgmEvent> = burst
+            .iter()
+            .flat_map(|&(n, us)| {
+                (0..n).map(move |_| BgmEvent {
+                    time: TimeUs(us),
+                    sound: SoundId(0),
+                })
+            })
+            .collect();
+        for t_us in [
+            102_500, 104_000, 105_000, 113_000, 120_000, 123_000, 300_000,
+        ] {
+            let case = Case {
+                bank: bank.clone(),
+                bgm: bgm.clone(),
+                voices: 2,
+                origin: TimeUs(1_000_000),
+                offset: TimeUs(0),
+                t: TimeUs(t_us),
+            };
+            check(&case).unwrap_or_else(|e| panic!("{burst:?}, t {t_us} us: {e}"));
+        }
+    }
+}
+
+/// A play on a steady device after the warmup, and its frame line.
+fn started(bank: &Arc<SoundBank>, bgm: &[BgmEvent]) -> (AudioEngine, RecordingOutput<SimDevice>) {
+    let dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let mut out = RecordingOutput::new(dev, 4 * RATE as usize);
+    let mut e = AudioEngine::new(bank.clone(), bgm, RATE, PERIOD, 2, 0).unwrap();
+    let (_tx, mut rx) = RingBuffer::new(1);
+    for _ in 0..WARMUP {
+        e.step(&mut out, &mut rx).unwrap();
+    }
+    e.restart(TimeUs(1_000_000));
+    (e, out)
+}
+
+#[test]
+fn a_start_the_plan_left_out_never_starts_before_the_seek() {
+    // The clock moves between planning and placing (as its window takes a
+    // less late wake): the plan's line is 60 µs later than the engine's.
+    // A long sound due 50 µs before t falls on t's frame on the plan's
+    // line, so the plan leaves it to the play, but one frame (125 µs)
+    // earlier on the engine's. It starts at t's frame instead, both when
+    // that frame is inside a pass and when it opens one, and the seek's
+    // voices do not replace it.
+    let bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        vec![sound(16_000, false, 1_000, 1)],
+    ));
+    for into_pass in [40, 0] {
+        let (probe, _) = started(&bank, &[]);
+        let line = probe.frame_line();
+        let period = i64::from(PERIOD);
+        let grid = line.block_start as i64 % period;
+        // t's frame on the engine's line: a pass's first frame, plus
+        // `into_pass`, a second into the play.
+        let frame = 1_000_000 * i64::from(RATE) / 1_000_000 / period * period + grid + into_pass;
+        let t = TimeUs(frame * 125 - line.base_us);
+        let bgm = [BgmEvent {
+            time: TimeUs(t.0 - 50),
+            sound: SoundId(0),
+        }];
+        let (mut e, mut out) = started(&bank, &bgm);
+        assert_eq!(e.frame_line(), line);
+        assert_eq!((line.frame(bgm[0].time), line.frame(t)), (frame - 1, frame));
+        let later = audio::FrameLine {
+            base_us: line.base_us + 60,
+            ..line
+        };
+        assert_eq!((later.frame(bgm[0].time), later.frame(t)), (frame, frame));
+        let plan = SeekPlan::new(&bank, &bgm, 2, later, t);
+        assert_eq!(plan.sounding(), 0);
+        e.seek(&plan).unwrap();
+        let (_tx, mut rx) = RingBuffer::new(1);
+        while out.samples().len() < 2 * (frame as usize + 4 * PERIOD as usize) {
+            e.step(&mut out, &mut rx).unwrap();
+        }
+        let samples = out.samples();
+        let f = frame as u64;
+        assert_eq!(left(samples, f - 1), 0.0, "into the pass {into_pass}");
+        assert_eq!(
+            left(samples, f),
+            1_000.0 / 65_536.0,
+            "into the pass {into_pass}"
+        );
+        assert_eq!(
+            left(samples, f + 1),
+            1_001.0 / 65_536.0,
+            "into the pass {into_pass}"
+        );
+    }
+}
+
+/// The median and worst of `runs` timings of `f`.
+fn timed(runs: usize, mut f: impl FnMut()) -> (std::time::Duration, std::time::Duration) {
+    let mut times: Vec<_> = (0..runs)
         .map(|_| {
-            e.restart(TimeUs(0));
             let at = std::time::Instant::now();
-            e.seek(TimeUs(119_000_000));
+            f();
             at.elapsed()
         })
         .collect();
     times.sort();
-    assert_eq!(e.bgm_left(), 50);
-    println!(
-        "seek to 119 s over {} starts, {} voices: median {:?}, worst {:?}",
-        bgm.len() - 50,
-        audio::MAX_VOICES,
-        times[times.len() / 2],
-        times[times.len() - 1]
-    );
+    (times[runs / 2], times[runs - 1])
+}
+
+/// What a seek costs and where: planning on the thread that prepares the
+/// play, and taking the plan on the audio thread. At 48 kHz with 256
+/// voices, a 120 s BGM sound and starts over 64 sounds of 0.1 to 2 s: a
+/// dense 2-minute chart (50 starts a second, 6,000 starts) sought to 119 s,
+/// and the loader's 500,000 objects as starts over 10 minutes sought to
+/// 599 s. Run with
+/// `cargo test --release -p audio --test seek -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing; run in release"]
+fn seek_cost_into_a_dense_chart() {
+    const DEVICE: u32 = 48_000;
+    let mut sounds = vec![sound(120 * DEVICE as usize, true, 0, 1)];
+    sounds.extend((0..64).map(|i| sound(4_800 + i * 1_425, false, i as i16, 3)));
+    let bank = Arc::new(SoundBank::from_sounds(DEVICE, sounds));
+    for (starts, span_s, runs) in [(6_000u32, 120i64, 21), (500_000, 600, 5)] {
+        let gap = span_s * 1_000_000 / i64::from(starts);
+        let mut bgm = events(&[(0, 0)]);
+        bgm.extend((0..starts).map(|k| BgmEvent {
+            time: TimeUs(i64::from(k) * gap),
+            sound: SoundId(1 + (k * 7 % 64) as u16),
+        }));
+        let t = TimeUs((span_s - 1) * 1_000_000);
+        let mut e =
+            AudioEngine::new(bank.clone(), &bgm, DEVICE, 480, audio::MAX_VOICES, 0).unwrap();
+        e.restart(TimeUs(0));
+        let plan_at = |line| SeekPlan::new(&bank, &bgm, audio::MAX_VOICES, line, t);
+        let mut plan = plan_at(e.frame_line());
+        let (plan_median, plan_worst) = timed(runs, || plan = plan_at(e.frame_line()));
+        let (take_median, take_worst) = timed(101, || e.seek(&plan).unwrap());
+        let before = bgm.len() - e.bgm_left();
+        println!(
+            "{before} starts before {} s, {} voices ({} sounding): plan median {plan_median:?}, \
+             worst {plan_worst:?}; seek on the audio thread median {take_median:?}, worst {take_worst:?}",
+            t.0 / 1_000_000,
+            audio::MAX_VOICES,
+            plan.sounding(),
+        );
+    }
 }
