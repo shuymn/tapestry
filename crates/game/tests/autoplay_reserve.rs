@@ -164,7 +164,7 @@ fn expected(chart: &Chart) -> (usize, usize) {
     let notes: usize = chart.lanes.iter().map(Vec::len).sum();
     let events = 2 * notes;
     let schedule = chart.bgm.len() + notes;
-    let r = Reservation::of(chart, &rules::custom(), &device, EFFECTS).unwrap();
+    let r = Reservation::of(chart, &rules::tapestry(), &device, EFFECTS).unwrap();
     let own = 2 * events * size_of::<PhysicalInputEvent>() + schedule * size_of::<BgmEvent>();
     (r.bytes(events) + own, own)
 }

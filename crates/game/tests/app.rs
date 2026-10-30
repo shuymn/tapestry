@@ -277,7 +277,7 @@ impl Headless {
             sources,
             script,
             paths,
-            preset: dir.join("presets").join("custom.toml"),
+            preset: dir.join("presets").join("tapestry.toml"),
             refusal,
             acts,
             next: 0,
@@ -642,7 +642,7 @@ impl AppRig for Headless {
         self.refusals.push(kind.to_owned());
         // The player fixes the preset file once its refusal is shown.
         if self.refusal == Refusal::Preset {
-            let text = game::preset_to_toml(&rules::custom());
+            let text = game::preset_to_toml(&rules::tapestry());
             std::fs::write(&self.preset, text).unwrap();
         }
     }
@@ -660,9 +660,9 @@ fn app(dir: &Path, refusal: Refusal, events: &Events) -> App {
     if refusal == Refusal::Preset {
         let presets = dir.join("presets");
         std::fs::create_dir_all(&presets).unwrap();
-        std::fs::write(presets.join("custom.toml"), b"not a preset").unwrap();
+        std::fs::write(presets.join("tapestry.toml"), b"not a preset").unwrap();
     }
-    settings.player.preset = "custom.toml".to_owned();
+    settings.player.preset = "tapestry.toml".to_owned();
     let config = SessionConfig {
         lead_in: TimeUs(1_000 * MS),
         step: TimeUs(MS),

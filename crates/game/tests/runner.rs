@@ -24,7 +24,7 @@ const NOTES: i64 = 500;
 fn play() -> (Chart, RulePreset, DeviceProfile) {
     (
         chart(NOTES, 97 * MS, 60 * MS),
-        rules::custom(),
+        rules::tapestry(),
         device(&[3 * MS]),
     )
 }
@@ -80,7 +80,7 @@ fn autoplay_key_sounds_land_at_their_frames() {
             n.sound = Some(bms_model::SoundId(u16::try_from(i % 3).unwrap()));
         }
     }
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[3 * MS]);
     let (_, script) = autoplay_script(&chart, &dev);
     let sources = SourceSet::new(common::sources()).unwrap();
@@ -192,7 +192,7 @@ fn aborted_play_records_its_tail_unevaluated() {
         .tap(lane(3), TimeUs(2_000 * MS))
         .build()
         .unwrap();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     // Keyboard 1 lags 40 ms, so the global watermark trails keyboard 0's.
     let dev = device(&[0, 40 * MS]);
     let at = |t: i64, action| ScriptItem {
@@ -306,7 +306,7 @@ fn removing_the_last_device_aborts_at_the_finalized_watermark() {
         .tap(lane(2), TimeUs(1_000 * MS))
         .build()
         .unwrap();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let at = |t: i64, action| ScriptItem {
         at: TimeUs(t),
@@ -372,7 +372,7 @@ fn event_at_the_opening_belongs_to_the_play() {
         .tap(lane(2), TimeUs(1_200 * MS))
         .build()
         .unwrap();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let ev = |t: i64, l: u8, value: i32| PhysicalInputEvent {
         received: TimeUs(t),
@@ -457,7 +457,7 @@ fn start_at_the_earliest_time_is_refused() {
 #[test]
 fn device_beyond_the_source_limit_marks_the_record_incomplete() {
     let chart = chart(8, 100 * MS, 50 * MS);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let events = input::autoplay(&chart, &dev.sources[0]).unwrap();
     // Two keyboards, room for one source.

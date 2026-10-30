@@ -35,7 +35,7 @@ pub enum PresetError {
 
 /// The largest preset file a reader accepts, in bytes. A file is untrusted,
 /// so a reader reads one byte past this at most and refuses a longer file.
-/// The custom preset takes about 2 KiB, and the largest presets the
+/// The tapestry preset takes about 2 KiB, and the largest presets the
 /// canonical encoding's property tests generate (131 gauges, ids of 136
 /// characters TOML escapes) about 160 KiB; a test keeps them below half
 /// the limit.

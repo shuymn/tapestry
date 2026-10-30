@@ -1,7 +1,7 @@
 //! One judgment per long note (design.md "LN Judgment Modes"): the worse
 //! of the head's judgment and the release's by the LN-end edges, scored
 //! once; the held head and the visual hold as feedback that scores
-//! nothing. Custom preset unless a test says otherwise: note windows
+//! nothing. The tapestry preset unless a test says otherwise: note windows
 //! PERFECT ±20, GREAT ±45, GOOD ±100, BAD ±180 ms; LN-end edges PERFECT
 //! 100, GREAT 150, GOOD 200 ms before the end.
 //!
@@ -303,39 +303,39 @@ fn ranked(preset: &RulePreset, rank: JudgmentHeader, length: i64, x: i64) -> Jud
 fn t8_ln_end_edges_scale_with_the_rank() {
     // Regression: each case needs the LN-end edges scaled by the factor of
     // the note windows. Edges by hand: floor(edge × scale / 100 %).
-    let custom = rules::custom();
+    let tapestry = rules::tapestry();
     let s = 1_000 * MS;
     // #RANK 3, 125 %: 125, 187.5 and 250 ms.
     let r3 = common::rank(3);
-    assert_eq!(ranked(&custom, r3, s, 125_000), Perfect);
-    assert_eq!(ranked(&custom, r3, s, 125_001), Great);
-    assert_eq!(ranked(&custom, r3, s, 187_500), Great);
-    assert_eq!(ranked(&custom, r3, s, 187_501), Good);
-    assert_eq!(ranked(&custom, r3, s, 250_000), Good);
-    assert_eq!(ranked(&custom, r3, s, 250_001), Bad);
+    assert_eq!(ranked(&tapestry, r3, s, 125_000), Perfect);
+    assert_eq!(ranked(&tapestry, r3, s, 125_001), Great);
+    assert_eq!(ranked(&tapestry, r3, s, 187_500), Great);
+    assert_eq!(ranked(&tapestry, r3, s, 187_501), Good);
+    assert_eq!(ranked(&tapestry, r3, s, 250_000), Good);
+    assert_eq!(ranked(&tapestry, r3, s, 250_001), Bad);
     // #DEFEXRANK 200: 200, 300 and 400 ms.
     let d200 = common::defexrank_decimal(200_000);
-    assert_eq!(ranked(&custom, d200, s, 200_000), Perfect);
-    assert_eq!(ranked(&custom, d200, s, 300_000), Great);
-    assert_eq!(ranked(&custom, d200, s, 400_000), Good);
-    assert_eq!(ranked(&custom, d200, s, 400_001), Bad);
+    assert_eq!(ranked(&tapestry, d200, s, 200_000), Perfect);
+    assert_eq!(ranked(&tapestry, d200, s, 300_000), Great);
+    assert_eq!(ranked(&tapestry, d200, s, 400_000), Good);
+    assert_eq!(ranked(&tapestry, d200, s, 400_001), Bad);
     // #RANK 0, 50 %: 50, 75 and 100 ms.
     let r0 = common::rank(0);
-    assert_eq!(ranked(&custom, r0, s, 50_000), Perfect);
-    assert_eq!(ranked(&custom, r0, s, 50_001), Great);
-    assert_eq!(ranked(&custom, r0, s, 100_000), Good);
-    assert_eq!(ranked(&custom, r0, s, 100_001), Bad);
+    assert_eq!(ranked(&tapestry, r0, s, 50_000), Perfect);
+    assert_eq!(ranked(&tapestry, r0, s, 50_001), Great);
+    assert_eq!(ranked(&tapestry, r0, s, 100_000), Good);
+    assert_eq!(ranked(&tapestry, r0, s, 100_001), Bad);
     // #DEFEXRANK 33.333: GREAT is 150 ms × 0.33333 = 49_999.5 µs, floored
     // to 49_999, so 50_000 µs early is GOOD.
     let third = common::defexrank_decimal(33_333);
-    assert_eq!(ranked(&custom, third, s, 33_333), Perfect);
-    assert_eq!(ranked(&custom, third, s, 33_334), Great);
-    assert_eq!(ranked(&custom, third, s, 49_999), Great);
-    assert_eq!(ranked(&custom, third, s, 50_000), Good);
+    assert_eq!(ranked(&tapestry, third, s, 33_333), Perfect);
+    assert_eq!(ranked(&tapestry, third, s, 33_334), Great);
+    assert_eq!(ranked(&tapestry, third, s, 49_999), Great);
+    assert_eq!(ranked(&tapestry, third, s, 50_000), Good);
     // Edges of 1, 2 and 3 µs (note early edges 0, 1, 2 and 3 µs) at 50 %
     // collapse to 0, 1 and 1: GOOD can no longer be reached, and 1 µs early
     // is GREAT where it is PERFECT unscaled.
-    let mut tiny = rules::custom();
+    let mut tiny = rules::tapestry();
     for (w, us) in [
         (&mut tiny.tables.keys.windows.perfect, 0),
         (&mut tiny.tables.keys.windows.great, 1),
@@ -410,10 +410,10 @@ fn t12_a_mine_at_the_ln_end() {
     assert_eq!(judged(&events)[0].3, Some(0));
 }
 
-/// The custom preset with the survival gauge at 50 %, away from its
+/// The tapestry preset with the survival gauge at 50 %, away from its
 /// bounds, so every change shows.
 fn mid_gauges() -> RulePreset {
-    let mut p = rules::custom();
+    let mut p = rules::tapestry();
     p.gauges[1].start = GaugeValue(50 * GaugeValue::PERCENT);
     p
 }
@@ -506,7 +506,7 @@ fn l1_4_a_play_aborted_while_held_matches_live() {
 #[test]
 fn l2_1_note_times_beyond_2_pow_32_are_refused() {
     let cap: i64 = 1 << 32;
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let new = |chart: &Chart| {
         Evaluator::new(chart, &preset, &dev, &InputStart::default(), None, 0).map(|_| ())
@@ -559,9 +559,9 @@ fn l1_2_scaled_edges_beyond_2_pow_32_refuse_the_rank() {
         Evaluator::new(&chart, preset, &dev, &InputStart::default(), None, 0).map(|_| ())
     };
     for edge in [half, half + 1] {
-        let mut wide_bad = rules::custom();
+        let mut wide_bad = rules::tapestry();
         wide_bad.tables.keys.windows.bad = Window::symmetric(edge);
-        let mut wide_end = rules::custom();
+        let mut wide_end = rules::tapestry();
         wide_end.tables.keys.ln_end.good = TimeUs(edge);
         for preset in [&wide_bad, &wide_end] {
             assert_eq!(preset.validate(), Ok(()));

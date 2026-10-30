@@ -90,10 +90,10 @@ impl SourceRead for Racing {
 
 #[test]
 fn boundary_press_published_between_pop_and_watermark_read_is_judged() {
-    // A tap at 1 s; the custom preset's late BAD edge is 180 ms, so its
+    // A tap at 1 s; the tapestry preset's late BAD edge is 180 ms, so its
     // miss deadline, and the press, are at 1 180 000 µs.
     let chart = taps(&[(1, 1_000)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let late_edge = 1_180_000;
     let (writer, reader) = source_queue(16);
@@ -133,7 +133,7 @@ fn boundary_press_published_between_pop_and_watermark_read_is_judged() {
 #[test]
 fn event_beyond_published_watermark_stays_staged() {
     let chart = taps(&[(1, 1_000), (2, 1_100)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (mut writer, reader) = source_queue(16);
     // Pushed, but the publication is still behind the first of them.
@@ -160,7 +160,7 @@ fn event_beyond_published_watermark_stays_staged() {
 #[test]
 fn unmoved_watermark_step_emits_nothing() {
     let chart = taps(&[(1, 1_000)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (mut writer, reader) = source_queue(16);
     writer.push(press(1_000_000, 0, lane(1))).unwrap();
@@ -182,7 +182,7 @@ fn unmoved_watermark_step_emits_nothing() {
 #[test]
 fn removed_source_drains_then_retires_while_another_remains() {
     let chart = taps(&[(1, 400), (2, 900)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0, 0]);
     let (mut gone, r0) = source_queue(4);
     let (mut kept, r1) = source_queue(4);
@@ -217,7 +217,7 @@ fn removed_source_drains_then_retires_while_another_remains() {
 #[test]
 fn losing_every_source_aborts_before_advancing() {
     let chart = taps(&[(1, 300)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0, 0]);
     let (w0, r0) = source_queue(4);
     let (w1, r1) = source_queue(4);
@@ -254,7 +254,7 @@ fn losing_every_source_aborts_before_advancing() {
 #[test]
 fn capacity_one_takes_one_input() {
     let chart = taps(&[(1, 1_000)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (mut writer, reader) = source_queue(4);
     writer.push(press(1_000_000, 0, lane(1))).unwrap();
@@ -273,7 +273,7 @@ fn capacity_one_takes_one_input() {
 #[test]
 fn equal_time_group_beyond_the_budget_aborts_unevaluated() {
     let chart = taps(&[(1, 1_000), (2, 1_000)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (mut writer, reader) = source_queue(4);
     // One batch of two presses, and a budget of one input (the one source's disconnect allowance).
@@ -297,7 +297,7 @@ fn equal_time_group_beyond_the_budget_aborts_unevaluated() {
 #[test]
 fn input_beyond_the_budget_aborts_at_the_finalized_watermark() {
     let chart = taps(&[(1, 1_000), (2, 1_100), (3, 1_200), (4, 1_300)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0, 0]);
     let (mut w0, r0) = source_queue(16);
     let (mut w1, r1) = source_queue(16);
@@ -334,7 +334,7 @@ fn input_beyond_the_budget_aborts_at_the_finalized_watermark() {
 #[test]
 fn input_at_or_before_the_finalized_watermark_aborts() {
     let chart = taps(&[(1, 1_050)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (mut writer, reader) = source_queue(16);
     writer.publish(TimeUs(1_000_000));
@@ -356,7 +356,7 @@ fn input_at_or_before_the_finalized_watermark_aborts() {
 #[test]
 fn event_of_another_source_aborts() {
     let chart = taps(&[(1, 1_000)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0, 0]);
     let (mut writer, reader) = source_queue(16);
     let (quiet, other) = source_queue(16);
@@ -375,7 +375,7 @@ fn event_of_another_source_aborts() {
 #[test]
 fn abort_keeps_queued_events_and_stops_advancing() {
     let chart = taps(&[(1, 1_000), (2, 1_500)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (mut writer, reader) = source_queue(16);
     writer.push(press(1_000_000, 0, lane(1))).unwrap();
@@ -406,7 +406,7 @@ fn abort_keeps_queued_events_and_stops_advancing() {
 #[test]
 fn abort_tail_beyond_the_budget_marks_overflow() {
     let chart = taps(&[(1, 1_000), (2, 1_500)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (mut writer, reader) = source_queue(16);
     writer.push(press(1_000_000, 0, lane(1))).unwrap();
@@ -425,7 +425,7 @@ fn abort_tail_beyond_the_budget_marks_overflow() {
 fn disconnect_after_a_full_d8_window_fits_the_budget() {
     // A tap at 3 s on lane 1; the inputs below play lane 7, which has none.
     let chart = taps(&[(1, 3_000)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0, 0]);
     // design.md "Recording Capacity": one bound button per source, pressed and
     // released 30 times a second over a 2 s window: 2 × 60 × 2 = 240 control
@@ -468,7 +468,7 @@ fn disconnect_after_a_full_d8_window_fits_the_budget() {
 #[test]
 fn source_beyond_its_share_of_the_window_aborts() {
     let chart = taps(&[(1, 1_000), (2, 1_100)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0, 0]);
     let (mut w0, r0) = source_queue(4);
     let (w1, r1) = source_queue(4);
@@ -489,7 +489,7 @@ fn source_beyond_its_share_of_the_window_aborts() {
 #[test]
 fn overflow_abort_from_the_caller_marks_overflow() {
     let chart = taps(&[(1, 1_000)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (_writer, reader) = source_queue(4);
     let mut logic = logic(&chart, &rule, &dev, vec![reader], CONFIG);
@@ -515,7 +515,7 @@ impl SourceRead for Silent {
 #[test]
 fn readers_beyond_the_source_id_range_are_refused() {
     let chart = taps(&[(1, 1_000)]);
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let config = LogicConfig {
         inputs: 1,
@@ -536,7 +536,7 @@ fn readers_beyond_the_source_id_range_are_refused() {
 #[test]
 fn evaluator_refusal_is_reported() {
     let chart = ChartBuilder::new(150_000).build().unwrap();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let readers: Vec<Silent> = vec![Silent];
     let result = Logic::new(

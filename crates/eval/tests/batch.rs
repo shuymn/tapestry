@@ -154,7 +154,7 @@ const END: i64 = 1_300 * MS;
 #[test]
 fn incremental_matches_batch_for_every_watermark_step() {
     let (chart, input) = scenario();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let batch = evaluate(&chart, &input, &rule).unwrap();
     // Counted by hand: lane 1's three taps, the LN, lane 3's tap, and
     // lane 5's two taps.
@@ -196,7 +196,7 @@ fn incremental_matches_batch_for_every_watermark_step() {
 #[test]
 fn aborted_prefix_matches_live() {
     let (chart, input) = scenario();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     // Abort after the step at 650 ms; later events stay in the record.
     let (events, finalized) = live(&chart, &rule, &input, (0..=650 * MS).step_by(1_000));
     assert_eq!(finalized, TimeUs(647 * MS));
@@ -223,7 +223,7 @@ fn completion_waits_for_watermark_past_final_deadline() {
         .tap(lane(1), TimeUs(1_000 * MS))
         .build()
         .unwrap();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[5 * MS]);
     let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, 4).unwrap();
     assert_eq!(ev.final_deadline(), TimeUs(1_180 * MS));
@@ -256,7 +256,7 @@ fn completion_waits_for_watermark_past_final_deadline() {
 #[test]
 fn same_input_same_result_twice() {
     let (chart, input) = scenario();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let a = evaluate(&chart, &input, &rule).unwrap();
     let b = evaluate(&chart, &input, &rule).unwrap();
     assert!(!a.events.is_empty());

@@ -64,7 +64,7 @@ fn eval_with(chart: &Chart, preset: &RulePreset, inputs: Vec<PhysicalInputEvent>
 }
 
 fn eval(chart: &Chart, inputs: Vec<PhysicalInputEvent>) -> Evaluation {
-    eval_with(chart, &rules::custom(), inputs)
+    eval_with(chart, &rules::tapestry(), inputs)
 }
 
 /// The final value of gauge `g` (0 normal, 1 survival).
@@ -309,7 +309,7 @@ fn a_scratch_reversal_takes_the_second_note_of_its_microsecond() {
         device,
         ..EvalInput::default()
     };
-    let e = evaluate(&chart, &input, &rules::custom()).unwrap();
+    let e = evaluate(&chart, &input, &rules::tapestry()).unwrap();
     assert_eq!(
         judged(&e.events),
         vec![

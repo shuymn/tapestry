@@ -24,10 +24,10 @@ const OTHER_CHART: &str = "#BPM 120\n#WAV01 a.wav\n#00211:01\n#00311:01\n";
 
 const MS: i64 = 1_000;
 
-/// The custom preset with its BAD window widened to 220 ms, whose final
+/// The tapestry preset with its BAD window widened to 220 ms, whose final
 /// deadline comes after the recording's end.
 fn wide() -> RulePreset {
-    let mut p = rules::custom();
+    let mut p = rules::tapestry();
     p.id = "wide".to_owned();
     p.tables.keys.windows.bad = Window::symmetric(220 * MS);
     p
@@ -44,7 +44,7 @@ fn press(at: i64, value: i32) -> PhysicalInputEvent {
     }
 }
 
-/// A completed play of `chart` under the custom preset, from one keyboard
+/// A completed play of `chart` under the tapestry preset, from one keyboard
 /// whose keys 1-7 are bound to lanes 1-7, hitting taps at 2 s and 4 s on
 /// time. It completed at 4.180 s.
 fn played(chart: &str) -> PlayRecord {
@@ -70,7 +70,7 @@ fn played_with(chart: &str, seed: u64) -> PlayRecord {
             random_seed: seed,
             transform: PASSTHROUGH.record(),
         },
-        preset: PresetRecord::of(&rules::custom()),
+        preset: PresetRecord::of(&rules::tapestry()),
         session_policy: "default".to_owned(),
         devices: DeviceRecord {
             sources: vec![SourceRecord {
@@ -115,12 +115,12 @@ fn played_with(chart: &str, seed: u64) -> PlayRecord {
     }
 }
 
-/// A folder holding `chart.bms`, `own.toml` (the custom preset) and
+/// A folder holding `chart.bms`, `own.toml` (the tapestry preset) and
 /// `wide.toml`.
 fn folder() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("chart.bms"), CHART).unwrap();
-    let own = rules_toml::preset_to_toml(&rules::custom());
+    let own = rules_toml::preset_to_toml(&rules::tapestry());
     fs::write(dir.path().join("own.toml"), own).unwrap();
     fs::write(
         dir.path().join("wide.toml"),
@@ -147,7 +147,7 @@ fn stdout(o: &Output) -> String {
     String::from_utf8(o.stdout.clone()).unwrap()
 }
 
-/// The totals after two PERFECTs, with the custom preset's gauges cleared.
+/// The totals after two PERFECTs, with the tapestry preset's gauges cleared.
 const CUSTOM_TOTALS: &str = "perfect 2 great 0 good 0 bad 0 poor 0 | ex 4 | bp 0 | max combo 2 \
                              | normal 100.000% cleared | survival 100.000% cleared";
 
@@ -415,7 +415,7 @@ fn an_unusable_chart_or_preset_exits_one_before_any_line() {
     let dir = folder();
     save(dir.path(), "play.tprl", &played(CHART));
     fs::write(dir.path().join("bad.toml"), "id = 1\n").unwrap();
-    let own = rules_toml::preset_to_toml(&rules::custom());
+    let own = rules_toml::preset_to_toml(&rules::tapestry());
     let limit = rules_toml::MAX_PRESET_FILE_BYTES;
     fs::write(dir.path().join("big.toml"), padded(&own, limit + 1)).unwrap();
     fs::write(dir.path().join("bad.bms"), "#LNTYPE 2\n#00111:01\n").unwrap();

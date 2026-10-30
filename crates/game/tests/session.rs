@@ -365,9 +365,9 @@ fn suspend_abort_is_ended_midway_and_incomplete() {
     assert_eq!(count_judged(&one.live, Judgment::Perfect), 2);
 }
 
-/// The custom preset with PERFECT widened to 30 ms each side.
+/// The tapestry preset with PERFECT widened to 30 ms each side.
 fn wide_perfect() -> rules::RulePreset {
-    let mut p = rules::custom();
+    let mut p = rules::tapestry();
     p.id = "wide".to_owned();
     for t in p.tables.each_mut() {
         t.windows.perfect = rules::Window::symmetric(30 * MS);
@@ -395,10 +395,10 @@ fn changed_preset_file_applies_from_next_retry_only() {
     let mut s = session(&root, &chart, &events);
     // Changed after loading, before the first play.
     rewrite(
-        &root.preset("custom.toml"),
+        &root.preset("tapestry.toml"),
         &preset_to_toml(&wide_perfect()),
     );
-    // A press 25 ms late: GREAT under the custom preset, PERFECT under the
+    // A press 25 ms late: GREAT under the tapestry preset, PERFECT under the
     // changed one.
     let late = |items: Vec<ScriptItem>| {
         let mut v = items;
@@ -419,7 +419,7 @@ fn changed_preset_file_applies_from_next_retry_only() {
     );
     assert_eq!(
         one.record.as_ref().unwrap().preset.sha256,
-        replay::preset_hash(&rules::custom())
+        replay::preset_hash(&rules::tapestry())
     );
     assert_eq!(
         two.record.as_ref().unwrap().preset.sha256,
@@ -437,11 +437,11 @@ fn malformed_preset_at_retry_keeps_the_old_one() {
     let one = s
         .play(script(vec![connect(0)], &[(-500 * MS, Command::Retry)]))
         .unwrap();
-    rewrite(&root.preset("custom.toml"), "windows = [");
+    rewrite(&root.preset("tapestry.toml"), "windows = [");
     let two = s
         .play(script(Vec::new(), &[(-500 * MS, Command::Retry)]))
         .unwrap();
-    fs::remove_file(root.preset("custom.toml")).unwrap();
+    fs::remove_file(root.preset("tapestry.toml")).unwrap();
     let three = s.play(script(Vec::new(), &[])).unwrap();
 
     assert_eq!(one.reload_error, None);
@@ -456,7 +456,7 @@ fn malformed_preset_at_retry_keeps_the_old_one() {
     for r in [&two, &three] {
         assert_eq!(
             r.record.as_ref().unwrap().preset.sha256,
-            replay::preset_hash(&rules::custom())
+            replay::preset_hash(&rules::tapestry())
         );
     }
     assert_eq!(three.end, PlayEnd::Completed);
@@ -467,12 +467,12 @@ fn missing_custom_preset_is_written_as_custom() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
     let _s = session(&root, &chart, &Events::default());
-    let text = fs::read_to_string(root.preset("custom.toml")).unwrap();
-    assert_eq!(game::load_preset_toml(&text).unwrap(), rules::custom());
+    let text = fs::read_to_string(root.preset("tapestry.toml")).unwrap();
+    assert_eq!(game::load_preset_toml(&text).unwrap(), rules::tapestry());
 }
 
 /// One play of a tap at 1 s pressed 17 ms late, with the settings in
-/// `root`: PERFECT under the custom preset (±20 ms), GREAT under
+/// `root`: PERFECT under the tapestry preset (±20 ms), GREAT under
 /// beatoraja-style (±15 ms at a chart's default rank).
 fn play_17_ms_late(root: &DataRoot) -> PlayReport {
     let chart = taps(&[(1, 1_000)]);
@@ -507,7 +507,7 @@ fn default_preset_is_beatoraja_style() {
         game::load_preset_toml(&text).unwrap(),
         rules::beatoraja_style()
     );
-    assert!(!root.preset("custom.toml").exists());
+    assert!(!root.preset("tapestry.toml").exists());
     assert_eq!(
         played_under(&report),
         (
@@ -521,15 +521,15 @@ fn default_preset_is_beatoraja_style() {
 fn explicit_custom_choice_is_kept() {
     let (_dir, root) = temp_root();
     fs::create_dir_all(root.path()).unwrap();
-    fs::write(root.player_settings(), "preset = \"custom.toml\"\n").unwrap();
+    fs::write(root.player_settings(), "preset = \"tapestry.toml\"\n").unwrap();
     let report = play_17_ms_late(&root);
     assert_eq!(
         played_under(&report),
-        (Judgment::Perfect, replay::preset_hash(&rules::custom()))
+        (Judgment::Perfect, replay::preset_hash(&rules::tapestry()))
     );
     Settings::load(&root).unwrap().save(&root).unwrap();
     let saved = fs::read_to_string(root.player_settings()).unwrap();
-    assert!(saved.contains("preset = \"custom.toml\""), "{saved}");
+    assert!(saved.contains("preset = \"tapestry.toml\""), "{saved}");
 }
 
 #[test]
@@ -856,13 +856,13 @@ fn load_refuses_what_it_cannot_use() {
             ..
         })
     ));
-    fs::write(root.preset("custom.toml"), "id = 3").unwrap();
+    fs::write(root.preset("tapestry.toml"), "id = 3").unwrap();
     assert!(matches!(
         load(&file),
         Err(SessionError::Preset(PresetError::Parse(_)))
     ));
-    fs::remove_file(root.preset("custom.toml")).unwrap();
-    fs::create_dir(root.preset("custom.toml")).unwrap();
+    fs::remove_file(root.preset("tapestry.toml")).unwrap();
+    fs::create_dir(root.preset("tapestry.toml")).unwrap();
     assert!(matches!(load(&file), Err(SessionError::Io { .. })));
 }
 
@@ -1128,7 +1128,7 @@ fn reevaluation_refuses_a_record_of_another_evaluator_version() {
     let mut items = vec![connect(0)];
     items.extend(presses(&[(1, 1_000)]));
     let one = s.play(script(items, &[])).unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let record = one.record.as_ref().unwrap();
     // The session records the version the preset runs on, and its preset.
     assert_eq!(record.versions.evaluator, 3);
@@ -1634,7 +1634,8 @@ fn recording_policy_fits_the_standard_decoder() {
     let decodable = replay::max_record_events(&replay::DecodeLimits::STANDARD);
     for n in 1..=8 {
         let device = DeviceSettings::default().profile(&vec![DeviceKind::Keyboard; n], &[]);
-        let r = game::Reservation::of(&chart, &rules::custom(), &device, config().effects).unwrap();
+        let r =
+            game::Reservation::of(&chart, &rules::tapestry(), &device, config().effects).unwrap();
         assert!(r.capacity() + n <= decodable, "{n} sources");
         assert!(r.bytes(r.capacity()) <= game::RECORDING_MEMORY);
         assert!(r.bytes(r.capacity() + 1) > game::RECORDING_MEMORY);
@@ -1642,7 +1643,7 @@ fn recording_policy_fits_the_standard_decoder() {
     // Indicator: how long a play one keyboard, and one keyboard with a
     // controller's axis, can record.
     let one = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
-    let r = game::Reservation::of(&chart, &rules::custom(), &one, config().effects).unwrap();
+    let r = game::Reservation::of(&chart, &rules::tapestry(), &one, config().effects).unwrap();
     println!(
         "indicator: {} bytes per input, {} inputs: {} s for a keyboard, {} s with an axis",
         r.per_input,
@@ -1728,10 +1729,10 @@ fn bms_ingest_leaves_missing_sounds_to_the_sound_table() {
     assert_eq!(missing, ["snare.wav", "hat.wav"]);
 }
 
-/// The custom preset with the BAD window `ms` each side: its final deadline
+/// The tapestry preset with the BAD window `ms` each side: its final deadline
 /// is the last note plus `ms`.
 fn bad_edge(ms: i64) -> rules::RulePreset {
-    let mut p = rules::custom();
+    let mut p = rules::tapestry();
     p.id = format!("bad-{ms}");
     for t in p.tables.each_mut() {
         t.windows.bad = rules::Window::symmetric(ms * MS);
@@ -1745,11 +1746,11 @@ fn under(
     chart: &Chart,
     preset: &rules::RulePreset,
 ) -> replay::verify::ReEvaluation {
-    let custom = rules::custom();
+    let tapestry = rules::tapestry();
     let ctx = game::ResultContext {
         record: report.record.as_ref().unwrap(),
         chart,
-        preset: &custom,
+        preset: &tapestry,
         live: &report.live,
     };
     ReEvaluate::under(&ctx, preset).unwrap()
@@ -1780,7 +1781,7 @@ fn as_played_matches_live() {
         let commands: Vec<_> = retry.map(|t| (t, Command::Retry)).into_iter().collect();
         let one = s.play(script(items, &commands)).unwrap();
         let (end, watermark) = status(&one);
-        let r = under(&one, &chart, &rules::custom());
+        let r = under(&one, &chart, &rules::tapestry());
         assert!(r.as_played);
         assert_eq!(r.evaluation.events, one.live, "retry {retry:?}");
         assert_eq!(r.evaluation.tally, one.tally);
@@ -1796,7 +1797,7 @@ fn as_played_matches_live() {
     }
 }
 
-/// A play of taps at 1 s and 60 s, both hit on time, under the custom
+/// A play of taps at 1 s and 60 s, both hit on time, under the tapestry
 /// preset, played to the end.
 fn sixty_seconds() -> (Chart, PlayReport) {
     let notes = [(1, 1_000), (2, 60_000)];
@@ -1807,7 +1808,7 @@ fn sixty_seconds() -> (Chart, PlayReport) {
     items.extend(presses(&notes));
     let one = s.play(script(items, &[])).unwrap();
     assert_eq!(one.end, PlayEnd::Completed);
-    // The custom preset's late BAD edge, 180 ms, puts the final deadline
+    // The tapestry preset's late BAD edge, 180 ms, puts the final deadline
     // at 60.180 s, and the recording ends there, within a step.
     assert_eq!(song_end(&one.live), Some(TimeUs(60_180 * MS)));
     let (_, watermark) = status(&one);
@@ -1855,7 +1856,7 @@ fn what_if_with_an_equal_or_earlier_final_deadline_is_covered_by_the_recording()
 fn what_if_of_an_aborted_play_stops_at_the_watermark() {
     use replay::verify::Coverage;
     // Taps at 1 s and 2 s hit on time; retried at 2.170 s, before the
-    // custom preset's final deadline at 2.180 s.
+    // tapestry preset's final deadline at 2.180 s.
     let notes = [(1, 1_000), (2, 2_000)];
     let chart = taps(&notes);
     let (_dir, root) = temp_root();
@@ -1895,14 +1896,14 @@ fn under_checks_the_evaluator_version_first() {
     let one = s.play(script(items, &[])).unwrap();
     let mut record = one.record.clone().unwrap();
     record.versions.evaluator = 4;
-    let custom = rules::custom();
+    let tapestry = rules::tapestry();
     let ctx = game::ResultContext {
         record: &record,
         chart: &chart,
-        preset: &custom,
+        preset: &tapestry,
         live: &one.live,
     };
-    for preset in [custom.clone(), bad_edge(220)] {
+    for preset in [tapestry.clone(), bad_edge(220)] {
         assert_eq!(
             ReEvaluate::under(&ctx, &preset).map(|_| ()),
             Err(game::ReEvaluationError::UnsupportedEvaluator(4))

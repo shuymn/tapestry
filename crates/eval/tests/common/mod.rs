@@ -100,7 +100,7 @@ pub fn disconnect(received: i64, source: u16) -> PhysicalInputEvent {
     }
 }
 
-/// Evaluates `inputs` (already in merge order) with the custom preset up to
+/// Evaluates `inputs` (already in merge order) with the tapestry preset up to
 /// `watermark`, in one step.
 pub fn run(
     chart: &Chart,
@@ -109,7 +109,7 @@ pub fn run(
     inputs: &[PhysicalInputEvent],
     watermark: i64,
 ) -> (Vec<JudgeEvent>, Tally) {
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     run_with(chart, &preset, device, start, inputs, watermark)
 }
 

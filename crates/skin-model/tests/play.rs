@@ -384,7 +384,7 @@ fn a_practice_round() {
 #[test]
 fn targets_match_the_evaluators() {
     let chart = practice_chart();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let skin = load(Vec::new(), Vec::new()).unwrap();
     let gauges: Vec<_> = preset
         .gauges

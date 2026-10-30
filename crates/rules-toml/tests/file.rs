@@ -4,16 +4,16 @@ use rules_toml::{MAX_PRESET_FILE_BYTES, PresetError, load_preset_toml, preset_to
 
 #[test]
 fn preset_file_round_trips_to_equal_canonical_bytes() {
-    let custom = rules::custom();
-    let text = preset_to_toml(&custom);
+    let tapestry = rules::tapestry();
+    let text = preset_to_toml(&tapestry);
     let back = load_preset_toml(&text).unwrap();
-    assert_eq!(back, custom);
-    assert_eq!(back.canonical_bytes(), custom.canonical_bytes());
+    assert_eq!(back, tapestry);
+    assert_eq!(back.canonical_bytes(), tapestry.canonical_bytes());
     // Whitespace and comments do not change the bytes.
     let commented = format!("# tuned by playing\n\n{}", text.replace(" = ", "   =   "));
     assert_eq!(
         load_preset_toml(&commented).unwrap().canonical_bytes(),
-        custom.canonical_bytes()
+        tapestry.canonical_bytes()
     );
 }
 
@@ -50,7 +50,7 @@ fn lr2_style_round_trips_to_equal_canonical_bytes() {
 
 #[test]
 fn older_preset_file_is_refused_with_the_hint() {
-    let text = preset_to_toml(&rules::custom());
+    let text = preset_to_toml(&rules::tapestry());
     let old = text.replacen("behind_us = 150000\n", "", 1);
     assert_ne!(old, text, "the edit did not apply");
     let e = load_preset_toml(&old).unwrap_err();
@@ -65,7 +65,7 @@ fn older_preset_file_is_refused_with_the_hint() {
 /// `rank_scale` beside the header policy.
 #[test]
 fn file_without_lane_class_tables_is_refused() {
-    let text = preset_to_toml(&rules::custom());
+    let text = preset_to_toml(&rules::tapestry());
     for (key, table) in [
         ("tables", "[tables.keys.windows.perfect]"),
         ("window_policy", "[window_policy]"),
@@ -105,15 +105,15 @@ fn edited_scratch_and_policy_values_read_back() {
 #[test]
 fn file_without_a_header_policy_is_refused() {
     // Each standard preset names its own policy.
-    let custom = preset_to_toml(&rules::custom());
+    let tapestry = preset_to_toml(&rules::tapestry());
     let style = preset_to_toml(&rules::beatoraja_style());
-    assert!(custom.contains("headers = \"decimals\"\n"), "{custom}");
+    assert!(tapestry.contains("headers = \"decimals\"\n"), "{tapestry}");
     assert!(
         style.contains("headers = \"def_ex_rank_first\"\n"),
         "{style}"
     );
     // A file from before the judgment-header model has no `headers` key.
-    let old = custom.replacen("headers = \"decimals\"\n", "", 1);
+    let old = tapestry.replacen("headers = \"decimals\"\n", "", 1);
     let e = load_preset_toml(&old).unwrap_err();
     assert!(
         matches!(&e, PresetError::Parse(m) if m.message().contains("headers")),
@@ -159,13 +159,13 @@ fn every_gauge_policy_round_trips() {
         fails_below: rules::GaugeValue(2 * rules::GaugeValue::PERCENT),
     };
     hard.correction = rules::TotalCorrection::ScaleDamage;
-    for preset in [p, rules::custom()] {
+    for preset in [p, rules::tapestry()] {
         let text = preset_to_toml(&preset);
         let back = load_preset_toml(&text).unwrap();
         assert_eq!(back.canonical_bytes(), preset.canonical_bytes());
         assert_eq!(back, preset);
     }
-    let mut fixed = rules::custom();
+    let mut fixed = rules::tapestry();
     fixed.default_total = rules::DefaultTotal::Fixed { milli: 0 };
     assert_eq!(
         load_preset_toml(&preset_to_toml(&fixed)),
@@ -177,7 +177,7 @@ fn every_gauge_policy_round_trips() {
 
 #[test]
 fn head_eligibility_reads_back_and_is_required() {
-    let text = preset_to_toml(&rules::custom());
+    let text = preset_to_toml(&rules::tapestry());
     let inside = "head_eligibility = \"inside_bad\"\n";
     assert_eq!(text.matches(inside).count(), 1, "{text}");
     let p = load_preset_toml(&text.replacen(inside, "head_eligibility = \"not_late_bad\"\n", 1))
@@ -198,7 +198,7 @@ fn head_eligibility_reads_back_and_is_required() {
 
 #[test]
 fn the_largest_generated_presets_fit_the_file_limit() {
-    let mut p = rules::custom();
+    let mut p = rules::tapestry();
     // Ids of 136 characters that TOML escapes, the longest the property
     // tests generate, on their largest gauge count.
     let long = "\u{1}".repeat(136);
@@ -214,6 +214,6 @@ fn the_largest_generated_presets_fit_the_file_limit() {
     let text = preset_to_toml(&p);
     assert_eq!(load_preset_toml(&text), Ok(p));
     assert!(text.len() < MAX_PRESET_FILE_BYTES / 2, "{}", text.len());
-    let custom = preset_to_toml(&rules::custom()).len();
-    assert!(custom < 4 << 10, "{custom}");
+    let tapestry = preset_to_toml(&rules::tapestry()).len();
+    assert!(tapestry < 4 << 10, "{tapestry}");
 }

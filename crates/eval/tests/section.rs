@@ -1,7 +1,7 @@
 //! Hand examples for section evaluation (design.md "Section Evaluation"):
 //! the half-open targets, the lead-in, conversion state carried across the
 //! start, the final deadline, the initial gauges and the gauge denominator.
-//! The preset is the custom preset (windows ±20/45/100/180 ms, empty POOR up
+//! The preset is the tapestry preset (windows ±20/45/100/180 ms, empty POOR up
 //! to 500 ms before and 150 ms after a note).
 
 mod common;
@@ -94,7 +94,7 @@ fn section_boundaries_follow_the_half_open_rule() {
             .build()
             .unwrap(),
     );
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let mut events = vec![
         press(9 * S, 0, 6),
@@ -152,7 +152,7 @@ fn ln_crossing_a_section_edge_is_excluded() {
         .long(lane(5), TimeUs(10 * S - 1), TimeUs(12 * S))
         .build()
         .unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let held = [
         (1, 9_900 * MS, 15 * S),
@@ -196,7 +196,7 @@ fn lead_in(presses: &[i64], section: bool) -> Evaluation {
             .build()
             .unwrap(),
     );
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let mut events: Vec<_> = presses
         .iter()
@@ -247,7 +247,7 @@ fn lead_in_release_judges_a_long_note_taken_in_the_lead_in() {
         .long(lane(1), TimeUs(10 * S), TimeUs(10_180 * MS))
         .build()
         .unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let events = vec![press(9_970 * MS, 0, 1), release(9_990 * MS, 0, 1)];
     let e = eval_with(
@@ -296,7 +296,7 @@ fn held_across_section_start_is_not_a_press() {
             .build()
             .unwrap(),
     );
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let start = InputStart {
         opened_at: TimeUs(0),
@@ -355,7 +355,7 @@ fn scratch(turns: &[(i64, i32)]) -> Evaluation {
             .build()
             .unwrap(),
     );
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let mut dev = device(&[0]);
     dev.sources[0].axes.push(AxisBinding {
         control: AXIS,
@@ -403,7 +403,7 @@ fn section_finalizes_through_its_final_deadline() {
         .tap(lane(1), TimeUs(25 * S))
         .build()
         .unwrap();
-    let mut preset = rules::custom();
+    let mut preset = rules::tapestry();
     // Wide enough that a press after the final deadline would be an empty
     // POOR if it were judged.
     preset.tables.keys.empty_poor.behind = TimeUs(S);
@@ -459,7 +459,7 @@ fn section_without_targets_completes_at_its_start() {
         .mine(lane(2), TimeUs(25 * S), 2)
         .build()
         .unwrap();
-    let mut preset = rules::custom();
+    let mut preset = rules::tapestry();
     preset.tables.keys.empty_poor.behind = TimeUs(100 * S);
     let dev = device(&[0]);
     let s = section(30 * S, 40 * S, 2 * S, &preset);
@@ -482,7 +482,7 @@ fn section_without_targets_completes_at_its_start() {
     assert_eq!(kinds, [(TimeUs(30 * S), JudgeEventKind::SongEnd)]);
 }
 
-/// The custom gauges (normal, survival) from `initial` after the section's
+/// The tapestry gauges (normal, survival) from `initial` after the section's
 /// one tap at 10 s, pressed on time or missed.
 fn gauges_after(press_it: bool, initial: [i64; 2]) -> Result<Vec<GaugeValue>, EvalError> {
     let chart = ChartBuilder::new(BPM)
@@ -490,7 +490,7 @@ fn gauges_after(press_it: bool, initial: [i64; 2]) -> Result<Vec<GaugeValue>, Ev
         .tap(lane(1), TimeUs(30 * S))
         .build()
         .unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let s = Section {
         initial_gauges: initial.map(GaugeValue).to_vec(),
@@ -556,7 +556,7 @@ fn initial_gauges_outside_the_bounds_are_refused() {
         .tap(lane(1), TimeUs(10 * S))
         .build()
         .unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let s = Section {
         initial_gauges: vec![GaugeValue(20 * PCT)],
@@ -620,7 +620,7 @@ fn section_gauge_uses_the_chart_denominator() {
     }
     let mut chart = b.build().unwrap();
     chart.meta.judgment_headers = vec![common::total(160_000)];
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let dev = device(&[0]);
     let s = Section {
         initial_gauges: vec![GaugeValue(20 * PCT), GaugeValue::FULL],

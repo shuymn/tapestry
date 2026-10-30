@@ -120,7 +120,7 @@ fn loaded_charts_evaluate_as_before() {
         ("lntype1", load(&fixture("long_notes_lntype1.bms"))),
         ("lnobj", load(&fixture("long_notes_lnobj.bms"))),
     ];
-    let (input, preset) = (frozen_input(), rules::custom());
+    let (input, preset) = (frozen_input(), rules::tapestry());
     let evaluations: Vec<(&str, Evaluation)> = charts
         .iter()
         .map(|(n, c)| (*n, evaluate(c, &input, &preset).unwrap()))

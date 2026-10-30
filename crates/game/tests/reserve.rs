@@ -78,7 +78,7 @@ fn reservation_matches_what_a_play_allocates() {
     }
     let chart = b.build().unwrap();
     let objects: usize = chart.lanes.iter().map(Vec::len).sum();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0, 0, 0]);
     let effects = 1_000;
     let r = Reservation::of(&chart, &rule, &dev, effects).unwrap();

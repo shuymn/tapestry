@@ -111,7 +111,7 @@ fn two_sources() -> PlayRecord {
         },
         // Its hash matches its bytes, so a mutated body gets past the preset
         // check while those bytes stay intact.
-        preset: PresetRecord::of(&rules::custom()),
+        preset: PresetRecord::of(&rules::tapestry()),
         session_policy: "default".to_owned(),
         devices: DeviceRecord {
             sources: vec![
@@ -438,10 +438,10 @@ pub fn raw_inputs() -> Vec<Seed> {
     ]
 }
 
-/// Where `bytes`, [`rules::custom`]'s, hold the gauge count: the first byte
+/// Where `bytes`, [`rules::tapestry`]'s, hold the gauge count: the first byte
 /// that differs from the same preset's without gauges.
 fn gauge_count_at(bytes: &[u8]) -> usize {
-    let mut empty = rules::custom();
+    let mut empty = rules::tapestry();
     empty.gauges.clear();
     bytes
         .iter()
@@ -454,10 +454,10 @@ fn gauge_count_at(bytes: &[u8]) -> usize {
 /// refusal the smoke tests expect.
 #[must_use]
 pub fn preset_canonicals() -> Vec<Seed> {
-    let custom = rules::custom();
-    let bytes = custom.canonical_bytes();
+    let tapestry = rules::tapestry();
+    let bytes = tapestry.canonical_bytes();
     // Strings and a gauge list whose lengths take two varint bytes.
-    let mut long = custom.clone();
+    let mut long = tapestry.clone();
     long.id = "p".repeat(200);
     let gauge = long.gauges[1].clone();
     long.gauges = (0..130)
@@ -477,7 +477,7 @@ pub fn preset_canonicals() -> Vec<Seed> {
     };
     policies.gauges[4].correction = rules::TotalCorrection::ScaleDamage;
     let mut seeds: Vec<Seed> = vec![
-        ("custom", bytes.clone()),
+        ("tapestry", bytes.clone()),
         (
             "beatoraja_style",
             rules::beatoraja_style().canonical_bytes(),
@@ -506,7 +506,7 @@ pub fn preset_canonicals() -> Vec<Seed> {
     let count_at = gauge_count_at(&bytes);
     assert!(
         bytes.len() - count_at < 16_383,
-        "the custom preset is short"
+        "the tapestry preset is short"
     );
     seeds.push((
         "count_beyond_data",
@@ -515,9 +515,9 @@ pub fn preset_canonicals() -> Vec<Seed> {
         }),
     ));
     // The first gauge's kind, after the count and its id, is tag 2.
-    let id = &custom.gauges[0].id;
+    let id = &tapestry.gauges[0].id;
     assert!(
-        id.len() < 128 && custom.gauges.len() < 128,
+        id.len() < 128 && tapestry.gauges.len() < 128,
         "one-byte lengths"
     );
     seeds.push(("unknown_tag", edited(&|b| b[count_at + 2 + id.len()] = 2)));
@@ -532,8 +532,8 @@ pub fn preset_canonicals() -> Vec<Seed> {
         }),
     ));
     // The id's first byte, then the preset version, after the id, as 2^32.
-    let id = &custom.id;
-    assert!(id.len() < 128 && custom.version < 128, "one-byte varints");
+    let id = &tapestry.id;
+    assert!(id.len() < 128 && tapestry.version < 128, "one-byte varints");
     seeds.push(("invalid_utf8", edited(&|b| b[2] = 0xff)));
     let version_at = 2 + id.len();
     seeds.push((
@@ -556,9 +556,9 @@ pub fn preset_canonicals() -> Vec<Seed> {
             .position(|(&a, b)| a != b)
             .expect("the edit changes the bytes")
     };
-    let mut scaled = custom.clone();
+    let mut scaled = tapestry.clone();
     let rules::WindowPolicy::Thousandths(scale) = &mut scaled.window_policy else {
-        panic!("custom scales in thousandths");
+        panic!("tapestry scales in thousandths");
     };
     scale.rank_milli[0] += 1;
     let rank_at = first_change(&bytes, &scaled) - 1;
@@ -585,7 +585,7 @@ pub fn preset_canonicals() -> Vec<Seed> {
             b.pop();
         }),
     ));
-    let mut no_gauges = custom;
+    let mut no_gauges = tapestry;
     no_gauges.gauges.clear();
     seeds.push(("invalid", no_gauges.canonical_bytes()));
     seeds

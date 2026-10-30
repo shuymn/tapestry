@@ -104,7 +104,7 @@ fn chart() -> impl Strategy<Value = ChartRecord> {
 fn preset() -> impl Strategy<Value = PresetRecord> {
     prop_oneof![
         text().prop_map(|id| {
-            let mut p = rules::custom();
+            let mut p = rules::tapestry();
             p.id = id;
             PresetRecord::of(&p)
         }),

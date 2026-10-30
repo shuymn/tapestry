@@ -952,7 +952,7 @@ fn excerpt_matches_mid_chart_start_end_to_end() {
         round.start.held.iter().any(|&(_, c, v)| c == x && v != 0),
         "lane 3's key is held at the opening"
     );
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let sec = eval::Section {
         start: TimeUs(section.0),
         end: TimeUs(section.1),

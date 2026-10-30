@@ -366,13 +366,13 @@ fn empty_poor_is_part_of_the_scan() {
 
 /// Source: play/JudgeManager.java:385-419 (the scan finds the judged note
 /// behind the press) and play/JudgeProperty.java:23 (MS late -150000); the
-/// custom preset's range is 150 ms behind too (design.md "Custom Preset").
+/// tapestry preset's range is 150 ms behind too (design.md "The tapestry Preset").
 /// The scan is located by time, not started at the first unjudged note,
 /// which no longer exists once the lane's last note is hit.
 #[test]
 fn empty_poor_after_the_last_hit_note() {
     let chart = taps(&[T - 400 * MS, T]);
-    for preset in [rules::beatoraja_style(), rules::custom()] {
+    for preset in [rules::beatoraja_style(), rules::tapestry()] {
         let run = |after: i64| {
             let input = EvalInput {
                 events: taps_at(&[T - 400 * MS, T, T + after]),
@@ -778,7 +778,7 @@ fn absent_total_is_260() {
 }
 
 /// Source: jbms-parser BMSDecoder.java:730-743 (`if (total > 0)`, else a
-/// warning and the earlier `#TOTAL` stays). The custom preset reads the same
+/// warning and the earlier `#TOTAL` stays). The tapestry preset reads the same
 /// declarations as loader version 6 did: the later `#TOTAL 0` counts, and a
 /// `#TOTAL` that is not positive leaves its default, 160.
 #[test]
@@ -791,7 +791,7 @@ fn zero_total_after_a_total() {
     // 200 % over 4 notes: a PERFECT adds 50 %.
     let e = play(&chart, tap_at(T));
     assert_eq!(e.gauges[NORMAL].history[0].value.0, 70 * PCT);
-    // Custom: 160 % over 4 notes adds 40 %.
+    // Tapestry: 160 % over 4 notes adds 40 %.
     let input = EvalInput {
         events: tap_at(T),
         device: device(&[0]),
@@ -799,8 +799,8 @@ fn zero_total_after_a_total() {
         finalized: None,
         section: None,
     };
-    let custom = evaluate(&chart, &input, &rules::custom()).unwrap();
-    assert_eq!(custom.gauges[0].history[0].value.0, 60 * PCT);
+    let tapestry = evaluate(&chart, &input, &rules::tapestry()).unwrap();
+    assert_eq!(tapestry.gauges[0].history[0].value.0, 60 * PCT);
 }
 
 // ------------------------------------------------- gauges from a set value

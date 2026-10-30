@@ -23,7 +23,7 @@ fn load(text: &str) -> Chart {
 fn autoplayed(chart: &Chart) -> Vec<JudgeEvent> {
     let device = device(&[0]);
     let inputs = input::autoplay(chart, &device.sources[0]).unwrap();
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let mut ev = Evaluator::new(
         chart,
         &preset,

@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn gauges_are_named_by_the_preset_the_play_used() {
-        let mut preset = rules::custom();
+        let mut preset = rules::tapestry();
         let ids: Vec<String> = preset.gauges.iter().map(|g| g.id.clone()).collect();
         assert!(!ids.is_empty());
         for g in &mut preset.gauges {
@@ -448,7 +448,7 @@ mod tests {
     /// record, the incomplete reason, alone or with others.
     #[test]
     fn an_input_failure_is_named_on_the_end_screen() {
-        let preset = rules::custom();
+        let preset = rules::tapestry();
         let mut played = report(preset.clone());
         played.end = game::PlayEnd::Aborted(game::AbortCause::InputFailed);
         played.input_error = Some(game::InputWaitError::Gone);
@@ -535,7 +535,7 @@ mod tests {
     /// and no such line.
     #[test]
     fn autoplay_end_screen_says_not_saved() {
-        let mut played = report(rules::custom());
+        let mut played = report(rules::tapestry());
         played.result.as_mut().unwrap().recommended_offset = Some(game::RecommendedOffset {
             median: bms_model::TimeUs(0),
             spread: bms_model::TimeUs(0),

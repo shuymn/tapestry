@@ -52,7 +52,7 @@ fn audio_on<O: AudioOutput + Wakes>(
 
 fn run_spaced(sim: SimConfig, step: i64) -> (Vec<f32>, SimDevice) {
     let chart = spaced_chart();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[3 * MS]);
     let (_, script) = autoplay_script(&chart, &dev);
     let sources = SourceSet::new(common::sources()).unwrap();
@@ -206,7 +206,7 @@ fn late_edge(out: Flaky, step: i64) -> (RunOutcome, Vec<f32>) {
         .build()
         .unwrap();
     chart.lanes[1][0].sound = Some(SoundId(0));
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let script = key_script(&[1_180 * MS], None);
     let sources = SourceSet::new(common::sources()).unwrap();
@@ -264,7 +264,7 @@ fn a_healthy_backlog_of_sounds_completes() {
         .build()
         .unwrap();
     chart.lanes[1][0].sound = Some(SoundId(0));
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let presses: Vec<i64> = (0..5_000).map(|k| 710 * MS + k * 20).collect();
     let script = key_script_with(&presses, 10, None);
@@ -305,7 +305,7 @@ fn a_stalled_output_ends_the_handoff_instead_of_waiting_forever() {
         .build()
         .unwrap();
     chart.lanes[1][0].sound = Some(SoundId(0));
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let presses: Vec<i64> = (0..1_100).map(|k| 200 * MS + k * 100).collect();
     let script = key_script(&presses, None);
@@ -359,7 +359,7 @@ fn abort_run(
             Sound::mono(vec![2_048; 480]),
         ],
     ));
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let script = key_script(presses, Some(focus));
     let sources = SourceSet::new(common::sources()).unwrap();
@@ -451,7 +451,7 @@ fn bgm_starts_at_its_chart_time_frames_across_the_lead_in() {
             sound: SoundId(u16::try_from(i).unwrap()),
         })
         .collect();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[0]);
     let (_, script) = autoplay_script(&chart, &dev);
     let sources = SourceSet::new(common::sources()).unwrap();
@@ -478,7 +478,7 @@ fn a_failed_output_stops_the_run() {
     // The device's first wake is 20 ms into the run, and every write fails.
     let first = TimeUs(START.0 + 20 * MS);
     let chart = spaced_chart();
-    let rule = rules::custom();
+    let rule = rules::tapestry();
     let dev = device(&[3 * MS]);
     let (_, script) = autoplay_script(&chart, &dev);
     let sources = SourceSet::new(common::sources()).unwrap();

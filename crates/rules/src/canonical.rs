@@ -768,7 +768,7 @@ mod tests {
     use bms_model::TimeUs;
 
     use crate::{
-        CanonicalError, GaugeKind, Judgment, LaneClass, RuleError, RulePreset, Side, custom,
+        CanonicalError, GaugeKind, Judgment, LaneClass, RuleError, RulePreset, Side, tapestry,
     };
 
     use super::{FORMAT_VERSION, MIN_BAND_BYTES, MIN_GAUGE_BYTES, Reader, Writer};
@@ -782,9 +782,9 @@ mod tests {
 
     #[test]
     fn canonical_bytes_change_with_any_window_of_either_class() {
-        let base = custom();
+        let base = tapestry();
         let base_bytes = base.canonical_bytes();
-        assert_eq!(base_bytes, custom().canonical_bytes());
+        assert_eq!(base_bytes, tapestry().canonical_bytes());
 
         let edges: [fn(&mut crate::JudgeWindows) -> &mut TimeUs; 8] = [
             |w| &mut w.perfect.early,
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn canonical_bytes_start_with_format_10_and_change_with_any_table_edge() {
-        let base = custom();
+        let base = tapestry();
         let base_bytes = base.canonical_bytes();
         assert_eq!(base_bytes.first(), Some(&10));
         let edges: [fn(&mut crate::LaneTable) -> &mut TimeUs; 5] = [
@@ -864,9 +864,9 @@ mod tests {
 
     #[test]
     fn canonical_bytes_cover_identity_and_gauges() {
-        let base = custom().canonical_bytes();
+        let base = tapestry().canonical_bytes();
         let changed = |edit: fn(&mut crate::RulePreset)| {
-            let mut preset = custom();
+            let mut preset = tapestry();
             edit(&mut preset);
             preset.canonical_bytes()
         };
@@ -907,7 +907,7 @@ mod tests {
 
     /// A preset with every field distinct from its neighbours.
     fn representative() -> crate::RulePreset {
-        let mut p = custom();
+        let mut p = tapestry();
         p.id = "rep".to_owned();
         p.version = 7;
         p.implementation = crate::Implementation::Standard { version: 4 };
@@ -963,7 +963,7 @@ mod tests {
     /// is zigzag 180000 = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1
     /// 19`) and the empty POOR range (`ahead` 250 ms is zigzag 500000 = `a0
     /// c2 1e`, `behind` 120 ms is zigzag 240000 = `80 d3 0e`); the scratch's
-    /// table, custom's but 160 ms behind (`80 c4 13`); the miss rule (0),
+    /// table, tapestry's but 160 ms behind (`80 c4 13`); the miss rule (0),
     /// the empty POOR's three flags, the header policy (`DefExRankFirst`, 1),
     /// the window policy (`Interpolated`, 2: five percentages `19 32 4b 64 7d`, 80
     /// `50`, 70 `46`), the default `#TOTAL` (`Fixed`, 0: 123.456 is zigzag
@@ -1029,10 +1029,10 @@ mod tests {
         RulePreset::from_canonical_bytes(bytes)
     }
 
-    /// Where a field of [`custom`]'s bytes starts: the length of the
+    /// Where a field of [`tapestry`]'s bytes starts: the length of the
     /// version and the fields `before` writes.
     fn offset(before: impl FnOnce(&mut Writer, &RulePreset)) -> usize {
-        let preset = custom();
+        let preset = tapestry();
         let mut w = Writer(Vec::new());
         w.uint(FORMAT_VERSION);
         before(&mut w, &preset);
@@ -1068,9 +1068,9 @@ mod tests {
         w.uint(0);
     }
 
-    /// [`custom`]'s bytes with the varint at `at` replaced by `v`.
+    /// [`tapestry`]'s bytes with the varint at `at` replaced by `v`.
     fn with_uint_at(at: usize, v: u64) -> Vec<u8> {
-        let bytes = custom().canonical_bytes();
+        let bytes = tapestry().canonical_bytes();
         let mut old = Reader(&bytes[at..]);
         old.uint().unwrap();
         let end = bytes.len() - old.0.len();
@@ -1082,16 +1082,16 @@ mod tests {
 
     #[test]
     fn custom_preset_decodes() {
-        assert_eq!(decode(&custom().canonical_bytes()), Ok(custom()));
+        assert_eq!(decode(&tapestry().canonical_bytes()), Ok(tapestry()));
     }
 
     #[test]
     fn header_policies_decode_and_differ() {
         let style = crate::beatoraja_style();
         assert_eq!(decode(&style.canonical_bytes()), Ok(style));
-        let mut p = custom();
+        let mut p = tapestry();
         p.headers = crate::HeaderPolicy::DefExRankFirst;
-        assert_ne!(p.canonical_bytes(), custom().canonical_bytes());
+        assert_ne!(p.canonical_bytes(), tapestry().canonical_bytes());
         assert_eq!(decode(&p.canonical_bytes()), Ok(p));
     }
 
@@ -1114,17 +1114,17 @@ mod tests {
     fn assignments_decode_and_differ() {
         let style = crate::beatoraja_style();
         assert_eq!(style.assignment, crate::Assignment::ComboPriority);
-        let mut p = custom();
+        let mut p = tapestry();
         p.assignment = crate::Assignment::ComboPriority;
-        assert_ne!(p.canonical_bytes(), custom().canonical_bytes());
+        assert_ne!(p.canonical_bytes(), tapestry().canonical_bytes());
         assert_eq!(decode(&p.canonical_bytes()), Ok(p));
     }
 
     #[test]
     fn head_eligibilities_decode_and_differ() {
-        let mut p = custom();
+        let mut p = tapestry();
         p.ln_mode.head_eligibility = crate::HeadEligibility::NotLateBad;
-        assert_ne!(p.canonical_bytes(), custom().canonical_bytes());
+        assert_ne!(p.canonical_bytes(), tapestry().canonical_bytes());
         assert_eq!(decode(&p.canonical_bytes()), Ok(p));
     }
 
@@ -1165,7 +1165,7 @@ mod tests {
         );
         // The gauge count, checked before the gauges are allocated.
         let at = offset(through_denominator);
-        let left = custom().canonical_bytes().len() - at - 1;
+        let left = tapestry().canonical_bytes().len() - at - 1;
         for count in [u64::try_from(left).unwrap() + 1, u64::MAX] {
             assert_eq!(
                 decode(&with_uint_at(at, count)),
@@ -1241,7 +1241,7 @@ mod tests {
     #[test]
     fn gauge_count_is_bounded_by_the_smallest_gauge() {
         let at = offset(through_denominator);
-        let prefix = &custom().canonical_bytes()[..at];
+        let prefix = &tapestry().canonical_bytes()[..at];
         // An empty id, survival with a zero threshold, zero values, six
         // `Fixed(0)` deltas, no correction and no low-damage band.
         let smallest = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn band_count_is_bounded_by_the_smallest_band() {
         let at = offset(through_denominator);
-        let prefix = &custom().canonical_bytes()[..at];
+        let prefix = &tapestry().canonical_bytes()[..at];
         // One gauge, the smallest but for its band count.
         let gauge = |bands: u64, band_bytes: usize| {
             let mut w = Writer(prefix.to_vec());
@@ -1339,7 +1339,7 @@ mod tests {
             let g = &p.gauges[0];
             w.str(&g.id);
             let GaugeKind::EndThreshold { clear } = g.kind else {
-                panic!("the first custom gauge has a clear threshold");
+                panic!("the first tapestry gauge has a clear threshold");
             };
             w.uint(0);
             w.gauge_value(clear);
@@ -1357,7 +1357,7 @@ mod tests {
             let g = &p.gauges[0];
             w.str(&g.id);
             let GaugeKind::EndThreshold { clear } = g.kind else {
-                panic!("the first custom gauge has a clear threshold");
+                panic!("the first tapestry gauge has a clear threshold");
             };
             w.uint(0);
             w.gauge_value(clear);
@@ -1379,9 +1379,9 @@ mod tests {
             decode(&with_uint_at(default_total, 3)),
             unknown("default_total", 3)
         );
-        let bytes = custom().canonical_bytes();
+        let bytes = tapestry().canonical_bytes();
         let mut mine = Writer(Vec::new());
-        mine.mine(&custom().mine);
+        mine.mine(&tapestry().mine);
         let mine = bytes.len() - mine.0.len();
         assert_eq!(decode(&with_uint_at(mine, 1)), unknown("mine", 1));
         // The assignment precedes the LN mode's three tags and the `#TOTAL`
@@ -1398,7 +1398,7 @@ mod tests {
         );
 
         // The implementation's tag is its name.
-        let mut p = custom();
+        let mut p = tapestry();
         p.id = "x".to_owned();
         let mut bytes = p.canonical_bytes();
         // The version, the id `x` and the preset version 3, then the name.
@@ -1414,7 +1414,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_refused() {
-        let mut bytes = custom().canonical_bytes();
+        let mut bytes = tapestry().canonical_bytes();
         bytes.push(0);
         assert_eq!(decode(&bytes), Err(CanonicalError::TrailingBytes(1)));
         bytes.extend_from_slice(&[0; 9]);
@@ -1425,7 +1425,7 @@ mod tests {
 
     #[test]
     fn invalid_decoded_preset_is_refused() {
-        let mut p = custom();
+        let mut p = tapestry();
         p.tables.scratch.windows.bad.early = p.tables.scratch.windows.good.early;
         assert_eq!(
             decode(&p.canonical_bytes()),
@@ -1444,7 +1444,7 @@ mod tests {
                 }
             ))
         );
-        let mut p = custom();
+        let mut p = tapestry();
         p.gauges.clear();
         assert_eq!(
             decode(&p.canonical_bytes()),
@@ -1465,7 +1465,7 @@ mod tests {
             Err(CanonicalError::ValueTooLarge { field: "version" })
         );
         // The id is not UTF-8.
-        let mut bytes = custom().canonical_bytes();
+        let mut bytes = tapestry().canonical_bytes();
         bytes[2] = 0xff;
         assert_eq!(
             decode(&bytes),

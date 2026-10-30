@@ -423,7 +423,7 @@ pub struct PlayOutcome {
 impl Loaded {
     /// Reads the preset named in `player.toml`, then ingests the chart and
     /// applies the transform. A missing standard preset file is written
-    /// first: `custom.toml` or `beatoraja-style.toml`.
+    /// first: `tapestry.toml` or `beatoraja-style.toml`.
     ///
     /// # Errors
     ///
@@ -1021,11 +1021,11 @@ fn generated() -> eval::SourceProfile {
 }
 
 /// The standard preset a missing file of this name is written with
-/// (design.md "Standard Presets"): `custom.toml` and
+/// (design.md "Standard Presets"): `tapestry.toml` and
 /// `beatoraja-style.toml`. `None` for any other name.
 fn standard_preset(file: &str) -> Option<RulePreset> {
     match file {
-        "custom.toml" => Some(rules::custom()),
+        "tapestry.toml" => Some(rules::tapestry()),
         "beatoraja-style.toml" => Some(rules::beatoraja_style()),
         _ => None,
     }

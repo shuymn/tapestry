@@ -540,7 +540,7 @@ fn sample() -> replay::PlayRecord {
             provenance: replay::BuildProvenance::Development,
         },
         chart: replay::ChartRecord::default(),
-        preset: replay::PresetRecord::of(&rules::custom()),
+        preset: replay::PresetRecord::of(&rules::tapestry()),
         session_policy: "default".to_owned(),
         devices: replay::DeviceRecord {
             sources: Vec::new(),

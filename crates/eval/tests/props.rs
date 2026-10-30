@@ -539,7 +539,10 @@ fn choices(p: &RulePreset) -> impl PartialEq + use<> {
 /// choice it makes, asymmetric windows, and survival gauges with and
 /// without reduced damage.
 fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
-    c.hit("choices_of_custom", choices(p) == choices(&rules::custom()));
+    c.hit(
+        "choices_of_custom",
+        choices(p) == choices(&rules::tapestry()),
+    );
     c.hit(
         "choices_of_beatoraja_style",
         choices(p) == choices(&rules::beatoraja_style()),

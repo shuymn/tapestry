@@ -708,11 +708,11 @@ fn a_screen_failure_on_the_end_screen_is_rebuilt_and_shown_again() {
 fn each_report_carries_the_preset_its_play_used() {
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = loaded(dir.path());
-    let mut renamed = rules::custom();
+    let mut renamed = rules::tapestry();
     for g in &mut renamed.gauges {
         g.id = format!("{}-renamed", g.id);
     }
-    let path = dir.path().join("presets").join("custom.toml");
+    let path = dir.path().join("presets").join("tapestry.toml");
     std::fs::write(&path, game::preset_to_toml(&renamed)).unwrap();
     std::fs::File::options()
         .write(true)
@@ -730,7 +730,7 @@ fn each_report_carries_the_preset_its_play_used() {
             .map(|g| g.id.clone())
             .collect::<Vec<_>>()
     };
-    let old: Vec<_> = rules::custom()
+    let old: Vec<_> = rules::tapestry()
         .gauges
         .iter()
         .map(|g| g.id.clone())

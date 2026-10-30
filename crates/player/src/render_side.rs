@@ -1089,7 +1089,7 @@ mod tests {
             .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
             .build()
             .unwrap();
-        let rule = rules::custom();
+        let rule = rules::tapestry();
         let device = DeviceProfile::default();
         let (_logic, side) = Logic::<SourceReader>::new(
             &chart,
@@ -1192,7 +1192,7 @@ mod tests {
             Box::new(NoFrames),
         )
         .unwrap();
-        let (rule, device) = (rules::custom(), DeviceProfile::default());
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
         let (_logic, side) = Logic::<SourceReader>::new(
             &chart,
             &rule,
@@ -1265,7 +1265,7 @@ mod tests {
             .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
             .build()
             .unwrap();
-        let rule = rules::custom();
+        let rule = rules::tapestry();
         let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
         let (mut writer, reader) = input::source_queue(16);
         // Z, lane 1's default key, pressed on the note.
@@ -1385,7 +1385,7 @@ mod tests {
             builder = builder.tap(Lane::new(1).unwrap(), TimeUs(1_000_000 + k * 200_000));
         }
         let chart = builder.build().unwrap();
-        let rule = rules::custom();
+        let rule = rules::tapestry();
         let device = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
         let (mut writer, reader) = input::source_queue(32);
         // Every note hit on time.
@@ -1529,7 +1529,7 @@ mod tests {
             .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
             .build()
             .unwrap();
-        let (rule, device) = (rules::custom(), DeviceProfile::default());
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
         let (_logic, side) = Logic::<SourceReader>::new(
             &chart,
             &rule,

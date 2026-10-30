@@ -155,7 +155,7 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
     assert_names(
         &seeds,
         &[
-            "custom",
+            "tapestry",
             "beatoraja_style",
             "lr2_style",
             "gauge_policies",
@@ -179,7 +179,7 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
     for (name, bytes) in seeds {
         let result = preset_canonical(&bytes).map(|_| ());
         let expected = match name {
-            "custom" | "beatoraja_style" | "lr2_style" | "gauge_policies" | "long" => Ok(()),
+            "tapestry" | "beatoraja_style" | "lr2_style" | "gauge_policies" | "long" => Ok(()),
             "other_version" => Err(CanonicalError::UnsupportedVersion(11)),
             "older_version" => Err(CanonicalError::UnsupportedVersion(9)),
             "wrong_percent_length" => Err(CanonicalError::WrongLength {
