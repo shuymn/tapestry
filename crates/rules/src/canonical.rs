@@ -27,6 +27,11 @@ use crate::{
 /// and no LN break.
 const FORMAT_VERSION: u64 = 4;
 
+/// The fewest bytes a gauge takes: an empty id's length, the survival tag,
+/// three one-byte values, six fixed deltas of a tag and a one-byte value,
+/// and no low-damage rule.
+const MIN_GAUGE_BYTES: usize = 1 + 1 + 3 + 6 * 2 + 1;
+
 impl RulePreset {
     /// The preset's canonical bytes: equal presets give equal bytes, and any
     /// change of value gives different bytes.
@@ -85,9 +90,7 @@ impl RulePreset {
         w.mine(mine);
         w.0
     }
-}
 
-impl RulePreset {
     /// Decodes [`canonical_bytes`](Self::canonical_bytes) of the current
     /// version back into the preset.
     ///
@@ -119,8 +122,9 @@ impl RulePreset {
         let denominator = r.tag("denominator", |t| {
             (t == 0).then_some(Denominator::TapsAndLnHeads)
         })?;
-        let count = r.count("gauges")?;
-        let mut gauges = Vec::with_capacity(count);
+        let count = r.count("gauges", MIN_GAUGE_BYTES)?;
+        // Grown as gauges are read, never reserved from the count.
+        let mut gauges = Vec::new();
         for _ in 0..count {
             gauges.push(r.gauge()?);
         }
@@ -396,13 +400,13 @@ impl Reader<'_> {
         u32::try_from(self.uint()?).map_err(|_| CanonicalError::ValueTooLarge { field })
     }
 
-    /// A count no larger than the bytes left, since every entry takes at
-    /// least one byte.
-    fn count(&mut self, field: &'static str) -> Result<usize, CanonicalError> {
+    /// A count of entries that each take at least `min_bytes`, refused when
+    /// that many cannot fit in the bytes left.
+    fn count(&mut self, field: &'static str, min_bytes: usize) -> Result<usize, CanonicalError> {
         let count = self.uint()?;
         usize::try_from(count)
             .ok()
-            .filter(|&n| n <= self.0.len())
+            .filter(|&n| n <= self.0.len() / min_bytes)
             .ok_or(CanonicalError::CountBeyondData { field, count })
     }
 
@@ -424,7 +428,7 @@ impl Reader<'_> {
     }
 
     fn str(&mut self, field: &'static str) -> Result<String, CanonicalError> {
-        let n = self.count(field)?;
+        let n = self.count(field, 1)?;
         let (s, rest) = self
             .0
             .split_at_checked(n)
@@ -486,7 +490,7 @@ impl Reader<'_> {
     }
 
     fn rank_scale(&mut self) -> Result<RankScale, CanonicalError> {
-        let len = self.count("rank_scale")?;
+        let len = self.count("rank_scale", 1)?;
         if len != 4 {
             return Err(CanonicalError::WrongLength {
                 field: "rank_scale",
@@ -607,7 +611,7 @@ mod tests {
 
     use crate::{CanonicalError, GaugeKind, Judgment, RuleError, RulePreset, Side, custom};
 
-    use super::{FORMAT_VERSION, Reader, Writer};
+    use super::{FORMAT_VERSION, MIN_GAUGE_BYTES, Reader, Writer};
 
     #[test]
     fn canonical_bytes_change_with_any_window() {
@@ -882,6 +886,45 @@ mod tests {
             Err(CanonicalError::WrongLength {
                 field: "rank_scale",
                 len: 5
+            })
+        );
+    }
+
+    #[test]
+    fn gauge_count_is_bounded_by_the_smallest_gauge() {
+        let at = offset(through_denominator);
+        let prefix = &custom().canonical_bytes()[..at];
+        // An empty id, survival, zero values, six `Fixed(0)` deltas, no
+        // low-damage rule.
+        let smallest = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(smallest.len(), MIN_GAUGE_BYTES);
+        let with = |count: u64, gauges: usize| {
+            let mut w = Writer(prefix.to_vec());
+            w.uint(count);
+            for _ in 0..gauges {
+                w.0.extend_from_slice(&smallest);
+            }
+            w.0
+        };
+        // Three gauges in exactly their bytes are read; the score then finds
+        // nothing. A fourth cannot fit.
+        assert_eq!(decode(&with(3, 3)), Err(CanonicalError::Truncated));
+        assert_eq!(
+            decode(&with(4, 3)),
+            Err(CanonicalError::CountBeyondData {
+                field: "gauges",
+                count: 4
+            })
+        );
+        // 2^24 gauges with 16 MiB left: refused before any gauge is read or
+        // space for one is reserved.
+        let mut large = with(1 << 24, 0);
+        large.resize(large.len() + (16 << 20), 0);
+        assert_eq!(
+            decode(&large),
+            Err(CanonicalError::CountBeyondData {
+                field: "gauges",
+                count: 1 << 24
             })
         );
     }
