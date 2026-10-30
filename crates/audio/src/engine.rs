@@ -128,6 +128,11 @@ pub enum SeekError {
         /// The first frame not yet written.
         written: u64,
     },
+    /// The play is ringing out, or has rung out: a seek belongs to the
+    /// start of a play, after [`AudioEngine::restart`] has taken the
+    /// ring-out off.
+    #[error("the play is ringing out; a seek starts the next play")]
+    RingingOut,
 }
 
 /// Engine ids for [`SeekSource`]: one per engine built.
@@ -163,7 +168,8 @@ pub struct AudioEngine {
     /// Where chart time 0 lies on the output's timeline.
     play_origin: TimeUs,
     /// The chart time a seek starts at and the starts the pass reaching it
-    /// may still admit, until its frame is placed.
+    /// may still admit, until its frame is placed. Set only at a play's
+    /// start: a seek is refused while a ring-out is set ([`SeekError::RingingOut`]).
     seek_to: Option<(TimeUs, usize)>,
     /// A ring-out's fade and end in chart time, until the pass that reaches
     /// the fade puts them on the output.
@@ -325,7 +331,9 @@ impl AudioEngine {
     /// dropped; no BGM event or key sound starts from there. The play's
     /// audio then ends as a sealed tail does
     /// (no voice, no BGM event left). Until then the BGM plays on its
-    /// schedule. Allocates nothing.
+    /// schedule. Until the next [`restart`](Self::restart) a seek is refused
+    /// ([`SeekError::RingingOut`]), so nothing takes the envelope off before
+    /// its end. Allocates nothing.
     pub fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
         // A fade after the end is placed and rung as the end.
         self.ring_out = Some((fade_at.min(end_at), end_at));
@@ -396,12 +404,20 @@ impl AudioEngine {
     /// [`SeekError`] for a plan made from another engine's
     /// [`seek_source`](Self::seek_source) (a schedule other than this
     /// engine's is refused when planning), on a line of another rate or
-    /// period, or whose frame is already written; nothing changes.
+    /// period, or whose frame is already written; and
+    /// [`SeekError::RingingOut`] while a ring-out is set: a seek starts a
+    /// play (a round's restore), so it comes after [`restart`](Self::restart),
+    /// which takes the ring-out off, and never cuts into a fade. Nothing
+    /// changes.
     pub fn seek(&mut self, plan: &SeekPlan) -> Result<(), SeekError> {
         // A plan of another engine, or of a chart the engine no longer plays
         // (its bank or schedule was replaced since), is refused.
         if plan.engine() != self.id || plan.chart() != self.chart {
             return Err(SeekError::Source);
+        }
+        // Parking the seek's voices would take the envelope off with them.
+        if self.ring_out.is_some() || self.ring_end.is_some() {
+            return Err(SeekError::RingingOut);
         }
         let line = plan.line();
         if (line.rate, line.period) != (self.rate, self.period) {

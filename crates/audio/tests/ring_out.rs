@@ -268,3 +268,28 @@ fn a_fade_after_the_end_counts_as_the_end() {
         time: TimeUs(2_600 * MS)
     }));
 }
+
+#[test]
+fn a_seek_during_a_ring_out_waits_for_the_next_play() {
+    // Rung out from 2 s to 2.5 s, rendered into the fade (2.2 s), then a
+    // seek to 2.4 s, inside the long sound: refused, so the fade still
+    // ends at 2.5 s and nothing sounds after it.
+    let mut out = device(480, 2);
+    let mut e = AudioEngine::new(bank(), &bgm(), RATE, 480, 8, 0).unwrap();
+    e.restart(TimeUs(ORIGIN));
+    e.ring_out(FADE_AT, END_AT);
+    run_to(&mut e, &mut out, ORIGIN + 2_200 * MS);
+    let plan =
+        audio::SeekPlan::new(&e.seek_source(), &bgm(), e.frame_line(), TimeUs(2_400 * MS)).unwrap();
+    assert_eq!(e.seek(&plan), Err(audio::SeekError::RingingOut));
+    run_to(&mut e, &mut out, ORIGIN + 3_000 * MS);
+    assert!(e.mixer().rung_out());
+    let end = frame(END_AT);
+    assert!(out.samples()[2 * end..].iter().all(|&x| x == 0.0));
+    // The next play takes the ring-out off, and a seek with it.
+    let origin = out.inner().next_wake().0 + 200 * MS;
+    e.restart(TimeUs(origin));
+    let plan =
+        audio::SeekPlan::new(&e.seek_source(), &bgm(), e.frame_line(), TimeUs(1_000 * MS)).unwrap();
+    assert_eq!(e.seek(&plan), Ok(()));
+}
