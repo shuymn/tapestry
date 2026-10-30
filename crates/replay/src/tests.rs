@@ -1,4 +1,4 @@
-use bms_model::{ChartIdentity, Lane, TimeUs};
+use bms_model::{ChartIdentity, Lane, Speed, TimeUs};
 use eval::{
     AxisBinding, AxisMode, Binding, ControlId, InputKind, InputStart, PhysicalInputEvent,
     ScratchSettings, SourceId, SourceProfile,
@@ -145,6 +145,7 @@ fn sample(n_events: usize) -> PlayRecord {
             },
         },
         play_type: PlayType::Full,
+        speed: Speed::NORMAL,
         start: InputStart {
             opened_at: TimeUs(opened_at),
             held: vec![(SourceId(1), ControlId(0x21), 1)],
@@ -345,6 +346,44 @@ fn a_record_from_before_the_wake_policy_is_refused() {
 }
 
 #[test]
+fn a_record_from_before_the_speed_is_refused() {
+    // Format 5 had no speed; its files are refused by their version, with
+    // no conversion to 1×.
+    let mut old = wrap(&body_bytes(&golden()), 3);
+    old[4..6].copy_from_slice(&5_u16.to_le_bytes());
+    assert_eq!(
+        decode(&old, &limits()),
+        Err(DecodeError::UnsupportedVersion(5))
+    );
+}
+
+#[test]
+fn every_speed_round_trips_and_one_off_the_ladder_is_refused() {
+    for speed in Speed::ladder() {
+        let mut rec = sample(5);
+        rec.speed = speed;
+        assert_eq!(decode(&encode(&rec), &limits()), Ok(rec));
+    }
+    // The session section ends with the speed's k; 9, 31 and a k past u32
+    // name no speed.
+    let rec = golden();
+    let sections = split_sections(&body_bytes(&rec));
+    let session = &sections[Section::Session as usize];
+    assert_eq!(session.last(), Some(&13));
+    for k in [&[9][..], &[31], &[0x80, 0x80, 0x80, 0x80, 0x10]] {
+        let mut sections = sections.clone();
+        let session = &mut sections[Section::Session as usize];
+        session.pop();
+        session.extend_from_slice(k);
+        assert_eq!(
+            decode(&wrap(&join_sections(&sections), 3), &limits()),
+            Err(DecodeError::InvalidValue("speed")),
+            "{k:?}"
+        );
+    }
+}
+
+#[test]
 fn both_wake_policies_round_trip_and_another_is_refused() {
     let policies = [
         WakePolicy::Input {
@@ -511,6 +550,7 @@ fn golden_base() -> PlayRecord {
             },
         },
         play_type: PlayType::Full,
+        speed: Speed::from_twentieths(13).unwrap(),
         start: InputStart {
             opened_at: TimeUs(1_000_000),
             held: vec![(SourceId(0), ControlId(0x2c), 1)],
@@ -576,7 +616,7 @@ fn golden() -> PlayRecord {
 
 /// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
 /// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "de5465b8e6a4e9fd8bc76b1d383e7ec3fc15778c7a43df90c08eadc8122f16a4";
+const GOLDEN_BODY_SHA256: &str = "b5978257eb62a20905b94b4c2a6ffd874ecda24c38eb4fd89709f70519bf3bf2";
 
 #[test]
 fn golden_body() {

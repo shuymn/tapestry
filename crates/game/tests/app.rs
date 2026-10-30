@@ -101,8 +101,20 @@ impl ChartIngest for Charts {
         path.extension().is_some_and(|e| e == "chart")
     }
 
-    fn ingest(&self, bytes: &[u8], _dir: &Path, _seed: u64) -> Result<Ingested, IngestError> {
+    fn ingest(
+        &self,
+        bytes: &[u8],
+        dir: &Path,
+        seed: u64,
+        speed: bms_model::Speed,
+    ) -> Result<Ingested, IngestError> {
         let chart = match bytes {
+            // A 40-minute BMS chart, through the loader at the session's
+            // speed.
+            b"slow" => {
+                let text = b"#BPM 60\n#WAV01 a.wav\n#60011:01\n";
+                return game::BmsIngest.ingest(text, dir, seed, speed);
+            }
             b"a" => chart_a(),
             b"b" => chart_b(),
             b"silent" => silent(),
@@ -150,6 +162,9 @@ enum Refusal {
     TooLong,
     /// The preset file is not a preset; the refusal shown fixes it.
     Preset,
+    /// It is 40 minutes long and the session plays at 50 %: its real
+    /// times pass ±2^32 µs, refused by the loader.
+    TooLongAtSpeed,
 }
 
 /// What the player does.
@@ -248,6 +263,7 @@ impl Headless {
             Refusal::Bank | Refusal::Preset => std::fs::write(&paths[2], b"a").unwrap(),
             Refusal::Silent => std::fs::write(&paths[2], b"silent").unwrap(),
             Refusal::TooLong => std::fs::write(&paths[2], b"long").unwrap(),
+            Refusal::TooLongAtSpeed => std::fs::write(&paths[2], b"slow").unwrap(),
         }
         let mut sources = SourceSet::new(common::sources()).unwrap();
         let mut script = ScriptedInput::new(vec![ScriptItem {
@@ -610,6 +626,9 @@ impl AppRig for Headless {
         let kind = match &refusal.reason {
             Refused::Chart(SessionError::Io { .. }) => "io",
             Refused::Chart(SessionError::Preset(_)) => "preset",
+            Refused::Chart(SessionError::Ingest(IngestError::Load(
+                bms_parser::LoadError::TooLongAtSpeed { .. },
+            ))) => "too long at speed",
             Refused::Chart(e) => panic!("{e:?}"),
             Refused::Bank(BankLost) => "bank",
             Refused::Play(LogicError::Eval(eval::EvalError::NoJudgeableNotes)) => "no notes",
@@ -646,6 +665,12 @@ fn app(dir: &Path, refusal: Refusal, events: &Events) -> App {
         start: TimeUs(0),
         effects: 4_096,
         seed: 3,
+        // The built charts ignore the speed; the 40-minute one loads at it.
+        speed: if refusal == Refusal::TooLongAtSpeed {
+            bms_model::Speed::SLOWEST
+        } else {
+            bms_model::Speed::NORMAL
+        },
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
@@ -757,6 +782,7 @@ fn refused_chart_returns_to_selection_then_valid_chart_plays() {
         (Refusal::Silent, "no notes"),
         (Refusal::TooLong, "too long"),
         (Refusal::Preset, "preset"),
+        (Refusal::TooLongAtSpeed, "too long at speed"),
     ] {
         let acts = vec![
             (0, Act::Choose(2)),
@@ -794,7 +820,10 @@ fn refused_chart_returns_to_selection_then_valid_chart_plays() {
         assert_eq!(plays[0].end, PlayEnd::Completed);
         // A chart file that is read reports its load before any refusal.
         let mut expected = vec![SessionEvent::Select];
-        if !matches!(refusal, Refusal::Missing | Refusal::Preset) {
+        if !matches!(
+            refusal,
+            Refusal::Missing | Refusal::Preset | Refusal::TooLongAtSpeed
+        ) {
             expected.push(SessionEvent::Load);
         }
         let status = replay::EndStatus::PlayedToEnd;

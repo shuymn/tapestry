@@ -43,6 +43,13 @@
 //!   change. Before time 0 it runs at the `#BPM` header's rate. A position
 //!   or retained time beyond what the map holds (±2^32 µs) is a
 //!   [`LoadError::PositionOverflow`].
+//! - **Speed:** at a [`LoadOptions::speed`] `k/20` other than 1×, each kept
+//!   time is its exact time times `20/k`, floored once to µs, and the scroll
+//!   map is built as above from that mapped exact timeline, so its rates
+//!   are the mapped BPMs'. The same pass keeps the 1× times and scroll map:
+//!   the duration limit applies to them, and the resolved hash covers that
+//!   1× chart, so the identity is the same at every speed. A real time
+//!   beyond ±2^32 µs is a [`LoadError::TooLongAtSpeed`].
 //! - **Identity:** which objects are the same, which survives a conflict,
 //!   long-note pairing and a note inside a long note are decided on exact
 //!   source positions, never on floored µs: objects at distinct positions
@@ -107,7 +114,7 @@
 //! - **Unsupported:** `#LNTYPE` 2 or higher, `#LNMODE` other than 1, negative
 //!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
 //!   The branching ones are refused even inside a branch not taken.
-//! - **Resolved hash:** covers what the chart resolved to, display
+//! - **Resolved hash:** covers what the chart resolved to at 1×, display
 //!   positions, the scroll map and the judgment-header declarations in
 //!   canonical form included (so whitespace, a header's case and line
 //!   positions do not change it, and `120` and `120.0` differ), not the
@@ -136,7 +143,9 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use bms_model::{Chart, ChartIdentity, ModelError, ScrollMap, SoundId, SoundRef, TimeUs};
+use bms_model::{
+    Chart, ChartIdentity, ModelError, NoteKind, ScrollMap, SoundId, SoundRef, Speed, TimeUs,
+};
 
 pub use error::{LoadError, Warning, WarningKind};
 pub use header::{Header, read_header};
@@ -181,6 +190,9 @@ impl Default for Limits {
 pub struct LoadOptions {
     /// Seed for `#RANDOM` branches.
     pub seed: u64,
+    /// The practice speed: the chart's times are real times at it, and its
+    /// identity is the 1× chart's.
+    pub speed: Speed,
     /// Bounds on the work.
     pub limits: Limits,
 }
@@ -211,7 +223,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         let text = decode(bytes, &mut warnings);
         parse::parse(&text, limits, opts.seed, &mut warnings)?
     };
-    let timeline = timing::compute(&source, limits, &mut warnings)?;
+    let mut timeline = timing::compute(&source, limits, opts.speed, &mut warnings)?;
 
     let dir = chart_dir
         .canonicalize()
@@ -243,7 +255,13 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         ids: &ids,
         warned: BTreeSet::new(),
     };
-    let resolved = resolve::resolve(&timeline.objects, &source.lnobj, &mut lookup, &mut warnings);
+    let resolved = resolve::resolve(
+        &timeline.objects,
+        timeline.real.is_some(),
+        &source.lnobj,
+        &mut lookup,
+        &mut warnings,
+    );
     if resolved.lanes.iter().all(Vec::is_empty) {
         warnings.push(Warning {
             line: None,
@@ -253,12 +271,15 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
 
     let (sha256, md5) = hash::file_hashes(bytes);
     let measure = timeline.last_measure;
-    let scroll = ScrollMap::from_segments(timeline.initial_rate, timeline.segments).map_err(
-        |e| match e {
+    let compile = |initial_rate, segments| {
+        ScrollMap::from_segments(initial_rate, segments).map_err(|e| match e {
             ModelError::PositionOverflow => LoadError::PositionOverflow { measure },
             e => LoadError::Model(e),
-        },
-    )?;
+        })
+    };
+    let real_scroll = timeline.real.take();
+    let scroll = compile(timeline.initial_rate, timeline.segments)?;
+    // The 1× chart first: its hash is the identity at every speed.
     let mut chart = Chart {
         lanes: resolved.lanes,
         bgm: resolved.bgm,
@@ -276,6 +297,23 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
     };
     chart.validate().map_err(LoadError::Model)?;
     chart.identity.resolved_hash = hash::resolved_hash(&chart);
+    // Then, at another speed, the same objects at their real times, on the
+    // real timeline's scroll map.
+    if let (Some(real), Some(scroll)) = (resolved.real, real_scroll) {
+        for (lane, times) in chart.lanes.iter_mut().zip(real.lanes) {
+            for (note, (head, tail)) in lane.iter_mut().zip(times) {
+                note.time = head;
+                if let NoteKind::Long { end, .. } = &mut note.kind {
+                    *end = tail;
+                }
+            }
+        }
+        for (event, time) in chart.bgm.iter_mut().zip(real.bgm) {
+            event.time = time;
+        }
+        chart.scroll = compile(scroll.initial_rate, scroll.segments)?;
+        chart.validate().map_err(LoadError::Model)?;
+    }
     Ok(Loaded { chart, warnings })
 }
 

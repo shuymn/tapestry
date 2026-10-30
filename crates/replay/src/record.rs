@@ -1,6 +1,6 @@
 //! The play record: everything needed to re-evaluate a play.
 
-use bms_model::{ChartIdentity, TimeUs};
+use bms_model::{ChartIdentity, Speed, TimeUs};
 use eval::{DeviceProfile, InputStart, PhysicalInputEvent, SourceProfile};
 use rules::RulePreset;
 
@@ -264,6 +264,9 @@ pub struct PlayRecord {
     pub devices: DeviceRecord,
     /// Which part of the chart was played.
     pub play_type: PlayType,
+    /// The practice speed the chart was loaded at: its times, and so the
+    /// input's, are real times at it.
+    pub speed: Speed,
     /// The controls held when recording opened.
     pub start: InputStart,
     /// The physical input events in stream order.

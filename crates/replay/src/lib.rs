@@ -26,6 +26,10 @@
 //! the decoder refuses every version but [`FORMAT_VERSION`]: older records
 //! are refused, not converted.
 //!
+//! The session section is the session policy's id, the play type (0 the
+//! whole chart) and the speed as k of `k/20` (10 to 30; anything else is
+//! refused).
+//!
 //! Each source of the devices section is its kind, receive method, input
 //! offset, its bindings (a count, then each control and lane), and its
 //! axis bindings (a count, then each axis's control, lane, mode (0
@@ -48,7 +52,7 @@ mod record;
 pub mod verify;
 mod wire;
 
-use bms_model::{ChartIdentity, Lane, TimeUs};
+use bms_model::{ChartIdentity, Lane, Speed, TimeUs};
 use eval::{
     AxisBinding, AxisMode, Binding, ControlId, InputKind, InputStart, PhysicalInputEvent,
     ScratchSettings, SourceId, SourceProfile,
@@ -66,7 +70,7 @@ pub use record::{
 use wire::{Reader, Writer};
 
 /// The format version this crate writes, and the only one it reads.
-pub const FORMAT_VERSION: u16 = 5;
+pub const FORMAT_VERSION: u16 = 6;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -177,6 +181,7 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
         session_policy,
         devices,
         play_type,
+        speed,
         start,
         events,
         arrivals,
@@ -197,6 +202,7 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
         w.uint(match play_type {
             PlayType::Full => 0,
         });
+        w.uint(u64::from(speed.twentieths()));
     });
     section(&|w| write_devices(w, devices));
     section(&|w| write_start(w, start));
@@ -509,13 +515,17 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
     let (versions, loader) = read_section(&mut r, Section::Versions, read_versions)?;
     let chart = read_section(&mut r, Section::Chart, |r| read_chart(r, loader))?;
     let preset = read_section(&mut r, Section::Preset, read_preset)?;
-    let (session_policy, play_type) = read_section(&mut r, Section::Session, |r| {
+    let (session_policy, play_type, speed) = read_section(&mut r, Section::Session, |r| {
         let policy = r.string()?;
         let play_type = match r.uint()? {
             0 => PlayType::Full,
             _ => return Err(DecodeError::InvalidValue("play type")),
         };
-        Ok((policy, play_type))
+        let speed = u32::try_from(r.uint()?)
+            .ok()
+            .and_then(Speed::from_twentieths)
+            .ok_or(DecodeError::InvalidValue("speed"))?;
+        Ok((policy, play_type, speed))
     })?;
     let devices = read_section(&mut r, Section::Devices, |r| read_devices(r, limits))?;
     let n_sources = devices.sources.len();
@@ -533,6 +543,7 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
         session_policy,
         devices,
         play_type,
+        speed,
         start,
         events,
         arrivals,

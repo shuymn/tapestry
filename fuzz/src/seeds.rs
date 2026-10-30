@@ -126,6 +126,7 @@ fn two_sources() -> PlayRecord {
             },
         },
         play_type: PlayType::Full,
+        speed: bms_model::Speed::NORMAL,
         start: InputStart {
             opened_at: TimeUs(1_000_000),
             held: vec![(SourceId(0), ControlId(0x2c), 1)],

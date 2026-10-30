@@ -6,7 +6,7 @@
 //! version, structure, preset hash) have already passed. The rest are
 //! checked here in a fixed order, and the first failure is the refusal:
 //! the evaluator version, the recorded preset copy, the loader version, the
-//! load with the recorded seed, the resolved-chart hash, and the chart
+//! load with the recorded seed and speed, the resolved-chart hash, and the chart
 //! transform. [`load_recorded_chart`] runs every check and
 //! [`evaluate_record`] the first two again, so each entry point refuses in
 //! that order on its own. The chart file's SHA-256 is not compared: an
@@ -97,7 +97,7 @@ fn recorded_preset(record: &PlayRecord) -> Result<RulePreset, VerifyError> {
 /// [`UnsupportedEvaluator`](VerifyError::UnsupportedEvaluator),
 /// [`PresetCopy`](VerifyError::PresetCopy) (both before the bytes are
 /// read), [`UnsupportedLoader`](VerifyError::UnsupportedLoader),
-/// [`Load`](VerifyError::Load) with the recorded `#RANDOM` seed,
+/// [`Load`](VerifyError::Load) with the recorded `#RANDOM` seed and speed,
 /// [`ResolvedChartMismatch`](VerifyError::ResolvedChartMismatch) and
 /// [`UnknownTransform`](VerifyError::UnknownTransform).
 pub fn load_recorded_chart(
@@ -111,8 +111,11 @@ pub fn load_recorded_chart(
     if loader != LOADER_VERSION {
         return Err(VerifyError::UnsupportedLoader(loader));
     }
+    // At the recorded speed: the recorded input is in its real time. The
+    // resolved hash is the 1× chart's at every speed.
     let opts = LoadOptions {
         seed: recorded.random_seed,
+        speed: record.speed,
         ..LoadOptions::default()
     };
     let loaded = bms_parser::load_bms(bytes, dir, &opts).map_err(VerifyError::Load)?;

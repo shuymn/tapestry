@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use bms_model::Chart;
+use bms_model::{Chart, Speed};
 use bms_parser::{LoadError, LoadOptions, WarningKind};
 pub use replay::TransformId;
 
@@ -35,13 +35,21 @@ pub trait ChartIngest {
     /// byte more, so a larger file reaches the adapter cut there, and the
     /// adapter refuses it.
     fn max_bytes(&self) -> usize;
-    /// Reads a chart from its file bytes; sounds resolve inside `dir`, and
-    /// `seed` resolves any randomness, which is recorded.
+    /// Reads a chart from its file bytes; sounds resolve inside `dir`,
+    /// `seed` resolves any randomness, which is recorded, and the chart's
+    /// times are real times at `speed`, with the 1× chart's identity
+    /// (design.md "Practice Speed Changes").
     ///
     /// # Errors
     ///
     /// The adapter's refusal.
-    fn ingest(&self, bytes: &[u8], dir: &Path, seed: u64) -> Result<Ingested, IngestError>;
+    fn ingest(
+        &self,
+        bytes: &[u8],
+        dir: &Path,
+        seed: u64,
+        speed: Speed,
+    ) -> Result<Ingested, IngestError>;
 }
 
 /// BMS and BME charts, through [`bms_parser::load_bms`].
@@ -59,9 +67,16 @@ impl ChartIngest for BmsIngest {
         LoadOptions::default().limits.max_file_bytes
     }
 
-    fn ingest(&self, bytes: &[u8], dir: &Path, seed: u64) -> Result<Ingested, IngestError> {
+    fn ingest(
+        &self,
+        bytes: &[u8],
+        dir: &Path,
+        seed: u64,
+        speed: Speed,
+    ) -> Result<Ingested, IngestError> {
         let opts = LoadOptions {
             seed,
+            speed,
             ..LoadOptions::default()
         };
         let loaded = bms_parser::load_bms(bytes, dir, &opts).map_err(IngestError::Load)?;

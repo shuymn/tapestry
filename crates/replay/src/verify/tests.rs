@@ -1,4 +1,4 @@
-use bms_model::{Lane, TimeUs};
+use bms_model::{Lane, Speed, TimeUs};
 use bms_parser::{LOADER_VERSION, LoadError, LoadOptions, load_bms};
 use eval::{
     Binding, ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId, SourceProfile,
@@ -88,6 +88,7 @@ fn played_from(text: &str, seed: u64, offset: i64) -> (TempDir, PlayRecord) {
             },
         },
         play_type: PlayType::Full,
+        speed: Speed::NORMAL,
         start: InputStart {
             opened_at: TimeUs(0),
             held: Vec::new(),
@@ -541,4 +542,30 @@ fn the_load_uses_the_recorded_seed() {
         load_recorded_chart(&reseeded, text.as_bytes(), dir.path()),
         Err(VerifyError::ResolvedChartMismatch)
     );
+}
+
+#[test]
+fn the_load_uses_the_recorded_speed() {
+    // `CHART` played at 50 %: its notes at 2 s and 4 s are at 4 s and 8 s
+    // in real time, where the input hits them.
+    let (dir, mut record) = played();
+    record.speed = Speed::SLOWEST;
+    for e in &mut record.events {
+        e.received = TimeUs(e.received.0 * 2);
+    }
+    record.status.finalized = TimeUs(8_180 * MS);
+    let times = |chart: &bms_model::Chart| -> Vec<i64> {
+        chart.lanes[1].iter().map(|n| n.time.0).collect()
+    };
+    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
+    assert_eq!(times(&chart), [4_000 * MS, 8_000 * MS]);
+    let r = evaluate_record(&record, &chart, None).unwrap();
+    assert_eq!(r.evaluation.tally.counts.perfect, 2);
+    // The identity is the 1× chart's, so the same record at 1× loads too,
+    // and its input then misses the 2 s note.
+    record.speed = Speed::NORMAL;
+    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
+    assert_eq!(times(&chart), [2_000 * MS, 4_000 * MS]);
+    let r = evaluate_record(&record, &chart, None).unwrap();
+    assert_eq!(r.evaluation.tally.counts.perfect, 1);
 }

@@ -4,7 +4,7 @@
 //! Every integer mixes small values (one-byte varints) with the full range
 //! (ten-byte varints and wrapping time deltas).
 
-use bms_model::{ChartIdentity, Lane, TimeUs};
+use bms_model::{ChartIdentity, Lane, Speed, TimeUs};
 use eval::{
     AxisBinding, AxisMode, Binding, ControlId, InputKind, InputStart, PhysicalInputEvent,
     ScratchSettings, SourceId, SourceProfile,
@@ -185,7 +185,7 @@ fn wake() -> impl Strategy<Value = WakePolicy> {
 fn record() -> impl Strategy<Value = PlayRecord> {
     (
         (versions(), chart(), preset(), text()),
-        (vec(source(), 1..=4), i64s(), i64s(), wake()),
+        (vec(source(), 1..=4), i64s(), i64s(), wake(), 10_u32..=30),
         (i64s(), vec((any::<u16>(), u32s(), i32s()), 0..=6)),
         vec(
             (
@@ -211,7 +211,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
         .prop_map(
             |(
                 (versions, chart, preset, session_policy),
-                (sources, audio_offset, display_offset, wake),
+                (sources, audio_offset, display_offset, wake, speed),
                 (opened_at, held),
                 events,
                 arrivals,
@@ -231,6 +231,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
                         wake,
                     },
                     play_type: PlayType::Full,
+                    speed: Speed::from_twentieths(speed).unwrap(),
                     start: InputStart {
                         opened_at: TimeUs(opened_at),
                         held: held

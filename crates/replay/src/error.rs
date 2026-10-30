@@ -9,7 +9,7 @@ pub enum Section {
     Chart,
     /// The preset record.
     Preset,
-    /// Session policy and play type.
+    /// Session policy, play type and speed.
     Session,
     /// Sources and offsets.
     Devices,

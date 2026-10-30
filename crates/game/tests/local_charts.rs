@@ -140,7 +140,8 @@ fn category(e: &SessionError) -> &'static str {
             | LoadError::MeasureOutOfRange { .. }
             | LoadError::DurationExceeded { .. }
             | LoadError::TimeOverflow { .. }
-            | LoadError::PositionOverflow { .. } => "loading limit",
+            | LoadError::PositionOverflow { .. }
+            | LoadError::TooLongAtSpeed { .. } => "loading limit",
             LoadError::InvalidValue { what, reason, .. } => invalid_value(what, reason),
             LoadError::SoundPathRejected { .. } | LoadError::SoundPathEscapes { .. } => {
                 "sound path outside the folder"
@@ -221,6 +222,7 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
         start: TimeUs(0),
         effects: 1 << 16,
         seed: 0,
+        speed: bms_model::Speed::NORMAL,
         app_version: "sweep".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,

@@ -9,7 +9,8 @@ pub fn file_hashes(bytes: &[u8]) -> ([u8; 32], [u8; 16]) {
     (Sha256::digest(bytes).into(), Md5::digest(bytes).into())
 }
 
-/// SHA-256 over a canonical encoding of the resolved chart: loader version,
+/// SHA-256 over a canonical encoding of the resolved 1× chart (the loader
+/// hashes it before mapping times to a speed): loader version,
 /// the scroll map (initial rate and segments), notes with their display
 /// positions, BGM, bar-line positions, sound names as written, the title,
 /// the judgment-header declarations in their canonical form (header, class
