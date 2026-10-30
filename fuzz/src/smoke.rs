@@ -28,6 +28,7 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
             "two_sources",
             "no_events",
             "extremes",
+            "practice_round",
             "section_past_end",
             "count_beyond_data",
             "too_many_events",
@@ -39,7 +40,7 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
     for (name, body) in seeds {
         let result = replay_body(&body).map(|_| ());
         match name {
-            "two_sources" | "no_events" | "extremes" => {
+            "two_sources" | "no_events" | "extremes" | "practice_round" => {
                 assert_eq!(result, Ok(()), "{name}");
             }
             "section_past_end" => assert!(
@@ -75,6 +76,7 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
             "two_sources",
             "no_events",
             "extremes",
+            "practice_round",
             "bad_magic",
             "unsupported_version",
             "unsupported_encoding",
@@ -87,7 +89,7 @@ fn replay_file_seeds_decode_or_fail_at_the_envelope() {
     for (name, file) in seeds {
         let result = replay_file(&file).map(|_| ());
         let expected = match name {
-            "two_sources" | "no_events" | "extremes" => Ok(()),
+            "two_sources" | "no_events" | "extremes" | "practice_round" => Ok(()),
             "bad_magic" => Err(DecodeError::BadMagic),
             "unsupported_version" => Err(DecodeError::UnsupportedVersion(
                 replay::FORMAT_VERSION.wrapping_add(1),
