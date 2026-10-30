@@ -189,11 +189,11 @@ fn batches_do_not_allocate() {
         &stop,
         &mut cadence,
         &mut report,
-        |now| {
+        |now, may_read| {
             wakes += 1;
             // Every tenth wake has more queued than one drain reads.
             let mut queued = if wakes.is_multiple_of(10) { 1_500 } else { 3 };
-            let (published, cut) = cadence::batch(&clock, &mut set, now, |set, budget| {
+            let (published, n) = cadence::batch(&clock, &mut set, now, may_read, |set, budget| {
                 if queued == 0 {
                     return 0;
                 }
@@ -209,7 +209,7 @@ fn batches_do_not_allocate() {
             }
             Boundary {
                 published,
-                cut,
+                read: may_read.then_some(n),
                 phase: if wakes.is_multiple_of(7) {
                     Phase::Idle
                 } else {

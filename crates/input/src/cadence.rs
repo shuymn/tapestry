@@ -15,9 +15,11 @@
 //! The thread only enters Idle when the hook says so, which it does on
 //! request; it starts in Tail.
 //!
-//! Two bounds hold under any input rate. Input wakes are at least
-//! [`INPUT_GAP`] apart: input that arrives within the gap ends the wait,
-//! but is not read; the thread then waits for the timer only, never for
+//! Two bounds hold under any input rate. The queue is read at most once
+//! per [`INPUT_GAP`], whatever woke the thread: a wake within the gap after
+//! a read (the heartbeat, the wake event) publishes and runs the hook
+//! without reading. Input that arrives within the gap ends the wait, but
+//! is not read; the thread then waits for the timer only, never for
 //! input, until the gap's end, and reads it there, so input left queued
 //! cannot make a wait return at once. Input slower than the gap costs one
 //! wait per arrival. A drain reads at most [`DRAIN_CUT`] messages
@@ -94,12 +96,37 @@ pub enum Woken {
     Input,
     /// The timer fired, or its deadline had already passed.
     Timer,
+    /// The wait returned for the thread's message queue although no input
+    /// was asked for (the system may do so for messages it needs
+    /// processed): nothing to process, and input stays queued.
+    Queue,
 }
 
 /// The wait itself failed: the thread cannot wait any more and ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("the input thread's wait failed")]
 pub struct WaitFailed;
+
+/// What a wait on `count` handles (the wake event, then the timer when
+/// `count` is 2) returned, as its index past `WAIT_OBJECT_0`; `count`
+/// itself names the message queue, which is input when `input` was asked
+/// for and [`Woken::Queue`] otherwise. Anything else (`WAIT_FAILED`) is a
+/// failure.
+///
+/// # Errors
+///
+/// [`WaitFailed`] for an index that names no handle and not the queue.
+pub const fn classify(index: u32, count: u32, input: bool) -> Result<Woken, WaitFailed> {
+    if index == 0 {
+        Ok(Woken::Event)
+    } else if index == 1 && count == 2 {
+        Ok(Woken::Timer)
+    } else if index == count {
+        Ok(if input { Woken::Input } else { Woken::Queue })
+    } else {
+        Err(WaitFailed)
+    }
+}
 
 /// Waits as [`Wait`] says.
 pub trait Waiter {
@@ -127,15 +154,23 @@ pub enum Cause {
 }
 
 /// What a processed wake did: the clock read its last publication was
-/// made from, whether its drain was cut, and the phase its hook reported.
+/// made from, how many messages it read, and the phase its hook reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Boundary {
     /// The time of the wake's last publication.
     pub published: TimeUs,
-    /// Whether the drain stopped at [`DRAIN_CUT`], so input may be left.
-    pub cut: bool,
+    /// Messages read; `None` when the wake was told not to read.
+    pub read: Option<u32>,
     /// The phase after the hook.
     pub phase: Phase,
+}
+
+impl Boundary {
+    /// Whether the drain stopped at [`DRAIN_CUT`], so input may be left.
+    #[must_use]
+    pub fn cut(&self) -> bool {
+        self.read.is_some_and(|n| n >= DRAIN_CUT)
+    }
 }
 
 /// The wake policy's state.
@@ -204,7 +239,8 @@ impl Cadence {
 
     /// Why the wait that returned `woken` at `now` is processed; `None`
     /// when there is nothing to do but wait again (input that arrived
-    /// within the gap, or a timer that returned before a deadline).
+    /// within the gap, a return for the message queue, or a timer that
+    /// returned before a deadline).
     pub fn woke(&mut self, woken: Woken, now: TimeUs) -> Option<Cause> {
         match woken {
             Woken::Event => Some(Cause::Event),
@@ -218,19 +254,31 @@ impl Cadence {
             }
             Woken::Timer if self.left && now >= self.quiet_until => Some(Cause::Drain),
             Woken::Timer if self.held && now >= self.quiet_until => Some(Cause::Input),
-            Woken::Timer => None,
+            Woken::Timer | Woken::Queue => None,
         }
     }
 
-    /// After a wake for `cause` at `woke_at` ended at `boundary`.
-    pub fn processed(&mut self, cause: Cause, woke_at: TimeUs, boundary: Boundary) {
+    /// Whether a wake at `now` may read queued input: not within the gap
+    /// after the last read, whatever woke it. A wake that may not still
+    /// publishes and runs its hook; the input waits for the gap's end.
+    #[must_use]
+    pub fn may_read(&self, now: TimeUs) -> bool {
+        self.driven == Driven::Timer || now >= self.quiet_until
+    }
+
+    /// After a wake at `woke_at` ended at `boundary`. Returns how late the
+    /// wake came after the heartbeat's deadline when its publication
+    /// reached that deadline (0 for a wake before it), whatever woke it.
+    pub fn processed(&mut self, woke_at: TimeUs, boundary: Boundary) -> Option<u64> {
         let was_idle = self.phase == Phase::Idle;
         self.phase = boundary.phase;
+        let mut late = None;
         if boundary.phase != Phase::Idle {
             let published = boundary.published;
             if was_idle {
                 self.heartbeat = TimeUs(published.0.saturating_add(HEARTBEAT.0));
             } else if self.heartbeat <= published {
+                late = Some(u64::try_from(woke_at.0.saturating_sub(self.heartbeat.0)).unwrap_or(0));
                 // Passed: the next point of the grid after the publication,
                 // so a late wake skips beats rather than making them up.
                 let steps = (published.0 - self.heartbeat.0) / HEARTBEAT.0 + 1;
@@ -241,12 +289,19 @@ impl Cadence {
                 );
             }
         }
-        if matches!(cause, Cause::Input | Cause::Drain) {
-            self.quiet_until = TimeUs(woke_at.0.saturating_add(INPUT_GAP.0));
+        if self.driven == Driven::Input
+            && let Some(read) = boundary.read
+        {
+            // The queue was read: what was held or left is read, or still
+            // left if the read was cut. The gap runs from a read that
+            // took anything.
+            if read > 0 {
+                self.quiet_until = TimeUs(woke_at.0.saturating_add(INPUT_GAP.0));
+            }
+            self.left = boundary.cut();
+            self.held = false;
         }
-        self.left = boundary.cut && self.driven == Driven::Input;
-        // Every wake drains: what was held is read.
-        self.held = false;
+        late
     }
 }
 
@@ -254,25 +309,27 @@ impl Cadence {
 /// into `sources`, at most the budget it is given, and returns how many it
 /// read (0 when the queue is empty). Reading stops at [`DRAIN_CUT`]
 /// messages; then the batch publishes from a fresh clock read. Returns
-/// that read and whether the batch was cut.
+/// that read and how many messages were read. With `read` false nothing is
+/// read: the batch only publishes (and checks the focus latch).
 pub fn batch<C: TimeSource>(
     clock: &C,
     sources: &mut SourceSet,
     stamp: TimeUs,
+    read: bool,
     mut next: impl FnMut(&mut SourceSet, u32) -> u32,
-) -> (TimeUs, bool) {
+) -> (TimeUs, u32) {
     sources.begin_batch(stamp);
-    let mut left = DRAIN_CUT;
-    while left > 0 {
-        let read = next(sources, left);
-        if read == 0 {
+    let mut total = 0;
+    while read && total < DRAIN_CUT {
+        let n = next(sources, DRAIN_CUT - total);
+        if n == 0 {
             break;
         }
-        left = left.saturating_sub(read);
+        total = total.saturating_add(n).min(DRAIN_CUT);
     }
     let fresh = clock.now();
     sources.end_batch(fresh);
-    (fresh, left == 0)
+    (fresh, total)
 }
 
 /// Processed wakes by cause.
@@ -299,10 +356,11 @@ impl WakeCauses {
 /// What the input thread measured.
 #[derive(Clone, Debug, Default)]
 pub struct WakeReport {
-    /// Every return from a wait: the thread's CPU wakes.
+    /// Every return from a wait, including one that returned at once,
+    /// without sleeping, for a deadline already passed.
     pub waits: u64,
-    /// Waits with nothing to process yet (input within the gap, an early
-    /// timer).
+    /// Waits with nothing to process yet (input within the gap, a return
+    /// for the message queue, an early timer).
     pub rearms: u64,
     /// Processed wakes by cause.
     pub causes: WakeCauses,
@@ -310,7 +368,9 @@ pub struct WakeReport {
     pub cuts: u64,
     /// The intervals between consecutive processed wakes.
     pub intervals: WakeHistogram,
-    /// How late each heartbeat wake was after its deadline.
+    /// For each wake whose publication reached the heartbeat's deadline,
+    /// whatever woke it, how long after the deadline the wake came (0 for
+    /// one before it).
     pub lateness: WakeHistogram,
     /// The intervals between consecutive publications while Open or Tail.
     pub publications: WakeHistogram,
@@ -328,7 +388,8 @@ impl WakeReport {
 
 /// Runs `cadence` until `stop` is set or a wait fails: waits through
 /// `waiter`, reads `clock` at each wake, and calls `wake` with that read
-/// for every wake to process. `wake` drains, publishes and runs the hook,
+/// and whether it may read queued input ([`Cadence::may_read`]) for every
+/// wake to process. `wake` drains if it may, publishes and runs the hook,
 /// and returns its [`Boundary`]. What the loop measures goes into
 /// `report`.
 ///
@@ -341,7 +402,7 @@ pub fn run<C: TimeSource, W: Waiter>(
     stop: &AtomicBool,
     cadence: &mut Cadence,
     report: &mut WakeReport,
-    mut wake: impl FnMut(TimeUs) -> Boundary,
+    mut wake: impl FnMut(TimeUs, bool) -> Boundary,
 ) -> Result<(), WaitFailed> {
     let mut last_wake: Option<TimeUs> = None;
     let mut last_publication: Option<TimeUs> = None;
@@ -359,21 +420,18 @@ pub fn run<C: TimeSource, W: Waiter>(
         match cause {
             Cause::Input => report.causes.input += 1,
             Cause::Event => report.causes.event += 1,
-            Cause::Heartbeat => {
-                report.causes.heartbeat += 1;
-                if let Some(deadline) = cadence.heartbeat() {
-                    report.lateness.record(now.0.abs_diff(deadline.0));
-                }
-            }
+            Cause::Heartbeat => report.causes.heartbeat += 1,
             Cause::Drain => report.causes.drain += 1,
         }
         if let Some(last) = last_wake {
             report.intervals.record(now.0.abs_diff(last.0));
         }
         last_wake = Some(now);
-        let boundary = wake(now);
-        report.cuts += u64::from(boundary.cut);
-        cadence.processed(cause, now, boundary);
+        let boundary = wake(now, cadence.may_read(now));
+        report.cuts += u64::from(boundary.cut());
+        if let Some(late) = cadence.processed(now, boundary) {
+            report.lateness.record(late);
+        }
         if boundary.phase == Phase::Idle {
             last_publication = None;
         } else {

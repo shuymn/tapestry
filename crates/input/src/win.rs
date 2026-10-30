@@ -45,9 +45,9 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL,
     HWND_MESSAGE, MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, MWMO_INPUTAVAILABLE,
-    MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, QS_RAWINPUT, QUEUE_STATUS_FLAGS,
-    RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RIM_INPUTSINK, RegisterClassW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WNDCLASSW,
+    MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_QS_SENDMESSAGE, PM_REMOVE, PeekMessageW,
+    QS_RAWINPUT, QUEUE_STATUS_FLAGS, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RIM_INPUTSINK,
+    RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WNDCLASSW,
 };
 use windows::core::{PCWSTR, w};
 
@@ -301,12 +301,20 @@ impl Waiter for OsWaiter<'_> {
         // SAFETY: valid handles that outlive the call.
         let woke =
             unsafe { MsgWaitForMultipleObjectsEx(handles.get(..count), INFINITE, mask, flags) };
-        match woke.0.wrapping_sub(WAIT_OBJECT_0.0) {
-            0 => Ok(Woken::Event),
-            1 if count == 2 => Ok(Woken::Timer),
-            n if wait.input && n == count as u32 => Ok(Woken::Input),
+        let index = woke.0.wrapping_sub(WAIT_OBJECT_0.0);
+        match cadence::classify(index, count as u32, wait.input) {
+            Ok(Woken::Queue) => {
+                // Messages sent to this thread are handled by peeking;
+                // nothing is removed, so held Raw Input stays queued.
+                let mut msg = MSG::default();
+                // SAFETY: peeking this thread's own messages.
+                let _ =
+                    unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE) };
+                Ok(Woken::Queue)
+            }
+            Ok(woken) => Ok(woken),
             // WAIT_FAILED, or a result no wait above can give.
-            _ => {
+            Err(WaitFailed) => {
                 self.failed = Some((
                     "MsgWaitForMultipleObjectsEx",
                     windows::core::Error::from_thread(),
@@ -1261,15 +1269,15 @@ fn device_list() -> Result<Vec<RAWINPUTDEVICELIST>, InputError> {
 }
 
 impl RawInput {
-    /// One batch ([`cadence::batch`]): what is queued now, up to
+    /// One batch ([`cadence::batch`]): when `read`, what is queued now, up to
     /// [`cadence::DRAIN_CUT`] messages, stamped `now`, then the
-    /// publication from a fresh clock read. Returns that read and whether
-    /// the batch was cut. It plays the part of
+    /// publication from a fresh clock read. Returns that read and how many
+    /// messages were read. It plays the part of
     /// [`InputAdapter::poll`](crate::InputAdapter::poll), which needs a
     /// `Send` adapter.
-    fn poll(&mut self, now: TimeUs, sources: &mut SourceSet) -> (TimeUs, bool) {
+    fn poll(&mut self, now: TimeUs, read: bool, sources: &mut SourceSet) -> (TimeUs, u32) {
         let clock = self.clock;
-        cadence::batch(&clock, sources, now, |sources, budget| {
+        cadence::batch(&clock, sources, now, read, |sources, budget| {
             self.next(sources, budget)
         })
     }
@@ -1336,7 +1344,7 @@ fn wake_loop(
     timer: &Timer,
     waker: &Waker,
     stop: &AtomicBool,
-    wake: impl FnMut(TimeUs) -> Boundary,
+    wake: impl FnMut(TimeUs, bool) -> Boundary,
 ) -> Result<WakeReport, InputError> {
     let mmcss = Mmcss::games();
     let mut report = WakeReport::new();
@@ -1419,7 +1427,7 @@ fn spawn_worker<S, W>(
 ) -> Result<(Worker, usize), InputError>
 where
     S: FnOnce() -> Setup<W> + Send + 'static,
-    W: FnMut(TimeUs) -> Boundary,
+    W: FnMut(TimeUs, bool) -> Boundary,
 {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
@@ -1500,14 +1508,14 @@ impl InputThread {
             raw.connect_present(&mut sources)?;
             let timer = Timer::new()?;
             let receiver = raw.hwnd.0 as usize;
-            Ok((timer, receiver, move |now| {
-                let (published, cut) = raw.poll(now, &mut sources);
+            Ok((timer, receiver, move |now, may_read| {
+                let (published, read) = raw.poll(now, may_read, &mut sources);
                 // Polling may take a while after a scheduling stall; the
                 // boundary is read after it.
                 let phase = on_wake(&mut sources, clock.now());
                 Boundary {
                     published,
-                    cut,
+                    read: Some(read),
                     phase,
                 }
             }))
@@ -1575,9 +1583,9 @@ impl ClockedThread {
         F: FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     {
         let (worker, _) = spawn_worker("clocked input", clock, Driven::Timer, waker, move || {
-            Ok((Timer::new()?, 0, move |now| Boundary {
+            Ok((Timer::new()?, 0, move |now, _| Boundary {
                 published: now,
-                cut: false,
+                read: None,
                 phase: on_wake(&mut sources, now),
             }))
         })?;

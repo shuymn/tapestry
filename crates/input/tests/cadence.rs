@@ -65,6 +65,11 @@ struct Sim {
     latch: Option<FocusLatch>,
     /// Messages to come, by time.
     arrivals: VecDeque<(i64, Msg)>,
+    /// Messages to come that a drain never sees: only a wait queues them,
+    /// as if they arrived just after the drain's last read.
+    late: VecDeque<(i64, Msg)>,
+    /// When a wait that asks for no input returns for the message queue.
+    queue_returns: VecDeque<i64>,
     /// Messages queued, with their arrival time.
     queue: VecDeque<(i64, Msg)>,
     signals: VecDeque<(i64, Signal)>,
@@ -126,6 +131,18 @@ impl Waiter for SimWaiter {
                 sim.event = false;
                 return Ok(Woken::Event);
             }
+            // After the event: a wake for it drains before these arrive.
+            while let Some(&(t, m)) = sim.late.front() {
+                if t > now {
+                    break;
+                }
+                sim.late.pop_front();
+                sim.queue.push_back((t, m));
+            }
+            if !wait.input && sim.queue_returns.front().is_some_and(|&t| now >= t) {
+                sim.queue_returns.pop_front();
+                return Ok(Woken::Queue);
+            }
             if wait.input && !sim.queue.is_empty() {
                 return Ok(Woken::Input);
             }
@@ -133,9 +150,15 @@ impl Waiter for SimWaiter {
                 return Ok(Woken::Timer);
             }
             let timer = wait.deadline.map(|d| d.0 + sim.timer_late);
-            let arrival = sim.arrivals.front().map(|&(t, _)| t).filter(|_| wait.input);
+            let arrival = [sim.arrivals.front(), sim.late.front()]
+                .into_iter()
+                .flatten()
+                .map(|&(t, _)| t)
+                .min()
+                .filter(|_| wait.input);
             let signal = sim.signals.front().map(|&(t, _)| t);
-            let other = arrival.into_iter().chain(signal).min();
+            let queue = sim.queue_returns.front().copied().filter(|_| !wait.input);
+            let other = arrival.into_iter().chain(signal).chain(queue).min();
             match (timer, other) {
                 (Some(t), Some(o)) if o <= t => sim.clock.set(o.max(now)),
                 // The deadline check above returns once the clock is there.
@@ -187,6 +210,8 @@ fn set() -> (SourceSet, SourceReader) {
 struct Setup {
     driven: Driven,
     arrivals: Vec<(i64, Msg)>,
+    late: Vec<(i64, Msg)>,
+    queue_returns: Vec<i64>,
     signals: Vec<(i64, Signal)>,
     timer_late: i64,
     read_cost: i64,
@@ -198,6 +223,8 @@ impl Setup {
         Self {
             driven,
             arrivals: Vec::new(),
+            late: Vec::new(),
+            queue_returns: Vec::new(),
             signals: Vec::new(),
             timer_late: 0,
             read_cost: 0,
@@ -214,6 +241,7 @@ impl Setup {
     /// wake's time and the requests seen so far.
     fn run(mut self, mut phase: impl FnMut(i64, u32) -> Phase) -> Run {
         self.arrivals.sort_by_key(|&(t, _)| t);
+        self.late.sort_by_key(|&(t, _)| t);
         self.signals.sort_by_key(|&(t, _)| t);
         let clock = Clock(Arc::new(AtomicI64::new(0)));
         let stop = Rc::new(AtomicBool::new(false));
@@ -223,6 +251,8 @@ impl Setup {
             stop: Rc::clone(&stop),
             latch: Some(sources.gate().handle()),
             arrivals: self.arrivals.into(),
+            late: self.late.into(),
+            queue_returns: self.queue_returns.into(),
             queue: VecDeque::new(),
             signals: self.signals.into(),
             event: false,
@@ -243,39 +273,43 @@ impl Setup {
         let last_watermark = Cell::new(i64::MIN);
         let driven = self.driven;
         let result = {
-            let wake = |now: TimeUs| {
-                let (published, cut) = if driven == Driven::Input {
-                    cadence::batch(&clock, &mut sources, now, |sources, budget| {
-                        let mut sim = sim.borrow_mut();
-                        sim.deliver();
-                        assert!(budget >= 1);
-                        let Some((arrived, msg)) = sim.queue.pop_front() else {
-                            return 0;
-                        };
-                        match msg {
-                            Msg::Key(value) => {
-                                sources.packet(&Packet {
-                                    device: KEYBOARD,
-                                    control: A,
-                                    value,
-                                    background: false,
-                                });
-                                events.borrow_mut().push(Read {
-                                    value,
-                                    arrived,
-                                    stamp: now.0,
-                                });
+            let wake = |now: TimeUs, may_read: bool| {
+                let (published, read) = if driven == Driven::Input {
+                    let (published, n) =
+                        cadence::batch(&clock, &mut sources, now, may_read, |sources, budget| {
+                            let mut sim = sim.borrow_mut();
+                            sim.deliver();
+                            assert!(budget >= 1);
+                            let Some((arrived, msg)) = sim.queue.pop_front() else {
+                                return 0;
+                            };
+                            match msg {
+                                Msg::Key(value) => {
+                                    sources.packet(&Packet {
+                                        device: KEYBOARD,
+                                        control: A,
+                                        value,
+                                        background: false,
+                                    });
+                                    events.borrow_mut().push(Read {
+                                        value,
+                                        arrived,
+                                        stamp: now.0,
+                                    });
+                                }
+                                Msg::Arrival(d) => {
+                                    sources.connect(DeviceId(d), DeviceKind::Keyboard)
+                                }
                             }
-                            Msg::Arrival(d) => sources.connect(DeviceId(d), DeviceKind::Keyboard),
-                        }
-                        let t = sim.clock.get() + sim.read_cost;
-                        sim.clock.set(t);
-                        1
-                    })
+                            let t = sim.clock.get() + sim.read_cost;
+                            sim.clock.set(t);
+                            1
+                        });
+                    (published, may_read.then_some(n))
                 } else {
                     sources.begin_batch(now);
                     sources.end_batch(now);
-                    (now, false)
+                    (now, None)
                 };
                 // The watermark rule: what this batch pushed lies above
                 // every watermark published before it.
@@ -297,7 +331,7 @@ impl Setup {
                 });
                 Boundary {
                     published,
-                    cut,
+                    read,
                     phase: phase(at, requests),
                 }
             };
@@ -410,14 +444,15 @@ fn fast_input_waits_for_the_bound_and_keeps_every_report() {
         assert!(r.stamp - r.arrived <= INPUT_GAP.0, "{r:?}");
     }
     // Wakes for input are at least the gap apart: at most one per gap,
-    // plus the heartbeats and a wait again at each gap's end.
+    // each with an early return before it, plus the heartbeats, each of
+    // which can add one more early return.
     let input_wakes = run.report.causes.input + run.report.causes.drain;
     assert!(
         input_wakes <= (20_000 / INPUT_GAP.0 + 1) as u64,
         "{input_wakes}"
     );
     assert!(
-        run.report.waits <= 2 * input_wakes + run.report.causes.heartbeat + 4,
+        run.report.waits <= 2 * input_wakes + 2 * run.report.causes.heartbeat + 4,
         "{} waits",
         run.report.waits
     );
@@ -481,17 +516,95 @@ fn stop_ends_a_sustained_drain_within_one_cut() {
 #[test]
 fn same_us_batch_keeps_the_watermark_rule() {
     let mut setup = Setup::new(Driven::Input).stop_at(5_000);
-    setup.arrivals = keys(10, 0, 1_500);
-    // A request in the same microsecond wakes the thread at once.
-    setup.signals.push((10, Signal::Request));
+    // A request at 500 finds the queue empty and publishes from 500; a key
+    // arrives right after, in the same microsecond, and is read at once.
+    setup.signals.push((500, Signal::Request));
+    setup.late = keys(500, 0, 1);
     let run = setup.run(|_, _| Phase::Open);
-    assert_eq!(run.seen[0].at, 10);
-    assert_eq!(run.seen[1].at, 10);
-    assert_eq!(run.seen[0].published, 10);
-    // The run's own check: every event of a batch lay above the
-    // watermark published before it (9 here).
-    assert_eq!(run.stamps().len(), 1_500);
-    assert!(run.report.cuts >= 1);
+    let wakes: Vec<(i64, i64)> = run
+        .seen
+        .iter()
+        .take(2)
+        .map(|s| (s.at, s.published))
+        .collect();
+    assert_eq!(wakes, [(500, 500), (500, 500)]);
+    // The run's own check: the event (500) lay above the watermark
+    // published before it (499).
+    assert_eq!(run.stamps(), [500]);
+}
+
+/// A heartbeat within the gap after a read publishes without reading:
+/// input held for the gap is read at its end, not at the heartbeat.
+#[test]
+fn a_heartbeat_inside_the_gap_publishes_without_reading() {
+    let mut setup = Setup::new(Driven::Input).stop_at(3_000);
+    setup.arrivals = vec![(990, Msg::Key(1)), (995, Msg::Key(2))];
+    let run = setup.run(|_, _| Phase::Open);
+    assert_eq!(run.stamps(), [990, 990 + INPUT_GAP.0]);
+    assert!(
+        run.seen
+            .iter()
+            .any(|s| s.at == 1_000 && s.published == 1_000),
+        "{:?}",
+        run.seen
+    );
+    assert_eq!(run.report.causes.heartbeat, 2);
+}
+
+/// A drain the wake event started and the cut stopped waits for the gap
+/// like any read; a request within the gap publishes without reading.
+#[test]
+fn an_event_cut_drain_waits_for_the_gap() {
+    let mut setup = Setup::new(Driven::Input).stop_at(900);
+    setup.arrivals = keys(10, 0, 2_500);
+    setup.signals.push((10, Signal::Request));
+    setup.signals.push((50, Signal::Request));
+    let run = setup.run(|_, _| Phase::Open);
+    let stamps = run.stamps();
+    let cut = DRAIN_CUT as usize;
+    assert_eq!(stamps.len(), 2_500);
+    assert!(stamps[..cut].iter().all(|&s| s == 10));
+    assert!(stamps[cut..2 * cut].iter().all(|&s| s == 10 + INPUT_GAP.0));
+    assert!(stamps[2 * cut..].iter().all(|&s| s == 10 + 2 * INPUT_GAP.0));
+    assert!(run.seen.iter().any(|s| s.at == 50), "{:?}", run.seen);
+    assert_eq!(run.report.causes.event, 2);
+}
+
+/// A wait for the timer alone that returns for the message queue is no
+/// failure: the loop waits again, and held input is read at the gap's end.
+#[test]
+fn a_queue_return_during_a_timer_only_wait_is_not_a_failure() {
+    // The OS result for the queue maps to a queue return, not a failure,
+    // when no input was asked for.
+    assert_eq!(cadence::classify(1, 1, false), Ok(Woken::Queue));
+    assert_eq!(cadence::classify(2, 2, false), Ok(Woken::Queue));
+    assert_eq!(cadence::classify(2, 2, true), Ok(Woken::Input));
+    assert_eq!(cadence::classify(1, 2, false), Ok(Woken::Timer));
+    assert_eq!(cadence::classify(0, 2, false), Ok(Woken::Event));
+    assert_eq!(cadence::classify(u32::MAX, 2, false), Err(WaitFailed));
+    assert_eq!(cadence::classify(3, 2, true), Err(WaitFailed));
+    let mut setup = Setup::new(Driven::Input).stop_at(900);
+    setup.arrivals = vec![(100, Msg::Key(1)), (110, Msg::Key(2))];
+    setup.queue_returns = vec![150, 160];
+    let run = setup.run(|_, _| Phase::Open);
+    assert_eq!(run.result, Ok(()));
+    assert_eq!(run.stamps(), [100, 100 + INPUT_GAP.0]);
+    assert!(run.report.rearms >= 3, "{}", run.report.rearms);
+}
+
+/// Lateness is sampled whenever a publication reaches the heartbeat's
+/// deadline, whatever woke the thread: here an input wake 50 µs after it,
+/// before the late timer fired.
+#[test]
+fn lateness_is_sampled_whatever_reaches_the_deadline() {
+    let mut setup = Setup::new(Driven::Input).stop_at(1_200);
+    setup.timer_late = 300;
+    setup.arrivals = keys(1_050, 0, 1);
+    let run = setup.run(|_, _| Phase::Open);
+    assert_eq!(run.report.causes.heartbeat, 0);
+    assert_eq!(run.report.causes.input, 1);
+    assert_eq!(run.report.lateness.count(), 1);
+    assert_eq!(run.report.lateness.max(), 50);
 }
 
 /// Arrivals during a drain are read in it; one right after it waits for
