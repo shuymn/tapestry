@@ -27,8 +27,12 @@
 //! are refused, not converted.
 //!
 //! The session section is the session policy's id, the play type (0 the
-//! whole chart) and the speed as k of `k/20` (10 to 30; anything else is
-//! refused).
+//! whole chart, 1 a mid-chart start, 2 a round of section repeat), for a
+//! practice round its conditions, and the speed as k of `k/20` (10 to 30;
+//! anything else is refused). A practice round's conditions are the
+//! section's start and end and its lead-in (signed, in the record's time),
+//! the attempt number, and the initial gauges (a count, then each gauge's
+//! ID and value); a repeated gauge ID is refused.
 //!
 //! Each source of the devices section is its kind, receive method, input
 //! offset, its bindings (a count, then each control and lane), and its
@@ -57,20 +61,20 @@ use eval::{
     AxisBinding, AxisMode, Binding, ControlId, InputKind, InputStart, PhysicalInputEvent,
     ScratchSettings, SourceId, SourceProfile,
 };
-use rules::RulePreset;
+use rules::{GaugeValue, RulePreset};
 use sha2::{Digest, Sha256};
 
 pub use error::{DecodeError, Section};
 pub use record::{
     Arrival, BuildProvenance, ChartRecord, DeviceKind, DeviceRecord, EndStatus, Incomplete,
-    PASSTHROUGH, PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status,
-    TransformId, TransformRecord, Versions, WakePolicy,
+    InitialGauge, PASSTHROUGH, PlayRecord, PlayType, Practice, PresetRecord, ReceiveMethod,
+    SourceRecord, Status, TransformId, TransformRecord, Versions, WakePolicy,
 };
 
 use wire::{Reader, Writer};
 
 /// The format version this crate writes, and the only one it reads.
-pub const FORMAT_VERSION: u16 = 6;
+pub const FORMAT_VERSION: u16 = 7;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -199,9 +203,17 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
     section(&|w| write_preset(w, preset));
     section(&|w| {
         w.str(session_policy);
-        w.uint(match play_type {
-            PlayType::Full => 0,
-        });
+        match play_type {
+            PlayType::Full => w.uint(0),
+            PlayType::MidChartStart(p) => {
+                w.uint(1);
+                write_practice(w, p);
+            }
+            PlayType::SectionRepeat(p) => {
+                w.uint(2);
+                write_practice(w, p);
+            }
+        }
         w.uint(u64::from(speed.twentieths()));
     });
     section(&|w| write_devices(w, devices));
@@ -256,6 +268,25 @@ fn write_chart(w: &mut Writer, c: &ChartRecord) {
     }
     w.str(id);
     w.uint(u64::from(*version));
+}
+
+fn write_practice(w: &mut Writer, p: &Practice) {
+    let Practice {
+        start,
+        end,
+        lead_in,
+        attempt,
+        initial_gauges,
+    } = p;
+    w.int(start.0);
+    w.int(end.0);
+    w.int(lead_in.0);
+    w.uint(u64::from(*attempt));
+    w.len(initial_gauges.len());
+    for InitialGauge { id, value } in initial_gauges {
+        w.str(id);
+        w.int(value.0);
+    }
 }
 
 fn write_preset(w: &mut Writer, p: &PresetRecord) {
@@ -521,6 +552,8 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
         let policy = r.string()?;
         let play_type = match r.uint()? {
             0 => PlayType::Full,
+            1 => PlayType::MidChartStart(read_practice(r)?),
+            2 => PlayType::SectionRepeat(read_practice(r)?),
             _ => return Err(DecodeError::InvalidValue("play type")),
         };
         let speed = u32::try_from(r.uint()?)
@@ -598,6 +631,37 @@ fn read_chart(r: &mut Reader<'_>, loader_version: u32) -> Result<ChartRecord, De
         },
         random_seed,
         transform,
+    })
+}
+
+/// The fewest bytes an initial gauge takes: an empty ID's length and a
+/// one-byte value.
+const MIN_INITIAL_GAUGE_BYTES: usize = 2;
+
+fn read_practice(r: &mut Reader<'_>) -> Result<Practice, DecodeError> {
+    let start = TimeUs(r.int()?);
+    let end = TimeUs(r.int()?);
+    let lead_in = TimeUs(r.int()?);
+    let attempt = r.u32()?;
+    let n = r.count(MIN_INITIAL_GAUGE_BYTES)?;
+    let mut initial_gauges = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = r.string()?;
+        let value = GaugeValue(r.int()?);
+        initial_gauges.push(InitialGauge { id, value });
+    }
+    // Gauges are taken by ID, so an ID names one value.
+    let mut ids: Vec<&str> = initial_gauges.iter().map(|g| g.id.as_str()).collect();
+    ids.sort_unstable();
+    if ids.windows(2).any(|w| w[0] == w[1]) {
+        return Err(DecodeError::InvalidValue("initial gauge ID"));
+    }
+    Ok(Practice {
+        start,
+        end,
+        lead_in,
+        attempt,
+        initial_gauges,
     })
 }
 

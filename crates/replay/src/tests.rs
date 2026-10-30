@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 use crate::wire::Writer;
 use crate::{
     Arrival, BuildProvenance, ChartRecord, DecodeError, DecodeLimits, DeviceKind, DeviceRecord,
-    EndStatus, FORMAT_VERSION, Incomplete, MAGIC, PlayRecord, PlayType, PresetRecord,
-    ReceiveMethod, Section, SourceRecord, Status, TransformRecord, Versions, WakePolicy,
-    body_bytes, decode, encode, preset_hash, write_events, write_status,
+    EndStatus, FORMAT_VERSION, Incomplete, InitialGauge, MAGIC, PlayRecord, PlayType, Practice,
+    PresetRecord, ReceiveMethod, Section, SourceRecord, Status, TransformRecord, Versions,
+    WakePolicy, body_bytes, decode, encode, preset_hash, write_events, write_status,
 };
 
 fn lane(i: u8) -> Lane {
@@ -355,6 +355,99 @@ fn a_record_from_before_the_speed_is_refused() {
     assert_eq!(
         decode(&old, &limits()),
         Err(DecodeError::UnsupportedVersion(5))
+    );
+}
+
+#[test]
+fn a_record_from_before_the_practice_fields_is_refused() {
+    // Format 6 had no practice conditions; its files are refused by their
+    // version, with no conversion to a full play.
+    let mut old = wrap(&body_bytes(&golden()), 3);
+    old[4..6].copy_from_slice(&6_u16.to_le_bytes());
+    assert_eq!(
+        decode(&old, &limits()),
+        Err(DecodeError::UnsupportedVersion(6))
+    );
+}
+
+/// A round of `[10 s, 20 s)` with a 2 s lead-in, its third attempt, with
+/// `normal` at 50 % and `survival` at 70 %.
+fn practice() -> Practice {
+    Practice {
+        start: TimeUs(10_000_000),
+        end: TimeUs(20_000_000),
+        lead_in: TimeUs(2_000_000),
+        attempt: 3,
+        initial_gauges: vec![
+            InitialGauge {
+                id: "normal".to_owned(),
+                value: rules::GaugeValue(5_000_000),
+            },
+            InitialGauge {
+                id: "survival".to_owned(),
+                value: rules::GaugeValue(7_000_000),
+            },
+        ],
+    }
+}
+
+#[test]
+fn practice_rounds_round_trip_and_a_repeated_gauge_id_is_refused() {
+    for play_type in [
+        PlayType::MidChartStart(practice()),
+        PlayType::SectionRepeat(practice()),
+        PlayType::SectionRepeat(Practice {
+            initial_gauges: Vec::new(),
+            ..practice()
+        }),
+    ] {
+        let mut rec = sample(5);
+        rec.play_type = play_type;
+        assert_eq!(decode(&encode(&rec), &limits()), Ok(rec));
+    }
+    let mut rec = sample(5);
+    let mut twice = practice();
+    twice.initial_gauges[1].id = "normal".to_owned();
+    rec.play_type = PlayType::SectionRepeat(twice);
+    assert_eq!(
+        decode(&encode(&rec), &limits()),
+        Err(DecodeError::InvalidValue("initial gauge ID"))
+    );
+    // Tag 3 names no play type.
+    let sections = split_sections(&body_bytes(&golden()));
+    let mut other = sections.clone();
+    let session = &mut other[Section::Session as usize];
+    let n = session.len();
+    assert_eq!(session[n - 2..], [0, 13]);
+    session[n - 2] = 3;
+    assert_eq!(
+        decode(&wrap(&join_sections(&other), 3), &limits()),
+        Err(DecodeError::InvalidValue("play type"))
+    );
+}
+
+#[test]
+fn initial_gauges_beyond_the_data_are_refused_before_allocating() {
+    // A round's session section that claims u64::MAX gauges in a few
+    // bytes: refused by the bytes left, before anything is reserved for
+    // them.
+    let sections = split_sections(&body_bytes(&golden()));
+    let mut other = sections.clone();
+    let session = &mut other[Section::Session as usize];
+    let n = session.len();
+    session.truncate(n - 2);
+    let mut w = Writer::default();
+    w.uint(2);
+    for v in [10_000_000, 20_000_000, 2_000_000] {
+        w.int(v);
+    }
+    w.uint(1);
+    w.uint(u64::MAX);
+    w.uint(13);
+    session.extend_from_slice(&w.0);
+    assert_eq!(
+        decode(&wrap(&join_sections(&other), 3), &limits()),
+        Err(DecodeError::CountBeyondData(u64::MAX))
     );
 }
 

@@ -211,6 +211,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::screen_failed",
             "PlayerRig::cancel_audio",
             "PlayerRig::seal_audio",
+            "PlayerRig::ring_out",
             "PlayerRig::audio_done",
             "PlayerRig::input_failure",
         ],
@@ -280,6 +281,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/play/reducer.rs"),
     Site::File("crates/skin-model/src/play/schema.rs"),
     Site::File("crates/skin-model/src/play/timers.rs"),
+    // A frame of an image from its cycle and its place in the atlas.
+    Site::File("crates/skin-model/src/atlas/uv.rs"),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],

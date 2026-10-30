@@ -1617,6 +1617,7 @@ fn a_play_too_long_to_record_is_refused_before_it_starts() {
         game::LogicError::RecordingTooLarge {
             needed: 902 * (240 + 1000) + 2 * 2,
             allowed,
+            section: false,
         }
     );
     // The keyboard alone fits: its 902 × 240 + 4 inputs are reserved
@@ -1699,6 +1700,7 @@ fn a_chart_too_large_to_reserve_is_refused_without_inputs() {
         game::LogicError::RecordingTooLarge {
             needed: 0,
             allowed: 0,
+            section: false,
         }
     );
 }

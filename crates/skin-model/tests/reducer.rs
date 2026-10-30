@@ -273,7 +273,7 @@ fn check_prefix(h: &Harness, k: usize, context: &str) {
 
 /// The skin of the split test: one `when(on(mine.0))` timer.
 fn mine_when_skin() -> Skin {
-    Skin::new(vec![bool_program("on(mine.0)")], Vec::new()).unwrap()
+    play_support::load(vec![bool_program("on(mine.0)")], Vec::new()).unwrap()
 }
 
 #[test]
