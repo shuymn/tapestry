@@ -779,7 +779,8 @@ Each one holds the behavior D5 and D6 state.
 - `refused_load_releases_the_scan_pause`: after a refusal, a newly added chart is discovered without any completed play;
 - the pause is acknowledged before each countdown;
 - the load time is printed;
-- unknown arguments exit 2.
+- unknown arguments exit 2;
+- a second player process started on the same data root is refused before it opens `library.db`, with a message naming the folder (`second_process_is_refused_before_the_library_opens`). `library` keeps one owner per file only within a process; today's `tapestry.lock` only decides which process writes the log.
 
 ### PR16. Preset shelf, first-start presets and polling (`game`)
 
