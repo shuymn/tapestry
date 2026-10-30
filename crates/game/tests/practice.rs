@@ -605,8 +605,14 @@ fn retry_cuts_the_ring_out_and_saves() {
     let round1 = &run.reports[0];
     assert_eq!(round1.end, PlayEnd::Completed);
     assert_eq!(round1.tail_cut, Some(game::AbortCause::Retry));
-    // Cut in that step: the audio stopped at 20.9 s, before the ring-out's
-    // end, and the frozen record was saved then.
+    // The ring-out was under way, and was cut in that step: the audio
+    // stopped at 20.9 s, before its end, and the frozen record was saved
+    // then.
+    let rung = first(&run, |e| match *e {
+        Ev::RingOut { at, .. } => Some(at),
+        _ => None,
+    });
+    assert_eq!(rung, 19_681 * MS);
     let cancel = first(&run, |e| match *e {
         Ev::Cancel { at } => Some(at),
         _ => None,
@@ -641,7 +647,17 @@ fn saving_never_delays_the_ring_out() {
             run.log[..=to].to_vec()
         };
         assert_eq!(round1(&instant), round1(&slow));
-        assert!(round1(&instant).len() >= 4);
+        assert!(
+            round1(&instant)
+                .iter()
+                .any(|e| matches!(e, Ev::RingOut { .. }))
+        );
+        // The quit cuts the ring-out in its step, before the save.
+        if !commands.is_empty() {
+            assert!(round1(&slow).contains(&Ev::Cancel {
+                at: CLOCK_START + 20_900 * MS - 8_000 * MS
+            }));
+        }
         // The fade and the stop on the output, sample for sample, through
         // the ring-out's end.
         // Frame `n` plays at `CLOCK_START + (n + 480) / RATE`, and round
@@ -743,8 +759,8 @@ fn load_bms(dir: &Path, text: &str, speed: Speed) -> Loaded {
 #[test]
 fn practice_window_is_sized_by_the_section() {
     // 60 BPM, so a measure is 4 s: a tap at 69.5 s is 1.5 s into measure
-    // 17, and a tap at 1 s gives the chart a start.
-    let text = "#BPM 60\n#WAV01 a.wav\n#00011:0001\n#01711:0000000100000000\n";
+    // 17; taps at 2 s and 74 s lie before and after the section.
+    let text = "#BPM 60\n#WAV01 a.wav\n#00011:0001\n#01711:0000000100000000\n#01811:0001\n";
     let dir = tempfile::tempdir().unwrap();
     let mut seen = 0;
     for (k, window) in [
@@ -922,6 +938,9 @@ fn excerpt_matches_mid_chart_start_end_to_end() {
         // too, as a mid-chart start does.
         rig.commands.push((1, 25_000 * MS, Command::Quit));
         let _ = game::live::run_chart(&mut loaded, &mut rig);
+        // Live, the play judged what its record re-evaluates to.
+        let summary = rig.reports[0].result.as_ref().unwrap();
+        assert!(summary.matches_live, "practice: {practice}");
         let records = records.borrow();
         assert_eq!(records.len(), 1);
         records[0].clone()
