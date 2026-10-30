@@ -5,7 +5,8 @@
 //! press on a screen that ignores it, unless the test keeps it queued.
 //!
 //! Allocations are counted from each play's handoff to its close on the
-//! property's thread (see `counting`): a play reserves everything at its
+//! property's thread alone (see `counting`), on a per-thread count no
+//! other test can move: a play reserves everything at its
 //! countdown's start, so none happen there.
 
 mod common;
@@ -230,7 +231,8 @@ struct Headless {
 /// A play between its handoff and its close.
 struct Play {
     finalized: bool,
-    allocs: u64,
+    /// This thread's count at the handoff, when counting.
+    allocs: Option<u64>,
 }
 
 impl Headless {
@@ -458,10 +460,12 @@ impl Rig for Headless {
         self.waits_since_seal = 0;
         self.play = Some(Play {
             finalized: false,
-            allocs: counting::calls(),
+            allocs: self.count_allocs.then(counting::thread_calls),
         });
         // Last: anything the rig itself frees above is not the play's.
-        counting::track(self.count_allocs);
+        if self.count_allocs {
+            counting::track(true);
+        }
     }
 
     fn measured(&mut self, advance: &game::Advance, _: &[eval::JudgeEvent], _: TimeUs) {
@@ -501,12 +505,14 @@ impl Rig for Headless {
     }
 
     fn close(&mut self) -> Result<Closing, InputWaitError> {
-        counting::track(false);
         if let Some(p) = self.play.take() {
-            let allocs = counting::calls() - p.allocs;
-            if allocs != 0 {
-                self.violations
-                    .push(format!("{allocs} allocations after the handoff"));
+            if let Some(before) = p.allocs {
+                counting::track(false);
+                let allocs = counting::thread_calls() - before;
+                if allocs != 0 {
+                    self.violations
+                        .push(format!("{allocs} allocations after the handoff"));
+                }
             }
             self.finalized.push(p.finalized);
         }
@@ -1017,7 +1023,7 @@ proptest! {
     ) {
         let acts = std::iter::once((0, Act::Choose(first))).chain(rest).collect();
         counting::track(true);
-        counting::self_check();
+        counting::thread_self_check();
         counting::track(false);
         let (rig, events, ran) = run(refusal, acts, |r| r.count_allocs = true);
         prop_assert!(ran.is_ok(), "{:?}", ran);

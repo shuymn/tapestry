@@ -22,12 +22,20 @@ static CALLS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
+    static MINE: Cell<u64> = const { Cell::new(0) };
 }
 
 fn note() {
     if TRACK.try_with(Cell::get).unwrap_or(false) {
         CALLS.fetch_add(1, Ordering::Relaxed);
+        let _ = MINE.try_with(|c| c.set(c.get() + 1));
     }
+}
+
+/// Allocations and frees counted so far on this thread alone, which no
+/// other thread can move.
+pub fn thread_calls() -> u64 {
+    MINE.with(Cell::get)
 }
 
 /// Starts or stops counting on this thread.
@@ -50,6 +58,15 @@ pub fn self_check() {
     drop(std::hint::black_box(vec![1u8; 8]));
     assert_eq!(calls() - before, 2, "the allocation was not counted");
     CALLS.fetch_sub(2, Ordering::Relaxed);
+}
+
+/// The positive control of [`thread_calls`], called while this thread is
+/// tracked: other tracked threads may run meanwhile, and a test compares
+/// this thread's counts before and after what it checks.
+pub fn thread_self_check() {
+    let mine = thread_calls();
+    drop(std::hint::black_box(vec![1u8; 8]));
+    assert_eq!(thread_calls() - mine, 2, "the allocation was not counted");
 }
 
 // SAFETY: delegates to `System`; only adds a counter, which never allocates.

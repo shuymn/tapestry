@@ -2,6 +2,10 @@
 //! outside the evaluator (design.md "Session Policy Lives Outside the
 //! Evaluator", "Screen Transition and Session Events").
 
+use std::cell::RefCell;
+use std::fmt;
+use std::rc::Rc;
+
 use eval::GaugeState;
 use replay::EndStatus;
 
@@ -93,6 +97,29 @@ pub enum SessionEvent {
 pub trait SessionEventSink {
     /// One event.
     fn on_event(&mut self, ev: &SessionEvent);
+}
+
+/// A handle to one session event sink, reported to through a shared
+/// borrow: a run's selection and each chart it loads hold handles to the
+/// same sink, and a play reports its start while its logic step borrows
+/// the chart.
+#[derive(Clone)]
+pub(crate) struct SharedEvents(Rc<RefCell<Box<dyn SessionEventSink>>>);
+
+impl SharedEvents {
+    pub(crate) fn new(sink: Box<dyn SessionEventSink>) -> Self {
+        Self(Rc::new(RefCell::new(sink)))
+    }
+
+    pub(crate) fn on_event(&self, ev: &SessionEvent) {
+        self.0.borrow_mut().on_event(ev);
+    }
+}
+
+impl fmt::Debug for SharedEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedEvents")
+    }
 }
 
 /// Receives events and does nothing.

@@ -11,7 +11,6 @@
 //! its countdown starts, and recording opens at the countdown. The session
 //! clock, which the audio output follows, only moves forward across plays.
 
-use std::cell::RefCell;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -34,7 +33,7 @@ use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
-    SessionPolicy,
+    SessionPolicy, SharedEvents,
 };
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
 use crate::render::PlayView;
@@ -344,24 +343,9 @@ pub struct Loaded {
     preset_path: PathBuf,
     preset_modified: Option<SystemTime>,
     attempt: u32,
-    /// The parts' event sink, taken out of them so a play can report its
-    /// start while its logic step borrows the chart.
-    events: Events,
-}
-
-/// A session event sink reported to through a shared borrow.
-struct Events(RefCell<Box<dyn SessionEventSink>>);
-
-impl Events {
-    fn on_event(&self, ev: &SessionEvent) {
-        self.0.borrow_mut().on_event(ev);
-    }
-}
-
-impl fmt::Debug for Events {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Events")
-    }
+    /// Where the session events go, out of the parts so a play can report
+    /// its start while its logic step borrows the chart.
+    events: SharedEvents,
 }
 
 /// The start of one play: its number, and whether the preset file it
@@ -436,6 +420,23 @@ impl Loaded {
         config: SessionConfig,
         mut parts: Parts,
     ) -> Result<Self, SessionError> {
+        let events = SharedEvents::new(std::mem::replace(
+            &mut parts.events,
+            Box::new(NoSessionEvents),
+        ));
+        Self::load_reporting_to(root, settings, chart_path, config, parts, events)
+    }
+
+    /// [`load`](Self::load), with the session events going to `events`
+    /// instead of the parts' sink.
+    pub(crate) fn load_reporting_to(
+        root: DataRoot,
+        settings: Settings,
+        chart_path: &Path,
+        config: SessionConfig,
+        parts: Parts,
+        events: SharedEvents,
+    ) -> Result<Self, SessionError> {
         if config.step.0 <= 0 {
             return Err(SessionError::InvalidStep(config.step));
         }
@@ -481,10 +482,6 @@ impl Loaded {
             random_seed: config.seed,
             transform: parts.transform.id().record(),
         };
-        let events = Events(RefCell::new(std::mem::replace(
-            &mut parts.events,
-            Box::new(NoSessionEvents),
-        )));
         events.on_event(&SessionEvent::Load);
         Ok(Self {
             root,

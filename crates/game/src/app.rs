@@ -12,16 +12,14 @@
 //! - Only the screen, audio and input-thread failures [`LiveError`] carries
 //!   end the run; closing the window ends it from any scene.
 
-use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use bms_model::TimeUs;
 
 use crate::live::{Leave, LiveError, Rig, run_chart, run_over};
 use crate::logic::LogicError;
-use crate::policy::{SessionEvent, SessionEventSink};
+use crate::policy::{SessionEvent, SessionEventSink, SharedEvents};
 use crate::session::{Loaded, Parts, SessionConfig, SessionError, Settings};
 use crate::settings::DataRoot;
 
@@ -91,17 +89,6 @@ pub struct App {
     events: SharedEvents,
 }
 
-/// The one session event sink of a run: selection reports through it, and
-/// each chart's parts get a handle to it, so no chart reports elsewhere.
-#[derive(Clone)]
-struct SharedEvents(Rc<RefCell<Box<dyn SessionEventSink>>>);
-
-impl SessionEventSink for SharedEvents {
-    fn on_event(&mut self, ev: &SessionEvent) {
-        self.0.borrow_mut().on_event(ev);
-    }
-}
-
 impl fmt::Debug for App {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("App")
@@ -129,7 +116,7 @@ impl App {
             settings,
             config,
             parts,
-            events: SharedEvents(Rc::new(RefCell::new(events))),
+            events: SharedEvents::new(events),
         }
     }
 
@@ -183,16 +170,14 @@ impl App {
         chart: &Path,
         rig: &mut R,
     ) -> Result<Chosen<R::BankError>, LiveError<R::ScreenError>> {
-        let parts = Parts {
-            events: Box::new(self.events.clone()),
-            ..(self.parts)(&self.settings)
-        };
-        let mut loaded = match Loaded::load(
+        // Every chart reports to the run's one sink, never the parts' own.
+        let mut loaded = match Loaded::load_reporting_to(
             self.root.clone(),
             self.settings.clone(),
             chart,
             self.config.clone(),
-            parts,
+            (self.parts)(&self.settings),
+            self.events.clone(),
         ) {
             Ok(loaded) => loaded,
             Err(e) => return Ok(Chosen::Refused(Refused::Chart(e))),
