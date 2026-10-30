@@ -48,6 +48,7 @@ pub const LICENSES: &[(&str, &str)] = &[
     ("bms-model", PERMISSIVE),
     ("bms-parser", PERMISSIVE),
     ("rules", PERMISSIVE),
+    ("rules-toml", PERMISSIVE),
     ("eval", PERMISSIVE),
     ("replay", PERMISSIVE),
     ("xtask", PERMISSIVE),

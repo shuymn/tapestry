@@ -36,13 +36,13 @@ use crate::policy::{
     SessionPolicy,
 };
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
-use crate::preset::{PresetError, load_preset_toml, preset_to_toml};
 use crate::render::PlayView;
 use crate::render::RenderSide;
 use crate::results::{ReEvaluate, ResultContext, ResultExtension, ResultSummary};
 use crate::save::{LocalRecords, RecordRef, RecordSink, SaveError, write_atomic};
 use crate::settings::{DataRoot, DeviceSettings, KeyConfig, PlayerSettings, SettingsError};
 use crate::sound::{AudioQueue, RunnerAudio, Wakes};
+use rules_toml::{PresetError, load_preset_toml, preset_to_toml};
 
 /// Every extension point the session calls through, each with one
 /// implementation in stage 1.

@@ -15,6 +15,7 @@ eval.workspace = true
 input.workspace = true
 replay.workspace = true
 rules.workspace = true
+rules-toml.workspace = true
 rtrb.workspace = true
 serde.workspace = true
 tempfile.workspace = true

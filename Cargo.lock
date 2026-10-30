@@ -577,6 +577,7 @@ dependencies = [
  "replay",
  "rtrb",
  "rules",
+ "rules-toml",
  "serde",
  "sha2",
  "tempfile",
@@ -1569,6 +1570,17 @@ name = "rules"
 version = "0.0.0"
 dependencies = [
  "bms-model",
+]
+
+[[package]]
+name = "rules-toml"
+version = "0.0.0"
+dependencies = [
+ "bms-model",
+ "rules",
+ "serde",
+ "thiserror 2.0.21",
+ "toml",
 ]
 
 [[package]]
