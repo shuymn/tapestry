@@ -155,6 +155,7 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
         &[
             "custom",
             "beatoraja_style",
+            "gauge_policies",
             "long",
             "other_version",
             "non_minimal_varint",
@@ -175,9 +176,9 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
     for (name, bytes) in seeds {
         let result = preset_canonical(&bytes).map(|_| ());
         let expected = match name {
-            "custom" | "beatoraja_style" | "long" => Ok(()),
-            "other_version" => Err(CanonicalError::UnsupportedVersion(7)),
-            "older_version" => Err(CanonicalError::UnsupportedVersion(5)),
+            "custom" | "beatoraja_style" | "gauge_policies" | "long" => Ok(()),
+            "other_version" => Err(CanonicalError::UnsupportedVersion(8)),
+            "older_version" => Err(CanonicalError::UnsupportedVersion(6)),
             "wrong_percent_length" => Err(CanonicalError::WrongLength {
                 field: "rank_percent",
                 len: 6,

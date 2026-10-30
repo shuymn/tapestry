@@ -1,10 +1,13 @@
 //! Gauges in fixed point: every gauge of the preset is computed side by
-//! side, each change computed in `i128`, reduced, clamped, then narrowed.
+//! side, each change computed in `i128` in the order of design.md
+//! "Evaluation Stages" (accounting), then narrowed.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::TimeUs;
-use rules::{GaugeDelta, GaugeKind, GaugeRule, GaugeValue, Judgment, MineRule};
+use rules::{
+    CorrectionFactors, Factor, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, Judgment, MineRule,
+};
 
 /// What changes the gauges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +28,7 @@ pub struct GaugeState {
     /// The value had the gauge never failed; equal to `value` for a gauge
     /// that cannot fail. It is a reference only, never used for a clear.
     pub reference: GaugeValue,
-    /// When a survival gauge reached 0, if it did.
+    /// When a survival gauge failed, if it did.
     pub failed_at: Option<TimeUs>,
 }
 
@@ -37,36 +40,64 @@ pub(crate) fn increment(total_milli: i64, notes: usize) -> i128 {
     (i128::from(total_milli) * 100).div_euclid(notes.max(1))
 }
 
-/// The change a gauge rule gives for `cause`, before any reduction.
-fn delta(rule: &GaugeRule, mine: &MineRule, cause: Cause, increment: i128) -> i128 {
-    let d = match cause {
+/// `(num, den)` multiplied by `f`, saturating: a validated preset's factors
+/// keep both far inside `i128`.
+fn times((num, den): (i128, i128), f: Factor) -> (i128, i128) {
+    (num.saturating_mul(f.num), den.saturating_mul(f.den))
+}
+
+/// The change `cause` makes to a gauge at `before`, steps 1 to 5 of
+/// design.md "Evaluation Stages" accounting: the base change, the `#TOTAL`
+/// correction, the low-gauge reduction chosen from `before`, then one
+/// signed floor. A mine's change is its damage as it is.
+fn change(
+    rule: &GaugeRule,
+    mine: &MineRule,
+    cause: Cause,
+    increment: i128,
+    correction: CorrectionFactors,
+    before: GaugeValue,
+) -> i128 {
+    // 1. The base change, as an exact fraction.
+    let base = match cause {
         Cause::Judged(j) => *rule.change.get(j),
         Cause::EmptyPoor => rule.empty_poor,
         Cause::Mine(damage) => return i128::from(mine.change(damage).0),
     };
-    match d {
-        GaugeDelta::Fixed(v) => i128::from(v.0),
+    let mut d = match base {
+        GaugeDelta::Fixed(v) => (i128::from(v.0), 1),
         GaugeDelta::TotalShare { num, den } => {
-            (increment * i128::from(num)).div_euclid(i128::from(den).max(1))
+            (increment.saturating_mul(i128::from(num)), i128::from(den))
         }
+    };
+    // 2. The #TOTAL correction, by the sign of the change.
+    if d.0 > 0 {
+        d = times(d, correction.increase);
+    } else if d.0 < 0 {
+        d = times(d, correction.damage);
     }
+    // 4. The low-gauge reduction, the first band that applies to `before`.
+    if d.0 < 0
+        && let Some(band) = rule.low_damage.iter().find(|b| b.applies_at(before))
+    {
+        d = times(
+            d,
+            Factor {
+                num: i128::from(band.num),
+                den: i128::from(band.den),
+            },
+        );
+    }
+    // 5. One signed floor; a validated preset's denominators are positive.
+    d.0.div_euclid(d.1.max(1))
 }
 
-/// `before` changed by `delta`: reduced while low (except for mines), then
-/// clamped to the rule's bounds, then narrowed.
-fn step(rule: &GaugeRule, before: GaugeValue, delta: i128, cause: Cause) -> GaugeValue {
-    let mut delta = delta;
-    if let Some(low) = rule.low_damage
-        && delta < 0
-        && !matches!(cause, Cause::Mine(_))
-        && low.applies_at(before)
-    {
-        // A negative change other than a mine's is a fixed amount, so it
-        // fits in i64.
-        let d = i64::try_from(delta).unwrap_or(i64::MIN);
-        delta = i128::from(low.reduce(GaugeValue(d)).0);
-    }
-    let next = (i128::from(before.0) + delta).clamp(i128::from(rule.min.0), i128::from(rule.max.0));
+/// `before` changed by `delta`, then clamped to the rule's bounds, then
+/// narrowed.
+fn step(rule: &GaugeRule, before: GaugeValue, delta: i128) -> GaugeValue {
+    let next = i128::from(before.0)
+        .saturating_add(delta)
+        .clamp(i128::from(rule.min.0), i128::from(rule.max.0));
     // Clamped to bounds that are i64 values.
     GaugeValue(i64::try_from(next).unwrap_or(rule.max.0))
 }
@@ -75,15 +106,20 @@ fn step(rule: &GaugeRule, before: GaugeValue, delta: i128, cause: Cause) -> Gaug
 #[derive(Clone, Debug)]
 pub(crate) struct Gauges {
     states: Vec<GaugeState>,
+    /// Each gauge's `#TOTAL` correction for this chart.
+    corrections: Vec<CorrectionFactors>,
     increment: i128,
 }
 
 impl Gauges {
     /// Each gauge at `initial`'s value, else at its rule's start;
-    /// `initial`, when given, holds one value per rule.
+    /// `initial`, when given, holds one value per rule. `total_milli` is the
+    /// `#TOTAL` in effect and `notes` the gauge denominator's count, which
+    /// set the increment and each gauge's correction.
     pub(crate) fn new(
         rules: &[GaugeRule],
-        increment: i128,
+        total_milli: i64,
+        notes: usize,
         initial: Option<&[GaugeValue]>,
     ) -> Self {
         Self {
@@ -99,18 +135,27 @@ impl Gauges {
                     }
                 })
                 .collect(),
-            increment,
+            corrections: rules
+                .iter()
+                .map(|r| r.correction.factors(total_milli, notes))
+                .collect(),
+            increment: increment(total_milli, notes),
         }
     }
 
     /// Whether `initial` can start `rules`' gauges: one value per rule,
-    /// within its bounds, and above 0 for a survival gauge, as a preset's
-    /// own start must be.
+    /// within its bounds, and for a survival gauge above 0 and not below
+    /// its failure threshold, as a preset's own start must be.
     pub(crate) fn accepts(rules: &[GaugeRule], initial: &[GaugeValue]) -> bool {
         rules.len() == initial.len()
             && rules.iter().zip(initial).all(|(r, &v)| {
                 (r.min..=r.max).contains(&v)
-                    && !(r.kind == GaugeKind::Survival && v <= GaugeValue::EMPTY)
+                    && match r.kind {
+                        GaugeKind::EndThreshold { .. } => true,
+                        GaugeKind::Survival { fails_below } => {
+                            v > GaugeValue::EMPTY && v >= fails_below
+                        }
+                    }
             })
     }
 
@@ -118,7 +163,10 @@ impl Gauges {
         &self.states
     }
 
-    /// Applies `cause` at `time` to every gauge.
+    /// Applies `cause` at `time` to every gauge: each change is computed
+    /// from the value before it, added and clamped (steps 6 and 7), and a
+    /// survival gauge it leaves at 0 or strictly below its threshold fails
+    /// at 0 (step 8).
     pub(crate) fn apply(
         &mut self,
         rules: &[GaugeRule],
@@ -126,16 +174,26 @@ impl Gauges {
         cause: Cause,
         time: TimeUs,
     ) {
-        for (rule, state) in rules.iter().zip(&mut self.states) {
-            let d = delta(rule, mine, cause, self.increment);
-            state.reference = step(rule, state.reference, d, cause);
+        let gauges = rules.iter().zip(&mut self.states).zip(&self.corrections);
+        for ((rule, state), &correction) in gauges {
+            let d = change(
+                rule,
+                mine,
+                cause,
+                self.increment,
+                correction,
+                state.reference,
+            );
+            state.reference = step(rule, state.reference, d);
             // Until a failure the real value equals the reference; after
             // one it stays at 0.
             if state.failed_at.is_some() {
                 continue;
             }
             state.value = state.reference;
-            if rule.kind == GaugeKind::Survival && state.value <= rule.min {
+            if let GaugeKind::Survival { fails_below } = rule.kind
+                && (state.value <= GaugeValue::EMPTY || state.value < fails_below)
+            {
                 state.value = GaugeValue::EMPTY;
                 state.failed_at = Some(time);
             }

@@ -122,7 +122,6 @@ pub const IN_PLAY: &[Site] = &[
             "LnEndWindows::table",
             "LnEndWindows::judgment_of",
             "LowDamage::applies_at",
-            "LowDamage::reduce",
             "MineRule::change",
         ],
     ),

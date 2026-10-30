@@ -11,10 +11,11 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use rules::{
-    Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
-    LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
-    RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalMode, Window, WindowPolicy,
+    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
+    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+    RankScale, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode,
+    Window, WindowPolicy,
 };
 
 const FULL: i64 = GaugeValue::FULL.0;
@@ -171,38 +172,69 @@ fn gauge() -> impl Strategy<Value = GaugeRule> {
     let values = [0..=FULL, 0..=FULL, 0..=FULL, 0..=FULL];
     (
         values,
-        any::<bool>(),
+        (any::<bool>(), 0..=FULL),
         [delta(), delta(), delta(), delta(), delta()],
         delta(),
-        proptest::option::of((0..=FULL, 1..=u32::MAX, 0_u32..=u32::MAX)),
+        prop_oneof![
+            Just(TotalCorrection::None),
+            Just(TotalCorrection::LimitIncrease),
+            Just(TotalCorrection::ScaleDamage),
+        ],
+        prop_oneof![
+            vec((0..=FULL, 1..=u32::MAX, 0_u32..=u32::MAX), 0..=1),
+            vec((0..=FULL, 1..=u32::MAX, 0_u32..=u32::MAX), 2..6),
+        ],
     )
-        .prop_map(|(mut v, survival, change, empty_poor, low)| {
-            v.sort_unstable();
-            let [min, start, clear, max] = v.map(GaugeValue);
-            let (kind, min, start, max) = if survival {
-                let max = max.max(GaugeValue(1));
-                let start = start.clamp(GaugeValue(1), max);
-                (GaugeKind::Survival, GaugeValue::EMPTY, start, max)
-            } else {
-                (GaugeKind::EndThreshold { clear }, min, start, max)
-            };
-            let low_damage = low.map(|(below, den, num)| LowDamage {
-                below: GaugeValue(below.clamp(min.0, max.0)),
-                // At most `den`, `den` included.
-                num: u32::try_from(u64::from(num) % (u64::from(den) + 1)).unwrap(),
-                den,
-            });
-            GaugeRule {
-                id: String::new(),
-                kind,
-                start,
-                min,
-                max,
-                change: per_judgment(change),
-                empty_poor,
-                low_damage,
-            }
-        })
+        .prop_map(
+            |(mut v, (survival, threshold), change, empty_poor, correction, low)| {
+                v.sort_unstable();
+                let [min, start, clear, max] = v.map(GaugeValue);
+                let (kind, min, start, max) = if survival {
+                    let max = max.max(GaugeValue(1));
+                    let start = start.clamp(GaugeValue(1), max);
+                    let fails_below = GaugeValue(threshold.min(start.0));
+                    (
+                        GaugeKind::Survival { fails_below },
+                        GaugeValue::EMPTY,
+                        start,
+                        max,
+                    )
+                } else {
+                    (GaugeKind::EndThreshold { clear }, min, start, max)
+                };
+                // Strictly ascending bands within the bounds; equal ones
+                // collapse to one.
+                let mut low_damage: Vec<LowDamage> = low
+                    .into_iter()
+                    .map(|(below, den, num)| LowDamage {
+                        below: GaugeValue(below.clamp(min.0, max.0)),
+                        // At most `den`, `den` included.
+                        num: u32::try_from(u64::from(num) % (u64::from(den) + 1)).unwrap(),
+                        den,
+                    })
+                    .collect();
+                low_damage.sort_unstable_by_key(|b| b.below);
+                low_damage.dedup_by_key(|b| b.below);
+                // A corrected gauge has fixed changes only.
+                let fixed = |d: GaugeDelta| match (correction, d) {
+                    (TotalCorrection::None, d) | (_, d @ GaugeDelta::Fixed(_)) => d,
+                    (_, GaugeDelta::TotalShare { num, .. }) => {
+                        GaugeDelta::Fixed(GaugeValue(i64::from(num % 1_000)))
+                    }
+                };
+                GaugeRule {
+                    id: String::new(),
+                    kind,
+                    start,
+                    min,
+                    max,
+                    change: per_judgment(change.map(fixed)),
+                    empty_poor: fixed(empty_poor),
+                    correction,
+                    low_damage,
+                }
+            },
+        )
 }
 
 /// One, a few, or at least 128 gauges, with distinct ids.
@@ -230,7 +262,12 @@ fn preset() -> impl Strategy<Value = RulePreset> {
             ],
             window_policy(),
         ),
-        prop_oneof![1_i64..64, 1_i64..=i64::MAX],
+        prop_oneof![
+            prop_oneof![1_i64..64, 1_i64..=i64::MAX]
+                .prop_map(|milli| DefaultTotal::Fixed { milli }),
+            Just(DefaultTotal::NotesCurve),
+            Just(DefaultTotal::NotesLinear),
+        ],
         gauges(),
         ([u32s(), u32s(), u32s(), u32s(), u32s()], bools(), bools()),
         0..=FULL,
@@ -240,7 +277,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                 (id, version, keys, scratch),
                 [breaks_combo, counts_bp, counted],
                 (headers, window_policy),
-                default_total_milli,
+                default_total,
                 gauges,
                 (ex, breaks_combo_by, counts_bp_by),
                 per_unit,
@@ -260,7 +297,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                     },
                     headers,
                     window_policy,
-                    default_total_milli,
+                    default_total,
                     denominator: Denominator::TapsAndLnHeads,
                     gauges,
                     score: ScoreWeights {
@@ -299,7 +336,7 @@ proptest! {
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 19];
+    let mut counts = [0_usize; 27];
     // Per boolean field, whether it was seen false and true.
     let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
@@ -320,9 +357,27 @@ fn generator_reaches_every_variant_and_length_class() {
             p.gauges
                 .iter()
                 .any(|g| matches!(g.kind, GaugeKind::EndThreshold { .. })),
-            p.gauges.iter().any(|g| g.kind == GaugeKind::Survival),
-            p.gauges.iter().any(|g| g.low_damage.is_none()),
-            p.gauges.iter().any(|g| g.low_damage.is_some()),
+            p.gauges
+                .iter()
+                .any(|g| matches!(g.kind, GaugeKind::Survival { .. })),
+            p.gauges.iter().any(
+                |g| matches!(g.kind, GaugeKind::Survival { fails_below } if fails_below.0 > 0),
+            ),
+            p.gauges.iter().any(|g| g.low_damage.is_empty()),
+            p.gauges.iter().any(|g| g.low_damage.len() == 1),
+            p.gauges.iter().any(|g| g.low_damage.len() >= 2),
+            p.gauges
+                .iter()
+                .any(|g| g.correction == TotalCorrection::None),
+            p.gauges
+                .iter()
+                .any(|g| g.correction == TotalCorrection::LimitIncrease),
+            p.gauges
+                .iter()
+                .any(|g| g.correction == TotalCorrection::ScaleDamage),
+            matches!(p.default_total, DefaultTotal::Fixed { .. }),
+            p.default_total == DefaultTotal::NotesCurve,
+            p.default_total == DefaultTotal::NotesLinear,
             p.tables.keys.empty_poor.ahead.0 >= 1 << 62,
             p.tables.scratch.empty_poor.behind.0 >= 1 << 62,
             p.tables.keys != p.tables.scratch,

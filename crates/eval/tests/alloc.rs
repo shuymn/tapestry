@@ -170,6 +170,21 @@ fn advance_does_not_allocate() {
     .unwrap();
     let mut sec_out = Vec::with_capacity(sec.max_events(inputs.len()));
     let sec_capacity = sec_out.capacity();
+    // A fourth under beatoraja-style's gauges (HARD's damage bands, the
+    // increase limit, the default #TOTAL from the note count) plus one that
+    // scales damage by #TOTAL and the note count and fails below 2 %, over
+    // the same inputs.
+    let mut gauged = rules::beatoraja_style();
+    let mut scaled = gauged.gauges[3].clone();
+    scaled.id = "scaled".to_owned();
+    scaled.kind = rules::GaugeKind::Survival {
+        fails_below: rules::GaugeValue(2 * rules::GaugeValue::PERCENT),
+    };
+    scaled.correction = rules::TotalCorrection::ScaleDamage;
+    gauged.gauges.push(scaled);
+    let mut gev = Evaluator::new(&chart, &gauged, &dev, &InputStart::default(), None, 64).unwrap();
+    let mut gauged_out = Vec::with_capacity(gev.max_events(inputs.len()));
+    let gauged_capacity = gauged_out.capacity();
 
     TRACK.with(|t| t.set(true));
     // The count works: an allocation that escapes is counted in any profile.
@@ -183,10 +198,12 @@ fn advance_does_not_allocate() {
         while next < inputs.len() && inputs[next].received.0 <= w {
             ev.push_input(inputs[next]).unwrap();
             sec.push_input(inputs[next]).unwrap();
+            gev.push_input(inputs[next]).unwrap();
             next += 1;
         }
         ev.advance_to(TimeUs(w), &mut out).unwrap();
         sec.advance_to(TimeUs(w), &mut sec_out).unwrap();
+        gev.advance_to(TimeUs(w), &mut gauged_out).unwrap();
         w += MS;
     }
     let elapsed = started.elapsed();
@@ -246,6 +263,13 @@ fn advance_does_not_allocate() {
     assert_eq!(sec_judged, 599);
     assert!(sec.is_complete());
     assert_eq!(sec_out.capacity(), sec_capacity);
+    // The held mines failed every survival gauge; their references, which
+    // take every step, kept moving.
+    assert!(gev.is_complete());
+    assert_eq!(gauged_out.capacity(), gauged_capacity);
+    let gauges = gev.gauges();
+    assert_eq!(gauges.len(), 7);
+    assert!(gauges[3..].iter().all(|g| g.failed_at.is_some()));
     assert_eq!(allocations, 0);
     let per_input = elapsed.as_nanos() / u128::try_from(inputs.len()).unwrap();
     println!(
