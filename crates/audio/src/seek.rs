@@ -25,6 +25,9 @@ pub struct SeekSource {
     pub(crate) engine: u64,
     pub(crate) bank: Arc<SoundBank>,
     pub(crate) schedule: u64,
+    /// The engine's chart: one more at each replacement of its bank and
+    /// schedule.
+    pub(crate) chart: u64,
     pub(crate) voices: usize,
 }
 
@@ -129,8 +132,8 @@ impl FrameLine {
 pub struct SeekPlan {
     /// The engine it is for.
     engine: u64,
-    /// The [`schedule_hash`] of the schedule it was planned from.
-    schedule: u64,
+    /// The engine's chart it was planned for: its bank and schedule.
+    chart: u64,
     t: TimeUs,
     line: FrameLine,
     /// The frame of `t` on `line`.
@@ -220,7 +223,7 @@ impl SeekPlan {
         slots.retire(bank, fade, at);
         Ok(Self {
             engine: source.engine,
-            schedule: source.schedule,
+            chart: source.chart,
             t,
             line,
             at,
@@ -261,10 +264,10 @@ impl SeekPlan {
         self.engine
     }
 
-    /// The [`schedule_hash`] of the schedule it was planned from.
+    /// The engine's chart it was planned for.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub(crate) fn schedule(&self) -> u64 {
-        self.schedule
+    pub(crate) fn chart(&self) -> u64 {
+        self.chart
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

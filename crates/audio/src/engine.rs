@@ -146,6 +146,9 @@ fn output_time(origin: TimeUs, offset: TimeUs, t: TimeUs) -> TimeUs {
 pub struct AudioEngine {
     /// Which engine it is, for its seek plans.
     id: u64,
+    /// Which of its charts it plays, for its seek plans: one more at each
+    /// [`replace`](Self::replace).
+    chart: u64,
     bank: Arc<SoundBank>,
     mixer: Mixer,
     clock: MixClock,
@@ -214,6 +217,7 @@ impl AudioEngine {
         }
         Ok(Self {
             id: NEXT_ENGINE.fetch_add(1, Ordering::Relaxed),
+            chart: 0,
             bank,
             mixer: Mixer::new(voices, rate),
             clock: MixClock::new(rate, period),
@@ -304,6 +308,7 @@ impl AudioEngine {
             engine: self.id,
             bank: Arc::clone(&self.bank),
             schedule: self.bgm_hash,
+            chart: self.chart,
             voices: self.mixer.voices(),
         }
     }
@@ -354,9 +359,9 @@ impl AudioEngine {
     /// engine's is refused when planning), on a line of another rate or
     /// period, or whose frame is already written; nothing changes.
     pub fn seek(&mut self, plan: &SeekPlan) -> Result<(), SeekError> {
-        // A plan of another engine, or of a schedule the engine no longer
-        // plays (another chart was loaded since), is refused.
-        if plan.engine() != self.id || plan.schedule() != self.bgm_hash {
+        // A plan of another engine, or of a chart the engine no longer plays
+        // (its bank or schedule was replaced since), is refused.
+        if plan.engine() != self.id || plan.chart() != self.chart {
             return Err(SeekError::Source);
         }
         let line = plan.line();
@@ -421,6 +426,7 @@ impl AudioEngine {
         let old_bank = std::mem::replace(&mut self.bank, bank);
         let old_bgm = std::mem::replace(&mut self.bgm, events);
         let old_hash = std::mem::replace(&mut self.bgm_hash, hash);
+        self.chart = self.chart.wrapping_add(1);
         self.next_bgm = self.bgm.len();
         self.seek_to = None;
         Ok((old_bank, BgmSchedule::from_parts(old_bgm, old_hash)))

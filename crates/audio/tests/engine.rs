@@ -648,3 +648,25 @@ fn another_chart_replaces_the_bank_and_bgm() {
     assert!(refused_bgm.events().is_empty());
     assert!(Arc::ptr_eq(e.bank(), &new_bank));
 }
+
+/// A seek planned before a bank replacement is refused after it even when
+/// the schedule is the same: the plan was made against the old bank (here
+/// one without the scheduled sound, so it would park nothing and play
+/// silence where the new bank has the sound's tail), and the new chart is
+/// planned again.
+#[test]
+fn a_seek_planned_before_a_bank_replacement_is_refused() {
+    let schedule = vec![BgmEvent {
+        time: TimeUs(0),
+        sound: KEY,
+    }];
+    let empty = Arc::new(SoundBank::from_sounds(RATE, Vec::new()));
+    let mut e = AudioEngine::new(empty, &schedule, RATE, PERIOD, 64, 64).unwrap();
+    let at = TimeUs(10_000_000);
+    let stale = audio::SeekPlan::new(&e.seek_source(), &schedule, e.frame_line(), at).unwrap();
+    e.replace(bank(), audio::BgmSchedule::new(schedule.clone()))
+        .expect("same rate");
+    assert_eq!(e.seek(&stale), Err(audio::SeekError::Source));
+    let fresh = audio::SeekPlan::new(&e.seek_source(), &schedule, e.frame_line(), at).unwrap();
+    assert_eq!(e.seek(&fresh), Ok(()));
+}
