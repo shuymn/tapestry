@@ -24,12 +24,13 @@ use crate::{
     TotalCorrection, TotalMode, Window, WindowPolicy,
 };
 
-/// The encoding layout. Version 7 has a table per lane class (keys, then
+/// The encoding layout. Version 8 has a table per lane class (keys, then
 /// scratch: windows, LN-end edges, empty POOR range), the window policy
-/// after the header policy, the default `#TOTAL` as a policy, and per gauge
-/// a survival gauge's failure threshold, its `#TOTAL` correction and a list
-/// of low-damage bands.
-const FORMAT_VERSION: u64 = 7;
+/// after the header policy, two assignment variants (nearest first 0, combo
+/// priority 1), the default `#TOTAL` as a policy, and per gauge a survival
+/// gauge's failure threshold, its `#TOTAL` correction and a list of
+/// low-damage bands.
+const FORMAT_VERSION: u64 = 8;
 
 /// The fewest bytes a gauge takes: an empty id's length, the survival tag
 /// and a one-byte threshold, three one-byte values, six fixed deltas of a
@@ -92,6 +93,7 @@ impl RulePreset {
         });
         w.uint(match assignment {
             Assignment::NearestTiesEarlier => 0,
+            Assignment::ComboPriority => 1,
         });
         w.ln_mode(ln_mode);
         w.uint(match total_mode {
@@ -150,8 +152,10 @@ impl RulePreset {
         let same_time_order = r.tag("same_time_order", |t| {
             (t == 0).then_some(SameTimeOrder::InputsFirst)
         })?;
-        let assignment = r.tag("assignment", |t| {
-            (t == 0).then_some(Assignment::NearestTiesEarlier)
+        let assignment = r.tag("assignment", |t| match t {
+            0 => Some(Assignment::NearestTiesEarlier),
+            1 => Some(Assignment::ComboPriority),
+            _ => None,
         })?;
         let ln_mode = r.ln_mode()?;
         let total_mode = r.tag("total_mode", |t| {
@@ -782,10 +786,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_bytes_start_with_format_7_and_change_with_any_table_edge() {
+    fn canonical_bytes_start_with_format_8_and_change_with_any_table_edge() {
         let base = custom();
         let base_bytes = base.canonical_bytes();
-        assert_eq!(base_bytes.first(), Some(&7));
+        assert_eq!(base_bytes.first(), Some(&8));
         let edges: [fn(&mut crate::LaneTable) -> &mut TimeUs; 5] = [
             |t| &mut t.ln_end.perfect,
             |t| &mut t.ln_end.great,
@@ -921,11 +925,12 @@ mod tests {
             num: 4,
             den: 5,
         });
+        p.assignment = crate::Assignment::ComboPriority;
         p
     }
 
     /// The bytes of [`representative`], written by hand from the module docs
-    /// field by field: the format version 7, then `rep`, version 7, the
+    /// field by field: the format version 8, then `rep`, version 7, the
     /// implementation; the keys' table: the windows, the LN-end edges (90 ms
     /// is zigzag 180000 = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1
     /// 19`) and the empty POOR range (`ahead` 250 ms is zigzag 500000 = `a0
@@ -934,13 +939,14 @@ mod tests {
     /// the empty POOR's three flags, the header policy (`DefExRankFirst`, 1),
     /// the window policy (`Scaled`, 1: five percentages `19 32 4b 64 7d`, 80
     /// `50`, 70 `46`), the default `#TOTAL` (`Fixed`, 0: 123.456 is zigzag
-    /// 246912 = `80 89 0f`), and the rest in declaration order. Each gauge
+    /// 246912 = `80 89 0f`), and the rest in declaration order, the
+    /// assignment `ComboPriority` (1) among them. Each gauge
     /// ends with its correction's tag and its bands: normal's `00 00`;
     /// survival, after its kind (1) and 2 % threshold (`80 b5 18`), ends
     /// with `ScaleDamage` (2), two bands, 30 % (`80 9b ee 02`) × 1/2 and
     /// 50 % (`80 ad e2 04`) × 4/5.
     const PINNED: [u8; 242] = [
-        0x07, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+        0x08, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x03, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
         0x14, 0x80, 0xb5, 0x18, 0xa0, 0xfe, 0x0a, 0xc0, 0x8b, 0x11, 0xa0, 0xd1, //
@@ -959,7 +965,7 @@ mod tests {
         0x00, 0xbf, 0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, //
         0x02, 0x02, 0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x80, 0xad, 0xe2, 0x04, //
         0x04, 0x05, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, //
-        0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, //
         0xa0, 0x8d, 0x06,
     ];
 
@@ -1061,6 +1067,16 @@ mod tests {
     }
 
     #[test]
+    fn assignments_decode_and_differ() {
+        let style = crate::beatoraja_style();
+        assert_eq!(style.assignment, crate::Assignment::ComboPriority);
+        let mut p = custom();
+        p.assignment = crate::Assignment::ComboPriority;
+        assert_ne!(p.canonical_bytes(), custom().canonical_bytes());
+        assert_eq!(decode(&p.canonical_bytes()), Ok(p));
+    }
+
+    #[test]
     fn other_canonical_version_is_refused() {
         for v in [0, FORMAT_VERSION - 1, FORMAT_VERSION + 1, u64::MAX] {
             assert_eq!(
@@ -1076,19 +1092,19 @@ mod tests {
         // The id's length: one more than the bytes left is refused; exactly
         // the bytes left is read, and the next field finds nothing.
         assert_eq!(
-            decode(&[7, 4, b'a', b'b', b'c']),
+            decode(&[8, 4, b'a', b'b', b'c']),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
                 count: 4
             })
         );
         assert_eq!(
-            decode(&[7, 3, b'a', b'b', b'c']),
+            decode(&[8, 3, b'a', b'b', b'c']),
             Err(CanonicalError::Truncated)
         );
         assert_eq!(
             decode(&[
-                7, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
+                8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
             ]),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
@@ -1316,6 +1332,14 @@ mod tests {
         mine.mine(&custom().mine);
         let mine = bytes.len() - mine.0.len();
         assert_eq!(decode(&with_uint_at(mine, 1)), unknown("mine", 1));
+        // The assignment precedes the LN mode's two tags and the `#TOTAL`
+        // mode's.
+        let assignment = mine - 4;
+        assert_eq!(&bytes[assignment..mine], [0, 0, 0, 0]);
+        assert_eq!(
+            decode(&with_uint_at(assignment, 2)),
+            unknown("assignment", 2)
+        );
 
         // The implementation's tag is its name.
         let mut p = custom();

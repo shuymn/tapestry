@@ -330,6 +330,145 @@ fn empty_poor_keeps_the_combo_adds_bp_and_costs_two_percent() {
     assert_eq!(history, vec![100 * PCT, 98 * PCT, 100 * PCT]);
 }
 
+/// Source: play/JudgeManager.java:385-419: one scan over the lane's notes,
+/// judged and unjudged, decides an empty POOR when no note is taken: a
+/// judged note inside the MS pair (`:400-401`), or an unjudged one inside
+/// it but outside every window (`:403-404`, judge 4 becomes 5); the MS pair
+/// is the same range for both (play/JudgeProperty.java:23, {-150000,
+/// 500000}).
+#[test]
+fn empty_poor_is_part_of_the_scan() {
+    let chart = taps(&[T]);
+    // An unjudged note ahead, past the early BAD edge (220 ms), up to
+    // 500 ms.
+    for (before, poor) in [(221, 1), (500, 1)] {
+        let e = play(&chart, tap_at(T - before * MS));
+        assert_eq!(empty_poors(&e.events), poor, "{before} ms before");
+        assert_eq!(judged_at(&e), vec![(T + MISSED, Poor)]);
+    }
+    // A judged note ahead: taken BAD 200 ms early, then pressed again
+    // 190 ms early.
+    let again = |before: i64| {
+        let e = play(&chart, taps_at(&[T - 200 * MS, T - before]));
+        assert_eq!(judged_at(&e), vec![(T - 200 * MS, Bad)]);
+        empty_poors(&e.events)
+    };
+    assert_eq!(again(190 * MS), 1);
+    // A judged note behind: within 150 ms of the press.
+    let behind = |after: i64| empty_poors(&play(&chart, taps_at(&[T, T + after])).events);
+    assert_eq!(behind(150 * MS), 1);
+    assert_eq!(behind(150 * MS + 1), 0);
+    // A press that takes a note is never an empty POOR, and one that
+    // judges no note far from every note is nothing.
+    assert_eq!(empty_poors(&play(&chart, tap_at(T)).events), 0);
+    assert_eq!(empty_poors(&play(&chart, tap_at(T - 501 * MS)).events), 0);
+}
+
+/// Source: play/JudgeManager.java:385-419 (the scan finds the judged note
+/// behind the press) and play/JudgeProperty.java:23 (MS late -150000); the
+/// custom preset's range is 150 ms behind too (design.md "Custom Preset").
+/// The scan is located by time, not started at the first unjudged note,
+/// which no longer exists once the lane's last note is hit.
+#[test]
+fn empty_poor_after_the_last_hit_note() {
+    let chart = taps(&[T - 400 * MS, T]);
+    for preset in [rules::beatoraja_style(), rules::custom()] {
+        let run = |after: i64| {
+            let input = EvalInput {
+                events: taps_at(&[T - 400 * MS, T, T + after]),
+                device: device(&[0]),
+                start: InputStart::default(),
+                finalized: None,
+                section: None,
+            };
+            let e = evaluate(&chart, &input, &preset).unwrap();
+            assert_eq!(e.tally.counts.perfect, 2, "{}", preset.id);
+            empty_poors(&e.events)
+        };
+        assert_eq!(run(150 * MS), 1, "{}", preset.id);
+        assert_eq!(run(150 * MS + 1), 0, "{}", preset.id);
+    }
+}
+
+// ------------------------------------------------------------ assignment
+
+/// Source: play/JudgeAlgorithm.java:17-20 (`Combo`: the later note is taken
+/// when the earlier is past `ptime + GOOD late` and the later is not past
+/// `ptime + GOOD early`), the default `PlayConfig.java:103`, applied in
+/// time order by the candidate loop play/JudgeManager.java:396-411. The
+/// notes the press passes are POOR at the press here (a known difference
+/// in the preset module: the source keeps them hittable).
+#[test]
+fn combo_priority_assigns_like_the_source_and_passed_notes_are_poor() {
+    let two = taps(&[T, T + 200 * MS]);
+    // 120 ms late on the first note: still GOOD, so it is taken, though
+    // the second (80 ms early) is nearer.
+    let e = play(&two, tap_at(T + 120 * MS));
+    assert_eq!(
+        judged_at(&e),
+        vec![(T + 120 * MS, Good), (T + 200 * MS + MISSED, Poor)]
+    );
+    // Exactly on the first note's late GOOD edge: still the first.
+    let e = play(&two, tap_at(T + 150 * MS));
+    assert_eq!(judged_at(&e)[0], (T + 150 * MS, Good));
+    // Past it: the second (GREAT, 30 ms early), and the first is POOR at
+    // the press.
+    let e = play(&two, tap_at(T + 170 * MS));
+    assert_eq!(
+        judged_at(&e),
+        vec![(T + 170 * MS, Poor), (T + 170 * MS, Great)]
+    );
+    // The later note must not be before its early GOOD edge: with notes
+    // at 0 and 350 ms, a press at 190 ms (160 ms before the second) is BAD
+    // on the first, and one at 200 ms (150 ms before it) GOOD on the
+    // second.
+    let far = taps(&[T, T + 350 * MS]);
+    let e = play(&far, tap_at(T + 190 * MS));
+    assert_eq!(judged_at(&e)[0], (T + 190 * MS, Bad));
+    let e = play(&far, tap_at(T + 200 * MS));
+    assert_eq!(
+        judged_at(&e),
+        vec![(T + 200 * MS, Poor), (T + 200 * MS, Good)]
+    );
+    // In a chain: 0, 100 and 260 ms, pressed at 255 ms. The first is past
+    // its GOOD edge, so the second takes over; the second is past its own,
+    // so the third does: both earlier notes are POOR at the press.
+    let chain = taps(&[T, T + 100 * MS, T + 260 * MS]);
+    let e = play(&chain, tap_at(T + 255 * MS));
+    assert_eq!(
+        judged_at(&e),
+        vec![
+            (T + 255 * MS, Poor),
+            (T + 255 * MS, Poor),
+            (T + 255 * MS, Perfect)
+        ]
+    );
+}
+
+/// Source: play/JudgeManager.java:419-458 (the sound of the note taken is
+/// played as it is judged). Here a press's events come in the order of
+/// design.md "Evaluation Stages": the sound, the passed notes' POORs in
+/// note order, then the note taken.
+#[test]
+fn press_emission_order_is_fixed() {
+    let mut chart = taps(&[T, T + 100 * MS, T + 260 * MS]);
+    for (k, note) in chart.lanes[1].iter_mut().enumerate() {
+        note.sound = Some(bms_model::SoundId(u16::try_from(k).unwrap()));
+    }
+    let e = play(&chart, tap_at(T + 255 * MS));
+    let at_press: Vec<_> = e
+        .events
+        .iter()
+        .filter(|ev| ev.time.0 == T + 255 * MS)
+        .filter_map(|ev| match ev.kind {
+            JudgeEventKind::PlaySound { sound, .. } => Some(format!("sound {}", sound.0)),
+            JudgeEventKind::Judged { note, judgment, .. } => Some(format!("{judgment:?} {note}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(at_press, ["sound 2", "Poor 0", "Poor 1", "Perfect 2"]);
+}
+
 // ------------------------------------------------------------ score
 
 /// Source: ScoreData.java:421-422 (EX = PG × 2 + GR), play/JudgeProperty.java:29

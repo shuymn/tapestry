@@ -447,10 +447,10 @@ pub fn preset_canonicals() -> Vec<Seed> {
             ..gauge.clone()
         })
         .collect();
-    // beatoraja-style carries the other header and window policies, a
-    // scratch table of its own, damage bands, the increase limit and the
-    // default #TOTAL from the note count; the gauge policies seed the other
-    // correction and default and a failure threshold.
+    // beatoraja-style carries the other header, window and assignment
+    // policies, a scratch table of its own, damage bands, the increase
+    // limit and the default #TOTAL from the note count; the gauge policies
+    // seed the other correction and default and a failure threshold.
     let mut policies = rules::beatoraja_style();
     policies.default_total = rules::DefaultTotal::NotesLinear;
     policies.gauges[4].kind = rules::GaugeKind::Survival {

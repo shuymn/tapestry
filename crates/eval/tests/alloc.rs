@@ -185,6 +185,36 @@ fn advance_does_not_allocate() {
     let mut gev = Evaluator::new(&chart, &gauged, &dev, &InputStart::default(), None, 64).unwrap();
     let mut gauged_out = Vec::with_capacity(gev.max_events(inputs.len()));
     let gauged_capacity = gauged_out.capacity();
+    // A fifth under beatoraja-style's combo priority, on a dense lane:
+    // key 1 has a note every 100 ms, and every other note is pressed
+    // 170 ms late. At its absent rank (75 %: GOOD ±112.5 ms), the press is
+    // past that note's GOOD edge, so it takes the next one (70 ms late,
+    // GOOD) and the note it passes is POOR at the press.
+    const DENSE: i64 = 200;
+    let mut dense_builder = ChartBuilder::new(150_000);
+    let mut dense_inputs = Vec::new();
+    for i in 0..DENSE {
+        let t = 1_000 * MS + i * 100 * MS;
+        dense_builder = dense_builder.tap(lane(1), TimeUs(t));
+        if i % 2 == 0 {
+            dense_inputs.push(press(t + 170 * MS, 0, 1));
+            dense_inputs.push(release(t + 180 * MS, 0, 1));
+        }
+    }
+    let dense_chart = dense_builder.build().unwrap();
+    let style = rules::beatoraja_style();
+    let dense_dev = device(&[0]);
+    let mut dense = Evaluator::new(
+        &dense_chart,
+        &style,
+        &dense_dev,
+        &InputStart::default(),
+        None,
+        64,
+    )
+    .unwrap();
+    let mut dense_out = Vec::with_capacity(dense.max_events(dense_inputs.len()));
+    let dense_capacity = dense_out.capacity();
 
     TRACK.with(|t| t.set(true));
     // The count works: an allocation that escapes is counted in any profile.
@@ -207,6 +237,17 @@ fn advance_does_not_allocate() {
         w += MS;
     }
     let elapsed = started.elapsed();
+    let mut next = 0;
+    let dense_end = dense.final_deadline().0;
+    let mut w = 0;
+    while w <= dense_end {
+        while next < dense_inputs.len() && dense_inputs[next].received.0 <= w {
+            dense.push_input(dense_inputs[next]).unwrap();
+            next += 1;
+        }
+        dense.advance_to(TimeUs(w), &mut dense_out).unwrap();
+        w += MS;
+    }
     // Fill the ring to capacity: one more is refused, not allocated.
     for e in &inputs[..BURST] {
         burst.push_input(*e).unwrap();
@@ -270,6 +311,24 @@ fn advance_does_not_allocate() {
     let gauges = gev.gauges();
     assert_eq!(gauges.len(), 7);
     assert!(gauges[3..].iter().all(|g| g.failed_at.is_some()));
+    // Every pressed note GOOD, every note it passed POOR at its press.
+    let passed = dense_out
+        .iter()
+        .filter(|e| {
+            e.origin.is_some()
+                && matches!(
+                    e.kind,
+                    JudgeEventKind::Judged {
+                        judgment: Judgment::Poor,
+                        ..
+                    }
+                )
+        })
+        .count();
+    assert_eq!(passed, 100);
+    assert_eq!(dense.tally().counts.good, 100);
+    assert!(dense.is_complete());
+    assert_eq!(dense_out.capacity(), dense_capacity);
     assert_eq!(allocations, 0);
     let per_input = elapsed.as_nanos() / u128::try_from(inputs.len()).unwrap();
     println!(

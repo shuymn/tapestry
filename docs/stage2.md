@@ -26,7 +26,7 @@ The stage exits when song selection, play, results and retry can be played repea
 - a what-if of a completed play runs to its own final deadline (D9);
 - the gauge denominator in practice is the whole chart's note count (D13);
 - a practice round ends with a short ring-out once the section is judged: the BGM plays on without notes, fades out, and the next round starts (D15);
-- the default rule preset is beatoraja-style; the custom preset stays available as a file (D24).
+- the standard presets (tapestry, beatoraja-style and LR2-style) are built in and chosen by name, beatoraja-style by default; a preset the player changes is a user preset file in `presets\`, created for now with `eval-cli preset export` (D24).
 
 ## 0. Prerequisites
 
@@ -41,7 +41,7 @@ The stage exits when song selection, play, results and retry can be played repea
 - **Song selection.** A library of the configured folders, scanned in the background (only changed files are read). Literal substring search with width and kana folding, sorting, and choosing a chart to play it.
 - **Results.** Judgment counts, EX score, BP, max combo, every gauge with its history, the early/late distribution, the difference from the personal best, and the recommended offset. The result can switch to the evaluation under any other preset.
 - **Retry and back to selection,** across charts.
-- **Standard presets.** beatoraja-style, which becomes the default, and LR2-style.
+- **Standard presets,** built in: beatoraja-style, which becomes the default, LR2-style and tapestry. User presets as files (D24).
 - **Preset polling,** with immediate re-evaluation on the result screen.
 - **Practice.** Speed change (50-150 %), mid-chart start, section repeat, and section evaluation with its excerpt property.
 - **Tools.** `eval-cli`, `--dev-scenario`, and a specified start position.
@@ -56,7 +56,8 @@ The stage exits when song selection, play, results and retry can be played repea
   - song preview playback;
   - pitch-preserving speed change (needs a time stretcher, so in stage 2 speed changes pitch);
   - `egui` (D4);
-  - how personal bests treat charts with `#RANDOM` (D8).
+  - how personal bests treat charts with `#RANDOM` (D8);
+  - creating and editing presets in a game screen, which arrives with an in-game settings screen (D24).
 - **Not built yet:** CN/HCN, automatic offset adjustment, and its recorded stream (section evaluation uses fixed offsets).
 - **Unchanged by this stage:** #43 output streaming (D16), #45, #75, #81, #83, #86.
 
@@ -214,23 +215,22 @@ egui comes with the first form-like screen.
 **Decision.** `ReEvaluate::under(ctx, preset)` checks the evaluator version first, then evaluates in one of three ways:
 - **As played** (equal preset hash): to the recorded watermark. The result must equal live.
 - **What-if of a completed play** (decided): to the what-if preset's own final deadline. Input ends with the recording, and the screen shows "no input after <t>".
-  - Example: the last note is at 60.000 s, hit on time. The custom preset's 180 ms late BAD edge closes the recording at about 60.180 s. A preset with a 220 ms edge has its final deadline at 60.220 s.
+  - Example: the last note is at 60.000 s, hit on time. The tapestry preset's 180 ms late BAD edge closes the recording at about 60.180 s. A preset with a 220 ms edge has its final deadline at 60.220 s.
   - That what-if completes and clears, with 60.180-60.220 s marked "no input".
 - **What-if of an aborted play:** to the recorded watermark, labeled "ended midway at <t>", with no clear.
 
-**The shelf.** `game::presets::Shelf` holds `presets\*.toml`.
+**The shelf.** `game::presets::Shelf` holds the built-in presets and the user presets in `presets\*.toml` (D24).
 - Other presets are evaluated lazily, cached by hash.
 - Switching presets on the result screen only changes the view. The play preset changes on the select screen, for the next play.
 
-### D10. Preset files are polled, not watched
+### D10. User preset files are polled, not watched
 
 **Today.** The preset is re-read at retry when its modification time changed (crates/game/src/session.rs:537-552).
 
-**Decision.** While a select or result screen shows, the shelf checks modification times every 250 ms.
+**Decision.** While a select or result screen shows, the shelf checks the user preset files' modification times every 250 ms. The built-ins are never read from disk, so they are never polled.
 - A changed file reloads, and the result screen re-evaluates under it.
-- A file that fails to load leaves the previous preset in place and shows the error.
+- A file that fails to load, or whose name is a built-in's (D24), leaves the previous preset in place and shows the error.
 - Plays pick up changes from the next play; nothing is polled during play.
-- On first start the shelf writes `custom.toml`, `beatoraja-style.toml` and `lr2-style.toml` (PR16).
 
 **Alternatives.** `notify`, or `ReadDirectoryChangesW`.
 
@@ -256,23 +256,24 @@ egui comes with the first form-like screen.
 - **The note scan's far end:** beatoraja scans a lane's notes up to the farthest early edge of its note and scratch tables, MS pairs included, and stops at a note exactly that far (`play/JudgeManager.java:189-196`, `:387-389`). Here a press looks at its lane class's own BAD window and empty POOR range, each with its own edges. So when a press judges no note, a note exactly 500 ms ahead makes an empty POOR here at every scale, and there only once a scaled early BAD edge passes 500 ms; and at `#DEFEXRANK 292` a scratch press exactly 503.7 ms early is BAD here and judges nothing there.
 - **`#DEFEXRANK`:** read as a number above 0 (`120`, `120.0` and `120.5` alike), counting over any `#RANK` before or after it (jbms-parser a7a0729 ignored `#RANK` once a `#DEFEXRANK` was set, and beatoraja's chart documentation says it takes precedence; the check went away in d0fba6d, when the `>= 10` encoding stopped working), and its `n × 75 / 100` % applied to each edge as it is, not truncated to an integer percent (`play/BMSPlayerRule.java:59-65`, under a TODO): `#DEFEXRANK 1` gives PERFECT ±150 µs here, zero-width windows there.
 - **H. Miss timing:** a note is missed at its late BAD edge, after the inputs at that µs; beatoraja's first frame strictly past it is its frame loop's, so a press on another lane at `edge + 1 µs` comes after the miss here and before it there.
-- **Notes a press passes (decided, B's second half):** when a press takes a later note, the earlier unjudged notes of its lane are POOR at the press, as custom does. beatoraja keeps them hittable until their own late BAD edge, a consequence of its structure with no stated intent: its judge algorithms (caef58b5, then d9b70361 and d19e05b5) only choose which note a press takes, and misses are a separate timeout pass. At `#RANK 3`, with notes at 0 and 200 ms on one lane, a press at 170 ms takes the 200 ms note; a second press at 250 ms is BAD on the 0 ms note there, while here that note was POOR at 170 ms.
+- **Notes a press passes (decided, B's second half):** when a press takes a later note, the earlier unjudged notes of its lane are POOR at the press, as tapestry does. beatoraja keeps them hittable until their own late BAD edge, a consequence of its structure with no stated intent: its judge algorithms (caef58b5, then d9b70361 and d19e05b5) only choose which note a press takes, and misses are a separate timeout pass. At `#RANK 3`, with notes at 0 and 200 ms on one lane, a press at 170 ms takes the 200 ms note; a second press at 250 ms is BAD on the 0 ms note there, while here that note was POOR at 170 ms.
 - **G. A BAD long-note head (decided):** it is scored at the press, when its judgment is decided, since a BAD head cannot get worse; beatoraja holds it and scores it at the release or the end, so max combo can differ.
 
-**What beatoraja-style still needs.** beatoraja differs from today's model in one place, shown by an example in crates/rules/src/beatoraja_style.rs (paths under `src/bms/player/beatoraja/`). PR7 landed the values the model expresses, and PR7c the gauges (C, D, E: HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))`, with a `#TOTAL` not positive ignored so an earlier one stays, jbms-parser `BMSDecoder.java:730-743`, from PR7e; N the whole chart's count, practice included). This remains:
-- **B. Note assignment:** combo priority, which note a press takes (PR7b); the notes it passes are a known difference above.
+**What beatoraja-style still needs.** Nothing the model cannot express: PR7 landed the values the model expresses, PR7b combo priority (B: which note a press takes, `Assignment::ComboPriority`; the notes it passes are a known difference above), and PR7c the gauges (C, D, E: HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))`, with a `#TOTAL` not positive ignored so an earlier one stays, jbms-parser `BMSDecoder.java:730-743`, from PR7e; N the whole chart's count, practice included). Each is shown by an example in crates/eval/tests/style_beatoraja.rs, cited under `src/bms/player/beatoraja/`.
 
-**What LR2-style needs beyond them.** Endless Dream shares B, and G and H as known differences, and its single low-gauge step (× 0.6 below 32 %) fits the band list. Its own, cited at that commit under `core/src/bms/player/beatoraja/`, each again with an example:
+**What LR2-style needs beyond them.** Endless Dream shares B, the notes a press passes, G and H as known differences, and its single low-gauge step (× 0.6 below 32 %) fits the band list. Its own known difference, cited at that commit under `core/src/bms/player/beatoraja/`:
+- **One press judges one note (decided).** Endless Dream's multi-BAD judges BAD, with the same press, the other unjudged notes in BAD but not GOOD range, filtered by the primary's timing, judgment and LN type, leading LN heads trimmed (`play/JudgeManager.java:993-1061`, from wcko87/lr2oraja bbe35f5e). That approximates LR2, where the lane pointer advances past a BAD and the same press judges the next note again (OpenLR2 `ProcSinglenote`, GOMazk/OpenLR2@583a3850 `LR2f.cpp:7509-7523`), an implementation artifact. Here the notes a press passes are POOR at the press. At `#RANK 3` (100 %), with taps at 0 and 160 ms and a long note from 50 to 100 ms on one lane, a press at 190 ms takes the 160 ms tap (GREAT); Endless Dream gives BAD on the 0 ms tap and the head, LR2-style POOR on both at the press.
+
+Its own rules, each again with an example:
 - **I. Window interpolation:** below 100 % PERFECT, GREAT and GOOD come from the LR2 table, interpolated; at 100 % and above they scale linearly; then each of them is clamped to the next wider window, so at `#DEFEXRANK 400` (300 %) GOOD is BAD's 200 ms, not 360 ms; BAD and empty POOR are not scaled; `#RANK` 0-4 is 25, 50, 75, 100, 75 %, and `#DEFEXRANK n` is n × 75 / 100 % (`play/JudgeProperty.java:168`, `:185-265`, the clamp `:241-249`; `play/BMSPlayerRule.java:61-65`) (PR8).
-- **J. Multi-BAD:** the other unjudged notes in BAD but not GOOD range are judged BAD too, before the primary, filtered by its timing, judgment and LN type, leading LN heads trimmed (`play/JudgeManager.java:993-1061`). The variant lands in PR7b, checked against a preset built in test code; PR8 assembles it.
-- **K. LN-head eligibility:** a late BAD on an LN head cannot be the primary (`play/JudgeManager.java:435-437`), but multi-BAD can still consume it; a head neither consumed nor passed by the primary stays to its own miss, and one the primary passes is POOR at the press. At `#RANK 3` (100 %), with taps at 0 and 160 ms and a long note from 50 to 100 ms on one lane, a press at 190 ms takes the 160 ms tap as the primary (GREAT), and multi-BAD judges the 0 ms tap and the head BAD (`:993-1061`). The variant lands in PR7d with that example; PR8 assembles it.
+- **K. LN-head eligibility:** a late BAD on an LN head cannot be the primary (`play/JudgeManager.java:435-437`); a head the primary passes is POOR at the press, and one it does not pass stays to its own miss. At `#RANK 3` (100 %), with a long note from 0 to 50 ms and a tap at 300 ms on one lane, a press at 160 ms cannot take the head (160 ms late, BAD), which combo priority alone would keep since the tap lies outside GOOD; it takes the tap (140 ms early, BAD), and the head is POOR at the press. With the long note alone, the press takes nothing and the head is missed at its own deadline. The variant lands in PR7d with that example; PR8 assembles it.
 - **L. Empty POOR:** for an unjudged note, (200, 1000) ms early: past the inclusive early BAD edge, and short of the scan's exclusive end; for a judged one, [0, 1000) ms early; no late side (`play/JudgeProperty.java:54-55`, the scan cutoff `play/JudgeManager.java:416`) (PR8).
 - **M. Gauges:** HARD-family damage × max(fix1, fix2); a survival gauge strictly below 2 % after a change, mines included, drops to 0 and fails; `#TOTAL` when absent as `160 + (N + clamp(N − 400, 0, 200)) × 0.16` (`play/GrooveGauge.java:218-225`, `:279-309`; `play/BMSPlayerRule.java:88-89`). PR7c lands the variants (the damage correction, the failure threshold, the default), checked against Endless Dream's gauges built in test code (crates/eval/tests/style_lr2.rs); PR8 assembles them.
 
-**Policies are choices, not replacements (decided).** Each is a new variant beside today's behavior, which stays available: custom keeps nearest assignment, misses at the press for overtaken notes, a miss at the edge and a BAD head scored at the press, and reads judgment headers as loader version 6 does, so its results do not change. Only the selection variants a supported preset uses are added (combo priority); beatoraja's other algorithms wait for a preset that uses one.
+**Policies are choices, not replacements (decided).** Each is a new variant beside today's behavior, which stays available: tapestry keeps nearest assignment, misses at the press for overtaken notes, a miss at the edge and a BAD head scored at the press, and reads judgment headers as loader version 6 does, so its results do not change. Only the selection variants a supported preset uses are added (combo priority); beatoraja's other algorithms wait for a preset that uses one.
 
 **Versions.**
-- A new field or variant bumps the canonical encoding version (`FORMAT_VERSION` in crates/rules/src/canonical.rs) and the file shape. Older files are refused with the existing hint.
+- A new field or variant bumps the canonical encoding version (`FORMAT_VERSION` in crates/rules/src/canonical.rs), so older records are refused. A new field also changes the file shape, and older files are refused with the existing hint; a new variant alone adds no key, so a user preset file naming an existing variant still reads with its own values and hash.
 - The evaluator version (`Implementation::STANDARD_VERSION`) bumps only when an existing variant's meaning changes.
 - The judgment-header model bumps `LOADER_VERSION`; records of loader version 6 are refused, also under an override (design.md "Determinism"), and cannot gain the declarations they did not keep.
 
@@ -284,7 +285,7 @@ egui comes with the first form-like screen.
   - A head at or after the end keeps `CompletesAtPress`, and the missing source is recorded.
 - The display is unchanged.
 
-**Generators.** The props generators draw every supported policy combination, not a sample, and deliberate examples cover the joint interactions (selection × overtaken notes × empty POOR × multi-BAD × LN eligibility).
+**Generators.** The props generators draw every supported policy combination, not a sample, and deliberate examples cover the joint interactions (selection × overtaken notes × empty POOR × LN eligibility).
 
 ### D12. Re-evaluating saved records: what moves down, and the refusal order
 
@@ -564,27 +565,28 @@ Analysis runs at 1× and its result is reused at every speed.
 - **Licenses.** Any license not yet in deny.toml `allow` is added together with its crate.
 - **Fuzzing.** The fuzz crate and scripts/fuzz.sh gain `preset_canonical`.
 
-### D24. The default rule preset is beatoraja-style (decided)
+### D24. The standard presets are built in; the default is beatoraja-style (decided)
 
-**Today.** PR7 (#102) made the switch below.
-- `PlayerSettings::default()` names `beatoraja-style.toml` (crates/game/src/settings.rs).
-- A missing preset file is written only for a standard preset, `custom.toml` or `beatoraja-style.toml` (`standard_preset` in crates/game/src/session.rs); any other missing name is refused.
-- design.md carries the text below (Non-goals, "Custom Preset", "Standard Presets", "Settings Files").
+**Today.**
+- `player.toml`'s `preset` names a file in `presets\`, by default `beatoraja-style.toml` (`PlayerSettings::default()`, crates/game/src/settings.rs; PR7, #102).
+- The session writes a missing `custom.toml` or `beatoraja-style.toml` from its preset (`standard_preset` in crates/game/src/session.rs) and refuses any other missing name.
+- A preset file states its name in its `id` field (crates/rules-toml/src/lib.rs), and that name is the preset ID records carry and the canonical encoding hashes.
 
 **Decision.**
-- The default play preset becomes `beatoraja-style.toml`. The custom preset stays available as `presets\custom.toml`.
-- **An existing `player.toml` keeps its choice.** `PlayerSettings` is `#[serde(default)]`, so only a file without `preset` takes the new default. The game writes every field when it saves `player.toml`, so a `player.toml` the game saved in stage 1 already names `custom.toml` and keeps it until the player picks another preset on the select screen. Startup creates only `device.toml`, and unchanged player settings are never saved, so an installation without a `player.toml` takes the new default.
-- **A missing preset file is written only for a standard preset.**
-  - If `custom.toml` is missing, `rules::custom()` is written.
-  - If `beatoraja-style.toml` is missing, `rules::beatoraja_style()` is written (later, `lr2-style.toml` likewise).
-  - Any other missing name is refused, naming the file.
-- **The switch lands in PR7,** the PR that creates beatoraja-style. It cannot land earlier.
-- **design.md text:**
-  - Non-goals: "The default is the beatoraja-style preset; no standard preset reproduces the judgment of the commercial game this is based on."
-  - "Custom Preset": drop "the only preset so far"; say the preset is written to `presets\custom.toml` when it is missing and is chosen by naming it in `player.toml`.
-  - "Standard Presets": mark beatoraja-style as the default and drop "(default)" from Custom.
-  - "Settings Files": the default `preset`.
-- **Why the default is not the custom preset:** play uses beatoraja-style by default, as design.md's own introduction describes ("You normally play with 'beatoraja-style'").
+- **Built-ins.** The standard presets are built into the code, not files: tapestry (`rules::tapestry()`, today's `rules::custom()`, whose ID `custom` becomes `tapestry`), beatoraja-style and LR2-style. Each is chosen by its name, `tapestry`, `beatoraja-style` or `lr2-style`, which is also its preset ID, and the game never writes one to disk. The list of built-ins by name lives in `rules`, so `game` and `eval-cli` (which cannot depend on `game`) share it.
+- **User presets.** A preset the player changes is the player's own preset, a TOML file in `presets\`. Only these files are read, validated and polled (D10).
+- **A user preset's name is its file stem.** The file has no `id` field, and the loader gives the preset its stem as its preset ID.
+  - The stem is what `player.toml` and the shelf look a preset up by, and the file system keeps it unique in `presets\`, so it is the name's one source. A name field would be a second name that could disagree with the file's, and two files could claim one name.
+  - Renaming the file renames the preset; records then see another preset, since the ID is part of the hash.
+  - A file with an `id` field, as every file from an older version has, is refused as unreadable, not converted.
+  - A name is 1 to 64 characters of lowercase ASCII letters, digits, `-` and `_`, and a stem that is not one is refused, naming the file: names then compare exactly on every file system, `TAPESTRY.toml` cannot stand for a built-in, and no older value such as `custom.toml` can be a name. The game, the shelf, the exporter and `eval-cli` share this check in `rules-toml`.
+- **No passing for a built-in.** A user preset whose stem is a built-in's name is refused, with an error naming the file and the built-in, so no file can pass for a built-in in records. The check is in `rules-toml`'s loader, so `eval-cli --preset` refuses such a file too; `--preset` also takes a built-in's name.
+- **`player.toml`'s `preset`** names a built-in or a user preset; its default is `beatoraja-style`. `PlayerSettings` stays `#[serde(default)]`, so a file without `preset` takes the default. Any other value, an older version's file name such as `custom.toml` or `beatoraja-style.toml` among them, is refused with an error naming it and the built-ins; it is not converted (AGENTS.md "No compatibility code before the first release"), and nothing is written.
+- **Creating a user preset, for now.** `eval-cli preset export <built-in> <path>` (for example `eval-cli preset export beatoraja-style my-rules.toml`) writes that built-in to a new TOML file, which the player puts in `presets\`. `eval-cli` is portable and does not locate the data root, so it takes a path. It refuses a path whose file exists and one whose stem is a built-in's name, and writes nothing then. Creating and editing presets in a game screen is not built yet: it arrives later with an in-game settings screen (design.md "Libraries"; D4).
+- **What goes away.** `standard_preset` and the writing of a missing preset file. Nothing writes a preset file at first start or at any other time, except the export command.
+- **Where it lands.** PR7 made beatoraja-style the default. PR16 makes the rename, the built-ins and the user presets, and adds the export command: the export is how a player gets an editable file once the game stops writing them, so it lands in the PR that stops the writing, which is also the first PR with all three built-ins (after PR8) and the stem-named file.
+- **design.md** carries this ("Standard Presets", "User Presets", "The tapestry Preset", "Settings Files", "Tuning Without Restart"), marked not built yet until PR16.
+- **Why the default is not the tapestry preset:** play uses beatoraja-style by default, as design.md's own introduction describes ("You normally play with 'beatoraja-style'").
 
 ## 3. Pull requests
 
@@ -683,10 +685,9 @@ Analysis runs at 1× and its result is reused at every speed.
 
 **Touches.**
 - `rules`, `rules-toml`, style_beatoraja.rs and the generators.
-- crates/game/src/settings.rs: the default `preset` becomes `beatoraja-style.toml`.
-- crates/game/src/session.rs: a missing preset file is written only for a standard preset (D24).
-- Existing `game` and `player` tests that relied on the default: they now name `custom.toml` explicitly when they mean it.
-- design.md: Non-goals, "Custom Preset", "Standard Presets" and "Settings Files".
+- crates/game/src/settings.rs: the default `preset` becomes beatoraja-style (D24).
+- Existing `game` and `player` tests that relied on the default: they now name the tapestry preset explicitly when they mean it.
+- design.md: Non-goals, "The tapestry Preset", "Standard Presets" and "Settings Files".
 
 **Depends on.** PR1.
 
@@ -694,11 +695,9 @@ Analysis runs at 1× and its result is reused at every speed.
 - When `cargo test -p eval --test style_beatoraja` runs, every example shall pass and name its source.
 - When the preset is written and read through `rules-toml`, it shall round-trip.
 - When the props run, the generators shall reach every variant the preset uses.
-- When the game starts with no `player.toml` and an empty presets folder, it shall write `beatoraja-style.toml` with `rules::beatoraja_style()`, and the first play shall be evaluated and recorded under it (`default_preset_is_beatoraja_style`).
-- When `player.toml` names `custom.toml`, the play shall use the custom preset, and saving settings shall keep `preset = "custom.toml"` (`explicit_custom_choice_is_kept`).
+- When the game starts with no `player.toml`, the first play shall be evaluated and recorded under beatoraja-style (`default_preset_is_beatoraja_style`).
 - When `player.toml` has no `preset` key, the play shall use beatoraja-style (`missing_preset_key_takes_the_new_default`).
-- If `player.toml` names a preset file that is missing and is not a standard preset, then loading shall be refused with an error naming the file, and nothing shall be written (`missing_non_standard_preset_is_refused`).
-- When `custom.toml` is missing and named, it shall be written with `rules::custom()` (`missing_custom_preset_is_written_as_custom`).
+- PR16 replaces PR7's tests of how `player.toml` names a preset and of missing preset files with the built-in and user-preset tests (D24).
 
 ### PR7e. Judgment-header model (`bms-model`, `bms-parser`, `rules`, `eval`)
 
@@ -707,7 +706,7 @@ PR7e lands before PR7a; the letter names it, not its place.
 **Touches.**
 - `ChartMeta`: the judgment-header declarations replace the resolved rank and `#TOTAL`.
 - parse.rs, hash.rs, `LOADER_VERSION` and the loader rules in crates/bms-parser/src/lib.rs.
-- The header policy in `rules`: custom reads the declarations as loader version 6 does; beatoraja-style reads them by jbms-parser's rules, a `#DEFEXRANK` as a number counting over `#RANK` (F, E). The canonical encoding and file shape.
+- The header policy in `rules`: tapestry reads the declarations as loader version 6 does; beatoraja-style reads them by jbms-parser's rules, a `#DEFEXRANK` as a number counting over `#RANK` (F, E). The canonical encoding and file shape.
 - `Evaluator::new` reads the rank and `#TOTAL` through the policy.
 - style_beatoraja.rs, the generators, and the bms-parser and fuzz seeds.
 - design.md "Chart Model" and "What the Loader Reads" (the "not built yet" notes go).
@@ -717,13 +716,13 @@ PR7e lands before PR7a; the letter names it, not its place.
 **Done when.**
 - When a chart declares `#RANK 3` and then `#DEFEXRANK 120.5`, the loader shall keep both, in order, with their lexical classes (`rank_and_defexrank_are_kept_in_order`), and beatoraja-style shall scale by the `#DEFEXRANK`, 90.375 %, in either order (`a_decimal_defexrank_counts_over_a_rank`).
 - When `#DEFEXRANK 120` and `#DEFEXRANK 120.0` are loaded, their declarations shall differ in class and the resolved-chart hashes shall differ (`integer_and_decimal_tokens_stay_distinct`).
-- When `#TOTAL 200` is followed by `#TOTAL 0`, beatoraja-style shall use 200, and custom shall use its default `#TOTAL` as it does today (`zero_total_after_a_total`).
+- When `#TOTAL 200` is followed by `#TOTAL 0`, beatoraja-style shall use 200, and tapestry shall use its default `#TOTAL` as it does today (`zero_total_after_a_total`).
 - When declarations sit in `#IF` blocks, only those of the active branches shall be kept (`inactive_branch_declarations_are_dropped`).
 - When only whitespace, the header's case or line positions change, the resolved-chart hash shall stay equal (`header_canonical_form_ignores_text`).
 - If a declaration is not a number, then the loader shall warn and keep it as not a number, and the chart shall still load (`unreadable_header_is_kept_and_warned`).
 - If a record was made before this PR, then `verify` shall refuse it at the first check that fails in design.md "Determinism"'s order: an unchanged record fails decoding its preset copy, since this PR also bumps the canonical encoding, before the loader version is compared (`record_before_the_header_model_is_refused_at_its_first_failing_check`).
 - If a record carries loader version 6 with every other field current (evaluator version and a preset copy in the current encoding), then `verify` shall refuse it with `UnsupportedLoader(6)`, also with a preset override (`refuses_loader_version_6_with_current_fields`).
-- When the custom preset's existing examples run, they shall pass unchanged.
+- When the tapestry preset's existing examples run, they shall pass unchanged.
 - When `cargo test -p bms-parser` runs, the property `judgment_headers_keep_order_and_class` shall pass.
 
 ### PR7a. Window preparation (`rules`, `eval`)
@@ -740,21 +739,20 @@ PR7e lands before PR7a; the letter names it, not its place.
 - When a note lies exactly 500 ms ahead of a press under beatoraja-style, judged or not, and the press judges no note, it shall make it an empty POOR whether or not a scaled early BAD edge passes 500 ms, recorded as a known difference with the source's scan bound (`a_note_500_ms_ahead_makes_an_empty_poor_at_every_scale`); at `#DEFEXRANK 292` a scratch press exactly on its early BAD edge shall be BAD (`a_scratch_press_on_its_early_bad_edge_at_219_percent_is_bad`).
 - When the scratch table's late BAD edge sets the latest deadline, completion, the what-if's final deadline and the section probe's `final_deadline()` shall all be that time (`final_deadline_has_one_source`).
 - When the presets are written and read through `rules-toml`, they shall round-trip; an older encoding shall be refused.
-- When the custom preset's existing examples run, they shall pass unchanged.
+- When the tapestry preset's existing examples run, they shall pass unchanged.
 
 ### PR7b. Press resolution (`rules`, `eval`)
 
-**Touches.** Press resolution in `eval` (the candidate scan over judged and unjudged targets by time, apart from the assignment cursor; primary selection; empty POOR from the scan; the multi-BAD variant, J; emission order); the preset's policy fields; the canonical encoding; style_beatoraja.rs, examples with Endless Dream's press rules built in test code (style_lr2.rs, which PR8 extends), the generators and the props; design.md "Evaluation Stages".
+**Touches.** Press resolution in `eval` (the candidate scan over judged and unjudged targets by time, apart from the assignment cursor; primary selection with combo priority, B; empty POOR from the scan; emission order); the preset's selection policy; the canonical encoding; style_beatoraja.rs, the generators and the props; design.md "Evaluation Stages".
 
 **Depends on.** PR7a. PR7b and PR7d share one transition contract (design.md "Evaluation Stages", press resolution and LN transitions) and may land as adjacent PRs.
 
 **Done when.**
 - When several notes on a lane are in range under beatoraja-style, the press shall judge the note beatoraja's combo-priority algorithm picks, and the earlier notes it passes shall be POOR at the press (`combo_priority_assigns_like_the_source_and_passed_notes_are_poor`).
 - When a press judges no note under beatoraja-style, the empty POOR shall be decided from the candidate scan, with the source's ranges for judged and unjudged notes (`empty_poor_is_part_of_the_scan`).
-- When a lane's last note has been hit and the lane is pressed again 150 ms after it, the press shall be an empty POOR, under beatoraja-style and custom alike (`empty_poor_after_the_last_hit_note`).
-- When, under a preset built in test code with combo priority and multi-BAD, a press judges a note while other unjudged notes lie in BAD but not GOOD range, those shall be BAD before the primary, filtered by the primary's timing, judgment and LN type, with leading LN heads trimmed (`multi_bad_matches_the_source`).
-- When a press both overtakes notes and judges one, its events shall come in the order sound, overtaken POORs, additional outcomes, primary (`press_emission_order_is_fixed`).
-- When the custom preset runs, assignment shall stay nearest-first, overtaken notes shall be missed at the press, and every existing example shall pass unchanged.
+- When a lane's last note has been hit and the lane is pressed again 150 ms after it, the press shall be an empty POOR, under beatoraja-style and tapestry alike (`empty_poor_after_the_last_hit_note`).
+- When a press both overtakes notes and judges one, its events shall come in the order sound, overtaken POORs, primary (`press_emission_order_is_fixed`).
+- When the tapestry preset runs, assignment shall stay nearest-first, overtaken notes shall be missed at the press, and every existing example shall pass unchanged.
 - When the props run, incremental and batch evaluation shall agree under every supported combination, the `Judged` events shall stay within the note count, and the `eval` allocation test shall count 0.
 
 ### PR7c. Gauges (`rules`, `eval`)
@@ -775,13 +773,13 @@ PR7e lands before PR7a; the letter names it, not its place.
 
 ### PR7d. LN transitions (`rules`, `eval`)
 
-**Touches.** The long-note state machine in `eval` and the eligibility it gives press resolution, separately for the primary and for additional outcomes (the LN-head eligibility variant, K); the preset's policy field; the canonical encoding; style_beatoraja.rs, style_lr2.rs (the preset built in test code), the props (`LnHeld < BAD` in props.rs) and the generators.
+**Touches.** The long-note state machine in `eval` and the eligibility it gives press resolution's primary (the LN-head eligibility variant, K); the preset's policy field; the canonical encoding; style_beatoraja.rs, style_lr2.rs (the preset built in test code), the props (`LnHeld < BAD` in props.rs) and the generators.
 
 **Depends on.** PR7b, whose transition contract it shares.
 
 **Done when.**
-- When, under the preset built in test code with combo priority, multi-BAD and LN-head eligibility, at 100 %, a lane holds taps at 0 and 160 ms and a long note from 50 to 100 ms, and it is pressed at 190 ms, the primary shall be the 160 ms tap (GREAT) and the 0 ms tap and the head shall be BAD, before it (`ineligible_head_is_consumed_by_multi_bad`).
-- When a late BAD press reaches an LN head that no additional outcome consumes and the primary does not pass (no primary, or one before the head), the head shall not be the primary and shall be missed at its own deadline, unmoved (`late_bad_ln_head_is_not_selectable`).
+- When, under the preset built in test code with combo priority and LN-head eligibility, at 100 %, a lane holds a long note from 0 to 50 ms and a tap at 300 ms, and it is pressed at 160 ms, the primary shall be the tap (BAD, 140 ms early) and the head shall be POOR at the press, before it (`ineligible_head_is_passed_and_poor`).
+- When a late BAD press reaches an LN head that the primary does not pass (no primary, or one before the head), the head shall not be the primary and shall be missed at its own deadline, unmoved (`late_bad_ln_head_is_not_selectable`).
 - When a long-note head is BAD, under any preset, the long note shall be scored at the press, as today.
 - When the props run, every judgeable note shall still be judged exactly once.
 
@@ -789,7 +787,7 @@ PR7e lands before PR7a; the letter names it, not its place.
 
 PR8 assembles policies whose place the earlier PRs and design.md "Evaluation Stages" already fixed: it adds variants to existing stages, not stages. An Endless Dream behavior that needs a new stage boundary changes design.md first.
 
-**Touches.** validate.rs; `rules`: `rules::lr2_style()`, the interpolated and clamped window variant (I) and the empty POOR ranges (L), assembled with PR7b's multi-BAD (J), PR7d's LN-head eligibility (K) and PR7c's gauge policies (M); `rules-toml`, style_lr2.rs (its examples move from the presets built in test code to `rules::lr2_style()`), the generators, the standard-preset writing of D24 (adds `lr2-style.toml`), and design.md "LN Judgment Modes" and "Standard Presets".
+**Touches.** validate.rs; `rules`: `rules::lr2_style()`, the interpolated and clamped window variant (I) and the empty POOR ranges (L), assembled with PR7b's combo priority (B), PR7d's LN-head eligibility (K) and PR7c's gauge policies (M); `rules-toml`, style_lr2.rs (its examples move from the presets built in test code to `rules::lr2_style()`), the generators, and design.md "LN Judgment Modes" and "Standard Presets".
 
 **Depends on.** PR7a-PR7e. LR2-style chooses its own policy values; an LR2 axis not listed in D11 needs its own failing example.
 
@@ -799,11 +797,9 @@ PR8 assembles policies whose place the earlier PRs and design.md "Evaluation Sta
 - When the rank scale is below 100 %, PERFECT, GREAT and GOOD shall follow the interpolated table, and BAD and empty POOR shall stay unscaled (`windows_interpolate_like_the_source`).
 - When a chart declares `#DEFEXRANK 400` (300 %), GOOD shall be clamped to BAD's 200 ms rather than scaled to 360 ms, and each of PERFECT, GREAT and GOOD shall stay within the next wider window (`scaled_windows_clamp_to_the_next_wider`).
 - When a press judges no note, an unjudged note (200, 1000) ms ahead or a judged note [0, 1000) ms ahead shall make it an empty POOR, and a note on the late side shall not (`empty_poor_ranges_match_the_source`).
-- When PR7b's and PR7d's examples run under `rules::lr2_style()`, they shall pass unchanged.
+- When PR7d's examples run under `rules::lr2_style()`, they shall pass unchanged.
 - When `style_lr2` runs, every example shall pass.
 - When a beatoraja-style record is re-evaluated under LR2-style, it shall run to LR2-style's own final deadline (`what_if_under_lr2_style_completes`).
-- When the props run with multi-BAD, the `Judged` events shall stay within the note count and the `eval` allocation test shall count 0.
-- When `lr2-style.toml` is named and missing, it shall be written with `rules::lr2_style()`.
 
 ### PR9. The input thread wakes on input; no idle timer (#87)
 
@@ -914,17 +910,30 @@ Each one holds the behavior D5 and D6 state.
 - unknown arguments exit 2;
 - a second player process started on the same data root is refused before it opens `library.db`, with a message naming the folder (`second_process_is_refused_before_the_library_opens`). `library` already refuses a second `Library` of the file in any process (`LibraryError::AlreadyOpen`, from its lock on `library.db.lock`); the player still decides what a second process does, and today's `tapestry.lock` only decides which process writes the log.
 
-### PR16. Preset shelf, first-start presets and polling (`game`)
+### PR16. Built-in presets, user presets, the shelf and polling (`rules`, `rules-toml`, `game`, `eval-cli`)
 
-**Touches.** presets.rs; design.md "Tuning Without Restart" (the "For now" box goes).
+**Touches.**
+- `rules`: `rules::custom()` becomes `rules::tapestry()` with the ID `tapestry` (custom.rs becomes tapestry.rs, and every caller and test follows), and the list of built-ins by name (D24).
+- `rules-toml`: the file loses `id`; the loader takes the name from the file stem and refuses a built-in's name; the refusal hint for an older file points to the export command.
+- `game`: settings.rs (`preset` is a name, by default `beatoraja-style`), session.rs (a built-in or a user preset; `standard_preset` and the writing of a missing file go), presets.rs (the shelf of the built-ins and the user preset files, which alone are polled), and PR7's preset-naming tests.
+- `eval-cli`: `preset export <built-in> <path>`, and `--preset` taking a built-in's name (D24).
+- design.md: "Standard Presets", "User Presets", "The tapestry Preset" and "Settings Files" drop their "not built yet", and "Tuning Without Restart" its "For now" box.
 
 **Depends on.** PR8.
 
 **Done when.**
-- When the game starts with an empty presets folder, it shall write `custom.toml`, `beatoraja-style.toml` and `lr2-style.toml`, each round-tripping, and `player.toml`'s default shall stay beatoraja-style (`first_start_writes_the_three_standard_presets`).
-- `changed_preset_reloads_within_a_poll`;
-- `failed_reload_keeps_the_previous_preset`;
-- `plays_use_reloads_from_the_next_play`.
+- When the game starts with no `player.toml` and an empty presets folder, the first play shall be evaluated and recorded under the built-in beatoraja-style, and `presets\` shall stay empty (`built_ins_are_never_written`).
+- When `player.toml` names `tapestry`, `beatoraja-style` or `lr2-style`, the play shall use `rules::tapestry()`, `rules::beatoraja_style()` or `rules::lr2_style()` without reading `presets\`, the shelf shall list all three, and saving settings shall keep the name (`built_ins_are_chosen_by_name`).
+- When `player.toml` names a user preset, the play shall use `presets\<name>.toml` with the stem as its preset ID, and the shelf shall list it beside the built-ins (`user_preset_is_named_by_its_stem`).
+- If a user preset's stem is not a name (uppercase, a dot, another character, or over 64 characters), then loading it shall be refused with an error naming the file (`user_preset_stem_must_be_a_name`).
+- If a user preset's stem is a built-in's name, then loading it shall be refused with an error naming the file and the built-in, in the game and in `eval-cli --preset` (`user_preset_named_like_a_built_in_is_refused`).
+- If `player.toml` names neither a built-in nor an existing user preset, `custom.toml` included even beside a file `presets\custom.toml.toml`, then loading shall be refused with an error naming the value and the built-ins, and nothing shall be written (`unknown_preset_name_is_refused`).
+- If a preset file has an `id` field, then it shall be refused as a file from an older version (`older_preset_file_is_refused_with_the_hint`).
+- When `eval-cli preset export beatoraja-style my-rules.toml` runs, it shall write `my-rules.toml`, which loads as `rules::beatoraja_style()` with the ID `my-rules`, and exit 0 (`export_writes_a_user_preset`).
+- If the export's stem is a built-in's or not a name, or its file exists, then it shall write nothing and exit 1 (`export_refuses_a_built_in_name_and_an_existing_file`).
+- When the chosen user preset's file changes while a select or result screen shows, the shelf shall reload it at the next 250 ms check, and the result screen shall re-evaluate under it (`changed_user_preset_reloads_within_a_poll`).
+- If a changed user preset fails to load, then the previous preset shall stay in use and the error shall be shown (`failed_reload_keeps_the_previous_preset`).
+- When a user preset changes during a play, that play shall keep the preset it started with, and the next play shall use the reloaded one (`plays_use_reloads_from_the_next_play`).
 
 ### PR17. Result screen and preset switching (`player`, `game`)
 
@@ -1016,7 +1025,7 @@ Each one holds the behavior D5 and D6 state.
 - When a play starts after a completed ring-out and after one cut mid-fade, its output shall be at full gain from its first frame (`play_resets_the_ring_out_envelope`, `audio`).
 - When the ring-out is rendered, the audio callback shall allocate nothing (`ring_out_allocates_nothing`, `audio`).
 - `section_round_records_its_conditions`.
-- When a practice record made under custom with `normal` at 50 % and `survival` at 70 % is re-evaluated under beatoraja-style, `normal` shall start at 50 %, every other gauge at beatoraja-style's start value, and the result shall mark those as started at the default (`what_if_transfers_initial_gauges_by_id`).
+- When a practice record made under tapestry with `normal` at 50 % and `survival` at 70 % is re-evaluated under beatoraja-style, `normal` shall start at 50 %, every other gauge at beatoraja-style's start value, and the result shall mark those as started at the default (`what_if_transfers_initial_gauges_by_id`).
 - If a recorded initial gauge lies outside the target gauge's bounds (a test preset whose `normal` starts at 20 % with bounds 10-100 %, and a recorded `normal` at 5 %), or is 0 on a survival gauge, then that gauge shall start at its preset's start value and be marked like a missing one (`out_of_bounds_initial_gauge_uses_the_default`).
 - When the windows are computed, they shall be 21.180, 16.795384, 11.680 and 8.513333 s (`practice_window_is_sized_by_the_section`).
 - When the long-note section is planned, its deadline shall be 19.900 s, its window 11.900 s and its capacity 12 s (`practice_window_includes_ln_end_deadlines`).
@@ -1079,7 +1088,7 @@ Each one holds the behavior D5 and D6 state.
 2. Choose the refused chart and see its reason.
 3. Add a chart and see it listed.
 4. Play A with autoplay; it is evaluated under beatoraja-style, the default.
-5. On the result screen, switch to custom, then LR2-style, then back.
+5. On the result screen, switch to tapestry, then LR2-style, then back.
 6. Retry with a scripted log to the end, then retry and abort.
 7. Go back, play B, go back.
 8. Play one practice round at 75 %, then quit.
@@ -1116,12 +1125,12 @@ Each one holds the behavior D5 and D6 state.
 ### Developer checklist (development PC)
 
 1. **Library.** Set `[library] roots` and start `tapestry`. The library fills, Japanese titles read correctly, and search works by kana and by a romanized word present in some chart's metadata.
-2. **Default preset.** On a fresh data root, plays use beatoraja-style. An existing `player.toml` naming `custom.toml` still plays custom.
+2. **Default preset.** On a fresh data root, plays use beatoraja-style and `presets\` stays empty. A `player.toml` naming `tapestry` plays tapestry, and one naming `custom.toml` is refused with an error naming it.
 3. **The loop.**
    - Choose a chart; play starts within 1-2 s.
    - Play to the end, step through the three presets, retry several times, go back and change charts. Do this with both keyboard and controller.
    - A refused chart shows why, and new charts still appear.
-4. **Preset reload.** Edit `presets\lr2-style.toml` while it is shown; it updates at the next poll.
+4. **Preset reload.** Export LR2-style as a user preset (`eval-cli preset export lr2-style %LOCALAPPDATA%\tapestry\presets\my-rules.toml`), choose it, and edit `presets\my-rules.toml` while it is shown; it updates at the next poll.
 5. **Practice.** Practice a section at 75 % with repeat. After the section is judged the BGM plays on briefly without notes and fades out, the next round starts, and long BGM is already playing at its start.
 6. **eval-cli.** Run it over saved records with two presets, and see a refusal for a record from before a version bump.
 7. **Idle input thread.** It barely wakes on menus, and the play overlay figures are unchanged.

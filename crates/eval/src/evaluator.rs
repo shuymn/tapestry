@@ -218,6 +218,16 @@ struct Held {
     deviation: TimeUs,
 }
 
+/// What a press's candidate scan found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Scan {
+    /// The note the press takes, as its deviation (press − note) and its
+    /// position in the lane's targets.
+    primary: Option<(i128, usize)>,
+    /// Whether a target, judged or not, lies inside the empty POOR range.
+    near: bool,
+}
+
 /// One lane's notes to judge and its deadlines.
 #[derive(Clone, Debug, Default)]
 struct LaneState {
@@ -858,6 +868,72 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// The candidate scan of a press on `lane` at `t` (design.md "Evaluation
+    /// Stages", press resolution): one pass over the lane's targets, judged
+    /// and unjudged, located by time inside the envelope of the class's BAD
+    /// window and empty POOR range, each with its own bounds, not started at
+    /// the assignment cursor. It picks the primary among the unjudged
+    /// targets inside BAD by the assignment policy, and finds whether a
+    /// target lies inside the empty POOR range.
+    fn scan(&self, lane: usize, t: TimeUs, table: &LaneTable) -> Scan {
+        let (bad, good) = (table.windows.bad, table.windows.good);
+        let range = table.empty_poor;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
+        )]
+        let (notes, state) = (&self.chart.lanes[lane], &self.lanes[lane]);
+        let at = i128::from(t.0);
+        let late = i128::from(bad.late.0.max(range.behind.0));
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`targets` holds indices into the lane's notes"
+        )]
+        let start = state
+            .targets
+            .partition_point(|&i| i128::from(notes[i].time.0) < at - late);
+        let mut primary: Option<(i128, usize)> = None;
+        let mut near = false;
+        for (k, (&i, &judged)) in state
+            .targets
+            .iter()
+            .zip(&state.judged)
+            .enumerate()
+            .skip(start)
+        {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`targets` holds indices into the lane's notes"
+            )]
+            let d = at - i128::from(notes[i].time.0);
+            let past_bad = d < -i128::from(bad.early.0);
+            // Past the BAD window nothing can become the primary, and the
+            // empty POOR range matters only without one, until it ends too.
+            if past_bad && (primary.is_some() || near || d < -i128::from(range.ahead.0)) {
+                break;
+            }
+            near |= -i128::from(range.ahead.0) <= d && d <= i128::from(range.behind.0);
+            if judged || past_bad || d > i128::from(bad.late.0) {
+                continue;
+            }
+            let replaces = match (self.rule.assignment, primary) {
+                (_, None) => true,
+                // Strictly nearer only, so a tie keeps the earlier note.
+                (Assignment::NearestTiesEarlier, Some((c, _))) => d.abs() < c.abs(),
+                // A later note takes over only once the press is past the
+                // taken note's late GOOD edge, and when it is not before
+                // the later note's early GOOD edge.
+                (Assignment::ComboPriority, Some((c, _))) => {
+                    c > i128::from(good.late.0) && d >= -i128::from(good.early.0)
+                }
+            };
+            if replaces {
+                primary = Some((d, k));
+            }
+        }
+        Scan { primary, near }
+    }
+
     /// A press edge on `lane` at evaluation time `t`. In a section's
     /// lead-in (`lead_in`), a press that judges no target is ignored.
     fn press(
@@ -869,7 +945,6 @@ impl<'a> Evaluator<'a> {
         out: &mut Vec<JudgeEvent>,
     ) {
         let table = *self.lane_table(lane);
-        let bad = table.windows.bad;
         #[expect(
             clippy::indexing_slicing,
             reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
@@ -880,38 +955,11 @@ impl<'a> Evaluator<'a> {
             reason = "`lane` comes from `Lane::index`, below LANE_COUNT"
         )]
         let state = &self.lanes[lane];
-        let at = i128::from(t.0);
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "callers pass a position below `targets.len()`, and `targets` holds indices into the lane's notes"
-        )]
-        let time_of = |k: usize| i128::from(notes[state.targets[k]].time.0);
         let first = (state.cursor < state.targets.len()).then_some(state.cursor);
-        // Candidates: unjudged targets with −early ≤ t − note ≤ late (BAD),
-        // by the lane class's windows.
-        let mut best: Option<(i128, usize)> = None;
-        for k in state.cursor..state.targets.len() {
-            let deviation = at - time_of(k);
-            if deviation < -i128::from(bad.early.0) {
-                break;
-            }
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "the loop keeps `k` below `targets.len()`, which `judged` matches"
-            )]
-            if state.judged[k] || deviation > i128::from(bad.late.0) {
-                continue;
-            }
-            let better = match self.rule.assignment {
-                // Strictly nearer only, so a tie keeps the earlier note.
-                Assignment::NearestTiesEarlier => {
-                    best.is_none_or(|(d, _)| deviation.abs() < d.abs())
-                }
-            };
-            if better {
-                best = Some((deviation, k));
-            }
-        }
+        let Scan {
+            primary: best,
+            near,
+        } = self.scan(lane, t, &table);
         // A lead-in press judges only inside its lane's first unjudged
         // target's early window: no sound, no empty POOR otherwise.
         if lead_in && best.is_none() {
@@ -921,20 +969,7 @@ impl<'a> Evaluator<'a> {
         // unjudged note lies inside BAD, and earlier ones are missed).
         let target = best.map(|(_, k)| k).or(first);
         let rule = self.rule.empty_poor;
-        let range = table.empty_poor;
-        // The first note at or after `t − behind`, judged or not, lies at or
-        // before `t + ahead`, by the lane class's range.
-        let empty_poor = best.is_none() && {
-            let from = at - i128::from(range.behind.0);
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "`targets` holds indices into the lane's notes"
-            )]
-            let k = state
-                .targets
-                .partition_point(|&i| i128::from(notes[i].time.0) < from);
-            k < state.targets.len() && time_of(k) <= at + i128::from(range.ahead.0)
-        };
+        let empty_poor = best.is_none() && near;
         #[expect(
             clippy::indexing_slicing,
             reason = "`target` is a candidate or the cursor, both below `targets.len()`"
@@ -950,6 +985,9 @@ impl<'a> Evaluator<'a> {
                 out,
             );
         }
+        // Emission order, all at the press's time (design.md "Evaluation
+        // Stages"): the sound above, the passed notes' POORs in note order,
+        // then the primary or the empty POOR.
         if let Some((deviation, k)) = best {
             match self.rule.miss {
                 // The earlier notes are passed: each is missed now, which

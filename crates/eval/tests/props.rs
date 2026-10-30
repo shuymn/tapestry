@@ -641,6 +641,22 @@ fn count_play(play: &Play, c: &mut Coverage) {
         "ln_hold_ended",
         has(&|k| matches!(k, JudgeEventKind::LnHoldEnded { .. })),
     );
+    // Under combo priority, a press that passes an unjudged note: a POOR
+    // caused by an input.
+    c.hit(
+        "combo_priority_passes_a_note",
+        play.preset.assignment == rules::Assignment::ComboPriority
+            && whole.events.iter().any(|e| {
+                e.origin.is_some()
+                    && matches!(
+                        e.kind,
+                        JudgeEventKind::Judged {
+                            judgment: rules::Judgment::Poor,
+                            ..
+                        }
+                    )
+            }),
+    );
     c.hit(
         "empty_poor",
         has(&|k| matches!(k, JudgeEventKind::EmptyPoor { .. })),
@@ -875,8 +891,9 @@ fn generators_reach_the_fragile_spots() {
         ("ln_hold_ended", 1),
         ("empty_poor", 1),
         ("play_sound", 1),
-        ("choices_of_custom", SAMPLES),
-        ("choices_of_beatoraja_style", SAMPLES),
+        ("choices_of_custom", SAMPLES / 4),
+        ("choices_of_beatoraja_style", SAMPLES / 4),
+        ("combo_priority_passes_a_note", 1),
         ("headers_decimals", 1),
         ("headers_def_ex_rank_first", 1),
         ("header_policies_differ", 1),

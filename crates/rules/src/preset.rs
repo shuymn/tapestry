@@ -298,7 +298,7 @@ impl LnEndWindows {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissRule {
     /// A note not pressed by its late BAD edge is a POOR at that edge, and a
-    /// press that judges a note first misses every earlier unjudged note of
+    /// press that takes a note first misses every earlier unjudged note of
     /// its lane, each a POOR at the press's time, in note order. Notes are
     /// never judged out of order.
     PoorAfterLateBadOrOvertaken,
@@ -568,13 +568,24 @@ pub enum SameTimeOrder {
     InputsFirst,
 }
 
-/// How a press is assigned to a note.
+/// Which note a press takes, the primary of press resolution (design.md
+/// "Evaluation Stages"). Only unjudged notes inside the lane class's BAD
+/// window are eligible, and the notes before the one taken are passed
+/// ([`MissRule`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Assignment {
     /// The nearest unjudged note inside the BAD window; at equal distance,
     /// the earlier note. A late press therefore moves on to the next note
     /// once it is past the midpoint between the two.
     NearestTiesEarlier,
+    /// Combo priority: the eligible notes are taken in time order, the first
+    /// one first, and a later one replaces the note taken when the press is
+    /// strictly past the taken note's late GOOD edge and not before the
+    /// later note's early GOOD edge. With `d = press − note` and the lane
+    /// class's windows, the note taken `c` gives way to a later `n` when
+    /// `d(c) > good.late` and `d(n) ≥ −good.early`. A later note is taken
+    /// only when the earlier one can no longer be hit GOOD or better.
+    ComboPriority,
 }
 
 /// How long notes are judged.

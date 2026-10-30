@@ -20,9 +20,10 @@ use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
 use rules::{
-    DefaultTotal, EmptyPoorRange, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeaderPolicy,
-    JudgeRank, JudgeWindows, LaneTable, LnEndWindows, LowDamage, MineRule, PerJudgment,
-    PerLaneClass, RankScale, RulePreset, ScaledRank, TotalCorrection, Window, WindowPolicy,
+    Assignment, DefaultTotal, EmptyPoorRange, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
+    HeaderPolicy, JudgeRank, JudgeWindows, LaneTable, LnEndWindows, LowDamage, MineRule,
+    PerJudgment, PerLaneClass, RankScale, RulePreset, ScaledRank, TotalCorrection, Window,
+    WindowPolicy,
 };
 
 use super::live::{Delivery, Publish, SourceStep};
@@ -580,6 +581,13 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     p.empty_poor.breaks_combo = flag(0);
     p.empty_poor.counts_bp = flag(1);
     p.empty_poor.counted = flag(2);
+    // Both assignment policies: nearest first (custom) and combo priority
+    // (beatoraja-style).
+    p.assignment = if flag(18) {
+        Assignment::ComboPriority
+    } else {
+        Assignment::NearestTiesEarlier
+    };
     p.headers = if flag(3) {
         HeaderPolicy::DefExRankFirst
     } else {

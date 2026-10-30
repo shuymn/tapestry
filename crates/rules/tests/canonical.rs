@@ -261,6 +261,10 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                 Just(HeaderPolicy::DefExRankFirst)
             ],
             window_policy(),
+            prop_oneof![
+                Just(Assignment::NearestTiesEarlier),
+                Just(Assignment::ComboPriority)
+            ],
         ),
         prop_oneof![
             prop_oneof![1_i64..64, 1_i64..=i64::MAX]
@@ -276,7 +280,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
             |(
                 (id, version, keys, scratch),
                 [breaks_combo, counts_bp, counted],
-                (headers, window_policy),
+                (headers, window_policy, assignment),
                 default_total,
                 gauges,
                 (ex, breaks_combo_by, counts_bp_by),
@@ -306,7 +310,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                         counts_bp: counts_bp_by,
                     },
                     same_time_order: SameTimeOrder::InputsFirst,
-                    assignment: Assignment::NearestTiesEarlier,
+                    assignment,
                     ln_mode: LnModeRule {
                         default: LnMode::Ln,
                         late_head: LateHeadRule::CompletesAtPress,
@@ -336,7 +340,7 @@ proptest! {
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 27];
+    let mut counts = [0_usize; 29];
     // Per boolean field, whether it was seen false and true.
     let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
@@ -391,6 +395,8 @@ fn generator_reaches_every_variant_and_length_class() {
             p.gauges.iter().any(|g| g.id.len() >= 128),
             p.headers == HeaderPolicy::Decimals,
             p.headers == HeaderPolicy::DefExRankFirst,
+            p.assignment == Assignment::NearestTiesEarlier,
+            p.assignment == Assignment::ComboPriority,
         ];
         for (count, hit) in counts.iter_mut().zip(reached) {
             *count += usize::from(hit);
