@@ -158,6 +158,12 @@ fn measured(record: &Path) -> toml::Table {
 
 /// `tapestry play <chart> --dev-scripted-input <log>` with its data root
 /// under `appdata`; the caller adds its own arguments.
+/// `--dev-render-timeout`'s seconds for every headless run: WARP frames
+/// on a loaded machine can take tens of seconds, past the production
+/// bounds on the render thread's answers and end, so the bound here only
+/// catches a render thread that never answers.
+const RENDER_TIMEOUT: [&str; 2] = ["--dev-render-timeout", "600"];
+
 fn scripted_play(chart: &Path, log: &Path, appdata: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tapestry"));
     command
@@ -165,6 +171,7 @@ fn scripted_play(chart: &Path, log: &Path, appdata: &Path) -> Command {
         .arg(chart)
         .arg("--dev-scripted-input")
         .arg(log)
+        .args(RENDER_TIMEOUT)
         .env("LOCALAPPDATA", appdata);
     command
 }
@@ -363,6 +370,7 @@ fn perfect_measurement_judges_key_sounds_and_saves() {
         .arg("play")
         .arg(&fx.chart_path)
         .args(["--dev-perfect", "--dev-headless"])
+        .args(RENDER_TIMEOUT)
         .env("LOCALAPPDATA", &fx.appdata)
         .output()
         .expect("run tapestry");
@@ -791,6 +799,7 @@ fn auto_run(chart: &Path, appdata: &Path, extra: &[&std::ffi::OsStr]) -> std::pr
         .arg("--auto")
         .arg(chart)
         .arg("--dev-headless")
+        .args(RENDER_TIMEOUT)
         .args(extra)
         .env("LOCALAPPDATA", appdata)
         .output()

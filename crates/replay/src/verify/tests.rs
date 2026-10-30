@@ -135,13 +135,13 @@ fn a_recorded_play_verifies_and_evaluates_as_played() {
 fn decode_checks_precede_verify_checks() {
     let (_dir, record) = played();
     let mut other = record.clone();
-    other.versions.evaluator = 3;
+    other.versions.evaluator = 4;
     // With only the evaluator version wrong, the record decodes and
     // verification refuses it.
     let decoded = decode(&encode(&other), &DecodeLimits::STANDARD).unwrap();
     assert_eq!(
         load_recorded_chart(&decoded, UNLOADABLE, std::path::Path::new("missing")),
-        Err(VerifyError::UnsupportedEvaluator(3))
+        Err(VerifyError::UnsupportedEvaluator(4))
     );
     // With the preset hash wrong too, decoding refuses it first.
     other.preset.sha256[0] ^= 1;
@@ -155,7 +155,7 @@ fn decode_checks_precede_verify_checks() {
 fn refuses_another_evaluator_before_loading() {
     let (dir, record) = played();
     let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
-    for version in [1, 3] {
+    for version in [2, 4] {
         let mut other = record.clone();
         other.versions.evaluator = version;
         // Every later check would fail too: the preset copy, the loader
@@ -389,8 +389,8 @@ fn an_override_is_a_what_if_and_its_own_copy_is_as_played() {
 fn verify_errors_say_what_was_refused() {
     let cases = [
         (
-            VerifyError::UnsupportedEvaluator(3),
-            "the record was made by evaluator version 3, which this build does not run",
+            VerifyError::UnsupportedEvaluator(4),
+            "the record was made by evaluator version 4, which this build does not run",
         ),
         (
             VerifyError::UnsupportedLoader(7),

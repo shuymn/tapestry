@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use bms_model::{TimeSource, TimeUs};
 use eval::ControlId;
 use input::cadence::{self, Boundary, Cadence, Driven, Wait, WaitFailed, Waiter, Woken};
-use input::hid::{HidProduct, axis_cap, axis_control};
+use input::hid::{HidDevice, HidLayout, HidProduct, HidReport, axis_cap, axis_control};
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, MenuAction, MenuBindings, MenuEvent, Packet, Phase,
     ScriptItem, ScriptedInput, SourceConfig, SourceSet, WakeReport, menu_queue,
@@ -272,6 +272,16 @@ fn menu_does_not_allocate() {
     .unwrap();
     let pad = DeviceId(30);
     set.set_menu(tap);
+    // The wheel filtered as absolute, as `device.toml` can set it, through
+    // the report reader.
+    set.set_axis_mode(product, vec![wheel], false);
+    let layout = HidLayout {
+        collection: 0,
+        axes: &caps,
+        buttons: &[],
+    };
+    let mut reader = HidDevice::new(pad, &layout);
+    let capture = input::Capture::new();
     let packet = |control, value| Packet {
         device: pad,
         control,
@@ -304,6 +314,13 @@ fn menu_does_not_allocate() {
                 // A burst far past the queue's room.
                 set.packet(&packet(wheel, -127));
             }
+            let axes = [None, Some(t % 3)];
+            let report = HidReport {
+                id: 0,
+                buttons: Some(&[]),
+                axes: &axes,
+            };
+            reader.report(&report, false, &capture, &mut set);
             set.end_batch(TimeUs(40_002));
             sent += u64::from(set.menu_mut().unwrap().take_sent());
             // Read only every fortieth batch, so the queue fills.

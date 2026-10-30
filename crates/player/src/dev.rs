@@ -147,6 +147,11 @@ pub struct Options {
     /// Play generated input that hits every note, with key sounds sent from
     /// judgments, and save the play: the perfect measurement.
     pub perfect: bool,
+    /// How long the render thread's answer to a preparation or a chart's
+    /// load, and its end, are waited for, in place of the production bounds
+    /// (`--dev-render-timeout <seconds>`): a run on WARP on a loaded machine
+    /// can take tens of seconds for a frame.
+    pub render_timeout: Option<std::time::Duration>,
 }
 
 impl Options {
@@ -204,6 +209,12 @@ impl Options {
             }
             "dev-scripted-input" => self.scripted_input = Some(PathBuf::from(p.value()?)),
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
+            "dev-render-timeout" => {
+                let secs = p.value()?.to_string_lossy().parse().map_err(|_| {
+                    UsageError::Usage("--dev-render-timeout takes seconds".to_owned())
+                })?;
+                self.render_timeout = Some(std::time::Duration::from_secs(secs));
+            }
             _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
         Ok(())

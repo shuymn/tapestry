@@ -289,7 +289,7 @@ pub fn lr2_style() -> RulePreset {
     RulePreset {
         id: "lr2-style".to_owned(),
         version: 1,
-        implementation: Implementation::Standard { version: 2 },
+        implementation: Implementation::Standard { version: 3 },
         tables: PerLaneClass::both(table()),
         miss: MissRule::PoorAfterLateBadOrOvertaken,
         empty_poor: EmptyPoorRule {

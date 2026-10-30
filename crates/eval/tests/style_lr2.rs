@@ -946,3 +946,34 @@ fn ln_timing_is_the_heads() {
         [(Great, Some(TimeUs(30 * MS)), Some(TimeUs(-100 * MS)))]
     );
 }
+
+/// Source: play/JudgeManager.java:435-437 (the head 160 ms late is judge 6,
+/// which drops it), :438-449 (the tap 740 ms ahead is the MS candidate),
+/// :500 (the candidate's sound plays). At `#RANK 3`, with a long note from
+/// 1000 to 1050 ms (sound A) and a tap at 1900 ms (sound B) on one lane, a
+/// press at 1160 ms is an empty POOR against the tap and plays B, as there
+/// (design.md "The Only Output Is the Judgment Event Stream").
+#[test]
+fn an_empty_poor_plays_the_note_it_is_against() {
+    let mut chart = chart(|b| {
+        b.sound("a.wav")
+            .sound("b.wav")
+            .long(lane(1), TimeUs(T), TimeUs(T + 50 * MS))
+            .tap(lane(1), TimeUs(T + 900 * MS))
+    });
+    for (k, note) in chart.lanes[1].iter_mut().enumerate() {
+        note.sound = Some(bms_model::SoundId(u16::try_from(k).unwrap()));
+    }
+    let at = T + 160 * MS;
+    let e = play_with(&chart, &preset(), hold_at(at, 10));
+    assert_eq!(empty_poors(&e.events), 1);
+    let played: Vec<_> = e
+        .events
+        .iter()
+        .filter_map(|ev| match ev.kind {
+            JudgeEventKind::PlaySound { sound, .. } => Some((ev.time.0, sound.0)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(played, [(at, 1)]);
+}

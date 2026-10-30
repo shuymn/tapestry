@@ -476,7 +476,8 @@ impl HidDevice {
 
     /// Turns one report into packets for `sources`, in order: the buttons
     /// it carries released or pressed since the last report, by number,
-    /// then each axis whose position changed or that reported a movement.
+    /// then each axis whose position changed or that reported a movement,
+    /// in the mode its conversion uses ([`SourceSet::axis_relative`]).
     /// Buttons it does not carry keep their state. Button presses are
     /// offered to `capture`, and so is an axis once it has turned
     /// [`capture_travel`] since the capture was armed.
@@ -544,7 +545,10 @@ impl HidDevice {
             if !cap.relative && capture.watched() == Some(cap.control) {
                 capture.observe(&cap, prev, value);
             }
-            let moved = if cap.relative {
+            // Filtered in the mode its conversion uses: `device.toml`'s,
+            // else the declared one ([`SourceSet::axis_relative`]).
+            let relative = sources.axis_relative(device, &cap);
+            let moved = if relative {
                 i64::from(value)
             } else {
                 match last.replace(value) {
@@ -553,7 +557,7 @@ impl HidDevice {
                     Some(prev) => wrapped(i64::from(value) - i64::from(prev), cap.wrap),
                 }
             };
-            if cap.relative && value == 0 {
+            if relative && value == 0 {
                 continue;
             }
             let p = packet(cap.control, value);

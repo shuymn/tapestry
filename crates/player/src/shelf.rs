@@ -377,17 +377,23 @@ mod tests {
         shelf.wait_paused(PAUSE_SLICE, || false, Duration::MAX, || {})
     }
 
-    /// Polls until `listed` holds `name`, at most `within`.
-    fn lists(shelf: &mut Shelf, name: &str, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
+    /// Polls until the running pass has ended. The bound only catches a
+    /// pass that never ends: the pass runs in background mode, which a
+    /// loaded machine can starve for seconds.
+    fn pass_ends(shelf: &mut Shelf) {
+        let begun = Instant::now();
+        while shelf.has_scan() {
+            assert!(
+                begun.elapsed() < Duration::from_secs(600),
+                "the pass never ended"
+            );
             shelf.poll(Instant::now());
-            if listed(shelf).iter().any(|n| n == name) {
-                return true;
-            }
             std::thread::sleep(Duration::from_millis(10));
         }
-        false
+    }
+
+    fn holds(shelf: &Shelf, name: &str) -> bool {
+        listed(shelf).iter().any(|n| n == name)
     }
 
     /// While a chart's choice pauses the scan no pass starts, however long
@@ -401,15 +407,27 @@ mod tests {
         chart(&charts, "refused.bms");
         let (library, _) = open(&root).unwrap();
         let mut shelf = Shelf::new(library, vec![charts.clone()], Duration::from_millis(20));
-        assert!(lists(&mut shelf, "refused.bms", Duration::from_secs(10)));
+        pass_ends(&mut shelf);
+        assert!(holds(&shelf, "refused.bms"));
         // A chart is chosen.
         shelf.pause();
         assert_ne!(wait(&mut shelf), Paused::Cancelled);
         chart(&charts, "added.bms");
-        // Paused: nothing is listed however long selection waits.
-        assert!(!lists(&mut shelf, "added.bms", Duration::from_millis(300)));
+        // Paused: no pass starts however long selection waits, though one
+        // is due every 20 ms.
+        let until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < until {
+            shelf.poll(Instant::now());
+            assert!(!shelf.has_scan(), "a pass started while paused");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!holds(&shelf, "added.bms"));
         shelf.release();
-        assert!(lists(&mut shelf, "added.bms", Duration::from_secs(10)));
+        // Due long since: the next poll starts the pass.
+        shelf.poll(Instant::now());
+        assert!(shelf.has_scan());
+        pass_ends(&mut shelf);
+        assert!(holds(&shelf, "added.bms"));
     }
 
     /// The pause a countdown waits for is acknowledged by a running pass
