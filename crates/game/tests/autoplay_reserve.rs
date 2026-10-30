@@ -18,22 +18,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use audio::{AudioEngine, MAX_VOICES};
 use bms_model::{BgmEvent, Chart, ChartBuilder, JudgeRank, SoundId, TimeUs};
-use common::{MS, lane};
+use common::{MS, custom_settings, lane};
 use eval::{EvalError, PhysicalInputEvent};
 use game::{
     AutoplayError, ChartIngest, DataRoot, DeviceSettings, IngestError, Ingested, KeyConfig, Loaded,
-    LogicError, Parts, RECORDING_MEMORY, Reservation, SessionConfig, Settings,
+    LogicError, Parts, RECORDING_MEMORY, Reservation, SessionConfig,
 };
 use input::{DeviceKind, source_queue};
 use replay::{BuildProvenance, ReceiveMethod};
-
-/// The settings in `root`, naming the custom preset: these tests' values
-/// are the custom preset's.
-fn custom_settings(root: &DataRoot) -> Settings {
-    let mut settings = Settings::load(root).unwrap();
-    settings.player.preset = "custom.toml".to_owned();
-    settings
-}
 
 struct Summing;
 

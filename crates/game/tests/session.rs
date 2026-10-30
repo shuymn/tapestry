@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
 use bms_model::{Chart, ChartBuilder, ModelError, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, count_judged, judgments, lane};
+use common::{MS, PERIOD, RATE, count_judged, custom_settings, judgments, lane};
 use eval::{ControlId, InputKind, SourceId};
 use game::{
     AbortCause, ChartIngest, Command, DataRoot, DefaultPolicy, DeviceSettings, FailureAction,
@@ -27,14 +27,6 @@ use replay::{BuildProvenance, DecodeLimits, EndStatus, ReceiveMethod};
 use rules::Judgment;
 
 type Out = RecordingOutput<SimDevice>;
-
-/// The settings in `root`, naming the custom preset: these tests' values
-/// are the custom preset's.
-fn custom_settings(root: &DataRoot) -> Settings {
-    let mut settings = Settings::load(root).unwrap();
-    settings.player.preset = "custom.toml".to_owned();
-    settings
-}
 
 /// A data root in the build's temporary directory, never the real one.
 fn temp_root() -> (tempfile::TempDir, DataRoot) {

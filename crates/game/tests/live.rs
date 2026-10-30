@@ -9,7 +9,7 @@ mod common;
 use std::path::Path;
 
 use bms_model::{Chart, ChartBuilder, TimeSource, TimeUs, VirtualClock};
-use common::{MS, lane};
+use common::{MS, custom_settings, lane};
 use eval::{ControlId, InputKind, JudgeEventKind, SourceId};
 use game::{
     AbortCause, AudioControl, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
@@ -22,14 +22,6 @@ use input::{
 };
 use replay::{BuildProvenance, ReceiveMethod};
 use rules::Judgment;
-
-/// The settings in `root`, naming the custom preset: these tests' values
-/// are the custom preset's.
-fn custom_settings(root: &DataRoot) -> Settings {
-    let mut settings = Settings::load(root).unwrap();
-    settings.player.preset = "custom.toml".to_owned();
-    settings
-}
 
 /// Where the rig's clock starts: no play's origin is near 0.
 const CLOCK_START: i64 = 7_300_000;
