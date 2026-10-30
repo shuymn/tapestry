@@ -358,13 +358,14 @@ A single exact stage is not used. A 383,999 Hz stereo source at 145 % on 384,000
 **Rounds.** Each round runs reset → restore → lead-in → section evaluation through #84's flow. Each round is one attempt and one saved practice record.
 
 **Restore.**
-- **Schedule.** The BGM plus autoplay key sounds for the notes before the section.
+- **Schedule.** The BGM plus autoplay key sounds for every note that is not a target: before the section, after its end, and long notes crossing either edge.
 - **Audio.** `AudioEngine::seek(t)` advances the engine's scheduling (starts, stops, steals, positions) without summing samples. A property test checks it against mixing.
-- **Notes.** Notes before the section are drawn auto-played; notes after its end are not drawn.
+- **Notes.** Only the section's targets are drawn. Notes before the section and after its end, and long notes that cross either edge (which D13 excludes), are not drawn, so the first note on screen is the first one to press. Those notes still sound, as autoplay key sounds on their own times (above), before the section and after it alike.
+- **Long notes across an edge** get no special rule: they are neither judged nor drawn. A player who wants one judged moves the section's edge to include it.
 
 **End of a round: a short ring-out (decided).**
 - Completion happens in the first step whose watermark covers the section's final deadline. Recording closes there, and the record is frozen; it is saved after the ring-out, as a full play is saved after its tail, so a slow write never delays the ring-out's controls.
-- A ring-out follows instead of the full-play audio tail, which waits for every voice and BGM event (crates/game/src/live.rs:359). For `RING_OUT` (1.5 s, tuned by playing) the BGM keeps playing on schedule, no notes are drawn and nothing is judged or recorded; key sounds of notes after the section never start. Over its last `FADE` (0.5 s, tuned by playing) the output fades to silence.
+- A ring-out follows instead of the full-play audio tail, which waits for every voice and BGM event (crates/game/src/live.rs:359). For `RING_OUT` (1.5 s, tuned by playing) the BGM keeps playing on schedule, no notes are drawn and nothing is judged or recorded; key sounds of notes after the section play as autoplay, like those before it. Over its last `FADE` (0.5 s, tuned by playing) the output fades to silence.
 - **The envelope is on output frames.** At completion the game sends `AudioCtl::RingOut { fade_at, end_at }` in play time. The engine converts both to frame positions on the play's mix clock, as it does for sound starts, and applies the gain per frame: 1 before `fade_at`, falling linearly to 0 at `end_at`. At `end_at` it stops every voice and starts nothing more, and it reports the ring-out done like a sealed tail. The fade therefore does not depend on when the request is taken or how the output is divided into periods, and the stop always comes at the envelope's zero. Nothing is allocated in the audio callback.
 - **The envelope is reset** to gain 1 by every `Play`, whether the previous ring-out finished or was cut, independently of master volume and loudness gain.
 - The ring-out ends when both the engine has reported done and play time has reached `end_at`: the engine mixes ahead into queued output, so its report alone can come early. The record is then saved, and the next round's countdown begins at the following step.
@@ -871,7 +872,7 @@ Each one holds the behavior D5 and D6 state.
   - `SongEnd.time` shall be 19.680000 s;
   - completion and the close shall happen in the step at 19.681 s, not at 19.680 s;
   - `RingOut { fade_at: 20.681 s, end_at: 21.181 s }` shall be sent in that step, and the record shall be saved only after the engine reports the ring-out done;
-  - the BGM event at 20.5 s shall start, no key sound of a note after the section shall start, and the BGM event at 30 s shall never start;
+  - the BGM event at 20.5 s and the autoplay key sound of a note at 20.4 s shall start, and the BGM event at 30 s shall never start;
   - round 2's countdown shall begin at 21.182 s, with the long voice 3 s in, also when the engine reports done early with two or three queued periods (`early_done_report_waits_for_end_at`).
 - When retry is pressed during the ring-out, the ring-out shall be cut in that step and the frozen record shall still be saved (`retry_cuts_the_ring_out_and_saves`).
 - When a slow save is simulated, the ring-out's fade, stop and quit handling shall happen at the same times as with an instant save (`saving_never_delays_the_ring_out`).
