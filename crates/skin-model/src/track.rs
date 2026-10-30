@@ -228,7 +228,8 @@ impl Track {
             return None;
         }
         let t = match self.end {
-            End::Hold => t_us.min(kn),
+            End::Hold if t_us >= kn => return self.v.last().map(Self::exact),
+            End::Hold => t_us,
             End::Hide if t_us > kn => return None,
             End::Hide => t_us,
             // `from ≥ k0 ≥ 0` and `t_us > from`, so neither subtraction
