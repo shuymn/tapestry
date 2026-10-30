@@ -12,9 +12,9 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use rules::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
-    MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode,
-    Window,
+    HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
+    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights,
+    TotalMode, Window,
 };
 
 const FULL: i64 = GaugeValue::FULL.0;
@@ -181,7 +181,14 @@ fn preset() -> impl Strategy<Value = RulePreset> {
     (
         (text(), u32s(), windows_and_ln_end()),
         (non_negative(), non_negative(), any::<[bool; 3]>()),
-        ([scale(), scale(), scale(), scale()], scale()),
+        (
+            prop_oneof![
+                Just(HeaderPolicy::Decimals),
+                Just(HeaderPolicy::IntegerRanks)
+            ],
+            [scale(), scale(), scale(), scale()],
+            scale(),
+        ),
         prop_oneof![1_i64..64, 1_i64..=i64::MAX],
         gauges(),
         ([u32s(), u32s(), u32s(), u32s(), u32s()], bools(), bools()),
@@ -191,7 +198,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
             |(
                 (id, version, (windows, ln_end)),
                 (ahead, behind, [breaks_combo, counts_bp, counted]),
-                (rank_milli, absent_milli),
+                (headers, rank_milli, absent_milli),
                 default_total_milli,
                 gauges,
                 (ex, breaks_combo_by, counts_bp_by),
@@ -212,6 +219,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                     counted,
                 },
                 ln_end,
+                headers,
                 rank_scale: RankScale {
                     rank_milli,
                     absent_milli,
@@ -254,7 +262,7 @@ proptest! {
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 13];
+    let mut counts = [0_usize; 15];
     // Per boolean field, whether it was seen false and true.
     let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
@@ -285,6 +293,8 @@ fn generator_reaches_every_variant_and_length_class() {
             (2..128).contains(&p.gauges.len()),
             p.gauges.len() >= 128,
             p.gauges.iter().any(|g| g.id.len() >= 128),
+            p.headers == HeaderPolicy::Decimals,
+            p.headers == HeaderPolicy::IntegerRanks,
         ];
         for (count, hit) in counts.iter_mut().zip(reached) {
             *count += usize::from(hit);

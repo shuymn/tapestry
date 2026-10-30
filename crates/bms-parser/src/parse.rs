@@ -3,12 +3,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bms_model::{ChartMeta, JudgeRank, Lane, LnMode};
+use bms_model::{ChartMeta, HeaderValue, JudgmentHeader, JudgmentHeaderName, Lane, LnMode};
 use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
 
 use crate::branch::Branches;
-use crate::decimal::{Rational, parse_base36, parse_decimal, parse_hex};
+use crate::decimal::{Rational, header_value, parse_base36, parse_decimal, parse_hex};
 use crate::{Limits, LoadError, Warning, WarningKind};
 
 /// What an object does.
@@ -50,7 +50,7 @@ pub struct Defined<T> {
 /// Everything read from the text.
 #[derive(Debug, Default)]
 pub struct Source {
-    /// Title, rank, total and long-note mode.
+    /// Title, judgment headers and long-note mode.
     pub meta: ChartMeta,
     pub bpm: Option<Rational>,
     pub bpm_defs: BTreeMap<u16, Rational>,
@@ -165,6 +165,8 @@ pub fn parse(
         }
     }
     source.random_results = branches.finish(warnings);
+    // One entry per declaring line, held at its exact size.
+    source.meta.judgment_headers.shrink_to_fit();
     Ok(source)
 }
 
@@ -313,20 +315,27 @@ fn parse_header(
         "BPM" => {
             source.bpm = Some(bpm(value, line, "#BPM")?);
         }
-        "RANK" => match value.parse::<i32>() {
-            Ok(rank) => source.meta.rank = Some(JudgeRank::Rank(rank)),
-            Err(_) => ignore(warnings, "#RANK"),
-        },
-        // A value below 1 is ignored, so an earlier #RANK stays, as in
-        // jbms-parser's BMSDecoder (its #DEFEXRANK handler: `if (rank >= 1)`).
-        "DEFEXRANK" => match thousandths(value) {
-            Some(v) if v >= 1_000 => source.meta.rank = Some(JudgeRank::DefExRankMilli(v)),
-            _ => ignore(warnings, "#DEFEXRANK"),
-        },
-        "TOTAL" => match thousandths(value) {
-            Some(v) => source.meta.total_milli = Some(v),
-            None => ignore(warnings, "#TOTAL"),
-        },
+        // Kept as declared, in canonical form, for each preset's header
+        // policy to read (design.md "Chart Model"). There is at most one per
+        // line, so the line limit bounds them.
+        "RANK" | "DEFEXRANK" | "TOTAL" => {
+            let (name, what) = match upper {
+                "RANK" => (JudgmentHeaderName::Rank, "#RANK"),
+                "DEFEXRANK" => (JudgmentHeaderName::DefExRank, "#DEFEXRANK"),
+                _ => (JudgmentHeaderName::Total, "#TOTAL"),
+            };
+            let value = header_value(value);
+            if value == HeaderValue::NotANumber {
+                warnings.push(Warning {
+                    line: Some(line),
+                    kind: WarningKind::NotANumber(what),
+                });
+            }
+            source
+                .meta
+                .judgment_headers
+                .push(JudgmentHeader { name, value });
+        }
         // An empty #LNOBJ names no object, so it changes nothing.
         "LNOBJ" if value.is_empty() => {
             if !std::mem::replace(&mut source.warned_lnobj, true) {
@@ -450,12 +459,4 @@ fn bpm(text: &str, line: usize, what: &'static str) -> Result<Rational, LoadErro
     } else {
         Ok(v)
     }
-}
-
-/// A non-negative decimal in thousandths, rounded down, or `None` for a
-/// value that is not one.
-fn thousandths(value: &str) -> Option<i64> {
-    let v = parse_decimal(value).ok().filter(|v| !v.is_negative())?;
-    let milli = (v * BigInt::from(1_000)).floor().to_integer();
-    i64::try_from(milli).ok()
 }

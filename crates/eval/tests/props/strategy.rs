@@ -8,7 +8,8 @@
 //! across sources and between inputs and deadlines are common.
 
 use bms_model::{
-    Chart, ChartBuilder, JudgeRank, LANE_COUNT, Lane, LnMode, Note, NoteKind, SoundId, TimeUs,
+    Chart, ChartBuilder, HeaderValue, JudgmentHeader, JudgmentHeaderName, LANE_COUNT, Lane, LnMode,
+    Note, NoteKind, SoundId, TimeUs,
 };
 use eval::{
     AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, EvalInput, Evaluator, InputKind,
@@ -19,8 +20,8 @@ use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
 use rules::{
-    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeWindows, LnEndWindows, LowDamage, MineRule,
-    PerJudgment, RulePreset, Window,
+    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeaderPolicy, JudgeWindows, LnEndWindows,
+    LowDamage, MineRule, PerJudgment, RulePreset, Window,
 };
 
 use super::live::{Delivery, Publish, SourceStep};
@@ -122,13 +123,47 @@ fn jitter(raw: u8) -> i64 {
     }
 }
 
-/// No rank, `#RANK -1` to `#RANK 4` (outside 0-3 counts as absent), or a
-/// `#DEFEXRANK` up to 200 %.
-fn rank(raw: (u8, u32)) -> Option<JudgeRank> {
-    match raw.0 % 3 {
-        0 => None,
-        1 => Some(JudgeRank::Rank(i32::try_from(below(raw.1, 6)).unwrap() - 1)),
-        _ => Some(JudgeRank::DefExRankMilli(below(raw.1, 200_000) + 1)),
+/// The rank declarations: none, `#RANK -1` to `#RANK 5` (beatoraja-style
+/// reads 0-4, custom any, and the rank scale takes 0-3), a `#DEFEXRANK` up
+/// to 200 % as an integer token or a decimal, one that is not a number, or
+/// a `#RANK` followed by one of those, which the header policies may read
+/// differently.
+fn rank(raw: (u8, u32)) -> Vec<JudgmentHeader> {
+    let declare = |name, value| JudgmentHeader { name, value };
+    let r = declare(
+        JudgmentHeaderName::Rank,
+        HeaderValue::integer(below(raw.1, 7) - 1),
+    );
+    let defexrank = match raw.0 / 8 % 3 {
+        0 => HeaderValue::integer(below(raw.1 / 7, 200) + 1),
+        1 => HeaderValue::decimal_milli(below(raw.1 / 7, 200_000) + 1),
+        _ => HeaderValue::NotANumber,
+    };
+    let d = declare(JudgmentHeaderName::DefExRank, defexrank);
+    match raw.0 % 4 {
+        0 => Vec::new(),
+        1 => vec![r],
+        2 => vec![d],
+        _ => vec![r, d],
+    }
+}
+
+/// The `#TOTAL` declarations: none, or one from -0.001 to 400 as a decimal,
+/// after a `#TOTAL 200` half the time, so a value not positive keeps the
+/// earlier one under beatoraja-style and the default under custom.
+fn total(raw: Option<u32>) -> Vec<JudgmentHeader> {
+    let declare = |value| JudgmentHeader {
+        name: JudgmentHeaderName::Total,
+        value,
+    };
+    let Some(t) = raw else {
+        return Vec::new();
+    };
+    let last = declare(HeaderValue::decimal_milli(below(t / 2, 400_002) - 1));
+    if t % 2 == 0 {
+        vec![last]
+    } else {
+        vec![declare(HeaderValue::integer(200)), last]
     }
 }
 
@@ -203,8 +238,8 @@ fn build_chart(raw: &RawChart) -> Chart {
             }
         }
     }
-    chart.meta.rank = rank(raw.rank);
-    chart.meta.total_milli = raw.total.map(|t| below(t, 400_002) - 1);
+    chart.meta.judgment_headers = rank(raw.rank);
+    chart.meta.judgment_headers.extend(total(raw.total));
     chart.meta.ln_mode = raw.ln.then_some(LnMode::Ln);
     chart.validate().unwrap();
     chart
@@ -443,6 +478,11 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     p.empty_poor.counts_bp = flag(1);
     p.empty_poor.counted = flag(2);
     p.ln_end = ln_end_of(raw.ln_end, early);
+    p.headers = if flag(3) {
+        HeaderPolicy::IntegerRanks
+    } else {
+        HeaderPolicy::Decimals
+    };
     p.rank_scale.rank_milli = [0, 1, 2, 3].map(|k| scale(raw.rank[k]));
     p.rank_scale.absent_milli = scale(raw.rank[4]);
     p.default_total_milli = below(raw.total, 400_000) + 1;
@@ -1559,7 +1599,7 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
         planned.push((l, t, press));
     }
     let mut chart = b.build().unwrap();
-    chart.meta.rank = rank(raw.rank);
+    chart.meta.judgment_headers = rank(raw.rank);
     let off = offset(raw.offset);
     let device = crate::common::device(&[off]);
     let scaled = |p: &RulePreset| {
@@ -1665,9 +1705,10 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
         .long(lane(1), TimeUs(head), TimeUs(head + length))
         .build()
         .unwrap();
-    chart.meta.rank = rank(raw.rank);
+    chart.meta.judgment_headers = rank(raw.rank);
     // The scaled BAD window, by hand: floor(edge × scale / 100 %).
-    let scale = preset.rank_scale.scale_milli(chart.meta.rank).unwrap();
+    let read = preset.headers.read(&chart.meta.judgment_headers);
+    let scale = preset.rank_scale.scale_milli(read.rank).unwrap();
     let scaled = |edge: TimeUs| edge.0 * scale / 100_000;
     let (early, late) = (
         scaled(preset.windows.bad.early),

@@ -1,0 +1,18 @@
+#PLAYER 1
+#TITLE Judgment headers
+#BPM 120
+#RANK 3
+#DEFEXRANK 120.5
+#TOTAL 200
+#TOTAL 0
+#RANDOM 2
+#IF 1
+#RANK 1
+#ELSE
+#defexrank 120
+#ENDIF
+#ENDRANDOM
+#TOTAL easy
+#WAV01 click.wav
+#00111:01
+#00114:0101

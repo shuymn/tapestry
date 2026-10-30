@@ -619,7 +619,7 @@ fn section_gauge_uses_the_chart_denominator() {
         }
     }
     let mut chart = b.build().unwrap();
-    chart.meta.total_milli = Some(160_000);
+    chart.meta.judgment_headers = vec![common::total(160_000)];
     let preset = rules::custom();
     let dev = device(&[0]);
     let s = Section {

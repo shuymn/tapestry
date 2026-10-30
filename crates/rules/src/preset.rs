@@ -3,7 +3,9 @@
 //! Each choice enum has only the variants a preset in use needs; a later
 //! preset adds the variant it needs.
 
-use bms_model::{DOMAIN, JudgeRank, TimeUs};
+use bms_model::{DOMAIN, TimeUs};
+
+use crate::{HeaderPolicy, JudgeRank};
 
 /// A gauge amount in units of 1/100000 % (1 % = `100_000`, 100 % =
 /// `10_000_000`).
@@ -317,9 +319,9 @@ pub struct RankScale {
 }
 
 impl RankScale {
-    /// The window scale for a chart's declared rank.
+    /// The window scale for the rank the header policy read.
     ///
-    /// `#DEFEXRANK n` scales by `n` %, which the chart model already holds in
+    /// `#DEFEXRANK n` scales by `n` %, which [`JudgeRank`] already holds in
     /// thousandths of a percent. No rank and a `#RANK` outside 0-3 use
     /// `absent_milli`. `None` for a `#DEFEXRANK` that is not positive.
     #[must_use]
@@ -538,9 +540,11 @@ pub struct RulePreset {
     pub empty_poor: EmptyPoorRule,
     /// The early edges of a long note's end at scale 100 %.
     pub ln_end: LnEndWindows,
+    /// How the chart's judgment headers are read.
+    pub headers: HeaderPolicy,
     /// Window scale per rank.
     pub rank_scale: RankScale,
-    /// `#TOTAL` when the chart declares none, in thousandths.
+    /// `#TOTAL` when the header policy reads none, in thousandths.
     pub default_total_milli: i64,
     /// Which notes make up the gauge denominator.
     pub denominator: Denominator,
@@ -562,9 +566,10 @@ pub struct RulePreset {
 
 #[cfg(test)]
 mod tests {
-    use bms_model::{JudgeRank, TimeUs};
+    use bms_model::TimeUs;
 
     use super::{GaugeValue, LowDamage, RankScale, Window};
+    use crate::JudgeRank;
     use crate::custom;
 
     #[test]

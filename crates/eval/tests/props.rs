@@ -31,7 +31,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
-use rules::{GaugeKind, GaugeValue, MineRule, RulePreset};
+use rules::{GaugeKind, GaugeValue, HeaderPolicy, MineRule, RulePreset};
 
 use live::{Delivery, Live, live};
 use strategy::{
@@ -513,6 +513,11 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
         "choices_of_beatoraja_style",
         choices(p) == choices(&rules::beatoraja_style()),
     );
+    c.hit("headers_decimals", p.headers == HeaderPolicy::Decimals);
+    c.hit(
+        "headers_integer_ranks",
+        p.headers == HeaderPolicy::IntegerRanks,
+    );
     c.hit("asymmetric_bad", p.windows.bad.early != p.windows.bad.late);
     let survival = |low: bool| {
         p.gauges
@@ -524,6 +529,11 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
 }
 
 fn count_play(play: &Play, c: &mut Coverage) {
+    let declared = &play.chart.meta.judgment_headers;
+    c.hit(
+        "header_policies_differ",
+        HeaderPolicy::Decimals.read(declared) != HeaderPolicy::IntegerRanks.read(declared),
+    );
     let device = &play.input.device;
     let times: Vec<(TimeUs, SourceId)> = play
         .input
@@ -812,6 +822,9 @@ fn generators_reach_the_fragile_spots() {
         ("play_sound", 1),
         ("choices_of_custom", SAMPLES),
         ("choices_of_beatoraja_style", SAMPLES),
+        ("headers_decimals", 1),
+        ("headers_integer_ranks", 1),
+        ("header_policies_differ", 1),
         ("asymmetric_bad", 1),
         ("survival_with_low_damage", 1),
         ("survival_without_low_damage", 1),

@@ -445,7 +445,15 @@ pub fn preset_canonicals() -> Vec<Seed> {
             ..gauge.clone()
         })
         .collect();
-    let mut seeds: Vec<Seed> = vec![("custom", bytes.clone()), ("long", long.canonical_bytes())];
+    // beatoraja-style carries the other header policy.
+    let mut seeds: Vec<Seed> = vec![
+        ("custom", bytes.clone()),
+        (
+            "beatoraja_style",
+            rules::beatoraja_style().canonical_bytes(),
+        ),
+        ("long", long.canonical_bytes()),
+    ];
 
     let edited = |edit: &dyn Fn(&mut Vec<u8>)| {
         let mut b = bytes.clone();
