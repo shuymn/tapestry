@@ -981,6 +981,19 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if autoplay {
         sources.set_queue_capacity(0);
     }
+    // The configured controller's lane controls drive the select screen;
+    // autoplay receives no device.
+    let bindings = select::menu_bindings(
+        &settings.device.controller,
+        settings.device.controller_device.map(Into::into),
+        settings.device.scratch.press_threshold,
+    )
+    .filter(|_| !autoplay);
+    let pad = bindings.map(|b| {
+        let (tap, receiver) = input::menu_queue(b);
+        sources.set_menu(tap);
+        receiver
+    });
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {
@@ -1112,6 +1125,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         screen: select::SelectScreen::new(roots),
         menu,
         dropped: 0,
+        pad,
+        pad_dropped: 0,
         search_pending: false,
         ime,
         rate: opened.rate,
