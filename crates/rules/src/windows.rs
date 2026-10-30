@@ -114,8 +114,9 @@ pub struct ScaledRank {
     pub rank_percent: [u32; 5],
     /// The scale with no rank, or a `#RANK` outside 0-4, in percent.
     pub absent_percent: u32,
-    /// `#DEFEXRANK n` scales by `floor(n × defexrank_percent / 100)` %,
-    /// with `n` as the header policy read it.
+    /// `#DEFEXRANK n` scales by `n × defexrank_percent / 100` %, with `n`
+    /// as the header policy read it, applied to each edge as it is (never
+    /// rounded to a whole percent).
     pub defexrank_percent: u32,
 }
 

@@ -266,7 +266,7 @@ egui comes with the first form-like screen.
 **What LR2-style needs beyond them.** Endless Dream shares B, and G and H as known differences, and its single low-gauge step fits today's model. Its own, cited at that commit under `core/src/bms/player/beatoraja/`, each again with an example:
 - **I. Window interpolation:** below 100 % PERFECT, GREAT and GOOD come from the LR2 table, interpolated; at 100 % and above they scale linearly; then each of them is clamped to the next wider window, so at `#DEFEXRANK 400` (300 %) GOOD is BAD's 200 ms, not 360 ms; BAD and empty POOR are not scaled; `#RANK` 0-4 is 25, 50, 75, 100, 75 %, and `#DEFEXRANK n` is n × 75 / 100 % (`play/JudgeProperty.java:168`, `:185-265`, the clamp `:241-249`; `play/BMSPlayerRule.java:61-65`) (PR8).
 - **J. Multi-BAD:** the other unjudged notes in BAD but not GOOD range are judged BAD too, before the primary, filtered by its timing, judgment and LN type, leading LN heads trimmed (`play/JudgeManager.java:993-1061`). The variant lands in PR7b, checked against a preset built in test code; PR8 assembles it.
-- **K. LN-head eligibility:** a late BAD on an LN head cannot be the primary (`play/JudgeManager.java:435-437`), but multi-BAD can still consume it; only a head nothing consumes stays to its own miss. At `#RANK 3` (100 %), with taps at 0 and 160 ms and a long note from 50 to 100 ms on one lane, a press at 190 ms takes the 160 ms tap as the primary (GREAT), and multi-BAD judges the 0 ms tap and the head BAD (`:993-1061`). The variant lands in PR7d with that example; PR8 assembles it.
+- **K. LN-head eligibility:** a late BAD on an LN head cannot be the primary (`play/JudgeManager.java:435-437`), but multi-BAD can still consume it; a head neither consumed nor passed by the primary stays to its own miss, and one the primary passes is POOR at the press. At `#RANK 3` (100 %), with taps at 0 and 160 ms and a long note from 50 to 100 ms on one lane, a press at 190 ms takes the 160 ms tap as the primary (GREAT), and multi-BAD judges the 0 ms tap and the head BAD (`:993-1061`). The variant lands in PR7d with that example; PR8 assembles it.
 - **L. Empty POOR:** for an unjudged note, (200, 1000) ms early: past the inclusive early BAD edge, and short of the scan's exclusive end; for a judged one, [0, 1000) ms early; no late side (`play/JudgeProperty.java:54-55`, the scan cutoff `play/JudgeManager.java:416`) (PR8).
 - **M. Gauges:** HARD-family damage × max(fix1, fix2); a survival gauge strictly below 2 % after a change, mines included, drops to 0 and fails; `#TOTAL` when absent as `160 + (N + clamp(N − 400, 0, 200)) × 0.16` (`play/GrooveGauge.java:218-225`, `:279-309`; `play/BMSPlayerRule.java:88-89`) (PR7c).
 
@@ -735,7 +735,7 @@ PR7e lands before PR7a; the letter names it, not its place.
 
 **Done when.**
 - When a scratch note, a scratch LN end or a scratch empty POOR is judged under beatoraja-style, the scratch table shall apply, and a key note at the same offset shall use the key table (`scratch_uses_its_own_windows`).
-- When `#DEFEXRANK` or `#RANK 4` is present, the windows shall scale as beatoraja does (`defexrank_and_rank_4_scale_like_the_source`).
+- When `#DEFEXRANK` or `#RANK 4` is present, the windows shall scale as beatoraja does, except that a `#DEFEXRANK` percentage is not truncated to an integer (a known difference, `defexrank_scales_by_its_exact_percentage`) (`defexrank_and_rank_4_scale_like_the_source`).
 - When a chart declares `#DEFEXRANK n` under beatoraja-style, every edge shall scale by `n × 75 / 100` % as it is, not truncated to an integer percent: `#DEFEXRANK 1` gives PERFECT ±150 µs, recorded as a known difference with the source's zero-width windows (`defexrank_scales_by_its_exact_percentage`).
 - When scaled edges tie, preparation shall accept them; if a preset's own table does not ascend, then validation shall refuse it (`derived_edges_may_tie`).
 - When a note lies exactly 500 ms ahead of a press under beatoraja-style, judged or not, and the press judges no note, it shall make it an empty POOR whether or not a scaled early BAD edge passes 500 ms, recorded as a known difference with the source's scan bound (`a_note_500_ms_ahead_makes_an_empty_poor_at_every_scale`); at `#DEFEXRANK 292` a scratch press exactly on its early BAD edge shall be BAD (`a_scratch_press_on_its_early_bad_edge_at_219_percent_is_bad`).
@@ -750,7 +750,7 @@ PR7e lands before PR7a; the letter names it, not its place.
 **Depends on.** PR7a. PR7b and PR7d share one transition contract (design.md "Evaluation Stages", press resolution and LN transitions) and may land as adjacent PRs.
 
 **Done when.**
-- When several notes on a lane are in range under beatoraja-style, the press shall judge the note beatoraja's combo-priority algorithm picks, and the earlier notes it passes shall be POOR at the press (`combo_priority_assignment_matches_the_source`).
+- When several notes on a lane are in range under beatoraja-style, the press shall judge the note beatoraja's combo-priority algorithm picks, and the earlier notes it passes shall be POOR at the press (`combo_priority_assigns_like_the_source_and_passed_notes_are_poor`).
 - When a press judges no note under beatoraja-style, the empty POOR shall be decided from the candidate scan, with the source's ranges for judged and unjudged notes (`empty_poor_is_part_of_the_scan`).
 - When a lane's last note has been hit and the lane is pressed again 150 ms after it, the press shall be an empty POOR, under beatoraja-style and custom alike (`empty_poor_after_the_last_hit_note`).
 - When, under a preset built in test code with combo priority and multi-BAD, a press judges a note while other unjudged notes lie in BAD but not GOOD range, those shall be BAD before the primary, filtered by the primary's timing, judgment and LN type, with leading LN heads trimmed (`multi_bad_matches_the_source`).
@@ -782,7 +782,7 @@ PR7e lands before PR7a; the letter names it, not its place.
 
 **Done when.**
 - When, under the preset built in test code with combo priority, multi-BAD and LN-head eligibility, at 100 %, a lane holds taps at 0 and 160 ms and a long note from 50 to 100 ms, and it is pressed at 190 ms, the primary shall be the 160 ms tap (GREAT) and the 0 ms tap and the head shall be BAD, before it (`ineligible_head_is_consumed_by_multi_bad`).
-- When a late BAD press reaches an LN head that no additional outcome consumes, the head shall not be the primary and shall be missed at its own deadline, unmoved (`late_bad_ln_head_is_not_selectable`).
+- When a late BAD press reaches an LN head that no additional outcome consumes and the primary does not pass (no primary, or one before the head), the head shall not be the primary and shall be missed at its own deadline, unmoved (`late_bad_ln_head_is_not_selectable`).
 - When a long-note head is BAD, under any preset, the long note shall be scored at the press, as today.
 - When the props run, every judgeable note shall still be judged exactly once.
 

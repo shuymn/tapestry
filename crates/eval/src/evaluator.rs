@@ -430,8 +430,7 @@ impl<'a> Evaluator<'a> {
         // one rank and one #TOTAL (design.md "Evaluation Stages").
         let headers = rule.headers.read(&chart.meta.judgment_headers);
         // The window policy derives every lane class's table from that rank
-        // (design.md "Evaluation Stages"); a scale of 0 gives zero-width
-        // windows, and derived edges may tie.
+        // (design.md "Evaluation Stages"); derived edges may tie.
         let tables = rule
             .window_policy
             .prepare(&rule.tables, headers.rank)
