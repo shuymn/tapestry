@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use input::{Capture, InputThread, QpcClock, SourceConfig, SourceSet};
+use input::{Capture, InputThread, Phase, QpcClock, SourceConfig, SourceSet, Waker};
 
 /// Sets its flag when dropped, which happens when the thread's hook is.
 struct DropFlag(Arc<AtomicBool>);
@@ -34,15 +34,23 @@ fn dropping_the_input_thread_waits_for_it() {
     let dropped = Arc::new(AtomicBool::new(false));
     let flag = DropFlag(Arc::clone(&dropped));
     let mut blocked = false;
-    let thread = InputThread::spawn(QpcClock::start(), sources, Capture::new(), move |_, _| {
-        let _keep = &flag;
-        if !blocked {
-            // The first wake holds the hook until the test releases it.
-            blocked = true;
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        }
-    })
+    let waker = Waker::new().unwrap();
+    let thread = InputThread::spawn(
+        QpcClock::start(),
+        sources,
+        Capture::new(),
+        &waker,
+        move |_, _| {
+            let _keep = &flag;
+            if !blocked {
+                // The first wake holds the hook until the test releases it.
+                blocked = true;
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            Phase::Tail
+        },
+    )
     .unwrap();
     entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let released = Arc::new(AtomicBool::new(false));

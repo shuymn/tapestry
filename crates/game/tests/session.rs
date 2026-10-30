@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
 use bms_model::{Chart, ChartBuilder, ModelError, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, count_judged, judgments, lane};
+use common::{MS, PERIOD, RATE, count_judged, custom_settings, judgments, lane};
 use eval::{ControlId, InputKind, SourceId};
 use game::{
     AbortCause, ChartIngest, Command, DataRoot, DefaultPolicy, DeviceSettings, FailureAction,
@@ -101,7 +101,7 @@ fn parts(root: &DataRoot, chart: &Chart, events: &Events) -> Parts {
     Parts {
         ingest: Box::new(Built(chart.clone())),
         events: Box::new(events.clone()),
-        ..Parts::standard(root, &Settings::load(root).unwrap().player)
+        ..Parts::standard(root, &custom_settings(root).player)
     }
 }
 
@@ -119,7 +119,7 @@ fn steady_audio(chart: &Chart, bank: Arc<SoundBank>) -> RunnerAudio<Out> {
 }
 
 fn session_with(root: &DataRoot, parts: Parts) -> Session<Out> {
-    let settings = Settings::load(root).unwrap();
+    let settings = custom_settings(root);
     let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config(), parts).unwrap();
     let audio = steady_audio(loaded.chart(), common::bank(loaded.chart()));
     loaded.start(audio, SourceSet::new(common::sources()).unwrap())
@@ -454,12 +454,102 @@ fn malformed_preset_at_retry_keeps_the_old_one() {
 }
 
 #[test]
-fn first_start_writes_the_custom_preset() {
+fn missing_custom_preset_is_written_as_custom() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
     let _s = session(&root, &chart, &Events::default());
     let text = fs::read_to_string(root.preset("custom.toml")).unwrap();
     assert_eq!(game::load_preset_toml(&text).unwrap(), rules::custom());
+}
+
+/// One play of a tap at 1 s pressed 17 ms late, with the settings in
+/// `root`: PERFECT under the custom preset (±20 ms), GREAT under
+/// beatoraja-style (±15 ms at a chart's default rank).
+fn play_17_ms_late(root: &DataRoot) -> PlayReport {
+    let chart = taps(&[(1, 1_000)]);
+    let settings = Settings::load(root).unwrap();
+    let parts = parts(root, &chart, &Events::default());
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config(), parts).unwrap();
+    let audio = steady_audio(loaded.chart(), common::bank(loaded.chart()));
+    let mut s = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
+    let items = vec![
+        connect(0),
+        key(1_017 * MS, 0, 1, 1),
+        key(1_060 * MS, 0, 1, 0),
+    ];
+    s.play(script(items, &[])).unwrap()
+}
+
+/// The judgment of the one tap, and the hash of the preset recorded.
+fn played_under(report: &PlayReport) -> (Judgment, [u8; 32]) {
+    let judged = judgments(&report.live);
+    assert_eq!(judged.len(), 1, "{judged:?}");
+    (judged[0].2, report.record.as_ref().unwrap().preset.sha256)
+}
+
+#[test]
+fn default_preset_is_beatoraja_style() {
+    let (_dir, root) = temp_root();
+    assert!(!root.player_settings().exists());
+    fs::create_dir_all(root.preset("")).unwrap();
+    let report = play_17_ms_late(&root);
+    let text = fs::read_to_string(root.preset("beatoraja-style.toml")).unwrap();
+    assert_eq!(
+        game::load_preset_toml(&text).unwrap(),
+        rules::beatoraja_style()
+    );
+    assert!(!root.preset("custom.toml").exists());
+    assert_eq!(
+        played_under(&report),
+        (
+            Judgment::Great,
+            replay::preset_hash(&rules::beatoraja_style())
+        )
+    );
+}
+
+#[test]
+fn explicit_custom_choice_is_kept() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    fs::write(root.player_settings(), "preset = \"custom.toml\"\n").unwrap();
+    let report = play_17_ms_late(&root);
+    assert_eq!(
+        played_under(&report),
+        (Judgment::Perfect, replay::preset_hash(&rules::custom()))
+    );
+    Settings::load(&root).unwrap().save(&root).unwrap();
+    let saved = fs::read_to_string(root.player_settings()).unwrap();
+    assert!(saved.contains("preset = \"custom.toml\""), "{saved}");
+}
+
+#[test]
+fn missing_preset_key_takes_the_new_default() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    fs::write(root.player_settings(), "visible_time_ms = 600\n").unwrap();
+    let report = play_17_ms_late(&root);
+    assert_eq!(
+        played_under(&report),
+        (
+            Judgment::Great,
+            replay::preset_hash(&rules::beatoraja_style())
+        )
+    );
+}
+
+#[test]
+fn missing_non_standard_preset_is_refused() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&[(1, 1_000)]);
+    let mut settings = Settings::load(&root).unwrap();
+    settings.player.preset = "wide.toml".to_owned();
+    let parts = parts(&root, &chart, &Events::default());
+    let e = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap_err();
+    assert_eq!(e, SessionError::MissingPreset(root.preset("wide.toml")));
+    assert!(e.to_string().contains("wide.toml"), "{e}");
+    // Nothing written: not the named file, nor the presets folder.
+    assert!(!root.preset("").exists());
 }
 
 #[test]
@@ -514,7 +604,7 @@ fn tail_chart() -> (Chart, Arc<SoundBank>) {
 
 fn tail_session(root: &DataRoot, events: &Events) -> Session<Out> {
     let (chart, bank) = tail_chart();
-    let settings = Settings::load(root).unwrap();
+    let settings = custom_settings(root);
     let parts = parts(root, &chart, events);
     let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config(), parts).unwrap();
     loaded.start(
@@ -734,7 +824,7 @@ fn load_refuses_what_it_cannot_use() {
     let chart = taps(&[(1, 1_000)]);
     let events = Events::default();
     let load = |path: &Path| {
-        let settings = Settings::load(&root).unwrap();
+        let settings = custom_settings(&root);
         Loaded::load(
             root.clone(),
             settings,
@@ -771,7 +861,7 @@ fn load_refuses_what_it_cannot_use() {
 fn bad_key_config_refuses_to_play_and_closes_recording() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
-    let mut settings = Settings::load(&root).unwrap();
+    let mut settings = custom_settings(&root);
     // Lanes 1 and 2 on one key: loading the file refuses it, and a
     // session given it all the same refuses to play.
     settings.device.keyboard.lanes[2].control = settings.device.keyboard.lanes[1].control;
@@ -803,7 +893,7 @@ fn passthrough_transform_is_recorded() {
     let (_dir, root) = temp_root();
     let path = common::write_bms(&root.path().join("charts"));
     let bytes = fs::read(&path).unwrap();
-    let settings = Settings::load(&root).unwrap();
+    let settings = custom_settings(&root);
     let parts = Parts::standard(&root, &settings.player);
     let loaded = Loaded::load(root.clone(), settings, &path, config(), parts).unwrap();
     // The chart is the loader's, unchanged.
@@ -890,7 +980,7 @@ fn failing_session(
     fail_from: i64,
     step: i64,
 ) -> Session<Failing> {
-    let settings = Settings::load(root).unwrap();
+    let settings = custom_settings(root);
     let config = SessionConfig {
         step: TimeUs(step),
         ..config()
@@ -1117,7 +1207,7 @@ fn chart_is_read_one_byte_past_the_adapter_limit_at_most() {
             }),
             ..parts(&root, &chart, &Events::default())
         };
-        let settings = Settings::load(&root).unwrap();
+        let settings = custom_settings(&root);
         Loaded::load(root.clone(), settings, &path, config(), parts).unwrap();
         assert_eq!(*seen.borrow(), Some(expected), "limit {max}");
     }
@@ -1125,7 +1215,7 @@ fn chart_is_read_one_byte_past_the_adapter_limit_at_most() {
     let big = root.path().join("big.bms");
     let limit = game::BmsIngest.max_bytes();
     fs::write(&big, vec![b'*'; limit + 5]).unwrap();
-    let settings = Settings::load(&root).unwrap();
+    let settings = custom_settings(&root);
     let parts = Parts::standard(&root, &settings.player);
     assert_eq!(
         Loaded::load(root.clone(), settings, &big, config(), parts).err(),
@@ -1144,7 +1234,7 @@ fn a_step_that_does_not_move_the_clock_is_refused() {
             step: TimeUs(step),
             ..config()
         };
-        let settings = Settings::load(&root).unwrap();
+        let settings = custom_settings(&root);
         let parts = parts(&root, &chart, &Events::default());
         assert_eq!(
             Loaded::load(root.clone(), settings, &chart_file(&root), config, parts).err(),
@@ -1273,7 +1363,7 @@ fn a_transformed_chart_that_breaks_an_invariant_is_refused() {
             transform,
             ..parts(&root, &chart, &Events::default())
         };
-        let settings = Settings::load(&root).unwrap();
+        let settings = custom_settings(&root);
         Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).err()
     };
     assert_eq!(
@@ -1329,7 +1419,7 @@ fn key_sounds_and_bgm_follow_each_play_across_a_retry() {
         .build()
         .unwrap();
     chart.lanes[1][0].sound = Some(SoundId(0));
-    let mut settings = Settings::load(&root).unwrap();
+    let mut settings = custom_settings(&root);
     settings.device.input_offset_us = 3 * MS;
     settings.device.audio_offset_us = 5 * MS;
     settings.save(&root).unwrap();
@@ -1399,7 +1489,7 @@ fn plan_sizes_axes_at_1khz_and_buttons_per_source() {
     // The final deadline is 1180 ms; with the 1 s lead-in the window is
     // 2.18 s, 3 whole seconds.
     let chart = taps(&[(1, 1_000)]);
-    let mut settings = Settings::load(&root).unwrap();
+    let mut settings = custom_settings(&root);
     settings.device.controller.lanes = vec![
         game::LaneKey {
             control: 7,
@@ -1441,7 +1531,7 @@ fn keyboards_bound_only_to_retry_and_quit_add_no_rate() {
     // retry and quit: a press and a release each per keyboard, whatever
     // the window's length.
     let window = |chart: Chart, keyboards: usize| {
-        let mut settings = Settings::load(&root).unwrap();
+        let mut settings = custom_settings(&root);
         settings.device.keyboard.lanes = Vec::new();
         settings.device.controller.lanes = (1..=7)
             .map(|lane| game::LaneKey {
@@ -1475,7 +1565,7 @@ fn keyboards_bound_only_to_retry_and_quit_add_no_rate() {
 
 /// A loaded session of `chart` whose controller binds `axes` axes.
 fn loaded_with_axes(root: &DataRoot, chart: Chart, axes: u32) -> Loaded {
-    let mut settings = Settings::load(root).unwrap();
+    let mut settings = custom_settings(root);
     settings.device.controller.lanes = (0..axes)
         .map(|i| game::LaneKey {
             control: 0x1_0030 + i,
@@ -1577,7 +1667,7 @@ fn a_chart_too_large_to_reserve_is_refused_without_inputs() {
             TimeUs(1_000 * MS + i * MS),
         );
     }
-    let mut settings = Settings::load(&root).unwrap();
+    let mut settings = custom_settings(&root);
     settings.device.keyboard = game::KeyConfig {
         lanes: Vec::new(),
         retry: None,

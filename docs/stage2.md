@@ -143,7 +143,7 @@ egui comes with the first form-like screen.
 | Version | PR | Adds |
 | --- | --- | --- |
 | 1 | PR12 | `roots`; `charts(path UNIQUE, size, mtime_ns, sha256, md5, header fields)` |
-| 2 | PR13 | `norm_text`, `charts_fts` |
+| 2 | PR13 | `norm_text` (the searched fields normalized and joined); `title_key` and `artist_key` (normalized sort keys, so full-width and katakana titles sort with the rest), with the index `charts_title` for the unfiltered title order; `folder` (the path's folder, for grouping without string work per row); `charts_fts` |
 | 3 | PR18 | `meta`, `scores`, `counted` |
 | 4 | PR25 | `loudness` |
 
@@ -167,11 +167,14 @@ egui comes with the first form-like screen.
 
 ### D7. Search and sort
 
-- **Normalization**, applied when indexing and when querying: NFKC, lowercase, and katakana folded to hiragana (U+30A1-U+30F6 minus 0x60).
-- **Long queries (3 or more characters).** The query becomes one FTS5 string: every `"` is doubled, the whole is wrapped in `"…"`, and it is bound as `charts_fts MATCH ?1`.
+- **Normalization**, applied when indexing and when querying: C0 control characters dropped first, then NFKC, lowercase, and katakana folded to hiragana (U+30A1-U+30F6 minus 0x60).
+  - Why the controls go first: neither side then holds NUL, at which SQLite's `LIKE` and string parsing stop, and a control between a base and its combining mark does not keep them from composing.
+  - The searched fields (title, subtitle, artist, subartist, genre) are joined by U+001F, which no normalized query holds, so no match spans two fields.
+- **Characters** are Unicode scalar values of the normalized query, the trigram tokenizer's unit. A query that normalizes to nothing matches every chart.
+- **Long queries (3 or more characters).** The query becomes one FTS5 string: every `"` is doubled, the whole is wrapped in `"…"`, and it is bound as `charts_fts MATCH ?1`. The candidates must also contain the normalized query exactly (`instr(norm_text, ?2) > 0`), since the tokenizer reads U+FFFE and U+FFFF as U+FFFD; both conditions apply before `LIMIT`, so the limit counts only matches.
 - **Short queries.** `norm_text LIKE ?1 ESCAPE '\'`, with `\`, `%` and `_` escaped.
 - **Not exposed.** SQLite's query syntax is never exposed, and there is no transliteration.
-- **Sorting.** By title, artist, level, or file modification time.
+- **Sorting.** By normalized title, normalized artist, level (digit-only levels by value at any length, then other text, then none), or file modification time (newest first). The path is the last key, so the order is total. The title order is indexed.
 - **Grouping and input.** Charts are grouped by folder. Search text arrives through winit IME while the search box has focus.
 
 ### D8. Personal bests: key, eligibility and invalidation
@@ -237,10 +240,11 @@ egui comes with the first form-like screen.
 - Each preset gets a few dozen hand-written examples.
 - An axis is added only when an example fails without it.
 
-**Axes beatoraja-style needs.** beatoraja (exch-bms2/beatoraja@83574048) differs from today's model in seven places, each shown by an example. PR7 lands the values the model expresses and records these in the preset's module with their sources; PR7a–PR7d add them.
+**Axes beatoraja-style needs.** beatoraja (exch-bms2/beatoraja@83574048) differs from today's model in eight places, each shown by an example. PR7 lands the values the model expresses and records these in the preset's module with their sources; PR7a–PR7d add them.
 - **A. Scratch windows:** a separate table for scratch notes, scratch LN ends and scratch empty POOR (PR7a).
 - **F. Rank scaling:** `#DEFEXRANK n` scales by n × 75 / 100 %, and `#RANK 4` by 125 % (PR7a).
 - **B. Note assignment:** which note a press judges when several are in range, and whether earlier notes stay hittable until their late BAD deadline (PR7b).
+- **H. Miss timing:** a note is missed strictly after its late BAD edge, so a press on another lane at that time is judged first, which can change combo and gauge (PR7b, with the miss policy).
 - **C, D, E. Gauges:** HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))` (PR7c). N is the whole chart's count, practice included.
 - **G. A BAD long-note head:** it keeps holding and is scored at the release or the end (PR7d).
 
@@ -681,12 +685,13 @@ Analysis runs at 1× and its result is reused at every speed.
 
 ### PR7b. Note assignment policy (`rules`, `eval`)
 
-**Touches.** the assignment step in `eval`, the preset's policy field, the canonical encoding, style_beatoraja.rs, the generators and the props.
+**Touches.** the assignment step and miss deadlines in `eval`, the preset's policy fields, the canonical encoding, style_beatoraja.rs, the generators and the props.
 
 **Depends on.** PR7a.
 
 **Done when.**
 - When several notes on a lane are in range under beatoraja-style, the press shall judge the note beatoraja's combo-priority algorithm picks, and earlier notes shall stay hittable until their late BAD deadline (`combo_priority_assignment_matches_the_source`).
+- When a note's late BAD edge and another lane's press fall at the same time under beatoraja-style, the press shall be judged first (`miss_is_decided_after_the_edge`).
 - When the custom preset runs, assignment shall stay nearest-first with overtaking, and every existing example shall pass unchanged.
 - When the props run, incremental and batch evaluation shall agree under every assignment value.
 
@@ -769,7 +774,8 @@ Each one holds the behavior D17 states.
 - When a Japanese title is drawn with the pinned font, the WARP image shall match within tolerance (`japanese_title_renders_on_warp`).
 - If the font hash differs, then the test shall fail and name both hashes.
 - When the runtime chooses a font, it shall pick the first present in order (`runtime_font_falls_back_in_order`).
-- When a glyph is drawn twice on one screen, it shall not be rasterized again (`glyphs_are_cached_per_screen`).
+- While a glyph is in a screen's atlas, a later prepare that does not grow the atlas shall not rasterize it again (`glyphs_are_cached_per_screen`).
+- When a prepare grows a screen's atlas, the glyphs already drawn shall draw the same afterwards (`atlas_growth_keeps_drawn_glyphs`).
 
 ### PR12. Library database and scanning (`library` new crate, `bms-parser`)
 

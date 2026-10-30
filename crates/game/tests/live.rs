@@ -9,7 +9,7 @@ mod common;
 use std::path::Path;
 
 use bms_model::{Chart, ChartBuilder, TimeSource, TimeUs, VirtualClock};
-use common::{MS, lane};
+use common::{MS, custom_settings, lane};
 use eval::{ControlId, InputKind, JudgeEventKind, SourceId};
 use game::{
     AbortCause, AudioControl, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
@@ -62,7 +62,7 @@ fn chart() -> Chart {
 
 fn loaded(dir: &Path) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let mut settings = Settings::load(&root).unwrap();
+    let mut settings = custom_settings(&root);
     settings.device.input_offset_us = OFFSET;
     let chart_path = dir.join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
@@ -930,7 +930,7 @@ fn every_step_is_measured() {
 /// first, so one step can judge two presses.
 fn chord_loaded(dir: &Path) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = Settings::load(&root).unwrap();
+    let settings = custom_settings(&root);
     let chart_path = dir.join("chord.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
     let chart = ChartBuilder::new(150_000)
@@ -1003,7 +1003,7 @@ impl game::RecordSink for NotingSink {
 fn the_play_is_over_before_it_is_saved() {
     let dir = tempfile::tempdir().unwrap();
     let root = DataRoot::new(dir.path().to_owned());
-    let settings = Settings::load(&root).unwrap();
+    let settings = custom_settings(&root);
     let chart_path = dir.path().join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
     let order = std::sync::Arc::default();

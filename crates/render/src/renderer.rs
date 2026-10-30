@@ -3,6 +3,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bms_model::Chart;
@@ -15,7 +16,11 @@ use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
 use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::text_screen;
+use crate::text::MenuText;
 use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
+
+/// The next [`Renderer`]'s id.
+static RENDERERS: AtomicU64 = AtomicU64::new(0);
 
 /// Sprites one frame can draw, across both blends.
 pub const MAX_SPRITES: usize = 8_192;
@@ -107,6 +112,12 @@ pub enum RenderError {
     /// must be built again.
     #[error("surface lost")]
     SurfaceLost,
+    /// A menu's text could not be drawn as prepared.
+    #[error("text")]
+    Text(#[source] glyphon::RenderError),
+    /// A menu's text was made for another renderer, whose device it uses.
+    #[error("text: made for another renderer")]
+    OtherRenderersText,
 }
 
 /// What one frame cost and drew.
@@ -167,9 +178,13 @@ enum Output {
 
 /// The play screen renderer.
 pub struct Renderer {
+    /// Unique among the renderers of the process, for the menu text tied to
+    /// this one's device.
+    id: u64,
     gpu: Gpu,
     output: Output,
     size: (u32, u32),
+    format: wgpu::TextureFormat,
     alpha: wgpu::RenderPipeline,
     additive: wgpu::RenderPipeline,
     atlas_bind: wgpu::BindGroup,
@@ -258,6 +273,7 @@ impl Renderer {
             gpu,
             output,
             size,
+            format,
             alpha,
             additive,
             atlas_bind,
@@ -266,13 +282,25 @@ impl Renderer {
             staging: Vec::with_capacity(MAX_SPRITES),
             skin: Box::new(SimpleSkin::new()),
             started: None,
+            id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// Identifies this renderer and its device among the process's
+    /// renderers.
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
     }
 
     /// The target's size in pixels.
     #[must_use]
     pub const fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// The target's pixel format.
+    pub(crate) const fn format(&self) -> wgpu::TextureFormat {
+        self.format
     }
 
     /// The device, queue and adapter in use.
@@ -355,7 +383,7 @@ impl Renderer {
     pub fn submit(&mut self) -> Result<FrameTiming, RenderError> {
         debug_assert!(self.started.is_some(), "submit without a build");
         let start = self.started.take().unwrap_or_else(Instant::now);
-        self.draw(start)
+        self.draw(start, None)
     }
 
     /// Draws a screen of text lines in the bitmap font instead of the skin
@@ -370,12 +398,42 @@ impl Renderer {
         self.batch.clear();
         text_screen(lines, &mut self.batch);
         self.batch.stage(&mut self.staging);
-        self.draw(start)
+        self.draw(start, None)
     }
 
-    /// Submits and presents the staged batch; `start` is when the frame's
-    /// work began.
-    fn draw(&mut self, start: Instant) -> Result<FrameTiming, RenderError> {
+    /// Draws a menu screen, as [`frame`](Self::frame) draws: the sprites
+    /// `sprites` pushes, then in a pass of its own the text last prepared
+    /// on `text` (design.md "Rendering and Skins"). Menus only; play
+    /// frames never draw text this way.
+    ///
+    /// # Errors
+    ///
+    /// As [`frame`](Self::frame); [`RenderError::OtherRenderersText`],
+    /// drawing nothing, when `text` was made for another renderer (one this
+    /// replaced: the screen makes and prepares its text again); and
+    /// [`RenderError::Text`] when glyphon cannot draw it as prepared.
+    pub fn menu_frame(
+        &mut self,
+        sprites: impl FnOnce(&mut SpriteBatch),
+        text: &MenuText,
+    ) -> Result<FrameTiming, RenderError> {
+        if text.owner() != self.id {
+            return Err(RenderError::OtherRenderersText);
+        }
+        let start = Instant::now();
+        self.batch.clear();
+        sprites(&mut self.batch);
+        self.batch.stage(&mut self.staging);
+        self.draw(start, Some(text))
+    }
+
+    /// Submits and presents the staged batch, then `text` in its own pass
+    /// when there is one; `start` is when the frame's work began.
+    fn draw(
+        &mut self,
+        start: Instant,
+        text: Option<&MenuText>,
+    ) -> Result<FrameTiming, RenderError> {
         let alpha = self.batch.alpha().len() as u32;
         let sprites = self.staging.len();
         let timing = |cpu, presented| FrameTiming {
@@ -442,6 +500,25 @@ impl Renderer {
             pass.draw(0..4, 0..alpha);
             pass.set_pipeline(&self.additive);
             pass.draw(0..4, alpha..sprites as u32);
+        }
+        if let Some(text) = text {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("menu text"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            text.render(&mut pass).map_err(RenderError::Text)?;
         }
         queue.submit([encoder.finish()]);
         let cpu = start.elapsed() - acquired;
@@ -785,12 +862,19 @@ mod tests {
         };
         let e = RenderError::Skin(skin.clone());
         assert_eq!(the_cause::<SkinError>(&e, "skin"), &skin);
+
+        let changed = glyphon::RenderError::ScreenResolutionChanged;
+        let e = RenderError::Text(changed);
+        assert_eq!(the_cause::<glyphon::RenderError>(&e, "text"), &changed);
     }
 
     #[test]
     fn leaf_failures_name_their_reason() {
         assert!(RenderError::SurfaceLost.source().is_none());
         assert!(RenderError::SurfaceUnsupported.source().is_none());
+        let e = RenderError::OtherRenderersText;
+        assert!(e.source().is_none());
+        assert_eq!(e.to_string(), "text: made for another renderer");
         let e = RenderError::NoSoftwareAdapter {
             names: vec!["GPU".to_owned()],
         };

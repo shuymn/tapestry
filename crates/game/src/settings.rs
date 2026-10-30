@@ -637,7 +637,7 @@ pub struct PlayerSettings {
     /// the lane to the judgment line at the chart's start BPM (design.md
     /// "Algorithms").
     pub visible_time_ms: u32,
-    /// The preset file in `presets/`.
+    /// The preset file in `presets/`; beatoraja-style by default.
     pub preset: String,
     /// The gauge shown, by its index in the preset.
     pub displayed_gauge: usize,
@@ -647,7 +647,7 @@ impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
             visible_time_ms: DEFAULT_VISIBLE_TIME_MS,
-            preset: "custom.toml".to_owned(),
+            preset: "beatoraja-style.toml".to_owned(),
             displayed_gauge: 0,
         }
     }

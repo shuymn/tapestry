@@ -24,7 +24,7 @@ use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
-    PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions,
+    PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions, WakePolicy,
 };
 use rules::{GaugeKind, RulePreset};
 
@@ -203,6 +203,10 @@ pub enum SessionError {
     /// The preset file could not be used.
     #[error(transparent)]
     Preset(PresetError),
+    /// The preset file `player.toml` names does not exist and is not a
+    /// standard preset, so nothing was written.
+    #[error("the preset file {} does not exist", .0.display())]
+    MissingPreset(PathBuf),
     /// The chart transform's output breaks a chart invariant
     /// ([`Chart::validate`]).
     #[error("the transformed chart is invalid")]
@@ -405,14 +409,16 @@ pub struct PlayOutcome {
 }
 
 impl Loaded {
-    /// Reads the preset named in `player.toml`, writing the custom preset
-    /// there first if the file does not exist, then ingests the chart and
-    /// applies the transform.
+    /// Reads the preset named in `player.toml`, then ingests the chart and
+    /// applies the transform. A missing standard preset file is written
+    /// first: `custom.toml` or `beatoraja-style.toml`.
     ///
     /// # Errors
     ///
-    /// [`SessionError`] for a step that is not positive, an unreadable
-    /// preset or chart, or a chart no adapter reads.
+    /// [`SessionError`] for a step that is not positive, a missing preset
+    /// file that is not a standard preset
+    /// ([`SessionError::MissingPreset`]), an unreadable preset or chart, or
+    /// a chart no adapter reads.
     pub fn load(
         root: DataRoot,
         settings: Settings,
@@ -442,10 +448,12 @@ impl Loaded {
         }
         let preset_path = root.preset(&settings.player.preset);
         if !preset_path.exists() {
+            let standard = standard_preset(&settings.player.preset)
+                .ok_or_else(|| SessionError::MissingPreset(preset_path.clone()))?;
             if let Some(dir) = preset_path.parent() {
                 fs::create_dir_all(dir).map_err(io_error(dir))?;
             }
-            let text = preset_to_toml(&rules::custom());
+            let text = preset_to_toml(&standard);
             write_atomic(&preset_path, text.as_bytes()).map_err(io_error(&preset_path))?;
         }
         let (preset, preset_modified) = read_preset(&preset_path).map_err(|e| match e {
@@ -828,6 +836,7 @@ impl Loaded {
                     .collect(),
                 audio_offset: TimeUs(settings.device.audio_offset_us),
                 display_offset: TimeUs(settings.device.display_offset_us),
+                wake: wake_policy(config.receive),
             },
             play_type: PlayType::Full,
             start: record.start,
@@ -884,6 +893,17 @@ fn generated() -> eval::SourceProfile {
         input_offset: TimeUs(0),
         bindings: KeyConfig::autoplay().bindings(DeviceKind::Keyboard),
         axes: Vec::new(),
+    }
+}
+
+/// The standard preset a missing file of this name is written with
+/// (design.md "Standard Presets"): `custom.toml` and
+/// `beatoraja-style.toml`. `None` for any other name.
+fn standard_preset(file: &str) -> Option<RulePreset> {
+    match file {
+        "custom.toml" => Some(rules::custom()),
+        "beatoraja-style.toml" => Some(rules::beatoraja_style()),
+        _ => None,
     }
 }
 
@@ -1163,6 +1183,24 @@ const fn replay_kind(kind: DeviceKind) -> replay::DeviceKind {
     match kind {
         DeviceKind::Keyboard => replay::DeviceKind::Keyboard,
         DeviceKind::Controller => replay::DeviceKind::Controller,
+    }
+}
+
+/// The wake policy of the input thread that receives input `receive`'s
+/// way: the Raw Input thread wakes on input, the thread of generated input
+/// on its timer (design.md "Raw Input reception", "Autoplay").
+#[must_use]
+pub fn wake_policy(receive: ReceiveMethod) -> WakePolicy {
+    use input::cadence::{DRAIN_CUT, HEARTBEAT, INPUT_GAP};
+    let us = |t: TimeUs| u32::try_from(t.0).unwrap_or(u32::MAX);
+    let (heartbeat_us, input_gap_us) = (us(HEARTBEAT), us(INPUT_GAP));
+    match receive {
+        ReceiveMethod::RawInput => WakePolicy::Input {
+            heartbeat_us,
+            input_gap_us,
+            drain_cut: DRAIN_CUT,
+        },
+        ReceiveMethod::Scripted => WakePolicy::Timer { heartbeat_us },
     }
 }
 

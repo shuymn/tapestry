@@ -24,7 +24,7 @@ const fn damage(v: GaugeValue) -> GaugeDelta {
     GaugeDelta::Fixed(GaugeValue(-v.0))
 }
 
-/// The custom preset, the default.
+/// The custom preset.
 #[must_use]
 pub fn custom() -> RulePreset {
     let full_share = GaugeDelta::TotalShare { num: 1, den: 1 };

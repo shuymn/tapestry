@@ -95,7 +95,7 @@ fn missing_files_give_the_defaults() {
     let s = Settings::load(&root).unwrap();
     assert_eq!(s.device, DeviceSettings::default());
     assert_eq!(s.player, PlayerSettings::default());
-    assert_eq!(s.player.preset, "custom.toml");
+    assert_eq!(s.player.preset, "beatoraja-style.toml");
 }
 
 #[test]
@@ -546,6 +546,9 @@ fn sample() -> replay::PlayRecord {
             sources: Vec::new(),
             audio_offset: TimeUs(0),
             display_offset: TimeUs(0),
+            wake: replay::WakePolicy::Timer {
+                heartbeat_us: 1_000,
+            },
         },
         play_type: replay::PlayType::Full,
         start: eval::InputStart::default(),

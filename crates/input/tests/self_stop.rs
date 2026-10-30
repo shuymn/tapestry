@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use input::{Capture, InputError, InputThread, QpcClock, SourceConfig, SourceSet};
+use input::{Capture, InputError, InputThread, Phase, QpcClock, SourceConfig, SourceSet, Waker};
 
 /// Sets its flag when dropped, which happens when the thread's hook is.
 struct DropFlag(Arc<AtomicBool>);
@@ -33,16 +33,24 @@ fn stopping_from_the_input_thread_detaches_it() {
     let (result_tx, result_rx) = mpsc::channel();
     let dropped = Arc::new(AtomicBool::new(false));
     let flag = DropFlag(Arc::clone(&dropped));
-    let thread = InputThread::spawn(QpcClock::start(), sources, Capture::new(), move |_, _| {
-        let _keep = &flag;
-        if let Ok(own) = handle_rx.try_recv() {
-            // Joining itself here would never return.
-            let stopped = own.stop();
-            result_tx
-                .send(matches!(stopped, Err(InputError::StopFromWorker)))
-                .unwrap();
-        }
-    })
+    let waker = Waker::new().unwrap();
+    let thread = InputThread::spawn(
+        QpcClock::start(),
+        sources,
+        Capture::new(),
+        &waker,
+        move |_, _| {
+            let _keep = &flag;
+            if let Ok(own) = handle_rx.try_recv() {
+                // Joining itself here would never return.
+                let stopped = own.stop();
+                result_tx
+                    .send(matches!(stopped, Err(InputError::StopFromWorker)))
+                    .unwrap();
+            }
+            Phase::Tail
+        },
+    )
     .unwrap();
     handle_tx.send(thread).unwrap();
     let stopped_with_error = result_rx.recv_timeout(Duration::from_secs(10));
