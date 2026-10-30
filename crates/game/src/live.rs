@@ -45,7 +45,9 @@ use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::policy::SessionEvent;
 use crate::practice::{FADE, RING_OUT};
 use crate::render::RenderSide;
-use crate::session::{Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, Settings};
+use crate::session::{
+    Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, PresetReload, Settings,
+};
 use crate::sound::{AudioQueue, audio_link_at};
 
 /// What opening recording gave.
@@ -210,6 +212,13 @@ pub trait Rig {
     fn ended(&mut self, report: &PlayReport);
     /// Shows the end screen of a play that neither quit nor retried.
     fn show_end(&mut self, report: &PlayReport);
+    /// While the end screen of `report` shows, a poll found the chosen
+    /// preset reloaded, with the play re-evaluated under it, or its file
+    /// failing to load (design.md "Tuning Without Restart"). By default
+    /// nothing is shown.
+    fn preset_reloaded(&mut self, report: &PlayReport, reload: &PresetReload) {
+        let _ = (report, reload);
+    }
     /// Before each play opens recording: settings changed since the previous
     /// play are written into `settings`, which the play is evaluated and
     /// recorded with. The input offset changes only here, so a change takes
@@ -314,6 +323,11 @@ pub fn run_chart<R: Rig>(
             rig.wait();
             if rig.quitting() {
                 return leave(rig);
+            }
+            // The user preset files are polled while the result shows, never
+            // during a play; a reload is used by plays from the next one on.
+            if let Some(reload) = loaded.poll_presets(rig.now(), &report) {
+                rig.preset_reloaded(&report, &reload);
             }
             // Retry and back are taken before the screen is rebuilt, so a
             // known input failure ends the run without another handshake

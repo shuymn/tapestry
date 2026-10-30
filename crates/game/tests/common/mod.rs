@@ -18,9 +18,9 @@ pub const MS: i64 = 1_000;
 
 /// The settings in `root`, naming the tapestry preset: for tests whose values
 /// are the tapestry preset's.
-pub fn custom_settings(root: &DataRoot) -> Settings {
+pub fn tapestry_settings(root: &DataRoot) -> Settings {
     let mut settings = Settings::load(root).unwrap();
-    settings.player.preset = "tapestry.toml".to_owned();
+    settings.player.preset = "tapestry".to_owned();
     settings
 }
 

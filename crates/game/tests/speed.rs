@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice};
 use bms_model::{Speed, TimeUs};
-use common::{MS, PERIOD, RATE, custom_settings, judgments};
+use common::{MS, PERIOD, RATE, judgments, tapestry_settings};
 use eval::{ControlId, JudgeEventKind};
 use game::{
     Command, DataRoot, DeviceSettings, Loaded, Parts, PlayEnd, PlayReport, PlayScript, RunnerAudio,
@@ -90,7 +90,7 @@ fn play(
     speed: Speed,
     presses: impl FnOnce(&bms_model::Chart) -> Vec<(u8, i64)>,
 ) -> (bms_model::Chart, PlayReport) {
-    let settings = custom_settings(root);
+    let settings = tapestry_settings(root);
     let parts = Parts::standard(root, &settings.player);
     let path = chart_file(root, text);
     let loaded = Loaded::load(root.clone(), settings, &path, config(speed), parts).unwrap();

@@ -21,6 +21,7 @@
 )]
 
 mod beatoraja_style;
+mod built_in;
 mod canonical;
 mod error;
 mod gauge_rules;
@@ -32,6 +33,7 @@ mod validate;
 mod windows;
 
 pub use beatoraja_style::beatoraja_style;
+pub use built_in::{BUILT_IN_PRESETS, built_in};
 pub use error::{CanonicalError, RuleError, Side};
 pub use headers::{HeaderPolicy, JudgeRank, ReadHeaders};
 pub use lr2_style::lr2_style;

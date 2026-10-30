@@ -19,6 +19,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::IoFailure;
+use crate::presets::UnknownPreset;
 use crate::queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS};
 use crate::save::write_atomic;
 use crate::tuning::{Adjust, DEFAULT_VISIBLE_TIME_MS, OFFSET_LIMIT_US, VISIBLE_TIME_MS};
@@ -52,10 +53,10 @@ impl DataRoot {
         self.0.join("player.toml")
     }
 
-    /// The preset file named `name` in `presets/`.
+    /// `presets/`, the user preset files.
     #[must_use]
-    pub fn preset(&self, name: &str) -> PathBuf {
-        self.0.join("presets").join(name)
+    pub fn presets(&self) -> PathBuf {
+        self.0.join("presets")
     }
 
     /// `records/`.
@@ -137,6 +138,9 @@ pub enum PlayerSettingsError {
         end = VISIBLE_TIME_MS.end()
     )]
     VisibleTime(u32),
+    /// A preset value that can name neither a built-in nor a user preset.
+    #[error(transparent)]
+    Preset(UnknownPreset),
 }
 
 /// A control bound to a lane, in a settings file.
@@ -637,7 +641,9 @@ pub struct PlayerSettings {
     /// the lane to the judgment line at the chart's start BPM (design.md
     /// "Algorithms").
     pub visible_time_ms: u32,
-    /// The preset file in `presets/`; beatoraja-style by default.
+    /// The preset plays use, by name: a built-in's, or a user preset's in
+    /// `presets/` (design.md "Standard Presets", "User Presets");
+    /// `beatoraja-style` by default.
     pub preset: String,
     /// The gauge shown, by its index in the preset.
     pub displayed_gauge: usize,
@@ -647,21 +653,32 @@ impl Default for PlayerSettings {
     fn default() -> Self {
         Self {
             visible_time_ms: DEFAULT_VISIBLE_TIME_MS,
-            preset: "beatoraja-style.toml".to_owned(),
+            preset: "beatoraja-style".to_owned(),
             displayed_gauge: 0,
         }
     }
 }
 
 impl PlayerSettings {
-    /// Checks the visible time is within [`VISIBLE_TIME_MS`].
+    /// Checks the visible time is within [`VISIBLE_TIME_MS`], and that the
+    /// preset is a built-in's name or one a user preset can take. Whether
+    /// that user preset exists is checked when it is loaded ([`Shelf`]).
     ///
     /// # Errors
     ///
-    /// The value outside its range, for the player.
+    /// The value that cannot be used, for the player.
+    ///
+    /// [`Shelf`]: crate::presets::Shelf
     pub fn validate(&self) -> Result<(), PlayerSettingsError> {
         if !VISIBLE_TIME_MS.contains(&self.visible_time_ms) {
             return Err(PlayerSettingsError::VisibleTime(self.visible_time_ms));
+        }
+        if rules::built_in(&self.preset).is_none()
+            && rules_toml::check_user_preset_name(&self.preset).is_err()
+        {
+            return Err(PlayerSettingsError::Preset(UnknownPreset(
+                self.preset.clone(),
+            )));
         }
         Ok(())
     }

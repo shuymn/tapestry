@@ -14,13 +14,14 @@ use std::time::{Duration, SystemTime};
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
 use bms_model::{Chart, ChartBuilder, ModelError, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, count_judged, custom_settings, judgments, lane};
+use common::{MS, PERIOD, RATE, count_judged, judgments, lane, tapestry_settings};
 use eval::{ControlId, InputKind, SourceId};
 use game::{
     AbortCause, ChartIngest, Command, DataRoot, DefaultPolicy, DeviceSettings, FailureAction,
     GaugeIndex, IngestError, Ingested, Loaded, Parts, PlayEnd, PlayReport, PlayScript, PresetError,
-    ReEvaluate, ReloadError, RunnerAudio, SaveError, Session, SessionConfig, SessionError,
-    SessionEvent, SessionEventSink, SessionPolicy, Settings, preset_to_toml,
+    PresetFileCause, PresetFileError, ReEvaluate, RunnerAudio, SaveError, Session, SessionConfig,
+    SessionError, SessionEvent, SessionEventSink, SessionPolicy, Settings, ShelfError,
+    UnknownPreset, preset_to_toml,
 };
 use input::{Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceSet};
 use replay::{BuildProvenance, DecodeLimits, EndStatus, ReceiveMethod};
@@ -108,7 +109,7 @@ fn parts(root: &DataRoot, chart: &Chart, events: &Events) -> Parts {
     Parts {
         ingest: Box::new(Built(chart.clone())),
         events: Box::new(events.clone()),
-        ..Parts::standard(root, &custom_settings(root).player)
+        ..Parts::standard(root, &tapestry_settings(root).player)
     }
 }
 
@@ -126,7 +127,7 @@ fn steady_audio(chart: &Chart, bank: Arc<SoundBank>) -> RunnerAudio<Out> {
 }
 
 fn session_with(root: &DataRoot, parts: Parts) -> Session<Out> {
-    let settings = custom_settings(root);
+    let settings = tapestry_settings(root);
     let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config(), parts).unwrap();
     let audio = steady_audio(loaded.chart(), common::bank(loaded.chart()));
     loaded.start(audio, SourceSet::new(common::sources()).unwrap())
@@ -365,14 +366,35 @@ fn suspend_abort_is_ended_midway_and_incomplete() {
     assert_eq!(count_judged(&one.live, Judgment::Perfect), 2);
 }
 
-/// The tapestry preset with PERFECT widened to 30 ms each side.
+/// The tapestry preset with PERFECT widened to 30 ms each side, named
+/// `wide`, as `presets/wide.toml` loads it.
 fn wide_perfect() -> rules::RulePreset {
-    let mut p = rules::tapestry();
-    p.id = "wide".to_owned();
+    let mut p = named("wide", rules::tapestry());
     for t in p.tables.each_mut() {
         t.windows.perfect = rules::Window::symmetric(30 * MS);
     }
     p
+}
+
+/// `preset` named `name`, as a user preset file of it loads.
+fn named(name: &str, preset: rules::RulePreset) -> rules::RulePreset {
+    rules::RulePreset {
+        id: name.to_owned(),
+        ..preset
+    }
+}
+
+/// `presets/<name>.toml` in `root`.
+fn user_preset_path(root: &DataRoot, name: &str) -> PathBuf {
+    root.presets().join(format!("{name}.toml"))
+}
+
+/// Writes `preset` to `presets/<name>.toml` in `root`.
+fn write_user_preset(root: &DataRoot, name: &str, preset: &rules::RulePreset) -> PathBuf {
+    fs::create_dir_all(root.presets()).unwrap();
+    let path = user_preset_path(root, name);
+    fs::write(&path, preset_to_toml(preset)).unwrap();
+    path
 }
 
 fn rewrite(path: &Path, text: &str) {
@@ -387,17 +409,47 @@ fn rewrite(path: &Path, text: &str) {
         .unwrap();
 }
 
+/// A session whose `player.toml` names `preset`.
+fn session_named(root: &DataRoot, chart: &Chart, events: &Events, preset: &str) -> Session<Out> {
+    let mut settings = tapestry_settings(root);
+    settings.player.preset = preset.to_owned();
+    let parts = parts(root, chart, events);
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config(), parts).unwrap();
+    let audio = steady_audio(loaded.chart(), common::bank(loaded.chart()));
+    loaded.start(audio, SourceSet::new(common::sources()).unwrap())
+}
+
+/// [`Loaded::load`] with `player.toml` naming `preset`.
+fn load_named(root: &DataRoot, preset: &str) -> Result<Loaded, SessionError> {
+    let chart = taps(&[(1, 1_000)]);
+    let mut settings = tapestry_settings(root);
+    settings.player.preset = preset.to_owned();
+    let parts = parts(root, &chart, &Events::default());
+    Loaded::load(root.clone(), settings, &chart_file(root), config(), parts)
+}
+
+/// Every file under `root`'s presets folder, by name; empty when the folder
+/// does not exist.
+fn presets_folder(root: &DataRoot) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(root.presets())
+        .map(|d| {
+            d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
 #[test]
 fn changed_preset_file_applies_from_next_retry_only() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
     let events = Events::default();
-    let mut s = session(&root, &chart, &events);
+    let path = write_user_preset(&root, "wide", &rules::tapestry());
+    let mut s = session_named(&root, &chart, &events, "wide");
     // Changed after loading, before the first play.
-    rewrite(
-        &root.preset("tapestry.toml"),
-        &preset_to_toml(&wide_perfect()),
-    );
+    rewrite(&path, &preset_to_toml(&wide_perfect()));
     // A press 25 ms late: GREAT under the tapestry preset, PERFECT under the
     // changed one.
     let late = |items: Vec<ScriptItem>| {
@@ -419,7 +471,7 @@ fn changed_preset_file_applies_from_next_retry_only() {
     );
     assert_eq!(
         one.record.as_ref().unwrap().preset.sha256,
-        replay::preset_hash(&rules::tapestry())
+        replay::preset_hash(&named("wide", rules::tapestry()))
     );
     assert_eq!(
         two.record.as_ref().unwrap().preset.sha256,
@@ -433,42 +485,36 @@ fn malformed_preset_at_retry_keeps_the_old_one() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
     let events = Events::default();
-    let mut s = session(&root, &chart, &events);
+    let path = write_user_preset(&root, "mine", &rules::tapestry());
+    let mut s = session_named(&root, &chart, &events, "mine");
     let one = s
         .play(script(vec![connect(0)], &[(-500 * MS, Command::Retry)]))
         .unwrap();
-    rewrite(&root.preset("tapestry.toml"), "windows = [");
+    rewrite(&path, "windows = [");
     let two = s
         .play(script(Vec::new(), &[(-500 * MS, Command::Retry)]))
         .unwrap();
-    fs::remove_file(root.preset("tapestry.toml")).unwrap();
+    fs::remove_file(&path).unwrap();
     let three = s.play(script(Vec::new(), &[])).unwrap();
 
     assert_eq!(one.reload_error, None);
-    assert!(matches!(
-        two.reload_error,
-        Some(ReloadError::Preset(PresetError::Parse(_)))
-    ));
+    let e = two.reload_error.as_ref().unwrap();
+    assert_eq!(e.path, path);
+    assert!(
+        matches!(&e.cause, PresetFileCause::Preset(PresetError::Parse(_))),
+        "{e:?}"
+    );
     assert_eq!(
         three.reload_error,
-        Some(ReloadError::Io(std::io::ErrorKind::NotFound))
+        Some(PresetFileError::io(path, std::io::ErrorKind::NotFound))
     );
     for r in [&two, &three] {
         assert_eq!(
             r.record.as_ref().unwrap().preset.sha256,
-            replay::preset_hash(&rules::tapestry())
+            replay::preset_hash(&named("mine", rules::tapestry()))
         );
     }
     assert_eq!(three.end, PlayEnd::Completed);
-}
-
-#[test]
-fn missing_custom_preset_is_written_as_custom() {
-    let (_dir, root) = temp_root();
-    let chart = taps(&[(1, 1_000)]);
-    let _s = session(&root, &chart, &Events::default());
-    let text = fs::read_to_string(root.preset("tapestry.toml")).unwrap();
-    assert_eq!(game::load_preset_toml(&text).unwrap(), rules::tapestry());
 }
 
 /// One play of a tap at 1 s pressed 17 ms late, with the settings in
@@ -500,14 +546,7 @@ fn played_under(report: &PlayReport) -> (Judgment, [u8; 32]) {
 fn default_preset_is_beatoraja_style() {
     let (_dir, root) = temp_root();
     assert!(!root.player_settings().exists());
-    fs::create_dir_all(root.preset("")).unwrap();
     let report = play_17_ms_late(&root);
-    let text = fs::read_to_string(root.preset("beatoraja-style.toml")).unwrap();
-    assert_eq!(
-        game::load_preset_toml(&text).unwrap(),
-        rules::beatoraja_style()
-    );
-    assert!(!root.preset("tapestry.toml").exists());
     assert_eq!(
         played_under(&report),
         (
@@ -517,19 +556,216 @@ fn default_preset_is_beatoraja_style() {
     );
 }
 
+/// No `player.toml` and an empty presets folder: the first play is
+/// evaluated and recorded under the built-in beatoraja-style, and nothing
+/// is written to the folder.
 #[test]
-fn explicit_custom_choice_is_kept() {
+fn built_ins_are_never_written() {
     let (_dir, root) = temp_root();
-    fs::create_dir_all(root.path()).unwrap();
-    fs::write(root.player_settings(), "preset = \"tapestry.toml\"\n").unwrap();
+    assert!(!root.player_settings().exists());
+    fs::create_dir_all(root.presets()).unwrap();
     let report = play_17_ms_late(&root);
     assert_eq!(
         played_under(&report),
-        (Judgment::Perfect, replay::preset_hash(&rules::tapestry()))
+        (
+            Judgment::Great,
+            replay::preset_hash(&rules::beatoraja_style())
+        )
     );
-    Settings::load(&root).unwrap().save(&root).unwrap();
-    let saved = fs::read_to_string(root.player_settings()).unwrap();
-    assert!(saved.contains("preset = \"tapestry.toml\""), "{saved}");
+    assert_eq!(report.record.as_ref().unwrap().preset.id, "beatoraja-style");
+    assert!(presets_folder(&root).is_empty());
+}
+
+/// Each built-in is chosen by its name, without reading the presets
+/// folder: files there named like the built-ins, or not presets at all,
+/// change nothing. The shelf lists the three, and saving keeps the name.
+#[test]
+fn built_ins_are_chosen_by_name() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.presets()).unwrap();
+    for name in rules::BUILT_IN_PRESETS {
+        fs::write(user_preset_path(&root, name), "not a preset").unwrap();
+    }
+    for (name, preset) in [
+        ("tapestry", rules::tapestry()),
+        ("beatoraja-style", rules::beatoraja_style()),
+        ("lr2-style", rules::lr2_style()),
+    ] {
+        let mut settings = Settings::load(&root).unwrap();
+        settings.player.preset = name.to_owned();
+        settings.save(&root).unwrap();
+        let report = play_17_ms_late(&root);
+        assert_eq!(report.preset, preset, "{name}");
+        assert_eq!(
+            report.record.as_ref().unwrap().preset.sha256,
+            replay::preset_hash(&preset)
+        );
+        let loaded = load_named(&root, name).unwrap();
+        let built_ins: Vec<&str> = loaded
+            .shelf()
+            .entries()
+            .into_iter()
+            .filter(|e| e.built_in)
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(built_ins, rules::BUILT_IN_PRESETS);
+        assert_eq!(loaded.shelf().chosen_name(), name);
+        Settings::load(&root).unwrap().save(&root).unwrap();
+        let saved = fs::read_to_string(root.player_settings()).unwrap();
+        assert!(saved.contains(&format!("preset = \"{name}\"")), "{saved}");
+    }
+    // The files were never replaced.
+    for name in rules::BUILT_IN_PRESETS {
+        let text = fs::read_to_string(user_preset_path(&root, name)).unwrap();
+        assert_eq!(text, "not a preset");
+    }
+    // A file named like the chosen built-in changing or going away changes
+    // nothing for it.
+    let mut shelf = game::Shelf::open(root.presets(), "tapestry").unwrap();
+    let path = user_preset_path(&root, "tapestry");
+    rewrite(&path, &preset_to_toml(&rules::lr2_style()));
+    assert_eq!(shelf.check(), None);
+    fs::remove_file(&path).unwrap();
+    assert_eq!(shelf.check(), None);
+    assert_eq!(shelf.chosen(), &rules::tapestry());
+}
+
+/// A user preset is `presets/<name>.toml`, its stem its preset ID; the
+/// shelf lists it beside the built-ins.
+#[test]
+fn user_preset_is_named_by_its_stem() {
+    let (_dir, root) = temp_root();
+    write_user_preset(&root, "my-rules_2", &rules::tapestry());
+    write_user_preset(&root, "other", &rules::lr2_style());
+    let mut settings = Settings::load(&root).unwrap();
+    settings.player.preset = "my-rules_2".to_owned();
+    settings.save(&root).unwrap();
+    let report = play_17_ms_late(&root);
+    let mine = named("my-rules_2", rules::tapestry());
+    assert_eq!(report.preset, mine);
+    assert_eq!(
+        played_under(&report),
+        (Judgment::Perfect, replay::preset_hash(&mine))
+    );
+    assert_eq!(report.record.as_ref().unwrap().preset.id, "my-rules_2");
+    let loaded = load_named(&root, "my-rules_2").unwrap();
+    let listed: Vec<(&str, bool)> = loaded
+        .shelf()
+        .entries()
+        .into_iter()
+        .map(|e| (e.name, e.built_in))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("tapestry", true),
+            ("beatoraja-style", true),
+            ("lr2-style", true),
+            ("my-rules_2", false),
+            ("other", false),
+        ]
+    );
+}
+
+/// A stem that is not a name cannot be chosen or loaded: reading it is
+/// refused with an error naming the file, and the shelf lists it with it.
+#[test]
+fn user_preset_stem_must_be_a_name() {
+    let (_dir, root) = temp_root();
+    let long = "a".repeat(65);
+    let stems = ["Mine", "my.rules", "my rules", "my+rules", long.as_str()];
+    for stem in stems {
+        write_user_preset(&root, stem, &rules::tapestry());
+    }
+    let loaded = load_named(&root, "beatoraja-style").unwrap();
+    let entries = loaded.shelf().entries();
+    for stem in stems {
+        let path = user_preset_path(&root, stem);
+        let e = rules_toml::read_preset_file(&path).unwrap_err();
+        assert_eq!(e.path, path);
+        assert_eq!(
+            e.cause,
+            PresetFileCause::Preset(PresetError::Name(game::NameError::NotAName(
+                stem.to_owned()
+            )))
+        );
+        assert!(e.to_string().contains(&path.display().to_string()), "{e}");
+        let entry = entries.iter().find(|e| e.name == stem).unwrap();
+        assert_eq!(entry.error, Some(&e));
+        assert_eq!(entry.preset, None);
+        // Not a name either in `player.toml`.
+        assert!(matches!(
+            load_named(&root, stem),
+            Err(SessionError::Preset(ShelfError::Unknown(_)))
+        ));
+    }
+}
+
+/// A file whose stem is a built-in's cannot pass for it: the shelf lists it
+/// with an error naming the file and the built-in, and reading it is
+/// refused the same way.
+#[test]
+fn user_preset_named_like_a_built_in_is_refused() {
+    let (_dir, root) = temp_root();
+    let path = write_user_preset(&root, "tapestry", &rules::lr2_style());
+    let e = rules_toml::read_preset_file(&path).unwrap_err();
+    assert_eq!(
+        game::Chain(&e).to_string(),
+        format!(
+            "the preset file {} cannot be used: `tapestry` is the name of a built-in preset",
+            path.display()
+        )
+    );
+    let loaded = load_named(&root, "tapestry").unwrap();
+    assert_eq!(loaded.preset(), &rules::tapestry());
+    let refused: Vec<_> = loaded
+        .shelf()
+        .entries()
+        .into_iter()
+        .filter(|e| !e.built_in)
+        .map(|e| (e.name, e.error.cloned()))
+        .collect();
+    assert_eq!(refused, [("tapestry", Some(e))]);
+}
+
+/// A value that names neither a built-in nor an existing user preset is
+/// refused naming it and the built-ins, an older file name included even
+/// beside a file it would name, and nothing is written.
+#[test]
+fn unknown_preset_name_is_refused() {
+    let (_dir, root) = temp_root();
+    write_user_preset(&root, "custom.toml", &rules::tapestry());
+    let before = presets_folder(&root);
+    assert_eq!(before, ["custom.toml.toml"]);
+    for name in ["custom.toml", "beatoraja-style.toml", "missing", "custom"] {
+        let e = load_named(&root, name).unwrap_err();
+        assert_eq!(
+            e,
+            SessionError::Preset(ShelfError::Unknown(UnknownPreset(name.to_owned())))
+        );
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "`{name}` is neither a built-in preset (tapestry, beatoraja-style, lr2-style) \
+                 nor a user preset in the presets folder"
+            )
+        );
+    }
+    // `player.toml` refuses a value that cannot be a name as it is read.
+    fs::write(root.player_settings(), "preset = \"custom.toml\"\n").unwrap();
+    let e = Settings::load(&root).unwrap_err();
+    assert_eq!(
+        e,
+        game::SettingsError::InvalidPlayer(game::PlayerSettingsError::Preset(UnknownPreset(
+            "custom.toml".to_owned()
+        )))
+    );
+    assert_eq!(
+        fs::read_to_string(root.player_settings()).unwrap(),
+        "preset = \"custom.toml\"\n"
+    );
+    assert_eq!(presets_folder(&root), before);
+    assert!(!root.records().exists());
 }
 
 #[test]
@@ -545,20 +781,6 @@ fn missing_preset_key_takes_the_new_default() {
             replay::preset_hash(&rules::beatoraja_style())
         )
     );
-}
-
-#[test]
-fn missing_non_standard_preset_is_refused() {
-    let (_dir, root) = temp_root();
-    let chart = taps(&[(1, 1_000)]);
-    let mut settings = Settings::load(&root).unwrap();
-    settings.player.preset = "wide.toml".to_owned();
-    let parts = parts(&root, &chart, &Events::default());
-    let e = Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).unwrap_err();
-    assert_eq!(e, SessionError::MissingPreset(root.preset("wide.toml")));
-    assert!(e.to_string().contains("wide.toml"), "{e}");
-    // Nothing written: not the named file, nor the presets folder.
-    assert!(!root.preset("").exists());
 }
 
 #[test]
@@ -613,7 +835,7 @@ fn tail_chart() -> (Chart, Arc<SoundBank>) {
 
 fn tail_session(root: &DataRoot, events: &Events) -> Session<Out> {
     let (chart, bank) = tail_chart();
-    let settings = custom_settings(root);
+    let settings = tapestry_settings(root);
     let parts = parts(root, &chart, events);
     let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config(), parts).unwrap();
     loaded.start(
@@ -833,7 +1055,7 @@ fn load_refuses_what_it_cannot_use() {
     let chart = taps(&[(1, 1_000)]);
     let events = Events::default();
     let load = |path: &Path| {
-        let settings = custom_settings(&root);
+        let settings = tapestry_settings(&root);
         Loaded::load(
             root.clone(),
             settings,
@@ -842,7 +1064,6 @@ fn load_refuses_what_it_cannot_use() {
             parts(&root, &chart, &events),
         )
     };
-    let file = chart_file(&root);
     let other = root.path().join("play.txt");
     assert_eq!(
         load(&other).err(),
@@ -856,21 +1077,55 @@ fn load_refuses_what_it_cannot_use() {
             ..
         })
     ));
-    fs::write(root.preset("tapestry.toml"), "id = 3").unwrap();
+    // A user preset file that does not load, or a larger file than any
+    // preset, read no further than one byte past the limit.
+    let path = write_user_preset(&root, "mine", &rules::tapestry());
+    fs::write(&path, "id = 3").unwrap();
+    let refused = |cause: PresetFileCause| {
+        Err(SessionError::Preset(ShelfError::Preset(PresetFileError {
+            path: path.clone(),
+            cause,
+        })))
+    };
+    let e = load_named(&root, "mine").map(|_| ());
+    assert!(
+        matches!(
+            &e,
+            Err(SessionError::Preset(ShelfError::Preset(PresetFileError {
+                cause: PresetFileCause::Preset(PresetError::Parse(_)),
+                ..
+            })))
+        ),
+        "{e:?}"
+    );
+    let text = preset_to_toml(&rules::tapestry());
+    let limit = rules_toml::MAX_PRESET_FILE_BYTES;
+    fs::write(&path, format!("{text}#{}", "x".repeat(limit - text.len()))).unwrap();
+    assert_eq!(
+        load_named(&root, "mine").map(|_| ()),
+        refused(PresetFileCause::TooLarge)
+    );
+    fs::write(&path, [0xff_u8, b'\n']).unwrap();
+    assert_eq!(
+        load_named(&root, "mine").map(|_| ()),
+        refused(PresetFileCause::NotUtf8)
+    );
+    // A folder where the presets folder should be: a chosen user preset
+    // is refused, a built-in still loads.
+    fs::remove_dir_all(root.presets()).unwrap();
+    fs::write(root.presets(), "not a folder").unwrap();
     assert!(matches!(
-        load(&file),
-        Err(SessionError::Preset(PresetError::Parse(_)))
+        load_named(&root, "mine"),
+        Err(SessionError::Preset(ShelfError::Io { .. }))
     ));
-    fs::remove_file(root.preset("tapestry.toml")).unwrap();
-    fs::create_dir(root.preset("tapestry.toml")).unwrap();
-    assert!(matches!(load(&file), Err(SessionError::Io { .. })));
+    assert!(load_named(&root, "beatoraja-style").is_ok());
 }
 
 #[test]
 fn bad_key_config_refuses_to_play_and_closes_recording() {
     let (_dir, root) = temp_root();
     let chart = taps(&[(1, 1_000)]);
-    let mut settings = custom_settings(&root);
+    let mut settings = tapestry_settings(&root);
     // Lanes 1 and 2 on one key: loading the file refuses it, and a
     // session given it all the same refuses to play.
     settings.device.keyboard.lanes[2].control = settings.device.keyboard.lanes[1].control;
@@ -902,7 +1157,7 @@ fn passthrough_transform_is_recorded() {
     let (_dir, root) = temp_root();
     let path = common::write_bms(&root.path().join("charts"));
     let bytes = fs::read(&path).unwrap();
-    let settings = custom_settings(&root);
+    let settings = tapestry_settings(&root);
     let parts = Parts::standard(&root, &settings.player);
     let loaded = Loaded::load(root.clone(), settings, &path, config(), parts).unwrap();
     // The chart is the loader's, unchanged.
@@ -989,7 +1244,7 @@ fn failing_session(
     fail_from: i64,
     step: i64,
 ) -> Session<Failing> {
-    let settings = custom_settings(root);
+    let settings = tapestry_settings(root);
     let config = SessionConfig {
         step: TimeUs(step),
         ..config()
@@ -1222,7 +1477,7 @@ fn chart_is_read_one_byte_past_the_adapter_limit_at_most() {
             }),
             ..parts(&root, &chart, &Events::default())
         };
-        let settings = custom_settings(&root);
+        let settings = tapestry_settings(&root);
         Loaded::load(root.clone(), settings, &path, config(), parts).unwrap();
         assert_eq!(*seen.borrow(), Some(expected), "limit {max}");
     }
@@ -1230,7 +1485,7 @@ fn chart_is_read_one_byte_past_the_adapter_limit_at_most() {
     let big = root.path().join("big.bms");
     let limit = game::BmsIngest.max_bytes();
     fs::write(&big, vec![b'*'; limit + 5]).unwrap();
-    let settings = custom_settings(&root);
+    let settings = tapestry_settings(&root);
     let parts = Parts::standard(&root, &settings.player);
     assert_eq!(
         Loaded::load(root.clone(), settings, &big, config(), parts).err(),
@@ -1249,7 +1504,7 @@ fn a_step_that_does_not_move_the_clock_is_refused() {
             step: TimeUs(step),
             ..config()
         };
-        let settings = custom_settings(&root);
+        let settings = tapestry_settings(&root);
         let parts = parts(&root, &chart, &Events::default());
         assert_eq!(
             Loaded::load(root.clone(), settings, &chart_file(&root), config, parts).err(),
@@ -1378,7 +1633,7 @@ fn a_transformed_chart_that_breaks_an_invariant_is_refused() {
             transform,
             ..parts(&root, &chart, &Events::default())
         };
-        let settings = custom_settings(&root);
+        let settings = tapestry_settings(&root);
         Loaded::load(root.clone(), settings, &chart_file(&root), config(), parts).err()
     };
     assert_eq!(
@@ -1434,7 +1689,7 @@ fn key_sounds_and_bgm_follow_each_play_across_a_retry() {
         .build()
         .unwrap();
     chart.lanes[1][0].sound = Some(SoundId(0));
-    let mut settings = custom_settings(&root);
+    let mut settings = tapestry_settings(&root);
     settings.device.input_offset_us = 3 * MS;
     settings.device.audio_offset_us = 5 * MS;
     settings.save(&root).unwrap();
@@ -1504,7 +1759,7 @@ fn plan_sizes_axes_at_1khz_and_buttons_per_source() {
     // The final deadline is 1180 ms; with the 1 s lead-in the window is
     // 2.18 s, 3 whole seconds.
     let chart = taps(&[(1, 1_000)]);
-    let mut settings = custom_settings(&root);
+    let mut settings = tapestry_settings(&root);
     settings.device.controller.lanes = vec![
         game::LaneKey {
             control: 7,
@@ -1546,7 +1801,7 @@ fn keyboards_bound_only_to_retry_and_quit_add_no_rate() {
     // retry and quit: a press and a release each per keyboard, whatever
     // the window's length.
     let window = |chart: Chart, keyboards: usize| {
-        let mut settings = custom_settings(&root);
+        let mut settings = tapestry_settings(&root);
         settings.device.keyboard.lanes = Vec::new();
         settings.device.controller.lanes = (1..=7)
             .map(|lane| game::LaneKey {
@@ -1580,7 +1835,7 @@ fn keyboards_bound_only_to_retry_and_quit_add_no_rate() {
 
 /// A loaded session of `chart` whose controller binds `axes` axes.
 fn loaded_with_axes(root: &DataRoot, chart: Chart, axes: u32) -> Loaded {
-    let mut settings = custom_settings(root);
+    let mut settings = tapestry_settings(root);
     settings.device.controller.lanes = (0..axes)
         .map(|i| game::LaneKey {
             control: 0x1_0030 + i,
@@ -1684,7 +1939,7 @@ fn a_chart_too_large_to_reserve_is_refused_without_inputs() {
             TimeUs(1_000 * MS + i * MS),
         );
     }
-    let mut settings = custom_settings(&root);
+    let mut settings = tapestry_settings(&root);
     settings.device.keyboard = game::KeyConfig {
         lanes: Vec::new(),
         retry: None,

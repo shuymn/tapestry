@@ -869,15 +869,11 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
         .collect();
     kept.sort();
     // The settings and the run's log are kept; no play is (design.md
-    // "Autoplay", "Log File").
+    // "Autoplay", "Log File"), and the built-in preset is never written
+    // (design.md "Standard Presets").
     assert_eq!(
         kept,
-        [
-            "device.toml",
-            "logs\\tapestry.lock",
-            "logs\\tapestry.log",
-            "presets\\beatoraja-style.toml"
-        ],
+        ["device.toml", "logs\\tapestry.lock", "logs\\tapestry.log"],
         "{kept:?}"
     );
 }

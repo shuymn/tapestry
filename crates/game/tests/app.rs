@@ -277,7 +277,7 @@ impl Headless {
             sources,
             script,
             paths,
-            preset: dir.join("presets").join("tapestry.toml"),
+            preset: dir.join("presets").join("mine.toml"),
             refusal,
             acts,
             next: 0,
@@ -660,9 +660,14 @@ fn app(dir: &Path, refusal: Refusal, events: &Events) -> App {
     if refusal == Refusal::Preset {
         let presets = dir.join("presets");
         std::fs::create_dir_all(&presets).unwrap();
-        std::fs::write(presets.join("tapestry.toml"), b"not a preset").unwrap();
+        std::fs::write(presets.join("mine.toml"), b"not a preset").unwrap();
     }
-    settings.player.preset = "tapestry.toml".to_owned();
+    settings.player.preset = if refusal == Refusal::Preset {
+        "mine"
+    } else {
+        "tapestry"
+    }
+    .to_owned();
     let config = SessionConfig {
         lead_in: TimeUs(1_000 * MS),
         step: TimeUs(MS),

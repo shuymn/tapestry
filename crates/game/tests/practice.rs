@@ -21,7 +21,7 @@ use audio::{
     SoundBank,
 };
 use bms_model::{Chart, ChartBuilder, SoundId, Speed, TimeUs};
-use common::{MS, custom_settings, lane};
+use common::{MS, lane, tapestry_settings};
 use eval::{ControlId, JudgeEventKind};
 use game::{
     AudioQueue, ChartIngest, Closing, Command, DataRoot, IngestError, Ingested, InputWaitError,
@@ -407,7 +407,7 @@ fn d15_practice(loaded: &Loaded) -> Practice {
 /// The chart loaded under the tapestry preset, saving to `saves`.
 fn load(dir: &Path, chart: Chart, saves: Saves, config: SessionConfig) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = custom_settings(&root);
+    let settings = tapestry_settings(&root);
     let chart_path = dir.join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
     let parts = Parts {
@@ -742,7 +742,7 @@ fn section_round_records_its_conditions() {
 /// `text` (a BMS chart) loaded at `speed` under the tapestry preset.
 fn load_bms(dir: &Path, text: &str, speed: Speed) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = custom_settings(&root);
+    let settings = tapestry_settings(&root);
     let chart_path = dir.join("chart.bms");
     std::fs::write(&chart_path, text).unwrap();
     let parts = Parts::standard(&root, &settings.player);

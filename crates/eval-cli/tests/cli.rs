@@ -161,7 +161,7 @@ fn prints_as_played_and_what_if() {
             "--chart",
             "chart.bms",
             "--preset",
-            "own.toml",
+            "tapestry",
             "--preset",
             "wide.toml",
             "play.tprl",
@@ -174,7 +174,7 @@ fn prints_as_played_and_what_if() {
     assert_eq!(
         stdout(&o),
         format!(
-            "play.tprl | preset own.toml | as played | {CUSTOM_TOTALS}\n\
+            "play.tprl | preset tapestry | as played | {CUSTOM_TOTALS}\n\
              play.tprl | preset wide.toml | what-if, no input after 4.180 s | {CUSTOM_TOTALS}\n"
         )
     );
@@ -281,7 +281,7 @@ fn a_random_chart_is_checked_under_the_recorded_seeds() {
     let mut failing = played_with(&text, good);
     failing.chart.random_seed = bad;
     save(dir.path(), "bad.tprl", &failing);
-    let presets = ["--preset", "own.toml", "--preset", "wide.toml"];
+    let presets = ["--preset", "tapestry", "--preset", "wide.toml"];
     let with = |records: &[&str]| {
         let mut args = vec!["--chart", "random.bms"];
         args.extend(presets);
@@ -295,7 +295,7 @@ fn a_random_chart_is_checked_under_the_recorded_seeds() {
     assert_eq!(
         stdout(&o),
         format!(
-            "good.tprl | preset own.toml | as played | {CUSTOM_TOTALS}\n\
+            "good.tprl | preset tapestry | as played | {CUSTOM_TOTALS}\n\
              good.tprl | preset wide.toml | what-if, no input after 4.180 s | {CUSTOM_TOTALS}\n"
         )
     );
@@ -310,7 +310,7 @@ fn a_random_chart_is_checked_under_the_recorded_seeds() {
     assert_eq!(
         lines[..2],
         [
-            format!("bad.tprl | preset own.toml | {reason}"),
+            format!("bad.tprl | preset tapestry | {reason}"),
             format!("bad.tprl | preset wide.toml | {reason}"),
         ],
         "{out}"
@@ -389,6 +389,8 @@ fn usage_error_exits_two() {
         &["--chart", "chart.bms", "--preset"],
         &["--chart", "chart.bms", "--chart", "chart.bms", "play.tprl"],
         &["--chart", "chart.bms", "--verbose", "play.tprl"],
+        &["preset"],
+        &["preset", "export", "tapestry"],
     ] {
         let o = run(dir.path(), args);
         assert_eq!(o.status.code(), Some(2), "{args:?}: {o:?}");
@@ -396,7 +398,8 @@ fn usage_error_exits_two() {
         let err = String::from_utf8(o.stderr).unwrap();
         assert!(
             err.trim_end().ends_with(
-                "usage: eval-cli --chart <chart> [--preset <file.toml>]... <record.tprl>..."
+                "usage: eval-cli --chart <chart> [--preset <built-in|file.toml>]... \
+                 <record.tprl>...\n       eval-cli preset export <built-in> <file.toml>"
             ),
             "{args:?}: {err}"
         );
@@ -477,7 +480,8 @@ fn an_unusable_chart_or_preset_exits_one_before_any_line() {
             assert_eq!(err.trim_end(), reason);
         }
     }
-    // A preset file of exactly the limit is read.
+    // A preset file of exactly the limit is read: the tapestry preset
+    // named `big`, another preset than the one played.
     fs::write(dir.path().join("big.toml"), padded(&own, limit)).unwrap();
     let o = run(
         dir.path(),
@@ -486,7 +490,7 @@ fn an_unusable_chart_or_preset_exits_one_before_any_line() {
     assert_eq!(o.status.code(), Some(0), "{o:?}");
     assert_eq!(
         stdout(&o),
-        format!("play.tprl | preset big.toml | as played | {CUSTOM_TOTALS}\n")
+        format!("play.tprl | preset big.toml | what-if | {CUSTOM_TOTALS}\n")
     );
 }
 
@@ -505,7 +509,7 @@ fn output_is_deterministic() {
         "--preset",
         "wide.toml",
         "--preset",
-        "own.toml",
+        "tapestry",
         "a.tprl",
         "b.tprl",
         "c.tprl",
@@ -530,7 +534,7 @@ fn output_is_deterministic() {
                 "preset wide.toml",
                 "what-if, no input after 4.180 s"
             ],
-            ["a.tprl", "preset own.toml", "as played"],
+            ["a.tprl", "preset tapestry", "as played"],
             [
                 "b.tprl",
                 "preset wide.toml",
@@ -538,12 +542,138 @@ fn output_is_deterministic() {
             ],
             [
                 "b.tprl",
-                "preset own.toml",
+                "preset tapestry",
                 "as played, ended midway at 3.000 s"
             ],
             ["c.tprl", "preset wide.toml", refused],
-            ["c.tprl", "preset own.toml", refused],
+            ["c.tprl", "preset tapestry", refused],
         ],
         "{out}"
+    );
+}
+
+/// The export writes the built-in as a user preset named by the file's
+/// stem: the same rules under another ID, which `--preset` then evaluates
+/// as a what-if of a play under the built-in.
+#[test]
+fn export_writes_a_user_preset() {
+    let dir = folder();
+    let o = run(
+        dir.path(),
+        &["preset", "export", "beatoraja-style", "my-rules.toml"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert!(o.stdout.is_empty() && o.stderr.is_empty(), "{o:?}");
+    let path = dir.path().join("my-rules.toml");
+    let (preset, _) = rules_toml::read_preset_file(&path).unwrap();
+    assert_eq!(
+        preset,
+        RulePreset {
+            id: "my-rules".to_owned(),
+            ..rules::beatoraja_style()
+        }
+    );
+    // The tapestry preset exported, then evaluated as a file and by name.
+    let o = run(dir.path(), &["preset", "export", "tapestry", "mine.toml"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    save(dir.path(), "play.tprl", &played(CHART));
+    let o = run(
+        dir.path(),
+        &[
+            "--chart",
+            "chart.bms",
+            "--preset",
+            "tapestry",
+            "--preset",
+            "mine.toml",
+            "play.tprl",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(
+        stdout(&o),
+        format!(
+            "play.tprl | preset tapestry | as played | {CUSTOM_TOTALS}\n\
+             play.tprl | preset mine.toml | what-if | {CUSTOM_TOTALS}\n"
+        )
+    );
+}
+
+/// A built-in's name, a stem that is not a name, an existing file and a
+/// name that is not a built-in's: nothing is written, and the run exits 1.
+#[test]
+fn export_refuses_a_built_in_name_and_an_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("taken.toml"), "kept").unwrap();
+    for (args, reason) in [
+        (
+            ["preset", "export", "beatoraja-style", "tapestry.toml"],
+            "`tapestry` is the name of a built-in preset",
+        ),
+        (
+            ["preset", "export", "beatoraja-style", "lr2-style.toml"],
+            "`lr2-style` is the name of a built-in preset",
+        ),
+        (
+            ["preset", "export", "tapestry", "My Rules.toml"],
+            "`My Rules` is not a preset name",
+        ),
+        (
+            ["preset", "export", "tapestry", "custom.toml.toml"],
+            "`custom.toml` is not a preset name",
+        ),
+        (["preset", "export", "tapestry", "taken.toml"], ""),
+        (
+            ["preset", "export", "custom", "new.toml"],
+            "`custom` is not a built-in preset (tapestry, beatoraja-style, lr2-style)",
+        ),
+    ] {
+        let o = run(dir.path(), &args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {o:?}");
+        assert!(o.stdout.is_empty(), "{args:?}: {o:?}");
+        let err = String::from_utf8(o.stderr).unwrap();
+        assert!(
+            err.starts_with(&format!("eval-cli: {}: {reason}", args[3])),
+            "{args:?}: {err}"
+        );
+    }
+    let mut left: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["taken.toml"]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("taken.toml")).unwrap(),
+        "kept"
+    );
+}
+
+/// A file named like a built-in cannot pass for it: `--preset` refuses it,
+/// naming the file and the built-in, while the name alone is the built-in.
+#[test]
+fn user_preset_named_like_a_built_in_is_refused() {
+    let dir = folder();
+    save(dir.path(), "play.tprl", &played(CHART));
+    fs::write(
+        dir.path().join("tapestry.toml"),
+        rules_toml::preset_to_toml(&rules::tapestry()),
+    )
+    .unwrap();
+    let o = run(
+        dir.path(),
+        &[
+            "--chart",
+            "chart.bms",
+            "--preset",
+            "tapestry.toml",
+            "play.tprl",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(o.stdout.is_empty(), "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap().trim_end(),
+        "eval-cli: tapestry.toml: `tapestry` is the name of a built-in preset"
     );
 }

@@ -6,8 +6,19 @@
 //! Times are integer µs and gauge values raw units of 1/100000 %, so a file
 //! round-trips to the same canonical bytes and the same hash.
 //!
+//! A file holds a user preset (design.md "User Presets"): its name, which is
+//! also its preset ID, is the file's stem, and the file names nothing
+//! itself. A name is 1 to 64 characters of `a-z`, `0-9`, `-` and `_`, and
+//! never a built-in's ([`rules::BUILT_IN_PRESETS`]); every reader of a user
+//! preset checks it here.
+//!
 //! Before the first release the file's shape may change incompatibly. A file
 //! of an older shape is refused as unreadable, never converted.
+
+use std::fs;
+use std::io::{self, Read as _};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use bms_model::TimeUs;
 use rules::{
@@ -19,18 +30,148 @@ use rules::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Why a preset file could not be used.
+/// Why a preset's text could not be used.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PresetError {
+    /// The name is not a user preset's.
+    #[error(transparent)]
+    Name(NameError),
     /// The text is not TOML of the preset's shape.
     #[error(
-        "the preset file cannot be read (a file from an older version is refused, not \
-         converted; deleting a standard preset's file writes its current version again)"
+        "the preset file cannot be read (a file from an older version, one with an `id` \
+         among them, is refused, not converted; `eval-cli preset export <built-in> <path>` \
+         writes a built-in preset to a new file to edit)"
     )]
     Parse(#[source] toml::de::Error),
     /// The preset failed its validation.
     #[error("the preset is invalid")]
     Invalid(#[source] RuleError),
+}
+
+/// Why a name cannot be a user preset's.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum NameError {
+    /// Not 1 to 64 characters of `a-z`, `0-9`, `-` and `_`.
+    #[error(
+        "`{0}` is not a preset name: a name is 1 to {MAX_PRESET_NAME} characters of a-z, 0-9, \
+         `-` and `_`"
+    )]
+    NotAName(String),
+    /// A built-in preset's name, which no file may take.
+    #[error("`{0}` is the name of a built-in preset")]
+    BuiltIn(String),
+}
+
+/// Why a preset file could not be used: the file, and the reason.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the preset file {} cannot be used", .path.display())]
+pub struct PresetFileError {
+    /// The file.
+    pub path: PathBuf,
+    /// Why.
+    #[source]
+    pub cause: PresetFileCause,
+}
+
+impl PresetFileError {
+    /// The file system refused `path` with `kind`.
+    #[must_use]
+    pub const fn io(path: PathBuf, kind: io::ErrorKind) -> Self {
+        Self {
+            path,
+            cause: PresetFileCause::Io(kind),
+        }
+    }
+}
+
+/// Why a preset file could not be used.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PresetFileCause {
+    /// The file could not be read.
+    #[error("{0}")]
+    Io(io::ErrorKind),
+    /// The file is larger than [`MAX_PRESET_FILE_BYTES`].
+    #[error(
+        "the file is larger than {MAX_PRESET_FILE_BYTES} bytes, the largest preset file accepted"
+    )]
+    TooLarge,
+    /// The file is not UTF-8 text.
+    #[error("the file is not UTF-8 text")]
+    NotUtf8,
+    /// The stem or the text is not a user preset's.
+    #[error(transparent)]
+    Preset(PresetError),
+}
+
+/// The longest preset name, in characters.
+pub const MAX_PRESET_NAME: usize = 64;
+
+/// Checks that `name` can name a user preset: 1 to [`MAX_PRESET_NAME`]
+/// characters of `a-z`, `0-9`, `-` and `_`, and not a built-in's name.
+///
+/// # Errors
+///
+/// [`NameError::NotAName`] or [`NameError::BuiltIn`].
+pub fn check_user_preset_name(name: &str) -> Result<(), NameError> {
+    let valid = (1..=MAX_PRESET_NAME).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    if !valid {
+        return Err(NameError::NotAName(name.to_owned()));
+    }
+    if rules::built_in(name).is_some() {
+        return Err(NameError::BuiltIn(name.to_owned()));
+    }
+    Ok(())
+}
+
+/// The user preset name a file at `path` takes: its stem, checked.
+///
+/// # Errors
+///
+/// The stem's [`NameError`]; a stem that is not Unicode is not a name.
+pub fn user_preset_name(path: &Path) -> Result<&str, NameError> {
+    let stem = path.file_stem().unwrap_or_default();
+    let name = stem
+        .to_str()
+        .ok_or_else(|| NameError::NotAName(stem.to_string_lossy().into_owned()))?;
+    check_user_preset_name(name)?;
+    Ok(name)
+}
+
+/// Reads the user preset file at `path`, named by its stem, with its
+/// modification time. The name is checked before the file is opened; the
+/// file is read one byte past [`MAX_PRESET_FILE_BYTES`] at most, and its
+/// content and time come from one open file, so a save that replaces the
+/// file in between cannot pair old content with the new time.
+///
+/// # Errors
+///
+/// The file and why it cannot be used: its stem is not a user preset's
+/// name, it cannot be read, it is too large or not UTF-8, or its text is
+/// not a valid preset.
+pub fn read_preset_file(path: &Path) -> Result<(RulePreset, Option<SystemTime>), PresetFileError> {
+    let error = |cause| PresetFileError {
+        path: path.to_owned(),
+        cause,
+    };
+    let name =
+        user_preset_name(path).map_err(|e| error(PresetFileCause::Preset(PresetError::Name(e))))?;
+    let io = |e: io::Error| error(PresetFileCause::Io(e.kind()));
+    let file = fs::File::open(path).map_err(io)?;
+    let modified = file.metadata().and_then(|m| m.modified()).ok();
+    let limit = u64::try_from(MAX_PRESET_FILE_BYTES).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() > MAX_PRESET_FILE_BYTES {
+        return Err(error(PresetFileCause::TooLarge));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| error(PresetFileCause::NotUtf8))?;
+    let preset = load_preset_toml(name, &text).map_err(|e| error(PresetFileCause::Preset(e)))?;
+    Ok((preset, modified))
 }
 
 /// The largest preset file a reader accepts, in bytes. A file is untrusted,
@@ -41,22 +182,26 @@ pub enum PresetError {
 /// the limit.
 pub const MAX_PRESET_FILE_BYTES: usize = 1 << 20;
 
-/// Reads a preset from TOML and validates it.
+/// Reads the user preset `name` from TOML and validates it; `name` is its
+/// preset ID.
 ///
 /// # Errors
 ///
-/// [`PresetError::Parse`] for text that is not a preset file, including an
-/// unknown key; [`PresetError::Invalid`] for a preset that fails
+/// [`PresetError::Name`] for a name no user preset may take
+/// ([`check_user_preset_name`]); [`PresetError::Parse`] for text that is not
+/// a preset file, including an unknown key such as an older file's `id`;
+/// [`PresetError::Invalid`] for a preset that fails
 /// [`RulePreset::validate`].
-pub fn load_preset_toml(text: &str) -> Result<RulePreset, PresetError> {
+pub fn load_preset_toml(name: &str, text: &str) -> Result<RulePreset, PresetError> {
+    check_user_preset_name(name).map_err(PresetError::Name)?;
     let file: PresetFile = toml::from_str(text).map_err(PresetError::Parse)?;
-    let preset = RulePreset::from(file);
+    let preset = file.into_preset(name.to_owned());
     preset.validate().map_err(PresetError::Invalid)?;
     Ok(preset)
 }
 
-/// Writes a preset as TOML that [`load_preset_toml`] reads back to an equal
-/// preset.
+/// Writes a preset as TOML that [`load_preset_toml`] reads back, under any
+/// name, to an equal preset with that ID. The ID is not written.
 ///
 /// # Panics
 ///
@@ -69,7 +214,6 @@ pub fn preset_to_toml(p: &RulePreset) -> String {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PresetFile {
-    id: String,
     version: u32,
     implementation: ImplementationFile,
     tables: TablesFile,
@@ -415,10 +559,10 @@ const fn delta_file(d: GaugeDelta) -> DeltaFile {
     }
 }
 
-impl From<PresetFile> for RulePreset {
-    fn from(f: PresetFile) -> Self {
-        let PresetFile {
-            id,
+impl PresetFile {
+    /// The preset the file holds, named `id`: the file itself names nothing.
+    fn into_preset(self, id: String) -> RulePreset {
+        let Self {
             version,
             implementation,
             tables,
@@ -435,8 +579,8 @@ impl From<PresetFile> for RulePreset {
             total_mode,
             mine,
             gauges,
-        } = f;
-        Self {
+        } = self;
+        RulePreset {
             id,
             version,
             implementation: match implementation {
@@ -565,9 +709,9 @@ impl From<PresetFile> for RulePreset {
 impl From<&RulePreset> for PresetFile {
     fn from(p: &RulePreset) -> Self {
         // Destructured in full, so a new preset field fails to compile until
-        // the file writes it.
+        // the file writes it. The ID is the file's stem, never written.
         let RulePreset {
-            id,
+            id: _,
             version,
             implementation,
             tables,
@@ -586,7 +730,6 @@ impl From<&RulePreset> for PresetFile {
             mine,
         } = p;
         Self {
-            id: id.clone(),
             version: *version,
             implementation: match *implementation {
                 Implementation::Standard { version } => ImplementationFile::Standard { version },

@@ -24,6 +24,7 @@ mod logic;
 mod policy;
 mod practice;
 mod prepare;
+pub mod presets;
 mod queue;
 mod render;
 mod results;
@@ -57,18 +58,21 @@ pub use practice::{FADE, Practice, PracticeError, RING_OUT};
 pub use prepare::{
     BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,
 };
+pub use presets::{Entry, POLL_INTERVAL, PresetChange, Shelf, ShelfError, UnknownPreset};
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
 pub use render::{PlayView, RenderSide, RenderSink};
 pub use results::{
     MIN_OFFSET_SAMPLES, ReEvaluate, ReEvaluationError, RecommendedOffset, ResultContext,
     ResultExtension, ResultSummary,
 };
-pub use rules_toml::{PresetError, load_preset_toml, preset_to_toml};
+pub use rules_toml::{
+    NameError, PresetError, PresetFileCause, PresetFileError, load_preset_toml, preset_to_toml,
+};
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
     AutoKeySounds, Command, Loaded, MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport,
-    PlayScript, PlayStart, RECORDING_MEMORY, ReloadError, Reservation, SMALL_PARTS_BYTES,
+    PlayScript, PlayStart, PresetReload, RECORDING_MEMORY, Reservation, SMALL_PARTS_BYTES,
     SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError, Settings, TABLE_BYTES_PER_OBJECT,
     wake_policy,
 };

@@ -153,7 +153,6 @@ fn category(e: &SessionError) -> &'static str {
         SessionError::InvalidStep(_) => "invalid step",
         SessionError::Io { .. } => "file error",
         SessionError::Preset(_) => "preset error",
-        SessionError::MissingPreset(_) => "missing preset",
         SessionError::Transform(_) => "transform bug",
     }
 }
