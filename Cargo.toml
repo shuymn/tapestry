@@ -79,7 +79,8 @@ wgpu-hal = { version = "30.0.1", features = ["dx12"] }
 # Menu text: `cosmic-text` layout (re-exported) and its glyph atlas on wgpu 30.
 glyphon = "0.12.0"
 
-# render (dev only): the expected images of the WARP tests
+# render and skin-model (dev only): the expected images of the WARP tests,
+# palette PNG fixtures
 png = "0.18.1"
 
 # skin-model: skin images (decoding, capped) and their atlas pages

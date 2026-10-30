@@ -2312,6 +2312,7 @@ dependencies = [
  "etagere",
  "eval",
  "image",
+ "png",
  "proptest",
  "rules",
  "tempfile",
