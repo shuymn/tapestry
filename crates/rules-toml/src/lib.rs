@@ -24,7 +24,7 @@ pub enum PresetError {
     /// The text is not TOML of the preset's shape.
     #[error(
         "the preset file cannot be read (a file from an older version is refused, not \
-         converted; deleting it writes the current custom preset again)"
+         converted; deleting a standard preset's file writes its current version again)"
     )]
     Parse(#[source] toml::de::Error),
     /// The preset failed its validation.

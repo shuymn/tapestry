@@ -12,6 +12,9 @@
 //! The app's per-frame work, the skin's build into the preallocated
 //! [`SpriteBatch`] and its staging into instances, allocates nothing.
 //!
+//! Menu screens draw Japanese text with [`text`] and
+//! [`Renderer::menu_frame`], which the play screen never calls.
+//!
 //! [`measure`] holds the pure frame and latency measurement of design.md
 //! "Latency Figures", and [`Renderer::frame_statistics`] reads the swap chain's
 //! DXGI frame statistics it pairs to frames.
@@ -23,6 +26,7 @@ mod renderer;
 mod simple;
 mod skin;
 mod sprite;
+pub mod text;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows};
 pub use gpu::{AdapterChoice, Gpu};

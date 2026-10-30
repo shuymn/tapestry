@@ -1,0 +1,15 @@
+# cargo-audit configuration, read from the repository root by CI and
+# audit.yml (docs/setup.md "Dependency Checks"). Keep `ignore` the same as
+# deny.toml's `[advisories] ignore`, which holds each exception's reason.
+
+[advisories]
+ignore = [
+    # `lru` 0.16 `LruCache::pop` panic safety: glyphon never calls `pop` and
+    # its `Copy` keys have no `Drop`. Remove when a glyphon release accepts
+    # lru >= 0.18.2.
+    "RUSTSEC-2026-0253",
+    # `ttf-parser` unmaintained (no advisory against its code), parsing only
+    # the Windows font file under fontdb. Remove when a cosmic-text release
+    # under glyphon drops ttf-parser 0.25.
+    "RUSTSEC-2026-0192",
+]

@@ -33,7 +33,7 @@ use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
-    SessionPolicy,
+    SessionPolicy, SharedEvents,
 };
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
 use crate::render::PlayView;
@@ -203,6 +203,10 @@ pub enum SessionError {
     /// The preset file could not be used.
     #[error(transparent)]
     Preset(PresetError),
+    /// The preset file `player.toml` names does not exist and is not a
+    /// standard preset, so nothing was written.
+    #[error("the preset file {} does not exist", .0.display())]
+    MissingPreset(PathBuf),
     /// The chart transform's output breaks a chart invariant
     /// ([`Chart::validate`]).
     #[error("the transformed chart is invalid")]
@@ -236,6 +240,21 @@ impl Command {
             Self::Suspend => AbortCause::Suspend,
         }
     }
+}
+
+/// A command on the result screen, separate from the in-play [`Command`]
+/// (design.md "Play Lifecycle").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuCommand {
+    /// Play the chart again.
+    Retry,
+    /// Leave the chart.
+    Back,
+    /// Show the result under the next preset; the play preset is unchanged.
+    NextPreset,
+    /// Show the result under the previous preset; the play preset is
+    /// unchanged.
+    PrevPreset,
 }
 
 /// What one play receives: device input and system controls, both on the
@@ -312,7 +331,8 @@ pub struct PlayReport {
 /// It also holds what every play of the chart shares, whichever driver
 /// runs the plays: [`Session::play`] headlessly, or the game's threads.
 /// Each play goes [`begin_play`](Self::begin_play) →
-/// [`plan`](Self::plan) once recording has opened → evaluation →
+/// [`plan`](Self::plan) once recording has opened → [`admitted`](Self::admitted)
+/// once its logic step is built → evaluation →
 /// [`finish_play`](Self::finish_play).
 #[derive(Debug)]
 pub struct Loaded {
@@ -327,6 +347,9 @@ pub struct Loaded {
     preset_path: PathBuf,
     preset_modified: Option<SystemTime>,
     attempt: u32,
+    /// Where the session events go, out of the parts so a play can report
+    /// its start while its logic step borrows the chart.
+    events: SharedEvents,
 }
 
 /// The start of one play: its number, and whether the preset file it
@@ -386,14 +409,16 @@ pub struct PlayOutcome {
 }
 
 impl Loaded {
-    /// Reads the preset named in `player.toml`, writing the custom preset
-    /// there first if the file does not exist, then ingests the chart and
-    /// applies the transform.
+    /// Reads the preset named in `player.toml`, then ingests the chart and
+    /// applies the transform. A missing standard preset file is written
+    /// first: `custom.toml` or `beatoraja-style.toml`.
     ///
     /// # Errors
     ///
-    /// [`SessionError`] for a step that is not positive, an unreadable
-    /// preset or chart, or a chart no adapter reads.
+    /// [`SessionError`] for a step that is not positive, a missing preset
+    /// file that is not a standard preset
+    /// ([`SessionError::MissingPreset`]), an unreadable preset or chart, or
+    /// a chart no adapter reads.
     pub fn load(
         root: DataRoot,
         settings: Settings,
@@ -401,15 +426,34 @@ impl Loaded {
         config: SessionConfig,
         mut parts: Parts,
     ) -> Result<Self, SessionError> {
+        let events = SharedEvents::new(std::mem::replace(
+            &mut parts.events,
+            Box::new(NoSessionEvents),
+        ));
+        Self::load_reporting_to(root, settings, chart_path, config, parts, events)
+    }
+
+    /// [`load`](Self::load), with the session events going to `events`
+    /// instead of the parts' sink.
+    pub(crate) fn load_reporting_to(
+        root: DataRoot,
+        settings: Settings,
+        chart_path: &Path,
+        config: SessionConfig,
+        parts: Parts,
+        events: SharedEvents,
+    ) -> Result<Self, SessionError> {
         if config.step.0 <= 0 {
             return Err(SessionError::InvalidStep(config.step));
         }
         let preset_path = root.preset(&settings.player.preset);
         if !preset_path.exists() {
+            let standard = standard_preset(&settings.player.preset)
+                .ok_or_else(|| SessionError::MissingPreset(preset_path.clone()))?;
             if let Some(dir) = preset_path.parent() {
                 fs::create_dir_all(dir).map_err(io_error(dir))?;
             }
-            let text = preset_to_toml(&rules::custom());
+            let text = preset_to_toml(&standard);
             write_atomic(&preset_path, text.as_bytes()).map_err(io_error(&preset_path))?;
         }
         let (preset, preset_modified) = read_preset(&preset_path).map_err(|e| match e {
@@ -446,7 +490,7 @@ impl Loaded {
             random_seed: config.seed,
             transform: parts.transform.id().record(),
         };
-        parts.events.on_event(&SessionEvent::Load);
+        events.on_event(&SessionEvent::Load);
         Ok(Self {
             root,
             settings,
@@ -459,6 +503,7 @@ impl Loaded {
             preset_path,
             preset_modified,
             attempt: 0,
+            events,
         })
     }
 
@@ -484,6 +529,11 @@ impl Loaded {
     #[must_use]
     pub const fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Reports `ev` to the session event sink.
+    pub(crate) fn emit(&self, ev: &SessionEvent) {
+        self.events.on_event(ev);
     }
 
     /// The settings, to change between plays.
@@ -520,9 +570,10 @@ impl Loaded {
         }
     }
 
-    /// Starts the next play. Every play after the first is a retry: a
-    /// preset file changed since the previous play is used from this one
-    /// on.
+    /// Numbers the next play, before recording opens; its start is reported
+    /// once it is [`admitted`](Self::admitted). Every play after the first
+    /// is a retry: a preset file changed since the previous play is used
+    /// from this one on.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
         let attempt = self.attempt;
@@ -531,11 +582,18 @@ impl Loaded {
         } else {
             None
         };
-        self.parts.events.on_event(&SessionEvent::Start { attempt });
         PlayStart {
             attempt,
             reload_error,
         }
+    }
+
+    /// The play `start` was admitted: recording opened, the play was
+    /// planned and its logic step built. Reports its start.
+    pub fn admitted(&self, start: &PlayStart) {
+        self.events.on_event(&SessionEvent::Start {
+            attempt: start.attempt,
+        });
     }
 
     /// At a retry: uses the preset file from now on if its modification
@@ -806,11 +864,9 @@ impl Loaded {
         let retried =
             end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
         if retried {
-            parts.events.on_event(&SessionEvent::Retry { attempt });
+            self.events.on_event(&SessionEvent::Retry { attempt });
         }
-        parts
-            .events
-            .on_event(&SessionEvent::End { attempt, status });
+        self.events.on_event(&SessionEvent::End { attempt, status });
         PlayReport {
             attempt,
             end,
@@ -836,6 +892,17 @@ fn generated() -> eval::SourceProfile {
         input_offset: TimeUs(0),
         bindings: KeyConfig::autoplay().bindings(DeviceKind::Keyboard),
         axes: Vec::new(),
+    }
+}
+
+/// The standard preset a missing file of this name is written with
+/// (design.md "Standard Presets"): `custom.toml` and
+/// `beatoraja-style.toml`. `None` for any other name.
+fn standard_preset(file: &str) -> Option<RulePreset> {
+    match file {
+        "custom.toml" => Some(rules::custom()),
+        "beatoraja-style.toml" => Some(rules::beatoraja_style()),
+        _ => None,
     }
 }
 

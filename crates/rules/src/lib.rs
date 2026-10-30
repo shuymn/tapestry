@@ -20,12 +20,14 @@
     clippy::cast_sign_loss
 )]
 
+mod beatoraja_style;
 mod canonical;
 mod custom;
 mod error;
 mod preset;
 mod validate;
 
+pub use beatoraja_style::beatoraja_style;
 pub use custom::custom;
 pub use error::{CanonicalError, RuleError, Side};
 pub use preset::{

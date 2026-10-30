@@ -176,7 +176,8 @@ fn parse_errors_have_the_toml_error_as_source() {
         panic!("{e:?}");
     };
     let refused = "the preset file cannot be read (a file from an older version is refused, \
-                   not converted; deleting it writes the current custom preset again)";
+                   not converted; deleting a standard preset's file writes its current version \
+                   again)";
     assert_chain(&e, toml, &[refused, &toml.to_string()]);
     let e = PresetError::Invalid(RuleError::NoGauges);
     assert_chain(
