@@ -27,7 +27,7 @@ use crate::end_screen::{self, Hints, LoadTimes, QueueLine};
 use crate::input_side::{InputLink, Recorded, Request};
 use crate::measure::{
     AudioBase, Figures, PlayMeasure, Step, StepSample, judgment_samples, limits_line, measure_path,
-    to_toml,
+    process_page_faults, to_toml,
 };
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
 use crate::tuning::{Delivered, SettingsFiles};
@@ -339,6 +339,10 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
+        // The play's setup ends here, before anything is handed over; the
+        // page faults count from here too.
+        let started = self.clock.now();
+        let page_faults = process_page_faults();
         let countdown_at = TimeUs(origin.0 - self.lead_in.0);
         self.countdown_at = Some(countdown_at);
         println!("play started");
@@ -353,6 +357,9 @@ impl Rig for PlayerRig<'_> {
         let measure = PlayMeasure {
             generation: self.generation,
             origin,
+            countdown_at,
+            started,
+            page_faults,
             load_from: self.retry_from.unwrap_or(self.load_start),
             retry: self.retry_from.is_some(),
             audio: Some(audio),
@@ -439,15 +446,17 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn ended(&mut self, report: &PlayReport) {
+        if let Some(c) = self.figures.as_ref().and_then(|f| f.countdown) {
+            println!(
+                "countdown: setup {} us, first frame {} after it started",
+                c.setup_us,
+                c.first_frame_us
+                    .map_or_else(|| "N/A".to_owned(), |us| format!("{us} us"))
+            );
+        }
         // Load times run to the play's first frame: from the load's start
         // for the first play, from the retry's receipt for a retry.
         if let Some(frame) = self.render.first_frame() {
-            if let Some(c) = self.countdown_at {
-                println!(
-                    "countdown: first frame {} us after it started",
-                    frame.0 - c.0
-                );
-            }
             match self.retry_from.take() {
                 Some(from) => self.times.retry = Some(since(from, frame)),
                 None if self.times.first.is_none() => {

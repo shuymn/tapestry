@@ -101,6 +101,14 @@ pub struct PlayMeasure {
     pub generation: u64,
     /// Where chart time 0 lies on the clock.
     pub origin: TimeUs,
+    /// When the countdown started (recording opened), on the clock.
+    pub countdown_at: TimeUs,
+    /// When the play was set up and about to be handed to audio and the
+    /// screen, on the clock: its setup ran from `countdown_at` to here.
+    pub started: TimeUs,
+    /// The process's page fault count at `started`; `None` when it could
+    /// not be read.
+    pub page_faults: Option<u32>,
     /// What the load time runs from: the load's start for the first play,
     /// the retry's receipt for a retry.
     pub load_from: TimeUs,
@@ -136,6 +144,32 @@ impl AudioBase {
             counters,
         }
     }
+}
+
+/// The countdown's figures, µs from its start (recording opened).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Countdown {
+    /// Until the play was set up, as it was handed to audio and the screen.
+    pub setup_us: i64,
+    /// Until the clock read once the play's first frame was presented;
+    /// `None` when none was.
+    pub first_frame_us: Option<i64>,
+}
+
+/// The process's page fault count now (`GetProcessMemoryInfo`); `None`
+/// when it cannot be read.
+pub fn process_page_faults() -> Option<u32> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let cb = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?;
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb,
+        ..PROCESS_MEMORY_COUNTERS::default()
+    };
+    // SAFETY: the current process's pseudo handle needs no closing, and
+    // `counters` is a writable `PROCESS_MEMORY_COUNTERS` of `cb` bytes.
+    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &raw mut counters, cb) }.ok()?;
+    Some(counters.PageFaultCount)
 }
 
 /// A play's figures, as written to `.measure.toml`.
@@ -194,6 +228,12 @@ pub struct Figures {
     /// Logic step samples the full queue refused: input to judgment and
     /// finalization delay are missing that many.
     pub steps_dropped: u64,
+    /// The countdown's setup and first frame.
+    pub countdown: Option<Countdown>,
+    /// Page faults of the whole process from the play's handover to audio
+    /// and the screen until it was over (diagnostic: every thread, wgpu and
+    /// the driver included).
+    pub page_faults: Option<u64>,
     /// One refresh, ns: measured from the play's accepted frame statistics
     /// (the sync times over the refreshes between them), else from the
     /// monitor's reported rate, which may be rounded to a whole hertz.
@@ -420,7 +460,9 @@ pub struct Measure {
     refreshes: RefreshLedger,
     /// The last present count, to notice a new swap chain.
     last_present: Option<u32>,
-    load_ms: Option<i64>,
+    /// When the play's first frame was presented, on the clock: the load
+    /// time and the countdown's first frame run to it.
+    first_frame: Option<TimeUs>,
     presents: u64,
     recent: [i64; RECENT],
     recent_next: usize,
@@ -479,7 +521,7 @@ impl Measure {
             filter: StatsFilter::default(),
             refreshes: RefreshLedger::default(),
             last_present: None,
-            load_ms: None,
+            first_frame: None,
             presents: 0,
             recent: [i64::MIN; RECENT],
             recent_next: 0,
@@ -506,7 +548,7 @@ impl Measure {
         self.last_present = None;
         self.first_sync = None;
         self.last_sync = None;
-        self.load_ms = None;
+        self.first_frame = None;
         self.presents = 0;
         self.recent = [i64::MIN; RECENT];
         self.refreshed_at = None;
@@ -563,8 +605,10 @@ impl Measure {
             self.drain();
             let fig = self.figures_now(now);
             let load = self
-                .load_ms
-                .map(|ms| (self.play.as_ref().is_some_and(|p| p.retry), ms));
+                .play
+                .as_ref()
+                .zip(self.first_frame)
+                .map(|(p, t)| (p.retry, (t.0 - p.load_from.0) / 1_000));
             self.shown = write_overlay(&fig, load, &mut self.lines);
         }
         for (o, l) in out.iter_mut().zip(self.lines.iter().take(self.shown)) {
@@ -614,6 +658,11 @@ impl Measure {
                 .zip(self.app_base)
                 .map(|(now, base)| now.saturating_sub(base)),
             steps_dropped: 0,
+            countdown: self.play.as_ref().map(|p| Countdown {
+                setup_us: p.started.0 - p.countdown_at.0,
+                first_frame_us: self.first_frame.map(|t| t.0 - p.countdown_at.0),
+            }),
+            page_faults: None,
             refresh_period_ns: self
                 .first_sync
                 .zip(self.last_sync)
@@ -643,8 +692,13 @@ impl Measure {
         self.play.as_ref()?;
         self.drain();
         self.on_screen.finish();
-        #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
         let mut fig = self.figures_now(end);
+        fig.page_faults = self
+            .play
+            .as_ref()
+            .and_then(|p| p.page_faults)
+            .zip(process_page_faults())
+            .map(|(base, now)| u64::from(now.wrapping_sub(base)));
         #[cfg(feature = "dev-tools")]
         {
             let kept = self.present_log.capacity() > 0 && !self.present_log_full;
@@ -683,7 +737,6 @@ impl Measure {
             return;
         }
         let origin = play.origin;
-        let load_from = play.load_from;
         #[cfg(all(test, feature = "dev-tools"))]
         if self.allocate_in_frames {
             drop(std::hint::black_box(vec![0u8; 8]));
@@ -721,8 +774,8 @@ impl Measure {
             // for the next play.
             self.present_log_full = true;
         }
-        if self.load_ms.is_none() {
-            self.load_ms = Some((d.at.0 - load_from.0) / 1_000);
+        if self.first_frame.is_none() {
+            self.first_frame = Some(d.at);
         }
         if d.at >= origin {
             self.presents += 1;
@@ -920,6 +973,17 @@ pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
     if let Some(ms) = load.1 {
         let _ = writeln!(out, "retry = {ms}");
     }
+    out.push_str("\n[countdown]\n");
+    if let Some(c) = fig.countdown {
+        let _ = writeln!(out, "setup_us = {}", c.setup_us);
+        if let Some(us) = c.first_frame_us {
+            let _ = writeln!(out, "first_frame_us = {us}");
+        }
+    }
+    out.push_str("\n[faults]\n");
+    if let Some(n) = fig.page_faults {
+        let _ = writeln!(out, "process = {n}");
+    }
     if let Some([i, l, a, r]) = fig.allocations {
         let _ = writeln!(
             out,
@@ -960,6 +1024,40 @@ mod tests {
         ] {
             assert_eq!(lines[i], want);
         }
+    }
+
+    /// The countdown's setup and first frame and the process's page faults
+    /// are written in their own tables; a figure without evidence has no
+    /// key.
+    #[test]
+    fn to_toml_writes_the_countdown_and_fault_figures() {
+        use super::{Countdown, to_toml};
+        let fig = Figures {
+            countdown: Some(Countdown {
+                setup_us: 2_345,
+                first_frame_us: Some(18_000),
+            }),
+            page_faults: Some(812),
+            ..Figures::default()
+        };
+        let t: toml::Table = to_toml(&fig, (None, None)).parse().unwrap();
+        let int = |table: &str, key: &str| t[table].get(key).and_then(toml::Value::as_integer);
+        assert_eq!(int("countdown", "setup_us"), Some(2_345));
+        assert_eq!(int("countdown", "first_frame_us"), Some(18_000));
+        assert_eq!(int("faults", "process"), Some(812));
+
+        let fig = Figures {
+            countdown: Some(Countdown {
+                setup_us: 2_345,
+                first_frame_us: None,
+            }),
+            ..Figures::default()
+        };
+        let t: toml::Table = to_toml(&fig, (None, None)).parse().unwrap();
+        assert_eq!(t["countdown"].as_table().unwrap().len(), 1);
+        assert!(t["faults"].as_table().unwrap().is_empty());
+        let t: toml::Table = to_toml(&Figures::default(), (None, None)).parse().unwrap();
+        assert!(t["countdown"].as_table().unwrap().is_empty());
     }
 
     /// The overlay's numbers come from the rings without allocating: the
@@ -1153,6 +1251,9 @@ mod frame_tests {
         PlayMeasure {
             generation,
             origin,
+            countdown_at: TimeUs(origin.0 - 1_000_000),
+            started: TimeUs(origin.0 - 990_000),
+            page_faults: None,
             load_from: TimeUs(0),
             retry: false,
             audio: None,

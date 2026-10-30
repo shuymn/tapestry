@@ -9,10 +9,13 @@
 //! tests. The rig owns the clock and every wait; the transitions here only
 //! ask it what happened and tell it what to do.
 //!
-//! - The screen is prepared, and acknowledges it, before recording opens,
-//!   so the countdown origin is chosen only once the work before play is
-//!   done; what follows the opening (the logic step's construction and the
-//!   handoff to audio and the screen) is bounded by the chart's size.
+//! - The screen and audio are prepared, and acknowledge it, before recording
+//!   opens, so the countdown origin is chosen only once that work is done.
+//!   The play's setup follows the opening, at the countdown's start: the
+//!   plan, the reservation of the whole recording window and the logic
+//!   step's construction, bounded by the chart and the reservation, then the
+//!   handoff to audio and the screen (design.md "Recording Capacity", "Play
+//!   Lifecycle"). The reserved memory is not touched in advance.
 //! - A quit is latched by the rig and checked before recording opens and in
 //!   every wait, so it is never lost to a transition.
 //! - An aborted play closes recording and only then drains what is left in the

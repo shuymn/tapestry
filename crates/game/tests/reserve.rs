@@ -1,4 +1,5 @@
-//! What a play reserves before its countdown, measured: the bytes the
+//! What a play reserves right after recording opens, before it is handed
+//! to audio and the screen, measured: the bytes the
 //! constructors allocate for the logic step and the live play's buffers match
 //! [`Reservation`], the recording policy's account (design.md "Recording
 //! Capacity").
