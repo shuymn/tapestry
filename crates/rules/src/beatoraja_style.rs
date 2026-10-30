@@ -102,6 +102,18 @@
 //!   a declaration is not a number here, so `#TOTAL 200` then `#TOTAL 300f`
 //!   keeps 200 here and takes 300 there. `#TOTAL` is also used in
 //!   thousandths rounded down, not as a `double`.
+//! - **Digits past the 18th fractional one.** They are cut off here, so a
+//!   positive value below 10^-18 is 0 and not above 0: `#TOTAL 200` then
+//!   `#TOTAL 1e-19` keeps 200 here, while `Double.parseDouble` keeps the
+//!   second positive and jbms-parser takes it (`BMSDecoder.java:730-743`).
+//! - **Whitespace around a value.** Non-ASCII whitespace (U+00A0, U+3000)
+//!   is trimmed here, so `#RANK 3` then `#RANK` with U+00A0 around `2`
+//!   reads rank 2 here; Java's `trim` removes only characters up to U+0020,
+//!   so `Integer.parseInt` throws and rank 3 stays there
+//!   (`BMSDecoder.java:367-368`, `:702-713`).
+//!
+//! Each of the last two is an example in
+//! `crates/bms-parser/tests/judgment_headers.rs`.
 //!
 //! The CLASS gauges (course play only) are not included.
 

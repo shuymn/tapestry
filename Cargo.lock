@@ -208,6 +208,7 @@ dependencies = [
  "num-rational",
  "num-traits",
  "proptest",
+ "rules",
  "sha2",
  "tempfile",
  "thiserror 2.0.21",

@@ -152,6 +152,50 @@ fn unreadable_header_is_kept_and_warned() {
     );
 }
 
+/// What beatoraja-style's header policy reads from `text`.
+fn read_by_beatoraja_style(text: &str) -> rules::ReadHeaders {
+    rules::beatoraja_style()
+        .headers
+        .read(&headers(&format!("{text}\n{NOTE}")))
+}
+
+/// A known difference (crates/rules/src/beatoraja_style.rs): a positive
+/// value below 10^-18 is cut off to 0 here, so it is not above 0 and the
+/// earlier `#TOTAL` stays; `Double.parseDouble` keeps it positive, so
+/// jbms-parser takes it (BMSDecoder.java:730-743).
+#[test]
+fn a_total_below_the_kept_digits_keeps_the_earlier_one() {
+    assert_eq!(
+        headers(&format!("#TOTAL 200\n#TOTAL 1e-19\n{NOTE}")),
+        [h(Total, Integer(200 * ONE)), h(Total, Decimal(0))]
+    );
+    assert_eq!(
+        read_by_beatoraja_style("#TOTAL 200\n#TOTAL 1e-19").total_milli,
+        Some(200_000)
+    );
+}
+
+/// A known difference (crates/rules/src/beatoraja_style.rs): non-ASCII
+/// whitespace around a value (U+00A0, U+3000) is trimmed here, so the
+/// value is read; Java's `trim` keeps it and `Integer.parseInt` throws, so
+/// jbms-parser keeps the earlier `#RANK` (BMSDecoder.java:367-368, :702-713).
+#[test]
+fn non_ascii_whitespace_around_a_value_is_trimmed() {
+    for space in ['\u{a0}', '\u{3000}'] {
+        let text = format!("#TITLE 判定\n#RANK 3\n#RANK {space}2{space}");
+        assert_eq!(
+            headers(&format!("{text}\n{NOTE}")),
+            [h(Rank, Integer(3 * ONE)), h(Rank, Integer(2 * ONE))],
+            "{space:?}"
+        );
+        assert_eq!(
+            read_by_beatoraja_style(&text).rank,
+            Some(rules::JudgeRank::Rank(2)),
+            "{space:?}"
+        );
+    }
+}
+
 #[test]
 fn the_fixture_keeps_its_active_declarations() {
     let path =
