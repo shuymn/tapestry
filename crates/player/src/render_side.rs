@@ -291,12 +291,13 @@ impl RenderLink {
         }
     }
 
-    /// Shortens the waits (tests).
-    #[cfg(test)]
-    fn with_timeouts(mut self, answer: Duration, exit: Duration) -> Self {
+    /// Sets how long a preparation or a chart's load and the end of the
+    /// thread are waited for, in place of [`LOAD_TIMEOUT`] and
+    /// [`EXIT_TIMEOUT`] (tests, and `--dev-render-timeout`).
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn set_timeouts(&mut self, answer: Duration, exit: Duration) {
         self.answer_timeout = answer;
         self.exit_timeout = exit;
-        self
     }
 }
 
@@ -942,7 +943,7 @@ mod tests {
             Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
-        let link = spawn(
+        let mut link = spawn(
             make,
             None,
             clock,
@@ -950,8 +951,8 @@ mod tests {
             measure(clock),
             Box::new(NoFrames),
         )
-        .unwrap()
-        .with_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+        .unwrap();
+        link.set_timeouts(Duration::from_millis(200), Duration::from_millis(200));
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         let started = Instant::now();
         assert!(matches!(link.load(chart), Err(ScreenError::NoAnswer)));

@@ -146,6 +146,9 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
             if dev_options.overlay {
                 rig.controls.toggle_overlay();
             }
+            if let Some(bound) = dev_options.render_timeout {
+                rig.render.set_timeouts(bound, bound);
+            }
             rig.adjust_in_play = dev_options.adjust_in_play;
             rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
             rig.adjust_on_end = dev_options.adjust_on_end;
@@ -166,6 +169,9 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
                 }
                 if dev_options.overlay {
                     _rig.controls.toggle_overlay();
+                }
+                if let Some(bound) = dev_options.render_timeout {
+                    _rig.render.set_timeouts(bound, bound);
                 }
                 _rig.adjust_in_play = dev_options.adjust_in_play;
                 _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
