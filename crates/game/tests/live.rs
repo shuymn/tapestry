@@ -23,6 +23,14 @@ use input::{
 use replay::{BuildProvenance, ReceiveMethod};
 use rules::Judgment;
 
+/// The settings in `root`, naming the custom preset: these tests' values
+/// are the custom preset's.
+fn custom_settings(root: &DataRoot) -> Settings {
+    let mut settings = Settings::load(root).unwrap();
+    settings.player.preset = "custom.toml".to_owned();
+    settings
+}
+
 /// Where the rig's clock starts: no play's origin is near 0.
 const CLOCK_START: i64 = 7_300_000;
 /// The input offset every play is evaluated with.
@@ -62,7 +70,7 @@ fn chart() -> Chart {
 
 fn loaded(dir: &Path) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let mut settings = Settings::load(&root).unwrap();
+    let mut settings = custom_settings(&root);
     settings.device.input_offset_us = OFFSET;
     let chart_path = dir.join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
@@ -930,7 +938,7 @@ fn every_step_is_measured() {
 /// first, so one step can judge two presses.
 fn chord_loaded(dir: &Path) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = Settings::load(&root).unwrap();
+    let settings = custom_settings(&root);
     let chart_path = dir.join("chord.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
     let chart = ChartBuilder::new(150_000)
@@ -1003,7 +1011,7 @@ impl game::RecordSink for NotingSink {
 fn the_play_is_over_before_it_is_saved() {
     let dir = tempfile::tempdir().unwrap();
     let root = DataRoot::new(dir.path().to_owned());
-    let settings = Settings::load(&root).unwrap();
+    let settings = custom_settings(&root);
     let chart_path = dir.path().join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
     let order = std::sync::Arc::default();

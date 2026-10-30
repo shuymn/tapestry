@@ -92,7 +92,7 @@ fn missing_files_give_the_defaults() {
     let s = Settings::load(&root).unwrap();
     assert_eq!(s.device, DeviceSettings::default());
     assert_eq!(s.player, PlayerSettings::default());
-    assert_eq!(s.player.preset, "custom.toml");
+    assert_eq!(s.player.preset, "beatoraja-style.toml");
 }
 
 #[test]

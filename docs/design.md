@@ -20,7 +20,7 @@ Build a BMS player that plays like beatoraja or Lunatic Rave 2. Its biggest dist
 ### Non-goals
 
 - **Exactly reproducing the judgment of beatoraja or LR2.** We provide "-style" presets with similar behavior, but do not go as far as matching bugs in the existing implementations.
-- **Making the judgment of the commercial game this is based on the standard.** The default is a custom preset.
+- **Making the judgment of the commercial game this is based on the standard.** The default is the beatoraja-style preset; no standard preset reproduces the judgment of the commercial game this is based on.
 - **Importing or converting commercial game data.** It goes neither in core nor in official extensions.
 - Support for platforms other than Windows.
 
@@ -390,14 +390,16 @@ For now only LN is judged, and a chart whose `#LNMODE` asks for CN or HCN is ref
 
 ### Standard Presets
 
-- **Custom (default)**: Judgment specific to this player. Its values differ from the judgment of the commercial game this is based on.
-- **beatoraja-style**, **LR2-style**: Aim for similar behavior based on public information. They are named "-style", not "compatible", and an exact match is not promised.
+- **beatoraja-style (default)**, **LR2-style**: Aim for similar behavior based on public information. They are named "-style", not "compatible", and an exact match is not promised.
+- **Custom**: Judgment specific to this player. Its values differ from the judgment of the commercial game this is based on.
+
+beatoraja-style (`rules::beatoraja_style()`) takes its values from beatoraja's public source code, each cited by file and line in its module and in its examples (`crates/eval/tests/style_beatoraja.rs`). Behavior the preset model cannot express yet (a separate scratch window table, combo-priority note assignment, multi-step low-gauge damage, `#TOTAL`-limited survival increases, the default `#TOTAL` formula, `#DEFEXRANK` and `#RANK 4` scaling, and when a BAD long-note head is scored) is listed in that module with the example that would differ, and arrives as axes with the examples that need them.
 
 Items are added when a preset that needs them appears. Unused tuning items are not built in advance.
 
 ### Custom Preset
 
-The custom preset (`rules::custom()`, written to `presets\custom.toml` on first start) is the only preset so far. Its values and behaviors are starting points chosen by what the player experiences and tuned by playing; another player's numbers are not copied, since they would carry that implementation's choices without anyone having felt them.
+The custom preset (`rules::custom()`) is written to `presets\custom.toml` when that file is missing, and is chosen by naming it in `player.toml`. Its values and behaviors are starting points chosen by what the player experiences and tuned by playing; another player's numbers are not copied, since they would carry that implementation's choices without anyone having felt them.
 
 | Item | Value | What the player experiences |
 | --- | --- | --- |
@@ -870,8 +872,9 @@ Results and replays display and record where the values used came from ("preset 
 
 ### Settings Files
 
-- Settings are TOML in two files: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor) and `player.toml` (hi-speed, the preset file, the displayed gauge). Files are written atomically: to a temporary file, then renamed.
-- Everything lives in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\` (with `custom.toml`), `records\`, `logs\` and `measure\`. Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large; one root keeps backup simple, and the scopes stay separated by file. The registry is not used: it is not human-editable and does not fit presets distributed as files.
+- Settings are TOML in two files: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor) and `player.toml` (hi-speed, the preset file, by default `beatoraja-style.toml`, and the displayed gauge). A `player.toml` without a `preset` keeps the default; one that names a preset keeps that choice. Files are written atomically: to a temporary file, then renamed.
+- A missing preset file is written only for a standard preset: `custom.toml` with the custom preset and `beatoraja-style.toml` with beatoraja-style. Any other missing name is refused, naming the file, and nothing is written.
+- Everything lives in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\`, `records\`, `logs\` and `measure\`. Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large; one root keeps backup simple, and the scopes stay separated by file. The registry is not used: it is not human-editable and does not fit presets distributed as files.
 
 ## IR (Rankings)
 

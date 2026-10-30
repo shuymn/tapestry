@@ -27,6 +27,14 @@ use game::{
 use input::{DeviceKind, source_queue};
 use replay::{BuildProvenance, ReceiveMethod};
 
+/// The settings in `root`, naming the custom preset: these tests' values
+/// are the custom preset's.
+fn custom_settings(root: &DataRoot) -> Settings {
+    let mut settings = Settings::load(root).unwrap();
+    settings.player.preset = "custom.toml".to_owned();
+    settings
+}
+
 struct Summing;
 
 static BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -121,7 +129,7 @@ fn chart(notes: i64, bgm: usize) -> Chart {
 
 fn loaded(dir: &Path, chart: &Chart) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = Settings::load(&root).unwrap();
+    let settings = custom_settings(&root);
     let path = dir.join("play.chart");
     std::fs::write(&path, b"built in code").unwrap();
     let parts = Parts {
