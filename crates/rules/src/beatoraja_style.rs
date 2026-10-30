@@ -21,7 +21,7 @@
 //! | Release earlier than the GOOD edge is BAD, never POOR | `play/JudgeManager.java:533-541` (`lnendJudge = 3`; the release margin is 0, `play/JudgeProperty.java:26`) |
 //! | Release: the worse of head and release; held through the end keeps the head | `play/JudgeManager.java:534`, `:572-573` |
 //! | Scratch notes: PERFECT ±30, GREAT ±70, GOOD ±160 ms, BAD 230 ms early and 290 ms late; scratch LN-end edges 130, 170, 210 ms; scratch empty POOR 160 ms behind | `play/JudgeProperty.java:24` (scratch notes and MS pair), `:27` (scratch LN ends), `:191-197` (the table per note type); a scratch press, release and miss read it (`play/JudgeManager.java:380`, `:494`, `:595`) |
-//! | Note assignment ([`Assignment::ComboPriority`]): the unjudged notes inside BAD in time order, the first taken, and a later one taking over only when the press is past the taken note's late GOOD edge and the later note is not before its early GOOD edge; mines and LN ends are never candidates | `play/JudgeAlgorithm.java:17-20` (`Combo`), the default `PlayConfig.java:103`; the candidate loop `play/JudgeManager.java:385-417` |
+//! | Note assignment ([`Assignment::ComboPriority`]): the unjudged notes inside BAD in time order, the first taken, and a later one taking over only when the press is past the taken note's late GOOD edge and the later note is not before its early GOOD edge; an LN head is a candidate like a tap ([`HeadEligibility::InsideBad`]); mines and LN ends are never candidates | `play/JudgeAlgorithm.java:17-20` (`Combo`), the default `PlayConfig.java:103`; the candidate loop `play/JudgeManager.java:385-417` |
 //! | Empty POOR when no note is taken, from the same scan: a judged note inside the MS pair, or an unjudged one inside it but outside every window (the same range for both) | `play/JudgeManager.java:400-404`, `:419` |
 //! | Empty POOR: a note at most 500 ms after the press or 150 ms before it (160 ms on the scratch), inclusive (the scan's far end: see the known differences) | `play/JudgeProperty.java:23-24` (MS pairs), `play/JudgeManager.java:401` |
 //! | Empty POOR keeps the combo, adds to BP, has its own count | `play/JudgeProperty.java:29` (combo), `play/JudgeManager.java:660-668`, `BMSPlayer.java:915` (BP), `ScoreData.java:278` (MS count) |
@@ -148,10 +148,10 @@ use bms_model::TimeUs;
 
 use crate::{
     Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
-    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
-    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
-    RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode, Window,
-    WindowPolicy,
+    GaugeRule, GaugeValue, HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable,
+    LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment,
+    PerLaneClass, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode,
+    Window, WindowPolicy,
 };
 
 const MS: i64 = 1_000;
@@ -348,6 +348,7 @@ pub fn beatoraja_style() -> RulePreset {
         ln_mode: LnModeRule {
             default: LnMode::Ln,
             late_head: LateHeadRule::CompletesAtPress,
+            head_eligibility: HeadEligibility::InsideBad,
         },
         total_mode: TotalMode::ScalesIncrease,
         mine: MineRule::WhileHeld { per_unit: pct(1) },

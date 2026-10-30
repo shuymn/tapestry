@@ -177,8 +177,8 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
         let result = preset_canonical(&bytes).map(|_| ());
         let expected = match name {
             "custom" | "beatoraja_style" | "gauge_policies" | "long" => Ok(()),
-            "other_version" => Err(CanonicalError::UnsupportedVersion(9)),
-            "older_version" => Err(CanonicalError::UnsupportedVersion(7)),
+            "other_version" => Err(CanonicalError::UnsupportedVersion(10)),
+            "older_version" => Err(CanonicalError::UnsupportedVersion(8)),
             "wrong_percent_length" => Err(CanonicalError::WrongLength {
                 field: "rank_percent",
                 len: 6,

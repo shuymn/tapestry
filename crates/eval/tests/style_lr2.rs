@@ -1,11 +1,18 @@
-//! Hand-written examples of LR2-style's gauges, on a preset built here:
-//! beatoraja-style with the gauges and default `#TOTAL` of LR2oraja Endless
+//! Hand-written examples of the LR2-style rules, each naming the public
+//! source it follows. `rules::lr2_style()` does not exist yet (stage 2,
+//! PR8): until it does, the examples run under [`preset`], a preset built
+//! here: beatoraja-style with the values and policies of LR2oraja Endless
 //! Dream (<https://github.com/seraxis/lr2oraja-endlessdream> at `d4995153`,
-//! under `core/src/bms/player/beatoraja/`), cited as `file:line`. The
-//! preset's other rules are beatoraja-style's here and not under test.
+//! under `core/src/bms/player/beatoraja/`, cited as `file:line`) that the
+//! examples read. Its other rules, LN-end edges, empty POOR ranges and the
+//! window policy among them, are beatoraja-style's stand-ins and not under
+//! test; `#RANK 3` is 100 % under both.
 //!
 //! | Value | Source |
 //! | --- | --- |
+//! | Note windows at 100 %: PERFECT ±21, GREAT ±60, GOOD ±120, BAD ±200 ms, keys and scratch alike | `play/JudgeProperty.java:54-55` |
+//! | Note assignment: combo priority ([`Assignment::ComboPriority`]), beatoraja's default kept | the candidate loop `play/JudgeManager.java:414-455` |
+//! | A late BAD LN head cannot be the primary ([`HeadEligibility::NotLateBad`]) | `play/JudgeManager.java:435-437` |
 //! | Gauges `{min, max, start, clear, death}` and changes `{PG, GR, GD, BD, PR, MS}` | `play/GaugeProperty.java:117-122`, field order `:161` |
 //! | ASSIST EASY, EASY and NORMAL increases × `TOTAL / notes` | `play/GrooveGauge.java:263` (`TOTAL` modifier), `:117-119` |
 //! | HARD and EX HARD damage × `max(fix1, fix2)` ([`TotalCorrection::ScaleDamage`]), MS included | `play/GrooveGauge.java:279-309` (`MODIFY_DAMAGE`), `play/GaugeProperty.java:120-121`; once per chart, `play/GrooveGauge.java:207-211` |
@@ -18,16 +25,33 @@
 //! each change exact until one rounding down to 1/100000 %, where the source
 //! computes in `f32` (a known difference every target shares, design.md
 //! "What a -style Preset Reproduces").
+//!
+//! # Known differences
+//!
+//! - **An ineligible head drops the earlier candidate there.** Endless
+//!   Dream makes a late BAD LN head ineligible by giving it judge 6
+//!   (`play/JudgeManager.java:435-437`), which reuses beatoraja's existing
+//!   "no judgment here" branch, and that branch also resets the candidate
+//!   the scan had already taken (`:445-452`). The rule only says a late BAD
+//!   head cannot be taken, and LR2 judges the oldest note, so here the
+//!   earlier candidate stays the primary. With a tap at 0 ms and a long
+//!   note from 30 ms on one lane, a press at 190 ms is BAD on the tap here
+//!   and the head is missed at 230 ms; there the press judges nothing, the
+//!   tap is missed at 200 ms and the head at 230 ms
+//!   (`late_bad_ln_head_is_not_selectable`).
 
 mod common;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{MS, device, lane, press, release};
-use eval::{EvalError, EvalInput, Evaluation, Evaluator, InputStart, PhysicalInputEvent, Section};
+use common::{MS, device, empty_poors, lane, press, release};
+use eval::{
+    EvalError, EvalInput, Evaluation, Evaluator, InputStart, JudgeEventKind, PhysicalInputEvent,
+    Section, evaluate,
+};
 use rules::Judgment::{Bad, Perfect, Poor};
 use rules::{
-    DefaultTotal, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, Judgment, LowDamage, PerJudgment,
-    RulePreset, TotalCorrection,
+    Assignment, DefaultTotal, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeadEligibility,
+    JudgeWindows, Judgment, LowDamage, PerJudgment, RulePreset, TotalCorrection, Window,
 };
 
 const BPM: i64 = 150_000;
@@ -37,6 +61,11 @@ const PCT: i64 = GaugeValue::PERCENT;
 const TARGET: i64 = 11_000 * MS;
 /// A BAD: 200 ms late at `#RANK 3`.
 const BAD_AT: i64 = TARGET + 200 * MS;
+
+/// The first note of the press examples.
+const T: i64 = 1_000 * MS;
+/// When this evaluator decides a miss: at the late BAD edge, 200 ms.
+const MISSED: i64 = 200 * MS;
 
 const NORMAL: usize = 0;
 const HARD: usize = 3;
@@ -111,11 +140,24 @@ fn survival_gauge(
     }
 }
 
-/// beatoraja-style with Endless Dream's gauges (`play/GaugeProperty.java:
-/// 117-122`) and default `#TOTAL` (`play/BMSPlayerRule.java:88-89`).
-fn lr2_gauges() -> RulePreset {
+/// beatoraja-style with Endless Dream's 100 % note windows on both lane
+/// classes (`play/JudgeProperty.java:54-55`), combo priority, its LN-head
+/// eligibility (`play/JudgeManager.java:435-437`), gauges
+/// (`play/GaugeProperty.java:117-122`) and default `#TOTAL`
+/// (`play/BMSPlayerRule.java:88-89`).
+fn preset() -> RulePreset {
     let mut p = rules::beatoraja_style();
-    p.id = "lr2-gauges".to_owned();
+    p.id = "lr2-style-examples".to_owned();
+    let windows = JudgeWindows {
+        perfect: Window::symmetric(21 * MS),
+        great: Window::symmetric(60 * MS),
+        good: Window::symmetric(120 * MS),
+        bad: Window::symmetric(200 * MS),
+    };
+    p.tables.keys.windows = windows;
+    p.tables.scratch.windows = windows;
+    p.assignment = Assignment::ComboPriority;
+    p.ln_mode.head_eligibility = HeadEligibility::NotLateBad;
     p.default_total = DefaultTotal::NotesLinear;
     p.gauges = vec![
         end_gauge("normal", 80, [10, 5], [400, 600, 200]),
@@ -144,7 +186,7 @@ fn lr2_gauges() -> RulePreset {
             Vec::new(),
         ),
     ];
-    p.validate().unwrap();
+    assert_eq!(p.validate(), Ok(()));
     p
 }
 
@@ -193,7 +235,7 @@ fn from_values(
             initial_gauges: initial,
         }),
     };
-    let e = eval::evaluate(chart, &input, preset).unwrap();
+    let e = evaluate(chart, &input, preset).unwrap();
     assert!(e.completed);
     e
 }
@@ -230,7 +272,7 @@ fn judged(e: &Evaluation) -> Vec<Judgment> {
 /// 2 %: 0.16 per note, twice that from the 401st to the 600th.
 #[test]
 fn lr2_default_total_matches_the_source() {
-    let preset = lr2_gauges();
+    let preset = preset();
     for (n, increase) in [
         // 160.16 % for one note: clamped to 100 %.
         (1, 98 * PCT),
@@ -279,7 +321,7 @@ fn lr2_default_total_matches_the_source() {
 /// per chart), play/GaugeProperty.java:121 (EX HARD BAD −12 %, MS −2 %).
 #[test]
 fn lr2_damage_correction_matches_the_source() {
-    let preset = lr2_gauges();
+    let preset = preset();
     let bad = |n, total| {
         let e = from_values(
             &preset,
@@ -331,7 +373,7 @@ fn lr2_damage_correction_matches_the_source() {
 /// 240` the correction is 1.
 #[test]
 fn survival_below_two_percent_fails_including_mines() {
-    let preset = lr2_gauges();
+    let preset = preset();
     let chart = one_target(1_000, Some(240_000), None);
     // EX HARD's BAD (−12 %) from 14 % leaves exactly 2 % and survives; from
     // 13.99999 % it leaves 1.99999 % and fails at 0.
@@ -374,7 +416,7 @@ fn survival_below_two_percent_fails_including_mines() {
 /// (`play/GaugeProperty.java:90` at exch-bms2/beatoraja@83574048).
 #[test]
 fn mine_damage_skips_judgment_modifiers() {
-    let preset = lr2_gauges();
+    let preset = preset();
     // 20 notes at #TOTAL 300: judgment damage × 10.
     let chart = one_target(20, Some(300_000), Some(5));
     let mut events = hold_mine();
@@ -415,7 +457,7 @@ fn mine_damage_skips_judgment_modifiers() {
 /// HARD's POOR (−10 %) at 1000 notes and `#TOTAL 224` (× 10/9).
 #[test]
 fn gauge_effect_order_is_fixed() {
-    let preset = lr2_gauges();
+    let preset = preset();
     let chart = one_target(1_000, Some(224_000), None);
     let poor = |before: i64| {
         let e = from_values(&preset, &chart, &[(HARD, before)], Vec::new());
@@ -443,7 +485,7 @@ fn gauge_effect_order_is_fixed() {
 /// correction alike, so a note moves a gauge as far as in a full play.
 #[test]
 fn a_practiced_section_reads_the_whole_charts_note_count() {
-    let preset = lr2_gauges();
+    let preset = preset();
     // 1000 notes, one of them in the section: #TOTAL 352 (not 160.16 for
     // one note) and no correction (not × 10).
     let chart = one_target(1_000, None, None);
@@ -458,4 +500,127 @@ fn a_practiced_section_reads_the_whole_charts_note_count() {
     assert_eq!(gauge(&e, NORMAL), 100 * PCT);
     let e = from_values(&preset, &alone, &[], tap_at(BAD_AT));
     assert_eq!(gauge(&e, EX_HARD), 0);
+}
+
+/// Builds a chart on key 1 at `#RANK 3`.
+fn chart(build: impl FnOnce(ChartBuilder) -> ChartBuilder) -> Chart {
+    let mut chart = build(ChartBuilder::new(BPM)).build().unwrap();
+    chart.meta.judgment_headers = vec![common::rank(3)];
+    chart
+}
+
+fn play_with(chart: &Chart, preset: &RulePreset, events: Vec<PhysicalInputEvent>) -> Evaluation {
+    let input = EvalInput {
+        events,
+        device: device(&[0]),
+        start: InputStart::default(),
+        finalized: None,
+        section: None,
+    };
+    let e = evaluate(chart, &input, preset).unwrap();
+    assert!(e.completed);
+    e
+}
+
+/// A press at `at` on key 1, released `hold` later.
+fn hold_at(at: i64, hold: i64) -> Vec<PhysicalInputEvent> {
+    vec![press(at, 0, 1), release(at + hold, 0, 1)]
+}
+
+/// Each judgment: (time, note index, judgment, deviation).
+fn judged_at(e: &Evaluation) -> Vec<(i64, usize, rules::Judgment, Option<i64>)> {
+    let times = e.events.iter().filter_map(|ev| match ev.kind {
+        JudgeEventKind::Judged { .. } => Some(ev.time.0),
+        _ => None,
+    });
+    times
+        .zip(common::judgments(&e.events))
+        .map(|(t, (_, note, j, d))| (t, note, j, d))
+        .collect()
+}
+
+/// K. A long note from 0 to 50 ms and a tap at 300 ms, pressed at 160 ms:
+/// the head would be a late BAD, so it cannot be the primary, which combo
+/// priority alone would keep since the tap lies outside GOOD. The press
+/// takes the tap, 140 ms early (BAD), and the head it passes is POOR at the
+/// press, before it (`play/JudgeManager.java:435-437`; the passed note is
+/// POOR at the press, a known difference shared with beatoraja-style).
+#[test]
+fn ineligible_head_is_passed_and_poor() {
+    let chart = chart(|b| {
+        b.long(lane(1), TimeUs(T), TimeUs(T + 50 * MS))
+            .tap(lane(1), TimeUs(T + 300 * MS))
+    });
+    let at = T + 160 * MS;
+    let e = play_with(&chart, &preset(), hold_at(at, 10));
+    assert_eq!(
+        judged_at(&e),
+        [(at, 0, Poor, None), (at, 1, Bad, Some(-140 * MS))]
+    );
+    // Without the eligibility rule, combo priority keeps the head.
+    let mut inside = preset();
+    inside.ln_mode.head_eligibility = HeadEligibility::InsideBad;
+    let e = play_with(&chart, &inside, hold_at(at, 10));
+    assert_eq!(judged_at(&e)[0], (at, 0, Bad, Some(160 * MS)));
+}
+
+/// K. A late BAD press that reaches an LN head no primary passes leaves the
+/// head where it is: it is not taken, and it is missed at its own deadline
+/// (`play/JudgeManager.java:435-437`). Pressed at 160 ms with the long note
+/// alone, the press takes nothing, under either assignment policy.
+#[test]
+fn late_bad_ln_head_is_not_selectable() {
+    let alone = chart(|b| b.long(lane(1), TimeUs(T), TimeUs(T + 50 * MS)));
+    for assignment in [Assignment::ComboPriority, Assignment::NearestTiesEarlier] {
+        let mut p = preset();
+        p.assignment = assignment;
+        let e = play_with(&alone, &p, hold_at(T + 160 * MS, 10));
+        assert_eq!(
+            judged_at(&e),
+            [(T + MISSED, 0, Poor, None)],
+            "{assignment:?}"
+        );
+        assert_eq!(empty_poors(&e.events), 0);
+        assert!(
+            !e.events
+                .iter()
+                .any(|ev| matches!(ev.kind, JudgeEventKind::LnHoldEnded { .. })),
+            "the press took no head"
+        );
+    }
+    // A tap at 0 ms and a long note from 30 ms, pressed at 190 ms: the head
+    // (160 ms late) is not the primary, which stays the tap, BAD at the
+    // press, and the head is missed at its own deadline, 230 ms. Endless
+    // Dream drops the tap too (a known difference, in the module docs).
+    let before = chart(|b| {
+        b.tap(lane(1), TimeUs(T))
+            .long(lane(1), TimeUs(T + 30 * MS), TimeUs(T + 80 * MS))
+    });
+    let at = T + 190 * MS;
+    let e = play_with(&before, &preset(), hold_at(at, 10));
+    assert_eq!(
+        judged_at(&e),
+        [
+            (at, 0, Bad, Some(190 * MS)),
+            (T + 30 * MS + MISSED, 1, Poor, None)
+        ]
+    );
+}
+
+/// G. A BAD long-note head decides its long note at the press, also under
+/// the head eligibility rule: an early BAD head is eligible, and the
+/// release that follows changes nothing.
+#[test]
+fn bad_ln_head_is_scored_at_the_press() {
+    let chart = chart(|b| b.long(lane(1), TimeUs(T), TimeUs(T + 500 * MS)));
+    let at = T - 150 * MS;
+    let e = play_with(&chart, &preset(), hold_at(at, 600 * MS));
+    assert_eq!(judged_at(&e), [(at, 0, Bad, Some(-150 * MS))]);
+    let ended: Vec<_> = e
+        .events
+        .iter()
+        .filter(|ev| matches!(ev.kind, JudgeEventKind::LnHoldEnded { .. }))
+        .map(|ev| ev.time.0)
+        .collect();
+    assert_eq!(ended, [at + 600 * MS], "released 50 ms before the end");
 }
