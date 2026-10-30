@@ -118,6 +118,8 @@ pub struct InputState {
     connected: AtomicBool,
     /// The hook was dropped: the input thread ended, or is unwinding.
     gone: AtomicBool,
+    /// The hook's wakes so far.
+    wakes: std::sync::atomic::AtomicU64,
 }
 
 /// The game thread's end of the input side.
@@ -234,6 +236,13 @@ impl InputLink {
             .then_some(InputWaitError::Gone))
     }
 
+    /// The input thread's wakes so far: what its cadence costs while
+    /// nothing plays (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn wakes(&self) -> u64 {
+        self.state.wakes.load(Ordering::Relaxed)
+    }
+
     /// Whether the focus gate has tripped since recording last opened.
     pub fn tripped(&self) -> bool {
         self.state.tripped.load(Ordering::Acquire)
@@ -341,6 +350,7 @@ impl Hook {
     /// checks the focus gate, so a focus loss during the audio tail or on
     /// the end screen is published.
     pub fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) -> Phase {
+        self.state.wakes.fetch_add(1, Ordering::Relaxed);
         match (&mut self.mode, self.origin) {
             (Mode::Autoplay(feeder), Some(origin)) => {
                 input::InputAdapter::poll(feeder, TimeUs(now.0 - origin.0), sources);

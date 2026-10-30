@@ -7,14 +7,14 @@
 //! latch is set (design.md "Input"). With song selection the menu keys and
 //! the text typed or composed through the IME go to the select screen too
 //! ([`crate::select::MenuInput`], design.md "Play Lifecycle"), through a
-//! bounded queue that drops what does not fit; the IME is allowed only while
-//! the search box has focus. The event loop runs
+//! queue that drops only keys past its bound ([`MenuQueue`]); the IME is
+//! allowed only while the search box has focus. The event loop runs
 //! on a thread of its own, so the game keeps the main thread and the loaded
 //! chart never has to move.
 
 use std::num::NonZeroIsize;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
 use anyhow::Context as _;
@@ -34,7 +34,7 @@ use winit::raw_window_handle::{
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::controls::Controls;
-use crate::select::{MenuInput, MenuKey};
+use crate::select::{MenuInput, MenuKey, MenuQueue};
 
 /// What the game thread asks of the window thread.
 enum Ask {
@@ -52,7 +52,7 @@ struct App {
     ready: Option<Sender<anyhow::Result<Surface>>>,
     window: Option<Window>,
     /// Where the select screen's input goes, with song selection.
-    menu: Option<SyncSender<MenuInput>>,
+    menu: Option<Arc<MenuQueue>>,
 }
 
 impl ApplicationHandler<Ask> for App {
@@ -167,6 +167,15 @@ impl WindowThread {
         let _ = self.handle.join();
     }
 
+    /// Closes the window once its renderer is gone (`rendered`), or else
+    /// leaves it open to the process's exit: a render thread that did not
+    /// end may still draw into it.
+    pub fn close_after(self, rendered: bool) {
+        if rendered {
+            self.close();
+        }
+    }
+
     /// The switch of the window's IME.
     pub fn ime(&self) -> ImeSwitch {
         ImeSwitch(self.proxy.clone())
@@ -213,7 +222,7 @@ pub fn open(
     retry: Option<u32>,
     quit: Option<u32>,
     monitor: Option<String>,
-    menu: Option<SyncSender<MenuInput>>,
+    menu: Option<Arc<MenuQueue>>,
 ) -> anyhow::Result<(WindowThread, Surface)> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proxy_tx, proxy_rx) = mpsc::channel();
@@ -359,10 +368,9 @@ fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &Keys)
     }
 }
 
-/// Hands `input` to the select screen and wakes the game thread; a full
-/// queue drops it (the game thread drains it at every look).
-fn send_menu(menu: &SyncSender<MenuInput>, controls: &Controls, input: MenuInput) {
-    let _ = menu.try_send(input);
+/// Hands `input` to the select screen and wakes the game thread.
+fn send_menu(menu: &MenuQueue, controls: &Controls, input: MenuInput) {
+    menu.push(input);
     controls.wake_game();
 }
 

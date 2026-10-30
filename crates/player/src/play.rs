@@ -138,11 +138,15 @@ pub struct PlayerRig<'a> {
 }
 
 impl PlayerRig<'_> {
-    /// Writes changed settings, then ends the render and audio threads.
-    pub fn shut_down(mut self) {
+    /// Writes changed settings, then ends the render and audio threads;
+    /// `false` when the render thread did not end, so the window must stay
+    /// open until the process exits.
+    #[must_use]
+    pub fn shut_down(mut self) -> bool {
         self.persist();
-        self.render.exit();
+        let ended = self.render.exit();
         self.audio.exit();
+        ended
     }
 
     /// Writes the settings keys' values to `device.toml` and

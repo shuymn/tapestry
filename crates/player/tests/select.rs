@@ -38,12 +38,25 @@ fn write_wav(path: &Path, amplitude: i16) {
 /// lane 1 half a second apart from 2 s on, each sounding its folder's own
 /// `key.wav`, a square wave of `amplitude`.
 fn write_chart(library: &Path, folder: &str, name: &str, title: &str, amplitude: i16) -> PathBuf {
+    write_notes(library, folder, name, title, amplitude, 4)
+}
+
+/// [`write_chart`] with `notes` notes spread evenly over the measure.
+fn write_notes(
+    library: &Path,
+    folder: &str,
+    name: &str,
+    title: &str,
+    amplitude: i16,
+    notes: usize,
+) -> PathBuf {
     let dir = library.join(folder);
     fs::create_dir_all(&dir).unwrap();
     write_wav(&dir.join("key.wav"), amplitude);
     let text = format!(
         "#PLAYER 1\n#TITLE {title}\n#ARTIST テスト\n#PLAYLEVEL 3\n#BPM 120\n\
-         #WAV01 key.wav\n#00111:01010101\n"
+         #WAV01 key.wav\n#00111:{}\n",
+        "01".repeat(notes)
     );
     let path = dir.join(name);
     fs::write(&path, text).unwrap();
@@ -155,14 +168,15 @@ fn choosing_a_chart_plays_it_and_returns() {
 }
 
 /// Two charts on the same threads: the second plays its own sound, never
-/// the first's, though both name it `#WAV01`; each chart's load time is
-/// printed; and every countdown, a retry's too, starts only after the
+/// the first's, though both name it `#WAV01`, and its own input, four
+/// times longer than the first's, every note of it on time; each chart's
+/// load time is printed; and every countdown, a retry's too, starts only after the
 /// scan's pause was acknowledged (or no scan ran).
 #[test]
 fn a_second_chart_plays_only_its_own_sounds() {
     let fx = fixture();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 24_000);
-    write_chart(&fx.library, "b", "b.bms", "譜面B", 1_000);
+    write_notes(&fx.library, "b", "b.bms", "譜面B", 1_000, 16);
     let (_, stdout) = run(
         &fx,
         "pick=a.bms,enter,retry,back,pick=b.bms,enter,back,close",
@@ -174,9 +188,15 @@ fn a_second_chart_plays_only_its_own_sounds() {
         2,
         "{stdout}"
     );
-    // Four notes a play: two plays of chart a, one of b.
+    let plays = lines(&stdout, "play 1: ");
+    assert!(plays[0].starts_with("play 1: Completed; perfect 4 great 0 good 0 bad 0 poor 0"));
+    assert!(
+        plays[1].starts_with("play 1: Completed; perfect 16 great 0 good 0 bad 0 poor 0"),
+        "{stdout}"
+    );
+    // Two plays of chart a, four notes each, one of b's sixteen.
     let peaks = onset_peaks(&stdout);
-    assert_eq!(peaks.len(), 12, "{stdout}");
+    assert_eq!(peaks.len(), 24, "{stdout}");
     let (a, b) = peaks.split_at(8);
     assert!(a.iter().all(|&p| p > 0.2), "{peaks:?}");
     assert!(b.iter().all(|&p| p < 0.05), "{peaks:?}");
@@ -210,13 +230,20 @@ fn refused_chart_shows_its_reason() {
     write_chart(&fx.library, "good", "good.bms", "譜面", 8_000);
     let (_, stdout) = run(
         &fx,
-        "pick=bad.bms,enter,enter,pick=good.bms,enter,back,close",
+        "pick=bad.bms,enter,sleep=500,enter,pick=good.bms,enter,back,close",
         &[],
     );
     let refused = lines(&stdout, "select: refused bad.bms: ");
     assert_eq!(refused.len(), 2, "{stdout}");
     assert!(
         refused[0].ends_with("the chart cannot be loaded: line 2: unsupported #LNTYPE 2"),
+        "{stdout}"
+    );
+    // The select screen drew the reason.
+    assert!(
+        lines(&stdout, "dev: drawn notice: bad.bms: ")
+            .iter()
+            .any(|l| l.ends_with("unsupported #LNTYPE 2")),
         "{stdout}"
     );
     assert_eq!(lines(&stdout, "select: chose bad.bms").len(), 2, "{stdout}");
@@ -257,4 +284,35 @@ fn refused_load_releases_the_scan_pause() {
     assert!(added, "{stdout}\n{stderr}");
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+}
+
+/// The input thread drops its heartbeat on the select screen: at the first
+/// entry, after a refused chart and after a completed play, it wakes only
+/// for what it is asked.
+#[test]
+fn the_input_thread_idles_on_the_select_screen() {
+    let fx = fixture();
+    let bad = fx.library.join("bad");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(bad.join("bad.bms"), "#LNTYPE 2\n#00111:01\n").unwrap();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let (_, stdout) = run(
+        &fx,
+        "wait=a.bms,idle=1000,pick=bad.bms,enter,idle=1000,pick=a.bms,enter,back,idle=1000,close",
+        &[],
+    );
+    let woke: Vec<u64> = lines(&stdout, "dev: the input thread woke ")
+        .iter()
+        .map(|l| {
+            l.trim_start_matches("dev: the input thread woke ")
+                .split(' ')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(woke.len(), 3, "{stdout}");
+    // A heartbeat would wake it about a thousand times a second.
+    assert!(woke.iter().all(|&n| n < 50), "{woke:?}\n{stdout}");
 }

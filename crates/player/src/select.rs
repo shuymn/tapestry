@@ -10,7 +10,10 @@
 //! lane keys type nothing into the list. Everything here runs on menus,
 //! where allocation is allowed.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use library::{ChartEntry, Search, Sort};
 
@@ -52,6 +55,54 @@ pub enum MenuInput {
     Text(String),
     /// The IME's composition so far; empty when it ends.
     Preedit(String),
+}
+
+/// Keys the queue holds at most; a key past them is dropped and counted.
+pub const QUEUED_KEYS: usize = 64;
+
+/// What the window hands the select screen, until the game thread takes it
+/// at its next look. Nothing that carries state is ever dropped: committed
+/// text joins the text before it, and an IME composition replaces the one
+/// before it, so its last state, the end of a composition included, always
+/// arrives. Only keys are bounded ([`QUEUED_KEYS`]); a key past the bound
+/// is dropped and counted.
+#[derive(Debug, Default)]
+pub struct MenuQueue {
+    inputs: Mutex<VecDeque<MenuInput>>,
+    dropped: AtomicU64,
+}
+
+impl MenuQueue {
+    /// Queues `input`.
+    pub fn push(&self, input: MenuInput) {
+        let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        match (input, q.back_mut()) {
+            (MenuInput::Text(text), Some(MenuInput::Text(last))) => last.push_str(&text),
+            (MenuInput::Preedit(text), Some(MenuInput::Preedit(last))) => *last = text,
+            (MenuInput::Key(key), _) => {
+                let keys = q.iter().filter(|i| matches!(i, MenuInput::Key(_))).count();
+                if keys < QUEUED_KEYS {
+                    q.push_back(MenuInput::Key(key));
+                } else {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            (input, _) => q.push_back(input),
+        }
+    }
+
+    /// Takes the oldest input.
+    pub fn pop(&self) -> Option<MenuInput> {
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+    }
+
+    /// Keys dropped so far.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 /// What an input did.
@@ -188,6 +239,12 @@ impl SelectScreen {
     #[cfg(feature = "dev-tools")]
     pub fn entries(&self) -> &[ChartEntry] {
         &self.entries
+    }
+
+    /// Forgets an IME composition left from before a chart: its end may
+    /// have arrived while the chart played, with what it typed.
+    pub fn end_composition(&mut self) {
+        self.preedit.clear();
     }
 
     /// Shows why the chosen chart was refused, or nothing.
@@ -385,7 +442,7 @@ mod tests {
 
     use library::{ChartEntry, Header, Sort};
 
-    use super::{Acted, MenuInput, MenuKey, SelectScreen};
+    use super::{Acted, MenuInput, MenuKey, MenuQueue, QUEUED_KEYS, SelectScreen};
     use crate::menu_screen::LineStyle;
 
     fn entry(path: &str, title: &str) -> ChartEntry {
@@ -466,6 +523,33 @@ mod tests {
         assert_eq!(s.input(key(MenuKey::Enter)), Acted::Focus(false));
         assert!(!s.searching());
         assert_eq!(s.input(MenuInput::Text("x".to_owned())), Acted::Nothing);
+    }
+
+    /// A full queue drops and counts keys only: committed text and the
+    /// IME's last composition, its end included, always arrive, joined or
+    /// replaced rather than queued one by one.
+    #[test]
+    fn the_menu_queue_keeps_text_and_the_end_of_a_composition() {
+        let q = MenuQueue::default();
+        for _ in 0..QUEUED_KEYS + 3 {
+            q.push(key(MenuKey::Down));
+        }
+        q.push(MenuInput::Preedit("に".to_owned()));
+        q.push(MenuInput::Preedit("にほ".to_owned()));
+        q.push(MenuInput::Preedit(String::new()));
+        q.push(MenuInput::Text("日".to_owned()));
+        q.push(MenuInput::Text("本".to_owned()));
+        q.push(key(MenuKey::Escape));
+        assert_eq!(q.dropped(), 4);
+        let all: Vec<MenuInput> = std::iter::from_fn(|| q.pop()).collect();
+        assert_eq!(all.len(), QUEUED_KEYS + 2);
+        assert_eq!(
+            all[QUEUED_KEYS..],
+            [
+                MenuInput::Preedit(String::new()),
+                MenuInput::Text("日本".to_owned())
+            ]
+        );
     }
 
     /// The list is grouped under folder headings, the cursor's chart is

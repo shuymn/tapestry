@@ -168,6 +168,10 @@ pub struct View {
 /// answers between frames, after the skin's uploads.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the end of the render thread is waited for: past it, the thread
+/// is left to the process's exit.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long the game thread waits for a play's figures. The render thread
 /// answers between frames, so this bounds only a stalled render thread: a
 /// slow frame, such as a software adapter drawing and the dev-tools frame
@@ -202,6 +206,12 @@ pub struct RenderLink {
     tx: Sender<RenderMsg>,
     shared: Arc<Shared>,
     handle: JoinHandle<()>,
+    /// Disconnects when the thread ends, however it ends.
+    ended: Receiver<()>,
+    /// How long a preparation or a chart's load is waited for.
+    answer_timeout: Duration,
+    /// How long the end of the thread is waited for.
+    exit_timeout: Duration,
 }
 
 impl RenderLink {
@@ -218,8 +228,7 @@ impl RenderLink {
     pub fn prepare(&self) -> Result<(), ScreenError> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Prepare(tx));
-        rx.recv().map_err(|_| ScreenError::Ended)??;
-        Ok(())
+        self.answer(&rx)
     }
 
     /// Prepares `chart` for every play from now on, and waits until it is.
@@ -232,7 +241,13 @@ impl RenderLink {
     pub fn load(&self, chart: Arc<Chart>) -> Result<(), ScreenError> {
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Load { chart, reply });
-        match rx.recv_timeout(LOAD_TIMEOUT) {
+        self.answer(&rx)
+    }
+
+    /// The answer to a preparation or a load, waited for at most
+    /// [`LOAD_TIMEOUT`]; a late answer goes nowhere.
+    fn answer(&self, rx: &Receiver<Result<(), RenderError>>) -> Result<(), ScreenError> {
+        match rx.recv_timeout(self.answer_timeout) {
             Ok(ready) => Ok(ready?),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
@@ -258,10 +273,30 @@ impl RenderLink {
         (t != i64::MIN).then_some(TimeUs(t))
     }
 
-    /// Ends the thread and waits for it.
-    pub fn exit(self) {
+    /// Ends the thread and waits for it at most [`EXIT_TIMEOUT`]; `false`
+    /// when it did not end, so the window it draws into must stay open.
+    pub fn exit(self) -> bool {
         self.send(RenderMsg::Exit);
-        let _ = self.handle.join();
+        match self.ended.recv_timeout(self.exit_timeout) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Detached: a thread stuck in the screen's work must not
+                // hold up the exit. The caller keeps the window open.
+                eprintln!("render: the render thread did not end");
+                false
+            }
+            _ => {
+                let _ = self.handle.join();
+                true
+            }
+        }
+    }
+
+    /// Shortens the waits (tests).
+    #[cfg(test)]
+    fn with_timeouts(mut self, answer: Duration, exit: Duration) -> Self {
+        self.answer_timeout = answer;
+        self.exit_timeout = exit;
+        self
     }
 }
 
@@ -288,9 +323,12 @@ pub fn spawn(
         first_frame: AtomicI64::new(i64::MIN),
     });
     let thread_shared = Arc::clone(&shared);
+    let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
     let handle = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
+            // Dropped when the thread ends, however it ends.
+            let _ended = ended_tx;
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
             let screen = match build(&mut make, chart.as_deref()) {
@@ -319,7 +357,14 @@ pub fn spawn(
         })
         .map_err(ScreenError::Spawn)?;
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(RenderLink { tx, shared, handle }),
+        Ok(Ok(())) => Ok(RenderLink {
+            tx,
+            shared,
+            handle,
+            ended,
+            answer_timeout: LOAD_TIMEOUT,
+            exit_timeout: EXIT_TIMEOUT,
+        }),
         Ok(Err(e)) => {
             let _ = handle.join();
             Err(e.into())
@@ -386,6 +431,16 @@ impl Run {
                 Ok(RenderMsg::Load { chart, reply }) => {
                     self.chart = Some(chart);
                     let ready = self.prepare();
+                    // A chart the screen cannot draw is refused, and the
+                    // screen it dropped is built again without it, for the
+                    // select screen; if that fails too, the failure is
+                    // reported and the game builds it through a preparation.
+                    if ready.is_err() {
+                        self.chart = None;
+                        if self.prepare().is_err() {
+                            self.shared.failed.store(true, Ordering::Release);
+                        }
+                    }
                     let _ = reply.send(ready);
                     mode = Mode::Idle;
                     continue;
@@ -510,6 +565,15 @@ impl Run {
                     if let Ok((t, _)) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
                         self.menu_stats.frame(t.cpu, after - before, *changed);
+                        // What a refusal put on the screen, once drawn.
+                        if *changed
+                            && let Some(notice) = page.lines.iter().find(|l| {
+                                l.style == crate::menu_screen::LineStyle::Notice
+                                    && !l.text.is_empty()
+                            })
+                        {
+                            println!("dev: drawn notice: {}", notice.text);
+                        }
                     }
                     *changed = false;
                     drawn
@@ -757,6 +821,145 @@ mod tests {
         assert_eq!(&seen[..3], [(1, true), (1, false), (1, false)]);
         assert_eq!(seen[3], (2, true), "{seen:?}");
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A screen that cannot draw any chart; it notes its menu frames by the
+    /// number of the build that made it.
+    struct NoCharts {
+        id: u32,
+        seen: Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    impl Screen for NoCharts {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+            Err(RenderError::Skin(SkinError {
+                reason: "no lanes".to_owned(),
+            }))
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.seen.lock().unwrap().push(self.id);
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A chart the screen cannot draw is refused, and the select screen
+    /// still draws afterwards, on a screen built again without the chart:
+    /// no failure is left for the game to find.
+    #[test]
+    fn a_refused_chart_leaves_a_working_select_screen() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let builds = Arc::new(AtomicU32::new(0));
+        let (made, noted) = (Arc::clone(&builds), Arc::clone(&seen));
+        let make: MakeScreen = Box::new(move || {
+            let id = made.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Box::new(NoCharts {
+                id,
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        assert!(matches!(
+            link.load(chart),
+            Err(ScreenError::Render(RenderError::Skin(_)))
+        ));
+        assert!(!link.failed());
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&2)));
+        assert!(!link.failed());
+        link.exit();
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A screen whose chart preparation blocks until `release` sends.
+    struct Blocking {
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Screen for Blocking {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+            let _ = self.release.recv();
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A chart's load that blocks the render thread bounds every wait on
+    /// it: the load and a preparation give up, and the close that follows
+    /// returns, saying the thread did not end, so the window stays open.
+    #[test]
+    fn a_blocked_load_bounds_the_preparation_and_the_close() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut blocked = Some(blocked);
+        let make: MakeScreen = Box::new(move || {
+            let release = blocked.take().expect("built once");
+            Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap()
+        .with_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let started = Instant::now();
+        assert!(matches!(link.load(chart), Err(ScreenError::NoAnswer)));
+        assert!(matches!(link.prepare(), Err(ScreenError::NoAnswer)));
+        assert!(!link.exit());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The thread ends once its screen does.
+        release.send(()).unwrap();
     }
 
     fn wait_until(f: impl Fn() -> bool) -> bool {

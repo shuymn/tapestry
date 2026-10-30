@@ -166,18 +166,12 @@ impl Controls {
             });
     }
 
-    /// Takes the pending suspend, quit (while it leaves the chart) or retry,
-    /// in that order: a quit drops a retry pressed with it, and a suspend
-    /// leaves the quit for the next take.
+    /// Takes the pending quit (while it leaves the chart), suspend or retry,
+    /// in that order: a quit drops a retry pressed with it and leaves a
+    /// suspend for the next take, so a chart the player left is left even
+    /// when the system suspends too.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take(&self) -> Option<Command> {
-        if self
-            .command
-            .compare_exchange(SUSPEND, NONE, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return Some(Command::Suspend);
-        }
         if self.leave.swap(false, Ordering::AcqRel) {
             let _ = self
                 .command
@@ -189,6 +183,12 @@ impl Controls {
             SUSPEND => Some(Command::Suspend),
             _ => None,
         }
+    }
+
+    /// Whether a quit key press waits to be taken (while it leaves the
+    /// chart).
+    pub fn leaving(&self) -> bool {
+        self.leave.load(Ordering::Acquire)
     }
 
     /// When the latest retry was received.
@@ -253,7 +253,7 @@ mod tests {
     }
 
     /// With song selection the quit key leaves the chart: taken once, ahead
-    /// of a retry pressed with it and behind a suspend, and it never
+    /// of a retry or a suspend pressed with it, and it never
     /// latches quitting; closing the window still does.
     #[test]
     fn the_quit_key_leaves_the_chart_with_selection() {
@@ -266,8 +266,10 @@ mod tests {
         assert_eq!(c.take(), None);
         c.command(Command::Suspend);
         c.command(Command::Quit);
-        assert_eq!(c.take(), Some(Command::Suspend));
+        assert!(c.leaving());
         assert_eq!(c.take(), Some(Command::Quit));
+        assert!(!c.leaving());
+        assert_eq!(c.take(), Some(Command::Suspend));
         assert_eq!(c.take(), None);
         assert!(!c.quitting());
         c.close();

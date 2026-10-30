@@ -28,9 +28,13 @@ use library::{ChartEntry, Library, LibraryError, Opened, Scan, ScanOptions, Scan
 /// How long the last pass is over before the next starts, at the select
 /// screen.
 pub const RESCAN_AFTER: Duration = Duration::from_secs(10);
-/// How long a countdown waits for the scan to acknowledge its pause: the
-/// file in hand (at most the loader's 16 MiB cap) and the batch's commit.
-pub const PAUSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a countdown's wait for the scan's pause looks whether it
+/// was cancelled.
+pub const PAUSE_SLICE: Duration = Duration::from_millis(100);
+/// How long the wait for the pause runs before the select screen says so:
+/// the file in hand (at most the loader's 16 MiB cap) and the batch's
+/// commit take far less on a local disk.
+pub const PAUSE_NOTICE: Duration = Duration::from_secs(2);
 
 /// The database file under the data root.
 pub fn database(root: &DataRoot) -> PathBuf {
@@ -91,8 +95,9 @@ pub enum Paused {
     Acknowledged,
     /// No scan runs.
     Idle,
-    /// The scan did not acknowledge within [`PAUSE_TIMEOUT`].
-    TimedOut,
+    /// The wait was cancelled: the window is closing, or the player left
+    /// the chart. No countdown follows.
+    Cancelled,
 }
 
 /// The library and its scan passes.
@@ -118,6 +123,16 @@ impl Shelf {
         let options = ScanOptions {
             on_thread_start: Some(Arc::new(background_mode)),
         };
+        Self::with_options(library, roots, rescan_after, options)
+    }
+
+    /// [`new`](Self::new), each pass's thread starting with `options`.
+    fn with_options(
+        library: Library,
+        roots: Vec<PathBuf>,
+        rescan_after: Duration,
+        options: ScanOptions,
+    ) -> Self {
         let mut shelf = Self {
             library,
             roots,
@@ -232,14 +247,36 @@ impl Shelf {
         }
     }
 
-    /// Before a countdown: requests the pause if none is, and waits up to
-    /// [`PAUSE_TIMEOUT`] for the scan to acknowledge it.
-    pub fn wait_paused(&mut self) -> Paused {
+    /// Before a countdown: requests the pause if none is, and waits for the
+    /// scan to acknowledge it, however long that takes (design.md "Loading
+    /// and Song Selection": the countdown starts only after it). Every
+    /// `slice` it asks `cancelled` whether to give up; once the wait has
+    /// run `notice_after`, it calls `notice` once.
+    pub fn wait_paused(
+        &mut self,
+        slice: Duration,
+        mut cancelled: impl FnMut() -> bool,
+        notice_after: Duration,
+        notice: impl FnOnce(),
+    ) -> Paused {
         self.pause();
-        match &self.scan {
-            None => Paused::Idle,
-            Some(scan) if scan.wait_paused(PAUSE_TIMEOUT) => Paused::Acknowledged,
-            Some(_) => Paused::TimedOut,
+        let Some(scan) = &self.scan else {
+            return Paused::Idle;
+        };
+        let started = Instant::now();
+        let mut notice = Some(notice);
+        loop {
+            if scan.wait_paused(slice) {
+                return Paused::Acknowledged;
+            }
+            if cancelled() {
+                return Paused::Cancelled;
+            }
+            if started.elapsed() >= notice_after
+                && let Some(notice) = notice.take()
+            {
+                notice();
+            }
         }
     }
 
@@ -291,7 +328,7 @@ mod tests {
     use game::DataRoot;
     use library::{Search, Sort};
 
-    use super::{OpenError, Paused, Shelf, open};
+    use super::{OpenError, PAUSE_SLICE, Paused, Shelf, open};
 
     fn chart(dir: &Path, name: &str) {
         std::fs::create_dir_all(dir).unwrap();
@@ -312,6 +349,11 @@ mod tests {
             .into_iter()
             .map(|e| super::file_name(&e.path))
             .collect()
+    }
+
+    /// The wait a countdown makes, never cancelled.
+    fn wait(shelf: &mut Shelf) -> Paused {
+        shelf.wait_paused(PAUSE_SLICE, || false, Duration::MAX, || {})
     }
 
     /// Polls until `listed` holds `name`, at most `within`.
@@ -341,7 +383,7 @@ mod tests {
         assert!(lists(&mut shelf, "refused.bms", Duration::from_secs(10)));
         // A chart is chosen.
         shelf.pause();
-        assert_ne!(shelf.wait_paused(), Paused::TimedOut);
+        assert_ne!(wait(&mut shelf), Paused::Cancelled);
         chart(&charts, "added.bms");
         // Paused: nothing is listed however long selection waits.
         assert!(!lists(&mut shelf, "added.bms", Duration::from_millis(300)));
@@ -363,7 +405,7 @@ mod tests {
         let (library, _) = open(&root).unwrap();
         let mut shelf = Shelf::new(library, vec![charts], Duration::from_secs(60));
         assert!(shelf.has_scan());
-        assert_eq!(shelf.wait_paused(), Paused::Acknowledged);
+        assert_eq!(wait(&mut shelf), Paused::Acknowledged);
         assert!(shelf.paused());
         // While paused nothing more is committed.
         let before = listed(&shelf).len();
@@ -371,7 +413,7 @@ mod tests {
         assert_eq!(listed(&shelf).len(), before);
         shelf.release();
         // A second wait, as a retry's, is acknowledged again.
-        assert_ne!(shelf.wait_paused(), Paused::TimedOut);
+        assert_ne!(wait(&mut shelf), Paused::Cancelled);
         shelf.release();
     }
 
@@ -385,5 +427,84 @@ mod tests {
         let e = open(&root).unwrap_err();
         assert!(matches!(e, OpenError::Running { .. }), "{e:?}");
         assert!(e.to_string().contains(&root.path().display().to_string()));
+    }
+
+    /// A gate the scan thread waits at before any work, so the pass cannot
+    /// acknowledge a pause until the test opens it.
+    type Gate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    fn gated(dir: &Path) -> (Shelf, Gate) {
+        let root = DataRoot::new(dir.join("data"));
+        let charts = dir.join("charts");
+        chart(&charts, "a.bms");
+        let (library, _) = open(&root).unwrap();
+        let gate: Gate = std::sync::Arc::default();
+        let held = std::sync::Arc::clone(&gate);
+        let options = library::ScanOptions {
+            on_thread_start: Some(std::sync::Arc::new(move || {
+                let (open, changed) = &*held;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = changed.wait(open).unwrap();
+                }
+            })),
+        };
+        let shelf = Shelf::with_options(library, vec![charts], Duration::from_secs(60), options);
+        (shelf, gate)
+    }
+
+    fn open_gate(gate: &Gate) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    /// The countdown's wait lasts until the scan acknowledges, however many
+    /// slices that takes: it never gives up on its own. Past its notice
+    /// time it says so once.
+    #[test]
+    fn the_countdown_waits_for_the_acknowledgment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shelf, gate) = gated(dir.path());
+        let opener = std::sync::Arc::clone(&gate);
+        let started = Instant::now();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            open_gate(&opener);
+        });
+        let mut notices = 0;
+        let paused = shelf.wait_paused(
+            Duration::from_millis(20),
+            || false,
+            Duration::from_millis(100),
+            || notices += 1,
+        );
+        assert_eq!(paused, Paused::Acknowledged);
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert_eq!(notices, 1);
+        thread.join().unwrap();
+        shelf.release();
+    }
+
+    /// Closing the window, or the quit key, cancels the wait: no countdown
+    /// follows, and the pause stays requested.
+    #[test]
+    fn closing_cancels_the_wait_for_the_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shelf, gate) = gated(dir.path());
+        let mut asked = 0;
+        let paused = shelf.wait_paused(
+            Duration::from_millis(20),
+            || {
+                asked += 1;
+                asked == 5
+            },
+            Duration::MAX,
+            || {},
+        );
+        assert_eq!(paused, Paused::Cancelled);
+        assert_eq!(asked, 5);
+        assert!(shelf.paused());
+        // The scan thread ends once it can.
+        open_gate(&gate);
     }
 }

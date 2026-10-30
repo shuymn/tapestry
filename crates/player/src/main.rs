@@ -44,7 +44,6 @@ mod window;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::mpsc::SyncSender;
 use std::time::SystemTime;
 
 use anyhow::Context as _;
@@ -70,7 +69,7 @@ use crate::measure::{AudioInfo, Measure, SOUND_QUEUE, STEP_QUEUE, StepSample};
 use crate::menu_screen::MenuScreen;
 use crate::play::PlayerRig;
 use crate::render_side::{MakeScreen, NoFrames, Screen, View};
-use crate::select::MenuInput;
+use crate::select::MenuQueue;
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
 
 /// The countdown before chart time 0 (design.md "Play Lifecycle").
@@ -677,7 +676,7 @@ fn open_window_and_input(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-    menu: Option<SyncSender<MenuInput>>,
+    menu: Option<Arc<MenuQueue>>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, InputThread)> {
     let (window_thread, surface) =
         window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
@@ -715,7 +714,7 @@ fn open_window_and_clocked(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-    menu: Option<SyncSender<MenuInput>>,
+    menu: Option<Arc<MenuQueue>>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, ClockedThread)> {
     let (window_thread, surface) =
         window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
@@ -855,8 +854,8 @@ fn play(
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run_chart(&mut loaded, &mut rig);
-    rig.shut_down();
-    window_thread.close();
+    let rendered = rig.shut_down();
+    window_thread.close_after(rendered);
     // Not joined: an input thread that stopped answering must not hold up
     // the exit or the report of why the run ended. Its wake report is not
     // used here.
@@ -872,10 +871,6 @@ fn play(
 
 /// What makes the extension points of each chart the scene flow loads.
 type MakeParts = Box<dyn FnMut(&Settings) -> Parts>;
-
-/// Window inputs the select screen's queue holds; the game thread empties
-/// it at every look, and what does not fit is dropped.
-const MENU_QUEUE: usize = 64;
 
 /// Opens the shared-mode WASAPI output on the audio thread.
 fn wasapi_audio(clock: QpcClock) -> anyhow::Result<(audio_side::AudioThread, audio_side::Opened)> {
@@ -938,16 +933,19 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             .map_or(shelf::RESCAN_AFTER, std::time::Duration::from_millis),
     );
     #[cfg(not(feature = "dev-tools"))]
-    let (headless, rescan) = (false, shelf::RESCAN_AFTER);
+    let rescan = shelf::RESCAN_AFTER;
     let shelf = shelf::Shelf::new(library, roots.clone(), rescan);
     let controls = controls(&settings, clock);
     controls.quit_leaves();
     let waker = Waker::new().context("input")?;
+    #[cfg(feature = "dev-tools")]
     let _suspend = if headless {
         None
     } else {
         Some(power::SuspendWatch::register(Arc::clone(&controls))?)
     };
+    #[cfg(not(feature = "dev-tools"))]
+    let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
     #[cfg(feature = "dev-tools")]
     let (audio, opened) = if headless {
         recorded_audio(clock, 240)?
@@ -969,7 +967,17 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     .context("the audio engine cannot start")?;
     settings.device.apply_to(&mut engine);
     let audio = audio.start(engine, probes.sounds.0);
-    let sources = sources();
+    // Autoplay's queues are sized by each chart's feed, before its first
+    // play; until then they hold nothing.
+    let sources = if autoplay {
+        SourceSet::new(SourceConfig {
+            queue_capacity: 0,
+            ..source_config()
+        })
+        .expect("8 sources are within the limit")
+    } else {
+        sources()
+    };
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {
@@ -983,40 +991,51 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         alloc_count::tag(alloc_count::Tag::Input);
         hook.wake(s, now)
     };
-    let (menu_tx, menu_rx) = std::sync::mpsc::sync_channel(MENU_QUEUE);
+    let menu = Arc::new(MenuQueue::default());
     let device = &settings.device;
     let keys = (device.keyboard.retry, device.keyboard.quit);
     let monitor = device.monitor.clone();
+    // The window, then the input thread that suits the input.
+    macro_rules! windowed {
+        () => {
+            if autoplay {
+                open_window_and_clocked(
+                    &controls,
+                    clock,
+                    sources,
+                    &waker,
+                    wake,
+                    keys,
+                    monitor,
+                    Some(Arc::clone(&menu)),
+                )
+                .map(|(w, s, t)| (Some(w), Some(s), None, Some(t)))
+            } else {
+                open_window_and_input(
+                    &controls,
+                    clock,
+                    sources,
+                    Capture::new(),
+                    &waker,
+                    wake,
+                    keys,
+                    monitor,
+                    Some(Arc::clone(&menu)),
+                )
+                .map(|(w, s, t)| (Some(w), Some(s), Some(t), None))
+            }
+        };
+    }
+    #[cfg(feature = "dev-tools")]
     let started = if headless {
         ClockedThread::spawn(clock, sources, &waker, wake)
             .map(|t| (None, None, None, Some(t)))
             .context("input")
-    } else if autoplay {
-        open_window_and_clocked(
-            &controls,
-            clock,
-            sources,
-            &waker,
-            wake,
-            keys,
-            monitor,
-            Some(menu_tx),
-        )
-        .map(|(w, s, t)| (Some(w), Some(s), None, Some(t)))
     } else {
-        open_window_and_input(
-            &controls,
-            clock,
-            sources,
-            Capture::new(),
-            &waker,
-            wake,
-            keys,
-            monitor,
-            Some(menu_tx),
-        )
-        .map(|(w, s, t)| (Some(w), Some(s), Some(t), None))
+        windowed!()
     };
+    #[cfg(not(feature = "dev-tools"))]
+    let started = windowed!();
     let (window_thread, surface, raw_thread, clocked_thread) = match started {
         Ok(started) => started,
         Err(e) => {
@@ -1037,6 +1056,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             let fonts = render::text::Fonts::runtime()?;
             Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
         }),
+        // Headless (dev-tools): offscreen on WARP.
+        #[cfg(feature = "dev-tools")]
         None => Box::new(|| {
             let target = Target::Offscreen {
                 width: 1280,
@@ -1046,6 +1067,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             let fonts = render::text::Fonts::runtime()?;
             Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
         }),
+        // A production run always has its window.
+        #[cfg(not(feature = "dev-tools"))]
+        None => Box::new(|| Err(render::RenderError::SurfaceUnsupported)),
     };
     let measure = measure(
         clock,
@@ -1083,7 +1107,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     rig.selection = Some(selection::Selection {
         shelf,
         screen: select::SelectScreen::new(roots),
-        menu: menu_rx,
+        menu,
+        dropped: 0,
+        search_pending: false,
         ime,
         rate: opened.rate,
         chosen_at: TimeUs(0),
@@ -1119,9 +1145,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         .selection
         .as_ref()
         .and_then(selection::Selection::script_failure);
-    rig.shut_down();
+    let rendered = rig.shut_down();
     if let Some(w) = window_thread {
-        w.close();
+        w.close_after(rendered);
     }
     // As in `play`: not joined.
     if let Some(t) = raw_thread {
@@ -1239,7 +1265,8 @@ fn headless(
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run_chart(&mut loaded, &mut rig);
-    rig.shut_down();
+    // Offscreen: no window to keep.
+    let _ = rig.shut_down();
     // As in `play`: not joined.
     input_thread.detach();
     ran?;

@@ -145,26 +145,32 @@ impl Screen for MenuScreen {
         self.renderer.load(chart)
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn wait(&self) -> bool {
         self.renderer.wait_for_frame(100)
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn paced(&self) -> bool {
         self.renderer.has_frame_waitable()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn build(&mut self, f: &render::FrameInput<'_>) {
         self.renderer.build(f);
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
         self.renderer.submit()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn statistics(&self) -> Option<render::measure::FrameStatistics> {
         self.renderer.frame_statistics()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn presentation(&self) -> Option<render::measure::Presentation> {
         self.renderer.presentation()
     }

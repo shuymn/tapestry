@@ -277,6 +277,9 @@ pub enum SelectStep {
     Search(String),
     /// Wait this many milliseconds on the select screen.
     Sleep(u64),
+    /// Wait this many milliseconds on the select screen and print how often
+    /// the input thread woke meanwhile.
+    Idle(u64),
     /// Press Enter.
     Enter,
     /// On a result: leave it (the quit key).
@@ -300,6 +303,8 @@ pub struct SelectScript {
     steps: std::collections::VecDeque<SelectStep>,
     /// Since when the front step waits.
     since: Option<std::time::Instant>,
+    /// The input thread's wakes when an `idle` step began.
+    pub idle_from: Option<u64>,
     /// Why the script failed.
     failed: Option<String>,
 }
@@ -320,6 +325,10 @@ impl SelectScript {
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
                     format!("{s} is not pick=, wait=, search=, sleep=, enter, back, retry or close")
                 }),
+                Some(("idle", ms)) => ms
+                    .parse()
+                    .map(SelectStep::Idle)
+                    .map_err(|_| format!("{s} takes milliseconds")),
                 None if s == "enter" => Ok(SelectStep::Enter),
                 None if s == "back" => Ok(SelectStep::Back),
                 None if s == "retry" => Ok(SelectStep::Retry),
@@ -332,6 +341,7 @@ impl SelectScript {
         Ok(Self {
             steps,
             since: None,
+            idle_from: None,
             failed: None,
         })
     }
@@ -345,6 +355,7 @@ impl SelectScript {
     pub fn done(&mut self) {
         self.steps.pop_front();
         self.since = None;
+        self.idle_from = None;
     }
 
     /// The front step waits on; `false` once it has waited

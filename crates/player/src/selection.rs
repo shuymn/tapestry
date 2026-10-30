@@ -15,7 +15,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,7 +27,7 @@ use crate::end_screen::LoadTimes;
 use crate::log_file;
 use crate::play::{PlayerRig, since};
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
-use crate::select::{Acted, MenuInput, SelectScreen};
+use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
 use crate::shelf::{Shelf, file_name};
 use crate::window::ImeSwitch;
 
@@ -39,7 +38,9 @@ pub struct Selection {
     /// The screen's state.
     pub screen: SelectScreen,
     /// What the window hands the screen.
-    pub menu: Receiver<MenuInput>,
+    pub menu: Arc<MenuQueue>,
+    /// The window's keys the queue dropped, as last reported.
+    pub dropped: u64,
     /// The window's IME, allowed while the search box has focus; none
     /// headless.
     pub ime: Option<ImeSwitch>,
@@ -51,6 +52,8 @@ pub struct Selection {
     pub entered_at: TimeUs,
     /// The page changed since it was last sent.
     pub dirty: bool,
+    /// The search or order changed and is not searched yet.
+    pub search_pending: bool,
     /// The scripted input (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub script: Option<crate::dev::SelectScript>,
@@ -59,6 +62,7 @@ pub struct Selection {
 impl Selection {
     /// Searches the library again for the screen's list.
     fn refresh(&mut self) {
+        self.search_pending = false;
         match self.shelf.search(&self.screen.search()) {
             Ok(found) => self.screen.set_entries(found),
             Err(e) => {
@@ -70,7 +74,8 @@ impl Selection {
         self.dirty = true;
     }
 
-    /// Acts on one input; the chart it chose, if it did.
+    /// Acts on one input; the chart it chose, if it did. A changed search
+    /// or order is searched once all queued input is taken.
     fn act(&mut self, input: MenuInput) -> Option<PathBuf> {
         match self.screen.input(input) {
             Acted::Nothing => None,
@@ -79,7 +84,8 @@ impl Selection {
                 None
             }
             Acted::Search => {
-                self.refresh();
+                self.search_pending = true;
+                self.dirty = true;
                 None
             }
             Acted::Focus(on) => {
@@ -93,6 +99,34 @@ impl Selection {
         }
     }
 
+    /// Takes the queued input; the chart it chose, if it did. Consecutive
+    /// edits of the search are searched once, at the end or before a key
+    /// that may choose from the list.
+    fn drain(&mut self) -> Option<PathBuf> {
+        while let Some(input) = self.menu.pop() {
+            if self.search_pending && input == MenuInput::Key(MenuKey::Enter) {
+                self.refresh();
+            }
+            if let Some(path) = self.act(input) {
+                return Some(path);
+            }
+        }
+        if self.search_pending {
+            self.refresh();
+        }
+        let dropped = self.menu.dropped();
+        if dropped > self.dropped {
+            let line = format!(
+                "select: {} keys dropped, the window's queue was full",
+                dropped - self.dropped
+            );
+            eprintln!("{line}");
+            log::warn!("{line}");
+            self.dropped = dropped;
+        }
+        None
+    }
+
     /// Sends the page if it changed, with `status` in its title (the
     /// library's when `None`).
     fn show(&mut self, render: &RenderLink, status: Option<&str>) {
@@ -103,84 +137,81 @@ impl Selection {
         }
     }
 
-    /// Runs the scripted steps due on the select screen; the chart chosen,
-    /// if one was.
+    /// Runs the scripted steps due on the select screen. A step that types
+    /// puts its input on the window's queue, as the window does, and the
+    /// steps stop there until the queue is taken: `true` then.
     #[cfg(feature = "dev-tools")]
-    fn script(&mut self, controls: &Controls) -> Option<PathBuf> {
+    fn script(&mut self, controls: &Controls, wakes: u64) -> bool {
         use crate::dev::SelectStep;
-        use crate::select::MenuKey;
         let listed = |screen: &SelectScreen, name: &str| {
             screen
                 .entries()
                 .iter()
                 .position(|e| e.path.file_name().is_some_and(|n| n == name))
         };
+        let Some(script) = &mut self.script else {
+            return false;
+        };
+        let mut typed = Vec::new();
         loop {
-            let mut script = self.script.take()?;
-            let chosen = match script.front().cloned() {
-                None => {
-                    self.script = Some(script);
-                    return None;
-                }
+            match script.front().cloned() {
+                None => return false,
                 Some(SelectStep::Pick(name)) => {
                     let Some(at) = listed(&self.screen, &name) else {
                         if !script.waiting() {
                             controls.close();
                         }
-                        self.script = Some(script);
-                        return None;
+                        return false;
                     };
-                    let _ = self.act(MenuInput::Key(MenuKey::Home));
-                    for _ in 0..at {
-                        let _ = self.act(MenuInput::Key(MenuKey::Down));
-                    }
-                    script.done();
-                    None
+                    typed.push(MenuInput::Key(MenuKey::Home));
+                    typed.extend(std::iter::repeat_n(MenuInput::Key(MenuKey::Down), at));
                 }
                 Some(SelectStep::Wait(name)) => {
                     if listed(&self.screen, &name).is_none() {
                         if !script.waiting() {
                             controls.close();
                         }
-                        self.script = Some(script);
-                        return None;
+                        return false;
                     }
-                    script.done();
-                    None
                 }
-                Some(SelectStep::Search(text)) => {
-                    let _ = self.act(MenuInput::Key(MenuKey::Tab));
-                    let _ = self.act(MenuInput::Text(text));
-                    let _ = self.act(MenuInput::Key(MenuKey::Enter));
-                    script.done();
-                    None
+                Some(SelectStep::Search(text)) => typed.extend([
+                    MenuInput::Key(MenuKey::Tab),
+                    MenuInput::Text(text),
+                    MenuInput::Key(MenuKey::Enter),
+                ]),
+                Some(SelectStep::Idle(ms)) => {
+                    let from = *script.idle_from.get_or_insert(wakes);
+                    if !script.slept(ms) {
+                        return false;
+                    }
+                    println!(
+                        "dev: the input thread woke {} times in {ms} ms on the select screen",
+                        wakes - from
+                    );
                 }
                 Some(SelectStep::Sleep(ms)) => {
                     if !script.slept(ms) {
-                        self.script = Some(script);
-                        return None;
+                        return false;
                     }
-                    script.done();
-                    None
                 }
-                Some(SelectStep::Enter) => {
-                    script.done();
-                    self.act(MenuInput::Key(MenuKey::Enter))
-                }
+                Some(SelectStep::Enter) => typed.push(MenuInput::Key(MenuKey::Enter)),
                 Some(SelectStep::Close) => {
                     script.done();
                     controls.close();
-                    None
+                    return false;
                 }
                 Some(step @ (SelectStep::Back | SelectStep::Retry)) => {
                     script.fail(format!("{step:?} on the select screen"));
                     controls.close();
-                    None
+                    return false;
                 }
-            };
-            self.script = Some(script);
-            if chosen.is_some() {
-                return chosen;
+            }
+            script.done();
+            if !typed.is_empty() {
+                for input in typed {
+                    self.menu.push(input);
+                }
+                return true;
             }
         }
     }
@@ -248,16 +279,14 @@ impl PlayerRig<'_> {
         if sel.shelf.poll(Instant::now()) {
             sel.refresh();
         }
-        let mut chosen = None;
-        while let Ok(input) = sel.menu.try_recv() {
-            chosen = sel.act(input);
-            if chosen.is_some() {
-                break;
-            }
-        }
+        #[cfg_attr(
+            not(feature = "dev-tools"),
+            expect(unused_mut, reason = "scripts choose too")
+        )]
+        let mut chosen = sel.drain();
         #[cfg(feature = "dev-tools")]
-        if chosen.is_none() {
-            chosen = sel.script(self.controls);
+        if chosen.is_none() && sel.script(self.controls, self.input.wakes()) {
+            chosen = sel.drain();
         }
         if let Some(path) = &chosen {
             sel.shelf.pause();
@@ -275,23 +304,35 @@ impl PlayerRig<'_> {
     }
 
     /// Before each countdown, with song selection: the scan's pause is
-    /// requested if it is not, and acknowledged before recording opens.
+    /// requested if it is not, and acknowledged before recording opens. A
+    /// close or the quit key cancels the wait; the play then does not start
+    /// (`game::live` takes the quit, or the close, before it opens).
     pub(crate) fn pause_scan(&mut self) {
         let Some(sel) = &mut self.selection else {
             return;
         };
-        match sel.shelf.wait_paused() {
+        let controls = self.controls;
+        let render = &self.render;
+        let Selection { shelf, screen, .. } = sel;
+        let paused = shelf.wait_paused(
+            crate::shelf::PAUSE_SLICE,
+            // Closing the window or the quit key ends the wait, and the
+            // play: the countdown never starts unacknowledged.
+            || controls.quitting() || controls.leaving(),
+            crate::shelf::PAUSE_NOTICE,
+            || {
+                println!("library: waiting for the scan to pause");
+                let page = screen.page("ライブラリのスキャンの一時停止を待っています");
+                render.send(RenderMsg::Menu(Box::new(page)));
+            },
+        );
+        match paused {
             crate::shelf::Paused::Acknowledged => {
                 println!("library: the scan paused before the countdown");
             }
             crate::shelf::Paused::Idle => println!("library: no scan before the countdown"),
-            crate::shelf::Paused::TimedOut => {
-                let line = format!(
-                    "library: the scan did not pause within {} s; the play starts anyway",
-                    crate::shelf::PAUSE_TIMEOUT.as_secs()
-                );
-                eprintln!("{line}");
-                log::warn!("{line}");
+            crate::shelf::Paused::Cancelled => {
+                println!("library: the wait for the scan was cancelled");
             }
         }
     }
@@ -398,12 +439,18 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_selection(&mut self) {
         self.end_lines = None;
+        // Nothing plays: the input thread drops its heartbeat, after a
+        // completed play, an opening the logic step refused (which closes
+        // recording without the end of a play) and at the first entry.
+        self.in_play = false;
+        self.input.idle();
         let Some(sel) = &mut self.selection else {
             return;
         };
         sel.entered_at = self.clock.now();
         // What was typed during the chart belongs to it.
-        while sel.menu.try_recv().is_ok() {}
+        while sel.menu.pop().is_some() {}
+        sel.screen.end_composition();
         sel.shelf.release();
         if let Some(ime) = &sel.ime {
             ime.set(sel.screen.searching());
