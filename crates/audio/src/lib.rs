@@ -4,7 +4,9 @@
 //! - [`load_bank`] decodes the sounds a chart references into i16 at the
 //!   device rate, stores files with identical contents once, and refuses a
 //!   bank over the caps of [`BankLimits`] before decoding when the files
-//!   declare their length, and while decoding otherwise.
+//!   declare their length, and while decoding otherwise. [`load_bank_at`]
+//!   converts them for a practice [`Speed`] in a second [`Stage`], with each
+//!   stage's workspace bound charged before it is built.
 //! - [`Mixer`] sums preallocated voices in `f32`, steals the oldest voice
 //!   with a short fade when all are busy, applies the volume and a fixed
 //!   headroom, and a static soft clipper that keeps the sum within full
@@ -39,8 +41,8 @@ mod sim;
 mod wasapi;
 
 pub use bank::{
-    BankError, BankLimits, BankWarning, Cap, Found, LoadStats, MAX_RATE, MIN_RATE, Sound,
-    SoundBank, load_bank,
+    BankError, BankLimits, BankWarning, Cap, Conversion, Found, LoadStats, MAX_RATE, MIN_RATE,
+    Sound, SoundBank, Speed, Stage, load_bank, load_bank_at, plan_conversion,
 };
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use engine::{AudioEngine, EngineError, Scheduled, ScheduledKind, SoundCmd, StepReport};
