@@ -16,7 +16,7 @@ use std::path::Path;
 
 use bms_model::{Chart, TimeUs};
 use bms_parser::{LOADER_VERSION, LoadError, LoadOptions};
-use eval::{EvalError, EvalInput, Evaluation, JudgeEventKind, evaluation_time};
+use eval::{EvalError, EvalInput, Evaluation, Evaluator, evaluation_time};
 use rules::{CanonicalError, Implementation, RulePreset};
 
 use crate::{EndStatus, PASSTHROUGH, PlayRecord, preset_hash};
@@ -153,8 +153,9 @@ pub fn evaluate_record(
 /// - **As played** (the preset's hash is the record's): to the recorded
 ///   finalized watermark, which reproduces the live stream.
 /// - **What-if of a completed play:** the inputs the play evaluated, those
-///   up to the recorded watermark, run to the preset's own final deadline.
-///   A deadline later than the watermark is
+///   up to the recorded watermark, run to the preset's own final deadline
+///   and stop there, so an input between that deadline and the watermark
+///   is not judged. A deadline later than the watermark is
 ///   [`NoInputAfter`](Coverage::NoInputAfter) the watermark.
 /// - **What-if of an aborted play:** to the recorded watermark,
 ///   [`EndedMidway`](Coverage::EndedMidway), with no gauge cleared even if
@@ -174,25 +175,28 @@ pub fn evaluate_under(
     let as_played = preset_hash(preset) == record.preset.sha256;
     let aborted = record.status.end == EndStatus::EndedMidway;
     let device = record.devices.profile();
-    let (events, finalized) = if as_played || aborted {
-        (record.events.clone(), Some(watermark))
+    let (events, finalized, no_input_after) = if as_played || aborted {
+        (record.events.clone(), watermark, None)
     } else {
-        // What was recorded after the watermark was never evaluated, so it
-        // is not input of the play. A source's events are in receive order,
-        // so each source keeps a prefix.
+        // The live evaluator judged every input at or before the watermark
+        // (`merge` and `advance_to` include it), and nothing after it, so
+        // only those are input of the play. Each source's events are in
+        // evaluation-time order, so each keeps a prefix.
         let played = record
             .events
             .iter()
             .filter(|e| evaluation_time(e, &device) <= watermark)
             .copied()
             .collect();
-        (played, None)
+        let deadline =
+            Evaluator::new(chart, preset, &device, &record.start, None, 0)?.final_deadline();
+        (played, deadline, Some(watermark).filter(|&w| deadline > w))
     };
     let input = EvalInput {
         events,
         device,
         start: record.start.clone(),
-        finalized,
+        finalized: Some(finalized),
         section: None,
     };
     let mut evaluation = eval::evaluate(chart, &input, preset)?;
@@ -203,8 +207,8 @@ pub fn evaluate_under(
             }
         }
         Coverage::EndedMidway(watermark)
-    } else if !as_played && song_end(&evaluation).is_some_and(|t| t > watermark) {
-        Coverage::NoInputAfter(watermark)
+    } else if let Some(t) = no_input_after {
+        Coverage::NoInputAfter(t)
     } else {
         Coverage::Recorded
     };
@@ -213,15 +217,6 @@ pub fn evaluate_under(
         as_played,
         coverage,
     })
-}
-
-/// When evaluation reached the final deadline, if it did.
-fn song_end(e: &Evaluation) -> Option<TimeUs> {
-    e.events
-        .iter()
-        .rev()
-        .find(|e| e.kind == JudgeEventKind::SongEnd)
-        .map(|e| e.time)
 }
 
 #[cfg(test)]

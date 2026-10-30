@@ -19,24 +19,39 @@ const CHART: &str = "#BPM 120\n#WAV01 a.wav\n#00111:01\n#00211:01\n";
 
 const MS: i64 = 1_000;
 
-fn press(at: i64, value: i32) -> PhysicalInputEvent {
+/// Key `n` (bound to lane `n`) set to `value`, received at `at`.
+fn key(n: u32, at: i64, value: i32) -> PhysicalInputEvent {
     PhysicalInputEvent {
         received: TimeUs(at),
         source: SourceId(0),
         kind: InputKind::Control {
-            control: ControlId(1),
+            control: ControlId(n),
             value,
         },
     }
 }
 
+fn press(at: i64, value: i32) -> PhysicalInputEvent {
+    key(1, at, value)
+}
+
 /// A completed play of `CHART` under the custom preset, both notes hit on
 /// time, with the folder its chart loads from.
 fn played() -> (TempDir, PlayRecord) {
+    played_from(CHART, 0, 0)
+}
+
+/// A play of `text` loaded with `seed`, from one keyboard whose keys 1-7
+/// are bound to lanes 1-7 with input offset `offset`. Its input hits
+/// `CHART`'s notes on time (received `offset` later), and it completed at
+/// 4.180 s.
+fn played_from(text: &str, seed: u64, offset: i64) -> (TempDir, PlayRecord) {
     let dir = tempfile::tempdir().unwrap();
-    let chart = load_bms(CHART.as_bytes(), dir.path(), &LoadOptions::default())
-        .unwrap()
-        .chart;
+    let opts = LoadOptions {
+        seed,
+        ..LoadOptions::default()
+    };
+    let chart = load_bms(text.as_bytes(), dir.path(), &opts).unwrap().chart;
     let record = PlayRecord {
         versions: Versions {
             evaluator: rules::Implementation::STANDARD_VERSION,
@@ -45,7 +60,7 @@ fn played() -> (TempDir, PlayRecord) {
         },
         chart: ChartRecord {
             identity: chart.identity,
-            random_seed: 0,
+            random_seed: seed,
             transform: PASSTHROUGH.record(),
         },
         preset: PresetRecord::of(&rules::custom()),
@@ -55,11 +70,13 @@ fn played() -> (TempDir, PlayRecord) {
                 kind: DeviceKind::Keyboard,
                 receive: ReceiveMethod::Scripted,
                 profile: SourceProfile {
-                    input_offset: TimeUs(0),
-                    bindings: vec![Binding {
-                        control: ControlId(1),
-                        lane: Lane::new(1).unwrap(),
-                    }],
+                    input_offset: TimeUs(offset),
+                    bindings: (1..=7)
+                        .map(|n| Binding {
+                            control: ControlId(n),
+                            lane: Lane::new(u8::try_from(n).unwrap()).unwrap(),
+                        })
+                        .collect(),
                     axes: Vec::new(),
                 },
                 axis_out_of_range: 0,
@@ -73,10 +90,10 @@ fn played() -> (TempDir, PlayRecord) {
             held: Vec::new(),
         },
         events: vec![
-            press(2_000 * MS, 1),
-            press(2_050 * MS, 0),
-            press(4_000 * MS, 1),
-            press(4_050 * MS, 0),
+            press(2_000 * MS + offset, 1),
+            press(2_050 * MS + offset, 0),
+            press(4_000 * MS + offset, 1),
+            press(4_050 * MS + offset, 0),
         ],
         arrivals: Vec::new(),
         status: Status {
@@ -330,4 +347,40 @@ fn what_if_ignores_input_recorded_after_the_watermark() {
     assert_eq!(r.coverage, Coverage::NoInputAfter(TimeUs(4_180 * MS)));
     let counts = r.evaluation.tally.counts;
     assert_eq!((counts.perfect, counts.bad, counts.poor), (1, 0, 1));
+}
+
+/// The custom preset with the BAD window `ms` each side.
+fn bad_edge(ms: i64) -> RulePreset {
+    let mut p = rules::custom();
+    p.windows.bad = Window::symmetric(ms * MS);
+    p
+}
+
+#[test]
+fn what_if_stops_at_its_own_final_deadline() {
+    let (dir, mut record) = played();
+    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
+    // A second press on key 1 at 4.120 s, before the recorded watermark
+    // (4.180 s): 120 ms after the last note, an empty POOR in the play.
+    record
+        .events
+        .extend([press(4_120 * MS, 1), press(4_140 * MS, 0)]);
+    let as_played = evaluate_record(&record, &chart, None).unwrap();
+    assert_eq!(as_played.evaluation.tally.empty_poor, 1);
+    // A 110 ms edge ends the what-if at 4.110 s, before that press: it is
+    // input of the play, but past the what-if's end, so it is not judged.
+    let r = evaluate_record(&record, &chart, Some(&bad_edge(110))).unwrap();
+    assert!(r.evaluation.completed);
+    assert_eq!(r.coverage, Coverage::Recorded);
+    let tally = r.evaluation.tally;
+    assert_eq!(
+        (tally.counts.perfect, tally.empty_poor, tally.bp),
+        (2, 0, 0)
+    );
+    assert!(
+        r.evaluation
+            .events
+            .iter()
+            .all(|e| e.time <= TimeUs(4_110 * MS))
+    );
 }
