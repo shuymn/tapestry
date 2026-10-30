@@ -22,7 +22,7 @@ The stage exits when song selection, play, results and retry can be played repea
 - personal bests for charts with `#RANDOM` are left undecided, and such charts get no best in stage 2 (D8);
 - a what-if of a completed play runs to its own final deadline (D9);
 - the gauge denominator in practice is the whole chart's note count (D13);
-- a practice round cuts its audio once the section is judged (D15);
+- a practice round ends with a short ring-out once the section is judged: the BGM plays on without notes, fades out, and the next round starts (D15);
 - the default rule preset is beatoraja-style; the custom preset stays available as a file (D24).
 
 ## 0. Prerequisites
@@ -362,17 +362,21 @@ A single exact stage is not used. A 383,999 Hz stereo source at 145 % on 384,000
 - **Audio.** `AudioEngine::seek(t)` advances the engine's scheduling (starts, stops, steals, positions) without summing samples. A property test checks it against mixing.
 - **Notes.** Notes before the section are drawn auto-played; notes after its end are not drawn.
 
-**End of a round (decided).**
-- Completion happens in the first step whose watermark covers the section's final deadline. That step sends `AudioCtl::Cancel` instead of waiting for the full-play audio tail (crates/game/src/live.rs:359).
-- The next round's countdown begins at the following step.
-- Quit returns to the practice screen.
+**End of a round: a short ring-out (decided).**
+- Completion happens in the first step whose watermark covers the section's final deadline. Recording closes there and the round's record is saved, as for any play.
+- A ring-out follows instead of the full-play audio tail, which waits for every voice and BGM event (crates/game/src/live.rs:359). For `RING_OUT` (1.5 s, tuned by playing) the BGM keeps playing on schedule, no notes are drawn and nothing is judged or recorded; key sounds of notes after the section never start. Over the last `FADE` (0.5 s, tuned by playing) the engine ramps its output gain to zero, then the round sends `AudioCtl::Cancel`.
+- The ramp is a gain step per mix block in the engine (`AudioCtl::FadeOut(duration)`), with no allocation in the audio callback.
+- The next round's countdown begins at the step after the cancel.
+- Quit, retry or focus loss during the ring-out cuts it at once, like the full-play tail. Quit returns to the practice screen.
 
 **Example.** 100 % speed, lead-in 2 s, offset 0, aligned 1 ms steps. Section `[10 s, 20 s)` of a 180 s chart; the last target is a tap at 19.5 s; the late BAD edge is 180 ms.
 - `SongEnd.time` is 19.680000 s.
 - The step at 19.680 s publishes `fresh − 1 µs` = 19.679999 s, which does not cover the deadline.
-- The step at 19.681 s publishes 19.680999 s: completion and cancel happen there.
-- Round 2's countdown begins at 19.682 s (round 1's timeline), at its own chart time 8.000 s.
-- A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's countdown; a BGM event at 30 s never starts.
+- The step at 19.681 s publishes 19.680999 s: completion and the close happen there, and the ring-out starts.
+- The fade starts at 20.681 s, and the cancel is sent at 21.181 s.
+- Round 2's countdown begins at 21.182 s (round 1's timeline), at its own chart time 8.000 s.
+- A BGM event at 20.5 s starts during the ring-out; one at 30 s never starts.
+- A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's countdown, restored by `seek`.
 
 **Setup.** The practice screen picks the section by measure, the speed, the lead-in (2 s, tuned by playing), the initial gauge, and repeat. `--dev-start <ms>` and a scenario step exist in development builds.
 
@@ -857,16 +861,19 @@ Each one holds the behavior D5 and D6 state.
 
 ### PR23. Section rounds (`game`, `replay`)
 
-**Touches.** The plan and rounds, the round-end cancel, the section probe, the practice record fields, design.md "Mid-Chart Start and Section Repeat", "Practice Records" and "Recording Capacity".
+**Touches.** The plan and rounds, the ring-out and fade, the section probe, the practice record fields, design.md "Mid-Chart Start and Section Repeat", "Practice Records" and "Recording Capacity".
 
 **Depends on.** PR2, PR14, PR20, PR22.
 
 **Done when.**
-- When D15's example runs (`section_round_ends_at_the_covering_step_and_repeats`):
+- When D15's example runs (`section_round_rings_out_and_repeats`):
   - `SongEnd.time` shall be 19.680000 s;
-  - completion and cancel shall happen in the step at 19.681 s, not at 19.680 s;
-  - round 2's countdown shall begin at 19.682 s with the long voice 3 s in;
-  - the BGM event at 30 s shall never start.
+  - completion and the close shall happen in the step at 19.681 s, not at 19.680 s;
+  - the fade shall start at 20.681 s and the cancel shall be sent at 21.181 s;
+  - the BGM event at 20.5 s shall start, no key sound of a note after the section shall start, and the BGM event at 30 s shall never start;
+  - round 2's countdown shall begin at 21.182 s with the long voice 3 s in.
+- When retry is pressed during the ring-out, the ring-out shall be cut in that step (`retry_cuts_the_ring_out`).
+- When the engine fades out, its output gain shall fall monotonically to zero over the fade, and the fade shall allocate nothing (`fade_out_ramps_to_zero_without_allocating`, `audio`).
 - `section_round_records_its_conditions`.
 - When the windows are computed, they shall be 21.180, 16.795384, 11.680 and 8.513333 s (`practice_window_is_sized_by_the_section`).
 - When the long-note section is planned, its deadline shall be 19.900 s, its window 11.900 s and its capacity 12 s (`practice_window_includes_ln_end_deadlines`).
