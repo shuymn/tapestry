@@ -328,9 +328,13 @@ fn generators_reach_the_fragile_spots() {
     let mut accepted_full = 0;
     let mut bounded_ops = Vec::new();
     let (mut mixed_div, mut mixed_rem) = (false, false);
+    let (mut full_positive, mut full_negative) = (false, false);
     for i in 0..4000 {
         let raw = raw_tree().new_tree(&mut runner).unwrap().current();
         let state = build_state(&raw_state().new_tree(&mut runner).unwrap().current());
+        let full = state.fields[strategy::FULL];
+        full_positive |= (2..i32::MAX - 1).contains(&full);
+        full_negative |= (i32::MIN + 1..-2).contains(&full);
         let bounded = i % 2 == 0;
         let (e, root) = build(&raw, bounded);
         let opts = ALL_OPTIONS[i % ALL_OPTIONS.len()];
@@ -362,6 +366,8 @@ fn generators_reach_the_fragile_spots() {
     assert_eq!(seen.cover, [true, true], "toggle states");
     assert_eq!(seen.choice, [true, true], "choice states");
     assert!(out_of_range, "no OutOfRange refusal");
+    assert!(full_positive, "no mid-range positive `full`");
+    assert!(full_negative, "no mid-range negative `full`");
     assert!(
         accepted_full > 100,
         "only {accepted_full} unbounded trees compiled"
@@ -377,4 +383,48 @@ fn generators_reach_the_fragile_spots() {
         mixed_rem,
         "no accepted `%` by a mixed-sign divisor holding 0"
     );
+}
+
+fn node_count(e: &E) -> u32 {
+    let mut n = 0;
+    visit(e, &mut |_| n += 1);
+    n
+}
+
+/// Deterministic sweeps of raw choices, including a case that once grew
+/// past the node budget (pending siblings were not reserved): a tree stays
+/// within `MAX_NODES` and its source within `MAX_SOURCE_BYTES`.
+#[test]
+fn generated_trees_stay_within_their_budget() {
+    let mut cases = vec![RawTree {
+        root: 2,
+        choices: [22, 15, 0].repeat(32),
+    }];
+    for root in 0..8 {
+        for c in 0..256 {
+            cases.push(RawTree {
+                root,
+                choices: vec![c; 96],
+            });
+            for (a, b) in [(15, 0), (0, 15), (3, 6), (22, 1)] {
+                cases.push(RawTree {
+                    root,
+                    choices: [c, a, b].repeat(32),
+                });
+            }
+        }
+    }
+    for raw in &cases {
+        for bounded in [false, true] {
+            let (e, _) = build(raw, bounded);
+            let src = print(&e);
+            let n = node_count(&e);
+            assert!(n <= strategy::MAX_NODES, "{raw:?}: {n} nodes");
+            assert!(
+                src.len() <= MAX_SOURCE_BYTES,
+                "{raw:?}: {} bytes",
+                src.len()
+            );
+        }
+    }
 }
