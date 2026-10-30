@@ -1,15 +1,18 @@
-//! A loaded skin: its elements in draw order and its `when` timers, and
-//! the per-frame build into a [`QuadBatch`].
+//! A loaded skin: its elements in draw order, its `when` timers and its
+//! images, and the per-frame build into a [`QuadBatch`].
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::Chart;
 
+use crate::atlas::uv::{Cycle, UvTable};
+use crate::atlas::{Atlas, AtlasError, AtlasLimits, Variant};
 use crate::expr::{CompileError, Program, SkinOps};
+use crate::image::Sheet;
 use crate::play::schema::timer::BUILTIN;
 use crate::play::timers::elapsed_us;
 use crate::play::{Play, PlayContext, PrepareError, SkinFrame};
-use crate::quad::{Blend, ClipId, Quad, QuadBatch, RunKey};
+use crate::quad::{Blend, ClipId, Filter, Quad, QuadBatch, RunKey};
 use crate::schema::Ty;
 use crate::track::Track;
 
@@ -22,13 +25,13 @@ pub const MAX_WHEN_TIMERS: usize = 1_024;
 pub const MAX_SKIN_KEYS: usize = 65_536;
 
 /// What an element draws.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// One atlas rectangle: left, top, right, bottom.
-    Uv([f32; 4]),
+    /// The sheet's image at this index, at the frame its cycle shows.
+    Image(u32),
 }
 
-/// The timer an element's track runs on.
+/// The timer an element's track or an image's cycle runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimerRef {
     /// A built-in timer's slot (`play::timer::*`, `lane_timer`).
@@ -67,13 +70,22 @@ pub enum LoadError {
     UnknownTimer { element: usize },
     #[error("element {element}'s track rotates, which is not drawn yet")]
     Rotation { element: usize },
+    #[error("element {element}'s image does not exist")]
+    UnknownImage { element: usize },
+    #[error("image {image}'s cycle timer does not exist")]
+    UnknownImageTimer { image: usize },
     #[error("the skin's expressions")]
     Ops(#[source] CompileError),
 }
 
 #[derive(Clone, Debug)]
 struct Element {
-    uv: [f32; 4],
+    /// The image's first frame in the uv table, its frame count, cycle and
+    /// filter, copied so a build never reads the sheet.
+    first: u32,
+    frames: u16,
+    cycle: Option<Cycle>,
+    filter: Filter,
     track: Track,
     /// The timer's slot: built-in, or `BUILTIN` plus the `when` index.
     slot: usize,
@@ -87,14 +99,32 @@ pub struct Skin {
     elements: Box<[Element]>,
     whens: Box<[Program]>,
     ops: SkinOps,
+    sheet: Sheet,
+    /// The sheet's identity and frame count, kept so a build never reads
+    /// the sheet.
+    sheet_id: u64,
+    frame_count: usize,
+}
+
+/// The slot `timer` reads with `whens` `when` timers: a built-in slot, or
+/// `BUILTIN` plus the `when` index.
+fn slot_of(timer: TimerRef, whens: usize) -> Option<usize> {
+    let builtin = usize::from(BUILTIN);
+    match timer {
+        TimerRef::Builtin(s) if usize::from(s) < builtin => Some(usize::from(s)),
+        TimerRef::When(i) if usize::from(i) < whens => Some(builtin + usize::from(i)),
+        TimerRef::Builtin(_) | TimerRef::When(_) => None,
+    }
 }
 
 impl Skin {
-    /// Loads a skin from `when` conditions and elements in draw order.
+    /// Loads a skin from `when` conditions, the sheet its elements draw
+    /// from, and elements in draw order.
     ///
     /// Checks, in order: the counts (elements, `when` timers, keys across
     /// all tracks); every `when` condition and visibility is a bool; every
-    /// timer exists; no track rotates; and the total operations, each
+    /// timer exists; no track rotates; every element's image exists; every
+    /// image's cycle timer exists; and the total operations, each
     /// `when` charged once however many elements share it, then each
     /// visibility in element order. So the per-frame cost is known here.
     ///
@@ -106,7 +136,11 @@ impl Skin {
     /// # Errors
     ///
     /// The first check that fails.
-    pub fn new(whens: Vec<Program>, elements: Vec<ElementDef>) -> Result<Self, LoadError> {
+    pub fn new(
+        whens: Vec<Program>,
+        sheet: Sheet,
+        elements: Vec<ElementDef>,
+    ) -> Result<Self, LoadError> {
         if elements.len() > MAX_ELEMENTS {
             return Err(LoadError::TooManyElements { n: elements.len() });
         }
@@ -128,20 +162,32 @@ impl Skin {
         {
             return Err(LoadError::VisibleNotBool { element });
         }
-        let builtin = usize::from(BUILTIN);
         let mut slots = Vec::with_capacity(elements.len());
         for (element, e) in elements.iter().enumerate() {
-            let slot = match e.timer {
-                TimerRef::Builtin(s) if usize::from(s) < builtin => usize::from(s),
-                TimerRef::When(i) if usize::from(i) < whens.len() => builtin + usize::from(i),
-                TimerRef::Builtin(_) | TimerRef::When(_) => {
-                    return Err(LoadError::UnknownTimer { element });
-                }
-            };
+            let slot = slot_of(e.timer, whens.len()).ok_or(LoadError::UnknownTimer { element })?;
             slots.push(slot);
         }
         if let Some(element) = elements.iter().position(|e| e.track.has_rotation()) {
             return Err(LoadError::Rotation { element });
+        }
+        let images = sheet.images();
+        if let Some(element) = elements.iter().position(|e| {
+            let Source::Image(i) = e.source;
+            usize::try_from(i).map_or(true, |i| i >= images.len())
+        }) {
+            return Err(LoadError::UnknownImage { element });
+        }
+        let mut cycles = Vec::with_capacity(images.len());
+        for (image, def) in images.iter().enumerate() {
+            let cycle = match def.cycle {
+                Some(c) => Some(Cycle {
+                    period: c.period.0,
+                    slot: slot_of(c.timer, whens.len())
+                        .ok_or(LoadError::UnknownImageTimer { image })?,
+                }),
+                None => None,
+            };
+            cycles.push(cycle);
         }
         let mut ops = SkinOps::default();
         for program in whens
@@ -154,9 +200,14 @@ impl Skin {
             .into_iter()
             .zip(slots)
             .map(|(e, slot)| {
-                let Source::Uv(uv) = e.source;
+                let Source::Image(i) = e.source;
+                let i = usize::try_from(i).unwrap_or(usize::MAX);
+                let image = images.get(i);
                 Element {
-                    uv,
+                    first: image.map_or(0, |m| m.first),
+                    frames: image.map_or(0, |m| m.frames),
+                    cycle: cycles.get(i).copied().flatten(),
+                    filter: image.map_or(Filter::Linear, |m| m.filter),
                     track: e.track,
                     slot,
                     visible: e.visible,
@@ -171,7 +222,32 @@ impl Skin {
             elements,
             whens: whens.into_boxed_slice(),
             ops,
+            sheet_id: sheet.id(),
+            frame_count: sheet.frame_count(),
+            sheet,
         })
+    }
+
+    /// The frames of the sheet's images: the length of the uv table
+    /// [`build`](Self::build) takes.
+    #[must_use]
+    pub fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    /// The sheet the elements draw from.
+    #[must_use]
+    pub fn sheet(&self) -> &Sheet {
+        &self.sheet
+    }
+
+    /// Builds the sheet's atlas for `variant` ([`Sheet::atlas`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Sheet::atlas`].
+    pub fn atlas(&self, variant: Variant, limits: AtlasLimits) -> Result<Atlas, AtlasError> {
+        self.sheet.atlas(variant, limits)
     }
 
     /// The operations every frame's expressions run.
@@ -208,7 +284,12 @@ impl Skin {
     /// in draw order (the caller clears `out`). Allocates nothing.
     ///
     /// `play` must come from this skin's [`prepare`](Self::prepare); one
-    /// with another number of timers draws nothing.
+    /// with another number of timers draws nothing. `uvs` must come from an
+    /// atlas of this skin's sheet; a table of another sheet, or of another
+    /// length, draws nothing.
+    ///
+    /// Each element shows its image's frame at the image's cycle timer:
+    /// frame 0 while that timer is off, without a cycle, or with one frame.
     ///
     /// Conditions sample once per frame, after the effects. The snapshot
     /// can be newer than a drain the effect buffer split, so a frame may
@@ -216,8 +297,17 @@ impl Skin {
     /// while the snapshot's gauge is below its maximum; if a below-maximum
     /// effect is dropped and the gauge later refills, it keeps the earlier
     /// start.
-    pub fn build(&self, play: &mut Play, frame: &SkinFrame<'_>, out: &mut QuadBatch) {
-        if play.slots() != usize::from(BUILTIN) + self.whens.len() {
+    pub fn build(
+        &self,
+        play: &mut Play,
+        frame: &SkinFrame<'_>,
+        uvs: &UvTable,
+        out: &mut QuadBatch,
+    ) {
+        if play.slots() != usize::from(BUILTIN) + self.whens.len()
+            || uvs.sheet_id() != self.sheet_id
+            || uvs.frames().len() != self.frame_count
+        {
             return;
         }
         play.fill(frame, &self.whens);
@@ -232,12 +322,21 @@ impl Skin {
             let Some(s) = e.track.sample(elapsed_us(frame.now, start)) else {
                 continue;
             };
+            let shown = e.cycle.map_or(0, |c| {
+                play.timer_at(c.slot)
+                    .map_or(0, |at| c.frame(elapsed_us(frame.now, at), e.frames))
+            });
+            let Some(f) = e.first.checked_add(shown).and_then(|i| uvs.get(i)) else {
+                continue;
+            };
             out.push(
                 e.key,
                 Quad {
                     rect: s.rect,
-                    uv: e.uv,
+                    uv: f.uv,
                     color: s.color,
+                    layer: f.layer,
+                    filter: e.filter,
                 },
             );
         }

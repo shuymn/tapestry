@@ -1,25 +1,30 @@
 //! A skin's per-frame build allocates nothing: effects through the
-//! reducer, the snapshot into the fields, every timer, the `when` timers
-//! and the elements into the batch.
+//! reducer, the snapshot into the fields, every timer, the `when` timers,
+//! each image's frame and its place in the atlas, and the elements into
+//! the batch.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
 //! disturb the count. This file holds a single test for the same reason.
 //! Profiles and the positive control: design.md "Scope of No Allocation".
 
+mod image_support;
 mod play_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, Lane, NoteKind, SoundId, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, Section, Tally};
+use image_support::{dir, file, save, solid, whole};
 use play_support::{bool_program, state, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
-    Attempt, Blend, ClipId, Ease, ElementDef, End, GaugeDesc, KeyDef, LaneTimer, Play, PlayContext,
-    QuadBatch, Skin, SkinFrame, Source, TimerRef, Track, lane_timer, timer,
+    AtlasLimits, Attempt, Blend, ClipId, CycleDef, Ease, ElementDef, End, Filter, GaugeDesc,
+    ImageDef, KeyDef, LaneTimer, Play, PlayContext, QuadBatch, Sheet, Skin, SkinFrame, Source,
+    TimerRef, Track, UvTable, Variant, lane_timer, timer,
 };
 
 struct Counting;
@@ -234,10 +239,69 @@ fn track(i: u16, ease: Ease, end: End) -> Track {
     .unwrap()
 }
 
+/// Images drawn by the elements on `when` timers, after one image per
+/// built-in timer.
+const WHEN_IMAGES: u16 = 5;
+/// The reserved layers of the atlas.
+const RESERVED: u16 = 1;
+
+/// A uv rectangle as a map key.
+fn uv_key(uv: [f32; 4]) -> [u32; 4] {
+    uv.map(f32::to_bits)
+}
+
+/// A skin, its atlas's uv table and, per uv, the image and frame it shows.
+struct Loaded {
+    skin: Skin,
+    uvs: UvTable,
+    shows: HashMap<[u32; 4], (u16, u16)>,
+}
+
+/// One image per built-in timer, then [`WHEN_IMAGES`] more: each a file of
+/// its own, every third a cycle of 4 to 8 frames on its own built-in timer
+/// or on a `when` timer, the filters alternating. Built in a folder that
+/// lives until the atlas is built.
+fn images() -> (tempfile::TempDir, Sheet) {
+    let d = dir();
+    let mut files = Vec::new();
+    let mut images = Vec::new();
+    for k in 0..timer::BUILTIN + WHEN_IMAGES {
+        let cols = if k % 3 == 0 { 4 + k % 5 } else { 1 };
+        let (w, h) = (u32::from(12 + k % 5), u32::from(10 + k % 3));
+        let name = format!("{k}.png");
+        save(
+            d.path(),
+            &name,
+            &solid(w * u32::from(cols), h, [k as u8, 0, 0, 255]),
+        );
+        files.push(file(&name));
+        let timer = if k < timer::BUILTIN && k % 2 == 0 {
+            TimerRef::Builtin(k)
+        } else {
+            TimerRef::When(k % 32)
+        };
+        images.push(ImageDef {
+            grid: [cols, 1],
+            cycle: (cols > 1).then_some(CycleDef {
+                period: TimeUs(300 * MS),
+                timer,
+            }),
+            filter: if k % 2 == 0 {
+                Filter::Linear
+            } else {
+                Filter::Nearest
+            },
+            ..whole(u32::from(k))
+        });
+    }
+    let sheet = Sheet::new(d.path(), files, images).unwrap();
+    (d, sheet)
+}
+
 /// 2 000 elements, 30 on every built-in timer and 350 over 32 `when`s,
 /// with every ease and end, both blends, clips and visibility programs,
-/// and a background on `ready`.
-fn skin() -> Skin {
+/// and a background on `ready`; each shows its timer's image.
+fn skin() -> Loaded {
     let conditions = [
         "combo >= 1",
         "combo >= 10",
@@ -260,13 +324,12 @@ fn skin() -> Skin {
     let builtin = 30 * timer::BUILTIN;
     let mut elements = Vec::new();
     for i in 0_u16..2_000 {
-        // A quad's atlas left edge names its built-in timer, or is
-        // negative for a `when` timer.
-        let (timer, tag) = if i < builtin {
+        // A built-in timer's elements show its image.
+        let (timer, image) = if i < builtin {
             let slot = i % timer::BUILTIN;
-            (TimerRef::Builtin(slot), f32::from(slot))
+            (TimerRef::Builtin(slot), slot)
         } else {
-            (TimerRef::When(i % 32), -1.0)
+            (TimerRef::When(i % 32), timer::BUILTIN + i % WHEN_IMAGES)
         };
         let end = match i % 3 {
             0 => End::Hold,
@@ -276,7 +339,7 @@ fn skin() -> Skin {
             },
         };
         elements.push(ElementDef {
-            source: Source::Uv([tag, 0.0, 0.5, 0.5]),
+            source: Source::Image(u32::from(image)),
             track: track(i, eases[usize::from(i % 4)], end),
             timer,
             visible: (i % 7 == 0).then(|| visible[usize::from(i % 3)].clone()),
@@ -290,14 +353,37 @@ fn skin() -> Skin {
     }
     // A background on `ready`, drawn on every frame after it.
     elements.push(ElementDef {
-        source: Source::Uv([0.0, 0.0, 1.0, 1.0]),
+        source: Source::Image(u32::from(timer::READY)),
         track: track(0, Ease::Linear, End::Hold),
         timer: TimerRef::Builtin(timer::READY),
         visible: None,
         blend: Blend::Alpha,
         clip: None,
     });
-    Skin::new(whens, elements).unwrap()
+    let (_dir, sheet) = images();
+    let skin = Skin::new(whens, sheet, elements).unwrap();
+    // A page of 256 holds only some of the frames.
+    let limits = AtlasLimits {
+        max_side: 256,
+        max_layers: 16,
+        reserved_layers: u32::from(RESERVED),
+    };
+    let atlas = skin.atlas(Variant::Lo, limits).unwrap();
+    assert!(atlas.pages().len() >= 2, "{} pages", atlas.pages().len());
+    let (_, uvs) = atlas.into_parts();
+    // Frames run image by image: image k's frames follow image k - 1's.
+    let mut shows = HashMap::new();
+    let mut next = 0;
+    for k in 0..timer::BUILTIN + WHEN_IMAGES {
+        let frames = if k % 3 == 0 { 4 + k % 5 } else { 1 };
+        for f in 0..frames {
+            let uv = uvs.get(next).unwrap().uv;
+            assert!(shows.insert(uv_key(uv), (k, f)).is_none());
+            next += 1;
+        }
+    }
+    assert_eq!(usize::try_from(next).unwrap(), uvs.frames().len());
+    Loaded { skin, uvs, shows }
 }
 
 /// What a stretch saw.
@@ -311,6 +397,10 @@ struct Witness {
     drawn: [bool; timer::BUILTIN as usize],
     when_started: bool,
     empty_frames_after_ready: u32,
+    /// Whether a quad showed a frame other than an image's first.
+    later_frame: bool,
+    /// Whether a quad lay on a layer after the first skin page.
+    later_layer: bool,
 }
 
 impl Witness {
@@ -323,6 +413,8 @@ impl Witness {
             drawn: [false; timer::BUILTIN as usize],
             when_started: false,
             empty_frames_after_ready: 0,
+            later_frame: false,
+            later_layer: false,
         }
     }
 }
@@ -332,7 +424,7 @@ impl Witness {
 /// gauge 1, shows it and changes the display offset.
 #[allow(clippy::too_many_arguments)]
 fn stretch(
-    skin: &Skin,
+    loaded: &Loaded,
     play: &mut Play,
     events: &[JudgeEvent],
     tally: &mut Tally,
@@ -343,6 +435,7 @@ fn stretch(
     to: i64,
     w: &mut Witness,
 ) {
+    let skin = &loaded.skin;
     let mut next = 0;
     let mut now = from;
     let mut frame_no = 0_u32;
@@ -389,7 +482,7 @@ fn stretch(
         let use_small = frame_no % 100 == 99;
         let out = if use_small { &mut *small } else { &mut *batch };
         out.clear();
-        skin.build(play, &frame, out);
+        skin.build(play, &frame, &loaded.uvs, out);
         if use_small {
             w.small_drops += out.dropped();
         } else {
@@ -398,11 +491,14 @@ fn stretch(
                 w.empty_frames_after_ready += 1;
             }
             for q in out.quads() {
-                if q.uv[0] >= 0.0
-                    && let Some(d) = w.drawn.get_mut(q.uv[0] as usize)
-                {
+                let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv)) else {
+                    continue;
+                };
+                if let Some(d) = w.drawn.get_mut(usize::from(image)) {
                     *d = true;
                 }
+                w.later_frame |= frame > 0;
+                w.later_layer |= q.layer > RESERVED;
             }
         }
         for (slot, on) in (0..).zip(w.on.iter_mut()) {
@@ -417,7 +513,8 @@ fn stretch(
 #[test]
 fn build_does_not_allocate() {
     let chart = chart();
-    let skin = skin();
+    let loaded = skin();
+    let skin = &loaded.skin;
     let descs = [
         GaugeDesc {
             start: GaugeValue(50 * GaugeValue::PERCENT),
@@ -492,7 +589,7 @@ fn build_does_not_allocate() {
         drop(std::hint::black_box(vec![1u8; 8]));
         assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1, "{name}");
         stretch(
-            &skin,
+            &loaded,
             &mut play,
             events,
             &mut tally,
@@ -511,6 +608,8 @@ fn build_does_not_allocate() {
         assert_eq!(w.other_drops, 0, "{name}");
         assert!(w.when_started, "{name}: no `when` timer started");
         assert_eq!(w.empty_frames_after_ready, 0, "{name}");
+        assert!(w.later_frame, "{name}: no cycle left its first frame");
+        assert!(w.later_layer, "{name}: every quad on the first page");
         let fc = usize::from(timer::FULL_COMBO);
         if *name == "clean round" {
             assert!(w.on[fc], "{name}: `full_combo` never started");

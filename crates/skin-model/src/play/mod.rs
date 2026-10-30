@@ -216,7 +216,7 @@ mod tests {
     use rules::{GaugeValue, Judgment, PerJudgment};
 
     use super::{Attempt, GaugeDesc, PlayContext, SkinFrame};
-    use crate::{QuadBatch, Skin};
+    use crate::{AtlasLimits, QuadBatch, Sheet, Skin, Variant};
 
     const MS: i64 = 1_000;
 
@@ -244,7 +244,13 @@ mod tests {
             .tap(lane(5), TimeUs(3_000 * MS))
             .build()
             .unwrap();
-        let skin = Skin::new(Vec::new(), Vec::new()).unwrap();
+        let skin = Skin::new(Vec::new(), Sheet::empty(), Vec::new()).unwrap();
+        let limits = AtlasLimits {
+            max_side: 256,
+            max_layers: 2,
+            reserved_layers: 1,
+        };
+        let (_, uvs) = skin.atlas(Variant::Lo, limits).unwrap().into_parts();
         let gauges = [GaugeDesc {
             start: GaugeValue(0),
             max: GaugeValue::FULL,
@@ -285,7 +291,7 @@ mod tests {
                 gauge: 0,
                 effects,
             };
-            skin.build(play, &frame, &mut batch);
+            skin.build(play, &frame, &uvs, &mut batch);
         };
         let held = |n: u8, note: usize, kind: Judgment| JudgeEventKind::LnHeld {
             lane: lane(n),

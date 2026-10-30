@@ -16,6 +16,21 @@ pub struct Quad {
     pub uv: [f32; 4],
     /// Color multiplied with the atlas sample, RGBA.
     pub color: [f32; 4],
+    /// The atlas texture array's layer the uv points into.
+    pub layer: u16,
+    /// How the atlas is sampled.
+    pub filter: Filter,
+}
+
+/// How an image is sampled. Both use the atlas's box-filtered mip levels
+/// when shrinking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Filter {
+    /// Bilinear within a level, blending between levels.
+    #[default]
+    Linear,
+    /// The nearest texel of the nearest level, for pixel art.
+    Nearest,
 }
 
 /// How a quad is blended over what is under it.

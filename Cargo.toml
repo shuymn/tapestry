@@ -61,7 +61,7 @@ toml = "1.1.8"
 # library: the library database (bundled SQLite, with FTS5 for search)
 rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
 
-# game, library and xtask, and replay and eval-cli (dev only)
+# game, library and xtask, and replay, eval-cli and skin-model (dev only)
 tempfile = "3.27.0"
 
 # player and eval-cli
@@ -79,8 +79,13 @@ wgpu-hal = { version = "30.0.1", features = ["dx12"] }
 # Menu text: `cosmic-text` layout (re-exported) and its glyph atlas on wgpu 30.
 glyphon = "0.12.0"
 
-# render (dev only): the expected images of the WARP tests
+# render and skin-model (dev only): the expected images of the WARP tests,
+# palette PNG fixtures
 png = "0.18.1"
+
+# skin-model: skin images (decoding, capped) and their atlas pages
+etagere = { version = "0.3.0", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp"] }
 
 # bms-parser and xtask, library (dev only)
 encoding_rs = "0.8.42"
