@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod app;
 mod audio_loop;
 mod autoplay;
 mod error;
@@ -32,6 +33,7 @@ mod settings;
 mod sound;
 mod tuning;
 
+pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Refused};
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioProbe, AudioWaitError, AudioWorker, Probed,
     SWITCH_TIMEOUT, audio_control,
@@ -42,7 +44,7 @@ pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
     LearntRange, Press, ROLES, Refusal, capture_keys, capture_keys_within,
 };
-pub use live::{Closing, InputWaitError, LiveError, Opening, Rig};
+pub use live::{Closing, InputWaitError, Leave, LiveError, Opening, Rig};
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };
@@ -63,8 +65,8 @@ pub use rules_toml::{PresetError, load_preset_toml, preset_to_toml};
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
 pub use session::{
-    AutoKeySounds, Command, Loaded, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript,
-    PlayStart, RECORDING_MEMORY, ReloadError, Reservation, SMALL_PARTS_BYTES,
+    AutoKeySounds, Command, Loaded, MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport,
+    PlayScript, PlayStart, RECORDING_MEMORY, ReloadError, Reservation, SMALL_PARTS_BYTES,
     SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError, Settings, TABLE_BYTES_PER_OBJECT,
 };
 pub use settings::{

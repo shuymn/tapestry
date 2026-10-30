@@ -238,6 +238,21 @@ impl Command {
     }
 }
 
+/// A command on the result screen, separate from the in-play [`Command`]
+/// (design.md "Play Lifecycle").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuCommand {
+    /// Play the chart again.
+    Retry,
+    /// Leave the chart.
+    Back,
+    /// Show the result under the next preset; the play preset is unchanged.
+    NextPreset,
+    /// Show the result under the previous preset; the play preset is
+    /// unchanged.
+    PrevPreset,
+}
+
 /// What one play receives: device input and system controls, both on the
 /// play's timeline (chart time; the countdown starts at `-lead_in`).
 /// Script items before the countdown bootstrap the devices: connections and
@@ -484,6 +499,11 @@ impl Loaded {
     #[must_use]
     pub const fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Reports `ev` to the session event sink.
+    pub(crate) fn emit(&mut self, ev: &SessionEvent) {
+        self.parts.events.on_event(ev);
     }
 
     /// The settings, to change between plays.

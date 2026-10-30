@@ -36,8 +36,9 @@ use replay::Incomplete;
 
 use crate::audio_loop::AudioWaitError;
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
+use crate::policy::SessionEvent;
 use crate::render::RenderSide;
-use crate::session::{Command, Loaded, PlayEnd, PlayOutcome, PlayReport, Settings};
+use crate::session::{Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, Settings};
 use crate::sound::{AudioQueue, audio_link_at};
 
 /// What opening recording gave.
@@ -116,6 +117,18 @@ pub trait Rig {
     /// A pending retry or suspend (or quit, for rigs without a latch),
     /// taken.
     fn take(&mut self) -> Option<Command>;
+    /// A pending result-screen command, taken. By default the in-play
+    /// controls stand in for it: retry retries, quit goes back, and a
+    /// suspend is ignored.
+    fn take_menu(&mut self) -> Option<MenuCommand> {
+        loop {
+            match self.take()? {
+                Command::Retry => return Some(MenuCommand::Retry),
+                Command::Quit => return Some(MenuCommand::Back),
+                Command::Suspend => {}
+            }
+        }
+    }
     /// Whether the player quit or the window is closing: latched, never
     /// cleared.
     fn quitting(&self) -> bool;
@@ -205,24 +218,49 @@ pub enum LiveError<S> {
 
 /// How the run ends when nothing else stopped it: with the input thread's
 /// failure, if one is known.
-fn run_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
+pub(crate) fn run_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
     rig.input_failure()
         .map_or(Ok(()), |e| Err(LiveError::Input(e)))
 }
 
-/// Plays until the player quits: every play's report goes to
-/// [`Rig::ended`]; a play that neither quit nor retried shows its end
-/// screen, which waits for retry or quit.
+/// How the plays of a chart were left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leave {
+    /// The player left the chart: quit during it, or back on its result.
+    Back,
+    /// The window is closing: the run ends.
+    Quit,
+}
+
+/// How the plays of a chart are left: closing the window ends the run,
+/// anything else leaves the chart; a known input-thread failure ends the
+/// run with its cause.
+fn leave<R: Rig>(rig: &R) -> Result<Leave, LiveError<R::ScreenError>> {
+    run_over(rig)?;
+    Ok(if rig.quitting() {
+        Leave::Quit
+    } else {
+        Leave::Back
+    })
+}
+
+/// Plays one chart until the player leaves it: every play's report goes
+/// to [`Rig::ended`]; a play that neither quit nor retried shows its
+/// result, which waits for a [`MenuCommand`]. A quit leaves the chart
+/// ([`Leave::Back`]); closing the window ends the run ([`Leave::Quit`]).
 ///
 /// # Errors
 ///
 /// [`LiveError`] when a play cannot start; the plays before it are saved.
 /// A run whose input thread failed ends with [`LiveError::Input`] at the
-/// next quit or retry, after the play's report and end screen.
-pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::ScreenError>> {
+/// next quit, back or retry, after the play's report and result.
+pub fn run_chart<R: Rig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+) -> Result<Leave, LiveError<R::ScreenError>> {
     loop {
         let Some((report, next)) = play_and_next(loaded, rig)? else {
-            return run_over(rig);
+            return leave(rig);
         };
         rig.ended(&report);
         let by = |c: AbortCause| {
@@ -231,24 +269,29 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::
                 || next.map(Command::cause) == Some(c)
         };
         if rig.quitting() || by(AbortCause::Quit) {
-            return run_over(rig);
+            return leave(rig);
         }
         if by(AbortCause::Retry) {
             continue;
         }
+        loaded.emit(&SessionEvent::Result {
+            attempt: report.attempt,
+        });
         rig.show_end(&report);
         loop {
             rig.wait();
             if rig.quitting() {
-                return run_over(rig);
+                return leave(rig);
             }
-            // Retry and quit are taken before the screen is rebuilt, so a
+            // Retry and back are taken before the screen is rebuilt, so a
             // known input failure ends the run without another handshake
             // with the screen; a retry's preparation rebuilds it anyway.
-            match rig.take() {
-                Some(Command::Retry) => break,
-                Some(Command::Quit) => return run_over(rig),
-                _ => {}
+            // A preset switch changes only the result's view, never the
+            // play preset (design.md "Play Lifecycle").
+            match rig.take_menu() {
+                Some(MenuCommand::Retry) => break,
+                Some(MenuCommand::Back) => return leave(rig),
+                Some(MenuCommand::NextPreset | MenuCommand::PrevPreset) | None => {}
             }
             // The screen failed during the play, its tail or this wait: it
             // is built again, acknowledged, before the end screen shows

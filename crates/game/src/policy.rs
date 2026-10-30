@@ -59,6 +59,8 @@ impl SessionPolicy for DefaultPolicy {
 /// A change of screen or play state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
+    /// Song selection was entered.
+    Select,
     /// The chart was loaded.
     Load,
     /// A play started; `attempt` counts from 1.
@@ -77,6 +79,11 @@ pub enum SessionEvent {
         attempt: u32,
         /// How it ended.
         status: EndStatus,
+    },
+    /// The result of the play `attempt` is shown.
+    Result {
+        /// The play.
+        attempt: u32,
     },
 }
 

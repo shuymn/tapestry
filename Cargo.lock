@@ -717,6 +717,7 @@ dependencies = [
  "bms-parser",
  "eval",
  "input",
+ "proptest",
  "replay",
  "rtrb",
  "rules",
