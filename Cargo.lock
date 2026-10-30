@@ -619,6 +619,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eval-cli"
+version = "0.0.0"
+dependencies = [
+ "bms-model",
+ "bms-parser",
+ "eval",
+ "lexopt",
+ "replay",
+ "rules",
+ "rules-toml",
+ "tempfile",
+]
+
+[[package]]
 name = "extended"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

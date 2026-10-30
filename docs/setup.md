@@ -171,6 +171,7 @@ The game's own figures ([design.md](design.md), "Latency Figures") show in an ov
 ## Other
 
 - Your own charts never enter the repository. To check the loader and autoplay against them, run the local chart sweep on the development PC (Git Bash): `TAPESTRY_CHARTS_DIR=<dir> mise exec -- cargo test -p game --test local_charts -- --ignored --nocapture`. The sweep prints one line per chart with counts and warnings, never titles or paths (the game's own log does record the paths of charts it plays).
+- To re-evaluate saved records without the game, run `mise exec -- cargo run -p eval-cli -- --chart <chart> [--preset <file.toml>]... <record.tprl>...`. It verifies each record against the chart and prints one line per record and preset (without `--preset`, the record's own preset): as played or what-if with what the input covers, the judgment counts, EX, BP, max combo and each gauge. A refused or incomplete record prints `refused: <reason>` on each of its lines and the exit code is 1; a chart or preset file that cannot be read or loaded exits 1 before any line, and bad arguments exit 2.
 - The game's log is `%LOCALAPPDATA%\tapestry\logs\tapestry.log`, with the two runs before it in `tapestry.1.log` and `tapestry.2.log` (design.md "Log File").
 - Antivirus exclusions are not configured by default. Only if builds are actually confirmed to be slow, exclude the build output directory and nothing else.
 - Code signing is prepared before public distribution. It is not needed during development.

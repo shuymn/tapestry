@@ -23,6 +23,7 @@ const REQUIRED_PORTABLE: &[&str] = &[
     "input",
     "audio",
     "game",
+    "eval-cli",
     "xtask",
 ];
 
