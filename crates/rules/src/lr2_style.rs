@@ -119,6 +119,14 @@
 //!   Here the long note is complete at its end with the head's judgment
 //!   (design.md "LN Judgment Modes"), and a release after the end changes
 //!   nothing.
+//! - **A long note's timing.** The source gives a long note finished by a
+//!   release the deviation of larger magnitude of its head and its release
+//!   (`play/JudgeManager.java:583-585`), and counts it early or late by it
+//!   (`:708`). Here the `Judged` event keeps both, the head's deviation and
+//!   the release's distance from the end, and timing readers take the
+//!   head's. At `#RANK 3`, a head pressed 30 ms late and released 100 ms
+//!   before the end is GREAT in both; the source records an early GREAT
+//!   100 ms off, here a late one 30 ms off with the release at −100 ms.
 //! - **`#DEFEXRANK` as a number, over `#RANK`; number syntax, digits and
 //!   whitespace of judgment headers.** The headers are read by the same
 //!   decoder as beatoraja's, and differ the same way (beatoraja-style's

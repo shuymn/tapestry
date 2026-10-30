@@ -914,3 +914,35 @@ fn ineligible_head_leaves_an_empty_poor_to_a_later_note() {
     );
     assert_eq!((e.tally.empty_poor, e.tally.bp), (1, 3));
 }
+
+/// Known difference (the preset's module): a long note's timing is its
+/// head's. A head 30 ms late released 100 ms before the end is GREAT (the
+/// worse of the head's GREAT and the release's PERFECT,
+/// play/JudgeManager.java:582); the source keeps the deviation of larger
+/// magnitude, the release's, and counts an early GREAT 100 ms off
+/// (:583-585, :708). Here the event holds the head's +30 ms and the
+/// release's −100 ms apart.
+#[test]
+fn ln_timing_is_the_heads() {
+    let end = T + 1_000 * MS;
+    let chart = chart(|b| b.long(lane(1), TimeUs(T), TimeUs(end)));
+    let events = vec![press(T + 30 * MS, 0, 1), release(end - 100 * MS, 0, 1)];
+    let e = play_with(&chart, &preset(), events);
+    let judged: Vec<_> = e
+        .events
+        .iter()
+        .filter_map(|ev| match ev.kind {
+            JudgeEventKind::Judged {
+                judgment,
+                deviation,
+                release,
+                ..
+            } => Some((judgment, deviation, release)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        judged,
+        [(Great, Some(TimeUs(30 * MS)), Some(TimeUs(-100 * MS)))]
+    );
+}
