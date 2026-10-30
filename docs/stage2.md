@@ -235,12 +235,16 @@ egui comes with the first form-like screen.
 **Values and examples.**
 - Values come from public descriptions, with each source recorded in the preset's module and its test file.
 - Each preset gets a few dozen hand-written examples.
-- An axis is added only when an example fails without it. Candidates, none committed:
-  - a separate scratch window table (today `JudgeWindows` is one table, crates/rules/src/preset.rs:153);
-  - assignment by combo priority or to the oldest note;
-  - `#TOTAL` damage correction;
-  - per-rank tables;
-  - more gauges.
+- An axis is added only when an example fails without it.
+
+**Axes beatoraja-style needs.** beatoraja (exch-bms2/beatoraja@83574048) differs from today's model in seven places, each shown by an example. PR7 lands the values the model expresses and records these in the preset's module with their sources; PR7a–PR7d add them.
+- **A. Scratch windows:** a separate table for scratch notes, scratch LN ends and scratch empty POOR (PR7a).
+- **F. Rank scaling:** `#DEFEXRANK n` scales by n × 75 / 100 %, and `#RANK 4` by 125 % (PR7a).
+- **B. Note assignment:** which note a press judges when several are in range, and whether earlier notes stay hittable until their late BAD deadline (PR7b).
+- **C, D, E. Gauges:** HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))` (PR7c). N is the whole chart's count, practice included.
+- **G. A BAD long-note head:** it keeps holding and is scored at the release or the end (PR7d).
+
+**Policies are choices, not replacements (decided).** B and G are new policy values beside today's behavior, which stays available to any preset: custom keeps nearest assignment, overtaking and scoring a BAD head at the press. beatoraja's other assignment algorithms are further values, added when a preset needs one. Adding a value does not bump the evaluator version; changing what an existing value means does.
 
 **Versions.**
 - A new field bumps the canonical encoding version (crates/rules/src/canonical.rs:23) and the file shape. Older files are refused with the existing hint.
@@ -662,11 +666,55 @@ Analysis runs at 1× and its result is reused at every speed.
 - If `player.toml` names a preset file that is missing and is not a standard preset, then loading shall be refused with an error naming the file, and nothing shall be written (`missing_non_standard_preset_is_refused`).
 - When `custom.toml` is missing and named, it shall be written with `rules::custom()` (`missing_custom_preset_is_written_as_custom`).
 
+### PR7a. Scratch windows and rank scaling (`rules`, `eval`)
+
+**Touches.** `JudgeWindows` and its validation, deadline preparation, the canonical encoding and file shape, style_beatoraja.rs, the generators and the fuzz seeds.
+
+**Depends on.** PR7.
+
+**Done when.**
+- When a scratch note, a scratch LN end or a scratch empty POOR is judged under beatoraja-style, the scratch table shall apply, and a key note at the same offset shall use the key table (`scratch_uses_its_own_windows`).
+- When `#DEFEXRANK` or `#RANK 4` is present, the windows shall scale as beatoraja does (`defexrank_and_rank_4_scale_like_the_source`).
+- When the presets are written and read through `rules-toml`, they shall round-trip; an older encoding shall be refused.
+
+### PR7b. Note assignment policy (`rules`, `eval`)
+
+**Touches.** the assignment step in `eval`, the preset's policy field, the canonical encoding, style_beatoraja.rs, the generators and the props.
+
+**Depends on.** PR7a.
+
+**Done when.**
+- When several notes on a lane are in range under beatoraja-style, the press shall judge the note beatoraja's combo-priority algorithm picks, and earlier notes shall stay hittable until their late BAD deadline (`combo_priority_assignment_matches_the_source`).
+- When the custom preset runs, assignment shall stay nearest-first with overtaking, and every existing example shall pass unchanged.
+- When the props run, incremental and batch evaluation shall agree under every assignment value.
+
+### PR7c. Gauge bands and TOTAL (`rules`, `eval`)
+
+**Touches.** gauge preparation and arithmetic, the preset's gauge fields, the canonical encoding, style_beatoraja.rs and the generators.
+
+**Depends on.** PR7. It can be developed beside PR7a and PR7b; encoding versions are taken at merge.
+
+**Done when.**
+- When the HARD gauge is low, damage shall shrink by the source's bands (`hard_guts_bands_match_the_source`).
+- When `#TOTAL` is low or absent, the HARD and EX HARD increase and the default TOTAL shall follow the source's formulas, including a TOTAL below 160 (`total_scaling_matches_the_source`).
+- When a section is practiced, N shall be the whole chart's count.
+
+### PR7d. BAD long-note head policy (`rules`, `eval`)
+
+**Touches.** the long-note state machine in `eval`, the preset's policy field, the canonical encoding, style_beatoraja.rs, the props (`LnHeld < BAD` in props.rs) and the generators.
+
+**Depends on.** PR7b.
+
+**Done when.**
+- When a long-note head is BAD under beatoraja-style, the note shall stay held and be scored once at the release or the end (`bad_head_is_scored_at_release`).
+- When the custom preset runs, a BAD head shall be scored at the press, as today.
+- When the props run, every judgeable note shall still be judged exactly once.
+
 ### PR8. LR2-style preset
 
 **Touches.** validate.rs:98, `rules`, `rules-toml`, style_lr2.rs, the generators, the standard-preset writing of D24 (adds `lr2-style.toml`), and design.md "LN Judgment Modes".
 
-**Depends on.** PR7.
+**Depends on.** PR7a–PR7d. LR2-style chooses its own policy values; an LR2 axis not listed in D11 needs its own failing example.
 
 **Done when.**
 - When a release falls within the GOOD width before the end, the head's judgment shall stay; if the release is earlier, then the long note shall be BAD (`release_within_good_width_keeps_head`, `earlier_release_is_bad`).
@@ -915,7 +963,9 @@ Each one holds the behavior D5 and D6 state.
 **Start in parallel:** PR1, PR2, PR3, PR4, PR9, PR11, PR12, PR14, PR21 and PR22.
 
 **Then:**
-- PR1 → PR7 → PR8 → PR16
+- PR1 → PR7 → PR7a → PR7b → PR7d → PR8 → PR16
+- PR7 → PR7c → PR8
+- PR7a–PR7d → PR18 (bests key on the preset bytes, so the standard presets settle first)
 - PR4 → PR5
 - PR1 + PR5 → PR6
 - PR12 → PR13
@@ -964,7 +1014,7 @@ Each one holds the behavior D5 and D6 state.
 
 **New or extended:**
 - `section_excerpt_matches_mid_chart_start`, plus section coverage in the existing properties (PR2);
-- the standard-preset generators (PR7, PR8);
+- the standard-preset generators, reaching every policy value (PR7, PR7a–PR7d, PR8);
 - `canonical_bytes_round_trip` (PR4);
 - round trips of the new record fields (PR9, PR20, PR23);
 - `any_command_sequence_ends_cleanly` (PR14);
