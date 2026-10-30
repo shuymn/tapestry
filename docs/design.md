@@ -1013,7 +1013,8 @@ Rust is recommended as the core language. The evaluator can be shared between th
 | --- | --- | --- |
 | L0 | `bms-model` | Chart types, time (µs) types |
 | L1 | `bms-parser` | Loading BMS/BME/PMS/BMSON, `#RANDOM`, time computation with rational numbers |
-| L2 | `rules` | Preset types, validation and canonical encoding, judgment window and gauge tables. Takes no external dependency; loading preset files (TOML) sits in `game`, so `eval`'s dependency closure stays free of external crates |
+| L2 | `rules` | Preset types, validation and canonical encoding, judgment window and gauge tables. Takes no external dependency, so `eval`'s dependency closure stays free of external crates |
+| L2 | `rules-toml` | Preset files (TOML) to and from `rules::RulePreset`; the file's shape lives here, so `rules` stays free of `serde` and `toml` |
 | L2 | `eval` | The evaluator and its input contract (physical input events, device profile, start snapshot, watermark and merge), which `input` and `replay` use. Depends only on `bms-model` and `rules` |
 | L2 | `replay` | Input log and replay formats |
 | L3 | `input`, `audio` | Raw Input/HID/MIDI, WASAPI/ASIO and the mixer |
@@ -1032,7 +1033,7 @@ Windows-dependent code is confined to `input`, `audio`, `render`, and `player`. 
 
 ### Licenses
 
-The license follows the layer. L0 through L2 (`bms-model`, `bms-parser`, `rules`, `eval`, `replay`), `eval-cli`, and the development tooling (`xtask`) are `MIT OR Apache-2.0`. L3 and above (`input`, `audio`, `game`, `render`, `skin-*`, `ui`) and `player` are `GPL-3.0-or-later`. The fuzz targets (`fuzz`, outside the workspace) are also GPL, because they link `input`; they are tooling and never shipped. The license of `ir-server` and `pkg` is decided when they are built.
+The license follows the layer. L0 through L2 (`bms-model`, `bms-parser`, `rules`, `rules-toml`, `eval`, `replay`), `eval-cli`, and the development tooling (`xtask`) are `MIT OR Apache-2.0`. L3 and above (`input`, `audio`, `game`, `render`, `skin-*`, `ui`) and `player` are `GPL-3.0-or-later`. The fuzz targets (`fuzz`, outside the workspace) are also GPL, because they link `input`; they are tooling and never shipped. The license of `ir-server` and `pkg` is decided when they are built.
 
 - **Why split:** The game itself is copyleft so that a modified player cannot be redistributed with its source closed. Chart loading, the evaluator, and the replay format stay permissive so that other players, tools, and IR servers can load charts and verify replays with the same code. This means the judgment logic can be reused in closed products; that is accepted. The license does not lower the trademark, trade dress, or patent risk of a game modeled on a commercial one; that is handled by what goes into the code (the banned-word list, no copied assets).
 - **One-way dependencies:** A permissive crate never depends on a GPL crate, for any dependency kind. The layer order already guarantees this. `cargo xtask check-arch` (R4) enforces it, and also checks each crate's `license` against an explicit crate-to-license table, so a crate missing from the table or carrying the other license fails. The workspace has no default license, so a new crate has to choose.
