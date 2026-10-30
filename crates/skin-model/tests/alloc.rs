@@ -7,17 +7,19 @@
 //! disturb the count. This file holds a single test for the same reason.
 //! Profiles and the positive control: design.md "Scope of No Allocation".
 
+mod play_support;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, Lane, NoteKind, SoundId, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, Section, Tally};
-use rules::{GaugeValue, Judgment, PerJudgment};
+use play_support::{bool_program, state, tally};
+use rules::{GaugeValue, Judgment};
 use skin_model::{
-    Attempt, Blend, ClipId, Ease, ElementDef, End, GaugeDesc, KeyDef, LaneTimer, PLAY, Play,
-    PlayContext, Program, QuadBatch, Scope, Skin, SkinFrame, Source, TimerRef, Track, Ty, compile,
-    lane_timer, timer,
+    Attempt, Blend, ClipId, Ease, ElementDef, End, GaugeDesc, KeyDef, LaneTimer, Play, PlayContext,
+    QuadBatch, Skin, SkinFrame, Source, TimerRef, Track, lane_timer, timer,
 };
 
 struct Counting;
@@ -101,13 +103,7 @@ fn ev(time: i64, kind: JudgeEventKind) -> JudgeEvent {
 /// otherwise BADs, POORs, BAD heads and empty POORs break it. The combos
 /// are counted in time order, an empty POOR breaking the combo.
 fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEvent> {
-    let grades = [
-        Judgment::Perfect,
-        Judgment::Great,
-        Judgment::Good,
-        Judgment::Bad,
-        Judgment::Poor,
-    ];
+    let grades = Judgment::ALL;
     let inside = |t: TimeUs| section.is_none_or(|s| s.start <= t && t < s.end);
     let mut out = Vec::new();
     let mut gauge = 50_i64;
@@ -211,11 +207,7 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
     out
 }
 
-fn program(src: &str) -> Program {
-    compile(src, &Scope::new(&PLAY), Ty::Bool).unwrap()
-}
-
-/// A 3-key track at x near `x`.
+/// A 3-key track at x near `i`.
 fn track(i: u16, ease: Ease, end: End) -> Track {
     let key = |at: i64, x: i32, alpha: i32| {
         let mut props = [None; 9];
@@ -257,12 +249,12 @@ fn skin() -> Skin {
         "elapsed(beat) < 100",
     ];
     let whens: Vec<_> = (0..32)
-        .map(|i| program(conditions[i % conditions.len()]))
+        .map(|i| bool_program(conditions[i % conditions.len()]))
         .collect();
     let visible = [
-        program("combo % 2 == 0"),
-        program("bp < 1000"),
-        program("on(play)"),
+        bool_program("combo % 2 == 0"),
+        bool_program("bp < 1000"),
+        bool_program("on(play)"),
     ];
     let eases = [Ease::Linear, Ease::In, Ease::Out, Ease::Step];
     let builtin = 30 * timer::BUILTIN;
@@ -422,31 +414,6 @@ fn stretch(
     }
 }
 
-fn fresh_tally() -> Tally {
-    Tally {
-        counts: PerJudgment {
-            perfect: 0,
-            great: 0,
-            good: 0,
-            bad: 0,
-            poor: 0,
-        },
-        ex_score: 0,
-        bp: 0,
-        combo: 0,
-        max_combo: 0,
-        empty_poor: 0,
-    }
-}
-
-fn state(v: GaugeValue) -> GaugeState {
-    GaugeState {
-        value: v,
-        reference: v,
-        failed_at: None,
-    }
-}
-
 #[test]
 fn build_does_not_allocate() {
     let chart = chart();
@@ -482,7 +449,7 @@ fn build_does_not_allocate() {
         end: TimeUs(20_000 * MS),
         ..round.clone()
     };
-    // (name, context, effects, first frame, last frame): the whole chart
+    // (name, context, effects, first frame): the whole chart
     // with breaks, a practice round with breaks after a retry, and a round
     // played to a full combo.
     let attempts = [
@@ -510,7 +477,7 @@ fn build_does_not_allocate() {
     for (name, ctx, events, from) in &attempts {
         // Prepared untracked, as between plays.
         let mut play = skin.prepare(&chart, ctx).unwrap();
-        let mut tally = fresh_tally();
+        let mut tally = tally(0);
         let initial = match ctx.attempt {
             Attempt::Full { .. } => [descs[0].start, descs[1].start],
             Attempt::Section(s) => [s.initial_gauges[0], s.initial_gauges[1]],
