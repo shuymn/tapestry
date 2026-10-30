@@ -1,8 +1,8 @@
 //! The play lifecycle every driver shares (design.md "Play Lifecycle"): prepare
 //! → open recording (the countdown starts) → play → evaluation complete → audio
 //! tail → save → result, with retry, quit, focus loss, removal of the last
-//! device, suspend, an audio or screen failure, and a session policy failure
-//! ending the play from any state.
+//! device, suspend, an audio, screen or input-thread failure, and a session
+//! policy failure ending the play from any state.
 //!
 //! The world around the play is a [`Rig`]: the game's threads in the
 //! player, a virtual clock and scripted input in [`crate::Session`] and in
@@ -20,6 +20,10 @@
 //!   the abort is kept (design.md "Play Lifecycle").
 //! - A completed play seals its key sounds; the tail ends when the audio
 //!   side reports the sealed audio done.
+//! - Opening and closing recording wait a bounded time for the input
+//!   thread. One that is gone or does not answer ends the run with
+//!   [`LiveError::Input`], after the play's record is saved: a failed close
+//!   keeps what the play already took, marked incomplete (input failed).
 
 use ::audio::OutputError;
 use bms_model::TimeUs;
@@ -62,6 +66,17 @@ pub struct Closing {
     /// conversion uses, by source id
     /// ([`input::SourceSet::axis_out_of_range`]).
     pub axis_out_of_range: Vec<u64>,
+}
+
+/// Why the input thread did not open or close recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InputWaitError {
+    /// The input thread is gone.
+    #[error("the input thread is gone")]
+    Gone,
+    /// It did not answer within the rig's bound.
+    #[error("the input thread did not answer")]
+    Timeout,
 }
 
 /// The world a play runs in.
@@ -119,7 +134,11 @@ pub trait Rig {
     }
     /// Opens recording at the next input boundary, with chart time 0
     /// `lead_in` after it.
-    fn open(&mut self, lead_in: TimeUs) -> Opening<Self::Reader>;
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not open it, which ends the run.
+    fn open(&mut self, lead_in: TimeUs) -> Result<Opening<Self::Reader>, InputWaitError>;
     /// Hands the play to audio and to the screen.
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide);
     /// Whether the focus gate has tripped since recording opened.
@@ -137,7 +156,18 @@ pub trait Rig {
     /// Whether the sealed play's audio has ended.
     fn audio_done(&self) -> bool;
     /// Closes recording and waits until nothing more is pushed.
-    fn close(&mut self) -> Closing;
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not close it: the play is saved without
+    /// the closing, and the run ends.
+    fn close(&mut self) -> Result<Closing, InputWaitError>;
+    /// The input thread's failure, once known: it is gone, or a handshake
+    /// with it failed. Sticks once set.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn input_failure(&self) -> Option<InputWaitError> {
+        None
+    }
     /// The play ended: its report, before any end screen.
     fn ended(&mut self, report: &PlayReport);
     /// Shows the end screen of a play that neither quit nor retried.
@@ -165,6 +195,16 @@ pub enum LiveError<S> {
     /// Audio cannot play.
     #[error("audio cannot play")]
     Audio(#[source] AudioWaitError),
+    /// The input thread is gone or did not answer.
+    #[error("the input thread failed")]
+    Input(#[source] InputWaitError),
+}
+
+/// How the run ends when nothing else stopped it: with the input thread's
+/// failure, if one is known.
+fn run_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
+    rig.input_failure()
+        .map_or(Ok(()), |e| Err(LiveError::Input(e)))
 }
 
 /// Plays until the player quits: every play's report goes to
@@ -174,10 +214,12 @@ pub enum LiveError<S> {
 /// # Errors
 ///
 /// [`LiveError`] when a play cannot start; the plays before it are saved.
+/// A run whose input thread failed ends with [`LiveError::Input`] at the
+/// next quit or retry, after the play's report and end screen.
 pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::ScreenError>> {
     loop {
         let Some((report, next)) = play_and_next(loaded, rig)? else {
-            return Ok(());
+            return run_over(rig);
         };
         rig.ended(&report);
         let by = |c: AbortCause| {
@@ -186,7 +228,7 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::
                 || next.map(Command::cause) == Some(c)
         };
         if rig.quitting() || by(AbortCause::Quit) {
-            return Ok(());
+            return run_over(rig);
         }
         if by(AbortCause::Retry) {
             continue;
@@ -195,7 +237,15 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::
         loop {
             rig.wait();
             if rig.quitting() {
-                return Ok(());
+                return run_over(rig);
+            }
+            // Retry and quit are taken before the screen is rebuilt, so a
+            // known input failure ends the run without another handshake
+            // with the screen; a retry's preparation rebuilds it anyway.
+            match rig.take() {
+                Some(Command::Retry) => break,
+                Some(Command::Quit) => return run_over(rig),
+                _ => {}
             }
             // The screen failed during the play, its tail or this wait: it
             // is built again, acknowledged, before the end screen shows
@@ -203,11 +253,6 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::
             if rig.screen_failed() {
                 rig.prepare_screen().map_err(LiveError::Screen)?;
                 rig.show_end(&report);
-            }
-            match rig.take() {
-                Some(Command::Retry) => break,
-                Some(Command::Quit) => return Ok(()),
-                _ => {}
             }
         }
     }
@@ -218,8 +263,8 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::
 ///
 /// # Errors
 ///
-/// [`LiveError`] when the screen or the logic step cannot start; recording
-/// is closed again.
+/// [`LiveError`] when the screen, audio, recording or the logic step cannot
+/// start; recording is closed again.
 pub fn play<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
@@ -240,6 +285,9 @@ fn play_and_next<R: Rig>(
     if rig.quitting() {
         return Ok(None);
     }
+    // A failed input thread is known before another handshake could mask
+    // or delay it.
+    run_over(rig)?;
     rig.prepare_screen().map_err(LiveError::Screen)?;
     rig.prepare_audio().map_err(LiveError::Audio)?;
     // A retry or suspend from before this play belongs to no play.
@@ -248,12 +296,16 @@ fn play_and_next<R: Rig>(
     }
     rig.before_play(loaded.settings_mut());
     let start = loaded.begin_play();
-    let opening = rig.open(loaded.config().lead_in);
+    // A quit during the wait is latched and taken by the first step.
+    let opening = rig
+        .open(loaded.config().lead_in)
+        .map_err(LiveError::Input)?;
     let origin = opening.origin;
+    // The refusal is the error reported; a failed close adds nothing to it.
     let plan = match loaded.plan(&opening.kinds, &opening.axes) {
         Ok(plan) => plan,
         Err(e) => {
-            rig.close();
+            let _ = rig.close();
             return Err(LiveError::Logic(e));
         }
     };
@@ -268,7 +320,7 @@ fn play_and_next<R: Rig>(
     ) {
         Ok(pair) => pair,
         Err(e) => {
-            rig.close();
+            let _ = rig.close();
             return Err(LiveError::Logic(e));
         }
     };
@@ -282,6 +334,7 @@ fn play_and_next<R: Rig>(
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
     let mut output_error = None;
+    let mut input_error = None;
     // A suspend while recording is open marks the record incomplete, whichever
     // cause ends the play (design.md "Play Lifecycle").
     let mut suspended = false;
@@ -300,6 +353,11 @@ fn play_and_next<R: Rig>(
             logic.abort(AbortCause::Quit);
         } else if let Some(c) = command {
             logic.abort(c.cause());
+        } else if let Some(e) = rig.input_failure() {
+            // Before focus loss: the input thread publishes the focus gate
+            // and the connections, which are stale once it is gone.
+            input_error = Some(e);
+            logic.abort(AbortCause::InputFailed);
         } else if rig.focus_lost() {
             logic.abort(AbortCause::FocusLoss);
         } else if let Some(e) = rig.audio_failure() {
@@ -338,7 +396,10 @@ fn play_and_next<R: Rig>(
 
     // Recording closes at the end of evaluation (design.md "Play Lifecycle");
     // an aborted play then takes what reached its queues after the abort.
-    let closing = rig.close();
+    // A failed close leaves the closing unknown, and the record keeps what
+    // the play already took: what reached the queues after its last step is
+    // lost, and the record is marked incomplete (input failed).
+    let closed = rig.close();
     // A command that arrived during the close handshake is kept for what
     // follows: it cuts the tail, or, after an abort, it is the run's next
     // step. A suspend there still happened while recording was open.
@@ -347,23 +408,40 @@ fn play_and_next<R: Rig>(
         suspended |= c == Command::Suspend;
         carried = carried.or(Some(c));
     }
-    logic.drain_after_close();
+    let closing = match closed {
+        Ok(closing) => {
+            logic.drain_after_close();
+            closing
+        }
+        Err(e) => {
+            input_error = input_error.or(Some(e));
+            Closing::default()
+        }
+    };
     let incomplete = Incomplete {
         overflow: logic.overflowed() || closing.overflowed,
         source_limit: closing.source_limited,
         suspend: suspended,
+        input_failed: input_error.is_some(),
     };
     let view = logic.view();
     let record = logic.into_record();
 
     // The audio tail of a completed play: nothing is recorded, and a
-    // control, focus loss, removal of the last device, an audio failure or
-    // a screen failure cuts it short; the record stays complete.
+    // control, an input-thread failure, focus loss, removal of the last
+    // device, an audio failure or a screen failure cuts it short; the
+    // play stays complete.
     let mut tail_cut = None;
     if end == PlayEnd::Completed
         && let Some(c) = carried
     {
         tail_cut = Some(c.cause());
+        rig.cancel_audio();
+    } else if end == PlayEnd::Completed
+        && let Some(e) = rig.input_failure()
+    {
+        input_error = Some(e);
+        tail_cut = Some(AbortCause::InputFailed);
         rig.cancel_audio();
     } else if end == PlayEnd::Completed
         && let Some(e) = rig.audio_failure()
@@ -378,6 +456,9 @@ fn play_and_next<R: Rig>(
             Some(AbortCause::Quit)
         } else if let Some(c) = rig.take() {
             Some(c.cause())
+        } else if let Some(e) = rig.input_failure() {
+            input_error = Some(e);
+            Some(AbortCause::InputFailed)
         } else if rig.focus_lost() {
             Some(AbortCause::FocusLoss)
         } else if !rig.connected() {
@@ -408,6 +489,7 @@ fn play_and_next<R: Rig>(
         end,
         tail_cut,
         output_error,
+        input_error,
         live,
         view,
         record,

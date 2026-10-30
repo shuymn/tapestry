@@ -62,7 +62,7 @@ pub use record::{
 use wire::{Reader, Writer};
 
 /// The format version this crate writes, and the only one it reads.
-pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION: u16 = 4;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -381,6 +381,7 @@ fn write_arrivals(w: &mut Writer, arrivals: &[Arrival]) {
 const OVERFLOW: u64 = 1;
 const SOURCE_LIMIT: u64 = 1 << 1;
 const SUSPEND: u64 = 1 << 2;
+const INPUT_FAILED: u64 = 1 << 3;
 
 fn write_status(w: &mut Writer, s: &Status) {
     let Status {
@@ -391,6 +392,7 @@ fn write_status(w: &mut Writer, s: &Status) {
                 overflow,
                 source_limit,
                 suspend,
+                input_failed,
             },
     } = s;
     w.uint(match end {
@@ -399,7 +401,12 @@ fn write_status(w: &mut Writer, s: &Status) {
     });
     w.int(finalized.0);
     let bit = |set: bool, bit: u64| if set { bit } else { 0 };
-    w.uint(bit(*overflow, OVERFLOW) | bit(*source_limit, SOURCE_LIMIT) | bit(*suspend, SUSPEND));
+    w.uint(
+        bit(*overflow, OVERFLOW)
+            | bit(*source_limit, SOURCE_LIMIT)
+            | bit(*suspend, SUSPEND)
+            | bit(*input_failed, INPUT_FAILED),
+    );
 }
 
 /// Decodes a file written by [`encode`] in [`FORMAT_VERSION`]; every other
@@ -747,7 +754,7 @@ fn read_status(r: &mut Reader<'_>) -> Result<Status, DecodeError> {
     };
     let finalized = TimeUs(r.int()?);
     let bits = r.uint()?;
-    if bits & !(OVERFLOW | SOURCE_LIMIT | SUSPEND) != 0 {
+    if bits & !(OVERFLOW | SOURCE_LIMIT | SUSPEND | INPUT_FAILED) != 0 {
         return Err(DecodeError::InvalidValue("incomplete reasons"));
     }
     Ok(Status {
@@ -757,6 +764,7 @@ fn read_status(r: &mut Reader<'_>) -> Result<Status, DecodeError> {
             overflow: bits & OVERFLOW != 0,
             source_limit: bits & SOURCE_LIMIT != 0,
             suspend: bits & SUSPEND != 0,
+            input_failed: bits & INPUT_FAILED != 0,
         },
     })
 }

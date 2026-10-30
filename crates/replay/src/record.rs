@@ -166,13 +166,16 @@ pub struct Incomplete {
     pub source_limit: bool,
     /// The system suspended during play, so the clock jumped.
     pub suspend: bool,
+    /// The input thread failed, so recording did not close normally: what
+    /// reached the queues after the play's last step is not in the record.
+    pub input_failed: bool,
 }
 
 impl Incomplete {
     /// Whether any reason holds.
     #[must_use]
     pub const fn any(self) -> bool {
-        self.overflow || self.source_limit || self.suspend
+        self.overflow || self.source_limit || self.suspend || self.input_failed
     }
 }
 

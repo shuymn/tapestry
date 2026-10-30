@@ -244,6 +244,16 @@ fn live_errors_have_each_side_as_source() {
         &AudioWaitError::Gone,
         &["audio cannot play", "the audio thread is gone"],
     );
+    for (cause, text) in [
+        (game::InputWaitError::Gone, "the input thread is gone"),
+        (
+            game::InputWaitError::Timeout,
+            "the input thread did not answer",
+        ),
+    ] {
+        let e = LiveError::<SurfaceLost>::Input(cause);
+        assert_chain(&e, &cause, &["the input thread failed", text]);
+    }
 }
 
 /// `SessionError::Ingest` and `::Preset` and `ReloadError::Preset` are

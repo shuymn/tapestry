@@ -1249,6 +1249,13 @@ impl Worker {
         }
         handle.join().map_err(|_| InputError::Panicked)
     }
+
+    /// Signals the thread to stop and lets it go without joining: a wake
+    /// that never returns cannot hold up the caller.
+    fn detach(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        drop(self.handle.take());
+    }
 }
 
 impl Drop for Worker {
@@ -1368,6 +1375,13 @@ impl InputThread {
     pub fn stop(mut self) -> Result<WakeReport, InputError> {
         self.worker.shutdown()
     }
+
+    /// Signals the thread to stop after its current wake and returns at
+    /// once, without waiting for it or its report: for the process's exit,
+    /// which a stuck wake must not hold up.
+    pub fn detach(mut self) {
+        self.worker.detach();
+    }
 }
 
 /// An input thread without Raw Input, for input that comes from no device
@@ -1412,6 +1426,11 @@ impl ClockedThread {
     /// As [`InputThread::stop`].
     pub fn stop(mut self) -> Result<WakeReport, InputError> {
         self.worker.shutdown()
+    }
+
+    /// As [`InputThread::detach`].
+    pub fn detach(mut self) {
+        self.worker.detach();
     }
 }
 
@@ -1497,6 +1516,48 @@ mod clocked_tests {
         // About 100 wakes; a loaded machine may skip some.
         let wakes = report.intervals.count();
         assert!((20..=150).contains(&wakes), "{wakes}");
+    }
+
+    /// Detaching returns while a wake is blocked, and the thread still
+    /// stops by itself once the wake returns.
+    #[test]
+    fn detach_returns_while_a_wake_is_blocked() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let clock = QpcClock::start();
+        let set = SourceSet::new(SourceConfig {
+            max_devices: 1,
+            max_sources: 1,
+            max_held: 1,
+            queue_capacity: 1,
+            max_arrivals: 1,
+        })
+        .unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        // Disconnected once the thread has ended and dropped its wake.
+        let (_ended_tx, ended) = mpsc::channel::<()>();
+        let thread = ClockedThread::spawn(clock, set, move |_, _| {
+            let _held = &_ended_tx;
+            let _ = entered_tx.send(());
+            // Blocked until released, within a bound.
+            let _ = released.recv_timeout(Duration::from_secs(10));
+        })
+        .unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        thread.detach();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            ended.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
     }
 }
 

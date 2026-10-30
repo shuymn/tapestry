@@ -799,7 +799,15 @@ fn play(
     let ran = game::live::run(&mut loaded, &mut rig);
     rig.shut_down();
     window_thread.close();
-    drop((raw_thread, clocked_thread));
+    // Not joined: an input thread that stopped answering must not hold up
+    // the exit or the report of why the run ended. Its wake report is not
+    // used here.
+    if let Some(t) = raw_thread {
+        t.detach();
+    }
+    if let Some(t) = clocked_thread {
+        t.detach();
+    }
     ran?;
     Ok(())
 }
@@ -897,7 +905,8 @@ fn headless(
     tune(&mut rig);
     let ran = game::live::run(&mut loaded, &mut rig);
     rig.shut_down();
-    drop(input_thread);
+    // As in `play`: not joined.
+    input_thread.detach();
     ran?;
     Ok(())
 }

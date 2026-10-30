@@ -316,6 +316,18 @@ fn a_record_from_before_the_out_of_range_counts_is_refused() {
 }
 
 #[test]
+fn a_record_from_before_the_input_failure_reason_is_refused() {
+    // Format 3 had no "input failed" reason; its files are refused by
+    // their version, with no conversion.
+    let mut old = wrap(&body_bytes(&golden()), 3);
+    old[4..6].copy_from_slice(&3_u16.to_le_bytes());
+    assert_eq!(
+        decode(&old, &limits()),
+        Err(DecodeError::UnsupportedVersion(3))
+    );
+}
+
+#[test]
 fn truncated_body_is_an_error_not_a_panic() {
     let rec = sample(60);
     let body = body_bytes(&rec);
@@ -468,6 +480,7 @@ fn golden_base() -> PlayRecord {
                 overflow: true,
                 source_limit: false,
                 suspend: true,
+                input_failed: false,
             },
         },
     }
@@ -664,36 +677,36 @@ fn preset_hash_is_sha256_of_canonical_bytes() {
 
 #[test]
 fn status_reasons_and_end_statuses_are_pinned() {
-    let status = |end, overflow, source_limit, suspend| Status {
+    let status = |end, [overflow, source_limit, suspend, input_failed]: [bool; 4]| Status {
         end,
         finalized: TimeUs(-2),
         incomplete: Incomplete {
             overflow,
             source_limit,
             suspend,
+            input_failed,
         },
     };
+    let none = [false; 4];
     // End status tag, zigzag finalized watermark (-2 is 3), reason bits.
     let cases = [
+        (status(EndStatus::PlayedToEnd, none), [0, 3, 0]),
+        (status(EndStatus::EndedMidway, none), [1, 3, 0]),
         (
-            status(EndStatus::PlayedToEnd, false, false, false),
-            [0, 3, 0],
-        ),
-        (
-            status(EndStatus::EndedMidway, false, false, false),
-            [1, 3, 0],
-        ),
-        (
-            status(EndStatus::EndedMidway, true, false, false),
+            status(EndStatus::EndedMidway, [true, false, false, false]),
             [1, 3, 1],
         ),
         (
-            status(EndStatus::EndedMidway, false, true, false),
+            status(EndStatus::EndedMidway, [false, true, false, false]),
             [1, 3, 2],
         ),
         (
-            status(EndStatus::EndedMidway, false, false, true),
+            status(EndStatus::EndedMidway, [false, false, true, false]),
             [1, 3, 4],
+        ),
+        (
+            status(EndStatus::EndedMidway, [false, false, false, true]),
+            [1, 3, 8],
         ),
     ];
     for (s, bytes) in cases {
@@ -704,6 +717,18 @@ fn status_reasons_and_end_statuses_are_pinned() {
         rec.status = s;
         assert_eq!(decode(&encode(&rec), &limits()), Ok(rec));
     }
+}
+
+/// A play whose input thread failed is incomplete for that reason alone
+/// (its round trip is in `status_reasons_and_end_statuses_are_pinned`).
+#[test]
+fn an_input_failure_alone_marks_the_record_incomplete() {
+    let input_failed = Incomplete {
+        input_failed: true,
+        ..Incomplete::default()
+    };
+    assert!(input_failed.any());
+    assert!(!Incomplete::default().any());
 }
 
 #[test]

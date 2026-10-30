@@ -9,21 +9,48 @@
 //! overflow flags. Between requests the hook publishes the gate's state
 //! and whether a participating device is still connected, for the abort
 //! checks of the play and its audio tail.
+//!
+//! The game thread waits for each reply at most [`INPUT_TIMEOUT`] of awake
+//! time; an input thread that is gone or does not answer fails the link for
+//! good. The input thread prints nothing: what the hook has to say travels
+//! with its reply and is printed by the game thread, so a blocked console
+//! never stalls the input thread.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::Thread;
+use std::time::Duration;
 
 use bms_model::TimeUs;
 use eval::ControlId;
-use game::{Closing, Opening, ScratchConfig};
+use game::{Closing, InputWaitError, Opening, ScratchConfig};
 use input::hid::HidProduct;
 use input::{DeviceId, DeviceKind, SourceReader, SourceSet};
 
 use crate::controls::Controls;
+
+/// How long the game thread waits for the input thread to open or close
+/// recording: far beyond a wake, at which a live input thread answers.
+pub const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long each wait for a reply lasts before the awake time is read
+/// again.
+const WAIT_SLICE: Duration = Duration::from_millis(50);
+
+/// The time the system has been awake, which stands still during a suspend
+/// (`QueryUnbiasedInterruptTime`), so a suspend during a handshake does
+/// not count against [`INPUT_TIMEOUT`].
+fn awake_time() -> Duration {
+    let mut t = 0_u64;
+    // SAFETY: one u64 written.
+    let _ =
+        unsafe { windows::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime(&mut t) };
+    // 100 ns units.
+    Duration::from_nanos(t.saturating_mul(100))
+}
 
 /// What the game thread asks of the input thread.
 pub enum Request {
@@ -56,12 +83,13 @@ pub struct Recorded {
     pub scratch: ScratchConfig,
 }
 
-/// The input thread's answers.
+/// The input thread's answers, each with the console lines the hook has
+/// for it.
 pub enum Reply {
     /// Recording is open.
-    Opened(Opening<SourceReader>),
+    Opened(Opening<SourceReader>, Vec<String>),
     /// Recording is closed.
-    Closed(Closing),
+    Closed(Closing, Vec<String>),
 }
 
 /// What the input thread publishes between requests.
@@ -69,6 +97,8 @@ pub enum Reply {
 pub struct InputState {
     tripped: AtomicBool,
     connected: AtomicBool,
+    /// The hook was dropped: the input thread ended, or is unwinding.
+    gone: AtomicBool,
 }
 
 /// The game thread's end of the input side.
@@ -76,43 +106,88 @@ pub struct InputLink {
     requests: Sender<Request>,
     replies: Receiver<Reply>,
     state: Arc<InputState>,
+    /// The most awake time a reply is waited for.
+    timeout: Duration,
+    /// The awake-time clock the wait is measured on.
+    awake: fn() -> Duration,
+    /// The first handshake's failure: once set, no request is sent and no
+    /// reply read, so a late reply to a request that timed out is never
+    /// taken for the answer to another.
+    failed: Option<InputWaitError>,
 }
 
 impl InputLink {
     /// Opens recording for a play.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If the input thread is gone.
-    #[expect(
-        clippy::expect_used,
-        reason = "the documented panic: the input thread outlives every play"
-    )]
-    pub fn open(&self, request: Request) -> Opening<SourceReader> {
-        self.requests.send(request).expect("the input thread runs");
-        match self.replies.recv().expect("the input thread runs") {
-            Reply::Opened(o) => o,
-            Reply::Closed(_) => unreachable!("an open is answered by an opening"),
+    /// [`InputWaitError`] if the input thread is gone or did not answer
+    /// within [`INPUT_TIMEOUT`], now or at an earlier handshake.
+    pub fn open(&mut self, request: Request) -> Result<Opening<SourceReader>, InputWaitError> {
+        match self.ask(request)? {
+            Reply::Opened(o, lines) => {
+                print_lines(&lines);
+                Ok(o)
+            }
+            Reply::Closed(..) => unreachable!("an open is answered by an opening"),
         }
     }
 
     /// Closes recording.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If the input thread is gone.
-    #[expect(
-        clippy::expect_used,
-        reason = "the documented panic: the input thread outlives every play"
-    )]
-    pub fn close(&self) -> Closing {
-        self.requests
-            .send(Request::Close)
-            .expect("the input thread runs");
-        match self.replies.recv().expect("the input thread runs") {
-            Reply::Closed(c) => c,
-            Reply::Opened(_) => unreachable!("a close is answered by a closing"),
+    /// As [`open`](Self::open).
+    pub fn close(&mut self) -> Result<Closing, InputWaitError> {
+        match self.ask(Request::Close)? {
+            Reply::Closed(c, lines) => {
+                print_lines(&lines);
+                Ok(c)
+            }
+            Reply::Opened(..) => unreachable!("a close is answered by a closing"),
         }
+    }
+
+    /// Sends `request` and waits for its reply. Every request is answered
+    /// once, in order, so with the link failed at the first wait that does
+    /// not end in a reply, the reply read is always this request's.
+    fn ask(&mut self, request: Request) -> Result<Reply, InputWaitError> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        let reply = self.wait(request);
+        if let Err(e) = reply {
+            self.failed = Some(e);
+        }
+        reply
+    }
+
+    fn wait(&self, request: Request) -> Result<Reply, InputWaitError> {
+        self.requests
+            .send(request)
+            .map_err(|_| InputWaitError::Gone)?;
+        let since = (self.awake)();
+        loop {
+            match self.replies.recv_timeout(WAIT_SLICE) {
+                Ok(reply) => return Ok(reply),
+                Err(RecvTimeoutError::Disconnected) => return Err(InputWaitError::Gone),
+                Err(RecvTimeoutError::Timeout) => {
+                    if (self.awake)().saturating_sub(since) >= self.timeout {
+                        return Err(InputWaitError::Timeout);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Why the input thread failed, once known: a handshake's failure, or
+    /// the hook gone (the thread ended or panicked). One atomic load.
+    pub fn failure(&self) -> Option<InputWaitError> {
+        self.failed.or(self
+            .state
+            .gone
+            .load(Ordering::Acquire)
+            .then_some(InputWaitError::Gone))
     }
 
     /// Whether the focus gate has tripped since recording last opened.
@@ -124,6 +199,13 @@ impl InputLink {
     /// connected (the same connection).
     pub fn connected(&self) -> bool {
         self.state.connected.load(Ordering::Acquire)
+    }
+}
+
+/// Prints the hook's lines for a reply, on the game thread.
+fn print_lines(lines: &[String]) {
+    for line in lines {
+        eprintln!("{line}");
     }
 }
 
@@ -189,8 +271,18 @@ pub fn link(controls: Arc<Controls>, mode: Mode) -> (Hook, InputLink) {
             requests: req_tx,
             replies: rep_rx,
             state,
+            timeout: INPUT_TIMEOUT,
+            awake: awake_time,
+            failed: None,
         },
     )
+}
+
+impl Drop for Hook {
+    /// Runs when the input thread ends, and while it unwinds from a panic.
+    fn drop(&mut self) {
+        self.state.gone.store(true, Ordering::Release);
+    }
 }
 
 impl Hook {
@@ -216,8 +308,14 @@ impl Hook {
                     lead_in,
                     logic,
                     recorded,
-                } => Reply::Opened(self.open(sources, now, lead_in, logic, &recorded)),
-                Request::Close => Reply::Closed(self.close(sources)),
+                } => {
+                    let (opening, lines) = self.open(sources, now, lead_in, logic, &recorded);
+                    Reply::Opened(opening, lines)
+                }
+                Request::Close => {
+                    let (closing, lines) = self.close(sources);
+                    Reply::Closed(closing, lines)
+                }
             };
             // Published before the reply, so the game thread never reads
             // the previous play's state after it.
@@ -252,13 +350,14 @@ impl Hook {
         lead_in: TimeUs,
         logic: Thread,
         recorded: &Recorded,
-    ) -> Opening<SourceReader> {
+    ) -> (Opening<SourceReader>, Vec<String>) {
         let origin = TimeUs(now.0 + lead_in.0);
+        let mut lines = Vec::new();
         let start = match &mut self.mode {
             Mode::Clock => {
                 if !take_part(sources, recorded) {
-                    eprintln!(
-                        "input: the controller set up in `tapestry keys` is not connected; this play uses the keyboard bindings only"
+                    lines.push(
+                        "input: the controller set up in `tapestry keys` is not connected; this play uses the keyboard bindings only".to_owned()
                     );
                 }
                 reset_gate(sources, &self.controls);
@@ -267,9 +366,9 @@ impl Hook {
                 // is (controllers come first), possibly one with lanes.
                 let n = sources.left_out();
                 if n > 0 {
-                    eprintln!(
+                    lines.push(format!(
                         "input: {n} connected device(s) take no part in this play: more devices than sources; a keyboard left out records nothing, and the log is marked incomplete"
-                    );
+                    ));
                 }
                 start
             }
@@ -314,7 +413,7 @@ impl Hook {
             .participants()
             .map(|(d, _)| (d, sources.connection(d)))
             .collect();
-        Opening {
+        let opening = Opening {
             origin,
             start,
             readers: sources.take_readers(),
@@ -323,10 +422,11 @@ impl Hook {
                 .participants()
                 .map(|(d, _)| sources.axes(d).to_vec())
                 .collect(),
-        }
+        };
+        (opening, lines)
     }
 
-    fn close(&mut self, sources: &mut SourceSet) -> Closing {
+    fn close(&mut self, sources: &mut SourceSet) -> (Closing, Vec<String>) {
         let closed = Closing {
             arrivals: sources.arrivals().to_vec(),
             overflowed: sources.overflowed(),
@@ -334,12 +434,10 @@ impl Hook {
             axis_out_of_range: sources.axis_out_of_range().collect(),
         };
         // Shown once per play: the record keeps the counts.
-        for line in out_of_range_warnings(sources) {
-            eprintln!("{line}");
-        }
+        let lines = out_of_range_warnings(sources);
         sources.close_recording();
         self.origin = None;
-        closed
+        (closed, lines)
     }
 }
 
@@ -733,7 +831,7 @@ mod autoplay_tests {
     use crate::controls::Controls;
 
     const MS: i64 = 1_000;
-    const LEAD_IN: TimeUs = TimeUs(1_000 * MS);
+    pub(super) const LEAD_IN: TimeUs = TimeUs(1_000 * MS);
     /// Lane 1's key in the built-in key config.
     const Z: ControlId = ControlId(0x2c);
 
@@ -748,7 +846,7 @@ mod autoplay_tests {
             .to_vec()
     }
 
-    fn recorded() -> Recorded {
+    pub(super) fn recorded() -> Recorded {
         Recorded {
             keyboard: vec![Z],
             controller: vec![ControlId(1)],
@@ -757,7 +855,7 @@ mod autoplay_tests {
         }
     }
 
-    fn set() -> SourceSet {
+    pub(super) fn set() -> SourceSet {
         SourceSet::new(SourceConfig {
             max_devices: 4,
             max_sources: 4,
@@ -770,7 +868,7 @@ mod autoplay_tests {
 
     /// The hook of an autoplay session and its link, with the window's
     /// controls holding the source set's latch before any play opens.
-    fn hooked(sources: &SourceSet) -> (Arc<Controls>, Hook, InputLink) {
+    pub(super) fn hooked(sources: &SourceSet) -> (Arc<Controls>, Hook, InputLink) {
         let controls = Arc::new(Controls::new(QpcClock::start()));
         controls.set_latch(sources.gate().handle());
         let (hook, link) = link(
@@ -797,15 +895,15 @@ mod autoplay_tests {
             .unwrap();
         hook.wake(sources, TimeUs(at));
         match link.replies.try_recv().unwrap() {
-            Reply::Opened(o) => o,
-            Reply::Closed(_) => panic!("an open is answered by an opening"),
+            Reply::Opened(o, _) => o,
+            Reply::Closed(..) => panic!("an open is answered by an opening"),
         }
     }
 
     fn close(hook: &mut Hook, link: &InputLink, sources: &mut SourceSet, at: i64) {
         link.requests.send(Request::Close).unwrap();
         hook.wake(sources, TimeUs(at));
-        assert!(matches!(link.replies.try_recv(), Ok(Reply::Closed(_))));
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Closed(..))));
     }
 
     /// P1: the latch the controls got before the first play still trips
@@ -898,5 +996,245 @@ mod autoplay_tests {
             got.push(e.received);
         }
         assert_eq!(got, [TimeUs(500 * MS), TimeUs(550 * MS)]);
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use bms_model::TimeUs;
+    use game::{InputWaitError, ScratchConfig};
+    use input::hid::HidProduct;
+    use input::{DeviceId, DeviceKind, QpcClock, SourceSet};
+
+    use super::autoplay_tests::{LEAD_IN, hooked, recorded, set};
+    use super::{Hook, Mode, Recorded, Reply, Request, link};
+    use crate::controls::Controls;
+
+    /// A short bound for the tests that wait it out.
+    const SHORT: Duration = Duration::from_millis(100);
+
+    /// An input thread double: wakes the hook about every millisecond
+    /// while not `stuck`, until stopped, and gives the hook back. It ends
+    /// by itself after 30 s, so a failing test cannot hang.
+    struct Waker {
+        stop: Arc<AtomicBool>,
+        stuck: Arc<AtomicBool>,
+        /// Set by the thread once it has seen `stuck` between two wakes:
+        /// no wake is under way, and none starts until `stuck` clears.
+        paused: Arc<AtomicBool>,
+        wakes: Arc<AtomicU64>,
+        handle: JoinHandle<Hook>,
+    }
+
+    impl Waker {
+        fn spawn(mut hook: Hook, mut sources: SourceSet) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stuck = Arc::new(AtomicBool::new(false));
+            let paused = Arc::new(AtomicBool::new(false));
+            let wakes = Arc::new(AtomicU64::new(0));
+            let (s, k, p, w) = (
+                Arc::clone(&stop),
+                Arc::clone(&stuck),
+                Arc::clone(&paused),
+                Arc::clone(&wakes),
+            );
+            let handle = std::thread::spawn(move || {
+                let begun = Instant::now();
+                let mut now = 0;
+                while !s.load(Ordering::Acquire) && begun.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(1));
+                    if k.load(Ordering::Acquire) {
+                        p.store(true, Ordering::Release);
+                    } else {
+                        p.store(false, Ordering::Release);
+                        now += 1_000;
+                        hook.wake(&mut sources, TimeUs(now));
+                        w.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                hook
+            });
+            Self {
+                stop,
+                stuck,
+                paused,
+                wakes,
+                handle,
+            }
+        }
+
+        /// Stops the wakes and waits (at most 5 s) until the thread says
+        /// its last wake has finished: a request sent after this is not
+        /// answered until [`resume`](Self::resume).
+        fn pause(&self) {
+            self.paused.store(false, Ordering::Release);
+            self.stuck.store(true, Ordering::Release);
+            let begun = Instant::now();
+            while !self.paused.load(Ordering::Acquire) {
+                assert!(begun.elapsed() < Duration::from_secs(5), "not paused");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn resume(&self) {
+            self.stuck.store(false, Ordering::Release);
+        }
+
+        /// Waits (at most 5 s) until the hook has woken twice more: a
+        /// request sent before has been answered.
+        fn two_more_wakes(&self) {
+            let from = self.wakes.load(Ordering::Acquire);
+            let begun = Instant::now();
+            while self.wakes.load(Ordering::Acquire) < from + 2 {
+                assert!(begun.elapsed() < Duration::from_secs(5), "no wakes");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn stop(self) -> Hook {
+            self.stop.store(true, Ordering::Release);
+            self.handle.join().unwrap()
+        }
+    }
+
+    fn open_request() -> Request {
+        Request::Open {
+            lead_in: LEAD_IN,
+            logic: std::thread::current(),
+            recorded: recorded(),
+        }
+    }
+
+    /// P1: with the hook gone, opening is an error, not a panic, and stays
+    /// one.
+    #[test]
+    fn open_after_the_hook_is_gone_is_an_error() {
+        let sources = set();
+        let (_controls, hook, mut link) = hooked(&sources);
+        drop(hook);
+        for _ in 0..2 {
+            assert_eq!(link.open(open_request()).err(), Some(InputWaitError::Gone));
+            assert_eq!(link.close().err(), Some(InputWaitError::Gone));
+        }
+        assert_eq!(link.failure(), Some(InputWaitError::Gone));
+    }
+
+    /// P2: a close the input thread does not answer times out, and the link
+    /// stays failed: once the late reply has arrived, the next open fails
+    /// at once without reading it.
+    #[test]
+    fn an_unanswered_close_times_out_and_the_link_stays_failed() {
+        let sources = set();
+        let (_controls, hook, mut link) = hooked(&sources);
+        link.timeout = SHORT;
+        let waker = Waker::spawn(hook, sources);
+        assert!(link.open(open_request()).is_ok());
+        assert_eq!(link.failure(), None);
+        waker.pause();
+        let begun = Instant::now();
+        assert_eq!(link.close().err(), Some(InputWaitError::Timeout));
+        assert!(begun.elapsed() >= SHORT, "{:?}", begun.elapsed());
+        waker.resume();
+        // The late reply to the close arrives.
+        waker.two_more_wakes();
+        let begun = Instant::now();
+        assert_eq!(
+            link.open(open_request()).err(),
+            Some(InputWaitError::Timeout)
+        );
+        assert!(begun.elapsed() < SHORT, "{:?}", begun.elapsed());
+        assert_eq!(link.failure(), Some(InputWaitError::Timeout));
+        // Never read, and no open was sent after it.
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Closed(..))));
+        waker.two_more_wakes();
+        assert!(link.replies.try_recv().is_err());
+        drop(waker.stop());
+    }
+
+    /// A2: a handshake whose wall time passes the bound during a suspend,
+    /// while the awake time stands still, is answered and leaves the link
+    /// healthy.
+    #[test]
+    fn a_handshake_across_a_suspend_is_answered_and_not_poisoned() {
+        let sources = set();
+        let (_controls, hook, mut link) = hooked(&sources);
+        link.timeout = SHORT;
+        // Asleep the whole time: the awake time does not move.
+        link.awake = || Duration::ZERO;
+        let waker = Waker::spawn(hook, sources);
+        waker.pause();
+        let begun = Instant::now();
+        let stuck = Arc::clone(&waker.stuck);
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(SHORT * 4);
+            stuck.store(false, Ordering::Release);
+        });
+        assert!(link.open(open_request()).is_ok());
+        assert!(begun.elapsed() >= SHORT * 4, "{:?}", begun.elapsed());
+        assert_eq!(link.failure(), None);
+        resume.join().unwrap();
+        assert!(link.close().is_ok());
+        drop(waker.stop());
+    }
+
+    /// P3: a hook dropped while its thread unwinds from a panic is seen as
+    /// gone, without any handshake.
+    #[test]
+    fn a_dropped_hook_is_seen_as_gone() {
+        let sources = set();
+        let (_controls, hook, link) = hooked(&sources);
+        assert_eq!(link.failure(), None);
+        let panicked = std::thread::spawn(move || {
+            let _hook = hook;
+            panic!("the input thread panics");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert_eq!(link.failure(), Some(InputWaitError::Gone));
+    }
+
+    /// P4: the open's console line (the configured controller is not
+    /// connected) travels with the reply instead of being printed by the
+    /// input thread.
+    #[test]
+    fn the_open_reply_carries_the_console_lines() {
+        let mut sources = set();
+        sources.begin_batch(TimeUs(0));
+        sources.connect(DeviceId(1), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(0));
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (mut hook, link) = link(Arc::clone(&controls), Mode::Clock);
+        let recorded = Recorded {
+            controller_device: Some(HidProduct {
+                vendor_id: 0x1A2B,
+                product_id: 0x3C4D,
+                interface: None,
+            }),
+            scratch: ScratchConfig::default(),
+            ..recorded()
+        };
+        link.requests
+            .send(Request::Open {
+                lead_in: LEAD_IN,
+                logic: std::thread::current(),
+                recorded,
+            })
+            .unwrap();
+        hook.wake(&mut sources, TimeUs(1_000));
+        let Ok(Reply::Opened(_, lines)) = link.replies.try_recv() else {
+            panic!("an open is answered by an opening");
+        };
+        assert_eq!(
+            lines,
+            [
+                "input: the controller set up in `tapestry keys` is not connected; this play uses the keyboard bindings only"
+            ]
+        );
     }
 }

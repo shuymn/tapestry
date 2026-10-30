@@ -110,7 +110,22 @@ fn cause(c: AbortCause) -> &'static str {
         AbortCause::OutputFailed => "AUDIO OUTPUT FAILED",
         AbortCause::GaugeFailed => "GAUGE FAILED",
         AbortCause::ScreenFailed => "SCREEN FAILED",
+        AbortCause::InputFailed => "INPUT FAILED",
     }
+}
+
+/// The line naming why the record is incomplete, if it is.
+fn incomplete_line(i: replay::Incomplete) -> Option<String> {
+    let why: Vec<&str> = [
+        (i.overflow, "OVERFLOW"),
+        (i.source_limit, "SOURCE LIMIT"),
+        (i.suspend, "SUSPEND"),
+        (i.input_failed, "INPUT FAILED"),
+    ]
+    .into_iter()
+    .filter_map(|(set, name)| set.then_some(name))
+    .collect();
+    (!why.is_empty()).then(|| format!("RECORD INCOMPLETE: {}", why.join(", ")))
 }
 
 /// The end screen's lines, the gauges named by the preset the play was
@@ -192,21 +207,12 @@ pub fn lines(
             ));
         }
     }
-    if let Some(rec) = &report.record {
-        let i = rec.status.incomplete;
-        if i.any() {
-            let mut why = Vec::new();
-            if i.overflow {
-                why.push("OVERFLOW");
-            }
-            if i.source_limit {
-                why.push("SOURCE LIMIT");
-            }
-            if i.suspend {
-                why.push("SUSPEND");
-            }
-            l.push(format!("RECORD INCOMPLETE: {}", why.join(", ")));
-        }
+    if let Some(line) = report
+        .record
+        .as_ref()
+        .and_then(|rec| incomplete_line(rec.status.incomplete))
+    {
+        l.push(line);
     }
     match &report.saved {
         Some(Ok(r)) => {
@@ -222,6 +228,9 @@ pub fn lines(
     }
     if let Some(e) = report.output_error {
         l.push(format!("AUDIO: {e}").to_uppercase());
+    }
+    if let Some(e) = report.input_error {
+        l.push(format!("INPUT: {e}").to_uppercase());
     }
     l.push(queue_line(queue));
     let ms = |d: Option<Duration>| d.map_or_else(|| "-".to_owned(), |d| d.as_millis().to_string());
@@ -382,6 +391,7 @@ mod tests {
             tail_cut: None,
             reload_error: None,
             output_error: None,
+            input_error: None,
             live: Vec::new(),
             tally,
             displayed_gauge: game::GaugeIndex(0),
@@ -432,6 +442,87 @@ mod tests {
             );
         }
         assert_eq!(lines.last().unwrap(), "BACKSPACE: RETRY    ESCAPE: QUIT");
+    }
+
+    /// A play the input thread ended names the cause, the error and, for its
+    /// record, the incomplete reason, alone or with others.
+    #[test]
+    fn an_input_failure_is_named_on_the_end_screen() {
+        let preset = rules::custom();
+        let mut played = report(preset.clone());
+        played.end = game::PlayEnd::Aborted(game::AbortCause::InputFailed);
+        played.input_error = Some(game::InputWaitError::Gone);
+        let hints = super::Hints::new(Some(0x0E), Some(0x01));
+        let queue = super::QueueLine {
+            played: Some(2),
+            steady_underruns: 0,
+            next: 2,
+        };
+        let lines = |played: &game::PlayReport| {
+            super::lines(played, 0, super::LoadTimes::default(), queue, &hints, false)
+        };
+        let incomplete = |l: &[String]| {
+            l.iter()
+                .filter(|l| l.starts_with("RECORD INCOMPLETE"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let shown = lines(&played);
+        for line in [
+            "RESULT: ENDED MIDWAY (INPUT FAILED)",
+            "INPUT: THE INPUT THREAD IS GONE",
+        ] {
+            assert!(shown.iter().any(|l| l == line), "{line} in {shown:?}");
+        }
+        assert!(incomplete(&shown).is_empty(), "{shown:?}");
+        let only = replay::Incomplete {
+            input_failed: true,
+            ..replay::Incomplete::default()
+        };
+        let both = replay::Incomplete {
+            suspend: true,
+            ..only
+        };
+        for (reasons, line) in [
+            (only, "RECORD INCOMPLETE: INPUT FAILED"),
+            (both, "RECORD INCOMPLETE: SUSPEND, INPUT FAILED"),
+        ] {
+            played.record = Some(record(&preset, reasons));
+            assert_eq!(incomplete(&lines(&played)), [line]);
+        }
+        played.record = Some(record(&preset, replay::Incomplete::default()));
+        assert!(incomplete(&lines(&played)).is_empty());
+    }
+
+    /// A record of an aborted play with no input, incomplete for `reasons`.
+    fn record(preset: &rules::RulePreset, reasons: replay::Incomplete) -> replay::PlayRecord {
+        replay::PlayRecord {
+            versions: replay::Versions {
+                evaluator: 1,
+                app: "0.0.0-test".to_owned(),
+                provenance: replay::BuildProvenance::Development,
+            },
+            chart: replay::ChartRecord::default(),
+            preset: replay::PresetRecord::of(preset),
+            session_policy: "default".to_owned(),
+            devices: replay::DeviceRecord {
+                sources: Vec::new(),
+                audio_offset: bms_model::TimeUs(0),
+                display_offset: bms_model::TimeUs(0),
+            },
+            play_type: replay::PlayType::Full,
+            start: eval::InputStart {
+                opened_at: bms_model::TimeUs(-1_000_000),
+                held: Vec::new(),
+            },
+            events: Vec::new(),
+            arrivals: Vec::new(),
+            status: replay::Status {
+                end: replay::EndStatus::EndedMidway,
+                finalized: bms_model::TimeUs(0),
+                incomplete: reasons,
+            },
+        }
     }
 
     /// P3: an autoplay play's end screen says it was not saved and shows

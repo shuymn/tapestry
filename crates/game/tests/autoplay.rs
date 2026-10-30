@@ -228,7 +228,7 @@ impl Rig for AutoRig {
         Ok(())
     }
 
-    fn open(&mut self, lead_in: TimeUs) -> Opening<Self::Reader> {
+    fn open(&mut self, lead_in: TimeUs) -> Result<Opening<Self::Reader>, game::InputWaitError> {
         let origin = TimeUs(self.clock.now().0 + lead_in.0);
         self.feeder
             .restart(&mut self.sources, self.recorded.clone());
@@ -236,13 +236,13 @@ impl Rig for AutoRig {
         let start = self.sources.open_recording(TimeUs(-lead_in.0));
         self.origin = Some(origin);
         self.sealed = false;
-        Opening {
+        Ok(Opening {
             origin,
             start,
             readers: self.sources.take_readers(),
             kinds: self.sources.participants().map(|(_, k)| k).collect(),
             axes: self.sources.participants().map(|_| Vec::new()).collect(),
-        }
+        })
     }
 
     fn start(&mut self, _origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
@@ -276,7 +276,7 @@ impl Rig for AutoRig {
         self.sealed
     }
 
-    fn close(&mut self) -> Closing {
+    fn close(&mut self) -> Result<Closing, game::InputWaitError> {
         let closing = Closing {
             arrivals: self.sources.arrivals().to_vec(),
             overflowed: self.sources.overflowed(),
@@ -285,7 +285,7 @@ impl Rig for AutoRig {
         };
         self.sources.close_recording();
         self.origin = None;
-        closing
+        Ok(closing)
     }
 
     fn ended(&mut self, _report: &PlayReport) {}
