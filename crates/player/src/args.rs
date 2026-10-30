@@ -532,11 +532,17 @@ mod tests {
             "d",
             "--dev-scripted-input",
             "l",
+            "--dev-render-timeout",
+            "90",
         ]);
         assert_eq!(play.chart, Path::new("a.bms"));
         assert!(play.dev.overlay);
         assert!(play.dev.auto_retry);
         assert_eq!(play.dev.frames.as_deref(), Some(Path::new("d")));
         assert_eq!(play.dev.scripted_input.as_deref(), Some(Path::new("l")));
+        assert_eq!(
+            play.dev.render_timeout,
+            Some(std::time::Duration::from_secs(90))
+        );
     }
 }
