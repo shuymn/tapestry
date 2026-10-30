@@ -248,13 +248,15 @@ proptest! {
 }
 
 /// Over a fixed number of deterministic samples, the generator reaches every
-/// variant of each enum with more than one, both values of the booleans,
+/// variant of each enum with more than one, both values of every boolean,
 /// ten-byte varints, and each length class of the strings and gauge lists.
 #[test]
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 15];
+    let mut counts = [0_usize; 13];
+    // Per boolean field, whether it was seen false and true.
+    let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
         let p = presets.new_tree(&mut runner).unwrap().current();
         let deltas = p.gauges.iter().flat_map(|g| {
@@ -276,8 +278,6 @@ fn generator_reaches_every_variant_and_length_class() {
             p.gauges.iter().any(|g| g.kind == GaugeKind::Survival),
             p.gauges.iter().any(|g| g.low_damage.is_none()),
             p.gauges.iter().any(|g| g.low_damage.is_some()),
-            p.empty_poor.counted,
-            !p.empty_poor.counted,
             p.empty_poor.ahead.0 >= 1 << 62,
             p.id.chars().count() == 1,
             p.id.len() >= 128,
@@ -289,9 +289,35 @@ fn generator_reaches_every_variant_and_length_class() {
         for (count, hit) in counts.iter_mut().zip(reached) {
             *count += usize::from(hit);
         }
+        let e = p.empty_poor;
+        let all = |w: PerJudgment<bool>| [w.perfect, w.great, w.good, w.bad, w.poor];
+        let [b0, b1, b2, b3, b4] = all(p.score.breaks_combo);
+        let [c0, c1, c2, c3, c4] = all(p.score.counts_bp);
+        let bools = [
+            e.breaks_combo,
+            e.counts_bp,
+            e.counted,
+            b0,
+            b1,
+            b2,
+            b3,
+            b4,
+            c0,
+            c1,
+            c2,
+            c3,
+            c4,
+        ];
+        for (seen, b) in bools_seen.iter_mut().zip(bools) {
+            seen[usize::from(b)] = true;
+        }
     }
     assert!(
         counts.iter().all(|&c| c > 0),
         "unreached classes: {counts:?}"
+    );
+    assert!(
+        bools_seen.iter().all(|&[f, t]| f && t),
+        "a boolean field missing a value: {bools_seen:?}"
     );
 }
