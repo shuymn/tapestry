@@ -100,6 +100,10 @@ pub struct Skin {
     whens: Box<[Program]>,
     ops: SkinOps,
     sheet: Sheet,
+    /// The sheet's identity and frame count, kept so a build never reads
+    /// the sheet.
+    sheet_id: u64,
+    frame_count: usize,
 }
 
 /// The slot `timer` reads with `whens` `when` timers: a built-in slot, or
@@ -218,6 +222,8 @@ impl Skin {
             elements,
             whens: whens.into_boxed_slice(),
             ops,
+            sheet_id: sheet.id(),
+            frame_count: sheet.frame_count(),
             sheet,
         })
     }
@@ -226,7 +232,7 @@ impl Skin {
     /// [`build`](Self::build) takes.
     #[must_use]
     pub fn frame_count(&self) -> usize {
-        self.sheet.frame_count()
+        self.frame_count
     }
 
     /// The sheet the elements draw from.
@@ -299,8 +305,8 @@ impl Skin {
         out: &mut QuadBatch,
     ) {
         if play.slots() != usize::from(BUILTIN) + self.whens.len()
-            || uvs.sheet_id() != self.sheet.id()
-            || uvs.frames().len() != self.sheet.frame_count()
+            || uvs.sheet_id() != self.sheet_id
+            || uvs.frames().len() != self.frame_count
         {
             return;
         }
