@@ -3,12 +3,17 @@
 
 #![allow(dead_code)]
 
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
 use bms_model::{Chart, Lane, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
+use image::{ImageFormat, Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
-    Attempt, Blend, Ease, ElementDef, End, GaugeDesc, KeyDef, PLAY, Play, PlayContext, Program,
-    QuadBatch, Scope, Skin, SkinFrame, Source, TimerRef, Ty, compile,
+    AtlasLimits, Attempt, Blend, Ease, ElementDef, End, FileDef, Filter, GaugeDesc, ImageDef,
+    KeyDef, LoadError, PLAY, Play, PlayContext, Program, QuadBatch, Scope, Sheet, Skin, SkinFrame,
+    Source, TimerRef, Ty, UvTable, Variant, compile,
 };
 
 pub const MS: i64 = 1_000;
@@ -134,12 +139,68 @@ pub fn bool_program(src: &str) -> Program {
     compile(src, &Scope::new(&PLAY), Ty::Bool).unwrap()
 }
 
-/// An element at x = `x` with a hold track from 0, on `timer`.
+/// The limits the play tests build atlases with.
+pub const LIMITS: AtlasLimits = AtlasLimits {
+    max_side: 256,
+    max_layers: 4,
+    reserved_layers: 1,
+};
+
+/// A folder holding `white.png`, one opaque white texel, under the
+/// target's test folder; written once, atomically.
+fn white_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("skin-model-play");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile_in(&dir)
+            .unwrap();
+        RgbaImage::from_pixel(1, 1, Rgba([255; 4]))
+            .save_with_format(tmp.path(), ImageFormat::Png)
+            .unwrap();
+        tmp.persist(dir.join("white.png")).unwrap();
+        dir
+    })
+}
+
+/// A sheet with one image: a white texel.
+pub fn white_sheet() -> Sheet {
+    Sheet::new(
+        white_root(),
+        vec![FileDef {
+            path: "white.png".into(),
+            hi: None,
+        }],
+        vec![ImageDef {
+            file: 0,
+            rect: None,
+            grid: [1, 1],
+            cycle: None,
+            filter: Filter::Linear,
+        }],
+    )
+    .unwrap()
+}
+
+/// A skin over [`white_sheet`].
+pub fn load(whens: Vec<Program>, elements: Vec<ElementDef>) -> Result<Skin, LoadError> {
+    Skin::new(whens, white_sheet(), elements)
+}
+
+/// The uv table of `skin`'s atlas at [`LIMITS`].
+pub fn uvs(skin: &Skin) -> UvTable {
+    skin.atlas(Variant::Lo, LIMITS).unwrap().into_parts().1
+}
+
+/// An element at x = `x` with a hold track from 0, on `timer`, showing
+/// image 0.
 pub fn element(timer: TimerRef, x: i32) -> ElementDef {
     let mut props = [None; 9];
     props[0] = Some(x);
     ElementDef {
-        source: Source::Uv([0.0, 0.0, 1.0, 1.0]),
+        source: Source::Image(0),
         track: skin_model::Track::new(
             &[KeyDef {
                 at: TimeUs(0),
@@ -156,9 +217,11 @@ pub fn element(timer: TimerRef, x: i32) -> ElementDef {
     }
 }
 
-/// A skin, its play, the snapshot it reads and a batch.
+/// A skin, its atlas's uv table, its play, the snapshot it reads and a
+/// batch.
 pub struct Harness {
     pub skin: Skin,
+    pub uvs: UvTable,
     pub play: Play,
     pub tally: Tally,
     pub gauges: Vec<GaugeState>,
@@ -172,6 +235,7 @@ impl Harness {
         let play = skin.prepare(chart, ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
+            uvs: uvs(&skin),
             skin,
             play,
             tally: tally(0),
@@ -184,7 +248,7 @@ impl Harness {
 
     /// An empty skin over `chart`.
     pub fn empty(chart: &Chart, ctx: &PlayContext<'_>) -> Self {
-        Self::new(Skin::new(Vec::new(), Vec::new()).unwrap(), chart, ctx)
+        Self::new(load(Vec::new(), Vec::new()).unwrap(), chart, ctx)
     }
 
     /// Builds the frame at `now_us` with `effects`.
@@ -198,7 +262,8 @@ impl Harness {
             gauge: self.gauge,
             effects,
         };
-        self.skin.build(&mut self.play, &frame, &mut self.batch);
+        self.skin
+            .build(&mut self.play, &frame, &self.uvs, &mut self.batch);
     }
 
     /// Builds the frame at `now_ms` with `effects`.

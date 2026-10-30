@@ -7,13 +7,13 @@ mod play_support;
 use bms_model::{BEAT, Chart, ChartBuilder, ScrollMap, TimeUs};
 use eval::{EvalInput, JudgeEventKind, Section};
 use play_support::{
-    GAUGES, Harness, MS, bool_program, element, ev, full, judged, lane, pct, state, tally,
+    GAUGES, Harness, MS, bool_program, element, ev, full, judged, lane, load, pct, state, tally,
 };
 use rules::{GaugeValue, Judgment};
 use skin_model::{
     Attempt, Blend, ClipId, Ease, ElementDef, End, ErrorKind, Export, KeyDef, LoadError,
     MAX_ELEMENTS, MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, PLAY, PlayContext, PrepareError, Prop,
-    Schema, Scope, Skin, Source, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field, timer,
+    Schema, Scope, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field, timer,
 };
 
 const BPM_150: i64 = 150_000;
@@ -49,7 +49,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
 fn a_retry_starts_clean() {
     let chart = taps(&[1_000, 2_000]);
     let skin = || {
-        Skin::new(
+        load(
             vec![bool_program("on(judge)")],
             vec![
                 element(TimerRef::When(0), 1),
@@ -89,7 +89,7 @@ fn a_retry_starts_clean() {
 fn a_mid_chart_countdown() {
     let chart = taps(&[1_000, 31_000]);
     let s = section(30_000, 60_000, 1_000);
-    let skin = Skin::new(Vec::new(), vec![element(TimerRef::Builtin(timer::PLAY), 1)]).unwrap();
+    let skin = load(Vec::new(), vec![element(TimerRef::Builtin(timer::PLAY), 1)]).unwrap();
     let mut h = Harness::new(skin, &chart, &in_section(&s));
     h.frame_us(28_999_999, &[]);
     assert_eq!(h.elapsed(timer::READY), TIMER_OFF);
@@ -219,7 +219,7 @@ fn an_element_ages_without_overflow() {
         End::Hold,
     )
     .unwrap();
-    let skin = Skin::new(
+    let skin = load(
         Vec::new(),
         vec![ElementDef {
             track,
@@ -279,7 +279,7 @@ fn time_extremes_neither_panic_nor_wrap() {
         "{b}"
     );
     // A countdown that would start before the time range is refused.
-    let skin = Skin::new(Vec::new(), Vec::new()).unwrap();
+    let skin = load(Vec::new(), Vec::new()).unwrap();
     let early = Section {
         start: TimeUs(i64::MIN),
         ..section(0, 1, 1)
@@ -385,7 +385,7 @@ fn a_practice_round() {
 fn targets_match_the_evaluators() {
     let chart = practice_chart();
     let preset = rules::custom();
-    let skin = Skin::new(Vec::new(), Vec::new()).unwrap();
+    let skin = load(Vec::new(), Vec::new()).unwrap();
     let gauges: Vec<_> = preset
         .gauges
         .iter()
@@ -446,7 +446,7 @@ fn two_elements_share_one_when_timer() {
         End::Hide,
     )
     .unwrap();
-    let skin = Skin::new(
+    let skin = load(
         vec![bool_program("combo >= 2")],
         vec![
             element(TimerRef::When(0), 1),
@@ -505,7 +505,7 @@ fn no_when_reads_a_when() {
     }));
     let reads_when = compile("on(w0)", &Scope::new(extended), Ty::Bool).unwrap();
     let chart = taps(&[1_000]);
-    let skin = Skin::new(
+    let skin = load(
         vec![bool_program("on(play)"), reads_when.clone()],
         vec![
             element(TimerRef::When(0), 1),
@@ -536,10 +536,9 @@ fn elements_draw_in_order_with_their_keys_and_visibility() {
     let added = ElementDef {
         blend: Blend::Add,
         clip: Some(ClipId(3)),
-        source: Source::Uv([0.5, 0.5, 1.0, 1.0]),
         ..element(TimerRef::Builtin(timer::PLAY), 2)
     };
-    let skin = Skin::new(
+    let skin = load(
         Vec::new(),
         vec![element(TimerRef::Builtin(timer::READY), 1), hidden, added],
     )
@@ -552,14 +551,17 @@ fn elements_draw_in_order_with_their_keys_and_visibility() {
     assert_eq!(quads.len(), 2);
     assert_eq!(quads[0].rect[0], 1.0);
     assert_eq!(quads[1].rect[0], 2.0);
-    assert_eq!(quads[1].uv, [0.5, 0.5, 1.0, 1.0]);
+    // The white texel at (8, 8) of a 256-texel page, on layer 1.
+    let texel = [8.0 / 256.0, 8.0 / 256.0, 9.0 / 256.0, 9.0 / 256.0];
+    assert_eq!(quads[1].uv, texel);
+    assert_eq!(quads[1].layer, 1);
     assert_eq!(h.batch.runs().len(), 2);
     assert_eq!(h.batch.runs()[1].key.clip, Some(ClipId(3)));
     h.tally = tally(1);
     h.frame(10, &[]);
     assert_eq!(h.batch.quads().len(), 3);
     // A play from a skin with other timer slots draws nothing.
-    let other = Skin::new(vec![bool_program("true")], Vec::new()).unwrap();
+    let other = load(vec![bool_program("true")], Vec::new()).unwrap();
     h.play = other.prepare(&chart, &full(0)).unwrap();
     h.frame(20, &[]);
     assert!(h.batch.quads().is_empty());
@@ -595,11 +597,11 @@ fn sized_program(ops: usize) -> skin_model::Program {
 fn load_errors() {
     let el = || element(TimerRef::Builtin(timer::PLAY), 0);
     assert!(matches!(
-        Skin::new(Vec::new(), vec![el(); MAX_ELEMENTS + 1]),
+        load(Vec::new(), vec![el(); MAX_ELEMENTS + 1]),
         Err(LoadError::TooManyElements { n }) if n == MAX_ELEMENTS + 1
     ));
     assert!(matches!(
-        Skin::new(vec![bool_program("true"); MAX_WHEN_TIMERS + 1], Vec::new()),
+        load(vec![bool_program("true"); MAX_WHEN_TIMERS + 1], Vec::new()),
         Err(LoadError::TooManyWhenTimers { n }) if n == MAX_WHEN_TIMERS + 1
     ));
     let keys: Vec<_> = (0..256)
@@ -613,15 +615,15 @@ fn load_errors() {
         ..el()
     };
     let at_limit = vec![long.clone(); MAX_SKIN_KEYS / 256];
-    assert!(Skin::new(Vec::new(), at_limit.clone()).is_ok());
+    assert!(load(Vec::new(), at_limit.clone()).is_ok());
     let mut over = at_limit;
     over.push(el());
     assert!(matches!(
-        Skin::new(Vec::new(), over),
+        load(Vec::new(), over),
         Err(LoadError::TooManyKeys { n }) if n == MAX_SKIN_KEYS + 1
     ));
     assert!(matches!(
-        Skin::new(vec![bool_program("true"), int_program("combo")], Vec::new()),
+        load(vec![bool_program("true"), int_program("combo")], Vec::new()),
         Err(LoadError::WhenNotBool { when: 1 })
     ));
     let not_bool = ElementDef {
@@ -629,12 +631,12 @@ fn load_errors() {
         ..el()
     };
     assert!(matches!(
-        Skin::new(Vec::new(), vec![el(), not_bool]),
+        load(Vec::new(), vec![el(), not_bool]),
         Err(LoadError::VisibleNotBool { element: 1 })
     ));
     for bad in [TimerRef::Builtin(timer::BUILTIN), TimerRef::When(1)] {
         assert!(matches!(
-            Skin::new(vec![bool_program("true")], vec![el(), element(bad, 0)]),
+            load(vec![bool_program("true")], vec![el(), element(bad, 0)]),
             Err(LoadError::UnknownTimer { element: 1 })
         ));
     }
@@ -653,7 +655,7 @@ fn load_errors() {
         ..el()
     };
     assert!(matches!(
-        Skin::new(Vec::new(), vec![rotated]),
+        load(Vec::new(), vec![rotated]),
         Err(LoadError::Rotation { element: 0 })
     ));
 }
@@ -664,7 +666,7 @@ fn operations_are_charged_once_per_program() {
     let whens = vec![sized_program(MAX_OPS); 256];
     assert_eq!(256 * MAX_OPS, skin_model::MAX_SKIN_OPS);
     // Elements sharing `when` 0 charge it once.
-    let shared = Skin::new(
+    let shared = load(
         whens.clone(),
         vec![element(TimerRef::When(0), 0), element(TimerRef::When(0), 0)],
     )
@@ -677,13 +679,13 @@ fn operations_are_charged_once_per_program() {
     };
     assert_eq!(one.visible.as_ref().unwrap().op_count(), 1);
     assert!(matches!(
-        Skin::new(whens.clone(), vec![one.clone()]),
+        load(whens.clone(), vec![one.clone()]),
         Err(LoadError::Ops(_))
     ));
     let mut fewer = whens;
     fewer.truncate(255);
     assert_eq!(
-        Skin::new(fewer, vec![one]).unwrap().ops().total(),
+        load(fewer, vec![one]).unwrap().ops().total(),
         255 * MAX_OPS + 1
     );
 }
