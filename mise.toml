@@ -8,7 +8,7 @@ minimum_release_age = "1d"
 locked = true
 
 [tools]
-rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
+rust = { version = "1", profile = "minimal", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown" }
 lefthook = "2"
 cargo-deny = "0"
 "aqua:rustsec/rustsec/cargo-audit" = "0"

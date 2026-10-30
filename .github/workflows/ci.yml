@@ -169,6 +169,36 @@ jobs:
             if grep -E "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$RUNNER_TEMP/audit.log"; then exit 1; fi
           done
 
+  # The crates the IR server runs as WASM keep building for it (design.md
+  # "Server Architecture (Cloudflare)"). The target comes from mise.toml;
+  # zstd-sys compiles its C sources with the runner image's clang.
+  wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.3
+          install: true
+          cache: true
+      - name: Show toolchain
+        run: |
+          mise ls --current
+          expected=$(mise current rust)
+          actual=$(mise exec -- rustc --version | cut -d' ' -f2)
+          test "$expected" = "$actual"
+          mise exec -- rustc -Vv
+          mise exec -- rustup target list --installed | grep -x wasm32-unknown-unknown
+          clang --version
+          echo "runner image $ImageOS $ImageVersion"
+      - name: Build (wasm32-unknown-unknown, release)
+        run: mise exec -- cargo build --release --locked --target wasm32-unknown-unknown -p eval -p bms-parser -p replay
+
   # The Nix dev shells used from WSL: the flake evaluates with the Rust version
   # from mise.lock, the wrapper's Linux path passes arguments and exit codes,
   # and short fuzz runs pass in the `fuzz` shell (docs/setup.md "Fuzzing").
