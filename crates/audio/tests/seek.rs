@@ -56,7 +56,7 @@ fn play(case: &Case, seek: bool) -> (Vec<f32>, u64, u64) {
     let restarted = e.written();
     e.restart(case.origin);
     if seek {
-        let plan = SeekPlan::new(&case.bank, &case.bgm, case.voices, e.frame_line(), case.t);
+        let plan = SeekPlan::new(&e.seek_source(), e.frame_line(), case.t);
         e.seek(&plan).unwrap();
     }
     while out.samples().len() < frames * 2 {
@@ -396,7 +396,9 @@ fn a_start_the_plan_left_out_never_starts_before_the_seek() {
     // line, so the plan leaves it to the play, but one frame (125 µs)
     // earlier on the engine's. It starts at t's frame instead, both when
     // that frame is inside a pass and when it opens one, and the seek's
-    // voices do not replace it.
+    // voices do not replace it. This is the bounded result of a moved clock,
+    // not the full play's output: that would start the sound a frame
+    // earlier.
     let bank = Arc::new(SoundBank::from_sounds(
         RATE,
         vec![sound(16_000, false, 1_000, 1)],
@@ -422,7 +424,7 @@ fn a_start_the_plan_left_out_never_starts_before_the_seek() {
             ..line
         };
         assert_eq!((later.frame(bgm[0].time), later.frame(t)), (frame, frame));
-        let plan = SeekPlan::new(&bank, &bgm, 2, later, t);
+        let plan = SeekPlan::new(&e.seek_source(), later, t);
         assert_eq!(plan.sounding(), 0);
         e.seek(&plan).unwrap();
         let (_tx, mut rx) = RingBuffer::new(1);
@@ -443,6 +445,105 @@ fn a_start_the_plan_left_out_never_starts_before_the_seek() {
             "into the pass {into_pass}"
         );
     }
+}
+
+/// The output of `e` into `out` until it holds `frames` frames.
+fn run_to(e: &mut AudioEngine, out: &mut RecordingOutput<SimDevice>, frames: usize) -> Vec<f32> {
+    let (_tx, mut rx) = RingBuffer::new(1);
+    while out.samples().len() < 2 * frames {
+        e.step(out, &mut rx).unwrap();
+    }
+    out.samples().to_vec()
+}
+
+#[test]
+fn a_plan_for_another_play_or_an_expired_frame_is_refused() {
+    // A seek to 0.5 s is taken; then a plan from an engine with another
+    // schedule of the same length, from one with another bank, on a line
+    // of another period, and to a frame already written are each refused,
+    // and the play sounds as with the first seek alone.
+    let bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        vec![sound(8_000, false, 1_000, 1), sound(8_000, true, -900, 2)],
+    ));
+    let bgm = events(&[(0, 0), (300, 1)]);
+    let frames = 2 * RATE as usize;
+    let (mut alone, mut alone_out) = started(&bank, &bgm);
+    let plan = SeekPlan::new(&alone.seek_source(), alone.frame_line(), TimeUs(500_000));
+    alone.seek(&plan).unwrap();
+    let want = run_to(&mut alone, &mut alone_out, frames);
+
+    let (mut e, mut out) = started(&bank, &bgm);
+    let line = e.frame_line();
+    e.seek(&SeekPlan::new(&e.seek_source(), line, TimeUs(500_000)))
+        .unwrap();
+    let state = |e: &AudioEngine| (e.bgm_left(), e.mixer().sounding(), e.mixer().pending());
+    let before = state(&e);
+    let (other_schedule, _) = started(&bank, &events(&[(0, 1), (300, 0)]));
+    let other_bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        vec![sound(8_000, false, 7, 1)],
+    ));
+    let (other_bank, _) = started(&other_bank, &bgm);
+    let doubled = audio::FrameLine {
+        period: 2 * PERIOD,
+        ..line
+    };
+    // The frame before the first not yet written.
+    let written = line.block_start as i64;
+    let expired = TimeUs((written - 1) * 125 - line.base_us);
+    assert_eq!(line.frame(expired), written - 1);
+    let refusals = [
+        (
+            SeekPlan::new(&other_schedule.seek_source(), line, TimeUs(500_000)),
+            "another schedule",
+        ),
+        (
+            SeekPlan::new(&other_bank.seek_source(), line, TimeUs(500_000)),
+            "another bank",
+        ),
+        (
+            SeekPlan::new(&e.seek_source(), doubled, TimeUs(500_000)),
+            "another period",
+        ),
+        (
+            SeekPlan::new(&e.seek_source(), line, expired),
+            "an expired frame",
+        ),
+    ];
+    let errors: Vec<_> = refusals
+        .iter()
+        .map(|(plan, what)| {
+            let err = e.seek(plan).expect_err(what);
+            assert_eq!(state(&e), before, "{what}");
+            err
+        })
+        .collect();
+    assert_eq!(errors[..2], [audio::SeekError::Source; 2]);
+    assert_eq!(
+        errors[2],
+        audio::SeekError::Line {
+            plan_rate: RATE,
+            plan_period: 2 * PERIOD,
+            rate: RATE,
+            period: PERIOD,
+        }
+    );
+    assert_eq!(
+        errors[3],
+        audio::SeekError::Late {
+            frame: written - 1,
+            written: written as u64,
+        }
+    );
+    // A plan to the first frame not yet written is still on time.
+    let on_time = TimeUs(written * 125 - line.base_us);
+    let (mut fresh, _) = started(&bank, &bgm);
+    assert_eq!(
+        fresh.seek(&SeekPlan::new(&fresh.seek_source(), line, on_time)),
+        Ok(())
+    );
+    assert_eq!(run_to(&mut e, &mut out, frames), want);
 }
 
 /// The median and worst of `runs` timings of `f`.
@@ -483,7 +584,8 @@ fn seek_cost_into_a_dense_chart() {
         let mut e =
             AudioEngine::new(bank.clone(), &bgm, DEVICE, 480, audio::MAX_VOICES, 0).unwrap();
         e.restart(TimeUs(0));
-        let plan_at = |line| SeekPlan::new(&bank, &bgm, audio::MAX_VOICES, line, t);
+        let source = e.seek_source();
+        let plan_at = |line| SeekPlan::new(&source, line, t);
         let mut plan = plan_at(e.frame_line());
         let (plan_median, plan_worst) = timed(runs, || plan = plan_at(e.frame_line()));
         let (take_median, take_worst) = timed(101, || e.seek(&plan).unwrap());

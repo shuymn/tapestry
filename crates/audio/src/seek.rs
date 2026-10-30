@@ -6,10 +6,24 @@
 //! only copies them in, so the audio thread's share is bounded by the voice
 //! count whatever the chart.
 
+use std::sync::Arc;
+
 use bms_model::{BgmEvent, TimeUs};
 
 use crate::bank::SoundBank;
 use crate::mixer::{Counts, MAX_PENDING_STARTS, Slots, Voice, fade_frames};
+
+/// What an engine plays, for planning its seeks where the play is prepared:
+/// its bank, schedule and voice count, shared with it, and which engine it
+/// is ([`AudioEngine::seek_source`](crate::AudioEngine::seek_source)). A
+/// plan made from it is taken only by that engine.
+#[derive(Clone, Debug)]
+pub struct SeekSource {
+    pub(crate) engine: u64,
+    pub(crate) bank: Arc<SoundBank>,
+    pub(crate) schedule: Arc<[BgmEvent]>,
+    pub(crate) voices: usize,
+}
 
 /// Where a play's chart times fall on the output, as the engine maps them:
 /// chart time `x` is due at frame `floor((x + base_us) × rate / 1,000,000)`,
@@ -32,6 +46,7 @@ pub struct FrameLine {
 impl FrameLine {
     /// The frame chart time `t` is due at, saturating at the `i64` range.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn frame(&self, t: TimeUs) -> i64 {
         let us = i128::from(t.0) + i128::from(self.base_us);
         let frame = (us * i128::from(self.rate)).div_euclid(1_000_000);
@@ -52,12 +67,13 @@ impl FrameLine {
 /// voice, 16 KiB with 256 voices, whatever the chart.
 #[derive(Clone, Debug)]
 pub struct SeekPlan {
+    /// The engine it is for.
+    engine: u64,
     t: TimeUs,
     line: FrameLine,
     /// The frame of `t` on `line`.
     at: i64,
-    /// The schedule's length, and its starts the plan covers.
-    events: usize,
+    /// The schedule's starts the plan covers.
     split: usize,
     /// Starts the block holding `at` can still admit.
     budget: usize,
@@ -67,20 +83,15 @@ pub struct SeekPlan {
 }
 
 impl SeekPlan {
-    /// Plans a seek to chart time `t` of `schedule` (sorted by time, as the
-    /// engine plays it) on `bank`, for an engine with `voices` voices whose
-    /// play falls on `line`. Each engine pass admits at most
-    /// [`MAX_PENDING_STARTS`] starts, as playing does, and the rest wait
-    /// for the next pass's first frame. Allocates the plan's slots; the work
-    /// grows with the starts before `t` times the voices.
+    /// Plans a seek to chart time `t` of `source`'s play falling on
+    /// `line`. Each engine pass is taken to write `line.period` frames and
+    /// to admit at most [`MAX_PENDING_STARTS`] starts, none of them key
+    /// sounds, as a play without input does; the rest wait for the next
+    /// pass's first frame. Allocates the plan's slots; the work grows with
+    /// the starts before `t` times the voices.
     #[must_use]
-    pub fn new(
-        bank: &SoundBank,
-        schedule: &[BgmEvent],
-        voices: usize,
-        line: FrameLine,
-        t: TimeUs,
-    ) -> Self {
+    pub fn new(source: &SeekSource, line: FrameLine, t: TimeUs) -> Self {
+        let (bank, schedule, voices) = (&*source.bank, &*source.schedule, source.voices);
         let fade = fade_frames(line.rate);
         let at = line.frame(t);
         let block_at = line.block_of(at);
@@ -134,10 +145,10 @@ impl SeekPlan {
         }
         slots.retire(bank, fade, at);
         Self {
+            engine: source.engine,
             t,
             line,
             at,
-            events: schedule.len(),
             split,
             budget: MAX_PENDING_STARTS - admitted_at,
             seq,
@@ -147,20 +158,16 @@ impl SeekPlan {
 
     /// The chart time it starts at.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn time(&self) -> TimeUs {
         self.t
     }
 
     /// The frame line it was planned on.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn line(&self) -> FrameLine {
         self.line
-    }
-
-    /// The voices it was planned for.
-    #[must_use]
-    pub fn voices(&self) -> usize {
-        self.slots.voices.len()
     }
 
     /// Voices and fading releases sounding at its frame.
@@ -169,26 +176,32 @@ impl SeekPlan {
         self.slots.all().filter(|v| v.active).count()
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn at(&self) -> i64 {
         self.at
     }
 
-    pub(crate) fn events(&self) -> usize {
-        self.events
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn engine(&self) -> u64 {
+        self.engine
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn split(&self) -> usize {
         self.split
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn budget(&self) -> usize {
         self.budget
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn seq(&self) -> u64 {
         self.seq
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn slots(&self) -> &Slots {
         &self.slots
     }

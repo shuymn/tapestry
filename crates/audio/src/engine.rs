@@ -5,6 +5,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::Consumer;
@@ -14,7 +15,7 @@ use crate::bank::SoundBank;
 use crate::clock::MixClock;
 use crate::mixer::{InvalidVolume, Mixer};
 use crate::output::{AudioOutput, OutputError};
-use crate::seek::{FrameLine, SeekPlan};
+use crate::seek::{FrameLine, SeekPlan, SeekSource};
 
 /// A key sound to play, from the logic thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,32 +95,39 @@ pub enum EngineError {
     },
 }
 
-/// Why an engine did not take a [`SeekPlan`]; nothing changed.
+/// Why an engine did not take a [`SeekPlan`]; nothing changed, and the
+/// caller plans again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SeekError {
-    /// The plan was made for another voice count.
-    #[error("the seek was planned for {plan} voices but the engine has {engine}")]
-    Voices {
-        /// The plan's.
-        plan: usize,
-        /// The engine's.
-        engine: usize,
-    },
-    /// The plan was made for a schedule of another length or rate.
+    /// The plan was made from another engine's bank and schedule.
+    #[error("the seek was planned for another engine")]
+    Source,
+    /// The plan's frame line has another rate or period than the output.
     #[error(
-        "the seek was planned for {plan} starts at {plan_rate} Hz but the engine plays {engine} at {engine_rate} Hz"
+        "the seek was planned at {plan_rate} Hz in {plan_period}-frame passes but the output runs at {rate} Hz in {period}-frame passes"
     )]
-    Schedule {
-        /// The plan's schedule length.
-        plan: usize,
+    Line {
         /// The plan's rate.
         plan_rate: u32,
-        /// The engine's schedule length.
-        engine: usize,
-        /// The engine's rate.
-        engine_rate: u32,
+        /// The plan's period.
+        plan_period: u32,
+        /// The output's rate.
+        rate: u32,
+        /// The output's period.
+        period: u32,
+    },
+    /// The seek's frame is already written.
+    #[error("the seek's frame {frame} is already written (up to {written})")]
+    Late {
+        /// The frame the mix clock gives the seek's time.
+        frame: i64,
+        /// The first frame not yet written.
+        written: u64,
     },
 }
+
+/// Engine ids for [`SeekSource`]: one per engine built.
+static NEXT_ENGINE: AtomicU64 = AtomicU64::new(0);
 
 /// Where chart time `t` of a play whose chart time 0 lies at `origin` is due
 /// on the output's timeline, `offset` early.
@@ -132,13 +140,15 @@ fn output_time(origin: TimeUs, offset: TimeUs, t: TimeUs) -> TimeUs {
 /// nothing.
 #[derive(Debug)]
 pub struct AudioEngine {
+    /// Which engine it is, for its seek plans.
+    id: u64,
     bank: Arc<SoundBank>,
     mixer: Mixer,
     clock: MixClock,
     rate: u32,
     period: u32,
     period_us: i64,
-    bgm: Vec<BgmEvent>,
+    bgm: Arc<[BgmEvent]>,
     next_bgm: usize,
     output_offset: TimeUs,
     /// Where chart time 0 lies on the output's timeline.
@@ -197,13 +207,14 @@ impl AudioEngine {
             });
         }
         Ok(Self {
+            id: NEXT_ENGINE.fetch_add(1, Ordering::Relaxed),
             bank,
             mixer: Mixer::new(voices, rate),
             clock: MixClock::new(rate, period),
             rate,
             period,
             period_us: i64::from(period) * 1_000_000 / i64::from(rate),
-            bgm,
+            bgm: Arc::from(bgm),
             next_bgm: 0,
             output_offset: TimeUs(0),
             play_origin: TimeUs(0),
@@ -278,6 +289,18 @@ impl AudioEngine {
         self.play_origin = origin;
     }
 
+    /// What this engine plays, for planning its seeks where the play is
+    /// prepared ([`SeekPlan::new`]); it shares the bank and schedule.
+    #[must_use]
+    pub fn seek_source(&self) -> SeekSource {
+        SeekSource {
+            engine: self.id,
+            bank: Arc::clone(&self.bank),
+            schedule: Arc::clone(&self.bgm),
+            voices: self.mixer.voices(),
+        }
+    }
+
     /// Where the current play's chart times fall on the output now, for
     /// planning a seek ([`SeekPlan::new`]).
     #[must_use]
@@ -301,30 +324,45 @@ impl AudioEngine {
     /// copied in, which costs at most the voice slots and allocates
     /// nothing, and enter at the frame the mix clock gives that time, each
     /// partway into its sound or fade; the plan's starts are neither logged
-    /// nor counted as BGM started. When the clock maps that time to the
-    /// frame the plan's line did, the output from that frame on is what
-    /// playing the schedule from chart time 0 gives there, sample for
-    /// sample; otherwise the voices move with the new frame, and no later
-    /// start is put before it. Nothing sounds before that frame, and a key
-    /// sound started before it stops there.
+    /// nor counted as BGM started. Nothing sounds before that frame, no
+    /// start of the schedule is put before it, and a key sound started
+    /// before it stops there.
+    ///
+    /// The output from that frame on is what playing the schedule from
+    /// chart time 0 gives there, sample for sample, when from planning to
+    /// that frame the mix clock maps chart times as the plan's line does,
+    /// every pass writes the line's period, and no key sound is started.
+    /// Otherwise it is degraded but bounded. A moved clock moves the seek's
+    /// voices with that frame, and a start lands where the moved clock
+    /// puts it, never before that frame, head intact. A different pass
+    /// size or key sounds change only which pass admits the starts beyond
+    /// [`MAX_PENDING_STARTS`](crate::MAX_PENDING_STARTS) in one pass (and
+    /// so the voices those start, cut or steal); each still starts at a
+    /// pass's first frame, head intact.
     ///
     /// # Errors
     ///
-    /// [`SeekError`] for a plan made for another voice count, schedule
-    /// length or rate; nothing changes.
+    /// [`SeekError`] for a plan made from another engine's
+    /// [`seek_source`](Self::seek_source), on a line of another rate or
+    /// period, or whose frame is already written; nothing changes.
     pub fn seek(&mut self, plan: &SeekPlan) -> Result<(), SeekError> {
-        if plan.voices() != self.mixer.voices() {
-            return Err(SeekError::Voices {
-                plan: plan.voices(),
-                engine: self.mixer.voices(),
+        if plan.engine() != self.id {
+            return Err(SeekError::Source);
+        }
+        let line = plan.line();
+        if (line.rate, line.period) != (self.rate, self.period) {
+            return Err(SeekError::Line {
+                plan_rate: line.rate,
+                plan_period: line.period,
+                rate: self.rate,
+                period: self.period,
             });
         }
-        if plan.events() != self.bgm.len() || plan.line().rate != self.rate {
-            return Err(SeekError::Schedule {
-                plan: plan.events(),
-                plan_rate: plan.line().rate,
-                engine: self.bgm.len(),
-                engine_rate: self.rate,
+        let frame = self.frame_line().frame(plan.time());
+        if frame < i64::try_from(self.written()).unwrap_or(i64::MAX) {
+            return Err(SeekError::Late {
+                frame,
+                written: self.written(),
             });
         }
         self.mixer.park(plan.slots(), plan.seq(), plan.at());
@@ -436,7 +474,11 @@ impl AudioEngine {
                 if frame < i64::try_from(block_end).unwrap_or(i64::MAX) {
                     self.mixer.place(frame);
                     self.seek_to = None;
-                    budget = left;
+                    // A clock moved past the frame leaves the plan's pass
+                    // behind, and its share with it.
+                    if frame >= i64::try_from(self.written()).unwrap_or(i64::MAX) {
+                        budget = left;
+                    }
                 } else {
                     held = true;
                 }
