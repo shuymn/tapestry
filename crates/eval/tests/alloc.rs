@@ -185,6 +185,19 @@ fn advance_does_not_allocate() {
     let mut gev = Evaluator::new(&chart, &gauged, &dev, &InputStart::default(), None, 64).unwrap();
     let mut gauged_out = Vec::with_capacity(gev.max_events(inputs.len()));
     let gauged_capacity = gauged_out.capacity();
+    // A sixth under LR2-style (combo priority, no late BAD head, the 1 s
+    // empty POOR range, tied LN-end edges, damage-corrected gauges failing
+    // below 2 %) at #RANK 0, whose windows are interpolated, over the same
+    // inputs.
+    let lr2 = rules::lr2_style();
+    let mut lr2_chart = chart.clone();
+    lr2_chart.meta.judgment_headers = vec![bms_model::JudgmentHeader {
+        name: bms_model::JudgmentHeaderName::Rank,
+        value: bms_model::HeaderValue::integer(0),
+    }];
+    let mut lev = Evaluator::new(&lr2_chart, &lr2, &dev, &InputStart::default(), None, 64).unwrap();
+    let mut lr2_out = Vec::with_capacity(lev.max_events(inputs.len()));
+    let lr2_capacity = lr2_out.capacity();
     // A fifth under beatoraja-style's combo priority, on a dense lane:
     // key 1 has a note every 100 ms, and every other note is pressed
     // 170 ms late. At its absent rank (75 %: GOOD ±112.5 ms), the press is
@@ -229,11 +242,13 @@ fn advance_does_not_allocate() {
             ev.push_input(inputs[next]).unwrap();
             sec.push_input(inputs[next]).unwrap();
             gev.push_input(inputs[next]).unwrap();
+            lev.push_input(inputs[next]).unwrap();
             next += 1;
         }
         ev.advance_to(TimeUs(w), &mut out).unwrap();
         sec.advance_to(TimeUs(w), &mut sec_out).unwrap();
         gev.advance_to(TimeUs(w), &mut gauged_out).unwrap();
+        lev.advance_to(TimeUs(w), &mut lr2_out).unwrap();
         w += MS;
     }
     let elapsed = started.elapsed();
@@ -308,6 +323,9 @@ fn advance_does_not_allocate() {
     // take every step, kept moving.
     assert!(gev.is_complete());
     assert_eq!(gauged_out.capacity(), gauged_capacity);
+    assert!(lev.is_complete());
+    assert_eq!(lr2_out.capacity(), lr2_capacity);
+    assert!(lev.tally().counts.perfect > 0 && lev.tally().empty_poor > 0);
     let gauges = gev.gauges();
     assert_eq!(gauges.len(), 7);
     assert!(gauges[3..].iter().all(|g| g.failed_at.is_some()));

@@ -4,7 +4,7 @@
 
 use bms_model::{Chart, HeaderValue, JudgmentHeader, JudgmentHeaderName, Lane, TimeUs};
 use eval::{
-    Binding, ControlId, DeviceProfile, Evaluator, InputKind, InputStart, JudgeEvent,
+    Binding, ControlId, DeviceProfile, Evaluation, Evaluator, InputKind, InputStart, JudgeEvent,
     JudgeEventKind, PhysicalInputEvent, SourceId, SourceProfile, Tally,
 };
 use rules::{Judgment, RulePreset};
@@ -153,4 +153,23 @@ pub fn empty_poors(events: &[JudgeEvent]) -> usize {
         .iter()
         .filter(|e| matches!(e.kind, JudgeEventKind::EmptyPoor { .. }))
         .count()
+}
+
+/// Presses on the scratch and key 1 at `at`, each released 10 µs later.
+pub fn both_at(at: i64) -> Vec<PhysicalInputEvent> {
+    vec![
+        press(at, 0, 0),
+        press(at, 0, 1),
+        release(at + 10, 0, 0),
+        release(at + 10, 0, 1),
+    ]
+}
+
+/// The judgments on lane `l`, in order.
+pub fn judged_on(e: &Evaluation, l: usize) -> Vec<Judgment> {
+    judgments(&e.events)
+        .into_iter()
+        .filter(|j| j.0 == l)
+        .map(|j| j.2)
+        .collect()
 }

@@ -24,7 +24,9 @@ mod beatoraja_style;
 mod canonical;
 mod custom;
 mod error;
+mod gauge_rules;
 mod headers;
+mod lr2_style;
 mod preset;
 mod validate;
 mod windows;
@@ -33,6 +35,7 @@ pub use beatoraja_style::beatoraja_style;
 pub use custom::custom;
 pub use error::{CanonicalError, RuleError, Side};
 pub use headers::{HeaderPolicy, JudgeRank, ReadHeaders};
+pub use lr2_style::lr2_style;
 pub use preset::{
     Assignment, CorrectionFactors, DefaultTotal, Denominator, EmptyPoorRule, Factor, GaugeDelta,
     GaugeKind, GaugeRule, GaugeValue, HeadEligibility, Implementation, JudgeWindows, Judgment,
