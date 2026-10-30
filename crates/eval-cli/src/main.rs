@@ -4,32 +4,36 @@
 //!
 //! `eval-cli --chart <chart> [--preset <file.toml>]... <record.tprl>...`
 //!
-//! Each record is decoded, refused if its input is incomplete, and
+//! The chart and the preset files are checked first: a file that cannot
+//! be read, is too large, or does not load ends the run before any line.
+//! Each record is then decoded, refused if its input is incomplete, and
 //! verified against the chart with `replay::verify` (design.md
-//! "Determinism"). It is then evaluated under each `--preset` in order, or
-//! under its own preset copy when none is given (design.md "Extension
+//! "Determinism"). It is evaluated under each `--preset` in order, or under
+//! its own preset copy when none is given (design.md "Extension
 //! Boundaries"), and one line per record and preset goes to stdout:
 //!
 //! `<record> | <preset> | <label> | perfect <n> great <n> good <n> bad <n>
 //! poor <n> | ex <n> | bp <n> | max combo <n> | <gauge> <value>% <cleared>...`
 //!
-//! The label is `as played` or `what-if`, followed by the coverage when
-//! the input does not cover all of it. A refused record gets one
-//! `<record> | refused: <reason>` line, or one per preset when only the
-//! evaluation under that preset fails. The output names only the paths
-//! given and nothing that varies between runs.
+//! `<preset>` is `preset <file>` or `recorded preset`. The label is
+//! `as played` or `what-if`, followed by the coverage when the input does
+//! not cover all of it. A refused record's lines end in
+//! `refused: <reason>` in place of the label and totals, one per preset.
+//! The output names only the paths given and nothing that varies between
+//! runs.
 //!
 //! Exit codes: 0 when every record was evaluated, 1 when any was refused
-//! or a chart or preset file cannot be used, and 2 for bad arguments,
+//! or the chart or a preset file cannot be used, and 2 for bad arguments,
 //! with the usage line.
 
 mod args;
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use bms_model::Chart;
@@ -37,6 +41,7 @@ use bms_parser::LoadOptions;
 use replay::verify::{Coverage, ReEvaluation, evaluate_record, load_recorded_chart};
 use replay::{DecodeLimits, Incomplete, PlayRecord};
 use rules::{GaugeValue, RulePreset};
+use rules_toml::MAX_PRESET_FILE_BYTES;
 
 fn main() -> ExitCode {
     let args = match args::parse(std::env::args_os().skip(1)) {
@@ -61,12 +66,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// What a record is evaluated under.
-enum Choice {
-    /// Its own preset copy.
-    Recorded,
-    /// A preset file, by the path given.
-    File(PathBuf, Box<RulePreset>),
+/// What a record is evaluated under, and its label.
+struct Choice {
+    /// `preset <file>` or `recorded preset`.
+    label: String,
+    /// The preset file's preset, or `None` for the record's own copy.
+    preset: Option<RulePreset>,
 }
 
 /// Writes every record's lines to `out`. Returns whether every record was
@@ -78,52 +83,46 @@ enum Choice {
 /// written, or a failed write.
 fn run(args: &args::Args, out: &mut impl io::Write) -> Result<bool, String> {
     let choices = if args.presets.is_empty() {
-        vec![Choice::Recorded]
+        vec![Choice {
+            label: "recorded preset".to_owned(),
+            preset: None,
+        }]
     } else {
         args.presets
             .iter()
             .map(|path| {
-                read_preset(path)
-                    .map(|preset| Choice::File(path.clone(), Box::new(preset)))
-                    .map_err(|e| format!("{}: {e}", shown(path)))
+                let preset = read_preset(path).map_err(|e| format!("{}: {e}", shown(path)))?;
+                Ok(Choice {
+                    label: format!("preset {}", shown(path)),
+                    preset: Some(preset),
+                })
             })
-            .collect::<Result<_, _>>()?
+            .collect::<Result<_, String>>()?
     };
-    // The loader refuses a larger file, so it is read one byte past the
-    // limit at most, as the game reads it.
-    let chart_bytes = read_bounded(&args.chart, LoadOptions::default().limits.max_file_bytes)
-        .map_err(|e| format!("{}: {e}", shown(&args.chart)))?;
-    // A bare file name's parent is the empty path, which names no folder.
-    let chart_dir = args
-        .chart
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let chart_bytes =
+        read_chart(&args.chart).map_err(|e| format!("{}: {e}", shown(&args.chart)))?;
+    let chart_dir = chart_dir(&args.chart);
+    // Whether the chart loads does not depend on a record, except through
+    // the branches its `#RANDOM` draws: a chart that does not load with the
+    // default seed is refused for every record before any line. A record
+    // whose own seed draws branches that do not load is refused on its own.
+    bms_parser::load_bms(&chart_bytes, chart_dir, &LoadOptions::default())
+        .map_err(|e| format!("{}: {}", shown(&args.chart), chain(&e)))?;
     let write = |e: io::Error| format!("stdout: {e}");
     let mut all = true;
     for path in &args.records {
         let name = shown(path);
-        let (record, chart, own) = match verified(path, &chart_bytes, chart_dir) {
-            Ok(v) => v,
-            Err(reason) => {
-                writeln!(out, "{name} | refused: {reason}").map_err(write)?;
-                all = false;
-                continue;
-            }
-        };
+        let verified = verified(path, &chart_bytes, chart_dir);
         for choice in &choices {
-            let (label, preset, under) = match choice {
-                Choice::Recorded => ("recorded preset".to_owned(), &own, None),
-                Choice::File(path, preset) => {
-                    let preset: &RulePreset = preset;
-                    (format!("preset {}", shown(path)), preset, Some(preset))
-                }
-            };
-            match evaluate_record(&record, &chart, under) {
-                Ok(r) => writeln!(out, "{name} | {label} | {}", result_line(&r, preset)),
-                Err(e) => {
+            let line = verified
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|(record, chart)| evaluated(record, chart, choice.preset.as_ref()));
+            match line {
+                Ok(line) => writeln!(out, "{name} | {} | {line}", choice.label),
+                Err(reason) => {
                     all = false;
-                    writeln!(out, "{name} | {label} | refused: {}", chain(&e))
+                    writeln!(out, "{name} | {} | refused: {reason}", choice.label)
                 }
             }
             .map_err(write)?;
@@ -132,18 +131,36 @@ fn run(args: &args::Args, out: &mut impl io::Write) -> Result<bool, String> {
     Ok(all)
 }
 
+/// The folder the chart's sounds resolve in. A bare file name's parent is
+/// the empty path, which names no folder.
+fn chart_dir(chart: &Path) -> &Path {
+    chart
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// The chart file's bytes. The loader refuses a file larger than its limit
+/// with its size, so it is read one byte past the limit at most, as the
+/// game reads it.
+fn read_chart(path: &Path) -> Result<Vec<u8>, String> {
+    read_bounded(path, LoadOptions::default().limits.max_file_bytes)
+}
+
 /// Reads, decodes and verifies the record at `path` against the chart,
-/// returning it with its chart and its own preset.
+/// returning it with its chart.
 ///
 /// # Errors
 ///
 /// Why the record is refused: it cannot be read or decoded, its input is
-/// incomplete, or verification refuses it.
+/// incomplete, or verification refuses it. Incompleteness is checked
+/// before verification, so an incomplete record is refused as incomplete
+/// whatever verification would say, without loading the chart.
 fn verified(
     path: &Path,
     chart_bytes: &[u8],
     chart_dir: &Path,
-) -> Result<(PlayRecord, Chart, RulePreset), String> {
+) -> Result<(PlayRecord, Chart), String> {
     let limits = DecodeLimits::STANDARD;
     // The limits the game saves records under. The file is untrusted, so
     // it is read one byte past the largest file they accept at most, as the
@@ -160,10 +177,31 @@ fn verified(
         return Err(format!("the record's input is incomplete ({why})"));
     }
     let chart = load_recorded_chart(&record, chart_bytes, chart_dir).map_err(|e| chain(&e))?;
-    // Verification decoded the copy already, so this does not fail.
-    let own =
-        RulePreset::from_canonical_bytes(&record.preset.canonical_bytes).map_err(|e| chain(&e))?;
-    Ok((record, chart, own))
+    Ok((record, chart))
+}
+
+/// The record evaluated under `preset`, or else under its own preset copy,
+/// as a line's label and totals.
+///
+/// # Errors
+///
+/// Why the evaluation is refused.
+fn evaluated(
+    record: &PlayRecord,
+    chart: &Chart,
+    preset: Option<&RulePreset>,
+) -> Result<String, String> {
+    let r = evaluate_record(record, chart, preset).map_err(|e| chain(&e))?;
+    // The gauges are named by the preset the evaluation ran under; the
+    // record's copy decoded in `evaluate_record`, so this does not fail.
+    let preset = match preset {
+        Some(p) => Cow::Borrowed(p),
+        None => Cow::Owned(
+            RulePreset::from_canonical_bytes(&record.preset.canonical_bytes)
+                .map_err(|e| chain(&e))?,
+        ),
+    };
+    Ok(result_line(&r, &preset))
 }
 
 /// The reasons the input is incomplete, if any.
@@ -227,9 +265,17 @@ fn percent(v: GaugeValue) -> String {
     format!("{sign}{}.{:03}%", a / unit, a % unit / (unit / 1_000))
 }
 
-/// The preset file at `path`, read and validated as the game reads it.
+/// The preset file at `path`, read and validated as the game reads it,
+/// within [`MAX_PRESET_FILE_BYTES`].
 fn read_preset(path: &Path) -> Result<RulePreset, String> {
-    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let bytes = read_bounded(path, MAX_PRESET_FILE_BYTES)?;
+    if bytes.len() > MAX_PRESET_FILE_BYTES {
+        return Err(format!(
+            "the file is larger than {MAX_PRESET_FILE_BYTES} bytes, the largest preset file \
+             accepted"
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "the file is not UTF-8 text".to_owned())?;
     rules_toml::load_preset_toml(&text).map_err(|e| chain(&e))
 }
 

@@ -204,7 +204,8 @@ fn refuses_with_the_reason_and_exits_one() {
     assert_eq!(lines.len(), 5, "{out}");
     assert_eq!(
         lines[0],
-        "other.tprl | refused: the chart resolves to another chart than the record's"
+        "other.tprl | recorded preset | refused: the chart resolves to another chart than the \
+         record's"
     );
     // A refusal does not stop the records after it.
     assert!(
@@ -214,27 +215,111 @@ fn refuses_with_the_reason_and_exits_one() {
     assert_eq!(
         lines[2],
         format!(
-            "old.tprl | refused: the record was made by evaluator version {}, which this \
-             build does not run",
+            "old.tprl | recorded preset | refused: the record was made by evaluator version {}, \
+             which this build does not run",
             old.versions.evaluator
         )
     );
-    assert!(lines[3].starts_with("junk.tprl | refused: "), "{out}");
-    assert!(lines[4].starts_with("missing.tprl | refused: "), "{out}");
+    assert!(
+        lines[3].starts_with("junk.tprl | recorded preset | refused: "),
+        "{out}"
+    );
+    assert!(
+        lines[4].starts_with("missing.tprl | recorded preset | refused: "),
+        "{out}"
+    );
+}
+
+/// A chart with `#RANDOM 2` whose branch `bad` holds a measure past the
+/// loader's limit, so it loads only when the other branch is drawn.
+fn random_chart(bad: u32) -> String {
+    let good = 3 - bad;
+    format!(
+        "#BPM 120\n#WAV01 a.wav\n#RANDOM 2\n#IF {good}\n#00111:01\n#ENDIF\n\
+         #IF {bad}\n#100011:01\n#ENDIF\n#ENDRANDOM\n"
+    )
+}
+
+#[test]
+fn a_chart_that_fails_only_under_the_recorded_seed_refuses_that_record() {
+    let loads = |text: &str, seed| {
+        let opts = LoadOptions {
+            seed,
+            ..LoadOptions::default()
+        };
+        load_bms(text.as_bytes(), Path::new("."), &opts).is_ok()
+    };
+    // Put the bad branch where the default seed does not go.
+    let text = [random_chart(1), random_chart(2)]
+        .into_iter()
+        .find(|t| loads(t, 0))
+        .unwrap();
+    let seed = (1..64).find(|&s| !loads(&text, s)).unwrap();
+    let dir = folder();
+    fs::write(dir.path().join("random.bms"), &text).unwrap();
+    let mut record = played(CHART);
+    record.chart.random_seed = seed;
+    save(dir.path(), "play.tprl", &record);
+    let o = run(
+        dir.path(),
+        &[
+            "--chart",
+            "random.bms",
+            "--preset",
+            "own.toml",
+            "--preset",
+            "wide.toml",
+            "play.tprl",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let reason = "refused: the chart cannot be loaded: line 8: measure 1000 is out of range";
+    assert_eq!(
+        stdout(&o),
+        format!(
+            "play.tprl | preset own.toml | {reason}\nplay.tprl | preset wide.toml | {reason}\n"
+        )
+    );
 }
 
 #[test]
 fn incomplete_record_is_refused() {
+    type Set = fn(&mut Incomplete);
+    let reasons: [(Set, &str); 4] = [
+        (|i| i.overflow = true, "overflow"),
+        (|i| i.source_limit = true, "source limit"),
+        (|i| i.suspend = true, "suspend"),
+        (|i| i.input_failed = true, "input failed"),
+    ];
     let dir = folder();
-    let mut record = played(CHART);
-    record.status.incomplete.suspend = true;
-    record.status.incomplete.overflow = true;
+    for (set, why) in reasons {
+        let mut record = played(CHART);
+        set(&mut record.status.incomplete);
+        save(dir.path(), "play.tprl", &record);
+        let o = run(dir.path(), &["--chart", "chart.bms", "play.tprl"]);
+        assert_eq!(o.status.code(), Some(1), "{why}: {o:?}");
+        assert_eq!(
+            stdout(&o),
+            format!(
+                "play.tprl | recorded preset | refused: the record's input is incomplete ({why})\n"
+            )
+        );
+    }
+    // Every reason holds, on a record of another chart: incompleteness is
+    // checked before verification, so it is the refusal, and the chart is
+    // not loaded for a record that would be refused anyway.
+    let mut record = played(OTHER_CHART);
+    for (set, _) in reasons {
+        set(&mut record.status.incomplete);
+    }
     save(dir.path(), "play.tprl", &record);
     let o = run(dir.path(), &["--chart", "chart.bms", "play.tprl"]);
     assert_eq!(o.status.code(), Some(1), "{o:?}");
     assert_eq!(
         stdout(&o),
-        "play.tprl | refused: the record's input is incomplete (overflow, suspend)\n"
+        "play.tprl | recorded preset | refused: the record's input is incomplete (overflow, \
+         source limit, suspend, input failed)\n"
     );
 }
 
@@ -263,29 +348,63 @@ fn usage_error_exits_two() {
     }
 }
 
+/// `text` padded with a comment line to exactly `len` bytes.
+fn padded(text: &str, len: usize) -> String {
+    let mut s = format!("{text}#");
+    s.push_str(&"x".repeat(len - s.len()));
+    s
+}
+
 #[test]
 fn an_unusable_chart_or_preset_exits_one_before_any_line() {
     let dir = folder();
     save(dir.path(), "play.tprl", &played(CHART));
     fs::write(dir.path().join("bad.toml"), "id = 1\n").unwrap();
-    for args in [
-        &["--chart", "missing.bms", "play.tprl"][..],
-        &[
-            "--chart",
-            "chart.bms",
-            "--preset",
-            "missing.toml",
-            "play.tprl",
-        ],
-        &[
-            "--chart",
-            "chart.bms",
-            "--preset",
-            "own.toml",
-            "--preset",
-            "bad.toml",
-            "play.tprl",
-        ],
+    let own = rules_toml::preset_to_toml(&rules::custom());
+    let limit = rules_toml::MAX_PRESET_FILE_BYTES;
+    fs::write(dir.path().join("big.toml"), padded(&own, limit + 1)).unwrap();
+    fs::write(dir.path().join("bad.bms"), "#LNTYPE 2\n#00111:01\n").unwrap();
+    let chart_limit = LoadOptions::default().limits.max_file_bytes;
+    fs::write(dir.path().join("big.bms"), padded(CHART, chart_limit + 1)).unwrap();
+    for (args, reason) in [
+        (&["--chart", "missing.bms", "play.tprl"][..], None),
+        (
+            &["--chart", "bad.bms", "play.tprl"],
+            Some("eval-cli: bad.bms: line 1: unsupported #LNTYPE 2"),
+        ),
+        (
+            &["--chart", "big.bms", "play.tprl"],
+            Some("eval-cli: big.bms: file of 16777217 bytes is too large"),
+        ),
+        (
+            &[
+                "--chart",
+                "chart.bms",
+                "--preset",
+                "missing.toml",
+                "play.tprl",
+            ],
+            None,
+        ),
+        (
+            &[
+                "--chart",
+                "chart.bms",
+                "--preset",
+                "own.toml",
+                "--preset",
+                "bad.toml",
+                "play.tprl",
+            ],
+            None,
+        ),
+        (
+            &["--chart", "chart.bms", "--preset", "big.toml", "play.tprl"],
+            Some(
+                "eval-cli: big.toml: the file is larger than 1048576 bytes, the largest preset \
+                 file accepted",
+            ),
+        ),
     ] {
         let o = run(dir.path(), args);
         assert_eq!(o.status.code(), Some(1), "{args:?}: {o:?}");
@@ -293,12 +412,24 @@ fn an_unusable_chart_or_preset_exits_one_before_any_line() {
         let err = String::from_utf8(o.stderr).unwrap();
         let named = args
             .iter()
-            .find(|a| a.contains("missing") || a.contains("bad"));
-        assert!(
-            err.starts_with(&format!("eval-cli: {}: ", named.unwrap())),
-            "{err}"
-        );
+            .find(|a| ["missing", "bad", "big"].iter().any(|n| a.contains(n)))
+            .unwrap();
+        assert!(err.starts_with(&format!("eval-cli: {named}: ")), "{err}");
+        if let Some(reason) = reason {
+            assert_eq!(err.trim_end(), reason);
+        }
     }
+    // A preset file of exactly the limit is read.
+    fs::write(dir.path().join("big.toml"), padded(&own, limit)).unwrap();
+    let o = run(
+        dir.path(),
+        &["--chart", "chart.bms", "--preset", "big.toml", "play.tprl"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(
+        stdout(&o),
+        format!("play.tprl | preset big.toml | as played | {CUSTOM_TOTALS}\n")
+    );
 }
 
 #[test]
@@ -326,20 +457,34 @@ fn output_is_deterministic() {
     assert_eq!(first.status.code(), Some(1), "{first:?}");
     assert_eq!(first.stdout, second.stdout);
     assert_eq!(first.status, second.status);
-    // Records, then presets, in the order given.
+    // Records, then presets, in the order given, each line labelled.
     let out = stdout(&first);
-    let heads: Vec<&str> = out
+    let heads: Vec<Vec<&str>> = out
         .lines()
-        .map(|l| l.splitn(4, " | ").take(3).last().unwrap())
+        .map(|l| l.splitn(4, " | ").take(3).collect())
         .collect();
+    let refused = "refused: the chart resolves to another chart than the record's";
     assert_eq!(
         heads,
         [
-            "what-if, no input after 4.180 s",
-            "as played",
-            "what-if, ended midway at 3.000 s",
-            "as played, ended midway at 3.000 s",
-            "refused: the chart resolves to another chart than the record's",
+            [
+                "a.tprl",
+                "preset wide.toml",
+                "what-if, no input after 4.180 s"
+            ],
+            ["a.tprl", "preset own.toml", "as played"],
+            [
+                "b.tprl",
+                "preset wide.toml",
+                "what-if, ended midway at 3.000 s"
+            ],
+            [
+                "b.tprl",
+                "preset own.toml",
+                "as played, ended midway at 3.000 s"
+            ],
+            ["c.tprl", "preset wide.toml", refused],
+            ["c.tprl", "preset own.toml", refused],
         ],
         "{out}"
     );
