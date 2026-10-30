@@ -68,15 +68,19 @@ pub enum LogicError {
     #[error("the play cannot start at the earliest time")]
     StartAtMinimum,
     /// The play's recording window needs more inputs than the recording policy
-    /// reserves (design.md "Recording Capacity").
+    /// reserves (design.md "Recording Capacity"). A full play's refusal
+    /// suggests practicing a section, whose window is shorter.
     #[error(
-        "the play is too long to record with these controls: it needs room for {needed} inputs, and {allowed} fit"
+        "the play is too long to record with these controls: it needs room for {needed} inputs, and {allowed} fit{hint}",
+        hint = if *section { "" } else { "; practice a section" }
     )]
     RecordingTooLarge {
         /// The inputs the window needs.
         needed: usize,
         /// The most the policy allows for this chart and these sources.
         allowed: usize,
+        /// Whether the play was a practice round of a section.
+        section: bool,
     },
 }
 
@@ -228,6 +232,29 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         config: LogicConfig,
         sinks: Vec<Box<dyn EventSink + Send + 'a>>,
     ) -> Result<(Self, RenderSide), LogicError> {
+        Self::with_section(chart, rule, device, start, None, readers, config, sinks)
+    }
+
+    /// [`new`](Self::new) for a play of `section` of the chart, if given: a
+    /// practice round (design.md "Section Evaluation"), evaluated in it.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new), and an unusable section.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the play's parts, as `new` takes them, and its section"
+    )]
+    pub fn with_section(
+        chart: &'a Chart,
+        rule: &'a RulePreset,
+        device: &'a DeviceProfile,
+        start: &InputStart,
+        section: Option<&eval::Section>,
+        readers: Vec<R>,
+        config: LogicConfig,
+        sinks: Vec<Box<dyn EventSink + Send + 'a>>,
+    ) -> Result<(Self, RenderSide), LogicError> {
         let n = readers.len();
         if n > usize::from(u16::MAX) + 1 {
             return Err(LogicError::TooManySources(n));
@@ -236,8 +263,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         // participant, which the rates of design.md "Recording Capacity" do not
         // count.
         let budget = config.inputs.saturating_add(n);
-        let evaluator =
-            Evaluator::new(chart, rule, device, start, None, budget).map_err(LogicError::Eval)?;
+        let evaluator = Evaluator::new(chart, rule, device, start, section, budget)
+            .map_err(LogicError::Eval)?;
         // Each buffer holds every control event of the window and its own
         // source's disconnect; a source beyond that exceeds the window, and
         // the push refused overflows like the budget.

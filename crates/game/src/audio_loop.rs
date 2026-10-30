@@ -1,7 +1,7 @@
 //! The audio thread's loop and its control (design.md "Overall Architecture"):
 //! the engine steps once per buffer event of its output for the whole run, and
-//! the game thread starts, cancels and seals each play through a preallocated
-//! SPSC queue. Nothing on the audio thread allocates or frees after
+//! the game thread starts, cancels and seals (or rings out) each play through a
+//! preallocated SPSC queue. Nothing on the audio thread allocates or frees after
 //! construction: a play's command queue, retired at the next play, goes back to
 //! the game thread through a second preallocated queue and is dropped there.
 //!
@@ -30,8 +30,8 @@ use bms_model::TimeUs;
 
 use crate::sound::{AudioQueue, audio_link};
 
-/// Control messages a play sends at most (start, cancel or seal, and one
-/// to spare), times the plays that may queue before the audio thread wakes.
+/// Control messages a play sends at most (start, seal or ring-out, cancel,
+/// and one to spare), times the plays that may queue before the audio thread wakes.
 const CONTROL_CAPACITY: usize = 16;
 /// Retired queues waiting for the game thread: one, since a play is
 /// started only once the queue the previous start retired has come back.
@@ -116,6 +116,17 @@ pub enum AudioCtl {
     Cancel,
     /// Evaluation completed: no key sound follows.
     Seal,
+    /// A practice round's evaluation completed: no key sound follows, and
+    /// the play rings out (design.md "Mid-Chart Start and Section Repeat"):
+    /// the BGM plays on until `fade_at`, the output fades to silence by
+    /// `end_at`, both in the play's chart time, and every sound stops
+    /// there. The play is then done as a sealed one is.
+    RingOut {
+        /// Where the fade starts.
+        fade_at: TimeUs,
+        /// Where the output is silent and every sound stops.
+        end_at: TimeUs,
+    },
     /// The run ends.
     Exit,
 }
@@ -510,6 +521,15 @@ impl AudioControl {
         self.send(AudioCtl::Seal);
     }
 
+    /// No key sound follows, and the play rings out from `fade_at` to
+    /// `end_at` in its chart time ([`AudioCtl::RingOut`]): [`done`](Self::done)
+    /// turns true once every sound has stopped, at the latest when the
+    /// output reaches `end_at`. The audio thread mixes ahead, so that can
+    /// be before the play's time reaches `end_at`.
+    pub fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
+        self.send(AudioCtl::RingOut { fade_at, end_at });
+    }
+
     /// Whether the sealed play's audio has ended.
     #[must_use]
     pub fn done(&self) -> bool {
@@ -639,6 +659,10 @@ impl AudioWorker {
                     while self.queue.commands().pop().is_ok() {}
                 }
                 AudioCtl::Seal => self.sealed = true,
+                AudioCtl::RingOut { fade_at, end_at } => {
+                    self.engine.ring_out(fade_at, end_at);
+                    self.sealed = true;
+                }
                 AudioCtl::Exit => self.exited = true,
             }
         }

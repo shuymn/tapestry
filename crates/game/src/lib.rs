@@ -22,6 +22,7 @@ mod keys;
 pub mod live;
 mod logic;
 mod policy;
+mod practice;
 mod prepare;
 mod queue;
 mod render;
@@ -52,6 +53,7 @@ pub use policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy,
 };
+pub use practice::{FADE, Practice, PracticeError, RING_OUT};
 pub use prepare::{
     BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,
 };

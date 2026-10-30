@@ -109,6 +109,57 @@ fn a_sealed_play_is_done_once_its_sounds_have_ended() {
     assert!(!control.done());
 }
 
+/// A practice round's ring-out on the audio thread (design.md "Mid-Chart
+/// Start and Section Repeat"): the BGM plays on, fades to silence at the
+/// ring-out's end, where every sound stops and a later BGM event never
+/// starts, and the play is done once the output has reached that end.
+#[test]
+fn a_rung_out_play_is_done_at_its_end() {
+    use std::sync::Arc;
+
+    // A 2 s sound at 0, and another at 1 s, past the ring-out's end.
+    let bank = Arc::new(audio::SoundBank::from_sounds(
+        RATE,
+        vec![audio::Sound::mono(vec![4_000; 2 * RATE as usize])],
+    ));
+    let bgm = [0, 1_000 * MS].map(|t| bms_model::BgmEvent {
+        time: TimeUs(t),
+        sound: SoundId(0),
+    });
+    let engine = AudioEngine::new(bank, &bgm, RATE, PERIOD, MAX_VOICES, 0).unwrap();
+    let (mut control, mut worker) = audio_control(engine);
+    let mut out = RecordingOutput::new(
+        SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+        2 * RATE as usize,
+    );
+    // Chart time 0 at 50 ms: a ring-out fading from 300 ms to 500 ms.
+    let (_sink, queue) = audio_link_at(4, TimeUs(50 * MS));
+    control.play(TimeUs(50 * MS), queue).unwrap();
+    control.ring_out(TimeUs(300 * MS), TimeUs(500 * MS));
+    // Frame `n` plays at `(n + 480) / RATE`: the end is frame 25 920.
+    let end = (550 - 10) * 48;
+    let mut steps = 0;
+    while !control.done() {
+        assert!(worker.engine().written() < end as u64 + 3 * u64::from(PERIOD));
+        worker.step(&mut out).unwrap();
+        steps += 1;
+        assert!(steps < 200, "never done");
+    }
+    assert!(worker.engine().written() >= end as u64);
+    let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+    let full = 4_000.0 / 65_536.0;
+    let fade = (350 - 10) * 48;
+    assert_eq!(left[fade - 1], full);
+    assert!(left[fade + 1] < full && left[end - 1] > 0.0);
+    assert!(left[end..].iter().all(|&x| x == 0.0));
+    // Nothing sounds afterwards: the event at 1 s never starts.
+    for _ in 0..80 {
+        worker.step(&mut out).unwrap();
+    }
+    assert!(out.samples().iter().skip(2 * end).all(|&x| x == 0.0));
+    assert_eq!(worker.engine().bgm_left(), 0);
+}
+
 /// The audio thread is gone before it took a play's switch: waiting for
 /// it reports that at once, so the next play gets an error, not a hang.
 #[test]

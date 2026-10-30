@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
 use bms_model::{BgmEvent, Chart, ModelError, Speed, TimeSource, TimeUs, VirtualClock};
-use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
+use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Section, Tally};
 use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
@@ -35,6 +35,7 @@ use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy, SharedEvents,
 };
+use crate::practice::{Practice, PracticeError};
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
 use crate::render::PlayView;
 use crate::render::RenderSide;
@@ -354,6 +355,9 @@ pub struct Loaded {
     /// Where the session events go, out of the parts so a play can report
     /// its start while its logic step borrows the chart.
     events: SharedEvents,
+    /// The practice set up, with its section in the chart's real time:
+    /// each play is then a round of it.
+    practice: Option<(Practice, Section)>,
 }
 
 /// The start of one play: its number, and whether the preset file it
@@ -376,6 +380,10 @@ pub struct PlayPlan {
     /// The logic step's sizes: the recording window's capacity (design.md
     /// "Recording Capacity").
     pub logic: LogicConfig,
+    /// The recording window the capacity is sized for: from the opening
+    /// (the countdown, or a round's lead-in) to the final deadline of the
+    /// chart or of the round's section, before the input-offset allowance.
+    pub window: TimeUs,
 }
 
 /// How one play went, as its driver saw it: what
@@ -508,7 +516,70 @@ impl Loaded {
             preset_modified,
             attempt: 0,
             events,
+            practice: None,
         })
+    }
+
+    /// Sets up practice (design.md "Mid-Chart Start and Section Repeat"):
+    /// from the next play on, each play is a round of `practice`'s section,
+    /// or, with `None`, a full play again. The section is mapped to the
+    /// chart's real time at the session's speed ([`Practice::section`]).
+    /// The engine's schedule for the rounds is
+    /// [`audio_schedule`](Self::audio_schedule), which changes with it.
+    ///
+    /// # Errors
+    ///
+    /// [`PracticeError::Autoplay`] in an autoplay session, and
+    /// [`PracticeError::Section`] for a section the evaluator refuses on
+    /// this chart under the current preset; the setup is unchanged.
+    pub fn set_practice(&mut self, practice: Option<Practice>) -> Result<(), PracticeError> {
+        let Some(practice) = practice else {
+            self.practice = None;
+            return Ok(());
+        };
+        if self.config.autoplay.is_some() {
+            return Err(PracticeError::Autoplay);
+        }
+        let section = practice.section(self.config.speed);
+        crate::practice::check(&self.chart, &self.preset, &section)?;
+        self.practice = Some((practice, section));
+        Ok(())
+    }
+
+    /// The practice set up, if any.
+    #[must_use]
+    pub fn practice(&self) -> Option<&Practice> {
+        self.practice.as_ref().map(|(p, _)| p)
+    }
+
+    /// The section a round evaluates, in the chart's real time; `None`
+    /// for a full play.
+    #[must_use]
+    pub fn section(&self) -> Option<&Section> {
+        self.practice.as_ref().map(|(_, s)| s)
+    }
+
+    /// The schedule the audio engine plays for the plays set up now: a
+    /// round's ([`crate::practice`]: the BGM with the key sounds of every
+    /// note that is not a target) during practice, else the chart's BGM.
+    /// An autoplay session's comes with [`autoplay`](Self::autoplay).
+    #[must_use]
+    pub fn audio_schedule(&self) -> Vec<BgmEvent> {
+        match self.section() {
+            Some(section) => crate::practice::schedule(&self.chart, section),
+            None => self.chart.bgm.clone(),
+        }
+    }
+
+    /// Where a play's recording opens, in its chart time: the countdown
+    /// before chart time 0 for a full play, the lead-in's start for a
+    /// round.
+    #[must_use]
+    pub fn opens_at(&self) -> TimeUs {
+        match self.section() {
+            Some(s) => TimeUs(s.start.0.saturating_sub(s.lead_in.0)),
+            None => TimeUs(-self.config.lead_in.0),
+        }
     }
 
     /// The chart to be played, after the transform.
@@ -667,18 +738,28 @@ impl Loaded {
             })
             .collect();
         // One probe sizes both the window and the reservation; a profile
-        // the evaluator refuses is left for the play to report.
+        // the evaluator refuses is left for the play to report. A round's
+        // probe is built with its section, so its window ends at the
+        // section's final deadline (design.md "Recording Capacity").
+        let section = self.section();
         let probe = Evaluator::new(
             &self.chart,
             &self.preset,
             &device,
             &InputStart::default(),
-            None,
+            section,
             0,
         );
         let end = probe.as_ref().map_or(TimeUs(0), Evaluator::final_deadline);
-        let inputs =
-            window_inputs(&device, end, self.config.lead_in, &rates).saturating_add(system);
+        // A full play's window counts from its countdown to its final
+        // deadline, or to chart time 0 if that comes first.
+        let end = if section.is_some() {
+            end
+        } else {
+            end.max(TimeUs(0))
+        };
+        let window = TimeUs(end.0.saturating_sub(self.opens_at().0).max(0));
+        let inputs = window_inputs(&device, window, &rates).saturating_add(system);
         if let Ok(probe) = &probe
             && let r = Reservation::from_probe(probe, &self.chart, &device, self.config.effects)
             && !r.fits(inputs)
@@ -686,13 +767,18 @@ impl Loaded {
             return Err(LogicError::RecordingTooLarge {
                 needed: inputs,
                 allowed: r.capacity(),
+                section: section.is_some(),
             });
         }
         let logic = LogicConfig {
             inputs,
             effects: self.config.effects,
         };
-        Ok(PlayPlan { device, logic })
+        Ok(PlayPlan {
+            device,
+            logic,
+            window,
+        })
     }
 
     /// The device settings an autoplay play is planned with: the loaded
@@ -737,13 +823,20 @@ impl Loaded {
             return Err(LogicError::RecordingTooLarge {
                 needed: inputs,
                 allowed: r.capacity(),
+                section: false,
             });
         }
         let logic = LogicConfig {
             inputs,
             effects: self.config.effects,
         };
-        Ok(PlayPlan { device, logic })
+        // An autoplay session plays whole charts only.
+        let end = probe.final_deadline().max(TimeUs(0));
+        Ok(PlayPlan {
+            device,
+            logic,
+            window: TimeUs(end.0.saturating_add(self.config.lead_in.0)),
+        })
     }
 
     /// What an autoplay session plays (design.md "Autoplay"), made once
@@ -817,6 +910,33 @@ impl Loaded {
             PlayEnd::Aborted(_) => EndStatus::EndedMidway,
         };
         let (config, settings, preset) = (&self.config, &self.settings, &self.preset);
+        // A round records its section as evaluated and its gauges' starts
+        // by gauge ID (design.md "Practice Records").
+        let play_type = match &self.practice {
+            None => PlayType::Full,
+            Some((practice, section)) => {
+                let round = replay::Practice {
+                    start: section.start,
+                    end: section.end,
+                    lead_in: section.lead_in,
+                    attempt,
+                    initial_gauges: preset
+                        .gauges
+                        .iter()
+                        .zip(&section.initial_gauges)
+                        .map(|(rule, &value)| replay::InitialGauge {
+                            id: rule.id.clone(),
+                            value,
+                        })
+                        .collect(),
+                };
+                if practice.repeat {
+                    PlayType::SectionRepeat(round)
+                } else {
+                    PlayType::MidChartStart(round)
+                }
+            }
+        };
         let play_record = record.finalized.map(|finalized| PlayRecord {
             versions: Versions {
                 evaluator: preset.implementation.version(),
@@ -842,7 +962,7 @@ impl Loaded {
                 display_offset: TimeUs(settings.device.display_offset_us),
                 wake: wake_policy(config.receive),
             },
-            play_type: PlayType::Full,
+            play_type,
             speed: config.speed,
             start: record.start,
             events: record.events,
@@ -964,6 +1084,27 @@ impl<O: AudioOutput + Wakes> Session<O> {
     #[must_use]
     pub const fn audio(&self) -> &RunnerAudio<O> {
         &self.audio
+    }
+
+    /// Sets up practice for the next plays, as [`Loaded::set_practice`]
+    /// does, and gives the engine the schedule they play
+    /// ([`Loaded::audio_schedule`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Loaded::set_practice`]; nothing changes.
+    pub fn set_practice(&mut self, practice: Option<Practice>) -> Result<(), PracticeError> {
+        self.loaded.set_practice(practice)?;
+        // An autoplay session keeps its own schedule; it plays whole charts
+        // only.
+        if self.loaded.config.autoplay.is_none() {
+            let engine = self.audio.engine_mut();
+            let bank = std::sync::Arc::clone(engine.bank());
+            let schedule = ::audio::BgmSchedule::new(self.loaded.audio_schedule());
+            // The engine's own bank, so its rate: never refused.
+            let _ = engine.replace(bank, schedule);
+        }
+        Ok(())
     }
 
     /// Plays the chart once with `script`, from the countdown to the
@@ -1129,6 +1270,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         self.audio.engine_mut().restart(origin);
         self.sounds = Some(sounds);
         self.screen = Some(screen);
+        self.sealed = false;
     }
 
     fn focus_lost(&self) -> bool {
@@ -1157,6 +1299,29 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
 
     fn seal_audio(&mut self) {
         self.sealed = true;
+    }
+
+    fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
+        self.audio.engine_mut().ring_out(fade_at, end_at);
+        self.sealed = true;
+    }
+
+    fn restore_audio(&mut self, at: TimeUs) {
+        let engine = self.audio.engine_mut();
+        // The output mixes ahead: a time whose frame is already written is
+        // restored at the first frame that is not, as a later seek is
+        // planned (design.md "Audio").
+        let line = engine.frame_line();
+        let written = i128::from(engine.written());
+        let rate = i128::from(line.rate.max(1));
+        let first = (written * 1_000_000 + rate - 1) / rate - i128::from(line.base_us);
+        let at = TimeUs(at.0.max(i64::try_from(first).unwrap_or(i64::MAX)));
+        let plan = ::audio::SeekPlan::new(&engine.seek_source(), engine.schedule(), line, at);
+        // The engine's own schedule, line and written frames: neither is
+        // refused.
+        if let Ok(plan) = plan {
+            let _ = engine.seek(&plan);
+        }
     }
 
     fn audio_done(&self) -> bool {
@@ -1355,14 +1520,13 @@ pub const SYSTEM_CONTROL_INPUTS: usize = 2;
 /// The recording window's input capacity (design.md "Recording Capacity",
 /// [`eval::window_inputs`]): each source's lane-bound buttons pressed and
 /// released 30 times a second each, up to 240 edges a second together, and its
-/// lane-bound axes it declares reporting 1000 times a second each, from the
-/// countdown to the chart's final deadline plus the largest input offset, in
-/// whole seconds, for sources recording `(buttons, axes)` each. The caller adds
-/// [`SYSTEM_CONTROL_INPUTS`] per bound system control.
+/// lane-bound axes it declares reporting 1000 times a second each, over the
+/// `window` (from the opening to the final deadline) plus the largest input
+/// offset, in whole seconds, for sources recording `(buttons, axes)` each.
+/// The caller adds [`SYSTEM_CONTROL_INPUTS`] per bound system control.
 fn window_inputs(
     device: &eval::DeviceProfile,
-    end: TimeUs,
-    lead_in: TimeUs,
+    window: TimeUs,
     sources: &[(usize, usize)],
 ) -> usize {
     let offset = device
@@ -1372,9 +1536,6 @@ fn window_inputs(
         .max()
         .unwrap_or(0)
         .max(0);
-    let span = lead_in
-        .0
-        .saturating_add(end.0.max(0))
-        .saturating_add(offset);
+    let span = window.0.saturating_add(offset);
     eval::window_inputs(TimeUs(span), sources)
 }
