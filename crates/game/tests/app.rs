@@ -2,9 +2,17 @@
 //! keyboard whose presses hit each chart's notes, audio and screen doubles,
 //! and the player's actions scripted at times after one another. An action
 //! the current scene does not take is dropped shortly after it is due, as a
-//! press on a screen that ignores it.
+//! press on a screen that ignores it, unless the test keeps it queued.
+//!
+//! Allocations are counted from each play's handoff to its close on the
+//! property's thread (see `counting`): a play reserves everything at its
+//! countdown's start, so none happen there.
 
 mod common;
+mod counting;
+
+#[global_allocator]
+static GLOBAL: counting::Counting = counting::Counting;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -54,6 +62,14 @@ fn chart_b() -> Chart {
         .unwrap()
 }
 
+/// One note 70 minutes in: its recording window is over the reservation.
+fn long() -> Chart {
+    ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(4_200_000 * MS))
+        .build()
+        .unwrap()
+}
+
 /// BGM only: nothing to judge.
 fn silent() -> Chart {
     ChartBuilder::new(150_000)
@@ -89,6 +105,7 @@ impl ChartIngest for Charts {
             b"a" => chart_a(),
             b"b" => chart_b(),
             b"silent" => silent(),
+            b"long" => long(),
             other => panic!("no chart {other:?}"),
         };
         Ok(Ingested {
@@ -127,6 +144,9 @@ enum Refusal {
     Bank,
     /// It has no judgeable notes, refused at the opening.
     Silent,
+    /// Its recording window is over the reservation, refused at the
+    /// opening.
+    TooLong,
     /// The preset file is not a preset; the refusal shown fixes it.
     Preset,
 }
@@ -197,6 +217,20 @@ struct Headless {
     refused_opens: Vec<usize>,
     starts: usize,
     chooses: usize,
+    /// Actions stay queued until a scene takes them.
+    keep_queued: bool,
+    /// Allocations are counted from each handoff to its close.
+    count_allocs: bool,
+    /// The play handed over and not yet closed.
+    play: Option<Play>,
+    /// Whether each play handed over finalized a watermark, in order.
+    finalized: Vec<bool>,
+}
+
+/// A play between its handoff and its close.
+struct Play {
+    finalized: bool,
+    allocs: u64,
 }
 
 impl Headless {
@@ -211,6 +245,7 @@ impl Headless {
             Refusal::Missing => {}
             Refusal::Bank | Refusal::Preset => std::fs::write(&paths[2], b"a").unwrap(),
             Refusal::Silent => std::fs::write(&paths[2], b"silent").unwrap(),
+            Refusal::TooLong => std::fs::write(&paths[2], b"long").unwrap(),
         }
         let mut sources = SourceSet::new(common::sources()).unwrap();
         let mut script = ScriptedInput::new(vec![ScriptItem {
@@ -250,6 +285,10 @@ impl Headless {
             refused_opens: Vec::new(),
             starts: 0,
             chooses: 0,
+            keep_queued: false,
+            count_allocs: false,
+            play: None,
+            finalized: Vec::new(),
         }
     }
 
@@ -294,7 +333,7 @@ impl Headless {
                 self.quitting = true;
                 self.consume();
             }
-            Some(_) if self.at() >= self.due + DROP_AFTER => self.consume(),
+            Some(_) if !self.keep_queued && self.at() >= self.due + DROP_AFTER => self.consume(),
             _ => {}
         }
         // With nothing left to do, the player closes the window.
@@ -417,6 +456,18 @@ impl Rig for Headless {
         self.sounds = Some(sounds);
         self.sealed = false;
         self.waits_since_seal = 0;
+        self.play = Some(Play {
+            finalized: false,
+            allocs: counting::calls(),
+        });
+        // Last: anything the rig itself frees above is not the play's.
+        counting::track(self.count_allocs);
+    }
+
+    fn measured(&mut self, advance: &game::Advance, _: &[eval::JudgeEvent], _: TimeUs) {
+        if let Some(p) = &mut self.play {
+            p.finalized |= advance.watermark.is_some();
+        }
     }
 
     fn focus_lost(&self) -> bool {
@@ -450,6 +501,15 @@ impl Rig for Headless {
     }
 
     fn close(&mut self) -> Result<Closing, InputWaitError> {
+        counting::track(false);
+        if let Some(p) = self.play.take() {
+            let allocs = counting::calls() - p.allocs;
+            if allocs != 0 {
+                self.violations
+                    .push(format!("{allocs} allocations after the handoff"));
+            }
+            self.finalized.push(p.finalized);
+        }
         if self.opened {
             self.opened = false;
             self.refused_opens.push(self.chosen.unwrap());
@@ -547,6 +607,7 @@ impl AppRig for Headless {
             Refused::Chart(e) => panic!("{e:?}"),
             Refused::Bank(BankLost) => "bank",
             Refused::Play(LogicError::Eval(eval::EvalError::NoJudgeableNotes)) => "no notes",
+            Refused::Play(LogicError::RecordingTooLarge { .. }) => "too long",
             Refused::Play(e) => panic!("{e:?}"),
         };
         self.refusals.push(kind.to_owned());
@@ -585,18 +646,18 @@ fn app(dir: &Path, refusal: Refusal, events: &Events) -> App {
         autoplay: None,
     };
     let parts_root = root.clone();
-    let chart_events = events.clone();
-    App {
+    // The parts report to no sink of their own: the run's sink receives
+    // every chart's events.
+    App::new(
         root,
         settings,
         config,
-        parts: Box::new(move |s: &Settings| Parts {
+        Box::new(move |s: &Settings| Parts {
             ingest: Box::new(Charts),
-            events: Box::new(chart_events.clone()),
             ..Parts::standard(&parts_root, &s.player)
         }),
-        events: Box::new(events.clone()),
-    }
+        Box::new(events.clone()),
+    )
 }
 
 /// Runs the flow over `acts`.
@@ -680,13 +741,15 @@ fn select_play_retry_back_select_again() {
 }
 
 /// Each refusal returns to selection, signaled, with the reason and the
-/// refused chart named; choosing a valid chart then plays it.
+/// refused chart named; choosing a valid chart then plays it. A chart
+/// refused at the opening reports no start of its own.
 #[test]
 fn refused_chart_returns_to_selection_then_valid_chart_plays() {
     for (refusal, kind) in [
         (Refusal::Missing, "io"),
         (Refusal::Bank, "bank"),
         (Refusal::Silent, "no notes"),
+        (Refusal::TooLong, "too long"),
         (Refusal::Preset, "preset"),
     ] {
         let acts = vec![
@@ -702,7 +765,7 @@ fn refused_chart_returns_to_selection_then_valid_chart_plays() {
             rig.violations
         );
         assert_eq!(rig.refusals, [kind], "{refusal:?}");
-        let loaded_refused = refusal == Refusal::Silent;
+        let loaded_refused = matches!(refusal, Refusal::Silent | Refusal::TooLong);
         let mut seen = vec![Seen::Select];
         if loaded_refused {
             seen.push(Seen::Load(2));
@@ -723,8 +786,43 @@ fn refused_chart_returns_to_selection_then_valid_chart_plays() {
         };
         assert_eq!(attempts(plays), [1]);
         assert_eq!(plays[0].end, PlayEnd::Completed);
-        assert_eq!(events.count(|e| *e == SessionEvent::Select), 2);
+        // A chart file that is read reports its load before any refusal.
+        let mut expected = vec![SessionEvent::Select];
+        if !matches!(refusal, Refusal::Missing | Refusal::Preset) {
+            expected.push(SessionEvent::Load);
+        }
+        let status = replay::EndStatus::PlayedToEnd;
+        expected.extend([
+            SessionEvent::Select,
+            SessionEvent::Load,
+            SessionEvent::Start { attempt: 1 },
+            SessionEvent::End { attempt: 1, status },
+            SessionEvent::Result { attempt: 1 },
+        ]);
+        assert_eq!(events.all(), expected, "{refusal:?}");
     }
+}
+
+/// Commands queued behind the retry that leaves a result belong to that
+/// result: a back queued after it does not leave the next result.
+#[test]
+fn queued_menu_commands_do_not_outlive_their_result() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (4_000, Act::Retry),
+        (0, Act::Back),
+        (4_000, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.keep_queued = true);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [Seen::Select, Seen::Load(0), Seen::Shown(1), Seen::Shown(2)]
+    );
+    let (_, plays) = &rig.loads[0];
+    assert_eq!(attempts(plays), [1, 2]);
+    assert_eq!(plays[1].end, PlayEnd::Completed);
 }
 
 /// A quit during play leaves the chart for selection, with no result; the
@@ -897,6 +995,7 @@ fn refusal() -> impl Strategy<Value = Refusal> {
         Just(Refusal::Missing),
         Just(Refusal::Bank),
         Just(Refusal::Silent),
+        Just(Refusal::TooLong),
     ]
 }
 
@@ -905,10 +1004,11 @@ proptest! {
 
     /// Random selections, retries, quits, backs, preset switches and
     /// closes at random times, over two built charts and one refused
-    /// chart: the run ends cleanly, every record re-evaluates equal to
-    /// live, attempts count from 1 per chart, every play is set up at its
-    /// countdown's start before any wait, and every entry into selection
-    /// is signaled.
+    /// chart: the run ends cleanly; every play that finalized anything has
+    /// a saved record that re-evaluates equal to live; attempts count from
+    /// 1 per chart; every play is reserved at its countdown's start, before
+    /// any wait and with nothing allocated after its handoff; and every
+    /// entry into selection is signaled.
     #[test]
     fn any_command_sequence_ends_cleanly(
         refusal in refusal(),
@@ -916,29 +1016,39 @@ proptest! {
         rest in proptest::collection::vec((0..3_000_i64, act()), 0..20),
     ) {
         let acts = std::iter::once((0, Act::Choose(first))).chain(rest).collect();
-        let (rig, events, ran) = run(refusal, acts, |_| {});
+        counting::track(true);
+        counting::self_check();
+        counting::track(false);
+        let (rig, events, ran) = run(refusal, acts, |r| r.count_allocs = true);
         prop_assert!(ran.is_ok(), "{:?}", ran);
         prop_assert!(rig.quitting);
         prop_assert!(rig.violations.is_empty(), "{:?}", rig.violations);
         for (chart, plays) in &rig.loads {
             let expected: Vec<u32> = (1..).take(plays.len()).collect();
             prop_assert_eq!(attempts(plays), expected, "chart {}", chart);
-            for r in plays {
-                if let Some(record) = &r.record {
-                    let result = r.result.as_ref().unwrap();
-                    prop_assert!(result.matches_live, "chart {}: {:?}", chart, r.end);
-                    let evaluation = result.evaluation.as_ref().unwrap();
-                    prop_assert_eq!(&evaluation.events, &r.live);
-                    prop_assert_eq!(&evaluation.tally, &r.tally);
-                    prop_assert!(matches!(r.saved, Some(Ok(_))));
-                    prop_assert_eq!(record.status.end == replay::EndStatus::PlayedToEnd,
-                        r.end == PlayEnd::Completed);
-                }
-            }
         }
-        // Only the chart without notes is refused after recording opens.
-        prop_assert!(rig.refused_opens.iter().all(|&c| c == 2 && refusal == Refusal::Silent));
+        // Every play handed over was closed and reported, and each that
+        // finalized a watermark has a record, saved, that re-evaluates to
+        // its live stream.
         prop_assert_eq!(rig.starts, rig.reports().count());
+        prop_assert_eq!(rig.finalized.len(), rig.starts);
+        for (r, &finalized) in rig.reports().zip(&rig.finalized) {
+            prop_assert_eq!(r.record.is_some(), finalized, "{:?}", r.end);
+            let Some(record) = &r.record else { continue };
+            prop_assert!(matches!(r.saved, Some(Ok(_))), "{:?}", r.saved);
+            let result = r.result.as_ref().unwrap();
+            prop_assert!(result.matches_live, "{:?}", r.end);
+            let evaluation = result.evaluation.as_ref().unwrap();
+            prop_assert_eq!(&evaluation.events, &r.live);
+            prop_assert_eq!(&evaluation.tally, &r.tally);
+            prop_assert_eq!(record.status.end == replay::EndStatus::PlayedToEnd,
+                r.end == PlayEnd::Completed);
+        }
+        // Only the chart refused at the opening opens recording unplayed,
+        // and only admitted plays report a start.
+        let at_opening = matches!(refusal, Refusal::Silent | Refusal::TooLong);
+        prop_assert!(rig.refused_opens.iter().all(|&c| c == 2 && at_opening));
+        prop_assert_eq!(events.count(|e| matches!(e, SessionEvent::Start { .. })), rig.starts);
         prop_assert_eq!(events.count(|e| *e == SessionEvent::Select), rig.entries);
         let shown = rig.seen.iter().filter(|s| matches!(s, Seen::Shown(_))).count();
         prop_assert_eq!(events.count(|e| matches!(e, SessionEvent::Result { .. })), shown);

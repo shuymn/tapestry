@@ -288,9 +288,17 @@ pub fn run_chart<R: Rig>(
             // with the screen; a retry's preparation rebuilds it anyway.
             // A preset switch changes only the result's view, never the
             // play preset (design.md "Play Lifecycle").
+            // Commands queued behind the one that leaves the result belong
+            // to that result and are dropped with it.
             match rig.take_menu() {
-                Some(MenuCommand::Retry) => break,
-                Some(MenuCommand::Back) => return leave(rig),
+                Some(MenuCommand::Retry) => {
+                    while rig.take_menu().is_some() {}
+                    break;
+                }
+                Some(MenuCommand::Back) => {
+                    while rig.take_menu().is_some() {}
+                    return leave(rig);
+                }
                 Some(MenuCommand::NextPreset | MenuCommand::PrevPreset) | None => {}
             }
             // The screen failed during the play, its tail or this wait: it
@@ -370,6 +378,9 @@ fn play_and_next<R: Rig>(
             return Err(LiveError::Logic(e));
         }
     };
+    // Admitted: only now does the play start, so a refused opening reports
+    // no start.
+    loaded.admitted(&start);
     let (mut sink, sounds) = audio_link_at(logic.max_events(), origin);
     // Autoplay's key sounds are on the engine's schedule, ahead of their
     // judgments.

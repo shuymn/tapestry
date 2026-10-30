@@ -11,6 +11,7 @@
 //! its countdown starts, and recording opens at the countdown. The session
 //! clock, which the audio output follows, only moves forward across plays.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -327,7 +328,8 @@ pub struct PlayReport {
 /// It also holds what every play of the chart shares, whichever driver
 /// runs the plays: [`Session::play`] headlessly, or the game's threads.
 /// Each play goes [`begin_play`](Self::begin_play) →
-/// [`plan`](Self::plan) once recording has opened → evaluation →
+/// [`plan`](Self::plan) once recording has opened → [`admitted`](Self::admitted)
+/// once its logic step is built → evaluation →
 /// [`finish_play`](Self::finish_play).
 #[derive(Debug)]
 pub struct Loaded {
@@ -342,6 +344,24 @@ pub struct Loaded {
     preset_path: PathBuf,
     preset_modified: Option<SystemTime>,
     attempt: u32,
+    /// The parts' event sink, taken out of them so a play can report its
+    /// start while its logic step borrows the chart.
+    events: Events,
+}
+
+/// A session event sink reported to through a shared borrow.
+struct Events(RefCell<Box<dyn SessionEventSink>>);
+
+impl Events {
+    fn on_event(&self, ev: &SessionEvent) {
+        self.0.borrow_mut().on_event(ev);
+    }
+}
+
+impl fmt::Debug for Events {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Events")
+    }
 }
 
 /// The start of one play: its number, and whether the preset file it
@@ -461,7 +481,11 @@ impl Loaded {
             random_seed: config.seed,
             transform: parts.transform.id().record(),
         };
-        parts.events.on_event(&SessionEvent::Load);
+        let events = Events(RefCell::new(std::mem::replace(
+            &mut parts.events,
+            Box::new(NoSessionEvents),
+        )));
+        events.on_event(&SessionEvent::Load);
         Ok(Self {
             root,
             settings,
@@ -474,6 +498,7 @@ impl Loaded {
             preset_path,
             preset_modified,
             attempt: 0,
+            events,
         })
     }
 
@@ -502,8 +527,8 @@ impl Loaded {
     }
 
     /// Reports `ev` to the session event sink.
-    pub(crate) fn emit(&mut self, ev: &SessionEvent) {
-        self.parts.events.on_event(ev);
+    pub(crate) fn emit(&self, ev: &SessionEvent) {
+        self.events.on_event(ev);
     }
 
     /// The settings, to change between plays.
@@ -540,9 +565,10 @@ impl Loaded {
         }
     }
 
-    /// Starts the next play. Every play after the first is a retry: a
-    /// preset file changed since the previous play is used from this one
-    /// on.
+    /// Numbers the next play, before recording opens; its start is reported
+    /// once it is [`admitted`](Self::admitted). Every play after the first
+    /// is a retry: a preset file changed since the previous play is used
+    /// from this one on.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
         let attempt = self.attempt;
@@ -551,11 +577,18 @@ impl Loaded {
         } else {
             None
         };
-        self.parts.events.on_event(&SessionEvent::Start { attempt });
         PlayStart {
             attempt,
             reload_error,
         }
+    }
+
+    /// The play `start` was admitted: recording opened, the play was
+    /// planned and its logic step built. Reports its start.
+    pub fn admitted(&self, start: &PlayStart) {
+        self.events.on_event(&SessionEvent::Start {
+            attempt: start.attempt,
+        });
     }
 
     /// At a retry: uses the preset file from now on if its modification
@@ -826,11 +859,9 @@ impl Loaded {
         let retried =
             end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
         if retried {
-            parts.events.on_event(&SessionEvent::Retry { attempt });
+            self.events.on_event(&SessionEvent::Retry { attempt });
         }
-        parts
-            .events
-            .on_event(&SessionEvent::End { attempt, status });
+        self.events.on_event(&SessionEvent::End { attempt, status });
         PlayReport {
             attempt,
             end,

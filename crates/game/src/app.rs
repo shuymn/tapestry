@@ -12,8 +12,10 @@
 //! - Only the screen, audio and input-thread failures [`LiveError`] carries
 //!   end the run; closing the window ends it from any scene.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use bms_model::TimeUs;
 
@@ -82,18 +84,22 @@ enum Chosen<B> {
 
 /// What the scene flow loads every chart with.
 pub struct App {
-    /// The data root.
-    pub root: DataRoot,
-    /// The settings; a chart's plays may change them, and the next chart
-    /// starts from those.
-    pub settings: Settings,
-    /// The fixed choices every chart is played with.
-    pub config: SessionConfig,
-    /// Makes the extension points for each chart loaded.
-    pub parts: Box<dyn FnMut(&Settings) -> Parts>,
-    /// Receives the screen changes outside a chart ([`SessionEvent::Select`]);
-    /// each chart's own come through its parts.
-    pub events: Box<dyn SessionEventSink>,
+    root: DataRoot,
+    settings: Settings,
+    config: SessionConfig,
+    parts: Box<dyn FnMut(&Settings) -> Parts>,
+    events: SharedEvents,
+}
+
+/// The one session event sink of a run: selection reports through it, and
+/// each chart's parts get a handle to it, so no chart reports elsewhere.
+#[derive(Clone)]
+struct SharedEvents(Rc<RefCell<Box<dyn SessionEventSink>>>);
+
+impl SessionEventSink for SharedEvents {
+    fn on_event(&mut self, ev: &SessionEvent) {
+        self.0.borrow_mut().on_event(ev);
+    }
 }
 
 impl fmt::Debug for App {
@@ -106,6 +112,27 @@ impl fmt::Debug for App {
 }
 
 impl App {
+    /// The scene flow under `root`, starting from `settings`; a chart's
+    /// plays may change them, and the next chart starts from those. `parts`
+    /// makes the extension points of each chart loaded; their session
+    /// events go to `events` whatever `parts` sets, as selection's do.
+    #[must_use]
+    pub fn new(
+        root: DataRoot,
+        settings: Settings,
+        config: SessionConfig,
+        parts: Box<dyn FnMut(&Settings) -> Parts>,
+        events: Box<dyn SessionEventSink>,
+    ) -> Self {
+        Self {
+            root,
+            settings,
+            config,
+            parts,
+            events: SharedEvents(Rc::new(RefCell::new(events))),
+        }
+    }
+
     /// Runs the scene flow from song selection until the window closes.
     ///
     /// # Errors
@@ -156,7 +183,10 @@ impl App {
         chart: &Path,
         rig: &mut R,
     ) -> Result<Chosen<R::BankError>, LiveError<R::ScreenError>> {
-        let parts = (self.parts)(&self.settings);
+        let parts = Parts {
+            events: Box::new(self.events.clone()),
+            ..(self.parts)(&self.settings)
+        };
         let mut loaded = match Loaded::load(
             self.root.clone(),
             self.settings.clone(),
