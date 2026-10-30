@@ -13,8 +13,7 @@ use rules::{GaugeValue, Judgment};
 use skin_model::{
     Attempt, Blend, ClipId, Ease, ElementDef, End, ErrorKind, Export, KeyDef, LoadError,
     MAX_ELEMENTS, MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, PLAY, PlayContext, PrepareError, Prop,
-    Schema, Scope, Skin, Source, State, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field,
-    timer,
+    Schema, Scope, Skin, Source, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field, timer,
 };
 
 const BPM_150: i64 = 150_000;
@@ -194,6 +193,53 @@ fn beat_inside_a_stop_keeps_the_latest_crossing() {
     h.frame(700, &[]);
     assert_eq!(h.start(timer::BEAT), Some(500 * MS));
     assert_eq!(crossing(&aligned.scroll, 1), 500 * MS);
+}
+
+/// A track on a timer that started at the earliest time, sampled at the
+/// latest: its age saturates and it shows its last key.
+#[test]
+fn an_element_ages_without_overflow() {
+    let chart = taps(&[1_000]);
+    let mut first = [None; 9];
+    first[Prop::X as usize] = Some(1);
+    let mut last = [None; 9];
+    last[Prop::X as usize] = Some(2);
+    let track = Track::new(
+        &[
+            KeyDef {
+                at: TimeUs(0),
+                props: first,
+            },
+            KeyDef {
+                at: TimeUs(1_000 * MS),
+                props: last,
+            },
+        ],
+        Ease::Linear,
+        End::Hold,
+    )
+    .unwrap();
+    let skin = Skin::new(
+        Vec::new(),
+        vec![ElementDef {
+            track,
+            ..element(TimerRef::Builtin(timer::READY), 0)
+        }],
+    )
+    .unwrap();
+    let ctx = PlayContext {
+        attempt: Attempt::Full {
+            lead_in: TimeUs(i64::MAX),
+        },
+        ..full(0)
+    };
+    let mut h = Harness::new(skin, &chart, &ctx);
+    h.frame_us(i64::MIN + 1, &[]);
+    assert_eq!(h.batch.quads()[0].rect[0], 1.0);
+    h.frame_us(i64::MAX, &[]);
+    assert_eq!(h.start(timer::READY), Some(i64::MIN + 1));
+    assert_eq!(h.batch.quads().len(), 1);
+    assert_eq!(h.batch.quads()[0].rect[0], 2.0);
 }
 
 #[test]
@@ -445,20 +491,9 @@ fn no_when_reads_a_when() {
     // The play scope names no `when` timer.
     let err = compile("on(w0)", &Scope::new(&PLAY), Ty::Bool).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::UnknownTimer { .. }));
-    let chart = taps(&[1_000]);
-    let skin = Skin::new(
-        vec![bool_program("on(play)"), bool_program("on(play)")],
-        vec![element(TimerRef::When(1), 1)],
-    )
-    .unwrap();
-    let mut h = Harness::new(skin, &chart, &full(0));
-    h.frame(0, &[]);
-    assert_eq!(h.start(timer::BUILTIN), Some(0));
-    assert_eq!(h.start(timer::BUILTIN + 1), Some(0));
-    assert_eq!(h.batch.quads().len(), 1);
-    // A program that did name `when` 0 (slot 55) reads it as off through
-    // the built-in slice the `when` conditions get, and on through the
-    // full state elements get.
+    // A condition compiled against a wider schema, which names `when` 0 at
+    // slot 55, still reads it as off: conditions see the built-in slots
+    // only. Elements see every slot.
     let mut timers = PLAY.timers.to_vec();
     timers.push(TimerDef {
         name: "w0",
@@ -469,13 +504,28 @@ fn no_when_reads_a_when() {
         ..PLAY
     }));
     let reads_when = compile("on(w0)", &Scope::new(extended), Ty::Bool).unwrap();
-    let full_state = h.play.state();
-    assert!(reads_when.eval_bool(&full_state));
-    let builtin = State {
-        timers: &full_state.timers[..usize::from(timer::BUILTIN)],
-        ..full_state
-    };
-    assert!(!reads_when.eval_bool(&builtin));
+    let chart = taps(&[1_000]);
+    let skin = Skin::new(
+        vec![bool_program("on(play)"), reads_when.clone()],
+        vec![
+            element(TimerRef::When(0), 1),
+            element(TimerRef::When(1), 2),
+            ElementDef {
+                visible: Some(reads_when),
+                ..element(TimerRef::Builtin(timer::PLAY), 3)
+            },
+        ],
+    )
+    .unwrap();
+    let mut h = Harness::new(skin, &chart, &full(0));
+    for now in [0, 16] {
+        h.frame(now, &[]);
+        assert_eq!(h.start(timer::BUILTIN), Some(0), "at {now}");
+        assert_eq!(h.start(timer::BUILTIN + 1), None, "at {now}");
+        assert_eq!(h.elapsed(timer::BUILTIN + 1), TIMER_OFF, "at {now}");
+        let xs: Vec<f32> = h.batch.quads().iter().map(|q| q.rect[0]).collect();
+        assert_eq!(xs, [1.0, 3.0], "at {now}");
+    }
 }
 
 #[test]
