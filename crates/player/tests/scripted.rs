@@ -308,6 +308,35 @@ fn render_app_region_does_not_allocate() {
     assert_eq!(int(&m, "allocations", "render_app"), Some(0));
 }
 
+/// The play's setup, measured as the game thread hands the play to audio
+/// and the screen, reaches its `.measure.toml` and the console line printed
+/// when the play ends, with the first frame after it and the process's page
+/// faults from the handover until the play was over.
+#[test]
+fn the_play_setup_reaches_the_figures() {
+    let fx = fixture();
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let saved = records(&fx.appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let m = measured(&saved[0]);
+    let setup = int(&m, "countdown", "setup_us").unwrap();
+    let first = int(&m, "countdown", "first_frame_us").unwrap();
+    // The setup takes time and ends within the 1 s lead-in; the first
+    // frame comes after it.
+    assert!(0 < setup && setup < 1_000_000, "{setup}");
+    assert!(first > setup, "{first} {setup}");
+    assert!(stdout.contains(&format!(
+        "countdown: setup {setup} us, first frame {first} us after it started"
+    )));
+    // Seconds of play that fill buffers and draw frames: some page faults.
+    assert!(int(&m, "faults", "process").unwrap() > 0);
+}
+
 /// The perfect measurement (`--dev-perfect`, headless here): with a
 /// `device.toml` whose keys and input offset differ from the built-in ones,
 /// every note is still PERFECT, each key sound is sent from its judgment

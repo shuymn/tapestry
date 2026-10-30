@@ -555,6 +555,9 @@ mod tests {
         Box::new(PlayMeasure {
             generation: 1,
             origin,
+            countdown_at: origin,
+            started: origin,
+            page_faults: None,
             load_from: TimeUs(0),
             retry: false,
             audio: None,
