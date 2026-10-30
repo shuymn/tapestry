@@ -214,7 +214,7 @@ fn encoding_4(bytes: &[u8]) -> Vec<u8> {
         .unwrap();
     let mut old = bytes.to_vec();
     old.remove(tag);
-    assert_eq!(old[0], 6, "the current encoding");
+    assert_eq!(old[0], 7, "the current encoding");
     old[0] = 4;
     old
 }

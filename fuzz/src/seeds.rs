@@ -447,8 +447,8 @@ pub fn preset_canonicals() -> Vec<Seed> {
             ..gauge.clone()
         })
         .collect();
-    // beatoraja-style carries the other header and window policies and a
-    // scratch table of its own.
+    // beatoraja-style carries the other header, window and assignment
+    // policies and a scratch table of its own.
     let mut seeds: Vec<Seed> = vec![
         ("custom", bytes.clone()),
         (

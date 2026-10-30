@@ -136,5 +136,41 @@ fn bench_live(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_batch, bench_live);
+/// A dense window (design.md "Evaluation Stages": dense windows are
+/// benchmarked): `notes` taps on key 1 every 5 ms, so about 100 notes lie
+/// inside one press's BAD window and empty POOR range, each pressed 30 ms
+/// late, under each assignment policy (custom's nearest first and
+/// beatoraja-style's combo priority).
+fn dense(notes: i64) -> (Chart, Vec<PhysicalInputEvent>) {
+    let mut builder = ChartBuilder::new(150_000);
+    let mut events = Vec::new();
+    for i in 0..notes {
+        let t = FIRST + i * 5 * MS;
+        builder = builder.tap(lane(1), TimeUs(t));
+        events.push(control_event(t + 30 * MS, 1, 1));
+        events.push(control_event(t + 30 * MS + 2 * MS, 1, 0));
+    }
+    events.sort_by_key(|e| e.received);
+    (builder.build().expect("valid chart"), events)
+}
+
+fn bench_dense_window(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dense_window");
+    let (chart, events) = dense(2_000);
+    let input = EvalInput {
+        events,
+        device: device(),
+        ..EvalInput::default()
+    };
+    for preset in [rules::custom(), rules::beatoraja_style()] {
+        let played = evaluate(&chart, &input, &preset).expect("evaluates");
+        assert!(played.completed);
+        group.bench_function(format!("2000_notes_{}", preset.id), |b| {
+            b.iter(|| evaluate(black_box(&chart), black_box(&input), &preset).expect("evaluates"));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_batch, bench_live, bench_dense_window);
 criterion_main!(benches);
