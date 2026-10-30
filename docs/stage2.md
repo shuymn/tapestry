@@ -367,7 +367,7 @@ A single exact stage is not used. A 383,999 Hz stereo source at 145 % on 384,000
 - A ring-out follows instead of the full-play audio tail, which waits for every voice and BGM event (crates/game/src/live.rs:359). For `RING_OUT` (1.5 s, tuned by playing) the BGM keeps playing on schedule, no notes are drawn and nothing is judged or recorded; key sounds of notes after the section never start. Over its last `FADE` (0.5 s, tuned by playing) the output fades to silence.
 - **The envelope is on output frames.** At completion the game sends `AudioCtl::RingOut { fade_at, end_at }` in play time. The engine converts both to frame positions on the play's mix clock, as it does for sound starts, and applies the gain per frame: 1 before `fade_at`, falling linearly to 0 at `end_at`. At `end_at` it stops every voice and starts nothing more, and it reports the ring-out done like a sealed tail. The fade therefore does not depend on when the request is taken or how the output is divided into periods, and the stop always comes at the envelope's zero. Nothing is allocated in the audio callback.
 - **The envelope is reset** to gain 1 by every `Play`, whether the previous ring-out finished or was cut, independently of master volume and loudness gain.
-- After the engine reports done, the record is saved, and the next round's countdown begins at the following step.
+- The ring-out ends when both the engine has reported done and play time has reached `end_at`: the engine mixes ahead into queued output, so its report alone can come early. The record is then saved, and the next round's countdown begins at the following step.
 - Quit, retry or focus loss during the ring-out cuts it at once with `AudioCtl::Cancel`, like the full-play tail; the frozen record is still saved. Quit returns to the practice screen.
 
 **Example.** 100 % speed, lead-in 2 s, offset 0, aligned 1 ms steps, 48 kHz output. Section `[10 s, 20 s)` of a 180 s chart; the last target is a tap at 19.5 s; the late BAD edge is 180 ms.
@@ -375,7 +375,7 @@ A single exact stage is not used. A 383,999 Hz stereo source at 145 % on 384,000
 - The step at 19.680 s publishes `fresh − 1 µs` = 19.679999 s, which does not cover the deadline.
 - The step at 19.681 s publishes 19.680999 s: completion and the close happen there, and `RingOut { fade_at: 20.681 s, end_at: 21.181 s }` is sent.
 - The rendered fade covers output frames from 20.681 s to 21.181 s on the play's mix clock: 24,000 frames, whatever the audio period.
-- The engine reports done once it has mixed past 21.181 s. The record is saved, and round 2's countdown begins at the first step after that report: at 21.182 s at the earliest (round 1's timeline), at its own chart time 8.000 s.
+- The engine may report done before 21.181 s, since it mixes ahead (with 10 ms periods and two queued, the wake at 21.160 s can render past 21.181 s). The ring-out ends at the first step at or after 21.181 s with the report in, so with aligned steps the record is saved in the step at 21.181 s and round 2's countdown begins at 21.182 s (round 1's timeline), at its own chart time 8.000 s.
 - A BGM event at 20.5 s starts during the ring-out; one at 30 s never starts.
 - A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's countdown, restored by `seek`, at full gain.
 
@@ -872,7 +872,7 @@ Each one holds the behavior D5 and D6 state.
   - completion and the close shall happen in the step at 19.681 s, not at 19.680 s;
   - `RingOut { fade_at: 20.681 s, end_at: 21.181 s }` shall be sent in that step, and the record shall be saved only after the engine reports the ring-out done;
   - the BGM event at 20.5 s shall start, no key sound of a note after the section shall start, and the BGM event at 30 s shall never start;
-  - round 2's countdown shall begin at the first step after the report, not before 21.182 s, with the long voice 3 s in.
+  - round 2's countdown shall begin at 21.182 s, with the long voice 3 s in, also when the engine reports done early with two or three queued periods (`early_done_report_waits_for_end_at`).
 - When retry is pressed during the ring-out, the ring-out shall be cut in that step and the frozen record shall still be saved (`retry_cuts_the_ring_out_and_saves`).
 - When a slow save is simulated, the ring-out's fade, stop and quit handling shall happen at the same times as with an instant save (`saving_never_delays_the_ring_out`).
 - When the engine renders a ring-out, the gain shall be 1 before `fade_at`, fall linearly per frame to 0 at `end_at` (24,000 frames at 48 kHz in D15's example), and every voice shall stop at `end_at` (`ring_out_envelope_is_on_output_frames`, `audio`).
