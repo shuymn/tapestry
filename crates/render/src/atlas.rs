@@ -111,7 +111,7 @@ pub(crate) fn glyph_uv(c: u8) -> [f32; 4] {
 /// zero-size rectangle, so every sample is white.
 #[must_use]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-pub(crate) fn solid_uv() -> [f32; 4] {
+pub fn solid_uv() -> [f32; 4] {
     let c = (SOLID as f32 + CELL as f32 / 2.0) / ATLAS_SIZE as f32;
     [c, c, c, c]
 }

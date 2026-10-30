@@ -1,7 +1,10 @@
 //! The render thread (design.md "Overall Architecture", "Rendering and Skins"):
 //! it owns the screen, readies it for each play on request and says when it is
 //! ready, draws each play from the logic step's effects and play view at the
-//! play's chart time, and draws the end screen between plays. A window target
+//! play's chart time, and draws the end screen between plays and the select
+//! screen ([`crate::menu_screen`]) on song selection. With selection the
+//! chart is not known at the start: each chosen chart is loaded on request
+//! ([`RenderMsg::Load`]) and stays until the next. A window target
 //! paces frames on the swap chain's waitable object; an offscreen one at about
 //! 60 Hz.
 //!
@@ -22,9 +25,10 @@ use eval::JudgeEvent;
 use game::{Chain, RenderSide};
 use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
-use render::{FrameInput, FrameTiming, RenderError, Renderer};
+use render::{FrameInput, FrameTiming, RenderError};
 
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
+use crate::menu_screen::MenuPage;
 use crate::tuning::LiveTuning;
 
 /// What draws: the renderer, or a double in tests.
@@ -66,50 +70,26 @@ pub trait Screen: Send {
     ///
     /// As [`draw`](Self::draw).
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError>;
+    /// Draws the select screen's `page`, laid out again when `changed`
+    /// (or when this screen has not laid it out yet). A screen that
+    /// draws no menus draws nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`draw`](Self::draw), and why the page's text cannot be prepared.
+    fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
+        let _ = (page, changed);
+        Ok(FrameTiming {
+            cpu: Duration::ZERO,
+            sprites: 0,
+            dropped: 0,
+            presented: true,
+            present_count: None,
+        })
+    }
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
-}
-
-impl Screen for Renderer {
-    fn load(&mut self, chart: &Chart) -> Result<(), RenderError> {
-        Self::load(self, chart)
-    }
-
-    fn wait(&self) -> bool {
-        self.wait_for_frame(100)
-    }
-
-    fn paced(&self) -> bool {
-        self.has_frame_waitable()
-    }
-
-    fn build(&mut self, f: &FrameInput<'_>) {
-        Self::build(self, f);
-    }
-
-    fn draw(&mut self) -> Result<FrameTiming, RenderError> {
-        self.submit()
-    }
-
-    fn statistics(&self) -> Option<FrameStatistics> {
-        self.frame_statistics()
-    }
-
-    fn presentation(&self) -> Option<Presentation> {
-        Self::presentation(self)
-    }
-
-    fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
-        self.text_frame(lines).map(|t| t.presented)
-    }
-
-    #[cfg(feature = "dev-tools")]
-    fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
-        let (w, h) = self.size();
-        let pixels = Self::read_back(self);
-        (!pixels.is_empty()).then_some((w, h, pixels))
-    }
 }
 
 /// Builds the screen on the render thread, at startup and after a failure.
@@ -130,6 +110,9 @@ pub enum ScreenError {
     /// The render thread ended before its screen was built.
     #[error("the render thread ended while starting")]
     EndedWhileStarting,
+    /// The render thread did not answer a chart's load in time.
+    #[error("the render thread did not answer")]
+    NoAnswer,
 }
 
 /// What the game thread tells the render thread.
@@ -137,6 +120,16 @@ pub enum RenderMsg {
     /// Ready the screen for a play (build it again if it failed) and
     /// answer when ready.
     Prepare(mpsc::SyncSender<Result<(), RenderError>>),
+    /// Another chart: prepare it, building the screen again if it failed,
+    /// and answer when ready. Every play draws it until the next.
+    Load {
+        /// The chart.
+        chart: Arc<Chart>,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<Result<(), RenderError>>,
+    },
+    /// Draw the select screen's page instead of a play.
+    Menu(Box<MenuPage>),
     /// A play starts: chart time 0 at the measurement's `origin` on the
     /// clock.
     Play {
@@ -170,6 +163,14 @@ pub struct View {
     /// The effect queue's capacity: the most effects one frame drains.
     pub effects: usize,
 }
+
+/// How long the game thread waits for a chart's load: the render thread
+/// answers between frames, after the skin's uploads.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the end of the render thread is waited for: past it, the thread
+/// is left to the process's exit.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the game thread waits for a play's figures. The render thread
 /// answers between frames, so this bounds only a stalled render thread: a
@@ -205,6 +206,12 @@ pub struct RenderLink {
     tx: Sender<RenderMsg>,
     shared: Arc<Shared>,
     handle: JoinHandle<()>,
+    /// Disconnects when the thread ends, however it ends.
+    ended: Receiver<()>,
+    /// How long a preparation or a chart's load is waited for.
+    answer_timeout: Duration,
+    /// How long the end of the thread is waited for.
+    exit_timeout: Duration,
 }
 
 impl RenderLink {
@@ -221,8 +228,30 @@ impl RenderLink {
     pub fn prepare(&self) -> Result<(), ScreenError> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Prepare(tx));
-        rx.recv().map_err(|_| ScreenError::Ended)??;
-        Ok(())
+        self.answer(&rx)
+    }
+
+    /// Prepares `chart` for every play from now on, and waits until it is.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen cannot be built or cannot draw the chart, and
+    /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`]; a late answer goes
+    /// nowhere.
+    pub fn load(&self, chart: Arc<Chart>) -> Result<(), ScreenError> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::Load { chart, reply });
+        self.answer(&rx)
+    }
+
+    /// The answer to a preparation or a load, waited for at most
+    /// [`LOAD_TIMEOUT`]; a late answer goes nowhere.
+    fn answer(&self, rx: &Receiver<Result<(), RenderError>>) -> Result<(), ScreenError> {
+        match rx.recv_timeout(self.answer_timeout) {
+            Ok(ready) => Ok(ready?),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
+        }
     }
 
     /// Whether a frame failed since the last preparation.
@@ -244,23 +273,44 @@ impl RenderLink {
         (t != i64::MIN).then_some(TimeUs(t))
     }
 
-    /// Ends the thread and waits for it.
-    pub fn exit(self) {
+    /// Ends the thread and waits for it at most [`EXIT_TIMEOUT`]; `false`
+    /// when it did not end, so the window it draws into must stay open.
+    pub fn exit(self) -> bool {
         self.send(RenderMsg::Exit);
-        let _ = self.handle.join();
+        match self.ended.recv_timeout(self.exit_timeout) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Detached: a thread stuck in the screen's work must not
+                // hold up the exit. The caller keeps the window open.
+                eprintln!("render: the render thread did not end");
+                false
+            }
+            _ => {
+                let _ = self.handle.join();
+                true
+            }
+        }
+    }
+
+    /// Shortens the waits (tests).
+    #[cfg(test)]
+    fn with_timeouts(mut self, answer: Duration, exit: Duration) -> Self {
+        self.answer_timeout = answer;
+        self.exit_timeout = exit;
+        self
     }
 }
 
-/// Starts the render thread; `make` builds the screen on it, and the chart is
-/// prepared before this returns, so every upload is done before the first
-/// countdown (design.md "Display Latency and Stutter").
+/// Starts the render thread; `make` builds the screen on it, and the chart,
+/// when there is one yet, is prepared before this returns, so every upload
+/// is done before the first countdown (design.md "Display Latency and
+/// Stutter"); a chart loaded later is prepared before its countdown too.
 ///
 /// # Errors
 ///
 /// Why the screen could not be built or could not draw the chart.
 pub fn spawn(
     mut make: MakeScreen,
-    chart: Arc<Chart>,
+    chart: Option<Arc<Chart>>,
     clock: QpcClock,
     view: View,
     measure: Measure,
@@ -273,12 +323,15 @@ pub fn spawn(
         first_frame: AtomicI64::new(i64::MIN),
     });
     let thread_shared = Arc::clone(&shared);
+    let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
     let handle = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
+            // Dropped when the thread ends, however it ends.
+            let _ended = ended_tx;
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
-            let screen = match build(&mut make, &chart) {
+            let screen = match build(&mut make, chart.as_deref()) {
                 Ok(screen) => {
                     let _ = ready_tx.send(Ok(()));
                     screen
@@ -297,12 +350,21 @@ pub fn spawn(
                 measure,
                 frames,
                 shared: thread_shared,
+                #[cfg(feature = "dev-tools")]
+                menu_stats: crate::dev::MenuStats::default(),
             };
             r.run(&rx);
         })
         .map_err(ScreenError::Spawn)?;
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(RenderLink { tx, shared, handle }),
+        Ok(Ok(())) => Ok(RenderLink {
+            tx,
+            shared,
+            handle,
+            ended,
+            answer_timeout: LOAD_TIMEOUT,
+            exit_timeout: EXIT_TIMEOUT,
+        }),
         Ok(Err(e)) => {
             let _ = handle.join();
             Err(e.into())
@@ -311,9 +373,11 @@ pub fn spawn(
     }
 }
 
-fn build(make: &mut MakeScreen, chart: &Chart) -> Result<Box<dyn Screen>, RenderError> {
+fn build(make: &mut MakeScreen, chart: Option<&Chart>) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make()?;
-    s.load(chart)?;
+    if let Some(chart) = chart {
+        s.load(chart)?;
+    }
     Ok(s)
 }
 
@@ -326,17 +390,25 @@ enum Mode {
         first: bool,
     },
     Text(Vec<String>),
+    /// The select screen; `changed` until its page is laid out.
+    Menu {
+        page: Box<MenuPage>,
+        changed: bool,
+    },
 }
 
 struct Run {
     screen: Option<Box<dyn Screen>>,
     make: MakeScreen,
-    chart: Arc<Chart>,
+    chart: Option<Arc<Chart>>,
     clock: QpcClock,
     view: View,
     measure: Measure,
     frames: Box<dyn FrameSink>,
     shared: Arc<Shared>,
+    /// The select screen's frames (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    menu_stats: crate::dev::MenuStats,
 }
 
 impl Run {
@@ -350,7 +422,35 @@ impl Run {
             } else {
                 rx.try_recv()
             };
+            // The select screen is left: its frames are reported.
+            #[cfg(feature = "dev-tools")]
+            if msg.is_ok() && !matches!(msg, Ok(RenderMsg::Menu(_))) {
+                self.menu_stats.report();
+            }
             match msg {
+                Ok(RenderMsg::Load { chart, reply }) => {
+                    self.chart = Some(chart);
+                    let ready = self.prepare();
+                    // A chart the screen cannot draw is refused, and the
+                    // screen it dropped is built again without it, for the
+                    // select screen; if that fails too, the failure is
+                    // reported and the game builds it through a preparation.
+                    if ready.is_err() {
+                        self.chart = None;
+                        if self.prepare().is_err() {
+                            self.shared.failed.store(true, Ordering::Release);
+                        }
+                    }
+                    let _ = reply.send(ready);
+                    mode = Mode::Idle;
+                    continue;
+                }
+                Ok(RenderMsg::Menu(page)) => {
+                    mode = Mode::Menu {
+                        page,
+                        changed: true,
+                    };
+                }
                 Ok(RenderMsg::Prepare(reply)) => {
                     let ready = self.prepare();
                     let _ = reply.send(ready);
@@ -455,6 +555,29 @@ impl Run {
                     }
                     drawn
                 }
+                Mode::Menu { page, changed } => {
+                    // A screen built again after a failure lays the page
+                    // out again.
+                    #[cfg(feature = "dev-tools")]
+                    let [_, _, _, before] = crate::alloc_count::counts();
+                    let drawn = screen.menu(page, *changed).map(|t| (t, None));
+                    #[cfg(feature = "dev-tools")]
+                    if let Ok((t, _)) = &drawn {
+                        let [_, _, _, after] = crate::alloc_count::counts();
+                        self.menu_stats.frame(t.cpu, after - before, *changed);
+                        // What a refusal put on the screen, once drawn.
+                        if *changed
+                            && let Some(notice) = page.lines.iter().find(|l| {
+                                l.style == crate::menu_screen::LineStyle::Notice
+                                    && !l.text.is_empty()
+                            })
+                        {
+                            println!("dev: drawn notice: {}", notice.text);
+                        }
+                    }
+                    *changed = false;
+                    drawn
+                }
                 Mode::Text(lines) => {
                     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
                     screen.text(&refs).map(|presented| {
@@ -473,6 +596,8 @@ impl Run {
                 Ok((timing, play)) => {
                     let d = Drawn {
                         play,
+                        #[cfg(feature = "dev-tools")]
+                        menu: matches!(mode, Mode::Menu { .. }),
                         timing,
                         statistics: screen.statistics(),
                         presentation: screen.presentation(),
@@ -505,9 +630,11 @@ impl Run {
 
     /// Resets the screen's play state, building it again after a failure.
     fn prepare(&mut self) -> Result<(), RenderError> {
-        let ready = match &mut self.screen {
-            Some(s) => s.load(&self.chart),
-            None => build(&mut self.make, &self.chart).map(|s| self.screen = Some(s)),
+        let chart = self.chart.as_deref();
+        let ready = match (&mut self.screen, chart) {
+            (Some(s), Some(chart)) => s.load(chart),
+            (Some(_), None) => Ok(()),
+            (None, _) => build(&mut self.make, chart).map(|s| self.screen = Some(s)),
         };
         if ready.is_ok() {
             self.shared.failed.store(false, Ordering::Release);
@@ -612,6 +739,229 @@ mod tests {
         }
     }
 
+    /// A menu screen, the `id`th built, whose first screen fails its third
+    /// menu frame; every menu frame notes the screen and whether its page
+    /// was new.
+    struct Menus {
+        id: u32,
+        frames: u32,
+        seen: Arc<std::sync::Mutex<Vec<(u32, bool)>>>,
+    }
+
+    impl Screen for Menus {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.frames += 1;
+            self.seen.lock().unwrap().push((self.id, changed));
+            if self.id == 1 && self.frames == 3 {
+                Err(RenderError::SurfaceLost)
+            } else {
+                Ok(timing(true))
+            }
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The select screen is drawn without a chart, its page laid out once;
+    /// a failed menu frame is reported, and after the preparation that
+    /// builds the screen again, the page selection sends again is drawn
+    /// there.
+    #[test]
+    fn a_failed_menu_frame_is_reported_and_the_page_draws_on_a_new_screen() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let builds = Arc::new(AtomicU32::new(0));
+        let (made, noted) = (Arc::clone(&builds), Arc::clone(&seen));
+        let make: MakeScreen = Box::new(move || {
+            let id = made.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Box::new(Menus {
+                id,
+                frames: 0,
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| link.failed()));
+        assert!(link.prepare().is_ok());
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&(2, false))));
+        link.exit();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(&seen[..3], [(1, true), (1, false), (1, false)]);
+        assert_eq!(seen[3], (2, true), "{seen:?}");
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A screen that cannot draw any chart; it notes its menu frames by the
+    /// number of the build that made it.
+    struct NoCharts {
+        id: u32,
+        seen: Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    impl Screen for NoCharts {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+            Err(RenderError::Skin(SkinError {
+                reason: "no lanes".to_owned(),
+            }))
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.seen.lock().unwrap().push(self.id);
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A chart the screen cannot draw is refused, and the select screen
+    /// still draws afterwards, on a screen built again without the chart:
+    /// no failure is left for the game to find.
+    #[test]
+    fn a_refused_chart_leaves_a_working_select_screen() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let builds = Arc::new(AtomicU32::new(0));
+        let (made, noted) = (Arc::clone(&builds), Arc::clone(&seen));
+        let make: MakeScreen = Box::new(move || {
+            let id = made.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Box::new(NoCharts {
+                id,
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        assert!(matches!(
+            link.load(chart),
+            Err(ScreenError::Render(RenderError::Skin(_)))
+        ));
+        assert!(!link.failed());
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| seen.lock().unwrap().contains(&2)));
+        assert!(!link.failed());
+        link.exit();
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A screen whose chart preparation blocks until `release` sends.
+    struct Blocking {
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Screen for Blocking {
+        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+            let _ = self.release.recv();
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A chart's load that blocks the render thread bounds every wait on
+    /// it: the load and a preparation give up, and the close that follows
+    /// returns, saying the thread did not end, so the window stays open.
+    #[test]
+    fn a_blocked_load_bounds_the_preparation_and_the_close() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut blocked = Some(blocked);
+        let make: MakeScreen = Box::new(move || {
+            let release = blocked.take().expect("built once");
+            Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap()
+        .with_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let started = Instant::now();
+        assert!(matches!(link.load(chart), Err(ScreenError::NoAnswer)));
+        assert!(matches!(link.prepare(), Err(ScreenError::NoAnswer)));
+        assert!(!link.exit());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The thread ends once its screen does.
+        release.send(()).unwrap();
+    }
+
     fn wait_until(f: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -698,7 +1048,7 @@ mod tests {
         let (builds, make) = factory(2, clock, &presented);
         let link = spawn(
             make,
-            chart,
+            Some(chart),
             clock,
             view(),
             measure(clock),
@@ -758,7 +1108,7 @@ mod tests {
         let (_builds, make) = factory(1, clock, &presented);
         let link = spawn(
             make,
-            Arc::new(chart.clone()),
+            Some(Arc::new(chart.clone())),
             clock,
             view(),
             measure(clock),
@@ -834,7 +1184,7 @@ mod tests {
         };
         let link = spawn(
             make,
-            Arc::new(chart.clone()),
+            Some(Arc::new(chart.clone())),
             clock,
             view,
             measure(clock),
@@ -952,7 +1302,7 @@ mod tests {
         let make: MakeScreen = Box::new(|| Ok(Box::new(Lost) as Box<dyn Screen>));
         let link = spawn(
             make,
-            Arc::new(chart.clone()),
+            Some(Arc::new(chart.clone())),
             clock,
             view(),
             measure(clock),
@@ -1081,7 +1431,7 @@ mod tests {
         };
         let link = spawn(
             make,
-            Arc::new(chart.clone()),
+            Some(Arc::new(chart.clone())),
             clock,
             view,
             measure(clock),
@@ -1208,7 +1558,7 @@ mod tests {
         }
         let link = spawn(
             make,
-            Arc::new(chart.clone()),
+            Some(Arc::new(chart.clone())),
             clock,
             view(),
             m,

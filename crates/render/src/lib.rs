@@ -28,7 +28,7 @@ mod skin;
 mod sprite;
 pub mod text;
 
-pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows};
+pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
 pub use gpu::{AdapterChoice, Gpu};
 pub use renderer::{
     FrameTiming, MAX_SPRITES, RenderError, Renderer, Target, build_frame, letterbox,

@@ -250,6 +250,9 @@ pub const IN_PLAY: &[Site] = &[
             "SeekPlan::time",
             "SeekPlan::line",
             "SeekPlan::engine",
+            "SeekPlan::chart",
+            "BgmSchedule::into_parts",
+            "BgmSchedule::from_parts",
             "SeekPlan::at",
             "SeekPlan::split",
             "SeekPlan::budget",
@@ -271,6 +274,19 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    // The play frame's calls through the screen the render thread keeps;
+    // its menu preparation runs on menus only.
+    Site::Fns(
+        "crates/player/src/menu_screen.rs",
+        &[
+            "MenuScreen::wait",
+            "MenuScreen::paced",
+            "MenuScreen::build",
+            "MenuScreen::draw",
+            "MenuScreen::statistics",
+            "MenuScreen::presentation",
+        ],
+    ),
     // The development builds' counting allocator, which every allocation
     // calls, and the render thread's app region marks.
     Site::File("crates/player/src/alloc_count.rs"),

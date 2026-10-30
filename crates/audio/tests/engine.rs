@@ -568,3 +568,105 @@ fn starts_align_across_the_ladder() {
         }
     }
 }
+
+/// Another chart's bank and BGM replace the engine's: the old ones come
+/// back to the caller, every voice stops, nothing of the new schedule
+/// starts before the next restart, and from it the new BGM plays the new
+/// bank's sound under the old id. A bank at another rate is handed back
+/// untouched.
+#[test]
+fn another_chart_replaces_the_bank_and_bgm() {
+    let old_bgm = bgm_every_half_second(0, 1);
+    let mut e = engine(&old_bgm);
+    let dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let mut out = RecordingOutput::new(dev, RATE as usize * 4);
+    let (_tx, mut rx) = queue();
+    e.restart(TimeUs(0));
+    for _ in 0..10 {
+        e.step(&mut out, &mut rx).unwrap();
+    }
+    // The old schedule still has an event to start.
+    assert!(e.bgm_left() > 0);
+    const NEW_FIRST: i16 = 7_777;
+    let new_bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        vec![
+            Sound::mono(vec![1; 10]),
+            Sound::mono((0..48).map(|i| NEW_FIRST + i).collect()),
+        ],
+    ));
+    let new_bgm = vec![BgmEvent {
+        time: TimeUs(300_000),
+        sound: CLICK,
+    }];
+    // A seek planned for the old chart's schedule.
+    let stale = audio::SeekPlan::new(
+        &e.seek_source(),
+        &old_bgm,
+        e.frame_line(),
+        TimeUs(60_000_000),
+    )
+    .unwrap();
+    let (back, back_bgm) = e
+        .replace(Arc::clone(&new_bank), audio::BgmSchedule::new(new_bgm))
+        .expect("same rate");
+    assert_eq!(e.seek(&stale), Err(audio::SeekError::Source));
+    assert_eq!(back_bgm.events(), old_bgm);
+    assert_eq!(back.stored_count(), 2);
+    assert!(Arc::ptr_eq(e.bank(), &new_bank));
+    assert_eq!((e.mixer().sounding(), e.bgm_left()), (0, 0));
+    let r = e.step(&mut out, &mut rx).unwrap();
+    assert_eq!((r.bgm_started, r.active_voices), (0, 0));
+    // From the restart, the new BGM plays the new bank's click.
+    let before = out.samples().len();
+    e.restart(r.at.unwrap());
+    assert_eq!(e.bgm_left(), 1);
+    for _ in 0..60 {
+        e.step(&mut out, &mut rx).unwrap();
+    }
+    assert_eq!(e.bgm_left(), 0);
+    let left: Vec<f32> = out.samples()[before..].iter().step_by(2).copied().collect();
+    let first = left
+        .iter()
+        .position(|&x| x != 0.0)
+        .expect("the click sounded");
+    // A mono sound is mixed at half its value to each channel; the old
+    // click would start negative.
+    let expect = f32::from(NEW_FIRST) / 32_768.0 / 2.0;
+    assert!(
+        (left[first] - expect).abs() < 0.01,
+        "{} vs {expect}",
+        left[first]
+    );
+
+    // A bank at another rate comes back as it was given.
+    let other = Arc::new(SoundBank::from_sounds(44_100, Vec::new()));
+    let (refused, refused_bgm) = e
+        .replace(Arc::clone(&other), audio::BgmSchedule::new(Vec::new()))
+        .expect_err("another rate");
+    assert!(Arc::ptr_eq(&refused, &other));
+    assert!(refused_bgm.events().is_empty());
+    assert!(Arc::ptr_eq(e.bank(), &new_bank));
+}
+
+/// A seek planned before a bank replacement is refused after it even when
+/// the schedule is the same: the plan was made against the old bank (here
+/// one without the scheduled sound, so it would park nothing and play
+/// silence where the new bank has the sound's tail), and the new chart is
+/// planned again.
+#[test]
+fn a_seek_planned_before_a_bank_replacement_is_refused() {
+    let schedule = vec![BgmEvent {
+        time: TimeUs(0),
+        sound: KEY,
+    }];
+    let empty = Arc::new(SoundBank::from_sounds(RATE, Vec::new()));
+    let mut e = AudioEngine::new(empty, &schedule, RATE, PERIOD, 64, 64).unwrap();
+    let at = TimeUs(10_000_000);
+    let stale = audio::SeekPlan::new(&e.seek_source(), &schedule, e.frame_line(), at).unwrap();
+    e.replace(bank(), audio::BgmSchedule::new(schedule.clone()))
+        .expect("same rate");
+    assert_eq!(e.seek(&stale), Err(audio::SeekError::Source));
+    let fresh = audio::SeekPlan::new(&e.seek_source(), &schedule, e.frame_line(), at).unwrap();
+    assert_eq!(e.seek(&fresh), Ok(()));
+}

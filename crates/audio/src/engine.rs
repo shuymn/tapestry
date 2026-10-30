@@ -15,7 +15,7 @@ use crate::bank::SoundBank;
 use crate::clock::MixClock;
 use crate::mixer::{InvalidVolume, Mixer};
 use crate::output::{AudioOutput, OutputError};
-use crate::seek::{FrameLine, SeekPlan, SeekSource, schedule_hash};
+use crate::seek::{BgmSchedule, FrameLine, SeekPlan, SeekSource, schedule_hash};
 
 /// A key sound to play, from the logic thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +95,9 @@ pub enum EngineError {
     },
 }
 
+/// A chart's sounds as the engine plays them: its bank and its BGM schedule.
+pub type ChartSounds = (Arc<SoundBank>, BgmSchedule);
+
 /// Why an engine did not take a [`SeekPlan`]; nothing changed, and the
 /// caller plans again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -143,6 +146,9 @@ fn output_time(origin: TimeUs, offset: TimeUs, t: TimeUs) -> TimeUs {
 pub struct AudioEngine {
     /// Which engine it is, for its seek plans.
     id: u64,
+    /// Which of its charts it plays, for its seek plans: one more at each
+    /// [`replace`](Self::replace).
+    chart: u64,
     bank: Arc<SoundBank>,
     mixer: Mixer,
     clock: MixClock,
@@ -211,6 +217,7 @@ impl AudioEngine {
         }
         Ok(Self {
             id: NEXT_ENGINE.fetch_add(1, Ordering::Relaxed),
+            chart: 0,
             bank,
             mixer: Mixer::new(voices, rate),
             clock: MixClock::new(rate, period),
@@ -301,6 +308,7 @@ impl AudioEngine {
             engine: self.id,
             bank: Arc::clone(&self.bank),
             schedule: self.bgm_hash,
+            chart: self.chart,
             voices: self.mixer.voices(),
         }
     }
@@ -351,7 +359,9 @@ impl AudioEngine {
     /// engine's is refused when planning), on a line of another rate or
     /// period, or whose frame is already written; nothing changes.
     pub fn seek(&mut self, plan: &SeekPlan) -> Result<(), SeekError> {
-        if plan.engine() != self.id {
+        // A plan of another engine, or of a chart the engine no longer plays
+        // (its bank or schedule was replaced since), is refused.
+        if plan.engine() != self.id || plan.chart() != self.chart {
             return Err(SeekError::Source);
         }
         let line = plan.line();
@@ -388,6 +398,44 @@ impl AudioEngine {
         self.mixer.stop_all();
         self.next_bgm = self.bgm.len();
         self.seek_to = None;
+    }
+
+    /// Plays another chart from here on: `bank` and `bgm` (sorted by time)
+    /// take the place of the current ones, which are returned so the caller
+    /// frees them where it may. Every voice stops and no BGM event starts
+    /// until the next [`restart`](Self::restart); the output stream and its
+    /// clock continue. Nothing is allocated or freed, and the schedule is
+    /// not walked: its hash came with it ([`BgmSchedule`]). A seek planned
+    /// for the old schedule no longer applies: a pending one is dropped,
+    /// and a later one is refused ([`SeekError::Source`]).
+    ///
+    /// # Errors
+    ///
+    /// `bank` and `bgm` themselves, untouched, when the bank was decoded at
+    /// another rate than the output's: the engine keeps what it had.
+    pub fn replace(
+        &mut self,
+        bank: Arc<SoundBank>,
+        bgm: BgmSchedule,
+    ) -> Result<ChartSounds, ChartSounds> {
+        if bank.rate() != self.bank.rate() {
+            return Err((bank, bgm));
+        }
+        self.mixer.stop_all();
+        let (events, hash) = bgm.into_parts();
+        let old_bank = std::mem::replace(&mut self.bank, bank);
+        let old_bgm = std::mem::replace(&mut self.bgm, events);
+        let old_hash = std::mem::replace(&mut self.bgm_hash, hash);
+        self.chart = self.chart.wrapping_add(1);
+        self.next_bgm = self.bgm.len();
+        self.seek_to = None;
+        Ok((old_bank, BgmSchedule::from_parts(old_bgm, old_hash)))
+    }
+
+    /// The bank key sounds and BGM play from.
+    #[must_use]
+    pub fn bank(&self) -> &Arc<SoundBank> {
+        &self.bank
     }
 
     /// Calls `f` with each scheduled start kept since the last drain, then
@@ -513,5 +561,37 @@ impl AudioEngine {
         report.active_voices = self.mixer.sounding();
         report.bgm_left = self.bgm.len() - self.next_bgm;
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bms_model::{BgmEvent, SoundId, TimeUs};
+
+    use super::AudioEngine;
+    use crate::bank::SoundBank;
+    use crate::seek::{BgmSchedule, HASHED};
+
+    /// The schedule is hashed where it is built, once; taking it in walks
+    /// none of it, however long it is.
+    #[test]
+    fn replace_does_not_hash_the_schedule() {
+        let bank = || Arc::new(SoundBank::from_sounds(48_000, Vec::new()));
+        let mut e = AudioEngine::new(bank(), &[], 48_000, 480, 4, 4).unwrap();
+        let events: Vec<BgmEvent> = (0..500_000)
+            .map(|k| BgmEvent {
+                time: TimeUs(k),
+                sound: SoundId(0),
+            })
+            .collect();
+        let before = HASHED.with(std::cell::Cell::get);
+        let schedule = BgmSchedule::new(events);
+        assert_eq!(HASHED.with(std::cell::Cell::get), before + 1);
+        let (_, old) = e.replace(bank(), schedule).unwrap();
+        assert!(old.events().is_empty());
+        assert_eq!(HASHED.with(std::cell::Cell::get), before + 1);
+        assert_eq!(e.bgm_left(), 0);
     }
 }

@@ -49,7 +49,8 @@ pub use bank::{
 };
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use engine::{
-    AudioEngine, EngineError, Scheduled, ScheduledKind, SeekError, SoundCmd, StepReport,
+    AudioEngine, ChartSounds, EngineError, Scheduled, ScheduledKind, SeekError, SoundCmd,
+    StepReport,
 };
 pub use mixer::{
     HEADROOM, InvalidVolume, MAX_PENDING_STARTS, MAX_VOICES, MAX_VOLUME, Mixer, SOFT_CLIP_KNEE,
@@ -57,7 +58,7 @@ pub use mixer::{
 };
 pub use output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, RecordingOutput, Wake};
 pub use run::{RunReport, run_audio};
-pub use seek::{FrameLine, SeekPlan, SeekSource};
+pub use seek::{BgmSchedule, FrameLine, SeekPlan, SeekSource};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
 #[cfg(windows)]
 pub use wasapi::{
