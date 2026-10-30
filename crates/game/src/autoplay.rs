@@ -47,12 +47,15 @@ pub enum AutoplayError {
     Time(#[from] TimeOverflow),
 }
 
-/// The key sounds of a lane autoplay plays: one per pressed note with a
-/// sound, at the note's time.
-fn lane_sounds(notes: &[Note]) -> impl Iterator<Item = (TimeUs, SoundId)> + '_ {
+/// The key sounds of a lane autoplay plays, of the notes `keep` keeps: one
+/// per pressed note with a sound, at the note's time.
+fn lane_sounds<'c>(
+    notes: &'c [Note],
+    keep: &'c impl Fn(&Note) -> bool,
+) -> impl Iterator<Item = (TimeUs, SoundId)> + 'c {
     notes
         .iter()
-        .filter(|n| !matches!(n.kind, NoteKind::Mine { .. }))
+        .filter(|n| !matches!(n.kind, NoteKind::Mine { .. }) && keep(n))
         .filter_map(|n| n.sound.map(|s| (n.time, s)))
 }
 
@@ -61,10 +64,15 @@ fn lane_sounds(notes: &[Note]) -> impl Iterator<Item = (TimeUs, SoundId)> + '_ {
 /// lane.
 #[must_use]
 pub fn schedule_len(chart: &Chart) -> usize {
+    schedule_len_where(chart, |_| true)
+}
+
+/// How many entries [`schedule_where`] makes.
+pub(crate) fn schedule_len_where(chart: &Chart, keep: impl Fn(&Note) -> bool) -> usize {
     chart
         .lanes
         .iter()
-        .map(|notes| lane_sounds(notes).count())
+        .map(|notes| lane_sounds(notes, &keep).count())
         .fold(chart.bgm.len(), usize::saturating_add)
 }
 
@@ -76,8 +84,17 @@ pub fn schedule_len(chart: &Chart) -> usize {
 /// entries, without sorting.
 #[must_use]
 pub fn schedule(chart: &Chart) -> Vec<BgmEvent> {
-    let mut out = Vec::with_capacity(schedule_len(chart));
-    let mut lanes = chart.lanes.each_ref().map(|notes| lane_sounds(notes));
+    schedule_where(chart, |_| true)
+}
+
+/// [`schedule`] with the key sounds of the notes `keep` keeps only, in a
+/// vector of exactly [`schedule_len_where`] entries.
+pub(crate) fn schedule_where(chart: &Chart, keep: impl Fn(&Note) -> bool) -> Vec<BgmEvent> {
+    let mut out = Vec::with_capacity(schedule_len_where(chart, &keep));
+    let mut lanes = chart
+        .lanes
+        .each_ref()
+        .map(|notes| lane_sounds(notes, &keep));
     let mut heads: [Option<(TimeUs, SoundId)>; LANE_COUNT] = [None; LANE_COUNT];
     for (head, lane) in heads.iter_mut().zip(&mut lanes) {
         *head = lane.next();

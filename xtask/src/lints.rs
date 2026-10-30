@@ -211,6 +211,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::screen_failed",
             "PlayerRig::cancel_audio",
             "PlayerRig::seal_audio",
+            "PlayerRig::ring_out",
             "PlayerRig::audio_done",
             "PlayerRig::input_failure",
         ],

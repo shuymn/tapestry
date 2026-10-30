@@ -279,6 +279,10 @@ impl Rig for AutoRig {
         self.sealed = true;
     }
 
+    fn ring_out(&mut self, _fade_at: TimeUs, _end_at: TimeUs) {
+        panic!("this rig plays no practice round");
+    }
+
     fn audio_done(&self) -> bool {
         self.sealed
     }
