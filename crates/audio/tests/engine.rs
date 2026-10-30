@@ -1,11 +1,14 @@
 //! The engine against a simulated device: key sounds at the first unwritten
-//! frame, BGM on the QPC timeline under drift, jitter, underruns and resume.
+//! frame, BGM on the QPC timeline under drift, jitter, underruns and resume;
+//! banks at every practice speed.
+
+mod common;
 
 use std::sync::Arc;
 
 use audio::{
-    AudioEngine, AudioOutput, EngineError, RecordingOutput, Resume, Scheduled, ScheduledKind,
-    SimConfig, SimDevice, Sound, SoundBank, SoundCmd,
+    AudioEngine, AudioOutput, BankLimits, EngineError, RecordingOutput, Resume, Scheduled,
+    ScheduledKind, SimConfig, SimDevice, Sound, SoundBank, SoundCmd, Speed, load_bank_at,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::{Producer, RingBuffer};
@@ -488,4 +491,76 @@ fn a_priming_wake_fills_silence_and_leaves_timing_to_the_first_timed_wake() {
     let r = e.step(&mut out, &mut rx).unwrap();
     assert_eq!((r.frames, r.commands, r.bgm_started), (480, 1, 1));
     assert!(e.clock().time_at(0).is_some());
+}
+
+/// A bank holding one 10 ms 44.1 kHz click converted for `RATE` at `speed`.
+fn click_bank_at(speed: Speed) -> SoundBank {
+    let dir = common::tmp();
+    let path = common::put(
+        dir.path(),
+        "click.wav",
+        &common::wav(44_100, 1, &common::ramp(441, -9_000, 41)),
+    );
+    load_bank_at(
+        &common::chart_of(&[Some(path)]),
+        RATE,
+        speed,
+        &BankLimits::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn engine_accepts_a_bank_at_any_speed() {
+    for speed in Speed::ladder() {
+        let k = speed.twentieths();
+        let bank = click_bank_at(speed);
+        // The bank stays at the device rate; only its sound lengths change:
+        // 480 device frames become floor(480 × 20/k).
+        assert_eq!((bank.rate(), bank.speed()), (RATE, speed));
+        let frames = bank.get(SoundId(0)).unwrap().frames();
+        assert_eq!(frames, 480 * 20 / u64::from(k));
+        let bgm = [BgmEvent {
+            time: TimeUs(0),
+            sound: SoundId(0),
+        }];
+        let mut e = AudioEngine::new(Arc::new(bank), &bgm, RATE, PERIOD, 4, 4).unwrap();
+        let mut dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+        // The click starts and, 20 ms at most later, has played out.
+        let starts = run(&mut e, &mut dev, TimeUs(100_000));
+        assert_eq!(starts.len(), 1, "speed {k}");
+        assert_eq!(e.mixer().sounding(), 0, "speed {k}");
+    }
+}
+
+#[test]
+fn starts_align_across_the_ladder() {
+    // Exact chart times mapped as the loader maps them, floor(t × 20/k),
+    // started after a retry's origin: each start frame lies within one
+    // frame of t × rate / 1 000 000 after the origin's frame.
+    let exact = [1_000_000i64, 1_234_567, 2_500_001, 7_777_777];
+    let origin = TimeUs(500_000);
+    for speed in Speed::ladder() {
+        let k = i64::from(speed.twentieths());
+        let mapped: Vec<i64> = exact.iter().map(|t| t * 20 / k).collect();
+        let bgm: Vec<BgmEvent> = mapped
+            .iter()
+            .map(|&t| BgmEvent {
+                time: TimeUs(t),
+                sound: SoundId(0),
+            })
+            .collect();
+        let bank = Arc::new(click_bank_at(speed));
+        let mut e = AudioEngine::new(bank, &bgm, RATE, PERIOD, 8, 64).unwrap();
+        let mut dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+        e.restart(origin);
+        let starts = run(&mut e, &mut dev, TimeUs(origin.0 + 16_000_000));
+        assert_eq!(starts.len(), mapped.len(), "speed {k}");
+        let origin_frame = e.clock().frame_at(origin).unwrap() as i64;
+        for (s, &t) in starts.iter().zip(&mapped) {
+            let want = t * i64::from(RATE) / 1_000_000;
+            let got = s.frame as i64 - origin_frame;
+            assert!((got - want).abs() <= 1, "speed {k}: {got} vs {want}");
+        }
+    }
 }
