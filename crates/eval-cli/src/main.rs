@@ -360,7 +360,8 @@ fn read_preset(arg: &Path) -> Result<RulePreset, String> {
 /// Writes the built-in `name` to a new user preset file at `path`, named by
 /// its stem (design.md "User Presets"). Nothing is written when the name
 /// is not a built-in's, the stem cannot name a user preset, or the file
-/// exists; a write that fails partway removes the file it created.
+/// exists. The text is made in full before the file is created; a write
+/// that fails after that leaves the file as far as it got, and says so.
 fn export(name: &str, path: &Path) -> Result<(), String> {
     let preset = rules::built_in(name).ok_or_else(|| {
         format!(
@@ -378,14 +379,11 @@ fn export(name: &str, path: &Path) -> Result<(), String> {
         .create_new(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    let written = file
-        .write_all(text.as_bytes())
-        .and_then(|()| file.sync_all());
-    drop(file);
-    written.map_err(|e| {
-        let _ = fs::remove_file(path);
-        e.to_string()
-    })
+    // The file is never removed after this: once created it may be replaced
+    // by another process, whose file a removal would delete.
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("{e}; the file may be partly written"))
 }
 
 /// Everything in `path` up to one byte past `limit`; a larger file comes

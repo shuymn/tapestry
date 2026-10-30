@@ -95,6 +95,9 @@ pub enum PresetFileCause {
         "the file is larger than {MAX_PRESET_FILE_BYTES} bytes, the largest preset file accepted"
     )]
     TooLarge,
+    /// The path is a symbolic link, not a file.
+    #[error("the path is a symbolic link; a preset file must be a file itself")]
+    Link,
     /// The file is not UTF-8 text.
     #[error("the file is not UTF-8 text")]
     NotUtf8,
@@ -149,8 +152,8 @@ pub fn user_preset_name(path: &Path) -> Result<&str, NameError> {
 /// # Errors
 ///
 /// The file and why it cannot be used: its stem is not a user preset's
-/// name, it cannot be read, it is too large or not UTF-8, or its text is
-/// not a valid preset.
+/// name, the path is a symbolic link, it cannot be read, it is too large or
+/// not UTF-8, or its text is not a valid preset.
 pub fn read_preset_file(path: &Path) -> Result<(RulePreset, Option<SystemTime>), PresetFileError> {
     let error = |cause| PresetFileError {
         path: path.to_owned(),
@@ -159,7 +162,17 @@ pub fn read_preset_file(path: &Path) -> Result<(RulePreset, Option<SystemTime>),
     let name =
         user_preset_name(path).map_err(|e| error(PresetFileCause::Preset(PresetError::Name(e))))?;
     let io = |e: io::Error| error(PresetFileCause::Io(e.kind()));
+    // A link could read a file outside the folder, and its target's changes
+    // would not show in the link's own modification time: the path itself
+    // must be a file, before the open and still after it.
+    let not_link = || match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(error(PresetFileCause::Link)),
+        Ok(_) => Ok(()),
+        Err(e) => Err(io(e)),
+    };
+    not_link()?;
     let file = fs::File::open(path).map_err(io)?;
+    not_link()?;
     let modified = file.metadata().and_then(|m| m.modified()).ok();
     let limit = u64::try_from(MAX_PRESET_FILE_BYTES).unwrap_or(u64::MAX);
     let mut bytes = Vec::new();

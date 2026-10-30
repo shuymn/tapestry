@@ -52,7 +52,8 @@ pub enum ShelfError {
 /// What a check found for the chosen user preset.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresetChange {
-    /// Its file changed and loaded: the chosen preset is the new one.
+    /// Its file changed and loaded to other rules, or loaded again after a
+    /// failure: the chosen preset is the loaded one.
     Reloaded,
     /// Its file changed, or went away, and does not load: the previous
     /// preset stays chosen.
@@ -212,8 +213,11 @@ impl Shelf {
             }
         }
         let user = self.users.get(chosen?)?;
+        // Loading again after a failure is a change even with the rules
+        // unchanged, so the failure shown can be cleared.
+        let recovered = before.is_some() && user.error.is_none();
         if let Some(p) = &user.preset
-            && *p != self.current
+            && (*p != self.current || recovered)
         {
             self.current = p.clone();
             return Some(PresetChange::Reloaded);
@@ -298,11 +302,13 @@ fn list(dir: &Path) -> Result<Vec<Listed>, io::ErrorKind> {
         let Some(stem) = path.file_stem() else {
             continue;
         };
-        let metadata = entry.metadata().ok();
-        if !is_toml || metadata.as_ref().is_some_and(|m| m.is_dir()) {
+        // The entry's own type and time, never a link's target's: a link is
+        // listed, and its read refuses it naming the file.
+        let file_type = entry.file_type().ok();
+        if !is_toml || file_type.is_some_and(|t| t.is_dir()) {
             continue;
         }
-        let modified = metadata.and_then(|m| m.modified().ok());
+        let modified = fs::symlink_metadata(&path).and_then(|m| m.modified()).ok();
         files.push((stem.to_string_lossy().into_owned(), path, modified));
     }
     Ok(files)

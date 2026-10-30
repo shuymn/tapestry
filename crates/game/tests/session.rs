@@ -2165,3 +2165,65 @@ fn under_checks_the_evaluator_version_first() {
         );
     }
 }
+
+/// The chosen preset fails to load and is then restored to the same rules:
+/// the restore is reported, so the failure shown can be cleared.
+#[test]
+fn a_restored_preset_is_reported_after_a_failure() {
+    let (_dir, root) = temp_root();
+    let path = write_user_preset(&root, "mine", &rules::tapestry());
+    let mut shelf = game::Shelf::open(root.presets(), "mine").unwrap();
+    rewrite(&path, "windows = [");
+    assert!(matches!(
+        shelf.check(),
+        Some(game::PresetChange::Failed(PresetFileError { .. }))
+    ));
+    assert_eq!(shelf.check(), None, "reported once");
+    rewrite(&path, &preset_to_toml(&rules::tapestry()));
+    assert_eq!(shelf.check(), Some(game::PresetChange::Reloaded));
+    assert_eq!(shelf.chosen(), &named("mine", rules::tapestry()));
+    assert_eq!(shelf.check(), None);
+}
+
+/// A user preset that is a symbolic link is refused naming the file, both
+/// as the chosen preset and in the shelf's list, so no preset is read from
+/// outside the folder. Creating the link needs the right to make symbolic
+/// links (on Windows, Developer Mode); without it the test says so and
+/// checks nothing.
+#[test]
+fn user_preset_links_are_refused() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.presets()).unwrap();
+    let outside = root.path().join("outside.toml");
+    fs::write(&outside, preset_to_toml(&rules::tapestry())).unwrap();
+    let link = user_preset_path(&root, "mine");
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(&outside, &link);
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&outside, &link);
+    if let Err(e) = made {
+        println!("skipped: a symbolic link cannot be made here ({e})");
+        return;
+    }
+    let refused = PresetFileError {
+        path: link.clone(),
+        cause: PresetFileCause::Link,
+    };
+    assert_eq!(
+        rules_toml::read_preset_file(&link).unwrap_err(),
+        refused.clone()
+    );
+    assert_eq!(
+        load_named(&root, "mine").map(|_| ()),
+        Err(SessionError::Preset(ShelfError::Preset(refused.clone())))
+    );
+    let loaded = load_named(&root, "tapestry").unwrap();
+    let entry = loaded
+        .shelf()
+        .entries()
+        .into_iter()
+        .find(|e| e.name == "mine")
+        .unwrap();
+    assert_eq!(entry.error, Some(&refused));
+    assert_eq!(entry.preset, None);
+}
