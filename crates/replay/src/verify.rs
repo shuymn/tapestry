@@ -17,8 +17,10 @@ use std::path::Path;
 
 use bms_model::{Chart, TimeUs};
 use bms_parser::{LOADER_VERSION, LoadError, LoadOptions};
-use eval::{EvalError, EvalInput, Evaluation, Evaluator, Section, evaluation_time};
-use rules::{CanonicalError, GaugeKind, GaugeRule, GaugeValue, Implementation, RulePreset};
+use eval::{
+    EvalError, EvalInput, Evaluation, Evaluator, Section, accepts_initial, evaluation_time,
+};
+use rules::{CanonicalError, Implementation, RulePreset};
 
 use crate::{EndStatus, PASSTHROUGH, PlayRecord, preset_hash};
 
@@ -92,9 +94,8 @@ pub struct ReEvaluation {
 /// The section a practice record's input is evaluated in under `preset`,
 /// and which of the preset's gauges start at its start value: each gauge
 /// starts at the value the record holds for its ID, unless the record has
-/// none or the gauge does not accept it (outside its bounds, or 0 or less
-/// on a survival gauge), as a preset's own start must be; then at its start
-/// value. `None` for a full play.
+/// none or the gauge does not accept it ([`eval::accepts_initial`]); then at
+/// its start value. `None` for a full play.
 fn practice_section(record: &PlayRecord, preset: &RulePreset) -> Option<(Section, Vec<bool>)> {
     let practice = record.play_type.practice()?;
     let (initial_gauges, started_at_default) = preset
@@ -106,7 +107,7 @@ fn practice_section(record: &PlayRecord, preset: &RulePreset) -> Option<(Section
                 .iter()
                 .find(|g| g.id == rule.id)
                 .map(|g| g.value)
-                .filter(|&v| accepts(rule, v))
+                .filter(|&v| accepts_initial(rule, v))
                 .map_or((rule.start, true), |v| (v, false))
         })
         .unzip();
@@ -117,18 +118,6 @@ fn practice_section(record: &PlayRecord, preset: &RulePreset) -> Option<(Section
         initial_gauges,
     };
     Some((section, started_at_default))
-}
-
-/// Whether `rule`'s gauge can start at `v`, as the evaluator takes a
-/// section's initial gauges (design.md "Section Evaluation"): within its
-/// bounds, and for a survival gauge above 0 and not below the value it
-/// fails under.
-fn accepts(rule: &GaugeRule, v: GaugeValue) -> bool {
-    (rule.min..=rule.max).contains(&v)
-        && match rule.kind {
-            GaugeKind::EndThreshold { .. } => true,
-            GaugeKind::Survival { fails_below } => v > GaugeValue::EMPTY && v >= fails_below,
-        }
 }
 
 /// Checks the record's evaluator version, then decodes its preset copy.
