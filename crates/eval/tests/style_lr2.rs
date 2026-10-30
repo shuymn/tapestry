@@ -9,6 +9,20 @@
 //!
 //! Window values are at `#RANK 3` (100 %): PERFECT ±21, GREAT ±60, GOOD
 //! ±120 and BAD ±200 ms (`play/JudgeProperty.java:54-55`).
+//!
+//! # Known differences
+//!
+//! - **An ineligible head drops the earlier candidate there.** Endless
+//!   Dream makes a late BAD LN head ineligible by giving it judge 6
+//!   (`play/JudgeManager.java:435-437`), which reuses beatoraja's existing
+//!   "no judgment here" branch, and that branch also resets the candidate
+//!   the scan had already taken (`:445-452`). The rule only says a late BAD
+//!   head cannot be taken, and LR2 judges the oldest note, so here the
+//!   earlier candidate stays the primary. With a tap at 0 ms and a long
+//!   note from 30 ms on one lane, a press at 190 ms is BAD on the tap here
+//!   and the head is missed at 230 ms; there the press judges nothing, the
+//!   tap is missed at 200 ms and the head at 230 ms
+//!   (`late_bad_ln_head_is_not_selectable`).
 
 mod common;
 
@@ -131,15 +145,22 @@ fn late_bad_ln_head_is_not_selectable() {
         );
     }
     // A tap at 0 ms and a long note from 30 ms, pressed at 190 ms: the head
-    // (160 ms late) is not the primary, which stays before it, and the head
-    // is missed at its own deadline, 230 ms.
+    // (160 ms late) is not the primary, which stays the tap, BAD at the
+    // press, and the head is missed at its own deadline, 230 ms. Endless
+    // Dream drops the tap too (a known difference, in the module docs).
     let before = chart(|b| {
         b.tap(lane(1), TimeUs(T))
             .long(lane(1), TimeUs(T + 30 * MS), TimeUs(T + 80 * MS))
     });
-    let e = play_with(&before, &preset(), hold_at(T + 190 * MS, 10));
-    let head: Vec<_> = judged(&e).into_iter().filter(|j| j.1 == 1).collect();
-    assert_eq!(head, [(T + 30 * MS + MISSED, 1, Poor, None)]);
+    let at = T + 190 * MS;
+    let e = play_with(&before, &preset(), hold_at(at, 10));
+    assert_eq!(
+        judged(&e),
+        [
+            (at, 0, Bad, Some(190 * MS)),
+            (T + 30 * MS + MISSED, 1, Poor, None)
+        ]
+    );
 }
 
 /// G. A BAD long-note head decides its long note at the press, also under
