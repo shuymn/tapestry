@@ -12,10 +12,10 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use rules::{
     Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
-    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
-    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
-    RankScale, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode,
-    Window, WindowPolicy,
+    GaugeRule, GaugeValue, HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable,
+    LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment,
+    PerLaneClass, RankScale, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection,
+    TotalMode, Window, WindowPolicy,
 };
 
 const FULL: i64 = GaugeValue::FULL.0;
@@ -265,6 +265,10 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                 Just(Assignment::NearestTiesEarlier),
                 Just(Assignment::ComboPriority)
             ],
+            prop_oneof![
+                Just(HeadEligibility::InsideBad),
+                Just(HeadEligibility::NotLateBad)
+            ],
         ),
         prop_oneof![
             prop_oneof![1_i64..64, 1_i64..=i64::MAX]
@@ -280,7 +284,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
             |(
                 (id, version, keys, scratch),
                 [breaks_combo, counts_bp, counted],
-                (headers, window_policy, assignment),
+                (headers, window_policy, assignment, head_eligibility),
                 default_total,
                 gauges,
                 (ex, breaks_combo_by, counts_bp_by),
@@ -314,6 +318,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                     ln_mode: LnModeRule {
                         default: LnMode::Ln,
                         late_head: LateHeadRule::CompletesAtPress,
+                        head_eligibility,
                     },
                     total_mode: TotalMode::ScalesIncrease,
                     mine: MineRule::WhileHeld {
@@ -340,7 +345,7 @@ proptest! {
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 29];
+    let mut counts = [0_usize; 31];
     // Per boolean field, whether it was seen false and true.
     let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
@@ -397,6 +402,8 @@ fn generator_reaches_every_variant_and_length_class() {
             p.headers == HeaderPolicy::DefExRankFirst,
             p.assignment == Assignment::NearestTiesEarlier,
             p.assignment == Assignment::ComboPriority,
+            p.ln_mode.head_eligibility == HeadEligibility::InsideBad,
+            p.ln_mode.head_eligibility == HeadEligibility::NotLateBad,
         ];
         for (count, hit) in counts.iter_mut().zip(reached) {
             *count += usize::from(hit);

@@ -155,6 +155,27 @@ fn every_gauge_policy_round_trips() {
 }
 
 #[test]
+fn head_eligibility_reads_back_and_is_required() {
+    let text = preset_to_toml(&rules::custom());
+    let inside = "head_eligibility = \"inside_bad\"\n";
+    assert_eq!(text.matches(inside).count(), 1, "{text}");
+    let p = load_preset_toml(&text.replacen(inside, "head_eligibility = \"not_late_bad\"\n", 1))
+        .unwrap();
+    assert_eq!(
+        p.ln_mode.head_eligibility,
+        rules::HeadEligibility::NotLateBad
+    );
+    assert_eq!(load_preset_toml(&preset_to_toml(&p)), Ok(p));
+    // A file from before the LN head eligibility has no such key.
+    let e = load_preset_toml(&text.replacen(inside, "", 1)).unwrap_err();
+    assert!(
+        matches!(&e, PresetError::Parse(m) if m.message().contains("head_eligibility")),
+        "{e}"
+    );
+    assert!(e.to_string().contains("older version"), "{e}");
+}
+
+#[test]
 fn the_largest_generated_presets_fit_the_file_limit() {
     let mut p = rules::custom();
     // Ids of 136 characters that TOML escapes, the longest the property
