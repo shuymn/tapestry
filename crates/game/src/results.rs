@@ -112,16 +112,15 @@ fn check_evaluator(rec: &PlayRecord) -> Result<(), ReEvaluationError> {
 impl ResultExtension for ReEvaluate {
     fn on_play_end(&mut self, ctx: &ResultContext<'_>) -> ResultSummary {
         let rec = ctx.record;
-        // The evaluator version first: a record of another version is
-        // refused whatever preset it names. The preset the play ran under
-        // is the record's, so another one is a mismatch, not a what-if.
-        let evaluation = check_evaluator(rec).and_then(|()| {
-            if replay::preset_hash(ctx.preset) == rec.preset.sha256 {
-                Self::under(ctx, ctx.preset).map(|r| r.evaluation)
-            } else {
-                Err(ReEvaluationError::PresetMismatch)
-            }
-        });
+        // The preset the play ran under is the record's, so another one is
+        // a mismatch, not a what-if. The evaluator version still comes
+        // first: `under` checks it, and a record of another version is
+        // refused whatever preset it names.
+        let evaluation = if replay::preset_hash(ctx.preset) == rec.preset.sha256 {
+            Self::under(ctx, ctx.preset).map(|r| r.evaluation)
+        } else {
+            check_evaluator(rec).and(Err(ReEvaluationError::PresetMismatch))
+        };
         ResultSummary {
             matches_live: evaluation.as_ref().is_ok_and(|e| e.events == ctx.live),
             recommended_offset: evaluation.as_ref().ok().and_then(|e| recommend(&e.events)),
