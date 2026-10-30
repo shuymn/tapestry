@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [bms_load, replay_file, replay_body, raw_input]
+        target: [bms_load, replay_file, replay_body, raw_input, preset_canonical]
     env:
       TAPESTRY_NIX_SHELL: fuzz
       # 60 s on pull requests, which only check this workflow. format() keeps a

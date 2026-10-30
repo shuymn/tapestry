@@ -5,8 +5,9 @@
 use std::path::Path;
 
 use replay::{DecodeError, DecodeLimits, Section};
+use rules::{CanonicalError, RuleError};
 
-use crate::{RawSummary, bms_load, raw_input, replay_body, replay_file, seeds};
+use crate::{RawSummary, bms_load, preset_canonical, raw_input, replay_body, replay_file, seeds};
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
 /// fails the test instead of going unchecked.
@@ -144,6 +145,46 @@ fn raw_input_seeds_reach_packets_reports_and_early_stops() {
         assert_eq!(raw_input(&data), expected, "{name}");
     }
     assert_eq!(raw_input(&[]), RawSummary::default());
+}
+
+#[test]
+fn preset_canonical_seeds_decode_or_fail_as_built() {
+    let seeds = seeds::preset_canonicals();
+    assert_names(
+        &seeds,
+        &[
+            "custom",
+            "long",
+            "other_version",
+            "non_minimal_varint",
+            "count_beyond_data",
+            "unknown_tag",
+            "trailing_bytes",
+            "truncated",
+            "invalid",
+        ],
+    );
+    for (name, bytes) in seeds {
+        let result = preset_canonical(&bytes).map(|_| ());
+        let expected = match name {
+            "custom" | "long" => Ok(()),
+            "other_version" => Err(CanonicalError::UnsupportedVersion(5)),
+            "non_minimal_varint" => Err(CanonicalError::NonMinimalVarint),
+            "count_beyond_data" => Err(CanonicalError::CountBeyondData {
+                field: "gauges",
+                count: 16_383,
+            }),
+            "unknown_tag" => Err(CanonicalError::UnknownTag {
+                field: "gauge kind",
+                tag: 2,
+            }),
+            "trailing_bytes" => Err(CanonicalError::TrailingBytes(1)),
+            "truncated" => Err(CanonicalError::Truncated),
+            "invalid" => Err(CanonicalError::Invalid(RuleError::NoGauges)),
+            _ => panic!("no expectation for seed {name}"),
+        };
+        assert_eq!(result, expected, "{name}");
+    }
 }
 
 #[test]

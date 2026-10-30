@@ -25,6 +25,7 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("replay_file", replay_files()),
         ("replay_body", replay_bodies()),
         ("raw_input", raw_inputs()),
+        ("preset_canonical", preset_canonicals()),
     ]
 }
 
@@ -409,4 +410,80 @@ pub fn raw_inputs() -> Vec<Seed> {
         // Five blocks asked for, two present.
         ("count_beyond", buffer(5, &[press.clone(), press])),
     ]
+}
+
+/// Where `bytes`, [`rules::custom`]'s, hold the gauge count: the first byte
+/// that differs from the same preset's without gauges.
+fn gauge_count_at(bytes: &[u8]) -> usize {
+    let mut empty = rules::custom();
+    empty.gauges.clear();
+    bytes
+        .iter()
+        .zip(empty.canonical_bytes())
+        .position(|(&a, b)| a != b)
+        .expect("the gauges change the bytes")
+}
+
+/// `preset_canonical` seeds: valid presets, then one malformed input per
+/// refusal the smoke tests expect.
+#[must_use]
+pub fn preset_canonicals() -> Vec<Seed> {
+    let custom = rules::custom();
+    let bytes = custom.canonical_bytes();
+    // Strings and a gauge list whose lengths take two varint bytes.
+    let mut long = custom.clone();
+    long.id = "p".repeat(200);
+    let gauge = long.gauges[1].clone();
+    long.gauges = (0..130)
+        .map(|i| rules::GaugeRule {
+            id: format!("{}{i}", "g".repeat(130)),
+            ..gauge.clone()
+        })
+        .collect();
+    let mut seeds: Vec<Seed> = vec![("custom", bytes.clone()), ("long", long.canonical_bytes())];
+
+    let edited = |edit: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = bytes.clone();
+        edit(&mut b);
+        b
+    };
+    seeds.push(("other_version", edited(&|b| b[0] += 1)));
+    // The version with a redundant zero byte.
+    seeds.push((
+        "non_minimal_varint",
+        edited(&|b| {
+            b[0] |= 0x80;
+            b.insert(1, 0);
+        }),
+    ));
+    // 16383 gauges, more than the bytes left.
+    let count_at = gauge_count_at(&bytes);
+    assert!(
+        bytes.len() - count_at < 16_383,
+        "the custom preset is short"
+    );
+    seeds.push((
+        "count_beyond_data",
+        edited(&|b| {
+            b.splice(count_at..=count_at, [0xff, 0x7f]);
+        }),
+    ));
+    // The first gauge's kind, after the count and its id, is tag 2.
+    let id = &custom.gauges[0].id;
+    assert!(
+        id.len() < 128 && custom.gauges.len() < 128,
+        "one-byte lengths"
+    );
+    seeds.push(("unknown_tag", edited(&|b| b[count_at + 2 + id.len()] = 2)));
+    seeds.push(("trailing_bytes", edited(&|b| b.push(0))));
+    seeds.push((
+        "truncated",
+        edited(&|b| {
+            b.pop();
+        }),
+    ));
+    let mut no_gauges = custom;
+    no_gauges.gauges.clear();
+    seeds.push(("invalid", no_gauges.canonical_bytes()));
+    seeds
 }

@@ -17,6 +17,7 @@ use std::time::Duration;
 use bms_parser::{LoadError, LoadOptions, Loaded};
 use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
+use rules::{CanonicalError, RulePreset};
 
 /// An empty folder for the chart's sounds. Nothing is written to it, so
 /// every `#WAV` name resolves to no file.
@@ -92,6 +93,27 @@ pub fn replay_body(body: &[u8]) -> Result<PlayRecord, DecodeError> {
         assert!(
             replay::body_bytes(rec) == body,
             "a decoded body differs from the canonical body of its record"
+        );
+    }
+    decoded
+}
+
+/// Target `preset_canonical`: a preset's canonical bytes.
+///
+/// # Errors
+///
+/// What [`RulePreset::from_canonical_bytes`] refuses.
+///
+/// # Panics
+///
+/// If bytes decode but the preset's canonical bytes differ from them: the
+/// decoder must accept only the encoder's output.
+pub fn preset_canonical(data: &[u8]) -> Result<RulePreset, CanonicalError> {
+    let decoded = RulePreset::from_canonical_bytes(data);
+    if let Ok(preset) = &decoded {
+        assert!(
+            preset.canonical_bytes() == data,
+            "decoded bytes differ from the canonical bytes of their preset"
         );
     }
     decoded
