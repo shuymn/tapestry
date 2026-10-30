@@ -158,7 +158,50 @@ fn search_is_literal_for_punctuation_quotes_and_wildcards() {
         assert_eq!(found(&lib, query), titles(expected), "query {query}");
     }
     assert_eq!(found(&lib, "").len(), all.len(), "an empty query finds all");
-    assert_eq!(found(&lib, "a\u{1F}b"), Vec::<String>::new());
+}
+
+#[test]
+fn control_characters_are_dropped_from_headers_and_queries() {
+    let fx = Fixture::new();
+    fx.chart("0.bms", &["TITLE head\0tail"]);
+    fx.chart("1.bms", &["TITLE ab"]);
+    fx.chart("2.bms", &["TITLE other"]);
+    let lib = fx.scanned();
+    // A header's NUL is dropped: text on both sides of it is found, short
+    // or long, and so is text across it.
+    for query in ["tail", "ta", "l", "dtai", "head"] {
+        assert_eq!(
+            found(&lib, query),
+            titles(&["head\0tail"]),
+            "query {query:?}"
+        );
+    }
+    // A query's control characters are dropped too: one of nothing else
+    // finds every chart, and one with text finds that text.
+    for query in ["\0", "\0\u{1F}\n"] {
+        assert_eq!(found(&lib, query).len(), 3, "query {query:?}");
+    }
+    for query in ["a\0b", "a\u{1F}b", "\0ab\0"] {
+        assert_eq!(found(&lib, query), titles(&["ab"]), "query {query:?}");
+    }
+    assert_eq!(found(&lib, "he\0ad\0ta"), titles(&["head\0tail"]));
+}
+
+#[test]
+fn long_query_requires_exact_containment() {
+    let fx = Fixture::new();
+    // The trigram tokenizer reads U+FFFE as U+FFFD; these sort first.
+    for i in 0..3 {
+        fx.chart(&format!("{i}.bms"), &["TITLE a\u{FFFD}b"]);
+    }
+    fx.chart("9.bms", &["TITLE xa\u{FFFE}by"]);
+    let lib = fx.scanned();
+    assert_eq!(found(&lib, "a\u{FFFE}b"), titles(&["xa\u{FFFE}by"]));
+    // The limit counts only exact matches.
+    let first = search_limited(&lib, "a\u{FFFE}b", Sort::Title, false, 1);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].header.title.as_deref(), Some("xa\u{FFFE}by"));
+    assert_eq!(found(&lib, "a\u{FFFD}b").len(), 3);
 }
 
 #[test]
@@ -221,11 +264,19 @@ fn sort_by_level_numbers_then_text_then_none() {
     let star = fx.chart("4.bms", &["TITLE a", "PLAYLEVEL ★3"]);
     let question = fx.chart("5.bms", &["TITLE a", "PLAYLEVEL ?"]);
     let none = fx.chart("6.bms", &["TITLE a"]);
-    let huge = fx.chart("7.bms", &["TITLE a", "PLAYLEVEL 99999999999999999999999"]);
+    // Past i64, where a cast saturates: by significant digits, then text.
+    let over_b = fx.chart("7.bms", &["TITLE a", "PLAYLEVEL 10000000000000000000"]);
+    let over_a = fx.chart("8.bms", &["TITLE b", "PLAYLEVEL 9223372036854775808"]);
+    let over_a0 = fx.chart("9.bms", &["TITLE c", "PLAYLEVEL 0009223372036854775808"]);
+    let zero = fx.chart("10.bms", &["TITLE b", "PLAYLEVEL 0"]);
+    let zero0 = fx.chart("11.bms", &["TITLE a", "PLAYLEVEL 00"]);
     let lib = fx.scanned();
     assert_eq!(
         search(&lib, "", Sort::Level, false),
-        [two, seven_a, seven_b, twelve, huge, question, star, none]
+        [
+            zero, zero0, two, seven_a, seven_b, twelve, over_a0, over_a, over_b, question, star,
+            none
+        ]
     );
 }
 

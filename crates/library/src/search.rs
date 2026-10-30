@@ -1,18 +1,22 @@
 //! Search and sort (design.md "Loading and Song Selection"): the normalized
 //! text the scan stores with each chart, and the one statement a query runs.
 //!
-//! **Normalization.** [`normalize`] applies NFKC, lowercases, and folds
-//! katakana U+30A1-U+30F6 to hiragana, the same way when indexing and when
-//! querying.
+//! **Normalization.** [`normalize`] applies NFKC, lowercases, folds
+//! katakana U+30A1-U+30F6 to hiragana and drops C0 control characters, the
+//! same way when indexing and when querying. Neither side holds NUL, at
+//! which SQLite's `LIKE` and string parsing would stop.
 //!
 //! **Matching.** A query matches a chart when one of its title, subtitle,
 //! artist, subartist or genre, normalized, contains the normalized query as
 //! a substring. The fields are stored in `norm_text` joined by
-//! [`SEPARATOR`], so a query holding it matches nothing. A query of three
-//! or more characters (Unicode scalar values after normalization, the unit
-//! of the trigram tokenizer) is one FTS5 phrase, `"` doubled and the whole
-//! quoted; a shorter one is a `LIKE` pattern with `\`, `%` and `_` escaped.
-//! SQLite's query syntax is never exposed.
+//! [`SEPARATOR`], a C0 character no normalized query holds, so no match
+//! spans two fields. A query of three or more characters (Unicode scalar
+//! values after normalization, the unit of the trigram tokenizer) is one
+//! FTS5 phrase, `"` doubled and the whole quoted, which finds the
+//! candidates; `instr` then keeps those that contain the query exactly,
+//! since the tokenizer maps U+FFFE and U+FFFF to U+FFFD. A shorter query is
+//! a `LIKE` pattern with `\`, `%` and `_` escaped. A query that normalizes
+//! to nothing matches every chart. SQLite's query syntax is never exposed.
 //!
 //! **Snapshot.** A query is one statement on the reader connection, so in
 //! WAL mode it reads the last committed batch of a running scan and neither
@@ -21,15 +25,14 @@
 use std::fmt::Write as _;
 
 use bms_parser::Header;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ToSql};
 use unicode_normalization::UnicodeNormalization as _;
 
 use crate::ChartEntry;
 use crate::db;
 
-/// Joins the fields of `norm_text`. A control character, which header text
-/// does not hold in practice; a query holding it matches nothing, so no
-/// match spans two fields.
+/// Joins the fields of `norm_text`: a C0 control character, which
+/// [`normalize`] drops from the fields and from every query.
 pub const SEPARATOR: char = '\u{1F}';
 
 /// Normalized characters from which a query is an FTS5 phrase: the trigram
@@ -45,9 +48,9 @@ pub enum Sort {
     Title,
     /// By normalized artist, then as [`Sort::Title`]; no artist last.
     Artist,
-    /// By `#PLAYLEVEL`: levels of ASCII digits only, by their value, then
-    /// any other level by its text, then no level; equal values by their
-    /// text (`07` before `7`), then as [`Sort::Title`].
+    /// By `#PLAYLEVEL`: levels of ASCII digits only, by their value at any
+    /// length, then any other level by its text, then no level; equal
+    /// values by their text (`07` before `7`), then as [`Sort::Title`].
     Level,
     /// By file modification time, newest first.
     Modified,
@@ -67,12 +70,13 @@ pub struct Search<'a> {
     pub limit: usize,
 }
 
-/// `text` normalized for searching: NFKC, lowercase, and katakana U+30A1-
-/// U+30F6 folded to hiragana.
+/// `text` normalized for searching: NFKC, lowercase, katakana U+30A1-
+/// U+30F6 folded to hiragana, and C0 control characters dropped.
 pub fn normalize(text: &str) -> String {
     text.nfkc()
         .flat_map(char::to_lowercase)
         .map(fold_kana)
+        .filter(|c| !matches!(c, '\0'..='\u{1F}'))
         .collect()
 }
 
@@ -98,26 +102,28 @@ pub struct Keys {
 
 impl Keys {
     pub fn of(header: &Header) -> Self {
+        let norm = |field: &Option<String>| field.as_deref().map(normalize);
+        let title = norm(&header.title);
+        let artist = norm(&header.artist);
+        let (subtitle, subartist, genre) = (
+            norm(&header.subtitle),
+            norm(&header.subartist),
+            norm(&header.genre),
+        );
         let mut text = String::new();
-        let fields = [
-            &header.title,
-            &header.subtitle,
-            &header.artist,
-            &header.subartist,
-            &header.genre,
-        ];
-        for (i, field) in fields.into_iter().enumerate() {
+        for (i, field) in [&title, &subtitle, &artist, &subartist, &genre]
+            .into_iter()
+            .enumerate()
+        {
             if i > 0 {
                 text.push(SEPARATOR);
             }
-            if let Some(value) = field {
-                text.push_str(&normalize(value));
-            }
+            text.push_str(field.as_deref().unwrap_or_default());
         }
         Self {
             text,
-            title: header.title.as_deref().map(normalize),
-            artist: header.artist.as_deref().map(normalize),
+            title,
+            artist,
         }
     }
 }
@@ -127,10 +133,9 @@ impl Keys {
 enum Filter {
     /// Every chart.
     All,
-    /// None: the query holds [`SEPARATOR`].
-    Nothing,
-    /// `charts_fts MATCH ?1`, with this phrase.
-    Phrase(String),
+    /// `charts_fts MATCH ?1` with `phrase`, and `instr(norm_text, ?2)` with
+    /// the normalized query `needle`.
+    Phrase { phrase: String, needle: String },
     /// `norm_text LIKE ?1 ESCAPE '\'`, with this pattern.
     Like(String),
 }
@@ -140,10 +145,11 @@ impl Filter {
         let norm = normalize(text);
         if norm.is_empty() {
             Self::All
-        } else if norm.contains(SEPARATOR) {
-            Self::Nothing
         } else if norm.chars().count() >= PHRASE_CHARS {
-            Self::Phrase(format!("\"{}\"", norm.replace('"', "\"\"")))
+            Self::Phrase {
+                phrase: format!("\"{}\"", norm.replace('"', "\"\"")),
+                needle: norm,
+            }
         } else {
             let mut pattern = String::from("%");
             for c in norm.chars() {
@@ -161,6 +167,11 @@ impl Filter {
 /// A level of ASCII digits only.
 const NUMERIC_LEVEL: &str = "c.playlevel <> '' AND c.playlevel NOT GLOB '*[^0-9]*'";
 
+/// The significant digits of a numeric level. Ordered by their count, then
+/// as text, they order the values at any length, where a cast to an integer
+/// would saturate.
+const LEVEL_DIGITS: &str = "ltrim(c.playlevel, '0')";
+
 /// The `ORDER BY` terms of `sort`, after the folder when grouping.
 fn order(sort: Sort, by_folder: bool) -> String {
     let mut terms = String::new();
@@ -177,7 +188,8 @@ fn order(sort: Sort, by_folder: bool) -> String {
             let _ = write!(
                 terms,
                 "CASE WHEN c.playlevel IS NULL THEN 2 WHEN {NUMERIC_LEVEL} THEN 0 ELSE 1 END, \
-                 CASE WHEN {NUMERIC_LEVEL} THEN CAST(c.playlevel AS INTEGER) END, \
+                 CASE WHEN {NUMERIC_LEVEL} THEN length({LEVEL_DIGITS}) END, \
+                 CASE WHEN {NUMERIC_LEVEL} THEN {LEVEL_DIGITS} END, \
                  c.playlevel, {by_title}"
             );
         }
@@ -190,31 +202,31 @@ fn order(sort: Sort, by_folder: bool) -> String {
 pub fn run(conn: &Connection, search: &Search<'_>) -> rusqlite::Result<Vec<ChartEntry>> {
     let limit = i64::try_from(search.limit).unwrap_or(i64::MAX);
     let filter = Filter::of(search.text);
-    let (from, arg) = match &filter {
-        Filter::Nothing => return Ok(Vec::new()),
-        Filter::All => ("charts c", None),
-        Filter::Phrase(phrase) => (
-            "charts_fts JOIN charts c ON c.id = charts_fts.rowid WHERE charts_fts MATCH ?1",
-            Some(phrase),
+    let (from, mut args): (&str, Vec<&dyn ToSql>) = match &filter {
+        Filter::All => ("charts c", Vec::new()),
+        Filter::Phrase { phrase, needle } => (
+            "charts_fts JOIN charts c ON c.id = charts_fts.rowid
+             WHERE charts_fts MATCH ?1 AND instr(c.norm_text, ?2) > 0",
+            vec![phrase, needle],
         ),
         Filter::Like(pattern) => (
             r"charts c WHERE c.norm_text LIKE ?1 ESCAPE '\'",
-            Some(pattern),
+            vec![pattern],
         ),
     };
+    // The limit is the last parameter, in the candidates' query, so it
+    // counts only rows that match.
+    args.push(&limit);
     let order = order(search.sort, search.by_folder);
     let sql = format!(
         "SELECT {} FROM charts c WHERE c.id IN (
              SELECT c.id FROM {from} ORDER BY {order} LIMIT ?{}
          ) ORDER BY {order}",
         db::ENTRY_COLUMNS,
-        if arg.is_some() { 2 } else { 1 },
+        args.len(),
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = match arg {
-        Some(arg) => stmt.query(params![arg, limit])?,
-        None => stmt.query(params![limit])?,
-    };
+    let rows = stmt.query(args.as_slice())?;
     rows.mapped(db::entry).collect()
 }
 
@@ -243,15 +255,20 @@ mod tests {
     fn long_queries_are_one_quoted_phrase() {
         assert_eq!(
             Filter::of(r#"say "hi""#),
-            Filter::Phrase(r#""say ""hi""""#.to_owned())
+            Filter::Phrase {
+                phrase: r#""say ""hi""""#.to_owned(),
+                needle: r#"say "hi""#.to_owned(),
+            }
         );
         // Counted after normalization: one character of NFKC "ｶﾞ".
         assert_eq!(Filter::of("ｶﾞa"), Filter::Like("%がa%".to_owned()));
     }
 
     #[test]
-    fn empty_and_separator_queries() {
+    fn control_characters_are_dropped() {
+        assert_eq!(normalize("a\0b\u{1F}c\td\u{7F}"), "abcd\u{7F}");
         assert_eq!(Filter::of(""), Filter::All);
-        assert_eq!(Filter::of("ab\u{1F}cd"), Filter::Nothing);
+        assert_eq!(Filter::of("\0\n\u{1F}"), Filter::All);
+        assert_eq!(Filter::of("a\0b"), Filter::Like("%ab%".to_owned()));
     }
 }
