@@ -133,7 +133,8 @@ fn reservation_matches_what_a_play_allocates() {
         let one = device(&[0]);
         BYTES.store(0, Ordering::Relaxed);
         TRACK.with(|t| t.set(true));
-        let ev = eval::Evaluator::new(&chart, &rule, &one, &InputStart::default(), 0).unwrap();
+        let ev =
+            eval::Evaluator::new(&chart, &rule, &one, &InputStart::default(), None, 0).unwrap();
         TRACK.with(|t| t.set(false));
         drop(ev);
         BYTES.load(Ordering::Relaxed)

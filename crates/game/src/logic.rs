@@ -153,6 +153,7 @@ impl Record {
             device: self.device.clone(),
             start: self.start.clone(),
             finalized: Some(finalized),
+            section: None,
         })
     }
 }
@@ -236,7 +237,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         // count.
         let budget = config.inputs.saturating_add(n);
         let evaluator =
-            Evaluator::new(chart, rule, device, start, budget).map_err(LogicError::Eval)?;
+            Evaluator::new(chart, rule, device, start, None, budget).map_err(LogicError::Eval)?;
         // Each buffer holds every control event of the window and its own
         // source's disconnect; a source beyond that exceeds the window, and
         // the push refused overflows like the budget.

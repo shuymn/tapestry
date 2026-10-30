@@ -82,7 +82,7 @@ fn removed_source_is_drained_before_retiring() {
         .unwrap();
     let preset = rules::custom();
     let dev = device(&[0, 0]);
-    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 8).unwrap();
     let mut out = Vec::new();
     let mut merged = Vec::with_capacity(8);
 
@@ -145,7 +145,7 @@ fn crossing_offsets_judge_in_evaluation_order() {
     ];
     let mut merged = Vec::new();
     merge(&mut stages, &dev, TimeUs(2_000 * MS), &mut merged);
-    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 8).unwrap();
     for e in merged {
         ev.push_input(e).unwrap();
     }

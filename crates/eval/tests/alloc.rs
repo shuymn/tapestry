@@ -25,7 +25,7 @@ use bms_model::{ChartBuilder, NoteKind, SoundId, TimeUs};
 use common::{MS, device, lane, press, release};
 use eval::{
     AxisBinding, ControlId, Evaluator, InputKind, InputStart, JudgeEventKind, PhysicalInputEvent,
-    PushError, ScratchSettings, SourceId,
+    PushError, ScratchSettings, Section, SourceId,
 };
 use rules::Judgment;
 
@@ -140,14 +140,36 @@ fn advance_does_not_allocate() {
         },
     });
     let end = 1_000 * MS + NOTES * 50 * MS + 1_000 * MS;
-    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 64).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 64).unwrap();
     let bound = ev.max_events(inputs.len());
     let mut out = Vec::with_capacity(bound);
     let capacity = out.capacity();
     // A second evaluator whose ring a burst fills to capacity.
     const BURST: usize = 4;
-    let mut burst = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), BURST).unwrap();
+    let mut burst =
+        Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, BURST).unwrap();
     let mut burst_out = Vec::with_capacity(burst.max_events(BURST + 1));
+    // A third evaluating the section [21 s, 51 s) with a 2 s lead-in, over
+    // the same inputs: they feed only conversion before 19 s, the lead-in
+    // press at 20.95 s is ignored (lane 1's first target is 350 ms later),
+    // and the long note from 50.8 s to 51 s is cut.
+    let section = Section {
+        start: TimeUs(21_000 * MS),
+        end: TimeUs(51_000 * MS),
+        lead_in: TimeUs(2_000 * MS),
+        initial_gauges: preset.gauges.iter().map(|g| g.start).collect(),
+    };
+    let mut sec = Evaluator::new(
+        &chart,
+        &preset,
+        &dev,
+        &InputStart::default(),
+        Some(&section),
+        64,
+    )
+    .unwrap();
+    let mut sec_out = Vec::with_capacity(sec.max_events(inputs.len()));
+    let sec_capacity = sec_out.capacity();
 
     TRACK.with(|t| t.set(true));
     // The count works: an allocation that escapes is counted in any profile.
@@ -160,9 +182,11 @@ fn advance_does_not_allocate() {
         // What the merge would hand over at this watermark.
         while next < inputs.len() && inputs[next].received.0 <= w {
             ev.push_input(inputs[next]).unwrap();
+            sec.push_input(inputs[next]).unwrap();
             next += 1;
         }
         ev.advance_to(TimeUs(w), &mut out).unwrap();
+        sec.advance_to(TimeUs(w), &mut sec_out).unwrap();
         w += MS;
     }
     let elapsed = started.elapsed();
@@ -214,6 +238,14 @@ fn advance_does_not_allocate() {
     assert_eq!(refused, Err(PushError::Full));
     assert_eq!(after_drain, Ok(()));
     assert!(!burst_out.is_empty());
+    // Notes 400 to 999, without the cut long note 996.
+    let sec_judged = sec_out
+        .iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::Judged { .. }))
+        .count();
+    assert_eq!(sec_judged, 599);
+    assert!(sec.is_complete());
+    assert_eq!(sec_out.capacity(), sec_capacity);
     assert_eq!(allocations, 0);
     let per_input = elapsed.as_nanos() / u128::try_from(inputs.len()).unwrap();
     println!(

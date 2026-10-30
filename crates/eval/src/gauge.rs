@@ -79,18 +79,39 @@ pub(crate) struct Gauges {
 }
 
 impl Gauges {
-    pub(crate) fn new(rules: &[GaugeRule], increment: i128) -> Self {
+    /// Each gauge at `initial`'s value, else at its rule's start;
+    /// `initial`, when given, holds one value per rule.
+    pub(crate) fn new(
+        rules: &[GaugeRule],
+        increment: i128,
+        initial: Option<&[GaugeValue]>,
+    ) -> Self {
         Self {
             states: rules
                 .iter()
-                .map(|r| GaugeState {
-                    value: r.start,
-                    reference: r.start,
-                    failed_at: None,
+                .enumerate()
+                .map(|(i, r)| {
+                    let start = initial.and_then(|v| v.get(i)).copied().unwrap_or(r.start);
+                    GaugeState {
+                        value: start,
+                        reference: start,
+                        failed_at: None,
+                    }
                 })
                 .collect(),
             increment,
         }
+    }
+
+    /// Whether `initial` can start `rules`' gauges: one value per rule,
+    /// within its bounds, and above 0 for a survival gauge, as a preset's
+    /// own start must be.
+    pub(crate) fn accepts(rules: &[GaugeRule], initial: &[GaugeValue]) -> bool {
+        rules.len() == initial.len()
+            && rules.iter().zip(initial).all(|(r, &v)| {
+                (r.min..=r.max).contains(&v)
+                    && !(r.kind == GaugeKind::Survival && v <= GaugeValue::EMPTY)
+            })
     }
 
     pub(crate) fn states(&self) -> &[GaugeState] {

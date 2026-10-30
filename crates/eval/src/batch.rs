@@ -6,7 +6,7 @@ use rules::{GaugeKind, GaugeValue, RulePreset};
 
 use crate::EvalError;
 use crate::evaluator::{Evaluator, JudgeEvent, JudgeEventKind, Tally};
-use crate::input::{DeviceProfile, InputStart, PhysicalInputEvent, evaluation_time};
+use crate::input::{DeviceProfile, InputStart, PhysicalInputEvent, Section, evaluation_time};
 use crate::merge::{Staged, merge};
 
 /// A recorded play, as evaluation needs it.
@@ -21,8 +21,11 @@ pub struct EvalInput {
     pub start: InputStart,
     /// For an aborted play, the watermark finalized before the abort;
     /// evaluation stops there, and a long note still held there is not
-    /// judged or counted. `None` evaluates the whole chart.
+    /// judged or counted. `None` evaluates to the final deadline.
     pub finalized: Option<TimeUs>,
+    /// The section to evaluate (design.md "Section Evaluation"); `None`
+    /// evaluates the whole chart.
+    pub section: Option<Section>,
 }
 
 /// One point of a gauge's history.
@@ -62,13 +65,15 @@ pub struct Evaluation {
     pub tally: Tally,
     /// Every gauge, in the preset's order.
     pub gauges: Vec<GaugeResult>,
-    /// Whether evaluation reached the chart's final deadline.
+    /// Whether evaluation reached the final deadline of the chart, or of
+    /// the section.
     pub completed: bool,
 }
 
 /// Evaluates a recorded play: merges its sources' events as live play does,
-/// pushes them into an [`Evaluator`], and advances to the finalized
-/// watermark of an aborted play, or else past every deadline and input.
+/// pushes them into an [`Evaluator`] with the input's section, if any, and
+/// advances to the finalized watermark of an aborted play, or else past
+/// every deadline and input.
 ///
 /// # Errors
 ///
@@ -79,7 +84,14 @@ pub fn evaluate(
     rule: &RulePreset,
 ) -> Result<Evaluation, EvalError> {
     let merged = merge_log(&input.events, &input.device);
-    let mut ev = Evaluator::new(chart, rule, &input.device, &input.start, merged.len())?;
+    let mut ev = Evaluator::new(
+        chart,
+        rule,
+        &input.device,
+        &input.start,
+        input.section.as_ref(),
+        merged.len(),
+    )?;
     let last_input = merged.last().map(|e| evaluation_time(e, &input.device));
     let inputs = merged.len();
     for e in merged {

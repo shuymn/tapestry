@@ -89,7 +89,7 @@ fn run(
     to: i64,
 ) -> Vec<JudgeEvent> {
     let rule = rules::custom();
-    let mut ev = Evaluator::new(chart, &rule, dev, &InputStart::default(), 256).unwrap();
+    let mut ev = Evaluator::new(chart, &rule, dev, &InputStart::default(), None, 256).unwrap();
     for &i in inputs {
         ev.push_input(i).unwrap();
     }
@@ -209,7 +209,7 @@ fn release_after_stop_is_a_deadline_not_a_frame() {
     let chart = scratch_ln();
     let dev = axis_device(TURNTABLE);
     let rule = rules::custom();
-    let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 8).unwrap();
+    let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, 8).unwrap();
     ev.push_input(report(900 * MS, 10)).unwrap();
     ev.push_input(report(1_000 * MS, 12)).unwrap(); // press: head PERFECT
     let mut out = Vec::new();
@@ -258,7 +258,7 @@ fn movement_moves_pending_release_deadline() {
     let chart = scratch_ln();
     let dev = axis_device(TURNTABLE);
     let rule = rules::custom();
-    let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 8).unwrap();
+    let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, 8).unwrap();
     for e in [
         report(900 * MS, 10),
         report(1_000 * MS, 12), // press; release due at 1100 ms
@@ -339,7 +339,7 @@ fn axis_capacity_holds_a_song_of_1khz_reports() {
     let chart = b.build().unwrap();
     let dev = axis_device(TURNTABLE);
     let rule = rules::custom();
-    let probe = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 0).unwrap();
+    let probe = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, 0).unwrap();
     assert_eq!(probe.final_deadline(), TimeUs(180_180 * MS));
     let lead_in = 1_000 * MS;
     let span = TimeUs(lead_in + probe.final_deadline().0);
@@ -348,7 +348,8 @@ fn axis_capacity_holds_a_song_of_1khz_reports() {
 
     // The axis turns forward one position every millisecond from the start
     // of the countdown to the final deadline: 181_181 reports.
-    let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), capacity).unwrap();
+    let mut ev =
+        Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, capacity).unwrap();
     let mut pushed = 0;
     let mut t = -lead_in;
     let mut value = 0;
@@ -639,6 +640,7 @@ fn aborted_and_incremental_scratch_match_batch() {
         device: dev.clone(),
         start: InputStart::default(),
         finalized: None,
+        section: None,
     };
     let rule = rules::custom();
     let batch = evaluate(&chart, &input, &rule).unwrap();
@@ -655,7 +657,7 @@ fn aborted_and_incremental_scratch_match_batch() {
     assert_eq!(ln_ends(&batch.events), [(1_500 * MS, Perfect, None, None)]);
     for step in [MS, 7 * MS] {
         let rule = rules::custom();
-        let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 64).unwrap();
+        let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, 64).unwrap();
         let mut out = Vec::new();
         let mut next = 0;
         let mut t = 0;

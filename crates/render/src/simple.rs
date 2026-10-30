@@ -1088,8 +1088,15 @@ mod tests {
                 value,
             },
         };
-        let mut ev =
-            eval::Evaluator::new(chart, &preset, &device, &eval::InputStart::default(), 4).unwrap();
+        let mut ev = eval::Evaluator::new(
+            chart,
+            &preset,
+            &device,
+            &eval::InputStart::default(),
+            None,
+            4,
+        )
+        .unwrap();
         ev.push_input(key(press, 1)).unwrap();
         ev.push_input(key(release, 0)).unwrap();
         let mut out = Vec::new();

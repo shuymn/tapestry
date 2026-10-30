@@ -876,6 +876,7 @@ fn target(
         device: device.clone(),
         start: start.clone(),
         finalized: None,
+        section: None,
     };
     let e = evaluate(chart, &base, preset).unwrap();
     let mut notes: Vec<(usize, TimeUs)> = e
@@ -903,7 +904,7 @@ pub fn build_play(raw: &RawPlay) -> Play {
     let (mut device, mut start, mut logs) = build_log(&raw.log);
     let n = logs.len();
     let (windows, final_deadline) = {
-        let ev = Evaluator::new(&chart, &preset, &device, &start, 0).unwrap();
+        let ev = Evaluator::new(&chart, &preset, &device, &start, None, 0).unwrap();
         (*ev.windows(), ev.final_deadline())
     };
     let (sel, param) = raw.joint;
@@ -968,6 +969,7 @@ pub fn build_play(raw: &RawPlay) -> Play {
         device,
         start,
         finalized: None,
+        section: None,
     };
     let deadlines = deadlines(&chart, &windows);
     let mut times: Vec<TimeUs> = input
@@ -1249,7 +1251,7 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
     let off = offset(raw.offset);
     let device = crate::common::device(&[off]);
     let scaled = |p: &RulePreset| {
-        *Evaluator::new(&chart, p, &device, &InputStart::default(), 0)
+        *Evaluator::new(&chart, p, &device, &InputStart::default(), None, 0)
             .unwrap()
             .windows()
     };
@@ -1291,6 +1293,7 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
             device,
             start,
             finalized: None,
+            section: None,
         },
     }
 }
@@ -1381,6 +1384,7 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
             events,
             device: crate::common::device(&[0]),
             finalized: None,
+            section: None,
         },
         deviation,
         scale,

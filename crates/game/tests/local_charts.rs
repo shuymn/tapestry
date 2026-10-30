@@ -273,6 +273,7 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
             device: record.devices.profile(),
             start: record.start.clone(),
             finalized: Some(record.status.finalized),
+            section: None,
         },
         session.preset(),
     )

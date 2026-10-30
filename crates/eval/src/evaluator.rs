@@ -16,7 +16,7 @@ use rules::{
 use crate::EvalError;
 use crate::convert::{ConversionState, LaneEdge};
 use crate::gauge::{Cause, GaugeState, Gauges, increment};
-use crate::input::{DeviceProfile, InputStart, PhysicalInputEvent, evaluation_time};
+use crate::input::{DeviceProfile, InputStart, PhysicalInputEvent, Section, evaluation_time};
 
 /// One output of the evaluator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,6 +285,29 @@ impl LaneState {
     }
 }
 
+/// Where a section's input is judged (design.md "Section Evaluation").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Bounds {
+    /// The lead-in start: earlier input feeds input conversion only.
+    lead_in: TimeUs,
+    /// The section start: earlier presses are judged only when they judge a
+    /// target.
+    start: TimeUs,
+}
+
+/// How an input at one time is taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Acceptance {
+    /// Judged as in a whole-chart play.
+    Judged,
+    /// In a section's lead-in: a press is judged only when it judges a
+    /// target, and is otherwise ignored.
+    LeadIn,
+    /// Before a section's lead-in or after its final deadline: input
+    /// conversion only.
+    ConversionOnly,
+}
+
 /// The incremental evaluator. It references the chart, preset and device
 /// profile, and after construction allocates nothing in
 /// [`push_input`](Self::push_input) and [`advance_to`](Self::advance_to)
@@ -303,9 +326,11 @@ pub struct Evaluator<'a> {
     input_capacity: usize,
     /// The watermark last advanced to: everything at or before it is final.
     finalized: Option<TimeUs>,
-    /// The latest deadline of the chart; evaluation is complete once the
-    /// watermark reaches it.
+    /// The latest deadline of the chart, or of the section's targets;
+    /// evaluation is complete once the watermark reaches it.
     final_deadline: TimeUs,
+    /// The section's bounds; `None` evaluates the whole chart.
+    section: Option<Bounds>,
     /// Whether [`JudgeEventKind::SongEnd`] was emitted.
     ended: bool,
     gauges: Gauges,
@@ -352,6 +377,9 @@ impl<'a> Evaluator<'a> {
     /// Prepares evaluation: scales the windows and LN-end edges by the
     /// chart's rank, builds each lane's deadlines, computes the gauge
     /// increment, and sets up input conversion from `start`.
+    /// `section`, if given, restricts the targets, the input judged and the
+    /// final deadline to it and sets the initial gauges ([`Section`]); the
+    /// gauge increment still counts the whole chart's judgeable notes.
     /// `input_capacity` sizes the ring of inputs pushed but not yet
     /// processed.
     ///
@@ -360,16 +388,42 @@ impl<'a> Evaluator<'a> {
     /// An invalid preset (including an implementation version this build
     /// does not run), a rank whose scale is unusable, a long-note mode the
     /// preset cannot judge, a note time or long-note end outside `±2^32` µs,
-    /// a chart without judgeable notes, or a source binding one control
-    /// twice.
+    /// a chart without judgeable notes, an unusable section, or a source
+    /// binding one control twice.
     pub fn new(
         chart: &'a Chart,
         rule: &'a RulePreset,
         device: &'a DeviceProfile,
         start: &InputStart,
+        section: Option<&Section>,
         input_capacity: usize,
     ) -> Result<Self, EvalError> {
         rule.validate().map_err(EvalError::InvalidPreset)?;
+        let bounds = match section {
+            None => None,
+            Some(s) => {
+                let invalid = |field| EvalError::InvalidSection { field };
+                if s.end < s.start {
+                    return Err(invalid("range"));
+                }
+                if s.lead_in.0 < 0 {
+                    return Err(invalid("lead_in"));
+                }
+                if !Gauges::accepts(&rule.gauges, &s.initial_gauges) {
+                    return Err(invalid("initial_gauges"));
+                }
+                let lead_in = s.start.checked_sub(s.lead_in).ok_or(invalid("lead_in"))?;
+                Some(Bounds {
+                    lead_in,
+                    start: s.start,
+                })
+            }
+        };
+        // A tap or mine at `t`, or a long note from `t` to `end`, is a
+        // target of the section.
+        let in_section = |t: TimeUs, end: TimeUs| {
+            section.is_none_or(|s| s.start <= t && t < s.end && end < s.end)
+        };
         let scale = rule
             .rank_scale
             .scale_milli(chart.meta.rank)
@@ -395,11 +449,12 @@ impl<'a> Evaluator<'a> {
             (LnMode::Ln, None | Some(ChartLnMode::Ln)) => {}
             (LnMode::Ln, Some(mode)) => return Err(EvalError::UnsupportedLnMode(mode)),
         }
+        let judgeable =
+            |n: &bms_model::Note| matches!(n.kind, NoteKind::Tap | NoteKind::Long { .. });
         let mut lanes: [LaneState; LANE_COUNT] = Default::default();
         for (state, notes) in lanes.iter_mut().zip(&chart.lanes) {
+            let judgeable = |n: &bms_model::Note| judgeable(n) && in_section(n.time, n.end());
             // Reserved at its exact size, which the recording policy counts.
-            let judgeable =
-                |n: &bms_model::Note| matches!(n.kind, NoteKind::Tap | NoteKind::Long { .. });
             state.targets = Vec::with_capacity(notes.iter().filter(|n| judgeable(n)).count());
             state.targets.extend(
                 notes
@@ -434,7 +489,7 @@ impl<'a> Evaluator<'a> {
                 }
             }
             for (i, note) in notes.iter().enumerate() {
-                if matches!(note.kind, NoteKind::Mine { .. }) {
+                if matches!(note.kind, NoteKind::Mine { .. }) && in_section(note.time, note.time) {
                     deadlines.push(Deadline {
                         time: note.time,
                         kind: DeadlineKind::Mine,
@@ -447,16 +502,26 @@ impl<'a> Evaluator<'a> {
             deadlines.sort_unstable();
             state.deadlines = deadlines;
         }
+        // The whole chart's notes, also for a section, so a note moves the
+        // gauges as far as in a full play.
         let notes = match rule.denominator {
-            Denominator::TapsAndLnHeads => lanes.iter().map(|l| l.targets.len()).sum::<usize>(),
+            Denominator::TapsAndLnHeads => chart
+                .lanes
+                .iter()
+                .flatten()
+                .filter(|n| judgeable(n))
+                .count(),
         };
         if notes == 0 {
             return Err(EvalError::NoJudgeableNotes);
         }
+        // A whole chart has a judgeable note, so a deadline; a section
+        // without targets or mines is complete at its start.
         let final_deadline = lanes
             .iter()
             .filter_map(|l| l.deadlines.last().map(|d| d.time))
             .max()
+            .or(section.map(|s| s.start))
             .unwrap_or(TimeUs(0));
         // A #TOTAL that is not positive counts as absent.
         let total_milli = chart
@@ -479,8 +544,13 @@ impl<'a> Evaluator<'a> {
             input_capacity,
             finalized: None,
             final_deadline,
+            section: bounds,
             ended: false,
-            gauges: Gauges::new(&rule.gauges, increment),
+            gauges: Gauges::new(
+                &rule.gauges,
+                increment,
+                section.map(|s| s.initial_gauges.as_slice()),
+            ),
             seq: 0,
             tally: Tally::new(),
         })
@@ -510,8 +580,9 @@ impl<'a> Evaluator<'a> {
         self.gauges.states()
     }
 
-    /// The chart's latest deadline: tap and LN head misses, LN ends and
-    /// mines.
+    /// The latest deadline of the chart, or of the section's targets: tap
+    /// and LN head misses, LN ends and mines; for a section with none, its
+    /// start.
     #[must_use]
     pub const fn final_deadline(&self) -> TimeUs {
         self.final_deadline
@@ -753,16 +824,40 @@ impl<'a> Evaluator<'a> {
             return;
         };
         let edges = self.conversion.apply(&ev, t);
+        let acceptance = self.acceptance(t);
+        if acceptance == Acceptance::ConversionOnly {
+            return;
+        }
+        let lead_in = acceptance == Acceptance::LeadIn;
         for &edge in edges.as_slice() {
             match edge {
-                LaneEdge::Press(lane) => self.press(lane.index(), t, ev.received, out),
+                LaneEdge::Press(lane) => self.press(lane.index(), t, ev.received, lead_in, out),
                 LaneEdge::Release(lane) => self.release(lane.index(), t, Some(ev.received), out),
             }
         }
     }
 
-    /// A press edge on `lane` at evaluation time `t`.
-    fn press(&mut self, lane: usize, t: TimeUs, origin: TimeUs, out: &mut Vec<JudgeEvent>) {
+    /// How an input at evaluation time `t` is taken (design.md "Section
+    /// Evaluation").
+    fn acceptance(&self, t: TimeUs) -> Acceptance {
+        match self.section {
+            None => Acceptance::Judged,
+            Some(b) if t < b.lead_in || t > self.final_deadline => Acceptance::ConversionOnly,
+            Some(b) if t < b.start => Acceptance::LeadIn,
+            Some(_) => Acceptance::Judged,
+        }
+    }
+
+    /// A press edge on `lane` at evaluation time `t`. In a section's
+    /// lead-in (`lead_in`), a press that judges no target is ignored.
+    fn press(
+        &mut self,
+        lane: usize,
+        t: TimeUs,
+        origin: TimeUs,
+        lead_in: bool,
+        out: &mut Vec<JudgeEvent>,
+    ) {
         let bad = self.windows.bad;
         #[expect(
             clippy::indexing_slicing,
@@ -804,6 +899,11 @@ impl<'a> Evaluator<'a> {
             if better {
                 best = Some((deviation, k));
             }
+        }
+        // A lead-in press judges only inside its lane's first unjudged
+        // target's early window: no sound, no empty POOR otherwise.
+        if lead_in && best.is_none() {
+            return;
         }
         // The judged note, else the next unjudged one (the cursor: no
         // unjudged note lies inside BAD, and earlier ones are missed).

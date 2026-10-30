@@ -451,6 +451,7 @@ fn reversed_ties(play: &Play) -> Vec<eval::JudgeEvent> {
         &play.preset,
         device,
         &play.input.start,
+        None,
         order.len(),
     )
     .unwrap();

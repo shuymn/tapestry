@@ -5,6 +5,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{Lane, TimeUs};
+use rules::GaugeValue;
 
 /// A source: one physical device, with its own queue and input offset.
 /// Ids are anonymous and session-local, given in the order devices are found
@@ -63,6 +64,28 @@ pub struct InputStart {
     /// An absolute axis listed here starts at its value; one not listed
     /// starts unknown, and its first report only sets where it is.
     pub held: Vec<(SourceId, ControlId, i32)>,
+}
+
+/// A section to evaluate instead of the whole chart (design.md "Section
+/// Evaluation"): the half-open range `[start, end)` in chart time.
+///
+/// A tap or mine is a target when `start ≤ t < end`, a long note when
+/// `start ≤ head` and its end is before `end`. Input before
+/// `start − lead_in` feeds input conversion only; a press in the lead-in
+/// is judged only when it judges a target, and is otherwise ignored, with
+/// no sound and no empty POOR; input after the section's final deadline
+/// feeds input conversion only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Section {
+    /// The first chart time of the section.
+    pub start: TimeUs,
+    /// The chart time just past the section.
+    pub end: TimeUs,
+    /// How long before `start` the lead-in begins; not negative.
+    pub lead_in: TimeUs,
+    /// Each gauge's value at the start, in the preset's order: one per
+    /// gauge, within its bounds, and above 0 for a survival gauge.
+    pub initial_gauges: Vec<GaugeValue>,
 }
 
 /// A control bound to a lane.

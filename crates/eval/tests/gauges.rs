@@ -58,6 +58,7 @@ fn play_with(
         device: device(&[0]),
         start: InputStart::default(),
         finalized: None,
+        section: None,
     };
     let e = evaluate(chart, &input, rule).unwrap();
     assert!(e.completed);
