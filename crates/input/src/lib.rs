@@ -8,6 +8,9 @@
 //! is already poppable. The participants are frozen when recording opens,
 //! and the controls held at that boundary go into [`eval::InputStart`].
 //! The [`FocusGate`] keeps input received after focus loss out of the log.
+//! While recording is closed, the configured controller's bound controls
+//! can drive the menus instead ([`MenuTap`], [`SourceSet::set_menu`]),
+//! through a bounded queue; nothing of it is recorded.
 //!
 //! [`ScriptedInput`] feeds a scenario or a recorded log through the same
 //! path. [`autoplay`] makes the inputs that hit every note of a chart, and
@@ -34,6 +37,7 @@ pub mod cadence;
 mod capture;
 mod gate;
 pub mod hid;
+mod menu;
 mod queue;
 pub mod raw;
 mod scripted;
@@ -49,6 +53,9 @@ pub use autoplay::{AUTOPLAY_DEVICE, AutoplayInput, TimeOverflow, autoplay, autop
 pub use cadence::{Phase, WakeReport};
 pub use capture::{Capture, Watched};
 pub use gate::{Admit, DeviceId, FocusGate, FocusLatch, Packet};
+pub use menu::{
+    MENU_QUEUE, MenuAction, MenuBindings, MenuEvent, MenuReceiver, MenuTap, menu_queue,
+};
 pub use queue::{Overflow, SourceReader, SourceWriter, source_queue};
 pub use scripted::{Action, ScriptItem, ScriptedInput, declared_axes};
 pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, SourceSet};

@@ -9,6 +9,7 @@ use eval::{ControlId, InputKind, InputStart, PhysicalInputEvent, SourceId};
 
 use crate::gate::{Admit, DeviceId, FocusGate, Packet};
 use crate::hid::{AxisCap, HidProduct, MAX_AXES, is_axis};
+use crate::menu::MenuTap;
 use crate::queue::{SourceReader, SourceWriter, source_queue};
 
 /// What kind of device a source is.
@@ -157,6 +158,9 @@ pub struct SourceSet {
     gate: FocusGate,
     batch_at: TimeUs,
     recording: Option<Recording>,
+    /// Where the configured controller's menu controls go while recording
+    /// is closed ([`set_menu`](Self::set_menu)).
+    menu: Option<MenuTap>,
 }
 
 impl SourceSet {
@@ -186,6 +190,7 @@ impl SourceSet {
             gate: FocusGate::new(),
             batch_at: TimeUs(i64::MIN),
             recording: None,
+            menu: None,
         })
     }
 
@@ -243,8 +248,13 @@ impl SourceSet {
     /// while the control is held, such as a key's auto-repeat, is recorded
     /// like any packet: recording applies no filter (design.md "Input",
     /// debounce), and input conversion ignores it.
+    ///
+    /// While recording is closed, a packet of the first connected
+    /// controller of the menu's model is offered to the menu
+    /// ([`set_menu`](Self::set_menu)), which acts on it only while active.
     pub fn packet(&mut self, packet: &Packet) -> Admit {
         let admit = self.gate.admit(packet);
+        self.offer_menu(packet);
         let max_held = self.config.max_held;
         let Some(device) = self.devices.iter_mut().find(|d| d.id == packet.device) else {
             return admit;
@@ -294,6 +304,50 @@ impl SourceSet {
             );
         }
         admit
+    }
+
+    /// Sends the configured controller's bound controls to `tap` as menu
+    /// events from now on, while it is active and recording is closed.
+    /// Replaces an earlier one.
+    pub fn set_menu(&mut self, tap: MenuTap) {
+        self.menu = Some(tap);
+    }
+
+    /// Takes the menu out, for a set that replaces this one.
+    pub const fn take_menu(&mut self) -> Option<MenuTap> {
+        self.menu.take()
+    }
+
+    /// The menu, to set it active at each boundary and see what it sent.
+    pub const fn menu_mut(&mut self) -> Option<&mut MenuTap> {
+        self.menu.as_mut()
+    }
+
+    /// Offers `packet` to the menu: only while recording is closed, and
+    /// only from the first connected controller of the menu's model, with
+    /// an axis's capability.
+    fn offer_menu(&mut self, packet: &Packet) {
+        let Some(menu) = &mut self.menu else {
+            return;
+        };
+        if self.recording.is_some() || !menu.is_active() {
+            return;
+        }
+        let product = menu.product();
+        let Some(device) = self
+            .devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Controller && d.product == Some(product))
+            .filter(|d| d.id == packet.device)
+        else {
+            return;
+        };
+        let axis = device
+            .axes
+            .iter()
+            .take(device.n_axes)
+            .find(|a| a.control == packet.control);
+        menu.offer(packet, axis);
     }
 
     /// A device was found. While recording is open it does not take part;
@@ -564,6 +618,9 @@ impl SourceSet {
     /// at the batch time, publishes that time as its final watermark, and
     /// closes; once the gate has tripped, nothing is recorded or published.
     pub fn disconnect(&mut self, device: DeviceId) {
+        if let Some(menu) = &mut self.menu {
+            menu.removed(device);
+        }
         if let Some(i) = self.unread.iter().position(|&d| d == device) {
             self.unread.swap_remove(i);
             self.untracked = self.untracked.saturating_sub(1);

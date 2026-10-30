@@ -1,7 +1,8 @@
 //! After construction and `open_recording`, batches allocate nothing:
 //! packets, pushes, publications, device changes, arrivals, overflow and
-//! focus rejection, a scripted connect and reconnect, and the wake loop
-//! with its cut drains.
+//! focus rejection, a scripted connect and reconnect, the wake loop with
+//! its cut drains, and the controller's menu (steps, bursts, a full queue
+//! and a removal).
 //!
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -16,9 +17,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use bms_model::{TimeSource, TimeUs};
 use eval::ControlId;
 use input::cadence::{self, Boundary, Cadence, Driven, Wait, WaitFailed, Waiter, Woken};
+use input::hid::{HidProduct, axis_cap, axis_control};
 use input::{
-    Action, DeviceId, DeviceKind, InputAdapter, Packet, Phase, ScriptItem, ScriptedInput,
-    SourceConfig, SourceSet, WakeReport,
+    Action, DeviceId, DeviceKind, InputAdapter, MenuAction, MenuBindings, MenuEvent, Packet, Phase,
+    ScriptItem, ScriptedInput, SourceConfig, SourceSet, WakeReport, menu_queue,
 };
 
 struct Counting;
@@ -223,5 +225,105 @@ fn batches_do_not_allocate() {
     assert_eq!(wakes, 2_000);
     assert!(report.cuts >= 100, "{}", report.cuts);
     assert!(looped > 2_000, "{looped}");
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
+    menu_does_not_allocate();
+}
+
+/// The controller's menu on the input thread: buttons, axis steps with
+/// multi-step reports, a relative burst past the queue's room, a full
+/// queue, a background packet, the menu turned off and on, and the
+/// controller's removal and reconnection. The set and the tap are made
+/// outside the counted section.
+fn menu_does_not_allocate() {
+    let product = HidProduct {
+        vendor_id: 1,
+        product_id: 2,
+        interface: None,
+    };
+    let x = axis_control(0x01, 0x30);
+    let wheel = axis_control(0x01, 0x38);
+    let caps = [
+        axis_cap(x, true, 0, 255, 8).unwrap(),
+        axis_cap(wheel, false, -127, 127, 8).unwrap(),
+    ];
+    let turn = MenuAction::Turn {
+        forward: MenuEvent::Down,
+        backward: MenuEvent::Up,
+    };
+    let (tap, mut menu) = menu_queue(MenuBindings {
+        product,
+        controls: vec![
+            (ControlId(1), MenuAction::Press(MenuEvent::Confirm)),
+            (ControlId(2), MenuAction::Press(MenuEvent::Back)),
+            (x, turn),
+            (wheel, turn),
+        ],
+        step: 2,
+        relative: None,
+        wrap: Some(256),
+    });
+    let mut set = SourceSet::new(SourceConfig {
+        max_devices: 2,
+        max_sources: 2,
+        max_held: 4,
+        queue_capacity: 4,
+        max_arrivals: 1,
+    })
+    .unwrap();
+    let pad = DeviceId(30);
+    set.set_menu(tap);
+    let packet = |control, value| Packet {
+        device: pad,
+        control,
+        value,
+        background: false,
+    };
+    let mut popped = 0_u64;
+    let mut sent = 0_u64;
+
+    TRACK.with(|t| t.set(true));
+    for _ in 0..2 {
+        // Connected (again, in the second round) as the adapter does.
+        set.begin_batch(TimeUs(40_000));
+        set.connect(pad, DeviceKind::Controller);
+        set.set_product(pad, product);
+        set.add_axes(pad, &caps);
+        set.end_batch(TimeUs(40_000));
+        set.menu_mut().unwrap().set_active(true);
+        for t in 0..500_i32 {
+            set.begin_batch(TimeUs(40_001));
+            set.packet(&packet(ControlId(1 + t.unsigned_abs() % 2), 1));
+            set.packet(&packet(ControlId(1 + t.unsigned_abs() % 2), 0));
+            // Five forward per report: two steps and a remainder.
+            set.packet(&packet(x, (t * 5) % 256));
+            set.packet(&Packet {
+                background: true,
+                ..packet(ControlId(1), 1)
+            });
+            if t % 50 == 0 {
+                // A burst far past the queue's room.
+                set.packet(&packet(wheel, -127));
+            }
+            set.end_batch(TimeUs(40_002));
+            sent += u64::from(set.menu_mut().unwrap().take_sent());
+            // Read only every fortieth batch, so the queue fills.
+            if t % 40 == 0 {
+                while menu.pop().is_some() {
+                    popped += 1;
+                }
+            }
+            if t == 250 {
+                set.menu_mut().unwrap().set_active(false);
+                set.menu_mut().unwrap().set_active(true);
+            }
+        }
+        set.begin_batch(TimeUs(40_003));
+        set.disconnect(pad);
+        set.end_batch(TimeUs(40_003));
+    }
+    TRACK.with(|t| t.set(false));
+    assert!(sent > 100, "{sent}");
+    assert!(popped > 1_000, "{popped}");
+    assert!(menu.dropped() > 1_000, "{}", menu.dropped());
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 }
