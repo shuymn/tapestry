@@ -109,7 +109,7 @@ pub struct InputLink {
     /// The most awake time a reply is waited for.
     timeout: Duration,
     /// The awake-time clock the wait is measured on.
-    awake: Box<dyn Fn() -> Duration>,
+    awake: fn() -> Duration,
     /// The first handshake's failure: once set, no request is sent and no
     /// reply read, so a late reply to a request that timed out is never
     /// taken for the answer to another.
@@ -272,7 +272,7 @@ pub fn link(controls: Arc<Controls>, mode: Mode) -> (Hook, InputLink) {
             replies: rep_rx,
             state,
             timeout: INPUT_TIMEOUT,
-            awake: Box::new(awake_time),
+            awake: awake_time,
             failed: None,
         },
     )
@@ -1009,7 +1009,7 @@ mod link_tests {
     use bms_model::TimeUs;
     use game::{InputWaitError, ScratchConfig};
     use input::hid::HidProduct;
-    use input::{DeviceId, DeviceKind, QpcClock, SourceConfig, SourceSet};
+    use input::{DeviceId, DeviceKind, QpcClock, SourceSet};
 
     use super::autoplay_tests::{LEAD_IN, hooked, recorded, set};
     use super::{Hook, Mode, Recorded, Reply, Request, link};
@@ -1165,7 +1165,7 @@ mod link_tests {
         let (_controls, hook, mut link) = hooked(&sources);
         link.timeout = SHORT;
         // Asleep the whole time: the awake time does not move.
-        link.awake = Box::new(|| Duration::ZERO);
+        link.awake = || Duration::ZERO;
         let waker = Waker::spawn(hook, sources);
         waker.pause();
         let begun = Instant::now();
@@ -1203,14 +1203,7 @@ mod link_tests {
     /// input thread.
     #[test]
     fn the_open_reply_carries_the_console_lines() {
-        let mut sources = SourceSet::new(SourceConfig {
-            max_devices: 4,
-            max_sources: 4,
-            max_held: 4,
-            queue_capacity: 8,
-            max_arrivals: 2,
-        })
-        .unwrap();
+        let mut sources = set();
         sources.begin_batch(TimeUs(0));
         sources.connect(DeviceId(1), DeviceKind::Keyboard);
         sources.end_batch(TimeUs(0));

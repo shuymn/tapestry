@@ -719,8 +719,8 @@ fn status_reasons_and_end_statuses_are_pinned() {
     }
 }
 
-/// A play whose input thread failed is incomplete for that reason alone,
-/// and the reason survives a round trip.
+/// A play whose input thread failed is incomplete for that reason alone
+/// (its round trip is in `status_reasons_and_end_statuses_are_pinned`).
 #[test]
 fn an_input_failure_alone_marks_the_record_incomplete() {
     let input_failed = Incomplete {
@@ -729,11 +729,6 @@ fn an_input_failure_alone_marks_the_record_incomplete() {
     };
     assert!(input_failed.any());
     assert!(!Incomplete::default().any());
-    let mut rec = sample(9);
-    rec.status.incomplete = input_failed;
-    let back = decode(&encode(&rec), &limits()).unwrap();
-    assert_eq!(back.status.incomplete, input_failed);
-    assert_eq!(back, rec);
 }
 
 #[test]
