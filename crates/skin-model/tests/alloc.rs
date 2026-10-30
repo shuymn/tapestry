@@ -388,18 +388,11 @@ fn lanes() -> skin_model::LanesDef {
 
 /// An element showing `image` over the whole screen with `fill`.
 fn background(image: u16, fill: Fill) -> ElementDef {
-    ElementDef {
-        source: Source::Image(u32::from(image)),
-        track: lanes_support::rect([0, 0, 1_920, 1_080]),
-        timer: TimerRef::Builtin(timer::READY),
-        visible: None,
-        blend: Blend::Alpha,
-        clip: None,
-        place: Place {
-            fill,
-            ..Place::SCREEN
-        },
-    }
+    let place = Place {
+        fill,
+        ..Place::SCREEN
+    };
+    lanes_support::image(u32::from(image), [0, 0, 1_920, 1_080], place)
 }
 
 /// 2 000 elements, 30 on every built-in timer and 350 over 32 `when`s,
@@ -483,14 +476,10 @@ fn skin() -> Loaded {
     elements.push(background(timer::READY, Fill::Cover));
     elements.push(background(timer::READY, Fill::Stretch));
     elements.push(lanes_support::lanes_element());
+    let beam = lanes_support::bound(Bind::Lane(Lane::SCRATCH));
     elements.push(ElementDef {
-        source: Source::Image(u32::from(BEAM)),
-        track: lanes_support::rect([152, 824, 112, 112]),
-        timer: TimerRef::Builtin(timer::READY),
-        visible: None,
         blend: Blend::Add,
-        clip: None,
-        place: lanes_support::bound(Bind::Lane(Lane::SCRATCH)),
+        ..lanes_support::image(u32::from(BEAM), [152, 824, 112, 112], beam)
     });
     let (_dir, sheet) = images();
     let skin = Skin::new(SkinDef {
