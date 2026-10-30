@@ -3,18 +3,23 @@
 //! found, grouped by folder, the cursor, the search box and the order, and
 //! the page the render thread draws from them ([`MenuPage`]).
 //!
-//! Its input comes through winit, from the keyboard (a controller's comes
-//! later): the navigation keys move the cursor, Enter chooses,
-//! Tab gives the search box focus, and text typed or committed through the
-//! IME goes into the search box only while it has focus. The keyboard's
-//! lane keys type nothing into the list. Everything here runs on menus,
-//! where allocation is allowed.
+//! The keyboard's input comes through winit: the navigation keys move the
+//! cursor, Enter chooses, Tab gives the search box focus, and text typed
+//! or committed through the IME goes into the search box only while it
+//! has focus. The keyboard's lane keys type nothing into the list. The
+//! controller's bound lane controls come from the input thread as menu
+//! events ([`menu_bindings`]) and act as the keys they stand for
+//! ([`event_key`]). Everything here runs on menus, where allocation is
+//! allowed.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
+use eval::ControlId;
+use input::hid::{HidProduct, is_axis};
+use input::{MenuAction, MenuBindings, MenuEvent};
 use library::{ChartEntry, Search, Sort};
 
 use crate::menu_screen::{LineStyle, MenuLine, MenuPage, PAGE_LINES};
@@ -55,6 +60,71 @@ pub enum MenuInput {
     Text(String),
     /// The IME's composition so far; empty when it ends.
     Preedit(String),
+}
+
+/// What a controller's bound lane control does on the select screen
+/// (design.md "Input"), the one table of it: the white keys 1, 3, 5 and 7
+/// confirm, the black keys 2, 4 and 6 go back, and the scratch scrolls: an
+/// axis one line per press threshold of movement, toward higher values
+/// down and lower values up, and a scratch of two buttons up for the first
+/// bound and down for the second, a line per press.
+fn lane_menu(lane: u8, axis: bool, nth_scratch: usize) -> Option<MenuAction> {
+    use input::MenuEvent::{Back, Confirm, Down, Up};
+    Some(match (lane, axis) {
+        (0, true) => MenuAction::Turn {
+            forward: Down,
+            backward: Up,
+        },
+        (0, false) if nth_scratch == 0 => MenuAction::Press(Up),
+        (0, false) if nth_scratch == 1 => MenuAction::Press(Down),
+        (1 | 3 | 5 | 7, _) => MenuAction::Press(Confirm),
+        (2 | 4 | 6, _) => MenuAction::Press(Back),
+        _ => return None,
+    })
+}
+
+/// The controller's menu controls from its key config, or `None` when no
+/// controller is configured: each bound lane control as [`lane_menu`]
+/// says, of the configured controller, an axis stepping every press
+/// threshold of `scratch`'s movement, measured in the revolution play
+/// converts it with (`scratch`'s mode and revolution when set).
+pub fn menu_bindings(
+    config: &game::KeyConfig,
+    device: Option<HidProduct>,
+    scratch: &game::ScratchConfig,
+) -> Option<MenuBindings> {
+    let product = device?;
+    let mut scratch_buttons = 0;
+    let controls = config
+        .lanes
+        .iter()
+        .filter_map(|k| {
+            let control = ControlId(k.control);
+            let axis = is_axis(control);
+            let nth = scratch_buttons;
+            if k.lane == 0 && !axis {
+                scratch_buttons += 1;
+            }
+            lane_menu(k.lane, axis, nth).map(|a| (control, a))
+        })
+        .collect();
+    Some(MenuBindings {
+        product,
+        controls,
+        step: scratch.press_threshold,
+        relative: scratch.relative,
+        wrap: scratch.wrap,
+    })
+}
+
+/// The select screen's key for a controller's menu event.
+pub const fn event_key(event: MenuEvent) -> MenuKey {
+    match event {
+        MenuEvent::Confirm => MenuKey::Enter,
+        MenuEvent::Back => MenuKey::Escape,
+        MenuEvent::Up => MenuKey::Up,
+        MenuEvent::Down => MenuKey::Down,
+    }
 }
 
 /// Keys the queue holds at most; a key past them is dropped and counted.
@@ -477,6 +547,84 @@ mod tests {
 
     fn key(k: MenuKey) -> MenuInput {
         MenuInput::Key(k)
+    }
+
+    /// The controller's menu table: the white keys 1, 3, 5 and 7 confirm,
+    /// the black keys 2, 4 and 6 go back; a scratch axis scrolls down
+    /// toward higher values and up toward lower ones, a scratch of two
+    /// buttons up with the first bound and down with the second, at the
+    /// press threshold; without a configured controller there is no menu.
+    #[test]
+    fn controller_lanes_map_to_menu_events() {
+        use eval::ControlId;
+        use game::{KeyConfig, LaneKey};
+        use input::hid::{HidProduct, axis_control};
+        use input::{MenuAction, MenuEvent};
+
+        use super::{event_key, menu_bindings};
+
+        let product = HidProduct {
+            vendor_id: 1,
+            product_id: 2,
+            interface: None,
+        };
+        let x = axis_control(0x01, 0x30).0;
+        let lane = |control, lane| LaneKey { control, lane };
+        let mut lanes: Vec<LaneKey> = (1..=7).map(|n| lane(u32::from(n) + 10, n)).collect();
+        lanes.push(lane(x, 0));
+        let config = KeyConfig {
+            lanes,
+            retry: None,
+            quit: None,
+        };
+        let scratch = game::ScratchConfig {
+            relative: Some(false),
+            wrap: Some(256),
+            press_threshold: 3,
+            ..game::ScratchConfig::default()
+        };
+        let b = menu_bindings(&config, Some(product), &scratch).unwrap();
+        assert_eq!(
+            (b.product, b.step, b.relative, b.wrap),
+            (product, 3, Some(false), Some(256))
+        );
+        let scratch = game::ScratchConfig::default();
+        let press = |e| MenuAction::Press(e);
+        let (c, k) = (MenuEvent::Confirm, MenuEvent::Back);
+        let mut want: Vec<(ControlId, MenuAction)> = [c, k, c, k, c, k, c]
+            .into_iter()
+            .zip(11..)
+            .map(|(e, n)| (ControlId(n), press(e)))
+            .collect();
+        want.push((
+            ControlId(x),
+            MenuAction::Turn {
+                forward: MenuEvent::Down,
+                backward: MenuEvent::Up,
+            },
+        ));
+        assert_eq!(b.controls, want);
+        // A scratch of two buttons, bound after key 1; a third plays the
+        // lane but sends nothing.
+        let config = KeyConfig {
+            lanes: vec![lane(11, 1), lane(20, 0), lane(21, 0), lane(22, 0)],
+            retry: None,
+            quit: None,
+        };
+        let b = menu_bindings(&config, Some(product), &scratch).unwrap();
+        assert_eq!(
+            b.controls,
+            [
+                (ControlId(11), press(c)),
+                (ControlId(20), press(MenuEvent::Up)),
+                (ControlId(21), press(MenuEvent::Down)),
+            ]
+        );
+        assert_eq!(menu_bindings(&config, None, &scratch), None);
+        assert_eq!(event_key(MenuEvent::Confirm), MenuKey::Enter);
+        assert_eq!(event_key(MenuEvent::Back), MenuKey::Escape);
+        assert_eq!(event_key(MenuEvent::Up), MenuKey::Up);
+        assert_eq!(event_key(MenuEvent::Down), MenuKey::Down);
     }
 
     /// The navigation keys move the cursor within the list, Enter chooses

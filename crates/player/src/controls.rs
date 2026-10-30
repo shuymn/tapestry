@@ -122,7 +122,9 @@ impl Controls {
     }
 
     /// Unparks the game thread, so it acts on what changed without
-    /// waiting out its idle wait.
+    /// waiting out its idle wait. The input thread calls it for menu
+    /// events.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn wake_game(&self) {
         if let Some(g) = self.game.get() {
             g.unpark();

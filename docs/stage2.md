@@ -483,9 +483,13 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 ### D18. Menu input
 
 - **Keyboard.** Navigation and IME come through winit.
-- **Controller.** While Idle and focused, the input thread turns the bound controller lanes and scratch into menu events: key 1 or 7 confirms or goes back, and the scratch scrolls.
+- **Controller.** While Idle and focused, the input thread turns the configured controller's bound lanes and scratch into menu events for the select screen (design.md "Input", "Menu input"):
+  - the white keys 1, 3, 5 and 7 confirm (as Enter), and the black keys 2, 4 and 6 go back (as Escape);
+  - the scratch scrolls a line at a time: an axis a line for each whole press threshold of movement, taken the short way round the revolution play converts it with, toward higher values down and toward lower values up, the remainder counting toward the next line; a scratch of two buttons, up with the first bound and down with the second;
+  - a button sends on its press only, with no repeat while held; only the first connected unit of the configured model sends, and none without a configured controller.
   - Events go through a bounded SPSC queue, and the thread unparks the game thread.
   - Menu events are never recorded.
+  - The result screen keeps the keyboard's retry and quit keys; controller commands there arrive with PR17.
 - **Keyboard lane keys** are not menu events.
 
 ### D19. Record format changes
@@ -829,6 +833,8 @@ Each one holds the behavior D17 states.
 **Done when (records).** Records shall carry the wake policy, and the `input` allocation test shall count 0.
 
 ### PR10. Controller menu input
+
+**Touches.** `input` (menu.rs, sources.rs), input_side.rs, select.rs, selection.rs, main.rs, design.md "Input".
 
 **Depends on.** PR9, PR15.
 

@@ -13,7 +13,10 @@
 //!
 //! The hook reports the thread's phase (`input::cadence`): Open from an
 //! open, Tail from a close, and Idle only from [`Request::Idle`], which the
-//! game thread sends once a play's audio tail is over.
+//! game thread sends once a play's audio tail is over. At each boundary
+//! the hook also sets the controller's menu active only while Idle with the
+//! window focused, and wakes the game thread when the batch sent a menu
+//! event (design.md "Input").
 //!
 //! The game thread waits for each reply at most [`INPUT_TIMEOUT`] of awake
 //! time; an input thread that is gone or does not answer fails the link for
@@ -410,7 +413,22 @@ impl Hook {
         {
             logic.unpark();
         }
+        self.menu(sources);
         self.phase
+    }
+
+    /// The controller's menu: active from here to the next boundary only
+    /// while the thread is Idle and the window has focus, so a request
+    /// that opens recording or a focus change ends it at the boundary it
+    /// is seen at. The game thread is woken when this batch sent events.
+    fn menu(&self, sources: &mut SourceSet) {
+        let active = self.phase == Phase::Idle && self.controls.focused();
+        if let Some(menu) = sources.menu_mut() {
+            menu.set_active(active);
+            if menu.take_sent() {
+                self.controls.wake_game();
+            }
+        }
     }
 
     fn publish(&self, sources: &SourceSet) {
@@ -479,8 +497,12 @@ impl Hook {
                     reason = "the run's source set was made with these sizes"
                 )]
                 {
+                    let menu = sources.take_menu();
                     *sources = SourceSet::new(script.sources.clone())
                         .expect("the run's source set was made with these sizes");
+                    if let Some(menu) = menu {
+                        sources.set_menu(menu);
+                    }
                 }
                 let open_at = TimeUs(-lead_in.0);
                 input::InputAdapter::poll(&mut script.current, TimeUs(open_at.0 - 1), sources);
@@ -1448,5 +1470,253 @@ mod wake_tests {
         assert_eq!(wakes.load(Ordering::Acquire), from + 1);
         let report = thread.stop().unwrap();
         assert!(report.causes.heartbeat <= 2, "{:?}", report.causes);
+    }
+}
+
+/// The controller's menu through the hook: menu events flow only while the
+/// thread is Idle and the window has focus, never from a background
+/// packet, and wake the game thread.
+#[cfg(test)]
+mod menu_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use bms_model::TimeUs;
+    use eval::ControlId;
+    use game::{KeyConfig, LaneKey, ScratchConfig};
+    use input::hid::{HidDevice, HidLayout, HidProduct, HidReport, axis_cap, axis_control};
+    use input::{
+        Capture, DeviceId, DeviceKind, MenuEvent, MenuReceiver, QpcClock, SourceConfig, SourceSet,
+        Waker,
+    };
+
+    use super::{Hook, InputLink, Mode, Recorded, Reply, Request, link};
+    use crate::controls::Controls;
+    use crate::select::menu_bindings;
+
+    const PAD: HidProduct = HidProduct {
+        vendor_id: 0x1A2B,
+        product_id: 0x3C4D,
+        interface: None,
+    };
+    const X: ControlId = axis_control(0x01, 0x30);
+
+    /// One batch's reports: the buttons held and X's position.
+    type Reports<'a> = &'a [(&'a [u16], Option<i32>)];
+
+    /// Buttons 1 to 7 play keys 1 to 7, X the scratch.
+    fn keys() -> KeyConfig {
+        let mut lanes: Vec<LaneKey> = (1..=7)
+            .map(|n| LaneKey {
+                control: u32::from(n),
+                lane: n,
+            })
+            .collect();
+        lanes.push(LaneKey {
+            control: X.0,
+            lane: 0,
+        });
+        KeyConfig {
+            lanes,
+            retry: None,
+            quit: None,
+        }
+    }
+
+    struct Rig {
+        controls: Arc<Controls>,
+        hook: Hook,
+        link: InputLink,
+        sources: SourceSet,
+        pad: HidDevice,
+        capture: Capture,
+        menu: MenuReceiver,
+        now: i64,
+    }
+
+    impl Rig {
+        /// The configured controller connected, with its menu, the window
+        /// focused, and the thread in its tail as at its start.
+        fn new() -> Self {
+            let mut sources = SourceSet::new(SourceConfig {
+                max_devices: 4,
+                max_sources: 4,
+                max_held: 16,
+                queue_capacity: 64,
+                max_arrivals: 2,
+            })
+            .unwrap();
+            let caps = [axis_cap(X, true, 0, 255, 8).unwrap()];
+            sources.begin_batch(TimeUs(0));
+            sources.connect(DeviceId(10), DeviceKind::Controller);
+            sources.set_product(DeviceId(10), PAD);
+            sources.add_axes(DeviceId(10), &caps);
+            sources.end_batch(TimeUs(0));
+            let scratch = ScratchConfig::default();
+            let bindings = menu_bindings(&keys(), Some(PAD), &scratch).unwrap();
+            let (tap, menu) = input::menu_queue(bindings);
+            sources.set_menu(tap);
+            let controls = Arc::new(Controls::new(QpcClock::start()));
+            controls.set_latch(sources.gate().handle());
+            controls.set_game(std::thread::current());
+            let (hook, link) = link(Arc::clone(&controls), Mode::Clock, Waker::new().unwrap());
+            let layout = HidLayout {
+                collection: 0,
+                axes: &caps,
+                buttons: &[],
+            };
+            Self {
+                controls,
+                hook,
+                link,
+                sources,
+                pad: HidDevice::new(DeviceId(10), &layout),
+                capture: Capture::new(),
+                menu,
+                now: 1_000,
+            }
+        }
+
+        /// A boundary with no batch before it.
+        fn wake(&mut self) {
+            self.now += 1_000;
+            self.hook.wake(&mut self.sources, TimeUs(self.now));
+        }
+
+        /// One batch of reports through the controller's reader, then its
+        /// boundary.
+        fn batch(&mut self, reports: Reports<'_>, background: bool) {
+            self.now += 1_000;
+            self.sources.begin_batch(TimeUs(self.now));
+            for &(buttons, x) in reports {
+                let axes = [x];
+                let report = HidReport {
+                    id: 0,
+                    buttons: Some(buttons),
+                    axes: &axes,
+                };
+                self.pad
+                    .report(&report, background, &self.capture, &mut self.sources);
+            }
+            self.sources.end_batch(TimeUs(self.now));
+            self.wake();
+        }
+
+        fn ask(&mut self, request: Request) -> Option<Reply> {
+            self.link.requests.send(request).unwrap();
+            self.wake();
+            self.link.replies.try_recv().ok()
+        }
+
+        fn idle(&mut self) {
+            assert!(self.ask(Request::Idle).is_none());
+        }
+
+        fn open(&mut self) {
+            let recorded = Recorded {
+                keyboard: Vec::new(),
+                controller: keys().recorded(),
+                controller_device: Some(PAD),
+                scratch: ScratchConfig::default(),
+            };
+            let reply = self.ask(Request::Open {
+                lead_in: TimeUs(1_000_000),
+                logic: std::thread::current(),
+                recorded,
+            });
+            assert!(matches!(reply, Some(Reply::Opened(..))));
+        }
+
+        fn events(&mut self) -> Vec<MenuEvent> {
+            std::iter::from_fn(|| self.menu.pop()).collect()
+        }
+
+        /// Takes any unpark left, runs `reports`, and says whether the game
+        /// thread (this one) was unparked by them.
+        fn unparks(&mut self, reports: Reports<'_>) -> bool {
+            std::thread::park_timeout(Duration::ZERO);
+            self.batch(reports, false);
+            let begun = Instant::now();
+            std::thread::park_timeout(Duration::from_secs(5));
+            begun.elapsed() < Duration::from_secs(1)
+        }
+    }
+
+    /// A press and release of each button of `buttons`.
+    fn presses(buttons: &[u16]) -> Vec<(&[u16], Option<i32>)> {
+        buttons
+            .iter()
+            .flat_map(|b| [(std::slice::from_ref(b), None), (&[][..], None)])
+            .collect()
+    }
+
+    /// Idle and focused, every bound control of the configured controller
+    /// becomes its menu event, in order: the white keys confirm, the black
+    /// keys go back, and the scratch axis scrolls a line per press
+    /// threshold (2), higher values down; an unbound button sends nothing.
+    /// The game thread is woken for them.
+    #[test]
+    fn menu_events_from_bound_controls() {
+        use MenuEvent::{Back, Confirm, Down, Up};
+        let mut rig = Rig::new();
+        rig.idle();
+        assert!(rig.unparks(&presses(&[1, 2, 3, 4, 5, 6, 7, 9])));
+        assert_eq!(
+            rig.events(),
+            [Confirm, Back, Confirm, Back, Confirm, Back, Confirm]
+        );
+        let turns: Reports<'_> = &[
+            (&[], Some(100)),
+            (&[], Some(102)),
+            (&[], Some(103)),
+            (&[], Some(101)),
+            (&[], Some(100)),
+        ];
+        assert!(rig.unparks(turns));
+        assert_eq!(rig.events(), [Down, Up]);
+    }
+
+    /// While Open or Tail no menu events are sent; once Idle again they
+    /// are.
+    #[test]
+    fn no_menu_events_while_recording() {
+        let mut rig = Rig::new();
+        let press = presses(&[1]);
+        // The thread starts in its tail.
+        rig.batch(&press, false);
+        assert_eq!(rig.events(), []);
+        rig.idle();
+        rig.open();
+        rig.batch(&press, false);
+        rig.batch(&[(&[], Some(10)), (&[], Some(20))], false);
+        assert_eq!(rig.events(), []);
+        assert!(matches!(rig.ask(Request::Close), Some(Reply::Closed(..))));
+        rig.batch(&press, false);
+        rig.batch(&[(&[], Some(30)), (&[], Some(40))], false);
+        assert_eq!(rig.events(), []);
+        rig.idle();
+        rig.batch(&press, false);
+        assert_eq!(rig.events(), [MenuEvent::Confirm]);
+    }
+
+    /// A packet received in the background never reaches the menu, nor
+    /// does any packet while the window has no focus; with focus back the
+    /// controls send again.
+    #[test]
+    fn background_packets_never_reach_the_menu() {
+        let mut rig = Rig::new();
+        rig.idle();
+        let press = presses(&[1]);
+        rig.batch(&press, true);
+        rig.batch(&[(&[], Some(10)), (&[], Some(20))], true);
+        assert_eq!(rig.events(), []);
+        rig.controls.focus(false);
+        rig.wake();
+        rig.batch(&press, false);
+        assert_eq!(rig.events(), []);
+        rig.controls.focus(true);
+        rig.wake();
+        rig.batch(&press, false);
+        assert_eq!(rig.events(), [MenuEvent::Confirm]);
     }
 }
