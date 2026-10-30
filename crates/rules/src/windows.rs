@@ -5,7 +5,7 @@
 
 use bms_model::{Lane, TimeUs};
 
-use crate::{JudgeRank, JudgeWindows, LnEndWindows, RankScale, scale_edge};
+use crate::{JudgeRank, JudgeWindows, LnEndWindows, RankScale};
 
 /// The lanes that share one table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,9 +175,6 @@ pub struct ScaledRank {
     /// `#DEFEXRANK n` scales by `floor(n × defexrank_percent / 100)` %,
     /// with `n` as the header policy read it.
     pub defexrank_percent: u32,
-    /// Whether the empty POOR range scales with the note windows. The note
-    /// windows and LN-end edges always scale.
-    pub scales_empty_poor: bool,
 }
 
 impl ScaledRank {
@@ -216,7 +213,7 @@ pub enum WindowPolicy {
     Thousandths(RankScale),
     /// Every window and LN-end edge scaled by a whole percentage from
     /// [`ScaledRank`], each edge `floor(edge × percent / 100)` in µs; the
-    /// empty POOR range only if [`ScaledRank::scales_empty_poor`]. One scan
+    /// empty POOR range is not scaled. One scan
     /// envelope spans both lane classes: ahead to the farthest early BAD
     /// edge or empty POOR reach of either table, that distance excluded;
     /// behind to the farthest late one, included. Once a scaled early BAD
@@ -236,26 +233,19 @@ impl WindowPolicy {
         tables: &PerLaneClass<LaneTable>,
         rank: Option<JudgeRank>,
     ) -> Option<PerLaneClass<PreparedTable>> {
-        let scaled = |t: &LaneTable, milli: i64, empty_poor: bool| -> Option<LaneTable> {
-            let range = t.empty_poor;
+        // The empty POOR range is never scaled.
+        let scaled = |t: &LaneTable, milli: i64| -> Option<LaneTable> {
             Some(LaneTable {
                 windows: t.windows.scaled(milli)?,
                 ln_end: t.ln_end.scaled(milli)?,
-                empty_poor: if empty_poor {
-                    EmptyPoorRange {
-                        ahead: scale_edge(range.ahead, milli)?,
-                        behind: scale_edge(range.behind, milli)?,
-                    }
-                } else {
-                    range
-                },
+                empty_poor: t.empty_poor,
             })
         };
         match self {
             Self::Thousandths(scale) => {
                 let milli = scale.scale_milli(rank)?;
                 let own = |t: &LaneTable| -> Option<PreparedTable> {
-                    let table = scaled(t, milli, false)?;
+                    let table = scaled(t, milli)?;
                     let (ahead, behind) = table.reach();
                     Some(PreparedTable {
                         table,
@@ -278,9 +268,8 @@ impl WindowPolicy {
             }
             Self::Scaled(rank_scale) => {
                 let milli = rank_scale.percent(rank)?.checked_mul(1_000)?;
-                let empty_poor = rank_scale.scales_empty_poor;
-                let keys = scaled(&tables.keys, milli, empty_poor)?;
-                let scratch = scaled(&tables.scratch, milli, empty_poor)?;
+                let keys = scaled(&tables.keys, milli)?;
+                let scratch = scaled(&tables.scratch, milli)?;
                 let (keys_ahead, keys_behind) = keys.reach();
                 let (scratch_ahead, scratch_behind) = scratch.reach();
                 let envelope = ScanEnvelope {
@@ -354,22 +343,18 @@ mod tests {
     }
 
     #[test]
-    fn a_scaled_empty_poor_range_follows_the_scale() {
-        let mut s = scaled();
+    fn a_scaled_policy_keeps_the_empty_poor_range() {
         let preset = beatoraja_style();
-        let at = |s: ScaledRank| {
-            WindowPolicy::Scaled(s)
-                .prepare(&preset.tables, Some(JudgeRank::Rank(0)))
-                .unwrap()
-                .scratch
-                .table
-                .empty_poor
-        };
-        assert_eq!(at(s).behind, TimeUs(160 * MS));
-        s.scales_empty_poor = true;
-        // 25 % of 500 and 160 ms.
-        assert_eq!(at(s).ahead, TimeUs(125 * MS));
-        assert_eq!(at(s).behind, TimeUs(40 * MS));
+        let range = WindowPolicy::Scaled(scaled())
+            .prepare(&preset.tables, Some(JudgeRank::Rank(0)))
+            .unwrap()
+            .scratch
+            .table
+            .empty_poor;
+        assert_eq!(
+            (range.ahead, range.behind),
+            (TimeUs(500 * MS), TimeUs(160 * MS))
+        );
     }
 
     #[test]

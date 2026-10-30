@@ -284,7 +284,6 @@ impl Writer {
                     rank_percent,
                     absent_percent,
                     defexrank_percent,
-                    scales_empty_poor,
                 } = *scaled;
                 self.uint(1);
                 self.len(rank_percent.len());
@@ -293,7 +292,6 @@ impl Writer {
                 }
                 self.uint(u64::from(absent_percent));
                 self.uint(u64::from(defexrank_percent));
-                self.bool(scales_empty_poor);
             }
         }
     }
@@ -554,7 +552,6 @@ impl Reader<'_> {
                     rank_percent,
                     absent_percent: self.u32("absent_percent")?,
                     defexrank_percent: self.u32("defexrank_percent")?,
-                    scales_empty_poor: self.bool("scales_empty_poor")?,
                 }))
             }
             tag => Err(CanonicalError::UnknownTag {
@@ -784,12 +781,11 @@ mod tests {
             preset.canonical_bytes()
         };
         let mut seen = HashSet::from([crate::beatoraja_style().canonical_bytes()]);
-        let edits: [fn(&mut crate::ScaledRank); 5] = [
+        let edits: [fn(&mut crate::ScaledRank); 4] = [
             |s| s.rank_percent[0] += 1,
             |s| s.rank_percent[4] += 1,
             |s| s.absent_percent += 1,
             |s| s.defexrank_percent += 1,
-            |s| s.scales_empty_poor = true,
         ];
         for edit in edits {
             assert!(seen.insert(scaled(edit)));
@@ -850,7 +846,6 @@ mod tests {
             rank_percent: [25, 50, 75, 100, 125],
             absent_percent: 80,
             defexrank_percent: 70,
-            scales_empty_poor: true,
         });
         p.default_total_milli = 123_456;
         p
@@ -865,8 +860,8 @@ mod tests {
     /// table, custom's but 160 ms behind (`80 c4 13`); the miss rule (0),
     /// the empty POOR's three flags, the header policy (`IntegerRanks`, 1),
     /// the window policy (`Scaled`, 1: five percentages `19 32 4b 64 7d`, 80
-    /// `50`, 70 `46`, true), and the rest in declaration order.
-    const PINNED: [u8; 231] = [
+    /// `50`, 70 `46`), and the rest in declaration order.
+    const PINNED: [u8; 230] = [
         0x06, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x03, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
@@ -876,7 +871,7 @@ mod tests {
         0x0c, 0xc0, 0xfc, 0x15, 0xc0, 0xfc, 0x15, 0xc0, 0x9a, 0x0c, 0xe0, 0xa7, //
         0x12, 0x80, 0xb5, 0x18, 0xc0, 0x84, 0x3d, 0x80, 0xc4, 0x13, 0x00, 0x00, //
         0x00, 0x01, 0x01, 0x01, 0x05, 0x19, 0x32, 0x4b, 0x64, 0x7d, 0x50, 0x46, //
-        0x01, 0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, //
+        0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, //
         0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, 0xb5, //
         0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, //
         0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, 0x00, 0xbf, //

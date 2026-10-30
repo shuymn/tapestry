@@ -164,7 +164,6 @@ enum WindowPolicyFile {
         rank_percent: [u32; 5],
         absent_percent: u32,
         defexrank_percent: u32,
-        scales_empty_poor: bool,
     },
 }
 
@@ -440,12 +439,10 @@ impl From<PresetFile> for RulePreset {
                     rank_percent,
                     absent_percent,
                     defexrank_percent,
-                    scales_empty_poor,
                 } => WindowPolicy::Scaled(ScaledRank {
                     rank_percent,
                     absent_percent,
                     defexrank_percent,
-                    scales_empty_poor,
                 }),
             },
             default_total_milli,
@@ -572,12 +569,10 @@ impl From<&RulePreset> for PresetFile {
                     rank_percent,
                     absent_percent,
                     defexrank_percent,
-                    scales_empty_poor,
                 }) => WindowPolicyFile::Scaled {
                     rank_percent,
                     absent_percent,
                     defexrank_percent,
-                    scales_empty_poor,
                 },
             },
             default_total_milli: *default_total_milli,

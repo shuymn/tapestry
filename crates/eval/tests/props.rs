@@ -527,9 +527,10 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
         "window_policy_thousandths",
         matches!(p.window_policy, WindowPolicy::Thousandths(_)),
     );
-    let scaled = |empty_poor: bool| matches!(p.window_policy, WindowPolicy::Scaled(s) if s.scales_empty_poor == empty_poor);
-    c.hit("window_policy_scaled", scaled(false));
-    c.hit("window_policy_scaled_empty_poor", scaled(true));
+    c.hit(
+        "window_policy_scaled",
+        matches!(p.window_policy, WindowPolicy::Scaled(_)),
+    );
     let survival = |low: bool| {
         p.gauges
             .iter()
@@ -840,7 +841,6 @@ fn generators_reach_the_fragile_spots() {
         ("scratch_own_table", 1),
         ("window_policy_thousandths", 1),
         ("window_policy_scaled", 1),
-        ("window_policy_scaled_empty_poor", 1),
         ("survival_with_low_damage", 1),
         ("survival_without_low_damage", 1),
         ("gauge_at_max", 1),

@@ -254,7 +254,6 @@ pub fn beatoraja_style() -> RulePreset {
             rank_percent: [25, 50, 75, 100, 125],
             absent_percent: 75,
             defexrank_percent: 75,
-            scales_empty_poor: false,
         }),
         default_total_milli: 260_000,
         denominator: Denominator::TapsAndLnHeads,

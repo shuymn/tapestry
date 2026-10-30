@@ -553,7 +553,6 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
             rank_percent: [0, 1, 2, 3, 4].map(|k| percent(raw.rank[k])),
             absent_percent: percent(raw.rank[5]),
             defexrank_percent: percent(raw.defexrank),
-            scales_empty_poor: flag(18),
         })
     } else {
         WindowPolicy::Thousandths(RankScale {
@@ -1194,11 +1193,8 @@ pub fn build_play(raw: &RawPlay) -> Play {
                 .or(judgeable(&chart, None).last())
                 .unwrap();
             let at = final_deadline.0 + if param % 2 == 0 { 1 } else { TICK };
-            // The range of the lane's class, kept unscaled; the scan
+            // The range of the lane's class, never scaled; the scan
             // envelope widens with it.
-            if let WindowPolicy::Scaled(s) = &mut preset.window_policy {
-                s.scales_empty_poor = false;
-            }
             let [keys, scratch] = preset.tables.each_mut();
             let table = if lane(l) == Lane::SCRATCH {
                 scratch

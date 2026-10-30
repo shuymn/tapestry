@@ -118,23 +118,18 @@ fn window_policy() -> impl Strategy<Value = WindowPolicy> {
             [percent(), percent(), percent(), percent(), percent()],
             percent(),
             u32s(),
-            any::<bool>(),
         )
-            .prop_map(
-                |(rank_percent, absent_percent, defexrank_percent, scales_empty_poor)| {
-                    WindowPolicy::Scaled(ScaledRank {
-                        rank_percent,
-                        absent_percent,
-                        defexrank_percent,
-                        scales_empty_poor,
-                    })
-                }
-            ),
+            .prop_map(|(rank_percent, absent_percent, defexrank_percent)| {
+                WindowPolicy::Scaled(ScaledRank {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                })
+            }),
     ]
 }
 
-/// A lane class's table. Its empty POOR range stays below 2^31 µs when the
-/// policy scales it.
+/// A lane class's table.
 fn table() -> impl Strategy<Value = LaneTable> {
     (windows_and_ln_end(), non_negative(), non_negative()).prop_map(
         |((windows, ln_end), ahead, behind)| LaneTable {
@@ -242,7 +237,7 @@ fn preset() -> impl Strategy<Value = RulePreset> {
     )
         .prop_map(
             |(
-                (id, version, mut keys, mut scratch),
+                (id, version, keys, scratch),
                 [breaks_combo, counts_bp, counted],
                 (headers, window_policy),
                 default_total_milli,
@@ -250,18 +245,6 @@ fn preset() -> impl Strategy<Value = RulePreset> {
                 (ex, breaks_combo_by, counts_bp_by),
                 per_unit,
             )| {
-                if matches!(
-                    window_policy,
-                    WindowPolicy::Scaled(ScaledRank {
-                        scales_empty_poor: true,
-                        ..
-                    })
-                ) {
-                    for t in [&mut keys, &mut scratch] {
-                        t.empty_poor.ahead.0 %= 1 << 31;
-                        t.empty_poor.behind.0 %= 1 << 31;
-                    }
-                }
                 RulePreset {
                     id,
                     version,
@@ -318,7 +301,7 @@ fn generator_reaches_every_variant_and_length_class() {
     let presets = preset();
     let mut counts = [0_usize; 19];
     // Per boolean field, whether it was seen false and true.
-    let mut bools_seen = [[false; 2]; 14];
+    let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
         let p = presets.new_tree(&mut runner).unwrap().current();
         let deltas = p.gauges.iter().flat_map(|g| {
@@ -361,12 +344,7 @@ fn generator_reaches_every_variant_and_length_class() {
         let all = |w: PerJudgment<bool>| [w.perfect, w.great, w.good, w.bad, w.poor];
         let [b0, b1, b2, b3, b4] = all(p.score.breaks_combo);
         let [c0, c1, c2, c3, c4] = all(p.score.counts_bp);
-        let scales_empty_poor = match p.window_policy {
-            WindowPolicy::Scaled(s) => s.scales_empty_poor,
-            WindowPolicy::Thousandths(_) => continue,
-        };
         let bools = [
-            scales_empty_poor,
             e.breaks_combo,
             e.counts_bp,
             e.counted,

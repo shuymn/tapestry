@@ -894,6 +894,34 @@ fn scan_envelope_follows_the_scaled_tables() {
     );
 }
 
+/// Source: play/JudgeManager.java:387-389 (`dmtime >= mjudgeend` ends the
+/// scan) with the envelope of :189-196. At `#DEFEXRANK 291` (218 %) the
+/// scratch's early BAD edge, 501.4 ms, is the envelope's far end, so a
+/// scratch note exactly that far ahead is not reached and 1 µs nearer is
+/// BAD; it is past the 500 ms empty POOR range too. The keys' early BAD
+/// edge, 479.6 ms, lies inside the envelope and stays inclusive.
+#[test]
+fn an_early_bad_edge_at_the_envelope_end_is_not_reached() {
+    let chart = scratch_and_key(Some(common::defexrank(291)));
+    let first = |presses: Vec<PhysicalInputEvent>| {
+        let e = play(&chart, presses);
+        let pressed: Vec<_> = judgments(&e.events)
+            .into_iter()
+            .filter(|j| j.3.is_some())
+            .map(|j| (j.0, j.2, j.3))
+            .collect();
+        (pressed, empty_poors(&e.events))
+    };
+    let scratch_at = |d: i64| vec![press(T + d, 0, 0), release(T + d + 10, 0, 0)];
+    assert_eq!(first(scratch_at(-501_400)), (Vec::new(), 0));
+    assert_eq!(
+        first(scratch_at(-501_399)),
+        (vec![(0, Bad, Some(-501_399))], 0)
+    );
+    let key_at = vec![press(T - 479_600, 0, 1), release(T - 479_590, 0, 1)];
+    assert_eq!(first(key_at), (vec![(1, Bad, Some(-479_600))], 0));
+}
+
 /// Known difference (the preset module): the source plays any scale its
 /// `int` arithmetic gives (play/BMSPlayerRule.java:63), while every edge
 /// here stays within 2^32 µs. `#DEFEXRANK 1974698` scales by 1 481 023 %,
