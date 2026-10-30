@@ -57,7 +57,7 @@ Times are integer milliseconds in files and microseconds inside. For an element 
 
 ### R3. State and timers
 
-The skin reads a per-frame `SkinFrame`, filled from the render thread's `FrameInput`, the chart, a play context given to `prepare`, and a reducer over the drained effects. The play context is fixed for one attempt: the preset's gauge descriptors (kind and order of `PlayView::gauges`, which carry values only, crates/game/src/render.rs:17-28), the attempt's start position and, in practice, its section, so the lanes widget draws only the section's targets (stage2.md D15) and `ready` and `play` start from the attempt's own countdown, not chart time 0.
+The skin reads a per-frame `SkinFrame`, filled from the render thread's `FrameInput`, the chart, a play context given to `prepare`, and a reducer over the drained effects. The play context is fixed for one attempt: the preset's gauge descriptors (`start` and `max`, in the order of `PlayView::gauges`, which carry values only, crates/game/src/render.rs:17-28), the attempt's start position and, in practice, its section, so the lanes widget draws only the section's targets (stage2.md D15) and `ready` and `play` start from the attempt's own countdown, not chart time 0.
 
 **Where each kind of value comes from:**
 - **Numbers come only from the play view.** A dropped effect loses a flash, never a number on screen (crates/game/src/render.rs:36-40). Counts, EX score, BP, combo, gauges and the like are read from `PlayView`, never accumulated from effects.
