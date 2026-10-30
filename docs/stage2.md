@@ -237,10 +237,11 @@ egui comes with the first form-like screen.
 - Each preset gets a few dozen hand-written examples.
 - An axis is added only when an example fails without it.
 
-**Axes beatoraja-style needs.** beatoraja (exch-bms2/beatoraja@83574048) differs from today's model in seven places, each shown by an example. PR7 lands the values the model expresses and records these in the preset's module with their sources; PR7a–PR7d add them.
+**Axes beatoraja-style needs.** beatoraja (exch-bms2/beatoraja@83574048) differs from today's model in eight places, each shown by an example. PR7 lands the values the model expresses and records these in the preset's module with their sources; PR7a–PR7d add them.
 - **A. Scratch windows:** a separate table for scratch notes, scratch LN ends and scratch empty POOR (PR7a).
 - **F. Rank scaling:** `#DEFEXRANK n` scales by n × 75 / 100 %, and `#RANK 4` by 125 % (PR7a).
 - **B. Note assignment:** which note a press judges when several are in range, and whether earlier notes stay hittable until their late BAD deadline (PR7b).
+- **H. Miss timing:** a note is missed strictly after its late BAD edge, so a press on another lane at that time is judged first, which can change combo and gauge (PR7b, with the miss policy).
 - **C, D, E. Gauges:** HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))` (PR7c). N is the whole chart's count, practice included.
 - **G. A BAD long-note head:** it keeps holding and is scored at the release or the end (PR7d).
 
@@ -679,12 +680,13 @@ Analysis runs at 1× and its result is reused at every speed.
 
 ### PR7b. Note assignment policy (`rules`, `eval`)
 
-**Touches.** the assignment step in `eval`, the preset's policy field, the canonical encoding, style_beatoraja.rs, the generators and the props.
+**Touches.** the assignment step and miss deadlines in `eval`, the preset's policy fields, the canonical encoding, style_beatoraja.rs, the generators and the props.
 
 **Depends on.** PR7a.
 
 **Done when.**
 - When several notes on a lane are in range under beatoraja-style, the press shall judge the note beatoraja's combo-priority algorithm picks, and earlier notes shall stay hittable until their late BAD deadline (`combo_priority_assignment_matches_the_source`).
+- When a note's late BAD edge and another lane's press fall at the same time under beatoraja-style, the press shall be judged first (`miss_is_decided_after_the_edge`).
 - When the custom preset runs, assignment shall stay nearest-first with overtaking, and every existing example shall pass unchanged.
 - When the props run, incremental and batch evaluation shall agree under every assignment value.
 
