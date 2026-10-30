@@ -267,10 +267,18 @@ fn a_pause_requested_again_right_after_a_release_is_acknowledged() {
     });
     assert!(scan.wait_paused(LONG), "the new request is acknowledged");
     assert!(gate.quiet(), "nothing is read between");
-    // Released and paused again from outside, one call after the other.
+    // Released, and the scan takes the next file in hand before the new
+    // request: the request is acknowledged once that file is done.
     scan.release();
+    gate.next();
     scan.request_pause();
+    assert!(
+        !scan.wait_paused(SHORT),
+        "no acknowledgment while a file is in hand"
+    );
+    gate.open(1);
     assert!(scan.wait_paused(LONG));
+    assert!(gate.quiet(), "nothing is read during the pause");
     scan.release();
     drain(&scan, &gate);
     assert_eq!(scan.finish().unwrap().read, 3);
