@@ -104,7 +104,7 @@ fn outer(layout: Layout) -> (Layout, usize) {
     (outer, head)
 }
 
-// SAFETY: delegates to `System` with room for a flag before each block.
+// SAFETY: delegates to `System` with room for a generation tag before each block.
 unsafe impl GlobalAlloc for Peak {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let (outer, head) = outer(layout);

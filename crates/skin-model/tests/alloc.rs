@@ -8,6 +8,7 @@
 //! disturb the count. This file holds a single test for the same reason.
 //! Profiles and the positive control: design.md "Scope of No Allocation".
 
+mod image_support;
 mod play_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -17,13 +18,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, Lane, NoteKind, SoundId, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, Section, Tally};
-use image::{ImageFormat, Rgba, RgbaImage};
+use image_support::{dir, file, save, solid, whole};
 use play_support::{bool_program, state, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
-    AtlasLimits, Attempt, Blend, ClipId, CycleDef, Ease, ElementDef, End, FileDef, Filter,
-    GaugeDesc, ImageDef, KeyDef, LaneTimer, Play, PlayContext, QuadBatch, Sheet, Skin, SkinFrame,
-    Source, TimerRef, Track, UvTable, Variant, lane_timer, timer,
+    AtlasLimits, Attempt, Blend, ClipId, CycleDef, Ease, ElementDef, End, Filter, GaugeDesc,
+    ImageDef, KeyDef, LaneTimer, Play, PlayContext, QuadBatch, Sheet, Skin, SkinFrame, Source,
+    TimerRef, Track, UvTable, Variant, lane_timer, timer,
 };
 
 struct Counting;
@@ -261,28 +262,25 @@ struct Loaded {
 /// or on a `when` timer, the filters alternating. Built in a folder that
 /// lives until the atlas is built.
 fn images() -> (tempfile::TempDir, Sheet) {
-    let d = tempfile::tempdir().unwrap();
+    let d = dir();
     let mut files = Vec::new();
     let mut images = Vec::new();
     for k in 0..timer::BUILTIN + WHEN_IMAGES {
         let cols = if k % 3 == 0 { 4 + k % 5 } else { 1 };
         let (w, h) = (u32::from(12 + k % 5), u32::from(10 + k % 3));
-        let img = RgbaImage::from_pixel(w * u32::from(cols), h, Rgba([k as u8, 0, 0, 255]));
         let name = format!("{k}.png");
-        img.save_with_format(d.path().join(&name), ImageFormat::Png)
-            .unwrap();
-        files.push(FileDef {
-            path: name,
-            hi: None,
-        });
+        save(
+            d.path(),
+            &name,
+            &solid(w * u32::from(cols), h, [k as u8, 0, 0, 255]),
+        );
+        files.push(file(&name));
         let timer = if k < timer::BUILTIN && k % 2 == 0 {
             TimerRef::Builtin(k)
         } else {
             TimerRef::When(k % 32)
         };
         images.push(ImageDef {
-            file: u32::from(k),
-            rect: None,
             grid: [cols, 1],
             cycle: (cols > 1).then_some(CycleDef {
                 period: TimeUs(300 * MS),
@@ -293,6 +291,7 @@ fn images() -> (tempfile::TempDir, Sheet) {
             } else {
                 Filter::Nearest
             },
+            ..whole(u32::from(k))
         });
     }
     let sheet = Sheet::new(d.path(), files, images).unwrap();
