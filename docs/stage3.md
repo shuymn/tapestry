@@ -1,8 +1,8 @@
-# Stage 3 Design Draft: Skins
+# Stage 3 Design: Skins
 
-Stage 3 of the roadmap (design.md "Roadmap") is the look and effects of the play screen. This draft decides the skin system ahead of time: the runtime model the player draws from, the importers that make existing skins playable, tapestry's own skin format, and its export to beatoraja-family players.
+Stage 3 of the roadmap (design.md "Roadmap") is the look and effects of the play screen. This file plans the skin system: the runtime model the player draws from, the importers that make existing skins playable, tapestry's own skin format, and its export to beatoraja-family players.
 
-**Status.** Draft. Decisions marked *(open)* change scope, public behavior or user-authored formats and are not decided yet ("Open decisions"). Every other decision is a method choice. This file is removed when stage 3 exits, once its decisions are in design.md.
+**Status.** Decided; the decisions that change design.md are in it ("Goals", "Rendering and Skins", "Custom Skin Format", "beatoraja Lua Skins", "Extension Boundaries", "Settings Scopes", "Language and Crate Structure", "Libraries", "Roadmap", "Open Questions"). The fast and slow counts in `Tally` go into design.md with the evaluator change that adds them (S9). This file holds the plan and the details, and is removed when stage 3 exits.
 
 **Citations.** `file:N` points into the repository at commit 17e17de, and design.md is cited by section name. "ED" is LR2oraja Endless Dream; "upstream" is beatoraja itself. What is said about their skin loaders was read from their published source as a description of the file format; none of their code is ported (design.md "Libraries").
 
@@ -32,7 +32,7 @@ Stage 3 of the roadmap (design.md "Roadmap") is the look and effects of the play
 - **BGA**, starting from the stage 0 spike's decoder.
 
 **Out:**
-- **The LR2 importer** *(open: §7, decision 1)*.
+- **The LR2 importer**, which comes right after stage 3 (§7, decision 1).
 - **Graphs and visualizers** (score graph, judgment graph, hit-error), double play, mouse dragging in the adjust mode (it comes with `egui`), SVG images, SDF shapes, MSDF text.
 - **Other screens' skins** (song selection, results). Stage 3 skins the play screen only.
 
@@ -73,7 +73,7 @@ The skin reads a per-frame `SkinFrame`, filled from the render thread's `FrameIn
 
 **Lane input in the play view** *(coordination PR, §6 S9)*. Key beams and key pads need presses without notes and releases, which no effect carries: `PlaySound` comes only for a press with a target note that has a sound (crates/eval/src/evaluator.rs:927-937). `PlayView` gains, per lane, whether it is held now and the chart times of its latest press and release, filled from the same conversion that feeds the evaluator, so a scratch reversal (a release and a press at one time, crates/eval/src/convert.rs:386-390) and a control held at the start without a press edge (convert.rs:145-150) come out right. Autoplay fills it too. It is generic input state, not skin state.
 
-**Fast/slow** need counts the play view does not have (`Tally`, crates/eval/src/evaluator.rs:122-136) *(open: §7, decision 6)*.
+**Fast/slow** need counts the play view does not have (`Tally`, crates/eval/src/evaluator.rs:122-136): they are added to `Tally` in `eval` (§7, decision 6).
 
 ### R4. Expressions
 
@@ -88,7 +88,7 @@ Expressions give conditions and values; they never move or color anything (§4).
 
 ### R5. Layout: canvas, regions and player adjustment
 
-**Canvas.** The canvas is 1080 reference pixels tall and `1080 × aspect` wide; narrower than 16:9 it is 1920 wide and grows taller instead *(open: §7, decision 3)*. It is scaled uniformly to the render target. At 16:9 every coordinate is exactly what the author wrote, so authors keep drawing at 1920×1080.
+**Canvas.** The canvas is 1080 reference pixels tall and `1080 × aspect` wide; narrower than 16:9 it is 1920 wide and grows taller instead (§7, decision 3). It is scaled uniformly to the render target. At 16:9 every coordinate is exactly what the author wrote, so authors keep drawing at 1920×1080.
 
 **Regions** are a fixed set defined by the format, so the player sees the same controls on every skin:
 
@@ -103,7 +103,7 @@ Expressions give conditions and values; they never move or color anything (§4).
 - The transform order is: author coordinates → region scale about the anchor → region translation → anchor shift → canvas to target. `judge` is placed relative to `playfield`: it is scaled about its own anchor and translated by its own adjustment first, then moved by the playfield's translation and anchor shift, once, so the inherited move is never scaled; it does not take the playfield's scale or lane width. A test with the judge at a scale other than 100 % moves the playfield and checks the judge moves exactly as far. Adjustments are integers (reference pixels and percent) with bounds that keep a region on the canvas.
 - **Lane width** scales lane-bound elements horizontally; nine-slice frames keep their borders.
 - **Judgment-line height** is the `playfield` y: the whole field moves, its top included, so the visible time is unchanged. Lift, which shortens the lane and changes the visible range, stays a play setting (design.md "Algorithms").
-- **Storage:** layout settings outside the skin, keyed by skin and aspect class (16:9, 21:9, 32:9, 16:10), so a skin update keeps them; a reset returns a region to the author's layout *(scope open: §7, decision 2)*.
+- **Storage:** layout settings outside the skin, keyed by skin and aspect class (16:9, 21:9, 32:9, 16:10), so a skin update keeps them; a reset returns a region to the author's layout; they are device settings, one file per skin under the data root's `layouts\` (§7, decision 2).
 - **Adjusting:** an adjust mode on the ready screen. A key or the turntable selects a region, arrows or the turntable move it, a modifier scales it, and region outlines are drawn with sprites, so no `egui` is needed. The values are also editable in the settings file.
 - **Imported skins** sit in one `screen` region and are pillarboxed at other aspects, never stretched. They get no composition adjustment, since `screen` has no controls.
 
@@ -228,7 +228,7 @@ All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `
 | S6 | `skin-beatoraja`: JSON | [mac] |
 | S7 | `skin-beatoraja`: Lua, sandbox, conversion, report tool | [mac] |
 | S8 | `skin-cli`: `check`, `preview`, goldens | [mac] |
-| S9 | Lane input in `PlayView` (and fast/slow, per decision 6) | coordinated with stage 2: it changes `game` and `eval`, and `PlayView` literals in render |
+| S9 | Lane input in `PlayView`; fast and slow counts in `Tally` | coordinated with stage 2: it changes `game` and `eval`, and `PlayView` literals in render |
 | S10 | Render integration; `SimpleSkin` stays the default | after stage 2 |
 | S11 | Player: skin choice, layout settings, adjust mode | after stage 2 |
 | S12 | `skin-toml`: the authored format; nine-slice and @2x | [mac] |
@@ -236,9 +236,9 @@ All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `
 | S14 | The standard skin; `SimpleSkin` removed | |
 | S15 | BGA | |
 
-S6 to S11 make existing beatoraja skins playable before S12 starts the authored format. The exit becomes: an existing beatoraja skin and the standard skin both play, and playing with the standard skin is fun.
+S6 to S11 make existing beatoraja skins playable before S12 starts the authored format. The exit (design.md "Roadmap"): an existing beatoraja skin and the standard skin both play, and playing with the standard skin is fun.
 
-## 7. Compromises and open decisions
+## 7. Compromises and decisions
 
 ### What stage 3 ships
 
@@ -255,11 +255,11 @@ S6 to S11 make existing beatoraja skins playable before S12 starts the authored 
 | Animation | Curves per key | Four eases per track | Per-key ease and in-out in the authored format, split into keys on export |
 | Imports | All existing skins | beatoraja JSON and Lua | LR2 (decision 1) |
 
-### Open decisions
+### Decisions
 
-1. **LR2 skins.** (a) The LR2 importer right after stage 3. (b) Inside stage 3, also before the authored format. (c) Inside stage 3, after it. **Recommendation: (a).** beatoraja-family skins are what current players use, and the runtime model is built to grow with its first consumer, so the LR2 importer adds its own semantics (cubic and per-key ease, the LR2 IDs) when it comes.
-2. **Where layout adjustments live.** (a) Device scope (follows the monitor and the seat). (b) Player scope. **Recommendation: (a),** keyed by skin and aspect class; the physical setup is what the adjustments answer.
-3. **Screens narrower than 16:9.** (a) The canvas grows taller. (b) Letterbox. **Recommendation: (a);** anchors already handle it.
-4. **Scratch side.** (a) A player setting that the lanes widget lays out, exported as a one-of option. (b) Not in stage 3. **Recommendation: (a).**
-5. **Name of the format and its file.** For example "tapestry skin", `skin.toml`.
-6. **Fast/slow on the play screen.** (a) Add fast and slow counts to `Tally` in `eval`. (b) Leave them out. **Recommendation: (a);** it is pure counting in the evaluator.
+1. **LR2 skins.** (a) The LR2 importer right after stage 3. (b) Inside stage 3, also before the authored format. (c) Inside stage 3, after it. **Decision: (a).** beatoraja-family skins are what current players use, and the runtime model is built to grow with its first consumer, so the LR2 importer adds its own semantics (cubic and per-key ease, the LR2 IDs) when it comes.
+2. **Where layout adjustments live.** (a) Device scope (follows the monitor and the seat). (b) Player scope. **Decision: (a),** keyed by skin and aspect class; the physical setup is what the adjustments depend on.
+3. **Screens narrower than 16:9.** (a) The canvas grows taller. (b) Letterbox. **Decision: (a);** anchors already handle it.
+4. **Scratch side.** (a) A player setting that the lanes widget lays out, exported as a one-of option. (b) Not in stage 3. **Decision: (a).**
+5. **Name of the format and its file.** "tapestry skin", `skin.toml`.
+6. **Fast/slow on the play screen.** (a) Add fast and slow counts to `Tally` in `eval`. (b) Leave them out. **Decision: (a);** it is pure counting in the evaluator.
