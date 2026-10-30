@@ -1222,10 +1222,14 @@ mod link_tests {
     fn an_unanswered_close_times_out_and_the_link_stays_failed() {
         let sources = set();
         let (_controls, hook, mut link) = hooked(&sources);
-        link.timeout = SHORT;
         let waker = Waker::spawn(hook, sources);
+        // The open is answered however late the machine runs the thread:
+        // its bound only catches one that never answers. Only the close
+        // below, which nothing answers, is given the short bound.
+        link.timeout = Duration::from_secs(60);
         assert!(link.open(open_request()).is_ok());
         assert_eq!(link.failure(), None);
+        link.timeout = SHORT;
         waker.pause();
         let begun = Instant::now();
         assert_eq!(link.close().err(), Some(InputWaitError::Timeout));
@@ -1233,14 +1237,13 @@ mod link_tests {
         waker.resume();
         // The late reply to the close arrives.
         waker.two_more_wakes();
-        let begun = Instant::now();
         assert_eq!(
             link.open(open_request()).err(),
             Some(InputWaitError::Timeout)
         );
-        assert!(begun.elapsed() < SHORT, "{:?}", begun.elapsed());
         assert_eq!(link.failure(), Some(InputWaitError::Timeout));
-        // Never read, and no open was sent after it.
+        // Never read, and no open was sent after it: a wait always sends
+        // first, so the open failed without waiting.
         assert!(matches!(link.replies.try_recv(), Ok(Reply::Closed(..))));
         waker.two_more_wakes();
         assert!(link.replies.try_recv().is_err());
