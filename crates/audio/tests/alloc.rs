@@ -115,7 +115,7 @@ fn mixing_does_not_allocate() {
     e.restart(TimeUs(now.0 - 15_000_000 + 100_000));
     // The plan is made where the play is prepared, which may allocate.
     counting::track(false);
-    let plan = SeekPlan::new(&e.seek_source(), e.frame_line(), TimeUs(15_000_000));
+    let plan = SeekPlan::new(&e.seek_source(), &bgm, e.frame_line(), TimeUs(15_000_000)).unwrap();
     counting::track(true);
     e.seek(&plan).unwrap();
     let sought = e.bgm_left();

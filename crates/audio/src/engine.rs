@@ -15,7 +15,7 @@ use crate::bank::SoundBank;
 use crate::clock::MixClock;
 use crate::mixer::{InvalidVolume, Mixer};
 use crate::output::{AudioOutput, OutputError};
-use crate::seek::{FrameLine, SeekPlan, SeekSource};
+use crate::seek::{FrameLine, SeekPlan, SeekSource, schedule_hash};
 
 /// A key sound to play, from the logic thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,8 +99,9 @@ pub enum EngineError {
 /// caller plans again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SeekError {
-    /// The plan was made from another engine's bank and schedule.
-    #[error("the seek was planned for another engine")]
+    /// The plan was made for another engine, or from a schedule other than
+    /// its engine's.
+    #[error("the seek was planned for another engine or schedule")]
     Source,
     /// The plan's frame line has another rate or period than the output.
     #[error(
@@ -148,7 +149,9 @@ pub struct AudioEngine {
     rate: u32,
     period: u32,
     period_us: i64,
-    bgm: Arc<[BgmEvent]>,
+    bgm: Vec<BgmEvent>,
+    /// [`schedule_hash`] of `bgm`.
+    bgm_hash: u64,
     next_bgm: usize,
     output_offset: TimeUs,
     /// Where chart time 0 lies on the output's timeline.
@@ -214,7 +217,8 @@ impl AudioEngine {
             rate,
             period,
             period_us: i64::from(period) * 1_000_000 / i64::from(rate),
-            bgm: Arc::from(bgm),
+            bgm_hash: schedule_hash(&bgm),
+            bgm,
             next_bgm: 0,
             output_offset: TimeUs(0),
             play_origin: TimeUs(0),
@@ -290,13 +294,13 @@ impl AudioEngine {
     }
 
     /// What this engine plays, for planning its seeks where the play is
-    /// prepared ([`SeekPlan::new`]); it shares the bank and schedule.
+    /// prepared ([`SeekPlan::new`], with the schedule it was built with).
     #[must_use]
     pub fn seek_source(&self) -> SeekSource {
         SeekSource {
             engine: self.id,
             bank: Arc::clone(&self.bank),
-            schedule: Arc::clone(&self.bgm),
+            schedule: self.bgm_hash,
             voices: self.mixer.voices(),
         }
     }
@@ -343,7 +347,8 @@ impl AudioEngine {
     /// # Errors
     ///
     /// [`SeekError`] for a plan made from another engine's
-    /// [`seek_source`](Self::seek_source), on a line of another rate or
+    /// [`seek_source`](Self::seek_source) (a schedule other than this
+    /// engine's is refused when planning), on a line of another rate or
     /// period, or whose frame is already written; nothing changes.
     pub fn seek(&mut self, plan: &SeekPlan) -> Result<(), SeekError> {
         if plan.engine() != self.id {

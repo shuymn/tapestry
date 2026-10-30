@@ -6,23 +6,38 @@
 //! only copies them in, so the audio thread's share is bounded by the voice
 //! count whatever the chart.
 
+use std::hash::{DefaultHasher, Hasher};
 use std::sync::Arc;
 
 use bms_model::{BgmEvent, TimeUs};
 
 use crate::bank::SoundBank;
+use crate::engine::SeekError;
 use crate::mixer::{Counts, MAX_PENDING_STARTS, Slots, Voice, fade_frames};
 
-/// What an engine plays, for planning its seeks where the play is prepared:
-/// its bank, schedule and voice count, shared with it, and which engine it
-/// is ([`AudioEngine::seek_source`](crate::AudioEngine::seek_source)). A
-/// plan made from it is taken only by that engine.
+/// What an engine plays, for planning its seeks where the play is prepared
+/// ([`AudioEngine::seek_source`](crate::AudioEngine::seek_source)): which
+/// engine it is, its bank (shared with it), its voice count and a hash of
+/// its schedule. A plan made from it is taken only by that engine, and only
+/// for that schedule.
 #[derive(Clone, Debug)]
 pub struct SeekSource {
     pub(crate) engine: u64,
     pub(crate) bank: Arc<SoundBank>,
-    pub(crate) schedule: Arc<[BgmEvent]>,
+    pub(crate) schedule: u64,
     pub(crate) voices: usize,
+}
+
+/// A hash of every start of `schedule`, in order (SipHash with fixed keys);
+/// it allocates nothing.
+pub(crate) fn schedule_hash(schedule: &[BgmEvent]) -> u64 {
+    let mut h = DefaultHasher::new();
+    h.write_usize(schedule.len());
+    for e in schedule {
+        h.write_i64(e.time.0);
+        h.write_u16(e.sound.0);
+    }
+    h.finish()
 }
 
 /// Where a play's chart times fall on the output, as the engine maps them:
@@ -83,15 +98,27 @@ pub struct SeekPlan {
 }
 
 impl SeekPlan {
-    /// Plans a seek to chart time `t` of `source`'s play falling on
-    /// `line`. Each engine pass is taken to write `line.period` frames and
-    /// to admit at most [`MAX_PENDING_STARTS`] starts, none of them key
-    /// sounds, as a play without input does; the rest wait for the next
-    /// pass's first frame. Allocates the plan's slots; the work grows with
-    /// the starts before `t` times the voices.
-    #[must_use]
-    pub fn new(source: &SeekSource, line: FrameLine, t: TimeUs) -> Self {
-        let (bank, schedule, voices) = (&*source.bank, &*source.schedule, source.voices);
+    /// Plans a seek to chart time `t` of `source`'s play of `schedule` (the
+    /// one its engine was built with) falling on `line`. Each engine pass is
+    /// taken to write `line.period` frames and to admit at most
+    /// [`MAX_PENDING_STARTS`] starts, none of them key sounds, as a play
+    /// without input does; the rest wait for the next pass's first frame.
+    /// Allocates the plan's slots; the work grows with the starts before
+    /// `t` times the voices.
+    ///
+    /// # Errors
+    ///
+    /// [`SeekError::Source`] for a schedule other than the engine's.
+    pub fn new(
+        source: &SeekSource,
+        schedule: &[BgmEvent],
+        line: FrameLine,
+        t: TimeUs,
+    ) -> Result<Self, SeekError> {
+        if schedule_hash(schedule) != source.schedule {
+            return Err(SeekError::Source);
+        }
+        let (bank, voices) = (&*source.bank, source.voices);
         let fade = fade_frames(line.rate);
         let at = line.frame(t);
         let block_at = line.block_of(at);
@@ -144,7 +171,7 @@ impl SeekPlan {
             slots.apply(voice, &mut unheard);
         }
         slots.retire(bank, fade, at);
-        Self {
+        Ok(Self {
             engine: source.engine,
             t,
             line,
@@ -153,7 +180,7 @@ impl SeekPlan {
             budget: MAX_PENDING_STARTS - admitted_at,
             seq,
             slots,
-        }
+        })
     }
 
     /// The chart time it starts at.
