@@ -31,10 +31,11 @@ use skin_model::{
 
 struct Peak;
 
-static LIVE: AtomicI64 = AtomicI64::new(0);
+/// The current measurement (0 before the first) in the bits from
+/// [`GEN_SHIFT`] up and its live bytes below, so that matching a free's
+/// measurement and subtracting it are one atomic step.
+static STATE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicI64 = AtomicI64::new(0);
-/// The current measurement; 0 before the first.
-static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SERIAL: Mutex<()> = Mutex::new(());
 
 thread_local! {
@@ -48,10 +49,51 @@ fn tracking() -> bool {
     TRACK.try_with(Cell::get).unwrap_or(false)
 }
 
-fn add(n: usize) {
-    let n = i64::try_from(n).unwrap_or(i64::MAX);
-    let live = LIVE.fetch_add(n, Ordering::Relaxed) + n;
-    PEAK.fetch_max(live, Ordering::Relaxed);
+const GEN_SHIFT: u32 = 40;
+const LIVE_MASK: u64 = (1 << GEN_SHIFT) - 1;
+
+fn generation(state: u64) -> u64 {
+    state >> GEN_SHIFT
+}
+
+fn live_of(state: u64) -> i64 {
+    i64::try_from(state & LIVE_MASK).unwrap_or(i64::MAX)
+}
+
+/// The live bytes of the current measurement.
+fn live() -> i64 {
+    live_of(STATE.load(Ordering::Relaxed))
+}
+
+/// Counts `n` bytes in the current measurement; returns that measurement.
+fn add(n: usize) -> u64 {
+    let n = u64::try_from(n).unwrap_or(LIVE_MASK);
+    let mut state = STATE.load(Ordering::Relaxed);
+    loop {
+        let sum = ((state & LIVE_MASK) + n.min(LIVE_MASK)).min(LIVE_MASK);
+        let next = (state & !LIVE_MASK) | sum;
+        match STATE.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                PEAK.fetch_max(live_of(next), Ordering::Relaxed);
+                return generation(next);
+            }
+            Err(now) => state = now,
+        }
+    }
+}
+
+/// Uncounts `n` bytes if `tag` is still the current measurement.
+fn sub(tag: u64, n: usize) {
+    let n = u64::try_from(n).unwrap_or(LIVE_MASK);
+    let mut state = STATE.load(Ordering::Relaxed);
+    // Another measurement has begun once the generation differs.
+    while tag != 0 && generation(state) == tag {
+        let next = (state & !LIVE_MASK) | (state & LIVE_MASK).saturating_sub(n);
+        match STATE.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(now) => state = now,
+        }
+    }
 }
 
 fn outer(layout: Layout) -> (Layout, usize) {
@@ -71,12 +113,7 @@ unsafe impl GlobalAlloc for Peak {
         if base.is_null() {
             return base;
         }
-        let tag = if tracking() {
-            add(layout.size());
-            GENERATION.load(Ordering::Relaxed)
-        } else {
-            0
-        };
+        let tag = if tracking() { add(layout.size()) } else { 0 };
         // SAFETY: `head` bytes lie before the returned block, the tag in
         // its last 8, aligned to 8.
         unsafe {
@@ -91,9 +128,7 @@ unsafe impl GlobalAlloc for Peak {
         // SAFETY: `ptr` came from `alloc` with this layout.
         unsafe {
             let tag = ptr.sub(8).cast::<u64>().read();
-            if tag != 0 && tag == GENERATION.load(Ordering::Relaxed) {
-                LIVE.fetch_sub(i64::try_from(layout.size()).unwrap_or(0), Ordering::Relaxed);
-            }
+            sub(tag, layout.size());
             System.dealloc(ptr.sub(head), outer);
         }
     }
@@ -125,8 +160,9 @@ fn measure_then<T>(f: impl FnOnce() -> T, check: impl FnOnce(&T)) -> (T, i64) {
     let _guard = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    GENERATION.fetch_add(1, Ordering::Relaxed);
-    LIVE.store(0, Ordering::Relaxed);
+    // Only this thread, holding the lock, changes the measurement.
+    let next = generation(STATE.load(Ordering::Relaxed)) + 1;
+    STATE.store(next << GEN_SHIFT, Ordering::Relaxed);
     PEAK.store(0, Ordering::Relaxed);
     let out = {
         let _tracking = Tracking::start();
@@ -153,7 +189,7 @@ fn the_count_works() {
             let w = std::hint::black_box(vec![1_u8; 1 << 20]);
             drop(w);
         },
-        |()| assert_eq!(LIVE.load(Ordering::Relaxed), 0),
+        |()| assert_eq!(live(), 0),
     );
     assert_eq!(peak, 3 * MIB);
     // A result that outlives its measurement is not charged to the next
@@ -165,7 +201,7 @@ fn the_count_works() {
             drop(kept);
             drop(v);
         },
-        |()| assert_eq!(LIVE.load(Ordering::Relaxed), 0),
+        |()| assert_eq!(live(), 0),
     );
     assert_eq!(peak, MIB);
 }
