@@ -5,9 +5,10 @@ use bms_model::TimeUs;
 
 use crate::{
     Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
-    LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
-    RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window, WindowPolicy,
+    GaugeValue, HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable,
+    LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment,
+    PerLaneClass, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window,
+    WindowPolicy,
 };
 
 const MS: i64 = 1_000;
@@ -128,6 +129,7 @@ pub fn custom() -> RulePreset {
         ln_mode: LnModeRule {
             default: LnMode::Ln,
             late_head: LateHeadRule::CompletesAtPress,
+            head_eligibility: HeadEligibility::InsideBad,
         },
         total_mode: TotalMode::ScalesIncrease,
         mine: MineRule::WhileHeld {
@@ -142,9 +144,9 @@ mod tests {
 
     use crate::{
         Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-        GaugeValue, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows, LnMode,
-        LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
-        RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window, WindowPolicy,
+        GaugeValue, HeadEligibility, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+        LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+        RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window, WindowPolicy,
     };
 
     const fn pj<T>(perfect: T, great: T, good: T, bad: T, poor: T) -> PerJudgment<T> {
@@ -248,6 +250,7 @@ mod tests {
             ln_mode: LnModeRule {
                 default: LnMode::Ln,
                 late_head: LateHeadRule::CompletesAtPress,
+                head_eligibility: HeadEligibility::InsideBad,
             },
             total_mode: TotalMode::ScalesIncrease,
             mine: MineRule::WhileHeld {

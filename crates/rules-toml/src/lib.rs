@@ -12,10 +12,10 @@
 use bms_model::TimeUs;
 use rules::{
     Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
-    LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
-    RuleError, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalMode, Window,
-    WindowPolicy,
+    GaugeValue, HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable,
+    LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment,
+    PerLaneClass, RankScale, RuleError, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights,
+    TotalMode, Window, WindowPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -239,6 +239,7 @@ enum AssignmentFile {
 struct LnModeFile {
     default: LnKindFile,
     late_head: LateHeadFile,
+    head_eligibility: HeadEligibilityFile,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -251,6 +252,13 @@ enum LnKindFile {
 #[serde(rename_all = "snake_case")]
 enum LateHeadFile {
     CompletesAtPress,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HeadEligibilityFile {
+    InsideBad,
+    NotLateBad,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -491,6 +499,10 @@ impl From<PresetFile> for RulePreset {
                 late_head: match ln_mode.late_head {
                     LateHeadFile::CompletesAtPress => LateHeadRule::CompletesAtPress,
                 },
+                head_eligibility: match ln_mode.head_eligibility {
+                    HeadEligibilityFile::InsideBad => HeadEligibility::InsideBad,
+                    HeadEligibilityFile::NotLateBad => HeadEligibility::NotLateBad,
+                },
             },
             total_mode: match total_mode {
                 TotalModeFile::ScalesIncrease => TotalMode::ScalesIncrease,
@@ -599,6 +611,10 @@ impl From<&RulePreset> for PresetFile {
                 },
                 late_head: match ln_mode.late_head {
                     LateHeadRule::CompletesAtPress => LateHeadFile::CompletesAtPress,
+                },
+                head_eligibility: match ln_mode.head_eligibility {
+                    HeadEligibility::InsideBad => HeadEligibilityFile::InsideBad,
+                    HeadEligibility::NotLateBad => HeadEligibilityFile::NotLateBad,
                 },
             },
             total_mode: match total_mode {

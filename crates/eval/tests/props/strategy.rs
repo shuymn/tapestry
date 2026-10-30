@@ -546,6 +546,14 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     } else {
         Assignment::NearestTiesEarlier
     };
+    // Both LN-head eligibilities: every head inside BAD (custom,
+    // beatoraja-style) and no late BAD head (LR2-style), with either
+    // assignment.
+    p.ln_mode.head_eligibility = if flag(19) {
+        rules::HeadEligibility::NotLateBad
+    } else {
+        rules::HeadEligibility::InsideBad
+    };
     p.headers = if flag(3) {
         HeaderPolicy::DefExRankFirst
     } else {
