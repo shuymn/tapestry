@@ -509,6 +509,9 @@ mod tests {
                 sources: Vec::new(),
                 audio_offset: bms_model::TimeUs(0),
                 display_offset: bms_model::TimeUs(0),
+                wake: replay::WakePolicy::Timer {
+                    heartbeat_us: 1_000,
+                },
             },
             play_type: replay::PlayType::Full,
             start: eval::InputStart {

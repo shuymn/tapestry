@@ -146,6 +146,28 @@ pub struct SourceRecord {
     pub axis_out_of_range: u64,
 }
 
+/// When the input thread woke during the play, which bounds when its
+/// input was stamped and how often the watermark moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakePolicy {
+    /// Woken by input, at most once per `input_gap_us`, and by a heartbeat
+    /// at most `heartbeat_us` after each publication; one batch read at
+    /// most `drain_cut` messages before it published.
+    Input {
+        /// The heartbeat's bound, in µs.
+        heartbeat_us: u32,
+        /// The shortest time between input wakes, in µs.
+        input_gap_us: u32,
+        /// The most messages one batch read.
+        drain_cut: u32,
+    },
+    /// Woken by a timer only, every `heartbeat_us` (input from no device).
+    Timer {
+        /// The timer's period, in µs.
+        heartbeat_us: u32,
+    },
+}
+
 /// The devices and offsets a play was evaluated with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceRecord {
@@ -155,6 +177,8 @@ pub struct DeviceRecord {
     pub audio_offset: TimeUs,
     /// The display latency offset.
     pub display_offset: TimeUs,
+    /// The input thread's wake policy.
+    pub wake: WakePolicy,
 }
 
 impl DeviceRecord {

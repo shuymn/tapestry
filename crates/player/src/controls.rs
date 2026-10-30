@@ -8,10 +8,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 
 use bms_model::{TimeSource, TimeUs};
 use game::Command;
-use input::{FocusLatch, QpcClock};
+use input::{FocusLatch, QpcClock, Waker};
 
 use crate::tuning::LiveTuning;
 
@@ -30,6 +31,11 @@ pub struct Controls {
     quit: AtomicBool,
     focused: AtomicBool,
     latch: OnceLock<FocusLatch>,
+    /// Wakes the input thread on a focus change.
+    input: OnceLock<Waker>,
+    /// The game thread, unparked by what the window and the system tell
+    /// it, so it can wait idly between plays.
+    game: OnceLock<Thread>,
     tuning: Arc<LiveTuning>,
     /// Whether the measurement overlay shows (design.md "Latency Figures").
     overlay: Arc<AtomicBool>,
@@ -61,6 +67,8 @@ impl Controls {
             quit: AtomicBool::new(false),
             focused: AtomicBool::new(true),
             latch: OnceLock::new(),
+            input: OnceLock::new(),
+            game: OnceLock::new(),
             tuning,
             overlay: Arc::new(AtomicBool::new(false)),
         }
@@ -93,9 +101,34 @@ impl Controls {
         let _ = self.latch.set(latch);
     }
 
+    /// Hands over the input thread's waker, once: every focus change
+    /// signals it.
+    pub fn set_waker(&self, waker: Waker) {
+        let _ = self.input.set(waker);
+    }
+
+    /// Names the game thread, once: every command, focus change and
+    /// settings key unparks it.
+    pub fn set_game(&self, game: Thread) {
+        let _ = self.game.set(game);
+    }
+
+    /// Unparks the game thread, so it acts on what changed without
+    /// waiting out its idle wait.
+    pub fn wake_game(&self) {
+        if let Some(g) = self.game.get() {
+            g.unpark();
+        }
+    }
+
     /// A system control or the system's suspend. Quit latches; a suspend is
     /// never replaced by a later retry, so it always aborts the play.
     pub fn command(&self, c: Command) {
+        self.set_command(c);
+        self.wake_game();
+    }
+
+    fn set_command(&self, c: Command) {
         let new = match c {
             Command::Quit => {
                 self.quit.store(true, Ordering::Release);
@@ -144,12 +177,17 @@ impl Controls {
     }
 
     /// The window gained or lost focus; a loss sets the input side's latch
-    /// (design.md "Input").
+    /// (design.md "Input"). Then the input thread is woken, so an idle one
+    /// sees the change, and the game thread.
     pub fn focus(&self, focused: bool) {
         self.focused.store(focused, Ordering::Release);
         if !focused && let Some(l) = self.latch.get() {
             l.latch();
         }
+        if let Some(w) = self.input.get() {
+            w.wake();
+        }
+        self.wake_game();
     }
 
     /// Whether the window has focus.

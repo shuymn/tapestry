@@ -90,6 +90,9 @@ fn played_with(chart: &str, seed: u64) -> PlayRecord {
             }],
             audio_offset: TimeUs(0),
             display_offset: TimeUs(0),
+            wake: replay::WakePolicy::Timer {
+                heartbeat_us: 1_000,
+            },
         },
         play_type: PlayType::Full,
         start: InputStart {

@@ -12,7 +12,7 @@ use input::raw;
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DecodeLimits, DeviceKind, DeviceRecord, EndStatus,
     FORMAT_VERSION, Incomplete, MAGIC, PlayRecord, PlayType, PresetRecord, ReceiveMethod,
-    SourceRecord, Status, TransformRecord, Versions,
+    SourceRecord, Status, TransformRecord, Versions, WakePolicy,
 };
 
 /// A named seed.
@@ -119,6 +119,11 @@ fn two_sources() -> PlayRecord {
             ],
             audio_offset: TimeUs(-10_000),
             display_offset: TimeUs(16_000),
+            wake: WakePolicy::Input {
+                heartbeat_us: 1_000,
+                input_gap_us: 125,
+                drain_cut: 1_024,
+            },
         },
         play_type: PlayType::Full,
         start: InputStart {

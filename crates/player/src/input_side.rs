@@ -4,11 +4,16 @@
 //! Architecture").
 //!
 //! The requests go through a channel the hook polls at every wake (an
-//! empty poll allocates nothing); the replies carry what only the input
-//! thread can read: the snapshot, the readers, the arrivals and the
-//! overflow flags. Between requests the hook publishes the gate's state
-//! and whether a participating device is still connected, for the abort
-//! checks of the play and its audio tail.
+//! empty poll allocates nothing), and the input thread's wake event is
+//! signaled after each, so an idle thread serves it at once; the replies
+//! carry what only the input thread can read: the snapshot, the readers,
+//! the arrivals and the overflow flags. Between requests the hook
+//! publishes the gate's state and whether a participating device is still
+//! connected, for the abort checks of the play and its audio tail.
+//!
+//! The hook reports the thread's phase (`input::cadence`): Open from an
+//! open, Tail from a close, and Idle only from [`Request::Idle`], which the
+//! game thread sends once a play's audio tail is over.
 //!
 //! The game thread waits for each reply at most [`INPUT_TIMEOUT`] of awake
 //! time; an input thread that is gone or does not answer fails the link for
@@ -28,7 +33,7 @@ use bms_model::TimeUs;
 use eval::ControlId;
 use game::{Closing, InputWaitError, Opening, ScratchConfig};
 use input::hid::HidProduct;
-use input::{DeviceId, DeviceKind, SourceReader, SourceSet};
+use input::{DeviceId, DeviceKind, Phase, SourceReader, SourceSet, Waker};
 
 use crate::controls::Controls;
 
@@ -66,6 +71,10 @@ pub enum Request {
     },
     /// Close recording at the next boundary.
     Close,
+    /// Nothing waits on the input thread's publications until the next
+    /// open: it stops its heartbeat. Not answered; ignored while
+    /// recording is open.
+    Idle,
 }
 
 /// What a play records, from the key configs.
@@ -106,6 +115,8 @@ pub struct InputLink {
     requests: Sender<Request>,
     replies: Receiver<Reply>,
     state: Arc<InputState>,
+    /// Wakes the input thread after each request.
+    waker: Waker,
     /// The most awake time a reply is waited for.
     timeout: Duration,
     /// The awake-time clock the wait is measured on.
@@ -148,6 +159,14 @@ impl InputLink {
         }
     }
 
+    /// Lets the input thread go idle: sent without waiting, since nothing
+    /// answers it. A failed link sends nothing.
+    pub fn idle(&self) {
+        if self.failed.is_none() && self.requests.send(Request::Idle).is_ok() {
+            self.waker.wake();
+        }
+    }
+
     /// Sends `request` and waits for its reply. Every request is answered
     /// once, in order, so with the link failed at the first wait that does
     /// not end in a reply, the reply read is always this request's.
@@ -166,6 +185,8 @@ impl InputLink {
         self.requests
             .send(request)
             .map_err(|_| InputWaitError::Gone)?;
+        // After the send: the wake that follows finds the request.
+        self.waker.wake();
         let since = (self.awake)();
         loop {
             match self.replies.recv_timeout(WAIT_SLICE) {
@@ -249,10 +270,13 @@ pub struct Hook {
     origin: Option<TimeUs>,
     /// The last recording's participants and their connections.
     participants: Vec<(DeviceId, Option<u64>)>,
+    /// The input thread's phase.
+    phase: Phase,
 }
 
-/// A linked hook and link.
-pub fn link(controls: Arc<Controls>, mode: Mode) -> (Hook, InputLink) {
+/// A linked hook and link; the link wakes the input thread through
+/// `waker`.
+pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLink) {
     let (req_tx, req_rx) = mpsc::channel();
     let (rep_tx, rep_rx) = mpsc::channel();
     let state = Arc::new(InputState::default());
@@ -266,11 +290,13 @@ pub fn link(controls: Arc<Controls>, mode: Mode) -> (Hook, InputLink) {
             logic: None,
             origin: None,
             participants: Vec::new(),
+            phase: Phase::Tail,
         },
         InputLink {
             requests: req_tx,
             replies: rep_rx,
             state,
+            waker,
             timeout: INPUT_TIMEOUT,
             awake: awake_time,
             failed: None,
@@ -286,11 +312,12 @@ impl Drop for Hook {
 }
 
 impl Hook {
-    /// One boundary, `now` being the clock read there. Generated input or
-    /// a script is first fed up to the play's time; between plays,
-    /// autoplay's wake still checks the focus gate, so a focus loss during
-    /// the audio tail or on the end screen is published.
-    pub fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) {
+    /// One boundary, `now` being the clock read there; returns the input
+    /// thread's phase from then on. Generated input or a script is first
+    /// fed up to the play's time; between plays, autoplay's wake still
+    /// checks the focus gate, so a focus loss during the audio tail or on
+    /// the end screen is published.
+    pub fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) -> Phase {
         match (&mut self.mode, self.origin) {
             (Mode::Autoplay(feeder), Some(origin)) => {
                 input::InputAdapter::poll(feeder, TimeUs(now.0 - origin.0), sources);
@@ -310,11 +337,19 @@ impl Hook {
                     recorded,
                 } => {
                     let (opening, lines) = self.open(sources, now, lead_in, logic, &recorded);
+                    self.phase = Phase::Open;
                     Reply::Opened(opening, lines)
                 }
                 Request::Close => {
                     let (closing, lines) = self.close(sources);
+                    self.phase = Phase::Tail;
                     Reply::Closed(closing, lines)
+                }
+                Request::Idle => {
+                    if self.phase != Phase::Open {
+                        self.phase = Phase::Idle;
+                    }
+                    continue;
                 }
             };
             // Published before the reply, so the game thread never reads
@@ -330,6 +365,7 @@ impl Hook {
         {
             logic.unpark();
         }
+        self.phase
     }
 
     fn publish(&self, sources: &SourceSet) {
@@ -824,7 +860,7 @@ mod autoplay_tests {
     use game::ScratchConfig;
     use input::{
         AUTOPLAY_DEVICE, AutoplayInput, DeviceId, DeviceKind, Packet, QpcClock, SourceConfig,
-        SourceSet,
+        SourceSet, Waker,
     };
 
     use super::{Hook, InputLink, Mode, Recorded, Reply, Request, link};
@@ -866,16 +902,26 @@ mod autoplay_tests {
         .unwrap()
     }
 
-    /// The hook of an autoplay session and its link, with the window's
-    /// controls holding the source set's latch before any play opens.
-    pub(super) fn hooked(sources: &SourceSet) -> (Arc<Controls>, Hook, InputLink) {
+    /// The hook of an autoplay session and its link, waking through
+    /// `waker`, with the window's controls holding the source set's latch
+    /// before any play opens (and not the waker).
+    pub(super) fn hooked_with(
+        sources: &SourceSet,
+        waker: Waker,
+    ) -> (Arc<Controls>, Hook, InputLink) {
         let controls = Arc::new(Controls::new(QpcClock::start()));
         controls.set_latch(sources.gate().handle());
         let (hook, link) = link(
             Arc::clone(&controls),
             Mode::Autoplay(AutoplayInput::new(events())),
+            waker,
         );
         (controls, hook, link)
+    }
+
+    /// As [`hooked_with`], with a waker of its own.
+    pub(super) fn hooked(sources: &SourceSet) -> (Arc<Controls>, Hook, InputLink) {
+        hooked_with(sources, Waker::new().unwrap())
     }
 
     /// Opens recording at clock time `at` through the request channel, as
@@ -1209,7 +1255,11 @@ mod link_tests {
         sources.end_batch(TimeUs(0));
         let controls = Arc::new(Controls::new(QpcClock::start()));
         controls.set_latch(sources.gate().handle());
-        let (mut hook, link) = link(Arc::clone(&controls), Mode::Clock);
+        let (mut hook, link) = link(
+            Arc::clone(&controls),
+            Mode::Clock,
+            input::Waker::new().unwrap(),
+        );
         let recorded = Recorded {
             controller_device: Some(HidProduct {
                 vendor_id: 0x1A2B,
@@ -1236,5 +1286,122 @@ mod link_tests {
                 "input: the controller set up in `tapestry keys` is not connected; this play uses the keyboard bindings only"
             ]
         );
+    }
+}
+
+/// The hook on a real clocked input thread: how requests and focus
+/// changes reach a thread in its tail or idle.
+#[cfg(test)]
+mod wake_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use input::{ClockedThread, QpcClock, SourceSet, Waker};
+
+    use super::autoplay_tests::{LEAD_IN, hooked_with, recorded, set};
+    use super::{Hook, InputLink, Request};
+
+    /// The hook on a clocked thread, counting its wakes.
+    fn spawn(mut hook: Hook, sources: SourceSet, waker: &Waker) -> (ClockedThread, Arc<AtomicU64>) {
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&wakes);
+        let thread = ClockedThread::spawn(QpcClock::start(), sources, waker, move |s, now| {
+            counted.fetch_add(1, Ordering::AcqRel);
+            hook.wake(s, now)
+        })
+        .unwrap();
+        (thread, wakes)
+    }
+
+    fn open(link: &mut InputLink) {
+        let opened = link.open(Request::Open {
+            lead_in: LEAD_IN,
+            logic: std::thread::current(),
+            recorded: recorded(),
+        });
+        assert!(opened.is_ok());
+    }
+
+    /// Waits (at most 5 s) until `f` holds.
+    fn until(f: impl Fn() -> bool) -> bool {
+        let begun = Instant::now();
+        while begun.elapsed() < Duration::from_secs(5) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// Waits until `wakes` stays still for 50 ms: the thread is idle.
+    fn settles(wakes: &AtomicU64) {
+        assert!(until(|| {
+            let before = wakes.load(Ordering::Acquire);
+            std::thread::sleep(Duration::from_millis(50));
+            wakes.load(Ordering::Acquire) == before
+        }));
+    }
+
+    /// An idle thread, which has no timer, serves an open at once: the
+    /// link wakes it after the request.
+    #[test]
+    fn request_wakes_the_idle_thread() {
+        let sources = set();
+        let waker = Waker::new().unwrap();
+        let (_controls, hook, mut link) = hooked_with(&sources, waker.clone());
+        let (thread, wakes) = spawn(hook, sources, &waker);
+        link.idle();
+        settles(&wakes);
+        let begun = Instant::now();
+        open(&mut link);
+        assert!(
+            begun.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            begun.elapsed()
+        );
+        // Open again: the heartbeat runs.
+        let from = wakes.load(Ordering::Acquire);
+        assert!(until(|| wakes.load(Ordering::Acquire) >= from + 10));
+        let report = thread.stop().unwrap();
+        assert!(report.causes.event >= 2, "{:?}", report.causes);
+    }
+
+    /// In an autoplay tail with no input and no wake from the window, the
+    /// heartbeat still checks the focus gate: a focus loss is published,
+    /// so the tail ends.
+    #[test]
+    fn focus_loss_in_the_tail_without_input_ends_the_tail() {
+        let sources = set();
+        let waker = Waker::new().unwrap();
+        let (controls, hook, mut link) = hooked_with(&sources, waker.clone());
+        let (thread, _) = spawn(hook, sources, &waker);
+        open(&mut link);
+        assert!(link.close().is_ok());
+        assert!(!link.tripped());
+        // The window's controls hold no waker here.
+        controls.focus(false);
+        assert!(until(|| link.tripped()));
+        thread.stop().unwrap();
+    }
+
+    /// An idle thread sees a focus loss through the window's wake, with no
+    /// timer.
+    #[test]
+    fn a_focus_loss_wakes_an_idle_input_thread() {
+        let sources = set();
+        let waker = Waker::new().unwrap();
+        let (controls, hook, link) = hooked_with(&sources, waker.clone());
+        controls.set_waker(waker.clone());
+        let (thread, wakes) = spawn(hook, sources, &waker);
+        link.idle();
+        settles(&wakes);
+        let from = wakes.load(Ordering::Acquire);
+        controls.focus(false);
+        assert!(until(|| link.tripped()));
+        assert_eq!(wakes.load(Ordering::Acquire), from + 1);
+        let report = thread.stop().unwrap();
+        assert!(report.causes.heartbeat <= 2, "{:?}", report.causes);
     }
 }
