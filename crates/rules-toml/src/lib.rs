@@ -231,6 +231,7 @@ enum SameTimeOrderFile {
 #[serde(rename_all = "snake_case")]
 enum AssignmentFile {
     NearestTiesEarlier,
+    ComboPriority,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -481,6 +482,7 @@ impl From<PresetFile> for RulePreset {
             },
             assignment: match assignment {
                 AssignmentFile::NearestTiesEarlier => Assignment::NearestTiesEarlier,
+                AssignmentFile::ComboPriority => Assignment::ComboPriority,
             },
             ln_mode: LnModeRule {
                 default: match ln_mode.default {
@@ -589,6 +591,7 @@ impl From<&RulePreset> for PresetFile {
             },
             assignment: match assignment {
                 Assignment::NearestTiesEarlier => AssignmentFile::NearestTiesEarlier,
+                Assignment::ComboPriority => AssignmentFile::ComboPriority,
             },
             ln_mode: LnModeFile {
                 default: match ln_mode.default {
