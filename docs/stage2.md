@@ -192,7 +192,7 @@ egui comes with the first form-like screen.
 **Values.**
 - `scores` holds the best EX, the best BP, a lamp, and the play count.
 - The lamp is the hardest gauge cleared (easiest first) or FULL COMBO.
-- The play count counts every saved, verified record of the variant.
+- The play count counts every saved, verified record under the key, so plays of a `#RANDOM` chart count across its branches even though they set no best.
 
 **Idempotence.** One ingest function serves live updates and rebuilds. `counted(record_file PRIMARY KEY)` makes ingesting the same record twice a no-op.
 
@@ -810,7 +810,7 @@ Each one holds the behavior D5 and D6 state.
 - `played_to_end_with_overflow_sets_no_best`;
 - `failed_save_sets_no_best`;
 - `only_eligible_plays_set_bests`;
-- `random_charts_get_no_best_and_still_save`;
+- `random_charts_get_no_best_and_still_save`: two plays resolving different branches set no best and count 2, before and after a rebuild;
 - `version_change_invalidates_bests_without_schema_change`;
 - `ingest_is_idempotent`;
 - `rebuild_from_records_skips_refused`.
