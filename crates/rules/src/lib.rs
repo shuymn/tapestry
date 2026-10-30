@@ -24,12 +24,14 @@ mod beatoraja_style;
 mod canonical;
 mod custom;
 mod error;
+mod headers;
 mod preset;
 mod validate;
 
 pub use beatoraja_style::beatoraja_style;
 pub use custom::custom;
 pub use error::{CanonicalError, RuleError, Side};
+pub use headers::{HeaderPolicy, JudgeRank, ReadHeaders};
 pub use preset::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
     Implementation, JudgeWindows, Judgment, LateHeadRule, LnEndWindows, LnMode, LnModeRule,

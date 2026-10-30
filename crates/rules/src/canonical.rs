@@ -18,14 +18,14 @@ use bms_model::TimeUs;
 
 use crate::{
     Assignment, CanonicalError, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-    GaugeValue, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
-    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights,
-    TotalMode, Window,
+    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode,
+    LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder,
+    ScoreWeights, TotalMode, Window,
 };
 
-/// The encoding layout. Version 4 has the LN-end edges after the windows
-/// and no LN break.
-const FORMAT_VERSION: u64 = 4;
+/// The encoding layout. Version 5 has the header policy before the rank
+/// scale.
+const FORMAT_VERSION: u64 = 5;
 
 /// The fewest bytes a gauge takes: an empty id's length, the survival tag,
 /// three one-byte values, six fixed deltas of a tag and a one-byte value,
@@ -47,6 +47,7 @@ impl RulePreset {
             miss,
             empty_poor,
             ln_end,
+            headers,
             rank_scale,
             default_total_milli,
             denominator,
@@ -67,6 +68,10 @@ impl RulePreset {
             MissRule::PoorAfterLateBadOrOvertaken => 0,
         });
         w.empty_poor(empty_poor);
+        w.uint(match headers {
+            HeaderPolicy::Decimals => 0,
+            HeaderPolicy::IntegerRanks => 1,
+        });
         w.rank_scale(rank_scale);
         w.int(*default_total_milli);
         w.uint(match denominator {
@@ -117,6 +122,11 @@ impl RulePreset {
             (t == 0).then_some(MissRule::PoorAfterLateBadOrOvertaken)
         })?;
         let empty_poor = r.empty_poor()?;
+        let headers = r.tag("headers", |t| match t {
+            0 => Some(HeaderPolicy::Decimals),
+            1 => Some(HeaderPolicy::IntegerRanks),
+            _ => None,
+        })?;
         let rank_scale = r.rank_scale()?;
         let default_total_milli = r.int()?;
         let denominator = r.tag("denominator", |t| {
@@ -151,6 +161,7 @@ impl RulePreset {
             miss,
             empty_poor,
             ln_end,
+            headers,
             rank_scale,
             default_total_milli,
             denominator,
@@ -644,10 +655,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_bytes_start_with_format_4_and_change_with_any_ln_end_edge() {
+    fn canonical_bytes_start_with_format_5_and_change_with_any_ln_end_edge() {
         let base = custom();
         let base_bytes = base.canonical_bytes();
-        assert_eq!(base_bytes.first(), Some(&4));
+        assert_eq!(base_bytes.first(), Some(&5));
         let edges: [fn(&mut crate::LnEndWindows) -> &mut TimeUs; 3] =
             [|w| &mut w.perfect, |w| &mut w.great, |w| &mut w.good];
         let mut seen = HashSet::from([base_bytes]);
@@ -713,35 +724,37 @@ mod tests {
             rank_milli: [40_000, 70_000, 100_000, 130_000],
             absent_milli: 90_000,
         };
+        p.headers = crate::HeaderPolicy::IntegerRanks;
         p.default_total_milli = 123_456;
         p
     }
 
     /// The bytes of [`representative`], written by hand from the module docs
-    /// field by field: the format version 4, then `rep`, version 7, the
+    /// field by field: the format version 5, then `rep`, version 7, the
     /// implementation, the windows, the LN-end edges (90 ms is zigzag 180000
     /// = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1 19`), the miss
     /// rule (0), the empty POOR (`ahead` 250 ms is zigzag 500000 = `a0 c2
-    /// 1e`, `behind` 120 ms is zigzag 240000 = `80 d3 0e`), and the rest in
+    /// 1e`, `behind` 120 ms is zigzag 240000 = `80 d3 0e`), the header policy
+    /// (`IntegerRanks`, 1), and the rest in
     /// declaration order.
-    const PINNED: [u8; 197] = [
-        0x04, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+    const PINNED: [u8; 198] = [
+        0x05, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x03, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
         0x14, 0x80, 0xb5, 0x18, 0xa0, 0xfe, 0x0a, 0xc0, 0x8b, 0x11, 0xa0, 0xd1, //
-        0x19, 0x00, 0xa0, 0xc2, 0x1e, 0x80, 0xd3, 0x0e, 0x00, 0x00, 0x01, 0x04, //
-        0x80, 0xf1, 0x04, 0xe0, 0xc5, 0x08, 0xc0, 0x9a, 0x0c, 0xa0, 0xef, 0x0f, //
-        0xa0, 0xfe, 0x0a, 0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, //
-        0x6d, 0x61, 0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, //
-        0x80, 0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, //
-        0x01, 0x01, 0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, //
-        0x00, 0xbf, 0xcf, 0x24, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, //
-        0x61, 0x6c, 0x01, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, 0xc4, 0x09, //
-        0x00, 0x80, 0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, 0x00, 0xbf, //
-        0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x01, 0x80, //
-        0x9b, 0xee, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0xa0, 0x8d, 0x06,
+        0x19, 0x00, 0xa0, 0xc2, 0x1e, 0x80, 0xd3, 0x0e, 0x00, 0x00, 0x01, 0x01, //
+        0x04, 0x80, 0xf1, 0x04, 0xe0, 0xc5, 0x08, 0xc0, 0x9a, 0x0c, 0xa0, 0xef, //
+        0x0f, 0xa0, 0xfe, 0x0a, 0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, //
+        0x72, 0x6d, 0x61, 0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, //
+        0x01, 0x80, 0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, //
+        0x01, 0x01, 0x01, 0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, //
+        0x49, 0x00, 0xbf, 0xcf, 0x24, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, //
+        0x76, 0x61, 0x6c, 0x01, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, 0xc4, //
+        0x09, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, 0x00, //
+        0xbf, 0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x01, //
+        0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x00, 0xa0, 0x8d, 0x06,
     ];
 
     /// The layout, pinned, so a reordered or dropped field fails here; an
@@ -794,11 +807,17 @@ mod tests {
         w.ln_end(&p.ln_end);
     }
 
-    /// Up to the gauge count.
-    fn through_denominator(w: &mut Writer, p: &RulePreset) {
+    /// Up to the header policy's tag.
+    fn through_empty_poor(w: &mut Writer, p: &RulePreset) {
         through_ln_end(w, p);
         w.uint(0);
         w.empty_poor(&p.empty_poor);
+    }
+
+    /// Up to the gauge count.
+    fn through_denominator(w: &mut Writer, p: &RulePreset) {
+        through_empty_poor(w, p);
+        w.uint(0);
         w.rank_scale(&p.rank_scale);
         w.int(p.default_total_milli);
         w.uint(0);
@@ -822,6 +841,16 @@ mod tests {
     }
 
     #[test]
+    fn header_policies_decode_and_differ() {
+        let style = crate::beatoraja_style();
+        assert_eq!(decode(&style.canonical_bytes()), Ok(style));
+        let mut p = custom();
+        p.headers = crate::HeaderPolicy::IntegerRanks;
+        assert_ne!(p.canonical_bytes(), custom().canonical_bytes());
+        assert_eq!(decode(&p.canonical_bytes()), Ok(p));
+    }
+
+    #[test]
     fn other_canonical_version_is_refused() {
         for v in [0, FORMAT_VERSION - 1, FORMAT_VERSION + 1, u64::MAX] {
             assert_eq!(
@@ -837,19 +866,19 @@ mod tests {
         // The id's length: one more than the bytes left is refused; exactly
         // the bytes left is read, and the next field finds nothing.
         assert_eq!(
-            decode(&[4, 4, b'a', b'b', b'c']),
+            decode(&[5, 4, b'a', b'b', b'c']),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
                 count: 4
             })
         );
         assert_eq!(
-            decode(&[4, 3, b'a', b'b', b'c']),
+            decode(&[5, 3, b'a', b'b', b'c']),
             Err(CanonicalError::Truncated)
         );
         assert_eq!(
             decode(&[
-                4, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
+                5, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
             ]),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
@@ -870,9 +899,8 @@ mod tests {
         }
         // The rank scale's length.
         let at = offset(|w, p| {
-            through_ln_end(w, p);
+            through_empty_poor(w, p);
             w.uint(0);
-            w.empty_poor(&p.empty_poor);
         });
         assert_eq!(
             decode(&with_uint_at(at, u64::MAX)),
@@ -934,6 +962,8 @@ mod tests {
         let unknown = |field, tag| Err(CanonicalError::UnknownTag { field, tag });
         let miss = offset(through_ln_end);
         assert_eq!(decode(&with_uint_at(miss, 1)), unknown("miss", 1));
+        let headers = offset(through_empty_poor);
+        assert_eq!(decode(&with_uint_at(headers, 2)), unknown("headers", 2));
         let breaks_combo = offset(|w, p| {
             through_ln_end(w, p);
             w.uint(0);

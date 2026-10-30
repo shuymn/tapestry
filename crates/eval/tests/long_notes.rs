@@ -11,7 +11,7 @@
 
 mod common;
 
-use bms_model::{Chart, ChartBuilder, JudgeRank, TimeUs};
+use bms_model::{Chart, ChartBuilder, JudgmentHeader, TimeUs};
 use common::{MS, device, disconnect, lane, press, release, run, run_with};
 use eval::{
     EvalError, EvalInput, Evaluator, InputStart, JudgeEvent, JudgeEventKind, PhysicalInputEvent,
@@ -286,9 +286,9 @@ fn t7_bad_heads_and_a_great_head_released_within_great() {
 
 /// The judgment of a 1 s note pressed on time and released `x` before its
 /// end, under `rank`.
-fn ranked(preset: &RulePreset, rank: JudgeRank, length: i64, x: i64) -> Judgment {
+fn ranked(preset: &RulePreset, rank: JudgmentHeader, length: i64, x: i64) -> Judgment {
     let mut chart = ln(length);
-    chart.meta.rank = Some(rank);
+    chart.meta.judgment_headers = vec![rank];
     let (events, _) = play_with(
         &chart,
         preset,
@@ -306,7 +306,7 @@ fn t8_ln_end_edges_scale_with_the_rank() {
     let custom = rules::custom();
     let s = 1_000 * MS;
     // #RANK 3, 125 %: 125, 187.5 and 250 ms.
-    let r3 = JudgeRank::Rank(3);
+    let r3 = common::rank(3);
     assert_eq!(ranked(&custom, r3, s, 125_000), Perfect);
     assert_eq!(ranked(&custom, r3, s, 125_001), Great);
     assert_eq!(ranked(&custom, r3, s, 187_500), Great);
@@ -314,20 +314,20 @@ fn t8_ln_end_edges_scale_with_the_rank() {
     assert_eq!(ranked(&custom, r3, s, 250_000), Good);
     assert_eq!(ranked(&custom, r3, s, 250_001), Bad);
     // #DEFEXRANK 200: 200, 300 and 400 ms.
-    let d200 = JudgeRank::DefExRankMilli(200_000);
+    let d200 = common::defexrank_decimal(200_000);
     assert_eq!(ranked(&custom, d200, s, 200_000), Perfect);
     assert_eq!(ranked(&custom, d200, s, 300_000), Great);
     assert_eq!(ranked(&custom, d200, s, 400_000), Good);
     assert_eq!(ranked(&custom, d200, s, 400_001), Bad);
     // #RANK 0, 50 %: 50, 75 and 100 ms.
-    let r0 = JudgeRank::Rank(0);
+    let r0 = common::rank(0);
     assert_eq!(ranked(&custom, r0, s, 50_000), Perfect);
     assert_eq!(ranked(&custom, r0, s, 50_001), Great);
     assert_eq!(ranked(&custom, r0, s, 100_000), Good);
     assert_eq!(ranked(&custom, r0, s, 100_001), Bad);
     // #DEFEXRANK 33.333: GREAT is 150 ms × 0.33333 = 49_999.5 µs, floored
     // to 49_999, so 50_000 µs early is GOOD.
-    let third = JudgeRank::DefExRankMilli(33_333);
+    let third = common::defexrank_decimal(33_333);
     assert_eq!(ranked(&custom, third, s, 33_333), Perfect);
     assert_eq!(ranked(&custom, third, s, 33_334), Great);
     assert_eq!(ranked(&custom, third, s, 49_999), Great);
@@ -348,7 +348,7 @@ fn t8_ln_end_edges_scale_with_the_rank() {
     tiny.ln_end.great = TimeUs(2);
     tiny.ln_end.good = TimeUs(3);
     assert_eq!(tiny.validate(), Ok(()));
-    let r2 = JudgeRank::Rank(2);
+    let r2 = common::rank(2);
     assert_eq!(ranked(&tiny, r2, s, 1), Perfect);
     assert_eq!(ranked(&tiny, r2, s, 3), Good);
     assert_eq!(ranked(&tiny, r0, s, 0), Perfect);
@@ -554,7 +554,7 @@ fn l1_2_scaled_edges_beyond_2_pow_32_refuse_the_rank() {
     let half = cap / 2;
     let dev = device(&[0]);
     let mut chart = ln(10 * MS);
-    chart.meta.rank = Some(JudgeRank::DefExRankMilli(200_000));
+    chart.meta.judgment_headers = vec![common::defexrank_decimal(200_000)];
     let new = |preset: &RulePreset| {
         Evaluator::new(&chart, preset, &dev, &InputStart::default(), None, 0).map(|_| ())
     };

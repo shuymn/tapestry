@@ -10,25 +10,30 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 6
+//! # Loader version 7
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 6; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 7; changing any of them
 //! changes the version.
 //!
 //! - **Time:** each object's time is accumulated in exact rationals and
 //!   floored to µs once; the time's denominator has at most
 //!   [`Limits::max_time_bits`] bits (an error otherwise). BPM, `#STOPxx`,
-//!   measure-length, `#TOTAL` and `#DEFEXRANK` values are decimals with an
+//!   measure-length and judgment-header values are decimals with an
 //!   optional exponent (`1.5`, `.5`, `1.00001E+07`), positive at most 18,
 //!   with at most 12 integer digits once the exponent applies; digits past
 //!   the 18th fractional one are cut off toward zero. A malformed timing
 //!   value is an error, and so is a measure length of 0, as written or cut
-//!   off to it; a malformed `#TOTAL` or `#DEFEXRANK` is ignored with a
-//!   warning. A BPM is at least 0.000001, and a negative one is an error,
-//!   since reverse scroll is not supported yet. `#TOTAL` and `#DEFEXRANK`
-//!   are kept in thousandths rounded down; a `#DEFEXRANK` below 1 is ignored
-//!   with a warning, so an earlier `#RANK` stays. A `#STOPxx` value counts
+//!   off to it. A BPM is at least 0.000001, and a negative one is an error,
+//!   since reverse scroll is not supported yet. A `#STOPxx` value counts
 //!   1/192 of a 4/4 measure (1/48 beat) whatever the measure length.
+//! - **Judgment headers:** every `#RANK`, `#DEFEXRANK` and `#TOTAL` read
+//!   (in a taken branch) is kept in file order in
+//!   [`ChartMeta::judgment_headers`](bms_model::ChartMeta::judgment_headers)
+//!   in canonical form: an integer token (`[+-]?[0-9]+`), another decimal,
+//!   each with its exact value in units of `10^-18`, or not a number (text
+//!   outside the decimal grammar or its bounds, with a warning). None is
+//!   refused, and the loader does not decide which one counts or what a
+//!   value means: that is each preset's header policy.
 //! - **Display:** a note head, long-note end or bar line sits at its exact
 //!   beat count floored once to 2^-80 beat; STOPs and BPM changes add no
 //!   beats. The scroll map has a segment per BPM change, STOP start and STOP
@@ -103,7 +108,9 @@
 //!   `#STOPxx`, `#ELSEIF`, and `#SWITCH`/`#CASE`/`#SKIP`/`#DEF`/`#ENDSW`.
 //!   The branching ones are refused even inside a branch not taken.
 //! - **Resolved hash:** covers what the chart resolved to, display
-//!   positions and the scroll map included, not the
+//!   positions, the scroll map and the judgment-header declarations in
+//!   canonical form included (so whitespace, a header's case and line
+//!   positions do not change it, and `120` and `120.0` differ), not the
 //!   `#RANDOM` results that chose it, so two draws resolving to the same
 //!   objects share one hash.
 
@@ -135,7 +142,7 @@ pub use error::{LoadError, Warning, WarningKind};
 pub use header::{Header, read_header};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 6;
+pub const LOADER_VERSION: u32 = 7;
 
 /// Bounds on the work a chart may cause (design.md "Loading Limits"). The
 /// defaults sit far above real charts.

@@ -424,9 +424,12 @@ impl<'a> Evaluator<'a> {
         let in_section = |t: TimeUs, end: TimeUs| {
             section.is_none_or(|s| s.start <= t && t < s.end && end < s.end)
         };
+        // The preset's header policy reads the chart's declarations into
+        // one rank and one #TOTAL (design.md "Evaluation Stages").
+        let headers = rule.headers.read(&chart.meta.judgment_headers);
         let scale = rule
             .rank_scale
-            .scale_milli(chart.meta.rank)
+            .scale_milli(headers.rank)
             .ok_or(EvalError::InvalidRank)?;
         let windows = rule.windows.scaled(scale).ok_or(EvalError::InvalidRank)?;
         let ln_end = rule.ln_end.scaled(scale).ok_or(EvalError::InvalidRank)?;
@@ -523,12 +526,7 @@ impl<'a> Evaluator<'a> {
             .max()
             .or(section.map(|s| s.start))
             .unwrap_or(TimeUs(0));
-        // A #TOTAL that is not positive counts as absent.
-        let total_milli = chart
-            .meta
-            .total_milli
-            .filter(|&t| t > 0)
-            .unwrap_or(rule.default_total_milli);
+        let total_milli = headers.total_milli.unwrap_or(rule.default_total_milli);
         let increment = match rule.total_mode {
             TotalMode::ScalesIncrease => increment(total_milli, notes),
         };
