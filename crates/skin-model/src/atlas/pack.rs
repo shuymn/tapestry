@@ -74,7 +74,7 @@ pub(crate) fn candidates(padded: &[[u32; 2]], cap: u32) -> impl Iterator<Item = 
 /// The order cells are placed in: taller first, then wider, then by index.
 pub(crate) fn order(padded: &[[u32; 2]]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..padded.len()).collect();
-    order.sort_by_key(|&i| {
+    order.sort_unstable_by_key(|&i| {
         let [w, h] = padded.get(i).copied().unwrap_or([0, 0]);
         (std::cmp::Reverse(h), std::cmp::Reverse(w), i)
     });
@@ -122,18 +122,19 @@ pub(crate) fn pack_side(
             return Ok(None);
         };
         let size = size2(w, h);
-        let mut placed = None;
-        for (page, (alloc, count)) in (0_u32..).zip(pages.iter_mut()) {
-            if *count >= per_page {
-                continue;
-            }
-            if let Some(a) = alloc.allocate(size) {
+        let existing = (0_u32..)
+            .zip(pages.iter_mut())
+            .find_map(|(page, (alloc, count))| {
+                if *count >= per_page {
+                    return None;
+                }
+                let a = alloc.allocate(size)?;
                 *count += 1;
-                placed = Some((page, a.rectangle));
-                break;
-            }
-        }
-        if placed.is_none() {
+                Some((page, a.rectangle))
+            });
+        let (page, r) = if let Some(place) = existing {
+            place
+        } else {
             let page = u32::try_from(pages.len()).unwrap_or(u32::MAX);
             if page >= max_pages || per_page == 0 {
                 return Ok(None);
@@ -143,10 +144,7 @@ pub(crate) fn pack_side(
                 return Ok(None);
             };
             pages.push((alloc, 1));
-            placed = Some((page, a.rectangle));
-        }
-        let Some((page, r)) = placed else {
-            return Ok(None);
+            (page, a.rectangle)
         };
         let rect = [r.min.x, r.min.y, r.width(), r.height()].map(|v| u32::try_from(v).ok());
         let [Some(x), Some(y), Some(rw), Some(rh)] = rect else {
@@ -206,8 +204,14 @@ pub(crate) fn pack(
             );
             new < old || (new == old && p.pages < b.pages)
         });
+        let one_page = p.pages == 1;
         if better {
             best = Some(p);
+        }
+        // Later sides are larger and need at least one page, so they cost
+        // strictly more than this one.
+        if one_page {
+            break;
         }
     }
     best.ok_or(PackError::TooManyPages)
