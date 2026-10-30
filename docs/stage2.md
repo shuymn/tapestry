@@ -780,7 +780,7 @@ Each one holds the behavior D5 and D6 state.
 - the pause is acknowledged before each countdown;
 - the load time is printed;
 - unknown arguments exit 2;
-- a second player process started on the same data root is refused before it opens `library.db`, with a message naming the folder (`second_process_is_refused_before_the_library_opens`). `library` keeps one owner per file only within a process; today's `tapestry.lock` only decides which process writes the log.
+- a second player process started on the same data root is refused before it opens `library.db`, with a message naming the folder (`second_process_is_refused_before_the_library_opens`). `library` already refuses a second `Library` of the file in any process (`LibraryError::AlreadyOpen`, from its lock on `library.db.lock`); the player still decides what a second process does, and today's `tapestry.lock` only decides which process writes the log.
 
 ### PR16. Preset shelf, first-start presets and polling (`game`)
 

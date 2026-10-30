@@ -20,13 +20,14 @@
 //!
 //! The database is in WAL mode. A scan's writer thread owns the one writer
 //! connection; [`Library`] holds the reader connection of the thread that
-//! queries it. Both come from the [`Library`], the only owner of every
-//! connection to its file in this process: a second one of the same file is
-//! refused while the first or its scan lives, and one scan runs at a time.
-//! A rebuild happens in [`Library::open`] before any connection exists.
-//! Keeping other processes away from the file is the caller's part. Each
-//! stored header value is cut to [`HEADER_FIELD_BYTES`], so a batch has a
-//! fixed bound in bytes.
+//! queries it. Both come from the [`Library`], which holds an exclusive OS
+//! lock on `<file name>.lock` beside the database for as long as it or its
+//! scan lives: a second [`Library`] of the file, in this process or
+//! another, is refused, and one scan runs at a time. A rebuild happens in
+//! [`Library::open`] after the lock is taken and before any connection
+//! exists. The lock file is left in place; the database file itself is
+//! never locked, since SQLite locks it. Each stored header value is cut to
+//! [`HEADER_FIELD_BYTES`], so a batch has a fixed bound in bytes.
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -39,10 +40,11 @@ mod db;
 mod scan;
 
 use std::fmt;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::Connection;
 
@@ -79,16 +81,17 @@ pub enum LibraryError {
     /// A scan thread could not be started.
     #[error("a library scan thread cannot be started")]
     Spawn(#[source] io::Error),
-    /// The folder of the database file cannot be resolved.
-    #[error("the library database's folder cannot be found: {}", path.display())]
-    Locate {
-        /// The database file.
+    /// The lock file beside the database cannot be opened or locked.
+    #[error("the library database's lock cannot be taken: {}", path.display())]
+    Lock {
+        /// The lock file.
         path: PathBuf,
         /// What the file system said.
         #[source]
         source: io::Error,
     },
-    /// Another [`Library`] of this file, or its scan, lives in this process.
+    /// Another [`Library`] of this file, or its scan, lives in this process
+    /// or another.
     #[error("the library database is already open: {}", path.display())]
     AlreadyOpen {
         /// The database file.
@@ -146,43 +149,49 @@ pub struct ChartEntry {
     pub header: Header,
 }
 
-/// The database files a [`Library`] of this process holds, by their
-/// canonical path.
-static OPEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
-/// A database file held by this process: by its [`Library`] and by the
-/// lease of its running scan, whichever ends last.
+/// The lock beside a database file, held by its [`Library`] and by the lease
+/// of its running scan, whichever ends last. The lock ends with the `File`.
 #[derive(Debug)]
 struct Owner {
-    key: PathBuf,
+    _lock: File,
     scanning: AtomicBool,
 }
 
 impl Owner {
-    /// Takes the file at canonical path `key`, if no other owner holds it.
-    fn take(key: PathBuf) -> Option<Arc<Self>> {
-        let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
-        if open.contains(&key) {
-            return None;
+    /// Takes the exclusive lock on `<file name>.lock` beside the database,
+    /// creating it. The database file itself is never locked: SQLite does
+    /// its own locking on it.
+    fn take(path: &Path) -> Result<Arc<Self>, LibraryError> {
+        let mut name = path.file_name().unwrap_or_default().to_owned();
+        name.push(".lock");
+        let lock_path = path.with_file_name(name);
+        let refused = |source| LibraryError::Lock {
+            path: lock_path.clone(),
+            source,
+        };
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(refused)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Arc::new(Self {
+                _lock: lock,
+                scanning: AtomicBool::new(false),
+            })),
+            Err(TryLockError::WouldBlock) => Err(LibraryError::AlreadyOpen {
+                path: path.to_owned(),
+            }),
+            Err(TryLockError::Error(e)) => Err(refused(e)),
         }
-        open.push(key.clone());
-        Some(Arc::new(Self {
-            key,
-            scanning: AtomicBool::new(false),
-        }))
-    }
-}
-
-impl Drop for Owner {
-    fn drop(&mut self) {
-        OPEN.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|key| *key != self.key);
     }
 }
 
 /// The right to run the one scan of a [`Library`], released when the scan's
-/// writer thread ends, however it ends.
+/// writer thread ends, however it ends. It keeps the lock beside the file
+/// while the scan outlives its library.
 #[derive(Debug)]
 pub(crate) struct ScanLease(Arc<Owner>);
 
@@ -192,29 +201,16 @@ impl Drop for ScanLease {
     }
 }
 
-/// The canonical path of database file `path`: its folder, which must exist,
-/// resolved, and its name.
-fn canonical(path: &Path) -> io::Result<PathBuf> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    Ok(dir.canonicalize()?.join(name))
-}
-
-/// The library database. It is the only owner of every connection to its
-/// file in this process: its own reader connection, and the writer
-/// connection of its scan. A second [`Library`] of the same file is refused
-/// while either lives, so a rebuild in [`open`](Self::open) never deletes a
-/// file under a live connection. Other processes are kept out by the data
-/// root's owner, not by this crate.
+/// The library database. It locks `<file name>.lock` beside the file for
+/// as long as it or its scan lives, so a second [`Library`] of the file, in
+/// this process or another and by any name of it, is refused. Every
+/// connection to the file comes from it: its own reader connection, and
+/// the writer connection of its scan. A rebuild in [`open`](Self::open)
+/// therefore never deletes a file under a live connection.
 #[derive(Debug)]
 pub struct Library {
     path: PathBuf,
-    // Before `owner`, so the connection closes before the file is released.
+    // Before `owner`, so the connection closes before the lock is released.
     reader: Connection,
     owner: Arc<Owner>,
 }
@@ -222,23 +218,17 @@ pub struct Library {
 impl Library {
     /// Opens the database at `path`, creating it when it is missing, or
     /// deleting and creating it when it holds another schema version. Both
-    /// happen before this process holds any connection to the file.
+    /// happen after the lock is taken and before any connection exists.
     ///
     /// # Errors
     ///
     /// [`LibraryError::AlreadyOpen`] while another [`Library`] of this file,
-    /// or its scan, lives in this process; [`LibraryError::Locate`] when its
-    /// folder cannot be resolved; [`LibraryError::Database`] when SQLite
-    /// refuses the file; and [`LibraryError::Remove`] when a file of another
-    /// version cannot be deleted.
+    /// or its scan, lives in any process; [`LibraryError::Lock`] when the
+    /// lock file cannot be opened or locked; [`LibraryError::Database`] when
+    /// SQLite refuses the file; and [`LibraryError::Remove`] when a file of
+    /// another version cannot be deleted.
     pub fn open(path: &Path) -> Result<(Self, Opened), LibraryError> {
-        let key = canonical(path).map_err(|source| LibraryError::Locate {
-            path: path.to_owned(),
-            source,
-        })?;
-        let owner = Owner::take(key).ok_or_else(|| LibraryError::AlreadyOpen {
-            path: path.to_owned(),
-        })?;
+        let owner = Owner::take(path)?;
         let database = |source| LibraryError::Database {
             path: path.to_owned(),
             source,

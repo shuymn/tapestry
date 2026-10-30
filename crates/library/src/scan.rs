@@ -158,14 +158,46 @@ enum Msg {
 struct State {
     /// A pause is requested and not released.
     pause: bool,
-    /// The writer acknowledged the pause: nothing is outstanding.
-    acked: bool,
+    /// Counts pause requests, so each is acknowledged on its own.
+    pause_gen: u64,
+    /// The latest request the writer acknowledged, with nothing outstanding.
+    acked_gen: u64,
     /// The scan is being dropped.
     shutdown: bool,
     /// Every thread but the writer has ended, and the writer is ending.
     finished: bool,
     report: ScanReport,
     error: Option<ScanError>,
+}
+
+impl State {
+    fn request_pause(&mut self) {
+        self.pause = true;
+        self.pause_gen += 1;
+    }
+
+    fn release(&mut self) {
+        self.pause = false;
+    }
+
+    fn paused(&self) -> bool {
+        (self.pause && self.acked_gen == self.pause_gen) || self.finished
+    }
+}
+
+/// Why the writer stopped short.
+enum Stop {
+    /// The writer connection refused a statement.
+    Database(rusqlite::Error),
+    /// A walker or parser ended, or a channel closed, while the scan still
+    /// needed it.
+    Worker,
+}
+
+impl From<rusqlite::Error> for Stop {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Database(e)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -296,26 +328,21 @@ impl Scan {
     /// Returns at once; [`wait_paused`](Self::wait_paused) waits for the
     /// acknowledgment.
     pub fn request_pause(&self) {
-        self.shared.update(|state| state.pause = true);
+        self.shared.update(State::request_pause);
         self.wake();
     }
 
-    /// Waits up to `timeout` for the pause to be acknowledged. `true` once
-    /// no scan thread is working: paused with nothing outstanding, or
-    /// finished.
+    /// Waits up to `timeout` for the latest pause request to be
+    /// acknowledged. `true` once no scan thread is working: paused with
+    /// nothing outstanding, or finished.
     #[must_use]
     pub fn wait_paused(&self, timeout: Duration) -> bool {
-        self.wait_for(timeout, |state| {
-            (state.pause && state.acked) || state.finished
-        })
+        self.wait_for(timeout, State::paused)
     }
 
     /// Releases a pause; the scan goes on.
     pub fn release(&self) {
-        self.shared.update(|state| {
-            state.pause = false;
-            state.acked = false;
-        });
+        self.shared.update(State::release);
         self.wake();
     }
 
@@ -436,20 +463,15 @@ fn list(dir: &Path, options: &ScanOptions) -> Listing {
             return listing;
         };
         let path = entry.path();
+        let kind = entry.file_type().ok();
         #[cfg(test)]
-        let fault = options.test.fault(&path);
+        let kind = match options.test.fault(&path) {
+            Some(tests::Fault::Listing) => return listing,
+            Some(tests::Fault::Metadata) => None,
+            None => kind,
+        };
         #[cfg(not(test))]
-        let fault = {
-            let _ = options;
-            None
-        };
-        if fault == Some(Fault::Listing) {
-            return listing;
-        }
-        let kind = match fault {
-            Some(Fault::Metadata) => None,
-            _ => entry.file_type().ok(),
-        };
+        let _ = options;
         match kind {
             Some(kind) if kind.is_dir() => listing.folders.push(path),
             Some(_) if !is_chart(&path) => {}
@@ -474,24 +496,14 @@ fn list(dir: &Path, options: &ScanOptions) -> Listing {
     listing
 }
 
-/// A failure the unit tests inject into a listing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "injected by the unit tests only")
-)]
-pub enum Fault {
-    /// Listing stops with an error at this entry.
-    Listing,
-    /// This entry's type and metadata cannot be read.
-    Metadata,
-}
-
-/// Cuts a header value to [`HEADER_FIELD_BYTES`] at a character boundary.
+/// Cuts a header value to [`HEADER_FIELD_BYTES`] at a character boundary,
+/// into a new string, so the long one's allocation is not kept.
 fn cap(value: &mut Option<String>) {
-    if let Some(text) = value {
+    if let Some(text) = value
+        && text.len() > HEADER_FIELD_BYTES
+    {
         let end = text.floor_char_boundary(HEADER_FIELD_BYTES);
-        text.truncate(end);
+        *text = text[..end].to_owned();
     }
 }
 
@@ -648,8 +660,9 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
-    /// Takes one message.
-    fn take(&mut self, msg: Msg) -> rusqlite::Result<()> {
+    /// Takes one message. A walker or parser that ends while the writer
+    /// still hands out work is fatal.
+    fn take(&mut self, msg: Msg) -> Result<(), Stop> {
         match msg {
             Msg::Listed(listing) => self.listed(listing),
             Msg::Parsed(row) => {
@@ -661,7 +674,10 @@ impl<'a> Writer<'a> {
                 self.outstanding = self.outstanding.saturating_sub(1);
                 self.count(|report| report.skipped += 1);
             }
-            Msg::Done => self.ended += 1,
+            Msg::Done => {
+                self.ended += 1;
+                return Err(Stop::Worker);
+            }
             Msg::Wake => {}
         }
         Ok(())
@@ -705,29 +721,31 @@ impl<'a> Writer<'a> {
 
     /// Hands out work: a folder to the walker while few files wait, and
     /// waiting files to the parsers up to [`OUTSTANDING`]. Once every
-    /// folder is listed, queues the removals of the files gone.
-    fn dispatch(&mut self) -> rusqlite::Result<()> {
+    /// folder is listed, queues the removals of the files gone. A closed
+    /// channel means its threads ended, which is fatal.
+    fn dispatch(&mut self) -> Result<(), Stop> {
         while self.outstanding < OUTSTANDING
             && let Some(job) = self.pending.pop_front()
         {
-            let Some(jobs) = &self.jobs_tx else { break };
+            let jobs = self.jobs_tx.as_ref().ok_or(Stop::Worker)?;
             match jobs.try_send(job) {
                 Ok(()) => self.outstanding += 1,
                 Err(TrySendError::Full(job)) => {
                     self.pending.push_front(job);
                     break;
                 }
-                Err(TrySendError::Disconnected(_)) => break,
+                Err(TrySendError::Disconnected(_)) => return Err(Stop::Worker),
             }
         }
         if self.listing.is_none()
             && self.pending.len() < PENDING
             && let Some((root, folder)) = self.folders.pop()
-            && let Some(walker) = &self.folders_tx
         {
+            let walker = self.folders_tx.as_ref().ok_or(Stop::Worker)?;
             match walker.try_send(folder.clone()) {
                 Ok(()) => self.listing = Some((root, folder)),
-                Err(_) => self.folders.push((root, folder)),
+                Err(TrySendError::Full(_)) => self.folders.push((root, folder)),
+                Err(TrySendError::Disconnected(_)) => return Err(Stop::Worker),
             }
         }
         if !self.walked && self.listing.is_none() && self.folders.is_empty() {
@@ -749,24 +767,29 @@ impl<'a> Writer<'a> {
         self.outstanding == 0 && self.listing.is_none()
     }
 
-    /// Commits, acknowledges the pause if it still holds, and waits for its
-    /// release. `false` when the scan is being dropped.
-    fn hold(&mut self) -> rusqlite::Result<bool> {
+    /// Commits, then, while the pause holds, acknowledges every request
+    /// made of it, since nothing is handed out meanwhile. `false` when the
+    /// scan is being dropped.
+    fn hold(&mut self) -> Result<bool, Stop> {
         self.commit()?;
         let mut state = self.shared.lock();
-        if state.pause {
-            state.acked = true;
-            self.shared.changed.notify_all();
-        }
-        while state.pause && !state.shutdown {
+        loop {
+            if state.shutdown {
+                return Ok(false);
+            }
+            if !state.pause {
+                return Ok(true);
+            }
+            if state.acked_gen != state.pause_gen {
+                state.acked_gen = state.pause_gen;
+                self.shared.changed.notify_all();
+            }
             state = self.shared.wait(state);
         }
-        state.acked = false;
-        Ok(!state.shutdown)
     }
 
     /// Runs the scan to its end, a drop, or a failure.
-    fn run(&mut self, roots: &[PathBuf]) -> rusqlite::Result<()> {
+    fn run(&mut self, roots: &[PathBuf]) -> Result<(), Stop> {
         let Prepared {
             roots,
             known,
@@ -782,23 +805,23 @@ impl<'a> Writer<'a> {
                 (state.pause, state.shutdown)
             };
             if shutdown {
-                return self.commit();
+                return Ok(self.commit()?);
             }
             if !pause {
                 self.dispatch()?;
             } else if self.idle() {
                 if !self.hold()? {
-                    return self.commit();
+                    return Ok(self.commit()?);
                 }
                 continue;
             }
             if self.walked && self.pending.is_empty() && self.idle() {
-                return self.commit();
+                return Ok(self.commit()?);
             }
-            match self.rx.recv() {
-                Ok(msg) => self.take(msg)?,
-                Err(_) => return self.commit(),
-            }
+            // The scan holds a sender until its drop, which sets
+            // `shutdown` first.
+            let msg = self.rx.recv().map_err(|_| Stop::Worker)?;
+            self.take(msg)?;
         }
     }
 
@@ -820,9 +843,16 @@ impl<'a> Writer<'a> {
 /// The writer thread: runs the scan, then ends the others before the scan
 /// counts as finished.
 fn write(shared: &Shared, mut writer: Writer<'_>, roots: &[PathBuf], lease: ScanLease) {
-    let result = writer.run(roots);
-    if let Err(e) = result {
-        shared.update(|state| state.error = Some(ScanError::Database(e)));
+    let error = match writer.run(roots) {
+        Ok(()) => None,
+        Err(Stop::Database(e)) => Some(ScanError::Database(e)),
+        // A drop also ends the walker and the parsers; only an end the
+        // scan did not ask for is an error.
+        Err(Stop::Worker) if shared.lock().shutdown => None,
+        Err(Stop::Worker) => Some(ScanError::Panicked),
+    };
+    if error.is_some() {
+        shared.update(|state| state.error = error);
     }
     writer.close();
     drop(writer);

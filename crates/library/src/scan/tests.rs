@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::{BATCH, Fault, Scan, ScanError, ScanOptions, ThreadStart};
+use super::{
+    BATCH, HEADER_FIELD_BYTES, Job, Scan, ScanError, ScanOptions, ThreadStart, Worker, cap,
+    read_chart,
+};
 use crate::{Library, LibraryError};
 
 const LONG: Duration = Duration::from_secs(20);
@@ -18,6 +21,15 @@ const SHORT: Duration = Duration::from_millis(300);
 type PathHook = Arc<dyn Fn(&Path) + Send + Sync>;
 type FaultHook = Arc<dyn Fn(&Path) -> Option<Fault> + Send + Sync>;
 type CommitHook = Arc<dyn Fn(usize) + Send + Sync>;
+
+/// A failure injected into a listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// Listing stops with an error at this entry.
+    Listing,
+    /// This entry's type and metadata cannot be read.
+    Metadata,
+}
 
 /// The unit tests' seams in a scan.
 #[derive(Clone, Default)]
@@ -588,4 +600,130 @@ fn pausing_an_ended_scan_holds_at_once() {
     scan.request_pause();
     assert!(scan.wait_paused(Duration::ZERO));
     assert_eq!(scan.finish().unwrap().read, 2);
+}
+
+#[test]
+fn a_pause_requested_again_right_after_a_release_is_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 3);
+    let lib = library(dir.path());
+    let (gate, hook) = Gate::new();
+    let scan = lib
+        .scan(
+            &[root],
+            with(Hooks {
+                in_hand: Some(hook),
+                ..Hooks::default()
+            }),
+        )
+        .unwrap();
+    gate.next();
+    gate.next();
+    scan.request_pause();
+    gate.open(2);
+    assert!(scan.wait_paused(LONG));
+    // Released and paused again before the writer can see the release.
+    scan.shared.update(|state| {
+        state.release();
+        state.request_pause();
+    });
+    scan.wake();
+    assert!(scan.wait_paused(LONG), "the new request is acknowledged");
+    assert!(gate.quiet(), "nothing is handed out between");
+    // Released and paused again from outside, one call after the other.
+    scan.release();
+    scan.request_pause();
+    assert!(scan.wait_paused(LONG));
+    scan.release();
+    drain(&scan, &gate);
+    assert_eq!(scan.finish().unwrap().read, 3);
+}
+
+/// Runs a scan whose hooks panic, and checks that it ends, joined and
+/// reported as panicked, within the bound, and that its lease is released.
+fn panicking_scan(options: ScanOptions) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 20);
+    let lib = library(dir.path());
+    let scan = lib.scan(std::slice::from_ref(&root), options).unwrap();
+    let result = bounded(move || scan.finish());
+    assert!(matches!(result, Err(ScanError::Panicked)), "{result:?}");
+    drop(lib.scan(&[root], ScanOptions::default()).unwrap());
+}
+
+#[test]
+fn a_panicking_walker_ends_the_scan() {
+    panicking_scan(ScanOptions {
+        on_thread_start: Some(Arc::new(|worker| {
+            assert_ne!(worker, Worker::Walker, "injected walker panic");
+        })),
+        ..ScanOptions::default()
+    });
+}
+
+#[test]
+fn a_parser_panicking_at_start_ends_the_scan() {
+    panicking_scan(ScanOptions {
+        on_thread_start: Some(Arc::new(|worker| {
+            assert_ne!(worker, Worker::Parser(0), "injected parser panic");
+        })),
+        ..ScanOptions::default()
+    });
+}
+
+#[test]
+fn a_parser_panicking_mid_file_ends_the_scan() {
+    let first = Arc::new(AtomicBool::new(true));
+    panicking_scan(with(Hooks {
+        in_hand: Some(Arc::new(move |_: &Path| {
+            assert!(
+                !first.swap(false, Ordering::SeqCst),
+                "injected parser panic"
+            );
+        })),
+        ..Hooks::default()
+    }));
+}
+
+#[test]
+fn a_capped_header_value_keeps_no_long_allocation() {
+    let mut short = Some("short".to_owned());
+    cap(&mut short);
+    assert_eq!(short.as_deref(), Some("short"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.bms");
+    let title = "あ".repeat(4 << 20);
+    fs::write(&path, format!("#TITLE {title}\n#ARTIST a\n")).unwrap();
+    let row = read_chart(
+        Job {
+            root: 0,
+            path: path.to_str().unwrap().to_owned(),
+        },
+        &bms_parser::Limits::default(),
+        &ScanOptions::default(),
+    )
+    .unwrap();
+    let kept = row.header.title.unwrap();
+    assert_eq!(kept.len(), HEADER_FIELD_BYTES / 3 * 3);
+    assert!(
+        kept.capacity() <= HEADER_FIELD_BYTES,
+        "capacity {}",
+        kept.capacity()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_case_alias_of_the_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (lib, _) = Library::open(&dir.path().join("library.db")).unwrap();
+    assert!(matches!(
+        Library::open(&dir.path().join("LIBRARY.DB")),
+        Err(LibraryError::AlreadyOpen { .. })
+    ));
+    drop(lib);
+    drop(Library::open(&dir.path().join("LIBRARY.DB")).unwrap());
 }
