@@ -61,11 +61,13 @@ toml = "1.1.8"
 # library: the library database (bundled SQLite, with FTS5 for search)
 rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
 
-# game, library and xtask
+# game, library and xtask, and replay and eval-cli (dev only)
 tempfile = "3.27.0"
 
-# player (Windows only)
+# player and eval-cli
 lexopt = "0.3.2"
+
+# player (Windows only)
 log = { version = "0.4.34", default-features = false }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 

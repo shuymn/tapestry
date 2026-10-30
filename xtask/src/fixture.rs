@@ -13,8 +13,8 @@ pub fn lib(name: &'static str, body: &str) -> Crate {
     (name, body.to_owned(), "src/lib.rs")
 }
 
-/// The real workspace's shape: the portable library crates, `player`, and
-/// `xtask`.
+/// The real workspace's shape: the portable library crates, `player`,
+/// `eval-cli`, and `xtask`.
 pub fn baseline() -> Vec<Crate> {
     vec![
         lib("bms-model", ""),
@@ -71,6 +71,16 @@ pub fn baseline() -> Vec<Crate> {
             "[package.metadata.tapestry]\nwindows-only = true\n\
              [features]\ndefault = []\ndev-tools = []\n\
              [dependencies]\neval = { path = \"../eval\" }\n"
+                .to_owned(),
+            "src/main.rs",
+        ),
+        (
+            "eval-cli",
+            "[dependencies]\nbms-model = { path = \"../bms-model\" }\n\
+             bms-parser = { path = \"../bms-parser\" }\n\
+             replay = { path = \"../replay\" }\n\
+             rules = { path = \"../rules\" }\n\
+             rules-toml = { path = \"../rules-toml\" }\n"
                 .to_owned(),
             "src/main.rs",
         ),

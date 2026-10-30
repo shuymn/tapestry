@@ -51,6 +51,7 @@ pub const LICENSES: &[(&str, &str)] = &[
     ("rules-toml", PERMISSIVE),
     ("eval", PERMISSIVE),
     ("replay", PERMISSIVE),
+    ("eval-cli", PERMISSIVE),
     ("xtask", PERMISSIVE),
     ("input", GPL),
     ("audio", GPL),

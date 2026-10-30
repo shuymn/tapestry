@@ -2,9 +2,10 @@
 //! of the saved record.
 
 use bms_model::{Chart, TimeUs};
-use eval::{EvalError, EvalInput, Evaluation, JudgeEvent, JudgeEventKind};
+use eval::{EvalError, Evaluation, JudgeEvent, JudgeEventKind};
 use replay::PlayRecord;
-use rules::RulePreset;
+use replay::verify::ReEvaluation;
+use rules::{Implementation, RulePreset};
 
 /// What a result extension reads at the end of a play.
 #[derive(Clone, Copy, Debug)]
@@ -38,11 +39,11 @@ pub const MIN_OFFSET_SAMPLES: usize = 32;
 /// Why a record could not be re-evaluated.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReEvaluationError {
-    /// The record was made by an evaluator version other than the one the
-    /// preset runs on, so its rules are not this build's.
+    /// The record was made by an evaluator version this build does not
+    /// run, so its rules are not this build's.
     #[error("the record was made by evaluator version {0}, which this build does not run")]
     UnsupportedEvaluator(u32),
-    /// The record names a preset other than the one given.
+    /// The record names a preset other than the one the play ran under.
     #[error("the record names another preset")]
     PresetMismatch,
     /// The evaluator refused the record.
@@ -68,31 +69,57 @@ pub trait ResultExtension {
     fn on_play_end(&mut self, ctx: &ResultContext<'_>) -> ResultSummary;
 }
 
-/// Re-evaluates the saved record under its own preset, through the
-/// finalized watermark, so the end screen's numbers come from the log.
+/// Re-evaluates the saved record of the chart just played: at the end of
+/// a play under its own preset, so the end screen's numbers come from the
+/// log, and under any other preset with [`under`](Self::under). The chart
+/// is the one played, so the record is not verified against a reloaded
+/// chart (design.md "Determinism").
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReEvaluate;
+
+impl ReEvaluate {
+    /// Re-evaluates the record of `ctx` on its chart under `preset`
+    /// (design.md "Extension Boundaries"): as played when `preset` is the
+    /// record's own, through the recorded watermark; otherwise a what-if,
+    /// to the preset's own final deadline after a completed play, or to the
+    /// recorded watermark, without a clear, after an aborted one.
+    ///
+    /// # Errors
+    ///
+    /// [`UnsupportedEvaluator`](ReEvaluationError::UnsupportedEvaluator),
+    /// checked first, or what the evaluator refuses.
+    pub fn under(
+        ctx: &ResultContext<'_>,
+        preset: &RulePreset,
+    ) -> Result<ReEvaluation, ReEvaluationError> {
+        check_evaluator(ctx.record)?;
+        replay::verify::evaluate_under(ctx.record, ctx.chart, preset)
+            .map_err(ReEvaluationError::Eval)
+    }
+}
+
+/// Refuses a record of an evaluator version this build does not run.
+fn check_evaluator(rec: &PlayRecord) -> Result<(), ReEvaluationError> {
+    if rec.versions.evaluator == Implementation::STANDARD_VERSION {
+        Ok(())
+    } else {
+        Err(ReEvaluationError::UnsupportedEvaluator(
+            rec.versions.evaluator,
+        ))
+    }
+}
 
 impl ResultExtension for ReEvaluate {
     fn on_play_end(&mut self, ctx: &ResultContext<'_>) -> ResultSummary {
         let rec = ctx.record;
-        // The evaluator version first: a record of another version is
+        // The preset the play ran under is the record's, so another one is
+        // a mismatch, not a what-if. The evaluator version still comes
+        // first: `under` checks it, and a record of another version is
         // refused whatever preset it names.
-        let evaluation = if rec.versions.evaluator != ctx.preset.implementation.version() {
-            Err(ReEvaluationError::UnsupportedEvaluator(
-                rec.versions.evaluator,
-            ))
-        } else if replay::preset_hash(ctx.preset) == rec.preset.sha256 {
-            let input = EvalInput {
-                events: rec.events.clone(),
-                device: rec.devices.profile(),
-                start: rec.start.clone(),
-                finalized: Some(rec.status.finalized),
-                section: None,
-            };
-            eval::evaluate(ctx.chart, &input, ctx.preset).map_err(ReEvaluationError::Eval)
+        let evaluation = if replay::preset_hash(ctx.preset) == rec.preset.sha256 {
+            Self::under(ctx, ctx.preset).map(|r| r.evaluation)
         } else {
-            Err(ReEvaluationError::PresetMismatch)
+            check_evaluator(rec).and(Err(ReEvaluationError::PresetMismatch))
         };
         ResultSummary {
             matches_live: evaluation.as_ref().is_ok_and(|e| e.events == ctx.live),

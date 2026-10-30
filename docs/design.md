@@ -349,7 +349,16 @@ During play, only `advance_to(watermark)` is called. Even for a note whose deadl
 - The evaluator's purity is checked in part: `cargo xtask check-arch` (R1) bounds its dependencies, and `crates/eval/clippy.toml` rejects the named `std` entry points for the clock, the file system, the environment, threads and printing, and `std`'s randomly ordered hash collections. Anything outside those lists stays a reviewed invariant. In `eval`, `rules` and `bms-parser`, clippy rejects `as` casts that may truncate, wrap, or lose the sign.
 - The processing order of events at the same time is made explicit as a preset item.
 - Anything that uses randomness (`#RANDOM` branches, RANDOM-type options) is decided at the step that resolves the chart before evaluation, and the result is recorded. The evaluator itself uses no randomness.
-- Even for the same chart file, a change in the loader version can change its interpretation. So the loader version and the hash of the resolved chart are recorded, and re-evaluating a saved record against a freshly loaded chart (`eval-cli`, local input logs) refuses a record whose loader version or resolved-chart hash differs from that chart's, as it refuses another evaluator version.
+- Even for the same chart file, a change in the loader version can change its interpretation. So the loader version and the hash of the resolved chart are recorded, and re-evaluating a saved record against a freshly loaded chart (`replay::verify`, which `eval-cli` uses) refuses at the first check that fails, in this order:
+  1. Decoding: the format version, the structure, and the stored preset hash against the stored preset bytes. These are structural, so they come first.
+  2. The evaluator version.
+  3. The recorded preset copy, decoded with the canonical decoder on every path, including when another preset overrides it.
+  4. The loader version.
+  5. The load itself, with the recorded `#RANDOM` seed.
+  6. The resolved-chart hash.
+  7. The chart transform: only the pass-through (`passthrough`, version 1) is known.
+
+  The chart file's SHA-256 is not compared, so an edited file that resolves to the same chart verifies. The result screen re-evaluates the chart just played, so it skips the chart checks.
 
 ## Rule Presets
 
@@ -482,7 +491,7 @@ The format uses a custom schema, and version detection does not rely on the hash
 
 - **Layout**: the magic `TPRL`, a `u16` format version, a `u8` body encoding (1 = zstd), a `u32` uncompressed body length, then the compressed body: a fixed sequence of sections, each a `u32` length and its payload. Integers are LEB128 varints (zigzag for signed values), and input times are deltas from the previous event of the same source. Records are saved as `records\<chart sha256>\<n>.tprl` under the data root.
 - **Recorded today**: the versions with the build provenance (`production | development`); the chart identity, `#RANDOM` results and the chart transform's id and version; the preset record; the session policy id; the device profile per source (kind, receive method, input offset, bindings, axis bindings with their resolved scratch settings, and the count of axis values outside the range their conversion used) with the audio and display offsets; the play type (always full); the start snapshot, the physical input with disconnects, and the arrivals list; and the status with the finalized watermark and the reasons for "incomplete" (overflow, source limit, suspend, input failed). Report intervals and polling estimates, offset changes, the other-operations stream, the practice fields and the IR start token arrive with the features that produce them, each with a version bump.
-- **Preset identity**: the hash of the preset's canonical binary encoding, not of its TOML text, so whitespace and comments do not split records. The encoding starts with its own version; a record made under an older layout matches no preset, and its re-evaluation is refused as a preset mismatch.
+- **Preset identity**: the hash of the preset's canonical binary encoding, not of its TOML text, so whitespace and comments do not split records. The encoding starts with its own version; the preset copy of a record made under an older layout fails to decode, and its re-evaluation is refused ("Determinism"), even under another preset.
 - **Versions**: each layout change bumps the format version, and the decoder reads only the current one; older versions are refused with `UnsupportedVersion(n)`, not converted. Reading older versions starts with the first release.
 - **Decoding limits** (the standard ones): at most 64 MiB compressed; a declared uncompressed size of at most 64 MiB, checked before decompressing, with decompression stopping at it; section lengths against the remaining bytes; at most 64 sources and 4,194,304 events; and bindings and axes against the evaluator's limits (at most 256 buttons and keys and 8 axes per source, 1024 and 16 over all sources), counted as each count is read and before anything is allocated for it. The evaluator refuses a profile beyond them too, and finds an input's axis by binary search over its source's axes, so a log that declares many controls cannot make conversion slow.
 - Alternatives: `serde` with `bincode` or `postcard`, whose wire layout follows the Rust struct layout and changes silently with a field reorder; JSON, about 5–10× larger; protobuf, a schema compiler for a format with one reader and one writer.
@@ -782,6 +791,12 @@ Extensions can plug in only at named extension points. Evaluation has no plug-in
 | Results | Transform | Analysis screens, re-evaluation under other presets | Reads the input log and the judgment event stream |
 | Saving | Receive only | Sending to IR, export | Even on failure, the play record remains locally |
 
+The built-in result extension re-evaluates a record's input under any preset (`ReEvaluate::under`). It checks the evaluator version first, then evaluates in one of three ways (`replay::verify::evaluate_under`, which `eval-cli` shares):
+- **As played** (the preset's hash is the record's): to the recorded finalized watermark. The result equals the live stream.
+- **What-if of a completed play:** the input the play evaluated, up to the recorded watermark, runs to the what-if preset's own final deadline. When that deadline is later than the watermark, the span after it is marked "no input after <t>".
+  - Example: the last note is at 60.000 s, hit on time. The custom preset's 180 ms late BAD edge closes the recording at about 60.180 s. Under a preset with a 220 ms edge, the final deadline is 60.220 s: the what-if completes and clears, with 60.180–60.220 s marked "no input".
+- **What-if of an aborted play:** to the recorded watermark, labeled "ended midway at <t>", with no gauge cleared, even when the what-if preset's final deadline comes before the watermark.
+
 ### What Stays Out of Core
 
 | Feature | Reason | Where it lives |
@@ -1026,7 +1041,7 @@ Rust is recommended as the core language. The evaluator can be shared between th
 | L2 | `rules` | Preset types, validation, canonical encoding and its bounded decoder, judgment window and gauge tables. Takes no external dependency, so `eval`'s dependency closure stays free of external crates |
 | L2 | `rules-toml` | Preset files (TOML) to and from `rules::RulePreset`; the file's shape lives here, so `rules` stays free of `serde` and `toml` |
 | L2 | `eval` | The evaluator and its input contract (physical input events, device profile, start snapshot, watermark and merge), which `input` and `replay` use. Depends only on `bms-model` and `rules` |
-| L2 | `replay` | Input log and replay formats |
+| L2 | `replay` | Input log and replay formats, and verifying a record against a freshly loaded chart (so it depends on `bms-parser`) |
 | L3 | `input`, `audio` | Raw Input/HID/MIDI, WASAPI/ASIO and the mixer |
 | L4 | `game` | Logic thread, session policy, publishing the state snapshot |
 | L4 | `library` | The library database (SQLite) and its background scan; `game` does not depend on it, and the caller hands it the roots |
@@ -1092,7 +1107,7 @@ Where there is no reason to build our own, established libraries are used. We bu
 | Measurement and testing | `tracy-client`, `criterion` | Span measurement, benchmarks |
 | Property tests | `proptest` | A dev-dependency of `eval` and `replay`: the evaluator's properties over generated charts, presets, input logs and delivery schedules, and the input log's round trip. Generators map independent raw values to valid ones, so shrinking keeps cases valid. Not used: `quickcheck`, whose type-driven generation and value shrinking fit valid-by-construction generators poorly and which keeps no failures; `bolero`, whose engines overlap `cargo-fuzz`; `arbitrary`-driven generation, which suits the fuzz targets that take bytes |
 | Errors | `thiserror` (libraries), `anyhow` (`player`, `xtask`) | `thiserror` derives the library error types and `anyhow` carries the player's and `xtask`'s reports; `eval`, `rules` and `bms-model` keep hand-written impls, since they take no external dependencies. How errors are built and printed is in "Errors" below. Not used: `snafu`, `error-stack` and `color-eyre`, which overlap these at more weight (panic hooks are out of scope); `miette`, to be reconsidered for `eval-cli` diagnostics |
-| Command line | `lexopt` (`player`) | Parses the player's arguments into a `Command` before anything is opened; a usage error prints `unknown argument: <arg>` or the usage line and exits 2. Development options exist only under `dev-tools`, so a production build reports them as unknown arguments. `xtask` keeps its own small dispatcher. Not used: `clap`, whose generated error text and help would change the CLI contract the CI probe checks |
+| Command line | `lexopt` (`player`, `eval-cli`) | Parses the arguments before anything is opened; a usage error exits 2. The player parses into a `Command` and prints `unknown argument: <arg>` or the usage line; `eval-cli` prints the error and the usage line. The player's development options exist only under `dev-tools`, so a production build reports them as unknown arguments. `xtask` keeps its own small dispatcher. Not used: `clap`, whose generated error text and help would change the CLI contract the CI probe checks |
 | Log file | `log` (facade); own file sink in `player` | Loading and lifecycle events and load warnings, under the data root in `logs\` ("Log File" below). Libraries return structured warnings and never log; summarizing repeated warnings happens where `player` logs them, whatever the backend. The sink is our own for its exact semantics: a byte limit checked before each write with room kept for the exit line, turning itself off on the first failed write, and a lease that lets only one running process rotate and write the files. Not used: `flexi_logger` and `log4rs`, whose size rotation runs during writing and which lack the reserved exit line, the off-on-first-error writer and the run-scoped lease; `tracing` (no spans needed; `tracy-client` is for investigations); `env_logger` (stderr by default, which a GUI build does not show, and a file sink is needed anyway); `fern`, `simplelog`, `simple-logging`, `ftail` (no size cap); `file-rotate`, `rolling-file` (writers only, without the lease or the reserve) |
 
 Code from GPL projects (beatoraja, bmz-player, etc.) and tables ported from them are not used. Behavior is determined from public information and hand-written tests, and the sources of the information behind tables and tests are recorded.

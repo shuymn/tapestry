@@ -24,6 +24,7 @@ const REQUIRED_PORTABLE: &[&str] = &[
     "audio",
     "game",
     "library",
+    "eval-cli",
     "xtask",
 ];
 
