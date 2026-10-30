@@ -243,6 +243,21 @@ pub const IN_PLAY: &[Site] = &[
             "SoundBank::stored",
         ],
     ),
+    // A seek plan is made off the audio thread; the engine reads it there.
+    Site::Fns(
+        "crates/audio/src/seek.rs",
+        &[
+            "FrameLine::frame",
+            "SeekPlan::time",
+            "SeekPlan::line",
+            "SeekPlan::engine",
+            "SeekPlan::at",
+            "SeekPlan::split",
+            "SeekPlan::budget",
+            "SeekPlan::seq",
+            "SeekPlan::slots",
+        ],
+    ),
     Site::File("crates/player/src/audio_side.rs"),
     // The render thread's frame.
     Site::File("crates/render/src/measure.rs"),
