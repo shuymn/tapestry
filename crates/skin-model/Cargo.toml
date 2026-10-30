@@ -1,13 +1,16 @@
 [package]
 name = "skin-model"
 version = "0.0.0"
-description = "The skin runtime model: state schema, expressions and quads."
+description = "The skin runtime model: state schema, expressions, tracks, timers and quads."
 edition.workspace = true
 license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+bms-model.workspace = true
+eval.workspace = true
+rules.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
