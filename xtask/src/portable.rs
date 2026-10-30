@@ -17,6 +17,7 @@ const REQUIRED_PORTABLE: &[&str] = &[
     "bms-model",
     "bms-parser",
     "rules",
+    "rules-toml",
     "eval",
     "replay",
     "input",
