@@ -4,9 +4,12 @@
 //! Live and batch evaluation share `merge` and `Evaluator`, so these
 //! properties check what does not depend on how input was delivered; the
 //! hand-calculated examples in the other test files check the values
-//! themselves. `generators_reach_the_fragile_spots` checks that the
-//! generators still reach the cases the properties need, so a generator
-//! change cannot make a property vacuous.
+//! themselves. Generated plays often evaluate a section, and
+//! `section_excerpt_matches_mid_chart_start` checks a section excerpted
+//! from a full log against a mid-chart start.
+//! `generators_reach_the_fragile_spots` checks that the generators still
+//! reach the cases the properties need, so a generator change cannot make
+//! a property vacuous.
 
 // A crate root's modules sit beside it, so the paths name the directory
 // that keeps them out of Cargo's test discovery.
@@ -21,8 +24,8 @@ use std::collections::BTreeMap;
 
 use bms_model::TimeUs;
 use eval::{
-    EvalInput, Evaluation, Evaluator, JudgeEventKind, PhysicalInputEvent, SourceId, Staged,
-    evaluate, evaluation_time, merge,
+    ConversionState, EvalInput, Evaluation, Evaluator, JudgeEventKind, PhysicalInputEvent,
+    SourceId, Staged, evaluate, evaluation_time, merge,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -32,8 +35,9 @@ use rules::{GaugeKind, GaugeValue, RulePreset};
 
 use live::{Delivery, Live, live};
 use strategy::{
-    Play, build_delivery, build_held_through, build_play, build_widening, end_of, interleave,
-    raw_delivery, raw_held_through, raw_play, raw_widening,
+    Excerpt, Play, build_delivery, build_excerpt, build_held_through, build_play, build_widening,
+    end_of, interleave, is_target, raw_delivery, raw_excerpt, raw_held_through, raw_play,
+    raw_widening,
 };
 
 /// A generated play and 1 to 4 delivery schedules for it.
@@ -150,8 +154,8 @@ fn check_gauges(preset: &RulePreset, e: &Evaluation) -> Result<(), TestCaseError
 }
 
 /// The long-note rules on one completed evaluation: every judgeable note
-/// has exactly one judgment, and only a judgment, an empty POOR or a mine
-/// hit changes the gauges. A held head comes at most once per long note,
+/// (of the section, if any) has exactly one judgment, and only a
+/// judgment, an empty POOR or a mine hit changes the gauges. A held head comes at most once per long note,
 /// before its judgment, with the judgment's deviation and never worse
 /// than it; while it is held, its lane sees no press. Every long note whose
 /// head a press took before its end (held, or a BAD) ends its visual hold
@@ -251,7 +255,9 @@ fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
         .enumerate()
         .flat_map(|(l, notes)| {
             notes.iter().enumerate().filter_map(move |(i, n)| {
-                (!matches!(n.kind, bms_model::NoteKind::Mine { .. })).then_some((l, i))
+                (!matches!(n.kind, bms_model::NoteKind::Mine { .. })
+                    && is_target(play.input.section.as_ref(), n))
+                .then_some((l, i))
             })
         })
         .collect();
@@ -299,6 +305,28 @@ proptest! {
             })
             .collect();
         prop_assert_eq!(judgments, vec![(expected, Some(TimeUs(p.deviation)))]);
+    }
+}
+
+proptest! {
+    /// P6: a section excerpted from a full log evaluates as a mid-chart
+    /// start whose snapshot leaves the same conversion state at the
+    /// lead-in start, with the same prefix and later input: input before
+    /// the lead-in judges nothing.
+    #[test]
+    fn section_excerpt_matches_mid_chart_start(raw in raw_excerpt()) {
+        let x = build_excerpt(&raw);
+        prop_assert_eq!(x.chart.validate(), Ok(()));
+        // The prefix before the lead-in start is never empty.
+        let device = &x.full.device;
+        prop_assert!(x.mid.events.iter().any(|e| evaluation_time(e, device) < x.lead_in_start));
+        let run = |input: &EvalInput| {
+            evaluate(&x.chart, input, &x.preset).map_err(|e| TestCaseError::fail(format!("{e:?}")))
+        };
+        let (full, mid) = (run(&x.full)?, run(&x.mid)?);
+        prop_assert!(full.completed);
+        check_stream(&full)?;
+        prop_assert_eq!(full, mid);
     }
 }
 
@@ -451,6 +479,7 @@ fn reversed_ties(play: &Play) -> Vec<eval::JudgeEvent> {
         &play.preset,
         device,
         &play.input.start,
+        play.input.section.as_ref(),
         order.len(),
     )
     .unwrap();
@@ -542,6 +571,9 @@ fn count_play(play: &Play, c: &mut Coverage) {
             e.time > play.final_deadline && matches!(e.kind, JudgeEventKind::EmptyPoor { .. })
         }),
     );
+    if let Some(s) = &play.input.section {
+        count_section(play, s, &whole, c);
+    }
     for (rule, g) in play.preset.gauges.iter().zip(&whole.gauges) {
         c.hit(
             "gauge_at_max",
@@ -564,6 +596,99 @@ fn count_play(play: &Play, c: &mut Coverage) {
                 }),
         );
     }
+}
+
+/// The section spots of one play: a long note cut by an edge, and lead-in
+/// presses judged on the first target's early edge or ignored.
+fn count_section(play: &Play, s: &eval::Section, whole: &Evaluation, c: &mut Coverage) {
+    let cut = play.chart.lanes.iter().flatten().any(|n| {
+        matches!(n.kind, bms_model::NoteKind::Long { .. })
+            && ((n.time < s.start && n.end() >= s.start)
+                || (s.start <= n.time && n.time < s.end && n.end() >= s.end))
+    });
+    c.hit("ln_cut_by_section", cut);
+    let ev = Evaluator::new(
+        &play.chart,
+        &play.preset,
+        &play.input.device,
+        &play.input.start,
+        Some(s),
+        0,
+    )
+    .unwrap();
+    let early = ev.windows().bad.early;
+    let lead_in = TimeUs(s.start.0 - s.lead_in.0)..s.start;
+    c.hit(
+        "lead_in_press_on_early_edge",
+        whole.events.iter().any(|e| {
+            lead_in.contains(&e.time)
+                && matches!(e.kind, JudgeEventKind::Judged { deviation: Some(d), .. } if d.0 == -early.0)
+        }),
+    );
+    // A lead-in press the section ignores and a whole-chart play judges or
+    // counts as an empty POOR.
+    let open = evaluate(
+        &play.chart,
+        &EvalInput {
+            section: None,
+            ..play.input.clone()
+        },
+        &play.preset,
+    )
+    .unwrap();
+    let acted = |e: &Evaluation, t: TimeUs| {
+        e.events.iter().any(|ev| {
+            ev.time == t
+                && ev.origin.is_some()
+                && matches!(
+                    ev.kind,
+                    JudgeEventKind::Judged { .. } | JudgeEventKind::EmptyPoor { .. }
+                )
+        })
+    };
+    c.hit(
+        "lead_in_press_ignored",
+        play.input.events.iter().any(|e| {
+            let t = evaluation_time(e, &play.input.device);
+            lead_in.contains(&t) && acted(&open, t) && !acted(whole, t)
+        }),
+    );
+}
+
+/// The conversion spots of one excerpt at its lead-in start: a lane held
+/// and a scratch release pending there, and input before the prefix.
+fn count_excerpt(x: &Excerpt, c: &mut Coverage) {
+    let device = &x.mid.device;
+    let mut conv = ConversionState::init(device, &x.mid.start).unwrap();
+    let mut events: Vec<(TimeUs, PhysicalInputEvent)> = x
+        .mid
+        .events
+        .iter()
+        .map(|e| (evaluation_time(e, device), *e))
+        .filter(|&(t, _)| t < x.lead_in_start)
+        .collect();
+    events.sort_by_key(|&(t, e)| (t, e.source));
+    let due = |conv: &mut ConversionState, before: TimeUs| {
+        while let Some((r, _, axis)) = conv.next_release()
+            && r < before
+        {
+            conv.release_due(axis);
+        }
+    };
+    for (t, e) in events {
+        due(&mut conv, t);
+        conv.apply(&e, t);
+    }
+    due(&mut conv, x.lead_in_start);
+    c.hit(
+        "held_at_lead_in_start",
+        bms_model::Lane::all().any(|l| conv.is_held(l)),
+    );
+    c.hit(
+        "release_pending_at_lead_in_start",
+        conv.next_release().is_some(),
+    );
+    c.hit("excerpt_earlier_input", x.earlier > 0);
 }
 
 /// Counts the live spots of one delivery and returns whether it reached the
@@ -616,6 +741,13 @@ fn generators_reach_the_fragile_spots() {
         }
         c.hit("joint_input_on_deadline_at_w", joint);
     }
+    let excerpts = raw_excerpt();
+    for _ in 0..SAMPLES {
+        count_excerpt(
+            &build_excerpt(&excerpts.new_tree(&mut runner).unwrap().current()),
+            &mut c,
+        );
+    }
     let widenings = raw_widening();
     for _ in 0..SAMPLES {
         let w = build_widening(&widenings.new_tree(&mut runner).unwrap().current());
@@ -649,6 +781,12 @@ fn generators_reach_the_fragile_spots() {
         ("gauge_at_positive_min", 1),
         ("survival_failed_then_rose", 1),
         ("widening_improved", 1),
+        ("ln_cut_by_section", 1),
+        ("lead_in_press_on_early_edge", 4),
+        ("lead_in_press_ignored", 1),
+        ("held_at_lead_in_start", 1),
+        ("release_pending_at_lead_in_start", 1),
+        ("excerpt_earlier_input", 1),
         ("joint_input_on_deadline_at_w", JOINT),
         ("joint_input_after_final_deadline", JOINT),
         ("joint_tie_order_shows", JOINT),

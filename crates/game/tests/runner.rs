@@ -400,6 +400,7 @@ fn event_at_the_opening_belongs_to_the_play() {
         device: dev.clone(),
         start: start.clone(),
         finalized: None,
+        section: None,
     };
     let expected = eval::evaluate(&chart, &original, &rule).unwrap().events;
     assert_eq!(count_judged(&expected, Judgment::Perfect), 2);

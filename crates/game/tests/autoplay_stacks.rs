@@ -29,6 +29,7 @@ fn autoplayed(chart: &Chart) -> Vec<JudgeEvent> {
         &preset,
         &device,
         &InputStart::default(),
+        None,
         inputs.len(),
     )
     .unwrap();

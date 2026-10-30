@@ -36,6 +36,15 @@ pub enum EvalError {
     /// [`MAX_AXES_PER_SOURCE`](crate::MAX_AXES_PER_SOURCE),
     /// [`MAX_BINDINGS`](crate::MAX_BINDINGS), [`MAX_AXES`](crate::MAX_AXES)).
     TooManyBindings,
+    /// The section is unusable: `field` names what is wrong (`range` for an
+    /// end before the start, `lead_in` for a negative lead-in or a lead-in
+    /// start outside `i64`, `initial_gauges` for a count other than the
+    /// preset's gauges or a value outside a gauge's bounds or at 0 for a
+    /// survival gauge).
+    InvalidSection {
+        /// What is wrong.
+        field: &'static str,
+    },
     /// Batch evaluation could not queue an input of the log.
     Input(PushError),
 }
@@ -54,6 +63,7 @@ impl fmt::Display for EvalError {
                 write!(f, "source {} binds control {} twice", source.0, control.0)
             }
             Self::TooManyBindings => f.write_str("the device profile binds too many controls"),
+            Self::InvalidSection { field } => write!(f, "the section's {field} is invalid"),
             // `PushError` is a plain value, not an `Error`, so it is printed
             // here and is no source.
             Self::Input(e) => write!(f, "the input log cannot be evaluated: {e:?}"),

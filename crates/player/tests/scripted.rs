@@ -215,6 +215,7 @@ fn scripted_play_writes_a_record() {
             device: rec.devices.profile(),
             start: rec.start.clone(),
             finalized: Some(rec.status.finalized),
+            section: None,
         },
         &rules::custom(),
     )
@@ -470,6 +471,7 @@ fn judged(chart: &bms_model::Chart, rec: &PlayRecord) -> Vec<eval::JudgeEvent> {
             device: rec.devices.profile(),
             start: rec.start.clone(),
             finalized: Some(rec.status.finalized),
+            section: None,
         },
         &rules::custom(),
     )

@@ -548,6 +548,7 @@ fn scheduled_key_sounds_are_the_sounds_the_evaluator_plays() {
             device: plan.device,
             start: InputStart::default(),
             finalized: None,
+            section: None,
         },
         loaded.preset(),
     )

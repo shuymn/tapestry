@@ -8,12 +8,12 @@
 //! across sources and between inputs and deadlines are common.
 
 use bms_model::{
-    Chart, ChartBuilder, JudgeRank, LANE_COUNT, Lane, LnMode, NoteKind, SoundId, TimeUs,
+    Chart, ChartBuilder, JudgeRank, LANE_COUNT, Lane, LnMode, Note, NoteKind, SoundId, TimeUs,
 };
 use eval::{
     AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, EvalInput, Evaluator, InputKind,
-    InputStart, JudgeEventKind, PhysicalInputEvent, ScratchSettings, SourceId, SourceProfile,
-    evaluate, evaluation_time,
+    InputStart, JudgeEventKind, PhysicalInputEvent, ScratchSettings, Section, SourceId,
+    SourceProfile, evaluate, evaluation_time,
 };
 use proptest::collection::vec;
 use proptest::option;
@@ -710,6 +710,98 @@ pub fn interleave(logs: &[Vec<PhysicalInputEvent>], choices: &[u8]) -> Vec<Physi
     out
 }
 
+// -------------------------------------------------------------- section
+
+#[derive(Clone, Debug)]
+pub struct RawSection {
+    start: (u8, u16),
+    end: (u8, u16),
+    lead_in: (u8, u32),
+    gauges: [(u8, u32); 3],
+}
+
+pub fn raw_section() -> impl Strategy<Value = RawSection> {
+    (
+        any::<(u8, u16)>(),
+        any::<(u8, u16)>(),
+        any::<(u8, u32)>(),
+        any::<[(u8, u32); 3]>(),
+    )
+        .prop_map(|(start, end, lead_in, gauges)| RawSection {
+            start,
+            end,
+            lead_in,
+            gauges,
+        })
+}
+
+/// Whether `n` is a target of `section` (design.md "Section Evaluation"),
+/// restated here: a tap or mine in `[start, end)`, a long note whose head
+/// is at or after the start and whose end is before the end.
+pub fn is_target(section: Option<&Section>, n: &Note) -> bool {
+    section.is_none_or(|s| s.start <= n.time && n.time < s.end && n.end() < s.end)
+}
+
+/// A section whose edges sit on note times and long-note ends, 1 µs either
+/// side of them, or anywhere on the grid, with a lead-in of 0, grid
+/// multiples, any µs count or 2 s, and each gauge starting at its preset
+/// start, its limits or anywhere between.
+fn build_section(chart: &Chart, preset: &RulePreset, raw: &RawSection) -> Section {
+    let mut edges: Vec<i64> = chart
+        .lanes
+        .iter()
+        .flatten()
+        .flat_map(|n| [n.time.0, n.end().0])
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    let at = |(sel, v): (u8, u16)| match sel % 5 {
+        0 | 1 => edges[pick(v, edges.len())],
+        2 => edges[pick(v, edges.len())] - 1,
+        3 => edges[pick(v, edges.len())] + 1,
+        _ => below(v, 300) * TICK,
+    };
+    let (a, b) = (at(raw.start), at(raw.end));
+    let (sel, v) = raw.lead_in;
+    let lead_in = match sel % 4 {
+        0 => 0,
+        1 => below(v, 200) * TICK,
+        2 => below(v, 2_000_001),
+        _ => 2_000 * MS,
+    };
+    let initial_gauges = preset
+        .gauges
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let (sel, v) = raw.gauges[i % 3];
+            // A survival gauge never starts at 0.
+            let low = if g.kind == GaugeKind::Survival {
+                1
+            } else {
+                g.min.0
+            };
+            GaugeValue(match sel % 4 {
+                0 => g.start.0,
+                1 => low,
+                2 => g.max.0,
+                _ => low + below(v, g.max.0 - low + 1),
+            })
+        })
+        .collect();
+    Section {
+        start: TimeUs(a.min(b)),
+        end: TimeUs(a.max(b)),
+        lead_in: TimeUs(lead_in),
+        initial_gauges,
+    }
+}
+
+/// The section's earliest target: (lane, time).
+fn first_target(chart: &Chart, section: &Section) -> Option<(usize, TimeUs)> {
+    judgeable(chart, Some(section)).first().copied()
+}
+
 // ----------------------------------------------------------------- play
 
 /// A generated play with what the properties and the coverage test need.
@@ -723,11 +815,13 @@ pub struct Play {
     /// Each source's producer capacity: its largest group of equal
     /// receive times, one more, and a generated extra.
     pub capacity: Vec<usize>,
-    /// The chart's deadlines, sorted: misses, LN ends and mines.
+    /// The deadlines of the chart, or of the section, sorted: misses, LN
+    /// ends and mines.
     pub deadlines: Vec<TimeUs>,
     pub final_deadline: TimeUs,
-    /// Times a publication may aim at: input evaluation times and
-    /// deadlines.
+    /// Times a publication may aim at: input evaluation times, deadlines
+    /// and the final deadline (never empty, even for a section without
+    /// targets or input).
     pub times: Vec<TimeUs>,
     /// A watermark the schedules step on deliberately (the joint case of an
     /// input on a deadline at an intermediate W).
@@ -740,21 +834,29 @@ pub struct RawPlay {
     preset: RawPreset,
     log: RawLog,
     joint: (u8, u16),
+    section: Option<RawSection>,
 }
 
 pub fn raw_play() -> impl Strategy<Value = RawPlay> {
-    (raw_chart(), raw_preset(), raw_log(), any::<(u8, u16)>()).prop_map(
-        |(chart, preset, log, joint)| RawPlay {
+    (
+        raw_chart(),
+        raw_preset(),
+        raw_log(),
+        any::<(u8, u16)>(),
+        option::weighted(0.4, raw_section()),
+    )
+        .prop_map(|(chart, preset, log, joint, section)| RawPlay {
             chart,
             preset,
             log,
             joint,
-        },
-    )
+            section,
+        })
 }
 
-/// The judgeable notes: (lane, time), in time order.
-fn judgeable(chart: &Chart) -> Vec<(usize, TimeUs)> {
+/// The judgeable notes of `section` (the whole chart for `None`): (lane,
+/// time), in time order.
+fn judgeable(chart: &Chart, section: Option<&Section>) -> Vec<(usize, TimeUs)> {
     let mut v: Vec<(usize, TimeUs)> = chart
         .lanes
         .iter()
@@ -762,7 +864,7 @@ fn judgeable(chart: &Chart) -> Vec<(usize, TimeUs)> {
         .flat_map(|(l, notes)| {
             notes
                 .iter()
-                .filter(|n| !matches!(n.kind, NoteKind::Mine { .. }))
+                .filter(move |n| !matches!(n.kind, NoteKind::Mine { .. }) && is_target(section, n))
                 .map(move |n| (l, n.time))
         })
         .collect();
@@ -770,9 +872,14 @@ fn judgeable(chart: &Chart) -> Vec<(usize, TimeUs)> {
     v
 }
 
-fn deadlines(chart: &Chart, windows: &JudgeWindows) -> Vec<TimeUs> {
+fn deadlines(chart: &Chart, windows: &JudgeWindows, section: Option<&Section>) -> Vec<TimeUs> {
     let mut v: Vec<TimeUs> = Vec::new();
-    for note in chart.lanes.iter().flatten() {
+    for note in chart
+        .lanes
+        .iter()
+        .flatten()
+        .filter(|n| is_target(section, n))
+    {
         match note.kind {
             NoteKind::Tap => v.push(TimeUs(note.time.0 + windows.bad.late.0)),
             NoteKind::Long { end, .. } => {
@@ -869,6 +976,7 @@ fn target(
     device: &DeviceProfile,
     start: &InputStart,
     logs: &[Vec<PhysicalInputEvent>],
+    section: Option<&Section>,
     raw: u64,
 ) -> (usize, TimeUs) {
     let base = EvalInput {
@@ -876,6 +984,7 @@ fn target(
         device: device.clone(),
         start: start.clone(),
         finalized: None,
+        section: section.cloned(),
     };
     let e = evaluate(chart, &base, preset).unwrap();
     let mut notes: Vec<(usize, TimeUs)> = e
@@ -892,7 +1001,10 @@ fn target(
         })
         .collect();
     if notes.is_empty() {
-        notes = judgeable(chart);
+        notes = judgeable(chart, section);
+    }
+    if notes.is_empty() {
+        notes = judgeable(chart, None);
     }
     notes[pick(raw, notes.len())]
 }
@@ -902,8 +1014,12 @@ pub fn build_play(raw: &RawPlay) -> Play {
     let mut preset = build_preset(&raw.preset);
     let (mut device, mut start, mut logs) = build_log(&raw.log);
     let n = logs.len();
+    let mut section = raw
+        .section
+        .as_ref()
+        .map(|r| build_section(&chart, &preset, r));
     let (windows, final_deadline) = {
-        let ev = Evaluator::new(&chart, &preset, &device, &start, 0).unwrap();
+        let ev = Evaluator::new(&chart, &preset, &device, &start, section.as_ref(), 0).unwrap();
         (*ev.windows(), ev.final_deadline())
     };
     let (sel, param) = raw.joint;
@@ -914,7 +1030,15 @@ pub fn build_play(raw: &RawPlay) -> Play {
         // an intermediate W: inputs go first at equal times, across steps
         // too, so the press judges the note.
         0 => {
-            let (l, t) = target(&chart, &preset, &device, &start, &logs, param);
+            let (l, t) = target(
+                &chart,
+                &preset,
+                &device,
+                &start,
+                &logs,
+                section.as_ref(),
+                param,
+            );
             let s = pick(param / 8, n);
             let x = t.0 + windows.bad.late.0;
             let off = bind(&mut device, s, l);
@@ -926,7 +1050,10 @@ pub fn build_play(raw: &RawPlay) -> Play {
         // An effective input after the final deadline: an empty POOR on
         // the lane of the last note, which batch evaluation must reach.
         1 => {
-            let &(l, t) = judgeable(&chart).last().unwrap();
+            let &(l, t) = judgeable(&chart, section.as_ref())
+                .last()
+                .or(judgeable(&chart, None).last())
+                .unwrap();
             let at = final_deadline.0 + if param % 2 == 0 { 1 } else { TICK };
             let behind = &mut preset.empty_poor.behind;
             *behind = TimeUs(behind.0.max(at - t.0));
@@ -941,7 +1068,15 @@ pub fn build_play(raw: &RawPlay) -> Play {
         // so the press judges the note; pressing first leaves the lane
         // held, with no press edge.
         2 if n >= 2 => {
-            let (l, t) = target(&chart, &preset, &device, &start, &logs, param);
+            let (l, t) = target(
+                &chart,
+                &preset,
+                &device,
+                &start,
+                &logs,
+                section.as_ref(),
+                param,
+            );
             let s = pick(param / 8, n);
             let r = (s + 1 + pick(param / 64, n - 1)) % n;
             let early = t.0 - windows.bad.early.0 - TICK;
@@ -952,6 +1087,20 @@ pub fn build_play(raw: &RawPlay) -> Play {
             clear_lane(&mut logs, &device, l, t.0 - 1);
             insert(&mut logs[r], joint(t.0 + off_r, r, 1));
             insert(&mut logs[r], joint(t.0 + off_r + TICK, r, 0));
+        }
+        // A press on the early BAD edge of the section's first target, or
+        // 1 µs before it, with the lead-in long enough to hold it: judged,
+        // or ignored with no empty POOR.
+        3 if let Some(s) = section.as_mut()
+            && let Some((l, t)) = first_target(&chart, s) =>
+        {
+            let at = t.0 - windows.bad.early.0 - i64::from(param % 2 == 1);
+            s.lead_in = TimeUs(s.lead_in.0.max(s.start.0 - at));
+            let src = pick(param / 8, n);
+            let off = bind(&mut device, src, l);
+            clear_lane(&mut logs, &device, l, at - 1);
+            insert(&mut logs[src], joint(at + off, src, 1));
+            insert(&mut logs[src], joint(at + off + TICK, src, 0));
         }
         _ => {}
     }
@@ -968,13 +1117,15 @@ pub fn build_play(raw: &RawPlay) -> Play {
         device,
         start,
         finalized: None,
+        section,
     };
-    let deadlines = deadlines(&chart, &windows);
+    let deadlines = deadlines(&chart, &windows, input.section.as_ref());
     let mut times: Vec<TimeUs> = input
         .events
         .iter()
         .map(|e| evaluation_time(e, &input.device))
         .chain(deadlines.iter().copied())
+        .chain([final_deadline])
         .collect();
     times.sort_unstable();
     times.dedup();
@@ -997,6 +1148,169 @@ fn max_group(log: &[PhysicalInputEvent]) -> usize {
         .map(<[_]>::len)
         .max()
         .unwrap_or(0)
+}
+
+// -------------------------------------------------------------- excerpt
+
+/// A section excerpted from a full log, and the mid-chart start it must
+/// match: the same section, device, prefix `C` and later input `R`, with
+/// the full log's earlier input `E` replaced by a snapshot of what it left
+/// held.
+#[derive(Clone, Debug)]
+pub struct Excerpt {
+    pub chart: Chart,
+    pub preset: RulePreset,
+    /// The full log: `E`, a quiet gap, `C`, then `R`.
+    pub full: EvalInput,
+    /// The mid-chart start: the snapshot after `E`, then `C` and `R`.
+    pub mid: EvalInput,
+    /// The section's lead-in start, `start − lead_in`.
+    pub lead_in_start: TimeUs,
+    /// How many events `E` holds.
+    pub earlier: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct RawExcerpt {
+    play: RawPlay,
+    section: RawSection,
+    axis: (u8, u8, u8, u32),
+    prefix: (u8, u8),
+}
+
+pub fn raw_excerpt() -> impl Strategy<Value = RawExcerpt> {
+    (
+        raw_play(),
+        raw_section(),
+        any::<(u8, u8, u8, u32)>(),
+        any::<(u8, u8)>(),
+    )
+        .prop_map(|(play, section, axis, prefix)| RawExcerpt {
+            play,
+            section,
+            axis,
+            prefix,
+        })
+}
+
+/// The longest scratch release time [`scratch`] gives, µs.
+const MAX_RELEASE: i64 = 200_000;
+
+/// The snapshot a play's conversion has after `start` and each source's
+/// `earlier` events, once every scratch release is due and every axis has
+/// paused: the buttons pressed and each absolute axis's position.
+fn snapshot(start: &InputStart, earlier: &[Vec<PhysicalInputEvent>]) -> InputStart {
+    let mut held: std::collections::BTreeMap<(SourceId, ControlId), i32> =
+        start.held.iter().map(|&(s, c, v)| ((s, c), v)).collect();
+    for e in earlier.iter().flatten() {
+        match e.kind {
+            InputKind::Control { control, value } => {
+                held.insert((e.source, control), value);
+            }
+            InputKind::Disconnected => held.retain(|&(s, _), _| s != e.source),
+        }
+    }
+    InputStart {
+        opened_at: TimeUs(0),
+        held: held
+            .into_iter()
+            // An axis keeps its position; a button is held when not 0.
+            .filter(|&((_, c), v)| c == AXIS || v != 0)
+            .map(|((s, c), v)| (s, c, v))
+            .collect(),
+    }
+}
+
+/// A play with a section and an axis on source 0, its log split at the
+/// section's lead-in start `L` into `E` (before `L − c − G`) and `R` (from
+/// `L`), the events between dropped, and a prefix `C` on source 0 in
+/// `[L − c, L)`: a button pressed and held, and the axis pressed `c` before
+/// `L` and turned back 1 µs before it, so `L` sees a held control, a
+/// pending scratch release and, when one step back does not press,
+/// accumulated movement. `G` is longer than any release time, so every
+/// pending release of `E` is due and every axis has paused before `C`.
+pub fn build_excerpt(raw: &RawExcerpt) -> Excerpt {
+    let mut rp = raw.play.clone();
+    rp.section = Some(raw.section.clone());
+    rp.log.sources[0].axis.get_or_insert(raw.axis);
+    let play = build_play(&rp);
+    let section = play.input.section.clone().unwrap();
+    let device = &play.input.device;
+    let lead_in_start = section.start.0 - section.lead_in.0;
+    let axis = device.sources[0].axes[0];
+    let release = i64::from(axis.scratch.release_after_us);
+    let half = (release / 2).max(1);
+    let c_from = lead_in_start - half - 2;
+    let quiet_from = c_from - MAX_RELEASE - 1;
+    let mut earlier = vec![Vec::new(); play.logs.len()];
+    let mut rest = vec![Vec::new(); play.logs.len()];
+    for (i, log) in play.logs.iter().enumerate() {
+        for e in log {
+            let t = evaluation_time(e, device).0;
+            if t < quiet_from {
+                earlier[i].push(*e);
+            } else if t >= lead_in_start {
+                rest[i].push(*e);
+            }
+        }
+    }
+    let off = device.sources[0].input_offset.0;
+    let turn = |at: i64, value: i32| PhysicalInputEvent {
+        received: TimeUs(at + off),
+        source: SourceId(0),
+        kind: InputKind::Control {
+            control: AXIS,
+            value,
+        },
+    };
+    let press = i32::try_from(axis.scratch.press_threshold.max(1)).unwrap();
+    let mut prefix = vec![button(c_from + off, 0, pick(raw.prefix.0, LANE_COUNT), 1)];
+    match axis.scratch.mode {
+        AxisMode::Relative => prefix.extend([
+            turn(lead_in_start - half, press),
+            turn(lead_in_start - 1, -1),
+        ]),
+        AxisMode::Absolute { .. } => {
+            let base = i32::from(raw.prefix.1 % 64);
+            prefix.extend([
+                turn(c_from, base),
+                turn(lead_in_start - half, base + press),
+                turn(lead_in_start - 1, base + press - 1),
+            ]);
+        }
+    }
+    let join = |first: &[Vec<PhysicalInputEvent>]| -> Vec<Vec<PhysicalInputEvent>> {
+        (0..play.logs.len())
+            .map(|i| {
+                let c: &[PhysicalInputEvent] = if i == 0 { &prefix } else { &[] };
+                [first[i].as_slice(), c, rest[i].as_slice()].concat()
+            })
+            .collect()
+    };
+    let full_logs = join(&earlier);
+    let mid_logs = join(&vec![Vec::new(); play.logs.len()]);
+    let order = &raw.play.log.interleave;
+    let full_events = interleave(&full_logs, order);
+    let mut full_start = play.input.start.clone();
+    full_start.opened_at = opened_before(&full_events);
+    let mut mid_start = snapshot(&play.input.start, &earlier);
+    let mid_events = interleave(&mid_logs, order);
+    mid_start.opened_at = opened_before(&mid_events);
+    let input = |events, start| EvalInput {
+        events,
+        device: device.clone(),
+        start,
+        finalized: None,
+        section: Some(section.clone()),
+    };
+    Excerpt {
+        full: input(full_events, full_start),
+        mid: input(mid_events, mid_start),
+        lead_in_start: TimeUs(lead_in_start),
+        earlier: earlier.iter().map(Vec::len).sum(),
+        chart: play.chart,
+        preset: play.preset,
+    }
 }
 
 // ------------------------------------------------------------- delivery
@@ -1249,7 +1563,7 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
     let off = offset(raw.offset);
     let device = crate::common::device(&[off]);
     let scaled = |p: &RulePreset| {
-        *Evaluator::new(&chart, p, &device, &InputStart::default(), 0)
+        *Evaluator::new(&chart, p, &device, &InputStart::default(), None, 0)
             .unwrap()
             .windows()
     };
@@ -1291,6 +1605,7 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
             device,
             start,
             finalized: None,
+            section: None,
         },
     }
 }
@@ -1381,6 +1696,7 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
             events,
             device: crate::common::device(&[0]),
             finalized: None,
+            section: None,
         },
         deviation,
         scale,

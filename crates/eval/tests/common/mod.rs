@@ -88,7 +88,7 @@ pub fn run_with(
     inputs: &[PhysicalInputEvent],
     watermark: i64,
 ) -> (Vec<JudgeEvent>, Tally) {
-    let mut ev = Evaluator::new(chart, preset, device, start, 64).unwrap();
+    let mut ev = Evaluator::new(chart, preset, device, start, None, 64).unwrap();
     for &i in inputs {
         ev.push_input(i).unwrap();
     }

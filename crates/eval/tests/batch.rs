@@ -37,6 +37,7 @@ fn live(
         rule,
         &input.device,
         &input.start,
+        None,
         input.events.len().max(1),
     )
     .unwrap();
@@ -134,6 +135,7 @@ fn scenario() -> (Chart, EvalInput) {
             device: dev,
             start,
             finalized: None,
+            section: None,
         },
     )
 }
@@ -223,7 +225,7 @@ fn completion_waits_for_watermark_past_final_deadline() {
         .unwrap();
     let rule = rules::custom();
     let dev = device(&[5 * MS]);
-    let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), 4).unwrap();
+    let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, 4).unwrap();
     assert_eq!(ev.final_deadline(), TimeUs(1_180 * MS));
     let mut out = Vec::new();
     for received in [1_180 * MS, 1_185 * MS - 1] {

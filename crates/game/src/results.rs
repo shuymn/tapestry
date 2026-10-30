@@ -88,6 +88,7 @@ impl ResultExtension for ReEvaluate {
                 device: rec.devices.profile(),
                 start: rec.start.clone(),
                 finalized: Some(rec.status.finalized),
+                section: None,
             };
             eval::evaluate(ctx.chart, &input, ctx.preset).map_err(ReEvaluationError::Eval)
         } else {

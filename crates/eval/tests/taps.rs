@@ -40,7 +40,7 @@ fn miss_waits_for_watermark() {
         .unwrap();
     let dev = device(&[0]);
     let preset = rules::custom();
-    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 8).unwrap();
     let mut out = Vec::new();
     // A press on the late edge (1180 ms) is queued, but the watermark is
     // 1 µs before it: neither the press nor the miss is processed.
@@ -53,7 +53,7 @@ fn miss_waits_for_watermark() {
 
     // Without a press, the POOR appears only when the watermark reaches the
     // deadline.
-    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 8).unwrap();
     let mut out = Vec::new();
     ev.advance_to(TimeUs(1_180 * MS - 1), &mut out).unwrap();
     assert!(out.is_empty());
@@ -72,7 +72,7 @@ fn finalized_or_unordered_input_and_backward_advance_are_refused() {
         .unwrap();
     let dev = device(&[0]);
     let preset = rules::custom();
-    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 2).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 2).unwrap();
     let mut out = Vec::new();
     ev.advance_to(TimeUs(1_180 * MS), &mut out).unwrap();
     assert_eq!(judgments(&out), [(1, 0, Poor, None)]);
@@ -124,7 +124,7 @@ fn finalization_compares_evaluation_time_not_receive_time() {
 
     // +5 ms: received after the watermark, but evaluated at or before it.
     let late = device(&[5 * MS]);
-    let mut ev = Evaluator::new(&chart, &preset, &late, &InputStart::default(), 4).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &late, &InputStart::default(), None, 4).unwrap();
     ev.advance_to(w, &mut Vec::new()).unwrap();
     assert_eq!(
         ev.push_input(press(1_005 * MS, 0, 1)),
@@ -137,7 +137,7 @@ fn finalization_compares_evaluation_time_not_receive_time() {
 
     // −5 ms: received at or before the watermark, but evaluated after it.
     let early = device(&[-5 * MS]);
-    let mut ev = Evaluator::new(&chart, &preset, &early, &InputStart::default(), 4).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &early, &InputStart::default(), None, 4).unwrap();
     ev.advance_to(w, &mut Vec::new()).unwrap();
     assert_eq!(
         ev.push_input(press(995 * MS, 0, 1)),

@@ -611,6 +611,7 @@ impl Loaded {
             &self.preset,
             &device,
             &InputStart::default(),
+            None,
             0,
         );
         let end = probe.as_ref().map_or(TimeUs(0), Evaluator::final_deadline);
@@ -664,6 +665,7 @@ impl Loaded {
             &self.preset,
             &device,
             &InputStart::default(),
+            None,
             0,
         )
         .map_err(LogicError::Eval)?;
@@ -1170,7 +1172,7 @@ impl Reservation {
         device: &eval::DeviceProfile,
         effects: usize,
     ) -> Option<Self> {
-        let probe = Evaluator::new(chart, preset, device, &InputStart::default(), 0).ok()?;
+        let probe = Evaluator::new(chart, preset, device, &InputStart::default(), None, 0).ok()?;
         Some(Self::from_probe(&probe, chart, device, effects))
     }
 

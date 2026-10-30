@@ -429,7 +429,7 @@ fn l1_4_a_held_head_scores_nothing_until_its_judgment() {
         .unwrap();
     let preset = mid_gauges();
     let dev = device(&[0]);
-    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
+    let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 8).unwrap();
     let start_tally = *ev.tally();
     let start_gauges = ev.gauges().to_vec();
     // A GREAT head, released 100 ms before the end (PERFECT): GREAT.
@@ -480,9 +480,11 @@ fn l1_4_a_play_aborted_while_held_matches_live() {
             device: dev.clone(),
             start: InputStart::default(),
             finalized: Some(TimeUs(abort)),
+            section: None,
         };
         let batch = evaluate(&chart, &input, &preset).unwrap();
-        let mut ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), 8).unwrap();
+        let mut ev =
+            Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 8).unwrap();
         for e in inputs {
             ev.push_input(e).unwrap();
         }
@@ -506,8 +508,9 @@ fn l2_1_note_times_beyond_2_pow_32_are_refused() {
     let cap: i64 = 1 << 32;
     let preset = rules::custom();
     let dev = device(&[0]);
-    let new =
-        |chart: &Chart| Evaluator::new(chart, &preset, &dev, &InputStart::default(), 0).map(|_| ());
+    let new = |chart: &Chart| {
+        Evaluator::new(chart, &preset, &dev, &InputStart::default(), None, 0).map(|_| ())
+    };
     // A long note from 0 to the cap is accepted; one ending at i64::MAX,
     // or a tap 1 µs past the cap, is refused.
     let mut chart = ln(1);
@@ -553,7 +556,7 @@ fn l1_2_scaled_edges_beyond_2_pow_32_refuse_the_rank() {
     let mut chart = ln(10 * MS);
     chart.meta.rank = Some(JudgeRank::DefExRankMilli(200_000));
     let new = |preset: &RulePreset| {
-        Evaluator::new(&chart, preset, &dev, &InputStart::default(), 0).map(|_| ())
+        Evaluator::new(&chart, preset, &dev, &InputStart::default(), None, 0).map(|_| ())
     };
     for edge in [half, half + 1] {
         let mut wide_bad = rules::custom();
