@@ -3,8 +3,8 @@
 //! its header and commits the rows in batches of [`BATCH`], in turn. Once
 //! every folder is listed it removes the rows of files that are gone.
 //!
-//! **Pausing.** The thread looks for a pause before each folder and each
-//! file. On one it commits its batch, acknowledges the latest request and
+//! **Pausing.** The thread looks for a pause before each folder, each file
+//! and each removal of a gone file's row. On one it commits its batch, acknowledges the latest request and
 //! waits until the release or the drop. A file in hand is finished first.
 //!
 //! **Endings.** Whatever ends the thread, an error, a panic in the start
@@ -606,6 +606,9 @@ impl<'a> Scanner<'a> {
             .filter(|path| !kept.iter().any(|dir| Path::new(path).starts_with(dir)))
             .collect();
         for path in gone {
+            if !self.checkpoint()? {
+                return self.commit();
+            }
             self.push(Err(path))?;
         }
         self.commit()

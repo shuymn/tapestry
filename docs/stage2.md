@@ -155,8 +155,8 @@ egui comes with the first form-like screen.
 
 - **One scan thread (decided).** It lists `.bms`, `.bme` and `.bml` files, and in turn reads every file whose `(path, size, mtime)` changed (16 MiB cap), computes SHA-256 and MD5, calls `bms_parser::read_header`, and commits.
   - `read_header` keeps only top-level header commands; it resolves no `#RANDOM` and computes no time.
-  - Why: three review rounds found completion defects between the threads of a walker, two parsers and a writer (an acknowledgment or an end that one thread never saw from another).
-  - Cost: reading no longer overlaps hashing and committing.
+  - Why: pausing, shutdown and failure live on one state that only this thread changes, so no acknowledgment or end can be lost between threads.
+  - Cost: reading does not overlap hashing and committing (a full scan of 300 generated files: about 136 ms, against 86 ms with separate walker, parser and writer threads).
 - **Writing.** Commits in batches of 256. Rows for missing files are removed.
 - **Pausing.**
   - Choosing a chart requests a pause before loading.

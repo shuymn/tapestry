@@ -80,6 +80,17 @@ pub enum LibraryError {
     /// A scan thread could not be started.
     #[error("a library scan thread cannot be started")]
     Spawn(#[source] io::Error),
+    /// The database path cannot be resolved: its folder is missing, or an
+    /// entry is there but does not lead to a file, such as a link to a
+    /// missing file. Nothing was removed.
+    #[error("the library database's path cannot be resolved: {}", path.display())]
+    Resolve {
+        /// The path given.
+        path: PathBuf,
+        /// What the file system said.
+        #[source]
+        source: io::Error,
+    },
     /// The lock file beside the database cannot be opened or locked.
     #[error("the library database's lock cannot be taken: {}", path.display())]
     Lock {
@@ -201,21 +212,27 @@ impl Drop for ScanLease {
 }
 
 /// The database file `path` resolves to: the file itself, links followed,
-/// when it exists, or else its resolved folder and its name.
-fn resolve(path: &Path) -> io::Result<PathBuf> {
+/// when it exists, or else, when there is no entry at all, its resolved
+/// folder and its name. An entry that exists but does not resolve, such as
+/// a link to a missing file, is refused, so nothing deletes or replaces it.
+fn resolve(path: &Path) -> Result<PathBuf, LibraryError> {
+    let unresolved = |source| LibraryError::Resolve {
+        path: path.to_owned(),
+        source,
+    };
     match fs::canonicalize(path) {
         Ok(file) => Ok(file),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let name = path
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() => {
+            let name = path.file_name().ok_or_else(|| {
+                unresolved(io::Error::new(io::ErrorKind::InvalidInput, "no file name"))
+            })?;
             let dir = match path.parent() {
                 Some(dir) if !dir.as_os_str().is_empty() => dir,
                 _ => Path::new("."),
             };
-            Ok(fs::canonicalize(dir)?.join(name))
+            Ok(fs::canonicalize(dir).map_err(unresolved)?.join(name))
         }
-        Err(e) => Err(e),
+        Err(e) => Err(unresolved(e)),
     }
 }
 
@@ -243,16 +260,15 @@ impl Library {
     ///
     /// # Errors
     ///
-    /// [`LibraryError::AlreadyOpen`] while another [`Library`] of this file,
-    /// or its scan, lives in any process; [`LibraryError::Lock`] when the
+    /// [`LibraryError::Resolve`] when the path does not resolve (a link to a
+    /// missing file included); [`LibraryError::AlreadyOpen`] while another
+    /// [`Library`] of this file, or its scan, lives in any process;
+    /// [`LibraryError::Lock`] when the
     /// lock file cannot be opened or locked; [`LibraryError::Database`] when
     /// SQLite refuses the file; and [`LibraryError::Remove`] when a file of
     /// another version cannot be deleted.
     pub fn open(path: &Path) -> Result<(Self, Opened), LibraryError> {
-        let resolved = resolve(path).map_err(|source| LibraryError::Lock {
-            path: path.to_owned(),
-            source,
-        })?;
+        let resolved = resolve(path)?;
         let path = resolved.as_path();
         let owner = Owner::take(path)?;
         let database = |source| LibraryError::Database {

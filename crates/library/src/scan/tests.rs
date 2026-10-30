@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -134,7 +134,8 @@ impl Gate {
     }
 
     fn quiet(&self) -> bool {
-        self.held.recv_timeout(SHORT) == Err(RecvTimeoutError::Timeout)
+        // Disconnected: the scan has ended and holds the hook no more.
+        self.held.recv_timeout(SHORT).is_err()
     }
 
     fn open(&self, n: usize) {
@@ -748,4 +749,96 @@ fn a_case_alias_of_the_file_is_refused() {
     ));
     drop(lib);
     drop(Library::open(&dir.path().join("LIBRARY.DB")).unwrap());
+}
+
+#[test]
+fn a_link_to_a_missing_file_is_refused_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let alias = dir.path().join("alias.db");
+    if link_file(&dir.path().join("missing.db"), &alias).is_none() {
+        println!("skipped: this system does not allow creating file links");
+        return;
+    }
+    assert!(matches!(
+        Library::open(&alias),
+        Err(LibraryError::Resolve { .. })
+    ));
+    assert!(
+        fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link is still there"
+    );
+    assert!(!dir.path().join("missing.db").exists());
+}
+
+/// A library indexing `BATCH + 44` files, all of them since deleted, so the
+/// next scan removes their rows in two commits.
+fn all_gone() -> (tempfile::TempDir, PathBuf, Library) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    let charts = write_charts(&root, BATCH + 44);
+    let lib = library(dir.path());
+    lib.scan(std::slice::from_ref(&root), ScanOptions::default())
+        .unwrap()
+        .finish()
+        .unwrap();
+    for path in charts {
+        fs::remove_file(path).unwrap();
+    }
+    (dir, root, lib)
+}
+
+fn gated_commits(gate_hook: PathHook) -> ScanOptions {
+    with(Hooks {
+        before_commit: Some(Arc::new(move |_| gate_hook(Path::new("")))),
+        ..Hooks::default()
+    })
+}
+
+#[test]
+fn a_pause_during_removals_holds_the_later_batches() {
+    let (_dir, root, lib) = all_gone();
+    let (commits, hook) = Gate::new();
+    let scan = lib.scan(&[root], gated_commits(hook)).unwrap();
+    commits.next();
+    scan.request_pause();
+    commits.open(1);
+    assert!(scan.wait_paused(LONG));
+    assert!(
+        commits.quiet(),
+        "no later batch is committed during the pause"
+    );
+    assert_eq!(indexed(&lib).len(), 44);
+    scan.release();
+    commits.next();
+    commits.open(1);
+    assert_eq!(
+        scan.finish().unwrap().removed,
+        u64::try_from(BATCH + 44).unwrap()
+    );
+    assert!(indexed(&lib).is_empty());
+}
+
+#[test]
+fn a_drop_during_removals_runs_no_later_batch() {
+    let (_dir, root, lib) = all_gone();
+    let (commits, hook) = Gate::new();
+    let scan = lib.scan(&[root], gated_commits(hook)).unwrap();
+    commits.next();
+    let shared = Arc::clone(&scan.shared);
+    let dropped = thread::spawn(move || drop(scan));
+    {
+        let state = shared.lock();
+        let (_state, timeout) = shared
+            .changed
+            .wait_timeout_while(state, LONG, |state| !state.shutdown)
+            .unwrap();
+        assert!(!timeout.timed_out(), "the drop is seen");
+    }
+    commits.open(1);
+    assert!(commits.quiet(), "no later batch is committed");
+    bounded(move || dropped.join().unwrap());
+    assert_eq!(indexed(&lib).len(), 44);
 }
