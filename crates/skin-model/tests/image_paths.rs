@@ -149,7 +149,9 @@ fn short(path: &Path) -> std::path::PathBuf {
 }
 
 /// Opening a FIFO with no writer blocks, so the file type must be checked
-/// before the file is opened. The load runs on a thread with a deadline.
+/// before the file is opened. The load runs on a thread with a deadline;
+/// past it the test fails at once and leaves the thread blocked, since
+/// opening the FIFO to release it could block too.
 #[cfg(unix)]
 #[test]
 fn a_fifo_is_refused_without_opening_it() {
@@ -173,10 +175,11 @@ fn a_fifo_is_refused_without_opening_it() {
             let err = result.unwrap_err();
             assert!(matches!(err, ImageError::NotAFile { at: AT0 }), "{err:?}");
         }
-        Err(_) => {
-            // Release the blocked open before failing.
-            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        Err(mpsc::RecvTimeoutError::Timeout) => {
             panic!("loading a FIFO blocked: it was opened before its type was checked");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the loading thread panicked");
         }
     }
 }
