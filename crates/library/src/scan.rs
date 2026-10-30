@@ -277,21 +277,20 @@ impl Scan {
     }
 
     /// Stops the scan, as dropping it does, but waits at most `timeout` for
-    /// its thread: `false` when the thread had not ended by then, which is
-    /// left to finish on its own (a read stalled on its file system). The
-    /// thread keeps its connection and the lock beside the database until
-    /// it ends, so the library stays refused to any other opening until
-    /// then, or until the process exits.
+    /// its work to end, never for its thread: `true` once the work ended
+    /// (the thread is left to exit on its own), `false` when it had not by
+    /// then, and the thread is left to finish it (a read stalled on its file
+    /// system). Until the work ends the thread keeps its connection and the
+    /// lock beside the database, so the library stays refused to any other
+    /// opening until then, or until the process exits.
     pub fn stop_within(mut self, timeout: Duration) -> bool {
         self.shared.update(|state| state.shutdown = true);
-        if self.wait_finished(timeout) {
-            self.join();
-            true
-        } else {
-            // Detached: the drop finds no thread to join.
-            drop(self.thread.take());
-            false
-        }
+        let finished = self.wait_finished(timeout);
+        // Detached either way: once the scan's work is done, what is left
+        // of the thread (its thread-local destructors) may still block, and
+        // the drop finds no thread to join.
+        drop(self.thread.take());
+        finished
     }
 
     /// Joins the thread; `true` if it panicked.
