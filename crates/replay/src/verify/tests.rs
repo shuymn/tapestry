@@ -384,3 +384,77 @@ fn what_if_stops_at_its_own_final_deadline() {
             .all(|e| e.time <= TimeUs(4_110 * MS))
     );
 }
+
+#[test]
+fn what_if_keeps_input_up_to_the_watermark_in_evaluation_time() {
+    // Notes on keys 2-4 at 4 s besides `CHART`'s; the source's input offset
+    // is 5 ms, so each input is received 5 ms after its evaluation time.
+    let text = format!("{CHART}#00212:01\n#00213:01\n#00214:01\n");
+    let offset = 5 * MS;
+    let (dir, mut record) = played_from(&text, 0, offset);
+    let chart = load_recorded_chart(&record, text.as_bytes(), dir.path()).unwrap();
+    let w = record.status.finalized.0;
+    // Presses at evaluation times W - 1, W and W + 1 µs on keys 2, 3, 4.
+    // The input thread publishes `fresh - 1 µs`: every event received at
+    // or before it is already queued, and the watermark is that
+    // publication less the offset. The live merge moves each input whose
+    // evaluation time is at or before the watermark, and the evaluator
+    // processes them, so the inputs at W - 1 and at W were judged in the
+    // play and the one at W + 1 was not.
+    for (n, t) in [(2, w - 1), (3, w), (4, w + 1)] {
+        record.events.push(key(n, t + offset, 1));
+    }
+    // Under a 220 ms edge the first two are BADs (about 180 ms late); the
+    // press on key 4 is not input of the play, so its note is missed.
+    let r = evaluate_record(&record, &chart, Some(&bad_edge(220))).unwrap();
+    let judged: Vec<_> = r
+        .evaluation
+        .events
+        .iter()
+        .filter_map(|e| match e.kind {
+            eval::JudgeEventKind::Judged { lane, judgment, .. } if lane.index() >= 2 => {
+                Some((lane.index(), judgment))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        judged,
+        [
+            (2, rules::Judgment::Bad),
+            (3, rules::Judgment::Bad),
+            (4, rules::Judgment::Poor)
+        ]
+    );
+}
+
+#[test]
+fn the_load_uses_the_recorded_seed() {
+    // `CHART` plus a 2 s note on key 2 or key 3, by the `#RANDOM` draw.
+    let text = format!("{CHART}#RANDOM 2\n#IF 1\n#00112:01\n#ENDIF\n#IF 2\n#00113:01\n#ENDIF\n");
+    let dir = tempfile::tempdir().unwrap();
+    let resolved = |seed| {
+        let opts = LoadOptions {
+            seed,
+            ..LoadOptions::default()
+        };
+        load_bms(text.as_bytes(), dir.path(), &opts)
+            .unwrap()
+            .chart
+            .identity
+            .resolved_hash
+    };
+    // A nonzero seed resolving otherwise than seed 0, and one resolving
+    // otherwise than it.
+    let seed = (1..64).find(|&s| resolved(s) != resolved(0)).unwrap();
+    let other = (0..64).find(|&s| resolved(s) != resolved(seed)).unwrap();
+    let (dir, record) = played_from(&text, seed, 0);
+    let chart = load_recorded_chart(&record, text.as_bytes(), dir.path()).unwrap();
+    assert_eq!(chart.identity.resolved_hash, resolved(seed));
+    let mut reseeded = record;
+    reseeded.chart.random_seed = other;
+    assert_eq!(
+        load_recorded_chart(&reseeded, text.as_bytes(), dir.path()),
+        Err(VerifyError::ResolvedChartMismatch)
+    );
+}
