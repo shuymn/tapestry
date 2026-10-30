@@ -544,14 +544,11 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
         "choices_of_beatoraja_style",
         choices(p) == choices(&rules::beatoraja_style()),
     );
-    c.hit(
-        "choices_of_lr2_style",
-        choices(p) == choices(&rules::lr2_style()),
-    );
+    let lr2 = rules::lr2_style();
+    c.hit("choices_of_lr2_style", choices(p) == choices(&lr2));
     // LR2-style's whole combination: its choices, the interpolated windows,
     // its header policy and default #TOTAL, and a damage-corrected gauge
     // with a failure threshold.
-    let lr2 = rules::lr2_style();
     c.hit(
         "policies_of_lr2_style",
         choices(p) == choices(&lr2)

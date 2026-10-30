@@ -36,7 +36,7 @@
 mod common;
 
 use bms_model::{Chart, ChartBuilder, JudgmentHeader, Lane, TimeUs};
-use common::{MS, device, empty_poors, lane, press, release};
+use common::{MS, both_at, device, empty_poors, judged_on, lane, press, release};
 use eval::{
     EvalError, EvalInput, Evaluation, Evaluator, InputStart, JudgeEventKind, PhysicalInputEvent,
     Section, evaluate,
@@ -525,19 +525,7 @@ fn judge_release(rank: Option<JudgmentHeader>, head: i64, before_end: i64) -> Ve
     let end = T + 1_000 * MS;
     let chart = ranked(rank, |b| b.long(lane(1), TimeUs(T), TimeUs(end)));
     let events = vec![press(T + head, 0, 1), release(end - before_end, 0, 1)];
-    judged_at(&play_with(&chart, &preset(), events))
-        .into_iter()
-        .map(|j| j.2)
-        .collect()
-}
-
-/// The judgments on `lane`, in order.
-fn judged_on(e: &Evaluation, lane: usize) -> Vec<Judgment> {
-    common::judgments(&e.events)
-        .into_iter()
-        .filter(|j| j.0 == lane)
-        .map(|j| j.2)
-        .collect()
+    judged(&play_with(&chart, &preset(), events))
 }
 
 /// Key 1's and the scratch's tables after the window policy, at `rank`.
@@ -789,16 +777,6 @@ fn empty_poor_keeps_the_combo_adds_bp_and_takes_its_gauge_damage() {
         assert_eq!(e.tally.empty_poor, 1);
         assert_eq!(e.gauges[HARD].history[0].value.0, after, "from {before}");
     }
-}
-
-/// A press and release on lanes 0 (the scratch) and 1 at `at`.
-fn both_at(at: i64) -> Vec<PhysicalInputEvent> {
-    vec![
-        press(at, 0, 0),
-        press(at, 0, 1),
-        release(at + 10, 0, 0),
-        release(at + 10, 0, 1),
-    ]
 }
 
 /// Source: play/JudgeProperty.java:55 and :58 (the LR2 scratch tables equal
