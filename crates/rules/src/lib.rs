@@ -27,7 +27,7 @@ mod preset;
 mod validate;
 
 pub use custom::custom;
-pub use error::{RuleError, Side};
+pub use error::{CanonicalError, RuleError, Side};
 pub use preset::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
     Implementation, JudgeWindows, Judgment, LateHeadRule, LnEndWindows, LnMode, LnModeRule,

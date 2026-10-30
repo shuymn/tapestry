@@ -105,3 +105,92 @@ impl fmt::Display for RuleError {
 }
 
 impl std::error::Error for RuleError {}
+
+/// Why [`RulePreset::from_canonical_bytes`](crate::RulePreset::from_canonical_bytes)
+/// refused its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanonicalError {
+    /// The bytes start with another encoding version.
+    UnsupportedVersion(u64),
+    /// The bytes ended inside a value.
+    Truncated,
+    /// A varint does not fit in 64 bits.
+    VarintOverflow,
+    /// A varint ends in a zero byte after its first, which the encoder never
+    /// writes.
+    NonMinimalVarint,
+    /// A count is larger than the bytes left.
+    CountBeyondData {
+        /// The list or string.
+        field: &'static str,
+        /// The count read.
+        count: u64,
+    },
+    /// An enum tag or a boolean has no meaning.
+    UnknownTag {
+        /// The field.
+        field: &'static str,
+        /// The tag read.
+        tag: u64,
+    },
+    /// The implementation's name is not one this build knows.
+    UnknownImplementation {
+        /// The name read.
+        name: String,
+    },
+    /// A value does not fit in its field's type.
+    ValueTooLarge {
+        /// The field.
+        field: &'static str,
+    },
+    /// A string is not UTF-8.
+    InvalidUtf8 {
+        /// The field.
+        field: &'static str,
+    },
+    /// A fixed-length list has another length.
+    WrongLength {
+        /// The list.
+        field: &'static str,
+        /// The length read.
+        len: usize,
+    },
+    /// Bytes follow the preset; the count is how many.
+    TrailingBytes(usize),
+    /// The decoded preset fails [`RulePreset::validate`](crate::RulePreset::validate).
+    Invalid(RuleError),
+}
+
+impl fmt::Display for CanonicalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedVersion(v) => {
+                write!(f, "the preset encoding version {v} is not supported")
+            }
+            Self::Truncated => f.write_str("the preset bytes end inside a value"),
+            Self::VarintOverflow => f.write_str("a varint does not fit in 64 bits"),
+            Self::NonMinimalVarint => f.write_str("a varint is not in its shortest form"),
+            Self::CountBeyondData { field, count } => {
+                write!(f, "{field}: the count {count} exceeds the bytes left")
+            }
+            Self::UnknownTag { field, tag } => write!(f, "{field}: unknown tag {tag}"),
+            Self::UnknownImplementation { name } => {
+                write!(f, "unknown evaluation implementation {name:?}")
+            }
+            Self::ValueTooLarge { field } => write!(f, "{field} is too large"),
+            Self::InvalidUtf8 { field } => write!(f, "{field} is not UTF-8"),
+            Self::WrongLength { field, len } => write!(f, "{field} has {len} entries"),
+            Self::TrailingBytes(n) => write!(f, "{n} bytes follow the preset"),
+            Self::Invalid(e) => write!(f, "the decoded preset is invalid: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Invalid(e) => Some(e),
+            _ => None,
+        }
+    }
+}

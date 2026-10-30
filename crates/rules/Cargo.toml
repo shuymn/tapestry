@@ -10,5 +10,8 @@ publish.workspace = true
 [dependencies]
 bms-model.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

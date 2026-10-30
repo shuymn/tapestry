@@ -8,14 +8,19 @@
 //! a change of layout bumps it and only the current layout is written, so a
 //! record made under an older layout no longer matches any preset and is
 //! refused when re-evaluated.
+//!
+//! [`RulePreset::from_canonical_bytes`] is the exact inverse for the current
+//! version: it accepts only the bytes the encoder writes for a valid preset,
+//! so every accepted input re-encodes to itself. Every count is checked
+//! against the bytes left before anything is allocated for it.
 
 use bms_model::TimeUs;
 
 use crate::{
-    Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
-    MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode,
-    Window,
+    Assignment, CanonicalError, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
+    GaugeValue, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
+    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights,
+    TotalMode, Window,
 };
 
 /// The encoding layout. Version 4 has the LN-end edges after the windows
@@ -79,6 +84,82 @@ impl RulePreset {
         });
         w.mine(mine);
         w.0
+    }
+}
+
+impl RulePreset {
+    /// Decodes [`canonical_bytes`](Self::canonical_bytes) of the current
+    /// version back into the preset.
+    ///
+    /// # Errors
+    ///
+    /// The first problem found in reading order: another version, bytes
+    /// that end inside a value, a varint that overflows or is not minimal, a
+    /// count beyond the bytes left, an unknown tag or implementation, a
+    /// value too large for its type, a string that is not UTF-8, a rank
+    /// scale without four entries; then bytes after the preset; and last a
+    /// preset that fails [`validate`](Self::validate).
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalError> {
+        let mut r = Reader(bytes);
+        let format = r.uint()?;
+        if format != FORMAT_VERSION {
+            return Err(CanonicalError::UnsupportedVersion(format));
+        }
+        let id = r.str("id")?;
+        let version = r.u32("version")?;
+        let implementation = r.implementation()?;
+        let windows = r.windows()?;
+        let ln_end = r.ln_end()?;
+        let miss = r.tag("miss", |t| {
+            (t == 0).then_some(MissRule::PoorAfterLateBadOrOvertaken)
+        })?;
+        let empty_poor = r.empty_poor()?;
+        let rank_scale = r.rank_scale()?;
+        let default_total_milli = r.int()?;
+        let denominator = r.tag("denominator", |t| {
+            (t == 0).then_some(Denominator::TapsAndLnHeads)
+        })?;
+        let count = r.count("gauges")?;
+        let mut gauges = Vec::with_capacity(count);
+        for _ in 0..count {
+            gauges.push(r.gauge()?);
+        }
+        let score = r.score()?;
+        let same_time_order = r.tag("same_time_order", |t| {
+            (t == 0).then_some(SameTimeOrder::InputsFirst)
+        })?;
+        let assignment = r.tag("assignment", |t| {
+            (t == 0).then_some(Assignment::NearestTiesEarlier)
+        })?;
+        let ln_mode = r.ln_mode()?;
+        let total_mode = r.tag("total_mode", |t| {
+            (t == 0).then_some(TotalMode::ScalesIncrease)
+        })?;
+        let mine = r.mine()?;
+        if !r.0.is_empty() {
+            return Err(CanonicalError::TrailingBytes(r.0.len()));
+        }
+        let preset = Self {
+            id,
+            version,
+            implementation,
+            windows,
+            miss,
+            empty_poor,
+            ln_end,
+            rank_scale,
+            default_total_milli,
+            denominator,
+            gauges,
+            score,
+            same_time_order,
+            assignment,
+            ln_mode,
+            total_mode,
+            mine,
+        };
+        preset.validate().map_err(CanonicalError::Invalid)?;
+        Ok(preset)
     }
 }
 
@@ -280,15 +361,253 @@ impl Writer {
     }
 }
 
+/// The bytes not read yet. Each method reads what the [`Writer`] method of
+/// the same name writes.
+struct Reader<'a>(&'a [u8]);
+
+impl Reader<'_> {
+    /// A LEB128 varint in its shortest form: no zero byte after the first,
+    /// and at most ten bytes, the tenth holding only bit 63.
+    fn uint(&mut self) -> Result<u64, CanonicalError> {
+        let mut v = 0_u64;
+        for shift in (0..64).step_by(7) {
+            let (&byte, rest) = self.0.split_first().ok_or(CanonicalError::Truncated)?;
+            self.0 = rest;
+            if shift == 63 && byte > 1 {
+                return Err(CanonicalError::VarintOverflow);
+            }
+            v |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                if byte == 0 && shift > 0 {
+                    return Err(CanonicalError::NonMinimalVarint);
+                }
+                return Ok(v);
+            }
+        }
+        Err(CanonicalError::VarintOverflow)
+    }
+
+    fn int(&mut self) -> Result<i64, CanonicalError> {
+        let v = self.uint()?;
+        Ok((v >> 1).cast_signed() ^ -(v & 1).cast_signed())
+    }
+
+    fn u32(&mut self, field: &'static str) -> Result<u32, CanonicalError> {
+        u32::try_from(self.uint()?).map_err(|_| CanonicalError::ValueTooLarge { field })
+    }
+
+    /// A count no larger than the bytes left, since every entry takes at
+    /// least one byte.
+    fn count(&mut self, field: &'static str) -> Result<usize, CanonicalError> {
+        let count = self.uint()?;
+        usize::try_from(count)
+            .ok()
+            .filter(|&n| n <= self.0.len())
+            .ok_or(CanonicalError::CountBeyondData { field, count })
+    }
+
+    fn tag<T>(
+        &mut self,
+        field: &'static str,
+        known: impl FnOnce(u64) -> Option<T>,
+    ) -> Result<T, CanonicalError> {
+        let tag = self.uint()?;
+        known(tag).ok_or(CanonicalError::UnknownTag { field, tag })
+    }
+
+    fn bool(&mut self, field: &'static str) -> Result<bool, CanonicalError> {
+        self.tag(field, |t| match t {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        })
+    }
+
+    fn str(&mut self, field: &'static str) -> Result<String, CanonicalError> {
+        let n = self.count(field)?;
+        let (s, rest) = self
+            .0
+            .split_at_checked(n)
+            .ok_or(CanonicalError::Truncated)?;
+        self.0 = rest;
+        let s = std::str::from_utf8(s).map_err(|_| CanonicalError::InvalidUtf8 { field })?;
+        Ok(s.to_owned())
+    }
+
+    fn time(&mut self) -> Result<TimeUs, CanonicalError> {
+        self.int().map(TimeUs)
+    }
+
+    fn gauge_value(&mut self) -> Result<GaugeValue, CanonicalError> {
+        self.int().map(GaugeValue)
+    }
+
+    fn implementation(&mut self) -> Result<Implementation, CanonicalError> {
+        let name = self.str("implementation")?;
+        let version = self.u32("implementation version")?;
+        match name.as_str() {
+            "standard" => Ok(Implementation::Standard { version }),
+            _ => Err(CanonicalError::UnknownImplementation { name }),
+        }
+    }
+
+    fn window(&mut self) -> Result<Window, CanonicalError> {
+        Ok(Window {
+            early: self.time()?,
+            late: self.time()?,
+        })
+    }
+
+    fn windows(&mut self) -> Result<JudgeWindows, CanonicalError> {
+        Ok(JudgeWindows {
+            perfect: self.window()?,
+            great: self.window()?,
+            good: self.window()?,
+            bad: self.window()?,
+        })
+    }
+
+    fn empty_poor(&mut self) -> Result<EmptyPoorRule, CanonicalError> {
+        Ok(EmptyPoorRule {
+            ahead: self.time()?,
+            behind: self.time()?,
+            breaks_combo: self.bool("empty_poor.breaks_combo")?,
+            counts_bp: self.bool("empty_poor.counts_bp")?,
+            counted: self.bool("empty_poor.counted")?,
+        })
+    }
+
+    fn ln_end(&mut self) -> Result<LnEndWindows, CanonicalError> {
+        Ok(LnEndWindows {
+            perfect: self.time()?,
+            great: self.time()?,
+            good: self.time()?,
+        })
+    }
+
+    fn rank_scale(&mut self) -> Result<RankScale, CanonicalError> {
+        let len = self.count("rank_scale")?;
+        if len != 4 {
+            return Err(CanonicalError::WrongLength {
+                field: "rank_scale",
+                len,
+            });
+        }
+        Ok(RankScale {
+            rank_milli: [self.int()?, self.int()?, self.int()?, self.int()?],
+            absent_milli: self.int()?,
+        })
+    }
+
+    fn per_judgment<T>(
+        &mut self,
+        mut each: impl FnMut(&mut Self) -> Result<T, CanonicalError>,
+    ) -> Result<PerJudgment<T>, CanonicalError> {
+        Ok(PerJudgment {
+            perfect: each(self)?,
+            great: each(self)?,
+            good: each(self)?,
+            bad: each(self)?,
+            poor: each(self)?,
+        })
+    }
+
+    fn delta(&mut self) -> Result<GaugeDelta, CanonicalError> {
+        match self.uint()? {
+            0 => Ok(GaugeDelta::Fixed(self.gauge_value()?)),
+            1 => Ok(GaugeDelta::TotalShare {
+                num: self.u32("gauge delta num")?,
+                den: self.u32("gauge delta den")?,
+            }),
+            tag => Err(CanonicalError::UnknownTag {
+                field: "gauge delta",
+                tag,
+            }),
+        }
+    }
+
+    fn gauge(&mut self) -> Result<GaugeRule, CanonicalError> {
+        let id = self.str("gauge id")?;
+        let kind = match self.uint()? {
+            0 => GaugeKind::EndThreshold {
+                clear: self.gauge_value()?,
+            },
+            1 => GaugeKind::Survival,
+            tag => {
+                return Err(CanonicalError::UnknownTag {
+                    field: "gauge kind",
+                    tag,
+                });
+            }
+        };
+        let start = self.gauge_value()?;
+        let min = self.gauge_value()?;
+        let max = self.gauge_value()?;
+        let change = self.per_judgment(Self::delta)?;
+        let empty_poor = self.delta()?;
+        let low_damage = match self.uint()? {
+            0 => None,
+            1 => Some(LowDamage {
+                below: self.gauge_value()?,
+                num: self.u32("low_damage num")?,
+                den: self.u32("low_damage den")?,
+            }),
+            tag => {
+                return Err(CanonicalError::UnknownTag {
+                    field: "low_damage",
+                    tag,
+                });
+            }
+        };
+        Ok(GaugeRule {
+            id,
+            kind,
+            start,
+            min,
+            max,
+            change,
+            empty_poor,
+            low_damage,
+        })
+    }
+
+    fn score(&mut self) -> Result<ScoreWeights, CanonicalError> {
+        Ok(ScoreWeights {
+            ex: self.per_judgment(|r| r.u32("score.ex"))?,
+            breaks_combo: self.per_judgment(|r| r.bool("score.breaks_combo"))?,
+            counts_bp: self.per_judgment(|r| r.bool("score.counts_bp"))?,
+        })
+    }
+
+    fn ln_mode(&mut self) -> Result<LnModeRule, CanonicalError> {
+        Ok(LnModeRule {
+            default: self.tag("ln_mode.default", |t| (t == 0).then_some(LnMode::Ln))?,
+            late_head: self.tag("ln_mode.late_head", |t| {
+                (t == 0).then_some(LateHeadRule::CompletesAtPress)
+            })?,
+        })
+    }
+
+    fn mine(&mut self) -> Result<MineRule, CanonicalError> {
+        let tag = self.uint()?;
+        match tag {
+            0 => Ok(MineRule::WhileHeld {
+                per_unit: self.gauge_value()?,
+            }),
+            _ => Err(CanonicalError::UnknownTag { field: "mine", tag }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
     use bms_model::TimeUs;
 
-    use crate::custom;
+    use crate::{CanonicalError, GaugeKind, Judgment, RuleError, RulePreset, Side, custom};
 
-    use super::Writer;
+    use super::{FORMAT_VERSION, Reader, Writer};
 
     #[test]
     fn canonical_bytes_change_with_any_window() {
@@ -446,5 +765,276 @@ mod tests {
                 0xff, 0xff, 0xff, 0xff, 0x01
             ]
         );
+    }
+
+    fn decode(bytes: &[u8]) -> Result<RulePreset, CanonicalError> {
+        RulePreset::from_canonical_bytes(bytes)
+    }
+
+    /// Where a field of [`custom`]'s bytes starts: the length of the
+    /// version and the fields `before` writes.
+    fn offset(before: impl FnOnce(&mut Writer, &RulePreset)) -> usize {
+        let preset = custom();
+        let mut w = Writer(Vec::new());
+        w.uint(FORMAT_VERSION);
+        before(&mut w, &preset);
+        w.0.len()
+    }
+
+    /// Up to the miss rule's tag.
+    fn through_ln_end(w: &mut Writer, p: &RulePreset) {
+        w.str(&p.id);
+        w.uint(u64::from(p.version));
+        w.implementation(p.implementation);
+        w.windows(&p.windows);
+        w.ln_end(&p.ln_end);
+    }
+
+    /// Up to the gauge count.
+    fn through_denominator(w: &mut Writer, p: &RulePreset) {
+        through_ln_end(w, p);
+        w.uint(0);
+        w.empty_poor(&p.empty_poor);
+        w.rank_scale(&p.rank_scale);
+        w.int(p.default_total_milli);
+        w.uint(0);
+    }
+
+    /// [`custom`]'s bytes with the varint at `at` replaced by `v`.
+    fn with_uint_at(at: usize, v: u64) -> Vec<u8> {
+        let bytes = custom().canonical_bytes();
+        let mut old = Reader(&bytes[at..]);
+        old.uint().unwrap();
+        let end = bytes.len() - old.0.len();
+        let mut w = Writer(bytes[..at].to_vec());
+        w.uint(v);
+        w.0.extend_from_slice(&bytes[end..]);
+        w.0
+    }
+
+    #[test]
+    fn custom_preset_decodes() {
+        assert_eq!(decode(&custom().canonical_bytes()), Ok(custom()));
+    }
+
+    #[test]
+    fn other_canonical_version_is_refused() {
+        for v in [0, FORMAT_VERSION - 1, FORMAT_VERSION + 1, u64::MAX] {
+            assert_eq!(
+                decode(&with_uint_at(0, v)),
+                Err(CanonicalError::UnsupportedVersion(v))
+            );
+        }
+        assert_eq!(decode(&[]), Err(CanonicalError::Truncated));
+    }
+
+    #[test]
+    fn count_beyond_the_bytes_is_refused() {
+        // The id's length: one more than the bytes left is refused; exactly
+        // the bytes left is read, and the next field finds nothing.
+        assert_eq!(
+            decode(&[4, 4, b'a', b'b', b'c']),
+            Err(CanonicalError::CountBeyondData {
+                field: "id",
+                count: 4
+            })
+        );
+        assert_eq!(
+            decode(&[4, 3, b'a', b'b', b'c']),
+            Err(CanonicalError::Truncated)
+        );
+        assert_eq!(
+            decode(&[
+                4, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
+            ]),
+            Err(CanonicalError::CountBeyondData {
+                field: "id",
+                count: 1 << 63
+            })
+        );
+        // The gauge count, checked before the gauges are allocated.
+        let at = offset(through_denominator);
+        let left = custom().canonical_bytes().len() - at - 1;
+        for count in [u64::try_from(left).unwrap() + 1, u64::MAX] {
+            assert_eq!(
+                decode(&with_uint_at(at, count)),
+                Err(CanonicalError::CountBeyondData {
+                    field: "gauges",
+                    count
+                })
+            );
+        }
+        // The rank scale's length.
+        let at = offset(|w, p| {
+            through_ln_end(w, p);
+            w.uint(0);
+            w.empty_poor(&p.empty_poor);
+        });
+        assert_eq!(
+            decode(&with_uint_at(at, u64::MAX)),
+            Err(CanonicalError::CountBeyondData {
+                field: "rank_scale",
+                count: u64::MAX
+            })
+        );
+        assert_eq!(
+            decode(&with_uint_at(at, 5)),
+            Err(CanonicalError::WrongLength {
+                field: "rank_scale",
+                len: 5
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_tag_is_refused() {
+        let unknown = |field, tag| Err(CanonicalError::UnknownTag { field, tag });
+        let miss = offset(through_ln_end);
+        assert_eq!(decode(&with_uint_at(miss, 1)), unknown("miss", 1));
+        let breaks_combo = offset(|w, p| {
+            through_ln_end(w, p);
+            w.uint(0);
+            w.time(p.empty_poor.ahead);
+            w.time(p.empty_poor.behind);
+        });
+        assert_eq!(
+            decode(&with_uint_at(breaks_combo, 2)),
+            unknown("empty_poor.breaks_combo", 2)
+        );
+        let kind = offset(|w, p| {
+            through_denominator(w, p);
+            w.len(p.gauges.len());
+            w.str(&p.gauges[0].id);
+        });
+        assert_eq!(decode(&with_uint_at(kind, 2)), unknown("gauge kind", 2));
+        let delta = offset(|w, p| {
+            through_denominator(w, p);
+            w.len(p.gauges.len());
+            let g = &p.gauges[0];
+            w.str(&g.id);
+            let GaugeKind::EndThreshold { clear } = g.kind else {
+                panic!("the first custom gauge has a clear threshold");
+            };
+            w.uint(0);
+            w.gauge_value(clear);
+            w.gauge_value(g.start);
+            w.gauge_value(g.min);
+            w.gauge_value(g.max);
+        });
+        assert_eq!(
+            decode(&with_uint_at(delta, u64::MAX)),
+            unknown("gauge delta", u64::MAX)
+        );
+        let bytes = custom().canonical_bytes();
+        let mut mine = Writer(Vec::new());
+        mine.mine(&custom().mine);
+        let mine = bytes.len() - mine.0.len();
+        assert_eq!(decode(&with_uint_at(mine, 1)), unknown("mine", 1));
+
+        // The implementation's tag is its name.
+        let mut p = custom();
+        p.id = "x".to_owned();
+        let mut bytes = p.canonical_bytes();
+        // The version, the id `x` and the preset version 3, then the name.
+        assert_eq!(&bytes[4..13], b"\x08standard");
+        bytes[5] = b'S';
+        assert_eq!(
+            decode(&bytes),
+            Err(CanonicalError::UnknownImplementation {
+                name: "Standard".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let mut bytes = custom().canonical_bytes();
+        bytes.push(0);
+        assert_eq!(decode(&bytes), Err(CanonicalError::TrailingBytes(1)));
+        bytes.extend_from_slice(&[0; 9]);
+        assert_eq!(decode(&bytes), Err(CanonicalError::TrailingBytes(10)));
+        bytes.truncate(bytes.len() - 11);
+        assert_eq!(decode(&bytes), Err(CanonicalError::Truncated));
+    }
+
+    #[test]
+    fn invalid_decoded_preset_is_refused() {
+        let mut p = custom();
+        p.windows.bad.early = p.windows.good.early;
+        assert_eq!(
+            decode(&p.canonical_bytes()),
+            Err(CanonicalError::Invalid(RuleError::WindowsNotAscending {
+                side: Side::Early,
+                judgment: Judgment::Bad,
+            }))
+        );
+        assert_eq!(
+            decode(&PINNED),
+            Err(CanonicalError::Invalid(
+                RuleError::UnsupportedImplementation {
+                    name: "standard",
+                    version: 3
+                }
+            ))
+        );
+        let mut p = custom();
+        p.gauges.clear();
+        assert_eq!(
+            decode(&p.canonical_bytes()),
+            Err(CanonicalError::Invalid(RuleError::NoGauges))
+        );
+    }
+
+    #[test]
+    fn values_outside_their_type_are_refused() {
+        // `version` is a u32.
+        let at = offset(|w, p| w.str(&p.id));
+        assert_eq!(
+            decode(&with_uint_at(at, u64::from(u32::MAX))).map(|p| p.version),
+            Ok(u32::MAX)
+        );
+        assert_eq!(
+            decode(&with_uint_at(at, u64::from(u32::MAX) + 1)),
+            Err(CanonicalError::ValueTooLarge { field: "version" })
+        );
+        // The id is not UTF-8.
+        let mut bytes = custom().canonical_bytes();
+        bytes[2] = 0xff;
+        assert_eq!(
+            decode(&bytes),
+            Err(CanonicalError::InvalidUtf8 { field: "id" })
+        );
+    }
+
+    #[test]
+    fn varints_in_another_form_are_refused() {
+        let read = |bytes: &[u8]| {
+            let mut r = Reader(bytes);
+            r.uint().map(|v| (v, r.0.len()))
+        };
+        let mut max = vec![0xff; 9];
+        max.push(0x01);
+        assert_eq!(read(&max), Ok((u64::MAX, 0)));
+        assert_eq!(read(&[0x80, 0x01, 0x00]), Ok((128, 1)));
+        assert_eq!(read(&[0x80, 0x00]), Err(CanonicalError::NonMinimalVarint));
+        assert_eq!(
+            read(&[0xff, 0x80, 0x00]),
+            Err(CanonicalError::NonMinimalVarint)
+        );
+        assert_eq!(read(&[0x80]), Err(CanonicalError::Truncated));
+        max[9] = 0x02;
+        assert_eq!(read(&max), Err(CanonicalError::VarintOverflow));
+        max[9] = 0x81;
+        assert_eq!(read(&max), Err(CanonicalError::VarintOverflow));
+        let mut w = Writer(Vec::new());
+        let ints = [0, -1, 1, -64, 64, i64::MIN, i64::MAX];
+        for v in ints {
+            w.int(v);
+        }
+        let mut r = Reader(&w.0);
+        for v in ints {
+            assert_eq!(r.int(), Ok(v));
+        }
+        assert!(r.0.is_empty());
     }
 }
