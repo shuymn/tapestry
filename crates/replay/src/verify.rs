@@ -119,11 +119,16 @@ fn practice_section(record: &PlayRecord, preset: &RulePreset) -> Option<(Section
     Some((section, started_at_default))
 }
 
-/// Whether `rule`'s gauge can start at `v`: within its bounds, and above 0
-/// for a survival gauge (design.md "Section Evaluation").
+/// Whether `rule`'s gauge can start at `v`, as the evaluator takes a
+/// section's initial gauges (design.md "Section Evaluation"): within its
+/// bounds, and for a survival gauge above 0 and not below the value it
+/// fails under.
 fn accepts(rule: &GaugeRule, v: GaugeValue) -> bool {
     (rule.min..=rule.max).contains(&v)
-        && !(rule.kind == GaugeKind::Survival && v <= GaugeValue::EMPTY)
+        && match rule.kind {
+            GaugeKind::EndThreshold { .. } => true,
+            GaugeKind::Survival { fails_below } => v > GaugeValue::EMPTY && v >= fails_below,
+        }
 }
 
 /// Checks the record's evaluator version, then decodes its preset copy.
