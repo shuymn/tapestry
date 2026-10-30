@@ -1708,6 +1708,7 @@ dependencies = [
  "game",
  "input",
  "lexopt",
+ "library",
  "log",
  "render",
  "replay",

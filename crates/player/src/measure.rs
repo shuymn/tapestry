@@ -409,8 +409,12 @@ fn write_overlay(fig: &Figures, load: Option<(bool, i64)>, lines: &mut [Line; LI
 /// [`FrameSink`]: crate::render_side::FrameSink
 #[derive(Clone, Copy, Debug)]
 pub struct Drawn<'a> {
-    /// The chart time of a play frame, `None` for a text screen.
+    /// The chart time of a play frame, `None` for a text or menu screen.
     pub play: Option<TimeUs>,
+    /// Whether it was a menu screen (song selection), for the frame dump
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub menu: bool,
     /// What the frame cost and whether it was presented.
     pub timing: FrameTiming,
     /// The swap chain's frame statistics, read right after the frame.
@@ -1233,6 +1237,8 @@ mod frame_tests {
     ) -> Drawn<'_> {
         Drawn {
             play: Some(TimeUs(0)),
+            #[cfg(feature = "dev-tools")]
+            menu: false,
             timing: FrameTiming {
                 cpu: Duration::from_micros(cpu_us),
                 sprites: 0,

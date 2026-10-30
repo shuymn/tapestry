@@ -118,6 +118,9 @@ pub enum RenderError {
     /// A menu's text was made for another renderer, whose device it uses.
     #[error("text: made for another renderer")]
     OtherRenderersText,
+    /// A menu's text could not be prepared ([`crate::text::MenuText::prepare`]).
+    #[error(transparent)]
+    TextPrepare(#[from] crate::text::TextError),
 }
 
 /// What one frame cost and drew.
