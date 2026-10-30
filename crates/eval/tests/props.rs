@@ -31,7 +31,10 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
-use rules::{GaugeKind, GaugeValue, HeaderPolicy, MineRule, RulePreset, WindowPolicy};
+use rules::{
+    DefaultTotal, GaugeKind, GaugeValue, HeaderPolicy, MineRule, RulePreset, TotalCorrection,
+    WindowPolicy,
+};
 
 use live::{Delivery, Live, live};
 use strategy::{
@@ -137,10 +140,18 @@ fn check_gauges(preset: &RulePreset, e: &Evaluation) -> Result<(), TestCaseError
                 prop_assert_eq!(g.value, g.reference);
                 prop_assert_eq!(g.failed_at, None);
             }
-            GaugeKind::Survival => {
+            GaugeKind::Survival { fails_below } => {
                 let f = g.history.iter().position(|p| p.value == GaugeValue::EMPTY);
                 let (before, after) = g.history.split_at(f.unwrap_or(g.history.len()));
                 prop_assert!(before.iter().all(|p| p.value == p.reference));
+                // Alive means at or above the threshold.
+                prop_assert!(before.iter().all(|p| p.value >= fails_below));
+                // It fails where the reference first goes 0 or below it.
+                prop_assert!(
+                    after.first().is_none_or(
+                        |p| p.reference <= GaugeValue::EMPTY || p.reference < fails_below
+                    )
+                );
                 prop_assert!(after.iter().all(|p| p.value == GaugeValue::EMPTY));
                 prop_assert_eq!(g.failed_at, after.first().map(|p| p.time));
                 if f.is_some() {
@@ -531,13 +542,39 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
         "window_policy_scaled",
         matches!(p.window_policy, WindowPolicy::Scaled(_)),
     );
-    let survival = |low: bool| {
+    let survival = |bands: fn(usize) -> bool| {
         p.gauges
             .iter()
-            .any(|g| g.kind == GaugeKind::Survival && g.low_damage.is_some() == low)
+            .any(|g| matches!(g.kind, GaugeKind::Survival { .. }) && bands(g.low_damage.len()))
     };
-    c.hit("survival_with_low_damage", survival(true));
-    c.hit("survival_without_low_damage", survival(false));
+    c.hit("survival_with_low_damage", survival(|n| n == 1));
+    c.hit("survival_with_low_damage_bands", survival(|n| n >= 2));
+    c.hit("survival_without_low_damage", survival(|n| n == 0));
+    c.hit(
+        "survival_with_threshold",
+        p.gauges.iter().any(
+            |g| matches!(g.kind, GaugeKind::Survival { fails_below } if fails_below > GaugeValue::EMPTY),
+        ),
+    );
+    for (spot, correction) in [
+        ("correction_none", TotalCorrection::None),
+        ("correction_limit_increase", TotalCorrection::LimitIncrease),
+        ("correction_scale_damage", TotalCorrection::ScaleDamage),
+    ] {
+        c.hit(spot, p.gauges.iter().any(|g| g.correction == correction));
+    }
+    c.hit(
+        "default_total_fixed",
+        matches!(p.default_total, DefaultTotal::Fixed { .. }),
+    );
+    c.hit(
+        "default_total_notes_curve",
+        p.default_total == DefaultTotal::NotesCurve,
+    );
+    c.hit(
+        "default_total_notes_linear",
+        p.default_total == DefaultTotal::NotesLinear,
+    );
 }
 
 fn count_play(play: &Play, c: &mut Coverage) {
@@ -604,6 +641,22 @@ fn count_play(play: &Play, c: &mut Coverage) {
         "ln_hold_ended",
         has(&|k| matches!(k, JudgeEventKind::LnHoldEnded { .. })),
     );
+    // Under combo priority, a press that passes an unjudged note: a POOR
+    // caused by an input.
+    c.hit(
+        "combo_priority_passes_a_note",
+        play.preset.assignment == rules::Assignment::ComboPriority
+            && whole.events.iter().any(|e| {
+                e.origin.is_some()
+                    && matches!(
+                        e.kind,
+                        JudgeEventKind::Judged {
+                            judgment: rules::Judgment::Poor,
+                            ..
+                        }
+                    )
+            }),
+    );
     c.hit(
         "empty_poor",
         has(&|k| matches!(k, JudgeEventKind::EmptyPoor { .. })),
@@ -643,12 +696,18 @@ fn count_play(play: &Play, c: &mut Coverage) {
         let failed = g.history.iter().position(|p| p.value == GaugeValue::EMPTY);
         c.hit(
             "survival_failed_then_rose",
-            rule.kind == GaugeKind::Survival
+            matches!(rule.kind, GaugeKind::Survival { .. })
                 && failed.is_some_and(|f| {
                     g.history[f + 1..]
                         .iter()
                         .any(|p| p.reference > GaugeValue::EMPTY)
                 }),
+        );
+        // A failure above 0, below the threshold.
+        c.hit(
+            "survival_failed_below_threshold",
+            matches!(rule.kind, GaugeKind::Survival { .. })
+                && failed.is_some_and(|f| g.history[f].reference > GaugeValue::EMPTY),
         );
     }
 }
@@ -832,8 +891,9 @@ fn generators_reach_the_fragile_spots() {
         ("ln_hold_ended", 1),
         ("empty_poor", 1),
         ("play_sound", 1),
-        ("choices_of_custom", SAMPLES),
-        ("choices_of_beatoraja_style", SAMPLES),
+        ("choices_of_custom", SAMPLES / 4),
+        ("choices_of_beatoraja_style", SAMPLES / 4),
+        ("combo_priority_passes_a_note", 1),
         ("headers_decimals", 1),
         ("headers_def_ex_rank_first", 1),
         ("header_policies_differ", 1),
@@ -843,6 +903,15 @@ fn generators_reach_the_fragile_spots() {
         ("window_policy_scaled", 1),
         ("survival_with_low_damage", 1),
         ("survival_without_low_damage", 1),
+        ("survival_with_low_damage_bands", 1),
+        ("survival_with_threshold", 1),
+        ("correction_none", 1),
+        ("correction_limit_increase", 1),
+        ("correction_scale_damage", 1),
+        ("default_total_fixed", 1),
+        ("default_total_notes_curve", 1),
+        ("default_total_notes_linear", 1),
+        ("survival_failed_below_threshold", 1),
         ("gauge_at_max", 1),
         ("gauge_at_positive_min", 1),
         ("survival_failed_then_rose", 1),

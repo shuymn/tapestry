@@ -34,9 +34,10 @@ pub use custom::custom;
 pub use error::{CanonicalError, RuleError, Side};
 pub use headers::{HeaderPolicy, JudgeRank, ReadHeaders};
 pub use preset::{
-    Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, Judgment, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
-    LowDamage, MAX_WINDOW_EDGE, MineRule, MissRule, PerJudgment, RankScale, RulePreset,
-    SCALE_FULL_MILLI, SameTimeOrder, ScoreWeights, TotalMode, Window, scale_edge, scale_edge_by,
+    Assignment, CorrectionFactors, DefaultTotal, Denominator, EmptyPoorRule, Factor, GaugeDelta,
+    GaugeKind, GaugeRule, GaugeValue, Implementation, JudgeWindows, Judgment, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MAX_WINDOW_EDGE, MineRule, MissRule, PerJudgment,
+    RankScale, RulePreset, SCALE_FULL_MILLI, SameTimeOrder, ScoreWeights, TotalCorrection,
+    TotalMode, Window, scale_edge, scale_edge_by,
 };
 pub use windows::{EmptyPoorRange, LaneClass, LaneTable, PerLaneClass, ScaledRank, WindowPolicy};

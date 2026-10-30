@@ -77,6 +77,12 @@ pub enum RuleError {
         /// The field.
         field: &'static str,
     },
+    /// A gauge with a `#TOTAL` correction has a change that is a share of
+    /// the per-note increment, a combination no preset specifies.
+    CorrectedShare {
+        /// The gauge.
+        id: String,
+    },
 }
 
 impl fmt::Display for RuleError {
@@ -113,6 +119,10 @@ impl fmt::Display for RuleError {
             Self::GaugeOutOfBounds { id, field } => {
                 write!(f, "gauge {id:?}: {field} is out of bounds")
             }
+            Self::CorrectedShare { id } => write!(
+                f,
+                "gauge {id:?}: a #TOTAL correction applies to fixed changes only"
+            ),
         }
     }
 }

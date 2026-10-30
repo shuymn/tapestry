@@ -20,9 +20,10 @@ use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
 use rules::{
-    EmptyPoorRange, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeaderPolicy, JudgeRank,
-    JudgeWindows, LaneTable, LnEndWindows, LowDamage, MineRule, PerJudgment, PerLaneClass,
-    RankScale, RulePreset, ScaledRank, Window, WindowPolicy,
+    Assignment, DefaultTotal, EmptyPoorRange, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
+    HeaderPolicy, JudgeRank, JudgeWindows, LaneTable, LnEndWindows, LowDamage, MineRule,
+    PerJudgment, PerLaneClass, RankScale, RulePreset, ScaledRank, TotalCorrection, Window,
+    WindowPolicy,
 };
 
 use super::live::{Delivery, Publish, SourceStep};
@@ -253,7 +254,9 @@ struct RawGauge {
     survival: bool,
     bounds: [u32; 4],
     deltas: [(u8, u32); 6],
-    low: Option<(u8, u8, u32)>,
+    /// The correction, and a survival gauge's failure threshold.
+    policy: (u8, u32),
+    low: Vec<(u8, u8, u32)>,
 }
 
 fn raw_gauge() -> impl Strategy<Value = RawGauge> {
@@ -261,12 +264,14 @@ fn raw_gauge() -> impl Strategy<Value = RawGauge> {
         any::<bool>(),
         any::<[u32; 4]>(),
         any::<[(u8, u32); 6]>(),
-        option::of(any::<(u8, u8, u32)>()),
+        any::<(u8, u32)>(),
+        vec(any::<(u8, u8, u32)>(), 0..=3),
     )
-        .prop_map(|(survival, bounds, deltas, low)| RawGauge {
+        .prop_map(|(survival, bounds, deltas, policy, low)| RawGauge {
             survival,
             bounds,
             deltas,
+            policy,
             low,
         })
 }
@@ -389,6 +394,7 @@ fn delta(sel: u8, v: u32) -> GaugeDelta {
 
 fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
     let [a, b, c, d] = raw.bounds.map(u64::from);
+    let (sel, v) = raw.policy;
     let (kind, min, start, max) = if raw.survival {
         // Often a low start, so failures happen.
         let max = FULL - below(a, 2) * below(a / 2, FULL / 2);
@@ -397,7 +403,22 @@ fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
         } else {
             1 + below(b / 2, max)
         };
-        (GaugeKind::Survival, 0, start.min(max), max)
+        let start = start.min(max);
+        // Failing at 0, below 2 % (the LR2-style threshold), or below any
+        // value up to the start.
+        let fails_below = match (sel / 3) % 3 {
+            0 => 0,
+            1 => (2 * PERCENT).min(start),
+            _ => below(v, start + 1),
+        };
+        (
+            GaugeKind::Survival {
+                fails_below: GaugeValue(fails_below),
+            },
+            0,
+            start,
+            max,
+        )
     } else {
         let min = below(a % 3, 2) * below(a / 3, FULL / 4);
         let max = min + below(b, (FULL - min) + 1);
@@ -412,15 +433,35 @@ fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
             max,
         )
     };
-    let [p, g, gd, bd, pr, ep] = raw.deltas.map(|(s, v)| delta(s, v));
-    let low_damage = raw.low.map(|(num, den, below_raw)| {
-        let den = u32::from(den % 4) + 1;
-        LowDamage {
-            below: GaugeValue(min + below(below_raw, (max - min) + 1)),
-            num: u32::from(num) % (den + 1),
-            den,
+    let correction = [
+        TotalCorrection::None,
+        TotalCorrection::LimitIncrease,
+        TotalCorrection::ScaleDamage,
+    ][usize::from(sel % 3)];
+    // A corrected gauge has fixed changes only: a share becomes a small
+    // fixed increase.
+    let fixed = |d: GaugeDelta| match (correction, d) {
+        (TotalCorrection::None, d) | (_, d @ GaugeDelta::Fixed(_)) => d,
+        (_, GaugeDelta::TotalShare { num, den }) => {
+            GaugeDelta::Fixed(GaugeValue(i64::from(num * 4_000 / den)))
         }
-    });
+    };
+    let [p, g, gd, bd, pr, ep] = raw.deltas.map(|(s, v)| fixed(delta(s, v)));
+    // Bands in strictly ascending order; equal thresholds collapse to one.
+    let mut low_damage: Vec<LowDamage> = raw
+        .low
+        .iter()
+        .map(|&(num, den, below_raw)| {
+            let den = u32::from(den % 4) + 1;
+            LowDamage {
+                below: GaugeValue(min + below(below_raw, (max - min) + 1)),
+                num: u32::from(num) % (den + 1),
+                den,
+            }
+        })
+        .collect();
+    low_damage.sort_unstable_by_key(|b| b.below);
+    low_damage.dedup_by_key(|b| b.below);
     GaugeRule {
         id: format!("g{id}"),
         kind,
@@ -435,6 +476,7 @@ fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
             poor: pr,
         },
         empty_poor: ep,
+        correction,
         low_damage,
     }
 }
@@ -539,6 +581,13 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     p.empty_poor.breaks_combo = flag(0);
     p.empty_poor.counts_bp = flag(1);
     p.empty_poor.counted = flag(2);
+    // Both assignment policies: nearest first (custom) and combo priority
+    // (beatoraja-style).
+    p.assignment = if flag(18) {
+        Assignment::ComboPriority
+    } else {
+        Assignment::NearestTiesEarlier
+    };
     p.headers = if flag(3) {
         HeaderPolicy::DefExRankFirst
     } else {
@@ -556,7 +605,13 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
             absent_milli: scale(raw.rank[4]),
         })
     };
-    p.default_total_milli = below(raw.total, 400_000) + 1;
+    p.default_total = match raw.total % 4 {
+        0 | 1 => DefaultTotal::Fixed {
+            milli: below(raw.total / 4, 400_000) + 1,
+        },
+        2 => DefaultTotal::NotesCurve,
+        _ => DefaultTotal::NotesLinear,
+    };
     p.gauges = raw
         .gauges
         .iter()
@@ -886,11 +941,10 @@ fn build_section(chart: &Chart, preset: &RulePreset, raw: &RawSection) -> Sectio
         .enumerate()
         .map(|(i, g)| {
             let (sel, v) = raw.gauges[i % 3];
-            // A survival gauge never starts at 0.
-            let low = if g.kind == GaugeKind::Survival {
-                1
-            } else {
-                g.min.0
+            // A survival gauge never starts at 0 or below its threshold.
+            let low = match g.kind {
+                GaugeKind::Survival { fails_below } => fails_below.0.max(1),
+                GaugeKind::EndThreshold { .. } => g.min.0,
             };
             GaugeValue(match sel % 4 {
                 0 => g.start.0,

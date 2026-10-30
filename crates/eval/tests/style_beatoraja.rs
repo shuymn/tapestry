@@ -24,10 +24,10 @@ use bms_model::{Chart, ChartBuilder, JudgmentHeader, Lane, TimeUs};
 use common::{MS, device, empty_poors, judgments, lane, press, release};
 use eval::{
     EvalError, EvalInput, Evaluation, Evaluator, InputStart, JudgeEventKind, PhysicalInputEvent,
-    evaluate,
+    Section, evaluate,
 };
 use rules::Judgment::{self, Bad, Good, Great, Perfect, Poor};
-use rules::{JudgeWindows, LaneClass, LnEndWindows, RuleError, Side, Window};
+use rules::{GaugeValue, JudgeWindows, LaneClass, LnEndWindows, RuleError, Side, Window};
 
 const BPM: i64 = 150_000;
 /// The first note's time.
@@ -330,6 +330,145 @@ fn empty_poor_keeps_the_combo_adds_bp_and_costs_two_percent() {
     assert_eq!(history, vec![100 * PCT, 98 * PCT, 100 * PCT]);
 }
 
+/// Source: play/JudgeManager.java:385-419: one scan over the lane's notes,
+/// judged and unjudged, decides an empty POOR when no note is taken: a
+/// judged note inside the MS pair (`:400-401`), or an unjudged one inside
+/// it but outside every window (`:403-404`, judge 4 becomes 5); the MS pair
+/// is the same range for both (play/JudgeProperty.java:23, {-150000,
+/// 500000}).
+#[test]
+fn empty_poor_is_part_of_the_scan() {
+    let chart = taps(&[T]);
+    // An unjudged note ahead, past the early BAD edge (220 ms), up to
+    // 500 ms.
+    for (before, poor) in [(221, 1), (500, 1)] {
+        let e = play(&chart, tap_at(T - before * MS));
+        assert_eq!(empty_poors(&e.events), poor, "{before} ms before");
+        assert_eq!(judged_at(&e), vec![(T + MISSED, Poor)]);
+    }
+    // A judged note ahead: taken BAD 200 ms early, then pressed again
+    // 190 ms early.
+    let again = |before: i64| {
+        let e = play(&chart, taps_at(&[T - 200 * MS, T - before]));
+        assert_eq!(judged_at(&e), vec![(T - 200 * MS, Bad)]);
+        empty_poors(&e.events)
+    };
+    assert_eq!(again(190 * MS), 1);
+    // A judged note behind: within 150 ms of the press.
+    let behind = |after: i64| empty_poors(&play(&chart, taps_at(&[T, T + after])).events);
+    assert_eq!(behind(150 * MS), 1);
+    assert_eq!(behind(150 * MS + 1), 0);
+    // A press that takes a note is never an empty POOR, and one that
+    // judges no note far from every note is nothing.
+    assert_eq!(empty_poors(&play(&chart, tap_at(T)).events), 0);
+    assert_eq!(empty_poors(&play(&chart, tap_at(T - 501 * MS)).events), 0);
+}
+
+/// Source: play/JudgeManager.java:385-419 (the scan finds the judged note
+/// behind the press) and play/JudgeProperty.java:23 (MS late -150000); the
+/// custom preset's range is 150 ms behind too (design.md "Custom Preset").
+/// The scan is located by time, not started at the first unjudged note,
+/// which no longer exists once the lane's last note is hit.
+#[test]
+fn empty_poor_after_the_last_hit_note() {
+    let chart = taps(&[T - 400 * MS, T]);
+    for preset in [rules::beatoraja_style(), rules::custom()] {
+        let run = |after: i64| {
+            let input = EvalInput {
+                events: taps_at(&[T - 400 * MS, T, T + after]),
+                device: device(&[0]),
+                start: InputStart::default(),
+                finalized: None,
+                section: None,
+            };
+            let e = evaluate(&chart, &input, &preset).unwrap();
+            assert_eq!(e.tally.counts.perfect, 2, "{}", preset.id);
+            empty_poors(&e.events)
+        };
+        assert_eq!(run(150 * MS), 1, "{}", preset.id);
+        assert_eq!(run(150 * MS + 1), 0, "{}", preset.id);
+    }
+}
+
+// ------------------------------------------------------------ assignment
+
+/// Source: play/JudgeAlgorithm.java:17-20 (`Combo`: the later note is taken
+/// when the earlier is past `ptime + GOOD late` and the later is not past
+/// `ptime + GOOD early`), the default `PlayConfig.java:103`, applied in
+/// time order by the candidate loop play/JudgeManager.java:396-411. The
+/// notes the press passes are POOR at the press here (a known difference
+/// in the preset module: the source keeps them hittable).
+#[test]
+fn combo_priority_assigns_like_the_source_and_passed_notes_are_poor() {
+    let two = taps(&[T, T + 200 * MS]);
+    // 120 ms late on the first note: still GOOD, so it is taken, though
+    // the second (80 ms early) is nearer.
+    let e = play(&two, tap_at(T + 120 * MS));
+    assert_eq!(
+        judged_at(&e),
+        vec![(T + 120 * MS, Good), (T + 200 * MS + MISSED, Poor)]
+    );
+    // Exactly on the first note's late GOOD edge: still the first.
+    let e = play(&two, tap_at(T + 150 * MS));
+    assert_eq!(judged_at(&e)[0], (T + 150 * MS, Good));
+    // Past it: the second (GREAT, 30 ms early), and the first is POOR at
+    // the press.
+    let e = play(&two, tap_at(T + 170 * MS));
+    assert_eq!(
+        judged_at(&e),
+        vec![(T + 170 * MS, Poor), (T + 170 * MS, Great)]
+    );
+    // The later note must not be before its early GOOD edge: with notes
+    // at 0 and 350 ms, a press at 190 ms (160 ms before the second) is BAD
+    // on the first, and one at 200 ms (150 ms before it) GOOD on the
+    // second.
+    let far = taps(&[T, T + 350 * MS]);
+    let e = play(&far, tap_at(T + 190 * MS));
+    assert_eq!(judged_at(&e)[0], (T + 190 * MS, Bad));
+    let e = play(&far, tap_at(T + 200 * MS));
+    assert_eq!(
+        judged_at(&e),
+        vec![(T + 200 * MS, Poor), (T + 200 * MS, Good)]
+    );
+    // In a chain: 0, 100 and 260 ms, pressed at 255 ms. The first is past
+    // its GOOD edge, so the second takes over; the second is past its own,
+    // so the third does: both earlier notes are POOR at the press.
+    let chain = taps(&[T, T + 100 * MS, T + 260 * MS]);
+    let e = play(&chain, tap_at(T + 255 * MS));
+    assert_eq!(
+        judged_at(&e),
+        vec![
+            (T + 255 * MS, Poor),
+            (T + 255 * MS, Poor),
+            (T + 255 * MS, Perfect)
+        ]
+    );
+}
+
+/// Source: play/JudgeManager.java:419-458 (the sound of the note taken is
+/// played as it is judged). Here a press's events come in the order of
+/// design.md "Evaluation Stages": the sound, the passed notes' POORs in
+/// note order, then the note taken.
+#[test]
+fn press_emission_order_is_fixed() {
+    let mut chart = taps(&[T, T + 100 * MS, T + 260 * MS]);
+    for (k, note) in chart.lanes[1].iter_mut().enumerate() {
+        note.sound = Some(bms_model::SoundId(u16::try_from(k).unwrap()));
+    }
+    let e = play(&chart, tap_at(T + 255 * MS));
+    let at_press: Vec<_> = e
+        .events
+        .iter()
+        .filter(|ev| ev.time.0 == T + 255 * MS)
+        .filter_map(|ev| match ev.kind {
+            JudgeEventKind::PlaySound { sound, .. } => Some(format!("sound {}", sound.0)),
+            JudgeEventKind::Judged { note, judgment, .. } => Some(format!("{judgment:?} {note}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(at_press, ["sound 2", "Poor 0", "Poor 1", "Perfect 2"]);
+}
+
 // ------------------------------------------------------------ score
 
 /// Source: ScoreData.java:421-422 (EX = PG × 2 + GR), play/JudgeProperty.java:29
@@ -534,9 +673,8 @@ fn survival_increases_per_judgment() {
 /// Source: play/GaugeProperty.java:91-92 (EX HARD POOR −16 %, HAZARD
 /// POOR −100 %, neither reduced while low), play/GrooveGauge.java:218-222
 /// (a gauge at 0 never changes again), :246-248 (a survival gauge clears
-/// above 0). HARD's misses are not asserted: below 50 % its damage is
-/// reduced there (difference C). The failure times are [`MISSED`] after the
-/// note, this evaluator's convention.
+/// above 0); :90, :229-238 (HARD's damage shrinks below 50 %). The failure
+/// times are [`MISSED`] after the note, this evaluator's convention.
 #[test]
 fn ex_hard_fails_at_the_seventh_poor_and_hazard_at_the_first() {
     let times: Vec<i64> = (0..10).map(|k| T + k * 1_000 * MS).collect();
@@ -545,6 +683,14 @@ fn ex_hard_fails_at_the_seventh_poor_and_hazard_at_the_first() {
     let e = play(&chart, Vec::new());
     assert_eq!(e.gauges[EX_HARD].failed_at, miss(6));
     assert_eq!(e.gauges[HAZARD].failed_at, miss(0));
+    // HARD survives the ten: −10 % down to 40 %, then −8 % (× 0.8 below
+    // 50 %), −7 %, −6 % and −5 %.
+    let hard: Vec<i64> = e.gauges[HARD].history.iter().map(|p| p.value.0).collect();
+    assert_eq!(
+        hard,
+        [90, 80, 70, 60, 50, 40, 32, 25, 19, 14].map(|p| p * PCT)
+    );
+    assert!(e.gauges[HARD].cleared);
     // A PERFECT on the last note does not bring them back.
     let e = play(&chart, tap_at(T + 9_000 * MS));
     for g in [EX_HARD, HAZARD] {
@@ -620,9 +766,9 @@ fn a_held_mine_damages_one_percent_per_unit() {
     assert_eq!(gauge(&e, HARD), 100 * PCT);
 }
 
-/// Source: play/BMSPlayerRule.java:75-78, :85 and jbms-parser
-/// BMSModel.java:75,79: without `#TOTAL` it is at least 260, the value used
-/// here (the preset module's E).
+/// Source: play/BMSPlayerRule.java:68-78, :85 and jbms-parser
+/// BMSModel.java:75,79: without `#TOTAL` it is `max(260, 7.605 N / (0.01 N
+/// + 6.5))`, 260 for 4 notes (more in `total_scaling_matches_the_source`).
 #[test]
 fn absent_total_is_260() {
     // 260 % over 4 notes: a GOOD adds 32.5 %.
@@ -655,6 +801,155 @@ fn zero_total_after_a_total() {
     };
     let custom = evaluate(&chart, &input, &rules::custom()).unwrap();
     assert_eq!(custom.gauges[0].history[0].value.0, 60 * PCT);
+}
+
+// ------------------------------------------------- gauges from a set value
+
+/// The one target of [`from_values`]'s section.
+const TARGET: i64 = 11_000 * MS;
+
+/// A chart of `n` judgeable notes, at `#RANK 3`: a tap on key 1 at
+/// [`TARGET`], the one note of [`from_values`]'s section, and `n − 1` taps on
+/// key 3 from 30 s, 10 ms apart, which no section reaches; with `#TOTAL` in
+/// thousandths when given.
+fn one_target(n: i64, total: Option<i64>) -> Chart {
+    let mut b = ChartBuilder::new(BPM).tap(lane(1), TimeUs(TARGET));
+    for k in 0..n - 1 {
+        b = b.tap(lane(3), TimeUs(30_000 * MS + k * 10 * MS));
+    }
+    let mut chart = with_rank(b.build().unwrap(), Some(common::rank(3)));
+    chart.meta.judgment_headers.extend(total.map(common::total));
+    chart
+}
+
+/// The section [10 s, 20 s) of `chart` played from the preset's start
+/// values, each `(gauge, value)` of `set` replacing one, with `events`.
+fn from_values(chart: &Chart, set: &[(usize, i64)], events: Vec<PhysicalInputEvent>) -> Evaluation {
+    let preset = rules::beatoraja_style();
+    let mut initial: Vec<GaugeValue> = preset.gauges.iter().map(|g| g.start).collect();
+    for &(g, v) in set {
+        initial[g] = GaugeValue(v);
+    }
+    let input = EvalInput {
+        events,
+        device: device(&[0]),
+        start: InputStart::default(),
+        finalized: None,
+        section: Some(Section {
+            start: TimeUs(10_000 * MS),
+            end: TimeUs(20_000 * MS),
+            lead_in: TimeUs(2_000 * MS),
+            initial_gauges: initial,
+        }),
+    };
+    let e = evaluate(chart, &input, &preset).unwrap();
+    assert!(e.completed);
+    e
+}
+
+/// Source: play/GaugeProperty.java:90 (HARD's guts `{10, 0.4}, {20, 0.5},
+/// {30, 0.6}, {40, 0.7}, {50, 0.8}`), play/GrooveGauge.java:229-238 (a
+/// negative change is multiplied by the first band whose bound the value
+/// before it is strictly below), :207-211 (the six values include the MS),
+/// :218-222 (then clamped; a gauge at 0 never changes again).
+#[test]
+fn hard_guts_bands_match_the_source() {
+    let chart = one_target(2, None);
+    // A BAD (−5 %) from each side of each band's bound.
+    for (before, after) in [
+        (5_000_000, 4_500_000),
+        (4_999_999, 4_599_999),
+        (4_000_000, 3_600_000),
+        (3_999_999, 3_649_999),
+        (3_000_000, 2_650_000),
+        (2_999_999, 2_699_999),
+        (2_000_000, 1_700_000),
+        (1_999_999, 1_749_999),
+        (1_000_000, 750_000),
+        (999_999, 799_999),
+    ] {
+        let e = from_values(&chart, &[(HARD, before)], tap_at(TARGET + 200 * MS));
+        assert_eq!(judged_at(&e), [(TARGET + 200 * MS, Bad)]);
+        assert_eq!(gauge(&e, HARD), after, "from {before}");
+    }
+    // A POOR (−10 %) and an empty POOR (−5 %) take the band too: × 0.4.
+    let e = from_values(&chart, &[(HARD, 999_999)], Vec::new());
+    assert_eq!(judged_at(&e), [(TARGET + MISSED, Poor)]);
+    assert_eq!(gauge(&e, HARD), 599_999);
+    let e = from_values(&chart, &[(HARD, 999_999)], tap_at(TARGET - 400 * MS));
+    assert_eq!(empty_poors(&e.events), 1);
+    assert_eq!(e.gauges[HARD].history[0].value.0, 799_999);
+    // The other gauges have no bands: EX HARD at 9.99999 % loses the full
+    // 8 % for a BAD.
+    let e = from_values(&chart, &[(EX_HARD, 999_999)], tap_at(TARGET + 200 * MS));
+    assert_eq!(gauge(&e, EX_HARD), 199_999);
+    // 1 % less 2 % is clamped to 0, and HARD fails.
+    let e = from_values(&chart, &[(HARD, PCT)], tap_at(TARGET + 200 * MS));
+    assert_eq!(gauge(&e, HARD), 0);
+    assert_eq!(e.gauges[HARD].failed_at, Some(TimeUs(TARGET + 200 * MS)));
+}
+
+/// Source: play/GaugeProperty.java:90-91 (HARD and EX HARD take
+/// `LIMIT_INCREMENT`), play/GrooveGauge.java:264-270 (an increase × `max(0,
+/// min(0.15, (2 × TOTAL − 320) / notes)) / 0.15`), :207-211 (once per
+/// chart), play/BMSPlayerRule.java:68-78, :85 (`#TOTAL` absent: `max(260,
+/// 7.605 × notes / (0.01 × notes + 6.5))`, from the whole chart's notes),
+/// :260 (NORMAL's increases × `TOTAL / notes`). The gauge arithmetic is this
+/// evaluator's (a known difference): each change rounded down to
+/// 1/100000 %, the default `#TOTAL` to thousandths.
+#[test]
+fn total_scaling_matches_the_source() {
+    let set = [(HARD, 50 * PCT), (EX_HARD, 50 * PCT)];
+    let rise = |e: &Evaluation, g: usize| gauge(e, g) - 50 * PCT;
+    // A PERFECT's increase on HARD and EX HARD: nothing up to #TOTAL 160,
+    // 8/15 of it at #TOTAL 200 over 1000 notes, all of it while 2 × TOTAL −
+    // 320 is at least 0.15 per note, and 3200/3201 of it just past that.
+    for (n, total, increase) in [
+        (1_000, Some(90_000), 0),
+        (1_000, Some(159_999), 0),
+        (1_000, Some(160_000), 0),
+        (1_000, Some(200_000), 8_000),
+        (2_133, Some(320_000), 15_000),
+        (2_134, Some(320_000), 14_995),
+        // Without #TOTAL: 460.909 over 1000 notes, 697.238 over 7164, the
+        // fewest notes whose default limits the increase (268619/268650).
+        (1_000, None, 15_000),
+        (7_164, None, 14_998),
+    ] {
+        let e = from_values(&one_target(n, total), &set, tap_at(TARGET));
+        assert_eq!(judged_at(&e), [(TARGET, Perfect)]);
+        assert_eq!(
+            [rise(&e, HARD), rise(&e, EX_HARD)],
+            [increase; 2],
+            "{n} notes, #TOTAL {total:?}"
+        );
+    }
+    // GREAT and GOOD scale alike: HARD +0.12 % and +0.03 %, EX HARD +0.06 %
+    // and 0, × 8/15.
+    let chart = one_target(1_000, Some(200_000));
+    let e = from_values(&chart, &set, tap_at(TARGET + 40 * MS));
+    assert_eq!([rise(&e, HARD), rise(&e, EX_HARD)], [6_400, 3_200]);
+    let e = from_values(&chart, &set, tap_at(TARGET + 100 * MS));
+    assert_eq!([rise(&e, HARD), rise(&e, EX_HARD)], [1_600, 0]);
+    // Damage is not limited: a BAD at #TOTAL 90 is −5 % and −8 % from 100 %.
+    let e = from_values(
+        &one_target(1_000, Some(90_000)),
+        &[],
+        tap_at(TARGET + 200 * MS),
+    );
+    assert_eq!([gauge(&e, HARD), gauge(&e, EX_HARD)], [95 * PCT, 92 * PCT]);
+    // NORMAL's PERFECT from 20 % adds the default #TOTAL over the notes:
+    // 260 up to 337 notes, then 260.171 for 338, 460.909 for 1000; a
+    // #TOTAL below 160 counts as it is.
+    for (n, total, increase) in [
+        (337, None, 77_151),
+        (338, None, 76_973),
+        (1_000, None, 46_090),
+        (1_000, Some(90_000), 9_000),
+    ] {
+        let e = from_values(&one_target(n, total), &[], tap_at(TARGET));
+        assert_eq!(gauge(&e, NORMAL) - 20 * PCT, increase, "{n} notes");
+    }
 }
 
 // ------------------------------------------------------------ lane classes
