@@ -4,7 +4,7 @@
 
 mod play_support;
 
-use bms_model::{Chart, ChartBuilder, TimeUs};
+use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind};
 use play_support::{
     GAUGES, Harness, MS, bool_program, empty_poor, ev, full, gauge, hold_ended, judged, lane,
@@ -46,7 +46,7 @@ fn script_chart() -> Chart {
         .unwrap()
 }
 
-/// Fourteen effects, every kind.
+/// Fifteen effects, every kind.
 fn script() -> Vec<JudgeEvent> {
     use Judgment::{Bad, Good, Great, Perfect, Poor};
     vec![
@@ -62,6 +62,13 @@ fn script() -> Vec<JudgeEvent> {
         ev(1_700, judged(6, 0, Poor, None, None, 0)),
         ev(1_700, gauge(0, pct(98))),
         ev(1_750, mine(7, 4_000)),
+        ev(
+            2_000,
+            JudgeEventKind::PlaySound {
+                lane: lane(1),
+                sound: SoundId(0),
+            },
+        ),
         ev(2_000, judged(1, 0, Perfect, Some(0), None, 1)),
         ev(2_500, JudgeEventKind::SongEnd),
     ]
@@ -90,7 +97,7 @@ const M7: u16 = 47 + 7;
 
 /// After each prefix of the script: the effect-sourced timers that are on
 /// (slot, start ms).
-const EXPECTED: [&[(u16, i64)]; 15] = [
+const EXPECTED: [&[(u16, i64)]; 16] = [
     &[],
     &[(J, 500), (JP, 500), (UP, 500), (B3, 500)],
     &[
@@ -183,6 +190,15 @@ const EXPECTED: [&[(u16, i64)]; 15] = [
         (B2, 1_000),
         (B5, 1_400),
         (M0, 1_050),
+    ],
+    &[
+        (J, 1_700),
+        (JPO, 1_700),
+        (B3, 500),
+        (B2, 1_000),
+        (B5, 1_400),
+        (M0, 1_050),
+        (M7, 1_750),
     ],
     &[
         (J, 1_700),
