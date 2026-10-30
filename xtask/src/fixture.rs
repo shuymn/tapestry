@@ -62,6 +62,10 @@ pub fn baseline() -> Vec<Crate> {
              rules = { path = \"../rules\" }\n\
              rules-toml = { path = \"../rules-toml\" }\n",
         ),
+        lib(
+            "library",
+            "[dependencies]\nbms-parser = { path = \"../bms-parser\" }\n",
+        ),
         (
             "player",
             "[package.metadata.tapestry]\nwindows-only = true\n\

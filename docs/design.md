@@ -685,6 +685,9 @@ Input capacity and the memory behind it are fixed when recording opens, from the
 
 - Key sounds are decoded in parallel on multiple threads. Converted PCM is cached on disk, keyed by file hash, conversion settings, and decoder version. Retries reuse the data in memory. First load and retry are measured separately.
 - A library of tens of thousands of songs is stored in SQLite, and only files whose modification time or size changed are re-read. Search uses FTS5, and scanning runs in the background.
+- The database (`library` crate) is `library.db` under the data root, in WAL mode: the scan's writer thread owns the one writer connection, and the thread that queries it owns one reader. Its schema version is `PRAGMA user_version`; a file of any other version is deleted with its `-wal` and `-shm` files and rebuilt by a full scan, since everything in it is derived, and only the version is read from the old file. `charts` holds each file's path, size, modification time, SHA-256, MD5 and descriptive header; `roots` holds the roots of the latest scan.
+- A scan is a walker thread listing `.bms`, `.bme` and `.bml` files (not following directory links), two parser threads reading each changed file (the loader's 16 MiB cap, SHA-256, MD5 and `bms_parser::read_header`, which keeps only the descriptive header commands outside `#IF` and `#SWITCH` blocks, draws no `#RANDOM` and computes no time), and a writer committing in batches of 256. Rows of files that are gone, and of roots no longer configured, are removed; the rows under a folder that cannot be listed (an unplugged drive) stay. Files over the cap, unreadable files and paths that are not Unicode are skipped and counted.
+- Choosing a chart pauses the scan: no thread starts another read, the parsers finish the file in hand, the writer commits it, and then the pause is acknowledged; nothing is read or committed until it is released. Every queue is bounded, and dropping a scan stops and joins its threads. A start hook runs first on each scan thread, so `player` can put them in background mode and the crate stays free of Windows code.
 
 ### Measurement
 
@@ -1024,6 +1027,7 @@ Rust is recommended as the core language. The evaluator can be shared between th
 | L2 | `replay` | Input log and replay formats |
 | L3 | `input`, `audio` | Raw Input/HID/MIDI, WASAPI/ASIO and the mixer |
 | L4 | `game` | Logic thread, session policy, publishing the state snapshot |
+| L4 | `library` | The library database (SQLite) and its background scan; `game` does not depend on it, and the caller hands it the roots |
 | L5 | `render`, `skin-*`, `ui` | wgpu rendering, the adapter for each skin, egui screens |
 | apps | `player`, `eval-cli` | The player itself, and a headless CLI that evaluates replays |
 | Later | `ir-server`, `pkg` | IR server (shares `eval`), distribution registry and installer |
@@ -1038,7 +1042,7 @@ Windows-dependent code is confined to `input`, `audio`, `render`, and `player`. 
 
 ### Licenses
 
-The license follows the layer. L0 through L2 (`bms-model`, `bms-parser`, `rules`, `rules-toml`, `eval`, `replay`), `eval-cli`, and the development tooling (`xtask`) are `MIT OR Apache-2.0`. L3 and above (`input`, `audio`, `game`, `render`, `skin-*`, `ui`) and `player` are `GPL-3.0-or-later`. The fuzz targets (`fuzz`, outside the workspace) are also GPL, because they link `input`; they are tooling and never shipped. The license of `ir-server` and `pkg` is decided when they are built.
+The license follows the layer. L0 through L2 (`bms-model`, `bms-parser`, `rules`, `rules-toml`, `eval`, `replay`), `eval-cli`, and the development tooling (`xtask`) are `MIT OR Apache-2.0`. L3 and above (`input`, `audio`, `game`, `library`, `render`, `skin-*`, `ui`) and `player` are `GPL-3.0-or-later`. The fuzz targets (`fuzz`, outside the workspace) are also GPL, because they link `input`; they are tooling and never shipped. The license of `ir-server` and `pkg` is decided when they are built.
 
 - **Why split:** The game itself is copyleft so that a modified player cannot be redistributed with its source closed. Chart loading, the evaluator, and the replay format stay permissive so that other players, tools, and IR servers can load charts and verify replays with the same code. This means the judgment logic can be reused in closed products; that is accepted. The license does not lower the trademark, trade dress, or patent risk of a game modeled on a commercial one; that is handled by what goes into the code (the banned-word list, no copied assets).
 - **One-way dependencies:** A permissive crate never depends on a GPL crate, for any dependency kind. The layer order already guarantees this. `cargo xtask check-arch` (R4) enforces it, and also checks each crate's `license` against an explicit crate-to-license table, so a crate missing from the table or carrying the other license fails. The workspace has no default license, so a new crate has to choose.
