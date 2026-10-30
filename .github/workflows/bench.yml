@@ -1,9 +1,11 @@
 name: Bench
 
-# The CPU benchmarks of `eval` and `bms-parser` on the merge base and on the
-# head, in one job on one runner, with criterion's change estimates printed
-# at the end (docs/setup.md "Benchmarks"). It is not a required check and
-# never fails: shared runners are noisy, so a reviewer reads the numbers.
+# The CPU benchmarks on the merge base and on the head, each crate group in
+# one job on one runner, with criterion's change estimates printed at the end
+# (docs/setup.md "Benchmarks"). `compare` runs `eval` and `bms-parser` on
+# Linux, `compare-render` runs `render` on Windows. Neither is a required
+# check and neither fails the run: shared runners are noisy, so a reviewer
+# reads the numbers.
 
 on:
   pull_request:
@@ -69,18 +71,79 @@ jobs:
           else
             echo "::warning::The benchmarks of the merge base failed."
           fi
+      # `--baseline-lenient` lets a benchmark the merge base lacks run
+      # without a comparison, and `--no-fail-fast` keeps one failing
+      # executable from hiding the others; whatever was captured is printed
+      # even after a failure.
       - name: Benchmark the head against it
         if: steps.base.outputs.saved == 'true'
         run: |
           set -o pipefail
-          if mise exec -- cargo bench -p eval -p bms-parser --bench evaluate --bench load -- --baseline base 2>&1 | tee "$RUNNER_TEMP/bench.log"; then
-            {
-              echo '### Benchmarks: head against merge base'
-              echo 'Shared runners fluctuate; read a change as real only when it is large and repeats.'
-              echo '```'
-              grep -v '^Benchmarking ' "$RUNNER_TEMP/bench.log"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          mise exec -- cargo bench --no-fail-fast -p eval -p bms-parser --bench evaluate --bench load -- --baseline-lenient base 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
+          {
+            echo '### Benchmarks: head against merge base'
+            echo 'Shared runners fluctuate; read a change as real only when it is large and repeats.'
+            echo '```'
+            grep -v '^Benchmarking ' "$RUNNER_TEMP/bench.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::The benchmarks of the head failed (exit $status); the results above are partial."
+          fi
+
+  compare-render:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    continue-on-error: true
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_EXEC_AUTO_INSTALL: "false"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.3
+          install: true
+          install_args: rust
+          cache: true
+      - name: Benchmark the merge base
+        id: base
+        run: |
+          base=$(git merge-base origin/main HEAD)
+          echo "merge base $base, head $(git rev-parse HEAD)"
+          git worktree add --detach "$RUNNER_TEMP/base" "$base"
+          if [ ! -f "$RUNNER_TEMP/base/crates/render/benches/skin.rs" ]; then
+            echo "::notice::The merge base has no render benchmark; there is nothing to compare."
+            exit 0
+          fi
+          if mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" -p render --bench skin -- --save-baseline base; then
+            echo "saved=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::The benchmarks of the head failed."
+            echo "::warning::The render benchmark of the merge base failed."
+          fi
+      - name: Benchmark the head against it
+        if: steps.base.outputs.saved == 'true'
+        run: |
+          set -o pipefail
+          status=0
+          mise exec -- cargo bench --no-fail-fast -p render --bench skin -- --baseline-lenient base 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
+          {
+            echo '### Render benchmark: head against merge base'
+            echo 'Shared runners fluctuate; read a change as real only when it is large and repeats.'
+            echo '```'
+            grep -v '^Benchmarking ' "$RUNNER_TEMP/bench.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::The render benchmark of the head failed (exit $status); the results above are partial."
           fi

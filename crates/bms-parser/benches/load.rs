@@ -1,4 +1,4 @@
-//! CPU benchmark of the loader (docs/stage2.md D21): loading generated BMS
+//! CPU benchmark of the loader (design.md "Measurement"): loading generated BMS
 //! text with many BPM changes. The text is built here; the sound folder is a
 //! temporary one holding the single sound the text names.
 

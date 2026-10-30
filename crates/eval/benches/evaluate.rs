@@ -1,4 +1,4 @@
-//! CPU benchmarks of the evaluator (docs/stage2.md D21): batch evaluation of
+//! CPU benchmarks of the evaluator (design.md "Measurement"): batch evaluation of
 //! generated 2,000- and 10,000-note charts with dense input, and the same
 //! play advanced live in 1 ms steps. Charts and input are built here.
 

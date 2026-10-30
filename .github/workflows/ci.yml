@@ -55,7 +55,7 @@ jobs:
       # Runs each benchmark once so it keeps building and running
       # (docs/setup.md "Benchmarks"); bench.yml measures.
       - name: Benchmarks run once
-        run: mise exec -- cargo bench --locked -p render -- --test
+        run: mise exec -- cargo bench --locked -p render --bench skin -- --test
       - name: Production build
         run: mise exec -- cargo build --release --locked -p player --no-default-features
       # The allocation contracts also hold with optimizations (design.md
@@ -132,7 +132,7 @@ jobs:
       # Runs each benchmark once so it keeps building and running
       # (docs/setup.md "Benchmarks"); bench.yml measures.
       - name: Benchmarks run once
-        run: mise exec -- cargo bench --locked -p eval -p bms-parser -- --test
+        run: mise exec -- cargo bench --locked -p eval -p bms-parser --bench evaluate --bench load -- --test
       # The allocation contracts also hold with optimizations (design.md
       # "Scope of No Allocation").
       - name: Allocation tests (release)

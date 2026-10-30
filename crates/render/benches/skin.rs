@@ -1,4 +1,4 @@
-//! CPU benchmark of the simple skin (docs/stage2.md D21): `SimpleSkin::build`
+//! CPU benchmark of the simple skin (design.md "Measurement"): `SimpleSkin::build`
 //! on a dense frame, without a GPU. The chart is built here and the frame
 //! helpers are the WARP tests'.
 
