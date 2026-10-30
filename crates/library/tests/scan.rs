@@ -271,7 +271,11 @@ fn other_schema_version_is_rebuilt() {
 
     let (lib, opened) = fx.open();
     assert_eq!(opened, Opened::Rebuilt { old_version: 7 });
-    assert!(opened.to_string().contains("schema version 7 is not 1"));
+    assert!(
+        opened
+            .to_string()
+            .contains(&format!("schema version 7 is not {SCHEMA_VERSION}"))
+    );
     assert_ne!(fs::read(beside("-wal")).unwrap_or_default(), stale_wal);
     assert_eq!(lib.charts().unwrap(), Vec::new());
     let report = scan(&lib, std::slice::from_ref(&fx.root));

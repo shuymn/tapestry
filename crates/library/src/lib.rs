@@ -2,15 +2,26 @@
 //! chart file under the configured roots, with its size, modification time,
 //! file hashes and descriptive header, kept current by a background [`Scan`].
 //!
-//! # Schema version 1
+//! # Schema version 2
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
 //! - `roots(id, path UNIQUE)`: the roots of the latest scan.
 //! - `charts(id, root, path UNIQUE, size, mtime_ns, sha256, md5, title,
-//!   subtitle, artist, subartist, genre, playlevel, difficulty, bpm)`: the
-//!   header values as [`bms_parser::read_header`] reads them, `NULL` when
-//!   undeclared.
+//!   subtitle, artist, subartist, genre, playlevel, difficulty, bpm,
+//!   norm_text, title_key, artist_key, folder)`: the header values as
+//!   [`bms_parser::read_header`] reads them, `NULL` when undeclared; the
+//!   searched fields normalized and joined ([`Search`]); the normalized
+//!   title and artist, by which [`Sort::Title`] and [`Sort::Artist`] order;
+//!   and the folder of the path, by which [`Search::by_folder`] groups.
+//!   Indexed by `root`, and by `(title_key IS NULL, title_key, path)`, the
+//!   [`Sort::Title`] order, so an unfiltered list reads only the rows it
+//!   returns.
+//! - `charts_fts(norm_text)`: an FTS5 trigram index of `charts.norm_text`,
+//!   kept in the same transactions as `charts` by triggers.
+//!
+//! A change of [`Search`]'s normalization changes what the stored text
+//! means, so it bumps the version too.
 //!
 //! Everything in the database is derived from the chart files, so a file of
 //! any other version is deleted with its `-wal` and `-shm` files and created
@@ -40,6 +51,7 @@
 
 mod db;
 mod scan;
+mod search;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -52,9 +64,10 @@ use rusqlite::Connection;
 
 pub use bms_parser::Header;
 pub use scan::{BATCH, HEADER_FIELD_BYTES, Scan, ScanError, ScanOptions, ScanReport, ThreadStart};
+pub use search::{SEPARATOR, Search, Sort};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -312,6 +325,20 @@ impl Library {
     /// [`LibraryError::Database`] when SQLite refuses the query.
     pub fn charts(&self) -> Result<Vec<ChartEntry>, LibraryError> {
         db::charts(&self.reader).map_err(|source| LibraryError::Database {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    /// The charts `search` finds, in its order, at most its limit. The query
+    /// runs on the reader connection and reads the last batch a running
+    /// scan committed; it takes no lock the scan waits for.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn search(&self, search: &Search<'_>) -> Result<Vec<ChartEntry>, LibraryError> {
+        search::run(&self.reader, search).map_err(|source| LibraryError::Database {
             path: self.path.clone(),
             source,
         })
