@@ -1620,3 +1620,181 @@ fn bms_ingest_leaves_missing_sounds_to_the_sound_table() {
         .collect();
     assert_eq!(missing, ["snare.wav", "hat.wav"]);
 }
+
+/// The custom preset with the BAD window `ms` each side: its final deadline
+/// is the last note plus `ms`.
+fn bad_edge(ms: i64) -> rules::RulePreset {
+    let mut p = rules::custom();
+    p.id = format!("bad-{ms}");
+    p.windows.bad = rules::Window::symmetric(ms * MS);
+    p
+}
+
+/// Re-evaluates `report`'s record of `chart` under `preset`.
+fn under(
+    report: &PlayReport,
+    chart: &Chart,
+    preset: &rules::RulePreset,
+) -> replay::verify::ReEvaluation {
+    let custom = rules::custom();
+    let ctx = game::ResultContext {
+        record: report.record.as_ref().unwrap(),
+        chart,
+        preset: &custom,
+        live: &report.live,
+    };
+    ReEvaluate::under(&ctx, preset).unwrap()
+}
+
+/// When `events` reach the final deadline.
+fn song_end(events: &[eval::JudgeEvent]) -> Option<TimeUs> {
+    events
+        .iter()
+        .find(|e| e.kind == eval::JudgeEventKind::SongEnd)
+        .map(|e| e.time)
+}
+
+fn all_cleared(e: &eval::Evaluation) -> bool {
+    e.gauges.iter().all(|g| g.cleared)
+}
+
+#[test]
+fn as_played_matches_live() {
+    use replay::verify::Coverage;
+    let chart = taps(&NOTES);
+    // Played to the end, and retried at 1.5 s.
+    for retry in [None, Some(1_500 * MS)] {
+        let (_dir, root) = temp_root();
+        let mut s = session(&root, &chart, &Events::default());
+        let mut items = vec![connect(0)];
+        items.extend(presses(&NOTES));
+        let commands: Vec<_> = retry.map(|t| (t, Command::Retry)).into_iter().collect();
+        let one = s.play(script(items, &commands)).unwrap();
+        let (end, watermark) = status(&one);
+        let r = under(&one, &chart, &rules::custom());
+        assert!(r.as_played);
+        assert_eq!(r.evaluation.events, one.live, "retry {retry:?}");
+        assert_eq!(r.evaluation.tally, one.tally);
+        if retry.is_none() {
+            assert_eq!(end, EndStatus::PlayedToEnd);
+            assert_eq!(r.coverage, Coverage::Recorded);
+            assert!(r.evaluation.completed && all_cleared(&r.evaluation));
+        } else {
+            assert_eq!(end, EndStatus::EndedMidway);
+            assert_eq!(r.coverage, Coverage::EndedMidway(watermark));
+            assert!(!r.evaluation.completed);
+        }
+    }
+}
+
+/// A play of taps at 1 s and 60 s, both hit on time, under the custom
+/// preset, played to the end.
+fn sixty_seconds() -> (Chart, PlayReport) {
+    let notes = [(1, 1_000), (2, 60_000)];
+    let chart = taps(&notes);
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &chart, &Events::default());
+    let mut items = vec![connect(0)];
+    items.extend(presses(&notes));
+    let one = s.play(script(items, &[])).unwrap();
+    assert_eq!(one.end, PlayEnd::Completed);
+    // The custom preset's late BAD edge, 180 ms, puts the final deadline
+    // at 60.180 s, and the recording ends there, within a step.
+    assert_eq!(song_end(&one.live), Some(TimeUs(60_180 * MS)));
+    let (_, watermark) = status(&one);
+    assert!(
+        (TimeUs(60_180 * MS)..TimeUs(60_181 * MS)).contains(&watermark),
+        "{watermark:?}"
+    );
+    (chart, one)
+}
+
+#[test]
+fn what_if_with_a_later_final_deadline_completes_and_clears() {
+    use replay::verify::Coverage;
+    let (chart, one) = sixty_seconds();
+    let (_, watermark) = status(&one);
+    // A 220 ms edge: the final deadline is 60.220 s, after the recording.
+    let r = under(&one, &chart, &bad_edge(220));
+    assert!(!r.as_played);
+    assert!(r.evaluation.completed);
+    assert!(all_cleared(&r.evaluation));
+    assert_eq!(song_end(&r.evaluation.events), Some(TimeUs(60_220 * MS)));
+    assert_eq!(r.coverage, Coverage::NoInputAfter(watermark));
+    assert_eq!(r.evaluation.tally.counts.perfect, 2);
+}
+
+#[test]
+fn what_if_with_an_equal_or_earlier_final_deadline_is_covered_by_the_recording() {
+    use replay::verify::Coverage;
+    let (chart, one) = sixty_seconds();
+    // Another preset with the same 180 ms edge, and one with 150 ms.
+    let mut equal = bad_edge(180);
+    equal.windows.great = rules::Window::symmetric(50 * MS);
+    for (preset, end) in [(equal, 60_180), (bad_edge(150), 60_150)] {
+        let r = under(&one, &chart, &preset);
+        assert!(!r.as_played);
+        assert!(r.evaluation.completed && all_cleared(&r.evaluation));
+        assert_eq!(song_end(&r.evaluation.events), Some(TimeUs(end * MS)));
+        assert_eq!(r.coverage, Coverage::Recorded, "{}", preset.id);
+    }
+}
+
+#[test]
+fn what_if_of_an_aborted_play_stops_at_the_watermark() {
+    use replay::verify::Coverage;
+    // Taps at 1 s and 2 s hit on time; retried at 2.170 s, before the
+    // custom preset's final deadline at 2.180 s.
+    let notes = [(1, 1_000), (2, 2_000)];
+    let chart = taps(&notes);
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &chart, &Events::default());
+    let mut items = vec![connect(0)];
+    items.extend(presses(&notes));
+    let one = s
+        .play(script(items, &[(2_170 * MS, Command::Retry)]))
+        .unwrap();
+    let (end, watermark) = status(&one);
+    assert_eq!(end, EndStatus::EndedMidway);
+    assert!(
+        (TimeUs(2_150 * MS)..TimeUs(2_170 * MS)).contains(&watermark),
+        "{watermark:?}"
+    );
+    // Under 220 ms the final deadline (2.220 s) is beyond the watermark:
+    // not complete. Under 150 ms it (2.150 s) is before it: complete, but
+    // an aborted play still clears nothing.
+    for (ms, completed) in [(220, false), (150, true)] {
+        let r = under(&one, &chart, &bad_edge(ms));
+        assert!(!r.as_played);
+        assert_eq!(r.coverage, Coverage::EndedMidway(watermark));
+        assert_eq!(r.evaluation.completed, completed, "{ms} ms");
+        assert!(r.evaluation.gauges.iter().all(|g| !g.cleared), "{ms} ms");
+        assert!(r.evaluation.events.iter().all(|e| e.time <= watermark));
+        assert_eq!(r.evaluation.tally.counts.perfect, 2);
+    }
+}
+
+#[test]
+fn under_checks_the_evaluator_version_first() {
+    let chart = taps(&NOTES);
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &chart, &Events::default());
+    let mut items = vec![connect(0)];
+    items.extend(presses(&NOTES));
+    let one = s.play(script(items, &[])).unwrap();
+    let mut record = one.record.clone().unwrap();
+    record.versions.evaluator = 3;
+    let custom = rules::custom();
+    let ctx = game::ResultContext {
+        record: &record,
+        chart: &chart,
+        preset: &custom,
+        live: &one.live,
+    };
+    for preset in [custom.clone(), bad_edge(220)] {
+        assert_eq!(
+            ReEvaluate::under(&ctx, &preset).map(|_| ()),
+            Err(game::ReEvaluationError::UnsupportedEvaluator(3))
+        );
+    }
+}

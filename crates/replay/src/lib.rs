@@ -42,6 +42,7 @@
 
 mod error;
 mod record;
+pub mod verify;
 mod wire;
 
 use bms_model::{ChartIdentity, Lane, TimeUs};
@@ -55,8 +56,8 @@ use sha2::{Digest, Sha256};
 pub use error::{DecodeError, Section};
 pub use record::{
     Arrival, BuildProvenance, ChartRecord, DeviceKind, DeviceRecord, EndStatus, Incomplete,
-    PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, TransformRecord,
-    Versions,
+    PASSTHROUGH, PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status,
+    TransformId, TransformRecord, Versions,
 };
 
 use wire::{Reader, Writer};

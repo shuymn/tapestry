@@ -5,7 +5,7 @@ use std::path::Path;
 
 use bms_model::Chart;
 use bms_parser::{LoadError, LoadOptions, WarningKind};
-use replay::TransformRecord;
+pub use replay::TransformId;
 
 /// A chart read by an ingestion adapter, in the common chart model.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,27 +77,6 @@ impl ChartIngest for BmsIngest {
     }
 }
 
-/// Which transform was applied: its id and the version of its rules, as
-/// the input log records them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TransformId {
-    /// The transform's id.
-    pub id: &'static str,
-    /// The version of its rules; a change of output bumps it.
-    pub version: u32,
-}
-
-impl TransformId {
-    /// The form the input log stores.
-    #[must_use]
-    pub fn record(self) -> TransformRecord {
-        TransformRecord {
-            id: self.id.to_owned(),
-            version: self.version,
-        }
-    }
-}
-
 /// The chart transformation extension point: changes the resolved chart
 /// before evaluation (later RANDOM or MIRROR options). Any randomness comes
 /// from `seed`, which is recorded. A note moved in time moves its display
@@ -116,10 +95,7 @@ pub struct Passthrough;
 
 impl ChartTransform for Passthrough {
     fn id(&self) -> TransformId {
-        TransformId {
-            id: "passthrough",
-            version: 1,
-        }
+        replay::PASSTHROUGH
     }
 
     fn apply(&self, chart: Chart, _seed: u64) -> Chart {

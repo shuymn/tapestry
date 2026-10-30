@@ -51,6 +51,41 @@ pub struct TransformRecord {
     pub version: u32,
 }
 
+/// Which transform was applied: its id and the version of its rules, as
+/// the code names it; [`record`](Self::record) gives the form the input log
+/// stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransformId {
+    /// The transform's id.
+    pub id: &'static str,
+    /// The version of its rules; a change of output bumps it.
+    pub version: u32,
+}
+
+impl TransformId {
+    /// The form the input log stores.
+    #[must_use]
+    pub fn record(self) -> TransformRecord {
+        TransformRecord {
+            id: self.id.to_owned(),
+            version: self.version,
+        }
+    }
+
+    /// Whether `record` names this transform at this version.
+    #[must_use]
+    pub fn is(self, record: &TransformRecord) -> bool {
+        record.id == self.id && record.version == self.version
+    }
+}
+
+/// The pass-through transform, which returns the chart unchanged: the only
+/// transform verification knows (design.md "Determinism").
+pub const PASSTHROUGH: TransformId = TransformId {
+    id: "passthrough",
+    version: 1,
+};
+
 /// The preset a play was evaluated under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresetRecord {

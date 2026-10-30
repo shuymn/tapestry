@@ -1713,10 +1713,12 @@ name = "replay"
 version = "0.0.0"
 dependencies = [
  "bms-model",
+ "bms-parser",
  "eval",
  "proptest",
  "rules",
  "sha2",
+ "tempfile",
  "thiserror 2.0.21",
  "zstd",
 ]
