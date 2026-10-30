@@ -49,6 +49,14 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         // Before the third play another chart.s sounds are loaded: the
         // audio thread swaps them in and hands the old ones back.
         if play == 2 {
+            // First one that times out while the audio thread stalls: the
+            // thread takes it late, in a counted step, and its answer is
+            // freed by the next load, on the game thread.
+            assert_eq!(
+                control.load(bank(&chart), chart.bgm.clone()),
+                Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+            );
+            steps(&mut worker, 1);
             let next = bank(&chart);
             let schedule = chart.bgm.clone();
             std::thread::scope(|s| {

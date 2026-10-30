@@ -364,3 +364,47 @@ fn a_loaded_bank_replaces_the_previous_charts_sounds() {
         Err(game::AudioLoadError::Wait(game::AudioWaitError::Gone))
     );
 }
+
+/// A load that times out while the audio thread is stalled stays
+/// outstanding: every later load is refused at once and sends nothing, so
+/// the control queue never fills, until the stalled thread answers; that
+/// answer is freed on the game thread with what it replaced, and the next
+/// load goes through.
+#[test]
+fn a_timed_out_load_refuses_others_until_it_is_answered() {
+    use std::sync::Arc;
+
+    let chart = chart();
+    let (mut control, mut worker, mut out) = rig(&chart);
+    let first = Arc::new(audio::SoundBank::from_sounds(RATE, Vec::new()));
+    // The worker is stalled: nothing steps it.
+    assert_eq!(
+        control.load(Arc::clone(&first), Vec::new()),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+    );
+    let started = std::time::Instant::now();
+    for _ in 0..32 {
+        let other = Arc::new(audio::SoundBank::from_sounds(RATE, Vec::new()));
+        assert_eq!(
+            control.load(other, Vec::new()),
+            Err(game::AudioLoadError::Busy)
+        );
+    }
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    // The thread recovers: it takes the timed-out load and answers it.
+    worker.step(&mut out).unwrap();
+    assert!(Arc::ptr_eq(worker.engine().bank(), &first));
+    // The next load frees that answer here, then goes through.
+    let second = Arc::new(audio::SoundBank::from_sounds(RATE, Vec::new()));
+    std::thread::scope(|s| {
+        let load = s.spawn(|| control.load(Arc::clone(&second), Vec::new()));
+        while !load.is_finished() {
+            worker.step(&mut out).unwrap();
+        }
+        load.join().unwrap().unwrap();
+    });
+    assert!(Arc::ptr_eq(worker.engine().bank(), &second));
+    // The first bank's answer and its replacement were freed on this
+    // thread: only the engine holds the first's successor now.
+    assert_eq!(Arc::strong_count(&first), 1);
+}
