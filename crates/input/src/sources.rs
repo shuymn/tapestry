@@ -68,7 +68,8 @@ struct Device {
     /// A controller's axes, from [`SourceSet::add_axes`].
     axes: [AxisCap; MAX_AXES],
     n_axes: usize,
-    /// Each absolute axis's last position, 0 included; `None` until seen.
+    /// Each last position of an axis converted as absolute (`device.toml`'s
+    /// mode, else the declared one), 0 included; `None` until seen.
     positions: [Option<i32>; MAX_AXES],
     /// Its source while it takes part in the open recording.
     source: Option<SourceId>,
@@ -161,6 +162,17 @@ pub struct SourceSet {
     /// Where the configured controller's menu controls go while recording
     /// is closed ([`set_menu`](Self::set_menu)).
     menu: Option<MenuTap>,
+    /// The mode `device.toml` sets for the bound axes of the configured
+    /// controller model ([`set_axis_mode`](Self::set_axis_mode)).
+    axis_mode: Option<AxisMode>,
+}
+
+/// The mode `device.toml` sets for a controller model's bound axes.
+#[derive(Debug)]
+struct AxisMode {
+    product: HidProduct,
+    controls: Vec<ControlId>,
+    relative: bool,
 }
 
 impl SourceSet {
@@ -191,6 +203,7 @@ impl SourceSet {
             batch_at: TimeUs(i64::MIN),
             recording: None,
             menu: None,
+            axis_mode: None,
         })
     }
 
@@ -266,12 +279,14 @@ impl SourceSet {
             .take(device.n_axes)
             .position(|a| a.control == packet.control);
         if let Some(i) = axis {
-            // A relative axis has no position to keep.
+            // An axis converted as relative has no position to keep; one
+            // converted as absolute keeps it for the start snapshot,
+            // whatever it declares.
             #[expect(
                 clippy::indexing_slicing,
                 reason = "`i` is a position below `n_axes`, at most MAX_AXES"
             )]
-            if !device.axes[i].relative {
+            if !resolved_relative(self.axis_mode.as_ref(), device.product, &device.axes[i]) {
                 device.positions[i] = Some(packet.value);
             }
         } else if !track(&mut device.held, max_held, packet.control, packet.value) {
@@ -481,6 +496,33 @@ impl SourceSet {
                 }
             }
         }
+    }
+
+    /// Sets whether the axes `controls` of every controller of `product`
+    /// report movement (`relative`) or position, whatever they declare: the
+    /// mode `device.toml` gives the axes bound to lanes, which their
+    /// conversion uses. Their reports are then filtered in that mode
+    /// ([`axis_relative`](Self::axis_relative)). Set it before the input
+    /// thread starts; it allocates.
+    pub fn set_axis_mode(&mut self, product: HidProduct, controls: Vec<ControlId>, relative: bool) {
+        self.axis_mode = Some(AxisMode {
+            product,
+            controls,
+            relative,
+        });
+    }
+
+    /// Whether the axis `cap` of `device` is taken as relative: the mode
+    /// [`set_axis_mode`](Self::set_axis_mode) sets for it, else the
+    /// declared one.
+    #[must_use]
+    pub fn axis_relative(&self, device: DeviceId, cap: &AxisCap) -> bool {
+        let product = self
+            .devices
+            .iter()
+            .find(|d| d.id == device)
+            .and_then(|d| d.product);
+        resolved_relative(self.axis_mode.as_ref(), product, cap)
     }
 
     /// Sets the axes of the connected `device` that the conversion takes
@@ -870,6 +912,13 @@ impl SourceSet {
 
 /// Updates one control in a device's held list. Returns `false` when a
 /// newly held control does not fit.
+/// Whether the axis `cap` of a device of `product` is converted as
+/// relative: the mode `set` gives it, else the declared one.
+fn resolved_relative(set: Option<&AxisMode>, product: Option<HidProduct>, cap: &AxisCap) -> bool {
+    set.filter(|m| product == Some(m.product) && m.controls.contains(&cap.control))
+        .map_or(cap.relative, |m| m.relative)
+}
+
 fn track(held: &mut Vec<(ControlId, i32)>, max: usize, control: ControlId, value: i32) -> bool {
     match held.iter().position(|&(c, _)| c == control) {
         Some(i) if value == 0 => {

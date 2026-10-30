@@ -399,6 +399,24 @@ fn sources() -> SourceSet {
     SourceSet::new(source_config()).expect("8 sources are within the limit")
 }
 
+/// Has the configured controller's axes bound to lanes filtered in the mode
+/// `device.toml` sets for them, when it sets one, so what is recorded and
+/// what the menu sees are the reports their conversion uses.
+fn axis_mode(sources: &mut SourceSet, device: &game::DeviceSettings) {
+    let (Some(product), Some(relative)) = (device.controller_device, device.scratch.relative)
+    else {
+        return;
+    };
+    let axes = device
+        .controller
+        .lanes
+        .iter()
+        .map(|k| ControlId(k.control))
+        .filter(|&c| input::hid::is_axis(c))
+        .collect();
+    sources.set_axis_mode(product.into(), axes, relative);
+}
+
 /// A loaded session and what its input side starts with.
 struct Prepared {
     loaded: Loaded,
@@ -771,6 +789,10 @@ fn play(
     let raw_input = matches!(mode, Mode::Clock);
     let (mut hook, input) = input_side::link(Arc::clone(&controls), mode, waker.clone());
     let device = &loaded.settings().device;
+    let mut sources = sources;
+    if raw_input {
+        axis_mode(&mut sources, device);
+    }
     let keys = (device.keyboard.retry, device.keyboard.quit);
     let monitor = device.monitor.clone();
     let wake = move |s: &mut SourceSet, now| {
@@ -980,6 +1002,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let mut sources = sources();
     if autoplay {
         sources.set_queue_capacity(0);
+    } else {
+        axis_mode(&mut sources, &settings.device);
     }
     // The configured controller's lane controls drive the select screen;
     // autoplay receives no device.
@@ -1297,7 +1321,54 @@ mod tests {
 
     use input::QpcClock;
 
-    use super::{Controls, Mode, diagnostic, input_side, open_window_and_input, sources};
+    use super::{
+        Controls, Mode, axis_mode, diagnostic, input_side, open_window_and_input, sources,
+    };
+
+    /// `device.toml`'s scratch mode reaches the configured controller's
+    /// axes bound to lanes, and nothing else: not its buttons, not an
+    /// unbound axis, not another model, and nothing when no mode is set.
+    #[test]
+    fn the_scratch_mode_reaches_the_bound_axes() {
+        use eval::ControlId;
+        use input::hid::{HidProduct, axis_cap, axis_control};
+        use input::{DeviceId, DeviceKind};
+        let product = HidProduct {
+            vendor_id: 1,
+            product_id: 2,
+            interface: None,
+        };
+        let (x, y) = (axis_control(0x01, 0x30), axis_control(0x01, 0x31));
+        let mut device = game::DeviceSettings::default();
+        device.controller.lanes = vec![
+            game::LaneKey {
+                control: x.0,
+                lane: 0,
+            },
+            game::LaneKey {
+                control: 1,
+                lane: 1,
+            },
+        ];
+        device.controller_device = Some(product.into());
+        let cap = |c: ControlId| axis_cap(c, true, 0, 255, 8).unwrap();
+        let relative = |device: &game::DeviceSettings, id: u64, p: HidProduct, c: ControlId| {
+            let mut set = sources();
+            set.connect(DeviceId(id), DeviceKind::Controller);
+            set.set_product(DeviceId(id), p);
+            axis_mode(&mut set, device);
+            set.axis_relative(DeviceId(id), &cap(c))
+        };
+        assert!(!relative(&device, 1, product, x));
+        device.scratch.relative = Some(true);
+        assert!(relative(&device, 1, product, x));
+        assert!(!relative(&device, 1, product, y));
+        let other = HidProduct {
+            product_id: 3,
+            ..product
+        };
+        assert!(!relative(&device, 1, other, x));
+    }
 
     /// The report prints the failure and each cause once, on one line: a
     /// chart that cannot be loaded names the file, then the session's and
