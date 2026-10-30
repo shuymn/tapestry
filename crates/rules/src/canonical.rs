@@ -17,23 +17,28 @@
 use bms_model::TimeUs;
 
 use crate::{
-    Assignment, CanonicalError, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
-    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
-    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
-    RankScale, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalMode, Window,
-    WindowPolicy,
+    Assignment, CanonicalError, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule,
+    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows,
+    LaneTable, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule,
+    PerJudgment, PerLaneClass, RankScale, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights,
+    TotalCorrection, TotalMode, Window, WindowPolicy,
 };
 
-/// The encoding layout. Version 7 has a table per lane class (keys, then
+/// The encoding layout. Version 8 has a table per lane class (keys, then
 /// scratch: windows, LN-end edges, empty POOR range), the window policy
-/// after the header policy, and two assignment variants (nearest first 0,
-/// combo priority 1).
-const FORMAT_VERSION: u64 = 7;
+/// after the header policy, two assignment variants (nearest first 0, combo
+/// priority 1), the default `#TOTAL` as a policy, and per gauge a survival
+/// gauge's failure threshold, its `#TOTAL` correction and a list of
+/// low-damage bands.
+const FORMAT_VERSION: u64 = 8;
 
-/// The fewest bytes a gauge takes: an empty id's length, the survival tag,
-/// three one-byte values, six fixed deltas of a tag and a one-byte value,
-/// and no low-damage rule.
-const MIN_GAUGE_BYTES: usize = 1 + 1 + 3 + 6 * 2 + 1;
+/// The fewest bytes a gauge takes: an empty id's length, the survival tag
+/// and a one-byte threshold, three one-byte values, six fixed deltas of a
+/// tag and a one-byte value, the correction's tag, and no low-damage band.
+const MIN_GAUGE_BYTES: usize = 1 + 2 + 3 + 6 * 2 + 1 + 1;
+
+/// The fewest bytes a low-damage band takes: three one-byte values.
+const MIN_BAND_BYTES: usize = 3;
 
 impl RulePreset {
     /// The preset's canonical bytes: equal presets give equal bytes, and any
@@ -51,7 +56,7 @@ impl RulePreset {
             empty_poor,
             headers,
             window_policy,
-            default_total_milli,
+            default_total,
             denominator,
             gauges,
             score,
@@ -74,7 +79,7 @@ impl RulePreset {
             HeaderPolicy::DefExRankFirst => 1,
         });
         w.window_policy(window_policy);
-        w.int(*default_total_milli);
+        w.default_total(*default_total);
         w.uint(match denominator {
             Denominator::TapsAndLnHeads => 0,
         });
@@ -133,7 +138,7 @@ impl RulePreset {
             _ => None,
         })?;
         let window_policy = r.window_policy()?;
-        let default_total_milli = r.int()?;
+        let default_total = r.default_total()?;
         let denominator = r.tag("denominator", |t| {
             (t == 0).then_some(Denominator::TapsAndLnHeads)
         })?;
@@ -169,7 +174,7 @@ impl RulePreset {
             empty_poor,
             headers,
             window_policy,
-            default_total_milli,
+            default_total,
             denominator,
             gauges,
             score,
@@ -363,6 +368,7 @@ impl Writer {
             max,
             change,
             empty_poor,
+            correction,
             low_damage,
         } = gauge;
         self.str(id);
@@ -371,21 +377,37 @@ impl Writer {
                 self.uint(0);
                 self.gauge_value(*clear);
             }
-            GaugeKind::Survival => self.uint(1),
+            GaugeKind::Survival { fails_below } => {
+                self.uint(1);
+                self.gauge_value(*fails_below);
+            }
         }
         self.gauge_value(*start);
         self.gauge_value(*min);
         self.gauge_value(*max);
         self.per_judgment(change, Self::delta);
         self.delta(*empty_poor);
-        match low_damage {
-            None => self.uint(0),
-            Some(LowDamage { below, num, den }) => {
-                self.uint(1);
-                self.gauge_value(*below);
-                self.uint(u64::from(*num));
-                self.uint(u64::from(*den));
+        self.uint(match correction {
+            TotalCorrection::None => 0,
+            TotalCorrection::LimitIncrease => 1,
+            TotalCorrection::ScaleDamage => 2,
+        });
+        self.len(low_damage.len());
+        for &LowDamage { below, num, den } in low_damage {
+            self.gauge_value(below);
+            self.uint(u64::from(num));
+            self.uint(u64::from(den));
+        }
+    }
+
+    fn default_total(&mut self, total: DefaultTotal) {
+        match total {
+            DefaultTotal::Fixed { milli } => {
+                self.uint(0);
+                self.int(milli);
             }
+            DefaultTotal::NotesCurve => self.uint(1),
+            DefaultTotal::NotesLinear => self.uint(2),
         }
     }
 
@@ -628,7 +650,9 @@ impl Reader<'_> {
             0 => GaugeKind::EndThreshold {
                 clear: self.gauge_value()?,
             },
-            1 => GaugeKind::Survival,
+            1 => GaugeKind::Survival {
+                fails_below: self.gauge_value()?,
+            },
             tag => {
                 return Err(CanonicalError::UnknownTag {
                     field: "gauge kind",
@@ -641,20 +665,22 @@ impl Reader<'_> {
         let max = self.gauge_value()?;
         let change = self.per_judgment(Self::delta)?;
         let empty_poor = self.delta()?;
-        let low_damage = match self.uint()? {
-            0 => None,
-            1 => Some(LowDamage {
+        let correction = self.tag("gauge correction", |t| match t {
+            0 => Some(TotalCorrection::None),
+            1 => Some(TotalCorrection::LimitIncrease),
+            2 => Some(TotalCorrection::ScaleDamage),
+            _ => None,
+        })?;
+        let count = self.count("low_damage", MIN_BAND_BYTES)?;
+        // Grown as bands are read, never reserved from the count.
+        let mut low_damage = Vec::new();
+        for _ in 0..count {
+            low_damage.push(LowDamage {
                 below: self.gauge_value()?,
                 num: self.u32("low_damage num")?,
                 den: self.u32("low_damage den")?,
-            }),
-            tag => {
-                return Err(CanonicalError::UnknownTag {
-                    field: "low_damage",
-                    tag,
-                });
-            }
-        };
+            });
+        }
         Ok(GaugeRule {
             id,
             kind,
@@ -663,8 +689,21 @@ impl Reader<'_> {
             max,
             change,
             empty_poor,
+            correction,
             low_damage,
         })
+    }
+
+    fn default_total(&mut self) -> Result<DefaultTotal, CanonicalError> {
+        match self.uint()? {
+            0 => Ok(DefaultTotal::Fixed { milli: self.int()? }),
+            1 => Ok(DefaultTotal::NotesCurve),
+            2 => Ok(DefaultTotal::NotesLinear),
+            tag => Err(CanonicalError::UnknownTag {
+                field: "default_total",
+                tag,
+            }),
+        }
     }
 
     fn score(&mut self) -> Result<ScoreWeights, CanonicalError> {
@@ -705,7 +744,7 @@ mod tests {
         CanonicalError, GaugeKind, Judgment, LaneClass, RuleError, RulePreset, Side, custom,
     };
 
-    use super::{FORMAT_VERSION, MIN_GAUGE_BYTES, Reader, Writer};
+    use super::{FORMAT_VERSION, MIN_BAND_BYTES, MIN_GAUGE_BYTES, Reader, Writer};
 
     fn table_mut(p: &mut RulePreset, class: LaneClass) -> &mut crate::LaneTable {
         match class {
@@ -747,10 +786,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_bytes_start_with_format_7_and_change_with_any_table_edge() {
+    fn canonical_bytes_start_with_format_8_and_change_with_any_table_edge() {
         let base = custom();
         let base_bytes = base.canonical_bytes();
-        assert_eq!(base_bytes.first(), Some(&7));
+        assert_eq!(base_bytes.first(), Some(&8));
         let edges: [fn(&mut crate::LaneTable) -> &mut TimeUs; 5] = [
             |t| &mut t.ln_end.perfect,
             |t| &mut t.ln_end.great,
@@ -810,7 +849,31 @@ mod tests {
             changed(|p| p.implementation = crate::Implementation::Standard { version: 3 }),
             base
         );
-        assert_ne!(changed(|p| p.gauges[1].low_damage = None), base);
+        assert_ne!(changed(|p| p.gauges[1].low_damage.clear()), base);
+        // Each gauge policy, and the default #TOTAL: a 1-unit threshold
+        // fails a gauge exactly where 0 does, yet differs.
+        let mut seen = HashSet::from([base.clone()]);
+        let edits: [fn(&mut RulePreset); 6] = [
+            |p| {
+                p.gauges[1].kind = GaugeKind::Survival {
+                    fails_below: crate::GaugeValue(1),
+                };
+            },
+            |p| p.gauges[1].correction = crate::TotalCorrection::LimitIncrease,
+            |p| p.gauges[1].correction = crate::TotalCorrection::ScaleDamage,
+            |p| {
+                let band = p.gauges[1].low_damage[0];
+                p.gauges[1].low_damage.push(crate::LowDamage {
+                    below: crate::GaugeValue(band.below.0 + 1),
+                    ..band
+                });
+            },
+            |p| p.default_total = crate::DefaultTotal::NotesCurve,
+            |p| p.default_total = crate::DefaultTotal::NotesLinear,
+        ];
+        for edit in edits {
+            assert!(seen.insert(changed(edit)));
+        }
         assert_ne!(changed(|p| p.gauges.swap(0, 1)), base);
         assert_ne!(changed(|p| p.empty_poor.counted = true), base);
     }
@@ -851,13 +914,23 @@ mod tests {
             absent_percent: 80,
             defexrank_percent: 70,
         });
-        p.default_total_milli = 123_456;
+        p.default_total = crate::DefaultTotal::Fixed { milli: 123_456 };
+        let survival = &mut p.gauges[1];
+        survival.kind = GaugeKind::Survival {
+            fails_below: crate::GaugeValue(200_000),
+        };
+        survival.correction = crate::TotalCorrection::ScaleDamage;
+        survival.low_damage.push(crate::LowDamage {
+            below: crate::GaugeValue(5_000_000),
+            num: 4,
+            den: 5,
+        });
         p.assignment = crate::Assignment::ComboPriority;
         p
     }
 
     /// The bytes of [`representative`], written by hand from the module docs
-    /// field by field: the format version 7, then `rep`, version 7, the
+    /// field by field: the format version 8, then `rep`, version 7, the
     /// implementation; the keys' table: the windows, the LN-end edges (90 ms
     /// is zigzag 180000 = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1
     /// 19`) and the empty POOR range (`ahead` 250 ms is zigzag 500000 = `a0
@@ -865,10 +938,15 @@ mod tests {
     /// table, custom's but 160 ms behind (`80 c4 13`); the miss rule (0),
     /// the empty POOR's three flags, the header policy (`DefExRankFirst`, 1),
     /// the window policy (`Scaled`, 1: five percentages `19 32 4b 64 7d`, 80
-    /// `50`, 70 `46`), and the rest in declaration order, the assignment
-    /// `ComboPriority` (1) among them.
-    const PINNED: [u8; 230] = [
-        0x07, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+    /// `50`, 70 `46`), the default `#TOTAL` (`Fixed`, 0: 123.456 is zigzag
+    /// 246912 = `80 89 0f`), and the rest in declaration order, the
+    /// assignment `ComboPriority` (1) among them. Each gauge
+    /// ends with its correction's tag and its bands: normal's `00 00`;
+    /// survival, after its kind (1) and 2 % threshold (`80 b5 18`), ends
+    /// with `ScaleDamage` (2), two bands, 30 % (`80 9b ee 02`) × 1/2 and
+    /// 50 % (`80 ad e2 04`) × 4/5.
+    const PINNED: [u8; 242] = [
+        0x08, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x03, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
         0x14, 0x80, 0xb5, 0x18, 0xa0, 0xfe, 0x0a, 0xc0, 0x8b, 0x11, 0xa0, 0xd1, //
@@ -877,15 +955,16 @@ mod tests {
         0x0c, 0xc0, 0xfc, 0x15, 0xc0, 0xfc, 0x15, 0xc0, 0x9a, 0x0c, 0xe0, 0xa7, //
         0x12, 0x80, 0xb5, 0x18, 0xc0, 0x84, 0x3d, 0x80, 0xc4, 0x13, 0x00, 0x00, //
         0x00, 0x01, 0x01, 0x01, 0x05, 0x19, 0x32, 0x4b, 0x64, 0x7d, 0x50, 0x46, //
-        0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, //
+        0x00, 0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, //
         0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, 0xb5, //
         0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, //
         0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, 0x00, 0xbf, //
-        0xcf, 0x24, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, 0x61, 0x6c, //
-        0x01, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, //
-        0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, 0x00, 0xbf, 0x84, 0x3d, //
-        0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x01, 0x80, 0x9b, 0xee, //
-        0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, //
+        0xcf, 0x24, 0x00, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, 0x61, //
+        0x6c, 0x01, 0x80, 0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, //
+        0xc4, 0x09, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, //
+        0x00, 0xbf, 0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, //
+        0x02, 0x02, 0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x80, 0xad, 0xe2, 0x04, //
+        0x04, 0x05, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, //
         0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, //
         0xa0, 0x8d, 0x06,
     ];
@@ -956,7 +1035,7 @@ mod tests {
     fn through_denominator(w: &mut Writer, p: &RulePreset) {
         through_headers(w, p);
         w.window_policy(&p.window_policy);
-        w.int(p.default_total_milli);
+        w.default_total(p.default_total);
         w.uint(0);
     }
 
@@ -1013,19 +1092,19 @@ mod tests {
         // The id's length: one more than the bytes left is refused; exactly
         // the bytes left is read, and the next field finds nothing.
         assert_eq!(
-            decode(&[7, 4, b'a', b'b', b'c']),
+            decode(&[8, 4, b'a', b'b', b'c']),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
                 count: 4
             })
         );
         assert_eq!(
-            decode(&[7, 3, b'a', b'b', b'c']),
+            decode(&[8, 3, b'a', b'b', b'c']),
             Err(CanonicalError::Truncated)
         );
         assert_eq!(
             decode(&[
-                7, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
+                8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
             ]),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
@@ -1111,9 +1190,9 @@ mod tests {
     fn gauge_count_is_bounded_by_the_smallest_gauge() {
         let at = offset(through_denominator);
         let prefix = &custom().canonical_bytes()[..at];
-        // An empty id, survival, zero values, six `Fixed(0)` deltas, no
-        // low-damage rule.
-        let smallest = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // An empty id, survival with a zero threshold, zero values, six
+        // `Fixed(0)` deltas, no correction and no low-damage band.
+        let smallest = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(smallest.len(), MIN_GAUGE_BYTES);
         let with = |count: u64, gauges: usize| {
             let mut w = Writer(prefix.to_vec());
@@ -1144,6 +1223,36 @@ mod tests {
                 count: 1 << 24
             })
         );
+    }
+
+    #[test]
+    fn band_count_is_bounded_by_the_smallest_band() {
+        let at = offset(through_denominator);
+        let prefix = &custom().canonical_bytes()[..at];
+        // One gauge, the smallest but for its band count.
+        let gauge = |bands: u64, band_bytes: usize| {
+            let mut w = Writer(prefix.to_vec());
+            w.uint(1);
+            w.0.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            w.uint(bands);
+            w.0.resize(w.0.len() + band_bytes, 0);
+            w.0
+        };
+        // Two bands in exactly their bytes are read; the score then finds
+        // nothing. A third cannot fit.
+        assert_eq!(MIN_BAND_BYTES, 3);
+        assert_eq!(decode(&gauge(2, 6)), Err(CanonicalError::Truncated));
+        let beyond = |count| {
+            Err(CanonicalError::CountBeyondData {
+                field: "low_damage",
+                count,
+            })
+        };
+        assert_eq!(decode(&gauge(3, 6)), beyond(3));
+        // A few bytes claiming the largest count, and 2^24 bands with
+        // 16 MiB left: refused before any band is read or reserved.
+        assert_eq!(decode(&gauge(u64::MAX, 0)), beyond(u64::MAX));
+        assert_eq!(decode(&gauge(1 << 24, 16 << 20)), beyond(1 << 24));
     }
 
     #[test]
@@ -1189,6 +1298,34 @@ mod tests {
         assert_eq!(
             decode(&with_uint_at(delta, u64::MAX)),
             unknown("gauge delta", u64::MAX)
+        );
+        let correction = offset(|w, p| {
+            through_denominator(w, p);
+            w.len(p.gauges.len());
+            let g = &p.gauges[0];
+            w.str(&g.id);
+            let GaugeKind::EndThreshold { clear } = g.kind else {
+                panic!("the first custom gauge has a clear threshold");
+            };
+            w.uint(0);
+            w.gauge_value(clear);
+            w.gauge_value(g.start);
+            w.gauge_value(g.min);
+            w.gauge_value(g.max);
+            w.per_judgment(&g.change, Writer::delta);
+            w.delta(g.empty_poor);
+        });
+        assert_eq!(
+            decode(&with_uint_at(correction, 3)),
+            unknown("gauge correction", 3)
+        );
+        let default_total = offset(|w, p| {
+            through_headers(w, p);
+            w.window_policy(&p.window_policy);
+        });
+        assert_eq!(
+            decode(&with_uint_at(default_total, 3)),
+            unknown("default_total", 3)
         );
         let bytes = custom().canonical_bytes();
         let mut mine = Writer(Vec::new());
