@@ -15,9 +15,10 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DecodeLimits, DeviceKind, DeviceRecord, EndStatus,
-    Incomplete, PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status,
-    TransformRecord, Versions, WakePolicy, decode, encode,
+    Incomplete, InitialGauge, PlayRecord, PlayType, Practice, PresetRecord, ReceiveMethod,
+    SourceRecord, Status, TransformRecord, Versions, WakePolicy, decode, encode,
 };
+use rules::GaugeValue;
 use sha2::{Digest, Sha256};
 
 fn u64s() -> impl Strategy<Value = u64> {
@@ -184,9 +185,41 @@ fn wake() -> impl Strategy<Value = WakePolicy> {
     ]
 }
 
+/// A full play or a practice round.
+fn play_type() -> impl Strategy<Value = PlayType> {
+    prop_oneof![
+        Just(PlayType::Full),
+        practice().prop_map(PlayType::MidChartStart),
+        practice().prop_map(PlayType::SectionRepeat),
+    ]
+}
+
+/// A practice round's conditions, whose gauge IDs are unique (each is
+/// numbered).
+fn practice() -> impl Strategy<Value = Practice> {
+    (
+        (i64s(), i64s(), i64s(), u32s()),
+        vec((text(), i64s()), 0..=4),
+    )
+        .prop_map(|((start, end, lead_in, attempt), gauges)| Practice {
+            start: TimeUs(start),
+            end: TimeUs(end),
+            lead_in: TimeUs(lead_in),
+            attempt,
+            initial_gauges: gauges
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, value))| InitialGauge {
+                    id: format!("{i}{id}"),
+                    value: GaugeValue(value),
+                })
+                .collect(),
+        })
+}
+
 fn record() -> impl Strategy<Value = PlayRecord> {
     (
-        (versions(), chart(), preset(), text()),
+        (versions(), chart(), preset(), text(), play_type()),
         (vec(source(), 1..=4), i64s(), i64s(), wake(), 10_u32..=30),
         (i64s(), vec((any::<u16>(), u32s(), i32s()), 0..=6)),
         vec(
@@ -212,7 +245,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
     )
         .prop_map(
             |(
-                (versions, chart, preset, session_policy),
+                (versions, chart, preset, session_policy, play_type),
                 (sources, audio_offset, display_offset, wake, speed),
                 (opened_at, held),
                 events,
@@ -232,7 +265,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
                         display_offset: TimeUs(display_offset),
                         wake,
                     },
-                    play_type: PlayType::Full,
+                    play_type,
                     speed: Speed::from_twentieths(speed).unwrap(),
                     start: InputStart {
                         opened_at: TimeUs(opened_at),
@@ -303,7 +336,7 @@ fn ten_bytes_signed(v: i64) -> bool {
 fn generator_reaches_ten_byte_varints_and_empty_lists() {
     let mut runner = TestRunner::deterministic();
     let records = record();
-    let mut counts = [0_usize; 10];
+    let mut counts = [0_usize; 12];
     for _ in 0..256 {
         let r = records.new_tree(&mut runner).unwrap().current();
         let sources = &r.devices.sources;
@@ -329,6 +362,8 @@ fn generator_reaches_ten_byte_varints_and_empty_lists() {
             sources.iter().any(|s| s.profile.bindings.is_empty()),
             sources.iter().any(|s| s.profile.axes.is_empty()),
             r.events.len() > 32,
+            matches!(r.play_type, PlayType::MidChartStart(_)),
+            matches!(&r.play_type, PlayType::SectionRepeat(p) if p.initial_gauges.len() > 1),
         ];
         for (n, hit) in counts.iter_mut().zip(reached) {
             *n += usize::from(hit);

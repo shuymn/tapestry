@@ -17,8 +17,8 @@ use std::path::Path;
 
 use bms_model::{Chart, TimeUs};
 use bms_parser::{LOADER_VERSION, LoadError, LoadOptions};
-use eval::{EvalError, EvalInput, Evaluation, Evaluator, evaluation_time};
-use rules::{CanonicalError, Implementation, RulePreset};
+use eval::{EvalError, EvalInput, Evaluation, Evaluator, Section, evaluation_time};
+use rules::{CanonicalError, GaugeKind, GaugeRule, GaugeValue, Implementation, RulePreset};
 
 use crate::{EndStatus, PASSTHROUGH, PlayRecord, preset_hash};
 
@@ -81,6 +81,49 @@ pub struct ReEvaluation {
     pub as_played: bool,
     /// What the recorded input covers.
     pub coverage: Coverage,
+    /// For a practice record, one per gauge of the preset, in its order:
+    /// whether the gauge started at the preset's start value because the
+    /// record holds no value for its ID that the gauge accepts (design.md
+    /// "Practice Records"). Empty for a full play, whose gauges all start
+    /// at the preset's start values.
+    pub started_at_default: Vec<bool>,
+}
+
+/// The section a practice record's input is evaluated in under `preset`,
+/// and which of the preset's gauges start at its start value: each gauge
+/// starts at the value the record holds for its ID, unless the record has
+/// none or the gauge does not accept it (outside its bounds, or 0 or less
+/// on a survival gauge), as a preset's own start must be; then at its start
+/// value. `None` for a full play.
+fn practice_section(record: &PlayRecord, preset: &RulePreset) -> Option<(Section, Vec<bool>)> {
+    let practice = record.play_type.practice()?;
+    let (initial_gauges, started_at_default) = preset
+        .gauges
+        .iter()
+        .map(|rule| {
+            practice
+                .initial_gauges
+                .iter()
+                .find(|g| g.id == rule.id)
+                .map(|g| g.value)
+                .filter(|&v| accepts(rule, v))
+                .map_or((rule.start, true), |v| (v, false))
+        })
+        .unzip();
+    let section = Section {
+        start: practice.start,
+        end: practice.end,
+        lead_in: practice.lead_in,
+        initial_gauges,
+    };
+    Some((section, started_at_default))
+}
+
+/// Whether `rule`'s gauge can start at `v`: within its bounds, and above 0
+/// for a survival gauge (design.md "Section Evaluation").
+fn accepts(rule: &GaugeRule, v: GaugeValue) -> bool {
+    (rule.min..=rule.max).contains(&v)
+        && !(rule.kind == GaugeKind::Survival && v <= GaugeValue::EMPTY)
 }
 
 /// Checks the record's evaluator version, then decodes its preset copy.
@@ -175,6 +218,11 @@ pub fn evaluate_record(
 ///   [`EndedMidway`](Coverage::EndedMidway), with no gauge cleared even if
 ///   the preset's final deadline comes before the watermark.
 ///
+/// A practice record is evaluated in its section, in each of these ways,
+/// with its initial gauges transferred to the preset's gauges by ID
+/// ([`ReEvaluation::started_at_default`]); the final deadline is then the
+/// section's.
+///
 /// The evaluator version is not checked here; the caller checks it first.
 ///
 /// # Errors
@@ -189,6 +237,7 @@ pub fn evaluate_under(
     let as_played = preset_hash(preset) == record.preset.sha256;
     let aborted = record.status.end == EndStatus::EndedMidway;
     let device = record.devices.profile();
+    let (section, started_at_default) = practice_section(record, preset).unzip();
     let (events, finalized, no_input_after) = if as_played || aborted {
         (record.events.clone(), watermark, None)
     } else {
@@ -202,8 +251,8 @@ pub fn evaluate_under(
             .filter(|e| evaluation_time(e, &device) <= watermark)
             .copied()
             .collect();
-        let deadline =
-            Evaluator::new(chart, preset, &device, &record.start, None, 0)?.final_deadline();
+        let deadline = Evaluator::new(chart, preset, &device, &record.start, section.as_ref(), 0)?
+            .final_deadline();
         (played, deadline, Some(watermark).filter(|&w| deadline > w))
     };
     let input = EvalInput {
@@ -211,7 +260,7 @@ pub fn evaluate_under(
         device,
         start: record.start.clone(),
         finalized: Some(finalized),
-        section: None,
+        section,
     };
     let mut evaluation = eval::evaluate(chart, &input, preset)?;
     let coverage = if aborted {
@@ -230,6 +279,7 @@ pub fn evaluate_under(
         evaluation,
         as_played,
         coverage,
+        started_at_default: started_at_default.unwrap_or_default(),
     })
 }
 
