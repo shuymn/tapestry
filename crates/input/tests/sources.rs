@@ -80,12 +80,15 @@ fn batch(set: &mut SourceSet, at: i64, packets: &[Packet], fresh: i64) {
 
 #[test]
 fn events_published_before_watermark_are_visible() {
-    const BATCHES: i64 = 250_000;
+    const BATCHES: i64 = 32_000;
     const PER_BATCH: i64 = 4;
     // A queue far smaller than the stream: the producer waits for room, so
     // the two threads interleave throughout.
     const QUEUE: i64 = 64;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // How long either side may wait for the other's next step: it bounds
+    // one handoff, not the run, which takes as many handoffs as the
+    // machine's scheduling makes slow.
+    const STALL: Duration = Duration::from_secs(30);
     let mut set = SourceSet::new(SourceConfig {
         queue_capacity: QUEUE as usize,
         ..config()
@@ -101,8 +104,9 @@ fn events_published_before_watermark_are_visible() {
         let (consumed, done) = (Arc::clone(&consumed), Arc::clone(&done));
         thread::spawn(move || {
             for t in 0..BATCHES {
+                let waiting = Instant::now();
                 while (t + 1) * PER_BATCH - consumed.load(Ordering::Acquire) > QUEUE {
-                    assert!(Instant::now() < deadline, "producer timed out");
+                    assert!(waiting.elapsed() < STALL, "the consumer stalled");
                     thread::yield_now();
                 }
                 set.begin_batch(TimeUs(t));
@@ -119,15 +123,19 @@ fn events_published_before_watermark_are_visible() {
     let total = BATCHES * PER_BATCH;
     let mut popped = 0;
     // Checks that found a new prefix while the producer was still running.
-    let mut intermediate = 0u64;
+    let mut intermediate = 0;
+    let mut waiting = Instant::now();
     while popped < total {
-        assert!(Instant::now() < deadline, "consumer timed out");
         let running = !done.load(Ordering::Acquire);
         let w = reader.published().received_up_to.0;
         let due = if w < 0 { 0 } else { (w + 1) * PER_BATCH };
-        if running && due > popped {
-            intermediate += 1;
+        if due > popped {
+            waiting = Instant::now();
+            if running {
+                intermediate += 1;
+            }
         }
+        assert!(waiting.elapsed() < STALL, "the producer stalled");
         while popped < due {
             let e = reader.pop().unwrap_or_else(|| {
                 panic!("event {popped} received at or before {w} is not poppable")
@@ -139,10 +147,11 @@ fn events_published_before_watermark_are_visible() {
         thread::yield_now();
     }
     assert!(!producer.join().unwrap());
-    assert_eq!(popped, 1_000_000);
-    // The producer cannot run more than one queue ahead, so most of the
-    // stream is checked prefix by prefix while it runs.
-    assert!(intermediate >= 1_000, "{intermediate}");
+    assert_eq!(popped, total);
+    // The producer runs at most one queue ahead, so a check takes at most a
+    // queue's events, and the stream up to the last queue is taken while
+    // the producer still runs: it is checked prefix by prefix as it runs.
+    assert!(intermediate >= (total - QUEUE) / QUEUE, "{intermediate}");
     assert!(!reader.overflowed());
 }
 

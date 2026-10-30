@@ -1654,13 +1654,14 @@ mod qpc_tests {
 #[cfg(test)]
 mod clocked_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use bms_model::{TimeSource, TimeUs};
 
     use super::{ClockedThread, QpcClock, Waker};
+    use crate::cadence::HEARTBEAT;
     use crate::{AUTOPLAY_DEVICE, DeviceKind, Phase, SourceConfig, SourceSet};
 
     fn set() -> SourceSet {
@@ -1683,32 +1684,54 @@ mod clocked_tests {
         }
     }
 
-    /// The clocked thread wakes about every millisecond with the clock's
-    /// time and the source set it was given while in its tail, and stops
-    /// when asked; every wake is a heartbeat.
+    /// The clocked thread wakes with the clock's time and the source set it
+    /// was given while in its tail, at most once per heartbeat period of
+    /// that time, and stops when asked; every wake is a heartbeat.
     #[test]
     fn the_clocked_thread_wakes_with_the_clock_and_its_sources() {
+        /// Wakes to see before stopping.
+        const WAKES: u64 = 50;
         let clock = QpcClock::start();
         let mut set = set();
         set.connect(AUTOPLAY_DEVICE, DeviceKind::Keyboard);
+        // The hook's wakes: how many, and the first and last clock reads.
+        let calls = Arc::new(AtomicU64::new(0));
+        let first = Arc::new(AtomicI64::new(i64::MIN));
         let last = Arc::new(AtomicI64::new(i64::MIN));
-        let seen = Arc::clone(&last);
+        let (seen_calls, seen_first, seen_last) =
+            (Arc::clone(&calls), Arc::clone(&first), Arc::clone(&last));
+        let (enough_tx, enough) = mpsc::sync_channel(1);
         let start = clock.now();
         let waker = Waker::new().unwrap();
         let thread = ClockedThread::spawn(clock, set, &waker, move |s, now| {
             assert_eq!(s.devices().count(), 1);
-            seen.store(now.0, Ordering::Release);
+            let previous = seen_last.swap(now.0, Ordering::AcqRel);
+            assert!(now.0 > previous, "{now:?} after {previous}");
+            let seen = seen_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if seen == 1 {
+                seen_first.store(now.0, Ordering::Release);
+            }
+            if seen == WAKES {
+                let _ = enough_tx.try_send(());
+            }
             Phase::Tail
         })
         .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        // However long the machine takes to give the thread its wakes:
+        // the bound only catches a thread that never wakes.
+        enough.recv_timeout(Duration::from_secs(60)).unwrap();
         let report = thread.stop().unwrap();
-        let woke = last.load(Ordering::Acquire);
-        assert!(TimeUs(woke) > start && TimeUs(woke) <= clock.now());
-        // About 100 wakes; a loaded machine may skip some.
-        let wakes = report.causes.heartbeat;
-        assert!((20..=150).contains(&wakes), "{wakes}");
-        assert_eq!(report.causes.input, 0);
+        let wakes = calls.load(Ordering::Acquire);
+        let (first, last) = (first.load(Ordering::Acquire), last.load(Ordering::Acquire));
+        assert!(wakes >= WAKES);
+        assert!(TimeUs(first) > start && TimeUs(last) <= clock.now());
+        // Each heartbeat wake comes at or after its deadline, and the next
+        // deadline is the first point of the heartbeat grid after it: two
+        // wakes never share a grid period, however late they come.
+        let span = i64::try_from(wakes - 2).unwrap() * HEARTBEAT.0;
+        assert!(last - first > span, "{wakes} wakes in {} µs", last - first);
+        assert_eq!(report.causes.heartbeat, wakes);
+        assert_eq!(report.causes.total(), wakes);
         assert_eq!(report.lateness.count(), wakes);
     }
 
