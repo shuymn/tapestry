@@ -186,14 +186,13 @@ pub fn resolve(
         pair_long_notes(lane, &mut candidates[l], sounds, warnings);
     }
 
-    let settled = candidates.map(|lane| settle(lane, warnings));
-    let lanes = settled
-        .each_ref()
-        .map(|lane| lane.iter().map(|c| c.note).collect());
-    let real = mapped.then(|| RealTimes {
-        lanes: settled
-            .each_ref()
-            .map(|lane| lane.iter().map(|c| c.real).collect()),
+    let mut lanes: [Vec<Note>; LANE_COUNT] = Default::default();
+    let mut real_lanes: [Vec<(TimeUs, TimeUs)>; LANE_COUNT] = Default::default();
+    for ((lane, notes), real) in candidates.into_iter().zip(&mut lanes).zip(&mut real_lanes) {
+        (*notes, *real) = settle(lane, mapped, warnings);
+    }
+    let real = mapped.then_some(RealTimes {
+        lanes: real_lanes,
         bgm: real_bgm,
     });
     Resolved { lanes, bgm, real }
@@ -257,10 +256,16 @@ fn pair_long_notes(
 
 /// Settles one lane: at one position the highest priority wins, then the
 /// later object in the file; a note at or inside an earlier long note's span
-/// is dropped.
-fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Candidate> {
+/// is dropped. With `mapped`, the kept notes' real times come beside them;
+/// otherwise that list stays empty.
+fn settle(
+    mut lane: Vec<Candidate>,
+    mapped: bool,
+    warnings: &mut Vec<Warning>,
+) -> (Vec<Note>, Vec<(TimeUs, TimeUs)>) {
     lane.sort_unstable_by_key(|c| (c.rank, priority(c.note.kind), c.seq));
-    let mut kept: Vec<Candidate> = Vec::with_capacity(lane.len());
+    let mut kept: Vec<Note> = Vec::with_capacity(lane.len());
+    let mut real = Vec::with_capacity(if mapped { lane.len() } else { 0 });
     // The end position of the last note kept.
     let mut last_end_rank: Option<usize> = None;
     for (i, c) in lane.iter().enumerate() {
@@ -275,11 +280,14 @@ fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Candidat
         } else if last_end_rank.is_some_and(|end| c.rank <= end) {
             drop(warnings, WarningKind::NoteInsideLongNoteDropped);
         } else {
-            kept.push(*c);
+            kept.push(c.note);
+            if mapped {
+                real.push(c.real);
+            }
             last_end_rank = Some(c.end_rank);
         }
     }
-    kept
+    (kept, real)
 }
 
 #[cfg(test)]

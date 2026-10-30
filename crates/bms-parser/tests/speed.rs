@@ -2,7 +2,7 @@
 //! real time is the exact time scaled by `20/k` and floored once, the scroll
 //! map follows the real timeline, and the identity is the 1× chart's.
 
-use bms_model::{BEAT, Chart, NoteKind, Speed, TimeUs};
+use bms_model::{BEAT, Chart, ChartIdentity, NoteKind, Speed, TimeUs};
 use bms_parser::{Limits, LoadError, LoadOptions, Loaded, WarningKind, load_bms};
 use proptest::prelude::*;
 
@@ -151,12 +151,24 @@ const MIXED: &str = "\
 #00316:01000001
 ";
 
+/// The identity shared by every speed: all of it but the played hash.
+fn shared(identity: &ChartIdentity) -> ChartIdentity {
+    ChartIdentity {
+        played_hash: [0; 32],
+        ..identity.clone()
+    }
+}
+
 #[test]
 fn identity_is_the_same_at_every_speed() {
     let one = load_at(MIXED, Speed::NORMAL).unwrap().chart;
+    assert_eq!(one.identity.played_hash, one.identity.resolved_hash);
+    let mut played = std::collections::BTreeSet::new();
     for speed in Speed::ladder() {
         let chart = load_at(MIXED, speed).unwrap().chart;
-        assert_eq!(chart.identity, one.identity, "{speed:?}");
+        assert_eq!(shared(&chart.identity), shared(&one.identity), "{speed:?}");
+        // The played hash pins each speed's real timeline.
+        assert!(played.insert(chart.identity.played_hash), "{speed:?}");
         if speed != Speed::NORMAL {
             assert_ne!(times(&chart), times(&one), "{speed:?}");
             assert_ne!(chart.scroll, one.scroll, "{speed:?}");
@@ -179,7 +191,7 @@ fn a_chart_too_long_at_a_slow_speed_is_refused() {
     );
     let sixty = load_at(text, at(12)).unwrap().chart;
     assert_eq!(sixty.lanes[1][0].time, TimeUs(4_000_000_000));
-    assert_eq!(sixty.identity, one.identity);
+    assert_eq!(shared(&sixty.identity), shared(&one.identity));
     // With a raised duration cap, 66.6 minutes load at 1× and 150 %, and
     // at 90 % (74 minutes) the domain still refuses them, from measure
     // 967 (4,297.8 s) on.
@@ -258,7 +270,7 @@ proptest! {
         let mapped = load_at(&text, at(k)).unwrap();
         let (one, chart) = (one.chart, mapped.chart);
         prop_assert_eq!(chart.validate(), Ok(()));
-        prop_assert_eq!(&chart.identity, &one.identity);
+        prop_assert_eq!(shared(&chart.identity), shared(&one.identity));
         prop_assert_eq!(&chart.bar_lines, &one.bar_lines);
         prop_assert_eq!(chart.bgm.len(), one.bgm.len());
         let k = i64::from(k);

@@ -120,6 +120,10 @@
 //!   positions do not change it, and `120` and `120.0` differ), not the
 //!   `#RANDOM` results that chose it, so two draws resolving to the same
 //!   objects share one hash.
+//! - **Played hash:** the same encoding over the chart at its speed, under
+//!   its own tag and with the speed's k; the resolved hash at 1×. Two
+//!   files can resolve alike at 1× and floor apart at a speed, so a record
+//!   pins the real timeline it was played on with it.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
@@ -291,12 +295,14 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
             sha256,
             md5,
             resolved_hash: [0; 32],
+            played_hash: [0; 32],
             loader_version: LOADER_VERSION,
             random_results: source.random_results,
         },
     };
     chart.validate().map_err(LoadError::Model)?;
     chart.identity.resolved_hash = hash::resolved_hash(&chart);
+    chart.identity.played_hash = chart.identity.resolved_hash;
     // Then, at another speed, the same objects at their real times, on the
     // real timeline's scroll map.
     if let (Some(real), Some(scroll)) = (resolved.real, real_scroll) {
@@ -313,6 +319,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         }
         chart.scroll = compile(scroll.initial_rate, scroll.segments)?;
         chart.validate().map_err(LoadError::Model)?;
+        chart.identity.played_hash = hash::played_hash(&chart, opts.speed);
     }
     Ok(Loaded { chart, warnings })
 }

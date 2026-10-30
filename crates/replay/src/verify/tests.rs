@@ -549,23 +549,90 @@ fn the_load_uses_the_recorded_speed() {
     // `CHART` played at 50 %: its notes at 2 s and 4 s are at 4 s and 8 s
     // in real time, where the input hits them.
     let (dir, mut record) = played();
+    let opts = LoadOptions {
+        speed: Speed::SLOWEST,
+        ..LoadOptions::default()
+    };
+    let half = load_bms(CHART.as_bytes(), dir.path(), &opts).unwrap().chart;
+    // The resolved hash is the 1× chart's; the played hash is the 50 %
+    // chart's.
+    assert_eq!(
+        half.identity.resolved_hash,
+        record.chart.identity.resolved_hash
+    );
+    assert_ne!(half.identity.played_hash, record.chart.identity.played_hash);
+    record.chart.identity = half.identity;
     record.speed = Speed::SLOWEST;
     for e in &mut record.events {
         e.received = TimeUs(e.received.0 * 2);
     }
     record.status.finalized = TimeUs(8_180 * MS);
-    let times = |chart: &bms_model::Chart| -> Vec<i64> {
-        chart.lanes[1].iter().map(|n| n.time.0).collect()
-    };
     let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
-    assert_eq!(times(&chart), [4_000 * MS, 8_000 * MS]);
+    let times: Vec<i64> = chart.lanes[1].iter().map(|n| n.time.0).collect();
+    assert_eq!(times, [4_000 * MS, 8_000 * MS]);
     let r = evaluate_record(&record, &chart, None).unwrap();
     assert_eq!(r.evaluation.tally.counts.perfect, 2);
-    // The identity is the 1× chart's, so the same record at 1× loads too,
-    // and its input then misses the 2 s note.
+    // At another speed the chart plays otherwise than it was judged.
     record.speed = Speed::NORMAL;
-    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
-    assert_eq!(times(&chart), [2_000 * MS, 4_000 * MS]);
-    let r = evaluate_record(&record, &chart, None).unwrap();
-    assert_eq!(r.evaluation.tally.counts.perfect, 1);
+    assert_eq!(
+        load_recorded_chart(&record, CHART.as_bytes(), dir.path()),
+        Err(VerifyError::PlayedChartMismatch)
+    );
+}
+
+#[test]
+fn refuses_a_chart_that_resolves_alike_but_plays_otherwise_at_the_speed() {
+    // The two BPMs differ by 10^-18: at 1× the note and the scroll map
+    // floor alike, so the resolved hash is one, and at 50 % the note floors
+    // to 2,000,001 µs and to 2,000,000 µs.
+    let text = |bpm| format!("#BPM {bpm}\n#WAV01 a.wav\n#00111:01\n");
+    let (played_text, edited) = (
+        text("239.999880000059999970"),
+        text("239.999880000059999971"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let load = |text: &str, speed| {
+        let opts = LoadOptions {
+            speed,
+            ..LoadOptions::default()
+        };
+        load_bms(text.as_bytes(), dir.path(), &opts).unwrap().chart
+    };
+    let (one, edited_one) = (
+        load(&played_text, Speed::NORMAL),
+        load(&edited, Speed::NORMAL),
+    );
+    assert_eq!(
+        one.identity.resolved_hash,
+        edited_one.identity.resolved_hash
+    );
+    assert_eq!(one.scroll, edited_one.scroll);
+    let (half, edited_half) = (
+        load(&played_text, Speed::SLOWEST),
+        load(&edited, Speed::SLOWEST),
+    );
+    assert_eq!(half.lanes[1][0].time, TimeUs(2_000_001));
+    assert_eq!(edited_half.lanes[1][0].time, TimeUs(2_000_000));
+    // A play at 50 % pressing 20.000 ms after its note: PERFECT under
+    // custom, and GREAT 20.001 ms after the edited file's.
+    let (_, mut record) = played();
+    record.speed = Speed::SLOWEST;
+    record.chart.identity = half.identity.clone();
+    record.events = vec![press(2_020_001, 1), press(2_070_001, 0)];
+    record.status.finalized = TimeUs(2_400_000);
+    let first = |chart: &bms_model::Chart| {
+        let r = evaluate_record(&record, chart, None).unwrap();
+        r.evaluation.events.iter().find_map(|e| match e.kind {
+            eval::JudgeEventKind::Judged { judgment, .. } => Some(judgment),
+            _ => None,
+        })
+    };
+    assert_eq!(first(&half), Some(rules::Judgment::Perfect));
+    assert_eq!(first(&edited_half), Some(rules::Judgment::Great));
+    let chart = load_recorded_chart(&record, played_text.as_bytes(), dir.path()).unwrap();
+    assert_eq!(chart, half);
+    assert_eq!(
+        load_recorded_chart(&record, edited.as_bytes(), dir.path()),
+        Err(VerifyError::PlayedChartMismatch)
+    );
 }

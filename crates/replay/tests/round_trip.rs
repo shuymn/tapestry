@@ -70,6 +70,7 @@ fn chart() -> impl Strategy<Value = ChartRecord> {
             any::<[u8; 32]>(),
             any::<[u8; 16]>(),
             any::<[u8; 32]>(),
+            any::<[u8; 32]>(),
             u32s(),
             vec(u32s(), 0..8),
         ),
@@ -78,7 +79,7 @@ fn chart() -> impl Strategy<Value = ChartRecord> {
     )
         .prop_map(
             |(
-                (sha256, md5, resolved_hash, loader_version, random_results),
+                (sha256, md5, resolved_hash, played_hash, loader_version, random_results),
                 random_seed,
                 (id, version),
             )| {
@@ -87,6 +88,7 @@ fn chart() -> impl Strategy<Value = ChartRecord> {
                         sha256,
                         md5,
                         resolved_hash,
+                        played_hash,
                         loader_version,
                         random_results,
                     },

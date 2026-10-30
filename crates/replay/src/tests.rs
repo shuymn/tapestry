@@ -113,6 +113,7 @@ fn sample(n_events: usize) -> PlayRecord {
                 sha256: [0x11; 32],
                 md5: [0x22; 16],
                 resolved_hash: [0x33; 32],
+                played_hash: [0x34; 32],
                 loader_version: 1,
                 random_results: vec![2, 1, 7],
             },
@@ -524,6 +525,7 @@ fn golden_base() -> PlayRecord {
                 sha256: [0xa1; 32],
                 md5: [0xb2; 16],
                 resolved_hash: [0xc3; 32],
+                played_hash: [0xc4; 32],
                 loader_version: 5,
                 random_results: vec![3, 1],
             },
@@ -616,7 +618,7 @@ fn golden() -> PlayRecord {
 
 /// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
 /// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "b5978257eb62a20905b94b4c2a6ffd874ecda24c38eb4fd89709f70519bf3bf2";
+const GOLDEN_BODY_SHA256: &str = "55bd78549dc36bbed5e7494f4eeac79972ae7ae8f2036d46393627d4b66049cf";
 
 #[test]
 fn golden_body() {
@@ -907,8 +909,8 @@ fn forged_counts_are_refused_before_allocating() {
     let cases = [
         // The app version string's length, after two versions.
         (0, payload(&[3, 5], huge, &[]), beyond(huge), limits()),
-        // `#RANDOM` results, after the three hashes and the seed.
-        (1, payload(&[0; 81], huge, &[]), beyond(huge), limits()),
+        // `#RANDOM` results, after the four hashes and the seed.
+        (1, payload(&[0; 113], huge, &[]), beyond(huge), limits()),
         // Five sources take at least 20 bytes; none are left.
         (4, payload(&[], 5, &[]), beyond(5), limits()),
         // Held controls, after `opened_at`.

@@ -238,6 +238,7 @@ fn write_chart(w: &mut Writer, c: &ChartRecord) {
                 sha256,
                 md5,
                 resolved_hash,
+                played_hash,
                 loader_version: _, // in the versions section
                 random_results,
             },
@@ -247,6 +248,7 @@ fn write_chart(w: &mut Writer, c: &ChartRecord) {
     w.raw(sha256);
     w.raw(md5);
     w.raw(resolved_hash);
+    w.raw(played_hash);
     w.uint(*random_seed);
     w.len(random_results.len());
     for r in random_results {
@@ -574,6 +576,7 @@ fn read_chart(r: &mut Reader<'_>, loader_version: u32) -> Result<ChartRecord, De
     let sha256 = r.array()?;
     let md5 = r.array()?;
     let resolved_hash = r.array()?;
+    let played_hash = r.array()?;
     let random_seed = r.uint()?;
     let n = r.count(1)?;
     let mut random_results = Vec::with_capacity(n);
@@ -589,6 +592,7 @@ fn read_chart(r: &mut Reader<'_>, loader_version: u32) -> Result<ChartRecord, De
             sha256,
             md5,
             resolved_hash,
+            played_hash,
             loader_version,
             random_results,
         },
