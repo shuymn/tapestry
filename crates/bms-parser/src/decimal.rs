@@ -1,7 +1,9 @@
 //! Decimal text straight to exact rationals, and object ids.
 
+use bms_model::HeaderValue;
 use num_bigint::BigInt;
 use num_rational::Ratio;
+use num_traits::ToPrimitive;
 
 /// An exact rational of arbitrary-precision integers (design.md "Chart Time").
 pub type Rational = Ratio<BigInt>;
@@ -127,6 +129,32 @@ pub fn parse_decimal(text: &str) -> Result<Rational, DecimalError> {
     let numer = BigInt::from(coefficient) * power(scale.max(0));
     let numer = if negative { -numer } else { numer };
     Ok(Ratio::new(numer, power((-scale).max(0))))
+}
+
+/// A judgment header's value in canonical form (design.md "Chart Model"):
+/// an integer token (`[+-]?[0-9]+`) or another decimal, each with its exact
+/// value in units of `10^-18`, or not a number when [`parse_decimal`]
+/// refuses the text (out of bounds included).
+pub fn header_value(text: &str) -> HeaderValue {
+    let Ok(v) = parse_decimal(text) else {
+        return HeaderValue::NotANumber;
+    };
+    // Every decimal is `n / 10^k` with `k ≤ 18` and `|n| < 10^30`, so this
+    // is exact and fits `i128`.
+    let units = v * BigInt::from(HeaderValue::ONE);
+    let Some(n) = units
+        .is_integer()
+        .then(|| units.to_integer().to_i128())
+        .flatten()
+    else {
+        return HeaderValue::NotANumber;
+    };
+    let (_, digits) = split_sign(text);
+    if !digits.is_empty() && all_digits(digits) {
+        HeaderValue::Integer(n)
+    } else {
+        HeaderValue::Decimal(n)
+    }
 }
 
 /// Parses a two-character base-36 id (`00`-`ZZ`, any case).
@@ -263,6 +291,40 @@ mod tests {
             "1e", "e3", ".e3", "1e+", "1e1.5", "++1", "1e--1", "1.5f", "1e 3",
         ] {
             assert_eq!(parse_decimal(bad), Err(DecimalError::Malformed), "{bad}");
+        }
+    }
+
+    #[test]
+    fn header_values_keep_their_class_and_exact_value() {
+        use bms_model::HeaderValue::{Decimal, Integer, NotANumber};
+        let one = bms_model::HeaderValue::ONE;
+        for (text, value) in [
+            ("120", Integer(120 * one)),
+            ("+3", Integer(3 * one)),
+            ("-2", Integer(-2 * one)),
+            ("007", Integer(7 * one)),
+            ("-0", Integer(0)),
+            ("999999999999", Integer(999_999_999_999 * one)),
+            ("120.0", Decimal(120 * one)),
+            ("120.", Decimal(120 * one)),
+            ("120.5", Decimal(120 * one + one / 2)),
+            ("1E2", Decimal(100 * one)),
+            (".5", Decimal(one / 2)),
+            ("0.000000000000000001", Decimal(1)),
+            // Cut off to 0, still a decimal.
+            ("0.0000000000000000001", Decimal(0)),
+            (
+                "-999999999999.999999999999999999",
+                Decimal(-(10_i128.pow(30) - 1)),
+            ),
+            ("", NotANumber),
+            ("easy", NotANumber),
+            ("1,5", NotANumber),
+            ("NaN", NotANumber),
+            ("1000000000000", NotANumber),
+            ("1e19", NotANumber),
+        ] {
+            assert_eq!(super::header_value(text), value, "{text}");
         }
     }
 

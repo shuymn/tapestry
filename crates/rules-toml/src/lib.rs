@@ -12,9 +12,9 @@
 use bms_model::TimeUs;
 use rules::{
     Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
-    MineRule, MissRule, PerJudgment, RankScale, RuleError, RulePreset, SameTimeOrder, ScoreWeights,
-    TotalMode, Window,
+    HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
+    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RuleError, RulePreset, SameTimeOrder,
+    ScoreWeights, TotalMode, Window,
 };
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +75,7 @@ struct PresetFile {
     ln_end: LnEndFile,
     miss: MissFile,
     empty_poor: EmptyPoorFile,
+    headers: HeadersFile,
     rank_scale: RankScaleFile,
     default_total_milli: i64,
     denominator: DenominatorFile,
@@ -107,6 +108,13 @@ struct WindowsFile {
     great: WindowFile,
     good: WindowFile,
     bad: WindowFile,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HeadersFile {
+    Decimals,
+    IntegerRanks,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -303,6 +311,7 @@ impl From<PresetFile> for RulePreset {
             ln_end,
             miss,
             empty_poor,
+            headers,
             rank_scale,
             default_total_milli,
             denominator,
@@ -340,6 +349,10 @@ impl From<PresetFile> for RulePreset {
                 perfect: TimeUs(ln_end.perfect_early_us),
                 great: TimeUs(ln_end.great_early_us),
                 good: TimeUs(ln_end.good_early_us),
+            },
+            headers: match headers {
+                HeadersFile::Decimals => HeaderPolicy::Decimals,
+                HeadersFile::IntegerRanks => HeaderPolicy::IntegerRanks,
             },
             rank_scale: RankScale {
                 rank_milli: rank_scale.rank_milli,
@@ -414,6 +427,7 @@ impl From<&RulePreset> for PresetFile {
             miss,
             empty_poor,
             ln_end,
+            headers,
             rank_scale,
             default_total_milli,
             denominator,
@@ -467,6 +481,10 @@ impl From<&RulePreset> for PresetFile {
                     great_early_us: great.0,
                     good_early_us: good.0,
                 }
+            },
+            headers: match headers {
+                HeaderPolicy::Decimals => HeadersFile::Decimals,
+                HeaderPolicy::IntegerRanks => HeadersFile::IntegerRanks,
             },
             rank_scale: RankScaleFile {
                 rank_milli: rank_scale.rank_milli,

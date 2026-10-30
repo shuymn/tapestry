@@ -3,7 +3,9 @@
 
 use std::time::Instant;
 
-use bms_model::{BEAT, Chart, JudgeRank, Note, NoteKind, Position, TimeUs};
+use bms_model::{
+    BEAT, Chart, HeaderValue, JudgmentHeader, JudgmentHeaderName, Note, NoteKind, Position, TimeUs,
+};
 use bms_parser::{Limits, LoadError, LoadOptions, Loaded, Warning, WarningKind, load_bms};
 use sha2::{Digest, Sha256};
 
@@ -117,7 +119,8 @@ fn cycling() -> String {
 
 /// What the evaluator and the audio see of a load, as text: the outcome,
 /// then per lane each note's time, kind, mine damage, sound and long-note
-/// end and end sound, the BGM, the sound names, rank, TOTAL and LN mode, and
+/// end and end sound, the BGM, the sound names, the judgment-header
+/// declarations and LN mode, and
 /// the warnings in order. Display geometry is left out.
 fn projection(result: &Result<Loaded, LoadError>) -> String {
     use std::fmt::Write;
@@ -149,12 +152,7 @@ fn projection(result: &Result<Loaded, LoadError>) -> String {
         writeln!(out, "sound {:?}", s.name).unwrap();
     }
     let meta = &chart.meta;
-    writeln!(
-        out,
-        "meta {:?} {:?} {:?}",
-        meta.rank, meta.total_milli, meta.ln_mode
-    )
-    .unwrap();
+    writeln!(out, "meta {:?} {:?}", meta.judgment_headers, meta.ln_mode).unwrap();
     for w in &loaded.warnings {
         writeln!(out, "warning {w:?}").unwrap();
     }
@@ -208,11 +206,11 @@ fn every_fixture_keeps_its_judgment_projection() {
     let expected = [
         (
             "bpm_stop.bms",
-            "4e5e2428b3d80ab8a6fc1cc1ea7da0227e4080bd6f59f6f55902b4cf175dd1c8",
+            "ee6328eab2c830033190644e067dc36cc1a8b9c121398614c9710e7ae6ea3632",
         ),
         (
             "case_variant.bms",
-            "5cbf4dc33d7ce569561f9cc8d00d665d9d14e3a8cd15a89697915d6358cdbc96",
+            "7a8d1dcac2532a7ca03d031a7ab5f2d34717dc8ea5ffe0a688eda29bb058a9a0",
         ),
         (
             "escape_drive.bms",
@@ -220,11 +218,11 @@ fn every_fixture_keeps_its_judgment_projection() {
         ),
         (
             "escape_fallback.bms",
-            "102f0f06d65b7b96b43376e0efc3b80d9b2c3ec06cc458ec2129b399bb437dee",
+            "474c0017b71fa3cf199a5ec2385588a14e945fbe53523d05198104910b76dce9",
         ),
         (
             "escape_junction.bms",
-            "decc289c2df6aac281754a31b89bd96412c9efaf847a8b3ffd707e709e939b9c",
+            "4330b954cf4a1a0b15ad30a02c4d98c704eae68ee75f0f85d806babba77f6408",
         ),
         (
             "escape_parent.bms",
@@ -240,7 +238,11 @@ fn every_fixture_keeps_its_judgment_projection() {
         ),
         (
             "fallback.bms",
-            "3e085b4c6c898277778b0b422ebdab0780923d250d9f6a1368e3c8ad313b2475",
+            "36787d686812e590e5a9312defef0ab923685a8a55e1bec2d947d8a63508bb80",
+        ),
+        (
+            "judgment_headers.bms",
+            "59b8d6a16efbb14bacf5579127865d3be7fe1ca3ad8b543b0e501727f271d66e",
         ),
         (
             "limits_measure.bms",
@@ -252,27 +254,27 @@ fn every_fixture_keeps_its_judgment_projection() {
         ),
         (
             "long_notes_lnobj.bms",
-            "df36e6434f2082610f425f5be7fda5677d8fc01e1e6747bf0755a8bfb94521c3",
+            "e2037b5591355e9089b47dc976871f437007a934605925a1e6f7608910da1225",
         ),
         (
             "long_notes_lntype1.bms",
-            "df36e6434f2082610f425f5be7fda5677d8fc01e1e6747bf0755a8bfb94521c3",
+            "e2037b5591355e9089b47dc976871f437007a934605925a1e6f7608910da1225",
         ),
         (
             "mines.bms",
-            "214e44342cbdfc11e18ab8befb21932837ffc6c96513996895cbe267ce4754ab",
+            "71f58b2514980237db591576a39bd6bbda021e69d7d7f22829c7136f89992961",
         ),
         (
             "random_branches.bms",
-            "d5822813f3d42775b09f9547a713e52987e64634b0cab81eaaa03c5085e48681",
+            "635463b9aec927df48acc0f99d4b7a6915922da817aa139d6897ec4a0fa4a96b",
         ),
         (
             "random_nested.bms",
-            "f4bf838f7c6a97c773acee2e94a9f9db948017306ac7715d39ad51c8e538e4f5",
+            "51fbd47ed5f8bc7ce0b483f108b1c6f7189fd5f0648fce6250f91d904998cd29",
         ),
         (
             "shift_jis_title.bms",
-            "24e193fbca9ab172637044f62d9b750677db7865406b4ab15e73837ca5cd2e15",
+            "37d5ee612e38eeb02d3450070bbc1895370bc5c453cdcf9aa8b35a231e34e982",
         ),
         (
             "unsupported_lnmode.bms",
@@ -288,23 +290,23 @@ fn every_fixture_keeps_its_judgment_projection() {
         ),
         (
             "mixed",
-            "3df1b2a74949eacae2d9e50175c076678a6985f3eba6a562624c0e83afb33e94",
+            "60d84c6d8a24b347b902fc6ea147f1f5fc0963e8115cb2cce2a510cb594b7d27",
         ),
         (
             "cycling",
-            "9222e9a5bea6c6ed2791bbd102df1c0d9b124018fd5634539159b38c8ab98e39",
+            "bd68b689f5e1f6a92283ddfa85564b06ef414226b9c23f84b96b5426762719c9",
         ),
         (
             "primes",
-            "5bf97bc7cf5155759cc572063a587e63879f4e826a462912195fb02dd8e22381",
+            "6c34e5a5a51c2b639174a813729f9579960d5dcad20648cd50e3f343d4815890",
         ),
         (
             "long decimals",
-            "d33bbac52272bb60112eb78f5f134fa20efef7f6d5902c534e536c0096a6c185",
+            "25d83c7a3e94afa9863ba4888eb2b1a6396999269c6f2707d3a697b09494af0c",
         ),
         (
             "growing",
-            "00d4849032bc440e20d8815a3aa8b0b6837ec5879538a51f4ca627e1e38d45b3",
+            "4e5f0fe237a8bcd58bfbb363fe228b58704c73c3fabf69a3fa072da12a1cdca2",
         ),
     ];
     let got: Vec<(&str, &str)> = got.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
@@ -458,26 +460,61 @@ fn total_and_defexrank_take_the_decimal_grammar() {
         let loaded = load(&format!("#BPM 120\n{header}\n#WAV01 a.wav\n#00111:01\n")).unwrap();
         (loaded.chart.meta, loaded.warnings)
     };
+    let one = HeaderValue::ONE;
+    let header = |name, value| vec![JudgmentHeader { name, value }];
     let (m, w) = meta("#TOTAL 312.3456789");
-    assert_eq!((m.total_milli, w), (Some(312_345), vec![]));
+    assert_eq!(
+        (m.judgment_headers, w),
+        (
+            header(
+                JudgmentHeaderName::Total,
+                HeaderValue::Decimal(312 * one + 345_678_900_000_000_000)
+            ),
+            vec![]
+        )
+    );
     let (m, w) = meta("#TOTAL 2.5E+02");
-    assert_eq!((m.total_milli, w), (Some(250_000), vec![]));
+    assert_eq!(
+        (m.judgment_headers, w),
+        (
+            header(JudgmentHeaderName::Total, HeaderValue::Decimal(250 * one)),
+            vec![]
+        )
+    );
     let (m, w) = meta("#DEFEXRANK 1.0000005E+02");
     assert_eq!(
-        (m.rank, w),
-        (Some(JudgeRank::DefExRankMilli(100_000)), vec![])
+        (m.judgment_headers, w),
+        (
+            header(
+                JudgmentHeaderName::DefExRank,
+                HeaderValue::Decimal(100 * one + one / 20_000)
+            ),
+            vec![]
+        )
     );
-    // An invalid value stays a warning: it does not change timing.
-    for (header, what) in [("#TOTAL 1e19", "#TOTAL"), ("#DEFEXRANK 7e13", "#DEFEXRANK")] {
-        let (m, w) = meta(header);
-        assert_eq!((m.total_milli, m.rank), (None, None), "{header}");
+    // A value outside the bounds is not a number, kept and warned: it does
+    // not change timing.
+    for (text, name, what) in [
+        ("#TOTAL 1e19", JudgmentHeaderName::Total, "#TOTAL"),
+        (
+            "#DEFEXRANK 7e13",
+            JudgmentHeaderName::DefExRank,
+            "#DEFEXRANK",
+        ),
+    ] {
+        let (m, w) = meta(text);
+        assert_eq!(
+            m.judgment_headers,
+            header(name, HeaderValue::NotANumber),
+            "{text}"
+        );
         assert_eq!(
             w,
             vec![Warning {
                 line: Some(2),
-                kind: WarningKind::IgnoredValue(what)
+                kind: WarningKind::NotANumber(what)
             }],
-            "{header}"
+            "{text}"
         );
     }
 }

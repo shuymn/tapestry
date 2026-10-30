@@ -115,8 +115,11 @@ pub enum WarningKind {
     InvalidObject,
     /// Channel data with an odd number of characters; the last is ignored.
     OddObjectData,
-    /// A malformed descriptive value (`#RANK`, `#TOTAL`, ...); ignored.
+    /// A value naming nothing (`#LNOBJ`, `#LNTYPE`); ignored.
     IgnoredValue(&'static str),
+    /// A judgment header (`#RANK`, `#DEFEXRANK`, `#TOTAL`) that is not a
+    /// number; kept as one, for the preset's header policy to read.
+    NotANumber(&'static str),
     /// No `#BPM`; 130 is used.
     MissingBpm,
     /// `#PLAYER` other than 1; the notes decide whether the chart loads.

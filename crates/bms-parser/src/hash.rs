@@ -1,6 +1,6 @@
 //! File hashes and the resolved-chart hash.
 
-use bms_model::{Chart, JudgeRank, LnMode, NoteKind, SoundId};
+use bms_model::{Chart, HeaderValue, JudgmentHeaderName, LnMode, NoteKind, SoundId};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 
@@ -11,8 +11,10 @@ pub fn file_hashes(bytes: &[u8]) -> ([u8; 32], [u8; 16]) {
 
 /// SHA-256 over a canonical encoding of the resolved chart: loader version,
 /// the scroll map (initial rate and segments), notes with their display
-/// positions, BGM, bar-line positions, sound names as written and header
-/// values. Resolved sound paths are left out, so moving the chart folder
+/// positions, BGM, bar-line positions, sound names as written, the title,
+/// the judgment-header declarations in their canonical form (header, class
+/// and exact value; never the text) and the LN mode. Resolved sound paths
+/// are left out, so moving the chart folder
 /// keeps the hash, and so are the `#RANDOM` results, which identify how the
 /// chart was resolved rather than what it resolved to; they stay in
 /// `ChartIdentity` beside the hash.
@@ -67,22 +69,24 @@ pub fn resolved_hash(chart: &Chart) -> [u8; 32] {
         h.bytes(sound.name.as_bytes());
     }
     h.bytes(chart.meta.title.as_bytes());
-    match chart.meta.rank {
-        None => h.u8(0),
-        Some(JudgeRank::Rank(r)) => {
-            h.u8(1);
-            h.i64(i64::from(r));
-        }
-        Some(JudgeRank::DefExRankMilli(r)) => {
-            h.u8(2);
-            h.i64(r);
-        }
-    }
-    match chart.meta.total_milli {
-        None => h.u8(0),
-        Some(t) => {
-            h.u8(1);
-            h.i64(t);
+    let headers = &chart.meta.judgment_headers;
+    h.len(headers.len());
+    for header in headers {
+        h.u8(match header.name {
+            JudgmentHeaderName::Rank => 0,
+            JudgmentHeaderName::DefExRank => 1,
+            JudgmentHeaderName::Total => 2,
+        });
+        match header.value {
+            HeaderValue::Integer(v) => {
+                h.u8(0);
+                h.i128(v);
+            }
+            HeaderValue::Decimal(v) => {
+                h.u8(1);
+                h.i128(v);
+            }
+            HeaderValue::NotANumber => h.u8(2),
         }
     }
     h.u8(match chart.meta.ln_mode {

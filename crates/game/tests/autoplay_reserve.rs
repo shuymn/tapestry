@@ -17,7 +17,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use audio::{AudioEngine, MAX_VOICES};
-use bms_model::{BgmEvent, Chart, ChartBuilder, JudgeRank, SoundId, TimeUs};
+use bms_model::{
+    BgmEvent, Chart, ChartBuilder, HeaderValue, JudgmentHeader, JudgmentHeaderName, SoundId, TimeUs,
+};
 use common::{MS, custom_settings, lane};
 use eval::{EvalError, PhysicalInputEvent};
 use game::{
@@ -262,10 +264,14 @@ fn autoplay_buffers_are_charged_and_admitted_before_they_exist() {
     drop(session);
 
     // The same over-budget chart with a rank the evaluator refuses
-    // (`#DEFEXRANK 0`): the refusal comes from the plan too, before the
-    // stream is made, never an admission that skipped the check.
+    // (`#DEFEXRANK 3000000`, edges past 2^32 µs): the refusal comes from the
+    // plan too, before the stream is made, never an admission that skipped
+    // the check.
     let mut unranked = over;
-    unranked.meta.rank = Some(JudgeRank::DefExRankMilli(0));
+    unranked.meta.judgment_headers = vec![JudgmentHeader {
+        name: JudgmentHeaderName::DefExRank,
+        value: HeaderValue::integer(3_000_000),
+    }];
     let session = loaded(dir.path(), &unranked);
     let refusal = LogicError::Eval(EvalError::InvalidRank);
     let (plan_bytes, plan) = measured(|| session.plan(&[DeviceKind::Keyboard], &[Vec::new()]));

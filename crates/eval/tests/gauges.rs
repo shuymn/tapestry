@@ -9,7 +9,7 @@
 mod common;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use common::{MS, device, lane, press, release};
+use common::{MS, device, lane, press, release, total};
 use eval::{EvalError, EvalInput, Evaluation, InputStart, JudgeEventKind, evaluate};
 use rules::{GaugeDelta, GaugeValue, Judgment, RulePreset};
 
@@ -483,10 +483,10 @@ fn non_positive_total_counts_as_absent() {
         .tap(lane(1), TimeUs(5_000 * MS))
         .build()
         .unwrap();
-    for total in [None, Some(0), Some(-1), Some(-160_000)] {
-        chart.meta.total_milli = total;
+    for declared in [None, Some(0), Some(-1), Some(-160_000)] {
+        chart.meta.judgment_headers = declared.map(total).into_iter().collect();
         let e = play(&chart, vec![press(1_000 * MS, 0, 1)]);
-        assert_eq!(history(&e, 0)[0], 5_200_000, "{total:?}");
+        assert_eq!(history(&e, 0)[0], 5_200_000, "{declared:?}");
     }
 }
 
@@ -529,7 +529,7 @@ fn gauge_rounding_is_floor_in_i128() {
         .tap(lane(1), TimeUs(3_000 * MS))
         .build()
         .unwrap();
-    chart.meta.total_milli = Some(100_001);
+    chart.meta.judgment_headers = vec![total(100_001)];
     let e = play(
         &chart,
         vec![
@@ -552,9 +552,9 @@ fn gauge_rounding_is_floor_in_i128() {
         }
     );
 
-    // An extreme #TOTAL overflows i64 before clamping; it stays in i128 and
-    // is clamped to the cap.
-    chart.meta.total_milli = Some(i64::MAX);
+    // The largest #TOTAL a chart can declare (12 integer digits) is far
+    // past the cap; the increment stays in i128 and is clamped to it.
+    chart.meta.judgment_headers = vec![total(999_999_999_999_999)];
     let e = play(&chart, vec![press(1_030 * MS, 0, 1)]);
     assert_eq!(e.gauges[0].history[0].value, GaugeValue::FULL);
 }
