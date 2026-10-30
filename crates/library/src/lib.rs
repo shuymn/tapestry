@@ -215,6 +215,8 @@ impl Drop for ScanLease {
 /// when it exists, or else, when there is no entry at all, its resolved
 /// folder and its name. An entry that exists but does not resolve, such as
 /// a link to a missing file, is refused, so nothing deletes or replaces it.
+/// The check is made on the path that will be created, so a spelling such
+/// as a trailing separator cannot hide the entry there.
 fn resolve(path: &Path) -> Result<PathBuf, LibraryError> {
     let unresolved = |source| LibraryError::Resolve {
         path: path.to_owned(),
@@ -222,7 +224,7 @@ fn resolve(path: &Path) -> Result<PathBuf, LibraryError> {
     };
     match fs::canonicalize(path) {
         Ok(file) => Ok(file),
-        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() => {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let name = path.file_name().ok_or_else(|| {
                 unresolved(io::Error::new(io::ErrorKind::InvalidInput, "no file name"))
             })?;
@@ -230,7 +232,13 @@ fn resolve(path: &Path) -> Result<PathBuf, LibraryError> {
                 Some(dir) if !dir.as_os_str().is_empty() => dir,
                 _ => Path::new("."),
             };
-            Ok(fs::canonicalize(dir).map_err(unresolved)?.join(name))
+            let candidate = fs::canonicalize(dir).map_err(unresolved)?.join(name);
+            match fs::symlink_metadata(&candidate) {
+                Err(gone) if gone.kind() == io::ErrorKind::NotFound => Ok(candidate),
+                // An entry is there, yet the path did not resolve to it.
+                Ok(_) => Err(unresolved(e)),
+                Err(other) => Err(unresolved(other)),
+            }
         }
         Err(e) => Err(unresolved(e)),
     }

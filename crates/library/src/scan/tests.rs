@@ -759,18 +759,33 @@ fn a_link_to_a_missing_file_is_refused_and_kept() {
         println!("skipped: this system does not allow creating file links");
         return;
     }
-    assert!(matches!(
-        Library::open(&alias),
-        Err(LibraryError::Resolve { .. })
-    ));
-    assert!(
-        fs::symlink_metadata(&alias)
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "the link is still there"
-    );
-    assert!(!dir.path().join("missing.db").exists());
+    // As written, and with a trailing separator, which makes resolution
+    // follow the link while the file name drops the separator.
+    let mut spellings = vec![alias.clone()];
+    for separator in ["/", "\\"] {
+        if cfg!(windows) || separator == "/" {
+            let mut spelled = alias.clone().into_os_string();
+            spelled.push(separator);
+            spellings.push(PathBuf::from(spelled));
+        }
+    }
+    for spelling in &spellings {
+        let opened = Library::open(spelling);
+        assert!(
+            matches!(opened, Err(LibraryError::Resolve { .. })),
+            "{}: {opened:?}",
+            spelling.display()
+        );
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{}: the link is still there",
+            spelling.display()
+        );
+        assert!(!dir.path().join("missing.db").exists());
+    }
 }
 
 /// A library indexing `BATCH + 44` files, all of them since deleted, so the
