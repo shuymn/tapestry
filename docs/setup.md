@@ -137,7 +137,7 @@ CPU-side time ([design.md](design.md), "Measurement") is measured with `criterio
 | --- | --- | --- |
 | `eval` | `benches/evaluate.rs` | `evaluate` over generated 2,000- and 10,000-note charts with dense input, and the same plays advanced live in 1 ms steps |
 | `bms-parser` | `benches/load.rs` | `load_bms` on generated text with thousands of BPM changes |
-| `library` | `benches/scan.rs` | `read_header` on a dense generated chart, and a full scan of 300 generated chart files into a new database |
+| `library` | `benches/scan.rs` | `read_header` on a dense generated chart, a full scan of 300 generated chart files into a new database, and searches and sorts over an index of 10,000 generated header-only charts |
 | `render` (Windows only) | `benches/skin.rs` | `SimpleSkin::build` on a dense frame, without a GPU |
 
 - Run them with `mise exec -- cargo bench -p eval -p bms-parser -p library` and `mise exec -- cargo bench -p render`. Add `-- --test` to run each once without measuring, as CI does so they do not rot. To compare two commits locally, run `cargo bench -p eval -p bms-parser -p library --bench evaluate --bench load --bench scan -- --save-baseline <name>` on one and `-- --baseline <name>` on the other (naming the benches keeps the unit-test harnesses, which do not take criterion's options, out of the run).

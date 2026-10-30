@@ -86,9 +86,11 @@ thiserror = "2.0.21"
 # player and xtask (error reports) and game (tests)
 anyhow = "1.0.104"
 
+# library (search text) and xtask
+unicode-normalization = "0.1.26"
+
 # xtask (dev tooling, never shipped)
 cargo_metadata = "0.23.1"
-unicode-normalization = "0.1.26"
 # The lint site check parses Rust source.
 proc-macro2 = { version = "1.0.107", default-features = false }
 quote = { version = "1.0.47", default-features = false }
