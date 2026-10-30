@@ -42,6 +42,7 @@
 
 mod error;
 mod record;
+pub mod verify;
 mod wire;
 
 use bms_model::{ChartIdentity, Lane, TimeUs};

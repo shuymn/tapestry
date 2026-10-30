@@ -57,7 +57,7 @@ triple_buffer = "9.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 
-# game and xtask
+# game and xtask, and replay (dev only)
 tempfile = "3.27.0"
 
 # player (Windows only)
