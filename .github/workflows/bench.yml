@@ -2,8 +2,8 @@ name: Bench
 
 # The CPU benchmarks on the merge base and on the head, each crate group in
 # one job on one runner, with criterion's change estimates printed at the end
-# (docs/setup.md "Benchmarks"). `compare` runs `eval` and `bms-parser` on
-# Linux, `compare-render` runs `render` on Windows. Neither is a required
+# (docs/setup.md "Benchmarks"). `compare` runs `eval`, `bms-parser` and
+# `library` on Linux, `compare-render` runs `render` on Windows. Neither is a required
 # check and neither fails the run: shared runners are noisy, so a reviewer
 # reads the numbers.
 
@@ -66,7 +66,12 @@ jobs:
             echo "::notice::The merge base has no benchmarks; there is nothing to compare."
             exit 0
           fi
-          if mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" -p eval -p bms-parser --bench evaluate --bench load -- --save-baseline base; then
+          benches=(-p eval -p bms-parser --bench evaluate --bench load)
+          # A merge base from before the library benchmark runs without it.
+          if [ -f "$RUNNER_TEMP/base/crates/library/benches/scan.rs" ]; then
+            benches+=(-p library --bench scan)
+          fi
+          if mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" "${benches[@]}" -- --save-baseline base; then
             echo "saved=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::The benchmarks of the merge base failed."
@@ -80,7 +85,7 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          mise exec -- cargo bench --no-fail-fast -p eval -p bms-parser --bench evaluate --bench load -- --baseline-lenient base 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
+          mise exec -- cargo bench --no-fail-fast -p eval -p bms-parser -p library --bench evaluate --bench load --bench scan -- --baseline-lenient base 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
           {
             echo '### Benchmarks: head against merge base'
             echo 'Shared runners fluctuate; read a change as real only when it is large and repeats.'

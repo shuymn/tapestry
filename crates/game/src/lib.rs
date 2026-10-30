@@ -71,8 +71,8 @@ pub use session::{
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,
-    OVERLAY_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig, SettingsError,
-    load_settings, reserved_key, save_settings,
+    LibrarySettings, OVERLAY_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig,
+    SettingsError, load_settings, reserved_key, save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{

@@ -136,7 +136,7 @@ egui comes with the first form-like screen.
 
 **The crate.** `library` is L4, GPL-3.0-or-later and portable, on `rusqlite` (bundled, FTS5). It is added to `LICENSES` (xtask/src/arch.rs:47), `REQUIRED_PORTABLE` (xtask/src/portable.rs:16) and the fixture.
 
-**The database file.** `library.db` lives under the data root, in WAL mode. The scan's writer thread owns one writer connection; the game thread owns one reader connection and queries only outside play.
+**The database file.** `library.db` lives under the data root, in WAL mode. The scan thread owns one writer connection; the game thread owns one reader connection and queries only outside play.
 
 **Schema.** `PRAGMA user_version` holds the version, bumped by one at each merge that changes the schema:
 
@@ -153,14 +153,14 @@ egui comes with the first form-like screen.
 
 ### D6. Background scanning
 
-- **Reading.**
-  - A walker lists `.bms`, `.bme` and `.bml` files.
-  - Two parser threads read every file whose `(path, size, mtime)` changed. Each reads the bytes (16 MiB cap), computes SHA-256 and MD5, and calls `bms_parser::read_header`.
+- **One scan thread (decided).** It lists `.bms`, `.bme` and `.bml` files, and in turn reads every file whose `(path, size, mtime)` changed (16 MiB cap), computes SHA-256 and MD5, calls `bms_parser::read_header`, and commits.
   - `read_header` keeps only top-level header commands; it resolves no `#RANDOM` and computes no time.
-- **Writing.** A writer commits in batches of 256. Rows for missing files are removed.
+  - Why: pausing, shutdown and failure live on one state that only this thread changes, so no acknowledgment or end can be lost between threads.
+  - Cost: reading does not overlap hashing and committing (a full scan of 300 generated files: about 136 ms, against 86 ms with separate walker, parser and writer threads).
+- **Writing.** Commits in batches of 256. Rows for missing files are removed.
 - **Pausing.**
   - Choosing a chart requests a pause before loading.
-  - The workers finish the file in hand, the writer commits, and they acknowledge.
+  - The thread finishes the file in hand, commits, and acknowledges.
   - The countdown starts only after the acknowledgment.
   - Every entry into selection releases the pause (after a refusal, Back, or quit from play), and so does entering a result screen.
 - **Priority.** A start hook from `player` sets background mode, so Windows code stays in `player`.
@@ -827,7 +827,8 @@ Each one holds the behavior D5 and D6 state.
 - `refused_load_releases_the_scan_pause`: after a refusal, a newly added chart is discovered without any completed play;
 - the pause is acknowledged before each countdown;
 - the load time is printed;
-- unknown arguments exit 2.
+- unknown arguments exit 2;
+- a second player process started on the same data root is refused before it opens `library.db`, with a message naming the folder (`second_process_is_refused_before_the_library_opens`). `library` already refuses a second `Library` of the file in any process (`LibraryError::AlreadyOpen`, from its lock on `library.db.lock`); the player still decides what a second process does, and today's `tapestry.lock` only decides which process writes the log.
 
 ### PR16. Preset shelf, first-start presets and polling (`game`)
 
