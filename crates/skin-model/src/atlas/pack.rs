@@ -241,11 +241,20 @@ mod tests {
             per_page[place.page as usize] += 1;
         }
         assert_eq!(per_page, [32_767, 32_767, 2]);
-        // No two cells of a page overlap: sort by page, then position, and
-        // compare neighbours on the same row of 24-texel slots.
-        let mut seen = std::collections::HashSet::new();
+        // No two allocations of a page overlap: mark every 8×8 block each
+        // covers (all are aligned to 8) and find none marked twice.
+        let blocks = 8_192 / 8;
+        let mut taken = vec![false; 3 * blocks * blocks];
         for place in &p.places {
-            assert!(seen.insert((place.page, place.alloc[0], place.alloc[1])));
+            let [x, y, w, h] = place.alloc.map(|v| v as usize / 8);
+            assert!(w >= 3 && h >= 3, "{place:?}");
+            for by in y..y + h {
+                for bx in x..x + w {
+                    let at = (place.page as usize * blocks + by) * blocks + bx;
+                    assert!(!taken[at], "{place:?} overlaps at block {bx}, {by}");
+                    taken[at] = true;
+                }
+            }
         }
     }
 
