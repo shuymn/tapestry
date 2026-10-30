@@ -595,7 +595,7 @@ Analysis runs at 1× and its result is reused at every speed.
 - **Creating a user preset, for now.** `eval-cli preset export <built-in> <path>` (for example `eval-cli preset export beatoraja-style my-rules.toml`) writes that built-in to a new TOML file, which the player puts in `presets\`. `eval-cli` is portable and does not locate the data root, so it takes a path. It refuses a path whose file exists and one whose stem is a built-in's name, and writes nothing then. Creating and editing presets in a game screen is not built yet: it arrives later with an in-game settings screen (design.md "Libraries"; D4).
 - **What goes away.** `standard_preset` and the writing of a missing preset file. Nothing writes a preset file at first start or at any other time, except the export command.
 - **Where it lands.** PR7 made beatoraja-style the default. PR16 makes the rename, the built-ins and the user presets, and adds the export command: the export is how a player gets an editable file once the game stops writing them, so it lands in the PR that stops the writing, which is also the first PR with all three built-ins (after PR8) and the stem-named file.
-- **design.md** carries this ("Standard Presets", "User Presets", "The tapestry Preset", "Settings Files", "Tuning Without Restart"), marked not built yet until PR16.
+- **design.md** carries this ("Standard Presets", "User Presets", "The tapestry Preset", "Settings Files", "Tuning Without Restart").
 - **Why the default is not the tapestry preset:** play uses beatoraja-style by default, as design.md's own introduction describes ("You normally play with 'beatoraja-style'").
 
 ## 3. Pull requests
@@ -946,6 +946,8 @@ Each one holds the behavior D5 and D6 state.
 - When the chosen user preset's file changes while a select or result screen shows, the shelf shall reload it at the next 250 ms check, and the result screen shall re-evaluate under it (`changed_user_preset_reloads_within_a_poll`).
 - If a changed user preset fails to load, then the previous preset shall stay in use and the error shall be shown (`failed_reload_keeps_the_previous_preset`).
 - When a user preset changes during a play, that play shall keep the preset it started with, and the next play shall use the reloaded one (`plays_use_reloads_from_the_next_play`).
+
+**Status.** Built. The shelf (crates/game/src/presets.rs) is polled on the result screen through `Loaded::poll_presets` and handed to the rig with `Rig::preset_reloaded`; the select screen does not poll, since each chart's shelf is opened when the chart loads. The player's end screen does not draw a reload or its error yet: PR17 adds that with preset switching.
 
 ### PR17. Result screen and preset switching (`player`, `game`)
 
