@@ -157,82 +157,16 @@
 
 use bms_model::TimeUs;
 
+use crate::gauge_rules::{end_gauge, pct, survival_gauge};
+
 use crate::{
-    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
-    GaugeRule, GaugeValue, HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable,
-    LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment,
-    PerLaneClass, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode,
-    Window, WindowPolicy,
+    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, HeadEligibility,
+    HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows, LnMode,
+    LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RulePreset,
+    SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode, Window, WindowPolicy,
 };
 
 const MS: i64 = 1_000;
-
-/// `n` hundredths of a percent as a fixed change.
-const fn centi(n: i64) -> GaugeDelta {
-    GaugeDelta::Fixed(GaugeValue::centi_percent(n))
-}
-
-const fn pct(n: i64) -> GaugeValue {
-    GaugeValue(n * GaugeValue::PERCENT)
-}
-
-/// A gauge decided at the end: start 20 %, min 2 %, the `TOTAL` modifier on
-/// its increases, `up` in tenths of `TOTAL / notes` (PERFECT and GREAT,
-/// GOOD) and `damage` in hundredths of a percent (BAD, POOR, empty POOR).
-fn end_gauge(id: &str, clear: i64, up: [u32; 2], damage: [i64; 3]) -> GaugeRule {
-    let share = |tenths| GaugeDelta::TotalShare {
-        num: tenths,
-        den: 10,
-    };
-    let [bad, poor, empty] = damage.map(|d| centi(-d));
-    GaugeRule {
-        id: id.to_owned(),
-        kind: GaugeKind::EndThreshold { clear: pct(clear) },
-        start: pct(20),
-        min: pct(2),
-        max: GaugeValue::FULL,
-        change: PerJudgment {
-            perfect: share(up[0]),
-            great: share(up[0]),
-            good: share(up[1]),
-            bad,
-            poor,
-        },
-        empty_poor: empty,
-        correction: TotalCorrection::None,
-        low_damage: Vec::new(),
-    }
-}
-
-/// A survival gauge from 100 %, failing below 2 %, with fixed changes in
-/// hundredths of a percent: PERFECT, GREAT, GOOD, BAD, POOR, empty POOR.
-fn survival_gauge(
-    id: &str,
-    change: [i64; 6],
-    correction: TotalCorrection,
-    low_damage: Vec<LowDamage>,
-) -> GaugeRule {
-    let [perfect, great, good, bad, poor, empty] = change.map(centi);
-    GaugeRule {
-        id: id.to_owned(),
-        kind: GaugeKind::Survival {
-            fails_below: pct(2),
-        },
-        start: GaugeValue::FULL,
-        min: GaugeValue::EMPTY,
-        max: GaugeValue::FULL,
-        change: PerJudgment {
-            perfect,
-            great,
-            good,
-            bad,
-            poor,
-        },
-        empty_poor: empty,
-        correction,
-        low_damage,
-    }
-}
 
 /// One lane class's table: the keys' and the scratch's are the same.
 const fn table() -> LaneTable {
@@ -260,11 +194,12 @@ const fn table() -> LaneTable {
 pub fn lr2_style() -> RulePreset {
     // NORMAL comes first: the displayed gauge defaults to index 0.
     let gauges = vec![
-        end_gauge("normal", 80, [10, 5], [400, 600, 200]),
-        end_gauge("assist_easy", 60, [12, 6], [320, 480, 160]),
-        end_gauge("easy", 80, [12, 6], [320, 480, 160]),
+        end_gauge("normal", 80, [(10, 10), (5, 10)], [400, 600, 200]),
+        end_gauge("assist_easy", 60, [(12, 10), (6, 10)], [320, 480, 160]),
+        end_gauge("easy", 80, [(12, 10), (6, 10)], [320, 480, 160]),
         survival_gauge(
             "hard",
+            pct(2),
             [10, 10, 5, -600, -1_000, -200],
             TotalCorrection::ScaleDamage,
             vec![LowDamage {
@@ -275,12 +210,14 @@ pub fn lr2_style() -> RulePreset {
         ),
         survival_gauge(
             "ex_hard",
+            pct(2),
             [10, 10, 5, -1_200, -2_000, -200],
             TotalCorrection::ScaleDamage,
             Vec::new(),
         ),
         survival_gauge(
             "hazard",
+            pct(2),
             [15, 6, 0, -10_000, -10_000, -1_000],
             TotalCorrection::None,
             Vec::new(),
