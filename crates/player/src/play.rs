@@ -446,8 +446,6 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn ended(&mut self, report: &PlayReport) {
-        // Load times run to the play's first frame: from the load's start
-        // for the first play, from the retry's receipt for a retry.
         if let Some(c) = self.figures.as_ref().and_then(|f| f.countdown) {
             println!(
                 "countdown: setup {} us, first frame {} after it started",
@@ -456,6 +454,8 @@ impl Rig for PlayerRig<'_> {
                     .map_or_else(|| "N/A".to_owned(), |us| format!("{us} us"))
             );
         }
+        // Load times run to the play's first frame: from the load's start
+        // for the first play, from the retry's receipt for a retry.
         if let Some(frame) = self.render.first_frame() {
             match self.retry_from.take() {
                 Some(from) => self.times.retry = Some(since(from, frame)),
