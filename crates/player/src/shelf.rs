@@ -28,6 +28,9 @@ use library::{ChartEntry, Library, LibraryError, Opened, Scan, ScanOptions, Scan
 /// How long the last pass is over before the next starts, at the select
 /// screen.
 pub const RESCAN_AFTER: Duration = Duration::from_secs(10);
+/// How long the end of a run waits for a running pass to stop.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How often a countdown's wait for the scan's pause looks whether it
 /// was cancelled.
 pub const PAUSE_SLICE: Duration = Duration::from_millis(100);
@@ -302,6 +305,24 @@ impl Shelf {
     }
 }
 
+impl Drop for Shelf {
+    /// Stops the running pass, waiting at most [`STOP_TIMEOUT`]: a pass
+    /// stuck on its file system is left to end on its own, keeping the
+    /// library's lock until it does or the process exits.
+    fn drop(&mut self) {
+        if let Some(scan) = self.scan.take()
+            && !scan.stop_within(STOP_TIMEOUT)
+        {
+            let line = format!(
+                "library: the scan did not stop within {} s; it ends with the process",
+                STOP_TIMEOUT.as_secs()
+            );
+            eprintln!("{line}");
+            log::warn!("{line}");
+        }
+    }
+}
+
 /// The scan thread's start hook: background mode, which lowers its CPU,
 /// I/O and memory priority (design.md "Coexisting with Other Software").
 fn background_mode() {
@@ -506,5 +527,25 @@ mod tests {
         assert!(shelf.paused());
         // The scan thread ends once it can.
         open_gate(&gate);
+    }
+
+    /// The end of a run whose pass is stuck (its gate never opens) is
+    /// bounded: the shelf drops within its stop bound, and the stuck pass
+    /// keeps the library refused to another opening until it ends.
+    #[test]
+    fn a_stuck_pass_bounds_the_shutdown_and_keeps_the_library_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shelf, gate) = gated(dir.path());
+        let started = Instant::now();
+        drop(shelf);
+        assert!(started.elapsed() < super::STOP_TIMEOUT + Duration::from_secs(2));
+        let root = DataRoot::new(dir.path().join("data"));
+        assert!(matches!(open(&root), Err(OpenError::Running { .. })));
+        open_gate(&gate);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while open(&root).is_err() {
+            assert!(Instant::now() < deadline, "the lock stayed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

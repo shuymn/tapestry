@@ -969,15 +969,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let audio = audio.start(engine, probes.sounds.0);
     // Autoplay's queues are sized by each chart's feed, before its first
     // play; until then they hold nothing.
-    let sources = if autoplay {
-        SourceSet::new(SourceConfig {
-            queue_capacity: 0,
-            ..source_config()
-        })
-        .expect("8 sources are within the limit")
-    } else {
-        sources()
-    };
+    let mut sources = sources();
+    if autoplay {
+        sources.set_queue_capacity(0);
+    }
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {

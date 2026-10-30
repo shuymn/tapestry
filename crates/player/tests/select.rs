@@ -316,3 +316,25 @@ fn the_input_thread_idles_on_the_select_screen() {
     // A heartbeat would wake it about a thousand times a second.
     assert!(woke.iter().all(|&n| n < 50), "{woke:?}\n{stdout}");
 }
+
+/// A scripted pick of a chart further down than the window's queue holds
+/// keys moves there in batches and chooses that very chart.
+#[test]
+fn a_pick_past_the_key_queue_chooses_its_chart() {
+    let fx = fixture();
+    for k in 0..70 {
+        write_chart(
+            &fx.library,
+            "many",
+            &format!("c{k:02}.bms"),
+            &format!("t{k:02}"),
+            8_000,
+        );
+    }
+    let (_, stdout) = run(&fx, "pick=c69.bms,enter,back,close", &[]);
+    assert_eq!(lines(&stdout, "select: chose ").len(), 1, "{stdout}");
+    assert!(
+        lines(&stdout, "select: chose c69.bms ").len() == 1,
+        "{stdout}"
+    );
+}

@@ -31,6 +31,11 @@ use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
 use crate::shelf::{Shelf, file_name};
 use crate::window::ImeSwitch;
 
+/// Arrow keys a scripted pick queues at a time: fewer than the queue holds
+/// (dev-tools).
+#[cfg(feature = "dev-tools")]
+const PICK_BATCH: usize = crate::select::QUEUED_KEYS / 2;
+
 /// The select screen's side of the rig.
 pub struct Selection {
     /// The library and its scan.
@@ -100,11 +105,17 @@ impl Selection {
     }
 
     /// Takes the queued input; the chart it chose, if it did. Consecutive
-    /// edits of the search are searched once, at the end or before a key
-    /// that may choose from the list.
+    /// edits of the search or the order are searched once: at the end, or
+    /// before any other input, which acts on the list they make.
     fn drain(&mut self) -> Option<PathBuf> {
         while let Some(input) = self.menu.pop() {
-            if self.search_pending && input == MenuInput::Key(MenuKey::Enter) {
+            let edit = matches!(
+                input,
+                MenuInput::Text(_)
+                    | MenuInput::Preedit(_)
+                    | MenuInput::Key(MenuKey::Left | MenuKey::Right | MenuKey::Backspace)
+            );
+            if self.search_pending && !edit {
                 self.refresh();
             }
             if let Some(path) = self.act(input) {
@@ -163,8 +174,21 @@ impl Selection {
                         }
                         return false;
                     };
-                    typed.push(MenuInput::Key(MenuKey::Home));
-                    typed.extend(std::iter::repeat_n(MenuInput::Key(MenuKey::Down), at));
+                    // Toward the chart, a batch of keys the queue holds at a
+                    // time; the step is done once the chart is selected.
+                    let cursor = self.screen.cursor();
+                    if cursor != at {
+                        let key = if at > cursor {
+                            MenuKey::Down
+                        } else {
+                            MenuKey::Up
+                        };
+                        let n = at.abs_diff(cursor).min(PICK_BATCH);
+                        for _ in 0..n {
+                            self.menu.push(MenuInput::Key(key));
+                        }
+                        return true;
+                    }
                 }
                 Some(SelectStep::Wait(name)) => {
                     if listed(&self.screen, &name).is_none() {
@@ -458,5 +482,84 @@ impl AppRig for PlayerRig<'_> {
         sel.refresh();
         println!("select: {} charts listed", sel.screen.listed());
         sel.show(&self.render, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use bms_model::TimeUs;
+    use game::DataRoot;
+
+    use super::Selection;
+    use crate::select::{MenuInput, MenuKey, MenuQueue, SelectScreen};
+    use crate::shelf::{Shelf, open};
+
+    /// Titles A, B and C by artists Z, Y and X, scanned and listed in title
+    /// order, A under the cursor.
+    fn selection(dir: &std::path::Path) -> Selection {
+        let charts = dir.join("charts");
+        std::fs::create_dir_all(&charts).unwrap();
+        for (file, title, artist) in [("a", "A", "Z"), ("b", "B", "Y"), ("c", "C", "X")] {
+            let text = format!("#TITLE {title}\n#ARTIST {artist}\n#BPM 120\n#00111:01\n");
+            std::fs::write(charts.join(format!("{file}.bms")), text).unwrap();
+        }
+        let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
+        let shelf = Shelf::new(library, vec![charts.clone()], Duration::from_secs(60));
+        let mut sel = Selection {
+            shelf,
+            screen: SelectScreen::new(vec![charts]),
+            menu: Arc::new(MenuQueue::default()),
+            dropped: 0,
+            ime: None,
+            rate: 48_000,
+            chosen_at: TimeUs(0),
+            entered_at: TimeUs(0),
+            dirty: false,
+            search_pending: false,
+            #[cfg(feature = "dev-tools")]
+            script: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sel.screen.listed() < 3 {
+            assert!(Instant::now() < deadline, "the charts were not listed");
+            sel.shelf.poll(Instant::now());
+            sel.refresh();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sel
+    }
+
+    /// An order change queued before navigation is searched before the
+    /// navigation acts: in artist order A is last, so Down stays there and
+    /// Enter chooses A. Navigating the stale title order first would move
+    /// to B.
+    #[test]
+    fn an_order_change_is_searched_before_the_keys_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        for key in [MenuKey::Right, MenuKey::Down, MenuKey::Enter] {
+            sel.menu.push(MenuInput::Key(key));
+        }
+        let chosen = sel.drain().expect("Enter chooses");
+        assert_eq!(chosen.file_name().unwrap(), "a.bms");
+    }
+
+    /// Consecutive edits of the search are searched once, at the end.
+    #[test]
+    fn consecutive_search_edits_are_searched_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        sel.menu.push(MenuInput::Key(MenuKey::Tab));
+        let _ = sel.drain();
+        for c in ["c", "x"] {
+            sel.menu.push(MenuInput::Text(c.to_owned()));
+        }
+        sel.menu.push(MenuInput::Key(MenuKey::Backspace));
+        assert!(sel.drain().is_none());
+        assert!(!sel.search_pending);
+        assert_eq!(sel.screen.listed(), 1);
     }
 }

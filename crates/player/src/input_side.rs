@@ -118,7 +118,8 @@ pub struct InputState {
     connected: AtomicBool,
     /// The hook was dropped: the input thread ended, or is unwinding.
     gone: AtomicBool,
-    /// The hook's wakes so far.
+    /// The hook's wakes so far (dev-tools).
+    #[cfg(feature = "dev-tools")]
     wakes: std::sync::atomic::AtomicU64,
 }
 
@@ -350,6 +351,7 @@ impl Hook {
     /// checks the focus gate, so a focus loss during the audio tail or on
     /// the end screen is published.
     pub fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) -> Phase {
+        #[cfg(feature = "dev-tools")]
         self.state.wakes.fetch_add(1, Ordering::Relaxed);
         match (&mut self.mode, self.origin) {
             (Mode::Autoplay(feeder), Some(origin)) => {

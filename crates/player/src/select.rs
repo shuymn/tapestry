@@ -235,6 +235,12 @@ impl SelectScreen {
         self.entries.len()
     }
 
+    /// The index of the chart under the cursor (dev-tools scripts).
+    #[cfg(feature = "dev-tools")]
+    pub const fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     /// The charts listed, in order (dev-tools scripts).
     #[cfg(feature = "dev-tools")]
     pub fn entries(&self) -> &[ChartEntry] {
