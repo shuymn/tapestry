@@ -40,8 +40,8 @@ pub enum RuleError {
         /// Its version.
         version: u32,
     },
-    /// An LN-end edge was negative, or not wider than the better judgment's.
-    LnEndNotAscending {
+    /// An LN-end edge was negative, or narrower than the better judgment's.
+    LnEndFalling {
         /// The lane class whose table it is.
         class: LaneClass,
         /// The judgment whose edge is out of order.
@@ -103,9 +103,9 @@ impl fmt::Display for RuleError {
                 "the {name} evaluator version {version} is not supported (this build runs version {})",
                 crate::Implementation::STANDARD_VERSION
             ),
-            Self::LnEndNotAscending { class, judgment } => write!(
+            Self::LnEndFalling { class, judgment } => write!(
                 f,
-                "{}: the {judgment:?} LN-end edge is negative or not wider than the better judgment's",
+                "{}: the {judgment:?} LN-end edge is negative or narrower than the better judgment's",
                 class.name()
             ),
             Self::LnEndNarrowerThanNote { class, judgment } => write!(

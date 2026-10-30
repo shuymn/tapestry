@@ -12,12 +12,12 @@ use crate::{
 
 impl RulePreset {
     /// Checks that this build runs the preset's implementation, each lane
-    /// class's own windows and LN-end edges ascend and stay within
-    /// [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE) at every fixed scale of
-    /// the window policy (`#RANK 0` to `#RANK 4` and no rank), gauge values
-    /// stay within their bounds, and every factor and scale is usable.
-    /// Only the preset's own tables must ascend: edges the scale derives
-    /// may tie.
+    /// class's own windows ascend and its LN-end edges do not fall, both
+    /// within [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE) at every fixed
+    /// scale of the window policy (`#RANK 0` to `#RANK 4` and no rank),
+    /// gauge values stay within their bounds, and every factor and scale is
+    /// usable. Only the preset's own windows must ascend: edges the scale
+    /// derives may tie.
     ///
     /// # Errors
     ///
@@ -40,7 +40,7 @@ impl RulePreset {
         // declares it.
         let field = match self.window_policy {
             WindowPolicy::Thousandths(_) => "rank_scale",
-            WindowPolicy::Scaled(_) => "rank_percent",
+            WindowPolicy::Scaled(_) | WindowPolicy::Interpolated(_) => "rank_percent",
         };
         let ranks = (0..5).map(|r| Some(JudgeRank::Rank(r))).chain([None]);
         for rank in ranks {
@@ -129,19 +129,21 @@ fn check_windows(class: LaneClass, windows: &JudgeWindows) -> Result<(), RuleErr
     Ok(())
 }
 
-/// The LN-end edges are not negative, strictly widen from PERFECT to GOOD,
-/// and are each at least the note window's early edge of the same judgment:
-/// a press held at least as long as its long note releases at `d = h + hold
-/// − length ≥ h` from its end, which then never grades below the head.
+/// The LN-end edges are not negative, do not narrow from PERFECT to GOOD
+/// (they may tie: edges all at one width keep the head's judgment inside
+/// it and make an earlier release BAD), and are each at least the note
+/// window's early edge of the same judgment: a press held at least as long
+/// as its long note releases at `d = h + hold − length ≥ h` from its end,
+/// which then never grades below the head.
 fn check_ln_end(
     class: LaneClass,
     ln_end: &LnEndWindows,
     windows: &JudgeWindows,
 ) -> Result<(), RuleError> {
-    let mut previous = -1;
+    let mut previous = 0;
     for (judgment, edge) in ln_end.table() {
-        if edge.0 <= previous {
-            return Err(RuleError::LnEndNotAscending { class, judgment });
+        if edge.0 < previous {
+            return Err(RuleError::LnEndFalling { class, judgment });
         }
         previous = edge.0;
     }
@@ -333,8 +335,12 @@ mod tests {
         }
     }
 
+    /// design.md "LN Judgment Modes": LN-end edges tied at one width keep
+    /// the head inside it and make an earlier release BAD (LR2-style's 120,
+    /// 120, 120 ms), so they may tie; a narrower edge after a wider one is
+    /// refused, as is a negative one.
     #[test]
-    fn ln_end_edges_must_ascend_from_zero() {
+    fn ln_end_edges_may_tie_but_not_fall() {
         let with = |p: i64, g: i64, d: i64| {
             let mut preset = custom();
             let ln_end = &mut preset.tables.scratch.ln_end;
@@ -343,8 +349,8 @@ mod tests {
             ln_end.good = TimeUs(d);
             preset.validate()
         };
-        let not = |judgment| {
-            Err(RuleError::LnEndNotAscending {
+        let falls = |judgment| {
+            Err(RuleError::LnEndFalling {
                 class: LaneClass::Scratch,
                 judgment,
             })
@@ -352,10 +358,14 @@ mod tests {
         // The note windows' early edges are 20, 45 and 100 ms.
         assert_eq!(with(100_000, 150_000, 200_000), Ok(()));
         assert_eq!(with(100_000, 100_001, 100_002), Ok(()));
-        assert_eq!(with(100_000, 100_000, 200_000), not(Judgment::Great));
-        assert_eq!(with(100_000, 150_000, 150_000), not(Judgment::Good));
-        assert_eq!(with(100_000, 150_000, 149_999), not(Judgment::Good));
-        assert_eq!(with(-1, 150_000, 200_000), not(Judgment::Perfect));
+        assert_eq!(with(100_000, 100_000, 200_000), Ok(()));
+        assert_eq!(with(100_000, 150_000, 150_000), Ok(()));
+        assert_eq!(with(120_000, 120_000, 120_000), Ok(()));
+        assert_eq!(with(100_000, 99_999, 200_000), falls(Judgment::Great));
+        assert_eq!(with(100_000, 150_000, 149_999), falls(Judgment::Good));
+        assert_eq!(with(-1, 150_000, 200_000), falls(Judgment::Perfect));
+        // LR2-style's own edges tie, and validate.
+        assert_eq!(crate::lr2_style().validate(), Ok(()));
     }
 
     #[test]

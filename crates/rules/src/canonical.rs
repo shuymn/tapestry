@@ -24,14 +24,16 @@ use crate::{
     ScoreWeights, TotalCorrection, TotalMode, Window, WindowPolicy,
 };
 
-/// The encoding layout. Version 9 has a table per lane class (keys, then
+/// The encoding layout. Version 10 has a table per lane class (keys, then
 /// scratch: windows, LN-end edges, empty POOR range), the window policy
-/// after the header policy, two assignment variants (nearest first 0, combo
-/// priority 1), the LN head eligibility after the late head rule (inside BAD
-/// 0, not late BAD 1), the default `#TOTAL` as a policy, and per gauge a
-/// survival gauge's failure threshold, its `#TOTAL` correction and a list of
+/// after the header policy (thousandths 0; scaled 1 and interpolated 2,
+/// each with five rank percentages, the absent and the `#DEFEXRANK`
+/// percentage), two assignment variants (nearest first 0, combo priority
+/// 1), the LN head eligibility after the late head rule (inside BAD 0, not
+/// late BAD 1), the default `#TOTAL` as a policy, and per gauge a survival
+/// gauge's failure threshold, its `#TOTAL` correction and a list of
 /// low-damage bands.
-const FORMAT_VERSION: u64 = 9;
+const FORMAT_VERSION: u64 = 10;
 
 /// The fewest bytes a gauge takes: an empty id's length, the survival tag
 /// and a one-byte threshold, three one-byte values, six fixed deltas of a
@@ -290,20 +292,28 @@ impl Writer {
                 self.rank_scale(scale);
             }
             WindowPolicy::Scaled(scaled) => {
-                let ScaledRank {
-                    rank_percent,
-                    absent_percent,
-                    defexrank_percent,
-                } = *scaled;
                 self.uint(1);
-                self.len(rank_percent.len());
-                for p in rank_percent {
-                    self.uint(u64::from(p));
-                }
-                self.uint(u64::from(absent_percent));
-                self.uint(u64::from(defexrank_percent));
+                self.scaled_rank(scaled);
+            }
+            WindowPolicy::Interpolated(scaled) => {
+                self.uint(2);
+                self.scaled_rank(scaled);
             }
         }
+    }
+
+    fn scaled_rank(&mut self, scaled: &ScaledRank) {
+        let ScaledRank {
+            rank_percent,
+            absent_percent,
+            defexrank_percent,
+        } = *scaled;
+        self.len(rank_percent.len());
+        for p in rank_percent {
+            self.uint(u64::from(p));
+        }
+        self.uint(u64::from(absent_percent));
+        self.uint(u64::from(defexrank_percent));
     }
 
     fn ln_end(&mut self, ln_end: &LnEndWindows) {
@@ -571,29 +581,32 @@ impl Reader<'_> {
     fn window_policy(&mut self) -> Result<WindowPolicy, CanonicalError> {
         match self.uint()? {
             0 => Ok(WindowPolicy::Thousandths(self.rank_scale()?)),
-            1 => {
-                let len = self.count("rank_percent", 1)?;
-                if len != 5 {
-                    return Err(CanonicalError::WrongLength {
-                        field: "rank_percent",
-                        len,
-                    });
-                }
-                let mut rank_percent = [0; 5];
-                for p in &mut rank_percent {
-                    *p = self.u32("rank_percent")?;
-                }
-                Ok(WindowPolicy::Scaled(ScaledRank {
-                    rank_percent,
-                    absent_percent: self.u32("absent_percent")?,
-                    defexrank_percent: self.u32("defexrank_percent")?,
-                }))
-            }
+            1 => Ok(WindowPolicy::Scaled(self.scaled_rank()?)),
+            2 => Ok(WindowPolicy::Interpolated(self.scaled_rank()?)),
             tag => Err(CanonicalError::UnknownTag {
                 field: "window_policy",
                 tag,
             }),
         }
+    }
+
+    fn scaled_rank(&mut self) -> Result<ScaledRank, CanonicalError> {
+        let len = self.count("rank_percent", 1)?;
+        if len != 5 {
+            return Err(CanonicalError::WrongLength {
+                field: "rank_percent",
+                len,
+            });
+        }
+        let mut rank_percent = [0; 5];
+        for p in &mut rank_percent {
+            *p = self.u32("rank_percent")?;
+        }
+        Ok(ScaledRank {
+            rank_percent,
+            absent_percent: self.u32("absent_percent")?,
+            defexrank_percent: self.u32("defexrank_percent")?,
+        })
     }
 
     fn empty_poor(&mut self) -> Result<EmptyPoorRule, CanonicalError> {
@@ -800,10 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_bytes_start_with_format_9_and_change_with_any_table_edge() {
+    fn canonical_bytes_start_with_format_10_and_change_with_any_table_edge() {
         let base = custom();
         let base_bytes = base.canonical_bytes();
-        assert_eq!(base_bytes.first(), Some(&9));
+        assert_eq!(base_bytes.first(), Some(&10));
         let edges: [fn(&mut crate::LaneTable) -> &mut TimeUs; 5] = [
             |t| &mut t.ln_end.perfect,
             |t| &mut t.ln_end.great,
@@ -923,7 +936,7 @@ mod tests {
         p.empty_poor.counts_bp = false;
         p.empty_poor.counted = true;
         p.headers = crate::HeaderPolicy::DefExRankFirst;
-        p.window_policy = crate::WindowPolicy::Scaled(crate::ScaledRank {
+        p.window_policy = crate::WindowPolicy::Interpolated(crate::ScaledRank {
             rank_percent: [25, 50, 75, 100, 125],
             absent_percent: 80,
             defexrank_percent: 70,
@@ -945,14 +958,14 @@ mod tests {
     }
 
     /// The bytes of [`representative`], written by hand from the module docs
-    /// field by field: the format version 9, then `rep`, version 7, the
+    /// field by field: the format version 10, then `rep`, version 7, the
     /// implementation; the keys' table: the windows, the LN-end edges (90 ms
     /// is zigzag 180000 = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1
     /// 19`) and the empty POOR range (`ahead` 250 ms is zigzag 500000 = `a0
     /// c2 1e`, `behind` 120 ms is zigzag 240000 = `80 d3 0e`); the scratch's
     /// table, custom's but 160 ms behind (`80 c4 13`); the miss rule (0),
     /// the empty POOR's three flags, the header policy (`DefExRankFirst`, 1),
-    /// the window policy (`Scaled`, 1: five percentages `19 32 4b 64 7d`, 80
+    /// the window policy (`Interpolated`, 2: five percentages `19 32 4b 64 7d`, 80
     /// `50`, 70 `46`), the default `#TOTAL` (`Fixed`, 0: 123.456 is zigzag
     /// 246912 = `80 89 0f`), and the rest in declaration order, the
     /// assignment `ComboPriority` (1) and the head eligibility `NotLateBad`
@@ -962,7 +975,7 @@ mod tests {
     /// with `ScaleDamage` (2), two bands, 30 % (`80 9b ee 02`) × 1/2 and
     /// 50 % (`80 ad e2 04`) × 4/5.
     const PINNED: [u8; 243] = [
-        0x09, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+        0x0a, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x04, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
         0x14, 0x80, 0xb5, 0x18, 0xa0, 0xfe, 0x0a, 0xc0, 0x8b, 0x11, 0xa0, 0xd1, //
@@ -970,7 +983,7 @@ mod tests {
         0x02, 0x90, 0xbf, 0x05, 0x90, 0xbf, 0x05, 0xc0, 0x9a, 0x0c, 0xc0, 0x9a, //
         0x0c, 0xc0, 0xfc, 0x15, 0xc0, 0xfc, 0x15, 0xc0, 0x9a, 0x0c, 0xe0, 0xa7, //
         0x12, 0x80, 0xb5, 0x18, 0xc0, 0x84, 0x3d, 0x80, 0xc4, 0x13, 0x00, 0x00, //
-        0x00, 0x01, 0x01, 0x01, 0x05, 0x19, 0x32, 0x4b, 0x64, 0x7d, 0x50, 0x46, //
+        0x00, 0x01, 0x01, 0x02, 0x05, 0x19, 0x32, 0x4b, 0x64, 0x7d, 0x50, 0x46, //
         0x00, 0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, //
         0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, 0xb5, //
         0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, //
@@ -1082,6 +1095,21 @@ mod tests {
         assert_eq!(decode(&p.canonical_bytes()), Ok(p));
     }
 
+    /// The interpolated window policy is its own tag: the same percentages
+    /// scaled and interpolated are two presets.
+    #[test]
+    fn window_policies_decode_and_differ() {
+        let lr2 = crate::lr2_style();
+        assert_eq!(decode(&lr2.canonical_bytes()), Ok(lr2.clone()));
+        let crate::WindowPolicy::Interpolated(s) = lr2.window_policy else {
+            panic!("LR2-style interpolates");
+        };
+        let mut scaled = lr2.clone();
+        scaled.window_policy = crate::WindowPolicy::Scaled(s);
+        assert_ne!(scaled.canonical_bytes(), lr2.canonical_bytes());
+        assert_eq!(decode(&scaled.canonical_bytes()), Ok(scaled));
+    }
+
     #[test]
     fn assignments_decode_and_differ() {
         let style = crate::beatoraja_style();
@@ -1116,19 +1144,19 @@ mod tests {
         // The id's length: one more than the bytes left is refused; exactly
         // the bytes left is read, and the next field finds nothing.
         assert_eq!(
-            decode(&[9, 4, b'a', b'b', b'c']),
+            decode(&[10, 4, b'a', b'b', b'c']),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
                 count: 4
             })
         );
         assert_eq!(
-            decode(&[9, 3, b'a', b'b', b'c']),
+            decode(&[10, 3, b'a', b'b', b'c']),
             Err(CanonicalError::Truncated)
         );
         assert_eq!(
             decode(&[
-                9, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
+                10, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
             ]),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
@@ -1200,12 +1228,12 @@ mod tests {
             );
         }
         let mut tag = bytes.clone();
-        tag[at - 1] = 2;
+        tag[at - 1] = 3;
         assert_eq!(
             decode(&tag),
             Err(CanonicalError::UnknownTag {
                 field: "window_policy",
-                tag: 2
+                tag: 3
             })
         );
     }
@@ -1288,8 +1316,8 @@ mod tests {
         assert_eq!(decode(&with_uint_at(headers, 2)), unknown("headers", 2));
         let policy = offset(through_headers);
         assert_eq!(
-            decode(&with_uint_at(policy, 2)),
-            unknown("window_policy", 2)
+            decode(&with_uint_at(policy, 3)),
+            unknown("window_policy", 3)
         );
         let breaks_combo = offset(|w, p| {
             through_tables(w, p);

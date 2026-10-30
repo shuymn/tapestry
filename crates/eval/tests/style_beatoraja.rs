@@ -21,7 +21,7 @@
 mod common;
 
 use bms_model::{Chart, ChartBuilder, JudgmentHeader, Lane, TimeUs};
-use common::{MS, device, empty_poors, judgments, lane, press, release};
+use common::{MS, both_at, device, empty_poors, judged_on, judgments, lane, press, release};
 use eval::{
     EvalError, EvalInput, Evaluation, Evaluator, InputStart, JudgeEventKind, PhysicalInputEvent,
     Section, evaluate,
@@ -962,25 +962,6 @@ fn scratch_and_key(rank: Option<JudgmentHeader>) -> Chart {
         .build()
         .unwrap();
     with_rank(chart, rank)
-}
-
-/// Presses on the scratch and key 1 at `at`, each released 10 µs later.
-fn both_at(at: i64) -> Vec<PhysicalInputEvent> {
-    vec![
-        press(at, 0, 0),
-        press(at, 0, 1),
-        release(at + 10, 0, 0),
-        release(at + 10, 0, 1),
-    ]
-}
-
-/// The judgments on lane `l`, in order.
-fn judged_on(e: &Evaluation, l: usize) -> Vec<Judgment> {
-    judgments(&e.events)
-        .into_iter()
-        .filter(|j| j.0 == l)
-        .map(|j| j.2)
-        .collect()
 }
 
 /// Source: play/JudgeProperty.java:24 (scratch notes: PG {-30000, 30000},

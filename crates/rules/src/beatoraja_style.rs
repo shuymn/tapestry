@@ -146,78 +146,21 @@
 
 use bms_model::TimeUs;
 
+use crate::gauge_rules::{end_gauge, pct, survival_gauge};
+
 use crate::{
-    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
-    GaugeRule, GaugeValue, HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable,
-    LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment,
-    PerLaneClass, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode,
-    Window, WindowPolicy,
+    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeValue,
+    HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+    RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode, Window,
+    WindowPolicy,
 };
 
 const MS: i64 = 1_000;
 
-/// `n` hundredths of a percent as a fixed change.
-const fn centi(n: i64) -> GaugeDelta {
-    GaugeDelta::Fixed(GaugeValue::centi_percent(n))
-}
-
-const fn pct(n: i64) -> GaugeValue {
-    GaugeValue(n * GaugeValue::PERCENT)
-}
-
-/// A gauge decided at the end, with the `TOTAL` modifier on its increases:
-/// PERFECT and GREAT `1.0 × TOTAL / notes`, GOOD `0.5 ×`.
-fn end_gauge(id: &str, clear: i64, damage: [i64; 3]) -> GaugeRule {
-    let full = GaugeDelta::TotalShare { num: 1, den: 1 };
-    let [bad, poor, empty] = damage;
-    GaugeRule {
-        id: id.to_owned(),
-        kind: GaugeKind::EndThreshold { clear: pct(clear) },
-        start: pct(20),
-        min: pct(2),
-        max: GaugeValue::FULL,
-        change: PerJudgment {
-            perfect: full,
-            great: full,
-            good: GaugeDelta::TotalShare { num: 1, den: 2 },
-            bad: centi(-bad),
-            poor: centi(-poor),
-        },
-        empty_poor: centi(-empty),
-        correction: TotalCorrection::None,
-        low_damage: Vec::new(),
-    }
-}
-
-/// A survival gauge from 100 %, failing at 0, with fixed changes in
-/// hundredths of a percent: PERFECT, GREAT, GOOD, BAD, POOR, empty POOR.
-fn survival_gauge(
-    id: &str,
-    change: [i64; 6],
-    correction: TotalCorrection,
-    low_damage: Vec<LowDamage>,
-) -> GaugeRule {
-    let [perfect, great, good, bad, poor, empty] = change.map(centi);
-    GaugeRule {
-        id: id.to_owned(),
-        kind: GaugeKind::Survival {
-            fails_below: GaugeValue::EMPTY,
-        },
-        start: GaugeValue::FULL,
-        min: GaugeValue::EMPTY,
-        max: GaugeValue::FULL,
-        change: PerJudgment {
-            perfect,
-            great,
-            good,
-            bad,
-            poor,
-        },
-        empty_poor: empty,
-        correction,
-        low_damage,
-    }
-}
+/// The increases of the gauges decided at the end: PERFECT and GREAT
+/// `1.0 × TOTAL / notes`, GOOD `0.5 ×`.
+const BEST_GOOD: [(u32, u32); 2] = [(1, 1), (1, 2)];
 
 /// HARD's damage while low: × `tenths / 10` below `below` %, the first band
 /// that applies.
@@ -237,23 +180,26 @@ fn hard_bands() -> Vec<LowDamage> {
 pub fn beatoraja_style() -> RulePreset {
     // NORMAL comes first: the displayed gauge defaults to index 0.
     let gauges = vec![
-        end_gauge("normal", 80, [300, 600, 200]),
-        end_gauge("assist_easy", 60, [150, 300, 50]),
-        end_gauge("easy", 80, [150, 450, 100]),
+        end_gauge("normal", 80, BEST_GOOD, [300, 600, 200]),
+        end_gauge("assist_easy", 60, BEST_GOOD, [150, 300, 50]),
+        end_gauge("easy", 80, BEST_GOOD, [150, 450, 100]),
         survival_gauge(
             "hard",
+            GaugeValue::EMPTY,
             [15, 12, 3, -500, -1_000, -500],
             TotalCorrection::LimitIncrease,
             hard_bands(),
         ),
         survival_gauge(
             "ex_hard",
+            GaugeValue::EMPTY,
             [15, 6, 0, -800, -1_600, -800],
             TotalCorrection::LimitIncrease,
             Vec::new(),
         ),
         survival_gauge(
             "hazard",
+            GaugeValue::EMPTY,
             [15, 6, 0, -10_000, -10_000, -1_000],
             TotalCorrection::None,
             Vec::new(),

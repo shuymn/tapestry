@@ -54,9 +54,9 @@ fn windows_and_ln_end() -> impl Strategy<Value = (JudgeWindows, LnEndWindows)> {
     (
         [first(), step(), step(), step()],
         [first(), step(), step(), step()],
-        [first(), step(), step()],
+        ([first(), first(), first()], any::<bool>()),
     )
-        .prop_map(|(early, late, ln)| {
+        .prop_map(|(early, late, (ln, tied))| {
             let ascending = |steps: [i64; 4]| {
                 let mut edge = -1;
                 steps.map(|s| {
@@ -84,11 +84,16 @@ fn windows_and_ln_end() -> impl Strategy<Value = (JudgeWindows, LnEndWindows)> {
                     late: l3,
                 },
             };
-            // Each LN-end edge is at least its window's early edge and wider
-            // than the better one.
+            // Each LN-end edge is at least its window's early edge and the
+            // better one's; they may tie, by a zero step or all at one width.
             let perfect = e0.0 + ln[0];
-            let great = (perfect + 1).max(e1.0) + ln[1];
-            let good = (great + 1).max(e2.0) + ln[2];
+            let great = perfect.max(e1.0) + ln[1];
+            let good = great.max(e2.0) + ln[2];
+            let (perfect, great, good) = if tied {
+                (good, good, good)
+            } else {
+                (perfect, great, good)
+            };
             let ln_end = LnEndWindows {
                 perfect: TimeUs(perfect),
                 great: TimeUs(great),
@@ -119,14 +124,22 @@ fn window_policy() -> impl Strategy<Value = WindowPolicy> {
             [percent(), percent(), percent(), percent(), percent()],
             percent(),
             u32s(),
+            any::<bool>(),
         )
-            .prop_map(|(rank_percent, absent_percent, defexrank_percent)| {
-                WindowPolicy::Scaled(ScaledRank {
-                    rank_percent,
-                    absent_percent,
-                    defexrank_percent,
-                })
-            }),
+            .prop_map(
+                |(rank_percent, absent_percent, defexrank_percent, interpolated)| {
+                    let scaled = ScaledRank {
+                        rank_percent,
+                        absent_percent,
+                        defexrank_percent,
+                    };
+                    if interpolated {
+                        WindowPolicy::Interpolated(scaled)
+                    } else {
+                        WindowPolicy::Scaled(scaled)
+                    }
+                }
+            ),
     ]
 }
 
@@ -345,7 +358,7 @@ proptest! {
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 31];
+    let mut counts = [0_usize; 33];
     // Per boolean field, whether it was seen false and true.
     let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
@@ -392,6 +405,8 @@ fn generator_reaches_every_variant_and_length_class() {
             p.tables.keys != p.tables.scratch,
             matches!(p.window_policy, WindowPolicy::Thousandths(_)),
             matches!(p.window_policy, WindowPolicy::Scaled(_)),
+            matches!(p.window_policy, WindowPolicy::Interpolated(_)),
+            p.tables.keys.ln_end.great == p.tables.keys.ln_end.good,
             p.id.chars().count() == 1,
             p.id.len() >= 128,
             p.gauges.len() == 1,

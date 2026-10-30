@@ -27,6 +27,27 @@ fn beatoraja_style_round_trips_to_equal_canonical_bytes() {
     assert!(text.len() < 8 << 10, "{}", text.len());
 }
 
+/// LR2-style's interpolated window policy is a variant of the existing key:
+/// `kind = "interpolated"` with the same fields as `scaled`, and its tied
+/// LN-end edges read back.
+#[test]
+fn lr2_style_round_trips_to_equal_canonical_bytes() {
+    let preset = rules::lr2_style();
+    let text = preset_to_toml(&preset);
+    let back = load_preset_toml(&text).unwrap();
+    assert_eq!(back, preset);
+    assert_eq!(back.canonical_bytes(), preset.canonical_bytes());
+    assert!(text.contains("kind = \"interpolated\""), "{text}");
+    let scaled =
+        load_preset_toml(&text.replacen("kind = \"interpolated\"", "kind = \"scaled\"", 1))
+            .unwrap();
+    assert!(matches!(
+        scaled.window_policy,
+        rules::WindowPolicy::Scaled(_)
+    ));
+    assert_ne!(scaled.canonical_bytes(), preset.canonical_bytes());
+}
+
 #[test]
 fn older_preset_file_is_refused_with_the_hint() {
     let text = preset_to_toml(&rules::custom());

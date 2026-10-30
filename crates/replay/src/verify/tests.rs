@@ -214,7 +214,7 @@ fn encoding_4(bytes: &[u8]) -> Vec<u8> {
         .unwrap();
     let mut old = bytes.to_vec();
     old.remove(tag);
-    assert_eq!(old[0], 9, "the current encoding");
+    assert_eq!(old[0], 10, "the current encoding");
     old[0] = 4;
     old
 }
@@ -590,6 +590,31 @@ fn final_deadline_has_one_source() {
     let start = InputStart::default();
     let probe = eval::Evaluator::new(&chart, &style, &device, &start, Some(&section), 0).unwrap();
     assert_eq!(probe.final_deadline(), scratch_miss);
+}
+
+/// A beatoraja-style record of `CHART` (no rank: 75 %, the keys' late BAD
+/// edge 210 ms) re-evaluated under LR2-style, whose BAD edge is 200 ms at
+/// every rank, runs to LR2-style's own final deadline, 4.200 s, past the
+/// recording's 4.180 s and short of beatoraja-style's 4.210 s.
+#[test]
+fn what_if_under_lr2_style_completes() {
+    let (dir, mut record) = played();
+    record.preset = PresetRecord::of(&rules::beatoraja_style());
+    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
+    let lr2 = rules::lr2_style();
+    let song_end = |e: &eval::Evaluation| {
+        e.events
+            .iter()
+            .filter(|ev| ev.kind == eval::JudgeEventKind::SongEnd)
+            .map(|ev| ev.time)
+            .collect::<Vec<_>>()
+    };
+    let r = evaluate_record(&record, &chart, Some(&lr2)).unwrap();
+    assert!(!r.as_played);
+    assert!(r.evaluation.completed);
+    assert_eq!(song_end(&r.evaluation), [TimeUs(4_200 * MS)]);
+    assert_eq!(r.coverage, Coverage::NoInputAfter(TimeUs(4_180 * MS)));
+    assert_eq!(r.evaluation.tally.counts.perfect, 2);
 }
 
 #[test]

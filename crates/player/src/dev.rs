@@ -209,16 +209,21 @@ impl Options {
             }
             "dev-scripted-input" => self.scripted_input = Some(PathBuf::from(p.value()?)),
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
-            "dev-render-timeout" => {
-                let secs = p.value()?.to_string_lossy().parse().map_err(|_| {
-                    UsageError::Usage("--dev-render-timeout takes seconds".to_owned())
-                })?;
-                self.render_timeout = Some(std::time::Duration::from_secs(secs));
-            }
+            "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
             _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
         Ok(())
     }
+}
+
+/// The value of `--dev-render-timeout`, in seconds.
+fn render_timeout(p: &mut lexopt::Parser) -> Result<std::time::Duration, UsageError> {
+    let secs = p
+        .value()?
+        .to_string_lossy()
+        .parse()
+        .map_err(|_| UsageError::Usage("--dev-render-timeout takes seconds".to_owned()))?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 /// The development options of song selection (`tapestry [--auto]`).
@@ -234,6 +239,9 @@ pub struct SelectOptions {
     /// Where to write frames (`--dev-frames`): the select screen's first
     /// frame, and the first play's countdown, play and end frames.
     pub frames: Option<PathBuf>,
+    /// The render thread's bounds, as [`Options::render_timeout`]
+    /// (`--dev-render-timeout`).
+    pub render_timeout: Option<std::time::Duration>,
 }
 
 impl SelectOptions {
@@ -256,6 +264,7 @@ impl SelectOptions {
                 })?);
             }
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
+            "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
             _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
         Ok(())

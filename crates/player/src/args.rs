@@ -331,10 +331,16 @@ mod tests {
             "--dev-rescan-ms=50",
             "--dev-frames",
             "d",
+            "--dev-render-timeout",
+            "90",
         ]);
         assert!(s.dev.headless);
         assert_eq!(s.dev.rescan_ms, Some(50));
         assert_eq!(s.dev.frames.as_deref(), Some(Path::new("d")));
+        assert_eq!(
+            s.dev.render_timeout,
+            Some(std::time::Duration::from_secs(90))
+        );
         assert_eq!(
             s.dev.script,
             Some(crate::dev::SelectScript::parse("pick=a.bms,enter,back,close").unwrap())
