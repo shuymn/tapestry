@@ -29,7 +29,7 @@ use replay::{
 use rules::{GaugeKind, RulePreset};
 
 use crate::autoplay::{Autoplay, AutoplayError};
-use crate::live::{Closing, LiveError, Opening, Rig};
+use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
@@ -285,6 +285,9 @@ pub struct PlayReport {
     pub reload_error: Option<ReloadError>,
     /// The audio output's failure, if it stopped the play.
     pub output_error: Option<OutputError>,
+    /// The input thread's failure, if it ended the play, its recording or
+    /// its tail.
+    pub input_error: Option<InputWaitError>,
     /// The live event stream.
     pub live: Vec<JudgeEvent>,
     /// The live totals.
@@ -361,6 +364,9 @@ pub struct PlayOutcome {
     pub tail_cut: Option<AbortCause>,
     /// The audio output's failure, if it stopped the play or its tail.
     pub output_error: Option<OutputError>,
+    /// The input thread's failure, if it ended the play, its recording or
+    /// its tail.
+    pub input_error: Option<InputWaitError>,
     /// The live event stream.
     pub live: Vec<JudgeEvent>,
     /// The play view after the last step.
@@ -727,6 +733,7 @@ impl Loaded {
             end,
             tail_cut,
             output_error,
+            input_error,
             live,
             view,
             record,
@@ -807,6 +814,7 @@ impl Loaded {
             tail_cut,
             reload_error,
             output_error,
+            input_error,
             live,
             tally: view.tally,
             displayed_gauge: parts.policy.displayed_gauge(&view.gauges),
@@ -922,6 +930,9 @@ impl<O: AudioOutput + Wakes> Session<O> {
             Err(LiveError::Audio(_)) => {
                 unreachable!("a session has no audio thread to fail")
             }
+            Err(LiveError::Input(_)) => {
+                unreachable!("a session has no input thread to fail")
+            }
         }
     }
 }
@@ -1010,7 +1021,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         Ok(())
     }
 
-    fn open(&mut self, lead_in: TimeUs) -> Opening<Self::Reader> {
+    fn open(&mut self, lead_in: TimeUs) -> Result<Opening<Self::Reader>, InputWaitError> {
         // The countdown starts now; chart time 0 is `lead_in` later.
         let origin = TimeUs(self.clock.now().0 + lead_in.0);
         let open_at = TimeUs(-lead_in.0);
@@ -1029,13 +1040,13 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             .map(|(d, _)| sources.axes(d).to_vec())
             .collect();
         self.origin = Some(origin);
-        Opening {
+        Ok(Opening {
             origin,
             start,
             readers: self.sources.take_readers(),
             kinds,
             axes,
-        }
+        })
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
@@ -1081,7 +1092,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             && engine.bgm_left() == 0
     }
 
-    fn close(&mut self) -> Closing {
+    fn close(&mut self) -> Result<Closing, InputWaitError> {
         let closing = Closing {
             arrivals: self.sources.arrivals().to_vec(),
             overflowed: self.sources.overflowed(),
@@ -1089,7 +1100,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             axis_out_of_range: self.sources.axis_out_of_range().collect(),
         };
         self.sources.close_recording();
-        closing
+        Ok(closing)
     }
 
     fn ended(&mut self, _report: &PlayReport) {}

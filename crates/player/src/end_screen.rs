@@ -110,7 +110,22 @@ fn cause(c: AbortCause) -> &'static str {
         AbortCause::OutputFailed => "AUDIO OUTPUT FAILED",
         AbortCause::GaugeFailed => "GAUGE FAILED",
         AbortCause::ScreenFailed => "SCREEN FAILED",
+        AbortCause::InputFailed => "INPUT FAILED",
     }
+}
+
+/// The line naming why the record is incomplete, if it is.
+fn incomplete_line(i: replay::Incomplete) -> Option<String> {
+    let why: Vec<&str> = [
+        (i.overflow, "OVERFLOW"),
+        (i.source_limit, "SOURCE LIMIT"),
+        (i.suspend, "SUSPEND"),
+        (i.input_failed, "INPUT FAILED"),
+    ]
+    .into_iter()
+    .filter_map(|(set, name)| set.then_some(name))
+    .collect();
+    (!why.is_empty()).then(|| format!("RECORD INCOMPLETE: {}", why.join(", ")))
 }
 
 /// The end screen's lines, the gauges named by the preset the play was
@@ -192,21 +207,12 @@ pub fn lines(
             ));
         }
     }
-    if let Some(rec) = &report.record {
-        let i = rec.status.incomplete;
-        if i.any() {
-            let mut why = Vec::new();
-            if i.overflow {
-                why.push("OVERFLOW");
-            }
-            if i.source_limit {
-                why.push("SOURCE LIMIT");
-            }
-            if i.suspend {
-                why.push("SUSPEND");
-            }
-            l.push(format!("RECORD INCOMPLETE: {}", why.join(", ")));
-        }
+    if let Some(line) = report
+        .record
+        .as_ref()
+        .and_then(|rec| incomplete_line(rec.status.incomplete))
+    {
+        l.push(line);
     }
     match &report.saved {
         Some(Ok(r)) => {
@@ -222,6 +228,9 @@ pub fn lines(
     }
     if let Some(e) = report.output_error {
         l.push(format!("AUDIO: {e}").to_uppercase());
+    }
+    if let Some(e) = report.input_error {
+        l.push(format!("INPUT: {e}").to_uppercase());
     }
     l.push(queue_line(queue));
     let ms = |d: Option<Duration>| d.map_or_else(|| "-".to_owned(), |d| d.as_millis().to_string());
@@ -382,6 +391,7 @@ mod tests {
             tail_cut: None,
             reload_error: None,
             output_error: None,
+            input_error: None,
             live: Vec::new(),
             tally,
             displayed_gauge: game::GaugeIndex(0),
@@ -432,6 +442,52 @@ mod tests {
             );
         }
         assert_eq!(lines.last().unwrap(), "BACKSPACE: RETRY    ESCAPE: QUIT");
+    }
+
+    /// A play the input thread ended names the cause, the error and, for its
+    /// record, the incomplete reason, alone or with others.
+    #[test]
+    fn an_input_failure_is_named_on_the_end_screen() {
+        let mut played = report(rules::custom());
+        played.end = game::PlayEnd::Aborted(game::AbortCause::InputFailed);
+        played.input_error = Some(game::InputWaitError::Gone);
+        let hints = super::Hints::new(Some(0x0E), Some(0x01));
+        let queue = super::QueueLine {
+            played: Some(2),
+            steady_underruns: 0,
+            next: 2,
+        };
+        let lines = super::lines(
+            &played,
+            0,
+            super::LoadTimes::default(),
+            queue,
+            &hints,
+            false,
+        );
+        for line in [
+            "RESULT: ENDED MIDWAY (INPUT FAILED)",
+            "INPUT: THE INPUT THREAD IS GONE",
+        ] {
+            assert!(lines.iter().any(|l| l == line), "{line} in {lines:?}");
+        }
+        let only = replay::Incomplete {
+            input_failed: true,
+            ..replay::Incomplete::default()
+        };
+        assert_eq!(
+            super::incomplete_line(only).as_deref(),
+            Some("RECORD INCOMPLETE: INPUT FAILED")
+        );
+        let both = replay::Incomplete {
+            suspend: true,
+            ..only
+        };
+        assert_eq!(
+            super::incomplete_line(both).as_deref(),
+            Some("RECORD INCOMPLETE: SUSPEND, INPUT FAILED")
+        );
+        assert_eq!(super::incomplete_line(replay::Incomplete::default()), None);
     }
 
     /// P3: an autoplay play's end screen says it was not saved and shows

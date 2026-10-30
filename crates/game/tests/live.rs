@@ -13,8 +13,8 @@ use common::{MS, lane};
 use eval::{ControlId, InputKind, JudgeEventKind, SourceId};
 use game::{
     AbortCause, AudioControl, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
-    DeviceSettings, IngestError, Ingested, LiveError, Loaded, Opening, Parts, PlayEnd, PlayReport,
-    RenderSide, Rig, SessionConfig, Settings,
+    DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, Loaded, Opening, Parts,
+    PlayEnd, PlayReport, RenderSide, Rig, SessionConfig, Settings,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -148,6 +148,23 @@ struct Fake {
     /// The lifecycle order: `play_over`, `ended`, and what the record sink
     /// adds.
     order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// Every open fails with this.
+    open_fails: Option<InputWaitError>,
+    /// Every close fails with this; with `Timeout`, the input thread still
+    /// pushes the batches of `close_lag`.
+    close_fails: Option<InputWaitError>,
+    /// The input thread is gone from this clock time on: nothing more is
+    /// received or published.
+    input_fails_at: i64,
+    /// The input thread is gone once the screen has been prepared.
+    input_fails_in_prepare: bool,
+    /// The window closes while recording opens or closes.
+    quit_in_open: bool,
+    quit_in_close: bool,
+    /// The failure a handshake found: it sticks, as on a poisoned link.
+    failed: Option<InputWaitError>,
+    /// Opens attempted, failed ones included.
+    opens: usize,
 }
 
 impl Fake {
@@ -189,6 +206,14 @@ impl Fake {
             read_cost: 0,
             reads: std::cell::Cell::new(0),
             order: std::sync::Arc::default(),
+            open_fails: None,
+            close_fails: None,
+            input_fails_at: i64::MAX,
+            input_fails_in_prepare: false,
+            quit_in_open: false,
+            quit_in_close: false,
+            failed: None,
+            opens: 0,
         }
     }
 
@@ -219,7 +244,9 @@ impl Rig for Fake {
         if self.sealed {
             self.waits_since_seal += 1;
         }
-        self.script.poll(self.clock.now(), &mut self.sources);
+        if self.input_failure().is_none() {
+            self.script.poll(self.clock.now(), &mut self.sources);
+        }
         self.drain_sounds();
         let now = self.clock.now().0;
         while let Some(i) = self.offset_changes.iter().position(|&(at, _)| at <= now) {
@@ -243,6 +270,9 @@ impl Rig for Fake {
             // The window closes while the screen gets ready.
             self.quitting = true;
         }
+        if self.input_fails_in_prepare {
+            self.failed = Some(InputWaitError::Gone);
+        }
         if self.prepares >= self.prepare_fails_from {
             return Err(SurfaceLost);
         }
@@ -257,7 +287,15 @@ impl Rig for Fake {
         self.audio.as_mut().map_or(Ok(()), AudioControl::ready)
     }
 
-    fn open(&mut self, lead_in: TimeUs) -> Opening<SourceReader> {
+    fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
+        self.opens += 1;
+        if let Some(e) = self.input_failure().or(self.open_fails) {
+            self.failed = Some(e);
+            return Err(e);
+        }
+        if self.quit_in_open {
+            self.quitting = true;
+        }
         let now = self.clock.now();
         let origin = TimeUs(now.0 + lead_in.0);
         let recorded = DeviceSettings::default().keyboard.recorded();
@@ -268,13 +306,13 @@ impl Rig for Fake {
         self.sources.gate_mut().reset();
         let start = self.sources.open_play(now, origin);
         self.origins.push(origin);
-        Opening {
+        Ok(Opening {
             origin,
             start,
             readers: self.sources.take_readers(),
             kinds: self.sources.participants().map(|(_, k)| k).collect(),
             axes: Vec::new(),
-        }
+        })
     }
 
     fn start(&mut self, _origin: TimeUs, sounds: AudioQueue, _screen: RenderSide) {
@@ -312,13 +350,27 @@ impl Rig for Fake {
         self.sealed && self.waits_since_seal >= self.tail_waits
     }
 
-    fn close(&mut self) -> Closing {
+    fn close(&mut self) -> Result<Closing, InputWaitError> {
         // Batches the input thread received before it took the request.
         if let Some(c) = self.in_close.take() {
             self.commands.push((i64::MIN, c));
         }
+        if self.quit_in_close {
+            self.quitting = true;
+        }
+        // A thread that is gone pushes nothing more.
+        let gone = self.close_fails.filter(|&e| e == InputWaitError::Gone);
+        if let Some(e) = self.input_failure().or(gone) {
+            self.failed = Some(e);
+            return Err(e);
+        }
         let lag = TimeUs(self.clock.now().0 + self.close_lag);
         self.script.poll(lag, &mut self.sources);
+        // One that does not answer may still push while the close waits.
+        if let Some(e) = self.close_fails {
+            self.failed = Some(e);
+            return Err(e);
+        }
         let closing = Closing {
             arrivals: self.sources.arrivals().to_vec(),
             overflowed: self.sources.overflowed(),
@@ -326,7 +378,12 @@ impl Rig for Fake {
             axis_out_of_range: self.sources.axis_out_of_range().collect(),
         };
         self.sources.close_recording();
-        closing
+        Ok(closing)
+    }
+
+    fn input_failure(&self) -> Option<InputWaitError> {
+        self.failed
+            .or((self.clock.now().0 >= self.input_fails_at).then_some(InputWaitError::Gone))
     }
 
     fn ended(&mut self, report: &PlayReport) {
@@ -976,4 +1033,288 @@ fn the_play_is_over_before_it_is_saved() {
         order,
         ["play over", "saved", "ended", "play over", "saved", "ended"]
     );
+}
+
+/// T1, T2: the input thread is gone, or does not answer, when recording
+/// opens: no play exists, so the run ends with that cause and nothing is
+/// saved.
+#[test]
+fn an_input_thread_gone_at_the_open_ends_the_run_with_its_cause() {
+    for cause in [InputWaitError::Gone, InputWaitError::Timeout] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Fake::new(vec![key(9_303_000, Z, 1)], &[], i64::MAX);
+        rig.open_fails = Some(cause);
+        let ran = game::live::run(&mut loaded, &mut rig);
+        assert!(
+            matches!(&ran, Err(LiveError::Input(e)) if *e == cause),
+            "{cause:?}: {ran:?}"
+        );
+        assert_eq!(rig.opens, 1, "{cause:?}");
+        assert!(rig.reports.is_empty(), "{cause:?}");
+        assert!(!dir.path().join("records").exists(), "{cause:?}");
+    }
+}
+
+/// The window closes while recording opens: the quit is latched and the
+/// first step aborts the play before it advances, so nothing is recorded.
+#[test]
+fn a_quit_in_the_open_saves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Fake::new(vec![key(9_303_000, Z, 1)], &[], i64::MAX);
+    rig.quit_in_open = true;
+    game::live::run(&mut loaded, &mut rig).unwrap();
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert!(one.record.is_none());
+    assert!(!dir.path().join("records").exists());
+}
+
+/// T3: the close fails after a quit: the record is still saved through the
+/// normal path, marked incomplete (input failed), with what the play took
+/// and none of the closing (the arrival during play is unknown); the run
+/// ends with the input cause.
+#[test]
+fn a_failed_close_saves_the_record_marked_input_failed() {
+    for cause in [InputWaitError::Gone, InputWaitError::Timeout] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let items = vec![
+            key(9_303_000, Z, 1),
+            key(9_353_000, Z, 0),
+            ScriptItem {
+                at: TimeUs(9_400_000),
+                action: Action::Connect(DeviceId(5), DeviceKind::Keyboard),
+            },
+        ];
+        let mut rig = Fake::new(items, &[], 9_500_000);
+        rig.close_fails = Some(cause);
+        let ran = game::live::run(&mut loaded, &mut rig);
+        assert!(
+            matches!(&ran, Err(LiveError::Input(e)) if *e == cause),
+            "{cause:?}: {ran:?}"
+        );
+        let [one] = &rig.reports[..] else {
+            panic!("{} plays", rig.reports.len());
+        };
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
+        assert_eq!(one.input_error, Some(cause));
+        assert!(matches!(one.saved, Some(Ok(_))));
+        let rec = one.record.as_ref().unwrap();
+        assert_eq!(rec.status.end, replay::EndStatus::EndedMidway);
+        assert!(rec.status.incomplete.input_failed);
+        assert!(rec.arrivals.is_empty());
+        assert_eq!(judged(one), [(0, Judgment::Perfect, Some(0))]);
+        assert_eq!(rig.shows, 0);
+    }
+}
+
+/// A3: a failed close skips the drain after it: input that reached the
+/// queues after the play's last step (pushed by a thread that does not
+/// answer) is not in the record, which holds exactly what the play took.
+#[test]
+fn a_failed_close_keeps_only_what_the_play_took() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![
+        key(9_303_000, Z, 1),
+        key(9_353_000, Z, 0),
+        // Inside the batches pushed while the close waits.
+        key(9_502_000, X, 1),
+    ];
+    let mut rig = Fake::new(items, &[], 9_500_000);
+    rig.close_lag = 5 * MS;
+    rig.close_fails = Some(InputWaitError::Timeout);
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::Input(_))), "{ran:?}");
+    let one = &rig.reports[0];
+    assert_eq!(received(one), [(1_003_000, Z.0, 1), (1_053_000, Z.0, 0)]);
+    assert!(incomplete(one).input_failed);
+}
+
+/// T4: a retry after a failed close ends the run with the input cause,
+/// before another preparation or open.
+#[test]
+fn a_retry_after_a_failed_close_ends_the_run_with_the_input_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], i64::MAX);
+    rig.close_fails = Some(InputWaitError::Gone);
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Retry));
+    assert_eq!(status(one).end, replay::EndStatus::EndedMidway);
+    assert!(incomplete(one).input_failed);
+    assert_eq!((rig.opens, rig.prepares), (1, 1));
+}
+
+/// A4: the input thread fails while the screen is prepared and the window
+/// closes there too: the run ends with the input cause, not as a quit.
+#[test]
+fn a_quit_during_preparation_with_a_failed_input_thread_ends_the_run_with_its_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Fake::new(vec![key(9_303_000, Z, 1)], &[], i64::MAX);
+    rig.quit_in_prepare = true;
+    rig.input_fails_in_prepare = true;
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    assert_eq!(rig.opens, 0);
+    assert!(rig.reports.is_empty());
+}
+
+/// T5: the input thread is gone during play, after the first note was
+/// judged: the play aborts at the last watermark finalized before it, and
+/// its saved record, marked incomplete, re-evaluates to the live stream.
+/// The end screen shows and the run ends with the input cause at the quit.
+#[test]
+fn an_input_failure_in_play_aborts_at_the_last_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![
+        key(9_303_000, Z, 1),
+        key(9_353_000, Z, 0),
+        key(9_803_000, Z, 1),
+    ];
+    let mut rig = Fake::new(items, &[], 10_500_000);
+    rig.input_fails_at = 9_600_000;
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::InputFailed));
+    assert_eq!(one.input_error, Some(InputWaitError::Gone));
+    let last = rig.measured[0]
+        .iter()
+        .filter_map(|a| a.watermark)
+        .next_back()
+        .unwrap();
+    let s = status(one);
+    assert_eq!(s.finalized, last);
+    assert!(last < TimeUs(9_600_000 - rig.origins[0].0));
+    assert!(s.incomplete.input_failed);
+    assert!(one.result.as_ref().unwrap().matches_live);
+    assert_eq!(judged(one), [(0, Judgment::Perfect, Some(0))]);
+    assert_eq!(rig.shows, 1);
+}
+
+/// T6: the close of a completed play fails: the play stays complete, its
+/// tail is cut with the input cause, and its record is marked.
+#[test]
+fn a_failed_close_after_completion_keeps_the_play_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_000_000);
+    rig.tail_waits = 200;
+    rig.close_fails = Some(InputWaitError::Timeout);
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Timeout))),
+        "{ran:?}"
+    );
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.tail_cut, Some(AbortCause::InputFailed));
+    assert_eq!(rig.cancels, 1);
+    let s = status(one);
+    assert_eq!(s.end, replay::EndStatus::PlayedToEnd);
+    assert!(s.incomplete.input_failed);
+    assert_eq!(rig.shows, 1);
+}
+
+/// T7: the window closes while the close of a completed play fails: the
+/// record is saved, the end screen never shows, and the run ends with the
+/// input cause.
+#[test]
+fn a_quit_during_a_failed_close_ends_the_run_with_the_input_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], i64::MAX);
+    rig.tail_waits = 200;
+    rig.close_fails = Some(InputWaitError::Timeout);
+    rig.quit_in_close = true;
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Timeout))),
+        "{ran:?}"
+    );
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.tail_cut, Some(AbortCause::InputFailed));
+    assert!(matches!(one.saved, Some(Ok(_))));
+    assert!(incomplete(one).input_failed);
+    assert_eq!(rig.shows, 0);
+}
+
+/// A5, A7: the input thread is gone during the audio tail, after a close
+/// that succeeded: the tail is cut with the input cause, the closed record
+/// stays complete and unmarked, and the run ends with the cause at the
+/// quit on the end screen.
+#[test]
+fn an_input_failure_in_the_tail_cuts_it_and_keeps_the_record_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_000_000);
+    rig.tail_waits = 2_000;
+    rig.input_fails_at = 10_100_000;
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.tail_cut, Some(AbortCause::InputFailed));
+    assert_eq!(one.input_error, Some(InputWaitError::Gone));
+    let s = status(one);
+    assert_eq!(s.end, replay::EndStatus::PlayedToEnd);
+    assert!(!s.incomplete.any());
+    assert_eq!(rig.shows, 1);
+}
+
+/// T8, A7: the input thread is gone while the end screen shows: nothing
+/// changes there (the tail was over, the record closed and unmarked), and
+/// the retry ends the run with the input cause, before another open.
+#[test]
+fn an_input_failure_on_the_end_screen_ends_the_run_at_the_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], i64::MAX);
+    rig.input_fails_at = 10_400_000;
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(one.tail_cut, None);
+    assert_eq!(one.input_error, None);
+    assert!(!incomplete(one).input_failed);
+    assert_eq!((rig.opens, rig.shows), (1, 1));
 }

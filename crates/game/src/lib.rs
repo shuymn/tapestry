@@ -43,7 +43,7 @@ pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
     LearntRange, Press, ROLES, Refusal, capture_keys, capture_keys_within,
 };
-pub use live::{Closing, LiveError, Opening, Rig};
+pub use live::{Closing, InputWaitError, LiveError, Opening, Rig};
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
 };

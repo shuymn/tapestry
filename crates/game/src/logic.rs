@@ -104,6 +104,8 @@ pub enum AbortCause {
     GaugeFailed,
     /// The screen could not be drawn.
     ScreenFailed,
+    /// The input thread failed: the record is incomplete (input failed).
+    InputFailed,
 }
 
 /// What one logic step did.

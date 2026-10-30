@@ -16,8 +16,8 @@ use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
-    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, Opening, PlayReport, RenderSide,
-    Rig, Settings, Tuning,
+    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, Opening,
+    PlayReport, RenderSide, Rig, Settings, Tuning,
 };
 use input::{QpcClock, SourceReader};
 
@@ -330,7 +330,7 @@ impl Rig for PlayerRig<'_> {
         self.render.prepare()
     }
 
-    fn open(&mut self, lead_in: TimeUs) -> Opening<SourceReader> {
+    fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
         self.input.open(Request::Open {
             lead_in,
             logic: thread::current(),
@@ -418,8 +418,13 @@ impl Rig for PlayerRig<'_> {
         self.audio.control.done()
     }
 
-    fn close(&mut self) -> Closing {
+    fn close(&mut self) -> Result<Closing, InputWaitError> {
         self.input.close()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn input_failure(&self) -> Option<InputWaitError> {
+        self.input.failure()
     }
 
     fn before_play(&mut self, settings: &mut Settings) {
