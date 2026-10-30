@@ -1065,7 +1065,7 @@ Each one holds the behavior D5 and D6 state.
 
 ### PR26. The key sound of a press (`eval`)
 
-**Touches.** Press resolution's sound choice in evaluator.rs (the scan names the note an empty POOR is against, the nearest inside the range, and the lane's latest target before the press); the examples in crates/eval/tests/sound.rs; the event-stream digests in crates/game/tests/loaded_eval.rs, whose non-sound events are unchanged; design.md "The Only Output Is the Judgment Event Stream" and "Evaluation Stages".
+**Touches.** Press resolution's sound choice in evaluator.rs (the scan names the note an empty POOR is against, the nearest inside the range, and the lane's latest target before the press); the examples in crates/eval/tests/sound.rs; the event-stream digests in crates/game/tests/loaded_eval.rs, whose non-sound events are unchanged; the evaluator version (`Implementation::STANDARD_VERSION` 3), since the event stream is the evaluator's output; design.md "The Only Output Is the Judgment Event Stream" and "Evaluation Stages".
 
 **Depends on.** PR7d, which also changes press resolution.
 

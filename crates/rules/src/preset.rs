@@ -98,7 +98,7 @@ pub enum Implementation {
 impl Implementation {
     /// The version of the standard evaluator this build runs. A preset or
     /// record naming another version is refused, never evaluated.
-    pub const STANDARD_VERSION: u32 = 2;
+    pub const STANDARD_VERSION: u32 = 3;
 
     /// The implementation's name as recorded.
     #[must_use]

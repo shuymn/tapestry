@@ -108,7 +108,7 @@ fn digest(evaluation: &Evaluation) -> String {
         .collect()
 }
 
-/// The digests pin the evaluation by standard evaluator version 2; display
+/// The digests pin the evaluation by standard evaluator version 3; display
 /// geometry takes no part in it.
 #[test]
 fn loaded_charts_evaluate_as_before() {

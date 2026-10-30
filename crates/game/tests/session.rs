@@ -1131,7 +1131,7 @@ fn reevaluation_refuses_a_record_of_another_evaluator_version() {
     let preset = rules::custom();
     let record = one.record.as_ref().unwrap();
     // The session records the version the preset runs on, and its preset.
-    assert_eq!(record.versions.evaluator, 2);
+    assert_eq!(record.versions.evaluator, 3);
     assert_eq!(record.preset.sha256, replay::preset_hash(&preset));
     let reevaluate = |record: &replay::PlayRecord| {
         game::ResultExtension::on_play_end(
@@ -1147,7 +1147,7 @@ fn reevaluation_refuses_a_record_of_another_evaluator_version() {
     assert!(reevaluate(record).matches_live);
     // The same record under another evaluator version, its preset hash
     // still matching: refused before the hash is compared.
-    for version in [1, 3] {
+    for version in [2, 4] {
         let mut other = record.clone();
         other.versions.evaluator = version;
         let summary = reevaluate(&other);
@@ -1892,7 +1892,7 @@ fn under_checks_the_evaluator_version_first() {
     items.extend(presses(&NOTES));
     let one = s.play(script(items, &[])).unwrap();
     let mut record = one.record.clone().unwrap();
-    record.versions.evaluator = 3;
+    record.versions.evaluator = 4;
     let custom = rules::custom();
     let ctx = game::ResultContext {
         record: &record,
@@ -1903,7 +1903,7 @@ fn under_checks_the_evaluator_version_first() {
     for preset in [custom.clone(), bad_edge(220)] {
         assert_eq!(
             ReEvaluate::under(&ctx, &preset).map(|_| ()),
-            Err(game::ReEvaluationError::UnsupportedEvaluator(3))
+            Err(game::ReEvaluationError::UnsupportedEvaluator(4))
         );
     }
 }

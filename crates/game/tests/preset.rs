@@ -118,18 +118,19 @@ fn ln_end_edges_and_the_implementation_version_read_back_and_validate() {
             judgment: rules::Judgment::Perfect
         }))
     );
-    // The standard evaluator's version 1, the earlier LN rule, is refused.
-    let v1 = text.replacen(
+    // The standard evaluator's version 2, the earlier key sound rule, is
+    // refused.
+    let v2 = text.replacen(
+        "[implementation]\nkind = \"standard\"\nversion = 3",
         "[implementation]\nkind = \"standard\"\nversion = 2",
-        "[implementation]\nkind = \"standard\"\nversion = 1",
         1,
     );
-    assert_ne!(v1, text, "the edit did not apply");
+    assert_ne!(v2, text, "the edit did not apply");
     assert_eq!(
-        load_preset_toml(&v1),
+        load_preset_toml(&v2),
         Err(PresetError::Invalid(RuleError::UnsupportedImplementation {
             name: "standard",
-            version: 1
+            version: 2
         }))
     );
 }
