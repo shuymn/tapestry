@@ -11,10 +11,11 @@
 
 use bms_model::TimeUs;
 use rules::{
-    Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
-    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RuleError, RulePreset, SameTimeOrder,
-    ScoreWeights, TotalMode, Window,
+    Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
+    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
+    LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
+    RuleError, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalMode, Window,
+    WindowPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,12 +72,11 @@ struct PresetFile {
     id: String,
     version: u32,
     implementation: ImplementationFile,
-    windows: WindowsFile,
-    ln_end: LnEndFile,
+    tables: TablesFile,
     miss: MissFile,
     empty_poor: EmptyPoorFile,
     headers: HeadersFile,
-    rank_scale: RankScaleFile,
+    window_policy: WindowPolicyFile,
     default_total_milli: i64,
     denominator: DenominatorFile,
     score: ScoreFile,
@@ -125,12 +125,47 @@ enum MissFile {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EmptyPoorFile {
+struct TablesFile {
+    keys: TableFile,
+    scratch: TableFile,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableFile {
+    windows: WindowsFile,
+    ln_end: LnEndFile,
+    empty_poor: EmptyPoorRangeFile,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyPoorRangeFile {
     ahead_us: i64,
     behind_us: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyPoorFile {
     breaks_combo: bool,
     counts_bp: bool,
     counted: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+enum WindowPolicyFile {
+    Thousandths {
+        rank_milli: [i64; 4],
+        absent_milli: i64,
+    },
+    Scaled {
+        rank_percent: [u32; 5],
+        absent_percent: u32,
+        defexrank_percent: u32,
+        scales_empty_poor: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -139,13 +174,6 @@ struct LnEndFile {
     perfect_early_us: i64,
     great_early_us: i64,
     good_early_us: i64,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RankScaleFile {
-    rank_milli: [i64; 4],
-    absent_milli: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -287,6 +315,62 @@ const fn window_file(w: Window) -> WindowFile {
     }
 }
 
+fn table(t: TableFile) -> LaneTable {
+    let TableFile {
+        windows,
+        ln_end,
+        empty_poor,
+    } = t;
+    LaneTable {
+        windows: JudgeWindows {
+            perfect: window(windows.perfect),
+            great: window(windows.great),
+            good: window(windows.good),
+            bad: window(windows.bad),
+        },
+        ln_end: LnEndWindows {
+            perfect: TimeUs(ln_end.perfect_early_us),
+            great: TimeUs(ln_end.great_early_us),
+            good: TimeUs(ln_end.good_early_us),
+        },
+        empty_poor: EmptyPoorRange {
+            ahead: TimeUs(empty_poor.ahead_us),
+            behind: TimeUs(empty_poor.behind_us),
+        },
+    }
+}
+
+fn table_file(t: &LaneTable) -> TableFile {
+    let LaneTable {
+        windows,
+        ln_end,
+        empty_poor,
+    } = t;
+    let LnEndWindows {
+        perfect,
+        great,
+        good,
+    } = *ln_end;
+    let EmptyPoorRange { ahead, behind } = *empty_poor;
+    TableFile {
+        windows: WindowsFile {
+            perfect: window_file(windows.perfect),
+            great: window_file(windows.great),
+            good: window_file(windows.good),
+            bad: window_file(windows.bad),
+        },
+        ln_end: LnEndFile {
+            perfect_early_us: perfect.0,
+            great_early_us: great.0,
+            good_early_us: good.0,
+        },
+        empty_poor: EmptyPoorRangeFile {
+            ahead_us: ahead.0,
+            behind_us: behind.0,
+        },
+    }
+}
+
 const fn delta(d: DeltaFile) -> GaugeDelta {
     match d {
         DeltaFile::Fixed(v) => GaugeDelta::Fixed(GaugeValue(v)),
@@ -307,12 +391,11 @@ impl From<PresetFile> for RulePreset {
             id,
             version,
             implementation,
-            windows,
-            ln_end,
+            tables,
             miss,
             empty_poor,
             headers,
-            rank_scale,
+            window_policy,
             default_total_milli,
             denominator,
             score,
@@ -329,34 +412,41 @@ impl From<PresetFile> for RulePreset {
             implementation: match implementation {
                 ImplementationFile::Standard { version } => Implementation::Standard { version },
             },
-            windows: JudgeWindows {
-                perfect: window(windows.perfect),
-                great: window(windows.great),
-                good: window(windows.good),
-                bad: window(windows.bad),
+            tables: PerLaneClass {
+                keys: table(tables.keys),
+                scratch: table(tables.scratch),
             },
             miss: match miss {
                 MissFile::PoorAfterLateBadOrOvertaken => MissRule::PoorAfterLateBadOrOvertaken,
             },
             empty_poor: EmptyPoorRule {
-                ahead: TimeUs(empty_poor.ahead_us),
-                behind: TimeUs(empty_poor.behind_us),
                 breaks_combo: empty_poor.breaks_combo,
                 counts_bp: empty_poor.counts_bp,
                 counted: empty_poor.counted,
-            },
-            ln_end: LnEndWindows {
-                perfect: TimeUs(ln_end.perfect_early_us),
-                great: TimeUs(ln_end.great_early_us),
-                good: TimeUs(ln_end.good_early_us),
             },
             headers: match headers {
                 HeadersFile::Decimals => HeaderPolicy::Decimals,
                 HeadersFile::IntegerRanks => HeaderPolicy::IntegerRanks,
             },
-            rank_scale: RankScale {
-                rank_milli: rank_scale.rank_milli,
-                absent_milli: rank_scale.absent_milli,
+            window_policy: match window_policy {
+                WindowPolicyFile::Thousandths {
+                    rank_milli,
+                    absent_milli,
+                } => WindowPolicy::Thousandths(RankScale {
+                    rank_milli,
+                    absent_milli,
+                }),
+                WindowPolicyFile::Scaled {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                    scales_empty_poor,
+                } => WindowPolicy::Scaled(ScaledRank {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                    scales_empty_poor,
+                }),
             },
             default_total_milli,
             denominator: match denominator {
@@ -423,12 +513,11 @@ impl From<&RulePreset> for PresetFile {
             id,
             version,
             implementation,
-            windows,
+            tables,
             miss,
             empty_poor,
-            ln_end,
             headers,
-            rank_scale,
+            window_policy,
             default_total_milli,
             denominator,
             gauges,
@@ -445,50 +534,51 @@ impl From<&RulePreset> for PresetFile {
             implementation: match *implementation {
                 Implementation::Standard { version } => ImplementationFile::Standard { version },
             },
-            windows: WindowsFile {
-                perfect: window_file(windows.perfect),
-                great: window_file(windows.great),
-                good: window_file(windows.good),
-                bad: window_file(windows.bad),
+            tables: {
+                let PerLaneClass { keys, scratch } = tables;
+                TablesFile {
+                    keys: table_file(keys),
+                    scratch: table_file(scratch),
+                }
             },
             miss: match miss {
                 MissRule::PoorAfterLateBadOrOvertaken => MissFile::PoorAfterLateBadOrOvertaken,
             },
             empty_poor: {
                 let EmptyPoorRule {
-                    ahead,
-                    behind,
                     breaks_combo,
                     counts_bp,
                     counted,
                 } = *empty_poor;
                 EmptyPoorFile {
-                    ahead_us: ahead.0,
-                    behind_us: behind.0,
                     breaks_combo,
                     counts_bp,
                     counted,
-                }
-            },
-            ln_end: {
-                let LnEndWindows {
-                    perfect,
-                    great,
-                    good,
-                } = *ln_end;
-                LnEndFile {
-                    perfect_early_us: perfect.0,
-                    great_early_us: great.0,
-                    good_early_us: good.0,
                 }
             },
             headers: match headers {
                 HeaderPolicy::Decimals => HeadersFile::Decimals,
                 HeaderPolicy::IntegerRanks => HeadersFile::IntegerRanks,
             },
-            rank_scale: RankScaleFile {
-                rank_milli: rank_scale.rank_milli,
-                absent_milli: rank_scale.absent_milli,
+            window_policy: match *window_policy {
+                WindowPolicy::Thousandths(RankScale {
+                    rank_milli,
+                    absent_milli,
+                }) => WindowPolicyFile::Thousandths {
+                    rank_milli,
+                    absent_milli,
+                },
+                WindowPolicy::Scaled(ScaledRank {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                    scales_empty_poor,
+                }) => WindowPolicyFile::Scaled {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                    scales_empty_poor,
+                },
             },
             default_total_milli: *default_total_milli,
             denominator: match denominator {

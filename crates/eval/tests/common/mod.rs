@@ -19,6 +19,14 @@ pub fn rank(n: i64) -> JudgmentHeader {
     }
 }
 
+/// The declaration `#DEFEXRANK n`, an integer token.
+pub fn defexrank(n: i64) -> JudgmentHeader {
+    JudgmentHeader {
+        name: JudgmentHeaderName::DefExRank,
+        value: HeaderValue::integer(n),
+    }
+}
+
 /// The declaration `#DEFEXRANK` of `milli` thousandths, written as a
 /// decimal (`120.5`).
 pub fn defexrank_decimal(milli: i64) -> JudgmentHeader {

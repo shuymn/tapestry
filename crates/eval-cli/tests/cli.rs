@@ -29,7 +29,7 @@ const MS: i64 = 1_000;
 fn wide() -> RulePreset {
     let mut p = rules::custom();
     p.id = "wide".to_owned();
-    p.windows.bad = Window::symmetric(220 * MS);
+    p.tables.keys.windows.bad = Window::symmetric(220 * MS);
     p
 }
 

@@ -5,7 +5,7 @@
 
 use bms_model::{DOMAIN, TimeUs};
 
-use crate::{HeaderPolicy, JudgeRank};
+use crate::{HeaderPolicy, JudgeRank, LaneTable, PerLaneClass, WindowPolicy};
 
 /// A gauge amount in units of 1/100000 % (1 % = `100_000`, 100 % =
 /// `10_000_000`).
@@ -152,7 +152,7 @@ impl Window {
 /// The scale factor of an unchanged window, in thousandths of a percent.
 pub const SCALE_FULL_MILLI: i64 = 100_000;
 
-/// The judgment windows, one table for every lane.
+/// The judgment windows of one lane class ([`LaneTable`]).
 ///
 /// A press is given the best judgment whose window contains it. An unpressed
 /// note is missed per [`MissRule`] at the late BAD edge.
@@ -182,7 +182,7 @@ impl JudgeWindows {
     }
 
     /// Every edge scaled by `scale_milli` with [`scale_edge`]. `None` when
-    /// the scale is not positive or an edge leaves `0..=`[`MAX_WINDOW_EDGE`].
+    /// the scale is negative or an edge leaves `0..=`[`MAX_WINDOW_EDGE`].
     #[must_use]
     pub fn scaled(&self, scale_milli: i64) -> Option<Self> {
         let window = |w: Window| -> Option<Window> {
@@ -209,11 +209,11 @@ pub const MAX_WINDOW_EDGE: TimeUs = TimeUs(DOMAIN);
 /// `edge` multiplied by `scale_milli` (thousandths of a percent, see
 /// [`RankScale::scale_milli`]): `floor(edge × scale_milli / 100_000)`,
 /// computed in `i128`, so a fractional µs is dropped and a window never
-/// grows by rounding. `None` when the scale is not positive or the result
-/// lies outside `0..=`[`MAX_WINDOW_EDGE`].
+/// grows by rounding. A scale of 0 gives a zero-width edge. `None` when the
+/// scale is negative or the result lies outside `0..=`[`MAX_WINDOW_EDGE`].
 #[must_use]
 pub fn scale_edge(edge: TimeUs, scale_milli: i64) -> Option<TimeUs> {
-    if scale_milli <= 0 {
+    if scale_milli < 0 {
         return None;
     }
     let v = (i128::from(edge.0) * i128::from(scale_milli)).div_euclid(i128::from(SCALE_FULL_MILLI));
@@ -287,18 +287,13 @@ pub enum MissRule {
 /// Empty POOR: a press that judges no note but lies close to one.
 ///
 /// A press that judges no note is an empty POOR when a note of its lane,
-/// judged or not, lies at most `ahead` after the press or at most `behind`
-/// before it.
+/// judged or not, lies inside its lane class's [`EmptyPoorRange`] and the
+/// scan envelope the [`WindowPolicy`] prepares.
 ///
 /// Every such press counts, with no cap. Its gauge change is
-/// [`GaugeRule::empty_poor`]. Neither distance is scaled by the rank, and
-/// a note exactly `ahead` or `behind` away counts.
+/// [`GaugeRule::empty_poor`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EmptyPoorRule {
-    /// How far ahead of the press a note makes it an empty POOR.
-    pub ahead: TimeUs,
-    /// How far behind the press a note makes it an empty POOR.
-    pub behind: TimeUs,
     /// Whether it breaks the combo.
     pub breaks_combo: bool,
     /// Whether it adds to BP.
@@ -307,8 +302,9 @@ pub struct EmptyPoorRule {
     pub counted: bool,
 }
 
-/// How `#RANK` and `#DEFEXRANK` scale every window and LN-end edge, in
-/// thousandths of a percent (`100_000` = unchanged).
+/// How `#RANK` and `#DEFEXRANK` scale every window and LN-end edge under
+/// [`WindowPolicy::Thousandths`], in thousandths of a percent (`100_000` =
+/// unchanged).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RankScale {
     /// The scale for `#RANK 0` to `#RANK 3`.
@@ -532,18 +528,17 @@ pub struct RulePreset {
     pub version: u32,
     /// The evaluation implementation it runs on.
     pub implementation: Implementation,
-    /// The judgment windows at scale 100 %.
-    pub windows: JudgeWindows,
+    /// Each lane class's note windows, LN-end edges and empty POOR range at
+    /// scale 100 %. Every lane class states its own table.
+    pub tables: PerLaneClass<LaneTable>,
     /// When an unpressed note is missed.
     pub miss: MissRule,
-    /// Empty POOR.
+    /// What an empty POOR does.
     pub empty_poor: EmptyPoorRule,
-    /// The early edges of a long note's end at scale 100 %.
-    pub ln_end: LnEndWindows,
     /// How the chart's judgment headers are read.
     pub headers: HeaderPolicy,
-    /// Window scale per rank.
-    pub rank_scale: RankScale,
+    /// How the tables derive from the rank the header policy read.
+    pub window_policy: WindowPolicy,
     /// `#TOTAL` when the header policy reads none, in thousandths.
     pub default_total_milli: i64,
     /// Which notes make up the gauge denominator.
@@ -577,24 +572,27 @@ mod tests {
         let preset = custom();
         let scale = |rank| {
             preset
-                .rank_scale
-                .scale_milli(Some(JudgeRank::Rank(rank)))
-                .and_then(|s| preset.windows.scaled(s))
+                .window_policy
+                .prepare(&preset.tables, Some(JudgeRank::Rank(rank)))
                 .unwrap()
+                .keys
+                .table
+                .windows
         };
+        let windows = preset.tables.keys.windows;
         // #RANK 0 (50 %) and 3 (125 %) divide evenly.
         assert_eq!(scale(0).great, Window::symmetric(22_500));
         assert_eq!(scale(3).bad, Window::symmetric(225_000));
-        assert_eq!(scale(2), preset.windows);
+        assert_eq!(scale(2), windows);
         // 33.333 %: 20 ms × 0.33333 = 6666.6 µs, floored to 6666.
-        let third = preset.windows.scaled(33_333).unwrap();
+        let third = windows.scaled(33_333).unwrap();
         assert_eq!(third.perfect, Window::symmetric(6_666));
         assert_eq!(third.bad, Window::symmetric(59_999));
     }
 
     #[test]
     fn ln_end_edges_scale_like_note_windows_and_grade_inclusively() {
-        let ln_end = custom().ln_end;
+        let ln_end = custom().tables.keys.ln_end;
         // 100, 150, 200 ms at 33.333 %: 33_333, 49_999.5 and 66_666 µs,
         // floored.
         let third = ln_end.scaled(33_333).unwrap();
@@ -603,7 +601,13 @@ mod tests {
             (TimeUs(33_333), TimeUs(49_999), TimeUs(66_666))
         );
         assert_eq!(ln_end.scaled(100_000), Some(ln_end));
-        assert_eq!(ln_end.scaled(0), None);
+        // A scale of 0 gives zero-width edges; a negative one is unusable.
+        let zero = ln_end.scaled(0).unwrap();
+        assert_eq!(
+            (zero.perfect, zero.great, zero.good),
+            (TimeUs(0), TimeUs(0), TimeUs(0))
+        );
+        assert_eq!(ln_end.scaled(-1), None);
         // A 1 µs edge at 50 % floors to 0.
         let tiny = super::LnEndWindows {
             perfect: TimeUs(1),
@@ -652,7 +656,8 @@ mod tests {
             bad: w,
         };
         assert_eq!(windows.scaled(200_000), None);
-        assert_eq!(windows.scaled(0), None);
+        assert_eq!(windows.scaled(-1), None);
+        assert_eq!(windows.scaled(0).map(|w| w.bad), Some(Window::symmetric(0)));
     }
 
     #[test]

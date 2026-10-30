@@ -5,16 +5,18 @@ use std::collections::HashSet;
 use bms_model::TimeUs;
 
 use crate::{
-    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeWindows, Judgment, LnEndWindows, MineRule,
-    RuleError, RulePreset, SCALE_FULL_MILLI, Side,
+    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeRank, JudgeWindows, Judgment, LaneClass,
+    LaneTable, LnEndWindows, MineRule, RuleError, RulePreset, SCALE_FULL_MILLI, Side, WindowPolicy,
 };
 
 impl RulePreset {
-    /// Checks that this build runs the preset's implementation, the windows
-    /// and LN-end edges ascend and stay within
-    /// [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE) at every rank scale of
-    /// the preset, gauge values stay within their bounds, and every factor
-    /// and scale is usable.
+    /// Checks that this build runs the preset's implementation, each lane
+    /// class's own windows and LN-end edges ascend and stay within
+    /// [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE) at every fixed scale of
+    /// the window policy (`#RANK 0` to `#RANK 4` and no rank), gauge values
+    /// stay within their bounds, and every factor and scale is usable.
+    /// Only the preset's own tables must ascend: edges the scale derives
+    /// may tie.
     ///
     /// # Errors
     ///
@@ -29,26 +31,21 @@ impl RulePreset {
         if self.id.is_empty() {
             return Err(RuleError::EmptyName { field: "id" });
         }
-        check_windows(&self.windows)?;
-        if self.windows.scaled(SCALE_FULL_MILLI).is_none() {
-            return Err(RuleError::OutOfRange { field: "windows" });
+        for class in LaneClass::ALL {
+            check_table(class, self.tables.get(class))?;
         }
-        check_ln_end(&self.ln_end, &self.windows)?;
-        if self.ln_end.scaled(SCALE_FULL_MILLI).is_none() {
-            return Err(RuleError::OutOfRange { field: "ln_end" });
-        }
-        non_negative(self.empty_poor.ahead, "empty_poor.ahead")?;
-        non_negative(self.empty_poor.behind, "empty_poor.behind")?;
-        let r = &self.rank_scale;
-        // Every scale is positive and keeps every edge within the cap.
-        if r.rank_milli
-            .iter()
-            .chain([&r.absent_milli])
-            .any(|&s| self.windows.scaled(s).is_none() || self.ln_end.scaled(s).is_none())
-        {
-            return Err(RuleError::OutOfRange {
-                field: "rank_scale",
-            });
+        // Every fixed scale of the policy keeps every edge within the cap;
+        // derived edges may tie. A #DEFEXRANK is checked when a chart
+        // declares it.
+        let field = match self.window_policy {
+            WindowPolicy::Thousandths(_) => "rank_scale",
+            WindowPolicy::Scaled(_) => "rank_percent",
+        };
+        let ranks = (0..5).map(|r| Some(JudgeRank::Rank(r))).chain([None]);
+        for rank in ranks {
+            if self.window_policy.prepare(&self.tables, rank).is_none() {
+                return Err(RuleError::OutOfRange { field });
+            }
         }
         if self.default_total_milli <= 0 {
             return Err(RuleError::OutOfRange {
@@ -77,8 +74,38 @@ impl RulePreset {
     }
 }
 
+/// A lane class's own table: its windows and LN-end edges ascend and stay
+/// within the cap, and its empty POOR range is not negative.
+fn check_table(class: LaneClass, table: &LaneTable) -> Result<(), RuleError> {
+    let field = |keys, scratch| match class {
+        LaneClass::Keys => keys,
+        LaneClass::Scratch => scratch,
+    };
+    check_windows(class, &table.windows)?;
+    if table.windows.scaled(SCALE_FULL_MILLI).is_none() {
+        return Err(RuleError::OutOfRange {
+            field: field("keys.windows", "scratch.windows"),
+        });
+    }
+    check_ln_end(class, &table.ln_end, &table.windows)?;
+    if table.ln_end.scaled(SCALE_FULL_MILLI).is_none() {
+        return Err(RuleError::OutOfRange {
+            field: field("keys.ln_end", "scratch.ln_end"),
+        });
+    }
+    let range = table.empty_poor;
+    non_negative(
+        range.ahead,
+        field("keys.empty_poor.ahead", "scratch.empty_poor.ahead"),
+    )?;
+    non_negative(
+        range.behind,
+        field("keys.empty_poor.behind", "scratch.empty_poor.behind"),
+    )
+}
+
 /// Each side's edges are not negative and strictly widen from PERFECT to BAD.
-fn check_windows(windows: &JudgeWindows) -> Result<(), RuleError> {
+fn check_windows(class: LaneClass, windows: &JudgeWindows) -> Result<(), RuleError> {
     for side in [Side::Early, Side::Late] {
         let mut previous = -1;
         for (judgment, window) in windows.table() {
@@ -87,7 +114,11 @@ fn check_windows(windows: &JudgeWindows) -> Result<(), RuleError> {
                 Side::Late => window.late,
             };
             if edge.0 <= previous {
-                return Err(RuleError::WindowsNotAscending { side, judgment });
+                return Err(RuleError::WindowsNotAscending {
+                    class,
+                    side,
+                    judgment,
+                });
             }
             previous = edge.0;
         }
@@ -99,17 +130,21 @@ fn check_windows(windows: &JudgeWindows) -> Result<(), RuleError> {
 /// and are each at least the note window's early edge of the same judgment:
 /// a press held at least as long as its long note releases at `d = h + hold
 /// − length ≥ h` from its end, which then never grades below the head.
-fn check_ln_end(ln_end: &LnEndWindows, windows: &JudgeWindows) -> Result<(), RuleError> {
+fn check_ln_end(
+    class: LaneClass,
+    ln_end: &LnEndWindows,
+    windows: &JudgeWindows,
+) -> Result<(), RuleError> {
     let mut previous = -1;
     for (judgment, edge) in ln_end.table() {
         if edge.0 <= previous {
-            return Err(RuleError::LnEndNotAscending { judgment });
+            return Err(RuleError::LnEndNotAscending { class, judgment });
         }
         previous = edge.0;
     }
     for ((judgment, edge), (_, window)) in ln_end.table().into_iter().zip(windows.table()) {
         if edge < window.early {
-            return Err(RuleError::LnEndNarrowerThanNote { judgment });
+            return Err(RuleError::LnEndNarrowerThanNote { class, judgment });
         }
     }
     Ok(())
@@ -177,7 +212,7 @@ fn check_gauge(gauge: &GaugeRule) -> Result<(), RuleError> {
 mod tests {
     use bms_model::TimeUs;
 
-    use crate::{GaugeValue, Judgment, RuleError, Side, custom};
+    use crate::{GaugeValue, Judgment, LaneClass, RuleError, Side, WindowPolicy, custom};
 
     #[test]
     fn custom_preset_validates() {
@@ -185,36 +220,64 @@ mod tests {
     }
 
     #[test]
-    fn descending_windows_are_rejected() {
+    fn descending_windows_are_rejected_in_either_table() {
         let mut preset = custom();
-        preset.windows.good.late = TimeUs(44_000);
+        preset.tables.keys.windows.good.late = TimeUs(44_000);
         assert_eq!(
             preset.validate(),
             Err(RuleError::WindowsNotAscending {
+                class: LaneClass::Keys,
                 side: Side::Late,
                 judgment: Judgment::Good,
             })
         );
 
         let mut preset = custom();
-        preset.windows.bad.early = preset.windows.good.early;
+        preset.tables.scratch.windows.bad.early = preset.tables.scratch.windows.good.early;
         assert_eq!(
             preset.validate(),
             Err(RuleError::WindowsNotAscending {
+                class: LaneClass::Scratch,
                 side: Side::Early,
                 judgment: Judgment::Bad,
             })
         );
 
         let mut preset = custom();
-        preset.windows.perfect.early = TimeUs(-1);
+        preset.tables.scratch.windows.perfect.early = TimeUs(-1);
         assert_eq!(
             preset.validate(),
             Err(RuleError::WindowsNotAscending {
+                class: LaneClass::Scratch,
                 side: Side::Early,
                 judgment: Judgment::Perfect,
             })
         );
+    }
+
+    #[test]
+    fn a_scale_of_0_validates() {
+        let with_rank_0 = |milli| {
+            let mut preset = custom();
+            let WindowPolicy::Thousandths(scale) = &mut preset.window_policy else {
+                panic!("custom scales in thousandths");
+            };
+            scale.rank_milli[0] = milli;
+            preset.validate()
+        };
+        assert_eq!(with_rank_0(0), Ok(()));
+        assert_eq!(
+            with_rank_0(-1),
+            Err(RuleError::OutOfRange {
+                field: "rank_scale"
+            })
+        );
+        let mut preset = crate::beatoraja_style();
+        let WindowPolicy::Scaled(scale) = &mut preset.window_policy else {
+            panic!("beatoraja-style scales by whole percentages");
+        };
+        scale.absent_percent = 0;
+        assert_eq!(preset.validate(), Ok(()));
     }
 
     #[test]
@@ -240,12 +303,18 @@ mod tests {
     fn ln_end_edges_must_ascend_from_zero() {
         let with = |p: i64, g: i64, d: i64| {
             let mut preset = custom();
-            preset.ln_end.perfect = TimeUs(p);
-            preset.ln_end.great = TimeUs(g);
-            preset.ln_end.good = TimeUs(d);
+            let ln_end = &mut preset.tables.scratch.ln_end;
+            ln_end.perfect = TimeUs(p);
+            ln_end.great = TimeUs(g);
+            ln_end.good = TimeUs(d);
             preset.validate()
         };
-        let not = |judgment| Err(RuleError::LnEndNotAscending { judgment });
+        let not = |judgment| {
+            Err(RuleError::LnEndNotAscending {
+                class: LaneClass::Scratch,
+                judgment,
+            })
+        };
         // The note windows' early edges are 20, 45 and 100 ms.
         assert_eq!(with(100_000, 150_000, 200_000), Ok(()));
         assert_eq!(with(100_000, 100_001, 100_002), Ok(()));
@@ -258,25 +327,31 @@ mod tests {
     #[test]
     fn ln_end_edges_are_at_least_the_note_windows_early_edges() {
         let mut preset = custom();
-        preset.windows.perfect.early = TimeUs(0);
+        preset.tables.keys.windows.perfect.early = TimeUs(0);
         let with = |p: i64, g: i64, d: i64| {
             let mut preset = preset.clone();
-            preset.ln_end.perfect = TimeUs(p);
-            preset.ln_end.great = TimeUs(g);
-            preset.ln_end.good = TimeUs(d);
+            let ln_end = &mut preset.tables.keys.ln_end;
+            ln_end.perfect = TimeUs(p);
+            ln_end.great = TimeUs(g);
+            ln_end.good = TimeUs(d);
             preset.validate()
         };
-        let narrower = |judgment| Err(RuleError::LnEndNarrowerThanNote { judgment });
+        let narrower = |class, judgment| Err(RuleError::LnEndNarrowerThanNote { class, judgment });
+        let keys = LaneClass::Keys;
         // Note early edges: PERFECT 0, GREAT 45 ms, GOOD 100 ms. Equal is
         // accepted, 1 µs narrower refused; the late edges do not matter.
         assert_eq!(with(0, 45_000, 100_000), Ok(()));
-        assert_eq!(with(0, 44_999, 100_000), narrower(Judgment::Great));
-        assert_eq!(with(0, 45_000, 99_999), narrower(Judgment::Good));
+        assert_eq!(with(0, 44_999, 100_000), narrower(keys, Judgment::Great));
+        assert_eq!(with(0, 45_000, 99_999), narrower(keys, Judgment::Good));
+        // Each class against its own windows.
         let mut wide = preset.clone();
-        wide.windows.perfect.early = TimeUs(30_000);
-        wide.ln_end.perfect = TimeUs(29_999);
-        assert_eq!(wide.validate(), narrower(Judgment::Perfect));
-        wide.ln_end.perfect = TimeUs(30_000);
+        wide.tables.scratch.windows.perfect.early = TimeUs(30_000);
+        wide.tables.scratch.ln_end.perfect = TimeUs(29_999);
+        assert_eq!(
+            wide.validate(),
+            narrower(LaneClass::Scratch, Judgment::Perfect)
+        );
+        wide.tables.scratch.ln_end.perfect = TimeUs(30_000);
         assert_eq!(wide.validate(), Ok(()));
     }
 
@@ -287,28 +362,35 @@ mod tests {
         // widening it.
         let unscaled = || {
             let mut preset = custom();
-            preset.rank_scale.rank_milli = [100_000; 4];
+            preset.window_policy = WindowPolicy::Thousandths(crate::RankScale {
+                rank_milli: [100_000; 4],
+                absent_milli: 100_000,
+            });
             preset
         };
         let with_bad = |top: i64| {
             let mut preset = unscaled();
-            preset.windows.bad.late = TimeUs(top);
+            preset.tables.keys.windows.bad.late = TimeUs(top);
             preset.validate()
         };
         assert_eq!(with_bad(cap), Ok(()));
         assert_eq!(
             with_bad(cap + 1),
-            Err(RuleError::OutOfRange { field: "windows" })
+            Err(RuleError::OutOfRange {
+                field: "keys.windows"
+            })
         );
         let with_good_end = |top: i64| {
             let mut preset = unscaled();
-            preset.ln_end.good = TimeUs(top);
+            preset.tables.scratch.ln_end.good = TimeUs(top);
             preset.validate()
         };
         assert_eq!(with_good_end(cap), Ok(()));
         assert_eq!(
             with_good_end(cap + 1),
-            Err(RuleError::OutOfRange { field: "ln_end" })
+            Err(RuleError::OutOfRange {
+                field: "scratch.ln_end"
+            })
         );
         // #RANK 3 scales by 125 %: floor(3_435_973_837 × 1.25) =
         // 4_294_967_296, the cap; floor(3_435_973_838 × 1.25) =
@@ -316,9 +398,9 @@ mod tests {
         let scaled = |edge: i64, ln_end: bool| {
             let mut preset = custom();
             if ln_end {
-                preset.ln_end.good = TimeUs(edge);
+                preset.tables.scratch.ln_end.good = TimeUs(edge);
             } else {
-                preset.windows.bad.early = TimeUs(edge);
+                preset.tables.keys.windows.bad.early = TimeUs(edge);
             }
             preset.validate()
         };
@@ -331,27 +413,38 @@ mod tests {
             assert_eq!(scaled(3_435_973_837, ln_end), Ok(()));
             assert_eq!(scaled(3_435_973_838, ln_end), rank);
         }
+        // beatoraja-style's #RANK 4 scales by 125 % too, in whole percent.
+        let mut preset = crate::beatoraja_style();
+        preset.tables.scratch.windows.bad.late = TimeUs(3_435_973_837);
+        assert_eq!(preset.validate(), Ok(()));
+        preset.tables.scratch.windows.bad.late = TimeUs(3_435_973_838);
+        assert_eq!(
+            preset.validate(),
+            Err(RuleError::OutOfRange {
+                field: "rank_percent"
+            })
+        );
     }
 
     #[test]
     fn negative_empty_poor_distances_are_rejected() {
         let with = |ahead: i64, behind: i64| {
             let mut preset = custom();
-            preset.empty_poor.ahead = TimeUs(ahead);
-            preset.empty_poor.behind = TimeUs(behind);
+            preset.tables.scratch.empty_poor.ahead = TimeUs(ahead);
+            preset.tables.scratch.empty_poor.behind = TimeUs(behind);
             preset.validate()
         };
         assert_eq!(with(0, 0), Ok(()));
         assert_eq!(
             with(0, -1),
             Err(RuleError::OutOfRange {
-                field: "empty_poor.behind"
+                field: "scratch.empty_poor.behind"
             })
         );
         assert_eq!(
             with(-1, 0),
             Err(RuleError::OutOfRange {
-                field: "empty_poor.ahead"
+                field: "scratch.empty_poor.ahead"
             })
         );
     }

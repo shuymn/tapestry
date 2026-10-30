@@ -337,16 +337,16 @@ fn t8_ln_end_edges_scale_with_the_rank() {
     // is GREAT where it is PERFECT unscaled.
     let mut tiny = rules::custom();
     for (w, us) in [
-        (&mut tiny.windows.perfect, 0),
-        (&mut tiny.windows.great, 1),
-        (&mut tiny.windows.good, 2),
-        (&mut tiny.windows.bad, 3),
+        (&mut tiny.tables.keys.windows.perfect, 0),
+        (&mut tiny.tables.keys.windows.great, 1),
+        (&mut tiny.tables.keys.windows.good, 2),
+        (&mut tiny.tables.keys.windows.bad, 3),
     ] {
         w.early = TimeUs(us);
     }
-    tiny.ln_end.perfect = TimeUs(1);
-    tiny.ln_end.great = TimeUs(2);
-    tiny.ln_end.good = TimeUs(3);
+    tiny.tables.keys.ln_end.perfect = TimeUs(1);
+    tiny.tables.keys.ln_end.great = TimeUs(2);
+    tiny.tables.keys.ln_end.good = TimeUs(3);
     assert_eq!(tiny.validate(), Ok(()));
     let r2 = common::rank(2);
     assert_eq!(ranked(&tiny, r2, s, 1), Perfect);
@@ -560,9 +560,9 @@ fn l1_2_scaled_edges_beyond_2_pow_32_refuse_the_rank() {
     };
     for edge in [half, half + 1] {
         let mut wide_bad = rules::custom();
-        wide_bad.windows.bad = Window::symmetric(edge);
+        wide_bad.tables.keys.windows.bad = Window::symmetric(edge);
         let mut wide_end = rules::custom();
-        wide_end.ln_end.good = TimeUs(edge);
+        wide_end.tables.keys.ln_end.good = TimeUs(edge);
         for preset in [&wide_bad, &wide_end] {
             assert_eq!(preset.validate(), Ok(()));
             let expected = if edge == half {

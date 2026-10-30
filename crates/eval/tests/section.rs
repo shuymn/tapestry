@@ -406,7 +406,7 @@ fn section_finalizes_through_its_final_deadline() {
     let mut preset = rules::custom();
     // Wide enough that a press after the final deadline would be an empty
     // POOR if it were judged.
-    preset.empty_poor.behind = TimeUs(S);
+    preset.tables.keys.empty_poor.behind = TimeUs(S);
     let dev = device(&[0]);
     let s = ten_to_twenty(&preset);
     let held = [press(18 * S, 0, 2), release(20_500 * MS, 0, 2)];
@@ -460,7 +460,7 @@ fn section_without_targets_completes_at_its_start() {
         .build()
         .unwrap();
     let mut preset = rules::custom();
-    preset.empty_poor.behind = TimeUs(100 * S);
+    preset.tables.keys.empty_poor.behind = TimeUs(100 * S);
     let dev = device(&[0]);
     let s = section(30 * S, 40 * S, 2 * S, &preset);
     let events = vec![

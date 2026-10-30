@@ -31,7 +31,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
-use rules::{GaugeKind, GaugeValue, HeaderPolicy, MineRule, RulePreset};
+use rules::{GaugeKind, GaugeValue, HeaderPolicy, MineRule, RulePreset, WindowPolicy};
 
 use live::{Delivery, Live, live};
 use strategy::{
@@ -290,6 +290,8 @@ proptest! {
         let scaled = |edge: TimeUs| edge.0 * p.scale / 100_000;
         let expected = p
             .preset
+            .tables
+            .keys
             .windows
             .table()
             .into_iter()
@@ -518,7 +520,16 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
         "headers_integer_ranks",
         p.headers == HeaderPolicy::IntegerRanks,
     );
-    c.hit("asymmetric_bad", p.windows.bad.early != p.windows.bad.late);
+    let bad = p.tables.keys.windows.bad;
+    c.hit("asymmetric_bad", bad.early != bad.late);
+    c.hit("scratch_own_table", p.tables.keys != p.tables.scratch);
+    c.hit(
+        "window_policy_thousandths",
+        matches!(p.window_policy, WindowPolicy::Thousandths(_)),
+    );
+    let scaled = |empty_poor: bool| matches!(p.window_policy, WindowPolicy::Scaled(s) if s.scales_empty_poor == empty_poor);
+    c.hit("window_policy_scaled", scaled(false));
+    c.hit("window_policy_scaled_empty_poor", scaled(true));
     let survival = |low: bool| {
         p.gauges
             .iter()
@@ -659,13 +670,13 @@ fn count_section(play: &Play, s: &eval::Section, whole: &Evaluation, c: &mut Cov
         0,
     )
     .unwrap();
-    let early = ev.windows().bad.early;
     let lead_in = TimeUs(s.start.0 - s.lead_in.0)..s.start;
     c.hit(
         "lead_in_press_on_early_edge",
         whole.events.iter().any(|e| {
             lead_in.contains(&e.time)
-                && matches!(e.kind, JudgeEventKind::Judged { deviation: Some(d), .. } if d.0 == -early.0)
+                && matches!(e.kind, JudgeEventKind::Judged { lane, deviation: Some(d), .. }
+                    if d.0 == -ev.table(lane).table.windows.bad.early.0)
         }),
     );
     // A lead-in press the section ignores and a whole-chart play judges or
@@ -826,6 +837,10 @@ fn generators_reach_the_fragile_spots() {
         ("headers_integer_ranks", 1),
         ("header_policies_differ", 1),
         ("asymmetric_bad", 1),
+        ("scratch_own_table", 1),
+        ("window_policy_thousandths", 1),
+        ("window_policy_scaled", 1),
+        ("window_policy_scaled_empty_poor", 1),
         ("survival_with_low_damage", 1),
         ("survival_without_low_damage", 1),
         ("gauge_at_max", 1),

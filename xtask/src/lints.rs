@@ -127,6 +127,15 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     Site::Fns(
+        "crates/rules/src/windows.rs",
+        &[
+            "LaneClass::of",
+            "PerLaneClass::get",
+            "PerLaneClass::of_lane",
+            "ScanEnvelope::contains",
+        ],
+    ),
+    Site::Fns(
         "crates/bms-model/src/lib.rs",
         &["TimeUs::checked_add", "TimeUs::checked_sub"],
     ),

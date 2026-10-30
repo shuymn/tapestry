@@ -27,6 +27,7 @@ mod error;
 mod headers;
 mod preset;
 mod validate;
+mod windows;
 
 pub use beatoraja_style::beatoraja_style;
 pub use custom::custom;
@@ -37,4 +38,8 @@ pub use preset::{
     Implementation, JudgeWindows, Judgment, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
     LowDamage, MAX_WINDOW_EDGE, MineRule, MissRule, PerJudgment, RankScale, RulePreset,
     SCALE_FULL_MILLI, SameTimeOrder, ScoreWeights, TotalMode, Window, scale_edge,
+};
+pub use windows::{
+    EmptyPoorRange, LaneClass, LaneTable, PerLaneClass, PreparedTable, Reach, ScaledRank,
+    ScanEnvelope, WindowPolicy,
 };

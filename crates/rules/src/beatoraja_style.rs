@@ -20,13 +20,16 @@
 //! | LN-end edges PERFECT 120, GREAT 160, GOOD 200 ms before the end | `play/JudgeProperty.java:25` |
 //! | Release earlier than the GOOD edge is BAD, never POOR | `play/JudgeManager.java:533-541` (`lnendJudge = 3`; the release margin is 0, `play/JudgeProperty.java:26`) |
 //! | Release: the worse of head and release; held through the end keeps the head | `play/JudgeManager.java:534`, `:572-573` |
-//! | Empty POOR: a note less than 500 ms after the press (499 999 µs here), or at most 150 ms before it | `play/JudgeProperty.java:23` (MS pair), `play/JudgeManager.java:387-389` (the scan stops at 500 ms ahead, exclusive), `:401` |
+//! | Scratch notes: PERFECT ±30, GREAT ±70, GOOD ±160 ms, BAD 230 ms early and 290 ms late; scratch LN-end edges 130, 170, 210 ms; scratch empty POOR 160 ms behind | `play/JudgeProperty.java:24` (scratch notes and MS pair), `:27` (scratch LN ends), `:191-197` (the table per note type); a scratch press, release and miss read it (`play/JudgeManager.java:380`, `:494`, `:595`) |
+//! | Empty POOR: a note at most 500 ms after the press or 150 ms before it (160 ms on the scratch), inclusive, and inside the scan envelope | `play/JudgeProperty.java:23-24` (MS pairs), `play/JudgeManager.java:401` |
+//! | Scan envelope ([`WindowPolicy::Scaled`]): one for both tables, from the farthest late edge, included, to the farthest early edge, excluded, over the scaled note and scratch tables with their MS pairs; at 500 ms or less of early BAD, a note exactly 500 ms after the press is not reached | `play/JudgeManager.java:189-196` (the envelope), `:387-392` (the scan) |
 //! | Empty POOR keeps the combo, adds to BP, has its own count | `play/JudgeProperty.java:29` (combo), `play/JudgeManager.java:660-668`, `BMSPlayer.java:915` (BP), `ScoreData.java:278` (MS count) |
 //! | BAD and POOR break the combo and add to BP | `play/JudgeProperty.java:29`, `BMSPlayer.java:915` |
 //! | Missed once its late BAD edge has passed (timing: see H below) | `play/JudgeManager.java:594-598` |
-//! | `#RANK` 0-3: 25, 50, 75, 100 %; no rank or an unknown `#RANK`: 75 % | `play/JudgeProperty.java:210`, `play/BMSPlayerRule.java:62`; jbms-parser `BMSModel.java:67,71` (default rank 2), `BMSDecoder.java:702-713` |
+//! | `#RANK` 0-4: 25, 50, 75, 100, 125 %; no rank or an unknown `#RANK`: 75 % | `play/JudgeProperty.java:210`, `play/BMSPlayerRule.java:62`; jbms-parser `BMSModel.java:67,71` (default rank 2), `BMSDecoder.java:702-713` |
+//! | `#DEFEXRANK n`: `n × 75 / 100` % in integer arithmetic, so `#DEFEXRANK 1` is 0 % and plays zero-width windows | `play/BMSPlayerRule.java:63` (75 is `#RANK 2`'s rate) |
 //! | Judgment headers ([`HeaderPolicy::IntegerRanks`]): `#RANK` an integer token 0-4, `#DEFEXRANK` an integer token of at least 1, `#TOTAL` any number above 0; a later accepted one replaces an earlier one, and a refused one keeps it | jbms-parser `BMSDecoder.java:702-713`, `:716-727`, `:730-743` |
-//! | Each edge scaled by `edge × rate / 100`, in µs | `play/JudgeProperty.java:234` |
+//! | Each window and LN-end edge scaled by `edge × rate / 100`, in µs; derived edges may tie | `play/JudgeProperty.java:234` |
 //! | Empty POOR distances not scaled | `play/JudgeProperty.java:210` (`fixjudge`) |
 //! | `#TOTAL` absent: 260 (see E below) | `play/BMSPlayerRule.java:75-78`, `:85`; jbms-parser `BMSModel.java:75,79` (a chart without `#TOTAL` keeps the bmson total type) |
 //! | Gauge denominator: taps and LN heads, mines excluded | jbms-parser `TimeLine.java:139-155` |
@@ -45,11 +48,6 @@
 //! preset plays the stated substitute; each line names the example that
 //! would differ.
 //!
-//! - **A. Scratch windows.** Scratch notes use their own table: PERFECT
-//!   ±30, GREAT ±70, GOOD ±160 ms, BAD 230 ms early and 290 ms late; scratch
-//!   LN-end edges 130, 170 and 210 ms; empty POOR 160 ms behind
-//!   (`play/JudgeProperty.java:24`, `:27`). Here the scratch uses the key
-//!   table, so a scratch pressed 25 ms late is GREAT, not PERFECT.
 //! - **B. Note assignment and misses.** beatoraja's default assignment is
 //!   combo priority (`play/JudgeAlgorithm.java:17-20`, `PlayConfig.java:103`):
 //!   it takes the later note only when the earlier one cannot be hit GOOD or
@@ -71,11 +69,6 @@
 //!   notes + 6.5))` (`play/BMSPlayerRule.java:85`). Here it is 260, which
 //!   matches up to 337 notes; a 1000-note chart without `#TOTAL` has about
 //!   460.9 there.
-//! - **F. `#DEFEXRANK` and `#RANK 4`.** `#DEFEXRANK n` scales by
-//!   `n × 75 / 100` %, and `#RANK 4` by 125 % (`play/BMSPlayerRule.java:62-63`,
-//!   jbms-parser `BMSDecoder.java:705`). Here `#DEFEXRANK n` scales by `n` %
-//!   and `#RANK 4` by the absent rank's 75 %: `#DEFEXRANK 100` gives PERFECT
-//!   ±15 ms there, ±20 ms here.
 //! - **G. A BAD long-note head.** It is held and scored at the release or the
 //!   end (`play/JudgeManager.java:428`, `play/JudgeProperty.java:31`); here it
 //!   is scored at the press. The counts are the same, but notes of other lanes
@@ -112,18 +105,26 @@
 //!   so `Integer.parseInt` throws and rank 3 stays there
 //!   (`BMSDecoder.java:367-368`, `:702-713`).
 //!
-//! Each of the last two is an example in
-//! `crates/bms-parser/tests/judgment_headers.rs`.
+//! - **A `#DEFEXRANK` whose windows pass 2^32 µs.** Every edge here stays
+//!   within the chart time domain, so from `#DEFEXRANK 1974699` (1 481 024 %,
+//!   which takes the scratch's 290 ms late edge past 2^32 µs) the chart is
+//!   refused, where the source plays windows over an hour wide; from
+//!   28 633 116, `n × 75` also wraps in the source's `int` arithmetic
+//!   (`play/BMSPlayerRule.java:63`).
+//!
+//! Each of the second and third is an example in
+//! `crates/bms-parser/tests/judgment_headers.rs`, and the last one in
+//! `crates/eval/tests/style_beatoraja.rs`.
 //!
 //! The CLASS gauges (course play only) are not included.
 
 use bms_model::TimeUs;
 
 use crate::{
-    Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
-    MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalMode,
-    Window,
+    Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
+    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
+    LnMode, LnModeRule, MineRule, MissRule, PerJudgment, PerLaneClass, RulePreset, SameTimeOrder,
+    ScaledRank, ScoreWeights, TotalMode, Window, WindowPolicy,
 };
 
 const MS: i64 = 1_000;
@@ -198,34 +199,63 @@ pub fn beatoraja_style() -> RulePreset {
         id: "beatoraja-style".to_owned(),
         version: 1,
         implementation: Implementation::Standard { version: 2 },
-        windows: JudgeWindows {
-            perfect: Window::symmetric(20 * MS),
-            great: Window::symmetric(60 * MS),
-            good: Window::symmetric(150 * MS),
-            bad: Window {
-                early: TimeUs(220 * MS),
-                late: TimeUs(280 * MS),
+        tables: PerLaneClass {
+            keys: LaneTable {
+                windows: JudgeWindows {
+                    perfect: Window::symmetric(20 * MS),
+                    great: Window::symmetric(60 * MS),
+                    good: Window::symmetric(150 * MS),
+                    bad: Window {
+                        early: TimeUs(220 * MS),
+                        late: TimeUs(280 * MS),
+                    },
+                },
+                ln_end: LnEndWindows {
+                    perfect: TimeUs(120 * MS),
+                    great: TimeUs(160 * MS),
+                    good: TimeUs(200 * MS),
+                },
+                // Inclusive; the scan envelope excludes a note exactly
+                // 500 ms ahead while no early BAD edge passes it.
+                empty_poor: EmptyPoorRange {
+                    ahead: TimeUs(500 * MS),
+                    behind: TimeUs(150 * MS),
+                },
+            },
+            scratch: LaneTable {
+                windows: JudgeWindows {
+                    perfect: Window::symmetric(30 * MS),
+                    great: Window::symmetric(70 * MS),
+                    good: Window::symmetric(160 * MS),
+                    bad: Window {
+                        early: TimeUs(230 * MS),
+                        late: TimeUs(290 * MS),
+                    },
+                },
+                ln_end: LnEndWindows {
+                    perfect: TimeUs(130 * MS),
+                    great: TimeUs(170 * MS),
+                    good: TimeUs(210 * MS),
+                },
+                empty_poor: EmptyPoorRange {
+                    ahead: TimeUs(500 * MS),
+                    behind: TimeUs(160 * MS),
+                },
             },
         },
         miss: MissRule::PoorAfterLateBadOrOvertaken,
         empty_poor: EmptyPoorRule {
-            // Exclusive at 500 ms (play/JudgeManager.java:387-389).
-            ahead: TimeUs(500 * MS - 1),
-            behind: TimeUs(150 * MS),
             breaks_combo: false,
             counts_bp: true,
             counted: false,
         },
-        ln_end: LnEndWindows {
-            perfect: TimeUs(120 * MS),
-            great: TimeUs(160 * MS),
-            good: TimeUs(200 * MS),
-        },
         headers: HeaderPolicy::IntegerRanks,
-        rank_scale: RankScale {
-            rank_milli: [25_000, 50_000, 75_000, 100_000],
-            absent_milli: 75_000,
-        },
+        window_policy: WindowPolicy::Scaled(ScaledRank {
+            rank_percent: [25, 50, 75, 100, 125],
+            absent_percent: 75,
+            defexrank_percent: 75,
+            scales_empty_poor: false,
+        }),
         default_total_milli: 260_000,
         denominator: Denominator::TapsAndLnHeads,
         gauges,

@@ -4,10 +4,10 @@
 use bms_model::TimeUs;
 
 use crate::{
-    Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
-    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights,
-    TotalMode, Window,
+    Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
+    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
+    LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
+    RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window, WindowPolicy,
 };
 
 const MS: i64 = 1_000;
@@ -68,30 +68,35 @@ pub fn custom() -> RulePreset {
         id: "custom".to_owned(),
         version: 3,
         implementation: Implementation::Standard { version: 2 },
-        windows: JudgeWindows {
-            perfect: Window::symmetric(20 * MS),
-            great: Window::symmetric(45 * MS),
-            good: Window::symmetric(100 * MS),
-            bad: Window::symmetric(180 * MS),
-        },
+        // One table for every lane: the scratch states the keys' table.
+        tables: PerLaneClass::both(LaneTable {
+            windows: JudgeWindows {
+                perfect: Window::symmetric(20 * MS),
+                great: Window::symmetric(45 * MS),
+                good: Window::symmetric(100 * MS),
+                bad: Window::symmetric(180 * MS),
+            },
+            ln_end: LnEndWindows {
+                perfect: TimeUs(100 * MS),
+                great: TimeUs(150 * MS),
+                good: TimeUs(200 * MS),
+            },
+            empty_poor: EmptyPoorRange {
+                ahead: TimeUs(500 * MS),
+                behind: TimeUs(150 * MS),
+            },
+        }),
         miss: MissRule::PoorAfterLateBadOrOvertaken,
         empty_poor: EmptyPoorRule {
-            ahead: TimeUs(500 * MS),
-            behind: TimeUs(150 * MS),
             breaks_combo: false,
             counts_bp: true,
             counted: false,
         },
-        ln_end: LnEndWindows {
-            perfect: TimeUs(100 * MS),
-            great: TimeUs(150 * MS),
-            good: TimeUs(200 * MS),
-        },
         headers: HeaderPolicy::Decimals,
-        rank_scale: RankScale {
+        window_policy: WindowPolicy::Thousandths(RankScale {
             rank_milli: [50_000, 75_000, 100_000, 125_000],
             absent_milli: 100_000,
-        },
+        }),
         default_total_milli: 160_000,
         denominator: Denominator::TapsAndLnHeads,
         gauges: vec![normal, survival],
@@ -136,10 +141,10 @@ mod tests {
     use bms_model::TimeUs;
 
     use crate::{
-        Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-        Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage,
-        MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights,
-        TotalMode, Window,
+        Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
+        GaugeValue, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows, LnMode,
+        LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
+        RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window, WindowPolicy,
     };
 
     const fn pj<T>(perfect: T, great: T, good: T, bad: T, poor: T) -> PerJudgment<T> {
@@ -161,34 +166,42 @@ mod tests {
             late: TimeUs(us),
         };
         let g = |v| GaugeDelta::Fixed(GaugeValue(v));
-        let expected = RulePreset {
-            id: "custom".to_owned(),
-            version: 3,
-            implementation: Implementation::Standard { version: 2 },
+        let table = LaneTable {
             windows: JudgeWindows {
                 perfect: w(20_000),
                 great: w(45_000),
                 good: w(100_000),
                 bad: w(180_000),
             },
-            miss: MissRule::PoorAfterLateBadOrOvertaken,
-            empty_poor: EmptyPoorRule {
-                ahead: TimeUs(500_000),
-                behind: TimeUs(150_000),
-                breaks_combo: false,
-                counts_bp: true,
-                counted: false,
-            },
             ln_end: LnEndWindows {
                 perfect: TimeUs(100_000),
                 great: TimeUs(150_000),
                 good: TimeUs(200_000),
             },
+            empty_poor: EmptyPoorRange {
+                ahead: TimeUs(500_000),
+                behind: TimeUs(150_000),
+            },
+        };
+        let expected = RulePreset {
+            id: "custom".to_owned(),
+            version: 3,
+            implementation: Implementation::Standard { version: 2 },
+            tables: PerLaneClass {
+                keys: table,
+                scratch: table,
+            },
+            miss: MissRule::PoorAfterLateBadOrOvertaken,
+            empty_poor: EmptyPoorRule {
+                breaks_combo: false,
+                counts_bp: true,
+                counted: false,
+            },
             headers: crate::HeaderPolicy::Decimals,
-            rank_scale: RankScale {
+            window_policy: WindowPolicy::Thousandths(RankScale {
                 rank_milli: [50_000, 75_000, 100_000, 125_000],
                 absent_milli: 100_000,
-            },
+            }),
             default_total_milli: 160_000,
             denominator: Denominator::TapsAndLnHeads,
             gauges: vec![
