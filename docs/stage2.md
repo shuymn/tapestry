@@ -14,7 +14,10 @@ The stage exits when song selection, play, results and retry can be played repea
 - A flaw found by a later variation rebuilds the affected part.
 
 **Decisions that change what players see**, each reflected below:
-- the LR2-style long-note rule follows LR2oraja Endless Dream (D11);
+- the LR2-style preset, its long-note rule included, follows LR2oraja Endless Dream (D11);
+- "-style" presets reproduce their target's rules, not its machine, and each lists the result differences this causes, such as a clear lamp that fixed-point rounding changes (D11);
+- the chart keeps its `#RANK`, `#DEFEXRANK` and `#TOTAL` declarations and each preset reads them, so one chart can have different windows and `#TOTAL` under different presets (D11, PR7e);
+- a what-if of a practice record transfers initial gauges by gauge ID, and a gauge the record lacks starts at its preset's start value, marked as such (PR23);
 - running `tapestry` with no arguments opens song selection (D1);
 - the library database is rebuilt when its schema version changes (D5);
 - no egui in stage 2, and library roots live in `device.toml` (D4);
@@ -231,38 +234,55 @@ egui comes with the first form-like screen.
 
 **Alternatives.** `notify`, or `ReadDirectoryChangesW`.
 
-### D11. The standard presets and their long-note rules
+### D11. The standard presets and their rules
 
 **Where they live.** `rules::beatoraja_style()` and `rules::lr2_style()`.
 
+**Targets (decided).** beatoraja-style follows beatoraja (exch-bms2/beatoraja@83574048) and LR2-style follows LR2oraja Endless Dream (seraxis/lr2oraja-endlessdream@d4995153), whose LR2 rule set is a set of changes on beatoraja's judge code. Lunatic Vibes and bmz-player are references only: evidence for which axes exist, not targets, so behavior only they have is not built.
+
+**The contract.** design.md "Rule Presets" holds it: preparation, one shared scheduler, press resolution, LN transitions and accounting ("Evaluation Stages"); closed policies with their own data, combined only where specified and tested, with a dedicated implementation for a substantially different state machine; one canonical encoding per validated preset value ("Policies, Combinations and Versions"). Every PR below fits its policy into the stage that owns it.
+
 **Values and examples.**
-- Values come from public descriptions, with each source recorded in the preset's module and its test file.
+- Values come from the target's source, each cited by file and line in the preset's module and its test file.
 - Each preset gets a few dozen hand-written examples.
-- An axis is added only when an example fails without it.
+- A policy variant arrives only with a hand-written example from its target preset that fails without it.
 
-**Axes beatoraja-style needs.** beatoraja (exch-bms2/beatoraja@83574048) differs from today's model in eight places, each shown by an example. PR7 lands the values the model expresses and records these in the preset's module with their sources; PR7a–PR7d add them.
-- **A. Scratch windows:** a separate table for scratch notes, scratch LN ends and scratch empty POOR (PR7a).
-- **F. Rank scaling:** `#DEFEXRANK n` scales by n × 75 / 100 %, and `#RANK 4` by 125 % (PR7a).
-- **B. Note assignment:** which note a press judges when several are in range, and whether earlier notes stay hittable until their late BAD deadline (PR7b).
-- **H. Miss timing:** a note is missed strictly after its late BAD edge, so a press on another lane at that time is judged first, which can change combo and gauge (PR7b, with the miss policy).
-- **C, D, E. Gauges:** HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))` (PR7c). N is the whole chart's count, practice included.
-- **G. A BAD long-note head:** it keeps holding and is scored at the release or the end (PR7d).
+**Rules, not the machine (decided).** Evaluation stays integer µs with fixed-point gauges and event-time processing. Each preset's module lists, beside its gaps, the known differences this causes, each with an example (design.md "What a -style Preset Reproduces"):
+- `f32` gauge rounding: from 20 %, 600 increases of 0.1 % reach about 79.9993 % in `f32`, below an 80 % clear, and exactly 80 % here;
+- the latest change per key per poll, and a poll's key changes before its misses;
+- tapestry's own scratch conversion.
 
-**Policies are choices, not replacements (decided).** B and G are new policy values beside today's behavior, which stays available to any preset: custom keeps nearest assignment, overtaking and scoring a BAD head at the press. beatoraja's other assignment algorithms are further values, added when a preset needs one. Adding a value does not bump the evaluator version; changing what an existing value means does.
+**What beatoraja-style still needs.** beatoraja differs from today's model in eight places, each shown by an example in crates/rules/src/beatoraja_style.rs (paths under `src/bms/player/beatoraja/`). PR7 landed the values the model expresses; these remain:
+- **A. Scratch windows:** a separate table for scratch notes, scratch LN ends and scratch empty POOR, and the scan envelope beatoraja derives across both tables (`play/JudgeManager.java:189-196`: the lowest late edge to the highest early edge, the far end exclusive). The envelope replaces the fixed 499,999 µs ahead: once a scaled early BAD edge passes 500 ms, a judged note exactly 500 ms ahead becomes an empty POOR there (PR7a).
+- **F. Rank and judgment headers:** `#DEFEXRANK n` scales by n × 75 / 100 %, and `#RANK 4` by 125 %. jbms-parser reads `#RANK` and `#DEFEXRANK` as integer tokens and takes a `#DEFEXRANK` only at 1 or more, so after `#RANK 3`, a `#DEFEXRANK 120.5` or `120.0` is ignored and rank 3 stays. `#DEFEXRANK 1` scales by 0 % in its integer arithmetic: zero-width windows, and the chart stays playable (PR7e for the declarations, PR7a for the scaling).
+- **B. Note assignment:** combo priority, and earlier notes stay hittable until their own deadlines instead of being missed at the press (PR7b).
+- **H. Miss timing:** a note is missed strictly after its late BAD edge, at `edge + 1 µs`, so a press on another lane at `edge + 1 µs` is judged first, which can change combo and gauge. A press on the same lane at the edge stays BAD (PR7b).
+- **C, D, E. Gauges:** HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))`, and a `#TOTAL` not positive ignored so an earlier one stays (jbms-parser `BMSDecoder.java:702-713`) (PR7c, with PR7e for the declarations). N is the whole chart's count, practice included.
+- **G. A BAD long-note head:** it is taken, keeps holding, and is scored at the release or the end (PR7d).
+
+**What LR2-style needs beyond them.** Endless Dream shares B, G and H, and its single low-gauge step fits today's model. Its own, cited at that commit under `core/src/bms/player/beatoraja/`, each again with an example:
+- **I. Window interpolation:** below 100 % PERFECT, GREAT and GOOD come from the LR2 table, interpolated; at 100 % and above they scale linearly; BAD and empty POOR are not scaled; `#RANK` 0-4 is 25, 50, 75, 100, 75 %, and `#DEFEXRANK n` is n × 75 / 100 % (`play/JudgeProperty.java:168`, `:185-265`, `play/BMSPlayerRule.java:61-65`) (PR8).
+- **J. Multi-BAD:** the other unjudged notes in BAD but not GOOD range are judged BAD too, before the primary, filtered by its timing, judgment and LN type, leading LN heads trimmed (`play/JudgeManager.java:993-1061`) (PR8).
+- **K. LN-head eligibility:** a late BAD on an LN head cannot be selected, so the head stays to its own miss (`play/JudgeManager.java:435-437`) (PR8).
+- **L. Empty POOR:** 200-1000 ms early for an unjudged note, 0-1000 ms early for a judged one, no late side (`play/JudgeManager.java:414`) (PR8).
+- **M. Gauges:** HARD-family damage × max(fix1, fix2); a survival gauge strictly below 2 % after a change, mines included, drops to 0 and fails; `#TOTAL` when absent as `160 + (N + clamp(N − 400, 0, 200)) × 0.16` (`play/GrooveGauge.java:218-225`, `:279-309`; `play/BMSPlayerRule.java:88-89`) (PR7c).
+
+**Policies are choices, not replacements (decided).** Each is a new variant beside today's behavior, which stays available: custom keeps nearest assignment, misses at the press for overtaken notes, a miss at the edge and a BAD head scored at the press, and reads judgment headers as loader version 6 does, so its results do not change. Only the selection variants a supported preset uses are added (combo priority); beatoraja's other algorithms wait for a preset that uses one.
 
 **Versions.**
-- A new field bumps the canonical encoding version (crates/rules/src/canonical.rs:23) and the file shape. Older files are refused with the existing hint.
-- The evaluator version (crates/rules/src/preset.rs:99) bumps only when an existing preset's meaning changes.
+- A new field or variant bumps the canonical encoding version (`FORMAT_VERSION` in crates/rules/src/canonical.rs) and the file shape. Older files are refused with the existing hint.
+- The evaluator version (`Implementation::STANDARD_VERSION`) bumps only when an existing variant's meaning changes.
+- The judgment-header model bumps `LOADER_VERSION`; records of loader version 6 are refused, also under an override (design.md "Determinism"), and cannot gain the declarations they did not keep.
 
 **Long notes.**
 - **beatoraja-style** uses `LnMode::Ln`: the worse of head and release.
-- **LR2-style** follows LR2oraja Endless Dream (decided).
+- **LR2-style** follows Endless Dream (decided).
   - A release within the GOOD width before the end keeps the head's judgment; an earlier release is BAD.
-  - The data is LN-end edges for PERFECT, GREAT and GOOD all set to that width. Validation becomes non-decreasing (crates/rules/src/validate.rs:98).
+  - The data is LN-end edges for PERFECT, GREAT and GOOD all set to that width, not a separate release policy. Validation becomes non-decreasing (crates/rules/src/validate.rs).
   - A head at or after the end keeps `CompletesAtPress`, and the missing source is recorded.
 - The display is unchanged.
 
-**Generators.** The props generators draw every variant the presets use.
+**Generators.** The props generators draw every supported policy combination, not a sample, and deliberate examples cover the joint interactions (selection × overtaken notes × empty POOR × multi-BAD × LN eligibility).
 
 ### D12. Re-evaluating saved records: what moves down, and the refusal order
 
@@ -670,61 +690,107 @@ Analysis runs at 1× and its result is reused at every speed.
 - If `player.toml` names a preset file that is missing and is not a standard preset, then loading shall be refused with an error naming the file, and nothing shall be written (`missing_non_standard_preset_is_refused`).
 - When `custom.toml` is missing and named, it shall be written with `rules::custom()` (`missing_custom_preset_is_written_as_custom`).
 
-### PR7a. Scratch windows and rank scaling (`rules`, `eval`)
+### PR7e. Judgment-header model (`bms-model`, `bms-parser`, `rules`, `eval`)
 
-**Touches.** `JudgeWindows` and its validation, deadline preparation, the canonical encoding and file shape, style_beatoraja.rs, the generators and the fuzz seeds.
+PR7e lands before PR7a; the letter names it, not its place.
+
+**Touches.**
+- `ChartMeta`: the judgment-header declarations replace the resolved rank and `#TOTAL`.
+- parse.rs, hash.rs, `LOADER_VERSION` and the loader rules in crates/bms-parser/src/lib.rs.
+- The header policy in `rules`: custom reads the declarations as loader version 6 does; beatoraja-style reads them as jbms-parser does (F, E). The canonical encoding and file shape.
+- `Evaluator::new` reads the rank and `#TOTAL` through the policy.
+- style_beatoraja.rs, the generators, and the bms-parser and fuzz seeds.
+- design.md "Chart Model" and "What the Loader Reads" (the "not built yet" notes go).
 
 **Depends on.** PR7.
 
 **Done when.**
-- When a scratch note, a scratch LN end or a scratch empty POOR is judged under beatoraja-style, the scratch table shall apply, and a key note at the same offset shall use the key table (`scratch_uses_its_own_windows`).
-- When `#DEFEXRANK` or `#RANK 4` is present, the windows shall scale as beatoraja does (`defexrank_and_rank_4_scale_like_the_source`).
-- When the presets are written and read through `rules-toml`, they shall round-trip; an older encoding shall be refused.
+- When a chart declares `#RANK 3` and then `#DEFEXRANK 120.5`, the loader shall keep both, in order, with their lexical classes, and beatoraja-style shall scale by rank 3 (`rejected_defexrank_keeps_the_earlier_rank`).
+- When `#DEFEXRANK 120` and `#DEFEXRANK 120.0` are loaded, their declarations shall differ in class and the resolved-chart hashes shall differ (`integer_and_decimal_tokens_stay_distinct`).
+- When `#TOTAL 200` is followed by `#TOTAL 0`, beatoraja-style shall use 200, and custom shall use its default `#TOTAL` as it does today (`zero_total_after_a_total`).
+- When declarations sit in `#IF` blocks, only those of the active branches shall be kept (`inactive_branch_declarations_are_dropped`).
+- When only whitespace, the header's case or line positions change, the resolved-chart hash shall stay equal (`header_canonical_form_ignores_text`).
+- If a declaration is not a number, then the loader shall warn and keep it as not a number, and the chart shall still load (`unreadable_header_is_kept_and_warned`).
+- If a record was made with loader version 6, then `verify` shall refuse it at the loader version, also with a preset override (`refuses_another_loader_version`, extended).
+- When the custom preset's existing examples run, they shall pass unchanged.
+- When `cargo test -p bms-parser` runs, the property `judgment_headers_keep_order_and_class` shall pass.
 
-### PR7b. Note assignment policy (`rules`, `eval`)
+### PR7a. Window preparation (`rules`, `eval`)
 
-**Touches.** the assignment step and miss deadlines in `eval`, the preset's policy fields, the canonical encoding, style_beatoraja.rs, the generators and the props.
+**Touches.** The lane-class tables (keys and scratch) and their validation; the window policy with beatoraja's scaling; scan envelopes; the deadline plan and the final deadline; the canonical encoding and file shape; style_beatoraja.rs, the generators and the fuzz seeds; design.md "Evaluation Stages".
 
-**Depends on.** PR7a.
+**Depends on.** PR7e.
 
 **Done when.**
-- When several notes on a lane are in range under beatoraja-style, the press shall judge the note beatoraja's combo-priority algorithm picks, and earlier notes shall stay hittable until their late BAD deadline (`combo_priority_assignment_matches_the_source`).
-- When a note's late BAD edge and another lane's press fall at the same time under beatoraja-style, the press shall be judged first (`miss_is_decided_after_the_edge`).
-- When the custom preset runs, assignment shall stay nearest-first with overtaking, and every existing example shall pass unchanged.
-- When the props run, incremental and batch evaluation shall agree under every assignment value.
+- When a scratch note, a scratch LN end or a scratch empty POOR is judged under beatoraja-style, the scratch table shall apply, and a key note at the same offset shall use the key table (`scratch_uses_its_own_windows`).
+- When `#DEFEXRANK` or `#RANK 4` is present, the windows shall scale as beatoraja does (`defexrank_and_rank_4_scale_like_the_source`).
+- When a chart declares `#DEFEXRANK 1` under beatoraja-style, its windows shall be zero-width and the chart shall play: a press exactly on a note is PERFECT and one 1 µs off judges no note (`defexrank_1_gives_zero_width_windows`).
+- When scaled edges tie, preparation shall accept them; if a preset's own table does not ascend, then validation shall refuse it (`derived_edges_may_tie`).
+- When beatoraja-style's scaled early BAD edge passes 500 ms, a judged note exactly 500 ms ahead of a press shall make it an empty POOR, and below that scale it shall not (`scan_envelope_follows_the_scaled_tables`).
+- When the scratch table's late BAD edge sets the latest deadline, completion, the what-if's final deadline and the section probe's `final_deadline()` shall all be that time (`final_deadline_has_one_source`).
+- When the presets are written and read through `rules-toml`, they shall round-trip; an older encoding shall be refused.
+- When the custom preset's existing examples run, they shall pass unchanged.
 
-### PR7c. Gauge bands and TOTAL (`rules`, `eval`)
+### PR7b. Press resolution (`rules`, `eval`)
 
-**Touches.** gauge preparation and arithmetic, the preset's gauge fields, the canonical encoding, style_beatoraja.rs and the generators.
+**Touches.** Press resolution in `eval` (candidate scan, primary selection, overtaken notes split from expiration, empty POOR inside the scan, emission order); the expiration policy in the deadline plan; the preset's policy fields; the canonical encoding; style_beatoraja.rs, the generators and the props; a `game` test of the recording window; design.md "Evaluation Stages".
 
-**Depends on.** PR7. It can be developed beside PR7a and PR7b; encoding versions are taken at merge.
+**Depends on.** PR7a. PR7b and PR7d share one transition contract (design.md "Evaluation Stages", press resolution and LN transitions) and may land as adjacent PRs.
+
+**Done when.**
+- When several notes on a lane are in range under beatoraja-style, the press shall judge the note beatoraja's combo-priority algorithm picks, and earlier notes shall stay hittable until their own deadlines (`combo_priority_assignment_matches_the_source`).
+- When, at `#RANK 3` under beatoraja-style, a tap at 1000 ms is left unhit and another lane's tap is hit at 1280.001 ms (`edge + 1 µs`), the press shall be judged before the miss; a press on the unhit note's lane at 1280.000 ms shall be BAD (`miss_is_decided_after_the_edge`).
+- When the watermark stops at a late edge and then at `edge + 1 µs`, the miss shall not be finalized at the edge, and live shall equal batch for every partition (`strict_miss_holds_across_watermark_partitions`).
+- When `edge + 1 µs` is the final deadline and falls in the next whole second, the recording window's capacity shall count that second (`strict_final_deadline_crosses_a_second`, `game`).
+- When a press judges no note under beatoraja-style, the empty POOR shall be decided within the candidate scan, with the source's ranges for judged and unjudged notes (`empty_poor_is_part_of_the_scan`).
+- When a press both overtakes notes and judges one, its events shall come in the order sound, overtaken POORs, primary (`press_emission_order_is_fixed`).
+- When the custom preset runs, assignment shall stay nearest-first, overtaken notes shall be missed at the press, and every existing example shall pass unchanged.
+- When the props run, incremental and batch evaluation shall agree under every supported combination, the `Judged` events shall stay within the note count, and the `eval` allocation test shall count 0.
+
+### PR7c. Gauges (`rules`, `eval`)
+
+**Touches.** Gauge preparation (coefficients, counts by purpose) and the accounting order; the preset's gauge fields; mine routing; the canonical encoding; style_beatoraja.rs, examples with Endless Dream's gauge values built in test code (style_lr2.rs, which PR8 extends), and the generators.
+
+**Depends on.** PR7e. It can be developed beside PR7a and PR7b; encoding versions are taken at merge.
 
 **Done when.**
 - When the HARD gauge is low, damage shall shrink by the source's bands (`hard_guts_bands_match_the_source`).
-- When `#TOTAL` is low or absent, the HARD and EX HARD increase and the default TOTAL shall follow the source's formulas, including a TOTAL below 160 (`total_scaling_matches_the_source`).
-- When a section is practiced, N shall be the whole chart's count.
+- When `#TOTAL` is low or absent, the HARD and EX HARD increase and the default TOTAL shall follow beatoraja's formulas, including a TOTAL below 160 (`total_scaling_matches_the_source`).
+- When `#TOTAL` is absent under Endless Dream's gauges, it shall be `160 + (N + clamp(N − 400, 0, 200)) × 0.16` (`lr2_default_total_matches_the_source`).
+- When a HARD-family gauge takes damage under Endless Dream's gauges, it shall be multiplied by max(fix1, fix2) (`lr2_damage_correction_matches_the_source`).
+- When a change leaves a survival gauge strictly below 2 % under Endless Dream's gauges, a mine's included, it shall drop to 0 and fail; exactly 2 % shall survive (`survival_below_two_percent_fails_including_mines`).
+- When a mine damages a gauge with a low-gauge reduction or a `#TOTAL` correction, neither shall apply to the mine, and the clamp and death shall (`mine_damage_skips_judgment_modifiers`).
+- When one effect needs the correction, the reduction, rounding and the clamp, they shall apply in the order of design.md "Evaluation Stages", the reduction chosen from the value before the change (`gauge_effect_order_is_fixed`).
+- When a section is practiced, N and any damage-correction count shall be the whole chart's.
 
-### PR7d. BAD long-note head policy (`rules`, `eval`)
+### PR7d. LN transitions (`rules`, `eval`)
 
-**Touches.** the long-note state machine in `eval`, the preset's policy field, the canonical encoding, style_beatoraja.rs, the props (`LnHeld < BAD` in props.rs) and the generators.
+**Touches.** The long-note state machine in `eval` and the eligibility it gives press resolution; the preset's policy field; the canonical encoding; style_beatoraja.rs, the props (`LnHeld < BAD` in props.rs) and the generators.
 
-**Depends on.** PR7b.
+**Depends on.** PR7b, whose transition contract it shares.
 
 **Done when.**
-- When a long-note head is BAD under beatoraja-style, the note shall stay held and be scored once at the release or the end (`bad_head_is_scored_at_release`).
+- When a long-note head is BAD under beatoraja-style, the head shall be taken, its miss deadline skipped, and the note scored once at the release or the end; with combo 10, a BAD head, then 5 taps on other lanes during the hold, max combo shall be 15 (`bad_head_is_scored_at_release`).
 - When the custom preset runs, a BAD head shall be scored at the press, as today.
 - When the props run, every judgeable note shall still be judged exactly once.
 
-### PR8. LR2-style preset
+### PR8. LR2-style preset (`rules`, `rules-toml`, `eval`)
 
-**Touches.** validate.rs:98, `rules`, `rules-toml`, style_lr2.rs, the generators, the standard-preset writing of D24 (adds `lr2-style.toml`), and design.md "LN Judgment Modes".
+PR8 assembles policies whose place the earlier PRs and design.md "Evaluation Stages" already fixed: it adds variants to existing stages, not stages. An Endless Dream behavior that needs a new stage boundary changes design.md first.
 
-**Depends on.** PR7a–PR7d. LR2-style chooses its own policy values; an LR2 axis not listed in D11 needs its own failing example.
+**Touches.** validate.rs; `rules`: `rules::lr2_style()`, the interpolated window variant (I), multi-BAD in press resolution (J), LN-head eligibility (K), the empty POOR ranges (L) and PR7c's gauge policies (M); `rules-toml`, style_lr2.rs, the generators, the standard-preset writing of D24 (adds `lr2-style.toml`), and design.md "LN Judgment Modes" and "Standard Presets".
+
+**Depends on.** PR7a-PR7e. LR2-style chooses its own policy values; an LR2 axis not listed in D11 needs its own failing example.
 
 **Done when.**
 - When a release falls within the GOOD width before the end, the head's judgment shall stay; if the release is earlier, then the long note shall be BAD (`release_within_good_width_keeps_head`, `earlier_release_is_bad`).
 - When LN-end edges tie, validation shall accept them; if they fall, then validation shall refuse them (`ln_end_edges_may_tie_but_not_fall`).
+- When the rank scale is below 100 %, PERFECT, GREAT and GOOD shall follow the interpolated table, and BAD and empty POOR shall stay unscaled (`windows_interpolate_like_the_source`).
+- When a press judges a note and other unjudged notes are in BAD but not GOOD range, those shall be BAD before the primary, with leading LN heads trimmed (`multi_bad_matches_the_source`).
+- When a late BAD press reaches an LN head, the head shall not be selected and shall be missed at its own deadline (`late_bad_ln_head_is_not_selectable`).
 - When `style_lr2` runs, every example shall pass.
+- When a beatoraja-style record is re-evaluated under LR2-style, it shall run to LR2-style's own final deadline (`what_if_under_lr2_style_completes`).
+- When the props run with multi-BAD, the `Judged` events shall stay within the note count and the `eval` allocation test shall count 0.
 - When `lr2-style.toml` is named and missing, it shall be written with `rules::lr2_style()`.
 
 ### PR9. The input thread wakes on input; no idle timer (#87)
@@ -918,9 +984,11 @@ Each one holds the behavior D5 and D6 state.
 
 ### PR23. Section rounds (`game`, `replay`)
 
-**Touches.** The plan and rounds, the ring-out and fade, the section probe, the practice record fields, design.md "Mid-Chart Start and Section Repeat", "Practice Records" and "Recording Capacity".
+**Touches.** The plan and rounds, the ring-out and fade, the section probe, the practice record fields (initial gauges by gauge ID), the transfer of initial gauges in `replay::verify`'s what-if, design.md "Mid-Chart Start and Section Repeat", "Practice Records" and "Recording Capacity".
 
 **Depends on.** PR2, PR14, PR20, PR22.
+
+**Why the gauge transfer is here.** Initial gauges enter records only with this PR's practice record fields; a full play starts every gauge at its preset's start, so PR17's what-if of a full play has nothing to transfer. The transfer belongs with the record fields it reads and the `verify` path that builds the target preset's `Section`.
 
 **Done when.**
 - When D15's example runs (`section_round_rings_out_and_repeats`):
@@ -936,6 +1004,7 @@ Each one holds the behavior D5 and D6 state.
 - When a play starts after a completed ring-out and after one cut mid-fade, its output shall be at full gain from its first frame (`play_resets_the_ring_out_envelope`, `audio`).
 - When the ring-out is rendered, the audio callback shall allocate nothing (`ring_out_allocates_nothing`, `audio`).
 - `section_round_records_its_conditions`.
+- When a practice record made under custom with `normal` at 50 % and `survival` at 70 % is re-evaluated under beatoraja-style, `normal` shall start at 50 %, every other gauge at beatoraja-style's start value, and the result shall mark those as started at the default (`what_if_transfers_initial_gauges_by_id`).
 - When the windows are computed, they shall be 21.180, 16.795384, 11.680 and 8.513333 s (`practice_window_is_sized_by_the_section`).
 - When the long-note section is planned, its deadline shall be 19.900 s, its window 11.900 s and its capacity 12 s (`practice_window_includes_ln_end_deadlines`).
 - `excerpt_matches_mid_chart_start_end_to_end`.
@@ -970,9 +1039,9 @@ Each one holds the behavior D5 and D6 state.
 **Start in parallel:** PR1, PR2, PR3, PR4, PR9, PR11, PR12, PR14, PR21 and PR22.
 
 **Then:**
-- PR1 → PR7 → PR7a → PR7b → PR7d → PR8 → PR16
-- PR7 → PR7c → PR8
-- PR7a–PR7d → PR18 (bests key on the preset bytes, so the standard presets settle first)
+- PR1 → PR7 → PR7e → PR7a → PR7b → PR7d → PR8 → PR16
+- PR7e → PR7c → PR8
+- PR7a–PR7e → PR18 (bests key on the preset bytes and the interpretation tuple, so the standard presets and the loader version settle first)
 - PR4 → PR5
 - PR1 + PR5 → PR6
 - PR12 → PR13
@@ -986,7 +1055,7 @@ Each one holds the behavior D5 and D6 state.
 - PR19 + PR21 + PR23 → PR24
 - PR15 + PR18 → PR25
 
-**Format numbering.** Library schema numbers follow the order PR12 < PR13 < PR18 < PR25. Replay format bumps (PR9, PR20, PR23) take the next number at merge.
+**Format numbering.** Library schema numbers follow the order PR12 < PR13 < PR18 < PR25. Replay format bumps (PR9, PR20, PR23), canonical encoding bumps (PR7e, PR7a–PR7d, PR8) and the loader version bump (PR7e) take the next number at merge.
 
 ## 4. Verifying the stage exit
 
@@ -1021,7 +1090,9 @@ Each one holds the behavior D5 and D6 state.
 
 **New or extended:**
 - `section_excerpt_matches_mid_chart_start`, plus section coverage in the existing properties (PR2);
-- the standard-preset generators, reaching every policy value (PR7, PR7a–PR7d, PR8);
+- the standard-preset generators, drawing every supported policy combination (PR7, PR7a–PR7e, PR8);
+- `live_matches_batch_for_every_delivery` with watermarks stopping at a late edge and at `edge + 1 µs` (PR7b);
+- `judgment_headers_keep_order_and_class` (PR7e);
 - `canonical_bytes_round_trip` (PR4);
 - round trips of the new record fields (PR9, PR20, PR23);
 - `any_command_sequence_ends_cleanly` (PR14);
@@ -1046,7 +1117,7 @@ Each one holds the behavior D5 and D6 state.
 ## 5. Risks that change the plan
 
 - **glyphon falls behind a wgpu update the workspace needs.** The text module moves to cosmic-text glyphs in our own atlas.
-- **A style rule does not split into axes.** That preset gets its own evaluation implementation.
+- **A style rule does not fit a stage's policy.** That preset gets its own evaluation implementation (design.md "Policies, Combinations and Versions").
 - **Input wakes worsen the play figures.** The in-play cadence goes back to timer-only.
 - **The two-stage conversion is audible, or a reload at a new speed is slow.** Use the single exact stage where the preflight admits it, or add a converted-PCM disk cache.
 - **SQLite stalls selection.** Queries move to a reader thread.
