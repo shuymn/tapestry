@@ -1,54 +1,68 @@
-//! The background scan (design.md "Loading and Song Selection"): a walker
-//! lists the chart files, [`PARSERS`] parser threads read the ones whose size
-//! or modification time changed, and a writer commits their rows in batches
-//! of [`BATCH`] and removes the rows of files that are gone.
+//! The background scan (design.md "Loading and Song Selection").
 //!
-//! **Pausing.** [`Scan::request_pause`] stops every thread from starting a
-//! read; the parsers finish the file in hand, the writer commits everything
-//! they handed it, and then [`Scan::wait_paused`] reports the pause. Nothing
-//! is read or committed until [`Scan::release`].
+//! The writer thread coordinates. It hands the walker one folder at a time
+//! to list, takes the listing, hands each changed chart file to one of
+//! [`PARSERS`] parser threads, and commits their rows in batches of
+//! [`BATCH`]. Once every folder is listed it removes the rows of files that
+//! are gone. The walker and the parsers only do what the writer hands them,
+//! so the writer always knows what is outstanding.
 //!
-//! **Endings.** A scan ends when the walk is done and every changed file is
-//! committed, when its writer fails (the others stop at their next send), or
-//! when the [`Scan`] is dropped (each thread stops at its next step and the
-//! writer commits what it holds). Every queue is bounded, and every thread is
-//! joined before [`Scan::finish`] or the drop returns.
+//! **Pausing.** [`Scan::request_pause`] stops the writer from handing out
+//! work. Once no listing or file is outstanding and the batch is committed,
+//! the writer acknowledges, which [`Scan::wait_paused`] reports. Nothing is
+//! handed out, so nothing is read or committed, until [`Scan::release`].
+//!
+//! **Endings.** A scan ends when every folder is listed and every changed
+//! file committed, when its writer fails, or when the [`Scan`] is dropped.
+//! In each case the writer stops handing out work, waits until the walker
+//! and every parser have ended, and only then reports the scan finished.
+//! Every queue is bounded, and every thread is joined before
+//! [`Scan::finish`] or the drop returns.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use bms_parser::{Limits, read_header};
+use bms_parser::{Header, Limits, read_header};
 use md5::Md5;
 use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
 
+use crate::ScanLease;
 use crate::db::{self, Prepared, Row};
 
 /// Parser threads.
 pub const PARSERS: usize = 2;
 /// Rows and removals per commit.
 pub const BATCH: usize = 256;
-/// Files listed ahead of the parsers.
-const JOB_QUEUE: usize = 64;
-/// Messages queued for the writer.
-const RESULT_QUEUE: usize = BATCH;
+/// Bytes kept of each header value; a longer value is cut at a character
+/// boundary at or below it (design.md "Loading and Song Selection").
+pub const HEADER_FIELD_BYTES: usize = 1024;
+/// Files handed to the parsers and not yet answered, at most: one for each,
+/// in its hand or queued for it.
+const OUTSTANDING: usize = PARSERS;
+/// Changed files waiting to be handed out before the walker lists another
+/// folder.
+const PENDING: usize = BATCH;
+/// The writer's queue: every outstanding answer, the walker's listing, each
+/// thread's end and a wake.
+const INBOX: usize = OUTSTANDING + PARSERS + 3;
 
 /// A scan thread, as [`ScanOptions::on_thread_start`] is told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Worker {
-    /// The thread listing the chart files.
+    /// The thread listing folders.
     Walker,
     /// A thread reading chart files, by index below [`PARSERS`].
     Parser(usize),
-    /// The thread owning the writer connection.
+    /// The thread owning the writer connection and coordinating the others.
     Writer,
 }
 
@@ -62,13 +76,16 @@ pub struct ScanOptions {
     /// mode. This crate holds no platform code, so the caller sets the
     /// priority.
     pub on_thread_start: Option<ThreadStart>,
+    /// Seams for the unit tests.
+    #[cfg(test)]
+    pub(crate) test: tests::Hooks,
 }
 
 impl fmt::Debug for ScanOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScanOptions")
             .field("on_thread_start", &self.on_thread_start.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -82,11 +99,12 @@ pub struct ScanReport {
     pub unchanged: u64,
     /// Files read and handed to the writer.
     pub read: u64,
-    /// Files that could not be read: over the loader's size cap, refused by
-    /// the file system, or with a path that is not Unicode.
+    /// Chart files not read: over the loader's size cap, refused by the
+    /// file system, changed while being read, or with a path that is not
+    /// Unicode. Their rows stay as they were.
     pub skipped: u64,
     /// Rows removed: their file is gone, or their root is no longer one of
-    /// the roots. The rows under a folder that could not be listed stay.
+    /// the roots. Rows under a folder that did not list completely stay.
     pub removed: u64,
 }
 
@@ -101,32 +119,35 @@ pub enum ScanError {
     Panicked,
 }
 
-/// The hook a unit test holds a parser in.
-#[cfg(test)]
-pub type InHand = Arc<dyn Fn(&Path) + Send + Sync>;
-
-/// Seams for the unit tests; empty in every other build.
-#[derive(Clone, Default)]
-pub struct Hooks {
-    /// Called by a parser holding a file it has read, before handing it on.
-    #[cfg(test)]
-    pub in_hand: Option<InHand>,
-}
-
 /// A changed chart file for a parser.
 struct Job {
     root: i64,
     path: String,
 }
 
+/// What a folder held, as far as it could be listed.
+#[derive(Debug, Default)]
+struct Listing {
+    folders: Vec<PathBuf>,
+    /// Chart files with their size and modification time.
+    charts: Vec<(PathBuf, i64, i64)>,
+    /// Entries whose type or metadata could not be read: their rows, and
+    /// any row below them, stay.
+    unread: Vec<PathBuf>,
+    /// Chart files among [`unread`](Self::unread).
+    unread_charts: u64,
+    /// The folder listed to its end.
+    complete: bool,
+}
+
 /// A message for the writer.
 enum Msg {
+    /// The walker listed the folder it was handed.
+    Listed(Listing),
     /// A parser read a file.
-    Parsed(usize, Box<Row>),
+    Parsed(Box<Row>),
     /// A parser could not read a file.
-    Skipped(usize),
-    /// Rows whose files are gone.
-    Gone(Vec<String>),
+    Skipped,
     /// A walker or parser thread ended.
     Done,
     /// Look at the state again.
@@ -137,16 +158,12 @@ enum Msg {
 struct State {
     /// A pause is requested and not released.
     pause: bool,
-    /// The writer acknowledged the pause.
+    /// The writer acknowledged the pause: nothing is outstanding.
     acked: bool,
     /// The scan is being dropped.
     shutdown: bool,
-    /// The writer has ended.
+    /// Every thread but the writer has ended, and the writer is ending.
     finished: bool,
-    /// The walker is reading a folder.
-    walker_busy: bool,
-    /// Each parser holds a file whose result the writer has not received.
-    holding: [bool; PARSERS],
     report: ScanReport,
     error: Option<ScanError>,
 }
@@ -168,59 +185,18 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Waits while a pause holds, then marks `worker` as reading. `false`
-    /// when the scan is being dropped.
-    fn enter(&self, worker: Worker) -> bool {
-        let mut state = self.lock();
-        while state.pause && !state.shutdown {
-            state = self.wait(state);
-        }
-        if state.shutdown {
-            return false;
-        }
-        match worker {
-            Worker::Walker => state.walker_busy = true,
-            Worker::Parser(i) => {
-                if let Some(held) = state.holding.get_mut(i) {
-                    *held = true;
-                }
-            }
-            Worker::Writer => {}
-        }
-        true
-    }
-
-    fn leave_walker(&self) {
-        self.lock().walker_busy = false;
-        self.changed.notify_all();
-    }
-
     fn update(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.lock());
         self.changed.notify_all();
     }
 }
 
-/// Marks a walker or parser as idle and tells the writer it ended, however
-/// its thread ends.
-struct ExitGuard {
-    shared: Arc<Shared>,
-    worker: Worker,
-    results: SyncSender<Msg>,
-}
+/// Tells the writer a walker or parser thread ended, however it ends.
+struct ExitGuard(SyncSender<Msg>);
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
-        self.shared.update(|state| match self.worker {
-            Worker::Walker => state.walker_busy = false,
-            Worker::Parser(i) => {
-                if let Some(held) = state.holding.get_mut(i) {
-                    *held = false;
-                }
-            }
-            Worker::Writer => {}
-        });
-        let _ = self.results.send(Msg::Done);
+        let _ = self.0.send(Msg::Done);
     }
 }
 
@@ -239,12 +215,13 @@ impl fmt::Debug for Scan {
     }
 }
 
-/// Starts the threads of a scan of `roots` writing through `conn`.
+/// Starts the threads of a scan of `roots` writing through `conn`. `lease`
+/// is released when the writer thread ends, or with this call if it fails.
 pub fn start(
     conn: Connection,
     roots: Vec<PathBuf>,
     options: ScanOptions,
-    hooks: Hooks,
+    lease: ScanLease,
 ) -> io::Result<Scan> {
     let shared = Arc::new(Shared::default());
     // Declared before the channel ends, so a failed spawn drops them first
@@ -254,11 +231,11 @@ pub fn start(
         wake: None,
         threads: Vec::new(),
     };
-    let (results, results_rx) = mpsc::sync_channel(RESULT_QUEUE);
-    let (setup, setup_rx) = mpsc::sync_channel(1);
-    let (jobs, jobs_rx) = mpsc::sync_channel(JOB_QUEUE);
+    let (inbox, inbox_rx) = mpsc::sync_channel(INBOX);
+    let (folders, folders_rx) = mpsc::sync_channel::<PathBuf>(1);
+    let (jobs, jobs_rx) = mpsc::sync_channel::<Job>(OUTSTANDING);
     let jobs_rx = Arc::new(Mutex::new(jobs_rx));
-    scan.wake = Some(results.clone());
+    scan.wake = Some(inbox.clone());
     let spawn = |name: String, worker: Worker, body: Box<dyn FnOnce() + Send>| {
         let hook = options.on_thread_start.clone();
         thread::Builder::new().name(name).spawn(move || {
@@ -271,20 +248,28 @@ pub fn start(
 
     let writer = {
         let shared = Arc::clone(&shared);
-        Box::new(move || write(&shared, conn, &roots, setup, &results_rx))
+        let options = options.clone();
+        Box::new(move || {
+            write(
+                &shared,
+                Writer::new(&shared, conn, inbox_rx, folders, jobs, options),
+                &roots,
+                lease,
+            );
+        })
     };
     scan.threads
         .push(spawn("library-writer".to_owned(), Worker::Writer, writer)?);
 
     let walker = {
-        let guard = ExitGuard {
-            shared: Arc::clone(&shared),
-            worker: Worker::Walker,
-            results: results.clone(),
-        };
+        let guard = ExitGuard(inbox.clone());
+        let options = options.clone();
         Box::new(move || {
-            if let Ok(prepared) = setup_rx.recv() {
-                walk(&guard, prepared, &jobs);
+            while let Ok(folder) = folders_rx.recv() {
+                let listing = list(&folder, &options);
+                if guard.0.send(Msg::Listed(listing)).is_err() {
+                    return;
+                }
             }
         })
     };
@@ -292,14 +277,10 @@ pub fn start(
         .push(spawn("library-walker".to_owned(), Worker::Walker, walker)?);
 
     for i in 0..PARSERS {
-        let guard = ExitGuard {
-            shared: Arc::clone(&shared),
-            worker: Worker::Parser(i),
-            results: results.clone(),
-        };
+        let guard = ExitGuard(inbox.clone());
         let jobs = Arc::clone(&jobs_rx);
-        let hooks = hooks.clone();
-        let parser = Box::new(move || parse(&guard, i, &jobs, &hooks));
+        let options = options.clone();
+        let parser = Box::new(move || parse(&guard, &jobs, &options));
         scan.threads.push(spawn(
             format!("library-parser-{i}"),
             Worker::Parser(i),
@@ -310,16 +291,18 @@ pub fn start(
 }
 
 impl Scan {
-    /// Asks the scan to pause: no thread starts another read, the parsers
-    /// finish the file in hand and the writer commits it. Returns at once;
-    /// [`wait_paused`](Self::wait_paused) waits for the acknowledgment.
+    /// Asks the scan to pause: the writer hands out no more work, the
+    /// parsers finish the files in hand, and the writer commits them.
+    /// Returns at once; [`wait_paused`](Self::wait_paused) waits for the
+    /// acknowledgment.
     pub fn request_pause(&self) {
         self.shared.update(|state| state.pause = true);
         self.wake();
     }
 
     /// Waits up to `timeout` for the pause to be acknowledged. `true` once
-    /// the scan holds still: paused, or ended.
+    /// no scan thread is working: paused with nothing outstanding, or
+    /// finished.
     #[must_use]
     pub fn wait_paused(&self, timeout: Duration) -> bool {
         self.wait_for(timeout, |state| {
@@ -333,9 +316,11 @@ impl Scan {
             state.pause = false;
             state.acked = false;
         });
+        self.wake();
     }
 
-    /// Waits up to `timeout` for the scan to end. `true` once it has.
+    /// Waits up to `timeout` for the scan to end. `true` once the walker
+    /// and every parser have ended.
     #[must_use]
     pub fn wait_finished(&self, timeout: Duration) -> bool {
         self.wait_for(timeout, |state| state.finished)
@@ -385,8 +370,7 @@ impl Scan {
         }
     }
 
-    /// Wakes the writer if it waits for a message. A full queue means it
-    /// has messages to take, after which it looks at the state anyway.
+    /// Wakes the writer if it waits for a message.
     fn wake(&self) {
         if let Some(wake) = &self.wake {
             // Full: the writer has messages to take. Disconnected: it ended.
@@ -430,235 +414,344 @@ fn mtime_ns(time: SystemTime) -> i64 {
     }
 }
 
-/// An entry of a listed folder.
-enum Entry {
-    Folder(PathBuf),
-    Chart(PathBuf, i64, i64),
+/// Size and modification time, as stored.
+fn stamp(meta: &Metadata) -> (i64, i64) {
+    (
+        i64::try_from(meta.len()).unwrap_or(i64::MAX),
+        meta.modified().map_or(0, mtime_ns),
+    )
 }
 
 /// Lists a folder: its subfolders, not following links, and its chart files
-/// with their size and modification time. An entry that cannot be read is
-/// left out, so it counts as gone only once its folder lists without it.
-fn list(dir: &Path) -> io::Result<Vec<Entry>> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let Ok(entry) = entry else { continue };
-        let Ok(kind) = entry.file_type() else {
-            continue;
+/// with their size and modification time. An entry whose type or metadata
+/// cannot be read is kept in [`Listing::unread`]; a failure partway leaves
+/// the listing incomplete.
+fn list(dir: &Path, options: &ScanOptions) -> Listing {
+    let mut listing = Listing::default();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return listing;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return listing;
         };
         let path = entry.path();
-        if kind.is_dir() {
-            entries.push(Entry::Folder(path));
-        } else if is_chart(&path)
-            && let Ok(meta) = fs::metadata(&path)
-            && meta.is_file()
-        {
-            let size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
-            let mtime = meta.modified().map_or(0, mtime_ns);
-            entries.push(Entry::Chart(path, size, mtime));
+        #[cfg(test)]
+        let fault = options.test.fault(&path);
+        #[cfg(not(test))]
+        let fault = {
+            let _ = options;
+            None
+        };
+        if fault == Some(Fault::Listing) {
+            return listing;
         }
-    }
-    Ok(entries)
-}
-
-/// The walker: lists every root, hands the changed files to the parsers, and
-/// then the writer the rows whose files are gone.
-fn walk(guard: &ExitGuard, prepared: Prepared, jobs: &SyncSender<Job>) {
-    let shared = &guard.shared;
-    let Prepared {
-        roots, mut known, ..
-    } = prepared;
-    let mut seen = HashSet::new();
-    let mut unlisted = Vec::new();
-    for (root, root_path) in roots {
-        let mut folders = vec![root_path];
-        while let Some(folder) = folders.pop() {
-            if !shared.enter(Worker::Walker) {
-                return;
-            }
-            let listing = list(&folder);
-            shared.leave_walker();
-            let Ok(entries) = listing else {
-                unlisted.push(folder);
-                continue;
-            };
-            for entry in entries {
-                let (path, size, mtime) = match entry {
-                    Entry::Folder(path) => {
-                        folders.push(path);
-                        continue;
-                    }
-                    Entry::Chart(path, size, mtime) => (path, size, mtime),
-                };
-                let Some(path) = path.to_str().map(str::to_owned) else {
-                    shared.update(|state| state.report.skipped += 1);
-                    continue;
-                };
-                if !seen.insert(path.clone()) {
-                    continue;
+        let kind = match fault {
+            Some(Fault::Metadata) => None,
+            _ => entry.file_type().ok(),
+        };
+        match kind {
+            Some(kind) if kind.is_dir() => listing.folders.push(path),
+            Some(_) if !is_chart(&path) => {}
+            Some(_) => match fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => {
+                    let (size, mtime) = stamp(&meta);
+                    listing.charts.push((path, size, mtime));
                 }
-                let unchanged = known.remove(&path) == Some((size, mtime));
-                shared.update(|state| {
-                    state.report.found += 1;
-                    if unchanged {
-                        state.report.unchanged += 1;
-                    }
-                });
-                if !unchanged && jobs.send(Job { root, path }).is_err() {
-                    return;
+                Ok(_) => {}
+                Err(_) => {
+                    listing.unread_charts += 1;
+                    listing.unread.push(path);
                 }
+            },
+            None => {
+                listing.unread_charts += u64::from(is_chart(&path));
+                listing.unread.push(path);
             }
         }
     }
-    let mut gone: Vec<String> = known
-        .into_keys()
-        .filter(|path| !unlisted.iter().any(|dir| Path::new(path).starts_with(dir)))
-        .collect();
-    while !gone.is_empty() {
-        let chunk = gone.split_off(gone.len().saturating_sub(BATCH));
-        if guard.results.send(Msg::Gone(chunk)).is_err() {
-            return;
-        }
+    listing.complete = true;
+    listing
+}
+
+/// A failure the unit tests inject into a listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "injected by the unit tests only")
+)]
+pub enum Fault {
+    /// Listing stops with an error at this entry.
+    Listing,
+    /// This entry's type and metadata cannot be read.
+    Metadata,
+}
+
+/// Cuts a header value to [`HEADER_FIELD_BYTES`] at a character boundary.
+fn cap(value: &mut Option<String>) {
+    if let Some(text) = value {
+        let end = text.floor_char_boundary(HEADER_FIELD_BYTES);
+        text.truncate(end);
     }
 }
 
-/// Reads a chart file: its size and time as it is opened, then at most the
-/// loader's cap and one byte more.
-fn read_chart(root: i64, path: String, limits: &Limits) -> Option<Row> {
-    let file = File::open(&path).ok()?;
-    let meta = file.metadata().ok()?;
-    let cap = u64::try_from(limits.max_file_bytes).unwrap_or(u64::MAX);
+/// Reads a chart file: its size and time as it is opened, at most the
+/// loader's cap and one byte more, then its size and time again. `None`
+/// when it cannot be read, is over the cap, or changed while being read.
+fn read_chart(job: Job, limits: &Limits, options: &ScanOptions) -> Option<Row> {
+    let mut file = File::open(&job.path).ok()?;
+    let before = stamp(&file.metadata().ok()?);
+    let cap_bytes = u64::try_from(limits.max_file_bytes).unwrap_or(u64::MAX);
     let mut bytes = Vec::new();
-    file.take(cap.saturating_add(1))
+    (&mut file)
+        .take(cap_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;
-    let header = read_header(&bytes, limits).ok()?;
+    #[cfg(test)]
+    options.test.after_read(Path::new(&job.path));
+    #[cfg(not(test))]
+    let _ = options;
+    if stamp(&file.metadata().ok()?) != before {
+        return None;
+    }
+    let mut header = read_header(&bytes, limits).ok()?;
+    let Header {
+        title,
+        subtitle,
+        artist,
+        subartist,
+        genre,
+        playlevel,
+        difficulty,
+        bpm,
+    } = &mut header;
+    for field in [
+        title, subtitle, artist, subartist, genre, playlevel, difficulty, bpm,
+    ] {
+        cap(field);
+    }
     Some(Row {
-        root,
-        path,
-        size: i64::try_from(meta.len()).unwrap_or(i64::MAX),
-        mtime_ns: meta.modified().map_or(0, mtime_ns),
+        root: job.root,
+        path: job.path,
+        size: before.0,
+        mtime_ns: before.1,
         sha256: Sha256::digest(&bytes).into(),
         md5: Md5::digest(&bytes).into(),
         header,
     })
 }
 
-/// A parser: reads each changed file it is handed.
-fn parse(guard: &ExitGuard, index: usize, jobs: &Mutex<Receiver<Job>>, hooks: &Hooks) {
+/// A parser: reads each file the writer hands it.
+fn parse(guard: &ExitGuard, jobs: &Mutex<Receiver<Job>>, options: &ScanOptions) {
     let limits = Limits::default();
     loop {
         let job = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
         let Ok(job) = job else { return };
-        if !guard.shared.enter(Worker::Parser(index)) {
-            return;
-        }
-        let row = read_chart(job.root, job.path, &limits);
         #[cfg(test)]
-        if let (Some(in_hand), Some(row)) = (&hooks.in_hand, &row) {
-            in_hand(Path::new(&row.path));
-        }
-        #[cfg(not(test))]
-        let _ = hooks;
-        let msg = row.map_or(Msg::Skipped(index), |row| Msg::Parsed(index, Box::new(row)));
-        if guard.results.send(msg).is_err() {
+        options.test.in_hand(Path::new(&job.path));
+        let msg = read_chart(job, &limits, options)
+            .map_or(Msg::Skipped, |row| Msg::Parsed(Box::new(row)));
+        if guard.0.send(msg).is_err() {
             return;
         }
     }
 }
 
-/// What the writer holds for its next commit.
-#[derive(Default)]
-struct Batch {
-    upserts: Vec<Row>,
-    removals: Vec<String>,
-}
-
-impl Batch {
-    fn len(&self) -> usize {
-        self.upserts.len() + self.removals.len()
-    }
-}
-
-/// The writer's side of the scan.
+/// The writer: the walk's state, what is outstanding, and the batch.
 struct Writer<'a> {
     shared: &'a Shared,
     conn: Connection,
-    rx: &'a Receiver<Msg>,
-    batch: Batch,
+    rx: Receiver<Msg>,
+    /// Closed when the writer stops handing out work.
+    folders_tx: Option<SyncSender<PathBuf>>,
+    jobs_tx: Option<SyncSender<Job>>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "test seams only"))]
+    options: ScanOptions,
+    /// Folders still to list, with their root.
+    folders: Vec<(i64, PathBuf)>,
+    /// The folder the walker is listing, with its root, if it is.
+    listing: Option<(i64, PathBuf)>,
+    /// Changed files not yet handed out.
+    pending: VecDeque<Job>,
+    /// Files handed out and not yet answered.
+    outstanding: usize,
+    /// What is indexed and not yet listed.
+    known: HashMap<String, (i64, i64)>,
+    seen: HashSet<String>,
+    /// Entries whose rows stay, with every row below them.
+    kept: Vec<PathBuf>,
+    walked: bool,
+    upserts: Vec<Row>,
+    removals: Vec<String>,
     /// Walker and parser threads that have ended.
     ended: usize,
 }
 
-impl Writer<'_> {
-    /// Takes one message; commits once the batch is full.
-    fn take(&mut self, msg: Msg) -> rusqlite::Result<()> {
-        match msg {
-            Msg::Parsed(i, row) => {
-                self.batch.upserts.push(*row);
-                self.received(i, |report| report.read += 1);
-            }
-            Msg::Skipped(i) => self.received(i, |report| report.skipped += 1),
-            Msg::Gone(paths) => self.batch.removals.extend(paths),
-            Msg::Done => self.ended += 1,
-            Msg::Wake => {}
+impl<'a> Writer<'a> {
+    fn new(
+        shared: &'a Shared,
+        conn: Connection,
+        rx: Receiver<Msg>,
+        folders: SyncSender<PathBuf>,
+        jobs: SyncSender<Job>,
+        options: ScanOptions,
+    ) -> Self {
+        Self {
+            shared,
+            conn,
+            rx,
+            folders_tx: Some(folders),
+            jobs_tx: Some(jobs),
+            options,
+            folders: Vec::new(),
+            listing: None,
+            pending: VecDeque::new(),
+            outstanding: 0,
+            known: HashMap::new(),
+            seen: HashSet::new(),
+            kept: Vec::new(),
+            walked: false,
+            upserts: Vec::new(),
+            removals: Vec::new(),
+            ended: 0,
         }
-        if self.batch.len() >= BATCH {
+    }
+
+    fn count(&self, f: impl FnOnce(&mut ScanReport)) {
+        self.shared.update(|state| f(&mut state.report));
+    }
+
+    /// Adds a row or a removal; commits once [`BATCH`] are held.
+    fn push(&mut self, item: Result<Row, String>) -> rusqlite::Result<()> {
+        match item {
+            Ok(row) => self.upserts.push(row),
+            Err(path) => self.removals.push(path),
+        }
+        if self.upserts.len() + self.removals.len() >= BATCH {
             self.commit()?;
         }
         Ok(())
     }
 
-    fn received(&self, parser: usize, count: impl FnOnce(&mut ScanReport)) {
-        self.shared.update(|state| {
-            if let Some(held) = state.holding.get_mut(parser) {
-                *held = false;
-            }
-            count(&mut state.report);
-        });
-    }
-
     fn commit(&mut self) -> rusqlite::Result<()> {
-        if self.batch.len() == 0 {
+        if self.upserts.is_empty() && self.removals.is_empty() {
             return Ok(());
         }
-        let batch = std::mem::take(&mut self.batch);
-        let removed = db::commit(&mut self.conn, &batch.upserts, &batch.removals)?;
-        self.shared.update(|state| state.report.removed += removed);
+        #[cfg(test)]
+        self.options
+            .test
+            .before_commit(self.upserts.len() + self.removals.len());
+        let removed = db::commit(&mut self.conn, &self.upserts, &self.removals)?;
+        self.upserts.clear();
+        self.removals.clear();
+        self.count(|report| report.removed += removed);
         Ok(())
     }
 
-    /// Takes every result of the files in hand, commits, acknowledges the
-    /// pause and waits for its release. `false` when the scan is being
-    /// dropped.
-    fn pause(&mut self) -> rusqlite::Result<bool> {
-        loop {
-            while let Ok(msg) = self.rx.try_recv() {
-                self.take(msg)?;
+    /// Takes one message.
+    fn take(&mut self, msg: Msg) -> rusqlite::Result<()> {
+        match msg {
+            Msg::Listed(listing) => self.listed(listing),
+            Msg::Parsed(row) => {
+                self.outstanding = self.outstanding.saturating_sub(1);
+                self.count(|report| report.read += 1);
+                self.push(Ok(*row))?;
             }
-            let mut state = self.shared.lock();
-            if state.shutdown {
-                return Ok(false);
+            Msg::Skipped => {
+                self.outstanding = self.outstanding.saturating_sub(1);
+                self.count(|report| report.skipped += 1);
             }
-            if state.holding.iter().any(|&held| held) {
-                // A parser holding a file sends its result next, or ends.
-                drop(state);
-                match self.rx.recv() {
-                    Ok(msg) => self.take(msg)?,
-                    Err(_) => return Ok(false),
-                }
-                continue;
-            }
-            if state.walker_busy {
-                // The walker only reads the file system; it sends nothing
-                // while it is busy.
-                while state.walker_busy && !state.shutdown {
-                    state = self.shared.wait(state);
-                }
-                continue;
-            }
-            break;
+            Msg::Done => self.ended += 1,
+            Msg::Wake => {}
         }
+        Ok(())
+    }
+
+    /// Takes the walker's listing of a folder of root `root`.
+    fn listed(&mut self, listing: Listing) {
+        let Some((root, folder)) = self.listing.take() else {
+            return;
+        };
+        let mut found = 0;
+        let mut unchanged = 0;
+        let mut skipped = listing.unread_charts;
+        for (path, size, mtime) in listing.charts {
+            let Some(path) = path.to_str().map(str::to_owned) else {
+                skipped += 1;
+                continue;
+            };
+            if !self.seen.insert(path.clone()) {
+                continue;
+            }
+            found += 1;
+            if self.known.remove(&path) == Some((size, mtime)) {
+                unchanged += 1;
+            } else {
+                self.pending.push_back(Job { root, path });
+            }
+        }
+        self.folders
+            .extend(listing.folders.into_iter().map(|folder| (root, folder)));
+        self.kept.extend(listing.unread);
+        if !listing.complete {
+            self.kept.push(folder);
+        }
+        self.count(|report| {
+            report.found += found;
+            report.unchanged += unchanged;
+            report.skipped += skipped;
+        });
+    }
+
+    /// Hands out work: a folder to the walker while few files wait, and
+    /// waiting files to the parsers up to [`OUTSTANDING`]. Once every
+    /// folder is listed, queues the removals of the files gone.
+    fn dispatch(&mut self) -> rusqlite::Result<()> {
+        while self.outstanding < OUTSTANDING
+            && let Some(job) = self.pending.pop_front()
+        {
+            let Some(jobs) = &self.jobs_tx else { break };
+            match jobs.try_send(job) {
+                Ok(()) => self.outstanding += 1,
+                Err(TrySendError::Full(job)) => {
+                    self.pending.push_front(job);
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+        if self.listing.is_none()
+            && self.pending.len() < PENDING
+            && let Some((root, folder)) = self.folders.pop()
+            && let Some(walker) = &self.folders_tx
+        {
+            match walker.try_send(folder.clone()) {
+                Ok(()) => self.listing = Some((root, folder)),
+                Err(_) => self.folders.push((root, folder)),
+            }
+        }
+        if !self.walked && self.listing.is_none() && self.folders.is_empty() {
+            self.walked = true;
+            let kept = std::mem::take(&mut self.kept);
+            let gone: Vec<String> = std::mem::take(&mut self.known)
+                .into_keys()
+                .filter(|path| !kept.iter().any(|dir| Path::new(path).starts_with(dir)))
+                .collect();
+            for path in gone {
+                self.push(Err(path))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Nothing is handed out and unanswered.
+    const fn idle(&self) -> bool {
+        self.outstanding == 0 && self.listing.is_none()
+    }
+
+    /// Commits, acknowledges the pause if it still holds, and waits for its
+    /// release. `false` when the scan is being dropped.
+    fn hold(&mut self) -> rusqlite::Result<bool> {
         self.commit()?;
         let mut state = self.shared.lock();
         if state.pause {
@@ -672,61 +765,69 @@ impl Writer<'_> {
         Ok(!state.shutdown)
     }
 
-    /// Takes messages until every walker and parser thread has ended.
-    fn run(&mut self) -> rusqlite::Result<()> {
-        while self.ended < PARSERS + 1 {
+    /// Runs the scan to its end, a drop, or a failure.
+    fn run(&mut self, roots: &[PathBuf]) -> rusqlite::Result<()> {
+        let Prepared {
+            roots,
+            known,
+            removed,
+        } = db::prepare(&mut self.conn, roots)?;
+        self.count(|report| report.removed += removed);
+        self.known = known;
+        // Popped from the end: the first root is listed first.
+        self.folders = roots.into_iter().rev().collect();
+        loop {
             let (pause, shutdown) = {
                 let state = self.shared.lock();
                 (state.pause, state.shutdown)
             };
             if shutdown {
-                break;
+                return self.commit();
             }
-            if pause {
-                if !self.pause()? {
-                    break;
+            if !pause {
+                self.dispatch()?;
+            } else if self.idle() {
+                if !self.hold()? {
+                    return self.commit();
                 }
                 continue;
             }
+            if self.walked && self.pending.is_empty() && self.idle() {
+                return self.commit();
+            }
             match self.rx.recv() {
                 Ok(msg) => self.take(msg)?,
+                Err(_) => return self.commit(),
+            }
+        }
+    }
+
+    /// Stops handing out work and waits until the walker and every parser
+    /// have ended, dropping what they still send.
+    fn close(&mut self) {
+        self.folders_tx = None;
+        self.jobs_tx = None;
+        while self.ended < PARSERS + 1 {
+            match self.rx.recv() {
+                Ok(Msg::Done) => self.ended += 1,
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
-        self.commit()
     }
 }
 
-/// The writer thread: prepares the roots, hands the walker what is indexed,
-/// and commits what the parsers read.
-fn write(
-    shared: &Shared,
-    mut conn: Connection,
-    roots: &[PathBuf],
-    setup: SyncSender<Prepared>,
-    rx: &Receiver<Msg>,
-) {
-    let result = (|| {
-        let mut prepared = db::prepare(&mut conn, roots)?;
-        let removed = std::mem::take(&mut prepared.removed);
-        shared.update(|state| state.report.removed += removed);
-        let _ = setup.send(prepared);
-        drop(setup);
-        Writer {
-            shared,
-            conn,
-            rx,
-            batch: Batch::default(),
-            ended: 0,
-        }
-        .run()
-    })();
-    shared.update(|state| {
-        state.finished = true;
-        if let Err(e) = result {
-            state.error = Some(ScanError::Database(e));
-        }
-    });
+/// The writer thread: runs the scan, then ends the others before the scan
+/// counts as finished.
+fn write(shared: &Shared, mut writer: Writer<'_>, roots: &[PathBuf], lease: ScanLease) {
+    let result = writer.run(roots);
+    if let Err(e) = result {
+        shared.update(|state| state.error = Some(ScanError::Database(e)));
+    }
+    writer.close();
+    drop(writer);
+    drop(lease);
+    shared.update(|state| state.finished = true);
 }
 
 #[cfg(test)]

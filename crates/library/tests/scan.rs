@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use library::{Library, Opened, SCHEMA_VERSION, ScanOptions, ScanReport};
+use library::{HEADER_FIELD_BYTES, Library, Opened, SCHEMA_VERSION, ScanOptions, ScanReport};
 use tempfile::TempDir;
 
 fn chart_text(title: &str) -> String {
@@ -202,6 +202,23 @@ fn removed_root_leaves_the_index_and_missing_root_stays() {
     let report = scan(&lib, std::slice::from_ref(&fx.root));
     assert_eq!((report.found, report.removed), (1, 1));
     assert_eq!(titles(&lib), vec![(in_root, "Root".to_owned())]);
+}
+
+#[test]
+fn long_header_values_are_cut_at_a_character_boundary() {
+    let fx = Fixture::new();
+    // 3 bytes per character, so the cap falls inside one.
+    let title = "あ".repeat(4 * HEADER_FIELD_BYTES);
+    let artist = "a".repeat(2 * HEADER_FIELD_BYTES);
+    let text = format!("#PLAYER 1\n#TITLE {title}\n#ARTIST {artist}\n#GENRE Short\n");
+    fx.write("long.bms", text.as_bytes());
+    let (lib, _) = fx.open();
+    assert_eq!(scan(&lib, std::slice::from_ref(&fx.root)).read, 1);
+    let header = lib.charts().unwrap().remove(0).header;
+    let kept = HEADER_FIELD_BYTES / 3;
+    assert_eq!(header.title, Some("あ".repeat(kept)));
+    assert_eq!(header.artist, Some("a".repeat(HEADER_FIELD_BYTES)));
+    assert_eq!(header.genre.as_deref(), Some("Short"));
 }
 
 #[test]
