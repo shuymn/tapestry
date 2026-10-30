@@ -31,7 +31,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
-use rules::{GaugeKind, GaugeValue, RulePreset};
+use rules::{GaugeKind, GaugeValue, MineRule, RulePreset};
 
 use live::{Delivery, Live, live};
 use strategy::{
@@ -491,6 +491,38 @@ fn reversed_ties(play: &Play) -> Vec<eval::JudgeEvent> {
     out
 }
 
+/// The choices a preset makes, one per choice enum.
+fn choices(p: &RulePreset) -> impl PartialEq + use<> {
+    let MineRule::WhileHeld { .. } = p.mine;
+    (
+        p.miss,
+        p.same_time_order,
+        p.assignment,
+        p.ln_mode,
+        p.total_mode,
+        p.denominator,
+    )
+}
+
+/// Whether the generated preset draws what each standard preset uses: every
+/// choice it makes, asymmetric windows, and survival gauges with and
+/// without reduced damage.
+fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
+    c.hit("choices_of_custom", choices(p) == choices(&rules::custom()));
+    c.hit(
+        "choices_of_beatoraja_style",
+        choices(p) == choices(&rules::beatoraja_style()),
+    );
+    c.hit("asymmetric_bad", p.windows.bad.early != p.windows.bad.late);
+    let survival = |low: bool| {
+        p.gauges
+            .iter()
+            .any(|g| g.kind == GaugeKind::Survival && g.low_damage.is_some() == low)
+    };
+    c.hit("survival_with_low_damage", survival(true));
+    c.hit("survival_without_low_damage", survival(false));
+}
+
 fn count_play(play: &Play, c: &mut Coverage) {
     let device = &play.input.device;
     let times: Vec<(TimeUs, SourceId)> = play
@@ -511,6 +543,7 @@ fn count_play(play: &Play, c: &mut Coverage) {
             .iter()
             .any(|(t, _)| play.deadlines.binary_search(t).is_ok()),
     );
+    count_preset_shapes(&play.preset, c);
     let whole = evaluate(&play.chart, &play.input, &play.preset).unwrap();
     c.hit("joint_tie_order_shows", reversed_ties(play) != whole.events);
     let has = |f: &dyn Fn(&JudgeEventKind) -> bool| whole.events.iter().any(|e| f(&e.kind));
@@ -777,6 +810,11 @@ fn generators_reach_the_fragile_spots() {
         ("ln_hold_ended", 1),
         ("empty_poor", 1),
         ("play_sound", 1),
+        ("choices_of_custom", SAMPLES),
+        ("choices_of_beatoraja_style", SAMPLES),
+        ("asymmetric_bad", 1),
+        ("survival_with_low_damage", 1),
+        ("survival_without_low_damage", 1),
         ("gauge_at_max", 1),
         ("gauge_at_positive_min", 1),
         ("survival_failed_then_rose", 1),
