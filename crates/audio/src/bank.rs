@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub use bms_model::Speed;
 use bms_model::{Chart, NoteKind, SoundId};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
@@ -60,60 +61,6 @@ use symphonia::core::meta::MetadataOptions;
 pub const MIN_RATE: u32 = 8_000;
 /// Highest sample rate accepted, for sources and the device.
 pub const MAX_RATE: u32 = 384_000;
-
-/// A practice speed on the ladder `k/20`, k = 10 to 30 (50 % to 150 %).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Speed(u8);
-
-impl Default for Speed {
-    fn default() -> Self {
-        Self::NORMAL
-    }
-}
-
-impl Speed {
-    /// 1×: no speed stage.
-    pub const NORMAL: Self = Self(20);
-    /// The slowest step, 50 %.
-    pub const SLOWEST: Self = Self(10);
-
-    /// The speed `k/20`, if k is on the ladder.
-    #[must_use]
-    pub fn from_twentieths(k: u32) -> Option<Self> {
-        u8::try_from(k)
-            .ok()
-            .filter(|k| (10..=30).contains(k))
-            .map(Self)
-    }
-
-    /// Every step from 50 % to 150 %.
-    pub fn ladder() -> impl Iterator<Item = Self> {
-        (10..=30).map(Self)
-    }
-
-    /// k of `k/20`.
-    #[must_use]
-    pub fn twentieths(self) -> u32 {
-        u32::from(self.0)
-    }
-
-    /// The speed stage's rates, input to output: `k/g : 20/g` with
-    /// `g = gcd(k, 20)` (1:2 at 50 %, 13:20 at 65 %, 29:20 at 145 %).
-    #[must_use]
-    pub fn stage_rates(self) -> (u32, u32) {
-        let k = u64::from(self.0);
-        let g = gcd(k, 20);
-        ((k / g) as u32, (20 / g) as u32)
-    }
-
-    /// Frames a sound of `frames` device frames holds at this speed:
-    /// `floor(frames × 20/k)`.
-    #[must_use]
-    pub fn frames(self, frames: u64) -> u64 {
-        let n = u128::from(frames) * 20 / u128::from(self.0);
-        u64::try_from(n).unwrap_or(u64::MAX)
-    }
-}
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
@@ -253,7 +200,7 @@ fn workspace_bound(from: u32, to: u32, ch: usize) -> u64 {
 pub struct Conversion {
     /// Source rate → device rate.
     pub device: Option<Stage>,
-    /// The speed stage at [`Speed::stage_rates`].
+    /// The speed stage at [`Speed::ratio`].
     pub speed: Option<Stage>,
 }
 
@@ -261,7 +208,7 @@ pub struct Conversion {
 /// device rate `rate` and `speed`. Nothing is allocated.
 #[must_use]
 pub fn plan_conversion(src_rate: u32, rate: u32, speed: Speed, channels: usize) -> Conversion {
-    let (from, to) = speed.stage_rates();
+    let (from, to) = speed.ratio();
     Conversion {
         device: (src_rate != rate).then(|| Stage::new(src_rate, rate, channels)),
         speed: (speed != Speed::NORMAL).then(|| Stage::new(from, to, channels)),
@@ -835,7 +782,7 @@ fn decode(
                 limit: shared.max_frames,
             }));
         }
-        let stored = shared.speed.frames(frames);
+        let stored = shared.speed.stretch(frames);
         declared
             .resize(pcm_bytes(n.max(frames).max(stored), ch))
             .map_err(|total| {
@@ -925,7 +872,7 @@ fn decode(
         samples.shrink_to_fit();
     }
     if let Some(stage) = plan.speed {
-        let frames = shared.speed.frames(out_frames);
+        let frames = shared.speed.stretch(out_frames);
         reservation
             .resize(cap_bytes(&samples) + pcm_bytes(frames, ch) + stage.workspace_bound())
             .map_err(over_bank)?;

@@ -47,10 +47,11 @@ fn hash(text: &str) -> [u8; 32] {
 }
 
 #[test]
-fn rejected_defexrank_keeps_the_earlier_rank() {
+fn rank_and_defexrank_are_kept_in_order() {
     // The loader keeps both, in order, with their classes; which one counts
-    // is the preset's (crates/eval/tests/style_beatoraja.rs has the same
-    // test for beatoraja-style's reading).
+    // is the preset's (crates/eval/tests/style_beatoraja.rs,
+    // `a_decimal_defexrank_counts_over_a_rank`, has beatoraja-style's
+    // reading).
     let loaded = load(&format!("#RANK 3\n#DEFEXRANK 120.5\n{NOTE}"));
     assert_eq!(
         loaded.chart.meta.judgment_headers,

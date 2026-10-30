@@ -99,6 +99,7 @@ fn two_sources() -> PlayRecord {
                 sha256: [0xa1; 32],
                 md5: [0xb2; 16],
                 resolved_hash: [0xc3; 32],
+                played_hash: [0xc4; 32],
                 loader_version: 5,
                 random_results: vec![3, 1],
             },
@@ -126,6 +127,7 @@ fn two_sources() -> PlayRecord {
             },
         },
         play_type: PlayType::Full,
+        speed: bms_model::Speed::NORMAL,
         start: InputStart {
             opened_at: TimeUs(1_000_000),
             held: vec![(SourceId(0), ControlId(0x2c), 1)],
@@ -445,7 +447,8 @@ pub fn preset_canonicals() -> Vec<Seed> {
             ..gauge.clone()
         })
         .collect();
-    // beatoraja-style carries the other header policy.
+    // beatoraja-style carries the other header and window policies and a
+    // scratch table of its own.
     let mut seeds: Vec<Seed> = vec![
         ("custom", bytes.clone()),
         (
@@ -517,16 +520,34 @@ pub fn preset_canonicals() -> Vec<Seed> {
     ));
     // Five rank scales: the count precedes the first scale, whose first
     // byte is the first to change with it.
+    let first_change = |base: &[u8], other: &rules::RulePreset| {
+        base.iter()
+            .zip(other.canonical_bytes())
+            .position(|(&a, b)| a != b)
+            .expect("the edit changes the bytes")
+    };
     let mut scaled = custom.clone();
-    scaled.rank_scale.rank_milli[0] += 1;
-    let rank_at = bytes
-        .iter()
-        .zip(scaled.canonical_bytes())
-        .position(|(&a, b)| a != b)
-        .expect("a rank scale changes the bytes")
-        - 1;
+    let rules::WindowPolicy::Thousandths(scale) = &mut scaled.window_policy else {
+        panic!("custom scales in thousandths");
+    };
+    scale.rank_milli[0] += 1;
+    let rank_at = first_change(&bytes, &scaled) - 1;
     assert_eq!(bytes[rank_at], 4, "the rank scale count");
     seeds.push(("wrong_length", edited(&|b| b[rank_at] = 5)));
+    // Six rank percentages of beatoraja-style's window policy.
+    let style = rules::beatoraja_style();
+    let style_bytes = style.canonical_bytes();
+    let mut percent = style.clone();
+    let rules::WindowPolicy::Scaled(s) = &mut percent.window_policy else {
+        panic!("beatoraja-style scales by whole percentages");
+    };
+    s.rank_percent[0] += 1;
+    let percent_at = first_change(&style_bytes, &percent) - 1;
+    assert_eq!(style_bytes[percent_at], 5, "the rank percentage count");
+    let mut six = style_bytes;
+    six[percent_at] = 6;
+    seeds.push(("wrong_percent_length", six));
+    seeds.push(("older_version", edited(&|b| b[0] -= 1)));
     seeds.push(("trailing_bytes", edited(&|b| b.push(0))));
     seeds.push((
         "truncated",

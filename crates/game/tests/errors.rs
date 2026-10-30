@@ -333,6 +333,7 @@ fn a_refused_chart_reports_each_cause_once() {
         start: TimeUs(0),
         effects: 16,
         seed: 1,
+        speed: bms_model::Speed::NORMAL,
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,

@@ -25,25 +25,36 @@ pub struct ReadHeaders {
 
 /// How the judgment-header declarations are read. Every variant walks the
 /// declarations in file order, and a declaration it accepts replaces the
-/// earlier one of its slot (`#RANK` and `#DEFEXRANK` share the rank's), so a
-/// declaration it refuses keeps the earlier one.
+/// earlier one of its slot, so a declaration it refuses keeps the earlier
+/// one. Each variant says whether `#RANK` and `#DEFEXRANK` share a slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderPolicy {
-    /// The custom reading, which loader version 6 applied itself:
+    /// The custom reading, which loader version 6 applied itself, with
+    /// `#RANK` and `#DEFEXRANK` sharing one slot:
     /// - `#RANK`: an integer token that fits `i32`, whatever its value;
     /// - `#DEFEXRANK`: any number of at least 1, in thousandths rounded down;
     /// - `#TOTAL`: any number not negative, in thousandths rounded down; a
     ///   `#TOTAL` that counts but is 0 there leaves the preset's default.
     Decimals,
-    /// The reference decoder's reading (jbms-parser `BMSDecoder.java`):
+    /// The reference decoder's rules (jbms-parser `BMSDecoder.java`), read
+    /// as numbers:
     /// - `#RANK`: an integer token from 0 to 4 (`:702-713`,
-    ///   `Integer.parseInt`, `rank >= 0 && rank < 5`);
-    /// - `#DEFEXRANK`: an integer token of at least 1 (`:716-727`,
-    ///   `Integer.parseInt`, `rank >= 1`), so `120.0` and `120.5` are
-    ///   refused;
+    ///   `rank >= 0 && rank < 5`);
+    /// - `#DEFEXRANK`: any number above 0 (`:716-727`), an integer token
+    ///   or a decimal (`120`, `120.0` and `120.5` alike), in thousandths
+    ///   rounded down, so one below 0.001 reads as 0 and is refused. Its
+    ///   `Integer.parseInt` is how the reference stores the value, not a
+    ///   rule of the header (design.md "What a -style Preset Reproduces").
+    ///   A `#DEFEXRANK` counts over any `#RANK`, before or after it: the
+    ///   decoder that introduced it ignored `#RANK` once a `#DEFEXRANK` was
+    ///   set (jbms-parser a7a0729, `if (model.getJudgerank() >= 10)
+    ///   return;`), and beatoraja's chart documentation says it takes
+    ///   precedence over `#RANK`; the check went away in jbms-parser
+    ///   d0fba6d, when the `>= 10` encoding of a #DEFEXRANK stopped working
+    ///   with its new minimum of 1;
     /// - `#TOTAL`: any number above 0 (`:730-743`, `total > 0`), in
     ///   thousandths rounded down.
-    IntegerRanks,
+    DefExRankFirst,
 }
 
 /// Thousandths of a positive multiple of `10^-18`, rounded down. Fits `i64`
@@ -65,6 +76,8 @@ impl HeaderPolicy {
     #[must_use]
     pub fn read(&self, headers: &[JudgmentHeader]) -> ReadHeaders {
         let mut read = ReadHeaders::default();
+        // `DefExRankFirst`'s #DEFEXRANK, kept apart from #RANK.
+        let mut defexrank = None;
         for &JudgmentHeader { name, value } in headers {
             match (self, name) {
                 (Self::Decimals, JudgmentHeaderName::Rank) => {
@@ -82,17 +95,17 @@ impl HeaderPolicy {
                         read.total_milli = Some(m);
                     }
                 }
-                (Self::IntegerRanks, JudgmentHeaderName::Rank) => {
+                (Self::DefExRankFirst, JudgmentHeaderName::Rank) => {
                     if let Some(r) = int32(value).filter(|r| (0..5).contains(r)) {
                         read.rank = Some(JudgeRank::Rank(r));
                     }
                 }
-                (Self::IntegerRanks, JudgmentHeaderName::DefExRank) => {
-                    if let Some(r) = int32(value).filter(|&r| r >= 1) {
-                        read.rank = Some(JudgeRank::DefExRankMilli(i64::from(r) * 1_000));
+                (Self::DefExRankFirst, JudgmentHeaderName::DefExRank) => {
+                    if let Some(m) = value.number().and_then(milli).filter(|&m| m > 0) {
+                        defexrank = Some(JudgeRank::DefExRankMilli(m));
                     }
                 }
-                (Self::IntegerRanks, JudgmentHeaderName::Total) => {
+                (Self::DefExRankFirst, JudgmentHeaderName::Total) => {
                     if let Some(m) = value.number().filter(|&v| v > 0).and_then(milli) {
                         read.total_milli = Some(m);
                     }
@@ -103,6 +116,7 @@ impl HeaderPolicy {
             // A #TOTAL that is not positive counts as absent.
             read.total_milli = read.total_milli.filter(|&t| t > 0);
         }
+        read.rank = defexrank.or(read.rank);
         read
     }
 }
@@ -113,7 +127,7 @@ mod tests {
     use bms_model::JudgmentHeader;
     use bms_model::JudgmentHeaderName::{self, DefExRank, Rank, Total};
 
-    use super::HeaderPolicy::{Decimals, IntegerRanks};
+    use super::HeaderPolicy::{Decimals, DefExRankFirst};
     use super::{JudgeRank, ReadHeaders};
 
     const ONE: i128 = HeaderValue::ONE;
@@ -253,9 +267,10 @@ mod tests {
         }
     }
 
-    /// Source: jbms-parser `BMSDecoder.java:702-743`.
+    /// Source: jbms-parser `BMSDecoder.java:702-743`; the precedence of
+    /// `#DEFEXRANK`, jbms-parser a7a0729.
     #[test]
-    fn integer_ranks_read_as_the_reference_decoder_does() {
+    fn defexrank_first_reads_the_reference_decoder_rules() {
         let r3 = (Rank, HeaderValue::integer(3));
         for (headers, expected) in [
             (vec![r3], Some(JudgeRank::Rank(3))),
@@ -275,35 +290,64 @@ mod tests {
             ),
             (vec![r3, (Rank, Decimal(2 * ONE))], Some(JudgeRank::Rank(3))),
             (vec![(Rank, HeaderValue::integer(7))], None),
-            // #DEFEXRANK: an integer token of at least 1.
+            // #DEFEXRANK: any number above 0, integer token or decimal, in
+            // thousandths rounded down.
             (
                 vec![r3, (DefExRank, HeaderValue::integer(120))],
                 Some(JudgeRank::DefExRankMilli(120_000)),
             ),
             (
-                vec![r3, (DefExRank, HeaderValue::integer(1))],
-                Some(JudgeRank::DefExRankMilli(1_000)),
+                vec![r3, (DefExRank, HeaderValue::decimal_milli(120_000))],
+                Some(JudgeRank::DefExRankMilli(120_000)),
             ),
             (
                 vec![r3, (DefExRank, HeaderValue::decimal_milli(120_500))],
+                Some(JudgeRank::DefExRankMilli(120_500)),
+            ),
+            (
+                vec![r3, (DefExRank, HeaderValue::decimal_milli(500))],
+                Some(JudgeRank::DefExRankMilli(500)),
+            ),
+            (
+                vec![(DefExRank, Integer(i128::from(i32::MAX) * ONE + ONE))],
+                Some(JudgeRank::DefExRankMilli((i64::from(i32::MAX) + 1) * 1_000)),
+            ),
+            // Not above 0 in thousandths, or not a number: refused, so the
+            // rank or an earlier #DEFEXRANK stays.
+            (vec![r3, (DefExRank, Integer(0))], Some(JudgeRank::Rank(3))),
+            (
+                vec![r3, (DefExRank, HeaderValue::integer(-2))],
                 Some(JudgeRank::Rank(3)),
             ),
             (
-                vec![r3, (DefExRank, HeaderValue::decimal_milli(120_000))],
+                vec![r3, (DefExRank, Decimal(ONE / 2_000))],
                 Some(JudgeRank::Rank(3)),
             ),
-            (vec![r3, (DefExRank, Integer(0))], Some(JudgeRank::Rank(3))),
             (vec![r3, (DefExRank, NotANumber)], Some(JudgeRank::Rank(3))),
             (
-                vec![r3, (DefExRank, Integer(i128::from(i32::MAX) * ONE + ONE))],
-                Some(JudgeRank::Rank(3)),
+                vec![
+                    (DefExRank, HeaderValue::integer(90)),
+                    (DefExRank, Integer(0)),
+                ],
+                Some(JudgeRank::DefExRankMilli(90_000)),
+            ),
+            // A #DEFEXRANK counts over any #RANK, before or after it; the
+            // later of two #DEFEXRANKs counts.
+            (
+                vec![(DefExRank, HeaderValue::integer(90)), r3],
+                Some(JudgeRank::DefExRankMilli(90_000)),
             ),
             (
-                vec![(DefExRank, Integer(i128::from(i32::MAX) * ONE))],
-                Some(JudgeRank::DefExRankMilli(i64::from(i32::MAX) * 1_000)),
+                vec![
+                    (DefExRank, HeaderValue::integer(90)),
+                    r3,
+                    (DefExRank, HeaderValue::integer(110)),
+                    (Rank, HeaderValue::integer(1)),
+                ],
+                Some(JudgeRank::DefExRankMilli(110_000)),
             ),
         ] {
-            assert_eq!(rank(IntegerRanks, &headers), expected, "{headers:?}");
+            assert_eq!(rank(DefExRankFirst, &headers), expected, "{headers:?}");
         }
         let t200 = (Total, HeaderValue::integer(200));
         for (headers, expected) in [
@@ -320,7 +364,7 @@ mod tests {
             // Positive below a thousandth counts, as 0 thousandths.
             (vec![t200, (Total, Decimal(1))], Some(0)),
         ] {
-            assert_eq!(total(IntegerRanks, &headers), expected, "{headers:?}");
+            assert_eq!(total(DefExRankFirst, &headers), expected, "{headers:?}");
         }
     }
 }

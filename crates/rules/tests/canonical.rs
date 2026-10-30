@@ -11,10 +11,10 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use rules::{
-    Assignment, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule, GaugeValue,
-    HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode, LnModeRule,
-    LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder, ScoreWeights,
-    TotalMode, Window,
+    Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
+    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
+    LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
+    RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalMode, Window, WindowPolicy,
 };
 
 const FULL: i64 = GaugeValue::FULL.0;
@@ -97,8 +97,50 @@ fn windows_and_ln_end() -> impl Strategy<Value = (JudgeWindows, LnEndWindows)> {
         })
 }
 
+/// A scale up to 200 %.
 fn scale() -> impl Strategy<Value = i64> {
     prop_oneof![1_i64..64, 1_i64..=200_000]
+}
+
+fn percent() -> impl Strategy<Value = u32> {
+    prop_oneof![1_u32..8, 1_u32..=200]
+}
+
+fn window_policy() -> impl Strategy<Value = WindowPolicy> {
+    prop_oneof![
+        ([scale(), scale(), scale(), scale()], scale()).prop_map(|(rank_milli, absent_milli)| {
+            WindowPolicy::Thousandths(RankScale {
+                rank_milli,
+                absent_milli,
+            })
+        }),
+        (
+            [percent(), percent(), percent(), percent(), percent()],
+            percent(),
+            u32s(),
+        )
+            .prop_map(|(rank_percent, absent_percent, defexrank_percent)| {
+                WindowPolicy::Scaled(ScaledRank {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                })
+            }),
+    ]
+}
+
+/// A lane class's table.
+fn table() -> impl Strategy<Value = LaneTable> {
+    (windows_and_ln_end(), non_negative(), non_negative()).prop_map(
+        |((windows, ln_end), ahead, behind)| LaneTable {
+            windows,
+            ln_end,
+            empty_poor: EmptyPoorRange {
+                ahead: TimeUs(ahead),
+                behind: TimeUs(behind),
+            },
+        },
+    )
 }
 
 fn bools() -> impl Strategy<Value = PerJudgment<bool>> {
@@ -179,15 +221,14 @@ fn gauges() -> impl Strategy<Value = Vec<GaugeRule>> {
 
 fn preset() -> impl Strategy<Value = RulePreset> {
     (
-        (text(), u32s(), windows_and_ln_end()),
-        (non_negative(), non_negative(), any::<[bool; 3]>()),
+        (text(), u32s(), table(), table()),
+        any::<[bool; 3]>(),
         (
             prop_oneof![
                 Just(HeaderPolicy::Decimals),
-                Just(HeaderPolicy::IntegerRanks)
+                Just(HeaderPolicy::DefExRankFirst)
             ],
-            [scale(), scale(), scale(), scale()],
-            scale(),
+            window_policy(),
         ),
         prop_oneof![1_i64..64, 1_i64..=i64::MAX],
         gauges(),
@@ -196,52 +237,48 @@ fn preset() -> impl Strategy<Value = RulePreset> {
     )
         .prop_map(
             |(
-                (id, version, (windows, ln_end)),
-                (ahead, behind, [breaks_combo, counts_bp, counted]),
-                (headers, rank_milli, absent_milli),
+                (id, version, keys, scratch),
+                [breaks_combo, counts_bp, counted],
+                (headers, window_policy),
                 default_total_milli,
                 gauges,
                 (ex, breaks_combo_by, counts_bp_by),
                 per_unit,
-            )| RulePreset {
-                id,
-                version,
-                implementation: Implementation::Standard {
-                    version: Implementation::STANDARD_VERSION,
-                },
-                windows,
-                miss: MissRule::PoorAfterLateBadOrOvertaken,
-                empty_poor: EmptyPoorRule {
-                    ahead: TimeUs(ahead),
-                    behind: TimeUs(behind),
-                    breaks_combo,
-                    counts_bp,
-                    counted,
-                },
-                ln_end,
-                headers,
-                rank_scale: RankScale {
-                    rank_milli,
-                    absent_milli,
-                },
-                default_total_milli,
-                denominator: Denominator::TapsAndLnHeads,
-                gauges,
-                score: ScoreWeights {
-                    ex: per_judgment(ex),
-                    breaks_combo: breaks_combo_by,
-                    counts_bp: counts_bp_by,
-                },
-                same_time_order: SameTimeOrder::InputsFirst,
-                assignment: Assignment::NearestTiesEarlier,
-                ln_mode: LnModeRule {
-                    default: LnMode::Ln,
-                    late_head: LateHeadRule::CompletesAtPress,
-                },
-                total_mode: TotalMode::ScalesIncrease,
-                mine: MineRule::WhileHeld {
-                    per_unit: GaugeValue(per_unit),
-                },
+            )| {
+                RulePreset {
+                    id,
+                    version,
+                    implementation: Implementation::Standard {
+                        version: Implementation::STANDARD_VERSION,
+                    },
+                    tables: PerLaneClass { keys, scratch },
+                    miss: MissRule::PoorAfterLateBadOrOvertaken,
+                    empty_poor: EmptyPoorRule {
+                        breaks_combo,
+                        counts_bp,
+                        counted,
+                    },
+                    headers,
+                    window_policy,
+                    default_total_milli,
+                    denominator: Denominator::TapsAndLnHeads,
+                    gauges,
+                    score: ScoreWeights {
+                        ex: per_judgment(ex),
+                        breaks_combo: breaks_combo_by,
+                        counts_bp: counts_bp_by,
+                    },
+                    same_time_order: SameTimeOrder::InputsFirst,
+                    assignment: Assignment::NearestTiesEarlier,
+                    ln_mode: LnModeRule {
+                        default: LnMode::Ln,
+                        late_head: LateHeadRule::CompletesAtPress,
+                    },
+                    total_mode: TotalMode::ScalesIncrease,
+                    mine: MineRule::WhileHeld {
+                        per_unit: GaugeValue(per_unit),
+                    },
+                }
             },
         )
 }
@@ -262,7 +299,7 @@ proptest! {
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 15];
+    let mut counts = [0_usize; 19];
     // Per boolean field, whether it was seen false and true.
     let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
@@ -286,7 +323,11 @@ fn generator_reaches_every_variant_and_length_class() {
             p.gauges.iter().any(|g| g.kind == GaugeKind::Survival),
             p.gauges.iter().any(|g| g.low_damage.is_none()),
             p.gauges.iter().any(|g| g.low_damage.is_some()),
-            p.empty_poor.ahead.0 >= 1 << 62,
+            p.tables.keys.empty_poor.ahead.0 >= 1 << 62,
+            p.tables.scratch.empty_poor.behind.0 >= 1 << 62,
+            p.tables.keys != p.tables.scratch,
+            matches!(p.window_policy, WindowPolicy::Thousandths(_)),
+            matches!(p.window_policy, WindowPolicy::Scaled(_)),
             p.id.chars().count() == 1,
             p.id.len() >= 128,
             p.gauges.len() == 1,
@@ -294,7 +335,7 @@ fn generator_reaches_every_variant_and_length_class() {
             p.gauges.len() >= 128,
             p.gauges.iter().any(|g| g.id.len() >= 128),
             p.headers == HeaderPolicy::Decimals,
-            p.headers == HeaderPolicy::IntegerRanks,
+            p.headers == HeaderPolicy::DefExRankFirst,
         ];
         for (count, hit) in counts.iter_mut().zip(reached) {
             *count += usize::from(hit);

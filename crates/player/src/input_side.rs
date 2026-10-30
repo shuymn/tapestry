@@ -75,6 +75,16 @@ pub enum Request {
     /// open: it stops its heartbeat. Not answered; ignored while
     /// recording is open.
     Idle,
+    /// Autoplay of another chart, between plays: its generated input, and
+    /// the events each source's queue holds for it. Not answered; ignored
+    /// by the other modes. The replaced input is freed on the input
+    /// thread, outside any play.
+    Feed {
+        /// The chart's generated input.
+        input: input::AutoplayInput,
+        /// Its source queue's size.
+        queue_capacity: usize,
+    },
 }
 
 /// What a play records, from the key configs.
@@ -108,6 +118,9 @@ pub struct InputState {
     connected: AtomicBool,
     /// The hook was dropped: the input thread ended, or is unwinding.
     gone: AtomicBool,
+    /// The hook's wakes so far (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    wakes: std::sync::atomic::AtomicU64,
 }
 
 /// The game thread's end of the input side.
@@ -156,6 +169,19 @@ impl InputLink {
                 Ok(c)
             }
             Reply::Opened(..) => unreachable!("a close is answered by a closing"),
+        }
+    }
+
+    /// Hands the input thread another chart's generated input (autoplay),
+    /// between plays: sent without waiting, since nothing answers it; the
+    /// next open, sent after it, plays it. A failed link sends nothing.
+    pub fn feed(&self, input: input::AutoplayInput, queue_capacity: usize) {
+        let feed = Request::Feed {
+            input,
+            queue_capacity,
+        };
+        if self.failed.is_none() && self.requests.send(feed).is_ok() {
+            self.waker.wake();
         }
     }
 
@@ -209,6 +235,13 @@ impl InputLink {
             .gone
             .load(Ordering::Acquire)
             .then_some(InputWaitError::Gone))
+    }
+
+    /// The input thread's wakes so far: what its cadence costs while
+    /// nothing plays (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn wakes(&self) -> u64 {
+        self.state.wakes.load(Ordering::Relaxed)
     }
 
     /// Whether the focus gate has tripped since recording last opened.
@@ -318,6 +351,8 @@ impl Hook {
     /// checks the focus gate, so a focus loss during the audio tail or on
     /// the end screen is published.
     pub fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) -> Phase {
+        #[cfg(feature = "dev-tools")]
+        self.state.wakes.fetch_add(1, Ordering::Relaxed);
         match (&mut self.mode, self.origin) {
             (Mode::Autoplay(feeder), Some(origin)) => {
                 input::InputAdapter::poll(feeder, TimeUs(now.0 - origin.0), sources);
@@ -348,6 +383,16 @@ impl Hook {
                 Request::Idle => {
                     if self.phase != Phase::Open {
                         self.phase = Phase::Idle;
+                    }
+                    continue;
+                }
+                Request::Feed {
+                    input,
+                    queue_capacity,
+                } => {
+                    if let Mode::Autoplay(feeder) = &mut self.mode {
+                        *feeder = input;
+                        sources.set_queue_capacity(queue_capacity);
                     }
                     continue;
                 }

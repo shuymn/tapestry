@@ -189,6 +189,14 @@ impl SourceSet {
         })
     }
 
+    /// Sets the events each source's queue holds from the next opening on,
+    /// between plays: for a session whose input stream changes with its
+    /// chart (autoplay of the chart chosen on the select screen). The open
+    /// recording's queues keep their size.
+    pub const fn set_queue_capacity(&mut self, capacity: usize) {
+        self.config.queue_capacity = capacity;
+    }
+
     /// The focus gate.
     #[must_use]
     pub const fn gate(&self) -> &FocusGate {

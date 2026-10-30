@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 
-use bms_model::{DOMAIN, FRAC_BITS, Position, ScrollSegment, TimeUs};
+use bms_model::{DOMAIN, FRAC_BITS, Position, ScrollSegment, Speed, TimeUs};
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
@@ -66,7 +66,11 @@ impl Time {
 /// An object with its time.
 #[derive(Clone, Copy, Debug)]
 pub struct Timed {
+    /// The time at 1×: the exact time floored to µs.
     pub time: TimeUs,
+    /// The real time at the load's speed: the exact time scaled by `20/k`,
+    /// then floored to µs; `time` at 1×.
+    pub real: TimeUs,
     /// The display position: the exact beat count floored to 2^-80 beat.
     pub pos: Position,
     pub kind: ObjectKind,
@@ -93,10 +97,66 @@ pub struct Timeline {
     pub initial_rate: i128,
     /// The scroll map's segments, coalesced by start in exact event order.
     pub segments: Vec<ScrollSegment>,
+    /// The scroll map on the real timeline at a speed other than 1×.
+    pub real: Option<Scroll>,
     pub bar_lines: Vec<Position>,
     /// The measure of the last position kept, which errors from compiling
     /// the scroll map name.
     pub last_measure: u16,
+}
+
+/// A scroll map's parts: the rate before time 0 and the segments.
+#[derive(Debug)]
+pub struct Scroll {
+    pub initial_rate: i128,
+    pub segments: Vec<ScrollSegment>,
+}
+
+/// Chart time to real time at a speed `k/20`: the exact time times
+/// `num / den = 20/k` in lowest terms, floored once (design.md "Practice
+/// Speed Changes"). Flooring the 1× time again would round twice.
+struct Mapping {
+    num: BigInt,
+    den: BigInt,
+    ratio: Rational,
+}
+
+impl Mapping {
+    /// `None` at 1×, where real time is the 1× time.
+    fn of(speed: Speed) -> Option<Self> {
+        (speed != Speed::NORMAL).then(|| {
+            let (k, twenty) = speed.ratio();
+            let (num, den) = (BigInt::from(twenty), BigInt::from(k));
+            Self {
+                ratio: Rational::new(num.clone(), den.clone()),
+                num,
+                den,
+            }
+        })
+    }
+
+    /// The real time of `time`: its floor in µs, the remainder and the
+    /// denominator it is over. Past the scroll map's domain the chart is
+    /// too long to play at this speed.
+    fn real(&self, time: &Time, measure: u16) -> Result<(TimeUs, BigInt, BigInt), LoadError> {
+        let denom = &time.denom * &self.den;
+        let (floor, rest) = (&time.numer * &self.num).div_mod_floor(&denom);
+        let floor = i64::try_from(floor)
+            .ok()
+            .filter(|&f| f < DOMAIN || (f == DOMAIN && rest.is_zero()))
+            .ok_or(LoadError::TooLongAtSpeed { measure })?;
+        Ok((TimeUs(floor), rest, denom))
+    }
+}
+
+/// The real timeline's scroll state at a speed other than 1×.
+struct RealScroll {
+    mapping: Mapping,
+    /// Real µs per beat at the current BPM.
+    us_per_beat: Rational,
+    /// Its rate in units per µs, floored.
+    rate: i128,
+    scroll: Scroll,
 }
 
 /// Where an event sits: `index / count` of the way through `measure`.
@@ -135,9 +195,12 @@ enum Event {
     Object(usize),
 }
 
+/// The chart's timeline at 1× and, at another `speed`, on the real
+/// timeline too, both from one exact time.
 pub fn compute(
     source: &Source,
     limits: &Limits,
+    speed: Speed,
     warnings: &mut Vec<Warning>,
 ) -> Result<Timeline, LoadError> {
     let initial_bpm = if let Some(bpm) = &source.bpm {
@@ -219,14 +282,34 @@ pub fn compute(
     let mut us_per_beat = int(US_PER_MINUTE) / &initial_bpm;
     let initial_rate = slope(&us_per_beat).ok_or(LoadError::PositionOverflow { measure: 0 })?;
     let mut scroll_rate = initial_rate;
+    let first = |slope| ScrollSegment {
+        start: TimeUs(0),
+        anchor: Position(0),
+        slope,
+    };
+    // The real timeline's scroll map, from the mapped exact time: its rates
+    // are the mapped BPM's, so hi-speed starts from the mapped start BPM.
+    let mut real = match Mapping::of(speed) {
+        Some(mapping) => {
+            let us_per_beat = &us_per_beat * &mapping.ratio;
+            let rate = slope(&us_per_beat).ok_or(LoadError::PositionOverflow { measure: 0 })?;
+            Some(RealScroll {
+                mapping,
+                us_per_beat,
+                rate,
+                scroll: Scroll {
+                    initial_rate: rate,
+                    segments: vec![first(rate)],
+                },
+            })
+        }
+        None => None,
+    };
     let mut timeline = Timeline {
         objects: Vec::with_capacity(source.objects.len()),
         initial_rate,
-        segments: vec![ScrollSegment {
-            start: TimeUs(0),
-            anchor: Position(0),
-            slope: initial_rate,
-        }],
+        segments: vec![first(initial_rate)],
+        real: None,
         bar_lines: Vec::with_capacity(usize::from(last_measure) + 1),
         last_measure: end.measure,
     };
@@ -296,6 +379,10 @@ pub fn compute(
             pos,
             pos_rest: &pos_rest,
         };
+        let real_here = match &real {
+            Some(r) => Some(r.mapping.real(&time, measure)?),
+            None => None,
+        };
 
         // A BPM change applies first; channel 08 wins over 03; the later
         // object in the file wins within a channel.
@@ -322,8 +409,19 @@ pub fn compute(
             us_per_beat = int(US_PER_MINUTE) / v;
             measure_us = None;
             scroll_rate = slope(&us_per_beat).ok_or_else(out_of_range)?;
-            let segment = segment(&here, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
-            push(&mut timeline.segments, segment);
+            let change = segment(&here, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
+            push(&mut timeline.segments, change);
+            if let (Some(r), Some(t)) = (&mut real, &real_here) {
+                r.us_per_beat = &us_per_beat * &r.mapping.ratio;
+                r.rate = slope(&r.us_per_beat).ok_or_else(out_of_range)?;
+                let change = segment(
+                    &Change::real(t, &beats, pos, &pos_rest),
+                    &r.us_per_beat,
+                    r.rate,
+                )
+                .ok_or_else(out_of_range)?;
+                push(&mut r.scroll.segments, change);
+            }
         }
 
         for (_, event) in group {
@@ -337,6 +435,7 @@ pub fn compute(
                     ) {
                         timeline.objects.push(Timed {
                             time: at,
+                            real: real_here.as_ref().map_or(at, |r| r.0),
                             pos,
                             kind: o.kind,
                             line: o.line,
@@ -384,8 +483,22 @@ pub fn compute(
             };
             let resume = segment(&change, &us_per_beat, scroll_rate).ok_or_else(out_of_range)?;
             push(&mut timeline.segments, resume);
+            if let (Some(r), Some(t)) = (&mut real, &real_here) {
+                let stop = segment(&Change::real(t, &beats, pos, &pos_rest), &r.us_per_beat, 0)
+                    .ok_or_else(out_of_range)?;
+                push(&mut r.scroll.segments, stop);
+                let end = r.mapping.real(&time, measure)?;
+                let resume = segment(
+                    &Change::real(&end, &beats, pos, &pos_rest),
+                    &r.us_per_beat,
+                    r.rate,
+                )
+                .ok_or_else(out_of_range)?;
+                push(&mut r.scroll.segments, resume);
+            }
         }
     }
+    timeline.real = real.map(|r| r.scroll);
     Ok(timeline)
 }
 
@@ -451,6 +564,26 @@ struct Change<'a> {
     beats: &'a Beats,
     pos: Position,
     pos_rest: &'a BigInt,
+}
+
+impl<'a> Change<'a> {
+    /// The change at the real time `(floor, rest, denom)` from
+    /// [`Mapping::real`], at the beat count `beats`.
+    const fn real(
+        (at, rest, denom): &'a (TimeUs, BigInt, BigInt),
+        beats: &'a Beats,
+        pos: Position,
+        pos_rest: &'a BigInt,
+    ) -> Self {
+        Self {
+            at: *at,
+            rest,
+            denom,
+            beats,
+            pos,
+            pos_rest,
+        }
+    }
 }
 
 /// The segment of `change`, after which the chart scrolls at `us_per_beat`

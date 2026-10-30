@@ -6,11 +6,12 @@
 //! version, structure, preset hash) have already passed. The rest are
 //! checked here in a fixed order, and the first failure is the refusal:
 //! the evaluator version, the recorded preset copy, the loader version, the
-//! load with the recorded seed, the resolved-chart hash, and the chart
-//! transform. [`load_recorded_chart`] runs every check and
-//! [`evaluate_record`] the first two again, so each entry point refuses in
-//! that order on its own. The chart file's SHA-256 is not compared: an
-//! edited file that resolves to the same chart verifies.
+//! load with the recorded seed and speed, the resolved-chart hash, the
+//! played-chart hash, and the chart transform. [`load_recorded_chart`]
+//! runs every check and [`evaluate_record`] the first two again, so each
+//! entry point refuses in that order on its own. The chart file's SHA-256
+//! is not compared: an edited file that resolves to the same chart, at
+//! the record's speed too, verifies.
 
 use std::path::Path;
 
@@ -40,6 +41,10 @@ pub enum VerifyError {
     /// The chart file resolves to another chart than the record's.
     #[error("the chart resolves to another chart than the record's")]
     ResolvedChartMismatch,
+    /// The chart file resolves to the record's chart at 1×, but its times
+    /// at the record's speed are not the ones the play was judged on.
+    #[error("the chart plays at the record's speed otherwise than the record's")]
+    PlayedChartMismatch,
     /// The record names a chart transform this build does not know.
     #[error("the record's chart transform {id:?} version {version} is unknown")]
     UnknownTransform {
@@ -97,8 +102,9 @@ fn recorded_preset(record: &PlayRecord) -> Result<RulePreset, VerifyError> {
 /// [`UnsupportedEvaluator`](VerifyError::UnsupportedEvaluator),
 /// [`PresetCopy`](VerifyError::PresetCopy) (both before the bytes are
 /// read), [`UnsupportedLoader`](VerifyError::UnsupportedLoader),
-/// [`Load`](VerifyError::Load) with the recorded `#RANDOM` seed,
-/// [`ResolvedChartMismatch`](VerifyError::ResolvedChartMismatch) and
+/// [`Load`](VerifyError::Load) with the recorded `#RANDOM` seed and speed,
+/// [`ResolvedChartMismatch`](VerifyError::ResolvedChartMismatch),
+/// [`PlayedChartMismatch`](VerifyError::PlayedChartMismatch) and
 /// [`UnknownTransform`](VerifyError::UnknownTransform).
 pub fn load_recorded_chart(
     record: &PlayRecord,
@@ -111,13 +117,21 @@ pub fn load_recorded_chart(
     if loader != LOADER_VERSION {
         return Err(VerifyError::UnsupportedLoader(loader));
     }
+    // At the recorded speed: the recorded input is in its real time. The
+    // resolved hash is the 1× chart's at every speed.
     let opts = LoadOptions {
         seed: recorded.random_seed,
+        speed: record.speed,
         ..LoadOptions::default()
     };
     let loaded = bms_parser::load_bms(bytes, dir, &opts).map_err(VerifyError::Load)?;
     if loaded.chart.identity.resolved_hash != recorded.identity.resolved_hash {
         return Err(VerifyError::ResolvedChartMismatch);
+    }
+    // At a speed, times floored from the exact time can differ between
+    // files that resolve alike at 1×; the played hash pins the play's.
+    if loaded.chart.identity.played_hash != recorded.identity.played_hash {
+        return Err(VerifyError::PlayedChartMismatch);
     }
     // The pass-through returns the chart unchanged.
     if !PASSTHROUGH.is(&recorded.transform) {

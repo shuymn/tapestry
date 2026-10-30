@@ -29,7 +29,7 @@ const MS: i64 = 1_000;
 fn wide() -> RulePreset {
     let mut p = rules::custom();
     p.id = "wide".to_owned();
-    p.windows.bad = Window::symmetric(220 * MS);
+    p.tables.keys.windows.bad = Window::symmetric(220 * MS);
     p
 }
 
@@ -95,6 +95,7 @@ fn played_with(chart: &str, seed: u64) -> PlayRecord {
             },
         },
         play_type: PlayType::Full,
+        speed: bms_model::Speed::NORMAL,
         start: InputStart {
             opened_at: TimeUs(0),
             held: Vec::new(),

@@ -1,10 +1,12 @@
 //! What the window and the system tell the game thread: system controls,
 //! focus, and quitting. Lock-free, so the game thread reads it each step.
 //!
-//! Quitting (the quit key or closing the window) is a latch that is never
-//! cleared, so a quit that arrives while the game is between states (during
-//! startup, while a play is prepared) still ends the run. Retry and suspend
-//! are taken once, each by the play it arrives in.
+//! Closing the window is a latch that is never cleared, so a close that
+//! arrives while the game is between states (during startup, while a play
+//! is prepared) still ends the run. The quit key latches it too when a
+//! chart was given on the command line; with song selection, it leaves the
+//! chart instead ([`Controls::quit_leaves`]): a quit taken once, like retry
+//! and suspend, each by the play or result it arrives in.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -29,6 +31,10 @@ pub struct Controls {
     /// When the latest retry was received, on the clock.
     retry_at: AtomicI64,
     quit: AtomicBool,
+    /// The quit key leaves the chart rather than latching [`quit`](Self::quit).
+    leaves: AtomicBool,
+    /// A quit key press waiting to be taken, while it leaves the chart.
+    leave: AtomicBool,
     focused: AtomicBool,
     latch: OnceLock<FocusLatch>,
     /// Wakes the input thread on a focus change.
@@ -65,6 +71,8 @@ impl Controls {
             command: AtomicU8::new(NONE),
             retry_at: AtomicI64::new(i64::MIN),
             quit: AtomicBool::new(false),
+            leaves: AtomicBool::new(false),
+            leave: AtomicBool::new(false),
             focused: AtomicBool::new(true),
             latch: OnceLock::new(),
             input: OnceLock::new(),
@@ -128,8 +136,19 @@ impl Controls {
         self.wake_game();
     }
 
+    /// From here on the quit key leaves the chart instead of ending the
+    /// run (song selection): it is taken once, and only closing the window
+    /// latches [`quitting`](Self::quitting).
+    pub fn quit_leaves(&self) {
+        self.leaves.store(true, Ordering::Release);
+    }
+
     fn set_command(&self, c: Command) {
         let new = match c {
+            Command::Quit if self.leaves.load(Ordering::Acquire) => {
+                self.leave.store(true, Ordering::Release);
+                return;
+            }
             Command::Quit => {
                 self.quit.store(true, Ordering::Release);
                 return;
@@ -147,14 +166,29 @@ impl Controls {
             });
     }
 
-    /// Takes the pending retry or suspend.
+    /// Takes the pending quit (while it leaves the chart), suspend or retry,
+    /// in that order: a quit drops a retry pressed with it and leaves a
+    /// suspend for the next take, so a chart the player left is left even
+    /// when the system suspends too.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn take(&self) -> Option<Command> {
+        if self.leave.swap(false, Ordering::AcqRel) {
+            let _ = self
+                .command
+                .compare_exchange(RETRY, NONE, Ordering::AcqRel, Ordering::Acquire);
+            return Some(Command::Quit);
+        }
         match self.command.swap(NONE, Ordering::AcqRel) {
             RETRY => Some(Command::Retry),
             SUSPEND => Some(Command::Suspend),
             _ => None,
         }
+    }
+
+    /// Whether a quit key press waits to be taken (while it leaves the
+    /// chart).
+    pub fn leaving(&self) -> bool {
+        self.leave.load(Ordering::Acquire)
     }
 
     /// When the latest retry was received.
@@ -167,7 +201,8 @@ impl Controls {
     /// The window was asked to close, or its event loop ended: the game
     /// quits.
     pub fn close(&self) {
-        self.command(Command::Quit);
+        self.quit.store(true, Ordering::Release);
+        self.wake_game();
     }
 
     /// Whether the player quit or the window is closing.
@@ -215,6 +250,31 @@ mod tests {
         c.command(Command::Retry);
         assert_eq!(c.take(), Some(Command::Suspend));
         assert!(c.retry_at().is_some());
+    }
+
+    /// With song selection the quit key leaves the chart: taken once, ahead
+    /// of a retry or a suspend pressed with it, and it never
+    /// latches quitting; closing the window still does.
+    #[test]
+    fn the_quit_key_leaves_the_chart_with_selection() {
+        let c = Controls::new(QpcClock::start());
+        c.quit_leaves();
+        c.command(Command::Retry);
+        c.command(Command::Quit);
+        assert!(!c.quitting());
+        assert_eq!(c.take(), Some(Command::Quit));
+        assert_eq!(c.take(), None);
+        c.command(Command::Suspend);
+        c.command(Command::Quit);
+        assert!(c.leaving());
+        assert_eq!(c.take(), Some(Command::Quit));
+        assert!(!c.leaving());
+        assert_eq!(c.take(), Some(Command::Suspend));
+        assert_eq!(c.take(), None);
+        assert!(!c.quitting());
+        c.close();
+        assert!(c.quitting());
+        assert_eq!(c.take(), None);
     }
 
     #[test]

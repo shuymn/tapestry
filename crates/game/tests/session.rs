@@ -65,7 +65,13 @@ impl ChartIngest for Built {
         path.extension().is_some_and(|e| e == "chart")
     }
 
-    fn ingest(&self, _bytes: &[u8], _dir: &Path, _seed: u64) -> Result<Ingested, IngestError> {
+    fn ingest(
+        &self,
+        _bytes: &[u8],
+        _dir: &Path,
+        _seed: u64,
+        _speed: bms_model::Speed,
+    ) -> Result<Ingested, IngestError> {
         Ok(Ingested {
             chart: self.0.clone(),
             warnings: Vec::new(),
@@ -90,6 +96,7 @@ fn config() -> SessionConfig {
         start: TimeUs(0),
         effects: 4_096,
         seed: 7,
+        speed: bms_model::Speed::NORMAL,
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
@@ -362,7 +369,9 @@ fn suspend_abort_is_ended_midway_and_incomplete() {
 fn wide_perfect() -> rules::RulePreset {
     let mut p = rules::custom();
     p.id = "wide".to_owned();
-    p.windows.perfect = rules::Window::symmetric(30 * MS);
+    for t in p.tables.each_mut() {
+        t.windows.perfect = rules::Window::symmetric(30 * MS);
+    }
     p
 }
 
@@ -1182,7 +1191,13 @@ impl ChartIngest for Capped {
         path.extension().is_some_and(|e| e == "chart")
     }
 
-    fn ingest(&self, bytes: &[u8], _dir: &Path, _seed: u64) -> Result<Ingested, IngestError> {
+    fn ingest(
+        &self,
+        bytes: &[u8],
+        _dir: &Path,
+        _seed: u64,
+        _speed: bms_model::Speed,
+    ) -> Result<Ingested, IngestError> {
         *self.seen.borrow_mut() = Some(bytes.len());
         Ok(Ingested {
             chart: self.chart.clone(),
@@ -1696,7 +1711,7 @@ fn bms_ingest_leaves_missing_sounds_to_the_sound_table() {
     let text =
         "#BPM 120\n#WAV01 kick.wav\n#WAV02 snare.wav\n#WAV03 hat.wav\n#FOO 1\n#00111:010203\n";
     let ingested = game::BmsIngest
-        .ingest(text.as_bytes(), dir.path(), 0)
+        .ingest(text.as_bytes(), dir.path(), 0, bms_model::Speed::NORMAL)
         .unwrap();
     // One warning, the unknown header; none per missing file.
     assert_eq!(ingested.warnings.len(), 1);
@@ -1716,7 +1731,9 @@ fn bms_ingest_leaves_missing_sounds_to_the_sound_table() {
 fn bad_edge(ms: i64) -> rules::RulePreset {
     let mut p = rules::custom();
     p.id = format!("bad-{ms}");
-    p.windows.bad = rules::Window::symmetric(ms * MS);
+    for t in p.tables.each_mut() {
+        t.windows.bad = rules::Window::symmetric(ms * MS);
+    }
     p
 }
 
@@ -1820,7 +1837,9 @@ fn what_if_with_an_equal_or_earlier_final_deadline_is_covered_by_the_recording()
     let (chart, one) = sixty_seconds();
     // Another preset with the same 180 ms edge, and one with 150 ms.
     let mut equal = bad_edge(180);
-    equal.windows.great = rules::Window::symmetric(50 * MS);
+    for t in equal.tables.each_mut() {
+        t.windows.great = rules::Window::symmetric(50 * MS);
+    }
     for (preset, end) in [(equal, 60_180), (bad_edge(150), 60_150)] {
         let r = under(&one, &chart, &preset);
         assert!(!r.as_played);

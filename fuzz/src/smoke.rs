@@ -165,6 +165,8 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
             "value_too_large",
             "unknown_implementation",
             "wrong_length",
+            "wrong_percent_length",
+            "older_version",
             "trailing_bytes",
             "truncated",
             "invalid",
@@ -174,7 +176,12 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
         let result = preset_canonical(&bytes).map(|_| ());
         let expected = match name {
             "custom" | "beatoraja_style" | "long" => Ok(()),
-            "other_version" => Err(CanonicalError::UnsupportedVersion(6)),
+            "other_version" => Err(CanonicalError::UnsupportedVersion(7)),
+            "older_version" => Err(CanonicalError::UnsupportedVersion(5)),
+            "wrong_percent_length" => Err(CanonicalError::WrongLength {
+                field: "rank_percent",
+                len: 6,
+            }),
             "non_minimal_varint" => Err(CanonicalError::NonMinimalVarint),
             "count_beyond_data" => Err(CanonicalError::CountBeyondData {
                 field: "gauges",

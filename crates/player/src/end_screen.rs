@@ -514,6 +514,7 @@ mod tests {
                 },
             },
             play_type: replay::PlayType::Full,
+            speed: bms_model::Speed::NORMAL,
             start: eval::InputStart {
                 opened_at: bms_model::TimeUs(-1_000_000),
                 held: Vec::new(),
