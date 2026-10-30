@@ -490,6 +490,39 @@ fn display_offset_moves_notes() {
 }
 
 #[test]
+fn the_culling_range_follows_the_tallest_part() {
+    // A tap, a mine and a bar line 615 ms ahead: at 800 px per 600 ms
+    // their centres are 20 px above the top (80). Made 64 tall, each
+    // reaches 12 px into the lanes, so it is drawn cut to [80, 92], though
+    // a padding of half the default note (8) would have culled it.
+    let at = TimeUs(1_600 * MS);
+    let mut chart = ChartBuilder::new(BPM)
+        .tap(lane(3), at)
+        .mine(lane(5), at, 10)
+        .build()
+        .unwrap();
+    chart.bar_lines = vec![chart.scroll.position_at(at)];
+    let tall = |set: fn(&mut LanesDef)| {
+        let mut def = simple();
+        set(&mut def);
+        let mut h = Harness::new(lanes_skin(def), &chart, &full(0));
+        h.frame(985, &[]);
+        h
+    };
+    let h = tall(|d| d.note_h = 64);
+    assert_eq!(in_lane(&h, NOTE, lane(3)), [[384.0, 80.0, 64.0, 12.0]]);
+    let h = tall(|d| d.mine_h = 64);
+    assert_eq!(in_lane(&h, MINE, lane(5)), [[512.0, 80.0, 64.0, 12.0]]);
+    let h = tall(|d| d.bar_h = 64);
+    assert_eq!(rects(&h, BAR), [[160.0, 80.0, 544.0, 12.0]]);
+    // At the default heights all three are culled there.
+    let h = tall(|_| {});
+    assert!(in_lane(&h, NOTE, lane(3)).is_empty());
+    assert!(in_lane(&h, MINE, lane(5)).is_empty());
+    assert!(rects(&h, BAR).is_empty());
+}
+
+#[test]
 fn caps_are_cropped_with_their_images_not_squashed() {
     // A note 600 ms ahead is centred on the top (80): its lower half shows,
     // and the uv keeps exactly the lower half of its 16-texel image.
@@ -611,6 +644,29 @@ fn the_scratch_side_moves_the_scratch_and_the_key_block() {
     // The bomb keeps its offset from its lane: 600 to 712, past the span.
     let bombs = rects(&h, WHITE);
     assert_eq!(bombs, [[600.0, 824.0, 112.0, 112.0]]);
+    // The playfield's box moves with it: [152, 704] as authored, [160, 712]
+    // with the scratch on the right. Pushed right as far as it goes, the
+    // box keeps 64 px on the canvas from its current left edge: a
+    // translation of 1920 − 64 − 160 = 1696 (the authored box would allow
+    // 1704), so the judgment line starts at 160 + 1696 = 1856.
+    h.layout
+        .set(
+            Region::Playfield,
+            skin_model::Adjust {
+                x: 4_320,
+                ..skin_model::Adjust::IDENTITY
+            },
+        )
+        .unwrap();
+    h.frame(1_000, &[]);
+    let p = h.skin.placement(
+        &Canvas::new([1920, 1080], Fit::Adapt),
+        &h.layout,
+        Side::Right,
+    );
+    assert_eq!(p.region(Region::Playfield).affine.offset, [1_696.0, 0.0]);
+    assert_eq!(rects(&h, LINE)[0][0], 1_856.0);
+    assert_eq!(rects(&h, WHITE)[0][0], 600.0 + 1_696.0);
     // On the author's side nothing moves.
     let skin = skin_with(
         REGIONS,
@@ -839,27 +895,36 @@ fn the_quad_budget_fills_exactly_and_keeps_the_reserved_quads() {
 
 #[test]
 fn the_budget_can_end_inside_a_long_note() {
-    // 8 191 taps, then a long note on key 7: its body is the budget's
-    // last quad, and its tail and head are dropped as one.
+    // `LANE_QUADS − left` taps, then a long note on key 7 drawn body, tail,
+    // head: with 1 quad left only its body fits, with 2 its body and tail,
+    // and the rest is dropped as one; with 3 it is whole.
     let per_lane = i64::from(LANE_QUADS) / 8;
-    let mut b = ChartBuilder::new(BPM);
-    for l in Lane::all() {
-        let n = if l == lane(7) { per_lane - 1 } else { per_lane };
-        for i in 0..n {
-            b = b.tap(l, TimeUs(1_000 * MS + i * 500));
+    for (left, parts, dropped) in [(1, [1, 0, 0], 1), (2, [1, 1, 0], 1), (3, [1, 1, 1], 0)] {
+        let mut b = ChartBuilder::new(BPM);
+        let mut taps = 0;
+        for l in Lane::all() {
+            let n = if l == lane(7) {
+                per_lane - left
+            } else {
+                per_lane
+            };
+            for i in 0..n {
+                b = b.tap(l, TimeUs(1_000 * MS + i * 500));
+                taps += 1;
+            }
         }
+        let at = 1_000 * MS + per_lane * 500;
+        let chart = b
+            .long(lane(7), TimeUs(at), TimeUs(at + 20 * MS))
+            .build()
+            .unwrap();
+        let mut h = Harness::new(budget_skin(), &chart, &full(0));
+        h.frame(1_000, &[]);
+        assert_eq!(rects(&h, NOTE).len(), taps, "{left} left");
+        let got = [BODY_OFF, TAIL, HEAD].map(|p| rects(&h, p).len());
+        assert_eq!(got, parts, "{left} left");
+        assert_eq!(h.batch.dropped(), dropped, "{left} left");
     }
-    let at = 1_000 * MS + per_lane * 500;
-    let chart = b
-        .long(lane(7), TimeUs(at), TimeUs(at + 20 * MS))
-        .build()
-        .unwrap();
-    let mut h = Harness::new(budget_skin(), &chart, &full(0));
-    h.frame(1_000, &[]);
-    assert_eq!(rects(&h, NOTE).len(), LANE_QUADS as usize - 1);
-    assert_eq!(rects(&h, BODY_OFF).len(), 1);
-    assert!(rects(&h, TAIL).is_empty() && rects(&h, HEAD).is_empty());
-    assert_eq!(h.batch.dropped(), 1);
 }
 
 #[test]
