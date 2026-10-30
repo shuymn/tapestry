@@ -137,8 +137,7 @@ impl Play {
             let hold = self.reducer.hold_at(l, now).map(|h| h.start);
             let bomb = self.reducer.bomb.get(l).copied().flatten();
             let mine = self.reducer.mine.get(l).copied().flatten();
-            set(lane_timer(LaneTimer::Press, lane), None);
-            set(lane_timer(LaneTimer::Release, lane), None);
+            // Press and release stay off until S9.
             set(lane_timer(LaneTimer::Bomb, lane), bomb);
             set(lane_timer(LaneTimer::Hold, lane), hold);
             set(lane_timer(LaneTimer::Mine, lane), mine);
