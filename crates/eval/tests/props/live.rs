@@ -415,8 +415,15 @@ pub fn live(
             )
         })
         .collect();
-    let ev = Evaluator::new(chart, rule, device, &input.start, None, budget)
-        .map_err(|e| format!("Evaluator::new: {e:?}"))?;
+    let ev = Evaluator::new(
+        chart,
+        rule,
+        device,
+        &input.start,
+        input.section.as_ref(),
+        budget,
+    )
+    .map_err(|e| format!("Evaluator::new: {e:?}"))?;
     let mut consumer = Consumer {
         ev,
         device,
