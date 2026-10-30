@@ -13,7 +13,7 @@ use rules::{GaugeValue, Judgment};
 use skin_model::{
     Attempt, Blend, ClipId, Ease, ElementDef, End, ErrorKind, Export, KeyDef, LoadError,
     MAX_ELEMENTS, MAX_OPS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, PLAY, PlayContext, PrepareError, Prop,
-    Schema, Scope, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field, timer,
+    Schema, Scope, Side, TIMER_OFF, TimerDef, TimerRef, Track, Ty, compile, field, timer,
 };
 
 const BPM_150: i64 = 150_000;
@@ -42,6 +42,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         gauges: &GAUGES,
         attempt: Attempt::Section(s),
         empty_poor_breaks_combo: false,
+        scratch: Side::Left,
     }
 }
 
@@ -399,6 +400,7 @@ fn targets_match_the_evaluators() {
         gauges: &gauges,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: preset.empty_poor.breaks_combo,
+        scratch: Side::Left,
     };
     let section_ctx = PlayContext {
         attempt: Attempt::Section(&edge),
@@ -640,24 +642,6 @@ fn load_errors() {
             Err(LoadError::UnknownTimer { element: 1 })
         ));
     }
-    let mut props = [None; 9];
-    props[Prop::Angle as usize] = Some(1);
-    let rotated = ElementDef {
-        track: Track::new(
-            &[KeyDef {
-                at: TimeUs(0),
-                props,
-            }],
-            Ease::Linear,
-            End::Hold,
-        )
-        .unwrap(),
-        ..el()
-    };
-    assert!(matches!(
-        load(Vec::new(), vec![rotated]),
-        Err(LoadError::Rotation { element: 0 })
-    ));
 }
 
 #[test]

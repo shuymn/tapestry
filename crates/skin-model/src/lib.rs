@@ -18,12 +18,17 @@
 //! [`Variant`] (1x or @2x) into texture-array [`Page`]s with box-filtered
 //! mips and a [`UvTable`] that finds each frame in them.
 //!
-//! A [`Skin`] holds elements in draw order, each an image on a keyframe
-//! [`Track`] on a timer, and `when` timers. [`Skin::prepare`] makes one
-//! attempt's [`Play`]; [`Skin::build`] runs each frame's drained effects
-//! through its reducer, reads the play view's snapshot into the [`PLAY`]
-//! schema's fields, starts the timers and pushes each drawn element's quad
-//! with its image's current frame from the uv table.
+//! A [`Skin`] holds elements in draw order, each an image or the lanes
+//! widget on a keyframe [`Track`] on a timer, placed in one of seven
+//! [`Region`]s, and `when` timers. The target size gives the [`Canvas`];
+//! the player's [`Layout`] moves, scales and hides regions within the
+//! translation clamp, and the scratch side and lane width re-lay the lanes
+//! ([`Skin::placement`]). [`Skin::prepare`] makes one attempt's [`Play`];
+//! [`Skin::build`] runs each frame's drained effects through its reducer,
+//! reads the play view's snapshot into the [`PLAY`] schema's fields,
+//! starts the timers and pushes each drawn element's quads: an image's
+//! current frame from the uv table, turned about its pivot, or the lanes'
+//! notes, bar lines, judgment line and covers.
 //!
 //! Expressions use integers only; floats appear only in a quad's geometry,
 //! after evaluation. The cast lints below reject `as` casts that may
@@ -38,19 +43,24 @@
 )]
 
 mod atlas;
+mod canvas;
 mod expr;
 mod image;
+mod layout;
+mod place;
 mod play;
 mod quad;
 mod schema;
 mod skin;
 mod track;
+mod widget;
 
 pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
     ALIGN, Atlas, AtlasError, AtlasLimits, GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES,
-    MIN_PAGE_SIDE, MIP_LEVELS, Page, Variant, variant_for,
+    MIN_PAGE_SIDE, MIP_LEVELS, Page, Variant,
 };
+pub use canvas::{Canvas, Fit, MAX_CANVAS};
 pub use expr::{
     CompileError, ErrorKind, MAX_ELAPSED_MS, MAX_NAME_BYTES, MAX_NESTING, MAX_OPS, MAX_SKIN_OPS,
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
@@ -61,6 +71,11 @@ pub use image::{
     MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE, MAX_SKIN_FRAMES,
     MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet,
 };
+pub use layout::{
+    Adjust, Anchor, Controls, LANE_WIDTH_PCT, Layout, LayoutError, MAX_INSET, MAX_OFFSET, Region,
+    RegionDef, SCALE_PCT,
+};
+pub use place::{Affine, Bind, Fill, MIN_VISIBLE, Place, Placement, RegionPlacement};
 pub use play::schema::{
     GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, PLAY, field, lane_timer, timer,
 };
@@ -68,8 +83,14 @@ pub use play::{Attempt, GaugeDesc, Play, PlayContext, PrepareError, SkinFrame};
 pub use quad::{Blend, ClipId, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use skin::{
-    ElementDef, LoadError, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, Skin, Source, TimerRef,
+    ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, Skin, SkinDef,
+    Source, TimerRef,
 };
 pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
 };
+pub use widget::lanes::{
+    LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneView, LanesDef, LanesError,
+    MAX_COVERED, Side,
+};
+pub use widget::scroll::Scale;

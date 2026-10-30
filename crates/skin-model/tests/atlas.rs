@@ -7,7 +7,7 @@ mod image_support;
 
 use image::{Rgba, RgbaImage};
 use image_support::{LIMITS, atlas, content, dir, file, load, save, solid, texel, whole};
-use skin_model::{AtlasLimits, ImageDef, Variant, variant_for};
+use skin_model::{AtlasLimits, ImageDef, Variant};
 
 const RED: [u8; 4] = [255, 0, 0, 255];
 const BLUE: [u8; 4] = [0, 0, 255, 255];
@@ -186,13 +186,7 @@ fn the_side_counts_the_reserved_layers() {
 }
 
 #[test]
-fn the_variant_follows_the_target() {
-    assert_eq!(variant_for([1920, 1080], [1920, 1080]), Variant::Lo);
-    assert_eq!(variant_for([1921, 1081], [1920, 1080]), Variant::Hi);
-    assert_eq!(variant_for([3840, 1080], [1920, 1080]), Variant::Lo);
-    assert_eq!(variant_for([3840, 2160], [1920, 1080]), Variant::Hi);
-    assert_eq!(variant_for([1280, 720], [1920, 1080]), Variant::Lo);
-
+fn a_hi_atlas_reads_the_hi_files() {
     let d = dir();
     save(d.path(), "a.png", &solid(6, 4, RED));
     save(d.path(), "a@2x.png", &solid(12, 8, BLUE));

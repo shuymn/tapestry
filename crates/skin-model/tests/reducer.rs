@@ -11,7 +11,7 @@ use play_support::{
     ln_held, mine, pct, state, tally,
 };
 use rules::{GaugeValue, Judgment};
-use skin_model::{Grade, LaneTimer, PlayContext, Skin, TIMER_OFF, lane_timer, timer};
+use skin_model::{Grade, LaneTimer, PlayContext, Side, Skin, TIMER_OFF, lane_timer, timer};
 
 const BPM_150: i64 = 150_000;
 
@@ -614,6 +614,7 @@ fn combo_up_follows_judgments_and_the_empty_poor_policy() {
     for breaks in [false, true] {
         let ctx = PlayContext {
             empty_poor_breaks_combo: breaks,
+            scratch: Side::Left,
             ..full(0)
         };
         let mut h = Harness::empty(&chart, &ctx);

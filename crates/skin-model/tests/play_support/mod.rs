@@ -11,9 +11,10 @@ use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
 use image::{ImageFormat, Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
-    AtlasLimits, Attempt, Blend, Ease, ElementDef, End, FileDef, Filter, GaugeDesc, ImageDef,
-    KeyDef, LoadError, PLAY, Play, PlayContext, Program, QuadBatch, Scope, Sheet, Skin, SkinFrame,
-    Source, TimerRef, Ty, UvTable, Variant, compile,
+    Anchor, AtlasLimits, Attempt, Blend, Ease, ElementDef, End, FileDef, Filter, Fit, GaugeDesc,
+    ImageDef, KeyDef, LaneView, Layout, LoadError, PLAY, Place, Play, PlayContext, Program,
+    QuadBatch, Region, RegionDef, Scope, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef,
+    Ty, UvTable, Variant, compile,
 };
 
 pub const MS: i64 = 1_000;
@@ -132,6 +133,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
             lead_in: TimeUs(lead_in_ms * MS),
         },
         empty_poor_breaks_combo: false,
+        scratch: Side::Left,
     }
 }
 
@@ -184,10 +186,35 @@ pub fn white_sheet() -> Sheet {
     .unwrap()
 }
 
+/// Every region anchored top left, none optional.
+pub const REGIONS: [RegionDef; Region::COUNT] = [RegionDef {
+    anchor: Anchor::TopLeft,
+    optional: false,
+}; Region::COUNT];
+
+/// An adapted skin without lanes, its regions [`REGIONS`].
+pub fn def(whens: Vec<Program>, sheet: Sheet, elements: Vec<ElementDef>) -> SkinDef {
+    SkinDef {
+        fit: Fit::Adapt,
+        regions: REGIONS,
+        whens,
+        sheet,
+        lanes: None,
+        elements,
+    }
+}
+
 /// A skin over [`white_sheet`].
 pub fn load(whens: Vec<Program>, elements: Vec<ElementDef>) -> Result<Skin, LoadError> {
-    Skin::new(whens, white_sheet(), elements)
+    Skin::new(def(whens, white_sheet(), elements))
 }
+
+/// What a frame shows the lanes by default: 600 ms visible, no covers.
+pub const VIEW: LaneView = LaneView {
+    visible_time: TimeUs(600 * MS),
+    cover: 0,
+    lift: 0,
+};
 
 /// The uv table of `skin`'s atlas at [`LIMITS`].
 pub fn uvs(skin: &Skin) -> UvTable {
@@ -214,6 +241,7 @@ pub fn element(timer: TimerRef, x: i32) -> ElementDef {
         visible: None,
         blend: Blend::Alpha,
         clip: None,
+        place: Place::SCREEN,
     }
 }
 
@@ -228,6 +256,10 @@ pub struct Harness {
     pub gauge: usize,
     pub offset: TimeUs,
     pub batch: QuadBatch,
+    pub complete: bool,
+    pub target: [u32; 2],
+    pub layout: Layout,
+    pub view: LaneView,
 }
 
 impl Harness {
@@ -243,6 +275,10 @@ impl Harness {
             gauge: 0,
             offset: TimeUs(0),
             batch,
+            complete: false,
+            target: [1_920, 1_080],
+            layout: Layout::AUTHOR,
+            view: VIEW,
         }
     }
 
@@ -261,6 +297,10 @@ impl Harness {
             gauges: &self.gauges,
             gauge: self.gauge,
             effects,
+            complete: self.complete,
+            target: self.target,
+            layout: &self.layout,
+            lanes: self.view,
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch);

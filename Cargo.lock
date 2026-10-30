@@ -2309,6 +2309,7 @@ name = "skin-model"
 version = "0.0.0"
 dependencies = [
  "bms-model",
+ "bms-parser",
  "etagere",
  "eval",
  "image",

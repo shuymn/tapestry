@@ -60,8 +60,8 @@ pub(crate) struct Hold {
 pub(crate) struct Reducer {
     /// Per lane and note: the long note's times, `None` for a tap or mine.
     longs: [Box<[Option<Long>]>; LANE_COUNT],
-    /// Per lane: the long notes whose head was held (`LnHeld`).
-    held: [Bits; LANE_COUNT],
+    /// Per lane: the notes no longer drawn, judged taps and hit mines.
+    done: [Bits; LANE_COUNT],
     pub(crate) hold: [Option<Hold>; LANE_COUNT],
     pub(crate) bomb: [Option<TimeUs>; LANE_COUNT],
     pub(crate) mine: [Option<TimeUs>; LANE_COUNT],
@@ -79,10 +79,10 @@ pub(crate) struct Reducer {
     empty_poor_breaks_combo: bool,
 }
 
-/// Whether a note from `time` to `end` is a target of `section`, as the
-/// evaluator decides it.
-pub(crate) fn is_target(section: Option<&Section>, time: TimeUs, end: TimeUs) -> bool {
-    section.is_none_or(|s| s.start <= time && time < s.end && end < s.end)
+/// Whether a note from `time` to `end` is a target of the section from
+/// `start` to `end` (every note without one), as the evaluator decides it.
+pub(crate) fn is_target(section: Option<(TimeUs, TimeUs)>, time: TimeUs, end: TimeUs) -> bool {
+    section.is_none_or(|(start, until)| start <= time && time < until && end < until)
 }
 
 impl Reducer {
@@ -99,7 +99,7 @@ impl Reducer {
         let mut targets: u32 = 0;
         for note in chart.lanes.iter().flatten() {
             if matches!(note.kind, NoteKind::Tap | NoteKind::Long { .. })
-                && is_target(section, note.time, note.end())
+                && is_target(section.map(|s| (s.start, s.end)), note.time, note.end())
             {
                 targets = targets.saturating_add(1);
             }
@@ -115,13 +115,13 @@ impl Reducer {
                     .collect()
             })
         });
-        let held = std::array::from_fn(|l| Bits::sized(chart.lanes.get(l).map_or(0, Vec::len)));
+        let done = std::array::from_fn(|l| Bits::sized(chart.lanes.get(l).map_or(0, Vec::len)));
         let (gauge_max, gauge_top): (Vec<_>, Vec<_>) = initial
             .map(|(value, top)| ((value >= top).then_some(ready_at), top))
             .unzip();
         Self {
             longs,
-            held,
+            done,
             hold: [None; LANE_COUNT],
             bomb: [None; LANE_COUNT],
             mine: [None; LANE_COUNT],
@@ -142,9 +142,11 @@ impl Reducer {
         self.targets
     }
 
-    /// Whether `note` on lane `l` was held (`LnHeld`).
-    pub(crate) fn held(&self, l: usize, note: usize) -> bool {
-        self.held.get(l).is_some_and(|b| b.get(note))
+    /// Whether `note` on lane `l` is no longer drawn: a judged tap or a
+    /// hit mine. A long note is never done; it is drawn until its end
+    /// passes the line.
+    pub(crate) fn done(&self, l: usize, note: usize) -> bool {
+        self.done.get(l).is_some_and(|b| b.get(note))
     }
 
     /// Applies one effect. Lanes come from [`bms_model::Lane`], so every
@@ -176,6 +178,9 @@ impl Reducer {
                 self.end_hold(l, note);
                 let long = self.long(l, note);
                 let Some(Long { head, end }) = long else {
+                    if let Some(bits) = self.done.get_mut(l) {
+                        bits.set(note);
+                    }
                     self.feedback(l, judgment, t);
                     return;
                 };
@@ -211,9 +216,6 @@ impl Reducer {
                 ..
             } => {
                 let l = lane.index();
-                if let Some(bits) = self.held.get_mut(l) {
-                    bits.set(note);
-                }
                 let long = self.long(l, note);
                 if let (Some(Long { end, .. }), Some(hold)) = (long, self.hold.get_mut(l)) {
                     *hold = Some(Hold {
@@ -226,9 +228,13 @@ impl Reducer {
                 self.feedback(l, judgment, t);
             }
             JudgeEventKind::LnHoldEnded { lane, note } => self.end_hold(lane.index(), note),
-            JudgeEventKind::MineHit { lane, .. } => {
-                if let Some(mine) = self.mine.get_mut(lane.index()) {
+            JudgeEventKind::MineHit { lane, note } => {
+                let l = lane.index();
+                if let Some(mine) = self.mine.get_mut(l) {
                     *mine = Some(t);
+                }
+                if let Some(bits) = self.done.get_mut(l) {
+                    bits.set(note);
                 }
             }
             JudgeEventKind::EmptyPoor { .. } => {
