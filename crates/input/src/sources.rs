@@ -161,6 +161,17 @@ pub struct SourceSet {
     /// Where the configured controller's menu controls go while recording
     /// is closed ([`set_menu`](Self::set_menu)).
     menu: Option<MenuTap>,
+    /// The mode `device.toml` sets for the bound axes of the configured
+    /// controller model ([`set_axis_mode`](Self::set_axis_mode)).
+    axis_mode: Option<AxisMode>,
+}
+
+/// The mode `device.toml` sets for a controller model's bound axes.
+#[derive(Debug)]
+struct AxisMode {
+    product: HidProduct,
+    controls: Vec<ControlId>,
+    relative: bool,
 }
 
 impl SourceSet {
@@ -191,6 +202,7 @@ impl SourceSet {
             batch_at: TimeUs(i64::MIN),
             recording: None,
             menu: None,
+            axis_mode: None,
         })
     }
 
@@ -481,6 +493,35 @@ impl SourceSet {
                 }
             }
         }
+    }
+
+    /// Sets whether the axes `controls` of every controller of `product`
+    /// report movement (`relative`) or position, whatever they declare: the
+    /// mode `device.toml` gives the axes bound to lanes, which their
+    /// conversion uses. Their reports are then filtered in that mode
+    /// ([`axis_relative`](Self::axis_relative)). Set it before the input
+    /// thread starts; it allocates.
+    pub fn set_axis_mode(&mut self, product: HidProduct, controls: Vec<ControlId>, relative: bool) {
+        self.axis_mode = Some(AxisMode {
+            product,
+            controls,
+            relative,
+        });
+    }
+
+    /// Whether the axis `cap` of `device` is taken as relative: the mode
+    /// [`set_axis_mode`](Self::set_axis_mode) sets for it, else the
+    /// declared one.
+    #[must_use]
+    pub fn axis_relative(&self, device: DeviceId, cap: &AxisCap) -> bool {
+        let set = self.axis_mode.as_ref().filter(|m| {
+            m.controls.contains(&cap.control)
+                && self
+                    .devices
+                    .iter()
+                    .any(|d| d.id == device && d.product == Some(m.product))
+        });
+        set.map_or(cap.relative, |m| m.relative)
     }
 
     /// Sets the axes of the connected `device` that the conversion takes
