@@ -14,7 +14,50 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Whether the change touches more than documentation (docs/ and Markdown
+  # files). The build jobs skip a documentation-only change; a skipped job
+  # passes as a required check, and `lint` still checks its banned words.
+  # Anything unclear (a manual run, an unknown range, a failure here) runs
+  # them.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      # The pull request's merge commit, whose first parent is the base it is
+      # tested against, or the history up to the pushed commit; trees only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+          filter: blob:none
+          persist-credentials: false
+      - name: Classify changed files
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request) base=HEAD^1 ;;
+            push) base=$BEFORE ;;
+            *) base= ;;
+          esac
+          # Exit 0 means no change outside the documentation; 1 (a change)
+          # and 128 (an unreadable range) run the build jobs. Without rename
+          # detection a file moved into docs/ also shows its old path.
+          code=true
+          if [ -n "$base" ] && git diff --quiet --no-renames "$base" HEAD -- . ':(exclude)docs/' ':(exclude)*.md'; then
+            code=false
+          fi
+          echo "code=$code"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   windows:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: windows-2025
     timeout-minutes: 45
     permissions:
@@ -97,6 +140,8 @@ jobs:
         run: mise exec -- cargo test -p player --features dev-tools --locked
 
   linux:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -117,8 +162,6 @@ jobs:
           actual=$(mise exec -- rustc --version | cut -d' ' -f2)
           test "$expected" = "$actual"
           mise exec -- rustc -Vv
-      - name: Banned words
-        run: mise exec -- cargo xtask banned-words --all
       - name: Format
         run: mise exec -- cargo fmt --all --check
       - name: Architecture rules
@@ -173,6 +216,8 @@ jobs:
   # "Server Architecture (Cloudflare)"). The target comes from mise.toml;
   # zstd-sys compiles its C sources with the runner image's clang.
   wasm:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -203,6 +248,8 @@ jobs:
   # from mise.lock, the wrapper's Linux path passes arguments and exit codes,
   # and short fuzz runs pass in the `fuzz` shell (docs/setup.md "Fuzzing").
   nix:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -226,14 +273,15 @@ jobs:
       - name: Fuzz (60 s per target, generated seeds)
         run: TAPESTRY_NIX_SHELL=fuzz scripts/wsl.sh scripts/fuzz.sh run-all 60 --seed 1
 
+  # Runs on every change, documentation included.
   lint:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
       # Only the tools in install_args are needed; keep `mise exec` from
-      # installing the rest (Rust) on demand.
+      # installing the rest on demand.
       MISE_EXEC_AUTO_INSTALL: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -243,8 +291,10 @@ jobs:
         with:
           version: 2026.10.3
           install: true
-          install_args: actionlint shellcheck
+          install_args: rust actionlint shellcheck
           cache: true
+      - name: Banned words
+        run: mise exec -- cargo xtask banned-words --all
       - name: actionlint
         run: mise exec -- actionlint
       - name: shellcheck
