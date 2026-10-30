@@ -855,7 +855,7 @@ Results and replays display and record where the values used came from ("preset 
 
 ### Settings Files
 
-- Settings are TOML in two files: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor) and `player.toml` (hi-speed, the preset file, the displayed gauge). Files are written atomically: to a temporary file, then renamed.
+- Settings are TOML in two files: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor, and the library roots under `[library] roots`, since they are per PC) and `player.toml` (hi-speed, the preset file, the displayed gauge). Files are written atomically: to a temporary file, then renamed.
 - Everything lives in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\` (with `custom.toml`), `records\`, `logs\` and `measure\`. Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large; one root keeps backup simple, and the scopes stay separated by file. The registry is not used: it is not human-editable and does not fit presets distributed as files.
 
 ## IR (Rankings)

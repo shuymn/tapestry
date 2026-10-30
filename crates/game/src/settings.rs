@@ -504,6 +504,17 @@ pub struct DeviceSettings {
     /// ([`QUEUED_PERIODS`]). A play with underruns after its countdown sets
     /// it to 3; only the player sets it back.
     pub queued_periods: u32,
+    /// The song library, `[library]`.
+    pub library: LibrarySettings,
+}
+
+/// `[library]` of `device.toml`: where this PC keeps its charts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LibrarySettings {
+    /// The folders scanned for charts, with every folder below them, as
+    /// written. Strings rather than paths, so every value has a TOML form.
+    pub roots: Vec<String>,
 }
 
 impl Default for DeviceSettings {
@@ -534,6 +545,7 @@ impl Default for DeviceSettings {
             master_volume: 1.0,
             scratch: ScratchConfig::default(),
             queued_periods: DEFAULT_QUEUED_PERIODS,
+            library: LibrarySettings::default(),
         }
     }
 }
