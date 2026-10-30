@@ -16,7 +16,8 @@
 //! - [`AudioEngine::step`] is one wake of the audio thread: it drains sound
 //!   commands, schedules BGM, and renders one block into an
 //!   [`AudioOutput`]. [`SimDevice`] and [`RecordingOutput`] stand in for the
-//!   device in tests and headless runs.
+//!   device in tests and headless runs. [`AudioEngine::seek`] starts a play
+//!   partway into its schedule, with the sounds still playing there.
 //!
 //! [`run_audio`] is the audio thread loop: one step per buffer event until
 //! asked to stop. On Windows, `WasapiShared` is the device: WASAPI shared

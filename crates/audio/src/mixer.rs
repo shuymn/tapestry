@@ -19,6 +19,13 @@
 //! once. The rule keys on the id, not on the stored sound: ids whose files
 //! have identical contents share a stored sound but still overlap.
 //!
+//! A seek (design.md "Audio") starts the output partway into a schedule: it
+//! decides every start, stop, cut and steal before the seek's frame as
+//! rendering would, without summing samples, and the voices left sounding
+//! there enter at that frame partway into their sounds and fades, in the
+//! slots rendering would have put them in. The output from that frame on is
+//! the output of rendering the whole schedule, sample for sample.
+//!
 //! The sum is never gain-ridden: a limiter that lowers the whole mix when a
 //! key sound pushes it over full scale would make the background audibly dip
 //! and pump back with every hit. Instead the sum takes a fixed [`HEADROOM`]
@@ -31,7 +38,7 @@
 use bms_model::SoundId;
 
 use crate::CHANNELS;
-use crate::bank::SoundBank;
+use crate::bank::{Sound, SoundBank};
 
 /// Voice cap.
 pub const MAX_VOICES: usize = 256;
@@ -54,10 +61,12 @@ struct Voice {
     id: SoundId,
     /// Index into the bank's stored sounds.
     sound: u32,
-    start: u64,
+    /// Output frame of its first sample: before frame 0 for a voice a seek
+    /// placed after a stream's first frames.
+    start: i64,
     seq: u64,
-    /// Fade-out start for a released voice; `u64::MAX` while playing.
-    cut: u64,
+    /// Fade-out start for a released voice; `i64::MAX` while playing.
+    cut: i64,
 }
 
 impl Voice {
@@ -68,8 +77,150 @@ impl Voice {
         sound: 0,
         start: 0,
         seq: 0,
-        cut: u64::MAX,
+        cut: i64::MAX,
     };
+
+    /// The frame after its last sample, or after its fade for a release.
+    fn end(&self, sound: &Sound, fade: usize) -> i64 {
+        let frames = i64::try_from(sound.frames()).unwrap_or(i64::MAX);
+        let fade = i64::try_from(fade).unwrap_or(i64::MAX);
+        self.start
+            .saturating_add(frames)
+            .min(self.cut.saturating_add(fade))
+    }
+
+    /// The voice `by` frames later.
+    fn shifted(self, by: i64) -> Self {
+        let cut = if self.cut == i64::MAX {
+            i64::MAX
+        } else {
+            self.cut.saturating_add(by)
+        };
+        Self {
+            start: self.start.saturating_add(by),
+            cut,
+            ..self
+        }
+    }
+}
+
+/// An output frame as a voice frame (output frames stay far below
+/// `i64::MAX`: 6 million years at 48 kHz).
+fn signed(frame: u64) -> i64 {
+    i64::try_from(frame).unwrap_or(i64::MAX)
+}
+
+/// What starting voices counted.
+#[derive(Clone, Copy, Debug, Default)]
+struct Counts {
+    steals: u64,
+    cuts: u64,
+    hard_cuts: u64,
+}
+
+/// Voice slots and as many release slots. Which slot a voice takes decides
+/// the order the mix adds voices in, so a seek keeps it.
+#[derive(Clone, Debug)]
+struct Slots {
+    voices: Vec<Voice>,
+    releases: Vec<Voice>,
+}
+
+impl Slots {
+    fn new(voices: usize) -> Self {
+        Self {
+            voices: vec![Voice::IDLE; voices],
+            releases: vec![Voice::IDLE; voices],
+        }
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Voice> {
+        self.voices.iter().chain(&self.releases)
+    }
+
+    fn all_mut(&mut self) -> impl Iterator<Item = &mut Voice> {
+        self.voices.iter_mut().chain(&mut self.releases)
+    }
+
+    fn sounding(&self) -> usize {
+        self.all().filter(|v| v.active).count()
+    }
+
+    fn stop(&mut self) {
+        for v in self.all_mut() {
+            v.active = false;
+        }
+    }
+
+    /// Puts a start into a voice slot, at its start frame: the slot of the
+    /// voice its id stops, else a free one, else the oldest voice's.
+    fn apply(&mut self, voice: Voice, counts: &mut Counts) {
+        let mut slot = None;
+        for (i, v) in self.voices.iter_mut().enumerate() {
+            if v.active && v.id == voice.id {
+                v.active = false;
+                counts.cuts += 1;
+                slot.get_or_insert(i);
+            }
+        }
+        for r in &mut self.releases {
+            if r.active && r.id == voice.id {
+                r.active = false;
+                counts.cuts += 1;
+            }
+        }
+        let slot = slot.or_else(|| self.voices.iter().position(|v| !v.active));
+        if let Some(free) = slot.and_then(|i| self.voices.get_mut(i)) {
+            *free = voice;
+            return;
+        }
+        let Some(oldest) = self.voices.iter_mut().min_by_key(|v| (v.start, v.seq)) else {
+            return;
+        };
+        let victim = std::mem::replace(oldest, voice);
+        counts.steals += 1;
+        // A victim starting here too has not sounded: it is dropped.
+        if victim.start < voice.start {
+            self.release(victim, voice.start, counts);
+        }
+    }
+
+    /// Moves a stolen voice to a release slot fading out from `cut`.
+    fn release(&mut self, victim: Voice, cut: i64, counts: &mut Counts) {
+        if let Some(free) = self.releases.iter_mut().find(|r| !r.active) {
+            *free = Voice { cut, ..victim };
+            return;
+        }
+        counts.hard_cuts += 1;
+        // The release furthest into its fade is the quietest.
+        if let Some(quietest) = self.releases.iter_mut().min_by_key(|r| r.cut) {
+            *quietest = Voice { cut, ..victim };
+        }
+    }
+
+    /// Frees what [`Mixer::render`] frees when it mixes up to `to`: every
+    /// voice and release started before `to` that has ended by it or whose
+    /// sound is missing.
+    fn retire(&mut self, bank: &SoundBank, fade: usize, to: i64) {
+        for v in self.all_mut().filter(|v| v.active && v.start < to) {
+            match bank.stored(v.sound) {
+                Some(sound) if v.end(sound, fade) > to => {}
+                _ => v.active = false,
+            }
+        }
+    }
+}
+
+/// Where a seek's voices are.
+#[derive(Clone, Copy, Debug)]
+enum Seek {
+    /// No seek is waiting.
+    Idle,
+    /// The voices sounding at frame `at` of the seek's own mapping wait in
+    /// the parked slots.
+    Parked { at: i64 },
+    /// They enter at output frame `from`, `by` frames later than parked.
+    Placed { from: i64, by: i64 },
 }
 
 /// A volume outside `0.0..=MAX_VOLUME` (NaN included).
@@ -96,12 +247,14 @@ pub fn soft_clip(x: f32) -> f32 {
     (SOFT_CLIP_KNEE + span * ((a - SOFT_CLIP_KNEE) / span).tanh()).copysign(x)
 }
 
-/// The mixer. Everything is allocated in [`Mixer::new`]; triggering and
-/// rendering allocate nothing.
+/// The mixer. Everything is allocated in [`Mixer::new`]; triggering,
+/// seeking and rendering allocate nothing.
 #[derive(Clone, Debug)]
 pub struct Mixer {
-    voices: Vec<Voice>,
-    releases: Vec<Voice>,
+    live: Slots,
+    /// A seek's voices until their frame is reached.
+    parked: Slots,
+    seek: Seek,
     /// Starts not yet applied, latest first (the next one is last).
     pending: Vec<Voice>,
     /// Gain over the fade, from just below 1 down to 0.
@@ -112,9 +265,7 @@ pub struct Mixer {
     volume: f32,
     /// Samples above [`SOFT_CLIP_KNEE`] after the volume and headroom.
     saturated: u64,
-    steals: u64,
-    cuts: u64,
-    hard_cuts: u64,
+    counts: Counts,
     dropped_starts: u64,
 }
 
@@ -131,17 +282,16 @@ impl Mixer {
             })
             .collect();
         Self {
-            voices: vec![Voice::IDLE; voices],
-            releases: vec![Voice::IDLE; voices],
+            live: Slots::new(voices),
+            parked: Slots::new(voices),
+            seek: Seek::Idle,
             pending: Vec::with_capacity(MAX_PENDING_STARTS),
             fade,
             mixed_to: 0,
             seq: 0,
             volume: 1.0,
             saturated: 0,
-            steals: 0,
-            cuts: 0,
-            hard_cuts: 0,
+            counts: Counts::default(),
             dropped_starts: 0,
         }
     }
@@ -155,31 +305,33 @@ impl Mixer {
     /// Voices playing, release slots and pending starts excluded.
     #[must_use]
     pub fn active(&self) -> usize {
-        self.voices.iter().filter(|v| v.active).count()
+        self.live.voices.iter().filter(|v| v.active).count()
     }
 
-    /// Voices, fading releases and pending starts still to sound.
+    /// Voices, fading releases, pending starts and a seek's waiting voices
+    /// still to sound.
     #[must_use]
     pub fn sounding(&self) -> usize {
-        self.active() + self.releases.iter().filter(|v| v.active).count() + self.pending.len()
+        // The parked slots are idle without a seek waiting.
+        self.live.sounding() + self.pending.len() + self.parked.sounding()
     }
 
     /// Voices stolen so far because every voice was busy.
     #[must_use]
     pub fn steals(&self) -> u64 {
-        self.steals
+        self.counts.steals
     }
 
     /// Voices and releases stopped so far by a start of their own sound id.
     #[must_use]
     pub fn cuts(&self) -> u64 {
-        self.cuts
+        self.counts.cuts
     }
 
     /// Fading releases cut off because every release slot was busy.
     #[must_use]
     pub fn hard_cuts(&self) -> u64 {
-        self.hard_cuts
+        self.counts.hard_cuts
     }
 
     /// Starts dropped because [`MAX_PENDING_STARTS`] were already waiting.
@@ -222,11 +374,11 @@ impl Mixer {
         Ok(())
     }
 
-    /// Stops every voice, release and pending start (a retry).
+    /// Stops every voice, release, pending start and seek (a retry).
     pub fn stop_all(&mut self) {
-        for v in self.voices.iter_mut().chain(self.releases.iter_mut()) {
-            v.active = false;
-        }
+        self.live.stop();
+        self.parked.stop();
+        self.seek = Seek::Idle;
         self.pending.clear();
     }
 
@@ -250,73 +402,88 @@ impl Mixer {
             active: true,
             id,
             sound,
-            start,
+            start: signed(start),
             seq: self.seq,
-            cut: u64::MAX,
+            cut: i64::MAX,
         };
-        let key = (start, self.seq);
+        let key = (voice.start, self.seq);
         let i = self.pending.partition_point(|p| (p.start, p.seq) > key);
         self.pending.insert(i, voice);
         Some(start)
     }
 
-    /// Puts a pending start into a voice slot, at its start frame: the slot
-    /// of the voice its id stops, else a free one, else the oldest voice's.
-    fn apply(&mut self, voice: Voice) {
-        let mut slot = None;
-        for (i, v) in self.voices.iter_mut().enumerate() {
-            if v.active && v.id == voice.id {
-                v.active = false;
-                self.cuts += 1;
-                slot.get_or_insert(i);
+    /// Prepares a seek to frame `at`: stops everything, then works out the
+    /// voices and releases that `starts` (ids at frames, in time order,
+    /// each before `at`, on a frame line of the caller's) leave sounding at
+    /// `at`, and where each is in its sound or fade. Every start, stop,
+    /// cut and steal is decided as [`Mixer::render`] decides it, voice slots
+    /// included, but no sample is summed, and these steals and cuts are not
+    /// counted. Nothing sounds until [`Mixer::place`] puts frame `at` on
+    /// the output.
+    pub fn seek(
+        &mut self,
+        bank: &SoundBank,
+        starts: impl IntoIterator<Item = (SoundId, i64)>,
+        at: i64,
+    ) {
+        self.stop_all();
+        let fade = self.fade.len();
+        let mut unheard = Counts::default();
+        let mut pos = i64::MIN;
+        for (id, frame) in starts {
+            if frame >= at {
+                break;
             }
-        }
-        for r in &mut self.releases {
-            if r.active && r.id == voice.id {
-                r.active = false;
-                self.cuts += 1;
+            let Some(sound) = bank.slot(id) else { continue };
+            if frame > pos {
+                self.parked.retire(bank, fade, frame);
+                pos = frame;
             }
+            self.seq += 1;
+            let voice = Voice {
+                active: true,
+                id,
+                sound,
+                start: frame,
+                seq: self.seq,
+                cut: i64::MAX,
+            };
+            self.parked.apply(voice, &mut unheard);
         }
-        let slot = slot.or_else(|| self.voices.iter().position(|v| !v.active));
-        if let Some(free) = slot.and_then(|i| self.voices.get_mut(i)) {
-            *free = voice;
-            return;
-        }
-        let Some(oldest) = self.voices.iter_mut().min_by_key(|v| (v.start, v.seq)) else {
-            return;
-        };
-        let victim = std::mem::replace(oldest, voice);
-        self.steals += 1;
-        // A victim starting here too has not sounded: it is dropped.
-        if victim.start < voice.start {
-            self.release(victim, voice.start);
+        self.parked.retire(bank, fade, at);
+        self.seek = Seek::Parked { at };
+    }
+
+    /// Puts the frame a [`seek`](Mixer::seek) prepared at output frame
+    /// `frame`: its voices enter there, each partway into its sound or fade
+    /// as far as that frame is past its start, or at the first frame not
+    /// yet rendered if `frame` is already rendered. Starts pending before
+    /// that frame still apply, and what they start stops there. Does
+    /// nothing without a prepared seek.
+    pub fn place(&mut self, frame: i64) {
+        if let Seek::Parked { at } = self.seek {
+            self.seek = Seek::Placed {
+                from: frame.max(signed(self.mixed_to)),
+                by: frame.saturating_sub(at),
+            };
         }
     }
 
-    /// Moves a stolen voice to a release slot fading out from `cut`.
-    fn release(&mut self, victim: Voice, cut: u64) {
-        if let Some(free) = self.releases.iter_mut().find(|r| !r.active) {
-            *free = Voice { cut, ..victim };
-            return;
+    /// Replaces every voice and release with the seek's, moved `by` frames.
+    fn enter(&mut self, by: i64) {
+        for (v, p) in self.live.all_mut().zip(self.parked.all_mut()) {
+            *v = p.shifted(by);
+            p.active = false;
         }
-        self.hard_cuts += 1;
-        // The release furthest into its fade is the quietest.
-        if let Some(quietest) = self.releases.iter_mut().min_by_key(|r| r.cut) {
-            *quietest = Voice { cut, ..victim };
-        }
+        self.seek = Seek::Idle;
     }
 
     /// Adds every voice and release into `out` (whose first frame is
     /// `block_start`) over frames `from..to`. Voices that end by `to` are
     /// freed.
-    fn mix(&mut self, bank: &SoundBank, out: &mut [f32], block_start: u64, from: u64, to: u64) {
+    fn mix(&mut self, bank: &SoundBank, out: &mut [f32], block_start: i64, from: i64, to: i64) {
         let fade = &self.fade;
-        for v in self
-            .voices
-            .iter_mut()
-            .chain(self.releases.iter_mut())
-            .filter(|v| v.active)
-        {
+        for v in self.live.all_mut().filter(|v| v.active) {
             if v.start >= to {
                 continue;
             }
@@ -325,7 +492,7 @@ impl Mixer {
                 continue;
             };
             let first = v.start.max(from);
-            let src_end = (v.start + sound.frames()).min(v.cut.saturating_add(fade.len() as u64));
+            let src_end = v.end(sound, fade.len());
             let last = src_end.min(to);
             for s in first..last {
                 #[expect(
@@ -356,23 +523,36 @@ impl Mixer {
 
     /// Renders the next `out.len() / 2` frames into interleaved stereo
     /// `out` (overwritten), starting at [`Mixer::mixed_to`]: every voice
-    /// summed, with each pending start applied when its frame is reached,
-    /// then the volume, [`HEADROOM`] and [`soft_clip`].
+    /// summed, with each pending start applied and a placed seek's voices
+    /// entered when their frame is reached (the seek first), then the
+    /// volume, [`HEADROOM`] and [`soft_clip`].
     pub fn render(&mut self, bank: &SoundBank, out: &mut [f32]) {
         out.fill(0.0);
-        let block_start = self.mixed_to;
-        let block_end = block_start + (out.len() / CHANNELS) as u64;
+        let block_start = signed(self.mixed_to);
+        let block_end = block_start + (out.len() / CHANNELS) as i64;
         let mut pos = block_start;
         loop {
             let next = self.pending.last().filter(|p| p.start < block_end).copied();
-            let until = next.map_or(block_end, |p| p.start);
+            let seek = match self.seek {
+                Seek::Placed { from, by } if from < block_end => Some((from, by)),
+                _ => None,
+            };
+            let until = next
+                .map_or(block_end, |p| p.start)
+                .min(seek.map_or(block_end, |(from, _)| from));
             if until > pos {
                 self.mix(bank, out, block_start, pos, until);
                 pos = until;
             }
+            if let Some((from, by)) = seek
+                && from <= until
+            {
+                self.enter(by);
+                continue;
+            }
             let Some(voice) = next else { break };
             self.pending.pop();
-            self.apply(voice);
+            self.live.apply(voice, &mut self.counts);
         }
         let gain = self.volume * HEADROOM;
         for x in out.iter_mut() {
@@ -382,7 +562,7 @@ impl Mixer {
             }
             *x = soft_clip(y);
         }
-        self.mixed_to = block_end;
+        self.mixed_to = block_end as u64;
     }
 }
 

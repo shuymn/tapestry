@@ -93,6 +93,12 @@ pub enum EngineError {
     },
 }
 
+/// Where chart time `t` of a play whose chart time 0 lies at `origin` is due
+/// on the output's timeline, `offset` early.
+fn output_time(origin: TimeUs, offset: TimeUs, t: TimeUs) -> TimeUs {
+    TimeUs(origin.0.saturating_add(t.0).saturating_sub(offset.0))
+}
+
 /// The audio engine: mixer, mix clock and BGM schedule. Everything is
 /// allocated in [`AudioEngine::new`]; [`AudioEngine::step`] allocates
 /// nothing.
@@ -107,6 +113,8 @@ pub struct AudioEngine {
     output_offset: TimeUs,
     /// Where chart time 0 lies on the output's timeline.
     play_origin: TimeUs,
+    /// The chart time a seek starts at, until its frame is placed.
+    seek_to: Option<TimeUs>,
     scheduled: Vec<Scheduled>,
     scheduled_dropped: u64,
     underruns: u64,
@@ -166,6 +174,7 @@ impl AudioEngine {
             next_bgm: 0,
             output_offset: TimeUs(0),
             play_origin: TimeUs(0),
+            seek_to: None,
             scheduled: Vec::with_capacity(schedule_log),
             scheduled_dropped: 0,
             underruns: 0,
@@ -232,7 +241,32 @@ impl AudioEngine {
     pub fn restart(&mut self, origin: TimeUs) {
         self.mixer.stop_all();
         self.next_bgm = 0;
+        self.seek_to = None;
         self.play_origin = origin;
+    }
+
+    /// Starts the play at chart time `t` instead of its beginning, for a
+    /// mid-chart start (design.md "Audio"); call it after
+    /// [`restart`](Self::restart). From the output frame of `t` on, the
+    /// output is what playing the schedule from chart time 0 gives there,
+    /// sample for sample, as long as the mix clock's mapping holds from
+    /// this call until that frame. The schedule's starts
+    /// before that frame are worked out here without summing a sample
+    /// ([`Mixer::seek`]), so they are neither logged nor counted as BGM
+    /// started; the voices still sounding at it, each partway into its
+    /// sound, enter at it. Starts from that frame on play as usual. Nothing
+    /// sounds before it, and a key sound started before it stops there. The
+    /// work grows with the starts before `t` times the voices; it allocates
+    /// nothing.
+    pub fn seek(&mut self, t: TimeUs) {
+        let (clock, origin, offset) = (&self.clock, self.play_origin, self.output_offset);
+        let at = |x: TimeUs| clock.frame_line(output_time(origin, offset, x));
+        let to = at(t);
+        let split = self.bgm.partition_point(|e| at(e.time) < to);
+        let starts = self.bgm.iter().take(split).map(|e| (e.sound, at(e.time)));
+        self.mixer.seek(&self.bank, starts, to);
+        self.next_bgm = split;
+        self.seek_to = Some(t);
     }
 
     /// BGM events not yet started.
@@ -246,6 +280,7 @@ impl AudioEngine {
     pub fn stop(&mut self) {
         self.mixer.stop_all();
         self.next_bgm = self.bgm.len();
+        self.seek_to = None;
     }
 
     /// Calls `f` with each scheduled start kept since the last drain, then
@@ -323,8 +358,18 @@ impl AudioEngine {
         let mut deferred = !self.mixer.can_start() && !cmds.is_empty();
         out.write(|buf| {
             let block_end = self.written() + (buf.len() / CHANNELS) as u64;
+            if let Some(t) = self.seek_to {
+                // Placed by the clock of the block that reaches it, as a
+                // BGM event at `t` is.
+                let at = output_time(self.play_origin, self.output_offset, t);
+                let frame = self.clock.frame_line(at);
+                if frame < i64::try_from(block_end).unwrap_or(i64::MAX) {
+                    self.mixer.place(frame);
+                    self.seek_to = None;
+                }
+            }
             while let Some(&event) = self.bgm.get(self.next_bgm) {
-                let at = TimeUs(self.play_origin.0 + event.time.0 - self.output_offset.0);
+                let at = output_time(self.play_origin, self.output_offset, event.time);
                 let target = self.clock.frame_at(at).unwrap_or(0);
                 if target >= block_end {
                     break;

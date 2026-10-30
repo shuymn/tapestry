@@ -1,5 +1,5 @@
 //! Once built, the engine allocates nothing per step: draining commands,
-//! scheduling BGM, cutting a sound's earlier instance, stealing voices,
+//! scheduling BGM, seeking, cutting a sound's earlier instance, stealing voices,
 //! mixing, soft clipping and writing; nor does
 //! the audio thread loop around it.
 //!
@@ -109,6 +109,17 @@ fn mixing_does_not_allocate() {
         commands += r.commands;
         e.drain_scheduled(|_| {});
     }
+    // A seek to chart time 15 s, due 100 ms from now, into the middle of a
+    // BGM sound; the play goes on from there.
+    let now = out.inner().next_wake();
+    e.restart(TimeUs(now.0 - 15_000_000 + 100_000));
+    e.seek(TimeUs(15_000_000));
+    let sought = e.bgm_left();
+    let mut entered = false;
+    for _ in 0..50 {
+        e.step(&mut out, &mut rx).unwrap();
+        entered |= e.mixer().active() > 0;
+    }
     let stop = AtomicBool::new(false);
     let mut looped = StopAfter {
         inner: &mut out,
@@ -126,5 +137,8 @@ fn mixing_does_not_allocate() {
     assert!(e.mixer().steals() > 1_000, "{}", e.mixer().steals());
     assert!(e.mixer().cuts() >= u64::from(STEPS), "{}", e.mixer().cuts());
     assert!(e.mixer().saturated() > 0);
+    // The events before 15 s were passed over, and voices sounded after.
+    assert_eq!(sought, 1_500 - 750);
+    assert!(entered);
     assert_eq!(counting::allocations(), 0);
 }
