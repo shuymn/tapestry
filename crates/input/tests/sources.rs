@@ -1007,3 +1007,28 @@ fn autoplay_refuses_times_outside_the_range() {
         ])
     );
 }
+
+/// A queue capacity set between plays sizes the queues of the next opening:
+/// a stream that overflows the old size fits the new one.
+#[test]
+fn a_set_queue_capacity_sizes_the_next_openings_queues() {
+    let mut set = SourceSet::new(SourceConfig {
+        queue_capacity: 2,
+        ..config()
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    plug(&mut set, DeviceId(0), DeviceKind::Keyboard);
+    set.end_batch(TimeUs(0));
+    let presses = [key(0, A, 1), key(0, A, 0), key(0, B, 1), key(0, B, 0)];
+    set.open_recording(TimeUs(0));
+    batch(&mut set, 1, &presses, 2);
+    assert!(set.overflowed());
+    set.close_recording();
+    set.set_queue_capacity(4);
+    set.open_recording(TimeUs(10));
+    let mut readers = set.take_readers();
+    batch(&mut set, 11, &presses, 12);
+    assert!(!set.overflowed());
+    assert_eq!(drain(&mut readers[0]).len(), 4);
+}
