@@ -3,8 +3,9 @@
 //! within its stated bound.
 //!
 //! A global allocator tracks the peak of live bytes allocated while a
-//! thread opts in. Each allocation carries a header saying whether it was
-//! made while tracking, so only those are subtracted when freed; a
+//! thread opts in. Each allocation carries a header naming the measurement
+//! it was made in (0 for none), so only frees of the current measurement's
+//! allocations are subtracted, wherever and whenever they happen; a
 //! reallocation counts as a new allocation and a free. Measurements take a
 //! lock, so tests in this file do not disturb each other's counts.
 
@@ -15,7 +16,7 @@ use std::cell::Cell;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, RgbImage};
@@ -32,13 +33,15 @@ struct Peak;
 
 static LIVE: AtomicI64 = AtomicI64::new(0);
 static PEAK: AtomicI64 = AtomicI64::new(0);
+/// The current measurement; 0 before the first.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SERIAL: Mutex<()> = Mutex::new(());
 
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Room before each allocation for its flag, at least the alignment.
+/// Room before each allocation for its tag, at least the alignment.
 const HEAD: usize = 16;
 
 fn tracking() -> bool {
@@ -68,15 +71,17 @@ unsafe impl GlobalAlloc for Peak {
         if base.is_null() {
             return base;
         }
-        let tracked = tracking();
-        // SAFETY: `head` bytes lie before the returned block, the flag in
+        let tag = if tracking() {
+            add(layout.size());
+            GENERATION.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        // SAFETY: `head` bytes lie before the returned block, the tag in
         // its last 8, aligned to 8.
         unsafe {
             let user = base.add(head);
-            user.sub(8).cast::<u64>().write(u64::from(tracked));
-            if tracked {
-                add(layout.size());
-            }
+            user.sub(8).cast::<u64>().write(tag);
             user
         }
     }
@@ -85,7 +90,8 @@ unsafe impl GlobalAlloc for Peak {
         let (outer, head) = outer(layout);
         // SAFETY: `ptr` came from `alloc` with this layout.
         unsafe {
-            if ptr.sub(8).cast::<u64>().read() == 1 {
+            let tag = ptr.sub(8).cast::<u64>().read();
+            if tag != 0 && tag == GENERATION.load(Ordering::Relaxed) {
                 LIVE.fetch_sub(i64::try_from(layout.size()).unwrap_or(0), Ordering::Relaxed);
             }
             System.dealloc(ptr.sub(head), outer);
@@ -96,17 +102,43 @@ unsafe impl GlobalAlloc for Peak {
 #[global_allocator]
 static GLOBAL: Peak = Peak;
 
-/// Runs `f` tracked; returns its result and the peak of live bytes.
-fn measure<T>(f: impl FnOnce() -> T) -> (T, i64) {
+/// Stops tracking when dropped, also on unwinding.
+struct Tracking;
+
+impl Tracking {
+    fn start() -> Self {
+        TRACK.with(|t| t.set(true));
+        Self
+    }
+}
+
+impl Drop for Tracking {
+    fn drop(&mut self) {
+        TRACK.with(|t| t.set(false));
+    }
+}
+
+/// Runs `f` tracked as a new measurement; returns its result and the peak
+/// of live bytes. `check` runs on the result under the same lock, after
+/// tracking stops, so counter reads see only this measurement.
+fn measure_then<T>(f: impl FnOnce() -> T, check: impl FnOnce(&T)) -> (T, i64) {
     let _guard = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
     LIVE.store(0, Ordering::Relaxed);
     PEAK.store(0, Ordering::Relaxed);
-    TRACK.with(|t| t.set(true));
-    let out = f();
-    TRACK.with(|t| t.set(false));
+    let out = {
+        let _tracking = Tracking::start();
+        f()
+    };
+    check(&out);
     (out, PEAK.load(Ordering::Relaxed))
+}
+
+/// [`measure_then`] with no check.
+fn measure<T>(f: impl FnOnce() -> T) -> (T, i64) {
+    measure_then(f, |_| {})
 }
 
 const MIB: i64 = 1 << 20;
@@ -114,14 +146,28 @@ const AT0: FileAt = FileAt { file: 0, hi: false };
 
 #[test]
 fn the_count_works() {
-    let ((), peak) = measure(|| {
-        let v = std::hint::black_box(vec![1_u8; 3 << 20]);
-        drop(v);
-        let w = std::hint::black_box(vec![1_u8; 1 << 20]);
-        drop(w);
-    });
+    let ((), peak) = measure_then(
+        || {
+            let v = std::hint::black_box(vec![1_u8; 3 << 20]);
+            drop(v);
+            let w = std::hint::black_box(vec![1_u8; 1 << 20]);
+            drop(w);
+        },
+        |()| assert_eq!(LIVE.load(Ordering::Relaxed), 0),
+    );
     assert_eq!(peak, 3 * MIB);
-    assert_eq!(LIVE.load(Ordering::Relaxed), 0);
+    // A result that outlives its measurement is not charged to the next
+    // one when it is freed there.
+    let (kept, _) = measure(|| std::hint::black_box(vec![1_u8; 2 << 20]));
+    let ((), peak) = measure_then(
+        || {
+            let v = std::hint::black_box(vec![1_u8; 1 << 20]);
+            drop(kept);
+            drop(v);
+        },
+        |()| assert_eq!(LIVE.load(Ordering::Relaxed), 0),
+    );
+    assert_eq!(peak, MIB);
 }
 
 /// Loads `names` tracked; the peak must stay under 8 MiB.
