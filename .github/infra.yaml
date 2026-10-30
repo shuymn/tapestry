@@ -70,6 +70,8 @@ spec:
               app: github-actions
             - context: nix
               app: github-actions
+            - context: wasm
+              app: github-actions
             - context: lint
               app: github-actions
   actions:

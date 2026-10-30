@@ -44,13 +44,13 @@ The Rust version is also pinned with mise. Do not add a language-specific versio
 
 ```toml
 [tools]
-rust = { version = "1", profile = "minimal", components = "rustfmt,clippy" }
+rust = { version = "1", profile = "minimal", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown" }
 ```
 
 - mise installs Rust using rustup and selects the version by setting `RUSTUP_TOOLCHAIN`. So calling `cargo` without going through mise does not give you the version pinned in this repository. Call it as `mise exec -- cargo ...`, or work in a shell with mise activated.
-- On both Windows and Linux (locally and in CI), mise selects the version in `mise.lock` with the `minimal` profile plus `rustfmt` and `clippy`.
+- On both Windows and Linux (locally and in CI), mise selects the version in `mise.lock` with the `minimal` profile plus `rustfmt` and `clippy` and the `wasm32-unknown-unknown` target.
 - Without mise, install the version written in `mise.lock` with rustup and call `cargo +<version> ...`.
-- Additional targets (such as `wasm32-unknown-unknown`) are added in the stage that uses them.
+- `targets` adds `wasm32-unknown-unknown` for the crates the IR server runs as WASM (`eval`, `bms-parser`, `replay`; design.md "Server Architecture (Cloudflare)"). `zstd-sys` (through `replay`) compiles C for that target with `clang`: Apple clang works on macOS, and Linux needs a `clang` on `PATH` (the Ubuntu runner image has one). Other targets are added in the stage that uses them.
 - Clippy reads the nearest `clippy.toml`: the workspace root's sets the test allowances, and `crates/eval/clippy.toml` repeats them and adds the evaluator's disallowed `std` APIs. `cargo xtask check-lints` checks that the two agree.
 
 ### Hooks
@@ -120,7 +120,7 @@ The property tests (`crates/eval/tests/props.rs`, `crates/replay/tests/round_tri
 | Runner | What it does |
 | --- | --- |
 | Windows (label with an explicit OS version) | Production build (pinned to a configuration with `dev-tools` disabled), verifying that development features are not included, the render benchmark run once, the render staging allocation test in the release profile, rendering image comparison with WARP, Windows tests, including the scripted plays' check of the render thread's app region allocations (`dev-tools`) |
-| Linux | Builds and tests of crates that do not depend on Windows, the `eval`, `bms-parser` and `library` benchmarks run once, the allocation tests of `eval`, `input`, `game` and `audio` again in the release profile, the fuzz crate's format, clippy and seed smoke tests, banned-word check, lint fixtures (`cargo xtask check-lints`), dependency checks of both lockfiles (`cargo-deny`, `cargo-audit`, `cargo-machete`; "Dependency Checks" below), tests in the Nix development shell through `scripts/wsl.sh`, and in the same `nix` job the fuzz self-test and short fuzzing runs (60 s per target, a fixed libFuzzer seed, in the `fuzz` shell) |
+| Linux | Builds and tests of crates that do not depend on Windows, the `eval`, `bms-parser` and `library` benchmarks run once, the allocation tests of `eval`, `input`, `game` and `audio` again in the release profile, the fuzz crate's format, clippy and seed smoke tests, the release build of `eval`, `bms-parser` and `replay` for `wasm32-unknown-unknown` (the `wasm` job), banned-word check, lint fixtures (`cargo xtask check-lints`), dependency checks of both lockfiles (`cargo-deny`, `cargo-audit`, `cargo-machete`; "Dependency Checks" below), tests in the Nix development shell through `scripts/wsl.sh`, and in the same `nix` job the fuzz self-test and short fuzzing runs (60 s per target, a fixed libFuzzer seed, in the `fuzz` shell) |
 
 - Both runners install tools from the same `mise.lock` (`jdx/mise-action`). Run the install step even after restoring the cache, and verify the Rust version in use.
 - `.github/workflows/fuzz.yml` fuzzes each target for 900 s daily (and on manual dispatch with another duration), with the same per-input limits, starting from the generated seeds; pull requests that change the workflow, `scripts/fuzz.sh` or `flake.nix` run it for 60 s. It is not a required check. Its scheduled runs notify and are disabled after 60 idle days as `audit.yml`'s are ("Dependency Checks" below).
@@ -137,7 +137,7 @@ CPU-side time ([design.md](design.md), "Measurement") is measured with `criterio
 | --- | --- | --- |
 | `eval` | `benches/evaluate.rs` | `evaluate` over generated 2,000- and 10,000-note charts with dense input, and the same plays advanced live in 1 ms steps |
 | `bms-parser` | `benches/load.rs` | `load_bms` on generated text with thousands of BPM changes |
-| `library` | `benches/scan.rs` | `read_header` on a dense generated chart, and a full scan of 300 generated chart files into a new database |
+| `library` | `benches/scan.rs` | `read_header` on a dense generated chart, a full scan of 300 generated chart files into a new database, and searches and sorts over an index of 50,000 generated header-only charts (one scanned, the rest written straight into the database, since writing and scanning 50,000 files takes minutes) |
 | `render` (Windows only) | `benches/skin.rs` | `SimpleSkin::build` on a dense frame, without a GPU |
 
 - Run them with `mise exec -- cargo bench -p eval -p bms-parser -p library` and `mise exec -- cargo bench -p render`. Add `-- --test` to run each once without measuring, as CI does so they do not rot. To compare two commits locally, run `cargo bench -p eval -p bms-parser -p library --bench evaluate --bench load --bench scan -- --save-baseline <name>` on one and `-- --baseline <name>` on the other (naming the benches keeps the unit-test harnesses, which do not take criterion's options, out of the run).
