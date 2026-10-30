@@ -21,8 +21,9 @@ input = { path = "crates/input" }
 game = { path = "crates/game" }
 audio = { path = "crates/audio" }
 render = { path = "crates/render" }
+library = { path = "crates/library" }
 
-# bms-parser
+# bms-parser (md-5 also library)
 chardetng = "1.0.0"
 md-5 = { version = "0.11.0", default-features = false }
 num-bigint = { version = "0.4.8", default-features = false }
@@ -30,13 +31,13 @@ num-integer = { version = "0.1.47", default-features = false }
 num-rational = { version = "0.4.2", default-features = false, features = ["num-bigint"] }
 num-traits = { version = "0.2.19", default-features = false }
 
-# bms-parser, replay and audio, and render (dev only)
+# bms-parser, library, replay and audio, and render (dev only)
 sha2 = { version = "0.11.1", default-features = false }
 
 # replay
 zstd = { version = "0.14.3", default-features = false }
 
-# eval, bms-parser and render (dev only): benchmarks (docs/setup.md "Benchmarks")
+# eval, bms-parser, library and render (dev only): benchmarks (docs/setup.md "Benchmarks")
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 # eval and replay (dev only): property tests
@@ -57,7 +58,10 @@ triple_buffer = "9.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 
-# game and xtask, and replay and eval-cli (dev only)
+# library: the library database (bundled SQLite, with FTS5 for search)
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
+
+# game, library and xtask, and replay and eval-cli (dev only)
 tempfile = "3.27.0"
 
 # player and eval-cli
@@ -78,10 +82,10 @@ glyphon = "0.12.0"
 # render (dev only): the expected images of the WARP tests
 png = "0.18.1"
 
-# bms-parser and xtask
+# bms-parser and xtask, library (dev only)
 encoding_rs = "0.8.42"
 
-# bms-parser, replay, game, audio, input, render and player (error types)
+# bms-parser, replay, game, library, audio, input, render and player (error types)
 thiserror = "2.0.21"
 
 # player and xtask (error reports) and game (tests)

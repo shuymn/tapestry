@@ -169,7 +169,7 @@ pub fn parse(
 }
 
 /// Splits `NAME value`, trimming the value.
-fn split_header(body: &str) -> (&str, &str) {
+pub fn split_header(body: &str) -> (&str, &str) {
     body.split_once(|c: char| c.is_ascii_whitespace())
         .map_or((body, ""), |(n, v)| (n, v.trim()))
 }
@@ -177,7 +177,7 @@ fn split_header(body: &str) -> (&str, &str) {
 /// Splits `mmmcc:data`. The measure takes three or more digits, so an
 /// oversized measure is refused rather than read as a header; it saturates
 /// at `u32::MAX`.
-fn split_channel(body: &str) -> Option<(u32, [u8; 2], &str)> {
+pub fn split_channel(body: &str) -> Option<(u32, [u8; 2], &str)> {
     let (head, data) = body.split_once(':')?;
     let head = head.trim_end().as_bytes();
     let (digits, channel) = head.split_last_chunk::<2>()?;
