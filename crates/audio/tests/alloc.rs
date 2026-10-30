@@ -1,5 +1,5 @@
 //! Once built, the engine allocates nothing per step: draining commands,
-//! scheduling BGM, cutting a sound's earlier instance, stealing voices,
+//! scheduling BGM, seeking, cutting a sound's earlier instance, stealing voices,
 //! mixing, soft clipping and writing; nor does
 //! the audio thread loop around it.
 //!
@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use audio::{
-    AudioEngine, AudioOutput, OutputError, RecordingOutput, SHIFT_HISTORY, SimConfig, SimDevice,
-    Sound, SoundBank, SoundCmd, Wake, run_audio,
+    AudioEngine, AudioOutput, OutputError, RecordingOutput, SHIFT_HISTORY, SeekPlan, SimConfig,
+    SimDevice, Sound, SoundBank, SoundCmd, Wake, run_audio,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::RingBuffer;
@@ -72,7 +72,7 @@ fn mixing_does_not_allocate() {
             sound: SoundId(KEYS),
         })
         .collect();
-    let mut e = AudioEngine::new(bank, &bgm, RATE, 480, 8, 64).unwrap();
+    let mut e = AudioEngine::new(bank.clone(), &bgm, RATE, 480, 8, 64).unwrap();
     // 40 stalls of three missed wakes, two underruns each: more than the
     // simulator's shift history holds.
     let missed_wakes = (0..40u64)
@@ -109,6 +109,21 @@ fn mixing_does_not_allocate() {
         commands += r.commands;
         e.drain_scheduled(|_| {});
     }
+    // A seek to chart time 15 s, due 100 ms from now, into the middle of a
+    // BGM sound; the play goes on from there.
+    let now = out.inner().next_wake();
+    e.restart(TimeUs(now.0 - 15_000_000 + 100_000));
+    // The plan is made where the play is prepared, which may allocate.
+    counting::track(false);
+    let plan = SeekPlan::new(&e.seek_source(), &bgm, e.frame_line(), TimeUs(15_000_000)).unwrap();
+    counting::track(true);
+    e.seek(&plan).unwrap();
+    let sought = e.bgm_left();
+    let mut entered = false;
+    for _ in 0..50 {
+        e.step(&mut out, &mut rx).unwrap();
+        entered |= e.mixer().active() > 0;
+    }
     let stop = AtomicBool::new(false);
     let mut looped = StopAfter {
         inner: &mut out,
@@ -126,5 +141,8 @@ fn mixing_does_not_allocate() {
     assert!(e.mixer().steals() > 1_000, "{}", e.mixer().steals());
     assert!(e.mixer().cuts() >= u64::from(STEPS), "{}", e.mixer().cuts());
     assert!(e.mixer().saturated() > 0);
+    // The events before 15 s were passed over, and voices sounded after.
+    assert_eq!(sought, 1_500 - 750);
+    assert!(entered);
     assert_eq!(counting::allocations(), 0);
 }

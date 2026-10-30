@@ -16,7 +16,9 @@
 //! - [`AudioEngine::step`] is one wake of the audio thread: it drains sound
 //!   commands, schedules BGM, and renders one block into an
 //!   [`AudioOutput`]. [`SimDevice`] and [`RecordingOutput`] stand in for the
-//!   device in tests and headless runs.
+//!   device in tests and headless runs. [`SeekPlan`] works out, off the audio
+//!   thread, the sounds still playing partway into a schedule, and
+//!   [`AudioEngine::seek`] starts a play there.
 //!
 //! [`run_audio`] is the audio thread loop: one step per buffer event until
 //! asked to stop. On Windows, `WasapiShared` is the device: WASAPI shared
@@ -35,6 +37,7 @@ mod engine;
 mod mixer;
 mod output;
 mod run;
+mod seek;
 mod sim;
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -46,7 +49,8 @@ pub use bank::{
 };
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use engine::{
-    AudioEngine, ChartSounds, EngineError, Scheduled, ScheduledKind, SoundCmd, StepReport,
+    AudioEngine, ChartSounds, EngineError, Scheduled, ScheduledKind, SeekError, SoundCmd,
+    StepReport,
 };
 pub use mixer::{
     HEADROOM, InvalidVolume, MAX_PENDING_STARTS, MAX_VOICES, MAX_VOLUME, Mixer, SOFT_CLIP_KNEE,
@@ -54,6 +58,7 @@ pub use mixer::{
 };
 pub use output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, RecordingOutput, Wake};
 pub use run::{RunReport, run_audio};
+pub use seek::{FrameLine, SeekPlan, SeekSource};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
 #[cfg(windows)]
 pub use wasapi::{

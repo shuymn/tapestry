@@ -599,9 +599,18 @@ fn another_chart_replaces_the_bank_and_bgm() {
         time: TimeUs(300_000),
         sound: CLICK,
     }];
+    // A seek planned for the old chart's schedule.
+    let stale = audio::SeekPlan::new(
+        &e.seek_source(),
+        &old_bgm,
+        e.frame_line(),
+        TimeUs(60_000_000),
+    )
+    .unwrap();
     let (back, back_bgm) = e
         .replace(Arc::clone(&new_bank), new_bgm)
         .expect("same rate");
+    assert_eq!(e.seek(&stale), Err(audio::SeekError::Source));
     assert_eq!(back_bgm, old_bgm);
     assert_eq!(back.stored_count(), 2);
     assert!(Arc::ptr_eq(e.bank(), &new_bank));

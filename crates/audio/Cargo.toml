@@ -29,6 +29,7 @@ windows = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
 
 [lints]
