@@ -212,10 +212,10 @@ The core is what must be correct for every record, and what a third party could 
 | Surface | Kind | Contract | Added by |
 | --- | --- | --- | --- |
 | Presets | Data | A canonical preset encoding (design.md "Rule Presets"), registered by hash | A registry row and its file |
-| Metrics | Transform | A pure Rust function `JudgeEvent stream → i64`, fixed once registered by id and version. Its order and tie-break are declared with it | Code in `ir-wasm`, reviewed in the repo |
+| Metrics | Transform | A pure Rust fold over judgment events: `init`, `step(acc, event)`, `finish(acc) → i64`, with an accumulator of bounded size (S3, "Streaming evaluation"). Fixed once registered by id and version; its order and tie-break are declared with it | Code in `ir-wasm`, reviewed in the repo |
 | Eligibility rules | Gate | A conjunction over a fixed set of facts the core computes: play type, speed, assists, offsets within limits, chart on the allowlist, LN mode. Not a rule language | A rule row |
 | Allowlist sources | Inject | Each source (difficulty table, registry, manual entry) writes chart hashes with provenance into one allowlist | A source adapter, run as a cron job family |
-| Detectors | Observe | A pure function over the record and its judgment stream, returning flags with a reason and a completion status. It cannot change an evaluation or a board | Code in `ir-wasm` |
+| Detectors | Observe | A pure fold over the judgment events, like a metric, with the record at hand, returning flags with a reason and a completion status. It cannot change an evaluation or a board | Code in `ir-wasm` |
 | Trust policy | Gate | Maps detector results, account age and verification to what a board shows. A required detector that did not complete counts as unknown, never as clean | A policy row |
 | Boards | Transform | Chart scope, preset hash, LN mode, metric id@version, eligibility rule, trust policy, and the per-player best | A board row |
 | Sign-in providers | Handle | One OAuth adapter interface. Stage 4 builds only the provider it needs | An adapter module |
@@ -303,6 +303,32 @@ bmz-player's IR made the same choice for the same reads.
   3. Chart loading under the server's loader limits, which are tighter than the client's.
   4. The event count against the loaded chart's length times a maximum input rate.
   5. Before evaluating, a budget computed from the known counts: notes, inputs and every preset's gauges. This budget is #97's resolution, which is decided before stage 4.
+- **Streaming evaluation:**
+  - **Where memory goes today:** batch evaluation (`eval::evaluate`) keeps every judgment event, reserving up to `notes × (3 + g) + inputs × (2 + g) + mines × (1 + g) + 1` events for `g` gauges (`Evaluator::max_events`).
+    - Every gauge change emits one event per gauge, whether from a note's judgment, an empty POOR or a mine.
+    - The gauge histories are then copied from those events.
+  - **Streaming:**
+    - The server instead drives the evaluator into a sink, and every metric and detector folds the events as they come.
+    - Nothing holds the event stream itself.
+  - **What remains:**
+    - Gauge histories are kept for the result. They grow as (judged notes + empty POORs + mine hits) × gauges, so input still multiplies by gauges there.
+    - They are charged to the evaluation budget (staged check 5), which the existing chart and input bounds keep finite.
+    - A cap on gauges per preset, one of #97's options, removes the preset's multiplier. It changes nothing the result screen shows.
+  - **Folds:**
+    - Metrics and detectors are per-record folds.
+    - An accumulator's size counts toward the budget. A histogram of deviations is bounded by the judgment windows, but its bins are chosen so that the bound is affordable.
+    - A detector that compares a play with the player's earlier plays needs that history supplied explicitly as an input. Otherwise it stays outside this surface.
+  - **The client:** keeps its batch output. Its median offset recommendation and its check against the live stream use the complete sequences.
+  - **Parity:** the test-only event stream (Parity, below) is a sink like any other.
+- **Resuming instead of one pass:**
+  - The evaluator advances in steps already: live play advances it to each watermark.
+  - Its lane state is chart-sized, its input conversion state device-sized, and its gauges preset-sized.
+  - Encoding that state canonically, with the metrics' accumulators and the position reached in the input, would let a job stop at a time, store the state, and resume in another invocation, with a result identical to one pass.
+  - **What resuming requires:**
+    - Today's batch evaluation queues every input before it advances, so resuming needs input fed in bounded, ordered steps instead.
+    - That feeding must keep equal-time inputs together, because advancing to a time finalizes it.
+  - **Joining section evaluations is not the whole chart.** Each section starts its judgment and gauge state fresh, drops long notes that cross its edges, and judges lead-in presses differently ("Section Evaluation").
+  - **Resuming is not built.** It is the path if a measured job ever leaves the budget. The loader's limits already make every chart finite, and the measured evaluation is milliseconds.
 - **Over a limit:**
   - A job over a limit parks **that record**, with the reason.
   - A chart is marked over the server's limits only when its loading alone fails, which is recorded per loader version and resolution. Another player's valid record for the same chart is unaffected.
