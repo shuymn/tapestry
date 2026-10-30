@@ -220,7 +220,7 @@ fn scripted_play_writes_a_record() {
             finalized: Some(rec.status.finalized),
             section: None,
         },
-        &rules::custom(),
+        &rules::RulePreset::from_canonical_bytes(&rec.preset.canonical_bytes).unwrap(),
     )
     .unwrap();
     let perfect = evaluation
@@ -476,7 +476,7 @@ fn judged(chart: &bms_model::Chart, rec: &PlayRecord) -> Vec<eval::JudgeEvent> {
             finalized: Some(rec.status.finalized),
             section: None,
         },
-        &rules::custom(),
+        &rules::RulePreset::from_canonical_bytes(&rec.preset.canonical_bytes).unwrap(),
     )
     .unwrap();
     evaluation
@@ -866,7 +866,7 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
             "device.toml",
             "logs\\tapestry.lock",
             "logs\\tapestry.log",
-            "presets\\custom.toml"
+            "presets\\beatoraja-style.toml"
         ],
         "{kept:?}"
     );

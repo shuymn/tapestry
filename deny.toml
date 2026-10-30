@@ -15,6 +15,22 @@ all-features = true
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
+# Reviewed exceptions from the menu text stack (glyphon 0.12, cosmic-text
+# 0.19, render), each with why it does not apply and when it goes.
+ignore = [
+    # `lru` 0.16: `LruCache::pop` is not panic-safe when a key's `Drop`
+    # panics. lru's only user is glyphon's glyph cache (text_atlas.rs), keyed
+    # by `GlyphonCacheKey`, a `Copy` enum of `Copy` keys with no `Drop`. Its
+    # calls are `unbounded_with_hasher`, `peek_lru`, `pop_lru` and iteration
+    # (text_atlas.rs) and `get` and `get_or_insert` (text_render.rs), never
+    # `pop`. Remove it when a glyphon release accepts lru >= 0.18.2.
+    { id = "RUSTSEC-2026-0253", reason = "glyphon never calls pop and its Copy keys have no Drop; remove when a glyphon release accepts lru >= 0.18.2" },
+    # `ttf-parser` is unmaintained, with no advisory against its code. fontdb
+    # 0.23 under cosmic-text 0.19 parses font tables with it, and only the
+    # runtime font file chosen in the Windows fonts folder reaches it. Remove
+    # it when a cosmic-text release (through glyphon) drops ttf-parser 0.25.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained only, parses the Windows font file; remove when a cosmic-text release under glyphon drops ttf-parser 0.25" },
+]
 
 [licenses]
 # Check dev-dependencies too, so a third-party GPL crate cannot enter a
@@ -28,7 +44,7 @@ allow = [
     "Unicode-3.0", # unicode-ident, unicode-normalization
     "BSD-3-Clause", # encoding_rs (together with MIT OR Apache-2.0), zstd (replay)
     "MPL-2.0",    # triple_buffer, symphonia (audio decoding); used unmodified
-    "Zlib",       # foldhash, under hashbrown in the wgpu graph (render)
+    "Zlib",       # foldhash, under hashbrown in the wgpu graph, and slotmap under fontdb (render)
     "ISC",        # libloading, which wgpu-hal uses to load the DX12 runtime (render)
     "NCSA",       # libfuzzer-sys (LLVM libFuzzer), fuzz/ only
 ]

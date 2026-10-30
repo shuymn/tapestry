@@ -20,7 +20,7 @@ Build a BMS player that plays like beatoraja or Lunatic Rave 2. Its biggest dist
 ### Non-goals
 
 - **Exactly reproducing the judgment of beatoraja or LR2.** We provide "-style" presets with similar behavior, but do not go as far as matching bugs in the existing implementations.
-- **Making the judgment of the commercial game this is based on the standard.** The default is a custom preset.
+- **Making the judgment of the commercial game this is based on the standard.** The default is the beatoraja-style preset; no standard preset reproduces the judgment of the commercial game this is based on.
 - **Importing or converting commercial game data.** It goes neither in core nor in official extensions.
 - Support for platforms other than Windows.
 
@@ -394,14 +394,16 @@ For now only LN is judged, and a chart whose `#LNMODE` asks for CN or HCN is ref
 
 ### Standard Presets
 
-- **Custom (default)**: Judgment specific to this player. Its values differ from the judgment of the commercial game this is based on.
-- **beatoraja-style**, **LR2-style**: Aim for similar behavior based on public information. They are named "-style", not "compatible", and an exact match is not promised.
+- **beatoraja-style (default)**, **LR2-style**: Aim for similar behavior based on public information. They are named "-style", not "compatible", and an exact match is not promised.
+- **Custom**: Judgment specific to this player. Its values differ from the judgment of the commercial game this is based on.
+
+beatoraja-style (`rules::beatoraja_style()`) takes its values from beatoraja's public source code, each cited by file and line in its module and in its examples (`crates/eval/tests/style_beatoraja.rs`). Behavior the preset model cannot express yet (a separate scratch window table, combo-priority note assignment, multi-step low-gauge damage, `#TOTAL`-limited survival increases, the default `#TOTAL` formula, `#DEFEXRANK` and `#RANK 4` scaling, when a BAD long-note head is scored, and a miss decided strictly after the late BAD edge rather than at it, which can also reorder it against another lane's press and change combo and gauge) is listed in that module with the example that would differ, and arrives as axes with the examples that need them.
 
 Items are added when a preset that needs them appears. Unused tuning items are not built in advance.
 
 ### Custom Preset
 
-The custom preset (`rules::custom()`, written to `presets\custom.toml` on first start) is the only preset so far. Its values and behaviors are starting points chosen by what the player experiences and tuned by playing; another player's numbers are not copied, since they would carry that implementation's choices without anyone having felt them.
+The custom preset (`rules::custom()`) is written to `presets\custom.toml` when that file is missing, and is chosen by naming it in `player.toml`. Its values and behaviors are starting points chosen by what the player experiences and tuned by playing; another player's numbers are not copied, since they would carry that implementation's choices without anyone having felt them.
 
 | Item | Value | What the player experiences |
 | --- | --- | --- |
@@ -593,7 +595,8 @@ If a "sound to play" event arrives too late for the current buffer write, the so
 - The presentation mode (vsync on or off, `present_mode`) and the number of frames rendered ahead (`desired_maximum_frame_latency`) are settings. The defaults favor lower latency.
 - Note positions are computed from the time the frame is expected to appear on screen, not the time it is rendered. The expected time is predicted from QPC and the display latency offset, and DXGI frame statistics are used as an aid when valid (the "Time Base (QPC)" section).
 - The logic thread publishes a typed state snapshot (for example `PlayView`) through a triple buffer. The render thread only reads it and never writes.
-- The play screen today is `SimpleSkin`, the one implementation of the skin boundary `render::PlaySkin`: a hard-coded 16:9 layout authored at 1920×1080 and scaled, drawn with one instanced sprite pipeline (alpha and additive blending) over a texture atlas, and text in a 5×7 ASCII bitmap font baked into the atlas at startup. The declarative skin of stage 3 is a second implementation behind the same trait. Japanese text (`cosmic-text`, `glyphon`) and `egui` arrive with song selection and settings screens, which first need them; until then key config is drawn with the play screen's sprites, and hi-speed, volume and display offset are keys during play. There is no BGA yet; it returns with stage 3, starting from the stage 0 spike's decoder.
+- The play screen today is `SimpleSkin`, the one implementation of the skin boundary `render::PlaySkin`: a hard-coded 16:9 layout authored at 1920×1080 and scaled, drawn with one instanced sprite pipeline (alpha and additive blending) over a texture atlas, and text in a 5×7 ASCII bitmap font baked into the atlas at startup. The declarative skin of stage 3 is a second implementation behind the same trait. There is no BGA yet; it returns with stage 3, starting from the stage 0 spike's decoder.
+- Menu screens draw Japanese text with `render::text`: `cosmic-text` lays a string out once into a text block, and `glyphon` rasterizes its glyphs into an atlas and draws them in a pass of their own after the sprite pass (`Renderer::menu_frame`), at the letterboxed layout's scale and on the target's own pixels, clipped to the letterbox. Each screen owns its atlas, freed with the screen: a glyph already in it is not rasterized again by later prepares. The atlas starts at 256×256 and doubles when its glyphs do not fit, and glyphon then rasterizes the glyphs already in it once more; that happens while a menu prepares its text, where allocation is allowed. A screen's text belongs to the renderer it was made for and to one set of fonts: using it with another is a typed error, so after the renderer is replaced the screen makes and prepares its text again. The font is the first present of Yu Gothic UI (`YuGothM.ttc`), Meiryo and MS Gothic in the Windows fonts folder; only that file is read, never a scan of the installed fonts. Text is laid out and prepared only on menus, where allocation is allowed; the play screen keeps the bitmap font and never calls into `render::text`. No screen draws this text yet; song selection is the first. `egui` arrives with the settings screens; until then key config is drawn with the play screen's sprites, and hi-speed, volume and display offset are keys during play.
 - A tap disappears when it is judged; a long note never does. It is drawn until its end passes below the judgment line on the display timeline, and once its head's time has passed, the head stays on the line and the body shrinks. Its body has two parts that a skin draws as it chooses (it may make the inactive one transparent): active while its head has been pressed (held, or decided at a press before its end, BAD included) until its visual hold ends at the release of its lane or its end on the logic timeline, so a tail still on screen after the logic end (a negative display offset) is drawn inactive; inactive otherwise (head missed, released, never pressed). The state follows the events alone (`LnHeld`, a head's judgment at a press before its end, `LnHoldEnded`), never the judgment's value. `SimpleSkin` draws the inactive body darker.
 - Short effects such as bombs and the judgment display can be missed with the snapshot alone. Sequence-numbered judgment events are also passed to the render thread through a queue, and the render thread receives everything it has not yet processed as effects.
 - Conversion to LR2 IDs or beatoraja property IDs happens only inside each skin's adapter. The game's internal structures are not shaped to fit a skin's ID system.
@@ -886,8 +889,9 @@ Results and replays display and record where the values used came from ("preset 
 
 ### Settings Files
 
-- Settings are TOML in two files: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor, and the library roots under `[library] roots`, since they are per PC) and `player.toml` (hi-speed, the preset file, the displayed gauge). Files are written atomically: to a temporary file, then renamed.
-- Everything lives in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\` (with `custom.toml`), `records\`, `logs\` and `measure\`. Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large; one root keeps backup simple, and the scopes stay separated by file. The registry is not used: it is not human-editable and does not fit presets distributed as files.
+- Settings are TOML in two files: `device.toml` (the keyboard key config, the controller key config with its controller's model, the three offsets, the audio device, master volume, queued audio periods, the monitor, and the library roots under `[library] roots`, since they are per PC) and `player.toml` (hi-speed, the preset file, by default `beatoraja-style.toml`, and the displayed gauge). A `player.toml` without a `preset` keeps the default; one that names a preset keeps that choice. Files are written atomically: to a temporary file, then renamed.
+- A missing preset file is written only for a standard preset: `custom.toml` with the custom preset and `beatoraja-style.toml` with beatoraja-style. Any other missing name is refused, naming the file, and nothing is written.
+- Everything lives in one data root, `%LOCALAPPDATA%\tapestry\`, which also holds `presets\`, `records\`, `logs\` and `measure\`. Local, not roaming, AppData, because device settings must not follow a profile to another PC and records are large; one root keeps backup simple, and the scopes stay separated by file. The registry is not used: it is not human-editable and does not fit presets distributed as files.
 
 ## IR (Rankings)
 

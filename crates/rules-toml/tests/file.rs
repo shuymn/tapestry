@@ -18,6 +18,16 @@ fn preset_file_round_trips_to_equal_canonical_bytes() {
 }
 
 #[test]
+fn beatoraja_style_round_trips_to_equal_canonical_bytes() {
+    let preset = rules::beatoraja_style();
+    let text = preset_to_toml(&preset);
+    let back = load_preset_toml(&text).unwrap();
+    assert_eq!(back, preset);
+    assert_eq!(back.canonical_bytes(), preset.canonical_bytes());
+    assert!(text.len() < 8 << 10, "{}", text.len());
+}
+
+#[test]
 fn older_preset_file_is_refused_with_the_hint() {
     let text = preset_to_toml(&rules::custom());
     let old = text.replacen("behind_us = 150000\n", "", 1);

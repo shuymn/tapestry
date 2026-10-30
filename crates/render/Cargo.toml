@@ -1,7 +1,7 @@
 [package]
 name = "render"
 version = "0.0.0"
-description = "The play screen: wgpu on DX12, the sprite batch, the bitmap font, and the skin boundary with the simple skin."
+description = "The play screen and menu text: wgpu on DX12, the sprite batch, the bitmap font, the skin boundary with the simple skin, and Japanese text for menus."
 edition.workspace = true
 license = "GPL-3.0-or-later"
 repository.workspace = true
@@ -16,6 +16,7 @@ bms-model.workspace = true
 bytemuck.workspace = true
 eval.workspace = true
 game.workspace = true
+glyphon.workspace = true
 pollster.workspace = true
 rules.workspace = true
 thiserror.workspace = true
@@ -24,6 +25,7 @@ wgpu-hal.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
@@ -31,6 +33,9 @@ windows = { workspace = true, features = [
 # Charts loaded from BMS text in the simple skin's tests.
 criterion.workspace = true
 bms-parser.workspace = true
+# The pinned font's hash and the expected image of the menu text test.
+png.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 # A plain Win32 window for the swap chain test.
 windows = { workspace = true, features = [
