@@ -3,6 +3,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bms_model::Chart;
@@ -17,6 +18,9 @@ use crate::simple::layout::{HEIGHT, WIDTH};
 use crate::simple::text_screen;
 use crate::text::MenuText;
 use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
+
+/// The next [`Renderer`]'s id.
+static RENDERERS: AtomicU64 = AtomicU64::new(0);
 
 /// Sprites one frame can draw, across both blends.
 pub const MAX_SPRITES: usize = 8_192;
@@ -111,6 +115,9 @@ pub enum RenderError {
     /// A menu's text could not be drawn as prepared.
     #[error("text")]
     Text(#[source] glyphon::RenderError),
+    /// A menu's text was made for another renderer, whose device it uses.
+    #[error("text: made for another renderer")]
+    OtherRenderersText,
 }
 
 /// What one frame cost and drew.
@@ -171,6 +178,9 @@ enum Output {
 
 /// The play screen renderer.
 pub struct Renderer {
+    /// Unique among the renderers of the process, for the menu text tied to
+    /// this one's device.
+    id: u64,
     gpu: Gpu,
     output: Output,
     size: (u32, u32),
@@ -272,7 +282,14 @@ impl Renderer {
             staging: Vec::with_capacity(MAX_SPRITES),
             skin: Box::new(SimpleSkin::new()),
             started: None,
+            id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// Identifies this renderer and its device among the process's
+    /// renderers.
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
     }
 
     /// The target's size in pixels.
@@ -391,13 +408,18 @@ impl Renderer {
     ///
     /// # Errors
     ///
-    /// As [`frame`](Self::frame), and [`RenderError::Text`] when `text`
-    /// was not prepared for this renderer's target.
+    /// As [`frame`](Self::frame); [`RenderError::OtherRenderersText`],
+    /// drawing nothing, when `text` was made for another renderer (one this
+    /// replaced: the screen makes and prepares its text again); and
+    /// [`RenderError::Text`] when glyphon cannot draw it as prepared.
     pub fn menu_frame(
         &mut self,
         sprites: impl FnOnce(&mut SpriteBatch),
         text: &MenuText,
     ) -> Result<FrameTiming, RenderError> {
+        if text.owner() != self.id {
+            return Err(RenderError::OtherRenderersText);
+        }
         let start = Instant::now();
         self.batch.clear();
         sprites(&mut self.batch);
@@ -496,7 +518,6 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_viewport(x, y, w, h, 0.0, 1.0);
             text.render(&mut pass).map_err(RenderError::Text)?;
         }
         queue.submit([encoder.finish()]);
@@ -851,6 +872,9 @@ mod tests {
     fn leaf_failures_name_their_reason() {
         assert!(RenderError::SurfaceLost.source().is_none());
         assert!(RenderError::SurfaceUnsupported.source().is_none());
+        let e = RenderError::OtherRenderersText;
+        assert!(e.source().is_none());
+        assert_eq!(e.to_string(), "text: made for another renderer");
         let e = RenderError::NoSoftwareAdapter {
             names: vec!["GPU".to_owned()],
         };

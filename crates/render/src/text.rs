@@ -8,11 +8,18 @@
 //! A screen loads [`Fonts`] once, lays out each string as a [`TextBlock`],
 //! hands its blocks to its [`MenuText`] with [`MenuText::prepare`] whenever
 //! they change, and draws them with [`Renderer::menu_frame`]. The
-//! [`MenuText`] holds the screen's glyph cache: a glyph is rasterized the
-//! first time the screen draws it and taken from the atlas after that, and
-//! the cache goes when the screen drops its [`MenuText`].
+//! [`MenuText`] holds the screen's glyph cache: a glyph already in its atlas
+//! is not rasterized again by later prepares, and the cache goes when the
+//! screen drops its [`MenuText`]. When the atlas grows, glyphon rasterizes
+//! the glyphs in it once more, on the menu.
+//!
+//! A [`MenuText`] belongs to the [`Renderer`] it was made for and to the
+//! [`Fonts`] it first prepared with. After the renderer is replaced, the
+//! screen makes a new [`MenuText`] and prepares it again; using the old one
+//! is an error, never a GPU fault.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use glyphon::cosmic_text::fontdb;
 use glyphon::{
@@ -78,7 +85,18 @@ pub enum TextError {
     /// The screen's glyph atlas cannot take its text.
     #[error("text")]
     Prepare(#[source] glyphon::PrepareError),
+    /// The screen's text was made for another renderer, one since replaced.
+    #[error("text: made for another renderer")]
+    OtherRenderer,
+    /// A block, or the screen's atlas, belongs to other [`Fonts`] than the
+    /// ones given.
+    #[error("text: laid out with other fonts")]
+    OtherFonts,
 }
+
+/// Identifies each [`Fonts`], so a screen's atlas never mixes glyphs of
+/// two font systems.
+static FONTS: AtomicU64 = AtomicU64::new(0);
 
 /// The Windows fonts folder (`%WINDIR%\Fonts`, the system one also under
 /// Remote Desktop).
@@ -111,6 +129,7 @@ pub fn choose_font(dir: &Path) -> Option<(RuntimeFont, PathBuf)> {
 pub struct Fonts {
     system: FontSystem,
     family: String,
+    id: u64,
 }
 
 impl Fonts {
@@ -153,6 +172,7 @@ impl Fonts {
         Ok(Self {
             system: FontSystem::new_with_locale_and_db("ja-JP".to_owned(), db),
             family: family.to_owned(),
+            id: FONTS.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -182,6 +202,8 @@ pub struct TextStyle {
 pub struct TextBlock {
     buffer: Buffer,
     style: TextStyle,
+    /// The [`Fonts`] it was laid out in.
+    fonts: u64,
 }
 
 impl TextBlock {
@@ -194,7 +216,11 @@ impl TextBlock {
         let attrs = Attrs::new().family(Family::Name(&fonts.family));
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut fonts.system, false);
-        Self { buffer, style }
+        Self {
+            buffer,
+            style,
+            fonts: fonts.id,
+        }
     }
 
     /// The laid-out width of the widest line, in layout pixels.
@@ -207,17 +233,23 @@ impl TextBlock {
     }
 }
 
-/// The text of one menu screen and its glyph cache: the atlas a glyph is
-/// rasterized into once and drawn from for as long as the screen keeps it.
+/// The text of one menu screen and its glyph cache: the atlas its glyphs
+/// are rasterized into and drawn from for as long as the screen keeps it.
+/// It works only with the renderer it was made for (see the module
+/// documentation).
 pub struct MenuText {
     atlas: TextAtlas,
     renderer: TextRenderer,
     viewport: Viewport,
     swash: SwashCache,
+    /// The [`Renderer::id`] it was made for.
+    owner: u64,
+    /// The [`Fonts`] its atlas holds glyphs of, from the first prepare.
+    fonts: Option<u64>,
 }
 
 impl MenuText {
-    /// An empty screen's text, for drawing with `renderer`.
+    /// An empty screen's text, for drawing with `renderer` only.
     #[must_use]
     pub fn new(renderer: &Renderer) -> Self {
         let gpu = renderer.gpu();
@@ -238,45 +270,67 @@ impl MenuText {
             renderer: text,
             viewport: Viewport::new(device, &cache),
             swash: SwashCache::new(),
+            owner: renderer.id(),
+            fonts: None,
         }
     }
 
-    /// Makes `blocks` what [`Renderer::menu_frame`] draws, rasterizing only
-    /// the glyphs this screen has not drawn yet. Glyphs of earlier
-    /// blocks stay cached; they are evicted only when the atlas needs
-    /// their room.
+    /// The [`Renderer::id`] it was made for.
+    pub(crate) const fn owner(&self) -> u64 {
+        self.owner
+    }
+
+    /// Makes `blocks` what [`Renderer::menu_frame`] draws. A glyph already
+    /// in this screen's atlas is not rasterized again; glyphs of earlier
+    /// blocks stay there and are evicted only when the atlas needs their
+    /// room. When the atlas has to grow, every glyph in it is rasterized
+    /// once more.
     ///
     /// # Errors
     ///
-    /// Returns an error when the atlas cannot grow to hold the blocks'
-    /// glyphs.
+    /// Returns an error when `renderer` is not the one this was made for,
+    /// when `fonts` or a block's fonts are not the ones the screen first
+    /// prepared with, or when the atlas cannot grow to hold the glyphs.
     pub fn prepare(
         &mut self,
         renderer: &Renderer,
         fonts: &mut Fonts,
         blocks: &[&TextBlock],
     ) -> Result<(), TextError> {
+        if renderer.id() != self.owner {
+            return Err(TextError::OtherRenderer);
+        }
+        // Glyphs in the atlas are rasterized again from `fonts` when it
+        // grows, so it holds glyphs of one font system only.
+        let own = *self.fonts.get_or_insert(fonts.id);
+        if own != fonts.id || blocks.iter().any(|b| b.fonts != own) {
+            return Err(TextError::OtherFonts);
+        }
         let gpu = renderer.gpu();
         let (width, height) = renderer.size();
-        let [_, _, w, h] = letterbox(width, height);
+        // The whole target is the viewport, so glyphs land on its pixels
+        // exactly; the layout is placed and clipped where the letterbox
+        // puts the sprites.
+        let [x, y, w, h] = letterbox(width, height);
         let scale = w / layout::WIDTH;
-        self.viewport.update(
-            gpu.queue(),
-            Resolution {
-                width: w.round() as u32,
-                height: h.round() as u32,
-            },
-        );
+        self.viewport
+            .update(gpu.queue(), Resolution { width, height });
+        let bounds = TextBounds {
+            left: x.round() as i32,
+            top: y.round() as i32,
+            right: (x + w).round() as i32,
+            bottom: (y + h).round() as i32,
+        };
         // Glyphs the previous blocks used may now be evicted for room.
         self.atlas.trim();
         let areas = blocks.iter().map(|b| {
             let [r, g, bl, a] = b.style.color;
             TextArea {
                 buffer: &b.buffer,
-                left: b.style.left * scale,
-                top: b.style.top * scale,
+                left: b.style.left.mul_add(scale, x),
+                top: b.style.top.mul_add(scale, y),
                 scale,
-                bounds: TextBounds::default(),
+                bounds,
                 default_color: Color::rgba(r, g, bl, a),
                 custom_glyphs: &[],
             }
@@ -294,8 +348,8 @@ impl MenuText {
             .map_err(TextError::Prepare)
     }
 
-    /// Draws the prepared blocks into `pass`, whose viewport is the
-    /// letterboxed layout.
+    /// Draws the prepared blocks into `pass`, whose viewport is the whole
+    /// target.
     pub(crate) fn render(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -311,8 +365,9 @@ mod tests {
     use glyphon::FontSystem;
     use glyphon::cosmic_text::fontdb;
 
-    use super::{FONT_ORDER, Fonts, MenuText, TextBlock, TextStyle, choose_font};
-    use crate::{AdapterChoice, Renderer, Target};
+    use super::{FONT_ORDER, Fonts, MenuText, TextBlock, TextError, TextStyle, choose_font};
+    use crate::atlas::solid_uv;
+    use crate::{AdapterChoice, Blend, RenderError, Renderer, Sprite, Target};
 
     #[test]
     fn runtime_font_falls_back_in_order() {
@@ -352,28 +407,39 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn glyphs_are_cached_per_screen() {
-        // 480×270: the layout at 1/4 scale, so 4 layout pixels are one
-        // target pixel and a block moved by a multiple of 4 lands on the
-        // same subpixel position, with the same glyph images.
-        let mut r = Renderer::new(
-            Target::Offscreen {
-                width: 480,
-                height: 270,
-            },
-            AdapterChoice::Warp,
-        )
-        .unwrap();
-        let mut fonts = Fonts::runtime().unwrap();
-        let style = |top| TextStyle {
-            left: 100.0,
+    fn warp(width: u32, height: u32) -> Renderer {
+        Renderer::new(Target::Offscreen { width, height }, AdapterChoice::Warp).unwrap()
+    }
+
+    fn white(left: f32, top: f32) -> TextStyle {
+        TextStyle {
+            left,
             top,
             size: 96.0,
             color: [255, 255, 255, 255],
-        };
-        let first = TextBlock::new(&mut fonts, "譜面", style(100.0));
-        let again = TextBlock::new(&mut fonts, "譜面", style(500.0));
+        }
+    }
+
+    /// Takes away every font of `fonts`: from here on no glyph can be
+    /// rasterized, so a glyph drawn must come from a screen's atlas.
+    fn unrasterizable(fonts: &mut Fonts) {
+        fonts.system =
+            FontSystem::new_with_locale_and_db("ja-JP".to_owned(), fontdb::Database::new());
+    }
+
+    #[test]
+    fn glyphs_are_cached_per_screen() {
+        // A glyph already in the screen's atlas is not rasterized again by
+        // a later prepare. Two glyphs fit the initial atlas, so it never
+        // grows here (`atlas_growth_keeps_drawn_glyphs` covers growth).
+        //
+        // 480×270: the layout at 1/4 scale, so 4 layout pixels are one
+        // target pixel and a block moved by a multiple of 4 lands on the
+        // same subpixel position, with the same glyph images.
+        let mut r = warp(480, 270);
+        let mut fonts = Fonts::runtime().unwrap();
+        let first = TextBlock::new(&mut fonts, "譜面", white(100.0, 100.0));
+        let again = TextBlock::new(&mut fonts, "譜面", white(100.0, 500.0));
         let mut text = MenuText::new(&r);
         text.prepare(&r, &mut fonts, &[&first]).unwrap();
         r.menu_frame(|_| {}, &text).unwrap();
@@ -381,12 +447,8 @@ mod tests {
         assert!(once.len() > 100, "{} lit pixels", once.len());
         assert!(once.iter().all(|&(_, y)| y < 100));
 
-        // From here on no glyph can be rasterized: the font system has no
-        // font. The screen still draws both blocks, from its atlas.
-        let family = fonts.family.clone();
-        fonts.system =
-            FontSystem::new_with_locale_and_db("ja-JP".to_owned(), fontdb::Database::new());
-        assert_eq!(fonts.family, family);
+        // The screen still draws both blocks, from its atlas.
+        unrasterizable(&mut fonts);
         text.prepare(&r, &mut fonts, &[&first, &again]).unwrap();
         r.menu_frame(|_| {}, &text).unwrap();
         let twice = lit(&r.read_back(), 480);
@@ -395,5 +457,142 @@ mod tests {
         // 400 layout pixels lower: 100 target rows.
         let shifted: Vec<_> = once.iter().map(|&(x, y)| (x, y + 100)).collect();
         assert_eq!(moved, shifted);
+    }
+
+    #[test]
+    fn atlas_growth_keeps_drawn_glyphs() {
+        // 1920×1080, so a 96 px glyph is about 90×90 target pixels: the 64
+        // distinct glyphs below need about 500 000 atlas texels, more than
+        // the initial 256×256 atlas and its first doubling hold, so the
+        // atlas grows while they are prepared, rasterizing the glyphs
+        // already in it again.
+        const MANY: &str = "一二三四五六七八九十百千万円年月日時分秒\n\
+                            春夏秋冬東西南北上下左右前後内外大小高低\n\
+                            山川海空雨雪風雲花草木森林石金銀銅鉄火水\n\
+                            土光音楽";
+        let mut r = warp(1920, 1080);
+        let mut fonts = Fonts::runtime().unwrap();
+        let first = TextBlock::new(&mut fonts, "譜面", white(100.0, 50.0));
+        let many = TextBlock::new(&mut fonts, MANY, white(100.0, 300.0));
+        let mut text = MenuText::new(&r);
+        text.prepare(&r, &mut fonts, &[&first]).unwrap();
+        r.menu_frame(|_| {}, &text).unwrap();
+        let before = lit(&r.read_back(), 1920);
+        assert!(before.len() > 1_000, "{} lit pixels", before.len());
+
+        text.prepare(&r, &mut fonts, &[&first, &many]).unwrap();
+        r.menu_frame(|_| {}, &text).unwrap();
+        let grown = lit(&r.read_back(), 1920);
+        let (top, rest): (Vec<_>, Vec<_>) = grown.iter().partition(|&&(_, y)| y < 250);
+        // The glyphs drawn before the growth draw the same after it.
+        assert_eq!(top, before);
+        // Every line of the many glyphs is drawn: lines are 120 px apart.
+        for line in 0..4 {
+            let rows = 300 + line * 120..300 + (line + 1) * 120;
+            let n = rest.iter().filter(|(_, y)| rows.contains(y)).count();
+            assert!(n > 2_000, "line {line}: {n} lit pixels");
+        }
+
+        // The grown atlas holds them all: drawn again without rasterizing,
+        // the screen is unchanged.
+        unrasterizable(&mut fonts);
+        text.prepare(&r, &mut fonts, &[&first, &many]).unwrap();
+        r.menu_frame(|_| {}, &text).unwrap();
+        assert_eq!(lit(&r.read_back(), 1920), grown);
+    }
+
+    #[test]
+    fn text_of_another_renderer_or_fonts_is_refused() {
+        let mut old = warp(480, 270);
+        let mut fonts = Fonts::runtime().unwrap();
+        let block = TextBlock::new(&mut fonts, "譜面", white(100.0, 100.0));
+        let mut text = MenuText::new(&old);
+        text.prepare(&old, &mut fonts, &[&block]).unwrap();
+
+        // The renderer is replaced, as after a lost surface: the old text
+        // uses the old device, so it is refused, not drawn.
+        let mut new = warp(480, 270);
+        assert!(matches!(
+            new.menu_frame(|_| {}, &text),
+            Err(RenderError::OtherRenderersText)
+        ));
+        assert!(matches!(
+            text.prepare(&new, &mut fonts, &[&block]),
+            Err(TextError::OtherRenderer)
+        ));
+        let mut remade = MenuText::new(&new);
+        remade.prepare(&new, &mut fonts, &[&block]).unwrap();
+        new.menu_frame(|_| {}, &remade).unwrap();
+        assert!(!lit(&new.read_back(), 480).is_empty());
+        old.menu_frame(|_| {}, &text).unwrap();
+
+        // Other fonts, or a block laid out in them, are refused too.
+        let mut other = Fonts::runtime().unwrap();
+        let theirs = TextBlock::new(&mut other, "譜面", white(100.0, 100.0));
+        assert!(matches!(
+            text.prepare(&old, &mut other, &[&theirs]),
+            Err(TextError::OtherFonts)
+        ));
+        assert!(matches!(
+            text.prepare(&old, &mut fonts, &[&theirs]),
+            Err(TextError::OtherFonts)
+        ));
+        text.prepare(&old, &mut fonts, &[&block]).unwrap();
+    }
+
+    #[test]
+    fn text_lines_up_with_sprites_off_16_9() {
+        // 1366×768 is scaled to the height, by 32/45: a 1365.33 px wide
+        // layout 0.33 px from the left. 1125 layout pixels are exactly 800
+        // target pixels, so a sprite and a glyph moved that far land 800
+        // pixels on, at the same subpixel position. A text pass projected
+        // against a rounded viewport drifts from the sprites across the
+        // screen.
+        let mut r = warp(1366, 768);
+        let mut fonts = Fonts::runtime().unwrap();
+        let near = TextBlock::new(&mut fonts, "譜", white(90.0, 100.0));
+        let far = TextBlock::new(&mut fonts, "譜", white(1_215.0, 100.0));
+        let mut text = MenuText::new(&r);
+        text.prepare(&r, &mut fonts, &[&near, &far]).unwrap();
+        r.menu_frame(
+            |b| {
+                for left in [90.0, 1_215.0] {
+                    b.push(
+                        Blend::Alpha,
+                        Sprite {
+                            rect: [left, 600.0, 45.0, 45.0],
+                            uv: solid_uv(),
+                            color: [1.0, 0.0, 0.0, 1.0],
+                        },
+                    );
+                }
+            },
+            &text,
+        )
+        .unwrap();
+        let on = lit(&r.read_back(), 1366);
+        let (text_on, sprite_on): (Vec<_>, Vec<_>) = on.into_iter().partition(|&(_, y)| y < 300);
+        let first_column = |pixels: &[(usize, usize)], right: bool| {
+            pixels
+                .iter()
+                .filter(|&&(x, _)| (x >= 683) == right)
+                .map(|&(x, _)| x)
+                .min()
+                .unwrap()
+        };
+        // The sprites' left edges: 0.33 + 64 and 0.33 + 864.
+        assert_eq!(
+            (
+                first_column(&sprite_on, false),
+                first_column(&sprite_on, true)
+            ),
+            (64, 864)
+        );
+        // The far glyph is the near one 800 pixels on, as the sprites are.
+        let (text_near, text_far): (Vec<_>, Vec<_>) =
+            text_on.into_iter().partition(|&(x, _)| x < 683);
+        assert!(!text_near.is_empty());
+        let shifted: Vec<_> = text_near.iter().map(|&(x, y)| (x + 800, y)).collect();
+        assert_eq!(text_far, shifted);
     }
 }
