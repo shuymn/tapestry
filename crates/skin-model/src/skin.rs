@@ -510,8 +510,8 @@ impl Skin {
     /// when some image the skin can draw is magnified on its smaller axis,
     /// counting the canvas scale, its region's scale, a cover or stretch
     /// fill, and for lane-bound images and the lane parts a lane width
-    /// below 100 % (lane width alone never picks `Hi`). Hidden regions do
-    /// not count. Exact rationals, no float. For `prepare`, not in play.
+    /// below 100 % (lane width alone never picks `Hi`). Hidden regions and
+    /// elements whose visibility folds to false do not count. Exact rationals, no float. For `prepare`, not in play.
     #[must_use]
     pub fn variant(&self, target: [u32; 2], layout: &Layout) -> Variant {
         let [tw, th] = target.map(|v| u128::from(v.max(1)));
@@ -540,7 +540,9 @@ impl Skin {
         let one = Ratio(1, 1);
         let hi = self.elements.iter().any(|e| {
             let adjust = self.regions.effective(e.region, layout);
-            if !adjust.visible {
+            // A hidden region, or a visibility folded to false, never draws.
+            let never = e.visible.as_ref().and_then(Program::constant) == Some(0);
+            if !adjust.visible || never {
                 return false;
             }
             let fill = match e.fill {

@@ -126,6 +126,14 @@ impl Program {
         self.ops.len()
     }
 
+    /// The value of a program folded to one constant at compile time.
+    pub(crate) fn constant(&self) -> Option<i32> {
+        match *self.ops {
+            [Op::Const(c)] => Some(c),
+            _ => None,
+        }
+    }
+
     /// The stack slots evaluation uses.
     #[must_use]
     pub fn stack_depth(&self) -> usize {

@@ -9,7 +9,7 @@ mod play_support;
 
 use bms_model::Lane;
 use lanes_support::{WHITE, bound, image, in_region, lanes_element, sheet, simple, skin_with};
-use play_support::REGIONS;
+use play_support::{REGIONS, bool_program};
 use skin_model::{
     Adjust, Bind, ElementDef, Fill, Fit, Layout, Place, Region, Skin, SkinDef, Variant,
 };
@@ -180,4 +180,26 @@ fn the_lane_width_narrows_lane_bound_images_only() {
     )
     .unwrap();
     assert_eq!(s.variant([3_840, 2_160], &width(50)), Variant::Hi);
+}
+
+#[test]
+fn an_element_that_can_never_draw_does_not_count() {
+    // A drawable image on `screen` at 100 % and a decoration in `top` at
+    // 200 % whose visibility folds to false: only the first can draw, 1 ×
+    // 100 % at 1080p, so `Lo`.
+    let decoration = |src: &str| ElementDef {
+        visible: Some(bool_program(src)),
+        ..image(WHITE, [0, 0, 10, 10], in_region(Region::Top))
+    };
+    let plain = image(WHITE, [0, 0, 10, 10], Place::SCREEN);
+    let l = scaled(Region::Top, 200);
+    for never in ["false", "false && combo >= 1", "1 > 2"] {
+        let s = adapted(vec![plain.clone(), decoration(never)]);
+        assert_eq!(s.variant([1_920, 1_080], &l), Variant::Lo, "{never}");
+    }
+    // A visibility that may hold, or folds to true, still counts.
+    for maybe in ["combo >= 1", "true"] {
+        let s = adapted(vec![plain.clone(), decoration(maybe)]);
+        assert_eq!(s.variant([1_920, 1_080], &l), Variant::Hi, "{maybe}");
+    }
 }
