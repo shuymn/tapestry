@@ -99,6 +99,7 @@ fn two_sources() -> PlayRecord {
                 sha256: [0xa1; 32],
                 md5: [0xb2; 16],
                 resolved_hash: [0xc3; 32],
+                played_hash: [0xc4; 32],
                 loader_version: 5,
                 random_results: vec![3, 1],
             },
@@ -126,6 +127,7 @@ fn two_sources() -> PlayRecord {
             },
         },
         play_type: PlayType::Full,
+        speed: bms_model::Speed::NORMAL,
         start: InputStart {
             opened_at: TimeUs(1_000_000),
             held: vec![(SourceId(0), ControlId(0x2c), 1)],

@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::Context as _;
-use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank};
+use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank_at};
 use bms_model::{BgmEvent, TimeUs};
 use eval::ControlId;
 use game::{
@@ -371,6 +371,8 @@ fn session_config(receive: ReceiveMethod, autoplay: Option<AutoKeySounds>) -> Se
         start: TimeUs(0),
         effects: EFFECTS,
         seed,
+        // Plays run at 1× until the practice screen chooses a speed.
+        speed: bms_model::Speed::NORMAL,
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
         provenance: if cfg!(feature = "dev-tools") {
             BuildProvenance::Development
@@ -479,8 +481,14 @@ fn start_engine(
     probe: rtrb::Producer<game::AudioProbe>,
 ) -> anyhow::Result<audio_side::AudioLink> {
     let chart = loaded.chart();
-    let bank = load_bank(chart, opened.rate, &BankLimits::default())
-        .context("the sounds cannot be loaded")?;
+    // At the speed the chart was loaded at, so the sounds keep its real time.
+    let bank = load_bank_at(
+        chart,
+        opened.rate,
+        loaded.config().speed,
+        &BankLimits::default(),
+    )
+    .context("the sounds cannot be loaded")?;
     log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
     let mut engine = AudioEngine::with_schedule(
         Arc::new(bank),

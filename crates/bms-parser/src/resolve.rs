@@ -12,6 +12,8 @@ use crate::{Warning, WarningKind};
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
     note: Note,
+    /// The real times of its head and its end ([`Timed::real`]).
+    real: (TimeUs, TimeUs),
     /// The exact position of the note's head ([`Timed::rank`]).
     rank: usize,
     /// The exact position of its end: a long note's end, else `rank`.
@@ -49,16 +51,26 @@ impl Sounds<'_> {
     }
 }
 
-/// The resolved notes per lane and the BGM.
+/// The resolved notes per lane and the BGM, at 1×.
 pub struct Resolved {
     pub lanes: [Vec<Note>; LANE_COUNT],
     pub bgm: Vec<BgmEvent>,
+    /// At another speed, the real times of the same objects in the same
+    /// order: each note's head and end, and each BGM event's.
+    pub real: Option<RealTimes>,
+}
+
+/// The real times of [`Resolved`]'s objects.
+pub struct RealTimes {
+    pub lanes: [Vec<(TimeUs, TimeUs)>; LANE_COUNT],
+    pub bgm: Vec<TimeUs>,
 }
 
 /// A `#LNTYPE 1` endpoint before pairing.
 #[derive(Clone, Copy)]
 struct Endpoint {
     time: TimeUs,
+    real: TimeUs,
     pos: Position,
     rank: usize,
     id: u16,
@@ -68,15 +80,18 @@ struct Endpoint {
 
 /// Builds lanes from objects sorted by position. Identity, conflicts and
 /// pairing are decided on exact positions ([`Timed::rank`]), so objects at
-/// distinct positions that floor to one µs stay distinct.
+/// distinct positions that floor to one µs stay distinct. With `mapped`,
+/// the real times are kept beside them.
 pub fn resolve(
     objects: &[Timed],
+    mapped: bool,
     lnobj: &BTreeSet<u16>,
     sounds: &mut Sounds<'_>,
     warnings: &mut Vec<Warning>,
 ) -> Resolved {
     let mut candidates: [Vec<Candidate>; LANE_COUNT] = Default::default();
     let mut bgm = Vec::new();
+    let mut real_bgm = Vec::new();
     // Per lane: the last plain note, which an #LNOBJ end may turn into a
     // long note.
     let mut last_plain: [Option<usize>; LANE_COUNT] = [None; LANE_COUNT];
@@ -96,6 +111,9 @@ pub fn resolve(
                         time: obj.time,
                         sound,
                     });
+                    if mapped {
+                        real_bgm.push(obj.real);
+                    }
                 }
             }
             ObjectKind::Note(lane, id) if lnobj.contains(&id) => {
@@ -112,6 +130,7 @@ pub fn resolve(
                             end_sound: None,
                         };
                         start.end_rank = obj.rank;
+                        start.real.1 = obj.real;
                     }
                     None => warn(warnings, WarningKind::UnpairedLongNoteEnd),
                 }
@@ -127,6 +146,7 @@ pub fn resolve(
                         sound,
                         kind: NoteKind::Tap,
                     },
+                    real: (obj.real, obj.real),
                     rank: obj.rank,
                     end_rank: obj.rank,
                     seq: obj.seq,
@@ -135,6 +155,7 @@ pub fn resolve(
             }
             ObjectKind::Long(lane, id) => endpoints[lane.index()].push(Endpoint {
                 time: obj.time,
+                real: obj.real,
                 pos: obj.pos,
                 rank: obj.rank,
                 id,
@@ -151,6 +172,7 @@ pub fn resolve(
                             damage: i32::from(id),
                         },
                     },
+                    real: (obj.real, obj.real),
                     rank: obj.rank,
                     end_rank: obj.rank,
                     seq: obj.seq,
@@ -164,8 +186,16 @@ pub fn resolve(
         pair_long_notes(lane, &mut candidates[l], sounds, warnings);
     }
 
-    let lanes = candidates.map(|lane| settle(lane, warnings));
-    Resolved { lanes, bgm }
+    let mut lanes: [Vec<Note>; LANE_COUNT] = Default::default();
+    let mut real_lanes: [Vec<(TimeUs, TimeUs)>; LANE_COUNT] = Default::default();
+    for ((lane, notes), real) in candidates.into_iter().zip(&mut lanes).zip(&mut real_lanes) {
+        (*notes, *real) = settle(lane, mapped, warnings);
+    }
+    let real = mapped.then_some(RealTimes {
+        lanes: real_lanes,
+        bgm: real_bgm,
+    });
+    Resolved { lanes, bgm, real }
 }
 
 /// Pairs one lane's `#LNTYPE 1` endpoints in position order. Endpoints at
@@ -209,6 +239,7 @@ fn pair_long_notes(
                     end_sound,
                 },
             },
+            real: (start.real, end.real),
             rank: start.rank,
             end_rank: end.rank,
             seq: start.seq,
@@ -225,10 +256,16 @@ fn pair_long_notes(
 
 /// Settles one lane: at one position the highest priority wins, then the
 /// later object in the file; a note at or inside an earlier long note's span
-/// is dropped.
-fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Note> {
+/// is dropped. With `mapped`, the kept notes' real times come beside them;
+/// otherwise that list stays empty.
+fn settle(
+    mut lane: Vec<Candidate>,
+    mapped: bool,
+    warnings: &mut Vec<Warning>,
+) -> (Vec<Note>, Vec<(TimeUs, TimeUs)>) {
     lane.sort_unstable_by_key(|c| (c.rank, priority(c.note.kind), c.seq));
     let mut kept: Vec<Note> = Vec::with_capacity(lane.len());
+    let mut real = Vec::with_capacity(if mapped { lane.len() } else { 0 });
     // The end position of the last note kept.
     let mut last_end_rank: Option<usize> = None;
     for (i, c) in lane.iter().enumerate() {
@@ -244,10 +281,13 @@ fn settle(mut lane: Vec<Candidate>, warnings: &mut Vec<Warning>) -> Vec<Note> {
             drop(warnings, WarningKind::NoteInsideLongNoteDropped);
         } else {
             kept.push(c.note);
+            if mapped {
+                real.push(c.real);
+            }
             last_end_rank = Some(c.end_rank);
         }
     }
-    kept
+    (kept, real)
 }
 
 #[cfg(test)]
@@ -264,6 +304,7 @@ mod tests {
     fn at(time: i64, kind: ObjectKind) -> Timed {
         Timed {
             time: TimeUs(time),
+            real: TimeUs(time),
             pos: Position(i128::from(time)),
             kind,
             line: usize::try_from(time).unwrap(),
@@ -286,7 +327,13 @@ mod tests {
             .zip(objects)
             .map(|(seq, o)| Timed { seq, ..*o })
             .collect();
-        let resolved = resolve(&objects, &BTreeSet::new(), &mut sounds, &mut warnings);
+        let resolved = resolve(
+            &objects,
+            false,
+            &BTreeSet::new(),
+            &mut sounds,
+            &mut warnings,
+        );
         let notes = resolved.lanes[1]
             .iter()
             .map(|n| (n.time.0, n.sound, n.kind))

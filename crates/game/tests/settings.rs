@@ -551,6 +551,7 @@ fn sample() -> replay::PlayRecord {
             },
         },
         play_type: replay::PlayType::Full,
+        speed: bms_model::Speed::NORMAL,
         start: eval::InputStart::default(),
         events: Vec::new(),
         arrivals: Vec::new(),

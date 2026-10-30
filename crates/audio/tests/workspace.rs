@@ -52,7 +52,7 @@ fn speed_stage_workspace_is_bounded() {
         }
     );
     // The ladder's stages, input to output, by hand.
-    let rates: Vec<(u32, u32)> = Speed::ladder().map(Speed::stage_rates).collect();
+    let rates: Vec<(u32, u32)> = Speed::ladder().map(Speed::ratio).collect();
     assert_eq!(rates[0], (1, 2));
     assert_eq!(rates[3], (13, 20));
     assert_eq!(rates[10], (1, 1));

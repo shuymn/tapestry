@@ -219,8 +219,13 @@ pub struct ChartIdentity {
     pub sha256: [u8; 32],
     /// MD5 of the file bytes.
     pub md5: [u8; 16],
-    /// Hash of the resolved objects and the sound names as written.
+    /// Hash of the resolved objects and the sound names as written, at 1×:
+    /// the same at every practice speed.
     pub resolved_hash: [u8; 32],
+    /// The same hash over the chart as loaded at its practice speed, so a
+    /// record also pins the real timeline it was played on; equal to
+    /// `resolved_hash` at 1×.
+    pub played_hash: [u8; 32],
     /// Version of the loader rules that resolved the chart.
     pub loader_version: u32,
     /// The value chosen by each `#RANDOM`, in order.

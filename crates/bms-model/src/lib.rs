@@ -13,6 +13,7 @@ mod chart;
 mod clock;
 mod error;
 mod scroll;
+mod speed;
 
 pub use builder::ChartBuilder;
 pub use chart::{
@@ -22,6 +23,7 @@ pub use chart::{
 pub use clock::{TimeSource, VirtualClock};
 pub use error::ModelError;
 pub use scroll::{BEAT, DOMAIN, FRAC_BITS, Position, ScrollChange, ScrollMap, ScrollSegment};
+pub use speed::Speed;
 
 /// A point in chart time, in integer microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

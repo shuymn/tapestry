@@ -95,6 +95,7 @@ fn played_with(chart: &str, seed: u64) -> PlayRecord {
             },
         },
         play_type: PlayType::Full,
+        speed: bms_model::Speed::NORMAL,
         start: InputStart {
             opened_at: TimeUs(0),
             held: Vec::new(),

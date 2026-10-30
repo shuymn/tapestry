@@ -69,6 +69,14 @@ pub enum LoadError {
         /// The measure being computed.
         measure: u16,
     },
+    /// At the load's speed, a kept time lies beyond what the scroll map and
+    /// the evaluator hold (±2^32 µs, about 71.6 minutes): a chart longer
+    /// than about 35.8 minutes at 50 %. It loads at a faster speed.
+    #[error("measure {measure}: chart is too long to play at this speed")]
+    TooLongAtSpeed {
+        /// The first measure with a real time past the limit.
+        measure: u16,
+    },
     /// A `#WAV` name is absolute, rooted, drive-prefixed, UNC, or contains
     /// `..`.
     #[error("line {line}: sound path must stay relative to the chart folder")]
