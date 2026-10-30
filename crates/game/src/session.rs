@@ -875,10 +875,9 @@ impl Loaded {
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn ends_play(&self, gauges: &[GaugeState]) -> bool {
-        let failed = gauges
-            .iter()
-            .zip(&self.preset.gauges)
-            .any(|(g, rule)| rule.kind == GaugeKind::Survival && g.failed_at.is_some());
+        let failed = gauges.iter().zip(&self.preset.gauges).any(|(g, rule)| {
+            matches!(rule.kind, GaugeKind::Survival { .. }) && g.failed_at.is_some()
+        });
         failed && self.parts.policy.on_survival_failure() == FailureAction::EndPlay
     }
 

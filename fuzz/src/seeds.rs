@@ -467,13 +467,22 @@ pub fn preset_canonicals() -> Vec<Seed> {
         })
         .collect();
     // beatoraja-style carries the other header, window and assignment
-    // policies and a scratch table of its own.
+    // policies, a scratch table of its own, damage bands, the increase
+    // limit and the default #TOTAL from the note count; the gauge policies
+    // seed the other correction and default and a failure threshold.
+    let mut policies = rules::beatoraja_style();
+    policies.default_total = rules::DefaultTotal::NotesLinear;
+    policies.gauges[4].kind = rules::GaugeKind::Survival {
+        fails_below: rules::GaugeValue(2 * rules::GaugeValue::PERCENT),
+    };
+    policies.gauges[4].correction = rules::TotalCorrection::ScaleDamage;
     let mut seeds: Vec<Seed> = vec![
         ("custom", bytes.clone()),
         (
             "beatoraja_style",
             rules::beatoraja_style().canonical_bytes(),
         ),
+        ("gauge_policies", policies.canonical_bytes()),
         ("long", long.canonical_bytes()),
     ];
 
