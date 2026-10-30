@@ -25,7 +25,7 @@ use crate::widget::lanes::{Geometry, Lanes, Side};
 pub const MIN_VISIBLE: i32 = 64;
 
 /// Where an element sits: its region, the point of its rect it rotates
-/// and scales about, its lane binding and its fill.
+/// about, its lane binding and its fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
     pub region: Region,
@@ -393,7 +393,7 @@ impl Regions {
                 };
             }
         };
-        // The playfield and the judge, translated jointly (C14): the
+        // The playfield and the judge, translated jointly: the
         // judge's own translation first, within what the playfield's
         // range leaves possible, then the playfield's within both.
         let play = axes(Region::Playfield);
