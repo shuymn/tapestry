@@ -18,11 +18,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use audio::{AudioEngine, MAX_VOICES};
 use bms_model::{BgmEvent, Chart, ChartBuilder, JudgeRank, SoundId, TimeUs};
-use common::{MS, lane};
+use common::{MS, custom_settings, lane};
 use eval::{EvalError, PhysicalInputEvent};
 use game::{
     AutoplayError, ChartIngest, DataRoot, DeviceSettings, IngestError, Ingested, KeyConfig, Loaded,
-    LogicError, Parts, RECORDING_MEMORY, Reservation, SessionConfig, Settings,
+    LogicError, Parts, RECORDING_MEMORY, Reservation, SessionConfig,
 };
 use input::{DeviceKind, source_queue};
 use replay::{BuildProvenance, ReceiveMethod};
@@ -121,7 +121,7 @@ fn chart(notes: i64, bgm: usize) -> Chart {
 
 fn loaded(dir: &Path, chart: &Chart) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = Settings::load(&root).unwrap();
+    let settings = custom_settings(&root);
     let path = dir.join("play.chart");
     std::fs::write(&path, b"built in code").unwrap();
     let parts = Parts {

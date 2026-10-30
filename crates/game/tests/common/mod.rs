@@ -10,11 +10,19 @@ use eval::{
     Binding, ControlId, DeviceProfile, InputKind, JudgeEvent, JudgeEventKind, PhysicalInputEvent,
     SourceId, SourceProfile,
 };
-use game::{Runner, RunnerAudio, Wakes};
+use game::{DataRoot, Runner, RunnerAudio, Settings, Wakes};
 use input::{DeviceKind, ScriptedInput, SourceConfig, autoplay};
 use rules::Judgment;
 
 pub const MS: i64 = 1_000;
+
+/// The settings in `root`, naming the custom preset: for tests whose values
+/// are the custom preset's.
+pub fn custom_settings(root: &DataRoot) -> Settings {
+    let mut settings = Settings::load(root).unwrap();
+    settings.player.preset = "custom.toml".to_owned();
+    settings
+}
 
 /// The control a source binds to `lane`: `0x100 + lane index`, so control
 /// ids never equal lane numbers.
