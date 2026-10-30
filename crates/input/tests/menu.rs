@@ -3,10 +3,10 @@
 
 use bms_model::TimeUs;
 use eval::ControlId;
-use input::hid::{AxisCap, HidProduct, axis_cap, axis_control};
+use input::hid::{AxisCap, HidDevice, HidLayout, HidProduct, HidReport, axis_cap, axis_control};
 use input::{
-    DeviceId, DeviceKind, MENU_QUEUE, MenuAction, MenuBindings, MenuEvent, MenuReceiver, Packet,
-    SourceConfig, SourceSet, menu_queue,
+    Capture, DeviceId, DeviceKind, MENU_QUEUE, MenuAction, MenuBindings, MenuEvent, MenuReceiver,
+    Packet, SourceConfig, SourceSet, menu_queue,
 };
 
 const PAD: HidProduct = HidProduct {
@@ -306,4 +306,38 @@ fn a_full_queue_drops_and_counts() {
     send(&mut set, &[packet(10, CONFIRM, 1)]);
     assert_eq!(events(&mut rx), [MenuEvent::Confirm]);
     assert_eq!(rx.dropped(), 3);
+}
+
+/// Through the controller's report reader: with focus lost and regained
+/// within one boundary interval (the menu stays active), X reported at 100
+/// in the foreground, 110 in the background and 112 in the foreground
+/// sends nothing for the movement made in the background; the report after
+/// it only says where X is, and movement from there counts again.
+#[test]
+fn background_movement_never_counts() {
+    let (mut set, mut rx) = set_with(&[(10, PAD)], &caps(), x_only(2, None));
+    let layout = HidLayout {
+        collection: 0,
+        axes: &caps(),
+        buttons: &[],
+    };
+    let mut pad = HidDevice::new(DeviceId(10), &layout);
+    let capture = Capture::new();
+    let mut report = |x: i32, background: bool, set: &mut SourceSet| {
+        let axes = [Some(x), None];
+        let r = HidReport {
+            id: 0,
+            buttons: None,
+            axes: &axes,
+        };
+        set.begin_batch(TimeUs(1));
+        pad.report(&r, background, &capture, set);
+        set.end_batch(TimeUs(2));
+    };
+    report(100, false, &mut set);
+    report(110, true, &mut set);
+    report(112, false, &mut set);
+    assert_eq!(events(&mut rx), []);
+    report(114, false, &mut set);
+    assert_eq!(events(&mut rx), [MenuEvent::Down]);
 }

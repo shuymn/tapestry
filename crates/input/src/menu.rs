@@ -15,7 +15,8 @@
 //! packet of any other device never reach the queue. Turning the menu off,
 //! another device sending, or the device's removal forgets the movement
 //! counted and every axis's position, so the next report of an axis only
-//! says where it is.
+//! says where it is; a background report of an axis forgets its position
+//! the same way, so movement made in the background never counts.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -194,9 +195,21 @@ impl MenuTap {
     /// One packet of the configured controller's first unit, with the
     /// axis's capability (`None` for a button). Sends what its binding
     /// says, if the menu is active and the packet was received in the
-    /// foreground.
+    /// foreground. A background report of an axis sends nothing and makes
+    /// its position unknown, so movement made in the background never
+    /// counts: the next foreground report only says where it is.
     pub fn offer(&mut self, packet: &Packet, axis: Option<&AxisCap>) {
-        if !self.active || packet.background {
+        if !self.active {
+            return;
+        }
+        if packet.background {
+            if let Some(b) = self
+                .controls
+                .iter_mut()
+                .find(|b| b.control == packet.control)
+            {
+                b.last = None;
+            }
             return;
         }
         if self.counting != Some(packet.device) {
