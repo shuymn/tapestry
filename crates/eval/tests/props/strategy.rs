@@ -990,8 +990,8 @@ fn judgeable(chart: &Chart, section: Option<&Section>) -> Vec<(usize, TimeUs)> {
 /// Each lane class's windows after the window policy.
 fn lane_windows(ev: &Evaluator<'_>) -> PerLaneClass<JudgeWindows> {
     PerLaneClass {
-        keys: ev.table(lane(1)).table.windows,
-        scratch: ev.table(Lane::SCRATCH).table.windows,
+        keys: ev.table(lane(1)).windows,
+        scratch: ev.table(Lane::SCRATCH).windows,
     }
 }
 
@@ -1193,8 +1193,7 @@ pub fn build_play(raw: &RawPlay) -> Play {
                 .or(judgeable(&chart, None).last())
                 .unwrap();
             let at = final_deadline.0 + if param % 2 == 0 { 1 } else { TICK };
-            // The range of the lane's class, never scaled; the scan
-            // envelope widens with it.
+            // The range of the lane's class, never scaled.
             let [keys, scratch] = preset.tables.each_mut();
             let table = if lane(l) == Lane::SCRATCH {
                 scratch
@@ -1817,23 +1816,7 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
     let scale = scale_of(&preset, &chart.meta.judgment_headers);
     let scaled = |edge: TimeUs| edge.0 * scale / 100_000;
     let bad = preset.tables.keys.windows.bad;
-    let (mut early, late) = (scaled(bad.early), scaled(bad.late));
-    // A scan envelope that excludes the early BAD edge excludes a press on
-    // it (`WindowPolicy::Scaled`).
-    let envelope = Evaluator::new(
-        &chart,
-        &preset,
-        &crate::common::device(&[0]),
-        &InputStart::default(),
-        None,
-        0,
-    )
-    .unwrap()
-    .table(lane(1))
-    .envelope;
-    if early > 0 && !envelope.contains(-i128::from(early)) {
-        early -= 1;
-    }
+    let (early, late) = (scaled(bad.early), scaled(bad.late));
     let deviation = below(raw.deviation, early + late + 1) - early;
     // Held exactly as long as the long note, a little or much longer.
     let extra = match raw.extra % 3 {

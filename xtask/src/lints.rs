@@ -132,7 +132,6 @@ pub const IN_PLAY: &[Site] = &[
             "LaneClass::of",
             "PerLaneClass::get",
             "PerLaneClass::of_lane",
-            "ScanEnvelope::contains",
         ],
     ),
     Site::Fns(

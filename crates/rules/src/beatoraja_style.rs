@@ -21,8 +21,7 @@
 //! | Release earlier than the GOOD edge is BAD, never POOR | `play/JudgeManager.java:533-541` (`lnendJudge = 3`; the release margin is 0, `play/JudgeProperty.java:26`) |
 //! | Release: the worse of head and release; held through the end keeps the head | `play/JudgeManager.java:534`, `:572-573` |
 //! | Scratch notes: PERFECT ±30, GREAT ±70, GOOD ±160 ms, BAD 230 ms early and 290 ms late; scratch LN-end edges 130, 170, 210 ms; scratch empty POOR 160 ms behind | `play/JudgeProperty.java:24` (scratch notes and MS pair), `:27` (scratch LN ends), `:191-197` (the table per note type); a scratch press, release and miss read it (`play/JudgeManager.java:380`, `:494`, `:595`) |
-//! | Empty POOR: a note at most 500 ms after the press or 150 ms before it (160 ms on the scratch), inclusive, and inside the scan envelope | `play/JudgeProperty.java:23-24` (MS pairs), `play/JudgeManager.java:401` |
-//! | Scan envelope ([`WindowPolicy::Scaled`]): one for both tables, from the farthest late edge, included, to the farthest early edge, excluded, over the scaled note and scratch tables with their MS pairs; at 500 ms or less of early BAD, a note exactly 500 ms after the press is not reached | `play/JudgeManager.java:189-196` (the envelope), `:387-392` (the scan) |
+//! | Empty POOR: a note at most 500 ms after the press or 150 ms before it (160 ms on the scratch), inclusive (the scan's far end: see the known differences) | `play/JudgeProperty.java:23-24` (MS pairs), `play/JudgeManager.java:401` |
 //! | Empty POOR keeps the combo, adds to BP, has its own count | `play/JudgeProperty.java:29` (combo), `play/JudgeManager.java:660-668`, `BMSPlayer.java:915` (BP), `ScoreData.java:278` (MS count) |
 //! | BAD and POOR break the combo and add to BP | `play/JudgeProperty.java:29`, `BMSPlayer.java:915` |
 //! | Missed once its late BAD edge has passed (timing: see H below) | `play/JudgeManager.java:594-598` |
@@ -104,16 +103,27 @@
 //!   reads rank 2 here; Java's `trim` removes only characters up to U+0020,
 //!   so `Integer.parseInt` throws and rank 3 stays there
 //!   (`BMSDecoder.java:367-368`, `:702-713`).
-//!
 //! - **A `#DEFEXRANK` whose windows pass 2^32 µs.** Every edge here stays
 //!   within the chart time domain, so from `#DEFEXRANK 1974699` (1 481 024 %,
 //!   which takes the scratch's 290 ms late edge past 2^32 µs) the chart is
 //!   refused, where the source plays windows over an hour wide; from
 //!   28 633 116, `n × 75` also wraps in the source's `int` arithmetic
 //!   (`play/BMSPlayerRule.java:63`).
+//! - **The note scan's far end.** Implementation structure is not
+//!   reproduced (design.md "What a -style Preset Reproduces"). The source
+//!   scans a lane's notes up to the farthest early edge of the scaled note
+//!   and scratch tables, their MS pairs' 500 ms included, and stops at a
+//!   note exactly that far (`play/JudgeManager.java:189-196` for the bound,
+//!   `:387-389` for the stop). Here a press looks at the notes inside its
+//!   lane class's own BAD window and empty POOR range, each with its own
+//!   edges. So a note exactly 500 ms after a press makes an empty POOR here
+//!   at every scale, and there only once a scaled early BAD edge passes
+//!   500 ms; and from about 218 %, where the scratch's early BAD edge is
+//!   that far end, a scratch press exactly on it (501.4 ms early at
+//!   `#DEFEXRANK 291`) is BAD here and judges nothing there.
 //!
 //! Each of the second and third is an example in
-//! `crates/bms-parser/tests/judgment_headers.rs`, and the last one in
+//! `crates/bms-parser/tests/judgment_headers.rs`, and the last two in
 //! `crates/eval/tests/style_beatoraja.rs`.
 //!
 //! The CLASS gauges (course play only) are not included.
@@ -215,8 +225,6 @@ pub fn beatoraja_style() -> RulePreset {
                     great: TimeUs(160 * MS),
                     good: TimeUs(200 * MS),
                 },
-                // Inclusive; the scan envelope excludes a note exactly
-                // 500 ms ahead while no early BAD edge passes it.
                 empty_poor: EmptyPoorRange {
                     ahead: TimeUs(500 * MS),
                     behind: TimeUs(150 * MS),

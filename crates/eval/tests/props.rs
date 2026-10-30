@@ -677,7 +677,7 @@ fn count_section(play: &Play, s: &eval::Section, whole: &Evaluation, c: &mut Cov
         whole.events.iter().any(|e| {
             lead_in.contains(&e.time)
                 && matches!(e.kind, JudgeEventKind::Judged { lane, deviation: Some(d), .. }
-                    if d.0 == -ev.table(lane).table.windows.bad.early.0)
+                    if d.0 == -ev.table(lane).windows.bad.early.0)
         }),
     );
     // A lead-in press the section ignores and a whole-chart play judges or

@@ -287,8 +287,7 @@ pub enum MissRule {
 /// Empty POOR: a press that judges no note but lies close to one.
 ///
 /// A press that judges no note is an empty POOR when a note of its lane,
-/// judged or not, lies inside its lane class's [`EmptyPoorRange`] and the
-/// scan envelope the [`WindowPolicy`] prepares.
+/// judged or not, lies inside its lane class's [`EmptyPoorRange`].
 ///
 /// Every such press counts, with no cap. Its gauge change is
 /// [`GaugeRule::empty_poor`].
@@ -576,7 +575,6 @@ mod tests {
                 .prepare(&preset.tables, Some(JudgeRank::Rank(rank)))
                 .unwrap()
                 .keys
-                .table
                 .windows
         };
         let windows = preset.tables.keys.windows;

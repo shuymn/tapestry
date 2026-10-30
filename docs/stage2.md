@@ -252,6 +252,8 @@ egui comes with the first form-like screen.
 - the latest change per key per poll, and a poll's key changes before its misses;
 - tapestry's own scratch conversion.
 
+**Implementation structure is not reproduced (decided).** A behavior that comes from a target's implementation structure, and would not arise from a straightforward implementation here, is not built; the preset's module records it as a known difference with its mechanism and an example. beatoraja-style's so far: beatoraja scans a lane's notes up to the farthest early edge of its note and scratch tables, MS pairs included, and stops at a note exactly that far (`play/JudgeManager.java:189-196`, `:387-389`). Here a press looks at its lane class's own BAD window and empty POOR range, each with its own edges. So a note exactly 500 ms ahead makes an empty POOR here at every scale, and there only once a scaled early BAD edge passes 500 ms; and at `#DEFEXRANK 291` a scratch press exactly 501.4 ms early is BAD here and judges nothing there.
+
 **What beatoraja-style still needs.** beatoraja differs from today's model in six places, each shown by an example in crates/rules/src/beatoraja_style.rs (paths under `src/bms/player/beatoraja/`). PR7 landed the values the model expresses; these remain:
 - **B. Note assignment:** combo priority, and earlier notes stay hittable until their own deadlines instead of being missed at the press (PR7b).
 - **H. Miss timing:** a note is missed strictly after its late BAD edge, at `edge + 1 µs`, so a press on another lane at `edge + 1 µs` is judged first, which can change combo and gauge. A press on the same lane at the edge stays BAD (PR7b).
@@ -733,7 +735,7 @@ PR7e lands before PR7a; the letter names it, not its place.
 - When `#DEFEXRANK` or `#RANK 4` is present, the windows shall scale as beatoraja does (`defexrank_and_rank_4_scale_like_the_source`).
 - When a chart declares `#DEFEXRANK 1` under beatoraja-style, its windows shall be zero-width and the chart shall play: a press exactly on a note is PERFECT and one 1 µs off judges no note (`defexrank_1_gives_zero_width_windows`).
 - When scaled edges tie, preparation shall accept them; if a preset's own table does not ascend, then validation shall refuse it (`derived_edges_may_tie`).
-- When beatoraja-style's scaled early BAD edge passes 500 ms, a judged note exactly 500 ms ahead of a press shall make it an empty POOR, and below that scale it shall not (`scan_envelope_follows_the_scaled_tables`).
+- When a note lies exactly 500 ms ahead of a press under beatoraja-style, judged or not, it shall make it an empty POOR whether or not a scaled early BAD edge passes 500 ms, recorded as a known difference with the source's scan bound (`a_note_500_ms_ahead_makes_an_empty_poor_at_every_scale`); at `#DEFEXRANK 291` a scratch press exactly on its early BAD edge shall be BAD (`a_scratch_press_on_its_early_bad_edge_at_218_percent_is_bad`).
 - When the scratch table's late BAD edge sets the latest deadline, completion, the what-if's final deadline and the section probe's `final_deadline()` shall all be that time (`final_deadline_has_one_source`).
 - When the presets are written and read through `rules-toml`, they shall round-trip; an older encoding shall be refused.
 - When the custom preset's existing examples run, they shall pass unchanged.

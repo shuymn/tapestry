@@ -86,9 +86,7 @@ impl<T: Copy> PerLaneClass<T> {
 }
 
 /// How far a note may lie from a press to make it an empty POOR, both
-/// distances inclusive. Press resolution reaches a note only inside the
-/// scan envelope too, which can cut the range's far end
-/// ([`WindowPolicy::Scaled`]).
+/// distances inclusive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EmptyPoorRange {
     /// How far ahead of the press (a magnitude, not negative).
@@ -107,61 +105,6 @@ pub struct LaneTable {
     pub ln_end: LnEndWindows,
     /// The empty POOR range.
     pub empty_poor: EmptyPoorRange,
-}
-
-impl LaneTable {
-    /// The farthest the table reaches ahead of and behind a press: the
-    /// wider of the BAD window's and the empty POOR range's.
-    fn reach(&self) -> (TimeUs, TimeUs) {
-        let bad = self.windows.bad;
-        let ep = self.empty_poor;
-        (bad.early.max(ep.ahead), bad.late.max(ep.behind))
-    }
-}
-
-/// One bound of a [`ScanEnvelope`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Reach {
-    /// The distance from the press (a magnitude, not negative).
-    pub distance: TimeUs,
-    /// Whether a note exactly `distance` away is inside.
-    pub inclusive: bool,
-}
-
-/// The farthest a note may lie ahead of or behind a press for press
-/// resolution to look at it: no note outside is a candidate or makes an
-/// empty POOR.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScanEnvelope {
-    /// Toward notes after the press.
-    pub ahead: Reach,
-    /// Toward notes before the press.
-    pub behind: Reach,
-}
-
-impl ScanEnvelope {
-    /// Whether a note at deviation `d = press − note` lies inside.
-    #[must_use]
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn contains(&self, d: i128) -> bool {
-        let (reach, distance) = if d < 0 {
-            (self.ahead, -d)
-        } else {
-            (self.behind, d)
-        };
-        let r = i128::from(reach.distance.0);
-        distance < r || (reach.inclusive && distance == r)
-    }
-}
-
-/// One lane class's table after the window policy applied the chart's
-/// rank, with its scan envelope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PreparedTable {
-    /// The scaled table. Its edges may tie; they never cross.
-    pub table: LaneTable,
-    /// Where press resolution looks for notes.
-    pub envelope: ScanEnvelope,
 }
 
 /// How `#RANK` and `#DEFEXRANK` become a scale, as whole percentages
@@ -208,92 +151,43 @@ impl ScaledRank {
 pub enum WindowPolicy {
     /// Every window and LN-end edge scaled by [`RankScale`], in thousandths
     /// of a percent, `#DEFEXRANK n` by `n` %; the empty POOR range is not
-    /// scaled. Each lane class's scan envelope is its own BAD window and
-    /// empty POOR range, so it never cuts either.
+    /// scaled.
     Thousandths(RankScale),
     /// Every window and LN-end edge scaled by a whole percentage from
     /// [`ScaledRank`], each edge `floor(edge × percent / 100)` in µs; the
-    /// empty POOR range is not scaled. One scan
-    /// envelope spans both lane classes: ahead to the farthest early BAD
-    /// edge or empty POOR reach of either table, that distance excluded;
-    /// behind to the farthest late one, included. Once a scaled early BAD
-    /// edge passes the empty POOR range's far end, a note exactly at that
-    /// end comes inside.
+    /// empty POOR range is not scaled.
     Scaled(ScaledRank),
 }
 
 impl WindowPolicy {
-    /// Each lane class's table and scan envelope for `rank`. A scale of 0
-    /// gives zero-width windows. `None` when the scale is unusable
-    /// (negative, or not fitting) or a scaled edge passes
+    /// Each lane class's table for `rank`. Press resolution looks at a note
+    /// inside the class's own BAD window or empty POOR range, each with its
+    /// own bounds (design.md "Evaluation Stages", scan envelopes). A scale
+    /// of 0 gives zero-width windows; scaled edges may tie. `None` when the
+    /// scale is unusable (negative, or not fitting) or a scaled edge passes
     /// [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE).
     #[must_use]
     pub fn prepare(
         &self,
         tables: &PerLaneClass<LaneTable>,
         rank: Option<JudgeRank>,
-    ) -> Option<PerLaneClass<PreparedTable>> {
+    ) -> Option<PerLaneClass<LaneTable>> {
+        let milli = match self {
+            Self::Thousandths(scale) => scale.scale_milli(rank)?,
+            Self::Scaled(scale) => scale.percent(rank)?.checked_mul(1_000)?,
+        };
         // The empty POOR range is never scaled.
-        let scaled = |t: &LaneTable, milli: i64| -> Option<LaneTable> {
+        let scaled = |t: &LaneTable| -> Option<LaneTable> {
             Some(LaneTable {
                 windows: t.windows.scaled(milli)?,
                 ln_end: t.ln_end.scaled(milli)?,
                 empty_poor: t.empty_poor,
             })
         };
-        match self {
-            Self::Thousandths(scale) => {
-                let milli = scale.scale_milli(rank)?;
-                let own = |t: &LaneTable| -> Option<PreparedTable> {
-                    let table = scaled(t, milli)?;
-                    let (ahead, behind) = table.reach();
-                    Some(PreparedTable {
-                        table,
-                        envelope: ScanEnvelope {
-                            ahead: Reach {
-                                distance: ahead,
-                                inclusive: true,
-                            },
-                            behind: Reach {
-                                distance: behind,
-                                inclusive: true,
-                            },
-                        },
-                    })
-                };
-                Some(PerLaneClass {
-                    keys: own(&tables.keys)?,
-                    scratch: own(&tables.scratch)?,
-                })
-            }
-            Self::Scaled(rank_scale) => {
-                let milli = rank_scale.percent(rank)?.checked_mul(1_000)?;
-                let keys = scaled(&tables.keys, milli)?;
-                let scratch = scaled(&tables.scratch, milli)?;
-                let (keys_ahead, keys_behind) = keys.reach();
-                let (scratch_ahead, scratch_behind) = scratch.reach();
-                let envelope = ScanEnvelope {
-                    ahead: Reach {
-                        distance: keys_ahead.max(scratch_ahead),
-                        inclusive: false,
-                    },
-                    behind: Reach {
-                        distance: keys_behind.max(scratch_behind),
-                        inclusive: true,
-                    },
-                };
-                Some(PerLaneClass {
-                    keys: PreparedTable {
-                        table: keys,
-                        envelope,
-                    },
-                    scratch: PreparedTable {
-                        table: scratch,
-                        envelope,
-                    },
-                })
-            }
-        }
+        Some(PerLaneClass {
+            keys: scaled(&tables.keys)?,
+            scratch: scaled(&tables.scratch)?,
+        })
     }
 }
 
@@ -301,8 +195,8 @@ impl WindowPolicy {
 mod tests {
     use bms_model::TimeUs;
 
-    use super::{Reach, ScaledRank, ScanEnvelope, WindowPolicy};
-    use crate::{JudgeRank, beatoraja_style, custom};
+    use super::{ScaledRank, WindowPolicy};
+    use crate::{JudgeRank, beatoraja_style};
 
     const MS: i64 = 1_000;
 
@@ -349,32 +243,10 @@ mod tests {
             .prepare(&preset.tables, Some(JudgeRank::Rank(0)))
             .unwrap()
             .scratch
-            .table
             .empty_poor;
         assert_eq!(
             (range.ahead, range.behind),
             (TimeUs(500 * MS), TimeUs(160 * MS))
         );
-    }
-
-    #[test]
-    fn thousandths_envelopes_never_cut_a_range() {
-        let preset = custom();
-        let prepared = preset.window_policy.prepare(&preset.tables, None).unwrap();
-        let inclusive = |ms: i64| Reach {
-            distance: TimeUs(ms * MS),
-            inclusive: true,
-        };
-        assert_eq!(
-            prepared.keys.envelope,
-            ScanEnvelope {
-                ahead: inclusive(500),
-                behind: inclusive(180),
-            }
-        );
-        assert!(prepared.keys.envelope.contains(-500 * i128::from(MS)));
-        assert!(!prepared.keys.envelope.contains(-500 * i128::from(MS) - 1));
-        assert!(prepared.keys.envelope.contains(180 * i128::from(MS)));
-        assert!(!prepared.keys.envelope.contains(180 * i128::from(MS) + 1));
     }
 }

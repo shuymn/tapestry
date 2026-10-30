@@ -287,16 +287,18 @@ fn empty_poor_distances_do_not_scale() {
 // ------------------------------------------------------------ empty POOR
 
 /// Source: play/JudgeProperty.java:23 (MS early 500000) and
-/// play/JudgeManager.java:387-389: the note scan stops at notes 500 ms or
-/// more ahead, so a note exactly 500 ms after the press is not reached.
+/// play/JudgeManager.java:401 (the MS pair's edges inclusive). A note
+/// exactly 500 ms after the press counts here; the source's note scan stops
+/// short of it while no early BAD edge passes 500 ms (a known difference,
+/// [`a_note_500_ms_ahead_makes_an_empty_poor_at_every_scale`]).
 #[test]
-fn empty_poor_reaches_up_to_but_not_500_ms_before_a_note() {
+fn empty_poor_reaches_500_ms_before_a_note() {
     let chart = taps(&[T]);
+    assert_eq!(empty_poors(&play(&chart, tap_at(T - 500 * MS)).events), 1);
     assert_eq!(
-        empty_poors(&play(&chart, tap_at(T - 500 * MS + 1)).events),
-        1
+        empty_poors(&play(&chart, tap_at(T - 500 * MS - 1)).events),
+        0
     );
-    assert_eq!(empty_poors(&play(&chart, tap_at(T - 500 * MS)).events), 0);
 }
 
 /// Source: play/JudgeProperty.java:23 (MS late -150000) and
@@ -799,7 +801,7 @@ fn derived_edges_may_tie() {
     let chart = scratch_and_key(Some(common::defexrank(1)));
     let ev = Evaluator::new(&chart, &style, &dev, &InputStart::default(), None, 0).unwrap();
     for l in [lane(0), lane(1)] {
-        let t = ev.table(l).table;
+        let t = *ev.table(l);
         assert_eq!(t.windows.perfect, Window::symmetric(0));
         assert_eq!(t.windows.bad, Window::symmetric(0));
         assert_eq!(t.ln_end.good, TimeUs(0));
@@ -848,17 +850,16 @@ fn derived_edges_may_tie() {
     );
 }
 
-/// Source: play/JudgeManager.java:189-196 (one envelope, from the farthest
-/// late edge to the farthest early edge of the scaled note and scratch
-/// tables with their MS pairs) and :387-392 (the scan stops at a note that
-/// far ahead, excluded), with the MS pairs' 500 ms early edge
-/// (play/JudgeProperty.java:23-24, inclusive at play/JudgeManager.java:401).
-/// At `#DEFEXRANK 291` (218 %) the scratch's early BAD edge is 501.4 ms,
-/// past 500 ms; at `#DEFEXRANK 290` (217 %) it is 499.1 ms.
+/// Known difference (the preset module, the note scan's far end): a press
+/// looks at the notes inside its lane class's own BAD window and empty POOR
+/// range here. The source scans up to the farthest early edge of the scaled
+/// note and scratch tables with their MS pairs and stops at a note exactly
+/// that far (play/JudgeManager.java:189-196, :387-389), so a note exactly
+/// 500 ms ahead makes an empty POOR there only once a scaled early BAD edge
+/// passes 500 ms: at `#DEFEXRANK 291` (the scratch's 501.4 ms) but not at
+/// `#DEFEXRANK 290` (499.1 ms). Here it does at both, judged or not.
 #[test]
-fn scan_envelope_follows_the_scaled_tables() {
-    // A judged scratch note exactly 500 ms ahead: the first press judges it
-    // BAD 501 ms early, the second is 500 ms before it.
+fn a_note_500_ms_ahead_makes_an_empty_poor_at_every_scale() {
     let scratch = |n| {
         let chart = ChartBuilder::new(BPM)
             .tap(lane(0), TimeUs(T))
@@ -866,6 +867,8 @@ fn scan_envelope_follows_the_scaled_tables() {
             .unwrap();
         with_rank(chart, Some(common::defexrank(n)))
     };
+    // A judged scratch note: the first press judges it BAD 501 ms early, the
+    // second is exactly 500 ms before it.
     let presses = vec![
         press(T - 501 * MS, 0, 0),
         release(T - 501 * MS + 10, 0, 0),
@@ -875,33 +878,30 @@ fn scan_envelope_follows_the_scaled_tables() {
     let e = play(&scratch(291), presses.clone());
     assert_eq!(judged_at(&e), [(T - 501 * MS, Bad)]);
     assert_eq!(empty_poors(&e.events), 1);
-    // Below that scale no press 500 ms early or more judges a note, and the
-    // scan stops short of a note 500 ms ahead.
+    // At 217 % no press 501 ms early judges it; the one 500 ms early is an
+    // empty POOR on the unjudged note.
     let e = play(&scratch(290), presses);
     assert!(judgments(&e.events).iter().all(|j| j.3.is_none()));
-    assert_eq!(empty_poors(&e.events), 0);
-    // One envelope spans both tables: an unjudged key note exactly 500 ms
-    // ahead, past the keys' early BAD edge (479.6 ms at 218 %), is an empty
-    // POOR once the scratch's edge widens the envelope.
-    let key = |n| taps_ranked(&[T], Some(common::defexrank(n)));
-    assert_eq!(
-        empty_poors(&play(&key(291), tap_at(T - 500 * MS)).events),
-        1
-    );
-    assert_eq!(
-        empty_poors(&play(&key(290), tap_at(T - 500 * MS)).events),
-        0
-    );
+    assert_eq!(empty_poors(&e.events), 1);
+    // An unjudged key note exactly 500 ms ahead, at either scale.
+    for n in [290, 291] {
+        let chart = taps_ranked(&[T], Some(common::defexrank(n)));
+        assert_eq!(
+            empty_poors(&play(&chart, tap_at(T - 500 * MS)).events),
+            1,
+            "#DEFEXRANK {n}"
+        );
+    }
 }
 
-/// Source: play/JudgeManager.java:387-389 (`dmtime >= mjudgeend` ends the
-/// scan) with the envelope of :189-196. At `#DEFEXRANK 291` (218 %) the
-/// scratch's early BAD edge, 501.4 ms, is the envelope's far end, so a
-/// scratch note exactly that far ahead is not reached and 1 µs nearer is
-/// BAD; it is past the 500 ms empty POOR range too. The keys' early BAD
-/// edge, 479.6 ms, lies inside the envelope and stays inclusive.
+/// Known difference (the preset module, the note scan's far end): at
+/// `#DEFEXRANK 291` (218 %) the scratch's early BAD edge, 501.4 ms, is the
+/// source's scan bound, at which it stops (play/JudgeManager.java:387-389,
+/// the bound :189-196), so a scratch press exactly 501.4 ms early judges
+/// nothing there. Here the scratch's own BAD window, edges included, makes
+/// it BAD. The note is past the 500 ms empty POOR range either way.
 #[test]
-fn an_early_bad_edge_at_the_envelope_end_is_not_reached() {
+fn a_scratch_press_on_its_early_bad_edge_at_218_percent_is_bad() {
     let chart = scratch_and_key(Some(common::defexrank(291)));
     let first = |presses: Vec<PhysicalInputEvent>| {
         let e = play(&chart, presses);
@@ -913,7 +913,11 @@ fn an_early_bad_edge_at_the_envelope_end_is_not_reached() {
         (pressed, empty_poors(&e.events))
     };
     let scratch_at = |d: i64| vec![press(T + d, 0, 0), release(T + d + 10, 0, 0)];
-    assert_eq!(first(scratch_at(-501_400)), (Vec::new(), 0));
+    assert_eq!(
+        first(scratch_at(-501_400)),
+        (vec![(0, Bad, Some(-501_400))], 0)
+    );
+    assert_eq!(first(scratch_at(-501_401)), (Vec::new(), 0));
     assert_eq!(
         first(scratch_at(-501_399)),
         (vec![(0, Bad, Some(-501_399))], 0)
@@ -934,7 +938,7 @@ fn a_defexrank_past_2_pow_32_is_refused() {
     let late = |n| {
         let chart = taps_ranked(&[T], Some(common::defexrank(n)));
         Evaluator::new(&chart, &style, &dev, &InputStart::default(), None, 0)
-            .map(|ev| ev.table(Lane::SCRATCH).table.windows.bad.late)
+            .map(|ev| ev.table(Lane::SCRATCH).windows.bad.late)
     };
     assert_eq!(late(1_974_698), Ok(TimeUs(4_294_966_700)));
     assert_eq!(late(1_974_699), Err(EvalError::InvalidRank));

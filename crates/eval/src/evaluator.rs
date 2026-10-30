@@ -9,8 +9,8 @@ use bms_model::{
     Chart, DOMAIN, LANE_COUNT, Lane, LnMode as ChartLnMode, NoteKind, SoundId, TimeUs,
 };
 use rules::{
-    Assignment, Denominator, GaugeValue, JudgeWindows, Judgment, LateHeadRule, LnMode, MissRule,
-    PerJudgment, PerLaneClass, PreparedTable, RulePreset, SameTimeOrder, TotalMode,
+    Assignment, Denominator, GaugeValue, JudgeWindows, Judgment, LaneTable, LateHeadRule, LnMode,
+    MissRule, PerJudgment, PerLaneClass, RulePreset, SameTimeOrder, TotalMode,
 };
 
 use crate::EvalError;
@@ -317,9 +317,8 @@ pub struct Evaluator<'a> {
     chart: &'a Chart,
     rule: &'a RulePreset,
     device: &'a DeviceProfile,
-    /// Each lane class's table after the window policy, with its scan
-    /// envelope.
-    tables: PerLaneClass<PreparedTable>,
+    /// Each lane class's table after the window policy.
+    tables: PerLaneClass<LaneTable>,
     lanes: [LaneState; LANE_COUNT],
     conversion: ConversionState,
     inputs: VecDeque<(TimeUs, PhysicalInputEvent)>,
@@ -375,9 +374,9 @@ pub enum AdvanceError {
 }
 
 impl<'a> Evaluator<'a> {
-    /// Prepares evaluation: derives each lane class's windows, LN-end edges,
-    /// empty POOR range and scan envelope from the chart's rank by the
-    /// preset's window policy, builds each lane's deadlines from its own
+    /// Prepares evaluation: derives each lane class's windows, LN-end edges
+    /// and empty POOR range from the chart's rank by the preset's window
+    /// policy, builds each lane's deadlines from its own
     /// class's table and the final deadline from them, computes the gauge
     /// increment, and sets up input conversion from `start`.
     /// `section`, if given, restricts the targets, the input judged and the
@@ -461,7 +460,7 @@ impl<'a> Evaluator<'a> {
             // Each lane's misses by its own class's late BAD edge.
             let miss_after = match rule.miss {
                 MissRule::PoorAfterLateBadOrOvertaken => {
-                    tables.of_lane(lane_of(lane)).table.windows.bad.late
+                    tables.of_lane(lane_of(lane)).windows.bad.late
                 }
             };
             // Reserved at its exact size, which the recording policy counts.
@@ -561,14 +560,14 @@ impl<'a> Evaluator<'a> {
     }
 
     /// The table `lane` is judged by after the window policy: its class's
-    /// windows, LN-end edges, empty POOR range and scan envelope.
+    /// windows, LN-end edges and empty POOR range.
     #[must_use]
-    pub fn table(&self, lane: Lane) -> &PreparedTable {
+    pub fn table(&self, lane: Lane) -> &LaneTable {
         self.tables.of_lane(lane)
     }
 
     /// The table of the lane at `index`, below [`LANE_COUNT`].
-    fn lane_table(&self, index: usize) -> &PreparedTable {
+    fn lane_table(&self, index: usize) -> &LaneTable {
         self.tables.of_lane(lane_of(index))
     }
 
@@ -864,7 +863,7 @@ impl<'a> Evaluator<'a> {
         lead_in: bool,
         out: &mut Vec<JudgeEvent>,
     ) {
-        let PreparedTable { table, envelope } = *self.lane_table(lane);
+        let table = *self.lane_table(lane);
         let bad = table.windows.bad;
         #[expect(
             clippy::indexing_slicing,
@@ -883,25 +882,19 @@ impl<'a> Evaluator<'a> {
         )]
         let time_of = |k: usize| i128::from(notes[state.targets[k]].time.0);
         let first = (state.cursor < state.targets.len()).then_some(state.cursor);
-        // Candidates: unjudged targets inside the scan envelope with
-        // −early ≤ t − note ≤ late (BAD).
+        // Candidates: unjudged targets with −early ≤ t − note ≤ late (BAD),
+        // by the lane class's windows.
         let mut best: Option<(i128, usize)> = None;
         for k in state.cursor..state.targets.len() {
             let deviation = at - time_of(k);
-            // Later targets lie farther ahead still.
-            if deviation < -i128::from(bad.early.0)
-                || (deviation < 0 && !envelope.contains(deviation))
-            {
+            if deviation < -i128::from(bad.early.0) {
                 break;
             }
             #[expect(
                 clippy::indexing_slicing,
                 reason = "the loop keeps `k` below `targets.len()`, which `judged` matches"
             )]
-            if state.judged[k]
-                || deviation > i128::from(bad.late.0)
-                || !envelope.contains(deviation)
-            {
+            if state.judged[k] || deviation > i128::from(bad.late.0) {
                 continue;
             }
             let better = match self.rule.assignment {
@@ -925,9 +918,7 @@ impl<'a> Evaluator<'a> {
         let rule = self.rule.empty_poor;
         let range = table.empty_poor;
         // The first note at or after `t − behind`, judged or not, lies at or
-        // before `t + ahead` and inside the scan envelope. The envelope
-        // reaches at least as far behind as the range, so a later note is
-        // never inside where this one is not.
+        // before `t + ahead`, by the lane class's range.
         let empty_poor = best.is_none() && {
             let from = at - i128::from(range.behind.0);
             #[expect(
@@ -937,9 +928,7 @@ impl<'a> Evaluator<'a> {
             let k = state
                 .targets
                 .partition_point(|&i| i128::from(notes[i].time.0) < from);
-            k < state.targets.len()
-                && time_of(k) <= at + i128::from(range.ahead.0)
-                && envelope.contains(at - time_of(k))
+            k < state.targets.len() && time_of(k) <= at + i128::from(range.ahead.0)
         };
         #[expect(
             clippy::indexing_slicing,
@@ -1095,7 +1084,7 @@ impl<'a> Evaluator<'a> {
         let before = TimeUs(t.0 - end.0);
         let judgment = held
             .judgment
-            .max(self.lane_table(lane).table.ln_end.judgment_of(before));
+            .max(self.lane_table(lane).ln_end.judgment_of(before));
         self.score(
             lane,
             held.target,

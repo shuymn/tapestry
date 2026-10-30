@@ -39,7 +39,4 @@ pub use preset::{
     LowDamage, MAX_WINDOW_EDGE, MineRule, MissRule, PerJudgment, RankScale, RulePreset,
     SCALE_FULL_MILLI, SameTimeOrder, ScoreWeights, TotalMode, Window, scale_edge,
 };
-pub use windows::{
-    EmptyPoorRange, LaneClass, LaneTable, PerLaneClass, PreparedTable, Reach, ScaledRank,
-    ScanEnvelope, WindowPolicy,
-};
+pub use windows::{EmptyPoorRange, LaneClass, LaneTable, PerLaneClass, ScaledRank, WindowPolicy};
