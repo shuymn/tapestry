@@ -31,7 +31,10 @@
 //! axis bindings (a count, then each axis's control, lane, mode (0
 //! absolute, followed by its wrap; 1 relative), press threshold, hold
 //! threshold and release time in µs, all unsigned), and the number of
-//! axis values it reported outside the range their conversion uses.
+//! axis values it reported outside the range their conversion uses. The
+//! audio and display offsets follow the sources, then the input thread's
+//! wake policy: 0 woken by input, followed by its heartbeat bound, input
+//! gap and drain cut; 1 timer only, followed by its period.
 //!
 //! Bindings and axes are bounded per source and in all by the evaluator's
 //! limits ([`eval::MAX_BINDINGS_PER_SOURCE`], [`eval::MAX_AXES_PER_SOURCE`],
@@ -57,13 +60,13 @@ pub use error::{DecodeError, Section};
 pub use record::{
     Arrival, BuildProvenance, ChartRecord, DeviceKind, DeviceRecord, EndStatus, Incomplete,
     PASSTHROUGH, PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status,
-    TransformId, TransformRecord, Versions,
+    TransformId, TransformRecord, Versions, WakePolicy,
 };
 
 use wire::{Reader, Writer};
 
 /// The format version this crate writes, and the only one it reads.
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -270,6 +273,7 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
         sources,
         audio_offset,
         display_offset,
+        wake,
     } = d;
     w.len(sources.len());
     for s in sources {
@@ -300,6 +304,22 @@ fn write_devices(w: &mut Writer, d: &DeviceRecord) {
     }
     w.int(audio_offset.0);
     w.int(display_offset.0);
+    match *wake {
+        WakePolicy::Input {
+            heartbeat_us,
+            input_gap_us,
+            drain_cut,
+        } => {
+            w.uint(0);
+            w.uint(u64::from(heartbeat_us));
+            w.uint(u64::from(input_gap_us));
+            w.uint(u64::from(drain_cut));
+        }
+        WakePolicy::Timer { heartbeat_us } => {
+            w.uint(1);
+            w.uint(u64::from(heartbeat_us));
+        }
+    }
 }
 
 fn write_axes(w: &mut Writer, axes: &[AxisBinding]) {
@@ -640,10 +660,22 @@ fn read_devices(r: &mut Reader<'_>, limits: &DecodeLimits) -> Result<DeviceRecor
     }
     let audio_offset = TimeUs(r.int()?);
     let display_offset = TimeUs(r.int()?);
+    let wake = match r.uint()? {
+        0 => WakePolicy::Input {
+            heartbeat_us: r.u32()?,
+            input_gap_us: r.u32()?,
+            drain_cut: r.u32()?,
+        },
+        1 => WakePolicy::Timer {
+            heartbeat_us: r.u32()?,
+        },
+        _ => return Err(DecodeError::InvalidValue("wake policy")),
+    };
     Ok(DeviceRecord {
         sources,
         audio_offset,
         display_offset,
+        wake,
     })
 }
 

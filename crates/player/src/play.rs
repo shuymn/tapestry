@@ -33,8 +33,14 @@ use crate::render_side::{RenderLink, RenderMsg, ScreenError};
 use crate::tuning::{Delivered, SettingsFiles};
 
 /// How long the logic step parks at most without a wake from the input
-/// thread; also the pace of the tail and the end screen.
+/// thread; also the pace of the tail.
 const PARK: Duration = Duration::from_millis(2);
+
+/// How long the game thread parks at most outside a play and its tail
+/// (the end screen): until the window or the system unparks it
+/// ([`Controls`]), or the next look at what has no wake of its own (the
+/// screen's failure, a timed quit).
+const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs());
 
 /// Each saved play's record and figures, in order (dev-tools).
 #[cfg(feature = "dev-tools")]
@@ -61,6 +67,9 @@ pub struct PlayerRig<'a> {
     pub autoplay: bool,
     /// The countdown's length.
     pub lead_in: TimeUs,
+    /// From recording's open to the end of the play's audio tail: the
+    /// game thread parks [`PARK`] at most, else [`IDLE_PARK`].
+    pub in_play: bool,
     /// The input offset the current play uses (a device play; autoplay
     /// plays with 0 whatever it is).
     pub input_offset_us: i64,
@@ -278,7 +287,7 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn wait(&mut self) {
-        thread::park_timeout(PARK);
+        thread::park_timeout(if self.in_play { PARK } else { IDLE_PARK });
         #[cfg(feature = "dev-tools")]
         if let Some(c) = self.countdown_at
             && !self.adjust_in_play.is_empty()
@@ -331,6 +340,7 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
+        self.in_play = true;
         self.input.open(Request::Open {
             lead_in,
             logic: thread::current(),
@@ -388,6 +398,10 @@ impl Rig for PlayerRig<'_> {
         // Measurement stops at the end of the play, before the save and the
         // re-evaluation, however long they take.
         self.figures = self.render.finish(self.clock.now());
+        // The tail is over: nothing reads the input thread's publications
+        // or its focus checks until the next play opens.
+        self.in_play = false;
+        self.input.idle();
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

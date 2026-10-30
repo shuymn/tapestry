@@ -183,12 +183,16 @@ pub fn run(
         load_settings(&path).with_context(|| path.display().to_string())?;
     let controls = Arc::new(Controls::new(clock));
     let capture = Capture::new();
+    let waker = input::Waker::new().context("input")?;
+    // Nothing reads the thread's publications here: it wakes for input
+    // alone, which it offers to the capture.
     let (window_thread, surface, input) = crate::open_window_and_input(
         &controls,
         clock,
         crate::sources(),
         capture.clone(),
-        |_, _| {},
+        &waker,
+        |_, _| input::Phase::Idle,
         (None, None),
         device.monitor.clone(),
     )?;

@@ -9,8 +9,8 @@ use crate::wire::Writer;
 use crate::{
     Arrival, BuildProvenance, ChartRecord, DecodeError, DecodeLimits, DeviceKind, DeviceRecord,
     EndStatus, FORMAT_VERSION, Incomplete, MAGIC, PlayRecord, PlayType, PresetRecord,
-    ReceiveMethod, Section, SourceRecord, Status, TransformRecord, Versions, body_bytes, decode,
-    encode, preset_hash, write_events, write_status,
+    ReceiveMethod, Section, SourceRecord, Status, TransformRecord, Versions, WakePolicy,
+    body_bytes, decode, encode, preset_hash, write_events, write_status,
 };
 
 fn lane(i: u8) -> Lane {
@@ -138,6 +138,11 @@ fn sample(n_events: usize) -> PlayRecord {
             ],
             audio_offset: TimeUs(-12_000),
             display_offset: TimeUs(8_000),
+            wake: crate::WakePolicy::Input {
+                heartbeat_us: 1_000,
+                input_gap_us: 125,
+                drain_cut: 1_024,
+            },
         },
         play_type: PlayType::Full,
         start: InputStart {
@@ -328,6 +333,56 @@ fn a_record_from_before_the_input_failure_reason_is_refused() {
 }
 
 #[test]
+fn a_record_from_before_the_wake_policy_is_refused() {
+    // Format 4 had no wake policy; its files are refused by their version,
+    // with no conversion.
+    let mut old = wrap(&body_bytes(&golden()), 3);
+    old[4..6].copy_from_slice(&4_u16.to_le_bytes());
+    assert_eq!(
+        decode(&old, &limits()),
+        Err(DecodeError::UnsupportedVersion(4))
+    );
+}
+
+#[test]
+fn both_wake_policies_round_trip_and_another_is_refused() {
+    let policies = [
+        WakePolicy::Input {
+            heartbeat_us: 1_000,
+            input_gap_us: 125,
+            drain_cut: 1_024,
+        },
+        WakePolicy::Input {
+            heartbeat_us: u32::MAX,
+            input_gap_us: 0,
+            drain_cut: u32::MAX,
+        },
+        WakePolicy::Timer {
+            heartbeat_us: 1_000,
+        },
+        WakePolicy::Timer { heartbeat_us: 0 },
+    ];
+    for wake in policies {
+        let mut rec = sample(5);
+        rec.devices.wake = wake;
+        assert_eq!(decode(&encode(&rec), &limits()), Ok(rec));
+    }
+    // A timer policy ends the devices section with its tag and period;
+    // tag 2 names no policy.
+    let mut rec = sample(5);
+    rec.devices.wake = WakePolicy::Timer { heartbeat_us: 7 };
+    let mut sections = split_sections(&body_bytes(&rec));
+    let devices = &mut sections[Section::Devices as usize];
+    let n = devices.len();
+    assert_eq!(devices[n - 2..], [1, 7]);
+    devices[n - 2] = 2;
+    assert_eq!(
+        decode(&wrap(&join_sections(&sections), 3), &limits()),
+        Err(DecodeError::InvalidValue("wake policy"))
+    );
+}
+
+#[test]
 fn truncated_body_is_an_error_not_a_panic() {
     let rec = sample(60);
     let body = body_bytes(&rec);
@@ -451,6 +506,9 @@ fn golden_base() -> PlayRecord {
             ],
             audio_offset: TimeUs(-10_000),
             display_offset: TimeUs(16_000),
+            wake: crate::WakePolicy::Timer {
+                heartbeat_us: 1_000,
+            },
         },
         play_type: PlayType::Full,
         start: InputStart {
@@ -518,7 +576,7 @@ fn golden() -> PlayRecord {
 
 /// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
 /// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "568d442b72493dd2c9cdc08175933af28523498ff83e6dbc66446434de284677";
+const GOLDEN_BODY_SHA256: &str = "de5465b8e6a4e9fd8bc76b1d383e7ec3fc15778c7a43df90c08eadc8122f16a4";
 
 #[test]
 fn golden_body() {
@@ -553,6 +611,9 @@ fn malformed_axes_are_refused() {
         w.uint(0);
         // Audio and display offsets.
         w.raw(&[0, 0]);
+        // A timer wake policy of 1 ms.
+        w.uint(1);
+        w.uint(1_000);
         w.0
     };
     let mut sections = split_sections(&body_bytes(&golden()));
@@ -575,8 +636,8 @@ fn malformed_axes_are_refused() {
         Err(DecodeError::InvalidValue("lane"))
     );
     assert_eq!(
-        decode_with(&mut sections, devices(2, 0, 1)),
-        Err(DecodeError::CountBeyondData(2))
+        decode_with(&mut sections, devices(3, 0, 1)),
+        Err(DecodeError::CountBeyondData(3))
     );
 }
 

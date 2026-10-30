@@ -2,7 +2,9 @@
 //! Skins"). The window is borderless fullscreen on the primary monitor and
 //! takes no device events (Raw Input has one target window per device type per
 //! process, and the input thread owns it). Focus, the retry and quit keys, the
-//! settings keys F1 to F8 and closing go to [`Controls`]. The event loop runs
+//! settings keys F1 to F8 and closing go to [`Controls`], which wakes the game
+//! thread for each, and the input thread on a focus change once the focus
+//! latch is set (design.md "Input"). The event loop runs
 //! on a thread of its own, so the game keeps the main thread and the loaded
 //! chart never has to move.
 
@@ -278,11 +280,12 @@ impl Keys {
 }
 
 /// A key pressed in the window. A settings key steps again while held
-/// (key repeat); the overlay key, retry and quit act on the first press
-/// only.
+/// (key repeat), and wakes the game thread to show it; the overlay key,
+/// retry and quit act on the first press only.
 fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &Keys) {
     if let Some(&(_, a)) = keys.settings.iter().find(|(k, _)| *k == key) {
         controls.tuning().adjust(a);
+        controls.wake_game();
     } else if repeat {
         // The others take the first press only.
     } else if key == keys.overlay {

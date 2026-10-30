@@ -1,6 +1,7 @@
 //! After construction and `open_recording`, batches allocate nothing:
 //! packets, pushes, publications, device changes, arrivals, overflow and
-//! focus rejection, and a scripted connect and reconnect.
+//! focus rejection, a scripted connect and reconnect, and the wake loop
+//! with its cut drains.
 //!
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -9,13 +10,15 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-use bms_model::TimeUs;
+use bms_model::{TimeSource, TimeUs};
 use eval::ControlId;
+use input::cadence::{self, Boundary, Cadence, Driven, Wait, WaitFailed, Waiter, Woken};
 use input::{
-    Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceConfig,
-    SourceSet,
+    Action, DeviceId, DeviceKind, InputAdapter, Packet, Phase, ScriptItem, ScriptedInput,
+    SourceConfig, SourceSet, WakeReport,
 };
 
 struct Counting;
@@ -54,6 +57,35 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
+
+/// A virtual clock in µs.
+#[derive(Clone)]
+struct Clock(Arc<AtomicI64>);
+
+impl TimeSource for Clock {
+    fn now(&self) -> TimeUs {
+        TimeUs(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// Waits that return in turn for input, the event and the timer, each
+/// 50 µs later.
+struct Stub {
+    clock: Clock,
+    n: u32,
+}
+
+impl Waiter for Stub {
+    fn wait(&mut self, wait: Wait) -> Result<Woken, WaitFailed> {
+        self.n += 1;
+        self.clock.0.fetch_add(50, Ordering::Relaxed);
+        Ok(match self.n % 3 {
+            0 if wait.input => Woken::Input,
+            1 => Woken::Event,
+            _ => Woken::Timer,
+        })
+    }
+}
 
 #[test]
 fn batches_do_not_allocate() {
@@ -130,12 +162,66 @@ fn batches_do_not_allocate() {
     });
     set.end_batch(TimeUs(20_001));
     TRACK.with(|t| t.set(false));
-
     assert_eq!(popped, 2_000);
     assert!(readers[1].overflowed());
     assert!(set.overflowed());
     assert_eq!(set.arrivals().len(), 1);
     assert_eq!(set.arrivals_dropped(), 3);
     assert!(set.gate().is_tripped());
+    set.gate_mut().reset();
+
+    // The wake loop: every kind of wake, with cut drains, on a virtual
+    // clock; its report and state are made outside the counted section.
+    let clock = Clock(Arc::new(AtomicI64::new(30_000)));
+    let stop = AtomicBool::new(false);
+    let mut waiter = Stub {
+        clock: clock.clone(),
+        n: 0,
+    };
+    let mut cadence = Cadence::new(Driven::Input, clock.now());
+    let mut report = WakeReport::new();
+    let mut wakes = 0_u32;
+    let mut looped = 0_u64;
+    TRACK.with(|t| t.set(true));
+    let ran = cadence::run(
+        &clock,
+        &mut waiter,
+        &stop,
+        &mut cadence,
+        &mut report,
+        |now, may_read| {
+            wakes += 1;
+            // Every tenth wake has more queued than one drain reads.
+            let mut queued = if wakes.is_multiple_of(10) { 1_500 } else { 3 };
+            let (published, n) = cadence::batch(&clock, &mut set, now, may_read, |set, budget| {
+                if queued == 0 {
+                    return 0;
+                }
+                queued -= 1;
+                set.packet(&key(0, controls[0], i32::from(budget % 2 == 0)));
+                1
+            });
+            while readers[0].pop().is_some() {
+                looped += 1;
+            }
+            if wakes == 2_000 {
+                stop.store(true, Ordering::Release);
+            }
+            Boundary {
+                published,
+                read: n,
+                phase: if wakes.is_multiple_of(7) {
+                    Phase::Idle
+                } else {
+                    Phase::Open
+                },
+            }
+        },
+    );
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ran, Ok(()));
+    assert_eq!(wakes, 2_000);
+    assert!(report.cuts >= 100, "{}", report.cuts);
+    assert!(looped > 2_000, "{looped}");
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 }
