@@ -93,6 +93,9 @@ pub enum EngineError {
     },
 }
 
+/// A chart's sounds as the engine plays them: its bank and its BGM schedule.
+pub type ChartSounds = (Arc<SoundBank>, Vec<BgmEvent>);
+
 /// The audio engine: mixer, mix clock and BGM schedule. Everything is
 /// allocated in [`AudioEngine::new`]; [`AudioEngine::step`] allocates
 /// nothing.
@@ -246,6 +249,37 @@ impl AudioEngine {
     pub fn stop(&mut self) {
         self.mixer.stop_all();
         self.next_bgm = self.bgm.len();
+    }
+
+    /// Plays another chart from here on: `bank` and `bgm` (sorted by time)
+    /// take the place of the current ones, which are returned so the caller
+    /// frees them where it may. Every voice stops and no BGM event starts
+    /// until the next [`restart`](Self::restart); the output stream and its
+    /// clock continue. Nothing is allocated or freed.
+    ///
+    /// # Errors
+    ///
+    /// `bank` and `bgm` themselves, untouched, when the bank was decoded at
+    /// another rate than the output's: the engine keeps what it had.
+    pub fn replace(
+        &mut self,
+        bank: Arc<SoundBank>,
+        bgm: Vec<BgmEvent>,
+    ) -> Result<ChartSounds, ChartSounds> {
+        if bank.rate() != self.bank.rate() {
+            return Err((bank, bgm));
+        }
+        self.mixer.stop_all();
+        let old_bank = std::mem::replace(&mut self.bank, bank);
+        let old_bgm = std::mem::replace(&mut self.bgm, bgm);
+        self.next_bgm = self.bgm.len();
+        Ok((old_bank, old_bgm))
+    }
+
+    /// The bank key sounds and BGM play from.
+    #[must_use]
+    pub fn bank(&self) -> &Arc<SoundBank> {
+        &self.bank
     }
 
     /// Calls `f` with each scheduled start kept since the last drain, then

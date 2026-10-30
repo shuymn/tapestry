@@ -304,3 +304,63 @@ fn deferred_starts_and_stolen_voices_are_counted() {
     assert!(counters.steals() >= 1_000, "{}", counters.steals());
     assert_eq!(counters.steals(), worker.engine().mixer().steals());
 }
+
+/// Another chart's bank, taken between plays on the running audio thread:
+/// the next play sounds the new bank under the same sound ids, never the
+/// old one, and nothing sounds between the load and that play. A bank at
+/// another rate is refused before it is sent, and a gone worker refuses
+/// a load.
+#[test]
+fn a_loaded_bank_replaces_the_previous_charts_sounds() {
+    use std::sync::Arc;
+
+    let chart = chart();
+    let (mut control, mut worker, mut out) = rig(&chart);
+    // The old chart's BGM sound is the constant 1000; the new one's 5000.
+    let new = Arc::new(audio::SoundBank::from_sounds(
+        RATE,
+        vec![audio::Sound::mono(vec![5_000; 480])],
+    ));
+    let schedule = vec![bms_model::BgmEvent {
+        time: TimeUs(0),
+        sound: SoundId(0),
+    }];
+    // The load waits for the audio thread, stepped here meanwhile.
+    std::thread::scope(|s| {
+        let load = s.spawn(|| control.load(Arc::clone(&new), schedule));
+        while !load.is_finished() {
+            worker.step(&mut out).unwrap();
+        }
+        load.join().unwrap().unwrap();
+    });
+    let silent = out.samples().len();
+    let other = Arc::new(audio::SoundBank::from_sounds(44_100, Vec::new()));
+    assert_eq!(
+        control.load(other, Vec::new()),
+        Err(game::AudioLoadError::RateMismatch {
+            bank: 44_100,
+            output: RATE
+        })
+    );
+    assert!(out.samples().iter().all(|&s| s == 0.0));
+    let (_sink, queue) = audio_link_at(4, TimeUs(50 * MS));
+    control.play(TimeUs(50 * MS), queue).unwrap();
+    control.seal();
+    let mut steps = 0;
+    while !control.done() {
+        worker.step(&mut out).unwrap();
+        steps += 1;
+        assert!(steps < 100, "the play never ended");
+    }
+    assert!(out.samples().len() > silent);
+    drop(worker);
+    let new_level = 5_000.0 / 32_768.0 / 2.0;
+    let old_level = 1_000.0 / 32_768.0 / 2.0;
+    let near = |s: f32, level: f32| (s - level).abs() < 1e-4;
+    assert!(out.samples().iter().any(|&s| near(s, new_level)));
+    assert!(!out.samples().iter().any(|&s| near(s, old_level)));
+    assert_eq!(
+        control.load(new, Vec::new()),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Gone))
+    );
+}

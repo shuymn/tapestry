@@ -45,7 +45,9 @@ pub use bank::{
     Sound, SoundBank, Speed, Stage, load_bank, load_bank_at, plan_conversion,
 };
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
-pub use engine::{AudioEngine, EngineError, Scheduled, ScheduledKind, SoundCmd, StepReport};
+pub use engine::{
+    AudioEngine, ChartSounds, EngineError, Scheduled, ScheduledKind, SoundCmd, StepReport,
+};
 pub use mixer::{
     HEADROOM, InvalidVolume, MAX_PENDING_STARTS, MAX_VOICES, MAX_VOLUME, Mixer, SOFT_CLIP_KNEE,
     STEAL_FADE_MS, soft_clip,
