@@ -4,7 +4,7 @@ Stage 4 of the roadmap (design.md "Roadmap") is the own IR: server-side computat
 
 Nothing here is built before stage 3 is done (design.md "Drawing the line on scope"). The only work that may land earlier is what design.md already requires of the client side, such as keeping the WASM build of `eval` passing in CI.
 
-**Status.** Draft. Decisions marked *(owner)* change public behavior, cost or licensing and wait for the owner. Every other decision is a method choice. This file is removed when stage 4 exits, once its decisions are in design.md.
+**Status.** Draft. Decisions marked *(open)* change public behavior, cost or licensing and are not decided yet ("Open decisions"). Every other decision is a method choice. This file is removed when stage 4 exits, once its decisions are in design.md.
 
 **Direction applied throughout:**
 - **Small cores with named extension surfaces:**
@@ -68,7 +68,7 @@ The player side is the **IR host**. It plugs into the saving extension point (`R
   - Process separation contains crashes. It does not isolate secrets from a malicious connector.
 - **Licensing:**
   - The bundled connector is GPL like the player.
-  - Whether independently written connectors that use only the published protocol may carry any license is *(owner)*. If yes, it is stated in `COPYRIGHT` next to the local event endpoint's statement ("Licenses"), not assumed from process separation.
+  - Whether independently written connectors that use only the published protocol may carry any license is *(open)*. If yes, it is stated in `COPYRIGHT` next to the local event endpoint's statement ("Licenses"), not assumed from process separation.
 - **Alternatives:**
   - An in-process Rust trait, like bmz-player's built-in providers. Every IR would need a release of the player, and there would be no crash isolation.
   - A DLL ABI, like OpenLR2. Its ABI is tied to one compiler, and it runs in-process.
@@ -109,7 +109,7 @@ The host sends types defined by the protocol crate:
 Each connector maps these to its IR's codes: clear-type and option enumerations, and rule and device names. An IR's vocabulary never enters the host, so an IR with other codes is a connector change only.
 
 - **Integers:** values beyond 2^53, such as seeds, are JSON strings, so a connector in any language reads them losslessly.
-- **Which plays go out** *(owner)*. Proposed:
+- **Which plays go out** *(open)*. Proposed:
   - Only plays **played** under an accepted preset are sent, matched by preset hash from `Provenance` before a summary is made.
   - A what-if re-evaluation under another preset is never sent to an external IR, because the player did not see that gauge and the IR cannot tell.
   - The own IR receives the record itself, and evaluates it under every preset on the server.
@@ -336,7 +336,7 @@ bmz-player's IR made the same choice for the same reads.
   - This way an evaluator change, its parity check, and the protocol fixtures shared with the connector land in one PR.
 - **Licenses:**
   - `ir-wasm` is `MIT OR Apache-2.0`.
-  - The license of `server/` is *(owner)*.
+  - The license of `server/` is *(open)*.
 
 ### S5. Jobs: claimed before work, completed by the claim
 
@@ -384,13 +384,13 @@ The pattern follows the kopje project's job runner and bmz-player's send queue.
   - A cache fill starts its D1 session at `first-primary` and reads the pointer and the board in it.
   - Board pages are cached at the edge for a short lifetime, so a removal, a deletion or a change of visibility shows within that lifetime.
   - Only the active generation is served publicly.
-- **Which change replaces a board and which starts a new one** *(owner)*, design.md's open question:
+- **Which change replaces a board and which starts a new one** *(open)*, design.md's open question:
   - Proposed: an evaluator, loader or transform bug fix recomputes and switches.
   - Proposed: a changed preset or metric definition is a new board, and the old one is kept, frozen.
 
 ### S7. Accounts and credentials
 
-- **Sign-in:** only through external OAuth providers, behind the adapter interface. Stage 4 builds the one it needs *(owner: which)*.
+- **Sign-in:** only through external OAuth providers, behind the adapter interface. Stage 4 builds the one it needs *(open: which)*.
 - **Credentials:**
   - A connector exchanges the sign-in's redemption code (C4) for an API credential: 32 random bytes, stored and looked up only by SHA-256, and scoped to submission, grants and reads.
   - If credentials expire, a refresh credential rotates. A reused refresh credential that was rotated more than a short grace period ago revokes the account's sessions, as in bmz-player's IR.
@@ -402,7 +402,7 @@ The pattern follows the kopje project's job runner and bmz-player's send queue.
 ### S8. Operation
 
 - **Deployment:**
-  - One deployment on the owner's account, on Workers Paid.
+  - One deployment on the operator's own account, on Workers Paid.
   - Public configuration is in `wrangler.jsonc`. Account values are in a gitignored deploy file, merged by a deploy script that refuses unknown keys.
 - **Logs:** Workers Logs with invocation logs off. Only a structured logger writes, with a closed set of fields. No record contents and no credentials are logged.
 - **Backups:**
@@ -411,7 +411,7 @@ The pattern follows the kopje project's job runner and bmz-player's send queue.
   - The operational tables are exported to R2 daily with a manifest written last, because they cannot be rebuilt.
 - **Threat model:** the server gets its own threat model in the invariant-ID format. Each enforced invariant cites the tests that pin it, and a test checks the document.
 
-## Owner decisions
+## Open decisions
 
 1. **The license of `server/`** (S4).
 2. **Connector licenses:** whether independently written connectors may carry any license (C1).
