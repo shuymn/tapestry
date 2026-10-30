@@ -363,20 +363,21 @@ A single exact stage is not used. A 383,999 Hz stereo source at 145 % on 384,000
 - **Notes.** Notes before the section are drawn auto-played; notes after its end are not drawn.
 
 **End of a round: a short ring-out (decided).**
-- Completion happens in the first step whose watermark covers the section's final deadline. Recording closes there and the round's record is saved, as for any play.
-- A ring-out follows instead of the full-play audio tail, which waits for every voice and BGM event (crates/game/src/live.rs:359). For `RING_OUT` (1.5 s, tuned by playing) the BGM keeps playing on schedule, no notes are drawn and nothing is judged or recorded; key sounds of notes after the section never start. Over the last `FADE` (0.5 s, tuned by playing) the engine ramps its output gain to zero, then the round sends `AudioCtl::Cancel`.
-- The ramp is a gain step per mix block in the engine (`AudioCtl::FadeOut(duration)`), with no allocation in the audio callback.
-- The next round's countdown begins at the step after the cancel.
-- Quit, retry or focus loss during the ring-out cuts it at once, like the full-play tail. Quit returns to the practice screen.
+- Completion happens in the first step whose watermark covers the section's final deadline. Recording closes there, and the record is frozen; it is saved after the ring-out, as a full play is saved after its tail, so a slow write never delays the ring-out's controls.
+- A ring-out follows instead of the full-play audio tail, which waits for every voice and BGM event (crates/game/src/live.rs:359). For `RING_OUT` (1.5 s, tuned by playing) the BGM keeps playing on schedule, no notes are drawn and nothing is judged or recorded; key sounds of notes after the section never start. Over its last `FADE` (0.5 s, tuned by playing) the output fades to silence.
+- **The envelope is on output frames.** At completion the game sends `AudioCtl::RingOut { fade_at, end_at }` in play time. The engine converts both to frame positions on the play's mix clock, as it does for sound starts, and applies the gain per frame: 1 before `fade_at`, falling linearly to 0 at `end_at`. At `end_at` it stops every voice and starts nothing more, and it reports the ring-out done like a sealed tail. The fade therefore does not depend on when the request is taken or how the output is divided into periods, and the stop always comes at the envelope's zero. Nothing is allocated in the audio callback.
+- **The envelope is reset** to gain 1 by every `Play`, whether the previous ring-out finished or was cut, independently of master volume and loudness gain.
+- After the engine reports done, the record is saved, and the next round's countdown begins at the following step.
+- Quit, retry or focus loss during the ring-out cuts it at once with `AudioCtl::Cancel`, like the full-play tail; the frozen record is still saved. Quit returns to the practice screen.
 
-**Example.** 100 % speed, lead-in 2 s, offset 0, aligned 1 ms steps. Section `[10 s, 20 s)` of a 180 s chart; the last target is a tap at 19.5 s; the late BAD edge is 180 ms.
+**Example.** 100 % speed, lead-in 2 s, offset 0, aligned 1 ms steps, 48 kHz output. Section `[10 s, 20 s)` of a 180 s chart; the last target is a tap at 19.5 s; the late BAD edge is 180 ms.
 - `SongEnd.time` is 19.680000 s.
 - The step at 19.680 s publishes `fresh − 1 µs` = 19.679999 s, which does not cover the deadline.
-- The step at 19.681 s publishes 19.680999 s: completion and the close happen there, and the ring-out starts.
-- The fade starts at 20.681 s, and the cancel is sent at 21.181 s.
-- Round 2's countdown begins at 21.182 s (round 1's timeline), at its own chart time 8.000 s.
+- The step at 19.681 s publishes 19.680999 s: completion and the close happen there, and `RingOut { fade_at: 20.681 s, end_at: 21.181 s }` is sent.
+- The rendered fade covers output frames from 20.681 s to 21.181 s on the play's mix clock: 24,000 frames, whatever the audio period.
+- The engine reports done once it has mixed past 21.181 s. The record is saved, and round 2's countdown begins at the first step after that report: at 21.182 s at the earliest (round 1's timeline), at its own chart time 8.000 s.
 - A BGM event at 20.5 s starts during the ring-out; one at 30 s never starts.
-- A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's countdown, restored by `seek`.
+- A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's countdown, restored by `seek`, at full gain.
 
 **Setup.** The practice screen picks the section by measure, the speed, the lead-in (2 s, tuned by playing), the initial gauge, and repeat. `--dev-start <ms>` and a scenario step exist in development builds.
 
@@ -869,11 +870,15 @@ Each one holds the behavior D5 and D6 state.
 - When D15's example runs (`section_round_rings_out_and_repeats`):
   - `SongEnd.time` shall be 19.680000 s;
   - completion and the close shall happen in the step at 19.681 s, not at 19.680 s;
-  - the fade shall start at 20.681 s and the cancel shall be sent at 21.181 s;
+  - `RingOut { fade_at: 20.681 s, end_at: 21.181 s }` shall be sent in that step, and the record shall be saved only after the engine reports the ring-out done;
   - the BGM event at 20.5 s shall start, no key sound of a note after the section shall start, and the BGM event at 30 s shall never start;
-  - round 2's countdown shall begin at 21.182 s with the long voice 3 s in.
-- When retry is pressed during the ring-out, the ring-out shall be cut in that step (`retry_cuts_the_ring_out`).
-- When the engine fades out, its output gain shall fall monotonically to zero over the fade, and the fade shall allocate nothing (`fade_out_ramps_to_zero_without_allocating`, `audio`).
+  - round 2's countdown shall begin at the first step after the report, not before 21.182 s, with the long voice 3 s in.
+- When retry is pressed during the ring-out, the ring-out shall be cut in that step and the frozen record shall still be saved (`retry_cuts_the_ring_out_and_saves`).
+- When a slow save is simulated, the ring-out's fade, stop and quit handling shall happen at the same times as with an instant save (`saving_never_delays_the_ring_out`).
+- When the engine renders a ring-out, the gain shall be 1 before `fade_at`, fall linearly per frame to 0 at `end_at` (24,000 frames at 48 kHz in D15's example), and every voice shall stop at `end_at` (`ring_out_envelope_is_on_output_frames`, `audio`).
+- When the same ring-out is rendered with different period sizes, including one not dividing the fade (e.g. 7 ms and 10 ms), the output shall be identical sample for sample (`ring_out_is_independent_of_period_size`, `audio`).
+- When a play starts after a completed ring-out and after one cut mid-fade, its output shall be at full gain from its first frame (`play_resets_the_ring_out_envelope`, `audio`).
+- When the ring-out is rendered, the audio callback shall allocate nothing (`ring_out_allocates_nothing`, `audio`).
 - `section_round_records_its_conditions`.
 - When the windows are computed, they shall be 21.180, 16.795384, 11.680 and 8.513333 s (`practice_window_is_sized_by_the_section`).
 - When the long-note section is planned, its deadline shall be 19.900 s, its window 11.900 s and its capacity 12 s (`practice_window_includes_ln_end_deadlines`).
@@ -976,7 +981,7 @@ Each one holds the behavior D5 and D6 state.
    - Play to the end, step through the three presets, retry several times, go back and change charts. Do this with both keyboard and controller.
    - A refused chart shows why, and new charts still appear.
 4. **Preset reload.** Edit `presets\lr2-style.toml` while it is shown; it updates at the next poll.
-5. **Practice.** Practice a section at 75 % with repeat. Rounds restart when the section is judged, and long BGM is already playing at the start.
+5. **Practice.** Practice a section at 75 % with repeat. After the section is judged the BGM plays on briefly without notes and fades out, the next round starts, and long BGM is already playing at its start.
 6. **eval-cli.** Run it over saved records with two presets, and see a refusal for a record from before a version bump.
 7. **Idle input thread.** It barely wakes on menus, and the play overlay figures are unchanged.
 
