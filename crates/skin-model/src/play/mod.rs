@@ -187,20 +187,187 @@ impl Play {
     }
 
     /// Whether the long note `note` on `lane` was held (its `LnHeld` was
-    /// delivered).
-    #[must_use]
-    pub fn held(&self, lane: Lane, note: usize) -> bool {
+    /// delivered). For the lanes widget (S5).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the lanes widget (S5) reads it")
+    )]
+    pub(crate) fn held(&self, lane: Lane, note: usize) -> bool {
         self.reducer.held(lane.index(), note)
     }
 
     /// The long note whose visual hold `lane` shows, as of the last build.
-    #[must_use]
-    pub fn hold_note(&self, lane: Lane) -> Option<usize> {
+    /// For the lanes widget (S5).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the lanes widget (S5) reads it")
+    )]
+    pub(crate) fn hold_note(&self, lane: Lane) -> Option<usize> {
         self.reducer
             .hold
             .get(lane.index())
             .copied()
             .flatten()
             .map(|h| h.note)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bms_model::{ChartBuilder, Lane, TimeUs};
+    use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
+    use rules::{GaugeValue, Judgment, PerJudgment};
+
+    use super::{Attempt, GaugeDesc, PlayContext, SkinFrame};
+    use crate::{QuadBatch, Skin};
+
+    const MS: i64 = 1_000;
+
+    fn lane(n: u8) -> Lane {
+        Lane::new(n).unwrap()
+    }
+
+    fn ev(ms: i64, kind: JudgeEventKind) -> JudgeEvent {
+        JudgeEvent {
+            seq: 0,
+            time: TimeUs(ms * MS),
+            origin: None,
+            kind,
+        }
+    }
+
+    /// The held bits and hold notes the lanes widget reads, after each
+    /// frame of effects.
+    #[test]
+    fn held_bits_and_hold_notes_follow_the_effects() {
+        let chart = ChartBuilder::new(150_000)
+            .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
+            .long(lane(2), TimeUs(2_000 * MS), TimeUs(2_300 * MS))
+            .long(lane(5), TimeUs(1_500 * MS), TimeUs(1_800 * MS))
+            .tap(lane(5), TimeUs(3_000 * MS))
+            .build()
+            .unwrap();
+        let skin = Skin::new(Vec::new(), Vec::new()).unwrap();
+        let gauges = [GaugeDesc {
+            start: GaugeValue(0),
+            max: GaugeValue::FULL,
+        }];
+        let ctx = PlayContext {
+            gauges: &gauges,
+            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            empty_poor_breaks_combo: false,
+        };
+        let mut play = skin.prepare(&chart, &ctx).unwrap();
+        let zero = PerJudgment {
+            perfect: 0,
+            great: 0,
+            good: 0,
+            bad: 0,
+            poor: 0,
+        };
+        let tally = Tally {
+            counts: zero,
+            ex_score: 0,
+            bp: 0,
+            combo: 0,
+            max_combo: 0,
+            empty_poor: 0,
+        };
+        let snapshot = [GaugeState {
+            value: GaugeValue(0),
+            reference: GaugeValue(0),
+            failed_at: None,
+        }];
+        let mut batch = QuadBatch::with_capacity(0, 0);
+        let mut frame = |play: &mut super::Play, now_ms: i64, effects: &[JudgeEvent]| {
+            let frame = SkinFrame {
+                now: TimeUs(now_ms * MS),
+                display_offset: TimeUs(0),
+                tally: &tally,
+                gauges: &snapshot,
+                gauge: 0,
+                effects,
+            };
+            skin.build(play, &frame, &mut batch);
+        };
+        let held = |n: u8, note: usize, kind: Judgment| JudgeEventKind::LnHeld {
+            lane: lane(n),
+            note,
+            judgment: kind,
+            deviation: TimeUs(0),
+        };
+        let ended = |n: u8, note: usize| JudgeEventKind::LnHoldEnded {
+            lane: lane(n),
+            note,
+        };
+        frame(&mut play, 1_000, &[ev(1_000, held(2, 0, Judgment::Great))]);
+        assert!(play.held(lane(2), 0));
+        assert_eq!(play.hold_note(lane(2)), Some(0));
+        frame(
+            &mut play,
+            1_250,
+            &[
+                ev(1_250, ended(2, 0)),
+                ev(
+                    1_250,
+                    JudgeEventKind::Judged {
+                        lane: lane(2),
+                        note: 0,
+                        judgment: Judgment::Good,
+                        deviation: Some(TimeUs(0)),
+                        release: Some(TimeUs(-50 * MS)),
+                        combo: 1,
+                    },
+                ),
+            ],
+        );
+        assert!(play.held(lane(2), 0));
+        assert_eq!(play.hold_note(lane(2)), None);
+        // A BAD head holds without the held bit.
+        frame(
+            &mut play,
+            1_400,
+            &[ev(
+                1_400,
+                JudgeEventKind::Judged {
+                    lane: lane(5),
+                    note: 0,
+                    judgment: Judgment::Bad,
+                    deviation: Some(TimeUs(-100 * MS)),
+                    release: None,
+                    combo: 0,
+                },
+            )],
+        );
+        assert_eq!(play.hold_note(lane(5)), Some(0));
+        assert!(!play.held(lane(5), 0));
+        // Another note's end leaves it; its own ends it.
+        frame(&mut play, 1_420, &[ev(1_420, ended(5, 1))]);
+        assert_eq!(play.hold_note(lane(5)), Some(0));
+        frame(&mut play, 1_450, &[ev(1_450, ended(5, 0))]);
+        assert_eq!(play.hold_note(lane(5)), None);
+        // A held note whose end event is lost stops at its end.
+        frame(
+            &mut play,
+            2_000,
+            &[ev(2_000, held(2, 1, Judgment::Perfect))],
+        );
+        assert!(play.held(lane(2), 1));
+        assert_eq!(play.hold_note(lane(2)), Some(1));
+        frame(&mut play, 2_300, &[]);
+        assert_eq!(play.hold_note(lane(2)), None);
+        // A tap or a stray index is no hold; the stray bit is ignored.
+        frame(
+            &mut play,
+            3_000,
+            &[
+                ev(3_000, held(5, 1, Judgment::Great)),
+                ev(3_000, held(5, 99, Judgment::Great)),
+            ],
+        );
+        assert_eq!(play.hold_note(lane(5)), None);
+        assert!(play.held(lane(5), 1));
+        assert!(!play.held(lane(5), 99));
+        assert!(!play.held(lane(6), 0));
     }
 }
