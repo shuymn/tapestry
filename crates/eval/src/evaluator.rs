@@ -904,13 +904,12 @@ impl<'a> Evaluator<'a> {
         let mut primary: Option<(i128, usize)> = None;
         let mut against: Option<(i128, usize)> = None;
         let mut before = start.checked_sub(1);
-        for (k, (&i, &judged)) in state
-            .targets
-            .iter()
-            .zip(&state.judged)
-            .enumerate()
-            .skip(start)
-        {
+        // Each slice iterator skips to `start` directly, so the press costs
+        // no walk over the lane's earlier targets; `k` stays the position
+        // in `targets`.
+        let targets = state.targets.iter().skip(start);
+        let judged = state.judged.iter().skip(start);
+        for (k, (&i, &judged)) in (start..).zip(targets.zip(judged)) {
             #[expect(
                 clippy::indexing_slicing,
                 reason = "`targets` holds indices into the lane's notes"
