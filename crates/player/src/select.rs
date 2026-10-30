@@ -3,8 +3,8 @@
 //! found, grouped by folder, the cursor, the search box and the order, and
 //! the page the render thread draws from them ([`MenuPage`]).
 //!
-//! Its input comes through winit (design.md D18 of the stage plan is the
-//! controller's, later): the navigation keys move the cursor, Enter chooses,
+//! Its input comes through winit, from the keyboard (a controller's comes
+//! later): the navigation keys move the cursor, Enter chooses,
 //! Tab gives the search box focus, and text typed or committed through the
 //! IME goes into the search box only while it has focus. The keyboard's
 //! lane keys type nothing into the list. Everything here runs on menus,
