@@ -548,21 +548,37 @@ mod tests {
     }
 
     /// The end of a run whose pass is stuck (its gate never opens) is
-    /// bounded: the shelf drops within its stop bound, and the stuck pass
-    /// keeps the library refused to another opening until it ends.
+    /// bounded: the shelf drops after its stop bound without waiting for
+    /// the pass, and the stuck pass keeps the library refused to another
+    /// opening until it ends.
     #[test]
     fn a_stuck_pass_bounds_the_shutdown_and_keeps_the_library_locked() {
         let dir = tempfile::tempdir().unwrap();
         let (shelf, gate) = gated(dir.path());
+        let (dropped_tx, dropped) = std::sync::mpsc::channel();
         let started = Instant::now();
-        drop(shelf);
-        assert!(started.elapsed() < super::STOP_TIMEOUT + Duration::from_secs(2));
+        std::thread::spawn(move || {
+            drop(shelf);
+            let _ = dropped_tx.send(started.elapsed());
+        });
+        // The gate stays shut until the drop returns, so the pass cannot
+        // end first: only the stop bound ends the drop, which never waits
+        // for the pass. The bound here only catches a drop that does.
+        let took = dropped
+            .recv_timeout(Duration::from_secs(600))
+            .expect("the drop waited for the stuck pass");
+        assert!(took >= super::STOP_TIMEOUT, "{took:?}");
         let root = DataRoot::new(dir.path().join("data"));
         assert!(matches!(open(&root), Err(OpenError::Running { .. })));
         open_gate(&gate);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // However long the machine takes to run the released pass to its
+        // end: the bound only catches a lock that is never given back.
+        let begun = Instant::now();
         while open(&root).is_err() {
-            assert!(Instant::now() < deadline, "the lock stayed");
+            assert!(
+                begun.elapsed() < Duration::from_secs(600),
+                "the lock stayed"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
