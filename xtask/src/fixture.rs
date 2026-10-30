@@ -27,6 +27,11 @@ pub fn baseline() -> Vec<Crate> {
             "[dependencies]\nbms-model = { path = \"../bms-model\" }\n",
         ),
         lib(
+            "rules-toml",
+            "[dependencies]\nbms-model = { path = \"../bms-model\" }\n\
+             rules = { path = \"../rules\" }\n",
+        ),
+        lib(
             "eval",
             "[dependencies]\nbms-model = { path = \"../bms-model\" }\n\
              rules = { path = \"../rules\" }\n",
@@ -54,7 +59,8 @@ pub fn baseline() -> Vec<Crate> {
              eval = { path = \"../eval\" }\n\
              input = { path = \"../input\" }\n\
              replay = { path = \"../replay\" }\n\
-             rules = { path = \"../rules\" }\n",
+             rules = { path = \"../rules\" }\n\
+             rules-toml = { path = \"../rules-toml\" }\n",
         ),
         (
             "player",

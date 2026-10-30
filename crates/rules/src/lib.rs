@@ -4,7 +4,7 @@
 //! plus the name and version of the evaluation implementation. Its
 //! [`canonical_bytes`](RulePreset::canonical_bytes) identify it in records.
 //! This crate takes no external dependency, so `eval`'s dependency closure
-//! stays `bms-model` and `rules`; reading preset files lives in `game`.
+//! stays `bms-model` and `rules`; reading preset files lives in `rules-toml`.
 //!
 //! Times are integer µs and gauges are fixed-point; this crate does not use
 //! floating point. The float lints below are partial checks: they catch float

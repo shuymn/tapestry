@@ -7,7 +7,7 @@ Licenses by crate
 The license of each crate is the `license` field of its `Cargo.toml`.
 
 MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE), at your option:
-  bms-model, bms-parser, rules, eval, replay, xtask
+  bms-model, bms-parser, rules, rules-toml, eval, replay, xtask
 
 GPL-3.0-or-later (LICENSE-GPL), with the additional permission below:
   input, audio, game, render, player, fuzz (it links input)

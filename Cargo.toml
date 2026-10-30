@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 bms-model = { path = "crates/bms-model" }
 rules = { path = "crates/rules" }
+rules-toml = { path = "crates/rules-toml" }
 eval = { path = "crates/eval" }
 bms-parser = { path = "crates/bms-parser" }
 replay = { path = "crates/replay" }
