@@ -118,8 +118,8 @@ The property tests (`crates/eval/tests/props.rs`, `crates/replay/tests/round_tri
 
 | Runner | What it does |
 | --- | --- |
-| Windows (label with an explicit OS version) | Production build (pinned to a configuration with `dev-tools` disabled), verifying that development features are not included, the render staging allocation test in the release profile, rendering image comparison with WARP, Windows tests, including the scripted plays' check of the render thread's app region allocations (`dev-tools`) |
-| Linux | Builds and tests of crates that do not depend on Windows, the allocation tests of `eval`, `input`, `game` and `audio` again in the release profile, the fuzz crate's format, clippy and seed smoke tests, banned-word check, lint fixtures (`cargo xtask check-lints`), dependency checks of both lockfiles (`cargo-deny`, `cargo-audit`, `cargo-machete`; "Dependency Checks" below), tests in the Nix development shell through `scripts/wsl.sh`, and in the same `nix` job the fuzz self-test and short fuzzing runs (60 s per target, a fixed libFuzzer seed, in the `fuzz` shell) |
+| Windows (label with an explicit OS version) | Production build (pinned to a configuration with `dev-tools` disabled), verifying that development features are not included, the render benchmark run once, the render staging allocation test in the release profile, rendering image comparison with WARP, Windows tests, including the scripted plays' check of the render thread's app region allocations (`dev-tools`) |
+| Linux | Builds and tests of crates that do not depend on Windows, the `eval` and `bms-parser` benchmarks run once, the allocation tests of `eval`, `input`, `game` and `audio` again in the release profile, the fuzz crate's format, clippy and seed smoke tests, banned-word check, lint fixtures (`cargo xtask check-lints`), dependency checks of both lockfiles (`cargo-deny`, `cargo-audit`, `cargo-machete`; "Dependency Checks" below), tests in the Nix development shell through `scripts/wsl.sh`, and in the same `nix` job the fuzz self-test and short fuzzing runs (60 s per target, a fixed libFuzzer seed, in the `fuzz` shell) |
 
 - Both runners install tools from the same `mise.lock` (`jdx/mise-action`). Run the install step even after restoring the cache, and verify the Rust version in use.
 - `.github/workflows/fuzz.yml` fuzzes each target for 900 s daily (and on manual dispatch with another duration), with the same per-input limits, starting from the generated seeds; pull requests that change the workflow, `scripts/fuzz.sh` or `flake.nix` run it for 60 s. It is not a required check. Its scheduled runs notify and are disabled after 60 idle days as `audit.yml`'s are ("Dependency Checks" below).
@@ -127,6 +127,20 @@ The property tests (`crates/eval/tests/props.rs`, `crates/replay/tests/round_tri
 - Windows runner images keep being updated even when the version is specified by label. Record the runner image version, the adapter used, and the available features. When an image update changes image comparison results, review the diff images before updating the expected images.
 - On the `windows-2025` runner, a WARP device can be created explicitly (D3D12, `IDXGIFactory4::EnumWarpAdapter`) and a rendered target read back exactly. Verified on image `win25-vs2026 20261021.278.1` (the `windows-2025` label currently maps to the Visual Studio 2026 image): Microsoft Basic Render Driver, driver 10.0.26100.33648, maximum feature level 12_1.
 - Repository settings (merge methods, the `main` rulesets with the required CI checks, allowed Actions, security features) are declared in `.github/infra.yaml`. Change them there and run `mise exec -- gh-infra plan .github/infra.yaml`, then `apply`.
+
+### Benchmarks
+
+CPU-side time ([design.md](design.md), "Measurement") is measured with `criterion` (default features off, `cargo_bench_support` on; a dev-dependency pinned in the root `Cargo.toml`). The benchmarks build their charts and input in code; no chart file is in the repository.
+
+| Crate | Benchmark file | What it measures |
+| --- | --- | --- |
+| `eval` | `benches/evaluate.rs` | `evaluate` over generated 2,000- and 10,000-note charts with dense input, and the same plays advanced live in 1 ms steps |
+| `bms-parser` | `benches/load.rs` | `load_bms` on generated text with thousands of BPM changes |
+| `render` (Windows only) | `benches/skin.rs` | `SimpleSkin::build` on a dense frame, without a GPU |
+
+- Run them with `mise exec -- cargo bench -p eval -p bms-parser` and `mise exec -- cargo bench -p render`. Add `-- --test` to run each once without measuring, as CI does so they do not rot. To compare two commits locally, run `cargo bench -p eval -p bms-parser --bench evaluate --bench load -- --save-baseline <name>` on one and `-- --baseline <name>` on the other (naming the benches keeps the unit-test harnesses, which do not take criterion's options, out of the run).
+- `.github/workflows/bench.yml` runs the `eval` and `bms-parser` benchmarks on the merge base and then on the pull request's head, in one job on one runner, and prints criterion's change estimates (and puts them in the job summary). It runs on pull requests that touch `crates/`, the manifests or the workflow, and on manual dispatch. It is not a required check and does not fail the run, even when a benchmark fails. `render` is not compared because it needs the Windows runner. If the merge base has no benchmarks yet, it only says so.
+- Measurements on shared runners fluctuate, so a change estimate flags a large regression for a reviewer to look at; absolute values are tracked on the development PC ("Measurement Conditions").
 
 ### Dependency Checks
 

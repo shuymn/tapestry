@@ -52,6 +52,10 @@ jobs:
       # R3 production-feature check sees cfg(windows) build-dependencies only here.
       - name: Architecture rules
         run: mise exec -- cargo xtask check-arch
+      # Runs each benchmark once so it keeps building and running
+      # (docs/setup.md "Benchmarks"); bench.yml measures.
+      - name: Benchmarks run once
+        run: mise exec -- cargo bench --locked -p render -- --test
       - name: Production build
         run: mise exec -- cargo build --release --locked -p player --no-default-features
       # The allocation contracts also hold with optimizations (design.md
@@ -125,6 +129,10 @@ jobs:
         run: mise exec -- cargo xtask check-lints
       - name: Test (portable crates)
         run: mise exec -- cargo xtask portable test --locked
+      # Runs each benchmark once so it keeps building and running
+      # (docs/setup.md "Benchmarks"); bench.yml measures.
+      - name: Benchmarks run once
+        run: mise exec -- cargo bench --locked -p eval -p bms-parser -- --test
       # The allocation contracts also hold with optimizations (design.md
       # "Scope of No Allocation").
       - name: Allocation tests (release)
