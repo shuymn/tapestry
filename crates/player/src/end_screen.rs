@@ -448,7 +448,8 @@ mod tests {
     /// record, the incomplete reason, alone or with others.
     #[test]
     fn an_input_failure_is_named_on_the_end_screen() {
-        let mut played = report(rules::custom());
+        let preset = rules::custom();
+        let mut played = report(preset.clone());
         played.end = game::PlayEnd::Aborted(game::AbortCause::InputFailed);
         played.input_error = Some(game::InputWaitError::Gone);
         let hints = super::Hints::new(Some(0x0E), Some(0x01));
@@ -457,37 +458,71 @@ mod tests {
             steady_underruns: 0,
             next: 2,
         };
-        let lines = super::lines(
-            &played,
-            0,
-            super::LoadTimes::default(),
-            queue,
-            &hints,
-            false,
-        );
+        let lines = |played: &game::PlayReport| {
+            super::lines(played, 0, super::LoadTimes::default(), queue, &hints, false)
+        };
+        let incomplete = |l: &[String]| {
+            l.iter()
+                .filter(|l| l.starts_with("RECORD INCOMPLETE"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let shown = lines(&played);
         for line in [
             "RESULT: ENDED MIDWAY (INPUT FAILED)",
             "INPUT: THE INPUT THREAD IS GONE",
         ] {
-            assert!(lines.iter().any(|l| l == line), "{line} in {lines:?}");
+            assert!(shown.iter().any(|l| l == line), "{line} in {shown:?}");
         }
+        assert!(incomplete(&shown).is_empty(), "{shown:?}");
         let only = replay::Incomplete {
             input_failed: true,
             ..replay::Incomplete::default()
         };
-        assert_eq!(
-            super::incomplete_line(only).as_deref(),
-            Some("RECORD INCOMPLETE: INPUT FAILED")
-        );
         let both = replay::Incomplete {
             suspend: true,
             ..only
         };
-        assert_eq!(
-            super::incomplete_line(both).as_deref(),
-            Some("RECORD INCOMPLETE: SUSPEND, INPUT FAILED")
-        );
-        assert_eq!(super::incomplete_line(replay::Incomplete::default()), None);
+        for (reasons, line) in [
+            (only, "RECORD INCOMPLETE: INPUT FAILED"),
+            (both, "RECORD INCOMPLETE: SUSPEND, INPUT FAILED"),
+        ] {
+            played.record = Some(record(&preset, reasons));
+            assert_eq!(incomplete(&lines(&played)), [line]);
+        }
+        played.record = Some(record(&preset, replay::Incomplete::default()));
+        assert!(incomplete(&lines(&played)).is_empty());
+    }
+
+    /// A record of an aborted play with no input, incomplete for `reasons`.
+    fn record(preset: &rules::RulePreset, reasons: replay::Incomplete) -> replay::PlayRecord {
+        replay::PlayRecord {
+            versions: replay::Versions {
+                evaluator: 1,
+                app: "0.0.0-test".to_owned(),
+                provenance: replay::BuildProvenance::Development,
+            },
+            chart: replay::ChartRecord::default(),
+            preset: replay::PresetRecord::of(preset),
+            session_policy: "default".to_owned(),
+            devices: replay::DeviceRecord {
+                sources: Vec::new(),
+                audio_offset: bms_model::TimeUs(0),
+                display_offset: bms_model::TimeUs(0),
+            },
+            play_type: replay::PlayType::Full,
+            start: eval::InputStart {
+                opened_at: bms_model::TimeUs(-1_000_000),
+                held: Vec::new(),
+            },
+            events: Vec::new(),
+            arrivals: Vec::new(),
+            status: replay::Status {
+                end: replay::EndStatus::EndedMidway,
+                finalized: bms_model::TimeUs(0),
+                incomplete: reasons,
+            },
+        }
     }
 
     /// P3: an autoplay play's end screen says it was not saved and shows

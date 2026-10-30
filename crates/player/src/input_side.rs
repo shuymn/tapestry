@@ -1024,6 +1024,9 @@ mod link_tests {
     struct Waker {
         stop: Arc<AtomicBool>,
         stuck: Arc<AtomicBool>,
+        /// Set by the thread once it has seen `stuck` between two wakes:
+        /// no wake is under way, and none starts until `stuck` clears.
+        paused: Arc<AtomicBool>,
         wakes: Arc<AtomicU64>,
         handle: JoinHandle<Hook>,
     }
@@ -1032,14 +1035,23 @@ mod link_tests {
         fn spawn(mut hook: Hook, mut sources: SourceSet) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let stuck = Arc::new(AtomicBool::new(false));
+            let paused = Arc::new(AtomicBool::new(false));
             let wakes = Arc::new(AtomicU64::new(0));
-            let (s, k, w) = (Arc::clone(&stop), Arc::clone(&stuck), Arc::clone(&wakes));
+            let (s, k, p, w) = (
+                Arc::clone(&stop),
+                Arc::clone(&stuck),
+                Arc::clone(&paused),
+                Arc::clone(&wakes),
+            );
             let handle = std::thread::spawn(move || {
                 let begun = Instant::now();
                 let mut now = 0;
                 while !s.load(Ordering::Acquire) && begun.elapsed() < Duration::from_secs(30) {
                     std::thread::sleep(Duration::from_millis(1));
-                    if !k.load(Ordering::Acquire) {
+                    if k.load(Ordering::Acquire) {
+                        p.store(true, Ordering::Release);
+                    } else {
+                        p.store(false, Ordering::Release);
                         now += 1_000;
                         hook.wake(&mut sources, TimeUs(now));
                         w.fetch_add(1, Ordering::AcqRel);
@@ -1050,9 +1062,27 @@ mod link_tests {
             Self {
                 stop,
                 stuck,
+                paused,
                 wakes,
                 handle,
             }
+        }
+
+        /// Stops the wakes and waits (at most 5 s) until the thread says
+        /// its last wake has finished: a request sent after this is not
+        /// answered until [`resume`](Self::resume).
+        fn pause(&self) {
+            self.paused.store(false, Ordering::Release);
+            self.stuck.store(true, Ordering::Release);
+            let begun = Instant::now();
+            while !self.paused.load(Ordering::Acquire) {
+                assert!(begun.elapsed() < Duration::from_secs(5), "not paused");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn resume(&self) {
+            self.stuck.store(false, Ordering::Release);
         }
 
         /// Waits (at most 5 s) until the hook has woken twice more: a
@@ -1105,11 +1135,11 @@ mod link_tests {
         let waker = Waker::spawn(hook, sources);
         assert!(link.open(open_request()).is_ok());
         assert_eq!(link.failure(), None);
-        waker.stuck.store(true, Ordering::Release);
+        waker.pause();
         let begun = Instant::now();
         assert_eq!(link.close().err(), Some(InputWaitError::Timeout));
         assert!(begun.elapsed() >= SHORT, "{:?}", begun.elapsed());
-        waker.stuck.store(false, Ordering::Release);
+        waker.resume();
         // The late reply to the close arrives.
         waker.two_more_wakes();
         let begun = Instant::now();
@@ -1137,13 +1167,13 @@ mod link_tests {
         // Asleep the whole time: the awake time does not move.
         link.awake = Box::new(|| Duration::ZERO);
         let waker = Waker::spawn(hook, sources);
-        waker.stuck.store(true, Ordering::Release);
+        waker.pause();
+        let begun = Instant::now();
         let stuck = Arc::clone(&waker.stuck);
         let resume = std::thread::spawn(move || {
             std::thread::sleep(SHORT * 4);
             stuck.store(false, Ordering::Release);
         });
-        let begun = Instant::now();
         assert!(link.open(open_request()).is_ok());
         assert!(begun.elapsed() >= SHORT * 4, "{:?}", begun.elapsed());
         assert_eq!(link.failure(), None);
