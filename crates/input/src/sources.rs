@@ -68,7 +68,8 @@ struct Device {
     /// A controller's axes, from [`SourceSet::add_axes`].
     axes: [AxisCap; MAX_AXES],
     n_axes: usize,
-    /// Each absolute axis's last position, 0 included; `None` until seen.
+    /// Each last position of an axis converted as absolute (`device.toml`'s
+    /// mode, else the declared one), 0 included; `None` until seen.
     positions: [Option<i32>; MAX_AXES],
     /// Its source while it takes part in the open recording.
     source: Option<SourceId>,
@@ -278,12 +279,14 @@ impl SourceSet {
             .take(device.n_axes)
             .position(|a| a.control == packet.control);
         if let Some(i) = axis {
-            // A relative axis has no position to keep.
+            // An axis converted as relative has no position to keep; one
+            // converted as absolute keeps it for the start snapshot,
+            // whatever it declares.
             #[expect(
                 clippy::indexing_slicing,
                 reason = "`i` is a position below `n_axes`, at most MAX_AXES"
             )]
-            if !device.axes[i].relative {
+            if !resolved_relative(self.axis_mode.as_ref(), device.product, &device.axes[i]) {
                 device.positions[i] = Some(packet.value);
             }
         } else if !track(&mut device.held, max_held, packet.control, packet.value) {
@@ -514,14 +517,12 @@ impl SourceSet {
     /// declared one.
     #[must_use]
     pub fn axis_relative(&self, device: DeviceId, cap: &AxisCap) -> bool {
-        let set = self.axis_mode.as_ref().filter(|m| {
-            m.controls.contains(&cap.control)
-                && self
-                    .devices
-                    .iter()
-                    .any(|d| d.id == device && d.product == Some(m.product))
-        });
-        set.map_or(cap.relative, |m| m.relative)
+        let product = self
+            .devices
+            .iter()
+            .find(|d| d.id == device)
+            .and_then(|d| d.product);
+        resolved_relative(self.axis_mode.as_ref(), product, cap)
     }
 
     /// Sets the axes of the connected `device` that the conversion takes
@@ -911,6 +912,13 @@ impl SourceSet {
 
 /// Updates one control in a device's held list. Returns `false` when a
 /// newly held control does not fit.
+/// Whether the axis `cap` of a device of `product` is converted as
+/// relative: the mode `set` gives it, else the declared one.
+fn resolved_relative(set: Option<&AxisMode>, product: Option<HidProduct>, cap: &AxisCap) -> bool {
+    set.filter(|m| product == Some(m.product) && m.controls.contains(&cap.control))
+        .map_or(cap.relative, |m| m.relative)
+}
+
 fn track(held: &mut Vec<(ControlId, i32)>, max: usize, control: ControlId, value: i32) -> bool {
     match held.iter().position(|&(c, _)| c == control) {
         Some(i) if value == 0 => {

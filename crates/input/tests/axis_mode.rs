@@ -112,3 +112,53 @@ fn an_axis_set_absolute_keeps_position_zero() {
     let (_, recorded) = run(declared, true, &[2, 0, 2]);
     assert_eq!(recorded, [2, 2]);
 }
+
+/// The start snapshot of a play after X reported 50 through the reader
+/// while recording was closed, with X declared as `cap` and converted as
+/// `relative` or absolute.
+fn snapshot(cap: AxisCap, relative: bool) -> Vec<(eval::SourceId, ControlId, i32)> {
+    let mut set = SourceSet::new(SourceConfig {
+        max_devices: 2,
+        max_sources: 2,
+        max_held: 4,
+        queue_capacity: 8,
+        max_arrivals: 1,
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    set.connect(DEVICE, DeviceKind::Controller);
+    set.set_product(DEVICE, PAD);
+    set.add_axes(DEVICE, &[cap]);
+    set.set_axis_mode(PAD, vec![X], relative);
+    let layout = HidLayout {
+        collection: 0,
+        axes: &[cap],
+        buttons: &[],
+    };
+    let mut pad = HidDevice::new(DEVICE, &layout);
+    let axes = [Some(50)];
+    let report = HidReport {
+        id: 0,
+        buttons: None,
+        axes: &axes,
+    };
+    pad.report(&report, false, &Capture::new(), &mut set);
+    set.end_batch(TimeUs(1));
+    set.set_recorded(DEVICE, vec![X]);
+    set.open_recording(TimeUs(2)).held
+}
+
+/// The start snapshot holds the position of an axis converted as
+/// absolute, whatever it declares, so play's conversion starts from it
+/// and counts the first movement; an axis converted as relative has no
+/// position to hold.
+#[test]
+fn the_start_snapshot_follows_the_conversion_mode() {
+    let source = eval::SourceId(0);
+    let declared_relative = axis_cap(X, false, -127, 127, 8).unwrap();
+    assert_eq!(snapshot(declared_relative, false), [(source, X, 50)]);
+    assert_eq!(snapshot(declared_relative, true), []);
+    let declared_absolute = axis_cap(X, true, 0, 255, 8).unwrap();
+    assert_eq!(snapshot(declared_absolute, true), []);
+    assert_eq!(snapshot(declared_absolute, false), [(source, X, 50)]);
+}
