@@ -129,6 +129,8 @@ pub struct PlayerRig<'a> {
     pub adjust_in_play: Vec<game::Adjust>,
     #[cfg(feature = "dev-tools")]
     pub adjust_at: TimeUs,
+    /// The select screen, with song selection.
+    pub selection: Option<crate::selection::Selection>,
     /// Settings keys pressed by themselves at the first end screen
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -183,7 +185,7 @@ impl PlayerRig<'_> {
     /// Acts on changed settings keys' values: the volume goes to the
     /// audio thread, and a shown end screen is drawn again.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn sync(&mut self) {
+    pub(crate) fn sync(&mut self) {
         let Some(t) = self.seen.take_new(self.controls.tuning()) else {
             return;
         };
@@ -272,7 +274,7 @@ impl PlayerRig<'_> {
     }
 }
 
-fn since(from: TimeUs, to: TimeUs) -> Duration {
+pub(crate) fn since(from: TimeUs, to: TimeUs) -> Duration {
     Duration::from_micros(u64::try_from(to.0 - from.0).unwrap_or(0))
 }
 
@@ -321,6 +323,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
+        // With selection, the scan has acknowledged its pause before
+        // recording opens and the countdown starts.
+        self.pause_scan();
         self.audio.control.ready()?;
         // Between plays, before recording opens: the change never lands
         // inside a play or its countdown.
@@ -356,6 +361,13 @@ impl Rig for PlayerRig<'_> {
         let countdown_at = TimeUs(origin.0 - self.lead_in.0);
         self.countdown_at = Some(countdown_at);
         println!("play started");
+        // A chart's first play: a retry runs from its own receipt.
+        if let Some(sel) = &self.selection
+            && self.retry_from.is_none()
+        {
+            let ms = since(sel.chosen_at, started).as_millis();
+            println!("load: the countdown started {ms} ms after the choice");
+        }
         // Before the play is sent: the audio thread may mix its first wake
         // before this thread runs again.
         let audio = AudioBase::new(self.audio.control.counters());
@@ -502,6 +514,7 @@ impl Rig for PlayerRig<'_> {
             self.autoplay,
         ));
         self.send_end(tuning.get());
+        self.result_shown();
         #[cfg(feature = "dev-tools")]
         for a in self.adjust_on_end.drain(..) {
             tuning.adjust(a);

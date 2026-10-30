@@ -75,6 +75,16 @@ pub enum Request {
     /// open: it stops its heartbeat. Not answered; ignored while
     /// recording is open.
     Idle,
+    /// Autoplay of another chart, between plays: its generated input, and
+    /// the events each source's queue holds for it. Not answered; ignored
+    /// by the other modes. The replaced input is freed on the input
+    /// thread, outside any play.
+    Feed {
+        /// The chart's generated input.
+        input: input::AutoplayInput,
+        /// Its source queue's size.
+        queue_capacity: usize,
+    },
 }
 
 /// What a play records, from the key configs.
@@ -156,6 +166,19 @@ impl InputLink {
                 Ok(c)
             }
             Reply::Opened(..) => unreachable!("a close is answered by a closing"),
+        }
+    }
+
+    /// Hands the input thread another chart's generated input (autoplay),
+    /// between plays: sent without waiting, since nothing answers it; the
+    /// next open, sent after it, plays it. A failed link sends nothing.
+    pub fn feed(&self, input: input::AutoplayInput, queue_capacity: usize) {
+        let feed = Request::Feed {
+            input,
+            queue_capacity,
+        };
+        if self.failed.is_none() && self.requests.send(feed).is_ok() {
+            self.waker.wake();
         }
     }
 
@@ -348,6 +371,16 @@ impl Hook {
                 Request::Idle => {
                     if self.phase != Phase::Open {
                         self.phase = Phase::Idle;
+                    }
+                    continue;
+                }
+                Request::Feed {
+                    input,
+                    queue_capacity,
+                } => {
+                    if let Mode::Autoplay(feeder) = &mut self.mode {
+                        *feeder = input;
+                        sources.set_queue_capacity(queue_capacity);
                     }
                     continue;
                 }

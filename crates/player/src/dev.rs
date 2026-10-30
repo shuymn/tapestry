@@ -210,6 +210,247 @@ impl Options {
     }
 }
 
+/// The development options of song selection (`tapestry [--auto]`).
+#[derive(Debug, Default)]
+pub struct SelectOptions {
+    /// Run headless: a recording of a simulated audio device, WARP
+    /// offscreen and no window; needs `--auto` and a script.
+    pub headless: bool,
+    /// The select screen's input, scripted (`--dev-select`).
+    pub script: Option<SelectScript>,
+    /// The wait between scan passes (`--dev-rescan-ms`).
+    pub rescan_ms: Option<u64>,
+    /// Where to write frames (`--dev-frames`): the select screen's first
+    /// frame, and the first play's countdown, play and end frames.
+    pub frames: Option<PathBuf>,
+}
+
+impl SelectOptions {
+    /// Takes the long option `name` (without its dashes) and its value.
+    ///
+    /// # Errors
+    ///
+    /// An option selection does not take, or a missing or bad value.
+    pub fn take(&mut self, name: &str, p: &mut lexopt::Parser) -> Result<(), UsageError> {
+        match name {
+            "dev-headless" => self.headless = true,
+            "dev-select" => {
+                let steps = p.value()?;
+                self.script =
+                    Some(SelectScript::parse(&steps.to_string_lossy()).map_err(UsageError::Usage)?);
+            }
+            "dev-rescan-ms" => {
+                self.rescan_ms = Some(p.value()?.to_string_lossy().parse().map_err(|_| {
+                    UsageError::Usage("--dev-rescan-ms takes milliseconds".to_owned())
+                })?);
+            }
+            "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
+            _ => return Err(UsageError::Unknown(format!("--{name}"))),
+        }
+        Ok(())
+    }
+
+    /// Refuses options that cannot go together.
+    ///
+    /// # Errors
+    ///
+    /// `--dev-headless` without `--auto` and a script.
+    pub fn check(&self, auto: bool) -> Result<(), UsageError> {
+        if self.headless && !(auto && self.script.is_some()) {
+            return Err(UsageError::Usage(
+                "--dev-headless needs --auto and --dev-select".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One step of a scripted select screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectStep {
+    /// Wait until the chart of this file name is listed, then move the
+    /// cursor onto it with the arrow keys.
+    Pick(String),
+    /// Wait until the chart of this file name is listed.
+    Wait(String),
+    /// Type into the search box: Tab, the text, Enter.
+    Search(String),
+    /// Wait this many milliseconds on the select screen.
+    Sleep(u64),
+    /// Press Enter.
+    Enter,
+    /// On a result: leave it (the quit key).
+    Back,
+    /// On a result: retry.
+    Retry,
+    /// Close the window.
+    Close,
+}
+
+/// How long a scripted step waits for its chart.
+pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `--dev-select <steps>`: the select screen's input, comma-separated:
+/// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`, `enter`,
+/// `back`, `retry` and `close`. Selection steps run on the select screen, `back` and
+/// `retry` on a result; a step out of place, or a chart not listed within
+/// [`STEP_TIMEOUT`], fails the run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectScript {
+    steps: std::collections::VecDeque<SelectStep>,
+    /// Since when the front step waits.
+    since: Option<std::time::Instant>,
+    /// Why the script failed.
+    failed: Option<String>,
+}
+
+impl SelectScript {
+    /// Reads the steps.
+    ///
+    /// # Errors
+    ///
+    /// A step of none of the forms.
+    pub fn parse(list: &str) -> Result<Self, String> {
+        let steps = list
+            .split(',')
+            .map(|s| match s.split_once('=') {
+                Some(("pick", f)) => Ok(SelectStep::Pick(f.to_owned())),
+                Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
+                Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
+                Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
+                    format!("{s} is not pick=, wait=, search=, sleep=, enter, back, retry or close")
+                }),
+                None if s == "enter" => Ok(SelectStep::Enter),
+                None if s == "back" => Ok(SelectStep::Back),
+                None if s == "retry" => Ok(SelectStep::Retry),
+                None if s == "close" => Ok(SelectStep::Close),
+                _ => Err(format!(
+                    "{s} is not pick=, wait=, search=, sleep=, enter, back, retry or close"
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            steps,
+            since: None,
+            failed: None,
+        })
+    }
+
+    /// The step to run now.
+    pub fn front(&self) -> Option<&SelectStep> {
+        self.steps.front()
+    }
+
+    /// The front step is done.
+    pub fn done(&mut self) {
+        self.steps.pop_front();
+        self.since = None;
+    }
+
+    /// The front step waits on; `false` once it has waited
+    /// [`STEP_TIMEOUT`], which fails the script.
+    pub fn waiting(&mut self) -> bool {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < STEP_TIMEOUT {
+            return true;
+        }
+        let step = format!("{:?}", self.front());
+        self.fail(format!("{step} waited {} s", STEP_TIMEOUT.as_secs()));
+        false
+    }
+
+    /// The script failed: no step runs from here on.
+    pub fn fail(&mut self, why: String) {
+        eprintln!("dev: select script: {why}");
+        self.failed.get_or_insert(why);
+        self.steps.clear();
+    }
+
+    /// Whether the front step has waited `ms` milliseconds since it became
+    /// the front.
+    pub fn slept(&mut self, ms: u64) -> bool {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        since.elapsed() >= Duration::from_millis(ms)
+    }
+
+    /// Why the script failed, if it did.
+    pub fn failure(&self) -> Option<&str> {
+        self.failed.as_deref()
+    }
+}
+
+/// The select screen's frames (dev-tools): CPU time, the interval between
+/// frames and the render thread's allocations per frame, kept from the
+/// screen's first frame until it is left, then printed.
+#[derive(Debug, Default)]
+pub struct MenuStats {
+    cpu_us: Vec<u64>,
+    interval_us: Vec<u64>,
+    /// Frames that drew the prepared page.
+    steady_allocs: Vec<u64>,
+    /// Frames that laid a new page out.
+    changed_allocs: Vec<u64>,
+    last: Option<std::time::Instant>,
+}
+
+impl MenuStats {
+    /// One frame: its CPU time, the render thread's allocations during
+    /// it, and whether it laid a new page out.
+    pub fn frame(&mut self, cpu: Duration, allocs: u64, changed: bool) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last {
+            self.interval_us
+                .push(u64::try_from(now.duration_since(last).as_micros()).unwrap_or(u64::MAX));
+        }
+        self.last = Some(now);
+        self.cpu_us
+            .push(u64::try_from(cpu.as_micros()).unwrap_or(u64::MAX));
+        if changed {
+            self.changed_allocs.push(allocs);
+        } else {
+            self.steady_allocs.push(allocs);
+        }
+    }
+
+    /// Prints what was kept, if anything, and starts over.
+    pub fn report(&mut self) {
+        if self.cpu_us.is_empty() {
+            return;
+        }
+        let q = |v: &mut Vec<u64>, p: usize| {
+            v.sort_unstable();
+            v.get((v.len().saturating_sub(1)) * p / 100)
+                .copied()
+                .unwrap_or(0)
+        };
+        let mean = |v: &[u64]| {
+            if v.is_empty() {
+                0.0
+            } else {
+                v.iter().sum::<u64>() as f64 / v.len() as f64
+            }
+        };
+        let (cpu50, cpu99, cpumax) = (
+            q(&mut self.cpu_us, 50),
+            q(&mut self.cpu_us, 99),
+            q(&mut self.cpu_us, 100),
+        );
+        let (gap50, gap99) = (q(&mut self.interval_us, 50), q(&mut self.interval_us, 99));
+        println!(
+            "dev: select frames {}: cpu p50 {cpu50} us, p99 {cpu99} us, max {cpumax} us; \
+             interval p50 {gap50} us, p99 {gap99} us; allocations per frame: \
+             steady mean {:.1} max {}, new page mean {:.1} max {} ({} pages)",
+            self.cpu_us.len(),
+            mean(&self.steady_allocs),
+            self.steady_allocs.iter().max().copied().unwrap_or(0),
+            mean(&self.changed_allocs),
+            self.changed_allocs.iter().max().copied().unwrap_or(0),
+            self.changed_allocs.len(),
+        );
+        *self = Self::default();
+    }
+}
+
 /// The scripted play's input: the log's events as a script, one device per
 /// source.
 ///
@@ -449,6 +690,21 @@ pub fn report_audio(out: &Paced<RecordingOutput<SimDevice>>) {
     let onsets = onsets(samples);
     let listed: Vec<String> = onsets.iter().take(64).map(ToString::to_string).collect();
     println!("dev: audio onsets {}: {}", onsets.len(), listed.join(" "));
+    // The loudest sample of the 10 ms after each onset, to tell sounds
+    // apart.
+    let peaks: Vec<String> = onsets
+        .iter()
+        .take(64)
+        .map(|&f| {
+            let from = f * audio::CHANNELS;
+            let to = (from + 480 * audio::CHANNELS).min(samples.len());
+            let peak = samples[from..to]
+                .iter()
+                .fold(0.0_f32, |p, s| p.max(s.abs()));
+            format!("{peak:.3}")
+        })
+        .collect();
+    println!("dev: audio onset peaks: {}", peaks.join(" "));
 }
 
 /// The frames where sound starts after at least 10 ms (at 48 kHz) of
@@ -471,15 +727,17 @@ fn onsets(samples: &[f32]) -> Vec<usize> {
     found
 }
 
-/// Writes frames as PNG files: `countdown.png` at the first frame of the
-/// lead-in, `play.png` at the first frame at or after `play_at`, and
-/// `end.png` at the first end screen frame.
+/// Writes frames as PNG files: `select.png` at the first select screen
+/// frame, `countdown.png` at the first frame of the lead-in, `play.png` at
+/// the first frame at or after `play_at`, and `end.png` at the first end
+/// screen frame.
 pub struct FrameDump {
     dir: PathBuf,
     play_at: TimeUs,
     countdown: bool,
     play: bool,
     end: bool,
+    select: bool,
 }
 
 impl FrameDump {
@@ -491,6 +749,7 @@ impl FrameDump {
             countdown: false,
             play: false,
             end: false,
+            select: false,
         }
     }
 
@@ -525,6 +784,12 @@ impl FrameSink for FrameDump {
             Some(t) if t >= self.play_at && !self.play => {
                 self.play = true;
                 self.save(screen, "play.png");
+            }
+            None if drawn.menu => {
+                if !self.select {
+                    self.select = true;
+                    self.save(screen, "select.png");
+                }
             }
             None if !self.end => {
                 self.end = true;

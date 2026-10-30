@@ -29,17 +29,22 @@ mod input_side;
 mod keys;
 mod log_file;
 mod measure;
+mod menu_screen;
 mod play;
 mod power;
 #[cfg(feature = "dev-tools")]
 mod presentmon;
 mod render_side;
+mod select;
+mod selection;
+mod shelf;
 mod tuning;
 mod window;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::mpsc::SyncSender;
 use std::time::SystemTime;
 
 use anyhow::Context as _;
@@ -62,8 +67,10 @@ use crate::controls::Controls;
 use crate::end_screen::{Hints, LoadTimes};
 use crate::input_side::Mode;
 use crate::measure::{AudioInfo, Measure, SOUND_QUEUE, STEP_QUEUE, StepSample};
+use crate::menu_screen::MenuScreen;
 use crate::play::PlayerRig;
 use crate::render_side::{MakeScreen, NoFrames, Screen, View};
+use crate::select::MenuInput;
 use crate::tuning::{Delivered, LiveTuning, SettingsFiles};
 
 /// The countdown before chart time 0 (design.md "Play Lifecycle").
@@ -103,6 +110,7 @@ fn main() -> ExitCode {
         #[cfg(not(feature = "dev-tools"))]
         Command::Keys(args::Keys {}) => report(keys::run(clock)),
         Command::Play(p) => play_command(p, clock),
+        Command::Select(s) => report(select(s, clock)),
         #[cfg(feature = "dev-tools")]
         Command::DevToolsProbe => dev::probe(),
         #[cfg(feature = "dev-tools")]
@@ -119,6 +127,7 @@ fn logged(command: &Command) -> Option<&'static str> {
         Command::DevToolsProbe => None,
         Command::Keys(_) => Some("keys"),
         Command::Play(_) => Some("play"),
+        Command::Select(_) => Some("select"),
         #[cfg(feature = "dev-tools")]
         Command::Measure { .. } => Some("measure"),
     }
@@ -333,26 +342,7 @@ fn load(chart: &Path, input: &PlayInput) -> anyhow::Result<Loaded> {
             Some(AutoKeySounds::Judged),
         ),
     };
-    // `#RANDOM` is resolved with a seed that differs per run; it is
-    // recorded.
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let config = SessionConfig {
-        lead_in: LEAD_IN,
-        step: TimeUs(1_000),
-        start: TimeUs(0),
-        effects: EFFECTS,
-        seed,
-        app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        provenance: if cfg!(feature = "dev-tools") {
-            BuildProvenance::Development
-        } else {
-            BuildProvenance::Production
-        },
-        receive,
-        autoplay,
-    };
+    let config = session_config(receive, autoplay);
     let loaded = Loaded::load(root, settings, chart, config, parts)
         .with_context(|| chart.display().to_string())?;
     let warnings = loaded.warnings();
@@ -367,6 +357,30 @@ fn load(chart: &Path, input: &PlayInput) -> anyhow::Result<Loaded> {
             .map(|s| s.name.as_str()),
     );
     Ok(loaded)
+}
+
+/// The session's fixed choices: how input is received, and autoplay's.
+fn session_config(receive: ReceiveMethod, autoplay: Option<AutoKeySounds>) -> SessionConfig {
+    // `#RANDOM` is resolved with a seed that differs per run; it is
+    // recorded.
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    SessionConfig {
+        lead_in: LEAD_IN,
+        step: TimeUs(1_000),
+        start: TimeUs(0),
+        effects: EFFECTS,
+        seed,
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        provenance: if cfg!(feature = "dev-tools") {
+            BuildProvenance::Development
+        } else {
+            BuildProvenance::Production
+        },
+        receive,
+        autoplay,
+    }
 }
 
 /// The source set: up to 16 devices kept, 8 taking part in a play.
@@ -553,25 +567,39 @@ fn view(controls: &Controls) -> View {
 
 /// The controls, with the settings keys starting from the loaded values,
 /// waking the calling thread: the game thread.
-fn controls(loaded: &Loaded, clock: QpcClock) -> Arc<Controls> {
-    let s = loaded.settings();
+fn controls(s: &Settings, clock: QpcClock) -> Arc<Controls> {
     let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volume(s.device.master_volume);
     let controls = Controls::with_tuning(clock, Arc::new(tuning));
     controls.set_game(std::thread::current());
     Arc::new(controls)
 }
 
-/// The game thread's rig around the started threads.
-fn rig<'a>(
-    loaded: &Loaded,
+/// The started threads' ends the rig holds.
+struct Threads {
     input: input_side::InputLink,
     audio: audio_side::AudioLink,
     render: render_side::RenderLink,
+    /// Where each logic step's measurement goes.
+    steps: rtrb::Producer<StepSample>,
+}
+
+/// The game thread's rig around the started threads, for plays under
+/// `root` with `settings`, by generated input when `autoplay`.
+fn rig<'a>(
+    root: &DataRoot,
+    settings: &Settings,
+    autoplay: bool,
+    threads: Threads,
     controls: &'a Controls,
     clock: QpcClock,
-    steps: rtrb::Producer<StepSample>,
 ) -> PlayerRig<'a> {
-    let device = &loaded.settings().device;
+    let Threads {
+        input,
+        audio,
+        render,
+        steps,
+    } = threads;
+    let device = &settings.device;
     PlayerRig {
         input,
         audio,
@@ -584,10 +612,10 @@ fn rig<'a>(
             controller_device: device.controller_device.map(Into::into),
             scratch: device.scratch,
         },
-        gauge: loaded.settings().player.displayed_gauge,
-        autoplay: loaded.config().autoplay.is_some(),
+        gauge: settings.player.displayed_gauge,
+        autoplay,
         input_offset_us: device.input_offset_us,
-        files: SettingsFiles::new(loaded.root().clone(), loaded.settings().clone()),
+        files: SettingsFiles::new(root.clone(), settings.clone()),
         seen: Delivered::default(),
         end_lines: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
@@ -606,7 +634,7 @@ fn rig<'a>(
         queue_line: None,
         #[cfg(feature = "dev-tools")]
         measured_plays: None,
-        lead_in: loaded.config().lead_in,
+        lead_in: LEAD_IN,
         in_play: false,
         #[cfg(feature = "dev-tools")]
         quit_after_end: None,
@@ -620,6 +648,7 @@ fn rig<'a>(
         adjust_at: TimeUs(0),
         #[cfg(feature = "dev-tools")]
         adjust_on_end: Vec::new(),
+        selection: None,
     }
 }
 
@@ -648,8 +677,10 @@ fn open_window_and_input(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
+    menu: Option<SyncSender<MenuInput>>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, InputThread)> {
-    let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1, monitor)?;
+    let (window_thread, surface) =
+        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
     let input = InputThread::spawn(clock, sources, capture, waker, wake);
     let input = match input {
         Ok(i) => i,
@@ -672,6 +703,10 @@ fn open_window_and_input(
 /// # Errors
 ///
 /// Why the window or the input thread cannot start.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one part of the startup, as in `open_window_and_input`"
+)]
 fn open_window_and_clocked(
     controls: &Arc<Controls>,
     clock: QpcClock,
@@ -680,8 +715,10 @@ fn open_window_and_clocked(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
+    menu: Option<SyncSender<MenuInput>>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, ClockedThread)> {
-    let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1, monitor)?;
+    let (window_thread, surface) =
+        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
     match ClockedThread::spawn(clock, sources, waker, wake) {
         Ok(input) => Ok((window_thread, surface, input)),
         Err(e) => {
@@ -709,7 +746,7 @@ fn play(
         schedule,
         keyboard,
     } = prepare(chart, &input)?;
-    let controls = controls(&loaded, clock);
+    let controls = controls(loaded.settings(), clock);
     let waker = Waker::new().context("input")?;
     let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
     let (audio, opened) = audio_side::spawn(
@@ -744,10 +781,11 @@ fn play(
             wake,
             keys,
             monitor,
+            None,
         )
         .map(|(w, s, t)| (w, s, Some(t), None))
     } else {
-        open_window_and_clocked(&controls, clock, sources, &waker, wake, keys, monitor)
+        open_window_and_clocked(&controls, clock, sources, &waker, wake, keys, monitor, None)
             .map(|(w, s, t)| (w, s, None, Some(t)))
     };
     let (window_thread, surface, raw_thread, clocked_thread) = match started {
@@ -764,7 +802,7 @@ fn play(
             height: surface.height,
         };
         Renderer::new(target, AdapterChoice::HighPerformance)
-            .map(|r| Box::new(r) as Box<dyn Screen>)
+            .map(|r| Box::new(MenuScreen::new(r, None)) as Box<dyn Screen>)
     });
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
     let mut measure = measure(
@@ -782,7 +820,7 @@ fn play(
     }
     let render = render_side::spawn(
         make,
-        Arc::new(loaded.chart().clone()),
+        Some(Arc::new(loaded.chart().clone())),
         clock,
         view(&controls),
         measure,
@@ -796,14 +834,20 @@ fn play(
             return Err(e.into());
         }
     };
-    let mut rig = rig(
-        &loaded,
+    let threads = Threads {
         input,
         audio,
         render,
+        steps: probes.steps.0,
+    };
+    let autoplay = loaded.config().autoplay.is_some();
+    let mut rig = rig(
+        loaded.root(),
+        loaded.settings(),
+        autoplay,
+        threads,
         &controls,
         clock,
-        probes.steps.0,
     );
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
@@ -823,6 +867,274 @@ fn play(
         t.detach();
     }
     ran?;
+    Ok(())
+}
+
+/// What makes the extension points of each chart the scene flow loads.
+type MakeParts = Box<dyn FnMut(&Settings) -> Parts>;
+
+/// Window inputs the select screen's queue holds; the game thread empties
+/// it at every look, and what does not fit is dropped.
+const MENU_QUEUE: usize = 64;
+
+/// Opens the shared-mode WASAPI output on the audio thread.
+fn wasapi_audio(clock: QpcClock) -> anyhow::Result<(audio_side::AudioThread, audio_side::Opened)> {
+    let spawned = audio_side::spawn(
+        move || -> Result<_, audio::WasapiError> {
+            let out = audio::WasapiShared::open(clock)?;
+            let most = out.grant().max_queue_periods;
+            Ok((out, Some(most)))
+        },
+        |_| {},
+    )?;
+    Ok(spawned)
+}
+
+/// The simulated output a headless run records into (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn recorded_audio(
+    clock: QpcClock,
+    seconds: usize,
+) -> anyhow::Result<(audio_side::AudioThread, audio_side::Opened)> {
+    let spawned = audio_side::spawn(
+        // The simulated output always opens.
+        move || -> Result<_, std::convert::Infallible> {
+            let out = dev::recording_output(clock, seconds);
+            Ok((out, Some(audio::MAX_QUEUE_PERIODS)))
+        },
+        dev::report_audio,
+    )?;
+    Ok(spawned)
+}
+
+/// `tapestry [--auto]`: song selection (design.md "Play Lifecycle"). The
+/// library's lock is taken first, so a second process on the same data
+/// root is refused before it reads a setting or opens anything else. Then
+/// the threads start without a chart, the scan's first pass with them, and
+/// the scene flow runs until the window closes: each chosen chart is
+/// loaded onto the running threads and played until the player leaves it.
+/// With `--auto` every chart plays by itself and nothing is saved.
+fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
+    #[cfg(feature = "dev-tools")]
+    alloc_count::tag(alloc_count::Tag::Logic);
+    let root = data_root()?;
+    let (library, opened) = shelf::open(&root)?;
+    println!("{opened}");
+    log::info!("{opened}");
+    let settings = settings(&root)?;
+    let autoplay = matches!(s.input, PlayInput::Autoplay);
+    let roots: Vec<PathBuf> = settings
+        .device
+        .library
+        .roots
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    #[cfg(feature = "dev-tools")]
+    let (headless, rescan) = (
+        s.dev.headless,
+        s.dev
+            .rescan_ms
+            .map_or(shelf::RESCAN_AFTER, std::time::Duration::from_millis),
+    );
+    #[cfg(not(feature = "dev-tools"))]
+    let (headless, rescan) = (false, shelf::RESCAN_AFTER);
+    let shelf = shelf::Shelf::new(library, roots.clone(), rescan);
+    let controls = controls(&settings, clock);
+    controls.quit_leaves();
+    let waker = Waker::new().context("input")?;
+    let _suspend = if headless {
+        None
+    } else {
+        Some(power::SuspendWatch::register(Arc::clone(&controls))?)
+    };
+    #[cfg(feature = "dev-tools")]
+    let (audio, opened) = if headless {
+        recorded_audio(clock, 240)?
+    } else {
+        wasapi_audio(clock)?
+    };
+    #[cfg(not(feature = "dev-tools"))]
+    let (audio, opened) = wasapi_audio(clock)?;
+    let probes = Probes::new();
+    // Silent until a chart is loaded: an empty bank and schedule.
+    let mut engine = AudioEngine::with_schedule(
+        Arc::new(audio::SoundBank::from_sounds(opened.rate, Vec::new())),
+        Vec::new(),
+        opened.rate,
+        opened.period,
+        MAX_VOICES,
+        SCHEDULE_LOG,
+    )
+    .context("the audio engine cannot start")?;
+    settings.device.apply_to(&mut engine);
+    let audio = audio.start(engine, probes.sounds.0);
+    let sources = sources();
+    controls.set_latch(sources.gate().handle());
+    controls.set_waker(waker.clone());
+    let mode = if autoplay {
+        Mode::Autoplay(AutoplayInput::new(Vec::new()))
+    } else {
+        Mode::Clock
+    };
+    let (mut hook, input) = input_side::link(Arc::clone(&controls), mode, waker.clone());
+    let wake = move |s: &mut SourceSet, now| {
+        #[cfg(feature = "dev-tools")]
+        alloc_count::tag(alloc_count::Tag::Input);
+        hook.wake(s, now)
+    };
+    let (menu_tx, menu_rx) = std::sync::mpsc::sync_channel(MENU_QUEUE);
+    let device = &settings.device;
+    let keys = (device.keyboard.retry, device.keyboard.quit);
+    let monitor = device.monitor.clone();
+    let started = if headless {
+        ClockedThread::spawn(clock, sources, &waker, wake)
+            .map(|t| (None, None, None, Some(t)))
+            .context("input")
+    } else if autoplay {
+        open_window_and_clocked(
+            &controls,
+            clock,
+            sources,
+            &waker,
+            wake,
+            keys,
+            monitor,
+            Some(menu_tx),
+        )
+        .map(|(w, s, t)| (Some(w), Some(s), None, Some(t)))
+    } else {
+        open_window_and_input(
+            &controls,
+            clock,
+            sources,
+            Capture::new(),
+            &waker,
+            wake,
+            keys,
+            monitor,
+            Some(menu_tx),
+        )
+        .map(|(w, s, t)| (Some(w), Some(s), Some(t), None))
+    };
+    let (window_thread, surface, raw_thread, clocked_thread) = match started {
+        Ok(started) => started,
+        Err(e) => {
+            audio.exit();
+            return Err(e);
+        }
+    };
+    let ime = window_thread.as_ref().map(window::WindowThread::ime);
+    let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
+    let make: MakeScreen = match surface {
+        Some(surface) => Box::new(move || {
+            let target = Target::Window {
+                window: surface.into(),
+                width: surface.width,
+                height: surface.height,
+            };
+            let r = Renderer::new(target, AdapterChoice::HighPerformance)?;
+            let fonts = render::text::Fonts::runtime()?;
+            Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
+        }),
+        None => Box::new(|| {
+            let target = Target::Offscreen {
+                width: 1280,
+                height: 720,
+            };
+            let r = Renderer::new(target, AdapterChoice::Warp)?;
+            let fonts = render::text::Fonts::runtime()?;
+            Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
+        }),
+    };
+    let measure = measure(
+        clock,
+        refresh_mhz,
+        opened,
+        probes.steps.1,
+        probes.sounds.1,
+        &controls,
+    );
+    #[cfg(feature = "dev-tools")]
+    let frames: Box<dyn render_side::FrameSink> = match s.dev.frames {
+        Some(dir) => Box::new(dev::FrameDump::new(dir, TimeUs(1_000_000))),
+        None => Box::new(NoFrames),
+    };
+    #[cfg(not(feature = "dev-tools"))]
+    let frames: Box<dyn render_side::FrameSink> = Box::new(NoFrames);
+    let render = match render_side::spawn(make, None, clock, view(&controls), measure, frames) {
+        Ok(r) => r,
+        Err(e) => {
+            audio.exit();
+            if let Some(w) = window_thread {
+                w.close();
+            }
+            return Err(e.into());
+        }
+    };
+    let threads = Threads {
+        input,
+        audio,
+        render,
+        steps: probes.steps.0,
+    };
+    let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock);
+    rig.queue_most = opened.most_queued_periods;
+    rig.selection = Some(selection::Selection {
+        shelf,
+        screen: select::SelectScreen::new(roots),
+        menu: menu_rx,
+        ime,
+        rate: opened.rate,
+        chosen_at: TimeUs(0),
+        entered_at: TimeUs(0),
+        dirty: true,
+        #[cfg(feature = "dev-tools")]
+        script: s.dev.script,
+    });
+    let (receive, auto, parts): (_, _, MakeParts) = if autoplay {
+        (
+            ReceiveMethod::Scripted,
+            Some(AutoKeySounds::Scheduled),
+            Box::new(|s: &Settings| Parts::unsaved(&s.player)),
+        )
+    } else {
+        let records = root.clone();
+        (
+            ReceiveMethod::RawInput,
+            None,
+            Box::new(move |s: &Settings| Parts::standard(&records, &s.player)),
+        )
+    };
+    let mut app = game::App::new(
+        root,
+        settings,
+        session_config(receive, auto),
+        parts,
+        Box::new(game::NoSessionEvents),
+    );
+    let ran = app.run(&mut rig);
+    #[cfg(feature = "dev-tools")]
+    let script_failed = rig
+        .selection
+        .as_ref()
+        .and_then(selection::Selection::script_failure);
+    rig.shut_down();
+    if let Some(w) = window_thread {
+        w.close();
+    }
+    // As in `play`: not joined.
+    if let Some(t) = raw_thread {
+        t.detach();
+    }
+    if let Some(t) = clocked_thread {
+        t.detach();
+    }
+    ran?;
+    #[cfg(feature = "dev-tools")]
+    if let Some(why) = script_failed {
+        anyhow::bail!("dev: the select script failed: {why}");
+    }
     Ok(())
 }
 
@@ -847,7 +1159,7 @@ fn headless(
         schedule,
         keyboard,
     } = prepare(chart, &input)?;
-    let controls = controls(&loaded, clock);
+    let controls = controls(loaded.settings(), clock);
     let waker = Waker::new().context("input")?;
     let last_note = loaded
         .chart()
@@ -884,7 +1196,8 @@ fn headless(
             width: 1280,
             height: 720,
         };
-        Renderer::new(target, AdapterChoice::Warp).map(|r| Box::new(r) as Box<dyn Screen>)
+        Renderer::new(target, AdapterChoice::Warp)
+            .map(|r| Box::new(MenuScreen::new(r, None)) as Box<dyn Screen>)
     });
     // Offscreen: no refresh rate and no frame statistics.
     let measure = measure(
@@ -897,20 +1210,26 @@ fn headless(
     );
     let render = render_side::spawn(
         make,
-        Arc::new(loaded.chart().clone()),
+        Some(Arc::new(loaded.chart().clone())),
         clock,
         view(&controls),
         measure,
         dump,
     )?;
-    let mut rig = rig(
-        &loaded,
+    let threads = Threads {
         input,
         audio,
         render,
+        steps: probes.steps.0,
+    };
+    let autoplay = loaded.config().autoplay.is_some();
+    let mut rig = rig(
+        loaded.root(),
+        loaded.settings(),
+        autoplay,
+        threads,
         &controls,
         clock,
-        probes.steps.0,
     );
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
@@ -970,6 +1289,7 @@ mod tests {
             &waker,
             move |s, now| hook.wake(s, now),
             (Some(0x0E), Some(0x01)),
+            None,
             None,
         )
         .expect("startup");

@@ -4,22 +4,26 @@
 //! process, and the input thread owns it). Focus, the retry and quit keys, the
 //! settings keys F1 to F8 and closing go to [`Controls`], which wakes the game
 //! thread for each, and the input thread on a focus change once the focus
-//! latch is set (design.md "Input"). The event loop runs
+//! latch is set (design.md "Input"). With song selection the menu keys and
+//! the text typed or composed through the IME go to the select screen too
+//! ([`crate::select::MenuInput`], design.md "Play Lifecycle"), through a
+//! bounded queue that drops what does not fit; the IME is allowed only while
+//! the search box has focus. The event loop runs
 //! on a thread of its own, so the game keeps the main thread and the loaded
 //! chart never has to move.
 
 use std::num::NonZeroIsize;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread::JoinHandle;
 
 use anyhow::Context as _;
 use eval::ControlId;
 use game::{Adjust, Command};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -30,9 +34,15 @@ use winit::raw_window_handle::{
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::controls::Controls;
+use crate::select::{MenuInput, MenuKey};
 
-/// Asks the event loop to end.
-struct Exit;
+/// What the game thread asks of the window thread.
+enum Ask {
+    /// End the event loop.
+    Exit,
+    /// Allow the IME (the search box has focus), or stop it.
+    Ime(bool),
+}
 
 struct App {
     controls: Arc<Controls>,
@@ -41,9 +51,11 @@ struct App {
     monitor: Option<String>,
     ready: Option<Sender<anyhow::Result<Surface>>>,
     window: Option<Window>,
+    /// Where the select screen's input goes, with song selection.
+    menu: Option<SyncSender<MenuInput>>,
 }
 
-impl ApplicationHandler<Exit> for App {
+impl ApplicationHandler<Ask> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let Some(ready) = self.ready.take() else {
             return;
@@ -86,13 +98,43 @@ impl ApplicationHandler<Exit> for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 key_pressed(&self.controls, event.physical_key, event.repeat, &self.keys);
+                if let Some(menu) = &self.menu {
+                    let key = menu_key(event.physical_key, event.repeat).map(MenuInput::Key);
+                    // Printable text only: control characters come as keys.
+                    let text = event
+                        .text
+                        .filter(|t| !t.chars().any(char::is_control))
+                        .map(|t| MenuInput::Text(t.to_string()));
+                    for input in key.into_iter().chain(text) {
+                        send_menu(menu, &self.controls, input);
+                    }
+                }
+            }
+            WindowEvent::Ime(ime) => {
+                if let Some(menu) = &self.menu {
+                    let input = match ime {
+                        Ime::Commit(text) => Some(MenuInput::Text(text)),
+                        Ime::Preedit(text, _) => Some(MenuInput::Preedit(text)),
+                        Ime::Disabled => Some(MenuInput::Preedit(String::new())),
+                        Ime::Enabled => None,
+                    };
+                    if let Some(input) = input {
+                        send_menu(menu, &self.controls, input);
+                    }
+                }
             }
             WindowEvent::CloseRequested => self.controls.close(),
             _ => {}
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Exit) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Ask) {
+        if let Ask::Ime(allowed) = event {
+            if let Some(w) = &self.window {
+                w.set_ime_allowed(allowed);
+            }
+            return;
+        }
         // The window goes before the loop ends, on its own thread.
         self.window = None;
         event_loop.exit();
@@ -101,16 +143,33 @@ impl ApplicationHandler<Exit> for App {
 
 /// The running window: ends its thread when closed.
 pub struct WindowThread {
-    proxy: EventLoopProxy<Exit>,
+    proxy: EventLoopProxy<Ask>,
     handle: JoinHandle<()>,
+}
+
+/// Allows or stops the window's IME from the game thread.
+#[derive(Clone)]
+pub struct ImeSwitch(EventLoopProxy<Ask>);
+
+impl ImeSwitch {
+    /// Allows the IME while the search box has focus, or stops it; a
+    /// window already closed ignores it.
+    pub fn set(&self, allowed: bool) {
+        let _ = self.0.send_event(Ask::Ime(allowed));
+    }
 }
 
 impl WindowThread {
     /// Closes the window and waits for its thread. Call it after every user
     /// of the window (the render thread) is done.
     pub fn close(self) {
-        let _ = self.proxy.send_event(Exit);
+        let _ = self.proxy.send_event(Ask::Exit);
         let _ = self.handle.join();
+    }
+
+    /// The switch of the window's IME.
+    pub fn ime(&self) -> ImeSwitch {
+        ImeSwitch(self.proxy.clone())
     }
 }
 
@@ -143,7 +202,8 @@ fn monitor_index(names: &[Option<String>], wanted: &str) -> Option<usize> {
 }
 
 /// Opens the window on its own thread. `retry` and `quit` are the keyboard
-/// scan codes bound to them; `monitor` names the monitor to open on.
+/// scan codes bound to them; `monitor` names the monitor to open on; with
+/// `menu`, the select screen's input goes there.
 ///
 /// # Errors
 ///
@@ -153,13 +213,14 @@ pub fn open(
     retry: Option<u32>,
     quit: Option<u32>,
     monitor: Option<String>,
+    menu: Option<SyncSender<MenuInput>>,
 ) -> anyhow::Result<(WindowThread, Surface)> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proxy_tx, proxy_rx) = mpsc::channel();
     let handle = std::thread::Builder::new()
         .name("window".into())
         .spawn(move || {
-            let event_loop = match EventLoop::<Exit>::with_user_event()
+            let event_loop = match EventLoop::<Ask>::with_user_event()
                 .with_any_thread(true)
                 .build()
             {
@@ -177,6 +238,7 @@ pub fn open(
                 monitor,
                 ready: Some(ready_tx),
                 window: None,
+                menu,
             };
             if let Err(e) = event_loop.run_app(&mut app) {
                 eprintln!("the event loop failed: {e}");
@@ -195,7 +257,7 @@ pub fn open(
             return Ok((thread, w));
         }
         (Err(e), Ok(proxy)) => {
-            let _ = proxy.send_event(Exit);
+            let _ = proxy.send_event(Ask::Exit);
             Err(e)
         }
         (Err(e), Err(_)) | (Ok(_), Err(e)) => Err(e),
@@ -295,6 +357,37 @@ fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &Keys)
     } else if Some(key) == keys.quit {
         controls.command(Command::Quit);
     }
+}
+
+/// Hands `input` to the select screen and wakes the game thread; a full
+/// queue drops it (the game thread drains it at every look).
+fn send_menu(menu: &SyncSender<MenuInput>, controls: &Controls, input: MenuInput) {
+    let _ = menu.try_send(input);
+    controls.wake_game();
+}
+
+/// The select screen's key for a key pressed in the window: navigation
+/// repeats while held, the others act on the first press only.
+fn menu_key(key: PhysicalKey, repeat: bool) -> Option<MenuKey> {
+    let PhysicalKey::Code(code) = key else {
+        return None;
+    };
+    let (key, repeats) = match code {
+        KeyCode::ArrowUp => (MenuKey::Up, true),
+        KeyCode::ArrowDown => (MenuKey::Down, true),
+        KeyCode::PageUp => (MenuKey::PageUp, true),
+        KeyCode::PageDown => (MenuKey::PageDown, true),
+        KeyCode::Backspace => (MenuKey::Backspace, true),
+        KeyCode::ArrowLeft => (MenuKey::Left, false),
+        KeyCode::ArrowRight => (MenuKey::Right, false),
+        KeyCode::Home => (MenuKey::Home, false),
+        KeyCode::End => (MenuKey::End, false),
+        KeyCode::Enter | KeyCode::NumpadEnter => (MenuKey::Enter, false),
+        KeyCode::Tab => (MenuKey::Tab, false),
+        KeyCode::Escape => (MenuKey::Escape, false),
+        _ => return None,
+    };
+    (repeats || !repeat).then_some(key)
 }
 
 #[cfg(test)]

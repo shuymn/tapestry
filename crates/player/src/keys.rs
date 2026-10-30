@@ -195,6 +195,7 @@ pub fn run(
         |_, _| input::Phase::Idle,
         (None, None),
         device.monitor.clone(),
+        None,
     )?;
     let target = Target::Window {
         window: surface.into(),
