@@ -475,6 +475,45 @@ pub fn preset_canonicals() -> Vec<Seed> {
         "one-byte lengths"
     );
     seeds.push(("unknown_tag", edited(&|b| b[count_at + 2 + id.len()] = 2)));
+    // The version as eleven varint bytes.
+    seeds.push((
+        "varint_overflow",
+        edited(&|b| {
+            b.splice(
+                0..1,
+                [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02],
+            );
+        }),
+    ));
+    // The id's first byte, then the preset version, after the id, as 2^32.
+    let id = &custom.id;
+    assert!(id.len() < 128 && custom.version < 128, "one-byte varints");
+    seeds.push(("invalid_utf8", edited(&|b| b[2] = 0xff)));
+    let version_at = 2 + id.len();
+    seeds.push((
+        "value_too_large",
+        edited(&|b| {
+            b.splice(version_at..=version_at, [0x80, 0x80, 0x80, 0x80, 0x10]);
+        }),
+    ));
+    // The implementation's name, after the version and its length, starts
+    // with a capital.
+    seeds.push((
+        "unknown_implementation",
+        edited(&|b| b[version_at + 2] = b'S'),
+    ));
+    // Five rank scales: the count precedes the first scale, whose first
+    // byte is the first to change with it.
+    let mut scaled = custom.clone();
+    scaled.rank_scale.rank_milli[0] += 1;
+    let rank_at = bytes
+        .iter()
+        .zip(scaled.canonical_bytes())
+        .position(|(&a, b)| a != b)
+        .expect("a rank scale changes the bytes")
+        - 1;
+    assert_eq!(bytes[rank_at], 4, "the rank scale count");
+    seeds.push(("wrong_length", edited(&|b| b[rank_at] = 5)));
     seeds.push(("trailing_bytes", edited(&|b| b.push(0))));
     seeds.push((
         "truncated",

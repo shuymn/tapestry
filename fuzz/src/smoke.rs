@@ -159,6 +159,11 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
             "non_minimal_varint",
             "count_beyond_data",
             "unknown_tag",
+            "varint_overflow",
+            "invalid_utf8",
+            "value_too_large",
+            "unknown_implementation",
+            "wrong_length",
             "trailing_bytes",
             "truncated",
             "invalid",
@@ -177,6 +182,16 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
             "unknown_tag" => Err(CanonicalError::UnknownTag {
                 field: "gauge kind",
                 tag: 2,
+            }),
+            "varint_overflow" => Err(CanonicalError::VarintOverflow),
+            "invalid_utf8" => Err(CanonicalError::InvalidUtf8 { field: "id" }),
+            "value_too_large" => Err(CanonicalError::ValueTooLarge { field: "version" }),
+            "unknown_implementation" => Err(CanonicalError::UnknownImplementation {
+                name: "Standard".to_owned(),
+            }),
+            "wrong_length" => Err(CanonicalError::WrongLength {
+                field: "rank_scale",
+                len: 5,
             }),
             "trailing_bytes" => Err(CanonicalError::TrailingBytes(1)),
             "truncated" => Err(CanonicalError::Truncated),
