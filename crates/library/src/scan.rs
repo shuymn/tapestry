@@ -156,7 +156,8 @@ impl Drop for Ending {
     }
 }
 
-/// A running scan. Dropping it stops the scan and joins its thread.
+/// A running scan. Dropping it stops the scan and joins its thread;
+/// [`Scan::stop_within`] bounds that wait.
 pub struct Scan {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -272,6 +273,24 @@ impl Scan {
                 .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
+        }
+    }
+
+    /// Stops the scan, as dropping it does, but waits at most `timeout` for
+    /// its thread: `false` when the thread had not ended by then, which is
+    /// left to finish on its own (a read stalled on its file system). The
+    /// thread keeps its connection and the lock beside the database until
+    /// it ends, so the library stays refused to any other opening until
+    /// then, or until the process exits.
+    pub fn stop_within(mut self, timeout: Duration) -> bool {
+        self.shared.update(|state| state.shutdown = true);
+        if self.wait_finished(timeout) {
+            self.join();
+            true
+        } else {
+            // Detached: the drop finds no thread to join.
+            drop(self.thread.take());
+            false
         }
     }
 

@@ -314,3 +314,52 @@ fn thread_start_hook_runs_first_on_the_scan_thread() {
         .unwrap();
     assert_eq!(*seen.lock().unwrap(), [Some("library-scan".to_owned())]);
 }
+
+/// A scan whose thread is stuck (here at its start hook, as on a stalled
+/// file system) is stopped within the bound and left to end on its own:
+/// until it does, its lock keeps the database refused to another opening,
+/// even with the library dropped; once it ends, the database opens again.
+#[test]
+fn a_stuck_scan_stops_within_its_bound_and_keeps_the_lock() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let dir = TempDir::new().unwrap();
+    let charts = dir.path().join("charts");
+    fs::create_dir_all(&charts).unwrap();
+    fs::write(charts.join("a.bms"), chart_text("a")).unwrap();
+    let db = dir.path().join("library.db");
+    let (lib, _) = Library::open(&db).unwrap();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let held = Arc::clone(&gate);
+    let options = ScanOptions {
+        on_thread_start: Some(Arc::new(move || {
+            let (open, changed) = &*held;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = changed.wait(open).unwrap();
+            }
+        })),
+    };
+    let scan = lib.scan(&[charts], options).unwrap();
+    let started = std::time::Instant::now();
+    assert!(!scan.stop_within(Duration::from_millis(100)));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    drop(lib);
+    assert!(matches!(
+        Library::open(&db),
+        Err(library::LibraryError::AlreadyOpen { .. })
+    ));
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match Library::open(&db) {
+            Ok(_) => break,
+            Err(library::LibraryError::AlreadyOpen { .. }) => {
+                assert!(std::time::Instant::now() < deadline, "the lock stayed");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
