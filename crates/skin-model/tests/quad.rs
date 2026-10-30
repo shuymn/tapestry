@@ -117,6 +117,7 @@ fn a_full_run_list_drops_only_quads_that_need_a_new_run() {
 #[test]
 fn clear_resets_everything_but_capacity() {
     let mut batch = QuadBatch::with_capacity(1, 1);
+    let (quads, runs) = (batch.quads().as_ptr(), batch.runs().as_ptr());
     batch.push(ALPHA, quad(0.0));
     batch.push(ALPHA, quad(1.0));
     assert_eq!(batch.dropped(), 1);
@@ -126,24 +127,29 @@ fn clear_resets_everything_but_capacity() {
     assert_eq!(batch.dropped(), 0);
     assert!(batch.push(ADD, quad(2.0)));
     assert_eq!(batch.runs(), [run(ADD, 0, 1)]);
+    assert_eq!(batch.quads().as_ptr(), quads);
+    assert_eq!(batch.runs().as_ptr(), runs);
 }
 
 #[test]
 fn filling_to_capacity_does_not_reallocate() {
     let mut batch = QuadBatch::with_capacity(64, 64);
     let keys = [ALPHA, ADD, clipped(0), clipped(1)];
+    // The buffers allocated by `with_capacity`, kept across every frame.
+    let quads = batch.quads().as_ptr();
+    let runs = batch.runs().as_ptr();
     for frame in 0..3 {
         batch.push(ALPHA, quad(0.0));
-        let quads = batch.quads().as_ptr();
-        let runs = batch.runs().as_ptr();
         for i in 0..100u16 {
             batch.push(keys[usize::from(i % 4)], quad(f32::from(i)));
         }
         assert_eq!(batch.quads().len(), 64, "frame {frame}");
         assert_eq!(batch.dropped(), 101 - 64);
-        assert_eq!(batch.quads().as_ptr(), quads);
-        assert_eq!(batch.runs().as_ptr(), runs);
+        assert_eq!(batch.quads().as_ptr(), quads, "frame {frame}");
+        assert_eq!(batch.runs().as_ptr(), runs, "frame {frame}");
         assert_runs_tile(&batch);
         batch.clear();
+        assert_eq!(batch.quads().as_ptr(), quads, "frame {frame}");
+        assert_eq!(batch.runs().as_ptr(), runs, "frame {frame}");
     }
 }

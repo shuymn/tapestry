@@ -135,9 +135,14 @@ fn names_are_bounded() {
 
 #[test]
 fn precedence_follows_the_table() {
+    // Operands differ (`small` 3, `ms` 2, `flag` set), so a misparse or a
+    // swapped comparison changes the result.
+    let fields = [0, 3, 2, 0, 1, 0, 0];
+    let int = |src: &str| eval_with(src, Ty::Int, &fields, &[]);
+    let boolean = |src: &str| eval_with(src, Ty::Bool, &fields, &[]) != 0;
     // `if`: the else branch extends as far as it can.
-    assert_eq!(int("if flag then 1 else 2 + 3"), 5);
-    assert_eq!(int("1 + if flag then 1 else 2 * 3"), 7);
+    assert_eq!(int("if flag then 1 else 2 + 3"), 1);
+    assert_eq!(int("1 + if flag then 1 else 2 * 3"), 2);
     // `||` below `&&`.
     assert!(boolean("true || false && false"));
     // `&&` below `==`.
@@ -146,19 +151,24 @@ fn precedence_follows_the_table() {
     assert!(boolean("1 < 2 == true"));
     // `<` below `+`.
     assert!(boolean("1 + 2 < 4"));
-    assert!(boolean("4 >= 1 + 3"));
+    assert!(!boolean("3 >= 1 + 3"));
     // `+` below `*`; both left-associative.
     assert_eq!(int("2 + 3 * 4"), 14);
     assert_eq!(int("7 - 2 - 1"), 4);
     assert_eq!(int("16 / 4 / 2"), 2);
     assert_eq!(int("2 * 7 % 4"), 2);
-    // Unary binds tighter than `*`: (-7) / 2, not -(7 / 2).
+    // Unary binds tighter than `*` and `&&`: (-7) / 2, not -(7 / 2), and
+    // (!false) && false, not !(false && false).
     assert_eq!(int("- 7 / 2"), -4);
     assert!(!boolean("!true && true"));
-    // Comparisons by slot values.
-    assert!(!boolean("small > ms"));
+    assert!(!boolean("!false && false"));
+    // `>` and `>=` keep their operand order.
+    assert!(boolean("small > ms"));
+    assert!(!boolean("ms > small"));
     assert!(boolean("small >= ms"));
-    assert!(!boolean("small >= ms + 1"));
+    assert!(!boolean("ms >= small"));
+    assert!(boolean("small >= ms + 1"));
+    assert!(!boolean("small >= ms + 2"));
 }
 
 #[test]
@@ -531,17 +541,28 @@ fn folding_leaves_one_operation_around_a_dynamic_leaf() {
         assert_eq!(p.op_count(), 1, "cover {cover}");
         assert_eq!(p.eval(&state), want);
     }
-    for (src, want) in [
-        ("true && flag", 1),
-        ("false && flag", 0),
-        ("flag || true", 1),
-        ("flag || false", 1),
-        ("flag && true", 1),
-        ("false || flag", 1),
-    ] {
+    let identity = |flag: i32| flag;
+    let zero = |_: i32| 0;
+    let one = |_: i32| 1;
+    let cases: [(&str, &dyn Fn(i32) -> i32); 6] = [
+        ("true && flag", &identity),
+        ("false && flag", &zero),
+        ("flag || true", &one),
+        ("flag || false", &identity),
+        ("flag && true", &identity),
+        ("false || flag", &identity),
+    ];
+    for (src, want) in cases {
         let p = ok(src, Ty::Bool);
         assert_eq!(p.op_count(), 1, "{src}");
-        assert_eq!(p.eval(&state), want, "{src}");
+        for flag in [0, 1] {
+            let fields = [0, 0, 0, 0, flag, 0, 0];
+            let state = State {
+                fields: &fields,
+                timers: &[],
+            };
+            assert_eq!(p.eval(&state), want(flag), "{src} with flag {flag}");
+        }
     }
     // A dynamic operation stays.
     assert_eq!(ok("small + 1", Ty::Int).op_count(), 3);
