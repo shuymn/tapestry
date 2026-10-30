@@ -259,10 +259,9 @@ egui comes with the first form-like screen.
 - **Notes a press passes (decided, B's second half):** when a press takes a later note, the earlier unjudged notes of its lane are POOR at the press, as tapestry does. beatoraja keeps them hittable until their own late BAD edge, a consequence of its structure with no stated intent: its judge algorithms (caef58b5, then d9b70361 and d19e05b5) only choose which note a press takes, and misses are a separate timeout pass. At `#RANK 3`, with notes at 0 and 200 ms on one lane, a press at 170 ms takes the 200 ms note; a second press at 250 ms is BAD on the 0 ms note there, while here that note was POOR at 170 ms.
 - **G. A BAD long-note head (decided):** it is scored at the press, when its judgment is decided, since a BAD head cannot get worse; beatoraja holds it and scores it at the release or the end, so max combo can differ.
 
-**What beatoraja-style still needs.** beatoraja differs from today's model in three places, each shown by an example in crates/rules/src/beatoraja_style.rs (paths under `src/bms/player/beatoraja/`). PR7 landed the values the model expresses and PR7b combo priority (B: which note a press takes, `Assignment::ComboPriority`; the notes it passes are a known difference above); these remain:
-- **C, D, E. Gauges:** HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))`, and a `#TOTAL` not positive ignored so an earlier one stays (jbms-parser `BMSDecoder.java:730-743`) (PR7c, with PR7e for the declarations). N is the whole chart's count, practice included.
+**What beatoraja-style still needs.** Nothing the model cannot express: PR7 landed the values the model expresses, PR7b combo priority (B: which note a press takes, `Assignment::ComboPriority`; the notes it passes are a known difference above), and PR7c the gauges (C, D, E: HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))`, with a `#TOTAL` not positive ignored so an earlier one stays, jbms-parser `BMSDecoder.java:730-743`, from PR7e; N the whole chart's count, practice included). Each is shown by an example in crates/eval/tests/style_beatoraja.rs, cited under `src/bms/player/beatoraja/`.
 
-**What LR2-style needs beyond them.** Endless Dream shares B, the notes a press passes, G and H as known differences, and its single low-gauge step fits today's model. Its own known differences, cited at that commit under `core/src/bms/player/beatoraja/`:
+**What LR2-style needs beyond them.** Endless Dream shares B, the notes a press passes, G and H as known differences, and its single low-gauge step (× 0.6 below 32 %) fits the band list. Its own known differences, cited at that commit under `core/src/bms/player/beatoraja/`:
 - **One press judges one note (decided).** Endless Dream's multi-BAD judges BAD, with the same press, the other unjudged notes in BAD but not GOOD range, filtered by the primary's timing, judgment and LN type, leading LN heads trimmed (`play/JudgeManager.java:993-1061`, from wcko87/lr2oraja bbe35f5e). That approximates LR2, where the lane pointer advances past a BAD and the same press judges the next note again (OpenLR2 `ProcSinglenote`, GOMazk/OpenLR2@583a3850 `LR2f.cpp:7509-7523`), an implementation artifact. Here the notes a press passes are POOR at the press. At `#RANK 3` (100 %), with taps at 0 and 160 ms and a long note from 50 to 100 ms on one lane, a press at 190 ms takes the 160 ms tap (GREAT); Endless Dream gives BAD on the 0 ms tap and the head, LR2-style POOR on both at the press.
 - **An ineligible LN head keeps the earlier candidate (decided).** Endless Dream makes a late BAD head ineligible (K) by giving it judge 6 (`play/JudgeManager.java:435-437`), which reuses beatoraja's "no judgment here" branch, and that branch also resets the candidate the scan had already taken (`:445-452`), an implementation artifact: the rule only says a late BAD head cannot be taken, and LR2 judges the oldest note. Here the earlier candidate stays the primary. At `#RANK 3` (100 %), with a tap at 0 ms and a long note from 30 ms on one lane, a press at 190 ms is BAD on the tap here and the head is missed at 230 ms; Endless Dream judges nothing at the press, and misses the tap at 200 ms and the head at 230 ms.
 
@@ -270,7 +269,7 @@ Its own rules, each again with an example:
 - **I. Window interpolation:** below 100 % PERFECT, GREAT and GOOD come from the LR2 table, interpolated; at 100 % and above they scale linearly; then each of them is clamped to the next wider window, so at `#DEFEXRANK 400` (300 %) GOOD is BAD's 200 ms, not 360 ms; BAD and empty POOR are not scaled; `#RANK` 0-4 is 25, 50, 75, 100, 75 %, and `#DEFEXRANK n` is n × 75 / 100 % (`play/JudgeProperty.java:168`, `:185-265`, the clamp `:241-249`; `play/BMSPlayerRule.java:61-65`) (PR8).
 - **K. LN-head eligibility:** a late BAD on an LN head cannot be the primary (`play/JudgeManager.java:435-437`); a head the primary passes is POOR at the press, and one it does not pass stays to its own miss. At `#RANK 3` (100 %), with a long note from 0 to 50 ms and a tap at 300 ms on one lane, a press at 160 ms cannot take the head (160 ms late, BAD), which combo priority alone would keep since the tap lies outside GOOD; it takes the tap (140 ms early, BAD), and the head is POOR at the press. With the long note alone, the press takes nothing and the head is missed at its own deadline. PR7d built the variant (`HeadEligibility::NotLateBad`), checked with that example in crates/eval/tests/style_lr2.rs under a preset built in test code; PR8 assembles it.
 - **L. Empty POOR:** for an unjudged note, (200, 1000) ms early: past the inclusive early BAD edge, and short of the scan's exclusive end; for a judged one, [0, 1000) ms early; no late side (`play/JudgeProperty.java:54-55`, the scan cutoff `play/JudgeManager.java:416`) (PR8).
-- **M. Gauges:** HARD-family damage × max(fix1, fix2); a survival gauge strictly below 2 % after a change, mines included, drops to 0 and fails; `#TOTAL` when absent as `160 + (N + clamp(N − 400, 0, 200)) × 0.16` (`play/GrooveGauge.java:218-225`, `:279-309`; `play/BMSPlayerRule.java:88-89`) (PR7c).
+- **M. Gauges:** HARD-family damage × max(fix1, fix2); a survival gauge strictly below 2 % after a change, mines included, drops to 0 and fails; `#TOTAL` when absent as `160 + (N + clamp(N − 400, 0, 200)) × 0.16` (`play/GrooveGauge.java:218-225`, `:279-309`; `play/BMSPlayerRule.java:88-89`). PR7c lands the variants (the damage correction, the failure threshold, the default), checked against Endless Dream's gauges built in test code (crates/eval/tests/style_lr2.rs); PR8 assembles them.
 
 **Policies are choices, not replacements (decided).** Each is a new variant beside today's behavior, which stays available: tapestry keeps nearest assignment, misses at the press for overtaken notes, a miss at the edge and a BAD head scored at the press, and reads judgment headers as loader version 6 does, so its results do not change. Only the selection variants a supported preset uses are added (combo priority); beatoraja's other algorithms wait for a preset that uses one.
 
@@ -1058,6 +1057,19 @@ Each one holds the behavior D5 and D6 state.
 - `replacing_a_sound_file_invalidates_the_analysis`.
 - While a play runs, the job shall be paused, and judgment shall be unchanged.
 
+### PR26. The key sound of a press (`eval`)
+
+**Touches.** Press resolution's sound choice in evaluator.rs (the scan names the note an empty POOR is against); design.md "The Only Output Is the Judgment Event Stream".
+
+**Depends on.** PR7d, which also changes press resolution.
+
+**Done when.**
+- When a press judges a note, it shall play that note's sound, under every preset (`a_judged_press_plays_its_note`).
+- When a press makes an empty POOR against a note, it shall play that note's sound (`an_empty_poor_plays_the_note_it_is_against`).
+- When a press judges nothing between notes, it shall play the lane's latest earlier note's sound, judged or not; and before the lane's first note, that note's sound (`a_press_on_nothing_plays_the_latest_earlier_note`).
+- When the same input is evaluated under the tapestry and beatoraja-style presets and a press judges nothing under both, the sound shall be the same (`the_fallback_sound_is_the_same_under_every_preset`).
+- When a press in a practiced section's lead-in (design.md "Section Evaluation") judges nothing, it shall still play no sound, as today.
+
 ### Order and parallel work
 
 **Start in parallel:** PR1, PR2, PR3, PR4, PR9, PR11, PR12, PR14, PR21 and PR22.
@@ -1078,6 +1090,7 @@ Each one holds the behavior D5 and D6 state.
 - PR2 + PR14 + PR20 + PR22 → PR23
 - PR19 + PR21 + PR23 → PR24
 - PR15 + PR18 → PR25
+- PR7d → PR26
 
 **Format numbering.** Library schema numbers follow the order PR12 < PR13 < PR18 < PR25. Replay format bumps (PR9, PR20, PR23), canonical encoding bumps (PR7e, PR7a–PR7d, PR8) and the loader version bump (PR7e) take the next number at merge.
 

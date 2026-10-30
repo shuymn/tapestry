@@ -128,7 +128,7 @@ pub fn evaluate(
         .map(|((rule, state), history)| {
             let passed = match rule.kind {
                 GaugeKind::EndThreshold { clear } => state.value >= clear,
-                GaugeKind::Survival => state.failed_at.is_none(),
+                GaugeKind::Survival { .. } => state.failed_at.is_none(),
             };
             GaugeResult {
                 value: state.value,

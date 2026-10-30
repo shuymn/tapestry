@@ -5,8 +5,9 @@ use std::collections::HashSet;
 use bms_model::TimeUs;
 
 use crate::{
-    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeRank, JudgeWindows, Judgment, LaneClass,
-    LaneTable, LnEndWindows, MineRule, RuleError, RulePreset, SCALE_FULL_MILLI, Side, WindowPolicy,
+    DefaultTotal, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, JudgeRank, JudgeWindows, Judgment,
+    LaneClass, LaneTable, LnEndWindows, MineRule, RuleError, RulePreset, SCALE_FULL_MILLI, Side,
+    TotalCorrection, WindowPolicy,
 };
 
 impl RulePreset {
@@ -47,9 +48,11 @@ impl RulePreset {
                 return Err(RuleError::OutOfRange { field });
             }
         }
-        if self.default_total_milli <= 0 {
+        if let DefaultTotal::Fixed { milli } = self.default_total
+            && milli <= 0
+        {
             return Err(RuleError::OutOfRange {
-                field: "default_total_milli",
+                field: "default_total.milli",
             });
         }
         let MineRule::WhileHeld { per_unit } = self.mine;
@@ -172,13 +175,18 @@ fn check_gauge(gauge: &GaugeRule) -> Result<(), RuleError> {
     if !ordered {
         return Err(fail("min, start, max"));
     }
-    if gauge.kind == GaugeKind::Survival {
+    if let GaugeKind::Survival { fails_below } = gauge.kind {
         if gauge.min != GaugeValue::EMPTY {
             return Err(fail("min"));
         }
         // Starting at 0 would start the gauge failed.
         if gauge.start == GaugeValue::EMPTY {
             return Err(fail("start"));
+        }
+        // So would starting below the threshold; the threshold is not
+        // negative.
+        if !(GaugeValue::EMPTY..=gauge.start).contains(&fails_below) {
+            return Err(fail("fails_below"));
         }
     }
     let bounded = gauge.min..=gauge.max;
@@ -191,7 +199,7 @@ fn check_gauge(gauge: &GaugeRule) -> Result<(), RuleError> {
         .iter()
         .map(|&j| (*gauge.change.get(j), "change"))
         .chain([(gauge.empty_poor, "empty_poor")]);
-    for (delta, field) in deltas {
+    for (delta, field) in deltas.clone() {
         let usable = match delta {
             GaugeDelta::Fixed(v) => (-GaugeValue::FULL.0..=GaugeValue::FULL.0).contains(&v.0),
             GaugeDelta::TotalShare { den, .. } => den != 0,
@@ -200,10 +208,29 @@ fn check_gauge(gauge: &GaugeRule) -> Result<(), RuleError> {
             return Err(fail(field));
         }
     }
-    if let Some(low) = gauge.low_damage
-        && (low.den == 0 || low.num > low.den || !bounded.contains(&low.below))
+    // Only fixed changes are corrected: no preset corrects a share of the
+    // per-note increment, so the combination is not specified.
+    if gauge.correction != TotalCorrection::None
+        && deltas
+            .clone()
+            .any(|(d, _)| matches!(d, GaugeDelta::TotalShare { .. }))
     {
-        return Err(fail("low_damage"));
+        return Err(RuleError::CorrectedShare {
+            id: gauge.id.clone(),
+        });
+    }
+    // Each band usable, within the bounds, and strictly above the one
+    // before it, so the first that applies is the narrowest.
+    let mut previous = None;
+    for low in &gauge.low_damage {
+        if low.den == 0
+            || low.num > low.den
+            || !bounded.contains(&low.below)
+            || previous.is_some_and(|p| low.below <= p)
+        {
+            return Err(fail("low_damage"));
+        }
+        previous = Some(low.below);
     }
     Ok(())
 }
@@ -508,5 +535,80 @@ mod tests {
             })
         );
         assert_eq!(out(|p| p.gauges.clear()), Err(RuleError::NoGauges));
+    }
+
+    #[test]
+    fn gauge_policies_are_checked() {
+        use crate::{DefaultTotal, GaugeKind, LowDamage, TotalCorrection};
+        let out = |edit: &dyn Fn(&mut crate::RulePreset)| {
+            let mut preset = custom();
+            edit(&mut preset);
+            preset.validate()
+        };
+        let survival = |field| {
+            Err(RuleError::GaugeOutOfBounds {
+                id: "survival".to_owned(),
+                field,
+            })
+        };
+        let pct = |n| GaugeValue(n * GaugeValue::PERCENT);
+        let fails_below = |v| {
+            move |p: &mut crate::RulePreset| {
+                p.gauges[1].kind = GaugeKind::Survival { fails_below: v };
+            }
+        };
+        // A threshold from 0 to the start; the start is 100 %.
+        assert_eq!(out(&fails_below(GaugeValue::FULL)), Ok(()));
+        assert_eq!(out(&fails_below(pct(2))), Ok(()));
+        assert_eq!(
+            out(&fails_below(GaugeValue(GaugeValue::FULL.0 + 1))),
+            survival("fails_below")
+        );
+        assert_eq!(out(&fails_below(GaugeValue(-1))), survival("fails_below"));
+        assert_eq!(
+            out(&|p| {
+                fails_below(pct(2))(p);
+                p.gauges[1].start = GaugeValue(2 * GaugeValue::PERCENT - 1);
+            }),
+            survival("fails_below")
+        );
+        // Bands strictly ascending, each usable.
+        let band = |below, num, den| LowDamage {
+            below: pct(below),
+            num,
+            den,
+        };
+        let bands = |b: Vec<LowDamage>| {
+            move |p: &mut crate::RulePreset| p.gauges[1].low_damage.clone_from(&b)
+        };
+        assert_eq!(out(&bands(vec![band(10, 2, 5), band(20, 1, 2)])), Ok(()));
+        assert_eq!(out(&bands(Vec::new())), Ok(()));
+        for b in [
+            vec![band(20, 1, 2), band(10, 2, 5)],
+            vec![band(10, 1, 2), band(10, 1, 2)],
+            vec![band(10, 3, 2)],
+            vec![band(10, 1, 0)],
+            vec![band(101, 1, 2)],
+        ] {
+            assert_eq!(out(&bands(b.clone())), survival("low_damage"), "{b:?}");
+        }
+        // A correction on a gauge with a share of the increment.
+        assert_eq!(
+            out(&|p| p.gauges[1].correction = TotalCorrection::ScaleDamage),
+            Ok(())
+        );
+        assert_eq!(
+            out(&|p| p.gauges[0].correction = TotalCorrection::LimitIncrease),
+            Err(RuleError::CorrectedShare {
+                id: "normal".to_owned()
+            })
+        );
+        assert_eq!(
+            out(&|p| p.default_total = DefaultTotal::Fixed { milli: 0 }),
+            Err(RuleError::OutOfRange {
+                field: "default_total.milli"
+            })
+        );
+        assert_eq!(out(&|p| p.default_total = DefaultTotal::NotesCurve), Ok(()));
     }
 }
