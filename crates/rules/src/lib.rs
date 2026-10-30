@@ -24,6 +24,7 @@ mod beatoraja_style;
 mod canonical;
 mod custom;
 mod error;
+mod gauge_rules;
 mod headers;
 mod lr2_style;
 mod preset;
