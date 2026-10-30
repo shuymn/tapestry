@@ -796,7 +796,7 @@ fn play(
     }
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     rig.shut_down();
     window_thread.close();
     // Not joined: an input thread that stopped answering must not hold up
@@ -903,7 +903,7 @@ fn headless(
     rig.auto_retries = auto_retries;
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     rig.shut_down();
     // As in `play`: not joined.
     input_thread.detach();

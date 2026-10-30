@@ -33,7 +33,7 @@ use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
-    SessionPolicy,
+    SessionPolicy, SharedEvents,
 };
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
 use crate::render::PlayView;
@@ -242,6 +242,21 @@ impl Command {
     }
 }
 
+/// A command on the result screen, separate from the in-play [`Command`]
+/// (design.md "Play Lifecycle").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuCommand {
+    /// Play the chart again.
+    Retry,
+    /// Leave the chart.
+    Back,
+    /// Show the result under the next preset; the play preset is unchanged.
+    NextPreset,
+    /// Show the result under the previous preset; the play preset is
+    /// unchanged.
+    PrevPreset,
+}
+
 /// What one play receives: device input and system controls, both on the
 /// play's timeline (chart time; the countdown starts at `-lead_in`).
 /// Script items before the countdown bootstrap the devices: connections and
@@ -316,7 +331,8 @@ pub struct PlayReport {
 /// It also holds what every play of the chart shares, whichever driver
 /// runs the plays: [`Session::play`] headlessly, or the game's threads.
 /// Each play goes [`begin_play`](Self::begin_play) →
-/// [`plan`](Self::plan) once recording has opened → evaluation →
+/// [`plan`](Self::plan) once recording has opened → [`admitted`](Self::admitted)
+/// once its logic step is built → evaluation →
 /// [`finish_play`](Self::finish_play).
 #[derive(Debug)]
 pub struct Loaded {
@@ -331,6 +347,9 @@ pub struct Loaded {
     preset_path: PathBuf,
     preset_modified: Option<SystemTime>,
     attempt: u32,
+    /// Where the session events go, out of the parts so a play can report
+    /// its start while its logic step borrows the chart.
+    events: SharedEvents,
 }
 
 /// The start of one play: its number, and whether the preset file it
@@ -407,6 +426,23 @@ impl Loaded {
         config: SessionConfig,
         mut parts: Parts,
     ) -> Result<Self, SessionError> {
+        let events = SharedEvents::new(std::mem::replace(
+            &mut parts.events,
+            Box::new(NoSessionEvents),
+        ));
+        Self::load_reporting_to(root, settings, chart_path, config, parts, events)
+    }
+
+    /// [`load`](Self::load), with the session events going to `events`
+    /// instead of the parts' sink.
+    pub(crate) fn load_reporting_to(
+        root: DataRoot,
+        settings: Settings,
+        chart_path: &Path,
+        config: SessionConfig,
+        parts: Parts,
+        events: SharedEvents,
+    ) -> Result<Self, SessionError> {
         if config.step.0 <= 0 {
             return Err(SessionError::InvalidStep(config.step));
         }
@@ -454,7 +490,7 @@ impl Loaded {
             random_seed: config.seed,
             transform: parts.transform.id().record(),
         };
-        parts.events.on_event(&SessionEvent::Load);
+        events.on_event(&SessionEvent::Load);
         Ok(Self {
             root,
             settings,
@@ -467,6 +503,7 @@ impl Loaded {
             preset_path,
             preset_modified,
             attempt: 0,
+            events,
         })
     }
 
@@ -492,6 +529,11 @@ impl Loaded {
     #[must_use]
     pub const fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Reports `ev` to the session event sink.
+    pub(crate) fn emit(&self, ev: &SessionEvent) {
+        self.events.on_event(ev);
     }
 
     /// The settings, to change between plays.
@@ -528,9 +570,10 @@ impl Loaded {
         }
     }
 
-    /// Starts the next play. Every play after the first is a retry: a
-    /// preset file changed since the previous play is used from this one
-    /// on.
+    /// Numbers the next play, before recording opens; its start is reported
+    /// once it is [`admitted`](Self::admitted). Every play after the first
+    /// is a retry: a preset file changed since the previous play is used
+    /// from this one on.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
         let attempt = self.attempt;
@@ -539,11 +582,18 @@ impl Loaded {
         } else {
             None
         };
-        self.parts.events.on_event(&SessionEvent::Start { attempt });
         PlayStart {
             attempt,
             reload_error,
         }
+    }
+
+    /// The play `start` was admitted: recording opened, the play was
+    /// planned and its logic step built. Reports its start.
+    pub fn admitted(&self, start: &PlayStart) {
+        self.events.on_event(&SessionEvent::Start {
+            attempt: start.attempt,
+        });
     }
 
     /// At a retry: uses the preset file from now on if its modification
@@ -814,11 +864,9 @@ impl Loaded {
         let retried =
             end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
         if retried {
-            parts.events.on_event(&SessionEvent::Retry { attempt });
+            self.events.on_event(&SessionEvent::Retry { attempt });
         }
-        parts
-            .events
-            .on_event(&SessionEvent::End { attempt, status });
+        self.events.on_event(&SessionEvent::End { attempt, status });
         PlayReport {
             attempt,
             end,

@@ -474,7 +474,7 @@ fn two_plays_at_nonzero_origins_with_an_input_offset() {
         key(12_053_000, Z, 0),
     ];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
     assert_eq!(rig.origins, [TimeUs(8_300_000), TimeUs(10_500_000)]);
     let [one, two] = &rig.reports[..] else {
@@ -523,7 +523,7 @@ fn retry_with_a_key_held_down() {
         key(11_553_000, Z, 0),
     ];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
     let two = &rig.reports[1];
     let rec = two.record.as_ref().unwrap();
@@ -555,7 +555,7 @@ fn abort_and_close_drain_late_input_into_the_record() {
     ];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 9_500_000);
     rig.close_lag = 5 * MS;
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
     let one = &rig.reports[0];
     assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
@@ -581,7 +581,7 @@ fn a_close_during_startup_quits_before_recording() {
     let mut loaded = loaded(dir.path());
     let mut rig = Fake::new(vec![key(9_303_000, Z, 1)], &[], i64::MAX);
     rig.quit_in_prepare = true;
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(rig.prepares, 1);
     assert!(rig.origins.is_empty());
     assert!(rig.reports.is_empty());
@@ -599,7 +599,7 @@ fn a_screen_failure_ends_the_play_and_a_failed_recovery_the_run() {
     let mut rig = Fake::new(items, &[(9_600_000, Command::Retry)], i64::MAX);
     rig.screen_fails_at = 9_400_000;
     rig.prepare_fails_from = 2;
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(&ran, Err(LiveError::Screen(SurfaceLost))),
         "{ran:?}"
@@ -625,7 +625,7 @@ fn a_suspend_with_a_quit_in_one_step_marks_the_record() {
     let mut loaded = loaded(dir.path());
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Suspend)], 9_500_000);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let [one] = &rig.reports[..] else {
         panic!("{} plays", rig.reports.len());
     };
@@ -642,7 +642,7 @@ fn a_suspend_during_the_close_marks_the_record() {
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[], 9_500_000);
     rig.in_close = Some(Command::Suspend);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let one = &rig.reports[0];
     assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
     assert!(incomplete(one).suspend);
@@ -662,7 +662,7 @@ fn a_screen_failure_in_the_tail_cuts_it_and_a_failed_rebuild_ends_the_run() {
     rig.tail_waits = 200;
     rig.screen_fails_at = 10_100_000;
     rig.prepare_fails_from = 2;
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(matches!(ran, Err(LiveError::Screen(_))), "{ran:?}");
     let [one] = &rig.reports[..] else {
         panic!("{} plays", rig.reports.len());
@@ -685,7 +685,7 @@ fn a_screen_failure_on_the_end_screen_is_rebuilt_and_shown_again() {
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[], 10_600_000);
     rig.screen_fails_at = 10_400_000;
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(rig.reports[0].end, PlayEnd::Completed);
     assert_eq!(rig.reports[0].tail_cut, None);
     assert_eq!((rig.prepares, rig.shows), (2, 2));
@@ -711,7 +711,7 @@ fn each_report_carries_the_preset_its_play_used() {
         .unwrap();
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 12_500_000);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let ids = |r: &PlayReport| {
         r.preset
             .gauges
@@ -743,7 +743,7 @@ fn a_retry_during_close_with_the_audio_done_retries() {
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[], 12_500_000);
     rig.in_close = Some(Command::Retry);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     // Retried without an end screen; the quit comes during play 2.
     assert_eq!(rig.reports.len(), 2);
     assert_eq!(rig.shows, 0);
@@ -766,7 +766,7 @@ fn a_retry_during_close_after_an_abort_retries() {
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Suspend)], 12_500_000);
     rig.in_close = Some(Command::Retry);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(rig.reports[0].end, PlayEnd::Aborted(AbortCause::Suspend));
     assert_eq!(rig.reports.len(), 2);
     assert_eq!(rig.origins.len(), 2);
@@ -782,7 +782,7 @@ fn a_suspend_during_close_cuts_a_long_tail() {
     let mut rig = Fake::new(items, &[], 12_500_000);
     rig.tail_waits = 2_000;
     rig.in_close = Some(Command::Suspend);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let one = &rig.reports[0];
     assert_eq!(one.end, PlayEnd::Completed);
     assert_eq!(one.tail_cut, Some(AbortCause::Suspend));
@@ -829,7 +829,7 @@ fn a_gone_audio_thread_fails_the_preparation() {
         let mut loaded = loaded(dir.path());
         let mut rig = Fake::new(Vec::new(), &[], i64::MAX);
         rig.audio = Some(gone_audio(took_a_play));
-        let ran = game::live::run(&mut loaded, &mut rig);
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
         assert!(
             matches!(&ran, Err(LiveError::Audio(AudioWaitError::Gone))),
             "{took_a_play}: {ran:?}"
@@ -857,7 +857,7 @@ fn input_offset_change_applies_next_play_only() {
     ];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
     rig.offset_changes = vec![(9_400_000, 8_000), (11_600_000, 21_000)];
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
     let [one, two] = &rig.reports[..] else {
         panic!("{} plays", rig.reports.len());
@@ -900,7 +900,7 @@ fn every_step_is_measured() {
         key(12_053_000, Z, 0),
     ];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(rig.measured.len(), 2);
     for (play, steps) in rig.measured.iter().enumerate() {
         assert!(!steps.is_empty());
@@ -973,7 +973,7 @@ fn input_to_judgment_is_timed_per_judgment_at_delivery() {
     ];
     let mut rig = Fake::new(items, &[], 10_500_000);
     rig.read_cost = 70;
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let origin = rig.origins[0].0;
     let judged = &rig.judged_at[0];
     assert_eq!(judged.len(), 2, "{judged:?}");
@@ -1027,7 +1027,7 @@ fn the_play_is_over_before_it_is_saved() {
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
     rig.order = std::sync::Arc::clone(&order);
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let order = order.lock().unwrap().clone();
     assert_eq!(
         order,
@@ -1045,7 +1045,7 @@ fn an_input_thread_gone_at_the_open_ends_the_run_with_its_cause() {
         let mut loaded = loaded(dir.path());
         let mut rig = Fake::new(vec![key(9_303_000, Z, 1)], &[], i64::MAX);
         rig.open_fails = Some(cause);
-        let ran = game::live::run(&mut loaded, &mut rig);
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
         assert!(
             matches!(&ran, Err(LiveError::Input(e)) if *e == cause),
             "{cause:?}: {ran:?}"
@@ -1064,7 +1064,7 @@ fn a_quit_in_the_open_saves_nothing() {
     let mut loaded = loaded(dir.path());
     let mut rig = Fake::new(vec![key(9_303_000, Z, 1)], &[], i64::MAX);
     rig.quit_in_open = true;
-    game::live::run(&mut loaded, &mut rig).unwrap();
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let [one] = &rig.reports[..] else {
         panic!("{} plays", rig.reports.len());
     };
@@ -1092,7 +1092,7 @@ fn a_failed_close_saves_the_record_marked_input_failed() {
         ];
         let mut rig = Fake::new(items, &[], 9_500_000);
         rig.close_fails = Some(cause);
-        let ran = game::live::run(&mut loaded, &mut rig);
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
         assert!(
             matches!(&ran, Err(LiveError::Input(e)) if *e == cause),
             "{cause:?}: {ran:?}"
@@ -1128,7 +1128,7 @@ fn a_failed_close_keeps_only_what_the_play_took() {
     let mut rig = Fake::new(items, &[], 9_500_000);
     rig.close_lag = 5 * MS;
     rig.close_fails = Some(InputWaitError::Timeout);
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(matches!(ran, Err(LiveError::Input(_))), "{ran:?}");
     let one = &rig.reports[0];
     assert_eq!(received(one), [(1_003_000, Z.0, 1), (1_053_000, Z.0, 0)]);
@@ -1144,7 +1144,7 @@ fn a_retry_after_a_failed_close_ends_the_run_with_the_input_cause() {
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], i64::MAX);
     rig.close_fails = Some(InputWaitError::Gone);
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
         "{ran:?}"
@@ -1167,7 +1167,7 @@ fn a_quit_during_preparation_with_a_failed_input_thread_ends_the_run_with_its_ca
     let mut rig = Fake::new(vec![key(9_303_000, Z, 1)], &[], i64::MAX);
     rig.quit_in_prepare = true;
     rig.input_fails_in_prepare = true;
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
         "{ran:?}"
@@ -1191,7 +1191,7 @@ fn an_input_failure_in_play_aborts_at_the_last_watermark() {
     ];
     let mut rig = Fake::new(items, &[], 10_500_000);
     rig.input_fails_at = 9_600_000;
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
         "{ran:?}"
@@ -1225,7 +1225,7 @@ fn a_failed_close_after_completion_keeps_the_play_complete() {
     let mut rig = Fake::new(items, &[], 12_000_000);
     rig.tail_waits = 200;
     rig.close_fails = Some(InputWaitError::Timeout);
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Timeout))),
         "{ran:?}"
@@ -1252,7 +1252,7 @@ fn a_quit_during_a_failed_close_ends_the_run_with_the_input_cause() {
     rig.tail_waits = 200;
     rig.close_fails = Some(InputWaitError::Timeout);
     rig.quit_in_close = true;
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Timeout))),
         "{ran:?}"
@@ -1279,7 +1279,7 @@ fn an_input_failure_in_the_tail_cuts_it_and_keeps_the_record_complete() {
     let mut rig = Fake::new(items, &[], 12_000_000);
     rig.tail_waits = 2_000;
     rig.input_fails_at = 10_100_000;
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
         "{ran:?}"
@@ -1304,7 +1304,7 @@ fn an_input_failure_on_the_end_screen_ends_the_run_at_the_retry() {
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], i64::MAX);
     rig.input_fails_at = 10_400_000;
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
         "{ran:?}"
@@ -1331,7 +1331,7 @@ fn a_retry_with_a_failed_input_thread_and_screen_ends_with_the_input_cause() {
     rig.input_fails_at = 10_400_000;
     rig.screen_fails_at = 10_600_000;
     rig.prepare_fails_from = 2;
-    let ran = game::live::run(&mut loaded, &mut rig);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
         "{ran:?}"
