@@ -20,10 +20,10 @@
 //! | LN-end edges PERFECT 120, GREAT 160, GOOD 200 ms before the end | `play/JudgeProperty.java:25` |
 //! | Release earlier than the GOOD edge is BAD, never POOR | `play/JudgeManager.java:533-541` (`lnendJudge = 3`; the release margin is 0, `play/JudgeProperty.java:26`) |
 //! | Release: the worse of head and release; held through the end keeps the head | `play/JudgeManager.java:534`, `:572-573` |
-//! | Empty POOR: a note within 500 ms after the press or 150 ms before it | `play/JudgeProperty.java:23` (MS pair), `play/JudgeManager.java:401` |
+//! | Empty POOR: a note less than 500 ms after the press (499 999 µs here), or at most 150 ms before it | `play/JudgeProperty.java:23` (MS pair), `play/JudgeManager.java:387-389` (the scan stops at 500 ms ahead, exclusive), `:401` |
 //! | Empty POOR keeps the combo, adds to BP, has its own count | `play/JudgeProperty.java:29` (combo), `play/JudgeManager.java:660-668`, `BMSPlayer.java:915` (BP), `ScoreData.java:278` (MS count) |
 //! | BAD and POOR break the combo and add to BP | `play/JudgeProperty.java:29`, `BMSPlayer.java:915` |
-//! | Missed at the late BAD edge | `play/JudgeManager.java:594-598` |
+//! | Missed once its late BAD edge has passed (timing: see H below) | `play/JudgeManager.java:594-598` |
 //! | `#RANK` 0-3: 25, 50, 75, 100 %; no rank or an unknown `#RANK`: 75 % | `play/JudgeProperty.java:210`, `play/BMSPlayerRule.java:62`; jbms-parser `BMSModel.java:67,71` (default rank 2), `BMSDecoder.java:702-713` |
 //! | Each edge scaled by `edge × rate / 100`, in µs | `play/JudgeProperty.java:234` |
 //! | Empty POOR distances not scaled | `play/JudgeProperty.java:210` (`fixjudge`) |
@@ -81,6 +81,13 @@
 //!   judged during the hold extend the combo before the break there, after it
 //!   here: combo 10, a BAD head, then 5 taps during the hold gives max combo
 //!   15 there, 10 here.
+//! - **H. When a miss is decided.** A note is missed only strictly after
+//!   its late BAD edge, at the first frame past it
+//!   (`play/JudgeManager.java:592-598`: `note time < now − 280 ms`); here
+//!   the POOR is decided at the edge itself, after any input at that time.
+//!   The judgments are the same, since a press exactly on the edge is BAD
+//!   in both; only the time of the POOR, and of a survival gauge's failure
+//!   it causes, differs.
 //!
 //! The CLASS gauges (course play only) are not included.
 
@@ -175,7 +182,8 @@ pub fn beatoraja_style() -> RulePreset {
         },
         miss: MissRule::PoorAfterLateBadOrOvertaken,
         empty_poor: EmptyPoorRule {
-            ahead: TimeUs(500 * MS),
+            // Exclusive at 500 ms (play/JudgeManager.java:387-389).
+            ahead: TimeUs(500 * MS - 1),
             behind: TimeUs(150 * MS),
             breaks_combo: false,
             counts_bp: true,

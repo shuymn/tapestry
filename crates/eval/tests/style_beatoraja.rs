@@ -10,6 +10,9 @@
 //! are listed in the preset's module, with the examples that would differ;
 //! none of them is asserted here.
 //!
+//! The time of a miss is this evaluator's convention, [`MISSED`] after the
+//! note (difference H); the POOR itself follows the source.
+//!
 //! Window values are at `#RANK 3` (100 %) unless a test says otherwise.
 //! Gauges are in 1/100000 %, in the preset's order: NORMAL, ASSIST EASY,
 //! EASY, HARD, EX HARD, HAZARD.
@@ -26,6 +29,11 @@ const BPM: i64 = 150_000;
 const T: i64 = 1_000 * MS;
 /// One percent of a gauge.
 const PCT: i64 = 100_000;
+/// When this evaluator decides a miss: at the late BAD edge (280 ms at
+/// `#RANK 3`). beatoraja decides it at the first frame after the edge
+/// (difference H in the preset module), so this time is this evaluator's
+/// convention, not the source's.
+const MISSED: i64 = 280 * MS;
 
 const NORMAL: usize = 0;
 const ASSIST_EASY: usize = 1;
@@ -172,24 +180,25 @@ fn a_press_past_the_early_bad_edge_is_an_empty_poor() {
     let chart = taps(&[T]);
     let e = play(&chart, tap_at(T - 220 * MS - 1));
     assert_eq!(empty_poors(&e.events), 1);
-    // The note is then missed at its late BAD edge.
-    assert_eq!(judged_at(&e), vec![(T + 280 * MS, Poor)]);
+    // The note is then missed (at this evaluator's miss time).
+    assert_eq!(judged_at(&e), vec![(T + MISSED, Poor)]);
 }
 
-/// Source: play/JudgeManager.java:594-598: a note is missed once the time
-/// passes its late BAD edge; a press on the edge still counts
-/// (play/JudgeProperty.java:187, inclusive).
+/// Source: play/JudgeManager.java:594-598: a note is missed once its late
+/// BAD edge has passed; a press on the edge still counts
+/// (play/JudgeProperty.java:187, inclusive). The POOR's time is
+/// [`MISSED`], this evaluator's convention.
 #[test]
 fn an_unpressed_note_is_a_poor_at_its_late_bad_edge() {
     let chart = taps(&[T]);
     let missed = play(&chart, Vec::new());
-    assert_eq!(judged_at(&missed), vec![(T + 280 * MS, Poor)]);
+    assert_eq!(judged_at(&missed), vec![(T + MISSED, Poor)]);
     let on_edge = play(&chart, tap_at(T + 280 * MS));
     assert_eq!(judged_at(&on_edge), vec![(T + 280 * MS, Bad)]);
     // Just after it: missed, and the press is too far behind the note for
     // an empty POOR (150 ms).
     let after = play(&chart, tap_at(T + 280 * MS + 1));
-    assert_eq!(judged_at(&after), vec![(T + 280 * MS, Poor)]);
+    assert_eq!(judged_at(&after), vec![(T + MISSED, Poor)]);
     assert_eq!(empty_poors(&after.events), 0);
 }
 
@@ -248,22 +257,23 @@ fn ranks_0_and_1_scale_to_25_and_50_percent() {
 #[test]
 fn empty_poor_distances_do_not_scale() {
     let chart = taps_ranked(&[T], Some(JudgeRank::Rank(0)));
-    let e = play(&chart, tap_at(T - 500 * MS));
+    let e = play(&chart, tap_at(T - 500 * MS + 1));
     assert_eq!(empty_poors(&e.events), 1);
 }
 
 // ------------------------------------------------------------ empty POOR
 
-/// Source: play/JudgeProperty.java:23 (MS early 500000),
-/// play/JudgeManager.java:401.
+/// Source: play/JudgeProperty.java:23 (MS early 500000) and
+/// play/JudgeManager.java:387-389: the note scan stops at notes 500 ms or
+/// more ahead, so a note exactly 500 ms after the press is not reached.
 #[test]
-fn empty_poor_reaches_500_ms_before_a_note() {
+fn empty_poor_reaches_up_to_but_not_500_ms_before_a_note() {
     let chart = taps(&[T]);
-    assert_eq!(empty_poors(&play(&chart, tap_at(T - 500 * MS)).events), 1);
     assert_eq!(
-        empty_poors(&play(&chart, tap_at(T - 500 * MS - 1)).events),
-        0
+        empty_poors(&play(&chart, tap_at(T - 500 * MS + 1)).events),
+        1
     );
+    assert_eq!(empty_poors(&play(&chart, tap_at(T - 500 * MS)).events), 0);
 }
 
 /// Source: play/JudgeProperty.java:23 (MS late -150000) and
@@ -401,7 +411,7 @@ fn ln_held_through_its_end_keeps_the_head_judgment() {
 fn a_missed_ln_head_is_one_poor() {
     let chart = long(1_000 * MS, Some(JudgeRank::Rank(3)));
     let e = play(&chart, Vec::new());
-    assert_eq!(judged_at(&e), vec![(T + 280 * MS, Poor)]);
+    assert_eq!(judged_at(&e), vec![(T + MISSED, Poor)]);
     assert_eq!(e.tally.bp, 1);
 }
 
@@ -492,26 +502,55 @@ fn survival_increases_per_judgment() {
     );
     assert_eq!(gauge(&e, HARD), 90 * PCT + 15_000 + 12_000 + 3_000);
     assert_eq!(gauge(&e, EX_HARD), 84 * PCT + 15_000 + 6_000);
-    assert_eq!(e.gauges[HAZARD].failed_at, Some(TimeUs(T + 280 * MS)));
+    assert_eq!(e.gauges[HAZARD].failed_at, Some(TimeUs(T + MISSED)));
 }
 
-/// Source: play/GaugeProperty.java:90-91 (HARD POOR −10 %, EX HARD −16 %),
-/// play/GrooveGauge.java:218-222 (a gauge at 0 never changes again),
-/// :246-248 (a survival gauge clears above 0).
+/// Source: play/GaugeProperty.java:91-92 (EX HARD POOR −16 %, HAZARD
+/// POOR −100 %, neither reduced while low), play/GrooveGauge.java:218-222
+/// (a gauge at 0 never changes again), :246-248 (a survival gauge clears
+/// above 0). HARD's misses are not asserted: below 50 % its damage is
+/// reduced there (difference C). The failure times are [`MISSED`] after the
+/// note, this evaluator's convention.
 #[test]
-fn hard_fails_at_the_tenth_poor_and_ex_hard_at_the_seventh() {
+fn ex_hard_fails_at_the_seventh_poor_and_hazard_at_the_first() {
     let times: Vec<i64> = (0..10).map(|k| T + k * 1_000 * MS).collect();
     let chart = taps(&times);
-    let miss = |k: i64| Some(TimeUs(T + k * 1_000 * MS + 280 * MS));
+    let miss = |k: i64| Some(TimeUs(T + k * 1_000 * MS + MISSED));
     let e = play(&chart, Vec::new());
-    assert_eq!(e.gauges[HARD].failed_at, miss(9));
     assert_eq!(e.gauges[EX_HARD].failed_at, miss(6));
     assert_eq!(e.gauges[HAZARD].failed_at, miss(0));
-    // Nine POORs, then a PERFECT: HARD survives at 10.15 %.
+    // A PERFECT on the last note does not bring them back.
     let e = play(&chart, tap_at(T + 9_000 * MS));
-    assert_eq!(gauge(&e, HARD), 10 * PCT + 15_000);
-    assert!(e.gauges[HARD].cleared);
-    assert!(!e.gauges[EX_HARD].cleared);
+    for g in [EX_HARD, HAZARD] {
+        assert_eq!(gauge(&e, g), 0, "{g}");
+        assert!(!e.gauges[g].cleared, "{g}");
+    }
+}
+
+/// Source: play/JudgeManager.java:244-246 and play/GrooveGauge.java:63-66
+/// (a held mine subtracts its value in percent, not reduced while low),
+/// :218-222 (clamped; a gauge at 0 never changes again), :246-248.
+#[test]
+fn a_lethal_mine_fails_every_survival_gauge_for_good() {
+    let chart = with_rank(
+        ChartBuilder::new(BPM)
+            .mine(lane(1), TimeUs(T), 100)
+            .tap(lane(1), TimeUs(T + 1_000 * MS))
+            .tap(lane(1), TimeUs(T + 2_000 * MS))
+            .build()
+            .unwrap(),
+        Some(JudgeRank::Rank(3)),
+    );
+    let mut events = vec![press(T - 100 * MS, 0, 1), release(T + 100 * MS, 0, 1)];
+    events.extend(taps_at(&[T + 1_000 * MS, T + 2_000 * MS]));
+    let e = play(&chart, events);
+    for g in [HARD, EX_HARD, HAZARD] {
+        assert_eq!(gauge(&e, g), 0, "{g}");
+        assert!(e.gauges[g].failed_at.is_some(), "{g}");
+        assert!(!e.gauges[g].cleared, "{g}");
+    }
+    // NORMAL floors at 2 % and recovers: two PERFECTs of 260 / 2 notes.
+    assert_eq!(gauge(&e, NORMAL), 100 * PCT);
 }
 
 /// Source: play/GaugeProperty.java:87-92 (MS: NORMAL −2, ASSIST EASY −0.5,
