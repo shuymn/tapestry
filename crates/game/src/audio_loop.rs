@@ -23,9 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ::audio::{
-    AudioEngine, AudioOutput, InvalidVolume, MAX_VOLUME, OutputError, ScheduledKind, SoundBank,
+    AudioEngine, AudioOutput, BgmSchedule, InvalidVolume, MAX_VOLUME, OutputError, ScheduledKind,
+    SoundBank,
 };
-use bms_model::{BgmEvent, TimeUs};
+use bms_model::TimeUs;
 
 use crate::sound::{AudioQueue, audio_link};
 
@@ -81,7 +82,7 @@ pub enum AudioLoadError {
 struct Retired {
     // Held only to be dropped where the game thread takes them.
     _bank: Arc<SoundBank>,
-    _schedule: Vec<BgmEvent>,
+    _schedule: BgmSchedule,
     /// The load it answers.
     id: u64,
     /// Whether the engine took the load.
@@ -97,7 +98,7 @@ pub enum AudioCtl {
         /// The chart's sounds, decoded at the output's rate.
         bank: Arc<SoundBank>,
         /// Its BGM, or the schedule that stands for it (autoplay).
-        schedule: Vec<BgmEvent>,
+        schedule: BgmSchedule,
         /// The load's number, which its answer carries.
         id: u64,
     },
@@ -390,7 +391,7 @@ impl AudioControl {
     pub fn load(
         &mut self,
         bank: Arc<SoundBank>,
-        schedule: Vec<BgmEvent>,
+        schedule: BgmSchedule,
     ) -> Result<(), AudioLoadError> {
         if bank.rate() != self.rate {
             return Err(AudioLoadError::RateMismatch {

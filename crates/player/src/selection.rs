@@ -414,7 +414,7 @@ impl AppRig for PlayerRig<'_> {
         let decoded = self.clock.now();
         self.audio
             .control
-            .load(Arc::new(bank), schedule)
+            .load(Arc::new(bank), audio::BgmSchedule::new(schedule))
             .map_err(ChartLoadError::Audio)?;
         self.render
             .load(Arc::new(chart.clone()))

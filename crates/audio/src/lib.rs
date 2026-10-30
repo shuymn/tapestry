@@ -58,7 +58,7 @@ pub use mixer::{
 };
 pub use output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, RecordingOutput, Wake};
 pub use run::{RunReport, run_audio};
-pub use seek::{FrameLine, SeekPlan, SeekSource};
+pub use seek::{BgmSchedule, FrameLine, SeekPlan, SeekSource};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
 #[cfg(windows)]
 pub use wasapi::{

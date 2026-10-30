@@ -53,14 +53,14 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
             // thread takes it late, in a counted step, and its answer is
             // freed by the next load, on the game thread.
             assert_eq!(
-                control.load(bank(&chart), chart.bgm.clone()),
+                control.load(bank(&chart), audio::BgmSchedule::new(chart.bgm.clone())),
                 Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
             );
             steps(&mut worker, 1);
             let next = bank(&chart);
             let schedule = chart.bgm.clone();
             std::thread::scope(|s| {
-                let load = s.spawn(|| control.load(next, schedule));
+                let load = s.spawn(|| control.load(next, audio::BgmSchedule::new(schedule)));
                 while !load.is_finished() {
                     steps(&mut worker, 1);
                 }

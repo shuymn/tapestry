@@ -28,9 +28,54 @@ pub struct SeekSource {
     pub(crate) voices: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`schedule_hash`] on this thread (unit tests).
+    pub(crate) static HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A BGM schedule (sorted by time) with its [`schedule_hash`], computed once
+/// where it is built, so the audio thread that takes it in
+/// ([`AudioEngine::replace`](crate::AudioEngine::replace)) never walks it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BgmSchedule {
+    events: Vec<BgmEvent>,
+    hash: u64,
+}
+
+impl BgmSchedule {
+    /// `events` with their hash: work in proportion to them, off the audio
+    /// thread.
+    #[must_use]
+    pub fn new(events: Vec<BgmEvent>) -> Self {
+        let hash = schedule_hash(&events);
+        Self { events, hash }
+    }
+
+    /// The events.
+    #[must_use]
+    pub fn events(&self) -> &[BgmEvent] {
+        &self.events
+    }
+
+    /// The events and their hash, taken apart without work.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn into_parts(self) -> (Vec<BgmEvent>, u64) {
+        (self.events, self.hash)
+    }
+
+    /// A schedule from parts that belong together, without work.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) const fn from_parts(events: Vec<BgmEvent>, hash: u64) -> Self {
+        Self { events, hash }
+    }
+}
+
 /// A hash of every start of `schedule`, in order (SipHash with fixed keys);
 /// it allocates nothing.
 pub(crate) fn schedule_hash(schedule: &[BgmEvent]) -> u64 {
+    #[cfg(test)]
+    HASHED.with(|n| n.set(n.get() + 1));
     let mut h = DefaultHasher::new();
     h.write_usize(schedule.len());
     for e in schedule {

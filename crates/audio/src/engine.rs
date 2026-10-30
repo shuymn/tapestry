@@ -15,7 +15,7 @@ use crate::bank::SoundBank;
 use crate::clock::MixClock;
 use crate::mixer::{InvalidVolume, Mixer};
 use crate::output::{AudioOutput, OutputError};
-use crate::seek::{FrameLine, SeekPlan, SeekSource, schedule_hash};
+use crate::seek::{BgmSchedule, FrameLine, SeekPlan, SeekSource, schedule_hash};
 
 /// A key sound to play, from the logic thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,7 +96,7 @@ pub enum EngineError {
 }
 
 /// A chart's sounds as the engine plays them: its bank and its BGM schedule.
-pub type ChartSounds = (Arc<SoundBank>, Vec<BgmEvent>);
+pub type ChartSounds = (Arc<SoundBank>, BgmSchedule);
 
 /// Why an engine did not take a [`SeekPlan`]; nothing changed, and the
 /// caller plans again.
@@ -399,7 +399,10 @@ impl AudioEngine {
     /// take the place of the current ones, which are returned so the caller
     /// frees them where it may. Every voice stops and no BGM event starts
     /// until the next [`restart`](Self::restart); the output stream and its
-    /// clock continue. Nothing is allocated or freed.
+    /// clock continue. Nothing is allocated or freed, and the schedule is
+    /// not walked: its hash came with it ([`BgmSchedule`]). A seek planned
+    /// for the old schedule no longer applies: a pending one is dropped,
+    /// and a later one is refused ([`SeekError::Source`]).
     ///
     /// # Errors
     ///
@@ -408,19 +411,19 @@ impl AudioEngine {
     pub fn replace(
         &mut self,
         bank: Arc<SoundBank>,
-        bgm: Vec<BgmEvent>,
+        bgm: BgmSchedule,
     ) -> Result<ChartSounds, ChartSounds> {
         if bank.rate() != self.bank.rate() {
             return Err((bank, bgm));
         }
         self.mixer.stop_all();
+        let (events, hash) = bgm.into_parts();
         let old_bank = std::mem::replace(&mut self.bank, bank);
-        let old_bgm = std::mem::replace(&mut self.bgm, bgm);
+        let old_bgm = std::mem::replace(&mut self.bgm, events);
+        let old_hash = std::mem::replace(&mut self.bgm_hash, hash);
         self.next_bgm = self.bgm.len();
-        // A seek planned for the old schedule no longer applies.
-        self.bgm_hash = schedule_hash(&self.bgm);
         self.seek_to = None;
-        Ok((old_bank, old_bgm))
+        Ok((old_bank, BgmSchedule::from_parts(old_bgm, old_hash)))
     }
 
     /// The bank key sounds and BGM play from.
@@ -552,5 +555,37 @@ impl AudioEngine {
         report.active_voices = self.mixer.sounding();
         report.bgm_left = self.bgm.len() - self.next_bgm;
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bms_model::{BgmEvent, SoundId, TimeUs};
+
+    use super::AudioEngine;
+    use crate::bank::SoundBank;
+    use crate::seek::{BgmSchedule, HASHED};
+
+    /// The schedule is hashed where it is built, once; taking it in walks
+    /// none of it, however long it is.
+    #[test]
+    fn replace_does_not_hash_the_schedule() {
+        let bank = || Arc::new(SoundBank::from_sounds(48_000, Vec::new()));
+        let mut e = AudioEngine::new(bank(), &[], 48_000, 480, 4, 4).unwrap();
+        let events: Vec<BgmEvent> = (0..500_000)
+            .map(|k| BgmEvent {
+                time: TimeUs(k),
+                sound: SoundId(0),
+            })
+            .collect();
+        let before = HASHED.with(std::cell::Cell::get);
+        let schedule = BgmSchedule::new(events);
+        assert_eq!(HASHED.with(std::cell::Cell::get), before + 1);
+        let (_, old) = e.replace(bank(), schedule).unwrap();
+        assert!(old.events().is_empty());
+        assert_eq!(HASHED.with(std::cell::Cell::get), before + 1);
+        assert_eq!(e.bgm_left(), 0);
     }
 }

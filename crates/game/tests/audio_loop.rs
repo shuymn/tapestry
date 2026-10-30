@@ -327,7 +327,7 @@ fn a_loaded_bank_replaces_the_previous_charts_sounds() {
     }];
     // The load waits for the audio thread, stepped here meanwhile.
     std::thread::scope(|s| {
-        let load = s.spawn(|| control.load(Arc::clone(&new), schedule));
+        let load = s.spawn(|| control.load(Arc::clone(&new), audio::BgmSchedule::new(schedule)));
         while !load.is_finished() {
             worker.step(&mut out).unwrap();
         }
@@ -336,7 +336,7 @@ fn a_loaded_bank_replaces_the_previous_charts_sounds() {
     let silent = out.samples().len();
     let other = Arc::new(audio::SoundBank::from_sounds(44_100, Vec::new()));
     assert_eq!(
-        control.load(other, Vec::new()),
+        control.load(other, audio::BgmSchedule::new(Vec::new())),
         Err(game::AudioLoadError::RateMismatch {
             bank: 44_100,
             output: RATE
@@ -360,7 +360,7 @@ fn a_loaded_bank_replaces_the_previous_charts_sounds() {
     assert!(out.samples().iter().any(|&s| near(s, new_level)));
     assert!(!out.samples().iter().any(|&s| near(s, old_level)));
     assert_eq!(
-        control.load(new, Vec::new()),
+        control.load(new, audio::BgmSchedule::new(Vec::new())),
         Err(game::AudioLoadError::Wait(game::AudioWaitError::Gone))
     );
 }
@@ -379,14 +379,14 @@ fn a_timed_out_load_refuses_others_until_it_is_answered() {
     let first = Arc::new(audio::SoundBank::from_sounds(RATE, Vec::new()));
     // The worker is stalled: nothing steps it.
     assert_eq!(
-        control.load(Arc::clone(&first), Vec::new()),
+        control.load(Arc::clone(&first), audio::BgmSchedule::new(Vec::new())),
         Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
     );
     let started = std::time::Instant::now();
     for _ in 0..32 {
         let other = Arc::new(audio::SoundBank::from_sounds(RATE, Vec::new()));
         assert_eq!(
-            control.load(other, Vec::new()),
+            control.load(other, audio::BgmSchedule::new(Vec::new())),
             Err(game::AudioLoadError::Busy)
         );
     }
@@ -397,7 +397,8 @@ fn a_timed_out_load_refuses_others_until_it_is_answered() {
     // The next load frees that answer here, then goes through.
     let second = Arc::new(audio::SoundBank::from_sounds(RATE, Vec::new()));
     std::thread::scope(|s| {
-        let load = s.spawn(|| control.load(Arc::clone(&second), Vec::new()));
+        let load =
+            s.spawn(|| control.load(Arc::clone(&second), audio::BgmSchedule::new(Vec::new())));
         while !load.is_finished() {
             worker.step(&mut out).unwrap();
         }

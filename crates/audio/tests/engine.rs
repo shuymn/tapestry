@@ -608,10 +608,10 @@ fn another_chart_replaces_the_bank_and_bgm() {
     )
     .unwrap();
     let (back, back_bgm) = e
-        .replace(Arc::clone(&new_bank), new_bgm)
+        .replace(Arc::clone(&new_bank), audio::BgmSchedule::new(new_bgm))
         .expect("same rate");
     assert_eq!(e.seek(&stale), Err(audio::SeekError::Source));
-    assert_eq!(back_bgm, old_bgm);
+    assert_eq!(back_bgm.events(), old_bgm);
     assert_eq!(back.stored_count(), 2);
     assert!(Arc::ptr_eq(e.bank(), &new_bank));
     assert_eq!((e.mixer().sounding(), e.bgm_left()), (0, 0));
@@ -642,9 +642,9 @@ fn another_chart_replaces_the_bank_and_bgm() {
     // A bank at another rate comes back as it was given.
     let other = Arc::new(SoundBank::from_sounds(44_100, Vec::new()));
     let (refused, refused_bgm) = e
-        .replace(Arc::clone(&other), Vec::new())
+        .replace(Arc::clone(&other), audio::BgmSchedule::new(Vec::new()))
         .expect_err("another rate");
     assert!(Arc::ptr_eq(&refused, &other));
-    assert!(refused_bgm.is_empty());
+    assert!(refused_bgm.events().is_empty());
     assert!(Arc::ptr_eq(e.bank(), &new_bank));
 }

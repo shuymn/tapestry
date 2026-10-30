@@ -243,6 +243,8 @@ pub const IN_PLAY: &[Site] = &[
             "SeekPlan::line",
             "SeekPlan::engine",
             "SeekPlan::schedule",
+            "BgmSchedule::into_parts",
+            "BgmSchedule::from_parts",
             "SeekPlan::at",
             "SeekPlan::split",
             "SeekPlan::budget",
