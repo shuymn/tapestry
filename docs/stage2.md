@@ -167,11 +167,14 @@ egui comes with the first form-like screen.
 
 ### D7. Search and sort
 
-- **Normalization**, applied when indexing and when querying: NFKC, lowercase, and katakana folded to hiragana (U+30A1-U+30F6 minus 0x60).
-- **Long queries (3 or more characters).** The query becomes one FTS5 string: every `"` is doubled, the whole is wrapped in `"…"`, and it is bound as `charts_fts MATCH ?1`.
+- **Normalization**, applied when indexing and when querying: C0 control characters dropped first, then NFKC, lowercase, and katakana folded to hiragana (U+30A1-U+30F6 minus 0x60).
+  - Why the controls go first: neither side then holds NUL, at which SQLite's `LIKE` and string parsing stop, and a control between a base and its combining mark does not keep them from composing.
+  - The searched fields (title, subtitle, artist, subartist, genre) are joined by U+001F, which no normalized query holds, so no match spans two fields.
+- **Characters** are Unicode scalar values of the normalized query, the trigram tokenizer's unit. A query that normalizes to nothing matches every chart.
+- **Long queries (3 or more characters).** The query becomes one FTS5 string: every `"` is doubled, the whole is wrapped in `"…"`, and it is bound as `charts_fts MATCH ?1`. The candidates must also contain the normalized query exactly (`instr(norm_text, ?2) > 0`), since the tokenizer reads U+FFFE and U+FFFF as U+FFFD; both conditions apply before `LIMIT`, so the limit counts only matches.
 - **Short queries.** `norm_text LIKE ?1 ESCAPE '\'`, with `\`, `%` and `_` escaped.
 - **Not exposed.** SQLite's query syntax is never exposed, and there is no transliteration.
-- **Sorting.** By title, artist, level, or file modification time.
+- **Sorting.** By normalized title, normalized artist, level (digit-only levels by value at any length, then other text, then none), or file modification time (newest first). The path is the last key, so the order is total. The title order is indexed.
 - **Grouping and input.** Charts are grouped by folder. Search text arrives through winit IME while the search box has focus.
 
 ### D8. Personal bests: key, eligibility and invalidation

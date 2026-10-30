@@ -1,9 +1,9 @@
 //! Search and sort (design.md "Loading and Song Selection"): the normalized
 //! text the scan stores with each chart, and the one statement a query runs.
 //!
-//! **Normalization.** [`normalize`] applies NFKC, lowercases, folds
-//! katakana U+30A1-U+30F6 to hiragana and drops C0 control characters, the
-//! same way when indexing and when querying. Neither side holds NUL, at
+//! **Normalization.** [`normalize`] drops C0 control characters, then
+//! applies NFKC, lowercases and folds katakana U+30A1-U+30F6 to hiragana,
+//! the same way when indexing and when querying. Neither side holds NUL, at
 //! which SQLite's `LIKE` and string parsing would stop.
 //!
 //! **Matching.** A query matches a chart when one of its title, subtitle,
@@ -70,13 +70,16 @@ pub struct Search<'a> {
     pub limit: usize,
 }
 
-/// `text` normalized for searching: NFKC, lowercase, katakana U+30A1-
-/// U+30F6 folded to hiragana, and C0 control characters dropped.
+/// `text` normalized for searching: C0 control characters dropped, then
+/// NFKC, lowercase, and katakana U+30A1-U+30F6 folded to hiragana. The
+/// controls go first, so one between a base and its combining mark does not
+/// keep them from composing; none of the later steps makes one.
 pub fn normalize(text: &str) -> String {
-    text.nfkc()
+    text.chars()
+        .filter(|c| !matches!(c, '\0'..='\u{1F}'))
+        .nfkc()
         .flat_map(char::to_lowercase)
         .map(fold_kana)
-        .filter(|c| !matches!(c, '\0'..='\u{1F}'))
         .collect()
 }
 

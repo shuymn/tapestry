@@ -188,6 +188,27 @@ fn control_characters_are_dropped_from_headers_and_queries() {
 }
 
 #[test]
+fn a_control_between_a_base_and_its_mark_does_not_keep_them_apart() {
+    let fx = Fixture::new();
+    // Half-width カ and voiced mark compose under NFKC unless a control
+    // stands between them.
+    fx.chart("0.bms", &["TITLE ｶ\0ﾞab"]);
+    fx.chart("1.bms", &["TITLE ギャ"]);
+    let lib = fx.scanned();
+    // Short (`LIKE`) and long (FTS5) queries without the control.
+    for query in ["ガa", "がab", "ｶﾞab"] {
+        assert_eq!(found(&lib, query), titles(&["ｶ\0ﾞab"]), "query {query:?}");
+    }
+    // A query with a control between base and mark finds composed text.
+    for query in ["ｷ\u{1}ﾞ", "ｷ\u{1}ﾞｬ"] {
+        assert_eq!(found(&lib, query), titles(&["ギャ"]), "query {query:?}");
+    }
+    for query in ["ｶ\u{1}ﾞa", "ｶ\u{1}ﾞab"] {
+        assert_eq!(found(&lib, query), titles(&["ｶ\0ﾞab"]), "query {query:?}");
+    }
+}
+
+#[test]
 fn long_query_requires_exact_containment() {
     let fx = Fixture::new();
     // The trigram tokenizer reads U+FFFE as U+FFFD; these sort first.
