@@ -57,6 +57,7 @@ pub const LICENSES: &[(&str, &str)] = &[
     ("audio", GPL),
     ("game", GPL),
     ("library", GPL),
+    ("skin-model", GPL),
     ("render", GPL),
     ("player", GPL),
 ];

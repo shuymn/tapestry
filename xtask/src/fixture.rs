@@ -66,6 +66,7 @@ pub fn baseline() -> Vec<Crate> {
             "library",
             "[dependencies]\nbms-parser = { path = \"../bms-parser\" }\n",
         ),
+        lib("skin-model", ""),
         (
             "player",
             "[package.metadata.tapestry]\nwindows-only = true\n\
