@@ -6,8 +6,8 @@ use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::{
     Adjust, Chain, ControllerDevice, DataRoot, DeviceSettings, KeyConfig, KeyError, LaneKey,
-    LocalRecords, PlayerSettings, RecordSink, Role, ScratchConfig, Settings, SettingsError, Tuning,
-    load_settings, save_settings, write_atomic,
+    LibrarySettings, LocalRecords, PlayerSettings, RecordSink, Role, ScratchConfig, Settings,
+    SettingsError, Tuning, load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -77,6 +77,9 @@ fn changed() -> Settings {
                 release_after_us: 80_000,
             },
             queued_periods: 3,
+            library: LibrarySettings {
+                roots: vec![r"D:\BMS".to_owned(), "songs/new".to_owned()],
+            },
         },
         player: PlayerSettings {
             visible_time_ms: 2_350,
@@ -115,6 +118,23 @@ fn device_and_player_settings_round_trip() {
     )
     .unwrap();
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
+    // `[library] roots` as a person writes it; an unknown key in the table
+    // is refused like any other.
+    fs::write(
+        root.device_settings(),
+        "[library]\nroots = ['D:\\BMS', \"songs/new\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        Settings::load(&root).unwrap().device.library,
+        s.device.library
+    );
+    fs::write(root.device_settings(), "[library]\nroot = 'D:\\BMS'\n").unwrap();
+    assert!(matches!(
+        load_settings::<DeviceSettings>(&root.device_settings()),
+        Err(SettingsError::Parse(e)) if e.message().contains("root")
+    ));
+    s.save(&root).unwrap();
 
     // The settings keys' values, stepped and written as the game does at
     // the end of a play, come back the same: hi-speed up twice (2350 ms
