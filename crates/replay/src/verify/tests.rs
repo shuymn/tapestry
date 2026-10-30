@@ -803,4 +803,24 @@ fn out_of_bounds_initial_gauge_uses_the_default() {
         starts(&[("normal", pct(10)), ("survival", rules::GaugeValue(1))]),
         (vec![pct(10), rules::GaugeValue(1)], vec![false, false])
     );
+    // A survival gauge that fails below 2 % does not start at 1 %, which it
+    // would fail at once, and starts at 2 %.
+    bounded.gauges[1].kind = rules::GaugeKind::Survival {
+        fails_below: pct(2),
+    };
+    bounded.validate().unwrap();
+    let starts = |held: &[(&str, rules::GaugeValue)]| {
+        let round = as_round(record.clone(), 500 * MS, 1_500 * MS, held);
+        let r = evaluate_record(&round, &chart, Some(&bounded)).unwrap();
+        let values: Vec<_> = r.evaluation.gauges.iter().map(|g| g.value).collect();
+        (values, r.started_at_default)
+    };
+    assert_eq!(
+        starts(&[("survival", pct(1))]),
+        (vec![pct(20), pct(100)], vec![true, true])
+    );
+    assert_eq!(
+        starts(&[("survival", pct(2))]),
+        (vec![pct(20), pct(2)], vec![true, false])
+    );
 }
