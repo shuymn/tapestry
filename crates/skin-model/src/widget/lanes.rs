@@ -13,12 +13,12 @@ use bms_model::{LANE_COUNT, Lane, NoteKind, Position, TimeUs};
 
 use super::ImageRef;
 use super::scroll::Scale;
-use crate::atlas::uv::UvTable;
+use crate::atlas::uv::{FrameUv, UvTable};
 use crate::canvas::f32_of;
 use crate::place::Affine;
 use crate::play::reducer::is_target;
 use crate::play::{Notes, Play};
-use crate::quad::{Quad, QuadBatch, RunKey};
+use crate::quad::{Filter, Quad, QuadBatch, RunKey};
 use crate::skin::MAX_COORD;
 
 /// The quads one frame's bar lines and notes may take.
@@ -284,8 +284,13 @@ impl Lanes {
     }
 
     /// The authored geometry.
+    #[expect(clippy::cast_precision_loss, reason = "within ±2^21, exact in f64")]
     pub(crate) fn authored(&self) -> Geometry {
-        self.geometry(self.scratch, 100, 0)
+        let [s0, s1] = self.span;
+        Geometry {
+            lanes: self.lanes.map(|[x, w]| [x as f64, w as f64]),
+            span: [s0 as f64, (s1 - s0) as f64],
+        }
     }
 
     /// The geometry with the scratch lane on `scratch` and every lane
@@ -346,6 +351,24 @@ pub(crate) struct Draw<'a> {
     pub(crate) uvs: &'a UvTable,
 }
 
+/// A part as one frame draws it: its current frame (`None` draws nothing
+/// but still spends its quad) and its filter.
+#[derive(Clone, Copy)]
+struct Shown {
+    frame: Option<FrameUv>,
+    filter: Filter,
+}
+
+impl Draw<'_> {
+    /// `part`'s frame this frame.
+    fn shown(&self, part: &ImageRef) -> Shown {
+        Shown {
+            frame: part.frame(self.play, self.now, self.uvs),
+            filter: part.filter,
+        }
+    }
+}
+
 /// The quads drawn so far and the budgets they draw on.
 struct Pen<'a, 'b> {
     d: &'b Draw<'a>,
@@ -404,7 +427,7 @@ impl Pen<'_, '_> {
 
     /// Pushes a bar line or note quad; `false` once the quads are spent or
     /// the batch is full.
-    fn counted(&mut self, part: &ImageRef, cut: &Cut) -> bool {
+    fn counted(&mut self, part: Shown, cut: &Cut) -> bool {
         if self.stopped {
             return false;
         }
@@ -421,7 +444,7 @@ impl Pen<'_, '_> {
     }
 
     /// A cap of height `h` centred at `y`, cut to the lanes.
-    fn cap(&mut self, part: &ImageRef, x: f32, w: f32, y: f32, h: f32) -> bool {
+    fn cap(&mut self, part: Shown, x: f32, w: f32, y: f32, h: f32) -> bool {
         match cut(x, w, y - h / 2.0, y + h / 2.0, self.top, self.bottom) {
             Some(c) => self.counted(part, &c),
             None => true,
@@ -430,9 +453,9 @@ impl Pen<'_, '_> {
 
     /// Pushes `part` over the cut rect, its uv cut alike, transformed;
     /// `false` when the batch refused it.
-    fn push(&mut self, part: &ImageRef, cut: &Cut) -> bool {
+    fn push(&mut self, part: Shown, cut: &Cut) -> bool {
         let d = self.d;
-        let Some(f) = part.frame(d.play, d.now, d.uvs) else {
+        let Some(f) = part.frame else {
             return true;
         };
         let [u0, v0, u1, v1] = f.uv;
@@ -494,7 +517,7 @@ impl Lanes {
             stopped: false,
         };
 
-        if let Some(bar) = &self.parts.bar {
+        if let Some(bar) = self.parts.bar.map(|p| d.shown(&p)) {
             let bars = &notes.bars;
             let start = bars.partition_point(|&p| p < from);
             for &p in bars.iter().skip(start).take_while(|&&p| p <= to) {
@@ -503,7 +526,7 @@ impl Lanes {
                 }
             }
         }
-        if let Some(part) = &self.parts.line {
+        if let Some(part) = self.parts.line.map(|p| d.shown(&p)) {
             let y = line - self.line_h / 2.0;
             pen.push(
                 part,
@@ -522,7 +545,7 @@ impl Lanes {
                 }
             }
         }
-        if let Some(part) = &self.parts.cover {
+        if let Some(part) = self.parts.cover.map(|p| d.shown(&p)) {
             let edge = f32_of(f64::from(self.top) + len * f64::from(cover) / 1_000.0);
             let len = f32_of(len);
             if let Some(c) = cut(sx, sw, edge - len, edge, top, bottom) {
@@ -530,7 +553,7 @@ impl Lanes {
             }
         }
         if lift > 0
-            && let Some(part) = &self.parts.lift
+            && let Some(part) = self.parts.lift.map(|p| d.shown(&p))
             && let Some(c) = cut(sx, sw, line, bottom, top, bottom)
         {
             pen.push(part, &c);
@@ -571,6 +594,9 @@ impl Lanes {
         ) else {
             return true;
         };
+        // Each part's frame once for the lane's pass.
+        let [note, head_part, tail_part, on, off, mine] =
+            [note, head_part, tail_part, on, off, mine].map(|p| d.shown(p));
         let held = d.play.hold_note(lane);
         // Positions never decrease along a lane (`Chart::validate`), so the
         // notes meeting [from, to] are one run.
