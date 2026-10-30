@@ -5,12 +5,17 @@
 //! recorded.
 //!
 //! What each control does is the caller's table ([`MenuBindings`]): a
-//! button press is one event, and an axis turned `step` units in one
-//! direction, taken the short way round its revolution, is one event for
-//! that direction; the count starts again when the direction changes.
-//! A packet received in the background, any packet while the menu is not
-//! [`active`](MenuTap::set_active), and a packet of any other device never
-//! reach the queue.
+//! button press is one event, and an axis sends one event for each whole
+//! `step` of movement in one direction, taken the short way round its
+//! revolution as play converts it (the revolution and whether it is
+//! relative as `device.toml` sets them, else as the device declares
+//! them); the remainder counts toward the next event, and the count starts
+//! again when the direction changes. A packet received in the background,
+//! any packet while the menu is not [`active`](MenuTap::set_active), and a
+//! packet of any other device never reach the queue. Turning the menu off,
+//! another device sending, or the device's removal forgets the movement
+//! counted and every axis's position, so the next report of an axis only
+//! says where it is.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -63,6 +68,23 @@ pub struct MenuBindings {
     pub controls: Vec<(ControlId, MenuAction)>,
     /// The movement of an axis that sends one event, at least 1.
     pub step: u32,
+    /// Whether the axes report movement rather than position, when set
+    /// (`device.toml`); else as each declares.
+    pub relative: Option<bool>,
+    /// The values in an absolute axis's revolution, 0 if it does not wrap,
+    /// when set (`device.toml`); else its declared range.
+    pub wrap: Option<u32>,
+}
+
+/// One bound control and what is counted for it.
+#[derive(Debug)]
+struct Bound {
+    control: ControlId,
+    action: MenuAction,
+    /// An axis's movement toward its next event.
+    travel: i64,
+    /// An absolute axis's last position; `None` until it reports.
+    last: Option<i32>,
 }
 
 /// The input thread's end: the bindings, each axis's movement so far, and
@@ -70,10 +92,10 @@ pub struct MenuBindings {
 #[derive(Debug)]
 pub struct MenuTap {
     product: HidProduct,
-    /// Each control, what it sends, and an axis's movement counted toward
-    /// its next event.
-    controls: Vec<(ControlId, MenuAction, i64)>,
+    controls: Vec<Bound>,
     step: i64,
+    relative: Option<bool>,
+    wrap: Option<u32>,
     /// The device whose movement is counted.
     counting: Option<DeviceId>,
     active: bool,
@@ -102,9 +124,16 @@ pub fn menu_queue(bindings: MenuBindings) -> (MenuTap, MenuReceiver) {
             controls: bindings
                 .controls
                 .into_iter()
-                .map(|(c, a)| (c, a, 0))
+                .map(|(control, action)| Bound {
+                    control,
+                    action,
+                    travel: 0,
+                    last: None,
+                })
                 .collect(),
             step: i64::from(bindings.step.max(1)),
+            relative: bindings.relative,
+            wrap: bindings.wrap,
             counting: None,
             active: false,
             sent: false,
@@ -123,7 +152,7 @@ impl MenuTap {
     /// while the thread is Idle and the window has focus. Turning it off
     /// forgets the movement counted.
     pub fn set_active(&mut self, active: bool) {
-        if !active {
+        if self.active && !active {
             self.reset();
         }
         self.active = active;
@@ -143,8 +172,17 @@ impl MenuTap {
 
     fn reset(&mut self) {
         self.counting = None;
-        for (_, _, travel) in &mut self.controls {
-            *travel = 0;
+        for b in &mut self.controls {
+            b.travel = 0;
+            b.last = None;
+        }
+    }
+
+    /// `device` was removed: what was counted for it is forgotten, so a
+    /// reconnection starts from nothing.
+    pub fn removed(&mut self, device: DeviceId) {
+        if self.counting == Some(device) {
+            self.reset();
         }
     }
 
@@ -154,11 +192,10 @@ impl MenuTap {
     }
 
     /// One packet of the configured controller's first unit, with the
-    /// axis's capability and its previous position (`None` for a button,
-    /// an axis not seen yet, or a relative axis). Sends what its binding
+    /// axis's capability (`None` for a button). Sends what its binding
     /// says, if the menu is active and the packet was received in the
     /// foreground.
-    pub fn offer(&mut self, packet: &Packet, axis: Option<(&AxisCap, Option<i32>)>) {
+    pub fn offer(&mut self, packet: &Packet, axis: Option<&AxisCap>) {
         if !self.active || packet.background {
             return;
         }
@@ -166,50 +203,58 @@ impl MenuTap {
             self.reset();
             self.counting = Some(packet.device);
         }
-        let step = self.step;
-        let Some((_, action, travel)) = self
+        let (step, relative, wrap) = (self.step, self.relative, self.wrap);
+        let Some(b) = self
             .controls
             .iter_mut()
-            .find(|(c, _, _)| *c == packet.control)
+            .find(|b| b.control == packet.control)
         else {
             return;
         };
-        let event = match (*action, axis) {
-            (MenuAction::Press(event), None) => (packet.value != 0).then_some(event),
-            (MenuAction::Turn { forward, backward }, Some((cap, prev))) => {
-                let moved = if cap.relative {
-                    i64::from(packet.value)
+        let (event, count) = match (b.action, axis) {
+            (MenuAction::Press(event), None) => (event, u64::from(packet.value != 0)),
+            (MenuAction::Turn { forward, backward }, Some(cap)) => {
+                let value = i64::from(packet.value);
+                let moved = if relative.unwrap_or(cap.relative) {
+                    value
                 } else {
-                    prev.map_or(0, |p| {
-                        wrapped(i64::from(packet.value) - i64::from(p), cap.wrap)
-                    })
+                    // As play converts it: the revolution set, else the
+                    // declared one, else none.
+                    let wrap = wrap.unwrap_or(if cap.relative { 0 } else { cap.wrap });
+                    let prev = b.last.replace(packet.value);
+                    prev.map_or(0, |p| wrapped(value - i64::from(p), wrap))
                 };
-                if moved.signum() * travel.signum() < 0 {
-                    *travel = 0;
+                if moved.signum() * b.travel.signum() < 0 {
+                    b.travel = 0;
                 }
-                *travel = travel.saturating_add(moved);
-                if travel.abs() >= step {
-                    let event = if *travel > 0 { forward } else { backward };
-                    *travel = 0;
-                    Some(event)
-                } else {
-                    None
-                }
+                b.travel = b.travel.saturating_add(moved);
+                // Every whole step sends; the remainder counts on.
+                let steps = b.travel / step;
+                b.travel -= steps * step;
+                let event = if steps > 0 { forward } else { backward };
+                (event, steps.unsigned_abs())
             }
             // A button bound as an axis or the other way round sends
             // nothing.
-            _ => None,
+            _ => return,
         };
-        if let Some(event) = event {
-            self.send(event);
-        }
+        self.send(event, count);
     }
 
-    fn send(&mut self, event: MenuEvent) {
-        if self.queue.push(event).is_ok() {
-            self.sent = true;
-        } else {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+    /// Sends `event` `count` times; those past the queue's room are
+    /// dropped and counted.
+    fn send(&mut self, event: MenuEvent, count: u64) {
+        let room = self.queue.slots() as u64;
+        let mut over = count.saturating_sub(room);
+        for _ in 0..count.min(room) {
+            if self.queue.push(event).is_ok() {
+                self.sent = true;
+            } else {
+                over += 1;
+            }
+        }
+        if over > 0 {
+            self.dropped.fetch_add(over, Ordering::Relaxed);
         }
     }
 }

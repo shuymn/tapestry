@@ -325,7 +325,7 @@ impl SourceSet {
 
     /// Offers `packet` to the menu: only while recording is closed, and
     /// only from the first connected controller of the menu's model, with
-    /// an axis's capability and its position before this packet.
+    /// an axis's capability.
     fn offer_menu(&mut self, packet: &Packet) {
         let Some(menu) = &mut self.menu else {
             return;
@@ -345,10 +345,8 @@ impl SourceSet {
         let axis = device
             .axes
             .iter()
-            .zip(&device.positions)
             .take(device.n_axes)
-            .find(|(a, _)| a.control == packet.control)
-            .map(|(a, &p)| (a, if a.relative { None } else { p }));
+            .find(|a| a.control == packet.control);
         menu.offer(packet, axis);
     }
 
@@ -620,6 +618,9 @@ impl SourceSet {
     /// at the batch time, publishes that time as its final watermark, and
     /// closes; once the gate has tripped, nothing is recorded or published.
     pub fn disconnect(&mut self, device: DeviceId) {
+        if let Some(menu) = &mut self.menu {
+            menu.removed(device);
+        }
         if let Some(i) = self.unread.iter().position(|&d| d == device) {
             self.unread.swap_remove(i);
             self.untracked = self.untracked.saturating_sub(1);

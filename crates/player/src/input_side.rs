@@ -1552,8 +1552,8 @@ mod menu_tests {
             sources.set_product(DeviceId(10), PAD);
             sources.add_axes(DeviceId(10), &caps);
             sources.end_batch(TimeUs(0));
-            let threshold = ScratchConfig::default().press_threshold;
-            let bindings = menu_bindings(&keys(), Some(PAD), threshold).unwrap();
+            let scratch = ScratchConfig::default();
+            let bindings = menu_bindings(&keys(), Some(PAD), &scratch).unwrap();
             let (tap, menu) = input::menu_queue(bindings);
             sources.set_menu(tap);
             let controls = Arc::new(Controls::new(QpcClock::start()));

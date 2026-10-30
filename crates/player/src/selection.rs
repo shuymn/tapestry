@@ -599,6 +599,8 @@ mod tests {
                 (ControlId(2), MenuAction::Press(MenuEvent::Down)),
             ],
             step: 2,
+            relative: None,
+            wrap: None,
         });
         sel.pad = Some(pad);
         let mut set = SourceSet::new(SourceConfig {

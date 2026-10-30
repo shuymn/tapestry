@@ -85,12 +85,13 @@ fn lane_menu(lane: u8, axis: bool, nth_scratch: usize) -> Option<MenuAction> {
 
 /// The controller's menu controls from its key config, or `None` when no
 /// controller is configured: each bound lane control as [`lane_menu`]
-/// says, of the configured controller, an axis stepping every
-/// `press_threshold` of movement.
+/// says, of the configured controller, an axis stepping every press
+/// threshold of `scratch`'s movement, measured in the revolution play
+/// converts it with (`scratch`'s mode and revolution when set).
 pub fn menu_bindings(
     config: &game::KeyConfig,
     device: Option<HidProduct>,
-    press_threshold: u32,
+    scratch: &game::ScratchConfig,
 ) -> Option<MenuBindings> {
     let product = device?;
     let mut scratch_buttons = 0;
@@ -110,7 +111,9 @@ pub fn menu_bindings(
     Some(MenuBindings {
         product,
         controls,
-        step: press_threshold,
+        step: scratch.press_threshold,
+        relative: scratch.relative,
+        wrap: scratch.wrap,
     })
 }
 
@@ -574,8 +577,18 @@ mod tests {
             retry: None,
             quit: None,
         };
-        let b = menu_bindings(&config, Some(product), 3).unwrap();
-        assert_eq!((b.product, b.step), (product, 3));
+        let scratch = game::ScratchConfig {
+            relative: Some(false),
+            wrap: Some(256),
+            press_threshold: 3,
+            ..game::ScratchConfig::default()
+        };
+        let b = menu_bindings(&config, Some(product), &scratch).unwrap();
+        assert_eq!(
+            (b.product, b.step, b.relative, b.wrap),
+            (product, 3, Some(false), Some(256))
+        );
+        let scratch = game::ScratchConfig::default();
         let press = |e| MenuAction::Press(e);
         let (c, k) = (MenuEvent::Confirm, MenuEvent::Back);
         let mut want: Vec<(ControlId, MenuAction)> = [c, k, c, k, c, k, c]
@@ -598,7 +611,7 @@ mod tests {
             retry: None,
             quit: None,
         };
-        let b = menu_bindings(&config, Some(product), 2).unwrap();
+        let b = menu_bindings(&config, Some(product), &scratch).unwrap();
         assert_eq!(
             b.controls,
             [
@@ -607,7 +620,7 @@ mod tests {
                 (ControlId(21), press(MenuEvent::Down)),
             ]
         );
-        assert_eq!(menu_bindings(&config, None, 2), None);
+        assert_eq!(menu_bindings(&config, None, &scratch), None);
         assert_eq!(event_key(MenuEvent::Confirm), MenuKey::Enter);
         assert_eq!(event_key(MenuEvent::Back), MenuKey::Escape);
         assert_eq!(event_key(MenuEvent::Up), MenuKey::Up);

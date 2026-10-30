@@ -986,7 +986,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let bindings = select::menu_bindings(
         &settings.device.controller,
         settings.device.controller_device.map(Into::into),
-        settings.device.scratch.press_threshold,
+        &settings.device.scratch,
     )
     .filter(|_| !autoplay);
     let pad = bindings.map(|b| {
