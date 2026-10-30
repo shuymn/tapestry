@@ -300,8 +300,9 @@ The evaluator is a discrete-event processing system that puts input events and n
 pub struct Evaluator<'a> { /* Judgment state. Does not own the chart itself; references it */ }
 
 impl<'a> Evaluator<'a> {
-    /// Input conversion starts from the start snapshot (held controls are pressed, with no press edge)
-    pub fn new(chart: &'a Chart, rule: &'a RulePreset, device: &'a DeviceProfile, start: &InputStart, input_capacity: usize) -> Result<Self, EvalError>;
+    /// Input conversion starts from the start snapshot (held controls are pressed, with no press edge);
+    /// a section restricts targets, input and the final deadline to it ("Section Evaluation")
+    pub fn new(chart: &'a Chart, rule: &'a RulePreset, device: &'a DeviceProfile, start: &InputStart, section: Option<&Section>, input_capacity: usize) -> Result<Self, EvalError>;
     /// Refuses (without change) an input beyond the fixed capacity, at or before the finalized watermark, or earlier than the last one
     pub fn push_input(&mut self, ev: PhysicalInputEvent) -> Result<(), PushError>;
     /// Finalizes events up to the watermark and appends judgment events to out
@@ -311,10 +312,10 @@ impl<'a> Evaluator<'a> {
 /// Batch evaluation used for results, replays, and IR: merges the recorded sources as live play does,
 /// pushes every input, and advances to the finalized watermark of an aborted play, or else to the end
 pub fn evaluate(chart: &Chart, input: &EvalInput, rule: &RulePreset) -> Result<Evaluation, EvalError>;
-// EvalInput: the recorded events, the device profile, the start snapshot, and the finalized watermark if aborted
+// EvalInput: the recorded events, the device profile, the start snapshot, the finalized watermark if aborted, and the section if any
 ```
 
-Section evaluation ("Section Evaluation") adds its conditions to `evaluate` when practice is built (stage 2); until then it evaluates whole plays only.
+Without a section, both evaluate the whole chart; with one, they follow "Section Evaluation".
 
 ### Event Order
 
@@ -453,7 +454,7 @@ The following three are not rules but policies for how play proceeds, and they a
 A play goes through countdown, play, evaluation complete, audio tail, save and result. Retry and quit work from any state.
 
 - **Lead-in**: chart time 0 is 1 s after recording opens, which starts the countdown (tuned by playing), so the first note cannot arrive before the player is ready. The play's setup (planning, the reservation and building the logic step, bounded by the chart and the reservation) runs at the countdown's start, before its first frame, and is measured ("Latency Figures"). A retry reuses the decoded audio and GPU resources and only resets the session.
-- **Completion**: the final deadline is the latest applicable deadline of the chart (misses of taps and LN heads, LN ends, mines). Evaluation is complete when the global watermark reaches it, not when QPC time does; with a positive input offset these differ. The evaluator then emits `SongEnd`, recording closes, and its finalized watermark is frozen, so the recording window and its capacity end at finalization.
+- **Completion**: the final deadline is the latest applicable deadline of the chart, or of the section's targets for section evaluation (misses of taps and LN heads, LN ends, mines). Evaluation is complete when the global watermark reaches it, not when QPC time does; with a positive input offset these differ. The evaluator then emits `SongEnd`, recording closes, and its finalized watermark is frozen, so the recording window and its capacity end at finalization.
 - **Abort**: retry, quit, focus loss, removal of the last participating device, suspend, input beyond the recording capacity, an audio output failure, a screen failure, an input thread that ends, and a failed survival gauge when the session policy ends the play there. A command, input-thread failure, focus loss, or audio or screen failure already seen in a step is handled before that step advances (an input-thread failure before focus loss, whose flag the input thread publishes), so a retry in the step that would emit `SongEnd` ends the play midway. An audio failure noticed after the advance, and a survival gauge the advance failed, are checked after it: if that advance completed the play, completion wins and the play stays complete. The play ends at the last watermark the evaluator had already finalized; staged and later events stay in the record while capacity remains but are not evaluated. The record stores that watermark with the end status "ended midway", and re-evaluation advances to it instead of to the end. A suspend while recording is open sets "incomplete" (reason "suspend"), because the clock jumped, whichever cause ends the play; an overflow sets it with the reason "overflow". The other causes do not set it themselves, and a flag already set by a queue overflow or the source limit stays. A play aborted before its first advance has no finalized watermark and saves no record.
 - **Input thread failure**: opening and closing recording wait for the input thread at most 2 s of awake time (a suspend during the wait does not count), far beyond the wake at which a live thread answers; quit is latched and taken after the wait. A thread that is gone, or does not answer, fails the link for good: no later request is sent, so a late reply is never read as another's. A failed open ends the run with that cause before any play. A failed close keeps what the play already took and loses what reached the queues after its last step, so the record is saved as usual, with no arrivals or closing flags, and marked "incomplete" (reason "input failed"); a completed play stays complete and loses its tail. An input thread that ends during play aborts it like any other cause, and one that ends after a close that succeeded cuts the tail only. In every case the run ends with the input cause at the next quit or retry, after the report and the end screen; on exit the input thread is told to stop but not joined, so one that is stuck cannot hold up the exit.
 - **Audio tail**: after `SongEnd` the play screen stays until the audio engine has no active voice and no BGM event left. This is session policy, not evaluation. Nothing is recorded; retry, quit, an input-thread failure, focus loss, removal of the last device, an audio failure or a screen failure cuts the tail short, and the record stays complete.
@@ -494,15 +495,19 @@ The format uses a custom schema, and version detection does not rely on the hash
 
 ### Section Evaluation
 
-Mid-chart starts, section repeat, and excerpts from full-play records are all handled by the same "section evaluation" rules. A section is `[start, end)` in chart time.
+Mid-chart starts, section repeat, and excerpts from full-play records are all handled by the same "section evaluation" rules. `EvalInput` and `Evaluator::new` take an optional `Section { start, end, lead_in, initial_gauges }`: a half-open range `[start, end)` in chart time, the lead-in length before it, and the initial gauge values. Without a section, the whole chart is evaluated and nothing below applies.
 
-- **Target notes**: Only notes whose time falls within the section are targeted. An LN that crosses the start or the end is excluded entirely.
-- **Input acceptance range**: Decided separately from the selection of target notes. Presses during the lead-in before the start are accepted only if they fall within the early judgment window of the first target note. After the end, too, the watermark is advanced and judgments are finalized up to the last judgment deadline of the target notes (late judgment window, miss deadline, LN release deadline).
-- **Evaluator state**: Judgment and gauge state are initialized at the section start. The initial gauge value (a fixed-point value) is set by the practice settings.
-- **Input conversion state**: The keys pressed at the start, pending debounce, and the accumulated scratch and hysteresis state are reconstructed from all physical input before the start: from the play's held-input snapshot and every event up to the start, not only the lead-in. A key held down across the start is treated as already pressed at the start and is not counted as a new press. Judgment and gauge state are reset separately, as above.
-- **Offsets**: The recorded changes are used as is, including the value at the start and any interpolation segment in progress.
+- **Target notes**: A tap or mine counts when `start ≤ t < end`; a long note counts when `start ≤ head` and its end is before `end`. A long note that crosses the start or the end is excluded entirely. For `[10 s, 20 s)`, a tap at 10 s counts and one at 20 s does not; a long note from 15 s to 19.999999 s counts, and those from 15 s to 20 s and from 9.9 s to 15 s do not.
+- **Input acceptance range**: Decided separately from the selection of target notes.
+  - Input before the lead-in start (`start − lead_in`) feeds input conversion only.
+  - During the lead-in, a press is judged only inside the early judgment window (BAD) of its lane's first unjudged target, that is, only when it judges a note. Any other lead-in press is ignored: no sound, no empty POOR.
+  - From the start on, input is judged as in a whole-chart play, up to the section's final deadline: the latest of the targets' miss deadlines, LN-end deadlines and mines, or the start when there are none. Evaluation completes there, and later input feeds input conversion only, so an excerpt of a full-play record ends where a practice round ends.
+- **Evaluator state**: Judgment and gauge state start fresh at the section. Each gauge starts at its initial value (a fixed-point value set by the practice settings): one per gauge of the preset, within the gauge's bounds, and above 0 for a survival gauge. `Evaluator::new` refuses any other section, as it does a range whose end is before its start or a negative lead-in.
+- **Gauge denominator**: The whole chart's judgeable-note count, not the section's, so a note moves the gauge as far as in a full play. With `#TOTAL` 160 over 1,000 notes, 100 PERFECT notes from 20 % end at 36 %.
+- **Input conversion state**: The keys pressed at the start, the accumulated scratch movement and hysteresis, and pending scratch releases are reconstructed from all physical input before the section: from the play's held-input snapshot and every earlier event, not only the lead-in. A key held down across the lead-in start or the start is treated as already pressed and is not counted as a new press.
+- **Offsets**: Each source's input offset from the device profile, as in a full play. Once automatic offset adjustment records changes, they are used as is, including the value at the start and any interpolation segment in progress.
 
-`evaluate` will accept these section conditions (section, lead-in length, initial gauge value, offset changes); without them, it evaluates the whole chart. The start snapshot and its conversion setup, which section evaluation reuses, exist already.
+An excerpt of a full-play record is therefore equivalent to a mid-chart start when these are equal at the lead-in start: the input conversion state (held controls, accumulated scratch movement and hysteresis, pending scratch releases), the lead-in and later input, the time mapping, and the offsets.
 
 ### Mid-Chart Start and Section Repeat
 
@@ -1144,15 +1149,15 @@ Verify the properties the evaluator must satisfy, not agreement with the results
 - Survival gauges never recover once they reach 0
 - Gauges stay within their bounds
 - The order of inputs at the same time does not depend on how the sources' events were recorded or staged
-- Given the same section, the same input conversion state at the start of the lead-in, the same lead-in input, the same time mapping, and the same offset changes, the evaluation of a section excerpted from a full input log matches the evaluation of a mid-chart start
+- Given the same section, the same input conversion state at the start of the lead-in, the same lead-in and later input, the same time mapping, and the same offsets, the evaluation of a section excerpted from a full input log matches the evaluation of a mid-chart start
 
-Whole-chart evaluation focuses on the fragile spots: inputs exactly on a judgment window boundary, the processing order of events at the same time, mashing, LN release and re-press, and inputs that arrive exactly at the watermark boundary.
+Whole-chart evaluation focuses on the fragile spots: inputs exactly on a judgment window boundary, the processing order of events at the same time, mashing, LN release and re-press, and inputs that arrive exactly at the watermark boundary. Section evaluation adds its own: long notes cut by a section edge, lead-in presses on either side of the first target's early edge, and controls held and scratch releases pending at the lead-in start.
 
 From the IR stage on, agreement between the native and WASM builds is verified end to end, not just for the evaluator. From the chart file's bytes and the input log, the resolved chart hash and the judgment event stream are computed on both the native build and the actually deployed Workers, and compared. The loader, evaluator, and preset versions are fixed, and overflow handling and the order of events at the same time follow explicit rules from stage 1. Agreement between incremental and batch evaluation is also verified with input logs that include offset changes and events at the same time.
 
 In addition, each preset has a few dozen small hand-written examples of "this input gives this judgment", to detect unintended changes when presets are tuned. Hand-written examples stay alongside the property tests, because live and batch evaluation share code and can share a bug.
 
-The properties above are property tests over generated charts, presets, input logs and delivery schedules, except the section excerpt, which comes with practice (stage 2). Live evaluation in them is a model of the logic thread's consumer ("Watermark") over bounded producer queues. A deterministic test checks that the generators still reach the fragile spots, including joint ones such as an input on a deadline at an intermediate watermark, which random generation alone rarely reaches. Seeds and failures are handled as in [setup.md "Property Tests"](setup.md#property-tests).
+The properties above are property tests over generated charts, presets, input logs, sections and delivery schedules. The section excerpt compares a full log with a log whose earlier input is replaced by a held-input snapshot that leaves the same conversion state at the lead-in start, with a shared prefix that leaves held controls, scratch movement and a pending scratch release there. Live evaluation in them is a model of the logic thread's consumer ("Watermark") over bounded producer queues. A deterministic test checks that the generators still reach the fragile spots, including joint ones such as an input on a deadline at an intermediate watermark, which random generation alone rarely reaches. Seeds and failures are handled as in [setup.md "Property Tests"](setup.md#property-tests).
 
 ### Verifying Without Launching the UI
 
