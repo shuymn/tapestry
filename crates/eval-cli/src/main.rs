@@ -5,7 +5,8 @@
 //! `eval-cli --chart <chart> [--preset <file.toml>]... <record.tprl>...`
 //!
 //! The chart and the preset files are checked first: a file that cannot
-//! be read, is too large, or does not load ends the run before any line.
+//! be read or is too large, an invalid preset, or a chart that loads under
+//! none of the records' seeds ends the run before any line.
 //! Each record is then decoded, refused if its input is incomplete, and
 //! verified against the chart with `replay::verify` (design.md
 //! "Determinism"). It is evaluated under each `--preset` in order, or under
@@ -29,6 +30,7 @@
 mod args;
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
@@ -102,12 +104,8 @@ fn run(args: &args::Args, out: &mut impl io::Write) -> Result<bool, String> {
     let chart_bytes =
         read_chart(&args.chart).map_err(|e| format!("{}: {e}", shown(&args.chart)))?;
     let chart_dir = chart_dir(&args.chart);
-    // Whether the chart loads does not depend on a record, except through
-    // the branches its `#RANDOM` draws: a chart that does not load with the
-    // default seed is refused for every record before any line. A record
-    // whose own seed draws branches that do not load is refused on its own.
-    bms_parser::load_bms(&chart_bytes, chart_dir, &LoadOptions::default())
-        .map_err(|e| format!("{}: {}", shown(&args.chart), chain(&e)))?;
+    check_chart_loads(args, &chart_bytes, chart_dir)
+        .map_err(|e| format!("{}: {e}", shown(&args.chart)))?;
     let write = |e: io::Error| format!("stdout: {e}");
     let mut all = true;
     for path in &args.records {
@@ -140,11 +138,62 @@ fn chart_dir(chart: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-/// The chart file's bytes. The loader refuses a file larger than its limit
-/// with its size, so it is read one byte past the limit at most, as the
-/// game reads it.
+/// The chart file's bytes, read one byte past the loader's limit at most,
+/// as the game reads it.
+///
+/// # Errors
+///
+/// The file cannot be read, or is larger than the limit.
 fn read_chart(path: &Path) -> Result<Vec<u8>, String> {
-    read_bounded(path, LoadOptions::default().limits.max_file_bytes)
+    let limit = LoadOptions::default().limits.max_file_bytes;
+    let bytes = read_bounded(path, limit)?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "the file is larger than {limit} bytes, the largest chart accepted"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Checks that the chart loads under the recorded seed of some record that
+/// decodes and is complete, or under the default seed when there is none.
+/// Whether a chart loads can depend on the branches its `#RANDOM` draws, so
+/// a chart refused under every seed the records draw cannot verify any of
+/// them, while a record whose own seed alone fails is refused on its own.
+///
+/// The records are decoded here one at a time, keeping only their seeds,
+/// and again when their lines are written, so one decoded record is held
+/// at a time.
+///
+/// # Errors
+///
+/// The load error under the first seed, when every seed fails.
+fn check_chart_loads(args: &args::Args, bytes: &[u8], dir: &Path) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    let mut seeds: Vec<u64> = args
+        .records
+        .iter()
+        .filter_map(|path| decoded(path).ok())
+        .map(|record| record.chart.random_seed)
+        .filter(|&seed| seen.insert(seed))
+        .collect();
+    if seeds.is_empty() {
+        seeds.push(LoadOptions::default().seed);
+    }
+    let mut first = None;
+    for seed in seeds {
+        let opts = LoadOptions {
+            seed,
+            ..LoadOptions::default()
+        };
+        match bms_parser::load_bms(bytes, dir, &opts) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    Err(first.map_or_else(String::new, |e| chain(&e)))
 }
 
 /// Reads, decodes and verifies the record at `path` against the chart,
@@ -152,15 +201,26 @@ fn read_chart(path: &Path) -> Result<Vec<u8>, String> {
 ///
 /// # Errors
 ///
-/// Why the record is refused: it cannot be read or decoded, its input is
-/// incomplete, or verification refuses it. Incompleteness is checked
-/// before verification, so an incomplete record is refused as incomplete
-/// whatever verification would say, without loading the chart.
+/// Why the record is refused: see [`decoded`], or verification refuses it.
 fn verified(
     path: &Path,
     chart_bytes: &[u8],
     chart_dir: &Path,
 ) -> Result<(PlayRecord, Chart), String> {
+    let record = decoded(path)?;
+    let chart = load_recorded_chart(&record, chart_bytes, chart_dir).map_err(|e| chain(&e))?;
+    Ok((record, chart))
+}
+
+/// Reads and decodes the record at `path`.
+///
+/// # Errors
+///
+/// Why the record is refused: it cannot be read or decoded, or its input is
+/// incomplete. Incompleteness is checked before verification, so an
+/// incomplete record is refused as incomplete whatever verification would
+/// say, without loading the chart.
+fn decoded(path: &Path) -> Result<PlayRecord, String> {
     let limits = DecodeLimits::STANDARD;
     // The limits the game saves records under. The file is untrusted, so
     // it is read one byte past the largest file they accept at most, as the
@@ -176,8 +236,7 @@ fn verified(
     if let Some(why) = incomplete(record.status.incomplete) {
         return Err(format!("the record's input is incomplete ({why})"));
     }
-    let chart = load_recorded_chart(&record, chart_bytes, chart_dir).map_err(|e| chain(&e))?;
-    Ok((record, chart))
+    Ok(record)
 }
 
 /// The record evaluated under `preset`, or else under its own preset copy,

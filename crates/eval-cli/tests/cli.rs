@@ -48,10 +48,17 @@ fn press(at: i64, value: i32) -> PhysicalInputEvent {
 /// whose keys 1-7 are bound to lanes 1-7, hitting taps at 2 s and 4 s on
 /// time. It completed at 4.180 s.
 fn played(chart: &str) -> PlayRecord {
+    played_with(chart, 0)
+}
+
+/// [`played`], with the chart loaded with `seed`.
+fn played_with(chart: &str, seed: u64) -> PlayRecord {
     let dir = tempfile::tempdir().unwrap();
-    let chart = load_bms(chart.as_bytes(), dir.path(), &LoadOptions::default())
-        .unwrap()
-        .chart;
+    let opts = LoadOptions {
+        seed,
+        ..LoadOptions::default()
+    };
+    let chart = load_bms(chart.as_bytes(), dir.path(), &opts).unwrap().chart;
     PlayRecord {
         versions: Versions {
             evaluator: rules::Implementation::STANDARD_VERSION,
@@ -60,7 +67,7 @@ fn played(chart: &str) -> PlayRecord {
         },
         chart: ChartRecord {
             identity: chart.identity,
-            random_seed: 0,
+            random_seed: seed,
             transform: PASSTHROUGH.record(),
         },
         preset: PresetRecord::of(&rules::custom()),
@@ -230,56 +237,100 @@ fn refuses_with_the_reason_and_exits_one() {
     );
 }
 
-/// A chart with `#RANDOM 2` whose branch `bad` holds a measure past the
-/// loader's limit, so it loads only when the other branch is drawn.
+/// A chart with `#RANDOM 2`: branch `bad` holds a measure past the loader's
+/// limit, so the chart loads only when the other branch, `CHART`'s two
+/// taps, is drawn.
 fn random_chart(bad: u32) -> String {
     let good = 3 - bad;
     format!(
-        "#BPM 120\n#WAV01 a.wav\n#RANDOM 2\n#IF {good}\n#00111:01\n#ENDIF\n\
+        "#BPM 120\n#WAV01 a.wav\n#RANDOM 2\n#IF {good}\n#00111:01\n#00211:01\n#ENDIF\n\
          #IF {bad}\n#100011:01\n#ENDIF\n#ENDRANDOM\n"
     )
 }
 
-#[test]
-fn a_chart_that_fails_only_under_the_recorded_seed_refuses_that_record() {
-    let loads = |text: &str, seed| {
-        let opts = LoadOptions {
-            seed,
-            ..LoadOptions::default()
-        };
-        load_bms(text.as_bytes(), Path::new("."), &opts).is_ok()
+fn loads(text: &str, seed: u64) -> bool {
+    let opts = LoadOptions {
+        seed,
+        ..LoadOptions::default()
     };
-    // Put the bad branch where the default seed does not go.
+    load_bms(text.as_bytes(), Path::new("."), &opts).is_ok()
+}
+
+/// The random chart whose bad branch the default seed draws, a seed that
+/// loads it, and one that does not.
+fn random_failing_at_default_seed() -> (String, u64, u64) {
     let text = [random_chart(1), random_chart(2)]
         .into_iter()
-        .find(|t| loads(t, 0))
+        .find(|t| !loads(t, 0))
         .unwrap();
-    let seed = (1..64).find(|&s| !loads(&text, s)).unwrap();
+    let good = (1..64).find(|&s| loads(&text, s)).unwrap();
+    let bad = (1..64).find(|&s| !loads(&text, s)).unwrap();
+    (text, good, bad)
+}
+
+#[test]
+fn a_random_chart_is_checked_under_the_recorded_seeds() {
+    let (text, good, bad) = random_failing_at_default_seed();
     let dir = folder();
     fs::write(dir.path().join("random.bms"), &text).unwrap();
-    let mut record = played(CHART);
-    record.chart.random_seed = seed;
-    save(dir.path(), "play.tprl", &record);
-    let o = run(
-        dir.path(),
-        &[
-            "--chart",
-            "random.bms",
-            "--preset",
-            "own.toml",
-            "--preset",
-            "wide.toml",
-            "play.tprl",
-        ],
-    );
-    assert_eq!(o.status.code(), Some(1), "{o:?}");
-    assert!(o.stderr.is_empty(), "{o:?}");
-    let reason = "refused: the chart cannot be loaded: line 8: measure 1000 is out of range";
+    save(dir.path(), "good.tprl", &played_with(&text, good));
+    let mut failing = played_with(&text, good);
+    failing.chart.random_seed = bad;
+    save(dir.path(), "bad.tprl", &failing);
+    let presets = ["--preset", "own.toml", "--preset", "wide.toml"];
+    let with = |records: &[&str]| {
+        let mut args = vec!["--chart", "random.bms"];
+        args.extend(presets);
+        args.extend(records);
+        run(dir.path(), &args)
+    };
+    // The chart fails under the default seed, but loads under the record's:
+    // the record is evaluated.
+    let o = with(&["good.tprl"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
     assert_eq!(
         stdout(&o),
         format!(
-            "play.tprl | preset own.toml | {reason}\nplay.tprl | preset wide.toml | {reason}\n"
+            "good.tprl | preset own.toml | as played | {CUSTOM_TOTALS}\n\
+             good.tprl | preset wide.toml | what-if, no input after 4.180 s | {CUSTOM_TOTALS}\n"
         )
+    );
+    // A record whose own seed fails, beside one whose seed loads, is
+    // refused on its own.
+    let o = with(&["bad.tprl", "good.tprl"]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let reason = "refused: the chart cannot be loaded: line 9: measure 1000 is out of range";
+    let out = stdout(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[..2],
+        [
+            format!("bad.tprl | preset own.toml | {reason}"),
+            format!("bad.tprl | preset wide.toml | {reason}"),
+        ],
+        "{out}"
+    );
+    assert_eq!(lines.len(), 4, "{out}");
+    // Under every recorded seed the chart fails: the run ends before any
+    // line, with the first seed's error. An undecodable record adds no seed.
+    fs::write(dir.path().join("junk.tprl"), b"not a record").unwrap();
+    let o = with(&["junk.tprl", "bad.tprl"]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(o.stdout.is_empty(), "{o:?}");
+    assert_eq!(
+        String::from_utf8(o.stderr).unwrap(),
+        "eval-cli: random.bms: line 9: measure 1000 is out of range\n"
+    );
+    // With no record that decodes, the default seed decides.
+    let o = with(&["junk.tprl"]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(o.stdout.is_empty(), "{o:?}");
+    let o = run(dir.path(), &["--chart", "chart.bms", "junk.tprl"]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(
+        stdout(&o).starts_with("junk.tprl | recorded preset | refused: "),
+        "{o:?}"
     );
 }
 
@@ -374,7 +425,10 @@ fn an_unusable_chart_or_preset_exits_one_before_any_line() {
         ),
         (
             &["--chart", "big.bms", "play.tprl"],
-            Some("eval-cli: big.bms: file of 16777217 bytes is too large"),
+            Some(
+                "eval-cli: big.bms: the file is larger than 16777216 bytes, the largest chart \
+                 accepted",
+            ),
         ),
         (
             &[
