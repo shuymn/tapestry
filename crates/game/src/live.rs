@@ -352,6 +352,7 @@ fn play_and_next<R: Rig>(
         overflow: logic.overflowed() || closing.overflowed,
         source_limit: closing.source_limited,
         suspend: suspended,
+        input_failed: false,
     };
     let view = logic.view();
     let record = logic.into_record();

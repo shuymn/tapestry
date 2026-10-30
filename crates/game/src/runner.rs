@@ -238,6 +238,7 @@ impl<'a, O: AudioOutput + Wakes> Runner<'a, O> {
             overflow: self.logic.overflowed() || self.sources.overflowed(),
             source_limit: self.sources.source_limited(),
             suspend: false,
+            input_failed: false,
         }
     }
 

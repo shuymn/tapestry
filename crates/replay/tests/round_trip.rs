@@ -192,7 +192,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
         (
             prop_oneof![Just(EndStatus::PlayedToEnd), Just(EndStatus::EndedMidway)],
             i64s(),
-            any::<[bool; 3]>(),
+            any::<[bool; 4]>(),
         ),
     )
         .prop_map(
@@ -202,7 +202,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
                 (opened_at, held),
                 events,
                 arrivals,
-                (end, finalized, [overflow, source_limit, suspend]),
+                (end, finalized, [overflow, source_limit, suspend, input_failed]),
             )| {
                 let n = u16::try_from(sources.len()).unwrap();
                 let source = |raw: u16| SourceId(raw % n);
@@ -252,6 +252,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
                             overflow,
                             source_limit,
                             suspend,
+                            input_failed,
                         },
                     },
                 }

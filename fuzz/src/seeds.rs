@@ -148,6 +148,7 @@ fn two_sources() -> PlayRecord {
                 overflow: true,
                 source_limit: false,
                 suspend: true,
+                input_failed: false,
             },
         },
     }
