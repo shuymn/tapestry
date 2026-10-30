@@ -964,7 +964,18 @@ Results and replays display and record where the values used came from ("preset 
 
 ## IR (Rankings)
 
-The custom IR receives input logs (replays), not scores. The server recomputes with the same evaluator and builds the rankings.
+tapestry's own IR, **Weft**, receives input logs (replays), not scores. The server recomputes with the same evaluator and builds the rankings.
+
+**Purpose.** Weft is not where scores are sent to be compared with others. Generic score and clear rankings, rivals, courses and difficulty-table competition already exist in other IRs, and the player reaches them through connectors ("Connecting to Existing IRs"). The custom IR does what only tapestry's input logs make possible, and keeps what an IR needs to keep, so rankings can start if the other IRs withdraw. LR2IR's data survived its closure only through a third party's archive.
+
+- **What only tapestry's data makes possible:**
+  - **Statistics:** population statistics per chart and preset.
+  - **Cross-preset comparison:** how the same input judges under each preset.
+  - **Rankings:** rankings by metrics other IRs cannot compute, such as timing accuracy and long-note release accuracy.
+  - **Cohort comparison:** comparison with players of similar skill.
+  - **Recommendations:** recommendations drawn from all of these.
+- **Placement between the player and the IR.** What can be computed from the player's own records stays in the player, as result extensions: personal timing analysis, weak sections and practice ranges, offsets, progress, and the player's position against population data the IR provides. The IR holds only what needs other players' data.
+- **Placement between IRs.** What another IR already does is left to it. Rankings by score and clear are not offered while other IRs offer them. If they withdraw, such a ranking is added as one more ranking definition over the input logs already stored.
 
 ```
 Client ─send→ { start token, chart hash, chart transformations, device settings, input log, versions }
@@ -978,7 +989,8 @@ Server ─store→ store the input log as the source of truth
 - Whichever preset you play with, you appear in the rankings for all presets. There is no need to settle on a single official preset.
 - New presets can be applied retroactively to stored plays.
 - When an evaluator bug is fixed, all logs can be recomputed to reflect the fix.
-- Metrics other than score can also be ranked: besides per-preset EX score, BP, and clears per gauge type, timing accuracy (the mean and standard deviation of deviation) and so on. Metrics are added to the server over time as pure functions that take the judgment event stream.
+- Metrics other than score can be ranked, such as timing accuracy (the mean and standard deviation of deviation). Per-preset EX score, BP and clears per gauge type are computed too, but are ranked only if the other IRs withdraw ("Purpose"). Metrics are added to the server over time as pure folds over the judgment event stream.
+- Because the input logs are kept, rankings that start later are recomputed from the stored plays, not collected from scratch. They cover the plays whose consent, eligibility, format version and evaluation chart still allow it. Recomputation establishes that a result follows from its input, not that a human played it.
 
 ### Decisions to Make
 
@@ -986,7 +998,6 @@ Server ─store→ store the input log as the source of truth
 - **Distinguishing the preset actually played**: Either mark the records actually played with that preset, or separate the rankings.
 - **Offsets**: Accepted as legitimate adjustment, with an upper limit on the range decided and recorded.
 - **Records under different conditions**: Normal rankings include only records that played the whole chart at normal speed to the end and meet the permitted conditions. Speed changes, assist options, records ended midway, mid-chart starts, section repeats, and excerpted section evaluations are not included in the normal rankings.
-- **Chart retrieval**: A retrieval path for chart files (identified by hash) is provided so the server can resolve the same chart. The distribution registry (the "Chart Distribution" section) doubles as that path.
 
 ### Server Architecture (Cloudflare)
 
@@ -995,14 +1006,28 @@ Server ─store→ store the input log as the source of truth
 | API | Workers (TypeScript) |
 | Evaluator | A WASM module built from the Rust `eval` crate for `wasm32-unknown-unknown`. Called from the API Worker |
 | Running evaluation | A Queues consumer Worker. The API stores the input log in R2 and enqueues only a reference to it. The consumer evaluates it and writes to D1 |
-| Input logs and chart files | R2 |
+| Input logs and evaluation charts | R2 |
 | Results and rankings | D1 |
 
 - The evaluator uses no threads, clock, or I/O and computes only with integers, so it runs on WASM as is. The WASM build of the `eval` crate is kept passing in CI at all times.
 - The same input log is evaluated with both the local native build and the WASM build, and CI verifies that the results match.
-- Evaluation is not done inside an HTTP request. The CPU time and memory of the whole processing of one item (expanding the input log, loading and resolving the chart, passing data between JS and WASM, evaluation, writing the result) are measured and kept within a budget well below the Workers limits. The sizes of input logs, chart files, and the WASM module are also capped.
+- Evaluation is not done inside an HTTP request. The CPU time and memory of the whole processing of one item (expanding the input log, decoding the evaluation chart, passing data between JS and WASM, evaluation, writing the result) are measured and kept within a budget well below the Workers limits. The sizes of input logs, evaluation charts, and the WASM module are also capped.
 - Writes to D1 give the same result however many times they run. The number of retries is capped, and failed jobs are recorded separately. A cap on overall intake and a rate cap for recomputing past records are also set. This is because Queues smooth the load but do not limit the total.
-- The server needs the chart's contents to evaluate. It receives the chart text file (not including audio or images), and stores it privately only if the SHA-256 computed on the server matches the allowlist and the author has permitted storage for evaluation in the distribution registry. Charts without permission are not evaluated on the server and are not eligible for rankings. The server does not resolve the audio or image paths that charts reference.
+- **The server evaluates from evaluation charts, never from chart text.** The player's loader derives an **evaluation chart** from the resolved chart ("Chart Model"): what judgment needs and what a later view of the play would draw.
+  - It contains the per-lane notes with their times in µs and display positions, long-note ends, mine damage, each note's sound as an opaque id (the evaluator's `PlaySound` events name it), bar lines, the scroll map, the judgment-header declarations in their canonical form and the LN mode. It is taken before the chart transform, which the server applies.
+  - It drops the sound names, the `#WAV` table, BGM events, BGA and metadata text. The server resolves no audio or image paths, since there are none to resolve.
+  - There is one per chart SHA-256, loader version, encoding version and `#RANDOM` results, in a canonical encoding, stored by its own hash. A server evaluation records the hash of the evaluation chart it used. Its loader version is the one the player's loader recorded, so a loader fix reaches the server only through evaluation charts that updated players derive and upload again.
+  - Evaluating a record with its evaluation chart gives the same judgment event stream as evaluating it with the loaded chart. A property test over generated charts, with key sounds, checks this.
+- **Checking an evaluation chart:** the server cannot compare it with the file's SHA-256, so independent uploads stand in for that check.
+  - An upload counts only once the server has decoded it, checked the model's invariants (notes ordered, long-note ends after their heads, the scroll map's arithmetic within bounds) and found it canonical: re-encoding gives the same bytes.
+  - A chart is **confirmed** once a configured number of accounts have uploaded byte-identical evaluation charts for it. The loader is deterministic, so honest players always agree. Plays are evaluated as soon as one is stored. Until it is confirmed, they are not on boards and not in statistics. A statistic's cell is per evaluation chart, every contributor's record arrives with its evaluation chart, and the minimum number of contributors is at least the confirmation count. So a cell that could be released is already confirmed, unless it is quarantined.
+  - Two different valid evaluation charts for one key are a conflict: a forgery or a client bug. The key is **quarantined** and its plays leave boards and statistics until an operator resolves it. There is no vote, so one valid conflicting upload is enough to hold a chart back; the account that made it is recorded.
+  - When a chart's `#RANDOM` structure has few combinations, the player derives and uploads all of them, so rare branches are confirmed with the common one.
+  - Several accounts under one person's control that upload first can still confirm a forgery. This is the same limit as for boards in general.
+  - **Loader fixes:** a generation names the loader version of its evaluation charts. A record made under an older loader is evaluated there with the chart of the same SHA-256 under that version, with `#RANDOM` results recomputed from that version's skeleton and the record's seed. The record itself is not rewritten. Coverage stays bounded by the recorded input: when the newer chart puts a deadline past the record's finalized watermark, that span is marked uncovered, not judged, and the evaluation is not counted as played as recorded. A test covers a loader change that moves the last deadline.
+  - **`#RANDOM` skeleton:** with its evaluation charts, the player uploads the chart's `#RANDOM` skeleton: the control lines (`#RANDOM`, `#SETRANDOM`, `#IF`, `#ELSE`, `#ENDIF`, `#ENDRANDOM` and their operands) in file order, with no notes. The draws depend on nothing else, so the server recomputes the `#RANDOM` results from the skeleton and the grant's seed and compares them with the record's. A skeleton is confirmed and quarantined per chart SHA-256 and skeleton version like an evaluation chart, and a record is verified only against a confirmed one.
+  - A signature from the player could not stand in for these checks: its key ships in the player. A signature from someone who holds the chart text, such as the distribution registry ("Chart Distribution"), can confirm a registered chart's evaluation charts and skeleton without waiting for agreement.
+- **What the author can opt out of:** evaluation charts are stored privately and never shown or distributed. The author's standing opt-out covers showing a chart on the server, such as a web view of a replay. The server does not have that view yet, but it is designed so the view can be added later. A takedown request for a chart's evaluation charts goes through the takedown channel ("Anti-Piracy Measures"). The evaluation charts are then deleted, the chart's plays are no longer evaluated, and the chart leaves the rankings and statistics.
 
 ### Connecting to Existing IRs
 
@@ -1023,7 +1048,7 @@ Built in a later roadmap stage, as an extension at the saving extension point. T
 
 | Attack vector | Threat | Mitigation | Stage |
 | --- | --- | --- | --- |
-| Chart files | Computation breakdown or DoS from a huge note count, extreme BPM or STOP, deeply nested `#RANDOM` | Cap the note count, line count, and time range (`#RANDOM` blocks cost O(1) a line whatever their depth). Time computation is exact with arbitrary-precision integers, caps their size, and rejects loading when exceeded. The same caps are applied on the server | 1 |
+| Chart files | Computation breakdown or DoS from a huge note count, extreme BPM or STOP, deeply nested `#RANDOM` | Cap the note count, line count, and time range (`#RANDOM` blocks cost O(1) a line whatever their depth). Time computation is exact with arbitrary-precision integers, caps their size, and rejects loading when exceeded. The server decodes evaluation charts under the same object and time bounds | 1 |
 | Audio and video | Decoder vulnerabilities | Use maintained decoders and narrow the supported codecs. Accept the remaining risk and keep dependencies up to date. Decoding in a separate process with restricted privileges is decided after measuring whether it is worth the handoff cost | 1 |
 | Archives | zip slip, zip bomb | Do not allow writes outside the extraction directory. Cap the extracted size and file count | 1 |
 | Dependencies | Supply chain attacks | Run `cargo-deny` and `cargo-audit` in CI and on a daily schedule, check for unused dependencies with `cargo-machete`, and pin the lockfile | 1 |
@@ -1048,6 +1073,16 @@ Known limitation: loading caps bound the raw sound file bytes in flight and the 
 ### Privacy
 
 - Replays are private by default, and the player can choose to publish them.
+- **Consent is given per purpose, and each consent is separate:**
+  1. Uploading input logs for evaluation and statistics on the server. The player is told that raw input and device data reach the server.
+  2. Keeping them for rankings that may start if other IRs withdraw. This includes whether they stay after the player leaves the statistics.
+  3. Publication: of each replay, and of the player's results in a ranking.
+
+  Neither private-use consent publishes anything.
+- **Statistics:**
+  - A statistic is released only for groups above a minimum number of contributors.
+  - That is suppression, not anonymity. Contributions themselves stay private.
+  - Each consent is withdrawn on its own. Withdrawing the first removes the player's data from the statistics when they are next aggregated; withdrawing publication removes the player's board entries and stops replay retrieval at once, and cached board pages follow within their short lifetime. When no purpose that keeps records remains, the records are deleted, as on account deletion.
 - Account deletion and data export are supported.
 - For the Discord integration, the information sent externally (song title, whether playing) is shown on the settings screen, and it is disabled by default. The OBS integration stays entirely within the local PC.
 
@@ -1065,7 +1100,7 @@ Neither can be prevented completely. Cheating is handled by stacking layers that
 | Layer | Mechanism | What it prevents |
 | --- | --- | --- |
 | Server-side computation | Scores are not accepted; they are computed from the input log | Rewriting just the score numbers, mismatches between the recorded options and the computation. Fabrication of the input log itself cannot be prevented |
-| Start registration | A one-time token and a random seed are issued at start. Only submissions within a time consistent with the chart's length are accepted | Clients specifying a seed of their choice to aim for a particular arrangement, reuse of old logs. Feeding automated input live cannot be prevented |
+| Start registration | A one-time token and a random seed are issued at start. Only submissions within a time consistent with the chart's length are accepted | Clients specifying a seed of their choice to aim for a particular lane arrangement, reuse of old logs. The `#RANDOM` results are recomputed from a confirmed skeleton ("Server Architecture"). Feeding automated input live cannot be prevented |
 | Impossible input | Input inconsistent with the device's specifications (mashing faster than the polling interval, debounce violations, etc.). HID puts multiple buttons in one report, so matching times of simultaneous presses alone is not used as the basis for a decision | Clues to crude automated input |
 | Statistics | Whether the deviation distribution looks human (how it grows with density and chords, fatigue late in the song, comparison with the player's own history) | Narrowing down what to investigate (no action is taken on this alone) |
 | Human review | Anyone can play published replays in the client. Top records become "verified" by publishing the replay or submitting a video | Sophisticated cheating |
@@ -1259,7 +1294,7 @@ Verify the properties the evaluator must satisfy, not agreement with the results
 
 Whole-chart evaluation focuses on the fragile spots: inputs exactly on a judgment window boundary, the processing order of events at the same time, mashing, LN release and re-press, and inputs that arrive exactly at the watermark boundary. Section evaluation adds its own: long notes cut by a section edge, lead-in presses on either side of the first target's early edge, and controls held and scratch releases pending at the lead-in start. Presets add theirs: inputs at a late edge and 1 µs after it, with the watermark stopping at either, and every supported policy combination ("Policies, Combinations and Versions").
 
-From the IR stage on, agreement between the native and WASM builds is verified end to end, not just for the evaluator. From the chart file's bytes and the input log, the resolved chart hash and the judgment event stream are computed on both the native build and the actually deployed Workers, and compared. The loader, evaluator, and preset versions are fixed, and overflow handling and the order of events at the same time follow explicit rules from stage 1. Agreement between incremental and batch evaluation is also verified with input logs that include offset changes and events at the same time.
+From the IR stage on, agreement between the native and WASM builds is verified end to end, not just for the evaluator. From the same evaluation chart bytes and input log, the judgment event stream is computed on both the native build and the actually deployed Workers, and compared. Separately, on the client, evaluating with the evaluation chart derived from a chart file is compared with evaluating with the loaded chart. Local replay verification keeps the resolved-chart hash. The loader, evaluator, and preset versions are fixed, and overflow handling and the order of events at the same time follow explicit rules from stage 1. Agreement between incremental and batch evaluation is also verified with input logs that include offset changes and events at the same time.
 
 In addition, each preset has a few dozen small hand-written examples of "this input gives this judgment", to detect unintended changes when presets are tuned. Hand-written examples stay alongside the property tests, because live and batch evaluation share code and can share a bug.
 
@@ -1322,7 +1357,7 @@ Feel, local dedicated controllers, running alongside OBS (once that variation is
 | 1 | The minimal setup for playing one song: chart loading, input, audio, a simple play screen, an evaluator with one custom preset, saving the input log. Also includes key config, volume, offset, hi-speed, and instant retry. The testing mechanisms (swappable clock and I/O, processing that can advance without threads) are also put in here | One chart on hand can be played to the end without feeling latency or stutter. Key sound and frame latency can be measured and displayed |
 | 2 | One full gameplay loop: song selection, results, retry, practice (section repeat and speed change), beatoraja-style and LR2-style presets with switching on the result screen, `eval-cli`, and development features such as scenario launch. | Song selection through play, results, and retry can be played repeatedly. The property tests pass |
 | 3 | Look and effects: the declarative custom skin format and polished effects. The LR2 and beatoraja skin adapters come after this, as variations ("Extension Boundaries") | Playing with the standard skin is fun |
-| 4 | Custom IR (server-side computation, start registration, impossible-input detection, allowlist) | Input logs can be sent, and rankings for multiple presets can be viewed |
+| 4 | Weft, the custom IR (server-side computation, start registration, impossible-input detection, allowlist), for what only tapestry's input logs make possible ("IR (Rankings)") | Input logs can be sent, and statistics and rankings by tapestry-only metrics can be viewed for multiple presets |
 | 5 | Chart registry (catalog only) and installer | Difficulty tables can be installed in one go, and derivative chart dependencies can be resolved |
 | 6 | Connecting to existing IRs | Scores computed with the specified preset can be sent in the existing format |
 
@@ -1342,7 +1377,8 @@ After stage 3, variations (other chart formats, input adapters, skin adapters, s
 - How far LR2 skin support should go
 - In chart distribution, how to record authors' distribution terms and how to obtain consent for hosting (requires consultation with event organizers and difficulty table maintainers)
 - The criteria for inclusion in the allowlist, and the takedown request procedure (including legal judgment)
-- How to obtain authors' permission for "storage for evaluation", and the form of that record (to be decided before starting IR)
+- How an author's opt-out of showing a chart on the server, and a takedown of its evaluation charts, are received and recorded (to be decided before starting IR)
+- How many accounts confirm an evaluation chart, and what counts as independent
 - How the game keeps a discrete GPU out of low performance states under the driver's default settings ("GPU Power State")
 - How to watch frame pacing under VRR, where counting in whole refreshes does not apply ("Frame Pacing in Refreshes")
 
