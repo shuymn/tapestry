@@ -272,6 +272,13 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/expr/arith.rs"),
     Site::File("crates/skin-model/src/expr/program.rs"),
     Site::File("crates/skin-model/src/quad.rs"),
+    // A skin's per-frame build: the reducer, the timers and the tracks.
+    Site::File("crates/skin-model/src/skin.rs"),
+    Site::File("crates/skin-model/src/track.rs"),
+    Site::File("crates/skin-model/src/play/mod.rs"),
+    Site::File("crates/skin-model/src/play/reducer.rs"),
+    Site::File("crates/skin-model/src/play/schema.rs"),
+    Site::File("crates/skin-model/src/play/timers.rs"),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
