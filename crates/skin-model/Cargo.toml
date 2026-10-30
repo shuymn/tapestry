@@ -18,9 +18,14 @@ thiserror.workspace = true
 [dev-dependencies]
 # The lanes tests load charts as a session does.
 bms-parser.workspace = true
+criterion.workspace = true
 png.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "build"
+harness = false

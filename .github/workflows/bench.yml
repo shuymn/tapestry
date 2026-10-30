@@ -2,10 +2,10 @@ name: Bench
 
 # The CPU benchmarks on the merge base and on the head, each crate group in
 # one job on one runner, with criterion's change estimates printed at the end
-# (docs/setup.md "Benchmarks"). `compare` runs `eval`, `bms-parser` and
-# `library` on Linux, `compare-render` runs `render` on Windows. Neither is a required
-# check and neither fails the run: shared runners are noisy, so a reviewer
-# reads the numbers.
+# (docs/setup.md "Benchmarks"). `compare` runs `eval`, `bms-parser`, `library`
+# and `skin-model` on Linux, `compare-render` runs `render` on Windows.
+# Neither is a required check and neither fails the run: shared runners are
+# noisy, so a reviewer reads the numbers.
 
 on:
   pull_request:
@@ -71,6 +71,10 @@ jobs:
           if [ -f "$RUNNER_TEMP/base/crates/library/benches/scan.rs" ]; then
             benches+=(-p library --bench scan)
           fi
+          # A merge base from before the skin-model benchmark runs without it.
+          if [ -f "$RUNNER_TEMP/base/crates/skin-model/benches/build.rs" ]; then
+            benches+=(-p skin-model --bench build)
+          fi
           if mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" "${benches[@]}" -- --save-baseline base; then
             echo "saved=true" >> "$GITHUB_OUTPUT"
           else
@@ -85,7 +89,7 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          mise exec -- cargo bench --no-fail-fast -p eval -p bms-parser -p library --bench evaluate --bench load --bench scan -- --baseline-lenient base 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
+          mise exec -- cargo bench --no-fail-fast -p eval -p bms-parser -p library -p skin-model --bench evaluate --bench load --bench scan --bench build -- --baseline-lenient base 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
           {
             echo '### Benchmarks: head against merge base'
             echo 'Shared runners fluctuate; read a change as real only when it is large and repeats.'
