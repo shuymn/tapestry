@@ -72,7 +72,7 @@ pub fn custom() -> RulePreset {
     RulePreset {
         id: "custom".to_owned(),
         version: 3,
-        implementation: Implementation::Standard { version: 2 },
+        implementation: Implementation::Standard { version: 3 },
         // One table for every lane: the scratch states the keys' table.
         tables: PerLaneClass::both(LaneTable {
             windows: JudgeWindows {
@@ -193,7 +193,7 @@ mod tests {
         let expected = RulePreset {
             id: "custom".to_owned(),
             version: 3,
-            implementation: Implementation::Standard { version: 2 },
+            implementation: Implementation::Standard { version: 3 },
             tables: PerLaneClass {
                 keys: table,
                 scratch: table,
