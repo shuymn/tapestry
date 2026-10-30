@@ -1,22 +1,24 @@
-//! Hand-written examples of the LR2-style rules, each naming the public
-//! source it follows. `rules::lr2_style()` does not exist yet (stage 2,
-//! PR8): until it does, the examples run under [`preset`], a preset built
-//! here: beatoraja-style with the values and policies of LR2oraja Endless
-//! Dream (<https://github.com/seraxis/lr2oraja-endlessdream> at `d4995153`,
-//! under `core/src/bms/player/beatoraja/`, cited as `file:line`) that the
-//! examples read. Its other rules, LN-end edges, empty POOR ranges and the
-//! window policy among them, are beatoraja-style's stand-ins and not under
-//! test; `#RANK 3` is 100 % under both.
+//! Hand-written examples of the LR2-style preset (`rules::lr2_style()`),
+//! each naming the public source it follows: LR2oraja Endless Dream
+//! (<https://github.com/seraxis/lr2oraja-endlessdream> at `d4995153`, under
+//! `core/src/bms/player/beatoraja/`, cited as `file:line`). The preset's
+//! module (crates/rules/src/lr2_style.rs) lists every value with its source
+//! and the known differences.
 //!
 //! | Value | Source |
 //! | --- | --- |
 //! | Note windows at 100 %: PERFECT ±21, GREAT ±60, GOOD ±120, BAD ±200 ms, keys and scratch alike | `play/JudgeProperty.java:54-55` |
-//! | Note assignment: combo priority ([`Assignment::ComboPriority`]), beatoraja's default kept | the candidate loop `play/JudgeManager.java:414-455` |
+//! | LN-end edges PERFECT, GREAT and GOOD all 120 ms, keys and scratch alike; earlier is BAD | `play/JudgeProperty.java:56`, `:58`; `play/JudgeManager.java:580-594` |
+//! | `#RANK` 0-4: 25, 50, 75, 100, 75 %; none: 75 %; `#DEFEXRANK n`: `n × 75 / 100` % | `play/JudgeProperty.java:169`, `play/BMSPlayerRule.java:62-65` |
+//! | PERFECT, GREAT and GOOD interpolated below 100 %, linear from it, then clamped to the next wider; BAD not scaled | `play/JudgeProperty.java:185-249` |
+//! | Empty POOR: a note 0 to 1000 ms after the press, judged or not, none behind it; not scaled | `play/JudgeProperty.java:54-55`, `play/JudgeManager.java:414-442` |
+//! | Empty POOR keeps the combo without adding to it, adds to BP, has its own count | `play/JudgeProperty.java:60`, `play/JudgeManager.java:716-725` |
+//! | Note assignment: combo priority ([`Assignment::ComboPriority`]) | `PlayConfig.java:103`, the candidate loop `play/JudgeManager.java:414-455` |
 //! | A late BAD LN head cannot be the primary ([`HeadEligibility::NotLateBad`]) | `play/JudgeManager.java:435-437` |
 //! | Gauges `{min, max, start, clear, death}` and changes `{PG, GR, GD, BD, PR, MS}` | `play/GaugeProperty.java:117-122`, field order `:161` |
-//! | ASSIST EASY, EASY and NORMAL increases × `TOTAL / notes` | `play/GrooveGauge.java:263` (`TOTAL` modifier), `:117-119` |
+//! | ASSIST EASY, EASY and NORMAL increases × `TOTAL / notes` | `play/GrooveGauge.java:263` (`TOTAL` modifier), `play/GaugeProperty.java:117-119` |
 //! | HARD and EX HARD damage × `max(fix1, fix2)` ([`TotalCorrection::ScaleDamage`]), MS included | `play/GrooveGauge.java:279-309` (`MODIFY_DAMAGE`), `play/GaugeProperty.java:120-121`; once per chart, `play/GrooveGauge.java:207-211` |
-//! | HARD damage × 0.6 below 32 % | `play/GaugeProperty.java:120`, `play/GrooveGauge.java:232-240` |
+//! | HARD damage × 0.6 below 32 % | `play/GaugeProperty.java:120`, `play/GrooveGauge.java:232-243` |
 //! | A survival gauge a change leaves strictly below 2 % drops to 0, a mine's change included | `play/GrooveGauge.java:218-225`, `play/GaugeProperty.java:120-122` (death 2); a mine changes the gauge by `setValue`, `play/GrooveGauge.java:63-66`, `play/JudgeManager.java:266-269` |
 //! | `#TOTAL` absent ([`DefaultTotal::NotesLinear`]): `160 + (N + clamp(N − 400, 0, 200)) × 0.16` over the whole chart's notes | `play/BMSPlayerRule.java:73-79`, `:88-89` |
 //!
@@ -26,33 +28,21 @@
 //! computes in `f32` (a known difference every target shares, design.md
 //! "What a -style Preset Reproduces").
 //!
-//! # Known differences
-//!
-//! - **An ineligible head drops the earlier candidate there.** Endless
-//!   Dream makes a late BAD LN head ineligible by giving it judge 6
-//!   (`play/JudgeManager.java:435-437`), which reuses beatoraja's existing
-//!   "no judgment here" branch, and that branch also resets the candidate
-//!   the scan had already taken (`:445-452`). The rule only says a late BAD
-//!   head cannot be taken, and LR2 judges the oldest note, so here the
-//!   earlier candidate stays the primary. With a tap at 0 ms and a long
-//!   note from 30 ms on one lane, a press at 190 ms is BAD on the tap here
-//!   and the head is missed at 230 ms; there the press judges nothing, the
-//!   tap is missed at 200 ms and the head at 230 ms
-//!   (`late_bad_ln_head_is_not_selectable`).
+//! [`Assignment::ComboPriority`]: rules::Assignment::ComboPriority
+//! [`HeadEligibility::NotLateBad`]: rules::HeadEligibility::NotLateBad
+//! [`TotalCorrection::ScaleDamage`]: rules::TotalCorrection::ScaleDamage
+//! [`DefaultTotal::NotesLinear`]: rules::DefaultTotal::NotesLinear
 
 mod common;
 
-use bms_model::{Chart, ChartBuilder, TimeUs};
+use bms_model::{Chart, ChartBuilder, JudgmentHeader, Lane, TimeUs};
 use common::{MS, device, empty_poors, lane, press, release};
 use eval::{
     EvalError, EvalInput, Evaluation, Evaluator, InputStart, JudgeEventKind, PhysicalInputEvent,
     Section, evaluate,
 };
-use rules::Judgment::{Bad, Perfect, Poor};
-use rules::{
-    Assignment, DefaultTotal, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeadEligibility,
-    JudgeWindows, Judgment, LowDamage, PerJudgment, RulePreset, TotalCorrection, Window,
-};
+use rules::Judgment::{Bad, Good, Great, Perfect, Poor};
+use rules::{Assignment, GaugeValue, HeadEligibility, Judgment, RulePreset};
 
 const BPM: i64 = 150_000;
 /// One percent of a gauge.
@@ -72,122 +62,8 @@ const HARD: usize = 3;
 const EX_HARD: usize = 4;
 const HAZARD: usize = 5;
 
-/// A change in hundredths of a percent, fixed or a `TOTAL / notes` share in
-/// tenths.
-fn centi(n: i64) -> GaugeDelta {
-    GaugeDelta::Fixed(GaugeValue::centi_percent(n))
-}
-
-fn share(tenths: u32) -> GaugeDelta {
-    GaugeDelta::TotalShare {
-        num: tenths,
-        den: 10,
-    }
-}
-
-/// A gauge decided at the end: start 20 %, min 2 %, the `TOTAL` modifier on
-/// its increases (`play/GaugeProperty.java:117-119`).
-fn end_gauge(id: &str, clear: i64, up: [u32; 2], damage: [i64; 3]) -> GaugeRule {
-    let [bad, poor, empty] = damage.map(|d| centi(-d));
-    GaugeRule {
-        id: id.to_owned(),
-        kind: GaugeKind::EndThreshold {
-            clear: GaugeValue(clear * PCT),
-        },
-        start: GaugeValue(20 * PCT),
-        min: GaugeValue(2 * PCT),
-        max: GaugeValue::FULL,
-        change: PerJudgment {
-            perfect: share(up[0]),
-            great: share(up[0]),
-            good: share(up[1]),
-            bad,
-            poor,
-        },
-        empty_poor: empty,
-        correction: TotalCorrection::None,
-        low_damage: Vec::new(),
-    }
-}
-
-/// A survival gauge from 100 %, dead below 2 % (`play/GaugeProperty.java:
-/// 120-122`), with fixed changes in hundredths of a percent.
-fn survival_gauge(
-    id: &str,
-    change: [i64; 6],
-    correction: TotalCorrection,
-    low_damage: Vec<LowDamage>,
-) -> GaugeRule {
-    let [perfect, great, good, bad, poor, empty] = change.map(centi);
-    GaugeRule {
-        id: id.to_owned(),
-        kind: GaugeKind::Survival {
-            fails_below: GaugeValue(2 * PCT),
-        },
-        start: GaugeValue::FULL,
-        min: GaugeValue::EMPTY,
-        max: GaugeValue::FULL,
-        change: PerJudgment {
-            perfect,
-            great,
-            good,
-            bad,
-            poor,
-        },
-        empty_poor: empty,
-        correction,
-        low_damage,
-    }
-}
-
-/// beatoraja-style with Endless Dream's 100 % note windows on both lane
-/// classes (`play/JudgeProperty.java:54-55`), combo priority, its LN-head
-/// eligibility (`play/JudgeManager.java:435-437`), gauges
-/// (`play/GaugeProperty.java:117-122`) and default `#TOTAL`
-/// (`play/BMSPlayerRule.java:88-89`).
 fn preset() -> RulePreset {
-    let mut p = rules::beatoraja_style();
-    p.id = "lr2-style-examples".to_owned();
-    let windows = JudgeWindows {
-        perfect: Window::symmetric(21 * MS),
-        great: Window::symmetric(60 * MS),
-        good: Window::symmetric(120 * MS),
-        bad: Window::symmetric(200 * MS),
-    };
-    p.tables.keys.windows = windows;
-    p.tables.scratch.windows = windows;
-    p.assignment = Assignment::ComboPriority;
-    p.ln_mode.head_eligibility = HeadEligibility::NotLateBad;
-    p.default_total = DefaultTotal::NotesLinear;
-    p.gauges = vec![
-        end_gauge("normal", 80, [10, 5], [400, 600, 200]),
-        end_gauge("assist_easy", 60, [12, 6], [320, 480, 160]),
-        end_gauge("easy", 80, [12, 6], [320, 480, 160]),
-        survival_gauge(
-            "hard",
-            [10, 10, 5, -600, -1_000, -200],
-            TotalCorrection::ScaleDamage,
-            vec![LowDamage {
-                below: GaugeValue(32 * PCT),
-                num: 3,
-                den: 5,
-            }],
-        ),
-        survival_gauge(
-            "ex_hard",
-            [10, 10, 5, -1_200, -2_000, -200],
-            TotalCorrection::ScaleDamage,
-            Vec::new(),
-        ),
-        survival_gauge(
-            "hazard",
-            [15, 6, 0, -10_000, -10_000, -1_000],
-            TotalCorrection::None,
-            Vec::new(),
-        ),
-    ];
-    assert_eq!(p.validate(), Ok(()));
-    p
+    rules::lr2_style()
 }
 
 /// A chart of `n` judgeable notes, at `#RANK 3`: a tap on key 1 at
@@ -591,7 +467,7 @@ fn late_bad_ln_head_is_not_selectable() {
     // A tap at 0 ms and a long note from 30 ms, pressed at 190 ms: the head
     // (160 ms late) is not the primary, which stays the tap, BAD at the
     // press, and the head is missed at its own deadline, 230 ms. Endless
-    // Dream drops the tap too (a known difference, in the module docs).
+    // Dream drops the tap too (a known difference, in the preset's module).
     let before = chart(|b| {
         b.tap(lane(1), TimeUs(T))
             .long(lane(1), TimeUs(T + 30 * MS), TimeUs(T + 80 * MS))
@@ -623,4 +499,418 @@ fn bad_ln_head_is_scored_at_the_press() {
         .map(|ev| ev.time.0)
         .collect();
     assert_eq!(ended, [at + 600 * MS], "released 50 ms before the end");
+}
+
+/// A chart on key 1 built by `build`, at `rank`.
+fn ranked(rank: Option<JudgmentHeader>, build: impl FnOnce(ChartBuilder) -> ChartBuilder) -> Chart {
+    let mut chart = build(ChartBuilder::new(BPM)).build().unwrap();
+    chart.meta.judgment_headers = rank.into_iter().collect();
+    chart
+}
+
+/// The judgment a press at deviation `d` (press − note) gives a tap at `T`
+/// on key 1 at `rank`, if the press judges it.
+fn judge_tap(rank: Option<JudgmentHeader>, d: i64) -> Option<Judgment> {
+    let chart = ranked(rank, |b| b.tap(lane(1), TimeUs(T)));
+    let e = play_with(&chart, &preset(), hold_at(T + d, 10));
+    judged_at(&e)
+        .into_iter()
+        .find(|j| j.0 == T + d)
+        .map(|j| j.2)
+}
+
+/// The judgments of a long note on key 1 from `T` to `T + 1 s` at `rank`,
+/// pressed at deviation `head` and released `before_end` before its end.
+fn judge_release(rank: Option<JudgmentHeader>, head: i64, before_end: i64) -> Vec<Judgment> {
+    let end = T + 1_000 * MS;
+    let chart = ranked(rank, |b| b.long(lane(1), TimeUs(T), TimeUs(end)));
+    let events = vec![press(T + head, 0, 1), release(end - before_end, 0, 1)];
+    judged_at(&play_with(&chart, &preset(), events))
+        .into_iter()
+        .map(|j| j.2)
+        .collect()
+}
+
+/// The judgments on `lane`, in order.
+fn judged_on(e: &Evaluation, lane: usize) -> Vec<Judgment> {
+    common::judgments(&e.events)
+        .into_iter()
+        .filter(|j| j.0 == lane)
+        .map(|j| j.2)
+        .collect()
+}
+
+/// Key 1's and the scratch's tables after the window policy, at `rank`.
+fn prepared(rank: Option<JudgmentHeader>) -> [rules::LaneTable; 2] {
+    let chart = ranked(rank, |b| b.tap(lane(1), TimeUs(T)));
+    let preset = preset();
+    let dev = device(&[0]);
+    let ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), None, 0).unwrap();
+    [*ev.table(lane(1)), *ev.table(Lane::SCRATCH)]
+}
+
+/// Checks symmetric `[PERFECT, GREAT, GOOD]` edges and a 200 ms BAD at
+/// `rank` through presses on both sides of each edge, and the LN-end
+/// edges, all at GOOD's, through releases.
+fn assert_windows(rank: Option<JudgmentHeader>, [pg, gr, gd]: [i64; 3]) {
+    let at = |d| judge_tap(rank, d);
+    let msg = format!("{rank:?}");
+    for side in [-1, 1] {
+        assert_eq!(at(side * pg), Some(Perfect), "{msg}");
+        assert_eq!(at(side * (pg + 1)), Some(Great), "{msg}");
+        assert_eq!(at(side * gr), Some(Great), "{msg}");
+        assert_eq!(at(side * (gr + 1)), Some(Good), "{msg}");
+        assert_eq!(at(side * gd), Some(Good), "{msg}");
+        assert_eq!(at(side * (gd + 1)), Some(Bad), "{msg}");
+        assert_eq!(at(side * 200 * MS), Some(Bad), "{msg}");
+    }
+    assert_eq!(at(-200 * MS - 1), None, "{msg}");
+    assert_eq!(judge_release(rank, 0, gd), [Perfect], "{msg}");
+    assert_eq!(judge_release(rank, 0, gd + 1), [Bad], "{msg}");
+}
+
+/// Source: play/JudgeProperty.java:54-55 (LR2: PG {-21000, 21000}, GR
+/// {-60000, 60000}, GD {-120000, 120000}, BD {-200000, 200000}), both
+/// edges inclusive (play/JudgeManager.java:439-440); at `#RANK 3` the
+/// window rule takes them as they are (play/JudgeProperty.java:169,
+/// :198-199, `judgerank >= 100`). The keys and the scratch share them.
+#[test]
+fn windows_at_rank_3_match_the_source() {
+    assert_windows(Some(common::rank(3)), [21 * MS, 60 * MS, 120 * MS]);
+    for table in prepared(Some(common::rank(3))) {
+        assert_eq!(table, preset().tables.keys);
+    }
+}
+
+/// Source: play/JudgeProperty.java:169 (`#RANK` 0-4: 25, 50, 75, 100, 75),
+/// play/BMSPlayerRule.java:62 (no rank: `#RANK 2`'s 75), :65 (`#DEFEXRANK
+/// n`: `n × 75 / 100`), play/JudgeProperty.java:185-190 (the LR2 table),
+/// :192-222 (below 100 %, interpolated between its columns at 0, 25, 50,
+/// 75 and 100 %), :233-239 (PERFECT, GREAT and GOOD only: BAD keeps
+/// 200 ms), and the LN-end table through the same rule (:120-122). Worked
+/// out by hand in the rules crate (`interpolated_windows_at_each_rank`);
+/// the empty POOR range does not scale either
+/// (`empty_poor_ranges_match_the_source`).
+#[test]
+fn windows_interpolate_like_the_source() {
+    let defex = |n| Some(common::defexrank(n));
+    for (rank, edges) in [
+        (Some(common::rank(0)), [8 * MS, 24 * MS, 40 * MS]),
+        (Some(common::rank(1)), [15 * MS, 30 * MS, 60 * MS]),
+        (Some(common::rank(2)), [18 * MS, 40 * MS, 100 * MS]),
+        (Some(common::rank(4)), [18 * MS, 40 * MS, 100 * MS]),
+        (None, [18 * MS, 40 * MS, 100 * MS]),
+        (defex(100), [18 * MS, 40 * MS, 100 * MS]),
+        // 37.5 %: half way from 25 to 50 %.
+        (defex(50), [11_500, 27 * MS, 50 * MS]),
+        // 60 %: 0.4 of the way from 50 to 75 %.
+        (defex(80), [16_200, 34 * MS, 76 * MS]),
+    ] {
+        assert_windows(rank, edges);
+    }
+}
+
+/// Source: play/BMSPlayerRule.java:65 stores `n × 75 / 100` as an `int`
+/// before the interpolation (play/JudgeProperty.java:192-222). Here the
+/// percentage is taken as it is (a known difference in the preset's
+/// module): `#DEFEXRANK 1` is 0.75 %, 0.03 of the way to 25 % (PERFECT,
+/// GREAT and GOOD 240, 720 and 1200 µs; 0 % and zero-width there), and
+/// `#DEFEXRANK 133` is 99.75 %, 0.99 of the way from 75 to 100 % (20.97,
+/// 59.8 and 119.8 ms; 99 % there, 20.88, 59.2 and 119.2 ms).
+#[test]
+fn defexrank_interpolates_at_its_exact_percentage() {
+    assert_windows(Some(common::defexrank(1)), [240, 720, 1_200]);
+    assert_windows(Some(common::defexrank(133)), [20_970, 59_800, 119_800]);
+}
+
+/// Source: play/JudgeProperty.java:198-199 (from 100 %, `edge ×
+/// judgerank / 100`) and :241-249 (from GOOD down, each of PERFECT, GREAT
+/// and GOOD no wider than the next, on each side), BAD unscaled (:233-239);
+/// the LN-end edges likewise (:120-122), whose BAD row is 200 ms too
+/// (:56, :58). At `#DEFEXRANK 400` (300 %), GOOD is BAD's 200 ms, not
+/// 360 ms, and the LN-end edges with it: a release 200 ms before the end
+/// keeps the head, 1 µs earlier is BAD. At `#DEFEXRANK 600` (450 %) GREAT
+/// is clamped too.
+#[test]
+fn scaled_windows_clamp_to_the_next_wider() {
+    let edges = |rank| {
+        prepared(rank).map(|t| {
+            let w = t.windows;
+            let l = t.ln_end;
+            (
+                [w.perfect, w.great, w.good, w.bad].map(|w| (w.early.0, w.late.0)),
+                [l.perfect.0, l.great.0, l.good.0],
+            )
+        })
+    };
+    let clamped = |pg: i64, gr: i64| {
+        (
+            [
+                (pg, pg),
+                (gr, gr),
+                (200 * MS, 200 * MS),
+                (200 * MS, 200 * MS),
+            ],
+            [200 * MS; 3],
+        )
+    };
+    let at_300 = Some(common::defexrank(400));
+    assert_eq!(edges(at_300), [clamped(63 * MS, 180 * MS); 2]);
+    let at_450 = Some(common::defexrank(600));
+    assert_eq!(edges(at_450), [clamped(94_500, 200 * MS); 2]);
+    // Through presses and releases at 300 %.
+    let at = |d| judge_tap(at_300, d);
+    assert_eq!(at(-63 * MS), Some(Perfect));
+    assert_eq!(at(180 * MS), Some(Great));
+    assert_eq!(at(180 * MS + 1), Some(Good));
+    assert_eq!(at(-200 * MS), Some(Good));
+    assert_eq!(at(-200 * MS - 1), None);
+    assert_eq!(judge_release(at_300, 0, 200 * MS), [Perfect]);
+    assert_eq!(judge_release(at_300, 0, 200 * MS + 1), [Bad]);
+}
+
+/// Source: play/JudgeProperty.java:56 (LR2 LN end: PG, GR and GD all
+/// {-120000, 120000}) and play/JudgeManager.java:580-596: the release's
+/// judgment is the first row holding it, then the worse of head and
+/// release (`:582`), so inside 120 ms before the end the head's judgment
+/// stays. At `#RANK 3`, for a PERFECT, a GREAT (30 ms late) and a GOOD
+/// (100 ms early) head.
+#[test]
+fn release_within_good_width_keeps_head() {
+    let rank = Some(common::rank(3));
+    for (head, judgment) in [(0, Perfect), (30 * MS, Great), (-100 * MS, Good)] {
+        for before_end in [1, 60 * MS, 120 * MS] {
+            assert_eq!(
+                judge_release(rank, head, before_end),
+                [judgment],
+                "head at {head}, released {before_end} before the end"
+            );
+        }
+    }
+}
+
+/// Source: play/JudgeManager.java:580-594: a release earlier than the GOOD
+/// row is graded BAD (`:586-590`, `lnendJudge = 3`; the release margin is
+/// 0, play/JudgeProperty.java:57), never POOR, whatever the head's
+/// judgment. The LN-end edges are the same 120 ms for PERFECT, GREAT and
+/// GOOD, so a release 120.001 ms before the end is BAD, not GREAT or GOOD
+/// as under widening edges.
+#[test]
+fn earlier_release_is_bad() {
+    let rank = Some(common::rank(3));
+    for head in [0, 30 * MS, -100 * MS] {
+        for before_end in [120 * MS + 1, 150 * MS, 200 * MS + 1, 900 * MS] {
+            assert_eq!(
+                judge_release(rank, head, before_end),
+                [Bad],
+                "head at {head}, released {before_end} before the end"
+            );
+        }
+    }
+}
+
+/// The empty POORs of presses at `at`, each released 10 µs later, on key 1
+/// of a chart with taps at `taps` at `rank`.
+fn empty_poors_of(rank: Option<JudgmentHeader>, taps: &[i64], at: &[i64]) -> usize {
+    let chart = ranked(rank, |mut b| {
+        for &t in taps {
+            b = b.tap(lane(1), TimeUs(t));
+        }
+        b
+    });
+    let events = at.iter().flat_map(|&a| hold_at(a, 10)).collect();
+    empty_poors(&play_with(&chart, &preset(), events).events)
+}
+
+/// Source: play/JudgeProperty.java:54-55 (the MS pair {0, 1000000}: from
+/// 0 to 1000 ms after the press, nothing before it) and
+/// play/JudgeManager.java:414-442: a judged note inside the pair is an
+/// empty POOR (`:433-434`), an unjudged one inside it but outside every
+/// window too (`:438-442`), so an unjudged note makes one only past the
+/// early BAD edge. The scan stops at a note 1000 ms ahead (`:416`); here
+/// the range's far edge is inclusive like every edge (a known difference
+/// in the preset's module). Not scaled: the same at `#RANK 0` (:233-239).
+#[test]
+fn empty_poor_ranges_match_the_source() {
+    for rank in [Some(common::rank(3)), Some(common::rank(0))] {
+        // An unjudged note at T: inside early BAD the press takes it.
+        let unjudged = |at: i64| empty_poors_of(rank, &[T], &[at]);
+        assert_eq!(unjudged(T - 200 * MS), 0);
+        assert_eq!(unjudged(T - 200 * MS - 1), 1);
+        assert_eq!(unjudged(T - 999 * MS), 1);
+        assert_eq!(unjudged(T - 1_000 * MS), 1);
+        assert_eq!(unjudged(T - 1_000 * MS - 1), 0);
+        // A judged note: hit 100 ms early, then pressed again before it,
+        // at it, and after it, where there is no late side.
+        let judged = |at: i64| empty_poors_of(rank, &[T], &[T - 100 * MS, at]);
+        assert_eq!(judged(T - 50 * MS), 1);
+        assert_eq!(judged(T), 1);
+        assert_eq!(judged(T + 1), 0);
+        assert_eq!(judged(T + 150 * MS), 0);
+        // A missed note behind the press makes none either.
+        assert_eq!(empty_poors_of(rank, &[T], &[T + 300 * MS]), 0);
+    }
+}
+
+/// Source: play/JudgeProperty.java:60 (MS keeps the combo) and
+/// play/JudgeManager.java:716-725 (`judge < 5` adds to it); BP and the own
+/// count as beatoraja's; play/GaugeProperty.java:119-122 (MS: NORMAL −2 %,
+/// HARD and EX HARD −2 %, HAZARD −10 %), the damage correction on HARD and
+/// EX HARD (play/GrooveGauge.java:279-309) and HARD's × 0.6 below 32 %
+/// (:232-243) applying to it like to any judgment.
+#[test]
+fn empty_poor_keeps_the_combo_adds_bp_and_takes_its_gauge_damage() {
+    let chart = chart(|b| {
+        b.tap(lane(1), TimeUs(T))
+            .tap(lane(1), TimeUs(T + 1_000 * MS))
+    });
+    let events = [T, T + 600 * MS, T + 1_000 * MS]
+        .into_iter()
+        .flat_map(|at| hold_at(at, 10))
+        .collect();
+    let e = play_with(&chart, &preset(), events);
+    let t = &e.tally;
+    assert_eq!((t.empty_poor, t.bp, t.counts.poor), (1, 1, 0));
+    assert_eq!((t.combo, t.max_combo), (2, 2));
+    // Two notes: #TOTAL 160.32, HARD and EX HARD damage × 10. After a
+    // PERFECT, every gauge full, the empty POOR takes −2 %, −20 %, −20 %
+    // and −10 %.
+    let second = |g: usize| e.gauges[g].history[1].value.0;
+    assert_eq!(
+        [NORMAL, HARD, EX_HARD, HAZARD].map(second),
+        [98 * PCT, 80 * PCT, 80 * PCT, 90 * PCT]
+    );
+    // HARD below 32 %, with no correction (1000 notes, #TOTAL 240): × 0.6.
+    let chart = one_target(1_000, Some(240_000), None);
+    let mut events = tap_at(TARGET - 400 * MS);
+    events.extend(tap_at(TARGET));
+    for (before, after) in [(32 * PCT, 30 * PCT), (3_199_999, 3_079_999)] {
+        let e = from_values(&preset(), &chart, &[(HARD, before)], events.clone());
+        assert_eq!(e.tally.empty_poor, 1);
+        assert_eq!(e.gauges[HARD].history[0].value.0, after, "from {before}");
+    }
+}
+
+/// A press and release on lanes 0 (the scratch) and 1 at `at`.
+fn both_at(at: i64) -> Vec<PhysicalInputEvent> {
+    vec![
+        press(at, 0, 0),
+        press(at, 0, 1),
+        release(at + 10, 0, 0),
+        release(at + 10, 0, 1),
+    ]
+}
+
+/// Source: play/JudgeProperty.java:55 and :58 (the LR2 scratch tables equal
+/// the keys': PG ±21, GR ±60, GD ±120, BD ±200 ms; LN end 120 ms; MS {0,
+/// 1000000}); a scratch press and release read them
+/// (play/JudgeManager.java:407, :538). A scratch press 25 ms early is GREAT
+/// here, where beatoraja-style's ±30 ms scratch PERFECT holds it.
+#[test]
+fn scratch_uses_the_key_windows() {
+    let taps = chart(|b| b.tap(Lane::SCRATCH, TimeUs(T)).tap(lane(1), TimeUs(T)));
+    for (d, judgment) in [
+        (-21 * MS, Perfect),
+        (-25 * MS, Great),
+        (60 * MS, Great),
+        (120 * MS, Good),
+        (120 * MS + 1, Bad),
+        (-200 * MS, Bad),
+    ] {
+        let e = play_with(&taps, &preset(), both_at(T + d));
+        assert_eq!(judged_on(&e, 0), [judgment], "{d}");
+        assert_eq!(judged_on(&e, 1), [judgment], "{d}");
+    }
+    let style = rules::beatoraja_style();
+    let e = play_with(&taps, &style, both_at(T - 25 * MS));
+    assert_eq!(judged_on(&e, 0), [Perfect]);
+    // A scratch long note released 120 ms and 120.001 ms before its end.
+    let end = T + 1_000 * MS;
+    let long = chart(|b| b.long(Lane::SCRATCH, TimeUs(T), TimeUs(end)));
+    for (before_end, judgment) in [(120 * MS, Perfect), (120 * MS + 1, Bad)] {
+        let events = vec![press(T, 0, 0), release(end - before_end, 0, 0)];
+        let e = play_with(&long, &preset(), events);
+        assert_eq!(judged_on(&e, 0), [judgment], "{before_end}");
+    }
+    // A scratch empty POOR 1000 ms before a scratch note; none behind one.
+    let tap = chart(|b| b.tap(Lane::SCRATCH, TimeUs(T)));
+    for (presses, empty) in [
+        (vec![T - 1_000 * MS], 1),
+        (vec![T - 1_000 * MS - 1], 0),
+        (vec![T, T + 100 * MS], 0),
+    ] {
+        let events = presses
+            .iter()
+            .flat_map(|&at| [press(at, 0, 0), release(at + 10, 0, 0)])
+            .collect();
+        let e = play_with(&tap, &preset(), events);
+        assert_eq!(empty_poors(&e.events), empty, "{presses:?}");
+    }
+}
+
+/// Known differences (the preset's module): one press judges one note, and
+/// the notes it passes are POOR at the press. At `#RANK 3`, with taps at 0
+/// and 160 ms and a long note from 50 to 100 ms on one lane, a press at
+/// 190 ms takes the 160 ms tap (GREAT, 30 ms late; by combo priority,
+/// since the 0 ms tap is past its late GOOD edge,
+/// play/JudgeAlgorithm.java:15-20) past the head it may not take (160 ms
+/// late, BAD, play/JudgeManager.java:435-437); the source's multi-BAD
+/// (play/JudgeManager.java:993-1061) gives BAD on the 0 ms tap and the
+/// head, here both are POOR at the press. With taps at 0 and 160 ms, a
+/// press at 130 ms takes the later tap and passes the earlier one, which a
+/// second press at 190 ms no longer finds (BAD there, where it stays
+/// hittable until its separate miss pass, :640-660).
+#[test]
+fn one_press_judges_one_note() {
+    let mixed = chart(|b| {
+        b.tap(lane(1), TimeUs(T))
+            .long(lane(1), TimeUs(T + 50 * MS), TimeUs(T + 100 * MS))
+            .tap(lane(1), TimeUs(T + 160 * MS))
+    });
+    let at = T + 190 * MS;
+    let e = play_with(&mixed, &preset(), hold_at(at, 10));
+    assert_eq!(
+        judged_at(&e),
+        [
+            (at, 0, Poor, None),
+            (at, 1, Poor, None),
+            (at, 2, Great, Some(30 * MS))
+        ]
+    );
+    let chart = chart(|b| b.tap(lane(1), TimeUs(T)).tap(lane(1), TimeUs(T + 160 * MS)));
+    let mut events = hold_at(T + 130 * MS, 10);
+    events.extend(hold_at(T + 190 * MS, 10));
+    let e = play_with(&chart, &preset(), events);
+    assert_eq!(
+        judged_at(&e),
+        [
+            (T + 130 * MS, 0, Poor, None),
+            (T + 130 * MS, 1, Great, Some(-30 * MS))
+        ]
+    );
+    assert_eq!(empty_poors(&e.events), 0);
+}
+
+/// Selection × empty POOR × LN eligibility: a press 160 ms after an LN
+/// head cannot take it (play/JudgeManager.java:435-437), and with no other
+/// note inside BAD it takes nothing; a tap 740 ms ahead then makes it an
+/// empty POOR (the source's scan reaches the tap after the head's judge 6
+/// and takes it as the MS candidate, :433-452), and the head is missed at
+/// its own deadline.
+#[test]
+fn ineligible_head_leaves_an_empty_poor_to_a_later_note() {
+    let chart = chart(|b| {
+        b.long(lane(1), TimeUs(T), TimeUs(T + 50 * MS))
+            .tap(lane(1), TimeUs(T + 900 * MS))
+    });
+    let e = play_with(&chart, &preset(), hold_at(T + 160 * MS, 10));
+    assert_eq!(empty_poors(&e.events), 1);
+    assert_eq!(
+        judged_at(&e),
+        [
+            (T + MISSED, 0, Poor, None),
+            (T + 900 * MS + MISSED, 1, Poor, None)
+        ]
+    );
+    assert_eq!((e.tally.empty_poor, e.tally.bp), (1, 3));
 }

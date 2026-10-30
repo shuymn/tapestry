@@ -162,7 +162,11 @@ fn bench_dense_window(c: &mut Criterion) {
         device: device(),
         ..EvalInput::default()
     };
-    for preset in [rules::custom(), rules::beatoraja_style()] {
+    for preset in [
+        rules::custom(),
+        rules::beatoraja_style(),
+        rules::lr2_style(),
+    ] {
         let played = evaluate(&chart, &input, &preset).expect("evaluates");
         assert!(played.completed);
         group.bench_function(format!("2000_notes_{}", preset.id), |b| {

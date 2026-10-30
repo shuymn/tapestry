@@ -165,6 +165,11 @@ enum WindowPolicyFile {
         absent_percent: u32,
         defexrank_percent: u32,
     },
+    Interpolated {
+        rank_percent: [u32; 5],
+        absent_percent: u32,
+        defexrank_percent: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -470,6 +475,15 @@ impl From<PresetFile> for RulePreset {
                     absent_percent,
                     defexrank_percent,
                 }),
+                WindowPolicyFile::Interpolated {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                } => WindowPolicy::Interpolated(ScaledRank {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                }),
             },
             default_total: match default_total {
                 DefaultTotalFile::Fixed { milli } => DefaultTotal::Fixed { milli },
@@ -616,6 +630,15 @@ impl From<&RulePreset> for PresetFile {
                     absent_percent,
                     defexrank_percent,
                 }) => WindowPolicyFile::Scaled {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                },
+                WindowPolicy::Interpolated(ScaledRank {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                }) => WindowPolicyFile::Interpolated {
                     rank_percent,
                     absent_percent,
                     defexrank_percent,

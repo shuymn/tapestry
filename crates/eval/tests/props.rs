@@ -312,16 +312,12 @@ proptest! {
         prop_assert_eq!(p.preset.validate(), Ok(()));
         let e = evaluate(&p.chart, &p.input, &p.preset)
             .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
-        // The head's judgment by the scaled windows, by hand.
-        let scaled = |edge: TimeUs| edge.0 * p.scale.0 / p.scale.1;
+        // The head's judgment by the windows at the chart's rank, by hand.
         let expected = p
-            .preset
-            .tables
-            .keys
             .windows
             .table()
             .into_iter()
-            .find(|(_, w)| -scaled(w.early) <= p.deviation && p.deviation <= scaled(w.late))
+            .find(|(_, w)| -w.early.0 <= p.deviation && p.deviation <= w.late.0)
             .map(|(j, _)| j)
             .unwrap();
         let judgments: Vec<_> = e
@@ -548,6 +544,25 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
         "choices_of_beatoraja_style",
         choices(p) == choices(&rules::beatoraja_style()),
     );
+    c.hit(
+        "choices_of_lr2_style",
+        choices(p) == choices(&rules::lr2_style()),
+    );
+    // LR2-style's whole combination: its choices, the interpolated windows,
+    // its header policy and default #TOTAL, and a damage-corrected gauge
+    // with a failure threshold.
+    let lr2 = rules::lr2_style();
+    c.hit(
+        "policies_of_lr2_style",
+        choices(p) == choices(&lr2)
+            && matches!(p.window_policy, WindowPolicy::Interpolated(_))
+            && p.headers == lr2.headers
+            && p.default_total == lr2.default_total
+            && p.gauges.iter().any(|g| {
+                g.correction == TotalCorrection::ScaleDamage
+                    && matches!(g.kind, GaugeKind::Survival { fails_below } if fails_below > GaugeValue::EMPTY)
+            }),
+    );
     c.hit("headers_decimals", p.headers == HeaderPolicy::Decimals);
     c.hit(
         "headers_def_ex_rank_first",
@@ -563,6 +578,15 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
     c.hit(
         "window_policy_scaled",
         matches!(p.window_policy, WindowPolicy::Scaled(_)),
+    );
+    c.hit(
+        "window_policy_interpolated",
+        matches!(p.window_policy, WindowPolicy::Interpolated(_)),
+    );
+    let ln_end = p.tables.keys.ln_end;
+    c.hit(
+        "ln_end_tied",
+        ln_end.perfect == ln_end.great && ln_end.great == ln_end.good,
     );
     let survival = |bands: fn(usize) -> bool| {
         p.gauges
@@ -926,6 +950,8 @@ fn generators_reach_the_fragile_spots() {
         ("play_sound", 1),
         ("choices_of_custom", SAMPLES / 8),
         ("choices_of_beatoraja_style", SAMPLES / 8),
+        ("choices_of_lr2_style", SAMPLES / 8),
+        ("policies_of_lr2_style", 1),
         ("combo_priority_passes_a_note", 1),
         ("head_eligibility_shows", 1),
         ("headers_decimals", 1),
@@ -935,6 +961,8 @@ fn generators_reach_the_fragile_spots() {
         ("scratch_own_table", 1),
         ("window_policy_thousandths", 1),
         ("window_policy_scaled", 1),
+        ("window_policy_interpolated", 1),
+        ("ln_end_tied", 1),
         ("survival_with_low_damage", 1),
         ("survival_without_low_damage", 1),
         ("survival_with_low_damage_bands", 1),

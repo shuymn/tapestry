@@ -463,6 +463,8 @@ pub fn preset_canonicals() -> Vec<Seed> {
             "beatoraja_style",
             rules::beatoraja_style().canonical_bytes(),
         ),
+        // The interpolated window policy and tied LN-end edges.
+        ("lr2_style", rules::lr2_style().canonical_bytes()),
         ("gauge_policies", policies.canonical_bytes()),
         ("long", long.canonical_bytes()),
     ];

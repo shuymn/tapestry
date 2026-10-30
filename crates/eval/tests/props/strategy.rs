@@ -512,17 +512,82 @@ fn percent(raw: u32) -> u32 {
 
 /// The factor `p`'s window policy scales edges by for the rank its header
 /// policy reads from `headers`, as `(num, den)`, by hand.
-pub fn scale_of(p: &RulePreset, headers: &[JudgmentHeader]) -> (i64, i64) {
+fn scale_of(p: &RulePreset, headers: &[JudgmentHeader]) -> (i64, i64) {
     let rank = p.headers.read(headers).rank;
+    let percent = |s: ScaledRank| match rank {
+        Some(JudgeRank::Rank(r @ 0..=4)) => (i64::from(s.rank_percent[r as usize]), 100),
+        Some(JudgeRank::DefExRankMilli(v)) if v > 0 => {
+            (v * i64::from(s.defexrank_percent), 10_000_000)
+        }
+        _ => (i64::from(s.absent_percent), 100),
+    };
     match p.window_policy {
         WindowPolicy::Thousandths(s) => (s.scale_milli(rank).unwrap(), 100_000),
-        WindowPolicy::Scaled(s) => match rank {
-            Some(JudgeRank::Rank(r @ 0..=4)) => (i64::from(s.rank_percent[r as usize]), 100),
-            Some(JudgeRank::DefExRankMilli(v)) if v > 0 => {
-                (v * i64::from(s.defexrank_percent), 10_000_000)
-            }
-            _ => (i64::from(s.absent_percent), 100),
-        },
+        WindowPolicy::Scaled(s) | WindowPolicy::Interpolated(s) => percent(s),
+    }
+}
+
+/// `edge` at the factor `num / den` by the LR2 rule, by hand, after the
+/// reference's `lr2JudgeScaling`: linear from 100 %; below, the row of
+/// the table the edge reaches, then the two columns around the percentage.
+fn lr2_edge(edge: i64, num: i128, den: i128) -> i128 {
+    const TABLE: [[i128; 5]; 4] = [
+        [0, 0, 0, 0, 0],
+        [0, 8_000, 15_000, 18_000, 21_000],
+        [0, 24_000, 30_000, 40_000, 60_000],
+        [0, 40_000, 60_000, 100_000, 120_000],
+    ];
+    let base = i128::from(edge);
+    if num >= den {
+        return base * num / den;
+    }
+    let column = usize::try_from(4 * num / den).unwrap();
+    let mut s = 0;
+    while s < TABLE.len() && base >= TABLE[s][4] {
+        s += 1;
+    }
+    let (d, x1, x2) = if s < TABLE.len() {
+        let (lo, hi) = (TABLE[s - 1], TABLE[s]);
+        let (n, d) = (base - lo[4], hi[4] - lo[4]);
+        let x = |c: usize| d * lo[c] + n * (hi[c] - lo[c]);
+        (d, x(column), x(column + 1))
+    } else {
+        let last = TABLE[s - 1];
+        (last[4], base * last[column], base * last[column + 1])
+    };
+    // The percentage `100 num / den` lies `(4 num − column den) / den` of
+    // the way to the next column.
+    (x1 * den + (4 * num - i128::try_from(column).unwrap() * den) * (x2 - x1)) / (den * d)
+}
+
+/// `p`'s windows of a lane class whose table holds `windows` and
+/// `ln_end`, at the rank its header policy reads from `headers`, by hand:
+/// every edge scaled and floored, or under the interpolated policy
+/// PERFECT, GREAT and GOOD by [`lr2_edge`], each clamped to the next wider
+/// on its side, BAD as it is.
+pub fn windows_at(
+    p: &RulePreset,
+    headers: &[JudgmentHeader],
+    windows: JudgeWindows,
+) -> JudgeWindows {
+    let (num, den) = scale_of(p, headers);
+    let w = windows.table().map(|(_, w)| w);
+    let scaled = |e: TimeUs| TimeUs(e.0 * num / den);
+    match p.window_policy {
+        WindowPolicy::Thousandths(_) | WindowPolicy::Scaled(_) => {
+            windows_of(w.map(|w| scaled(w.early).0), w.map(|w| scaled(w.late).0))
+        }
+        WindowPolicy::Interpolated(_) => {
+            let side = |edge: fn(&Window) -> TimeUs| {
+                let mut e = w.map(|w| edge(&w).0);
+                for k in (0..3).rev() {
+                    let v = lr2_edge(e[k], i128::from(num), i128::from(den));
+                    e[k] = i64::try_from(v.min(i128::from(e[k + 1]))).unwrap();
+                }
+                e
+            };
+            windows_of(side(|w| w.early), side(|w| w.late))
+        }
     }
 }
 
@@ -544,20 +609,24 @@ fn table_of(raw: &RawTable) -> LaneTable {
 }
 
 /// Valid LN-end edges for the note windows' `early` edges: each at least
-/// its judgment's early edge and wider than the better one, by 0, a grid
-/// multiple, or any µs count more.
+/// its judgment's early edge and the better one, by 0, a grid multiple, or
+/// any µs count more; or, with the first's top bit set, all three at
+/// GOOD's (LR2-style's tie).
 fn ln_end_of(raw: [u32; 3], early: [i64; 4]) -> LnEndWindows {
     let mut e = [0; 3];
     let mut floor = 0;
     for (k, r) in raw.iter().enumerate() {
-        let v = u64::from(r / 3);
+        let v = u64::from((r & 0x7fff_ffff) / 3);
         let extra = match r % 3 {
             0 => 0,
             1 => below(v, 10) * TICK,
             _ => below(v, 200_000),
         };
         e[k] = floor.max(early[k]) + extra;
-        floor = e[k] + 1;
+        floor = e[k];
+    }
+    if raw[0] >> 31 == 1 {
+        e = [e[2]; 3];
     }
     LnEndWindows {
         perfect: TimeUs(e[0]),
@@ -601,12 +670,19 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
     } else {
         HeaderPolicy::Decimals
     };
+    // The three window policies: thousandths (custom), scaled
+    // (beatoraja-style) and interpolated (LR2-style).
     p.window_policy = if flag(17) {
-        WindowPolicy::Scaled(ScaledRank {
+        let scaled = ScaledRank {
             rank_percent: [0, 1, 2, 3, 4].map(|k| percent(raw.rank[k])),
             absent_percent: percent(raw.rank[5]),
             defexrank_percent: percent(raw.defexrank),
-        })
+        };
+        if flag(20) {
+            WindowPolicy::Interpolated(scaled)
+        } else {
+            WindowPolicy::Scaled(scaled)
+        }
     } else {
         WindowPolicy::Thousandths(RankScale {
             rank_milli: [0, 1, 2, 3].map(|k| scale(raw.rank[k])),
@@ -1825,8 +1901,8 @@ pub struct HeldThrough {
     pub input: EvalInput,
     /// The press's deviation from the head.
     pub deviation: i64,
-    /// The factor the chart's rank scales edges by, as `(num, den)`.
-    pub scale: (i64, i64),
+    /// The key windows at the chart's rank, by hand.
+    pub windows: JudgeWindows,
 }
 
 #[derive(Clone, Debug)]
@@ -1870,11 +1946,13 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
         .build()
         .unwrap();
     chart.meta.judgment_headers = rank(raw.rank);
-    // The scaled BAD window, by hand: floor(edge × scale / 100 %).
-    let scale = scale_of(&preset, &chart.meta.judgment_headers);
-    let scaled = |edge: TimeUs| edge.0 * scale.0 / scale.1;
-    let bad = preset.tables.keys.windows.bad;
-    let (early, late) = (scaled(bad.early), scaled(bad.late));
+    // The BAD window at the chart's rank, by hand.
+    let windows = windows_at(
+        &preset,
+        &chart.meta.judgment_headers,
+        preset.tables.keys.windows,
+    );
+    let (early, late) = (windows.bad.early.0, windows.bad.late.0);
     let deviation = below(raw.deviation, early + late + 1) - early;
     // Held exactly as long as the long note, a little or much longer.
     let extra = match raw.extra % 3 {
@@ -1901,6 +1979,6 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
             section: None,
         },
         deviation,
-        scale,
+        windows,
     }
 }
