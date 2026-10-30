@@ -31,7 +31,7 @@ num-integer = { version = "0.1.47", default-features = false }
 num-rational = { version = "0.4.2", default-features = false, features = ["num-bigint"] }
 num-traits = { version = "0.2.19", default-features = false }
 
-# bms-parser, library, replay and audio
+# bms-parser, library, replay and audio, and render (dev only)
 sha2 = { version = "0.11.1", default-features = false }
 
 # replay
@@ -76,6 +76,11 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 pollster = "1.0.1"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
 wgpu-hal = { version = "30.0.1", features = ["dx12"] }
+# Menu text: `cosmic-text` layout (re-exported) and its glyph atlas on wgpu 30.
+glyphon = "0.12.0"
+
+# render (dev only): the expected images of the WARP tests
+png = "0.18.1"
 
 # bms-parser and xtask, library (dev only)
 encoding_rs = "0.8.42"
