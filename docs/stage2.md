@@ -487,9 +487,13 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 ### D18. Menu input
 
 - **Keyboard.** Navigation and IME come through winit.
-- **Controller.** While Idle and focused, the input thread turns the bound controller lanes and scratch into menu events: key 1 or 7 confirms or goes back, and the scratch scrolls.
+- **Controller.** While Idle and focused, the input thread turns the configured controller's bound lanes and scratch into menu events for the select screen (design.md "Input", "Menu input"):
+  - the white keys 1, 3, 5 and 7 confirm (as Enter), and the black keys 2, 4 and 6 go back (as Escape);
+  - the scratch scrolls a line at a time: an axis a line for each whole press threshold of movement, taken the short way round the revolution play converts it with, toward higher values down and toward lower values up, the remainder counting toward the next line; a scratch of two buttons, up with the first bound and down with the second;
+  - a button sends on its press only, with no repeat while held; only the first connected unit of the configured model sends, and none without a configured controller.
   - Events go through a bounded SPSC queue, and the thread unparks the game thread.
   - Menu events are never recorded.
+  - The result screen keeps the keyboard's retry and quit keys; controller commands there arrive with PR17.
 - **Keyboard lane keys** are not menu events.
 
 ### D19. Record format changes
@@ -497,7 +501,7 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 Each bumps `FORMAT_VERSION` at merge, and older formats are refused:
 - the wake policy (PR9);
 - the speed (PR20);
-- the play type, section, attempt, lead-in and initial gauges (PR23; today only `Full`, crates/replay/src/record.rs:137).
+- the play type, section, attempt, lead-in and initial gauges (PR23, format 7: the section as evaluated, in real time; the attempt is the play's number in its session).
 
 Each change is covered by round trips and changes D8's interpretation tuple.
 
@@ -834,6 +838,8 @@ Each one holds the behavior D17 states.
 
 ### PR10. Controller menu input
 
+**Touches.** `input` (menu.rs, sources.rs), input_side.rs, select.rs, selection.rs, main.rs, design.md "Input".
+
 **Depends on.** PR9, PR15.
 
 **Done when.**
@@ -1015,6 +1021,16 @@ Each one holds the behavior D5 and D6 state.
 **Depends on.** PR2, PR14, PR20, PR22.
 
 **Why the gauge transfer is here.** Initial gauges enter records only with this PR's practice record fields; a full play starts every gauge at its preset's start, so PR17's what-if of a full play has nothing to transfer. The transfer belongs with the record fields it reads and the `verify` path that builds the target preset's `Section`.
+
+**What it leaves to PR24.** `Loaded::set_practice` sets the rounds up and the headless session restores audio with a seek; the player's rig rings out (`AudioCtl::RingOut`) but restores nothing yet (`Rig::restore_audio`'s default): the seek plan on the play command, the drawing of the section's targets only, and the screen that sets a practice up stay with the practice screen.
+
+**Decided in this PR** (design.md "Mid-Chart Start and Section Repeat", "Practice Records"):
+- A record stores the section as evaluated, in real time, with its lead-in; its attempt is the play's number in its session.
+- The section is set in 1× time, and both edges are mapped with `floor(t × 20/k)`.
+- A mid-chart start is one round, followed by its result screen.
+- An autoplay session refuses a practice.
+- A preset reloaded at a retry whose gauges no longer take the practice's initial gauges refuses the round at its opening.
+- One acceptance rule for initial gauges, `eval::accepts_initial`, serves `Evaluator::new` and the what-if's transfer.
 
 **Done when.**
 - When D15's example runs (`section_round_rings_out_and_repeats`):

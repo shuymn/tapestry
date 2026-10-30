@@ -11,8 +11,8 @@ use eval::{
 use input::raw;
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DecodeLimits, DeviceKind, DeviceRecord, EndStatus,
-    FORMAT_VERSION, Incomplete, MAGIC, PlayRecord, PlayType, PresetRecord, ReceiveMethod,
-    SourceRecord, Status, TransformRecord, Versions, WakePolicy,
+    FORMAT_VERSION, Incomplete, InitialGauge, MAGIC, PlayRecord, PlayType, Practice, PresetRecord,
+    ReceiveMethod, SourceRecord, Status, TransformRecord, Versions, WakePolicy,
 };
 
 /// A named seed.
@@ -198,11 +198,30 @@ fn extremes() -> PlayRecord {
     rec
 }
 
-fn valid_records() -> [(&'static str, PlayRecord); 3] {
+/// A round of section repeat with both of the preset's gauges by ID.
+fn practice_round() -> PlayRecord {
+    let mut rec = no_events();
+    rec.play_type = PlayType::SectionRepeat(Practice {
+        start: TimeUs(10_000_000),
+        end: TimeUs(20_000_000),
+        lead_in: TimeUs(2_000_000),
+        attempt: 2,
+        initial_gauges: [("normal", 5_000_000), ("survival", 7_000_000)]
+            .map(|(id, value)| InitialGauge {
+                id: id.to_owned(),
+                value: rules::GaugeValue(value),
+            })
+            .to_vec(),
+    });
+    rec
+}
+
+fn valid_records() -> [(&'static str, PlayRecord); 4] {
     [
         ("two_sources", two_sources()),
         ("no_events", no_events()),
         ("extremes", extremes()),
+        ("practice_round", practice_round()),
     ]
 }
 

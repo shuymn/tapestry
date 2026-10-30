@@ -2,7 +2,7 @@
 
 use bms_model::{ChartIdentity, Speed, TimeUs};
 use eval::{DeviceProfile, InputStart, PhysicalInputEvent, SourceProfile};
-use rules::RulePreset;
+use rules::{GaugeValue, RulePreset};
 
 use sha2::{Digest, Sha256};
 
@@ -192,10 +192,52 @@ impl DeviceRecord {
 }
 
 /// Which part of the chart was played.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlayType {
     /// The whole chart.
     Full,
+    /// A practice round from a position in the chart, played once.
+    MidChartStart(Practice),
+    /// A practice round of a section played repeatedly: one round.
+    SectionRepeat(Practice),
+}
+
+impl PlayType {
+    /// The practice conditions; `None` for a full play.
+    #[must_use]
+    pub const fn practice(&self) -> Option<&Practice> {
+        match self {
+            Self::Full => None,
+            Self::MidChartStart(p) | Self::SectionRepeat(p) => Some(p),
+        }
+    }
+}
+
+/// The evaluation conditions of a practice round (design.md "Practice
+/// Records"): the section evaluated, as [`eval::Section`] takes it, the
+/// round's number, and the initial gauges by gauge ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Practice {
+    /// The section's first time, in the record's (real) time, as evaluated.
+    pub start: TimeUs,
+    /// The time just past the section.
+    pub end: TimeUs,
+    /// How long before `start` the lead-in begins.
+    pub lead_in: TimeUs,
+    /// The play's number in its session, from 1: each round is one.
+    pub attempt: u32,
+    /// Each gauge's value at the start, by the ID of the preset's gauge it
+    /// started, in the preset's order; IDs are unique.
+    pub initial_gauges: Vec<InitialGauge>,
+}
+
+/// One gauge's value at the start of a practice round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialGauge {
+    /// The gauge's ID in the preset.
+    pub id: String,
+    /// Its value.
+    pub value: GaugeValue,
 }
 
 /// A device that arrived during play. It does not take part in the play.

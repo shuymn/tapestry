@@ -4,7 +4,7 @@ Stage 3 of the roadmap (design.md "Roadmap") is the look and effects of the play
 
 **Status.** Decided; the decisions that change design.md are in it ("Goals", "Rendering and Skins", "Custom Skin Format", "beatoraja Lua Skins", "Extension Boundaries", "Settings Scopes", "Language and Crate Structure", "Libraries", "Roadmap", "Open Questions"). The fast and slow counts in `Tally` go into design.md with the evaluator change that adds them (S9). This file holds the plan and the details, and is removed when stage 3 exits.
 
-**Citations.** `file:N` points into the repository at commit 17e17de, and design.md is cited by section name. "ED" is LR2oraja Endless Dream; "upstream" is beatoraja itself. What is said about their skin loaders was read from their published source as a description of the file format; none of their code is ported (design.md "Libraries").
+**Citations.** `file:N` points into the repository at commit 17e17de unless it names another revision, and design.md is cited by section name. "ED" is LR2oraja Endless Dream; "upstream" is beatoraja itself. What is said about their skin loaders was read from their published source as a description of the file format; none of their code is ported (design.md "Libraries").
 
 **What the skin system must do:**
 - **Existing skins first.** Skins made for beatoraja-family players become playable in tapestry before tapestry's own format exists. The importers are separate from the format and never shape it.
@@ -48,16 +48,17 @@ A compiled skin is a list of elements in draw order. Each element has a source (
 
 Times are integer milliseconds in files and microseconds inside. For an element with timer `T` and keyframes at `k0 < … < kn`:
 - The element is not drawn while `T` is off.
-- Local time is `t = now − start(T)`; an element without a timer uses `play`.
+- Local time is `t = now − start(T)`; an element without a timer uses `ready`, so it is drawn during the countdown as the target loaders draw untimed objects from the screen's start.
 - After the last key, one of three behaviors, named by the author: **hold** (keep the last key's values), **hide** (drawn while `t ≤ kn`, not after), or **loop from `L`** (`k0 ≤ L < kn`): for `t > L`, `t' = L + (t − L) mod (kn − L)`, so `t = kn` already shows `L`. This matches the target loaders exactly (ED `SkinObject.prepareRegion`), so the export is one-to-one.
 - Before `k0` the element is not drawn.
 - Between keys, x, y, w, h, alpha, r, g, b and angle interpolate; a field left out of a key keeps the previous key's value. Rotation and scaling use a 9-point pivot.
 - Ease per track: linear, in, out, step (in and out are quadratic). Cubic and per-keyframe ease come into the runtime model with the importer that needs them.
+- **Image frames** are not part of the track: an image's frame cycle runs on the image's own timer, so an element can show on `ready` while its frames restart on `judge`. With `n` frames over a period `p` (1 µs to the longest key time), `t` after that timer started shows frame `((t mod p) · n) / p`; frame 0 shows while the timer is off, without a cycle, or with one frame. Both timers come from the same frame's fill, before any element is drawn. Whether the target loaders show frame 0 while a cycle's timer is off is checked when S6 imports; the importer adapts, the rule stays.
 - In the authored format, keys must be strictly increasing from `k0 ≥ 0` and a loop point must lie inside the track (the target loaders hide a finished track by setting its time to −1, which a negative key would make visible again); anything else is a load error. The target loaders accept unsorted and equal-time keys and apply a loop only when the last key is after 0; the importer reproduces that, and the exporter emits only tracks that need neither. Tests pin `k0`, `kn` and `L` at exactly and ±1 µs, for hold, hide, loop and a single-key track.
 
 ### R3. State and timers
 
-The skin reads a per-frame `SkinFrame`, filled from the render thread's `FrameInput`, the chart, a play context given to `prepare`, and a reducer over the drained effects. The play context is fixed for one attempt: the preset's gauge descriptors (kind and order of `PlayView::gauges`, which carry values only, crates/game/src/render.rs:17-28), the attempt's start position and, in practice, its section, so the lanes widget draws only the section's targets (stage2.md D15) and `ready` and `play` start from the attempt's own countdown, not chart time 0.
+The skin reads a per-frame `SkinFrame`, filled from the render thread's `FrameInput`, the chart, a play context given to `prepare`, and a reducer over the drained effects. The play context is fixed for one attempt: the preset's gauge descriptors (`start` and `max`, in the order of `PlayView::gauges`, which carry values only, crates/game/src/render.rs:17-28), the attempt's start position and, in practice, its section, so the lanes widget draws only the section's targets (stage2.md D15) and `ready` and `play` start from the attempt's own countdown, not chart time 0.
 
 **Where each kind of value comes from:**
 - **Numbers come only from the play view.** A dropped effect loses a flash, never a number on screen (crates/game/src/render.rs:36-40). Counts, EX score, BP, combo, gauges and the like are read from `PlayView`, never accumulated from effects.
@@ -69,7 +70,7 @@ The skin reads a per-frame `SkinFrame`, filled from the render thread's `FrameIn
 - A BAD head starts the visual hold through its `Judged`, without `LnHeld`; the hold ends at `LnHoldEnded`.
 - `EmptyPoor` drives the empty-POOR feedback.
 
-**Timers in stage 3:** `play`, `ready`, `failed` (from `GaugeState::failed_at`, crates/eval/src/gauge.rs:29, not from a gauge value: a normal gauge at 0 has not failed), `last_note`, `full_combo`, `gauge_max`, `beat` (from the scroll map); `judge`, `judge.<grade>`, `combo`; per lane `press`, `release`, `bomb`, `hold`, `mine`; and `when(<condition>)` timers, which start on the condition's rising edge and turn off on its falling edge. A `when` condition may read state and built-in timers but not another `when` timer, so there is no cycle and no order to choose; every `when` timer is updated once per frame before any element is drawn. Every timer has a fixed slot sized in `prepare`. The reducer is reset in `prepare`, so a retry starts clean. Its tests split one sequence of effects across drains at every point and compare against explicit expected states, and cover a mid-chart countdown, a practice round and two elements sharing one `when` timer.
+**Timers in stage 3:** `play`, `ready`, `failed` (from `GaugeState::failed_at`, crates/eval/src/gauge.rs:29, not from a gauge value: a normal gauge at 0 has not failed), `last_note`, `full_combo`, `gauge_max`, `beat` (from the scroll map, on the display clock: the latest integer-beat crossing, which a STOP does not restart); `judge`, `judge.<grade>` (only the latest judgment's grade is on), `combo.up` (the field `combo` holds the count); per lane `press`, `release` (off until the play view carries lane input, S9), `bomb`, `hold`, `mine`; and `when(<condition>)` timers, which start on the condition's rising edge and turn off on its falling edge. A `when` condition may read state and built-in timers but not another `when` timer, so there is no cycle and no order to choose; every `when` timer is updated once per frame before any element is drawn. `gauge_max` reads off while the snapshot's gauge is below its maximum; if a below-maximum effect is dropped and the gauge later refills, it keeps the earlier start. Every timer has a fixed slot sized in `prepare`. The reducer is reset in `prepare`, so a retry starts clean. Its tests split one sequence of effects across drains at every point and compare against explicit expected states, and cover a mid-chart countdown, a practice round and two elements sharing one `when` timer.
 
 **Lane input in the play view** *(coordination PR, §6 S9)*. Key beams and key pads need presses without notes and releases, which no effect carries: `PlaySound` comes only for a press with a target note that has a sound (crates/eval/src/evaluator.rs:927-937). `PlayView` gains, per lane, whether it is held now and the chart times of its latest press and release, filled from the same conversion that feeds the evaluator, so a scratch reversal (a release and a press at one time, crates/eval/src/convert.rs:386-390) and a control held at the start without a press edge (convert.rs:145-150) come out right. Autoplay fills it too. It is generic input state, not skin state.
 
@@ -125,13 +126,14 @@ Composed by authors from elements, per-lane repetition and timers: key beams, bo
 
 ### R7. Images and scaling
 
-All at load, on the loading thread, so per-frame cost is unchanged apart from trilinear sampling:
-- **Atlas pages** packed with `etagere`, sized within the limits the device was created with (`Device::limits()`; device creation requests defaults today, crates/render/src/gpu.rs:95), not the adapter's, so a skin that fits the adapter but not the device is refused at load rather than failing at texture creation.
-- **Mipmaps** generated on the CPU, at most 4 levels, with premultiplied alpha. Padding protects every frame of a grid and every glyph of a digit strip, not just the packed image, so lower levels never mix neighbouring frames; the tests use contrasting adjacent frames and colored transparent edges and sample them at minimum scale.
-- **Per-image filter:** linear by default, nearest for pixel art.
+Before play, never per frame, so per-frame cost is unchanged apart from trilinear sampling. Loading a skin (`Sheet::new`) checks its files and images and reads only their headers; the atlas (`Sheet::atlas`) decodes, packs and builds the mips for the chosen variant whenever that variant changes, between plays and off the in-play path, so a retry keeps it. This is how the loading thread and `prepare`'s pick of @2x (R5) fit together. A file whose dimensions changed since load is refused, and the player keeps its current skin.
+- **Atlas pages** packed with `etagere`, sized within the limits the device was created with (`Device::limits()`; device creation requests defaults today, crates/render/src/gpu.rs:95), not the adapter's, so a skin that fits the adapter but not the device is refused at load rather than failing at texture creation. The pages are one texture array: every layer has one power-of-two side, from 256 (or the largest frame) to the device's side capped at 8 192, chosen as the fewest texels across all layers, reserved ones included, among the sides whose pages fit the device's layers and 64. The skin's pages start after the reserved layers (the bitmap font's layer 0), and a frame's uv is its content over the side, exact in `f32`.
+- **Mipmaps** generated on the CPU, 4 levels, with premultiplied alpha (`(c·a + 127) / 255`) and a 2×2 box filter in stored (non-sRGB) space. Every frame of a grid and every glyph of a digit strip is packed on its own with an 8-texel gutter, its allocation aligned to 8, so every texel of every level covers one allocation and lower levels never mix neighbouring frames. The gutter and any rounding in the allocation repeat the frame's nearest edge texel, as clamp-to-edge would. Two images cutting the same rectangle share one packed frame. The tests use contrasting adjacent frames and colored transparent edges and sample them at every level.
+- **Per-image filter:** linear by default, nearest for pixel art: nearest within a level and between levels, so shrinking still uses the box-filtered levels and never blurs two levels together.
 - **Text** rasterized at `prepare` at its final pixel size with `cosmic-text` and swash. The play screen still never calls into `render::text`.
-- **Nine-slice and @2x variants** come with the authored format, their first consumer (S12).
-- **Bounds:** image dimensions, decoded bytes per image and in total, atlas pages, and element, keyframe and timer counts are capped before anything is allocated. Every referenced file resolves inside the skin's folder and must be a regular file (design.md threat model "Skins").
+- **@2x variants** (S4): a file may name an @2x file at exactly twice its size. The atlas reads them when the canvas is magnified on both axes (`variant_for`), doubling the frames' rectangles; a file without one keeps its 1x frames, and track geometry does not change. Per-region picks come with regions (S5). The authored syntax for @2x, and nine-slice, come with the authored format (S12).
+- **Elements and quads** (S4): an element's source is an image of the sheet; `Skin::build` takes the uv table of an atlas of the skin's sheet (a table of another sheet draws nothing) and writes the frame's uv and layer and the image's filter into the `Quad`. Neither breaks a run: blend and clip alone do (R1).
+- **Bounds:** file, image and frame counts, name length, file size, header position, image dimensions and texels per file and per variant, atlas texels, and element, keyframe and timer counts are capped before anything that grows with them is allocated, and one file's decoding is bounded (design.md "Memory Budget"). Every referenced file resolves inside the skin's folder and must be a regular file, checked before opening and on the handle (design.md threat model "Skins", with its precondition and the decoder exception).
 
 ## 3. The beatoraja importer (`skin-beatoraja`)
 
@@ -147,7 +149,7 @@ All at load, on the loading thread, so per-frame cost is unchanged apart from tr
 
 | Concept | What it gives the author |
 | --- | --- |
-| image | A file with optional grid frames, a frame cycle and its own timer, as authors make sprite sheets today |
+| image | A file with optional grid frames, a frame cycle and its own timer (R2), as authors make sprite sheets today |
 | element | One placement model for images, numbers, text, bars and widgets, in reference pixels |
 | region | 21:9 support and player adjustment, by tagging HUD elements (the playfield and judgment are automatic) |
 | expression | Conditions and values by name (`combo >= 100`) instead of numeric IDs |
@@ -192,7 +194,7 @@ All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `
 ### Render, after stage 2 exits
 
 - `SpriteBatch` becomes one ordered list with runs broken at each blend or clip change; a pipeline per blend and a scissor per clip.
-- `Sprite` grows from 48 to 64 bytes with an atlas layer and flags; the atlas becomes a texture array, the bitmap font in layer 0.
+- `Sprite` grows from 48 to 64 bytes with an atlas layer and flags; the atlas becomes a texture array of one page side, the bitmap font in reserved layer 0 and the skin's pages after it (R7), uploaded with their mips as `Rgba8Unorm`, with a linear and a nearest sampler chosen per quad. `AtlasLimits` comes from `Device::limits()`. The uv table and the uploaded pages have one owner, and the memory budget counts the old atlas alive during a reload and the upload staging.
 - Premultiplied alpha throughout: every pipeline, the bitmap font and `text_screen` (today `ALPHA_BLENDING`, crates/render/src/renderer.rs:799).
 - The letterbox (renderer.rs:678) becomes the canvas fit, and `FrameInput` carries the canvas size.
 - `PlaySkin::prepare` gains the play context and the target's pixel size; `DeclSkin: PlaySkin` uploads the atlas pages in `prepare` and delegates `build` to `skin-model`.
@@ -223,15 +225,15 @@ All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `
 | S1 | design.md and this file | [mac] |
 | S2 | `skin-model`: schema, expressions, `Quad` types | [mac] |
 | S3 | Tracks, timers and the reducer; the allocation test | [mac] |
-| S4 | Images, atlas pages, mips | [mac] |
+| S4 | Images, atlas pages, mips; the @2x mechanism and its pick | [mac] |
 | S5 | Canvas, regions, widgets with the scroll copy | [mac] |
-| S6 | `skin-beatoraja`: JSON | [mac] |
+| S6 | `skin-beatoraja`: JSON; enforces the element, `when` and key limits cumulatively while building, before compiling or allocating each item | [mac] |
 | S7 | `skin-beatoraja`: Lua, sandbox, conversion, report tool | [mac] |
 | S8 | `skin-cli`: `check`, `preview`, goldens | [mac] |
 | S9 | Lane input in `PlayView`; fast and slow counts in `Tally` | coordinated with stage 2: it changes `game` and `eval`, and `PlayView` literals in render |
 | S10 | Render integration; `SimpleSkin` stays the default | after stage 2 |
 | S11 | Player: skin choice, layout settings, adjust mode | after stage 2 |
-| S12 | `skin-toml`: the authored format; nine-slice and @2x | [mac] |
+| S12 | `skin-toml`: the authored format; nine-slice and the @2x syntax; the same cumulative limits as S6 | [mac] |
 | S13 | `skin-export` and `build` | [mac] |
 | S14 | The standard skin; `SimpleSkin` removed | |
 | S15 | BGA | |

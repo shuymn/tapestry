@@ -26,6 +26,14 @@
 //! would have put them in, partway into their sounds and fades. No start is
 //! put before that frame while they wait.
 //!
+//! A ring-out (design.md "Mid-Chart Start and Section Repeat") fades the
+//! output on its own frames: gain 1 before its fade frame, falling linearly
+//! to 0 at its end frame, where every voice stops and from which nothing
+//! starts. The envelope multiplies the clipped output, so it is independent
+//! of the volume and of how the output is divided into blocks. Stopping
+//! everything ([`Mixer::stop_all`], as every play's start does) takes it
+//! off.
+//!
 //! The sum is never gain-ridden: a limiter that lowers the whole mix when a
 //! key sound pushes it over full scale would make the background audibly dip
 //! and pump back with every hit. Instead the sum takes a fixed [`HEADROOM`]
@@ -228,6 +236,31 @@ enum Seek {
     Placed { from: i64, by: i64 },
 }
 
+/// A ring-out's envelope on output frames.
+#[derive(Clone, Copy, Debug)]
+struct Envelope {
+    /// The frame the fade starts at: gain 1 before it.
+    fade: i64,
+    /// The frame the gain reaches 0 at, where every voice stops.
+    end: i64,
+    /// Whether rendering has reached `end` and stopped every voice.
+    ended: bool,
+}
+
+impl Envelope {
+    /// The gain of frame `f`: 1 before `fade`, `(end - f) / (end - fade)`
+    /// from it, 0 from `end` on.
+    fn gain(&self, f: i64) -> f32 {
+        if f < self.fade {
+            1.0
+        } else if f >= self.end {
+            0.0
+        } else {
+            ((self.end - f) as f64 / (self.end - self.fade) as f64) as f32
+        }
+    }
+}
+
 /// A volume outside `0.0..=MAX_VOLUME` (NaN included).
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 #[error("volume {0} is outside 0 to {MAX_VOLUME}")]
@@ -272,6 +305,8 @@ pub struct Mixer {
     saturated: u64,
     counts: Counts,
     dropped_starts: u64,
+    /// A ring-out's envelope, until everything stops.
+    envelope: Option<Envelope>,
 }
 
 impl Mixer {
@@ -298,6 +333,7 @@ impl Mixer {
             saturated: 0,
             counts: Counts::default(),
             dropped_starts: 0,
+            envelope: None,
         }
     }
 
@@ -384,12 +420,39 @@ impl Mixer {
         Ok(())
     }
 
-    /// Stops every voice, release, pending start and seek (a retry).
+    /// Stops every voice, release, pending start and seek (a retry), and
+    /// takes a ring-out's envelope off: the output is at full gain again.
     pub fn stop_all(&mut self) {
+        self.silence();
+        self.envelope = None;
+    }
+
+    /// Stops every voice, release, pending start and seek.
+    fn silence(&mut self) {
         self.live.stop();
         self.parked.stop();
         self.seek = Seek::Idle;
         self.pending.clear();
+    }
+
+    /// Rings the output out: from output frame `fade` the gain falls
+    /// linearly per frame, from 1 to 0 at frame `end` (a `fade` after `end`
+    /// counts as `end`), where every voice stops, and no start is put at or
+    /// after `end`. Frames already rendered keep what they had. Replaces an
+    /// earlier ring-out; [`stop_all`](Self::stop_all) takes it off.
+    pub fn ring_out(&mut self, fade: i64, end: i64) {
+        self.envelope = Some(Envelope {
+            fade: fade.min(end),
+            end,
+            ended: false,
+        });
+    }
+
+    /// Whether a ring-out's end frame has been rendered: everything stopped
+    /// there and nothing starts any more.
+    #[must_use]
+    pub fn rung_out(&self) -> bool {
+        self.envelope.is_some_and(|e| e.ended)
     }
 
     /// Schedules sound `id` of `bank` to start at output frame `at`, or at
@@ -399,14 +462,18 @@ impl Mixer {
     /// voice is busy, the oldest playing voice (earliest start, then
     /// earliest trigger) is stolen and fades out from it, or is dropped if
     /// it starts there too. Returns `None` if the bank holds no sound for
-    /// `id` or [`MAX_PENDING_STARTS`] are waiting. While a placed seek waits
-    /// to enter, no start is put before its frame.
+    /// `id`, [`MAX_PENDING_STARTS`] are waiting, or the start falls at or
+    /// after a ring-out's end. While a placed seek waits to enter, no start
+    /// is put before its frame.
     pub fn trigger(&mut self, bank: &SoundBank, id: SoundId, at: u64) -> Option<u64> {
         let sound = bank.slot(id)?;
         let mut start = at.max(self.mixed_to);
         if let Seek::Placed { from, .. } = self.seek {
             // The seek's voices replace whatever starts before them.
             start = start.max(u64::try_from(from).unwrap_or(0));
+        }
+        if self.envelope.is_some_and(|e| signed(start) >= e.end) {
+            return None;
         }
         if self.pending.len() >= MAX_PENDING_STARTS {
             self.dropped_starts += 1;
@@ -512,7 +579,8 @@ impl Mixer {
     /// `out` (overwritten), starting at [`Mixer::mixed_to`]: every voice
     /// summed, with each pending start applied and a placed seek's voices
     /// entered when their frame is reached (the seek first), then the
-    /// volume, [`HEADROOM`] and [`soft_clip`].
+    /// volume, [`HEADROOM`] and [`soft_clip`], then a ring-out's envelope.
+    /// Every voice stops at a ring-out's end frame.
     pub fn render(&mut self, bank: &SoundBank, out: &mut [f32]) {
         out.fill(0.0);
         let block_start = signed(self.mixed_to);
@@ -524,12 +592,29 @@ impl Mixer {
                 Seek::Placed { from, by } if from < block_end => Some((from, by)),
                 _ => None,
             };
+            // A ring-out's end in this block, not yet reached.
+            let end = self
+                .envelope
+                .filter(|e| !e.ended && e.end < block_end)
+                .map(|e| e.end.max(pos));
             let until = next
                 .map_or(block_end, |p| p.start)
-                .min(seek.map_or(block_end, |(from, _)| from));
+                .min(seek.map_or(block_end, |(from, _)| from))
+                .min(end.unwrap_or(block_end));
             if until > pos {
                 self.mix(bank, out, block_start, pos, until);
                 pos = until;
+            }
+            if let Some(end) = end
+                && end <= until
+            {
+                // Everything stops at the envelope's zero, and nothing
+                // starts after it.
+                self.silence();
+                if let Some(e) = &mut self.envelope {
+                    e.ended = true;
+                }
+                continue;
             }
             if let Some((from, by)) = seek
                 && from <= until
@@ -548,6 +633,14 @@ impl Mixer {
                 self.saturated += 1;
             }
             *x = soft_clip(y);
+        }
+        if let Some(e) = self.envelope.filter(|e| e.fade < block_end) {
+            for (f, frame) in (block_start..).zip(out.as_chunks_mut::<CHANNELS>().0) {
+                let g = e.gain(f);
+                for x in frame {
+                    *x *= g;
+                }
+            }
         }
         self.mixed_to = block_end as u64;
     }

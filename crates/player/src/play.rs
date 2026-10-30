@@ -451,6 +451,11 @@ impl Rig for PlayerRig<'_> {
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
+        self.audio.control.ring_out(fade_at, end_at);
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn audio_done(&self) -> bool {
         self.audio.control.done()
     }

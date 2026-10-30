@@ -9,6 +9,20 @@ use rules::{
     CorrectionFactors, Factor, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, Judgment, MineRule,
 };
 
+/// Whether `rule`'s gauge can start a section at `v` (design.md "Section
+/// Evaluation"): within its bounds, and for a survival gauge above 0 and at
+/// or above its failure threshold, as a preset's own start must be.
+/// [`Evaluator::new`](crate::Evaluator::new) refuses a section with a
+/// value its gauge does not accept.
+#[must_use]
+pub fn accepts_initial(rule: &GaugeRule, v: GaugeValue) -> bool {
+    (rule.min..=rule.max).contains(&v)
+        && match rule.kind {
+            GaugeKind::EndThreshold { .. } => true,
+            GaugeKind::Survival { fails_below } => v > GaugeValue::EMPTY && v >= fails_below,
+        }
+}
+
 /// What changes the gauges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Cause {
@@ -144,19 +158,13 @@ impl Gauges {
     }
 
     /// Whether `initial` can start `rules`' gauges: one value per rule,
-    /// within its bounds, and for a survival gauge above 0 and not below
-    /// its failure threshold, as a preset's own start must be.
+    /// each accepted by its rule ([`accepts_initial`]).
     pub(crate) fn accepts(rules: &[GaugeRule], initial: &[GaugeValue]) -> bool {
         rules.len() == initial.len()
-            && rules.iter().zip(initial).all(|(r, &v)| {
-                (r.min..=r.max).contains(&v)
-                    && match r.kind {
-                        GaugeKind::EndThreshold { .. } => true,
-                        GaugeKind::Survival { fails_below } => {
-                            v > GaugeValue::EMPTY && v >= fails_below
-                        }
-                    }
-            })
+            && rules
+                .iter()
+                .zip(initial)
+                .all(|(r, &v)| accepts_initial(r, v))
     }
 
     pub(crate) fn states(&self) -> &[GaugeState] {
