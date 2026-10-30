@@ -363,7 +363,7 @@ pub enum GaugeDelta {
     /// A fixed amount (negative for damage).
     Fixed(GaugeValue),
     /// A share of the per-note increment `floor(total_milli × 100 / notes)`
-    /// (design.md "Gauges and Session Policy"): `floor(increment × num / den)`.
+    /// (design.md "Gauges and Session Policy"): `increment × num / den`.
     TotalShare {
         /// Numerator.
         num: u32,
@@ -381,20 +381,24 @@ pub enum GaugeKind {
         /// The clear threshold.
         clear: GaugeValue,
     },
-    /// Failed the moment it reaches 0, and never recovers. Its `min` is 0,
-    /// and it starts above 0.
-    Survival,
+    /// Failed the moment a change, a mine's included, leaves it at 0 or
+    /// strictly below `fails_below`; it is then 0 and never recovers. Its
+    /// `min` is 0, and it starts above 0 and at or above `fails_below`.
+    Survival {
+        /// The value a change must not leave the gauge strictly below;
+        /// `EMPTY` fails it only at 0.
+        fails_below: GaugeValue,
+    },
 }
 
-/// Reduced damage while the gauge is low.
+/// One band of reduced damage while the gauge is low.
 ///
 /// When the value before a change is strictly below `below`, a negative
-/// change `d` becomes `floor(d × num / den)` (a signed floor, so a remainder
-/// adds damage). A value exactly at `below` takes full damage. Mines are not
-/// reduced (see [`MineRule`]).
+/// change is multiplied by `num / den`. A value exactly at `below` is
+/// outside the band. Mines are not reduced (see [`MineRule`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LowDamage {
-    /// The value below which damage is reduced.
+    /// The value below which the band applies.
     pub below: GaugeValue,
     /// Numerator of the damage factor.
     pub num: u32,
@@ -403,33 +407,122 @@ pub struct LowDamage {
 }
 
 impl LowDamage {
-    /// Whether the reduction applies to a change from `before`.
+    /// Whether the band applies to a change from `before`.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn applies_at(&self, before: GaugeValue) -> bool {
         before < self.below
     }
+}
 
-    /// The reduced form of `damage` (a negative change); other changes are
-    /// returned as they are.
-    #[must_use]
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn reduce(&self, damage: GaugeValue) -> GaugeValue {
-        if damage.0 >= 0 {
-            return damage;
+/// A factor `num / den` of a gauge change, `den` positive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Factor {
+    /// Numerator, not negative.
+    pub num: i128,
+    /// Denominator, positive.
+    pub den: i128,
+}
+
+impl Factor {
+    /// The factor that changes nothing.
+    pub const ONE: Self = Self { num: 1, den: 1 };
+
+    /// `num / den` in lowest terms; `num` not negative and `den` positive.
+    fn reduced(num: i128, den: i128) -> Self {
+        let (mut a, mut b) = (num, den);
+        while b != 0 {
+            (a, b) = (b, a % b);
         }
-        let reduced =
-            (i128::from(damage.0) * i128::from(self.num)).div_euclid(i128::from(self.den));
-        // A validated preset has num ≤ den, so this stays within `damage`;
-        // saturate otherwise.
-        GaugeValue(i64::try_from(reduced).unwrap_or(i64::MIN))
+        let gcd = a.max(1);
+        Self {
+            num: num / gcd,
+            den: den / gcd,
+        }
+    }
+}
+
+/// The factors a [`TotalCorrection`] gives one chart: one for increases and
+/// one for damage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CorrectionFactors {
+    /// For a positive change.
+    pub increase: Factor,
+    /// For a negative change.
+    pub damage: Factor,
+}
+
+/// How a gauge's changes are corrected by the chart's `#TOTAL` and note
+/// count (design.md "Evaluation Stages", accounting step 2). It applies to
+/// every judgment and empty POOR, never to a mine. `T` is the `#TOTAL` in
+/// effect, read or the default, and `N` the gauge denominator's count of the
+/// whole chart, also for a section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TotalCorrection {
+    /// No correction.
+    None,
+    /// An increase is multiplied by `max(0, min(0.15, (2T − 320) / N)) /
+    /// 0.15`: nothing at `#TOTAL 160` and below, in full once `2T − 320 ≥
+    /// 0.15 N`. With `T` in thousandths `t`, the factor is
+    /// `clamp(2t − 320_000, 0, 150 N) / (150 N)`.
+    LimitIncrease,
+    /// Damage is multiplied by `max(fix1, fix2)`, where `fix1 = 10 /
+    /// clamp(floor(T / 16) − 5, 1, 10)` (10 below `#TOTAL 112`, 1 from 240)
+    /// and `fix2` falls with `N`: 10 up to 20 notes, then `8 + 0.2 (30 − N)`
+    /// below 30, `5 + 0.2 (60 − N) / 3` below 60, `4 + (125 − N) / 65` below
+    /// 125, `3 + 0.008 (250 − N)` below 250, `2 + 0.004 (500 − N)` below
+    /// 500, `1 + 0.002 (1000 − N)` below 1000, and 1 from 1000.
+    ScaleDamage,
+}
+
+impl TotalCorrection {
+    /// The factors, in lowest terms, for a chart whose `#TOTAL` in effect is
+    /// `total_milli` thousandths and whose gauge denominator counts `notes`
+    /// (at least 1: a chart without notes is refused, and 0 counts as 1).
+    /// Exact: nothing is rounded here.
+    #[must_use]
+    pub fn factors(&self, total_milli: i64, notes: usize) -> CorrectionFactors {
+        let n = i128::try_from(notes.max(1)).unwrap_or(i128::MAX);
+        let t = i128::from(total_milli);
+        let (mut increase, mut damage) = (Factor::ONE, Factor::ONE);
+        match self {
+            Self::None => {}
+            Self::LimitIncrease => {
+                let den = n.saturating_mul(150);
+                let num = t.saturating_mul(2).saturating_sub(320_000).clamp(0, den);
+                increase = Factor::reduced(num, den);
+            }
+            Self::ScaleDamage => {
+                let fix1 = (10, (t.div_euclid(16_000) - 5).clamp(1, 10));
+                let fix2 = match n {
+                    ..=20 => (10, 1),
+                    21..=29 => (70 - n, 5),
+                    30..=59 => (135 - n, 15),
+                    60..=124 => (385 - n, 65),
+                    125..=249 => (625 - n, 125),
+                    250..=499 => (1_000 - n, 250),
+                    500..=999 => (1_500 - n, 500),
+                    _ => (1, 1),
+                };
+                // The larger, compared exactly; both are small fractions.
+                let (num, den) = if fix1.0 * fix2.1 >= fix2.0 * fix1.1 {
+                    fix1
+                } else {
+                    fix2
+                };
+                damage = Factor::reduced(num, den);
+            }
+        }
+        CorrectionFactors { increase, damage }
     }
 }
 
 /// One gauge. Every gauge of a preset is computed side by side.
 ///
-/// A change is computed, reduced per `low_damage`, and then clamped to
-/// `min..=max`, in that order.
+/// A change is computed from its base, corrected per `correction`, reduced
+/// per `low_damage`, rounded once, added, clamped to `min..=max`, and a
+/// survival gauge's failure checked, in that order (design.md "Evaluation
+/// Stages", accounting).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GaugeRule {
     /// Name of the gauge, unique within the preset.
@@ -447,9 +540,14 @@ pub struct GaugeRule {
     pub change: PerJudgment<GaugeDelta>,
     /// Change for an empty POOR.
     pub empty_poor: GaugeDelta,
-    /// Reduced damage while low, if any. Applies to every negative change
+    /// The `#TOTAL` correction of every change but a mine's. A gauge with a
+    /// correction has fixed changes only.
+    pub correction: TotalCorrection,
+    /// Reduced damage while low: bands in strictly ascending order of
+    /// `below`, of which the first that applies to the value before the
+    /// change reduces it. Empty for none. Applies to every negative change
     /// except mines.
-    pub low_damage: Option<LowDamage>,
+    pub low_damage: Vec<LowDamage>,
 }
 
 /// EX score weights and what each judgment does to combo and BP.
@@ -520,17 +618,58 @@ pub struct LnModeRule {
 /// How `#TOTAL` applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TotalMode {
-    /// It sets the per-note increment only ([`GaugeDelta::TotalShare`]).
+    /// It sets the per-note increment ([`GaugeDelta::TotalShare`]); each
+    /// gauge's [`TotalCorrection`] reads it too.
     ScalesIncrease,
+}
+
+/// `#TOTAL` when the header policy reads none, from the gauge denominator's
+/// count `N` of the whole chart, also for a section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultTotal {
+    /// A fixed value.
+    Fixed {
+        /// The value, in thousandths, positive.
+        milli: i64,
+    },
+    /// `max(260, 7.605 N / (0.01 N + 6.5))`, in thousandths rounded down:
+    /// 260 up to 337 notes, then rising toward 760.5.
+    NotesCurve,
+    /// `160 + (N + clamp(N − 400, 0, 200)) × 0.16`: 0.16 per note, twice
+    /// that for the 401st to the 600th.
+    NotesLinear,
+}
+
+impl DefaultTotal {
+    /// The value for a chart of `notes`, in thousandths, computed in
+    /// `i128` and saturated to `i64`.
+    #[must_use]
+    pub fn milli(&self, notes: usize) -> i64 {
+        let n = i128::try_from(notes).unwrap_or(i128::MAX);
+        let v = match *self {
+            Self::Fixed { milli } => i128::from(milli),
+            // 1000 × 7.605 N / (0.01 N + 6.5) = 7_605_000 N / (10 N + 6_500).
+            Self::NotesCurve => n
+                .saturating_mul(7_605_000)
+                .div_euclid(n.saturating_mul(10).saturating_add(6_500))
+                .max(260_000),
+            Self::NotesLinear => n
+                .saturating_add((n - 400).clamp(0, 200))
+                .saturating_mul(160)
+                .saturating_add(160_000),
+        };
+        i64::try_from(v).unwrap_or(i64::MAX)
+    }
 }
 
 /// When and how much a mine damages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MineRule {
     /// A mine damages every gauge when its lane is held as it passes, by the
-    /// chart's damage value × `per_unit`, as is: never reduced by
-    /// [`LowDamage`], then clamped like any change. It has no judgment, combo
-    /// or BP effect.
+    /// chart's damage value × `per_unit`, as is: never corrected by a
+    /// [`TotalCorrection`] or reduced by [`LowDamage`], then clamped like any
+    /// change, and a survival gauge it leaves too low fails. It has no
+    /// judgment, combo or BP effect.
     WhileHeld {
         /// Gauge damage per unit of the chart's value (not negative).
         per_unit: GaugeValue,
@@ -569,8 +708,8 @@ pub struct RulePreset {
     pub headers: HeaderPolicy,
     /// How the tables derive from the rank the header policy read.
     pub window_policy: WindowPolicy,
-    /// `#TOTAL` when the header policy reads none, in thousandths.
-    pub default_total_milli: i64,
+    /// `#TOTAL` when the header policy reads none.
+    pub default_total: DefaultTotal,
     /// Which notes make up the gauge denominator.
     pub denominator: Denominator,
     /// The gauges, computed side by side.
@@ -593,7 +732,10 @@ pub struct RulePreset {
 mod tests {
     use bms_model::TimeUs;
 
-    use super::{GaugeValue, LowDamage, RankScale, Window};
+    use super::{
+        CorrectionFactors, DefaultTotal, Factor, GaugeValue, LowDamage, RankScale, TotalCorrection,
+        Window,
+    };
     use crate::JudgeRank;
     use crate::custom;
 
@@ -707,9 +849,127 @@ mod tests {
         };
         assert!(!low.applies_at(GaugeValue(30 * GaugeValue::PERCENT)));
         assert!(low.applies_at(GaugeValue(30 * GaugeValue::PERCENT - 1)));
-        assert_eq!(low.reduce(GaugeValue(-900_000)), GaugeValue(-450_000));
-        // Signed floor: -1.5 becomes -2.
-        assert_eq!(low.reduce(GaugeValue(-3)), GaugeValue(-2));
-        assert_eq!(low.reduce(GaugeValue(16_000)), GaugeValue(16_000));
+    }
+
+    /// `num / den` in lowest terms, as the factors are given.
+    fn f(num: i128, den: i128) -> Factor {
+        Factor::reduced(num, den)
+    }
+
+    #[test]
+    fn factors_are_in_lowest_terms() {
+        assert_eq!(f(80_000, 150_000), Factor { num: 8, den: 15 });
+        assert_eq!(f(0, 150_000), Factor { num: 0, den: 1 });
+        assert_eq!(f(10, 10), Factor::ONE);
+    }
+
+    /// Both formulas at the edges of their pieces, against values worked out
+    /// by hand: `NotesCurve` reaches 260 between 337 and 338 notes
+    /// (`7605 × 338 / 9880 = 260.171…`), `NotesLinear` doubles its step
+    /// from the 401st note to the 600th. 0 notes is never evaluated (such a
+    /// chart is refused) but stays defined.
+    #[test]
+    fn default_totals_at_their_edges() {
+        let curve = |n| DefaultTotal::NotesCurve.milli(n);
+        let linear = |n| DefaultTotal::NotesLinear.milli(n);
+        for (n, c, l) in [
+            (0, 260_000, 160_000),
+            (1, 260_000, 160_160),
+            (337, 260_000, 213_920),
+            (338, 260_171, 214_080),
+            (399, 289_265, 223_840),
+            (400, 289_714, 224_000),
+            (401, 290_162, 224_320),
+            (599, 364_723, 287_680),
+            (600, 365_040, 288_000),
+            (601, 365_356, 288_160),
+            // 460.909 09…, rounded down to thousandths.
+            (1_000, 460_909, 352_000),
+        ] {
+            assert_eq!((curve(n), linear(n)), (c, l), "{n} notes");
+        }
+        assert_eq!(DefaultTotal::Fixed { milli: 160_000 }.milli(5), 160_000);
+        // Toward 760.5, without overflow.
+        assert_eq!(curve(usize::MAX), 760_499);
+        assert_eq!(linear(usize::MAX), i64::MAX);
+    }
+
+    /// `LimitIncrease` at `#TOTAL` below, at and above 160, at 320 around
+    /// `0.15 N`; `ScaleDamage`'s `fix1` at each `#TOTAL` step it changes on
+    /// and `fix2` on both sides of each piece, worked out by hand.
+    #[test]
+    fn total_corrections_at_their_edges() {
+        let limit = |t, n| TotalCorrection::LimitIncrease.factors(t, n);
+        let one = CorrectionFactors {
+            increase: Factor::ONE,
+            damage: Factor::ONE,
+        };
+        assert_eq!(TotalCorrection::None.factors(1, 1), one);
+        for (t, n, increase) in [
+            (159_999, 1_000, f(0, 150_000)),
+            (160_000, 1_000, f(0, 150_000)),
+            (160_001, 1_000, f(2, 150_000)),
+            // (400 − 320) / 1000 = 0.08 of 0.15.
+            (200_000, 1_000, f(80_000, 150_000)),
+            // 320 / 2133 ≥ 0.15, 320 / 2134 < 0.15.
+            (320_000, 2_133, f(319_950, 319_950)),
+            (320_000, 2_134, f(320_000, 320_100)),
+            // 0 notes counts as 1.
+            (320_000, 0, f(150, 150)),
+        ] {
+            assert_eq!(limit(t, n).increase, increase, "#TOTAL {t} over {n}");
+            assert_eq!(limit(t, n).damage, Factor::ONE);
+        }
+        let damage = |t, n| TotalCorrection::ScaleDamage.factors(t, n).damage;
+        assert_eq!(
+            TotalCorrection::ScaleDamage.factors(1, 1).increase,
+            Factor::ONE
+        );
+        // fix1 alone, from 1000 notes (fix2 = 1).
+        for (t, fix1) in [
+            (1, f(10, 1)),
+            (111_999, f(10, 1)),
+            (112_000, f(10, 2)),
+            (223_999, f(10, 8)),
+            (224_000, f(10, 9)),
+            (239_999, f(10, 9)),
+            (240_000, f(10, 10)),
+            (i64::MAX, f(10, 10)),
+        ] {
+            assert_eq!(damage(t, 1_000), fix1, "#TOTAL {t}");
+        }
+        // fix2 alone, at #TOTAL 240 (fix1 = 1).
+        for (n, fix2) in [
+            (0, f(10, 1)),
+            (1, f(10, 1)),
+            (20, f(10, 1)),
+            (21, f(49, 5)),
+            (29, f(41, 5)),
+            (30, f(105, 15)),
+            (59, f(76, 15)),
+            (60, f(325, 65)),
+            (124, f(261, 65)),
+            (125, f(500, 125)),
+            (249, f(376, 125)),
+            (250, f(750, 250)),
+            (399, f(601, 250)),
+            (400, f(600, 250)),
+            (401, f(599, 250)),
+            (499, f(501, 250)),
+            (500, f(1_000, 500)),
+            (599, f(901, 500)),
+            (600, f(900, 500)),
+            (601, f(899, 500)),
+            (999, f(501, 500)),
+            (1_000, Factor::ONE),
+            (usize::MAX, Factor::ONE),
+        ] {
+            assert_eq!(damage(240_000, n), fix2, "{n} notes");
+        }
+        // The larger of the two: 10/9 over 1.002, 2.4 over 10/9; a tie (5
+        // and 5 at 60 notes and #TOTAL 112) is the same factor either way.
+        assert_eq!(damage(224_000, 999), f(10, 9));
+        assert_eq!(damage(224_000, 400), f(600, 250));
+        assert_eq!(damage(112_000, 60), f(10, 2));
     }
 }

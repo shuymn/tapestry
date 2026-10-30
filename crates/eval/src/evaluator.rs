@@ -15,7 +15,7 @@ use rules::{
 
 use crate::EvalError;
 use crate::convert::{ConversionState, LaneEdge};
-use crate::gauge::{Cause, GaugeState, Gauges, increment};
+use crate::gauge::{Cause, GaugeState, Gauges};
 use crate::input::{DeviceProfile, InputStart, PhysicalInputEvent, Section, evaluation_time};
 
 /// One output of the evaluator.
@@ -388,10 +388,12 @@ impl<'a> Evaluator<'a> {
     /// and empty POOR range from the chart's rank by the preset's window
     /// policy, builds each lane's deadlines from its own
     /// class's table and the final deadline from them, computes the gauge
-    /// increment, and sets up input conversion from `start`.
+    /// increment, the default `#TOTAL` and each gauge's correction, and sets
+    /// up input conversion from `start`.
     /// `section`, if given, restricts the targets, the input judged and the
     /// final deadline to it and sets the initial gauges ([`Section`]); the
-    /// gauge increment still counts the whole chart's judgeable notes.
+    /// gauge increment, the default `#TOTAL` and the corrections still count
+    /// the whole chart's judgeable notes.
     /// `input_capacity` sizes the ring of inputs pushed but not yet
     /// processed.
     ///
@@ -541,9 +543,12 @@ impl<'a> Evaluator<'a> {
             .max()
             .or(section.map(|s| s.start))
             .unwrap_or(TimeUs(0));
-        let total_milli = headers.total_milli.unwrap_or(rule.default_total_milli);
-        let increment = match rule.total_mode {
-            TotalMode::ScalesIncrease => increment(total_milli, notes),
+        // The #TOTAL read, else the preset's default for the whole chart's
+        // notes; it sets the increment and each gauge's correction.
+        let total_milli = match rule.total_mode {
+            TotalMode::ScalesIncrease => headers
+                .total_milli
+                .unwrap_or_else(|| rule.default_total.milli(notes)),
         };
         Ok(Self {
             chart,
@@ -560,7 +565,8 @@ impl<'a> Evaluator<'a> {
             ended: false,
             gauges: Gauges::new(
                 &rule.gauges,
-                increment,
+                total_milli,
+                notes,
                 section.map(|s| s.initial_gauges.as_slice()),
             ),
             seq: 0,

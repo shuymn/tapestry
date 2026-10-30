@@ -32,37 +32,19 @@
 //! | Judgment headers ([`HeaderPolicy::DefExRankFirst`]): `#RANK` an integer token 0-4, `#DEFEXRANK` any number above 0, `#TOTAL` any number above 0; a later accepted one replaces an earlier one, a refused one keeps it, and a `#DEFEXRANK` counts over any `#RANK` | jbms-parser `BMSDecoder.java:702-713`, `:716-727`, `:730-743`; the precedence, jbms-parser a7a0729 and beatoraja's chart documentation |
 //! | Each window and LN-end edge scaled by `edge × rate / 100`, in µs; derived edges may tie | `play/JudgeProperty.java:234` |
 //! | Empty POOR distances not scaled | `play/JudgeProperty.java:210` (`fixjudge`) |
-//! | `#TOTAL` absent: 260 (see E below) | `play/BMSPlayerRule.java:75-78`, `:85`; jbms-parser `BMSModel.java:75,79` (a chart without `#TOTAL` keeps the bmson total type) |
+//! | `#TOTAL` absent ([`DefaultTotal::NotesCurve`]): `max(260, 7.605 N / (0.01 N + 6.5))` over the whole chart's notes, 260 up to 337 notes | `play/BMSPlayerRule.java:68-78` (a `#TOTAL` not above 0 counts as absent), `:85`; jbms-parser `BMSModel.java:75,79` (a chart without `#TOTAL` keeps the bmson total type, whose 100 % is that value) |
+//! | A `#TOTAL` not above 0 is refused and an earlier one stays | jbms-parser `BMSDecoder.java:730-743` |
 //! | Gauge denominator: taps and LN heads, mines excluded | jbms-parser `TimeLine.java:139-155` |
 //! | Gauges, `{min, max, start, clear}` and changes `{PG, GR, GD, BD, PR, MS}` | `play/GaugeProperty.java:87-92`, field order `:157` |
 //! | Increases of ASSIST EASY, EASY and NORMAL are `value × TOTAL / notes` | `play/GrooveGauge.java:260` (`TOTAL` modifier) |
+//! | Increases of HARD and EX HARD × `max(0, min(0.15, (2 × TOTAL − 320) / notes)) / 0.15` ([`TotalCorrection::LimitIncrease`]), computed once per chart from the `#TOTAL` in effect | `play/GaugeProperty.java:90-91` (`LIMIT_INCREMENT`), `play/GrooveGauge.java:264-270`; applied to the per-judgment values when the gauge is made, `:207-211` (`play/BMSPlayer.java:386`), from the `#TOTAL` the chart's load set, the default included (`PlayerResource.java:215`) |
+//! | HARD damage while low, chosen from the value before the change: × 0.4 below 10 %, 0.5 below 20 %, 0.6 below 30 %, 0.7 below 40 %, 0.8 below 50 %, the first band that applies | `play/GaugeProperty.java:90`, `play/GrooveGauge.java:229-238` |
+//! | The modifiers and damage while low apply to the MS change too, never to a mine | `play/GrooveGauge.java:207-211` (every value of the six), `:229-238`; a mine adds its value directly, `:63-66` |
 //! | A change is clamped to `min..=max`; a gauge at 0 never changes again | `play/GrooveGauge.java:218-222`, `:229-240` |
 //! | Cleared when the value at the end is at or above the border; survival gauges have border 0 | `play/GrooveGauge.java:246-248` |
 //! | Mines: 1 % per unit of the chart's value, while the lane is held as it passes, not reduced by the gauge | `play/JudgeManager.java:244-246`, `play/GrooveGauge.java:63-66`; jbms-parser `Section.java:513`, `MineNote.java` |
 //! | EX score: PERFECT 2, GREAT 1 | `ScoreData.java:421-422` |
 //! | LN mode | `play/JudgeManager.java:425-441` |
-//!
-//! # Not expressed
-//!
-//! These behaviors need an axis the preset model does not have yet
-//! (design.md "Handling Differences Not Expressible as Numbers"). This
-//! preset plays the stated substitute; each line names the example that
-//! would differ.
-//!
-//! - **C. HARD gauge damage while low.** Damage is multiplied by 0.4 below
-//!   10 %, 0.5 below 20 %, 0.6 below 30 %, 0.7 below 40 % and 0.8 below 50 %
-//!   (`play/GaugeProperty.java:90`, `play/GrooveGauge.java:229-238`); the
-//!   model holds one step. Here HARD takes full damage: a BAD at 15 % leaves
-//!   10 %, not 12.5 %.
-//! - **D. HARD and EX HARD increases limited by `#TOTAL`.** An increase is
-//!   multiplied by `min(0.15, (2 × TOTAL − 320) / notes) / 0.15`, at least 0
-//!   (`play/GrooveGauge.java:264-270`). Here the increases are fixed, which
-//!   matches whenever `2 × TOTAL − 320 ≥ 0.15 × notes`: a 1000-note chart
-//!   with `#TOTAL 200` gains 0.08 % per PERFECT there, 0.15 % here.
-//! - **E. `#TOTAL` when absent.** It is `max(260, 7.605 × notes / (0.01 ×
-//!   notes + 6.5))` (`play/BMSPlayerRule.java:85`). Here it is 260, which
-//!   matches up to 337 notes; a 1000-note chart without `#TOTAL` has about
-//!   460.9 there.
 //!
 //! # Known differences
 //!
@@ -143,6 +125,17 @@
 //!   the chart is refused, where the source plays windows over an hour wide;
 //!   from 28 633 116, `n × 75` also wraps in the source's `int` arithmetic
 //!   (`play/BMSPlayerRule.java:63`).
+//! - **Gauge arithmetic.** The source keeps gauges in `f32` and computes
+//!   its modifiers once per chart in `double`, then `f32`
+//!   (`play/GrooveGauge.java:188`, `:207-211`, `:260-270`); here a gauge is
+//!   fixed-point in 1/100000 %, each change is computed exactly from its
+//!   base, correction and reduction and rounded down once, and the default
+//!   `#TOTAL` is in thousandths rounded down like a declared one. From
+//!   20 %, 600 increases of 0.1 % (600 PERFECTs at `#TOTAL 60`) reach about
+//!   79.9993 % in `f32`, below NORMAL's 80 % clear, and exactly 80 % here,
+//!   a clear; a 1000-note chart without `#TOTAL` has 460.909 here and
+//!   460.909 09… there. These are arithmetic examples, not runs of the
+//!   source.
 //!
 //! The digits and whitespace differences are examples in
 //! `crates/bms-parser/tests/judgment_headers.rs`; the `#DEFEXRANK`, scan
@@ -154,10 +147,11 @@
 use bms_model::TimeUs;
 
 use crate::{
-    Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
-    LnMode, LnModeRule, MineRule, MissRule, PerJudgment, PerLaneClass, RulePreset, SameTimeOrder,
-    ScaledRank, ScoreWeights, TotalMode, Window, WindowPolicy,
+    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
+    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+    RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection, TotalMode, Window,
+    WindowPolicy,
 };
 
 const MS: i64 = 1_000;
@@ -190,17 +184,25 @@ fn end_gauge(id: &str, clear: i64, damage: [i64; 3]) -> GaugeRule {
             poor: centi(-poor),
         },
         empty_poor: centi(-empty),
-        low_damage: None,
+        correction: TotalCorrection::None,
+        low_damage: Vec::new(),
     }
 }
 
-/// A survival gauge from 100 %, with fixed changes in hundredths of a
-/// percent: PERFECT, GREAT, GOOD, BAD, POOR, empty POOR.
-fn survival_gauge(id: &str, change: [i64; 6]) -> GaugeRule {
+/// A survival gauge from 100 %, failing at 0, with fixed changes in
+/// hundredths of a percent: PERFECT, GREAT, GOOD, BAD, POOR, empty POOR.
+fn survival_gauge(
+    id: &str,
+    change: [i64; 6],
+    correction: TotalCorrection,
+    low_damage: Vec<LowDamage>,
+) -> GaugeRule {
     let [perfect, great, good, bad, poor, empty] = change.map(centi);
     GaugeRule {
         id: id.to_owned(),
-        kind: GaugeKind::Survival,
+        kind: GaugeKind::Survival {
+            fails_below: GaugeValue::EMPTY,
+        },
         start: GaugeValue::FULL,
         min: GaugeValue::EMPTY,
         max: GaugeValue::FULL,
@@ -212,8 +214,22 @@ fn survival_gauge(id: &str, change: [i64; 6]) -> GaugeRule {
             poor,
         },
         empty_poor: empty,
-        low_damage: None,
+        correction,
+        low_damage,
     }
+}
+
+/// HARD's damage while low: × `tenths / 10` below `below` %, the first band
+/// that applies.
+fn hard_bands() -> Vec<LowDamage> {
+    [(10, 4), (20, 5), (30, 6), (40, 7), (50, 8)]
+        .into_iter()
+        .map(|(below, tenths)| LowDamage {
+            below: pct(below),
+            num: tenths,
+            den: 10,
+        })
+        .collect()
 }
 
 /// The beatoraja-style preset, the default play preset.
@@ -224,9 +240,24 @@ pub fn beatoraja_style() -> RulePreset {
         end_gauge("normal", 80, [300, 600, 200]),
         end_gauge("assist_easy", 60, [150, 300, 50]),
         end_gauge("easy", 80, [150, 450, 100]),
-        survival_gauge("hard", [15, 12, 3, -500, -1_000, -500]),
-        survival_gauge("ex_hard", [15, 6, 0, -800, -1_600, -800]),
-        survival_gauge("hazard", [15, 6, 0, -10_000, -10_000, -1_000]),
+        survival_gauge(
+            "hard",
+            [15, 12, 3, -500, -1_000, -500],
+            TotalCorrection::LimitIncrease,
+            hard_bands(),
+        ),
+        survival_gauge(
+            "ex_hard",
+            [15, 6, 0, -800, -1_600, -800],
+            TotalCorrection::LimitIncrease,
+            Vec::new(),
+        ),
+        survival_gauge(
+            "hazard",
+            [15, 6, 0, -10_000, -10_000, -1_000],
+            TotalCorrection::None,
+            Vec::new(),
+        ),
     ];
     RulePreset {
         id: "beatoraja-style".to_owned(),
@@ -286,7 +317,7 @@ pub fn beatoraja_style() -> RulePreset {
             absent_percent: 75,
             defexrank_percent: 75,
         }),
-        default_total_milli: 260_000,
+        default_total: DefaultTotal::NotesCurve,
         denominator: Denominator::TapsAndLnHeads,
         gauges,
         score: ScoreWeights {

@@ -11,11 +11,11 @@
 
 use bms_model::TimeUs;
 use rules::{
-    Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
-    LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
-    RuleError, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalMode, Window,
-    WindowPolicy,
+    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
+    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+    RankScale, RuleError, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection,
+    TotalMode, Window, WindowPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -77,7 +77,7 @@ struct PresetFile {
     empty_poor: EmptyPoorFile,
     headers: HeadersFile,
     window_policy: WindowPolicyFile,
-    default_total_milli: i64,
+    default_total: DefaultTotalFile,
     denominator: DenominatorFile,
     score: ScoreFile,
     same_time_order: SameTimeOrderFile,
@@ -272,11 +272,27 @@ enum DeltaFile {
     TotalShare { num: u32, den: u32 },
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+enum DefaultTotalFile {
+    Fixed { milli: i64 },
+    NotesCurve,
+    NotesLinear,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 enum GaugeKindFile {
     EndThreshold { clear: i64 },
-    Survival,
+    Survival { fails_below: i64 },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CorrectionFile {
+    None,
+    LimitIncrease,
+    ScaleDamage,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -297,8 +313,9 @@ struct GaugeFile {
     max: i64,
     change: PerJudgmentFile<DeltaFile>,
     empty_poor: DeltaFile,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    low_damage: Option<LowDamageFile>,
+    correction: CorrectionFile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    low_damage: Vec<LowDamageFile>,
 }
 
 const fn window(w: WindowFile) -> Window {
@@ -396,7 +413,7 @@ impl From<PresetFile> for RulePreset {
             empty_poor,
             headers,
             window_policy,
-            default_total_milli,
+            default_total,
             denominator,
             score,
             same_time_order,
@@ -446,7 +463,11 @@ impl From<PresetFile> for RulePreset {
                     defexrank_percent,
                 }),
             },
-            default_total_milli,
+            default_total: match default_total {
+                DefaultTotalFile::Fixed { milli } => DefaultTotal::Fixed { milli },
+                DefaultTotalFile::NotesCurve => DefaultTotal::NotesCurve,
+                DefaultTotalFile::NotesLinear => DefaultTotal::NotesLinear,
+            },
             denominator: match denominator {
                 DenominatorFile::TapsAndLnHeads => Denominator::TapsAndLnHeads,
             },
@@ -458,18 +479,29 @@ impl From<PresetFile> for RulePreset {
                         GaugeKindFile::EndThreshold { clear } => GaugeKind::EndThreshold {
                             clear: GaugeValue(clear),
                         },
-                        GaugeKindFile::Survival => GaugeKind::Survival,
+                        GaugeKindFile::Survival { fails_below } => GaugeKind::Survival {
+                            fails_below: GaugeValue(fails_below),
+                        },
                     },
                     start: GaugeValue(g.start),
                     min: GaugeValue(g.min),
                     max: GaugeValue(g.max),
                     change: g.change.map(delta),
                     empty_poor: delta(g.empty_poor),
-                    low_damage: g.low_damage.map(|l| LowDamage {
-                        below: GaugeValue(l.below),
-                        num: l.num,
-                        den: l.den,
-                    }),
+                    correction: match g.correction {
+                        CorrectionFile::None => TotalCorrection::None,
+                        CorrectionFile::LimitIncrease => TotalCorrection::LimitIncrease,
+                        CorrectionFile::ScaleDamage => TotalCorrection::ScaleDamage,
+                    },
+                    low_damage: g
+                        .low_damage
+                        .into_iter()
+                        .map(|l| LowDamage {
+                            below: GaugeValue(l.below),
+                            num: l.num,
+                            den: l.den,
+                        })
+                        .collect(),
                 })
                 .collect(),
             score: ScoreWeights {
@@ -517,7 +549,7 @@ impl From<&RulePreset> for PresetFile {
             empty_poor,
             headers,
             window_policy,
-            default_total_milli,
+            default_total,
             denominator,
             gauges,
             score,
@@ -577,7 +609,11 @@ impl From<&RulePreset> for PresetFile {
                     defexrank_percent,
                 },
             },
-            default_total_milli: *default_total_milli,
+            default_total: match *default_total {
+                DefaultTotal::Fixed { milli } => DefaultTotalFile::Fixed { milli },
+                DefaultTotal::NotesCurve => DefaultTotalFile::NotesCurve,
+                DefaultTotal::NotesLinear => DefaultTotalFile::NotesLinear,
+            },
             denominator: match denominator {
                 Denominator::TapsAndLnHeads => DenominatorFile::TapsAndLnHeads,
             },
@@ -617,18 +653,29 @@ impl From<&RulePreset> for PresetFile {
                         GaugeKind::EndThreshold { clear } => {
                             GaugeKindFile::EndThreshold { clear: clear.0 }
                         }
-                        GaugeKind::Survival => GaugeKindFile::Survival,
+                        GaugeKind::Survival { fails_below } => GaugeKindFile::Survival {
+                            fails_below: fails_below.0,
+                        },
                     },
                     start: g.start.0,
                     min: g.min.0,
                     max: g.max.0,
                     change: PerJudgmentFile::of(&g.change, delta_file),
                     empty_poor: delta_file(g.empty_poor),
-                    low_damage: g.low_damage.map(|l| LowDamageFile {
-                        below: l.below.0,
-                        num: l.num,
-                        den: l.den,
-                    }),
+                    correction: match g.correction {
+                        TotalCorrection::None => CorrectionFile::None,
+                        TotalCorrection::LimitIncrease => CorrectionFile::LimitIncrease,
+                        TotalCorrection::ScaleDamage => CorrectionFile::ScaleDamage,
+                    },
+                    low_damage: g
+                        .low_damage
+                        .iter()
+                        .map(|l| LowDamageFile {
+                            below: l.below.0,
+                            num: l.num,
+                            den: l.den,
+                        })
+                        .collect(),
                 })
                 .collect(),
         }
