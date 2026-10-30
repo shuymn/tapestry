@@ -767,7 +767,8 @@ Each one holds the behavior D17 states.
 - When a Japanese title is drawn with the pinned font, the WARP image shall match within tolerance (`japanese_title_renders_on_warp`).
 - If the font hash differs, then the test shall fail and name both hashes.
 - When the runtime chooses a font, it shall pick the first present in order (`runtime_font_falls_back_in_order`).
-- When a glyph is drawn twice on one screen, it shall not be rasterized again (`glyphs_are_cached_per_screen`).
+- While a glyph is in a screen's atlas, a later prepare that does not grow the atlas shall not rasterize it again (`glyphs_are_cached_per_screen`).
+- When a prepare grows a screen's atlas, the glyphs already drawn shall draw the same afterwards (`atlas_growth_keeps_drawn_glyphs`).
 
 ### PR12. Library database and scanning (`library` new crate, `bms-parser`)
 

@@ -302,10 +302,12 @@ impl MenuText {
         }
         // Glyphs in the atlas are rasterized again from `fonts` when it
         // grows, so it holds glyphs of one font system only.
-        let own = *self.fonts.get_or_insert(fonts.id);
+        // A refused prepare binds nothing.
+        let own = self.fonts.unwrap_or(fonts.id);
         if own != fonts.id || blocks.iter().any(|b| b.fonts != own) {
             return Err(TextError::OtherFonts);
         }
+        self.fonts = Some(own);
         let gpu = renderer.gpu();
         let (width, height) = renderer.size();
         // The whole target is the viewport, so glyphs land on its pixels
@@ -316,10 +318,10 @@ impl MenuText {
         self.viewport
             .update(gpu.queue(), Resolution { width, height });
         let bounds = TextBounds {
-            left: x.round() as i32,
-            top: y.round() as i32,
-            right: (x + w).round() as i32,
-            bottom: (y + h).round() as i32,
+            left: first_covered(x),
+            top: first_covered(y),
+            right: first_covered(x + w),
+            bottom: first_covered(y + h),
         };
         // Glyphs the previous blocks used may now be evicted for room.
         self.atlas.trim();
@@ -356,6 +358,14 @@ impl MenuText {
     ) -> Result<(), glyphon::RenderError> {
         self.renderer.render(&self.atlas, &self.viewport, pass)
     }
+}
+
+/// The first pixel whose center is at or past the edge `edge`: as the
+/// rasterizer covers pixels by their centers, with a center on a left or
+/// top edge inside and one on a right or bottom edge outside, so text is
+/// clipped to the pixels the letterboxed sprites cover.
+fn first_covered(edge: f32) -> i32 {
+    (edge - 0.5).ceil() as i32
 }
 
 #[cfg(test)]
@@ -594,5 +604,65 @@ mod tests {
         assert!(!text_near.is_empty());
         let shifted: Vec<_> = text_near.iter().map(|&(x, y)| (x + 800, y)).collect();
         assert_eq!(text_far, shifted);
+    }
+
+    #[test]
+    fn text_is_clipped_where_sprites_are() {
+        // 1921×1080 is scaled by 1 and letterboxed at x = 0.5…1920.5: pixel
+        // centers 0.5 and 1920.5 lie on its edges, so the covered columns
+        // are 0…1919. A glyph and a sprite cross each edge.
+        let mut r = warp(1921, 1080);
+        let mut fonts = Fonts::runtime().unwrap();
+        let left = TextBlock::new(&mut fonts, "譜", white(-40.0, 100.0));
+        let right = TextBlock::new(&mut fonts, "譜", white(1_880.0, 100.0));
+        let mut text = MenuText::new(&r);
+        text.prepare(&r, &mut fonts, &[&left, &right]).unwrap();
+        r.menu_frame(
+            |b| {
+                for x in [-40.0, 1_880.0] {
+                    b.push(
+                        Blend::Alpha,
+                        Sprite {
+                            rect: [x, 600.0, 100.0, 50.0],
+                            uv: solid_uv(),
+                            color: [1.0, 0.0, 0.0, 1.0],
+                        },
+                    );
+                }
+            },
+            &text,
+        )
+        .unwrap();
+        let on = lit(&r.read_back(), 1921);
+        let columns = |rows: std::ops::Range<usize>| {
+            let xs: Vec<_> = on
+                .iter()
+                .filter(|(_, y)| rows.contains(y))
+                .map(|&(x, _)| x)
+                .collect();
+            (*xs.iter().min().unwrap(), *xs.iter().max().unwrap())
+        };
+        let sprites = columns(500..1080);
+        assert_eq!(sprites, (0, 1919));
+        assert_eq!(columns(0..500), sprites);
+    }
+
+    #[test]
+    fn refused_first_prepare_binds_no_fonts() {
+        let r = warp(480, 270);
+        let mut a = Fonts::runtime().unwrap();
+        let mut b = Fonts::runtime().unwrap();
+        let of_b = TextBlock::new(&mut b, "譜面", white(100.0, 100.0));
+        let mut text = MenuText::new(&r);
+        assert!(matches!(
+            text.prepare(&r, &mut a, &[&of_b]),
+            Err(TextError::OtherFonts)
+        ));
+        text.prepare(&r, &mut b, &[&of_b]).unwrap();
+        let of_a = TextBlock::new(&mut a, "譜面", white(100.0, 100.0));
+        assert!(matches!(
+            text.prepare(&r, &mut a, &[&of_a]),
+            Err(TextError::OtherFonts)
+        ));
     }
 }
