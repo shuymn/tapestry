@@ -1011,7 +1011,15 @@ Each one holds the behavior D5 and D6 state.
 
 **Why the gauge transfer is here.** Initial gauges enter records only with this PR's practice record fields; a full play starts every gauge at its preset's start, so PR17's what-if of a full play has nothing to transfer. The transfer belongs with the record fields it reads and the `verify` path that builds the target preset's `Section`.
 
-**What it leaves to PR24.** `Loaded::set_practice` sets the rounds up and the headless session restores audio with a seek; the player's rig rings out (`AudioCtl::RingOut`) but restores nothing yet (`Rig::restore_audio`'s default): the seek plan on the play command, the drawing of the section's targets only, and the screen that sets a practice up stay with the practice screen. An autoplay session refuses a practice.
+**What it leaves to PR24.** `Loaded::set_practice` sets the rounds up and the headless session restores audio with a seek; the player's rig rings out (`AudioCtl::RingOut`) but restores nothing yet (`Rig::restore_audio`'s default): the seek plan on the play command, the drawing of the section's targets only, and the screen that sets a practice up stay with the practice screen.
+
+**Decided in this PR** (design.md "Mid-Chart Start and Section Repeat", "Practice Records"):
+- A record stores the section as evaluated, in real time, with its lead-in; its attempt is the play's number in its session.
+- The section is set in 1× time, and both edges are mapped with `floor(t × 20/k)`.
+- A mid-chart start is one round, followed by its result screen.
+- An autoplay session refuses a practice.
+- A preset reloaded at a retry whose gauges no longer take the practice's initial gauges refuses the round at its opening.
+- One acceptance rule for initial gauges, `eval::accepts_initial`, serves `Evaluator::new` and the what-if's transfer.
 
 **Done when.**
 - When D15's example runs (`section_round_rings_out_and_repeats`):
