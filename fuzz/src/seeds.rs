@@ -25,6 +25,7 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("replay_file", replay_files()),
         ("replay_body", replay_bodies()),
         ("raw_input", raw_inputs()),
+        ("preset_canonical", preset_canonicals()),
     ]
 }
 
@@ -409,4 +410,119 @@ pub fn raw_inputs() -> Vec<Seed> {
         // Five blocks asked for, two present.
         ("count_beyond", buffer(5, &[press.clone(), press])),
     ]
+}
+
+/// Where `bytes`, [`rules::custom`]'s, hold the gauge count: the first byte
+/// that differs from the same preset's without gauges.
+fn gauge_count_at(bytes: &[u8]) -> usize {
+    let mut empty = rules::custom();
+    empty.gauges.clear();
+    bytes
+        .iter()
+        .zip(empty.canonical_bytes())
+        .position(|(&a, b)| a != b)
+        .expect("the gauges change the bytes")
+}
+
+/// `preset_canonical` seeds: valid presets, then one malformed input per
+/// refusal the smoke tests expect.
+#[must_use]
+pub fn preset_canonicals() -> Vec<Seed> {
+    let custom = rules::custom();
+    let bytes = custom.canonical_bytes();
+    // Strings and a gauge list whose lengths take two varint bytes.
+    let mut long = custom.clone();
+    long.id = "p".repeat(200);
+    let gauge = long.gauges[1].clone();
+    long.gauges = (0..130)
+        .map(|i| rules::GaugeRule {
+            id: format!("{}{i}", "g".repeat(130)),
+            ..gauge.clone()
+        })
+        .collect();
+    let mut seeds: Vec<Seed> = vec![("custom", bytes.clone()), ("long", long.canonical_bytes())];
+
+    let edited = |edit: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = bytes.clone();
+        edit(&mut b);
+        b
+    };
+    seeds.push(("other_version", edited(&|b| b[0] += 1)));
+    // The version with a redundant zero byte.
+    seeds.push((
+        "non_minimal_varint",
+        edited(&|b| {
+            b[0] |= 0x80;
+            b.insert(1, 0);
+        }),
+    ));
+    // 16383 gauges, more than the bytes left.
+    let count_at = gauge_count_at(&bytes);
+    assert!(
+        bytes.len() - count_at < 16_383,
+        "the custom preset is short"
+    );
+    seeds.push((
+        "count_beyond_data",
+        edited(&|b| {
+            b.splice(count_at..=count_at, [0xff, 0x7f]);
+        }),
+    ));
+    // The first gauge's kind, after the count and its id, is tag 2.
+    let id = &custom.gauges[0].id;
+    assert!(
+        id.len() < 128 && custom.gauges.len() < 128,
+        "one-byte lengths"
+    );
+    seeds.push(("unknown_tag", edited(&|b| b[count_at + 2 + id.len()] = 2)));
+    // The version as eleven varint bytes.
+    seeds.push((
+        "varint_overflow",
+        edited(&|b| {
+            b.splice(
+                0..1,
+                [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02],
+            );
+        }),
+    ));
+    // The id's first byte, then the preset version, after the id, as 2^32.
+    let id = &custom.id;
+    assert!(id.len() < 128 && custom.version < 128, "one-byte varints");
+    seeds.push(("invalid_utf8", edited(&|b| b[2] = 0xff)));
+    let version_at = 2 + id.len();
+    seeds.push((
+        "value_too_large",
+        edited(&|b| {
+            b.splice(version_at..=version_at, [0x80, 0x80, 0x80, 0x80, 0x10]);
+        }),
+    ));
+    // The implementation's name, after the version and its length, starts
+    // with a capital.
+    seeds.push((
+        "unknown_implementation",
+        edited(&|b| b[version_at + 2] = b'S'),
+    ));
+    // Five rank scales: the count precedes the first scale, whose first
+    // byte is the first to change with it.
+    let mut scaled = custom.clone();
+    scaled.rank_scale.rank_milli[0] += 1;
+    let rank_at = bytes
+        .iter()
+        .zip(scaled.canonical_bytes())
+        .position(|(&a, b)| a != b)
+        .expect("a rank scale changes the bytes")
+        - 1;
+    assert_eq!(bytes[rank_at], 4, "the rank scale count");
+    seeds.push(("wrong_length", edited(&|b| b[rank_at] = 5)));
+    seeds.push(("trailing_bytes", edited(&|b| b.push(0))));
+    seeds.push((
+        "truncated",
+        edited(&|b| {
+            b.pop();
+        }),
+    ));
+    let mut no_gauges = custom;
+    no_gauges.gauges.clear();
+    seeds.push(("invalid", no_gauges.canonical_bytes()));
+    seeds
 }

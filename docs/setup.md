@@ -99,6 +99,7 @@ The fuzz targets are in `fuzz/`, a crate outside the workspace with its own `fuz
 | `replay_file` | An input log file's bytes, decoded with `replay::decode` |
 | `replay_body` | An uncompressed body, decoded from a valid file built around it, so every input reaches the sections, counts and varints. A body that decodes must be the canonical body of its record |
 | `raw_input` | A block count byte, then a Raw Input buffer: the block walk and the keyboard and HID decoders of `input::raw` |
+| `preset_canonical` | A preset's canonical bytes, decoded with `RulePreset::from_canonical_bytes`. Bytes that decode must be the canonical bytes of their preset |
 
 - Seeds are generated from the public types when a run starts (`fuzz/src/seeds.rs`), so they follow format changes and no seed bytes are committed; `bms_load` also reads the self-made charts in `crates/bms-parser/tests/charts/` and the dictionary `fuzz/dict/bms.dict`. `cargo test --manifest-path fuzz/Cargo.toml` checks that the seeds reach what each target is for: successful decodes, and each malformed seed failing with the error it was built for.
 - Every run has the same per-input limits: 10 s (`-timeout`), 2048 MiB of RSS and of one allocation, inputs up to 64 KiB (4 KiB for `raw_input`). The targets are built with AddressSanitizer and debug assertions, so overflow checks are on.
@@ -108,11 +109,11 @@ The fuzz targets are in `fuzz/`, a crate outside the workspace with its own `fuz
 
 ## Property Tests
 
-The property tests (`crates/eval/tests/props.rs`, `crates/replay/tests/round_trip.rs`) are ordinary tests: `cargo test` runs them on every runner with proptest's 256 cases per property and a random seed.
+The property tests (`crates/eval/tests/props.rs`, `crates/replay/tests/round_trip.rs`, `crates/rules/tests/canonical.rs`) are ordinary tests: `cargo test` runs them on every runner with proptest's 256 cases per property and a random seed.
 
 - For a longer local run, set `PROPTEST_CASES`, for example `PROPTEST_CASES=4096 mise exec -- cargo test --test props`.
 - A failure prints the shrunk input. proptest saves its seed beside the test (`*.proptest-regressions`, ignored by git) and replays it first on the next local run. Turn the case into a named hand-written test in the regular test files; regression files are not committed, since a generator change makes their seeds mean other cases.
-- `generators_reach_the_fragile_spots` and `generator_reaches_ten_byte_varints_and_empty_lists` sample the generators with a fixed seed and fail when a generator change stops reaching a case a property depends on.
+- `generators_reach_the_fragile_spots`, `generator_reaches_ten_byte_varints_and_empty_lists` and `generator_reaches_every_variant_and_length_class` sample the generators with a fixed seed and fail when a generator change stops reaching a case a property depends on.
 
 ## CI
 

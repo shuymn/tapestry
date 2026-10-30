@@ -1018,7 +1018,7 @@ Rust is recommended as the core language. The evaluator can be shared between th
 | --- | --- | --- |
 | L0 | `bms-model` | Chart types, time (µs) types |
 | L1 | `bms-parser` | Loading BMS/BME/PMS/BMSON, `#RANDOM`, time computation with rational numbers |
-| L2 | `rules` | Preset types, validation and canonical encoding, judgment window and gauge tables. Takes no external dependency, so `eval`'s dependency closure stays free of external crates |
+| L2 | `rules` | Preset types, validation, canonical encoding and its bounded decoder, judgment window and gauge tables. Takes no external dependency, so `eval`'s dependency closure stays free of external crates |
 | L2 | `rules-toml` | Preset files (TOML) to and from `rules::RulePreset`; the file's shape lives here, so `rules` stays free of `serde` and `toml` |
 | L2 | `eval` | The evaluator and its input contract (physical input events, device profile, start snapshot, watermark and merge), which `input` and `replay` use. Depends only on `bms-model` and `rules` |
 | L2 | `replay` | Input log and replay formats |

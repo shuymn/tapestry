@@ -4,7 +4,7 @@
 [package]
 name = "fuzz"
 version = "0.0.0"
-description = "Fuzz targets: chart loading, input log decoding and Raw Input packet decoding."
+description = "Fuzz targets: chart loading, input log decoding, Raw Input packet decoding and canonical preset decoding."
 edition = "2024"
 # GPL because it links `input` (design.md "Licenses"). Tooling, never shipped.
 license = "GPL-3.0-or-later"
@@ -43,6 +43,13 @@ bench = false
 [[bin]]
 name = "replay_body"
 path = "fuzz_targets/replay_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "preset_canonical"
+path = "fuzz_targets/preset_canonical.rs"
 test = false
 doc = false
 bench = false

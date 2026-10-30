@@ -1748,6 +1748,7 @@ name = "rules"
 version = "0.0.0"
 dependencies = [
  "bms-model",
+ "proptest",
 ]
 
 [[package]]
