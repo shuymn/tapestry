@@ -1,6 +1,6 @@
-//! File hashes and the resolved-chart hash.
+//! File hashes, the resolved-chart hash and the played-chart hash.
 
-use bms_model::{Chart, HeaderValue, JudgmentHeaderName, LnMode, NoteKind, SoundId};
+use bms_model::{Chart, HeaderValue, JudgmentHeaderName, LnMode, NoteKind, SoundId, Speed};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 
@@ -9,7 +9,8 @@ pub fn file_hashes(bytes: &[u8]) -> ([u8; 32], [u8; 16]) {
     (Sha256::digest(bytes).into(), Md5::digest(bytes).into())
 }
 
-/// SHA-256 over a canonical encoding of the resolved chart: loader version,
+/// SHA-256 over a canonical encoding of the resolved 1× chart (the loader
+/// hashes it before mapping times to a speed): loader version,
 /// the scroll map (initial rate and segments), notes with their display
 /// positions, BGM, bar-line positions, sound names as written, the title,
 /// the judgment-header declarations in their canonical form (header, class
@@ -21,6 +22,22 @@ pub fn file_hashes(bytes: &[u8]) -> ([u8; 32], [u8; 16]) {
 pub fn resolved_hash(chart: &Chart) -> [u8; 32] {
     let mut h = Encoder(Sha256::new());
     h.bytes(b"tapestry resolved chart");
+    encode_chart(&mut h, chart);
+    h.0.finalize().into()
+}
+
+/// The same encoding over the chart as loaded at `speed` other than 1×,
+/// under its own tag and with the speed's k, so a record pins the real
+/// timeline its input was judged on.
+pub fn played_hash(chart: &Chart, speed: Speed) -> [u8; 32] {
+    let mut h = Encoder(Sha256::new());
+    h.bytes(b"tapestry played chart");
+    h.u64(u64::from(speed.twentieths()));
+    encode_chart(&mut h, chart);
+    h.0.finalize().into()
+}
+
+fn encode_chart(h: &mut Encoder, chart: &Chart) {
     h.u64(u64::from(chart.identity.loader_version));
     h.i128(chart.scroll.initial_rate());
     let segments = chart.scroll.segments();
@@ -95,7 +112,6 @@ pub fn resolved_hash(chart: &Chart) -> [u8; 32] {
         Some(LnMode::Cn) => 2,
         Some(LnMode::Hcn) => 3,
     });
-    h.0.finalize().into()
 }
 
 /// Fixed-width little-endian fields; byte strings carry their length.

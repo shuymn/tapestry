@@ -34,7 +34,13 @@ impl ChartIngest for Built {
         path.extension().is_some_and(|e| e == "chart")
     }
 
-    fn ingest(&self, _bytes: &[u8], _dir: &Path, _seed: u64) -> Result<Ingested, IngestError> {
+    fn ingest(
+        &self,
+        _bytes: &[u8],
+        _dir: &Path,
+        _seed: u64,
+        _speed: bms_model::Speed,
+    ) -> Result<Ingested, IngestError> {
         Ok(Ingested {
             chart: self.0.clone(),
             warnings: Vec::new(),
@@ -66,6 +72,7 @@ fn config() -> SessionConfig {
         start: TimeUs(0),
         effects: 4_096,
         seed: 3,
+        speed: bms_model::Speed::NORMAL,
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,

@@ -65,7 +65,13 @@ impl ChartIngest for Built {
         path.extension().is_some_and(|e| e == "chart")
     }
 
-    fn ingest(&self, _bytes: &[u8], _dir: &Path, _seed: u64) -> Result<Ingested, IngestError> {
+    fn ingest(
+        &self,
+        _bytes: &[u8],
+        _dir: &Path,
+        _seed: u64,
+        _speed: bms_model::Speed,
+    ) -> Result<Ingested, IngestError> {
         Ok(Ingested {
             chart: self.0.clone(),
             warnings: Vec::new(),
@@ -90,6 +96,7 @@ fn config() -> SessionConfig {
         start: TimeUs(0),
         effects: 4_096,
         seed: 7,
+        speed: bms_model::Speed::NORMAL,
         app_version: "0.0.0-test".to_owned(),
         provenance: BuildProvenance::Development,
         receive: ReceiveMethod::Scripted,
@@ -1182,7 +1189,13 @@ impl ChartIngest for Capped {
         path.extension().is_some_and(|e| e == "chart")
     }
 
-    fn ingest(&self, bytes: &[u8], _dir: &Path, _seed: u64) -> Result<Ingested, IngestError> {
+    fn ingest(
+        &self,
+        bytes: &[u8],
+        _dir: &Path,
+        _seed: u64,
+        _speed: bms_model::Speed,
+    ) -> Result<Ingested, IngestError> {
         *self.seen.borrow_mut() = Some(bytes.len());
         Ok(Ingested {
             chart: self.chart.clone(),
@@ -1696,7 +1709,7 @@ fn bms_ingest_leaves_missing_sounds_to_the_sound_table() {
     let text =
         "#BPM 120\n#WAV01 kick.wav\n#WAV02 snare.wav\n#WAV03 hat.wav\n#FOO 1\n#00111:010203\n";
     let ingested = game::BmsIngest
-        .ingest(text.as_bytes(), dir.path(), 0)
+        .ingest(text.as_bytes(), dir.path(), 0, bms_model::Speed::NORMAL)
         .unwrap();
     // One warning, the unknown header; none per missing file.
     assert_eq!(ingested.warnings.len(), 1);

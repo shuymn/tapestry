@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use ::audio::{AudioOutput, OutputError};
-use bms_model::{BgmEvent, Chart, ModelError, TimeSource, TimeUs, VirtualClock};
+use bms_model::{BgmEvent, Chart, ModelError, Speed, TimeSource, TimeUs, VirtualClock};
 use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Tally};
 use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
@@ -154,6 +154,10 @@ pub struct SessionConfig {
     pub effects: usize,
     /// The seed for `#RANDOM` and the chart transform.
     pub seed: u64,
+    /// The practice speed the chart is loaded at, as recorded: its times
+    /// are real times, so judgment windows and the recording window stay
+    /// in real time (design.md "Practice Speed Changes").
+    pub speed: Speed,
     /// The app's version, as recorded.
     pub app_version: String,
     /// Which kind of build records.
@@ -477,7 +481,7 @@ impl Loaded {
         let dir = chart_path.parent().unwrap_or_else(|| Path::new("."));
         let ingested = parts
             .ingest
-            .ingest(&bytes, dir, config.seed)
+            .ingest(&bytes, dir, config.seed, config.speed)
             .map_err(SessionError::Ingest)?;
         let identity = ingested.chart.identity.clone();
         let chart = parts.transform.apply(ingested.chart, config.seed);
@@ -839,6 +843,7 @@ impl Loaded {
                 wake: wake_policy(config.receive),
             },
             play_type: PlayType::Full,
+            speed: config.speed,
             start: record.start,
             events: record.events,
             arrivals: arrivals.iter().map(arrival).collect(),
