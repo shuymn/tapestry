@@ -9,13 +9,18 @@ publish.workspace = true
 
 # `cargo xtask check-arch` (R1) rejects any normal or build dependency
 # outside `bms-model`, `rules`, and the reviewed allowlist in
-# `xtask/src/arch.rs`. Dev-dependencies are test-only and outside R1.
+# `xtask/src/arch.rs`. Dev-dependencies (tests and benchmarks) are outside R1.
 [dependencies]
 bms-model.workspace = true
 rules.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "evaluate"
+harness = false
