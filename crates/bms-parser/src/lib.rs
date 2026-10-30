@@ -4,7 +4,8 @@
 //! Supports `#PLAYER 1` 7-key + scratch charts. Charts and sounds are
 //! untrusted: every limit in [`Limits`] is checked before the work it bounds,
 //! times use exact rationals whose size is capped, and sound files are
-//! confined to the chart folder. This crate does not use floating point.
+//! confined to the chart folder. [`read_header`] reads only the descriptive
+//! header commands, for a song list. This crate does not use floating point.
 //! The cast lints at the crate root reject `as` casts that may truncate,
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
@@ -118,6 +119,7 @@ mod branch;
 mod decimal;
 mod error;
 mod hash;
+mod header;
 mod parse;
 mod resolve;
 mod sound;
@@ -130,6 +132,7 @@ use std::path::Path;
 use bms_model::{Chart, ChartIdentity, ModelError, ScrollMap, SoundId, SoundRef, TimeUs};
 
 pub use error::{LoadError, Warning, WarningKind};
+pub use header::{Header, read_header};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
 pub const LOADER_VERSION: u32 = 6;
