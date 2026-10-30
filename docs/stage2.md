@@ -19,7 +19,7 @@ The stage exits when song selection, play, results and retry can be played repea
 - the library database is rebuilt when its schema version changes (D5);
 - no egui in stage 2, and library roots live in `device.toml` (D4);
 - difficulty tables, song preview and pitch-preserving speed are deferred (§1);
-- personal bests are kept per `#RANDOM` branch (D8);
+- personal bests for charts with `#RANDOM` are left undecided, and such charts get no best in stage 2 (D8);
 - a what-if of a completed play runs to its own final deadline (D9);
 - the gauge denominator in practice is the whole chart's note count (D13);
 - a practice round cuts its audio once the section is judged (D15);
@@ -52,7 +52,8 @@ The stage exits when song selection, play, results and retry can be played repea
   - difficulty tables (importing table data, fetched or from a local file, plus an MD5 join);
   - song preview playback;
   - pitch-preserving speed change (needs a time stretcher, so in stage 2 speed changes pitch);
-  - `egui` (D4).
+  - `egui` (D4);
+  - how personal bests treat charts with `#RANDOM` (D8).
 - **Not built yet:** CN/HCN, automatic offset adjustment, and its recorded stream (section evaluation uses fixed offsets).
 - **Unchanged by this stage:** #43 output streaming (D16), #45, #75, #81, #83, #86.
 
@@ -175,9 +176,11 @@ egui comes with the first form-like screen.
 
 ### D8. Personal bests: key, eligibility and invalidation
 
-**Key.** Bests are keyed by (file SHA-256, resolved-chart hash, preset SHA-256, LN mode).
-- Each `#RANDOM` branch keeps its own best (decided). A perfect 10-note branch is never compared with a 100-note branch's 200 EX.
-- Selection shows the best for the variant the current seed resolves.
+**Key.** Bests are keyed by (file SHA-256, preset SHA-256, LN mode).
+
+**Charts with `#RANDOM` get no best yet.** Whether a best is kept per resolved branch or per file is left open: a file whose branches hold 10 and 100 notes would otherwise either show several bests or compare a perfect 10-note play with a 100-note branch's 200 EX.
+- A play whose load resolved any `#RANDOM` is saved as usual, but `counts_for_best` is false for it and selection shows no best for the chart.
+- Records keep their seed and resolved-chart hash, and the bests are a cache rebuilt from records. Either rule can therefore be adopted later by a schema bump and a rebuild, with no play lost.
 
 **Eligibility.** One predicate, `counts_for_best(record, verified, saved)`, serves live updates and rebuilds alike. It holds only when all of these are true:
 - `verify` accepts the record;
@@ -803,7 +806,7 @@ Each one holds the behavior D5 and D6 state.
 - `played_to_end_with_overflow_sets_no_best`;
 - `failed_save_sets_no_best`;
 - `only_eligible_plays_set_bests`;
-- `random_branches_keep_separate_bests`;
+- `random_charts_get_no_best_and_still_save`;
 - `version_change_invalidates_bests_without_schema_change`;
 - `ingest_is_idempotent`;
 - `rebuild_from_records_skips_refused`.
