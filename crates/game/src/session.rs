@@ -564,7 +564,8 @@ impl Loaded {
     ///
     /// [`LogicError::RecordingTooLarge`] when the window needs more than
     /// the recording policy reserves ([`Reservation`]): the play is refused
-    /// before its countdown rather than cut off midway.
+    /// right after recording opens, before it is handed to audio and the
+    /// screen, rather than cut off midway.
     ///
     /// An autoplay session ([`SessionConfig::autoplay`]) plans with the
     /// built-in keyboard key config and an input offset of 0, whatever the
@@ -1122,7 +1123,8 @@ fn arrival(a: &InputArrival) -> Arrival {
     }
 }
 
-/// The memory one play may reserve for its recording, before its countdown
+/// The memory one play may reserve for its recording, right after
+/// recording opens and before the play is handed to audio and the screen
 /// (design.md "Recording Capacity"): what [`Reservation`] counts.
 pub const RECORDING_MEMORY: usize = 512 << 20;
 
@@ -1135,7 +1137,8 @@ pub const TABLE_BYTES_PER_OBJECT: usize = 64;
 /// bookkeeping, the play view's buffers and the gauges).
 pub const SMALL_PARTS_BYTES: usize = 64 << 10;
 
-/// What a play reserves before its countdown, as a function of its input
+/// What a play reserves right after recording opens, before it is handed
+/// to audio and the screen, as a function of its input
 /// capacity: `fixed + per_input × inputs` bytes (design.md "Recording
 /// Capacity").
 ///
