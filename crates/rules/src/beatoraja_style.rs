@@ -85,9 +85,12 @@
 //!   its late BAD edge, at the first frame past it
 //!   (`play/JudgeManager.java:592-598`: `note time < now − 280 ms`); here
 //!   the POOR is decided at the edge itself, after any input at that time.
-//!   The judgments are the same, since a press exactly on the edge is BAD
-//!   in both; only the time of the POOR, and of a survival gauge's failure
-//!   it causes, differs.
+//!   A press exactly on the edge is BAD in both, but the order of
+//!   judgments can differ: at `#RANK 3`, with a tap at 1000 ms left unhit
+//!   and another lane's tap hit at 1280.001 ms, beatoraja judges the press
+//!   before the miss (NORMAL ends at 94 %, combo 0), while here the miss
+//!   comes first (NORMAL 100 %, combo 1). The time of the POOR, and of a
+//!   survival gauge's failure it causes, differs too.
 //!
 //! The CLASS gauges (course play only) are not included.
 
