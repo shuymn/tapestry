@@ -101,6 +101,59 @@ fn file_without_a_header_policy_is_refused() {
     assert!(e.to_string().contains("older version"), "{e}");
 }
 
+/// A file from before the gauge policies: a `default_total_milli` number,
+/// no correction, and a survival gauge without its threshold.
+#[test]
+fn file_before_the_gauge_policies_is_refused() {
+    let text = preset_to_toml(&rules::beatoraja_style());
+    for (current, old, key) in [
+        (
+            "[default_total]\nkind = \"notes_curve\"\n",
+            "default_total_milli = 260000\n",
+            "default_total",
+        ),
+        ("correction = \"none\"\n", "", "correction"),
+        (
+            "kind = \"survival\"\nfails_below = 0\n",
+            "kind = \"survival\"\n",
+            "fails_below",
+        ),
+    ] {
+        assert!(text.contains(current), "{text}");
+        let e = load_preset_toml(&text.replacen(current, old, 1)).unwrap_err();
+        assert!(
+            matches!(&e, PresetError::Parse(m) if m.message().contains(key)),
+            "{key}: {e}"
+        );
+        assert!(e.to_string().contains("older version"), "{e}");
+    }
+}
+
+#[test]
+fn every_gauge_policy_round_trips() {
+    let mut p = rules::beatoraja_style();
+    p.default_total = rules::DefaultTotal::NotesLinear;
+    let hard = &mut p.gauges[3];
+    hard.kind = rules::GaugeKind::Survival {
+        fails_below: rules::GaugeValue(2 * rules::GaugeValue::PERCENT),
+    };
+    hard.correction = rules::TotalCorrection::ScaleDamage;
+    for preset in [p, rules::custom()] {
+        let text = preset_to_toml(&preset);
+        let back = load_preset_toml(&text).unwrap();
+        assert_eq!(back.canonical_bytes(), preset.canonical_bytes());
+        assert_eq!(back, preset);
+    }
+    let mut fixed = rules::custom();
+    fixed.default_total = rules::DefaultTotal::Fixed { milli: 0 };
+    assert_eq!(
+        load_preset_toml(&preset_to_toml(&fixed)),
+        Err(PresetError::Invalid(rules::RuleError::OutOfRange {
+            field: "default_total.milli"
+        }))
+    );
+}
+
 #[test]
 fn the_largest_generated_presets_fit_the_file_limit() {
     let mut p = rules::custom();

@@ -4,10 +4,11 @@
 use bms_model::TimeUs;
 
 use crate::{
-    Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows,
-    LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
-    RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window, WindowPolicy,
+    Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
+    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+    RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalCorrection, TotalMode, Window,
+    WindowPolicy,
 };
 
 const MS: i64 = 1_000;
@@ -42,11 +43,14 @@ pub fn custom() -> RulePreset {
             poor: damage(pct(6)),
         },
         empty_poor: damage(pct(3)),
-        low_damage: None,
+        correction: TotalCorrection::None,
+        low_damage: Vec::new(),
     };
     let survival = GaugeRule {
         id: "survival".to_owned(),
-        kind: GaugeKind::Survival,
+        kind: GaugeKind::Survival {
+            fails_below: GaugeValue::EMPTY,
+        },
         start: GaugeValue::FULL,
         min: GaugeValue::EMPTY,
         max: GaugeValue::FULL,
@@ -58,11 +62,12 @@ pub fn custom() -> RulePreset {
             poor: damage(pct(9)),
         },
         empty_poor: damage(GaugeValue::centi_percent(450)),
-        low_damage: Some(LowDamage {
+        correction: TotalCorrection::None,
+        low_damage: vec![LowDamage {
             below: pct(30),
             num: 1,
             den: 2,
-        }),
+        }],
     };
     RulePreset {
         id: "custom".to_owned(),
@@ -97,7 +102,7 @@ pub fn custom() -> RulePreset {
             rank_milli: [50_000, 75_000, 100_000, 125_000],
             absent_milli: 100_000,
         }),
-        default_total_milli: 160_000,
+        default_total: DefaultTotal::Fixed { milli: 160_000 },
         denominator: Denominator::TapsAndLnHeads,
         gauges: vec![normal, survival],
         score: ScoreWeights {
@@ -141,10 +146,11 @@ mod tests {
     use bms_model::TimeUs;
 
     use crate::{
-        Assignment, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-        GaugeValue, Implementation, JudgeWindows, LaneTable, LateHeadRule, LnEndWindows, LnMode,
-        LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass, RankScale,
-        RulePreset, SameTimeOrder, ScoreWeights, TotalMode, Window, WindowPolicy,
+        Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta,
+        GaugeKind, GaugeRule, GaugeValue, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+        LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+        RankScale, RulePreset, SameTimeOrder, ScoreWeights, TotalCorrection, TotalMode, Window,
+        WindowPolicy,
     };
 
     const fn pj<T>(perfect: T, great: T, good: T, bad: T, poor: T) -> PerJudgment<T> {
@@ -202,7 +208,7 @@ mod tests {
                 rank_milli: [50_000, 75_000, 100_000, 125_000],
                 absent_milli: 100_000,
             }),
-            default_total_milli: 160_000,
+            default_total: DefaultTotal::Fixed { milli: 160_000 },
             denominator: Denominator::TapsAndLnHeads,
             gauges: vec![
                 GaugeRule {
@@ -221,21 +227,25 @@ mod tests {
                         g(-600_000),
                     ),
                     empty_poor: g(-300_000),
-                    low_damage: None,
+                    correction: TotalCorrection::None,
+                    low_damage: Vec::new(),
                 },
                 GaugeRule {
                     id: "survival".to_owned(),
-                    kind: GaugeKind::Survival,
+                    kind: GaugeKind::Survival {
+                        fails_below: GaugeValue(0),
+                    },
                     start: GaugeValue(10_000_000),
                     min: GaugeValue(0),
                     max: GaugeValue(10_000_000),
                     change: pj(g(16_000), g(16_000), g(0), g(-500_000), g(-900_000)),
                     empty_poor: g(-450_000),
-                    low_damage: Some(LowDamage {
+                    correction: TotalCorrection::None,
+                    low_damage: vec![LowDamage {
                         below: GaugeValue(3_000_000),
                         num: 1,
                         den: 2,
-                    }),
+                    }],
                 },
             ],
             score: ScoreWeights {
