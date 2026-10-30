@@ -7,7 +7,7 @@
 //! round-trips to the same canonical bytes and the same hash.
 //!
 //! Before the first release the file's shape may change incompatibly. A file
-//! written by an older version is refused as unreadable, never converted.
+//! of an older shape is refused as unreadable, never converted.
 
 use bms_model::TimeUs;
 use rules::{
