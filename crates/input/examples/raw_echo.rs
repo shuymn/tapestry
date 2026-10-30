@@ -1,8 +1,11 @@
 //! Manual check of the Raw Input path: prints each key edge with its source
 //! id and receive time, disconnects, arrivals and the focus gate tripping,
-//! then the input thread's wake interval distribution.
+//! then what the input thread measured: its wakes per second, by cause,
+//! the heartbeat's lateness and the publication intervals.
 //!
-//! `cargo run -p input --example raw_echo [seconds]` (30 s by default).
+//! `cargo run -p input --example raw_echo [seconds] [idle]` (30 s by
+//! default). With `idle` the thread is Idle after its first wake: it wakes
+//! for input only, and keys print as they arrive.
 //! A small window takes the foreground; its focus loss sets the gate's
 //! latch, because the message-only receiver window is never in the
 //! foreground. Every key is recorded here; a game records bound keys only.
@@ -28,8 +31,8 @@ mod app {
     use eval::{ControlId, InputKind};
     use input::raw::{RI_KEY_E0, RI_KEY_E1, key_control};
     use input::{
-        Capture, FocusLatch, InputThread, Percentile, QpcClock, SourceConfig, SourceReader,
-        SourceSet, WAKE_HISTOGRAM_LIMIT,
+        Capture, FocusLatch, InputThread, Percentile, Phase, QpcClock, SourceConfig, SourceReader,
+        SourceSet, WAKE_HISTOGRAM_LIMIT, WakeHistogram, Waker,
     };
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -41,6 +44,7 @@ mod app {
     use windows::core::w;
 
     static LATCH: OnceLock<FocusLatch> = OnceLock::new();
+    static WAKER: OnceLock<Waker> = OnceLock::new();
     static CLOSED: AtomicBool = AtomicBool::new(false);
 
     /// `e` and each of its sources on one line, `root: source: ...`.
@@ -66,9 +70,13 @@ mod app {
         unsafe { DefWindowProcW(hwnd, msg, w, l) }
     }
 
+    /// Sets the latch, then wakes the input thread to see it.
     fn latch() {
         if let Some(latch) = LATCH.get() {
             latch.latch();
+        }
+        if let Some(waker) = WAKER.get() {
+            waker.wake();
         }
     }
 
@@ -84,10 +92,12 @@ mod app {
         readers: Option<Vec<SourceReader>>,
         arrivals: usize,
         tripped: bool,
+        /// The phase after every wake.
+        phase: Phase,
     }
 
     impl Echo {
-        fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) {
+        fn wake(&mut self, sources: &mut SourceSet, now: TimeUs) -> Phase {
             let Some(readers) = &mut self.readers else {
                 // The first wake: every keyboard present takes part.
                 let keys = every_key();
@@ -103,7 +113,7 @@ mod app {
                     start.held.len()
                 );
                 self.readers = Some(sources.take_readers());
-                return;
+                return self.phase;
             };
             for reader in readers.iter_mut() {
                 while let Some(ev) = reader.pop() {
@@ -133,6 +143,7 @@ mod app {
                 self.tripped = true;
                 println!("{:>10} us  gate tripped: nothing more is recorded", now.0);
             }
+            self.phase
         }
     }
 
@@ -195,14 +206,26 @@ mod app {
         };
         println!("window open; in the foreground: {foreground}");
 
+        let idle = std::env::args().nth(2).as_deref() == Some("idle");
+        let waker = match Waker::new() {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("{}", chain(&e));
+                return ExitCode::FAILURE;
+            }
+        };
+        let _ = WAKER.set(waker.clone());
         let mut echo = Echo {
             readers: None,
             arrivals: 0,
             tripped: false,
+            phase: if idle { Phase::Idle } else { Phase::Open },
         };
-        let thread = match InputThread::spawn(clock, sources, Capture::new(), move |s, now| {
-            echo.wake(s, now);
-        }) {
+        let begun = clock.now();
+        let spawned = InputThread::spawn(clock, sources, Capture::new(), &waker, move |s, now| {
+            echo.wake(s, now)
+        });
+        let thread = match spawned {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("{}", chain(&e));
@@ -234,18 +257,39 @@ mod app {
                 return ExitCode::FAILURE;
             }
         };
-        let p99 = match report.intervals.p99() {
+        let ran_s = (clock.now().0 - begun.0) as f64 / 1e6;
+        let c = report.causes;
+        println!(
+            "{:>10} us  {} waits in {ran_s:.1} s ({:.0}/s; {} with nothing to do); MMCSS Games: {}",
+            clock.now().0,
+            report.waits,
+            report.waits as f64 / ran_s,
+            report.rearms,
+            report.mmcss
+        );
+        println!(
+            "            wakes by cause: input {}, event {}, heartbeat {}, rest of a cut drain {}; drains cut {}",
+            c.input, c.event, c.heartbeat, c.drain, report.cuts
+        );
+        println!("            wake intervals: {}", summary(&report.intervals));
+        println!(
+            "            heartbeat lateness: {}",
+            summary(&report.lateness)
+        );
+        println!(
+            "            publication intervals (Open, Tail): {}",
+            summary(&report.publications)
+        );
+        ExitCode::SUCCESS
+    }
+
+    /// A histogram's count, p99 and maximum.
+    fn summary(h: &WakeHistogram) -> String {
+        let p99 = match h.p99() {
             Percentile::At(us) => format!("{us} us"),
             Percentile::Above => format!("above {WAKE_HISTOGRAM_LIMIT} us"),
             Percentile::Empty => "none".to_owned(),
         };
-        println!(
-            "{:>10} us  wake intervals: {} wakes, p99 {p99}, max {} us; MMCSS Games: {}",
-            clock.now().0,
-            report.intervals.count(),
-            report.intervals.max(),
-            report.mmcss
-        );
-        ExitCode::SUCCESS
+        format!("{} samples, p99 {p99}, max {} us", h.count(), h.max())
     }
 }

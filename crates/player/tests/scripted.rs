@@ -73,6 +73,9 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
             }],
             audio_offset: TimeUs(0),
             display_offset: TimeUs(0),
+            wake: replay::WakePolicy::Timer {
+                heartbeat_us: 1_000,
+            },
         },
         play_type: PlayType::Full,
         start: InputStart {

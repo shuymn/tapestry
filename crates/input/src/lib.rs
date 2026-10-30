@@ -17,7 +17,8 @@
 //!
 //! On Windows, the input thread (`InputThread`) receives keyboards and
 //! HID game controllers through Raw Input and stamps each batch with the
-//! QPC read at its wake (`QpcClock`). Decoding the Raw Input packets
+//! QPC read at its wake (`QpcClock`); when it wakes is [`cadence`]'s
+//! portable state machine. Decoding the Raw Input packets
 //! ([`raw`]), turning controller reports into packets ([`hid`]) and
 //! converting QPC ticks ([`qpc_to_us`]) are portable.
 //!
@@ -29,6 +30,7 @@
 #![cfg_attr(windows, deny(unsafe_code))]
 
 mod autoplay;
+pub mod cadence;
 mod capture;
 mod gate;
 pub mod hid;
@@ -44,6 +46,7 @@ mod win;
 use bms_model::TimeUs;
 
 pub use autoplay::{AUTOPLAY_DEVICE, AutoplayInput, TimeOverflow, autoplay, autoplay_count};
+pub use cadence::{Phase, WakeReport};
 pub use capture::{Capture, Watched};
 pub use gate::{Admit, DeviceId, FocusGate, FocusLatch, Packet};
 pub use queue::{Overflow, SourceReader, SourceWriter, source_queue};
@@ -52,8 +55,8 @@ pub use sources::{Arrival, ConfigError, DeviceKind, SOURCE_LIMIT, SourceConfig, 
 pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
 #[cfg(windows)]
 pub use win::{
-    ClockedThread, CollectionInfo, InputError, InputThread, QpcClock, WakeReport,
-    controller_layouts, hid_usages, keyboard_target,
+    ClockedThread, CollectionInfo, InputError, InputThread, QpcClock, Waker, controller_layouts,
+    hid_usages, keyboard_target,
 };
 
 /// Something that delivers input to a [`SourceSet`], such as a script in

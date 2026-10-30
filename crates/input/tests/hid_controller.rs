@@ -22,8 +22,8 @@ use bms_model::TimeUs;
 use eval::{ControlId, InputKind};
 use input::hid::{AxisCap, axis_control, button_control, in_collection, is_axis};
 use input::{
-    Capture, DeviceId, DeviceKind, FocusLatch, InputThread, QpcClock, SourceConfig, SourceReader,
-    SourceSet, controller_layouts, hid_usages,
+    Capture, DeviceId, DeviceKind, FocusLatch, InputThread, Phase, QpcClock, SourceConfig,
+    SourceReader, SourceSet, Waker, controller_layouts, hid_usages,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -131,10 +131,12 @@ fn hid_controller_round_trip() {
     let out_of_range: Arc<Vec<AtomicU64>> = Arc::new((0..16).map(|_| AtomicU64::new(0)).collect());
     let counts = Arc::clone(&out_of_range);
     let mut opened = false;
+    let waker = Waker::new().unwrap();
     let thread = InputThread::spawn(
         QpcClock::start(),
         sources,
         Capture::new(),
+        &waker,
         move |sources: &mut SourceSet, now: TimeUs| {
             if opened {
                 if sources.gate().is_tripped() {
@@ -143,7 +145,7 @@ fn hid_controller_round_trip() {
                 for (c, n) in counts.iter().zip(sources.axis_out_of_range()) {
                     c.store(n, Ordering::Release);
                 }
-                return;
+                return Phase::Open;
             }
             opened = true;
             let devices: Vec<_> = sources.devices().collect();
@@ -158,6 +160,7 @@ fn hid_controller_round_trip() {
                 .map(|(d, k)| (d, k, sources.axes(d).to_vec()))
                 .collect();
             let _ = tx.send((sources.take_readers(), participants));
+            Phase::Open
         },
     )
     .unwrap();

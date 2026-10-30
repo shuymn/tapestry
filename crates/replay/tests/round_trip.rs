@@ -16,7 +16,7 @@ use proptest::test_runner::TestRunner;
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DecodeLimits, DeviceKind, DeviceRecord, EndStatus,
     Incomplete, PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status,
-    TransformRecord, Versions, decode, encode,
+    TransformRecord, Versions, WakePolicy, decode, encode,
 };
 use sha2::{Digest, Sha256};
 
@@ -169,10 +169,23 @@ fn source() -> impl Strategy<Value = SourceRecord> {
         )
 }
 
+fn wake() -> impl Strategy<Value = WakePolicy> {
+    prop_oneof![
+        (u32s(), u32s(), u32s()).prop_map(|(heartbeat_us, input_gap_us, drain_cut)| {
+            WakePolicy::Input {
+                heartbeat_us,
+                input_gap_us,
+                drain_cut,
+            }
+        }),
+        u32s().prop_map(|heartbeat_us| WakePolicy::Timer { heartbeat_us }),
+    ]
+}
+
 fn record() -> impl Strategy<Value = PlayRecord> {
     (
         (versions(), chart(), preset(), text()),
-        (vec(source(), 1..=4), i64s(), i64s()),
+        (vec(source(), 1..=4), i64s(), i64s(), wake()),
         (i64s(), vec((any::<u16>(), u32s(), i32s()), 0..=6)),
         vec(
             (
@@ -198,7 +211,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
         .prop_map(
             |(
                 (versions, chart, preset, session_policy),
-                (sources, audio_offset, display_offset),
+                (sources, audio_offset, display_offset, wake),
                 (opened_at, held),
                 events,
                 arrivals,
@@ -215,6 +228,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
                         sources,
                         audio_offset: TimeUs(audio_offset),
                         display_offset: TimeUs(display_offset),
+                        wake,
                     },
                     play_type: PlayType::Full,
                     start: InputStart {

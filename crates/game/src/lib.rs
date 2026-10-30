@@ -68,6 +68,7 @@ pub use session::{
     AutoKeySounds, Command, Loaded, MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport,
     PlayScript, PlayStart, RECORDING_MEMORY, ReloadError, Reservation, SMALL_PARTS_BYTES,
     SYSTEM_CONTROL_INPUTS, Session, SessionConfig, SessionError, Settings, TABLE_BYTES_PER_OBJECT,
+    wake_policy,
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,

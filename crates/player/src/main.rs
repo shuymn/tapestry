@@ -51,7 +51,8 @@ use game::{
     save_settings,
 };
 use input::{
-    AutoplayInput, Capture, ClockedThread, InputThread, QpcClock, SourceConfig, SourceSet,
+    AutoplayInput, Capture, ClockedThread, InputThread, Phase, QpcClock, SourceConfig, SourceSet,
+    Waker,
 };
 use render::{AdapterChoice, Renderer, Target};
 use replay::{BuildProvenance, ReceiveMethod};
@@ -550,11 +551,14 @@ fn view(controls: &Controls) -> View {
     }
 }
 
-/// The controls, with the settings keys starting from the loaded values.
+/// The controls, with the settings keys starting from the loaded values,
+/// waking the calling thread: the game thread.
 fn controls(loaded: &Loaded, clock: QpcClock) -> Arc<Controls> {
     let s = loaded.settings();
     let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volume(s.device.master_volume);
-    Arc::new(Controls::with_tuning(clock, Arc::new(tuning)))
+    let controls = Controls::with_tuning(clock, Arc::new(tuning));
+    controls.set_game(std::thread::current());
+    Arc::new(controls)
 }
 
 /// The game thread's rig around the started threads.
@@ -603,6 +607,7 @@ fn rig<'a>(
         #[cfg(feature = "dev-tools")]
         measured_plays: None,
         lead_in: loaded.config().lead_in,
+        in_play: false,
         #[cfg(feature = "dev-tools")]
         quit_after_end: None,
         #[cfg(feature = "dev-tools")]
@@ -630,17 +635,22 @@ fn rig<'a>(
 ///
 /// Why the window or the input thread cannot start, or a registration
 /// that does not target the input thread.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one part of the startup the order above needs"
+)]
 fn open_window_and_input(
     controls: &Arc<Controls>,
     clock: QpcClock,
     sources: SourceSet,
     capture: Capture,
-    wake: impl FnMut(&mut SourceSet, TimeUs) + Send + 'static,
+    waker: &Waker,
+    wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, InputThread)> {
     let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1, monitor)?;
-    let input = InputThread::spawn(clock, sources, capture, wake);
+    let input = InputThread::spawn(clock, sources, capture, waker, wake);
     let input = match input {
         Ok(i) => i,
         Err(e) => {
@@ -666,12 +676,13 @@ fn open_window_and_clocked(
     controls: &Arc<Controls>,
     clock: QpcClock,
     sources: SourceSet,
-    wake: impl FnMut(&mut SourceSet, TimeUs) + Send + 'static,
+    waker: &Waker,
+    wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, ClockedThread)> {
     let (window_thread, surface) = window::open(Arc::clone(controls), keys.0, keys.1, monitor)?;
-    match ClockedThread::spawn(clock, sources, wake) {
+    match ClockedThread::spawn(clock, sources, waker, wake) {
         Ok(input) => Ok((window_thread, surface, input)),
         Err(e) => {
             window_thread.close();
@@ -699,6 +710,7 @@ fn play(
         keyboard,
     } = prepare(chart, &input)?;
     let controls = controls(&loaded, clock);
+    let waker = Waker::new().context("input")?;
     let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
     let (audio, opened) = audio_side::spawn(
         move || -> Result<_, audio::WasapiError> {
@@ -711,15 +723,16 @@ fn play(
     let probes = Probes::new();
     let audio = start_engine(&loaded, schedule, audio, opened, probes.sounds.0)?;
     controls.set_latch(sources.gate().handle());
+    controls.set_waker(waker.clone());
     let raw_input = matches!(mode, Mode::Clock);
-    let (mut hook, input) = input_side::link(Arc::clone(&controls), mode);
+    let (mut hook, input) = input_side::link(Arc::clone(&controls), mode, waker.clone());
     let device = &loaded.settings().device;
     let keys = (device.keyboard.retry, device.keyboard.quit);
     let monitor = device.monitor.clone();
     let wake = move |s: &mut SourceSet, now| {
         #[cfg(feature = "dev-tools")]
         alloc_count::tag(alloc_count::Tag::Input);
-        hook.wake(s, now);
+        hook.wake(s, now)
     };
     let started = if raw_input {
         open_window_and_input(
@@ -727,13 +740,14 @@ fn play(
             clock,
             sources,
             Capture::new(),
+            &waker,
             wake,
             keys,
             monitor,
         )
         .map(|(w, s, t)| (w, s, Some(t), None))
     } else {
-        open_window_and_clocked(&controls, clock, sources, wake, keys, monitor)
+        open_window_and_clocked(&controls, clock, sources, &waker, wake, keys, monitor)
             .map(|(w, s, t)| (w, s, None, Some(t)))
     };
     let (window_thread, surface, raw_thread, clocked_thread) = match started {
@@ -834,6 +848,7 @@ fn headless(
         keyboard,
     } = prepare(chart, &input)?;
     let controls = controls(&loaded, clock);
+    let waker = Waker::new().context("input")?;
     let last_note = loaded
         .chart()
         .lanes
@@ -853,10 +868,11 @@ fn headless(
     let probes = Probes::new();
     let audio = start_engine(&loaded, schedule, audio, opened, probes.sounds.0)?;
     controls.set_latch(sources.gate().handle());
-    let (mut hook, input) = input_side::link(Arc::clone(&controls), mode);
-    let input_thread = ClockedThread::spawn(clock, sources, move |s, now| {
+    controls.set_waker(waker.clone());
+    let (mut hook, input) = input_side::link(Arc::clone(&controls), mode, waker.clone());
+    let input_thread = ClockedThread::spawn(clock, sources, &waker, move |s, now| {
         alloc_count::tag(alloc_count::Tag::Input);
-        hook.wake(s, now);
+        hook.wake(s, now)
     })
     .context("input")?;
     let dump: Box<dyn render_side::FrameSink> = match frames {
@@ -944,12 +960,14 @@ mod tests {
     fn keyboards_stay_registered_to_the_input_thread() {
         let clock = QpcClock::start();
         let controls = Arc::new(Controls::new(clock));
-        let (mut hook, _link) = input_side::link(Arc::clone(&controls), Mode::Clock);
+        let waker = input::Waker::new().unwrap();
+        let (mut hook, _link) = input_side::link(Arc::clone(&controls), Mode::Clock, waker.clone());
         let (window, _surface, input) = open_window_and_input(
             &controls,
             clock,
             sources(),
             input::Capture::new(),
+            &waker,
             move |s, now| hook.wake(s, now),
             (Some(0x0E), Some(0x01)),
             None,

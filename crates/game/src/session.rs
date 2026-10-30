@@ -24,7 +24,7 @@ use input::hid::is_axis;
 use input::{Arrival as InputArrival, DeviceKind, InputAdapter, ScriptedInput, SourceSet};
 use replay::{
     Arrival, BuildProvenance, ChartRecord, DeviceRecord, EndStatus, Incomplete, PlayRecord,
-    PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions,
+    PlayType, PresetRecord, ReceiveMethod, SourceRecord, Status, Versions, WakePolicy,
 };
 use rules::{GaugeKind, RulePreset};
 
@@ -828,6 +828,7 @@ impl Loaded {
                     .collect(),
                 audio_offset: TimeUs(settings.device.audio_offset_us),
                 display_offset: TimeUs(settings.device.display_offset_us),
+                wake: wake_policy(config.receive),
             },
             play_type: PlayType::Full,
             start: record.start,
@@ -1163,6 +1164,24 @@ const fn replay_kind(kind: DeviceKind) -> replay::DeviceKind {
     match kind {
         DeviceKind::Keyboard => replay::DeviceKind::Keyboard,
         DeviceKind::Controller => replay::DeviceKind::Controller,
+    }
+}
+
+/// The wake policy of the input thread that receives input `receive`'s
+/// way: the Raw Input thread wakes on input, the thread of generated input
+/// on its timer (design.md "Raw Input reception", "Autoplay").
+#[must_use]
+pub fn wake_policy(receive: ReceiveMethod) -> WakePolicy {
+    use input::cadence::{DRAIN_CUT, HEARTBEAT, INPUT_GAP};
+    let us = |t: TimeUs| u32::try_from(t.0).unwrap_or(u32::MAX);
+    let (heartbeat_us, input_gap_us) = (us(HEARTBEAT), us(INPUT_GAP));
+    match receive {
+        ReceiveMethod::RawInput => WakePolicy::Input {
+            heartbeat_us,
+            input_gap_us,
+            drain_cut: DRAIN_CUT,
+        },
+        ReceiveMethod::Scripted => WakePolicy::Timer { heartbeat_us },
     }
 }
 

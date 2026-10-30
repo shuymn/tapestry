@@ -26,12 +26,14 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
 use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_ContainerId, DEVPKEY_Device_InstanceId, DEVPROPTYPE,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer,
-    TIMER_ALL_ACCESS, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, INFINITE,
+    SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::Input::{
     GetRawInputBuffer, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList,
@@ -42,11 +44,15 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL,
-    HWND_MESSAGE, MSG, PM_REMOVE, PeekMessageW, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RIM_INPUTSINK,
-    RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WNDCLASSW,
+    HWND_MESSAGE, MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, MWMO_INPUTAVAILABLE,
+    MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, QS_RAWINPUT, QUEUE_STATUS_FLAGS,
+    RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RIM_INPUTSINK, RegisterClassW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WNDCLASSW,
 };
 use windows::core::{PCWSTR, w};
 
+use crate::WakeReport;
+use crate::cadence::{self, Boundary, Cadence, Driven, Phase, Wait, WaitFailed, Waiter, Woken};
 use crate::capture::Capture;
 use crate::gate::DeviceId;
 use crate::hid::{
@@ -57,7 +63,7 @@ use crate::hid::{
 };
 use crate::raw;
 use crate::sources::{DeviceKind, SourceSet};
-use crate::time::{QpcFrequency, WakeHistogram, qpc_to_us};
+use crate::time::{QpcFrequency, qpc_to_us};
 
 // The layout `raw` decodes, checked against the OS definitions.
 const _: () = {
@@ -198,18 +204,114 @@ impl Timer {
         Ok(Self(handle))
     }
 
-    /// Sleeps until `clock` reads `deadline`, without spinning.
-    fn wait_until(&self, clock: &QpcClock, deadline: TimeUs) {
-        let left = deadline.0.saturating_sub(clock.now().0);
-        if left <= 0 {
-            return;
-        }
+    /// Sets the timer to fire once, `left_us` from now; setting it clears
+    /// a signal left from before.
+    fn set(&self, left_us: i64) -> windows::core::Result<()> {
         // Relative due time in 100 ns units.
-        let due = -left.saturating_mul(10);
+        let due = -left_us.saturating_mul(10);
         // SAFETY: a valid timer handle and no completion routine.
-        unsafe {
-            if SetWaitableTimer(self.0, &due, 0, None, None, false).is_ok() {
-                WaitForSingleObject(self.0, 1000);
+        unsafe { SetWaitableTimer(self.0, &due, 0, None, None, false) }
+    }
+}
+
+/// An auto-reset event, closed on drop.
+#[derive(Debug)]
+struct Event(HANDLE);
+
+// SAFETY: an event handle may be signaled, waited on and closed from any
+// thread; it is closed once, when the last owner drops it.
+unsafe impl Send for Event {}
+// SAFETY: as above; `SetEvent` and waits need no exclusive access.
+unsafe impl Sync for Event {}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned by this value.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// The input thread's wake event (design.md "Input"): signaling it wakes
+/// the thread from any wait, so a request, a focus change or stop is seen
+/// without a timer. A signal before the wait is kept until it.
+/// Clones share the event.
+#[derive(Clone, Debug)]
+pub struct Waker(Arc<Event>);
+
+impl Waker {
+    /// A new event, not signaled.
+    ///
+    /// # Errors
+    ///
+    /// [`InputError::Os`] if the event cannot be created.
+    pub fn new() -> Result<Self, InputError> {
+        // SAFETY: an unnamed auto-reset event, owned by the value.
+        let handle = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+            .map_err(|e| InputError::os("CreateEventW", e))?;
+        Ok(Self(Arc::new(Event(handle))))
+    }
+
+    /// Wakes the thread. It never blocks and allocates nothing.
+    pub fn wake(&self) {
+        // SAFETY: a valid event handle. It fails only for an invalid one.
+        let _ = unsafe { SetEvent(self.0.0) };
+    }
+
+    fn handle(&self) -> HANDLE {
+        self.0.0
+    }
+}
+
+/// The OS side of [`cadence::run`]: `MsgWaitForMultipleObjectsEx` on the
+/// wake event and the timer, for queued Raw Input with
+/// `QS_RAWINPUT | MWMO_INPUTAVAILABLE` (device changes come through the
+/// Raw Input queue too). The call that failed is kept for the error.
+struct OsWaiter<'a> {
+    clock: QpcClock,
+    timer: &'a Timer,
+    event: HANDLE,
+    failed: Option<(&'static str, windows::core::Error)>,
+}
+
+impl Waiter for OsWaiter<'_> {
+    fn wait(&mut self, wait: Wait) -> Result<Woken, WaitFailed> {
+        let handles = [self.event, self.timer.0];
+        let mut count = 1;
+        if let Some(deadline) = wait.deadline {
+            let left = deadline.0.saturating_sub(self.clock.now().0);
+            if left <= 0 {
+                return Ok(Woken::Timer);
+            }
+            if let Err(e) = self.timer.set(left) {
+                self.failed = Some(("SetWaitableTimer", e));
+                return Err(WaitFailed);
+            }
+            count = 2;
+        }
+        let (mask, flags) = if wait.input {
+            (QS_RAWINPUT, MWMO_INPUTAVAILABLE)
+        } else {
+            (
+                QUEUE_STATUS_FLAGS(0),
+                MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS(0),
+            )
+        };
+        // No timeout: the event wakes every wait that has no deadline,
+        // and stop signals it after setting its flag.
+        // SAFETY: valid handles that outlive the call.
+        let woke =
+            unsafe { MsgWaitForMultipleObjectsEx(handles.get(..count), INFINITE, mask, flags) };
+        match woke.0.wrapping_sub(WAIT_OBJECT_0.0) {
+            0 => Ok(Woken::Event),
+            1 if count == 2 => Ok(Woken::Timer),
+            n if wait.input && n == count as u32 => Ok(Woken::Input),
+            // WAIT_FAILED, or a result no wait above can give.
+            _ => {
+                self.failed = Some((
+                    "MsgWaitForMultipleObjectsEx",
+                    windows::core::Error::from_thread(),
+                ));
+                Err(WaitFailed)
             }
         }
     }
@@ -262,6 +364,18 @@ const ONE_WORDS: usize = (raw::HEADER_SIZE + raw::HID_HEADER_SIZE + MAX_REPORT_B
 const MANY_WORDS: usize = 8192;
 /// `size_of::<RAWINPUTHEADER>()` as the calls take it.
 const HEADER_BYTES: u32 = raw::HEADER_SIZE as u32;
+/// The fewest bytes a packet takes in `GetRawInputBuffer`'s buffer: a
+/// header and a keyboard, or a header, `RAWHID`'s fields and one report
+/// byte, aligned to 8.
+const MIN_PACKET_BYTES: usize = {
+    let hid = raw::HID_HEADER_SIZE + 1;
+    let body = if raw::KEYBOARD_SIZE < hid {
+        raw::KEYBOARD_SIZE
+    } else {
+        hid
+    };
+    (raw::HEADER_SIZE + body).next_multiple_of(8)
+};
 
 fn as_bytes(words: &[u64]) -> &[u8] {
     // SAFETY: any u64 is valid as 8 bytes, and the length is in bytes.
@@ -924,11 +1038,18 @@ impl RawInput {
         }
     }
 
-    /// Reads every packet still queued, in blocks.
-    fn drain(&mut self, sources: &mut SourceSet) {
-        loop {
-            let mut size = (self.many.len() * 8) as u32;
-            // SAFETY: `many` holds `size` bytes and is 8-byte aligned.
+    /// Reads the packets still queued, in blocks, at most `budget` of
+    /// them, and returns how many it read. Each read offers only as many
+    /// bytes as `budget` smallest packets take, so it cannot read more.
+    fn drain(&mut self, sources: &mut SourceSet, budget: u32) -> u32 {
+        let mut read = 0;
+        while read < budget {
+            let room = ((budget - read) as usize)
+                .saturating_mul(MIN_PACKET_BYTES)
+                .min(self.many.len() * 8);
+            let mut size = room as u32;
+            // SAFETY: `many` holds at least `size` bytes and is 8-byte
+            // aligned.
             let count = unsafe {
                 GetRawInputBuffer(
                     Some(self.many.as_mut_ptr().cast::<RAWINPUT>()),
@@ -936,15 +1057,18 @@ impl RawInput {
                     HEADER_BYTES,
                 )
             };
-            // On failure, such as a next packet larger than the buffer,
-            // the packets stay queued and arrive as their own `WM_INPUT`.
+            // On failure, such as a next packet larger than the room
+            // offered, the packets stay queued and arrive as their own
+            // `WM_INPUT` or at the next drain.
             if count == 0 || count == u32::MAX {
-                return;
+                break;
             }
             for block in raw::blocks(as_bytes(&self.many), count as usize) {
                 deliver(block, &self.capture, &mut self.controllers, sources);
             }
+            read += count;
         }
+        read
     }
 
     fn device_change(&mut self, change: u32, handle: HANDLE, sources: &mut SourceSet) {
@@ -1137,33 +1261,46 @@ fn device_list() -> Result<Vec<RAWINPUTDEVICELIST>, InputError> {
 }
 
 impl RawInput {
-    /// One batch: everything queued now, stamped `now`, then the
-    /// publication from a fresh clock read. It plays the part of
+    /// One batch ([`cadence::batch`]): what is queued now, up to
+    /// [`cadence::DRAIN_CUT`] messages, stamped `now`, then the
+    /// publication from a fresh clock read. Returns that read and whether
+    /// the batch was cut. It plays the part of
     /// [`InputAdapter::poll`](crate::InputAdapter::poll), which needs a
     /// `Send` adapter.
-    fn poll(&mut self, now: TimeUs, sources: &mut SourceSet) {
-        sources.begin_batch(now);
+    fn poll(&mut self, now: TimeUs, sources: &mut SourceSet) -> (TimeUs, bool) {
+        let clock = self.clock;
+        cadence::batch(&clock, sources, now, |sources, budget| {
+            self.next(sources, budget)
+        })
+    }
+
+    /// Takes one message off the queue and what it carries, at most
+    /// `budget` packets; returns how many messages and packets were read,
+    /// 0 when the queue is empty.
+    fn next(&mut self, sources: &mut SourceSet, budget: u32) -> u32 {
         let mut msg = MSG::default();
         // No message filter, so WM_INPUT_DEVICE_CHANGE is never dropped.
         // SAFETY: pumping this thread's own messages.
-        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-            match msg.message {
-                WM_INPUT => {
-                    self.read_one(HRAWINPUT(msg.lParam.0 as *mut c_void), sources);
-                    self.drain(sources);
-                }
-                WM_INPUT_DEVICE_CHANGE => self.device_change(
-                    msg.wParam.0 as u32,
-                    HANDLE(msg.lParam.0 as *mut c_void),
-                    sources,
-                ),
-                _ => {}
-            }
-            // SAFETY: a message just retrieved; for WM_INPUT this lets
-            // DefWindowProc clean up.
-            unsafe { DispatchMessageW(&msg) };
+        if !unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            return 0;
         }
-        sources.end_batch(self.clock.now());
+        let mut read = 1;
+        match msg.message {
+            WM_INPUT => {
+                self.read_one(HRAWINPUT(msg.lParam.0 as *mut c_void), sources);
+                read += self.drain(sources, budget.saturating_sub(1));
+            }
+            WM_INPUT_DEVICE_CHANGE => self.device_change(
+                msg.wParam.0 as u32,
+                HANDLE(msg.lParam.0 as *mut c_void),
+                sources,
+            ),
+            _ => {}
+        }
+        // SAFETY: a message just retrieved; for WM_INPUT this lets
+        // DefWindowProc clean up.
+        unsafe { DispatchMessageW(&msg) };
+        read
     }
 }
 
@@ -1184,76 +1321,77 @@ impl Drop for RawInput {
     }
 }
 
-/// The input thread's wake period: 1 kHz.
-const WAKE_PERIOD: TimeUs = TimeUs(1000);
-
-/// What the input thread measured.
-#[derive(Clone, Debug, Default)]
-pub struct WakeReport {
-    /// The intervals between consecutive wakes.
-    pub intervals: WakeHistogram,
-    /// Whether the MMCSS "Games" registration succeeded.
-    pub mmcss: bool,
-}
-
 /// The loop both input threads run until `stop` is set: under MMCSS
-/// "Games", it wakes at 1 kHz on `timer`, reads the clock and calls `wake`
-/// with that read. Wakes keep their phase, and a missed one is skipped
-/// rather than made up in a burst.
+/// "Games", [`cadence::run`] on the wake event, the timer and, for
+/// [`Driven::Input`], the thread's Raw Input queue. `wake` is dropped when
+/// the loop ends, however it ends.
+///
+/// # Errors
+///
+/// [`InputError::Os`] when a wait or setting the timer failed: the thread
+/// ends, and its hook with it.
 fn wake_loop(
     clock: QpcClock,
+    driven: Driven,
     timer: &Timer,
+    waker: &Waker,
     stop: &AtomicBool,
-    mut wake: impl FnMut(TimeUs),
-) -> WakeReport {
+    wake: impl FnMut(TimeUs) -> Boundary,
+) -> Result<WakeReport, InputError> {
     let mmcss = Mmcss::games();
-    let mut report = WakeReport {
-        intervals: WakeHistogram::new(),
-        mmcss: mmcss.is_some(),
+    let mut report = WakeReport::new();
+    report.mmcss = mmcss.is_some();
+    let mut waiter = OsWaiter {
+        clock,
+        timer,
+        event: waker.handle(),
+        failed: None,
     };
-    let mut last = clock.now();
-    let mut next = last;
-    while !stop.load(Ordering::Acquire) {
-        next = TimeUs(next.0 + WAKE_PERIOD.0);
-        timer.wait_until(&clock, next);
-        let now = clock.now();
-        let missed = (now.0 - next.0).div_euclid(WAKE_PERIOD.0).max(0);
-        next = TimeUs(next.0 + missed * WAKE_PERIOD.0);
-        report.intervals.record(now.0.abs_diff(last.0));
-        last = now;
-        wake(now);
-    }
+    let mut cadence = Cadence::new(driven, clock.now());
+    let ran = cadence::run(&clock, &mut waiter, stop, &mut cadence, &mut report, wake);
     drop(mmcss);
-    report
+    match (ran, waiter.failed) {
+        (Ok(()), _) => Ok(report),
+        (Err(WaitFailed), Some((call, error))) => Err(InputError::os(call, error)),
+        (Err(WaitFailed), None) => Err(InputError::os(
+            "MsgWaitForMultipleObjectsEx",
+            windows::core::Error::from_thread(),
+        )),
+    }
 }
 
-/// A running input thread: the signal that stops it and its handle.
-/// Dropping it stops and joins the thread.
+/// A running input thread: the signal that stops it, the event that wakes
+/// it and its handle. Dropping it stops and joins the thread.
 #[derive(Debug)]
 struct Worker {
     stop: Arc<AtomicBool>,
+    waker: Waker,
     /// `None` once joined.
-    handle: Option<JoinHandle<WakeReport>>,
+    handle: Option<JoinHandle<Result<WakeReport, InputError>>>,
 }
 
 impl Worker {
-    /// Signals the thread to stop and joins it. From the thread itself
-    /// (its hook, or a destructor while it unwinds) joining would never
-    /// return, so the thread is detached and ends after its wake.
+    /// Signals the thread to stop, wakes it, and joins it. From the thread
+    /// itself (its hook, or a destructor while it unwinds) joining would
+    /// never return, so the thread is detached and ends after its wake.
     fn shutdown(&mut self) -> Result<WakeReport, InputError> {
         self.stop.store(true, Ordering::Release);
+        // After the flag: a wait that has not begun yet returns at once
+        // on the kept signal, and one under way returns now.
+        self.waker.wake();
         // Only a second call finds the handle gone.
         let handle = self.handle.take().ok_or(InputError::Panicked)?;
         if handle.thread().id() == std::thread::current().id() {
             return Err(InputError::StopFromWorker);
         }
-        handle.join().map_err(|_| InputError::Panicked)
+        handle.join().map_err(|_| InputError::Panicked)?
     }
 
-    /// Signals the thread to stop and lets it go without joining: a wake
-    /// that never returns cannot hold up the caller.
+    /// Signals the thread to stop, wakes it, and lets it go without
+    /// joining: a wake that never returns cannot hold up the caller.
     fn detach(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.waker.wake();
         drop(self.handle.take());
     }
 }
@@ -1270,25 +1408,33 @@ type Setup<W> = Result<(Timer, usize, W), InputError>;
 
 /// Spawns a thread named `name` that runs `setup`, reports its outcome,
 /// and on success runs [`wake_loop`] with the timer and the wake `setup`
-/// returned. Returns, with the value `setup` gave, once it has reported.
-fn spawn_worker<S, W>(name: &str, clock: QpcClock, setup: S) -> Result<(Worker, usize), InputError>
+/// returned, woken through `waker`. Returns, with the value `setup` gave,
+/// once it has reported.
+fn spawn_worker<S, W>(
+    name: &str,
+    clock: QpcClock,
+    driven: Driven,
+    waker: &Waker,
+    setup: S,
+) -> Result<(Worker, usize), InputError>
 where
     S: FnOnce() -> Setup<W> + Send + 'static,
-    W: FnMut(TimeUs),
+    W: FnMut(TimeUs) -> Boundary,
 {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let thread_waker = waker.clone();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
         .name(name.into())
         .spawn(move || match setup() {
             Ok((timer, value, wake)) => {
                 let _ = ready_tx.send(Ok(value));
-                wake_loop(clock, &timer, &thread_stop, wake)
+                wake_loop(clock, driven, &timer, &thread_waker, &thread_stop, wake)
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
-                WakeReport::default()
+                Ok(WakeReport::default())
             }
         })
         .map_err(InputError::Spawn)?;
@@ -1296,6 +1442,7 @@ where
         Ok(Ok(value)) => Ok((
             Worker {
                 stop,
+                waker: waker.clone(),
                 handle: Some(handle),
             },
             value,
@@ -1308,11 +1455,13 @@ where
     }
 }
 
-/// The input thread: wakes at 1 kHz on a high-resolution timer under MMCSS
-/// "Games", reads QPC, receives everything Raw Input queued as one batch
-/// stamped with that read, publishes, and calls the caller's hook at the
-/// boundary after the batch. This handle may move between threads;
-/// dropping it stops and joins the thread, as [`stop`](Self::stop) does.
+/// The input thread: under MMCSS "Games" it wakes on Raw Input, on the
+/// wake event, and while Open or Tail on a high-resolution timer
+/// heartbeat ([`cadence`]); it reads QPC, receives what Raw Input queued
+/// as one batch stamped with that read, publishes, and calls the caller's
+/// hook at the boundary after the batch. This handle may move between
+/// threads; dropping it stops and joins the thread, as
+/// [`stop`](Self::stop) does.
 #[derive(Debug)]
 pub struct InputThread {
     worker: Worker,
@@ -1322,12 +1471,15 @@ pub struct InputThread {
 
 impl InputThread {
     /// Starts the thread with `sources`, connecting the keyboards and
-    /// controllers present.
+    /// controllers present; `waker` wakes it (requests, focus changes),
+    /// and stopping it signals `waker` too.
     /// `on_wake` runs after each batch's publication with a clock read
     /// taken after it, which is the QPC read of that boundary (the batch
-    /// itself keeps its wake time); it is the boundary where the caller opens and closes recording, sets
-    /// recorded controls and wakes the logic thread, and it must not
-    /// allocate during play.
+    /// itself keeps its wake time); it is the boundary where the caller
+    /// opens and closes recording, sets recorded controls and wakes the
+    /// logic thread, and it must not allocate during play. It returns the
+    /// thread's phase from then on; the thread starts in
+    /// [`Phase::Tail`].
     ///
     /// # Errors
     ///
@@ -1337,21 +1489,27 @@ impl InputThread {
         clock: QpcClock,
         mut sources: SourceSet,
         capture: Capture,
+        waker: &Waker,
         mut on_wake: F,
     ) -> Result<Self, InputError>
     where
-        F: FnMut(&mut SourceSet, TimeUs) + Send + 'static,
+        F: FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     {
-        let (worker, receiver) = spawn_worker("input", clock, move || {
+        let (worker, receiver) = spawn_worker("input", clock, Driven::Input, waker, move || {
             let mut raw = RawInput::new(clock, capture)?;
             raw.connect_present(&mut sources)?;
             let timer = Timer::new()?;
             let receiver = raw.hwnd.0 as usize;
             Ok((timer, receiver, move |now| {
-                raw.poll(now, &mut sources);
+                let (published, cut) = raw.poll(now, &mut sources);
                 // Polling may take a while after a scheduling stall; the
                 // boundary is read after it.
-                on_wake(&mut sources, clock.now());
+                let phase = on_wake(&mut sources, clock.now());
+                Boundary {
+                    published,
+                    cut,
+                    phase,
+                }
             }))
         })?;
         Ok(Self { worker, receiver })
@@ -1369,9 +1527,10 @@ impl InputThread {
     ///
     /// # Errors
     ///
-    /// [`InputError::Panicked`] if the thread panicked, and
+    /// [`InputError::Panicked`] if the thread panicked,
     /// [`InputError::StopFromWorker`] if called from the input thread
-    /// itself, which then ends after its current wake.
+    /// itself, which then ends after its current wake, and
+    /// [`InputError::Os`] if a wait failed and ended the thread.
     pub fn stop(mut self) -> Result<WakeReport, InputError> {
         self.worker.shutdown()
     }
@@ -1385,21 +1544,23 @@ impl InputThread {
 }
 
 /// An input thread without Raw Input, for input that comes from no device
-/// (autoplay): the same 1 kHz high-resolution timer under MMCSS "Games" as
-/// [`InputThread`], calling the caller's hook with the clock read at each
-/// wake; the hook feeds the sources and publishes. Nothing is registered,
-/// so no device is received. Dropping the handle stops and joins the
-/// thread, as [`stop`](Self::stop) does.
+/// (autoplay): under MMCSS "Games" as [`InputThread`], it wakes on the
+/// high-resolution timer heartbeat while Open or Tail and on the wake
+/// event only while Idle ([`Driven::Timer`]), calling the caller's hook
+/// with the clock read at each wake; the hook feeds the sources and
+/// publishes. Nothing is registered, so no device is received. Dropping
+/// the handle stops and joins the thread, as [`stop`](Self::stop) does.
 #[derive(Debug)]
 pub struct ClockedThread {
     worker: Worker,
 }
 
 impl ClockedThread {
-    /// Starts the thread with `sources`. `on_wake` runs at every wake with
-    /// the clock read there: it feeds the sources and ends with a
-    /// publication, opens and closes recording and wakes the logic thread,
-    /// and it must not allocate during play.
+    /// Starts the thread with `sources`, woken through `waker` as
+    /// [`InputThread::spawn`]. `on_wake` runs at every wake with the clock
+    /// read there: it feeds the sources and ends with a publication, opens
+    /// and closes recording and wakes the logic thread, must not allocate
+    /// during play, and returns the thread's phase from then on.
     ///
     /// # Errors
     ///
@@ -1407,13 +1568,18 @@ impl ClockedThread {
     pub fn spawn<F>(
         clock: QpcClock,
         mut sources: SourceSet,
+        waker: &Waker,
         mut on_wake: F,
     ) -> Result<Self, InputError>
     where
-        F: FnMut(&mut SourceSet, TimeUs) + Send + 'static,
+        F: FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     {
-        let (worker, _) = spawn_worker("clocked input", clock, move || {
-            Ok((Timer::new()?, 0, move |now| on_wake(&mut sources, now)))
+        let (worker, _) = spawn_worker("clocked input", clock, Driven::Timer, waker, move || {
+            Ok((Timer::new()?, 0, move |now| Boundary {
+                published: now,
+                cut: false,
+                phase: on_wake(&mut sources, now),
+            }))
         })?;
         Ok(Self { worker })
     }
@@ -1480,69 +1646,128 @@ mod qpc_tests {
 #[cfg(test)]
 mod clocked_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use bms_model::{TimeSource, TimeUs};
 
-    use super::{ClockedThread, QpcClock};
-    use crate::{AUTOPLAY_DEVICE, DeviceKind, SourceConfig, SourceSet};
+    use super::{ClockedThread, QpcClock, Waker};
+    use crate::{AUTOPLAY_DEVICE, DeviceKind, Phase, SourceConfig, SourceSet};
 
-    /// The clocked thread wakes about every millisecond with the clock's
-    /// time and the source set it was given, and stops when asked.
-    #[test]
-    fn the_clocked_thread_wakes_with_the_clock_and_its_sources() {
-        let clock = QpcClock::start();
-        let mut set = SourceSet::new(SourceConfig {
+    fn set() -> SourceSet {
+        SourceSet::new(SourceConfig {
             max_devices: 1,
             max_sources: 1,
             max_held: 1,
             queue_capacity: 1,
             max_arrivals: 1,
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Sets its flag when dropped, which happens when the thread's hook is.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// The clocked thread wakes about every millisecond with the clock's
+    /// time and the source set it was given while in its tail, and stops
+    /// when asked; every wake is a heartbeat.
+    #[test]
+    fn the_clocked_thread_wakes_with_the_clock_and_its_sources() {
+        let clock = QpcClock::start();
+        let mut set = set();
         set.connect(AUTOPLAY_DEVICE, DeviceKind::Keyboard);
         let last = Arc::new(AtomicI64::new(i64::MIN));
         let seen = Arc::clone(&last);
         let start = clock.now();
-        let thread = ClockedThread::spawn(clock, set, move |s, now| {
+        let waker = Waker::new().unwrap();
+        let thread = ClockedThread::spawn(clock, set, &waker, move |s, now| {
             assert_eq!(s.devices().count(), 1);
             seen.store(now.0, Ordering::Release);
+            Phase::Tail
         })
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
         let report = thread.stop().unwrap();
         let woke = last.load(Ordering::Acquire);
         assert!(TimeUs(woke) > start && TimeUs(woke) <= clock.now());
         // About 100 wakes; a loaded machine may skip some.
-        let wakes = report.intervals.count();
+        let wakes = report.causes.heartbeat;
         assert!((20..=150).contains(&wakes), "{wakes}");
+        assert_eq!(report.causes.input, 0);
+        assert_eq!(report.lateness.count(), wakes);
+    }
+
+    /// An idle worker waits on its wake event alone, with no timer. Stop
+    /// wakes it and joins it, and so does dropping its handle: each
+    /// returns within a bound, with the hook dropped.
+    #[test]
+    fn stop_and_drop_join_an_idle_worker() {
+        for by_drop in [false, true] {
+            let waker = Waker::new().unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = DropFlag(Arc::clone(&dropped));
+            let (idle_tx, idle_rx) = mpsc::channel();
+            let thread = ClockedThread::spawn(QpcClock::start(), set(), &waker, move |_, _| {
+                let _keep = &flag;
+                let _ = idle_tx.send(());
+                Phase::Idle
+            })
+            .unwrap();
+            // The first heartbeat reports Idle; no wake follows it.
+            idle_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(idle_rx.try_recv().is_err(), "an idle worker woke");
+            let (done_tx, done_rx) = mpsc::channel();
+            let begun = Instant::now();
+            let stopper = std::thread::spawn(move || {
+                let waits = if by_drop {
+                    drop(thread);
+                    None
+                } else {
+                    Some(thread.stop().unwrap().waits)
+                };
+                let _ = done_tx.send(waits);
+            });
+            let waits = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("the idle worker was not joined (drop: {by_drop})"));
+            assert!(
+                begun.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                begun.elapsed()
+            );
+            assert!(dropped.load(Ordering::Acquire));
+            // The heartbeat that went Idle and the stop's wake.
+            if let Some(waits) = waits {
+                assert!(waits <= 3, "{waits}");
+            }
+            stopper.join().unwrap();
+        }
     }
 
     /// Detaching returns while a wake is blocked, and the thread still
     /// stops by itself once the wake returns.
     #[test]
     fn detach_returns_while_a_wake_is_blocked() {
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
-
         let clock = QpcClock::start();
-        let set = SourceSet::new(SourceConfig {
-            max_devices: 1,
-            max_sources: 1,
-            max_held: 1,
-            queue_capacity: 1,
-            max_arrivals: 1,
-        })
-        .unwrap();
         let (entered_tx, entered) = mpsc::channel();
         let (release, released) = mpsc::channel::<()>();
         // Disconnected once the thread has ended and dropped its wake.
         let (_ended_tx, ended) = mpsc::channel::<()>();
-        let thread = ClockedThread::spawn(clock, set, move |_, _| {
+        let waker = Waker::new().unwrap();
+        let thread = ClockedThread::spawn(clock, set(), &waker, move |_, _| {
             let _held = &_ended_tx;
             let _ = entered_tx.send(());
             // Blocked until released, within a bound.
             let _ = released.recv_timeout(Duration::from_secs(10));
+            Phase::Tail
         })
         .unwrap();
         entered.recv_timeout(Duration::from_secs(5)).unwrap();

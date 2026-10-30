@@ -83,6 +83,9 @@ fn played_from(text: &str, seed: u64, offset: i64) -> (TempDir, PlayRecord) {
             }],
             audio_offset: TimeUs(0),
             display_offset: TimeUs(0),
+            wake: crate::WakePolicy::Timer {
+                heartbeat_us: 1_000,
+            },
         },
         play_type: PlayType::Full,
         start: InputStart {
