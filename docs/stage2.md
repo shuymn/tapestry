@@ -360,7 +360,8 @@ A single exact stage is not used. A 383,999 Hz stereo source at 145 % on 384,000
 **Restore.**
 - **Schedule.** The BGM plus autoplay key sounds for the notes before the section.
 - **Audio.** `AudioEngine::seek(t)` advances the engine's scheduling (starts, stops, steals, positions) without summing samples. A property test checks it against mixing.
-- **Notes.** Notes before the section are drawn auto-played; notes after its end are not drawn.
+- **Notes.** Only the section's targets are drawn. Notes before the section and after its end, and long notes that cross either edge (which D13 excludes), are not drawn, so the first note on screen is the first one to press. Notes before the section still sound, through the autoplay key sounds above; notes after it do not.
+- **Long notes across an edge** get no special rule: they are neither judged nor drawn. A player who wants one judged moves the section's edge to include it.
 
 **End of a round: a short ring-out (decided).**
 - Completion happens in the first step whose watermark covers the section's final deadline. Recording closes there, and the record is frozen; it is saved after the ring-out, as a full play is saved after its tail, so a slow write never delays the ring-out's controls.
