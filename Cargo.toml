@@ -40,7 +40,7 @@ zstd = { version = "0.14.3", default-features = false }
 # eval, bms-parser, library and render (dev only): benchmarks (docs/setup.md "Benchmarks")
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
-# eval and replay (dev only): property tests
+# eval, replay and skin-model (dev only): property tests
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 
 # input, game and audio
@@ -85,7 +85,7 @@ png = "0.18.1"
 # bms-parser and xtask, library (dev only)
 encoding_rs = "0.8.42"
 
-# bms-parser, replay, game, library, audio, input, render and player (error types)
+# bms-parser, replay, game, library, audio, input, render, skin-model and player (error types)
 thiserror = "2.0.21"
 
 # player and xtask (error reports) and game (tests)
