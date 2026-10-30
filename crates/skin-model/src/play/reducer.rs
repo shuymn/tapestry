@@ -86,9 +86,9 @@ pub(crate) fn is_target(section: Option<&Section>, time: TimeUs, end: TimeUs) ->
 }
 
 impl Reducer {
-    /// A clean reducer for one attempt: `tops` are the gauges' maxima, and
-    /// a gauge whose initial value is at its maximum reads on from
-    /// `ready_at`.
+    /// A clean reducer for one attempt: `initial` gives each gauge's
+    /// initial value and maximum, and a gauge whose initial value is at its
+    /// maximum reads on from `ready_at`.
     pub(crate) fn new(
         chart: &Chart,
         section: Option<&Section>,

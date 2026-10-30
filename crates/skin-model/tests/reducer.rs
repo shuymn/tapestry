@@ -685,8 +685,8 @@ fn real_streams_without_ln_held() {
         gauges: &GAUGES,
         ..full(0)
     };
-    // (inputs, whether `LnHeld` was in the stream, expected bomb, hold
-    // start seen right after the judgment's frame)
+    // (name, inputs, whether `LnHeld` was in the stream, expected bomb
+    // start)
     let cases: [(&str, Vec<PhysicalInputEvent>, bool, Option<i64>); 5] = [
         (
             "released early",
