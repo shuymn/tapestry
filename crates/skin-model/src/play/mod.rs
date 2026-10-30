@@ -102,8 +102,6 @@ pub struct Play {
     starts: Box<[Option<TimeUs>]>,
     /// Per timer slot: elapsed ms, or [`TIMER_OFF`].
     ms: Box<[i32]>,
-    /// Per `when` timer: its condition at the last build.
-    when_on: Box<[bool]>,
     fields: [i32; field::COUNT],
     scroll: ScrollMap,
     /// The display beat last seen and the µs it was crossed at.
@@ -153,7 +151,6 @@ impl Play {
             reducer,
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
-            when_on: vec![false; whens].into_boxed_slice(),
             fields: [0; field::COUNT],
             scroll: chart.scroll.clone(),
             beat: None,

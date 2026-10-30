@@ -58,19 +58,16 @@ impl Play {
             fields: &self.fields,
             timers: builtin_ms,
         };
-        for (((program, on), start), ms) in whens
+        for ((program, start), ms) in whens
             .iter()
-            .zip(self.when_on.iter_mut())
             .zip(when_starts.iter_mut())
             .zip(when_ms.iter_mut())
         {
-            let c = program.eval_bool(&state);
-            if !c {
+            if !program.eval_bool(&state) {
                 *start = None;
-            } else if !*on {
+            } else if start.is_none() {
                 *start = Some(now);
             }
-            *on = c;
             *ms = reading(now, *start);
         }
     }
