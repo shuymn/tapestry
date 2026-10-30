@@ -1057,6 +1057,19 @@ Each one holds the behavior D5 and D6 state.
 - `replacing_a_sound_file_invalidates_the_analysis`.
 - While a play runs, the job shall be paused, and judgment shall be unchanged.
 
+### PR26. The key sound of a press (`eval`)
+
+**Touches.** Press resolution's sound choice in evaluator.rs (the scan names the note an empty POOR is against); design.md "The Only Output Is the Judgment Event Stream".
+
+**Depends on.** PR7d, which also changes press resolution.
+
+**Done when.**
+- When a press judges a note, it shall play that note's sound, under every preset (`a_judged_press_plays_its_note`).
+- When a press makes an empty POOR against a note, it shall play that note's sound (`an_empty_poor_plays_the_note_it_is_against`).
+- When a press judges nothing between notes, it shall play the lane's latest earlier note's sound, judged or not; and before the lane's first note, that note's sound (`a_press_on_nothing_plays_the_latest_earlier_note`).
+- When the same input is evaluated under the tapestry and beatoraja-style presets and a press judges nothing under both, the sound shall be the same (`the_fallback_sound_is_the_same_under_every_preset`).
+- When a press in a practiced section's lead-in (design.md "Section Evaluation") judges nothing, it shall still play no sound, as today.
+
 ### Order and parallel work
 
 **Start in parallel:** PR1, PR2, PR3, PR4, PR9, PR11, PR12, PR14, PR21 and PR22.
@@ -1077,6 +1090,7 @@ Each one holds the behavior D5 and D6 state.
 - PR2 + PR14 + PR20 + PR22 → PR23
 - PR19 + PR21 + PR23 → PR24
 - PR15 + PR18 → PR25
+- PR7d → PR26
 
 **Format numbering.** Library schema numbers follow the order PR12 < PR13 < PR18 < PR25. Replay format bumps (PR9, PR20, PR23), canonical encoding bumps (PR7e, PR7a–PR7d, PR8) and the loader version bump (PR7e) take the next number at merge.
 
