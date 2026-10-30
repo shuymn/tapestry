@@ -81,6 +81,7 @@ pub const CRATE_ROOT_LINES: &[(&str, &[&str])] = &[
     ("crates/eval/src/lib.rs", &[CAST_LINE, DISALLOWED_LINE]),
     ("crates/rules/src/lib.rs", &[CAST_LINE]),
     ("crates/bms-parser/src/lib.rs", &[CAST_LINE]),
+    ("crates/skin-model/src/lib.rs", &[CAST_LINE]),
 ];
 
 /// The attribute of an in-play module file, before its first item.
@@ -267,6 +268,10 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/render/src/simple.rs"),
     Site::File("crates/render/src/skin.rs"),
     Site::File("crates/render/src/sprite.rs"),
+    // A skin's per-frame expressions and quad batch.
+    Site::File("crates/skin-model/src/expr/arith.rs"),
+    Site::File("crates/skin-model/src/expr/program.rs"),
+    Site::File("crates/skin-model/src/quad.rs"),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
