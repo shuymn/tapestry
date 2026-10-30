@@ -165,6 +165,12 @@ pub struct AudioEngine {
     /// The chart time a seek starts at and the starts the pass reaching it
     /// may still admit, until its frame is placed.
     seek_to: Option<(TimeUs, usize)>,
+    /// A ring-out's fade and end in chart time, until the pass that reaches
+    /// the fade puts them on the output.
+    ring_out: Option<(TimeUs, TimeUs)>,
+    /// The output frame a placed ring-out ends at: no BGM event starts
+    /// from there.
+    ring_end: Option<i64>,
     scheduled: Vec<Scheduled>,
     scheduled_dropped: u64,
     underruns: u64,
@@ -230,6 +236,8 @@ impl AudioEngine {
             output_offset: TimeUs(0),
             play_origin: TimeUs(0),
             seek_to: None,
+            ring_out: None,
+            ring_end: None,
             scheduled: Vec::with_capacity(schedule_log),
             scheduled_dropped: 0,
             underruns: 0,
@@ -291,13 +299,42 @@ impl AudioEngine {
     }
 
     /// Starts the play over (a retry) with chart time 0 at `origin` on the
-    /// timeline the output's wakes are in: every voice stops and the BGM
-    /// schedule rewinds. The output stream and its clock continue.
+    /// timeline the output's wakes are in: every voice stops, the BGM
+    /// schedule rewinds, and a ring-out, finished or not, is taken off, so
+    /// the output is at full gain from the play's first frame. The output
+    /// stream and its clock continue.
     pub fn restart(&mut self, origin: TimeUs) {
         self.mixer.stop_all();
         self.next_bgm = 0;
         self.seek_to = None;
+        self.clear_ring_out();
         self.play_origin = origin;
+    }
+
+    fn clear_ring_out(&mut self) {
+        self.ring_out = None;
+        self.ring_end = None;
+    }
+
+    /// Rings the play out (design.md "Mid-Chart Start and Section Repeat"):
+    /// chart times `fade_at` and `end_at` go on the output's frames as a BGM
+    /// event's time does, by the mix clock of the pass that reaches
+    /// `fade_at`'s frame. From that frame the output's gain falls linearly
+    /// per frame to 0 at `end_at`'s frame (a `fade_at` after `end_at` counts
+    /// as `end_at`), where every voice stops; no BGM event or key sound
+    /// starts from there. The play's audio then ends as a sealed tail does
+    /// (no voice, no BGM event left). Until then the BGM plays on its
+    /// schedule. Allocates nothing.
+    pub fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
+        self.ring_out = Some((fade_at, end_at));
+        self.ring_end = None;
+    }
+
+    /// The BGM schedule the engine plays (sorted by time), for planning
+    /// its seeks ([`SeekPlan::new`]).
+    #[must_use]
+    pub fn schedule(&self) -> &[BgmEvent] {
+        &self.bgm
     }
 
     /// What this engine plays, for planning its seeks where the play is
@@ -398,6 +435,7 @@ impl AudioEngine {
         self.mixer.stop_all();
         self.next_bgm = self.bgm.len();
         self.seek_to = None;
+        self.clear_ring_out();
     }
 
     /// Plays another chart from here on: `bank` and `bgm` (sorted by time)
@@ -429,6 +467,7 @@ impl AudioEngine {
         self.chart = self.chart.wrapping_add(1);
         self.next_bgm = self.bgm.len();
         self.seek_to = None;
+        self.clear_ring_out();
         Ok((old_bank, BgmSchedule::from_parts(old_bgm, old_hash)))
     }
 
@@ -536,9 +575,28 @@ impl AudioEngine {
                     held = true;
                 }
             }
+            // A ring-out goes on the output at the pass reaching its fade,
+            // by that pass's clock.
+            if let Some((fade_at, end_at)) = self.ring_out {
+                let line = self.frame_line();
+                let (fade, end) = (line.frame(fade_at), line.frame(end_at));
+                if fade < i64::try_from(block_end).unwrap_or(i64::MAX) {
+                    self.mixer.ring_out(fade, end);
+                    self.ring_out = None;
+                    self.ring_end = Some(end);
+                }
+            }
             while let Some(&event) = self.bgm.get(self.next_bgm).filter(|_| !held) {
                 let at = output_time(self.play_origin, self.output_offset, event.time);
                 let target = self.clock.frame_at(at).unwrap_or(0);
+                // Nothing starts from a ring-out's end on.
+                if self
+                    .ring_end
+                    .is_some_and(|end| i64::try_from(target).unwrap_or(i64::MAX) >= end)
+                {
+                    self.next_bgm = self.bgm.len();
+                    break;
+                }
                 if target >= block_end {
                     break;
                 }
