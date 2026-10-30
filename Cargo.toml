@@ -57,11 +57,13 @@ triple_buffer = "9.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 
-# game and xtask, and replay (dev only)
+# game and xtask, and replay and eval-cli (dev only)
 tempfile = "3.27.0"
 
-# player (Windows only)
+# player and eval-cli
 lexopt = "0.3.2"
+
+# player (Windows only)
 log = { version = "0.4.34", default-features = false }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
