@@ -66,13 +66,14 @@ fn lane(n: i64) -> Lane {
     Lane::new(u8::try_from(n.rem_euclid(8)).unwrap()).unwrap()
 }
 
-/// Notes every 50 ms over the 8 lanes (400 ms apart in a lane), every 4th
-/// a 200 ms long note, and a mine 25 ms after every 5th, four lanes over.
+/// Notes every 50 ms over the 8 lanes (400 ms apart in a lane), every 5th
+/// a 200 ms long note (on every lane in turn), and a mine 25 ms after every
+/// 5th, four lanes over.
 fn chart() -> Chart {
     let mut b = ChartBuilder::new(150_000).sound("a.wav");
     for i in 0..NOTES {
         let t = TimeUs(i * 50 * MS);
-        b = if i % 4 == 0 {
+        b = if i % 5 == 1 {
             b.long(lane(i), t, TimeUs(t.0 + 200 * MS))
         } else {
             b.tap(lane(i), t)
@@ -93,9 +94,13 @@ fn ev(time: i64, kind: JudgeEventKind) -> JudgeEvent {
     }
 }
 
-/// Every kind of effect for every note, with both gauges reported after
-/// each judgment, sorted by time, ending with `SongEnd`.
-fn effects(chart: &Chart) -> Vec<JudgeEvent> {
+/// Every kind of effect for every target of `section` (every note without
+/// one) and every mine inside it, with both gauges reported after each
+/// judgment, sorted by time, ending with `SongEnd`. A `clean` play judges
+/// every target GOOD or better, so its combo reaches the target count;
+/// otherwise BADs, POORs, BAD heads and empty POORs break it. The combos
+/// are counted in time order, an empty POOR breaking the combo.
+fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEvent> {
     let grades = [
         Judgment::Perfect,
         Judgment::Great,
@@ -103,16 +108,29 @@ fn effects(chart: &Chart) -> Vec<JudgeEvent> {
         Judgment::Bad,
         Judgment::Poor,
     ];
+    let inside = |t: TimeUs| section.is_none_or(|s| s.start <= t && t < s.end);
     let mut out = Vec::new();
-    let mut combo = 0_u32;
     let mut gauge = 50_i64;
     for (l, notes) in chart.lanes.iter().enumerate() {
         let lane = Lane::new(u8::try_from(l).unwrap()).unwrap();
         for (n, note) in notes.iter().enumerate() {
             let t = note.time.0;
+            let judged = |judgment, deviation, release| JudgeEventKind::Judged {
+                lane,
+                note: n,
+                judgment,
+                deviation,
+                release,
+                combo: 0,
+            };
             match note.kind {
                 NoteKind::Mine { .. } => {
-                    out.push(ev(t, JudgeEventKind::MineHit { lane, note: n }));
+                    if inside(note.time) {
+                        out.push(ev(t, JudgeEventKind::MineHit { lane, note: n }));
+                    }
+                    continue;
+                }
+                _ if !(inside(note.time) && section.is_none_or(|s| note.end() < s.end)) => {
                     continue;
                 }
                 NoteKind::Tap => {
@@ -123,48 +141,23 @@ fn effects(chart: &Chart) -> Vec<JudgeEvent> {
                             sound: SoundId(0),
                         },
                     ));
-                    let judgment = grades[(t / (50 * MS)) as usize % 5];
-                    combo = if judgment >= Judgment::Bad {
-                        0
-                    } else {
-                        combo + 1
-                    };
-                    out.push(ev(
-                        t,
-                        JudgeEventKind::Judged {
-                            lane,
-                            note: n,
-                            judgment,
-                            deviation: (judgment != Judgment::Poor).then_some(TimeUs(0)),
-                            release: None,
-                            combo,
-                        },
-                    ));
+                    let k = usize::try_from(t / (50 * MS)).unwrap();
+                    let judgment = grades[k % if clean { 3 } else { 5 }];
+                    let deviation = (judgment != Judgment::Poor).then_some(TimeUs(0));
+                    out.push(ev(t, judged(judgment, deviation, None)));
                     if judgment == Judgment::Poor {
                         out.push(ev(t + 10 * MS, JudgeEventKind::EmptyPoor { lane }));
                     }
                 }
                 NoteKind::Long { end, .. } => {
-                    let bad_head = (t / (200 * MS)) % 3 == 0;
-                    if bad_head {
-                        combo = 0;
-                        out.push(ev(
-                            t - 20 * MS,
-                            JudgeEventKind::Judged {
-                                lane,
-                                note: n,
-                                judgment: Judgment::Bad,
-                                deviation: Some(TimeUs(-20 * MS)),
-                                release: None,
-                                combo,
-                            },
-                        ));
+                    if !clean && (t / (200 * MS)) % 3 == 0 {
+                        let head = judged(Judgment::Bad, Some(TimeUs(-20 * MS)), None);
+                        out.push(ev(t - 20 * MS, head));
                         out.push(ev(
                             t + 100 * MS,
                             JudgeEventKind::LnHoldEnded { lane, note: n },
                         ));
                     } else {
-                        combo += 1;
                         out.push(ev(
                             t,
                             JudgeEventKind::LnHeld {
@@ -175,35 +168,44 @@ fn effects(chart: &Chart) -> Vec<JudgeEvent> {
                             },
                         ));
                         out.push(ev(end.0, JudgeEventKind::LnHoldEnded { lane, note: n }));
-                        out.push(ev(
-                            end.0,
-                            JudgeEventKind::Judged {
-                                lane,
-                                note: n,
-                                judgment: Judgment::Perfect,
-                                deviation: Some(TimeUs(0)),
-                                release: Some(TimeUs(0)),
-                                combo,
-                            },
-                        ));
+                        let done = judged(Judgment::Perfect, Some(TimeUs(0)), Some(TimeUs(0)));
+                        out.push(ev(end.0, done));
                     }
                 }
             }
             // The gauges climb to the maximum and fall back.
             gauge = if gauge >= 100 { 60 } else { gauge + 4 };
             for g in 0..2 {
+                let value = GaugeValue(gauge.min(100) * GaugeValue::PERCENT);
                 out.push(ev(
                     t,
                     JudgeEventKind::Gauge {
                         gauge: g,
-                        value: GaugeValue(gauge.min(100) * GaugeValue::PERCENT),
-                        reference: GaugeValue(gauge.min(100) * GaugeValue::PERCENT),
+                        value,
+                        reference: value,
                     },
                 ));
             }
         }
     }
     out.sort_by_key(|e| e.time);
+    let mut running = 0;
+    for e in &mut out {
+        match &mut e.kind {
+            JudgeEventKind::Judged {
+                judgment, combo, ..
+            } => {
+                running = if *judgment >= Judgment::Bad {
+                    0
+                } else {
+                    running + 1
+                };
+                *combo = running;
+            }
+            JudgeEventKind::EmptyPoor { .. } => running = 0,
+            _ => {}
+        }
+    }
     let last = out.last().map_or(0, |e| e.time.0);
     out.push(ev(last + 500 * MS, JudgeEventKind::SongEnd));
     out
@@ -213,8 +215,36 @@ fn program(src: &str) -> Program {
     compile(src, &Scope::new(&PLAY), Ty::Bool).unwrap()
 }
 
-/// About 2 000 elements over every built-in timer and 32 `when`s, every
-/// ease and end, both blends, clips and visibility programs.
+/// A 3-key track at x near `x`.
+fn track(i: u16, ease: Ease, end: End) -> Track {
+    let key = |at: i64, x: i32, alpha: i32| {
+        let mut props = [None; 9];
+        props[0] = Some(x);
+        props[1] = Some(x / 2);
+        props[2] = Some(64);
+        props[3] = Some(64);
+        props[4] = Some(alpha);
+        KeyDef {
+            at: TimeUs(at),
+            props,
+        }
+    };
+    let x = i32::from(i);
+    Track::new(
+        &[
+            key(0, x, 0),
+            key(100 * MS, x + 10, 255),
+            key(500 * MS, x + 40, 128),
+        ],
+        ease,
+        end,
+    )
+    .unwrap()
+}
+
+/// 2 000 elements, 30 on every built-in timer and 350 over 32 `when`s,
+/// with every ease and end, both blends, clips and visibility programs,
+/// and a background on `ready`.
 fn skin() -> Skin {
     let conditions = [
         "combo >= 1",
@@ -235,24 +265,16 @@ fn skin() -> Skin {
         program("on(play)"),
     ];
     let eases = [Ease::Linear, Ease::In, Ease::Out, Ease::Step];
+    let builtin = 30 * timer::BUILTIN;
     let mut elements = Vec::new();
     for i in 0_u16..2_000 {
-        let timer = if i % 5 == 4 {
-            TimerRef::When(i % 32)
+        // A quad's atlas left edge names its built-in timer, or is
+        // negative for a `when` timer.
+        let (timer, tag) = if i < builtin {
+            let slot = i % timer::BUILTIN;
+            (TimerRef::Builtin(slot), f32::from(slot))
         } else {
-            TimerRef::Builtin(i % timer::BUILTIN)
-        };
-        let key = |at: i64, x: i32, alpha: i32| {
-            let mut props = [None; 9];
-            props[0] = Some(x);
-            props[1] = Some(x / 2);
-            props[2] = Some(64);
-            props[3] = Some(64);
-            props[4] = Some(alpha);
-            KeyDef {
-                at: TimeUs(at),
-                props,
-            }
+            (TimerRef::When(i % 32), -1.0)
         };
         let end = match i % 3 {
             0 => End::Hold,
@@ -261,19 +283,9 @@ fn skin() -> Skin {
                 from: TimeUs(100 * MS),
             },
         };
-        let track = Track::new(
-            &[
-                key(0, i32::from(i), 0),
-                key(100 * MS, i32::from(i) + 10, 255),
-                key(500 * MS, i32::from(i) + 40, 128),
-            ],
-            eases[usize::from(i % 4)],
-            end,
-        )
-        .unwrap();
         elements.push(ElementDef {
-            source: Source::Uv([0.0, 0.0, 0.5, 0.5]),
-            track,
+            source: Source::Uv([tag, 0.0, 0.5, 0.5]),
+            track: track(i, eases[usize::from(i % 4)], end),
             timer,
             visible: (i % 7 == 0).then(|| visible[usize::from(i % 3)].clone()),
             blend: if (i / 3) % 2 == 0 {
@@ -287,15 +299,7 @@ fn skin() -> Skin {
     // A background on `ready`, drawn on every frame after it.
     elements.push(ElementDef {
         source: Source::Uv([0.0, 0.0, 1.0, 1.0]),
-        track: Track::new(
-            &[KeyDef {
-                at: TimeUs(0),
-                props: [None; 9],
-            }],
-            Ease::Linear,
-            End::Hold,
-        )
-        .unwrap(),
+        track: track(0, Ease::Linear, End::Hold),
         timer: TimerRef::Builtin(timer::READY),
         visible: None,
         blend: Blend::Alpha,
@@ -304,18 +308,36 @@ fn skin() -> Skin {
     Skin::new(whens, elements).unwrap()
 }
 
-/// What the stretch saw.
-#[derive(Default)]
+/// What a stretch saw.
 struct Witness {
     split_drains: u32,
     small_drops: u32,
     other_drops: u32,
-    feedback: bool,
-    ending: bool,
+    /// Per built-in slot: whether it was on at a frame.
+    on: [bool; timer::BUILTIN as usize],
+    /// Per built-in slot: whether an element on it reached the batch.
+    drawn: [bool; timer::BUILTIN as usize],
     when_started: bool,
     empty_frames_after_ready: u32,
 }
 
+impl Witness {
+    fn new() -> Self {
+        Self {
+            split_drains: 0,
+            small_drops: 0,
+            other_drops: 0,
+            on: [false; timer::BUILTIN as usize],
+            drawn: [false; timer::BUILTIN as usize],
+            when_started: false,
+            empty_frames_after_ready: 0,
+        }
+    }
+}
+
+/// One attempt's frames, every 16 ms from `from` to `to`, each draining at
+/// most [`DRAIN`] effects; a 1 s stall halfway backs the queue up, fails
+/// gauge 1, shows it and changes the display offset.
 #[allow(clippy::too_many_arguments)]
 fn stretch(
     skin: &Skin,
@@ -336,7 +358,6 @@ fn stretch(
     let mut shown = 0;
     let midway = from + (to - from) / 2;
     while now <= to {
-        // A 1 s stall halfway: the queue backs up and drains over frames.
         if (midway..midway + 16 * MS).contains(&now) {
             now += 1_000 * MS;
             gauges[1].failed_at = Some(TimeUs(now));
@@ -384,14 +405,17 @@ fn stretch(
             if out.quads().is_empty() {
                 w.empty_frames_after_ready += 1;
             }
+            for q in out.quads() {
+                if q.uv[0] >= 0.0
+                    && let Some(d) = w.drawn.get_mut(q.uv[0] as usize)
+                {
+                    *d = true;
+                }
+            }
         }
-        for l in 0..8 {
-            let lane = lane(l);
-            w.feedback |= play.timer(lane_timer(LaneTimer::Bomb, lane)).is_some()
-                && play.timer(lane_timer(LaneTimer::Hold, lane)).is_some();
+        for (slot, on) in (0..).zip(w.on.iter_mut()) {
+            *on |= play.timer(slot).is_some();
         }
-        w.ending |=
-            play.timer(timer::FULL_COMBO).is_some() || play.timer(timer::LAST_NOTE).is_some();
         w.when_started |= play.timer(timer::BUILTIN).is_some();
         frame_no += 1;
         now += 16 * MS;
@@ -415,10 +439,17 @@ fn fresh_tally() -> Tally {
     }
 }
 
+fn state(v: GaugeValue) -> GaugeState {
+    GaugeState {
+        value: v,
+        reference: v,
+        failed_at: None,
+    }
+}
+
 #[test]
 fn build_does_not_allocate() {
     let chart = chart();
-    let events = effects(&chart);
     let skin = skin();
     let descs = [
         GaugeDesc {
@@ -430,93 +461,124 @@ fn build_does_not_allocate() {
             max: GaugeValue::FULL,
         },
     ];
-    let state = |v: GaugeValue| GaugeState {
-        value: v,
-        reference: v,
-        failed_at: None,
-    };
-    let mut tally = fresh_tally();
-    let mut gauges = vec![state(descs[0].start), state(descs[1].start)];
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let mut small = QuadBatch::with_capacity(8, 4);
     let lead_in = 1_000 * MS;
-    let ctx = PlayContext {
+    let full = PlayContext {
         gauges: &descs,
         attempt: Attempt::Full {
             lead_in: TimeUs(lead_in),
         },
         empty_poor_breaks_combo: true,
     };
-    let mut play = skin.prepare(&chart, &ctx).unwrap();
-    let song_end = events.last().unwrap().time.0;
-    let mut w = Witness::default();
-
-    TRACK.with(|t| t.set(true));
-    // The count works: an allocation that escapes is counted in any profile.
-    drop(std::hint::black_box(vec![1u8; 8]));
-    assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1);
-    stretch(
-        &skin,
-        &mut play,
-        &events,
-        &mut tally,
-        &mut gauges,
-        &mut batch,
-        &mut small,
-        -lead_in,
-        song_end + 1_000 * MS,
-        &mut w,
-    );
-    TRACK.with(|t| t.set(false));
-    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "allocations in play");
-
-    // A retry of a practice round: prepared untracked, then counted again.
-    let section = Section {
+    let round = Section {
         start: TimeUs(30_000 * MS),
         end: TimeUs(60_000 * MS),
         lead_in: TimeUs(2_000 * MS),
         initial_gauges: vec![GaugeValue(70 * GaugeValue::PERCENT), GaugeValue::FULL],
     };
-    let ctx = PlayContext {
-        attempt: Attempt::Section(&section),
-        ..ctx
+    let clean_round = Section {
+        start: TimeUs(10_000 * MS),
+        end: TimeUs(20_000 * MS),
+        ..round.clone()
     };
-    let mut play = skin.prepare(&chart, &ctx).unwrap();
-    let mut tally = fresh_tally();
-    let mut gauges = vec![state(section.initial_gauges[0]), state(GaugeValue::FULL)];
-    let first = events.partition_point(|e| e.time < section.start);
-    let last = events.partition_point(|e| e.time < section.end);
-    let mut w2 = Witness::default();
+    // (name, context, effects, first frame, last frame): the whole chart
+    // with breaks, a practice round with breaks after a retry, and a round
+    // played to a full combo.
+    let attempts = [
+        ("play", full, effects(&chart, None, false), -lead_in),
+        (
+            "round",
+            PlayContext {
+                attempt: Attempt::Section(&round),
+                ..full
+            },
+            effects(&chart, Some(&round), false),
+            28_000 * MS,
+        ),
+        (
+            "clean round",
+            PlayContext {
+                attempt: Attempt::Section(&clean_round),
+                ..full
+            },
+            effects(&chart, Some(&clean_round), true),
+            8_000 * MS,
+        ),
+    ];
+    let mut seen = Witness::new();
+    for (name, ctx, events, from) in &attempts {
+        // Prepared untracked, as between plays.
+        let mut play = skin.prepare(&chart, ctx).unwrap();
+        let mut tally = fresh_tally();
+        let initial = match ctx.attempt {
+            Attempt::Full { .. } => [descs[0].start, descs[1].start],
+            Attempt::Section(s) => [s.initial_gauges[0], s.initial_gauges[1]],
+        };
+        let mut gauges = initial.map(state);
+        let to = events.last().unwrap().time.0 + 1_000 * MS;
+        let mut w = Witness::new();
 
-    TRACK.with(|t| t.set(true));
-    drop(std::hint::black_box(vec![1u8; 8]));
-    assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1);
-    stretch(
-        &skin,
-        &mut play,
-        &events[first..last],
-        &mut tally,
-        &mut gauges,
-        &mut batch,
-        &mut small,
-        28_000 * MS,
-        61_000 * MS,
-        &mut w2,
-    );
-    TRACK.with(|t| t.set(false));
-    assert_eq!(
-        ALLOCS.load(Ordering::Relaxed),
-        0,
-        "allocations in the round"
-    );
+        TRACK.with(|t| t.set(true));
+        // The count works: an allocation that escapes is counted in any
+        // profile.
+        drop(std::hint::black_box(vec![1u8; 8]));
+        assert_eq!(ALLOCS.swap(0, Ordering::Relaxed), 1, "{name}");
+        stretch(
+            &skin,
+            &mut play,
+            events,
+            &mut tally,
+            &mut gauges,
+            &mut batch,
+            &mut small,
+            *from,
+            to,
+            &mut w,
+        );
+        TRACK.with(|t| t.set(false));
+        assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "{name}: allocations");
 
-    for (name, w) in [("play", &w), ("round", &w2)] {
         assert!(w.split_drains > 0, "{name}: no drain was split");
         assert!(w.small_drops > 0, "{name}: the small batch dropped nothing");
         assert_eq!(w.other_drops, 0, "{name}");
-        assert!(w.feedback, "{name}: no bomb with a hold");
-        assert!(w.ending, "{name}: no full combo or last note");
         assert!(w.when_started, "{name}: no `when` timer started");
         assert_eq!(w.empty_frames_after_ready, 0, "{name}");
+        let fc = usize::from(timer::FULL_COMBO);
+        if *name == "clean round" {
+            assert!(w.on[fc], "{name}: `full_combo` never started");
+            assert!(w.drawn[fc], "{name}: its elements were never drawn");
+        } else {
+            assert!(!w.on[fc] && !w.drawn[fc], "{name}: a full combo");
+        }
+        for (a, b) in seen.on.iter_mut().zip(w.on) {
+            *a |= b;
+        }
+        for (a, b) in seen.drawn.iter_mut().zip(w.drawn) {
+            *a |= b;
+        }
     }
+    // Every fed built-in timer turned on, and an element on it was drawn,
+    // in some attempt; lane input is not fed yet.
+    for lane in 0..8 {
+        for kind in [LaneTimer::Press, LaneTimer::Release] {
+            let slot = usize::from(lane_timer(kind, Lane::new(lane).unwrap()));
+            assert!(!seen.on[slot] && !seen.drawn[slot], "slot {slot}");
+            seen.on[slot] = true;
+            seen.drawn[slot] = true;
+        }
+    }
+    let missing = |flags: [bool; timer::BUILTIN as usize]| -> Vec<u16> {
+        (0..)
+            .zip(flags)
+            .filter(|&(_, f)| !f)
+            .map(|(s, _)| s)
+            .collect()
+    };
+    assert_eq!(missing(seen.on), [0_u16; 0], "built-in timers never on");
+    assert_eq!(
+        missing(seen.drawn),
+        [0_u16; 0],
+        "built-in timers never drawn"
+    );
 }
