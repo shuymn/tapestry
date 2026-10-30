@@ -239,17 +239,20 @@ pub fn run<R: Rig>(loaded: &mut Loaded, rig: &mut R) -> Result<(), LiveError<R::
             if rig.quitting() {
                 return run_over(rig);
             }
+            // Retry and quit are taken before the screen is rebuilt, so a
+            // known input failure ends the run without another handshake
+            // with the screen; a retry's preparation rebuilds it anyway.
+            match rig.take() {
+                Some(Command::Retry) => break,
+                Some(Command::Quit) => return run_over(rig),
+                _ => {}
+            }
             // The screen failed during the play, its tail or this wait: it
             // is built again, acknowledged, before the end screen shows
             // again; if it cannot be, the run ends with the reason.
             if rig.screen_failed() {
                 rig.prepare_screen().map_err(LiveError::Screen)?;
                 rig.show_end(&report);
-            }
-            match rig.take() {
-                Some(Command::Retry) => break,
-                Some(Command::Quit) => return run_over(rig),
-                _ => {}
             }
         }
     }

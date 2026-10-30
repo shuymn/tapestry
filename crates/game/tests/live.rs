@@ -1318,3 +1318,23 @@ fn an_input_failure_on_the_end_screen_ends_the_run_at_the_retry() {
     assert!(!incomplete(one).input_failed);
     assert_eq!((rig.opens, rig.shows), (1, 1));
 }
+
+/// The input thread is gone on the end screen, and the screen fails as the
+/// retry arrives, with no rebuild possible: the retry is taken first, so the
+/// run ends with the input cause without another preparation of the screen.
+#[test]
+fn a_retry_with_a_failed_input_thread_and_screen_ends_with_the_input_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], i64::MAX);
+    rig.input_fails_at = 10_400_000;
+    rig.screen_fails_at = 10_600_000;
+    rig.prepare_fails_from = 2;
+    let ran = game::live::run(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    assert_eq!((rig.prepares, rig.opens, rig.shows), (1, 1, 1));
+}
