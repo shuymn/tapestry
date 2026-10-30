@@ -484,6 +484,24 @@ fn bank_lengths_follow_the_two_stages() {
 }
 
 #[test]
+fn fractional_lengths_round_up_then_down() {
+    // floor(ceil(frames × 48 000 / 44 100) × 20/k), by hand: 1000 frames
+    // are 1088.435 at 48 kHz, so 1089, then floor(1089 × 20/13) = 1675 at
+    // 65 %; one frame is 2, then 4 at 50 %.
+    let dir = tmp();
+    let long = put(dir.path(), "long.wav", &wav(44_100, 1, &ramp(1_000, 3, 5)));
+    let one = put(dir.path(), "one.wav", &wav(44_100, 1, &[1_000]));
+    let chart = chart_of(&[Some(long), Some(one)]);
+    let frames = |k| {
+        let speed = Speed::from_twentieths(k).unwrap();
+        let bank = load_bank_at(&chart, RATE, speed, &BankLimits::default()).unwrap();
+        [0, 1].map(|i| bank.get(SoundId(i)).unwrap().frames())
+    };
+    assert_eq!(frames(13), [1_675, 3]);
+    assert_eq!(frames(10), [2_178, 4]);
+}
+
+#[test]
 fn decode_pool_is_capped() {
     let cores = thread::available_parallelism().map_or(1, usize::from);
     let files: Vec<Vec<u8>> = (0..6).map(|k| wav(RATE, 1, &ramp(10, k, 1))).collect();

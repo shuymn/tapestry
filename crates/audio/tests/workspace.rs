@@ -60,9 +60,11 @@ fn speed_stage_workspace_is_bounded() {
     assert_eq!(rates[20], (3, 2));
 }
 
-/// The most bytes converting `samples` (`frames` frames out) allocated at
-/// once, besides the output it returns.
-fn workspace_peak(stage: &Stage, samples: &[i16], frames: u64) -> u64 {
+/// The most bytes converting `samples` into `frames` frames allocated at
+/// once, the output included, and the output's size. With no frames out
+/// the output allocates nothing, so the peak is the stage's construction
+/// and chunk buffers alone.
+fn workspace_peak(stage: &Stage, samples: &[i16], frames: u64) -> (u64, u64) {
     counting::track(true);
     let base = counting::live_bytes();
     counting::reset_peak();
@@ -70,19 +72,21 @@ fn workspace_peak(stage: &Stage, samples: &[i16], frames: u64) -> u64 {
     let peak = counting::peak_bytes(base);
     counting::track(false);
     assert_eq!(out.len() as u64, frames * stage.channels() as u64);
-    peak - out.capacity() as u64 * 2
+    (peak, out.capacity() as u64 * 2)
 }
 
-/// Converts one second of a ramp at the stage's input rate (at most 48 000
-/// frames), returning the bound and the measured peak.
-fn measure(stage: &Stage) -> (u64, u64) {
+/// Builds the stage alone, then converts 48 000 frames of a ramp: the
+/// bound, the build's peak, and the run's peak with the output's size.
+fn measure(stage: &Stage) -> (u64, u64, u64, u64) {
     let (from, to) = stage.rates();
     let ch = stage.channels();
-    let frames = u64::from(from.min(48_000));
+    let frames = 48_000;
     let samples = ramp(frames as usize * ch, -12_000, 7);
+    let (build, none) = workspace_peak(stage, &samples, 0);
+    assert_eq!(none, 0);
     let out = frames * u64::from(to) / u64::from(from);
-    let peak = workspace_peak(stage, &samples, out);
-    (stage.workspace_bound(), peak)
+    let (run, out_bytes) = workspace_peak(stage, &samples, out);
+    (stage.workspace_bound(), build, run, out_bytes)
 }
 
 #[test]
@@ -104,14 +108,24 @@ fn resampler_workspace_stays_within_its_bound() {
         stages.push(plan.speed.unwrap());
     }
     for stage in &stages {
-        let (bound, peak) = measure(stage);
+        let (bound, build, run, out) = measure(stage);
         let (from, to) = stage.rates();
         println!(
-            "{from} -> {to} x{}: bound {bound} B, peak {peak} B ({:.2}x)",
+            "{from} -> {to} x{}: bound {bound} B, build peak {build} B ({:.2}x), \
+             run peak {run} B with {out} B out",
             stage.channels(),
-            bound as f64 / peak as f64
+            bound as f64 / build as f64
         );
-        assert!(peak <= bound, "{from} -> {to}: peak {peak} > bound {bound}");
+        // Building alone stays within the bound; running, with the output
+        // allocated beside the workspace, within the bound plus the output.
+        assert!(
+            build <= bound,
+            "{from} -> {to}: build {build} > bound {bound}"
+        );
+        assert!(
+            run <= bound + out,
+            "{from} -> {to}: run {run} > bound {bound} + output {out}"
+        );
     }
 }
 
@@ -189,7 +203,7 @@ fn every_transform_length_stays_within_the_bound() {
                             break worst;
                         }
                         let stage = Stage::new(n, n - 1, 1);
-                        let peak = workspace_peak(&stage, &[], 0);
+                        let (peak, _) = workspace_peak(&stage, &[], 0);
                         let bound = stage.workspace_bound();
                         assert!(peak <= bound, "{n} -> {}: {peak} > {bound}", n - 1);
                         let r = peak as f64 / bound as f64;

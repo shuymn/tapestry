@@ -537,7 +537,8 @@ fn engine_accepts_a_bank_at_any_speed() {
 fn starts_align_across_the_ladder() {
     // Exact chart times mapped as the loader maps them, floor(t × 20/k),
     // started after a retry's origin: each start frame lies within one
-    // frame of t × rate / 1 000 000 after the origin's frame.
+    // frame of the exact t × rate / 1 000 000 after the origin's frame,
+    // compared without rounding (1.234567 s is 59 259.216 frames).
     let exact = [1_000_000i64, 1_234_567, 2_500_001, 7_777_777];
     let origin = TimeUs(500_000);
     for speed in Speed::ladder() {
@@ -558,9 +559,12 @@ fn starts_align_across_the_ladder() {
         assert_eq!(starts.len(), mapped.len(), "speed {k}");
         let origin_frame = e.clock().frame_at(origin).unwrap() as i64;
         for (s, &t) in starts.iter().zip(&mapped) {
-            let want = t * i64::from(RATE) / 1_000_000;
             let got = s.frame as i64 - origin_frame;
-            assert!((got - want).abs() <= 1, "speed {k}: {got} vs {want}");
+            let off = got * 1_000_000 - t * i64::from(RATE);
+            assert!(
+                off.abs() <= 1_000_000,
+                "speed {k}: frame {got} for {t} us is {off} / 1 000 000 frames off"
+            );
         }
     }
 }
