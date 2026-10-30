@@ -8,7 +8,7 @@ use bms_model::{Chart, LANE_COUNT, TimeUs};
 
 use crate::atlas::uv::{Cycle, UvTable};
 use crate::atlas::{Atlas, AtlasError, AtlasLimits, Variant};
-use crate::canvas::{Canvas, Fit, f32_of};
+use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
 use crate::expr::{CompileError, Program, SkinOps};
 use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
@@ -517,19 +517,20 @@ impl Skin {
         let [tw, th] = target.map(|v| u128::from(v.max(1)));
         let wide = tw * 9 >= th * 16;
         let fixed = self.regions.fit == Fit::Fixed;
+        let [max_w, max_h] = MAX_CANVAS.map(u128::from);
         let (fit, cw, ch) = if fixed {
             let fit = Ratio(tw, 1_920).min(Ratio(th, 1_080));
             (fit, Ratio(1_920, 1), Ratio(1_080, 1))
         } else if wide {
             let cw = if tw > 4 * th {
-                Ratio(4_320, 1)
+                Ratio(max_w, 1)
             } else {
                 Ratio(1_080 * tw, th)
             };
             (Ratio(th, 1_080), cw, Ratio(1_080, 1))
         } else {
             let ch = if th > 2 * tw {
-                Ratio(3_840, 1)
+                Ratio(max_h, 1)
             } else {
                 Ratio(1_920 * th, tw)
             };
