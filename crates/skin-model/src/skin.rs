@@ -633,8 +633,8 @@ impl Skin {
                     let [x, y, w, h] = s.rect;
                     let [fx, fy] = e.pivot;
                     let pivot = [x + fx * w, y + fy * h];
-                    let [x, w] = placement.bind(e.bind, x, w);
-                    let [px, _] = placement.bind(e.bind, pivot[0], 0.0);
+                    let map = placement.bind(e.bind);
+                    let (x, w, px) = (map.x(x), map.w(w), map.x(pivot[0]));
                     out.push(
                         e.key,
                         Quad {

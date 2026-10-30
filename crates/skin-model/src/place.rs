@@ -332,7 +332,6 @@ impl Regions {
             let i = if r == Region::Screen { 0.0 } else { inset };
             [i + fx * (cw - 2.0 * i - 1_920.0), fy * (ch - 1_080.0)]
         };
-        let size = [cw, ch];
         // Per region: its box now, its axes and its requested translation.
         let axes = |r: Region| -> Option<([f64; 4], [Axis; 2], f64)> {
             let now = self.current(r, &authored, &current)?;
@@ -350,18 +349,13 @@ impl Regions {
             } else {
                 r
             });
-            let axis = |i: usize, (lo, hi): (usize, usize)| {
-                let g = |b: &[f64; 4], j: usize| b.get(j).copied().unwrap_or(0.0);
-                Axis::new(
-                    [g(&now, lo), g(&now, hi)],
-                    [g(&author, lo), g(&author, hi)],
-                    p.get(i).copied().unwrap_or(0.0),
-                    s,
-                    sh.get(i).copied().unwrap_or(0.0),
-                    size.get(i).copied().unwrap_or(0.0),
-                )
-            };
-            Some((now, [axis(0, (0, 2)), axis(1, (1, 3))], s))
+            let [nx0, ny0, nx1, ny1] = now;
+            let [ax0, ay0, ax1, ay1] = author;
+            let [px, py] = p;
+            let [shx, shy] = sh;
+            let x = Axis::new([nx0, nx1], [ax0, ax1], px, s, shx, cw);
+            let y = Axis::new([ny0, ny1], [ay0, ay1], py, s, shy, ch);
+            Some((now, [x, y], s))
         };
         // A region whose position the skin does not offer stays put.
         let range_of = |r: Region, ax: &Axis| {
@@ -397,7 +391,10 @@ impl Regions {
         // judge's own translation first, within what the playfield's
         // range leaves possible, then the playfield's within both.
         let play = axes(Region::Playfield);
-        let judge = axes(Region::Judge).filter(|_| self.effective(Region::Judge, layout).visible);
+        let judge_axes = axes(Region::Judge);
+        let judge_visible = self.effective(Region::Judge, layout).visible;
+        // A hidden judge does not limit the playfield.
+        let judge = judge_axes.filter(|_| judge_visible);
         let mut t_play = [0.0; 2];
         let mut t_judge = [0.0; 2];
         let want_play = requested(Region::Playfield);
@@ -426,13 +423,12 @@ impl Regions {
             let o = [ax.base + t_play[0], ay.base + t_play[1]];
             set(Region::Playfield, now, s, o, true);
         }
-        if let Some((now, [ax, ay], s)) = axes(Region::Judge) {
+        if let Some((now, [ax, ay], s)) = judge_axes {
             let o = [
                 ax.base + t_judge[0] + t_play[0],
                 ay.base + t_judge[1] + t_play[1],
             ];
-            let visible = self.effective(Region::Judge, layout).visible;
-            set(Region::Judge, now, s, o, visible);
+            set(Region::Judge, now, s, o, judge_visible);
         }
         for r in [Region::Left, Region::Right, Region::Top, Region::Bottom] {
             let Some((now, [ax, ay], s)) = axes(r) else {
@@ -468,7 +464,8 @@ impl Placement {
     }
 
     /// `lane`'s current `(x, w)` before its region's transform: after the
-    /// scratch side and the lane width. `(0, 0)` without lanes.
+    /// scratch side and the lane width. Without lanes, `(0, 1)`: a unit
+    /// width, so a binding never divides by zero.
     #[must_use]
     pub fn lane(&self, lane: Lane) -> [f32; 2] {
         self.current
@@ -491,11 +488,11 @@ impl Placement {
         &self.current
     }
 
-    /// `x` and `w` of an element bound by `bind`, moved from its authored
-    /// lane to the current one: `x' = cx + (x − ax)·cw/aw`, `w' = w·cw/aw`.
-    pub(crate) fn bind(&self, bind: Bind, x: f32, w: f32) -> [f32; 2] {
+    /// The map of an element bound by `bind` from its authored lane to the
+    /// current one; the identity when unbound.
+    pub(crate) fn bind(&self, bind: Bind) -> LaneMap {
         let pair = match bind {
-            Bind::None => return [x, w],
+            Bind::None => None,
             Bind::Lane(l) => self
                 .authored
                 .lanes
@@ -504,13 +501,24 @@ impl Placement {
                 .map(|(a, c)| (*a, *c)),
             Bind::Lanes => Some((self.authored.span, self.current.span)),
         };
-        let Some(([ax, aw], [cx, cw])) = pair else {
-            return [x, w];
-        };
-        let r = cw / aw;
-        [
-            f32_of(cx + (f64::from(x) - ax) * r),
-            f32_of(f64::from(w) * r),
-        ]
+        LaneMap(pair.map(|([ax, aw], [cx, cw])| [ax, cx, cw / aw]))
+    }
+}
+
+/// An x mapping from an authored lane to its current place, as
+/// `[ax, cx, cw/aw]`: `x' = cx + (x − ax)·cw/aw`, `w' = w·cw/aw`.
+#[derive(Clone, Copy)]
+pub(crate) struct LaneMap(Option<[f64; 3]>);
+
+impl LaneMap {
+    /// A point's x.
+    pub(crate) fn x(self, x: f32) -> f32 {
+        self.0
+            .map_or(x, |[ax, cx, r]| f32_of(cx + (f64::from(x) - ax) * r))
+    }
+
+    /// A width.
+    pub(crate) fn w(self, w: f32) -> f32 {
+        self.0.map_or(w, |[_, _, r]| f32_of(f64::from(w) * r))
     }
 }
