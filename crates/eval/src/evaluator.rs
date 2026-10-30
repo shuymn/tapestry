@@ -9,8 +9,9 @@ use bms_model::{
     Chart, DOMAIN, LANE_COUNT, Lane, LnMode as ChartLnMode, NoteKind, SoundId, TimeUs,
 };
 use rules::{
-    Assignment, Denominator, GaugeValue, JudgeWindows, Judgment, LaneTable, LateHeadRule, LnMode,
-    MissRule, PerJudgment, PerLaneClass, RulePreset, SameTimeOrder, TotalMode,
+    Assignment, Denominator, GaugeValue, HeadEligibility, JudgeWindows, Judgment, LaneTable,
+    LateHeadRule, LnMode, MissRule, PerJudgment, PerLaneClass, RulePreset, SameTimeOrder,
+    TotalMode,
 };
 
 use crate::EvalError;
@@ -916,6 +917,22 @@ impl<'a> Evaluator<'a> {
             if judged || past_bad || d > i128::from(bad.late.0) {
                 continue;
             }
+            // LN transitions decide which heads are eligible (design.md
+            // "Evaluation Stages"). An ineligible head is not taken: a later
+            // primary passes it, and otherwise it waits for its own miss.
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`targets` holds indices into the lane's notes"
+            )]
+            let head = matches!(notes[i].kind, NoteKind::Long { .. });
+            let eligible = match self.rule.ln_mode.head_eligibility {
+                HeadEligibility::InsideBad => true,
+                // A late BAD: past the late GOOD edge, inside BAD.
+                HeadEligibility::NotLateBad => !head || d <= i128::from(good.late.0),
+            };
+            if !eligible {
+                continue;
+            }
             let replaces = match (self.rule.assignment, primary) {
                 (_, None) => true,
                 // Strictly nearer only, so a tie keeps the earlier note.
@@ -965,8 +982,8 @@ impl<'a> Evaluator<'a> {
         if lead_in && best.is_none() {
             return;
         }
-        // The judged note, else the next unjudged one (the cursor: no
-        // unjudged note lies inside BAD, and earlier ones are missed).
+        // The note taken, else the lane's first unjudged one (the cursor),
+        // which may be a head the press could not take.
         let target = best.map(|(_, k)| k).or(first);
         let rule = self.rule.empty_poor;
         let empty_poor = best.is_none() && near;

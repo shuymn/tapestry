@@ -179,7 +179,7 @@ jobs:
       # The allocation contracts also hold with optimizations (design.md
       # "Scope of No Allocation").
       - name: Allocation tests (release)
-        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio --test alloc --test audio_alloc --test audio_burst
+        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio -p skin-model --test alloc --test audio_alloc --test audio_burst --test ring_out_alloc
       # The fuzz crate is its own workspace (fuzz/Cargo.toml), which the
       # workspace commands above do not reach.
       - name: Format (fuzz crate)

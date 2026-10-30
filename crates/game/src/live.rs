@@ -23,6 +23,12 @@
 //!   the abort is kept (design.md "Play Lifecycle").
 //! - A completed play seals its key sounds; the tail ends when the audio
 //!   side reports the sealed audio done.
+//! - A practice round ([`crate::practice`]) opens recording at its
+//!   lead-in's start, has its audio restored there, and is evaluated in its
+//!   section. At completion it rings out instead of the tail: the ring-out
+//!   ends when the audio side reports it done and the play's time has
+//!   reached its end. A repeated round that rang out to its end is followed
+//!   by the next round at the following step, with no result between.
 //! - Opening and closing recording wait a bounded time for the input
 //!   thread. One that is gone or does not answer ends the run with
 //!   [`LiveError::Input`], after the play's record is saved: a failed close
@@ -37,6 +43,7 @@ use replay::Incomplete;
 use crate::audio_loop::AudioWaitError;
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::policy::SessionEvent;
+use crate::practice::{FADE, RING_OUT};
 use crate::render::RenderSide;
 use crate::session::{Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, Settings};
 use crate::sound::{AudioQueue, audio_link_at};
@@ -169,6 +176,21 @@ pub trait Rig {
     fn cancel_audio(&mut self);
     /// No key sound follows.
     fn seal_audio(&mut self);
+    /// A practice round completed: no key sound follows, and its audio
+    /// rings out (design.md "Mid-Chart Start and Section Repeat"): the BGM
+    /// plays on until `fade_at`, the output fades to silence by `end_at`,
+    /// both in the play's chart time, and every sound stops there.
+    /// [`audio_done`](Self::audio_done) then turns true as for a sealed
+    /// play, possibly before the play's time reaches `end_at`.
+    fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs);
+    /// Restores a practice round's audio to chart time `at`, the lead-in's
+    /// start, right after [`start`](Self::start): the voices that playing
+    /// the engine's schedule from its beginning leaves sounding there, each
+    /// partway into its sound, at full gain. By default nothing is
+    /// restored, and the round's audio starts from silence there.
+    fn restore_audio(&mut self, at: TimeUs) {
+        let _ = at;
+    }
     /// Whether the sealed play's audio has ended.
     fn audio_done(&self) -> bool;
     /// Closes recording and waits until nothing more is pushed.
@@ -274,6 +296,16 @@ pub fn run_chart<R: Rig>(
         if by(AbortCause::Retry) {
             continue;
         }
+        // A repeated round whose ring-out ran to its end is followed by the
+        // next round, whose countdown begins at the following step; any
+        // other end of a round shows its result as a full play's does.
+        if report.end == PlayEnd::Completed
+            && report.tail_cut.is_none()
+            && loaded.practice().is_some_and(|p| p.repeat)
+        {
+            rig.wait();
+            continue;
+        }
         loaded.emit(&SessionEvent::Result {
             attempt: report.attempt,
         });
@@ -350,9 +382,13 @@ fn play_and_next<R: Rig>(
     }
     rig.before_play(loaded.settings_mut());
     let start = loaded.begin_play();
+    // A full play's recording opens its countdown before chart time 0, a
+    // practice round's at its lead-in's start (design.md "Mid-Chart Start
+    // and Section Repeat").
+    let opens_at = loaded.opens_at();
     // A quit during the wait is latched and taken by the first step.
     let opening = rig
-        .open(loaded.config().lead_in)
+        .open(TimeUs(opens_at.0.saturating_neg()))
         .map_err(LiveError::Input)?;
     let origin = opening.origin;
     // The refusal is the error reported; a failed close adds nothing to it.
@@ -363,11 +399,12 @@ fn play_and_next<R: Rig>(
             return Err(LiveError::Logic(e));
         }
     };
-    let (mut logic, screen) = match Logic::new(
+    let (mut logic, screen) = match Logic::with_section(
         loaded.chart(),
         loaded.preset(),
         &plan.device,
         &opening.start,
+        loaded.section(),
         opening.readers,
         plan.logic,
         Vec::new(),
@@ -390,6 +427,15 @@ fn play_and_next<R: Rig>(
     logic.add_sink(Box::new(sink));
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
+    // A round's audio is restored where its recording opens: reset →
+    // restore → lead-in → section evaluation.
+    let round = loaded.section().is_some();
+    if round {
+        rig.restore_audio(opens_at);
+    }
+    // A round's ring-out, once it completed: where its fade starts and
+    // where it ends, in its chart time.
+    let mut ring_out = None;
     let mut output_error = None;
     let mut input_error = None;
     // A suspend while recording is open marks the record incomplete, whichever
@@ -423,7 +469,8 @@ fn play_and_next<R: Rig>(
         } else if rig.screen_failed() {
             logic.abort(AbortCause::ScreenFailed);
         }
-        let advance = logic.advance_to(TimeUs(rig.now().0 - origin.0));
+        let now = TimeUs(rig.now().0 - origin.0);
+        let advance = logic.advance_to(now);
         live.extend_from_slice(logic.events());
         let delivered = TimeUs(rig.now().0 - origin.0);
         rig.measured(&advance, logic.events(), delivered);
@@ -433,7 +480,16 @@ fn play_and_next<R: Rig>(
             break PlayEnd::Aborted(cause);
         }
         if advance.complete {
-            rig.seal_audio();
+            // A round rings out from the step that completed it, as a full
+            // play's audio tail follows it.
+            if round {
+                let end_at = TimeUs(now.0.saturating_add(RING_OUT.0));
+                let fade_at = TimeUs(end_at.0.saturating_sub(FADE.0));
+                rig.ring_out(fade_at, end_at);
+                ring_out = Some(end_at);
+            } else {
+                rig.seal_audio();
+            }
             break PlayEnd::Completed;
         }
         // An audio failure after a step that did not complete ends the play
@@ -484,10 +540,11 @@ fn play_and_next<R: Rig>(
     let view = logic.view();
     let record = logic.into_record();
 
-    // The audio tail of a completed play: nothing is recorded, and a
-    // control, an input-thread failure, focus loss, removal of the last
-    // device, an audio failure or a screen failure cuts it short; the
-    // play stays complete.
+    // The audio tail of a completed play, or a round's ring-out: nothing is
+    // recorded, and a control, an input-thread failure, focus loss, removal
+    // of the last device, an audio failure or a screen failure cuts it
+    // short; the play stays complete, and its frozen record is saved after
+    // it either way.
     let mut tail_cut = None;
     if end == PlayEnd::Completed
         && let Some(c) = carried
@@ -507,7 +564,13 @@ fn play_and_next<R: Rig>(
         tail_cut = Some(AbortCause::OutputFailed);
         rig.cancel_audio();
     }
-    while end == PlayEnd::Completed && tail_cut.is_none() && !rig.audio_done() {
+    // A round's ring-out ends once the audio is done and its time has
+    // reached the ring-out's end: the audio side mixes ahead, so its report
+    // alone can come early.
+    let tail_over = |rig: &R| {
+        rig.audio_done() && ring_out.is_none_or(|end_at| rig.now().0 - origin.0 >= end_at.0)
+    };
+    while end == PlayEnd::Completed && tail_cut.is_none() && !tail_over(rig) {
         rig.wait();
         tail_cut = if rig.quitting() {
             Some(AbortCause::Quit)

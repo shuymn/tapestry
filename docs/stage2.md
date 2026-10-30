@@ -261,12 +261,13 @@ egui comes with the first form-like screen.
 
 **What beatoraja-style still needs.** Nothing the model cannot express: PR7 landed the values the model expresses, PR7b combo priority (B: which note a press takes, `Assignment::ComboPriority`; the notes it passes are a known difference above), and PR7c the gauges (C, D, E: HARD guts as ordered damage bands; the HARD and EX HARD increase scaled by `max(0, min(0.15, (2T − 320) / N)) / 0.15`; `#TOTAL` when absent as `max(260, 7.605N / (0.01N + 6.5))`, with a `#TOTAL` not positive ignored so an earlier one stays, jbms-parser `BMSDecoder.java:730-743`, from PR7e; N the whole chart's count, practice included). Each is shown by an example in crates/eval/tests/style_beatoraja.rs, cited under `src/bms/player/beatoraja/`.
 
-**What LR2-style needs beyond them.** Endless Dream shares B, the notes a press passes, G and H as known differences, and its single low-gauge step (× 0.6 below 32 %) fits the band list. Its own known difference, cited at that commit under `core/src/bms/player/beatoraja/`:
+**What LR2-style needs beyond them.** Endless Dream shares B, the notes a press passes, G and H as known differences, and its single low-gauge step (× 0.6 below 32 %) fits the band list. Its own known differences, cited at that commit under `core/src/bms/player/beatoraja/`:
 - **One press judges one note (decided).** Endless Dream's multi-BAD judges BAD, with the same press, the other unjudged notes in BAD but not GOOD range, filtered by the primary's timing, judgment and LN type, leading LN heads trimmed (`play/JudgeManager.java:993-1061`, from wcko87/lr2oraja bbe35f5e). That approximates LR2, where the lane pointer advances past a BAD and the same press judges the next note again (OpenLR2 `ProcSinglenote`, GOMazk/OpenLR2@583a3850 `LR2f.cpp:7509-7523`), an implementation artifact. Here the notes a press passes are POOR at the press. At `#RANK 3` (100 %), with taps at 0 and 160 ms and a long note from 50 to 100 ms on one lane, a press at 190 ms takes the 160 ms tap (GREAT); Endless Dream gives BAD on the 0 ms tap and the head, LR2-style POOR on both at the press.
+- **An ineligible LN head keeps the earlier candidate (decided).** Endless Dream makes a late BAD head ineligible (K) by giving it judge 6 (`play/JudgeManager.java:435-437`), which reuses beatoraja's "no judgment here" branch, and that branch also resets the candidate the scan had already taken (`:445-452`), an implementation artifact: the rule only says a late BAD head cannot be taken, and LR2 judges the oldest note. Here the earlier candidate stays the primary. At `#RANK 3` (100 %), with a tap at 0 ms and a long note from 30 ms on one lane, a press at 190 ms is BAD on the tap here and the head is missed at 230 ms; Endless Dream judges nothing at the press, and misses the tap at 200 ms and the head at 230 ms.
 
 Its own rules, each again with an example:
 - **I. Window interpolation:** below 100 % PERFECT, GREAT and GOOD come from the LR2 table, interpolated; at 100 % and above they scale linearly; then each of them is clamped to the next wider window, so at `#DEFEXRANK 400` (300 %) GOOD is BAD's 200 ms, not 360 ms; BAD and empty POOR are not scaled; `#RANK` 0-4 is 25, 50, 75, 100, 75 %, and `#DEFEXRANK n` is n × 75 / 100 % (`play/JudgeProperty.java:168`, `:185-265`, the clamp `:241-249`; `play/BMSPlayerRule.java:61-65`) (PR8).
-- **K. LN-head eligibility:** a late BAD on an LN head cannot be the primary (`play/JudgeManager.java:435-437`); a head the primary passes is POOR at the press, and one it does not pass stays to its own miss. At `#RANK 3` (100 %), with a long note from 0 to 50 ms and a tap at 300 ms on one lane, a press at 160 ms cannot take the head (160 ms late, BAD), which combo priority alone would keep since the tap lies outside GOOD; it takes the tap (140 ms early, BAD), and the head is POOR at the press. With the long note alone, the press takes nothing and the head is missed at its own deadline. The variant lands in PR7d with that example; PR8 assembles it.
+- **K. LN-head eligibility:** a late BAD on an LN head cannot be the primary (`play/JudgeManager.java:435-437`); a head the primary passes is POOR at the press, and one it does not pass stays to its own miss. At `#RANK 3` (100 %), with a long note from 0 to 50 ms and a tap at 300 ms on one lane, a press at 160 ms cannot take the head (160 ms late, BAD), which combo priority alone would keep since the tap lies outside GOOD; it takes the tap (140 ms early, BAD), and the head is POOR at the press. With the long note alone, the press takes nothing and the head is missed at its own deadline. PR7d built the variant (`HeadEligibility::NotLateBad`), checked with that example in crates/eval/tests/style_lr2.rs under a preset built in test code; PR8 assembles it.
 - **L. Empty POOR:** for an unjudged note, (200, 1000) ms early: past the inclusive early BAD edge, and short of the scan's exclusive end; for a judged one, [0, 1000) ms early; no late side (`play/JudgeProperty.java:54-55`, the scan cutoff `play/JudgeManager.java:416`) (PR8).
 - **M. Gauges:** HARD-family damage × max(fix1, fix2); a survival gauge strictly below 2 % after a change, mines included, drops to 0 and fails; `#TOTAL` when absent as `160 + (N + clamp(N − 400, 0, 200)) × 0.16` (`play/GrooveGauge.java:218-225`, `:279-309`; `play/BMSPlayerRule.java:88-89`). PR7c lands the variants (the damage correction, the failure threshold, the default), checked against Endless Dream's gauges built in test code (crates/eval/tests/style_lr2.rs); PR8 assembles them.
 
@@ -482,9 +483,13 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 ### D18. Menu input
 
 - **Keyboard.** Navigation and IME come through winit.
-- **Controller.** While Idle and focused, the input thread turns the bound controller lanes and scratch into menu events: key 1 or 7 confirms or goes back, and the scratch scrolls.
+- **Controller.** While Idle and focused, the input thread turns the configured controller's bound lanes and scratch into menu events for the select screen (design.md "Input", "Menu input"):
+  - the white keys 1, 3, 5 and 7 confirm (as Enter), and the black keys 2, 4 and 6 go back (as Escape);
+  - the scratch scrolls a line at a time: an axis a line for each whole press threshold of movement, taken the short way round the revolution play converts it with, toward higher values down and toward lower values up, the remainder counting toward the next line; a scratch of two buttons, up with the first bound and down with the second;
+  - a button sends on its press only, with no repeat while held; only the first connected unit of the configured model sends, and none without a configured controller.
   - Events go through a bounded SPSC queue, and the thread unparks the game thread.
   - Menu events are never recorded.
+  - The result screen keeps the keyboard's retry and quit keys; controller commands there arrive with PR17.
 - **Keyboard lane keys** are not menu events.
 
 ### D19. Record format changes
@@ -492,7 +497,7 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 Each bumps `FORMAT_VERSION` at merge, and older formats are refused:
 - the wake policy (PR9);
 - the speed (PR20);
-- the play type, section, attempt, lead-in and initial gauges (PR23; today only `Full`, crates/replay/src/record.rs:137).
+- the play type, section, attempt, lead-in and initial gauges (PR23, format 7: the section as evaluated, in real time; the attempt is the play's number in its session).
 
 Each change is covered by round trips and changes D8's interpretation tuple.
 
@@ -829,6 +834,8 @@ Each one holds the behavior D17 states.
 
 ### PR10. Controller menu input
 
+**Touches.** `input` (menu.rs, sources.rs), input_side.rs, select.rs, selection.rs, main.rs, design.md "Input".
+
 **Depends on.** PR9, PR15.
 
 **Done when.**
@@ -1010,6 +1017,16 @@ Each one holds the behavior D5 and D6 state.
 **Depends on.** PR2, PR14, PR20, PR22.
 
 **Why the gauge transfer is here.** Initial gauges enter records only with this PR's practice record fields; a full play starts every gauge at its preset's start, so PR17's what-if of a full play has nothing to transfer. The transfer belongs with the record fields it reads and the `verify` path that builds the target preset's `Section`.
+
+**What it leaves to PR24.** `Loaded::set_practice` sets the rounds up and the headless session restores audio with a seek; the player's rig rings out (`AudioCtl::RingOut`) but restores nothing yet (`Rig::restore_audio`'s default): the seek plan on the play command, the drawing of the section's targets only, and the screen that sets a practice up stay with the practice screen.
+
+**Decided in this PR** (design.md "Mid-Chart Start and Section Repeat", "Practice Records"):
+- A record stores the section as evaluated, in real time, with its lead-in; its attempt is the play's number in its session.
+- The section is set in 1× time, and both edges are mapped with `floor(t × 20/k)`.
+- A mid-chart start is one round, followed by its result screen.
+- An autoplay session refuses a practice.
+- A preset reloaded at a retry whose gauges no longer take the practice's initial gauges refuses the round at its opening.
+- One acceptance rule for initial gauges, `eval::accepts_initial`, serves `Evaluator::new` and the what-if's transfer.
 
 **Done when.**
 - When D15's example runs (`section_round_rings_out_and_repeats`):

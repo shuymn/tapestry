@@ -46,6 +46,11 @@ pub struct Selection {
     pub menu: Arc<MenuQueue>,
     /// The window's keys the queue dropped, as last reported.
     pub dropped: u64,
+    /// The controller's menu events from the input thread; none without a
+    /// configured controller.
+    pub pad: Option<input::MenuReceiver>,
+    /// The controller's events its queue dropped, as last reported.
+    pub pad_dropped: u64,
     /// The window's IME, allowed while the search box has focus; none
     /// headless.
     pub ime: Option<ImeSwitch>,
@@ -108,6 +113,24 @@ impl Selection {
     /// edits of the search or the order are searched once: at the end, or
     /// before any other input, which acts on the list they make.
     fn drain(&mut self) -> Option<PathBuf> {
+        // The controller's events join the window's, as the keys they
+        // stand for.
+        if let Some(pad) = &mut self.pad {
+            while let Some(event) = pad.pop() {
+                self.menu
+                    .push(MenuInput::Key(crate::select::event_key(event)));
+            }
+            let dropped = pad.dropped();
+            if dropped > self.pad_dropped {
+                let line = format!(
+                    "select: {} controller menu events dropped, their queue was full",
+                    dropped - self.pad_dropped
+                );
+                eprintln!("{line}");
+                log::warn!("{line}");
+                self.pad_dropped = dropped;
+            }
+        }
         while let Some(input) = self.menu.pop() {
             let edit = matches!(
                 input,
@@ -474,6 +497,9 @@ impl AppRig for PlayerRig<'_> {
         sel.entered_at = self.clock.now();
         // What was typed during the chart belongs to it.
         while sel.menu.pop().is_some() {}
+        if let Some(pad) = &mut sel.pad {
+            while pad.pop().is_some() {}
+        }
         sel.screen.end_composition();
         sel.shelf.release();
         if let Some(ime) = &sel.ime {
@@ -513,6 +539,8 @@ mod tests {
             screen: SelectScreen::new(vec![charts]),
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            pad: None,
+            pad_dropped: 0,
             ime: None,
             rate: 48_000,
             chosen_at: TimeUs(0),
@@ -545,6 +573,58 @@ mod tests {
         }
         let chosen = sel.drain().expect("Enter chooses");
         assert_eq!(chosen.file_name().unwrap(), "a.bms");
+    }
+
+    /// The controller's events act as the keys they stand for: Down twice
+    /// and Confirm choose C.
+    #[test]
+    fn controller_events_move_and_choose() {
+        use eval::ControlId;
+        use input::hid::HidProduct;
+        use input::{
+            DeviceId, DeviceKind, MenuAction, MenuBindings, MenuEvent, Packet, SourceConfig,
+            SourceSet,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let product = HidProduct {
+            vendor_id: 1,
+            product_id: 2,
+            interface: None,
+        };
+        let (tap, pad) = input::menu_queue(MenuBindings {
+            product,
+            controls: vec![
+                (ControlId(1), MenuAction::Press(MenuEvent::Confirm)),
+                (ControlId(2), MenuAction::Press(MenuEvent::Down)),
+            ],
+            step: 2,
+            relative: None,
+            wrap: None,
+        });
+        sel.pad = Some(pad);
+        let mut set = SourceSet::new(SourceConfig {
+            max_devices: 1,
+            max_sources: 1,
+            max_held: 4,
+            queue_capacity: 4,
+            max_arrivals: 1,
+        })
+        .unwrap();
+        set.connect(DeviceId(7), DeviceKind::Controller);
+        set.set_product(DeviceId(7), product);
+        set.set_menu(tap);
+        set.menu_mut().unwrap().set_active(true);
+        for (control, value) in [(2, 1), (2, 0), (2, 1), (1, 1)] {
+            set.packet(&Packet {
+                device: DeviceId(7),
+                control: ControlId(control),
+                value,
+                background: false,
+            });
+        }
+        let chosen = sel.drain().expect("Confirm chooses");
+        assert_eq!(chosen.file_name().unwrap(), "c.bms");
     }
 
     /// Consecutive edits of the search are searched once, at the end.

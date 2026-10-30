@@ -128,6 +128,11 @@ pub enum SeekError {
         /// The first frame not yet written.
         written: u64,
     },
+    /// The play is ringing out, or has rung out: a seek belongs to the
+    /// start of a play, after [`AudioEngine::restart`] has taken the
+    /// ring-out off.
+    #[error("the play is ringing out; a seek starts the next play")]
+    RingingOut,
 }
 
 /// Engine ids for [`SeekSource`]: one per engine built.
@@ -163,8 +168,15 @@ pub struct AudioEngine {
     /// Where chart time 0 lies on the output's timeline.
     play_origin: TimeUs,
     /// The chart time a seek starts at and the starts the pass reaching it
-    /// may still admit, until its frame is placed.
+    /// may still admit, until its frame is placed. Set only at a play's
+    /// start: a seek is refused while a ring-out is set ([`SeekError::RingingOut`]).
     seek_to: Option<(TimeUs, usize)>,
+    /// A ring-out's fade and end in chart time, until the pass that reaches
+    /// the fade puts them on the output.
+    ring_out: Option<(TimeUs, TimeUs)>,
+    /// The output frame a placed ring-out ends at: no BGM event starts
+    /// from there.
+    ring_end: Option<i64>,
     scheduled: Vec<Scheduled>,
     scheduled_dropped: u64,
     underruns: u64,
@@ -230,6 +242,8 @@ impl AudioEngine {
             output_offset: TimeUs(0),
             play_origin: TimeUs(0),
             seek_to: None,
+            ring_out: None,
+            ring_end: None,
             scheduled: Vec::with_capacity(schedule_log),
             scheduled_dropped: 0,
             underruns: 0,
@@ -291,13 +305,46 @@ impl AudioEngine {
     }
 
     /// Starts the play over (a retry) with chart time 0 at `origin` on the
-    /// timeline the output's wakes are in: every voice stops and the BGM
-    /// schedule rewinds. The output stream and its clock continue.
+    /// timeline the output's wakes are in: every voice stops, the BGM
+    /// schedule rewinds, and a ring-out, finished or not, is taken off, so
+    /// the output is at full gain from the play's first frame. The output
+    /// stream and its clock continue.
     pub fn restart(&mut self, origin: TimeUs) {
         self.mixer.stop_all();
         self.next_bgm = 0;
         self.seek_to = None;
+        self.clear_ring_out();
         self.play_origin = origin;
+    }
+
+    fn clear_ring_out(&mut self) {
+        self.ring_out = None;
+        self.ring_end = None;
+    }
+
+    /// Rings the play out (design.md "Mid-Chart Start and Section Repeat"):
+    /// chart times `fade_at` and `end_at` go on the output's frames as a BGM
+    /// event's time does, by the mix clock of the pass that reaches
+    /// `fade_at`'s frame. From that frame the output's gain falls linearly
+    /// per frame to 0 at `end_at`'s frame (a `fade_at` after `end_at` counts
+    /// as `end_at`), where every voice stops and a seek still waiting is
+    /// dropped; no BGM event or key sound starts from there. The play's
+    /// audio then ends as a sealed tail does
+    /// (no voice, no BGM event left). Until then the BGM plays on its
+    /// schedule. Until the next [`restart`](Self::restart) a seek is refused
+    /// ([`SeekError::RingingOut`]), so nothing takes the envelope off before
+    /// its end. Allocates nothing.
+    pub fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
+        // A fade after the end is placed and rung as the end.
+        self.ring_out = Some((fade_at.min(end_at), end_at));
+        self.ring_end = None;
+    }
+
+    /// The BGM schedule the engine plays (sorted by time), for planning
+    /// its seeks ([`SeekPlan::new`]).
+    #[must_use]
+    pub fn schedule(&self) -> &[BgmEvent] {
+        &self.bgm
     }
 
     /// What this engine plays, for planning its seeks where the play is
@@ -357,12 +404,20 @@ impl AudioEngine {
     /// [`SeekError`] for a plan made from another engine's
     /// [`seek_source`](Self::seek_source) (a schedule other than this
     /// engine's is refused when planning), on a line of another rate or
-    /// period, or whose frame is already written; nothing changes.
+    /// period, or whose frame is already written; and
+    /// [`SeekError::RingingOut`] while a ring-out is set: a seek starts a
+    /// play (a round's restore), so it comes after [`restart`](Self::restart),
+    /// which takes the ring-out off, and never cuts into a fade. Nothing
+    /// changes.
     pub fn seek(&mut self, plan: &SeekPlan) -> Result<(), SeekError> {
         // A plan of another engine, or of a chart the engine no longer plays
         // (its bank or schedule was replaced since), is refused.
         if plan.engine() != self.id || plan.chart() != self.chart {
             return Err(SeekError::Source);
+        }
+        // Parking the seek's voices would take the envelope off with them.
+        if self.ring_out.is_some() || self.ring_end.is_some() {
+            return Err(SeekError::RingingOut);
         }
         let line = plan.line();
         if (line.rate, line.period) != (self.rate, self.period) {
@@ -398,6 +453,7 @@ impl AudioEngine {
         self.mixer.stop_all();
         self.next_bgm = self.bgm.len();
         self.seek_to = None;
+        self.clear_ring_out();
     }
 
     /// Plays another chart from here on: `bank` and `bgm` (sorted by time)
@@ -429,6 +485,7 @@ impl AudioEngine {
         self.chart = self.chart.wrapping_add(1);
         self.next_bgm = self.bgm.len();
         self.seek_to = None;
+        self.clear_ring_out();
         Ok((old_bank, BgmSchedule::from_parts(old_bgm, old_hash)))
     }
 
@@ -536,9 +593,28 @@ impl AudioEngine {
                     held = true;
                 }
             }
+            // A ring-out goes on the output at the pass reaching its fade,
+            // by that pass's clock.
+            if let Some((fade_at, end_at)) = self.ring_out {
+                let line = self.frame_line();
+                let (fade, end) = (line.frame(fade_at), line.frame(end_at));
+                if fade < i64::try_from(block_end).unwrap_or(i64::MAX) {
+                    self.mixer.ring_out(fade, end);
+                    self.ring_out = None;
+                    self.ring_end = Some(end);
+                }
+            }
             while let Some(&event) = self.bgm.get(self.next_bgm).filter(|_| !held) {
                 let at = output_time(self.play_origin, self.output_offset, event.time);
                 let target = self.clock.frame_at(at).unwrap_or(0);
+                // Nothing starts from a ring-out's end on.
+                if self
+                    .ring_end
+                    .is_some_and(|end| i64::try_from(target).unwrap_or(i64::MAX) >= end)
+                {
+                    self.next_bgm = self.bgm.len();
+                    break;
+                }
                 if target >= block_end {
                     break;
                 }
@@ -554,6 +630,13 @@ impl AudioEngine {
             }
             report.frames = (buf.len() / CHANNELS) as u32;
             self.mixer.render(&self.bank, buf);
+            // Rendering reached a ring-out's end: everything stopped there,
+            // a seek still waiting included, and nothing of the schedule
+            // starts any more.
+            if self.mixer.rung_out() {
+                self.seek_to = None;
+                self.next_bgm = self.bgm.len();
+            }
         })?;
         if deferred {
             self.deferred_wakes += 1;

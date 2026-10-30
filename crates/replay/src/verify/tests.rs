@@ -214,7 +214,7 @@ fn encoding_4(bytes: &[u8]) -> Vec<u8> {
         .unwrap();
     let mut old = bytes.to_vec();
     old.remove(tag);
-    assert_eq!(old[0], 8, "the current encoding");
+    assert_eq!(old[0], 9, "the current encoding");
     old[0] = 4;
     old
 }
@@ -682,5 +682,145 @@ fn refuses_a_chart_that_resolves_alike_but_plays_otherwise_at_the_speed() {
     assert_eq!(
         load_recorded_chart(&record, edited.as_bytes(), dir.path()),
         Err(VerifyError::PlayedChartMismatch)
+    );
+}
+
+/// `record` as a round of section repeat of `[start, end)` with a 1 s
+/// lead-in, holding `gauges` by ID.
+fn as_round(
+    mut record: PlayRecord,
+    start: i64,
+    end: i64,
+    gauges: &[(&str, rules::GaugeValue)],
+) -> PlayRecord {
+    record.play_type = PlayType::SectionRepeat(crate::Practice {
+        start: TimeUs(start),
+        end: TimeUs(end),
+        lead_in: TimeUs(1_000 * MS),
+        attempt: 1,
+        initial_gauges: gauges
+            .iter()
+            .map(|&(id, value)| crate::InitialGauge {
+                id: id.to_owned(),
+                value,
+            })
+            .collect(),
+    });
+    record
+}
+
+fn pct(n: i64) -> rules::GaugeValue {
+    rules::GaugeValue(n * rules::GaugeValue::PERCENT)
+}
+
+#[test]
+fn what_if_transfers_initial_gauges_by_id() {
+    // A practice record made under the tapestry preset with `normal` at
+    // 50 % and `survival` at 70 %.
+    let (dir, record) = played();
+    let held = [("normal", pct(50)), ("survival", pct(70))];
+    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
+    let style = rules::beatoraja_style();
+    let ids: Vec<&str> = style.gauges.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(ids[0], "normal");
+    assert!(!ids.contains(&"survival"));
+    // A section with no note: every gauge stays where it started.
+    let empty = as_round(record.clone(), 500 * MS, 1_500 * MS, &held);
+    let r = evaluate_record(&empty, &chart, Some(&style)).unwrap();
+    assert!(!r.as_played);
+    let started: Vec<_> = r.evaluation.gauges.iter().map(|g| g.value).collect();
+    let mut expected: Vec<_> = style.gauges.iter().map(|g| g.start).collect();
+    expected[0] = pct(50);
+    assert_eq!(started, expected);
+    // `normal` came from the record; every other gauge is marked as started
+    // at beatoraja-style's start value.
+    let mut defaulted = vec![true; style.gauges.len()];
+    defaulted[0] = false;
+    assert_eq!(r.started_at_default, defaulted);
+    // As played, both recorded values apply and none is marked.
+    let own = evaluate_record(&empty, &chart, None).unwrap();
+    assert!(own.as_played);
+    assert_eq!(own.started_at_default, [false, false]);
+    let started: Vec<_> = own.evaluation.gauges.iter().map(|g| g.value).collect();
+    assert_eq!(started, [pct(50), pct(70)]);
+    // Over the section [1 s, 5 s), the what-if is the section evaluated
+    // from those starts.
+    let round = as_round(record, 1_000 * MS, 5_000 * MS, &held);
+    let r = evaluate_record(&round, &chart, Some(&style)).unwrap();
+    let section = eval::Section {
+        start: TimeUs(1_000 * MS),
+        end: TimeUs(5_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: expected,
+    };
+    let input = eval::EvalInput {
+        events: round.events.clone(),
+        device: round.devices.profile(),
+        start: round.start.clone(),
+        finalized: None,
+        section: Some(section),
+    };
+    assert_eq!(
+        r.evaluation,
+        eval::evaluate(&chart, &input, &style).unwrap()
+    );
+    assert_eq!(r.evaluation.tally.counts.perfect, 2);
+    // A full play marks nothing.
+    let (_, full) = played();
+    assert!(
+        evaluate_record(&full, &chart, Some(&style))
+            .unwrap()
+            .started_at_default
+            .is_empty()
+    );
+}
+
+#[test]
+fn out_of_bounds_initial_gauge_uses_the_default() {
+    // A test preset whose `normal` starts at 20 % with bounds 10-100 %.
+    let mut bounded = rules::custom();
+    bounded.id = "bounded".to_owned();
+    bounded.gauges[0].min = pct(10);
+    assert_eq!(bounded.gauges[0].start, pct(20));
+    bounded.validate().unwrap();
+    let (dir, record) = played();
+    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
+    let starts = |held: &[(&str, rules::GaugeValue)]| {
+        let round = as_round(record.clone(), 500 * MS, 1_500 * MS, held);
+        let r = evaluate_record(&round, &chart, Some(&bounded)).unwrap();
+        let values: Vec<_> = r.evaluation.gauges.iter().map(|g| g.value).collect();
+        (values, r.started_at_default)
+    };
+    // `normal` at 5 % is below its bounds, and `survival` at 0 would fail
+    // at once: each starts at its start value, marked like a missing one.
+    assert_eq!(
+        starts(&[("normal", pct(5)), ("survival", pct(0))]),
+        (vec![pct(20), pct(100)], vec![true, true])
+    );
+    assert_eq!(starts(&[]), (vec![pct(20), pct(100)], vec![true, true]));
+    // Within the bounds, the recorded values apply.
+    assert_eq!(
+        starts(&[("normal", pct(10)), ("survival", rules::GaugeValue(1))]),
+        (vec![pct(10), rules::GaugeValue(1)], vec![false, false])
+    );
+    // A survival gauge that fails below 2 % does not start at 1 %, which it
+    // would fail at once, and starts at 2 %.
+    bounded.gauges[1].kind = rules::GaugeKind::Survival {
+        fails_below: pct(2),
+    };
+    bounded.validate().unwrap();
+    let starts = |held: &[(&str, rules::GaugeValue)]| {
+        let round = as_round(record.clone(), 500 * MS, 1_500 * MS, held);
+        let r = evaluate_record(&round, &chart, Some(&bounded)).unwrap();
+        let values: Vec<_> = r.evaluation.gauges.iter().map(|g| g.value).collect();
+        (values, r.started_at_default)
+    };
+    assert_eq!(
+        starts(&[("survival", pct(1))]),
+        (vec![pct(20), pct(100)], vec![true, true])
+    );
+    assert_eq!(
+        starts(&[("survival", pct(2))]),
+        (vec![pct(20), pct(2)], vec![true, false])
     );
 }
