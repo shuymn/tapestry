@@ -13,7 +13,7 @@ use eval::{
     InputKind, InputStart, JudgeEvent, JudgeEventKind, PhysicalInputEvent, ScratchSettings,
     Section, SourceId, evaluate,
 };
-use rules::Judgment::{Bad, Perfect, Poor};
+use rules::Judgment::{Bad, Good, Perfect, Poor};
 use rules::{GaugeValue, RulePreset};
 
 const BPM: i64 = 150_000;
@@ -235,6 +235,51 @@ fn lead_in_press_on_the_first_early_edge_is_judged() {
         [(1, 0, Bad, Some(-180 * MS)), (2, 0, Poor, None)]
     );
     assert_eq!(sounds(&e.events), 1);
+}
+
+#[test]
+fn lead_in_release_judges_a_long_note_taken_in_the_lead_in() {
+    // The first target is a long note from 10 s to 10.18 s. Pressed at
+    // 9.97 s (30 ms early, a GREAT head) and released at 9.99 s, still in
+    // the lead-in and before the head: 190 ms before its end, which the
+    // LN-end edges (100/150/200 ms) grade GOOD, the worse of the two.
+    let chart = ChartBuilder::new(BPM)
+        .long(lane(1), TimeUs(10 * S), TimeUs(10_180 * MS))
+        .build()
+        .unwrap();
+    let preset = rules::custom();
+    let dev = device(&[0]);
+    let events = vec![press(9_970 * MS, 0, 1), release(9_990 * MS, 0, 1)];
+    let e = eval_with(
+        &chart,
+        &preset,
+        &dev,
+        InputStart::default(),
+        events,
+        Some(ten_to_twenty(&preset)),
+    );
+    let judged: Vec<_> = e
+        .events
+        .iter()
+        .filter_map(|ev| match ev.kind {
+            JudgeEventKind::Judged {
+                judgment,
+                deviation,
+                release,
+                ..
+            } => Some((ev.time, judgment, deviation, release)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        judged,
+        [(
+            TimeUs(9_990 * MS),
+            Good,
+            Some(TimeUs(-30 * MS)),
+            Some(TimeUs(-190 * MS))
+        )]
+    );
 }
 
 #[test]
