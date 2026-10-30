@@ -1,11 +1,12 @@
 //! The Pratt parser: tokens to an arena syntax tree with spans.
 //!
-//! Two guards bound the tree. [`Parser::enter`] refuses to recurse past
-//! [`MAX_NESTING`] levels (parentheses, unary operands, call arguments and
-//! `if` parts), and [`Parser::push`] refuses a node whose operator height
-//! passes [`MAX_NESTING`], which catches the left chains the Pratt loop
-//! builds without recursing. Every later recursive pass is bounded by the
-//! height.
+//! Two guards bound the tree. [`Parser::enter`] runs before every
+//! recursive `expr` call (a binary operator's right operand, a parenthesis,
+//! a unary operand, a call's arguments, an `if`) and refuses to pass
+//! [`MAX_NESTING`] levels. [`Parser::push`] refuses a node whose operator
+//! height passes [`MAX_NESTING`], which catches the left chains the Pratt
+//! loop builds without recursing. Every later recursive pass is bounded
+//! by the height.
 
 use super::MAX_NESTING;
 use super::error::{CompileError, ErrorKind, Span};
@@ -91,7 +92,8 @@ pub(super) enum Kind {
 pub(super) struct Node {
     pub(super) kind: Kind,
     pub(super) span: Span,
-    /// Operators on the longest path to a leaf; a leaf is 0.
+    /// Operators on the longest path to a leaf after `clamp` is lowered; a
+    /// leaf is 0.
     height: u8,
 }
 
@@ -225,15 +227,23 @@ impl Parser<'_, '_> {
 
     /// Adds a node, refusing one whose height passes [`MAX_NESTING`].
     fn push(&mut self, kind: Kind, span: Span) -> Result<Id, CompileError> {
-        let h = |id: Id| self.nodes[usize::from(id)].height;
-        let children = match kind {
-            Kind::Int(_) | Kind::Bool(_) | Kind::Name(_) => None,
-            Kind::Un(_, a) => Some(h(a)),
-            Kind::Bin(_, a, b) => Some(h(a).max(h(b))),
-            Kind::If(c, a, b) => Some(h(c).max(h(a)).max(h(b))),
-            Kind::Call(_, args, n) => args.iter().take(usize::from(n)).map(|&a| h(a)).max(),
+        let h = |id: Id| usize::from(self.nodes[usize::from(id)].height);
+        let height = match kind {
+            Kind::Int(_) | Kind::Bool(_) | Kind::Name(_) => 0,
+            Kind::Un(_, a) => h(a) + 1,
+            Kind::Bin(_, a, b) => h(a).max(h(b)) + 1,
+            Kind::If(c, a, b) => h(c).max(h(a)).max(h(b)) + 1,
+            // `clamp(x, l, h)` is checked as `min(max(x, l), h)`.
+            Kind::Call(Func::Clamp, [x, l, hi], _) => (h(x).max(h(l)) + 2).max(h(hi) + 1),
+            Kind::Call(_, args, n) => {
+                args.iter()
+                    .take(usize::from(n))
+                    .map(|&a| h(a))
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            }
         };
-        let height = children.map_or(0, |c| usize::from(c) + 1);
         if height > MAX_NESTING {
             return Err(CompileError::new(span, ErrorKind::TooDeep));
         }
@@ -270,7 +280,9 @@ impl Parser<'_, '_> {
             if matches!(level, 3 | 4) && built_by == Some(level) {
                 return Err(CompileError::new(op_tok.span, ErrorKind::NonAssociative));
             }
+            self.enter()?;
             let rhs = self.expr(level * 2 + 1)?;
+            self.leave();
             let span = self.span(lhs).to(self.span(rhs));
             lhs = self.push(Kind::Bin(op, lhs, rhs), span)?;
             built_by = Some(level);

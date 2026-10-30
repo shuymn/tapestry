@@ -32,11 +32,16 @@ use crate::schema::{Schema, Ty};
 pub const MAX_SOURCE_BYTES: usize = 1024;
 /// The longest name, in bytes.
 pub const MAX_NAME_BYTES: usize = 64;
-/// The deepest nesting. It bounds two things: the operator height of the
-/// syntax tree (the operators on its longest root-to-leaf path, so 64
-/// nested unary operators or a 65-term chain of binary ones), and the
-/// parser's recursion (each parenthesis, unary operand, call argument list
-/// and `if` counts one level, so 64 nested parentheses).
+/// The deepest nesting. It bounds two things:
+/// - The operator height of the syntax tree: the operators on its longest
+///   root-to-leaf path, with a call counting one and `clamp` counting two
+///   above its first two arguments (it is checked as `min(max(x, l), h)`).
+///   So 64 nested unary operators or calls, 32 nested `clamp`s, or a
+///   65-term chain of binary operators.
+/// - The parser's recursion: each binary operator's right operand,
+///   parenthesis, unary operand, call argument list and `if` counts one
+///   level while it is parsed. So 64 nested parentheses, or 32 of
+///   `1 + (…)`.
 pub const MAX_NESTING: usize = 64;
 /// The most postfix operations per expression, after folding.
 pub const MAX_OPS: usize = 256;

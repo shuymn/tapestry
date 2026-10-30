@@ -626,6 +626,15 @@ fn nesting_is_bounded_at_64_levels() {
     let chain = |terms: usize| format!("small{}", " + zero".repeat(terms - 1));
     ok(&chain(65), Ty::Int);
     assert_eq!(kind(&chain(66)), ErrorKind::TooDeep);
+    // A right operand counts a level of recursion, and so does its
+    // parenthesis. 32 levels parse (and then need 33 stack slots).
+    let right = |n: usize| format!("{}small{}", "1 + (".repeat(n), ")".repeat(n));
+    assert_eq!(kind(&right(32)), ErrorKind::StackTooDeep { depth: 33 });
+    assert_eq!(kind(&right(33)), ErrorKind::TooDeep);
+    // `clamp` is checked as `min(max(x, l), h)`: two levels above `x`.
+    let clamps = |n: usize| format!("{}small{}", "clamp(".repeat(n), ", 0, 1)".repeat(n));
+    ok(&clamps(32), Ty::Int);
+    assert_eq!(kind(&clamps(33)), ErrorKind::TooDeep);
 }
 
 /// A sum of 16 products of 8 `zero`s (255 operations), with `extra` unary
