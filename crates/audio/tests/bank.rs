@@ -5,7 +5,9 @@ mod common;
 
 use std::thread;
 
-use audio::{BankError, BankLimits, BankWarning, Cap, Found, load_bank};
+use audio::{
+    BankError, BankLimits, BankWarning, Cap, Found, Speed, load_bank, load_bank_at, plan_conversion,
+};
 use bms_model::SoundId;
 use common::{chart_of, put, ramp, tmp, wav, wav_declaring, wav_padded, wav_streaming};
 
@@ -194,25 +196,62 @@ fn bank_without_declared_lengths_is_bounded_while_decoding() {
 
 #[test]
 fn source_and_converted_pcm_are_charged_while_converting() {
-    // 400 frames at 16 kHz become 200 at 8 kHz. Converting holds both: 800
-    // source bytes plus 400 converted bytes, so a 1199-byte cap refuses it
-    // and 1200 does not, though the stored sound is only 400 bytes.
+    // 400 frames at 16 kHz become 200 at 8 kHz. Converting holds both, 800
+    // source bytes plus 400 converted bytes, and the stage's workspace
+    // bound W, so a cap of 1199 + W refuses it and 1200 + W does not,
+    // though the stored sound is only 400 bytes.
     let file = || vec![wav_streaming(16_000, 1, &ramp(400, 5, 9))];
     let limits = |max_bank_bytes| BankLimits {
         max_bank_bytes,
         ..BankLimits::default()
     };
-    let bank = load_files(&file(), 8_000, &limits(1_200)).unwrap();
+    let w = plan_conversion(16_000, 8_000, Speed::NORMAL, 1)
+        .device
+        .unwrap()
+        .workspace_bound();
+    let bank = load_files(&file(), 8_000, &limits(1_200 + w)).unwrap();
     assert_eq!(bank.get(SoundId(0)).unwrap().frames(), 200);
     assert_eq!(bank.bytes(), 400);
     assert_eq!(
-        load_files(&file(), 8_000, &limits(1_199)).unwrap_err(),
+        load_files(&file(), 8_000, &limits(1_199 + w)).unwrap_err(),
         BankError::OverCap {
             cap: Cap::BankMemory,
             found: Found::WhileDecoding,
             sound: SoundId(0),
-            amount: 1_200,
-            limit: 1_199,
+            amount: 1_200 + w,
+            limit: 1_199 + w,
+        }
+    );
+}
+
+#[test]
+fn speed_stage_charges_its_input_output_and_workspace() {
+    // 400 frames at the device rate become 800 at 50 %: 800 input bytes,
+    // 1600 output bytes and the speed stage's workspace bound W, so a cap
+    // of 2399 + W refuses it and 2400 + W does not.
+    let half = Speed::SLOWEST;
+    let limits = |max_bank_bytes| BankLimits {
+        max_bank_bytes,
+        ..BankLimits::default()
+    };
+    let w = plan_conversion(8_000, 8_000, half, 1)
+        .speed
+        .unwrap()
+        .workspace_bound();
+    let dir = tmp();
+    let file = wav_streaming(8_000, 1, &ramp(400, 5, 9));
+    let chart = chart_of(&[Some(put(dir.path(), "a.wav", &file))]);
+    let bank = load_bank_at(&chart, 8_000, half, &limits(2_400 + w)).unwrap();
+    assert_eq!(bank.get(SoundId(0)).unwrap().frames(), 800);
+    assert_eq!(bank.bytes(), 1_600);
+    assert_eq!(
+        load_bank_at(&chart, 8_000, half, &limits(2_399 + w)).unwrap_err(),
+        BankError::OverCap {
+            cap: Cap::BankMemory,
+            found: Found::WhileDecoding,
+            sound: SoundId(0),
+            amount: 2_400 + w,
+            limit: 2_399 + w,
         }
     );
 }
@@ -390,6 +429,76 @@ fn source_at_another_rate_is_converted_with_its_length_and_onset() {
         .max()
         .unwrap();
     assert!(worst < 160, "worst error {worst} of {amp}");
+}
+
+#[test]
+fn bank_lengths_follow_the_two_stages() {
+    // A 60 s 441 Hz tone at 44.1 kHz, right at half the left: 2 880 000
+    // frames at 48 kHz, then floor(2 880 000 × 20/k) (by hand). Pitch
+    // follows speed: output frame j holds the source at j / 48 000 × k/20 s,
+    // with neither stage's delay left. The resampler centres its filter on
+    // the lower middle sample, so a stage whose transform takes an odd
+    // number of input frames (261 at 29:20) leads by half an input frame
+    // (0.5 / 48 000 s here); that offset is allowed.
+    let amp = 16_000.0;
+    let at = |t: f64| amp * (2.0 * std::f64::consts::PI * 441.0 * t).sin();
+    let samples: Vec<i16> = (0..2_646_000)
+        .flat_map(|i| {
+            let x = at(f64::from(i) / 44_100.0);
+            [x as i16, (x / 2.0) as i16]
+        })
+        .collect();
+    let dir = tmp();
+    let path = put(dir.path(), "tone.wav", &wav(44_100, 2, &samples));
+    let chart = chart_of(&[Some(path)]);
+    for (k, frames) in [(10, 5_760_000), (13, 4_430_769), (29, 1_986_206)] {
+        let speed = Speed::from_twentieths(k).unwrap();
+        let bank = load_bank_at(&chart, RATE, speed, &BankLimits::default()).unwrap();
+        assert_eq!((bank.rate(), bank.speed()), (RATE, speed));
+        let sound = bank.get(SoundId(0)).unwrap();
+        assert!(sound.is_stereo());
+        assert_eq!(sound.frames(), frames, "{k}/20");
+        assert_eq!(bank.bytes(), frames * 4);
+        let got = sound.samples();
+        // Away from the edges, at the better of the two offsets.
+        let worst = [0.0, 0.5 / 48_000.0]
+            .map(|lead| {
+                (10_000..20_000)
+                    .chain(frames as usize - 20_000..frames as usize - 10_000)
+                    .map(|j| {
+                        let want = at(j as f64 / 48_000.0 * f64::from(k) / 20.0 + lead);
+                        let l = (f64::from(got[2 * j]) - want).abs();
+                        let r = (f64::from(got[2 * j + 1]) - want / 2.0).abs();
+                        l.max(r)
+                    })
+                    .fold(0.0, f64::max)
+            })
+            .into_iter()
+            .fold(f64::INFINITY, f64::min);
+        assert!(worst < 160.0, "{k}/20: worst error {worst} of {amp}");
+        println!(
+            "60 s stereo 44.1 kHz at {k}/20: loaded in {:?}",
+            bank.stats().elapsed
+        );
+    }
+}
+
+#[test]
+fn fractional_lengths_round_up_then_down() {
+    // floor(ceil(frames × 48 000 / 44 100) × 20/k), by hand: 1000 frames
+    // are 1088.435 at 48 kHz, so 1089, then floor(1089 × 20/13) = 1675 at
+    // 65 %; one frame is 2, then 4 at 50 %.
+    let dir = tmp();
+    let long = put(dir.path(), "long.wav", &wav(44_100, 1, &ramp(1_000, 3, 5)));
+    let one = put(dir.path(), "one.wav", &wav(44_100, 1, &[1_000]));
+    let chart = chart_of(&[Some(long), Some(one)]);
+    let frames = |k| {
+        let speed = Speed::from_twentieths(k).unwrap();
+        let bank = load_bank_at(&chart, RATE, speed, &BankLimits::default()).unwrap();
+        [0, 1].map(|i| bank.get(SoundId(i)).unwrap().frames())
+    };
+    assert_eq!(frames(13), [1_675, 3]);
+    assert_eq!(frames(10), [2_178, 4]);
 }
 
 #[test]

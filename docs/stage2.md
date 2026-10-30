@@ -361,13 +361,15 @@ A single exact stage is not used. A 383,999 Hz stereo source at 145 % on 384,000
 - That bound is charged to the bank cap through the shared counter that also sums concurrent workers' decode charges.
 - A sound whose workspace does not fit is refused before anything is allocated.
 
-**Length.** The output length is `floor(floor(frames × device / r) × 20/k)`. Example: a 60 s, 44.1 kHz sound played at 48 kHz.
+**Length.** The output length is `floor(ceil(frames × device / r) × 20/k)`: the source → device stage rounds up, as at 1×, and the speed stage rounds down. Example: a 60 s, 44.1 kHz sound played at 48 kHz.
 
 | Speed | Frames | Duration |
 | --- | --- | --- |
 | 50 % | 5,760,000 | 120.000 s |
 | 65 % | 4,430,769 | 92.308 s |
 | 145 % | 1,986,206 | 41.379 s |
+
+A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kHz, so 1,089, and `floor(1,089 × 20/13)` = 1,675 frames at 65 %. One 44.1 kHz frame becomes 2 frames at 48 kHz and 4 at 50 %.
 
 **Playback and records.**
 - The mixer is unchanged, and pitch follows speed.

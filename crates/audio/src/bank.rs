@@ -17,6 +17,14 @@
 //! On success the charge becomes the stored sound's allocation; on failure
 //! or panic it, and the sound's declared share, are returned.
 //!
+//! A bank is loaded at a [`Speed`] (design.md "Practice Speed Changes"). Its
+//! rate stays the device rate: a sound is converted in up to two `rubato`
+//! `Fft` [`Stage`]s, source → device and then the speed stage at the reduced
+//! rates `k/g : 20/g`, so pitch follows speed. Before a stage is built, its
+//! input, its output and an upper bound for its workspace
+//! ([`Stage::workspace_bound`]) are charged to the bank cap, so a sound whose
+//! workspace does not fit is refused before the resampler allocates.
+//!
 //! The caps bound the raw file bytes in flight (workers × the file cap) and
 //! the decoded PCM (the bank cap). They do not bound the decoder's own
 //! workspace (for example the codebooks a Vorbis header sets up), which only
@@ -52,6 +60,213 @@ use symphonia::core::meta::MetadataOptions;
 pub const MIN_RATE: u32 = 8_000;
 /// Highest sample rate accepted, for sources and the device.
 pub const MAX_RATE: u32 = 384_000;
+
+/// A practice speed on the ladder `k/20`, k = 10 to 30 (50 % to 150 %).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Speed(u8);
+
+impl Default for Speed {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
+
+impl Speed {
+    /// 1×: no speed stage.
+    pub const NORMAL: Self = Self(20);
+    /// The slowest step, 50 %.
+    pub const SLOWEST: Self = Self(10);
+
+    /// The speed `k/20`, if k is on the ladder.
+    #[must_use]
+    pub fn from_twentieths(k: u32) -> Option<Self> {
+        u8::try_from(k)
+            .ok()
+            .filter(|k| (10..=30).contains(k))
+            .map(Self)
+    }
+
+    /// Every step from 50 % to 150 %.
+    pub fn ladder() -> impl Iterator<Item = Self> {
+        (10..=30).map(Self)
+    }
+
+    /// k of `k/20`.
+    #[must_use]
+    pub fn twentieths(self) -> u32 {
+        u32::from(self.0)
+    }
+
+    /// The speed stage's rates, input to output: `k/g : 20/g` with
+    /// `g = gcd(k, 20)` (1:2 at 50 %, 13:20 at 65 %, 29:20 at 145 %).
+    #[must_use]
+    pub fn stage_rates(self) -> (u32, u32) {
+        let k = u64::from(self.0);
+        let g = gcd(k, 20);
+        ((k / g) as u32, (20 / g) as u32)
+    }
+
+    /// Frames a sound of `frames` device frames holds at this speed:
+    /// `floor(frames × 20/k)`.
+    #[must_use]
+    pub fn frames(self, frames: u64) -> u64 {
+        let n = u128::from(frames) * 20 / u128::from(self.0);
+        u64::try_from(n).unwrap_or(u64::MAX)
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Frames `rubato`'s `Fft` is asked to take per call (`FixedSync::Input`).
+const CHUNK: usize = 1024;
+
+/// The crate versions [`Stage::workspace_bound`] is derived for. A change to
+/// any of them fails a test until the bound is derived again from the new
+/// sources.
+#[cfg(test)]
+const BOUND_DERIVED_FOR: [(&str, &str); 3] = [
+    ("rubato", "5.0.1"),
+    ("realfft", "3.5.0"),
+    ("rustfft", "6.4.1"),
+];
+
+/// Bytes per complex point of one real transform of length `2n`, bounding
+/// its plan, the scratch `rubato` keeps for it, and the planners' peak while
+/// planning. The worst plan is Bluestein's for a prime `n`: an inner
+/// transform of length `m ≤ 4n − 4` (a power of two or three quarters of
+/// one; rustfft `plan.rs` `design_prime`, `avx_planner.rs`
+/// `plan_bluesteins`), whose multiplier (`m`) and twiddles (`n`) stay, whose
+/// inner plan keeps at most `2m` twiddles, whose construction runs the inner
+/// transform with `m` of scratch (`bluesteins_algorithm.rs` `new`), and whose
+/// out-of-place scratch, kept by `rubato`, is `m` plus the inner scratch
+/// (`≤ m`); realfft adds `n/2` twiddles (`RealToComplexEven::new`). That is
+/// at most `6m + 1.5n ≤ 25.5n` complex values of 8 bytes; composite lengths
+/// split into smaller such plans plus at most `2n` twiddles. 26 × 8 bytes.
+const FFT_BYTES_PER_POINT: u64 = 208;
+/// Bytes per transform for what does not grow with its length: the plan
+/// nodes, butterflies and the planners' caches.
+const FFT_FIXED_BYTES: u64 = 64 * 1024;
+
+/// One `rubato` `Fft` conversion of interleaved i16 from one rate to
+/// another, with an upper bound for the workspace building and running it
+/// allocates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage {
+    from: u32,
+    to: u32,
+    channels: usize,
+    workspace: u64,
+}
+
+impl Stage {
+    /// A stage from rate `from` to rate `to` for `channels` channels (1 or
+    /// 2).
+    #[must_use]
+    pub fn new(from: u32, to: u32, channels: usize) -> Self {
+        Self {
+            from,
+            to,
+            channels,
+            workspace: workspace_bound(from, to, channels),
+        }
+    }
+
+    /// The rates, input to output.
+    #[must_use]
+    pub fn rates(&self) -> (u32, u32) {
+        (self.from, self.to)
+    }
+
+    /// The channel count.
+    #[must_use]
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// An upper bound, in bytes, for everything [`Self::convert`] allocates
+    /// besides its output: the resampler with its retained sample, spectrum,
+    /// overlap and per-channel scratch buffers, its FFT plans and FFT
+    /// scratch, its constructor's temporaries, and the chunk buffers that
+    /// feed it. It is computed from the rates and the channel count alone,
+    /// before anything is allocated.
+    #[must_use]
+    pub fn workspace_bound(&self) -> u64 {
+        self.workspace
+    }
+
+    /// Converts interleaved `samples` chunk by chunk into exactly
+    /// `out_frames` frames, with the resampler's delay removed and zeros
+    /// past the end of the input. Only one chunk of either side is held as
+    /// `f32` at a time. The caller charges [`Self::workspace_bound`] first.
+    ///
+    /// # Errors
+    ///
+    /// The resampler's construction or processing error.
+    pub fn convert(&self, samples: &[i16], out_frames: u64) -> Result<Vec<i16>, String> {
+        resample(samples, self.channels, self.from, self.to, out_frames)
+    }
+}
+
+/// [`Stage::workspace_bound`] for `rubato` 5.0.1's `Fft::<f32>::new(from, to,
+/// CHUNK, ch, FixedSync::Input)` (`synchro.rs`), counting every buffer as
+/// live at once. f32 is 4 bytes, a complex value 8, a `Vec` header 24.
+fn workspace_bound(from: u32, to: u32, ch: usize) -> u64 {
+    const VEC: u64 = 24;
+    let (from, to, ch) = (u64::from(from.max(1)), u64::from(to.max(1)), ch as u64);
+    let chunk = CHUNK as u64;
+    // synchro.rs:222 and 300-321: 4 sub-chunks of 256 frames, rounded
+    // up to whole blocks of `from / g` input frames.
+    let g = gcd(from, to);
+    let blocks = (chunk / 4).div_ceil(from / g).max(1);
+    let (n_in, n_out) = (blocks * from / g, blocks * to / g);
+    // synchro.rs:482-488: the most output one call can give.
+    let out_max = chunk.div_ceil(n_in) * n_out;
+    // FftResampler::new, synchro.rs:97-140. make_sincs (sinc.rs:17-49):
+    // the values, the window (budgeted with an f64 copy) and the sincs;
+    // then filter_t (2n_in f32), filter_f and input_f (n_in + 1 complex),
+    // input_buf (2n_in f32), output_f (n_out + 1 complex), output_buf
+    // (2n_out f32).
+    let sincs = 4 * n_in + (4 + 8) * n_in + 4 * n_in + 2 * VEC;
+    let filter = 8 * n_in + 2 * 8 * (n_in + 1) + 8 * n_in;
+    let output = 8 * (n_out + 1) + 8 * n_out;
+    // The forward plan of 2n_in and the inverse of 2n_out with their kept
+    // scratch (synchro.rs:119-124, realfft lib.rs:376-394 and 623-641).
+    let ffts = (FFT_BYTES_PER_POINT * n_in + FFT_FIXED_BYTES)
+        + (FFT_BYTES_PER_POINT * n_out + FFT_FIXED_BYTES);
+    // Fft::new_custom, synchro.rs:329-355: per channel the overlap (n_out),
+    // input scratch (CHUNK + n_in) and output scratch (out_max + n_out), and
+    // the channel mask.
+    let per_channel = 4 * n_out + 4 * (chunk + n_in) + 4 * (out_max + n_out) + 3 * VEC + 1;
+    // `resample`'s chunk buffers: CHUNK input and out_max output frames.
+    let chunks = 4 * ch * (chunk + out_max);
+    sincs + filter + output + ffts + ch * per_channel + 3 * VEC + chunks
+}
+
+/// How a sound is converted: source → device when the rates differ, then
+/// the speed stage when the speed is not 1×.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conversion {
+    /// Source rate → device rate.
+    pub device: Option<Stage>,
+    /// The speed stage at [`Speed::stage_rates`].
+    pub speed: Option<Stage>,
+}
+
+/// The stages for a sound at `src_rate` with `channels` channels, stored at
+/// device rate `rate` and `speed`. Nothing is allocated.
+#[must_use]
+pub fn plan_conversion(src_rate: u32, rate: u32, speed: Speed, channels: usize) -> Conversion {
+    let (from, to) = speed.stage_rates();
+    Conversion {
+        device: (src_rate != rate).then(|| Stage::new(src_rate, rate, channels)),
+        speed: (speed != Speed::NORMAL).then(|| Stage::new(from, to, channels)),
+    }
+}
 
 /// Caps on decoding (design.md "Audio"). They bound work on untrusted files and
 /// sit far beyond real charts.
@@ -262,6 +477,7 @@ impl Sound {
 #[derive(Clone, Debug, Default)]
 pub struct SoundBank {
     rate: u32,
+    speed: Speed,
     /// Per [`SoundId`], the index into `sounds`.
     slots: Vec<Option<u32>>,
     sounds: Vec<Sound>,
@@ -285,6 +501,12 @@ impl SoundBank {
     #[must_use]
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// The speed the sounds were converted for.
+    #[must_use]
+    pub fn speed(&self) -> Speed {
+        self.speed
     }
 
     /// The sound for `id`, if one was decoded.
@@ -529,6 +751,7 @@ enum Outcome {
 
 struct Shared<'a> {
     rate: u32,
+    speed: Speed,
     limits: &'a BankLimits,
     max_frames: u64,
     /// Bank bytes stored or reserved.
@@ -612,8 +835,9 @@ fn decode(
                 limit: shared.max_frames,
             }));
         }
+        let stored = shared.speed.frames(frames);
         declared
-            .resize(pcm_bytes(n.max(frames), ch))
+            .resize(pcm_bytes(n.max(frames).max(stored), ch))
             .map_err(|total| {
                 Stop::Cap(BankError::OverCap {
                     cap: Cap::BankMemory,
@@ -684,18 +908,28 @@ fn decode(
     }
     let out_frames = device_frames(src_frames, src_rate, shared.rate);
     let held = cap_bytes(&samples);
-    if src_rate != shared.rate {
-        // The source and the converted output are both held while converting.
+    let plan = plan_conversion(src_rate, shared.rate, shared.speed, ch as usize);
+    // Each stage holds its input and its output, and its workspace bound is
+    // charged before the resampler is built: a workspace that does not fit
+    // refuses the sound before it allocates.
+    if let Some(stage) = plan.device {
         reservation
-            .resize(held + pcm_bytes(out_frames, ch))
+            .resize(held + pcm_bytes(out_frames, ch) + stage.workspace_bound())
             .map_err(over_bank)?;
-        samples = resample(&samples, ch as usize, src_rate, shared.rate, out_frames)?;
+        samples = stage.convert(&samples, out_frames)?;
     } else if samples.capacity() > samples.len() {
         // Shrinking copies into a buffer of the length beside the old one.
         reservation
             .resize(held + pcm_bytes(src_frames, ch))
             .map_err(over_bank)?;
         samples.shrink_to_fit();
+    }
+    if let Some(stage) = plan.speed {
+        let frames = shared.speed.frames(out_frames);
+        reservation
+            .resize(cap_bytes(&samples) + pcm_bytes(frames, ch) + stage.workspace_bound())
+            .map_err(over_bank)?;
+        samples = stage.convert(&samples, frames)?;
     }
     reservation.resize(cap_bytes(&samples)).map_err(over_bank)?;
     reservation.commit();
@@ -707,9 +941,7 @@ fn decode(
     })
 }
 
-/// Converts interleaved `samples` from `src_rate` to `rate` chunk by chunk,
-/// giving exactly `out_frames` frames with the resampler's delay removed.
-/// Only one chunk of either side is held as `f32` at a time.
+/// [`Stage::convert`] from `src_rate` to `rate`.
 fn resample(
     samples: &[i16],
     ch: usize,
@@ -717,9 +949,14 @@ fn resample(
     rate: u32,
     out_frames: u64,
 ) -> Result<Vec<i16>, String> {
-    let mut resampler =
-        Fft::<f32>::new(src_rate as usize, rate as usize, 1024, ch, FixedSync::Input)
-            .map_err(|e| e.to_string())?;
+    let mut resampler = Fft::<f32>::new(
+        src_rate as usize,
+        rate as usize,
+        CHUNK,
+        ch,
+        FixedSync::Input,
+    )
+    .map_err(|e| e.to_string())?;
     let mut skip = resampler.output_delay();
     let mut input = vec![0.0f32; resampler.input_frames_max() * ch];
     let mut output = vec![0.0f32; resampler.output_frames_max() * ch];
@@ -818,6 +1055,25 @@ fn referenced(chart: &Chart) -> Vec<SoundId> {
 /// declared frame counts before decoding, or from the running count while
 /// decoding.
 pub fn load_bank(chart: &Chart, rate: u32, limits: &BankLimits) -> Result<SoundBank, BankError> {
+    load_bank_at(chart, rate, Speed::NORMAL, limits)
+}
+
+/// [`load_bank`] with every sound converted for `speed`: the bank stays at
+/// `rate`, and each sound of `n` device frames holds `floor(n × 20/k)`, so
+/// it plays slower and lower, or faster and higher. The sound length cap
+/// applies to the device frames at 1×; the bank cap to what is held,
+/// including each conversion stage's workspace bound.
+///
+/// # Errors
+///
+/// As [`load_bank`]; a stage whose input, output and workspace bound pass
+/// the bank cap refuses the bank before the stage is built.
+pub fn load_bank_at(
+    chart: &Chart,
+    rate: u32,
+    speed: Speed,
+    limits: &BankLimits,
+) -> Result<SoundBank, BankError> {
     if !(MIN_RATE..=MAX_RATE).contains(&rate) {
         return Err(BankError::RateOutOfRange { rate });
     }
@@ -841,6 +1097,7 @@ pub fn load_bank(chart: &Chart, rate: u32, limits: &BankLimits) -> Result<SoundB
 
     let shared = Shared {
         rate,
+        speed,
         limits,
         max_frames: u64::from(limits.max_sound_seconds) * u64::from(rate),
         used: AtomicU64::new(0),
@@ -897,6 +1154,7 @@ pub fn load_bank(chart: &Chart, rate: u32, limits: &BankLimits) -> Result<SoundB
     warnings.sort_by_key(|BankWarning::Undecodable { sound, .. }| *sound);
     Ok(SoundBank {
         rate,
+        speed,
         slots,
         sounds,
         warnings,
@@ -952,6 +1210,32 @@ mod tests {
 
     use super::inject::{self, Fault};
     use super::*;
+
+    /// The workspace bound is derived from these crates' sources; when the
+    /// lock file pins another version, the bound must be derived again and
+    /// `BOUND_DERIVED_FOR` updated with it.
+    #[test]
+    fn workspace_bound_matches_the_pinned_resampler() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        for (name, version) in BOUND_DERIVED_FOR {
+            let pinned: Vec<&str> = lock
+                .split("[[package]]")
+                .filter_map(|p| {
+                    let mut lines = p.lines().map(str::trim);
+                    lines.find(|l| *l == format!("name = \"{name}\""))?;
+                    lines.find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"'))
+                })
+                .collect();
+            assert_eq!(
+                pinned,
+                [version],
+                "{name} is pinned at {pinned:?}; derive the workspace bound again for it"
+            );
+        }
+    }
 
     #[test]
     fn device_frames_round_up_and_keep_equal_rates_exact() {
