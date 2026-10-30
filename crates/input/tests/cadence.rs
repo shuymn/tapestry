@@ -305,7 +305,7 @@ impl Setup {
                             sim.clock.set(t);
                             1
                         });
-                    (published, may_read.then_some(n))
+                    (published, n)
                 } else {
                     sources.begin_batch(now);
                     sources.end_batch(now);
@@ -549,6 +549,45 @@ fn a_heartbeat_inside_the_gap_publishes_without_reading() {
         run.seen
     );
     assert_eq!(run.report.causes.heartbeat, 2);
+    // The heartbeat kept the input held: the one early return for it at
+    // 995, none after the heartbeat.
+    assert_eq!(run.report.rearms, 1);
+}
+
+/// A batch told not to read reads nothing and reports no count, which
+/// keeps held or left input so; told to read, it reports what it read,
+/// 0 included.
+#[test]
+fn a_batch_that_may_not_read_reports_no_count() {
+    let clock = Clock(Arc::new(AtomicI64::new(7)));
+    let (mut sources, _reader) = set();
+    let mut calls = 0;
+    let skipped = cadence::batch(&clock, &mut sources, TimeUs(7), false, |_, _| {
+        calls += 1;
+        1
+    });
+    assert_eq!((skipped, calls), ((TimeUs(7), None), 0));
+    let empty = cadence::batch(&clock, &mut sources, TimeUs(7), true, |_, _| 0);
+    assert_eq!(empty, (TimeUs(7), Some(0)));
+}
+
+/// A wake whose hook leaves for Idle still samples the deadline its
+/// publication reached: a request at 1,050 after a deadline at 1,000.
+#[test]
+fn entering_idle_keeps_the_last_lateness_sample() {
+    let mut setup = Setup::new(Driven::Input).stop_at(2_000);
+    setup.timer_late = 300;
+    setup.signals.push((1_050, Signal::Request));
+    let run = setup.run(|_, requests| {
+        if requests > 0 {
+            Phase::Idle
+        } else {
+            Phase::Tail
+        }
+    });
+    assert_eq!(run.report.causes.heartbeat, 0);
+    assert_eq!(run.report.lateness.count(), 1);
+    assert_eq!(run.report.lateness.max(), 50);
 }
 
 /// A drain the wake event started and the cut stopped waits for the gap

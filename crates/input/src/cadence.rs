@@ -273,21 +273,22 @@ impl Cadence {
         let was_idle = self.phase == Phase::Idle;
         self.phase = boundary.phase;
         let mut late = None;
-        if boundary.phase != Phase::Idle {
-            let published = boundary.published;
-            if was_idle {
-                self.heartbeat = TimeUs(published.0.saturating_add(HEARTBEAT.0));
-            } else if self.heartbeat <= published {
-                late = Some(u64::try_from(woke_at.0.saturating_sub(self.heartbeat.0)).unwrap_or(0));
-                // Passed: the next point of the grid after the publication,
-                // so a late wake skips beats rather than making them up.
-                let steps = (published.0 - self.heartbeat.0) / HEARTBEAT.0 + 1;
-                self.heartbeat = TimeUs(
-                    self.heartbeat
-                        .0
-                        .saturating_add(steps.saturating_mul(HEARTBEAT.0)),
-                );
-            }
+        let published = boundary.published;
+        // Against the deadline of the phase the wake ran in, also when its
+        // hook leaves for Idle.
+        if !was_idle && self.heartbeat <= published {
+            late = Some(u64::try_from(woke_at.0.saturating_sub(self.heartbeat.0)).unwrap_or(0));
+            // Passed: the next point of the grid after the publication, so
+            // a late wake skips beats rather than making them up.
+            let steps = (published.0 - self.heartbeat.0) / HEARTBEAT.0 + 1;
+            self.heartbeat = TimeUs(
+                self.heartbeat
+                    .0
+                    .saturating_add(steps.saturating_mul(HEARTBEAT.0)),
+            );
+        }
+        if was_idle && boundary.phase != Phase::Idle {
+            self.heartbeat = TimeUs(published.0.saturating_add(HEARTBEAT.0));
         }
         if self.driven == Driven::Input
             && let Some(read) = boundary.read
@@ -309,15 +310,17 @@ impl Cadence {
 /// into `sources`, at most the budget it is given, and returns how many it
 /// read (0 when the queue is empty). Reading stops at [`DRAIN_CUT`]
 /// messages; then the batch publishes from a fresh clock read. Returns
-/// that read and how many messages were read. With `read` false nothing is
-/// read: the batch only publishes (and checks the focus latch).
+/// that read and how many messages were read, as [`Boundary::read`]
+/// takes it: with `read` false nothing is read and the count is `None`
+/// (the batch only publishes and checks the focus latch), so held or
+/// left input stays so.
 pub fn batch<C: TimeSource>(
     clock: &C,
     sources: &mut SourceSet,
     stamp: TimeUs,
     read: bool,
     mut next: impl FnMut(&mut SourceSet, u32) -> u32,
-) -> (TimeUs, u32) {
+) -> (TimeUs, Option<u32>) {
     sources.begin_batch(stamp);
     let mut total = 0;
     while read && total < DRAIN_CUT {
@@ -329,7 +332,7 @@ pub fn batch<C: TimeSource>(
     }
     let fresh = clock.now();
     sources.end_batch(fresh);
-    (fresh, total)
+    (fresh, read.then_some(total))
 }
 
 /// Processed wakes by cause.

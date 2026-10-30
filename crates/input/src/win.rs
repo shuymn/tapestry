@@ -1272,10 +1272,10 @@ impl RawInput {
     /// One batch ([`cadence::batch`]): when `read`, what is queued now, up to
     /// [`cadence::DRAIN_CUT`] messages, stamped `now`, then the
     /// publication from a fresh clock read. Returns that read and how many
-    /// messages were read. It plays the part of
+    /// messages were read (`None` when not `read`). It plays the part of
     /// [`InputAdapter::poll`](crate::InputAdapter::poll), which needs a
     /// `Send` adapter.
-    fn poll(&mut self, now: TimeUs, read: bool, sources: &mut SourceSet) -> (TimeUs, u32) {
+    fn poll(&mut self, now: TimeUs, read: bool, sources: &mut SourceSet) -> (TimeUs, Option<u32>) {
         let clock = self.clock;
         cadence::batch(&clock, sources, now, read, |sources, budget| {
             self.next(sources, budget)
@@ -1515,7 +1515,7 @@ impl InputThread {
                 let phase = on_wake(&mut sources, clock.now());
                 Boundary {
                     published,
-                    read: Some(read),
+                    read,
                     phase,
                 }
             }))

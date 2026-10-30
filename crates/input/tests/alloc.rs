@@ -209,7 +209,7 @@ fn batches_do_not_allocate() {
             }
             Boundary {
                 published,
-                read: may_read.then_some(n),
+                read: n,
                 phase: if wakes.is_multiple_of(7) {
                     Phase::Idle
                 } else {
