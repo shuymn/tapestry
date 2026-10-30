@@ -42,7 +42,8 @@ fn raw_tree() -> impl Strategy<Value = RawTree> {
 }
 
 fn raw_state() -> impl Strategy<Value = RawState> {
-    (any::<[u32; 7]>(), any::<[u32; 2]>()).prop_map(|(fields, timers)| RawState { fields, timers })
+    (any::<[(u8, u32); 7]>(), any::<[u32; 2]>())
+        .prop_map(|(fields, timers)| RawState { fields, timers })
 }
 
 fn want(root: Root) -> Ty {
@@ -328,13 +329,16 @@ fn generators_reach_the_fragile_spots() {
     let mut accepted_full = 0;
     let mut bounded_ops = Vec::new();
     let (mut mixed_div, mut mixed_rem) = (false, false);
-    let (mut full_positive, mut full_negative) = (false, false);
+    let (mut full_positive, mut full_negative, mut full_unaligned) = (false, false, false);
     for i in 0..4000 {
         let raw = raw_tree().new_tree(&mut runner).unwrap().current();
         let state = build_state(&raw_state().new_tree(&mut runner).unwrap().current());
         let full = state.fields[strategy::FULL];
         full_positive |= (2..i32::MAX - 1).contains(&full);
         full_negative |= (i32::MIN + 1..-2).contains(&full);
+        full_unaligned |= (i32::MIN + 2..i32::MAX - 1).contains(&full)
+            && !(-1..=1).contains(&full)
+            && full % 8 != 0;
         let bounded = i % 2 == 0;
         let (e, root) = build(&raw, bounded);
         let opts = ALL_OPTIONS[i % ALL_OPTIONS.len()];
@@ -368,6 +372,7 @@ fn generators_reach_the_fragile_spots() {
     assert!(out_of_range, "no OutOfRange refusal");
     assert!(full_positive, "no mid-range positive `full`");
     assert!(full_negative, "no mid-range negative `full`");
+    assert!(full_unaligned, "no interior `full` with nonzero low 3 bits");
     assert!(
         accepted_full > 100,
         "only {accepted_full} unbounded trees compiled"

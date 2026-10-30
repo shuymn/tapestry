@@ -396,12 +396,12 @@ fn write(e: &E, out: &mut String) {
     }
 }
 
-/// Raw state values: each maps to a value inside its slot's range, biased
-/// toward the ends and `{0, ±1}`, where interval extremes sit, and
-/// otherwise uniform over the range.
+/// Raw state values: per field, a selector and a payload. The selector
+/// picks the range ends and `{0, ±1}`, where interval extremes sit, or a
+/// value drawn uniformly over the range from the full 32-bit payload.
 #[derive(Clone, Debug)]
 pub struct RawState {
-    pub fields: [u32; 7],
+    pub fields: [(u8, u32); 7],
     pub timers: [u32; 2],
 }
 
@@ -412,17 +412,17 @@ pub struct InRange {
     pub timers: [i32; 2],
 }
 
-fn pick(raw: u32, lo: i32, hi: i32) -> i32 {
-    let v = match raw % 8 {
+fn pick((selector, payload): (u8, u32), lo: i32, hi: i32) -> i32 {
+    let v = match selector % 8 {
         0 => i64::from(lo),
         1 => i64::from(hi),
         2 => 0,
         3 => 1,
         4 => -1,
-        // Uniform over the whole range: scale the raw value into it.
+        // Uniform over the whole range: scale the payload into it.
         _ => {
             let size = i128::from(hi) - i128::from(lo) + 1;
-            let offset = (i128::from(raw >> 3) * size) >> 29;
+            let offset = (i128::from(payload) * size) >> 32;
             i64::try_from(i128::from(lo) + offset).unwrap()
         }
     };
