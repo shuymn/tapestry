@@ -943,11 +943,10 @@ Each one holds the behavior D5 and D6 state.
 - If a preset file has an `id` field, then it shall be refused as a file from an older version (`older_preset_file_is_refused_with_the_hint`).
 - When `eval-cli preset export beatoraja-style my-rules.toml` runs, it shall write `my-rules.toml`, which loads as `rules::beatoraja_style()` with the ID `my-rules`, and exit 0 (`export_writes_a_user_preset`).
 - If the export's stem is a built-in's or not a name, or its file exists, then it shall write nothing and exit 1 (`export_refuses_a_built_in_name_and_an_existing_file`).
-- When the chosen user preset's file changes while a select or result screen shows, the shelf shall reload it at the next 250 ms check, and the result screen shall re-evaluate under it (`changed_user_preset_reloads_within_a_poll`).
-- If a changed user preset fails to load, then the previous preset shall stay in use and the error shall be shown (`failed_reload_keeps_the_previous_preset`).
+- When the chosen user preset's file changes while a result screen shows, the game's result loop shall reload it at the next 250 ms check, re-evaluate the play under it, and hand both to the rig (`changed_user_preset_reloads_within_a_poll`).
+- If a changed user preset fails to load, then the previous preset shall stay in use and the error shall be handed to the rig (`failed_reload_keeps_the_previous_preset`); if it then loads again, even to the same rules, the reload shall be handed to the rig too (`a_restored_preset_is_reported_after_a_failure`).
+- If a user preset file is a symbolic link, then loading it shall be refused with an error naming the file (`user_preset_links_are_refused`).
 - When a user preset changes during a play, that play shall keep the preset it started with, and the next play shall use the reloaded one (`plays_use_reloads_from_the_next_play`).
-
-**Status.** Built. The shelf (crates/game/src/presets.rs) is polled on the result screen through `Loaded::poll_presets` and handed to the rig with `Rig::preset_reloaded`; the select screen does not poll, since each chart's shelf is opened when the chart loads. The player's end screen does not draw a reload or its error yet: PR17 adds that with preset switching.
 
 ### PR17. Result screen and preset switching (`player`, `game`)
 
@@ -955,7 +954,12 @@ Each one holds the behavior D5 and D6 state.
 
 **Done when.**
 - `result_switches_presets_and_labels_what_if`;
-- `edited_preset_reevaluates_on_the_result_screen`.
+- `edited_preset_reevaluates_on_the_result_screen`;
+- When a user preset file changes while the select screen shows, the shelf shall reload it at the next 250 ms check (`select_screen_polls_the_shelf`);
+- When the player returns to the select screen, the shelf shall be kept, not reopened: if the chosen preset's file is then corrupted, the next chart shall play the last valid preset and the error shall be shown (`shelf_survives_returning_to_select`);
+- When a poll reloads the chosen preset or finds its file failing, the player's result screen shall show the re-evaluation or the error (`result_screen_shows_reload_and_error`).
+
+**Note.** The shelf reports changes only for the chosen preset (`Shelf::check`); listing every preset on the select and result screens may need a change notice per entry.
 
 ### PR18. Personal bests (`library`, `game`, `player`)
 
