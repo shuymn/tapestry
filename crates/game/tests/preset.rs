@@ -23,13 +23,13 @@ fn edited_values_read_back_in_raw_units() {
     // The GREAT window widened to 50 ms and the normal gauge's GOOD change
     // made a fixed 0.5 %, written by hand in the file's units.
     let text = preset_to_toml(&rules::custom()).replacen(
-        "[windows.great]\nearly_us = 45000\nlate_us = 45000",
-        "[windows.great]\nearly_us = 50000\nlate_us = 50000",
+        "[tables.keys.windows.great]\nearly_us = 45000\nlate_us = 45000",
+        "[tables.keys.windows.great]\nearly_us = 50000\nlate_us = 50000",
         1,
     );
     let p = load_preset_toml(&text).unwrap();
-    assert_eq!(p.windows.great.early.0, 50_000);
-    assert_eq!(p.windows.great.late.0, 50_000);
+    assert_eq!(p.tables.keys.windows.great.early.0, 50_000);
+    assert_eq!(p.tables.keys.windows.great.late.0, 50_000);
     let text = preset_to_toml(&rules::custom()).replacen(
         "[gauges.change.good.total_share]\nnum = 1\nden = 2",
         "[gauges.change.good]\nfixed = 50000",
@@ -87,13 +87,12 @@ fn older_preset_files_are_refused() {
     refused(&text.replacen("behind_us = 150000\n", "", 1), "behind_us");
     // An LN break table where the LN-end edges are: a file of the earlier
     // LN rule.
-    let ln_end =
-        "[ln_end]\nperfect_early_us = 100000\ngreat_early_us = 150000\ngood_early_us = 200000\n";
+    let ln_end = "[tables.keys.ln_end]\nperfect_early_us = 100000\ngreat_early_us = 150000\ngood_early_us = 200000\n";
     assert!(text.contains(ln_end), "{text}");
     refused(
         &text.replacen(
             ln_end,
-            "[ln_break]\nrelease_margin_us = 100000\nbreaks_combo = true\ncounts_bp = true\n",
+            "[tables.keys.ln_break]\nrelease_margin_us = 100000\nbreaks_combo = true\ncounts_bp = true\n",
             1,
         ),
         "ln_break",
@@ -106,7 +105,7 @@ fn ln_end_edges_and_the_implementation_version_read_back_and_validate() {
     // The GOOD LN-end edge widened to 250 ms, by hand in µs.
     let p = load_preset_toml(&text.replacen("good_early_us = 200000", "good_early_us = 250000", 1))
         .unwrap();
-    assert_eq!(p.ln_end.good.0, 250_000);
+    assert_eq!(p.tables.keys.ln_end.good.0, 250_000);
     // Narrower than the PERFECT window's early edge (20 ms): invalid.
     assert_eq!(
         load_preset_toml(&text.replacen(
@@ -115,6 +114,7 @@ fn ln_end_edges_and_the_implementation_version_read_back_and_validate() {
             1
         )),
         Err(PresetError::Invalid(RuleError::LnEndNarrowerThanNote {
+            class: rules::LaneClass::Keys,
             judgment: rules::Judgment::Perfect
         }))
     );

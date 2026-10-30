@@ -20,8 +20,9 @@ use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
 use rules::{
-    GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeaderPolicy, JudgeWindows, LnEndWindows,
-    LowDamage, MineRule, PerJudgment, RulePreset, Window,
+    EmptyPoorRange, GaugeDelta, GaugeKind, GaugeRule, GaugeValue, HeaderPolicy, JudgeRank,
+    JudgeWindows, LaneTable, LnEndWindows, LowDamage, MineRule, PerJudgment, PerLaneClass,
+    RankScale, RulePreset, ScaledRank, Window, WindowPolicy,
 };
 
 use super::live::{Delivery, Publish, SourceStep};
@@ -270,15 +271,40 @@ fn raw_gauge() -> impl Strategy<Value = RawGauge> {
         })
 }
 
+/// One lane class's table, raw.
 #[derive(Clone, Debug)]
-struct RawPreset {
+struct RawTable {
     early: [u32; 4],
     late: [u32; 4],
     symmetric: bool,
     empty_poor: (u32, u32),
     ln_end: [u32; 3],
-    flags: u16,
-    rank: [u32; 5],
+}
+
+fn raw_table() -> impl Strategy<Value = RawTable> {
+    (
+        (any::<[u32; 4]>(), any::<[u32; 4]>(), any::<bool>()),
+        (any::<(u32, u32)>(), any::<[u32; 3]>()),
+    )
+        .prop_map(
+            |((early, late, symmetric), (empty_poor, ln_end))| RawTable {
+                early,
+                late,
+                symmetric,
+                empty_poor,
+                ln_end,
+            },
+        )
+}
+
+#[derive(Clone, Debug)]
+struct RawPreset {
+    keys: RawTable,
+    /// The scratch's own table, used when flag 16 is set; else the keys'.
+    scratch: RawTable,
+    flags: u32,
+    rank: [u32; 6],
+    defexrank: u32,
     total: u32,
     gauges: Vec<RawGauge>,
     ex: [u8; 5],
@@ -287,31 +313,24 @@ struct RawPreset {
 
 fn raw_preset() -> impl Strategy<Value = RawPreset> {
     (
-        (any::<[u32; 4]>(), any::<[u32; 4]>(), any::<bool>()),
-        (any::<(u32, u32)>(), any::<[u32; 3]>(), any::<u16>()),
-        (any::<[u32; 5]>(), any::<u32>()),
+        (raw_table(), raw_table(), any::<u32>()),
+        (any::<[u32; 6]>(), any::<u32>(), any::<u32>()),
         vec(raw_gauge(), 1..=3),
         (any::<[u8; 5]>(), any::<u32>()),
     )
         .prop_map(
-            |(
-                (early, late, symmetric),
-                (empty_poor, ln_end, flags),
-                (rank, total),
-                gauges,
-                (ex, per_unit),
-            )| RawPreset {
-                early,
-                late,
-                symmetric,
-                empty_poor,
-                ln_end,
-                flags,
-                rank,
-                total,
-                gauges,
-                ex,
-                per_unit,
+            |((keys, scratch, flags), (rank, defexrank, total), gauges, (ex, per_unit))| {
+                RawPreset {
+                    keys,
+                    scratch,
+                    flags,
+                    rank,
+                    defexrank,
+                    total,
+                    gauges,
+                    ex,
+                    per_unit,
+                }
             },
         )
 }
@@ -439,6 +458,49 @@ fn scale(raw: u32) -> i64 {
     }
 }
 
+/// A whole-percent rank scale: the usual ones, or anything up to 200 %.
+fn percent(raw: u32) -> u32 {
+    let p = match raw % 3 {
+        0 => [25, 50, 75, 100, 125][pick(raw / 3, 5)],
+        1 => 100,
+        _ => below(raw / 3, 200) + 1,
+    };
+    u32::try_from(p).unwrap()
+}
+
+/// The factor `p`'s window policy scales edges by for the rank its header
+/// policy reads from `headers`, as `(num, den)`, by hand.
+pub fn scale_of(p: &RulePreset, headers: &[JudgmentHeader]) -> (i64, i64) {
+    let rank = p.headers.read(headers).rank;
+    match p.window_policy {
+        WindowPolicy::Thousandths(s) => (s.scale_milli(rank).unwrap(), 100_000),
+        WindowPolicy::Scaled(s) => match rank {
+            Some(JudgeRank::Rank(r @ 0..=4)) => (i64::from(s.rank_percent[r as usize]), 100),
+            Some(JudgeRank::DefExRankMilli(v)) if v > 0 => {
+                (v * i64::from(s.defexrank_percent), 10_000_000)
+            }
+            _ => (i64::from(s.absent_percent), 100),
+        },
+    }
+}
+
+fn table_of(raw: &RawTable) -> LaneTable {
+    let late = edges(raw.late);
+    let early = if raw.symmetric {
+        late
+    } else {
+        edges(raw.early)
+    };
+    LaneTable {
+        windows: windows_of(early, late),
+        ln_end: ln_end_of(raw.ln_end, early),
+        empty_poor: EmptyPoorRange {
+            ahead: distance(raw.empty_poor.0),
+            behind: distance(raw.empty_poor.1),
+        },
+    }
+}
+
 /// Valid LN-end edges for the note windows' `early` edges: each at least
 /// its judgment's early edge and wider than the better one, by 0, a grid
 /// multiple, or any µs count more.
@@ -464,27 +526,36 @@ fn ln_end_of(raw: [u32; 3], early: [i64; 4]) -> LnEndWindows {
 
 fn build_preset(raw: &RawPreset) -> RulePreset {
     let mut p = rules::custom();
-    let late = edges(raw.late);
-    let early = if raw.symmetric {
-        late
-    } else {
-        edges(raw.early)
+    let flag = |bit: u32| raw.flags & (1 << bit) != 0;
+    let keys = table_of(&raw.keys);
+    p.tables = PerLaneClass {
+        keys,
+        scratch: if flag(16) {
+            table_of(&raw.scratch)
+        } else {
+            keys
+        },
     };
-    p.windows = windows_of(early, late);
-    let flag = |bit: u16| raw.flags & (1 << bit) != 0;
-    p.empty_poor.ahead = distance(raw.empty_poor.0);
-    p.empty_poor.behind = distance(raw.empty_poor.1);
     p.empty_poor.breaks_combo = flag(0);
     p.empty_poor.counts_bp = flag(1);
     p.empty_poor.counted = flag(2);
-    p.ln_end = ln_end_of(raw.ln_end, early);
     p.headers = if flag(3) {
-        HeaderPolicy::IntegerRanks
+        HeaderPolicy::DefExRankFirst
     } else {
         HeaderPolicy::Decimals
     };
-    p.rank_scale.rank_milli = [0, 1, 2, 3].map(|k| scale(raw.rank[k]));
-    p.rank_scale.absent_milli = scale(raw.rank[4]);
+    p.window_policy = if flag(17) {
+        WindowPolicy::Scaled(ScaledRank {
+            rank_percent: [0, 1, 2, 3, 4].map(|k| percent(raw.rank[k])),
+            absent_percent: percent(raw.rank[5]),
+            defexrank_percent: percent(raw.defexrank),
+        })
+    } else {
+        WindowPolicy::Thousandths(RankScale {
+            rank_milli: [0, 1, 2, 3].map(|k| scale(raw.rank[k])),
+            absent_milli: scale(raw.rank[4]),
+        })
+    };
     p.default_total_milli = below(raw.total, 400_000) + 1;
     p.gauges = raw
         .gauges
@@ -912,26 +983,42 @@ fn judgeable(chart: &Chart, section: Option<&Section>) -> Vec<(usize, TimeUs)> {
     v
 }
 
-fn deadlines(chart: &Chart, windows: &JudgeWindows, section: Option<&Section>) -> Vec<TimeUs> {
+/// Each lane class's windows after the window policy.
+fn lane_windows(ev: &Evaluator<'_>) -> PerLaneClass<JudgeWindows> {
+    PerLaneClass {
+        keys: ev.table(lane(1)).windows,
+        scratch: ev.table(Lane::SCRATCH).windows,
+    }
+}
+
+fn deadlines(
+    chart: &Chart,
+    tables: &PerLaneClass<JudgeWindows>,
+    section: Option<&Section>,
+) -> Vec<TimeUs> {
     let mut v: Vec<TimeUs> = Vec::new();
-    for note in chart
-        .lanes
-        .iter()
-        .flatten()
-        .filter(|n| is_target(section, n))
-    {
-        match note.kind {
-            NoteKind::Tap => v.push(TimeUs(note.time.0 + windows.bad.late.0)),
-            NoteKind::Long { end, .. } => {
-                v.push(TimeUs(note.time.0 + windows.bad.late.0));
-                v.push(end);
-            }
-            NoteKind::Mine { .. } => v.push(note.time),
+    for (l, notes) in chart.lanes.iter().enumerate() {
+        let windows = tables.of_lane(lane(l));
+        for note in notes.iter().filter(|n| is_target(section, n)) {
+            deadline_of(note, windows, &mut v);
         }
     }
     v.sort_unstable();
     v.dedup();
     v
+}
+
+/// A note's deadlines: its miss at its lane's late BAD edge, a long note's
+/// end, a mine's time.
+fn deadline_of(note: &Note, windows: &JudgeWindows, v: &mut Vec<TimeUs>) {
+    match note.kind {
+        NoteKind::Tap => v.push(TimeUs(note.time.0 + windows.bad.late.0)),
+        NoteKind::Long { end, .. } => {
+            v.push(TimeUs(note.time.0 + windows.bad.late.0));
+            v.push(end);
+        }
+        NoteKind::Mine { .. } => v.push(note.time),
+    }
 }
 
 /// Inserts `e` into a source's log in receive order, before its
@@ -1060,12 +1147,19 @@ pub fn build_play(raw: &RawPlay) -> Play {
         .map(|r| build_section(&chart, &preset, r));
     let (windows, final_deadline) = {
         let ev = Evaluator::new(&chart, &preset, &device, &start, section.as_ref(), 0).unwrap();
-        (*ev.windows(), ev.final_deadline())
+        (lane_windows(&ev), ev.final_deadline())
     };
     let (sel, param) = raw.joint;
     let param = u64::from(param);
     let mut sync_at = None;
-    match sel % 8 {
+    // Without a section, the section-only case 3 plays case 1, which only
+    // a whole-chart play reaches: a section takes input after its final
+    // deadline for conversion only.
+    let case = match sel % 8 {
+        3 if section.is_none() => 1,
+        c => c,
+    };
+    match case {
         // A press on a missed note's miss deadline, which the schedules make
         // an intermediate W: inputs go first at equal times, across steps
         // too, so the press judges the note.
@@ -1080,7 +1174,7 @@ pub fn build_play(raw: &RawPlay) -> Play {
                 param,
             );
             let s = pick(param / 8, n);
-            let x = t.0 + windows.bad.late.0;
+            let x = t.0 + windows.of_lane(lane(l)).bad.late.0;
             let off = bind(&mut device, s, l);
             clear_lane(&mut logs, &device, l, x - 1);
             insert(&mut logs[s], joint(x + off, s, 1));
@@ -1095,7 +1189,14 @@ pub fn build_play(raw: &RawPlay) -> Play {
                 .or(judgeable(&chart, None).last())
                 .unwrap();
             let at = final_deadline.0 + if param % 2 == 0 { 1 } else { TICK };
-            let behind = &mut preset.empty_poor.behind;
+            // The range of the lane's class, never scaled.
+            let [keys, scratch] = preset.tables.each_mut();
+            let table = if lane(l) == Lane::SCRATCH {
+                scratch
+            } else {
+                keys
+            };
+            let behind = &mut table.empty_poor.behind;
             *behind = TimeUs(behind.0.max(at - t.0));
             let off = bind(&mut device, 0, l);
             clear_lane(&mut logs, &device, l, at - 1);
@@ -1119,7 +1220,7 @@ pub fn build_play(raw: &RawPlay) -> Play {
             );
             let s = pick(param / 8, n);
             let r = (s + 1 + pick(param / 64, n - 1)) % n;
-            let early = t.0 - windows.bad.early.0 - TICK;
+            let early = t.0 - windows.of_lane(lane(l)).bad.early.0 - TICK;
             let off_s = bind(&mut device, s, l);
             let off_r = bind(&mut device, r, l);
             insert(&mut logs[s], joint(early + off_s, s, 1));
@@ -1134,7 +1235,7 @@ pub fn build_play(raw: &RawPlay) -> Play {
         3 if let Some(s) = section.as_mut()
             && let Some((l, t)) = first_target(&chart, s) =>
         {
-            let at = t.0 - windows.bad.early.0 - i64::from(param % 2 == 1);
+            let at = t.0 - windows.of_lane(lane(l)).bad.early.0 - i64::from(param % 2 == 1);
             s.lead_in = TimeUs(s.lead_in.0.max(s.start.0 - at));
             let src = pick(param / 8, n);
             let off = bind(&mut device, src, l);
@@ -1549,32 +1650,35 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
         }
         out
     };
-    let side = |p: &RulePreset, early: bool| {
-        p.windows
-            .table()
+    let side = |w: &JudgeWindows, early: bool| {
+        w.table()
             .map(|(_, w)| if early { w.early.0 } else { w.late.0 })
     };
-    wide.windows = windows_of(
-        widen(side(&narrow, true), raw.widen.0),
-        widen(side(&narrow, false), raw.widen.1),
-    );
-    // The LN-end edges widen too, by their own steps, and at least as far
-    // as the widened early edges they must cover; each stays wider than
-    // the better one.
-    let early = side(&wide, true);
-    let mut floor = 0;
-    let mut add = 0;
-    let mut end = [0; 3];
-    for (k, (_, edge)) in narrow.ln_end.table().into_iter().enumerate() {
-        add += widen_step(raw.widen.2[k]);
-        end[k] = (edge.0 + add).max(early[k]).max(floor);
-        floor = end[k] + 1;
+    // Each lane class's table widens by the same steps.
+    for table in wide.tables.each_mut() {
+        let narrow = *table;
+        table.windows = windows_of(
+            widen(side(&narrow.windows, true), raw.widen.0),
+            widen(side(&narrow.windows, false), raw.widen.1),
+        );
+        // The LN-end edges widen too, by their own steps, and at least as
+        // far as the widened early edges they must cover; each stays wider
+        // than the better one.
+        let early = side(&table.windows, true);
+        let mut floor = 0;
+        let mut add = 0;
+        let mut end = [0; 3];
+        for (k, (_, edge)) in narrow.ln_end.table().into_iter().enumerate() {
+            add += widen_step(raw.widen.2[k]);
+            end[k] = (edge.0 + add).max(early[k]).max(floor);
+            floor = end[k] + 1;
+        }
+        table.ln_end = LnEndWindows {
+            perfect: TimeUs(end[0]),
+            great: TimeUs(end[1]),
+            good: TimeUs(end[2]),
+        };
     }
-    wide.ln_end = LnEndWindows {
-        perfect: TimeUs(end[0]),
-        great: TimeUs(end[1]),
-        good: TimeUs(end[2]),
-    };
     // Distinct lanes, one judgeable note each.
     let mut used = [false; LANE_COUNT];
     let mut b = ChartBuilder::new(150_000);
@@ -1603,9 +1707,7 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
     let off = offset(raw.offset);
     let device = crate::common::device(&[off]);
     let scaled = |p: &RulePreset| {
-        *Evaluator::new(&chart, p, &device, &InputStart::default(), None, 0)
-            .unwrap()
-            .windows()
+        lane_windows(&Evaluator::new(&chart, p, &device, &InputStart::default(), None, 0).unwrap())
     };
     let (wn, ww) = (scaled(&narrow), scaled(&wide));
     let mut log = Vec::new();
@@ -1619,7 +1721,7 @@ pub fn build_widening(raw: &RawWidening) -> Widening {
             below(v, 600_001) - 300_000
         } else {
             let w = if sel / 2 % 2 == 0 { &wn } else { &ww };
-            let (_, window) = w.table()[pick(v, 4)];
+            let (_, window) = w.of_lane(lane(l)).table()[pick(v, 4)];
             let edge = if v / 4 % 2 == 0 {
                 -window.early.0
             } else {
@@ -1661,8 +1763,8 @@ pub struct HeldThrough {
     pub input: EvalInput,
     /// The press's deviation from the head.
     pub deviation: i64,
-    /// The scale the chart's rank gives, in thousandths of a percent.
-    pub scale: i64,
+    /// The factor the chart's rank scales edges by, as `(num, den)`.
+    pub scale: (i64, i64),
 }
 
 #[derive(Clone, Debug)]
@@ -1707,13 +1809,10 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
         .unwrap();
     chart.meta.judgment_headers = rank(raw.rank);
     // The scaled BAD window, by hand: floor(edge × scale / 100 %).
-    let read = preset.headers.read(&chart.meta.judgment_headers);
-    let scale = preset.rank_scale.scale_milli(read.rank).unwrap();
-    let scaled = |edge: TimeUs| edge.0 * scale / 100_000;
-    let (early, late) = (
-        scaled(preset.windows.bad.early),
-        scaled(preset.windows.bad.late),
-    );
+    let scale = scale_of(&preset, &chart.meta.judgment_headers);
+    let scaled = |edge: TimeUs| edge.0 * scale.0 / scale.1;
+    let bad = preset.tables.keys.windows.bad;
+    let (early, late) = (scaled(bad.early), scaled(bad.late));
     let deviation = below(raw.deviation, early + late + 1) - early;
     // Held exactly as long as the long note, a little or much longer.
     let extra = match raw.extra % 3 {

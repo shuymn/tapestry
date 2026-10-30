@@ -31,7 +31,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
-use rules::{GaugeKind, GaugeValue, HeaderPolicy, MineRule, RulePreset};
+use rules::{GaugeKind, GaugeValue, HeaderPolicy, MineRule, RulePreset, WindowPolicy};
 
 use live::{Delivery, Live, live};
 use strategy::{
@@ -287,9 +287,11 @@ proptest! {
         let e = evaluate(&p.chart, &p.input, &p.preset)
             .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
         // The head's judgment by the scaled windows, by hand.
-        let scaled = |edge: TimeUs| edge.0 * p.scale / 100_000;
+        let scaled = |edge: TimeUs| edge.0 * p.scale.0 / p.scale.1;
         let expected = p
             .preset
+            .tables
+            .keys
             .windows
             .table()
             .into_iter()
@@ -515,10 +517,20 @@ fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
     );
     c.hit("headers_decimals", p.headers == HeaderPolicy::Decimals);
     c.hit(
-        "headers_integer_ranks",
-        p.headers == HeaderPolicy::IntegerRanks,
+        "headers_def_ex_rank_first",
+        p.headers == HeaderPolicy::DefExRankFirst,
     );
-    c.hit("asymmetric_bad", p.windows.bad.early != p.windows.bad.late);
+    let bad = p.tables.keys.windows.bad;
+    c.hit("asymmetric_bad", bad.early != bad.late);
+    c.hit("scratch_own_table", p.tables.keys != p.tables.scratch);
+    c.hit(
+        "window_policy_thousandths",
+        matches!(p.window_policy, WindowPolicy::Thousandths(_)),
+    );
+    c.hit(
+        "window_policy_scaled",
+        matches!(p.window_policy, WindowPolicy::Scaled(_)),
+    );
     let survival = |low: bool| {
         p.gauges
             .iter()
@@ -532,7 +544,7 @@ fn count_play(play: &Play, c: &mut Coverage) {
     let declared = &play.chart.meta.judgment_headers;
     c.hit(
         "header_policies_differ",
-        HeaderPolicy::Decimals.read(declared) != HeaderPolicy::IntegerRanks.read(declared),
+        HeaderPolicy::Decimals.read(declared) != HeaderPolicy::DefExRankFirst.read(declared),
     );
     let device = &play.input.device;
     let times: Vec<(TimeUs, SourceId)> = play
@@ -659,13 +671,13 @@ fn count_section(play: &Play, s: &eval::Section, whole: &Evaluation, c: &mut Cov
         0,
     )
     .unwrap();
-    let early = ev.windows().bad.early;
     let lead_in = TimeUs(s.start.0 - s.lead_in.0)..s.start;
     c.hit(
         "lead_in_press_on_early_edge",
         whole.events.iter().any(|e| {
             lead_in.contains(&e.time)
-                && matches!(e.kind, JudgeEventKind::Judged { deviation: Some(d), .. } if d.0 == -early.0)
+                && matches!(e.kind, JudgeEventKind::Judged { lane, deviation: Some(d), .. }
+                    if d.0 == -ev.table(lane).windows.bad.early.0)
         }),
     );
     // A lead-in press the section ignores and a whole-chart play judges or
@@ -823,9 +835,12 @@ fn generators_reach_the_fragile_spots() {
         ("choices_of_custom", SAMPLES),
         ("choices_of_beatoraja_style", SAMPLES),
         ("headers_decimals", 1),
-        ("headers_integer_ranks", 1),
+        ("headers_def_ex_rank_first", 1),
         ("header_policies_differ", 1),
         ("asymmetric_bad", 1),
+        ("scratch_own_table", 1),
+        ("window_policy_thousandths", 1),
+        ("window_policy_scaled", 1),
         ("survival_with_low_damage", 1),
         ("survival_without_low_damage", 1),
         ("gauge_at_max", 1),

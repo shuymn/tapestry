@@ -201,11 +201,12 @@ fn old_preset_copy_is_refused_even_with_an_override() {
     );
 }
 
-/// `bytes` (a current preset copy) in canonical encoding 4, the layout
-/// before the judgment-header model: without the header policy's tag.
+/// `bytes` (a current preset copy) labeled canonical encoding 4, the layout
+/// before the judgment-header model, and without the header policy's tag.
+/// The decoder refuses it at the version byte, before any other field.
 fn encoding_4(bytes: &[u8]) -> Vec<u8> {
     let mut other = rules::custom();
-    other.headers = rules::HeaderPolicy::IntegerRanks;
+    other.headers = rules::HeaderPolicy::DefExRankFirst;
     let tag = bytes
         .iter()
         .zip(other.canonical_bytes())
@@ -213,7 +214,7 @@ fn encoding_4(bytes: &[u8]) -> Vec<u8> {
         .unwrap();
     let mut old = bytes.to_vec();
     old.remove(tag);
-    assert_eq!(old[0], 5, "the current encoding");
+    assert_eq!(old[0], 6, "the current encoding");
     old[0] = 4;
     old
 }
@@ -372,7 +373,7 @@ fn an_override_is_a_what_if_and_its_own_copy_is_as_played() {
     let (dir, record) = played();
     let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
     let mut wide = rules::custom();
-    wide.windows.bad = Window::symmetric(220 * MS);
+    wide.tables.keys.windows.bad = Window::symmetric(220 * MS);
     let r = evaluate_record(&record, &chart, Some(&wide)).unwrap();
     assert!(!r.as_played);
     assert_eq!(r.coverage, Coverage::NoInputAfter(TimeUs(4_180 * MS)));
@@ -427,7 +428,7 @@ fn what_if_ignores_input_recorded_after_the_watermark() {
     // Under a 220 ms BAD edge the press would be a BAD: it is not input of
     // the play, so the note is still missed.
     let mut wide = rules::custom();
-    wide.windows.bad = Window::symmetric(220 * MS);
+    wide.tables.keys.windows.bad = Window::symmetric(220 * MS);
     let r = evaluate_record(&record, &chart, Some(&wide)).unwrap();
     assert_eq!(r.coverage, Coverage::NoInputAfter(TimeUs(4_180 * MS)));
     let counts = r.evaluation.tally.counts;
@@ -437,7 +438,7 @@ fn what_if_ignores_input_recorded_after_the_watermark() {
 /// The custom preset with the BAD window `ms` each side.
 fn bad_edge(ms: i64) -> RulePreset {
     let mut p = rules::custom();
-    p.windows.bad = Window::symmetric(ms * MS);
+    p.tables.keys.windows.bad = Window::symmetric(ms * MS);
     p
 }
 
@@ -542,6 +543,53 @@ fn the_load_uses_the_recorded_seed() {
         load_recorded_chart(&reseeded, text.as_bytes(), dir.path()),
         Err(VerifyError::ResolvedChartMismatch)
     );
+}
+
+/// Source: beatoraja's scratch BAD late edge is 290 ms
+/// (`play/JudgeProperty.java:24`), 217.5 ms at beatoraja-style's absent
+/// rank (75 %), past the keys' 210 ms.
+#[test]
+fn final_deadline_has_one_source() {
+    // `CHART` plus a scratch tap at 4 s, beside the key 1 tap there.
+    let text = format!("{CHART}#00216:01\n");
+    let (dir, record) = played_from(&text, 0, 0);
+    let chart = load_recorded_chart(&record, text.as_bytes(), dir.path()).unwrap();
+    let style = rules::beatoraja_style();
+    let scratch_miss = TimeUs(4_217_500);
+    let device = record.devices.profile();
+    let song_end = |e: &eval::Evaluation| {
+        e.events
+            .iter()
+            .filter(|ev| ev.kind == eval::JudgeEventKind::SongEnd)
+            .map(|ev| ev.time)
+            .collect::<Vec<_>>()
+    };
+    // Completion: a play with no input ends at the scratch's miss.
+    let input = eval::EvalInput {
+        events: Vec::new(),
+        device: device.clone(),
+        start: InputStart::default(),
+        finalized: None,
+        section: None,
+    };
+    let done = eval::evaluate(&chart, &input, &style).unwrap();
+    assert!(done.completed);
+    assert_eq!(song_end(&done), [scratch_miss]);
+    // The what-if of the play, recorded to 4.180 s, runs to it.
+    let r = evaluate_record(&record, &chart, Some(&style)).unwrap();
+    assert!(r.evaluation.completed);
+    assert_eq!(song_end(&r.evaluation), [scratch_miss]);
+    assert_eq!(r.coverage, Coverage::NoInputAfter(TimeUs(4_180 * MS)));
+    // The section probe sizing a recording window.
+    let section = eval::Section {
+        start: TimeUs(0),
+        end: TimeUs(5_000 * MS),
+        lead_in: TimeUs(0),
+        initial_gauges: style.gauges.iter().map(|g| g.start).collect(),
+    };
+    let start = InputStart::default();
+    let probe = eval::Evaluator::new(&chart, &style, &device, &start, Some(&section), 0).unwrap();
+    assert_eq!(probe.final_deadline(), scratch_miss);
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::Judgment;
+use crate::{Judgment, LaneClass};
 
 /// A side of a judgment window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +25,8 @@ pub enum RuleError {
     /// A window edge was negative, or not wider than the better judgment's
     /// edge on the same side.
     WindowsNotAscending {
+        /// The lane class whose table it is.
+        class: LaneClass,
         /// The side.
         side: Side,
         /// The judgment whose edge is out of order.
@@ -40,13 +42,17 @@ pub enum RuleError {
     },
     /// An LN-end edge was negative, or not wider than the better judgment's.
     LnEndNotAscending {
+        /// The lane class whose table it is.
+        class: LaneClass,
         /// The judgment whose edge is out of order.
         judgment: Judgment,
     },
     /// An LN-end edge was narrower than the note window's early edge of the
-    /// same judgment, so a press held as long as its long note could lose
-    /// its head's judgment.
+    /// same judgment and lane class, so a press held as long as its long
+    /// note could lose its head's judgment.
     LnEndNarrowerThanNote {
+        /// The lane class whose table it is.
+        class: LaneClass,
         /// The judgment.
         judgment: Judgment,
     },
@@ -77,22 +83,29 @@ impl fmt::Display for RuleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyName { field } => write!(f, "{field} is empty"),
-            Self::WindowsNotAscending { side, judgment } => write!(
+            Self::WindowsNotAscending {
+                class,
+                side,
+                judgment,
+            } => write!(
                 f,
-                "the {side:?} edge of the {judgment:?} window is negative or not wider than the better judgment's"
+                "{}: the {side:?} edge of the {judgment:?} window is negative or not wider than the better judgment's",
+                class.name()
             ),
             Self::UnsupportedImplementation { name, version } => write!(
                 f,
                 "the {name} evaluator version {version} is not supported (this build runs version {})",
                 crate::Implementation::STANDARD_VERSION
             ),
-            Self::LnEndNotAscending { judgment } => write!(
+            Self::LnEndNotAscending { class, judgment } => write!(
                 f,
-                "the {judgment:?} LN-end edge is negative or not wider than the better judgment's"
+                "{}: the {judgment:?} LN-end edge is negative or not wider than the better judgment's",
+                class.name()
             ),
-            Self::LnEndNarrowerThanNote { judgment } => write!(
+            Self::LnEndNarrowerThanNote { class, judgment } => write!(
                 f,
-                "the {judgment:?} LN-end edge is narrower than the {judgment:?} window's early edge"
+                "{}: the {judgment:?} LN-end edge is narrower than the {judgment:?} window's early edge",
+                class.name()
             ),
             Self::OutOfRange { field } => write!(f, "{field} is out of range"),
             Self::NoGauges => f.write_str("the preset has no gauge"),

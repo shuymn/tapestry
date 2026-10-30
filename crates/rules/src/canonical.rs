@@ -17,15 +17,17 @@
 use bms_model::TimeUs;
 
 use crate::{
-    Assignment, CanonicalError, Denominator, EmptyPoorRule, GaugeDelta, GaugeKind, GaugeRule,
-    GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LateHeadRule, LnEndWindows, LnMode,
-    LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, RankScale, RulePreset, SameTimeOrder,
-    ScoreWeights, TotalMode, Window,
+    Assignment, CanonicalError, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
+    GaugeRule, GaugeValue, HeaderPolicy, Implementation, JudgeWindows, LaneTable, LateHeadRule,
+    LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment, PerLaneClass,
+    RankScale, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalMode, Window,
+    WindowPolicy,
 };
 
-/// The encoding layout. Version 5 has the header policy before the rank
-/// scale.
-const FORMAT_VERSION: u64 = 5;
+/// The encoding layout. Version 6 has a table per lane class (keys, then
+/// scratch: windows, LN-end edges, empty POOR range) and the window policy
+/// after the header policy.
+const FORMAT_VERSION: u64 = 6;
 
 /// The fewest bytes a gauge takes: an empty id's length, the survival tag,
 /// three one-byte values, six fixed deltas of a tag and a one-byte value,
@@ -43,12 +45,11 @@ impl RulePreset {
             id,
             version,
             implementation,
-            windows,
+            tables,
             miss,
             empty_poor,
-            ln_end,
             headers,
-            rank_scale,
+            window_policy,
             default_total_milli,
             denominator,
             gauges,
@@ -62,17 +63,16 @@ impl RulePreset {
         w.str(id);
         w.uint(u64::from(*version));
         w.implementation(*implementation);
-        w.windows(windows);
-        w.ln_end(ln_end);
+        w.tables(tables);
         w.uint(match miss {
             MissRule::PoorAfterLateBadOrOvertaken => 0,
         });
         w.empty_poor(empty_poor);
         w.uint(match headers {
             HeaderPolicy::Decimals => 0,
-            HeaderPolicy::IntegerRanks => 1,
+            HeaderPolicy::DefExRankFirst => 1,
         });
-        w.rank_scale(rank_scale);
+        w.window_policy(window_policy);
         w.int(*default_total_milli);
         w.uint(match denominator {
             Denominator::TapsAndLnHeads => 0,
@@ -105,8 +105,9 @@ impl RulePreset {
     /// that end inside a value, a varint that overflows or is not minimal, a
     /// count beyond the bytes left, an unknown tag or implementation, a
     /// value too large for its type, a string that is not UTF-8, a rank
-    /// scale without four entries; then bytes after the preset; and last a
-    /// preset that fails [`validate`](Self::validate).
+    /// scale without four entries or rank percentages without five; then
+    /// bytes after the preset; and last a preset that fails
+    /// [`validate`](Self::validate).
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalError> {
         let mut r = Reader(bytes);
         let format = r.uint()?;
@@ -116,18 +117,20 @@ impl RulePreset {
         let id = r.str("id")?;
         let version = r.u32("version")?;
         let implementation = r.implementation()?;
-        let windows = r.windows()?;
-        let ln_end = r.ln_end()?;
+        let tables = PerLaneClass {
+            keys: r.table()?,
+            scratch: r.table()?,
+        };
         let miss = r.tag("miss", |t| {
             (t == 0).then_some(MissRule::PoorAfterLateBadOrOvertaken)
         })?;
         let empty_poor = r.empty_poor()?;
         let headers = r.tag("headers", |t| match t {
             0 => Some(HeaderPolicy::Decimals),
-            1 => Some(HeaderPolicy::IntegerRanks),
+            1 => Some(HeaderPolicy::DefExRankFirst),
             _ => None,
         })?;
-        let rank_scale = r.rank_scale()?;
+        let window_policy = r.window_policy()?;
         let default_total_milli = r.int()?;
         let denominator = r.tag("denominator", |t| {
             (t == 0).then_some(Denominator::TapsAndLnHeads)
@@ -157,12 +160,11 @@ impl RulePreset {
             id,
             version,
             implementation,
-            windows,
+            tables,
             miss,
             empty_poor,
-            ln_end,
             headers,
-            rank_scale,
+            window_policy,
             default_total_milli,
             denominator,
             gauges,
@@ -241,19 +243,57 @@ impl Writer {
         }
     }
 
+    fn tables(&mut self, tables: &PerLaneClass<LaneTable>) {
+        let PerLaneClass { keys, scratch } = tables;
+        self.table(keys);
+        self.table(scratch);
+    }
+
+    fn table(&mut self, table: &LaneTable) {
+        let LaneTable {
+            windows,
+            ln_end,
+            empty_poor,
+        } = table;
+        self.windows(windows);
+        self.ln_end(ln_end);
+        let EmptyPoorRange { ahead, behind } = *empty_poor;
+        self.time(ahead);
+        self.time(behind);
+    }
+
     fn empty_poor(&mut self, rule: &EmptyPoorRule) {
         let EmptyPoorRule {
-            ahead,
-            behind,
             breaks_combo,
             counts_bp,
             counted,
         } = *rule;
-        self.time(ahead);
-        self.time(behind);
         self.bool(breaks_combo);
         self.bool(counts_bp);
         self.bool(counted);
+    }
+
+    fn window_policy(&mut self, policy: &WindowPolicy) {
+        match policy {
+            WindowPolicy::Thousandths(scale) => {
+                self.uint(0);
+                self.rank_scale(scale);
+            }
+            WindowPolicy::Scaled(scaled) => {
+                let ScaledRank {
+                    rank_percent,
+                    absent_percent,
+                    defexrank_percent,
+                } = *scaled;
+                self.uint(1);
+                self.len(rank_percent.len());
+                for p in rank_percent {
+                    self.uint(u64::from(p));
+                }
+                self.uint(u64::from(absent_percent));
+                self.uint(u64::from(defexrank_percent));
+            }
+        }
     }
 
     fn ln_end(&mut self, ln_end: &LnEndWindows) {
@@ -482,10 +522,47 @@ impl Reader<'_> {
         })
     }
 
+    fn table(&mut self) -> Result<LaneTable, CanonicalError> {
+        Ok(LaneTable {
+            windows: self.windows()?,
+            ln_end: self.ln_end()?,
+            empty_poor: EmptyPoorRange {
+                ahead: self.time()?,
+                behind: self.time()?,
+            },
+        })
+    }
+
+    fn window_policy(&mut self) -> Result<WindowPolicy, CanonicalError> {
+        match self.uint()? {
+            0 => Ok(WindowPolicy::Thousandths(self.rank_scale()?)),
+            1 => {
+                let len = self.count("rank_percent", 1)?;
+                if len != 5 {
+                    return Err(CanonicalError::WrongLength {
+                        field: "rank_percent",
+                        len,
+                    });
+                }
+                let mut rank_percent = [0; 5];
+                for p in &mut rank_percent {
+                    *p = self.u32("rank_percent")?;
+                }
+                Ok(WindowPolicy::Scaled(ScaledRank {
+                    rank_percent,
+                    absent_percent: self.u32("absent_percent")?,
+                    defexrank_percent: self.u32("defexrank_percent")?,
+                }))
+            }
+            tag => Err(CanonicalError::UnknownTag {
+                field: "window_policy",
+                tag,
+            }),
+        }
+    }
+
     fn empty_poor(&mut self) -> Result<EmptyPoorRule, CanonicalError> {
         Ok(EmptyPoorRule {
-            ahead: self.time()?,
-            behind: self.time()?,
             breaks_combo: self.bool("empty_poor.breaks_combo")?,
             counts_bp: self.bool("empty_poor.counts_bp")?,
             counted: self.bool("empty_poor.counted")?,
@@ -620,12 +697,21 @@ mod tests {
 
     use bms_model::TimeUs;
 
-    use crate::{CanonicalError, GaugeKind, Judgment, RuleError, RulePreset, Side, custom};
+    use crate::{
+        CanonicalError, GaugeKind, Judgment, LaneClass, RuleError, RulePreset, Side, custom,
+    };
 
     use super::{FORMAT_VERSION, MIN_GAUGE_BYTES, Reader, Writer};
 
+    fn table_mut(p: &mut RulePreset, class: LaneClass) -> &mut crate::LaneTable {
+        match class {
+            LaneClass::Keys => &mut p.tables.keys,
+            LaneClass::Scratch => &mut p.tables.scratch,
+        }
+    }
+
     #[test]
-    fn canonical_bytes_change_with_any_window() {
+    fn canonical_bytes_change_with_any_window_of_either_class() {
         let base = custom();
         let base_bytes = base.canonical_bytes();
         assert_eq!(base_bytes, custom().canonical_bytes());
@@ -641,38 +727,69 @@ mod tests {
             |w| &mut w.bad.late,
         ];
         let mut seen = HashSet::from([base_bytes.clone()]);
-        for edge in edges {
-            for step in [-1, 1] {
-                let mut preset = base.clone();
-                edge(&mut preset.windows).0 += step;
-                assert!(
-                    seen.insert(preset.canonical_bytes()),
-                    "a 1 µs change of a window edge left the bytes unchanged or equal to another edge's"
-                );
+        for class in LaneClass::ALL {
+            for edge in edges {
+                for step in [-1, 1] {
+                    let mut preset = base.clone();
+                    edge(&mut table_mut(&mut preset, class).windows).0 += step;
+                    assert!(
+                        seen.insert(preset.canonical_bytes()),
+                        "a 1 µs change of a window edge left the bytes unchanged or equal to another edge's"
+                    );
+                }
             }
         }
-        assert_eq!(seen.len(), 1 + 8 * 2);
+        assert_eq!(seen.len(), 1 + 2 * 8 * 2);
     }
 
     #[test]
-    fn canonical_bytes_start_with_format_5_and_change_with_any_ln_end_edge() {
+    fn canonical_bytes_start_with_format_6_and_change_with_any_table_edge() {
         let base = custom();
         let base_bytes = base.canonical_bytes();
-        assert_eq!(base_bytes.first(), Some(&5));
-        let edges: [fn(&mut crate::LnEndWindows) -> &mut TimeUs; 3] =
-            [|w| &mut w.perfect, |w| &mut w.great, |w| &mut w.good];
+        assert_eq!(base_bytes.first(), Some(&6));
+        let edges: [fn(&mut crate::LaneTable) -> &mut TimeUs; 5] = [
+            |t| &mut t.ln_end.perfect,
+            |t| &mut t.ln_end.great,
+            |t| &mut t.ln_end.good,
+            |t| &mut t.empty_poor.ahead,
+            |t| &mut t.empty_poor.behind,
+        ];
         let mut seen = HashSet::from([base_bytes]);
-        for edge in edges {
-            for step in [-1, 1] {
-                let mut preset = base.clone();
-                edge(&mut preset.ln_end).0 += step;
-                assert!(
-                    seen.insert(preset.canonical_bytes()),
-                    "a 1 µs change of an LN-end edge left the bytes unchanged or equal to another edge's"
-                );
+        for class in LaneClass::ALL {
+            for edge in edges {
+                for step in [-1, 1] {
+                    let mut preset = base.clone();
+                    edge(table_mut(&mut preset, class)).0 += step;
+                    assert!(
+                        seen.insert(preset.canonical_bytes()),
+                        "a 1 µs change of a table edge left the bytes unchanged or equal to another edge's"
+                    );
+                }
             }
         }
-        assert_eq!(seen.len(), 1 + 3 * 2);
+        assert_eq!(seen.len(), 1 + 2 * 5 * 2);
+    }
+
+    #[test]
+    fn canonical_bytes_change_with_any_scaled_rank_value() {
+        let scaled = |edit: fn(&mut crate::ScaledRank)| {
+            let mut preset = crate::beatoraja_style();
+            let crate::WindowPolicy::Scaled(s) = &mut preset.window_policy else {
+                panic!("beatoraja-style scales by whole percentages");
+            };
+            edit(s);
+            preset.canonical_bytes()
+        };
+        let mut seen = HashSet::from([crate::beatoraja_style().canonical_bytes()]);
+        let edits: [fn(&mut crate::ScaledRank); 4] = [
+            |s| s.rank_percent[0] += 1,
+            |s| s.rank_percent[4] += 1,
+            |s| s.absent_percent += 1,
+            |s| s.defexrank_percent += 1,
+        ];
+        for edit in edits {
+            assert!(seen.insert(scaled(edit)));
+        }
     }
 
     #[test]
@@ -692,7 +809,6 @@ mod tests {
         assert_ne!(changed(|p| p.gauges[1].low_damage = None), base);
         assert_ne!(changed(|p| p.gauges.swap(0, 1)), base);
         assert_ne!(changed(|p| p.empty_poor.counted = true), base);
-        assert_ne!(changed(|p| p.empty_poor.behind = TimeUs(150_001)), base);
     }
 
     /// A preset with every field distinct from its neighbours.
@@ -705,56 +821,67 @@ mod tests {
             early: TimeUs(early),
             late: TimeUs(late),
         };
-        p.windows = crate::JudgeWindows {
-            perfect: w(18_000, 22_000),
-            great: w(40_000, 50_000),
-            good: w(90_000, 110_000),
-            bad: w(170_000, 200_000),
+        p.tables.keys = crate::LaneTable {
+            windows: crate::JudgeWindows {
+                perfect: w(18_000, 22_000),
+                great: w(40_000, 50_000),
+                good: w(90_000, 110_000),
+                bad: w(170_000, 200_000),
+            },
+            ln_end: crate::LnEndWindows {
+                perfect: TimeUs(90_000),
+                great: TimeUs(140_000),
+                good: TimeUs(210_000),
+            },
+            empty_poor: crate::EmptyPoorRange {
+                ahead: TimeUs(250_000),
+                behind: TimeUs(120_000),
+            },
         };
-        p.empty_poor.ahead = TimeUs(250_000);
-        p.empty_poor.behind = TimeUs(120_000);
+        p.tables.scratch.empty_poor.behind = TimeUs(160_000);
         p.empty_poor.counts_bp = false;
         p.empty_poor.counted = true;
-        p.ln_end = crate::LnEndWindows {
-            perfect: TimeUs(90_000),
-            great: TimeUs(140_000),
-            good: TimeUs(210_000),
-        };
-        p.rank_scale = crate::RankScale {
-            rank_milli: [40_000, 70_000, 100_000, 130_000],
-            absent_milli: 90_000,
-        };
-        p.headers = crate::HeaderPolicy::IntegerRanks;
+        p.headers = crate::HeaderPolicy::DefExRankFirst;
+        p.window_policy = crate::WindowPolicy::Scaled(crate::ScaledRank {
+            rank_percent: [25, 50, 75, 100, 125],
+            absent_percent: 80,
+            defexrank_percent: 70,
+        });
         p.default_total_milli = 123_456;
         p
     }
 
     /// The bytes of [`representative`], written by hand from the module docs
-    /// field by field: the format version 5, then `rep`, version 7, the
-    /// implementation, the windows, the LN-end edges (90 ms is zigzag 180000
-    /// = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1 19`), the miss
-    /// rule (0), the empty POOR (`ahead` 250 ms is zigzag 500000 = `a0 c2
-    /// 1e`, `behind` 120 ms is zigzag 240000 = `80 d3 0e`), the header policy
-    /// (`IntegerRanks`, 1), and the rest in
-    /// declaration order.
-    const PINNED: [u8; 198] = [
-        0x05, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+    /// field by field: the format version 6, then `rep`, version 7, the
+    /// implementation; the keys' table: the windows, the LN-end edges (90 ms
+    /// is zigzag 180000 = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1
+    /// 19`) and the empty POOR range (`ahead` 250 ms is zigzag 500000 = `a0
+    /// c2 1e`, `behind` 120 ms is zigzag 240000 = `80 d3 0e`); the scratch's
+    /// table, custom's but 160 ms behind (`80 c4 13`); the miss rule (0),
+    /// the empty POOR's three flags, the header policy (`DefExRankFirst`, 1),
+    /// the window policy (`Scaled`, 1: five percentages `19 32 4b 64 7d`, 80
+    /// `50`, 70 `46`), and the rest in declaration order.
+    const PINNED: [u8; 230] = [
+        0x06, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x03, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
         0x14, 0x80, 0xb5, 0x18, 0xa0, 0xfe, 0x0a, 0xc0, 0x8b, 0x11, 0xa0, 0xd1, //
-        0x19, 0x00, 0xa0, 0xc2, 0x1e, 0x80, 0xd3, 0x0e, 0x00, 0x00, 0x01, 0x01, //
-        0x04, 0x80, 0xf1, 0x04, 0xe0, 0xc5, 0x08, 0xc0, 0x9a, 0x0c, 0xa0, 0xef, //
-        0x0f, 0xa0, 0xfe, 0x0a, 0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, //
-        0x72, 0x6d, 0x61, 0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, //
-        0x01, 0x80, 0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, //
-        0x01, 0x01, 0x01, 0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, //
-        0x49, 0x00, 0xbf, 0xcf, 0x24, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, //
-        0x76, 0x61, 0x6c, 0x01, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, 0xc4, //
-        0x09, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, 0x00, //
-        0xbf, 0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x01, //
-        0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0xa0, 0x8d, 0x06,
+        0x19, 0xa0, 0xc2, 0x1e, 0x80, 0xd3, 0x0e, 0xc0, 0xb8, 0x02, 0xc0, 0xb8, //
+        0x02, 0x90, 0xbf, 0x05, 0x90, 0xbf, 0x05, 0xc0, 0x9a, 0x0c, 0xc0, 0x9a, //
+        0x0c, 0xc0, 0xfc, 0x15, 0xc0, 0xfc, 0x15, 0xc0, 0x9a, 0x0c, 0xe0, 0xa7, //
+        0x12, 0x80, 0xb5, 0x18, 0xc0, 0x84, 0x3d, 0x80, 0xc4, 0x13, 0x00, 0x00, //
+        0x00, 0x01, 0x01, 0x01, 0x05, 0x19, 0x32, 0x4b, 0x64, 0x7d, 0x50, 0x46, //
+        0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, //
+        0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, 0xb5, //
+        0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, //
+        0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, 0x00, 0xbf, //
+        0xcf, 0x24, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, 0x61, 0x6c, //
+        0x01, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, //
+        0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, 0x00, 0xbf, 0x84, 0x3d, //
+        0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, 0x01, 0x80, 0x9b, 0xee, //
+        0x02, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, //
+        0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0xa0, 0x8d, 0x06,
     ];
 
     /// The layout, pinned, so a reordered or dropped field fails here; an
@@ -799,26 +926,30 @@ mod tests {
     }
 
     /// Up to the miss rule's tag.
-    fn through_ln_end(w: &mut Writer, p: &RulePreset) {
+    fn through_tables(w: &mut Writer, p: &RulePreset) {
         w.str(&p.id);
         w.uint(u64::from(p.version));
         w.implementation(p.implementation);
-        w.windows(&p.windows);
-        w.ln_end(&p.ln_end);
+        w.tables(&p.tables);
     }
 
     /// Up to the header policy's tag.
     fn through_empty_poor(w: &mut Writer, p: &RulePreset) {
-        through_ln_end(w, p);
+        through_tables(w, p);
         w.uint(0);
         w.empty_poor(&p.empty_poor);
     }
 
-    /// Up to the gauge count.
-    fn through_denominator(w: &mut Writer, p: &RulePreset) {
+    /// Up to the window policy's tag.
+    fn through_headers(w: &mut Writer, p: &RulePreset) {
         through_empty_poor(w, p);
         w.uint(0);
-        w.rank_scale(&p.rank_scale);
+    }
+
+    /// Up to the gauge count.
+    fn through_denominator(w: &mut Writer, p: &RulePreset) {
+        through_headers(w, p);
+        w.window_policy(&p.window_policy);
         w.int(p.default_total_milli);
         w.uint(0);
     }
@@ -845,7 +976,7 @@ mod tests {
         let style = crate::beatoraja_style();
         assert_eq!(decode(&style.canonical_bytes()), Ok(style));
         let mut p = custom();
-        p.headers = crate::HeaderPolicy::IntegerRanks;
+        p.headers = crate::HeaderPolicy::DefExRankFirst;
         assert_ne!(p.canonical_bytes(), custom().canonical_bytes());
         assert_eq!(decode(&p.canonical_bytes()), Ok(p));
     }
@@ -866,19 +997,19 @@ mod tests {
         // The id's length: one more than the bytes left is refused; exactly
         // the bytes left is read, and the next field finds nothing.
         assert_eq!(
-            decode(&[5, 4, b'a', b'b', b'c']),
+            decode(&[6, 4, b'a', b'b', b'c']),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
                 count: 4
             })
         );
         assert_eq!(
-            decode(&[5, 3, b'a', b'b', b'c']),
+            decode(&[6, 3, b'a', b'b', b'c']),
             Err(CanonicalError::Truncated)
         );
         assert_eq!(
             decode(&[
-                5, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
+                6, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
             ]),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
@@ -897,9 +1028,9 @@ mod tests {
                 })
             );
         }
-        // The rank scale's length.
+        // The rank scale's length, after the window policy's tag.
         let at = offset(|w, p| {
-            through_empty_poor(w, p);
+            through_headers(w, p);
             w.uint(0);
         });
         assert_eq!(
@@ -914,6 +1045,48 @@ mod tests {
             Err(CanonicalError::WrongLength {
                 field: "rank_scale",
                 len: 5
+            })
+        );
+    }
+
+    #[test]
+    fn rank_percentages_are_exactly_five() {
+        let style = crate::beatoraja_style();
+        let bytes = style.canonical_bytes();
+        let mut w = Writer(Vec::new());
+        w.uint(FORMAT_VERSION);
+        w.str(&style.id);
+        w.uint(u64::from(style.version));
+        w.implementation(style.implementation);
+        w.tables(&style.tables);
+        w.uint(0);
+        w.empty_poor(&style.empty_poor);
+        w.uint(1);
+        // The window policy's tag, then the count.
+        assert_eq!(bytes[w.0.len()], 1);
+        let at = w.0.len() + 1;
+        assert_eq!(bytes[at], 5);
+        let with = |len: u8| {
+            let mut b = bytes.clone();
+            b[at] = len;
+            decode(&b)
+        };
+        for len in [4, 6] {
+            assert_eq!(
+                with(len),
+                Err(CanonicalError::WrongLength {
+                    field: "rank_percent",
+                    len: usize::from(len)
+                })
+            );
+        }
+        let mut tag = bytes.clone();
+        tag[at - 1] = 2;
+        assert_eq!(
+            decode(&tag),
+            Err(CanonicalError::UnknownTag {
+                field: "window_policy",
+                tag: 2
             })
         );
     }
@@ -960,15 +1133,18 @@ mod tests {
     #[test]
     fn unknown_tag_is_refused() {
         let unknown = |field, tag| Err(CanonicalError::UnknownTag { field, tag });
-        let miss = offset(through_ln_end);
+        let miss = offset(through_tables);
         assert_eq!(decode(&with_uint_at(miss, 1)), unknown("miss", 1));
         let headers = offset(through_empty_poor);
         assert_eq!(decode(&with_uint_at(headers, 2)), unknown("headers", 2));
+        let policy = offset(through_headers);
+        assert_eq!(
+            decode(&with_uint_at(policy, 2)),
+            unknown("window_policy", 2)
+        );
         let breaks_combo = offset(|w, p| {
-            through_ln_end(w, p);
+            through_tables(w, p);
             w.uint(0);
-            w.time(p.empty_poor.ahead);
-            w.time(p.empty_poor.behind);
         });
         assert_eq!(
             decode(&with_uint_at(breaks_combo, 2)),
@@ -1033,10 +1209,11 @@ mod tests {
     #[test]
     fn invalid_decoded_preset_is_refused() {
         let mut p = custom();
-        p.windows.bad.early = p.windows.good.early;
+        p.tables.scratch.windows.bad.early = p.tables.scratch.windows.good.early;
         assert_eq!(
             decode(&p.canonical_bytes()),
             Err(CanonicalError::Invalid(RuleError::WindowsNotAscending {
+                class: LaneClass::Scratch,
                 side: Side::Early,
                 judgment: Judgment::Bad,
             }))

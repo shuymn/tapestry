@@ -11,7 +11,8 @@
 //! none of them is asserted here.
 //!
 //! The time of a miss is this evaluator's convention, [`MISSED`] after the
-//! note (difference H); the POOR itself follows the source.
+//! note (a known difference: when a miss is decided); the POOR itself
+//! follows the source.
 //!
 //! Window values are at `#RANK 3` (100 %) unless a test says otherwise.
 //! Gauges are in 1/100000 %, in the preset's order: NORMAL, ASSIST EASY,
@@ -19,10 +20,14 @@
 
 mod common;
 
-use bms_model::{Chart, ChartBuilder, JudgmentHeader, TimeUs};
+use bms_model::{Chart, ChartBuilder, JudgmentHeader, Lane, TimeUs};
 use common::{MS, device, empty_poors, judgments, lane, press, release};
-use eval::{EvalInput, Evaluation, InputStart, JudgeEventKind, PhysicalInputEvent, evaluate};
+use eval::{
+    EvalError, EvalInput, Evaluation, Evaluator, InputStart, JudgeEventKind, PhysicalInputEvent,
+    evaluate,
+};
 use rules::Judgment::{self, Bad, Good, Great, Perfect, Poor};
+use rules::{JudgeWindows, LaneClass, LnEndWindows, RuleError, Side, Window};
 
 const BPM: i64 = 150_000;
 /// The first note's time.
@@ -31,7 +36,7 @@ const T: i64 = 1_000 * MS;
 const PCT: i64 = 100_000;
 /// When this evaluator decides a miss: at the late BAD edge (280 ms at
 /// `#RANK 3`). beatoraja decides it at the first frame after the edge
-/// (difference H in the preset module), so this time is this evaluator's
+/// (a known difference in the preset module), so this time is this evaluator's
 /// convention, not the source's.
 const MISSED: i64 = 280 * MS;
 
@@ -240,23 +245,23 @@ fn absent_and_unknown_ranks_scale_to_75_percent() {
     }
 }
 
-/// Source: jbms-parser BMSDecoder.java:716-727 (`#DEFEXRANK` read with
-/// `Integer.parseInt`, so `120.5` throws and the earlier #RANK stays), then
-/// play/JudgeProperty.java:210 (#RANK 3, rate 100).
+/// Source: jbms-parser BMSDecoder.java:716-727 (`#DEFEXRANK` read as a
+/// number above 0) and jbms-parser a7a0729 (a #DEFEXRANK counts over
+/// #RANK), then play/BMSPlayerRule.java:63 (`n × 75 / 100` %). `120.5`
+/// scales by 90.375 %, before or after `#RANK 3`. Known differences (the
+/// preset module): the source parses `120.5` with `Integer.parseInt`, which
+/// throws, and since jbms-parser d0fba6d a later `#RANK` replaces a
+/// `#DEFEXRANK`; so it plays #RANK 3 (PERFECT ±20 ms) here.
 #[test]
-fn rejected_defexrank_keeps_the_earlier_rank() {
-    let mut chart = taps(&[T]);
-    chart
-        .meta
-        .judgment_headers
-        .push(common::defexrank_decimal(120_500));
-    assert_eq!(judge_tap(&chart, 20 * MS), Some(Perfect));
-    assert_eq!(judge_tap(&chart, 20 * MS + 1), Some(Great));
-    assert_eq!(judge_tap(&chart, 280 * MS), Some(Bad));
-    assert_eq!(
-        judged_at(&play(&chart, Vec::new())),
-        vec![(T + MISSED, Poor)]
-    );
+fn a_decimal_defexrank_counts_over_a_rank() {
+    let defex = common::defexrank_decimal(120_500);
+    for headers in [vec![common::rank(3), defex], vec![defex, common::rank(3)]] {
+        let mut chart = taps_ranked(&[T], None);
+        chart.meta.judgment_headers.clone_from(&headers);
+        // 20 ms × 0.90375 = 18.075 ms.
+        assert_eq!(judge_tap(&chart, 18_075), Some(Perfect), "{headers:?}");
+        assert_eq!(judge_tap(&chart, 18_076), Some(Great), "{headers:?}");
+    }
 }
 
 /// Source: play/JudgeProperty.java:210 (rates 25 and 50 for #RANK 0 and 1).
@@ -283,16 +288,18 @@ fn empty_poor_distances_do_not_scale() {
 // ------------------------------------------------------------ empty POOR
 
 /// Source: play/JudgeProperty.java:23 (MS early 500000) and
-/// play/JudgeManager.java:387-389: the note scan stops at notes 500 ms or
-/// more ahead, so a note exactly 500 ms after the press is not reached.
+/// play/JudgeManager.java:401 (the MS pair's edges inclusive). A note
+/// exactly 500 ms after the press counts here; the source's note scan stops
+/// short of it while no early BAD edge passes 500 ms (a known difference,
+/// [`a_note_500_ms_ahead_makes_an_empty_poor_at_every_scale`]).
 #[test]
-fn empty_poor_reaches_up_to_but_not_500_ms_before_a_note() {
+fn empty_poor_reaches_500_ms_before_a_note() {
     let chart = taps(&[T]);
+    assert_eq!(empty_poors(&play(&chart, tap_at(T - 500 * MS)).events), 1);
     assert_eq!(
-        empty_poors(&play(&chart, tap_at(T - 500 * MS + 1)).events),
-        1
+        empty_poors(&play(&chart, tap_at(T - 500 * MS - 1)).events),
+        0
     );
-    assert_eq!(empty_poors(&play(&chart, tap_at(T - 500 * MS)).events), 0);
 }
 
 /// Source: play/JudgeProperty.java:23 (MS late -150000) and
@@ -648,4 +655,287 @@ fn zero_total_after_a_total() {
     };
     let custom = evaluate(&chart, &input, &rules::custom()).unwrap();
     assert_eq!(custom.gauges[0].history[0].value.0, 60 * PCT);
+}
+
+// ------------------------------------------------------------ lane classes
+
+/// A tap on the scratch and one on key 1, both at `T`, at `rank`.
+fn scratch_and_key(rank: Option<JudgmentHeader>) -> Chart {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(0), TimeUs(T))
+        .tap(lane(1), TimeUs(T))
+        .build()
+        .unwrap();
+    with_rank(chart, rank)
+}
+
+/// Presses on the scratch and key 1 at `at`, each released 10 µs later.
+fn both_at(at: i64) -> Vec<PhysicalInputEvent> {
+    vec![
+        press(at, 0, 0),
+        press(at, 0, 1),
+        release(at + 10, 0, 0),
+        release(at + 10, 0, 1),
+    ]
+}
+
+/// The judgments on lane `l`, in order.
+fn judged_on(e: &Evaluation, l: usize) -> Vec<Judgment> {
+    judgments(&e.events)
+        .into_iter()
+        .filter(|j| j.0 == l)
+        .map(|j| j.2)
+        .collect()
+}
+
+/// Source: play/JudgeProperty.java:24 (scratch notes: PG {-30000, 30000},
+/// BD {-290000, 230000}, MS {-160000, 500000}), :27 (scratch LN ends: PG
+/// 130 ms), :191-197 (the table per note type), and
+/// play/JudgeManager.java:380, :494, :595 (a scratch press, release and
+/// miss read the scratch's). At the absent rank's 75 %, the scratch's
+/// PERFECT is ±22.5 ms, its late BAD edge 217.5 ms and its LN-end PERFECT
+/// 97.5 ms, against the keys' 15, 210 and 90 ms; its empty POOR reaches
+/// 160 ms behind (not scaled), the keys' 150 ms.
+#[test]
+fn scratch_uses_its_own_windows() {
+    let chart = scratch_and_key(None);
+    // A note pressed 20 ms late.
+    let e = play(&chart, both_at(T + 20 * MS));
+    assert_eq!(judged_on(&e, 0), [Perfect]);
+    assert_eq!(judged_on(&e, 1), [Great]);
+    // Its miss: 215 ms late is inside the scratch's late BAD edge and past
+    // the keys'.
+    let e = play(&chart, both_at(T + 215 * MS));
+    assert_eq!(judged_on(&e, 0), [Bad]);
+    assert_eq!(judged_on(&e, 1), [Poor]);
+    // An empty POOR 155 ms after a judged note.
+    let mut presses = both_at(T);
+    presses.extend(both_at(T + 155 * MS));
+    let e = play(&chart, presses);
+    let empty: Vec<_> = e
+        .events
+        .iter()
+        .filter_map(|ev| match ev.kind {
+            JudgeEventKind::EmptyPoor { lane } => Some(lane.index()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(empty, [0]);
+    // A long note's end, released 95 ms before it.
+    let end = T + 1_000 * MS;
+    let chart = ChartBuilder::new(BPM)
+        .long(lane(0), TimeUs(T), TimeUs(end))
+        .long(lane(1), TimeUs(T), TimeUs(end))
+        .build()
+        .unwrap();
+    let held = vec![
+        press(T, 0, 0),
+        press(T, 0, 1),
+        release(end - 95 * MS, 0, 0),
+        release(end - 95 * MS, 0, 1),
+    ];
+    let e = play(&with_rank(chart, None), held);
+    assert_eq!(judged_on(&e, 0), [Perfect]);
+    assert_eq!(judged_on(&e, 1), [Great]);
+}
+
+/// Source: play/BMSPlayerRule.java:62 (`#RANK 4` takes NORMAL's fifth rate,
+/// 125, play/JudgeProperty.java:210) and :63 (`#DEFEXRANK n` is
+/// `n × 75 / 100` %, 75 being `#RANK 2`'s rate), then each edge
+/// `edge × rate / 100` (play/JudgeProperty.java:234). The percentage is
+/// not truncated to an integer here (a known difference,
+/// [`defexrank_scales_by_its_exact_percentage`]).
+#[test]
+fn defexrank_and_rank_4_scale_like_the_source() {
+    // The keys' PERFECT edge (20 ms) at 125, 75, 76.5, 150 and 90.375 %.
+    for (rank, edge) in [
+        (common::rank(4), 25_000),
+        (common::defexrank(100), 15_000),
+        (common::defexrank(102), 15_300),
+        (common::defexrank(200), 30_000),
+        (common::defexrank_decimal(120_500), 18_075),
+    ] {
+        let chart = taps_ranked(&[T], Some(rank));
+        assert_eq!(judge_tap(&chart, edge), Some(Perfect), "{rank:?}");
+        assert_eq!(judge_tap(&chart, edge + 1), Some(Great), "{rank:?}");
+    }
+    // The scratch's PERFECT (30 ms) at #RANK 4: 37.5 ms, where the keys'
+    // is 25 ms.
+    let chart = scratch_and_key(Some(common::rank(4)));
+    let e = play(&chart, both_at(T + 37_500));
+    assert_eq!(
+        (judged_on(&e, 0), judged_on(&e, 1)),
+        (vec![Perfect], vec![Great])
+    );
+    let e = play(&chart, both_at(T + 37_501));
+    assert_eq!(judged_on(&e, 0), [Great]);
+}
+
+/// Known difference (the preset module): `#DEFEXRANK n` scales every edge
+/// by `n × 75 / 100` % as it is. The source stores that percentage as an
+/// `int` (play/BMSPlayerRule.java:59-65, under a TODO), so it truncates it
+/// first: `#DEFEXRANK 1` is 0 % there, zero-width windows, and 0.75 % here
+/// (the keys' PERFECT ±150 µs, the scratch's ±225 µs); `#DEFEXRANK 101` is
+/// 75 % there (PERFECT ±15 ms) and 75.75 % here (±15.15 ms).
+#[test]
+fn defexrank_scales_by_its_exact_percentage() {
+    let chart = scratch_and_key(Some(common::defexrank(1)));
+    let e = play(&chart, both_at(T + 150));
+    assert_eq!(
+        (judged_on(&e, 0), judged_on(&e, 1)),
+        (vec![Perfect], vec![Perfect])
+    );
+    let e = play(&chart, both_at(T + 151));
+    assert_eq!(
+        (judged_on(&e, 0), judged_on(&e, 1)),
+        (vec![Perfect], vec![Great])
+    );
+    let e = play(&chart, both_at(T + 226));
+    assert_eq!(judged_on(&e, 0), [Great]);
+    let chart = taps_ranked(&[T], Some(common::defexrank(101)));
+    assert_eq!(judge_tap(&chart, 15_150), Some(Perfect));
+    assert_eq!(judge_tap(&chart, 15_151), Some(Great));
+}
+
+/// Source: play/JudgeProperty.java:234: each edge scales on its own, so
+/// flooring can tie two of them. Only a preset's own table must ascend
+/// (design.md "Evaluation Stages").
+#[test]
+fn derived_edges_may_tie() {
+    let style = rules::beatoraja_style();
+    let dev = device(&[0]);
+    // Edges of 1 to 4 µs at #RANK 0 (25 %): PERFECT, GREAT and GOOD floor
+    // to 0, BAD to 1.
+    let mut tiny = style.clone();
+    tiny.tables.keys.windows = JudgeWindows {
+        perfect: Window::symmetric(1),
+        great: Window::symmetric(2),
+        good: Window::symmetric(3),
+        bad: Window::symmetric(4),
+    };
+    tiny.tables.keys.ln_end = LnEndWindows {
+        perfect: TimeUs(1),
+        great: TimeUs(2),
+        good: TimeUs(3),
+    };
+    assert_eq!(tiny.validate(), Ok(()));
+    let chart = taps_ranked(&[T], Some(common::rank(0)));
+    let judge = |at: i64| {
+        let input = EvalInput {
+            events: tap_at(at),
+            device: device(&[0]),
+            start: InputStart::default(),
+            finalized: None,
+            section: None,
+        };
+        let e = evaluate(&chart, &input, &tiny).unwrap();
+        judgments(&e.events).first().map(|j| j.2)
+    };
+    assert_eq!(judge(T), Some(Perfect));
+    assert_eq!(judge(T + 1), Some(Bad));
+    // A preset's own table that does not ascend is refused.
+    let mut tied = style.clone();
+    tied.tables.scratch.windows.great = tied.tables.scratch.windows.perfect;
+    let refused = RuleError::WindowsNotAscending {
+        class: LaneClass::Scratch,
+        side: Side::Early,
+        judgment: Great,
+    };
+    assert_eq!(tied.validate(), Err(refused.clone()));
+    assert_eq!(
+        Evaluator::new(&chart, &tied, &dev, &InputStart::default(), None, 0).map(|_| ()),
+        Err(EvalError::InvalidPreset(refused))
+    );
+}
+
+/// Known difference (the preset module, the note scan's far end): a press
+/// looks at the notes inside its lane class's own BAD window and empty POOR
+/// range here. The source scans up to the farthest early edge of the scaled
+/// note and scratch tables with their MS pairs and stops at a note exactly
+/// that far (play/JudgeManager.java:189-196, :387-389). So when no note is
+/// judged by the press, a note exactly 500 ms ahead makes an empty POOR
+/// there only once a scaled early BAD edge passes 500 ms: at
+/// `#DEFEXRANK 292` (219 %, the scratch's 503.7 ms) but not at
+/// `#DEFEXRANK 288` (216 %, 496.8 ms). Here it does at both, judged or not.
+#[test]
+fn a_note_500_ms_ahead_makes_an_empty_poor_at_every_scale() {
+    let scratch = |n| {
+        let chart = ChartBuilder::new(BPM)
+            .tap(lane(0), TimeUs(T))
+            .build()
+            .unwrap();
+        with_rank(chart, Some(common::defexrank(n)))
+    };
+    // A judged scratch note: the first press judges it BAD 501 ms early, the
+    // second is exactly 500 ms before it.
+    let presses = vec![
+        press(T - 501 * MS, 0, 0),
+        release(T - 501 * MS + 10, 0, 0),
+        press(T - 500 * MS, 0, 0),
+        release(T - 500 * MS + 10, 0, 0),
+    ];
+    let e = play(&scratch(292), presses.clone());
+    assert_eq!(judged_at(&e), [(T - 501 * MS, Bad)]);
+    assert_eq!(empty_poors(&e.events), 1);
+    // At 216 % no press 501 ms early judges it; the one 500 ms early is an
+    // empty POOR on the unjudged note.
+    let e = play(&scratch(288), presses);
+    assert!(judgments(&e.events).iter().all(|j| j.3.is_none()));
+    assert_eq!(empty_poors(&e.events), 1);
+    // An unjudged key note exactly 500 ms ahead, outside its BAD window
+    // (481.8 ms at 219 %), at either scale.
+    for n in [288, 292] {
+        let chart = taps_ranked(&[T], Some(common::defexrank(n)));
+        assert_eq!(
+            empty_poors(&play(&chart, tap_at(T - 500 * MS)).events),
+            1,
+            "#DEFEXRANK {n}"
+        );
+    }
+}
+
+/// Known difference (the preset module, the note scan's far end): at
+/// `#DEFEXRANK 292` (219 %) the scratch's early BAD edge, 503.7 ms, is the
+/// source's scan bound, at which it stops (play/JudgeManager.java:387-389,
+/// the bound :189-196), so a scratch press exactly 503.7 ms early judges
+/// nothing there. Here the scratch's own BAD window, edges included, makes
+/// it BAD. The note is past the 500 ms empty POOR range either way.
+#[test]
+fn a_scratch_press_on_its_early_bad_edge_at_219_percent_is_bad() {
+    let chart = scratch_and_key(Some(common::defexrank(292)));
+    let first = |presses: Vec<PhysicalInputEvent>| {
+        let e = play(&chart, presses);
+        let pressed: Vec<_> = judgments(&e.events)
+            .into_iter()
+            .filter(|j| j.3.is_some())
+            .map(|j| (j.0, j.2, j.3))
+            .collect();
+        (pressed, empty_poors(&e.events))
+    };
+    let scratch_at = |d: i64| vec![press(T + d, 0, 0), release(T + d + 10, 0, 0)];
+    assert_eq!(
+        first(scratch_at(-503_700)),
+        (vec![(0, Bad, Some(-503_700))], 0)
+    );
+    assert_eq!(first(scratch_at(-503_701)), (Vec::new(), 0));
+    let key_at = vec![press(T - 481_800, 0, 1), release(T - 481_790, 0, 1)];
+    assert_eq!(first(key_at), (vec![(1, Bad, Some(-481_800))], 0));
+}
+
+/// Known difference (the preset module): the source plays any scale its
+/// `int` arithmetic gives (play/BMSPlayerRule.java:63), while every edge
+/// here stays within 2^32 µs. `#DEFEXRANK 1974697` scales by
+/// 1 481 022.75 %, taking the scratch's 290 ms late edge to
+/// 4 294 965 975 µs; `1974698` scales by 1 481 023.5 % and passes 2^32 µs.
+#[test]
+fn a_defexrank_past_2_pow_32_is_refused() {
+    let style = rules::beatoraja_style();
+    let dev = device(&[0]);
+    let late = |n| {
+        let chart = taps_ranked(&[T], Some(common::defexrank(n)));
+        Evaluator::new(&chart, &style, &dev, &InputStart::default(), None, 0)
+            .map(|ev| ev.table(Lane::SCRATCH).windows.bad.late)
+    };
+    assert_eq!(late(1_974_697), Ok(TimeUs(4_294_965_975)));
+    assert_eq!(late(1_974_698), Err(EvalError::InvalidRank));
 }

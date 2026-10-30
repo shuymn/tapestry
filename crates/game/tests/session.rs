@@ -369,7 +369,9 @@ fn suspend_abort_is_ended_midway_and_incomplete() {
 fn wide_perfect() -> rules::RulePreset {
     let mut p = rules::custom();
     p.id = "wide".to_owned();
-    p.windows.perfect = rules::Window::symmetric(30 * MS);
+    for t in p.tables.each_mut() {
+        t.windows.perfect = rules::Window::symmetric(30 * MS);
+    }
     p
 }
 
@@ -1729,7 +1731,9 @@ fn bms_ingest_leaves_missing_sounds_to_the_sound_table() {
 fn bad_edge(ms: i64) -> rules::RulePreset {
     let mut p = rules::custom();
     p.id = format!("bad-{ms}");
-    p.windows.bad = rules::Window::symmetric(ms * MS);
+    for t in p.tables.each_mut() {
+        t.windows.bad = rules::Window::symmetric(ms * MS);
+    }
     p
 }
 
@@ -1833,7 +1837,9 @@ fn what_if_with_an_equal_or_earlier_final_deadline_is_covered_by_the_recording()
     let (chart, one) = sixty_seconds();
     // Another preset with the same 180 ms edge, and one with 150 ms.
     let mut equal = bad_edge(180);
-    equal.windows.great = rules::Window::symmetric(50 * MS);
+    for t in equal.tables.each_mut() {
+        t.windows.great = rules::Window::symmetric(50 * MS);
+    }
     for (preset, end) in [(equal, 60_180), (bad_edge(150), 60_150)] {
         let r = under(&one, &chart, &preset);
         assert!(!r.as_played);
