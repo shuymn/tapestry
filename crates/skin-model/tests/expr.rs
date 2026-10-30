@@ -6,8 +6,9 @@ mod common;
 
 use common::{SCHEMA, options};
 use skin_model::{
-    CompileError, EnumId, ErrorKind, MAX_ELAPSED_MS, MAX_OPS, MAX_SKIN_OPS, MAX_SOURCE_BYTES,
-    Program, Scope, SkinOps, Span, State, TIMER_OFF, Ty, compile,
+    CompileError, EnumId, ErrorKind, Export, Field, FieldTy, MAX_ELAPSED_MS, MAX_OPS, MAX_SKIN_OPS,
+    MAX_SOURCE_BYTES, Program, Schema, SchemaError, Scope, SkinOps, Span, State, TIMER_OFF, Ty,
+    compile,
 };
 
 const I32_TOP: i64 = 1 << 31;
@@ -677,6 +678,26 @@ fn skin_operations_are_bounded() {
         ErrorKind::TooManySkinOps
     );
     assert_eq!(skin.total(), MAX_SKIN_OPS);
+}
+
+#[test]
+fn a_schema_error_is_the_source_of_a_compile_error() {
+    static BAD: Schema = Schema {
+        fields: &[Field {
+            name: "x",
+            ty: FieldTy::Int { lo: 1, hi: 0 },
+            export: Export::Exportable,
+        }],
+        timers: &[],
+        enums: &[],
+    };
+    let e = compile("x", &Scope::new(&BAD), Ty::Int).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::BadSchema(SchemaError::EmptyRange("x")));
+    assert_eq!(e.to_string(), "the schema is invalid");
+    let source = std::error::Error::source(&e).expect("a source");
+    assert_eq!(source.to_string(), "`x` has an empty range");
+    assert!(std::error::Error::source(source).is_none());
+    assert!(std::error::Error::source(&err("1 +", Ty::Int)).is_none());
 }
 
 #[test]

@@ -1,6 +1,9 @@
 //! Compile errors and their source spans.
 
 use super::{MAX_NAME_BYTES, MAX_NESTING, MAX_OPS, MAX_SKIN_OPS, MAX_SOURCE_BYTES, MAX_STACK};
+use std::error::Error;
+use std::fmt;
+
 use crate::schema::{SchemaError, Ty};
 
 /// Byte offsets into an expression's source, `start..end`.
@@ -37,11 +40,25 @@ impl Span {
 }
 
 /// The first error found while compiling an expression, and where.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{kind}")]
+///
+/// It displays as its kind, and its source is the kind's source, so an
+/// error chain names each cause once.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileError {
     pub span: Span,
     pub kind: ErrorKind,
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+
+impl Error for CompileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.kind.source()
+    }
 }
 
 impl CompileError {
@@ -102,6 +119,6 @@ pub enum ErrorKind {
     NotOrdered { found: Ty },
     #[error("the value can reach [{lo}, {hi}], outside the 32-bit integer range")]
     OutOfRange { lo: i64, hi: i64 },
-    #[error("the schema is invalid: {0}")]
+    #[error("the schema is invalid")]
     BadSchema(#[from] SchemaError),
 }
