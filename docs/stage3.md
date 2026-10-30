@@ -48,7 +48,7 @@ A compiled skin is a list of elements in draw order. Each element has a source (
 
 Times are integer milliseconds in files and microseconds inside. For an element with timer `T` and keyframes at `k0 < … < kn`:
 - The element is not drawn while `T` is off.
-- Local time is `t = now − start(T)`; an element without a timer uses `play`.
+- Local time is `t = now − start(T)`; an element without a timer uses `ready`, so it is drawn during the countdown as the target loaders draw untimed objects from the screen's start.
 - After the last key, one of three behaviors, named by the author: **hold** (keep the last key's values), **hide** (drawn while `t ≤ kn`, not after), or **loop from `L`** (`k0 ≤ L < kn`): for `t > L`, `t' = L + (t − L) mod (kn − L)`, so `t = kn` already shows `L`. This matches the target loaders exactly (ED `SkinObject.prepareRegion`), so the export is one-to-one.
 - Before `k0` the element is not drawn.
 - Between keys, x, y, w, h, alpha, r, g, b and angle interpolate; a field left out of a key keeps the previous key's value. Rotation and scaling use a 9-point pivot.
@@ -69,7 +69,7 @@ The skin reads a per-frame `SkinFrame`, filled from the render thread's `FrameIn
 - A BAD head starts the visual hold through its `Judged`, without `LnHeld`; the hold ends at `LnHoldEnded`.
 - `EmptyPoor` drives the empty-POOR feedback.
 
-**Timers in stage 3:** `play`, `ready`, `failed` (from `GaugeState::failed_at`, crates/eval/src/gauge.rs:29, not from a gauge value: a normal gauge at 0 has not failed), `last_note`, `full_combo`, `gauge_max`, `beat` (from the scroll map); `judge`, `judge.<grade>`, `combo`; per lane `press`, `release`, `bomb`, `hold`, `mine`; and `when(<condition>)` timers, which start on the condition's rising edge and turn off on its falling edge. A `when` condition may read state and built-in timers but not another `when` timer, so there is no cycle and no order to choose; every `when` timer is updated once per frame before any element is drawn. Every timer has a fixed slot sized in `prepare`. The reducer is reset in `prepare`, so a retry starts clean. Its tests split one sequence of effects across drains at every point and compare against explicit expected states, and cover a mid-chart countdown, a practice round and two elements sharing one `when` timer.
+**Timers in stage 3:** `play`, `ready`, `failed` (from `GaugeState::failed_at`, crates/eval/src/gauge.rs:29, not from a gauge value: a normal gauge at 0 has not failed), `last_note`, `full_combo`, `gauge_max`, `beat` (from the scroll map, on the display clock: the latest integer-beat crossing, which a STOP does not restart); `judge`, `judge.<grade>` (only the latest judgment's grade is on), `combo.up` (the field `combo` holds the count); per lane `press`, `release` (off until the play view carries lane input, S9), `bomb`, `hold`, `mine`; and `when(<condition>)` timers, which start on the condition's rising edge and turn off on its falling edge. A `when` condition may read state and built-in timers but not another `when` timer, so there is no cycle and no order to choose; every `when` timer is updated once per frame before any element is drawn. `gauge_max` reads off while the snapshot's gauge is below its maximum; if a below-maximum effect is dropped and the gauge later refills, it keeps the earlier start. Every timer has a fixed slot sized in `prepare`. The reducer is reset in `prepare`, so a retry starts clean. Its tests split one sequence of effects across drains at every point and compare against explicit expected states, and cover a mid-chart countdown, a practice round and two elements sharing one `when` timer.
 
 **Lane input in the play view** *(coordination PR, §6 S9)*. Key beams and key pads need presses without notes and releases, which no effect carries: `PlaySound` comes only for a press with a target note that has a sound (crates/eval/src/evaluator.rs:927-937). `PlayView` gains, per lane, whether it is held now and the chart times of its latest press and release, filled from the same conversion that feeds the evaluator, so a scratch reversal (a release and a press at one time, crates/eval/src/convert.rs:386-390) and a control held at the start without a press edge (convert.rs:145-150) come out right. Autoplay fills it too. It is generic input state, not skin state.
 
@@ -225,13 +225,13 @@ All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `
 | S3 | Tracks, timers and the reducer; the allocation test | [mac] |
 | S4 | Images, atlas pages, mips | [mac] |
 | S5 | Canvas, regions, widgets with the scroll copy | [mac] |
-| S6 | `skin-beatoraja`: JSON | [mac] |
+| S6 | `skin-beatoraja`: JSON; enforces the element, `when` and key limits cumulatively while building, before compiling or allocating each item | [mac] |
 | S7 | `skin-beatoraja`: Lua, sandbox, conversion, report tool | [mac] |
 | S8 | `skin-cli`: `check`, `preview`, goldens | [mac] |
 | S9 | Lane input in `PlayView`; fast and slow counts in `Tally` | coordinated with stage 2: it changes `game` and `eval`, and `PlayView` literals in render |
 | S10 | Render integration; `SimpleSkin` stays the default | after stage 2 |
 | S11 | Player: skin choice, layout settings, adjust mode | after stage 2 |
-| S12 | `skin-toml`: the authored format; nine-slice and @2x | [mac] |
+| S12 | `skin-toml`: the authored format; nine-slice and @2x; the same cumulative limits as S6 | [mac] |
 | S13 | `skin-export` and `build` | [mac] |
 | S14 | The standard skin; `SimpleSkin` removed | |
 | S15 | BGA | |
