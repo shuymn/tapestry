@@ -200,3 +200,71 @@ fn play_resets_the_ring_out_envelope() {
         assert_eq!(frames, RATE as usize / 10, "cut mid-fade: {cut_mid_fade}");
     }
 }
+
+/// Steps `e` into `out` until the device's next wake reaches `until` on
+/// its timeline.
+fn run_to(e: &mut AudioEngine, out: &mut RecordingOutput<SimDevice>, until: i64) {
+    let (_tx, mut rx) = RingBuffer::new(4);
+    while out.inner().next_wake() < TimeUs(until) {
+        e.step(out, &mut rx).unwrap();
+    }
+}
+
+#[test]
+fn a_ring_out_ends_a_seek_still_waiting() {
+    // A play sought to 10 s, whose seek waits for its frame, rung out from
+    // 1 s to 1.5 s with a BGM event left at 12 s.
+    let bgm = vec![
+        BgmEvent {
+            time: TimeUs(500 * MS),
+            sound: SoundId(0),
+        },
+        BgmEvent {
+            time: TimeUs(12_000 * MS),
+            sound: SoundId(1),
+        },
+    ];
+    let mut out = device(480, 2);
+    let mut e = AudioEngine::new(bank(), &bgm, RATE, 480, 8, 0).unwrap();
+    run_to(&mut e, &mut out, 50 * MS);
+    e.restart(TimeUs(ORIGIN));
+    let plan =
+        audio::SeekPlan::new(&e.seek_source(), &bgm, e.frame_line(), TimeUs(10_000 * MS)).unwrap();
+    e.seek(&plan).unwrap();
+    e.ring_out(TimeUs(1_000 * MS), TimeUs(1_500 * MS));
+    // Past the ring-out's end, long before the seek's frame: the play is
+    // over, as a sealed tail is, with nothing left to start.
+    run_to(&mut e, &mut out, ORIGIN + 1_600 * MS);
+    assert!(e.mixer().rung_out());
+    assert_eq!(e.mixer().sounding(), 0);
+    assert_eq!(e.bgm_left(), 0);
+    // The seek's voices and the event at 12 s never sound.
+    run_to(&mut e, &mut out, ORIGIN + 13_000 * MS);
+    let end = frame(TimeUs(1_500 * MS));
+    assert!(out.samples()[2 * end..].iter().all(|&x| x == 0.0));
+}
+
+#[test]
+fn a_fade_after_the_end_counts_as_the_end() {
+    // The fade at 3 s, after the end at 2.5 s: the output stops at 2.5 s,
+    // where the long sound is cut and the event at 2.6 s never starts.
+    let mut out = device(480, 2);
+    let mut e = AudioEngine::new(bank(), &bgm(), RATE, 480, 8, 64).unwrap();
+    e.restart(TimeUs(ORIGIN));
+    e.ring_out(TimeUs(3_000 * MS), END_AT);
+    run_to(&mut e, &mut out, ORIGIN + 3_500 * MS);
+    let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+    let end = frame(END_AT);
+    // Full gain up to the end (sound 1 at 2.2 s adds to it), silence from
+    // it on.
+    assert_eq!(left[frame(TimeUs(2_100 * MS))], full());
+    assert!(left[end - 1] >= full());
+    assert!(left[end..].iter().all(|&x| x == 0.0));
+    assert_eq!(e.mixer().sounding(), 0);
+    assert_eq!(e.bgm_left(), 0);
+    let mut starts = Vec::new();
+    e.drain_scheduled(|s| starts.push(s.kind));
+    assert!(!starts.contains(&ScheduledKind::Bgm {
+        time: TimeUs(2_600 * MS)
+    }));
+}

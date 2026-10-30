@@ -321,12 +321,14 @@ impl AudioEngine {
     /// event's time does, by the mix clock of the pass that reaches
     /// `fade_at`'s frame. From that frame the output's gain falls linearly
     /// per frame to 0 at `end_at`'s frame (a `fade_at` after `end_at` counts
-    /// as `end_at`), where every voice stops; no BGM event or key sound
-    /// starts from there. The play's audio then ends as a sealed tail does
+    /// as `end_at`), where every voice stops and a seek still waiting is
+    /// dropped; no BGM event or key sound starts from there. The play's
+    /// audio then ends as a sealed tail does
     /// (no voice, no BGM event left). Until then the BGM plays on its
     /// schedule. Allocates nothing.
     pub fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs) {
-        self.ring_out = Some((fade_at, end_at));
+        // A fade after the end is placed and rung as the end.
+        self.ring_out = Some((fade_at.min(end_at), end_at));
         self.ring_end = None;
     }
 
@@ -612,6 +614,13 @@ impl AudioEngine {
             }
             report.frames = (buf.len() / CHANNELS) as u32;
             self.mixer.render(&self.bank, buf);
+            // Rendering reached a ring-out's end: everything stopped there,
+            // a seek still waiting included, and nothing of the schedule
+            // starts any more.
+            if self.mixer.rung_out() {
+                self.seek_to = None;
+                self.next_bgm = self.bgm.len();
+            }
         })?;
         if deferred {
             self.deferred_wakes += 1;
