@@ -35,8 +35,8 @@ mod tuning;
 
 pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Refused};
 pub use audio_loop::{
-    AudioControl, AudioCounters, AudioCtl, AudioProbe, AudioWaitError, AudioWorker, Probed,
-    SWITCH_TIMEOUT, audio_control,
+    AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
+    Probed, SWITCH_TIMEOUT, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError};
 pub use error::{Chain, IoFailure};

@@ -22,7 +22,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ::audio::{AudioEngine, AudioOutput, InvalidVolume, MAX_VOLUME, OutputError, ScheduledKind};
+use ::audio::{
+    AudioEngine, AudioOutput, BgmSchedule, InvalidVolume, MAX_VOLUME, OutputError, ScheduledKind,
+    SoundBank,
+};
 use bms_model::TimeUs;
 
 use crate::sound::{AudioQueue, audio_link};
@@ -33,6 +36,9 @@ const CONTROL_CAPACITY: usize = 16;
 /// Retired queues waiting for the game thread: one, since a play is
 /// started only once the queue the previous start retired has come back.
 const RETIRED_CAPACITY: usize = 1;
+/// Replaced banks waiting for the game thread: one, since a load waits for
+/// its answer before another is sent.
+const LOADS_CAPACITY: usize = 1;
 
 /// How long the game thread waits for the audio thread to take a play
 /// switch: far beyond a period, which is when it takes one.
@@ -49,9 +55,53 @@ pub enum AudioWaitError {
     Timeout,
 }
 
+/// Why the audio thread did not take another chart's sounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AudioLoadError {
+    /// The audio thread did not take them.
+    #[error(transparent)]
+    Wait(#[from] AudioWaitError),
+    /// An earlier load, which timed out, is still not answered: no other
+    /// is sent until it is.
+    #[error("the audio thread has not answered the previous load")]
+    Busy,
+    /// The bank was decoded at another rate than the output's.
+    #[error("the sound bank is at {bank} Hz but the output runs at {output} Hz")]
+    RateMismatch {
+        /// The bank's rate.
+        bank: u32,
+        /// The output's rate.
+        output: u32,
+    },
+}
+
+/// A bank and schedule the audio thread hands back to be freed on the game
+/// thread: the ones a load replaced, or the load's own when the engine
+/// refused them.
+#[derive(Debug)]
+struct Retired {
+    // Held only to be dropped where the game thread takes them.
+    _bank: Arc<SoundBank>,
+    _schedule: BgmSchedule,
+    /// The load it answers.
+    id: u64,
+    /// Whether the engine took the load.
+    taken: bool,
+}
+
 /// What the game thread tells the audio thread.
 #[derive(Debug)]
 pub enum AudioCtl {
+    /// Another chart: its bank and audio schedule replace the engine's,
+    /// and nothing sounds until the next play. Between plays only.
+    Load {
+        /// The chart's sounds, decoded at the output's rate.
+        bank: Arc<SoundBank>,
+        /// Its BGM, or the schedule that stands for it (autoplay).
+        schedule: BgmSchedule,
+        /// The load's number, which its answer carries.
+        id: u64,
+    },
     /// A play starts: chart time 0 at `origin` on the output's timeline,
     /// key sounds from `queue`.
     Play {
@@ -172,6 +222,15 @@ pub struct AudioControl {
     retired: rtrb::Consumer<AudioQueue>,
     /// Whether a start was sent whose retired queue has not come back.
     in_flight: bool,
+    /// Banks and schedules a load replaced, freed here.
+    loads: rtrb::Consumer<Retired>,
+    /// The number of the last load sent.
+    load_id: u64,
+    /// A load sent and not yet answered, by number: no other is sent
+    /// while it is, so at most one answer is ever on its way.
+    outstanding: Option<u64>,
+    /// The engine's bank rate: a load at another rate is refused here.
+    rate: u32,
     shared: Arc<Shared>,
     generation: u64,
     /// The number of the latest queue change asked for.
@@ -184,6 +243,9 @@ pub struct AudioWorker {
     engine: AudioEngine,
     ctl: rtrb::Consumer<AudioCtl>,
     retired: rtrb::Producer<AudioQueue>,
+    loads: rtrb::Producer<Retired>,
+    /// A replaced bank the full return queue did not take.
+    unreturned_load: Option<Retired>,
     shared: Arc<Shared>,
     queue: AudioQueue,
     generation: u64,
@@ -207,12 +269,18 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
     engine.stop();
     let (ctl_tx, ctl_rx) = rtrb::RingBuffer::new(CONTROL_CAPACITY);
     let (ret_tx, ret_rx) = rtrb::RingBuffer::new(RETIRED_CAPACITY);
+    let (loads_tx, loads_rx) = rtrb::RingBuffer::new(LOADS_CAPACITY);
+    let rate = engine.bank().rate();
     let shared = Arc::new(Shared::default());
     (
         AudioControl {
             ctl: ctl_tx,
             retired: ret_rx,
             in_flight: false,
+            loads: loads_rx,
+            load_id: 0,
+            outstanding: None,
+            rate,
             shared: Arc::clone(&shared),
             generation: 0,
             queue_change: 0,
@@ -221,6 +289,8 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
             engine,
             ctl: ctl_rx,
             retired: ret_tx,
+            loads: loads_tx,
+            unreturned_load: None,
             shared,
             // Before the first play: a queue nothing sends to.
             queue: audio_link(1).1,
@@ -301,6 +371,83 @@ impl AudioControl {
             generation,
         });
         Ok(())
+    }
+
+    /// Hands another chart's `bank` and `schedule` to the engine, between
+    /// plays, and waits until the audio thread has taken them: what they
+    /// replace comes back and is freed here, never on the audio thread.
+    /// Nothing sounds until the next [`play`](Self::play).
+    ///
+    /// # Errors
+    ///
+    /// [`AudioLoadError::RateMismatch`] for a bank at another rate than the
+    /// output's, sent nowhere; [`AudioWaitError::Gone`] once the worker is
+    /// gone, and [`AudioWaitError::Timeout`] after [`SWITCH_TIMEOUT`]. A load
+    /// that timed out stays outstanding: the engine may still take it, and
+    /// until its answer comes back, which is freed here, every later load is
+    /// refused with [`AudioLoadError::Busy`] and sends nothing. So at most
+    /// one load is ever queued or answered, and the audio thread always has
+    /// room for its answer.
+    pub fn load(
+        &mut self,
+        bank: Arc<SoundBank>,
+        schedule: BgmSchedule,
+    ) -> Result<(), AudioLoadError> {
+        if bank.rate() != self.rate {
+            return Err(AudioLoadError::RateMismatch {
+                bank: bank.rate(),
+                output: self.rate,
+            });
+        }
+        // The answer to a load that timed out is freed first.
+        if self.outstanding.is_some() {
+            if let Ok(late) = self.loads.pop() {
+                if Some(late.id) == self.outstanding {
+                    self.outstanding = None;
+                }
+                drop(late);
+            }
+            if self.outstanding.is_some() {
+                return Err(if self.loads.is_abandoned() {
+                    AudioWaitError::Gone.into()
+                } else {
+                    AudioLoadError::Busy
+                });
+            }
+        }
+        if self.ctl.is_abandoned() {
+            return Err(AudioWaitError::Gone.into());
+        }
+        self.load_id += 1;
+        let id = self.load_id;
+        self.outstanding = Some(id);
+        self.send(AudioCtl::Load { bank, schedule, id });
+        let deadline = Instant::now() + SWITCH_TIMEOUT;
+        loop {
+            if let Ok(retired) = self.loads.pop() {
+                let (answered, taken) = (retired.id, retired.taken);
+                drop(retired);
+                if answered == id {
+                    self.outstanding = None;
+                    // The engine refuses only another rate, checked above.
+                    return if taken {
+                        Ok(())
+                    } else {
+                        Err(AudioLoadError::RateMismatch {
+                            bank: self.rate,
+                            output: self.rate,
+                        })
+                    };
+                }
+            }
+            if self.loads.is_abandoned() {
+                return Err(AudioWaitError::Gone.into());
+            }
+            if Instant::now() >= deadline {
+                return Err(AudioWaitError::Timeout.into());
+            }
+            std::thread::sleep(Duration::from_micros(500));
+        }
     }
 
     /// Keeps `periods` periods queued on the output from the audio thread's
@@ -424,8 +571,48 @@ impl AudioWorker {
         {
             self.unreturned = Some(old);
         }
-        while let Ok(msg) = self.ctl.pop() {
+        if let Some(old) = self.unreturned_load.take()
+            && let Err(rtrb::PushError::Full(old)) = self.loads.push(old)
+        {
+            self.unreturned_load = Some(old);
+        }
+        loop {
+            // An answer not yet handed back is never replaced: a load behind
+            // it waits in the queue, still owned by it, until the return
+            // queue takes the answer.
+            if self.unreturned_load.is_some()
+                && matches!(self.ctl.peek(), Ok(AudioCtl::Load { .. }))
+            {
+                break;
+            }
+            let Ok(msg) = self.ctl.pop() else {
+                break;
+            };
             match msg {
+                AudioCtl::Load { bank, schedule, id } => {
+                    self.steady_from = None;
+                    while self.queue.commands().pop().is_ok() {}
+                    let retired = match self.engine.replace(bank, schedule) {
+                        Ok((bank, schedule)) => Retired {
+                            _bank: bank,
+                            _schedule: schedule,
+                            id,
+                            taken: true,
+                        },
+                        Err((bank, schedule)) => Retired {
+                            _bank: bank,
+                            _schedule: schedule,
+                            id,
+                            taken: false,
+                        },
+                    };
+                    // One load is outstanding at a time, so the queue has
+                    // room; were it full, the answer would wait here, still
+                    // owned, rather than be freed on this thread.
+                    if let Err(rtrb::PushError::Full(retired)) = self.loads.push(retired) {
+                        self.unreturned_load = Some(retired);
+                    }
+                }
                 AudioCtl::Play {
                     origin,
                     queue,

@@ -10,12 +10,13 @@ use std::path::PathBuf;
 
 use lexopt::{Arg, Parser};
 
-pub const USAGE: &str =
-    "usage: tapestry play [--auto] <chart.bms> | tapestry keys | tapestry --version";
+pub const USAGE: &str = "usage: tapestry [--auto] | tapestry play [--auto] <chart.bms> | tapestry keys | tapestry --version";
 
 /// What the command line asks for.
 #[derive(Debug)]
 pub enum Command {
+    /// No command, or `--auto` alone: song selection.
+    Select(Select),
     /// `--version`.
     Version,
     /// `keys`: the key config.
@@ -39,6 +40,15 @@ pub struct Play {
     pub input: crate::PlayInput,
     #[cfg(feature = "dev-tools")]
     pub dev: crate::dev::Options,
+}
+
+/// Song selection's arguments.
+#[derive(Debug)]
+pub struct Select {
+    /// The devices, or autoplay (`--auto`).
+    pub input: crate::PlayInput,
+    #[cfg(feature = "dev-tools")]
+    pub dev: crate::dev::SelectOptions,
 }
 
 /// `keys`' arguments.
@@ -90,7 +100,12 @@ impl From<lexopt::Error> for UsageError {
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageError> {
     let mut p = Parser::from_args(args);
     let command = match p.next()? {
-        None => return Err(UsageError::Usage(USAGE.to_owned())),
+        None => Command::Select(select(&mut p, None)?),
+        Some(Arg::Long(name)) if is_select_option(name) => {
+            // The name borrows the parser, which the options need.
+            let name = name.to_owned();
+            Command::Select(select(&mut p, Some(name))?)
+        }
         Some(Arg::Long("version")) => {
             end(&mut p)?;
             Command::Version
@@ -115,6 +130,50 @@ pub(crate) fn end(p: &mut Parser) -> Result<(), UsageError> {
         None => Ok(()),
         Some(extra) => Err(extra.unexpected().into()),
     }
+}
+
+/// Whether `--<name>` is an option of song selection: `--auto`, and the
+/// development options.
+fn is_select_option(name: &str) -> bool {
+    name == "auto"
+        || (cfg!(feature = "dev-tools") && name.starts_with("dev-") && name != "dev-tools-probe")
+}
+
+/// Song selection's options, from `first` (the long option already read,
+/// without its dashes) on.
+fn select(p: &mut Parser, first: Option<String>) -> Result<Select, UsageError> {
+    let mut auto = false;
+    #[cfg(feature = "dev-tools")]
+    let mut options = crate::dev::SelectOptions::default();
+    let mut pending = first;
+    loop {
+        let name = match pending.take() {
+            Some(name) => name,
+            None => match p.next()? {
+                None => break,
+                Some(Arg::Long(name)) => name.to_owned(),
+                Some(other) => return Err(other.unexpected().into()),
+            },
+        };
+        match name.as_str() {
+            // A second `--auto` is unknown, as in `play`.
+            "auto" if !auto => auto = true,
+            #[cfg(feature = "dev-tools")]
+            n if n.starts_with("dev-") => options.take(n, p)?,
+            _ => return Err(UsageError::Unknown(format!("--{name}"))),
+        }
+    }
+    #[cfg(feature = "dev-tools")]
+    options.check(auto)?;
+    Ok(Select {
+        input: if auto {
+            crate::PlayInput::Autoplay
+        } else {
+            crate::PlayInput::Devices
+        },
+        #[cfg(feature = "dev-tools")]
+        dev: options,
+    })
 }
 
 fn play(p: &mut Parser) -> Result<Play, UsageError> {
@@ -228,14 +287,71 @@ mod tests {
     #[test]
     fn a_double_dash_ends_the_options() {
         assert_eq!(chart(&["play", "--", "-x.bms"]).chart, Path::new("-x.bms"));
-        // A lone `--` is no argument at all.
-        assert_eq!(
-            parsed(&["--"]).unwrap_err(),
-            UsageError::Usage(USAGE.to_owned())
-        );
+        // A lone `--` is no argument at all: song selection.
+        assert!(matches!(parsed(&["--"]), Ok(Command::Select(_))));
         assert_eq!(
             parsed(&["play", "--"]).unwrap_err(),
             UsageError::Usage(format!("play needs a chart file\n{USAGE}"))
+        );
+    }
+
+    /// No arguments open song selection with the devices, `--auto` alone
+    /// with autoplay; anything else there is unknown and exits 2.
+    #[test]
+    fn no_arguments_parse_to_song_selection() {
+        let input = |args: &[&str]| match parsed(args) {
+            Ok(Command::Select(s)) => s.input,
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert!(matches!(input(&[]), PlayInput::Devices));
+        assert!(matches!(input(&["--auto"]), PlayInput::Autoplay));
+        assert_eq!(
+            parsed(&["--auto", "--auto"]).unwrap_err(),
+            unknown("--auto")
+        );
+        assert_eq!(parsed(&["--auto", "a.bms"]).unwrap_err(), unknown("a.bms"));
+        assert_eq!(parsed(&["--auto=1"]).unwrap_err(), unknown("--auto=1"));
+        assert_eq!(parsed(&["--x"]).unwrap_err(), unknown("--x"));
+        assert_eq!(parsed(&["--auto", "-x"]).unwrap_err(), unknown("-x"));
+    }
+
+    /// Song selection's development options, and their refusals.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn selection_takes_its_development_options() {
+        let select = |args: &[&str]| match parsed(args) {
+            Ok(Command::Select(s)) => s,
+            other => panic!("{args:?}: {other:?}"),
+        };
+        let s = select(&[
+            "--auto",
+            "--dev-headless",
+            "--dev-select",
+            "pick=a.bms,enter,back,close",
+            "--dev-rescan-ms=50",
+            "--dev-frames",
+            "d",
+        ]);
+        assert!(s.dev.headless);
+        assert_eq!(s.dev.rescan_ms, Some(50));
+        assert_eq!(s.dev.frames.as_deref(), Some(Path::new("d")));
+        assert_eq!(
+            s.dev.script,
+            Some(crate::dev::SelectScript::parse("pick=a.bms,enter,back,close").unwrap())
+        );
+        let headless = UsageError::Usage("--dev-headless needs --auto and --dev-select".to_owned());
+        assert_eq!(parsed(&["--dev-headless"]).unwrap_err(), headless);
+        assert_eq!(
+            parsed(&["--dev-headless", "--dev-select", "close"]).unwrap_err(),
+            headless
+        );
+        assert!(matches!(
+            parsed(&["--dev-select", "jump"]),
+            Err(UsageError::Usage(_))
+        ));
+        assert_eq!(
+            parsed(&["--dev-nothing"]).unwrap_err(),
+            unknown("--dev-nothing")
         );
     }
 
@@ -273,7 +389,8 @@ mod tests {
             parsed(&["play", "--auto", "a.bms", "--auto"]).unwrap_err(),
             unknown("--auto")
         );
-        assert_eq!(parsed(&["--auto", "play"]).unwrap_err(), unknown("--auto"));
+        // Before a command, `--auto` is selection's: `play` is unknown there.
+        assert_eq!(parsed(&["--auto", "play"]).unwrap_err(), unknown("play"));
         assert_eq!(
             parsed(&["play", "--auto=1", "a.bms"]).unwrap_err(),
             unknown("--auto=1")

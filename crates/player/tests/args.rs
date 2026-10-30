@@ -49,19 +49,77 @@ fn unknown_argument_still_exits_two() {
     assert_unknown(&["play", "a.bms", "b.bms"], "b.bms");
     assert_unknown(&["keys", "--no-such-flag"], "--no-such-flag");
     assert_unknown(&["keys", "a.bms"], "a.bms");
+    // Song selection takes `--auto` once and nothing else.
+    assert_unknown(&["a.bms"], "a.bms");
+    assert_unknown(&["--auto", "a.bms"], "a.bms");
+    assert_unknown(&["--auto", "--auto"], "--auto");
+    assert_unknown(&["--auto", "--no-such-flag"], "--no-such-flag");
+}
+
+/// No arguments open song selection, which needs the data folder first:
+/// without one the run fails naming why (exit 1), where it once printed
+/// the usage (exit 2).
+#[test]
+fn no_arguments_open_song_selection() {
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .env("LOCALAPPDATA", "")
+        .output()
+        .expect("run tapestry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("LOCALAPPDATA is not set"), "{stderr}");
+    assert!(!stderr.contains("usage:"), "{stderr}");
+}
+
+/// While a player process holds the library of a data root (its lock on
+/// `library.db.lock`, which the test takes as that process would), a
+/// second one on the same root is refused naming the folder, before it
+/// opens `library.db` or does anything else: the database, here a file
+/// no SQLite would read, is untouched, no settings are written and no
+/// window opens.
+#[test]
+fn second_process_is_refused_before_the_library_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tapestry");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("library.db");
+    std::fs::write(&db, b"not a database").unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("library.db.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let started = std::time::Instant::now();
+    let out = run_in(&[], dir.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "another tapestry is running on the data folder {}",
+            root.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&db).unwrap(), b"not a database");
+    assert!(!root.join("device.toml").exists());
+    assert!(!root.join("library.db-wal").exists());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    drop(lock);
 }
 
 #[test]
 fn play_without_chart_is_an_error() {
-    for args in [&["play"][..], &[]] {
-        let out = run(args);
-        assert_eq!(out.status.code(), Some(2), "{args:?}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("usage: tapestry play"), "{stderr}");
-        if !args.is_empty() {
-            assert!(stderr.contains("play needs a chart file"), "{stderr}");
-        }
-    }
+    let out = run(&["play"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("usage: tapestry [--auto] | tapestry play"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("play needs a chart file"), "{stderr}");
 }
 
 /// A chart that does not exist is refused before any window opens, in a
@@ -184,12 +242,14 @@ fn auto_is_a_play_option() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("play needs a chart file"), "{stderr}");
     assert!(
-        stderr.contains("usage: tapestry play [--auto] <chart.bms>"),
+        stderr.contains("tapestry play [--auto] <chart.bms>"),
         "{stderr}"
     );
     assert_unknown(&["play", "--auto", "--auto", "a.bms"], "--auto");
     assert_unknown(&["play", "--auto", "a.bms", "--auto"], "--auto");
-    assert_unknown(&["--auto", "play", "a.bms"], "--auto");
+    // Before a command, `--auto` opens song selection, which takes no
+    // command.
+    assert_unknown(&["--auto", "play", "a.bms"], "play");
 }
 
 #[cfg(not(feature = "dev-tools"))]
@@ -259,6 +319,7 @@ fn usage_errors_touch_no_data_root() {
         &["play"],
         &["play", "a.bms", "b.bms"],
         &["keys", "a.bms"],
+        &["--auto", "a.bms"],
     ];
     #[cfg(feature = "dev-tools")]
     const DEV_CASES: &[&[&str]] = &[

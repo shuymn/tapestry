@@ -1,9 +1,9 @@
-//! The audio thread neither allocates nor frees across retries: each
-//! play's command queue goes back to the game thread to be dropped there,
-//! and the control messages travel through a preallocated queue. Only the
-//! audio loop's steps are counted (see `counting`); this file holds a
-//! single test. Profiles and the positive control: design.md "Scope of No
-//! Allocation".
+//! The audio thread neither allocates nor frees across retries and loads:
+//! each play's command queue, and each bank a load replaces, goes back to
+//! the game thread to be dropped there, and the control messages travel
+//! through a preallocated queue. Only the audio loop's steps are counted
+//! (see `counting`); this file holds a single test. Profiles and the
+//! positive control: design.md "Scope of No Allocation".
 
 mod common;
 mod counting;
@@ -46,6 +46,27 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         let origin = TimeUs((100 + play * 400) * MS);
         // Between plays the queue deepens to three periods and back.
         control.request_queued_periods(if play % 2 == 0 { 3 } else { 2 });
+        // Before the third play another chart.s sounds are loaded: the
+        // audio thread swaps them in and hands the old ones back.
+        if play == 2 {
+            // First one that times out while the audio thread stalls: the
+            // thread takes it late, in a counted step, and its answer is
+            // freed by the next load, on the game thread.
+            assert_eq!(
+                control.load(bank(&chart), audio::BgmSchedule::new(chart.bgm.clone())),
+                Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+            );
+            steps(&mut worker, 1);
+            let next = bank(&chart);
+            let schedule = chart.bgm.clone();
+            std::thread::scope(|s| {
+                let load = s.spawn(|| control.load(next, audio::BgmSchedule::new(schedule)));
+                while !load.is_finished() {
+                    steps(&mut worker, 1);
+                }
+                load.join().unwrap().unwrap();
+            });
+        }
         let (mut sink, queue) = audio_link_at(64, origin);
         control.play(origin, queue).unwrap();
         for k in 0..3 {
