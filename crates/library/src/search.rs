@@ -178,7 +178,9 @@ fn order(sort: Sort, by_folder: bool) -> String {
     if by_folder {
         terms.push_str("c.folder, ");
     }
-    let by_title = "c.title_key NULLS LAST, c.path";
+    // The terms of the `charts_title` index, so the unfiltered title order
+    // reads it rather than sorting every row.
+    let by_title = "c.title_key IS NULL, c.title_key, c.path";
     match sort {
         Sort::Title => terms.push_str(by_title),
         Sort::Artist => {
@@ -262,6 +264,25 @@ mod tests {
         );
         // Counted after normalization: one character of NFKC "ｶﾞ".
         assert_eq!(Filter::of("ｶﾞa"), Filter::Like("%がa%".to_owned()));
+    }
+
+    #[test]
+    fn the_title_order_reads_its_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::create(&conn).unwrap();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(3)).unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ")
+        };
+        let title = plan(&format!(
+            "SELECT c.id FROM charts c ORDER BY {} LIMIT 200",
+            order(Sort::Title, false)
+        ));
+        assert!(title.contains("charts_title"), "{title}");
+        assert!(!title.contains("TEMP B-TREE"), "{title}");
     }
 
     #[test]

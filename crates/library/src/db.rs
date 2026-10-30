@@ -114,6 +114,7 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              folder TEXT NOT NULL
          );
          CREATE INDEX charts_root ON charts(root);
+         CREATE INDEX charts_title ON charts(title_key IS NULL, title_key, path);
          CREATE VIRTUAL TABLE charts_fts USING fts5(
              norm_text,
              content = 'charts',

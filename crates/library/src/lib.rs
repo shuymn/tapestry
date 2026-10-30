@@ -14,6 +14,9 @@
 //!   searched fields normalized and joined ([`Search`]); the normalized
 //!   title and artist, by which [`Sort::Title`] and [`Sort::Artist`] order;
 //!   and the folder of the path, by which [`Search::by_folder`] groups.
+//!   Indexed by `root`, and by `(title_key IS NULL, title_key, path)`, the
+//!   [`Sort::Title`] order, so an unfiltered list reads only the rows it
+//!   returns.
 //! - `charts_fts(norm_text)`: an FTS5 trigram index of `charts.norm_text`,
 //!   kept in the same transactions as `charts` by triggers.
 //!

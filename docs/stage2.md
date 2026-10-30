@@ -143,7 +143,7 @@ egui comes with the first form-like screen.
 | Version | PR | Adds |
 | --- | --- | --- |
 | 1 | PR12 | `roots`; `charts(path UNIQUE, size, mtime_ns, sha256, md5, header fields)` |
-| 2 | PR13 | `norm_text`, `charts_fts` |
+| 2 | PR13 | `norm_text` (the searched fields normalized and joined); `title_key` and `artist_key` (normalized sort keys, so full-width and katakana titles sort with the rest), with the index `charts_title` for the unfiltered title order; `folder` (the path's folder, for grouping without string work per row); `charts_fts` |
 | 3 | PR18 | `meta`, `scores`, `counted` |
 | 4 | PR25 | `loudness` |
 
