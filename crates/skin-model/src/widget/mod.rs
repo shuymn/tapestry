@@ -14,10 +14,12 @@ pub(crate) mod scroll;
 use bms_model::TimeUs;
 
 use crate::atlas::uv::{Cycle, FrameUv, UvTable};
+use crate::expr::{Program, State};
 use crate::place::{Affine, LaneMap};
 use crate::play::Play;
 use crate::play::timers::elapsed_us;
 use crate::quad::{Filter, Quad, QuadBatch, RunKey};
+use crate::track::{Sample, Track};
 
 /// An image as a build reads it: its first frame in the uv table, its
 /// frame count, cycle and filter, copied so a build never reads the sheet.
@@ -98,6 +100,25 @@ impl Brush {
             },
         )
     }
+}
+
+/// `track` on the timer in `slot` at `now`, with the µs since that timer
+/// started: nothing while the timer is off, `visible` is false, or the
+/// track does not draw.
+pub(crate) fn sample(
+    play: &Play,
+    now: TimeUs,
+    state: &State<'_>,
+    slot: usize,
+    visible: Option<&Program>,
+    track: &Track,
+) -> Option<(i64, Sample)> {
+    let start = play.timer_at(slot)?;
+    if visible.is_some_and(|v| !v.eval_bool(state)) {
+        return None;
+    }
+    let t = elapsed_us(now, start);
+    Some((t, track.sample(t)?))
 }
 
 /// Two colors multiplied component by component.

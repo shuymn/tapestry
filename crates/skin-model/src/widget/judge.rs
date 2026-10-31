@@ -18,7 +18,6 @@ use crate::expr::{Program, State};
 use crate::layout::Anchor;
 use crate::place::{Affine, Bounds, LaneMap, union};
 use crate::play::schema::{Grade, field, timer};
-use crate::play::timers::elapsed_us;
 use crate::quad::{Blend, ClipId, QuadBatch, RunKey};
 use crate::skin::{MAX_COORD, TimerRef, radians};
 use crate::track::Track;
@@ -304,11 +303,7 @@ fn sample(
     slot: usize,
     visible: Option<&Program>,
 ) -> Option<crate::track::Sample> {
-    let start = d.at.play.timer_at(slot)?;
-    if visible.is_some_and(|v| !v.eval_bool(d.state)) {
-        return None;
-    }
-    track.sample(elapsed_us(d.at.now, start))
+    super::sample(d.at.play, d.at.now, d.state, slot, visible, track).map(|(_, s)| s)
 }
 
 impl Judge {

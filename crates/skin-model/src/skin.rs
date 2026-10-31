@@ -14,7 +14,6 @@ use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
 use crate::place::{Bind, Bounds, Fill, Place, Placement, Regions, union};
 use crate::play::schema::timer::BUILTIN;
-use crate::play::timers::elapsed_us;
 use crate::play::{Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::schema::Ty;
@@ -25,7 +24,7 @@ use crate::widget::judge::{
     ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgeSlot,
 };
 use crate::widget::lanes::{Draw, LANE_QUADS, LANE_RESERVED, Lanes, LanesDef, LanesError, Side};
-use crate::widget::{Brush, Frame, ImageRef};
+use crate::widget::{Brush, Frame, ImageRef, sample};
 
 /// The most elements one skin may hold.
 pub const MAX_ELEMENTS: usize = 16_384;
@@ -962,13 +961,14 @@ impl Skin {
             if !placement.region(e.region).visible {
                 continue;
             }
-            let Some(start) = play.timer_at(e.slot) else {
-                continue;
-            };
-            if e.visible.as_ref().is_some_and(|v| !v.eval_bool(&state)) {
-                continue;
-            }
-            let Some(s) = e.track.sample(elapsed_us(frame.now, start)) else {
+            let Some((t, s)) = sample(
+                play,
+                frame.now,
+                &state,
+                e.slot,
+                e.visible.as_ref(),
+                &e.track,
+            ) else {
                 continue;
             };
             let affine = placement.affine(e.region, e.fill);
@@ -1003,7 +1003,7 @@ impl Skin {
                             at,
                             gauges: frame.gauges,
                             shown: frame.gauge,
-                            t: elapsed_us(frame.now, start),
+                            t,
                         };
                         g.draw(&d, s.rect, &brush, out);
                     }
