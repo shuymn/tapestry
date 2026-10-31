@@ -404,9 +404,10 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 **Restore.**
 - **Schedule.** The BGM plus autoplay key sounds for every note that is not a target: before the section, after its end, and long notes crossing either edge.
 - **Audio.** The seek is split by thread.
-  - **Planning, before the countdown, off the audio thread.** `SeekPlan::new` takes the engine's `SeekSource` (its id, bank, voice count and a hash of its schedule; taken before the engine moves to the audio thread), the schedule, the play's `FrameLine` and `t`, and refuses a schedule whose hash differs. It decides the schedule's starts, stops, steals and positions before `t`'s frame without summing samples, admitting at most `MAX_PENDING_STARTS` starts per engine pass as playing does. It costs O(starts before `t` × voices): about 2 ms for a dense 2-minute chart and 0.2 s for 500,000 starts with 256 voices.
-  - **The plan.** It holds the sounding voices and releases: two 32-byte slots per voice, 16 KiB at 256 voices, whatever the chart. It travels with the play command.
-  - **On the audio thread.** `AudioEngine::seek(&plan)` copies the slots into slots preallocated with the mixer, bounded by the voice count, and allocates nothing. It refuses, with nothing changed, a plan from another engine, one on a line of another rate or period, and one whose frame is already written; the caller plans again.
+  - **Planning, at the round's opening and before its lead-in, off the audio thread.** The round's recording opens `RESTORE_AHEAD` (200 ms, tuned by playing) before its lead-in, so the origin is fixed and the plan is made for the lead-in's start on it; a second plan for `RESTORE_RETRY` (500 ms) later covers a missed origin, a game thread slower than those 200 ms minus the queued output. A plan for the opening itself would always be late: the opening chooses the origin, and the output is already written ahead of that moment. Input in the extra 200 ms comes before `start − lead_in`, so it feeds input conversion only (D13), and live and batch evaluation agree. `SeekPlan::new` takes the engine's `SeekSource` (its id, bank, voice count and a hash of its schedule; taken before the engine moves to the audio thread), the schedule, the play's `FrameLine` and `t`, and refuses a schedule whose hash differs. It decides the schedule's starts, stops, steals and positions before `t`'s frame without summing samples, admitting at most `MAX_PENDING_STARTS` starts per engine pass as playing does. It costs O(starts before `t` × voices): about 2 ms for a dense 2-minute chart and 0.2 s for 500,000 starts with 256 voices.
+  - **The plan.** It holds the sounding voices and releases: two 32-byte slots per voice, 16 KiB at 256 voices, whatever the chart. Both plans travel boxed on the play command (`AudioCtl::Play`, which carries the play's gain too), so no pass runs between the start and the seek. The box stays with the worker and goes back to the game thread with the play's retired queue at the next play, where it is freed.
+  - **On the audio thread.** `AudioEngine::seek(&plan)` copies the slots into slots preallocated with the mixer, bounded by the voice count, and allocates nothing. It refuses, with nothing changed, a plan from another engine, one on a line of another rate or period, and one whose frame is already written. The worker restarts the play, then takes the first plan, the fallback only when the first is late, and otherwise stops the schedule: a refused restore is an explicit silent play, the BGM never runs from chart time 0, and key sounds still play. It publishes the outcome by generation (first, fallback, or the refusal), and the player prints it after the play. The frame line the plans are made on is the audio thread's: after each step it publishes, together, its written frames and where its clock puts a play's origin.
+- **Refusals before the round.** Before recording opens, the round's schedule is checked against the engine's `SeekSource` (`RestoreError::Schedule`), and a rig without the plan's source refuses a round (`NotPrepared`): nothing opened, so there is no start and no record. A plan that fails after the opening (`RestoreError::Plan`) closes recording again, as a logic refusal does.
   - **Placement.** At the pass that reaches `t`'s frame on its own mix clock, the voices enter partway into their sounds. The plan's own admissions there count toward that pass's limit.
   - **A moved clock.** If the clock moved since planning, the voices move with `t`'s frame. A start the plan left out waits until the voices enter and never starts before that frame.
   - **What is exact.** The output equals mixing from the start, sample for sample, when from planning to `t`'s frame the clock maps chart times as the plan's line does, every pass writes the line's period, and no key sound is started; a property test checks it under a steady clock. Otherwise the result is degraded but bounded. A moved clock moves the voices with `t`'s frame, and starts land where it puts them, never before that frame, heads intact. A different pass size (a recovery write) or key sounds taking pending starts change only which pass admits the starts beyond `MAX_PENDING_STARTS` in one pass, and the voices those start, cut or steal; each still starts at a pass's first frame, head intact. These are not modelled.
@@ -426,33 +427,36 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
 - The step at 19.680 s publishes `fresh − 1 µs` = 19.679999 s, which does not cover the deadline.
 - The step at 19.681 s publishes 19.680999 s: completion and the close happen there, and `RingOut { fade_at: 20.681 s, end_at: 21.181 s }` is sent.
 - The rendered fade covers output frames from 20.681 s to 21.181 s on the play's mix clock: 24,000 frames, whatever the audio period.
-- The engine may report done before 21.181 s, since it mixes ahead (with 10 ms periods and two queued, the wake at 21.160 s can render past 21.181 s). The ring-out ends at the first step at or after 21.181 s with the report in, so with aligned steps the record is saved in the step at 21.181 s and round 2's countdown begins at 21.182 s (round 1's timeline), at its own chart time 8.000 s.
+- The engine may report done before 21.181 s, since it mixes ahead (with 10 ms periods and two queued, the wake at 21.160 s can render past 21.181 s). The ring-out ends at the first step at or after 21.181 s with the report in, so with aligned steps the record is saved in the step at 21.181 s and round 2's recording opens and its countdown begins at 21.182 s (round 1's timeline), at its own chart time 7.800 s; its lead-in's audio starts at 8.000 s.
 - A BGM event at 20.5 s starts during the ring-out; one at 30 s never starts.
-- A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's countdown, restored by `seek`, at full gain.
+- A 60 s BGM voice that started at 5 s is playing 3 s in at round 2's lead-in start, restored by `seek`, at full gain.
 
-**Setup.** The practice screen picks the section by measure, the speed, the lead-in (2 s, tuned by playing), the initial gauge, and repeat. `--dev-start <ms>` and a scenario step exist in development builds.
+**Setup.** The practice screen picks the section by measure, the speed, the lead-in (`LEAD_IN`, 2 s, tuned by playing), the initial gauge, and repeat. `--dev-start <ms>` and a scenario step exist in development builds.
+- **The chart's end** must stay past the last note at every speed: `practice::chart_end(chart_at_speed, speed)` is `ceil((r_max + 1) × k/20)` in 1× time, where `r_max` is the latest note end of the chart as loaded at that speed, so `floor(end × 20/k) ≥ r_max + 1`. Adding 1 µs to the last 1× end is not enough: at 150 %, a last end at exact time 0.9 µs maps to `floor(0.6) = 0`, and `floor(1 × 2/3)` is also 0.
+- **No targets.** A section none of whose taps or long notes is a target is refused before evaluation (`PracticeError::NoTargets`), a mine-only section included.
+- **One target rule.** `eval::Section::is_target` is the rule the evaluator, the round's schedule and the screen's hidden notes share.
 
 ### D16. #43 in practice: windows sized by the section's final deadline
 
 **The window.**
 - Mapped times are already real time, so nothing is divided by speed again.
 - Admission works as for a full play: the plan's probe `Evaluator` is built with the section, and its `final_deadline()` goes into `window_inputs`, with the existing input-offset allowance (crates/game/src/session.rs:601-610).
-- The window runs from `s_m − lead_in`, where `s_m = floor(start × 20/k)`, to that deadline.
+- The window runs from `s_m − lead_in − RESTORE_AHEAD`, where `s_m = floor(start × 20/k)`, to that deadline: recording opens 200 ms before the lead-in (D15).
 - Capacity counts whole seconds of window, rounded up.
 
 **Tap example.** Section `[60 s, 70 s)`, last target a tap at 69.5 s, late BAD 180 ms, lead-in 2 s:
 
 | Speed | From | To | Window |
 | --- | --- | --- | --- |
-| 50 % | 118.000 s | 139.180 s | 21.180 s |
-| 65 % | 90.307692 s | 107.103076 s | 16.795384 s |
-| 100 % | 58.000 s | 69.680 s | 11.680 s |
-| 150 % | 38.000 s | 46.513333 s | 8.513333 s |
+| 50 % | 117.800 s | 139.180 s | 21.380 s |
+| 65 % | 90.107692 s | 107.103076 s | 16.995384 s |
+| 100 % | 57.800 s | 69.680 s | 11.880 s |
+| 150 % | 37.800 s | 46.513333 s | 8.713333 s |
 
 **Long-note example.** Section `[10 s, 20 s)`, 100 %, lead-in 2 s, one LN from 18.000 s to 19.900 s.
 - The final deadline is the LN end, 19.900 s; the head's miss deadline (18.180 s) is earlier.
-- The window is 11.900 s, so capacity counts 12 seconds.
-- A tap-only formula would give 10.180 s and 11 seconds.
+- The window is 12.100 s, so capacity counts 13 seconds.
+- A tap-only formula would give 10.380 s and 11 seconds.
 
 **Refusal.** A slow full play over 512 MiB is refused before its countdown through D1, with the inputs needed, the inputs that fit, and "practice a section".
 
@@ -525,7 +529,7 @@ Each change is covered by round trips and changes D8's interpretation tuple.
   - `play { input = "auto" | log, until = "end" | { at_ms, command = "retry" | "quit" } }`: every play of one chart uses its first input;
   - `result = "next-preset" | "prev-preset" | "retry" | "back"`;
   - `capture { at, file }`: the first presented frame at or after `at` of the next play that starts, written under `output`;
-  - `practice { … }` (PR24);
+  - `practice { … }` (PR24b);
   - `quit`, last.
 - A step out of place (a result where no result shows, a capture no play follows) is refused when the file is loaded, naming the step.
 - `output` is a folder the run creates itself: it must not exist, and no folder below the file's on the way to it may be a link. Each capture is created new, never replacing a file. The run is a development tool started by the user who owns these folders, so a link swapped in during the run is outside its threat model.
@@ -1065,7 +1069,7 @@ Each one holds the behavior D5 and D6 state.
 
 **Why the gauge transfer is here.** Initial gauges enter records only with this PR's practice record fields; a full play starts every gauge at its preset's start, so PR17's what-if of a full play has nothing to transfer. The transfer belongs with the record fields it reads and the `verify` path that builds the target preset's `Section`.
 
-**What it leaves to PR24.** `Loaded::set_practice` sets the rounds up and the headless session restores audio with a seek; the player's rig rings out (`AudioCtl::RingOut`) but restores nothing yet (`Rig::restore_audio`'s default): the seek plan on the play command, the drawing of the section's targets only, and the screen that sets a practice up stay with the practice screen.
+**What it leaves to PR24a and PR24b.** `Loaded::set_practice` sets the rounds up and the headless session restores audio with a seek; the player's rig rings out (`AudioCtl::RingOut`): the seek plan on the play command and the drawing of the section's targets only are PR24a's, and the screen that sets a practice up is PR24b's.
 
 **Decided in this PR** (design.md "Mid-Chart Start and Section Repeat", "Practice Records"):
 - A record stores the section as evaluated, in real time, with its lead-in; its attempt is the play's number in its session.
@@ -1091,18 +1095,36 @@ Each one holds the behavior D5 and D6 state.
 - `section_round_records_its_conditions`.
 - When a practice record made under tapestry with `normal` at 50 % and `survival` at 70 % is re-evaluated under beatoraja-style, `normal` shall start at 50 %, every other gauge at beatoraja-style's start value, and the result shall mark those as started at the default (`what_if_transfers_initial_gauges_by_id`).
 - If a recorded initial gauge lies outside the target gauge's bounds (a test preset whose `normal` starts at 20 % with bounds 10-100 %, and a recorded `normal` at 5 %), or is 0 on a survival gauge, then that gauge shall start at its preset's start value and be marked like a missing one (`out_of_bounds_initial_gauge_uses_the_default`).
-- When the windows are computed, they shall be 21.180, 16.795384, 11.680 and 8.513333 s (`practice_window_is_sized_by_the_section`).
-- When the long-note section is planned, its deadline shall be 19.900 s, its window 11.900 s and its capacity 12 s (`practice_window_includes_ln_end_deadlines`).
+- When the windows are computed, they shall be 21.380, 16.995384, 11.880 and 8.713333 s (`practice_window_is_sized_by_the_section`; PR24a added `RESTORE_AHEAD`).
+- When the long-note section is planned, its deadline shall be 19.900 s, its window 12.100 s and its capacity 13 s (`practice_window_includes_ln_end_deadlines`).
 - `excerpt_matches_mid_chart_start_end_to_end`.
 - `slow_full_play_over_budget_is_refused`.
 
-### PR24. Practice screen and start position (`player`)
+### PR24a. Audio restore on the real threads, drawing only targets, `--dev-start` (`eval`, `audio`, `game`, `render`, `player`)
 
-**Depends on.** PR19, PR21, PR23.
+**Depends on.** PR21, PR23, PR25.
+
+**Touches.**
+- `eval`: `Section::is_target`, which the evaluator's two target checks call.
+- `audio`: `SeekSource::matches`.
+- `game`: practice.rs (`LEAD_IN`, `RESTORE_AHEAD`, `RESTORE_RETRY`, `mid_chart_start`, `chart_end`, `PracticeError::NoTargets`); restore.rs (`Restorer`, `Restore`, `RestoreError`); live.rs (`Rig::restore_ready` before the opening, `Rig::restore_audio` after the logic step's construction, `LiveError::Restore`); session.rs (`opens_at`, `restore_at`, the headless session's restore); audio_loop.rs (`Play` carries the restore, the outcome and the frame line are published, a load's answer carries the seek source).
+- `render`: `PlaySkin::prepare` takes the section, and `SimpleSkin` hides non-targets.
+- `player`: the render thread's `Load` carries the section; `PlayerRig` restores and keeps the lead-in its opening was given; both CLI paths set the practice up and the restorer; `--dev-start` (dev.rs, args.rs).
+- D15, D16 and PR23's window figures (D15's 200 ms before the lead-in); design.md "Mid-Chart Start and Section Repeat", "Audio", "Recording Capacity", "Shortening Launch-Based Checks".
+
+**Done when.**
+- When `play --dev-scripted-input <log> --dev-start 4000 <chart>` runs, the play shall be one mid-chart-start round from 4 s with a 2 s lead-in, the restored long voice shall be heard at its exact offset, and no start before the restore point shall be heard (`dev_start_starts_the_play_at_that_time`).
+- When `--dev-start` falls inside the chart's only long note, the run shall exit 1 with no play and no record (`dev_start_inside_a_lone_long_note_exits_one`).
+- If the round's schedule does not match the engine's, then the round shall be refused before recording opens (`a_schedule_mismatch_refuses_the_round_before_opening`).
+
+### PR24b. Practice screen and entry from selection (`game`, `player`, PR19's scenario)
+
+**Depends on.** PR19, PR24a.
+
+**Touches.** game's practice screen model, `Loaded::set_speed`, the app flow's practice entry; player's practice page, the P key, the shared menu queue owner, selection's loading at a speed; PR19's scenario `practice` step and exit.toml; D1, D15 Setup, D18, D20; design.md "Play Lifecycle", "Input" and "Mid-Chart Start and Section Repeat".
 
 **Done when.**
 - `practice_screen_repeats_and_quits`;
-- `--dev-start <ms>` starts the play at that time;
 - the exit scenario's practice round passes.
 
 ### PR25. Loudness normalization (`audio`, `game`, `library`, `player`)
@@ -1152,7 +1174,8 @@ Each one holds the behavior D5 and D6 state.
 - PR8 + PR18 → PR19
 - PR5 → PR20
 - PR2 + PR14 + PR20 + PR22 → PR23
-- PR19 + PR21 + PR23 → PR24
+- PR21 + PR23 + PR25 → PR24a
+- PR19 + PR24a → PR24b
 - PR15 + PR18 → PR25
 - PR7d → PR26
 
@@ -1162,7 +1185,7 @@ Each one holds the behavior D5 and D6 state.
 
 ### Automated
 
-**Exit scenario** (Windows CI, dev-tools; PR19, extended by PR24). The data root starts with no `player.toml`.
+**Exit scenario** (Windows CI, dev-tools; PR19, extended by PR24b). The data root starts with no `player.toml`.
 1. Scan two generated charts and one refused chart.
 2. Play A with autoplay; it is evaluated under beatoraja-style, the default.
 3. On the result screen, switch to tapestry, then LR2-style, then back.
