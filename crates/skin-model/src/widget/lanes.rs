@@ -1,6 +1,7 @@
 //! The lanes widget: notes, long notes, mines, bar lines, the judgment line
-//! and the lane and lift covers, drawn as the simple skin draws them
-//! (crates/render/src/simple.rs) on lanes a skin authors as rects.
+//! and the lane and lift covers on lanes a skin authors as rects, drawn as
+//! the simple skin draws them (crates/render/src/simple.rs) or as the
+//! source player draws an imported skin ([`LaneStyle`]).
 //!
 //! Its work per frame is bounded twice: [`LANE_VISITS`] candidates
 //! (notes and bar lines met, drawn or skipped) and [`LANE_QUADS`] quads
@@ -14,7 +15,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{LANE_COUNT, Lane, NoteKind, Position, TimeUs};
+use bms_model::{LANE_COUNT, Lane, Note, NoteKind, Position, TimeUs};
 
 use super::ImageRef;
 use super::scroll::Scale;
@@ -60,6 +61,46 @@ pub struct LaneParts {
     pub lift: Option<u32>,
 }
 
+/// How the lanes place and keep their notes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LaneStyle {
+    /// As the simple skin (crates/render/src/simple.rs): notes centred on
+    /// their position against `line`; a tap or mine stays until judged,
+    /// hit or its time passes; a long note shows both caps, its body
+    /// between their centres, until its end's position passes the line.
+    Simple,
+    /// As the source player draws an imported skin
+    /// (`play/LaneRenderer.java:288-727` at `0.8.9`), see [`SourceLanes`].
+    Source(SourceLanes),
+}
+
+/// The source player's lane geometry, unrounded, in reference pixels (y
+/// down).
+///
+/// A note's lower edge sits `offset_y` above the raised judgment line
+/// `bottom − lift` at its judgment time, and every note, cap and mine is
+/// `note_h` high. A tap or mine is drawn while its time has not passed,
+/// judged or not (`:546-560`, `:589-593`); nothing is drawn below the
+/// line. A long note is drawn while its end's time has not passed and its
+/// end is ahead of its head, or of the line once the head has passed it
+/// (`:552`, `:577`); its body runs from its end cap's lower edge to its
+/// head cap's upper edge, and its end cap is drawn only when its release
+/// is judged on its own (`:701-727`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SourceLanes {
+    /// Where a note's lower edge sits at its judgment time with no lift
+    /// and no offset: the source lane region's lower edge.
+    pub bottom: f32,
+    /// The source lane region's height: the lift and SUDDEN+ take their
+    /// shares of it.
+    pub height: f32,
+    /// How far above the line a note's lower edge sits (the source's `y`
+    /// offset), at least 0.
+    pub offset_y: f32,
+    /// Every note's height, the source's note size plus its `h` offset.
+    pub note_h: f32,
+}
+
 /// A part of the lanes, for errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanePart {
@@ -76,8 +117,10 @@ pub enum LanePart {
 }
 
 /// The lanes as a skin authors them, in reference pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LanesDef {
+    /// How notes are placed and kept.
+    pub style: LaneStyle,
     /// `(x, w)` per [`Lane::index`], at 100 % lane width.
     pub lanes: [[i32; 2]; LANE_COUNT],
     /// The side the author drew the scratch lane on.
@@ -135,6 +178,11 @@ pub enum LanesError {
     Anchors,
     #[error("a key lane is not on the scratch lane's side")]
     ScratchNotAtSide,
+    #[error(
+        "the source geometry needs a positive height and note height, an offset of at least 0, \
+         and a note at its judgment time within the lanes"
+    )]
+    Source,
     #[error("a {part:?} image does not exist")]
     UnknownPart { part: LanePart },
 }
@@ -171,7 +219,8 @@ impl LanesDef {
     /// ±[`MAX_COORD`], `top < line ≤ bottom` within it, heights of at
     /// least 1, the cover anchors (`top ≤ cover_at`, at least a tenth of
     /// the lane from `cover_at` to the line, `line ≤ lift_at ≤ bottom`),
-    /// and every key lane on the scratch lane's side.
+    /// every key lane on the scratch lane's side, and for the source
+    /// style its geometry ([`LanesError::Source`]).
     pub(crate) fn check(&self) -> Result<(), LanesError> {
         let max = i64::from(MAX_COORD);
         let within = |v: i64| (-max..=max).contains(&v);
@@ -205,6 +254,21 @@ impl LanesDef {
         });
         if !beside {
             return Err(LanesError::ScratchNotAtSide);
+        }
+        if let LaneStyle::Source(s) = self.style {
+            let [y, h, o, n] = [s.bottom, s.height, s.offset_y, s.note_h].map(f64::from);
+            // The note at its judgment time, with no lift, lies within
+            // `[top, bottom]` (`bottom` is the source's).
+            #[expect(clippy::cast_precision_loss, reason = "within ±2^21, exact in f64")]
+            let ok = y.abs() <= max as f64
+                && h > 0.0
+                && h <= 2.0 * max as f64
+                && n > 0.0
+                && o >= 0.0
+                && y - o - n >= top as f64;
+            if !ok {
+                return Err(LanesError::Source);
+            }
         }
         Ok(())
     }
@@ -251,6 +315,7 @@ pub(crate) struct Lanes {
     span: [i64; 2],
     keys: [i64; 2],
     scratch: Side,
+    style: LaneStyle,
     top: i32,
     line: i32,
     bottom: i32,
@@ -279,6 +344,7 @@ impl Lanes {
             span: edges(&lanes),
             keys,
             scratch: def.scratch,
+            style: def.style,
             top: def.top,
             line: def.line,
             bottom: def.bottom,
@@ -358,19 +424,6 @@ impl Lanes {
             span: [a, b - a],
         }
     }
-}
-
-/// The covers' geometry for one frame, in reference pixels.
-struct Covers {
-    /// The lane's length, from the top to the unlifted line.
-    len: f64,
-    /// How far the lift raises the line, and the raised line.
-    lift_px: f64,
-    line_y: f64,
-    /// How far the cover's lower edge moves down from its anchor.
-    cover_px: f64,
-    /// The top of the scroll: where notes appear.
-    edge: f64,
 }
 
 /// What the lanes draw from this frame.
@@ -485,7 +538,12 @@ impl Pen<'_, '_> {
 
     /// A cap of height `h` centred at `y`, cut to the lanes.
     fn cap(&mut self, part: Shown, x: f32, w: f32, y: f32, h: f32) -> bool {
-        match cut(x, w, y - h / 2.0, y + h / 2.0, self.top, self.bottom) {
+        self.span(part, x, w, y - h / 2.0, y + h / 2.0)
+    }
+
+    /// `part` over `[y0, y1)`, cut to the lanes.
+    fn span(&mut self, part: Shown, x: f32, w: f32, y0: f32, y1: f32) -> bool {
+        match cut(x, w, y0, y1, self.top, self.bottom) {
             Some(c) => self.counted(part, &c),
             None => true,
         }
@@ -517,6 +575,19 @@ impl Pen<'_, '_> {
     }
 }
 
+/// The covers' geometry for one frame, in reference pixels.
+struct Covers {
+    /// The cover's height above its lower edge.
+    len: f64,
+    /// How far the lift raises the line, and the raised line.
+    lift_px: f64,
+    line_y: f64,
+    /// How far the cover's lower edge moves down from its anchor.
+    cover_px: f64,
+    /// The scroll's length: from the uncovered top to the line.
+    span: f64,
+}
+
 impl Lanes {
     /// Draws the lanes into `out`: the bar lines, the judgment line, every
     /// lane's notes, the cover, then the lift cover. Allocates nothing.
@@ -525,23 +596,21 @@ impl Lanes {
             return;
         };
         let g = self.covers(d.view);
-        let (line_y, span_px) = (g.line_y, g.line_y - g.edge);
         let scale = Scale::new(
             d.play.scroll(),
             d.display,
             d.view.visible_time,
-            span_px,
-            line_y,
+            g.span,
+            g.line_y,
         );
         // Coordinates within ±2^20 are exact in `f32`.
         #[expect(clippy::cast_precision_loss, reason = "within ±2^20")]
-        let (top, bottom) = (self.top as f32, self.bottom as f32);
-        let line = f32_of(line_y);
-        let pad = self.note_h.max(self.mine_h).max(self.bar_h) / 2.0;
-        let (from, to) = scale.positions(
-            f32_of(f64::from(self.bottom) - line_y) + pad,
-            f32_of(line_y - f64::from(self.top)) + pad,
-        );
+        let top = self.top as f32;
+        #[expect(clippy::cast_precision_loss, reason = "within ±2^20")]
+        let bottom = match self.style {
+            LaneStyle::Simple => self.bottom as f32,
+            LaneStyle::Source(s) => s.bottom,
+        };
         let [sx, sw] = d.geometry.span.map(f32_of);
         let mut pen = Pen {
             d,
@@ -552,34 +621,10 @@ impl Lanes {
             quads: 0,
             stopped: false,
         };
-
-        if let Some(bar) = self.parts.bar.map(|p| d.shown(&p)) {
-            let bars = &notes.bars;
-            let start = bars.partition_point(|&p| p < from);
-            for &p in bars.iter().skip(start).take_while(|&&p| p <= to) {
-                if !(pen.visit() && pen.cap(bar, sx, sw, scale.y(p), self.bar_h)) {
-                    break;
-                }
-            }
-        }
-        if let Some(part) = self.parts.line.map(|p| d.shown(&p)) {
-            let y = line - self.line_h / 2.0;
-            pen.push(
-                part,
-                &Cut {
-                    rect: [sx, y, sw, self.line_h],
-                    from: None,
-                    to: None,
-                },
-            );
-        }
         let ringing_out = d.complete && notes.section.is_some();
-        if !ringing_out {
-            for lane in Lane::all() {
-                if !self.lane(&mut pen, notes, &scale, lane, line, from, to) {
-                    break;
-                }
-            }
+        match self.style {
+            LaneStyle::Simple => self.simple(&mut pen, notes, &scale, ringing_out),
+            LaneStyle::Source(s) => self.source(&mut pen, notes, &scale, s, g.span, ringing_out),
         }
         if let Some(part) = self.parts.cover.map(|p| d.shown(&p)) {
             let edge = f32_of(f64::from(self.cover_at) + g.cover_px);
@@ -598,12 +643,65 @@ impl Lanes {
         }
     }
 
-    /// The covers' geometry for `view`. The lift takes its share of the
-    /// lane, the cover its share of the height left above the lift; each is
-    /// clamped so its painted edge stays a tenth of the lane above the
-    /// raised judgment line, which [`LanesDef::check`]'s anchors allow at
-    /// 0 ‰.
+    /// The judgment line, centred on the raised line `line`.
+    fn line(&self, pen: &mut Pen<'_, '_>, line: f32) {
+        let d = pen.d;
+        if let Some(part) = self.parts.line.map(|p| d.shown(&p)) {
+            let [sx, sw] = d.geometry.span.map(f32_of);
+            pen.push(
+                part,
+                &Cut {
+                    rect: [sx, line - self.line_h / 2.0, sw, self.line_h],
+                    from: None,
+                    to: None,
+                },
+            );
+        }
+    }
+
+    /// The bar lines at positions `[from, to]`, centred `shift` below
+    /// their position's y.
+    fn bars(
+        &self,
+        pen: &mut Pen<'_, '_>,
+        notes: &Notes,
+        scale: &Scale,
+        [from, to]: [Position; 2],
+        shift: f32,
+    ) {
+        let d = pen.d;
+        let [sx, sw] = d.geometry.span.map(f32_of);
+        if let Some(bar) = self.parts.bar.map(|p| d.shown(&p)) {
+            let bars = &notes.bars;
+            let start = bars.partition_point(|&p| p < from);
+            for &p in bars.iter().skip(start).take_while(|&&p| p <= to) {
+                if !(pen.visit() && pen.cap(bar, sx, sw, scale.y(p) + shift, self.bar_h)) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The covers' geometry for `view`.
     fn covers(&self, view: LaneView) -> Covers {
+        if let LaneStyle::Source(s) = self.style {
+            let (lift, cover) = (view.lift.min(1_000), view.cover.min(1_000));
+            // The source's shares of its lane region
+            // (`play/LaneRenderer.java:322-333`): the lift's of the height,
+            // the cover's of what the lift leaves; the notes scroll over
+            // what both leave.
+            let h = f64::from(s.height);
+            let left = h * f64::from(1_000 - lift) / 1_000.0;
+            let span = left * f64::from(1_000 - cover) / 1_000.0;
+            let lift_px = h - left;
+            return Covers {
+                len: h,
+                lift_px,
+                line_y: f64::from(s.bottom) - lift_px,
+                cover_px: left - span,
+                span,
+            };
+        }
         // `top < line` within ±2^20, so the length fits and is positive.
         let len = f64::from(self.line - self.top);
         let band = len / 10.0;
@@ -619,68 +717,64 @@ impl Lanes {
             lift_px,
             line_y,
             cover_px,
-            edge: f64::from(self.top) + cover_px,
+            span: line_y - (f64::from(self.top) + cover_px),
         }
     }
 
-    /// One lane's notes meeting `[from, to]`; `false` once the frame's
-    /// lanes stop.
-    #[expect(clippy::too_many_arguments, reason = "one frame's lane pass")]
-    fn lane(
+    /// The simple skin's bar lines, judgment line and notes.
+    fn simple(&self, pen: &mut Pen<'_, '_>, notes: &Notes, scale: &Scale, ringing_out: bool) {
+        let line = f32_of(scale.line_y);
+        let pad = self.note_h.max(self.mine_h).max(self.bar_h) / 2.0;
+        let (from, to) = scale.positions(
+            f32_of(f64::from(self.bottom) - scale.line_y) + pad,
+            f32_of(scale.line_y - f64::from(self.top)) + pad,
+        );
+        self.bars(pen, notes, scale, [from, to], 0.0);
+        self.line(pen, line);
+        if !ringing_out {
+            for lane in Lane::all() {
+                if !self.simple_lane(pen, notes, scale, lane, [from, to]) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// One lane's notes meeting `[from, to]`, as the simple skin draws
+    /// them; `false` once the frame's lanes stop.
+    fn simple_lane(
         &self,
         pen: &mut Pen<'_, '_>,
         notes: &Notes,
         scale: &Scale,
         lane: Lane,
-        line: f32,
-        from: Position,
-        to: Position,
+        [from, to]: [Position; 2],
     ) -> bool {
         let d = pen.d;
-        let l = lane.index();
-        let (Some(list), Some(&(lo, hi)), Some(&[x, w])) = (
-            notes.lanes.get(l),
-            notes.range.get(l),
-            d.geometry.lanes.get(l),
-        ) else {
+        let Some(l) = LaneOf::new(self, d, notes, lane) else {
             return true;
         };
-        let (x, w) = (f32_of(x), f32_of(w));
-        let p = &self.parts;
-        let (Some(note), Some(head_part), Some(tail_part), Some(on), Some(off), Some(mine)) = (
-            p.note.get(l),
-            p.head.get(l),
-            p.tail.get(l),
-            p.body_on.get(l),
-            p.body_off.get(l),
-            p.mine.get(l),
-        ) else {
-            return true;
-        };
-        // Each part's frame once for the lane's pass.
-        let [note, head_part, tail_part, on, off, mine] =
-            [note, head_part, tail_part, on, off, mine].map(|p| d.shown(p));
-        let held = d.play.hold_note(lane);
+        let (x, w, line) = (l.x, l.w, f32_of(scale.line_y));
         // Positions never decrease along a lane (`Chart::validate`), so the
         // notes meeting [from, to] are one run.
-        let start = list.partition_point(|n| n.end_pos() < from).max(lo);
-        for (i, n) in list.iter().enumerate().take(hi).skip(start) {
+        let start = l.list.partition_point(|n| n.end_pos() < from).max(l.lo);
+        for (i, n) in l.list.iter().enumerate().take(l.hi).skip(start) {
             if n.pos > to {
                 break;
             }
             if !pen.visit() {
                 return false;
             }
-            if d.play.done(l, i) {
+            if d.play.done(l.index, i) {
                 continue;
             }
             let head = scale.y(n.pos);
             let drawn = match n.kind {
                 // A mine leaves at its time, hit or not.
                 NoteKind::Mine { .. } if n.time < d.display => true,
-                NoteKind::Mine { .. } => pen.cap(mine, x, w, head, self.mine_h),
+                NoteKind::Mine { .. } => pen.cap(l.mine, x, w, head, self.mine_h),
                 _ if !is_target(notes.section, n.time, n.end()) => true,
-                NoteKind::Tap => pen.cap(note, x, w, head, self.note_h),
+                NoteKind::Tap => pen.cap(l.note, x, w, head, self.note_h),
                 NoteKind::Long { end_pos, .. } => {
                     // Judged or not, a long note is drawn until its end
                     // passes the line, and once its head's time has passed
@@ -690,14 +784,10 @@ impl Lanes {
                     }
                     let tail = scale.y(end_pos);
                     let head = head.min(line);
-                    let body = if held == Some(i) { on } else { off };
-                    let body_ok = match cut(x, w, tail, head, pen.top, pen.bottom) {
-                        Some(c) => pen.counted(body, &c),
-                        None => true,
-                    };
-                    body_ok
-                        && pen.cap(tail_part, x, w, tail, self.note_h)
-                        && pen.cap(head_part, x, w, head, self.note_h)
+                    let body = if l.held == Some(i) { l.on } else { l.off };
+                    pen.span(body, x, w, tail, head)
+                        && pen.cap(l.tail, x, w, tail, self.note_h)
+                        && pen.cap(l.head, x, w, head, self.note_h)
                 }
             };
             if !drawn {
@@ -705,5 +795,173 @@ impl Lanes {
             }
         }
         true
+    }
+
+    /// The source player's bar lines, judgment line and notes
+    /// ([`SourceLanes`]). With no scroll left (`span` 0) nothing is
+    /// scaled: every tap and mine whose time has not passed is drawn on
+    /// the line, as the source then draws every note there, and no long
+    /// note or bar line is drawn.
+    fn source(
+        &self,
+        pen: &mut Pen<'_, '_>,
+        notes: &Notes,
+        scale: &Scale,
+        s: SourceLanes,
+        span: f64,
+        ringing_out: bool,
+    ) {
+        let range = (span > 0.0).then(|| {
+            // A note's lower edge sits `offset_y` above its position's y.
+            let pad = s.note_h.max(self.bar_h);
+            let (from, to) = scale.positions(
+                f32_of(f64::from(s.bottom) - scale.line_y) + s.offset_y + pad,
+                f32_of(scale.line_y - f64::from(self.top)) + pad,
+            );
+            [from, to]
+        });
+        if let Some(range) = range {
+            // At the notes' centres.
+            self.bars(pen, notes, scale, range, -s.offset_y - s.note_h / 2.0);
+        }
+        self.line(pen, f32_of(scale.line_y));
+        if !ringing_out {
+            for lane in Lane::all() {
+                if !self.source_lane(pen, notes, scale, lane, s, range) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// One lane's notes as the source player draws them, from those
+    /// meeting `range`, or from the display time on without one; `false`
+    /// once the frame's lanes stop.
+    fn source_lane(
+        &self,
+        pen: &mut Pen<'_, '_>,
+        notes: &Notes,
+        scale: &Scale,
+        lane: Lane,
+        s: SourceLanes,
+        range: Option<[Position; 2]>,
+    ) -> bool {
+        let d = pen.d;
+        let Some(l) = LaneOf::new(self, d, notes, lane) else {
+            return true;
+        };
+        let (x, w, oy, nh) = (l.x, l.w, s.offset_y, s.note_h);
+        let line = f32_of(scale.line_y);
+        let tail_shown = d.play.separate_end_judgment();
+        // Times and positions never decrease along a lane
+        // (`Chart::validate`).
+        let start = match range {
+            Some([from, _]) => l.list.partition_point(|n| n.end_pos() < from),
+            None => l.list.partition_point(|n| n.time < d.display),
+        };
+        for (i, n) in l.list.iter().enumerate().take(l.hi).skip(start.max(l.lo)) {
+            if range.is_some_and(|[_, to]| n.pos > to) {
+                break;
+            }
+            if !pen.visit() {
+                return false;
+            }
+            if !is_target(notes.section, n.time, n.end()) {
+                continue;
+            }
+            let drawn = match n.kind {
+                // Judged or not, until its time passes.
+                NoteKind::Tap | NoteKind::Mine { .. } => {
+                    if n.time < d.display {
+                        continue;
+                    }
+                    let y = if range.is_some() {
+                        scale.y(n.pos)
+                    } else {
+                        line
+                    };
+                    let part = if n.kind == NoteKind::Tap {
+                        l.note
+                    } else {
+                        l.mine
+                    };
+                    pen.span(part, x, w, y - oy - nh, y - oy)
+                }
+                NoteKind::Long { end, end_pos, .. } => {
+                    // Until its end's time passes and while its end is ahead
+                    // of its head, which stays on the line once passed.
+                    let head_pos = n.pos.max(scale.at_line);
+                    if range.is_none() || d.display >= end || end_pos <= head_pos {
+                        continue;
+                    }
+                    let (head, tail) = (scale.y(head_pos) - oy, scale.y(end_pos) - oy);
+                    let body = if l.held == Some(i) { l.on } else { l.off };
+                    pen.span(body, x, w, tail, head - nh)
+                        && (!tail_shown || pen.span(l.tail, x, w, tail - nh, tail))
+                        && pen.span(l.head, x, w, head - nh, head)
+                }
+            };
+            if !drawn {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// One lane's notes, geometry and parts for a frame's pass.
+struct LaneOf<'n> {
+    index: usize,
+    list: &'n [Note],
+    lo: usize,
+    hi: usize,
+    x: f32,
+    w: f32,
+    held: Option<usize>,
+    note: Shown,
+    head: Shown,
+    tail: Shown,
+    on: Shown,
+    off: Shown,
+    mine: Shown,
+}
+
+impl<'n> LaneOf<'n> {
+    /// `lane`'s, with each part's frame read once for the pass.
+    fn new(lanes: &Lanes, d: &Draw<'_>, notes: &'n Notes, lane: Lane) -> Option<Self> {
+        let l = lane.index();
+        let (Some(list), Some(&(lo, hi)), Some(&[x, w])) = (
+            notes.lanes.get(l),
+            notes.range.get(l),
+            d.geometry.lanes.get(l),
+        ) else {
+            return None;
+        };
+        let p = &lanes.parts;
+        let (Some(note), Some(head), Some(tail), Some(on), Some(off), Some(mine)) = (
+            p.note.get(l),
+            p.head.get(l),
+            p.tail.get(l),
+            p.body_on.get(l),
+            p.body_off.get(l),
+            p.mine.get(l),
+        ) else {
+            return None;
+        };
+        Some(Self {
+            index: l,
+            list,
+            lo,
+            hi,
+            x: f32_of(x),
+            w: f32_of(w),
+            held: d.play.hold_note(lane),
+            note: d.shown(note),
+            head: d.shown(head),
+            tail: d.shown(tail),
+            on: d.shown(on),
+            off: d.shown(off),
+            mine: d.shown(mine),
+        })
     }
 }

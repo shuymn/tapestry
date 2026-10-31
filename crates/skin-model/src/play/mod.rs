@@ -8,7 +8,7 @@ pub(crate) mod reducer;
 pub(crate) mod schema;
 pub(crate) mod timers;
 
-use bms_model::{Chart, LANE_COUNT, Lane, Note, Position, ScrollMap, TimeUs};
+use bms_model::{Chart, LANE_COUNT, Lane, LnMode, Note, Position, ScrollMap, TimeUs};
 use eval::{GaugeState, JudgeEvent, Section, Tally};
 use rules::GaugeValue;
 
@@ -61,6 +61,9 @@ pub struct PlayContext<'a> {
     pub empty_poor_breaks_combo: bool,
     /// The player's scratch side, which the lanes are laid out for.
     pub scratch: Side,
+    /// The preset's long-note mode for a chart that declares none
+    /// (`rule.ln_mode.default`).
+    pub ln_default: rules::LnMode,
 }
 
 /// What one frame gives the skin.
@@ -119,6 +122,8 @@ pub struct Play {
     ready_at: TimeUs,
     play_at: TimeUs,
     scratch: Side,
+    /// Whether a long note's release is judged on its own (CN and HCN).
+    separate_end_judgment: bool,
     notes: Option<Box<Notes>>,
     /// The context's gauge descriptors.
     gauges: Box<[GaugeDesc]>,
@@ -205,6 +210,12 @@ impl Play {
             ready_at,
             play_at,
             scratch: ctx.scratch,
+            // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
+            // a new preset mode must be placed here.
+            separate_end_judgment: match (ctx.ln_default, chart.meta.ln_mode) {
+                (rules::LnMode::Ln, None | Some(LnMode::Ln)) => false,
+                (rules::LnMode::Ln, Some(LnMode::Cn | LnMode::Hcn)) => true,
+            },
             notes,
             gauges: ctx.gauges.into(),
             text: TextTable::default(),
@@ -258,6 +269,12 @@ impl Play {
     /// The attempt's scratch side.
     pub(crate) fn scratch(&self) -> Side {
         self.scratch
+    }
+
+    /// Whether a long note's release is judged on its own: the chart's
+    /// mode, or the preset's default when it declares none, is CN or HCN.
+    pub(crate) fn separate_end_judgment(&self) -> bool {
+        self.separate_end_judgment
     }
 
     /// The chart's notes, kept when the skin has lanes.
@@ -357,6 +374,7 @@ mod tests {
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {

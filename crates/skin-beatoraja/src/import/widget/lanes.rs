@@ -9,7 +9,7 @@
 //! lanes' own timer, conditions and window. HIDDEN+ is never drawn
 //! (owner decision 15, D11).
 
-use skin_model::{Blend, End, Filter, LaneParts, LanesDef, Side, Source, TimerRef};
+use skin_model::{Blend, End, Filter, LaneParts, LaneStyle, LanesDef, Side, Source, TimerRef};
 
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
@@ -529,6 +529,7 @@ impl Cx<'_> {
         let t = self.neutral_track(&c)?;
         let state = LaneState {
             def: LanesDef {
+                style: LaneStyle::Simple,
                 lanes,
                 scratch,
                 top,

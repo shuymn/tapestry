@@ -98,6 +98,7 @@ impl Drawn {
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
         };
         let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());

@@ -1190,6 +1190,7 @@ fn build_does_not_allocate() {
         },
         empty_poor_breaks_combo: true,
         scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -1333,6 +1334,7 @@ fn build_does_not_allocate() {
         [0_u16; 0],
         "built-in timers never drawn"
     );
+    source_lanes_do_not_allocate(&chart, &full);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
     skin.attach_text(&mut play, text_table()).unwrap();
@@ -1362,4 +1364,57 @@ fn build_does_not_allocate() {
     let requests = skin.text_requests(&chart_text, TARGETS[0], &views.layouts[0]);
     let texts: Vec<_> = requests.iter().map(|r| (r.slot, r.text.as_str())).collect();
     assert_eq!(texts, [(0, "Title"), (1, "MAX")]);
+}
+
+/// The source player's lanes (`lanes_support::source`) on `chart` played
+/// as CN, so every long note shows its end cap, through frames every 16 ms
+/// under covers that leave scroll and covers that leave none: nothing
+/// allocated, and notes, end caps and bodies drawn.
+fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
+    let skin = lanes_support::lanes_skin(lanes_support::source());
+    let uvs = play_support::uvs(&skin);
+    let mut cn = chart.clone();
+    cn.meta.ln_mode = Some(bms_model::LnMode::Cn);
+    let mut play = skin.prepare(&cn, ctx).unwrap();
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let t = tally(0);
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let layout = SkinLayout::AUTHOR;
+    let views = [(0, 0), (500, 200), (1_000, 0), (0, 1_000), (1_000, 1_000)];
+    let tail = uvs.get(lanes_support::TAIL).unwrap().uv;
+    let (mut quads, mut tails) = (0_usize, 0_usize);
+    TRACK.with(|t| t.set(true));
+    for (i, now) in (0..12_000 * MS).step_by(16 * MS as usize).enumerate() {
+        let (cover, lift) = views[i / 50 % views.len()];
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(now),
+            display_offset: TimeUs(0),
+            tally: &t,
+            gauges: &gauges,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: TARGETS[i % TARGETS.len()],
+            layout: &layout,
+            lanes: LaneView {
+                visible_time: TimeUs(600 * MS),
+                cover,
+                lift,
+            },
+        };
+        skin.build(&mut play, &frame, &uvs, &mut batch);
+        quads += batch.quads().len();
+        tails += batch.quads().iter().filter(|q| q.uv == tail).count();
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.swap(0, Ordering::Relaxed),
+        0,
+        "source lanes: allocations"
+    );
+    assert!(
+        quads > 0 && tails > 0,
+        "source lanes drew {quads} quads, {tails} end caps"
+    );
 }
