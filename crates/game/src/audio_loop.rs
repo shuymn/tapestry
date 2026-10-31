@@ -547,6 +547,10 @@ impl AudioControl {
             if let Ok(late) = self.loads.pop() {
                 if Some(late.id) == self.outstanding {
                     self.outstanding = None;
+                    // The engine plays what that load left it.
+                    if late.taken {
+                        self.source = late.source.clone();
+                    }
                 }
                 drop(late);
             }
