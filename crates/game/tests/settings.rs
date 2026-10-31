@@ -490,11 +490,11 @@ fn number(name: &str) -> u64 {
         .unwrap()
 }
 
-/// Deleting the newest record gives its number again, never its name: an
-/// identical play saved then lands at a new path, so it counts as another
+/// Deleting the newest record gives its number again with a new random id:
+/// an identical play saved then lands at a new path, so it counts as another
 /// play (design.md "Personal Bests").
 #[test]
-fn a_deleted_record_never_gives_its_name_again() {
+fn a_deleted_record_gets_a_new_name() {
     let (_dir, root) = temp_root();
     let mut records = LocalRecords::new(root.records());
     records.save(&sample()).unwrap();

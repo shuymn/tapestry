@@ -89,9 +89,11 @@ pub const SAVE_ATTEMPTS: u64 = 64;
 /// temporary file and then renamed to the next free name by a rename that
 /// refuses to replace, so plays saved at the same moment, even by two
 /// sessions, never replace or mix with one another. Records are written
-/// once and never changed (design.md "Personal Bests"), and a name does
-/// not come back: after the newest record is deleted its number is given
-/// again, with another `id`, whatever the clock reads.
+/// once and never changed (design.md "Personal Bests"). After the newest
+/// record is deleted its number is given again with another `id`, whatever
+/// the clock reads: a deleted name comes back only if two random 64-bit
+/// ids collide, a negligible risk; the no-replace rename protects only the
+/// names that exist.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalRecords {
     dir: PathBuf,
@@ -158,8 +160,8 @@ fn now_us() -> u64 {
 /// standard library's, seeded from the operating system once per thread
 /// and changed at every call) over the time, the process and a count of
 /// the ids this process made. It does not depend on the clock to differ:
-/// two ids made at the same `now_us`, in one process or two, differ but
-/// with chance 2⁻⁶⁴.
+/// two ids made at the same `now_us`, in one process or two, collide with
+/// chance 2⁻⁶⁴, a negligible risk.
 fn record_id(now_us: u64) -> u64 {
     static MADE: AtomicU64 = AtomicU64::new(0);
     let mut h = RandomState::new().build_hasher();
@@ -298,7 +300,7 @@ mod tests {
         assert_eq!(record_number("notes"), None);
     }
 
-    /// Ids made at one clock reading differ, so a deleted record's name
+    /// does not come back when the clock repeats, but by a 64-bit collision.
     /// does not come back when the clock repeats.
     #[test]
     fn record_ids_do_not_repeat_with_the_clock() {
