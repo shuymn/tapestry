@@ -185,12 +185,15 @@ fn status(report: &PlayReport) -> (EndStatus, TimeUs) {
     (s.end, s.finalized)
 }
 
-/// The number of the saved record's file, `<n>-<time>.tprl`.
+/// The number of the saved record's file, `<n>-<id>.tprl`.
 fn number(report: &PlayReport) -> u64 {
     let saved = report.saved.as_ref().unwrap().as_ref().unwrap();
     let name = saved.path.file_name().unwrap().to_str().unwrap();
-    let (n, time) = name.trim_end_matches(".tprl").split_once('-').unwrap();
-    assert!(time.parse::<u64>().is_ok(), "{name}");
+    let (n, id) = name.trim_end_matches(".tprl").split_once('-').unwrap();
+    assert!(
+        id.len() == 16 && u64::from_str_radix(id, 16).is_ok(),
+        "{name}"
+    );
     n.parse().unwrap()
 }
 

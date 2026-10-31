@@ -2,8 +2,10 @@
 //! that settings and records share.
 
 use std::fs;
+use std::hash::{BuildHasher as _, Hasher as _, RandomState};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use replay::PlayRecord;
@@ -81,16 +83,15 @@ pub trait RecordSink {
 /// writers would have to publish in the same moment.
 pub const SAVE_ATTEMPTS: u64 = 64;
 
-/// Saves records as `<records>/<chart sha256>/<n>-<t>.tprl`, numbering each
-/// chart's plays from 1 after the highest number there, with `t` the time
-/// of saving in µs since the Unix epoch. A record is written whole to a
+/// Saves records as `<records>/<chart sha256>/<n>-<id>.tprl`, numbering each
+/// chart's plays from 1 after the highest number there, with `id` 64 random
+/// bits in 16 hex digits ([`record_id`]). A record is written whole to a
 /// temporary file and then renamed to the next free name by a rename that
 /// refuses to replace, so plays saved at the same moment, even by two
 /// sessions, never replace or mix with one another. Records are written
-/// once and never changed (design.md "Personal Bests"), and a name never
-/// comes back: after the newest record is deleted its number is given
-/// again, but with another time, unless the clock reads the same
-/// microsecond again.
+/// once and never changed (design.md "Personal Bests"), and a name does
+/// not come back: after the newest record is deleted its number is given
+/// again, with another `id`, whatever the clock reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalRecords {
     dir: PathBuf,
@@ -136,12 +137,12 @@ impl RecordSink for LocalRecords {
             last = last.max(number.unwrap_or(0));
         }
         let first = last.checked_add(1).ok_or_else(numbers_exhausted)?;
-        let path = publish(&dir, &replay::encode(rec), first, now_us())?;
+        let path = publish(&dir, &replay::encode(rec), first, record_id(now_us()))?;
         Ok(RecordRef { path })
     }
 }
 
-/// The number of a record file's stem, `<n>-<t>` or `<n>`.
+/// The number of a record file's stem, `<n>-<id>` or `<n>`.
 fn record_number(stem: &str) -> Option<u64> {
     stem.split_once('-').map_or(stem, |(n, _)| n).parse().ok()
 }
@@ -153,13 +154,29 @@ fn now_us() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
-/// Writes `bytes` as `<first>-<stamp>.tprl` in `dir`, or under the next
-/// number free when that name is taken, never replacing a file.
-fn publish(dir: &Path, bytes: &[u8], first: u64, stamp: u64) -> io::Result<PathBuf> {
+/// A record name's `id`: 64 bits from a hasher with fresh random keys (the
+/// standard library's, seeded from the operating system once per thread
+/// and changed at every call) over the time, the process and a count of
+/// the ids this process made. It does not depend on the clock to differ:
+/// two ids made at the same `now_us`, in one process or two, differ but
+/// with chance 2⁻⁶⁴.
+fn record_id(now_us: u64) -> u64 {
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(now_us);
+    h.write_u32(std::process::id());
+    h.write_u64(MADE.fetch_add(1, Ordering::Relaxed));
+    h.finish()
+}
+
+/// Writes `bytes` as `<first>-<id>.tprl` in `dir`, `id` in 16 hex digits,
+/// or under the next number free when that name is taken, never replacing
+/// a file.
+fn publish(dir: &Path, bytes: &[u8], first: u64, id: u64) -> io::Result<PathBuf> {
     let mut tmp = temp_in(dir, bytes)?;
     let mut n = first;
     for _ in 0..SAVE_ATTEMPTS {
-        let path = dir.join(format!("{n}-{stamp}.tprl"));
+        let path = dir.join(format!("{n}-{id:016x}.tprl"));
         match tmp.persist_noclobber(&path) {
             Ok(_) => return Ok(path),
             Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => tmp = e.file,
@@ -175,7 +192,7 @@ mod tests {
     use std::fs;
     use std::sync::Barrier;
 
-    use super::{SAVE_ATTEMPTS, publish, record_number};
+    use super::{SAVE_ATTEMPTS, publish, record_id, record_number};
 
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -184,14 +201,17 @@ mod tests {
     #[test]
     fn a_taken_name_is_never_replaced() {
         let dir = dir();
-        fs::write(dir.path().join("1-7.tprl"), b"first").unwrap();
+        fs::write(dir.path().join("1-0000000000000007.tprl"), b"first").unwrap();
         let path = publish(dir.path(), b"second", 1, 7).unwrap();
-        assert_eq!(path, dir.path().join("2-7.tprl"));
-        assert_eq!(fs::read(dir.path().join("1-7.tprl")).unwrap(), b"first");
+        assert_eq!(path, dir.path().join("2-0000000000000007.tprl"));
+        assert_eq!(
+            fs::read(dir.path().join("1-0000000000000007.tprl")).unwrap(),
+            b"first"
+        );
         assert_eq!(fs::read(&path).unwrap(), b"second");
         // Another time takes the number.
         let path = publish(dir.path(), b"third", 1, 8).unwrap();
-        assert_eq!(path, dir.path().join("1-8.tprl"));
+        assert_eq!(path, dir.path().join("1-0000000000000008.tprl"));
     }
 
     #[test]
@@ -215,7 +235,10 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            [dir.path().join("1-5.tprl"), dir.path().join("2-5.tprl")]
+            [
+                dir.path().join("1-0000000000000005.tprl"),
+                dir.path().join("2-0000000000000005.tprl")
+            ]
         );
         for (path, bytes) in &paths {
             assert_eq!(fs::read(path).unwrap(), *bytes);
@@ -225,7 +248,7 @@ mod tests {
     #[test]
     fn numbering_past_the_last_number_is_an_error() {
         let dir = dir();
-        let last = format!("{}-1.tprl", u64::MAX);
+        let last = format!("{}-{:016x}.tprl", u64::MAX, 1);
         fs::write(dir.path().join(&last), b"last").unwrap();
         assert_eq!(
             publish(dir.path(), b"next", u64::MAX, 1)
@@ -243,12 +266,17 @@ mod tests {
     #[test]
     fn publishing_gives_up_after_the_bound_of_taken_names() {
         let dir = dir();
-        let taken = |n: u64| fs::create_dir(dir.path().join(format!("{n}-3.tprl"))).unwrap();
+        let taken =
+            |n: u64| fs::create_dir(dir.path().join(format!("{n}-0000000000000003.tprl"))).unwrap();
         for n in 1..SAVE_ATTEMPTS {
             taken(n);
         }
         let last = publish(dir.path(), b"x", 1, 3).unwrap();
-        assert_eq!(last, dir.path().join(format!("{SAVE_ATTEMPTS}-3.tprl")));
+        assert_eq!(
+            last,
+            dir.path()
+                .join(format!("{SAVE_ATTEMPTS}-0000000000000003.tprl"))
+        );
         fs::remove_file(&last).unwrap();
         taken(SAVE_ATTEMPTS);
         assert_eq!(
@@ -263,10 +291,23 @@ mod tests {
     }
 
     #[test]
-    fn a_record_number_is_the_stem_up_to_its_time() {
-        assert_eq!(record_number("12-1730000000000000"), Some(12));
+    fn a_record_number_is_the_stem_up_to_its_id() {
+        assert_eq!(record_number("12-00ab00cd00ef0012"), Some(12));
         assert_eq!(record_number("12"), Some(12));
         assert_eq!(record_number("x-1"), None);
         assert_eq!(record_number("notes"), None);
+    }
+
+    /// Ids made at one clock reading differ, so a deleted record's name
+    /// does not come back when the clock repeats.
+    #[test]
+    fn record_ids_do_not_repeat_with_the_clock() {
+        let ids: std::collections::HashSet<u64> = (0..1_000).map(|_| record_id(42)).collect();
+        assert_eq!(ids.len(), 1_000);
+        let dir = dir();
+        let first = publish(dir.path(), b"x", 1, record_id(42)).unwrap();
+        fs::remove_file(&first).unwrap();
+        let again = publish(dir.path(), b"x", 1, record_id(42)).unwrap();
+        assert_ne!(first, again);
     }
 }

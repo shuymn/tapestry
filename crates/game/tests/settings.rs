@@ -481,7 +481,7 @@ fn a_record_numbered_last_leaves_no_number_to_save_under() {
     assert_eq!(names(&dir).len(), 1);
 }
 
-/// A record file's number: its name up to the time of saving.
+/// A record file's number: its name up to its id.
 fn number(name: &str) -> u64 {
     let stem = name.trim_end_matches(".tprl");
     stem.split_once('-')
