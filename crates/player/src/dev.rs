@@ -350,6 +350,10 @@ pub enum SelectStep {
     Analyzed,
     /// Press Enter.
     Enter,
+    /// Press F11: the previous play preset.
+    PrevPreset,
+    /// Press F12: the next play preset.
+    NextPreset,
     /// A play starts, fed as it says (a scenario's `play`).
     Play(scenario::PlayStep),
     /// Save the frame its capture names, in the next play that starts.
@@ -387,8 +391,9 @@ pub const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
 /// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
-/// `idle=<ms>`, `analyzed`, `enter`, `back`, `retry`, `next`, `prev` and
-/// `close`. Selection steps run on the select screen, `back`, `retry`,
+/// `idle=<ms>`, `analyzed`, `enter`, `prev-preset`, `next-preset`, `back`,
+/// `retry`, `next`, `prev` and `close`. Selection steps run on the select
+/// screen (`prev-preset` and `next-preset` press F11 and F12), `back`, `retry`,
 /// `next` and `prev` on a result; a step out of place, or a chart not
 /// listed within [`STEP_TIMEOUT`], fails the run. A scenario
 /// ([`scenario`]) compiles into the same steps, each with the scenario step
@@ -429,7 +434,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, analyzed, enter, back, retry, next, prev or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, analyzed, enter, prev-preset, next-preset, back, retry, next, prev or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -437,13 +442,15 @@ impl SelectScript {
                     .map_err(|_| format!("{s} takes milliseconds")),
                 None if s == "analyzed" => Ok(SelectStep::Analyzed),
                 None if s == "enter" => Ok(SelectStep::Enter),
+                None if s == "prev-preset" => Ok(SelectStep::PrevPreset),
+                None if s == "next-preset" => Ok(SelectStep::NextPreset),
                 None if s == "back" => Ok(SelectStep::Back),
                 None if s == "retry" => Ok(SelectStep::Retry),
                 None if s == "next" => Ok(SelectStep::Next),
                 None if s == "prev" => Ok(SelectStep::Prev),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, analyzed, enter, back, retry, next, prev or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, analyzed, enter, prev-preset, next-preset, back, retry, next, prev or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

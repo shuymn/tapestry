@@ -29,10 +29,10 @@ use crate::logic::LogicError;
 use crate::policy::{SessionEvent, SessionEventSink, SharedEvents};
 use crate::practice::PracticeError;
 use crate::practice_screen::{PracticeActed, PracticeInput, PracticeScreen};
-use crate::presets::{PollDeadline, Shelf, ShelfError, UnknownPreset};
+use crate::presets::{PollDeadline, PresetStep, Shelf, ShelfError, UnknownPreset};
 use crate::session::Command;
 use crate::session::{Loaded, Parts, SessionConfig, SessionError, Settings};
-use crate::settings::DataRoot;
+use crate::settings::{DataRoot, PlayerSettings};
 
 /// The longest idle wait on the select screen and a result, on the rig's
 /// clock: the flow looks again at least this often.
@@ -60,7 +60,8 @@ pub trait AppRig: Rig {
     fn entered_selection(&mut self);
     /// The shelf, or why it cannot open: called on every entry into
     /// selection, right after [`entered_selection`](Self::entered_selection),
-    /// and after every poll there that changed it.
+    /// and after every poll or batch of preset steps there that changed
+    /// it.
     fn presets_changed(&mut self, shelf: Result<&Shelf, &ShelfError>) {
         let _ = shelf;
     }
@@ -84,6 +85,12 @@ pub trait AppRig: Rig {
     }
     /// The next input on the practice screen, taken.
     fn take_practice(&mut self) -> Option<PracticeInput> {
+        None
+    }
+    /// The next step of the play preset taken on the select screen, in
+    /// the order taken: those before a chosen chart, taken by the same
+    /// [`choose`](Self::choose), apply to it.
+    fn take_preset_step(&mut self) -> Option<PresetStep> {
         None
     }
 }
@@ -225,6 +232,44 @@ impl App {
         }
     }
 
+    /// Applies the preset steps the rig took (design.md "Play Lifecycle");
+    /// whether what the rig shows of the shelf changed. Each step checks
+    /// the shelf and chooses the previous or next entry that loads; a step
+    /// while the shelf cannot open opens it on the default preset. The
+    /// chosen name is the one the next chart loads with, and the one a
+    /// shelf that cannot open is opened with again.
+    fn step_presets<R: AppRig>(&mut self, rig: &mut R) -> bool {
+        let mut changed = false;
+        while let Some(step) = rig.take_preset_step() {
+            changed |= match &mut self.shelf {
+                Ok(shelf) => {
+                    let before = shelf.revision();
+                    shelf.step(step);
+                    shelf.revision() != before
+                }
+                Err(_) => {
+                    let default = PlayerSettings::default().preset;
+                    match Shelf::open(self.root.presets(), &default) {
+                        Ok(mut shelf) => {
+                            // The cadence carries over, as at a reopen.
+                            shelf.set_deadline(self.reopen);
+                            self.shelf = Ok(shelf);
+                            true
+                        }
+                        // A built-in opens whatever the folder holds.
+                        Err(_) => false,
+                    }
+                }
+            };
+        }
+        if let Ok(shelf) = &self.shelf
+            && shelf.chosen_name() != self.settings.player.preset
+        {
+            self.settings.player.preset = shelf.chosen_name().to_owned();
+        }
+        changed
+    }
+
     /// Runs the scene flow from song selection until the window closes.
     ///
     /// # Errors
@@ -255,14 +300,20 @@ impl App {
                     rig.prepare_screen().map_err(LiveError::Screen)?;
                     continue 'select;
                 }
-                if let Some(pick) = rig.choose() {
+                // Steps taken before a choice apply to the chart chosen.
+                let pick = rig.choose();
+                let stepped = self.step_presets(rig);
+                if let Some(pick) = pick {
+                    if stepped {
+                        rig.presets_changed(self.shelf.as_ref());
+                    }
                     break pick;
                 }
                 // The user preset files are polled while selection shows,
                 // and the wait ends at the poll deadline at the latest, so a
                 // wake just before it does not put the check off.
                 let now = rig.now();
-                if self.poll(now) {
+                if self.poll(now) | stepped {
                     // A refusal for the shelf that would not open is over
                     // once it opens: it is not shown again.
                     if self.shelf.is_ok()

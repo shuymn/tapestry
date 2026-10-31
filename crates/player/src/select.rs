@@ -4,7 +4,8 @@
 //! the page the render thread draws from them ([`MenuPage`]).
 //!
 //! The keyboard's input comes through winit: the navigation keys move the
-//! cursor, Enter chooses, Tab gives the search box focus, and text typed
+//! cursor, Enter chooses, F11 and F12 step the play preset, which the game
+//! thread's flow applies, Tab gives the search box focus, and text typed
 //! or committed through the IME goes into the search box only while it
 //! has focus. The keyboard's lane keys type nothing into the list. The
 //! controller's bound lane controls come from the input thread as menu
@@ -52,6 +53,10 @@ pub enum MenuKey {
     Escape,
     /// P: the practice screen of the chart under the cursor.
     Practice,
+    /// F11: the previous play preset.
+    PrevPreset,
+    /// F12: the next play preset.
+    NextPreset,
 }
 
 /// What the window hands the select screen.
@@ -66,13 +71,14 @@ pub enum MenuInput {
 }
 
 /// What a controller's bound lane control does on the select screen
-/// (design.md "Input"), the one table of it: the white keys 1, 3, 5 and 7
-/// confirm, the black keys 2, 4 and 6 go back, and the scratch scrolls: an
+/// (design.md "Input"), the one table of it: the white keys 1, 3 and 5
+/// confirm, the white key 7 sends its own event (the next play preset
+/// there), the black keys 2, 4 and 6 go back, and the scratch scrolls: an
 /// axis one line per press threshold of movement, toward higher values
 /// down and lower values up, and a scratch of two buttons up for the first
 /// bound and down for the second, a line per press.
 fn lane_menu(lane: u8, axis: bool, nth_scratch: usize) -> Option<MenuAction> {
-    use input::MenuEvent::{Back, Confirm, Down, Up};
+    use input::MenuEvent::{Back, Confirm, Down, Extra, Up};
     Some(match (lane, axis) {
         (0, true) => MenuAction::Turn {
             forward: Down,
@@ -80,7 +86,8 @@ fn lane_menu(lane: u8, axis: bool, nth_scratch: usize) -> Option<MenuAction> {
         },
         (0, false) if nth_scratch == 0 => MenuAction::Press(Up),
         (0, false) if nth_scratch == 1 => MenuAction::Press(Down),
-        (1 | 3 | 5 | 7, _) => MenuAction::Press(Confirm),
+        (1 | 3 | 5, _) => MenuAction::Press(Confirm),
+        (7, _) => MenuAction::Press(Extra),
         (2 | 4 | 6, _) => MenuAction::Press(Back),
         _ => return None,
     })
@@ -120,10 +127,12 @@ pub fn menu_bindings(
     })
 }
 
-/// The select screen's key for a controller's menu event.
+/// The select screen's key for a controller's menu event: key 7 chooses
+/// the next play preset, as F12 does.
 pub const fn event_key(event: MenuEvent) -> MenuKey {
     match event {
         MenuEvent::Confirm => MenuKey::Enter,
+        MenuEvent::Extra => MenuKey::NextPreset,
         MenuEvent::Back => MenuKey::Escape,
         MenuEvent::Up => MenuKey::Up,
         MenuEvent::Down => MenuKey::Down,
@@ -142,12 +151,13 @@ pub const fn result_key(key: MenuKey) -> Option<game::MenuCommand> {
 }
 
 /// The result screen's command for a controller's menu event: the scratch
-/// switches presets, the white keys retry and the black keys go back.
+/// switches presets, the white keys (7 included) retry and the black keys
+/// go back.
 pub const fn result_event(event: MenuEvent) -> game::MenuCommand {
     match event {
         MenuEvent::Up => game::MenuCommand::PrevPreset,
         MenuEvent::Down => game::MenuCommand::NextPreset,
-        MenuEvent::Confirm => game::MenuCommand::Retry,
+        MenuEvent::Confirm | MenuEvent::Extra => game::MenuCommand::Retry,
         MenuEvent::Back => game::MenuCommand::Back,
     }
 }
@@ -216,6 +226,9 @@ pub enum Acted {
     Choose(PathBuf),
     /// The chart under the cursor is to be practiced.
     Practice(PathBuf),
+    /// The play preset is to step: the game thread's flow, which holds
+    /// the presets, takes it.
+    Preset(game::PresetStep),
 }
 
 /// The orders, in the order Left and Right cycle them, with their labels.
@@ -260,6 +273,8 @@ pub struct SelectScreen {
     preset: String,
     /// The chosen preset file's error, or why the shelf cannot open.
     preset_error: Option<String>,
+    /// Why `player.toml` could not be written, until it is.
+    save_error: Option<String>,
     /// The library roots, for folder names.
     roots: Vec<PathBuf>,
     /// The chosen preset, whose bests the list shows.
@@ -376,6 +391,12 @@ impl SelectScreen {
         self.preset_error = error;
     }
 
+    /// Shows why `player.toml` could not be written, while no refusal
+    /// shows; `None` once it was.
+    pub fn set_save_error(&mut self, error: Option<String>) {
+        self.save_error = error;
+    }
+
     /// The preset whose bests the list shows; `None` shows none.
     pub fn set_bests_preset(&mut self, preset: Option<RulePreset>) {
         if preset.is_none() {
@@ -439,6 +460,8 @@ impl SelectScreen {
                     None => Acted::Nothing,
                 };
             }
+            MenuKey::PrevPreset => return Acted::Preset(game::PresetStep::Prev),
+            MenuKey::NextPreset => return Acted::Preset(game::PresetStep::Next),
             // The retry and quit keys mean nothing here.
             MenuKey::Backspace | MenuKey::Escape => return Acted::Nothing,
         };
@@ -501,6 +524,7 @@ impl SelectScreen {
         lines.push(line(
             self.notice
                 .clone()
+                .or_else(|| self.save_error.clone())
                 .or_else(|| self.preset_error.clone())
                 .unwrap_or_default(),
             LineStyle::Notice,
@@ -540,7 +564,7 @@ impl SelectScreen {
             lines.push(line(String::new(), LineStyle::Chart));
         }
         lines.push(line(
-            "↑↓ 選択  Enter 決定  P 練習  Tab 検索  ←→ 並び順  F1-F8 設定  ウィンドウを閉じて終了"
+            "↑↓ 選択  Enter 決定  P 練習  Tab 検索  ←→ 並び順  F11/F12 プリセット  F1-F8 設定  ウィンドウを閉じて終了"
                 .to_owned(),
             LineStyle::Help,
         ));
@@ -631,15 +655,16 @@ mod tests {
         MenuInput::Key(k)
     }
 
-    /// The controller's menu table: the white keys 1, 3, 5 and 7 confirm,
-    /// the black keys 2, 4 and 6 go back; a scratch axis scrolls down
+    /// The controller's menu table: the white keys 1, 3 and 5 confirm, the
+    /// white key 7 sends its own event, which steps to the next preset on
+    /// the select screen, the black keys 2, 4 and 6 go back; a scratch axis scrolls down
     /// toward higher values and up toward lower ones, a scratch of two
     /// buttons up with the first bound and down with the second, at the
     /// press threshold; without a configured controller there is no menu.
     /// On a result: the arrows switch presets (left and up back, right and
-    /// down on), and Enter, Escape, Backspace and the rest do nothing; the
-    /// scratch switches presets, the white keys retry and the black keys go
-    /// back.
+    /// down on), and Enter, Escape, Backspace, F11, F12 and the rest do
+    /// nothing; the scratch switches presets, the white keys (7 included)
+    /// retry and the black keys go back.
     #[test]
     fn result_keys_and_controller_events_map_to_menu_commands() {
         use game::MenuCommand::{Back, NextPreset, PrevPreset, Retry};
@@ -657,6 +682,8 @@ mod tests {
             (MenuKey::PageDown, None),
             (MenuKey::Home, None),
             (MenuKey::End, None),
+            (MenuKey::PrevPreset, None),
+            (MenuKey::NextPreset, None),
         ] {
             assert_eq!(super::result_key(key), command, "{key:?}");
         }
@@ -664,6 +691,7 @@ mod tests {
             (MenuEvent::Up, PrevPreset),
             (MenuEvent::Down, NextPreset),
             (MenuEvent::Confirm, Retry),
+            (MenuEvent::Extra, Retry),
             (MenuEvent::Back, Back),
         ] {
             assert_eq!(super::result_event(event), command, "{event:?}");
@@ -727,7 +755,7 @@ mod tests {
         let scratch = game::ScratchConfig::default();
         let press = |e| MenuAction::Press(e);
         let (c, k) = (MenuEvent::Confirm, MenuEvent::Back);
-        let mut want: Vec<(ControlId, MenuAction)> = [c, k, c, k, c, k, c]
+        let mut want: Vec<(ControlId, MenuAction)> = [c, k, c, k, c, k, MenuEvent::Extra]
             .into_iter()
             .zip(11..)
             .map(|(e, n)| (ControlId(n), press(e)))
@@ -761,6 +789,7 @@ mod tests {
         assert_eq!(event_key(MenuEvent::Back), MenuKey::Escape);
         assert_eq!(event_key(MenuEvent::Up), MenuKey::Up);
         assert_eq!(event_key(MenuEvent::Down), MenuKey::Down);
+        assert_eq!(event_key(MenuEvent::Extra), MenuKey::NextPreset);
     }
 
     /// The navigation keys move the cursor within the list, Enter chooses

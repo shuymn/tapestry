@@ -674,8 +674,9 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
         );
     }
 
-    // The settings keys F1 (first) and F8 (last), the overlay key F9 and
-    // the keep key F12, as a lane, retry and quit; F10 is free.
+    // The settings keys F1 (first) and F8 (last), the overlay key F9, the
+    // preset keys F11 and F12 (also the keep key), as a lane, retry and
+    // quit; F10 is free.
     let reserved = [
         (with(|d| set_lane(d, 1, 0x3b)), 0x3b, "hi-speed"),
         (
@@ -688,6 +689,12 @@ fn key_configs_that_reuse_a_control_or_bind_a_reserved_key_are_refused_on_load()
             0x58,
             "keeping a binding",
         ),
+        (
+            with(|d| d.keyboard.retry = Some(0x57)),
+            0x57,
+            "is reserved for the previous play preset",
+        ),
+        (with(|d| set_lane(d, 3, 0x58)), 0x58, "the next play preset"),
         (
             with(|d| set_lane(d, 4, 0x43)),
             0x43,
@@ -857,6 +864,8 @@ fn settings_keys_step_and_stop_at_their_bounds() {
         assert_eq!(game::reserved_key(free), None);
     }
     assert!(game::reserved_key(game::KEEP_KEY).is_some());
+    assert_eq!(game::NEXT_PRESET_KEY, game::KEEP_KEY);
+    assert!(game::reserved_key(game::PREV_PRESET_KEY).is_some());
 
     let t = Tuning {
         visible_time_ms: 600,
@@ -1106,11 +1115,11 @@ fn two_names_of_one_key_cannot_have_two_roles() {
     ];
     assert!(load_written(&pad, &player).is_ok());
     // The settings keys and the keep key have one name each.
-    for code in game::Adjust::ALL
-        .iter()
-        .map(|a| a.key())
-        .chain([game::KEEP_KEY, game::OVERLAY_KEY])
-    {
+    for code in game::Adjust::ALL.iter().map(|a| a.key()).chain([
+        game::KEEP_KEY,
+        game::OVERLAY_KEY,
+        game::PREV_PRESET_KEY,
+    ]) {
         for other in (0..=0xFF).chain(0xE000..=0xE1FF) {
             let same = input::raw::key_identity(eval::ControlId(other))
                 == input::raw::key_identity(eval::ControlId(code));

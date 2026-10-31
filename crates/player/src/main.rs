@@ -1315,6 +1315,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         dropped: 0,
         preset_refusal: false,
         search_pending: false,
+        preset_steps: std::collections::VecDeque::new(),
         ime,
         rate: opened.rate,
         chosen_at: TimeUs(0),

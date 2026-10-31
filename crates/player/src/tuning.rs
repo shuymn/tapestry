@@ -150,20 +150,61 @@ impl Delivered {
     }
 }
 
-/// `device.toml` and `player.toml` as the settings keys leave them.
+/// `device.toml` and `player.toml` as the settings keys and the select
+/// screen's preset leave them.
 #[derive(Debug)]
 pub struct SettingsFiles {
     root: DataRoot,
     /// What the files hold: as loaded, then as last written.
     written: Settings,
+    /// The play preset the select screen chose, written with the rest.
+    preset: String,
+    /// Why `player.toml` could not be written, until it is or holds what
+    /// is wanted.
+    player_error: Option<String>,
 }
 
 impl SettingsFiles {
     /// The files in `root`, holding `loaded`.
-    pub const fn new(root: DataRoot, loaded: Settings) -> Self {
+    pub fn new(root: DataRoot, loaded: Settings) -> Self {
         Self {
             root,
+            preset: loaded.player.preset.clone(),
             written: loaded,
+            player_error: None,
+        }
+    }
+
+    /// The play preset `player.toml` is to hold.
+    pub fn preset(&self) -> &str {
+        &self.preset
+    }
+
+    /// Why `player.toml` could not be written at the last write that
+    /// tried, while it does not hold what is wanted.
+    pub fn player_error(&self) -> Option<&str> {
+        self.player_error.as_deref()
+    }
+
+    /// Chooses the play preset `name` and writes it at once, with the
+    /// values `t` and the periods the audio output queues, as
+    /// [`write`](Self::write) does (design.md "Settings Files").
+    ///
+    /// # Errors
+    ///
+    /// Why `player.toml` could not be written: the choice is kept and
+    /// written at the next write.
+    pub fn choose_preset(
+        &mut self,
+        name: &str,
+        t: Tuning,
+        queued_periods: u32,
+    ) -> Result<(), String> {
+        name.clone_into(&mut self.preset);
+        self.write(t, queued_periods);
+        match &self.player_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
         }
     }
 
@@ -176,6 +217,7 @@ impl SettingsFiles {
         let mut next = self.written.clone();
         t.apply_to(&mut next);
         next.device.queued_periods = queued_periods;
+        next.player.preset.clone_from(&self.preset);
         let mut wrote = Vec::new();
         if next.device != self.written.device {
             let path = self.root.device_settings();
@@ -187,14 +229,21 @@ impl SettingsFiles {
                 Err(e) => eprintln!("{}: {}", path.display(), Chain(&e)),
             }
         }
-        if next.player != self.written.player {
+        if next.player == self.written.player {
+            self.player_error = None;
+        } else {
             let path = self.root.player_settings();
             match save_settings(&path, &next.player) {
                 Ok(()) => {
                     self.written.player = next.player;
+                    self.player_error = None;
                     wrote.push("player.toml");
                 }
-                Err(e) => eprintln!("{}: {}", path.display(), Chain(&e)),
+                Err(e) => {
+                    let why = Chain(&e).to_string();
+                    eprintln!("{}: {why}", path.display());
+                    self.player_error = Some(why);
+                }
             }
         }
         for name in &wrote {
@@ -320,6 +369,66 @@ mod tests {
             files.write(faster.adjust(Adjust::VolumeDown), 2),
             ["device.toml"]
         );
+    }
+
+    /// A chosen preset is written to `player.toml` at once, with the values
+    /// as they stand, and later writes keep it.
+    #[test]
+    fn a_chosen_preset_is_written_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().to_owned());
+        let loaded = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let mut files = SettingsFiles::new(root.clone(), loaded.clone());
+        let faster = Tuning::of(&loaded).adjust(Adjust::HiSpeedUp);
+        assert_eq!(files.choose_preset("lr2-style", faster, 2), Ok(()));
+        let s = game::Settings::load(&root).unwrap();
+        assert_eq!(s.player.preset, "lr2-style");
+        assert_eq!(s.player.visible_time_ms, 569);
+        assert_eq!(files.preset(), "lr2-style");
+        let slower = faster.adjust(Adjust::HiSpeedDown);
+        assert_eq!(files.write(slower, 2), ["player.toml"]);
+        let s = game::Settings::load(&root).unwrap();
+        assert_eq!(s.player.preset, "lr2-style");
+        assert_eq!(s.player.visible_time_ms, 600);
+        assert_eq!(files.player_error(), None);
+    }
+
+    /// A chosen preset that cannot be written is kept, with the error, and
+    /// written by the next ordinary write, which clears the error; choosing
+    /// back the preset the file holds clears it too.
+    #[test]
+    fn a_preset_that_cannot_be_written_is_written_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().to_owned());
+        let loaded = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let mut files = SettingsFiles::new(root.clone(), loaded.clone());
+        let t = Tuning::of(&loaded);
+        // `player.toml` cannot be written: a directory is in the way.
+        std::fs::create_dir_all(root.player_settings().join("x")).unwrap();
+        let Err(e) = files.choose_preset("tapestry", t, 2) else {
+            panic!("written");
+        };
+        assert_eq!(files.player_error(), Some(e.as_str()));
+        assert_eq!(files.preset(), "tapestry");
+        std::fs::remove_dir_all(root.player_settings()).unwrap();
+        assert_eq!(files.write(t, 2), ["player.toml"]);
+        assert_eq!(files.player_error(), None);
+        assert_eq!(
+            game::Settings::load(&root).unwrap().player.preset,
+            "tapestry"
+        );
+        // Failing again, then choosing back what the file holds.
+        std::fs::remove_file(root.player_settings()).unwrap();
+        std::fs::create_dir_all(root.player_settings().join("x")).unwrap();
+        assert!(files.choose_preset("lr2-style", t, 2).is_err());
+        assert_eq!(files.choose_preset("tapestry", t, 2), Ok(()));
+        assert_eq!(files.player_error(), None);
     }
 
     /// A raised audio queue goes to `device.toml` alone; a write that fails
