@@ -1288,6 +1288,87 @@ impl Skin {
 mod tests {
     use super::radians;
 
+    /// Only a text whose visibility does not fold to false is laid out.
+    #[test]
+    fn hidden_bitmap_text_is_not_laid_out() {
+        use crate::{
+            Align, Anchor, Attempt, Blend, ChartText, Ease, ElementDef, End, Fit, FontRef, KeyDef,
+            Overflow, PLAY, Place, PlayContext, Region, RegionDef, Root, Scope, SheetBuilder, Side,
+            Skin, SkinDef, Source, TextDef, TextValue, TimerRef, Track, Ty, WidgetDefs, compile,
+            timer,
+        };
+        use bms_model::{ChartBuilder, TimeUs};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.fnt"),
+            "info face=\"t\" size=10 padding=0,0,0,0\n\
+             common lineHeight=12 base=10 scaleW=8 scaleH=8 pages=1\n\
+             page id=0 file=\"f.png\"\n\
+             char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n",
+        )
+        .unwrap();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([255; 4]))
+            .save_with_format(dir.path().join("f.png"), image::ImageFormat::Png)
+            .unwrap();
+        let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
+        let f = b.admit_fnt("f.fnt", &mut |_| Ok(())).unwrap();
+        b.add_bitmap_font(f, &[]).unwrap();
+        let mut props = [None; 9];
+        props[..4].copy_from_slice(&[Some(0), Some(0), Some(100), Some(10)]);
+        let track = Track::new(
+            &[KeyDef {
+                at: TimeUs(0),
+                props,
+            }],
+            Ease::Linear,
+            End::Hold,
+        )
+        .unwrap();
+        let element = |i: u32, visible: &str| ElementDef {
+            source: Source::Text(i),
+            track: track.clone(),
+            timer: TimerRef::Builtin(timer::READY),
+            visible: Some(compile(visible, &Scope::new(&PLAY), Ty::Bool).unwrap()),
+            blend: Blend::Alpha,
+            clip: None,
+            place: Place::SCREEN,
+        };
+        let text = TextDef {
+            value: TextValue::Literal("A".into()),
+            font: FontRef::Bitmap(0),
+            align: Align::Left,
+            overflow: Overflow::Spill,
+        };
+        let skin = Skin::new(SkinDef {
+            fit: Fit::Adapt,
+            regions: [RegionDef {
+                anchor: Anchor::TopLeft,
+                optional: false,
+            }; Region::COUNT],
+            whens: Vec::new(),
+            sheet: b.finish(),
+            lanes: None,
+            elements: vec![element(0, "true"), element(1, "false")],
+            widgets: WidgetDefs {
+                texts: vec![text.clone(), text],
+                ..WidgetDefs::default()
+            },
+        })
+        .unwrap();
+        let chart = ChartBuilder::new(150_000).build().unwrap();
+        let ctx = PlayContext {
+            gauges: &[],
+            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            empty_poor_breaks_combo: false,
+            scratch: Side::Left,
+        };
+        let mut play = skin.prepare(&chart, &ctx).unwrap();
+        skin.attach_bitmap_text(&mut play, &ChartText::default());
+        let laid: Vec<bool> = play.bitmap().iter().map(Option::is_some).collect();
+        assert_eq!(laid, [true, false]);
+    }
+
     #[test]
     fn angles_reduce_into_one_turn() {
         assert_eq!(radians(0.0), 0.0);
