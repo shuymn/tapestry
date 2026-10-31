@@ -222,12 +222,17 @@ impl Cx<'_> {
             u32::try_from(w),
             u32::try_from(h),
         ) else {
-            self.drop_el(role, at, NoteKind::UnsupportedField { field: "src rect" })?;
+            self.drop_el(role, at, NoteKind::SourceRect)?;
             return Ok(None);
         };
         let [dx, dy] = s.div;
         let cell = [w / dx, h / dy];
         let rect = [x, y, cell[0] * grid[0], cell[1] * grid[1]];
+        let inside = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
+        if !inside(x, rect[2], fw) || !inside(y, rect[3], fh) {
+            self.drop_el(role, at, NoteKind::SourceRect)?;
+            return Ok(None);
+        }
         let def = ImageDef {
             file,
             rect: Some(rect),
@@ -313,20 +318,25 @@ impl Cx<'_> {
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
             return Ok(());
         };
+        let native = c.stretch.native(cell);
         let mut rects = Vec::with_capacity(c.track.keys.len());
-        let mut branches = Vec::with_capacity(c.track.keys.len());
+        let mut shared = track::ANY_BRANCH;
         for k in &c.track.keys {
             let r = self.key_rect(&c, k)?;
-            let (r, b) = track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?;
-            branches.push(b);
+            let (r, b) = if native.is_some() {
+                (r, 0b1)
+            } else {
+                track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?
+            };
+            shared &= b;
             rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
         }
-        if !track::one_branch(branches) {
+        if !track::one_branch(shared) {
             self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
             return Ok(());
         }
         let t = self.model_track(&c, &rects)?;
-        self.push(c, Source::Image(image), t);
+        self.push_native(c, Source::Image(image), t, native);
         Ok(())
     }
 

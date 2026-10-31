@@ -481,6 +481,7 @@ fn hidden_regions_and_offered_controls() {
         lanes: None,
         elements: vec![image(WHITE, [0; 4], Place::SCREEN)],
         widgets: skin_model::WidgetDefs::default(),
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
     .unwrap();
     for r in Region::ALL {

@@ -105,17 +105,21 @@ impl Objects {
         Ok(None)
     }
 
-    /// Whether the `note` record has id `id`.
-    pub(crate) fn is_note(
+    /// Whether a record of `object`'s table has id `id`.
+    pub(crate) fn names(
         &mut self,
         def: &mut Definition,
         tables: &Tables,
         id: &str,
+        object: Object,
     ) -> Result<bool, ImportError> {
-        let slot = ORDER.len() - 1;
+        let Some(slot) = ORDER.iter().position(|&(_, o)| o == object) else {
+            return Ok(false);
+        };
+        let name = ORDER.get(slot).map_or("", |&(n, _)| n);
         if let Some(m) = self.maps.get_mut(slot) {
             if m.is_none() {
-                *m = Some(index(def, records(tables, "note"), false)?);
+                *m = Some(index(def, records(tables, name), false)?);
             }
             return Ok(m.as_ref().is_some_and(|m| m.contains_key(id)));
         }

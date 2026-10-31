@@ -3,7 +3,8 @@
 //! each image's frame and its place in the atlas, the canvas and the
 //! regions' placement as the target, the layout and the scratch side
 //! change, the lanes, number, gauge, judge and text widgets, and the
-//! elements into the batch.
+//! elements into the batch, image quads at their native size where they
+//! keep one.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -28,9 +29,9 @@ use skin_model::{
     Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, ClipId, ComboPart, CycleDef,
     DigitsDef, Ease, ElementDef, End, Fill, Filter, Fit, GaugeDef, GaugeDesc, GaugeLook,
     GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneTimer,
-    LaneView, Layout as SkinLayout, Motion, NumberDef, Pad, Place, Play, PlayContext, QuadBatch,
-    Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable,
-    Variant, lane_timer, timer,
+    LaneView, Layout as SkinLayout, Motion, Native, NumberDef, Pad, Place, Play, PlayContext,
+    QuadBatch, Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track,
+    UvTable, Variant, lane_timer, timer,
 };
 use skin_model::{
     ChartText, FontRef, FrameUv, Overflow, TextDef, TextField, TextImage, TextTable, TextValue,
@@ -505,6 +506,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             bind: Bind::Lanes,
             pivot: Anchor::Center,
             fill: Fill::None,
+            native: Some(Native::NoLarger([4, 4])),
         },
         Place {
             region: Region::Left,
@@ -514,6 +516,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
         Place {
             region: Region::Top,
             pivot: Anchor::Top,
+            native: Some(Native::Exact([3, 5])),
             ..Place::SCREEN
         },
         Place::SCREEN,
@@ -644,6 +647,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 pivot: Anchor::ALL[s.index()],
                 blend: if k % 2 == 0 { Blend::Alpha } else { Blend::Add },
                 visible: (k == 3).then(|| bool_program("bp < 100000")),
+                native: (k % 2 == 1).then_some(Native::Exact([2, 3])),
             });
             j.combos[s.index()] = Some(ComboPart {
                 digits: combos[s.index() % 3],
@@ -661,6 +665,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 pivot: Anchor::Center,
                 blend: Blend::Alpha,
                 visible: (k == 2).then(|| bool_program("combo % 3 != 0")),
+                native: (k == 1).then_some(Native::NoLarger([1, 1])),
             });
         }
         j
@@ -803,6 +808,11 @@ fn skin() -> Loaded {
                 pivot: Anchor::ALL[usize::from(i % 9)],
                 bind,
                 fill: Fill::None,
+                native: match i % 5 {
+                    1 => Some(Native::NoLarger([3, 2])),
+                    3 => Some(Native::Exact([2, 2])),
+                    _ => None,
+                },
             },
         });
     }
@@ -834,6 +844,7 @@ fn skin() -> Loaded {
         lanes: Some(lanes()),
         elements,
         widgets,
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
     .unwrap();
     // A page of 256 holds only some of the frames.
@@ -1118,6 +1129,7 @@ fn stretch(
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
             lanes: views.lanes[(frame_no / 23) % views.lanes.len()],
+            playing: true,
         };
         let use_small = frame_no % 100 == 99;
         let out = if use_small { &mut *small } else { &mut *batch };
@@ -1191,6 +1203,7 @@ fn build_does_not_allocate() {
         empty_poor_breaks_combo: true,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -1352,6 +1365,7 @@ fn build_does_not_allocate() {
         target: TARGETS[0],
         layout: &views.layouts[0],
         lanes: views.lanes[0],
+        playing: true,
     };
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch);
     assert!(!batch.quads().is_empty());
@@ -1397,6 +1411,7 @@ fn build_does_not_allocate() {
             target: TARGETS[0],
             layout: &views.layouts[0],
             lanes: views.lanes[0],
+            playing: true,
         };
         bitmap.build(&mut play, &frame, &uvs, &mut batch);
         glyphs += batch.quads().len();
@@ -1466,6 +1481,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
             texts: vec![text(Overflow::Spill), text(Overflow::Shrink)],
             ..skin_model::WidgetDefs::default()
         },
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
     .unwrap();
     (root, skin)
@@ -1507,6 +1523,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 cover,
                 lift,
             },
+            playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch);
         quads += batch.quads().len();

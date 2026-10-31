@@ -25,7 +25,7 @@ use crate::widget::lanes::{Geometry, Lanes, Side};
 pub const MIN_VISIBLE: i32 = 64;
 
 /// Where an element sits: its region, the point of its rect it rotates
-/// about, its lane binding and its fill.
+/// about, its lane binding, its fill and its native size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
     pub region: Region,
@@ -34,16 +34,58 @@ pub struct Place {
     pub pivot: Anchor,
     pub bind: Bind,
     pub fill: Fill,
+    /// A size in target pixels each image quad of the element keeps; text
+    /// and the lanes ignore it.
+    pub native: Option<Native>,
 }
 
 impl Place {
-    /// In `screen`, pivot at the top left, unbound, no fill.
+    /// In `screen`, pivot at the top left, unbound, no fill, no native
+    /// size.
     pub const SCREEN: Self = Self {
         region: Region::Screen,
         pivot: Anchor::TopLeft,
         bind: Bind::None,
         fill: Fill::None,
+        native: None,
     };
+}
+
+/// A quad size kept in target pixels whatever the canvas's scale, centred
+/// on the placed rect, from a frame's size in texels: an imported skin's
+/// stretch 8 and 9, which the source applies after scaling to the window
+/// (`skin/StretchType.java:85-98`, `skin/SkinObject.java:626-629`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Native {
+    /// Shrunk uniformly to fit the placed rect, never enlarged.
+    NoLarger([u32; 2]),
+    /// Exactly the frame's size.
+    Exact([u32; 2]),
+}
+
+impl Native {
+    /// The placed canvas rect `[x, y, w, h]` resized at `scale` target
+    /// pixels per canvas pixel. A frame without area keeps the rect.
+    pub(crate) fn fit(self, [x, y, w, h]: [f32; 4], scale: f32) -> [f32; 4] {
+        let (Self::NoLarger([iw, ih]) | Self::Exact([iw, ih])) = self;
+        if iw == 0 || ih == 0 || scale <= 0.0 {
+            return [x, y, w, h];
+        }
+        let s = f64::from(scale);
+        let (iw, ih) = (f64::from(iw), f64::from(ih));
+        let (fw, fh) = (f64::from(w), f64::from(h));
+        let k = match self {
+            Self::NoLarger(_) => (fw * s / iw).min(fh * s / ih).min(1.0),
+            Self::Exact(_) => 1.0,
+        };
+        let (nw, nh) = (iw * k / s, ih * k / s);
+        [
+            f32_of(f64::from(x) + (fw - nw) / 2.0),
+            f32_of(f64::from(y) + (fh - nh) / 2.0),
+            f32_of(nw),
+            f32_of(nh),
+        ]
+    }
 }
 
 /// What an element's x and width follow.

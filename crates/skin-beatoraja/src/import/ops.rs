@@ -6,7 +6,7 @@
 //! items fold to constants (`Skin.java:214-226`). An id that is neither
 //! is never drawn, for either sign.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// The ids `BooleanPropertyFactory.getBooleanProperty(int)` knows, with
 /// their names (`BooleanPropertyFactory.java:349-~720`, the `BooleanType`
@@ -278,8 +278,13 @@ pub(crate) fn is_builtin(id: i32) -> bool {
         || (PRACTICE_ITEM_SELECTED..PRACTICE_ITEM_SELECTED + PRACTICE_ITEMS).contains(&id)
 }
 
-/// A built-in, negated for `negative`.
-fn built_in_cond(id: i32, negative: bool) -> Cond {
+/// A built-in, negated for `negative`. Without a judge region
+/// (`judge_region`) the latest judgment is never a PERFECT
+/// (`JudgeManager.java:129, 686`).
+fn built_in_cond(id: i32, negative: bool, judge_region: bool) -> Cond {
+    if id == JUDGE_PERFECT && !judge_region {
+        return Cond::Fold(negative);
+    }
     match builtin(id) {
         Some(e) if negative => Cond::Expr(format!("!({e})")),
         Some(e) => Cond::Expr(e),
@@ -288,16 +293,16 @@ fn built_in_cond(id: i32, negative: bool) -> Cond {
 }
 
 /// Numeric op `op` (non-zero): built-ins first, then the declared items
-/// `declared`, folded against the selected `enabled`.
-pub(crate) fn numeric(op: i32, declared: &BTreeSet<i32>, enabled: &BTreeSet<i32>) -> Cond {
+/// `items`, each folded to whether it is selected.
+pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>, judge_region: bool) -> Cond {
     let Ok(id) = i32::try_from(op.unsigned_abs()) else {
         return Cond::Undefined(op);
     };
     if is_builtin(id) {
-        return built_in_cond(id, op < 0);
+        return built_in_cond(id, op < 0, judge_region);
     }
-    if declared.contains(&id) {
-        return Cond::Fold(enabled.contains(&id) == (op > 0));
+    if let Some(&on) = items.get(&id) {
+        return Cond::Fold(on == (op > 0));
     }
     Cond::Undefined(op)
 }
@@ -319,7 +324,7 @@ fn named_id(name: &str) -> Option<i32> {
 /// A boolean property named `name` (`getBooleanProperty(String)`,
 /// `BooleanPropertyFactory.java:69-85`): each leading `!` negates; a name
 /// the factory does not know is a script, `None`.
-pub(crate) fn named(name: &str) -> Option<Cond> {
+pub(crate) fn named(name: &str, judge_region: bool) -> Option<Cond> {
     let mut negative = false;
     let mut rest = name;
     while let Some(r) = rest.strip_prefix('!') {
@@ -327,7 +332,7 @@ pub(crate) fn named(name: &str) -> Option<Cond> {
         rest = r;
     }
     let id = named_id(rest)?;
-    Some(built_in_cond(id, negative))
+    Some(built_in_cond(id, negative, judge_region))
 }
 
 #[cfg(test)]
@@ -376,7 +381,7 @@ mod tests {
         let mut exprs = Vec::new();
         for &(id, _) in KNOWN_BOOLEAN_IDS {
             for op in [id, -id] {
-                if let Cond::Expr(e) = numeric(op, &BTreeSet::new(), &BTreeSet::new()) {
+                if let Cond::Expr(e) = numeric(op, &BTreeMap::new(), true) {
                     exprs.push(e);
                 }
             }
@@ -391,33 +396,37 @@ mod tests {
     #[test]
     fn names_negate_and_patterns_parse() {
         assert_eq!(
-            named("!!judge_1p_perfect"),
+            named("!!judge_1p_perfect", true),
             Some(Cond::Expr("on(judge.perfect)".into()))
         );
         assert_eq!(
-            named("!practice_item+2_selected"),
+            named("!practice_item+2_selected", true),
             Some(Cond::Unsupported(-3_021))
         );
-        assert_eq!(named("practice_item17"), None);
-        assert_eq!(named("myscript"), None);
+        assert_eq!(named("practice_item17", true), None);
+        assert_eq!(named("myscript", true), None);
+        // Without a judge region, PERFECT is never the latest judgment.
+        assert_eq!(named("judge_1p_perfect", false), Some(Cond::Fold(false)));
+        assert_eq!(named("!judge_1p_perfect", false), Some(Cond::Fold(true)));
+        assert_eq!(numeric(241, &BTreeMap::new(), false), Cond::Fold(false));
+        assert_eq!(numeric(-241, &BTreeMap::new(), false), Cond::Fold(true));
     }
 
     #[test]
     fn built_ins_win_over_declared_items() {
-        let declared = BTreeSet::from([241, 900]);
-        let on = BTreeSet::from([900]);
+        let items = BTreeMap::from([(241, false), (900, true)]);
         assert_eq!(
-            numeric(-241, &declared, &on),
+            numeric(-241, &items, true),
             Cond::Expr("!(on(judge.perfect))".into())
         );
-        assert_eq!(numeric(900, &declared, &on), Cond::Fold(true));
-        assert_eq!(numeric(-900, &declared, &on), Cond::Fold(false));
-        assert_eq!(numeric(901, &declared, &on), Cond::Undefined(901));
-        assert_eq!(numeric(202, &declared, &on), Cond::Unsupported(202));
+        assert_eq!(numeric(900, &items, true), Cond::Fold(true));
+        assert_eq!(numeric(-900, &items, true), Cond::Fold(false));
+        assert_eq!(numeric(901, &items, true), Cond::Undefined(901));
+        assert_eq!(numeric(202, &items, true), Cond::Unsupported(202));
         // The BGA built-ins win over items declared with their numbers.
-        let declared = BTreeSet::from([40, 41]);
-        assert_eq!(numeric(40, &declared, &declared), Cond::Unsupported(40));
-        assert_eq!(numeric(-41, &declared, &declared), Cond::Unsupported(-41));
-        assert_eq!(named("!bgaon"), Some(Cond::Unsupported(-41)));
+        let items = BTreeMap::from([(40, true), (41, true)]);
+        assert_eq!(numeric(40, &items, true), Cond::Unsupported(40));
+        assert_eq!(numeric(-41, &items, true), Cond::Unsupported(-41));
+        assert_eq!(named("!bgaon", true), Some(Cond::Unsupported(-41)));
     }
 }

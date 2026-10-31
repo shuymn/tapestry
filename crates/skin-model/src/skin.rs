@@ -12,7 +12,8 @@ use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
 use crate::expr::{CompileError, Program, SkinOps};
 use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
-use crate::place::{Bind, Bounds, Fill, Place, Placement, Regions, union};
+use crate::place::{Bind, Bounds, Fill, Native, Place, Placement, Regions, union};
+use crate::play::schema::Grade;
 use crate::play::schema::timer::BUILTIN;
 use crate::play::{Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
@@ -117,6 +118,9 @@ pub struct SkinDef {
     /// The widgets [`Source::Number`], [`Source::Gauge`] and
     /// [`Source::Judge`] index.
     pub widgets: WidgetDefs,
+    /// The last grade, in [`Grade::ALL`]'s order, whose press starts a
+    /// lane's `bomb` timer; `None` starts none.
+    pub bomb_up_to: Option<Grade>,
 }
 
 /// Why [`Skin::new`] refused a skin; `element` and `when` are indices.
@@ -216,6 +220,7 @@ struct Element {
     pivot: [f32; 2],
     bind: Bind,
     fill: Fill,
+    native: Option<Native>,
 }
 
 /// A loaded skin.
@@ -240,6 +245,7 @@ pub struct Skin {
     text_slots: u16,
     /// The quads one frame's widget elements can push, the lanes aside.
     widget_quads: u32,
+    bomb_up_to: Option<Grade>,
 }
 
 /// A table index from a definition's `u32`, past every table when it
@@ -803,6 +809,7 @@ impl Skin {
                         pivot: g.pivot.fractions(),
                         blend: g.blend,
                         visible: g.visible,
+                        native: g.native,
                     })
                 }),
                 combos: j.combos.map(|c| {
@@ -814,6 +821,7 @@ impl Skin {
                         pivot: c.pivot.fractions(),
                         blend: c.blend,
                         visible: c.visible,
+                        native: c.native,
                     })
                 }),
                 shift: j.shift,
@@ -858,6 +866,7 @@ impl Skin {
                 pivot: e.place.pivot.fractions(),
                 bind: e.place.bind,
                 fill: e.place.fill,
+                native: e.place.native,
             })
             .collect();
         Ok(Self {
@@ -875,6 +884,7 @@ impl Skin {
             texts: texts.into_boxed_slice(),
             text_slots,
             widget_quads,
+            bomb_up_to: def.bomb_up_to,
         })
     }
 
@@ -1136,7 +1146,13 @@ impl Skin {
     /// A negative lead-in, a countdown start outside the time range, or a
     /// section whose initial gauges do not match the context's gauges.
     pub fn prepare(&self, chart: &Chart, ctx: &PlayContext<'_>) -> Result<Play, PrepareError> {
-        Play::new(chart, ctx, self.whens.len(), self.lanes.is_some())
+        Play::new(
+            chart,
+            ctx,
+            self.whens.len(),
+            self.lanes.is_some(),
+            self.bomb_up_to,
+        )
     }
 
     /// Builds one frame: applies the drained effects, reads the snapshot,
@@ -1209,6 +1225,8 @@ impl Skin {
                 pivot: e.pivot,
                 angle: radians(s.angle),
                 color: s.color,
+                native: e.native,
+                scale: canvas.scale(),
             };
             let at = Frame {
                 play,
@@ -1247,6 +1265,7 @@ impl Skin {
                             map: brush.map,
                             color: s.color,
                             clip: e.key.clip,
+                            scale: canvas.scale(),
                         };
                         j.draw(&d, out);
                     }
@@ -1354,6 +1373,7 @@ mod tests {
                 texts: vec![text.clone(), text],
                 ..WidgetDefs::default()
             },
+            bomb_up_to: None,
         })
         .unwrap();
         let chart = ChartBuilder::new(150_000).build().unwrap();
@@ -1363,6 +1383,7 @@ mod tests {
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
+            last_note_end: TimeUs(0),
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         skin.attach_bitmap_text(&mut play, &ChartText::default());
