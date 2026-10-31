@@ -462,11 +462,8 @@ impl<'a> Evaluator<'a> {
                 })
             }
         };
-        // A tap or mine at `t`, or a long note from `t` to `end`, is a
-        // target of the section.
-        let in_section = |t: TimeUs, end: TimeUs| {
-            section.is_none_or(|s| s.start <= t && t < s.end && end < s.end)
-        };
+        // Without a section, every note is a target.
+        let in_section = |n: &bms_model::Note| section.is_none_or(|s| s.is_target(n));
         // The preset's header policy reads the chart's declarations into
         // one rank and one #TOTAL (design.md "Evaluation Stages").
         let headers = rule.headers.read(&chart.meta.judgment_headers);
@@ -496,7 +493,7 @@ impl<'a> Evaluator<'a> {
             |n: &bms_model::Note| matches!(n.kind, NoteKind::Tap | NoteKind::Long { .. });
         let mut lanes: [LaneState; LANE_COUNT] = Default::default();
         for (lane, (state, notes)) in lanes.iter_mut().zip(&chart.lanes).enumerate() {
-            let judgeable = |n: &bms_model::Note| judgeable(n) && in_section(n.time, n.end());
+            let judgeable = |n: &bms_model::Note| judgeable(n) && in_section(n);
             // Each lane's misses by its own class's late BAD edge.
             let miss_after = match rule.miss {
                 MissRule::PoorAfterLateBadOrOvertaken => {
@@ -538,7 +535,7 @@ impl<'a> Evaluator<'a> {
                 }
             }
             for (i, note) in notes.iter().enumerate() {
-                if matches!(note.kind, NoteKind::Mine { .. }) && in_section(note.time, note.time) {
+                if matches!(note.kind, NoteKind::Mine { .. }) && in_section(note) {
                     deadlines.push(Deadline {
                         time: note.time,
                         kind: DeadlineKind::Mine,
