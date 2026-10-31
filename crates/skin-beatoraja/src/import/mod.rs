@@ -708,6 +708,15 @@ impl<'d> Cx<'d> {
         };
         let mut keys = track::read(self.def, &dst.keys, o.digits)?;
         if o.neutral {
+            // The emitted keys, at 0 and at the last time, charged before
+            // the constructor's key joins.
+            let last = keys.keys.iter().map(|k| k.at).max().unwrap_or(0);
+            let emitted = 1 + usize::from(last > 0);
+            if emitted > written {
+                self.budget
+                    .keys(emitted - written)
+                    .map_err(|l| self.limit(at, l))?;
+            }
             // The constructor's key at 0 (`SkinObject.java:234-254`), then
             // the destination's times; values are not consumed.
             keys.keys.push(track::SrcKey::NEUTRAL);
@@ -720,15 +729,6 @@ impl<'d> Cx<'d> {
             if keys.clip {
                 self.ignored(at, NoteKind::Ignored { field: "clip" });
                 keys.clip = false;
-            }
-        }
-        if o.neutral {
-            let last = keys.keys.iter().map(|k| k.at).max().unwrap_or(0);
-            let emitted = 1 + usize::from(last > 0);
-            if emitted > written {
-                self.budget
-                    .keys(emitted - written)
-                    .map_err(|l| self.limit(at, l))?;
             }
         }
         let mut angle = false;
