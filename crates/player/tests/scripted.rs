@@ -806,6 +806,40 @@ fn auto_run(chart: &Path, appdata: &Path, extra: &[&std::ffi::OsStr]) -> std::pr
         .expect("run tapestry")
 }
 
+/// `tapestry play <chart>` switches presets on its result too: a scripted
+/// right arrow shows the play under lr2-style as a what-if, after the
+/// default beatoraja-style as played; the play preset is unchanged.
+#[test]
+fn direct_play_result_switches_presets() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &["--dev-result".as_ref(), "next,back".as_ref()],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let viewing: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("result: viewing "))
+        .collect();
+    assert_eq!(viewing.len(), 2, "{stdout}");
+    assert_eq!(viewing[0], "result: viewing beatoraja-style (as played)");
+    assert!(
+        viewing[1].starts_with("result: viewing lr2-style (what-if, "),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|l| l.starts_with("play started"))
+            .count(),
+        1,
+        "{stdout}"
+    );
+}
+
 /// Every file under `dir`, recursively.
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

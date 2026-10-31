@@ -262,6 +262,12 @@ impl ResultScreen {
         self.cursor
     }
 
+    /// The hash of the preset the play used: its entry is its own.
+    #[must_use]
+    pub const fn played(&self) -> [u8; 32] {
+        self.played
+    }
+
     /// The viewed entry.
     #[must_use]
     pub fn viewed(&self) -> Option<&ViewEntry> {

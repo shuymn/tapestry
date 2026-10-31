@@ -9,6 +9,7 @@
 //! render thread draws at the clock minus the origin. This thread runs the
 //! logic step, woken by the input thread after each publication.
 
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
-    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, Opening,
-    PlayReport, RenderSide, Rig, Settings, Tuning,
+    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, MenuCommand,
+    Opening, PlayReport, RenderSide, ResultScreen, Rig, Settings, Tuning, ViewStatus,
 };
 use input::{QpcClock, SourceReader};
 
@@ -30,6 +31,7 @@ use crate::measure::{
     process_page_faults, to_toml,
 };
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
+use crate::select::{MenuInput, MenuQueue, result_event, result_key};
 use crate::tuning::{Delivered, SettingsFiles};
 
 /// How long the logic step parks at most without a wake from the input
@@ -45,6 +47,110 @@ const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs
 /// Each saved play's record and figures, in order (dev-tools).
 #[cfg(feature = "dev-tools")]
 pub type MeasuredPlays = std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, Figures)>>>;
+
+/// The controller's menu events from the input thread, shared by the select
+/// screen and the result screen.
+#[derive(Default)]
+pub struct Pad {
+    /// Its queue; none without a configured controller.
+    pub receiver: Option<input::MenuReceiver>,
+    /// The events its queue dropped, as last reported.
+    pub dropped: u64,
+}
+
+impl Pad {
+    /// Takes the next event.
+    pub fn pop(&mut self) -> Option<input::MenuEvent> {
+        self.receiver.as_mut()?.pop()
+    }
+
+    /// Drops what is queued.
+    pub fn clear(&mut self) {
+        while self.pop().is_some() {}
+    }
+
+    /// Reports events the full queue dropped since the last report.
+    pub fn report_dropped(&mut self, screen: &str) {
+        let Some(pad) = &self.receiver else {
+            return;
+        };
+        let dropped = pad.dropped();
+        if dropped > self.dropped {
+            let line = format!(
+                "{screen}: {} controller menu events dropped, their queue was full",
+                dropped - self.dropped
+            );
+            eprintln!("{line}");
+            log::warn!("{line}");
+            self.dropped = dropped;
+        }
+    }
+}
+
+/// The result screen's input (design.md "Input"): the window's keys and
+/// the controller's menu events, read only while a result shows, so the
+/// select screen's input is never taken by a result.
+pub struct ResultInput {
+    /// What the window hands the menus; the select screen reads it too.
+    pub menu: Arc<MenuQueue>,
+    /// The controller's menu events.
+    pub pad: Pad,
+    /// Whether a result shows.
+    pub showing: bool,
+}
+
+impl ResultInput {
+    /// Input with nothing queued, no controller, and no result showing.
+    pub fn new(menu: Arc<MenuQueue>, pad: Option<input::MenuReceiver>) -> Self {
+        Self {
+            menu,
+            pad: Pad {
+                receiver: pad,
+                dropped: 0,
+            },
+            showing: false,
+        }
+    }
+
+    /// Drops everything queued: what arrived while no screen read it
+    /// belongs to no screen.
+    pub fn clear(&mut self) {
+        while self.menu.pop().is_some() {}
+        self.pad.clear();
+    }
+
+    /// A result shows: on entry, what was queued during the play is
+    /// dropped. Whether this was the entry.
+    pub fn enter(&mut self) -> bool {
+        if self.showing {
+            return false;
+        }
+        self.clear();
+        self.showing = true;
+        true
+    }
+
+    /// The next result command queued, while a result shows: the
+    /// controller's first, then the window's; keys and text that mean
+    /// nothing there are dropped.
+    pub fn take(&mut self) -> Option<MenuCommand> {
+        if !self.showing {
+            return None;
+        }
+        if let Some(event) = self.pad.pop() {
+            return Some(result_event(event));
+        }
+        self.pad.report_dropped("result");
+        while let Some(input) = self.menu.pop() {
+            if let MenuInput::Key(key) = input
+                && let Some(c) = result_key(key)
+            {
+                return Some(c);
+            }
+        }
+        None
+    }
+}
 
 /// The game's threads as a rig.
 pub struct PlayerRig<'a> {
@@ -82,6 +188,13 @@ pub struct PlayerRig<'a> {
     pub end_lines: Option<Vec<String>>,
     /// The end screen's key names.
     pub hints: Hints,
+    /// The result screen's input.
+    pub result_input: ResultInput,
+    /// The view last printed: its entry's name, and the evaluations made.
+    pub viewed: Option<(String, u64)>,
+    /// The result screen's input, scripted, without selection (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub result_script: Option<crate::dev::SelectScript>,
     /// What the first play's load time runs from: the process start (the
     /// clock's 0), or the end of what the command set up first (a
     /// measurement's PresentMon capture).
@@ -241,6 +354,42 @@ impl PlayerRig<'_> {
         let _: Figures = fig;
     }
 
+    /// Prints which preset the result views when that changed, and how
+    /// long a new evaluation took, with any error's full chain.
+    fn print_view(&mut self, screen: &ResultScreen) {
+        let Some(entry) = screen.viewed() else {
+            return;
+        };
+        let evaluations = screen.evaluations();
+        let before = self.viewed.replace((entry.name.clone(), evaluations));
+        if let Some(t) = screen.last_evaluation()
+            && before
+                .as_ref()
+                .map_or(evaluations > 0, |(_, n)| *n < evaluations)
+        {
+            println!("result: evaluated {} in {} ms", entry.name, t.as_millis());
+        }
+        if before.is_some_and(|(name, n)| name == entry.name && n == evaluations) {
+            return;
+        }
+        let what = match screen.status() {
+            ViewStatus::Ready(s) if s.as_played => "as played".to_owned(),
+            ViewStatus::Ready(s) => format!("what-if, {:?}", s.coverage),
+            ViewStatus::CannotLoad(e) => format!("cannot load: {}", Chain(e)),
+            ViewStatus::OverBudget { needed, budget } => {
+                format!("too large to re-evaluate: {needed} bytes, budget {budget}")
+            }
+            ViewStatus::Failed(e) => format!("no re-evaluation: {}", Chain(e)),
+            ViewStatus::NothingRecorded => "nothing recorded".to_owned(),
+        };
+        println!("result: viewing {} ({what})", entry.name);
+        log::info!("result: viewing {} ({what})", entry.name);
+        if let Some(e) = screen.file_error() {
+            eprintln!("result: {}", Chain(e));
+            log::warn!("result: {}", Chain(e));
+        }
+    }
+
     fn print(&self, report: &PlayReport) {
         let result = report.result.as_ref();
         let counts = result
@@ -306,6 +455,14 @@ impl Rig for PlayerRig<'_> {
         self.sync();
     }
 
+    fn idle_wait(&mut self, deadline: TimeUs) {
+        let left = deadline.0 - self.clock.now().0;
+        if left > 0 {
+            thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
+        }
+        self.sync();
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn take(&mut self) -> Option<Command> {
         let c = self.controls.take();
@@ -313,6 +470,20 @@ impl Rig for PlayerRig<'_> {
             self.pending_retry = self.controls.retry_at();
         }
         c
+    }
+
+    /// The retry and quit keys first (a suspend means nothing on a result),
+    /// then, while a result shows, its own keys and controller events.
+    fn take_menu(&mut self) -> Option<MenuCommand> {
+        loop {
+            match self.take() {
+                Some(Command::Retry) => return Some(MenuCommand::Retry),
+                Some(Command::Quit) => return Some(MenuCommand::Back),
+                Some(Command::Suspend) => {}
+                None => break,
+            }
+        }
+        self.result_input.take()
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -475,6 +646,7 @@ impl Rig for PlayerRig<'_> {
         // the Watermark"); the other values are recorded as they are at the
         // start.
         self.end_lines = None;
+        self.result_input.showing = false;
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
         self.input_offset_us = t.input_offset_us;
@@ -506,7 +678,12 @@ impl Rig for PlayerRig<'_> {
         self.persist();
     }
 
-    fn show_end(&mut self, report: &PlayReport) {
+    fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
+        // On entry: what was queued during the play is no result's.
+        if self.result_input.enter() {
+            self.viewed = None;
+        }
+        self.print_view(screen);
         let tuning = self.controls.tuning();
         tuning.open_end_screen();
         let queue = self.queue_line.unwrap_or(QueueLine {
@@ -516,6 +693,7 @@ impl Rig for PlayerRig<'_> {
         });
         self.end_lines = Some(end_screen::lines(
             report,
+            screen,
             self.input_offset_us,
             self.times,
             queue,

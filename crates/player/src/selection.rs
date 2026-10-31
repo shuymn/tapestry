@@ -15,17 +15,16 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bms_model::{TimeSource, TimeUs};
-use game::{AppRig, Chain, LoadRefusal, Loaded};
+use game::{AppRig, Chain, LoadRefusal, Loaded, Refused, SessionError};
 
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
-use crate::end_screen::LoadTimes;
+use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text};
 use crate::log_file;
-use crate::play::{PlayerRig, since};
+use crate::play::{Pad, PlayerRig, since};
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
 use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
 use crate::shelf::{Shelf, file_name};
@@ -42,15 +41,11 @@ pub struct Selection {
     pub shelf: Shelf,
     /// The screen's state.
     pub screen: SelectScreen,
-    /// What the window hands the screen.
+    /// What the window hands the screen: the result screen's input
+    /// ([`crate::play::ResultInput`]) reads it too, while a result shows.
     pub menu: Arc<MenuQueue>,
     /// The window's keys the queue dropped, as last reported.
     pub dropped: u64,
-    /// The controller's menu events from the input thread; none without a
-    /// configured controller.
-    pub pad: Option<input::MenuReceiver>,
-    /// The controller's events its queue dropped, as last reported.
-    pub pad_dropped: u64,
     /// The window's IME, allowed while the search box has focus; none
     /// headless.
     pub ime: Option<ImeSwitch>,
@@ -112,25 +107,14 @@ impl Selection {
     /// Takes the queued input; the chart it chose, if it did. Consecutive
     /// edits of the search or the order are searched once: at the end, or
     /// before any other input, which acts on the list they make.
-    fn drain(&mut self) -> Option<PathBuf> {
+    fn drain(&mut self, pad: &mut Pad) -> Option<PathBuf> {
         // The controller's events join the window's, as the keys they
         // stand for.
-        if let Some(pad) = &mut self.pad {
-            while let Some(event) = pad.pop() {
-                self.menu
-                    .push(MenuInput::Key(crate::select::event_key(event)));
-            }
-            let dropped = pad.dropped();
-            if dropped > self.pad_dropped {
-                let line = format!(
-                    "select: {} controller menu events dropped, their queue was full",
-                    dropped - self.pad_dropped
-                );
-                eprintln!("{line}");
-                log::warn!("{line}");
-                self.pad_dropped = dropped;
-            }
+        while let Some(event) = pad.pop() {
+            self.menu
+                .push(MenuInput::Key(crate::select::event_key(event)));
         }
+        pad.report_dropped("select");
         while let Some(input) = self.menu.pop() {
             let edit = matches!(
                 input,
@@ -247,7 +231,12 @@ impl Selection {
                     controls.close();
                     return false;
                 }
-                Some(step @ (SelectStep::Back | SelectStep::Retry)) => {
+                Some(
+                    step @ (SelectStep::Back
+                    | SelectStep::Retry
+                    | SelectStep::Next
+                    | SelectStep::Prev),
+                ) => {
                     script.fail(format!("{step:?} on the select screen"));
                     controls.close();
                     return false;
@@ -266,25 +255,8 @@ impl Selection {
     /// Runs the scripted step due on a result.
     #[cfg(feature = "dev-tools")]
     fn script_result(&mut self, controls: &Controls) {
-        use crate::dev::SelectStep;
-        let Some(script) = &mut self.script else {
-            return;
-        };
-        match script.front() {
-            Some(SelectStep::Back) => {
-                script.done();
-                controls.command(game::Command::Quit);
-            }
-            Some(SelectStep::Retry) => {
-                script.done();
-                controls.command(game::Command::Retry);
-            }
-            Some(step) => {
-                let why = format!("{step:?} on a result");
-                script.fail(why);
-                controls.close();
-            }
-            None => {}
+        if let Some(script) = &mut self.script {
+            script_result(script, controls, &self.menu);
         }
     }
 
@@ -294,6 +266,38 @@ impl Selection {
         self.script
             .as_ref()
             .and_then(|s| s.failure().map(str::to_owned))
+    }
+}
+
+/// Runs the scripted step due on a result: `back` and `retry` as their
+/// keys, `next` and `prev` as the right and left arrows on the window's
+/// queue `menu`.
+#[cfg(feature = "dev-tools")]
+pub fn script_result(script: &mut crate::dev::SelectScript, controls: &Controls, menu: &MenuQueue) {
+    use crate::dev::SelectStep;
+    match script.front() {
+        Some(SelectStep::Back) => {
+            script.done();
+            controls.command(game::Command::Quit);
+        }
+        Some(SelectStep::Retry) => {
+            script.done();
+            controls.command(game::Command::Retry);
+        }
+        Some(SelectStep::Next) => {
+            script.done();
+            menu.push(MenuInput::Key(MenuKey::Right));
+        }
+        Some(SelectStep::Prev) => {
+            script.done();
+            menu.push(MenuInput::Key(MenuKey::Left));
+        }
+        Some(step) => {
+            let why = format!("{step:?} on a result");
+            script.fail(why);
+            controls.close();
+        }
+        None => {}
     }
 }
 
@@ -330,10 +334,10 @@ impl PlayerRig<'_> {
             not(feature = "dev-tools"),
             expect(unused_mut, reason = "scripts choose too")
         )]
-        let mut chosen = sel.drain();
+        let mut chosen = sel.drain(&mut self.result_input.pad);
         #[cfg(feature = "dev-tools")]
         if chosen.is_none() && sel.script(self.controls, self.input.wakes()) {
-            chosen = sel.drain();
+            chosen = sel.drain(&mut self.result_input.pad);
         }
         if let Some(path) = &chosen {
             sel.shelf.pause();
@@ -387,6 +391,10 @@ impl PlayerRig<'_> {
     /// A result shows: the scan goes on, and a scripted step for it runs.
     pub(crate) fn result_shown(&mut self) {
         let Some(sel) = &mut self.selection else {
+            #[cfg(feature = "dev-tools")]
+            if let Some(script) = &mut self.result_script {
+                script_result(script, self.controls, &self.result_input.menu);
+            }
             return;
         };
         sel.shelf.release();
@@ -463,22 +471,46 @@ impl AppRig for PlayerRig<'_> {
         Ok(())
     }
 
-    fn idle_wait(&mut self, deadline: TimeUs) {
-        let left = deadline.0 - self.clock.now().0;
-        if left > 0 {
-            thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
-        }
-        self.sync();
-    }
-
     fn show_refusal(&mut self, refusal: &LoadRefusal<ChartLoadError>) {
         let name = file_name(&refusal.chart);
         let why = Chain(&refusal.reason).to_string();
         println!("select: refused {name}: {why}");
         log::warn!("select: refused {}: {why}", refusal.chart.display());
+        // A preset's error is shown by its file's name, never its path.
+        let shown = match &refusal.reason {
+            Refused::Chart(SessionError::Preset(e)) => {
+                format!("{}: {}", refusal.reason, shelf_error_text(e))
+            }
+            _ => why,
+        };
         if let Some(sel) = &mut self.selection {
             sel.screen.select_path(&refusal.chart);
-            sel.screen.set_notice(Some(format!("{name}: {why}")));
+            sel.screen.set_notice(Some(format!("{name}: {shown}")));
+            sel.dirty = true;
+            sel.show(&self.render, None);
+        }
+    }
+
+    fn presets_changed(&mut self, shelf: Result<&game::Shelf, &game::ShelfError>) {
+        let (name, error) = match shelf {
+            Ok(shelf) => (
+                shelf.chosen_name().to_owned(),
+                shelf.chosen_error().map(|e| {
+                    let line = format!("presets: {}", Chain(e));
+                    eprintln!("{line}");
+                    log::warn!("{line}");
+                    preset_error_text(e)
+                }),
+            ),
+            Err(e) => {
+                let line = format!("presets: {}", Chain(e));
+                eprintln!("{line}");
+                log::warn!("{line}");
+                ("-".to_owned(), Some(shelf_error_text(e)))
+            }
+        };
+        if let Some(sel) = &mut self.selection {
+            sel.screen.set_preset(name, error);
             sel.dirty = true;
             sel.show(&self.render, None);
         }
@@ -486,6 +518,7 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_selection(&mut self) {
         self.end_lines = None;
+        self.result_input.showing = false;
         // Nothing plays: the input thread drops its heartbeat, after a
         // completed play, an opening the logic step refused (which closes
         // recording without the end of a play) and at the first entry.
@@ -496,10 +529,7 @@ impl AppRig for PlayerRig<'_> {
         };
         sel.entered_at = self.clock.now();
         // What was typed during the chart belongs to it.
-        while sel.menu.pop().is_some() {}
-        if let Some(pad) = &mut sel.pad {
-            while pad.pop().is_some() {}
-        }
+        self.result_input.clear();
         sel.screen.end_composition();
         sel.shelf.release();
         if let Some(ime) = &sel.ime {
@@ -520,6 +550,7 @@ mod tests {
     use game::DataRoot;
 
     use super::Selection;
+    use crate::play::{Pad, ResultInput};
     use crate::select::{MenuInput, MenuKey, MenuQueue, SelectScreen};
     use crate::shelf::{Shelf, open};
 
@@ -539,8 +570,6 @@ mod tests {
             screen: SelectScreen::new(vec![charts]),
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
-            pad: None,
-            pad_dropped: 0,
             ime: None,
             rate: 48_000,
             chosen_at: TimeUs(0),
@@ -577,7 +606,7 @@ mod tests {
         for key in [MenuKey::Right, MenuKey::Down, MenuKey::Enter] {
             sel.menu.push(MenuInput::Key(key));
         }
-        let chosen = sel.drain().expect("Enter chooses");
+        let chosen = sel.drain(&mut Pad::default()).expect("Enter chooses");
         assert_eq!(chosen.file_name().unwrap(), "a.bms");
     }
 
@@ -608,7 +637,10 @@ mod tests {
             relative: None,
             wrap: None,
         });
-        sel.pad = Some(pad);
+        let mut pad = Pad {
+            receiver: Some(pad),
+            dropped: 0,
+        };
         let mut set = SourceSet::new(SourceConfig {
             max_devices: 1,
             max_sources: 1,
@@ -629,8 +661,43 @@ mod tests {
                 background: false,
             });
         }
-        let chosen = sel.drain().expect("Confirm chooses");
+        let chosen = sel.drain(&mut pad).expect("Confirm chooses");
         assert_eq!(chosen.file_name().unwrap(), "c.bms");
+    }
+
+    /// The select loop drains result commands on every look; while no
+    /// result shows, that takes nothing from the queue, so the select
+    /// screen's keys survive it and still choose.
+    #[test]
+    fn select_input_survives_the_select_loop_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let mut result = ResultInput::new(Arc::clone(&sel.menu), None);
+        for key in [MenuKey::Down, MenuKey::Down, MenuKey::Enter] {
+            sel.menu.push(MenuInput::Key(key));
+        }
+        assert_eq!(result.take(), None);
+        let chosen = sel.drain(&mut result.pad).expect("Enter chooses");
+        assert_eq!(chosen.file_name().unwrap(), "c.bms");
+    }
+
+    /// Keys pressed during the play wait in the window's queue; the result
+    /// drops them when it shows, and takes only what is pressed after.
+    #[test]
+    fn menu_input_from_the_play_is_dropped_at_the_result() {
+        let menu = Arc::new(MenuQueue::default());
+        let mut result = ResultInput::new(Arc::clone(&menu), None);
+        for key in [MenuKey::Right, MenuKey::Left, MenuKey::Down] {
+            menu.push(MenuInput::Key(key));
+        }
+        assert!(result.enter());
+        assert!(!result.enter());
+        assert_eq!(result.take(), None);
+        menu.push(MenuInput::Text("x".to_owned()));
+        menu.push(MenuInput::Key(MenuKey::Enter));
+        menu.push(MenuInput::Key(MenuKey::Left));
+        assert_eq!(result.take(), Some(game::MenuCommand::PrevPreset));
+        assert_eq!(result.take(), None);
     }
 
     /// Consecutive edits of the search are searched once, at the end.
@@ -639,12 +706,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut sel = selection(dir.path());
         sel.menu.push(MenuInput::Key(MenuKey::Tab));
-        let _ = sel.drain();
+        let _ = sel.drain(&mut Pad::default());
         for c in ["c", "x"] {
             sel.menu.push(MenuInput::Text(c.to_owned()));
         }
         sel.menu.push(MenuInput::Key(MenuKey::Backspace));
-        assert!(sel.drain().is_none());
+        assert!(sel.drain(&mut Pad::default()).is_none());
         assert!(!sel.search_pending);
         assert_eq!(sel.screen.listed(), 1);
     }

@@ -152,6 +152,7 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
             rig.adjust_in_play = dev_options.adjust_in_play;
             rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
             rig.adjust_on_end = dev_options.adjust_on_end;
+            rig.result_script = dev_options.result;
         }));
     }
     report(play(
@@ -176,6 +177,7 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
                 _rig.adjust_in_play = dev_options.adjust_in_play;
                 _rig.adjust_at = TimeUs(dev_options.adjust_at_ms.saturating_mul(1_000));
                 _rig.adjust_on_end = dev_options.adjust_on_end;
+                _rig.result_script = dev_options.result;
             }
         },
     ))
@@ -650,6 +652,10 @@ fn rig<'a>(
         seen: Delivered::default(),
         end_lines: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
+        result_input: play::ResultInput::new(Arc::new(MenuQueue::default()), None),
+        viewed: None,
+        #[cfg(feature = "dev-tools")]
+        result_script: None,
         load_start: TimeUs(0),
         pending_retry: None,
         retry_from: None,
@@ -759,8 +765,31 @@ fn open_window_and_clocked(
     }
 }
 
+/// The configured controller's lane controls as menu events for the select
+/// and result screens, tapped from `sources`; none without a configured
+/// controller, and none for autoplay, which receives no device.
+fn menu_pad(
+    device: &game::DeviceSettings,
+    autoplay: bool,
+    sources: &mut SourceSet,
+) -> Option<input::MenuReceiver> {
+    let bindings = select::menu_bindings(
+        &device.controller,
+        device.controller_device.map(Into::into),
+        &device.scratch,
+    )
+    .filter(|_| !autoplay);
+    bindings.map(|b| {
+        let (tap, receiver) = input::menu_queue(b);
+        sources.set_menu(tap);
+        receiver
+    })
+}
+
 /// The game: WASAPI and a window, with the devices' input through Raw
-/// Input, or generated input on a clocked input thread (autoplay).
+/// Input, or generated input on a clocked input thread (autoplay). The
+/// result screen takes the window's keys and the controller's menu events
+/// as with selection.
 fn play(
     chart: &Path,
     input: PlayInput,
@@ -799,6 +828,8 @@ fn play(
     if raw_input {
         axis_mode(&mut sources, device);
     }
+    let pad = menu_pad(device, !raw_input, &mut sources);
+    let menu = Arc::new(MenuQueue::default());
     let keys = (device.keyboard.retry, device.keyboard.quit);
     let monitor = device.monitor.clone();
     let wake = move |s: &mut SourceSet, now| {
@@ -816,12 +847,21 @@ fn play(
             wake,
             keys,
             monitor,
-            None,
+            Some(Arc::clone(&menu)),
         )
         .map(|(w, s, t)| (w, s, Some(t), None))
     } else {
-        open_window_and_clocked(&controls, clock, sources, &waker, wake, keys, monitor, None)
-            .map(|(w, s, t)| (w, s, None, Some(t)))
+        open_window_and_clocked(
+            &controls,
+            clock,
+            sources,
+            &waker,
+            wake,
+            keys,
+            monitor,
+            Some(Arc::clone(&menu)),
+        )
+        .map(|(w, s, t)| (w, s, None, Some(t)))
     };
     let (window_thread, surface, raw_thread, clocked_thread) = match started {
         Ok(started) => started,
@@ -887,6 +927,7 @@ fn play(
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
+    rig.result_input = play::ResultInput::new(menu, pad);
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run_chart(&mut loaded, &mut rig);
@@ -1011,19 +1052,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     } else {
         axis_mode(&mut sources, &settings.device);
     }
-    // The configured controller's lane controls drive the select screen;
-    // autoplay receives no device.
-    let bindings = select::menu_bindings(
-        &settings.device.controller,
-        settings.device.controller_device.map(Into::into),
-        &settings.device.scratch,
-    )
-    .filter(|_| !autoplay);
-    let pad = bindings.map(|b| {
-        let (tap, receiver) = input::menu_queue(b);
-        sources.set_menu(tap);
-        receiver
-    });
+    let pad = menu_pad(&settings.device, autoplay, &mut sources);
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {
@@ -1155,13 +1184,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     };
     let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock);
     rig.queue_most = opened.most_queued_periods;
+    rig.result_input = play::ResultInput::new(Arc::clone(&menu), pad);
     rig.selection = Some(selection::Selection {
         shelf,
         screen: select::SelectScreen::new(roots),
         menu,
         dropped: 0,
-        pad,
-        pad_dropped: 0,
         search_pending: false,
         ime,
         rate: opened.rate,

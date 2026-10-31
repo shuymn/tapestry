@@ -127,6 +127,28 @@ pub const fn event_key(event: MenuEvent) -> MenuKey {
     }
 }
 
+/// The result screen's command for a window key: the arrow keys switch
+/// presets, and every other key does nothing there (the retry and quit
+/// keys arrive as controls, which the window takes from the same press).
+pub const fn result_key(key: MenuKey) -> Option<game::MenuCommand> {
+    match key {
+        MenuKey::Left | MenuKey::Up => Some(game::MenuCommand::PrevPreset),
+        MenuKey::Right | MenuKey::Down => Some(game::MenuCommand::NextPreset),
+        _ => None,
+    }
+}
+
+/// The result screen's command for a controller's menu event: the scratch
+/// switches presets, the white keys retry and the black keys go back.
+pub const fn result_event(event: MenuEvent) -> game::MenuCommand {
+    match event {
+        MenuEvent::Up => game::MenuCommand::PrevPreset,
+        MenuEvent::Down => game::MenuCommand::NextPreset,
+        MenuEvent::Confirm => game::MenuCommand::Retry,
+        MenuEvent::Back => game::MenuCommand::Back,
+    }
+}
+
 /// Keys the queue holds at most; a key past them is dropped and counted.
 pub const QUEUED_KEYS: usize = 64;
 
@@ -229,6 +251,10 @@ pub struct SelectScreen {
     sort: usize,
     /// Why the chart last chosen was refused, until the next choice.
     notice: Option<String>,
+    /// The chosen preset's name, for the title.
+    preset: String,
+    /// The chosen preset file's error, or why the shelf cannot open.
+    preset_error: Option<String>,
     /// The library roots, for folder names.
     roots: Vec<PathBuf>,
 }
@@ -328,6 +354,13 @@ impl SelectScreen {
         self.notice = notice;
     }
 
+    /// Shows the chosen preset in the title and, while no refusal shows,
+    /// the error of its file, or why the shelf cannot open.
+    pub fn set_preset(&mut self, name: String, error: Option<String>) {
+        self.preset = name;
+        self.preset_error = error;
+    }
+
     /// Acts on one input.
     pub fn input(&mut self, input: MenuInput) -> Acted {
         if self.searching {
@@ -414,8 +447,9 @@ impl SelectScreen {
         let more = if self.more { "以上" } else { "" };
         let mut lines = vec![line(
             format!(
-                "曲選択  {}{more} 譜面  並び順: {sort}  {status}",
-                self.entries.len()
+                "曲選択  {}{more} 譜面  並び順: {sort}  プリセット: {}  {status}",
+                self.entries.len(),
+                self.preset
             ),
             LineStyle::Title,
         )];
@@ -428,7 +462,10 @@ impl SelectScreen {
             line(format!("検索 (Tab): {}", self.query), LineStyle::Search)
         });
         lines.push(line(
-            self.notice.clone().unwrap_or_default(),
+            self.notice
+                .clone()
+                .or_else(|| self.preset_error.clone())
+                .unwrap_or_default(),
             LineStyle::Notice,
         ));
         let at = self
@@ -554,6 +591,60 @@ mod tests {
     /// toward higher values and up toward lower ones, a scratch of two
     /// buttons up with the first bound and down with the second, at the
     /// press threshold; without a configured controller there is no menu.
+    /// On a result: the arrows switch presets (left and up back, right and
+    /// down on), and Enter, Escape, Backspace and the rest do nothing; the
+    /// scratch switches presets, the white keys retry and the black keys go
+    /// back.
+    #[test]
+    fn result_keys_and_controller_events_map_to_menu_commands() {
+        use game::MenuCommand::{Back, NextPreset, PrevPreset, Retry};
+        use input::MenuEvent;
+        for (key, command) in [
+            (MenuKey::Left, Some(PrevPreset)),
+            (MenuKey::Up, Some(PrevPreset)),
+            (MenuKey::Right, Some(NextPreset)),
+            (MenuKey::Down, Some(NextPreset)),
+            (MenuKey::Enter, None),
+            (MenuKey::Escape, None),
+            (MenuKey::Backspace, None),
+            (MenuKey::Tab, None),
+            (MenuKey::PageUp, None),
+            (MenuKey::PageDown, None),
+            (MenuKey::Home, None),
+            (MenuKey::End, None),
+        ] {
+            assert_eq!(super::result_key(key), command, "{key:?}");
+        }
+        for (event, command) in [
+            (MenuEvent::Up, PrevPreset),
+            (MenuEvent::Down, NextPreset),
+            (MenuEvent::Confirm, Retry),
+            (MenuEvent::Back, Back),
+        ] {
+            assert_eq!(super::result_event(event), command, "{event:?}");
+        }
+    }
+
+    /// The title names the chosen preset; its file's error shows on the
+    /// notice line unless a refusal shows there.
+    #[test]
+    fn the_title_names_the_chosen_preset_and_its_error() {
+        let mut s = screen();
+        s.set_preset("mine".to_owned(), Some("mine.toml: broken".to_owned()));
+        let page = s.page("");
+        assert!(
+            page.lines[0].text.contains("プリセット: mine"),
+            "{}",
+            page.lines[0].text
+        );
+        assert_eq!(page.lines[2].text, "mine.toml: broken");
+        s.set_notice(Some("a.bms: refused".to_owned()));
+        assert_eq!(s.page("").lines[2].text, "a.bms: refused");
+        s.set_notice(None);
+        s.set_preset("mine".to_owned(), None);
+        assert_eq!(s.page("").lines[2].text, "");
+    }
+
     #[test]
     fn controller_lanes_map_to_menu_events() {
         use eval::ControlId;
