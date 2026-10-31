@@ -18,8 +18,8 @@
 //! - **Priority.** The scan thread runs in background mode (lowered CPU and
 //!   I/O priority), set by its start hook.
 //! - **Loudness.** The shelf also holds the loaded chart's loudness
-//!   ([`Loudness`]): its analysis job pauses and resumes with the scan, and
-//!   its measurements are stored only while the scan is quiet.
+//!   ([`Loudness`]): a miss is measured during the chart's load, and its
+//!   measurements are stored only while the scan is quiet.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ use library::{
     Search,
 };
 
-use crate::loudness::{Hook, Loudness, Point};
+use crate::loudness::{Host, Loudness};
 
 /// How long the last pass is over before the next starts, at the select
 /// screen.
@@ -116,8 +116,7 @@ pub fn open(root: &DataRoot) -> Result<(Library, Opened), OpenError> {
     Ok((library, opened))
 }
 
-/// What a countdown's wait for the pause found: the scan's state, once the
-/// loudness analysis, if one runs, has acknowledged too.
+/// What a countdown's wait for the pause found: the scan's state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Paused {
     /// The scan acknowledged the pause.
@@ -144,7 +143,7 @@ pub struct Shelf {
     seen: u64,
     /// The latest pass's outcome, for the select screen.
     status: String,
-    /// The loaded chart's loudness and its analysis.
+    /// The loaded chart's loudness.
     loudness: Loudness,
     /// Passes completed (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -165,22 +164,15 @@ impl Shelf {
             records,
             ..ScanOptions::default()
         };
-        let hook: Hook = Arc::new(|point| {
-            if point == Point::Start {
-                background_mode();
-            }
-        });
-        Self::with_options(library, roots, rescan_after, options, hook)
+        Self::with_options(library, roots, rescan_after, options)
     }
 
-    /// [`new`](Self::new), each pass's thread starting with `options`, each
-    /// loudness job's calling `hook`.
+    /// [`new`](Self::new), each pass's thread starting with `options`.
     fn with_options(
         library: Library,
         roots: Vec<PathBuf>,
         rescan_after: Duration,
         options: ScanOptions,
-        hook: Hook,
     ) -> Self {
         let mut shelf = Self {
             library,
@@ -192,7 +184,7 @@ impl Shelf {
             rescan_after,
             seen: 0,
             status: String::new(),
-            loudness: Loudness::new(hook),
+            loudness: Loudness::default(),
             #[cfg(feature = "dev-tools")]
             passes: 0,
         };
@@ -341,26 +333,22 @@ impl Shelf {
     }
 
     /// A chart was chosen: the scan pauses after the file in hand, and no
-    /// pass starts until the release; a loudness analysis pauses before
-    /// its next block.
+    /// pass starts until the release.
     pub fn pause(&mut self) {
         if !self.paused {
             self.paused = true;
             if let Some(scan) = &self.scan {
                 scan.request_pause();
             }
-            if let Some(job) = self.loudness.job() {
-                job.request_pause();
-            }
         }
     }
 
     /// Before a countdown: requests the pause if none is, and waits for the
-    /// scan and a loudness analysis to acknowledge it, however long that
-    /// takes (design.md "Loading and Song Selection": the countdown starts
-    /// only after it); either is done once it has acknowledged, or is not
-    /// running. Every `slice` it asks `cancelled` whether to give up; once
-    /// the wait has run `notice_after`, it calls `notice` once.
+    /// scan to acknowledge it, however long that takes (design.md "Loading
+    /// and Song Selection": the countdown starts only after it), or returns
+    /// at once when no scan runs. Every `slice` it asks `cancelled` whether
+    /// to give up; once the wait has run `notice_after`, it calls `notice`
+    /// once.
     pub fn wait_paused(
         &mut self,
         slice: Duration,
@@ -372,16 +360,10 @@ impl Shelf {
         let started = Instant::now();
         let mut notice = Some(notice);
         loop {
-            let scan = self
-                .scan
-                .as_ref()
-                .is_none_or(|scan| scan.wait_paused(slice));
-            if scan && self.loudness.job().is_none_or(|job| job.wait_paused(slice)) {
-                return if self.scan.is_some() {
-                    Paused::Acknowledged
-                } else {
-                    Paused::Idle
-                };
+            match &self.scan {
+                None => return Paused::Idle,
+                Some(scan) if scan.wait_paused(slice) => return Paused::Acknowledged,
+                Some(_) => {}
             }
             if cancelled() {
                 return Paused::Cancelled;
@@ -394,48 +376,36 @@ impl Shelf {
         }
     }
 
-    /// Selection was entered, or a result shown: the scan and a loudness
-    /// analysis go on, and passes start again when due.
+    /// Selection was entered, or a result shown: the scan goes on, and
+    /// passes start again when due.
     pub fn release(&mut self) {
         self.paused = false;
         if let Some(scan) = &self.scan {
             scan.release();
         }
-        if let Some(job) = self.loudness.job() {
-            job.release();
-        }
-    }
-
-    /// Decodes another chart's sounds with `decode` once the loudness
-    /// analysis of the chart before has stopped (a finished one kept in
-    /// memory), so its bank is never held beside the new one.
-    pub fn decode<T>(&mut self, decode: impl FnOnce() -> T) -> T {
-        self.loudness.cancel();
-        decode()
     }
 
     /// The chart `name` was loaded with `bank`: its plays' gain is looked
-    /// up, or its analysis starts (paused while the shelf is).
-    pub fn loaded(&mut self, chart: Arc<Chart>, bank: Arc<SoundBank>, name: String) {
-        self.loudness
-            .load(&self.library, chart, bank, name, self.paused);
+    /// up, or measured now with `host` ([`Loudness::load`]).
+    pub fn loaded(
+        &mut self,
+        chart: &Chart,
+        bank: &Arc<SoundBank>,
+        name: &str,
+        host: &mut dyn Host,
+    ) {
+        self.loudness.load(&self.library, chart, bank, name, host);
     }
 
     /// Before a countdown, once [`wait_paused`](Self::wait_paused) found
-    /// the scan quiet: stores the measurements taken, and the loaded
-    /// chart's gain follows its own.
+    /// the scan quiet: stores the measurements taken.
     pub fn store_loudness(&mut self) {
         self.loudness.store(&mut self.library);
     }
 
-    /// The gain of the loaded chart's next play.
+    /// The gain of the loaded chart's plays.
     pub const fn gain(&self) -> Gain {
         self.loudness.gain()
-    }
-
-    /// Whether a loudness analysis is unfinished.
-    pub fn analyzing(&self) -> bool {
-        self.loudness.analyzing()
     }
 
     /// How many passes have completed (dev-tools): what a search lists is
@@ -475,8 +445,8 @@ impl Drop for Shelf {
             eprintln!("{line}");
             log::warn!("{line}");
         }
-        // A finished analysis is kept only when no scan may still commit.
-        self.loudness.close(&mut self.library, quiet, STOP_TIMEOUT);
+        // A measurement is stored only when no scan may still commit.
+        self.loudness.close(&mut self.library, quiet);
     }
 }
 
@@ -678,13 +648,7 @@ mod tests {
             })),
             ..library::ScanOptions::default()
         };
-        let shelf = Shelf::with_options(
-            library,
-            vec![charts],
-            Duration::from_secs(60),
-            options,
-            std::sync::Arc::new(|_| {}),
-        );
+        let shelf = Shelf::with_options(library, vec![charts], Duration::from_secs(60), options);
         (shelf, gate)
     }
 
@@ -779,167 +743,63 @@ mod tests {
         }
     }
 
-    use crate::loudness::Point;
-    use crate::loudness::fixture::{self as sound, bank, square, write_sound};
+    use crate::loudness::fixture::{self as sound, Host, bank, square, write_sound};
 
-    /// A shelf without roots (no scan) whose loudness jobs pass `gate`.
-    fn unscanned(dir: &Path, gate: &std::sync::Arc<sound::Gate>) -> Shelf {
+    /// A shelf without roots (no scan).
+    fn unscanned(dir: &Path) -> Shelf {
         let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
         Shelf::with_options(
             library,
             Vec::new(),
             Duration::from_secs(60),
             library::ScanOptions::default(),
-            gate.hook(),
         )
     }
 
-    /// Loads a chart of a two-second sound into `shelf`; its key.
+    /// Loads a chart of a two-second sound into `shelf`, measured during
+    /// the load; its key.
     fn load(shelf: &mut Shelf, dir: &Path) -> library::LoudnessKey {
         let songs = dir.join("song");
         write_sound(&songs, &square(2.0, 3_000));
         let c = sound::chart(&songs, 1);
         let b = bank(&c);
         let key = crate::loudness::key(&c, &b).unwrap();
-        shelf.loaded(c, b, "a.bms".to_owned());
+        let mut host = Host::default();
+        shelf.loaded(&c, &b, "a.bms", &mut host);
+        assert_eq!(host.measuring, 1);
         key
     }
 
-    fn analyzed(shelf: &Shelf) {
-        let begun = Instant::now();
-        while shelf.analyzing() {
-            assert!(begun.elapsed() < WATCHDOG, "the analysis never ended");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// The countdown's wait covers the loudness analysis: with a scan and
-    /// a job each held until the wait lets it go, it returns only once both
-    /// have acknowledged; without a scan it waits for the job alone and
-    /// says no scan ran.
+    /// The wait for the pause does not wait for the loudness, which the
+    /// load measured: without a scan it returns at once.
     #[test]
-    fn the_countdown_waits_for_the_scan_and_the_analysis() {
+    fn the_countdown_does_not_wait_for_the_loudness() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut shelf, scan_gate) = gated(dir.path());
-        let job_gate = sound::Gate::holding(&[Point::Step]);
-        shelf.loudness = crate::loudness::Loudness::new(job_gate.hook());
+        let mut shelf = unscanned(dir.path());
         load(&mut shelf, dir.path());
-        job_gate.reached(Point::Step, 1);
-        let mut asked = 0;
-        let paused = shelf.wait_paused(
-            Duration::from_millis(20),
-            || {
-                asked += 1;
-                match asked {
-                    1 => open_gate(&scan_gate),
-                    // The scan is free well before; the job is held still.
-                    5 => job_gate.open(),
-                    _ => {}
-                }
-                false
-            },
-            Duration::MAX,
-            || {},
-        );
-        assert_eq!(paused, Paused::Acknowledged);
-        assert!(asked >= 5, "{asked}");
-        assert!(shelf.analyzing(), "the job ended instead of pausing");
-        shelf.release();
-        analyzed(&shelf);
-
-        // No scan: the job alone.
-        let dir = tempfile::tempdir().unwrap();
-        let job_gate = sound::Gate::holding(&[Point::Step]);
-        let mut shelf = unscanned(dir.path(), &job_gate);
-        assert_eq!(wait(&mut shelf), Paused::Idle);
-        shelf.release();
-        load(&mut shelf, dir.path());
-        job_gate.reached(Point::Step, 1);
-        let mut asked = 0;
-        let paused = shelf.wait_paused(
-            Duration::from_millis(20),
-            || {
-                asked += 1;
-                if asked == 3 {
-                    job_gate.open();
-                }
-                false
-            },
-            Duration::MAX,
-            || {},
-        );
-        assert_eq!(paused, Paused::Idle);
-        assert!(asked >= 3, "{asked}");
-        assert!(shelf.analyzing());
-        // A finished job counts as paused.
-        shelf.release();
-        analyzed(&shelf);
         assert_eq!(wait(&mut shelf), Paused::Idle);
     }
 
-    /// An analysis that finishes while a result shows is stored when the
-    /// run ends with its scan stopped: the next run (a second opening of
-    /// the library) finds it.
+    /// A measurement not yet stored (the run ended before a countdown) is
+    /// stored when the run ends with its scan stopped: the next run (a
+    /// second opening of the library) finds it.
     #[test]
-    fn a_finished_analysis_is_stored_at_exit() {
+    fn a_measurement_is_stored_at_exit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut shelf = unscanned(dir.path(), &sound::Gate::holding(&[]));
+        let mut shelf = unscanned(dir.path());
         let key = load(&mut shelf, dir.path());
-        analyzed(&shelf);
         drop(shelf);
         let (library, _) = open(&DataRoot::new(dir.path().join("data"))).unwrap();
         assert!(library.loudness(&key).unwrap().is_some());
     }
 
-    /// The next chart's sounds are decoded only once the analysis of the
-    /// chart before has stopped and dropped its bank.
-    #[test]
-    fn the_analysis_stops_before_the_next_sounds_are_decoded() {
-        let dir = tempfile::tempdir().unwrap();
-        let gate = sound::Gate::holding(&[Point::Step]);
-        let mut shelf = unscanned(dir.path(), &gate);
-        let songs = dir.path().join("song");
-        write_sound(&songs, &square(2.0, 3_000));
-        let c = sound::chart(&songs, 1);
-        let held = bank(&c);
-        shelf.loaded(
-            std::sync::Arc::clone(&c),
-            std::sync::Arc::clone(&held),
-            "a.bms".to_owned(),
-        );
-        gate.reached(Point::Step, 1);
-        assert_eq!(std::sync::Arc::strong_count(&held), 2);
-        let next = std::thread::scope(|s| {
-            s.spawn(|| {
-                // The stop waits for the block in hand.
-                std::thread::sleep(Duration::from_millis(50));
-                gate.open();
-            });
-            shelf.decode(|| {
-                assert_eq!(
-                    std::sync::Arc::strong_count(&held),
-                    1,
-                    "decoded beside the old bank"
-                );
-                bank(&c)
-            })
-        });
-        shelf.loaded(c, next, "a.bms".to_owned());
-        assert!(
-            shelf.loudness.job().is_some(),
-            "the next analysis did not start"
-        );
-    }
-
     /// At an exit whose scan does not stop (it may still commit), a
-    /// finished analysis is not stored; a job paused at the exit stops at
-    /// once and stores nothing.
+    /// measurement is not stored.
     #[test]
-    fn exit_stores_nothing_with_a_stuck_scan_or_a_paused_job() {
+    fn exit_stores_nothing_with_a_stuck_scan() {
         let dir = tempfile::tempdir().unwrap();
         let (mut shelf, gate) = gated(dir.path());
         let key = load(&mut shelf, dir.path());
-        analyzed(&shelf);
         let dropping = std::thread::spawn(move || drop(shelf));
         let begun = Instant::now();
         while !dropping.is_finished() {
@@ -957,21 +817,6 @@ mod tests {
             assert!(begun.elapsed() < WATCHDOG, "the lock stayed");
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(library.loudness(&key).unwrap(), None);
-        drop(library);
-
-        let dir = tempfile::tempdir().unwrap();
-        let job_gate = sound::Gate::holding(&[]);
-        let mut shelf = unscanned(dir.path(), &job_gate);
-        shelf.pause();
-        let key = load(&mut shelf, dir.path());
-        assert_eq!(wait(&mut shelf), Paused::Idle);
-        // The paused job stops at once; the bound only catches a hang.
-        let started = Instant::now();
-        drop(shelf);
-        assert!(started.elapsed() < WATCHDOG);
-        assert_eq!(job_gate.count(Point::Construct), 0);
-        let (library, _) = open(&DataRoot::new(dir.path().join("data"))).unwrap();
         assert_eq!(library.loudness(&key).unwrap(), None);
     }
 }

@@ -1,32 +1,30 @@
 //! Loudness normalization on the game thread (design.md "Algorithms"): the
 //! gain of the loaded chart's plays, the cache it is read from, and the
-//! background job that analyzes a chart the cache misses.
+//! analysis a load runs when the cache misses.
 //!
 //! - **Lookup at load.** A chart's key is its resolved hash, its bank's
 //!   sound-content digest, the mixer and analysis versions and the device
 //!   rate. A measurement kept in memory, then the library's `loudness`
-//!   table, gives the gain from the chart's first play; a miss plays at
-//!   the 0.5 headroom and starts the job (at 1× only: other speeds read
-//!   the 1× key and start none).
-//! - **The job.** One thread named `loudness` per analysis, in background
-//!   mode, that mixes the chart's 1× autoplay schedule offline and meters
-//!   it ([`audio::Analysis`]). It pauses with the scan: a pause is asked
-//!   when a chart is chosen and acknowledged before each countdown, so the
-//!   job never runs during a play; it checks for a pause before building
-//!   the analysis and before each block. However it ends, a guard
-//!   publishes the end, a panic included.
-//! - **Results.** A finished measurement is taken into memory, keyed by
-//!   its whole key, when the job is collected or cancelled; it is stored
-//!   in the library only before a countdown, once the scan's pause is
-//!   acknowledged (or no scan runs), or at a graceful exit whose scan
-//!   stopped, so the store never races a scan's commit. The loaded chart's
-//!   gain changes only between plays, from a measurement of its own key:
-//!   "from the next play".
+//!   table, gives the gain of the chart's plays.
+//! - **Measured at load.** On a miss the load measures the chart before its
+//!   first play ([`measure`]): its 1× autoplay schedule mixed offline and
+//!   metered ([`audio::Analysis`]) on the loading thread, block by block,
+//!   the load's cancel checked before each. A bank at another speed is
+//!   measured through the chart and its bank read again at 1×, under the
+//!   same 1× key. An analysis that fails (a panic included), is cancelled,
+//!   or cannot get its 1× bank leaves the 0.5 headroom and keeps nothing,
+//!   so the next load measures again; a sound that cannot be read is
+//!   measured as it plays, silent.
+//! - **Results.** A measurement is kept in memory by its whole key and
+//!   stored in the library only before a countdown, once the scan's pause
+//!   is acknowledged (or no scan runs), or at a graceful exit whose scan
+//!   stopped, so the store never races a scan's commit; one the database
+//!   refuses stays in memory for the run. Without a library (`tapestry
+//!   play`) each load measures and nothing is stored.
 
 use std::collections::HashMap;
-use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audio::{Analysis, AnalysisError, Gain, Measurement, SoundBank, Speed, Step};
@@ -34,308 +32,130 @@ use bms_model::Chart;
 use game::Chain;
 use library::{Library, LoudnessKey, LoudnessRow};
 
-/// Where the job's thread is, for its hook: its start in the game (where
-/// it enters background mode), and the barriers tests hold it at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Point {
-    /// The thread started, before anything else.
-    Start,
-    /// Before the analysis is built (after the first pause check).
-    #[cfg(test)]
-    Construct,
-    /// Before each block's step (after its pause check).
-    #[cfg(test)]
-    Step,
-    /// Before the result is published.
-    #[cfg(test)]
-    Publish,
-}
-
-/// The hook the job's thread calls at each [`Point`].
-pub type Hook = Arc<dyn Fn(Point) + Send + Sync>;
-
-/// Why an analysis gave no measurement.
-#[derive(Debug, thiserror::Error)]
-pub enum JobError {
-    /// The analysis failed.
-    #[error("the loudness analysis failed")]
-    Analysis(#[source] AnalysisError),
-    /// The job's thread panicked.
-    #[error("the loudness analysis stopped unexpectedly")]
-    Panicked,
-}
-
-#[derive(Debug, Default)]
-struct State {
-    /// A pause is requested and not released.
-    pause: bool,
-    /// Counts pause requests, so each is acknowledged on its own.
-    pause_gen: u64,
-    /// The latest request the thread acknowledged.
-    acked_gen: u64,
-    /// The job is being stopped.
-    shutdown: bool,
-    /// The thread has ended, or is ending and will do nothing more.
-    finished: bool,
-    /// What the analysis came to, once it did.
-    result: Option<Result<Measurement, JobError>>,
-    /// The time spent analyzing, pauses excluded.
-    busy: Duration,
-}
-
-impl State {
-    fn paused(&self) -> bool {
-        (self.pause && self.acked_gen == self.pause_gen) || self.finished
-    }
-}
-
-#[derive(Debug, Default)]
-struct Shared {
-    state: Mutex<State>,
-    changed: Condvar,
-}
-
-impl Shared {
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn update(&self, f: impl FnOnce(&mut State)) {
-        f(&mut self.lock());
-        self.changed.notify_all();
-    }
-
-    /// Before the next piece of work: on a pause, acknowledges every
-    /// request made of it and waits for the release. `false` when the job
-    /// is being stopped.
-    fn checkpoint(&self) -> bool {
-        let mut state = self.lock();
-        loop {
-            if state.shutdown {
-                return false;
-            }
-            if !state.pause {
-                return true;
-            }
-            if state.acked_gen != state.pause_gen {
-                state.acked_gen = state.pause_gen;
-                self.changed.notify_all();
-            }
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-}
-
-/// Publishes the end of the job's thread however it ends, a panic
-/// included, and wakes every waiter.
-struct Ending(Arc<Shared>);
-
-impl Drop for Ending {
-    fn drop(&mut self) {
-        let panicked = thread::panicking();
-        self.0.update(|state| {
-            if panicked && state.result.is_none() {
-                state.result = Some(Err(JobError::Panicked));
-            }
-            state.finished = true;
-        });
-    }
-}
-
-/// A running analysis of one chart. Dropping it stops the analysis (it
-/// ends within one block) and joins its thread.
-pub struct Job {
-    shared: Arc<Shared>,
-    thread: Option<JoinHandle<()>>,
-    key: LoudnessKey,
-    /// The chart's file name, for the log.
-    name: String,
-}
-
-impl Job {
-    /// Starts analyzing `chart`'s 1× autoplay schedule over `bank`, the
-    /// measurement to be kept under `key` (`name` names the chart in the
-    /// log); paused from the start if
-    /// `paused`, so it holds only its two `Arc`s until released.
+/// What a load lends its loudness measurement.
+pub trait Host {
+    /// The chart and its bank read again at 1×, for a bank at another
+    /// speed: the 1× key's measurement.
     ///
     /// # Errors
     ///
-    /// Why the thread cannot be started.
-    pub fn start(
-        chart: Arc<Chart>,
-        bank: Arc<SoundBank>,
-        key: LoudnessKey,
-        name: String,
-        paused: bool,
-        hook: Hook,
-    ) -> io::Result<Self> {
-        let shared = Arc::new(Shared::default());
-        if paused {
-            shared.update(|s| {
-                s.pause = true;
-                s.pause_gen = 1;
-            });
-        }
-        let ending = Ending(Arc::clone(&shared));
-        let thread = thread::Builder::new()
-            .name("loudness".to_owned())
-            .spawn(move || {
-                // `ending` drops last and sees any panic.
-                let ending = ending;
-                hook(Point::Start);
-                let result = analyze(&ending.0, &chart, bank, &*hook);
-                if let Some((result, busy)) = result {
-                    #[cfg(test)]
-                    hook(Point::Publish);
-                    ending.0.update(|s| {
-                        s.result = Some(result);
-                        s.busy = busy;
-                    });
+    /// Why they cannot be read.
+    fn at_normal(&mut self) -> anyhow::Result<(Chart, Arc<SoundBank>)>;
+
+    /// The measurement starts: the load says so.
+    fn measuring(&mut self, name: &str);
+
+    /// Asked before each block: whether the load was cancelled (the window
+    /// closing, the quit key).
+    fn cancelled(&mut self) -> bool;
+}
+
+/// How an analysis ended.
+#[derive(Debug)]
+enum Analyzed {
+    /// Measured, in this much time.
+    Done(Measurement, Duration),
+    /// The load was cancelled.
+    Cancelled,
+    /// Why it gave no measurement.
+    Failed(String),
+}
+
+/// Mixes and meters `chart`'s 1× autoplay schedule over `bank`, asking
+/// `cancelled` before each block. A panic of the analysis is a failure.
+fn analyze(chart: &Chart, bank: Arc<SoundBank>, cancelled: &mut dyn FnMut() -> bool) -> Analyzed {
+    let began = Instant::now();
+    let run = panic::catch_unwind(AssertUnwindSafe(
+        || -> Result<Option<Measurement>, AnalysisError> {
+            let mut analysis = Analysis::new(bank)?;
+            let mut events = game::schedule_iter(chart);
+            loop {
+                if cancelled() {
+                    return Ok(None);
                 }
-            })?;
-        Ok(Self {
-            shared,
-            thread: Some(thread),
-            key,
-            name,
-        })
+                match analysis.step(&mut events)? {
+                    Step::More => {}
+                    Step::Done(m) => return Ok(Some(m)),
+                }
+            }
+        },
+    ));
+    match run {
+        Ok(Ok(Some(m))) => Analyzed::Done(m, began.elapsed()),
+        Ok(Ok(None)) => Analyzed::Cancelled,
+        Ok(Err(e)) => Analyzed::Failed(format!("the loudness analysis failed: {}", Chain(&e))),
+        Err(_) => Analyzed::Failed("the loudness analysis stopped unexpectedly".to_owned()),
     }
+}
 
-    /// The key its measurement is kept under.
-    pub const fn key(&self) -> &LoudnessKey {
-        &self.key
-    }
-
-    /// Asks the job to pause before its next block. Returns at once.
-    pub fn request_pause(&self) {
-        self.shared.update(|s| {
-            s.pause = true;
-            s.pause_gen += 1;
-        });
-    }
-
-    /// Waits up to `timeout` for the latest pause request to be
-    /// acknowledged. `true` once the job does nothing: paused, or
-    /// finished.
-    pub fn wait_paused(&self, timeout: Duration) -> bool {
-        self.wait_for(timeout, State::paused)
-    }
-
-    /// Releases a pause; the analysis goes on.
-    pub fn release(&self) {
-        self.shared.update(|s| s.pause = false);
-    }
-
-    /// Whether the job has ended, with or without a measurement.
-    pub fn finished(&self) -> bool {
-        self.shared.lock().finished
-    }
-
-    /// The result of a finished job, once: `None` while it runs, or once
-    /// taken, or when it was stopped before its end.
-    pub fn take_result(&self) -> Option<Result<Measurement, JobError>> {
-        let mut state = self.shared.lock();
-        if state.finished {
-            state.result.take()
-        } else {
+/// Measures `chart` loaded with `bank` (`name` names it in the log): at a
+/// bank's other speed, the chart and bank `host` reads again at 1×, whose
+/// key must be `key` when one is given. `None`, logged, when it cannot be
+/// measured.
+pub fn measure(
+    chart: &Chart,
+    bank: &Arc<SoundBank>,
+    key: Option<&LoudnessKey>,
+    name: &str,
+    host: &mut dyn Host,
+) -> Option<Measurement> {
+    host.measuring(name);
+    log_line(&format!("loudness: measuring {name}"), false);
+    let analyzed = if bank.speed() == Speed::NORMAL {
+        analyze(chart, Arc::clone(bank), &mut || host.cancelled())
+    } else {
+        match host.at_normal() {
+            Ok((c, b)) if key.is_none_or(|k| self::key(&c, &b).as_ref() == Some(k)) => {
+                analyze(&c, b, &mut || host.cancelled())
+            }
+            Ok(_) => Analyzed::Failed("the sounds changed while they were read again".to_owned()),
+            Err(e) => Analyzed::Failed(format!("the 1× sounds cannot be read: {e:#}")),
+        }
+    };
+    match analyzed {
+        Analyzed::Done(m, took) => {
+            let g = audio::normalization_gain(&m);
+            log_line(
+                &format!(
+                    "loudness: {name} measured in {} ms: {} LUFS{}, {:.2} dBTP; gain {:.2} dB",
+                    took.as_millis(),
+                    m.integrated
+                        .map_or_else(|| "-".to_owned(), |l| format!("{l:.2}")),
+                    if m.over_range { " (over range)" } else { "" },
+                    20.0 * m.true_peak.max(1e-10).log10(),
+                    20.0 * f64::from(g).log10(),
+                ),
+                false,
+            );
+            Some(m)
+        }
+        Analyzed::Cancelled => {
+            log_line(
+                &format!("loudness: {name}: the measurement was cancelled"),
+                false,
+            );
+            None
+        }
+        Analyzed::Failed(why) => {
+            log_line(
+                &format!("loudness: {name}: {why}; it plays at the headroom"),
+                true,
+            );
             None
         }
     }
-
-    /// The time the analysis spent working, pauses and the wait for its
-    /// collection excluded.
-    pub fn busy(&self) -> Duration {
-        self.shared.lock().busy
-    }
-
-    fn wait_for(&self, timeout: Duration, done: impl Fn(&State) -> bool) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.shared.lock();
-        loop {
-            if done(&state) {
-                return true;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            state = self
-                .shared
-                .changed
-                .wait_timeout(state, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
-    }
-
-    /// Stops the job, waiting at most `timeout` for it to end: `true` once
-    /// it has (its thread is joined), `false` when it had not, and its
-    /// thread is left to end on its own.
-    pub fn stop_within(mut self, timeout: Duration) -> bool {
-        self.shared.update(|s| s.shutdown = true);
-        let finished = self.wait_for(timeout, |s| s.finished);
-        if finished {
-            self.join();
-        } else {
-            drop(self.thread.take());
-        }
-        finished
-    }
-
-    fn join(&mut self) {
-        if let Some(t) = self.thread.take() {
-            // A panic is published by the guard.
-            let _ = t.join();
-        }
-    }
 }
 
-impl Drop for Job {
-    fn drop(&mut self) {
-        self.shared.update(|s| s.shutdown = true);
-        self.join();
-    }
-}
-
-/// The job's work, with the time spent on it outside pauses: `None` when
-/// it was stopped.
-#[cfg_attr(not(test), expect(unused_variables, reason = "the hook's test points"))]
-fn analyze(
-    shared: &Shared,
+/// The gain of a play of `chart` loaded with `bank` without a library
+/// (`tapestry play`): measured at each load, the headroom when it cannot
+/// be.
+pub fn unstored_gain(
     chart: &Chart,
-    bank: Arc<SoundBank>,
-    hook: &dyn Fn(Point),
-) -> Option<(Result<Measurement, JobError>, Duration)> {
-    if !shared.checkpoint() {
-        return None;
-    }
-    #[cfg(test)]
-    hook(Point::Construct);
-    let began = Instant::now();
-    let mut analysis = match Analysis::new(bank) {
-        Ok(a) => a,
-        Err(e) => return Some((Err(JobError::Analysis(e)), began.elapsed())),
-    };
-    let mut events = game::schedule_iter(chart);
-    let mut busy = began.elapsed();
-    loop {
-        if !shared.checkpoint() {
-            return None;
-        }
-        #[cfg(test)]
-        hook(Point::Step);
-        let began = Instant::now();
-        let step = analysis.step(&mut events);
-        busy += began.elapsed();
-        match step {
-            Ok(Step::More) => {}
-            Ok(Step::Done(m)) => return Some((Ok(m), busy)),
-            Err(e) => return Some((Err(JobError::Analysis(e)), busy)),
-        }
-    }
+    bank: &Arc<SoundBank>,
+    name: &str,
+    host: &mut dyn Host,
+) -> Gain {
+    measure(chart, bank, None, name, host).map_or(Gain::HEADROOM, |m| gain(&row(&m)))
 }
 
 /// A measurement as a cached row.
@@ -380,131 +200,69 @@ fn log_line(line: &str, warn: bool) {
     }
 }
 
-/// The gain of the loaded chart's plays, the measurements not yet stored,
-/// and the job.
+/// The gain of the loaded chart's plays and the measurements not yet
+/// stored.
+#[derive(Debug)]
 pub struct Loudness {
-    job: Option<Job>,
-    /// Finished measurements not yet stored, by their whole key.
+    /// Measurements not yet stored, by their whole key.
     measured: HashMap<LoudnessKey, LoudnessRow>,
-    /// The loaded chart's key, when its bank has a digest.
-    loaded: Option<LoudnessKey>,
-    /// The gain of the loaded chart's next play.
+    /// The gain of the loaded chart's plays.
     gain: Gain,
-    /// Whether `gain` comes from a measurement of `loaded`.
-    normalized: bool,
-    hook: Hook,
+}
+
+impl Default for Loudness {
+    fn default() -> Self {
+        Self {
+            measured: HashMap::new(),
+            gain: Gain::HEADROOM,
+        }
+    }
 }
 
 impl Loudness {
-    /// No chart loaded; jobs call `hook` at each [`Point`].
-    pub fn new(hook: Hook) -> Self {
-        Self {
-            job: None,
-            measured: HashMap::new(),
-            loaded: None,
-            gain: Gain::HEADROOM,
-            normalized: false,
-            hook,
-        }
-    }
-
-    /// The gain of the loaded chart's next play.
+    /// The gain of the loaded chart's plays.
     pub const fn gain(&self) -> Gain {
         self.gain
     }
 
-    /// Whether a job is analyzing (not yet finished).
-    pub fn analyzing(&self) -> bool {
-        self.job.as_ref().is_some_and(|j| !j.finished())
-    }
-
-    /// The running job, for the pause.
-    pub const fn job(&self) -> Option<&Job> {
-        self.job.as_ref()
-    }
-
-    /// A finished measurement kept in memory under `key`.
+    /// A measurement kept in memory under `key`.
     #[cfg(test)]
     pub fn in_memory(&self, key: &LoudnessKey) -> Option<LoudnessRow> {
         self.measured.get(key).copied()
     }
 
-    /// Takes a finished job's result into memory, logging it, and drops
-    /// the job; a job still running is left.
-    fn take_finished(&mut self) {
-        let Some(job) = self.job.take_if(|j| j.finished()) else {
-            return;
-        };
-        let name = &job.name;
-        match job.take_result() {
-            Some(Ok(m)) => {
-                let g = audio::normalization_gain(&m);
-                log_line(
-                    &format!(
-                        "loudness: {name} analyzed in {} ms: {} LUFS{}, {:.2} dBTP; gain {:.2} dB from the next play",
-                        job.busy().as_millis(),
-                        m.integrated
-                            .map_or_else(|| "-".to_owned(), |l| format!("{l:.2}")),
-                        if m.over_range { " (over range)" } else { "" },
-                        20.0 * m.true_peak.max(1e-10).log10(),
-                        20.0 * f64::from(g).log10(),
-                    ),
-                    false,
-                );
-                self.measured.insert(*job.key(), row(&m));
-            }
-            Some(Err(e)) => log_line(
-                &format!(
-                    "loudness: {name}: {}; it plays at the headroom until it is loaded again",
-                    Chain(&e)
-                ),
-                true,
-            ),
-            None => {}
-        }
-    }
-
-    /// Before another chart's sounds are decoded: a finished measurement
-    /// is taken into memory; a running job stops (within one block) and
-    /// drops its bank, so the bank peak stays the engine's old and new.
-    pub fn cancel(&mut self) {
-        self.take_finished();
-        self.job = None;
-    }
-
-    /// The chart `name` was loaded with `bank`: its gain from a
-    /// measurement of its key in memory, else in `library`; on a miss, the
-    /// headroom, and an analysis started (paused if `paused`) when the bank
-    /// is at 1× and has a digest.
+    /// The chart `name` was loaded with `bank`: its gain from a measurement
+    /// of its key in memory, else in `library`; on a miss it is measured
+    /// now ([`measure`]) and kept in memory, or plays at the headroom when
+    /// it cannot be. A bank without a digest is never cached and plays at
+    /// the headroom.
     pub fn load(
         &mut self,
         library: &Library,
-        chart: Arc<Chart>,
-        bank: Arc<SoundBank>,
-        name: String,
-        paused: bool,
+        chart: &Chart,
+        bank: &Arc<SoundBank>,
+        name: &str,
+        host: &mut dyn Host,
     ) {
-        self.cancel();
-        self.loaded = key(&chart, &bank);
         self.gain = Gain::HEADROOM;
-        self.normalized = false;
-        let Some(key) = self.loaded else {
+        let Some(key) = key(chart, bank) else {
             return;
         };
         if let Some(row) = self.lookup(library, &key) {
             self.gain = gain(&row);
-            self.normalized = true;
+            log_line(
+                &format!(
+                    "loudness: {name}: gain {:.2} dB, measured before",
+                    20.0 * f64::from(self.gain.get()).log10()
+                ),
+                false,
+            );
             return;
         }
-        if bank.speed() != Speed::NORMAL {
-            return;
-        }
-        match Job::start(chart, bank, key, name, paused, Arc::clone(&self.hook)) {
-            Ok(job) => self.job = Some(job),
-            Err(e) => log_line(
-                &format!("loudness: the analysis cannot start: {}", Chain(&e)),
-                true,
-            ),
+        if let Some(m) = measure(chart, bank, Some(&key), name, host) {
+            let row = row(&m);
+            self.measured.insert(key, row);
+            self.gain = gain(&row);
         }
     }
 
@@ -524,25 +282,9 @@ impl Loudness {
     }
 
     /// Before a countdown, with the scan quiet (its pause acknowledged, or
-    /// none running) and the job paused: a finished measurement is taken,
-    /// every measurement in memory is stored, and the loaded chart's gain
-    /// is updated from a measurement of its own key. A store that fails is
-    /// logged and kept in memory for this run.
+    /// none running): every measurement in memory is stored; one the
+    /// database refuses is logged and kept for this run.
     pub fn store(&mut self, library: &mut Library) {
-        self.take_finished();
-        self.flush(library);
-        if !self.normalized
-            && let Some(key) = self.loaded
-            && let Some(row) = self.lookup(library, &key)
-        {
-            self.gain = gain(&row);
-            self.normalized = true;
-        }
-    }
-
-    /// Stores every measurement in memory; one the database refuses is
-    /// logged and kept.
-    fn flush(&mut self, library: &mut Library) {
         self.measured
             .retain(|key, row| match library.store_loudness(key, row) {
                 Ok(()) => false,
@@ -559,20 +301,11 @@ impl Loudness {
             });
     }
 
-    /// At the end of a run: a finished measurement is stored if the scan
-    /// stopped (`quiet`), a running analysis is stopped and discarded.
-    pub fn close(&mut self, library: &mut Library, quiet: bool, timeout: Duration) {
-        self.take_finished();
-        if let Some(job) = self.job.take()
-            && !job.stop_within(timeout)
-        {
-            log_line(
-                "loudness: the analysis did not stop in time; it ends with the process",
-                true,
-            );
-        }
+    /// At the end of a run: the measurements in memory are stored if the
+    /// scan stopped (`quiet`).
+    pub fn close(&mut self, library: &mut Library, quiet: bool) {
         if quiet {
-            self.flush(library);
+            self.store(library);
         } else if !self.measured.is_empty() {
             log_line(
                 "loudness: the scan did not stop, so the measurements are not stored",
@@ -582,25 +315,19 @@ impl Loudness {
     }
 }
 
-/// Charts, banks and a gate for the job's tests, shared with the shelf's.
+/// Charts, banks and a host for the measurement's tests, shared with the
+/// shelf's.
 #[cfg(test)]
 pub(crate) mod fixture {
     use std::path::Path;
-    use std::sync::{Arc, Condvar, Mutex, PoisonError};
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
 
-    use audio::SoundBank;
+    use audio::{SoundBank, Speed};
     use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
-
-    use super::{Hook, Point};
 
     /// The rate the test banks are decoded at: low, so a debug build
     /// analyzes seconds of sound quickly.
     pub const RATE: u32 = 8_000;
-
-    /// How long a test waits for what must happen however late a loaded
-    /// machine runs it: it only catches what never happens.
-    pub const WATCHDOG: Duration = Duration::from_secs(600);
 
     /// A mono 16-bit WAV of `samples` at [`RATE`].
     pub fn wav(samples: &[i16]) -> Vec<u8> {
@@ -638,7 +365,7 @@ pub(crate) mod fixture {
 
     /// A chart playing `dir/key.wav` as BGM at 0, its resolved hash all
     /// `id`.
-    pub fn chart(dir: &Path, id: u8) -> Arc<Chart> {
+    pub fn chart(dir: &Path, id: u8) -> Chart {
         let mut chart = ChartBuilder::new(120_000)
             .sound("key.wav")
             .bgm(TimeUs(0), SoundId(0))
@@ -646,111 +373,49 @@ pub(crate) mod fixture {
             .unwrap();
         chart.sounds[0].path = Some(dir.join("key.wav"));
         chart.identity.resolved_hash = [id; 32];
-        Arc::new(chart)
+        chart
+    }
+
+    /// `chart`'s sounds, decoded at [`RATE`] and `speed`.
+    pub fn bank_at(chart: &Chart, speed: Speed) -> Arc<SoundBank> {
+        Arc::new(audio::load_bank_at(chart, RATE, speed, &audio::BankLimits::default()).unwrap())
     }
 
     /// `chart`'s sounds, decoded at [`RATE`].
     pub fn bank(chart: &Chart) -> Arc<SoundBank> {
-        Arc::new(audio::load_bank(chart, RATE, &audio::BankLimits::default()).unwrap())
+        bank_at(chart, Speed::NORMAL)
     }
 
-    #[derive(Debug, Default)]
-    struct Counts {
-        /// Per point, how many may pass (`usize::MAX`: all).
-        allowed: [usize; 4],
-        /// Per point, how many reached it.
-        reached: [usize; 4],
-        /// The step to panic at.
-        panic_at: Option<usize>,
+    /// A load's host: counts the blocks it is asked about, cancels at
+    /// block `cancel_at`, panics at block `panic_at`, and reads the 1×
+    /// chart and bank from `normal`.
+    #[derive(Default)]
+    pub struct Host {
+        pub blocks: usize,
+        pub measuring: usize,
+        pub cancel_at: Option<usize>,
+        pub panic_at: Option<usize>,
+        pub normal: Option<(Chart, Arc<SoundBank>)>,
+        pub normal_asked: usize,
     }
 
-    /// Holds the job's thread at its points until the test lets it pass.
-    #[derive(Debug, Default)]
-    pub struct Gate {
-        counts: Mutex<Counts>,
-        changed: Condvar,
-    }
-
-    const fn index(p: Point) -> usize {
-        match p {
-            Point::Start => 0,
-            Point::Construct => 1,
-            Point::Step => 2,
-            Point::Publish => 3,
-        }
-    }
-
-    impl Gate {
-        /// A gate letting everything pass but `held` points.
-        pub fn holding(held: &[Point]) -> Arc<Self> {
-            let gate = Self::default();
-            {
-                let mut c = gate.counts.lock().unwrap();
-                c.allowed = [usize::MAX; 4];
-                for &p in held {
-                    c.allowed[index(p)] = 0;
-                }
-            }
-            Arc::new(gate)
+    impl super::Host for Host {
+        fn at_normal(&mut self) -> anyhow::Result<(Chart, Arc<SoundBank>)> {
+            self.normal_asked += 1;
+            self.normal
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no 1× chart (test)"))
         }
 
-        /// The hook that passes through this gate.
-        pub fn hook(self: &Arc<Self>) -> Hook {
-            let gate = Arc::clone(self);
-            Arc::new(move |p| gate.pass(p))
+        fn measuring(&mut self, _name: &str) {
+            self.measuring += 1;
         }
 
-        fn pass(&self, p: Point) {
-            let i = index(p);
-            let mut c = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
-            let n = c.reached[i];
-            c.reached[i] += 1;
-            self.changed.notify_all();
-            while c.allowed[i] <= n {
-                c = self.changed.wait(c).unwrap_or_else(PoisonError::into_inner);
-            }
-            if p == Point::Step && c.panic_at == Some(n) {
-                drop(c);
-                panic!("a step failed (test)");
-            }
-        }
-
-        /// Lets `n` more of point `p` pass.
-        pub fn allow(&self, p: Point, n: usize) {
-            let mut c = self.counts.lock().unwrap();
-            let i = index(p);
-            c.allowed[i] = c.allowed[i].saturating_add(n);
-            self.changed.notify_all();
-        }
-
-        /// Lets every point pass from now on.
-        pub fn open(&self) {
-            self.counts.lock().unwrap().allowed = [usize::MAX; 4];
-            self.changed.notify_all();
-        }
-
-        /// Panics the thread at step `n` (from 0).
-        pub fn panic_at(&self, n: usize) {
-            self.counts.lock().unwrap().panic_at = Some(n);
-        }
-
-        /// Waits until `n` of point `p` were reached.
-        pub fn reached(&self, p: Point, n: usize) {
-            let begun = Instant::now();
-            let mut c = self.counts.lock().unwrap();
-            while c.reached[index(p)] < n {
-                assert!(begun.elapsed() < WATCHDOG, "{p:?} {n} never reached");
-                c = self
-                    .changed
-                    .wait_timeout(c, Duration::from_millis(100))
-                    .unwrap()
-                    .0;
-            }
-        }
-
-        /// How many of point `p` were reached.
-        pub fn count(&self, p: Point) -> usize {
-            self.counts.lock().unwrap().reached[index(p)]
+        fn cancelled(&mut self) -> bool {
+            let n = self.blocks;
+            self.blocks += 1;
+            assert_ne!(self.panic_at, Some(n), "a block failed (test)");
+            self.cancel_at == Some(n)
         }
     }
 }
@@ -759,14 +424,13 @@ pub(crate) mod fixture {
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
-    use audio::Gain;
+    use audio::{Gain, Speed};
     use game::DataRoot;
     use library::Library;
 
-    use super::fixture::{Gate, WATCHDOG, bank, chart, square, write_sound};
-    use super::{Job, JobError, Loudness, Point};
+    use super::Loudness;
+    use super::fixture::{Host, bank, bank_at, chart, square, write_sound};
 
     fn library(dir: &Path) -> Library {
         crate::shelf::open(&DataRoot::new(dir.join("data")))
@@ -774,40 +438,229 @@ mod tests {
             .0
     }
 
-    fn open_hook() -> super::Hook {
-        Arc::new(|_| {})
+    /// A miss is measured during the load: the first play's gain is the
+    /// measured one, kept in memory and stored before the countdown; a
+    /// second load (in memory, then from the library in another run)
+    /// measures nothing.
+    #[test]
+    fn a_missing_key_is_measured_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lib = library(dir.path());
+        let songs = dir.path().join("song");
+        write_sound(&songs, &square(2.0, 1_000));
+        let c = chart(&songs, 1);
+        let b = bank(&c);
+        let key = super::key(&c, &b).unwrap();
+        let mut loudness = Loudness::default();
+        let mut host = Host::default();
+        loudness.load(&lib, &c, &b, "a.bms", &mut host);
+        assert_eq!(host.measuring, 1);
+        assert!(host.blocks > 0);
+        let row = loudness.in_memory(&key).unwrap();
+        assert!(row.integrated.is_some(), "{row:?}");
+        assert_eq!(loudness.gain(), super::gain(&row));
+        assert_ne!(loudness.gain(), Gain::HEADROOM);
+        assert_eq!(lib.loudness(&key).unwrap(), None);
+        // Before the countdown: stored.
+        loudness.store(&mut lib);
+        assert_eq!(lib.loudness(&key).unwrap(), Some(row));
+        assert!(loudness.in_memory(&key).is_none());
+        // Loaded again: from the library, nothing measured.
+        let mut again = Host::default();
+        loudness.load(&lib, &c, &b, "a.bms", &mut again);
+        assert_eq!((again.measuring, again.blocks), (0, 0));
+        assert_eq!(loudness.gain(), super::gain(&row));
+        // In another run's memory-less state, too.
+        let mut fresh = Loudness::default();
+        fresh.load(&lib, &c, &b, "a.bms", &mut again);
+        assert_eq!((again.measuring, again.blocks), (0, 0));
+        assert_eq!(fresh.gain(), super::gain(&row));
     }
 
-    /// Waits for the job to finish, the shelf released.
-    fn finished(loudness: &Loudness) {
-        let begun = Instant::now();
-        while loudness.analyzing() {
-            assert!(begun.elapsed() < WATCHDOG, "the analysis never ended");
-            std::thread::sleep(Duration::from_millis(5));
+    /// An analysis that fails (it panics at its second block), and one
+    /// cancelled at its second block, leave the headroom and keep nothing:
+    /// nothing is stored, and the next load measures again.
+    #[test]
+    fn a_failed_or_cancelled_measurement_leaves_the_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lib = library(dir.path());
+        let songs = dir.path().join("song");
+        write_sound(&songs, &square(2.0, 1_000));
+        let c = chart(&songs, 1);
+        let b = bank(&c);
+        let key = super::key(&c, &b).unwrap();
+        for host in [
+            Host {
+                panic_at: Some(1),
+                ..Host::default()
+            },
+            Host {
+                cancel_at: Some(1),
+                ..Host::default()
+            },
+        ] {
+            let mut host = host;
+            let mut loudness = Loudness::default();
+            loudness.load(&lib, &c, &b, "a.bms", &mut host);
+            // It stopped at the block it was told to.
+            assert_eq!(host.blocks, 2);
+            assert_eq!(loudness.gain(), Gain::HEADROOM);
+            assert!(loudness.in_memory(&key).is_none());
+            loudness.store(&mut lib);
+            assert_eq!(lib.loudness(&key).unwrap(), None);
+            let mut next = Host::default();
+            loudness.load(&lib, &c, &b, "a.bms", &mut next);
+            assert_eq!(next.measuring, 1);
+            assert_ne!(loudness.gain(), Gain::HEADROOM);
         }
     }
 
-    /// A chart and its `key.wav` in a folder, analyzed and stored; the file
+    /// A store the database refuses keeps the measurement in memory for
+    /// the run: the gain is the measured one, and a reload measures
+    /// nothing.
+    #[test]
+    fn a_refused_store_keeps_the_measurement_for_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lib = library(dir.path());
+        let songs = dir.path().join("song");
+        write_sound(&songs, &square(1.0, 3_000));
+        let c = chart(&songs, 1);
+        let b = bank(&c);
+        let key = super::key(&c, &b).unwrap();
+        rusqlite::Connection::open(dir.path().join("data").join("library.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE loudness;")
+            .unwrap();
+        let mut loudness = Loudness::default();
+        loudness.load(&lib, &c, &b, "a.bms", &mut Host::default());
+        let measured = loudness.gain();
+        assert_ne!(measured, Gain::HEADROOM);
+        loudness.store(&mut lib);
+        assert!(loudness.in_memory(&key).is_some());
+        let mut again = Host::default();
+        loudness.load(&lib, &c, &b, "a.bms", &mut again);
+        assert_eq!(again.measuring, 0);
+        assert_eq!(loudness.gain(), measured);
+    }
+
+    /// A bank at another speed is measured through the chart and bank read
+    /// again at 1×, under the 1× key: the gain a 1× load measures. When
+    /// the 1× ones cannot be read, or their key is another, it plays at
+    /// the headroom and keeps nothing.
+    #[test]
+    fn another_speed_measures_the_1x_chart() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = library(dir.path());
+        let songs = dir.path().join("song");
+        write_sound(&songs, &square(2.0, 1_000));
+        let c = chart(&songs, 1);
+        let normal = bank(&c);
+        let slow = bank_at(&c, Speed::SLOWEST);
+        let key = super::key(&c, &normal).unwrap();
+        assert_eq!(super::key(&c, &slow), Some(key));
+        let mut at_1x = Loudness::default();
+        at_1x.load(&lib, &c, &normal, "a.bms", &mut Host::default());
+
+        let mut host = Host {
+            normal: Some((c.clone(), Arc::clone(&normal))),
+            ..Host::default()
+        };
+        let mut loudness = Loudness::default();
+        loudness.load(&lib, &c, &slow, "a.bms", &mut host);
+        assert_eq!(host.normal_asked, 1);
+        assert_eq!(loudness.gain(), at_1x.gain());
+        assert_eq!(loudness.in_memory(&key), at_1x.in_memory(&key));
+
+        // No 1× chart.
+        let mut none = Host::default();
+        let mut loudness = Loudness::default();
+        loudness.load(&lib, &c, &slow, "a.bms", &mut none);
+        assert_eq!(none.normal_asked, 1);
+        assert_eq!(loudness.gain(), Gain::HEADROOM);
+        assert!(loudness.in_memory(&key).is_none());
+        // Another chart's 1× bank.
+        let other_dir = dir.path().join("other");
+        write_sound(&other_dir, &square(2.0, 500));
+        let other = chart(&other_dir, 1);
+        let mut wrong = Host {
+            normal: Some((other.clone(), bank(&other))),
+            ..Host::default()
+        };
+        loudness.load(&lib, &c, &slow, "a.bms", &mut wrong);
+        assert_eq!(wrong.blocks, 0);
+        assert_eq!(loudness.gain(), Gain::HEADROOM);
+        assert!(loudness.in_memory(&key).is_none());
+    }
+
+    /// A sound that cannot be read is measured as it plays, silent: the
+    /// chart plays at the headroom (no integrated loudness), measured once
+    /// and kept.
+    #[test]
+    fn an_unreadable_sound_measures_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = library(dir.path());
+        let songs = dir.path().join("song");
+        std::fs::create_dir_all(&songs).unwrap();
+        std::fs::write(songs.join("key.wav"), b"not a sound").unwrap();
+        let c = chart(&songs, 1);
+        let b = bank(&c);
+        assert!(!b.warnings().is_empty());
+        let key = super::key(&c, &b).unwrap();
+        let mut loudness = Loudness::default();
+        let mut host = Host::default();
+        loudness.load(&lib, &c, &b, "a.bms", &mut host);
+        assert_eq!(host.measuring, 1);
+        assert_eq!(loudness.gain(), Gain::HEADROOM);
+        assert_eq!(loudness.in_memory(&key).unwrap().integrated, None);
+    }
+
+    /// Without a library each load measures, and nothing is kept: a
+    /// failure plays at the headroom.
+    #[test]
+    fn without_a_library_each_load_measures() {
+        let dir = tempfile::tempdir().unwrap();
+        let songs = dir.path().join("song");
+        write_sound(&songs, &square(1.0, 1_000));
+        let c = chart(&songs, 1);
+        let b = bank(&c);
+        let lib = library(dir.path());
+        let mut stored = Loudness::default();
+        stored.load(&lib, &c, &b, "a.bms", &mut Host::default());
+        for _ in 0..2 {
+            let mut host = Host::default();
+            let g = super::unstored_gain(&c, &b, "a.bms", &mut host);
+            assert_eq!(host.measuring, 1);
+            assert_eq!(g, stored.gain());
+        }
+        let mut failing = Host {
+            panic_at: Some(0),
+            ..Host::default()
+        };
+        assert_eq!(
+            super::unstored_gain(&c, &b, "a.bms", &mut failing),
+            Gain::HEADROOM
+        );
+    }
+
+    /// A chart and its `key.wav` in a folder, measured and stored; the file
     /// is then overwritten with other samples of the same size and its old
     /// modification time, which the chart's resolved hash (sound names
     /// only) cannot see: the reload's key differs by its sound digest, the
-    /// stored row misses, and a new analysis measures the new file.
+    /// stored row misses, and the load measures the new file.
     #[test]
-    fn replacing_a_sound_file_invalidates_the_analysis() {
+    fn replacing_a_sound_file_invalidates_the_measurement() {
         let dir = tempfile::tempdir().unwrap();
         let mut lib = library(dir.path());
         let songs = dir.path().join("song");
         write_sound(&songs, &square(2.0, 4_000));
         let wav = songs.join("key.wav");
         let mtime = std::fs::metadata(&wav).unwrap().modified().unwrap();
-        let mut loudness = Loudness::new(open_hook());
+        let mut loudness = Loudness::default();
 
         let c = chart(&songs, 1);
         let b = bank(&c);
         let first = super::key(&c, &b).unwrap();
-        loudness.load(&lib, c, b, "a.bms".to_owned(), false);
-        assert!(loudness.job().is_some());
-        finished(&loudness);
+        loudness.load(&lib, &c, &b, "a.bms", &mut Host::default());
         loudness.store(&mut lib);
         let stored = lib.loudness(&first).unwrap().unwrap();
         assert_eq!(loudness.gain(), super::gain(&stored));
@@ -827,10 +680,9 @@ mod tests {
         assert_eq!(second.resolved_hash, first.resolved_hash);
         assert_ne!(second.sounds, first.sounds);
         assert_eq!(lib.loudness(&second).unwrap(), None);
-        loudness.load(&lib, c, b, "a.bms".to_owned(), false);
-        assert!(loudness.job().is_some(), "the stale row was taken");
-        assert_eq!(loudness.gain(), Gain::HEADROOM);
-        finished(&loudness);
+        let mut host = Host::default();
+        loudness.load(&lib, &c, &b, "a.bms", &mut host);
+        assert_eq!(host.measuring, 1, "the stale row was taken");
         loudness.store(&mut lib);
         let again = lib.loudness(&second).unwrap().unwrap();
         // 20 dB quieter.
@@ -839,251 +691,5 @@ mod tests {
             (l(&stored) - l(&again) - 20.0).abs() < 0.5,
             "{stored:?} {again:?}"
         );
-    }
-
-    /// A measurement taken from a finished job is kept in memory by its
-    /// whole key until stored: the same chart loaded again before the
-    /// store plays at its gain at once and starts no analysis; another
-    /// chart does not take it; a store the database refuses keeps it for
-    /// the run.
-    #[test]
-    fn measurements_are_handed_over_by_their_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut lib = library(dir.path());
-        let (a_dir, b_dir) = (dir.path().join("a"), dir.path().join("b"));
-        write_sound(&a_dir, &square(1.0, 3_000));
-        write_sound(&b_dir, &square(1.0, 3_000));
-        let mut loudness = Loudness::new(open_hook());
-        let a = chart(&a_dir, 1);
-        let a_bank = bank(&a);
-        let a_key = super::key(&a, &a_bank).unwrap();
-        loudness.load(
-            &lib,
-            Arc::clone(&a),
-            Arc::clone(&a_bank),
-            "a".to_owned(),
-            false,
-        );
-        finished(&loudness);
-        // Reloaded before any store: from memory.
-        loudness.load(
-            &lib,
-            Arc::clone(&a),
-            Arc::clone(&a_bank),
-            "a".to_owned(),
-            false,
-        );
-        assert!(loudness.job().is_none());
-        assert_ne!(loudness.gain(), Gain::HEADROOM);
-        let a_gain = loudness.gain();
-        assert!(loudness.in_memory(&a_key).is_some());
-        assert_eq!(lib.loudness(&a_key).unwrap(), None);
-        // Another chart: the headroom and its own analysis.
-        let b = chart(&b_dir, 2);
-        let b_bank = bank(&b);
-        loudness.load(&lib, b, b_bank, "b".to_owned(), true);
-        assert_eq!(loudness.gain(), Gain::HEADROOM);
-        assert!(loudness.job().is_some());
-        loudness.store(&mut lib);
-        assert_eq!(loudness.gain(), Gain::HEADROOM, "b took a's gain");
-        assert!(lib.loudness(&a_key).unwrap().is_some());
-
-        // A store the database refuses: kept in memory for the run.
-        let db = dir.path().join("data").join("library.db");
-        rusqlite::Connection::open(&db)
-            .unwrap()
-            .execute_batch("DROP TABLE loudness;")
-            .unwrap();
-        let mut fresh = Loudness::new(open_hook());
-        fresh.load(
-            &lib,
-            Arc::clone(&a),
-            Arc::clone(&a_bank),
-            "a".to_owned(),
-            false,
-        );
-        finished(&fresh);
-        fresh.store(&mut lib);
-        assert!(fresh.in_memory(&a_key).is_some());
-        assert_eq!(fresh.gain(), a_gain);
-        fresh.load(&lib, a, a_bank, "a".to_owned(), false);
-        assert_eq!(fresh.gain(), a_gain);
-        assert!(fresh.job().is_none());
-    }
-
-    /// A job whose step panics ends Failed: no measurement, no row, the
-    /// chart stays at the headroom; the next load analyzes again.
-    #[test]
-    fn a_failed_analysis_leaves_the_headroom() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut lib = library(dir.path());
-        let songs = dir.path().join("song");
-        write_sound(&songs, &square(1.0, 3_000));
-        // One second at 8 kHz is two blocks: the second fails.
-        let gate = Gate::holding(&[]);
-        gate.panic_at(1);
-        let mut loudness = Loudness::new(gate.hook());
-        let c = chart(&songs, 1);
-        let b = bank(&c);
-        let key = super::key(&c, &b).unwrap();
-        loudness.load(&lib, Arc::clone(&c), Arc::clone(&b), "a".to_owned(), false);
-        finished(&loudness);
-        let job = loudness.job().unwrap();
-        assert!(matches!(job.take_result(), Some(Err(JobError::Panicked))));
-        loudness.store(&mut lib);
-        assert_eq!(loudness.gain(), Gain::HEADROOM);
-        assert_eq!(lib.loudness(&key).unwrap(), None);
-        assert!(loudness.in_memory(&key).is_none());
-        // The next load starts another analysis.
-        let mut retried = Loudness::new(open_hook());
-        retried.load(&lib, c, b, "a".to_owned(), false);
-        assert!(retried.job().is_some());
-    }
-
-    /// The job's pause, block by block: a pause asked during a block is
-    /// acknowledged at the next block's check, and each request on its own
-    /// (successive generations); a job paused from the start builds
-    /// nothing until released; a pause asked during the last block is
-    /// answered by the end, and so is one asked during a failing block.
-    #[test]
-    fn the_job_pauses_between_blocks() {
-        let dir = tempfile::tempdir().unwrap();
-        let songs = dir.path().join("song");
-        write_sound(&songs, &square(2.0, 3_000));
-        let c = chart(&songs, 1);
-        let b = bank(&c);
-        let key = super::key(&c, &b).unwrap();
-
-        // Paused from the start: nothing is built until the release.
-        let gate = Gate::holding(&[Point::Step, Point::Publish]);
-        let begun = Instant::now();
-        let job = Job::start(
-            Arc::clone(&c),
-            Arc::clone(&b),
-            key,
-            "a".to_owned(),
-            true,
-            gate.hook(),
-        )
-        .unwrap();
-        assert!(job.wait_paused(WATCHDOG));
-        assert_eq!(gate.count(Point::Construct), 0);
-        job.release();
-        gate.reached(Point::Step, 1);
-        assert_eq!(gate.count(Point::Construct), 1);
-        // Asked during block 0: not acknowledged until the block is over.
-        job.request_pause();
-        assert!(!job.wait_paused(Duration::from_millis(50)));
-        gate.allow(Point::Step, 1);
-        assert!(job.wait_paused(WATCHDOG));
-        assert_eq!(gate.count(Point::Step), 1);
-        // Released and asked again: the second request is acknowledged on
-        // its own.
-        job.release();
-        gate.reached(Point::Step, 2);
-        job.request_pause();
-        assert!(!job.wait_paused(Duration::from_millis(50)));
-        gate.allow(Point::Step, 1);
-        assert!(job.wait_paused(WATCHDOG));
-        // Released to its last block (two seconds at 8 kHz: four blocks),
-        // held there a while, and a pause asked: the block ends the
-        // analysis, and only its publication answers the pause.
-        job.release();
-        gate.allow(Point::Step, 1);
-        gate.reached(Point::Step, 4);
-        let held = Instant::now();
-        job.request_pause();
-        std::thread::sleep(Duration::from_millis(200));
-        let held = held.elapsed();
-        gate.allow(Point::Step, 1);
-        gate.reached(Point::Publish, 1);
-        assert!(!job.wait_paused(Duration::from_millis(50)));
-        assert!(!job.finished());
-        gate.allow(Point::Publish, 1);
-        assert!(job.wait_paused(WATCHDOG));
-        assert!(job.finished());
-        let wall = begun.elapsed();
-        assert_eq!(gate.count(Point::Step), 4);
-        assert!(matches!(job.take_result(), Some(Ok(_))));
-        assert!(job.take_result().is_none(), "taken twice");
-        // The time it reports excludes its pauses and holds.
-        assert!(
-            job.busy() + held <= wall,
-            "{:?} {held:?} {wall:?}",
-            job.busy()
-        );
-
-        // A pause asked during a block that fails: answered by the end.
-        let gate = Gate::holding(&[Point::Step]);
-        gate.allow(Point::Step, 1);
-        gate.panic_at(1);
-        let job = Job::start(c, b, key, "a".to_owned(), false, gate.hook()).unwrap();
-        gate.reached(Point::Step, 2);
-        job.request_pause();
-        gate.allow(Point::Step, 1);
-        assert!(job.wait_paused(WATCHDOG));
-        assert!(job.finished());
-        assert!(matches!(job.take_result(), Some(Err(JobError::Panicked))));
-    }
-
-    /// Cancelling a running job stops it within its block, before a chart's
-    /// sounds are decoded: it drops its bank, and keeps no measurement; a
-    /// job stopped while paused ends at once.
-    #[test]
-    fn cancelling_stops_the_job_and_drops_its_bank() {
-        let dir = tempfile::tempdir().unwrap();
-        let lib = library(dir.path());
-        let songs = dir.path().join("song");
-        write_sound(&songs, &square(2.0, 3_000));
-        let c = chart(&songs, 1);
-        let b = bank(&c);
-        let key = super::key(&c, &b).unwrap();
-
-        // Running, held in its third block.
-        let gate = Gate::holding(&[Point::Step]);
-        gate.allow(Point::Step, 2);
-        let mut loudness = Loudness::new(gate.hook());
-        loudness.load(&lib, Arc::clone(&c), Arc::clone(&b), "a".to_owned(), false);
-        gate.reached(Point::Step, 3);
-        assert_eq!(Arc::strong_count(&b), 2);
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                // The cancel waits for the block in hand.
-                std::thread::sleep(Duration::from_millis(50));
-                gate.open();
-            });
-            loudness.cancel();
-        });
-        assert!(loudness.job().is_none());
-        assert_eq!(Arc::strong_count(&b), 1, "the job kept its bank");
-        assert!(loudness.in_memory(&key).is_none());
-        assert_eq!(gate.count(Point::Publish), 0);
-
-        // Paused from the start, then stopped.
-        let gate = Gate::holding(&[]);
-        let mut loudness = Loudness::new(gate.hook());
-        loudness.load(&lib, c, Arc::clone(&b), "a".to_owned(), true);
-        assert!(loudness.job().unwrap().wait_paused(WATCHDOG));
-        loudness.cancel();
-        assert_eq!(Arc::strong_count(&b), 1);
-        assert_eq!(gate.count(Point::Construct), 0);
-    }
-
-    /// A job stopped with `stop_within` ends within its bound while paused,
-    /// publishing nothing.
-    #[test]
-    fn a_paused_job_stops_within_its_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let songs = dir.path().join("song");
-        write_sound(&songs, &square(1.0, 3_000));
-        let c = chart(&songs, 1);
-        let b = bank(&c);
-        let key = super::key(&c, &b).unwrap();
-        let gate = Gate::holding(&[]);
-        let job = Job::start(c, Arc::clone(&b), key, "a".to_owned(), true, gate.hook()).unwrap();
-        assert!(job.wait_paused(WATCHDOG));
-        assert!(job.stop_within(WATCHDOG));
-        assert_eq!(Arc::strong_count(&b), 1);
-        assert_eq!(gate.count(Point::Publish), 0);
     }
 }

@@ -344,10 +344,6 @@ pub enum SelectStep {
     /// Wait this many milliseconds on the select screen and print how often
     /// the input thread woke meanwhile.
     Idle(u64),
-    /// Wait on the select screen until the loaded chart's loudness analysis
-    /// has finished, however long a loaded machine takes (within
-    /// [`ANALYSIS_TIMEOUT`]).
-    Analyzed,
     /// Press Enter.
     Enter,
     /// Press F11: the previous play preset.
@@ -387,14 +383,10 @@ pub enum SelectStep {
 
 /// How long a scripted step waits for its chart.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long the `analyzed` step waits: the analysis runs in background
-/// mode, which a loaded machine can starve, so the bound only catches an
-/// analysis that never ends.
-pub const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
 /// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
-/// `idle=<ms>`, `analyzed`, `enter`, `prev-preset`, `next-preset`, `drawn`,
+/// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
 /// `back`, `retry`, `next`, `prev` and `close`. Selection steps run on the
 /// select screen (`prev-preset` and `next-preset` press F11 and F12),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
@@ -438,13 +430,12 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, analyzed, enter, prev-preset, next-preset, drawn, back, retry, next, prev or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, enter, prev-preset, next-preset, drawn, back, retry, next, prev or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
                     .map(SelectStep::Idle)
                     .map_err(|_| format!("{s} takes milliseconds")),
-                None if s == "analyzed" => Ok(SelectStep::Analyzed),
                 None if s == "enter" => Ok(SelectStep::Enter),
                 None if s == "prev-preset" => Ok(SelectStep::PrevPreset),
                 None if s == "next-preset" => Ok(SelectStep::NextPreset),
@@ -455,7 +446,7 @@ impl SelectScript {
                 None if s == "prev" => Ok(SelectStep::Prev),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, analyzed, enter, prev-preset, next-preset, drawn, back, retry, next, prev or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, enter, prev-preset, next-preset, drawn, back, retry, next, prev or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))
@@ -513,17 +504,11 @@ impl SelectScript {
     /// The front step waits on; `false` once it has waited
     /// [`STEP_TIMEOUT`], which fails the script.
     pub fn waiting(&mut self) -> bool {
-        self.waiting_for(STEP_TIMEOUT)
-    }
-
-    /// The front step waits on; `false` once it has waited `bound`, which
-    /// fails the script.
-    pub fn waiting_for(&mut self, bound: Duration) -> bool {
-        if !self.expired_after(bound) {
+        if !self.expired_after(STEP_TIMEOUT) {
             return true;
         }
         let step = format!("{:?}", self.front());
-        self.fail(format!("{step} waited {} s", bound.as_secs()));
+        self.fail(format!("{step} waited {} s", STEP_TIMEOUT.as_secs()));
         false
     }
 

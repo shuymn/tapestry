@@ -529,14 +529,17 @@ fn generated(loaded: Loaded, chart: &Path) -> anyhow::Result<Prepared> {
 /// Loads the bank at the output's rate and hands the engine, playing
 /// `schedule` or else the session's ([`Loaded::audio_schedule`]: a round's,
 /// or the chart's BGM), to the audio thread, which keeps it silent until
-/// the first play.
+/// the first play; with the plays' gain, measured now (design.md
+/// "Algorithms", per-chart volume normalization: without a library each
+/// load measures, and nothing is stored). A close cancels the measurement.
 fn start_engine(
     loaded: &Loaded,
     schedule: Option<Vec<BgmEvent>>,
     audio: audio_side::AudioThread,
     opened: audio_side::Opened,
     probe: rtrb::Producer<game::AudioProbe>,
-) -> anyhow::Result<audio_side::AudioLink> {
+    controls: &Controls,
+) -> anyhow::Result<(audio_side::AudioLink, audio::Gain)> {
     let chart = loaded.chart();
     // At the speed the chart was loaded at, so the sounds keep its real time.
     let bank = load_bank_at(
@@ -547,8 +550,16 @@ fn start_engine(
     )
     .context("the sounds cannot be loaded")?;
     log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
+    let bank = Arc::new(bank);
+    let name = shelf::file_name(loaded.path());
+    let mut host = PlayHost {
+        loaded,
+        rate: opened.rate,
+        controls,
+    };
+    let gain = loudness::unstored_gain(chart, &bank, &name, &mut host);
     let mut engine = AudioEngine::with_schedule(
-        Arc::new(bank),
+        bank,
         schedule.unwrap_or_else(|| loaded.audio_schedule()),
         opened.rate,
         opened.period,
@@ -557,7 +568,35 @@ fn start_engine(
     )
     .context("the audio engine cannot start")?;
     loaded.settings().device.apply_to(&mut engine);
-    Ok(audio.start(engine, probe))
+    Ok((audio.start(engine, probe), gain))
+}
+
+/// What `tapestry play`'s load lends its loudness measurement: the 1×
+/// chart and bank for a chart at another speed, and the close as its
+/// cancel.
+struct PlayHost<'a> {
+    loaded: &'a Loaded,
+    rate: u32,
+    controls: &'a Controls,
+}
+
+impl loudness::Host for PlayHost<'_> {
+    fn at_normal(&mut self) -> anyhow::Result<(bms_model::Chart, Arc<audio::SoundBank>)> {
+        let chart = self.loaded.chart_at(bms_model::Speed::NORMAL)?;
+        let bank = load_bank_at(
+            &chart,
+            self.rate,
+            bms_model::Speed::NORMAL,
+            &BankLimits::default(),
+        )?;
+        Ok((chart, Arc::new(bank)))
+    }
+
+    fn measuring(&mut self, _name: &str) {}
+
+    fn cancelled(&mut self) -> bool {
+        self.controls.quitting()
+    }
 }
 
 /// What restores the rounds of a practice set up at load: the engine's
@@ -733,6 +772,7 @@ fn rig<'a>(
         #[cfg(feature = "dev-tools")]
         adjust_on_end: Vec::new(),
         selection: None,
+        gain: audio::Gain::HEADROOM,
     }
 }
 
@@ -870,7 +910,7 @@ fn play(
         |_| {},
     )?;
     let probes = Probes::new();
-    let audio = start_engine(&loaded, schedule, audio, opened, probes.sounds.0)?;
+    let (audio, gain) = start_engine(&loaded, schedule, audio, opened, probes.sounds.0, &controls)?;
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let raw_input = matches!(mode, Mode::Clock);
@@ -980,6 +1020,7 @@ fn play(
         rig.recorded.keyboard = keyboard;
     }
     rig.restorer = restorer(&loaded, &rig);
+    rig.gain = gain;
     rig.result_input = menus;
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
@@ -1439,7 +1480,7 @@ fn headless(
         dev::report_audio,
     )?;
     let probes = Probes::new();
-    let audio = start_engine(&loaded, schedule, audio, opened, probes.sounds.0)?;
+    let (audio, gain) = start_engine(&loaded, schedule, audio, opened, probes.sounds.0, &controls)?;
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let (mut hook, input) = input_side::link(Arc::clone(&controls), mode, waker.clone());
@@ -1497,6 +1538,7 @@ fn headless(
         rig.recorded.keyboard = keyboard;
     }
     rig.restorer = restorer(&loaded, &rig);
+    rig.gain = gain;
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.auto_retries = auto_retries;
     rig.queue_most = opened.most_queued_periods;

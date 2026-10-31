@@ -552,6 +552,33 @@ impl Loaded {
     /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
     /// one loaded, and what reading it refuses; nothing changes then.
     pub fn set_speed(&mut self, speed: Speed) -> Result<(), SessionError> {
+        let (config, chart, chart_record, warnings) = self.read_at(speed)?;
+        self.config = config;
+        self.chart = chart;
+        self.chart_record = chart_record;
+        self.warnings = warnings;
+        self.practice = None;
+        Ok(())
+    }
+
+    /// The chart read again from its file at `speed`, with the same seed
+    /// and transform, the session unchanged: what the loudness analysis of
+    /// a practice at another speed measures at 1× (design.md
+    /// "Algorithms", per-chart volume normalization).
+    ///
+    /// # Errors
+    ///
+    /// As [`set_speed`](Self::set_speed).
+    pub fn chart_at(&self, speed: Speed) -> Result<Chart, SessionError> {
+        self.read_at(speed).map(|(_, chart, _, _)| chart)
+    }
+
+    /// The chart read again at `speed`; refused when its file's SHA-256 is
+    /// not the one loaded.
+    fn read_at(
+        &self,
+        speed: Speed,
+    ) -> Result<(SessionConfig, Chart, ChartRecord, Vec<String>), SessionError> {
         let config = SessionConfig {
             speed,
             ..self.config.clone()
@@ -560,12 +587,7 @@ impl Loaded {
         if chart_record.identity.sha256 != self.chart_record.identity.sha256 {
             return Err(SessionError::ChartChanged(self.path.clone()));
         }
-        self.config = config;
-        self.chart = chart;
-        self.chart_record = chart_record;
-        self.warnings = warnings;
-        self.practice = None;
-        Ok(())
+        Ok((config, chart, chart_record, warnings))
     }
 
     /// Sets up practice (design.md "Mid-Chart Start and Section Repeat"):

@@ -244,7 +244,9 @@ fn a_second_chart_plays_only_its_own_sounds() {
     assert_eq!(peaks.len(), 24, "{stdout}");
     let (a, b) = peaks.split_at(8);
     assert!(a.iter().all(|&p| p > 0.2), "{peaks:?}");
-    assert!(b.iter().all(|&p| p < 0.05), "{peaks:?}");
+    // Each at its own measured gain: b's quiet sound, at the +6 dB cap,
+    // stays far below a's.
+    assert!(b.iter().all(|&p| p < 0.1), "{peaks:?}");
     // Each countdown follows a pause line since the one before.
     let mut paused = false;
     for line in stdout.lines() {
@@ -259,81 +261,89 @@ fn a_second_chart_plays_only_its_own_sounds() {
     }
 }
 
-/// The first load of a chart plays at the 0.5 headroom while its loudness
-/// is analyzed, paused before every countdown and running only while the
-/// result and the select screen show; once analyzed, the chart's next load
-/// plays at the measured gain. Judgment is the same at either gain.
-#[test]
-fn analysis_pauses_during_play_and_sets_the_next_gain() {
-    let fx = fixture();
-    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
-    let (_, stdout) = run(
-        &fx,
-        "pick=a.bms,enter,back,analyzed,pick=a.bms,enter,back,close",
-        &[],
-    );
-    assert_eq!(lines(&stdout, "play started").len(), 2, "{stdout}");
-    // Every countdown follows the analysis's pause line since the play
-    // before: paused (the first load's analysis), or none (the second
-    // load, a cache hit).
-    let mut said = Vec::new();
-    let mut last = None;
-    for line in stdout.lines() {
-        if line.starts_with("loudness: the analysis paused before the countdown")
-            || line.starts_with("loudness: no analysis before the countdown")
-        {
-            last = Some(line);
-        } else if line == "play started" {
-            said.push(
-                last.take()
-                    .unwrap_or_else(|| panic!("no pause line:\n{stdout}")),
-            );
-        }
-    }
-    assert_eq!(
-        said,
-        [
-            "loudness: the analysis paused before the countdown",
-            "loudness: no analysis before the countdown"
-        ],
-        "{stdout}"
-    );
-    // Judgment is unchanged.
-    let plays = lines(&stdout, "play 1: ");
-    assert_eq!(plays.len(), 2, "{stdout}");
-    for play in plays {
-        assert!(
-            play.starts_with("play 1: Completed; perfect 4 great 0 good 0 bad 0 poor 0"),
-            "{stdout}"
-        );
-    }
-    // The measured gain, in dB, from the analysis's line.
-    let analyzed = lines(&stdout, "loudness: a.bms analyzed in ");
-    assert_eq!(analyzed.len(), 1, "{stdout}");
-    let db: f64 = analyzed[0]
+/// The gain in dB a `loudness: <name> measured in` line gives, as a factor.
+fn measured_gain(line: &str) -> f64 {
+    let db: f64 = line
         .split("; gain ")
         .nth(1)
         .and_then(|r| r.split(" dB").next())
         .unwrap()
         .parse()
         .unwrap();
-    let gain = 10_f64.powf(db / 20.0);
-    assert!(gain > 0.5 && gain <= 1.996, "{gain}");
-    // Four onsets a play, the second play's louder by the gain over the
-    // headroom (each peak printed to 0.001, the gain to 0.01 dB: within
-    // 2 %). The square wave's resampling ripple is the same in both.
-    let peaks = onset_peaks(&stdout);
-    assert_eq!(peaks.len(), 8, "{stdout}");
-    let (first, second) = peaks.split_at(4);
-    let ratio = f64::from(second[0]) / f64::from(first[0]);
-    assert!(
-        (ratio / (gain / 0.5) - 1.0).abs() < 0.02,
-        "{peaks:?} {analyzed:?}"
+    10_f64.powf(db / 20.0)
+}
+
+/// A chart whose loudness the library misses is measured during its load,
+/// before its first countdown: its first play and its retry sound at the
+/// measured gain, not the 0.5 headroom. Its next load finds the
+/// measurement stored at that countdown and measures nothing. Judgment is
+/// the same at either gain.
+#[test]
+fn the_first_play_has_the_measured_gain() {
+    let fx = fixture();
+    // The same square wave, b's four times louder.
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    write_chart(&fx.library, "b", "b.bms", "譜面B", 16_000);
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,enter,retry,back,pick=b.bms,enter,back,pick=a.bms,enter,back,close",
+        &[],
     );
-    assert!(first.iter().all(|&p| p == first[0]), "{peaks:?}");
-    assert!(second.iter().all(|&p| p == second[0]), "{peaks:?}");
+    assert_eq!(lines(&stdout, "play started").len(), 4, "{stdout}");
+    // Each measured once, during its first load, before its countdown.
+    for name in ["a.bms", "b.bms"] {
+        let line = format!("loudness: measuring {name}");
+        assert_eq!(lines(&stdout, &line).len(), 1, "{stdout}");
+        let at = stdout.find(&line).unwrap();
+        let next = stdout[at..].find("play started").map(|p| at + p);
+        let load = stdout[at..]
+            .find("load: the chart is ready ")
+            .map(|p| at + p);
+        assert!(load < next && load.is_some(), "{stdout}");
+    }
+    let gain = |name: &str| {
+        let measured = lines(&stdout, &format!("loudness: {name} measured in "));
+        assert_eq!(measured.len(), 1, "{stdout}");
+        measured_gain(measured[0])
+    };
+    let (a_gain, b_gain) = (gain("a.bms"), gain("b.bms"));
+    assert!(a_gain > 1.0 && a_gain <= 1.996, "{a_gain}");
+    assert!(a_gain / b_gain > 2.0, "{a_gain} {b_gain}");
+    // a's second load: the stored measurement.
+    let before = lines(&stdout, "loudness: a.bms: gain ");
+    assert_eq!(before.len(), 1, "{stdout}");
+    assert!(before[0].ends_with("measured before"), "{stdout}");
+    // Judgment is unchanged.
+    let plays: Vec<_> = stdout
+        .lines()
+        .filter(|l| l.starts_with("play ") && l.contains(": Completed; "))
+        .collect();
+    assert_eq!(plays.len(), 4, "{stdout}");
+    for play in plays {
+        assert!(
+            play.contains("Completed; perfect 4 great 0 good 0 bad 0 poor 0"),
+            "{stdout}"
+        );
+    }
+    // Four onsets a play. Every play of a peaks alike, its first too; the
+    // wave's peak, resampling ripple included, scales with its amplitude
+    // times its gain, so a's over b's is (1/4)(a's gain over b's), within
+    // the printed precision: at the headroom on its first play, a would
+    // have peaked a's gain over 0.5 lower.
+    let peaks = onset_peaks(&stdout);
+    assert_eq!(peaks.len(), 16, "{stdout}");
+    let (a, rest) = peaks.split_at(8);
+    let (b, again) = rest.split_at(4);
+    assert!(a.iter().chain(again).all(|&p| p == a[0]), "{peaks:?}");
+    assert!(b.iter().all(|&p| p == b[0]), "{peaks:?}");
+    let ratio = f64::from(a[0]) / f64::from(b[0]);
+    let expected = a_gain / b_gain / 4.0;
+    assert!(
+        (ratio / expected - 1.0).abs() < 0.02,
+        "{peaks:?} {a_gain} {b_gain}"
+    );
     // Below the clipper's knee.
-    assert!(second[0] < 0.8, "{peaks:?}");
+    assert!(a[0] < 0.8 && b[0] < 0.8, "{peaks:?}");
 }
 
 /// A chart that cannot be loaded returns to selection with its reason

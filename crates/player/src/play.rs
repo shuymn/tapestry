@@ -156,6 +156,9 @@ pub struct PlayerRig<'a> {
     pub adjust_at: TimeUs,
     /// The select screen, with song selection.
     pub selection: Option<crate::selection::Selection>,
+    /// The plays' gain without song selection (`tapestry play`): measured
+    /// at the load, else the headroom.
+    pub gain: audio::Gain,
     /// Settings keys pressed by themselves at the first end screen
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -495,11 +498,11 @@ impl Rig for PlayerRig<'_> {
         // before this thread runs again.
         let audio = AudioBase::new(self.audio.control.counters());
         // The play's gain, fixed for the whole play: its chart's
-        // normalization gain once measured, else the headroom.
+        // normalization gain, measured by its load, else the headroom.
         let gain = self
             .selection
             .as_ref()
-            .map_or(audio::Gain::HEADROOM, |s| s.shelf.gain());
+            .map_or(self.gain, |s| s.shelf.gain());
         // Audio was readied before recording opened, so this does not
         // wait; a worker gone since shows as the output's failure.
         let _ = self

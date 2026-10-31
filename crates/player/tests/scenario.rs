@@ -657,18 +657,44 @@ fn onset_peaks(stdout: &str) -> Vec<f64> {
         .collect()
 }
 
-/// A quiet chart's gain is measured at 1× and cached by one run; a
-/// practice of it at 75 % in another plays with that gain, found by the
-/// chart's 1× key, not the headroom: its sounds peak as loud as the 1×
-/// play's at the gain, about four times the headroom's.
+/// A practice at 75 % of a quiet chart the library misses measures the
+/// chart at 1× (read again with its 1× sounds) during the Start's load, so
+/// its first round plays at that gain, not the headroom; a later 1× play
+/// finds that measurement by the chart's 1× key and measures nothing: its
+/// sounds peak as loud as the round's, about four times the headroom's.
 #[test]
-fn practice_at_a_speed_keeps_the_charts_gain() {
+fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
     let fx = Fixture::new();
     let a = write_chart(&fx.library(), "a", "譜面A");
     write_wav_at(&fx.library().join("a").join("key.wav"), 1_000);
     write_log(&fx.base.join("logs").join("a.tprl"), &hits(&a, |_| true), 1);
-    // The first run analyzes A at 1× and stores its gain at the second
-    // play's countdown, which plays with it.
+    // The practice: measured at its Start, its round's four presses at the
+    // gain.
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 75, \
+         lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/a.tprl\", rounds = 1 }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        lines(&stdout, "loudness: measuring a.bms").len(),
+        1,
+        "{stdout}"
+    );
+    let measured = lines(&stdout, "loudness: a.bms measured in ");
+    assert_eq!(measured.len(), 1, "{stdout}");
+    let db: f64 = measured[0]
+        .split("; gain ")
+        .nth(1)
+        .and_then(|r| r.split(" dB").next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The +6 dB cap: four times the headroom.
+    assert!(db > 5.5, "{stdout}");
+    let round = onset_peaks(&stdout);
+    assert_eq!(round.len(), 4, "{stdout}");
+    // A 1× play in another run: the stored measurement, nothing measured.
     let root = game::DataRoot::new(fx.data());
     fs::create_dir_all(root.path()).unwrap();
     let device = DeviceSettings {
@@ -680,36 +706,26 @@ fn practice_at_a_speed_keeps_the_charts_gain() {
     game::save_settings(&root.device_settings(), &device).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
         .args(["--auto", "--dev-headless", "--dev-select"])
-        .arg("pick=a.bms,enter,back,analyzed,pick=a.bms,enter,back,close")
+        .arg("pick=a.bms,enter,back,close")
         .args(["--dev-render-timeout", "600"])
         .env("LOCALAPPDATA", &fx.appdata)
         .output()
         .unwrap();
-    let first = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert_eq!(out.status.code(), Some(0), "{first}");
-    let peaks = onset_peaks(&first);
-    assert_eq!(peaks.len(), 8, "{first}");
-    let (headroom, gained) = (peaks[0], peaks[4]);
-    assert!(gained > headroom * 3.0, "{peaks:?}");
-    // The practice: its round's four presses sound at the gain.
-    let (out, stdout, stderr) = fx.run(&scenario(&[
-        "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 75, \
-         lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/a.tprl\", rounds = 1 }",
-        "quit = {}",
-    ]));
-    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    assert!(
-        lines(&stdout, "loudness: ")
-            .iter()
-            .all(|l| !l.contains("analyzed")),
-        "{stdout}"
+    let played = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{played}");
+    assert!(lines(&played, "loudness: measuring").is_empty(), "{played}");
+    assert_eq!(
+        lines(&played, "loudness: a.bms: gain ").len(),
+        1,
+        "{played}"
     );
-    let round = onset_peaks(&stdout);
-    assert_eq!(round.len(), 4, "{stdout}");
+    let peaks = onset_peaks(&played);
+    assert_eq!(peaks.len(), 4, "{played}");
     for p in round {
         assert!(
-            (p / gained - 1.0).abs() < 0.15,
-            "{p} against {gained}: {stdout}"
+            (p / peaks[0] - 1.0).abs() < 0.15,
+            "{p} against {}: {stdout}",
+            peaks[0]
         );
     }
 }

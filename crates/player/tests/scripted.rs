@@ -28,8 +28,13 @@ const NOTES: usize = 7;
 
 /// A 50 ms mono 16-bit click at 44.1 kHz.
 fn write_click(path: &Path) {
+    write_click_at(path, 8_000);
+}
+
+/// [`write_click`] of `amplitude`.
+fn write_click_at(path: &Path, amplitude: i16) {
     let samples: Vec<i16> = (0..2_205)
-        .map(|i| if i % 50 < 25 { 8_000 } else { -8_000 })
+        .map(|i| if i % 50 < 25 { amplitude } else { -amplitude })
         .collect();
     let data = u32::try_from(samples.len() * 2).unwrap();
     let mut b = Vec::new();
@@ -990,6 +995,84 @@ fn png_pixels(path: &Path) -> (usize, usize, Vec<u8>) {
     }
     assert_eq!(rgba.len(), w * h * 4);
     (w, h, rgba)
+}
+
+/// `tapestry play` has no library: each load measures the chart before its
+/// first play, which sounds at the measured gain, as its retry does, and
+/// nothing is stored. Two charts alike but for their click's amplitude
+/// (the quiet one a quarter of the loud one): every onset's peak, the
+/// click's resampling ripple included, scales with amplitude times gain,
+/// so the loud over the quiet is four times the loud's gain over the
+/// quiet's, which at the headroom would be 1.
+#[test]
+fn direct_play_measures_at_each_load() {
+    let run = |amplitude: i16| {
+        let (dir, chart, appdata) = auto_fixture();
+        write_click_at(&chart.with_file_name("click.wav"), amplitude);
+        let out = auto_run(&chart, &appdata, &["--dev-auto-retry".as_ref()]);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+        let line = |prefix: &str| -> Vec<String> {
+            stdout
+                .lines()
+                .filter(|l| l.starts_with(prefix))
+                .map(str::to_owned)
+                .collect()
+        };
+        // Measured once, before the first countdown; the retry reuses it.
+        assert_eq!(
+            line("loudness: measuring autoplay.bms").len(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            stdout.find("loudness: measuring") < stdout.find("play started"),
+            "{stdout}"
+        );
+        let measured = line("loudness: autoplay.bms measured in ");
+        assert_eq!(measured.len(), 1, "{stdout}");
+        let db: f64 = measured[0]
+            .split("; gain ")
+            .nth(1)
+            .and_then(|r| r.split(" dB").next())
+            .unwrap()
+            .parse()
+            .unwrap();
+        // Nothing stored: no library.
+        assert!(
+            !appdata.join("tapestry").join("library.db").exists(),
+            "{stdout}"
+        );
+        let peaks: Vec<f64> = line("dev: audio onset peaks:")[0]
+            .trim_start_matches("dev: audio onset peaks:")
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        // Both plays alike.
+        assert_eq!(peaks.len() % 2, 0, "{peaks:?}");
+        let (first, retry) = peaks.split_at(peaks.len() / 2);
+        assert_eq!(first, retry, "{stdout}");
+        (dir, chart, appdata, 10_f64.powf(db / 20.0), peaks)
+    };
+    let (_loud_dir, loud_chart, loud_appdata, loud_gain, loud) = run(8_000);
+    let (_quiet_dir, _, _, quiet_gain, quiet) = run(2_000);
+    assert!(loud_gain / quiet_gain < 0.8, "{loud_gain} {quiet_gain}");
+    assert_eq!(loud.len(), quiet.len());
+    let expected = 4.0 * loud_gain / quiet_gain;
+    for (l, q) in loud.iter().zip(&quiet) {
+        assert!(
+            (l / q / expected - 1.0).abs() < 0.03,
+            "{loud:?} {quiet:?} {loud_gain} {quiet_gain}"
+        );
+    }
+    // Below the clipper's knee.
+    assert!(loud.iter().all(|&p| p < 0.8), "{loud:?}");
+    // The next run measures again.
+    let out = auto_run(&loud_chart, &loud_appdata, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert_eq!(stdout.matches("loudness: measuring").count(), 1, "{stdout}");
 }
 
 /// H2: retried by itself after ten input offset steps on the end screen
