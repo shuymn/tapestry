@@ -177,11 +177,14 @@ pub enum RenderMsg {
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
-    /// Draw the play screen's loading state with the lines in the slot
-    /// ([`LoadingSink`]), kept through a chart's load and a preparation
-    /// until something else is drawn; nothing when the slot was emptied
-    /// ([`RenderLink::clear_loading`]).
-    Loading,
+    /// Draw the play screen's loading state of this loading lifetime with
+    /// the lines in the slot ([`LoadingSink`]), kept through a chart's load
+    /// and a preparation until something else is drawn; nothing when the
+    /// lifetime has ended ([`RenderLink::clear_loading`]).
+    Loading(u64),
+    /// Loading has ended: stop drawing the loading state, and answer once
+    /// no loading frame can be drawn any more ([`RenderLink::end_loading`]).
+    EndLoading(mpsc::SyncSender<()>),
     /// A play starts: chart time 0 at the measurement's `origin` on the
     /// clock.
     Play {
@@ -265,11 +268,13 @@ struct Shared {
     loading: Mutex<LoadingSlot>,
 }
 
-/// The loading state's newest page, until the render thread takes it or
-/// loading ends, and whether a [`RenderMsg::Loading`] for it waits in the
-/// channel.
+/// The loading state's lifetime, its newest page until the render thread
+/// takes it or the lifetime ends, and whether a [`RenderMsg::Loading`] of
+/// this lifetime waits in the channel. Each clear starts a new lifetime: a
+/// sink, a signal or a frame of an older one does nothing.
 #[derive(Debug, Default)]
 struct LoadingSlot {
+    lifetime: u64,
     page: Option<Box<MenuPage>>,
     signaled: bool,
 }
@@ -315,34 +320,59 @@ impl Shared {
         self.loading.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes the waiting loading state, if any: the signal that came for it
-    /// is taken with it.
-    fn take_loading(&self) -> Option<Box<MenuPage>> {
+    /// Takes the waiting lines of loading lifetime `lifetime`, if it is
+    /// still the current one: the signal that came for them is taken with
+    /// them. A signal of an ended lifetime takes nothing.
+    fn take_loading(&self, lifetime: u64) -> Option<Box<MenuPage>> {
         let mut slot = self.loading_slot();
+        if slot.lifetime != lifetime {
+            return None;
+        }
         slot.signaled = false;
         slot.page.take()
+    }
+
+    /// Whether loading lifetime `lifetime` is still the current one.
+    fn loading_current(&self, lifetime: u64) -> bool {
+        self.loading_slot().lifetime == lifetime
+    }
+
+    /// Ends the current loading lifetime: its waiting lines are dropped,
+    /// and its sinks, signals and frames do nothing from here.
+    fn end_lifetime(&self) {
+        let mut slot = self.loading_slot();
+        slot.lifetime = slot.lifetime.wrapping_add(1);
+        slot.signaled = false;
+        drop(slot.page.take());
     }
 }
 
 /// Where the loading state is shown from, on any thread (the game thread
 /// and the decode pool): the newest page replaces one the render thread
 /// has not taken yet, and a signal is sent only when none waits, so at most
-/// one page and one signal wait whatever the render thread's pace.
+/// one page and one signal wait whatever the render thread's pace. A sink
+/// belongs to the loading lifetime current when it was made, and shows
+/// nothing once that lifetime has ended.
 #[derive(Clone)]
 pub struct LoadingSink {
     tx: Sender<RenderMsg>,
     shared: Arc<Shared>,
+    lifetime: u64,
 }
 
 impl LoadingSink {
-    /// Shows `page` as the loading state.
+    /// Shows `page` as the loading state, if the sink's lifetime is still
+    /// the current one.
     pub fn show(&self, page: MenuPage) {
         let mut slot = self.shared.loading_slot();
+        if slot.lifetime != self.lifetime {
+            return;
+        }
         drop(slot.page.replace(Box::new(page)));
         if !slot.signaled {
             slot.signaled = true;
             // A thread that already ended ignores it.
-            let _ = self.tx.send(RenderMsg::Loading);
+            let _ = self.tx.send(RenderMsg::Loading(self.lifetime));
         }
     }
 }
@@ -452,19 +482,34 @@ impl RenderLink {
         PendingLoad(rx)
     }
 
-    /// Where the loading state is shown from, on any thread.
+    /// Where the current loading lifetime's lines are shown from, on any
+    /// thread.
     pub fn loading(&self) -> LoadingSink {
         LoadingSink {
             tx: self.tx.clone(),
             shared: Arc::clone(&self.shared),
+            lifetime: self.shared.loading_slot().lifetime,
         }
     }
 
-    /// Loading ended (the countdown, selection, the practice page): a
-    /// loading state still waiting is dropped, and a signal still pending
-    /// draws nothing.
+    /// Loading ended (selection, the practice page): its lifetime ends, so
+    /// lines still waiting are dropped, a signal still pending takes
+    /// nothing, and the render thread draws no further loading frame of it,
+    /// checked after each frame's wait. The next lines shown begin a new
+    /// lifetime's.
     pub fn clear_loading(&self) {
-        drop(self.shared.loading_slot().page.take());
+        self.shared.end_lifetime();
+    }
+
+    /// Loading ended before recording opens: [`clear_loading`](Self::clear_loading),
+    /// then waits, at most [`LOAD_TIMEOUT`], until the render thread has
+    /// answered that it draws no loading frame any more, so none is drawn
+    /// after recording opens. Whether it answered.
+    pub fn end_loading(&self) -> bool {
+        self.clear_loading();
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::EndLoading(reply));
+        rx.recv_timeout(self.answer_timeout).is_ok()
     }
 
     /// The answer to a preparation or a load, waited for at most
@@ -650,11 +695,12 @@ enum Mode {
     /// The end screen: [`Run::end_page`].
     End,
     /// The select screen, or with `loading` the play screen's loading
-    /// state and its lines; `changed` until the page is laid out.
+    /// state of that loading lifetime and its lines; `changed` until the
+    /// page is laid out.
     Menu {
         page: Box<MenuPage>,
         changed: bool,
-        loading: bool,
+        loading: Option<u64>,
     },
 }
 
@@ -706,7 +752,7 @@ impl Run {
             if msg.is_ok()
                 && !matches!(
                     msg,
-                    Ok(RenderMsg::Loading | RenderMsg::Load { .. } | RenderMsg::Prepare(_))
+                    Ok(RenderMsg::Loading(_) | RenderMsg::Load { .. } | RenderMsg::Prepare(_))
                 )
             {
                 self.loading_stats.report("loading");
@@ -750,7 +796,13 @@ impl Run {
                     let _ = reply.send(ready);
                     // The loading state stays; anything else is not drawn
                     // until what comes next.
-                    if !matches!(mode, Mode::Menu { loading: true, .. }) {
+                    if !matches!(
+                        mode,
+                        Mode::Menu {
+                            loading: Some(_),
+                            ..
+                        }
+                    ) {
                         mode = Mode::Idle;
                     }
                     continue;
@@ -759,24 +811,44 @@ impl Run {
                     mode = Mode::Menu {
                         page,
                         changed: true,
-                        loading: false,
+                        loading: None,
                     };
                 }
-                Ok(RenderMsg::Loading) => {
-                    // A page the slot no longer holds (loading ended)
-                    // changes nothing.
-                    if let Some(page) = self.shared.take_loading() {
+                Ok(RenderMsg::Loading(lifetime)) => {
+                    // Lines the slot no longer holds (taken, or their
+                    // lifetime ended) change nothing.
+                    if let Some(page) = self.shared.take_loading(lifetime) {
                         mode = Mode::Menu {
                             page,
                             changed: true,
-                            loading: true,
+                            loading: Some(lifetime),
                         };
                     }
+                }
+                Ok(RenderMsg::EndLoading(reply)) => {
+                    // Between frames: none of the loading state follows.
+                    if matches!(
+                        mode,
+                        Mode::Menu {
+                            loading: Some(_),
+                            ..
+                        }
+                    ) {
+                        mode = Mode::Idle;
+                    }
+                    let _ = reply.send(());
+                    continue;
                 }
                 Ok(RenderMsg::Prepare(reply)) => {
                     let ready = self.prepare();
                     let _ = reply.send(ready);
-                    if !matches!(mode, Mode::Menu { loading: true, .. }) {
+                    if !matches!(
+                        mode,
+                        Mode::Menu {
+                            loading: Some(_),
+                            ..
+                        }
+                    ) {
                         mode = Mode::Idle;
                     }
                     continue;
@@ -840,7 +912,25 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
-            let loading_frame = matches!(mode, Mode::Menu { loading: true, .. });
+            // Loading ended during the wait: its frame is not drawn, and
+            // nothing is until what comes next, which takes the frame
+            // granted.
+            if let Mode::Menu {
+                loading: Some(lifetime),
+                ..
+            } = mode
+                && !self.shared.loading_current(lifetime)
+            {
+                mode = Mode::Idle;
+                continue;
+            }
+            let loading_frame = matches!(
+                mode,
+                Mode::Menu {
+                    loading: Some(_),
+                    ..
+                }
+            );
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Play {
@@ -952,7 +1042,13 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         menu: matches!(mode, Mode::Menu { .. }),
                         #[cfg(feature = "dev-tools")]
-                        loading: matches!(mode, Mode::Menu { loading: true, .. }),
+                        loading: matches!(
+                            mode,
+                            Mode::Menu {
+                                loading: Some(_),
+                                ..
+                            }
+                        ),
                         timing,
                         statistics: screen.statistics(),
                         presentation: screen.presentation(),
@@ -1376,6 +1472,179 @@ mod tests {
         link.exit();
         let seen = seen.lock().unwrap().clone();
         assert!(!seen.iter().any(|(l, _)| l == "stale"), "{seen:?}");
+    }
+
+    /// A paced screen, as a swap chain's waitable object paces one: `wait`
+    /// grants a frame, blocking while `hold` is set, and the frame drawn
+    /// next takes the grant; every frame notes whether it was a loading
+    /// frame and its page's first line.
+    struct PacedLoading {
+        hold: Arc<AtomicBool>,
+        waiting: Arc<AtomicBool>,
+        seen: Arc<std::sync::Mutex<Vec<(bool, String)>>>,
+    }
+
+    impl PacedLoading {
+        fn note(&self, loading: bool, page: &crate::menu_screen::MenuPage) -> FrameTiming {
+            let line = page
+                .lines
+                .first()
+                .map_or_else(String::new, |l| l.text.clone());
+            self.seen.lock().unwrap().push((loading, line));
+            timing(true)
+        }
+    }
+
+    impl Screen for PacedLoading {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            while self.hold.load(Ordering::Acquire) {
+                self.waiting.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.waiting.store(false, Ordering::Release);
+            true
+        }
+        fn paced(&self) -> bool {
+            true
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            Ok(self.note(false, page))
+        }
+        fn loading(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            Ok(self.note(true, page))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The end of loading before recording opens, while the render thread
+    /// waits for its next frame: the answer comes only once it can draw
+    /// no loading frame any more, and none is drawn after the end began,
+    /// though the wait it was in grants a frame.
+    #[test]
+    fn no_loading_frame_follows_the_end_of_loading() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hold = Arc::new(AtomicBool::new(false));
+        let waiting = Arc::new(AtomicBool::new(false));
+        let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&hold), Arc::clone(&waiting));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(PacedLoading {
+                hold: Arc::clone(&held),
+                waiting: Arc::clone(&at),
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let loading = || seen.lock().unwrap().iter().filter(|(l, _)| *l).count();
+        link.loading().show(one_line("L"));
+        assert!(wait_until(|| loading() >= 2));
+        // The render thread waits for its next frame when loading ends.
+        hold.store(true, Ordering::Release);
+        assert!(wait_until(|| waiting.load(Ordering::Acquire)));
+        let before = loading();
+        let release = {
+            let hold = Arc::clone(&hold);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                hold.store(false, Ordering::Release);
+            })
+        };
+        assert!(link.end_loading());
+        let answered = loading();
+        release.join().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        link.exit();
+        assert_eq!(answered, before, "a loading frame before the answer");
+        assert_eq!(loading(), before, "a loading frame after the answer");
+    }
+
+    /// A load cancelled while the render thread stalls with its signal
+    /// unread, the select page sent and another chart chosen at once: the
+    /// cancelled load's signal takes nothing, and the next load's lines
+    /// get a signal of their own, drawn after the select page and kept
+    /// through its chart's load.
+    #[test]
+    fn a_cancelled_loads_signal_leaves_the_next_loads_lines() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stall = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(AtomicBool::new(false));
+        let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(StalledMenus {
+                stall: Arc::clone(&held),
+                stalled: Arc::clone(&at),
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.send(RenderMsg::Menu(Box::new(one_line("select"))));
+        assert!(wait_until(|| !seen.lock().unwrap().is_empty()));
+        stall.store(true, Ordering::Release);
+        assert!(wait_until(|| stalled.load(Ordering::Acquire)));
+        // Chart A: its lines and signal, then the quit key cancels it and
+        // selection is entered; chart B is chosen at once.
+        link.loading().show(one_line("A"));
+        link.clear_loading();
+        link.send(RenderMsg::Menu(Box::new(one_line("select"))));
+        link.loading().show(one_line("B"));
+        stall.store(false, Ordering::Release);
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(chart, None).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        link.exit();
+        let seen = seen.lock().unwrap().clone();
+        let lines: Vec<&str> = seen.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(!lines.contains(&"A"), "{lines:?}");
+        let last_select = lines.iter().rposition(|l| *l == "select").unwrap();
+        assert!(
+            lines[last_select..].contains(&"B"),
+            "B not drawn after the select page: {lines:?}"
+        );
+        assert_eq!(lines.last(), Some(&"B"), "{lines:?}");
     }
 
     /// A screen that cannot draw any chart; it notes its menu frames by the

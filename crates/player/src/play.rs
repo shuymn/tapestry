@@ -468,6 +468,15 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
+        // The loading state ends before recording opens (design.md "Play
+        // Lifecycle"): the render thread answers once it draws no loading
+        // frame any more. A retry has none to end.
+        if let Some(sel) = &mut self.selection
+            && sel.loading.take().is_some()
+            && !self.render.end_loading()
+        {
+            eprintln!("render: the end of the loading state was not answered");
+        }
         self.in_play = true;
         // A round's opening is not the full play's countdown: the countdown
         // and a scenario's `until` run from it.
@@ -488,11 +497,6 @@ impl Rig for PlayerRig<'_> {
         self.countdown_at = Some(countdown_at);
         self.origin = Some(origin);
         println!("play started");
-        // The countdown ends the loading state.
-        self.render.clear_loading();
-        if let Some(sel) = &mut self.selection {
-            sel.loading = None;
-        }
         // A chart's first play: a retry runs from its own receipt.
         if let Some(sel) = &self.selection
             && self.retry_from.is_none()
