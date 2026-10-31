@@ -73,8 +73,10 @@ pub trait PlaySkin: Send {
 
     /// Fills `out`, which arrives empty, with the play screen's frame while
     /// a chart loads before the countdown (design.md "Play Lifecycle"):
-    /// the lanes and the rest of the screen without notes, whatever chart
-    /// was prepared last. The renderer draws the load's text over it. The
+    /// the lanes and the rest of the screen without notes, and nothing of
+    /// any chart: the skin may still hold the previous chart's
+    /// preparation, whose values the loading frame must not show. The
+    /// renderer draws the load's text, the chosen chart's, over it. The
     /// default draws nothing.
     fn build_loading(&mut self, out: &mut SpriteBatch) {
         let _ = out;
