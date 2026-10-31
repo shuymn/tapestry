@@ -192,6 +192,29 @@ impl ImageError {
     }
 }
 
+/// The encoded bytes of the file at `canonical`, closed before they are
+/// returned. A file over `limit` refuses as [`ImageError::FileTooLarge`]
+/// at [`MAX_FILE_BYTES`], and as [`ImageError::TotalBytesTooLarge`] below
+/// it, where the limit is what remains of a total.
+pub(crate) fn read_encoded(
+    canonical: &Path,
+    at: FileAt,
+    limit: u64,
+) -> Result<Vec<u8>, ImageError> {
+    let (mut file, len) = path::open(canonical).map_err(|e| ImageError::path(at, e))?;
+    let (bytes, more) = decode::read_capped(&mut file, len, limit)
+        .map_err(|source| ImageError::Io { at, source })?;
+    drop(file);
+    if more {
+        return Err(if limit < MAX_FILE_BYTES {
+            ImageError::TotalBytesTooLarge { at }
+        } else {
+            ImageError::FileTooLarge { at }
+        });
+    }
+    Ok(bytes)
+}
+
 /// One version of a file: its name and the dimensions its header gave at
 /// load.
 #[derive(Clone, Debug)]

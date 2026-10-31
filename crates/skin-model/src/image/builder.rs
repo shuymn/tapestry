@@ -23,7 +23,7 @@ use super::path::{self, PathError, Root};
 use super::{
     Cell, File, FileAt, FileDef, Image, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
     MAX_IMAGES, NEXT_SHEET, Sheet, Total, Version, add_frames, check_cycle, checked_header, cut,
-    decode, image_frames, push_frames, read_file, renumber, resolve_file, texels,
+    decode, image_frames, push_frames, read_encoded, read_file, renumber, resolve_file, texels,
 };
 use crate::quad::Filter;
 use crate::widget::text::MAX_TEXT_ELEMENTS;
@@ -489,14 +489,7 @@ impl SheetBuilder {
                 file: first + p,
                 hi: false,
             };
-            let (mut handle, len) =
-                path::open(resolved).map_err(|e| page_error(p, ImageError::path(at, e)))?;
-            let (bytes, more) = decode::read_capped(&mut handle, len, MAX_FILE_BYTES)
-                .map_err(|source| page_error(p, ImageError::Io { at, source }))?;
-            drop(handle);
-            if more {
-                return Err(page_error(p, ImageError::FileTooLarge { at }));
-            }
+            let bytes = read_encoded(resolved, at, MAX_FILE_BYTES).map_err(|e| page_error(p, e))?;
             decode::decode(bytes, d).map_err(|e| page_error(p, ImageError::decode(at, e)))?;
         }
 
