@@ -682,9 +682,9 @@ impl Lanes {
                 _ if !is_target(notes.section, n.time, n.end()) => true,
                 NoteKind::Tap => pen.cap(note, x, w, head, self.note_h),
                 NoteKind::Long { end_pos, .. } => {
-                    // Judged or not, a long note is drawn until its end
-                    // passes the line, and once its head's time has passed
-                    // the head stays on the line.
+                    // Unless done by a decision before its end, a long
+                    // note is drawn until its end passes the line, and once
+                    // its head's time has passed the head stays on the line.
                     if end_pos < scale.at_line {
                         continue;
                     }
