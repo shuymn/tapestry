@@ -21,8 +21,7 @@ use skin_model::{
 use crate::lanes_support::rect;
 use crate::play_support::{Harness, MS, REGIONS, ev, full, judged};
 
-/// The images, by index.
-pub const WHITE: u32 = 0;
+/// The images, by index; image 0 is a plain one.
 pub const TEN: u32 = 1;
 pub const ELEVEN: u32 = 2;
 pub const TWENTY_FOUR: u32 = 3;
