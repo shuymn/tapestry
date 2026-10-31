@@ -223,6 +223,8 @@ pub struct RenderLink {
     answer_timeout: Duration,
     /// How long the end of the thread is waited for.
     exit_timeout: Duration,
+    /// How long a play's figures are waited for.
+    finish_timeout: Duration,
 }
 
 impl RenderLink {
@@ -275,7 +277,7 @@ impl RenderLink {
     pub fn finish(&self, end: TimeUs) -> Option<Figures> {
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Finish { end, reply });
-        rx.recv_timeout(FINISH_TIMEOUT).ok().flatten()
+        rx.recv_timeout(self.finish_timeout).ok().flatten()
     }
 
     /// When the current play's first frame was drawn.
@@ -302,12 +304,14 @@ impl RenderLink {
         }
     }
 
-    /// Sets how long a preparation or a chart's load and the end of the
-    /// thread are waited for, in place of [`LOAD_TIMEOUT`] and
-    /// [`EXIT_TIMEOUT`] (tests, and `--dev-render-timeout`).
+    /// Sets how long a preparation, a chart's load or a play's figures
+    /// and the end of the thread are waited for, in place of
+    /// [`LOAD_TIMEOUT`], [`FINISH_TIMEOUT`] and [`EXIT_TIMEOUT`] (tests,
+    /// and `--dev-render-timeout`).
     #[cfg(any(test, feature = "dev-tools"))]
     pub fn set_timeouts(&mut self, answer: Duration, exit: Duration) {
         self.answer_timeout = answer;
+        self.finish_timeout = answer;
         self.exit_timeout = exit;
     }
 }
@@ -376,6 +380,7 @@ pub fn spawn(
             ended,
             answer_timeout: LOAD_TIMEOUT,
             exit_timeout: EXIT_TIMEOUT,
+            finish_timeout: FINISH_TIMEOUT,
         }),
         Ok(Err(e)) => {
             let _ = handle.join();
@@ -1656,10 +1661,12 @@ mod tests {
             (TimeUs(2_900_000), taken.clone()),
             (TimeUs(0), late.clone()),
         ]);
+        let draws = Arc::new(AtomicU32::new(0));
+        let drawn = Arc::clone(&draws);
         let make: MakeScreen = Box::new(move || {
             Ok(Box::new(Allocating {
                 in_build: false,
-                draws: Arc::new(AtomicU32::new(0)),
+                draws: Arc::clone(&drawn),
                 read_backs: Arc::new(AtomicU32::new(0)),
             }) as Box<dyn Screen>)
         });
@@ -1688,7 +1695,9 @@ mod tests {
         // count in no play.
         captures.arm(1);
         captures.bind(1);
-        std::thread::sleep(Duration::from_millis(200));
+        // A frame drawn after the next has started was sunk whole.
+        let after = draws.load(Ordering::Acquire);
+        assert!(wait_until(|| draws.load(Ordering::Acquire) >= after + 2));
         assert_eq!(captures.states()[1], CaptureState::Bound(1));
         assert!(!late.exists());
         link.exit();

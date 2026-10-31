@@ -703,7 +703,10 @@ impl PlayerRig<'_> {
             failed = true;
         }
         match sc.captures.settle(self.generation, self.figures.is_some()) {
-            Ok((written, refused)) => {
+            Ok(crate::dev::scenario::Settled {
+                written,
+                failed: refused,
+            }) => {
                 for (o, path) in written {
                     println!("dev: scenario: {o}: wrote {}", path.display());
                 }
@@ -1281,6 +1284,22 @@ mod tests {
                 "the steps never ended"
             );
             if sel.script(&controls, 0, None) {
+                // Each batch typed is at most half the queue's keys.
+                let mut batch = Vec::new();
+                while let Some(input) = sel.menu.pop() {
+                    batch.push(input);
+                }
+                let keys = batch
+                    .iter()
+                    .filter(|i| matches!(i, MenuInput::Key(_)))
+                    .count();
+                assert!(
+                    keys <= crate::select::QUEUED_KEYS / 2,
+                    "{keys} keys in one batch"
+                );
+                for input in batch {
+                    sel.menu.push(input);
+                }
                 assert!(sel.drain(&mut Pad::default()).is_none());
             } else {
                 sel.shelf.poll(Instant::now());
@@ -1299,20 +1318,28 @@ mod tests {
         use crate::dev::SelectStep;
         let dir = tempfile::tempdir().unwrap();
         let mut sel = selection(dir.path());
-        search(&mut sel, &"x".repeat(63));
-        assert_eq!(sel.screen.listed(), 0);
-        run_steps(
-            &mut sel,
-            vec![
-                SelectStep::Query("B".to_owned()),
-                SelectStep::PickSearched("B".to_owned()),
-            ],
-        );
-        assert_eq!(sel.screen.query(), "B");
-        assert!(!sel.screen.searching());
-        assert_eq!(sel.screen.listed(), 1);
-        let chosen = sel.screen.selected().unwrap().path.clone();
-        assert_eq!(chosen.file_name().unwrap(), "b.bms");
+        // Below the queue's keys, and past them.
+        for (n, text) in [(63, "B"), (crate::select::QUEUED_KEYS * 2 + 5, "C")] {
+            search(&mut sel, &"x".repeat(n));
+            assert_eq!(sel.screen.listed(), 0);
+            run_steps(
+                &mut sel,
+                vec![
+                    SelectStep::Query(text.to_owned()),
+                    SelectStep::PickSearched(text.to_owned()),
+                ],
+            );
+            assert_eq!(sel.screen.query(), text);
+            assert!(!sel.screen.searching());
+            assert_eq!(sel.screen.listed(), 1);
+            let chosen = sel.screen.selected().unwrap().path.clone();
+            assert_eq!(
+                chosen.file_name().unwrap(),
+                format!("{}.bms", text.to_lowercase()).as_str()
+            );
+            // Back to an empty box for the next.
+            run_steps(&mut sel, vec![SelectStep::Query(String::new())]);
+        }
     }
 
     /// A path chosen after a search clears the search first, so the chart

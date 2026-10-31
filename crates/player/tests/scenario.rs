@@ -278,10 +278,13 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         "dev: scenario: step 10 (result)",
         "dev: scenario: step 11 (play)",
         "play started",
-        "play 2: Aborted(Retry); perfect 1 great 0 good 0 bad 0 poor 0",
+        // Where a cut lands depends on the machine's timing: what the
+        // aborted plays judged is not pinned here (`until_fires_once_at_its_time`
+        // pins the time a cut is sent).
+        "play 2: Aborted(Retry); ",
         "dev: scenario: step 12 (play)",
         "play started",
-        "play 3: Aborted(Quit); perfect 2 great 0 good 0 bad 0 poor 1",
+        "play 3: Aborted(Quit); ",
         "dev: scenario: step 13 (select)",
         "select: chose b.bms",
         "dev: scenario: step 14 (play)",
@@ -319,26 +322,30 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
     let evaluated = lines(&stdout, "result: evaluated ");
     assert!(evaluated.len() >= 2, "{stdout}");
 
-    // The log's three plays, none of autoplay's: each replays the log from
-    // its first event up to its cut, and its figures were measured with
-    // no allocation in the render thread's app region.
+    // The log's three plays, none of autoplay's: the completed one holds
+    // the whole log, and each aborted one the log replayed from its first
+    // event up to where it was cut; the figures of each were measured
+    // with no allocation in the render thread's app region.
     let records = fx.records();
     assert_eq!(records.len(), 3, "{records:?}");
     let decoded: Vec<PlayRecord> = records
         .iter()
         .map(|r| replay::decode(&fs::read(r).unwrap(), &DecodeLimits::default()).unwrap())
         .collect();
-    let cut = |at: i64| -> Vec<PhysicalInputEvent> {
-        log.iter().filter(|e| e.received.0 < at).copied().collect()
-    };
-    let expected = [
-        (EndStatus::PlayedToEnd, cut(i64::MAX)),
-        (EndStatus::EndedMidway, cut(2_250_000)),
-        (EndStatus::EndedMidway, cut(3_250_000)),
+    let statuses = [
+        EndStatus::PlayedToEnd,
+        EndStatus::EndedMidway,
+        EndStatus::EndedMidway,
     ];
-    for ((rec, path), (status, events)) in decoded.iter().zip(&records).zip(expected) {
+    assert_eq!(decoded[0].events, log);
+    for ((rec, path), status) in decoded.iter().zip(&records).zip(statuses) {
         assert_eq!(rec.status.end, status, "{}", path.display());
-        assert_eq!(rec.events, events, "{}", path.display());
+        assert!(
+            !rec.events.is_empty() && log.starts_with(&rec.events),
+            "{}: {:?}",
+            path.display(),
+            rec.events
+        );
         assert_eq!(rec.devices.sources[0].receive, ReceiveMethod::Scripted);
         let m: toml::Table = fs::read_to_string(path.with_extension("measure.toml"))
             .unwrap()
@@ -406,6 +413,67 @@ fn unrunnable_step_exits_one() {
         lines(&stdout, "dev: scenario: step 3").is_empty(),
         "{stdout}"
     );
+    // The run's error leads; what else went wrong follows it.
+    let at = |prefix: &str| stderr.lines().position(|l| l.starts_with(prefix));
+    let primary = at("dev: scenario: step 2 (play): the chart chosen at step 1").unwrap();
+    let also = at("dev: scenario: also: step 3 (quit) did not run").unwrap();
+    assert!(primary < also, "{stderr}");
+}
+
+/// A render thread stuck writing a capture (stalled by the test hook) ends
+/// the run with 1 within the render bound: the play's end is not
+/// answered, the capture fails, and the thread is left to the process's
+/// exit.
+#[test]
+fn a_stalled_capture_exits_one_within_the_bound() {
+    use std::time::{Duration, Instant};
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let file = fx.base.join("scenario.toml");
+    fs::write(
+        &file,
+        scenario(&[
+            "capture = { at = 0, file = \"a.png\" }",
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]),
+    )
+    .unwrap();
+    let begun = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("--dev-scenario")
+        .arg(&file)
+        .args(["--dev-render-timeout", "20"])
+        .env("LOCALAPPDATA", &fx.appdata)
+        .env("TAPESTRY_DEV_CAPTURE_STALL_MS", "600000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Far below the stall: the run must not wait for it.
+    let bound = Duration::from_secs(300);
+    while child.try_wait().unwrap().is_none() {
+        if begun.elapsed() > bound {
+            let _ = child.kill();
+            panic!("the run did not end within {} s", bound.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("step 1 (capture): the render thread did not answer"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("the render thread did not end cleanly"),
+        "{stderr}"
+    );
+    assert!(!fx.base.join("out").join("a.png").exists());
 }
 
 /// A file of another version is refused for its version, whatever else it

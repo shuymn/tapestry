@@ -1235,7 +1235,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     );
     #[cfg(feature = "dev-tools")]
     let frames: Box<dyn render_side::FrameSink> = match (&scenario, s.dev.frames) {
-        (Some(sc), _) => Box::new(dev::scenario::ScenarioFrames::new(sc.captures.clone())),
+        (Some(sc), _) => Box::new(dev::scenario::ScenarioFrames::from_env(sc.captures.clone())),
         (None, Some(dir)) => Box::new(dev::FrameDump::new(dir, TimeUs(1_000_000))),
         (None, None) => Box::new(NoFrames),
     };
@@ -1293,27 +1293,21 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             until: None,
         });
     }
+    // Autoplay saves nothing, but in a scenario, whose logs' plays are
+    // saved.
     #[cfg(feature = "dev-tools")]
-    let unsaved = !counted;
+    let saved = !autoplay || counted;
     #[cfg(not(feature = "dev-tools"))]
-    let unsaved = true;
-    let (receive, auto, parts): (_, _, MakeParts) = if autoplay {
-        let parts: MakeParts = if unsaved {
-            Box::new(|s: &Settings| Parts::unsaved(&s.player))
-        } else {
-            saved_parts(&root, best_writer)
-        };
-        (
-            ReceiveMethod::Scripted,
-            Some(AutoKeySounds::Scheduled),
-            parts,
-        )
+    let saved = !autoplay;
+    let parts: MakeParts = if saved {
+        saved_parts(&root, best_writer)
     } else {
-        (
-            ReceiveMethod::RawInput,
-            None,
-            saved_parts(&root, best_writer),
-        )
+        Box::new(|s: &Settings| Parts::unsaved(&s.player))
+    };
+    let (receive, auto) = if autoplay {
+        (ReceiveMethod::Scripted, Some(AutoKeySounds::Scheduled))
+    } else {
+        (ReceiveMethod::RawInput, None)
     };
     let mut app = game::App::new(
         root,

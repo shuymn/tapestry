@@ -215,6 +215,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::audio_done",
             "PlayerRig::input_failure",
             "until_due",
+            "until_fired",
         ],
     ),
     Site::Fns(

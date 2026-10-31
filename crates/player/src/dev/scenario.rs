@@ -598,7 +598,13 @@ fn target(base: &Path, p: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Target,
 /// Whether `p` is only normal components: it stays below the folder it is
 /// joined to.
 fn stays_below(p: &Path) -> bool {
-    p.components().next().is_some() && p.components().all(|c| matches!(c, Component::Normal(_)))
+    // A component holding a colon would be a drive or a stream once
+    // joined (`a/C:b` pushes `C:b`, which replaces the path).
+    p.components().next().is_some()
+        && p.components().all(|c| match c {
+            Component::Normal(n) => !n.to_string_lossy().contains(':'),
+            _ => false,
+        })
 }
 
 /// A capture's file, relative to the output folder.
@@ -690,6 +696,16 @@ pub fn find<'a>(
     })
 }
 
+/// How the captures of a play ended, as [`Captures::settle`] reports
+/// them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Settled {
+    /// Each written one: its step and file.
+    pub written: Vec<(Origin, PathBuf)>,
+    /// Each failed one: its step and why.
+    pub failed: Vec<(Origin, String)>,
+}
+
 /// How far a capture has come.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CaptureState {
@@ -767,16 +783,12 @@ impl Captures {
 
     /// The play of `generation` is over, its frames drawn when `answered`
     /// (the render thread answered its end): each capture bound to it ends
-    /// here. Returns each written one, and each failed one with why; `Err`
-    /// when the render thread holds the list (it did not answer).
-    #[expect(clippy::type_complexity, reason = "two lists of outcomes")]
-    pub fn settle(
-        &self,
-        generation: u64,
-        answered: bool,
-    ) -> Result<(Vec<(Origin, PathBuf)>, Vec<(Origin, String)>), ()> {
+    /// here. Returns how those not reported yet ended; `Err` when the
+    /// render thread holds the list (it did not answer).
+    pub fn settle(&self, generation: u64, answered: bool) -> Result<Settled, ()> {
         let mut list = self.try_lock().ok_or(())?;
-        let (mut written, mut failed) = (Vec::new(), Vec::new());
+        let mut settled = Settled::default();
+        let Settled { written, failed } = &mut settled;
         for c in list.iter_mut() {
             match c.state {
                 CaptureState::Bound(g) if g == generation => {
@@ -801,7 +813,7 @@ impl Captures {
             }
             c.reported = true;
         }
-        Ok((written, failed))
+        Ok(settled)
     }
 
     /// After the render thread has ended: each capture that did not end,
@@ -871,12 +883,32 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// frame is read back, encoded or written.
 pub struct ScenarioFrames {
     captures: Captures,
+    /// How long each capture's read-back stalls first: a test's stand-in
+    /// for a render thread stuck in its work ([`STALL_ENV`]).
+    stall: Option<Duration>,
 }
 
+/// The environment variable that stalls each capture's read-back by its
+/// value in milliseconds, for tests of a stuck render thread.
+pub const STALL_ENV: &str = "TAPESTRY_DEV_CAPTURE_STALL_MS";
+
 impl ScenarioFrames {
-    /// The sink of `captures`.
+    /// The sink of `captures` (tests).
+    #[cfg(test)]
     pub const fn new(captures: Captures) -> Self {
-        Self { captures }
+        Self {
+            captures,
+            stall: None,
+        }
+    }
+
+    /// The sink of `captures`, stalled as [`STALL_ENV`] says.
+    pub fn from_env(captures: Captures) -> Self {
+        let stall = std::env::var(STALL_ENV)
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(Duration::from_millis);
+        Self { captures, stall }
     }
 }
 
@@ -902,13 +934,17 @@ impl FrameSink for ScenarioFrames {
         if due.is_empty() {
             return;
         }
-        let image = screen.read_back();
+        if let Some(stall) = self.stall {
+            std::thread::sleep(stall);
+        }
+        // Read back and encoded once, for every capture due.
+        let image = screen
+            .read_back()
+            .map(|(w, h, pixels)| super::png(w, h, &pixels));
         for (i, path) in due {
             let outcome = match &image {
                 None => Err("nothing to read back".to_owned()),
-                Some((w, h, pixels)) => {
-                    write_new(&path, &super::png(*w, *h, pixels)).map_err(|e| e.to_string())
-                }
+                Some(png) => write_new(&path, png).map_err(|e| e.to_string()),
             };
             if let Some(c) = self.captures.lock().get_mut(i)
                 && c.state == CaptureState::Saving(generation)
@@ -1011,10 +1047,14 @@ pub fn conclude<E: std::error::Error + 'static>(
     let Some(first) = all.next() else {
         return Ok(());
     };
+    // One message, the first failure leading: the run's report prints it
+    // whole.
+    let mut message = format!("dev: scenario: {first}");
     for also in all {
-        eprintln!("dev: scenario: also: {also}");
+        message.push_str("\ndev: scenario: also: ");
+        message.push_str(&also);
     }
-    anyhow::bail!("dev: scenario: {first}")
+    Err(anyhow::Error::msg(message))
 }
 
 #[cfg(test)]
@@ -1309,7 +1349,15 @@ mod tests {
     #[test]
     fn capture_paths_stay_in_the_output() {
         let dir = folder();
-        for file in ["../a.png", "C:/a.png", "C:a.png", "/a.png", "a/../../b.png"] {
+        for file in [
+            "../a.png",
+            "C:/a.png",
+            "C:a.png",
+            "/a.png",
+            "a/../../b.png",
+            "a/C:b.png",
+            "a.png:stream",
+        ] {
             let e = refused(
                 dir.path(),
                 Some("out"),
@@ -1334,6 +1382,16 @@ mod tests {
         assert_eq!(e, "step 2 (capture): A.PNG is also step 1's file");
         let e = refused(dir.path(), Some("../out"), &["quit = {}"]);
         assert!(e.ends_with("leaves the scenario's folder"), "{e}");
+        // A drive inside a component would replace the path once joined.
+        let e = refused(dir.path(), Some("safe/C:escaped"), &["quit = {}"]);
+        assert!(e.ends_with("leaves the scenario's folder"), "{e}");
+        assert!(!dir.path().join("safe").exists());
+        let e = refused(
+            dir.path(),
+            Some("out"),
+            &["capture = { at = 0, file = \"a/C:b.png\" }"],
+        );
+        assert!(e.ends_with("leaves the output folder"), "{e}");
         // An output that exists is refused, not reused.
         fs::create_dir(dir.path().join("out")).unwrap();
         let e = refused(dir.path(), Some("out"), &["quit = {}"]);
@@ -1462,16 +1520,19 @@ mod tests {
                 CaptureState::Unarmed
             ]
         );
-        let (written, failed) = c.settle(5, true).unwrap();
-        assert!(written.is_empty());
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].1, "the play ended before a frame at 1000 ms");
+        let settled = c.settle(5, true).unwrap();
+        assert!(settled.written.is_empty());
+        assert_eq!(settled.failed.len(), 1);
+        assert_eq!(
+            settled.failed[0].1,
+            "the play ended before a frame at 1000 ms"
+        );
         c.bind(6);
         c.0.lock().unwrap()[1].state = CaptureState::Succeeded;
-        let (written, failed) = c.settle(6, true).unwrap();
-        assert_eq!(written.len(), 1);
-        assert!(failed.is_empty());
-        assert_eq!(c.settle(6, true).unwrap(), (Vec::new(), Vec::new()));
+        let settled = c.settle(6, true).unwrap();
+        assert_eq!(settled.written.len(), 1);
+        assert!(settled.failed.is_empty());
+        assert_eq!(c.settle(6, true).unwrap(), super::Settled::default());
         // Never armed: its step did not run, which the steps report.
         assert!(c.unfinished().is_empty());
         c.arm(2);
@@ -1505,9 +1566,9 @@ mod tests {
         });
         stalled.recv().unwrap();
         let begun = Instant::now();
-        let (_, failed) = c.settle(1, false).unwrap();
+        let settled = c.settle(1, false).unwrap();
         assert!(begun.elapsed() < Duration::from_secs(1));
-        assert_eq!(failed[0].1, "the render thread did not answer");
+        assert_eq!(settled.failed[0].1, "the render thread did not answer");
         let e = super::conclude::<std::io::Error>(Ok(()), None, None, RenderEnd::Joined, &c);
         assert!(e.is_ok(), "a reported failure is the script's to report");
         let e = super::conclude::<std::io::Error>(Ok(()), None, None, RenderEnd::Stuck, &c)
