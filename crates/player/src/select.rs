@@ -393,6 +393,11 @@ impl SelectScreen {
         self.preset_error = error;
     }
 
+    /// The chosen preset's name, as the title shows it.
+    pub fn preset(&self) -> &str {
+        &self.preset
+    }
+
     /// Shows why `player.toml` could not be written, while no refusal
     /// shows; `None` once it was.
     pub fn set_save_error(&mut self, error: Option<String>) {

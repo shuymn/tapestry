@@ -762,6 +762,23 @@ fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
         .unwrap();
     // The +6 dB cap: four times the headroom.
     assert!(db > 5.5, "{stdout}");
+    // The Start left the practice page for the loading page, which said
+    // the measurement and was drawn, up to the round's countdown.
+    let all: Vec<&str> = stdout.lines().collect();
+    let at = |from: usize, line: &str| {
+        (from..all.len())
+            .find(|&i| all[i].starts_with(line))
+            .unwrap_or_else(|| panic!("no {line} after line {from}:\n{stdout}"))
+    };
+    let page = at(0, "practice: on the practice screen");
+    let shown = at(page, "load: the loading page shows a.bms");
+    let measuring = at(shown, "load: measuring the loudness");
+    let ready = at(measuring, "load: the chart is ready ");
+    at(ready, "play started");
+    assert!(
+        !lines(&stdout, "dev: loading frames ").is_empty(),
+        "{stdout}"
+    );
     let round = onset_peaks(&stdout);
     assert_eq!(round.len(), 4, "{stdout}");
     // A 1× play in another run: the stored measurement, nothing measured.

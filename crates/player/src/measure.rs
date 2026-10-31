@@ -415,6 +415,9 @@ pub struct Drawn<'a> {
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub menu: bool,
+    /// Whether that menu screen was the loading page (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub loading: bool,
     /// The generation of the play whose figures the frame counts in, until
     /// they are taken (dev-tools: a scenario's captures).
     #[cfg(feature = "dev-tools")]
@@ -1250,6 +1253,8 @@ mod frame_tests {
             play: Some(TimeUs(0)),
             #[cfg(feature = "dev-tools")]
             menu: false,
+            #[cfg(feature = "dev-tools")]
+            loading: false,
             #[cfg(feature = "dev-tools")]
             generation: Some(1),
             timing: FrameTiming {

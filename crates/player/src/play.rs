@@ -488,6 +488,10 @@ impl Rig for PlayerRig<'_> {
         self.countdown_at = Some(countdown_at);
         self.origin = Some(origin);
         println!("play started");
+        // The countdown replaces the loading page.
+        if let Some(sel) = &mut self.selection {
+            sel.loading = None;
+        }
         // A chart's first play: a retry runs from its own receipt.
         if let Some(sel) = &self.selection
             && self.retry_from.is_none()

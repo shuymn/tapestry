@@ -11,12 +11,19 @@
 //!   into selection and every result releases it. A chart whose loudness
 //!   the library misses is measured during its load, so its first play has
 //!   its gain; the measurement is stored once that pause is acknowledged.
-//! - Loading runs on the game thread: the window thread keeps the window
-//!   answering meanwhile, and a close is latched and taken once the load
-//!   is over (the load's waits are all bounded).
+//! - **The loading page** shows from a chart chosen to play, or a
+//!   practice Start, to the countdown: the chart, the preset and the
+//!   load's stage, with the sounds decoded so far.
+//! - Loading runs on the game thread, the screen's preparation of the
+//!   chart on the render thread meanwhile: the render thread keeps drawing
+//!   the loading page around it, the window thread keeps the window
+//!   answering, and a close or the quit key cancels the load at the
+//!   measurement's checks, or is taken once the load is over (the load's
+//!   waits are all bounded).
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use bms_model::{TimeSource, TimeUs};
 use game::{
@@ -27,6 +34,7 @@ use game::{
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
 use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log};
+use crate::loading_page::{LoadingPage, Stage};
 use crate::log_file;
 use crate::play::{PlayerRig, since};
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
@@ -52,16 +60,15 @@ const PICK_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 const QUERY_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 
 /// What a chart's load lends its loudness measurement: the 1× chart and
-/// bank of a practice at another speed, the select page's status, and the
+/// bank of a practice at another speed, the loading page's stage, and the
 /// window's close or the quit key as its cancel.
 struct LoadHost<'a> {
     loaded: &'a Loaded,
     rate: u32,
     controls: &'a crate::controls::Controls,
     render: &'a RenderLink,
-    /// The select page, which says the chart is being measured; none for a
-    /// practice's rounds, whose page stays.
-    screen: Option<&'a SelectScreen>,
+    /// The loading page, which says the chart is being measured.
+    page: Option<&'a LoadingPage>,
     /// The measurement closes the window (a script's `close-measuring`,
     /// dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -80,11 +87,8 @@ impl crate::loudness::Host for LoadHost<'_> {
         Ok((chart, Arc::new(bank)))
     }
 
-    fn measuring(&mut self, name: &str) {
-        if let Some(screen) = self.screen {
-            let page = screen.page(&format!("音量を測定中: {name}"));
-            self.render.send(RenderMsg::Menu(Box::new(page)));
-        }
+    fn measuring(&mut self, _name: &str) {
+        show_stage(self.render, self.page, Stage::Loudness);
         #[cfg(feature = "dev-tools")]
         if self.close {
             self.controls.close();
@@ -117,6 +121,11 @@ pub struct Selection {
     pub rate: u32,
     /// When the chart being loaded was chosen.
     pub chosen_at: TimeUs,
+    /// The loading page, from a chart's choice or a practice Start to its
+    /// countdown or the way back.
+    pub loading: Option<LoadingPage>,
+    /// Whether the chart chosen last was chosen to practice.
+    pub practicing: bool,
     /// When selection was last entered.
     pub entered_at: TimeUs,
     /// The page changed since it was last sent.
@@ -434,6 +443,13 @@ impl Selection {
                     }
                 }
                 Some(SelectStep::CloseMeasuring) => script.close_measuring = true,
+                Some(SelectStep::SlowLoad(ms)) => script.slow_load.get_or_insert_default().ms = ms,
+                Some(SelectStep::QuitLoading) => {
+                    script.slow_load.get_or_insert_default().quit = true
+                }
+                Some(SelectStep::CloseLoading) => {
+                    script.slow_load.get_or_insert_default().close = true;
+                }
                 // Due here only when the chosen chart did not play.
                 Some(SelectStep::Play(_)) => {
                     if let Some(why) = script.refusal() {
@@ -866,6 +882,86 @@ pub enum ChartLoadError {
     NoSelection,
 }
 
+/// Shows the loading `page` at `stage`, and says so on the console; nothing
+/// without a page.
+fn show_stage(render: &RenderLink, page: Option<&LoadingPage>, stage: Stage) {
+    let Some(page) = page else {
+        return;
+    };
+    println!("load: {}", stage.label());
+    render.send(RenderMsg::Loading(Box::new(page.page(stage))));
+}
+
+/// How often the sounds' progress is sent at most: the render thread
+/// draws a frame for every page it takes.
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+
+/// The sounds' progress on the loading page, sent from the decode pool.
+struct Progress {
+    render: Mutex<(Sender<RenderMsg>, Option<Instant>)>,
+    page: Option<LoadingPage>,
+}
+
+impl Progress {
+    const fn new(render: Sender<RenderMsg>, page: Option<LoadingPage>) -> Self {
+        Self {
+            render: Mutex::new((render, None)),
+            page,
+        }
+    }
+
+    /// `done` of `files` decoded: shown at most every [`PROGRESS_EVERY`],
+    /// and when the last is done.
+    fn decoded(&self, done: usize, files: usize) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        let mut render = self.render.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if done < files
+            && render
+                .1
+                .is_some_and(|t| now.duration_since(t) < PROGRESS_EVERY)
+        {
+            return;
+        }
+        render.1 = Some(now);
+        let page = page.page(Stage::Sounds { done, files });
+        let _ = render.0.send(RenderMsg::Loading(Box::new(page)));
+    }
+}
+
+/// Holds a load for a script's slow load (dev-tools), pressing the quit
+/// key or closing the window halfway if it says; whether the quit key or a
+/// close cancelled it, checked as the measurement does.
+#[cfg(feature = "dev-tools")]
+fn hold(controls: &Controls, slow: crate::dev::SlowLoad) -> bool {
+    println!("dev: the load holds {} ms", slow.ms);
+    let began = Instant::now();
+    let total = Duration::from_millis(slow.ms);
+    let mut acted = false;
+    loop {
+        if controls.quitting() || controls.leaving() {
+            return true;
+        }
+        let held = began.elapsed();
+        if held >= total {
+            return false;
+        }
+        if !acted && held >= total / 2 {
+            acted = true;
+            if slow.quit {
+                controls.command(game::Command::Quit);
+            }
+            if slow.close {
+                controls.close();
+            }
+            continue;
+        }
+        std::thread::sleep((total - held).min(Duration::from_millis(10)));
+    }
+}
+
 impl PlayerRig<'_> {
     /// Looks at the library and the window's input on the select screen,
     /// and sends the page if it changed; the chart chosen, if one was.
@@ -907,7 +1003,12 @@ impl PlayerRig<'_> {
             println!("select: chose {name}{what} {after} ms after entering selection");
             log::info!("select: chose {}{what}", path.display());
             sel.dirty = true;
-            sel.show(&self.render, Some(&format!("読み込み中: {name}")));
+            sel.practicing = matches!(pick, Pick::Practice(_));
+            // A chart to play shows the loading page at once
+            // (`entered_loading`); the practice page reads it first.
+            if sel.practicing {
+                sel.show(&self.render, Some(&format!("読み込み中: {name}")));
+            }
         } else {
             sel.show(&self.render, None);
         }
@@ -924,7 +1025,12 @@ impl PlayerRig<'_> {
         };
         let controls = self.controls;
         let render = &self.render;
-        let Selection { shelf, screen, .. } = sel;
+        let Selection {
+            shelf,
+            screen,
+            loading,
+            ..
+        } = sel;
         let began = Instant::now();
         let paused = shelf.wait_paused(
             crate::shelf::PAUSE_SLICE,
@@ -934,8 +1040,14 @@ impl PlayerRig<'_> {
             crate::shelf::PAUSE_NOTICE,
             || {
                 println!("library: waiting for the scan to pause");
-                let page = screen.page("ライブラリのスキャンの一時停止を待っています");
-                render.send(RenderMsg::Menu(Box::new(page)));
+                // On the loading page before a chart's first countdown; a
+                // retry's shows on the select page, as the scan's state.
+                if loading.is_some() {
+                    show_stage(render, loading.as_ref(), Stage::Scan);
+                } else {
+                    let page = screen.page("ライブラリのスキャンの一時停止を待っています");
+                    render.send(RenderMsg::Menu(Box::new(page)));
+                }
             },
         );
         match paused {
@@ -1226,6 +1338,32 @@ impl AppRig for PlayerRig<'_> {
         self.look()
     }
 
+    /// The chart's page from its library entry (its title and artist) and
+    /// the chosen preset, at the chart's stage.
+    fn entered_loading(&mut self, chart: &std::path::Path) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let entry = sel.screen.selected().filter(|e| e.path == chart);
+        let header = entry.map(|e| &e.header);
+        let mut title = header
+            .and_then(|h| h.title.clone())
+            .unwrap_or_else(|| file_name(chart));
+        if let Some(sub) = header.and_then(|h| h.subtitle.as_deref()) {
+            title.push(' ');
+            title.push_str(sub);
+        }
+        let page = LoadingPage {
+            title,
+            artist: header.and_then(|h| h.artist.clone()).unwrap_or_default(),
+            preset: sel.screen.preset().to_owned(),
+            practice: sel.practicing,
+        };
+        println!("load: the loading page shows {}", file_name(chart));
+        show_stage(&self.render, Some(&page), Stage::Chart);
+        sel.loading = Some(page);
+    }
+
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
         // A practice's Start chooses again: its load times run from it.
         let now = self.clock.now();
@@ -1237,6 +1375,9 @@ impl AppRig for PlayerRig<'_> {
         // choice does.
         sel.shelf.pause();
         let (rate, chosen_at) = (sel.rate, sel.chosen_at);
+        let page = sel.loading.clone();
+        #[cfg(feature = "dev-tools")]
+        let slow = sel.script.as_mut().and_then(|s| s.slow_load.take());
         // The previous chart's restorer never restores this one's rounds.
         self.restorer = None;
         let chart = loaded.chart();
@@ -1267,11 +1408,37 @@ impl AppRig for PlayerRig<'_> {
             // notes that are not targets.
             (loaded.audio_schedule(), None)
         };
+        // The screen prepares the chart on the render thread while the
+        // sounds decode and the loudness is measured: it needs neither. A
+        // load that stops before its answer leaves the screen the chart,
+        // which the next load replaces.
+        let screen = self
+            .render
+            .begin_load(Arc::new(chart.clone()), loaded.section().cloned());
         let rounds = loaded.section().map(|_| schedule.clone());
         let speed = loaded.config().speed;
+        show_stage(
+            &self.render,
+            page.as_ref(),
+            Stage::Sounds { done: 0, files: 0 },
+        );
+        #[cfg(feature = "dev-tools")]
+        if let Some(slow) = slow
+            && hold(self.controls, slow)
+        {
+            println!("load: cancelled");
+            return Ok(Loading::Cancelled);
+        }
+        let progress = Progress::new(self.render.sender(), page.clone());
         let bank = Arc::new(
-            audio::load_bank_at(chart, rate, speed, &audio::BankLimits::default())
-                .map_err(ChartLoadError::Sounds)?,
+            audio::load_bank_reporting(
+                chart,
+                rate,
+                speed,
+                &audio::BankLimits::default(),
+                &|done, files| progress.decoded(done, files),
+            )
+            .map_err(ChartLoadError::Sounds)?,
         );
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
@@ -1290,32 +1457,29 @@ impl AppRig for PlayerRig<'_> {
             .screen
             .selected()
             .map_or_else(|| "the chart".to_owned(), |e| file_name(&e.path));
-        let practice = loaded.section().is_some();
         #[cfg(feature = "dev-tools")]
         let close = sel
             .script
             .as_mut()
             .is_some_and(|s| std::mem::take(&mut s.close_measuring));
-        let Selection { shelf, screen, .. } = sel;
         let mut host = LoadHost {
             loaded,
             rate,
             controls: self.controls,
             render: &self.render,
-            screen: (!practice).then_some(&*screen),
+            page: page.as_ref(),
             #[cfg(feature = "dev-tools")]
             close,
         };
-        if shelf.loaded(chart, &bank, &name, &mut host) == Loading::Cancelled {
+        if sel.shelf.loaded(chart, &bank, &name, &mut host) == Loading::Cancelled {
             // Closing or the quit key: nothing more is prepared, and the
             // flow leaves the chart.
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
         let measured = self.clock.now();
-        self.render
-            .load(Arc::new(chart.clone()), loaded.section().cloned())
-            .map_err(ChartLoadError::Screen)?;
+        show_stage(&self.render, page.as_ref(), Stage::Screen);
+        screen.wait(&self.render).map_err(ChartLoadError::Screen)?;
         let ready = self.clock.now();
         #[cfg(feature = "dev-tools")]
         let feed = self.scenario_input(feed);
@@ -1330,12 +1494,13 @@ impl AppRig for PlayerRig<'_> {
         self.retry_from = None;
         let ms = |from: TimeUs, to: TimeUs| since(from, to).as_millis();
         println!(
-            "load: the chart is ready {} ms after its choice (chart {} ms, sounds {} ms, loudness {} ms, audio and screen {} ms)",
+            "load: the chart is ready {} ms after its choice (chart {} ms, sounds {} ms, loudness {} ms, audio {} ms, screen {} ms)",
             ms(chosen_at, ready),
             ms(chosen_at, read),
             ms(read, decoded),
             ms(engine, measured),
-            ms(decoded, engine) + ms(measured, ready),
+            ms(decoded, engine),
+            ms(measured, ready),
         );
         Ok(Loading::Ready)
     }
@@ -1430,6 +1595,9 @@ impl AppRig for PlayerRig<'_> {
             self.selection.as_mut().map(|s| &mut s.shelf),
         );
         self.render.clear_end();
+        if let Some(sel) = &mut self.selection {
+            sel.loading = None;
+        }
         if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
             ime.set(false);
         }
@@ -1479,6 +1647,7 @@ impl Selection {
     /// preset are read anew, with what the chart's plays counted.
     fn entered(&mut self, now: TimeUs) {
         self.entered_at = now;
+        self.loading = None;
         self.screen.end_composition();
         self.shelf.release();
         if let Some(ime) = &self.ime {
@@ -1529,6 +1698,8 @@ mod tests {
             ime: None,
             rate: 48_000,
             chosen_at: TimeUs(0),
+            loading: None,
+            practicing: false,
             entered_at: TimeUs(0),
             dirty: false,
             search_pending: false,

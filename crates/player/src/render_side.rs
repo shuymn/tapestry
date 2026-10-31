@@ -10,7 +10,10 @@
 //! a signal whose page went with it draws nothing.
 //! With selection the
 //! chart is not known at the start: each chosen chart is loaded on request
-//! ([`RenderMsg::Load`]) and stays until the next. A window target
+//! ([`RenderMsg::Load`]) and stays until the next. The loading page
+//! ([`RenderMsg::Loading`]) is drawn from a chart's choice to its play,
+//! through the chart's load and the play's preparation, whose answers come
+//! between its frames. A window target
 //! paces frames on the swap chain's waitable object; an offscreen one at about
 //! 60 Hz.
 //!
@@ -159,6 +162,9 @@ pub enum RenderMsg {
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
+    /// Draw the loading page: as [`Menu`](Self::Menu), and kept through a
+    /// chart's load and a preparation until something else is drawn.
+    Loading(Box<MenuPage>),
     /// A play starts: chart time 0 at the measurement's `origin` on the
     /// clock.
     Play {
@@ -363,17 +369,30 @@ impl RenderLink {
     ///
     /// # Errors
     ///
-    /// Why the screen cannot be built or cannot draw the chart, and
-    /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`]; a late answer goes
-    /// nowhere.
+    /// As [`PendingLoad::wait`].
+    #[cfg(test)]
     pub fn load(&self, chart: Arc<Chart>, section: Option<Section>) -> Result<(), ScreenError> {
+        self.begin_load(chart, section).wait(self)
+    }
+
+    /// Starts preparing `chart` for every play from now on; the game
+    /// thread goes on with the rest of the load and waits for the answer
+    /// later ([`PendingLoad::wait`]). A pending load dropped unanswered
+    /// leaves the screen with the chart, which the next load replaces.
+    pub fn begin_load(&self, chart: Arc<Chart>, section: Option<Section>) -> PendingLoad {
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Load {
             chart,
             section,
             reply,
         });
-        self.answer(&rx)
+        PendingLoad(rx)
+    }
+
+    /// Where the loading page's progress is sent from other threads (the
+    /// decode pool); a thread that already ended ignores it.
+    pub fn sender(&self) -> Sender<RenderMsg> {
+        self.tx.clone()
     }
 
     /// The answer to a preparation or a load, waited for at most
@@ -432,6 +451,22 @@ impl RenderLink {
         self.answer_timeout = answer;
         self.finish_timeout = answer;
         self.exit_timeout = exit;
+    }
+}
+
+/// A chart's load the render thread was asked for ([`RenderLink::begin_load`]).
+pub struct PendingLoad(Receiver<Result<(), RenderError>>);
+
+impl PendingLoad {
+    /// Waits for the answer, at most [`LOAD_TIMEOUT`] from here.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen cannot be built or cannot draw the chart, and
+    /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`]; a late answer goes
+    /// nowhere.
+    pub fn wait(self, link: &RenderLink) -> Result<(), ScreenError> {
+        link.answer(&self.0)
     }
 }
 
@@ -494,6 +529,8 @@ pub fn spawn(
                 granted: false,
                 #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
+                #[cfg(feature = "dev-tools")]
+                loading_stats: crate::dev::MenuStats::default(),
             };
             r.run(&rx);
         })
@@ -539,10 +576,12 @@ enum Mode {
     },
     /// The end screen: [`Run::end_page`].
     End,
-    /// The select screen; `changed` until its page is laid out.
+    /// The select screen, or the loading page with `loading`; `changed`
+    /// until its page is laid out.
     Menu {
         page: Box<MenuPage>,
         changed: bool,
+        loading: bool,
     },
 }
 
@@ -568,6 +607,9 @@ struct Run {
     /// The select screen's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
+    /// The loading page's frames (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    loading_stats: crate::dev::MenuStats,
 }
 
 impl Run {
@@ -581,10 +623,20 @@ impl Run {
             } else {
                 rx.try_recv()
             };
-            // The select screen is left: its frames are reported.
+            // The select screen is left: its frames are reported; and the
+            // loading page's, once it is left.
             #[cfg(feature = "dev-tools")]
             if msg.is_ok() && !matches!(msg, Ok(RenderMsg::Menu(_))) {
-                self.menu_stats.report();
+                self.menu_stats.report("select");
+            }
+            #[cfg(feature = "dev-tools")]
+            if msg.is_ok()
+                && !matches!(
+                    msg,
+                    Ok(RenderMsg::Loading(_) | RenderMsg::Load { .. } | RenderMsg::Prepare(_))
+                )
+            {
+                self.loading_stats.report("loading");
             }
             match msg {
                 Ok(RenderMsg::Load {
@@ -623,19 +675,33 @@ impl Run {
                         }
                     }
                     let _ = reply.send(ready);
-                    mode = Mode::Idle;
+                    // The loading page stays; anything else is not drawn
+                    // until what comes next.
+                    if !matches!(mode, Mode::Menu { loading: true, .. }) {
+                        mode = Mode::Idle;
+                    }
                     continue;
                 }
                 Ok(RenderMsg::Menu(page)) => {
                     mode = Mode::Menu {
                         page,
                         changed: true,
+                        loading: false,
+                    };
+                }
+                Ok(RenderMsg::Loading(page)) => {
+                    mode = Mode::Menu {
+                        page,
+                        changed: true,
+                        loading: true,
                     };
                 }
                 Ok(RenderMsg::Prepare(reply)) => {
                     let ready = self.prepare();
                     let _ = reply.send(ready);
-                    mode = Mode::Idle;
+                    if !matches!(mode, Mode::Menu { loading: true, .. }) {
+                        mode = Mode::Idle;
+                    }
                     continue;
                 }
                 Ok(RenderMsg::Play {
@@ -697,6 +763,8 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
+            #[cfg(feature = "dev-tools")]
+            let loading_frame = matches!(mode, Mode::Menu { loading: true, .. });
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Play {
@@ -752,7 +820,7 @@ impl Run {
                     }
                     drawn
                 }
-                Mode::Menu { page, changed } => {
+                Mode::Menu { page, changed, .. } => {
                     // A screen built again after a failure lays the page
                     // out again.
                     #[cfg(feature = "dev-tools")]
@@ -761,7 +829,12 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     if let Ok((t, _)) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
-                        self.menu_stats.frame(t.cpu, after - before, *changed);
+                        let stats = if loading_frame {
+                            &mut self.loading_stats
+                        } else {
+                            &mut self.menu_stats
+                        };
+                        stats.frame(t.cpu, after - before, *changed);
                         // What a refusal put on the screen, once drawn.
                         if *changed
                             && let Some(notice) = page.lines.iter().find(|l| {
@@ -797,6 +870,8 @@ impl Run {
                         generation: self.measure.generation(),
                         #[cfg(feature = "dev-tools")]
                         menu: matches!(mode, Mode::Menu { .. }),
+                        #[cfg(feature = "dev-tools")]
+                        loading: matches!(mode, Mode::Menu { loading: true, .. }),
                         timing,
                         statistics: screen.statistics(),
                         presentation: screen.presentation(),
@@ -1039,6 +1114,60 @@ mod tests {
         assert_eq!(&seen[..3], [(1, true), (1, false), (1, false)]);
         assert_eq!(seen[3], (2, true), "{seen:?}");
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    /// The loading page is drawn on through a chart's load and a
+    /// preparation, answered between its frames, until the play's page
+    /// replaces it; after the select page, a load leaves nothing drawn
+    /// until what comes next.
+    #[test]
+    fn the_loading_page_is_drawn_through_the_load_and_the_preparation() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Menus {
+                // Not the first build: no frame fails.
+                id: 2,
+                frames: 0,
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let frames = || seen.lock().unwrap().len();
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.send(RenderMsg::Loading(Box::default()));
+        assert!(wait_until(|| frames() >= 2));
+        link.load(Arc::clone(&chart), None).unwrap();
+        let loaded = frames();
+        assert!(
+            wait_until(|| frames() >= loaded + 3),
+            "no frame after the load"
+        );
+        link.prepare().unwrap();
+        let prepared = frames();
+        assert!(
+            wait_until(|| frames() >= prepared + 3),
+            "no frame after the preparation"
+        );
+        // The select page and a load: nothing drawn after the answer.
+        link.send(RenderMsg::Menu(Box::default()));
+        let menu = frames();
+        assert!(wait_until(|| frames() >= menu + 2));
+        link.load(chart, None).unwrap();
+        let after = frames();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(frames(), after);
+        link.exit();
     }
 
     /// A screen that cannot draw any chart; it notes its menu frames by the

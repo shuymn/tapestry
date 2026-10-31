@@ -380,6 +380,109 @@ fn closing_during_the_measurement_leaves_the_load() {
     assert_eq!(lines(&again, "play started").len(), 1, "{again}");
 }
 
+/// Where `line` first starts a line of `stdout`, from line `from` on.
+fn find_from(stdout: &str, from: usize, line: &str) -> Option<usize> {
+    stdout
+        .lines()
+        .enumerate()
+        .skip(from)
+        .find(|(_, l)| l.starts_with(line))
+        .map(|(i, _)| i)
+}
+
+/// The frames a `dev: <screen> frames <n>:` line counts, each report.
+fn frames_of(stdout: &str, screen: &str) -> Vec<u64> {
+    lines(stdout, &format!("dev: {screen} frames "))
+        .iter()
+        .map(|l| {
+            l.trim_start_matches(&format!("dev: {screen} frames "))
+                .split(':')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Choosing a chart leaves the select screen at once for the loading
+/// page, which names the chart and says each stage, and is drawn on
+/// (its frame dumped) while a slow load holds, until the countdown.
+#[test]
+fn the_loading_page_shows_from_the_choice_through_a_slow_load() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,slow-load=1500,enter,back,close",
+        &["--dev-frames", &frames_arg],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let chose = at(0, "select: chose a.bms");
+    let shown = at(chose, "load: the loading page shows a.bms");
+    let read = at(shown, "load: reading the chart");
+    let held = at(read, "dev: the load holds 1500 ms");
+    let ready = at(held, "load: the chart is ready ");
+    at(ready, "play started");
+    assert!(lines(&stdout, "load: cancelled").is_empty(), "{stdout}");
+    // About 90 frames in 1.5 s at the offscreen pace; far fewer would mean
+    // the page stopped being drawn.
+    let drawn = frames_of(&stdout, "loading");
+    assert_eq!(drawn.len(), 1, "{stdout}");
+    assert!(drawn[0] >= 20, "{drawn:?}\n{stdout}");
+    assert!(frames.join("loading.png").is_file());
+}
+
+/// The quit key during a load cancels it and returns to selection: the
+/// chart is not readied and no countdown starts; Enter then plays it.
+#[test]
+fn the_quit_key_during_a_load_returns_to_selection() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,slow-load=2000,quit-loading,enter,pick=a.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let shown = at(0, "load: the loading page shows a.bms");
+    let cancelled = at(shown, "load: cancelled");
+    let back = at(cancelled, "select: 1 charts listed");
+    let again = at(back, "select: chose a.bms");
+    let ready = at(again, "load: the chart is ready ");
+    at(ready, "play started");
+    assert_eq!(lines(&stdout, "load: cancelled").len(), 1, "{stdout}");
+    assert_eq!(lines(&stdout, "load: the chart is ready ").len(), 1);
+    assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+    // Its loading page was drawn.
+    assert!(!frames_of(&stdout, "loading").is_empty(), "{stdout}");
+}
+
+/// Closing the window during a load cancels it and ends the run at once
+/// with 0, before any countdown.
+#[test]
+fn closing_during_a_load_ends_the_run() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let (_, stdout) = run(&fx, "pick=a.bms,slow-load=2000,close-loading,enter", &[]);
+    assert!(
+        find_from(&stdout, 0, "load: the loading page shows a.bms").is_some(),
+        "{stdout}"
+    );
+    assert_eq!(lines(&stdout, "load: cancelled").len(), 1, "{stdout}");
+    assert!(
+        lines(&stdout, "load: the chart is ready").is_empty(),
+        "{stdout}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+}
+
 /// A chart that cannot be loaded returns to selection with its reason
 /// shown, and stays selected: Enter chooses it again. The threads keep
 /// running: a valid chart plays after it.
@@ -414,6 +517,13 @@ fn refused_chart_shows_its_reason() {
     );
     assert_eq!(lines(&stdout, "select: chose bad.bms").len(), 2, "{stdout}");
     assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+    // Each choice showed the loading page, which the refusal left.
+    let mut from = 0;
+    for _ in 0..2 {
+        let shown = find_from(&stdout, from, "load: the loading page shows bad.bms");
+        let shown = shown.unwrap_or_else(|| panic!("{stdout}"));
+        from = find_from(&stdout, shown, "select: refused bad.bms: ").unwrap();
+    }
 }
 
 /// After a refusal, selection releases the scan's pause: a chart added

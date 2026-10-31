@@ -1081,6 +1081,25 @@ pub fn load_bank_at(
     speed: Speed,
     limits: &BankLimits,
 ) -> Result<SoundBank, BankError> {
+    load_bank_reporting(chart, rate, speed, limits, &|_, _| {})
+}
+
+/// [`load_bank_at`], calling `progress(done, files)` from the decode pool
+/// each time it is done with one of the bank's distinct files, whatever
+/// became of it: `done` counts from 1 to `files`, in the order the files
+/// finish, which is not the path order. The bank is the same as without
+/// it.
+///
+/// # Errors
+///
+/// As [`load_bank_at`].
+pub fn load_bank_reporting(
+    chart: &Chart,
+    rate: u32,
+    speed: Speed,
+    limits: &BankLimits,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<SoundBank, BankError> {
     if !(MIN_RATE..=MAX_RATE).contains(&rate) {
         return Err(BankError::RateOutOfRange { rate });
     }
@@ -1114,11 +1133,13 @@ pub fn load_bank_at(
         stop: AtomicBool::new(false),
         taken: Mutex::new(HashMap::new()),
     };
+    let finished = AtomicUsize::new(0);
     let (hashes, mut outcomes): (Vec<_>, Vec<_>) = pool(threads, paths.len(), |i| {
         let r = process(i, paths[i].0, paths[i].1[0], &shared);
         if matches!(r.1, Outcome::Stopped(Stop::Cap(_))) {
             shared.stop.store(true, Ordering::Relaxed);
         }
+        progress(finished.fetch_add(1, Ordering::Relaxed) + 1, paths.len());
         r
     })
     .into_iter()
@@ -1336,5 +1357,51 @@ mod tests {
     fn a_decode_panic_is_contained_and_returns_its_charge() {
         failure_then_healthy(Fault::Panic, false, "panics");
         failure_then_healthy(Fault::Panic, true, "panics-known");
+    }
+
+    /// Progress counts each distinct file once, a duplicate and one that
+    /// does not decode included, up to the file count, from the decode
+    /// pool; the bank is the one loaded without it.
+    #[test]
+    fn progress_counts_every_distinct_file_once() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("audio-unit-")
+            .tempdir_in(root)
+            .unwrap();
+        let files = ["a", "b", "same-as-a", "broken"].map(|n| dir.path().join(format!("{n}.wav")));
+        std::fs::write(&files[0], wav(&[100; 400], true)).unwrap();
+        std::fs::write(&files[1], wav(&[200; 300], true)).unwrap();
+        std::fs::write(&files[2], wav(&[100; 400], true)).unwrap();
+        std::fs::write(&files[3], b"not a sound").unwrap();
+        let mut builder = ChartBuilder::new(120_000);
+        for (i, _) in files.iter().enumerate() {
+            builder = builder
+                .sound(&format!("{i}.wav"))
+                .bgm(TimeUs(i as i64), SoundId(i as u16));
+        }
+        let mut chart = builder.build().unwrap();
+        for (sound, path) in chart.sounds.iter_mut().zip(&files) {
+            sound.path = Some(path.clone());
+        }
+        let limits = BankLimits {
+            max_decode_threads: 3,
+            ..BankLimits::default()
+        };
+        let seen = std::sync::Mutex::new(Vec::new());
+        let bank = load_bank_reporting(&chart, 8_000, Speed::NORMAL, &limits, &|done, n| {
+            seen.lock().unwrap().push((done, n));
+        })
+        .unwrap();
+        let mut seen = seen.into_inner().unwrap();
+        seen.sort_unstable();
+        assert_eq!(seen, [(1, 4), (2, 4), (3, 4), (4, 4)]);
+        let plain = load_bank(&chart, 8_000, &limits).unwrap();
+        for i in 0..4 {
+            let frames = |b: &SoundBank| b.get(SoundId(i)).map(Sound::frames);
+            assert_eq!(frames(&bank), frames(&plain), "sound {i}");
+        }
+        assert_eq!(bank.warnings(), plain.warnings());
     }
 }

@@ -28,6 +28,7 @@ mod dev;
 mod end_screen;
 mod input_side;
 mod keys;
+mod loading_page;
 mod log_file;
 mod loudness;
 mod measure;
@@ -1364,6 +1365,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         ime,
         rate: opened.rate,
         chosen_at: TimeUs(0),
+        loading: None,
+        practicing: false,
         entered_at: TimeUs(0),
         dirty: true,
         #[cfg(feature = "dev-tools")]
