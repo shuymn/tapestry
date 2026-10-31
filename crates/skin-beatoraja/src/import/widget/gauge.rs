@@ -7,7 +7,7 @@ use skin_model::{Filter, GaugeDef, GaugeParts, MAX_KEY_US, MAX_SEGMENTS, Motion,
 
 use super::super::policy::{CriticalPart, Role};
 use super::super::report::{DeviationId, NoteKind, Severity};
-use super::super::{Cx, Dst};
+use super::super::{Cx, Dst, Opts};
 use crate::error::ImportError;
 
 /// The source's 36 node indices: `look·6 + part + below`, part 0 front,
@@ -160,18 +160,15 @@ impl Cx<'_> {
             }
             Err(field) => return refuse(self, field),
         };
-        let Some(mut c) = self.common(role, &dst, false)? else {
-            return Ok(());
-        };
         // The gauge draws unrotated (`SkinGauge.java:189-192`) and without
         // stretch or filter of its own.
-        if c.offset.r != 0 || c.track.keys.iter().any(|k| k.angle != 0) {
-            self.ignored(at, NoteKind::Ignored { field: "angle" });
-        }
-        c.offset.r = 0;
-        for k in &mut c.track.keys {
-            k.angle = 0;
-        }
+        let o = Opts {
+            unrotated: true,
+            ..Opts::default()
+        };
+        let Some(mut c) = self.common_with(role, &dst, o)? else {
+            return Ok(());
+        };
         if dst.stretch != -1 {
             self.ignored(at, NoteKind::Ignored { field: "stretch" });
         }

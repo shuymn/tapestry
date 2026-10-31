@@ -200,6 +200,9 @@ enum Op {
 struct Opts<'a> {
     /// A `text`: no angle, the blend only noted.
     text: bool,
+    /// Drawn unrotated: the keys' angles are cleared before the track is
+    /// accepted, and an angle is only noted.
+    unrotated: bool,
     /// Run-time offsets the element takes.
     allow: &'a [i32],
     /// A play widget's outer destination: the source's constructor key
@@ -728,10 +731,10 @@ impl<'d> Cx<'d> {
                     .map_err(|l| self.limit(at, l))?;
             }
         }
-        let mut text_angle = false;
-        if text {
+        let mut angle = false;
+        if text || o.unrotated {
             for k in &mut keys.keys {
-                text_angle |= k.angle != 0;
+                angle |= k.angle != 0;
                 k.angle = 0;
             }
         }
@@ -944,8 +947,8 @@ impl<'d> Cx<'d> {
             Some(self.compile(&src, Ty::Bool, at)?)
         };
 
-        if text {
-            if text_angle || offset.r != 0 {
+        if text || o.unrotated {
+            if angle || offset.r != 0 {
                 self.ignored(at, NoteKind::Ignored { field: "angle" });
             }
             offset.r = 0;

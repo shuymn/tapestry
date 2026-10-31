@@ -136,6 +136,18 @@ fn nodes_draw_their_first_frame_nearest() {
     for field in ["stretch", "filter"] {
         assert!(has(l.report(), NoteKind::Ignored { field }), "{field}");
     }
+    // Two keys at one time differing only in the ignored angle.
+    let body = format!(
+        r#"{}, "gauge": {{"id": "g", "nodes": {}, "parts": 10}},
+           "destination": [{{"id": "g", "dst": [
+               {{"time": 0, "x": 100, "y": 500, "w": 100, "h": 10}},
+               {{"time": 0, "x": 100, "y": 500, "w": 100, "h": 10, "angle": 90}}]}}]"#,
+        images(""),
+        nodes(4)
+    );
+    let l = import_sized([1_920, 1_080], &body, &[]);
+    assert!(has(l.report(), NoteKind::Ignored { field: "angle" }));
+    assert_eq!(round(l.quads(1_000)[0].rect), [100, 570, 10, 10]);
     let body = format!(
         r#"{}, "gauge": {{"id": "g", "nodes": {}, "parts": 10}},
            "destination": [{{"id": "g", "dst": [{{"x": 100, "y": 500, "w": 100, "h": 10, "r": 0, "angle": 90}}]}}]"#,
