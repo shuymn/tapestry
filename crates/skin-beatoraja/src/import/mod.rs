@@ -610,7 +610,7 @@ impl<'d> Cx<'d> {
         };
         // A negative number is a player-drawn image (`JSONSkinLoader.java:
         // 316-339`).
-        if ops::java_int(&id).is_some_and(|n| n < 0) {
+        if id.parse::<i32>().is_ok_and(|n| n < 0) {
             self.drop_el(
                 Role::Decorative,
                 at,

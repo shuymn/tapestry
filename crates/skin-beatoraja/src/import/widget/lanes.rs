@@ -976,7 +976,7 @@ fn span_of(xs: &[[i128; 2]]) -> [i128; 2] {
 
 /// Whether a destination id is a negative number: a player-drawn image.
 fn ops_negative(id: &str) -> bool {
-    super::super::ops::java_int(id).is_some_and(|n| n < 0)
+    id.parse::<i32>().is_ok_and(|n| n < 0)
 }
 
 #[cfg(test)]
