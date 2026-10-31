@@ -2288,6 +2288,14 @@ fn a_standing_listing_failure_shows_on_result_entry() {
     let dir = tempfile::tempdir().unwrap();
     // A file where the folder is: listing it fails.
     std::fs::write(dir.path().join("presets"), b"").unwrap();
+    // Opened so, the shelf already holds the failure, before any check: the
+    // select screen shows it from the start.
+    let opened = shelf_of(dir.path(), "tapestry");
+    assert_eq!(
+        opened.listing_error().map(|e| &e.path),
+        Some(&dir.path().join("presets"))
+    );
+    assert_eq!(opened.revision(), 0);
     let (loaded, report) = played(dir.path(), "tapestry");
     assert!(loaded.shelf().listing_error().is_some());
     let s = ResultScreen::new(&report, loaded.shelf(), &chart(), game::RECORDING_MEMORY);
