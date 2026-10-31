@@ -157,16 +157,8 @@ impl Resolved<'_> {
     /// folder, or a count over [`crate::limits`].
     pub fn header(&mut self) -> Result<Header, ImportError> {
         let d = &mut *self.def;
-        let name = self
-            .name
-            .map(|id| d.string(id, "name"))
-            .transpose()?
-            .flatten();
-        let author = self
-            .author
-            .map(|id| d.string(id, "author"))
-            .transpose()?
-            .flatten();
+        let name = opt_string(d, self.name, "name")?;
+        let author = opt_string(d, self.author, "author")?;
 
         let mut options = Vec::new();
         let mut item_count = 0;
@@ -178,7 +170,7 @@ impl Resolved<'_> {
             let mut items = Vec::new();
             if let Some(list) = item {
                 if d.arena.node(list).kind != Kind::Array {
-                    return Err(type_error(d, list, "item", "an array"));
+                    return Err(d.type_error(list, "item", "an array"));
                 }
                 // Sibling links, so nothing is collected before the item
                 // count is checked.
@@ -191,7 +183,7 @@ impl Resolved<'_> {
                     }
                     item_count += 1;
                     if d.arena.node(it).kind != Kind::Object {
-                        return Err(type_error(d, it, "item", "an object"));
+                        return Err(d.type_error(it, "item", "an object"));
                     }
                     let [n, op] = d.fields(it, ["name", "op"]);
                     items.push(OptionItem {
@@ -269,14 +261,6 @@ fn over(d: &Definition, id: u32, limit: InputLimit) -> ImportError {
     ImportError::Input {
         at: Some(d.loc(id)),
         limit,
-    }
-}
-
-fn type_error(d: &Definition, id: u32, field: &'static str, expected: &'static str) -> ImportError {
-    ImportError::Type {
-        at: d.loc(id),
-        field,
-        expected,
     }
 }
 

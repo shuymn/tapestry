@@ -7,7 +7,7 @@ use crate::limits::{MAX_DEPTH, MAX_NODES, MAX_STRING_BYTES};
 use crate::tree::{Arena, KEYED, Kind, Scalar, Text};
 
 fn arena(src: &[u8]) -> Arena {
-    let mut a = Arena::with_estimate(16);
+    let mut a = Arena::new();
     a.files.push(Text {
         name: "t.json".into(),
         dir: String::new(),

@@ -161,7 +161,7 @@ impl Definition {
         })?;
         let (bytes, entry) = read_file(&root, file, 0, || None)?;
         let entry_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let mut arena = Arena::with_estimate(bytes.len() / 4 + 16);
+        let mut arena = Arena::new();
         arena.files.push(Text {
             name: entry.name().to_owned(),
             dir: dir_of(entry.name()),
@@ -193,7 +193,12 @@ impl Definition {
         self.arena.loc(id)
     }
 
-    fn type_error(&self, id: u32, field: &'static str, expected: &'static str) -> ImportError {
+    pub(crate) fn type_error(
+        &self,
+        id: u32,
+        field: &'static str,
+        expected: &'static str,
+    ) -> ImportError {
         ImportError::Type {
             at: self.loc(id),
             field,
@@ -259,14 +264,16 @@ impl Definition {
                 .and_then(truncated)
                 .ok_or_else(|| range(self)),
             Scalar::Str { raw, escaped } => {
+                let decoded;
                 let s = if escaped {
-                    self.decode(id, true)?
+                    decoded = self.decode(id, true)?;
+                    decoded.as_str()
                 } else {
-                    raw.to_owned()
+                    raw
                 };
                 match s.parse::<i32>() {
                     Ok(v) => Ok(v),
-                    Err(_) if integer_shaped(&s) => Err(range(self)),
+                    Err(_) if integer_shaped(s) => Err(range(self)),
                     Err(_) => Err(self.type_error(id, field, "an integer")),
                 }
             }
@@ -409,6 +416,9 @@ impl Resolver<'_, '_> {
 
     /// An array field at depth `depth` into `out`.
     fn array(&mut self, id: u32, depth: u32, out: &mut Vec<u32>) -> Result<(), ImportError> {
+        if let Some(member) = self.arena().first_member_ci(id, "include") {
+            return self.include(member, depth, |r, root, d| r.array(root, d, out));
+        }
         let kind = self.arena().node(id).kind;
         match kind {
             Kind::Array => {
@@ -419,9 +429,6 @@ impl Resolver<'_, '_> {
                     self.item(item, depth + 1, out)?;
                 }
                 Ok(())
-            }
-            Kind::Object if self.arena().first_member_ci(id, "include").is_some() => {
-                self.include(id, depth, |r, root, d| r.array(root, d, out))
             }
             Kind::Object => match self.record(id, depth)? {
                 Some(rec) => self.emit(rec, out),
@@ -450,8 +457,8 @@ impl Resolver<'_, '_> {
             }
             return Ok(());
         }
-        if self.arena().first_member_ci(item, "include").is_some() {
-            return self.include(item, depth, |r, root, d| r.array(root, d, out));
+        if let Some(member) = self.arena().first_member_ci(item, "include") {
+            return self.include(member, depth, |r, root, d| r.array(root, d, out));
         }
         match self.record(item, depth)? {
             Some(rec) => self.emit(rec, out),
@@ -462,6 +469,9 @@ impl Resolver<'_, '_> {
     /// A record at depth `depth`: the literal node, or none when a choice
     /// selects nothing.
     fn record(&mut self, id: u32, depth: u32) -> Result<Option<u32>, ImportError> {
+        if let Some(member) = self.arena().first_member_ci(id, "include") {
+            return self.include(member, depth, |r, root, d| r.record(root, d));
+        }
         let kind = self.arena().node(id).kind;
         match kind {
             Kind::Array => {
@@ -478,9 +488,6 @@ impl Resolver<'_, '_> {
                     }
                 }
                 Ok(None)
-            }
-            Kind::Object if self.arena().first_member_ci(id, "include").is_some() => {
-                self.include(id, depth, |r, root, d| r.record(root, d))
             }
             _ => Ok(Some(id)),
         }
@@ -542,17 +549,15 @@ impl Resolver<'_, '_> {
         })
     }
 
-    /// Reads, parses and resolves the file object `obj` (at `depth`)
-    /// includes, through `then` with its root and the root's depth.
+    /// Reads, parses and resolves the file that `member`, the first
+    /// `include` of an object at `depth`, names, through `then` with its
+    /// root and the root's depth.
     fn include<T>(
         &mut self,
-        obj: u32,
+        member: u32,
         depth: u32,
         then: impl FnOnce(&mut Self, u32, u32) -> Result<T, ImportError>,
     ) -> Result<T, ImportError> {
-        let Some(member) = self.arena().first_member_ci(obj, "include") else {
-            return Err(self.def.type_error(obj, "include", "a file name"));
-        };
         // The location is built only for an error: it rescans the file.
         let Some(name) = self.def.string(member, "include")? else {
             return Err(self.def.type_error(member, "include", "a file name"));

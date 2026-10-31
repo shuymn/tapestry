@@ -9,7 +9,6 @@
 use std::str::Chars;
 
 use crate::error::{ImportError, InputLimit, Loc, Syntax};
-use crate::limits::MAX_NODES;
 
 /// No node: the end of a sibling chain, an empty container, no key.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -198,10 +197,11 @@ pub(crate) fn check_escapes(raw: &[u8]) -> Result<(), (usize, Syntax)> {
 }
 
 impl Arena {
-    /// An arena with room for `estimate` nodes, at most [`MAX_NODES`].
-    pub(crate) fn with_estimate(estimate: usize) -> Self {
+    /// An empty arena; the parser grows it, capped at
+    /// [`crate::limits::MAX_NODES`].
+    pub(crate) fn new() -> Self {
         Self {
-            nodes: Vec::with_capacity(estimate.min(MAX_NODES)),
+            nodes: Vec::new(),
             files: Vec::new(),
         }
     }
@@ -267,12 +267,15 @@ impl Arena {
     pub(crate) fn scalar(&self, id: u32) -> Scalar<'_> {
         let n = *self.node(id);
         let escaped = n.flags & ESCAPED != 0;
-        let raw = self.raw(id);
         match n.kind {
             Kind::Object => Scalar::Object,
             Kind::Array => Scalar::Array,
-            Kind::Quoted => Scalar::Str { raw, escaped },
+            Kind::Quoted => Scalar::Str {
+                raw: self.raw(id),
+                escaped,
+            },
             Kind::Bare => {
+                let raw = self.raw(id);
                 // `true`, `false` and `null` are compared after unescaping
                 // (JsonReader.rl:118-128); the number check runs on the
                 // token as written (JsonReader.rl:130-176).
@@ -392,36 +395,25 @@ mod tests {
         assert_eq!(size_of::<Node>(), 28);
     }
 
-    /// `\u` and four hex digits, spelled so that no tool reads it as an
-    /// escape.
-    fn u(hex: &str) -> String {
-        format!("{}u{hex}", '\\')
-    }
-
     #[test]
     fn escapes_are_checked() {
-        let pair = format!("{}{}", u("D83D"), u("DE00"));
         for good in [
-            r#"a\"b\\c\/d\b\f\n\r\t"#.to_owned(),
-            u("0041"),
-            u("00e9"),
-            pair,
+            r#"a\"b\\c\/d\b\f\n\r\t"#,
+            r"\u0041",
+            r"\u00e9",
+            r"\uD83D\uDE00",
         ] {
             assert_eq!(check_escapes(good.as_bytes()), Ok(()), "{good}");
         }
         for (bad, at, what) in [
-            (r"ab\x".to_owned(), 2, Syntax::InvalidEscape),
-            (u("12"), 0, Syntax::InvalidEscape),
-            (u("12G4"), 0, Syntax::InvalidEscape),
-            (u("+123"), 0, Syntax::InvalidEscape),
-            (r"a\".to_owned(), 1, Syntax::InvalidEscape),
-            (u("DE00"), 0, Syntax::LoneSurrogate),
-            (format!("{}x", u("D83D")), 0, Syntax::LoneSurrogate),
-            (
-                format!("{}{}", u("D83D"), u("0041")),
-                0,
-                Syntax::LoneSurrogate,
-            ),
+            (r"ab\x", 2, Syntax::InvalidEscape),
+            (r"\u12", 0, Syntax::InvalidEscape),
+            (r"\u12G4", 0, Syntax::InvalidEscape),
+            (r"\u+123", 0, Syntax::InvalidEscape),
+            (r"a\", 1, Syntax::InvalidEscape),
+            (r"\uDE00", 0, Syntax::LoneSurrogate),
+            (r"\uD83Dx", 0, Syntax::LoneSurrogate),
+            (r"\uD83D\u0041", 0, Syntax::LoneSurrogate),
         ] {
             assert_eq!(check_escapes(bad.as_bytes()), Err((at, what)), "{bad}");
         }

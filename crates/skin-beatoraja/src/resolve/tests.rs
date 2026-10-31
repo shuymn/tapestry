@@ -62,6 +62,18 @@ fn decoded_bytes_are_counted_before_they_are_allocated() {
 }
 
 #[test]
+fn the_arena_grows_with_the_nodes_not_the_file_size() {
+    let d = skin(&format!(r#"{}{{"type":0}}"#, " ".repeat(1 << 20)));
+    let def = Definition::read_with(d.path(), "s.json", Limits::STANDARD).unwrap();
+    assert_eq!(def.arena.nodes.len(), 2);
+    assert!(
+        def.arena.nodes.capacity() <= 1_024,
+        "{}",
+        def.arena.nodes.capacity()
+    );
+}
+
+#[test]
 fn successful_resolution_builds_no_location() {
     use crate::tree::RESCANS;
     let d = skin(
