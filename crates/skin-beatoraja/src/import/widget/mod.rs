@@ -9,7 +9,7 @@ pub(super) mod text;
 
 use skin_model::{ImageDef, MAX_SKIN_FRAMES, Source};
 
-use super::asset::{self, Failed, Path};
+use super::asset::{self, Crop, Failed, ImageKey, Path};
 use super::budget::ImportLimit;
 use super::policy::Role;
 use super::report::{NoteKind, Object, PropertyKind, Span, TrackWhy};
@@ -104,6 +104,21 @@ impl Cx<'_> {
         s: &SrcImage,
         grid: [u32; 2],
     ) -> Result<Option<(u32, [u32; 2])>, ImportError> {
+        self.add_src_image_cropped(c, rec, s, grid, |_, _| Ok(None))
+    }
+
+    /// [`Self::add_src_image`] with its frame's rows cut to what `crop`
+    /// returns for the uncropped rect `[x, y, w, h]` (texels, y down),
+    /// asked once that rect is known; a cropped image is cached apart
+    /// from the uncropped one, sharing its file.
+    pub(super) fn add_src_image_cropped(
+        &mut self,
+        c: &Common,
+        rec: u32,
+        s: &SrcImage,
+        grid: [u32; 2],
+        crop: impl FnOnce(&Self, [u32; 4]) -> Result<Option<Crop>, ImportError>,
+    ) -> Result<Option<(u32, [u32; 2])>, ImportError> {
         let at = c.span;
         let role = c.role;
         let frames = self.grid_frames(at, grid)?;
@@ -128,8 +143,15 @@ impl Cx<'_> {
         }
         let linear = c.filter == skin_model::Filter::Linear;
         let key = (rec, linear, grid);
-        if let Some(found) = self.assets.image(key) {
-            return Ok(Some(found));
+        if let Some((def, cell)) = self.assets.base(key) {
+            let crop = crop(self, def.rect.unwrap_or_default())?;
+            if let Some(found) = self.assets.image(key, crop) {
+                return Ok(Some(found));
+            }
+            self.budget.image(frames).map_err(|l| self.limit(at, l))?;
+            #[cfg(test)]
+            super::trace(super::Event::Charge);
+            return self.add_image(c, key, crop, def, cell);
         }
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
@@ -213,8 +235,23 @@ impl Cx<'_> {
             cycle,
             filter: c.filter,
         };
-        match self.assets.add_image(key, def, cell) {
-            Ok(i) => Ok(Some((i, cell))),
+        let crop = crop(self, rect)?;
+        self.add_image(c, key, crop, def, cell)
+    }
+
+    /// Adds `def` cut to `crop` under `key`: a failure refuses a critical
+    /// element and drops any other.
+    fn add_image(
+        &mut self,
+        c: &Common,
+        key: ImageKey,
+        crop: Option<Crop>,
+        def: ImageDef,
+        cell: [u32; 2],
+    ) -> Result<Option<(u32, [u32; 2])>, ImportError> {
+        let (at, role) = (c.span, c.role);
+        match self.assets.add_image(key, crop, def, cell) {
+            Ok(found) => Ok(Some(found)),
             Err(e) if matches!(role, Role::Critical(_)) => Err(ImportError::Asset {
                 at: self.loc(at),
                 source: e,

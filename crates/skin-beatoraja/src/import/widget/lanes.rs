@@ -10,9 +10,11 @@
 //! (owner decision 15, D11).
 
 use skin_model::{
-    Blend, End, Filter, LaneParts, LaneStyle, LanesDef, Side, Source, SourceLanes, TimerRef,
+    Blend, End, Filter, LaneParts, LaneStyle, LanesDef, MAX_COORD, Side, Source, SourceLanes,
+    TimerRef,
 };
 
+use super::super::asset::Crop;
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
 use super::super::report::{DeviationId, LaneApprox, NoteKind, Severity, Span};
@@ -63,6 +65,31 @@ impl LaneState {
     pub(crate) fn def(&self) -> LanesDef {
         self.def
     }
+}
+
+/// The height stretch 5 keeps of a frame of `[iw, ih]` texels for
+/// destination `r` when it crops the frame's rows, computed in `f32` as
+/// the source does (`skin/StretchType.java:65-68, 143-148`).
+#[expect(clippy::cast_precision_loss, reason = "the source's float arithmetic")]
+fn trimmed(r: Rect, [iw, ih]: [u32; 2]) -> Option<f32> {
+    let scale = r.w.to_f32() / iw as f32;
+    let (h, fitted) = (r.h.to_f32(), scale * ih as f32);
+    (h < fitted).then(|| h / scale)
+}
+
+/// The rows a frame at row `y`, `h` high, keeps about its middle when it
+/// keeps `kept` texels, truncated as the source does
+/// (`skin/StretchType.java:146-149`); `None` when no row is left.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "the source's float arithmetic"
+)]
+fn crop_rows(y: u32, h: u32, kept: f32) -> Option<Crop> {
+    let middle = y as f32 + h as f32 * 0.5;
+    let first = u32::try_from((middle - kept * 0.5) as i32).ok()?;
+    let rows = u32::try_from(kept as i32).ok().filter(|&n| n > 0)?;
+    Some([first, rows])
 }
 
 /// `v` exactly; `None` for one beyond the rationals' range.
@@ -816,22 +843,95 @@ impl Cx<'_> {
         {
             return refuse(self, "dst");
         }
-        let Some(cover_h) = Q::int(hc).mul(self.r) else {
-            return Err(self.range(at, "dst"));
-        };
-        let Some((image, _)) = self.add_src_image(&c, rec, s, s.div)? else {
+        let Some((image, r)) = self.add_cover_image(&c, part, &dst, rec, s)? else {
             return refuse(self, "src");
         };
+        if r.h <= Q::int(0) {
+            return refuse(self, "dst");
+        }
+        let [_, lower] = self.cover_edges(at, r)?;
         let kept_after = self.lanes.as_ref().is_some_and(|l| l.kept_after);
         if let Some(l) = self.lanes.as_mut() {
             l.def.parts.cover = Some(image);
-            l.def.cover_h = cover_h.to_f32();
+            l.def.cover_at = lower.to_f32();
+            l.def.cover_h = r.h.to_f32();
         }
         self.lane_approx(at, part, LaneApprox::CoverAbove)?;
         if kept_after {
             self.lane_approx(at, part, LaneApprox::CoverOrder)?;
         }
         Ok(())
+    }
+
+    /// A cover's destination in reference pixels, y up.
+    fn cover_rect(&self, c: &Common) -> Result<Rect, ImportError> {
+        match c.track.keys.first() {
+            Some(k) => self.key_rect(c, k),
+            None => Err(self.range(c.span, "dst")),
+        }
+    }
+
+    /// A cover's image and its destination stretched against the image's
+    /// frame, y up: unchanged for identity; fit to its width for stretch
+    /// 4 (`skin/StretchType.java:61-64, 125-129`); for stretch 5 the same
+    /// unless the fitted frame is taller than the destination, when the
+    /// destination stays and the frame keeps its middle rows, which only
+    /// a single frame can (`:65-68, 143-153`). `None` when the image was
+    /// dropped.
+    fn add_cover_image(
+        &mut self,
+        c: &Common,
+        part: CriticalPart,
+        dst: &Dst,
+        rec: u32,
+        s: &SrcImage,
+    ) -> Result<Option<(u32, Rect)>, ImportError> {
+        let at = c.span;
+        let r = self.cover_rect(c)?;
+        let (mode, grid) = (dst.stretch, s.div);
+        let refuse = |cx: &Self, why: NoteKind| ImportError::Critical {
+            at: cx.loc(at),
+            part,
+            why,
+        };
+        let mut cropped = false;
+        let found = self.add_src_image_cropped(c, rec, s, grid, |cx, [_, y, w, h]| {
+            let cell = [w / grid[0].max(1), h / grid[1].max(1)];
+            let Some(kept) = (mode == 5).then(|| trimmed(r, cell)).flatten() else {
+                return Ok(None);
+            };
+            if grid != [1, 1] {
+                return Err(refuse(cx, NoteKind::Stretch(mode)));
+            }
+            let Some(crop) = crop_rows(y, h, kept) else {
+                return Err(refuse(cx, NoteKind::UnsupportedField { field: "dst" }));
+            };
+            cropped = true;
+            Ok(Some(crop))
+        })?;
+        let Some((image, cell)) = found else {
+            return Ok(None);
+        };
+        if matches!(mode, 4 | 5) && !cropped {
+            let fitted = track::stretch(Stretch::FitWidth, r, cell);
+            return match fitted {
+                Some((r, _)) => Ok(Some((image, r))),
+                None => Err(self.range(at, "dst")),
+            };
+        }
+        Ok(Some((image, r)))
+    }
+
+    /// A cover's upper and lower edges, y down, each within
+    /// ±[`MAX_COORD`].
+    fn cover_edges(&self, at: Span, r: Rect) -> Result<[Q; 2], ImportError> {
+        let max = i128::from(MAX_COORD);
+        let near = |v: Q| Q::int(-max) <= v && v <= Q::int(max);
+        let lower = Q::int(HEIGHT).sub(r.y);
+        match (lower.and_then(|v| v.sub(r.h)), lower) {
+            (Some(upper), Some(lower)) if near(upper) && near(lower) => Ok([upper, lower]),
+            _ => Err(self.range(at, "dst")),
+        }
     }
 
     /// Whether `x` and `w` (source pixels) round to the lanes' span.
@@ -850,8 +950,9 @@ impl Cx<'_> {
     }
 
     /// SUDDEN+'s or LIFT's common part, refused unless it is static,
-    /// white, opaque, alpha-blended, unrotated, unstretched, not moved by
-    /// any user offset, and shown exactly when the lanes are.
+    /// white, opaque, alpha-blended, unrotated, unstretched or fit to its
+    /// width (stretch 4 or 5), not moved by any user offset, and shown
+    /// exactly when the lanes are.
     fn cover_common(
         &mut self,
         dst: &Dst,
@@ -874,6 +975,13 @@ impl Cx<'_> {
         let Some(l) = self.lanes.as_ref() else {
             return Ok(None);
         };
+        if !(Stretch::of(dst.stretch) == Stretch::Identity || matches!(dst.stretch, 4 | 5)) {
+            return Err(ImportError::Critical {
+                at: self.loc(at),
+                part,
+                why: NoteKind::Stretch(dst.stretch),
+            });
+        }
         let still = c.track.identical()
             && c.track
                 .keys
@@ -881,7 +989,6 @@ impl Cx<'_> {
                 .is_some_and(|k| k.color == [255; 4] && k.angle == 0)
             && c.blend == Blend::Alpha
             && dst.blend != 3
-            && Stretch::of(dst.stretch) == Stretch::Identity
             && c.offset == Offset::default()
             && !l.moved;
         let same = c.timer == l.timer && c.cond_src == l.cond_src && window(&c.track) == l.window;
@@ -940,16 +1047,28 @@ impl Cx<'_> {
         {
             return refuse(self, "dst");
         }
-        let Some(lift_h) = Q::int(hl).mul(self.r) else {
-            return Err(self.range(at, "dst"));
-        };
-        let Some((image, _)) = self.add_src_image(&c, rec, &s, s.div)? else {
+        let unstretched = self.cover_rect(&c)?;
+        let Some((image, r)) = self.add_cover_image(&c, part, &dst, rec, &s)? else {
             return refuse(self, "src");
         };
+        // The source clips LIFT to its unstretched destination before
+        // stretching it (`play/SkinHidden.java:75-88`,
+        // `skin/SkinObject.java:655-656`): a stretch maps only when it
+        // keeps the destination's vertical extent, so the cover's upper
+        // edge stays on the raised line.
+        if (r.y, r.h) != (unstretched.y, unstretched.h) {
+            return Err(ImportError::Critical {
+                at: self.loc(at),
+                part,
+                why: NoteKind::Stretch(dst.stretch),
+            });
+        }
+        let [upper, _] = self.cover_edges(at, r)?;
         let kept_after = self.lanes.as_ref().is_some_and(|l| l.kept_after);
         if let Some(l) = self.lanes.as_mut() {
             l.def.parts.lift = Some(image);
-            l.def.lift_h = lift_h.to_f32();
+            l.def.lift_at = upper.to_f32();
+            l.def.lift_h = r.h.to_f32();
         }
         if kept_after {
             self.lane_approx(at, part, LaneApprox::CoverOrder)?;
@@ -999,5 +1118,32 @@ mod tests {
         assert_eq!(f32_q(0.1), Q::new(13_421_773, 134_217_728));
         assert_eq!(f32_q(f32::INFINITY), None);
         assert_eq!(f32_q(f32::MAX), None);
+    }
+
+    fn rect(w: i32, h: i32) -> Rect {
+        Rect {
+            x: Q::int(20),
+            y: Q::int(800),
+            w: Q::int(w),
+            h: Q::int(h),
+        }
+    }
+
+    #[test]
+    fn stretch_five_crops_in_the_sources_floats() {
+        // A 25×128 frame over 430×258 keeps 258 / 17.2 rows: exactly 15,
+        // but 14.999999 in `f32`, which truncates to 14.
+        let kept = trimmed(rect(430, 258), [25, 128]).unwrap();
+        assert!(kept < 15.0, "{kept}");
+        assert_eq!(crop_rows(0, 128, kept), Some([56, 14]));
+        // A 75×17 frame at row 24 over 430×86 keeps about 15 rows about
+        // its middle, 32.5: from row 25.
+        let kept = trimmed(rect(430, 86), [75, 17]).unwrap();
+        assert_eq!(crop_rows(24, 17, kept).map(|c| c[0]), Some(25));
+        // A frame no taller than the destination once fit is not cropped.
+        assert_eq!(trimmed(rect(430, 300), [43, 30]), None);
+        assert_eq!(trimmed(rect(430, 299), [43, 30]), Some(29.9));
+        // No row left.
+        assert_eq!(crop_rows(0, 128, 0.5), None);
     }
 }

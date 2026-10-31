@@ -11,7 +11,7 @@ mod common;
 use bms_model::{ChartBuilder, Lane, TimeUs};
 use common::lanes::{NOTES, body, cover, lift, lift_object, note};
 use common::play::{Drawn, MS};
-use common::{Loaded, has, import_body, import_config};
+use common::{Loaded, has, import_body, import_config, import_sized};
 use skin_beatoraja::{
     Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
 };
@@ -484,5 +484,152 @@ fn hidden_plus_is_never_drawn() {
         );
         assert_eq!(r.usage.images, images, "{d}");
         assert_eq!(rects(&l, 5_000, 0, 0), Vec::<[i32; 4]>::new(), "{d}");
+    }
+}
+
+/// The lanes over a 64×256 `a.png` with image records `extra`, `objects`
+/// beside the note, and `dsts` after it.
+fn tall(extra: &str, objects: &str, dsts: &[&str]) -> Loaded {
+    let objects = if objects.is_empty() {
+        note("")
+    } else {
+        format!("{}, {objects}", note(""))
+    };
+    let mut all = vec![NOTES];
+    all.extend_from_slice(dsts);
+    import_sized(
+        [1_920, 1_080],
+        &body(extra, &objects, &all),
+        &[("a.png", 64, 256)],
+    )
+}
+
+/// A SUDDEN+ destination of image `id` with stretch `mode` over the
+/// default lanes.
+fn stretched(id: &str, mode: i32) -> String {
+    cover(&format!(r#""stretch": {mode}"#)).replace(r#""id": "cover""#, &format!(r#""id": "{id}""#))
+}
+
+/// The rows of its frame the one quad drawn keeps, from its uv's aspect
+/// against the frame's `width` texels (the atlas pages are square).
+fn rows_drawn(l: &Loaded, width: f32) -> f32 {
+    let chart = ChartBuilder::new(150_000)
+        .tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS))
+        .build()
+        .unwrap();
+    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+    // At 1 000 ‰ a 600 px SUDDEN+ spans [280, 880], uncut.
+    d.view.cover = 1_000;
+    let q: Vec<_> = d
+        .frame(1_000, &[])
+        .into_iter()
+        .filter(|q| q.rect == [20.0, 280.0, 430.0, 600.0])
+        .collect();
+    assert_eq!(q.len(), 1);
+    let [u0, v0, u1, v1] = q[0].uv;
+    width * (v1 - v0) / (u1 - u0)
+}
+
+const WIDE: &str = r#"{"id": "cw", "src": "a", "x": 0, "y": 24, "w": 43, "h": 30}"#;
+
+#[test]
+fn fit_width_covers_take_the_frames_aspect() {
+    // A 43×30 frame over 430 px is 300 high, centred on the 600 px
+    // destination: its lower edge at 130, 150 above the region's top.
+    for mode in [4, 5] {
+        let l = tall(WIDE, "", &[&stretched("cw", mode)]);
+        // 500 ‰ lowers it by 300 to 430, cut at the lanes' top.
+        assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 160]], "{mode}");
+        // At 1 000 ‰ it spans 430–730: the tap at its judgment time
+        // stays visible below it, on the line.
+        assert_eq!(
+            rects(&l, 1_000, 1_000, 0),
+            [[100, 860, 50, 20], [20, 430, 430, 300]],
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn fit_width_trimmed_covers_crop_the_frames_rows() {
+    // A 43×120 frame fit to 430 would be 1 200 high: stretch 5 keeps the
+    // 600 px destination and the frame's middle 60 rows (30 to 90).
+    let frame = r#"{"id": "ct", "src": "a", "x": 0, "y": 0, "w": 43, "h": 120}"#;
+    let l = tall(frame, "", &[&stretched("ct", 5)]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 310]]);
+    assert_eq!(rows_drawn(&l, 43.0), 60.0);
+    // Stretch 4 keeps every row and fits the height: 1 200 centred on
+    // the destination puts its lower edge at 580.
+    let l = tall(frame, "", &[&stretched("ct", 4)]);
+    assert_eq!(rects(&l, 5_000, 0, 0), [[20, 270, 430, 310]]);
+    // Only a single frame crops: two rows of frames refuse.
+    let grid = r#"{"id": "ct", "src": "a", "x": 0, "y": 0, "w": 43, "h": 240, "divy": 2}"#;
+    assert_eq!(
+        critical(tall(grid, "", &[&stretched("ct", 5)])),
+        (CriticalPart::Cover, NoteKind::Stretch(5))
+    );
+    // Uncropped, a grid fits as stretch 4 does.
+    let grid = grid.replace(r#""h": 240"#, r#""h": 40"#);
+    tall(&grid, "", &[&stretched("ct", 5)]).ok();
+}
+
+#[test]
+fn a_cropped_cover_is_its_own_image_of_the_same_file() {
+    // The record drawn whole by a decorative image and cropped by
+    // SUDDEN+: two images, one file.
+    let frame = r#"{"id": "ct", "src": "a", "x": 0, "y": 0, "w": 43, "h": 120}"#;
+    let plain = r#"{"id": "ct", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let alone = tall(frame, "", &[&stretched("ct", 5)]);
+    let both = tall(frame, "", &[plain, &stretched("ct", 5)]);
+    let (a, b) = (alone.report().usage, both.report().usage);
+    assert_eq!((b.images, b.frames), (a.images + 1, a.frames + 1));
+    assert_eq!(b.files, a.files);
+    assert_eq!(rows_drawn(&both, 43.0), 60.0);
+    // Drawn whole after the cover cropped it, it is added too.
+    let after = tall(frame, "", &[&stretched("ct", 5), plain]);
+    assert_eq!(after.report().usage.images, b.images);
+    assert_eq!(rows_drawn(&after, 43.0), 60.0);
+}
+
+#[test]
+fn other_stretches_refuse_the_covers() {
+    for mode in [1, 2, 3, 6, 7, 8, 9, 10] {
+        let want = NoteKind::Stretch(mode);
+        assert_eq!(
+            critical(tall(WIDE, "", &[&stretched("cw", mode)])),
+            (CriticalPart::Cover, want),
+            "{mode}"
+        );
+        let l = with(&lift_object(""), &[&lift(&format!(r#""stretch": {mode}"#))]);
+        assert_eq!(critical(l), (CriticalPart::Lift, want), "{mode}");
+    }
+    // Unknown modes are identity.
+    tall(WIDE, "", &[&stretched("cw", 11)]).ok();
+}
+
+#[test]
+fn lift_fits_its_width_only_in_place() {
+    // The source clips LIFT to its destination before stretching it: a
+    // fit that changes the 200 px height refuses. A 16×16 frame over
+    // 430 px grows to 430; a 43×10 frame shrinks to 100.
+    let lift_mode = |mode: i32| lift(&format!(r#""stretch": {mode}"#));
+    let small = lift_object("").replace(r#""w": 16, "h": 16"#, r#""w": 43, "h": 10"#);
+    for (object, mode) in [(lift_object(""), 4), (small.clone(), 4), (small, 5)] {
+        let l = with(&object, &[&lift_mode(mode)]);
+        assert_eq!(
+            critical(l),
+            (CriticalPart::Lift, NoteKind::Stretch(mode)),
+            "{object} {mode}"
+        );
+    }
+    // Stretch 5 crops the 16×16 frame's rows and keeps the destination.
+    let l = with(&lift_object(""), &[&lift_mode(5)]);
+    assert_eq!(rects(&l, 5_000, 0, 200), [[20, 760, 430, 120]]);
+    // A 43×20 frame fits 430×200 exactly and maps.
+    let exact = lift_object("").replace(r#""w": 16, "h": 16"#, r#""w": 43, "h": 20"#);
+    for mode in [4, 5] {
+        let l = with(&exact, &[&lift(&format!(r#""stretch": {mode}"#))]);
+        // LIFT 200 ‰ raises its upper edge 120 px to 760.
+        assert_eq!(rects(&l, 5_000, 0, 200), [[20, 760, 430, 120]], "{mode}");
     }
 }
