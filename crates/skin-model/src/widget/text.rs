@@ -18,6 +18,8 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::borrow::Cow;
+
 use super::Brush;
 use super::digits::Align;
 use super::glyphs::GlyphLine;
@@ -253,25 +255,26 @@ pub(crate) fn clean(s: &str) -> String {
 }
 
 impl TextValue {
-    /// The string this value shows for `chart`, before cleaning.
-    pub(crate) fn resolve(&self, chart: &ChartText<'_>) -> String {
-        let join = |a: &str, b: &str| {
+    /// The string this value shows for `chart`, before cleaning: a
+    /// literal or a single field borrowed, a joined pair owned.
+    pub(crate) fn resolve<'a>(&'a self, chart: &ChartText<'a>) -> Cow<'a, str> {
+        let join = |a: &'a str, b: &str| {
             if b.is_empty() {
-                a.to_owned()
+                Cow::Borrowed(a)
             } else {
-                format!("{a} {b}")
+                Cow::Owned(format!("{a} {b}"))
             }
         };
         match self {
-            Self::Literal(s) => s.clone(),
+            Self::Literal(s) => Cow::Borrowed(s),
             Self::Field(f) => match f {
-                TextField::Title => chart.title.to_owned(),
-                TextField::Subtitle => chart.subtitle.to_owned(),
+                TextField::Title => Cow::Borrowed(chart.title),
+                TextField::Subtitle => Cow::Borrowed(chart.subtitle),
                 TextField::FullTitle => join(chart.title, chart.subtitle),
-                TextField::Artist => chart.artist.to_owned(),
-                TextField::Subartist => chart.subartist.to_owned(),
+                TextField::Artist => Cow::Borrowed(chart.artist),
+                TextField::Subartist => Cow::Borrowed(chart.subartist),
                 TextField::FullArtist => join(chart.artist, chart.subartist),
-                TextField::Genre => chart.genre.to_owned(),
+                TextField::Genre => Cow::Borrowed(chart.genre),
             },
         }
     }
