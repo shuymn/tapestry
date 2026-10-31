@@ -679,10 +679,11 @@ fn view(controls: &Controls) -> View {
 
 /// The controls, with the settings keys starting from the loaded values,
 /// waking the calling thread: the game thread. The quit key is taken once
-/// by the play or result it arrives in, with or without selection: before
-/// a play is complete it leaves the chart, after it it skips the tail to
-/// the result (design.md "Audio tail"); only closing the window latches
-/// quitting.
+/// by the play or result it arrives in, with or without selection: in a
+/// play's countdown it leaves the chart, while the chart plays it ends the
+/// play on its result, after completion it skips the tail to the result
+/// (design.md "Play Lifecycle", "Audio tail"); only closing the window
+/// latches quitting.
 fn controls(s: &Settings, clock: QpcClock) -> Arc<Controls> {
     let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volume(s.device.master_volume);
     let controls = Controls::with_tuning(clock, Arc::new(tuning));
