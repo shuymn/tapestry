@@ -1,7 +1,9 @@
 //! Object tables by id, built on first use, in the source's lookup order
 //! (`JsonSkinObjectLoader.java:38-~560`, `PlaySkinObjectLoader.java` at
 //! `0.8.9`): the first record of an id wins in each table, and the first
-//! table that has the id wins.
+//! table that has the id wins. The play loader sets `note` and keeps
+//! looking, so a later play object of the same id overrides it
+//! (`JsonPlaySkinObjectLoader.java:37-181`): `note` is looked up last.
 
 use std::collections::HashMap;
 
@@ -26,13 +28,13 @@ const ORDER: [(&str, Object); 21] = [
     ("timingvisualizer", Object::TimingVisualizer),
     ("timingdistributiongraph", Object::TimingDistribution),
     ("gauge", Object::Gauge),
-    ("note", Object::Note),
     ("hiddenCover", Object::HiddenCover),
     ("liftCover", Object::LiftCover),
     ("practice", Object::Practice),
     ("bga", Object::Bga),
     ("judge", Object::Judge),
     ("pmchara", Object::PmChara),
+    ("note", Object::Note),
 ];
 
 /// The records of a table: an array field's, or a record field's one.
@@ -101,5 +103,22 @@ impl Objects {
             }
         }
         Ok(None)
+    }
+
+    /// Whether the `note` record has id `id`.
+    pub(crate) fn is_note(
+        &mut self,
+        def: &mut Definition,
+        tables: &Tables,
+        id: &str,
+    ) -> Result<bool, ImportError> {
+        let slot = ORDER.len() - 1;
+        if let Some(m) = self.maps.get_mut(slot) {
+            if m.is_none() {
+                *m = Some(index(def, records(tables, "note"), false)?);
+            }
+            return Ok(m.as_ref().is_some_and(|m| m.contains_key(id)));
+        }
+        Ok(false)
     }
 }

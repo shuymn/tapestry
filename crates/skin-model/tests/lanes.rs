@@ -558,10 +558,11 @@ fn centres(chart: &Chart, now: i64, cover: u16, lift: u16) -> Vec<f32> {
 
 #[test]
 fn the_cover_and_the_lift_shorten_the_visible_span() {
-    // L = 800. Cover 250 ‰: the span is 600 px from the cover's edge
-    // (280) to the line (880), and 600 ms of 150 BPM take all of it.
-    // Lift 100 ‰ as well: the line is at 800 and the span 520 px, again
-    // from 280. A note 300 ms ahead is halfway: 580 without the lift, 540
+    // L = 800, a tenth 80. Cover 250 ‰: the span is 600 px from the
+    // cover's edge (280) to the line (880), and 600 ms of 150 BPM take all
+    // of it. Lift 100 ‰ as well: the line rises 80 to 800 and the cover
+    // takes 250 ‰ of the 720 left above it, 180, so the span is 540 px
+    // from 260. A note 300 ms ahead is halfway: 580 without the lift, 530
     // with it.
     let chart = ChartBuilder::new(BPM)
         .tap(lane(3), TimeUs(1_000 * MS))
@@ -569,7 +570,7 @@ fn the_cover_and_the_lift_shorten_the_visible_span() {
         .build()
         .unwrap();
     assert_eq!(centres(&chart, 700, 250, 0), [580.0, 280.0]);
-    assert_eq!(centres(&chart, 700, 250, 100), [540.0, 280.0]);
+    assert_eq!(centres(&chart, 700, 250, 100), [530.0, 260.0]);
     let mut h = harness(&chart);
     h.view.cover = 250;
     h.view.lift = 100;
@@ -578,17 +579,17 @@ fn the_cover_and_the_lift_shorten_the_visible_span() {
     // the bottom.
     assert_eq!(rects(&h, LINE), [[160.0, 797.0, 544.0, 6.0]]);
     assert_eq!(rects(&h, LIFT), [[160.0, 800.0, 544.0, 160.0]]);
-    // The cover is 800 tall with its bottom edge at 280, cut at the top:
-    // its lowest 200 texel rows of 800, the last quarter of its image.
+    // The cover is 800 tall with its bottom edge at 260, cut at the top:
+    // its lowest 180 texel rows of 800.
     let [cover] = quads_of(&h, COVER)[..] else {
         panic!("one cover");
     };
-    assert_eq!(cover.rect, [160.0, 80.0, 544.0, 200.0]);
+    assert_eq!(cover.rect, [160.0, 80.0, 544.0, 180.0]);
     let whole = h.uvs.get(COVER).unwrap().uv;
-    let quarter = whole[1] + (whole[3] - whole[1]) * 0.75;
-    assert_eq!(cover.uv, [whole[0], quarter, whole[2], whole[3]]);
-    // At most 900 ‰ is covered: a cover of 950 is 900 (its edge at 800),
-    // and with the lift 100 it is 800 (its edge at 720).
+    let from = whole[1] + (whole[3] - whole[1]) * (620.0 / 800.0);
+    assert_eq!(cover.uv, [whole[0], from, whole[2], whole[3]]);
+    // The painted cover leaves a tenth of the lane above the line: a cover
+    // of 950 or 900 stops at 800, and with the lift 100 at 720.
     for (cover, lift, edge) in [(950, 0, 800.0), (900, 0, 800.0), (950, 100, 720.0)] {
         let mut h = harness(&chart);
         h.view.cover = cover;
@@ -597,11 +598,114 @@ fn the_cover_and_the_lift_shorten_the_visible_span() {
         let r = rects(&h, COVER)[0];
         assert_eq!(r[1] + r[3], edge, "cover {cover}, lift {lift}");
     }
+    // Lift 500 ‰ raises the line 400 to 480; cover 500 ‰ of the 400 left
+    // is 200, within the clamp of 480 − 80 − 80 = 320: the edge is 280 and
+    // a note 300 ms ahead sits halfway down the 200 px span.
+    assert_eq!(centres(&chart, 700, 500, 500), [380.0, 280.0]);
     // Without cover and lift, neither is drawn.
     let mut h = harness(&chart);
     h.frame(700, &[]);
     assert!(rects(&h, COVER).is_empty() && rects(&h, LIFT).is_empty());
     assert_eq!(rects(&h, LINE), [[160.0, 877.0, 544.0, 6.0]]);
+}
+
+/// A harness over `chart` on the simple lanes changed by `set`, its view
+/// set to `cover` and `lift`, at `now` ms.
+fn covered(
+    chart: &Chart,
+    set: impl FnOnce(&mut LanesDef),
+    cover: u16,
+    lift: u16,
+    now: i64,
+) -> Harness {
+    let mut def = simple();
+    set(&mut def);
+    let mut h = Harness::new(lanes_skin(def), chart, &full(0));
+    h.view.cover = cover;
+    h.view.lift = lift;
+    h.frame(now, &[]);
+    h
+}
+
+#[test]
+fn the_cover_is_painted_from_its_anchor() {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    // With its anchor at 90, a cover at 0 ‰ paints nothing, and one at
+    // 10 ‰ paints the 8 px strip [90, 98] under the anchor.
+    let below = |d: &mut LanesDef| d.cover_at = 90;
+    assert!(rects(&covered(&chart, below, 0, 0, 700), COVER).is_empty());
+    assert_eq!(
+        rects(&covered(&chart, below, 10, 0, 700), COVER),
+        [[160.0, 90.0, 544.0, 8.0]]
+    );
+}
+
+#[test]
+fn the_painted_cover_keeps_a_tenth_of_the_lane_above_the_line() {
+    // Top 200, line and bottom 800, the cover anchored at 260: the lane is
+    // 600 and a tenth 60. A cover of 900 ‰ would take 540 but stops 60
+    // above the line: the painted edge is at 740, the scroll's top at 680,
+    // a 120 px span.
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .tap(lane(3), TimeUs(1_300 * MS))
+        .build()
+        .unwrap();
+    let anchors = |d: &mut LanesDef| {
+        (d.top, d.line, d.bottom, d.cover_at, d.lift_at) = (200, 800, 800, 260, 800);
+    };
+    let h = covered(&chart, anchors, 900, 0, 700);
+    let r = rects(&h, COVER)[0];
+    assert_eq!(r[1] + r[3], 740.0);
+    let centre = |h: &Harness| -> Vec<f32> {
+        in_lane(h, NOTE, lane(3))
+            .iter()
+            .map(|r| r[1] + r[3] / 2.0)
+            .collect()
+    };
+    // 300 ms ahead is halfway down the span: 680 + 60 (the note on the
+    // line is cut at the bottom).
+    let h = covered(&chart, anchors, 900, 0, 1_000);
+    assert_eq!(centre(&h)[1..], [740.0]);
+    // A lift of 900 ‰ (540) stops at 800 − 260 − 60 = 480: the line at
+    // 320, and the cover left no room at all.
+    let h = covered(&chart, anchors, 900, 900, 700);
+    assert_eq!(rects(&h, LINE), [[160.0, 317.0, 544.0, 6.0]]);
+    assert!(rects(&h, COVER).is_empty());
+    assert_eq!(rects(&h, LIFT), [[160.0, 320.0, 544.0, 480.0]]);
+}
+
+#[test]
+fn the_lift_cover_hangs_from_its_anchor() {
+    // Anchored at the bottom (960), a lift of 100 ‰ (80) paints from 880.
+    let chart = ChartBuilder::new(BPM).build().unwrap();
+    let h = covered(&chart, |d| d.lift_at = 960, 0, 100, 700);
+    assert_eq!(rects(&h, LIFT), [[160.0, 880.0, 544.0, 80.0]]);
+    assert_eq!(rects(&h, LINE), [[160.0, 797.0, 544.0, 6.0]]);
+}
+
+#[test]
+fn a_mine_leaves_at_its_time_hit_or_not() {
+    // A mine at 1 s: drawn 1 ms before it, gone 1 ms after it although
+    // nobody hit it.
+    let chart = ChartBuilder::new(BPM)
+        .mine(lane(5), TimeUs(1_000 * MS), 10)
+        .mine(lane(6), TimeUs(1_300 * MS), 10)
+        .build()
+        .unwrap();
+    let mut h = harness(&chart);
+    h.frame(999, &[]);
+    assert_eq!(in_lane(&h, MINE, lane(5)).len(), 1);
+    h.frame(1_001, &[]);
+    assert!(in_lane(&h, MINE, lane(5)).is_empty());
+    // A mine hit early is gone at once.
+    h.frame(1_002, &[]);
+    assert_eq!(in_lane(&h, MINE, lane(6)).len(), 1);
+    h.frame(1_010, &[event(1_005 * MS, play_support::mine(6, 0))]);
+    assert!(in_lane(&h, MINE, lane(6)).is_empty());
 }
 
 /// A tap on every lane at 1 s.
@@ -1121,10 +1225,29 @@ fn places_and_lanes_are_checked_at_load() {
     }
     let mut edge = simple();
     (edge.top, edge.line, edge.bottom) = (-MAX_COORD, 880, 880);
+    (edge.cover_at, edge.lift_at) = (-MAX_COORD, 880);
     assert!(Skin::new(def_with(vec![lanes_element()], Some(edge))).is_ok());
     let mut bad = simple();
     bad.mine_h = 0;
     assert_eq!(lanes_err(bad), LanesError::Heights);
+    // The cover's anchor from the top to a tenth of the lane above the
+    // line (800 here), the lift's from the line to the bottom.
+    for (cover_at, lift_at, ok) in [
+        (80, 880, true),
+        (800, 960, true),
+        (79, 880, false),
+        (801, 880, false),
+        (80, 879, false),
+        (80, 961, false),
+    ] {
+        let mut def = simple();
+        (def.cover_at, def.lift_at) = (cover_at, lift_at);
+        match Skin::new(def_with(vec![lanes_element()], Some(def))) {
+            Ok(_) => assert!(ok, "{cover_at} {lift_at}"),
+            Err(LoadError::Lanes(LanesError::Anchors)) => assert!(!ok, "{cover_at} {lift_at}"),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
     // Authored on the right: the scratch is left of a key.
     let mut bad = simple();
     bad.scratch = Side::Right;

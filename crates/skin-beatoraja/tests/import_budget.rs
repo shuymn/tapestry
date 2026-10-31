@@ -375,3 +375,158 @@ fn grids_past_the_frames_are_the_limit() {
     );
     limit(load(&past, |_| {}), ImportLimit::Frames);
 }
+
+/// Image `deco` destinations of `n` keys in all, 256 to an element.
+fn filler(n: usize) -> Vec<String> {
+    let track = |k: usize| join((0..k).map(|t| format!(r#"{{"time": {t}, "w": 1, "h": 1}}"#)));
+    let mut v: Vec<String> = (0..n / 256)
+        .map(|_| format!(r#"{{"id": "deco", "loop": 255, "dst": [{}]}}"#, track(256)))
+        .collect();
+    if !n.is_multiple_of(256) {
+        v.push(format!(
+            r#"{{"id": "deco", "loop": {}, "dst": [{}]}}"#,
+            n % 256 - 1,
+            track(n % 256)
+        ));
+    }
+    v
+}
+
+/// The lanes' parts with `objects` and `dsts`.
+fn play(objects: &str, dsts: &[String]) -> Loaded {
+    let dsts: Vec<&str> = dsts.iter().map(String::as_str).collect();
+    load(&common::lanes::body("", objects, &dsts), |_| {})
+}
+
+#[test]
+fn the_lanes_charge_the_keys_they_emit() {
+    // One key at 500, hidden after it: the lanes emit keys at 0 and 500.
+    let notes = |t: i32| {
+        format!(
+            r#"{{"id": "notes", "timer": 41, "loop": -1, "dst": [{{"time": {t}, "w": 0, "h": 0}}]}}"#
+        )
+    };
+    let with = |t: i32| {
+        let mut dsts = filler(MAX_SKIN_KEYS - 1);
+        dsts.push(notes(t));
+        play(&common::lanes::note(""), &dsts)
+    };
+    limit(with(500), ImportLimit::Keys);
+    // At 0 they emit the one key.
+    assert_eq!(with(0).report().usage.keys, as_u32(MAX_SKIN_KEYS));
+}
+
+/// A judge of one grade of `keys` keys and `op` conditions, drawn after
+/// `filler` keys.
+fn judge_skin(filler_keys: usize, keys: usize, op: &str) -> Loaded {
+    let track = join((0..keys).map(|t| format!(r#"{{"time": {t}, "w": 8, "h": 8}}"#)));
+    let objects = format!(
+        r#""value": [], "judge": [{{"id": "j", "index": 0, "numbers": [],
+            "images": [{{"id": "g0", "loop": 0, "op": [{op}], "dst": [{track}]}}]}}]"#
+    );
+    let mut dsts = filler(filler_keys);
+    dsts.push(r#"{"id": "j", "dst": [{"w": 0, "h": 0}]}"#.to_owned());
+    play(&objects, &dsts)
+}
+
+#[test]
+fn a_key_overflow_wins_over_a_malformed_key() {
+    // Two keys, the second unreadable: alone a type error; past the
+    // keys their charge comes first, for an image and for the lanes.
+    let keys = r#"{"time": 0, "w": 1, "h": 1}, {"time": [], "w": 1, "h": 1}"#;
+    let deco = format!(r#"{{"id": "deco", "dst": [{keys}]}}"#);
+    let notes = format!(r#"{{"id": "notes", "dst": [{keys}]}}"#);
+    for last in [&deco, &notes] {
+        let alone = play(&common::lanes::note(""), std::slice::from_ref(last));
+        assert!(matches!(alone.err(), ImportError::Type { .. }), "{last}");
+        let mut dsts = filler(MAX_SKIN_KEYS - 1);
+        dsts.push(last.clone());
+        limit(play(&common::lanes::note(""), &dsts), ImportLimit::Keys);
+    }
+}
+
+#[test]
+fn offset_four_images_charge_their_keys() {
+    // An image listing offset 4 clear of the lanes is dropped, its key
+    // charged; SUDDEN+ charges its key once.
+    let deco = r#"{"id": "deco", "offset": 4, "dst": [{"x": 600, "w": 10, "h": 10}]}"#;
+    for last in [deco.to_owned(), common::lanes::cover("")] {
+        let with = |n: usize| {
+            let mut dsts = filler(n);
+            dsts.push(common::lanes::NOTES.to_owned());
+            dsts.push(last.clone());
+            play(&common::lanes::note(""), &dsts)
+        };
+        let l = with(MAX_SKIN_KEYS - 2);
+        assert_eq!(l.report().usage.keys, as_u32(MAX_SKIN_KEYS), "{last}");
+        limit(with(MAX_SKIN_KEYS - 1), ImportLimit::Keys);
+    }
+}
+
+#[test]
+fn judge_parts_charge_their_keys() {
+    // The outer track emits one key, the grade its 200.
+    let l = judge_skin(MAX_SKIN_KEYS - 201, 200, "");
+    assert_eq!(l.report().usage.keys, as_u32(MAX_SKIN_KEYS));
+    limit(judge_skin(MAX_SKIN_KEYS - 200, 200, ""), ImportLimit::Keys);
+}
+
+#[test]
+fn judge_parts_charge_their_ops() {
+    let cost = judge_skin(0, 1, "240").report().usage.ops as usize;
+    assert_eq!(cost, 7);
+    // Long condition lists, then numbers of 1 op each, fill the rest.
+    let big_ops = join((230..=240).chain(-240..=-230).map(|i| i.to_string()));
+    let big_dst = format!(r#"{{"id": "deco", "op": [{big_ops}], "dst": [{KEY}]}}"#);
+    let big = play("", std::slice::from_ref(&big_dst)).report().usage.ops as usize;
+    let skin = |extra: usize| {
+        let target = MAX_SKIN_OPS - cost;
+        let n = target / big;
+        let ones = target - n * big + extra;
+        let value =
+            r#"{"id": "v", "src": "a", "w": 60, "h": 1, "divx": 10, "digit": 1, "ref": 110}"#;
+        let mut dsts = vec![big_dst.clone(); n];
+        dsts.extend((0..ones).map(|_| format!(r#"{{"id": "v", "dst": [{KEY}]}}"#)));
+        dsts.push(r#"{"id": "j", "dst": [{"w": 0, "h": 0}]}"#.to_owned());
+        let objects = format!(
+            r#""value": [{value}], "judge": [{{"id": "j", "index": 0,
+                "numbers": [{{"id": "none", "dst": []}}],
+                "images": [{{"id": "g0", "op": [240], "dst": [{{"w": 8, "h": 8}}]}}]}}]"#
+        );
+        play(&objects, &dsts)
+    };
+    assert_eq!(skin(0).report().usage.ops, as_u32(MAX_SKIN_OPS));
+    limit(skin(1), ImportLimit::Ops);
+}
+
+/// Sixteen draws of a 1,000-part flickering gauge (1,001 quads each),
+/// 122 judges of a grade and a 2-digit combo (3 each), and a last judge
+/// whose combo has `last` digits.
+fn quads_play(last: u32) -> Loaded {
+    let judges = join((0..123).map(|i| {
+        let v = if i < 122 { "v2" } else { "vl" };
+        format!(
+            r#"{{"id": "j{i}", "index": 0, "numbers": [{{"id": "{v}", "dst": [{{"x": 10, "y": 0, "w": 10, "h": 8}}]}}],
+                "images": [{{"id": "g0", "dst": [{{"w": 8, "h": 8}}]}}]}}"#
+        )
+    }));
+    let objects = format!(
+        r#""value": [{{"id": "v2", "src": "a", "w": 60, "h": 1, "divx": 10, "digit": 2}},
+                     {{"id": "vl", "src": "a", "w": 60, "h": 1, "divx": 10, "digit": {last}}}],
+           "gauge": {{"id": "gg", "nodes": ["g0", "g1", "g2", "g3"], "parts": 1000,
+                      "type": 3, "cycle": 100}},
+           "judge": [{judges}]"#
+    );
+    let mut dsts: Vec<String> = (0..16)
+        .map(|_| r#"{"id": "gg", "dst": [{"w": 1000, "h": 8}]}"#.to_owned())
+        .collect();
+    dsts.extend((0..123).map(|i| format!(r#"{{"id": "j{i}", "dst": [{{"w": 0, "h": 0}}]}}"#)));
+    play(&objects, &dsts)
+}
+
+#[test]
+fn judges_and_gauges_charge_their_quads() {
+    let l = quads_play(1);
+    assert_eq!(l.report().usage.widget_quads, MAX_WIDGET_QUADS);
+    limit(quads_play(2), ImportLimit::WidgetQuads);
+}

@@ -25,7 +25,7 @@ pub enum Severity {
     /// An element the source draws was left out.
     Dropped,
     /// The element is kept and drawn differently from the source, by an
-    /// owner decision (D1–D8).
+    /// owner decision (D1–D11).
     Deviation,
     /// Something the source does not draw either, or a field with no
     /// effect, was left out.
@@ -122,6 +122,45 @@ pub enum DeviationId {
     D6,
     D7,
     D8,
+    /// A lane approximation (owner decision 12).
+    D9(LaneApprox),
+    /// The gauge motion's phase, random sequence and flicker curve.
+    D10,
+    /// HIDDEN+ is never drawn (owner decision 15).
+    D11,
+}
+
+/// How the lanes, SUDDEN+ and LIFT are drawn differently from the source
+/// (owner decision 12, items a–l).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneApprox {
+    /// a: notes and long-note bodies stop at the top of the lanes.
+    TopCrop,
+    /// b: an unhit tap keeps falling below the judgment line until it is
+    /// judged a miss or leaves the lanes.
+    LateTaps,
+    /// c: a tap hit early disappears at once.
+    EarlyTaps,
+    /// d: a hit mine disappears when hit.
+    Mines,
+    /// e: `dst2` is ignored.
+    Dst2,
+    /// f: `expansionrate` is ignored.
+    Expansion,
+    /// g: a long note's end cap is drawn.
+    LnTail,
+    /// h: a long note's body runs between the caps' centres.
+    LnBody,
+    /// i: the part of SUDDEN+ above the lanes is never drawn.
+    CoverAbove,
+    /// j: bar lines are drawn across the lanes at note centres, white and
+    /// opaque, until they leave the lanes' bottom.
+    BarLine,
+    /// k: what the skin draws between the notes and SUDDEN+ or LIFT is
+    /// drawn above them.
+    CoverOrder,
+    /// l: the LIFT image is stretched over the covered area.
+    LiftStretch,
 }
 
 /// What a note is about.
@@ -157,10 +196,6 @@ pub enum NoteKind {
     /// A file that is missing or failed to load, or a choice with no
     /// candidate.
     MissingAsset,
-    /// A play part imported by a later stage.
-    NotYet {
-        object: Object,
-    },
     /// A field with no effect, or a value the source does not draw.
     Ignored {
         field: &'static str,
@@ -188,7 +223,6 @@ impl fmt::Display for NoteKind {
             Self::Timer(why) => write!(f, "an unsupported timer ({why:?})"),
             Self::Deviation(d) => write!(f, "deviation {d:?}"),
             Self::MissingAsset => f.write_str("a missing or unreadable file"),
-            Self::NotYet { object } => write!(f, "a {object:?} is not imported yet"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
         }
     }

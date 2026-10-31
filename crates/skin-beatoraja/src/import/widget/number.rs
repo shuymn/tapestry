@@ -3,7 +3,7 @@
 
 use skin_model::{Align, DigitsDef, GlyphSet, MAX_COORD, NumberDef, Pad, Source, Ty};
 
-use super::super::geom::{HEIGHT, Q};
+use super::super::geom::{HEIGHT, Q, Rect};
 use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IntProp, Value};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity};
@@ -13,6 +13,54 @@ use crate::error::ImportError;
 
 /// The most cells the model draws.
 const CELLS: i32 = skin_model::MAX_CELLS as i32;
+
+/// The grid of the first `keep` of a `div` grid's `frames` frames, when
+/// they form whole rows (`JsonSkinObjectLoader.java:104-170`); `None`
+/// otherwise.
+pub(super) fn glyphs(keep: u32, frames: u32, [dx, dy]: [u32; 2]) -> Option<[u32; 2]> {
+    if keep == frames {
+        Some([dx, dy])
+    } else if dy == 1 {
+        Some([keep, 1])
+    } else if keep.is_multiple_of(dx) {
+        Some([dx, keep / dx])
+    } else {
+        None
+    }
+}
+
+/// The cells of a `digit`-digit strip and the blank cells past the
+/// model's most (`SkinNumber.java:189-191`); `None` for more than the
+/// model's cells without blank padding.
+pub(super) fn cells(digit: i32, pad: Pad) -> Option<(i32, i32)> {
+    if digit <= CELLS {
+        Some((digit, 0))
+    } else if pad == Pad::Blank {
+        Some((CELLS, digit - CELLS))
+    } else {
+        None
+    }
+}
+
+/// The model's space between cells for keys of `(x, rect, pitch)`: the
+/// rounded pitch less the rounded width while every key has the same
+/// width and pitch, else the rounded scaled `space` `sr`; `None` when it
+/// does not round or lies outside the model's coordinates.
+pub(super) fn cell_space(keys: &[(Q, Rect, Q)], sr: Q) -> Option<i128> {
+    let same = keys
+        .windows(2)
+        .all(|w| matches!(w, [(_, a, pa), (_, b, pb)] if a.w == b.w && pa == pb));
+    let space = match (same, keys.first()) {
+        (true, Some((_, r0, p0))) => p0
+            .round()
+            .zip(r0.w.round())
+            .and_then(|(p, w)| p.checked_sub(w)),
+        _ => sr.round(),
+    }?;
+    (-i128::from(MAX_COORD)..=i128::from(MAX_COORD))
+        .contains(&space)
+        .then_some(space)
+}
 
 impl Cx<'_> {
     /// The effective integer property (`JsonSkinObjectLoader.java:
@@ -30,7 +78,7 @@ impl Cx<'_> {
     }
 
     /// Whether a value's `offset` array moves any digit.
-    fn digit_offsets(&mut self, field: Option<u32>) -> Result<bool, ImportError> {
+    pub(super) fn digit_offsets(&mut self, field: Option<u32>) -> Result<bool, ImportError> {
         let Some(list) = field else {
             return Ok(false);
         };
@@ -138,23 +186,11 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "src" });
             return Ok(());
         }
-        let keep = sets * d;
-        let [dx, dy] = s.div;
-        let grid = if keep == frames {
-            s.div
-        } else if dy == 1 {
-            [keep, 1]
-        } else if keep.is_multiple_of(dx) {
-            [dx, keep / dx]
-        } else {
+        let Some(grid) = glyphs(sets * d, frames, s.div) else {
             self.drop_el(role, at, NoteKind::UnsupportedField { field: "divx" })?;
             return Ok(());
         };
-        let (cells, extra) = if digit <= CELLS {
-            (digit, 0)
-        } else if pad == Pad::Blank {
-            (CELLS, digit - CELLS)
-        } else {
+        let Some((cells, extra)) = cells(digit, pad) else {
             self.drop_el(role, at, NoteKind::UnsupportedField { field: "digit" })?;
             return Ok(());
         };
@@ -199,20 +235,7 @@ impl Cx<'_> {
             let x = rect.x.add(shift).ok_or_else(|| range(self))?;
             keys.push((x, rect, p));
         }
-        let same = keys
-            .windows(2)
-            .all(|w| matches!(w, [(_, a, pa), (_, b, pb)] if a.w == b.w && pa == pb));
-        let space = match (same, keys.first()) {
-            (true, Some((_, r0, p0))) => p0
-                .round()
-                .zip(r0.w.round())
-                .and_then(|(p, w)| p.checked_sub(w)),
-            _ => sr.round(),
-        }
-        .ok_or_else(|| range(self))?;
-        if !(-i128::from(MAX_COORD)..=i128::from(MAX_COORD)).contains(&space) {
-            return Err(range(self));
-        }
+        let space = cell_space(&keys, sr).ok_or_else(|| range(self))?;
         let mut rects = Vec::with_capacity(keys.len());
         for (x, rect, p) in &keys {
             let w = rect.w.round().ok_or_else(|| range(self))?;

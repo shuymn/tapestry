@@ -25,13 +25,14 @@ pub(crate) struct Q {
     d: i128,
 }
 
-fn gcd(mut a: i128, mut b: i128) -> i128 {
-    a = a.abs();
-    b = b.abs();
+/// The greatest common divisor of the magnitudes; `None` when it is
+/// `2^127` (both operands `i128::MIN` or zero).
+fn gcd(a: i128, b: i128) -> Option<i128> {
+    let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
     while b != 0 {
         (a, b) = (b, a % b);
     }
-    a
+    i128::try_from(a).ok()
 }
 
 impl Q {
@@ -46,7 +47,7 @@ impl Q {
         if d == 0 {
             return None;
         }
-        let g = gcd(n, d);
+        let g = gcd(n, d)?;
         let (mut n, mut d) = (n.checked_div(g)?, d.checked_div(g)?);
         if d < 0 {
             n = n.checked_neg()?;
@@ -56,7 +57,7 @@ impl Q {
     }
 
     pub(crate) fn add(self, o: Self) -> Option<Self> {
-        let g = gcd(self.d, o.d);
+        let g = gcd(self.d, o.d)?;
         let l = self.d.checked_div(g)?.checked_mul(o.d)?;
         let a = self.n.checked_mul(l.checked_div(self.d)?)?;
         let b = o.n.checked_mul(l.checked_div(o.d)?)?;
@@ -71,10 +72,10 @@ impl Q {
     }
 
     pub(crate) fn mul(self, o: Self) -> Option<Self> {
-        let g1 = gcd(self.n, o.d).max(1);
-        let g2 = gcd(o.n, self.d).max(1);
-        let n = (self.n / g1).checked_mul(o.n / g2)?;
-        let d = (self.d / g2).checked_mul(o.d / g1)?;
+        let g1 = gcd(self.n, o.d)?.max(1);
+        let g2 = gcd(o.n, self.d)?.max(1);
+        let n = self.n.checked_div(g1)?.checked_mul(o.n.checked_div(g2)?)?;
+        let d = self.d.checked_div(g2)?.checked_mul(o.d.checked_div(g1)?)?;
         Self::new(n, d)
     }
 
@@ -161,6 +162,16 @@ impl Rect {
         })
     }
 
+    /// With the offsets of a relative object applied: only its size
+    /// (`SkinObject.java:403-411`).
+    pub(crate) fn offset_relative(self, o: Offset) -> Option<Self> {
+        Some(Self {
+            w: self.w.add(Q::int(o.w))?,
+            h: self.h.add(Q::int(o.h))?,
+            ..self
+        })
+    }
+
     /// The edges reflected to y down and rounded half up: left, top,
     /// right, bottom.
     pub(crate) fn edges(self) -> Option<[i128; 4]> {
@@ -221,6 +232,19 @@ mod tests {
         assert_eq!(q(1, 2).div(Q::ZERO), None);
         assert_eq!(Q::int(i128::MAX).add(Q::int(1)), None);
         assert!(q(1, 3) < q(1, 2));
+    }
+
+    #[test]
+    fn the_negative_boundary_is_checked() {
+        // −2^127 has no positive counterpart.
+        assert_eq!(Q::new(i128::MIN, 1), Some(Q::int(i128::MIN)));
+        assert_eq!(Q::new(i128::MIN, 2), Some(q(i128::MIN / 2, 1)));
+        assert_eq!(Q::new(i128::MIN, -1), None);
+        assert_eq!(Q::new(i128::MIN, i128::MIN), None);
+        assert_eq!(Q::int(i128::MIN).mul(q(1, 3)), Q::new(i128::MIN, 3));
+        assert_eq!(Q::int(i128::MIN).mul(Q::int(-1)), None);
+        assert_eq!(Q::int(i128::MIN).add(q(1, 2)), None);
+        assert_eq!(Q::int(i128::MIN).round(), None);
     }
 
     #[test]

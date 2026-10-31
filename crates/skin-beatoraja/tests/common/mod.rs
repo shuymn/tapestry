@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod lanes;
 pub mod play;
 
 use std::fs;

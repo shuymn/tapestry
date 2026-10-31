@@ -13,7 +13,8 @@
 //! offsets. [`read_header`] does all three with no option enabled, as the
 //! source's own header pass does.
 //!
-//! [`import`] maps a play skin's images, numbers and text onto a
+//! [`import`] maps a play skin's images, numbers, text and play objects (the
+//! lanes, SUDDEN+, LIFT, the judge and the gauge) onto a
 //! [`skin_model::Skin`] for a [`Config`] (the selected options, file
 //! choices and offsets), and returns it with a [`Report`]: the definition
 //! files read, the file each choice took, a located note for every element
@@ -47,7 +48,8 @@ mod tree;
 pub use error::{ImportError, InputLimit, Loc, Syntax};
 pub use header::{FileSpec, Header, OffsetSpec, OptionItem, OptionSpec, SIZES, read_header};
 pub use import::{
-    Config, CriticalPart, DeviationId, FileChoice, ImportLimit, Imported, Note, NoteKind, NoteLoc,
-    Object, OffsetValue, PropertyKind, Report, Rule, Severity, TimerWhy, TrackWhy, Usage, import,
+    Config, CriticalPart, DeviationId, FileChoice, ImportLimit, Imported, LaneApprox, Note,
+    NoteKind, NoteLoc, Object, OffsetValue, PropertyKind, Report, Rule, Severity, TimerWhy,
+    TrackWhy, Usage, import,
 };
 pub use resolve::{Definition, Resolved, resolve};

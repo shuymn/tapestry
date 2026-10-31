@@ -35,7 +35,7 @@ use skin_model::{
 
 /// The recorded bound: the largest measured peak over the fixtures plus
 /// 25 %.
-const BOUND: i64 = 153_276_555;
+const BOUND: i64 = 153_276_380;
 
 struct Counting;
 
@@ -280,6 +280,171 @@ fn check_f2(_: &Header, i: Imported) {
     assert_eq!(i.skin.quad_capacity(), MAX_WIDGET_QUADS);
 }
 
+/// F5's judges: 5,127 with a 2-digit combo and one with a 1-digit combo.
+const JUDGES: usize = 5_128;
+/// Judges whose grade has 11 keys; the rest have 10.
+const ELEVEN_KEYS: usize = 3_995;
+/// Judges whose grade has the 7-op predicate; the rest the 17-op one.
+const SEVEN_OPS: usize = 2_164;
+
+/// F5: the play objects at the key, op and widget quad caps. Lanes of 48
+/// distinct part images with a bar, SUDDEN+, LIFT and HIDDEN+; a 36-node
+/// gauge of 1,000 flickering parts (1,001 quads); 5,128 judges, each one
+/// grade of 10 or 11 timed keys under a 7- or 17-op predicate and a combo
+/// of 2 digits (3 quads), one of 1 digit (2 quads).
+fn f5(root: &Path) {
+    png(root, "a.png", 256, 256);
+    let cell = |id: &str, i: usize, w: usize, h: usize| {
+        format!(
+            r#"{{"id": "{id}", "src": "a", "x": {}, "y": {}, "w": {w}, "h": {h}}}"#,
+            8 * (i % 32),
+            20 * (i / 32)
+        )
+    };
+    // Parts p{u}_{k}: note, start, end, body, active body, mine.
+    let mut images: Vec<String> = (0..48)
+        .map(|i| cell(&format!("p{}_{}", i / 6, i % 6), i, 8, 20))
+        .collect();
+    images.push(cell("bar", 48, 8, 2));
+    images.push(cell("cv", 49, 8, 8));
+    images.push(cell("g", 50, 8, 8));
+    images.extend((0..36).map(|n| cell(&format!("n{n}"), 51 + n, 8, 8)));
+    let list = |k: usize| join((0..8).map(|u| format!("\"p{u}_{k}\"")));
+    let note = format!(
+        r#"{{"id": "notes", "note": [{}], "lnstart": [{}], "lnend": [{}], "lnbody": [{}],
+            "lnactive": [{}], "mine": [{}], "hcnstart": [{}], "hcnend": [{}], "hcnbody": [{}],
+            "hcnactive": [{}], "hcndamage": [{}], "hcnreactive": [{}], "dst": [{}],
+            "group": [{{"id": "bar", "dst": [{{"x": 0, "y": 0, "w": 8, "h": 2}}]}}]}}"#,
+        list(0),
+        list(1),
+        list(2),
+        list(3),
+        list(4),
+        list(5),
+        list(1),
+        list(2),
+        list(3),
+        list(4),
+        list(3),
+        list(4),
+        common::lanes::lane_rects(200, 600)
+    );
+    let judges = join((0..JUDGES).map(|i| {
+        let keys = if i < ELEVEN_KEYS { 11 } else { 10 };
+        let op = if i < SEVEN_OPS { "240" } else { "-230, -231" };
+        let track = join((0..keys).map(|t| {
+            format!(
+                r#"{{"time": {t}, "x": {}, "y": 500, "w": 80, "h": 20}}"#,
+                100 + t
+            )
+        }));
+        let value = if i + 1 < JUDGES { "v" } else { "v1" };
+        format!(
+            r#"{{"id": "j{i}", "index": 0,
+                "images": [{{"id": "g", "timer": 46, "op": [{op}], "loop": 0, "dst": [{track}]}}],
+                "numbers": [{{"id": "{value}", "dst": [{{"x": 10, "y": 0, "w": 6, "h": 6}}]}}]}}"#
+        )
+    }));
+    let nodes = join((0..36).map(|n| format!("\"n{n}\"")));
+    let dsts = join(
+        [
+            r#"{"id": "notes", "dst": [{"w": 0, "h": 0}]}"#.to_owned(),
+            r#"{"id": "cv", "offset": 4, "dst": [{"x": 20, "y": 800, "w": 430, "h": 600}]}"#
+                .to_owned(),
+            r#"{"id": "lc", "dst": [{"x": 20, "y": 0, "w": 430, "h": 200}]}"#.to_owned(),
+            r#"{"id": "hid", "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#.to_owned(),
+            r#"{"id": "gg", "dst": [{"x": 600, "y": 100, "w": 1000, "h": 10}]}"#.to_owned(),
+        ]
+        .into_iter()
+        .chain((0..JUDGES).map(|i| format!(r#"{{"id": "j{i}", "dst": [{{"w": 0, "h": 0}}]}}"#))),
+    );
+    write(
+        root,
+        "s.json",
+        common::hd(&format!(
+            r#""source": [{{"id": "a", "path": "a.png"}}], "image": [{}],
+               "value": [
+                 {{"id": "v", "src": "a", "x": 0, "y": 200, "w": 60, "h": 6, "divx": 10, "digit": 2}},
+                 {{"id": "v1", "src": "a", "x": 0, "y": 200, "w": 60, "h": 6, "divx": 10, "digit": 1}}],
+               "note": {note},
+               "liftCover": [{{"id": "lc", "src": "a", "x": 0, "y": 220, "w": 8, "h": 8,
+                               "disapearLine": 200}}],
+               "hiddenCover": [{{"id": "hid", "src": "a"}}],
+               "gauge": {{"id": "gg", "nodes": [{nodes}], "parts": 1000, "type": 3, "cycle": 100}},
+               "judge": [{judges}],
+               "destination": [{dsts}]"#,
+            images.join(", ")
+        ))
+        .as_bytes(),
+    );
+}
+
+fn check_f5(_: &Header, i: Imported) {
+    let u = i.report.usage;
+    assert_eq!(u.keys, as_u32(MAX_SKIN_KEYS));
+    assert_eq!(u.ops, as_u32(MAX_SKIN_OPS));
+    assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
+    assert_eq!(u.elements, as_u32(JUDGES) + 5);
+    assert!(i.scratch.is_some());
+    // No image element: the widgets' worst cases and the lanes' budget.
+    assert_eq!(
+        i.skin.quad_capacity(),
+        MAX_WIDGET_QUADS + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
+    );
+    // The snapshot: a PERFECT with combo 12, the gauge full, SUDDEN+ at
+    // 300 ‰ and LIFT at 100 ‰, no note on screen.
+    let chart = bms_model::ChartBuilder::new(150_000)
+        .tap(
+            bms_model::Lane::new(1).unwrap(),
+            bms_model::TimeUs(100_000_000),
+        )
+        .build()
+        .unwrap();
+    let mut d = Drawn::over(i.skin, &chart);
+    d.tally = common::play::tally(2, 12);
+    d.gauges[0].value = GaugeValue::FULL;
+    d.view.cover = 300;
+    d.view.lift = 100;
+    let full = eval::JudgeEvent {
+        seq: 0,
+        time: bms_model::TimeUs(900_000),
+        origin: None,
+        kind: eval::JudgeEventKind::Gauge {
+            gauge: 0,
+            value: GaugeValue::FULL,
+            reference: GaugeValue::FULL,
+        },
+    };
+    d.frame(900, &[full]);
+    let q = d.frame(1_000, &[judged(1_000, Judgment::Perfect, 12)]);
+    // Each emission by its drawn size: every judge's 80×20 grade, the
+    // 6×6 cells of "1" and "2" for each but the last, whose one-digit
+    // combo draws "2" alone; SUDDEN+ and LIFT over the 430 px lanes; the
+    // gauge's 1,000 one-pixel segments, and its tip while the flicker
+    // shows it.
+    let mut by_size = std::collections::BTreeMap::<[i32; 2], usize>::new();
+    for quad in &q {
+        let [_, _, w, h] = common::play::round(quad.rect);
+        *by_size.entry([w, h]).or_default() += 1;
+    }
+    let count = |size: [i32; 2]| by_size.get(&size).copied().unwrap_or(0);
+    assert_eq!(count([80, 20]), JUDGES, "{by_size:?}");
+    assert_eq!(count([6, 6]), 2 * (JUDGES - 1) + 1, "{by_size:?}");
+    let covers: usize = by_size
+        .iter()
+        .filter(|(s, _)| s[0] == 430)
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(covers, 2, "{by_size:?}");
+    let gauge: usize = by_size
+        .iter()
+        .filter(|(s, _)| s[1] == 10)
+        .map(|(_, n)| n)
+        .sum();
+    assert!((1_000..=1_001).contains(&gauge), "{by_size:?}");
+    assert_eq!(q.len(), JUDGES + 2 * JUDGES - 1 + 2 + gauge, "{by_size:?}");
+}
+
 /// A relative name of `len` bytes ending in `tail`, in folders of at most
 /// 200-byte names.
 fn long_name(len: usize, tail: &str) -> String {
@@ -455,6 +620,12 @@ fn import_memory_is_measured() {
         size_of::<Note>(),
         size_of::<Report>(),
     );
+    println!(
+        "sizes: JudgeDef {}, GaugeDef {}, LanesDef {}",
+        size_of::<skin_model::JudgeDef>(),
+        size_of::<skin_model::GaugeDef>(),
+        size_of::<skin_model::LanesDef>(),
+    );
     let mut peaks = Vec::new();
     let d = tempfile::tempdir().unwrap();
     f1(d.path());
@@ -473,6 +644,17 @@ fn import_memory_is_measured() {
     f4(d.path(), 0, 0);
     f4_reaches_its_input_caps(d.path());
     peaks.push(("F4 input", measure(d.path(), check_f4)));
+    drop(d);
+    assert_eq!(ops_of("240"), 7);
+    assert_eq!(ops_of("-230, -231"), 17);
+    assert_eq!(SEVEN_OPS * 7 + (JUDGES - SEVEN_OPS) * 17, MAX_SKIN_OPS);
+    assert_eq!(
+        5 + 2 * JUDGES + ELEVEN_KEYS * 11 + (JUDGES - ELEVEN_KEYS) * 10,
+        MAX_SKIN_KEYS
+    );
+    let d = tempfile::tempdir().unwrap();
+    f5(d.path());
+    peaks.push(("F5 play objects", measure(d.path(), check_f5)));
     drop(d);
     for (name, p) in &peaks {
         println!("{name}: peak {p} B");

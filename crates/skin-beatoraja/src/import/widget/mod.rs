@@ -1,6 +1,9 @@
-//! Elements by object kind: images and image sets here, numbers and text
-//! in their modules.
+//! Elements by object kind: images and image sets here, numbers, text
+//! and the play objects in their modules.
 
+pub(super) mod gauge;
+pub(super) mod judge;
+pub(super) mod lanes;
 pub(super) mod number;
 pub(super) mod text;
 
@@ -34,6 +37,37 @@ impl Cx<'_> {
             .ok()
             .filter(|&n| usize::try_from(n).is_ok_and(|n| n <= MAX_SKIN_FRAMES))
             .ok_or_else(|| self.limit(at, ImportLimit::Frames))
+    }
+
+    /// The `image` record of id `id`, the first of it: the play objects
+    /// look their parts up in the image table alone
+    /// (`JsonPlaySkinObjectLoader.java:96-103, 230-232`).
+    pub(super) fn image_rec(&mut self, id: &str) -> Result<Option<u32>, ImportError> {
+        if self.images.is_none() {
+            let recs = super::object::records(&self.tables, "image").to_vec();
+            self.images = Some(super::object::index(self.def, &recs, false)?);
+        }
+        Ok(self.images.as_ref().and_then(|m| m.get(id)).copied())
+    }
+
+    /// The `String[]` items of a literal array field, each `null` item
+    /// `None`; empty when absent.
+    pub(super) fn opt_strings(
+        &mut self,
+        field: Option<u32>,
+        name: &'static str,
+    ) -> Result<Vec<Option<String>>, ImportError> {
+        let Some(f) = field else {
+            return Ok(Vec::new());
+        };
+        if self.def.arena.node(f).kind != crate::tree::Kind::Array {
+            return Err(self.def.type_error(f, name, "an array"));
+        }
+        let items: Vec<u32> = self.def.arena.children(f).collect();
+        items
+            .into_iter()
+            .map(|i| self.def.string(i, name))
+            .collect()
     }
 
     /// Reads record `rec`'s source-image fields.
@@ -205,7 +239,14 @@ impl Cx<'_> {
         // A selector group (`len` above 1) is the image object's own; an
         // image set draws the image's frames whatever its `len`
         // (`JsonSkinObjectLoader.java:76-84`).
-        if set.is_none() && self.int_or(len, "len", 0)? > 1 {
+        let group = set.is_none() && self.int_or(len, "len", 0)? > 1;
+        if dst.offsets.contains(&super::OFFSET_LANECOVER) {
+            if group {
+                return self.lane_cover_selector(dst, "len");
+            }
+            return self.lane_cover_image(dst, rec, &s);
+        }
+        if group {
             self.drop_el(
                 Role::Decorative,
                 at,
@@ -257,8 +298,13 @@ impl Cx<'_> {
     pub(super) fn image_set(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let [r, value, images] = self.def.fields(rec, ["ref", "value", "images"]);
-        let selected = self.int_or(r, "ref", 0)? != 0 || self.prop(value, "value")? != Prop::Null;
-        if selected {
+        let by_ref = self.int_or(r, "ref", 0)? != 0;
+        let by_value = self.prop(value, "value")? != Prop::Null;
+        // Listing offset 4, it is classified before the selector drops it.
+        if (by_ref || by_value) && dst.offsets.contains(&super::OFFSET_LANECOVER) {
+            return self.lane_cover_selector(dst, if by_ref { "ref" } else { "value" });
+        }
+        if by_ref || by_value {
             let why = NoteKind::UnsupportedProperty {
                 kind: PropertyKind::Integer,
                 id: None,
@@ -280,11 +326,7 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
             return Ok(());
         };
-        if self.images.is_none() {
-            let recs = super::object::records(&self.tables, "image").to_vec();
-            self.images = Some(super::object::index(self.def, &recs, false)?);
-        }
-        let Some(image) = self.images.as_ref().and_then(|m| m.get(&name)).copied() else {
+        let Some(image) = self.image_rec(&name)? else {
             self.ignored(at, NoteKind::Track(TrackWhy::NeverDrawn));
             return Ok(());
         };

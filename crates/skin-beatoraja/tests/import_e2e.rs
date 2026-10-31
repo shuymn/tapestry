@@ -92,3 +92,69 @@ fn an_imported_skin_draws_through_the_model() {
     let rank = at.iter().find(|q| round(q.rect)[0] == 300).unwrap();
     assert_eq!(round(rank.rect), [300, 1080 - 52, 64, 32]);
 }
+
+/// The play objects together: lanes with SUDDEN+ and LIFT, a judge of
+/// one grade and a 2-digit combo, and a 10-part gauge.
+#[test]
+fn the_play_objects_draw_together() {
+    use bms_model::{ChartBuilder, Lane, TimeUs};
+    use common::lanes::{NOTES, body, cover, lift, lift_object, note};
+    use common::play::MS;
+    use rules::GaugeValue;
+    let objects = format!(
+        r#"{}, {},
+           "value": [{{"id": "two", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 2}}],
+           "judge": [{{"id": "j", "index": 0,
+                      "images": [{{"id": "deco", "dst": [{{"x": 600, "y": 500, "w": 80, "h": 20}}]}}],
+                      "numbers": [{{"id": "two", "dst": [{{"x": 10, "y": 0, "w": 10, "h": 20}}]}}]}}],
+           "gauge": {{"id": "gg", "nodes": ["g0", "g1", "g2", "g3"], "parts": 10}}"#,
+        note(""),
+        lift_object("")
+    );
+    let dsts = [
+        NOTES,
+        &cover(""),
+        &lift(""),
+        r#"{"id": "j", "dst": [{"w": 0, "h": 0}]}"#,
+        r#"{"id": "gg", "dst": [{"x": 600, "y": 100, "w": 100, "h": 10}]}"#,
+    ];
+    let l = common::import_sized([1_920, 1_080], &body("", &objects, &dsts), &[]);
+    let chart = ChartBuilder::new(150_000)
+        .tap(Lane::new(1).unwrap(), TimeUs(1_000 * MS))
+        .long(Lane::new(2).unwrap(), TimeUs(900 * MS), TimeUs(1_300 * MS))
+        .build()
+        .unwrap();
+    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+    d.view.cover = 100;
+    d.view.lift = 100;
+    d.tally = tally(2, 12);
+    d.gauges[0].value = GaugeValue::FULL;
+    let held = eval::JudgeEvent {
+        seq: 0,
+        time: TimeUs(900 * MS),
+        origin: None,
+        kind: eval::JudgeEventKind::LnHeld {
+            lane: Lane::new(2).unwrap(),
+            note: 0,
+            judgment: Judgment::Perfect,
+            deviation: TimeUs(0),
+        },
+    };
+    d.frame(900, &[held]);
+    let r: Vec<[i32; 4]> = d
+        .frame(1_000, &[judged(1_000, Judgment::Perfect, 12)])
+        .iter()
+        .map(|q| round(q.rect))
+        .collect();
+    // The lift raises the line by 60 to 810; the cover takes 54 px.
+    assert!(
+        r.contains(&[150, 800, 50, 20]),
+        "the held head on the line: {r:?}"
+    );
+    assert!(r.contains(&[20, 280, 430, 54]), "SUDDEN+: {r:?}");
+    assert!(r.contains(&[20, 820, 430, 60]), "LIFT: {r:?}");
+    assert!(r.contains(&[600, 560, 80, 20]), "the grade: {r:?}");
+    // Ten gauge segments, the grade, two digits, the held long note's
+    // head, body and tail, the covers; the judged tap is gone.
+    assert_eq!(r.len(), 10 + 1 + 2 + 3 + 2, "{r:?}");
+}

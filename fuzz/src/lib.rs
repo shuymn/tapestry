@@ -19,7 +19,10 @@ use bms_parser::{LoadError, LoadOptions, Loaded};
 use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
-use skin_beatoraja::{Config, Header, ImportError, Imported, SIZES, import, read_header, resolve};
+use skin_beatoraja::{
+    Config, DeviationId, Header, ImportError, Imported, NoteKind, SIZES, Severity, import,
+    read_header, resolve,
+};
 
 /// An empty folder for the chart's sounds. Nothing is written to it, so
 /// every `#WAV` name resolves to no file.
@@ -469,6 +472,24 @@ fn check_usage(i: &Imported) {
     assert!(within(u.frames, MAX_SKIN_FRAMES), "too many frames");
     assert!(within(u.file_attempts, MAX_FILES), "too many file attempts");
     assert!(u.widget_quads <= MAX_WIDGET_QUADS, "too many widget quads");
+    // Lanes reserve their quads beside the elements' and widgets'.
+    if i.scratch.is_some() {
+        let lanes = skin_model::LANE_QUADS + skin_model::LANE_RESERVED;
+        assert!(i.skin.quad_capacity() >= lanes, "lanes without their quads");
+    }
+    // Every lane approximation is one the owner accepted, a deviation;
+    // HIDDEN+ is only ever noted.
+    for n in &i.report.notes {
+        match n.kind {
+            NoteKind::Deviation(DeviationId::D9(_)) => {
+                assert_eq!(n.severity, Severity::Deviation, "a lane approximation");
+            }
+            NoteKind::Deviation(DeviationId::D11) => {
+                assert_eq!(n.severity, Severity::Ignored, "HIDDEN+ drawn");
+            }
+            _ => {}
+        }
+    }
     // An element dropped after its ops were charged keeps none of them.
     assert!(
         i.skin.ops().total() <= usize::try_from(u.ops).unwrap_or(usize::MAX),
