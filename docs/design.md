@@ -867,13 +867,13 @@ Importing a JSON skin (`read_header`, then `import` with the `Header` and `Defin
 | Elements | 16 384 | 104 B |
 | Track keys | 65 536 | 80 B |
 | Program ops and headers | 65 536 and 17 408 | an op and 24 B |
-| Images and their map entries | 16 384 | 48 B and a key |
+| Images, their map entries (a key and its crop) and the uncropped base kept per key | 16 384 | 48 B and a key; a base 48 B, its cell and a key |
 | File requests and cached failures | 4 096 | a path of ≤ 1 024 B and an entry |
 | The sheet's files (a second owned path) | 4 096 | a path of ≤ 1 024 B and a file |
 | Header read of one admitted file | 1 | 1 MiB read and 4 MiB decoding |
 | Frames, cells and renumbering when the sheet finishes | 65 536 each | 4 to 20 B |
 | Widgets, texts and fonts | ≤ 16 384 quads; 64 of 256 B; 16 of 1 024 B | |
-| Judges, gauges and the lanes | 16 384 at most (an element each); one lanes | 1 408 B, 168 B and 320 B |
+| Judges, gauges and the lanes | 16 384 at most (an element each); one lanes | 1 408 B, 168 B and 348 B |
 | Report: notes, definition files, file choices | 4 096; 1 025 of ≤ 1 024 B; 1 024 | 48 B a note |
 
 The chart's display geometry is fixed at load time and bounded by the source: an `i128` position per note head, long-note end and bar line, and a 48-byte scroll segment (an `i64` start, an `i128` anchor and slope, aligned to 16 bytes) per BPM change, STOP start and STOP end.
