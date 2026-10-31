@@ -11,6 +11,9 @@
 //! with every grade and 4-cell combos, and two lines of text (one
 //! squeezed, one spilling), all drawn. The skin helpers are the widget
 //! tests'.
+//!
+//! `skin_model_build_bitmap_text` is `Skin::build` of 64 lines of 256
+//! kerned glyphs in a bitmap font, the widget quad cap.
 
 #[path = "../tests/lanes_support/mod.rs"]
 mod lanes_support;
@@ -27,8 +30,9 @@ use lanes_support::{lanes_skin, simple};
 use play_support::{Harness, MS, full, lane, pct};
 use rules::Judgment;
 use skin_model::{
-    Align, DigitsDef, FontRef, FrameUv, GlyphSet, JudgeSlot, Motion, Overflow, Pad, Place, Source,
-    TextDef, TextImage, TextTable, TextValue, WidgetDefs,
+    Align, ChartText, DigitsDef, Fit, FontRef, FrameUv, GlyphSet, JudgeSlot, MAX_TEXT_BYTES,
+    MAX_TEXT_ELEMENTS, MAX_WIDGET_QUADS, Motion, Overflow, Pad, Place, Root, SheetBuilder, Skin,
+    SkinDef, Source, TextDef, TextImage, TextTable, TextValue, WidgetDefs,
 };
 use widget_support::{
     TEN, combo, digits, element, gauge, harness, judge_all, judge_element, judgment, load, number,
@@ -133,5 +137,72 @@ fn bench_widgets(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_build, bench_widgets);
+/// 64 bitmap texts of 256 kerned glyphs, at the widget quad cap: every
+/// glyph's uv found in the atlas each frame.
+fn bench_bitmap_text(c: &mut Criterion) {
+    let dir = tempfile::tempdir().expect("a font folder");
+    let fnt = "info face=\"b\" size=10 padding=0,0,0,0\n\
+               common lineHeight=12 base=10 scaleW=64 scaleH=16 pages=1\n\
+               page id=0 file=\"b.png\"\nchars count=2\n\
+               char id=65 x=0 y=0 width=7 height=9 xoffset=1 yoffset=1 xadvance=8 page=0\n\
+               char id=66 x=8 y=0 width=7 height=9 xoffset=1 yoffset=1 xadvance=8 page=0\n\
+               kernings count=1\nkerning first=65 second=66 amount=-1\n";
+    std::fs::write(dir.path().join("b.fnt"), fnt).expect("write the font");
+    image::RgbaImage::from_pixel(64, 16, image::Rgba([255; 4]))
+        .save_with_format(dir.path().join("b.png"), image::ImageFormat::Png)
+        .expect("write the page");
+    let mut b = SheetBuilder::new(&Root::new(dir.path()).expect("a root"));
+    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).expect("the font");
+    b.add_bitmap_font(f, &[]).expect("a bitmap font");
+    let text = TextDef {
+        value: TextValue::Literal("AB".repeat(MAX_TEXT_BYTES / 2)),
+        font: FontRef::Bitmap(0),
+        align: Align::Left,
+        overflow: Overflow::Spill,
+    };
+    let elements = (0..MAX_TEXT_ELEMENTS)
+        .map(|i| {
+            let y = i32::try_from(i).expect("64 texts") * 16;
+            element(
+                Source::Text(u32::try_from(i).expect("64 texts")),
+                [0, y, 1_000, 16],
+                Place::SCREEN,
+            )
+        })
+        .collect();
+    let skin = Skin::new(SkinDef {
+        fit: Fit::Adapt,
+        regions: play_support::REGIONS,
+        whens: Vec::new(),
+        sheet: b.finish(),
+        lanes: None,
+        elements,
+        widgets: WidgetDefs {
+            texts: vec![text; MAX_TEXT_ELEMENTS],
+            ..WidgetDefs::default()
+        },
+    })
+    .expect("valid skin");
+    let mut h = harness(skin);
+    let chart = ChartText {
+        title: "",
+        subtitle: "",
+        artist: "",
+        subartist: "",
+        genre: "",
+    };
+    h.skin.attach_bitmap_text(&mut h.play, &chart);
+    h.frame(500, &[]);
+    let quads = usize::try_from(MAX_WIDGET_QUADS).expect("a quad count");
+    assert_eq!(h.batch.quads().len(), quads, "every glyph drawn");
+    assert_eq!(h.batch.dropped(), 0, "the batch has room");
+    c.bench_function("skin_model_build_bitmap_text", |b| {
+        b.iter(|| {
+            h.frame(black_box(500), &[]);
+            black_box(h.batch.quads().len())
+        });
+    });
+}
+
+criterion_group!(benches, bench_build, bench_widgets, bench_bitmap_text);
 criterion_main!(benches);

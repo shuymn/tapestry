@@ -27,6 +27,7 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("raw_input", raw_inputs()),
         ("preset_canonical", preset_canonicals()),
         ("skin_json", skin_jsons()),
+        ("skin_fnt", skin_fnts()),
     ]
 }
 
@@ -672,6 +673,55 @@ pub fn skin_jsons() -> Vec<Seed> {
     .collect()
 }
 
+/// The bitmap font `font.fnt` of the `skin_json` folder: `A`, `B` and `l`
+/// side by side on its 16×8 page `font_0.png`, a missing glyph, and a
+/// kerning pair.
+pub const FONT_FNT: &str = "info face=\"seed\" size=8 bold=0 italic=0 padding=0,0,0,0 spacing=1,1
+common lineHeight=8 base=7 scaleW=16 scaleH=8 pages=1 packed=0
+page id=0 file=\"font_0.png\"
+chars count=4
+char id=65   x=0 y=0 width=4 height=6 xoffset=0 yoffset=1 xadvance=5 page=0 chnl=15
+char id=66   x=4 y=0 width=4 height=6 xoffset=0 yoffset=1 xadvance=5 page=0 chnl=15
+char id=108  x=8 y=0 width=2 height=7 xoffset=1 yoffset=0 xadvance=3 page=0 chnl=15
+char id=-1   x=10 y=0 width=4 height=6 xoffset=0 yoffset=1 xadvance=5 page=0 chnl=15
+kernings count=1
+kerning first=65 second=66 amount=-1
+";
+
+/// `skin_fnt` seeds: [`FONT_FNT`] and its variants that parse, then one
+/// refused file per error the smoke tests expect.
+#[must_use]
+pub fn skin_fnts() -> Vec<Seed> {
+    let edit = |from: &str, to: &str| FONT_FNT.replacen(from, to, 1).into_bytes();
+    vec![
+        ("font", FONT_FNT.as_bytes().to_vec()),
+        ("crlf", FONT_FNT.replace('\n', "\r\n").into_bytes()),
+        (
+            "two_pages",
+            edit(
+                "pages=1 packed=0\npage id=0 file=\"font_0.png\"",
+                "pages=2 packed=0\npage id=0 file=\"font_0.png\"\npage id=1 file=\"sub/font_1.png\"",
+            ),
+        ),
+        ("supplementary", edit("id=108", "id=128512")),
+        ("binary", b"BMF\x03\x01\x00\x00\x00".to_vec()),
+        ("no_size", edit(" size=8", "")),
+        ("page_id", edit("page id=0", "page id=1")),
+        ("glyph_page", edit("xadvance=3 page=0", "xadvance=3 page=1")),
+        ("duplicate_id", edit("id=66", "id=65")),
+        ("count", edit("chars count=4", "chars count=5")),
+        ("trailing", format!("{FONT_FNT}char id=67\n").into_bytes()),
+        ("lone_cr", edit("page=0 chnl=15\n", "page=0\rchnl=15\n")),
+        (
+            "no_glyphs",
+            b"info face=\"\" size=8 padding=0,0,0,0\ncommon lineHeight=8 base=7 scaleW=16 \
+              scaleH=8 pages=1\npage id=0 file=\"font_0.png\"\nchar id=65 x=0 y=0 width=0 \
+              height=6 xoffset=0 yoffset=1 xadvance=5 page=0\n"
+                .to_vec(),
+        ),
+    ]
+}
+
 /// A 1920×1080 play skin of `body` with the resources of the skin folder
 /// as sources `strip`, `grid` and font `f`.
 fn play_skin(body: &str) -> Vec<u8> {
@@ -682,7 +732,8 @@ fn play_skin(body: &str) -> Vec<u8> {
     )])
 }
 
-/// `skin_json` seeds that import: images, numbers, text, tracks, ops,
+/// `skin_json` seeds that import: images, numbers, text, bitmap text,
+/// tracks, ops,
 /// offsets, a default file choice and the play objects.
 #[must_use]
 pub fn skin_imports() -> Vec<Seed> {
@@ -719,6 +770,17 @@ pub fn skin_imports() -> Vec<Seed> {
                     {"id": "t", "timer": 41, "dst": [{"x": 400, "y": 900, "w": 300, "h": 20}]},
                     {"id": "c", "timer": 41, "dst": [{"x": 400, "y": 800, "w": 300, "h": 20}]}]"#,
             ),
+        ),
+        (
+            "bitmap_text",
+            skin_input(&[r#"{"type": 0, "w": 1920, "h": 1080,
+                "font": [{"id": "b", "path": "font.fnt"}],
+                "text": [
+                    {"id": "c", "font": "b", "size": 16, "constantText": "ABl?", "align": 1},
+                    {"id": "t", "font": "b", "size": 8, "ref": 10}],
+                "destination": [
+                    {"id": "c", "timer": 41, "dst": [{"x": 400, "y": 800, "w": 300, "h": 16}]},
+                    {"id": "t", "timer": 41, "dst": [{"x": 400, "y": 900, "w": 300, "h": 8}]}]}"#]),
         ),
         (
             "tracks",
