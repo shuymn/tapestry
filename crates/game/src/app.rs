@@ -6,9 +6,9 @@
 //! it, and waits idly on menus. The flow only asks it what happened and
 //! tells it what to do, as [`crate::live`] does for a play.
 //!
-//! - A chart chosen to play, and each practice Start, enters the loading
-//!   page at once ([`AppRig::entered_loading`]), before anything is read,
-//!   and it stays until the countdown or the way back.
+//! - A chart chosen to play, and each practice Start, switches to the play
+//!   screen in its loading state at once ([`AppRig::entered_loading`]),
+//!   before anything is read; it lasts until the countdown or the way back.
 //! - A refused load returns to selection with the reason, and the chart
 //!   stays selected: a chart or preset file that cannot be used, a bank
 //!   that does not load, and a play the logic step refuses at the opening.
@@ -57,12 +57,12 @@ pub trait AppRig: Rig {
     ///
     /// Why the bank cannot be built: the chart is refused.
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError>;
-    /// A chart's load for play began: the loading page shows from here,
-    /// before anything of `chart` is read, until the play's countdown or a
-    /// return to where the chart was chosen (selection with a refusal or
-    /// after a cancel, the practice page), or the run's end. Called at
-    /// every chosen chart to play and at every practice Start, never at a
-    /// retry, which loads nothing.
+    /// A chart's load for play began: the play screen shows in its loading
+    /// state from here, before anything of `chart` is read, until the
+    /// play's countdown or a return to where the chart was chosen
+    /// (selection with a refusal or after a cancel, the practice page), or
+    /// the run's end. Called at every chosen chart to play and at every
+    /// practice Start, never at a retry, which loads nothing.
     fn entered_loading(&mut self, chart: &Path);
     /// Shows on the select screen why the chosen chart was refused.
     fn show_refusal(&mut self, refusal: &LoadRefusal<Self::BankError>);
@@ -413,7 +413,7 @@ impl App {
             // The screen's measures are the chart's 1× times.
             config.speed = Speed::NORMAL;
         } else {
-            // The loading page shows before the chart is read; a practice
+            // The loading state shows before the chart is read; a practice
             // shows it at each Start instead.
             rig.entered_loading(chart);
         }

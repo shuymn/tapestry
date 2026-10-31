@@ -425,6 +425,26 @@ impl Renderer {
         self.draw(start, None)
     }
 
+    /// Draws the play screen while a chart loads before the countdown, as
+    /// [`frame`](Self::frame) draws: the skin's loading frame
+    /// ([`PlaySkin::build_loading`]), then in a pass of its own the text
+    /// last prepared on `text`, the load's lines. Before recording opens
+    /// only: no play frame draws text this way.
+    ///
+    /// # Errors
+    ///
+    /// As [`menu_frame`](Self::menu_frame).
+    pub fn loading_frame(&mut self, text: &MenuText) -> Result<FrameTiming, RenderError> {
+        if text.owner() != self.id {
+            return Err(RenderError::OtherRenderersText);
+        }
+        let start = Instant::now();
+        self.batch.clear();
+        self.skin.build_loading(&mut self.batch);
+        self.batch.stage(&mut self.staging);
+        self.draw(start, Some(text))
+    }
+
     /// Draws a menu screen, as [`frame`](Self::frame) draws: the sprites
     /// `sprites` pushes, then in a pass of its own the text last prepared
     /// on `text` (design.md "Rendering and Skins"). Menus only; play

@@ -28,7 +28,7 @@ mod dev;
 mod end_screen;
 mod input_side;
 mod keys;
-mod loading_page;
+mod loading_text;
 mod log_file;
 mod loudness;
 mod measure;

@@ -488,7 +488,7 @@ impl Rig for PlayerRig<'_> {
         self.countdown_at = Some(countdown_at);
         self.origin = Some(origin);
         println!("play started");
-        // The countdown replaces the loading page.
+        // The countdown ends the loading state.
         self.render.clear_loading();
         if let Some(sel) = &mut self.selection {
             sel.loading = None;

@@ -70,4 +70,13 @@ pub trait PlaySkin: Send {
 
     /// Fills `out`, which arrives empty, with the frame's sprites.
     fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch);
+
+    /// Fills `out`, which arrives empty, with the play screen's frame while
+    /// a chart loads before the countdown (design.md "Play Lifecycle"):
+    /// the lanes and the rest of the screen without notes, whatever chart
+    /// was prepared last. The renderer draws the load's text over it. The
+    /// default draws nothing.
+    fn build_loading(&mut self, out: &mut SpriteBatch) {
+        let _ = out;
+    }
 }

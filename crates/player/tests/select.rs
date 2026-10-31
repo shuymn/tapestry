@@ -405,11 +405,64 @@ fn frames_of(stdout: &str, screen: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Choosing a chart leaves the select screen at once for the loading
-/// page, which names the chart and says each stage, and is drawn on
-/// (its frame dumped) while a slow load holds, until the countdown.
+/// The pixels of a frame the dump wrote (`dev::png`'s stored deflate
+/// blocks, unfiltered RGBA rows): its width, height and RGBA bytes.
+fn dumped_rgba(path: &Path) -> (usize, usize, Vec<u8>) {
+    let png = fs::read(path).unwrap();
+    let be = |b: &[u8]| u32::from_be_bytes(b.try_into().unwrap()) as usize;
+    let (mut at, mut size, mut z) = (8, (0, 0), Vec::new());
+    while at < png.len() {
+        let len = be(&png[at..at + 4]);
+        let kind = &png[at + 4..at + 8];
+        let data = &png[at + 8..at + 8 + len];
+        match kind {
+            b"IHDR" => size = (be(&data[..4]), be(&data[4..8])),
+            b"IDAT" => z.extend_from_slice(data),
+            _ => {}
+        }
+        at += 12 + len;
+    }
+    // Past the zlib header: stored blocks of a 5-byte header each.
+    let (mut raw, mut i) = (Vec::new(), 2);
+    loop {
+        let last = z[i] & 1 == 1;
+        let n = usize::from(u16::from_le_bytes([z[i + 1], z[i + 2]]));
+        raw.extend_from_slice(&z[i + 5..i + 5 + n]);
+        i += 5 + n;
+        if last {
+            break;
+        }
+    }
+    let (w, h) = size;
+    let rgba = raw
+        .chunks(w * 4 + 1)
+        .flat_map(|row| row[1..].to_vec())
+        .collect();
+    (w, h, rgba)
+}
+
+/// Whether a row of `rgba` holds a run of at least `len` red pixels: the
+/// play screen's judgment line.
+fn has_red_run((w, _, rgba): &(usize, usize, Vec<u8>), len: usize) -> bool {
+    rgba.chunks(w * 4).any(|row| {
+        let mut run = 0;
+        row.chunks(4).any(|p| {
+            run = if p[0] > 200 && p[1] < 110 && p[2] < 110 {
+                run + 1
+            } else {
+                0
+            };
+            run >= len
+        })
+    })
+}
+
+/// Choosing a chart switches at once to the play screen in its loading
+/// state, the lanes and judgment line drawn without notes, the chart's
+/// lines saying each stage over it, drawn on (its frame dumped) while a
+/// slow load holds, until the countdown.
 #[test]
-fn the_loading_page_shows_from_the_choice_through_a_slow_load() {
+fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
     let fx = fixture();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
     let frames = fx.appdata.join("frames");
@@ -423,18 +476,23 @@ fn the_loading_page_shows_from_the_choice_through_a_slow_load() {
         find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
     };
     let chose = at(0, "select: chose a.bms");
-    let shown = at(chose, "load: the loading page shows a.bms");
+    let shown = at(chose, "load: the play screen loads a.bms");
     let read = at(shown, "load: reading the chart");
     let held = at(read, "dev: the load holds 1500 ms");
     let ready = at(held, "load: the chart is ready ");
     at(ready, "play started");
     assert!(lines(&stdout, "load: cancelled").is_empty(), "{stdout}");
     // About 90 frames in 1.5 s at the offscreen pace; far fewer would mean
-    // the page stopped being drawn.
+    // the loading state stopped being drawn.
     let drawn = frames_of(&stdout, "loading");
     assert_eq!(drawn.len(), 1, "{stdout}");
     assert!(drawn[0] >= 20, "{drawn:?}\n{stdout}");
-    assert!(frames.join("loading.png").is_file());
+    // The loading frame is the play screen's: its judgment line spans the
+    // lanes, as in play, and the select screen has none.
+    let loading = dumped_rgba(&frames.join("loading.png"));
+    assert!(has_red_run(&loading, loading.0 / 5), "no judgment line");
+    let select = dumped_rgba(&frames.join("select.png"));
+    assert!(!has_red_run(&select, select.0 / 5));
 }
 
 /// The quit key during a load cancels it and returns to selection: the
@@ -451,7 +509,7 @@ fn the_quit_key_during_a_load_returns_to_selection() {
     let at = |from: usize, line: &str| {
         find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
     };
-    let shown = at(0, "load: the loading page shows a.bms");
+    let shown = at(0, "load: the play screen loads a.bms");
     let cancelled = at(shown, "load: cancelled");
     let back = at(cancelled, "select: 1 charts listed");
     let again = at(back, "select: chose a.bms");
@@ -460,7 +518,7 @@ fn the_quit_key_during_a_load_returns_to_selection() {
     assert_eq!(lines(&stdout, "load: cancelled").len(), 1, "{stdout}");
     assert_eq!(lines(&stdout, "load: the chart is ready ").len(), 1);
     assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
-    // Its loading page was drawn.
+    // Its loading state was drawn.
     assert!(!frames_of(&stdout, "loading").is_empty(), "{stdout}");
 }
 
@@ -472,7 +530,7 @@ fn closing_during_a_load_ends_the_run() {
     write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
     let (_, stdout) = run(&fx, "pick=a.bms,slow-load=2000,close-loading,enter", &[]);
     assert!(
-        find_from(&stdout, 0, "load: the loading page shows a.bms").is_some(),
+        find_from(&stdout, 0, "load: the play screen loads a.bms").is_some(),
         "{stdout}"
     );
     assert_eq!(lines(&stdout, "load: cancelled").len(), 1, "{stdout}");
@@ -517,10 +575,10 @@ fn refused_chart_shows_its_reason() {
     );
     assert_eq!(lines(&stdout, "select: chose bad.bms").len(), 2, "{stdout}");
     assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
-    // Each choice showed the loading page, which the refusal left.
+    // Each choice showed the loading state, which the refusal left.
     let mut from = 0;
     for _ in 0..2 {
-        let shown = find_from(&stdout, from, "load: the loading page shows bad.bms");
+        let shown = find_from(&stdout, from, "load: the play screen loads bad.bms");
         let shown = shown.unwrap_or_else(|| panic!("{stdout}"));
         from = find_from(&stdout, shown, "select: refused bad.bms: ").unwrap();
     }

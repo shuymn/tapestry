@@ -11,12 +11,13 @@
 //!   into selection and every result releases it. A chart whose loudness
 //!   the library misses is measured during its load, so its first play has
 //!   its gain; the measurement is stored once that pause is acknowledged.
-//! - **The loading page** shows from a chart chosen to play, or a
-//!   practice Start, to the countdown: the chart, the preset and the
-//!   load's stage, with the sounds decoded so far.
+//! - **The play screen's loading state** shows from a chart chosen to
+//!   play, or a practice Start, to the countdown: the play screen without
+//!   notes, with the chart, the preset and the load's stage over it, the
+//!   sounds decoded so far among them.
 //! - Loading runs on the game thread, the screen's preparation of the
 //!   chart on the render thread meanwhile: the render thread keeps drawing
-//!   the loading page around it, the window thread keeps the window
+//!   the loading state around it, the window thread keeps the window
 //!   answering, and a close or the quit key cancels the load at the
 //!   measurement's checks, or is taken once the load is over (the load's
 //!   waits are all bounded).
@@ -33,7 +34,7 @@ use game::{
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
 use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log};
-use crate::loading_page::{LoadingPage, Stage};
+use crate::loading_text::{LoadingText, Stage};
 use crate::log_file;
 use crate::play::{PlayerRig, since};
 use crate::render_side::{LoadingSink, RenderLink, RenderMsg, ScreenError};
@@ -59,15 +60,16 @@ const PICK_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 const QUERY_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 
 /// What a chart's load lends its loudness measurement: the 1× chart and
-/// bank of a practice at another speed, the loading page's stage, and the
+/// bank of a practice at another speed, the load's stage on the play
+/// screen, and the
 /// window's close or the quit key as its cancel.
 struct LoadHost<'a> {
     loaded: &'a Loaded,
     rate: u32,
     controls: &'a crate::controls::Controls,
     render: &'a RenderLink,
-    /// The loading page, which says the chart is being measured.
-    page: Option<&'a LoadingPage>,
+    /// The load's lines, which say the chart is being measured.
+    page: Option<&'a LoadingText>,
     /// The measurement closes the window (a script's `close-measuring`,
     /// dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -120,9 +122,9 @@ pub struct Selection {
     pub rate: u32,
     /// When the chart being loaded was chosen.
     pub chosen_at: TimeUs,
-    /// The loading page, from a chart's choice or a practice Start to its
-    /// countdown or the way back.
-    pub loading: Option<LoadingPage>,
+    /// The load's lines on the play screen, from a chart's choice or a
+    /// practice Start to its countdown or the way back.
+    pub loading: Option<LoadingText>,
     /// Whether the chart chosen last was chosen to practice.
     pub practicing: bool,
     /// When selection was last entered.
@@ -881,30 +883,30 @@ pub enum ChartLoadError {
     NoSelection,
 }
 
-/// Shows the loading `page` at `stage`, and says so on the console; nothing
-/// without a page.
-fn show_stage(render: &RenderLink, page: Option<&LoadingPage>, stage: Stage) {
+/// Shows the load's lines of `page` at `stage` on the play screen, and
+/// says so on the console; nothing without them.
+fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
     let Some(page) = page else {
         return;
     };
     println!("load: {}", stage.label());
-    render.loading().show(page.page(stage));
+    render.loading().show(page.lines(stage));
 }
 
 /// How often the sounds' progress is shown at most: more often would only
 /// lay out pages a frame never draws, the slot keeping the newest.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
-/// The sounds' progress on the loading page, sent from the decode pool.
+/// The sounds' progress on the play screen, sent from the decode pool.
 struct Progress {
     render: LoadingSink,
     /// When progress was last shown.
     shown: Mutex<Option<Instant>>,
-    page: Option<LoadingPage>,
+    page: Option<LoadingText>,
 }
 
 impl Progress {
-    const fn new(render: LoadingSink, page: Option<LoadingPage>) -> Self {
+    const fn new(render: LoadingSink, page: Option<LoadingText>) -> Self {
         Self {
             render,
             shown: Mutex::new(None),
@@ -924,7 +926,7 @@ impl Progress {
             return;
         }
         *shown = Some(now);
-        self.render.show(page.page(Stage::Sounds { done, files }));
+        self.render.show(page.lines(Stage::Sounds { done, files }));
     }
 }
 
@@ -1001,7 +1003,7 @@ impl PlayerRig<'_> {
             log::info!("select: chose {}{what}", path.display());
             sel.dirty = true;
             sel.practicing = matches!(pick, Pick::Practice(_));
-            // A chart to play shows the loading page at once
+            // A chart to play enters the play screen's loading state at once
             // (`entered_loading`); the practice page reads it first.
             if sel.practicing {
                 sel.show(&self.render, Some(&format!("読み込み中: {name}")));
@@ -1037,7 +1039,7 @@ impl PlayerRig<'_> {
             crate::shelf::PAUSE_NOTICE,
             || {
                 println!("library: waiting for the scan to pause");
-                // On the loading page before a chart's first countdown; a
+                // On the play screen before a chart's first countdown; a
                 // retry's shows on the select page, as the scan's state.
                 if loading.is_some() {
                     show_stage(render, loading.as_ref(), Stage::Scan);
@@ -1335,8 +1337,9 @@ impl AppRig for PlayerRig<'_> {
         self.look()
     }
 
-    /// The chart's page from its library entry (its title and artist) and
-    /// the chosen preset, at the chart's stage.
+    /// The play screen's loading state, its lines from the chart's library
+    /// entry (its title and artist) and the chosen preset, at the chart's
+    /// stage.
     fn entered_loading(&mut self, chart: &std::path::Path) {
         let Some(sel) = &mut self.selection else {
             return;
@@ -1350,13 +1353,13 @@ impl AppRig for PlayerRig<'_> {
             title.push(' ');
             title.push_str(sub);
         }
-        let page = LoadingPage {
+        let page = LoadingText {
             title,
             artist: header.and_then(|h| h.artist.clone()).unwrap_or_default(),
             preset: sel.screen.preset().to_owned(),
             practice: sel.practicing,
         };
-        println!("load: the loading page shows {}", file_name(chart));
+        println!("load: the play screen loads {}", file_name(chart));
         show_stage(&self.render, Some(&page), Stage::Chart);
         sel.loading = Some(page);
     }

@@ -575,6 +575,14 @@ impl PlaySkin for SimpleSkin {
         Ok(())
     }
 
+    fn build_loading(&mut self, out: &mut SpriteBatch) {
+        Self::lanes_and_lines(out);
+        let w = LANES_RIGHT - LANE_LEFT;
+        let y = JUDGE_Y - JUDGE_LINE_H / 2.0;
+        rect(out, Blend::Alpha, LANE_LEFT, y, w, JUDGE_LINE_H, JUDGE_LINE);
+        rect(out, Blend::Alpha, LANE_LEFT, GAUGE_Y, w, GAUGE_H, GAUGE_BG);
+    }
+
     fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch) {
         for ev in f.effects {
             self.apply(ev);
@@ -1786,6 +1794,30 @@ mod tests {
         }
         let batch = build(&mut s, &frame(&v, 0, &[]));
         assert!(glyphs(&batch, COUNTDOWN).is_empty());
+    }
+
+    /// The loading frame draws the lanes, the judgment line and the gauge's
+    /// frame, but no note of the prepared chart, no countdown and nothing
+    /// that allocates.
+    #[test]
+    fn the_loading_frame_draws_the_lanes_without_notes() {
+        let chart = ChartBuilder::new(BPM)
+            .tap(lane(3), TimeUs(0))
+            .build()
+            .unwrap();
+        let mut s = skin(&chart);
+        let mut batch = SpriteBatch::with_capacity(4096);
+        s.build_loading(&mut batch);
+        assert!(batch.alpha().iter().any(|s| s.color == JUDGE_LINE));
+        assert!(batch.alpha().iter().any(|s| s.color == LANE_BG));
+        assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());
+        assert!(in_lane(&batch, lane(3), NOTE_BLUE).is_empty());
+        assert!(glyphs(&batch, COUNTDOWN).is_empty());
+        // The same frame on a play's clock draws the note.
+        let v = view();
+        let played = build(&mut s, &frame(&v, 0, &[]));
+        let notes = [NOTE_WHITE, NOTE_BLUE].map(|c| in_lane(&played, lane(3), c).len());
+        assert_eq!(notes.iter().sum::<usize>(), 1);
     }
 
     #[test]

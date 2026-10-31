@@ -415,7 +415,7 @@ pub struct Drawn<'a> {
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub menu: bool,
-    /// Whether that menu screen was the loading page (dev-tools).
+    /// Whether it was the play screen's loading state (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub loading: bool,
     /// The generation of the play whose figures the frame counts in, until

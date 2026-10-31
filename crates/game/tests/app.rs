@@ -279,11 +279,11 @@ struct Headless {
     in_load: Option<(i64, InLoad)>,
     /// A quit key press the rig took during a load, for the flow to take.
     quit_pressed: bool,
-    /// The chart whose loading page shows.
+    /// The chart whose loading state shows.
     loading: Option<usize>,
-    /// Each entry into the loading page: the chart and the clock time.
+    /// Each entry into the loading state: the chart and the clock time.
     loading_pages: Vec<(usize, i64)>,
-    /// Whether the loading page showed at each play's start, in order.
+    /// Whether the loading state showed at each play's start, in order.
     started_loading: Vec<bool>,
     /// The loads, by count from 0, that are cancelled.
     cancel_loads: Vec<usize>,
@@ -639,7 +639,7 @@ impl Rig for Headless {
     fn start(&mut self, _origin: TimeUs, sounds: AudioQueue, _screen: RenderSide) {
         self.opened = false;
         self.starts += 1;
-        // The countdown replaces the loading page.
+        // The countdown replaces the loading state.
         self.started_loading.push(self.loading.take().is_some());
         self.sounds = Some(sounds);
         self.sealed = false;
@@ -826,7 +826,7 @@ impl AppRig for Headless {
         let i = self.chosen.unwrap();
         if self.loading != Some(i) {
             self.violations
-                .push(format!("chart {i} loaded without its loading page"));
+                .push(format!("chart {i} loaded without its loading state"));
         }
         if self.close_in_load {
             self.quitting = true;
@@ -847,16 +847,17 @@ impl AppRig for Headless {
     fn entered_loading(&mut self, chart: &Path) {
         let Some(i) = self.paths.iter().position(|p| p == chart) else {
             self.violations
-                .push(format!("the loading page of {}", chart.display()));
+                .push(format!("the loading state of {}", chart.display()));
             return;
         };
         if Some(i) != self.chosen {
-            self.violations
-                .push(format!("the loading page of chart {i}, not the chosen one"));
+            self.violations.push(format!(
+                "the loading state of chart {i}, not the chosen one"
+            ));
         }
         if self.in_selection {
             self.violations
-                .push("the loading page in selection".to_owned());
+                .push("the loading state in selection".to_owned());
         }
         self.loading = Some(i);
         self.loading_pages.push((i, self.at()));
@@ -1020,7 +1021,7 @@ fn select_play_retry_back_select_again() {
     let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
-    // Each chosen chart shows its loading page up to its first countdown;
+    // Each chosen chart shows its loading state up to its first countdown;
     // the retry loads nothing and shows none.
     assert_eq!(
         rig.loading_pages.iter().map(|p| p.0).collect::<Vec<_>>(),
@@ -1801,7 +1802,7 @@ const fn loaded_chart(entry: Entry) -> usize {
     }
 }
 
-/// The loading page's state × event table (design.md "Play Lifecycle"),
+/// The play screen's loading state × event table (design.md "Play Lifecycle"),
 /// on a slow load from either entry, its page entered at the choice or
 /// the Start, before the load:
 ///
@@ -1901,7 +1902,7 @@ fn the_loading_page_through_each_event_of_a_load() {
     }
 }
 
-/// A refused load leaves its loading page for where the chart was chosen,
+/// A refused load leaves its loading state for where the chart was chosen,
 /// with the reason: selection for a chart file that cannot be read, a bank
 /// that does not load and a play the logic step refuses at its opening;
 /// the practice page for a round whose restore is refused at its opening.

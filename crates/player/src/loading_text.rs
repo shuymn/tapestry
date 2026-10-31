@@ -1,8 +1,9 @@
-//! The loading page (design.md "Play Lifecycle"): from a chart chosen to
-//! play, or a practice Start, to its countdown, it names the chart and the
-//! play preset and says what the load is doing, as lines the render thread
-//! draws ([`MenuPage`]). Everything here runs on menus, where allocation is
-//! allowed.
+//! The load's lines on the play screen (design.md "Play Lifecycle"): from a
+//! chart chosen to play, or a practice Start, to its countdown, the play
+//! screen is drawn in its loading state, and these lines over it name the
+//! chart and the play preset and say what the load is doing
+//! ([`MenuPage`], laid out by the render thread's text path). Everything
+//! here runs before recording opens, where allocation is allowed.
 
 use crate::menu_screen::{LineStyle, MenuLine, MenuPage};
 
@@ -38,7 +39,7 @@ impl Stage {
         }
     }
 
-    /// The stage on the page.
+    /// The stage on the play screen.
     fn text(self) -> String {
         match self {
             Self::Chart => "譜面を読み込んでいます".to_owned(),
@@ -51,9 +52,9 @@ impl Stage {
     }
 }
 
-/// The chart being loaded, as its page names it.
+/// The chart being loaded, as its lines name it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LoadingPage {
+pub struct LoadingText {
     /// The title, or the file's name without one.
     pub title: String,
     /// The artist; empty without one.
@@ -64,23 +65,21 @@ pub struct LoadingPage {
     pub practice: bool,
 }
 
-impl LoadingPage {
-    /// The page at `stage`: the heading, the chart's lines and the stage.
-    pub fn page(&self, stage: Stage) -> MenuPage {
+impl LoadingText {
+    /// The lines at `stage`: the heading, the chart's lines and the stage.
+    pub fn lines(&self, stage: Stage) -> MenuPage {
         let line = |text: String, style| MenuLine { text, style };
         let heading = if self.practice {
-            "練習の読み込み中"
+            "NOW LOADING (練習)"
         } else {
-            "読み込み中"
+            "NOW LOADING"
         };
         MenuPage {
             lines: vec![
-                line(heading.to_owned(), LineStyle::Title),
-                line(String::new(), LineStyle::Chart),
-                line(self.title.clone(), LineStyle::Cursor),
+                line(heading.to_owned(), LineStyle::Folder),
+                line(self.title.clone(), LineStyle::Title),
                 line(self.artist.clone(), LineStyle::Chart),
                 line(format!("プリセット: {}", self.preset), LineStyle::Chart),
-                line(String::new(), LineStyle::Chart),
                 line(stage.text(), LineStyle::Search),
             ],
         }
@@ -89,45 +88,41 @@ impl LoadingPage {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadingPage, Stage};
+    use super::{LoadingText, Stage};
     use crate::menu_screen::{LineStyle, PAGE_LINES};
 
-    /// The page names the chart, its artist and the preset, and says the
+    /// The lines name the chart, its artist and the preset, and say the
     /// stage, with the sounds' progress once their count is known.
     #[test]
-    fn the_page_names_the_chart_and_the_stage() {
-        let page = LoadingPage {
+    fn the_lines_name_the_chart_and_the_stage() {
+        let text = LoadingText {
             title: "譜面A".to_owned(),
             artist: "テスト".to_owned(),
             preset: "lr2-style".to_owned(),
             practice: false,
         };
-        let text = |stage| {
-            page.page(stage)
+        let strings = |stage| {
+            text.lines(stage)
                 .lines
                 .iter()
                 .map(|l| l.text.clone())
                 .collect::<Vec<_>>()
         };
-        let lines = text(Stage::Sounds { done: 3, files: 12 });
+        let lines = strings(Stage::Sounds { done: 3, files: 12 });
         assert!(lines.contains(&"譜面A".to_owned()), "{lines:?}");
         assert!(lines.contains(&"テスト".to_owned()), "{lines:?}");
-        assert!(
-            lines.contains(&"プリセット: lr2-style".to_owned()),
-            "{lines:?}"
-        );
+        assert!(lines.contains(&"プリセット: lr2-style".to_owned()));
         assert!(lines.contains(&"音を読み込んでいます  3 / 12".to_owned()));
-        let lines = text(Stage::Sounds { done: 0, files: 0 });
+        let lines = strings(Stage::Sounds { done: 0, files: 0 });
         assert!(
             lines.contains(&"音を読み込んでいます".to_owned()),
             "{lines:?}"
         );
         for stage in [Stage::Chart, Stage::Loudness, Stage::Screen, Stage::Scan] {
-            let p = page.page(stage);
+            let p = text.lines(stage);
             assert!(p.lines.len() <= PAGE_LINES);
-            // No cursor bar but the title's.
-            let cursors = p.lines.iter().filter(|l| l.style == LineStyle::Cursor);
-            assert_eq!(cursors.count(), 1);
+            // No cursor: the play screen draws no bar under a line.
+            assert!(p.lines.iter().all(|l| l.style != LineStyle::Cursor));
         }
     }
 }

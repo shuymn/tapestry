@@ -646,7 +646,8 @@ impl SelectScript {
     }
 }
 
-/// A menu screen's frames, the select screen's or the loading page's
+/// A menu screen's frames, the select screen's or the play screen's
+/// loading state's
 /// (dev-tools): CPU time, the interval between frames and the render
 /// thread's allocations per frame, kept from the screen's first frame until
 /// it is left, then printed.
@@ -1029,7 +1030,7 @@ fn onsets(samples: &[f32]) -> Vec<usize> {
 }
 
 /// Writes frames as PNG files: `select.png` at the first select screen
-/// frame, `loading.png` at the first loading page frame, `countdown.png` at
+/// frame, `loading.png` at the first loading state frame, `countdown.png` at
 /// the first frame of the lead-in, `play.png` at the first frame at or
 /// after `play_at`, and `end.png` at the first end screen frame.
 pub struct FrameDump {
