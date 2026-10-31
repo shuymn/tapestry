@@ -398,10 +398,13 @@ pub fn lines(
             ),
         );
     }
-    // The play's best, under the preset it was played with, whatever is
-    // viewed.
+    // The play's best, under the preset it was played with, named, whatever
+    // is viewed.
     if let Some(best) = &report.best {
-        set(10, crate::bests::best_line(best));
+        set(
+            10,
+            format!("{} {}", report.preset.id, crate::bests::best_line(best)),
+        );
     }
     if let ViewStatus::Ready(s) = status {
         let preset = viewed.and_then(|e| e.preset.as_deref());
@@ -703,6 +706,23 @@ mod tests {
             &hints(),
             autoplay,
         )
+    }
+
+    /// The best line sits under the view and names the preset the play was
+    /// played with, also while another preset's what-if shows.
+    #[test]
+    fn the_best_line_names_the_played_preset_under_any_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut played = report(rules::tapestry());
+        played.best = Some(game::BestView::NotCounted("ended midway".to_owned()));
+        let mut s = screen(dir.path(), &played);
+        let line = |s: &ResultScreen| lines_of(&played, s, false)[10].clone();
+        assert_eq!(line(&s), "TAPESTRY BEST NOT UPDATED: ENDED MIDWAY");
+        s.step(1, &played, &chart());
+        let viewed = s.viewed().unwrap().name.clone();
+        assert_ne!(viewed, "tapestry");
+        assert!(lines_of(&played, &s, false)[2].contains(&viewed.to_uppercase()));
+        assert_eq!(line(&s), "TAPESTRY BEST NOT UPDATED: ENDED MIDWAY");
     }
 
     /// The gauges are named by the preset viewed: as played, the preset the
