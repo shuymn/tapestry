@@ -806,6 +806,56 @@ fn auto_run(chart: &Path, appdata: &Path, extra: &[&std::ffi::OsStr]) -> std::pr
         .expect("run tapestry")
 }
 
+/// `tapestry play <chart>` switches presets on its result too: a scripted
+/// right arrow shows the play under lr2-style as a what-if, after the
+/// default beatoraja-style as played; the play preset is unchanged.
+#[test]
+fn direct_play_result_switches_presets() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &["--dev-result".as_ref(), "next,back".as_ref()],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let viewing: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("result: viewing "))
+        .collect();
+    assert_eq!(viewing.len(), 2, "{stdout}");
+    assert_eq!(viewing[0], "result: viewing beatoraja-style (as played)");
+    assert!(
+        viewing[1].starts_with("result: viewing lr2-style (what-if, "),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|l| l.starts_with("play started"))
+            .count(),
+        1,
+        "{stdout}"
+    );
+}
+
+/// A result script step that has no place on a result fails the direct
+/// play's run with a nonzero exit that names it.
+#[test]
+fn direct_play_result_script_failure_fails_the_run() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &["--dev-result".as_ref(), "enter".as_ref()],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("the result script failed"), "{stderr}");
+    assert!(stderr.contains("Enter on a result"), "{stderr}");
+}
+
 /// Every file under `dir`, recursively.
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

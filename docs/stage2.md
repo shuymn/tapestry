@@ -225,7 +225,7 @@ egui comes with the first form-like screen.
 
 ### D10. User preset files are polled, not watched
 
-**Today.** The shelf (crates/game/src/presets.rs) checks the user preset files every 250 ms while a result screen shows (`Loaded::poll_presets`) and at every retry; the select screen does not poll yet (PR17).
+**Today.** One shelf (crates/game/src/presets.rs) serves the run: `App` opens it once, polls it every 250 ms on the select screen, and lends it to each chart, whose result screen polls it too (`Loaded::poll_presets`), and whose loads and retries check it.
 
 **Decision.** While a select or result screen shows, the shelf checks the user preset files' modification times every 250 ms. The built-ins are never read from disk, so they are never polled.
 - A changed file reloads, and the result screen re-evaluates under it.
@@ -494,7 +494,7 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
   - a button sends on its press only, with no repeat while held; only the first connected unit of the configured model sends, and none without a configured controller.
   - Events go through a bounded SPSC queue, and the thread unparks the game thread.
   - Menu events are never recorded.
-  - The result screen keeps the keyboard's retry and quit keys; controller commands there arrive with PR17.
+  - On the result screen (PR17), the scratch's up and down switch presets, the white keys retry and the black keys go back; the keyboard keeps its retry and quit keys and adds the arrow keys. The queues are read only while a result shows, so the select loop's drain never takes the select screen's input.
 - **Keyboard lane keys** are not menu events.
 
 ### D19. Record format changes
@@ -947,14 +947,18 @@ Each one holds the behavior D5 and D6 state.
 
 **Depends on.** PR5, PR15, PR16.
 
+**Touches.**
+- `game`: presets.rs (a revision counter, a listing error, the absolute poll deadline), app.rs (one shelf for the run, lent to each chart and handed back on every outcome, polled on the select screen), session.rs (`load_reporting_to` takes the shelf; a chart's first play reports the chosen file's standing error), live.rs (the result loop drives the new `result_screen.rs` and waits to the poll deadline; `Rig::preset_reloaded` goes), and `result_screen.rs` (entries by identity, the view, its summaries and cache, and the evaluation budget, which reuses `Reservation`).
+- `player`: the result screen's keyboard and controller commands in both launch paths, read only while a result shows; the end screen's fixed layout; the select screen's chosen preset and its error.
+
 **Done when.**
-- `result_switches_presets_and_labels_what_if`;
-- `edited_preset_reevaluates_on_the_result_screen`;
+- When the player switches presets on a result, the view shall show the play as played under its own preset, equal to the live tally, then each other preset as a what-if labeled with its name and "no input after <t>" for a completed play, or "ended midway at <t>" with no gauge cleared for an aborted one, wrapping at both ends, while the play preset stays unchanged (`result_switches_presets_and_labels_what_if`);
+- When a viewed user preset that is not the chosen one changes, the view shall be re-evaluated under it within one 250 ms poll, and the chosen preset shall stay unchanged (`edited_preset_reevaluates_on_the_result_screen`);
 - When a user preset file changes while the select screen shows, the shelf shall reload it at the next 250 ms check (`select_screen_polls_the_shelf`);
 - When the player returns to the select screen, the shelf shall be kept, not reopened: if the chosen preset's file is then corrupted, the next chart shall play the last valid preset and the error shall be shown (`shelf_survives_returning_to_select`);
 - When a poll reloads the chosen preset or finds its file failing, the player's result screen shall show the re-evaluation or the error (`result_screen_shows_reload_and_error`).
 
-**Note.** The shelf reports changes only for the chosen preset (`Shelf::check`); listing every preset on the select and result screens may need a change notice per entry.
+**Measured.** `crates/game/tests/what_if_time.rs` (ignored; run in release) times a what-if on a chart near the 500,000-object limit with a full-input record. The figure is an indicator against the 250 ms target, not a gate; an off-thread evaluation is the follow-up only if real charts exceed it.
 
 ### PR18. Personal bests (`library`, `game`, `player`)
 
