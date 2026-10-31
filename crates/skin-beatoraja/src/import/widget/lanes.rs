@@ -296,9 +296,10 @@ impl Cx<'_> {
         for (f, name) in fields.iter().zip(FIELDS).take(18) {
             lists.push(self.opt_strings(*f, name)?);
         }
-        let list = |i: usize| lists.get(i).cloned().unwrap_or_default();
+        let none = Vec::new();
+        let list = |i: usize| lists.get(i).unwrap_or(&none);
         let [note, lnstart, lnend, lnbody, lnbody_active, lnactive] = [0, 1, 2, 3, 4, 5].map(list);
-        let hcn: Vec<Vec<Option<String>>> = (6..15).map(list).collect();
+        let hcn: Vec<&Vec<Option<String>>> = (6..15).map(list).collect();
         let [mine, hidden, processed] = [15, 16, 17].map(list);
         let [.., dst2, expansion, size, group] = fields;
 
@@ -314,7 +315,7 @@ impl Cx<'_> {
         } else {
             (lnbody_active, lnbody)
         };
-        let hcn_len = |i: usize| hcn.get(i).map_or(0, Vec::len);
+        let hcn_len = |i: usize| hcn.get(i).map_or(0, |l| l.len());
         let hcn_lists: [usize; 6] = if hcn_len(4) == 0 {
             // hcnstart, hcnend, hcnbody, hcnactive, hcndamage, hcnreactive
             [0, 1, 2, 3, 5, 7]
@@ -325,7 +326,7 @@ impl Cx<'_> {
         };
         let tail = lnend.len();
         if tail < LANES
-            || [&lnstart, &on, &off].iter().any(|l| l.len() < tail)
+            || [lnstart, on, off].iter().any(|l| l.len() < tail)
             || hcn_lists.iter().any(|&i| hcn_len(i) < tail)
         {
             return refuse(self, "lnend");
@@ -388,12 +389,12 @@ impl Cx<'_> {
         let mut cells = [[0_u32; 2]; LANES];
         let mut images = [[0_u32; 6]; LANES];
         let names: [(&Vec<Option<String>>, &'static str); 6] = [
-            (&note, "note"),
-            (&lnstart, "lnstart"),
-            (&lnend, "lnend"),
-            (&on, "lnbody"),
-            (&off, "lnbody"),
-            (&mine, "mine"),
+            (note, "note"),
+            (lnstart, "lnstart"),
+            (lnend, "lnend"),
+            (on, "lnbody"),
+            (off, "lnbody"),
+            (mine, "mine"),
         ];
         for u in 0..LANES {
             for (p, (names, field)) in names.iter().enumerate() {
@@ -556,7 +557,7 @@ impl Cx<'_> {
         self.lanes = Some(state);
 
         // What the source draws that the model does not.
-        for (field, list) in [("hidden", &hidden), ("processed", &processed)] {
+        for (field, list) in [("hidden", hidden), ("processed", processed)] {
             if !list.is_empty() {
                 self.ignored(at, NoteKind::Ignored { field });
             }
@@ -595,25 +596,26 @@ impl Cx<'_> {
     }
 
     /// A `float[]` field's items as the source reads them, as `f32`.
-    fn floats(&mut self, field: Option<u32>, name: &'static str) -> Result<Vec<f32>, ImportError> {
+    fn floats(&self, field: Option<u32>, name: &'static str) -> Result<Vec<f32>, ImportError> {
         let Some(f) = field else {
             return Ok(Vec::new());
         };
-        if self.def.arena.node(f).kind != crate::tree::Kind::Array {
+        let arena = &self.def.arena;
+        if arena.node(f).kind != crate::tree::Kind::Array {
             return Err(self.def.type_error(f, name, "an array"));
         }
-        let items: Vec<u32> = self.def.arena.children(f).collect();
-        let mut out = Vec::with_capacity(items.len());
-        for i in items {
-            #[expect(clippy::cast_possible_truncation, reason = "the source's float field")]
-            let v = match self.def.arena.scalar(i) {
-                Scalar::Long(raw) => raw.parse::<i64>().ok().map(|v| v as f32),
-                Scalar::Double(raw) => raw.parse::<f64>().ok().map(|v| v as f32),
-                _ => None,
-            };
-            out.push(v.ok_or_else(|| self.def.type_error(i, name, "a number"))?);
-        }
-        Ok(out)
+        arena
+            .children(f)
+            .map(|i| {
+                #[expect(clippy::cast_possible_truncation, reason = "the source's float field")]
+                let v = match arena.scalar(i) {
+                    Scalar::Long(raw) => raw.parse::<i64>().ok().map(|v| v as f32),
+                    Scalar::Double(raw) => raw.parse::<f64>().ok().map(|v| v as f32),
+                    _ => None,
+                };
+                v.ok_or_else(|| self.def.type_error(i, name, "a number"))
+            })
+            .collect()
     }
 
     /// The bar line of the note's `group` (`JsonPlaySkinObjectLoader.
