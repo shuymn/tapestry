@@ -5,6 +5,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::io::{self, Read as _};
+use std::path::{Path, PathBuf};
 
 use super::path::{self, PathError};
 use super::{MAX_FILE_BYTES, Sheet, Total};
@@ -67,6 +68,31 @@ impl FontError {
     }
 }
 
+/// Font `font`'s name resolved inside the canonical skin folder `root`,
+/// with its length.
+pub(crate) fn resolve(root: &Path, font: usize, name: &str) -> Result<(PathBuf, u64), FontError> {
+    path::resolve(root, name).map_err(|e| FontError::path(font, e))
+}
+
+/// Whether the resolved font file starts with a TrueType, OpenType or
+/// collection magic.
+pub(crate) fn check_magic(font: usize, p: &Path) -> Result<(), FontError> {
+    let (mut file, _) = path::open(p).map_err(|e| FontError::path(font, e))?;
+    let mut magic = [0_u8; 4];
+    match file.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(FontError::Unsupported { font });
+        }
+        Err(source) => return Err(FontError::Io { font, source }),
+    }
+    if MAGICS.contains(&magic) {
+        Ok(())
+    } else {
+        Err(FontError::Unsupported { font })
+    }
+}
+
 impl Sheet {
     /// This sheet with `fonts`, checked against its skin folder.
     ///
@@ -93,26 +119,14 @@ impl Sheet {
         };
         let mut paths = Vec::with_capacity(fonts.len());
         for (font, def) in fonts.iter().enumerate() {
-            let (p, len) =
-                path::resolve(&self.root, &def.path).map_err(|e| FontError::path(font, e))?;
+            let (p, len) = resolve(&self.root, font, &def.path)?;
             if !total.add(len) {
                 return Err(FontError::TotalTooLarge { font });
             }
             paths.push(p);
         }
         for (font, p) in paths.iter().enumerate() {
-            let (mut file, _) = path::open(p).map_err(|e| FontError::path(font, e))?;
-            let mut magic = [0_u8; 4];
-            match file.read_exact(&mut magic) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    return Err(FontError::Unsupported { font });
-                }
-                Err(source) => return Err(FontError::Io { font, source }),
-            }
-            if !MAGICS.contains(&magic) {
-                return Err(FontError::Unsupported { font });
-            }
+            check_magic(font, p)?;
         }
         self.fonts = fonts.into_iter().map(|f| f.path).collect();
         Ok(self)

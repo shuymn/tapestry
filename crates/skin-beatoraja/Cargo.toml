@@ -1,17 +1,27 @@
 [package]
 name = "skin-beatoraja"
 version = "0.0.0"
-description = "Imports 7-key play skin definitions in the source format's lenient JSON: a bounded reader, include and branch resolution, and the header."
+description = "Imports 7-key play skin definitions in the source format's lenient JSON: a bounded reader, include and branch resolution, the header, and the mapping of images, numbers and text onto the skin model with a conversion report."
 edition.workspace = true
 license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+bms-model.workspace = true
 skin-model.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+eval.workspace = true
+png.workspace = true
+proptest.workspace = true
+rules.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "import"
+harness = false

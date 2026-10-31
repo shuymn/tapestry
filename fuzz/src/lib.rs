@@ -19,7 +19,7 @@ use bms_parser::{LoadError, LoadOptions, Loaded};
 use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
-use skin_beatoraja::{Header, ImportError, SIZES, read_header, resolve};
+use skin_beatoraja::{Config, Header, ImportError, Imported, SIZES, import, read_header, resolve};
 
 /// An empty folder for the chart's sounds. Nothing is written to it, so
 /// every `#WAV` name resolves to no file.
@@ -204,16 +204,167 @@ fn decode_block(block: &[u8], summary: &mut RawSummary) -> bool {
 /// then files it may include.
 pub const SKIN_FILES: [&str; 4] = ["s.json", "i1.json", "i2.json", "i3.json"];
 
-/// A folder for the skin definitions, rewritten by each input.
+/// A folder for the skin definitions, rewritten by each input, with
+/// fixed resources the definitions can name: `strip.png`, ten 10×10
+/// frames in a row; `grid.png`, a 2×2 grid of 4×4 frames; and `font.ttf`,
+/// a file with a font's magic number.
 fn skin_dir() -> &'static Path {
     static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
     DIR.get_or_init(|| {
-        tempfile::Builder::new()
+        let dir = tempfile::Builder::new()
             .prefix("tapestry-fuzz-skin-")
             .tempdir()
-            .expect("create a skin folder")
+            .expect("create a skin folder");
+        write_png(&dir.path().join("strip.png"), 100, 10);
+        write_png(&dir.path().join("grid.png"), 8, 8);
+        std::fs::write(dir.path().join("font.ttf"), [0, 1, 0, 0, 0]).expect("write a font");
+        dir
     })
     .path()
+}
+
+/// An opaque `w`×`h` PNG at `path`.
+fn write_png(path: &Path, w: u32, h: u32) {
+    let file = std::fs::File::create(path).expect("create a PNG");
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    let mut out = enc.write_header().expect("write a PNG header");
+    let texels = usize::try_from(w * h * 4).expect("a small PNG");
+    out.write_image_data(&vec![255; texels])
+        .expect("write PNG data");
+}
+
+/// What an imported skin draws: the quads of frames at a few times of a
+/// 100-note play with a perfect judgment at each, each frame within the
+/// skin's quad capacity.
+///
+/// # Panics
+///
+/// If the atlas, the play or the text table is refused, or a frame holds
+/// more quads than the skin's capacity.
+#[must_use]
+pub fn draw(imported: &Imported) -> Vec<usize> {
+    use bms_model::{ChartBuilder, Lane, TimeUs};
+    use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
+    use rules::{GaugeValue, Judgment, PerJudgment};
+    use skin_model::{
+        AtlasLimits, Attempt, ChartText, FrameUv, GaugeDesc, GaugeLook, LaneView, Layout,
+        PlayContext, QuadBatch, Side, SkinFrame, TextImage, TextTable, Variant,
+    };
+
+    let skin = &imported.skin;
+    let limits = AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    let uvs = skin
+        .atlas(Variant::Lo, limits)
+        .expect("an imported sheet builds its atlas")
+        .into_parts()
+        .1;
+    let lane = Lane::new(1).expect("lane 1");
+    let chart = (0..100_i64)
+        .fold(ChartBuilder::new(150_000), |b, i| {
+            b.tap(lane, TimeUs(1_000_000 + i * 10_000))
+        })
+        .build()
+        .expect("a chart of taps");
+    let gauges = [GaugeDesc {
+        start: GaugeValue(20 * GaugeValue::PERCENT),
+        max: GaugeValue::FULL,
+        look: GaugeLook::Normal,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
+    }];
+    let ctx = PlayContext {
+        gauges: &gauges,
+        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        empty_poor_breaks_combo: false,
+        scratch: Side::Left,
+    };
+    let mut play = skin
+        .prepare(&chart, &ctx)
+        .expect("an imported skin prepares");
+    let text = ChartText {
+        title: "t",
+        subtitle: "",
+        artist: "a",
+        subartist: "",
+        genre: "g",
+    };
+    let mut lines = vec![None; skin.text_slots()];
+    for r in skin.text_requests(&text, [1_920, 1_080], &Layout::AUTHOR) {
+        let uv = FrameUv {
+            uv: [0.0, 0.0, 0.5, 0.5],
+            layer: 1,
+        };
+        if let Some(slot) = lines.get_mut(usize::from(r.slot)) {
+            *slot = TextImage::new(uv, [0.0, 0.0, 1.0, 1.0], 1.0);
+        }
+    }
+    skin.attach_text(&mut play, TextTable::new(lines))
+        .expect("one line per slot");
+    let tally = Tally {
+        counts: PerJudgment {
+            perfect: 1,
+            great: 0,
+            good: 0,
+            bad: 0,
+            poor: 0,
+        },
+        ex_score: 150,
+        bp: 0,
+        combo: 1,
+        max_combo: 1,
+        empty_poor: 0,
+    };
+    let states = [GaugeState {
+        value: gauges[0].start,
+        reference: gauges[0].start,
+        failed_at: None,
+    }];
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut counts = Vec::new();
+    for ms in [0_i64, 50, 500, 5_000] {
+        let effects = [JudgeEvent {
+            seq: 0,
+            time: TimeUs(ms * 1_000),
+            origin: None,
+            kind: JudgeEventKind::Judged {
+                lane,
+                note: 0,
+                judgment: Judgment::Perfect,
+                deviation: Some(TimeUs(0)),
+                release: None,
+                combo: 1,
+            },
+        }];
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(ms * 1_000),
+            display_offset: TimeUs(0),
+            tally: &tally,
+            gauges: &states,
+            gauge: 0,
+            effects: &effects,
+            complete: false,
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes: LaneView {
+                visible_time: TimeUs(600_000),
+                cover: 0,
+                lift: 0,
+            },
+        };
+        skin.build(&mut play, &frame, &uvs, &mut batch);
+        let n = batch.quads().len();
+        assert!(
+            n <= usize::try_from(skin.quad_capacity()).unwrap_or(usize::MAX),
+            "more quads than the capacity"
+        );
+        counts.push(n);
+    }
+    counts
 }
 
 /// The header's counts are inside their caps, its size is an accepted
@@ -240,9 +391,12 @@ fn check_header(h: &Header) {
 
 /// Target `skin_json`: skin definition files separated by NUL bytes, at
 /// most [`SKIN_FILES`]`.len()` of them, written to a temporary skin folder
-/// under those names. The header is read with no option enabled, then
-/// resolved again with every option item's number enabled, then once more
-/// with none, also after that configured pass fails.
+/// under those names (beside the resources of [`skin_dir`]). The header is
+/// read with no option enabled, then resolved again with every option
+/// item's number enabled, then once more with none, also after that
+/// configured pass fails. A configured header that resolves is returned
+/// with the skin imported with the header's defaults; an imported skin
+/// is then drawn ([`draw`]).
 ///
 /// # Errors
 ///
@@ -250,11 +404,18 @@ fn check_header(h: &Header) {
 ///
 /// # Panics
 ///
-/// If a header breaks [`check_header`]'s bounds, or resolving again with
-/// no option enabled gives another header than the first pass or fails.
+/// If a header breaks [`check_header`]'s bounds, resolving again with no
+/// option enabled gives another header than the first pass or fails, an
+/// import's charged counters pass the model's caps, or [`draw`] panics.
 ///
 /// [`Resolved::header`]: skin_beatoraja::Resolved::header
-pub fn skin_json(data: &[u8]) -> Result<Header, ImportError> {
+pub fn skin_json(data: &[u8]) -> Result<(Header, Result<Imported, ImportError>), ImportError> {
+    // One input at a time owns the folder (the smoke tests run in
+    // parallel).
+    static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _owned = FOLDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = skin_dir();
     let mut parts = data.splitn(SKIN_FILES.len(), |&b| b == 0);
     for name in SKIN_FILES {
@@ -286,7 +447,33 @@ pub fn skin_json(data: &[u8]) -> Result<Header, ImportError> {
         matches!(&again, Ok(h) if *h == header),
         "resolving again with no option enabled changed the header: {again:?}"
     );
-    configured
+    let configured = configured?;
+    let imported = import(&mut def, &header, &Config::defaults(&header));
+    if let Ok(i) = &imported {
+        check_usage(i);
+        black_box(draw(i));
+    }
+    Ok((configured, imported))
+}
+
+/// An import's charged counters are within the model's caps.
+fn check_usage(i: &Imported) {
+    use skin_model::{
+        MAX_ELEMENTS, MAX_FILES, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_WIDGET_QUADS,
+    };
+    let u = i.report.usage;
+    let within = |n: u32, cap: usize| usize::try_from(n).is_ok_and(|n| n <= cap);
+    assert!(within(u.elements, MAX_ELEMENTS), "too many elements");
+    assert!(within(u.keys, MAX_SKIN_KEYS), "too many keys");
+    assert!(within(u.ops, MAX_SKIN_OPS), "too many ops");
+    assert!(within(u.frames, MAX_SKIN_FRAMES), "too many frames");
+    assert!(within(u.file_attempts, MAX_FILES), "too many file attempts");
+    assert!(u.widget_quads <= MAX_WIDGET_QUADS, "too many widget quads");
+    // An element dropped after its ops were charged keeps none of them.
+    assert!(
+        i.skin.ops().total() <= usize::try_from(u.ops).unwrap_or(usize::MAX),
+        "more ops kept than charged"
+    );
 }
 
 /// Target `canary`, for the self-test only (scripts/fuzz-selftest.sh): one

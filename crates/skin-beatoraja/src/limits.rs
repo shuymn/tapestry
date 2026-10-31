@@ -52,3 +52,6 @@ impl Limits {
         decoded_bytes: MAX_DECODED_BYTES,
     };
 }
+
+/// The most report notes an import keeps; later ones are counted only.
+pub const MAX_NOTES: usize = 4_096;
