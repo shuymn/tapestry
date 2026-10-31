@@ -103,6 +103,8 @@ pub fn simple() -> LanesDef {
         top: 80,
         line: 880,
         bottom: 960,
+        cover_at: 80,
+        lift_at: 880,
         note_h: 16,
         mine_h: 8,
         bar_h: 2,

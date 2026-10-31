@@ -6,6 +6,11 @@
 //! (notes and bar lines met, drawn or skipped) and [`LANE_QUADS`] quads
 //! for them. The judgment line and the covers are reserved and always
 //! drawn: a dropped cover would show notes it should hide.
+//!
+//! The lift raises the judgment line by its share of the lane; the cover
+//! then takes its share of the length left above the lift. Both are
+//! clamped on the edges they paint, so the painted cover always leaves a
+//! tenth of the lane uncovered above the judgment line.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -29,8 +34,9 @@ pub const LANE_VISITS: u32 = 2 * LANE_QUADS;
 /// The quads reserved beyond [`LANE_QUADS`]: the judgment line, the lane
 /// cover and the lift cover.
 pub const LANE_RESERVED: u32 = 3;
-/// The most of the lane the cover and the lift may take together, in ‰:
-/// at least 100 ‰ stays uncovered.
+/// The most of the lane the lift may take, in ‰: the painted cover always
+/// leaves 100 ‰ of the lane uncovered above the judgment line, and the
+/// lift stops where that tenth would start below the cover's anchor.
 pub const MAX_COVERED: u16 = 900;
 
 /// Which side of the key lanes the scratch lane is on.
@@ -86,6 +92,13 @@ pub struct LanesDef {
     pub line: i32,
     /// Where a late note leaves the lanes.
     pub bottom: i32,
+    /// Where the cover's lower edge sits with the cover at 0 ‰, and the
+    /// top the cover is cut to: from `top` down, leaving at least a tenth
+    /// of the lane above the line.
+    pub cover_at: i32,
+    /// Where the lift cover's upper edge sits with the lift at 0 ‰: from
+    /// `line` to `bottom`.
+    pub lift_at: i32,
     pub note_h: u16,
     pub mine_h: u16,
     pub bar_h: u16,
@@ -99,7 +112,7 @@ pub struct LaneView {
     /// The time a note takes from the uncovered top to the line, at the
     /// chart's initial rate.
     pub visible_time: TimeUs,
-    /// The lane cover, in ‰ of the lane from its top to the line.
+    /// The lane cover, in ‰ of the lane height left above the lift.
     pub cover: u16,
     /// The lift, in ‰ of the same length: the line moves up by it.
     pub lift: u16,
@@ -118,6 +131,10 @@ pub enum LanesError {
     Span,
     #[error("the lanes need top < line ≤ bottom within ±{MAX_COORD} and heights of at least 1")]
     Heights,
+    #[error(
+        "the covers need top ≤ cover_at, a tenth of the lane below cover_at, and line ≤ lift_at ≤ bottom"
+    )]
+    Anchors,
     #[error("a key lane is not on the scratch lane's side")]
     ScratchNotAtSide,
     #[error("a {part:?} image does not exist")]
@@ -154,7 +171,9 @@ impl LanesDef {
 
     /// Checks the geometry: every width at least 1, every lane within
     /// ±[`MAX_COORD`], `top < line ≤ bottom` within it, heights of at
-    /// least 1, and every key lane on the scratch lane's side.
+    /// least 1, the cover anchors (`top ≤ cover_at`, at least a tenth of
+    /// the lane from `cover_at` to the line, `line ≤ lift_at ≤ bottom`),
+    /// and every key lane on the scratch lane's side.
     pub(crate) fn check(&self) -> Result<(), LanesError> {
         let max = i64::from(MAX_COORD);
         let within = |v: i64| (-max..=max).contains(&v);
@@ -172,6 +191,12 @@ impl LanesDef {
             || [self.note_h, self.mine_h, self.bar_h, self.line_h].contains(&0)
         {
             return Err(LanesError::Heights);
+        }
+        let [cover_at, lift_at] = [self.cover_at, self.lift_at].map(i64::from);
+        if !(top <= cover_at && 10 * (line - cover_at) >= line - top && line <= lift_at)
+            || lift_at > bottom
+        {
+            return Err(LanesError::Anchors);
         }
         let [scratch, keys @ ..] = self
             .lanes
@@ -231,6 +256,8 @@ pub(crate) struct Lanes {
     top: i32,
     line: i32,
     bottom: i32,
+    cover_at: i32,
+    lift_at: i32,
     note_h: f32,
     mine_h: f32,
     bar_h: f32,
@@ -257,6 +284,8 @@ impl Lanes {
             top: def.top,
             line: def.line,
             bottom: def.bottom,
+            cover_at: def.cover_at,
+            lift_at: def.lift_at,
             note_h: f32::from(def.note_h),
             mine_h: f32::from(def.mine_h),
             bar_h: f32::from(def.bar_h),
@@ -331,6 +360,19 @@ impl Lanes {
             span: [a, b - a],
         }
     }
+}
+
+/// The covers' geometry for one frame, in reference pixels.
+struct Covers {
+    /// The lane's length, from the top to the unlifted line.
+    len: f64,
+    /// How far the lift raises the line, and the raised line.
+    lift_px: f64,
+    line_y: f64,
+    /// How far the cover's lower edge moves down from its anchor.
+    cover_px: f64,
+    /// The top of the scroll: where notes appear.
+    edge: f64,
 }
 
 /// What the lanes draw from this frame.
@@ -484,12 +526,8 @@ impl Lanes {
         let Some(notes) = d.play.notes() else {
             return;
         };
-        let lift = d.view.lift.min(MAX_COVERED);
-        let cover = d.view.cover.min(MAX_COVERED - lift);
-        // `top < line` within ±2^20, so the length fits and is positive.
-        let len = f64::from(self.line - self.top);
-        let span_px = len * f64::from(1_000 - cover - lift) / 1_000.0;
-        let line_y = f64::from(self.line) - len * f64::from(lift) / 1_000.0;
+        let g = self.covers(d.view);
+        let (line_y, span_px) = (g.line_y, g.line_y - g.edge);
         let scale = Scale::new(
             d.play.scroll(),
             d.display,
@@ -546,17 +584,44 @@ impl Lanes {
             }
         }
         if let Some(part) = self.parts.cover.map(|p| d.shown(&p)) {
-            let edge = f32_of(f64::from(self.top) + len * f64::from(cover) / 1_000.0);
-            let len = f32_of(len);
-            if let Some(c) = cut(sx, sw, edge - len, edge, top, bottom) {
+            let edge = f32_of(f64::from(self.cover_at) + g.cover_px);
+            let (len, cover_at) = (f32_of(g.len), f32_of(f64::from(self.cover_at)));
+            if let Some(c) = cut(sx, sw, edge - len, edge, cover_at, bottom) {
                 pen.push(part, &c);
             }
         }
-        if lift > 0
+        if g.lift_px > 0.0
             && let Some(part) = self.parts.lift.map(|p| d.shown(&p))
-            && let Some(c) = cut(sx, sw, line, bottom, top, bottom)
         {
-            pen.push(part, &c);
+            let from = f32_of(f64::from(self.lift_at) - g.lift_px);
+            if let Some(c) = cut(sx, sw, from, bottom, top, bottom) {
+                pen.push(part, &c);
+            }
+        }
+    }
+
+    /// The covers' geometry for `view`. The lift takes its share of the
+    /// lane, the cover its share of the height left above the lift; each is
+    /// clamped so its painted edge stays a tenth of the lane above the
+    /// raised judgment line, which [`LanesDef::check`]'s anchors allow at
+    /// 0 ‰.
+    fn covers(&self, view: LaneView) -> Covers {
+        // `top < line` within ±2^20, so the length fits and is positive.
+        let len = f64::from(self.line - self.top);
+        let band = len / 10.0;
+        let (line, cover_at) = (f64::from(self.line), f64::from(self.cover_at));
+        // Both clamps are at least 0 by the anchors' check; with
+        // `top ≤ cover_at`, the lift's keeps it within `MAX_COVERED`.
+        let lift_px = (len * f64::from(view.lift) / 1_000.0).min(line - cover_at - band);
+        let line_y = line - lift_px;
+        let above = len - lift_px;
+        let cover_px = (above * f64::from(view.cover) / 1_000.0).min(line_y - band - cover_at);
+        Covers {
+            len,
+            lift_px,
+            line_y,
+            cover_px,
+            edge: f64::from(self.top) + cover_px,
         }
     }
 

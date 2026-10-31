@@ -73,12 +73,10 @@ mod reference {
 }
 
 /// The simple skin's span as the lanes widget computes it with no cover
-/// and no lift: `(line − top) · 1000 / 1000`.
+/// and no lift: the raised line (`line`) less the scroll top (`top`).
 fn span() -> f64 {
-    let (top, line) = (80_i64, 880_i64);
-    #[allow(clippy::cast_precision_loss)]
-    let px = ((line - top) * 1_000) as f64 / 1_000.0;
-    px
+    let (top, line) = (80_i32, 880_i32);
+    f64::from(line) - f64::from(top)
 }
 
 /// The text between each pair of markers in `src`, whitespace collapsed.
