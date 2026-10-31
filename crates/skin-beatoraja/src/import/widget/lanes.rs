@@ -102,26 +102,50 @@ fn f32_q(v: f32) -> Option<Q> {
     }
 }
 
+/// The lanes' span as read ahead of the walk, for the offset-4 rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SpanHint {
+    /// No destination names the notes: nothing can reach the lanes.
+    #[default]
+    NoLanes,
+    /// The lanes' rounded left and right edges.
+    Span([i128; 2]),
+    /// The notes' destination cannot be read ahead; their mapping then
+    /// refuses or fails, and no offset-4 image is decorative before it.
+    Undetermined,
+}
+
 impl Cx<'_> {
     /// The lanes' rounded span, read ahead of the walk from the first
-    /// destination naming the notes, for the offset-4 rule; `None`
-    /// without readable lanes (their mapping then refuses).
-    pub(in super::super) fn lane_span_hint(&mut self, destinations: &[u32]) -> Option<[i128; 2]> {
+    /// destination naming the notes; destinations without an id, or
+    /// naming no object, are skipped as the walk skips them.
+    pub(in super::super) fn lane_span_hint(&mut self, destinations: &[u32]) -> SpanHint {
         for &rec in destinations {
-            let id = super::super::object::id_of(self.def, rec).ok()??;
-            if ops_negative(&id) {
+            let Ok(id) = super::super::object::id_of(self.def, rec) else {
+                return SpanHint::Undetermined;
+            };
+            let Some(id) = id.filter(|id| !ops_negative(id)) else {
                 continue;
-            }
-            let (object, note) = self.objects.lookup(self.def, &self.tables, &id).ok()??;
+            };
+            let Ok(found) = self.objects.lookup(self.def, &self.tables, &id) else {
+                return SpanHint::Undetermined;
+            };
+            let Some((object, note)) = found else {
+                continue;
+            };
             if object != super::super::report::Object::Note {
                 continue;
             }
-            let (_, dst) = self.read_dst_keys(rec, Vec::new()).ok()?;
+            let Ok((_, dst)) = self.read_dst_keys(rec, Vec::new()) else {
+                return SpanHint::Undetermined;
+            };
             let off = self.configured(&dst.offsets).0;
-            let xs = self.lane_xs(note, off).ok()??;
-            return Some(span_of(&xs));
+            return match self.lane_xs(note, off) {
+                Ok(Some(xs)) => SpanHint::Span(span_of(&xs)),
+                Ok(None) | Err(_) => SpanHint::Undetermined,
+            };
         }
-        None
+        SpanHint::NoLanes
     }
 
     /// The sum of the configured offsets among `ids` (run-time and
@@ -718,8 +742,14 @@ impl Cx<'_> {
         if rotates || keys.keys.iter().any(|k| k.angle != 0) {
             return Ok(false);
         }
-        let Some([s0, s1]) = self.lanes.as_ref().map(|l| l.lane_span).or(self.span_hint) else {
-            return Ok(true);
+        let hint = match self.lanes.as_ref() {
+            Some(l) => SpanHint::Span(l.lane_span),
+            None => self.span_hint,
+        };
+        let [s0, s1] = match hint {
+            SpanHint::Span(s) => s,
+            SpanHint::NoLanes => return Ok(true),
+            SpanHint::Undetermined => return Ok(false),
         };
         let range = |cx: &Self| cx.range(dst.span, "dst");
         let (ow, oxw) = (Q::int(o.w), Q::int(o.x));

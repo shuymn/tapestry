@@ -262,9 +262,8 @@ pub(crate) struct Cx<'d> {
     widgets: WidgetDefs,
     /// The lanes, once the note destination is mapped.
     lanes: Option<widget::lanes::LaneState>,
-    /// The lanes' rounded span, read ahead of the walk for the offset-4
-    /// rule; `None` without readable lanes.
-    span_hint: Option<[i128; 2]>,
+    /// The lanes' span, read ahead of the walk for the offset-4 rule.
+    span_hint: widget::lanes::SpanHint,
     /// The judge records already drawn.
     judges: Vec<u32>,
 }
@@ -331,7 +330,7 @@ impl<'d> Cx<'d> {
             element_spans: Vec::new(),
             widgets: WidgetDefs::default(),
             lanes: None,
-            span_hint: None,
+            span_hint: widget::lanes::SpanHint::NoLanes,
             judges: Vec::new(),
         };
         cx.config_notes();

@@ -122,6 +122,40 @@ fn offset_four_elements_off_the_lanes_stay_decorative() {
     // Before the notes, the lanes' span is known ahead.
     let early = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#);
     load(&body("", &note(""), &[&early, NOTES])).ok();
+    // Past destinations naming nothing.
+    let none = [
+        r#"{"dst": [{"w": 1, "h": 1}]}"#,
+        r#"{"id": "nothing", "dst": [{"w": 1, "h": 1}]}"#,
+    ];
+    load(&body("", &note(""), &[none[0], none[1], &early, NOTES])).ok();
+}
+
+#[test]
+fn an_unknown_span_keeps_offset_four_critical() {
+    // A full cover before the notes, past destinations naming nothing,
+    // reaches the lanes: no SUDDEN+ maps before them.
+    let early = cover("");
+    for none in [
+        r#"{"dst": [{"w": 1, "h": 1}]}"#,
+        r#"{"id": "nothing", "dst": [{"w": 1, "h": 1}]}"#,
+    ] {
+        refused(
+            load(&body("", &note(""), &[none, &early, NOTES])),
+            CriticalPart::Cover,
+            "offset",
+        );
+    }
+    // Lanes that cannot be read ahead leave the span unknown.
+    let all = common::lanes::lane_rects(200, 600);
+    let seven: Vec<&str> = all.rsplitn(2, "}, ").collect();
+    let seven = seven[1].to_owned() + "}";
+    let notes = common::lanes::note_with(&seven, "");
+    let off = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#);
+    refused(
+        load(&body("", &notes, &[&off, NOTES])),
+        CriticalPart::Cover,
+        "offset",
+    );
 }
 
 #[test]
