@@ -8,9 +8,10 @@
 //! the text typed or composed through the IME go to the select screen too
 //! ([`crate::select::MenuInput`], design.md "Play Lifecycle"), through a
 //! queue that drops only keys past its bound ([`MenuQueue`]); the IME is
-//! allowed only while the search box has focus. The event loop runs
-//! on a thread of its own, so the game keeps the main thread and the loaded
-//! chart never has to move.
+//! allowed only while the search box has focus, and told where its caret
+//! is ([`ImeState`]) so the candidate window opens beside it. The event
+//! loop runs on a thread of its own, so the game keeps the main thread and
+//! the loaded chart never has to move.
 
 use std::num::NonZeroIsize;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use anyhow::Context as _;
 use eval::ControlId;
 use game::{Adjust, Command};
 use winit::application::ApplicationHandler;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -34,14 +36,104 @@ use winit::raw_window_handle::{
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::controls::Controls;
+use crate::menu_screen::WindowSink;
 use crate::select::{MenuInput, MenuKey, MenuQueue};
 
-/// What the game thread asks of the window thread.
+/// What the game and render threads ask of the window thread.
 enum Ask {
     /// End the event loop.
     Exit,
     /// Allow the IME (the search box has focus), or stop it.
     Ime(bool),
+    /// The caret's area on the page drawn, in layout pixels (from the
+    /// render thread).
+    Caret(Option<[f32; 4]>),
+}
+
+/// What the window's IME needs of the window: [`Window`], or a fake in
+/// tests.
+trait ImeWindow {
+    /// The client size in pixels.
+    fn client_size(&self) -> (u32, u32);
+    fn allow_ime(&self, allowed: bool);
+    /// The caret's area in client pixels: the IME opens its candidate
+    /// window beside it.
+    fn ime_area(&self, at: PhysicalPosition<i32>, size: PhysicalSize<u32>);
+}
+
+impl ImeWindow for Window {
+    fn client_size(&self) -> (u32, u32) {
+        let s = self.inner_size();
+        (s.width, s.height)
+    }
+
+    fn allow_ime(&self, allowed: bool) {
+        self.set_ime_allowed(allowed);
+    }
+
+    fn ime_area(&self, at: PhysicalPosition<i32>, size: PhysicalSize<u32>) {
+        self.set_ime_cursor_area(at, size);
+    }
+}
+
+/// The IME's state on the window thread: whether it is allowed and where
+/// the caret is. The caret's area is reported to the IME whenever it is
+/// allowed, the caret moves or the window's size changes, so its
+/// candidate window opens beside the search box, not where Windows would
+/// guess; a context the IME is not allowed has nothing to report to (the
+/// window has no input context then).
+#[derive(Debug, Default)]
+struct ImeState {
+    allowed: bool,
+    /// The caret's area in layout pixels, as the last page drawn has it.
+    caret: Option<[f32; 4]>,
+}
+
+impl ImeState {
+    /// The IME allowed (the search box gained focus) or stopped (lost it).
+    fn allow(&mut self, window: &impl ImeWindow, allowed: bool) {
+        self.allowed = allowed;
+        window.allow_ime(allowed);
+        self.report(window);
+    }
+
+    /// The caret moved, or no text box has focus any more (`None`).
+    fn caret(&mut self, window: &impl ImeWindow, caret: Option<[f32; 4]>) {
+        self.caret = caret;
+        self.report(window);
+    }
+
+    /// Reports the caret's area to an allowed IME at the window's current
+    /// size (also on a resize).
+    fn report(&self, window: &impl ImeWindow) {
+        let Some(caret) = self.caret.filter(|_| self.allowed) else {
+            return;
+        };
+        let (width, height) = window.client_size();
+        let (at, size) = client_area(caret, width, height);
+        window.ime_area(at, size);
+    }
+}
+
+/// `area` (`[left, top, width, height]` in layout pixels) in the client
+/// pixels of a `width` × `height` window, through the letterbox the
+/// layout is drawn in ([`render::letterbox`]); at least a pixel each way.
+fn client_area(
+    area: [f32; 4],
+    width: u32,
+    height: u32,
+) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let [x, y, w, h] = area;
+    let [left, top, scaled, _] = render::letterbox(width, height);
+    // The layout is 1920 pixels wide.
+    let s = scaled / 1920.0;
+    // Client pixels: far inside i32 and u32.
+    let at = PhysicalPosition::new((left + x * s).round() as i32, (top + y * s).round() as i32);
+    let size = PhysicalSize::new(
+        ((w * s).round() as u32).max(1),
+        ((h * s).round() as u32).max(1),
+    );
+    (at, size)
 }
 
 struct App {
@@ -53,6 +145,7 @@ struct App {
     window: Option<Window>,
     /// Where the select screen's input goes, with song selection.
     menu: Option<Arc<MenuQueue>>,
+    ime: ImeState,
 }
 
 impl ApplicationHandler<Ask> for App {
@@ -123,21 +216,27 @@ impl ApplicationHandler<Ask> for App {
                     }
                 }
             }
+            WindowEvent::Resized(_) => {
+                if let Some(w) = &self.window {
+                    self.ime.report(w);
+                }
+            }
             WindowEvent::CloseRequested => self.controls.close(),
             _ => {}
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Ask) {
-        if let Ask::Ime(allowed) = event {
-            if let Some(w) = &self.window {
-                w.set_ime_allowed(allowed);
+        match (event, &self.window) {
+            (Ask::Ime(allowed), Some(w)) => self.ime.allow(w, allowed),
+            (Ask::Caret(caret), Some(w)) => self.ime.caret(w, caret),
+            (Ask::Ime(_) | Ask::Caret(_), None) => {}
+            (Ask::Exit, _) => {
+                // The window goes before the loop ends, on its own thread.
+                self.window = None;
+                event_loop.exit();
             }
-            return;
         }
-        // The window goes before the loop ends, on its own thread.
-        self.window = None;
-        event_loop.exit();
     }
 }
 
@@ -179,6 +278,22 @@ impl WindowThread {
     /// The switch of the window's IME.
     pub fn ime(&self) -> ImeSwitch {
         ImeSwitch(self.proxy.clone())
+    }
+
+    /// Where the render thread tells the window what it drew.
+    pub fn link(&self) -> WindowLink {
+        WindowLink(self.proxy.clone())
+    }
+}
+
+/// The render thread's line to the window: the caret's area of each menu
+/// page drawn; a window already closed ignores it.
+#[derive(Clone)]
+pub struct WindowLink(EventLoopProxy<Ask>);
+
+impl WindowSink for WindowLink {
+    fn caret(&self, area: Option<[f32; 4]>) {
+        let _ = self.0.send_event(Ask::Caret(area));
     }
 }
 
@@ -248,6 +363,7 @@ pub fn open(
                 ready: Some(ready_tx),
                 window: None,
                 menu,
+                ime: ImeState::default(),
             };
             if let Err(e) = event_loop.run_app(&mut app) {
                 eprintln!("the event loop failed: {e}");
@@ -403,6 +519,97 @@ fn menu_key(key: PhysicalKey, repeat: bool) -> Option<MenuKey> {
 
 #[cfg(test)]
 mod tests {
+    /// The window as the IME handler sees it: its size, and what it was
+    /// asked.
+    struct FakeWindow {
+        size: std::cell::Cell<(u32, u32)>,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeWindow {
+        fn new(width: u32, height: u32) -> Self {
+            Self {
+                size: std::cell::Cell::new((width, height)),
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn take(&self) -> Vec<String> {
+            self.asked.take()
+        }
+    }
+
+    impl super::ImeWindow for FakeWindow {
+        fn client_size(&self) -> (u32, u32) {
+            self.size.get()
+        }
+
+        fn allow_ime(&self, allowed: bool) {
+            self.asked.borrow_mut().push(format!("allow {allowed}"));
+        }
+
+        fn ime_area(
+            &self,
+            at: winit::dpi::PhysicalPosition<i32>,
+            size: winit::dpi::PhysicalSize<u32>,
+        ) {
+            self.asked.borrow_mut().push(format!(
+                "area {} {} {} {}",
+                at.x, at.y, size.width, size.height
+            ));
+        }
+    }
+
+    /// A layout area lands on the window's pixels through the letterbox:
+    /// scaled with the layout, shifted past the bars, at least a pixel.
+    #[test]
+    fn the_caret_area_maps_through_the_letterbox() {
+        let area = [300.0, 72.0, 60.0, 42.0];
+        let mapped = |w, h| {
+            let (at, size) = super::client_area(area, w, h);
+            (at.x, at.y, size.width, size.height)
+        };
+        assert_eq!(mapped(1920, 1080), (300, 72, 60, 42));
+        assert_eq!(mapped(3840, 2160), (600, 144, 120, 84));
+        assert_eq!(mapped(2560, 1440), (400, 96, 80, 56));
+        // Bars left and right (21:9): 320 pixels each side.
+        assert_eq!(mapped(2560, 1080), (620, 72, 60, 42));
+        // Bars above and below (5:4): scaled by 2/3, 152 pixels down.
+        assert_eq!(mapped(1280, 1024), (200, 200, 40, 28));
+        // A sliver of an area is still a pixel.
+        let (_, size) = super::client_area([0.0, 0.0, 0.1, 0.1], 960, 540);
+        assert_eq!((size.width, size.height), (1, 1));
+    }
+
+    /// The search box's focus allows the IME and reports where its caret
+    /// is; a caret move and a resize report it again, and losing focus
+    /// stops the IME with nothing more reported.
+    #[test]
+    fn focus_reports_the_caret_to_the_ime_and_leaving_stops_it() {
+        let w = FakeWindow::new(1920, 1080);
+        let mut ime = super::ImeState::default();
+        // The page is drawn before the focus reaches the window: nothing to
+        // report to yet.
+        ime.caret(&w, Some([200.0, 72.0, 1.0, 42.0]));
+        assert!(w.take().is_empty());
+        ime.allow(&w, true);
+        assert_eq!(w.take(), ["allow true", "area 200 72 1 42"]);
+        ime.caret(&w, Some([230.0, 72.0, 60.0, 42.0]));
+        assert_eq!(w.take(), ["area 230 72 60 42"]);
+        w.size.set((3840, 2160));
+        ime.report(&w);
+        assert_eq!(w.take(), ["area 460 144 120 84"]);
+        ime.allow(&w, false);
+        assert_eq!(w.take(), ["allow false"]);
+        ime.caret(&w, None);
+        ime.report(&w);
+        assert!(w.take().is_empty());
+        // Focus again before the next page: that page's caret is reported.
+        ime.allow(&w, true);
+        assert_eq!(w.take(), ["allow true"]);
+        ime.caret(&w, Some([200.0, 72.0, 1.0, 42.0]));
+        assert_eq!(w.take(), ["area 400 144 2 84"]);
+    }
     use game::{Adjust, Command, DeviceSettings};
     use input::{DeviceKind, QpcClock};
     use winit::keyboard::{KeyCode, PhysicalKey};
