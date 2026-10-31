@@ -89,12 +89,20 @@ fn rooted_drive_unc_and_verbatim_names_are_refused_before_normalising() {
             matches!(root.read(name, 16), Err(RootError::Rejected)),
             "read {name}"
         );
+        assert!(
+            matches!(Root::check_name(name), Err(RootError::Rejected)),
+            "check {name}"
+        );
         if !name.is_empty() {
             assert!(
                 matches!(root.list(name, 16), Err(RootError::Rejected)),
                 "list {name}"
             );
         }
+    }
+    let longest = "a".repeat(MAX_PATH_BYTES);
+    for name in ["x", "../x", "a/b*.png", longest.as_str()] {
+        assert!(Root::check_name(name).is_ok(), "check {name}");
     }
 }
 

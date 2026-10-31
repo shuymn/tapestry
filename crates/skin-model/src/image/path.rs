@@ -210,10 +210,20 @@ impl Root {
         Ok(Self { dir })
     }
 
-    /// The canonical folder.
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// Checks the form of `name` as [`Root::read`] and [`Root::list`] do
+    /// first, before it is normalised or touches the file system: at most
+    /// [`MAX_PATH_BYTES`], not empty, not rooted, drive, UNC or verbatim,
+    /// and no `:`. For a name whose parts are checked before it is split.
+    ///
+    /// # Errors
+    ///
+    /// [`RootError::Rejected`] when the form is wrong.
+    pub fn check_name(name: &str) -> Result<(), RootError> {
+        if is_relative_form(name) {
+            Ok(())
+        } else {
+            Err(RootError::Rejected)
+        }
     }
 
     /// The canonical path `name` leads to inside the folder, and the
