@@ -5,6 +5,7 @@
 //! `device.toml` atomically; Escape or closing the window writes nothing.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
 use eval::ControlId;
@@ -18,6 +19,7 @@ use render::{AdapterChoice, Renderer, Target};
 
 use crate::controls::Controls;
 use crate::end_screen::key_name;
+use crate::menu_screen::WindowSink as _;
 
 /// A bound control's name: a keyboard key by its scan code, a controller's
 /// button by its number and its axis by its HID usage, each after its
@@ -142,17 +144,23 @@ pub fn lines(flow: &KeyConfigFlow) -> Vec<String> {
 struct Screen<'a> {
     renderer: Renderer,
     controls: &'a Controls,
+    /// Set by a presented frame: the hidden window shows then.
+    presented: Arc<AtomicBool>,
 }
 
 impl KeyScreen for Screen<'_> {
     fn show(&mut self, flow: &KeyConfigFlow) {
         let lines = lines(flow);
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        if let Err(e) = self.renderer.text_frame(&refs) {
-            // The screen is lost: nothing more can be shown, so the key
-            // config ends as if the window closed.
-            eprintln!("render: {}", game::Chain(&e));
-            self.controls.close();
+        match self.renderer.text_frame(&refs) {
+            Ok(t) if t.presented => self.presented.store(true, Ordering::Release),
+            Ok(_) => {}
+            Err(e) => {
+                // The screen is lost: nothing more can be shown, so the
+                // key config ends as if the window closed.
+                eprintln!("render: {}", game::Chain(&e));
+                self.controls.close();
+            }
         }
     }
 
@@ -241,6 +249,7 @@ pub fn run(
     let mut screen = Screen {
         renderer,
         controls: &controls,
+        presented: window_thread.link().presented(),
     };
     let current = KeyConfigs {
         keyboard: device.keyboard.clone(),
@@ -463,5 +472,36 @@ mod tests {
         assert_eq!(name(second(0x0201_0030)), "AXIS 2:0030");
         assert_eq!(name(second(0x0200_0005)), "BUTTON 2:5");
         assert_eq!(name(second(5)), "BUTTON 5");
+    }
+
+    /// Key config's frame tells the hidden window it was presented, as a
+    /// menu's or a play's does: its window shows then, not at the deadline.
+    #[test]
+    fn a_key_config_frame_tells_the_window() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use render::{AdapterChoice, Renderer, Target};
+
+        let target = Target::Offscreen {
+            width: 64,
+            height: 36,
+        };
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let presented = Arc::new(AtomicBool::new(false));
+        let mut screen = super::Screen {
+            renderer: Renderer::new(target, AdapterChoice::Warp).unwrap(),
+            controls: &controls,
+            presented: Arc::clone(&presented),
+        };
+        let flow = KeyConfigFlow::new(KeyConfigs {
+            keyboard: DeviceSettings::default().keyboard,
+            controller: DeviceSettings::default().controller,
+            controller_device: None,
+        });
+        assert!(!presented.load(Ordering::Acquire));
+        screen.show(&flow);
+        assert!(presented.load(Ordering::Acquire));
+        assert!(!controls.quitting());
     }
 }

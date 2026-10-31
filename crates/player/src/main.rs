@@ -743,6 +743,7 @@ fn rig<'a>(
         result_script: None,
         load_start: TimeUs(0),
         pending_retry: None,
+        window: None,
         retry_from: None,
         times: LoadTimes::default(),
         countdown_at: None,
@@ -1027,6 +1028,7 @@ fn play(
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
+    rig.window = Some(window_thread.shown());
     rig.restorer = restorer(&loaded, &rig);
     rig.gain = gain;
     rig.result_input = menus;
@@ -1356,6 +1358,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         steps: probes.steps.0,
     };
     let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock);
+    rig.window = window_thread.as_ref().map(window::WindowThread::shown);
     rig.queue_most = opened.most_queued_periods;
     rig.result_input = menus;
     rig.selection = Some(selection::Selection {

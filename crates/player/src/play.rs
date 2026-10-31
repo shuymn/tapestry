@@ -58,6 +58,9 @@ pub struct PlayerRig<'a> {
     pub render: RenderLink,
     /// The window's controls.
     pub controls: &'a Controls,
+    /// Whether the window was shown: recording opens once it is. `None`
+    /// without a window (headless).
+    pub window: Option<crate::window::WindowShown>,
     /// The clock, started with the process.
     pub clock: QpcClock,
     /// What each play records.
@@ -468,6 +471,11 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
+        // The window gains its focus when shown: an opening before it
+        // would latch the play's focus loss at once.
+        if let Some(window) = &self.window {
+            window.wait_to_open();
+        }
         self.in_play = true;
         // A round's opening is not the full play's countdown: the countdown
         // and a scenario's `until` run from it.

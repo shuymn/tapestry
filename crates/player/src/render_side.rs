@@ -526,6 +526,17 @@ pub fn spawn(
     }
 }
 
+/// What a preparation or a load leaves drawn: the splash stays until what
+/// comes next replaces it, since a hidden window shows on a presented
+/// frame and a play opens only once the window is shown; anything else
+/// stops.
+fn after_preparing(mode: Mode) -> Mode {
+    match mode {
+        Mode::Splash => Mode::Splash,
+        _ => Mode::Idle,
+    }
+}
+
 fn build(
     make: &mut MakeScreen,
     chart: Option<&Chart>,
@@ -634,7 +645,7 @@ impl Run {
                         }
                     }
                     let _ = reply.send(ready);
-                    mode = Mode::Idle;
+                    mode = after_preparing(mode);
                     continue;
                 }
                 Ok(RenderMsg::Menu(page)) => {
@@ -646,7 +657,7 @@ impl Run {
                 Ok(RenderMsg::Prepare(reply)) => {
                     let ready = self.prepare();
                     let _ = reply.send(ready);
-                    mode = Mode::Idle;
+                    mode = after_preparing(mode);
                     continue;
                 }
                 Ok(RenderMsg::Play {
@@ -1189,6 +1200,45 @@ mod tests {
         assert!(wait_until(|| menus.load(Ordering::SeqCst) >= 3));
         link.exit();
         assert_eq!(splashes.load(Ordering::SeqCst), drawn);
+    }
+
+    /// A preparation (a play's, before it opens) leaves the splash drawn,
+    /// whether it comes before the splash's first frame or after: the
+    /// hidden window shows on a presented frame, and the play waits for
+    /// the show.
+    #[test]
+    fn a_preparation_keeps_the_splash_drawn() {
+        for prepare_first in [true, false] {
+            let splashes = Arc::new(AtomicU32::new(0));
+            let s = Arc::clone(&splashes);
+            let make: MakeScreen = Box::new(move || {
+                Ok(Box::new(Splashes {
+                    splashes: Arc::clone(&s),
+                    menus: Arc::new(AtomicU32::new(0)),
+                }) as Box<dyn Screen>)
+            });
+            let clock = QpcClock::start();
+            let link = spawn(
+                make,
+                None,
+                None,
+                clock,
+                view(),
+                measure(clock),
+                Box::new(NoFrames),
+            )
+            .unwrap();
+            if !prepare_first {
+                assert!(wait_until(|| splashes.load(Ordering::SeqCst) >= 1));
+            }
+            assert!(link.prepare().is_ok());
+            let drawn = splashes.load(Ordering::SeqCst);
+            assert!(
+                wait_until(|| splashes.load(Ordering::SeqCst) >= drawn + 2),
+                "prepare first: {prepare_first}"
+            );
+            link.exit();
+        }
     }
 
     /// A screen that notes the section of every chart it prepares.

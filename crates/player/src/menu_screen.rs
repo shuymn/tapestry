@@ -19,6 +19,9 @@
 //! first frame was presented: the window stays hidden until then, so the
 //! empty window is never seen.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use bms_model::Chart;
 use eval::Section;
 use render::text::{Fonts, MenuText, TextBlock, TextStyle};
@@ -107,8 +110,10 @@ pub trait WindowSink: Send {
     /// The caret's area `[left, top, width, height]` in layout pixels
     /// (1920×1080), or `None` when no text box has focus.
     fn caret(&self, area: Option<[f32; 4]>);
-    /// A frame reached the window: it can be shown.
-    fn presented(&self);
+    /// The flag a frame that reached the window sets: the window, which
+    /// looks at it until it is shown, can show then. Setting it allocates
+    /// nothing, so a play's frame may set it.
+    fn presented(&self) -> Arc<AtomicBool>;
 }
 
 /// The splash page: the game's name and version, until the select
@@ -163,12 +168,12 @@ pub struct MenuScreen {
     /// The prepared page's composition, underlined: `[left, top, width,
     /// height]` in layout pixels.
     underline: Option<[f32; 4]>,
-    /// Where the caret's area and the first frame presented go.
+    /// Where the caret's area goes.
     sink: Option<Box<dyn WindowSink>>,
+    /// What a presented frame sets, from the sink.
+    presented: Option<Arc<AtomicBool>>,
     /// The caret's area last sent there; `None` before the first.
     sent: Option<Option<[f32; 4]>>,
-    /// Whether a frame was presented.
-    shown: bool,
 }
 
 impl MenuScreen {
@@ -181,8 +186,8 @@ impl MenuScreen {
             cursor: None,
             underline: None,
             sink: None,
+            presented: None,
             sent: None,
-            shown: false,
         }
     }
 
@@ -190,6 +195,7 @@ impl MenuScreen {
     /// each page prepared, and draws a splash page until told what to draw.
     #[must_use]
     pub fn with_sink(mut self, sink: Box<dyn WindowSink>) -> Self {
+        self.presented = Some(sink.presented());
         self.sink = Some(sink);
         self
     }
@@ -255,13 +261,12 @@ impl MenuScreen {
         self.sent = Some(area);
     }
 
-    /// Tells the sink of the first frame `presented`; passes it on.
-    fn shown(&mut self, presented: bool) -> bool {
-        if presented && !self.shown {
-            self.shown = true;
-            if let Some(sink) = &self.sink {
-                sink.presented();
-            }
+    /// Tells the window a frame was `presented`, with nothing allocated (a
+    /// play's frame calls it); passes it on.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn shown(&self, presented: bool) -> bool {
+        if presented && let Some(flag) = &self.presented {
+            flag.store(true, Ordering::Release);
         }
         presented
     }
@@ -384,7 +389,7 @@ impl MenuScreen {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use render::text::Fonts;
@@ -406,15 +411,15 @@ mod tests {
 
     /// The caret's areas a screen sent.
     #[derive(Clone, Default)]
-    struct Sent(Arc<Mutex<Vec<Option<[f32; 4]>>>>, Arc<AtomicU32>);
+    struct Sent(Arc<Mutex<Vec<Option<[f32; 4]>>>>, Arc<AtomicBool>);
 
     impl WindowSink for Sent {
         fn caret(&self, area: Option<[f32; 4]>) {
             self.0.lock().unwrap().push(area);
         }
 
-        fn presented(&self) {
-            self.1.fetch_add(1, Ordering::SeqCst);
+        fn presented(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.1)
         }
     }
 
@@ -430,19 +435,17 @@ mod tests {
     }
 
     /// A screen with a window to tell draws the splash page, in the menu
-    /// font or, for plays only, the bitmap font, and tells the window of
-    /// its first frame only; a screen without one draws no splash.
+    /// font or, for plays only, the bitmap font, and its presented frame
+    /// tells the window; a screen without one draws no splash.
     #[test]
-    fn the_splash_tells_the_window_of_the_first_frame() {
+    fn the_splash_tells_the_window_of_its_frame() {
         for fonts in [Some(Fonts::runtime().unwrap()), None] {
             let sent = Sent::default();
             let mut screen = MenuScreen::new(warp(), fonts).with_sink(Box::new(sent.clone()));
+            assert!(!sent.1.load(Ordering::Acquire));
             assert!(matches!(screen.splash(), Some(Ok(true))));
             assert!(screen.renderer.read_back().chunks(4).any(|p| p[0] > 200));
-            assert_eq!(sent.1.load(Ordering::SeqCst), 1);
-            assert!(matches!(screen.splash(), Some(Ok(true))));
-            screen.text(&["x"]).unwrap();
-            assert_eq!(sent.1.load(Ordering::SeqCst), 1);
+            assert!(sent.1.load(Ordering::Acquire));
         }
         let mut screen = MenuScreen::new(warp(), None);
         assert!(screen.splash().is_none());
