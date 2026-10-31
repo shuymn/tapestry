@@ -36,6 +36,8 @@ mod play;
 mod power;
 #[cfg(feature = "dev-tools")]
 mod presentmon;
+#[cfg(feature = "dev-tools")]
+mod recording;
 mod render_side;
 mod result_input;
 mod select;

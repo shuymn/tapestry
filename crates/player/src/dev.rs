@@ -27,6 +27,7 @@ use replay::DecodeLimits;
 
 use crate::args::{Command, UsageError};
 use crate::measure::Drawn;
+use crate::recording::SoundRecording;
 use crate::render_side::{FrameSink, Screen};
 
 /// Prints, to the console only, which window took the foreground when the
@@ -749,65 +750,8 @@ impl<O: AudioOutput + Wakes> AudioOutput for Paced<O> {
 pub fn sound_recording(clock: QpcClock, seconds: usize) -> Paced<SoundRecording> {
     let device = SimDevice::new(SimConfig::steady(48_000, 480, clock.now()));
     Paced {
-        inner: SoundRecording {
-            inner: device,
-            samples: Vec::with_capacity(48_000 * seconds * audio::CHANNELS),
-            quiet: false,
-        },
+        inner: SoundRecording::new(device, 48_000 * seconds),
         clock,
-    }
-}
-
-/// A recording of a simulated device that keeps every period that sounds
-/// and the first silent period of each silence. Recording allocates
-/// nothing.
-pub struct SoundRecording {
-    inner: SimDevice,
-    samples: Vec<f32>,
-    /// The last period kept was silent.
-    quiet: bool,
-}
-
-impl AudioOutput for SoundRecording {
-    fn rate(&self) -> u32 {
-        self.inner.rate()
-    }
-
-    fn period(&self) -> u32 {
-        self.inner.period()
-    }
-
-    fn wait(&mut self) -> Wake {
-        self.inner.wait()
-    }
-
-    fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
-        let samples = &mut self.samples;
-        let quiet = &mut self.quiet;
-        self.inner.write(|buf| {
-            f(buf);
-            let silent = buf.iter().all(|&x| x == 0.0);
-            if silent && *quiet {
-                return;
-            }
-            *quiet = silent;
-            let room = samples.capacity() - samples.len();
-            samples.extend_from_slice(&buf[..buf.len().min(room)]);
-        })
-    }
-
-    fn queue_periods(&self) -> Option<u32> {
-        self.inner.queue_periods()
-    }
-
-    fn set_queue_periods(&mut self, periods: u32) -> Option<u32> {
-        self.inner.set_queue_periods(periods)
-    }
-}
-
-impl Wakes for SoundRecording {
-    fn next_wake(&self) -> TimeUs {
-        self.inner.next_wake()
     }
 }
 
@@ -825,7 +769,7 @@ impl Recorded for RecordingOutput<SimDevice> {
 
 impl Recorded for SoundRecording {
     fn samples(&self) -> &[f32] {
-        &self.samples
+        SoundRecording::samples(self)
     }
 }
 
