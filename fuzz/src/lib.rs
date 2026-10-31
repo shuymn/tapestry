@@ -23,6 +23,7 @@ use skin_beatoraja::{
     Config, DeviationId, Header, ImportError, Imported, NoteKind, SIZES, Severity, import,
     read_header, resolve,
 };
+use skin_model::{FntError, FntFile, FntLimits};
 
 /// An empty folder for the chart's sounds. Nothing is written to it, so
 /// every `#WAV` name resolves to no file.
@@ -209,8 +210,9 @@ pub const SKIN_FILES: [&str; 4] = ["s.json", "i1.json", "i2.json", "i3.json"];
 
 /// A folder for the skin definitions, rewritten by each input, with
 /// fixed resources the definitions can name: `strip.png`, ten 10×10
-/// frames in a row; `grid.png`, a 2×2 grid of 4×4 frames; and `font.ttf`,
-/// a file with a font's magic number.
+/// frames in a row; `grid.png`, a 2×2 grid of 4×4 frames; `font.ttf`,
+/// a file with a font's magic number; and `font.fnt`, the bitmap font
+/// [`seeds::FONT_FNT`], whose page is `font_0.png`, 16×8.
 fn skin_dir() -> &'static Path {
     static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -221,6 +223,8 @@ fn skin_dir() -> &'static Path {
         write_png(&dir.path().join("strip.png"), 100, 10);
         write_png(&dir.path().join("grid.png"), 8, 8);
         std::fs::write(dir.path().join("font.ttf"), [0, 1, 0, 0, 0]).expect("write a font");
+        std::fs::write(dir.path().join("font.fnt"), seeds::FONT_FNT).expect("write a font");
+        write_png(&dir.path().join("font_0.png"), 16, 8);
         dir
     })
     .path()
@@ -307,6 +311,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
     }
     skin.attach_text(&mut play, TextTable::new(lines))
         .expect("one line per slot");
+    skin.attach_bitmap_text(&mut play, &text);
     let tally = Tally {
         counts: PerJudgment {
             perfect: 1,
@@ -462,10 +467,13 @@ pub fn skin_json(data: &[u8]) -> Result<(Header, Result<Imported, ImportError>),
 /// An import's charged counters are within the model's caps.
 fn check_usage(i: &Imported) {
     use skin_model::{
-        MAX_ELEMENTS, MAX_FILES, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_WIDGET_QUADS,
+        MAX_ELEMENTS, MAX_FILES, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES,
+        MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_WIDGET_QUADS,
     };
     let u = i.report.usage;
     let within = |n: u32, cap: usize| usize::try_from(n).is_ok_and(|n| n <= cap);
+    assert!(within(u.glyphs, MAX_SHEET_GLYPHS), "too many glyphs");
+    assert!(within(u.kernings, MAX_SHEET_KERNINGS), "too many kernings");
     assert!(within(u.elements, MAX_ELEMENTS), "too many elements");
     assert!(within(u.keys, MAX_SKIN_KEYS), "too many keys");
     assert!(within(u.ops, MAX_SKIN_OPS), "too many ops");
@@ -495,6 +503,86 @@ fn check_usage(i: &Imported) {
         i.skin.ops().total() <= usize::try_from(u.ops).unwrap_or(usize::MAX),
         "more ops kept than charged"
     );
+}
+
+/// Target `skin_fnt`: a bitmap `.fnt` file's bytes, parsed with one
+/// file's caps.
+///
+/// # Errors
+///
+/// What [`FntFile::parse`] refuses.
+///
+/// # Panics
+///
+/// If a parsed font breaks [`check_fnt`]'s bounds.
+pub fn skin_fnt(data: &[u8]) -> Result<FntFile, FntError> {
+    let f = FntFile::parse(data, "fonts", FntLimits::FILE)?;
+    check_fnt(&f);
+    Ok(f)
+}
+
+/// A parsed font is within its caps, its tables are sorted and unique,
+/// its glyphs are on its pages, and every value is a finite number of ems.
+fn check_fnt(f: &FntFile) {
+    use skin_model::{MAX_FNT_PAGES, MAX_FNT_VALUE, MAX_FONT_GLYPHS, MAX_FONT_KERNINGS};
+    let size = f.size();
+    assert!(
+        size > 0 && i32::from(size) <= MAX_FNT_VALUE,
+        "a size out of range"
+    );
+    let glyphs = f.glyphs().len() + usize::from(f.missing().is_some());
+    assert!(glyphs <= MAX_FONT_GLYPHS, "too many glyphs");
+    assert!(f.kernings().len() <= MAX_FONT_KERNINGS, "too many kernings");
+    assert!(
+        (1..=MAX_FNT_PAGES).contains(&f.pages().len()),
+        "a page count out of range"
+    );
+    assert!(
+        f.pages()
+            .iter()
+            .all(|p| p.len() <= skin_model::MAX_PATH_BYTES),
+        "a page path too long"
+    );
+    assert!(
+        f.glyphs().windows(2).all(|w| w[0].code < w[1].code),
+        "glyphs not sorted and unique"
+    );
+    assert!(
+        f.kernings()
+            .windows(2)
+            .all(|w| (w[0].first, w[0].second) < (w[1].first, w[1].second)),
+        "kernings not sorted and unique"
+    );
+    assert!(f.glyph(u32::from(b' ')).is_some(), "no space");
+    let em = |v: i32| {
+        let e = f64::from(v) / f64::from(size);
+        assert!(e.is_finite(), "a value of no finite em");
+    };
+    em(f.ascent());
+    em(f.rep());
+    assert!(
+        f.glyphs().iter().all(|g| g.code != 0),
+        "the missing glyph in the table"
+    );
+    for g in f.glyphs().iter().chain(f.missing().as_ref()) {
+        assert!(
+            usize::from(g.page) < f.pages().len(),
+            "a glyph off its pages"
+        );
+        for v in [g.xoff, g.raw_yoff, g.adv] {
+            em(i32::from(v));
+        }
+        for v in g.src {
+            em(i32::from(v));
+        }
+        em(i32::from(g.raw_yoff) - f.ascent());
+    }
+    for k in f.kernings() {
+        assert!(
+            f.glyph(u32::from(k.first)).is_some(),
+            "a kerning pair without its first glyph"
+        );
+    }
 }
 
 /// Target `canary`, for the self-test only (scripts/fuzz-selftest.sh): one

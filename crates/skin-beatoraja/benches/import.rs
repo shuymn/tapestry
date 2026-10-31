@@ -5,6 +5,9 @@
 //! lanes, one judge and a 36-node gauge.
 //! `skin_beatoraja_import_element_cap` is a skin at the element cap, each
 //! element its own image.
+//! `skin_beatoraja_import_bitmap_fonts` is 64 texts of 128 glyphs in 16
+//! bitmap `.fnt` fonts of 16 pages each, together at the sheet's glyph and
+//! kerning caps.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -159,6 +162,12 @@ fn bench_import(c: &mut Criterion) {
     element_cap(d.path());
     assert_eq!(run(d.path()), 16_384);
     c.bench_function("skin_beatoraja_import_element_cap", |b| {
+        b.iter(|| black_box(run(black_box(d.path()))));
+    });
+    let d = tempfile::tempdir().unwrap();
+    common::bitmap_fonts(d.path(), 0);
+    assert_eq!(run(d.path()), 64);
+    c.bench_function("skin_beatoraja_import_bitmap_fonts", |b| {
         b.iter(|| black_box(run(black_box(d.path()))));
     });
 }
