@@ -12,8 +12,10 @@
 //! 2. File choice: configured, then the default by name or stem ignoring
 //!    ASCII case (first sorted when ambiguous), then the first sorted
 //!    candidate; reported (D8, [`super::asset`]).
-//! 3. Bitmap `.fnt` fonts: the default font at the source's size, top
-//!    kept; reported (D7, [`super::widget::text`]).
+//! 3. Bitmap `.fnt` fonts: drawn as bitmap fonts with their fallbacks,
+//!    the size rounded to a whole pixel (D12); distance-field ones with
+//!    the default font at the source's size, top kept (D13); a size of 0
+//!    or less ignored; reported ([`super::widget::text`]).
 //! 4. The five 16:9 skin sizes ([`crate::SIZES`]).
 //! 5. Play-critical numbers: EX score and max combo, by what they show
 //!    ([`super::property::Value::critical`]).
