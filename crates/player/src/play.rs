@@ -9,7 +9,6 @@
 //! render thread draws at the clock minus the origin. This thread runs the
 //! logic step, woken by the input thread after each publication.
 
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -18,7 +17,7 @@ use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
     Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, MenuCommand,
-    Opening, PlayReport, RenderSide, ResultScreen, Rig, Settings, Tuning, ViewStatus,
+    Opening, PlayReport, RenderSide, ResultScreen, Rig, Settings, Tuning,
 };
 use input::{QpcClock, SourceReader};
 
@@ -31,7 +30,7 @@ use crate::measure::{
     process_page_faults, to_toml,
 };
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
-use crate::select::{MenuInput, MenuQueue, result_event, result_key};
+use crate::result_input::ResultInput;
 use crate::tuning::{Delivered, SettingsFiles};
 
 /// How long the logic step parks at most without a wake from the input
@@ -47,110 +46,6 @@ const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs
 /// Each saved play's record and figures, in order (dev-tools).
 #[cfg(feature = "dev-tools")]
 pub type MeasuredPlays = std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, Figures)>>>;
-
-/// The controller's menu events from the input thread, shared by the select
-/// screen and the result screen.
-#[derive(Default)]
-pub struct Pad {
-    /// Its queue; none without a configured controller.
-    pub receiver: Option<input::MenuReceiver>,
-    /// The events its queue dropped, as last reported.
-    pub dropped: u64,
-}
-
-impl Pad {
-    /// Takes the next event.
-    pub fn pop(&mut self) -> Option<input::MenuEvent> {
-        self.receiver.as_mut()?.pop()
-    }
-
-    /// Drops what is queued.
-    pub fn clear(&mut self) {
-        while self.pop().is_some() {}
-    }
-
-    /// Reports events the full queue dropped since the last report.
-    pub fn report_dropped(&mut self, screen: &str) {
-        let Some(pad) = &self.receiver else {
-            return;
-        };
-        let dropped = pad.dropped();
-        if dropped > self.dropped {
-            let line = format!(
-                "{screen}: {} controller menu events dropped, their queue was full",
-                dropped - self.dropped
-            );
-            eprintln!("{line}");
-            log::warn!("{line}");
-            self.dropped = dropped;
-        }
-    }
-}
-
-/// The result screen's input (design.md "Input"): the window's keys and
-/// the controller's menu events, read only while a result shows, so the
-/// select screen's input is never taken by a result.
-pub struct ResultInput {
-    /// What the window hands the menus; the select screen reads it too.
-    pub menu: Arc<MenuQueue>,
-    /// The controller's menu events.
-    pub pad: Pad,
-    /// Whether a result shows.
-    pub showing: bool,
-}
-
-impl ResultInput {
-    /// Input with nothing queued, no controller, and no result showing.
-    pub fn new(menu: Arc<MenuQueue>, pad: Option<input::MenuReceiver>) -> Self {
-        Self {
-            menu,
-            pad: Pad {
-                receiver: pad,
-                dropped: 0,
-            },
-            showing: false,
-        }
-    }
-
-    /// Drops everything queued: what arrived while no screen read it
-    /// belongs to no screen.
-    pub fn clear(&mut self) {
-        while self.menu.pop().is_some() {}
-        self.pad.clear();
-    }
-
-    /// A result shows: on entry, what was queued during the play is
-    /// dropped. Whether this was the entry.
-    pub fn enter(&mut self) -> bool {
-        if self.showing {
-            return false;
-        }
-        self.clear();
-        self.showing = true;
-        true
-    }
-
-    /// The next result command queued, while a result shows: the
-    /// controller's first, then the window's; keys and text that mean
-    /// nothing there are dropped.
-    pub fn take(&mut self) -> Option<MenuCommand> {
-        if !self.showing {
-            return None;
-        }
-        if let Some(event) = self.pad.pop() {
-            return Some(result_event(event));
-        }
-        self.pad.report_dropped("result");
-        while let Some(input) = self.menu.pop() {
-            if let MenuInput::Key(key) = input
-                && let Some(c) = result_key(key)
-            {
-                return Some(c);
-            }
-        }
-        None
-    }
-}
 
 /// The game's threads as a rig.
 pub struct PlayerRig<'a> {
@@ -352,42 +247,6 @@ impl PlayerRig<'_> {
         }
         #[cfg(not(feature = "dev-tools"))]
         let _: Figures = fig;
-    }
-
-    /// Prints which preset the result views when that changed, and how
-    /// long a new evaluation took, with any error's full chain.
-    fn print_view(&mut self, screen: &ResultScreen) {
-        let Some(entry) = screen.viewed() else {
-            return;
-        };
-        let evaluations = screen.evaluations();
-        let before = self.viewed.replace((entry.name.clone(), evaluations));
-        if let Some(t) = screen.last_evaluation()
-            && before
-                .as_ref()
-                .map_or(evaluations > 0, |(_, n)| *n < evaluations)
-        {
-            println!("result: evaluated {} in {} ms", entry.name, t.as_millis());
-        }
-        if before.is_some_and(|(name, n)| name == entry.name && n == evaluations) {
-            return;
-        }
-        let what = match screen.status() {
-            ViewStatus::Ready(s) if s.as_played => "as played".to_owned(),
-            ViewStatus::Ready(s) => format!("what-if, {:?}", s.coverage),
-            ViewStatus::CannotLoad(e) => format!("cannot load: {}", Chain(e)),
-            ViewStatus::OverBudget { needed, budget } => {
-                format!("too large to re-evaluate: {needed} bytes, budget {budget}")
-            }
-            ViewStatus::Failed(e) => format!("no re-evaluation: {}", Chain(e)),
-            ViewStatus::NothingRecorded => "nothing recorded".to_owned(),
-        };
-        println!("result: viewing {} ({what})", entry.name);
-        log::info!("result: viewing {} ({what})", entry.name);
-        if let Some(e) = screen.file_error() {
-            eprintln!("result: {}", Chain(e));
-            log::warn!("result: {}", Chain(e));
-        }
     }
 
     fn print(&self, report: &PlayReport) {

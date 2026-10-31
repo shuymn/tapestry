@@ -18,14 +18,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bms_model::{TimeSource, TimeUs};
-use game::{AppRig, Chain, LoadRefusal, Loaded, Refused, SessionError};
+use game::{AppRig, Chain, LoadRefusal, Loaded, Refused, ResultScreen, SessionError, ViewStatus};
 
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
 use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text};
 use crate::log_file;
-use crate::play::{Pad, PlayerRig, since};
+use crate::play::{PlayerRig, since};
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
+use crate::result_input::Pad;
 use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
 use crate::shelf::{Shelf, file_name};
 use crate::window::ImeSwitch;
@@ -388,6 +389,42 @@ impl PlayerRig<'_> {
         }
     }
 
+    /// Prints which preset the result views when that changed, and how
+    /// long a new evaluation took, with any error's full chain.
+    pub(crate) fn print_view(&mut self, screen: &ResultScreen) {
+        let Some(entry) = screen.viewed() else {
+            return;
+        };
+        let evaluations = screen.evaluations();
+        let before = self.viewed.replace((entry.name.clone(), evaluations));
+        if let Some(t) = screen.last_evaluation()
+            && before
+                .as_ref()
+                .map_or(evaluations > 0, |(_, n)| *n < evaluations)
+        {
+            println!("result: evaluated {} in {} ms", entry.name, t.as_millis());
+        }
+        if before.is_some_and(|(name, n)| name == entry.name && n == evaluations) {
+            return;
+        }
+        let what = match screen.status() {
+            ViewStatus::Ready(s) if s.as_played => "as played".to_owned(),
+            ViewStatus::Ready(s) => format!("what-if, {:?}", s.coverage),
+            ViewStatus::CannotLoad(e) => format!("cannot load: {}", Chain(e)),
+            ViewStatus::OverBudget { needed, budget } => {
+                format!("too large to re-evaluate: {needed} bytes, budget {budget}")
+            }
+            ViewStatus::Failed(e) => format!("no re-evaluation: {}", Chain(e)),
+            ViewStatus::NothingRecorded => "nothing recorded".to_owned(),
+        };
+        println!("result: viewing {} ({what})", entry.name);
+        log::info!("result: viewing {} ({what})", entry.name);
+        if let Some(e) = screen.file_error() {
+            eprintln!("result: {}", Chain(e));
+            log::warn!("result: {}", Chain(e));
+        }
+    }
+
     /// A result shows: the scan goes on, and a scripted step for it runs.
     pub(crate) fn result_shown(&mut self) {
         let Some(sel) = &mut self.selection else {
@@ -550,7 +587,7 @@ mod tests {
     use game::DataRoot;
 
     use super::Selection;
-    use crate::play::{Pad, ResultInput};
+    use crate::result_input::{Pad, ResultInput};
     use crate::select::{MenuInput, MenuKey, MenuQueue, SelectScreen};
     use crate::shelf::{Shelf, open};
 

@@ -35,6 +35,7 @@ mod power;
 #[cfg(feature = "dev-tools")]
 mod presentmon;
 mod render_side;
+mod result_input;
 mod select;
 mod selection;
 mod shelf;
@@ -652,7 +653,7 @@ fn rig<'a>(
         seen: Delivered::default(),
         end_lines: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
-        result_input: play::ResultInput::new(Arc::new(MenuQueue::default()), None),
+        result_input: result_input::ResultInput::new(Arc::new(MenuQueue::default()), None),
         viewed: None,
         #[cfg(feature = "dev-tools")]
         result_script: None,
@@ -927,7 +928,7 @@ fn play(
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
-    rig.result_input = play::ResultInput::new(menu, pad);
+    rig.result_input = result_input::ResultInput::new(menu, pad);
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run_chart(&mut loaded, &mut rig);
@@ -1184,7 +1185,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     };
     let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock);
     rig.queue_most = opened.most_queued_periods;
-    rig.result_input = play::ResultInput::new(Arc::clone(&menu), pad);
+    rig.result_input = result_input::ResultInput::new(Arc::clone(&menu), pad);
     rig.selection = Some(selection::Selection {
         shelf,
         screen: select::SelectScreen::new(roots),
