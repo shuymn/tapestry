@@ -538,11 +538,11 @@ impl Resolver<'_, '_> {
         id: u32,
         depth: u32,
         nested: &mut HashMap<u32, Vec<u32>>,
-    ) -> Result<Vec<u32>, ImportError> {
+    ) -> Result<(), ImportError> {
         let mut out = Vec::new();
         self.array(id, depth, &mut out)?;
-        nested.insert(id, out.clone());
-        Ok(out)
+        nested.insert(id, out);
+        Ok(())
     }
 
     /// A `Destination[]` field at `depth`, and each destination's `dst`.
@@ -552,7 +552,12 @@ impl Resolver<'_, '_> {
         depth: u32,
         nested: &mut HashMap<u32, Vec<u32>>,
     ) -> Result<(), ImportError> {
-        for d in self.nested_array(id, depth, nested)? {
+        self.nested_array(id, depth, nested)?;
+        // Each destination's `dst` is another node, so `id`'s list stays
+        // as resolved while they are added.
+        let mut i = 0;
+        while let Some(&d) = nested.get(&id).and_then(|l| l.get(i)) {
+            i += 1;
             if let Some(dst) = self.def.fields(d, ["dst"])[0] {
                 self.nested_array(dst, depth + 2, nested)?;
             }
