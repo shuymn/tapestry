@@ -550,9 +550,15 @@ mod tests {
             #[cfg(feature = "dev-tools")]
             script: None,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The scan pass runs in background mode, which a loaded machine
+        // starves for seconds: the bound only catches a pass that never
+        // lists them.
+        let begun = Instant::now();
         while sel.screen.listed() < 3 {
-            assert!(Instant::now() < deadline, "the charts were not listed");
+            assert!(
+                begun.elapsed() < Duration::from_secs(600),
+                "the charts were not listed"
+            );
             sel.shelf.poll(Instant::now());
             sel.refresh();
             std::thread::sleep(Duration::from_millis(10));

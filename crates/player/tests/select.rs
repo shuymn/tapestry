@@ -91,11 +91,15 @@ fn fixture() -> Fixture {
     }
 }
 
-/// `tapestry --auto --dev-headless --dev-select <steps>` and `extra`.
+/// `tapestry --auto --dev-headless --dev-select <steps>` and `extra`, with
+/// a render bound that only catches a render thread that never answers:
+/// WARP frames on a loaded machine can take tens of seconds, past the
+/// production bounds.
 fn select(fx: &Fixture, steps: &str, extra: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tapestry"));
     command
         .args(["--auto", "--dev-headless", "--dev-select", steps])
+        .args(["--dev-render-timeout", "600"])
         .args(extra)
         .env("LOCALAPPDATA", &fx.appdata);
     command

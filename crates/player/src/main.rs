@@ -1132,7 +1132,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     };
     #[cfg(not(feature = "dev-tools"))]
     let frames: Box<dyn render_side::FrameSink> = Box::new(NoFrames);
-    let render = match render_side::spawn(make, None, clock, view(&controls), measure, frames) {
+    #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+    let mut render = match render_side::spawn(make, None, clock, view(&controls), measure, frames) {
         Ok(r) => r,
         Err(e) => {
             audio.exit();
@@ -1142,6 +1143,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
+    #[cfg(feature = "dev-tools")]
+    if let Some(bound) = s.dev.render_timeout {
+        render.set_timeouts(bound, bound);
+    }
     let threads = Threads {
         input,
         audio,

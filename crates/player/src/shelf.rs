@@ -377,16 +377,16 @@ mod tests {
         shelf.wait_paused(PAUSE_SLICE, || false, Duration::MAX, || {})
     }
 
-    /// Polls until the running pass has ended. The bound only catches a
-    /// pass that never ends: the pass runs in background mode, which a
-    /// loaded machine can starve for seconds.
+    /// How long a test waits for something that must happen however late a
+    /// loaded machine runs it: it only catches what never happens.
+    const WATCHDOG: Duration = Duration::from_secs(600);
+
+    /// Polls until the running pass has ended. The pass runs in background
+    /// mode, which a loaded machine can starve for seconds.
     fn pass_ends(shelf: &mut Shelf) {
         let begun = Instant::now();
         while shelf.has_scan() {
-            assert!(
-                begun.elapsed() < Duration::from_secs(600),
-                "the pass never ended"
-            );
+            assert!(begun.elapsed() < WATCHDOG, "the pass never ended");
             shelf.poll(Instant::now());
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -548,21 +548,37 @@ mod tests {
     }
 
     /// The end of a run whose pass is stuck (its gate never opens) is
-    /// bounded: the shelf drops within its stop bound, and the stuck pass
-    /// keeps the library refused to another opening until it ends.
+    /// bounded: the shelf drops after its stop bound without waiting for
+    /// the pass, and the stuck pass keeps the library refused to another
+    /// opening until it ends.
     #[test]
     fn a_stuck_pass_bounds_the_shutdown_and_keeps_the_library_locked() {
         let dir = tempfile::tempdir().unwrap();
         let (shelf, gate) = gated(dir.path());
-        let started = Instant::now();
-        drop(shelf);
-        assert!(started.elapsed() < super::STOP_TIMEOUT + Duration::from_secs(2));
+        let (dropped_tx, dropped) = std::sync::mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            let started = Instant::now();
+            drop(shelf);
+            let _ = dropped_tx.send(started.elapsed());
+        });
+        // The gate stays shut until the drop returns, so the pass cannot
+        // end first: only the stop bound ends the drop, which never waits
+        // for the pass.
+        let Ok(took) = dropped.recv_timeout(WATCHDOG) else {
+            // Let the pass and the drop end before failing.
+            open_gate(&gate);
+            let _ = dropping.join();
+            panic!("the drop waited for the stuck pass");
+        };
+        assert!(took >= super::STOP_TIMEOUT, "{took:?}");
         let root = DataRoot::new(dir.path().join("data"));
         assert!(matches!(open(&root), Err(OpenError::Running { .. })));
         open_gate(&gate);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // However long the machine takes to run the released pass to its
+        // end.
+        let begun = Instant::now();
         while open(&root).is_err() {
-            assert!(Instant::now() < deadline, "the lock stayed");
+            assert!(begun.elapsed() < WATCHDOG, "the lock stayed");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
