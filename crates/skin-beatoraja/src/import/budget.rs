@@ -6,8 +6,8 @@ use std::fmt;
 
 use skin_model::{
     Charge, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGES, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
-    MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TRACK_KEYS,
-    MAX_WHEN_TIMERS, MAX_WIDGET_QUADS, Program, SkinOps,
+    MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES,
+    MAX_TOTAL_FONT_BYTES, MAX_TRACK_KEYS, MAX_WHEN_TIMERS, MAX_WIDGET_QUADS, Program, SkinOps,
 };
 
 use super::report::Usage;
@@ -69,6 +69,18 @@ impl fmt::Display for ImportLimit {
 pub(crate) struct Budget {
     pub(crate) usage: Usage,
     ops: SkinOps,
+    /// The bytes charged for bitmap font pages, low and high variant,
+    /// failed admissions included: never refunded.
+    page_bytes: [u64; 2],
+    /// The bytes charged for `.fnt` files, failed ones included.
+    font_bytes: u64,
+}
+
+/// `n` more bytes on `total`, at most `cap`; unchanged when it would pass.
+fn charge_bytes(total: &mut u64, n: u64, cap: u64, limit: ImportLimit) -> Result<(), ImportLimit> {
+    let next = total.checked_add(n).filter(|&t| t <= cap).ok_or(limit)?;
+    *total = next;
+    Ok(())
 }
 
 /// `n` more on `count`, at most `cap`; unchanged when it would pass.
@@ -136,15 +148,30 @@ impl Budget {
         )
     }
 
-    /// A charge of a bitmap font's admission: its attempts, its pages'
-    /// images and frames. Its bytes are bounded by the sheet builder's
-    /// totals, the same ones every font and image file counts against.
+    /// A charge of a bitmap font's admission: its attempts, its file's
+    /// bytes, its pages' bytes, images and frames. Every charge stays
+    /// spent when the admission later fails; the bytes are kept here
+    /// against the sheet's totals, since the builder counts only what it
+    /// keeps.
     pub(crate) fn fnt_charge(&mut self, c: Charge) -> Result<(), ImportLimit> {
         match c {
             Charge::FileAttempt => self.file_attempt(),
             Charge::Image => charge(&mut self.usage.images, 1, MAX_IMAGES, ImportLimit::Images),
             Charge::Frames(n) => self.frames(n),
-            Charge::FontBytes(_) | Charge::ImageBytes { .. } => Ok(()),
+            Charge::FontBytes(n) => charge_bytes(
+                &mut self.font_bytes,
+                n,
+                MAX_TOTAL_FONT_BYTES,
+                ImportLimit::Fonts,
+            ),
+            Charge::ImageBytes { lo, hi } => {
+                let [mut l, mut h] = self.page_bytes;
+                let cap = MAX_TOTAL_FILE_BYTES;
+                charge_bytes(&mut l, lo, cap, ImportLimit::FileTotals)?;
+                charge_bytes(&mut h, hi, cap, ImportLimit::FileTotals)?;
+                self.page_bytes = [l, h];
+                Ok(())
+            }
         }
     }
 

@@ -331,6 +331,7 @@ fn check_f6(_: &Header, i: Imported) {
     assert_eq!(u.glyphs, as_u32(MAX_SHEET_GLYPHS));
     assert_eq!(u.kernings, as_u32(MAX_SHEET_KERNINGS));
     assert_eq!(u.images, as_u32(MAX_FONTS * MAX_FNT_PAGES));
+    assert_eq!(u.files, as_u32(MAX_FONTS * MAX_FNT_PAGES));
     assert_eq!(u.widget_quads, as_u32(MAX_TEXT_ELEMENTS * 128));
     assert_eq!(i.report.notes, []);
     assert_eq!(i.skin.sheet().bitmap_font_count(), MAX_FONTS);

@@ -303,7 +303,8 @@ impl Cx<'_> {
 
     /// The bitmap font of `.fnt` font record `rec` with primary `path`:
     /// made once per record, its files admitted once per name. A fallback
-    /// that fails is skipped with a note; a primary that fails ignores
+    /// that fails is skipped with a note, ignored when the source also
+    /// fails to load it and dropped otherwise; a primary that fails ignores
     /// the element when the source also draws nothing, and drops it
     /// otherwise. `None` when the element went.
     fn bitmap_font(
@@ -332,8 +333,16 @@ impl Cx<'_> {
                         {
                             Ok(f) => fallbacks.push(f),
                             Err(failure) => {
+                                // Where the source draws the fallback, its
+                                // omission is ours: dropped, not ignored.
+                                let severity = match failure {
+                                    FntFailure::Fnt(e) if !e.kind.upstream_fails() => {
+                                        Severity::Dropped
+                                    }
+                                    _ => Severity::Ignored,
+                                };
                                 let why = failure_note(failure);
-                                self.note(Some(at), Severity::Ignored, why);
+                                self.note(Some(at), severity, why);
                             }
                         }
                     }

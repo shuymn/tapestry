@@ -312,6 +312,7 @@ impl Assets {
             return Ok(r);
         }
         let mut refused = None;
+        let files = self.builder.file_count();
         let admitted = self.builder.admit_fnt(name, &mut |c| {
             budget.fnt_charge(c).map_err(|l| {
                 refused = Some(l);
@@ -324,6 +325,12 @@ impl Assets {
         let result = match admitted {
             Ok(i) => {
                 budget.usage.fonts = budget.usage.fonts.saturating_add(1);
+                // Its pages are files of the sheet.
+                let pages = self.builder.file_count().saturating_sub(files);
+                budget.usage.files = budget
+                    .usage
+                    .files
+                    .saturating_add(u32::try_from(pages).unwrap_or(u32::MAX));
                 Ok(i)
             }
             Err(FntAdmitError::Limit(l)) => {

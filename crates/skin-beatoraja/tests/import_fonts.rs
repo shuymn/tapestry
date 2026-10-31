@@ -104,6 +104,8 @@ fn a_bitmap_font_draws_its_glyphs() {
             .is_empty()
     );
     assert_eq!((i.report.usage.fonts, i.report.usage.glyphs), (1, 3));
+    // Its page is a file of the sheet.
+    assert_eq!(i.report.usage.files, 1);
     // The box's top is 1080 − 830; the em is 24, the font's own size.
     let r = rects(i, "AA");
     close(r[0], [402.0, 251.0, 10.0, 20.0]);
@@ -301,4 +303,115 @@ fn a_page_past_the_image_budget_stops_before_it_is_read() {
         Err(ImportError::Limit { limit, .. }) => assert_eq!(limit, ImportLimit::Images),
         other => panic!("{:?}", other.map(|i| i.report.usage)),
     }
+}
+
+#[test]
+fn page_bytes_stay_charged_when_a_font_fails() {
+    // Two fonts of 16 pages of 32 MiB each (a sparse PNG), each failing
+    // after its pages' bytes were charged: the first fills the 512 MiB,
+    // so the second's first page passes it.
+    let fonts = r#"{"id": "a", "path": "a.fnt"}, {"id": "b", "path": "b.fnt"}"#;
+    let dir = skin(&[(
+        "s.json",
+        &json([1_920, 1_080], fonts, &[("a", 24, "A"), ("b", 24, "A")]),
+    )]);
+    png(dir.path(), "big.png", 4, 4);
+    std::fs::File::options()
+        .write(true)
+        .open(dir.path().join("big.png"))
+        .unwrap()
+        .set_len(skin_model::MAX_FILE_BYTES)
+        .unwrap();
+    let pages: String = (0..16)
+        .map(|p| format!("page id={p} file=\"big.png\"\n"))
+        .collect();
+    let text = format!(
+        "info face=\"t\" size=24 padding=0,0,0,0\n\
+         common lineHeight=24 base=20 scaleW=4 scaleH=4 pages=16\n{pages}\
+         char id=65 x=0 y=0 width=8 height=4 xoffset=0 yoffset=0 xadvance=4 page=0\n"
+    );
+    write(dir.path(), "a.fnt", text.as_bytes());
+    write(dir.path(), "b.fnt", text.as_bytes());
+    assert_eq!(
+        16 * skin_model::MAX_FILE_BYTES,
+        skin_model::MAX_TOTAL_FILE_BYTES
+    );
+    match import(dir.path()) {
+        Err(ImportError::Limit { limit, .. }) => assert_eq!(limit, ImportLimit::FileTotals),
+        other => panic!("{:?}", other.map(|i| i.report.notes)),
+    }
+    // One such font alone fails by itself, its bytes at the total.
+    let one = r#"{"id": "a", "path": "a.fnt"}"#;
+    write(
+        dir.path(),
+        "s.json",
+        json([1_920, 1_080], one, &[("a", 24, "A")]).as_bytes(),
+    );
+    let i = import(dir.path()).unwrap();
+    assert_eq!(
+        common::kinds(&i.report),
+        [NoteKind::BitmapFont(FntError {
+            line: 0,
+            kind: FntErrorKind::GlyphOutside { code: 65 },
+        })]
+    );
+}
+
+#[test]
+fn a_page_with_corrupt_pixels_fails_its_font_not_the_atlas() {
+    let fonts = r#"{"id": "a", "path": "p.fnt", "fallback": [{"path": "f.fnt"}]}"#;
+    let dir = skin(&[("s.json", &json([1_920, 1_080], fonts, &[("a", 24, "AB")]))]);
+    fnt(dir.path(), "p.fnt", &[A, M]);
+    fnt(dir.path(), "f.fnt", &[(66, 0, 4, 20, 0, 3, 12)]);
+    // The header is whole; the pixel data is cut short.
+    let page = std::fs::read(dir.path().join("f.fnt.png")).unwrap();
+    write(dir.path(), "f.fnt.png", &page[..page.len() - 24]);
+    let i = import(dir.path()).unwrap();
+    let notes: Vec<_> = i
+        .report
+        .notes
+        .iter()
+        .map(|n| (n.severity, n.kind))
+        .collect();
+    assert_eq!(
+        notes,
+        [(
+            Severity::Ignored,
+            bitmap(FntErrorKind::PageBroken { page: 0 })
+        )]
+    );
+    let limits = skin_model::AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    assert!(i.skin.atlas(skin_model::Variant::Lo, limits).is_ok());
+    assert_eq!(rects(i, "").len(), 1);
+}
+
+#[test]
+fn a_fallback_refused_only_by_our_rules_is_dropped() {
+    let fonts = r#"{"id": "a", "path": "p.fnt", "fallback": [{"path": "f.fnt"}]}"#;
+    let dir = skin(&[("s.json", &json([1_920, 1_080], fonts, &[("a", 24, "AB")]))]);
+    fnt(dir.path(), "p.fnt", &[A, M]);
+    fnt(dir.path(), "f.fnt", &[(66, 0, 4, 20, 0, 3, 12)]);
+    let s = std::fs::read_to_string(dir.path().join("f.fnt")).unwrap();
+    write(
+        dir.path(),
+        "f.fnt",
+        s.replacen(" scaleW=64", "", 1).as_bytes(),
+    );
+    let i = import(dir.path()).unwrap();
+    let notes: Vec<_> = i
+        .report
+        .notes
+        .iter()
+        .map(|n| (n.severity, n.kind))
+        .collect();
+    let kind = NoteKind::BitmapFont(FntError {
+        line: 2,
+        kind: FntErrorKind::Metadata("scaleW"),
+    });
+    assert_eq!(notes, [(Severity::Dropped, kind)]);
+    assert_eq!(i.report.usage.texts, 1);
 }
