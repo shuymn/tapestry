@@ -4,14 +4,14 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use skin_model::RootError;
+use skin_model::{Root, RootError};
 
 use crate::error::{ImportError, InputLimit};
 use crate::limits::{
     MAX_FILE_CHOICES, MAX_LIST_ENTRIES, MAX_OFFSETS, MAX_OPTION_ITEMS, MAX_OPTIONS,
 };
 use crate::resolve::{Definition, Resolved, resolve};
-use crate::tree::Kind;
+use crate::tree::{Kind, NONE};
 
 /// The skin sizes accepted, width by height: the 16:9 entries of the
 /// source's size list (`Resolution.java:9-23` at `0.8.9`). The source
@@ -101,8 +101,9 @@ pub fn read_header(root: &Path, file: &str) -> Result<(Definition, Header), Impo
     Ok((def, header))
 }
 
-/// Whether `name` matches `pattern`, where `*` stands for any run of
-/// bytes and everything else is literal.
+/// Whether `name` matches `pattern`, already in ASCII lower case, where
+/// `*` stands for any run of bytes and every other byte matches itself
+/// ignoring ASCII case.
 fn wildcard(name: &[u8], pattern: &[u8]) -> bool {
     let (mut n, mut p) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
@@ -112,7 +113,7 @@ fn wildcard(name: &[u8], pattern: &[u8]) -> bool {
                 star = Some((p, n));
                 p += 1;
             }
-            Some(&c) if c == name[n] => {
+            Some(&c) if c == name[n].to_ascii_lowercase() => {
                 n += 1;
                 p += 1;
             }
@@ -129,12 +130,13 @@ fn wildcard(name: &[u8], pattern: &[u8]) -> bool {
     pattern[p..].iter().all(|&c| c == b'*')
 }
 
-/// Whether a folder entry matches a file choice's pattern: in all lower
-/// case or all upper case, as the source's `{lower,upper}` glob does
-/// (`SkinConfigurationView.java:374-389` at `0.8.9`).
-fn matches(name: &str, pattern: &str) -> bool {
-    wildcard(name.as_bytes(), pattern.to_lowercase().as_bytes())
-        || wildcard(name.as_bytes(), pattern.to_uppercase().as_bytes())
+/// Whether a folder entry matches a file choice's pattern, `folded` to
+/// ASCII lower case once for the choice. Case is ignored: the source
+/// globs its `{lower,upper}` pattern (`SkinConfigurationView.java:374-389`
+/// at `0.8.9`) on the target's case-insensitive file system. Only ASCII
+/// letters fold, an intentional subset of that file system's folding.
+fn matches(name: &str, folded: &str) -> bool {
+    wildcard(name.as_bytes(), folded.as_bytes())
 }
 
 impl Resolved<'_> {
@@ -178,15 +180,19 @@ impl Resolved<'_> {
                 if d.arena.node(list).kind != Kind::Array {
                     return Err(type_error(d, list, "item", "an array"));
                 }
-                let children: Vec<u32> = d.arena.children(list).collect();
-                for it in children {
-                    if d.arena.node(it).kind != Kind::Object {
-                        return Err(type_error(d, it, "item", "an object"));
-                    }
+                // Sibling links, so nothing is collected before the item
+                // count is checked.
+                let mut next = d.arena.node(list).first_child;
+                while next != NONE {
+                    let it = next;
+                    next = d.arena.node(it).next_sibling;
                     if item_count >= MAX_OPTION_ITEMS {
                         return Err(over(d, it, InputLimit::OptionItems));
                     }
                     item_count += 1;
+                    if d.arena.node(it).kind != Kind::Object {
+                        return Err(type_error(d, it, "item", "an object"));
+                    }
                     let [n, op] = d.fields(it, ["name", "op"]);
                     items.push(OptionItem {
                         name: opt_string(d, n, "name")?,
@@ -288,42 +294,47 @@ fn opt_string(
 /// The entries matching file choice `path` (node `id`): its folder,
 /// joined to the definition's folder, listed through the skin folder's
 /// root with what remains of the entry allowance, and filtered by its
-/// last component. Only that component may hold wildcards, and only `*`
+/// last component. The whole name, as written and joined to the
+/// definition's folder, has the form [`Root::check_name`] requires before
+/// it is split. Only the last component may hold wildcards, and only `*`
 /// (`|`, `?`, `[`, `]`, `{` and `}` are refused rather than given the
 /// source's meanings). A folder that does not exist has no entries, as
 /// the source skips it (SkinConfigurationView.java:383-386).
 fn candidates(d: &mut Definition, id: u32, path: &str) -> Result<Vec<String>, ImportError> {
-    let at = d.loc(id);
-    if path.starts_with(['/', '\\']) {
+    let entry_dir = d.entry_dir();
+    let full = if entry_dir.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{entry_dir}/{path}")
+    };
+    if let Err(source) = Root::check_name(path).and_then(|()| Root::check_name(&full)) {
         return Err(ImportError::Read {
-            at: Some(at),
+            at: Some(d.loc(id)),
             name: path.to_owned(),
-            source: RootError::Rejected,
+            source,
         });
     }
     let (folder, pattern) = path.rsplit_once(['/', '\\']).unwrap_or(("", path));
     if folder.contains('*') || pattern.contains(['|', '?', '[', ']', '{', '}']) {
-        return Err(ImportError::Pattern { at });
+        return Err(ImportError::Pattern { at: d.loc(id) });
     }
-    let dir = [d.entry_dir(), folder]
-        .iter()
-        .filter(|s| !s.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join("/");
+    let folded = pattern.to_ascii_lowercase();
+    let dir = full
+        .rsplit_once(['/', '\\'])
+        .map_or(String::new(), |(dir, _)| dir.to_owned());
     let remaining = MAX_LIST_ENTRIES - d.run.entries;
     let listing = match d.root().list(&dir, remaining) {
         Ok(listing) => listing,
         Err(RootError::Missing | RootError::NotAFolder) => return Ok(Vec::new()),
         Err(RootError::TooManyEntries { .. }) => {
             return Err(ImportError::Input {
-                at: Some(at),
+                at: Some(d.loc(id)),
                 limit: InputLimit::ListEntries,
             });
         }
         Err(source) => {
             return Err(ImportError::Read {
-                at: Some(at),
+                at: Some(d.loc(id)),
                 name: dir,
                 source,
             });
@@ -333,7 +344,7 @@ fn candidates(d: &mut Definition, id: u32, path: &str) -> Result<Vec<String>, Im
     Ok(listing
         .entries
         .into_iter()
-        .filter(|e| matches(&e.name, pattern))
+        .filter(|e| matches(&e.name, &folded))
         .map(|e| e.name)
         .collect())
 }
@@ -343,10 +354,11 @@ mod tests {
     use super::matches;
 
     #[test]
-    fn patterns_match_in_lower_or_upper_case() {
+    fn patterns_match_ignoring_ascii_case() {
         assert!(matches("a.png", "*.png"));
         assert!(matches("A.PNG", "*.png"));
-        assert!(!matches("a.Png", "*.png"));
+        assert!(matches("background.Png", "*.png"));
+        assert!(!matches("\u{c9}.png", "\u{e9}.png"));
         assert!(matches("bg", "*"));
         assert!(matches("x_1.png", "x_*.png"));
         assert!(!matches("y_1.png", "x_*.png"));

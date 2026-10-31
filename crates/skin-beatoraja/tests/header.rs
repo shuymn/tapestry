@@ -352,8 +352,10 @@ fn candidates(path: &str) -> Vec<String> {
 fn file_choices_list_matching_entries_sorted() {
     assert_eq!(
         candidates("bg/*.png"),
-        ["C.PNG", "a.png", "b.png", "dir.png"]
+        ["C.PNG", "a.png", "b.png", "d.Png", "dir.png"]
     );
+    // Case is ignored in every letter of the pattern.
+    assert_eq!(candidates("bg/*.pNg"), candidates("bg/*.png"));
     assert_eq!(candidates("bg/a*"), ["a.png"]);
     // A folder choice.
     assert_eq!(candidates("custom/*"), ["f.json", "one", "two"]);
@@ -383,6 +385,21 @@ fn file_choices_resolve_from_the_definition_folder() {
     assert_eq!(
         files(d.path(), "play/s.json").unwrap()[0].candidates,
         ["x.ttf", "y.ttf"]
+    );
+    // A file choice declared in an included fragment resolves from the
+    // entry file's folder, not the fragment's.
+    let fragment = skin(&[
+        ("play/z.ttf", ""),
+        ("play/parts/w.ttf", ""),
+        (
+            "play/s.json",
+            &play(r#""filepath": {"include": "parts/f.json"}"#),
+        ),
+        ("play/parts/f.json", r#"[{"path": "*.ttf"}]"#),
+    ]);
+    assert_eq!(
+        files(fragment.path(), "play/s.json").unwrap()[0].candidates,
+        ["z.ttf"]
     );
     for (file, want) in [("play/t.json", "underflow"), ("play/u.json", "rejected")] {
         match files(d.path(), file) {
@@ -417,6 +434,30 @@ fn file_choices_allow_wildcards_in_the_last_component_only() {
             ),
             "{path}"
         );
+    }
+}
+
+#[test]
+fn file_choice_names_are_checked_whole_before_listing() {
+    let long_last = format!("bg/{}*.png", "a".repeat(skin_model::MAX_PATH_BYTES));
+    let joined_long = format!("{}*", "a".repeat(skin_model::MAX_PATH_BYTES - 1));
+    for (file, path) in [
+        ("s.json", "C:*.png"),
+        ("s.json", "c:bg/*.png"),
+        ("s.json", "bg/x:*.png"),
+        ("s.json", long_last.as_str()),
+        // Within the bound as written, over it joined to `play`.
+        ("play/s.json", joined_long.as_str()),
+    ] {
+        let text = play(&format!(r#""filepath": [{{"path": "{path}"}}]"#));
+        let d = skin(&[(file, &text), ("bg/a.png", ""), ("play/a.png", "")]);
+        match common::header_of(d.path(), file) {
+            Err(ImportError::Read {
+                source: RootError::Rejected,
+                ..
+            }) => {}
+            other => panic!("{path}: {other:?}"),
+        }
     }
 }
 
