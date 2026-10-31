@@ -3,7 +3,7 @@
 
 use skin_model::{Align, DigitsDef, GlyphSet, MAX_COORD, NumberDef, Pad, Source, Ty};
 
-use super::super::geom::{HEIGHT, Q};
+use super::super::geom::{HEIGHT, Q, Rect};
 use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, IntProp, Value};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity};
@@ -40,6 +40,26 @@ pub(super) fn cells(digit: i32, pad: Pad) -> Option<(i32, i32)> {
     } else {
         None
     }
+}
+
+/// The model's space between cells for keys of `(x, rect, pitch)`: the
+/// rounded pitch less the rounded width while every key has the same
+/// width and pitch, else the rounded scaled `space` `sr`; `None` when it
+/// does not round or lies outside the model's coordinates.
+pub(super) fn cell_space(keys: &[(Q, Rect, Q)], sr: Q) -> Option<i128> {
+    let same = keys
+        .windows(2)
+        .all(|w| matches!(w, [(_, a, pa), (_, b, pb)] if a.w == b.w && pa == pb));
+    let space = match (same, keys.first()) {
+        (true, Some((_, r0, p0))) => p0
+            .round()
+            .zip(r0.w.round())
+            .and_then(|(p, w)| p.checked_sub(w)),
+        _ => sr.round(),
+    }?;
+    (-i128::from(MAX_COORD)..=i128::from(MAX_COORD))
+        .contains(&space)
+        .then_some(space)
 }
 
 impl Cx<'_> {
@@ -215,20 +235,7 @@ impl Cx<'_> {
             let x = rect.x.add(shift).ok_or_else(|| range(self))?;
             keys.push((x, rect, p));
         }
-        let same = keys
-            .windows(2)
-            .all(|w| matches!(w, [(_, a, pa), (_, b, pb)] if a.w == b.w && pa == pb));
-        let space = match (same, keys.first()) {
-            (true, Some((_, r0, p0))) => p0
-                .round()
-                .zip(r0.w.round())
-                .and_then(|(p, w)| p.checked_sub(w)),
-            _ => sr.round(),
-        }
-        .ok_or_else(|| range(self))?;
-        if !(-i128::from(MAX_COORD)..=i128::from(MAX_COORD)).contains(&space) {
-            return Err(range(self));
-        }
+        let space = cell_space(&keys, sr).ok_or_else(|| range(self))?;
         let mut rects = Vec::with_capacity(keys.len());
         for (x, rect, p) in &keys {
             let w = rect.w.round().ok_or_else(|| range(self))?;

@@ -11,7 +11,7 @@
 use bms_model::TimeUs;
 use skin_model::{
     Align, Attach, ComboPart, DigitsDef, Ease, GlyphSet, GradePart, JudgeDef, JudgeSlot, KeyDef,
-    MAX_COORD, Pad, Source, Track,
+    Pad, Source, Track,
 };
 
 use super::super::geom::{Q, Rect};
@@ -338,20 +338,7 @@ impl Cx<'_> {
                 .ok_or_else(|| range(self))?;
             keys.push((x, rect, p));
         }
-        let same = keys
-            .windows(2)
-            .all(|w| matches!(w, [(_, a, pa), (_, b, pb)] if a.w == b.w && pa == pb));
-        let space = match (same, keys.first()) {
-            (true, Some((_, r0, p0))) => p0
-                .round()
-                .zip(r0.w.round())
-                .and_then(|(p, w)| p.checked_sub(w)),
-            _ => sr.round(),
-        }
-        .ok_or_else(|| range(self))?;
-        if !(-i128::from(MAX_COORD)..=i128::from(MAX_COORD)).contains(&space) {
-            return Err(range(self));
-        }
+        let space = number::cell_space(&keys, sr).ok_or_else(|| range(self))?;
         let mut rects = Vec::with_capacity(keys.len());
         for (x, rect, _) in &keys {
             let w = rect.w.round().ok_or_else(|| range(self))?;
