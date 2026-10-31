@@ -235,6 +235,10 @@ struct Shared {
     /// The end screen's newest page with its number, until the render
     /// thread takes it or the end screen is left.
     end_page: Mutex<Option<(u64, EndPage)>>,
+    /// The number of the end page last presented, after the frame sink
+    /// saw it (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    end_drawn: AtomicU64,
 }
 
 impl Shared {
@@ -292,6 +296,24 @@ impl RenderLink {
     /// page still waiting is dropped and never drawn.
     pub fn clear_end(&self) {
         drop(self.shared.swap_end(None));
+    }
+
+    /// Waits at most `timeout` until the end page shown last has been
+    /// presented, and the frame sink has seen it (dev-tools: a script's
+    /// `drawn` step). Whether it was.
+    #[cfg(feature = "dev-tools")]
+    pub fn wait_end_drawn(&self, timeout: Duration) -> bool {
+        let shown = self.end_pages.load(Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.shared.end_drawn.load(Ordering::Acquire) >= shown {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// Readies the screen for a play and waits until it is.
@@ -404,6 +426,8 @@ pub fn spawn(
         failed: AtomicBool::new(false),
         first_frame: AtomicI64::new(i64::MIN),
         end_page: Mutex::new(None),
+        #[cfg(feature = "dev-tools")]
+        end_drawn: AtomicU64::new(0),
     });
     let thread_shared = Arc::clone(&shared);
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
@@ -747,6 +771,14 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     crate::alloc_count::app_region(false);
                     self.frames.frame(screen.as_ref(), &d);
+                    // The end page drawn, for a script waiting on it
+                    // (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    if matches!(mode, Mode::End) && timing.presented {
+                        self.shared
+                            .end_drawn
+                            .store(self.end_page.0, Ordering::Release);
+                    }
                 }
                 Err(e) => {
                     // What this frame drew never reached the screen.
@@ -2215,5 +2247,28 @@ mod tests {
             }
             link.exit();
         }
+    }
+    /// A script's `drawn` step: the wait ends once the page shown last has
+    /// been presented, and gives up at its bound while the render thread
+    /// is stuck before drawing it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn waiting_for_the_end_page_ends_when_drawn_or_at_its_bound() {
+        let (link, drew, hold, release) = ends();
+        link.show_end(page("first", None));
+        assert!(link.wait_end_drawn(Duration::from_secs(10)));
+        assert!(!drew.lock().unwrap().is_empty());
+        // Stuck in the next page's frame: the page after it is not drawn.
+        hold.store(true, Ordering::SeqCst);
+        link.show_end(page("stuck", None));
+        assert!(wait_until(|| !hold.load(Ordering::SeqCst)));
+        link.show_end(page("waiting", None));
+        let began = Instant::now();
+        assert!(!link.wait_end_drawn(Duration::from_millis(200)));
+        assert!(began.elapsed() >= Duration::from_millis(200));
+        release.send(()).unwrap();
+        assert!(link.wait_end_drawn(Duration::from_secs(10)));
+        assert_eq!(drew.lock().unwrap().last().unwrap().0, "waiting");
+        link.exit();
     }
 }

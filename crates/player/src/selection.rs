@@ -415,7 +415,8 @@ impl Selection {
                     return false;
                 }
                 Some(
-                    step @ (SelectStep::Back
+                    step @ (SelectStep::Drawn
+                    | SelectStep::Back
                     | SelectStep::Retry
                     | SelectStep::Next
                     | SelectStep::Prev),
@@ -440,10 +441,11 @@ impl Selection {
     fn script_result(
         &mut self,
         controls: &Controls,
+        render: &RenderLink,
         captures: Option<&crate::dev::scenario::Captures>,
     ) {
         if let Some(script) = &mut self.script {
-            script_result(script, controls, &self.menu, captures);
+            script_result(script, controls, render, &self.menu, captures);
         }
     }
 
@@ -479,21 +481,35 @@ fn shelf_shown(
     }
 }
 
-/// Runs the scripted step due on a result: `back` and `retry` as their
-/// keys, `next` and `prev` as the right and left arrows on the window's
-/// queue `menu`, `close` as closing the window; a scenario's captures
-/// before them are armed from `captures`.
+/// Runs the scripted step due on a result: `drawn` by waiting on `render`
+/// until the result's page has been drawn, then the step after it; `back`
+/// and `retry` as their keys, `next` and `prev` as the right and left
+/// arrows on the window's queue `menu`, `close` as closing the window; a
+/// scenario's captures before them are armed from `captures`.
 #[cfg(feature = "dev-tools")]
 pub fn script_result(
     script: &mut crate::dev::SelectScript,
     controls: &Controls,
+    render: &RenderLink,
     menu: &MenuQueue,
     captures: Option<&crate::dev::scenario::Captures>,
 ) {
     script.announce();
-    while let Some(&SelectStep::Capture(k)) = script.front() {
-        if let Some(c) = captures {
-            c.arm(k);
+    loop {
+        match script.front() {
+            Some(&SelectStep::Capture(k)) => {
+                if let Some(c) = captures {
+                    c.arm(k);
+                }
+            }
+            Some(SelectStep::Drawn) => {
+                if !render.wait_end_drawn(crate::dev::STEP_TIMEOUT) {
+                    script.fail("the result's page was not drawn".to_owned());
+                    controls.close();
+                    return;
+                }
+            }
+            _ => break,
         }
         script.done();
         script.announce();
@@ -933,13 +949,23 @@ impl PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             #[cfg(feature = "dev-tools")]
             if let Some(script) = &mut self.result_script {
-                script_result(script, self.controls, &self.result_input.menu, None);
+                script_result(
+                    script,
+                    self.controls,
+                    &self.render,
+                    &self.result_input.menu,
+                    None,
+                );
             }
             return;
         };
         sel.shelf.release();
         #[cfg(feature = "dev-tools")]
-        sel.script_result(self.controls, self.scenario.as_ref().map(|s| &s.captures));
+        sel.script_result(
+            self.controls,
+            &self.render,
+            self.scenario.as_ref().map(|s| &s.captures),
+        );
     }
 
     /// Before a play's screen is readied (a scenario): the `play` step due

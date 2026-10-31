@@ -139,7 +139,7 @@ fn choosing_a_chart_plays_it_and_returns() {
     let frames_arg = frames.display().to_string();
     let (_, stdout) = run(
         &fx,
-        "pick=a.bms,enter,back,wait=a.bms,close",
+        "pick=a.bms,enter,drawn,back,wait=a.bms,close",
         &["--dev-frames", &frames_arg],
     );
     let at = |line: &str| {
