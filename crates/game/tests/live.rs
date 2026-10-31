@@ -2425,22 +2425,24 @@ fn went(event: Event, at: i64) -> Went {
 }
 
 /// The state × event table of design.md "Play Lifecycle": in the countdown
-/// and while playing, the quit key aborts the play and leaves the chart;
-/// once the play is complete, in its audio tail, it skips to the result,
-/// which the next quit leaves. Retry retries from every state, closing the
-/// window ends the run from every state, and focus loss ends the play, or
-/// cuts its tail, and shows the result.
+/// the quit key aborts the play and leaves the chart without a result;
+/// while playing it aborts the play and shows its result, which the next
+/// quit leaves; once the play is complete, in its audio tail, it skips to
+/// the result, which the next quit leaves. Retry retries from every state,
+/// closing the window ends the run from every state, and focus loss ends
+/// the play, or cuts its tail, and shows the result.
 #[test]
 fn every_state_and_event_of_a_play() {
     use game::Leave::{Back, Quit};
     let aborted = PlayEnd::Aborted;
     let done = PlayEnd::Completed;
-    // The countdown (play time -0.5 s) and playing (1.2 s).
-    for (state, at) in [("countdown", 7_800_000), ("playing", 9_500_000)] {
+    // The countdown (play time -0.5 s) and playing (1.2 s): only the quit
+    // key's result differs.
+    for (state, at, quit_shows) in [("countdown", 7_800_000, 0), ("playing", 9_500_000, 1)] {
         let cases = [
             (
                 Event::QuitKey,
-                (aborted(AbortCause::Quit), None, false, 1, 0, Back),
+                (aborted(AbortCause::Quit), None, false, 1, quit_shows, Back),
             ),
             (
                 Event::Retry,
@@ -2478,6 +2480,67 @@ fn every_state_and_event_of_a_play() {
     for (event, expected) in tail {
         assert_eq!(went(event, 10_100_000), expected, "tail, {event:?}");
     }
+}
+
+/// The chart starts at chart time 0 (clock 8.3 s): the quit key in the
+/// step before it leaves the chart with no result, and from the step at it
+/// on aborts the play and shows its result in that step, ended midway and
+/// never cleared, until the back at 15 s. Both plays are saved, ended
+/// midway.
+#[test]
+fn the_quit_key_shows_the_result_from_the_charts_start() {
+    for (at, shown) in [(8_299_000, None), (8_300_000, Some(8_300_000))] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+        let commands = [(at, Command::Quit), (15_000_000, Command::Quit)];
+        let mut rig = Fake::new(items, &commands, i64::MAX);
+        let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        assert_eq!(left, game::Leave::Back, "{at}");
+        let [one] = &rig.reports[..] else {
+            panic!("{at}: {} plays", rig.reports.len());
+        };
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit), "{at}");
+        assert_eq!(rig.shown_at.first().copied(), shown, "{at}");
+        assert_eq!(status(one).end, replay::EndStatus::EndedMidway, "{at}");
+        if shown.is_some() {
+            // Left by the back at 15 s, not at once.
+            assert!(rig.clock.now().0 >= 15_000_000, "{}", rig.clock.now().0);
+            let result = one.result.as_ref().unwrap();
+            let evaluation = result.evaluation.as_ref().unwrap();
+            assert!(
+                evaluation.gauges.iter().all(|g| !g.cleared),
+                "{evaluation:?}"
+            );
+        }
+    }
+}
+
+/// A quit that arrives as recording closes, on a play aborted after its
+/// chart started, is taken with that play: its result shows and stays
+/// until the back at 15 s.
+#[test]
+fn a_quit_during_close_after_an_abort_shows_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![
+        key(9_303_000, Z, 1),
+        key(9_353_000, Z, 0),
+        ScriptItem {
+            at: TimeUs(9_500_000),
+            action: Action::FocusLoss,
+        },
+    ];
+    let mut rig = Fake::new(items, &[(15_000_000, Command::Quit)], i64::MAX);
+    rig.in_close = Some(Command::Quit);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::FocusLoss));
+    assert_eq!(rig.shows, 1);
+    assert!(rig.clock.now().0 >= 15_000_000, "{}", rig.clock.now().0);
 }
 
 /// The quit key in the tail stops the audio in that step, shows the

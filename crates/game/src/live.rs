@@ -18,6 +18,10 @@
 //!   Lifecycle"). The reserved memory is not touched in advance.
 //! - A quit is latched by the rig and checked before recording opens and in
 //!   every wait, so it is never lost to a transition.
+//! - The quit key in a play's countdown, before its chart starts (chart
+//!   time 0, a round's section start), leaves the chart without a result;
+//!   from there until the play is complete it aborts the play, whose
+//!   result shows, ended midway, as for any other abort.
 //! - An aborted play closes recording and only then drains what is left in the
 //!   source queues into its record, unevaluated, so input that arrived after
 //!   the abort is kept (design.md "Play Lifecycle").
@@ -28,7 +32,7 @@
 //!   ring-out's end; a full play seals its key sounds and its stage ends
 //!   when the audio is done. The controls and failures act on every stage
 //!   alike: once the play is complete, the quit key skips the rest of the
-//!   stage to the result instead of leaving the chart ([`TailAction`]). A
+//!   stage to the result instead of aborting the play ([`TailAction`]). A
 //!   repeated round whose stage ran to its end is followed by the next
 //!   round at the following step, with no result between.
 //! - A practice round opens recording [`RESTORE_AHEAD`](crate::RESTORE_AHEAD)
@@ -244,9 +248,9 @@ pub trait Rig {
     }
     /// The play ended: its report, before any end screen.
     fn ended(&mut self, report: &PlayReport);
-    /// Shows the end screen of a play that neither quit nor retried, with
-    /// its result screen's view; called again whenever the view changes or
-    /// the screen was built again.
+    /// Shows the end screen of a play that was not retried or quit in its
+    /// countdown, with its result screen's view; called again whenever the
+    /// view changes or the screen was built again.
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen);
     /// Before each play opens recording: settings changed since the previous
     /// play are written into `settings`, which the play is evaluated and
@@ -290,7 +294,8 @@ pub(crate) fn run_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>>
 /// How the plays of a chart were left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leave {
-    /// The player left the chart: quit during it, or back on its result.
+    /// The player left the chart: quit in a play's countdown, or back on
+    /// its result.
     Back,
     /// The window is closing: the run ends.
     Quit,
@@ -333,10 +338,12 @@ fn leave<R: Rig>(rig: &R) -> Result<Leave, LiveError<R::ScreenError>> {
 }
 
 /// Plays one chart until the player leaves it: every play's report goes
-/// to [`Rig::ended`]; a play that neither quit nor retried shows its
-/// result, which waits for a [`MenuCommand`]. A quit before the play is
-/// complete leaves the chart ([`Leave::Back`]); after it, it skips the
-/// tail to the result. Closing the window ends the run ([`Leave::Quit`]).
+/// to [`Rig::ended`]; a play that was not retried, and not quit in its
+/// countdown, shows its result, which waits for a [`MenuCommand`]. The
+/// quit key before the chart starts ([`Loaded::starts_at`]) leaves the
+/// chart ([`Leave::Back`]); from then until the play is complete it aborts
+/// the play, whose result shows, ended midway; after it, it skips the tail
+/// to the result. Closing the window ends the run ([`Leave::Quit`]).
 ///
 /// # Errors
 ///
@@ -352,20 +359,19 @@ pub fn run_chart<R: Rig>(
             report,
             next,
             next_round,
+            counted_down,
         }) = play_and_next(loaded, rig)?
         else {
             return leave(rig);
         };
         rig.ended(&report);
-        let by = |c: AbortCause| {
-            report.end == PlayEnd::Aborted(c)
-                || report.tail_cut == Some(c)
-                || next.map(Command::cause) == Some(c)
-        };
-        if rig.quitting() || by(AbortCause::Quit) {
+        if rig.quitting() || counted_down {
             return leave(rig);
         }
-        if by(AbortCause::Retry) {
+        if report.end == PlayEnd::Aborted(AbortCause::Retry)
+            || report.tail_cut == Some(AbortCause::Retry)
+            || next == Some(Command::Retry)
+        {
             continue;
         }
         // A tail stage that ran to its end and repeats (a repeated round's
@@ -460,6 +466,9 @@ struct Played {
     /// The play's tail stage ran to its end and is followed by the next
     /// round, with no result between.
     next_round: bool,
+    /// The quit key ended the play before its chart started: the chart is
+    /// left without a result.
+    counted_down: bool,
 }
 
 /// [`play`], with the command that arrived as recording closed after an
@@ -550,6 +559,8 @@ fn play_and_next<R: Rig>(
     // A suspend while recording is open marks the record incomplete, whichever
     // cause ends the play (design.md "Play Lifecycle").
     let mut suspended = false;
+    // The play time of the last step: where an abort came.
+    let mut last;
 
     let end = loop {
         rig.wait();
@@ -579,6 +590,7 @@ fn play_and_next<R: Rig>(
             logic.abort(AbortCause::ScreenFailed);
         }
         let now = TimeUs(rig.now().0 - origin.0);
+        last = now;
         let advance = logic.advance_to(now);
         live.extend_from_slice(logic.events());
         let delivered = TimeUs(rig.now().0 - origin.0);
@@ -670,6 +682,12 @@ fn play_and_next<R: Rig>(
     });
     // A completed play's tail took the carried command.
     let mut next = carried.filter(|_| end != PlayEnd::Completed);
+    // The quit key before the chart started (in the countdown, or as
+    // recording closed on a play aborted there) leaves the chart without a
+    // result; from its start on, the aborted play's result shows, and a
+    // quit that arrived as recording closed is taken with the play.
+    let counted_down = last < loaded.starts_at()
+        && (end == PlayEnd::Aborted(AbortCause::Quit) || next == Some(Command::Quit));
     let mut next_round = stage.is_some_and(|s| s.repeats) && tail == TailEnd::RanOut;
     // Commands still pending once a completed play's stage is over, pressed
     // as it ended or during the save, belong to that play: the quit key is
@@ -689,6 +707,7 @@ fn play_and_next<R: Rig>(
         report,
         next,
         next_round,
+        counted_down,
     }))
 }
 
