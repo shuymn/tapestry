@@ -26,13 +26,13 @@ pub const fn practice_key(key: MenuKey) -> Option<PracticeInput> {
 }
 
 /// The page's input for a controller's menu event (design.md "Input"): the
-/// scratch moves between rows, the white keys confirm and the black keys go
-/// back.
+/// scratch moves between rows, the white keys (7 included) confirm and the
+/// black keys go back.
 pub const fn practice_event(event: MenuEvent) -> PracticeInput {
     match event {
         MenuEvent::Up => PracticeInput::Up,
         MenuEvent::Down => PracticeInput::Down,
-        MenuEvent::Confirm => PracticeInput::Confirm,
+        MenuEvent::Confirm | MenuEvent::Extra => PracticeInput::Confirm,
         MenuEvent::Back => PracticeInput::Back,
     }
 }
@@ -205,8 +205,9 @@ mod tests {
     }
 
     /// The keyboard's arrows, Enter and Escape are the page's inputs and
-    /// nothing else is; the controller's scratch moves, its white keys
-    /// confirm and its black keys go back.
+    /// nothing else is, F11 and F12 among them; the controller's scratch
+    /// moves, its white keys (7 included) confirm and its black keys go
+    /// back.
     #[test]
     fn practice_input_maps_keys_and_controller_events() {
         use PracticeInput::{Back, Confirm, Down, Left, Right, Up};
@@ -224,6 +225,8 @@ mod tests {
             (MenuKey::Home, None),
             (MenuKey::End, None),
             (MenuKey::Practice, None),
+            (MenuKey::PrevPreset, None),
+            (MenuKey::NextPreset, None),
         ] {
             assert_eq!(practice_key(key), input, "{key:?}");
         }
@@ -231,6 +234,7 @@ mod tests {
             (MenuEvent::Up, Up),
             (MenuEvent::Down, Down),
             (MenuEvent::Confirm, Confirm),
+            (MenuEvent::Extra, Confirm),
             (MenuEvent::Back, Back),
         ] {
             assert_eq!(practice_event(event), input, "{event:?}");

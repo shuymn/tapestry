@@ -72,7 +72,7 @@ pub use prepare::{
     BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,
 };
 pub use presets::{
-    Entry, POLL_INTERVAL, PollDeadline, PresetChange, Shelf, ShelfError, UnknownPreset,
+    Entry, POLL_INTERVAL, PollDeadline, PresetChange, PresetStep, Shelf, ShelfError, UnknownPreset,
 };
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
 pub use render::{PlayView, RenderSide, RenderSink};
@@ -98,8 +98,9 @@ pub use session::{
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,
-    LibrarySettings, OVERLAY_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig,
-    SettingsError, load_settings, reserved_key, save_settings,
+    LibrarySettings, NEXT_PRESET_KEY, OVERLAY_KEY, PREV_PRESET_KEY, PlayerSettings,
+    PlayerSettingsError, Role, ScratchConfig, SettingsError, load_settings, reserved_key,
+    save_settings,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tuning::{

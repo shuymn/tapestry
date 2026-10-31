@@ -78,6 +78,9 @@ pub struct Selection {
     pub dirty: bool,
     /// The search or order changed and is not searched yet.
     pub search_pending: bool,
+    /// Steps of the play preset taken and not yet applied: the flow takes
+    /// them after each look ([`AppRig::take_preset_step`]).
+    pub preset_steps: std::collections::VecDeque<game::PresetStep>,
     /// The scripted input (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub script: Option<crate::dev::SelectScript>,
@@ -138,6 +141,10 @@ impl Selection {
             }
             Acted::Choose(path) => Some(Pick::Play(path)),
             Acted::Practice(path) => Some(Pick::Practice(path)),
+            Acted::Preset(step) => {
+                self.preset_steps.push_back(step);
+                None
+            }
         }
     }
 
@@ -210,6 +217,19 @@ impl Selection {
             self.screen.set_notice(None);
             self.preset_refusal = false;
         }
+        self.dirty = true;
+    }
+
+    /// Shows why `player.toml` could not be written (`error`), or nothing
+    /// once it was; a write that failed `now` replaces the refusal shown,
+    /// which is older than it.
+    fn save_error(&mut self, error: Option<&str>, now: bool) {
+        if now {
+            self.screen.set_notice(None);
+            self.preset_refusal = false;
+        }
+        self.screen
+            .set_save_error(error.map(|e| format!("player.toml を保存できません: {e}")));
         self.dirty = true;
     }
 
@@ -348,6 +368,8 @@ impl Selection {
                     }
                 }
                 Some(SelectStep::Enter) => typed.push(MenuInput::Key(MenuKey::Enter)),
+                Some(SelectStep::PrevPreset) => typed.push(MenuInput::Key(MenuKey::PrevPreset)),
+                Some(SelectStep::NextPreset) => typed.push(MenuInput::Key(MenuKey::NextPreset)),
                 Some(SelectStep::PracticeKey(_)) => {
                     typed.push(MenuInput::Key(MenuKey::Practice));
                 }
@@ -1243,6 +1265,9 @@ impl AppRig for PlayerRig<'_> {
         }
     }
 
+    /// Shows the shelf, and writes a chosen preset that changed to
+    /// `player.toml` at once (design.md "Settings Files"): the flow chose
+    /// it on a step, the only way its name changes.
     fn presets_changed(&mut self, shelf: Result<&game::Shelf, &game::ShelfError>) {
         let (name, error) = shelf_shown(shelf);
         let error = error.map(|(shown, chain)| {
@@ -1251,8 +1276,24 @@ impl AppRig for PlayerRig<'_> {
             log::warn!("{line}");
             shown
         });
+        let chosen = shelf
+            .ok()
+            .map(game::Shelf::chosen_name)
+            .filter(|n| *n != self.files.preset());
+        // Said once written, or once the write failed.
+        let failed = chosen.is_some_and(|n| {
+            let t = self.controls.tuning().get();
+            let written = self.files.choose_preset(n, t, self.queue.periods());
+            println!("select: preset {n}");
+            log::info!("select: preset {n}");
+            written.is_err_and(|e| {
+                log::warn!("select: player.toml cannot be written: {e}");
+                true
+            })
+        });
         if let Some(sel) = &mut self.selection {
             sel.presets(name, error, shelf.is_ok());
+            sel.save_error(self.files.player_error(), failed);
             // The list shows the bests of the chosen preset.
             sel.screen
                 .set_bests_preset(shelf.ok().map(|s| s.chosen().clone()));
@@ -1315,6 +1356,10 @@ impl AppRig for PlayerRig<'_> {
             sc.practice = Some(screen.clone());
             sc.shown = true;
         }
+    }
+
+    fn take_preset_step(&mut self) -> Option<game::PresetStep> {
+        self.selection.as_mut()?.preset_steps.pop_front()
     }
 
     fn take_practice(&mut self) -> Option<PracticeInput> {
@@ -1388,6 +1433,7 @@ mod tests {
             entered_at: TimeUs(0),
             dirty: false,
             search_pending: false,
+            preset_steps: std::collections::VecDeque::new(),
             #[cfg(feature = "dev-tools")]
             script: None,
         };
@@ -1493,6 +1539,15 @@ mod tests {
         assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
     }
 
+    /// The test controller's model.
+    const fn controller_product() -> input::hid::HidProduct {
+        input::hid::HidProduct {
+            vendor_id: 1,
+            product_id: 2,
+            interface: None,
+        }
+    }
+
     /// The menus with a controller whose control 2 moves down, its source
     /// set, and the input thread's hook and link, in its tail as at its
     /// start (or after a close).
@@ -1504,20 +1559,29 @@ mod tests {
         std::sync::Arc<crate::controls::Controls>,
     ) {
         use eval::ControlId;
-        use input::hid::HidProduct;
-        use input::{DeviceId, DeviceKind, MenuAction, MenuBindings, MenuEvent, SourceConfig};
-        let product = HidProduct {
-            vendor_id: 1,
-            product_id: 2,
-            interface: None,
-        };
-        let (tap, pad) = input::menu_queue(MenuBindings {
-            product,
+        use input::{MenuAction, MenuBindings, MenuEvent};
+        controller_with(MenuBindings {
+            product: controller_product(),
             controls: vec![(ControlId(2), MenuAction::Press(MenuEvent::Down))],
             step: 2,
             relative: None,
             wrap: None,
-        });
+        })
+    }
+
+    /// [`controller`] with `bindings`, of [`controller_product`].
+    fn controller_with(
+        bindings: input::MenuBindings,
+    ) -> (
+        ResultInput,
+        input::SourceSet,
+        crate::input_side::Hook,
+        crate::input_side::InputLink,
+        std::sync::Arc<crate::controls::Controls>,
+    ) {
+        use input::{DeviceId, DeviceKind, SourceConfig};
+        let product = bindings.product;
+        let (tap, pad) = input::menu_queue(bindings);
         let mut set = input::SourceSet::new(SourceConfig {
             max_devices: 1,
             max_sources: 1,
@@ -1545,11 +1609,22 @@ mod tests {
 
     /// The controller's Down pressed in a batch at `at`, then the boundary.
     fn press_down(set: &mut input::SourceSet, hook: &mut crate::input_side::Hook, at: i64) {
+        press(set, hook, 2, at);
+    }
+
+    /// The controller's `control` pressed and released in a batch at `at`,
+    /// then the boundary.
+    fn press(
+        set: &mut input::SourceSet,
+        hook: &mut crate::input_side::Hook,
+        control: u32,
+        at: i64,
+    ) {
         set.begin_batch(TimeUs(at));
         for value in [1, 0] {
             set.packet(&input::Packet {
                 device: input::DeviceId(7),
-                control: eval::ControlId(2),
+                control: eval::ControlId(control),
                 value,
                 background: false,
             });
@@ -1868,6 +1943,145 @@ mod tests {
         assert_eq!(notice(&sel), "a.bms: no adapter reads it");
         sel.screen.set_notice(None);
         assert_eq!(notice(&sel), "presets: denied");
+    }
+
+    /// The play preset keys step it while the list has the keys: F11 and
+    /// F12 step back and forth, in order, and Enter after them chooses
+    /// with the steps taken. With the search box focused, or the IME
+    /// composing, they step nothing; leaving the search box, they step
+    /// again.
+    #[test]
+    fn preset_keys_step_only_outside_the_search_box() {
+        use game::PresetStep::{Next, Prev};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        for key in [
+            MenuKey::NextPreset,
+            MenuKey::PrevPreset,
+            MenuKey::NextPreset,
+        ] {
+            sel.menu.push(MenuInput::Key(key));
+        }
+        assert_eq!(sel.drain(&mut Pad::default()), None);
+        assert_eq!(
+            Vec::from(std::mem::take(&mut sel.preset_steps)),
+            [Next, Prev, Next]
+        );
+        // Focused: typed text only.
+        for input in [
+            MenuInput::Key(MenuKey::Tab),
+            MenuInput::Key(MenuKey::NextPreset),
+            MenuInput::Preedit("か".to_owned()),
+            MenuInput::Key(MenuKey::PrevPreset),
+            MenuInput::Preedit(String::new()),
+            MenuInput::Key(MenuKey::NextPreset),
+        ] {
+            sel.menu.push(input);
+        }
+        assert_eq!(sel.drain(&mut Pad::default()), None);
+        assert!(sel.screen.searching());
+        assert!(sel.preset_steps.is_empty());
+        // Left: they step again, before the choice that follows.
+        for key in [MenuKey::Enter, MenuKey::PrevPreset, MenuKey::Enter] {
+            sel.menu.push(MenuInput::Key(key));
+        }
+        assert!(sel.drain(&mut Pad::default()).is_some());
+        assert_eq!(Vec::from(std::mem::take(&mut sel.preset_steps)), [Prev]);
+    }
+
+    /// Controller key 7, through the production bindings and the input
+    /// thread's hook: on a result it retries, and a press queued there is
+    /// dropped when selection takes the queues; on the select screen it
+    /// steps to the next preset, and a black key never does. Key 1 still
+    /// chooses. On the practice page it confirms.
+    #[test]
+    fn controller_key_7_steps_the_preset_on_select_only() {
+        use crate::result_input::Owner;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let (key1, key2, key7) = (11, 12, 17);
+        let config = game::KeyConfig {
+            lanes: [(key1, 1), (key2, 2), (key7, 7)]
+                .map(|(control, lane)| game::LaneKey { control, lane })
+                .to_vec(),
+            retry: None,
+            quit: None,
+        };
+        let bindings = crate::select::menu_bindings(
+            &config,
+            Some(controller_product()),
+            &game::ScratchConfig::default(),
+        )
+        .unwrap();
+        let (mut menus, mut set, mut hook, link, _controls) = controller_with(bindings);
+        menus.menu = Arc::clone(&sel.menu);
+        // A result shows: key 7 retries, and one more stays queued.
+        menus.release();
+        assert!(menus.enter());
+        set.menu_mut().unwrap().set_active(true);
+        press(&mut set, &mut hook, key7, 1_000);
+        assert_eq!(menus.take(), Some(game::MenuCommand::Retry));
+        press(&mut set, &mut hook, key7, 2_000);
+        // Back to selection: what was queued is dropped.
+        let (mut in_play, mut end_lines) = (false, None);
+        super::recover(
+            &mut menus,
+            Owner::Select,
+            &link,
+            &mut in_play,
+            &mut end_lines,
+            Some(&mut sel.shelf),
+        );
+        assert_eq!(hook.wake(&mut set, TimeUs(3_000)), input::Phase::Idle);
+        assert_eq!(sel.drain_owned(&mut menus), None);
+        assert!(sel.preset_steps.is_empty());
+        // A black key goes back, which means nothing here.
+        press(&mut set, &mut hook, key2, 4_000);
+        assert_eq!(sel.drain_owned(&mut menus), None);
+        assert!(sel.preset_steps.is_empty());
+        // Key 7 steps.
+        press(&mut set, &mut hook, key7, 5_000);
+        assert_eq!(sel.drain_owned(&mut menus), None);
+        assert_eq!(
+            Vec::from(std::mem::take(&mut sel.preset_steps)),
+            [game::PresetStep::Next]
+        );
+        press(&mut set, &mut hook, key1, 6_000);
+        assert!(sel.drain_owned(&mut menus).is_some());
+        assert!(sel.preset_steps.is_empty());
+        // The practice page takes it as Confirm.
+        menus.take_over(Owner::Practice);
+        press(&mut set, &mut hook, key7, 7_000);
+        assert_eq!(menus.take_practice(), Some(game::PracticeInput::Confirm));
+    }
+
+    /// A write of `player.toml` that failed shows on the select screen in
+    /// place of the refusal before it, and goes once the file is written;
+    /// a later refusal shows over it.
+    #[test]
+    fn a_save_error_replaces_the_refusal_until_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let notice = |sel: &Selection| sel.screen.page("").lines[2].text.clone();
+        let chart = dir.path().join("charts").join("a.bms");
+        // The shelf would not open; a step opened it, and the write failed.
+        sel.refused(&chart, "a.bms: the preset cannot open".to_owned(), true);
+        sel.presets("beatoraja-style".to_owned(), None, true);
+        sel.save_error(Some("denied"), true);
+        assert_eq!(notice(&sel), "player.toml を保存できません: denied");
+        assert!(!sel.preset_refusal);
+        // Shown again with no new failure, a chart's refusal stays over it.
+        sel.refused(&chart, "a.bms: no adapter reads it".to_owned(), false);
+        sel.save_error(Some("denied"), false);
+        assert_eq!(notice(&sel), "a.bms: no adapter reads it");
+        sel.screen.set_notice(None);
+        assert_eq!(notice(&sel), "player.toml を保存できません: denied");
+        sel.save_error(None, false);
+        assert_eq!(notice(&sel), "");
+        // A chart's refusal shows; a write that fails after it replaces it.
+        sel.refused(&chart, "a.bms: no adapter reads it".to_owned(), false);
+        sel.save_error(Some("denied"), true);
+        assert_eq!(notice(&sel), "player.toml を保存できません: denied");
     }
 
     /// The select screen shows the chosen file's error, else the folder's

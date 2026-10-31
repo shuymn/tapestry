@@ -104,7 +104,8 @@ pub fn ineligible(
     None
 }
 
-/// Whether `record` counts for its best (design.md D8's one predicate).
+/// Whether `record` counts for its best (design.md "Personal Bests": the
+/// one eligibility predicate).
 #[must_use]
 pub fn counts_for_best(record: &PlayRecord, verified: Option<&Verified>, saved: bool) -> bool {
     ineligible(record, verified, saved).is_none()
@@ -190,8 +191,8 @@ pub struct Score {
     pub best: Option<Best>,
 }
 
-/// The key bests are stored under (design.md D8): the chart file's
-/// SHA-256, the preset's and the LN mode.
+/// The key bests are stored under (design.md "Personal Bests"): the chart
+/// file's SHA-256, the preset's and the LN mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
     /// SHA-256 of the preset's canonical encoding.

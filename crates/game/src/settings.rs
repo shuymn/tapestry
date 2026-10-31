@@ -223,13 +223,24 @@ pub enum KeyError {
 /// Figures").
 pub const OVERLAY_KEY: u32 = 0x43;
 
+/// F11: chooses the previous play preset on the select screen (design.md
+/// "Play Lifecycle").
+pub const PREV_PRESET_KEY: u32 = 0x57;
+
+/// F12: chooses the next play preset on the select screen; key config's
+/// keep key too, on its own screen.
+pub const NEXT_PRESET_KEY: u32 = crate::keys::KEEP_KEY;
+
 /// What the game reserves keyboard key `code` (a scan code) for, if
-/// anything: the settings keys and the key config's keep key are never
-/// bound.
+/// anything: the settings keys, the overlay key, the preset keys and the
+/// key config's keep key are never bound.
 #[must_use]
 pub fn reserved_key(code: u32) -> Option<&'static str> {
-    if code == crate::keys::KEEP_KEY {
-        return Some("keeping a binding in key config");
+    if code == NEXT_PRESET_KEY {
+        return Some("keeping a binding in key config and the next play preset");
+    }
+    if code == PREV_PRESET_KEY {
+        return Some("the previous play preset");
     }
     if code == OVERLAY_KEY {
         return Some("the measurement overlay");

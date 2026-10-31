@@ -38,6 +38,10 @@ pub enum MenuEvent {
     Confirm,
     /// Go back.
     Back,
+    /// The white key 7's own event: the select screen chooses the next
+    /// play preset with it, and the other menus take it as
+    /// [`Confirm`](Self::Confirm).
+    Extra,
     /// Move the cursor up one line.
     Up,
     /// Move the cursor down one line.
