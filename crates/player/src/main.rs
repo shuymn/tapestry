@@ -1250,11 +1250,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             Box::new(move |s: &Settings| {
                 let mut parts = Parts::standard(&records, &s.player);
                 if let Some(bests) = &bests {
-                    parts.records = Some(Box::new(bests::BestsRecords {
-                        local: game::LocalRecords::new(records.records()),
-                        dir: records.records(),
-                        bests: Arc::clone(bests),
-                    }));
+                    parts.records = Some(Box::new(bests::BestsRecords::new(
+                        records.records(),
+                        Arc::clone(bests),
+                    )));
                 }
                 parts
             }),

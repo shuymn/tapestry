@@ -17,11 +17,23 @@ use rules::RulePreset;
 /// pass counts it from its file.
 pub struct BestsRecords {
     /// Where records are saved.
-    pub local: LocalRecords,
-    /// The data root's `records`, which play paths are relative to.
-    pub dir: PathBuf,
+    local: LocalRecords,
+    /// The same folder, which play paths are relative to.
+    dir: PathBuf,
     /// The library's live writer, shared by every chart's sink.
-    pub bests: Arc<Mutex<BestWriter>>,
+    bests: Arc<Mutex<BestWriter>>,
+}
+
+impl BestsRecords {
+    /// Saves under `records` (the data root's `records`) and counts through
+    /// `bests`.
+    pub fn new(records: PathBuf, bests: Arc<Mutex<BestWriter>>) -> Self {
+        Self {
+            local: LocalRecords::new(records.clone()),
+            dir: records,
+            bests,
+        }
+    }
 }
 
 impl RecordSink for BestsRecords {
@@ -327,11 +339,10 @@ mod tests {
 
     /// The sink over the fixture's records and library.
     fn sink(fx: &common::Fixture, lib: &library::Library) -> super::BestsRecords {
-        super::BestsRecords {
-            local: game::LocalRecords::new(fx.records.clone()),
-            dir: fx.records.clone(),
-            bests: Arc::new(Mutex::new(lib.best_writer().unwrap())),
-        }
+        super::BestsRecords::new(
+            fx.records.clone(),
+            Arc::new(Mutex::new(lib.best_writer().unwrap())),
+        )
     }
 
     /// Saves `record` through `sink` and hands it the play as
