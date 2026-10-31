@@ -6,7 +6,10 @@
 //! A check lists `presets/` again and reads each file whose modification
 //! time changed since the last check; a file that fails to load keeps the
 //! preset it last loaded, with its error. The chosen preset is the one plays
-//! use, so a failed reload of it leaves the previous one in use.
+//! use, so a failed reload of it leaves the previous one in use. Every
+//! change a check makes bumps the shelf's revision, which the screens
+//! compare with the one they last drew; polls run at an absolute
+//! [`PollDeadline`].
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -60,6 +63,37 @@ pub enum PresetChange {
     Failed(PresetFileError),
 }
 
+/// When the next check is due: an absolute time on the rig's clock, so a
+/// wake before it does not move it, and a wait can end at it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PollDeadline {
+    next: Option<TimeUs>,
+}
+
+impl PollDeadline {
+    /// Whether a check is due at `now`: none was made yet, or `now` has
+    /// reached the deadline. When it is, the next one is set
+    /// [`POLL_INTERVAL`] after `now`.
+    pub const fn due(&mut self, now: TimeUs) -> bool {
+        if let Some(t) = self.next
+            && now.0 < t.0
+        {
+            return false;
+        }
+        self.next = Some(TimeUs(now.0.saturating_add(POLL_INTERVAL.0)));
+        true
+    }
+
+    /// When the next check is due: `now` itself when none was made yet.
+    #[must_use]
+    pub const fn next(&self, now: TimeUs) -> TimeUs {
+        match self.next {
+            Some(t) => t,
+            None => now,
+        }
+    }
+}
+
 /// One preset the shelf lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry<'a> {
@@ -67,6 +101,8 @@ pub struct Entry<'a> {
     pub name: &'a str,
     /// Whether it is a built-in.
     pub built_in: bool,
+    /// Whether it is the chosen preset.
+    pub chosen: bool,
     /// The preset, unless its file never loaded.
     pub preset: Option<&'a RulePreset>,
     /// Why its file did not load at the last check, if it did not.
@@ -98,13 +134,18 @@ pub struct Shelf {
     /// The chosen preset: plays take it at their start. Its ID is its
     /// name, as a built-in's or as the stem a user preset loads under.
     current: RulePreset,
-    next_check: Option<TimeUs>,
+    deadline: PollDeadline,
+    /// Bumped by every change a check makes.
+    revision: u64,
+    /// Why the folder could not be listed at the last check, if it could
+    /// not: each entry then keeps its state.
+    listing_error: Option<PresetFileError>,
 }
 
 impl Shelf {
     /// Lists the built-ins and the user presets in `dir`, choosing `chosen`.
     /// A built-in is chosen without reading any file; a folder that cannot
-    /// be listed then lists only the built-ins.
+    /// be listed then lists only the built-ins, with its listing error.
     ///
     /// # Errors
     ///
@@ -120,12 +161,16 @@ impl Shelf {
         }
         let user_chosen = built_in_chosen.is_none().then_some(chosen);
         let mut users = BTreeMap::new();
+        let mut listing_error = None;
         match list(&dir) {
-            Ok(files) => read(&mut users, &files, &dir, user_chosen),
+            Ok(files) => {
+                read(&mut users, &files, &dir, user_chosen);
+            }
             Err(kind) if built_in_chosen.is_none() => {
                 return Err(ShelfError::Io { path: dir, kind });
             }
-            Err(_) => {}
+            // Kept until a listing succeeds, as a check keeps it.
+            Err(kind) => listing_error = Some(PresetFileError::io(dir.clone(), kind)),
         }
         let current = match built_in_chosen {
             Some(p) => p,
@@ -147,7 +192,9 @@ impl Shelf {
             users,
             user_chosen: user_chosen.is_some(),
             current,
-            next_check: None,
+            deadline: PollDeadline::default(),
+            revision: 0,
+            listing_error,
         })
     }
 
@@ -170,25 +217,64 @@ impl Shelf {
         let built_ins = self.built_ins.iter().map(|p| Entry {
             name: &p.id,
             built_in: true,
+            chosen: !self.user_chosen && p.id == self.current.id,
             preset: Some(p),
             error: None,
         });
         let users = self.users.iter().map(|(name, u)| Entry {
             name,
             built_in: false,
+            chosen: self.user_chosen && *name == self.current.id,
             preset: u.preset.as_ref(),
             error: u.error.as_ref(),
         });
         built_ins.chain(users).collect()
     }
 
-    /// Checks the user preset files at `now` if [`POLL_INTERVAL`] has passed
-    /// since the last poll's check (the first poll checks at once).
+    /// The chosen user preset's standing error: why its file did not load
+    /// at the last check, while the shelf keeps its last good version.
+    /// `None` for a built-in.
+    #[must_use]
+    pub fn chosen_error(&self) -> Option<&PresetFileError> {
+        self.users
+            .get(&self.current.id)
+            .filter(|_| self.user_chosen)
+            .and_then(|u| u.error.as_ref())
+    }
+
+    /// Why the folder could not be listed at the last check, if it could
+    /// not.
+    #[must_use]
+    pub const fn listing_error(&self) -> Option<&PresetFileError> {
+        self.listing_error.as_ref()
+    }
+
+    /// Bumped by every change a check makes: an entry's preset or error
+    /// changed, an entry added or removed, or the listing error set or
+    /// cleared.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// When the next poll checks.
+    #[must_use]
+    pub const fn deadline(&self) -> PollDeadline {
+        self.deadline
+    }
+
+    /// Polls on `deadline` from now on: a shelf opened again keeps the
+    /// cadence of the polls that retried it.
+    pub const fn set_deadline(&mut self, deadline: PollDeadline) {
+        self.deadline = deadline;
+    }
+
+    /// Checks the user preset files at `now` if its [`PollDeadline`] is due
+    /// (the first poll checks at once).
     pub fn poll(&mut self, now: TimeUs) -> Option<PresetChange> {
-        if self.next_check.is_some_and(|t| now.0 < t.0) {
+        if !self.deadline.due(now) {
             return None;
         }
-        self.next_check = Some(TimeUs(now.0.saturating_add(POLL_INTERVAL.0)));
         self.check()
     }
 
@@ -202,17 +288,40 @@ impl Shelf {
         let before = chosen
             .and_then(|c| self.users.get(c))
             .and_then(|u| u.error.clone());
-        match list(&self.dir) {
-            Ok(files) => read(&mut self.users, &files, &self.dir, chosen),
+        let mut changed = match list(&self.dir) {
+            Ok(files) => {
+                let cleared = self.listing_error.take().is_some();
+                read(&mut self.users, &files, &self.dir, chosen) | cleared
+            }
             Err(kind) => {
                 // Nothing is known about the files: each keeps its state,
                 // and the chosen one reports the failure.
+                let e = PresetFileError::io(self.dir.clone(), kind);
+                let mut changed = self.listing_error.as_ref() != Some(&e);
                 if let Some(u) = chosen.and_then(|c| self.users.get_mut(c)) {
-                    u.error = Some(PresetFileError::io(self.dir.clone(), kind));
+                    changed |= u.error.as_ref() != Some(&e);
+                    u.error = Some(e.clone());
                     u.modified = None;
                 }
+                self.listing_error = Some(e);
+                changed
             }
+        };
+        let change = self.chosen_change(chosen, before);
+        changed |= change.is_some();
+        if changed {
+            self.revision += 1;
         }
+        change
+    }
+
+    /// What changed for the chosen user preset `chosen`, whose error was
+    /// `before` the check: a reload makes its preset the chosen one.
+    fn chosen_change(
+        &mut self,
+        chosen: Option<&str>,
+        before: Option<PresetFileError>,
+    ) -> Option<PresetChange> {
         let user = self.users.get(chosen?)?;
         // Loading again after a failure is a change even with the rules
         // unchanged, so the failure shown can be cleared.
@@ -235,13 +344,15 @@ impl Shelf {
 type Listed = (String, PathBuf, Option<SystemTime>);
 
 /// Updates `users` from the folder `dir`'s `files`; `chosen` is the chosen
-/// user preset's name, `None` when a built-in is chosen.
+/// user preset's name, `None` when a built-in is chosen. Whether an entry
+/// was added or removed, or its preset or error changed.
 fn read(
     users: &mut BTreeMap<String, UserPreset>,
     files: &[Listed],
     dir: &Path,
     chosen: Option<&str>,
-) {
+) -> bool {
+    let mut changed = false;
     for (name, path, modified) in files {
         let known = users.get(name);
         if modified.is_some() && known.is_some_and(|u| u.modified == *modified) {
@@ -259,6 +370,7 @@ fn read(
                 error: Some(e),
             },
         };
+        changed |= known.is_none_or(|k| k.preset != user.preset || k.error != user.error);
         users.insert(name.clone(), user);
     }
     // A file gone is dropped, except the chosen one's: its preset stays
@@ -268,15 +380,16 @@ fn read(
             return true;
         }
         if chosen != Some(name.as_str()) {
+            changed = true;
             return false;
         }
-        u.error = Some(PresetFileError::io(
-            user_preset_path(dir, name),
-            io::ErrorKind::NotFound,
-        ));
+        let gone = PresetFileError::io(user_preset_path(dir, name), io::ErrorKind::NotFound);
+        changed |= u.error.as_ref() != Some(&gone);
+        u.error = Some(gone);
         u.modified = None;
         true
     });
+    changed
 }
 
 /// Where the user preset `name` lives in `dir`.

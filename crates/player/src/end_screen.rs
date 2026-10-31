@@ -1,10 +1,17 @@
 //! The end screen: the play's summary as text lines for the bitmap font,
-//! numbers from the re-evaluation of the saved record (`ReEvaluate`).
+//! numbers from the re-evaluation of the saved record (`ReEvaluate`), in a
+//! fixed layout with the result screen's view of it (design.md "Play
+//! Lifecycle"): the preset strip, what the view shows, its coverage, the
+//! viewed file's error and the latest notices.
 
 use std::time::Duration;
 
-use game::{AbortCause, Chain, PlayEnd, PlayReport, Tuning};
-use rules::GaugeValue;
+use game::{
+    AbortCause, Chain, EntryId, Notice, PlayEnd, PlayReport, PresetFileError, ResultScreen,
+    SHOWN_GAUGES, ShelfError, Tuning, ViewEntry, ViewStatus, ViewSummary,
+};
+use replay::verify::Coverage;
+use rules::{GaugeValue, RulePreset};
 
 /// How long loading took, shown on the end screen (design.md "Latency
 /// Figures").
@@ -128,56 +135,279 @@ fn incomplete_line(i: replay::Incomplete) -> Option<String> {
     (!why.is_empty()).then(|| format!("RECORD INCOMPLETE: {}", why.join(", ")))
 }
 
-/// The end screen's lines, the gauges named by the preset the play was
-/// evaluated under. `input_offset_us` is the input offset the play
-/// used, to which the recommendation adds the median deviation. An
-/// `autoplay` play (design.md "Autoplay") says it was not saved in place
-/// of the saved line and recommends no input offset: its deviations say
-/// nothing about the player's.
+/// Columns a line of the bitmap screen holds (76 glyphs of 24 px from the
+/// left edge at 80 px).
+pub const COLUMNS: usize = 76;
+
+/// Lines of the summary, the key hints last; the settings lines follow,
+/// for 25 in all.
+pub const SUMMARY_LINES: usize = 23;
+
+/// `text` as the bitmap font draws it: uppercase, any character it has no
+/// glyph for as `?`, and cut to `width` columns with a trailing `..`.
+pub fn fit(text: &str, width: usize) -> String {
+    let drawn: Vec<char> = text
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c.to_ascii_uppercase()
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if drawn.len() <= width {
+        return drawn.into_iter().collect();
+    }
+    let mut cut: String = drawn[..width.saturating_sub(2)].iter().collect();
+    cut.push_str("..");
+    cut
+}
+
+/// A preset file's error as the screens show it: the file's name and the
+/// cause, never its path, which goes to the console and the log only.
+pub fn preset_error_text(e: &PresetFileError) -> String {
+    let name = e
+        .path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    format!("{name}: {}", Chain(&e.cause))
+}
+
+/// Why the shelf cannot open, as the screens show it: by file name and
+/// cause, never a path.
+pub fn shelf_error_text(e: &ShelfError) -> String {
+    match e {
+        // The name as the file names it, only when it is a name: a value
+        // that is not could be a path. The console and the log have it.
+        ShelfError::Unknown(u)
+            if rules::built_in(&u.0).is_some() || game::check_user_preset_name(&u.0).is_ok() =>
+        {
+            u.to_string()
+        }
+        ShelfError::Unknown(_) => {
+            "the chosen preset in player.toml is not a preset name".to_owned()
+        }
+        ShelfError::Preset(e) => preset_error_text(e),
+        ShelfError::Io { path, kind } => {
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            format!("{name}: {kind}")
+        }
+    }
+}
+
+/// What the console and the log say of the view: its entry, and what it
+/// shows with any error's full chain. The caller prints it again whenever
+/// either changes, so a switch between two entries of one name, or a new
+/// error on the same entry, is said.
+pub fn view_log(screen: &ResultScreen) -> Option<(EntryId, String)> {
+    let entry = screen.viewed()?;
+    let what = match screen.status() {
+        ViewStatus::Ready(s) if s.as_played => "as played".to_owned(),
+        ViewStatus::Ready(s) => format!("what-if, {:?}", s.coverage),
+        ViewStatus::CannotLoad(e) => format!("cannot load: {}", Chain(e)),
+        ViewStatus::OverBudget { needed, budget } => {
+            format!("too large to re-evaluate: {needed} bytes, budget {budget}")
+        }
+        ViewStatus::Failed(e) => format!("no re-evaluation: {}", Chain(e)),
+        ViewStatus::NothingRecorded => "nothing recorded".to_owned(),
+    };
+    let mut line = format!("result: viewing {} ({what})", entry.name);
+    if let Some(e) = screen.file_error() {
+        line.push_str(&format!("; {}", Chain(e)));
+    }
+    Some((entry.id.clone(), line))
+}
+
+/// `t` in seconds with three decimals.
+fn seconds(t: bms_model::TimeUs) -> String {
+    let sign = if t.0 < 0 { "-" } else { "" };
+    let a = t.0.unsigned_abs();
+    format!("{sign}{}.{:03}", a / 1_000_000, a % 1_000_000 / 1_000)
+}
+
+/// The preset strip: the entries before and after the viewed one, the
+/// viewed one between `>` and `<`, and its place; `+` marks the play's own
+/// preset and `!` an entry whose file has an error.
+fn strip(screen: &ResultScreen) -> String {
+    let entries = screen.entries();
+    let n = entries.len();
+    let name = |i: usize| {
+        entries.get(i).map_or_else(String::new, |e: &ViewEntry| {
+            let own = e.hash == Some(screen.played());
+            let mut s = fit(&e.name, 18);
+            if own {
+                s.push('+');
+            }
+            if e.error.is_some() {
+                s.push('!');
+            }
+            s
+        })
+    };
+    let at = screen.cursor();
+    let prev = (at + n - 1) % n.max(1);
+    let next = (at + 1) % n.max(1);
+    format!(
+        "< {}  >{}<  {} >  {}/{n}",
+        name(prev),
+        name(at),
+        name(next),
+        at + 1
+    )
+}
+
+/// What the view shows, on its line.
+fn view_label(status: ViewStatus<'_>, name: &str) -> String {
+    match status {
+        ViewStatus::Ready(s) if s.as_played => "AS PLAYED".to_owned(),
+        ViewStatus::Ready(_) => format!("WHAT-IF UNDER {name}"),
+        ViewStatus::CannotLoad(e) => format!("CANNOT LOAD: {}", preset_error_text(e)),
+        ViewStatus::OverBudget { .. } => format!("TOO LARGE TO RE-EVALUATE UNDER {name}"),
+        ViewStatus::Failed(e) => format!("NO RE-EVALUATION: {}", Chain(e)),
+        ViewStatus::NothingRecorded => "NOTHING WAS RECORDED".to_owned(),
+    }
+}
+
+/// What a what-if's input covers, on its own line; blank as played.
+fn coverage_line(status: ViewStatus<'_>) -> String {
+    match status {
+        ViewStatus::Ready(s) if !s.as_played => match s.coverage {
+            Coverage::NoInputAfter(t) => format!("NO INPUT AFTER {} S", seconds(t)),
+            Coverage::EndedMidway(t) => format!("ENDED MIDWAY AT {} S, NO CLEAR", seconds(t)),
+            Coverage::Recorded => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn notice_line(n: &Notice) -> String {
+    match n {
+        Notice::Reloaded(name) => format!("{name} RELOADED"),
+        Notice::NextPlayUsesIt(_) => "THE NEXT PLAY USES IT".to_owned(),
+        Notice::Removed(name) => format!("{name}: REMOVED"),
+        Notice::Failed(e) | Notice::ListingFailed(e) => preset_error_text(e),
+    }
+}
+
+/// The gauge cells: `width` columns each, the gauge's name cut to fit, in
+/// the viewed preset's order and named by it; a seventh or later gauge
+/// counts in place of the sixth.
+fn gauge_cells(s: &ViewSummary, preset: Option<&RulePreset>, width: usize) -> Vec<String> {
+    let mut cells: Vec<String> = s
+        .gauges
+        .iter()
+        .enumerate()
+        .filter_map(|(i, g)| g.map(|g| (i, g)))
+        .map(|(i, g)| {
+            let id = preset
+                .and_then(|p| p.gauges.get(i))
+                .map_or_else(|| format!("GAUGE {}", i + 1), |r| r.id.clone());
+            let v = g.value.0;
+            let default = if s.started_at_default & (1 << i) != 0 {
+                " (DEFAULT START)"
+            } else {
+                ""
+            };
+            let rest = format!(
+                " {}.{:03}% {}{default}",
+                v / GaugeValue::PERCENT,
+                v % GaugeValue::PERCENT / 100,
+                if g.cleared { "CLEAR" } else { "NOT CLEAR" }
+            );
+            let room = width.saturating_sub(rest.len());
+            fit(&format!("{}{rest}", fit(&id, room)), width)
+        })
+        .collect();
+    if s.more_gauges > 0 {
+        cells.truncate(SHOWN_GAUGES - 1);
+        cells.push(format!("+{} MORE", u32::from(s.more_gauges) + 1));
+    }
+    cells
+}
+
+/// The end screen's summary: [`SUMMARY_LINES`] lines in a fixed layout, each
+/// cut to [`COLUMNS`], the view of `screen` among them. `input_offset_us`
+/// is the input offset the play used, to which the recommendation adds the
+/// median deviation; whether the play matches the live stream and the
+/// recommendation stay the play's own, whatever is viewed. An `autoplay`
+/// play (design.md "Autoplay") says it was not saved in place of the saved
+/// line and recommends no input offset: its deviations say nothing about
+/// the player's.
 pub fn lines(
     report: &PlayReport,
+    screen: &ResultScreen,
     input_offset_us: i64,
     times: LoadTimes,
     queue: QueueLine,
     hints: &Hints,
     autoplay: bool,
 ) -> Vec<String> {
-    let mut l = Vec::new();
-    l.push(match report.end {
-        PlayEnd::Completed => "RESULT: PLAYED TO END".to_owned(),
-        PlayEnd::Aborted(c) => format!("RESULT: ENDED MIDWAY ({})", cause(c)),
-    });
-    l.push(String::new());
-    let summary = report.result.as_ref();
-    match summary.map(|s| &s.evaluation) {
-        Some(Ok(e)) => {
-            let t = &e.tally;
-            let c = &t.counts;
-            l.push(format!(
+    let viewed = screen.viewed();
+    let name = viewed.map_or(String::new(), |e| e.name.clone());
+    let status = screen.status();
+    let mut l = vec![String::new(); SUMMARY_LINES];
+    let mut set = |i: usize, text: String| {
+        if let Some(line) = l.get_mut(i) {
+            *line = fit(&text, COLUMNS);
+        }
+    };
+    set(
+        0,
+        match report.end {
+            PlayEnd::Completed => "RESULT: PLAYED TO END".to_owned(),
+            PlayEnd::Aborted(c) => format!("RESULT: ENDED MIDWAY ({})", cause(c)),
+        },
+    );
+    set(1, strip(screen));
+    set(2, view_label(status, &name));
+    set(3, coverage_line(status));
+    if let Some(e) = screen.file_error() {
+        set(4, format!("FILE DID NOT RELOAD: {}", preset_error_text(e)));
+    }
+    for (i, n) in screen.notices().enumerate() {
+        set(5 + i, notice_line(n));
+    }
+    if let Some(e) = &report.reload_error {
+        set(
+            7,
+            format!(
+                "THIS PLAY USED THE PREVIOUS {}: {}",
+                report.preset.id,
+                preset_error_text(e)
+            ),
+        );
+    }
+    if let ViewStatus::Ready(s) = status {
+        let t = &s.tally;
+        let c = &t.counts;
+        set(
+            8,
+            format!(
                 "PERFECT {}  GREAT {}  GOOD {}  BAD {}  POOR {}",
                 c.perfect, c.great, c.good, c.bad, c.poor
-            ));
-            l.push(format!(
+            ),
+        );
+        set(
+            9,
+            format!(
                 "EX SCORE {}  MAX COMBO {}  BP {}",
                 t.ex_score, t.max_combo, t.bp
-            ));
-            l.push(format!("EMPTY POOR {}", t.empty_poor));
-            for (g, rule) in e.gauges.iter().zip(&report.preset.gauges) {
-                let v = g.value.0;
-                l.push(format!(
-                    "GAUGE {} {}.{:03}%  {}",
-                    rule.id.to_uppercase(),
-                    v / GaugeValue::PERCENT,
-                    v % GaugeValue::PERCENT / 100,
-                    if g.cleared { "CLEAR" } else { "NOT CLEAR" }
-                ));
-            }
+            ),
+        );
+        set(10, format!("EMPTY POOR {}", t.empty_poor));
+        let preset = viewed.and_then(|e| e.preset.as_deref());
+        let width = (COLUMNS - 2) / 2;
+        for (row, pair) in gauge_cells(s, preset, width).chunks(2).enumerate() {
+            set(11 + row, pair.join("  "));
         }
-        Some(Err(e)) => l.push(format!("NO RE-EVALUATION: {}", Chain(e)).to_uppercase()),
-        None => l.push("NOTHING WAS RECORDED".to_owned()),
     }
+    let summary = report.result.as_ref();
     if let Some(s) = summary {
-        l.push(
+        set(
+            14,
             if s.matches_live {
                 "RE-EVALUATION MATCHES THE LIVE PLAY"
             } else {
@@ -187,24 +417,30 @@ pub fn lines(
         );
     }
     if let Some(s) = summary.filter(|_| !autoplay) {
-        l.push(match s.recommended_offset {
-            Some(r) => format!(
-                "RECOMMENDED INPUT OFFSET {} MS (NOW {} MS)",
-                ms(input_offset_us.saturating_add(r.median.0)),
-                ms(input_offset_us)
-            ),
-            None => format!(
-                "RECOMMENDED INPUT OFFSET: NEEDS {} JUDGED PRESSES",
-                game::MIN_OFFSET_SAMPLES
-            ),
-        });
+        set(
+            15,
+            match s.recommended_offset {
+                Some(r) => format!(
+                    "RECOMMENDED INPUT OFFSET {} MS (NOW {} MS)",
+                    ms(input_offset_us.saturating_add(r.median.0)),
+                    ms(input_offset_us)
+                ),
+                None => format!(
+                    "RECOMMENDED INPUT OFFSET: NEEDS {} JUDGED PRESSES",
+                    game::MIN_OFFSET_SAMPLES
+                ),
+            },
+        );
         if let Some(r) = s.recommended_offset {
-            l.push(format!(
-                "  MEDIAN DEVIATION {} MS, SPREAD {} MS, {} PRESSES",
-                ms(r.median.0),
-                ms(r.spread.0),
-                r.samples
-            ));
+            set(
+                16,
+                format!(
+                    "  MEDIAN DEVIATION {} MS, SPREAD {} MS, {} PRESSES",
+                    ms(r.median.0),
+                    ms(r.spread.0),
+                    r.samples
+                ),
+            );
         }
     }
     if let Some(line) = report
@@ -212,61 +448,78 @@ pub fn lines(
         .as_ref()
         .and_then(|rec| incomplete_line(rec.status.incomplete))
     {
-        l.push(line);
+        set(17, line);
     }
     match &report.saved {
         Some(Ok(r)) => {
             let name = r
                 .path
                 .file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().to_uppercase());
-            l.push(format!("SAVED AS RECORD {name}"));
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            set(18, format!("SAVED AS RECORD {name}"));
         }
-        Some(Err(e)) => l.push(format!("NOT SAVED: {}", Chain(e)).to_uppercase()),
-        None if autoplay => l.push("AUTOPLAY: NOT SAVED".to_owned()),
+        Some(Err(e)) => set(18, format!("NOT SAVED: {}", Chain(e))),
+        None if autoplay => set(18, "AUTOPLAY: NOT SAVED".to_owned()),
         None => {}
     }
-    if let Some(e) = report.output_error {
-        l.push(format!("AUDIO: {e}").to_uppercase());
-    }
-    if let Some(e) = report.input_error {
-        l.push(format!("INPUT: {e}").to_uppercase());
-    }
-    l.push(queue_line(queue));
+    let failures: Vec<String> = report
+        .output_error
+        .map(|e| format!("AUDIO: {e}"))
+        .into_iter()
+        .chain(report.input_error.map(|e| format!("INPUT: {e}")))
+        .collect();
+    set(19, failures.join("  "));
+    set(20, queue_line(queue));
     let ms = |d: Option<Duration>| d.map_or_else(|| "-".to_owned(), |d| d.as_millis().to_string());
-    l.push(format!(
-        "LOAD {} MS  RETRY {} MS",
-        ms(times.first),
-        ms(times.retry)
-    ));
-    l.push(String::new());
-    l.push(format!("{}: RETRY    {}: QUIT", hints.retry, hints.quit));
+    set(
+        21,
+        format!("LOAD {} MS  RETRY {} MS", ms(times.first), ms(times.retry)),
+    );
+    set(
+        22,
+        format!(
+            "{}: RETRY  {}: BACK  LEFT/RIGHT: PRESET",
+            hints.retry, hints.quit
+        ),
+    );
     l
 }
 
-/// The settings keys and their values, under the summary. The input offset
-/// applies from the next play (design.md "Offset Changes and the Watermark") of
-/// devices; autoplay plays with 0 whatever it is.
+/// The settings keys and their values, under the summary, on the two lines
+/// left: the input offset with its keys always among them. The input offset
+/// applies from the next play (design.md "Offset Changes and the
+/// Watermark") of devices; autoplay plays with 0 whatever it is.
 pub fn settings_lines(t: Tuning) -> Vec<String> {
     vec![
-        String::new(),
-        format!("F1/F2 HI-SPEED: VISIBLE TIME {} MS", t.visible_time_ms),
-        format!(
-            "F3/F4 VOLUME {}%    F5/F6 DISPLAY OFFSET {} MS",
-            t.volume_percent,
-            ms(t.display_offset_us)
+        fit(
+            &format!(
+                "F1/F2 VISIBLE TIME {} MS  F3/F4 VOLUME {}%  F5/F6 DISPLAY OFFSET {} MS",
+                t.visible_time_ms,
+                t.volume_percent,
+                ms(t.display_offset_us)
+            ),
+            COLUMNS,
         ),
-        format!(
-            "F7/F8 INPUT OFFSET {} MS FROM THE NEXT PLAY",
-            ms(t.input_offset_us)
+        fit(
+            &format!(
+                "F7/F8 INPUT OFFSET {} MS FROM THE NEXT PLAY  F9 OVERLAY",
+                ms(t.input_offset_us)
+            ),
+            COLUMNS,
         ),
-        "F9 MEASUREMENT OVERLAY IN PLAY".to_owned(),
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{key_name, ms};
+    use std::path::Path;
+
+    use bms_model::{ChartBuilder, Lane, TimeUs};
+    use game::{GaugeEnd, Notice, ResultScreen, SHOWN_GAUGES, ViewStatus, ViewSummary};
+    use replay::verify::Coverage;
+    use rules::GaugeValue;
+
+    use super::{COLUMNS, Hints, LoadTimes, QueueLine, SUMMARY_LINES, key_name, ms};
 
     #[test]
     fn key_names_follow_the_scan_code() {
@@ -289,11 +542,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "",
-                "F1/F2 HI-SPEED: VISIBLE TIME 575 MS",
-                "F3/F4 VOLUME 35%    F5/F6 DISPLAY OFFSET -2.0 MS",
-                "F7/F8 INPUT OFFSET +4.0 MS FROM THE NEXT PLAY",
-                "F9 MEASUREMENT OVERLAY IN PLAY",
+                "F1/F2 VISIBLE TIME 575 MS  F3/F4 VOLUME 35%  F5/F6 DISPLAY OFFSET -2.0 MS",
+                "F7/F8 INPUT OFFSET +4.0 MS FROM THE NEXT PLAY  F9 OVERLAY",
             ]
         );
     }
@@ -355,11 +605,29 @@ mod tests {
         assert_eq!(ms(12_000), "+12.0");
     }
 
+    /// One tap at 1 s on lane 1.
+    fn chart() -> bms_model::Chart {
+        ChartBuilder::new(150_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap()
+    }
+
+    const QUEUE: QueueLine = QueueLine {
+        played: Some(2),
+        steady_underruns: 0,
+        next: 2,
+    };
+
+    fn hints() -> Hints {
+        Hints::new(Some(0x0E), Some(0x01))
+    }
+
     /// A completed play's report under `preset`, with one gauge result per
-    /// preset gauge at 61.234 %.
+    /// preset gauge at 61.234 %, and a record of no input.
     fn report(preset: rules::RulePreset) -> game::PlayReport {
         use eval::{Evaluation, GaugeResult, Tally};
-        use rules::{GaugeValue, PerJudgment};
+        use rules::PerJudgment;
         let tally = Tally {
             counts: PerJudgment {
                 perfect: 3,
@@ -395,7 +663,7 @@ mod tests {
             live: Vec::new(),
             tally,
             displayed_gauge: game::GaugeIndex(0),
-            record: None,
+            record: Some(record(&preset, replay::Incomplete::default())),
             saved: None,
             result: Some(game::ResultSummary {
                 evaluation: Ok(Evaluation {
@@ -411,56 +679,383 @@ mod tests {
         }
     }
 
+    /// The result screen of `report` over the presets in `dir`.
+    fn screen(dir: &Path, report: &game::PlayReport) -> ResultScreen {
+        let shelf = game::Shelf::open(dir.join("presets"), "tapestry").unwrap();
+        ResultScreen::new(report, &shelf, &chart(), game::RECORDING_MEMORY)
+    }
+
+    /// The end screen of `report`, viewed on `screen`.
+    fn lines_of(report: &game::PlayReport, screen: &ResultScreen, autoplay: bool) -> Vec<String> {
+        super::lines(
+            report,
+            screen,
+            0,
+            LoadTimes::default(),
+            QUEUE,
+            &hints(),
+            autoplay,
+        )
+    }
+
+    /// The gauges are named by the preset viewed: as played, the preset the
+    /// play used, whose renamed gauges are pinned as played.
     #[test]
-    fn gauges_are_named_by_the_preset_the_play_used() {
+    fn gauges_are_named_by_the_viewed_preset() {
+        let dir = tempfile::tempdir().unwrap();
         let mut preset = rules::tapestry();
         let ids: Vec<String> = preset.gauges.iter().map(|g| g.id.clone()).collect();
         assert!(!ids.is_empty());
         for g in &mut preset.gauges {
             g.id = format!("{}-renamed", g.id);
         }
-        let hints = super::Hints::new(Some(0x0E), Some(0x01));
-        let queue = super::QueueLine {
-            played: Some(2),
-            steady_underruns: 0,
-            next: 2,
-        };
-        let lines = super::lines(
-            &report(preset),
-            0,
-            super::LoadTimes::default(),
-            queue,
-            &hints,
-            false,
-        );
-        assert!(lines.contains(&super::queue_line(queue)), "{lines:?}");
+        let played = report(preset);
+        let s = screen(dir.path(), &played);
+        let lines = lines_of(&played, &s, false);
+        assert_eq!(lines.len(), SUMMARY_LINES);
+        assert!(lines.contains(&super::queue_line(QUEUE)), "{lines:?}");
         for id in &ids {
-            let named = format!("GAUGE {}-RENAMED 61.234%", id.to_uppercase());
+            let named = format!("{}-RENAMED 61.234% NOT CLEAR", id.to_uppercase());
             assert!(
-                lines.iter().any(|l| l.starts_with(&named)),
+                lines.iter().any(|l| l.contains(&named)),
                 "{named} in {lines:?}"
             );
         }
-        assert_eq!(lines.last().unwrap(), "BACKSPACE: RETRY    ESCAPE: QUIT");
+        // Another preset's gauges are named by it.
+        let mut what_if = ViewSummary {
+            tally: played.tally,
+            gauges: [None; SHOWN_GAUGES],
+            more_gauges: 0,
+            coverage: Coverage::Recorded,
+            as_played: false,
+            started_at_default: 0b10,
+        };
+        for g in what_if.gauges.iter_mut().take(2) {
+            *g = Some(GaugeEnd {
+                value: GaugeValue(5_000_000),
+                cleared: true,
+            });
+        }
+        let lr2 = rules::lr2_style();
+        let cells = super::gauge_cells(&what_if, Some(&lr2), 37);
+        assert_eq!(
+            cells,
+            [
+                format!("{} 50.000% CLEAR", lr2.gauges[0].id.to_uppercase()),
+                // Cut within its cell, keeping the value.
+                format!(
+                    "{}.. 50.000% CLEAR (DEFAULT START)",
+                    &lr2.gauges[1].id.to_uppercase()[..5]
+                ),
+            ]
+        );
+    }
+
+    /// The view line names the viewed preset, and a what-if's coverage
+    /// gets its own line with the time in seconds to three decimals.
+    #[test]
+    fn what_if_labels_name_the_preset_and_the_time() {
+        let mut s = ViewSummary {
+            tally: report(rules::tapestry()).tally,
+            gauges: [None; SHOWN_GAUGES],
+            more_gauges: 0,
+            coverage: Coverage::Recorded,
+            as_played: true,
+            started_at_default: 0,
+        };
+        let label = |s: &ViewSummary| {
+            (
+                super::view_label(ViewStatus::Ready(s), "LR2-STYLE"),
+                super::coverage_line(ViewStatus::Ready(s)),
+            )
+        };
+        assert_eq!(label(&s), ("AS PLAYED".to_owned(), String::new()));
+        s.as_played = false;
+        assert_eq!(
+            label(&s),
+            ("WHAT-IF UNDER LR2-STYLE".to_owned(), String::new())
+        );
+        s.coverage = Coverage::NoInputAfter(TimeUs(60_180_000));
+        assert_eq!(label(&s).1, "NO INPUT AFTER 60.180 S");
+        s.coverage = Coverage::EndedMidway(TimeUs(1_649_999));
+        assert_eq!(label(&s).1, "ENDED MIDWAY AT 1.649 S, NO CLEAR");
+        assert_eq!(
+            super::view_label(
+                ViewStatus::OverBudget {
+                    needed: 9,
+                    budget: 1
+                },
+                "MINE"
+            ),
+            "TOO LARGE TO RE-EVALUATE UNDER MINE"
+        );
+        assert_eq!(
+            super::view_label(ViewStatus::NothingRecorded, "MINE"),
+            "NOTHING WAS RECORDED"
+        );
+    }
+
+    /// Lines 2 to 8 of a screen whose viewed file broke after reloading,
+    /// with the play's own reload error: the strip, the view, the
+    /// coverage, the file's error, the two notices and the reload error;
+    /// the coverage and the standing error each keep their own line after
+    /// the notices roll over.
+    #[test]
+    fn the_view_lines_show_the_strip_notices_and_reload_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let presets = dir.path().join("presets");
+        std::fs::create_dir_all(&presets).unwrap();
+        let mine = presets.join("mine.toml");
+        let mut late = rules::tapestry();
+        for t in [&mut late.tables.keys, &mut late.tables.scratch] {
+            t.windows.bad.late = TimeUs(400_000);
+        }
+        std::fs::write(&mine, game::preset_to_toml(&late)).unwrap();
+        let mut played = report(rules::tapestry());
+        let rec = played.record.as_mut().unwrap();
+        rec.status.end = replay::EndStatus::PlayedToEnd;
+        rec.status.finalized = TimeUs(1_180_000);
+        played.reload_error = Some(game::PresetFileError::io(
+            presets.join("tapestry-old.toml"),
+            std::io::ErrorKind::NotFound,
+        ));
+        let mut shelf = game::Shelf::open(presets.clone(), "tapestry").unwrap();
+        let mut s = ResultScreen::new(&played, &shelf, &chart(), game::RECORDING_MEMORY);
+        // tapestry, beatoraja-style, lr2-style, mine: back one.
+        s.step(-1, &played, &chart());
+        let broken = |text: &str| {
+            std::fs::write(&mine, text).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&mine)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
+        };
+        broken("windows = [");
+        shelf.check();
+        s.sync(&played, &shelf, &chart());
+        // Two more files failing roll the viewed file's notice out.
+        for other in ["zz.toml", "yy.toml"] {
+            std::fs::write(presets.join(other), "windows = [").unwrap();
+            shelf.check();
+            s.sync(&played, &shelf, &chart());
+        }
+        let lines = lines_of(&played, &s, false);
+        let error = "MINE.TOML: THE PRESET FILE CANNOT BE READ";
+        let got: Vec<&str> = lines[1..8].iter().map(String::as_str).collect();
+        assert_eq!(got[0], "< LR2-STYLE  >MINE!<  YY! >  4/6");
+        assert_eq!(got[1], "WHAT-IF UNDER MINE");
+        assert_eq!(got[2], "NO INPUT AFTER 1.180 S");
+        assert!(
+            got[3].starts_with(&format!("FILE DID NOT RELOAD: {error}")),
+            "{got:?}"
+        );
+        assert!(got[4].starts_with("ZZ.TOML: "), "{got:?}");
+        assert!(got[5].starts_with("YY.TOML: "), "{got:?}");
+        assert_eq!(
+            got[6],
+            "THIS PLAY USED THE PREVIOUS TAPESTRY: TAPESTRY-OLD.TOML: ENTITY NOT FOUND"
+        );
+        // The viewed file's notice went; its standing error did not.
+        assert!(
+            s.notices()
+                .all(|n| matches!(n, Notice::Failed(e) if e.path != mine)),
+            "{:?}",
+            s.notices().collect::<Vec<_>>()
+        );
+        assert_eq!(s.file_error().map(|e| &e.path), Some(&mine));
+        assert!(lines.iter().all(|l| l.len() <= COLUMNS), "{lines:?}");
+    }
+
+    /// The console says the view again when its entry changes, even to one
+    /// of the same name, and when its error changes.
+    #[test]
+    fn the_view_is_logged_by_entry_and_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let presets = dir.path().join("presets");
+        std::fs::create_dir_all(&presets).unwrap();
+        let mine = presets.join("mine.toml");
+        let write = |text: &str| {
+            std::fs::write(&mine, text).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&mine)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
+        };
+        // Played under `mine`, whose file changed since: `mine` as played is
+        // pinned beside the file `mine`.
+        let played_preset = rules::RulePreset {
+            id: "mine".to_owned(),
+            ..rules::tapestry()
+        };
+        let mut lr2 = rules::lr2_style();
+        lr2.id = "mine".to_owned();
+        write(&game::preset_to_toml(&lr2));
+        let played = report(played_preset);
+        let mut shelf = game::Shelf::open(presets.clone(), "mine").unwrap();
+        let mut s = ResultScreen::new(&played, &shelf, &chart(), game::RECORDING_MEMORY);
+        let pinned = super::view_log(&s).unwrap();
+        assert!(matches!(pinned.0, game::EntryId::AsPlayed(_)));
+        s.step(1, &played, &chart());
+        let file = super::view_log(&s).unwrap();
+        assert_eq!(file.0, game::EntryId::UserFile("mine".to_owned()));
+        assert_ne!(pinned, file);
+        write("windows = [");
+        shelf.check();
+        s.sync(&played, &shelf, &chart());
+        let broken = super::view_log(&s).unwrap();
+        assert_eq!(broken.0, file.0);
+        assert_ne!(broken, file);
+        assert!(broken.1.contains("mine.toml"), "{}", broken.1);
+    }
+
+    /// Long names and errors are cut to the line with a trailing `..`, a
+    /// gauge's name within its cell, never the whole row.
+    #[test]
+    fn long_names_and_errors_are_cut_with_a_marker() {
+        let long = "x".repeat(200);
+        let cut = super::fit(&long, COLUMNS);
+        assert_eq!(cut.len(), COLUMNS);
+        assert!(cut.ends_with(".."));
+        let mut preset = rules::tapestry();
+        preset.gauges[0].id = "g".repeat(60);
+        let s = ViewSummary {
+            tally: report(rules::tapestry()).tally,
+            gauges: [
+                Some(GaugeEnd {
+                    value: GaugeValue(5_000_000),
+                    cleared: false,
+                }),
+                Some(GaugeEnd {
+                    value: GaugeValue(5_000_000),
+                    cleared: true,
+                }),
+                None,
+                None,
+                None,
+                None,
+            ],
+            more_gauges: 0,
+            coverage: Coverage::Recorded,
+            as_played: true,
+            started_at_default: 0,
+        };
+        let cells = super::gauge_cells(&s, Some(&preset), 37);
+        assert_eq!(cells[0].len(), 37);
+        assert!(cells[0].ends_with(".. 50.000% NOT CLEAR"), "{}", cells[0]);
+        assert!(
+            cells[1].starts_with("SURVIVAL 50.000% CLEAR"),
+            "{}",
+            cells[1]
+        );
+    }
+
+    /// A seventh gauge or more shows as a count in place of the sixth.
+    #[test]
+    fn gauges_past_six_show_a_count() {
+        let g = Some(GaugeEnd {
+            value: GaugeValue(0),
+            cleared: false,
+        });
+        let s = ViewSummary {
+            tally: report(rules::tapestry()).tally,
+            gauges: [g; SHOWN_GAUGES],
+            more_gauges: 3,
+            coverage: Coverage::Recorded,
+            as_played: true,
+            started_at_default: 0,
+        };
+        let cells = super::gauge_cells(&s, None, 37);
+        assert_eq!(cells.len(), SHOWN_GAUGES);
+        assert_eq!(cells[5], "+4 MORE");
+        assert_eq!(cells[4], "GAUGE 5 0.000% NOT CLEAR");
+    }
+
+    /// A refused file's stem that is not a name is drawn with `?` for
+    /// what the bitmap font cannot draw, by its file name only.
+    #[test]
+    fn refused_stem_is_drawn_ascii_safe() {
+        let e = game::PresetFileError::io(
+            Path::new("C:/data/presets").join("曲の設定.toml"),
+            std::io::ErrorKind::InvalidData,
+        );
+        let text = super::fit(&super::preset_error_text(&e), COLUMNS);
+        assert_eq!(text, "????.TOML: INVALID DATA");
+        let io = game::ShelfError::Io {
+            path: Path::new("C:/data/presets").to_owned(),
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        assert_eq!(super::shelf_error_text(&io), "presets: permission denied");
+        // A name is drawn; a value that is not a name, a path perhaps, never.
+        let unknown = |v: &str| {
+            super::shelf_error_text(&game::ShelfError::Unknown(game::UnknownPreset(
+                v.to_owned(),
+            )))
+        };
+        assert!(unknown("mine").contains("`mine`"), "{}", unknown("mine"));
+        let path = unknown("C:/Users/me/presets/custom.toml");
+        assert_eq!(
+            path,
+            "the chosen preset in player.toml is not a preset name"
+        );
+    }
+
+    /// Whatever the summary holds, the key hints stay on their line and the
+    /// settings lines, the input offset with its keys among them, follow
+    /// within the 25 lines the screen draws, after an offset change too.
+    #[test]
+    fn the_key_hint_line_is_always_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut played = report(rules::tapestry());
+        played.end = game::PlayEnd::Aborted(game::AbortCause::InputFailed);
+        played.input_error = Some(game::InputWaitError::Gone);
+        played.output_error = Some(audio::OutputError::DeviceLost);
+        played.record = Some(record(
+            &played.preset,
+            replay::Incomplete {
+                suspend: true,
+                ..replay::Incomplete::default()
+            },
+        ));
+        played.result.as_mut().unwrap().recommended_offset = Some(game::RecommendedOffset {
+            median: TimeUs(1_000),
+            spread: TimeUs(0),
+            samples: 40,
+        });
+        let s = screen(dir.path(), &played);
+        let mut page = lines_of(&played, &s, false);
+        assert_eq!(
+            page[SUMMARY_LINES - 1],
+            "BACKSPACE: RETRY  ESCAPE: BACK  LEFT/RIGHT: PRESET"
+        );
+        page.extend(super::settings_lines(game::Tuning {
+            visible_time_ms: 575,
+            volume_percent: 100,
+            display_offset_us: -12_000,
+            input_offset_us: -7_500,
+        }));
+        assert_eq!(page.len(), 25);
+        assert_eq!(
+            page[24],
+            "F7/F8 INPUT OFFSET -7.5 MS FROM THE NEXT PLAY  F9 OVERLAY"
+        );
+        assert!(page.iter().all(|l| l.len() <= COLUMNS), "{page:?}");
     }
 
     /// A play the input thread ended names the cause, the error and, for its
     /// record, the incomplete reason, alone or with others.
     #[test]
     fn an_input_failure_is_named_on_the_end_screen() {
+        let dir = tempfile::tempdir().unwrap();
         let preset = rules::tapestry();
         let mut played = report(preset.clone());
         played.end = game::PlayEnd::Aborted(game::AbortCause::InputFailed);
         played.input_error = Some(game::InputWaitError::Gone);
-        let hints = super::Hints::new(Some(0x0E), Some(0x01));
-        let queue = super::QueueLine {
-            played: Some(2),
-            steady_underruns: 0,
-            next: 2,
-        };
-        let lines = |played: &game::PlayReport| {
-            super::lines(played, 0, super::LoadTimes::default(), queue, &hints, false)
-        };
+        let lines =
+            |played: &game::PlayReport| lines_of(played, &screen(dir.path(), played), false);
         let incomplete = |l: &[String]| {
             l.iter()
                 .filter(|l| l.starts_with("RECORD INCOMPLETE"))
@@ -498,7 +1093,7 @@ mod tests {
     fn record(preset: &rules::RulePreset, reasons: replay::Incomplete) -> replay::PlayRecord {
         replay::PlayRecord {
             versions: replay::Versions {
-                evaluator: 1,
+                evaluator: rules::Implementation::STANDARD_VERSION,
                 app: "0.0.0-test".to_owned(),
                 provenance: replay::BuildProvenance::Development,
             },
@@ -535,28 +1130,14 @@ mod tests {
     /// and no such line.
     #[test]
     fn autoplay_end_screen_says_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
         let mut played = report(rules::tapestry());
         played.result.as_mut().unwrap().recommended_offset = Some(game::RecommendedOffset {
             median: bms_model::TimeUs(0),
             spread: bms_model::TimeUs(0),
             samples: 40,
         });
-        let hints = super::Hints::new(Some(0x0E), Some(0x01));
-        let queue = super::QueueLine {
-            played: Some(2),
-            steady_underruns: 0,
-            next: 2,
-        };
-        let lines = |autoplay| {
-            super::lines(
-                &played,
-                0,
-                super::LoadTimes::default(),
-                queue,
-                &hints,
-                autoplay,
-            )
-        };
+        let s = screen(dir.path(), &played);
         let recommends = |l: &[String]| {
             l.iter()
                 .filter(|l| {
@@ -564,7 +1145,7 @@ mod tests {
                 })
                 .count()
         };
-        let auto = lines(true);
+        let auto = lines_of(&played, &s, true);
         assert!(auto.iter().any(|l| l == "AUTOPLAY: NOT SAVED"), "{auto:?}");
         assert!(auto.iter().any(|l| l.starts_with("PERFECT 3")), "{auto:?}");
         assert!(
@@ -572,7 +1153,7 @@ mod tests {
                 .any(|l| l == "RE-EVALUATION MATCHES THE LIVE PLAY")
         );
         assert_eq!(recommends(&auto), 0, "{auto:?}");
-        let saved = lines(false);
+        let saved = lines_of(&played, &s, false);
         assert!(!saved.iter().any(|l| l.contains("AUTOPLAY")), "{saved:?}");
         assert_eq!(recommends(&saved), 2, "{saved:?}");
     }

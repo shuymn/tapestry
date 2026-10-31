@@ -198,7 +198,7 @@ egui comes with the first form-like screen.
 
 **Values.**
 - `scores` holds the best EX, the best BP, a lamp, and the play count.
-- The lamp is the hardest gauge cleared (easiest first) or FULL COMBO.
+- The lamp is the cleared gauge with the highest `lamp` rank (design.md "Rule Presets"), or FULL COMBO. Presets list their gauges in display order, not in order of difficulty, so each gauge states its rank (PR18a).
 - The play count counts every saved, verified record under the key, so plays of a `#RANDOM` chart count across its branches even though they set no best.
 
 **Idempotence.** One ingest function serves live updates and rebuilds. `counted(record_file PRIMARY KEY)` makes ingesting the same record twice a no-op.
@@ -225,7 +225,7 @@ egui comes with the first form-like screen.
 
 ### D10. User preset files are polled, not watched
 
-**Today.** The shelf (crates/game/src/presets.rs) checks the user preset files every 250 ms while a result screen shows (`Loaded::poll_presets`) and at every retry; the select screen does not poll yet (PR17).
+**Today.** One shelf (crates/game/src/presets.rs) serves the run: `App` opens it once, polls it every 250 ms on the select screen, and lends it to each chart, whose result screen polls it too (`Loaded::poll_presets`), and whose loads and retries check it.
 
 **Decision.** While a select or result screen shows, the shelf checks the user preset files' modification times every 250 ms. The built-ins are never read from disk, so they are never polled.
 - A changed file reloads, and the result screen re-evaluates under it.
@@ -278,7 +278,7 @@ Its own rules, each with an example in crates/eval/tests/style_lr2.rs:
 **Policies are choices, not replacements (decided).** Each is a new variant beside today's behavior, which stays available: tapestry keeps nearest assignment, misses at the press for overtaken notes, a miss at the edge and a BAD head scored at the press, and reads judgment headers as loader version 6 does, so its results do not change. Only the selection variants a supported preset uses are added (combo priority); beatoraja's other algorithms wait for a preset that uses one.
 
 **Versions.**
-- A new field or variant bumps the canonical encoding version (`FORMAT_VERSION` in crates/rules/src/canonical.rs), so older records are refused. A new field also changes the file shape, and older files are refused with the existing hint; a new variant alone adds no key, so a user preset file naming an existing variant still reads with its own values and hash.
+- A new field or variant bumps the canonical encoding version (`rules::CANONICAL_VERSION`), so older records are refused. A new field also changes the file shape, and older files are refused with the existing hint; a new variant alone adds no key, so a user preset file naming an existing variant still reads with its own values and hash.
 - The evaluator version (`Implementation::STANDARD_VERSION`) bumps only when an existing variant's meaning changes.
 - The judgment-header model bumps `LOADER_VERSION`; records of loader version 6 are refused, also under an override (design.md "Determinism"), and cannot gain the declarations they did not keep.
 
@@ -494,7 +494,7 @@ A fractional first stage: 1,000 frames at 44.1 kHz are 1,088.435 frames at 48 kH
   - a button sends on its press only, with no repeat while held; only the first connected unit of the configured model sends, and none without a configured controller.
   - Events go through a bounded SPSC queue, and the thread unparks the game thread.
   - Menu events are never recorded.
-  - The result screen keeps the keyboard's retry and quit keys; controller commands there arrive with PR17.
+  - On the result screen (PR17), the scratch's up and down switch presets, the white keys retry and the black keys go back; the keyboard keeps its retry and quit keys and adds the arrow keys. The queues are read only while a result shows, so the select loop's drain never takes the select screen's input.
 - **Keyboard lane keys** are not menu events.
 
 ### D19. Record format changes
@@ -947,20 +947,43 @@ Each one holds the behavior D5 and D6 state.
 
 **Depends on.** PR5, PR15, PR16.
 
+**Touches.**
+- `game`: presets.rs (a revision counter, a listing error, the absolute poll deadline), app.rs (one shelf for the run, lent to each chart and handed back on every outcome, polled on the select screen), session.rs (`load_reporting_to` takes the shelf; a chart's first play reports the chosen file's standing error), live.rs (the result loop drives the new `result_screen.rs` and waits to the poll deadline; `Rig::preset_reloaded` goes), and `result_screen.rs` (entries by identity, the view, its summaries and cache, and the evaluation budget, which reuses `Reservation`).
+- `player`: the result screen's keyboard and controller commands in both launch paths, read only while a result shows; the end screen's fixed layout; the select screen's chosen preset and its error.
+
 **Done when.**
-- `result_switches_presets_and_labels_what_if`;
-- `edited_preset_reevaluates_on_the_result_screen`;
+- When the player switches presets on a result, the view shall show the play as played under its own preset, equal to the live tally, then each other preset as a what-if labeled with its name and "no input after <t>" for a completed play, or "ended midway at <t>" with no gauge cleared for an aborted one, wrapping at both ends, while the play preset stays unchanged (`result_switches_presets_and_labels_what_if`);
+- When a viewed user preset that is not the chosen one changes, the view shall be re-evaluated under it within one 250 ms poll, and the chosen preset shall stay unchanged (`edited_preset_reevaluates_on_the_result_screen`);
 - When a user preset file changes while the select screen shows, the shelf shall reload it at the next 250 ms check (`select_screen_polls_the_shelf`);
 - When the player returns to the select screen, the shelf shall be kept, not reopened: if the chosen preset's file is then corrupted, the next chart shall play the last valid preset and the error shall be shown (`shelf_survives_returning_to_select`);
 - When a poll reloads the chosen preset or finds its file failing, the player's result screen shall show the re-evaluation or the error (`result_screen_shows_reload_and_error`).
 
-**Note.** The shelf reports changes only for the chosen preset (`Shelf::check`); listing every preset on the select and result screens may need a change notice per entry.
+**Measured.** `crates/game/tests/what_if_time.rs` (ignored; run in release) times a what-if on a chart near the 500,000-object limit with a full-input record. The figure is an indicator against the 250 ms target, not a gate; an off-thread evaluation is the follow-up only if real charts exceed it.
+
+### PR18a. Lamp ranks in presets (`rules`, `rules-toml`)
+
+**Touches.**
+- `rules`: `GaugeRule` gains `lamp: u16`, a higher rank a harder clear; validation refuses a repeated rank (`RuleError::DuplicateLamp`); the canonical encoding writes and reads `lamp` after the gauge's `id`, and its version, now exported as `rules::CANONICAL_VERSION`, goes from 10 to 11, so older encodings and the preset copies of older records are refused; the built-ins state their ranks (design.md "Standard Presets").
+- `rules-toml`: every gauge of a file states `lamp`; a file without it is refused with the older-file hint.
+- Every gauge built in test code and the fuzz seeds follow: the property generators draw the ranks as a permutation.
+- design.md "Rule Presets", "Standard Presets" and "User Presets".
+
+**Depends on.** PR8, PR16.
+
+**Done when.**
+- If two gauges of a preset share a rank, then validation shall refuse it with `DuplicateLamp` naming the rank and both gauges, and distinct ranks that are not contiguous shall validate (`lamp_ranks_must_be_distinct`).
+- The gauge IDs of each built-in sorted by rank shall be `assist_easy`, `easy`, `normal`, `hard`, `ex_hard`, `hazard` for beatoraja-style and LR2-style, and `normal`, `survival` for tapestry (`built_in_lamp_ranks`).
+- When a preset is encoded and decoded, the result shall equal it, and changing one rank shall change its hash (`canonical_round_trips_lamp_ranks`; the canonical round-trip property over generated rank permutations).
+- If canonical bytes repeat a rank, then decoding shall refuse them as invalid (`canonical_decoder_refuses_duplicate_lamp_ranks`).
+- If canonical bytes carry version 10, then decoding shall refuse them with `UnsupportedVersion(10)` (`other_canonical_version_is_refused`).
+- If a preset file has a gauge without `lamp`, then loading shall refuse it as unreadable, with the hint to export a built-in (`preset_file_without_lamp_is_refused_with_the_hint`).
+- When `eval-cli preset export beatoraja-style <path>` runs, the file shall state a `lamp` per gauge and load equal to the built-in apart from its ID (`export_writes_lamp_ranks`).
 
 ### PR18. Personal bests (`library`, `game`, `player`)
 
 **Touches.** Schema 3, `counts_for_best`, the ingest path, the rebuild, the display.
 
-**Depends on.** PR5, PR13, PR17.
+**Depends on.** PR5, PR13, PR17, PR18a.
 
 **Done when.**
 - `completed_full_play_updates_the_best`;
@@ -1098,6 +1121,7 @@ Each one holds the behavior D5 and D6 state.
 
 **Then:**
 - PR1 → PR7 → PR7e → PR7a → PR7b → PR7d → PR8 → PR16
+- PR8 + PR16 → PR18a (the lamp ranks of the built-ins and the file)
 - PR7e → PR7c → PR8
 - PR7a–PR7e → PR18 (bests key on the preset bytes and the interpretation tuple, so the standard presets and the loader version settle first)
 - PR4 → PR5
@@ -1106,7 +1130,7 @@ Each one holds the behavior D5 and D6 state.
 - PR11 + PR13 + PR14 → PR15
 - PR9 + PR15 → PR10
 - PR5 + PR15 + PR16 → PR17
-- PR5 + PR13 + PR17 → PR18
+- PR5 + PR13 + PR17 + PR18a → PR18
 - PR8 + PR18 → PR19
 - PR5 → PR20
 - PR2 + PR14 + PR20 + PR22 → PR23
@@ -1114,7 +1138,7 @@ Each one holds the behavior D5 and D6 state.
 - PR15 + PR18 → PR25
 - PR7d → PR26
 
-**Format numbering.** Library schema numbers follow the order PR12 < PR13 < PR18 < PR25. Replay format bumps (PR9, PR20, PR23), canonical encoding bumps (PR7e, PR7a–PR7d, PR8) and the loader version bump (PR7e) take the next number at merge.
+**Format numbering.** Library schema numbers follow the order PR12 < PR13 < PR18 < PR25. Replay format bumps (PR9, PR20, PR23), canonical encoding bumps (PR7e, PR7a–PR7d, PR8, PR18a) and the loader version bump (PR7e) take the next number at merge.
 
 ## 4. Verifying the stage exit
 

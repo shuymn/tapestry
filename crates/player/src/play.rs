@@ -16,8 +16,8 @@ use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
-    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, Opening,
-    PlayReport, RenderSide, Rig, Settings, Tuning,
+    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, MenuCommand,
+    Opening, PlayReport, RenderSide, ResultScreen, Rig, Settings, Tuning,
 };
 use input::{QpcClock, SourceReader};
 
@@ -30,6 +30,7 @@ use crate::measure::{
     process_page_faults, to_toml,
 };
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
+use crate::result_input::ResultInput;
 use crate::tuning::{Delivered, SettingsFiles};
 
 /// How long the logic step parks at most without a wake from the input
@@ -82,6 +83,15 @@ pub struct PlayerRig<'a> {
     pub end_lines: Option<Vec<String>>,
     /// The end screen's key names.
     pub hints: Hints,
+    /// The result screen's input.
+    pub result_input: ResultInput,
+    /// The view last printed: its entry and line ([`crate::end_screen::view_log`]).
+    pub viewed: Option<(game::EntryId, String)>,
+    /// The evaluations the shown result had made when last printed.
+    pub evaluated: u64,
+    /// The result screen's input, scripted, without selection (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub result_script: Option<crate::dev::SelectScript>,
     /// What the first play's load time runs from: the process start (the
     /// clock's 0), or the end of what the command set up first (a
     /// measurement's PresentMon capture).
@@ -306,6 +316,14 @@ impl Rig for PlayerRig<'_> {
         self.sync();
     }
 
+    fn idle_wait(&mut self, deadline: TimeUs) {
+        let left = deadline.0 - self.clock.now().0;
+        if left > 0 {
+            thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
+        }
+        self.sync();
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn take(&mut self) -> Option<Command> {
         let c = self.controls.take();
@@ -313,6 +331,20 @@ impl Rig for PlayerRig<'_> {
             self.pending_retry = self.controls.retry_at();
         }
         c
+    }
+
+    /// The retry and quit keys first (a suspend means nothing on a result),
+    /// then, while a result shows, its own keys and controller events.
+    fn take_menu(&mut self) -> Option<MenuCommand> {
+        loop {
+            match self.take() {
+                Some(Command::Retry) => return Some(MenuCommand::Retry),
+                Some(Command::Quit) => return Some(MenuCommand::Back),
+                Some(Command::Suspend) => {}
+                None => break,
+            }
+        }
+        self.result_input.take()
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -475,6 +507,7 @@ impl Rig for PlayerRig<'_> {
         // the Watermark"); the other values are recorded as they are at the
         // start.
         self.end_lines = None;
+        self.result_input.showing = false;
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
         self.input_offset_us = t.input_offset_us;
@@ -506,7 +539,13 @@ impl Rig for PlayerRig<'_> {
         self.persist();
     }
 
-    fn show_end(&mut self, report: &PlayReport) {
+    fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
+        // On entry: what was queued during the play is no result's.
+        if self.result_input.enter() {
+            self.viewed = None;
+            self.evaluated = 0;
+        }
+        self.print_view(screen);
         let tuning = self.controls.tuning();
         tuning.open_end_screen();
         let queue = self.queue_line.unwrap_or(QueueLine {
@@ -516,6 +555,7 @@ impl Rig for PlayerRig<'_> {
         });
         self.end_lines = Some(end_screen::lines(
             report,
+            screen,
             self.input_offset_us,
             self.times,
             queue,

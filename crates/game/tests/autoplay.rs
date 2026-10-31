@@ -301,7 +301,7 @@ impl Rig for AutoRig {
 
     fn ended(&mut self, _report: &PlayReport) {}
 
-    fn show_end(&mut self, _report: &PlayReport) {}
+    fn show_end(&mut self, _report: &PlayReport, _screen: &game::ResultScreen) {}
 
     fn before_play(&mut self, settings: &mut Settings) {
         (self.before)(settings, self.plays);

@@ -527,6 +527,11 @@ impl TotalCorrection {
 pub struct GaugeRule {
     /// Name of the gauge, unique within the preset.
     pub id: String,
+    /// Lamp rank: a higher rank is a harder clear. Ranks are distinct
+    /// within the preset and need not be contiguous; the gauges' order is
+    /// their display order, not their difficulty (design.md "Rule
+    /// Presets").
+    pub lamp: u16,
     /// How it decides a clear.
     pub kind: GaugeKind,
     /// Value at the start.
