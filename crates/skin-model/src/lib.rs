@@ -75,6 +75,7 @@ pub use expr::{
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
     compile,
 };
+pub use image::builder::{AdmitError, FontAdmitError, SheetBuilder};
 pub use image::font::{FontDef, FontError, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
 pub use image::path::{Entry, FileId, Listing, Root, RootError};
 pub use image::{

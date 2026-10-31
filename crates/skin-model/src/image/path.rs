@@ -210,6 +210,11 @@ impl Root {
         Ok(Self { dir })
     }
 
+    /// The canonical folder.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Checks the form of `name` as [`Root::read`] and [`Root::list`] do
     /// first, before it is normalised or touches the file system: at most
     /// [`MAX_PATH_BYTES`], not empty, not rooted, drive, UNC or verbatim,

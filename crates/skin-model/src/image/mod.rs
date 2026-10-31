@@ -8,6 +8,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+pub(crate) mod builder;
 pub(crate) mod decode;
 pub(crate) mod font;
 pub(crate) mod path;
@@ -249,42 +250,251 @@ pub struct Sheet {
     fonts: Box<[String]>,
 }
 
-/// A frame total, saturating.
-fn frame_total(images: &[ImageDef]) -> Result<usize, ImageError> {
-    let mut total = 0_usize;
-    for (image, def) in images.iter().enumerate() {
-        let [cols, rows] = def.grid;
-        if cols == 0 || rows == 0 {
-            return Err(ImageError::EmptyGrid { image });
-        }
-        let n = u32::from(cols) * u32::from(rows);
-        if n > MAX_IMAGE_FRAMES {
-            return Err(ImageError::TooManyImageFrames { image, n });
-        }
-        total = total.saturating_add(usize::try_from(n).unwrap_or(usize::MAX));
-        if total > MAX_SKIN_FRAMES {
-            return Err(ImageError::TooManySkinFrames);
-        }
+/// Image `image`'s frame count: its grid has a column and a row, and at
+/// most [`MAX_IMAGE_FRAMES`] frames.
+fn image_frames(image: usize, def: &ImageDef) -> Result<u32, ImageError> {
+    let [cols, rows] = def.grid;
+    if cols == 0 || rows == 0 {
+        return Err(ImageError::EmptyGrid { image });
+    }
+    let n = u32::from(cols) * u32::from(rows);
+    if n > MAX_IMAGE_FRAMES {
+        return Err(ImageError::TooManyImageFrames { image, n });
+    }
+    Ok(n)
+}
+
+/// `total` frames and `n` more, at most [`MAX_SKIN_FRAMES`].
+fn add_frames(total: usize, n: u32) -> Result<usize, ImageError> {
+    let total = total.saturating_add(usize::try_from(n).unwrap_or(usize::MAX));
+    if total > MAX_SKIN_FRAMES {
+        return Err(ImageError::TooManySkinFrames);
     }
     Ok(total)
 }
 
+/// A frame total, saturating.
+fn frame_total(images: &[ImageDef]) -> Result<usize, ImageError> {
+    let mut total = 0_usize;
+    for (image, def) in images.iter().enumerate() {
+        total = add_frames(total, image_frames(image, def)?)?;
+    }
+    Ok(total)
+}
+
+/// Whether image `image`'s cycle period is 1 µs to [`MAX_KEY_US`].
+fn check_cycle(image: usize, def: &ImageDef) -> Result<(), ImageError> {
+    if def
+        .cycle
+        .is_some_and(|c| c.period.0 < 1 || c.period.0 > MAX_KEY_US)
+    {
+        return Err(ImageError::CycleOutOfRange { image });
+    }
+    Ok(())
+}
+
 /// Running totals for one variant, checked against a cap.
-struct Total {
-    sum: u64,
-    cap: u64,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Total {
+    pub(crate) sum: u64,
+    pub(crate) cap: u64,
 }
 
 impl Total {
-    fn add(&mut self, n: u64) -> bool {
+    pub(crate) fn add(&mut self, n: u64) -> bool {
         self.sum = self.sum.saturating_add(n);
         self.sum <= self.cap
     }
+
+    /// The total with `n` more, if it stays within the cap; `self` is
+    /// unchanged.
+    pub(crate) fn with(self, n: u64) -> Option<Self> {
+        let mut next = self;
+        next.add(n).then_some(next)
+    }
+
+    /// No encoded bytes yet, against [`MAX_TOTAL_FILE_BYTES`].
+    pub(crate) const BYTES: Self = Self {
+        sum: 0,
+        cap: MAX_TOTAL_FILE_BYTES,
+    };
+
+    /// No texels yet, against [`MAX_TOTAL_TEXELS`].
+    pub(crate) const TEXELS: Self = Self {
+        sum: 0,
+        cap: MAX_TOTAL_TEXELS,
+    };
+}
+
+/// A file's name resolved inside the canonical skin folder `root`, with
+/// its length: the metadata checks, before any header is read.
+fn meta(root: &Path, at: FileAt, name: &str) -> Result<(PathBuf, u64), ImageError> {
+    path::resolve(root, name).map_err(|e| ImageError::path(at, e))
+}
+
+/// One file's versions resolved ([`meta`]); no hi path when there is no
+/// hi version, whose variant then reads the lo one.
+struct Resolved {
+    lo: PathBuf,
+    hi: Option<PathBuf>,
+}
+
+/// Resolves file `file`'s versions and checks the running byte totals,
+/// returning the totals with this file added.
+fn resolve_file(
+    root: &Path,
+    file: usize,
+    def: &FileDef,
+    lo_bytes: Total,
+    hi_bytes: Total,
+) -> Result<(Resolved, Total, Total), ImageError> {
+    let lo_at = FileAt { file, hi: false };
+    let (lo, lo_len) = meta(root, lo_at, &def.path)?;
+    let hi = match &def.hi {
+        Some(name) => Some(meta(root, FileAt { file, hi: true }, name)?),
+        None => None,
+    };
+    let lo_bytes = lo_bytes
+        .with(lo_len)
+        .ok_or(ImageError::TotalBytesTooLarge { at: lo_at })?;
+    let hi_len = hi.as_ref().map_or(lo_len, |&(_, len)| len);
+    let hi_at = FileAt {
+        file,
+        hi: hi.is_some(),
+    };
+    let hi_bytes = hi_bytes
+        .with(hi_len)
+        .ok_or(ImageError::TotalBytesTooLarge { at: hi_at })?;
+    let resolved = Resolved {
+        lo,
+        hi: hi.map(|(p, _)| p),
+    };
+    Ok((resolved, lo_bytes, hi_bytes))
+}
+
+/// Reads file `file`'s headers (lo, then hi at exactly twice its size)
+/// and checks the running texel totals, returning the file and the
+/// totals with it added.
+fn read_file(
+    file: usize,
+    def: FileDef,
+    paths: &Resolved,
+    lo_texels: Total,
+    hi_texels: Total,
+) -> Result<(File, Total, Total), ImageError> {
+    let lo_at = FileAt { file, hi: false };
+    let lo_dims = checked_header(lo_at, &paths.lo)?;
+    let lo_texels = lo_texels
+        .with(texels(lo_dims))
+        .ok_or(ImageError::TotalTooLarge { at: lo_at })?;
+    let hi = match (def.hi, &paths.hi) {
+        (Some(name), Some(hi_path)) => {
+            let dims = checked_header(FileAt { file, hi: true }, hi_path)?;
+            let [w, h] = lo_dims;
+            if dims != [w * 2, h * 2] {
+                return Err(ImageError::HiSizeMismatch { file });
+            }
+            Some(Version { name, dims })
+        }
+        _ => None,
+    };
+    let hi_dims = hi.as_ref().map_or(lo_dims, |v| v.dims);
+    let hi_at = FileAt {
+        file,
+        hi: hi.is_some(),
+    };
+    let hi_texels = hi_texels
+        .with(texels(hi_dims))
+        .ok_or(ImageError::TotalTooLarge { at: hi_at })?;
+    let loaded = File {
+        lo: Version {
+            name: def.path,
+            dims: lo_dims,
+        },
+        hi,
+    };
+    Ok((loaded, lo_texels, hi_texels))
+}
+
+/// Image `image`'s rectangle in its file of 1x size `dims` and its cell
+/// size: the rectangle inside the file and the cells not empty.
+fn cut(image: usize, def: &ImageDef, dims: [u32; 2]) -> Result<([u32; 4], [u32; 2]), ImageError> {
+    let [fw, fh] = dims;
+    let rect = def.rect.unwrap_or([0, 0, fw, fh]);
+    let [x, y, w, h] = rect;
+    let inside = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
+    if !inside(x, w, fw) || !inside(y, h, fh) {
+        return Err(ImageError::RectOutside { image });
+    }
+    let [cols, rows] = def.grid;
+    let (cw, ch) = (w / u32::from(cols), h / u32::from(rows));
+    if cw == 0 || ch == 0 {
+        return Err(ImageError::EmptyCell { image });
+    }
+    Ok((rect, [cw, ch]))
+}
+
+/// Appends a checked image's frames, row by row, each its cell's id in
+/// first-sight order, and returns how the skin draws it.
+fn push_frames(
+    def: &ImageDef,
+    [x, y, ..]: [u32; 4],
+    [cw, ch]: [u32; 2],
+    cell_ids: &mut BTreeMap<Cell, u32>,
+    frames: &mut Vec<u32>,
+) -> Image {
+    let first = u32::try_from(frames.len()).unwrap_or(u32::MAX);
+    let [cols, rows] = def.grid;
+    for r in 0..u32::from(rows) {
+        for c in 0..u32::from(cols) {
+            let cell = Cell {
+                file: def.file,
+                rect: [x + c * cw, y + r * ch, cw, ch],
+            };
+            let next = u32::try_from(cell_ids.len()).unwrap_or(u32::MAX);
+            frames.push(*cell_ids.entry(cell).or_insert(next));
+        }
+    }
+    Image {
+        first,
+        frames: u16::try_from(u32::from(cols) * u32::from(rows)).unwrap_or(u16::MAX),
+        cycle: def.cycle,
+        filter: def.filter,
+    }
+}
+
+/// The distinct cells in cell order, with `frames` renumbered from
+/// first-sight ids to that order, so the atlas reads each file once, in
+/// file order.
+fn renumber(cell_ids: BTreeMap<Cell, u32>, frames: &mut [u32]) -> Vec<Cell> {
+    let mut cells = Vec::with_capacity(cell_ids.len());
+    let mut renumber = vec![0_u32; cell_ids.len()];
+    for (sorted, (cell, id)) in (0_u32..).zip(cell_ids) {
+        if let Some(slot) = usize::try_from(id).ok().and_then(|i| renumber.get_mut(i)) {
+            *slot = sorted;
+        }
+        cells.push(cell);
+    }
+    for f in frames {
+        if let Some(&n) = usize::try_from(*f).ok().and_then(|i| renumber.get(i)) {
+            *f = n;
+        }
+    }
+    cells
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The headers this thread has read: a witness that metadata checks
+    /// come first and that a file is read once.
+    pub(crate) static HEADER_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// The header of a resolved file, checked: non-empty, at most
 /// [`MAX_SIDE`] per side and [`MAX_IMAGE_TEXELS`] in all.
 fn checked_header(at: FileAt, path: &Path) -> Result<[u32; 2], ImageError> {
+    #[cfg(test)]
+    HEADER_READS.with(|n| n.set(n.get() + 1));
     let (mut file, len) = path::open(path).map_err(|e| ImageError::path(at, e))?;
     let dims = decode::header(&mut file, len).map_err(|e| ImageError::decode(at, e))?;
     let [w, h] = dims;
@@ -355,92 +565,27 @@ impl Sheet {
             return Err(ImageError::UnknownFile { image });
         }
         let frame_count = frame_total(&images)?;
-        if let Some(image) = images.iter().position(|d| {
-            d.cycle
-                .is_some_and(|c| c.period.0 < 1 || c.period.0 > MAX_KEY_US)
-        }) {
-            return Err(ImageError::CycleOutOfRange { image });
+        for (image, def) in images.iter().enumerate() {
+            check_cycle(image, def)?;
         }
         let root = root.canonicalize().map_err(ImageError::Root)?;
 
         // Paths and lengths, before any header is read.
         let mut paths = Vec::with_capacity(files.len());
-        let mut lo_bytes = Total {
-            sum: 0,
-            cap: MAX_TOTAL_FILE_BYTES,
-        };
-        let mut hi_bytes = Total {
-            sum: 0,
-            cap: MAX_TOTAL_FILE_BYTES,
-        };
+        let (mut lo_bytes, mut hi_bytes) = (Total::BYTES, Total::BYTES);
         for (file, def) in files.iter().enumerate() {
-            let lo_at = FileAt { file, hi: false };
-            let (lo, lo_len) =
-                path::resolve(&root, &def.path).map_err(|e| ImageError::path(lo_at, e))?;
-            let hi = match &def.hi {
-                Some(name) => {
-                    let at = FileAt { file, hi: true };
-                    Some(path::resolve(&root, name).map_err(|e| ImageError::path(at, e))?)
-                }
-                None => None,
-            };
-            if !lo_bytes.add(lo_len) {
-                return Err(ImageError::TotalBytesTooLarge { at: lo_at });
-            }
-            let hi_len = hi.as_ref().map_or(lo_len, |&(_, len)| len);
-            if !hi_bytes.add(hi_len) {
-                let at = FileAt {
-                    file,
-                    hi: hi.is_some(),
-                };
-                return Err(ImageError::TotalBytesTooLarge { at });
-            }
-            paths.push((lo, hi.map(|(p, _)| p)));
+            let (resolved, lo, hi) = resolve_file(&root, file, def, lo_bytes, hi_bytes)?;
+            (lo_bytes, hi_bytes) = (lo, hi);
+            paths.push(resolved);
         }
 
         // Headers.
-        let mut lo_texels = Total {
-            sum: 0,
-            cap: MAX_TOTAL_TEXELS,
-        };
-        let mut hi_texels = Total {
-            sum: 0,
-            cap: MAX_TOTAL_TEXELS,
-        };
+        let (mut lo_texels, mut hi_texels) = (Total::TEXELS, Total::TEXELS);
         let mut loaded = Vec::with_capacity(files.len());
-        for (file, (def, (lo_path, hi_path))) in files.into_iter().zip(paths).enumerate() {
-            let lo_at = FileAt { file, hi: false };
-            let lo_dims = checked_header(lo_at, &lo_path)?;
-            if !lo_texels.add(texels(lo_dims)) {
-                return Err(ImageError::TotalTooLarge { at: lo_at });
-            }
-            let hi = match (def.hi, hi_path) {
-                (Some(name), Some(hi_path)) => {
-                    let at = FileAt { file, hi: true };
-                    let dims = checked_header(at, &hi_path)?;
-                    let [w, h] = lo_dims;
-                    if dims != [w * 2, h * 2] {
-                        return Err(ImageError::HiSizeMismatch { file });
-                    }
-                    Some(Version { name, dims })
-                }
-                _ => None,
-            };
-            let hi_dims = hi.as_ref().map_or(lo_dims, |v| v.dims);
-            if !hi_texels.add(texels(hi_dims)) {
-                let at = FileAt {
-                    file,
-                    hi: hi.is_some(),
-                };
-                return Err(ImageError::TotalTooLarge { at });
-            }
-            loaded.push(File {
-                lo: Version {
-                    name: def.path,
-                    dims: lo_dims,
-                },
-                hi,
-            });
+        for (file, (def, resolved)) in files.into_iter().zip(paths).enumerate() {
+            let (f, lo, hi) = read_file(file, def, &resolved, lo_texels, hi_texels)?;
+            (lo_texels, hi_texels) = (lo, hi);
+            loaded.push(f);
         }
 
         // Rectangles, frames and their cells.
@@ -451,51 +596,10 @@ impl Sheet {
             let Some(file) = usize::try_from(def.file).ok().and_then(|f| loaded.get(f)) else {
                 return Err(ImageError::UnknownFile { image });
             };
-            let [fw, fh] = file.lo.dims;
-            let [x, y, w, h] = def.rect.unwrap_or([0, 0, fw, fh]);
-            let inside =
-                |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
-            if !inside(x, w, fw) || !inside(y, h, fh) {
-                return Err(ImageError::RectOutside { image });
-            }
-            let [cols, rows] = def.grid;
-            let (cw, ch) = (w / u32::from(cols), h / u32::from(rows));
-            if cw == 0 || ch == 0 {
-                return Err(ImageError::EmptyCell { image });
-            }
-            let first = u32::try_from(frames.len()).unwrap_or(u32::MAX);
-            for r in 0..u32::from(rows) {
-                for c in 0..u32::from(cols) {
-                    let cell = Cell {
-                        file: def.file,
-                        rect: [x + c * cw, y + r * ch, cw, ch],
-                    };
-                    let next = u32::try_from(cell_ids.len()).unwrap_or(u32::MAX);
-                    frames.push(*cell_ids.entry(cell).or_insert(next));
-                }
-            }
-            drawn.push(Image {
-                first,
-                frames: u16::try_from(u32::from(cols) * u32::from(rows)).unwrap_or(u16::MAX),
-                cycle: def.cycle,
-                filter: def.filter,
-            });
+            let (rect, cell) = cut(image, def, file.lo.dims)?;
+            drawn.push(push_frames(def, rect, cell, &mut cell_ids, &mut frames));
         }
-        // Cell ids follow first sight; renumber them in cell order so the
-        // atlas reads each file once, in file order.
-        let mut cells = Vec::with_capacity(cell_ids.len());
-        let mut renumber = vec![0_u32; cell_ids.len()];
-        for (sorted, (cell, id)) in (0_u32..).zip(cell_ids) {
-            if let Some(slot) = usize::try_from(id).ok().and_then(|i| renumber.get_mut(i)) {
-                *slot = sorted;
-            }
-            cells.push(cell);
-        }
-        for f in &mut frames {
-            if let Some(&n) = usize::try_from(*f).ok().and_then(|i| renumber.get(i)) {
-                *f = n;
-            }
-        }
+        let cells = renumber(cell_ids, &mut frames);
         Ok(Self {
             id: NEXT_SHEET.fetch_add(1, Ordering::Relaxed),
             root,
