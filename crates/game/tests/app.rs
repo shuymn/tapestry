@@ -241,6 +241,10 @@ struct Headless {
     sounds: Option<AudioQueue>,
     sealed: bool,
     waits_since_seal: usize,
+    /// Waits after the seal before the audio tail ends.
+    tail_waits: usize,
+    /// The play's sounds stopped, counted.
+    cancels: usize,
     /// Recording opened and the play not yet handed over.
     opened: bool,
     in_selection: bool,
@@ -355,6 +359,8 @@ impl Headless {
             sounds: None,
             sealed: false,
             waits_since_seal: 0,
+            tail_waits: TAIL_WAITS,
+            cancels: 0,
             opened: false,
             in_selection: false,
             screen_fails_at: i64::MAX,
@@ -597,6 +603,7 @@ impl Rig for Headless {
     }
 
     fn cancel_audio(&mut self) {
+        self.cancels += 1;
         if let Some(s) = &mut self.sounds {
             while s.commands().pop().is_ok() {}
         }
@@ -620,7 +627,7 @@ impl Rig for Headless {
     }
 
     fn audio_done(&self) -> bool {
-        self.sealed && self.waits_since_seal >= TAIL_WAITS
+        self.sealed && self.waits_since_seal >= self.tail_waits
     }
 
     fn close(&mut self) -> Result<Closing, InputWaitError> {
@@ -1099,6 +1106,141 @@ fn quit_leaves_the_chart_close_ends_the_run() {
     }
     assert_eq!(rig.reports().count(), 2);
     assert_eq!(rig.next, 4);
+}
+
+/// Chart A's play completes about 2.7 s after its choice; with a 2 s tail,
+/// 3.5 s after it falls in the tail.
+const IN_THE_TAIL: i64 = 3_500;
+
+/// The quit key once the play is complete skips its audio tail to the
+/// result, whose audio stops there and whose record is saved complete;
+/// the quit key on that result then returns to selection (design.md
+/// "Audio tail").
+#[test]
+fn quit_in_the_tail_skips_to_the_result() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (IN_THE_TAIL, Act::Quit),
+        (500, Act::Quit),
+        (500, Act::Choose(1)),
+        (6_000, Act::Close),
+    ];
+    let (rig, events, ran) = run(Refusal::Missing, acts, |r| r.tail_waits = 2_000);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Load(0),
+            Seen::Shown(1),
+            Seen::Select,
+            Seen::Load(1),
+            Seen::Shown(1),
+        ]
+    );
+    let one = &rig.loads[0].1[0];
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert!(one.tail_skipped);
+    assert_eq!(one.tail_cut, None);
+    assert!(matches!(one.saved, Some(Ok(_))), "{:?}", one.saved);
+    let status = one.record.as_ref().unwrap().status;
+    assert_eq!(status.end, replay::EndStatus::PlayedToEnd);
+    // Chart B's tail ran to its end; only the skip stopped the audio.
+    assert!(!rig.loads[1].1[0].tail_skipped);
+    assert_eq!(rig.cancels, 1);
+    assert!(events.all().contains(&SessionEvent::Result { attempt: 1 }));
+}
+
+/// Before the play is complete, in its countdown or while it plays, the
+/// quit key still aborts it and returns to selection with no result.
+#[test]
+fn quit_before_completion_leaves_the_chart() {
+    for at in [300, 1_500] {
+        let acts = vec![
+            (0, Act::Choose(0)),
+            (at, Act::Quit),
+            (100, Act::Choose(1)),
+            (4_000, Act::Close),
+        ];
+        let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.tail_waits = 2_000);
+        ran.unwrap();
+        assert!(rig.violations.is_empty(), "{at}: {:?}", rig.violations);
+        assert_eq!(
+            rig.seen,
+            [Seen::Select, Seen::Load(0), Seen::Select, Seen::Load(1)],
+            "{at}"
+        );
+        let one = &rig.loads[0].1[0];
+        assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit), "{at}");
+        assert!(!one.tail_skipped, "{at}");
+    }
+}
+
+/// Retry in the tail still retries, with no result between.
+#[test]
+fn retry_in_the_tail_retries() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (IN_THE_TAIL, Act::Retry),
+        (5_000, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.tail_waits = 2_000);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.seen, [Seen::Select, Seen::Load(0), Seen::Shown(2)]);
+    let one = &rig.loads[0].1[0];
+    assert_eq!(
+        (one.end, one.tail_cut, one.tail_skipped),
+        (PlayEnd::Completed, Some(AbortCause::Retry), false)
+    );
+}
+
+/// Closing the window in the tail ends the run, with no result.
+#[test]
+fn close_in_the_tail_ends_the_run() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (IN_THE_TAIL, Act::Close),
+        // Never reached: the run has ended.
+        (100, Act::Choose(1)),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.tail_waits = 2_000);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.seen, [Seen::Select, Seen::Load(0)]);
+    let one = &rig.loads[0].1[0];
+    assert_eq!(
+        (one.end, one.tail_cut, one.tail_skipped),
+        (PlayEnd::Completed, Some(AbortCause::Quit), false)
+    );
+    assert_eq!(rig.next, 2);
+}
+
+/// Autoplay follows the same rule: the quit key in its tail skips to the
+/// result.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn autoplay_quit_in_the_tail_skips_to_the_result() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (IN_THE_TAIL, Act::Quit),
+        (500, Act::Quit),
+        (100, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| {
+        r.autoplay = vec![0];
+        r.tail_waits = 2_000;
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [Seen::Select, Seen::Load(0), Seen::Shown(1), Seen::Select]
+    );
+    let one = &rig.loads[0].1[0];
+    assert_eq!((one.end, one.tail_skipped), (PlayEnd::Completed, true));
+    assert_eq!(rig.cancels, 1);
 }
 
 /// Commands of a chart or a result do nothing in selection, and none is

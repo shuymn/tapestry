@@ -422,6 +422,76 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
     assert!(step9 < wrote && wrote < reported, "{stdout}");
 }
 
+/// Chart `tail/tail.bms`: [`chart_text`]'s four notes, and a 4 s BGM sound
+/// from 2.0 s, so its audio tail sounds from completion (about 3.7 s) to
+/// 6.0 s.
+fn write_tail_chart(library: &Path) {
+    let dir = library.join("tail");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    let samples: Vec<i16> = (0..4 * 44_100)
+        .map(|i| if i % 100 < 50 { 2_000 } else { -2_000 })
+        .collect();
+    let data = u32::try_from(samples.len() * 2).unwrap();
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16_u32.to_le_bytes());
+    b.extend_from_slice(&[1, 0, 1, 0]);
+    b.extend_from_slice(&44_100_u32.to_le_bytes());
+    b.extend_from_slice(&88_200_u32.to_le_bytes());
+    b.extend_from_slice(&[2, 0, 16, 0]);
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for s in samples {
+        b.extend_from_slice(&s.to_le_bytes());
+    }
+    fs::write(dir.join("bgm.wav"), b).unwrap();
+    let text = format!("{}#WAV02 bgm.wav\n#00101:02\n", chart_text("余韻"));
+    fs::write(dir.join("tail.bms"), text).unwrap();
+}
+
+/// The quit key timed after the play completes, its BGM still sounding
+/// (`command = "skip"`), skips the tail to the play's result, which the
+/// next step leaves; the play is complete and saved as played to the end.
+#[test]
+fn a_skip_after_completion_lands_on_the_result() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = \"auto\", until = { at_ms = 4500, command = \"skip\" } }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let plays = lines(&stdout, "play 1: ");
+    assert_eq!(plays.len(), 1, "{stdout}");
+    assert!(plays[0].starts_with("play 1: Completed"), "{stdout}");
+    assert!(!lines(&stdout, "result: viewing ").is_empty(), "{stdout}");
+}
+
+/// A `quit` timed after the play completes lands on its result, not on
+/// selection: the run fails at that step, naming `skip`.
+#[test]
+fn a_quit_after_completion_fails_naming_skip() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = \"auto\", until = { at_ms = 4500, command = \"quit\" } }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains(
+            "step 2 (play): the quit came after the play completed, which skips to its result"
+        ),
+        "{stderr}"
+    );
+}
+
 /// A play whose chart was refused fails the run at that step: exit 1,
 /// naming it and the choice, and no step after it runs.
 #[test]

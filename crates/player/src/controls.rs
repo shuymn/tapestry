@@ -3,10 +3,12 @@
 //!
 //! Closing the window is a latch that is never cleared, so a close that
 //! arrives while the game is between states (during startup, while a play
-//! is prepared) still ends the run. The quit key latches it too when a
-//! chart was given on the command line; with song selection, it leaves the
-//! chart instead ([`Controls::quit_leaves`]): a quit taken once, like retry
-//! and suspend, each by the play or result it arrives in.
+//! is prepared) still ends the run. In the game's runs, with song selection
+//! or a chart given on the command line, the quit key is instead a command
+//! taken once, like retry and suspend, by the play or result it arrives in
+//! ([`Controls::quit_leaves`]): it leaves the chart, or, once the play is
+//! complete, skips its tail to the result. Elsewhere (the key config) it
+//! latches as a close does.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -139,9 +141,9 @@ impl Controls {
         self.wake_game();
     }
 
-    /// From here on the quit key leaves the chart instead of ending the
-    /// run (song selection): it is taken once, and only closing the window
-    /// latches [`quitting`](Self::quitting).
+    /// From here on the quit key is a command taken once by the play or
+    /// result it arrives in, instead of ending the run: only closing the
+    /// window latches [`quitting`](Self::quitting).
     pub fn quit_leaves(&self) {
         self.leaves.store(true, Ordering::Release);
     }
