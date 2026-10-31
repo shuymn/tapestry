@@ -33,12 +33,17 @@ pub(crate) enum Timer {
     Unsupported,
 }
 
-/// Built-in timer `id`.
-pub(crate) fn builtin(id: i32) -> Timer {
+/// Built-in timer `id` in a skin that has a judge region (`judge_region`)
+/// or not.
+pub(crate) fn builtin(id: i32, judge_region: bool) -> Timer {
     let slot = match id {
         // Proven unset: nothing sets timer 0 (`TimerPropertyFactory.java:
         // 6-10`, `JsonSkinSerializer.java:109`).
         0 => return Timer::Unset,
+        // Set only for a judge region, which a judge destination makes
+        // (`JsonPlaySkinObjectLoader.java:283-287`, `JudgeManager.java:
+        // 129, 677-690`).
+        46 | 446 if !judge_region => return Timer::Unset,
         40 => timer::READY,
         41 => timer::PLAY,
         3 => timer::FAILED,
@@ -76,21 +81,28 @@ pub(crate) fn rank_source(k: usize) -> Option<String> {
 }
 
 /// The declared custom timers: id to the built-in it aliases, or `None`
-/// when it is anything else (passive, a chain, a script).
+/// when it is anything else (passive, a chain, a script); and whether the
+/// skin has a judge region.
 #[derive(Debug, Default)]
-pub(crate) struct Custom(pub(crate) BTreeMap<i32, Option<i32>>);
+pub(crate) struct Custom {
+    pub(crate) aliases: BTreeMap<i32, Option<i32>>,
+    pub(crate) judge_region: bool,
+}
 
 impl Custom {
-    /// Timer `id` (non-negative) resolved through the custom timers.
+    /// Timer `id` (non-negative) resolved through the custom timers. An
+    /// alias of a timer never set is never set.
     pub(crate) fn resolve(&self, id: i32) -> Timer {
         if id <= BUILTIN_MAX {
-            return builtin(id);
+            return builtin(id, self.judge_region);
         }
-        match self.0.get(&id) {
-            Some(&Some(target)) if (0..=BUILTIN_MAX).contains(&target) => match builtin(target) {
-                t @ (Timer::Builtin(_) | Timer::Rank(_)) => t,
-                Timer::Unset | Timer::Unsupported => Timer::Unsupported,
-            },
+        match self.aliases.get(&id) {
+            Some(&Some(target)) if (0..=BUILTIN_MAX).contains(&target) => {
+                match builtin(target, self.judge_region) {
+                    t @ (Timer::Builtin(_) | Timer::Rank(_) | Timer::Unset) => t,
+                    Timer::Unsupported => Timer::Unsupported,
+                }
+            }
             _ => Timer::Unsupported,
         }
     }
@@ -122,24 +134,43 @@ mod tests {
         ] {
             for lane in 0..8_u8 {
                 let want = lane_timer(kind, Lane::new(lane).unwrap());
-                assert_eq!(builtin(first + i32::from(lane)), Timer::Builtin(want));
+                assert_eq!(builtin(first + i32::from(lane), true), Timer::Builtin(want));
             }
         }
-        assert_eq!(builtin(58), Timer::Unsupported);
-        assert_eq!(builtin(2), Timer::Unsupported);
-        assert_eq!(builtin(140), Timer::Unsupported);
+        assert_eq!(builtin(58, true), Timer::Unsupported);
+        assert_eq!(builtin(2, true), Timer::Unsupported);
+        assert_eq!(builtin(140, true), Timer::Unsupported);
     }
 
     #[test]
     fn custom_timers_alias_supported_built_ins_only() {
-        let c = Custom(BTreeMap::from([
-            (10_000, Some(41)),
-            (10_001, Some(2)),
-            (10_002, None),
-            (10_003, Some(10_000)),
-        ]));
+        let c = Custom {
+            aliases: BTreeMap::from([
+                (10_000, Some(41)),
+                (10_001, Some(2)),
+                (10_002, None),
+                (10_003, Some(10_000)),
+                (10_005, Some(0)),
+                (10_006, Some(46)),
+            ]),
+            judge_region: false,
+        };
         assert_eq!(c.resolve(10_000), Timer::Builtin(timer::PLAY));
         assert_eq!(c.resolve(10_001), Timer::Unsupported);
+        assert_eq!(c.resolve(10_005), Timer::Unset);
+        assert_eq!(c.resolve(10_006), Timer::Unset);
+        assert_eq!(c.resolve(46), Timer::Unset);
+        assert_eq!(c.resolve(446), Timer::Unset);
+        let c = Custom {
+            judge_region: true,
+            ..c
+        };
+        assert_eq!(c.resolve(10_006), Timer::Builtin(timer::JUDGE));
+        assert_eq!(c.resolve(446), Timer::Builtin(timer::JUDGE));
+        let c = Custom {
+            judge_region: false,
+            ..c
+        };
         assert_eq!(c.resolve(10_002), Timer::Unsupported);
         assert_eq!(c.resolve(10_003), Timer::Unsupported);
         assert_eq!(c.resolve(10_004), Timer::Unsupported);

@@ -21,6 +21,31 @@ fn image(fields: &str) -> common::Loaded {
     ))
 }
 
+/// A judge of no grades: it draws nothing (an ignored note) but gives
+/// the skin its judge region.
+const REGION: &str = r#""judge": [{"id": "j", "index": 0, "images": [], "numbers": []}]"#;
+
+/// [`image`] after a [`REGION`] judge's destination, or before it with
+/// `after`.
+fn judged_image(fields: &str, after: bool) -> common::Loaded {
+    let i = format!(r#"{{"id": "i", "timer": 41, {fields}, "dst": [{{"w": 10, "h": 10}}]}}"#);
+    let j = r#"{"id": "j", "dst": [{"w": 1, "h": 1}]}"#;
+    let (a, b) = if after {
+        (i.as_str(), j)
+    } else {
+        (j, i.as_str())
+    };
+    import_body(&format!(
+        r#"{HEADER}, {REGION}, "image": [{{"id": "i", "src": "a", "w": 64, "h": 64}}],
+           "destination": [{a}, {b}]"#
+    ))
+}
+
+/// The judge's only note.
+fn region_note() -> NoteKind {
+    ignored("judge")
+}
+
 /// A critical EX score with `fields`.
 fn critical(fields: &str) -> common::Loaded {
     import_body(&format!(
@@ -112,12 +137,48 @@ fn gauge_ranges_and_the_perfect_judgment() {
     d.gauges[0].value = GaugeValue(0);
     assert_eq!(d.frame(0, &[]).len(), 1);
     // 241 is the last judgment's perfect, a built-in although declared.
-    let loaded = image(r#""op": [241]"#);
-    assert!(loaded.report().notes.is_empty());
+    let loaded = judged_image(r#""op": [241]"#, false);
+    assert_eq!(common::kinds(loaded.report()), [region_note()]);
     let mut d = loaded.drawn();
     assert!(d.frame(0, &[]).is_empty());
     assert_eq!(d.frame(10, &[judged(10, Judgment::Perfect, 1)]).len(), 1);
     assert!(d.frame(20, &[judged(20, Judgment::Great, 2)]).is_empty());
+}
+
+/// 241 and timers 46 and 446 need a judge region, which a judge's
+/// destination anywhere in the skin makes (`JsonPlaySkinObjectLoader.
+/// java:283-287`, `JudgeManager.java:129, 677-690`); without one 241 is
+/// false and the timers are never set, through every way of naming them.
+#[test]
+fn the_perfect_judgment_needs_a_judge_region() {
+    let perfect = [judged(10, Judgment::Perfect, 1)];
+    for after in [false, true] {
+        let mut d = judged_image(r#""op": [241]"#, after).drawn();
+        assert_eq!(d.frame(10, &perfect).len(), 1, "after {after}");
+        let mut d = judged_image(r#""op": [-241]"#, after).drawn();
+        assert!(d.frame(10, &perfect).is_empty(), "after {after}");
+    }
+    let fold_false = |fields: &str| {
+        let loaded = image(fields);
+        assert!(has(loaded.report(), ignored("op")), "{fields}");
+        assert_eq!(loaded.report().usage.images, 0, "{fields}");
+    };
+    fold_false(r#""op": [241]"#);
+    fold_false(r#""op": ["judge_1p_perfect"]"#);
+    fold_false(r#""op": ["!!judge_1p_perfect"]"#);
+    fold_false(r#""draw": "judge_1p_perfect""#);
+    fold_false(r#""draw": 241"#);
+    for fields in [
+        r#""op": [-241]"#,
+        r#""op": ["!judge_1p_perfect"]"#,
+        r#""draw": "!judge_1p_perfect""#,
+        r#""draw": -241"#,
+    ] {
+        let loaded = image(fields);
+        assert!(loaded.report().notes.is_empty(), "{fields}");
+        let mut d = loaded.drawn();
+        assert_eq!(d.frame(10, &perfect).len(), 1, "{fields}");
+    }
 }
 
 #[test]
@@ -158,9 +219,9 @@ fn declared_options_fold() {
 
 #[test]
 fn names_use_the_same_table() {
-    let mut d = image(r#""op": ["!!judge_1p_perfect"]"#).drawn();
+    let mut d = judged_image(r#""op": ["!!judge_1p_perfect"]"#, false).drawn();
     assert_eq!(d.frame(10, &[judged(10, Judgment::Perfect, 1)]).len(), 1);
-    let mut d = image(r#""draw": "!judge_1p_perfect""#).drawn();
+    let mut d = judged_image(r#""draw": "!judge_1p_perfect""#, false).drawn();
     assert_eq!(d.frame(0, &[]).len(), 1);
     assert!(d.frame(10, &[judged(10, Judgment::Perfect, 1)]).is_empty());
     let script = NoteKind::UnsupportedProperty {
@@ -180,8 +241,11 @@ fn repeated_conditions_add_nothing() {
     // 500 000 repeats of one name build one condition, not a source past
     // the compiler's limit.
     let many = vec![r#""judge_1p_perfect""#; 500_000].join(",");
-    let once = image(r#""op": ["judge_1p_perfect"]"#);
-    let repeated = image(&format!(r#""op": [{many}], "draw": "judge_1p_perfect""#));
+    let once = judged_image(r#""op": ["judge_1p_perfect"]"#, false);
+    let repeated = judged_image(
+        &format!(r#""op": [{many}], "draw": "judge_1p_perfect""#),
+        false,
+    );
     assert_eq!(
         repeated.ok().skin.ops().total(),
         once.ok().skin.ops().total()
@@ -195,7 +259,7 @@ fn repeated_conditions_add_nothing() {
         .chain(std::iter::once(r#""judge_1p_perfect""#.to_owned()))
         .flat_map(|n| [n.clone(), n.replacen('"', "\"!", 1)])
         .collect();
-    let loaded = image(&format!(r#""op": [{}]"#, all.join(",")));
+    let loaded = judged_image(&format!(r#""op": [{}]"#, all.join(",")), false);
     assert!(loaded.ok().skin.ops().total() > 0);
 }
 

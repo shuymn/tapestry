@@ -15,6 +15,19 @@ fn timer(why: TimerWhy) -> NoteKind {
 /// Images on destination `timer`s: each moves from x 0 to 100 over
 /// 100 ms, then holds.
 fn images(timers: &[&str], custom: &str) -> common::Loaded {
+    images_with(timers, custom, "")
+}
+
+/// A judge of no grades, which gives the skin its judge region, and its
+/// destination.
+const REGION: [&str; 2] = [
+    r#""judge": [{"id": "j", "index": 0, "images": [], "numbers": []}],"#,
+    r#"{"id": "j", "dst": [{"w": 1, "h": 1}]}"#,
+];
+
+/// [`images`] with `judge` (a [`REGION`]) before them.
+fn images_with(timers: &[&str], custom: &str, judge: &str) -> common::Loaded {
+    let region = if judge.is_empty() { "" } else { REGION[0] };
     let dsts: Vec<String> = timers
         .iter()
         .map(|t| {
@@ -24,8 +37,13 @@ fn images(timers: &[&str], custom: &str) -> common::Loaded {
             )
         })
         .collect();
+    let dsts = std::iter::once(judge)
+        .filter(|j| !j.is_empty())
+        .map(str::to_owned)
+        .chain(dsts)
+        .collect::<Vec<_>>();
     import_body(&format!(
-        r#""customTimers": [{custom}],
+        r#""customTimers": [{custom}], {region}
            "image": [{{"id": "i", "src": "a", "w": 64, "h": 64}}],
            "destination": [{}]"#,
         dsts.join(", ")
@@ -100,7 +118,7 @@ fn judgetimer_is_the_bomb_threshold() {
 
 #[test]
 fn timer_446_is_the_judgment_timer() {
-    let mut d = images(&[r#""timer": 46,"#, r#""timer": 446,"#], "").drawn();
+    let mut d = images_with(&[r#""timer": 46,"#, r#""timer": 446,"#], "", REGION[1]).drawn();
     assert!(d.frame(0, &[]).is_empty());
     let events = [
         (10, judged(10, Judgment::Perfect, 1)),
@@ -119,6 +137,34 @@ fn timer_446_is_the_judgment_timer() {
             assert_eq!(q[0].rect, q[1].rect, "{t}");
         }
     }
+}
+
+/// Without a judge region timers 46 and 446 are never set: as
+/// destination timers, through an alias and as cycle timers
+/// (`JudgeManager.java:129, 677-690`).
+#[test]
+fn judge_timers_need_a_judge_region() {
+    let alias = r#"{"id": 10000, "timer": 446}"#;
+    let perfect = [judged(10, Judgment::Perfect, 1)];
+    for t in [r#""timer": 46,"#, r#""timer": 446,"#, r#""timer": 10000,"#] {
+        let loaded = images(&[t], alias);
+        assert!(
+            loaded
+                .report()
+                .notes
+                .iter()
+                .any(|n| matches!(n.kind, NoteKind::Timer(TimerWhy::Unset(_)))),
+            "{t}: {:?}",
+            loaded.report()
+        );
+        assert!(loaded.drawn().frame(10, &perfect).is_empty(), "{t}");
+        let mut d = images_with(&[t], alias, REGION[1]).drawn();
+        assert_eq!(d.frame(10, &perfect).len(), 1, "{t}");
+    }
+    // A cycle on 46 stays at frame 0 without a region.
+    let mut d = cycled(r#", "timer": 46"#).drawn();
+    let first = d.frame(0, &perfect)[0].uv;
+    assert_eq!(d.frame(150, &[])[0].uv, first);
 }
 
 #[test]
