@@ -812,8 +812,8 @@ impl AppRig for PlayerRig<'_> {
         }
     }
 
-    fn choose(&mut self) -> Option<PathBuf> {
-        self.look()
+    fn choose(&mut self) -> Option<game::Pick> {
+        self.look().map(game::Pick::Play)
     }
 
     fn load_chart(&mut self, loaded: &Loaded) -> Result<(), ChartLoadError> {

@@ -21,10 +21,16 @@ use std::path::{Path, PathBuf};
 
 use bms_model::TimeUs;
 
+use bms_model::Speed;
+
+use crate::error::Chain;
 use crate::live::{Leave, LiveError, Rig, run_chart, run_over};
 use crate::logic::LogicError;
 use crate::policy::{SessionEvent, SessionEventSink, SharedEvents};
+use crate::practice::PracticeError;
+use crate::practice_screen::{PracticeActed, PracticeInput, PracticeScreen};
 use crate::presets::{PollDeadline, Shelf, ShelfError, UnknownPreset};
+use crate::session::Command;
 use crate::session::{Loaded, Parts, SessionConfig, SessionError, Settings};
 use crate::settings::DataRoot;
 
@@ -37,8 +43,9 @@ pub trait AppRig: Rig {
     /// Why the sound bank of a chart cannot be built.
     type BankError: std::error::Error + Send + Sync + 'static;
 
-    /// The chart the player chose on the select screen, taken.
-    fn choose(&mut self) -> Option<PathBuf>;
+    /// The chart the player chose on the select screen, taken, and
+    /// whether to play or practice it.
+    fn choose(&mut self) -> Option<Pick>;
     /// Builds what the plays of `loaded` need beside it: its sound bank
     /// and the screen's chart, replacing the previous chart's.
     ///
@@ -64,6 +71,30 @@ pub trait AppRig: Rig {
     fn configure(&mut self, config: &mut SessionConfig, parts: &mut Parts) {
         let _ = (config, parts);
     }
+    /// The practice screen was entered, or returned to: called when it
+    /// opens and after every return to it (a refused Start, the rounds
+    /// left, a rebuilt screen), before anything is read there. The model
+    /// is the one built when it opened.
+    fn entered_practice(&mut self, screen: &PracticeScreen) {
+        let _ = screen;
+    }
+    /// What the practice screen shows changed.
+    fn show_practice(&mut self, screen: &PracticeScreen) {
+        let _ = screen;
+    }
+    /// The next input on the practice screen, taken.
+    fn take_practice(&mut self) -> Option<PracticeInput> {
+        None
+    }
+}
+
+/// A chart chosen on the select screen, and what to do with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// Play it.
+    Play(PathBuf),
+    /// Open its practice screen.
+    Practice(PathBuf),
 }
 
 /// Why a chosen chart was refused.
@@ -78,6 +109,9 @@ pub enum Refused<B> {
     /// The logic step refused to play the chart, at a play's opening.
     #[error("the chart cannot be played")]
     Play(#[source] LogicError),
+    /// The chart cannot be practiced (an autoplay session).
+    #[error("the chart cannot be practiced")]
+    Practice(#[source] PracticeError),
 }
 
 /// A chosen chart that was refused, and why; it stays selected.
@@ -206,7 +240,7 @@ impl App {
             if let Some(r) = &refusal {
                 rig.show_refusal(r);
             }
-            let chart = loop {
+            let pick = loop {
                 run_over(rig)?;
                 if rig.quitting() {
                     return Ok(());
@@ -221,8 +255,8 @@ impl App {
                     rig.prepare_screen().map_err(LiveError::Screen)?;
                     continue 'select;
                 }
-                if let Some(chart) = rig.choose() {
-                    break chart;
+                if let Some(pick) = rig.choose() {
+                    break pick;
                 }
                 // The user preset files are polled while selection shows,
                 // and the wait ends at the poll deadline at the latest, so a
@@ -244,7 +278,11 @@ impl App {
                 rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(deadline.0)));
             };
             refusal = None;
-            match self.play_chart(&chart, rig)? {
+            let (chart, practice) = match pick {
+                Pick::Play(chart) => (chart, false),
+                Pick::Practice(chart) => (chart, true),
+            };
+            match self.play_chart(&chart, practice, rig)? {
                 Chosen::Left(Leave::Back) => {}
                 Chosen::Left(Leave::Quit) => return Ok(()),
                 Chosen::Refused(reason) => refusal = Some(LoadRefusal { chart, reason }),
@@ -252,11 +290,13 @@ impl App {
         }
     }
 
-    /// Loads `chart` and plays it until the player leaves it, or refuses
-    /// it. The shelf is lent to the chart and comes back on every outcome.
+    /// Loads `chart` and plays it, or opens its practice screen with
+    /// `practice`, until the player leaves it, or refuses it. The shelf is
+    /// lent to the chart and comes back on every outcome.
     fn play_chart<R: AppRig>(
         &mut self,
         chart: &Path,
+        practice: bool,
         rig: &mut R,
     ) -> Result<Chosen<R::BankError>, LiveError<R::ScreenError>> {
         let shelf = match std::mem::replace(&mut self.shelf, Err(lent())) {
@@ -267,21 +307,39 @@ impl App {
             }
         };
         // The one way back for the shelf, whatever the chart did.
-        let (shelf, chosen) = self.play_on(shelf, chart, rig);
+        let (shelf, chosen) = self.play_on(shelf, chart, practice, rig);
         self.shelf = Ok(shelf);
         chosen
     }
 
     /// [`play_chart`](Self::play_chart) on the lent `shelf`, which comes
     /// back with how the chart went.
-    fn play_on<R: AppRig>(&mut self, shelf: Shelf, chart: &Path, rig: &mut R) -> (Shelf, Went<R>) {
+    fn play_on<R: AppRig>(
+        &mut self,
+        shelf: Shelf,
+        chart: &Path,
+        practice: bool,
+        rig: &mut R,
+    ) -> (Shelf, Went<R>) {
+        let mut config = self.config.clone();
         #[cfg_attr(
             not(feature = "dev-tools"),
             expect(unused_mut, reason = "the hook changes them")
         )]
-        let (mut config, mut parts) = (self.config.clone(), (self.parts)(&self.settings));
+        let mut parts = (self.parts)(&self.settings);
         #[cfg(feature = "dev-tools")]
         rig.configure(&mut config, &mut parts);
+        if practice {
+            // An autoplay session plays whole charts only.
+            if config.autoplay.is_some() {
+                return (
+                    shelf,
+                    Ok(Chosen::Refused(Refused::Practice(PracticeError::Autoplay))),
+                );
+            }
+            // The screen's measures are the chart's 1× times.
+            config.speed = Speed::NORMAL;
+        }
         // Every chart reports to the run's one sink, never the parts' own.
         let mut loaded = match Loaded::load_reporting_to(
             self.root.clone(),
@@ -298,16 +356,127 @@ impl App {
                 return (shelf, Ok(Chosen::Refused(Refused::Chart(e))));
             }
         };
-        let chosen = match rig.load_chart(&loaded) {
-            Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
-            Ok(()) => match run_chart(&mut loaded, rig) {
-                Ok(leave) => Ok(Chosen::Left(leave)),
-                Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
-                Err(e) => Err(e),
-            },
+        let chosen = if practice {
+            practice_chart(&mut loaded, rig).map(Chosen::Left)
+        } else {
+            match rig.load_chart(&loaded) {
+                Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
+                Ok(()) => match run_chart(&mut loaded, rig) {
+                    Ok(leave) => Ok(Chosen::Left(leave)),
+                    Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
+                    Err(e) => Err(e),
+                },
+            }
         };
         self.settings = loaded.settings().clone();
         (loaded.into_shelf(), chosen)
+    }
+}
+
+/// The practice screen of `loaded`, loaded at 1×, until the player leaves
+/// it (design.md "Play Lifecycle"): it waits idly on the page, and each
+/// Start reads the chart again at the chosen speed, sets the practice up,
+/// loads the bank and the screen's chart, and plays its rounds. A refusal
+/// on the way, or at a round's opening, shows on the page, which stays;
+/// leaving the rounds returns to it. The model is built once, here, and
+/// every return to the page enters it again ([`AppRig::entered_practice`]).
+///
+/// # Errors
+///
+/// The screen, audio or input-thread failure that ends the run.
+fn practice_chart<R: AppRig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+) -> Result<Leave, LiveError<R::ScreenError>> {
+    let mut screen = PracticeScreen::new(
+        loaded.chart(),
+        loaded.preset(),
+        loaded.settings().player.displayed_gauge,
+    );
+    rig.entered_practice(&screen);
+    loop {
+        run_over(rig)?;
+        if rig.quitting() {
+            return Ok(Leave::Quit);
+        }
+        // The quit key goes back; the other controls and a result's
+        // commands mean nothing here.
+        let mut back = false;
+        while let Some(c) = rig.take() {
+            back |= c == Command::Quit;
+        }
+        while rig.take_menu().is_some() {}
+        if back {
+            return Ok(Leave::Back);
+        }
+        if rig.screen_failed() {
+            rig.prepare_screen().map_err(LiveError::Screen)?;
+            rig.entered_practice(&screen);
+            continue;
+        }
+        let mut dirty = false;
+        let mut start = false;
+        while let Some(input) = rig.take_practice() {
+            match screen.input(input) {
+                PracticeActed::Nothing => {}
+                PracticeActed::Changed => dirty = true,
+                PracticeActed::Start => {
+                    start = true;
+                    break;
+                }
+                PracticeActed::Back => return Ok(Leave::Back),
+            }
+        }
+        if start {
+            let notice = match start_rounds(loaded, &screen, rig) {
+                Ok(Leave::Quit) => return Ok(Leave::Quit),
+                Ok(Leave::Back) => None,
+                Err(Stopped::Notice(n)) => Some(n),
+                Err(Stopped::Run(e)) => return Err(e),
+            };
+            screen.set_notice(notice);
+            rig.entered_practice(&screen);
+            continue;
+        }
+        if dirty {
+            rig.show_practice(&screen);
+        }
+        let now = rig.now();
+        rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0)));
+    }
+}
+
+/// How a Start that did not end in leaving the rounds went.
+enum Stopped<S> {
+    /// It was refused, and why, for the page.
+    Notice(String),
+    /// The run ends.
+    Run(LiveError<S>),
+}
+
+/// One Start of the practice screen: the chart read again at the chosen
+/// speed, the practice set up, the bank and the screen's chart loaded
+/// (every time, so no bank of another chart or speed is reused), and the
+/// rounds played until they are left.
+fn start_rounds<R: AppRig>(
+    loaded: &mut Loaded,
+    screen: &PracticeScreen,
+    rig: &mut R,
+) -> Result<Leave, Stopped<R::ScreenError>> {
+    let notice = |e: &(dyn std::error::Error + 'static)| Stopped::Notice(Chain(e).to_string());
+    if loaded.config().speed != screen.speed() {
+        loaded.set_speed(screen.speed()).map_err(|e| notice(&e))?;
+    }
+    let practice = screen.practice(loaded);
+    loaded
+        .set_practice(Some(practice))
+        .map_err(|e| notice(&e))?;
+    rig.load_chart(loaded).map_err(|e| notice(&e))?;
+    match run_chart(loaded, rig) {
+        Ok(leave) => Ok(leave),
+        Err(LiveError::Logic(e)) => Err(notice(&e)),
+        Err(LiveError::Restore(e)) => Err(notice(&e)),
+        Err(e) => Err(Stopped::Run(e)),
     }
 }
 

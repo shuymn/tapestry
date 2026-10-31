@@ -154,6 +154,7 @@ fn category(e: &SessionError) -> &'static str {
         SessionError::Io { .. } => "file error",
         SessionError::Preset(_) => "preset error",
         SessionError::Transform(_) => "transform bug",
+        SessionError::ChartChanged(_) => "chart changed",
     }
 }
 
