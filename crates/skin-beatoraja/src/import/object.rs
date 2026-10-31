@@ -9,42 +9,30 @@ use super::report::Object;
 use crate::error::ImportError;
 use crate::resolve::{ARRAYS, Definition, RECORDS, Tables};
 
-/// Where an object table comes from.
-#[derive(Clone, Copy, Debug)]
-enum From {
-    Array(&'static str),
-    Record(&'static str),
-}
-
-/// The destination lookup order.
-const ORDER: [(From, Object); 21] = [
-    (From::Array("image"), Object::Image),
-    (From::Array("imageset"), Object::ImageSet),
-    (From::Array("value"), Object::Value),
-    (From::Array("floatvalue"), Object::FloatValue),
-    (From::Array("text"), Object::Text),
-    (From::Array("slider"), Object::Slider),
-    (From::Array("graph"), Object::Graph),
-    (From::Array("gaugegraph"), Object::GaugeGraph),
-    (From::Array("judgegraph"), Object::JudgeGraph),
-    (From::Array("bpmgraph"), Object::BpmGraph),
-    (
-        From::Array("hiterrorvisualizer"),
-        Object::HitErrorVisualizer,
-    ),
-    (From::Array("timingvisualizer"), Object::TimingVisualizer),
-    (
-        From::Array("timingdistributiongraph"),
-        Object::TimingDistribution,
-    ),
-    (From::Record("gauge"), Object::Gauge),
-    (From::Record("note"), Object::Note),
-    (From::Array("hiddenCover"), Object::HiddenCover),
-    (From::Array("liftCover"), Object::LiftCover),
-    (From::Record("practice"), Object::Practice),
-    (From::Record("bga"), Object::Bga),
-    (From::Array("judge"), Object::Judge),
-    (From::Array("pmchara"), Object::PmChara),
+/// The destination lookup order, by table name (an array field's or a
+/// record field's, [`records`]).
+const ORDER: [(&str, Object); 21] = [
+    ("image", Object::Image),
+    ("imageset", Object::ImageSet),
+    ("value", Object::Value),
+    ("floatvalue", Object::FloatValue),
+    ("text", Object::Text),
+    ("slider", Object::Slider),
+    ("graph", Object::Graph),
+    ("gaugegraph", Object::GaugeGraph),
+    ("judgegraph", Object::JudgeGraph),
+    ("bpmgraph", Object::BpmGraph),
+    ("hiterrorvisualizer", Object::HitErrorVisualizer),
+    ("timingvisualizer", Object::TimingVisualizer),
+    ("timingdistributiongraph", Object::TimingDistribution),
+    ("gauge", Object::Gauge),
+    ("note", Object::Note),
+    ("hiddenCover", Object::HiddenCover),
+    ("liftCover", Object::LiftCover),
+    ("practice", Object::Practice),
+    ("bga", Object::Bga),
+    ("judge", Object::Judge),
+    ("pmchara", Object::PmChara),
 ];
 
 /// The records of a table: an array field's, or a record field's one.
@@ -104,11 +92,8 @@ impl Objects {
         tables: &Tables,
         id: &str,
     ) -> Result<Option<(Object, u32)>, ImportError> {
-        for (slot, &(from, object)) in self.maps.iter_mut().zip(&ORDER) {
+        for (slot, &(name, object)) in self.maps.iter_mut().zip(&ORDER) {
             if slot.is_none() {
-                let name = match from {
-                    From::Array(n) | From::Record(n) => n,
-                };
                 *slot = Some(index(def, records(tables, name), false)?);
             }
             if let Some(&rec) = slot.as_ref().and_then(|m| m.get(id)) {
