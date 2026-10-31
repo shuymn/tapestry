@@ -26,8 +26,12 @@ use md5::Md5;
 use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
 
-use crate::ScanLease;
 use crate::db::{self, Prepared, Row};
+use crate::{Owner, ScanLease};
+
+pub use rebuild::{BEST_BATCH, BestsReport, REBUILD_MEMORY, Refusal, Refusals};
+
+mod rebuild;
 
 /// Rows and removals per commit.
 pub const BATCH: usize = 256;
@@ -45,6 +49,12 @@ pub struct ScanOptions {
     /// mode. This crate holds no platform code, so the caller sets the
     /// priority.
     pub on_thread_start: Option<ThreadStart>,
+    /// The records folder (the data root's `records`), whose records the
+    /// bests phase counts after the charts; `None` runs no bests phase.
+    pub records: Option<PathBuf>,
+    /// The memory budget each record's evaluation is admitted against in
+    /// the bests phase; `None` is [`REBUILD_MEMORY`].
+    pub rebuild_memory: Option<usize>,
     /// Seams for the unit tests.
     #[cfg(test)]
     pub(crate) test: tests::Hooks,
@@ -54,6 +64,8 @@ impl fmt::Debug for ScanOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScanOptions")
             .field("on_thread_start", &self.on_thread_start.is_some())
+            .field("records", &self.records)
+            .field("rebuild_memory", &self.rebuild_memory)
             .finish_non_exhaustive()
     }
 }
@@ -75,6 +87,8 @@ pub struct ScanReport {
     /// Rows removed: their file is gone, or their root is no longer one of
     /// the roots. Rows under a folder that did not list completely stay.
     pub removed: u64,
+    /// The bests phase.
+    pub bests: BestsReport,
 }
 
 /// Why a scan stopped short.
@@ -180,6 +194,7 @@ pub fn start(
     lease: ScanLease,
 ) -> io::Result<Scan> {
     let shared = Arc::new(Shared::default());
+    let owner = Arc::clone(&lease.0);
     let ending = Ending {
         shared: Arc::clone(&shared),
         lease: Some(lease),
@@ -192,7 +207,7 @@ pub fn start(
             if let Some(hook) = &options.on_thread_start {
                 hook();
             }
-            let result = Scanner::new(&ending.shared, conn, options).run(&roots);
+            let result = Scanner::new(&ending.shared, conn, options, owner).run(&roots);
             if let Err(e) = result {
                 ending
                     .shared
@@ -323,8 +338,9 @@ fn mtime_ns(time: SystemTime) -> i64 {
     }
 }
 
-/// Size and modification time, as stored.
-fn stamp(meta: &Metadata) -> (i64, i64) {
+/// A file's size and modification time as the library stores them, by
+/// which a scan finds it unchanged.
+pub fn stamp(meta: &Metadata) -> (i64, i64) {
     (
         i64::try_from(meta.len()).unwrap_or(i64::MAX),
         meta.modified().map_or(0, mtime_ns),
@@ -464,10 +480,18 @@ struct Scanner<'a> {
     kept: Vec<PathBuf>,
     upserts: Vec<Row>,
     removals: Vec<String>,
+    /// The lock's owner, which holds the catch-up request a write failed
+    /// to keep.
+    owner: Arc<Owner>,
+    /// The SHA-256 of every chart file read this pass, whose waiting
+    /// records the bests phase retries.
+    read: HashSet<[u8; 32]>,
+    /// The bests phase's batch.
+    items: Vec<rebuild::Item>,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(shared: &'a Shared, conn: Connection, options: ScanOptions) -> Self {
+    fn new(shared: &'a Shared, conn: Connection, options: ScanOptions, owner: Arc<Owner>) -> Self {
         Self {
             shared,
             conn,
@@ -478,6 +502,9 @@ impl<'a> Scanner<'a> {
             kept: Vec::new(),
             upserts: Vec::new(),
             removals: Vec::new(),
+            owner,
+            read: HashSet::new(),
+            items: Vec::new(),
         }
     }
 
@@ -497,7 +524,13 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
+    /// Commits the chart batch, then the bests batch.
     fn commit(&mut self) -> rusqlite::Result<()> {
+        self.commit_charts()?;
+        self.commit_bests(None)
+    }
+
+    fn commit_charts(&mut self) -> rusqlite::Result<()> {
         if self.upserts.is_empty() && self.removals.is_empty() {
             return Ok(());
         }
@@ -612,6 +645,7 @@ impl<'a> Scanner<'a> {
                 match read_chart(root, path, &self.limits, &self.options) {
                     Some(row) => {
                         self.count(|report| report.read += 1);
+                        self.read.insert(row.sha256);
                         self.push(Ok(row))?;
                     }
                     None => self.count(|report| report.skipped += 1),
@@ -629,7 +663,11 @@ impl<'a> Scanner<'a> {
             }
             self.push(Err(path))?;
         }
-        self.commit()
+        self.commit()?;
+        if let Some(records) = self.options.records.clone() {
+            self.bests(&records)?;
+        }
+        Ok(())
     }
 }
 

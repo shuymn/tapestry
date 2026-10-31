@@ -30,20 +30,43 @@ pub enum Fault {
     Metadata,
 }
 
+/// A step of the bests phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step<'a> {
+    /// This record is about to be decoded.
+    Decode(&'a Path),
+    /// This record's chart is about to be loaded.
+    Load(&'a Path),
+    /// This record is about to be evaluated.
+    Evaluate(&'a Path),
+    /// The phase commits this many items.
+    Commit(usize),
+}
+
+pub type BestsHook = Arc<dyn Fn(Step<'_>) + Send + Sync>;
+
 /// The unit tests' seams in a scan.
 #[derive(Clone, Default)]
 pub struct Hooks {
     /// The scan is about to read this file.
-    in_hand: Option<PathHook>,
+    pub(crate) in_hand: Option<PathHook>,
     /// The scan read this file, before it checks it again.
-    after_read: Option<PathHook>,
+    pub(crate) after_read: Option<PathHook>,
     /// The scan is at this entry of a listing.
-    fault: Option<FaultHook>,
+    pub(crate) fault: Option<FaultHook>,
     /// The scan commits this many rows and removals.
-    before_commit: Option<CommitHook>,
+    pub(crate) before_commit: Option<CommitHook>,
+    /// The bests phase is at this step.
+    pub(crate) bests: Option<BestsHook>,
 }
 
 impl Hooks {
+    pub fn bests(&self, step: Step<'_>) {
+        if let Some(hook) = &self.bests {
+            hook(step);
+        }
+    }
+
     pub fn in_hand(&self, path: &Path) {
         if let Some(hook) = &self.in_hand {
             hook(path);

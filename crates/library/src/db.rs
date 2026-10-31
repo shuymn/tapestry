@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bms_parser::Header;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 
 use crate::search::Keys;
 use crate::{ChartEntry, LibraryError, SCHEMA_VERSION};
@@ -133,9 +134,150 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
                  VALUES ('delete', old.id, old.norm_text);
              INSERT INTO charts_fts (rowid, norm_text) VALUES (new.id, new.norm_text);
          END;
+         CREATE INDEX charts_sha ON charts(sha256, path);
+         CREATE TABLE meta (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             replay_format INTEGER NOT NULL,
+             canonical INTEGER NOT NULL,
+             evaluator INTEGER NOT NULL,
+             loader INTEGER NOT NULL,
+             bests INTEGER NOT NULL,
+             requested INTEGER NOT NULL,
+             completed INTEGER NOT NULL
+         );
+         CREATE TABLE scores (
+             preset_sha256 BLOB NOT NULL,
+             ln_mode INTEGER NOT NULL,
+             chart_sha256 BLOB NOT NULL,
+             plays INTEGER NOT NULL,
+             best_ex INTEGER,
+             best_bp INTEGER,
+             cleared BLOB,
+             full_combo INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
+         ) WITHOUT ROWID;
+         CREATE TABLE counted (
+             path TEXT NOT NULL,
+             body_sha256 BLOB NOT NULL,
+             size INTEGER NOT NULL,
+             mtime_ns INTEGER NOT NULL,
+             PRIMARY KEY (path, body_sha256)
+         ) WITHOUT ROWID;
+         CREATE TABLE refused (
+             path TEXT NOT NULL PRIMARY KEY,
+             size INTEGER NOT NULL,
+             mtime_ns INTEGER NOT NULL,
+             reason INTEGER NOT NULL,
+             waits_for BLOB
+         ) WITHOUT ROWID;
          PRAGMA user_version = {SCHEMA_VERSION};
          COMMIT;"
     ))
+}
+
+/// The versions bests are derived under (design.md "Personal Bests"): a
+/// difference in any of them makes every stored best stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tuple {
+    /// The replay format version.
+    pub replay_format: i64,
+    /// The canonical preset encoding's version.
+    pub canonical: i64,
+    /// The standard evaluator's version.
+    pub evaluator: i64,
+    /// The chart loader's version.
+    pub loader: i64,
+    /// The bests rules' version, [`BESTS_VERSION`](crate::BESTS_VERSION).
+    pub bests: i64,
+}
+
+impl fmt::Display for Tuple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "replay format {}, canonical encoding {}, evaluator {}, loader {}, bests {}",
+            self.replay_format, self.canonical, self.evaluator, self.loader, self.bests
+        )
+    }
+}
+
+impl Tuple {
+    /// This build's.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            replay_format: i64::from(replay::FORMAT_VERSION),
+            canonical: i64::try_from(rules::CANONICAL_VERSION).unwrap_or(i64::MAX),
+            evaluator: i64::from(rules::Implementation::STANDARD_VERSION),
+            loader: i64::from(bms_parser::LOADER_VERSION),
+            bests: crate::BESTS_VERSION,
+        }
+    }
+}
+
+/// The stored tuple, `None` without a `meta` row.
+pub fn stored_tuple(conn: &Connection) -> rusqlite::Result<Option<Tuple>> {
+    conn.query_row(
+        "SELECT replay_format, canonical, evaluator, loader, bests FROM meta WHERE id = 1",
+        [],
+        |r| {
+            Ok(Tuple {
+                replay_format: r.get(0)?,
+                canonical: r.get(1)?,
+                evaluator: r.get(2)?,
+                loader: r.get(3)?,
+                bests: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Makes the stored bests this build's: when the tuple differs or is
+/// missing, clears `scores`, `counted` and `refused`, writes the tuple and
+/// requests a catch-up, in one transaction. Returns the tuple found when it
+/// was not this build's.
+pub fn check_tuple(conn: &mut Connection) -> rusqlite::Result<Option<Option<Tuple>>> {
+    let tx = conn.transaction()?;
+    let stored = stored_tuple(&tx)?;
+    let current = Tuple::current();
+    if stored == Some(current) {
+        return Ok(None);
+    }
+    tx.execute_batch("DELETE FROM scores; DELETE FROM counted; DELETE FROM refused;")?;
+    tx.execute(
+        "INSERT INTO meta (id, replay_format, canonical, evaluator, loader, bests, requested,
+             completed)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, 1, 0)
+         ON CONFLICT (id) DO UPDATE SET replay_format = excluded.replay_format,
+             canonical = excluded.canonical, evaluator = excluded.evaluator,
+             loader = excluded.loader, bests = excluded.bests,
+             requested = requested + 1",
+        params![
+            current.replay_format,
+            current.canonical,
+            current.evaluator,
+            current.loader,
+            current.bests
+        ],
+    )?;
+    tx.commit()?;
+    Ok(Some(stored))
+}
+
+/// Requests a catch-up: `requested` rises by one, durably.
+pub fn request(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("UPDATE meta SET requested = requested + 1 WHERE id = 1", [])
+        .map(|_| ())
+}
+
+/// `(requested, completed)`.
+pub fn progress(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT requested, completed FROM meta WHERE id = 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
 }
 
 /// A chart file as a parser read it.
