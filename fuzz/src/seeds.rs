@@ -26,6 +26,7 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("replay_body", replay_bodies()),
         ("raw_input", raw_inputs()),
         ("preset_canonical", preset_canonicals()),
+        ("skin_json", skin_jsons()),
     ]
 }
 
@@ -598,4 +599,82 @@ pub fn preset_canonicals() -> Vec<Seed> {
     no_gauges.gauges.clear();
     seeds.push(("invalid", no_gauges.canonical_bytes()));
     seeds
+}
+
+/// One `skin_json` input: the files joined by NUL bytes, entry file first.
+fn skin_input(files: &[&str]) -> Vec<u8> {
+    files.join("\0").into_bytes()
+}
+
+/// `skin_json` seeds: headers whose wrapper-enabled fields (options, file
+/// choices, offsets) hold includes, choices and conditional items, the
+/// lenient syntax, then one refused input per kind.
+#[must_use]
+pub fn skin_jsons() -> Vec<Seed> {
+    let options = r#"{"type": 0, "name": "seed", "author": "a", "w": 1920, "h": 1080,
+        "property": [
+            {"name": "mode", "item": [{"name": "on", "op": 901}, {"name": "off", "op": 902}], "def": "on"},
+            {"include": "i1.json"},
+            {"if": 901, "values": {"include": "i2.json"}},
+            {"if": [[901, 902], -903], "value": {"name": "either"}}
+        ],
+        "filepath": [{"name": "defs", "path": "*.json", "def": "s"}],
+        "offset": [{"name": "o", "id": 40, "x": true, "y": true, "a": "true"}]}"#;
+    let choices = r#"{"type": 0,
+        "property": [{"name": "c", "item": [{"name": "x", "op": 1}]}],
+        "filepath": [[{"if": 1, "value": {"name": "one", "path": "*"}}, {"value": {"include": "i1.json"}}]],
+        "offset": {"include": "i2.json"}}"#;
+    let lenient = "\u{feff}// a comment\n{type: 0, name: unquoted name  ,\n\
+        property: [\n  {name: a /* block */}\n  {name: b},\n],\n\
+        offset: [{id: 10.7, x: TRUE}]}";
+    let configured_fails = configured_fails_entry();
+    vec![
+        (
+            "options",
+            skin_input(&[
+                options,
+                r#"[{"name": "included", "item": [{"name": "i", "op": 903}]}]"#,
+                r#"[{"name": "when on"}, {"include": "i3.json"}]"#,
+                r#"{"name": "nested"}"#,
+            ]),
+        ),
+        (
+            "choices",
+            skin_input(&[
+                choices,
+                r#"{"name": "fallback", "path": "*.json"}"#,
+                r#"[{"if": 1, "values": [{"name": "o1", "id": 1}]}, {"name": "o2", "id": 2}]"#,
+            ]),
+        ),
+        ("lenient", skin_input(&[lenient])),
+        (
+            "cycle",
+            skin_input(&[
+                r#"{"type": 0, "property": {"include": "i1.json"}}"#,
+                r#"{"include": "s.json"}"#,
+            ]),
+        ),
+        ("not_play", skin_input(&[r#"{"type": 1}"#])),
+        ("size", skin_input(&[r#"{"type": 0, "w": 1366, "h": 768}"#])),
+        (
+            "syntax",
+            skin_input(&[r#"{"type": 0, "property": [{} {}]}"#]),
+        ),
+        (
+            "missing",
+            skin_input(&[r#"{"type": 0, "offset": [{"include": "none.json"}]}"#]),
+        ),
+        ("configured_fails", skin_input(&[&configured_fails, "[]"])),
+    ]
+}
+
+/// A header pass of 600 includes; the configured pass makes them too, then
+/// fails on a missing file, so the pass after it starts from a partly
+/// filled arena and counts that are only right if they start again.
+fn configured_fails_entry() -> String {
+    let includes = vec![r#"{"include": "i1.json"}"#; 600].join(",");
+    format!(
+        r#"{{"type": 0, "property": [{{"name": "m", "item": [{{"op": 901}}]}}, {includes},
+        {{"if": 901, "values": {{"include": "none.json"}}}}]}}"#
+    )
 }

@@ -5,9 +5,8 @@
 mod image_support;
 
 use std::fs::File;
-use std::path::Path;
 
-use image_support::{dir, file, load, load_files, save, solid, whole};
+use image_support::{dir, file, link_dir, load, load_files, save, solid, whole};
 use skin_model::{FileAt, ImageError, MAX_FILE_BYTES, MAX_PATH_BYTES};
 
 const AT0: FileAt = FileAt { file: 0, hi: false };
@@ -51,25 +50,6 @@ fn names_that_leave_the_folder_are_rejected() {
             at: FileAt { file: 0, hi: true }
         }
     ));
-}
-
-/// A directory junction on Windows, a symbolic link elsewhere.
-fn link_dir(link: &Path, target: &Path) {
-    #[cfg(windows)]
-    {
-        let status = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(link)
-            .arg(target)
-            .stdout(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
 }
 
 #[test]
@@ -128,7 +108,7 @@ fn only_regular_files_are_read() {
 /// Folder `path`, or the same folder relative to the working folder when
 /// that is shorter: a socket's path has a small length limit.
 #[cfg(unix)]
-fn short(path: &Path) -> std::path::PathBuf {
+fn short(path: &std::path::Path) -> std::path::PathBuf {
     let path = path.canonicalize().unwrap();
     let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
     let common = path

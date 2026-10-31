@@ -58,6 +58,7 @@ pub const LICENSES: &[(&str, &str)] = &[
     ("game", GPL),
     ("library", GPL),
     ("skin-model", GPL),
+    ("skin-beatoraja", GPL),
     ("render", GPL),
     ("player", GPL),
 ];

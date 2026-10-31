@@ -22,6 +22,7 @@ game = { path = "crates/game" }
 audio = { path = "crates/audio" }
 render = { path = "crates/render" }
 library = { path = "crates/library" }
+skin-model = { path = "crates/skin-model" }
 
 # bms-parser (md-5 also library)
 chardetng = "1.0.0"
@@ -63,7 +64,7 @@ toml = "1.1.8"
 # library: the library database (bundled SQLite, with FTS5 for search)
 rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
 
-# game, library and xtask, and replay, eval-cli and skin-model (dev only)
+# game, library and xtask, and replay, eval-cli, skin-model and skin-beatoraja (dev only)
 tempfile = "3.27.0"
 
 # player and eval-cli
