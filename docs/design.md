@@ -1407,7 +1407,7 @@ Tests without threads do not find bugs in notifications or queues. So a small nu
 
 ### Shortening Launch-Based Checks (Development Builds Only)
 
-- **Scenario launch**: The app can be launched with a scenario (`--scenario scenario.toml`) that describes "load this chart, feed this input log, save the screen at this time, exit". The same scenario is used whether a human or an AI does the checking.
+- **Scenario launch**: The app can be launched with a scenario (`--dev-scenario scenario.toml`) that describes "load this chart, feed this input log, save the screen at this time, exit". The same scenario is used whether a human or an AI does the checking. It runs headless on the game's real threads, through the same select and result input the keyboard drives; the run exits 0 only when every step ran, every screen save succeeded and the render thread ended cleanly, and 1 naming the step that failed. Screen saves go only into an output folder the run creates itself, each file created new and never replaced; this is a development tool run by the user who owns that folder, so a link swapped in during the run is outside its threat model.
 - **Specifying the start position**: From the command line or a scenario, the app can be launched with a specified start position for the practice "mid-chart start" (the "Input Logs and Replays" section). It uses the same mechanism as the product's practice feature, and the development build adds only the way to specify it. It is used in combination with preset and skin reloading.
 - **External control** (once the local event endpoint exists): Load, start, and screen-save operations are added to the local event endpoint. The event endpoint is by nature receive-only, so this is an exception for development builds only, and the connection token and loopback restrictions still apply.
 - **Render thread bounds**: `--dev-render-timeout <seconds>`, on `play` and on song selection, sets how long the run waits for the render thread's answer to a preparation or a chart's load and for its end, in place of the production bounds (30 s and 5 s). A headless run draws on WARP, whose frames take tens of seconds on a loaded machine, so the scripted and select tests pass a long bound that only catches a render thread that never answers.
@@ -1416,7 +1416,7 @@ Tests without threads do not find bugs in notifications or queues. So a small nu
 ### Separating Development and Production Builds
 
 - All of the features above go only into builds with a Cargo feature (for example `dev-tools`) enabled. Rather than hiding them behind a runtime flag, the production build does not contain the code itself.
-- The production build is made with `dev-tools` disabled. Features can be enabled even with the `release` profile, so the distribution CI pins the feature configuration. Development command-line arguments (`--scenario`, etc.) do not exist in the production build, and are treated as unknown arguments if passed.
+- The production build is made with `dev-tools` disabled. Features can be enabled even with the `release` profile, so the distribution CI pins the feature configuration. Development command-line arguments (`--dev-scenario`, etc.) do not exist in the production build, and are treated as unknown arguments if passed.
 - CI builds the production build and verifies that it does not accept development arguments and that the event endpoint has no development operations.
 - Replays and scores made with a development build record that they come from a development build, and cannot be sent to IR.
 

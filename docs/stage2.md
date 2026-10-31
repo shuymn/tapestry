@@ -513,22 +513,24 @@ Each change is covered by round trips and changes D8's interpretation tuple.
 
 ### D20. Scenario launch
 
-**The flag.** `--dev-scenario <file.toml>`, built with `dev-tools` only.
+**The flag.** `tapestry --dev-scenario <file.toml> [--dev-render-timeout <s>]`, its own command, built with `dev-tools` only.
 - It follows the `--dev-` prefix convention of `play`'s development options (crates/player/src/args.rs). The existing exception is `measure play --perfect`.
-- design.md "Shortening Launch-Based Checks" changes from `--scenario`.
+- Parsing does not open the file; a production build reports the flag as an unknown argument (exit 2).
 
 **The file.**
-- It carries a `version`; any other version is refused.
-- Library roots are relative to the file.
-- Steps:
-  - `select { search | path }`;
-  - `play { input = "auto" | log, until = "end" | { at_ms, command } }`;
+- It carries a `version`, read before anything else; any other version is refused, whatever else the file holds. It is read through a 1 MiB bound.
+- Library roots, the output folder and input logs are relative to the file. The roots replace `device.toml`'s for the run only.
+- Steps, in `[[step]]` tables of one kind each:
+  - `select { search | path }`: a path matches the listed chart of the same file, whatever its spelling;
+  - `play { input = "auto" | log, until = "end" | { at_ms, command = "retry" | "quit" } }`: every play of one chart uses its first input;
   - `result = "next-preset" | "prev-preset" | "retry" | "back"`;
-  - `capture { at, file }`;
+  - `capture { at, file }`: the first presented frame at or after `at` of the next play that starts, written under `output`;
   - `practice { … }` (PR24);
-  - `quit`.
+  - `quit`, last.
+- A step out of place (a result where no result shows, a capture no play follows) is refused when the file is loaded, naming the step.
+- `output` is a folder the run creates itself: it must not exist, and no folder below the file's on the way to it may be a link. Each capture is created new, never replacing a file. The run is a development tool started by the user who owns these folders, so a link swapped in during the run is outside its threat model.
 
-**Running.** It runs headless on the real threads. Exit code 0 means every step ran; 1 names the failed step.
+**Running.** It runs headless on the real threads, compiled into the same scripted select and result input as `--dev-select`, which drives the screens through the keyboard's route (D18). Each chart's input is chosen when it loads. Exit code 0 means every step ran, every capture was written and the render thread ended cleanly; 1 names the failed step; the first failure is the error and the others are printed after it.
 
 ### D21. Benchmarks
 
@@ -1160,13 +1162,13 @@ Each one holds the behavior D5 and D6 state.
 
 **Exit scenario** (Windows CI, dev-tools; PR19, extended by PR24). The data root starts with no `player.toml`.
 1. Scan two generated charts and one refused chart.
-2. Choose the refused chart and see its reason.
-3. Add a chart and see it listed.
-4. Play A with autoplay; it is evaluated under beatoraja-style, the default.
-5. On the result screen, switch to tapestry, then LR2-style, then back.
-6. Retry with a scripted log to the end, then retry and abort.
-7. Go back, play B, go back.
-8. Play one practice round at 75 %, then quit.
+2. Play A with autoplay; it is evaluated under beatoraja-style, the default.
+3. On the result screen, switch to tapestry, then LR2-style, then back.
+4. Go back, choose A again, play a scripted log to the end, retry, retry during the play, quit during the play.
+5. Search for B, play it, go back.
+6. Play one practice round at 75 %, then quit.
+
+Choosing a refused chart and seeing a chart added are covered by `unrunnable_step_exits_one` and the select tests.
 
 **It asserts:**
 - the scene order;
