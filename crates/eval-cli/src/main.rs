@@ -14,7 +14,9 @@
 //! verified against the chart with `replay::verify` (design.md
 //! "Determinism"). It is evaluated under each `--preset` in order, or under
 //! its own preset copy when none is given (design.md "Extension
-//! Boundaries"), and one line per record and preset goes to stdout:
+//! Boundaries"), each evaluation first admitted against a memory budget
+//! and refused as too large over it, and one line per record and preset
+//! goes to stdout:
 //!
 //! `<record> | <preset> | <label> | perfect <n> great <n> good <n> bad <n>
 //! poor <n> | ex <n> | bp <n> | max combo <n> | <gauge> <value>% <cleared>...`
@@ -49,9 +51,14 @@ use std::process::ExitCode;
 
 use bms_model::Chart;
 use bms_parser::LoadOptions;
-use replay::verify::{Coverage, ReEvaluation, evaluate_record, load_recorded_chart};
+use replay::verify::{Coverage, ReEvaluation, admit, evaluate_record, load_recorded_chart};
 use replay::{DecodeLimits, Incomplete, PlayRecord};
 use rules::{GaugeValue, RulePreset};
+
+/// The memory budget each evaluation is admitted against, in bytes: the
+/// figure the game admits saved records' evaluations within (design.md
+/// "Determinism", "Recording Capacity").
+const EVAL_MEMORY: usize = 512 << 20;
 
 fn main() -> ExitCode {
     let args = match args::parse(std::env::args_os().skip(1)) {
@@ -260,19 +267,20 @@ fn decoded(path: &Path) -> Result<PlayRecord, String> {
 }
 
 /// The record evaluated under `preset`, or else under its own preset copy,
-/// as a line's label and totals.
+/// as a line's label and totals, once its evaluation is admitted within
+/// [`EVAL_MEMORY`].
 ///
 /// # Errors
 ///
-/// Why the evaluation is refused.
+/// Why the evaluation is refused, being too large among the reasons.
 fn evaluated(
     record: &PlayRecord,
     chart: &Chart,
     preset: Option<&RulePreset>,
 ) -> Result<String, String> {
-    let r = evaluate_record(record, chart, preset).map_err(|e| chain(&e))?;
-    // The gauges are named by the preset the evaluation ran under; the
-    // record's copy decoded in `evaluate_record`, so this does not fail.
+    // The preset the evaluation runs under, which sizes it and names the
+    // gauges; verification decoded the record's copy, so this does not
+    // fail.
     let preset = match preset {
         Some(p) => Cow::Borrowed(p),
         None => Cow::Owned(
@@ -280,6 +288,8 @@ fn evaluated(
                 .map_err(|e| chain(&e))?,
         ),
     };
+    admit(record, chart, &preset, EVAL_MEMORY).map_err(|e| chain(&e))?;
+    let r = evaluate_record(record, chart, Some(&preset)).map_err(|e| chain(&e))?;
     Ok(result_line(&r, &preset))
 }
 

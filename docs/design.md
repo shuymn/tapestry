@@ -366,7 +366,7 @@ During play, only `advance_to(watermark)` is called. Even for a note whose deadl
   8. The chart transform: only the pass-through (`passthrough`, version 1) is known.
 
   The chart file's SHA-256 is not compared, so an edited file that resolves to the same chart verifies. The result screen re-evaluates the chart just played, so it skips the chart checks.
-- Before a saved record is evaluated, its evaluation is admitted against a memory budget (`replay::verify::admit`): `eval` estimates what a batch evaluation holds at its peak from the record's input count, the chart and the preset ("Recording Capacity"), and a record over the budget is refused as too large without being evaluated, so a record placed by hand that passes the decoding limits with many gauges and inputs cannot exhaust memory. The rebuild of the bests admits each record within 512 MiB after the transform check ("Personal Bests"), and the result screen admits each what-if within the same figure.
+- Before a saved record is evaluated, its evaluation is admitted against a memory budget (`replay::verify::admit`): `eval` estimates what a batch evaluation holds at its peak from the record's input count, the chart and the preset ("Recording Capacity"), and a record over the budget is refused as too large without being evaluated, so a record placed by hand that passes the decoding limits with many gauges and inputs cannot exhaust memory. The rebuild of the bests admits each record within 512 MiB after the transform check ("Personal Bests"), the result screen admits each what-if within the same figure, and `eval-cli` admits each evaluation within it under the preset it runs under, a `--preset` or the record's own copy, refusing that record's line as too large.
 
 ## Rule Presets
 
