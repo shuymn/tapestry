@@ -704,15 +704,19 @@ impl Resolver<'_, '_> {
         Ok(true)
     }
 
-    /// `n` enabled for `n >= 0`, `-n` not enabled for `n < 0`; `-MIN` is
-    /// `MIN`, as Java's negation wraps.
+    /// `n` enabled for `n >= 0`, `-n` not enabled for `n < 0`; `i32::MIN`,
+    /// which has no negation in `i32`, is a range error (the source's
+    /// wrapping negation is not reproduced).
     fn test_number(&mut self, id: u32) -> Result<bool, ImportError> {
         let op = self.def.int(id, "if")?;
-        Ok(if op >= 0 {
-            self.enabled.contains(&op)
-        } else {
-            !self.enabled.contains(&op.wrapping_neg())
-        })
+        if op >= 0 {
+            return Ok(self.enabled.contains(&op));
+        }
+        let neg = op.checked_neg().ok_or_else(|| ImportError::Range {
+            at: self.def.loc(id),
+            field: "if",
+        })?;
+        Ok(!self.enabled.contains(&neg))
     }
 
     /// Reads, parses and resolves the file that `member`, the first

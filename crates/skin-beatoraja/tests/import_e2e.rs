@@ -146,12 +146,13 @@ fn the_play_objects_draw_together() {
         .iter()
         .map(|q| round(q.rect))
         .collect();
-    // The lift raises the line by 60 to 810; the cover takes 54 px.
+    // The lift raises the line by 60 to 810; the cover lowers by 54 px
+    // and shows from the lanes' top.
     assert!(
         r.contains(&[150, 800, 50, 20]),
         "the held head on the line: {r:?}"
     );
-    assert!(r.contains(&[20, 280, 430, 54]), "SUDDEN+: {r:?}");
+    assert!(r.contains(&[20, 270, 430, 64]), "SUDDEN+: {r:?}");
     assert!(r.contains(&[20, 820, 430, 60]), "LIFT: {r:?}");
     assert!(r.contains(&[600, 560, 80, 20]), "the grade: {r:?}");
     // Ten gauge segments, the grade, two digits, the held long note's

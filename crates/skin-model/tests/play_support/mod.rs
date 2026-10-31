@@ -138,6 +138,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
         },
         empty_poor_breaks_combo: false,
         scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
     }
 }
 
