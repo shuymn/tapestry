@@ -390,6 +390,11 @@ fn check_f5(_: &Header, i: Imported) {
     assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
     assert_eq!(u.elements, as_u32(JUDGES) + 5);
     assert!(i.scratch.is_some());
+    // No image element: the widgets' worst cases and the lanes' budget.
+    assert_eq!(
+        i.skin.quad_capacity(),
+        MAX_WIDGET_QUADS + skin_model::LANE_QUADS + skin_model::LANE_RESERVED
+    );
     // The snapshot: a PERFECT with combo 12, the gauge full, SUDDEN+ at
     // 300 ‰ and LIFT at 100 ‰, no note on screen.
     let chart = bms_model::ChartBuilder::new(150_000)
@@ -416,12 +421,32 @@ fn check_f5(_: &Header, i: Imported) {
     };
     d.frame(900, &[full]);
     let q = d.frame(1_000, &[judged(1_000, Judgment::Perfect, 12)]);
-    // The judges: a grade and "1" and "2" each, the last a grade and "2"
-    // (15,383); the gauge's 1,000 segments, and its tip while the
-    // flicker shows it; SUDDEN+ and LIFT.
-    let judges = 3 * (JUDGES - 1) + 2;
-    let gauge = q.len() - judges - 2;
-    assert!((1_000..=1_001).contains(&gauge), "{}", q.len());
+    // Each emission by its drawn size: every judge's 80×20 grade, the
+    // 6×6 cells of "1" and "2" for each but the last, whose one-digit
+    // combo draws "2" alone; SUDDEN+ and LIFT over the 430 px lanes; the
+    // gauge's 1,000 one-pixel segments, and its tip while the flicker
+    // shows it.
+    let mut by_size = std::collections::BTreeMap::<[i32; 2], usize>::new();
+    for quad in &q {
+        let [_, _, w, h] = common::play::round(quad.rect);
+        *by_size.entry([w, h]).or_default() += 1;
+    }
+    let count = |size: [i32; 2]| by_size.get(&size).copied().unwrap_or(0);
+    assert_eq!(count([80, 20]), JUDGES, "{by_size:?}");
+    assert_eq!(count([6, 6]), 2 * (JUDGES - 1) + 1, "{by_size:?}");
+    let covers: usize = by_size
+        .iter()
+        .filter(|(s, _)| s[0] == 430)
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(covers, 2, "{by_size:?}");
+    let gauge: usize = by_size
+        .iter()
+        .filter(|(s, _)| s[1] == 10)
+        .map(|(_, n)| n)
+        .sum();
+    assert!((1_000..=1_001).contains(&gauge), "{by_size:?}");
+    assert_eq!(q.len(), JUDGES + 2 * JUDGES - 1 + 2 + gauge, "{by_size:?}");
 }
 
 /// A relative name of `len` bytes ending in `tail`, in folders of at most
