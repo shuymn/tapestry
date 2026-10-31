@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bms_model::{Chart, TimeSource, TimeUs};
 use eval::{JudgeEvent, Section};
@@ -34,7 +34,7 @@ use render::measure::{FrameStatistics, Presentation};
 use render::{FrameInput, FrameTiming, RenderError};
 
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
-use crate::menu_screen::MenuPage;
+use crate::menu_screen::{MenuPage, SPLASH};
 use crate::tuning::LiveTuning;
 
 /// What draws: the renderer, or a double in tests.
@@ -104,6 +104,17 @@ pub trait Screen: Send {
             presented: true,
             present_count: None,
         })
+    }
+    /// Draws the launch screen `elapsed` after the render thread started,
+    /// as [`text`](Self::text), until the game sends what to draw; `None`
+    /// draws nothing instead (no launch screen).
+    ///
+    /// # Errors
+    ///
+    /// As [`menu`](Self::menu).
+    fn splash(&mut self, elapsed: Duration) -> Option<Result<bool, RenderError>> {
+        let _ = elapsed;
+        None
     }
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
@@ -482,6 +493,7 @@ pub fn spawn(
             };
             let mut r = Run {
                 screen: Some(screen),
+                started: Instant::now(),
                 make,
                 chart,
                 section,
@@ -517,6 +529,17 @@ pub fn spawn(
     }
 }
 
+/// What a preparation or a load leaves drawn: the splash stays until what
+/// comes next replaces it, since a hidden window shows on a presented
+/// frame and a play opens only once the window is shown; anything else
+/// stops.
+fn after_preparing(mode: Mode) -> Mode {
+    match mode {
+        Mode::Splash { pending } => Mode::Splash { pending },
+        _ => Mode::Idle,
+    }
+}
+
 fn build(
     make: &mut MakeScreen,
     chart: Option<&Chart>,
@@ -531,6 +554,11 @@ fn build(
 
 enum Mode {
     Idle,
+    /// The launch screen, until the game sends what to draw; a select
+    /// page sent before it ends ([`SPLASH`]) waits in `pending`.
+    Splash {
+        pending: Option<Box<MenuPage>>,
+    },
     Play {
         origin: TimeUs,
         side: RenderSide,
@@ -548,6 +576,8 @@ enum Mode {
 
 struct Run {
     screen: Option<Box<dyn Screen>>,
+    /// When the render thread started: the launch screen's time runs from it.
+    started: Instant,
     make: MakeScreen,
     chart: Option<Arc<Chart>>,
     /// The section of the chart a practice round draws only the targets of.
@@ -572,7 +602,7 @@ struct Run {
 
 impl Run {
     fn run(&mut self, rx: &Receiver<RenderMsg>) {
-        let mut mode = Mode::Idle;
+        let mut mode = Mode::Splash { pending: None };
         let mut effects: Vec<JudgeEvent> = Vec::with_capacity(self.view.effects);
         loop {
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
@@ -623,19 +653,25 @@ impl Run {
                         }
                     }
                     let _ = reply.send(ready);
-                    mode = Mode::Idle;
+                    mode = after_preparing(mode);
                     continue;
                 }
                 Ok(RenderMsg::Menu(page)) => {
-                    mode = Mode::Menu {
-                        page,
-                        changed: true,
+                    mode = match mode {
+                        // The launch screen shows out its time.
+                        Mode::Splash { .. } if self.started.elapsed() < SPLASH => Mode::Splash {
+                            pending: Some(page),
+                        },
+                        _ => Mode::Menu {
+                            page,
+                            changed: true,
+                        },
                     };
                 }
                 Ok(RenderMsg::Prepare(reply)) => {
                     let ready = self.prepare();
                     let _ = reply.send(ready);
-                    mode = Mode::Idle;
+                    mode = after_preparing(mode);
                     continue;
                 }
                 Ok(RenderMsg::Play {
@@ -697,8 +733,41 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
+            // The launch screen's time is over: the page waiting replaces it.
+            let elapsed = self.started.elapsed();
+            if elapsed >= SPLASH
+                && let Mode::Splash { pending } = &mut mode
+                && let Some(page) = pending.take()
+            {
+                mode = Mode::Menu {
+                    page,
+                    changed: true,
+                };
+            }
             let drawn = match &mut mode {
                 Mode::Idle => continue,
+                Mode::Splash { pending } => {
+                    let Some(drawn) = screen.splash(elapsed) else {
+                        // No launch screen: the page waiting, if any, at
+                        // once; else the frame granted waits for what
+                        // comes next.
+                        mode = pending.take().map_or(Mode::Idle, |page| Mode::Menu {
+                            page,
+                            changed: true,
+                        });
+                        continue;
+                    };
+                    drawn.map(|presented| {
+                        let timing = FrameTiming {
+                            cpu: Duration::ZERO,
+                            sprites: 0,
+                            dropped: 0,
+                            presented,
+                            present_count: None,
+                        };
+                        (timing, None)
+                    })
+                }
                 Mode::Play {
                     origin,
                     side,
@@ -1082,6 +1151,161 @@ mod tests {
         #[cfg(feature = "dev-tools")]
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
             None
+        }
+    }
+
+    /// A screen with a splash page: it counts its splash and menu frames.
+    struct Splashes {
+        splashes: Arc<AtomicU32>,
+        menus: Arc<AtomicU32>,
+    }
+
+    impl Screen for Splashes {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn splash(&mut self, _elapsed: Duration) -> Option<Result<bool, RenderError>> {
+            self.splashes.fetch_add(1, Ordering::SeqCst);
+            Some(Ok(true))
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.menus.fetch_add(1, Ordering::SeqCst);
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The render thread draws the splash page from its start, before the
+    /// game sends anything, and only until the first page replaces it.
+    #[test]
+    fn the_splash_shows_out_its_time_then_the_first_page() {
+        let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let (s, m) = (Arc::clone(&splashes), Arc::clone(&menus));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Splashes {
+                splashes: Arc::clone(&s),
+                menus: Arc::clone(&m),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let spawned = Instant::now();
+        assert!(wait_until(|| splashes.load(Ordering::SeqCst) >= 2));
+        // The page, ready early, waits for the launch screen's end.
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= 1));
+        assert!(spawned.elapsed() >= crate::menu_screen::SPLASH);
+        let drawn = splashes.load(Ordering::SeqCst);
+        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= 3));
+        link.exit();
+        assert_eq!(splashes.load(Ordering::SeqCst), drawn);
+    }
+
+    /// A page that comes after the launch screen's time replaces it at
+    /// once.
+    #[test]
+    fn a_page_after_the_splash_time_shows_at_once() {
+        let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let (s, m) = (Arc::clone(&splashes), Arc::clone(&menus));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Splashes {
+                splashes: Arc::clone(&s),
+                menus: Arc::clone(&m),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        std::thread::sleep(crate::menu_screen::SPLASH + Duration::from_millis(100));
+        assert_eq!(menus.load(Ordering::SeqCst), 0);
+        let sent = Instant::now();
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= 1));
+        assert!(
+            sent.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            sent.elapsed()
+        );
+        link.exit();
+    }
+
+    /// A preparation (a play's, before it opens) leaves the splash drawn,
+    /// whether it comes before the splash's first frame or after: the
+    /// hidden window shows on a presented frame, and the play waits for
+    /// the show.
+    #[test]
+    fn a_preparation_keeps_the_splash_drawn() {
+        for prepare_first in [true, false] {
+            let splashes = Arc::new(AtomicU32::new(0));
+            let s = Arc::clone(&splashes);
+            let make: MakeScreen = Box::new(move || {
+                Ok(Box::new(Splashes {
+                    splashes: Arc::clone(&s),
+                    menus: Arc::new(AtomicU32::new(0)),
+                }) as Box<dyn Screen>)
+            });
+            let clock = QpcClock::start();
+            let link = spawn(
+                make,
+                None,
+                None,
+                clock,
+                view(),
+                measure(clock),
+                Box::new(NoFrames),
+            )
+            .unwrap();
+            if !prepare_first {
+                assert!(wait_until(|| splashes.load(Ordering::SeqCst) >= 1));
+            }
+            assert!(link.prepare().is_ok());
+            let drawn = splashes.load(Ordering::SeqCst);
+            assert!(
+                wait_until(|| splashes.load(Ordering::SeqCst) >= drawn + 2),
+                "prepare first: {prepare_first}"
+            );
+            link.exit();
         }
     }
 
