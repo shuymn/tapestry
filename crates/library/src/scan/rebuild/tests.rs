@@ -151,6 +151,39 @@ fn rebuild_acknowledges_between_load_and_evaluation() {
     assert_eq!(evaluated.load(Ordering::SeqCst), 1);
 }
 
+/// Each record folder is looked at behind a checkpoint, an empty one too: a
+/// pause requested while the first is listed is acknowledged before the
+/// second.
+#[test]
+fn a_pause_is_acknowledged_between_two_folder_listings() {
+    let fx = Fixture::new();
+    for name in ["aa", "bb"] {
+        std::fs::create_dir_all(fx.records.join(name)).unwrap();
+    }
+    let lib = fx.open();
+    let listed = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&listed);
+    let (held, at_list) = gate(|s| matches!(s, Step::List(_)));
+    let scan = scan(
+        &fx,
+        &lib,
+        hooked(&fx, move |s| {
+            if matches!(s, Step::List(_)) {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+            at_list(s);
+        }),
+    );
+    held.held.recv_timeout(LONG).unwrap();
+    scan.request_pause();
+    held.go.send(()).unwrap();
+    assert!(scan.wait_paused(LONG));
+    assert_eq!(listed.load(Ordering::SeqCst), 1, "listed past the pause");
+    scan.release();
+    assert!(scan.finish().unwrap().bests.enumeration_complete);
+    assert_eq!(listed.load(Ordering::SeqCst), 2);
+}
+
 #[test]
 fn rebuild_resumes_after_exit_without_clearing() {
     let fx = Fixture::new();

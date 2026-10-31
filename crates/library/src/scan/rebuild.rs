@@ -539,6 +539,12 @@ impl Scanner<'_> {
                 break;
             };
             let folder = entry.path();
+            // Before each folder, an empty or unreadable one too.
+            if let Flow::Stop = self.step()? {
+                return self.commit_bests(None);
+            }
+            #[cfg(test)]
+            self.options.test.bests(super::tests::Step::List(&folder));
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => {}
                 Ok(_) => continue,

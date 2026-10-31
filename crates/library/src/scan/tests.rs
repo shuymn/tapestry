@@ -33,6 +33,8 @@ pub enum Fault {
 /// A step of the bests phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step<'a> {
+    /// This entry of `records` is about to be looked at and listed.
+    List(&'a Path),
     /// This record is about to be decoded.
     Decode(&'a Path),
     /// This record's chart is about to be loaded.
