@@ -1188,31 +1188,44 @@ fn queued_menu_commands_do_not_outlive_their_result() {
     assert_eq!(plays[1].end, PlayEnd::Completed);
 }
 
-/// A quit during play leaves the chart for selection, with no result; the
-/// window closing during the next chart's play ends the run.
+/// A quit while the chart plays aborts the play and shows its result,
+/// saved ended midway; back on it returns to selection; the window closing
+/// during the next chart's play ends the run, with no result.
 #[test]
-fn quit_leaves_the_chart_close_ends_the_run() {
+fn quit_shows_the_result_close_ends_the_run() {
     let acts = vec![
         (0, Act::Choose(0)),
         (1_500, Act::Quit),
+        (100, Act::Back),
         (100, Act::Choose(1)),
         (1_500, Act::Close),
         // Never reached: the run has ended.
         (100, Act::Choose(0)),
     ];
-    let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
+    let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
     assert_eq!(
         rig.seen,
-        [Seen::Select, Seen::Load(0), Seen::Select, Seen::Load(1)]
+        [
+            Seen::Select,
+            Seen::Load(0),
+            Seen::Shown(1),
+            Seen::Select,
+            Seen::Load(1)
+        ]
     );
     for r in rig.reports() {
         assert_eq!(r.end, PlayEnd::Aborted(AbortCause::Quit));
-        assert!(r.record.is_some());
+        let status = r.record.as_ref().unwrap().status;
+        assert_eq!(status.end, replay::EndStatus::EndedMidway);
     }
     assert_eq!(rig.reports().count(), 2);
-    assert_eq!(rig.next, 4);
+    assert_eq!(
+        events.count(|e| matches!(e, SessionEvent::Result { .. })),
+        1
+    );
+    assert_eq!(rig.next, 5);
 }
 
 /// Chart A's play completes about 2.7 s after its choice; with a 2 s tail,
@@ -1259,25 +1272,24 @@ fn quit_in_the_tail_skips_to_the_result() {
     assert!(events.all().contains(&SessionEvent::Result { attempt: 1 }));
 }
 
-/// Before the play is complete, in its countdown or while it plays, the
-/// quit key still aborts it and returns to selection with no result.
+/// Before the play is complete the quit key aborts it: in its countdown it
+/// returns to selection with no result; while the chart plays it shows
+/// the play's result, which back leaves for selection.
 #[test]
-fn quit_before_completion_leaves_the_chart() {
-    for at in [300, 1_500] {
-        let acts = vec![
-            (0, Act::Choose(0)),
-            (at, Act::Quit),
-            (100, Act::Choose(1)),
-            (4_000, Act::Close),
-        ];
+fn quit_before_completion_leaves_or_shows_the_result() {
+    for (at, result) in [(300, false), (1_500, true)] {
+        let mut acts = vec![(0, Act::Choose(0)), (at, Act::Quit)];
+        let mut seen = vec![Seen::Select, Seen::Load(0)];
+        if result {
+            acts.push((100, Act::Back));
+            seen.push(Seen::Shown(1));
+        }
+        acts.extend([(100, Act::Choose(1)), (4_000, Act::Close)]);
+        seen.extend([Seen::Select, Seen::Load(1)]);
         let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.tail_waits = 2_000);
         ran.unwrap();
         assert!(rig.violations.is_empty(), "{at}: {:?}", rig.violations);
-        assert_eq!(
-            rig.seen,
-            [Seen::Select, Seen::Load(0), Seen::Select, Seen::Load(1)],
-            "{at}"
-        );
+        assert_eq!(rig.seen, seen, "{at}");
         let one = &rig.loads[0].1[0];
         assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit), "{at}");
         assert!(!one.tail_skipped, "{at}");
@@ -2298,9 +2310,10 @@ fn notices(rig: &Headless) -> Vec<Option<String>> {
 
 /// P on the practice chart opens its screen at 1×; 75 % with repeat on
 /// and Start load it at that speed and play round 1 to the end of its
-/// ring-out, then round 2 with no result between; the quit key in round
-/// 2 returns to the practice screen, and Back to selection. Round 1's
-/// record is a section repeat at 15/20, attempt 1.
+/// ring-out, then round 2 with no result between; the quit key while
+/// round 2 plays shows its result, whose back returns to the practice
+/// screen, and Back to selection. Round 1's record is a section repeat at
+/// 15/20, attempt 1.
 #[test]
 fn practice_screen_repeats_and_quits() {
     let mut acts = vec![(0, Act::Practice(P))];
@@ -2308,6 +2321,7 @@ fn practice_screen_repeats_and_quits() {
     acts.push((10, Act::Page(PracticeInput::Confirm)));
     // Round 1 runs about 11 s at 75 %: the quit falls inside round 2.
     acts.push((14_000, Act::Quit));
+    acts.push((500, Act::Back));
     acts.push((500, Act::Page(PracticeInput::Back)));
     acts.push((500, Act::Close));
     let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
@@ -2319,6 +2333,7 @@ fn practice_screen_repeats_and_quits() {
             Seen::Select,
             Seen::Practice(None),
             Seen::Load(P),
+            Seen::Shown(2),
             Seen::Practice(None),
             Seen::Select,
         ]
@@ -2348,11 +2363,15 @@ fn practice_screen_repeats_and_quits() {
         .count();
     assert_eq!(judged, 8);
     assert_eq!(reports[1].end, PlayEnd::Aborted(game::AbortCause::Quit));
-    // No result between the rounds, nor after them.
-    assert_eq!(
-        events.count(|e| matches!(e, SessionEvent::Result { .. })),
-        0
-    );
+    let status = reports[1].record.as_ref().unwrap().status;
+    assert_eq!(status.end, replay::EndStatus::EndedMidway);
+    // No result between the rounds; round 2's after the quit.
+    let results: Vec<SessionEvent> = events
+        .all()
+        .into_iter()
+        .filter(|e| matches!(e, SessionEvent::Result { .. }))
+        .collect();
+    assert_eq!(results, [SessionEvent::Result { attempt: 2 }]);
     // The model came back as it was left: 75 %, its 1× measures.
     let [entered, back] = &rig.practice_entries[..] else {
         panic!("{:?}", rig.seen);
@@ -2361,19 +2380,62 @@ fn practice_screen_repeats_and_quits() {
     assert_eq!(back.measures(), entered.measures());
 }
 
+/// The quit key in a round's countdown, before its section starts, aborts
+/// the round and returns to the practice page with no result.
+#[test]
+fn practice_quit_in_the_countdown_returns_to_the_page() {
+    use PracticeInput::{Back, Confirm};
+    let mut acts = vec![(0, Act::Practice(0))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (500, Act::Quit),
+        (500, Act::Page(Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Practice(None),
+            Seen::Load(0),
+            Seen::Practice(None),
+            Seen::Select,
+        ]
+    );
+    let [(0, reports)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    let [round] = &reports[..] else {
+        panic!("{} rounds", reports.len());
+    };
+    assert_eq!(round.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert_eq!(
+        events.count(|e| matches!(e, SessionEvent::Result { .. })),
+        0
+    );
+}
+
 /// Every Start loads the chart, at an unchanged speed too: a first entry
 /// at 100 % loads, a second Start loads again, and practicing A then B
 /// at the same speed loads B.
 #[test]
 fn start_always_loads_the_current_chart() {
     use PracticeInput::{Back, Confirm};
+    // Each quit falls while a round plays: its result shows, and back
+    // returns to the page.
     let mut acts = vec![(0, Act::Practice(0))];
     acts.extend(to_start(0));
     acts.extend([
         (10, Act::Page(Confirm)),
         (3_000, Act::Quit),
+        (100, Act::Back),
         (500, Act::Page(Confirm)),
         (3_000, Act::Quit),
+        (100, Act::Back),
         (500, Act::Page(Back)),
         (500, Act::Practice(1)),
     ]);
@@ -2381,6 +2443,7 @@ fn start_always_loads_the_current_chart() {
     acts.extend([
         (10, Act::Page(Confirm)),
         (3_000, Act::Quit),
+        (100, Act::Back),
         (500, Act::Page(Back)),
         (500, Act::Close),
     ]);

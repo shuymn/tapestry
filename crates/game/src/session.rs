@@ -659,6 +659,15 @@ impl Loaded {
         }
     }
 
+    /// Where a play's chart starts, in its chart time: chart time 0 for a
+    /// full play, the section's start for a round. Until then it counts
+    /// down, and the quit key leaves it without a result (design.md "Play
+    /// Lifecycle").
+    #[must_use]
+    pub fn starts_at(&self) -> TimeUs {
+        self.section().map_or(TimeUs(0), |s| s.start)
+    }
+
     /// Where a round's audio is restored, in its chart time: its lead-in's
     /// start; `None` for a full play.
     #[must_use]

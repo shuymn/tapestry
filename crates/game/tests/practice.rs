@@ -801,6 +801,34 @@ fn quit_skips_the_ring_out_to_the_rounds_result() {
     assert!(left[cut..].iter().all(|&x| x == 0.0));
 }
 
+/// A round starts at its section's start (10 s): the quit key in the step
+/// before it, in the lead-in, leaves the rounds with no result; from the
+/// step at it on it ends the round midway and shows its result, never
+/// cleared, which the quit key at 10.5 s leaves.
+#[test]
+fn a_rounds_quit_shows_its_result_from_the_sections_start() {
+    for (at, shown) in [(9_999 * MS, vec![]), (10_000 * MS, vec![1])] {
+        let run = example_rounds(
+            2,
+            0,
+            &[(1, at, Command::Quit), (1, 10_500 * MS, Command::Quit)],
+        );
+        let [round1] = &run.reports[..] else {
+            panic!("{at}: {} rounds", run.reports.len());
+        };
+        assert_eq!(round1.end, PlayEnd::Aborted(game::AbortCause::Quit), "{at}");
+        assert_eq!(run.rig.shown, shown, "{at}");
+        for record in &run.records {
+            assert_eq!(record.status.end, replay::EndStatus::EndedMidway, "{at}");
+        }
+        if !shown.is_empty() {
+            assert_eq!(run.records.len(), 1);
+            let evaluation = round1.result.as_ref().unwrap().evaluation.as_ref().unwrap();
+            assert!(evaluation.gauges.iter().all(|g| !g.cleared), "{at}");
+        }
+    }
+}
+
 /// The quit key pressed while a repeated round is saved, after its
 /// ring-out ran to its end, is the skip to that round's result: the result
 /// shows instead of the next round starting, and the quit key on it at
@@ -821,6 +849,35 @@ fn a_quit_during_a_rounds_save_shows_its_result() {
         .filter(|e| matches!(e, Ev::Open { .. }))
         .count();
     assert_eq!(opens, 1);
+}
+
+/// The quit key pressed while a round the quit key ended at 15 s, as it
+/// played, is saved is taken with that round: its result shows and stays
+/// until the quit key on it at 25 s leaves the rounds.
+#[test]
+fn a_quit_during_an_aborted_rounds_save_keeps_its_result() {
+    let run = example_rounds_pressing(
+        2,
+        0,
+        &[
+            (1, 15_000 * MS, Command::Quit),
+            (1, 25_000 * MS, Command::Quit),
+        ],
+        true,
+    );
+    let [round1] = &run.reports[..] else {
+        panic!("{} rounds", run.reports.len());
+    };
+    assert_eq!(round1.end, PlayEnd::Aborted(game::AbortCause::Quit));
+    assert!(round1.saved.as_ref().is_some_and(Result::is_ok));
+    assert_eq!(run.rig.shown, [1]);
+    assert!(run.rig.pressed.borrow().is_empty());
+    // Left by the quit at 25 s, not at once.
+    assert!(
+        run.t(run.rig.at()) >= 25_000 * MS,
+        "{}",
+        run.t(run.rig.at())
+    );
 }
 
 #[test]
@@ -908,9 +965,12 @@ fn section_round_records_its_conditions() {
         };
         loaded.set_practice(Some(practice)).unwrap();
         let mut rig = Rounds::new(loaded.audio_schedule(), 2, &log, &clock);
-        // Round 1 is left by a quit at 18 s.
+        // Round 1 is ended by a quit at 18 s, and its result left at
+        // 18.5 s.
         rig.commands.push((1, 18_000 * MS, Command::Quit));
+        rig.commands.push((1, 18_500 * MS, Command::Quit));
         game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        assert_eq!(rig.shown, [1]);
         reports.append(&mut rig.reports);
     }
     // G9: each round's result is drawn from its section's start, each gauge

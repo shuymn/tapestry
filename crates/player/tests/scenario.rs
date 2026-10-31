@@ -211,7 +211,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 1\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 2\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -231,12 +231,12 @@ fn int(t: &toml::Table, table: &str, key: &str) -> Option<i64> {
 
 /// The exit scenario: chart A by autoplay and its result under each
 /// preset, A again with an input log played to the end, retried from the
-/// result, retried and left during the play, then B found by search, then
-/// one practice round of A at 75 % with the log, left at the next round's
-/// start; the steps run in scene order, the log's plays are saved,
-/// re-evaluate equal and are counted into the bests, the round is saved
-/// as a section repeat at 75 % played to the end, and the capture is the
-/// log's first play's frame.
+/// result, retried during the play, quit during the play to its result and
+/// left there, then B found by search, then one practice round of A at
+/// 75 % with the log, left at the next round's start; the steps run in
+/// scene order, the log's plays are saved, re-evaluate equal and are
+/// counted into the bests, the round is saved as a section repeat at 75 %
+/// played to the end, and the capture is the log's first play's frame.
 #[test]
 fn exit_scenario_plays_select_result_retry_repeatedly() {
     let fx = Fixture::new();
@@ -292,20 +292,23 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         "dev: scenario: step 12 (play)",
         "play started",
         "play 3: Aborted(Quit); ",
-        "dev: scenario: step 13 (select)",
+        // The quit while the chart plays shows the play's result.
+        "dev: scenario: step 13 (result)",
+        "dev: scenario: step 14 (select)",
         "select: chose b.bms",
-        "dev: scenario: step 14 (play)",
+        "dev: scenario: step 15 (play)",
         "play started",
         "play 1: Completed; perfect 4 great 0 good 0 bad 0 poor 0",
-        "dev: scenario: step 15 (result)",
-        "dev: scenario: step 16 (practice)",
+        "dev: scenario: step 16 (result)",
+        "dev: scenario: step 17 (practice)",
         "select: chose a.bms to practice ",
         "play started",
         // The log's presses fall on 1× times: at 75 % they miss.
         "play 1: Completed; ",
         "play started",
+        // The quit in the next round's countdown returns to the page.
         "play 2: Aborted(Quit); nothing recorded",
-        "dev: scenario: step 17 (quit)",
+        "dev: scenario: step 18 (quit)",
     ];
     assert_eq!(
         scene.len(),
@@ -472,8 +475,38 @@ fn a_skip_after_completion_lands_on_the_result() {
     assert!(!lines(&stdout, "result: viewing ").is_empty(), "{stdout}");
 }
 
-/// A `quit` timed after the play completes lands on its result, not on
-/// selection: the run fails at that step, naming `skip`.
+/// The quit key timed while the chart plays (`command = "quit"`) ends the
+/// play midway on its result, which the next step leaves for selection.
+#[test]
+fn a_quit_while_playing_lands_on_the_result() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = \"auto\", until = { at_ms = 2250, command = \"quit\" } }",
+        "result = \"back\"",
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let plays = lines(&stdout, "play 1: ");
+    assert_eq!(plays.len(), 2, "{stdout}");
+    assert!(plays[0].starts_with("play 1: Aborted(Quit)"), "{stdout}");
+    assert!(plays[1].starts_with("play 1: Completed"), "{stdout}");
+    let at = |prefix: &str| stdout.lines().position(|l| l.starts_with(prefix));
+    let viewing = at("result: viewing ").unwrap();
+    assert!(at("play 1: Aborted(Quit)").unwrap() < viewing, "{stdout}");
+    assert!(
+        viewing < at("dev: scenario: step 4 (select)").unwrap(),
+        "{stdout}"
+    );
+}
+
+/// A `quit` timed after the play completes lands on its result, as a skip
+/// does, but the play is not ended midway: the run fails at that step,
+/// naming `skip`.
 #[test]
 fn a_quit_after_completion_fails_naming_skip() {
     let fx = Fixture::new();
@@ -581,18 +614,18 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 2\nwhat_v2_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 3\nwhat_v3_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 2 is not supported; this build reads version 1"),
+        stderr.contains("version 3 is not supported; this build reads version 2"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v2_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v3_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 1"),
+        stderr.contains("no version; this build reads version 2"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
