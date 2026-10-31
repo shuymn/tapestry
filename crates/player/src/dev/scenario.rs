@@ -1119,6 +1119,9 @@ pub struct State {
     pub shown: bool,
     /// The rounds of the current `practice` step started so far.
     pub rounds: u16,
+    /// The practice page's nearest approach to the goal its step sets,
+    /// in keys: only a page nearer than this is progress.
+    pub nearest: Option<u64>,
 }
 
 /// Runs the scenario of `args`: song selection, headless, on its steps.

@@ -572,7 +572,21 @@ fn drive_practice(
                 );
                 return fail(script, why);
             }
-            if sc.shown {
+            // The page moves in 1 % steps from the gauge's start: a goal
+            // off them is never shown.
+            if (screen.value().0 - goal.value.0) % rules::GaugeValue::PERCENT != 0 {
+                let why = format!(
+                    "gauge {} is off the page's 1 % steps from {}",
+                    crate::practice_page::percent(goal.value),
+                    crate::practice_page::percent(screen.value())
+                );
+                return fail(script, why);
+            }
+            // Only a page nearer the goal is progress: one that only moves
+            // about stalls.
+            let distance = distance(screen, &goal);
+            if sc.shown && sc.nearest.is_none_or(|n| distance < n) {
+                sc.nearest = Some(distance);
                 script.progressed();
             }
             if script.expired() {
@@ -623,6 +637,24 @@ fn drive_practice(
     }
     sc.shown = false;
     Driven::Key(key)
+}
+
+/// How many value steps the practice page is from `goal` (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn distance(screen: &PracticeScreen, goal: &crate::dev::scenario::PracticeGoal) -> u64 {
+    let steps = |a: i64, b: i64, step: i64| (a - b).unsigned_abs() / step.unsigned_abs();
+    let index = |a: usize, b: usize| a.abs_diff(b) as u64;
+    index(screen.from(), goal.from)
+        + index(screen.to(), goal.to)
+        + u64::from(
+            screen
+                .speed()
+                .twentieths()
+                .abs_diff(goal.speed.twentieths()),
+        )
+        + steps(screen.lead_in().0, goal.lead_in.0, game::LEAD_IN_STEP.0)
+        + steps(screen.value().0, goal.value.0, rules::GaugeValue::PERCENT)
+        + u64::from(screen.repeat() != goal.repeat)
 }
 
 /// The key that moves the practice page toward `goal`: out of an edit
@@ -1076,6 +1108,7 @@ impl AppRig for PlayerRig<'_> {
         sc.chart_input = Some(input);
         sc.practice = None;
         sc.rounds = 0;
+        sc.nearest = None;
         match input {
             InputRef::Auto => {
                 config.autoplay = Some(game::AutoKeySounds::Scheduled);
@@ -1621,6 +1654,7 @@ mod tests {
     fn practice_script(
         measures: usize,
         steps: Vec<crate::dev::SelectStep>,
+        preset: &rules::RulePreset,
     ) -> (crate::dev::SelectScript, crate::dev::scenario::State) {
         use std::fmt::Write as _;
         let mut text = "#BPM 240\n".to_owned();
@@ -1634,7 +1668,7 @@ mod tests {
         )
         .unwrap()
         .chart;
-        let screen = game::PracticeScreen::new(&chart, &rules::tapestry(), 0);
+        let screen = game::PracticeScreen::new(&chart, preset, 0);
         assert_eq!(screen.measures().len(), measures);
         let o = crate::dev::scenario::Origin {
             index: 1,
@@ -1657,6 +1691,7 @@ mod tests {
             practice: Some(screen),
             shown: true,
             rounds: 0,
+            nearest: None,
         };
         (script, state)
     }
@@ -1715,6 +1750,7 @@ mod tests {
         let (mut script, mut state) = practice_script(
             101,
             vec![SelectStep::PracticeSet(goal), SelectStep::PracticeStart],
+            &rules::tapestry(),
         );
         let (keys, ended) = drive(&mut script, &mut state, Duration::from_millis(250), 400);
         assert_eq!(ended, super::Driven::Wait, "{:?}", script.failure());
@@ -1738,12 +1774,13 @@ mod tests {
             to: 2,
             speed: bms_model::Speed::NORMAL,
             lead_in: TimeUs(2_000_000),
-            // Half a percent: off the page's 1 % steps.
-            value: rules::GaugeValue(rules::GaugeValue::PERCENT / 2),
+            // Past what the gauge accepts, on its 1 % steps.
+            value: rules::GaugeValue(200 * rules::GaugeValue::PERCENT),
             repeat: true,
             input: crate::dev::scenario::InputRef::Log(0),
         };
-        let (mut script, mut state) = practice_script(2, vec![SelectStep::PracticeSet(goal)]);
+        let (mut script, mut state) =
+            practice_script(2, vec![SelectStep::PracticeSet(goal)], &rules::tapestry());
         let (keys, ended) = drive(&mut script, &mut state, Duration::from_millis(250), 400);
         assert_eq!(ended, super::Driven::Wait);
         assert!(!keys.is_empty());
@@ -1756,6 +1793,33 @@ mod tests {
         );
         let failure = script.failure().unwrap();
         assert!(failure.contains("did not reach"), "{failure}");
+    }
+
+    /// A gauge goal off the page's 1 % steps from the gauge's start (20 %
+    /// from 20.5 %) is never shown: the page would only step about it,
+    /// 20.5 to 19.5 and back. The step fails, named, within a bounded time.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_gauge_goal_off_the_pages_steps_fails() {
+        use crate::dev::SelectStep;
+        let mut preset = rules::tapestry();
+        preset.gauges[0].start = rules::GaugeValue(2_050_000);
+        let goal = crate::dev::scenario::PracticeGoal {
+            from: 0,
+            to: 2,
+            speed: bms_model::Speed::NORMAL,
+            lead_in: TimeUs(2_000_000),
+            value: rules::GaugeValue(20 * rules::GaugeValue::PERCENT),
+            repeat: true,
+            input: crate::dev::scenario::InputRef::Log(0),
+        };
+        let (mut script, mut state) =
+            practice_script(2, vec![SelectStep::PracticeSet(goal)], &preset);
+        // Within twice the step's wait at four looks a second.
+        let (_, ended) = drive(&mut script, &mut state, Duration::from_millis(250), 160);
+        assert_eq!(ended, super::Driven::Failed);
+        let failure = script.failure().unwrap();
+        assert!(failure.starts_with("step 1 (practice): "), "{failure}");
     }
 
     /// Keys pressed during the play wait in the window's queue; the result

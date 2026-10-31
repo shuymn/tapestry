@@ -1337,6 +1337,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             practice: None,
             shown: false,
             rounds: 0,
+            nearest: None,
         });
     }
     // Autoplay saves nothing, but in a scenario, whose logs' plays are

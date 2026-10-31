@@ -43,7 +43,7 @@ fn seconds(us: i64) -> String {
 }
 
 /// `v` as a percentage to a hundredth.
-fn percent(v: GaugeValue) -> String {
+pub fn percent(v: GaugeValue) -> String {
     let hundredths = v.0 / (GaugeValue::PERCENT / 100);
     format!("{}.{:02}", hundredths / 100, hundredths % 100)
 }
