@@ -68,8 +68,8 @@ impl LaneState {
 }
 
 /// The texels of a frame of `[iw, ih]` that stretch 5 keeps for
-/// destination `r`, exactly: the frame's height times the destination's
-/// aspect over the frame's (`skin/StretchType.java:65-68, 143-148`).
+/// destination `r`, exactly: `r.h × iw / r.w`
+/// (`skin/StretchType.java:65-68, 143-148`).
 /// `Some(None)` when the fitted frame is no taller than the destination,
 /// so nothing is cropped; `None` on overflow.
 fn trimmed(r: Rect, [iw, ih]: [u32; 2]) -> Option<Option<Q>> {
@@ -1041,6 +1041,10 @@ impl Cx<'_> {
             return Ok(());
         };
         let [xl, yl, wl, hl] = c.track.keys.first().map_or([0; 4], |k| k.rect);
+        // A destination without height refuses, even with stretch 4: at
+        // zero lift the source hides it, but a lift can pass its trim gate
+        // and stretch 4 would then grow it, changing its vertical extent
+        // (below).
         if !self.over_lanes(at, xl, wl)?
             || hl <= 0
             || i64::from(yl) + i64::from(hl) != i64::from(y0)
