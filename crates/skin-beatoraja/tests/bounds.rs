@@ -118,17 +118,26 @@ fn include_depth_is_reserved_before_reading() {
 
 #[test]
 fn include_parses_are_reserved_before_reading() {
-    let items = |n: u32| {
+    // The include past the count names a missing file: refused for the
+    // count, it was never looked up.
+    let items = |n: u32, last: &str| {
         let one = r#"{"include": "p.json"}"#;
-        play(&format!(
-            r#""property": [{}]"#,
-            vec![one; n as usize].join(",")
-        ))
+        let mut all = vec![one.to_owned(); n as usize];
+        all.push(format!(r#"{{"include": "{last}"}}"#));
+        play(&format!(r#""property": [{}]"#, all.join(",")))
     };
-    let d = skin(&[("s.json", &items(MAX_INCLUDE_PARSES)), ("p.json", "[]")]);
+    let d = skin(&[
+        ("s.json", &items(MAX_INCLUDE_PARSES - 1, "p.json")),
+        ("p.json", "[]"),
+    ]);
     header(&d).unwrap();
-    write(d.path(), "s.json", items(MAX_INCLUDE_PARSES + 1).as_bytes());
+    write(
+        d.path(),
+        "s.json",
+        items(MAX_INCLUDE_PARSES, "missing.json").as_bytes(),
+    );
     assert_eq!(limit(header(&d)), InputLimit::IncludeParses);
+    let items = |n: u32| items(n - 1, "p.json");
     // Each resolution counts again from the entry file.
     let d = skin(&[("s.json", &items(MAX_INCLUDE_PARSES)), ("p.json", "[]")]);
     let (mut def, _) = skin_beatoraja::read_header(d.path(), "s.json").unwrap();
