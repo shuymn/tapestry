@@ -823,12 +823,21 @@ Budgets are set for each of decoded audio (about 115 MB per 10 minutes at 2 chan
 
 A skin's atlas holds at most 128 Mi level-0 texels across its texture array, reserved layers included (512 MiB RGBA8, about 683 MiB with mips), checked before its pages are allocated. While it is built, one file is decoded at a time beside the pages, within 96 MiB: a file has at most 32 MiB encoded and 8 Mi texels, and the larger of a JPEG decoder's copy of the encoded bytes beside ours (2 × 32 MiB), the encoded bytes beside the native image (32 MiB + 8 B × 8 Mi, 16-bit RGBA being the widest), and the native image beside its RGBA8 copy (12 B × 8 Mi) is 96 MiB. A variant's files hold at most 512 MiB encoded and 128 Mi texels in all.
 
-Reading a JSON skin definition's header is bounded by the caps ("Threat Model") in two phases, a vector counted at twice its length for growth unless stated:
+Reading a JSON skin definition's header peaks at 220 086 272 bytes (about 210 MiB). Each term is retained capacity under the caps ("Threat Model"), a vector at twice its length for growth:
 
-- **Resolving** (`resolve`, 180 682 752 bytes, about 172 MiB): the input kept for the import (32 MiB); its one flat node arena, 2 Mi nodes of 28 bytes, counted twice for the old and new buffers while it grows (112 MiB); the resolved record ids, 2 Mi `u32` across the three lists, plus an old buffer while one grows (24 MiB); the table of files read, at most 1 025 with two 1 024-byte names each (2.25 MiB); the canonical identities of the include chain, the skin folder and the entry file, at most 19 paths of up to 32 767 UTF-16 units (3 bytes each) and a 1 024-byte name (2 MiB); and one decoded string (64 KiB).
-- **The header** (`Resolved::header`, 150 896 640 bytes, about 144 MiB): the input (32 MiB), the arena at its final size (56 MiB), the record ids (16 MiB), the file table (2.25 MiB) and the folder's and entry file's identities (256 KiB); the header's decoded strings (32 MiB) and its records, each list's count checked before each record (1 024 options, 16 384 option items, 1 024 file choices, 1 024 offsets: 1 474 560 bytes); and the folder entries one import enumerates, 4 096 of 32 bytes with a name of at most 765 bytes, one listing at a time, the matching names moved into the header (4 MiB).
+| Term | Resolving (`resolve`) | Header (`Resolved::header`) |
+| --- | --- | --- |
+| Input kept for the import | 32 MiB | 32 MiB |
+| Node arena, 2 Mi × 28 B | 112 MiB (old and new buffers while growing) | 56 MiB |
+| Resolved record ids, 2 Mi `u32` | 24 MiB (with an old buffer) | 16 MiB |
+| Files read, 1 025 with two 1 024 B names | 2.25 MiB | 2.25 MiB |
+| Canonical identities, ≤ 19 paths of ≤ 96 KiB | 2 MiB | 256 KiB |
+| Decoded strings | 64 KiB (one at a time) | 32 MiB |
+| Header records (1 024 options, 16 384 items, 1 024 file choices, 1 024 offsets) | | 1 474 560 B |
+| Folder entries, 4 096 of 32 B with a name of ≤ 1 020 B capacity, one listing at a time | | 4.5 MiB |
+| **Total** | **180 682 752 B** | **151 420 928 B** |
 
-A caller that keeps the header pass's result while the configured pass resolves adds that header, at most 38 359 040 bytes (its strings, records and 4 096 candidate names), for 219 041 792 bytes (about 209 MiB). No line index is kept: an error's line and column are found by rescanning its file, only when the error is built.
+The peak assumes the caller keeps the header pass's result (at most 39 403 520 bytes: its strings, records and candidates) while the configured pass resolves. An error's location is built only when the error is: its file is rescanned for the line and column.
 
 The chart's display geometry is fixed at load time and bounded by the source: an `i128` position per note head, long-note end and bar line, and a 48-byte scroll segment (an `i64` start, an `i128` anchor and slope, aligned to 16 bytes) per BPM change, STOP start and STOP end.
 
