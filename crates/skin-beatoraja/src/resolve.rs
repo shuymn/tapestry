@@ -541,6 +541,8 @@ impl Resolver<'_, '_> {
     ) -> Result<(), ImportError> {
         let mut out = Vec::new();
         self.array(id, depth, &mut out)?;
+        // The list stays live for the whole import: drop the growth slack.
+        out.shrink_to_fit();
         nested.insert(id, out);
         Ok(())
     }
