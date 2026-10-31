@@ -463,6 +463,17 @@ impl Rig for PlayerRig<'_> {
         Ok(())
     }
 
+    /// The render thread answers once it draws no loading frame any more;
+    /// a retry has no loading state to end.
+    fn end_loading(&mut self) -> Result<(), ScreenError> {
+        let loading = self.selection.as_mut().and_then(|s| s.loading.take());
+        if loading.is_some() {
+            self.render.end_loading()
+        } else {
+            Ok(())
+        }
+    }
+
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
         self.retry_from = self.pending_retry.take();
         #[cfg(feature = "dev-tools")]
@@ -471,15 +482,6 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
-        // The loading state ends before recording opens (design.md "Play
-        // Lifecycle"): the render thread answers once it draws no loading
-        // frame any more. A retry has none to end.
-        if let Some(sel) = &mut self.selection
-            && sel.loading.take().is_some()
-            && !self.render.end_loading()
-        {
-            eprintln!("render: the end of the loading state was not answered");
-        }
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
         if let Some(window) = &self.window {

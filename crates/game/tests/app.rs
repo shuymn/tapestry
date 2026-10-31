@@ -271,6 +271,12 @@ struct Headless {
     prepares: usize,
     input_fails_at: i64,
     audio_gone: bool,
+    /// The screen does not confirm the end of the loading state.
+    loading_end_fails: bool,
+    /// Each loading state the flow ended, by the chart showing it.
+    loading_ended: Vec<Option<usize>>,
+    /// Recordings opened.
+    opens: usize,
     close_in_load: bool,
     /// How long each load takes on the clock, in 1 ms waits: the quit key
     /// or a close during it cancels it, as the measurement's check does.
@@ -398,6 +404,9 @@ impl Headless {
             prepares: 0,
             input_fails_at: i64::MAX,
             audio_gone: false,
+            loading_end_fails: false,
+            loading_ended: Vec::new(),
+            opens: 0,
             close_in_load: false,
             load_ms: 0,
             in_load: None,
@@ -601,6 +610,14 @@ impl Rig for Headless {
         Ok(())
     }
 
+    fn end_loading(&mut self) -> Result<(), SurfaceLost> {
+        self.loading_ended.push(self.loading);
+        if self.loading_end_fails {
+            return Err(SurfaceLost);
+        }
+        Ok(())
+    }
+
     fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
         if self.audio_gone {
             return Err(AudioWaitError::Gone);
@@ -627,6 +644,7 @@ impl Rig for Headless {
         let start = self.sources.open_play(now, origin);
         self.script = self.play_script(origin.0, now.0);
         self.opened = true;
+        self.opens += 1;
         Ok(Opening {
             origin,
             start,
@@ -1912,6 +1930,33 @@ fn the_loading_page_through_each_event_of_a_load() {
             assert_eq!(rig.loading.is_some(), ended, "{at}");
         }
     }
+}
+
+/// The flow ends the loading state after the play's preparation and
+/// before recording opens, at every play, a retry's too (with nothing to
+/// end); a screen that does not confirm it ends the run, as a failed
+/// preparation does, and recording never opens.
+#[test]
+fn recording_opens_only_once_the_loading_state_ended() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (4_000, Act::Retry),
+        (4_000, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert_eq!(rig.loading_ended, [Some(0), None]);
+    assert_eq!(rig.opens, 2);
+
+    let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.loading_end_fails = true);
+    assert!(
+        matches!(ran, Err(LiveError::Screen(SurfaceLost))),
+        "{ran:?}"
+    );
+    assert_eq!(rig.loading_ended, [Some(0)]);
+    assert_eq!(rig.opens, 0);
+    assert_eq!(rig.starts, 0);
 }
 
 /// A refused load leaves its loading state for where the chart was chosen,

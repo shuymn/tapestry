@@ -515,12 +515,22 @@ impl RenderLink {
     /// Loading ended before recording opens: [`clear_loading`](Self::clear_loading),
     /// then waits, at most [`LOAD_TIMEOUT`], until the render thread has
     /// answered that it draws no loading frame any more, so none is drawn
-    /// after recording opens. Whether it answered.
-    pub fn end_loading(&self) -> bool {
+    /// after recording opens.
+    ///
+    /// # Errors
+    ///
+    /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`], and
+    /// [`ScreenError::Ended`] when the render thread is gone: recording
+    /// must not open.
+    pub fn end_loading(&self) -> Result<(), ScreenError> {
         self.clear_loading();
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::EndLoading(reply));
-        rx.recv_timeout(self.answer_timeout).is_ok()
+        match rx.recv_timeout(self.answer_timeout) {
+            Ok(()) => Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
+        }
     }
 
     /// The answer to a preparation or a load, waited for at most
@@ -1642,13 +1652,55 @@ mod tests {
                 hold.store(false, Ordering::Release);
             })
         };
-        assert!(link.end_loading());
+        link.end_loading().unwrap();
         let answered = loading();
         release.join().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         link.exit();
         assert_eq!(answered, before, "a loading frame before the answer");
         assert_eq!(loading(), before, "a loading frame after the answer");
+    }
+
+    /// The end of loading is refused, so recording does not open, when the
+    /// render thread stalls in a loading frame past the answer's bound, and
+    /// when it is gone.
+    #[test]
+    fn an_unconfirmed_end_of_loading_is_an_error() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stall = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(AtomicBool::new(false));
+        let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(StalledMenus {
+                stall: Arc::clone(&held),
+                stalled: Arc::clone(&at),
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let mut link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.set_timeouts(Duration::from_millis(200), Duration::from_secs(5));
+        link.loading().show(one_line("L"));
+        assert!(wait_until(|| !seen.lock().unwrap().is_empty()));
+        stall.store(true, Ordering::Release);
+        assert!(wait_until(|| stalled.load(Ordering::Acquire)));
+        assert!(matches!(link.end_loading(), Err(ScreenError::NoAnswer)));
+        stall.store(false, Ordering::Release);
+        // The thread ends; nothing answers any more.
+        link.send(RenderMsg::Exit);
+        assert!(wait_until(
+            || link.ended.try_recv() == Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(link.end_loading(), Err(ScreenError::Ended)));
     }
 
     /// A load cancelled while the render thread stalls with its signal
