@@ -101,9 +101,9 @@ impl Sheet {
             paths.push(p);
         }
         for (font, p) in paths.iter().enumerate() {
-            let (file, _) = path::open(p).map_err(|e| FontError::path(font, e))?;
+            let (mut file, _) = path::open(p).map_err(|e| FontError::path(font, e))?;
             let mut magic = [0_u8; 4];
-            match file.take(4).read_exact(&mut magic) {
+            match file.read_exact(&mut magic) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     return Err(FontError::Unsupported { font });
