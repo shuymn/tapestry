@@ -174,6 +174,30 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
         );
         assert_eq!(critical(l).0, CriticalPart::Cover, "{d}");
     }
+    // Frames selected by an expression: an image group and image sets.
+    let selectors = r#""imageset": [{"id": "byref", "images": ["cover"], "ref": 1},
+                                    {"id": "byvalue", "images": ["cover"], "value": 71}]"#;
+    let group = r#"{"id": "group", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2}"#;
+    for (id, field) in [("byref", "ref"), ("byvalue", "value"), ("group", "len")] {
+        let over = cover("").replace(r#""id": "cover""#, &format!(r#""id": "{id}""#));
+        let off = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#)
+            .replace(r#""id": "deco""#, &format!(r#""id": "{id}""#));
+        let objects = format!("{}, {selectors}", note(""));
+        let l = load(&body(group, &objects, &[NOTES, &over]));
+        assert_eq!(
+            critical(l),
+            (CriticalPart::Cover, NoteKind::UnsupportedField { field }),
+            "{id}"
+        );
+        let l = load(&body(group, &objects, &[NOTES, &off]));
+        assert!(
+            l.report()
+                .notes
+                .iter()
+                .any(|n| n.severity == Severity::Dropped && n.kind == NoteKind::RuntimeOffset(4)),
+            "{id}"
+        );
+    }
     // A number listing offset 4.
     let number = r#""value": [{"id": "num", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3, "ref": 71}]"#;
     let num = r#"{"id": "num", "offset": 4, "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;

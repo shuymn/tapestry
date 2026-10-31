@@ -744,6 +744,43 @@ impl Cx<'_> {
         Ok(hull.is_none_or(|(lo, hi)| hi <= Q::int(s0) || lo >= Q::int(s1)))
     }
 
+    /// Charges an image listing offset 4 its keys as written, once before
+    /// either reading, and drops it as decorative when it cannot move
+    /// over the lanes: `true` when dropped.
+    fn offset4_dropped(&mut self, dst: &Dst) -> Result<bool, ImportError> {
+        let at = dst.span;
+        self.budget
+            .keys(dst.keys.len())
+            .map_err(|l| self.limit(at, l))?;
+        if !self.decorative_offset4(dst)? {
+            return Ok(false);
+        }
+        self.drop_el(
+            Role::Decorative,
+            at,
+            NoteKind::RuntimeOffset(OFFSET_LANECOVER),
+        )?;
+        Ok(true)
+    }
+
+    /// An image listing offset 4 that selects its frames by `field`, an
+    /// expression the mapping does not run: decorative and dropped when
+    /// it cannot move over the lanes, refused otherwise.
+    pub(super) fn lane_cover_selector(
+        &mut self,
+        dst: Dst,
+        field: &'static str,
+    ) -> Result<(), ImportError> {
+        if self.offset4_dropped(&dst)? {
+            return Ok(());
+        }
+        Err(ImportError::Critical {
+            at: self.loc(dst.span),
+            part: CriticalPart::Cover,
+            why: NoteKind::UnsupportedField { field },
+        })
+    }
+
     /// An image listing offset 4: decorative and dropped when it cannot
     /// move over the lanes, else SUDDEN+ when it is the first exact match,
     /// else refused.
@@ -752,19 +789,9 @@ impl Cx<'_> {
         dst: Dst,
         rec: u32,
         s: &SrcImage,
-        group: bool,
     ) -> Result<(), ImportError> {
         let at = dst.span;
-        // The keys as written, charged once before either reading.
-        self.budget
-            .keys(dst.keys.len())
-            .map_err(|l| self.limit(at, l))?;
-        if self.decorative_offset4(&dst)? {
-            self.drop_el(
-                Role::Decorative,
-                at,
-                NoteKind::RuntimeOffset(OFFSET_LANECOVER),
-            )?;
+        if self.offset4_dropped(&dst)? {
             return Ok(());
         }
         let part = CriticalPart::Cover;
@@ -775,9 +802,6 @@ impl Cx<'_> {
                 why: NoteKind::UnsupportedField { field },
             })
         };
-        if group {
-            return refuse(self, "len");
-        }
         let Some(l) = self.lanes.as_ref() else {
             return refuse(self, "offset");
         };

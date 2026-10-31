@@ -253,7 +253,10 @@ impl Cx<'_> {
         // (`JsonSkinObjectLoader.java:76-84`).
         let group = set.is_none() && self.int_or(len, "len", 0)? > 1;
         if dst.offsets.contains(&super::OFFSET_LANECOVER) {
-            return self.lane_cover_image(dst, rec, &s, group);
+            if group {
+                return self.lane_cover_selector(dst, "len");
+            }
+            return self.lane_cover_image(dst, rec, &s);
         }
         if group {
             self.drop_el(
@@ -307,8 +310,13 @@ impl Cx<'_> {
     pub(super) fn image_set(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let [r, value, images] = self.def.fields(rec, ["ref", "value", "images"]);
-        let selected = self.int_or(r, "ref", 0)? != 0 || self.prop(value, "value")? != Prop::Null;
-        if selected {
+        let by_ref = self.int_or(r, "ref", 0)? != 0;
+        let by_value = self.prop(value, "value")? != Prop::Null;
+        // Listing offset 4, it is classified before the selector drops it.
+        if (by_ref || by_value) && dst.offsets.contains(&super::OFFSET_LANECOVER) {
+            return self.lane_cover_selector(dst, if by_ref { "ref" } else { "value" });
+        }
+        if by_ref || by_value {
             let why = NoteKind::UnsupportedProperty {
                 kind: PropertyKind::Integer,
                 id: None,
