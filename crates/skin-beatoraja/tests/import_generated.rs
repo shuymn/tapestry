@@ -58,7 +58,6 @@ fn destination() -> impl Strategy<Value = String> {
 
 /// The play objects: lanes, LIFT, HIDDEN+, a judge and a gauge.
 fn play_objects() -> String {
-    let eight = |id: &str| format!("[{}]", vec![format!("\"{id}\""); 8].join(", "));
     let mut rects: Vec<String> = (0..7)
         .map(|i| format!(r#"{{"x": {}, "y": 140, "w": 30, "h": 400}}"#, 100 + 30 * i))
         .collect();
@@ -77,7 +76,7 @@ fn play_objects() -> String {
         "hcndamage",
         "hcnreactive",
     ]
-    .map(|f| format!(r#""{f}": {}"#, eight("img")))
+    .map(|f| format!(r#""{f}": {}"#, common::lanes::eight("img")))
     .join(", ");
     format!(
         r#""note": {{"id": "notes", {lists}, "dst": [{}],

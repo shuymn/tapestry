@@ -310,10 +310,6 @@ fn f5(root: &Path) {
     images.push(cell("g", 50, 8, 8));
     images.extend((0..36).map(|n| cell(&format!("n{n}"), 51 + n, 8, 8)));
     let list = |k: usize| join((0..8).map(|u| format!("\"p{u}_{k}\"")));
-    let mut rects: Vec<String> = (0..7)
-        .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))
-        .collect();
-    rects.push(r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#.to_owned());
     let note = format!(
         r#"{{"id": "notes", "note": [{}], "lnstart": [{}], "lnend": [{}], "lnbody": [{}],
             "lnactive": [{}], "mine": [{}], "hcnstart": [{}], "hcnend": [{}], "hcnbody": [{}],
@@ -331,7 +327,7 @@ fn f5(root: &Path) {
         list(4),
         list(3),
         list(4),
-        rects.join(", ")
+        common::lanes::lane_rects(200, 600)
     );
     let judges = join((0..JUDGES).map(|i| {
         let keys = if i < ELEVEN_KEYS { 11 } else { 10 };

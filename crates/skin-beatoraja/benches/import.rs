@@ -52,11 +52,7 @@ fn typical(root: &Path) {
         .iter()
         .map(|f| format!(r#""{f}": [{eight}]"#)),
     );
-    let lanes = join(
-        (0..7)
-            .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))
-            .chain([r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#.to_owned()]),
-    );
+    let lanes = common::lanes::lane_rects(200, 600);
     let nodes = join((0..36).map(|_| r#""gd""#.to_owned()));
     let play = format!(
         r#""note": {{"id": "notes", {lists}, "dst": [{lanes}]}},

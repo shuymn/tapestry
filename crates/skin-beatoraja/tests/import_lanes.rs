@@ -7,7 +7,7 @@ mod common;
 use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
 use common::lanes::{NOTES, body, cover, eight, lane_rects, lift_object, note, note_with};
 use common::play::{Drawn, MS, judged, round};
-use common::{Loaded, has, import_config, import_sized};
+use common::{Loaded, has, import_body, import_config, import_sized};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::Judgment;
 use skin_beatoraja::{
@@ -16,22 +16,17 @@ use skin_beatoraja::{
 };
 use skin_model::{LanesError, LoadError, Side};
 
-/// Imports a 1920×1080 skin of `body`.
-fn load(body: &str) -> Loaded {
-    import_sized([1_920, 1_080], body, &[])
-}
-
 /// The lanes skin with `note_extra` note fields and `dsts` after the
 /// note destination.
 fn lanes(note_extra: &str, dsts: &[&str]) -> Loaded {
     let mut all = vec![NOTES];
     all.extend_from_slice(dsts);
-    load(&body("", &note(note_extra), &all))
+    import_body(&body("", &note(note_extra), &all))
 }
 
 /// The lanes skin whose note destination is `notes`.
 fn lanes_dst(notes: &str) -> Loaded {
-    load(&body("", &note(""), &[notes]))
+    import_body(&body("", &note(""), &[notes]))
 }
 
 /// A chart of taps, each a model lane and a time in ms.
@@ -152,7 +147,7 @@ fn lanes_map_source_seven_to_the_scratch() {
     assert_eq!(l.ok().scratch, Some(Side::Left));
     // The scratch right of the keys.
     let right = rects_with(7, r#"{"x": 450, "y": 200, "w": 80, "h": 600}"#);
-    let l = load(&body("", &note_with(&right, ""), &[NOTES]));
+    let l = import_body(&body("", &note_with(&right, ""), &[NOTES]));
     assert_eq!(l.ok().scratch, Some(Side::Right));
     // Played with the scratch on the left, the model mirrors the lanes.
     assert_eq!(rects_over(&l, &tap(0, 1_000), 1_000), [[100, 860, 80, 20]]);
@@ -164,7 +159,7 @@ fn lanes_map_source_seven_to_the_scratch() {
         })
         .collect();
     v.push(r#"{"x": 250, "y": 200, "w": 80, "h": 600}"#.to_owned());
-    let l = load(&body("", &note_with(&v.join(", "), ""), &[NOTES]));
+    let l = import_body(&body("", &note_with(&v.join(", "), ""), &[NOTES]));
     assert_eq!(model(l), (LanesError::ScratchNotAtSide, 20));
 }
 
@@ -172,7 +167,10 @@ fn lanes_map_source_seven_to_the_scratch() {
 fn overlapping_lanes_refuse() {
     // One pixel into the first key lane.
     let wide = rects_with(7, r#"{"x": 20, "y": 200, "w": 81, "h": 600}"#);
-    refused(load(&body("", &note_with(&wide, ""), &[NOTES])), "dst");
+    refused(
+        import_body(&body("", &note_with(&wide, ""), &[NOTES])),
+        "dst",
+    );
     // Touching lanes import (the default lanes touch).
     lanes("", &[]).ok();
     // A configured width that makes each lane reach into the next.
@@ -256,7 +254,7 @@ fn note_heights_come_from_size_or_the_cell() {
     let objects = note("").replace(r#""note": ["nt""#, r#""note": ["tall""#);
     let objects = objects.replace(r#", "nt""#, r#", "tall""#);
     let tall = tall.replace(r#""id": "nt""#, r#""id": "tall""#);
-    let l = load(&body(&tall, &objects, &[NOTES]));
+    let l = import_body(&body(&tall, &objects, &[NOTES]));
     assert_eq!(rects_over(&l, &tap(1, 1_000), 1_000), [[100, 860, 50, 20]]);
     // Sizes equal after rounding pass; unequal ones refuse.
     let sizes = |s: &str| lanes(&format!(r#""size": [{s}]"#), &[]);
@@ -289,10 +287,13 @@ fn note_heights_come_from_size_or_the_cell() {
 #[test]
 fn lane_rows_must_share_their_y() {
     let off = rects_with(3, r#"{"x": 250, "y": 201, "w": 50, "h": 600}"#);
-    refused(load(&body("", &note_with(&off, ""), &[NOTES])), "dst");
+    refused(
+        import_body(&body("", &note_with(&off, ""), &[NOTES])),
+        "dst",
+    );
     // Each lane's height is unused.
     let short = rects_with(3, r#"{"x": 250, "y": 200, "w": 50, "h": 10}"#);
-    load(&body("", &note_with(&short, ""), &[NOTES])).ok();
+    import_body(&body("", &note_with(&short, ""), &[NOTES])).ok();
 }
 
 #[test]
@@ -300,11 +301,14 @@ fn the_part_lists_are_checked() {
     let all = lane_rects(200, 600);
     let seven: Vec<&str> = all.rsplitn(2, "}, ").collect();
     let seven = seven[1].to_owned() + "}";
-    refused(load(&body("", &note_with(&seven, ""), &[NOTES])), "dst");
+    refused(
+        import_body(&body("", &note_with(&seven, ""), &[NOTES])),
+        "dst",
+    );
     let with = |from: &str, to: &str| {
         let n = note("");
         assert!(n.contains(from), "{from}");
-        load(&body("", &n.replacen(from, to, 1), &[NOTES]))
+        import_body(&body("", &n.replacen(from, to, 1), &[NOTES]))
     };
     let short = format!(r#""hcnbody": {}"#, eight("lb"));
     refused(with(&short, r#""hcnbody": ["lb"]"#), "lnend");
@@ -321,7 +325,7 @@ fn the_part_lists_are_checked() {
     let empty = r#"{"id": "", "src": "a", "x": 40, "y": 0, "w": 8, "h": 20}"#;
     let with_empty = |to: &str| {
         let n = note("").replacen(&mines, to, 1);
-        load(&body(empty, &n, &[NOTES]))
+        import_body(&body(empty, &n, &[NOTES]))
     };
     with_empty(&format!(r#""mine": {}, "#, eight(""))).ok();
     refused(with_empty(""), "mine");
@@ -475,7 +479,7 @@ fn a_plain_bar_maps() {
     assert_eq!(drawn(&l, &chart).rects(1_400), [[20, 869, 430, 2]]);
     // Four frames with no cycle: frame 0 for good.
     let four = r#"{"id": "bar4", "src": "a", "x": 0, "y": 20, "w": 8, "h": 8, "divy": 4}"#;
-    let l = load(&body(
+    let l = import_body(&body(
         four,
         &note(&format!(
             r#""group": [{}]"#,
@@ -502,7 +506,7 @@ fn other_bars_drop() {
             NoteKind::Deviation(DeviationId::D9(LaneApprox::BarLine))
         ));
     };
-    dropped(load(&body(
+    dropped(import_body(&body(
         cyc,
         &note(&format!(
             r#""group": [{}]"#,
@@ -574,7 +578,7 @@ fn ids_resolve_in_the_source_order() {
         r#"{}, "hiddenCover": [{{"id": "notes", "src": "a"}}]"#,
         note("")
     );
-    let l = load(&body("", &hidden, &[NOTES]));
+    let l = import_body(&body("", &hidden, &[NOTES]));
     assert!(l.report().notes.iter().any(
         |n| n.severity == Severity::Ignored && n.kind == NoteKind::Deviation(DeviationId::D11)
     ));
@@ -584,7 +588,7 @@ fn ids_resolve_in_the_source_order() {
         r#"{}, "pmchara": [{{"id": "notes", "src": "a"}}]"#,
         note("")
     );
-    refused(load(&body("", &chara, &[NOTES])), "id");
+    refused(import_body(&body("", &chara, &[NOTES])), "id");
     // A second note destination refuses.
     refused(lanes("", &[NOTES]), "note");
 }

@@ -11,15 +11,11 @@ mod common;
 use bms_model::{ChartBuilder, Lane, TimeUs};
 use common::lanes::{NOTES, body, cover, lift, lift_object, note};
 use common::play::{Drawn, MS};
-use common::{Loaded, has, import_config, import_sized};
+use common::{Loaded, has, import_body, import_config};
 use skin_beatoraja::{
     Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
 };
 use skin_model::Blend;
-
-fn load(body: &str) -> Loaded {
-    import_sized([1_920, 1_080], body, &[])
-}
 
 /// The lanes with `objects` beside the note and `dsts` after it.
 fn with(objects: &str, dsts: &[&str]) -> Loaded {
@@ -30,7 +26,7 @@ fn with(objects: &str, dsts: &[&str]) -> Loaded {
     };
     let mut all = vec![NOTES];
     all.extend_from_slice(dsts);
-    load(&body("", &objects, &all))
+    import_body(&body("", &objects, &all))
 }
 
 /// The rects at 1,000 ms over a tap on lane 1 at `tap` ms, with the
@@ -121,13 +117,13 @@ fn offset_four_elements_off_the_lanes_stay_decorative() {
     }
     // Before the notes, the lanes' span is known ahead.
     let early = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#);
-    load(&body("", &note(""), &[&early, NOTES])).ok();
+    import_body(&body("", &note(""), &[&early, NOTES])).ok();
     // Past destinations naming nothing.
     let none = [
         r#"{"dst": [{"w": 1, "h": 1}]}"#,
         r#"{"id": "nothing", "dst": [{"w": 1, "h": 1}]}"#,
     ];
-    load(&body("", &note(""), &[none[0], none[1], &early, NOTES])).ok();
+    import_body(&body("", &note(""), &[none[0], none[1], &early, NOTES])).ok();
 }
 
 #[test]
@@ -140,7 +136,7 @@ fn an_unknown_span_keeps_offset_four_critical() {
         r#"{"id": "nothing", "dst": [{"w": 1, "h": 1}]}"#,
     ] {
         refused(
-            load(&body("", &note(""), &[none, &early, NOTES])),
+            import_body(&body("", &note(""), &[none, &early, NOTES])),
             CriticalPart::Cover,
             "offset",
         );
@@ -152,7 +148,7 @@ fn an_unknown_span_keeps_offset_four_critical() {
     let notes = common::lanes::note_with(&seven, "");
     let off = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#);
     refused(
-        load(&body("", &notes, &[&off, NOTES])),
+        import_body(&body("", &notes, &[&off, NOTES])),
         CriticalPart::Cover,
         "offset",
     );
@@ -217,13 +213,13 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
         let off = deco("", r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#)
             .replace(r#""id": "deco""#, &format!(r#""id": "{id}""#));
         let objects = format!("{}, {selectors}", note(""));
-        let l = load(&body(group, &objects, &[NOTES, &over]));
+        let l = import_body(&body(group, &objects, &[NOTES, &over]));
         assert_eq!(
             critical(l),
             (CriticalPart::Cover, NoteKind::UnsupportedField { field }),
             "{id}"
         );
-        let l = load(&body(group, &objects, &[NOTES, &off]));
+        let l = import_body(&body(group, &objects, &[NOTES, &off]));
         assert!(
             l.report()
                 .notes
@@ -277,7 +273,7 @@ fn only_an_exact_cover_maps() {
         "offset",
     );
     refused(
-        load(&body("", &note(""), &[&cover(""), NOTES])),
+        import_body(&body("", &note(""), &[&cover(""), NOTES])),
         CriticalPart::Cover,
         "offset",
     );
@@ -310,7 +306,7 @@ fn the_lanes_blend_ignores_the_outer_blend() {
             r#"{{"id": "notes", "blend": {blend}, "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}"#
         );
         let objects = format!("{}, {}", note(""), lift_object(""));
-        let l = load(&body("", &objects, &[&notes, &cover(""), &lift("")]));
+        let l = import_body(&body("", &objects, &[&notes, &cover(""), &lift("")]));
         assert!(
             has(l.report(), NoteKind::Ignored { field: "blend" }),
             "{blend}"
@@ -334,7 +330,7 @@ fn windows_compare_by_what_they_show() {
     let notes = r#"{"id": "notes", "loop": 1000, "dst": [
         {"time": 0, "x": 0, "y": 0, "w": 0, "h": 0},
         {"time": 1000, "x": 0, "y": 0, "w": 0, "h": 0}]}"#;
-    let l = load(&body("", &note(""), &[notes, &cover(r#""loop": 0"#)]));
+    let l = import_body(&body("", &note(""), &[notes, &cover(r#""loop": 0"#)]));
     assert_eq!(rects(&l, 5_000, 500, 0), [[20, 280, 430, 300]]);
 }
 
@@ -387,7 +383,7 @@ fn only_an_exact_lift_maps() {
     );
     // Before the notes.
     refused(
-        load(&body(
+        import_body(&body(
             "",
             &format!("{}, {}", note(""), lift_object("")),
             &[&lift(""), NOTES],
