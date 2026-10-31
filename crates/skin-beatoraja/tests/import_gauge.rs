@@ -183,29 +183,28 @@ fn motions_follow_the_source() {
         r#""type": 1, "range": 3, "cycle": 33"#,
         r#""type": 2, "range": 3, "cycle": 33"#,
         r#""type": 3, "cycle": 100"#,
-        // Still: range 0, also with no cycle; −2 truncates to 0.
+        // Still: range 0, also with no cycle.
         r#""type": 1, "range": 0, "cycle": 0"#,
-        r#""type": 0, "range": -1"#,
-        r#""type": 0, "range": -2"#,
-        r#""type": 1, "range": -2"#,
-        r#""type": 2, "range": -2"#,
-        // Flicker reads no range.
-        r#""type": 3, "range": -5, "cycle": 100"#,
+        r#""type": 3, "range": 0, "cycle": 0"#,
     ] {
         gauge(fields).ok();
+    }
+    // A negative range is still for every kind, as range 0.
+    for kind in 0..=3 {
+        let still = |range: i32| {
+            let mut d = gauge(&format!(r#""type": {kind}, "range": {range}, "cycle": 33"#)).drawn();
+            [0, 17, 50, 1_000].map(|ms| d.frame(ms, &[]))
+        };
+        let zero = still(0);
+        for range in [-1, -3] {
+            assert_eq!(still(range), zero, "{kind} {range}");
+        }
     }
     assert!(has(
         gauge(r#""type": 4"#).report(),
         NoteKind::Ignored { field: "type" }
     ));
-    for fields in [
-        r#""type": 0, "range": -3"#,
-        r#""type": 1, "range": -1"#,
-        r#""type": 2, "range": -3"#,
-        r#""type": 0, "range": 11"#,
-    ] {
-        refused(gauge(fields), "range");
-    }
+    refused(gauge(r#""type": 0, "range": 11"#), "range");
     for fields in [
         r#""type": 3, "cycle": 0"#,
         r#""type": 1, "range": 2, "cycle": 0"#,

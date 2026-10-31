@@ -120,7 +120,6 @@ pub enum DeviationId {
     D4,
     D5,
     D6,
-    D7,
     D8,
     /// A lane approximation (owner decision 12).
     D9(LaneApprox),
@@ -128,28 +127,24 @@ pub enum DeviationId {
     D10,
     /// HIDDEN+ is never drawn (owner decision 15).
     D11,
+    /// A bitmap font's size rounded to a whole reference pixel.
+    D12,
+    /// A distance-field bitmap font drawn with the default font.
+    D13,
 }
 
 /// How the lanes, SUDDEN+ and LIFT are drawn differently from the source
-/// (owner decision 12, items a–l).
+/// (owner decision 12, items a–k).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneApprox {
     /// a: notes and long-note bodies stop at the top of the lanes.
     TopCrop,
-    /// b: an unhit tap keeps falling below the judgment line until it is
-    /// judged a miss or leaves the lanes.
-    LateTaps,
-    /// c: a tap hit early disappears at once.
-    EarlyTaps,
-    /// d: a hit mine disappears when hit.
-    Mines,
     /// e: `dst2` is ignored.
     Dst2,
     /// f: `expansionrate` is ignored.
     Expansion,
-    /// g: a long note's end cap is drawn.
-    LnTail,
-    /// h: a long note's body runs between the caps' centres.
+    /// h: a long note within one note height of its end draws no body
+    /// (the source draws one of negative height).
     LnBody,
     /// i: the part of SUDDEN+ above the lanes is never drawn.
     CoverAbove,
@@ -159,8 +154,6 @@ pub enum LaneApprox {
     /// k: what the skin draws between the notes and SUDDEN+ or LIFT is
     /// drawn above them.
     CoverOrder,
-    /// l: the LIFT image is stretched over the covered area.
-    LiftStretch,
 }
 
 /// What a note is about.
@@ -196,6 +189,10 @@ pub enum NoteKind {
     /// A file that is missing or failed to load, or a choice with no
     /// candidate.
     MissingAsset,
+    /// A bitmap `.fnt` file refused: ignored when the source also fails to
+    /// load it, dropped when only the importer refuses it; a fallback
+    /// file is skipped.
+    BitmapFont(skin_model::FntError),
     /// A field with no effect, or a value the source does not draw.
     Ignored {
         field: &'static str,
@@ -223,6 +220,7 @@ impl fmt::Display for NoteKind {
             Self::Timer(why) => write!(f, "an unsupported timer ({why:?})"),
             Self::Deviation(d) => write!(f, "deviation {d:?}"),
             Self::MissingAsset => f.write_str("a missing or unreadable file"),
+            Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
         }
     }
@@ -276,6 +274,8 @@ pub struct Usage {
     pub file_attempts: u32,
     pub files: u32,
     pub fonts: u32,
+    pub glyphs: u32,
+    pub kernings: u32,
     pub texts: u32,
     pub widget_quads: u32,
     pub notes: u32,

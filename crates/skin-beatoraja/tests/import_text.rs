@@ -1,5 +1,5 @@
 //! Text: the effective string, the box, the fonts and the
-//! fallbacks of D5–D7.
+//! deviations D5, D6 and D13.
 
 mod common;
 
@@ -16,13 +16,14 @@ const CHART: ChartText<'static> = ChartText {
     genre: "Genre",
 };
 
-/// A skin of size `size` with fonts `f` (f.ttf) and `b` (b.fnt), and one
+/// A skin of size `size` with fonts `f` (f.ttf) and `b` (b.fnt, a
+/// distance-field font), and one
 /// text of `fields` drawn at `dst`.
 fn text(size: [u32; 2], fields: &str, dst: &str) -> Loaded {
     let [w, h] = size;
     let json = format!(
         r#"{{"type": 0, "w": {w}, "h": {h},
-            "font": [{{"id": "f", "path": "f.ttf"}}, {{"id": "b", "path": "b.fnt"}},
+            "font": [{{"id": "f", "path": "f.ttf"}}, {{"id": "b", "path": "b.fnt", "type": 1}},
                      {{"id": "m", "path": "missing.ttf"}}],
             "text": [{{"id": "t", "size": 24, {fields}}}],
             "destination": [{{"id": "t", "timer": 41, {dst}}}]}}"#
@@ -127,14 +128,16 @@ fn the_box_moves_by_its_alignment() {
 }
 
 #[test]
-fn bitmap_fonts_draw_with_the_default_font_at_their_size() {
-    // r = 3/2: the em is 24 · 3/2 = 36, the box's top kept (1080 − 1245).
+fn distance_field_fonts_draw_with_the_default_font_at_their_size() {
+    // r = 3/2: the em is 24 · 3/2 = 36, the box's top kept; no file is
+    // read.
     let l = text(
         [1_280, 720],
         r#""font": "b", "constantText": "x""#,
         r#""dst": [{"x": 10, "y": 400, "w": 100, "h": 30}]"#,
     );
-    assert!(has(l.report(), d(DeviationId::D7)));
+    assert!(has(l.report(), d(DeviationId::D13)));
+    assert_eq!(l.report().usage.fonts, 0);
     let r = requests(&l);
     assert_eq!(r[0].font, FontRef::Default);
     assert!((r[0].em_px - 36.0).abs() < 1e-3, "{}", r[0].em_px);

@@ -616,6 +616,7 @@ fn combo_up_follows_judgments_and_the_empty_poor_policy() {
         let ctx = PlayContext {
             empty_poor_breaks_combo: breaks,
             scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
             ..full(0)
         };
         let mut h = Harness::empty(&chart, &ctx);

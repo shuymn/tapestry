@@ -98,6 +98,7 @@ impl Drawn {
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
         };
         let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
@@ -144,6 +145,15 @@ impl Drawn {
         self.skin
             .attach_text(&mut self.play, TextTable::new(lines))
             .unwrap();
+    }
+
+    /// Lays out the bitmap lines for a chart titled `title`.
+    pub fn attach_bitmap(&mut self, title: &str) {
+        let chart = ChartText {
+            title,
+            ..ChartText::default()
+        };
+        self.skin.attach_bitmap_text(&mut self.play, &chart);
     }
 
     /// The quads of the frame at `ms` with `effects`.
