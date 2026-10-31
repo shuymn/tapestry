@@ -487,13 +487,24 @@ impl Scanner<'_> {
             return Ok(());
         }
         let read = std::mem::take(&mut self.read);
-        let paths = waiting(&self.conn, &read)?;
+        let paths = match waiting(&self.conn, &read) {
+            Ok(paths) => paths,
+            Err(e) => {
+                let _ = self.owner.request(&self.conn);
+                return Err(e);
+            }
+        };
         if paths.is_empty() {
             return Ok(());
         }
         self.count_bests(|r| r.running = true);
         let ended = self.retry(records, paths);
         self.count_bests(|r| r.running = false);
+        // The charts read are forgotten with the pass: a retry that failed
+        // leaves its records to a catch-up, written or held in memory.
+        if ended.is_err() {
+            let _ = self.owner.request(&self.conn);
+        }
         ended
     }
 

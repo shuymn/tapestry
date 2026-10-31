@@ -501,6 +501,40 @@ fn catch_up_from_pending_resumes() {
     assert!(!lib.bests_pending().unwrap());
 }
 
+/// From no catch-up pending, a pass indexes the chart a record waits for,
+/// and the retry fails to write: the record is left to a catch-up, which
+/// counts it.
+#[test]
+fn a_failed_retry_leaves_a_catch_up_pending() {
+    let fx = Fixture::new();
+    let record = played(0);
+    fx.save(&record, "1-1.tprl");
+    let lib = fx.open();
+    assert_eq!(fx.pass(&lib).bests.refused.chart_not_in_library, 1);
+    assert!(!lib.bests_pending().unwrap());
+    fx.chart("a.bms", CHART);
+    sql(
+        &fx.db(),
+        "CREATE TRIGGER fail BEFORE INSERT ON scores BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    );
+    let ended = lib
+        .scan(std::slice::from_ref(&fx.charts), fx.options())
+        .unwrap()
+        .finish();
+    assert!(
+        matches!(ended, Err(library::ScanError::Database(_))),
+        "{ended:?}"
+    );
+    assert!(lib.bests_pending().unwrap());
+    sql(&fx.db(), "DROP TRIGGER fail;");
+    // The chart is indexed now, so only the catch-up can count it.
+    let report = fx.pass(&lib);
+    assert_eq!(report.read, 0);
+    assert!(report.bests.catch_up);
+    assert_eq!(score_of(&lib, &record).unwrap().plays, 1);
+    assert!(!lib.bests_pending().unwrap());
+}
+
 #[test]
 fn missing_chart_is_retried_after_it_is_scanned() {
     let fx = Fixture::new();
