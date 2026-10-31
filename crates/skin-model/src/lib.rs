@@ -18,6 +18,9 @@
 //! [`Sheet::atlas`] decodes the files of one [`Variant`] (1x or @2x) into
 //! texture-array [`Page`]s with box-filtered mips and a [`UvTable`] that
 //! finds each frame in them.
+//! A [`Root`] gives a skin definition's reader the same confinement:
+//! bounded reads of regular files and bounded folder listings, by names
+//! that may step up with `..` but never above the folder.
 //!
 //! A [`Skin`] holds elements in draw order, each an image, a number, a
 //! gauge, a judgment display, a line of text or the lanes widget on a
@@ -73,6 +76,7 @@ pub use expr::{
     compile,
 };
 pub use image::font::{FontDef, FontError, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
+pub use image::path::{Entry, FileId, Listing, Root, RootError};
 pub use image::{
     CycleDef, FileAt, FileDef, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
     MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE, MAX_SKIN_FRAMES,
