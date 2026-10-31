@@ -294,6 +294,29 @@ impl Selection {
     }
 }
 
+/// What the select screen shows of the shelf: the chosen preset's name, and
+/// the error to show, if any, as the screen draws it (by file name) and
+/// with its full chain for the console and the log. The error is the
+/// chosen file's, else that of a folder that cannot be listed, which a
+/// chosen built-in shows too; a shelf that cannot open shows why.
+fn shelf_shown(
+    shelf: Result<&game::Shelf, &game::ShelfError>,
+) -> (String, Option<(String, String)>) {
+    match shelf {
+        Ok(shelf) => (
+            shelf.chosen_name().to_owned(),
+            shelf
+                .chosen_error()
+                .or(shelf.listing_error())
+                .map(|e| (preset_error_text(e), Chain(e).to_string())),
+        ),
+        Err(e) => (
+            "-".to_owned(),
+            Some((shelf_error_text(e), Chain(e).to_string())),
+        ),
+    }
+}
+
 /// Runs the scripted step due on a result: `back` and `retry` as their
 /// keys, `next` and `prev` as the right and left arrows on the window's
 /// queue `menu`.
@@ -534,26 +557,13 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn presets_changed(&mut self, shelf: Result<&game::Shelf, &game::ShelfError>) {
-        let say = |e: &(dyn std::error::Error + 'static)| {
-            let line = format!("presets: {}", Chain(e));
+        let (name, error) = shelf_shown(shelf);
+        let error = error.map(|(shown, chain)| {
+            let line = format!("presets: {chain}");
             eprintln!("{line}");
             log::warn!("{line}");
-        };
-        // The chosen file's error, else a folder that cannot be listed,
-        // which a chosen built-in shows too.
-        let (name, error) = match shelf {
-            Ok(shelf) => (
-                shelf.chosen_name().to_owned(),
-                shelf.chosen_error().or(shelf.listing_error()).map(|e| {
-                    say(e);
-                    preset_error_text(e)
-                }),
-            ),
-            Err(e) => {
-                say(e);
-                ("-".to_owned(), Some(shelf_error_text(e)))
-            }
-        };
+            shown
+        });
         if let Some(sel) = &mut self.selection {
             sel.presets(name, error, shelf.is_ok());
             sel.show(&self.render, None);
@@ -772,6 +782,66 @@ mod tests {
         assert_eq!(notice(&sel), "a.bms: no adapter reads it");
         sel.screen.set_notice(None);
         assert_eq!(notice(&sel), "presets: denied");
+    }
+
+    /// The select screen shows the chosen file's error, else the folder's
+    /// that cannot be listed, with a built-in chosen too; each goes once the
+    /// shelf recovers; a shelf that cannot open shows why.
+    #[test]
+    fn the_select_screen_picks_the_file_error_else_the_listing_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let presets = dir.path().join("presets");
+        std::fs::create_dir_all(&presets).unwrap();
+        let mine = presets.join("mine.toml");
+        let write = |text: &str| {
+            std::fs::write(&mine, text).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&mine)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+                .unwrap();
+        };
+        let shown = |shelf: &game::Shelf| {
+            let (name, error) = super::shelf_shown(Ok(shelf));
+            (name, error.map(|(text, _)| text))
+        };
+        write(&game::preset_to_toml(&rules::tapestry()));
+        let mut chosen = game::Shelf::open(presets.clone(), "mine").unwrap();
+        assert_eq!(shown(&chosen), ("mine".to_owned(), None));
+        // The chosen file breaks: its error, by file name.
+        write("windows = [");
+        chosen.check();
+        let (name, error) = shown(&chosen);
+        assert_eq!(name, "mine");
+        let error = error.unwrap();
+        assert!(error.starts_with("mine.toml: "), "{error}");
+        assert!(!error.contains(&*presets.to_string_lossy()), "{error}");
+        // It recovers: nothing.
+        write(&game::preset_to_toml(&rules::tapestry()));
+        chosen.check();
+        assert_eq!(shown(&chosen), ("mine".to_owned(), None));
+        // A built-in chosen, the folder not listable: the folder's error;
+        // listable again: nothing.
+        let mut built_in = game::Shelf::open(presets.clone(), "tapestry").unwrap();
+        let kept = dir.path().join("kept");
+        std::fs::rename(&presets, &kept).unwrap();
+        std::fs::write(&presets, b"").unwrap();
+        built_in.check();
+        let (name, error) = shown(&built_in);
+        assert_eq!(name, "tapestry");
+        assert!(error.unwrap().starts_with("presets: "));
+        std::fs::remove_file(&presets).unwrap();
+        std::fs::rename(&kept, &presets).unwrap();
+        built_in.check();
+        assert_eq!(shown(&built_in), ("tapestry".to_owned(), None));
+        // A shelf that cannot open: why, with no name.
+        let refused = game::Shelf::open(presets.clone(), "nothing").unwrap_err();
+        let (name, error) = super::shelf_shown(Err(&refused));
+        assert_eq!(name, "-");
+        let (text, chain) = error.unwrap();
+        assert!(text.contains("`nothing`"), "{text}");
+        assert!(!chain.is_empty());
     }
 
     /// Consecutive edits of the search are searched once, at the end.
