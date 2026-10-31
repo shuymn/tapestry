@@ -647,7 +647,8 @@ fn a_note_offset_off_the_lanes_refuses() {
     // Below the lanes' bottom at its judgment time: refused.
     refused(with("", y(-1)), "offset");
     // On it, or raised by the offset: drawn with the lower edge raised.
-    with("", y(0)).ok();
+    let l = with("", y(0));
+    assert_eq!(rects_over(&l, &tap(1, 1_000), 1_000), [[100, 860, 50, 20]]);
     let l = with("", y(30));
     assert_eq!(rects_over(&l, &tap(1, 1_000), 1_000), [[100, 830, 50, 20]]);
     // Above the lanes' top at its judgment time (a note more than twice
@@ -655,7 +656,12 @@ fn a_note_offset_off_the_lanes_refuses() {
     // refused at 1201, drawn at 1200.
     let size = |s: &str| format!(r#""size": [{s}, {s}, {s}, {s}, {s}, {s}, {s}, {s}]"#);
     refused(with(&size("1201"), y(0)), "offset");
-    with(&size("1200"), y(0)).ok();
+    // At 1200 the note spans the lanes from their top, −320, to 880.
+    let l = with(&size("1200"), y(0));
+    assert_eq!(
+        rects_over(&l, &tap(1, 1_000), 1_000),
+        [[100, -320, 50, 1_200]]
+    );
 }
 
 #[test]
