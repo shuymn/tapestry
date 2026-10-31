@@ -33,6 +33,11 @@ pub enum FontError {
     TooManyFonts { n: usize },
     #[error("the sheet has no skin folder")]
     NoFolder,
+    /// Fonts given to a sheet holding bitmap fonts, which share the font
+    /// slots and bytes: such a sheet takes its fonts through
+    /// [`SheetBuilder::admit_font`](super::builder::SheetBuilder::admit_font).
+    #[error("the sheet holds bitmap fonts; its fonts are admitted with them")]
+    BitmapFonts,
     #[error("font {font}'s name may leave the skin folder")]
     PathRejected { font: usize },
     #[error("font {font} does not exist")]
@@ -96,7 +101,8 @@ pub(crate) fn check_magic(font: usize, p: &Path) -> Result<(), FontError> {
 impl Sheet {
     /// This sheet with `fonts`, checked against its skin folder.
     ///
-    /// Checks, in order: the count; then each font's name, its path
+    /// Checks, in order: the count; a sheet holding bitmap fonts takes
+    /// none ([`FontError::BitmapFonts`]); then each font's name, its path
     /// inside the folder, a regular file of at most [`MAX_FONT_BYTES`],
     /// and the running total of at most [`MAX_TOTAL_FONT_BYTES`]; then
     /// each file's first four bytes: `00 01 00 00`, `OTTO`, `true` or
@@ -112,6 +118,9 @@ impl Sheet {
         }
         if !fonts.is_empty() && self.root.as_os_str().is_empty() {
             return Err(FontError::NoFolder);
+        }
+        if !fonts.is_empty() && !self.fnts.is_empty() {
+            return Err(FontError::BitmapFonts);
         }
         let mut total = Total {
             sum: 0,

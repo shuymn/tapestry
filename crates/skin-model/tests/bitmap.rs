@@ -435,6 +435,29 @@ fn bitmap_text_is_laid_out_only_when_asked() {
 }
 
 #[test]
+fn a_sheet_with_bitmap_fonts_takes_no_more_fonts() {
+    let dir = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..skin_model::MAX_FONTS)
+        .map(|i| format!("f{i}.fnt"))
+        .collect();
+    for n in &names {
+        fnt(dir.path(), n, 10, [0; 4], &[A, m()], &[]);
+    }
+    fs::write(dir.path().join("o.ttf"), [0, 1, 0, 0, 0]).unwrap();
+    let chains: Vec<[&str; 1]> = names.iter().map(|n| [n.as_str()]).collect();
+    let chains: Vec<&[&str]> = chains.iter().map(|c| c.as_slice()).collect();
+    let s = sheet(dir.path(), &chains);
+    let outline = skin_model::FontDef {
+        path: "o.ttf".into(),
+    };
+    assert!(matches!(
+        s.clone().with_fonts(vec![outline]),
+        Err(skin_model::FontError::BitmapFonts)
+    ));
+    assert!(s.with_fonts(Vec::new()).is_ok());
+}
+
+#[test]
 fn bitmap_texts_fill_the_widget_quads() {
     let dir = tempfile::tempdir().unwrap();
     fnt(dir.path(), "f.fnt", 10, [0; 4], &[A, m()], &[]);
