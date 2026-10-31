@@ -477,6 +477,7 @@ struct LowDamageFile {
 #[serde(deny_unknown_fields)]
 struct GaugeFile {
     id: String,
+    lamp: u16,
     kind: GaugeKindFile,
     start: i64,
     min: i64,
@@ -654,6 +655,7 @@ impl PresetFile {
                 .into_iter()
                 .map(|g| GaugeRule {
                     id: g.id,
+                    lamp: g.lamp,
                     kind: match g.kind {
                         GaugeKindFile::EndThreshold { clear } => GaugeKind::EndThreshold {
                             clear: GaugeValue(clear),
@@ -844,6 +846,7 @@ impl From<&RulePreset> for PresetFile {
                 .iter()
                 .map(|g| GaugeFile {
                     id: g.id.clone(),
+                    lamp: g.lamp,
                     kind: match g.kind {
                         GaugeKind::EndThreshold { clear } => {
                             GaugeKindFile::EndThreshold { clear: clear.0 }

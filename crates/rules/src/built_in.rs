@@ -21,6 +21,7 @@ pub fn built_in(name: &str) -> Option<RulePreset> {
 #[cfg(test)]
 mod tests {
     use super::{BUILT_IN_PRESETS, built_in};
+    use crate::RulePreset;
 
     #[test]
     fn each_built_in_is_named_by_its_id() {
@@ -29,5 +30,36 @@ mod tests {
         }
         assert_eq!(built_in("custom"), None);
         assert_eq!(built_in("TAPESTRY"), None);
+    }
+
+    /// The (gauge id, lamp rank) pairs, easiest clear first.
+    fn by_lamp(preset: &RulePreset) -> Vec<(&str, u16)> {
+        let mut gauges: Vec<_> = preset.gauges.iter().collect();
+        gauges.sort_by_key(|g| g.lamp);
+        gauges.iter().map(|g| (g.id.as_str(), g.lamp)).collect()
+    }
+
+    #[test]
+    fn built_in_lamp_ranks() {
+        let style = [
+            ("assist_easy", 0),
+            ("easy", 1),
+            ("normal", 2),
+            ("hard", 3),
+            ("ex_hard", 4),
+            ("hazard", 5),
+        ];
+        assert_eq!(by_lamp(&crate::beatoraja_style()), style);
+        assert_eq!(by_lamp(&crate::lr2_style()), style);
+        assert_eq!(
+            by_lamp(&crate::tapestry()),
+            [("normal", 0), ("survival", 1)]
+        );
+        // The display order is unchanged: NORMAL stays first.
+        for name in BUILT_IN_PRESETS {
+            let preset = built_in(name).expect("a built-in");
+            assert_eq!(preset.gauges.first().map(|g| g.id.as_str()), Some("normal"));
+            assert_eq!(preset.validate(), Ok(()));
+        }
     }
 }

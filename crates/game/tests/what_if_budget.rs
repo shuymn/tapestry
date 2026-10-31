@@ -150,6 +150,7 @@ fn what_if_peak_stays_within_its_budget() {
         what_if.gauges = (0..gauges)
             .map(|i| rules::GaugeRule {
                 id: format!("g{i}"),
+                lamp: u16::try_from(i).unwrap(),
                 ..normal.clone()
             })
             .collect();

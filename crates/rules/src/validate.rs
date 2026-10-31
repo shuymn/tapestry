@@ -1,6 +1,6 @@
 //! Checks that a preset's values are usable.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bms_model::TimeUs;
 
@@ -15,8 +15,8 @@ impl RulePreset {
     /// class's own windows ascend and its LN-end edges do not fall, both
     /// within [`MAX_WINDOW_EDGE`](crate::MAX_WINDOW_EDGE) at every fixed
     /// scale of the window policy (`#RANK 0` to `#RANK 4` and no rank),
-    /// gauge values stay within their bounds, and every factor and scale is
-    /// usable. Only the preset's own windows must ascend: edges the scale
+    /// gauge names and lamp ranks are distinct, gauge values stay within
+    /// their bounds, and every factor and scale is usable. Only the preset's own windows must ascend: edges the scale
     /// derives may tie.
     ///
     /// # Errors
@@ -65,10 +65,18 @@ impl RulePreset {
             return Err(RuleError::NoGauges);
         }
         let mut ids = HashSet::new();
+        let mut lamps = HashMap::new();
         for gauge in &self.gauges {
             if !ids.insert(gauge.id.as_str()) {
                 return Err(RuleError::DuplicateGauge {
                     id: gauge.id.clone(),
+                });
+            }
+            if let Some(first) = lamps.insert(gauge.lamp, gauge.id.as_str()) {
+                return Err(RuleError::DuplicateLamp {
+                    rank: gauge.lamp,
+                    first: first.to_owned(),
+                    second: gauge.id.clone(),
                 });
             }
             check_gauge(gauge)?;
@@ -246,6 +254,39 @@ mod tests {
     #[test]
     fn tapestry_preset_validates() {
         assert_eq!(tapestry().validate(), Ok(()));
+    }
+
+    #[test]
+    fn lamp_ranks_must_be_distinct() {
+        let ranked = |ranks: [u16; 2]| {
+            let mut preset = tapestry();
+            for (gauge, rank) in preset.gauges.iter_mut().zip(ranks) {
+                gauge.lamp = rank;
+            }
+            preset.validate()
+        };
+        assert_eq!(
+            ranked([2, 2]),
+            Err(RuleError::DuplicateLamp {
+                rank: 2,
+                first: "normal".to_owned(),
+                second: "survival".to_owned(),
+            })
+        );
+        assert_eq!(ranked([0, 5]), Ok(()));
+        assert_eq!(ranked([5, 0]), Ok(()));
+        // A repeat further down the list names the gauge listed first.
+        let mut preset = crate::beatoraja_style();
+        let hard = preset.gauges.iter_mut().find(|g| g.id == "hard");
+        hard.expect("beatoraja-style has a hard gauge").lamp = 2;
+        assert_eq!(
+            preset.validate(),
+            Err(RuleError::DuplicateLamp {
+                rank: 2,
+                first: "normal".to_owned(),
+                second: "hard".to_owned(),
+            })
+        );
     }
 
     #[test]

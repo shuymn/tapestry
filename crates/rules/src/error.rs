@@ -70,6 +70,15 @@ pub enum RuleError {
         /// The shared name.
         id: String,
     },
+    /// Two gauges share a lamp rank.
+    DuplicateLamp {
+        /// The shared rank.
+        rank: u16,
+        /// The gauge listed first with it.
+        first: String,
+        /// The gauge listed second with it.
+        second: String,
+    },
     /// A gauge value or factor is outside its bounds.
     GaugeOutOfBounds {
         /// The gauge.
@@ -116,6 +125,11 @@ impl fmt::Display for RuleError {
             Self::OutOfRange { field } => write!(f, "{field} is out of range"),
             Self::NoGauges => f.write_str("the preset has no gauge"),
             Self::DuplicateGauge { id } => write!(f, "gauge {id:?} is defined twice"),
+            Self::DuplicateLamp {
+                rank,
+                first,
+                second,
+            } => write!(f, "gauges {first:?} and {second:?} share lamp rank {rank}"),
             Self::GaugeOutOfBounds { id, field } => {
                 write!(f, "gauge {id:?}: {field} is out of bounds")
             }

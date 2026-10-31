@@ -192,13 +192,16 @@ const fn table() -> LaneTable {
 /// The LR2-style preset.
 #[must_use]
 pub fn lr2_style() -> RulePreset {
-    // NORMAL comes first: the displayed gauge defaults to index 0.
+    // NORMAL comes first: the displayed gauge defaults to index 0. Lamp
+    // ranks, easiest first: ASSIST EASY, EASY, NORMAL, HARD, EX HARD,
+    // HAZARD (design.md "Standard Presets").
     let gauges = vec![
-        end_gauge("normal", 80, [(10, 10), (5, 10)], [400, 600, 200]),
-        end_gauge("assist_easy", 60, [(12, 10), (6, 10)], [320, 480, 160]),
-        end_gauge("easy", 80, [(12, 10), (6, 10)], [320, 480, 160]),
+        end_gauge("normal", 2, 80, [(10, 10), (5, 10)], [400, 600, 200]),
+        end_gauge("assist_easy", 0, 60, [(12, 10), (6, 10)], [320, 480, 160]),
+        end_gauge("easy", 1, 80, [(12, 10), (6, 10)], [320, 480, 160]),
         survival_gauge(
             "hard",
+            3,
             pct(2),
             [10, 10, 5, -600, -1_000, -200],
             TotalCorrection::ScaleDamage,
@@ -210,6 +213,7 @@ pub fn lr2_style() -> RulePreset {
         ),
         survival_gauge(
             "ex_hard",
+            4,
             pct(2),
             [10, 10, 5, -1_200, -2_000, -200],
             TotalCorrection::ScaleDamage,
@@ -217,6 +221,7 @@ pub fn lr2_style() -> RulePreset {
         ),
         survival_gauge(
             "hazard",
+            5,
             pct(2),
             [15, 6, 0, -10_000, -10_000, -1_000],
             TotalCorrection::None,
