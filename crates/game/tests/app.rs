@@ -25,7 +25,7 @@ use common::{MS, lane};
 use eval::{ControlId, JudgeEventKind};
 use game::{
     AbortCause, App, AppRig, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
-    DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal, Loaded,
+    DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal, Loaded, Loading,
     LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput,
     PracticeScreen, PresetStep, Refused, RenderSide, Rig, SessionConfig, SessionError,
     SessionEvent, SessionEventSink, Settings,
@@ -251,6 +251,10 @@ struct Headless {
     input_fails_at: i64,
     audio_gone: bool,
     close_in_load: bool,
+    /// The loads, by count from 0, that are cancelled.
+    cancel_loads: Vec<usize>,
+    /// How many loads came before each screen preparation.
+    prepared_for: Vec<usize>,
     // What the rig saw.
     seen: Vec<Seen>,
     entries: usize,
@@ -359,6 +363,8 @@ impl Headless {
             input_fails_at: i64::MAX,
             audio_gone: false,
             close_in_load: false,
+            cancel_loads: Vec::new(),
+            prepared_for: Vec::new(),
             seen: Vec::new(),
             entries: 0,
             violations: Vec::new(),
@@ -507,6 +513,7 @@ impl Rig for Headless {
 
     fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
         self.prepares += 1;
+        self.prepared_for.push(self.loads.len());
         if self.prepares >= self.prepare_fails_from {
             return Err(SurfaceLost);
         }
@@ -732,7 +739,7 @@ impl AppRig for Headless {
         })
     }
 
-    fn load_chart(&mut self, loaded: &Loaded) -> Result<(), BankLost> {
+    fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, BankLost> {
         self.hits = presses(loaded.chart());
         self.speeds.push(loaded.config().speed);
         let i = self.chosen.unwrap();
@@ -745,7 +752,10 @@ impl AppRig for Headless {
         self.seen.push(Seen::Load(i));
         self.loads.push((i, Vec::new()));
         self.practiced.push(loaded.practice().is_some());
-        Ok(())
+        if self.cancel_loads.contains(&(self.speeds.len() - 1)) {
+            return Ok(Loading::Cancelled);
+        }
+        Ok(Loading::Ready)
     }
 
     fn show_refusal(&mut self, refusal: &LoadRefusal<BankLost>) {
@@ -1428,6 +1438,72 @@ fn close_while_loading_ends_the_run() {
     assert_eq!(rig.seen, [Seen::Select, Seen::Load(0)]);
     assert_eq!(rig.starts, 0);
     assert!(rig.refused_opens.is_empty());
+}
+
+/// A load the rig cancels (the quit key pressed while it loads) leaves the
+/// chart before anything more is prepared: no screen preparation or play
+/// for it, the quit taken with it, back to selection, where the next
+/// chart plays.
+#[test]
+fn a_cancelled_load_leaves_before_any_preparation() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (0, Act::Quit),
+        (500, Act::Choose(1)),
+        (4_000, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.cancel_loads = vec![0]);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Load(0),
+            Seen::Select,
+            Seen::Load(1),
+            Seen::Shown(1),
+        ]
+    );
+    assert!(!rig.prepared_for.contains(&1), "{:?}", rig.prepared_for);
+    let [(0, a), (1, b)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    assert!(a.is_empty());
+    assert_eq!(attempts(b), [1]);
+}
+
+/// A practice Start whose load is cancelled returns to the practice page
+/// before anything more is prepared; the quit that cancelled it does not
+/// also leave the page, whose next Start plays.
+#[test]
+fn a_cancelled_practice_load_returns_to_the_page() {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.push((10, Act::Page(PracticeInput::Confirm)));
+    acts.push((0, Act::Quit));
+    acts.push((500, Act::Page(PracticeInput::Confirm)));
+    acts.push((14_000, Act::Close));
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.cancel_loads = vec![0]);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Practice(None),
+            Seen::Load(P),
+            Seen::Practice(None),
+            Seen::Load(P),
+        ]
+    );
+    // Prepared only for the second Start's rounds.
+    assert!(!rig.prepared_for.contains(&1), "{:?}", rig.prepared_for);
+    let [(P, cancelled), (P, played)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    assert!(cancelled.is_empty());
+    assert!(!played.is_empty());
 }
 
 /// The user preset `mine`'s file in `dir`.
