@@ -1,0 +1,112 @@
+//! Roles and the owner decisions (design.md, the S6b decision table).
+//!
+//! A role comes from what an element shows, never from its id string.
+//! A play-critical element must be reproduced exactly in value,
+//! visibility and timing, or the import is refused; anything else the
+//! importer cannot reproduce is dropped with a note. The owner's
+//! decisions, each implemented where named:
+//!
+//! 1. Geometry: exact arithmetic, each edge rounded half up; the source's
+//!    `f32`, its 0.01 px nudge and its whole-degree angles are not copied;
+//!    nothing is refused for geometry (D1, [`super::geom`]).
+//! 2. File choice: configured, then the default by name or stem ignoring
+//!    ASCII case (first sorted when ambiguous), then the first sorted
+//!    candidate; reported (D8, [`super::asset`]).
+//! 3. Bitmap `.fnt` fonts: the default font at the source's size, top
+//!    kept; reported (D7, [`super::widget::text`]).
+//! 4. The five 16:9 skin sizes ([`crate::SIZES`]).
+//! 5. Play-critical numbers: EX score and max combo, by what they show
+//!    ([`super::property::Value::critical`]).
+//! 6. A decorative element whose image or font fails: only it is dropped;
+//!    aggregate limits still refuse ([`unsupported`]).
+//! 7. Elements without a timer start at `ready`; a critical one only with
+//!    output independent of the start time (D3, [`untimed_ok`]).
+//! 8. Play-state display differences on decorative elements are accepted
+//!    (D4, [`super::ops`], [`super::property`]).
+//! 9. Text is always drawn with smooth sampling and normal blending (D5).
+//! 10. Text content and layout fallbacks: literals cut at 256 bytes,
+//!     control characters removed, overflow 2 shrinks, outline, shadow and
+//!     wrapping removed (D6, [`super::widget::text`]).
+
+use std::fmt;
+
+use skin_model::End;
+
+use super::report::{NoteKind, Notes, Severity, Span};
+use crate::error::ImportError;
+use crate::tree::Arena;
+
+/// The play-critical parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CriticalPart {
+    ExScore,
+    MaxCombo,
+    /// The note lanes (imported later).
+    Lanes,
+    /// The judgment display (imported later).
+    Judge,
+    /// The gauge (imported later).
+    Gauge,
+    /// The lane cover (imported later).
+    Cover,
+    /// The lift (imported later).
+    Lift,
+}
+
+impl fmt::Display for CriticalPart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ExScore => "EX score number",
+            Self::MaxCombo => "max combo number",
+            Self::Lanes => "note lanes",
+            Self::Judge => "judgment display",
+            Self::Gauge => "gauge",
+            Self::Cover => "lane cover",
+            Self::Lift => "lift",
+        })
+    }
+}
+
+/// An element's role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    Critical(CriticalPart),
+    Decorative,
+}
+
+/// What became of an element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// Left out, with a note.
+    Dropped,
+}
+
+/// Something `role`'s element at `at` needs that the importer cannot
+/// reproduce: a critical element refuses the import; a decorative one is
+/// dropped with a note (owner decision 6).
+pub(crate) fn unsupported(
+    arena: &Arena,
+    role: Role,
+    at: Span,
+    why: NoteKind,
+    notes: &mut Notes,
+) -> Result<Outcome, ImportError> {
+    match role {
+        Role::Critical(part) => Err(ImportError::Critical {
+            at: arena.loc_at(at.file, at.offset),
+            part,
+            why,
+        }),
+        Role::Decorative => {
+            notes.push(Some(at), Severity::Dropped, why);
+            Ok(Outcome::Dropped)
+        }
+    }
+}
+
+/// Whether an untimed critical element's output is independent of when
+/// the state started (owner decision 7, D3): every key identical, the
+/// first at 0, a perpetual end, and an image cycle absent or on a timer.
+pub(crate) fn untimed_ok(identical: bool, first_at_zero: bool, end: End, cycle_ok: bool) -> bool {
+    identical && first_at_zero && matches!(end, End::Hold | End::Loop { .. }) && cycle_ok
+}

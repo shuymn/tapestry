@@ -389,6 +389,107 @@ pub fn resolve<'d>(
     })
 }
 
+/// The top-level fields the import reads, in [`Tables::arrays`] order.
+/// Every one has an array serializer (JsonSkinSerializer.java:73-97)
+/// except `bpmgraph`, `hiddenCover`, `liftCover` and `pmchara`, which are
+/// read literally ([`LITERAL`]).
+pub(crate) const ARRAYS: [&str; 21] = [
+    "source",
+    "font",
+    "image",
+    "imageset",
+    "value",
+    "floatvalue",
+    "text",
+    "slider",
+    "graph",
+    "gaugegraph",
+    "judgegraph",
+    "bpmgraph",
+    "hiterrorvisualizer",
+    "timingvisualizer",
+    "timingdistributiongraph",
+    "hiddenCover",
+    "liftCover",
+    "judge",
+    "pmchara",
+    "customTimers",
+    "destination",
+];
+
+/// The fields of [`ARRAYS`] with no array serializer: their items are
+/// records as written, no wrapper expanded.
+const LITERAL: [&str; 4] = ["bpmgraph", "hiddenCover", "liftCover", "pmchara"];
+
+/// The top-level records the import reads (`ObjectSerializer`), in
+/// [`Tables::records`] order.
+pub(crate) const RECORDS: [&str; 4] = ["gauge", "practice", "bga", "note"];
+
+/// The definition's fields the import reads, resolved for one set of
+/// options: each array field's records, each record field's record, and
+/// each destination's `dst` keys.
+#[derive(Debug, Default)]
+pub(crate) struct Tables {
+    pub(crate) arrays: [Vec<u32>; ARRAYS.len()],
+    pub(crate) records: [Option<u32>; RECORDS.len()],
+    /// The keys of every destination, in destination order.
+    pub(crate) keys: Vec<u32>,
+    /// Per destination: its keys' end in `keys`.
+    pub(crate) key_ends: Vec<u32>,
+}
+
+impl Resolved<'_> {
+    /// Resolves the fields the import reads with the options in `enabled`,
+    /// the same ones this resolution used: the registered arrays and
+    /// records, and each destination's `dst` (an `Animation[]` with its own
+    /// array serializer). Literal arrays keep their items as written.
+    ///
+    /// # Errors
+    ///
+    /// What resolution refuses: an include that cannot be read or parsed
+    /// or forms a cycle, a field of the wrong type, an input bound.
+    pub(crate) fn tables(&mut self, enabled: &BTreeSet<i32>) -> Result<Tables, ImportError> {
+        let top = self.def.top;
+        let def = &mut *self.def;
+        let mut r = Resolver {
+            chain: vec![def.entry.clone()],
+            def,
+            enabled,
+        };
+        let mut t = Tables::default();
+        for (name, out) in ARRAYS.iter().zip(&mut t.arrays) {
+            let Some(id) = r.def.arena.last_member(top, name) else {
+                continue;
+            };
+            if LITERAL.contains(name) {
+                if r.def.arena.node(id).kind == Kind::Array {
+                    let items: Vec<u32> = r.def.arena.children(id).collect();
+                    for item in items {
+                        r.emit(item, out)?;
+                    }
+                }
+            } else {
+                r.array(id, 2, out)?;
+            }
+        }
+        for (name, out) in RECORDS.iter().zip(&mut t.records) {
+            if let Some(id) = r.def.arena.last_member(top, name) {
+                *out = r.record(id, 2)?;
+            }
+        }
+        let [.., destinations] = &t.arrays;
+        let destinations = destinations.clone();
+        for d in destinations {
+            if let Some(dst) = r.def.fields(d, ["dst"])[0] {
+                r.array(dst, 4, &mut t.keys)?;
+            }
+            t.key_ends
+                .push(u32::try_from(t.keys.len()).unwrap_or(u32::MAX));
+        }
+        Ok(t)
+    }
+}
+
 struct Resolver<'d, 'e> {
     def: &'d mut Definition,
     enabled: &'e BTreeSet<i32>,

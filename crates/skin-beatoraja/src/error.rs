@@ -2,7 +2,9 @@
 
 use std::fmt;
 
-use skin_model::RootError;
+use skin_model::{CompileError, ImageError, LoadError, RootError};
+
+use crate::import::{CriticalPart, ImportLimit, NoteKind};
 
 use crate::limits::{
     MAX_DEPTH, MAX_EXPANDED, MAX_FILE_BYTES, MAX_FILE_CHOICES, MAX_INCLUDE_DEPTH,
@@ -155,7 +157,8 @@ pub enum ImportError {
         expected: &'static str,
     },
     /// An integer field outside `i32` (an intentional policy: the source
-    /// wraps or saturates).
+    /// wraps or saturates), or imported geometry outside what the skin
+    /// model represents.
     Range {
         at: Loc,
         field: &'static str,
@@ -169,6 +172,35 @@ pub enum ImportError {
         at: Option<Loc>,
         w: i32,
         h: i32,
+    },
+    /// An importer budget or an aggregate asset limit was reached; `at` is
+    /// the element that reached it, when one did.
+    Limit {
+        at: Option<Loc>,
+        limit: ImportLimit,
+    },
+    /// A play-critical element, or a part not imported yet, that the
+    /// importer cannot reproduce: `why` is what it met.
+    Critical {
+        at: Loc,
+        part: CriticalPart,
+        why: NoteKind,
+    },
+    /// An expression the importer built did not compile.
+    Expr {
+        at: Loc,
+        source: CompileError,
+    },
+    /// A play-critical element's image could not be loaded.
+    Asset {
+        at: Loc,
+        source: ImageError,
+    },
+    /// The skin model refused the imported skin; `at` is the element or
+    /// `when` timer it names, when it names one.
+    Model {
+        at: Option<Loc>,
+        source: LoadError,
     },
 }
 
@@ -211,6 +243,13 @@ impl fmt::Display for ImportError {
             Self::Resolution { at, w, h } => {
                 write!(f, "{}an unsupported skin size {w}x{h}", At(at))
             }
+            Self::Limit { at, limit } => write!(f, "{}{limit}", At(at)),
+            Self::Critical { at, part, why } => {
+                write!(f, "{at}: the {part} cannot be imported: {why}")
+            }
+            Self::Expr { at, .. } => write!(f, "{at}: an imported expression"),
+            Self::Asset { at, .. } => write!(f, "{at}: a play-critical image"),
+            Self::Model { at, .. } => write!(f, "{}the skin model refused the skin", At(at)),
         }
     }
 }
@@ -219,6 +258,9 @@ impl std::error::Error for ImportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Read { source, .. } => Some(source),
+            Self::Expr { source, .. } => Some(source),
+            Self::Asset { source, .. } => Some(source),
+            Self::Model { source, .. } => Some(source),
             _ => None,
         }
     }
