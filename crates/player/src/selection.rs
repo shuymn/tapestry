@@ -30,6 +30,13 @@ use crate::play::{PlayerRig, since};
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
 use crate::result_input::Pad;
 use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
+#[cfg(feature = "dev-tools")]
+use crate::{dev::SelectStep, dev::scenario::InputRef, input_side::Mode};
+
+/// Autoplay's input for a chart as made: the input, its queue's size and
+/// the controls it records (dev-tools).
+#[cfg(feature = "dev-tools")]
+type Feed = (input::AutoplayInput, usize, Vec<eval::ControlId>);
 use crate::shelf::{Shelf, file_name};
 use crate::window::ImeSwitch;
 
@@ -37,6 +44,10 @@ use crate::window::ImeSwitch;
 /// (dev-tools).
 #[cfg(feature = "dev-tools")]
 const PICK_BATCH: usize = crate::select::QUEUED_KEYS / 2;
+
+/// Backspaces a scripted search queues at a time (dev-tools).
+#[cfg(feature = "dev-tools")]
+const QUERY_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 
 /// The select screen's side of the rig.
 pub struct Selection {
@@ -202,10 +213,15 @@ impl Selection {
 
     /// Runs the scripted steps due on the select screen. A step that types
     /// puts its input on the window's queue, as the window does, and the
-    /// steps stop there until the queue is taken: `true` then.
+    /// steps stop there until the queue is taken: `true` then. A scenario's
+    /// captures are armed from `captures`.
     #[cfg(feature = "dev-tools")]
-    fn script(&mut self, controls: &Controls, wakes: u64) -> bool {
-        use crate::dev::SelectStep;
+    fn script(
+        &mut self,
+        controls: &Controls,
+        wakes: u64,
+        captures: Option<&crate::dev::scenario::Captures>,
+    ) -> bool {
         let listed = |screen: &SelectScreen, name: &str| {
             screen
                 .entries()
@@ -217,6 +233,7 @@ impl Selection {
         };
         let mut typed = Vec::new();
         loop {
+            script.announce();
             match script.front().cloned() {
                 None => return false,
                 Some(SelectStep::Pick(name)) => {
@@ -226,19 +243,28 @@ impl Selection {
                         }
                         return false;
                     };
-                    // Toward the chart, a batch of keys the queue holds at a
-                    // time; the step is done once the chart is selected.
-                    let cursor = self.screen.cursor();
-                    if cursor != at {
-                        let key = if at > cursor {
-                            MenuKey::Down
-                        } else {
-                            MenuKey::Up
-                        };
-                        let n = at.abs_diff(cursor).min(PICK_BATCH);
-                        for _ in 0..n {
-                            self.menu.push(MenuInput::Key(key));
-                        }
+                    if move_to(&self.screen, &self.menu, at) {
+                        return true;
+                    }
+                }
+                Some(SelectStep::PickPath(target)) => {
+                    if script.expired() {
+                        let why = format!("{} was not listed", target.path.display());
+                        script.fail(why);
+                        controls.close();
+                        return false;
+                    }
+                    // A search left from an earlier step is cleared first.
+                    if type_query(&self.screen, &self.menu, "") {
+                        return true;
+                    }
+                    let paths = self.screen.entries().iter().map(|e| e.path.as_path());
+                    let Some(at) =
+                        crate::dev::scenario::find(paths, &target, &mut script.identities)
+                    else {
+                        return false;
+                    };
+                    if move_to(&self.screen, &self.menu, at) {
                         return true;
                     }
                 }
@@ -255,6 +281,36 @@ impl Selection {
                     MenuInput::Text(text),
                     MenuInput::Key(MenuKey::Enter),
                 ]),
+                Some(SelectStep::Query(text)) => {
+                    if script.expired() {
+                        script.fail(format!("the search \"{text}\" was not typed"));
+                        controls.close();
+                        return false;
+                    }
+                    if type_query(&self.screen, &self.menu, &text) {
+                        return true;
+                    }
+                }
+                Some(SelectStep::PickSearched(text)) => {
+                    // Only a completed pass lists every chart the search
+                    // finds.
+                    let n = self.screen.entries().len();
+                    if self.shelf.passes() == 0 || n == 0 {
+                        if script.expired() {
+                            script.fail(format!("search \"{text}\" listed no chart"));
+                            controls.close();
+                        }
+                        return false;
+                    }
+                    if n > 1 {
+                        script.fail(format!("search \"{text}\" listed {n} charts; give a path"));
+                        controls.close();
+                        return false;
+                    }
+                    if move_to(&self.screen, &self.menu, 0) {
+                        return true;
+                    }
+                }
                 Some(SelectStep::Idle(ms)) => {
                     let from = *script.idle_from.get_or_insert(wakes);
                     if !script.slept(ms) {
@@ -279,6 +335,24 @@ impl Selection {
                     }
                 }
                 Some(SelectStep::Enter) => typed.push(MenuInput::Key(MenuKey::Enter)),
+                Some(SelectStep::Capture(k)) => {
+                    if let Some(c) = captures {
+                        c.arm(k);
+                    }
+                }
+                // Due here only when the chosen chart did not play.
+                Some(SelectStep::Play(_)) => {
+                    if let Some(why) = script.refusal() {
+                        let chosen = script.last_done().map_or(0, |o| o.index);
+                        let why = format!("the chart chosen at step {chosen} was refused: {why}");
+                        script.fail(why);
+                        controls.close();
+                    } else if script.expired() {
+                        script.fail("no chart was chosen".to_owned());
+                        controls.close();
+                    }
+                    return false;
+                }
                 Some(SelectStep::Close) => {
                     script.done();
                     controls.close();
@@ -307,9 +381,13 @@ impl Selection {
 
     /// Runs the scripted step due on a result.
     #[cfg(feature = "dev-tools")]
-    fn script_result(&mut self, controls: &Controls) {
+    fn script_result(
+        &mut self,
+        controls: &Controls,
+        captures: Option<&crate::dev::scenario::Captures>,
+    ) {
         if let Some(script) = &mut self.script {
-            script_result(script, controls, &self.menu);
+            script_result(script, controls, &self.menu, captures);
         }
     }
 
@@ -347,10 +425,23 @@ fn shelf_shown(
 
 /// Runs the scripted step due on a result: `back` and `retry` as their
 /// keys, `next` and `prev` as the right and left arrows on the window's
-/// queue `menu`.
+/// queue `menu`, `close` as closing the window; a scenario's captures
+/// before them are armed from `captures`.
 #[cfg(feature = "dev-tools")]
-pub fn script_result(script: &mut crate::dev::SelectScript, controls: &Controls, menu: &MenuQueue) {
-    use crate::dev::SelectStep;
+pub fn script_result(
+    script: &mut crate::dev::SelectScript,
+    controls: &Controls,
+    menu: &MenuQueue,
+    captures: Option<&crate::dev::scenario::Captures>,
+) {
+    script.announce();
+    while let Some(&SelectStep::Capture(k)) = script.front() {
+        if let Some(c) = captures {
+            c.arm(k);
+        }
+        script.done();
+        script.announce();
+    }
     match script.front() {
         Some(SelectStep::Back) => {
             script.done();
@@ -368,6 +459,11 @@ pub fn script_result(script: &mut crate::dev::SelectScript, controls: &Controls,
             script.done();
             menu.push(MenuInput::Key(MenuKey::Left));
         }
+        // Closing the window ends the run from any scene.
+        Some(SelectStep::Close) => {
+            script.done();
+            controls.close();
+        }
         Some(step) => {
             let why = format!("{step:?} on a result");
             script.fail(why);
@@ -375,6 +471,52 @@ pub fn script_result(script: &mut crate::dev::SelectScript, controls: &Controls,
         }
         None => {}
     }
+}
+
+/// Moves the cursor toward entry `at` with the arrow keys, a batch the
+/// queue holds at a time: `true` while it queued keys, `false` once the
+/// entry is selected (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn move_to(screen: &SelectScreen, menu: &MenuQueue, at: usize) -> bool {
+    let cursor = screen.cursor();
+    if cursor == at {
+        return false;
+    }
+    let key = if at > cursor {
+        MenuKey::Down
+    } else {
+        MenuKey::Up
+    };
+    for _ in 0..at.abs_diff(cursor).min(PICK_BATCH) {
+        menu.push(MenuInput::Key(key));
+    }
+    true
+}
+
+/// Types toward the search text `text` as the keyboard does, a step per
+/// call: the box's focus, then the old text erased a bounded batch of
+/// Backspaces at a time, then the new text and Enter. `true` while it
+/// queued input; `false` once the box has left focus with `text` in it
+/// (drained, so it is searched) (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn type_query(screen: &SelectScreen, menu: &MenuQueue, text: &str) -> bool {
+    if !screen.searching() {
+        if screen.query() == text {
+            return false;
+        }
+        menu.push(MenuInput::Key(MenuKey::Tab));
+        return true;
+    }
+    let left = screen.query().chars().count();
+    if left > 0 {
+        for _ in 0..left.min(QUERY_BATCH) {
+            menu.push(MenuInput::Key(MenuKey::Backspace));
+        }
+        return true;
+    }
+    menu.push(MenuInput::Text(text.to_owned()));
+    menu.push(MenuInput::Key(MenuKey::Enter));
+    true
 }
 
 /// Why a chosen chart's sounds or screen could not be readied: the chart is
@@ -412,10 +554,20 @@ impl PlayerRig<'_> {
         )]
         let mut chosen = sel.drain(&mut self.result_input.pad);
         #[cfg(feature = "dev-tools")]
-        if chosen.is_none() && sel.script(self.controls, self.input.wakes()) {
+        if chosen.is_none()
+            && sel.script(
+                self.controls,
+                self.input.wakes(),
+                self.scenario.as_ref().map(|s| &s.captures),
+            )
+        {
             chosen = sel.drain(&mut self.result_input.pad);
         }
         if let Some(path) = &chosen {
+            #[cfg(feature = "dev-tools")]
+            if let Some(script) = &mut sel.script {
+                script.chose();
+            }
             sel.shelf.pause();
             sel.chosen_at = self.clock.now();
             let name = file_name(path);
@@ -503,18 +655,162 @@ impl PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             #[cfg(feature = "dev-tools")]
             if let Some(script) = &mut self.result_script {
-                script_result(script, self.controls, &self.result_input.menu);
+                script_result(script, self.controls, &self.result_input.menu, None);
             }
             return;
         };
         sel.shelf.release();
         #[cfg(feature = "dev-tools")]
-        sel.script_result(self.controls);
+        sel.script_result(self.controls, self.scenario.as_ref().map(|s| &s.captures));
+    }
+
+    /// Before a play's screen is readied (a scenario): the `play` step due
+    /// is the one a failure from here to the play's start is named by.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn scenario_pending(&mut self) {
+        let (Some(sc), Some(script)) = (
+            &mut self.scenario,
+            self.selection.as_mut().and_then(|s| s.script.as_mut()),
+        ) else {
+            return;
+        };
+        script.announce();
+        sc.pending = matches!(script.front(), Some(SelectStep::Play(_)))
+            .then(|| script.origin())
+            .flatten();
+    }
+
+    /// A play started (a scenario): its `play` step is done, its `until`
+    /// armed and the captures armed before it bound to it. A play where no
+    /// `play` step is due fails the run.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn scenario_started(&mut self) {
+        let (Some(sc), Some(script)) = (
+            &mut self.scenario,
+            self.selection.as_mut().and_then(|s| s.script.as_mut()),
+        ) else {
+            return;
+        };
+        sc.pending = None;
+        if let Some(&SelectStep::Play(p)) = script.front() {
+            script.done();
+            sc.until = p.until;
+            sc.captures.bind(self.generation);
+        } else {
+            script.fail("a play started where this step was due".to_owned());
+            self.controls.close();
+        }
+    }
+
+    /// A play is over and its frames drawn (a scenario): an `until` it
+    /// never reached, and each capture bound to it that failed, fail the
+    /// run; each written is printed.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn scenario_over(&mut self) {
+        let (Some(sc), Some(script)) = (
+            &mut self.scenario,
+            self.selection.as_mut().and_then(|s| s.script.as_mut()),
+        ) else {
+            return;
+        };
+        let play = script.last_done();
+        let mut failed = false;
+        if sc.until.take().is_some()
+            && let Some(o) = play
+        {
+            script.fail_at(o, "the play ended before at_ms");
+            failed = true;
+        }
+        match sc.captures.settle(self.generation, self.figures.is_some()) {
+            Ok(crate::dev::scenario::Settled {
+                written,
+                failed: refused,
+            }) => {
+                for (o, path) in written {
+                    println!("dev: scenario: {o}: wrote {}", path.display());
+                }
+                for (o, why) in refused {
+                    script.fail_at(o, &why);
+                    failed = true;
+                }
+            }
+            Err(()) => {
+                if let Some(o) = play {
+                    script.fail_at(o, "the render thread did not answer");
+                }
+                failed = true;
+            }
+        }
+        if failed {
+            self.controls.close();
+        }
+    }
+
+    /// The input the loaded chart plays (a scenario): autoplay's generated
+    /// input, or its log replayed from its start at every play, each on a
+    /// source set started over, and what a log's plays record.
+    /// Returns `feed`, autoplay's input as made, when no scenario takes it.
+    #[cfg(feature = "dev-tools")]
+    fn scenario_input(&mut self, feed: Option<Feed>) -> Option<Feed> {
+        let Some(sc) = &self.scenario else {
+            return feed;
+        };
+        match (sc.chart_input, feed) {
+            (Some(InputRef::Auto), Some((input, capacity, recorded))) => {
+                let sources = input::SourceConfig {
+                    queue_capacity: capacity,
+                    ..crate::source_config()
+                };
+                self.input.switch(Mode::Autoplay(input), sources);
+                self.recorded.keyboard = recorded;
+                None
+            }
+            (Some(InputRef::Log(k)), feed) => {
+                if let Some(log) = sc.logs.get(usize::from(k)) {
+                    let script = crate::input_side::Script {
+                        log: log.clone(),
+                        current: log.clone(),
+                        sources: crate::source_config(),
+                    };
+                    self.input
+                        .switch(Mode::Script(Box::new(script)), crate::source_config());
+                }
+                self.recorded = sc.recorded.clone();
+                feed
+            }
+            (_, feed) => feed,
+        }
     }
 }
 
 impl AppRig for PlayerRig<'_> {
     type BankError = ChartLoadError;
+
+    /// A scenario's chart plays the input of its `play` step: autoplay
+    /// unsaved, or a log saved and counted.
+    #[cfg(feature = "dev-tools")]
+    fn configure(&mut self, config: &mut game::SessionConfig, parts: &mut game::Parts) {
+        let Some(sc) = &mut self.scenario else {
+            return;
+        };
+        let script = self.selection.as_ref().and_then(|s| s.script.as_ref());
+        let Some(&SelectStep::Play(p)) = script.and_then(crate::dev::SelectScript::front) else {
+            sc.chart_input = None;
+            return;
+        };
+        sc.chart_input = Some(p.input);
+        match p.input {
+            InputRef::Auto => {
+                config.autoplay = Some(game::AutoKeySounds::Scheduled);
+                parts.records = None;
+                self.autoplay = true;
+            }
+            InputRef::Log(_) => {
+                config.autoplay = None;
+                self.autoplay = false;
+            }
+        }
+    }
 
     fn choose(&mut self) -> Option<PathBuf> {
         self.look()
@@ -576,6 +872,8 @@ impl AppRig for PlayerRig<'_> {
             sel.shelf.loaded(shared, bank, name);
         }
         let ready = self.clock.now();
+        #[cfg(feature = "dev-tools")]
+        let feed = self.scenario_input(feed);
         if let Some((input, capacity, recorded)) = feed {
             self.input.feed(input, capacity);
             self.recorded.keyboard = recorded;
@@ -609,6 +907,10 @@ impl AppRig for PlayerRig<'_> {
             _ => (why, false),
         };
         if let Some(sel) = &mut self.selection {
+            #[cfg(feature = "dev-tools")]
+            if let Some(script) = &mut sel.script {
+                script.refused(Chain(&refusal.reason).to_string());
+            }
             sel.refused(&refusal.chart, format!("{name}: {shown}"), preset);
             sel.show(&self.render, None);
         }
@@ -979,5 +1281,120 @@ mod tests {
         assert_eq!(sel.entered_at, TimeUs(5));
         let lamp = preset.gauges[0].id.to_uppercase();
         assert_eq!(line(&sel), format!("    {lamp:11}     2 ☆-   A  / Z"));
+    }
+
+    /// Types `text` into the search box through the window's queue.
+    #[cfg(feature = "dev-tools")]
+    fn search(sel: &mut Selection, text: &str) {
+        for input in [
+            MenuInput::Key(MenuKey::Tab),
+            MenuInput::Text(text.to_owned()),
+            MenuInput::Key(MenuKey::Enter),
+        ] {
+            sel.menu.push(input);
+        }
+        assert!(sel.drain(&mut Pad::default()).is_none());
+        assert_eq!(sel.screen.query(), text);
+    }
+
+    /// Runs `steps` as a scenario's on the select screen, draining the
+    /// window's queue after each batch they type, until they are done or
+    /// wait; whether any key was dropped.
+    #[cfg(feature = "dev-tools")]
+    fn run_steps(sel: &mut Selection, steps: Vec<crate::dev::SelectStep>) {
+        use crate::dev::scenario::{Origin, StepKind};
+        let o = Origin {
+            index: 1,
+            kind: StepKind::Select,
+        };
+        sel.script = Some(crate::dev::SelectScript::compiled(
+            steps.into_iter().map(|s| (s, o)).collect(),
+        ));
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let begun = Instant::now();
+        while sel.script.as_ref().unwrap().front().is_some() {
+            assert!(
+                begun.elapsed() < Duration::from_secs(600),
+                "the steps never ended"
+            );
+            if sel.script(&controls, 0, None) {
+                // Each batch typed is at most half the queue's keys.
+                let mut batch = Vec::new();
+                while let Some(input) = sel.menu.pop() {
+                    batch.push(input);
+                }
+                let keys = batch
+                    .iter()
+                    .filter(|i| matches!(i, MenuInput::Key(_)))
+                    .count();
+                assert!(
+                    keys <= crate::select::QUEUED_KEYS / 2,
+                    "{keys} keys in one batch"
+                );
+                for input in batch {
+                    sel.menu.push(input);
+                }
+                assert!(sel.drain(&mut Pad::default()).is_none());
+            } else {
+                sel.shelf.poll(Instant::now());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(sel.script.as_ref().unwrap().failure(), None);
+        assert_eq!(sel.menu.dropped(), 0, "a key was dropped");
+    }
+
+    /// A scenario's search replaces the text in the box, however long, by
+    /// keys the window's queue holds, and picks the one chart it lists.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_query_replaces_the_search_text() {
+        use crate::dev::SelectStep;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        // Below the queue's keys, and past them.
+        for (n, text) in [(63, "B"), (crate::select::QUEUED_KEYS * 2 + 5, "C")] {
+            search(&mut sel, &"x".repeat(n));
+            assert_eq!(sel.screen.listed(), 0);
+            run_steps(
+                &mut sel,
+                vec![
+                    SelectStep::Query(text.to_owned()),
+                    SelectStep::PickSearched(text.to_owned()),
+                ],
+            );
+            assert_eq!(sel.screen.query(), text);
+            assert!(!sel.screen.searching());
+            assert_eq!(sel.screen.listed(), 1);
+            let chosen = sel.screen.selected().unwrap().path.clone();
+            assert_eq!(
+                chosen.file_name().unwrap(),
+                format!("{}.bms", text.to_lowercase()).as_str()
+            );
+            // Back to an empty box for the next.
+            run_steps(&mut sel, vec![SelectStep::Query(String::new())]);
+        }
+    }
+
+    /// A path chosen after a search clears the search first, so the chart
+    /// is listed and picked.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_path_pick_after_a_search_clears_it() {
+        use crate::dev::SelectStep;
+        use crate::dev::scenario::Target;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        search(&mut sel, "B");
+        let path = std::path::absolute(dir.path().join("charts").join("c.bms")).unwrap();
+        let target = Target {
+            identity: std::fs::canonicalize(&path).unwrap(),
+            path,
+        };
+        run_steps(&mut sel, vec![SelectStep::PickPath(target)]);
+        assert_eq!(sel.screen.query(), "");
+        assert_eq!(sel.screen.listed(), 3);
+        let chosen = sel.screen.selected().unwrap().path.clone();
+        assert_eq!(chosen.file_name().unwrap(), "c.bms");
     }
 }

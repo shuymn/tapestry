@@ -215,6 +215,24 @@ impl SourceSet {
         self.config.queue_capacity = capacity;
     }
 
+    /// Starts over with `config`, between plays: every device and its
+    /// queues go, as in a new set, while the focus gate (and every latch
+    /// handle taken from it), the menu and the axis mode stay. For a
+    /// session whose input changes with its chart (a development scenario
+    /// replaying a log for one chart and autoplay for the next).
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new); the set is unchanged then.
+    pub fn reset(&mut self, config: SourceConfig) -> Result<(), ConfigError> {
+        let mut fresh = Self::new(config)?;
+        std::mem::swap(&mut fresh.gate, &mut self.gate);
+        fresh.menu = self.menu.take();
+        fresh.axis_mode = self.axis_mode.take();
+        *self = fresh;
+        Ok(())
+    }
+
     /// The focus gate.
     #[must_use]
     pub const fn gate(&self) -> &FocusGate {

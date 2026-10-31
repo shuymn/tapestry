@@ -57,6 +57,13 @@ pub trait AppRig: Rig {
     fn presets_changed(&mut self, shelf: Result<&Shelf, &ShelfError>) {
         let _ = shelf;
     }
+    /// The chosen chart's session choices and parts, before it loads
+    /// (dev-tools): a development scenario chooses each chart's input. The
+    /// default keeps them.
+    #[cfg(feature = "dev-tools")]
+    fn configure(&mut self, config: &mut SessionConfig, parts: &mut Parts) {
+        let _ = (config, parts);
+    }
 }
 
 /// Why a chosen chart was refused.
@@ -268,13 +275,20 @@ impl App {
     /// [`play_chart`](Self::play_chart) on the lent `shelf`, which comes
     /// back with how the chart went.
     fn play_on<R: AppRig>(&mut self, shelf: Shelf, chart: &Path, rig: &mut R) -> (Shelf, Went<R>) {
+        #[cfg_attr(
+            not(feature = "dev-tools"),
+            expect(unused_mut, reason = "the hook changes them")
+        )]
+        let (mut config, mut parts) = (self.config.clone(), (self.parts)(&self.settings));
+        #[cfg(feature = "dev-tools")]
+        rig.configure(&mut config, &mut parts);
         // Every chart reports to the run's one sink, never the parts' own.
         let mut loaded = match Loaded::load_reporting_to(
             self.root.clone(),
             self.settings.clone(),
             chart,
-            self.config.clone(),
-            (self.parts)(&self.settings),
+            config,
+            parts,
             self.events.clone(),
             shelf,
         ) {

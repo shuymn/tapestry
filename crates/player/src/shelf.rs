@@ -146,6 +146,9 @@ pub struct Shelf {
     status: String,
     /// The loaded chart's loudness and its analysis.
     loudness: Loudness,
+    /// Passes completed (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    passes: u64,
 }
 
 impl Shelf {
@@ -190,6 +193,8 @@ impl Shelf {
             seen: 0,
             status: String::new(),
             loudness: Loudness::new(hook),
+            #[cfg(feature = "dev-tools")]
+            passes: 0,
         };
         shelf.start_pass();
         shelf
@@ -321,6 +326,10 @@ impl Shelf {
                     log::info!("{line}");
                 }
                 self.status = String::new();
+                #[cfg(feature = "dev-tools")]
+                {
+                    self.passes += 1;
+                }
             }
             Err(e) => {
                 let line = format!("library: the scan failed: {}", Chain(&e));
@@ -427,6 +436,13 @@ impl Shelf {
     /// Whether a loudness analysis is unfinished.
     pub fn analyzing(&self) -> bool {
         self.loudness.analyzing()
+    }
+
+    /// How many passes have completed (dev-tools): what a search lists is
+    /// the whole library's once one has.
+    #[cfg(feature = "dev-tools")]
+    pub const fn passes(&self) -> u64 {
+        self.passes
     }
 
     /// Whether a pause is requested and not released.
