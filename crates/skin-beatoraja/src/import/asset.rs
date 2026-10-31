@@ -205,6 +205,8 @@ impl Assets {
         }
         #[cfg(test)]
         ADMITS.with(|n| n.set(n.get() + 1));
+        #[cfg(test)]
+        super::trace(super::Event::Admit);
         let def = FileDef {
             path: key.0.clone(),
             hi: key.1.clone(),

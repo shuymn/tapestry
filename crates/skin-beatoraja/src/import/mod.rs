@@ -229,9 +229,6 @@ pub(crate) struct Cx<'d> {
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
     widgets: WidgetDefs,
-    /// Per element, the destination index it came from.
-    #[cfg(test)]
-    trace: Vec<Event>,
 }
 
 /// A witness of the order of an import's work.
@@ -241,6 +238,19 @@ pub(crate) enum Event {
     Charge,
     Compile,
     Admit,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The order of this thread's charges, compiles and admissions.
+    pub(crate) static TRACE: std::cell::RefCell<Vec<Event>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records `e` in [`TRACE`].
+#[cfg(test)]
+pub(crate) fn trace(e: Event) {
+    TRACE.with(|t| t.borrow_mut().push(e));
 }
 
 impl<'d> Cx<'d> {
@@ -282,8 +292,6 @@ impl<'d> Cx<'d> {
             elements: Vec::new(),
             element_spans: Vec::new(),
             widgets: WidgetDefs::default(),
-            #[cfg(test)]
-            trace: Vec::new(),
         };
         cx.config_notes();
         cx.custom_timers()?;
@@ -532,7 +540,7 @@ impl<'d> Cx<'d> {
         let at = self.arena_span(rec);
         self.budget.element().map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
-        self.trace.push(Event::Charge);
+        trace(Event::Charge);
         let (id, dst) = self.read_dst(index, rec)?;
         let Some(id) = id else {
             self.ignored(at, NoteKind::UndefinedObject);
@@ -839,7 +847,7 @@ impl<'d> Cx<'d> {
     /// before it is kept.
     fn compile(&mut self, src: &str, want: Ty, at: Span) -> Result<Program, ImportError> {
         #[cfg(test)]
-        self.trace.push(Event::Compile);
+        trace(Event::Compile);
         let p = compile(src, &Scope::new(&PLAY), want).map_err(|source| ImportError::Expr {
             at: self.loc(at),
             source,
@@ -856,7 +864,7 @@ impl<'d> Cx<'d> {
         {
             self.budget.when().map_err(|l| self.limit(at, l))?;
             #[cfg(test)]
-            self.trace.push(Event::Charge);
+            trace(Event::Charge);
             let src = timer::rank_source(k).unwrap_or_default();
             let p = self.compile(&src, Ty::Bool, at)?;
             let index =

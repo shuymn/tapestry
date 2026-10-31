@@ -70,7 +70,7 @@ fn an_imported_skin_draws_through_the_model() {
     assert_eq!(imported.skin.text_slots(), 2);
 
     let mut drawn = Drawn::new(imported.skin, 100);
-    drawn.attach_lines(50.0, 20.0);
+    drawn.attach_lines(1.0, 1.0);
     // Playing from 0 (no lead-in): the untimed image, each number's one
     // glyph "0", and the texts; the judge-timed image and the rank image
     // wait.

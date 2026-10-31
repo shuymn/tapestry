@@ -173,6 +173,19 @@ mod tests {
         assert_eq!(b.usage.whens as usize, MAX_WHEN_TIMERS);
     }
 
+    /// The image cap equals the element cap, so the mapping meets the
+    /// element cap first; the image cap is charged here directly.
+    #[test]
+    fn images_are_capped() {
+        let mut b = Budget::default();
+        for _ in 0..MAX_IMAGES {
+            b.image(1).unwrap();
+        }
+        assert_eq!(b.image(1), Err(ImportLimit::Images));
+        assert_eq!(b.usage.images as usize, MAX_IMAGES);
+        assert_eq!(b.usage.frames as usize, MAX_IMAGES);
+    }
+
     #[test]
     fn a_track_over_the_key_cap_is_charged_and_flagged() {
         let mut b = Budget::default();

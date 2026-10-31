@@ -108,7 +108,8 @@ impl Drawn {
         }
     }
 
-    /// Attaches one line per text slot, each an ink box `w`×`h`.
+    /// Attaches one line per text slot, each an ink box `w`×`h` ems
+    /// advancing `w`.
     pub fn attach_lines(&mut self, w: f32, h: f32) {
         let chart = ChartText {
             title: "Title",

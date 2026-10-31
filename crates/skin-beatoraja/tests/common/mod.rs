@@ -112,14 +112,96 @@ pub fn skin_with(json: &str, files: &[(&str, u32, u32)]) -> TempDir {
     d
 }
 
-/// Imports a 1920×1080 skin of `body` with one 64×64 `a.png` as source
-/// `a`.
-pub fn import_body(body: &str) -> Result<Imported, ImportError> {
-    let json = hd(&format!(
-        r#""source": [{{"id": "a", "path": "a.png"}}], {body}"#
-    ));
-    let d = skin_with(&json, &[("a.png", 64, 64)]);
-    import_dir(d.path())
+/// An import and the folder its sheet reads at atlas time.
+pub struct Loaded {
+    pub dir: TempDir,
+    pub result: Result<Imported, ImportError>,
+}
+
+impl Loaded {
+    #[track_caller]
+    pub fn ok(&self) -> &Imported {
+        match &self.result {
+            Ok(i) => i,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    #[track_caller]
+    pub fn err(self) -> ImportError {
+        match self.result {
+            Ok(i) => panic!("imported: {:?}", i.report),
+            Err(e) => e,
+        }
+    }
+
+    #[track_caller]
+    pub fn report(&self) -> &Report {
+        &self.ok().report
+    }
+
+    /// The import played over a 100-note chart, its atlas built.
+    #[track_caller]
+    pub fn drawn(self) -> play::Drawn {
+        self.drawn_over(100)
+    }
+
+    /// The import played over a chart of `notes` notes.
+    #[track_caller]
+    pub fn drawn_over(self, notes: u32) -> play::Drawn {
+        match self.result {
+            Ok(i) => play::Drawn::new(i.skin, notes),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    /// The quads at `ms` of a 100-note play.
+    #[track_caller]
+    pub fn quads(self, ms: i64) -> Vec<skin_model::Quad> {
+        self.drawn().frame(ms, &[])
+    }
+
+    /// The rounded rects at `ms` of a 100-note play.
+    #[track_caller]
+    pub fn rects(self, ms: i64) -> Vec<[i32; 4]> {
+        self.drawn().rects(ms)
+    }
+}
+
+/// Imports a 1920×1080 skin of `body` (see [`import_sized`]).
+pub fn import_body(body: &str) -> Loaded {
+    import_sized([1_920, 1_080], body, &[])
+}
+
+/// Imports a `size` skin of `body` with source `a` (a 64×64 `a.png`)
+/// and source `n` (a 120×20 `n.png`), and `files` written as PNGs.
+pub fn import_sized(size: [u32; 2], body: &str, files: &[(&str, u32, u32)]) -> Loaded {
+    import_config(size, body, files, |_| {})
+}
+
+/// [`import_sized`] with `edit` applied to the header's defaults.
+pub fn import_config(
+    size: [u32; 2],
+    body: &str,
+    files: &[(&str, u32, u32)],
+    edit: impl FnOnce(&mut Config),
+) -> Loaded {
+    let [w, h] = size;
+    let json = format!(
+        r#"{{"type": 0, "w": {w}, "h": {h},
+            "source": [{{"id": "a", "path": "a.png"}}, {{"id": "n", "path": "n.png"}}], {body}}}"#
+    );
+    let dir = skin_with(&json, &[("a.png", 64, 64), ("n.png", 120, 20)]);
+    for &(name, w, h) in files {
+        png(dir.path(), name, w, h);
+    }
+    let result = import_with(dir.path(), edit);
+    Loaded { dir, result }
+}
+
+/// Whether `r` has a note of `kind`.
+pub fn has(r: &Report, kind: NoteKind) -> bool {
+    r.notes.iter().any(|n| n.kind == kind)
 }
 
 /// The note kinds of a report.

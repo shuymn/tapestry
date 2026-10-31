@@ -94,7 +94,7 @@ impl Cx<'_> {
         let frames = grid[0] * grid[1];
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
-        self.trace.push(super::Event::Charge);
+        super::trace(super::Event::Charge);
         let Some(path) = self.source_path(s.src.as_deref())? else {
             self.drop_el(role, at, NoteKind::MissingAsset)?;
             return Ok(None);
@@ -126,8 +126,6 @@ impl Cx<'_> {
                 return Ok(None);
             }
         };
-        #[cfg(test)]
-        self.trace.push(super::Event::Admit);
         let def = skin_model::FileDef {
             path: name.clone(),
             hi: None,
