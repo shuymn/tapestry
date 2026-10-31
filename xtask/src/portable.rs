@@ -25,6 +25,7 @@ const REQUIRED_PORTABLE: &[&str] = &[
     "game",
     "library",
     "skin-model",
+    "skin-beatoraja",
     "eval-cli",
     "xtask",
 ];

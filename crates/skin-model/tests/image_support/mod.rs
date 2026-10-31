@@ -129,6 +129,25 @@ pub fn write(root: &Path, name: &str, bytes: &[u8]) {
     fs::write(root.join(name), bytes).unwrap();
 }
 
+/// A directory junction on Windows, a symbolic link elsewhere.
+pub fn link_dir(link: &Path, target: &Path) {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
 /// The texel at (`x`, `y`) of level `k` of page `page`.
 pub fn texel(atlas: &Atlas, page: usize, k: usize, x: u32, y: u32) -> [u8; 4] {
     let side = atlas.side() >> k;

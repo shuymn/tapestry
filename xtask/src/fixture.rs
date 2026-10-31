@@ -72,6 +72,10 @@ pub fn baseline() -> Vec<Crate> {
              eval = { path = \"../eval\" }\n\
              rules = { path = \"../rules\" }\n",
         ),
+        lib(
+            "skin-beatoraja",
+            "[dependencies]\nskin-model = { path = \"../skin-model\" }\n",
+        ),
         (
             "player",
             "[package.metadata.tapestry]\nwindows-only = true\n\
