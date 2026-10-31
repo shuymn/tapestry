@@ -45,13 +45,14 @@ pub const MIXER_VERSION: u32 = 1;
 /// and version, the time-to-frame mapping and the autoplay schedule
 /// (`game::schedule_iter`). A change bumps it.
 pub const ANALYSIS_VERSION: u32 = 1;
-/// The resolved dependencies that shape a measurement (the decoder, the
-/// resampler and the meter, with their features), as a SHA-256 the
-/// `analysis_dependencies_are_pinned` test computes from `Cargo.lock` and
-/// the workspace manifest. A change of any of them fails that test until
+/// The resolved crates that shape a measurement (the decoder, the
+/// resampler and the meter, not those that only derive code or log) and
+/// their dependency entries with features in the workspace manifest and
+/// `audio`'s, as a SHA-256 the `analysis_dependencies_are_pinned` test
+/// computes. A change of any of them fails that test until
 /// [`MIXER_VERSION`] or [`ANALYSIS_VERSION`] is bumped and this updated.
 pub const MEASUREMENT_DEPENDENCIES: &str =
-    "2d604af5d932c1f02cb3095b34106d77a539d3a6d058337fe10d4fd729a5aa3b";
+    "307f1b5eb7f292d6b92f57b764c27704f076852a47cc6d364d77e7b5fd3b3e82";
 
 /// The integrated loudness the normalization aims at, LUFS.
 pub const TARGET_LUFS: f64 = -18.0;
@@ -73,7 +74,7 @@ pub struct Measurement {
     /// Whether a gating block was at or above [`CEILING_LUFS`]: the
     /// integrated loudness is then taken as the ceiling.
     pub over_range: bool,
-    /// The frames mixed.
+    /// The program's frames: up to the last sample of the last voice.
     pub frames: u64,
 }
 
@@ -244,15 +245,35 @@ impl Analysis {
             // A sound the bank lacks starts nothing, as in play.
             let _ = self.mixer.trigger(&self.bank, event.sound, at);
         }
-        if self.exhausted && self.next.is_none() && self.mixer.sounding() == 0 {
-            return self.finish().map(Step::Done);
+        if self.ended() {
+            // Nothing was started: no frame to meter.
+            return self.finish(self.mixer.mixed_to()).map(Step::Done);
         }
+        let block_start = self.mixer.mixed_to();
         let mut block = std::mem::take(&mut self.block);
         self.mixer.mix_raw(&self.bank, &mut block);
-        let fed = self.feed(&block);
+        // The block in which the last voice ends is metered only up to its
+        // last sample: the silence after the program is not part of it.
+        let end = if self.ended() {
+            self.mixer
+                .last_end()
+                .clamp(block_start, block_start + BLOCK_FRAMES as u64)
+        } else {
+            block_start + BLOCK_FRAMES as u64
+        };
+        let len = usize::try_from(end - block_start).unwrap_or(BLOCK_FRAMES) * CHANNELS;
+        let fed = self.feed(block.get(..len).unwrap_or(&block));
         self.block = block;
         fed?;
+        if self.ended() {
+            return self.finish(end).map(Step::Done);
+        }
         Ok(Step::More)
+    }
+
+    /// Whether the schedule is exhausted and nothing sounds or waits.
+    fn ended(&self) -> bool {
+        self.exhausted && self.next.is_none() && self.mixer.sounding() == 0
     }
 
     /// Feeds `frames` to the meter, split where it completes a gating
@@ -277,12 +298,11 @@ impl Analysis {
         Ok(())
     }
 
-    /// The measurement: the integrated loudness of the completed gating
-    /// blocks, then the true peak once the interpolator's delay is flushed
-    /// with zeros.
-    fn finish(&mut self) -> Result<Measurement, AnalysisError> {
+    /// The measurement of the program's `frames` frames: the integrated
+    /// loudness of the completed gating blocks, then the true peak once the
+    /// interpolator's delay is flushed with zeros.
+    fn finish(&mut self, frames: u64) -> Result<Measurement, AnalysisError> {
         let integrated = Some(self.meter.loudness_global()?).filter(|l| l.is_finite());
-        let frames = self.mixer.mixed_to();
         let delay = true_peak_delay(self.bank.rate());
         let mut zeros = std::mem::take(&mut self.block);
         zeros.fill(0.0);

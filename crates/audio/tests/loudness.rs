@@ -234,17 +234,69 @@ fn analysis_version_pins_the_reference_tone() {
     assert_eq!((audio::MIXER_VERSION, audio::ANALYSIS_VERSION), (1, 1));
 }
 
-/// The resolved closure of the crates that shape a measurement (the
-/// decoder, the resampler and the meter) in `Cargo.lock`, and their
-/// manifest lines with the features, hashed: it must match the fingerprint
-/// kept beside the versions, so a dependency update that could change a
-/// measurement bumps a version first.
+/// The crates whose code computes samples or measurements: the decoder
+/// (`symphonia` and its codec, format and shared crates, with the codec
+/// algorithms and extended floats they use), the resampler (`rubato`, its
+/// buffer adapters, and the FFT and numeric crates under it), and the
+/// meter (`ebur128` and the `dasp` sample and frame crates). Crates that
+/// only move bytes, log, derive code (`syn`, `quote`, `thiserror`) or
+/// detect the compiler (`autocfg`) cannot change a sample, so their
+/// updates need no version bump. None of these crates generates numeric
+/// code at build time.
+fn shapes_measurement(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "audio-codec-algorithms",
+        "extended",
+        "rubato",
+        "realfft",
+        "rustfft",
+        "primal-check",
+        "num-complex",
+        "num-integer",
+        "num-traits",
+        "strength_reduce",
+        "transpose",
+        "ebur128",
+    ];
+    ["symphonia", "audioadapter", "dasp_"]
+        .iter()
+        .any(|p| name.starts_with(p))
+        || NAMES.contains(&name)
+}
+
+/// The dependency entry of `name` in a manifest, continuation lines
+/// included: `name = ...` or `name.workspace = ...`, with any features.
+fn dependency_entry(manifest: &str, name: &str) -> Option<String> {
+    let mut lines = manifest.lines();
+    let first = lines.find(|l| {
+        l.strip_prefix(name)
+            .is_some_and(|r| r.starts_with(" =") || r.starts_with('.'))
+    })?;
+    let mut entry = first.trim().to_owned();
+    let open = |s: &str| s.matches(['[', '{']).count() > s.matches([']', '}']).count();
+    while open(&entry) {
+        entry.push(' ');
+        entry.push_str(lines.next()?.trim());
+    }
+    Some(entry)
+}
+
+/// The resolved crates that shape a measurement ([`shapes_measurement`])
+/// in the closure of the decoder, the resampler and the meter in
+/// `Cargo.lock`, and their dependency entries with features in the
+/// workspace manifest and in `audio`'s, hashed: it must match the
+/// fingerprint kept beside the versions, so an update or a feature change
+/// that could change a measurement bumps a version first.
 #[test]
 fn analysis_dependencies_are_pinned() {
     use sha2::{Digest, Sha256};
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let member = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = member.join("../..");
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let manifests = [
+        std::fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        std::fs::read_to_string(member.join("Cargo.toml")).unwrap(),
+    ];
     // Each package: name, version, checksum and dependencies.
     struct Package {
         name: String,
@@ -299,11 +351,9 @@ fn analysis_dependencies_are_pinned() {
         assert_eq!(found.len(), 1, "{dep}");
         found[0]
     };
+    let roots = ["symphonia", "rubato", "ebur128"];
     let mut seen = vec![false; packages.len()];
-    let mut stack: Vec<usize> = ["symphonia", "rubato", "ebur128"]
-        .into_iter()
-        .map(find)
-        .collect();
+    let mut stack: Vec<usize> = roots.into_iter().map(find).collect();
     while let Some(i) = stack.pop() {
         if std::mem::replace(&mut seen[i], true) {
             continue;
@@ -311,19 +361,25 @@ fn analysis_dependencies_are_pinned() {
         stack.extend(packages[i].deps.iter().map(|d| find(d)));
     }
     let mut lines: Vec<String> = (0..packages.len())
-        .filter(|&i| seen[i])
+        .filter(|&i| seen[i] && shapes_measurement(&packages[i].name))
         .map(|i| {
             let p = &packages[i];
             format!("{} {} {}", p.name, p.version, p.checksum)
         })
         .collect();
     lines.sort();
-    for name in ["symphonia = ", "rubato = ", "ebur128 = "] {
-        let line = manifest
-            .lines()
-            .find(|l| l.starts_with(name))
-            .unwrap_or_else(|| panic!("no {name} in the workspace manifest"));
-        lines.push(line.to_owned());
+    for name in ["rustfft", "ebur128", "dasp_frame", "symphonia-core"] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(&format!("{name} "))),
+            "{name} is not in the closure"
+        );
+    }
+    for (manifest, which) in manifests.iter().zip(["workspace", "audio"]) {
+        for name in roots {
+            let entry = dependency_entry(manifest, name)
+                .unwrap_or_else(|| panic!("no {name} in the {which} manifest"));
+            lines.push(format!("{which}: {entry}"));
+        }
     }
     let hash: String = Sha256::digest(lines.join("\n"))
         .iter()
@@ -421,19 +477,20 @@ fn a_sound_ending_on_a_block_boundary_reports_its_interpolated_peak() {
     );
 }
 
-/// A steady one-second tone: the integrated loudness is that of the frames
-/// mixed, read before any padding.
+/// A steady one-second tone: the program ends at its last sample, inside
+/// the twelfth block, and the integrated loudness is that of exactly its
+/// frames, the block's silence after it not metered.
 #[test]
-fn a_steady_tone_measures_the_frames_mixed() {
+fn a_steady_tone_measures_its_own_frames() {
     const RATE: u32 = 48_000;
     let bank = Arc::new(SoundBank::from_sounds(
         RATE,
         vec![sine(RATE, 1_000.0, 8_000.0, RATE as usize)],
     ));
     let events = [event(0, 0)];
-    let (m, _) = analyze(&bank, &events);
-    // The tone ends inside the twelfth block.
-    assert_eq!(m.frames, 12 * BLOCK_FRAMES as u64);
+    let (m, steps) = analyze(&bank, &events);
+    assert_eq!(m.frames, u64::from(RATE));
+    assert_eq!(steps, 12);
     let raw = raw_mix(&bank, &events, m.frames);
     let reference = meter(RATE, Mode::I | Mode::HISTOGRAM, &raw)
         .loudness_global()
@@ -441,20 +498,38 @@ fn a_steady_tone_measures_the_frames_mixed() {
     assert_eq!(m.integrated, Some(reference));
 }
 
-/// A sound shorter than one gating block (100 ms) completes none: no
-/// integrated loudness, so the chart plays at the headroom.
+/// Programs shorter than one 400 ms gating block complete none, whatever
+/// the block size against the rate: no integrated loudness, so the chart
+/// plays at the headroom; one just longer completes one. At 8 kHz a single
+/// 4,096-frame block is 512 ms, longer than the gating block, so metering
+/// a whole block would give a loudness to every short program.
 #[test]
-fn a_short_sound_has_no_integrated_loudness() {
-    const RATE: u32 = 48_000;
-    let bank = Arc::new(SoundBank::from_sounds(
-        RATE,
-        vec![sine(RATE, 1_000.0, 20_000.0, RATE as usize / 10)],
-    ));
-    let (m, steps) = analyze(&bank, &[event(0, 0)]);
-    assert_eq!(m.integrated, None);
-    assert!(m.true_peak > 0.5);
-    assert_eq!(normalization_gain(&m), HEADROOM);
-    assert_eq!(steps, 3);
+fn a_program_shorter_than_a_gating_block_has_no_integrated_loudness() {
+    // Frames: 100, 390 and 410 ms, and a sound ending exactly on a block's
+    // end (five blocks at 48 kHz, one at 8 kHz).
+    for (rate, n, gated) in [
+        (48_000, 4_800, false),
+        (48_000, 18_720, false),
+        (48_000, 19_680, true),
+        (48_000, 5 * BLOCK_FRAMES, true),
+        (8_000, 800, false),
+        (8_000, 3_120, false),
+        (8_000, 3_280, true),
+        (8_000, BLOCK_FRAMES, true),
+    ] {
+        let ms = n * 1_000 / rate as usize;
+        let bank = Arc::new(SoundBank::from_sounds(
+            rate,
+            vec![sine(rate, 440.0, 20_000.0, n)],
+        ));
+        let (m, _) = analyze(&bank, &[event(0, 0)]);
+        assert_eq!(m.frames, n as u64, "{rate} {ms}");
+        assert_eq!(m.integrated.is_some(), gated, "{rate} {ms}: {m:?}");
+        assert!(m.true_peak > 0.5, "{rate} {ms}");
+        if !gated {
+            assert_eq!(normalization_gain(&m), HEADROOM, "{rate} {ms}");
+        }
+    }
 }
 
 /// A bank with no sound stored is done at once, metering nothing however

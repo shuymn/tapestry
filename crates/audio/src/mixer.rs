@@ -347,6 +347,9 @@ pub struct Mixer {
     saturated: u64,
     counts: Counts,
     dropped_starts: u64,
+    /// The frame after the last sample (fade included) of every voice that
+    /// has played to its end.
+    last_end: i64,
     /// A ring-out's envelope, until everything stops.
     envelope: Option<Envelope>,
 }
@@ -376,6 +379,7 @@ impl Mixer {
             saturated: 0,
             counts: Counts::default(),
             dropped_starts: 0,
+            last_end: 0,
             envelope: None,
         }
     }
@@ -421,6 +425,14 @@ impl Mixer {
     #[must_use]
     pub fn hard_cuts(&self) -> u64 {
         self.counts.hard_cuts
+    }
+
+    /// The output frame after the last sample, fade included, of every
+    /// voice that has played to its end: where the sum fell silent once
+    /// nothing sounds.
+    #[must_use]
+    pub fn last_end(&self) -> u64 {
+        u64::try_from(self.last_end).unwrap_or(0)
     }
 
     /// Starts dropped because [`MAX_PENDING_STARTS`] were already waiting.
@@ -598,6 +610,7 @@ impl Mixer {
     /// freed.
     fn mix(&mut self, bank: &SoundBank, out: &mut [f32], block_start: i64, from: i64, to: i64) {
         let fade = &self.fade;
+        let mut last_end = self.last_end;
         for v in self.live.all_mut().filter(|v| v.active) {
             if v.start >= to {
                 continue;
@@ -632,8 +645,10 @@ impl Mixer {
             }
             if src_end <= to {
                 v.active = false;
+                last_end = last_end.max(src_end);
             }
         }
+        self.last_end = last_end;
     }
 
     /// Renders the next `out.len() / 2` frames into interleaved stereo
