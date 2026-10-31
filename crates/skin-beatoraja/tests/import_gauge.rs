@@ -191,13 +191,13 @@ fn motions_follow_the_source() {
     }
     // A negative range is still for every kind, as range 0.
     for kind in 0..=3 {
+        let still = |range: i32| {
+            let mut d = gauge(&format!(r#""type": {kind}, "range": {range}, "cycle": 33"#)).drawn();
+            [0, 17, 50, 1_000].map(|ms| d.frame(ms, &[]))
+        };
+        let zero = still(0);
         for range in [-1, -3] {
-            let still = |range: i32| {
-                [0, 17, 50, 1_000].map(|ms| {
-                    gauge(&format!(r#""type": {kind}, "range": {range}, "cycle": 33"#)).quads(ms)
-                })
-            };
-            assert_eq!(still(range), still(0), "{kind} {range}");
+            assert_eq!(still(range), zero, "{kind} {range}");
         }
     }
     assert!(has(
