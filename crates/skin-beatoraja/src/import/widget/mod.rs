@@ -320,7 +320,7 @@ impl Cx<'_> {
         };
         let native = c.stretch.native(cell);
         let mut rects = Vec::with_capacity(c.track.keys.len());
-        let mut branches = Vec::with_capacity(c.track.keys.len());
+        let mut shared = track::ANY_BRANCH;
         for k in &c.track.keys {
             let r = self.key_rect(&c, k)?;
             let (r, b) = if native.is_some() {
@@ -328,10 +328,10 @@ impl Cx<'_> {
             } else {
                 track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?
             };
-            branches.push(b);
+            shared &= b;
             rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
         }
-        if !track::one_branch(branches) {
+        if !track::one_branch(shared) {
             self.drop_el(c.role, at, NoteKind::Stretch(c.stretch_mode))?;
             return Ok(());
         }

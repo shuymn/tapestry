@@ -264,7 +264,10 @@ impl Stretch {
 
 /// The branches a key's stretch can take, a bit per branch; an exact tie
 /// takes either.
-type Branches = u8;
+pub(crate) type Branches = u8;
+
+/// Every branch: where the intersection of the keys' branches starts.
+pub(crate) const ANY_BRANCH: Branches = 0xFF;
 
 fn fit_height(r: Rect, h: Q) -> Option<Rect> {
     Some(Rect {
@@ -325,10 +328,11 @@ pub(crate) fn stretch(mode: Stretch, r: Rect, [iw, ih]: [u32; 2]) -> Option<(Rec
     })
 }
 
-/// Whether every key's branches share one: a piecewise mode is baked only
-/// then (the modes are continuous at branch boundaries).
-pub(crate) fn one_branch(branches: impl IntoIterator<Item = Branches>) -> bool {
-    branches.into_iter().fold(0xFF, |acc, b| acc & b) != 0
+/// Whether the intersection of every key's branches keeps one: a
+/// piecewise mode is baked only then (the modes are continuous at branch
+/// boundaries).
+pub(crate) fn one_branch(shared: Branches) -> bool {
+    shared != 0
 }
 
 #[cfg(test)]
@@ -393,7 +397,7 @@ mod tests {
         let (_, a) = stretch(Stretch::Inner, r(2, 4), [1, 1]).unwrap();
         let (_, b) = stretch(Stretch::Inner, r(4, 2), [1, 1]).unwrap();
         let (_, c) = stretch(Stretch::Inner, r(3, 3), [1, 1]).unwrap();
-        assert!(!one_branch([a, b]));
-        assert!(one_branch([a, c]) && one_branch([b, c]));
+        assert!(!one_branch(ANY_BRANCH & a & b));
+        assert!(one_branch(ANY_BRANCH & a & c) && one_branch(ANY_BRANCH & b & c));
     }
 }

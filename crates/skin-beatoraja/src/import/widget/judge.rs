@@ -239,7 +239,7 @@ impl Cx<'_> {
         // combo attaches to (`play/SkinJudge.java:124`).
         let native = c.stretch.native(cell);
         let mut rects = Vec::with_capacity(c.track.keys.len());
-        let mut branches = Vec::with_capacity(c.track.keys.len());
+        let mut shared = track::ANY_BRANCH;
         let mut moved = false;
         for k in &c.track.keys {
             let r = self.key_rect(&c, k)?;
@@ -248,13 +248,13 @@ impl Cx<'_> {
             } else {
                 track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?
             };
-            branches.push(b);
+            shared &= b;
             let plain = r.model().ok_or_else(|| self.range(at, "dst"))?;
             let m = st.model().ok_or_else(|| self.range(at, "dst"))?;
             moved |= plain[0] != m[0] || plain[1] + plain[3] != m[1] + m[3];
             rects.push(m);
         }
-        if !track::one_branch(branches) {
+        if !track::one_branch(shared) {
             self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
         }
         let track = self.model_track(&c, &rects)?;
