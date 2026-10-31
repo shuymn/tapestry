@@ -189,6 +189,10 @@ pub enum NoteKind {
     /// A file that is missing or failed to load, or a choice with no
     /// candidate.
     MissingAsset,
+    /// A source rectangle with a negative corner or size (a mirrored
+    /// cut), or one leaving its file, which the source cuts as given
+    /// (`JsonSkinObjectLoader.java:600-619`).
+    SourceRect,
     /// A bitmap `.fnt` file refused: ignored when the source also fails to
     /// load it, dropped when only the importer refuses it; a fallback
     /// file is skipped.
@@ -220,6 +224,7 @@ impl fmt::Display for NoteKind {
             Self::Timer(why) => write!(f, "an unsupported timer ({why:?})"),
             Self::Deviation(d) => write!(f, "deviation {d:?}"),
             Self::MissingAsset => f.write_str("a missing or unreadable file"),
+            Self::SourceRect => f.write_str("a mirrored or out-of-file source rectangle"),
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
         }

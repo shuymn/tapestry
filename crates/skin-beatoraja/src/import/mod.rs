@@ -732,8 +732,11 @@ impl<'d> Cx<'d> {
     ) -> Result<Option<Common>, ImportError> {
         let text = o.text;
         let at = dst.span;
+        // The source draws it only while the mouse is inside its rect
+        // (`SkinObject.java:603-607`); the play has no mouse.
         if dst.mouse {
-            self.ignored(at, NoteKind::Ignored { field: "mouseRect" });
+            self.drop_el(role, at, NoteKind::UnsupportedField { field: "mouseRect" })?;
+            return Ok(None);
         }
         // Keys: charged as written before they are read, then as emitted
         // when more (a neutral track emits its first and last).

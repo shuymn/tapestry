@@ -192,7 +192,7 @@ fn f1(root: &Path) {
                 &lo
             };
             format!(
-                r#"{{"id": "{i}", "op": [{ops}], "loop": 3, "mouseRect": {{}}, "dst": [
+                r#"{{"id": "{i}", "op": [{ops}], "loop": 3, "draw": 900, "dst": [
                     {{"time": 0, "w": 1, "h": 1}}, {{"time": 1, "x": 1}},
                     {{"time": 2, "x": 3}}, {{"time": 3, "x": 2}}]}}"#
             )

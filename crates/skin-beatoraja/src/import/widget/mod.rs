@@ -222,12 +222,17 @@ impl Cx<'_> {
             u32::try_from(w),
             u32::try_from(h),
         ) else {
-            self.drop_el(role, at, NoteKind::UnsupportedField { field: "src rect" })?;
+            self.drop_el(role, at, NoteKind::SourceRect)?;
             return Ok(None);
         };
         let [dx, dy] = s.div;
         let cell = [w / dx, h / dy];
         let rect = [x, y, cell[0] * grid[0], cell[1] * grid[1]];
+        let inside = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
+        if !inside(x, rect[2], fw) || !inside(y, rect[3], fh) {
+            self.drop_el(role, at, NoteKind::SourceRect)?;
+            return Ok(None);
+        }
         let def = ImageDef {
             file,
             rect: Some(rect),
