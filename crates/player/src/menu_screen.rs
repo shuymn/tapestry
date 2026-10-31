@@ -13,6 +13,11 @@
 //! underlined there, and the area goes to the window ([`WindowSink`]),
 //! which reports it to the IME so its candidate window opens beside the
 //! composition.
+//!
+//! A screen that has a window to tell draws a splash page until the game
+//! sends what to draw ([`Screen::splash`]), and tells the window when its
+//! first frame was presented: the window stays hidden until then, so the
+//! empty window is never seen.
 
 use bms_model::Chart;
 use eval::Section;
@@ -96,12 +101,27 @@ pub struct Caret {
     pub end: usize,
 }
 
-/// Where the window learns of the caret: the area the IME's windows open
-/// beside.
+/// Where the window learns what was drawn: the caret, which the IME's
+/// windows open beside, and the first frame presented.
 pub trait WindowSink: Send {
     /// The caret's area `[left, top, width, height]` in layout pixels
     /// (1920×1080), or `None` when no text box has focus.
     fn caret(&self, area: Option<[f32; 4]>);
+    /// A frame reached the window: it can be shown.
+    fn presented(&self);
+}
+
+/// The splash page: the game's name and version, until the select
+/// screen's first page or a play replaces it.
+pub fn splash_page() -> MenuPage {
+    let line = |text: String, style| MenuLine { text, style };
+    let mut lines = vec![line(String::new(), LineStyle::Chart); 10];
+    lines.push(line("tapestry".to_owned(), LineStyle::Title));
+    lines.push(line(
+        format!("version {}", env!("CARGO_PKG_VERSION")),
+        LineStyle::Help,
+    ));
+    MenuPage { lines, caret: None }
 }
 
 /// The caret's area on `page`, `[left, top, width, height]` in layout
@@ -143,10 +163,12 @@ pub struct MenuScreen {
     /// The prepared page's composition, underlined: `[left, top, width,
     /// height]` in layout pixels.
     underline: Option<[f32; 4]>,
-    /// Where the caret's area goes.
+    /// Where the caret's area and the first frame presented go.
     sink: Option<Box<dyn WindowSink>>,
     /// The caret's area last sent there; `None` before the first.
     sent: Option<Option<[f32; 4]>>,
+    /// Whether a frame was presented.
+    shown: bool,
 }
 
 impl MenuScreen {
@@ -160,10 +182,12 @@ impl MenuScreen {
             underline: None,
             sink: None,
             sent: None,
+            shown: false,
         }
     }
 
-    /// Sends the caret's area of each page prepared to `sink`.
+    /// Tells `sink` of its first frame presented and the caret's area of
+    /// each page prepared, and draws a splash page until told what to draw.
     #[must_use]
     pub fn with_sink(mut self, sink: Box<dyn WindowSink>) -> Self {
         self.sink = Some(sink);
@@ -230,6 +254,17 @@ impl MenuScreen {
         }
         self.sent = Some(area);
     }
+
+    /// Tells the sink of the first frame `presented`; passes it on.
+    fn shown(&mut self, presented: bool) -> bool {
+        if presented && !self.shown {
+            self.shown = true;
+            if let Some(sink) = &self.sink {
+                sink.presented();
+            }
+        }
+        presented
+    }
 }
 
 impl Screen for MenuScreen {
@@ -254,7 +289,9 @@ impl Screen for MenuScreen {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
-        self.renderer.submit()
+        let timing = self.renderer.submit()?;
+        self.shown(timing.presented);
+        Ok(timing)
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -268,16 +305,47 @@ impl Screen for MenuScreen {
     }
 
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
-        self.renderer.text_frame(lines).map(|t| t.presented)
+        let presented = self.renderer.text_frame(lines)?.presented;
+        Ok(self.shown(presented))
     }
 
     fn end(&mut self, page: &crate::render_side::EndPage) -> Result<bool, RenderError> {
-        self.renderer
-            .result_frame(&page.lines, page.graphs.as_deref())
-            .map(|t| t.presented)
+        let presented = self
+            .renderer
+            .result_frame(&page.lines, page.graphs.as_deref())?
+            .presented;
+        Ok(self.shown(presented))
+    }
+
+    fn splash(&mut self) -> Option<Result<bool, RenderError>> {
+        self.sink.as_ref()?;
+        let page = splash_page();
+        Some(if self.fonts.is_some() {
+            self.menu(&page, false).map(|t| t.presented)
+        } else {
+            // A screen for plays only has no menu font: the bitmap font.
+            let lines: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+            self.text(&lines)
+        })
     }
 
     fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
+        let timing = self.menu_frame(page, changed)?;
+        self.shown(timing.presented);
+        Ok(timing)
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let (w, h) = self.renderer.size();
+        let pixels = self.renderer.read_back();
+        (!pixels.is_empty()).then_some((w, h, pixels))
+    }
+}
+
+impl MenuScreen {
+    /// Draws `page`, laid out again when `changed`.
+    fn menu_frame(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
         if changed || self.text.is_none() {
             self.prepare(page)?;
         }
@@ -312,17 +380,11 @@ impl Screen for MenuScreen {
             text,
         )
     }
-
-    #[cfg(feature = "dev-tools")]
-    fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
-        let (w, h) = self.renderer.size();
-        let pixels = self.renderer.read_back();
-        (!pixels.is_empty()).then_some((w, h, pixels))
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use render::text::Fonts;
@@ -344,12 +406,46 @@ mod tests {
 
     /// The caret's areas a screen sent.
     #[derive(Clone, Default)]
-    struct Sent(Arc<Mutex<Vec<Option<[f32; 4]>>>>);
+    struct Sent(Arc<Mutex<Vec<Option<[f32; 4]>>>>, Arc<AtomicU32>);
 
     impl WindowSink for Sent {
         fn caret(&self, area: Option<[f32; 4]>) {
             self.0.lock().unwrap().push(area);
         }
+
+        fn presented(&self) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn warp() -> Renderer {
+        Renderer::new(
+            Target::Offscreen {
+                width: 1920,
+                height: 1080,
+            },
+            AdapterChoice::Warp,
+        )
+        .unwrap()
+    }
+
+    /// A screen with a window to tell draws the splash page, in the menu
+    /// font or, for plays only, the bitmap font, and tells the window of
+    /// its first frame only; a screen without one draws no splash.
+    #[test]
+    fn the_splash_tells_the_window_of_the_first_frame() {
+        for fonts in [Some(Fonts::runtime().unwrap()), None] {
+            let sent = Sent::default();
+            let mut screen = MenuScreen::new(warp(), fonts).with_sink(Box::new(sent.clone()));
+            assert!(matches!(screen.splash(), Some(Ok(true))));
+            assert!(screen.renderer.read_back().chunks(4).any(|p| p[0] > 200));
+            assert_eq!(sent.1.load(Ordering::SeqCst), 1);
+            assert!(matches!(screen.splash(), Some(Ok(true))));
+            screen.text(&["x"]).unwrap();
+            assert_eq!(sent.1.load(Ordering::SeqCst), 1);
+        }
+        let mut screen = MenuScreen::new(warp(), None);
+        assert!(screen.splash().is_none());
     }
 
     /// The search box's caret lies after the typed text and spans the
@@ -380,17 +476,9 @@ mod tests {
     /// the window once per change, and underlines the composition.
     #[test]
     fn a_drawn_page_sends_its_caret_and_underlines_the_composition() {
-        let r = Renderer::new(
-            Target::Offscreen {
-                width: 1920,
-                height: 1080,
-            },
-            AdapterChoice::Warp,
-        )
-        .unwrap();
         let sent = Sent::default();
-        let mut screen =
-            MenuScreen::new(r, Some(Fonts::runtime().unwrap())).with_sink(Box::new(sent.clone()));
+        let mut screen = MenuScreen::new(warp(), Some(Fonts::runtime().unwrap()))
+            .with_sink(Box::new(sent.clone()));
         let page = searching("ab", "にほ").page("");
         screen.menu(&page, true).unwrap();
         screen.menu(&page, true).unwrap();

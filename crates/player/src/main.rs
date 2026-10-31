@@ -966,14 +966,17 @@ fn play(
             return Err(e);
         }
     };
+    let link = window_thread.link();
     let make: MakeScreen = Box::new(move || {
         let target = Target::Window {
             window: surface.into(),
             width: surface.width,
             height: surface.height,
         };
-        Renderer::new(target, AdapterChoice::HighPerformance)
-            .map(|r| Box::new(MenuScreen::new(r, None)) as Box<dyn Screen>)
+        Renderer::new(target, AdapterChoice::HighPerformance).map(|r| {
+            let screen = MenuScreen::new(r, None).with_sink(Box::new(link.clone()));
+            Box::new(screen) as Box<dyn Screen>
+        })
     });
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
     let mut measure = measure(

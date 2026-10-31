@@ -105,6 +105,15 @@ pub trait Screen: Send {
             present_count: None,
         })
     }
+    /// Draws the splash page, as [`text`](Self::text), until the game
+    /// sends what to draw; `None` draws nothing instead (no splash).
+    ///
+    /// # Errors
+    ///
+    /// As [`menu`](Self::menu).
+    fn splash(&mut self) -> Option<Result<bool, RenderError>> {
+        None
+    }
     /// The last frame's pixels (RGBA8) and size, for an offscreen target.
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)>;
@@ -531,6 +540,8 @@ fn build(
 
 enum Mode {
     Idle,
+    /// The splash page, until the game sends what to draw.
+    Splash,
     Play {
         origin: TimeUs,
         side: RenderSide,
@@ -572,7 +583,7 @@ struct Run {
 
 impl Run {
     fn run(&mut self, rx: &Receiver<RenderMsg>) {
-        let mut mode = Mode::Idle;
+        let mut mode = Mode::Splash;
         let mut effects: Vec<JudgeEvent> = Vec::with_capacity(self.view.effects);
         loop {
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
@@ -699,6 +710,24 @@ impl Run {
             }
             let drawn = match &mut mode {
                 Mode::Idle => continue,
+                Mode::Splash => {
+                    let Some(drawn) = screen.splash() else {
+                        // No splash: the frame granted waits for what
+                        // comes next.
+                        mode = Mode::Idle;
+                        continue;
+                    };
+                    drawn.map(|presented| {
+                        let timing = FrameTiming {
+                            cpu: Duration::ZERO,
+                            sprites: 0,
+                            dropped: 0,
+                            presented,
+                            present_count: None,
+                        };
+                        (timing, None)
+                    })
+                }
                 Mode::Play {
                     origin,
                     side,
@@ -1083,6 +1112,83 @@ mod tests {
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
             None
         }
+    }
+
+    /// A screen with a splash page: it counts its splash and menu frames.
+    struct Splashes {
+        splashes: Arc<AtomicU32>,
+        menus: Arc<AtomicU32>,
+    }
+
+    impl Screen for Splashes {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn splash(&mut self) -> Option<Result<bool, RenderError>> {
+            self.splashes.fetch_add(1, Ordering::SeqCst);
+            Some(Ok(true))
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.menus.fetch_add(1, Ordering::SeqCst);
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The render thread draws the splash page from its start, before the
+    /// game sends anything, and only until the first page replaces it.
+    #[test]
+    fn the_splash_shows_until_the_first_page() {
+        let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let (s, m) = (Arc::clone(&splashes), Arc::clone(&menus));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Splashes {
+                splashes: Arc::clone(&s),
+                menus: Arc::clone(&m),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        assert!(wait_until(|| splashes.load(Ordering::SeqCst) >= 2));
+        link.send(RenderMsg::Menu(Box::default()));
+        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= 1));
+        let drawn = splashes.load(Ordering::SeqCst);
+        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= 3));
+        link.exit();
+        assert_eq!(splashes.load(Ordering::SeqCst), drawn);
     }
 
     /// A screen that notes the section of every chart it prepares.

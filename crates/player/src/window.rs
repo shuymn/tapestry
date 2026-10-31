@@ -1,7 +1,10 @@
 //! The window thread: the winit window and its events (design.md "Rendering and
 //! Skins"). The window is borderless fullscreen on the primary monitor and
 //! takes no device events (Raw Input has one target window per device type per
-//! process, and the input thread owns it). Focus, the retry and quit keys, the
+//! process, and the input thread owns it). It is made hidden and shown once
+//! the render thread presented its first frame, or after [`SHOW_TIMEOUT`]
+//! at the latest ([`Showing`]), so the empty window Windows would paint
+//! first is never seen. Focus, the retry and quit keys, the
 //! settings keys F1 to F8 and closing go to [`Controls`], which wakes the game
 //! thread for each, and the input thread on a focus change once the focus
 //! latch is set (design.md "Input"). With song selection the menu keys and
@@ -17,14 +20,15 @@ use std::num::NonZeroIsize;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use eval::ControlId;
 use game::{Adjust, Command};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Ime, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
+use winit::event::{ElementState, Ime, StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::platform::scancode::PhysicalKeyExtScancode;
@@ -48,6 +52,67 @@ enum Ask {
     /// The caret's area on the page drawn, in layout pixels (from the
     /// render thread).
     Caret(Option<[f32; 4]>),
+    /// The render thread presented a frame.
+    Presented,
+}
+
+/// The longest the window stays hidden waiting for its first frame: a
+/// render thread that never presents must not leave a window nobody can
+/// see or close.
+pub const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What showing the window needs of it: [`Window`], or a fake in tests.
+trait ShowWindow {
+    /// Shows the window and brings it to the foreground.
+    fn show(&self);
+    fn has_focus(&self) -> bool;
+}
+
+impl ShowWindow for Window {
+    fn show(&self) {
+        self.set_visible(true);
+        // Made hidden, the window was not brought to the foreground when
+        // it was made fullscreen.
+        self.focus_window();
+    }
+
+    fn has_focus(&self) -> bool {
+        Window::has_focus(self)
+    }
+}
+
+/// Whether the hidden window was shown: on the first frame presented, or
+/// at its deadline without one.
+#[derive(Debug)]
+struct Showing {
+    shown: bool,
+    deadline: Instant,
+}
+
+impl Showing {
+    fn new(now: Instant) -> Self {
+        Self {
+            shown: false,
+            deadline: now + SHOW_TIMEOUT,
+        }
+    }
+
+    /// Shows `window` the first time only, and tells `controls` whether
+    /// it has focus: the focus latch and the input thread see the window
+    /// gain focus, even when no focus event follows the show.
+    fn show(&mut self, window: &impl ShowWindow, controls: &Controls) {
+        if self.shown {
+            return;
+        }
+        self.shown = true;
+        window.show();
+        controls.focus(window.has_focus());
+    }
+
+    /// Whether the deadline passed at `now` with the window still hidden.
+    fn due(&self, now: Instant) -> bool {
+        !self.shown && now >= self.deadline
+    }
 }
 
 /// What the window's IME needs of the window: [`Window`], or a fake in
@@ -146,6 +211,8 @@ struct App {
     /// Where the select screen's input goes, with song selection.
     menu: Option<Arc<MenuQueue>>,
     ime: ImeState,
+    /// Set once the window is made.
+    showing: Option<Showing>,
 }
 
 impl ApplicationHandler<Ask> for App {
@@ -164,6 +231,7 @@ impl ApplicationHandler<Ask> for App {
         }
         let attrs = Window::default_attributes()
             .with_title("tapestry")
+            .with_visible(false)
             .with_fullscreen(Some(Fullscreen::Borderless(monitor)));
         match event_loop.create_window(attrs) {
             Ok(w) => {
@@ -172,6 +240,9 @@ impl ApplicationHandler<Ask> for App {
                 let surface = surface(&w);
                 let _ = ready.send(surface);
                 self.window = Some(w);
+                let showing = Showing::new(Instant::now());
+                event_loop.set_control_flow(ControlFlow::WaitUntil(showing.deadline));
+                self.showing = Some(showing);
             }
             Err(e) => {
                 let _ = ready.send(Err(e).context("the window cannot be created"));
@@ -226,16 +297,34 @@ impl ApplicationHandler<Ask> for App {
         }
     }
 
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
+        if self.showing.as_ref().is_some_and(|s| s.due(Instant::now())) {
+            println!("window: no frame within {SHOW_TIMEOUT:?}; shown anyway");
+            self.show(event_loop);
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Ask) {
         match (event, &self.window) {
             (Ask::Ime(allowed), Some(w)) => self.ime.allow(w, allowed),
             (Ask::Caret(caret), Some(w)) => self.ime.caret(w, caret),
-            (Ask::Ime(_) | Ask::Caret(_), None) => {}
+            (Ask::Presented, Some(_)) => self.show(event_loop),
+            (Ask::Ime(_) | Ask::Caret(_) | Ask::Presented, None) => {}
             (Ask::Exit, _) => {
                 // The window goes before the loop ends, on its own thread.
                 self.window = None;
                 event_loop.exit();
             }
+        }
+    }
+}
+
+impl App {
+    /// Shows the window once; the loop then waits for events only.
+    fn show(&mut self, event_loop: &ActiveEventLoop) {
+        if let (Some(w), Some(showing)) = (&self.window, &mut self.showing) {
+            showing.show(w, &self.controls);
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
@@ -294,6 +383,10 @@ pub struct WindowLink(EventLoopProxy<Ask>);
 impl WindowSink for WindowLink {
     fn caret(&self, area: Option<[f32; 4]>) {
         let _ = self.0.send_event(Ask::Caret(area));
+    }
+
+    fn presented(&self) {
+        let _ = self.0.send_event(Ask::Presented);
     }
 }
 
@@ -364,6 +457,7 @@ pub fn open(
                 window: None,
                 menu,
                 ime: ImeState::default(),
+                showing: None,
             };
             if let Err(e) = event_loop.run_app(&mut app) {
                 eprintln!("the event loop failed: {e}");
@@ -558,6 +652,57 @@ mod tests {
                 at.x, at.y, size.width, size.height
             ));
         }
+    }
+
+    /// The hidden window as showing sees it.
+    #[derive(Default)]
+    struct FakeShow {
+        shows: std::cell::Cell<u32>,
+        focused: bool,
+    }
+
+    impl super::ShowWindow for FakeShow {
+        fn show(&self) {
+            self.shows.set(self.shows.get() + 1);
+        }
+
+        fn has_focus(&self) -> bool {
+            self.focused && self.shows.get() > 0
+        }
+    }
+
+    /// The first frame shows the window, once, and its focus reaches the
+    /// controls; a later frame shows nothing again.
+    #[test]
+    fn the_first_frame_shows_the_window_and_latches_its_focus() {
+        let c = Controls::new(QpcClock::start());
+        let w = FakeShow {
+            focused: true,
+            ..FakeShow::default()
+        };
+        let mut showing = super::Showing::new(std::time::Instant::now());
+        // Made hidden, the window had no focus.
+        c.focus(false);
+        showing.show(&w, &c);
+        assert_eq!(w.shows.get(), 1);
+        assert!(c.focused());
+        showing.show(&w, &c);
+        assert_eq!(w.shows.get(), 1);
+    }
+
+    /// Without a frame the window is shown at its deadline, and not before;
+    /// once shown, nothing is due.
+    #[test]
+    fn a_window_without_a_frame_is_shown_at_its_deadline() {
+        let start = std::time::Instant::now();
+        let mut showing = super::Showing::new(start);
+        assert!(!showing.due(start));
+        assert!(!showing.due(start + super::SHOW_TIMEOUT / 2));
+        assert!(showing.due(start + super::SHOW_TIMEOUT));
+        let c = Controls::new(QpcClock::start());
+        showing.show(&FakeShow::default(), &c);
+        assert!(!c.focused());
+        assert!(!showing.due(start + super::SHOW_TIMEOUT * 2));
     }
 
     /// A layout area lands on the window's pixels through the letterbox:
