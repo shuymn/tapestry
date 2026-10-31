@@ -249,11 +249,8 @@ impl Cx<'_> {
                 }),
             }
             .ok_or_else(|| self.range(at, "dst"))?;
-            let [_, _, w, h] = v;
-            if h <= 0 || w < 0 {
-                self.drop_el(role, at, NoteKind::UnsupportedField { field: "dst" })?;
-                return Ok(());
-            }
+            // A key the model cannot draw (`TextError::Size`) is its
+            // refusal, located at this element.
             rects.push(v);
         }
         let t = self.model_track(&c, &rects)?;

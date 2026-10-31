@@ -5,8 +5,8 @@ mod common;
 
 use common::play::round;
 use common::{Loaded, font, has, hd, import_dir, skin};
-use skin_beatoraja::{DeviationId, NoteKind};
-use skin_model::{ChartText, FontRef, Layout, TextRequest};
+use skin_beatoraja::{DeviationId, ImportError, NoteKind};
+use skin_model::{ChartText, FontRef, Layout, LoadError, TextError, TextRequest};
 
 const CHART: ChartText<'static> = ChartText {
     title: "Title",
@@ -213,12 +213,24 @@ fn fonts_and_boxes_that_cannot_draw() {
     let l = text([1_920, 1_080], r#""font": "m", "constantText": "x""#, BOX);
     assert!(has(l.report(), NoteKind::MissingAsset));
     assert_eq!(l.report().usage.texts, 0);
-    let l = text(
-        [1_920, 1_080],
-        r#""font": "f", "constantText": "x""#,
+    // A box the model cannot draw is the model's located refusal.
+    for dst in [
         r#""dst": [{"x": 400, "y": 800, "w": 300, "h": 0}]"#,
-    );
-    assert!(has(l.report(), NoteKind::UnsupportedField { field: "dst" }));
+        r#""dst": [{"x": 400, "y": 800, "w": -300, "h": 30}]"#,
+    ] {
+        let l = text([1_920, 1_080], r#""font": "f", "constantText": "x""#, dst);
+        match l.err() {
+            ImportError::Model {
+                at: Some(at),
+                source:
+                    LoadError::Text {
+                        element: 0,
+                        error: TextError::Size,
+                    },
+            } => assert_eq!(at.line, 5, "{dst}"),
+            other => panic!("{dst}: {other:?}"),
+        }
+    }
     // The source file need not hold a text to be a play skin.
     let l = Loaded {
         result: import_dir(skin(&[("s.json", &hd(r#""text": []"#))]).path()),
