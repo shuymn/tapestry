@@ -202,7 +202,10 @@ impl Cx<'_> {
         let at = dst.span;
         let s = self.src_image(rec)?;
         let [len, act] = self.def.fields(rec, ["len", "act"]);
-        if self.int_or(len, "len", 0)? > 1 {
+        // A selector group (`len` above 1) is the image object's own; an
+        // image set draws the image's frames whatever its `len`
+        // (`JsonSkinObjectLoader.java:76-84`).
+        if set.is_none() && self.int_or(len, "len", 0)? > 1 {
             self.drop_el(
                 Role::Decorative,
                 at,
@@ -210,7 +213,15 @@ impl Cx<'_> {
             )?;
             return Ok(());
         }
-        if act.is_some() || set.is_some() {
+        // An image set's click action is its own, the image's unused.
+        let act = match set {
+            Some(set) => {
+                let [act] = self.def.fields(set, ["act"]);
+                act
+            }
+            None => act,
+        };
+        if act.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "act" });
         }
         let stretch = Stretch::of(dst.stretch);
