@@ -431,3 +431,18 @@ fn a_stretch_may_not_move_a_combos_anchor() {
         [[100, 560, 10, 20], [110, 560, 10, 20], [100, 560, 20, 20]]
     );
 }
+
+#[test]
+fn native_grades_keep_the_combos_anchor() {
+    // No resize: the 8×8 grade centred in its 80×20 box and each 12×20
+    // glyph in its 10×20 cell, the combo anchored to the box
+    // (`play/SkinJudge.java:124`).
+    let g = r#"{"id": "g0", "stretch": 9, "dst": [{"x": 100, "y": 500, "w": 80, "h": 20}]}"#;
+    let n = r#"{"id": "ten", "stretch": 9, "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]}"#;
+    let l = judge(&[g.to_owned()], &[n.to_owned()]);
+    assert!(l.report().notes.is_empty(), "{:?}", l.report());
+    assert_eq!(
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [[99, 560, 12, 20], [109, 560, 12, 20], [136, 566, 8, 8]]
+    );
+}

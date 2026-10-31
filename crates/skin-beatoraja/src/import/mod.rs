@@ -28,8 +28,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use bms_model::TimeUs;
 use skin_model::{
     Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Grade, KeyDef, LoadError, MAX_GEOMETRY,
-    PLAY, Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track, Ty,
-    WidgetDefs, compile, timer as slot,
+    Native, PLAY, Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track,
+    Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -1175,6 +1175,11 @@ impl<'d> Cx<'d> {
 
     /// Adds an element and its location.
     fn push(&mut self, c: Common, source: Source, track: Track) {
+        self.push_native(c, source, track, None);
+    }
+
+    /// [`Self::push`] with the native size its quads keep.
+    fn push_native(&mut self, c: Common, source: Source, track: Track, native: Option<Native>) {
         self.elements.push(ElementDef {
             source,
             track,
@@ -1184,6 +1189,7 @@ impl<'d> Cx<'d> {
             clip: None,
             place: Place {
                 pivot: c.pivot,
+                native,
                 ..Place::SCREEN
             },
         });

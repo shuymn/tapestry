@@ -203,6 +203,7 @@ pub fn grade(image: u32, r: [i32; 4]) -> GradePart {
         pivot: Anchor::TopLeft,
         blend: Blend::Alpha,
         visible: None,
+        native: None,
     }
 }
 
@@ -217,6 +218,7 @@ pub fn combo(d: DigitsDef, r: [i32; 4]) -> ComboPart {
         pivot: Anchor::TopLeft,
         blend: Blend::Alpha,
         visible: None,
+        native: None,
     }
 }
 

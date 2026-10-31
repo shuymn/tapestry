@@ -12,7 +12,7 @@ use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
 use crate::expr::{CompileError, Program, SkinOps};
 use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
-use crate::place::{Bind, Bounds, Fill, Place, Placement, Regions, union};
+use crate::place::{Bind, Bounds, Fill, Native, Place, Placement, Regions, union};
 use crate::play::schema::Grade;
 use crate::play::schema::timer::BUILTIN;
 use crate::play::{Play, PlayContext, PrepareError, SkinFrame};
@@ -220,6 +220,7 @@ struct Element {
     pivot: [f32; 2],
     bind: Bind,
     fill: Fill,
+    native: Option<Native>,
 }
 
 /// A loaded skin.
@@ -808,6 +809,7 @@ impl Skin {
                         pivot: g.pivot.fractions(),
                         blend: g.blend,
                         visible: g.visible,
+                        native: g.native,
                     })
                 }),
                 combos: j.combos.map(|c| {
@@ -819,6 +821,7 @@ impl Skin {
                         pivot: c.pivot.fractions(),
                         blend: c.blend,
                         visible: c.visible,
+                        native: c.native,
                     })
                 }),
                 shift: j.shift,
@@ -863,6 +866,7 @@ impl Skin {
                 pivot: e.place.pivot.fractions(),
                 bind: e.place.bind,
                 fill: e.place.fill,
+                native: e.place.native,
             })
             .collect();
         Ok(Self {
@@ -1221,6 +1225,8 @@ impl Skin {
                 pivot: e.pivot,
                 angle: radians(s.angle),
                 color: s.color,
+                native: e.native,
+                scale: canvas.scale(),
             };
             let at = Frame {
                 play,
@@ -1259,6 +1265,7 @@ impl Skin {
                             map: brush.map,
                             color: s.color,
                             clip: e.key.clip,
+                            scale: canvas.scale(),
                         };
                         j.draw(&d, out);
                     }

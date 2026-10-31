@@ -17,7 +17,7 @@ use bms_model::TimeUs;
 
 use crate::atlas::uv::{Cycle, FrameUv, UvTable};
 use crate::expr::{Program, State};
-use crate::place::{Affine, LaneMap};
+use crate::place::{Affine, LaneMap, Native};
 use crate::play::Play;
 use crate::play::timers::elapsed_us;
 use crate::quad::{Filter, Quad, QuadBatch, RunKey};
@@ -63,7 +63,8 @@ pub(crate) struct Frame<'a> {
 
 /// What the quads of one widget part share: the run key, the transform
 /// of the element's region or fill, the lane map of its binding, the
-/// pivot's fractions of each quad's rect, the angle and the color.
+/// pivot's fractions of each quad's rect, the angle, the color, and the
+/// native size each quad keeps at the canvas's scale.
 #[derive(Clone, Copy)]
 pub(crate) struct Brush {
     pub(crate) key: RunKey,
@@ -73,12 +74,16 @@ pub(crate) struct Brush {
     /// Radians in `[0, 2π)`.
     pub(crate) angle: f32,
     pub(crate) color: [f32; 4],
+    pub(crate) native: Option<Native>,
+    /// Target pixels per canvas pixel.
+    pub(crate) scale: f32,
 }
 
 impl Brush {
     /// Pushes the quad showing `f` over the reference rect `[x, y, w, h]`:
-    /// moved with its lane (when bound), then by the affine, turned about
-    /// its own pivot moved alike. `false` when the batch refused it.
+    /// moved with its lane (when bound), then by the affine, resized to
+    /// its native size (when it has one), turned about its own pivot in
+    /// that rect. `false` when the batch refused it.
     pub(crate) fn push(
         &self,
         out: &mut QuadBatch,
@@ -87,8 +92,24 @@ impl Brush {
         filter: Filter,
     ) -> bool {
         let [fx, fy] = self.pivot;
-        let pivot = [x + fx * w, y + fy * h];
-        self.push_about(out, [x, y, w, h], pivot, f, filter)
+        let Some(native) = self.native else {
+            let pivot = [x + fx * w, y + fy * h];
+            return self.push_about(out, [x, y, w, h], pivot, f, filter);
+        };
+        let placed = self.affine.rect([self.map.x(x), y, self.map.w(w), h]);
+        let rect @ [qx, qy, qw, qh] = native.fit(placed, self.scale);
+        out.push(
+            self.key,
+            Quad {
+                rect,
+                uv: f.uv,
+                color: self.color,
+                pivot: [qx + fx * qw, qy + fy * qh],
+                angle: self.angle,
+                layer: f.layer,
+                filter,
+            },
+        )
     }
 
     /// Pushes the quad showing `f` over the reference rect `[x, y, w, h]`

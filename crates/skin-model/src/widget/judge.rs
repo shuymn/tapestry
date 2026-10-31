@@ -16,7 +16,7 @@ use super::digits::{Digits, DigitsDef, NumberError};
 use super::{Brush, Frame, ImageRef, tint};
 use crate::expr::{Program, State};
 use crate::layout::Anchor;
-use crate::place::{Affine, Bounds, LaneMap, union};
+use crate::place::{Affine, Bounds, LaneMap, Native, union};
 use crate::play::schema::{Grade, field, timer};
 use crate::quad::{Blend, ClipId, QuadBatch, RunKey};
 use crate::skin::{MAX_COORD, TimerRef, radians};
@@ -87,6 +87,8 @@ pub struct GradePart {
     pub blend: Blend,
     /// Drawn only while this is true; compiled against the play schema.
     pub visible: Option<Program>,
+    /// The size its quad keeps at the canvas's scale, if any.
+    pub native: Option<Native>,
 }
 
 /// A slot's combo strip.
@@ -102,6 +104,8 @@ pub struct ComboPart {
     pub blend: Blend,
     /// Drawn only while this is true; compiled against the play schema.
     pub visible: Option<Program>,
+    /// The size each glyph quad keeps at the canvas's scale, if any.
+    pub native: Option<Native>,
 }
 
 /// A judge: per [`JudgeSlot::index`], a grade image and a combo, each
@@ -263,6 +267,7 @@ pub(crate) struct GradeImage {
     pub(crate) pivot: [f32; 2],
     pub(crate) blend: Blend,
     pub(crate) visible: Option<Program>,
+    pub(crate) native: Option<Native>,
 }
 
 /// A combo as a build reads it.
@@ -275,6 +280,7 @@ pub(crate) struct ComboStrip {
     pub(crate) pivot: [f32; 2],
     pub(crate) blend: Blend,
     pub(crate) visible: Option<Program>,
+    pub(crate) native: Option<Native>,
 }
 
 /// A loaded judge.
@@ -294,6 +300,8 @@ pub(crate) struct JudgeDraw<'a> {
     /// The element's color and clip.
     pub(crate) color: [f32; 4],
     pub(crate) clip: Option<ClipId>,
+    /// Target pixels per canvas pixel.
+    pub(crate) scale: f32,
 }
 
 /// A part's track at `now`, when its timer is on and it is visible.
@@ -352,6 +360,8 @@ impl Judge {
                 pivot: c.pivot,
                 angle: radians(cs.angle),
                 color: tint(cs.color, d.color),
+                native: c.native,
+                scale: d.scale,
             };
             let rect = [gx + cx, top + cy, cw, ch];
             let Some(width) = c.digits.draw(combo, rect, &brush, &d.at, out) else {
@@ -374,6 +384,8 @@ impl Judge {
             pivot: g.pivot,
             angle: radians(gs.angle),
             color: tint(gs.color, d.color),
+            native: g.native,
+            scale: d.scale,
         };
         brush.push(out, [gx - shift, gy, gw, gh], f, g.image.filter);
     }

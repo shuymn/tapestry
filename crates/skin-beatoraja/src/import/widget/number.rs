@@ -216,12 +216,16 @@ impl Cx<'_> {
         let sr = Q::int(spaces).mul(self.r).ok_or_else(|| range(self))?;
         let n = Q::int(cells - 1);
         let e = Q::int(extra);
+        // Stretch 8 and 9 apply per glyph at placement
+        // (`skin/SkinNumber.java:191`); any other mode must leave each
+        // key's cell as it is.
+        let native = c.stretch.native(cell);
         let mut keys = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
             let rect = self.key_rect(&c, k)?;
             let (stretched, _) =
                 track::stretch(c.stretch, rect, cell).ok_or_else(|| range(self))?;
-            if stretched != rect {
+            if native.is_none() && stretched != rect {
                 self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
                 return Ok(());
             }
@@ -291,7 +295,7 @@ impl Cx<'_> {
             },
             value: program,
         });
-        self.push(c, Source::Number(index), t);
+        self.push_native(c, Source::Number(index), t, native);
         Ok(())
     }
 }

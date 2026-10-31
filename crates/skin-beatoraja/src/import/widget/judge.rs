@@ -235,13 +235,19 @@ impl Cx<'_> {
         let Some((image, cell)) = self.add_src_image(&c, img, &s, s.div)? else {
             return Ok(None);
         };
+        // Stretch 8 and 9 apply at placement, inside the destination the
+        // combo attaches to (`play/SkinJudge.java:124`).
+        let native = c.stretch.native(cell);
         let mut rects = Vec::with_capacity(c.track.keys.len());
         let mut branches = Vec::with_capacity(c.track.keys.len());
         let mut moved = false;
         for k in &c.track.keys {
             let r = self.key_rect(&c, k)?;
-            let (st, b) =
-                track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?;
+            let (st, b) = if native.is_some() {
+                (r, 0b1)
+            } else {
+                track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?
+            };
             branches.push(b);
             let plain = r.model().ok_or_else(|| self.range(at, "dst"))?;
             let m = st.model().ok_or_else(|| self.range(at, "dst"))?;
@@ -260,6 +266,7 @@ impl Cx<'_> {
                 pivot: c.pivot,
                 blend: c.blend,
                 visible: c.visible,
+                native,
             },
             moved,
         )))
@@ -319,6 +326,9 @@ impl Cx<'_> {
         let range = |cx: &Self| cx.range(at, "dst");
         let sr = Q::int(spaces).mul(self.r).ok_or_else(|| range(self))?;
         let e = Q::int(extra);
+        // Stretch 8 and 9 apply per glyph at placement
+        // (`skin/SkinNumber.java:191`).
+        let native = c.stretch.native(cell);
         let mut keys = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
             let rect = Rect::scaled(k.rect, self.r)
@@ -326,7 +336,7 @@ impl Cx<'_> {
                 .ok_or_else(|| range(self))?;
             let (stretched, _) =
                 track::stretch(c.stretch, rect, cell).ok_or_else(|| range(self))?;
-            if stretched != rect {
+            if native.is_none() && stretched != rect {
                 self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
             }
             let p = rect.w.add(sr).ok_or_else(|| range(self))?;
@@ -370,6 +380,7 @@ impl Cx<'_> {
             pivot: c.pivot,
             blend: c.blend,
             visible: c.visible,
+            native,
         }))
     }
 }

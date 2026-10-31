@@ -1,8 +1,8 @@
 //! Tracks and stretch: a destination's keys read with the
 //! source's inheritance, sorted, accepted or refused, and the stretch
-//! modes baked into each key.
+//! modes baked into each key or, for 8 and 9, kept for placement.
 
-use skin_model::{End, MAX_KEY_US};
+use skin_model::{End, MAX_KEY_US, Native};
 
 use super::geom::{Q, Rect};
 use super::report::TrackWhy;
@@ -243,6 +243,21 @@ impl Stretch {
             9 => Self::NoResize,
             3 | 5 | 7 | 10 => Self::Trimmed,
             _ => Self::Identity,
+        }
+    }
+}
+
+impl Stretch {
+    /// The size a quad of a `cell`-texel frame keeps in target pixels:
+    /// stretch 8 and 9 size it after the source scales the destination
+    /// to the window (`skin/SkinObject.java:626-629`,
+    /// `skin/StretchType.java:85-98`), so the model applies them at
+    /// placement instead of baking them into the keys.
+    pub(crate) fn native(self, cell: [u32; 2]) -> Option<Native> {
+        match self {
+            Self::NoExpanding => Some(Native::NoLarger(cell)),
+            Self::NoResize => Some(Native::Exact(cell)),
+            _ => None,
         }
     }
 }

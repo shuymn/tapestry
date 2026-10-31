@@ -73,6 +73,8 @@ pub struct Drawn {
     pub batch: QuadBatch,
     /// The hi-speed and covers each frame shows.
     pub view: LaneView,
+    /// The render target's size each frame draws at.
+    pub target: [u32; 2],
 }
 
 /// A chart with `notes` notes on lane 1, one every 10 ms from 1 s.
@@ -122,6 +124,7 @@ impl Drawn {
                 cover: 0,
                 lift: 0,
             },
+            target: [1_920, 1_080],
         }
     }
 
@@ -171,7 +174,7 @@ impl Drawn {
             gauge: 0,
             effects,
             complete: false,
-            target: [1_920, 1_080],
+            target: self.target,
             layout: &Layout::AUTHOR,
             lanes: self.view,
             playing: true,
