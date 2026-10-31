@@ -687,6 +687,27 @@ fn the_lift_cover_hangs_from_its_anchor() {
     assert_eq!(rects(&h, LINE), [[160.0, 797.0, 544.0, 6.0]]);
 }
 
+#[test]
+fn a_mine_leaves_at_its_time_hit_or_not() {
+    // A mine at 1 s: drawn 1 ms before it, gone 1 ms after it although
+    // nobody hit it.
+    let chart = ChartBuilder::new(BPM)
+        .mine(lane(5), TimeUs(1_000 * MS), 10)
+        .mine(lane(6), TimeUs(1_300 * MS), 10)
+        .build()
+        .unwrap();
+    let mut h = harness(&chart);
+    h.frame(999, &[]);
+    assert_eq!(in_lane(&h, MINE, lane(5)).len(), 1);
+    h.frame(1_001, &[]);
+    assert!(in_lane(&h, MINE, lane(5)).is_empty());
+    // A mine hit early is gone at once.
+    h.frame(1_002, &[]);
+    assert_eq!(in_lane(&h, MINE, lane(6)).len(), 1);
+    h.frame(1_010, &[event(1_005 * MS, play_support::mine(6, 0))]);
+    assert!(in_lane(&h, MINE, lane(6)).is_empty());
+}
+
 /// A tap on every lane at 1 s.
 fn chord() -> Chart {
     Lane::all()

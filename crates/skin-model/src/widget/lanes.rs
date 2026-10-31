@@ -678,6 +678,8 @@ impl Lanes {
             }
             let head = scale.y(n.pos);
             let drawn = match n.kind {
+                // A mine leaves at its time, hit or not.
+                NoteKind::Mine { .. } if n.time < d.display => true,
                 NoteKind::Mine { .. } => pen.cap(mine, x, w, head, self.mine_h),
                 _ if !is_target(notes.section, n.time, n.end()) => true,
                 NoteKind::Tap => pen.cap(note, x, w, head, self.note_h),
