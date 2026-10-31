@@ -171,6 +171,42 @@ fn choosing_a_chart_plays_it_and_returns() {
     assert!(!fx.appdata.join("tapestry").join("records").exists());
 }
 
+/// On the real threads, a result switches presets with the arrow keys
+/// (scripted): the play under the default beatoraja-style shows as played,
+/// then lr2-style and tapestry as what-ifs, wrapping past the last, and
+/// lr2-style again from its cached summary; back returns to selection.
+#[test]
+fn result_switches_presets_on_the_real_threads() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,enter,next,next,prev,back,wait=a.bms,close",
+        &[],
+    );
+    let viewing = lines(&stdout, "result: viewing ");
+    let expected = [
+        "result: viewing beatoraja-style (as played)",
+        "result: viewing lr2-style (what-if, ",
+        "result: viewing tapestry (what-if, ",
+        "result: viewing lr2-style (what-if, ",
+    ];
+    assert_eq!(viewing.len(), expected.len(), "{stdout}");
+    for (line, start) in viewing.iter().zip(expected) {
+        assert!(line.starts_with(start), "{line}: {stdout}");
+    }
+    let evaluated = lines(&stdout, "result: evaluated ");
+    assert_eq!(evaluated.len(), 2, "{stdout}");
+    assert!(evaluated[0].starts_with("result: evaluated lr2-style in "));
+    assert!(evaluated[1].starts_with("result: evaluated tapestry in "));
+    assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+    assert_eq!(
+        lines(&stdout, "select: 1 charts listed").len(),
+        2,
+        "{stdout}"
+    );
+}
+
 /// Two charts on the same threads: the second plays its own sound, never
 /// the first's, though both name it `#WAV01`, and its own input, four
 /// times longer than the first's, every note of it on time; each chart's

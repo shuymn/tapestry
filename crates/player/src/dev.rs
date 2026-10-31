@@ -141,6 +141,9 @@ pub struct Options {
     pub adjust_at_ms: i64,
     /// Show the measurement overlay from the start, without its key.
     pub overlay: bool,
+    /// The result screen's input, scripted (`--dev-result`): `next`,
+    /// `prev`, `back` and `retry`, one step each time a result is drawn.
+    pub result: Option<SelectScript>,
     /// Run autoplay headless: a recording of a simulated audio device and
     /// WARP offscreen, as a scripted run.
     pub headless: bool,
@@ -210,6 +213,11 @@ impl Options {
             "dev-scripted-input" => self.scripted_input = Some(PathBuf::from(p.value()?)),
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
+            "dev-result" => {
+                let steps = p.value()?;
+                self.result =
+                    Some(SelectScript::parse(&steps.to_string_lossy()).map_err(UsageError::Usage)?);
+            }
             _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
         Ok(())
@@ -306,6 +314,10 @@ pub enum SelectStep {
     Back,
     /// On a result: retry.
     Retry,
+    /// On a result: view the next preset (the right arrow).
+    Next,
+    /// On a result: view the previous preset (the left arrow).
+    Prev,
     /// Close the window.
     Close,
 }
@@ -315,8 +327,8 @@ pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
 /// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`, `enter`,
-/// `back`, `retry` and `close`. Selection steps run on the select screen, `back` and
-/// `retry` on a result; a step out of place, or a chart not listed within
+/// `back`, `retry`, `next`, `prev` and `close`. Selection steps run on the
+/// select screen, `back`, `retry`, `next` and `prev` on a result; a step out of place, or a chart not listed within
 /// [`STEP_TIMEOUT`], fails the run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SelectScript {
@@ -343,7 +355,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, enter, back, retry or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, enter, back, retry, next, prev or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -352,9 +364,11 @@ impl SelectScript {
                 None if s == "enter" => Ok(SelectStep::Enter),
                 None if s == "back" => Ok(SelectStep::Back),
                 None if s == "retry" => Ok(SelectStep::Retry),
+                None if s == "next" => Ok(SelectStep::Next),
+                None if s == "prev" => Ok(SelectStep::Prev),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, enter, back, retry or close"
+                    "{s} is not pick=, wait=, search=, sleep=, enter, back, retry, next, prev or close"
                 )),
             })
             .collect::<Result<_, _>>()?;
