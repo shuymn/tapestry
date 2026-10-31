@@ -714,6 +714,60 @@ fn practice_at_a_speed_keeps_the_charts_gain() {
     }
 }
 
+/// A practice of the middle of a chart: measure 3, whose lead-in holds
+/// measure 2's notes on key 2, which are not targets and sound a loud
+/// sound. The round's schedule plays them as autoplay in the lead-in,
+/// before the four quiet targets the log hits; the screen is given the
+/// section and draws only its four targets of the eight notes.
+#[test]
+fn a_middle_measure_round_sounds_its_lead_in_and_draws_its_targets() {
+    let fx = Fixture::new();
+    let dir = fx.library().join("m");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav_at(&dir.join("key.wav"), 1_000);
+    write_wav_at(&dir.join("loud.wav"), 8_000);
+    let text = "#PLAYER 1\n#TITLE 譜面M\n#BPM 120\n#WAV01 key.wav\n#WAV02 loud.wav\n\
+                #00112:02020202\n#00211:01010101\n";
+    fs::write(dir.join("m.bms"), text).unwrap();
+    let chart = bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart;
+    let log = hits(&chart, |t| t.0 >= 4_000_000);
+    assert_eq!(log.len(), 8);
+    write_log(&fx.base.join("logs").join("m.tprl"), &log, 1);
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "practice = { path = \"library/m/m.bms\", from = 3, to = 3, speed = 100, \
+         lead_in_ms = 2500, gauge = 20, repeat = true, input = \"logs/m.tprl\", rounds = 1 }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        lines(
+            &stdout,
+            "dev: render: a section's 4 targets of 8 notes are drawn"
+        )
+        .len(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        lines(
+            &stdout,
+            "play 1: Completed; perfect 4 great 0 good 0 bad 0 poor 0"
+        )
+        .len(),
+        1,
+        "{stdout}"
+    );
+    // The lead-in's four loud sounds, then the four targets' quiet ones.
+    let peaks = onset_peaks(&stdout);
+    assert_eq!(peaks.len(), 8, "{peaks:?}\n{stdout}");
+    let (loud, quiet) = peaks.split_at(4);
+    let least_loud = loud.iter().copied().fold(f64::MAX, f64::min);
+    let most_quiet = quiet.iter().copied().fold(0.0, f64::max);
+    assert!(least_loud > most_quiet * 4.0, "{peaks:?}");
+}
+
 /// A log of as many keyboards as the input thread keeps devices for, then
 /// another chart by autoplay: the input thread starts over for it, so its
 /// generated keyboard plays every note.

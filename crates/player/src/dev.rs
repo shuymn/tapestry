@@ -369,9 +369,9 @@ pub enum SelectStep {
     PracticeSet(scenario::PracticeGoal),
     /// On the practice page: Start.
     PracticeStart,
-    /// The practice's rounds: the quit key at the start of the round after
-    /// the last.
-    Rounds(scenario::Rounds),
+    /// The practice's rounds, this many: the quit key at the start of the
+    /// round after the last.
+    Rounds(u16),
     /// On the practice page: back to selection (Escape).
     PracticeBack,
     /// Close the window.
@@ -513,6 +513,20 @@ impl SelectScript {
         let step = format!("{:?}", self.front());
         self.fail(format!("{step} waited {} s", bound.as_secs()));
         false
+    }
+
+    /// The front step made progress: its wait starts over, so a step of
+    /// many moves times out only once it stalls.
+    pub fn progressed(&mut self) {
+        self.since = None;
+    }
+
+    /// Moves the front step's wait `by` into the past, as if that much
+    /// time had passed (tests).
+    #[cfg(test)]
+    pub fn age(&mut self, by: Duration) {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.since = Some(since.checked_sub(by).unwrap_or(since));
     }
 
     /// Whether the front step has waited [`STEP_TIMEOUT`] since it became

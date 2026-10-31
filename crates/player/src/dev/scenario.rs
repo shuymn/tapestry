@@ -322,16 +322,6 @@ pub struct PracticeGoal {
     pub input: InputRef,
 }
 
-/// A `practice` step's rounds: `n` played, then the quit key at the start
-/// of the next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rounds {
-    /// Their input.
-    pub input: InputRef,
-    /// How many are played.
-    pub n: u16,
-}
-
 /// A loaded scenario: its library, its compiled steps, and what the run
 /// keeps of it.
 #[derive(Debug)]
@@ -634,13 +624,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 steps.push((SelectStep::PracticeKey(goal.input), o));
                 steps.push((SelectStep::PracticeSet(goal), o));
                 steps.push((SelectStep::PracticeStart, o));
-                steps.push((
-                    SelectStep::Rounds(Rounds {
-                        input: goal.input,
-                        n,
-                    }),
-                    o,
-                ));
+                steps.push((SelectStep::Rounds(n), o));
                 steps.push((SelectStep::PracticeBack, o));
                 waiting.clear();
                 chart_input = None;
@@ -1763,7 +1747,7 @@ mod tests {
     /// past the last, and the input is the log's.
     #[test]
     fn practice_step_compiles_to_its_keys() {
-        use super::{PracticeGoal, Rounds};
+        use super::PracticeGoal;
         let dir = folder();
         write_log(dir.path());
         let s = parse(
@@ -1809,7 +1793,7 @@ mod tests {
                 (SelectStep::PracticeKey(input), o),
                 (SelectStep::PracticeSet(goal), o),
                 (SelectStep::PracticeStart, o),
-                (SelectStep::Rounds(Rounds { input, n: 3 }), o),
+                (SelectStep::Rounds(3), o),
                 (SelectStep::PracticeBack, o),
             ]
         );

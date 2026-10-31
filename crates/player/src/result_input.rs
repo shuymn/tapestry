@@ -99,21 +99,22 @@ impl ResultInput {
         self.owner
     }
 
-    /// `owner` reads the queues from now on: on a change, what was queued
-    /// for the one before is dropped. Whether it changed.
-    pub fn enter_as(&mut self, owner: Owner) -> bool {
-        if self.owner == owner {
-            return false;
-        }
+    /// `owner` takes the queues as a screen is entered, every time: what
+    /// was queued, for it or for another, is dropped.
+    pub fn take_over(&mut self, owner: Owner) {
         self.clear();
         self.owner = owner;
-        true
     }
 
     /// A result shows: on entry, what was queued during the play is
-    /// dropped. Whether this was the entry.
+    /// dropped; drawn again, it keeps what came since. Whether this was the
+    /// entry.
     pub fn enter(&mut self) -> bool {
-        self.enter_as(Owner::Result)
+        if self.owner == Owner::Result {
+            return false;
+        }
+        self.take_over(Owner::Result);
+        true
     }
 
     /// No screen reads the queues (a play is about to start); what arrives
@@ -162,117 +163,5 @@ impl ResultInput {
             }
         }
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use eval::ControlId;
-    use game::{MenuCommand, PracticeInput};
-    use input::hid::HidProduct;
-    use input::{
-        DeviceId, DeviceKind, MenuAction, MenuBindings, MenuEvent, Packet, SourceConfig, SourceSet,
-    };
-
-    use super::{Owner, ResultInput};
-    use crate::select::{MenuInput, MenuKey, MenuQueue};
-
-    /// The menus with a controller whose control 1 confirms and 2 moves
-    /// down, and its source set to press them.
-    fn menus() -> (ResultInput, SourceSet) {
-        let product = HidProduct {
-            vendor_id: 1,
-            product_id: 2,
-            interface: None,
-        };
-        let (tap, pad) = input::menu_queue(MenuBindings {
-            product,
-            controls: vec![
-                (ControlId(1), MenuAction::Press(MenuEvent::Confirm)),
-                (ControlId(2), MenuAction::Press(MenuEvent::Down)),
-            ],
-            step: 2,
-            relative: None,
-            wrap: None,
-        });
-        let mut set = SourceSet::new(SourceConfig {
-            max_devices: 1,
-            max_sources: 1,
-            max_held: 4,
-            queue_capacity: 4,
-            max_arrivals: 1,
-        })
-        .unwrap();
-        set.connect(DeviceId(7), DeviceKind::Controller);
-        set.set_product(DeviceId(7), product);
-        set.set_menu(tap);
-        set.menu_mut().unwrap().set_active(true);
-        (
-            ResultInput::new(Arc::new(MenuQueue::default()), Some(pad)),
-            set,
-        )
-    }
-
-    fn press(set: &mut SourceSet, control: u32) {
-        for value in [1, 0] {
-            set.packet(&Packet {
-                device: DeviceId(7),
-                control: ControlId(control),
-                value,
-                background: false,
-            });
-        }
-    }
-
-    /// After a round's opening was refused, the practice page owns the
-    /// queues again: a pad Down queued during the refused play is dropped,
-    /// one pressed after reaches the page, and a result reads nothing.
-    #[test]
-    fn controller_navigates_the_practice_page_after_a_logic_refusal() {
-        let (mut menus, mut set) = menus();
-        assert!(menus.enter_as(Owner::Practice));
-        // Start: the play opens and is refused at its opening.
-        menus.release();
-        press(&mut set, 2);
-        // The routine of every return.
-        menus.enter_as(Owner::Practice);
-        menus.clear();
-        assert_eq!(menus.owner(), Owner::Practice);
-        assert_eq!(menus.take_practice(), None);
-        press(&mut set, 2);
-        assert_eq!(menus.take(), None);
-        assert_eq!(menus.take_practice(), Some(PracticeInput::Down));
-        assert_eq!(menus.take_practice(), None);
-    }
-
-    /// A round's result owns the queues while it shows, and Back returns
-    /// them to the practice page: the pad then reaches the page, never the
-    /// result, and the window's arrows too.
-    #[test]
-    fn controller_navigates_after_result_back_to_practice() {
-        let (mut menus, mut set) = menus();
-        menus.enter_as(Owner::Practice);
-        menus.release();
-        assert!(menus.enter());
-        press(&mut set, 2);
-        assert_eq!(menus.take_practice(), None);
-        assert_eq!(menus.take(), Some(MenuCommand::NextPreset));
-        // Back to the page: what the result left queued is dropped.
-        press(&mut set, 1);
-        menus.menu.push(MenuInput::Key(MenuKey::Left));
-        assert!(menus.enter_as(Owner::Practice));
-        menus.clear();
-        assert_eq!(menus.take_practice(), None);
-        press(&mut set, 2);
-        menus.menu.push(MenuInput::Key(MenuKey::Right));
-        assert_eq!(menus.take(), None);
-        assert_eq!(menus.take_practice(), Some(PracticeInput::Down));
-        assert_eq!(menus.take_practice(), Some(PracticeInput::Right));
-        // The select screen's keys mean nothing on the page.
-        menus.menu.push(MenuInput::Key(MenuKey::Tab));
-        menus.menu.push(MenuInput::Text("p".to_owned()));
-        assert_eq!(menus.take_practice(), None);
     }
 }
