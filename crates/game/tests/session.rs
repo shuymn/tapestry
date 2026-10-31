@@ -621,6 +621,121 @@ fn built_ins_are_chosen_by_name() {
     assert_eq!(shelf.chosen(), &rules::tapestry());
 }
 
+/// The chosen entry's name and whether it is a built-in.
+fn chosen_entry(shelf: &game::Shelf) -> (String, bool) {
+    let entries = shelf.entries();
+    let e = entries.iter().find(|e| e.chosen).unwrap();
+    (e.name.to_owned(), e.built_in)
+}
+
+/// Steps go through the shelf's list, the built-ins in their order and
+/// then the user files by name, wrapping at both ends; each change bumps
+/// the revision, and the chosen preset is the entry's.
+#[test]
+fn step_cycles_built_ins_then_user_files_and_wraps() {
+    let (_dir, root) = temp_root();
+    write_user_preset(&root, "b", &rules::lr2_style());
+    write_user_preset(&root, "a", &rules::tapestry());
+    let mut shelf = game::Shelf::open(root.presets(), "tapestry").unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        let before = shelf.revision();
+        assert!(shelf.step(game::PresetStep::Next));
+        assert!(shelf.revision() > before);
+        seen.push(chosen_entry(&shelf));
+        assert_eq!(shelf.chosen_name(), seen.last().unwrap().0);
+    }
+    let names: Vec<(&str, bool)> = seen.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+    assert_eq!(
+        names,
+        [
+            ("beatoraja-style", true),
+            ("lr2-style", true),
+            ("a", false),
+            ("b", false),
+            ("tapestry", true),
+        ]
+    );
+    assert_eq!(shelf.chosen(), &rules::tapestry());
+    assert!(shelf.step(game::PresetStep::Prev));
+    assert_eq!(chosen_entry(&shelf), ("b".to_owned(), false));
+    assert_eq!(shelf.chosen(), &named("b", rules::lr2_style()));
+    assert!(shelf.step(game::PresetStep::Prev));
+    assert_eq!(shelf.chosen(), &named("a", rules::tapestry()));
+}
+
+/// A step passes over every entry that does not load now: a malformed
+/// file, a file named like a built-in, a stem that is not a name, and a
+/// file that broke after it loaded. A chosen file that breaks stays chosen
+/// with its last good version and its error until a step leaves it; gone,
+/// it is dropped at the first check after.
+#[test]
+fn step_passes_over_presets_that_do_not_load() {
+    let (_dir, root) = temp_root();
+    write_user_preset(&root, "a", &rules::tapestry());
+    write_user_preset(&root, "c", &rules::lr2_style());
+    write_user_preset(&root, "tapestry", &rules::lr2_style());
+    write_user_preset(&root, "Bad Name", &rules::tapestry());
+    fs::write(user_preset_path(&root, "mal"), "not a preset").unwrap();
+    let mut shelf = game::Shelf::open(root.presets(), "lr2-style").unwrap();
+    // `a` breaks after it loaded: the step's check sees it.
+    rewrite(&user_preset_path(&root, "a"), "not a preset");
+    assert!(shelf.step(game::PresetStep::Next));
+    assert_eq!(chosen_entry(&shelf), ("c".to_owned(), false));
+    assert!(shelf.step(game::PresetStep::Next));
+    assert_eq!(chosen_entry(&shelf), ("tapestry".to_owned(), true));
+    assert_eq!(shelf.chosen(), &rules::tapestry());
+
+    // The chosen `c` breaks: it keeps its last good version and its error.
+    let mut shelf = game::Shelf::open(root.presets(), "c").unwrap();
+    let c = user_preset_path(&root, "c");
+    rewrite(&c, "not a preset");
+    let _ = shelf.check();
+    assert!(shelf.chosen_error().is_some());
+    assert_eq!(shelf.chosen(), &named("c", rules::lr2_style()));
+    // Gone, it is still chosen, until a step leaves it.
+    fs::remove_file(&c).unwrap();
+    let _ = shelf.check();
+    assert_eq!(chosen_entry(&shelf), ("c".to_owned(), false));
+    assert!(shelf.step(game::PresetStep::Next));
+    assert_eq!(chosen_entry(&shelf), ("tapestry".to_owned(), true));
+    assert_eq!(shelf.chosen_error(), None);
+    assert!(shelf.entries().iter().any(|e| e.name == "c"));
+    let _ = shelf.check();
+    assert!(!shelf.entries().iter().any(|e| e.name == "c"));
+    // Back the other way, only lr2-style loads before it.
+    assert!(shelf.step(game::PresetStep::Prev));
+    assert_eq!(chosen_entry(&shelf), ("lr2-style".to_owned(), true));
+}
+
+/// While the presets folder cannot be listed, a step chooses only among
+/// the built-ins: a user file could not be opened again at the next
+/// launch. The chosen user preset keeps its last good version until left.
+#[test]
+fn a_step_while_the_folder_cannot_be_listed_chooses_built_ins() {
+    let (_dir, root) = temp_root();
+    write_user_preset(&root, "a", &rules::tapestry());
+    write_user_preset(&root, "b", &rules::lr2_style());
+    let mut shelf = game::Shelf::open(root.presets(), "a").unwrap();
+    let kept = root.presets().with_extension("kept");
+    fs::rename(root.presets(), &kept).unwrap();
+    // A file where the folder was: listing it fails.
+    fs::write(root.presets(), b"").unwrap();
+    let _ = shelf.check();
+    assert!(shelf.listing_error().is_some());
+    assert_eq!(shelf.chosen(), &named("a", rules::tapestry()));
+    // `b` is passed over: the step wraps to the first built-in.
+    assert!(shelf.step(game::PresetStep::Next));
+    assert_eq!(chosen_entry(&shelf), ("tapestry".to_owned(), true));
+    assert!(shelf.step(game::PresetStep::Prev));
+    assert_eq!(chosen_entry(&shelf), ("lr2-style".to_owned(), true));
+    // Listed again, the user files are choices again.
+    fs::remove_file(root.presets()).unwrap();
+    fs::rename(&kept, root.presets()).unwrap();
+    assert!(shelf.step(game::PresetStep::Next));
+    assert_eq!(chosen_entry(&shelf), ("a".to_owned(), false));
+}
+
 /// A user preset is `presets/<name>.toml`, its stem its preset ID; the
 /// shelf lists it beside the built-ins.
 #[test]
