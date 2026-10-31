@@ -8,7 +8,8 @@
 //! on WARP. `play --auto <chart> --dev-headless` runs autoplay the same
 //! way. `--dev-frames <dir>` also writes a countdown frame, a play frame
 //! and the end screen there as PNG files. `--dev-overlay` shows the
-//! measurement overlay from the start.
+//! measurement overlay from the start. `--dev-start <ms>` plays a mid-chart
+//! start from that time of the chart to its end.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -158,6 +159,9 @@ pub struct Options {
     /// (`--dev-render-timeout <seconds>`): a run on WARP on a loaded machine
     /// can take tens of seconds for a frame.
     pub render_timeout: Option<std::time::Duration>,
+    /// Play a mid-chart start from this time of the chart's 1× time to its
+    /// end (`--dev-start <ms>`; design.md "Shortening Launch-Based Checks").
+    pub start: Option<TimeUs>,
 }
 
 impl Options {
@@ -172,6 +176,12 @@ impl Options {
     pub fn play_input(&self, input: crate::PlayInput) -> Result<crate::PlayInput, UsageError> {
         let log = self.scripted_input.clone();
         let auto = matches!(input, crate::PlayInput::Autoplay);
+        // Autoplay plays whole charts only.
+        if self.start.is_some() && (auto || self.perfect) {
+            return Err(UsageError::Usage(
+                "--dev-start cannot be used with --auto or --dev-perfect".to_owned(),
+            ));
+        }
         match input {
             crate::PlayInput::Autoplay if log.is_some() => Err(UsageError::Usage(
                 "--auto and --dev-scripted-input cannot be used together".to_owned(),
@@ -216,6 +226,7 @@ impl Options {
             "dev-scripted-input" => self.scripted_input = Some(PathBuf::from(p.value()?)),
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
+            "dev-start" => self.start = Some(start(p)?),
             "dev-result" => {
                 let steps = p.value()?;
                 self.result =
@@ -225,6 +236,16 @@ impl Options {
         }
         Ok(())
     }
+}
+
+/// The value of `--dev-start`: whole milliseconds, 0 or more, as a time.
+fn start(p: &mut lexopt::Parser) -> Result<TimeUs, UsageError> {
+    let bad = || UsageError::Usage("--dev-start takes milliseconds, 0 or more".to_owned());
+    let ms: i64 = p.value()?.to_string_lossy().parse().map_err(|_| bad())?;
+    if ms < 0 {
+        return Err(bad());
+    }
+    ms.checked_mul(1_000).map(TimeUs).ok_or_else(bad)
 }
 
 /// The value of `--dev-render-timeout`, in seconds.

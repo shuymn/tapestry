@@ -4,17 +4,31 @@
 //!
 //! Each round runs reset → restore → lead-in → section evaluation through
 //! the play lifecycle every driver shares ([`crate::live`]), and is one
-//! attempt and one saved record. Its recording opens at the lead-in's
-//! start, where the countdown begins, and its audio is restored there:
-//! the schedule is the BGM with the key sounds of every note that is not a
-//! target, played as autoplay ([`schedule`]). Completion comes at the
+//! attempt and one saved record. Its recording opens [`RESTORE_AHEAD`]
+//! before the lead-in's start, where the countdown begins, so the play's
+//! origin is fixed before its audio is restored at the lead-in's start
+//! ([`crate::restore`]): the schedule is the BGM with the key sounds of
+//! every note that is not a target, played as autoplay ([`schedule`]).
+//! Completion comes at the
 //! section's final deadline; the round then rings out for [`RING_OUT`],
 //! fading over its last [`FADE`], instead of the full play's audio tail,
 //! and the frozen record is saved once the ring-out has ended.
 
-use bms_model::{BgmEvent, Chart, Note, Speed, TimeUs};
+use bms_model::{BgmEvent, Chart, NoteKind, Speed, TimeUs};
 use eval::{DeviceProfile, EvalError, Evaluator, InputStart, Section};
 use rules::{GaugeValue, RulePreset};
+
+/// The lead-in a practice starts with (tuned by playing).
+pub const LEAD_IN: TimeUs = TimeUs(2_000_000);
+/// How long before its lead-in a round's recording opens (tuned by
+/// playing): the opening fixes the play's origin, so the restore is planned
+/// on it for the lead-in's start, this far in the future, and lands on time
+/// although the output is written ahead.
+pub const RESTORE_AHEAD: TimeUs = TimeUs(200_000);
+/// How much later than the lead-in's start the fallback restore is
+/// planned for, should the first be late: a game thread slower than
+/// [`RESTORE_AHEAD`] minus the queued output.
+pub const RESTORE_RETRY: TimeUs = TimeUs(500_000);
 
 /// How long a round's ring-out lasts from completion (tuned by playing).
 pub const RING_OUT: TimeUs = TimeUs(1_500_000);
@@ -50,6 +64,10 @@ pub enum PracticeError {
     /// gauges are unusable for the chart and the preset.
     #[error("the section cannot be evaluated")]
     Section(#[source] EvalError),
+    /// No tap or long note of the chart is a target of the section: there
+    /// is nothing to play.
+    #[error("the section has no notes to play")]
+    NoTargets,
 }
 
 /// `t` of the chart's 1× time in the real time of a chart loaded at
@@ -76,17 +94,66 @@ impl Practice {
     }
 }
 
+/// Where a practice to the chart's end ends, in 1× time, for `chart` as
+/// loaded at `speed`: `ceil((r + 1) × k/20)`, where `r` is the latest note
+/// end of the loaded chart, so that `floor(end × 20/k) ≥ r + 1` and the
+/// last note stays inside the section at every speed.
+#[must_use]
+pub fn chart_end(chart: &Chart, speed: Speed) -> TimeUs {
+    let last = chart
+        .lanes
+        .iter()
+        .flatten()
+        .map(|n| n.end().0)
+        .max()
+        .unwrap_or(0);
+    let k = i128::from(speed.twentieths());
+    let end = (i128::from(last) + 1) * k;
+    let end = end.div_euclid(20) + i128::from(end.rem_euclid(20) != 0);
+    TimeUs(i64::try_from(end).unwrap_or(i64::MAX))
+}
+
+/// A mid-chart start from `start` (the chart's 1× time) to the chart's end
+/// ([`chart_end`]) of `chart` as loaded at `speed`: one round with the
+/// default lead-in ([`LEAD_IN`]) and every gauge of `preset` at its start.
+/// [`Loaded::set_practice`](crate::Loaded::set_practice) checks it.
+#[must_use]
+pub fn mid_chart_start(
+    chart: &Chart,
+    speed: Speed,
+    preset: &RulePreset,
+    start: TimeUs,
+) -> Practice {
+    Practice {
+        start,
+        end: chart_end(chart, speed),
+        lead_in: LEAD_IN,
+        initial_gauges: preset.gauges.iter().map(|g| g.start).collect(),
+        repeat: false,
+    }
+}
+
 /// Checks that `section` can be evaluated on `chart` under `preset`, as a
-/// round's opening would.
+/// round's opening would, and that it has a tap or long note to play.
 ///
 /// # Errors
 ///
-/// What [`Evaluator::new`] refuses.
+/// [`PracticeError::NoTargets`] for a section without a tap or long note
+/// among its targets, then what [`Evaluator::new`] refuses.
 pub(crate) fn check(
     chart: &Chart,
     preset: &RulePreset,
     section: &Section,
 ) -> Result<(), PracticeError> {
+    let playable = |n: &bms_model::Note| matches!(n.kind, NoteKind::Tap | NoteKind::Long { .. });
+    if !chart
+        .lanes
+        .iter()
+        .flatten()
+        .any(|n| playable(n) && section.is_target(n))
+    {
+        return Err(PracticeError::NoTargets);
+    }
     let device = DeviceProfile {
         sources: Vec::new(),
     };
@@ -102,18 +169,11 @@ pub(crate) fn check(
     .map_err(PracticeError::Section)
 }
 
-/// Whether `note` is a target of `section` (design.md "Section
-/// Evaluation"): a tap or mine with `start ≤ t < end`, a long note with
-/// `start ≤ head` and its end before `end`.
-fn is_target(section: &Section, note: &Note) -> bool {
-    section.start <= note.time && note.time < section.end && note.end() < section.end
-}
-
 /// The audio schedule of a round of `section`: the chart's BGM merged with
 /// the key sound of every note that is not a target, at the note's time,
 /// as autoplay plays it (before the section, after its end, and long notes
 /// crossing either edge).
 #[must_use]
 pub(crate) fn schedule(chart: &Chart, section: &Section) -> Vec<BgmEvent> {
-    crate::autoplay::schedule_where(chart, |n| !is_target(section, n))
+    crate::autoplay::schedule_where(chart, |n| !section.is_target(n))
 }

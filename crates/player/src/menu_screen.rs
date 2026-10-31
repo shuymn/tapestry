@@ -9,6 +9,7 @@
 //! where allocation is allowed.
 
 use bms_model::Chart;
+use eval::Section;
 use render::text::{Fonts, MenuText, TextBlock, TextStyle};
 use render::{Blend, FrameTiming, RenderError, Renderer, Sprite, solid_uv};
 
@@ -141,8 +142,8 @@ impl MenuScreen {
 }
 
 impl Screen for MenuScreen {
-    fn load(&mut self, chart: &Chart) -> Result<(), RenderError> {
-        self.renderer.load(chart)
+    fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError> {
+        self.renderer.load(chart, section)
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

@@ -446,3 +446,50 @@ fn measure_play_needs_presentmon() {
     let usage = run(&["measure"]);
     assert_eq!(usage.status.code(), Some(2));
 }
+
+/// `--dev-start` takes whole milliseconds, 0 or more, and goes with the
+/// devices or an input log only; a value that is not one, is negative or
+/// overflows microseconds is a usage error before anything opens.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn dev_start_takes_milliseconds() {
+    let line = "--dev-start takes milliseconds, 0 or more\n";
+    for value in ["x", "-1", "1.5", "9223372036854776", "9223372036854775808"] {
+        let out = run(&["play", "a.bms", "--dev-start", value]);
+        assert_eq!(out.status.code(), Some(2), "{value}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), line, "{value}");
+    }
+    let out = run(&["play", "a.bms", "--dev-start"]);
+    assert_eq!(out.status.code(), Some(2));
+    for with in ["--auto", "--dev-perfect"] {
+        let out = run(&["play", "a.bms", with, "--dev-start", "4000"]);
+        assert_eq!(out.status.code(), Some(2), "{with}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "--dev-start cannot be used with --auto or --dev-perfect\n",
+            "{with}"
+        );
+    }
+    // Taken: the run fails on the missing chart instead. The largest value
+    // that fits is taken too.
+    let dir = tempfile::tempdir().unwrap();
+    for value in ["0", "4000", "9223372036854775"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+            .arg("play")
+            .arg(dir.path().join("missing.bms"))
+            .args(["--dev-start", value])
+            .env("LOCALAPPDATA", dir.path())
+            .output()
+            .expect("run tapestry");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{value}: {stderr}");
+        assert!(stderr.contains("missing."), "{stderr}");
+    }
+}
+
+/// A production build reports `--dev-start` as unknown.
+#[cfg(not(feature = "dev-tools"))]
+#[test]
+fn dev_start_takes_milliseconds() {
+    assert_unknown(&["play", "a.bms", "--dev-start", "4000"], "--dev-start");
+}

@@ -861,7 +861,7 @@ impl AppRig for PlayerRig<'_> {
             .map_err(ChartLoadError::Audio)?;
         let shared = Arc::new(chart.clone());
         self.render
-            .load(Arc::clone(&shared))
+            .load(Arc::clone(&shared), None)
             .map_err(ChartLoadError::Screen)?;
         // Its gain, from the cache, or its analysis.
         if let Some(sel) = &mut self.selection {

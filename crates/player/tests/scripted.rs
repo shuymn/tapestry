@@ -1115,3 +1115,154 @@ fn missing_sounds_are_summed_up_once() {
         "{line:?} in {logged:?}"
     );
 }
+
+/// A mono 16-bit sound at 48 kHz, the output's rate, so it is not
+/// converted and its clicks keep their frames: `frames` long, silent but
+/// for a 2 ms click from each frame of `clicks`.
+fn write_clicks(path: &Path, frames: usize, clicks: &[usize]) {
+    let samples: Vec<i16> = (0..frames)
+        .map(|i| {
+            let into = clicks
+                .iter()
+                .find_map(|&c| i.checked_sub(c).filter(|&d| d < 96));
+            match into {
+                Some(d) if d % 8 < 4 => 8_000,
+                Some(_) => -8_000,
+                None => 0,
+            }
+        })
+        .collect();
+    let data = u32::try_from(samples.len() * 2).unwrap();
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16_u32.to_le_bytes());
+    // PCM, mono, 48 kHz, 96 000 bytes/s, 2-byte frames of 16 bits.
+    b.extend_from_slice(&[1, 0, 1, 0]);
+    b.extend_from_slice(&48_000_u32.to_le_bytes());
+    b.extend_from_slice(&96_000_u32.to_le_bytes());
+    b.extend_from_slice(&[2, 0, 16, 0]);
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for s in samples {
+        b.extend_from_slice(&s.to_le_bytes());
+    }
+    fs::write(path, b).unwrap();
+}
+
+/// 120 BPM, 2 s a measure. BGM: `long.wav` at 0 (4 s, silent but for a
+/// click 3.0 s in), `click.wav` at 1.0 s, 2.05 s and 3.5 s. Targets: lane 1
+/// at 4.0 and 4.5 s.
+const START_CHART: &str = "#PLAYER 1\n#TITLE start\n#BPM 120\n#WAV01 long.wav\n\
+                           #WAV02 click.wav\n#00001:01\n#00001:0002\n\
+                           #00101:00020000000000000000000000000000000000000000000000000000000000000000000000000000\n\
+                           #00101:00000002\n#00211:0202\n";
+
+/// The fixture of `text`, with `long.wav` and `click.wav` beside it.
+fn start_fixture(text: &str) -> Fixture {
+    let fx = fixture_of(text);
+    let dir = fx.chart_path.parent().unwrap();
+    write_clicks(&dir.join("long.wav"), 4 * 48_000, &[3 * 48_000]);
+    write_clicks(&dir.join("click.wav"), 2_400, &[0]);
+    fx
+}
+
+/// The onsets the run printed, in output frames.
+fn printed_onsets(stdout: &str) -> Vec<i64> {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("dev: audio onsets "))
+        .and_then(|l| l.split_once(": "))
+        .map(|(_, frames)| frames.split(' ').map(|f| f.parse().unwrap()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn dev_start_starts_the_play_at_that_time() {
+    let fx = start_fixture(START_CHART);
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .args(["--dev-start", "4000"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    println!("{stdout}{stderr}");
+    assert_eq!(out.status.code(), Some(0));
+    // One round, both targets hit, saved as a mid-chart start from 4 s with
+    // a 2 s lead-in, recording from 1.8 s.
+    assert_eq!(stdout.matches("play started").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("play 1: Completed; perfect 2 great 0 good 0 bad 0 poor 0"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("re-evaluation matches live: true"));
+    let saved = records(&fx.appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    let PlayType::MidChartStart(practice) = &rec.play_type else {
+        panic!("{:?}", rec.play_type);
+    };
+    assert_eq!(practice.start, TimeUs(4_000_000));
+    assert_eq!(practice.lead_in, TimeUs(2_000_000));
+    assert_eq!(practice.attempt, 1);
+    assert_eq!(rec.start.opened_at, TimeUs(1_800_000));
+    // The run is on real threads, so which plan lands depends on how fast
+    // the game thread got from the opening to the start: the first plan
+    // within 200 ms minus the queued output, the fallback within 700 ms;
+    // past that the restore is refused as late and the round plays with
+    // its background music stopped. Whichever it is, nothing due before
+    // the restore point sounds: not the 1.0 s click, nor the schedule from
+    // chart time 0.
+    let first = stdout.contains("audio: restored at 2000 ms (first)");
+    let fallback = stdout.contains("audio: restored at 2500 ms (fallback)");
+    let refused = stdout.contains("audio: not restored (Late)");
+    assert_eq!(
+        u8::from(first) + u8::from(fallback) + u8::from(refused),
+        1,
+        "{stdout}"
+    );
+    let onsets = printed_onsets(&stdout);
+    // Refused: only the targets' two key sounds, sent from their
+    // judgments.
+    if refused {
+        assert_eq!(onsets.len(), 2, "{onsets:?}");
+        return;
+    }
+    // The restored long voice's click (3.0 s) and the marker (3.5 s) sound
+    // exactly 0.5 s apart, both restore points being before 3.0 s; the
+    // 2.05 s click only after a restore at the lead-in's start; then the
+    // two key sounds.
+    let gaps: Vec<i64> = onsets.windows(2).map(|w| w[1] - w[0]).collect();
+    let near = |gap: i64, want: i64| (gap - want).abs() <= 1;
+    let lead = usize::from(first);
+    assert_eq!(onsets.len(), lead + 4, "{onsets:?}");
+    if first {
+        // 2.05 s to 3.0 s.
+        assert!(near(gaps[0], 45_600), "{onsets:?}");
+    }
+    assert!(near(gaps[lead], 24_000), "{onsets:?}");
+}
+
+#[test]
+fn dev_start_inside_a_lone_long_note_exits_one() {
+    // One long note on lane 1 from 1 s to 6 s: a start at 4 s leaves no
+    // tap or long note to play.
+    let text = "#PLAYER 1\n#TITLE lone\n#BPM 120\n#LNTYPE 1\n#WAV01 click.wav\n\
+                #00051:0001\n#00351:01\n";
+    let fx = fixture_of(text);
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .args(["--dev-start", "4000"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    println!("{stdout}{stderr}");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr.contains("the section has no notes to play"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("play started"), "{stdout}");
+    assert!(!fx.appdata.join("tapestry").join("records").exists());
+}

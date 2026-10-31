@@ -4,7 +4,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{Lane, TimeUs};
+use bms_model::{Lane, Note, TimeUs};
 use rules::GaugeValue;
 
 /// A source: one physical device, with its own queue and input offset.
@@ -86,6 +86,18 @@ pub struct Section {
     /// Each gauge's value at the start, in the preset's order: one per
     /// gauge, within its bounds, and above 0 for a survival gauge.
     pub initial_gauges: Vec<GaugeValue>,
+}
+
+impl Section {
+    /// Whether `note` is one of the section's targets: a tap or mine with
+    /// `start ≤ t < end`, a long note with `start ≤ head` and its end
+    /// before `end`. The one rule the evaluator, a round's audio schedule
+    /// and the play screen share (design.md "Section Evaluation").
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn is_target(&self, note: &Note) -> bool {
+        self.start <= note.time && note.time < self.end && note.end() < self.end
+    }
 }
 
 /// A control bound to a lane.

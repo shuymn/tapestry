@@ -15,7 +15,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, ScrollMap, TimeUs};
-use eval::{JudgeEvent, JudgeEventKind};
+use eval::{JudgeEvent, JudgeEventKind, Section};
 use rules::{GaugeValue, Judgment};
 
 use crate::atlas::{GLYPH_H, GLYPH_W, glyph_uv, solid_uv};
@@ -241,17 +241,30 @@ impl SimpleSkin {
     }
 
     /// Takes `chart`'s notes, bar lines and scroll, and resets the play
-    /// state. This is all of `prepare`; the skin needs nothing from the GPU.
+    /// state. With a practice round's `section`, every note that is not one
+    /// of its targets is marked done, so only the targets are drawn
+    /// (design.md "Mid-Chart Start and Section Repeat"); the notes keep their
+    /// indices, which effects name. This is all of `prepare`; the skin needs
+    /// nothing from the GPU.
     #[expect(
         clippy::indexing_slicing,
         reason = "loading before play: `from_fn` passes lane indices below LANE_COUNT"
     )]
-    pub fn load(&mut self, chart: &Chart) {
+    pub fn load(&mut self, chart: &Chart, section: Option<&Section>) {
         self.lanes = chart.lanes.clone();
         self.bar_lines = chart.bar_lines.clone();
         self.scroll = chart.scroll.clone();
         self.held = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
         self.done = std::array::from_fn(|l| Bits::sized(self.lanes[l].len()));
+        if let Some(section) = section {
+            for (notes, done) in self.lanes.iter().zip(&mut self.done) {
+                for (i, note) in notes.iter().enumerate() {
+                    if !section.is_target(note) {
+                        done.set(i);
+                    }
+                }
+            }
+        }
         self.active = [None; LANE_COUNT];
         self.pressed = [None; LANE_COUNT];
         self.hit = [None; LANE_COUNT];
@@ -551,8 +564,13 @@ impl SimpleSkin {
 }
 
 impl PlaySkin for SimpleSkin {
-    fn prepare(&mut self, _gpu: &Gpu, chart: &Chart) -> Result<(), SkinError> {
-        self.load(chart);
+    fn prepare(
+        &mut self,
+        _gpu: &Gpu,
+        chart: &Chart,
+        section: Option<&Section>,
+    ) -> Result<(), SkinError> {
+        self.load(chart, section);
         Ok(())
     }
 
@@ -798,7 +816,7 @@ mod tests {
 
     fn skin(chart: &Chart) -> SimpleSkin {
         let mut s = SimpleSkin::new();
-        s.load(chart);
+        s.load(chart, None);
         s
     }
 
@@ -1346,6 +1364,65 @@ mod tests {
             [[320.0, JUDGE_Y - NOTE_H / 2.0, 64.0, NOTE_H]]
         );
         assert!(in_lane(&batch, lane(3), NOTE_WHITE).is_empty());
+    }
+
+    /// Taps on key 1 at 1.0, 1.1, 1.2 and 1.3 s; a long note on key 2 from
+    /// 1.15 s to 1.3 s and one on key 3 from 1.15 s to 1.2 s; and the
+    /// section `[1.1 s, 1.25 s)`, whose targets are the taps at 1.1 and
+    /// 1.2 s and key 3's long note.
+    fn sectioned() -> (Chart, Section) {
+        let mut b = ChartBuilder::new(BPM)
+            .long(lane(2), TimeUs(1_150 * MS), TimeUs(1_300 * MS))
+            .long(lane(3), TimeUs(1_150 * MS), TimeUs(1_200 * MS));
+        for t in [1_000, 1_100, 1_200, 1_300] {
+            b = b.tap(lane(1), TimeUs(t * MS));
+        }
+        let section = Section {
+            start: TimeUs(1_100 * MS),
+            end: TimeUs(1_250 * MS),
+            lead_in: TimeUs(0),
+            initial_gauges: Vec::new(),
+        };
+        (b.build().unwrap(), section)
+    }
+
+    /// The taps on key 1 and the long notes' sprites on keys 2 and 3 drawn
+    /// at 0.9 s, when every note is on screen.
+    fn notes_drawn(s: &mut SimpleSkin) -> (usize, usize, usize) {
+        let v = view();
+        let batch = build(s, &frame(&v, 900 * MS, &[]));
+        let sprites = |l| long_parts(&batch, lane(l)).iter().map(Vec::len).sum();
+        (
+            in_lane(&batch, lane(1), note_color(lane(1))).len(),
+            sprites(2),
+            sprites(3),
+        )
+    }
+
+    #[test]
+    fn only_section_targets_are_drawn() {
+        let (chart, section) = sectioned();
+        let mut s = SimpleSkin::new();
+        s.load(&chart, Some(&section));
+        let (taps, crossing, inside) = notes_drawn(&mut s);
+        assert_eq!(taps, 2);
+        assert_eq!(crossing, 0);
+        assert!(inside > 0);
+        // The drawn taps are those at 1.1 and 1.2 s, which keep their
+        // indices: an effect on note 1 still finds it.
+        assert!(!s.done[1].get(1) && !s.done[1].get(2));
+        assert!(s.done[1].get(0) && s.done[1].get(3));
+    }
+
+    #[test]
+    fn a_full_play_after_a_section_draws_every_note() {
+        let (chart, section) = sectioned();
+        let mut s = SimpleSkin::new();
+        s.load(&chart, Some(&section));
+        s.load(&chart, None);
+        let (taps, crossing, inside) = notes_drawn(&mut s);
+        assert_eq!(taps, 4);
+        assert!(crossing > 0 && inside > 0);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{Chart, TimeUs};
-use eval::JudgeEvent;
+use eval::{JudgeEvent, Section};
 use game::PlayView;
 
 use crate::{Gpu, SpriteBatch};
@@ -55,12 +55,18 @@ pub struct SkinError {
 /// needs is sized in `prepare`.
 pub trait PlaySkin: Send {
     /// Takes what the skin needs from `chart` and the GPU, and resets any
-    /// per-play state, so a retry calls it again.
+    /// per-play state, so a retry calls it again. With a practice round's
+    /// `section`, only its targets are drawn ([`Section::is_target`]).
     ///
     /// # Errors
     ///
     /// Returns why the skin cannot draw this chart.
-    fn prepare(&mut self, gpu: &Gpu, chart: &Chart) -> Result<(), SkinError>;
+    fn prepare(
+        &mut self,
+        gpu: &Gpu,
+        chart: &Chart,
+        section: Option<&Section>,
+    ) -> Result<(), SkinError>;
 
     /// Fills `out`, which arrives empty, with the frame's sprites.
     fn build(&mut self, f: &FrameInput<'_>, out: &mut SpriteBatch);

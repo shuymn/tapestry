@@ -141,6 +141,26 @@ fn section_boundaries_follow_the_half_open_rule() {
 }
 
 #[test]
+fn section_targets_follow_the_table() {
+    // D13's five rows for [10 s, 20 s), and a mine on each edge.
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(10 * S))
+        .tap(lane(2), TimeUs(20 * S))
+        .long(lane(3), TimeUs(15 * S), TimeUs(20 * S))
+        .long(lane(4), TimeUs(15 * S), TimeUs(20 * S - 1))
+        .long(lane(5), TimeUs(9_900 * MS), TimeUs(15 * S))
+        .mine(lane(6), TimeUs(10 * S), 2)
+        .mine(lane(7), TimeUs(20 * S), 2)
+        .build()
+        .unwrap();
+    let s = ten_to_twenty(&rules::tapestry());
+    let targets: Vec<bool> = (1..=7)
+        .map(|l| s.is_target(&chart.lanes[lane(l).index()][0]))
+        .collect();
+    assert_eq!(targets, [true, false, false, true, false, true, false]);
+}
+
+#[test]
 fn ln_crossing_a_section_edge_is_excluded() {
     // Each long note held for its whole length; only the one inside
     // [10 s, 20 s) counts.

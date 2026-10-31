@@ -28,6 +28,7 @@ mod prepare;
 pub mod presets;
 mod queue;
 mod render;
+mod restore;
 pub mod result_screen;
 mod results;
 mod runner;
@@ -58,7 +59,10 @@ pub use policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy,
 };
-pub use practice::{FADE, Practice, PracticeError, RING_OUT};
+pub use practice::{
+    FADE, LEAD_IN, Practice, PracticeError, RESTORE_AHEAD, RESTORE_RETRY, RING_OUT, chart_end,
+    mid_chart_start,
+};
 pub use prepare::{
     BmsIngest, ChartIngest, ChartTransform, IngestError, Ingested, Passthrough, TransformId,
 };
@@ -67,6 +71,7 @@ pub use presets::{
 };
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
 pub use render::{PlayView, RenderSide, RenderSink};
+pub use restore::{Restore, RestoreError, RestoreRefusal, Restored, Restorer};
 pub use result_screen::{
     EntryId, GaugeEnd, NOTICES, Notice, RESULT_CACHE, ResultScreen, SHOWN_GAUGES, ViewEntry,
     ViewStatus, ViewSummary, what_if_bytes,
@@ -84,7 +89,7 @@ pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, wr
 pub use session::{
     AutoKeySounds, Command, Loaded, MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport,
     PlayScript, PlayStart, RECORDING_MEMORY, Reservation, SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS,
-    Session, SessionConfig, SessionError, Settings, wake_policy,
+    Session, SessionConfig, SessionError, SessionPlayError, Settings, wake_policy,
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,

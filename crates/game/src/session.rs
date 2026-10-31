@@ -35,11 +35,12 @@ use crate::policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
     SessionPolicy, SharedEvents,
 };
-use crate::practice::{Practice, PracticeError};
+use crate::practice::{Practice, PracticeError, RESTORE_AHEAD};
 use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passthrough};
 use crate::presets::{PresetChange, Shelf, ShelfError};
 use crate::render::PlayView;
 use crate::render::RenderSide;
+use crate::restore::RestoreError;
 use crate::results::{ReEvaluate, ResultContext, ResultExtension, ResultSummary};
 use crate::save::{LocalRecords, RecordRef, RecordSink, SaveError};
 use crate::settings::{DataRoot, DeviceSettings, KeyConfig, PlayerSettings, SettingsError};
@@ -580,14 +581,23 @@ impl Loaded {
     }
 
     /// Where a play's recording opens, in its chart time: the countdown
-    /// before chart time 0 for a full play, the lead-in's start for a
-    /// round.
+    /// before chart time 0 for a full play, [`RESTORE_AHEAD`] before the
+    /// lead-in's start for a round, so the play's origin is fixed before its
+    /// audio is restored there ([`restore_at`](Self::restore_at)).
     #[must_use]
     pub fn opens_at(&self) -> TimeUs {
-        match self.section() {
-            Some(s) => TimeUs(s.start.0.saturating_sub(s.lead_in.0)),
+        match self.restore_at() {
+            Some(at) => TimeUs(at.0.saturating_sub(RESTORE_AHEAD.0)),
             None => TimeUs(-self.config.lead_in.0),
         }
+    }
+
+    /// Where a round's audio is restored, in its chart time: its lead-in's
+    /// start; `None` for a full play.
+    #[must_use]
+    pub fn restore_at(&self) -> Option<TimeUs> {
+        self.section()
+            .map(|s| TimeUs(s.start.0.saturating_sub(s.lead_in.0)))
     }
 
     /// The chart to be played, after the transform.
@@ -1138,15 +1148,24 @@ impl<O: AudioOutput + Wakes> Session<O> {
     ///
     /// # Errors
     ///
-    /// What [`Logic::new`] refuses (for example a key config binding one
-    /// control twice); recording is closed again and nothing is played.
-    pub fn play(&mut self, script: PlayScript) -> Result<PlayReport, LogicError> {
+    /// [`SessionPlayError::Logic`] for what [`Logic::new`] refuses (for
+    /// example a key config binding one control twice): recording is closed
+    /// again and nothing is played. [`SessionPlayError::Restore`] for a
+    /// round whose schedule is not the engine's (a practice set on the
+    /// [`Loaded`] before [`Loaded::start`] rather than through
+    /// [`set_practice`](Self::set_practice)): refused before recording
+    /// opens.
+    pub fn play(&mut self, script: PlayScript) -> Result<PlayReport, SessionPlayError> {
         let Self {
             loaded,
             audio,
             sources,
             clock,
         } = self;
+        // The round's schedule, which the engine must be playing.
+        let restorer = loaded
+            .section()
+            .map(|_| crate::Restorer::new(audio.engine().seek_source(), loaded.audio_schedule()));
         let mut rig = SessionRig {
             step: loaded.config.step,
             clock,
@@ -1160,11 +1179,14 @@ impl<O: AudioOutput + Wakes> Session<O> {
             screen: None,
             failure: None,
             sealed: false,
+            restorer,
+            restore: None,
         };
         match crate::live::play(loaded, &mut rig) {
             Ok(Some(report)) => Ok(report),
             Ok(None) => unreachable!("a session never quits before recording opens"),
-            Err(LiveError::Logic(e)) => Err(e),
+            Err(LiveError::Logic(e)) => Err(SessionPlayError::Logic(e)),
+            Err(LiveError::Restore(e)) => Err(SessionPlayError::Restore(e)),
             Err(LiveError::Screen(e)) => match e {},
             Err(LiveError::Audio(_)) => {
                 unreachable!("a session has no audio thread to fail")
@@ -1174,6 +1196,17 @@ impl<O: AudioOutput + Wakes> Session<O> {
             }
         }
     }
+}
+
+/// Why [`Session::play`] did not play.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SessionPlayError {
+    /// The logic step refused to start.
+    #[error("the play cannot start")]
+    Logic(#[source] LogicError),
+    /// A round's audio cannot be restored; the round did not start.
+    #[error("the round's audio cannot be restored")]
+    Restore(#[source] RestoreError),
 }
 
 /// The session's rig: one step of the virtual clock per wait, the script
@@ -1194,6 +1227,10 @@ struct SessionRig<'s, O> {
     screen: Option<RenderSide>,
     failure: Option<OutputError>,
     sealed: bool,
+    /// What restores a round's audio, as the player's rig keeps one.
+    restorer: Option<crate::Restorer>,
+    /// A round's restore, planned at its opening, applied with its start.
+    restore: Option<Box<crate::Restore>>,
 }
 
 impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
@@ -1289,7 +1326,14 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide) {
-        self.audio.engine_mut().restart(origin);
+        let engine = self.audio.engine_mut();
+        engine.restart(origin);
+        // As the audio thread restores a round: the lead-in's start, else
+        // its fallback, else silence (design.md "Mid-Chart Start and
+        // Section Repeat").
+        if let Some(restore) = self.restore.take() {
+            restore.apply(engine);
+        }
         self.sounds = Some(sounds);
         self.screen = Some(screen);
         self.sealed = false;
@@ -1328,22 +1372,20 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
         self.sealed = true;
     }
 
-    fn restore_audio(&mut self, at: TimeUs) {
-        let engine = self.audio.engine_mut();
-        // The output mixes ahead: a time whose frame is already written is
-        // restored at the first frame that is not, as a later seek is
-        // planned (design.md "Audio").
-        let line = engine.frame_line();
-        let written = i128::from(engine.written());
-        let rate = i128::from(line.rate.max(1));
-        let first = (written * 1_000_000 + rate - 1) / rate - i128::from(line.base_us);
-        let at = TimeUs(at.0.max(i64::try_from(first).unwrap_or(i64::MAX)));
-        let plan = ::audio::SeekPlan::new(&engine.seek_source(), engine.schedule(), line, at);
-        // The engine's own schedule, line and written frames: neither is
-        // refused.
-        if let Ok(plan) = plan {
-            let _ = engine.seek(&plan);
-        }
+    fn restore_ready(&mut self, _at: TimeUs) -> Result<(), RestoreError> {
+        self.restore = None;
+        self.restorer
+            .as_ref()
+            .ok_or(RestoreError::NotPrepared)?
+            .check()
+    }
+
+    fn restore_audio(&mut self, origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
+        let restorer = self.restorer.as_ref().ok_or(RestoreError::NotPrepared)?;
+        // On the line of the opening's origin, before the play starts there.
+        let line = self.audio.engine().frame_line_at(origin);
+        self.restore = Some(restorer.plan(line, at)?);
+        Ok(())
     }
 
     fn audio_done(&self) -> bool {

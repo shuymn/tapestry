@@ -1607,7 +1607,11 @@ mod tests {
     }
 
     impl crate::render_side::Screen for Stalling {
-        fn load(&mut self, _chart: &bms_model::Chart) -> Result<(), render::RenderError> {
+        fn load(
+            &mut self,
+            _chart: &bms_model::Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), render::RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {

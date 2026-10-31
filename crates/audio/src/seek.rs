@@ -31,6 +31,16 @@ pub struct SeekSource {
     pub(crate) voices: usize,
 }
 
+impl SeekSource {
+    /// Whether `schedule` is the one the engine plays, by its hash: a plan
+    /// from any other is refused ([`SeekPlan::new`]). Work in proportion to
+    /// the schedule, off the audio thread.
+    #[must_use]
+    pub fn matches(&self, schedule: &[BgmEvent]) -> bool {
+        schedule_hash(schedule) == self.schedule
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Calls of [`schedule_hash`] on this thread (unit tests).

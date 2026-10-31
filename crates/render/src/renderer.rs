@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bms_model::Chart;
+use eval::Section;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
@@ -313,14 +314,15 @@ impl Renderer {
     }
 
     /// Prepares the skin for `chart` and resets its play state, before the
-    /// countdown and at each retry.
+    /// countdown and at each retry; with a practice round's `section`, only
+    /// its targets are drawn.
     ///
     /// # Errors
     ///
     /// Returns the skin's error when it cannot draw `chart`.
-    pub fn load(&mut self, chart: &Chart) -> Result<(), RenderError> {
+    pub fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError> {
         self.skin
-            .prepare(&self.gpu, chart)
+            .prepare(&self.gpu, chart, section)
             .map_err(RenderError::Skin)?;
         finish_uploads(&self.gpu)
     }

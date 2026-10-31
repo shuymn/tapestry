@@ -29,7 +29,7 @@ fn bench_build(c: &mut Criterion) {
     }
     let chart = builder.build().expect("valid chart");
     let mut skin = SimpleSkin::new();
-    skin.load(&chart);
+    skin.load(&chart, None);
     let mut batch = SpriteBatch::with_capacity(MAX_SPRITES);
     let v = view(42, 1_234);
     let now = TimeUs(10_000 * MS);

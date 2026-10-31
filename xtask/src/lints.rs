@@ -235,6 +235,10 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/player/src/tuning.rs"),
     // The audio thread.
     Site::File("crates/game/src/audio_loop.rs"),
+    Site::Fns(
+        "crates/game/src/restore.rs",
+        &["Restore::apply", "Restored::code", "refusal"],
+    ),
     Site::File("crates/player/src/recording.rs"),
     Site::File("crates/audio/src/clock.rs"),
     Site::File("crates/audio/src/engine.rs"),

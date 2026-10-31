@@ -23,9 +23,10 @@
 //!   the abort is kept (design.md "Play Lifecycle").
 //! - A completed play seals its key sounds; the tail ends when the audio
 //!   side reports the sealed audio done.
-//! - A practice round ([`crate::practice`]) opens recording at its
-//!   lead-in's start, has its audio restored there, and is evaluated in its
-//!   section. At completion it rings out instead of the tail: the ring-out
+//! - A practice round ([`crate::practice`]) opens recording
+//!   [`RESTORE_AHEAD`](crate::RESTORE_AHEAD) before its lead-in, has its
+//!   audio restored at the lead-in's start ([`crate::restore`]), and is
+//!   evaluated in its section. At completion it rings out instead of the tail: the ring-out
 //!   ends when the audio side reports it done and the play's time has
 //!   reached its end. A repeated round that rang out to its end is followed
 //!   by the next round at the following step, with no result between.
@@ -46,6 +47,7 @@ use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::policy::SessionEvent;
 use crate::practice::{FADE, RING_OUT};
 use crate::render::RenderSide;
+use crate::restore::RestoreError;
 use crate::result_screen::ResultScreen;
 use crate::session::{
     Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, RECORDING_MEMORY, Settings,
@@ -194,13 +196,32 @@ pub trait Rig {
     /// [`audio_done`](Self::audio_done) then turns true as for a sealed
     /// play, possibly before the play's time reaches `end_at`.
     fn ring_out(&mut self, fade_at: TimeUs, end_at: TimeUs);
-    /// Restores a practice round's audio to chart time `at`, the lead-in's
-    /// start, right after [`start`](Self::start): the voices that playing
-    /// the engine's schedule from its beginning leaves sounding there, each
-    /// partway into its sound, at full gain. By default nothing is
-    /// restored, and the round's audio starts from silence there.
-    fn restore_audio(&mut self, at: TimeUs) {
+    /// Before a practice round's recording opens: checks that its audio can
+    /// be restored at chart time `at`, the lead-in's start ([`crate::restore`]).
+    /// By default, for rigs without audio, it can.
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot (no restorer, a schedule other than the engine's): the
+    /// round is refused before anything opens, with no start and no record.
+    fn restore_ready(&mut self, at: TimeUs) -> Result<(), RestoreError> {
         let _ = at;
+        Ok(())
+    }
+    /// After a practice round's recording opened with chart time 0 at
+    /// `origin`, and before [`start`](Self::start): plans the restore of its
+    /// audio to chart time `at`, the lead-in's start, which then lands with
+    /// the start: the voices that playing the engine's schedule from its
+    /// beginning leaves sounding there, each partway into its sound, at full
+    /// gain. By default, for rigs without audio, nothing is restored.
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be planned: recording closes again, and the round
+    /// reports no start and saves no record.
+    fn restore_audio(&mut self, origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
+        let _ = (origin, at);
+        Ok(())
     }
     /// Whether the sealed play's audio has ended.
     fn audio_done(&self) -> bool;
@@ -249,6 +270,10 @@ pub enum LiveError<S> {
     /// The input thread is gone or did not answer.
     #[error("the input thread failed")]
     Input(#[source] InputWaitError),
+    /// A practice round's audio cannot be restored; the round did not
+    /// start.
+    #[error("the round's audio cannot be restored")]
+    Restore(#[source] RestoreError),
 }
 
 /// How the run ends when nothing else stopped it: with the input thread's
@@ -419,9 +444,14 @@ fn play_and_next<R: Rig>(
     rig.before_play(loaded.settings_mut());
     let start = loaded.begin_play();
     // A full play's recording opens its countdown before chart time 0, a
-    // practice round's at its lead-in's start (design.md "Mid-Chart Start
-    // and Section Repeat").
+    // practice round's `RESTORE_AHEAD` before its lead-in, whose start its
+    // audio is restored at (design.md "Mid-Chart Start and Section
+    // Repeat"): checked before anything opens.
     let opens_at = loaded.opens_at();
+    let restore_at = loaded.restore_at();
+    if let Some(at) = restore_at {
+        rig.restore_ready(at).map_err(LiveError::Restore)?;
+    }
     // A quit during the wait is latched and taken by the first step.
     let opening = rig
         .open(TimeUs(opens_at.0.saturating_neg()))
@@ -451,6 +481,15 @@ fn play_and_next<R: Rig>(
             return Err(LiveError::Logic(e));
         }
     };
+    // The restore is planned on the opening's origin, in the play's setup,
+    // and lands with the start: reset → restore → lead-in → section
+    // evaluation. A refusal closes recording as the logic step's does.
+    if let Some(at) = restore_at
+        && let Err(e) = rig.restore_audio(origin, at)
+    {
+        let _ = rig.close();
+        return Err(LiveError::Restore(e));
+    }
     // Admitted: only now does the play start, so a refused opening reports
     // no start.
     loaded.admitted(&start);
@@ -463,12 +502,7 @@ fn play_and_next<R: Rig>(
     logic.add_sink(Box::new(sink));
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
-    // A round's audio is restored where its recording opens: reset →
-    // restore → lead-in → section evaluation.
-    let round = loaded.section().is_some();
-    if round {
-        rig.restore_audio(opens_at);
-    }
+    let round = restore_at.is_some();
     // A round's ring-out, once it completed: where its fade starts and
     // where it ends, in its chart time.
     let mut ring_out = None;

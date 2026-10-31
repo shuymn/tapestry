@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bms_model::{Chart, TimeSource, TimeUs};
-use eval::JudgeEvent;
+use eval::{JudgeEvent, Section};
 use game::{Chain, RenderSide};
 use input::QpcClock;
 use render::measure::{FrameStatistics, Presentation};
@@ -33,12 +33,13 @@ use crate::tuning::LiveTuning;
 
 /// What draws: the renderer, or a double in tests.
 pub trait Screen: Send {
-    /// Prepares `chart` and resets the play state.
+    /// Prepares `chart` and resets the play state; with a practice round's
+    /// `section`, only its targets are drawn.
     ///
     /// # Errors
     ///
     /// Why it cannot draw the chart.
-    fn load(&mut self, chart: &Chart) -> Result<(), RenderError>;
+    fn load(&mut self, chart: &Chart, section: Option<&Section>) -> Result<(), RenderError>;
     /// Waits until a frame may start; `false` on a timeout. Returns at
     /// once without a frame latency waitable object.
     fn wait(&self) -> bool;
@@ -125,6 +126,8 @@ pub enum RenderMsg {
     Load {
         /// The chart.
         chart: Arc<Chart>,
+        /// The section a practice round draws only the targets of.
+        section: Option<Section>,
         /// Where the answer goes.
         reply: mpsc::SyncSender<Result<(), RenderError>>,
     },
@@ -251,9 +254,13 @@ impl RenderLink {
     /// Why the screen cannot be built or cannot draw the chart, and
     /// [`ScreenError::NoAnswer`] after [`LOAD_TIMEOUT`]; a late answer goes
     /// nowhere.
-    pub fn load(&self, chart: Arc<Chart>) -> Result<(), ScreenError> {
+    pub fn load(&self, chart: Arc<Chart>, section: Option<Section>) -> Result<(), ScreenError> {
         let (reply, rx) = mpsc::sync_channel(1);
-        self.send(RenderMsg::Load { chart, reply });
+        self.send(RenderMsg::Load {
+            chart,
+            section,
+            reply,
+        });
         self.answer(&rx)
     }
 
@@ -327,6 +334,7 @@ impl RenderLink {
 pub fn spawn(
     mut make: MakeScreen,
     chart: Option<Arc<Chart>>,
+    section: Option<Section>,
     clock: QpcClock,
     view: View,
     measure: Measure,
@@ -347,7 +355,7 @@ pub fn spawn(
             let _ended = ended_tx;
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
-            let screen = match build(&mut make, chart.as_deref()) {
+            let screen = match build(&mut make, chart.as_deref(), section.as_ref()) {
                 Ok(screen) => {
                     let _ = ready_tx.send(Ok(()));
                     screen
@@ -361,6 +369,7 @@ pub fn spawn(
                 screen: Some(screen),
                 make,
                 chart,
+                section,
                 clock,
                 view,
                 measure,
@@ -390,10 +399,14 @@ pub fn spawn(
     }
 }
 
-fn build(make: &mut MakeScreen, chart: Option<&Chart>) -> Result<Box<dyn Screen>, RenderError> {
+fn build(
+    make: &mut MakeScreen,
+    chart: Option<&Chart>,
+    section: Option<&Section>,
+) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make()?;
     if let Some(chart) = chart {
-        s.load(chart)?;
+        s.load(chart, section)?;
     }
     Ok(s)
 }
@@ -418,6 +431,8 @@ struct Run {
     screen: Option<Box<dyn Screen>>,
     make: MakeScreen,
     chart: Option<Arc<Chart>>,
+    /// The section of the chart a practice round draws only the targets of.
+    section: Option<Section>,
     clock: QpcClock,
     view: View,
     measure: Measure,
@@ -445,8 +460,13 @@ impl Run {
                 self.menu_stats.report();
             }
             match msg {
-                Ok(RenderMsg::Load { chart, reply }) => {
+                Ok(RenderMsg::Load {
+                    chart,
+                    section,
+                    reply,
+                }) => {
                     self.chart = Some(chart);
+                    self.section = section;
                     let ready = self.prepare();
                     // A chart the screen cannot draw is refused, and the
                     // screen it dropped is built again without it, for the
@@ -454,6 +474,7 @@ impl Run {
                     // reported and the game builds it through a preparation.
                     if ready.is_err() {
                         self.chart = None;
+                        self.section = None;
                         if self.prepare().is_err() {
                             self.shared.failed.store(true, Ordering::Release);
                         }
@@ -652,10 +673,11 @@ impl Run {
     /// Resets the screen's play state, building it again after a failure.
     fn prepare(&mut self) -> Result<(), RenderError> {
         let chart = self.chart.as_deref();
+        let section = self.section.as_ref();
         let ready = match (&mut self.screen, chart) {
-            (Some(s), Some(chart)) => s.load(chart),
+            (Some(s), Some(chart)) => s.load(chart, section),
             (Some(_), None) => Ok(()),
-            (None, _) => build(&mut self.make, chart).map(|s| self.screen = Some(s)),
+            (None, _) => build(&mut self.make, chart, section).map(|s| self.screen = Some(s)),
         };
         if ready.is_ok() {
             self.shared.failed.store(false, Ordering::Release);
@@ -723,7 +745,11 @@ mod tests {
     }
 
     impl Screen for Flaky {
-        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -770,7 +796,11 @@ mod tests {
     }
 
     impl Screen for Menus {
-        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -826,6 +856,7 @@ mod tests {
         let link = spawn(
             make,
             None,
+            None,
             clock,
             view(),
             measure(clock),
@@ -852,7 +883,11 @@ mod tests {
     }
 
     impl Screen for NoCharts {
-        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
             Err(RenderError::Skin(SkinError {
                 reason: "no lanes".to_owned(),
             }))
@@ -884,6 +919,88 @@ mod tests {
         }
     }
 
+    /// A screen that notes the section of every chart it prepares.
+    struct Sections(Arc<std::sync::Mutex<Vec<Option<eval::Section>>>>);
+
+    impl Screen for Sections {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            self.0.lock().unwrap().push(section.cloned());
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The section a chart is spawned or loaded with reaches the screen,
+    /// and every later preparation (a retry's) prepares with it, until a
+    /// load without one.
+    #[test]
+    fn load_carries_the_section_to_the_screen() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(Sections(Arc::clone(&noted))) as Box<dyn Screen>));
+        let section = |s: i64| eval::Section {
+            start: TimeUs(s),
+            end: TimeUs(s + 1_000_000),
+            lead_in: TimeUs(2_000_000),
+            initial_gauges: Vec::new(),
+        };
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            Some(Arc::clone(&chart)),
+            Some(section(1)),
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.load(Arc::clone(&chart), Some(section(2))).unwrap();
+        link.prepare().unwrap();
+        link.load(chart, None).unwrap();
+        link.prepare().unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Some(section(1)),
+                Some(section(2)),
+                Some(section(2)),
+                None,
+                None
+            ]
+        );
+        link.exit();
+    }
+
     /// A chart the screen cannot draw is refused, and the select screen
     /// still draws afterwards, on a screen built again without the chart:
     /// no failure is left for the game to find.
@@ -903,6 +1020,7 @@ mod tests {
         let link = spawn(
             make,
             None,
+            None,
             clock,
             view(),
             measure(clock),
@@ -911,7 +1029,7 @@ mod tests {
         .unwrap();
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         assert!(matches!(
-            link.load(chart),
+            link.load(chart, None),
             Err(ScreenError::Render(RenderError::Skin(_)))
         ));
         assert!(!link.failed());
@@ -928,7 +1046,11 @@ mod tests {
     }
 
     impl Screen for Blocking {
-        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
             let _ = self.release.recv();
             Ok(())
         }
@@ -967,6 +1089,7 @@ mod tests {
         let mut link = spawn(
             make,
             None,
+            None,
             clock,
             view(),
             measure(clock),
@@ -975,7 +1098,7 @@ mod tests {
         .unwrap();
         link.set_timeouts(Duration::from_millis(200), Duration::from_millis(200));
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
-        assert!(matches!(link.load(chart), Err(ScreenError::NoAnswer)));
+        assert!(matches!(link.load(chart, None), Err(ScreenError::NoAnswer)));
         let started = Instant::now();
         assert!(link.finish(clock.now()).is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -998,6 +1121,7 @@ mod tests {
         let mut link = spawn(
             make,
             None,
+            None,
             clock,
             view(),
             measure(clock),
@@ -1007,7 +1131,7 @@ mod tests {
         link.set_timeouts(Duration::from_millis(200), Duration::from_millis(200));
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         let started = Instant::now();
-        assert!(matches!(link.load(chart), Err(ScreenError::NoAnswer)));
+        assert!(matches!(link.load(chart, None), Err(ScreenError::NoAnswer)));
         assert!(matches!(link.prepare(), Err(ScreenError::NoAnswer)));
         assert_eq!(link.exit(), super::RenderEnd::Stuck);
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1102,6 +1226,7 @@ mod tests {
         let link = spawn(
             make,
             Some(chart),
+            None,
             clock,
             view(),
             measure(clock),
@@ -1162,6 +1287,7 @@ mod tests {
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
+            None,
             clock,
             view(),
             measure(clock),
@@ -1187,7 +1313,11 @@ mod tests {
     struct Inputs(Arc<std::sync::Mutex<Vec<(TimeUs, TimeUs)>>>);
 
     impl Screen for Inputs {
-        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -1238,6 +1368,7 @@ mod tests {
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
+            None,
             clock,
             view,
             measure(clock),
@@ -1283,7 +1414,11 @@ mod tests {
     struct Lost;
 
     impl Screen for Lost {
-        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -1356,6 +1491,7 @@ mod tests {
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
+            None,
             clock,
             view(),
             measure(clock),
@@ -1387,7 +1523,11 @@ mod tests {
     }
 
     impl Screen for Stalling {
-        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -1485,6 +1625,7 @@ mod tests {
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
+            None,
             clock,
             view,
             measure(clock),
@@ -1529,7 +1670,11 @@ mod tests {
 
     #[cfg(feature = "dev-tools")]
     impl Screen for Allocating {
-        fn load(&mut self, _chart: &Chart) -> Result<(), RenderError> {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -1612,6 +1757,7 @@ mod tests {
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
+            None,
             clock,
             view(),
             m,
@@ -1706,6 +1852,7 @@ mod tests {
         let link = spawn(
             make,
             Some(Arc::new(chart.clone())),
+            None,
             clock,
             view(),
             measure(clock),
