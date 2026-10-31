@@ -185,7 +185,7 @@ fn drawn(chart: &Chart, now: i64, offset: i64, effects: &[JudgeEvent]) -> usize 
 }
 
 /// The events the evaluator emits up to logic time `to` for key 2
-/// pressed at `press` and released at `release` (µs), with the custom
+/// pressed at `press` and released at `release` (µs), with the tapestry
 /// preset and one keyboard source.
 fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent> {
     let device = eval::DeviceProfile {
@@ -198,7 +198,7 @@ fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent
             axes: Vec::new(),
         }],
     };
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let key = |at: i64, value: i32| eval::PhysicalInputEvent {
         received: TimeUs(at),
         source: eval::SourceId(0),
