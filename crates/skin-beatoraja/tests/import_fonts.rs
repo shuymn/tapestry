@@ -194,11 +194,16 @@ fn a_failing_fallback_is_skipped() {
 #[test]
 fn a_failing_primary_is_ignored_or_dropped() {
     let fonts = r#"{"id": "a", "path": "p.fnt"}"#;
-    let cases: [(&str, Severity, NoteKind); 3] = [
+    let cases: [(&str, Severity, NoteKind); 4] = [
         (
             "page",
             Severity::Ignored,
             bitmap(FntErrorKind::PageMissing { page: 0 }),
+        ),
+        (
+            "broken",
+            Severity::Ignored,
+            bitmap(FntErrorKind::PageBroken { page: 0 }),
         ),
         (
             "scale",
@@ -218,6 +223,7 @@ fn a_failing_primary_is_ignored_or_dropped() {
         fnt(dir.path(), "p.fnt", &[A, M]);
         match case {
             "page" => std::fs::remove_file(dir.path().join("p.fnt.png")).unwrap(),
+            "broken" => write(dir.path(), "p.fnt.png", b"\x89PNG\r\n\x1a\nbroken"),
             "scale" => {
                 let s = std::fs::read_to_string(dir.path().join("p.fnt")).unwrap();
                 write(
@@ -244,12 +250,20 @@ fn a_failing_primary_is_ignored_or_dropped() {
 
 #[test]
 fn the_fallback_list_is_capped() {
-    let list = |n: usize| {
-        let items = vec![r#"{"path": "f.fnt"}"#; n].join(", ");
+    // The entries are counted before any is read: missing files, each
+    // skipped when read, count too.
+    let list = |n: usize, path: &str| {
+        let items = vec![format!(r#"{{"path": "{path}"}}"#); n].join(", ");
         format!(r#"{{"id": "a", "path": "p.fnt", "fallback": [{items}]}}"#)
     };
-    for (n, ok) in [(MAX_FALLBACKS, true), (MAX_FALLBACKS + 1, false)] {
-        let dir = skin(&[("s.json", &json([1_920, 1_080], &list(n), &[("a", 24, "A")]))]);
+    for (n, ok, path) in [
+        (MAX_FALLBACKS, true, "f.fnt"),
+        (MAX_FALLBACKS + 1, false, "f.fnt"),
+        (MAX_FALLBACKS, true, "none.fnt"),
+        (MAX_FALLBACKS + 1, false, "none.fnt"),
+    ] {
+        let fonts = list(n, path);
+        let dir = skin(&[("s.json", &json([1_920, 1_080], &fonts, &[("a", 24, "A")]))]);
         fnt(dir.path(), "p.fnt", &[A, M]);
         fnt(dir.path(), "f.fnt", &[A]);
         match import(dir.path()) {
