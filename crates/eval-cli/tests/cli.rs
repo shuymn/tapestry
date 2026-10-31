@@ -148,7 +148,7 @@ fn stdout(o: &Output) -> String {
 }
 
 /// The totals after two PERFECTs, with the tapestry preset's gauges cleared.
-const CUSTOM_TOTALS: &str = "perfect 2 great 0 good 0 bad 0 poor 0 | ex 4 | bp 0 | max combo 2 \
+const TAPESTRY_TOTALS: &str = "perfect 2 great 0 good 0 bad 0 poor 0 | ex 4 | bp 0 | max combo 2 \
                              | normal 100.000% cleared | survival 100.000% cleared";
 
 #[test]
@@ -174,8 +174,8 @@ fn prints_as_played_and_what_if() {
     assert_eq!(
         stdout(&o),
         format!(
-            "play.tprl | preset tapestry | as played | {CUSTOM_TOTALS}\n\
-             play.tprl | preset wide.toml | what-if, no input after 4.180 s | {CUSTOM_TOTALS}\n"
+            "play.tprl | preset tapestry | as played | {TAPESTRY_TOTALS}\n\
+             play.tprl | preset wide.toml | what-if, no input after 4.180 s | {TAPESTRY_TOTALS}\n"
         )
     );
     // Without a preset, the record's own copy is used.
@@ -183,7 +183,7 @@ fn prints_as_played_and_what_if() {
     assert_eq!(o.status.code(), Some(0), "{o:?}");
     assert_eq!(
         stdout(&o),
-        format!("play.tprl | recorded preset | as played | {CUSTOM_TOTALS}\n")
+        format!("play.tprl | recorded preset | as played | {TAPESTRY_TOTALS}\n")
     );
 }
 
@@ -295,8 +295,8 @@ fn a_random_chart_is_checked_under_the_recorded_seeds() {
     assert_eq!(
         stdout(&o),
         format!(
-            "good.tprl | preset tapestry | as played | {CUSTOM_TOTALS}\n\
-             good.tprl | preset wide.toml | what-if, no input after 4.180 s | {CUSTOM_TOTALS}\n"
+            "good.tprl | preset tapestry | as played | {TAPESTRY_TOTALS}\n\
+             good.tprl | preset wide.toml | what-if, no input after 4.180 s | {TAPESTRY_TOTALS}\n"
         )
     );
     // A record whose own seed fails, beside one whose seed loads, is
@@ -490,7 +490,7 @@ fn an_unusable_chart_or_preset_exits_one_before_any_line() {
     assert_eq!(o.status.code(), Some(0), "{o:?}");
     assert_eq!(
         stdout(&o),
-        format!("play.tprl | preset big.toml | what-if | {CUSTOM_TOTALS}\n")
+        format!("play.tprl | preset big.toml | what-if | {TAPESTRY_TOTALS}\n")
     );
 }
 
@@ -593,8 +593,8 @@ fn export_writes_a_user_preset() {
     assert_eq!(
         stdout(&o),
         format!(
-            "play.tprl | preset tapestry | as played | {CUSTOM_TOTALS}\n\
-             play.tprl | preset mine.toml | what-if | {CUSTOM_TOTALS}\n"
+            "play.tprl | preset tapestry | as played | {TAPESTRY_TOTALS}\n\
+             play.tprl | preset mine.toml | what-if | {TAPESTRY_TOTALS}\n"
         )
     );
 }

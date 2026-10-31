@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_preset_decodes() {
+    fn tapestry_preset_decodes() {
         assert_eq!(decode(&tapestry().canonical_bytes()), Ok(tapestry()));
     }
 

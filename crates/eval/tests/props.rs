@@ -540,7 +540,7 @@ fn choices(p: &RulePreset) -> impl PartialEq + use<> {
 /// without reduced damage.
 fn count_preset_shapes(p: &RulePreset, c: &mut Coverage) {
     c.hit(
-        "choices_of_custom",
+        "choices_of_tapestry",
         choices(p) == choices(&rules::tapestry()),
     );
     c.hit(
@@ -948,7 +948,7 @@ fn generators_reach_the_fragile_spots() {
         ("ln_hold_ended", 1),
         ("empty_poor", 1),
         ("play_sound", 1),
-        ("choices_of_custom", SAMPLES / 8),
+        ("choices_of_tapestry", SAMPLES / 8),
         ("choices_of_beatoraja_style", SAMPLES / 8),
         ("choices_of_lr2_style", SAMPLES / 8),
         ("policies_of_lr2_style", 1),

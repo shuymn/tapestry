@@ -79,21 +79,9 @@ fn write_user_preset(dir: &Path, preset: &rules::RulePreset) -> PathBuf {
     path
 }
 
-/// The file at `path` rewritten to hold `preset`, with a modification time
-/// clearly after any read before.
-fn rewrite(path: &Path, preset: &rules::RulePreset) {
-    rewrite_text(path, &game::preset_to_toml(preset));
-}
-
-/// [`rewrite`] with `text`.
-fn rewrite_text(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(path)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
-        .unwrap();
+/// The file at `path` rewritten to hold `preset` ([`common::rewrite`]).
+fn rewrite_preset(path: &Path, preset: &rules::RulePreset) {
+    common::rewrite(path, &game::preset_to_toml(preset));
 }
 
 /// [`loaded`] with the preset named `preset` in `player.toml`.
@@ -763,7 +751,7 @@ fn each_report_carries_the_preset_its_play_used() {
     for g in &mut renamed.gauges {
         g.id = format!("{}-renamed", g.id);
     }
-    rewrite(&path, &renamed);
+    rewrite_preset(&path, &renamed);
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 12_500_000);
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
@@ -1424,8 +1412,10 @@ fn changed_user_preset_reloads_within_a_poll() {
     let mut rig = Fake::new(items, &[], 12_000_000);
     let changed = 11_000_000;
     let edit = path.clone();
-    rig.at
-        .push((changed, Box::new(move || rewrite(&edit, &flat_normal()))));
+    rig.at.push((
+        changed,
+        Box::new(move || rewrite_preset(&edit, &flat_normal())),
+    ));
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
     assert!(rig.shown_at[0] < changed, "{:?}", rig.shown_at);
@@ -1464,7 +1454,7 @@ fn failed_reload_keeps_the_previous_preset() {
     let edit = path.clone();
     rig.at.push((
         11_000_000,
-        Box::new(move || rewrite_text(&edit, "windows = [")),
+        Box::new(move || common::rewrite(&edit, "windows = [")),
     ));
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
@@ -1511,8 +1501,10 @@ fn plays_use_reloads_from_the_next_play() {
     let mut rig = Fake::new(items, &[(11_500_000, Command::Retry)], 15_000_000);
     // Between the press and the second note, mid-play.
     let edit = path.clone();
-    rig.at
-        .push((9_400_000, Box::new(move || rewrite(&edit, &flat_normal()))));
+    rig.at.push((
+        9_400_000,
+        Box::new(move || rewrite_preset(&edit, &flat_normal())),
+    ));
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
     assert_eq!(rig.reports.len(), 2);

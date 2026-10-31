@@ -167,7 +167,7 @@ mod tests {
     /// The values of design.md "The tapestry Preset", written out in raw units (µs;
     /// 1/100000 %), independent of the helpers `tapestry` uses.
     #[test]
-    fn custom_preset_has_d7_values() {
+    fn tapestry_preset_has_d7_values() {
         let w = |us| Window {
             early: TimeUs(us),
             late: TimeUs(us),

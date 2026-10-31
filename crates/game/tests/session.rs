@@ -10,11 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
 use bms_model::{Chart, ChartBuilder, ModelError, SoundId, TimeUs};
-use common::{MS, PERIOD, RATE, count_judged, judgments, lane, tapestry_settings};
+use common::{MS, PERIOD, RATE, count_judged, judgments, lane, rewrite, tapestry_settings};
 use eval::{ControlId, InputKind, SourceId};
 use game::{
     AbortCause, ChartIngest, Command, DataRoot, DefaultPolicy, DeviceSettings, FailureAction,
@@ -395,18 +394,6 @@ fn write_user_preset(root: &DataRoot, name: &str, preset: &rules::RulePreset) ->
     let path = user_preset_path(root, name);
     fs::write(&path, preset_to_toml(preset)).unwrap();
     path
-}
-
-fn rewrite(path: &Path, text: &str) {
-    fs::write(path, text).unwrap();
-    // A modification time clearly after the one read at load.
-    let later = SystemTime::now() + Duration::from_secs(60);
-    fs::File::options()
-        .write(true)
-        .open(path)
-        .unwrap()
-        .set_modified(later)
-        .unwrap();
 }
 
 /// A session whose `player.toml` names `preset`.
@@ -2187,9 +2174,9 @@ fn a_restored_preset_is_reported_after_a_failure() {
 
 /// A user preset that is a symbolic link is refused naming the file, both
 /// as the chosen preset and in the shelf's list, so no preset is read from
-/// outside the folder. Creating the link needs the right to make symbolic
-/// links (on Windows, Developer Mode); without it the test says so and
-/// checks nothing.
+/// outside the folder. On Windows, making the link needs the right to make
+/// symbolic links (Developer Mode); without that right alone the test says
+/// so and checks nothing, and any other failure to make it fails the test.
 #[test]
 fn user_preset_links_are_refused() {
     let (_dir, root) = temp_root();
@@ -2198,13 +2185,20 @@ fn user_preset_links_are_refused() {
     fs::write(&outside, preset_to_toml(&rules::tapestry())).unwrap();
     let link = user_preset_path(&root, "mine");
     #[cfg(windows)]
-    let made = std::os::windows::fs::symlink_file(&outside, &link);
-    #[cfg(unix)]
-    let made = std::os::unix::fs::symlink(&outside, &link);
-    if let Err(e) = made {
-        println!("skipped: a symbolic link cannot be made here ({e})");
-        return;
+    {
+        // ERROR_PRIVILEGE_NOT_HELD: no right to make symbolic links.
+        const PRIVILEGE_NOT_HELD: i32 = 1314;
+        match std::os::windows::fs::symlink_file(&outside, &link) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+                println!("skipped: no right to make a symbolic link here ({e})");
+                return;
+            }
+            Err(e) => panic!("the symbolic link cannot be made: {e}"),
+        }
     }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
     let refused = PresetFileError {
         path: link.clone(),
         cause: PresetFileCause::Link,

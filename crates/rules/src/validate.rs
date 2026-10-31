@@ -244,7 +244,7 @@ mod tests {
     use crate::{GaugeValue, Judgment, LaneClass, RuleError, Side, WindowPolicy, tapestry};
 
     #[test]
-    fn custom_preset_validates() {
+    fn tapestry_preset_validates() {
         assert_eq!(tapestry().validate(), Ok(()));
     }
 

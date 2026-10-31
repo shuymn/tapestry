@@ -225,7 +225,7 @@ egui comes with the first form-like screen.
 
 ### D10. User preset files are polled, not watched
 
-**Today.** The preset is re-read at retry when its modification time changed (crates/game/src/session.rs:537-552).
+**Today.** The shelf (crates/game/src/presets.rs) checks the user preset files every 250 ms while a result screen shows (`Loaded::poll_presets`) and at every retry; the select screen does not poll yet (PR17).
 
 **Decision.** While a select or result screen shows, the shelf checks the user preset files' modification times every 250 ms. The built-ins are never read from disk, so they are never polled.
 - A changed file reloads, and the result screen re-evaluates under it.
@@ -577,13 +577,8 @@ Analysis runs at 1× and its result is reused at every speed.
 
 ### D24. The standard presets are built in; the default is beatoraja-style (decided)
 
-**Today.**
-- `player.toml`'s `preset` names a file in `presets\`, by default `beatoraja-style.toml` (`PlayerSettings::default()`, crates/game/src/settings.rs; PR7, #102).
-- The session writes a missing `custom.toml` or `beatoraja-style.toml` from its preset (`standard_preset` in crates/game/src/session.rs) and refuses any other missing name.
-- A preset file states its name in its `id` field (crates/rules-toml/src/lib.rs), and that name is the preset ID records carry and the canonical encoding hashes.
-
 **Decision.**
-- **Built-ins.** The standard presets are built into the code, not files: tapestry (`rules::tapestry()`, today's `rules::custom()`, whose ID `custom` becomes `tapestry`), beatoraja-style and LR2-style. Each is chosen by its name, `tapestry`, `beatoraja-style` or `lr2-style`, which is also its preset ID, and the game never writes one to disk. The list of built-ins by name lives in `rules`, so `game` and `eval-cli` (which cannot depend on `game`) share it.
+- **Built-ins.** The standard presets are built into the code, not files: tapestry (`rules::tapestry()`), beatoraja-style (`rules::beatoraja_style()`) and LR2-style (`rules::lr2_style()`). Each is chosen by its name, `tapestry`, `beatoraja-style` or `lr2-style`, which is also its preset ID, and the game never writes one to disk. The list of built-ins by name lives in `rules`, so `game` and `eval-cli` (which cannot depend on `game`) share it.
 - **User presets.** A preset the player changes is the player's own preset, a TOML file in `presets\`. Only these files are read, validated and polled (D10).
 - **A user preset's name is its file stem.** The file has no `id` field, and the loader gives the preset its stem as its preset ID.
   - The stem is what `player.toml` and the shelf look a preset up by, and the file system keeps it unique in `presets\`, so it is the name's one source. A name field would be a second name that could disagree with the file's, and two files could claim one name.
@@ -592,8 +587,8 @@ Analysis runs at 1× and its result is reused at every speed.
   - A name is 1 to 64 characters of lowercase ASCII letters, digits, `-` and `_`, and a stem that is not one is refused, naming the file: names then compare exactly on every file system, `TAPESTRY.toml` cannot stand for a built-in, and no older value such as `custom.toml` can be a name. The game, the shelf, the exporter and `eval-cli` share this check in `rules-toml`.
 - **No passing for a built-in.** A user preset whose stem is a built-in's name is refused, with an error naming the file and the built-in, so no file can pass for a built-in in records. The check is in `rules-toml`'s loader, so `eval-cli --preset` refuses such a file too; `--preset` also takes a built-in's name.
 - **`player.toml`'s `preset`** names a built-in or a user preset; its default is `beatoraja-style`. `PlayerSettings` stays `#[serde(default)]`, so a file without `preset` takes the default. Any other value, an older version's file name such as `custom.toml` or `beatoraja-style.toml` among them, is refused with an error naming it and the built-ins; it is not converted (AGENTS.md "No compatibility code before the first release"), and nothing is written.
-- **Creating a user preset, for now.** `eval-cli preset export <built-in> <path>` (for example `eval-cli preset export beatoraja-style my-rules.toml`) writes that built-in to a new TOML file, which the player puts in `presets\`. `eval-cli` is portable and does not locate the data root, so it takes a path. It refuses a path whose file exists and one whose stem is a built-in's name, and writes nothing then. Creating and editing presets in a game screen is not built yet: it arrives later with an in-game settings screen (design.md "Libraries"; D4).
-- **What goes away.** `standard_preset` and the writing of a missing preset file. Nothing writes a preset file at first start or at any other time, except the export command.
+- **Creating a user preset.** `eval-cli preset export <built-in> <path>` (for example `eval-cli preset export beatoraja-style my-rules.toml`) writes that built-in to a new TOML file, which the player puts in `presets\`. `eval-cli` is portable and does not locate the data root, so it takes a path. It refuses a path whose file exists and one whose stem is a built-in's name, and writes nothing then. Creating and editing presets in a game screen is not built yet: it arrives later with an in-game settings screen (design.md "Libraries"; D4).
+- **Nothing writes a preset file but the export.** Nothing writes a preset file at first start or at any other time, except the export command.
 - **Where it lands.** PR7 made beatoraja-style the default. PR16 makes the rename, the built-ins and the user presets, and adds the export command: the export is how a player gets an editable file once the game stops writing them, so it lands in the PR that stops the writing, which is also the first PR with all three built-ins (after PR8) and the stem-named file.
 - **design.md** carries this ("Standard Presets", "User Presets", "The tapestry Preset", "Settings Files", "Tuning Without Restart").
 - **Why the default is not the tapestry preset:** play uses beatoraja-style by default, as design.md's own introduction describes ("You normally play with 'beatoraja-style'").

@@ -673,7 +673,7 @@ impl PlayerSettings {
         if !VISIBLE_TIME_MS.contains(&self.visible_time_ms) {
             return Err(PlayerSettingsError::VisibleTime(self.visible_time_ms));
         }
-        if rules::built_in(&self.preset).is_none()
+        if !rules::BUILT_IN_PRESETS.contains(&self.preset.as_str())
             && rules_toml::check_user_preset_name(&self.preset).is_err()
         {
             return Err(PlayerSettingsError::Preset(UnknownPreset(

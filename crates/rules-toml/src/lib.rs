@@ -123,7 +123,7 @@ pub fn check_user_preset_name(name: &str) -> Result<(), NameError> {
     if !valid {
         return Err(NameError::NotAName(name.to_owned()));
     }
-    if rules::built_in(name).is_some() {
+    if rules::BUILT_IN_PRESETS.contains(&name) {
         return Err(NameError::BuiltIn(name.to_owned()));
     }
     Ok(())

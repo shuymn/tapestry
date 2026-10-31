@@ -92,11 +92,11 @@ pub struct Shelf {
     /// The user preset files by stem, refused names included, so a refused
     /// file is listed with its error.
     users: BTreeMap<String, UserPreset>,
-    chosen: String,
     /// Whether the chosen preset is a user preset, not a built-in: a file
     /// named like a built-in is listed under the built-in's name too.
     user_chosen: bool,
-    /// The chosen preset: plays take it at their start.
+    /// The chosen preset: plays take it at their start. Its ID is its
+    /// name, as a built-in's or as the stem a user preset loads under.
     current: RulePreset,
     next_check: Option<TimeUs>,
 }
@@ -145,7 +145,6 @@ impl Shelf {
                 .filter_map(|n| built_in(n))
                 .collect(),
             users,
-            chosen: chosen.to_owned(),
             user_chosen: user_chosen.is_some(),
             current,
             next_check: None,
@@ -155,7 +154,7 @@ impl Shelf {
     /// The chosen preset's name.
     #[must_use]
     pub fn chosen_name(&self) -> &str {
-        &self.chosen
+        &self.current.id
     }
 
     /// The chosen preset, as plays use it from their start.
@@ -197,7 +196,9 @@ impl Shelf {
     /// modification time changed. Returns what changed for the chosen user
     /// preset; `None` for a built-in, or when its file did not change.
     pub fn check(&mut self) -> Option<PresetChange> {
-        let chosen = self.user_chosen.then_some(self.chosen.as_str());
+        // The chosen preset's ID is its name, a user preset's stem.
+        let chosen = self.user_chosen.then(|| self.current.id.clone());
+        let chosen = chosen.as_deref();
         let before = chosen
             .and_then(|c| self.users.get(c))
             .and_then(|u| u.error.clone());
@@ -246,7 +247,6 @@ fn read(
         if modified.is_some() && known.is_some_and(|u| u.modified == *modified) {
             continue;
         }
-        let previous = known.and_then(|u| u.preset.clone());
         let user = match read_preset_file(path) {
             Ok((preset, read_at)) => UserPreset {
                 modified: read_at,
@@ -255,7 +255,7 @@ fn read(
             },
             Err(e) => UserPreset {
                 modified: *modified,
-                preset: previous,
+                preset: known.and_then(|u| u.preset.clone()),
                 error: Some(e),
             },
         };
