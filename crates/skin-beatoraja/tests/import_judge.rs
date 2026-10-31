@@ -349,6 +349,15 @@ fn a_stretch_may_not_move_a_combos_anchor() {
         critical(judge(&images, &numbers)),
         (CriticalPart::Judge, NoteKind::Stretch(1))
     );
+    // The full-gauge slot's grade paired with PERFECT's combo.
+    let mut images = grades(6);
+    images.push(fit(6));
+    let mut numbers = vec![combo("ten", 10)];
+    numbers.extend((1..7).map(|_| NONE.to_owned()));
+    assert_eq!(
+        critical(judge(&images, &numbers)),
+        (CriticalPart::Judge, NoteKind::Stretch(1))
+    );
     // The same stretch where no combo pairs with it.
     let mut images = grades(3);
     images.push(fit(3));
