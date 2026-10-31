@@ -6,8 +6,9 @@
 //! A check lists `presets/` again and reads each file whose modification
 //! time changed since the last check; a file that fails to load keeps the
 //! preset it last loaded, with its error. The chosen preset is the one plays
-//! use, so a failed reload of it leaves the previous one in use. Every
-//! change a check makes bumps the shelf's revision, which the screens
+//! use, so a failed reload of it leaves the previous one in use; a step on
+//! the select screen ([`Shelf::step`]) chooses another. Every change a
+//! check or a step makes bumps the shelf's revision, which the screens
 //! compare with the one they last drew; polls run at an absolute
 //! [`PollDeadline`].
 
@@ -61,6 +62,15 @@ pub enum PresetChange {
     /// Its file changed, or went away, and does not load: the previous
     /// preset stays chosen.
     Failed(PresetFileError),
+}
+
+/// A step of the chosen preset on the select screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresetStep {
+    /// The previous entry of the shelf's list.
+    Prev,
+    /// The next entry of the shelf's list.
+    Next,
 }
 
 /// When the next check is due: an absolute time on the rig's clock, so a
@@ -135,7 +145,7 @@ pub struct Shelf {
     /// name, as a built-in's or as the stem a user preset loads under.
     current: RulePreset,
     deadline: PollDeadline,
-    /// Bumped by every change a check makes.
+    /// Bumped by every change a check or a step makes.
     revision: u64,
     /// Why the folder could not be listed at the last check, if it could
     /// not: each entry then keeps its state.
@@ -249,9 +259,9 @@ impl Shelf {
         self.listing_error.as_ref()
     }
 
-    /// Bumped by every change a check makes: an entry's preset or error
+    /// Bumped by every change a check makes (an entry's preset or error
     /// changed, an entry added or removed, or the listing error set or
-    /// cleared.
+    /// cleared) and by a step that changed the choice.
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
@@ -313,6 +323,43 @@ impl Shelf {
             self.revision += 1;
         }
         change
+    }
+
+    /// Chooses the previous or next entry of [`entries`](Self::entries)
+    /// that loads now, wrapping at both ends (design.md "Play Lifecycle"),
+    /// after a [`check`](Self::check), so a step sees the files as they
+    /// are. An entry that does not load now is passed over: a file that
+    /// never loaded or is refused, or whose last check failed; while the
+    /// folder cannot be listed, so is every user preset, which could not
+    /// be opened again. Whether the choice changed; a change bumps the
+    /// revision, as the check may on its own.
+    pub fn step(&mut self, step: PresetStep) -> bool {
+        let _ = self.check();
+        let listed = self.listing_error.is_none();
+        let entries = self.entries();
+        let n = entries.len();
+        let Some(at) = entries.iter().position(|e| e.chosen) else {
+            return false;
+        };
+        let next = (1..n)
+            .map(|k| match step {
+                PresetStep::Next => (at + k) % n,
+                PresetStep::Prev => (at + n - k) % n,
+            })
+            .filter_map(|i| entries.get(i))
+            .find_map(|e| {
+                let usable = e.error.is_none() && (e.built_in || listed);
+                e.preset
+                    .filter(|_| usable)
+                    .map(|p| (p.clone(), !e.built_in))
+            });
+        let Some((preset, user)) = next else {
+            return false;
+        };
+        self.current = preset;
+        self.user_chosen = user;
+        self.revision += 1;
+        true
     }
 
     /// What changed for the chosen user preset `chosen`, whose error was

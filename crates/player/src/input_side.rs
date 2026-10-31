@@ -1776,19 +1776,19 @@ mod menu_tests {
     }
 
     /// Idle and focused, every bound control of the configured controller
-    /// becomes its menu event, in order: the white keys confirm, the black
-    /// keys go back, and the scratch axis scrolls a line per press
+    /// becomes its menu event, in order: the white keys 1, 3 and 5 confirm,
+    /// key 7 sends its own event, the black keys go back, and the scratch axis scrolls a line per press
     /// threshold (2), higher values down; an unbound button sends nothing.
     /// The game thread is woken for them.
     #[test]
     fn menu_events_from_bound_controls() {
-        use MenuEvent::{Back, Confirm, Down, Up};
+        use MenuEvent::{Back, Confirm, Down, Extra, Up};
         let mut rig = Rig::new();
         rig.idle();
         assert!(rig.unparks(&presses(&[1, 2, 3, 4, 5, 6, 7, 9])));
         assert_eq!(
             rig.events(),
-            [Confirm, Back, Confirm, Back, Confirm, Back, Confirm]
+            [Confirm, Back, Confirm, Back, Confirm, Back, Extra]
         );
         let turns: Reports<'_> = &[
             (&[], Some(100)),

@@ -460,3 +460,91 @@ fn a_pick_past_the_key_queue_chooses_its_chart() {
         "{stdout}"
     );
 }
+
+/// F12 on the select screen chooses the next play preset, lr2-style after
+/// the default beatoraja-style: `player.toml` holds it at once, while
+/// selection still shows, and the chart chosen after it plays under it.
+#[test]
+fn choosing_a_preset_writes_player_toml() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let player = DataRoot::new(fx.appdata.join("tapestry")).player_settings();
+    let mut child = select(
+        &fx,
+        "next-preset,sleep=2000,pick=a.bms,enter,back,wait=a.bms,close",
+        &[],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let mut stdout = String::new();
+    let mut while_idle = None;
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        // Read while the sleep step keeps selection idle: neither a play's
+        // end nor the run's end could have written it.
+        if line == "select: preset lr2-style" {
+            while_idle = Some(fs::read_to_string(&player).unwrap_or_default());
+        }
+        stdout.push_str(&line);
+        stdout.push('\n');
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let while_idle = while_idle.unwrap_or_else(|| panic!("no step:\n{stdout}"));
+    assert!(lines(&stdout, "play started").len() == 1, "{stdout}");
+    assert!(
+        while_idle.contains("preset = \"lr2-style\""),
+        "{while_idle}\n{stdout}"
+    );
+    let saved = fs::read_to_string(&player).unwrap();
+    assert!(saved.contains("preset = \"lr2-style\""), "{saved}");
+    assert_eq!(
+        lines(&stdout, "result: viewing ").first().copied(),
+        Some("result: viewing lr2-style (as played)"),
+        "{stdout}"
+    );
+}
+
+/// A `player.toml` that cannot be replaced (read-only): the step still
+/// chooses the preset, which the chart then plays, the failure is
+/// reported, and the file keeps what it held.
+#[test]
+fn a_preset_that_cannot_be_written_still_plays() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let player = DataRoot::new(fx.appdata.join("tapestry")).player_settings();
+    save_settings(&player, &game::PlayerSettings::default()).unwrap();
+    let held = fs::read_to_string(&player).unwrap();
+    let mut read_only = fs::metadata(&player).unwrap().permissions();
+    read_only.set_readonly(true);
+    fs::set_permissions(&player, read_only.clone()).unwrap();
+    let out = select(
+        &fx,
+        "next-preset,pick=a.bms,enter,back,wait=a.bms,close",
+        &[],
+    )
+    .output()
+    .unwrap();
+    // Writable again, so the folder can go.
+    #[expect(clippy::permissions_set_readonly_false, reason = "a test's own file")]
+    read_only.set_readonly(false);
+    fs::set_permissions(&player, read_only).unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(lines(&stdout, "select: preset ").len(), 1, "{stdout}");
+    assert!(stderr.contains("player.toml"), "{stderr}");
+    assert!(
+        lines(&stdout, "settings: wrote player.toml").is_empty(),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&player).unwrap(), held);
+    assert_eq!(
+        lines(&stdout, "result: viewing ").first().copied(),
+        Some("result: viewing lr2-style (as played)"),
+        "{stdout}"
+    );
+}

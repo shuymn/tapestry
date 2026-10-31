@@ -394,6 +394,8 @@ fn menu_key(key: PhysicalKey, repeat: bool) -> Option<MenuKey> {
         KeyCode::Tab => (MenuKey::Tab, false),
         KeyCode::Escape => (MenuKey::Escape, false),
         KeyCode::KeyP => (MenuKey::Practice, false),
+        KeyCode::F11 => (MenuKey::PrevPreset, false),
+        KeyCode::F12 => (MenuKey::NextPreset, false),
         _ => return None,
     };
     (repeats || !repeat).then_some(key)
@@ -420,6 +422,23 @@ mod tests {
         let p = PhysicalKey::Code(KeyCode::KeyP);
         assert_eq!(super::menu_key(p, false), Some(MenuKey::Practice));
         assert_eq!(super::menu_key(p, true), None);
+    }
+
+    /// F11 and F12 step the play preset, on their first press only; they
+    /// are the keys the game reserves for it, so no binding takes them.
+    #[test]
+    fn f11_and_f12_step_the_preset_on_their_first_press() {
+        use crate::select::MenuKey;
+        for (code, key, raw) in [
+            (KeyCode::F11, MenuKey::PrevPreset, game::PREV_PRESET_KEY),
+            (KeyCode::F12, MenuKey::NextPreset, game::NEXT_PRESET_KEY),
+        ] {
+            let pressed = PhysicalKey::Code(code);
+            assert_eq!(super::menu_key(pressed, false), Some(key));
+            assert_eq!(super::menu_key(pressed, true), None);
+            assert_eq!(window_key(raw), pressed);
+            assert!(game::reserved_key(raw).is_some());
+        }
     }
 
     /// Pause bound to retry and NumLock to quit, as `tapestry keys`

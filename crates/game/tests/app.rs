@@ -16,6 +16,7 @@ mod counting;
 static GLOBAL: counting::Counting = counting::Counting;
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -26,8 +27,8 @@ use game::{
     AbortCause, App, AppRig, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
     DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal, Loaded,
     LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput,
-    PracticeScreen, Refused, RenderSide, Rig, SessionConfig, SessionError, SessionEvent,
-    SessionEventSink, Settings,
+    PracticeScreen, PresetStep, Refused, RenderSide, Rig, SessionConfig, SessionError,
+    SessionEvent, SessionEventSink, Settings,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -191,6 +192,8 @@ enum Act {
     Back,
     Next,
     Prev,
+    /// F11 or F12 on the select screen.
+    Preset(PresetStep),
     Close,
 }
 
@@ -288,6 +291,10 @@ struct Headless {
     /// Each shelf state selection was shown, with its clock time: the
     /// revision and the chosen file's error, or why it cannot open.
     presets: Vec<(i64, PresetsSeen)>,
+    /// The chosen preset's name each time an opened shelf was shown.
+    chosen_names: Vec<String>,
+    /// Preset steps taken on the select screen, not yet taken by the flow.
+    steps: VecDeque<PresetStep>,
 }
 
 /// What selection was shown of the shelf.
@@ -367,6 +374,8 @@ impl Headless {
             idle_waits: Vec::new(),
             edits: Vec::new(),
             presets: Vec::new(),
+            chosen_names: Vec::new(),
+            steps: VecDeque::new(),
             hits: Vec::new(),
             speeds: Vec::new(),
             practice_entries: Vec::new(),
@@ -693,6 +702,15 @@ impl AppRig for Headless {
     }
 
     fn choose(&mut self) -> Option<Pick> {
+        // The steps due before a choice are taken with it, as one batch.
+        while let Some(Act::Preset(step)) = self.due_act() {
+            self.consume();
+            if !self.in_selection {
+                self.violations
+                    .push("a preset step taken outside selection".to_owned());
+            }
+            self.steps.push_back(step);
+        }
         let (i, practice) = match self.due_act()? {
             Act::Choose(i) => (i, false),
             Act::Practice(i) => (i, true),
@@ -767,6 +785,9 @@ impl AppRig for Headless {
             .map(|s| (s.revision(), s.chosen_error().cloned()))
             .map_err(Clone::clone);
         self.presets.push((self.at(), seen));
+        if let Ok(s) = shelf {
+            self.chosen_names.push(s.chosen_name().to_owned());
+        }
     }
 
     fn entered_selection(&mut self) {
@@ -792,6 +813,10 @@ impl AppRig for Headless {
         };
         self.consume();
         Some(input)
+    }
+
+    fn take_preset_step(&mut self) -> Option<PresetStep> {
+        self.steps.pop_front()
     }
 }
 
@@ -1107,6 +1132,219 @@ fn preset_switch_keeps_the_result_and_the_play_preset() {
     let (_, plays) = &rig.loads[0];
     assert_eq!(attempts(plays), [1, 2]);
     assert_eq!(plays[0].preset, plays[1].preset);
+}
+
+/// The tapestry preset's next and previous preset steps.
+const NEXT: Act = Act::Preset(PresetStep::Next);
+const PREV: Act = Act::Preset(PresetStep::Prev);
+
+/// The preset each play of each load used, by load.
+fn presets_played(rig: &Headless) -> Vec<Vec<String>> {
+    rig.loads
+        .iter()
+        .map(|(_, r)| r.iter().map(|r| r.preset.id.clone()).collect())
+        .collect()
+}
+
+/// A step on the select screen chooses the next chart's preset: from
+/// tapestry, Next chooses beatoraja-style, which selection is shown and
+/// the chart's play and its retry use, and which their records carry.
+#[test]
+fn a_select_step_sets_the_next_plays_preset() {
+    let acts = vec![
+        (0, NEXT),
+        (100, Act::Choose(0)),
+        (4_000, Act::Retry),
+        (4_000, Act::Close),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app(dir.path(), Refusal::Missing, &Events::default());
+    let mut rig = Headless::new(dir.path(), Refusal::Missing, acts);
+    app.run(&mut rig).unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.chosen_names, ["tapestry", "beatoraja-style"]);
+    assert_eq!(
+        presets_played(&rig),
+        [["beatoraja-style", "beatoraja-style"]]
+    );
+    let hash = replay::preset_hash(&rules::beatoraja_style());
+    for r in rig.reports() {
+        assert_eq!(r.preset, rules::beatoraja_style());
+        assert_eq!(r.record.as_ref().unwrap().preset.sha256, hash);
+    }
+    assert_eq!(app.shelf().unwrap().chosen_name(), "beatoraja-style");
+}
+
+/// Steps taken in one batch before a choice apply to the chart it chose,
+/// and selection is shown them once; a step queued after the choice is
+/// not taken with it, and is dropped with the play's input. Back in
+/// selection, a step applies again.
+#[test]
+fn steps_before_a_choice_in_one_batch_apply_first() {
+    // Two steps and Enter, taken at once.
+    let acts = vec![
+        (0, NEXT),
+        (0, NEXT),
+        (0, Act::Choose(0)),
+        (4_000, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.chooses, 1);
+    assert_eq!(rig.chosen_names, ["tapestry", "lr2-style"]);
+    assert_eq!(presets_played(&rig), [["lr2-style"]]);
+
+    // Enter, then a step: the play keeps tapestry; the step after back
+    // chooses the second chart's.
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (0, NEXT),
+        (4_000, Act::Back),
+        (500, NEXT),
+        (100, Act::Choose(1)),
+        (4_000, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(presets_played(&rig), [["tapestry"], ["beatoraja-style"]]);
+}
+
+/// Steps that leave the chosen name as it was still show selection the
+/// shelf when their check reloaded the chosen file: `mine` changes, and
+/// Next then Prev, at once, come back to it reloaded.
+#[test]
+fn a_net_unchanged_batch_with_a_reload_still_shows_the_shelf() {
+    let edited = CLOCK_START + 100 * MS;
+    let acts = vec![(100, NEXT), (0, PREV), (500, Act::Close)];
+    let (rig, app, _dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
+        edit(
+            r,
+            edited,
+            &mine_path(dir),
+            game::preset_to_toml(&flat_normal()),
+        );
+    });
+    ran.unwrap();
+    // Shown at the entry, then at the steps, before any poll could.
+    let [(t0, Ok((r0, None))), (t1, Ok((r1, None)))] = &rig.presets[..] else {
+        panic!("{:?}", rig.presets);
+    };
+    assert_eq!((*t0, *t1), (CLOCK_START, edited));
+    assert!(r0 < r1);
+    assert_eq!(rig.chosen_names, ["mine", "mine"]);
+    assert_eq!(app.shelf().unwrap().chosen(), &mine(flat_normal()));
+}
+
+/// The practice of a chart after a step plays its rounds under the chosen
+/// preset, which its records carry.
+#[test]
+fn practice_uses_the_chosen_preset() {
+    // From tapestry, the previous preset wraps to lr2-style.
+    let mut acts = vec![(0, PREV), (100, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(PracticeInput::Confirm)),
+        (3_000, Act::Quit),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ]);
+    let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let [(P, rounds)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    let first = &rounds[0];
+    assert_eq!(first.preset, rules::lr2_style());
+    assert_eq!(
+        first.record.as_ref().unwrap().preset.sha256,
+        replay::preset_hash(&rules::lr2_style())
+    );
+}
+
+/// An autoplay session plays under the chosen preset too.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn autoplay_uses_the_chosen_preset() {
+    let acts = vec![(0, NEXT), (100, Act::Choose(0)), (4_000, Act::Close)];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.autoplay = vec![0]);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.configured, [0]);
+    assert_eq!(presets_played(&rig), [["beatoraja-style"]]);
+}
+
+/// A shelf that cannot open (its preset names no file) refuses a chart;
+/// a step opens it on the default, beatoraja-style, and the refusal is
+/// over: selection built again does not show it, and the chart plays.
+#[test]
+fn a_step_recovers_a_shelf_that_cannot_open() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (100, PREV),
+        (100, Act::Choose(0)),
+        (4_000, Act::Close),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_named(dir.path(), Refusal::Missing, "gone", &Events::default());
+    let mut rig = Headless::new(dir.path(), Refusal::Missing, acts);
+    rig.screen_fails_at = CLOCK_START + 150 * MS;
+    app.run(&mut rig).unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.refusals, ["preset"]);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Select,
+            Seen::Refused(0),
+            Seen::Select,
+            Seen::Load(0),
+            Seen::Shown(1),
+        ]
+    );
+    let errs: Vec<bool> = rig.presets.iter().map(|(_, s)| s.is_err()).collect();
+    assert_eq!(&errs[..3], [true, true, false], "{:?}", rig.presets);
+    assert_eq!(rig.chosen_names[0], "beatoraja-style");
+    assert_eq!(presets_played(&rig), [["beatoraja-style"]]);
+}
+
+/// Steps during a play, on its result and on the practice page are not
+/// taken; one in selection after them is, once.
+#[test]
+fn steps_outside_selection_are_ignored() {
+    let mut acts = vec![
+        (0, Act::Choose(0)),
+        // In play, then on the result.
+        (500, NEXT),
+        (4_000, NEXT),
+        (100, Act::Back),
+        (500, Act::Practice(0)),
+        // On the practice page.
+        (100, NEXT),
+        (100, Act::Page(PracticeInput::Back)),
+    ];
+    // In selection: taken.
+    acts.extend([(500, NEXT), (100, Act::Choose(1)), (4_000, Act::Close)]);
+    let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Load(0),
+            Seen::Shown(1),
+            Seen::Select,
+            Seen::Practice(None),
+            Seen::Select,
+            Seen::Load(1),
+            Seen::Shown(1),
+        ]
+    );
+    assert_eq!(presets_played(&rig), [["tapestry"], ["beatoraja-style"]]);
 }
 
 /// An input thread that fails while selection shows ends the run with its
@@ -1843,6 +2081,8 @@ fn act() -> impl Strategy<Value = Act> {
         2 => Just(Act::Back),
         1 => Just(Act::Next),
         1 => Just(Act::Prev),
+        1 => Just(NEXT),
+        1 => Just(PREV),
         1 => Just(Act::Close),
     ]
 }
@@ -1879,7 +2119,8 @@ fn refusal() -> impl Strategy<Value = Refusal> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
-    /// Random selections, retries, quits, backs, preset switches, closes
+    /// Random selections, retries, quits, backs, preset switches and
+    /// steps, closes
     /// and practices (P, Start, the quit key, Back) at random times, over
     /// two built charts, one refused chart and the practice chart: the run
     /// ends cleanly; every play that finalized anything has
