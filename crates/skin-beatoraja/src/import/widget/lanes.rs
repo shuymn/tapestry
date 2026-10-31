@@ -9,10 +9,7 @@
 //! lanes' own timer, conditions and window. HIDDEN+ is never drawn
 //! (owner decision 15, D11).
 
-use bms_model::TimeUs;
-use skin_model::{
-    Blend, Ease, End, Filter, KeyDef, LaneParts, LanesDef, Side, Source, TimerRef, Track,
-};
+use skin_model::{Blend, End, Filter, LaneParts, LanesDef, Side, Source, TimerRef};
 
 use super::super::geom::{HEIGHT, Offset, Q};
 use super::super::policy::{self, CriticalPart, Role};
@@ -342,7 +339,7 @@ impl Cx<'_> {
         }
 
         // The element: the destination's lifetime, timer and conditions.
-        let Some(c) = self.common_with(
+        let Some(mut c) = self.common_with(
             role,
             &dst,
             Opts {
@@ -386,23 +383,8 @@ impl Cx<'_> {
         }
         let span = span_of(&xs);
 
-        // The parts, each its lane's image in the image table.
-        let parts_c = Common {
-            role,
-            span: at,
-            track: c.track.clone(),
-            ease: Ease::Linear,
-            timer: c.timer,
-            visible: None,
-            blend: Blend::Alpha,
-            filter: Filter::Nearest,
-            pivot: c.pivot,
-            offset: Offset::default(),
-            stretch: Stretch::Identity,
-            stretch_mode: -1,
-            untimed: c.untimed,
-            cond_src: String::new(),
-        };
+        // The parts, each its lane's image in the image table, drawn nearest.
+        c.filter = Filter::Nearest;
         let mut cells = [[0_u32; 2]; LANES];
         let mut images = [[0_u32; 6]; LANES];
         let names: [(&Vec<Option<String>>, &'static str); 6] = [
@@ -424,7 +406,7 @@ impl Cx<'_> {
                     return refuse(self, field);
                 };
                 let s = self.src_image(img)?;
-                let Some((image, cell)) = self.add_src_image(&parts_c, img, &s, s.div)? else {
+                let Some((image, cell)) = self.add_src_image(&c, img, &s, s.div)? else {
                     return refuse(self, field);
                 };
                 if let Some(slot) = images.get_mut(u).and_then(|i| i.get_mut(p)) {
@@ -543,19 +525,7 @@ impl Cx<'_> {
         parts.bar = bar;
 
         // The element.
-        let kn = c.track.keys.last().map_or(0, |k| k.at);
-        let mut times = vec![0];
-        if kn > 0 {
-            times.push(kn);
-        }
-        let keys: Vec<KeyDef> = times
-            .iter()
-            .map(|&t| KeyDef {
-                at: TimeUs(t * 1000),
-                props: [0, 0, 0, 0, 255, 255, 255, 255, 0].map(Some),
-            })
-            .collect();
-        let t = Track::new(&keys, Ease::Linear, c.track.end).map_err(|_| range(self))?;
+        let t = self.neutral_track(&c)?;
         let state = LaneState {
             def: LanesDef {
                 lanes,
