@@ -133,17 +133,16 @@ impl Accepted {
 pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, TrackWhy> {
     // `SkinObject.java:240-255` inserts before the first later key.
     keys.sort_by_key(|k| k.at);
-    let mut out: Vec<SrcKey> = Vec::with_capacity(keys.len());
-    for k in keys {
-        match out.last() {
-            Some(last) if last.at == k.at => {
-                if !last.same_values(&k) {
-                    return Err(TrackWhy::EqualTime);
-                }
-            }
-            _ => out.push(k),
-        }
+    // Equal-time keys must show the same values (equality is transitive,
+    // so neighbours suffice); one of each run is kept.
+    if keys
+        .windows(2)
+        .any(|w| matches!(w, [a, b] if a.at == b.at && !a.same_values(b)))
+    {
+        return Err(TrackWhy::EqualTime);
     }
+    keys.dedup_by(|b, a| a.at == b.at);
+    let out = keys;
     let (Some(first), Some(last)) = (out.first(), out.last()) else {
         return Ok(None);
     };
