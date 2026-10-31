@@ -2,8 +2,9 @@
 //! `from_canonical_bytes` unchanged.
 //!
 //! The presets are valid, since the decoder refuses the others, and reach
-//! every enum variant, both booleans, one-byte to ten-byte varints, and
-//! strings and gauge lists whose length takes one or two varint bytes.
+//! every enum variant, both booleans, one-byte to ten-byte varints, strings
+//! and gauge lists whose length takes one or two varint bytes, and lamp
+//! ranks drawn as a permutation of the gauges, spread apart or contiguous.
 
 use bms_model::TimeUs;
 use proptest::collection::vec;
@@ -14,8 +15,8 @@ use rules::{
     Assignment, DefaultTotal, Denominator, EmptyPoorRange, EmptyPoorRule, GaugeDelta, GaugeKind,
     GaugeRule, GaugeValue, HeadEligibility, HeaderPolicy, Implementation, JudgeWindows, LaneTable,
     LateHeadRule, LnEndWindows, LnMode, LnModeRule, LowDamage, MineRule, MissRule, PerJudgment,
-    PerLaneClass, RankScale, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights, TotalCorrection,
-    TotalMode, Window, WindowPolicy,
+    PerLaneClass, RankScale, RuleError, RulePreset, SameTimeOrder, ScaledRank, ScoreWeights,
+    TotalCorrection, TotalMode, Window, WindowPolicy,
 };
 
 const FULL: i64 = GaugeValue::FULL.0;
@@ -237,6 +238,7 @@ fn gauge() -> impl Strategy<Value = GaugeRule> {
                 };
                 GaugeRule {
                     id: String::new(),
+                    lamp: 0,
                     kind,
                     start,
                     min,
@@ -250,15 +252,29 @@ fn gauge() -> impl Strategy<Value = GaugeRule> {
         )
 }
 
-/// One, a few, or at least 128 gauges, with distinct ids.
+/// One, a few, or at least 128 gauges, with distinct ids, and lamp ranks
+/// a shuffled permutation of the list's positions: contiguous or spread by
+/// a stride, counted up from 0 or down from `u16::MAX`.
 fn gauges() -> impl Strategy<Value = Vec<GaugeRule>> {
     (
         text(),
         prop_oneof![vec(gauge(), 1), vec(gauge(), 2..5), vec(gauge(), 128..131)],
     )
-        .prop_map(|(base, mut gauges)| {
-            for (i, g) in gauges.iter_mut().enumerate() {
+        .prop_flat_map(|(base, gauges)| {
+            let positions: Vec<u16> = (0..u16::try_from(gauges.len()).unwrap()).collect();
+            (
+                Just((base, gauges)),
+                Just(positions).prop_shuffle(),
+                prop_oneof![Just(1_u16), 1_u16..=500],
+                any::<bool>(),
+            )
+        })
+        .prop_map(|((base, mut gauges), order, stride, down)| {
+            for (i, (g, position)) in gauges.iter_mut().zip(order).enumerate() {
                 g.id = format!("{base}{i}");
+                // At most 130 × 500, within a u16.
+                let rank = position * stride;
+                g.lamp = if down { u16::MAX - rank } else { rank };
             }
             gauges
         })
@@ -358,7 +374,7 @@ proptest! {
 fn generator_reaches_every_variant_and_length_class() {
     let mut runner = TestRunner::deterministic();
     let presets = preset();
-    let mut counts = [0_usize; 33];
+    let mut counts = [0_usize; 36];
     // Per boolean field, whether it was seen false and true.
     let mut bools_seen = [[false; 2]; 13];
     for _ in 0..256 {
@@ -419,6 +435,15 @@ fn generator_reaches_every_variant_and_length_class() {
             p.assignment == Assignment::ComboPriority,
             p.ln_mode.head_eligibility == HeadEligibility::InsideBad,
             p.ln_mode.head_eligibility == HeadEligibility::NotLateBad,
+            // Ranks out of list order, spread apart, and of two or three
+            // varint bytes.
+            p.gauges.windows(2).any(|w| w[0].lamp > w[1].lamp),
+            p.gauges.len() >= 2 && {
+                let mut ranks: Vec<u16> = p.gauges.iter().map(|g| g.lamp).collect();
+                ranks.sort_unstable();
+                ranks.windows(2).all(|w| w[1] - w[0] >= 2)
+            },
+            p.gauges.iter().any(|g| g.lamp >= 1 << 14),
         ];
         for (count, hit) in counts.iter_mut().zip(reached) {
             *count += usize::from(hit);
@@ -453,5 +478,54 @@ fn generator_reaches_every_variant_and_length_class() {
     assert!(
         bools_seen.iter().all(|&[f, t]| f && t),
         "a boolean field missing a value: {bools_seen:?}"
+    );
+}
+
+/// Each built-in, and one with a rank changed: encoding then decoding gives
+/// the preset back, and a changed rank changes the bytes and so the preset's
+/// hash, which is the SHA-256 of these bytes.
+#[test]
+fn canonical_round_trips_lamp_ranks() {
+    for preset in [
+        rules::tapestry(),
+        rules::beatoraja_style(),
+        rules::lr2_style(),
+    ] {
+        let bytes = preset.canonical_bytes();
+        assert_eq!(bytes.first(), Some(&11));
+        assert_eq!(rules::CANONICAL_VERSION, 11);
+        assert_eq!(RulePreset::from_canonical_bytes(&bytes), Ok(preset.clone()));
+        let mut changed = preset.clone();
+        let top = changed.gauges.iter().map(|g| g.lamp).max().unwrap();
+        changed.gauges[0].lamp = top + 1;
+        let changed_bytes = changed.canonical_bytes();
+        assert_ne!(changed_bytes, bytes);
+        assert_eq!(
+            RulePreset::from_canonical_bytes(&changed_bytes),
+            Ok(changed)
+        );
+    }
+}
+
+/// Bytes whose two gauges share a rank: tapestry's encoding with the
+/// survival gauge's rank (the byte after its id) set to normal's, 0.
+#[test]
+fn canonical_decoder_refuses_duplicate_lamp_ranks() {
+    let mut bytes = rules::tapestry().canonical_bytes();
+    let id = b"survival";
+    let at = bytes
+        .windows(id.len())
+        .position(|w| w == id)
+        .expect("the survival gauge's id")
+        + id.len();
+    assert_eq!(bytes[at], 1);
+    bytes[at] = 0;
+    assert_eq!(
+        RulePreset::from_canonical_bytes(&bytes),
+        Err(rules::CanonicalError::Invalid(RuleError::DuplicateLamp {
+            rank: 0,
+            first: "normal".to_owned(),
+            second: "survival".to_owned(),
+        }))
     );
 }

@@ -456,13 +456,15 @@ fn gauge_count_at(bytes: &[u8]) -> usize {
 pub fn preset_canonicals() -> Vec<Seed> {
     let tapestry = rules::tapestry();
     let bytes = tapestry.canonical_bytes();
-    // Strings and a gauge list whose lengths take two varint bytes.
+    // Strings and a gauge list whose lengths take two varint bytes, and
+    // lamp ranks of three.
     let mut long = tapestry.clone();
     long.id = "p".repeat(200);
     let gauge = long.gauges[1].clone();
     long.gauges = (0..130)
         .map(|i| rules::GaugeRule {
             id: format!("{}{i}", "g".repeat(130)),
+            lamp: u16::MAX - i,
             ..gauge.clone()
         })
         .collect();
@@ -514,13 +516,20 @@ pub fn preset_canonicals() -> Vec<Seed> {
             b.splice(count_at..=count_at, [0xff, 0x7f]);
         }),
     ));
-    // The first gauge's kind, after the count and its id, is tag 2.
+    // The first gauge's kind, after the count, its id and its lamp rank, is
+    // tag 2.
     let id = &tapestry.gauges[0].id;
     assert!(
         id.len() < 128 && tapestry.gauges.len() < 128,
         "one-byte lengths"
     );
-    seeds.push(("unknown_tag", edited(&|b| b[count_at + 2 + id.len()] = 2)));
+    let lamp_at = count_at + 2 + id.len();
+    assert_eq!(bytes[lamp_at], 0, "the first gauge's lamp rank");
+    seeds.push(("unknown_tag", edited(&|b| b[lamp_at + 1] = 2)));
+    // Both gauges ranked 0.
+    let mut same_lamp = tapestry.clone();
+    same_lamp.gauges[1].lamp = 0;
+    seeds.push(("duplicate_lamp", same_lamp.canonical_bytes()));
     // The version as eleven varint bytes.
     seeds.push((
         "varint_overflow",

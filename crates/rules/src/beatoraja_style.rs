@@ -178,13 +178,16 @@ fn hard_bands() -> Vec<LowDamage> {
 /// The beatoraja-style preset, the default play preset.
 #[must_use]
 pub fn beatoraja_style() -> RulePreset {
-    // NORMAL comes first: the displayed gauge defaults to index 0.
+    // NORMAL comes first: the displayed gauge defaults to index 0. Lamp
+    // ranks, easiest first: ASSIST EASY, EASY, NORMAL, HARD, EX HARD,
+    // HAZARD (design.md "Standard Presets").
     let gauges = vec![
-        end_gauge("normal", 80, BEST_GOOD, [300, 600, 200]),
-        end_gauge("assist_easy", 60, BEST_GOOD, [150, 300, 50]),
-        end_gauge("easy", 80, BEST_GOOD, [150, 450, 100]),
+        end_gauge("normal", 2, 80, BEST_GOOD, [300, 600, 200]),
+        end_gauge("assist_easy", 0, 60, BEST_GOOD, [150, 300, 50]),
+        end_gauge("easy", 1, 80, BEST_GOOD, [150, 450, 100]),
         survival_gauge(
             "hard",
+            3,
             GaugeValue::EMPTY,
             [15, 12, 3, -500, -1_000, -500],
             TotalCorrection::LimitIncrease,
@@ -192,6 +195,7 @@ pub fn beatoraja_style() -> RulePreset {
         ),
         survival_gauge(
             "ex_hard",
+            4,
             GaugeValue::EMPTY,
             [15, 6, 0, -800, -1_600, -800],
             TotalCorrection::LimitIncrease,
@@ -199,6 +203,7 @@ pub fn beatoraja_style() -> RulePreset {
         ),
         survival_gauge(
             "hazard",
+            5,
             GaugeValue::EMPTY,
             [15, 6, 0, -10_000, -10_000, -1_000],
             TotalCorrection::None,

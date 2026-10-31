@@ -340,6 +340,21 @@ fn raw_preset() -> impl Strategy<Value = RawPreset> {
         )
 }
 
+/// Lamp ranks for `n` gauges (at most 3): a permutation of `0..n`, chosen
+/// by `raw` (decoded as a factorial-base number), times a stride of 1 to 4,
+/// so ranks reach every order and need not be contiguous.
+fn lamp_ranks(n: usize, raw: u32) -> Vec<u16> {
+    let mut pool: Vec<u16> = (0..u16::try_from(n).unwrap()).collect();
+    let mut raw = raw;
+    let mut order = Vec::with_capacity(n);
+    for k in (1..=u32::try_from(n).unwrap()).rev() {
+        order.push(pool.remove(usize::try_from(raw % k).unwrap()));
+        raw /= k;
+    }
+    let stride = u16::try_from(raw % 4).unwrap() + 1;
+    order.into_iter().map(|pos| pos * stride).collect()
+}
+
 /// A window edge increment: a grid multiple (so deadlines meet inputs),
 /// or any µs count; the first edge may be 0.
 fn edge_step(raw: u32, first: bool) -> i64 {
@@ -392,7 +407,7 @@ fn delta(sel: u8, v: u32) -> GaugeDelta {
     }
 }
 
-fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
+fn build_gauge(raw: &RawGauge, id: usize, lamp: u16) -> GaugeRule {
     let [a, b, c, d] = raw.bounds.map(u64::from);
     let (sel, v) = raw.policy;
     let (kind, min, start, max) = if raw.survival {
@@ -464,6 +479,7 @@ fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
     low_damage.dedup_by_key(|b| b.below);
     GaugeRule {
         id: format!("g{id}"),
+        lamp,
         kind,
         start: GaugeValue(start),
         min: GaugeValue(min),
@@ -696,11 +712,15 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
         2 => DefaultTotal::NotesCurve,
         _ => DefaultTotal::NotesLinear,
     };
+    // Lamp ranks from the flags' unused top bits, so drawing them leaves
+    // every other value of a sample as it was.
+    let lamps = lamp_ranks(raw.gauges.len(), raw.flags >> 21);
     p.gauges = raw
         .gauges
         .iter()
+        .zip(lamps)
         .enumerate()
-        .map(|(i, g)| build_gauge(g, i))
+        .map(|(i, (g, lamp))| build_gauge(g, i, lamp))
         .collect();
     let ex = raw.ex.map(|e| u32::from(e % 4));
     p.score.ex = PerJudgment {

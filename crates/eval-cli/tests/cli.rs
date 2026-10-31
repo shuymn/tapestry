@@ -552,6 +552,39 @@ fn output_is_deterministic() {
     );
 }
 
+/// Each exported gauge states its lamp rank, in the built-in's gauge order
+/// (NORMAL first, ranked 2), and the file loads as the built-in.
+#[test]
+fn export_writes_lamp_ranks() {
+    let dir = folder();
+    let o = run(
+        dir.path(),
+        &["preset", "export", "beatoraja-style", "x.toml"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    let path = dir.path().join("x.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lamps: Vec<&str> = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("lamp"))
+        .collect();
+    assert_eq!(
+        lamps,
+        [
+            "lamp = 2", "lamp = 0", "lamp = 1", "lamp = 3", "lamp = 4", "lamp = 5"
+        ],
+        "{text}"
+    );
+    let (preset, _) = rules_toml::read_preset_file(&path).unwrap();
+    assert_eq!(
+        preset,
+        RulePreset {
+            id: "x".to_owned(),
+            ..rules::beatoraja_style()
+        }
+    );
+}
+
 /// The export writes the built-in as a user preset named by the file's
 /// stem: the same rules under another ID, which `--preset` then evaluates
 /// as a what-if of a play under the built-in.

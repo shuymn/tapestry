@@ -24,21 +24,23 @@ use crate::{
     ScoreWeights, TotalCorrection, TotalMode, Window, WindowPolicy,
 };
 
-/// The encoding layout. Version 10 has a table per lane class (keys, then
-/// scratch: windows, LN-end edges, empty POOR range), the window policy
-/// after the header policy (thousandths 0; scaled 1 and interpolated 2,
-/// each with five rank percentages, the absent and the `#DEFEXRANK`
-/// percentage), two assignment variants (nearest first 0, combo priority
-/// 1), the LN head eligibility after the late head rule (inside BAD 0, not
-/// late BAD 1), the default `#TOTAL` as a policy, and per gauge a survival
-/// gauge's failure threshold, its `#TOTAL` correction and a list of
-/// low-damage bands.
-const FORMAT_VERSION: u64 = 10;
+/// The encoding layout, which every encoding starts with. Version 11 has a
+/// table per lane class (keys, then scratch: windows, LN-end edges, empty
+/// POOR range), the window policy after the header policy (thousandths 0;
+/// scaled 1 and interpolated 2, each with five rank percentages, the absent
+/// and the `#DEFEXRANK` percentage), two assignment variants (nearest first
+/// 0, combo priority 1), the LN head eligibility after the late head rule
+/// (inside BAD 0, not late BAD 1), the default `#TOTAL` as a policy, and per
+/// gauge its lamp rank after its id, a survival gauge's failure threshold,
+/// its `#TOTAL` correction and a list of low-damage bands. Another version
+/// is refused, never converted.
+pub const CANONICAL_VERSION: u64 = 11;
 
-/// The fewest bytes a gauge takes: an empty id's length, the survival tag
-/// and a one-byte threshold, three one-byte values, six fixed deltas of a
-/// tag and a one-byte value, the correction's tag, and no low-damage band.
-const MIN_GAUGE_BYTES: usize = 1 + 2 + 3 + 6 * 2 + 1 + 1;
+/// The fewest bytes a gauge takes: an empty id's length, a one-byte lamp
+/// rank, the survival tag and a one-byte threshold, three one-byte values,
+/// six fixed deltas of a tag and a one-byte value, the correction's tag,
+/// and no low-damage band.
+const MIN_GAUGE_BYTES: usize = 1 + 1 + 2 + 3 + 6 * 2 + 1 + 1;
 
 /// The fewest bytes a low-damage band takes: three one-byte values.
 const MIN_BAND_BYTES: usize = 3;
@@ -49,7 +51,7 @@ impl RulePreset {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
-        w.uint(FORMAT_VERSION);
+        w.uint(CANONICAL_VERSION);
         let Self {
             id,
             version,
@@ -121,7 +123,7 @@ impl RulePreset {
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CanonicalError> {
         let mut r = Reader(bytes);
         let format = r.uint()?;
-        if format != FORMAT_VERSION {
+        if format != CANONICAL_VERSION {
             return Err(CanonicalError::UnsupportedVersion(format));
         }
         let id = r.str("id")?;
@@ -373,6 +375,7 @@ impl Writer {
     fn gauge(&mut self, gauge: &GaugeRule) {
         let GaugeRule {
             id,
+            lamp,
             kind,
             start,
             min,
@@ -383,6 +386,7 @@ impl Writer {
             low_damage,
         } = gauge;
         self.str(id);
+        self.uint(u64::from(*lamp));
         match kind {
             GaugeKind::EndThreshold { clear } => {
                 self.uint(0);
@@ -668,6 +672,9 @@ impl Reader<'_> {
 
     fn gauge(&mut self) -> Result<GaugeRule, CanonicalError> {
         let id = self.str("gauge id")?;
+        let lamp = u16::try_from(self.uint()?).map_err(|_| CanonicalError::ValueTooLarge {
+            field: "gauge lamp",
+        })?;
         let kind = match self.uint()? {
             0 => GaugeKind::EndThreshold {
                 clear: self.gauge_value()?,
@@ -705,6 +712,7 @@ impl Reader<'_> {
         }
         Ok(GaugeRule {
             id,
+            lamp,
             kind,
             start,
             min,
@@ -771,7 +779,7 @@ mod tests {
         CanonicalError, GaugeKind, Judgment, LaneClass, RuleError, RulePreset, Side, tapestry,
     };
 
-    use super::{FORMAT_VERSION, MIN_BAND_BYTES, MIN_GAUGE_BYTES, Reader, Writer};
+    use super::{CANONICAL_VERSION, MIN_BAND_BYTES, MIN_GAUGE_BYTES, Reader, Writer};
 
     fn table_mut(p: &mut RulePreset, class: LaneClass) -> &mut crate::LaneTable {
         match class {
@@ -813,10 +821,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_bytes_start_with_format_10_and_change_with_any_table_edge() {
+    fn canonical_bytes_start_with_format_11_and_change_with_any_table_edge() {
         let base = tapestry();
         let base_bytes = base.canonical_bytes();
-        assert_eq!(base_bytes.first(), Some(&10));
+        assert_eq!(base_bytes.first(), Some(&11));
         let edges: [fn(&mut crate::LaneTable) -> &mut TimeUs; 5] = [
             |t| &mut t.ln_end.perfect,
             |t| &mut t.ln_end.great,
@@ -958,7 +966,7 @@ mod tests {
     }
 
     /// The bytes of [`representative`], written by hand from the module docs
-    /// field by field: the format version 10, then `rep`, version 7, the
+    /// field by field: the format version 11, then `rep`, version 7, the
     /// implementation; the keys' table: the windows, the LN-end edges (90 ms
     /// is zigzag 180000 = `a0 fe 0a`, 140 ms is `c0 8b 11`, 210 ms is `a0 d1
     /// 19`) and the empty POOR range (`ahead` 250 ms is zigzag 500000 = `a0
@@ -969,13 +977,13 @@ mod tests {
     /// `50`, 70 `46`), the default `#TOTAL` (`Fixed`, 0: 123.456 is zigzag
     /// 246912 = `80 89 0f`), and the rest in declaration order, the
     /// assignment `ComboPriority` (1) and the head eligibility `NotLateBad`
-    /// (1) among them. Each gauge
-    /// ends with its correction's tag and its bands: normal's `00 00`;
-    /// survival, after its kind (1) and 2 % threshold (`80 b5 18`), ends
-    /// with `ScaleDamage` (2), two bands, 30 % (`80 9b ee 02`) × 1/2 and
-    /// 50 % (`80 ad e2 04`) × 4/5.
-    const PINNED: [u8; 243] = [
-        0x0a, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
+    /// (1) among them. Each gauge's lamp rank follows its id (normal 0,
+    /// survival 1), and each gauge ends with its correction's tag and its
+    /// bands: normal's `00 00`; survival, after its kind (1) and 2 %
+    /// threshold (`80 b5 18`), ends with `ScaleDamage` (2), two bands, 30 %
+    /// (`80 9b ee 02`) × 1/2 and 50 % (`80 ad e2 04`) × 4/5.
+    const PINNED: [u8; 245] = [
+        0x0b, 0x03, 0x72, 0x65, 0x70, 0x07, 0x08, 0x73, 0x74, 0x61, 0x6e, 0x64, //
         0x61, 0x72, 0x64, 0x04, 0xa0, 0x99, 0x02, 0xe0, 0xd7, 0x02, 0x80, 0xf1, //
         0x04, 0xa0, 0x8d, 0x06, 0xa0, 0xfe, 0x0a, 0xe0, 0xb6, 0x0d, 0xa0, 0xe0, //
         0x14, 0x80, 0xb5, 0x18, 0xa0, 0xfe, 0x0a, 0xc0, 0x8b, 0x11, 0xa0, 0xd1, //
@@ -985,17 +993,17 @@ mod tests {
         0x12, 0x80, 0xb5, 0x18, 0xc0, 0x84, 0x3d, 0x80, 0xc4, 0x13, 0x00, 0x00, //
         0x00, 0x01, 0x01, 0x02, 0x05, 0x19, 0x32, 0x4b, 0x64, 0x7d, 0x50, 0x46, //
         0x00, 0x80, 0x89, 0x0f, 0x00, 0x02, 0x06, 0x6e, 0x6f, 0x72, 0x6d, 0x61, //
-        0x6c, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, 0xb5, //
-        0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, //
-        0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, 0x00, 0xbf, //
-        0xcf, 0x24, 0x00, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, 0x61, //
-        0x6c, 0x01, 0x80, 0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xda, //
-        0xc4, 0x09, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x00, //
-        0x00, 0xbf, 0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, 0xf7, 0x36, //
-        0x02, 0x02, 0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x80, 0xad, 0xe2, 0x04, //
-        0x04, 0x05, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, //
-        0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, //
-        0x00, 0xa0, 0x8d, 0x06,
+        0x6c, 0x00, 0x00, 0x80, 0xc8, 0xd0, 0x07, 0x80, 0x92, 0xf4, 0x01, 0x80, //
+        0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, //
+        0x01, 0x01, 0x02, 0x00, 0xff, 0xb4, 0x18, 0x00, 0xff, 0x9e, 0x49, 0x00, //
+        0xbf, 0xcf, 0x24, 0x00, 0x00, 0x08, 0x73, 0x75, 0x72, 0x76, 0x69, 0x76, //
+        0x61, 0x6c, 0x01, 0x01, 0x80, 0xb5, 0x18, 0x80, 0xda, 0xc4, 0x09, 0x00, //
+        0x80, 0xda, 0xc4, 0x09, 0x00, 0x80, 0xfa, 0x01, 0x00, 0x80, 0xfa, 0x01, //
+        0x00, 0x00, 0x00, 0xbf, 0x84, 0x3d, 0x00, 0xbf, 0xee, 0x6d, 0x00, 0x9f, //
+        0xf7, 0x36, 0x02, 0x02, 0x80, 0x9b, 0xee, 0x02, 0x01, 0x02, 0x80, 0xad, //
+        0xe2, 0x04, 0x04, 0x05, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, //
+        0x00, 0x00, 0xa0, 0x8d, 0x06,
     ];
 
     /// The layout, pinned, so a reordered or dropped field fails here; an
@@ -1034,7 +1042,7 @@ mod tests {
     fn offset(before: impl FnOnce(&mut Writer, &RulePreset)) -> usize {
         let preset = tapestry();
         let mut w = Writer(Vec::new());
-        w.uint(FORMAT_VERSION);
+        w.uint(CANONICAL_VERSION);
         before(&mut w, &preset);
         w.0.len()
     }
@@ -1130,7 +1138,9 @@ mod tests {
 
     #[test]
     fn other_canonical_version_is_refused() {
-        for v in [0, FORMAT_VERSION - 1, FORMAT_VERSION + 1, u64::MAX] {
+        // Version 10, the layout before lamp ranks, among them.
+        assert_eq!(CANONICAL_VERSION, 11);
+        for v in [0, 10, CANONICAL_VERSION + 1, u64::MAX] {
             assert_eq!(
                 decode(&with_uint_at(0, v)),
                 Err(CanonicalError::UnsupportedVersion(v))
@@ -1144,19 +1154,19 @@ mod tests {
         // The id's length: one more than the bytes left is refused; exactly
         // the bytes left is read, and the next field finds nothing.
         assert_eq!(
-            decode(&[10, 4, b'a', b'b', b'c']),
+            decode(&[11, 4, b'a', b'b', b'c']),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
                 count: 4
             })
         );
         assert_eq!(
-            decode(&[10, 3, b'a', b'b', b'c']),
+            decode(&[11, 3, b'a', b'b', b'c']),
             Err(CanonicalError::Truncated)
         );
         assert_eq!(
             decode(&[
-                10, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
+                11, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01
             ]),
             Err(CanonicalError::CountBeyondData {
                 field: "id",
@@ -1201,7 +1211,7 @@ mod tests {
         let style = crate::beatoraja_style();
         let bytes = style.canonical_bytes();
         let mut w = Writer(Vec::new());
-        w.uint(FORMAT_VERSION);
+        w.uint(CANONICAL_VERSION);
         w.str(&style.id);
         w.uint(u64::from(style.version));
         w.implementation(style.implementation);
@@ -1242,9 +1252,12 @@ mod tests {
     fn gauge_count_is_bounded_by_the_smallest_gauge() {
         let at = offset(through_denominator);
         let prefix = &tapestry().canonical_bytes()[..at];
-        // An empty id, survival with a zero threshold, zero values, six
-        // `Fixed(0)` deltas, no correction and no low-damage band.
-        let smallest = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // An empty id, lamp rank 0, survival with a zero threshold, zero
+        // values, six `Fixed(0)` deltas, no correction and no low-damage
+        // band.
+        let smallest = [
+            0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         assert_eq!(smallest.len(), MIN_GAUGE_BYTES);
         let with = |count: u64, gauges: usize| {
             let mut w = Writer(prefix.to_vec());
@@ -1285,7 +1298,7 @@ mod tests {
         let gauge = |bands: u64, band_bytes: usize| {
             let mut w = Writer(prefix.to_vec());
             w.uint(1);
-            w.0.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            w.0.extend_from_slice(&[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
             w.uint(bands);
             w.0.resize(w.0.len() + band_bytes, 0);
             w.0
@@ -1331,6 +1344,7 @@ mod tests {
             through_denominator(w, p);
             w.len(p.gauges.len());
             w.str(&p.gauges[0].id);
+            w.uint(u64::from(p.gauges[0].lamp));
         });
         assert_eq!(decode(&with_uint_at(kind, 2)), unknown("gauge kind", 2));
         let delta = offset(|w, p| {
@@ -1338,6 +1352,7 @@ mod tests {
             w.len(p.gauges.len());
             let g = &p.gauges[0];
             w.str(&g.id);
+            w.uint(u64::from(g.lamp));
             let GaugeKind::EndThreshold { clear } = g.kind else {
                 panic!("the first tapestry gauge has a clear threshold");
             };
@@ -1356,6 +1371,7 @@ mod tests {
             w.len(p.gauges.len());
             let g = &p.gauges[0];
             w.str(&g.id);
+            w.uint(u64::from(g.lamp));
             let GaugeKind::EndThreshold { clear } = g.kind else {
                 panic!("the first tapestry gauge has a clear threshold");
             };
@@ -1463,6 +1479,22 @@ mod tests {
         assert_eq!(
             decode(&with_uint_at(at, u64::from(u32::MAX) + 1)),
             Err(CanonicalError::ValueTooLarge { field: "version" })
+        );
+        // A gauge's lamp rank is a u16.
+        let at = offset(|w, p| {
+            through_denominator(w, p);
+            w.len(p.gauges.len());
+            w.str(&p.gauges[0].id);
+        });
+        assert_eq!(
+            decode(&with_uint_at(at, u64::from(u16::MAX))).map(|p| p.gauges[0].lamp),
+            Ok(u16::MAX)
+        );
+        assert_eq!(
+            decode(&with_uint_at(at, u64::from(u16::MAX) + 1)),
+            Err(CanonicalError::ValueTooLarge {
+                field: "gauge lamp"
+            })
         );
         // The id is not UTF-8.
         let mut bytes = tapestry().canonical_bytes();

@@ -31,6 +31,7 @@ pub fn tapestry() -> RulePreset {
     let full_share = GaugeDelta::TotalShare { num: 1, den: 1 };
     let normal = GaugeRule {
         id: "normal".to_owned(),
+        lamp: 0,
         kind: GaugeKind::EndThreshold { clear: pct(80) },
         start: pct(20),
         min: pct(2),
@@ -48,6 +49,7 @@ pub fn tapestry() -> RulePreset {
     };
     let survival = GaugeRule {
         id: "survival".to_owned(),
+        lamp: 1,
         kind: GaugeKind::Survival {
             fails_below: GaugeValue::EMPTY,
         },
@@ -214,6 +216,7 @@ mod tests {
             gauges: vec![
                 GaugeRule {
                     id: "normal".to_owned(),
+                    lamp: 0,
                     kind: GaugeKind::EndThreshold {
                         clear: GaugeValue(8_000_000),
                     },
@@ -233,6 +236,7 @@ mod tests {
                 },
                 GaugeRule {
                     id: "survival".to_owned(),
+                    lamp: 1,
                     kind: GaugeKind::Survival {
                         fails_below: GaugeValue(0),
                     },

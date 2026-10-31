@@ -121,6 +121,21 @@ fn older_preset_file_is_refused_with_the_hint() {
 }
 
 #[test]
+fn preset_file_without_lamp_is_refused_with_the_hint() {
+    let text = preset_to_toml(&rules::tapestry());
+    let old = text.replacen("lamp = 1\n", "", 1);
+    assert_ne!(old, text, "the edit did not apply");
+    let e = load(&old).unwrap_err();
+    assert!(
+        matches!(&e, PresetError::Parse(m) if m.message().contains("lamp")),
+        "{e}"
+    );
+    let shown = e.to_string();
+    assert!(shown.contains("older version"), "{shown}");
+    assert!(shown.contains("eval-cli preset export"), "{shown}");
+}
+
+#[test]
 fn file_without_the_empty_poor_behind_edge_is_refused() {
     let text = preset_to_toml(&rules::tapestry());
     let old = text.replacen("behind_us = 150000\n", "", 1);
@@ -270,13 +285,15 @@ fn head_eligibility_reads_back_and_is_required() {
 fn the_largest_generated_presets_fit_the_file_limit() {
     let mut p = mine(rules::tapestry());
     // Gauge ids of 136 characters that TOML escapes, the longest the property
-    // tests generate, on their largest gauge count.
+    // tests generate, on their largest gauge count, with five-digit lamp
+    // ranks.
     let long = "\u{1}".repeat(136);
     let gauge = p.gauges[1].clone();
     p.gauges = (0..131)
         .map(|i| {
             let mut g = gauge.clone();
             g.id = format!("{long}{i}");
+            g.lamp = u16::MAX - i;
             g
         })
         .collect();
