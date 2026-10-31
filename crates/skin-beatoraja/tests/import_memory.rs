@@ -18,12 +18,16 @@ use std::hint::black_box;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use common::play::{Drawn, judged};
 use common::{font, png, write};
+use rules::{GaugeValue, Judgment};
 use skin_beatoraja::limits::{
     MAX_FILE_CHOICES, MAX_INPUT_BYTES, MAX_LIST_ENTRIES, MAX_NODES, MAX_NOTES, MAX_OFFSETS,
     MAX_OPTION_ITEMS, MAX_OPTIONS,
 };
-use skin_beatoraja::{Config, Imported, Note, Report, import, read_header};
+use skin_beatoraja::{
+    Config, Header, ImportError, Imported, InputLimit, Note, Report, import, read_header,
+};
 use skin_model::{
     ElementDef, ImageDef, KeyDef, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_SKIN_FRAMES,
     MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_WIDGET_QUADS, Program,
@@ -99,18 +103,24 @@ fn peak<T>(f: impl FnOnce() -> T) -> (T, i64) {
     (out, PEAK.load(Ordering::Relaxed))
 }
 
-/// Reads and imports `s.json` of `root` within the window, keeping the
-/// header and definition until the import is checked by `check`.
-fn measure(root: &Path, check: impl FnOnce(&Imported)) -> i64 {
-    let ((), p) = peak(|| {
+/// Reads and imports `s.json` of `root` within the window, the header
+/// and definition kept with the import, then checks them with `check`
+/// outside it.
+fn measure(root: &Path, check: impl FnOnce(&Header, Imported)) -> i64 {
+    let ((def, header, imported), p) = peak(|| {
         let (mut def, header) = read_header(root, "s.json").unwrap();
         let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
-        check(&imported);
-        drop(imported);
-        drop(header);
-        drop(def);
+        (def, header, imported)
     });
+    check(&header, imported);
+    drop(def);
     p
+}
+
+/// What importing `s.json` of `root` stops at.
+fn refused(root: &Path) -> ImportError {
+    let (mut def, header) = read_header(root, "s.json").unwrap();
+    import(&mut def, &header, &Config::defaults(&header)).unwrap_err()
 }
 
 fn join(items: impl Iterator<Item = String>) -> String {
@@ -184,7 +194,7 @@ fn f1(root: &Path) {
             format!(
                 r#"{{"id": "{i}", "op": [{ops}], "loop": 3, "mouseRect": {{}}, "dst": [
                     {{"time": 0, "w": 1, "h": 1}}, {{"time": 1, "x": 1}},
-                    {{"time": 2, "x": 2}}, {{"time": 3, "x": 3}}]}}"#
+                    {{"time": 2, "x": 3}}, {{"time": 3, "x": 2}}]}}"#
             )
         }));
         write(root, &format!("d{f}.json"), format!("[{dsts}]").as_bytes());
@@ -200,7 +210,7 @@ fn f1(root: &Path) {
     );
 }
 
-fn check_f1(i: &Imported) {
+fn check_f1(_: &Header, i: Imported) {
     let u = i.report.usage;
     assert_eq!(u.elements, as_u32(MAX_ELEMENTS));
     assert_eq!(u.keys, as_u32(MAX_SKIN_KEYS));
@@ -215,6 +225,17 @@ fn check_f1(i: &Imported) {
     assert_eq!(i.skin.sheet().image_count(), MAX_ELEMENTS);
     assert_eq!(i.skin.sheet().frame_count(), MAX_SKIN_FRAMES);
     assert_eq!(i.skin.quad_capacity(), as_u32(MAX_ELEMENTS));
+    // Every element keeps its four keys: with the gauge at 25 % and a
+    // perfect judgment both conditions hold, and each key's x shows at
+    // its time (x 0, 1, 3, 2: no key lies on its neighbours' line).
+    let mut d = Drawn::new(i.skin, 100);
+    d.gauges[0].value = GaugeValue(25 * GaugeValue::PERCENT);
+    let effects = [judged(0, Judgment::Perfect, 1)];
+    for (ms, x) in [(0, 0_i16), (1, 1), (2, 3), (3, 2)] {
+        let quads = d.frame(ms, if ms == 0 { &effects } else { &[] });
+        assert_eq!(quads.len(), MAX_ELEMENTS, "{ms} ms");
+        assert!(quads.iter().all(|q| q.rect[0] == f32::from(x)), "{ms} ms");
+    }
 }
 
 /// F2: 64 texts in 16 fonts, and counts filling the widget quads.
@@ -253,12 +274,13 @@ fn f2(root: &Path) {
     );
 }
 
-fn check_f2(i: &Imported) {
+fn check_f2(_: &Header, i: Imported) {
     let u = i.report.usage;
     assert_eq!(u.texts, as_u32(MAX_TEXT_ELEMENTS));
     assert_eq!(u.fonts, as_u32(MAX_FONTS));
     assert_eq!(u.widget_quads, MAX_WIDGET_QUADS);
     assert_eq!(i.skin.text_slots(), MAX_TEXT_ELEMENTS);
+    assert_eq!(i.skin.sheet().font_count(), MAX_FONTS);
     assert_eq!(i.skin.quad_capacity(), MAX_WIDGET_QUADS);
 }
 
@@ -277,9 +299,13 @@ fn long_name(len: usize, tail: &str) -> String {
 /// F3: 4,096 file attempts with long valid names: 2,048 admitted (as
 /// long as the platform opens) and 2,048 missing (1,024 bytes).
 fn f3(root: &Path) -> usize {
-    // The absolute path must fit the platform's limit (1,024 on macOS).
-    let room = 1_000 - root.as_os_str().len();
-    let ok_len = room.min(1_024);
+    // The absolute path must fit the platform's limit: 1,024 bytes on
+    // macOS, so the admitted names are shorter there; 4,096 on Linux.
+    let ok_len = if cfg!(target_os = "macos") {
+        (1_000 - root.as_os_str().len()).min(1_024)
+    } else {
+        1_024
+    };
     let names: Vec<String> = (0..MAX_FILES)
         .map(|i| {
             let tail = format!("/{i:04}.png");
@@ -316,7 +342,7 @@ fn f3(root: &Path) -> usize {
     ok_len
 }
 
-fn check_f3(i: &Imported) {
+fn check_f3(_: &Header, i: Imported) {
     let u = i.report.usage;
     assert_eq!(u.file_attempts, as_u32(MAX_FILES));
     assert_eq!(u.files, as_u32(MAX_FILES / 2));
@@ -324,8 +350,9 @@ fn check_f3(i: &Imported) {
 }
 
 /// F4: 32 MiB of input holding nodes within 1 % of the cap, every header
-/// record table at its cap, 4,096 candidates and about 1,000 elements.
-fn f4(root: &Path) {
+/// record table at its cap, 4,096 candidates and about 1,000 elements;
+/// `more_nodes` and `more_bytes` added to the included file.
+fn f4(root: &Path, more_nodes: usize, more_bytes: usize) {
     png(root, "a.png", 1, 1);
     for i in 0..MAX_LIST_ENTRIES {
         write(root, &format!("c/{i:04}.png"), b"");
@@ -360,7 +387,7 @@ fn f4(root: &Path) {
     // The rest of the skin is about 64,400 nodes (measured: a pad 2,032,760
     // long reaches the cap), so this totals about 99.5 % of it.
     let used_nodes = 75_000;
-    let nodes = MAX_NODES - used_nodes;
+    let nodes = MAX_NODES - used_nodes + more_nodes;
     let mut pad = String::with_capacity(16 << 20);
     pad.push_str(r#"[{"id": "i", "dst": [{"w": 1, "h": 1}], "pad": ["#);
     for k in 0..nodes {
@@ -372,15 +399,43 @@ fn f4(root: &Path) {
     pad.push_str("]}]");
     let rest = usize::try_from(MAX_INPUT_BYTES).unwrap() - entry;
     assert!(pad.len() < rest);
-    let fill = rest - pad.len();
+    let fill = rest - pad.len() + more_bytes;
     let _ = write!(pad, "{}", " ".repeat(fill));
     write(root, "p.json", pad.as_bytes());
 }
 
-fn check_f4(i: &Imported) {
+fn check_f4(h: &Header, i: Imported) {
     assert_eq!(i.report.usage.elements, 1_001);
     assert_eq!(i.report.sources.len(), 2);
     assert_eq!(i.report.files.len(), MAX_FILE_CHOICES);
+    assert_eq!(h.options.len(), MAX_OPTIONS);
+    let items: usize = h.options.iter().map(|o| o.items.len()).sum();
+    assert_eq!(items, MAX_OPTION_ITEMS);
+    assert_eq!(h.files.len(), MAX_FILE_CHOICES);
+    assert_eq!(h.offsets.len(), MAX_OFFSETS);
+    assert_eq!(h.files[0].candidates.len(), MAX_LIST_ENTRIES);
+}
+
+/// F4's input reaches the input bytes exactly, two files at the file
+/// cap, so a byte more is refused (by the file cap it meets first); its
+/// nodes are within 1 % of the cap, so 1 % more are refused.
+fn f4_reaches_its_input_caps(root: &Path) {
+    let bytes: u64 = ["s.json", "p.json"]
+        .iter()
+        .map(|f| std::fs::metadata(root.join(f)).unwrap().len())
+        .sum();
+    assert_eq!(bytes, MAX_INPUT_BYTES);
+    for (nodes, bytes, want) in [
+        (0, 1, InputLimit::FileBytes),
+        (MAX_NODES / 100, 0, InputLimit::Nodes),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        f4(d.path(), nodes, bytes);
+        match refused(d.path()) {
+            ImportError::Input { limit, .. } => assert_eq!(limit, want),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -419,7 +474,8 @@ fn import_memory_is_measured() {
     peaks.push(("F3 files", measure(d.path(), check_f3)));
     drop(d);
     let d = tempfile::tempdir().unwrap();
-    f4(d.path());
+    f4(d.path(), 0, 0);
+    f4_reaches_its_input_caps(d.path());
     peaks.push(("F4 input", measure(d.path(), check_f4)));
     drop(d);
     for (name, p) in &peaks {
