@@ -416,3 +416,18 @@ fn skin_import_seeds_import_and_draw_as_built() {
         }
     }
 }
+
+#[test]
+fn skin_json_accepts_ops_charged_for_a_dropped_element() {
+    // The condition is compiled and charged before the image's missing
+    // source drops the element, so the skin keeps fewer ops than charged.
+    let data = br#"{"type": 0, "w": 1920, "h": 1080,
+        "source": [{"id": "gone", "path": "gone.png"}],
+        "image": [{"id": "g", "src": "gone", "w": 4, "h": 4}],
+        "destination": [{"id": "g", "op": [241], "dst": [{"w": 4, "h": 4}]}]}"#;
+    let (_, imported) = skin_json(data).expect("the header resolves");
+    let i = imported.expect("the skin imports");
+    assert!(i.report.usage.ops > 0);
+    assert_eq!(i.skin.ops().total(), 0);
+    assert_eq!(kinds(&i), [NoteKind::MissingAsset]);
+}

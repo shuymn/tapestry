@@ -469,7 +469,11 @@ fn check_usage(i: &Imported) {
     assert!(within(u.frames, MAX_SKIN_FRAMES), "too many frames");
     assert!(within(u.file_attempts, MAX_FILES), "too many file attempts");
     assert!(u.widget_quads <= MAX_WIDGET_QUADS, "too many widget quads");
-    assert_eq!(i.skin.ops().total(), usize::try_from(u.ops).unwrap_or(0));
+    // An element dropped after its ops were charged keeps none of them.
+    assert!(
+        i.skin.ops().total() <= usize::try_from(u.ops).unwrap_or(usize::MAX),
+        "more ops kept than charged"
+    );
 }
 
 /// Target `canary`, for the self-test only (scripts/fuzz-selftest.sh): one
