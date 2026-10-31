@@ -268,7 +268,7 @@ impl Cx<'_> {
             },
             value: program,
         });
-        self.push(&c, Source::Number(index), t);
+        self.push(c, Source::Number(index), t);
         Ok(())
     }
 }

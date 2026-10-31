@@ -267,7 +267,7 @@ impl Cx<'_> {
         });
         // D5: text always blends normally.
         c.blend = skin_model::Blend::Alpha;
-        self.push(&c, Source::Text(index), t);
+        self.push(c, Source::Text(index), t);
         Ok(())
     }
 }

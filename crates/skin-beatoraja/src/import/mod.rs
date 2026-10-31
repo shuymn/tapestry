@@ -1001,12 +1001,12 @@ impl<'d> Cx<'d> {
     }
 
     /// Adds an element and its location.
-    fn push(&mut self, c: &Common, source: Source, track: Track) {
+    fn push(&mut self, c: Common, source: Source, track: Track) {
         self.elements.push(ElementDef {
             source,
             track,
             timer: c.timer,
-            visible: c.visible.clone(),
+            visible: c.visible,
             blend: c.blend,
             clip: None,
             place: Place {

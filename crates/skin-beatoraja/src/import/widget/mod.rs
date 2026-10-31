@@ -248,7 +248,7 @@ impl Cx<'_> {
             return Ok(());
         }
         let t = self.model_track(&c, &rects)?;
-        self.push(&c, Source::Image(image), t);
+        self.push(c, Source::Image(image), t);
         Ok(())
     }
 
