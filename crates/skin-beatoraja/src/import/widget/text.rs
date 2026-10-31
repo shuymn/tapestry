@@ -4,7 +4,7 @@
 use skin_model::{Align, FontRef, MAX_TEXT_BYTES, Overflow, Source, TextDef, TextField, TextValue};
 
 use super::super::asset::{self, Font};
-use super::super::geom::{HEIGHT, Q, coords};
+use super::super::geom::{Q, coords};
 use super::super::policy::Role;
 use super::super::property::{self, StrProp};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity};
@@ -242,11 +242,9 @@ impl Cx<'_> {
             let moved = super::super::geom::Rect { x, ..rect };
             let v = match &tf {
                 TextFont::Model(_) => moved.model(),
-                TextFont::Fixed(_, em) => moved.edges().and_then(|[l, t, r, _]| {
-                    let top = Q::int(HEIGHT).sub(moved.y.add(moved.h)?)?.round()?;
-                    debug_assert_eq!(top, t);
-                    coords([l, t, r.checked_sub(l)?, em.round()?])
-                }),
+                TextFont::Fixed(_, em) => moved
+                    .edges()
+                    .and_then(|[l, t, r, _]| coords([l, t, r.checked_sub(l)?, em.round()?])),
             }
             .ok_or_else(|| self.range(at, "dst"))?;
             // A key the model cannot draw (`TextError::Size`) is its
