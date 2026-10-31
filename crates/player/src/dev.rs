@@ -362,6 +362,18 @@ pub enum SelectStep {
     Next,
     /// On a result: view the previous preset (the left arrow).
     Prev,
+    /// Press P on the chart under the cursor (a scenario's `practice`): its
+    /// practice page opens, the chart playing this input.
+    PracticeKey(scenario::InputRef),
+    /// On the practice page: press keys until it shows this.
+    PracticeSet(scenario::PracticeGoal),
+    /// On the practice page: Start.
+    PracticeStart,
+    /// The practice's rounds: the quit key at the start of the round after
+    /// the last.
+    Rounds(scenario::Rounds),
+    /// On the practice page: back to selection (Escape).
+    PracticeBack,
     /// Close the window.
     Close,
 }

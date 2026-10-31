@@ -15,12 +15,14 @@
 //!   answering meanwhile, and a close is latched and taken once the load
 //!   is over (the load's waits are all bounded).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bms_model::{TimeSource, TimeUs};
-use game::{AppRig, Chain, LoadRefusal, Loaded, Refused, ResultScreen, SessionError};
+use game::{
+    AppRig, Chain, LoadRefusal, Loaded, Pick, PracticeInput, PracticeScreen, Refused, ResultScreen,
+    SessionError,
+};
 
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
@@ -28,7 +30,7 @@ use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log
 use crate::log_file;
 use crate::play::{PlayerRig, since};
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
-use crate::result_input::Pad;
+use crate::result_input::{Owner, Pad};
 use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
 #[cfg(feature = "dev-tools")]
 use crate::{dev::SelectStep, dev::scenario::InputRef, input_side::Mode};
@@ -115,7 +117,7 @@ impl Selection {
 
     /// Acts on one input; the chart it chose, if it did. A changed search
     /// or order is searched once all queued input is taken.
-    fn act(&mut self, input: MenuInput) -> Option<PathBuf> {
+    fn act(&mut self, input: MenuInput) -> Option<Pick> {
         match self.screen.input(input) {
             Acted::Nothing => None,
             Acted::Changed => {
@@ -134,14 +136,15 @@ impl Selection {
                 self.dirty = true;
                 None
             }
-            Acted::Choose(path) => Some(path),
+            Acted::Choose(path) => Some(Pick::Play(path)),
+            Acted::Practice(path) => Some(Pick::Practice(path)),
         }
     }
 
     /// Takes the queued input; the chart it chose, if it did. Consecutive
     /// edits of the search or the order are searched once: at the end, or
     /// before any other input, which acts on the list they make.
-    fn drain(&mut self, pad: &mut Pad) -> Option<PathBuf> {
+    fn drain(&mut self, pad: &mut Pad) -> Option<Pick> {
         // The controller's events join the window's, as the keys they
         // stand for.
         while let Some(event) = pad.pop() {
@@ -159,8 +162,8 @@ impl Selection {
             if self.search_pending && !edit {
                 self.refresh();
             }
-            if let Some(path) = self.act(input) {
-                return Some(path);
+            if let Some(pick) = self.act(input) {
+                return Some(pick);
             }
         }
         if self.search_pending {
@@ -335,6 +338,27 @@ impl Selection {
                     }
                 }
                 Some(SelectStep::Enter) => typed.push(MenuInput::Key(MenuKey::Enter)),
+                Some(SelectStep::PracticeKey(_)) => {
+                    typed.push(MenuInput::Key(MenuKey::Practice));
+                }
+                // Due here only when the practice page did not open.
+                Some(
+                    SelectStep::PracticeSet(_)
+                    | SelectStep::PracticeStart
+                    | SelectStep::Rounds(_)
+                    | SelectStep::PracticeBack,
+                ) => {
+                    if let Some(why) = script.refusal() {
+                        let chosen = script.last_done().map_or(0, |o| o.index);
+                        let why = format!("the chart chosen at step {chosen} was refused: {why}");
+                        script.fail(why);
+                        controls.close();
+                    } else if script.expired() {
+                        script.fail("the practice screen did not open".to_owned());
+                        controls.close();
+                    }
+                    return false;
+                }
                 Some(SelectStep::Capture(k)) => {
                     if let Some(c) = captures {
                         c.arm(k);
@@ -473,6 +497,75 @@ pub fn script_result(
     }
 }
 
+/// The key that moves the practice page toward `goal`: out of an edit
+/// first, then, row by row from the top, to the first row whose value
+/// differs, and Left or Right on it; `to` first when `from` cannot pass
+/// it. `None` once the page shows the goal (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn toward(screen: &PracticeScreen, goal: &crate::dev::scenario::PracticeGoal) -> Option<MenuKey> {
+    use game::PracticeRow;
+    if screen.editing() {
+        return Some(MenuKey::Escape);
+    }
+    let step = |up: bool| if up { MenuKey::Right } else { MenuKey::Left };
+    let rows = [
+        (
+            PracticeRow::To,
+            (goal.to > screen.to() || goal.from >= screen.to()).then(|| step(true)),
+        ),
+        (
+            PracticeRow::From,
+            (goal.from != screen.from()).then(|| step(goal.from > screen.from())),
+        ),
+        (
+            PracticeRow::To,
+            (goal.to != screen.to()).then(|| step(goal.to > screen.to())),
+        ),
+        (
+            PracticeRow::Speed,
+            (goal.speed != screen.speed())
+                .then(|| step(goal.speed.twentieths() > screen.speed().twentieths())),
+        ),
+        (
+            PracticeRow::LeadIn,
+            (goal.lead_in != screen.lead_in()).then(|| step(goal.lead_in > screen.lead_in())),
+        ),
+        (
+            PracticeRow::Gauge,
+            (goal.value != screen.value()).then(|| step(goal.value > screen.value())),
+        ),
+        (
+            PracticeRow::Repeat,
+            (goal.repeat != screen.repeat()).then(|| step(true)),
+        ),
+    ];
+    let (row, key) = rows.into_iter().find_map(|(r, k)| k.map(|k| (r, k)))?;
+    Some(row_key(screen, row).unwrap_or(key))
+}
+
+/// The arrow that moves the page's cursor toward `row`, if it is not
+/// there (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn row_key(screen: &PracticeScreen, row: game::PracticeRow) -> Option<MenuKey> {
+    let at = |r| game::PracticeRow::ALL.iter().position(|&x| x == r);
+    let (now, to) = (at(screen.row())?, at(row)?);
+    match now.cmp(&to) {
+        std::cmp::Ordering::Less => Some(MenuKey::Down),
+        std::cmp::Ordering::Greater => Some(MenuKey::Up),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// The key toward Start on the practice page, and Enter there
+/// (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn start_key(screen: &PracticeScreen) -> MenuKey {
+    if screen.editing() {
+        return MenuKey::Escape;
+    }
+    row_key(screen, game::PracticeRow::Start).unwrap_or(MenuKey::Enter)
+}
+
 /// Moves the cursor toward entry `at` with the arrow keys, a batch the
 /// queue holds at a time: `true` while it queued keys, `false` once the
 /// entry is selected (dev-tools).
@@ -543,7 +636,11 @@ pub enum ChartLoadError {
 impl PlayerRig<'_> {
     /// Looks at the library and the window's input on the select screen,
     /// and sends the page if it changed; the chart chosen, if one was.
-    fn look(&mut self) -> Option<PathBuf> {
+    fn look(&mut self) -> Option<Pick> {
+        // Only selection's own input chooses.
+        if self.result_input.owner() != Owner::Select {
+            return None;
+        }
         let sel = self.selection.as_mut()?;
         if sel.shelf.poll(Instant::now()) {
             sel.refresh();
@@ -563,7 +660,13 @@ impl PlayerRig<'_> {
         {
             chosen = sel.drain(&mut self.result_input.pad);
         }
-        if let Some(path) = &chosen {
+        if let Some(pick) = &chosen {
+            let (Pick::Play(path) | Pick::Practice(path)) = pick;
+            let what = if matches!(pick, Pick::Practice(_)) {
+                " to practice"
+            } else {
+                ""
+            };
             #[cfg(feature = "dev-tools")]
             if let Some(script) = &mut sel.script {
                 script.chose();
@@ -572,8 +675,8 @@ impl PlayerRig<'_> {
             sel.chosen_at = self.clock.now();
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
-            println!("select: chose {name} {after} ms after entering selection");
-            log::info!("select: chose {}", path.display());
+            println!("select: chose {name}{what} {after} ms after entering selection");
+            log::info!("select: chose {}{what}", path.display());
             sel.dirty = true;
             sel.show(&self.render, Some(&format!("読み込み中: {name}")));
         } else {
@@ -675,9 +778,12 @@ impl PlayerRig<'_> {
             return;
         };
         script.announce();
-        sc.pending = matches!(script.front(), Some(SelectStep::Play(_)))
-            .then(|| script.origin())
-            .flatten();
+        sc.pending = matches!(
+            script.front(),
+            Some(SelectStep::Play(_) | SelectStep::Rounds(_))
+        )
+        .then(|| script.origin())
+        .flatten();
     }
 
     /// A play started (a scenario): its `play` step is done, its `until`
@@ -692,14 +798,115 @@ impl PlayerRig<'_> {
             return;
         };
         sc.pending = None;
-        if let Some(&SelectStep::Play(p)) = script.front() {
-            script.done();
-            sc.until = p.until;
-            sc.captures.bind(self.generation);
-        } else {
-            script.fail("a play started where this step was due".to_owned());
-            self.controls.close();
+        match script.front() {
+            Some(&SelectStep::Play(p)) => {
+                script.done();
+                sc.until = p.until;
+                sc.captures.bind(self.generation);
+            }
+            // A practice's round: the one after the last is left at its
+            // start by the quit key, which returns to the practice page.
+            Some(&SelectStep::Rounds(r)) => {
+                sc.until = None;
+                sc.captures.bind(self.generation);
+                sc.rounds = sc.rounds.saturating_add(1);
+                if sc.rounds > r.n {
+                    sc.rounds = 0;
+                    script.done();
+                    self.controls.command(game::Command::Quit);
+                }
+            }
+            _ => {
+                script.fail("a play started where this step was due".to_owned());
+                self.controls.close();
+            }
         }
+    }
+
+    /// Runs the scripted step due on the practice page (a scenario): a key
+    /// toward the page its `practice` step sets, Start, or Back, on the
+    /// window's queue as the keyboard does, one key per showing of the
+    /// page. `true` when it queued one. A step that cannot be done there
+    /// fails the run.
+    #[cfg(feature = "dev-tools")]
+    fn script_practice(&mut self) -> bool {
+        let (Some(sc), Some(script)) = (
+            &mut self.scenario,
+            self.selection.as_mut().and_then(|s| s.script.as_mut()),
+        ) else {
+            return false;
+        };
+        let Some(screen) = &sc.practice else {
+            return false;
+        };
+        let menu = &self.result_input.menu;
+        let fail = |script: &mut crate::dev::SelectScript, why: String| {
+            script.fail(why);
+            self.controls.close();
+            false
+        };
+        script.announce();
+        let key = match script.front().cloned() {
+            Some(SelectStep::PracticeSet(goal)) => {
+                if goal.to > screen.measures().len() {
+                    let why = format!(
+                        "to {} is past the chart's {} measures",
+                        goal.to,
+                        screen.measures().len()
+                    );
+                    return fail(script, why);
+                }
+                if script.expired() {
+                    return fail(script, format!("the practice page did not reach {goal:?}"));
+                }
+                match toward(screen, &goal) {
+                    Some(key) => key,
+                    None => {
+                        script.done();
+                        script.announce();
+                        if !matches!(script.front(), Some(SelectStep::PracticeStart)) {
+                            return false;
+                        }
+                        start_key(screen)
+                    }
+                }
+            }
+            Some(SelectStep::PracticeStart) => start_key(screen),
+            Some(SelectStep::PracticeBack) => MenuKey::Escape,
+            // The rounds were due: their Start was refused, or they ended
+            // before their last.
+            Some(SelectStep::Rounds(_)) => {
+                let why = match screen.notice() {
+                    Some(why) => format!("the practice was refused: {why}"),
+                    None if sc.rounds > 0 => "the rounds ended before their last".to_owned(),
+                    None if script.expired() => "no round started".to_owned(),
+                    None => return false,
+                };
+                return fail(script, why);
+            }
+            None => return false,
+            Some(step) => return fail(script, format!("{step:?} on the practice page")),
+        };
+        // One key on what the page shows: the next waits for it to show
+        // that key's change.
+        if !sc.shown {
+            return false;
+        }
+        let last = match script.front() {
+            Some(SelectStep::PracticeBack) => true,
+            Some(SelectStep::PracticeStart) => {
+                key == MenuKey::Enter
+                    && screen.row() == game::PracticeRow::Start
+                    && !screen.editing()
+            }
+            _ => false,
+        };
+        if last {
+            script.done();
+        }
+        sc.shown = false;
+        menu.push(MenuInput::Key(key));
+        true
     }
 
     /// A play is over and its frames drawn (a scenario): an `until` it
@@ -794,12 +1001,21 @@ impl AppRig for PlayerRig<'_> {
             return;
         };
         let script = self.selection.as_ref().and_then(|s| s.script.as_ref());
-        let Some(&SelectStep::Play(p)) = script.and_then(crate::dev::SelectScript::front) else {
-            sc.chart_input = None;
-            return;
+        // A chart's input comes from its `play` step, or from its
+        // `practice` step's page keys, P pressed or about to be.
+        let input = match script.and_then(crate::dev::SelectScript::front) {
+            Some(&SelectStep::Play(p)) => p.input,
+            Some(&SelectStep::PracticeKey(input)) => input,
+            Some(&SelectStep::PracticeSet(goal)) => goal.input,
+            _ => {
+                sc.chart_input = None;
+                return;
+            }
         };
-        sc.chart_input = Some(p.input);
-        match p.input {
+        sc.chart_input = Some(input);
+        sc.practice = None;
+        sc.rounds = 0;
+        match input {
             InputRef::Auto => {
                 config.autoplay = Some(game::AutoKeySounds::Scheduled);
                 parts.records = None;
@@ -812,13 +1028,23 @@ impl AppRig for PlayerRig<'_> {
         }
     }
 
-    fn choose(&mut self) -> Option<game::Pick> {
-        self.look().map(game::Pick::Play)
+    fn choose(&mut self) -> Option<Pick> {
+        self.look()
     }
 
     fn load_chart(&mut self, loaded: &Loaded) -> Result<(), ChartLoadError> {
-        let sel = self.selection.as_ref().ok_or(ChartLoadError::NoSelection)?;
+        // A practice's Start chooses again: its load times run from it.
+        let now = self.clock.now();
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+        if loaded.section().is_some() {
+            sel.chosen_at = now;
+        }
+        // Requested again after the practice page released it, as a
+        // choice does.
+        sel.shelf.pause();
         let (rate, chosen_at) = (sel.rate, sel.chosen_at);
+        // The previous chart's restorer never restores this one's rounds.
+        self.restorer = None;
         let chart = loaded.chart();
         let warnings = loaded.warnings();
         log::info!("loaded the chart ({} warnings)", warnings.len());
@@ -843,14 +1069,19 @@ impl AppRig for PlayerRig<'_> {
             );
             (made.schedule, Some(feed))
         } else {
-            (chart.bgm.clone(), None)
+            // A practice's rounds play the BGM with the key sounds of the
+            // notes that are not targets.
+            (loaded.audio_schedule(), None)
         };
+        let rounds = loaded.section().map(|_| schedule.clone());
         // The chart before's analysis stops before these sounds are
-        // decoded, so it never holds its bank beside them.
+        // decoded, so it never holds its bank beside them. A bank at
+        // another speed finds its gain by the 1× key, and is not analyzed.
+        let speed = loaded.config().speed;
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         let bank = Arc::new(
             sel.shelf
-                .decode(|| audio::load_bank(chart, rate, &audio::BankLimits::default()))
+                .decode(|| audio::load_bank_at(chart, rate, speed, &audio::BankLimits::default()))
                 .map_err(ChartLoadError::Sounds)?,
         );
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
@@ -859,9 +1090,11 @@ impl AppRig for PlayerRig<'_> {
             .control
             .load(Arc::clone(&bank), audio::BgmSchedule::new(schedule))
             .map_err(ChartLoadError::Audio)?;
+        // The rounds restore against the engine this load answered with.
+        self.restorer = rounds.map(|s| game::Restorer::new(self.audio.control.seek_source(), s));
         let shared = Arc::new(chart.clone());
         self.render
-            .load(Arc::clone(&shared), None)
+            .load(Arc::clone(&shared), loaded.section().cloned())
             .map_err(ChartLoadError::Screen)?;
         // Its gain, from the cache, or its analysis.
         if let Some(sel) = &mut self.selection {
@@ -936,7 +1169,9 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_selection(&mut self) {
         self.end_lines = None;
-        self.result_input.showing = false;
+        // What was typed during the chart belongs to it.
+        self.result_input.enter_as(Owner::Select);
+        self.result_input.clear();
         // Nothing plays: the input thread drops its heartbeat, after a
         // completed play, an opening the logic step refused (which closes
         // recording without the end of a play) and at the first entry.
@@ -945,11 +1180,62 @@ impl AppRig for PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             return;
         };
-        // What was typed during the chart belongs to it.
-        self.result_input.clear();
         sel.entered(self.clock.now());
         println!("select: {} charts listed", sel.screen.listed());
         sel.show(&self.render, None);
+    }
+
+    /// The one routine of every entry into the practice page: on opening
+    /// and after every return (a refused Start, a refused opening or
+    /// restore, the rounds left by the quit key or a result's back).
+    fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.end_lines = None;
+        // What was typed before belongs to the screen it was typed on.
+        self.result_input.enter_as(Owner::Practice);
+        self.result_input.clear();
+        // Nothing plays: the input thread drops its heartbeat (Tail to
+        // Idle), and its menu events flow again.
+        self.in_play = false;
+        self.input.idle();
+        if let Some(sel) = &mut self.selection {
+            sel.shelf.release();
+            if let Some(ime) = &sel.ime {
+                ime.set(false);
+            }
+        }
+        match screen.notice() {
+            Some(why) => println!("practice: refused: {why}"),
+            None => println!("practice: on the practice screen"),
+        }
+        self.show_practice(screen);
+    }
+
+    fn show_practice(&mut self, screen: &PracticeScreen) {
+        let name = self
+            .selection
+            .as_ref()
+            .and_then(|s| s.screen.selected())
+            .map_or_else(String::new, |e| {
+                e.header.title.clone().unwrap_or_else(|| file_name(&e.path))
+            });
+        let page = crate::practice_page::page(screen, &name);
+        self.render.send(RenderMsg::Menu(Box::new(page)));
+        #[cfg(feature = "dev-tools")]
+        if let Some(sc) = &mut self.scenario {
+            sc.practice = Some(screen.clone());
+            sc.shown = true;
+        }
+    }
+
+    fn take_practice(&mut self) -> Option<PracticeInput> {
+        if let Some(input) = self.result_input.take_practice() {
+            return Some(input);
+        }
+        #[cfg(feature = "dev-tools")]
+        if self.script_practice() {
+            return self.result_input.take_practice();
+        }
+        None
     }
 }
 
@@ -980,6 +1266,14 @@ mod tests {
     use crate::result_input::{Pad, ResultInput};
     use crate::select::{MenuInput, MenuKey, MenuQueue, SelectScreen};
     use crate::shelf::{Shelf, open};
+
+    /// The chart a pick plays.
+    fn played(pick: game::Pick) -> std::path::PathBuf {
+        match pick {
+            game::Pick::Play(path) => path,
+            other @ game::Pick::Practice(_) => panic!("{other:?}"),
+        }
+    }
 
     /// Titles A, B and C by artists Z, Y and X, scanned and listed in title
     /// order, A under the cursor.
@@ -1035,7 +1329,7 @@ mod tests {
             sel.menu.push(MenuInput::Key(key));
         }
         let chosen = sel.drain(&mut Pad::default()).expect("Enter chooses");
-        assert_eq!(chosen.file_name().unwrap(), "a.bms");
+        assert_eq!(played(chosen).file_name().unwrap(), "a.bms");
     }
 
     /// The controller's events act as the keys they stand for: Down twice
@@ -1090,7 +1384,7 @@ mod tests {
             });
         }
         let chosen = sel.drain(&mut pad).expect("Confirm chooses");
-        assert_eq!(chosen.file_name().unwrap(), "c.bms");
+        assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
     }
 
     /// The select loop drains result commands on every look; while no
@@ -1106,7 +1400,7 @@ mod tests {
         }
         assert_eq!(result.take(), None);
         let chosen = sel.drain(&mut result.pad).expect("Enter chooses");
-        assert_eq!(chosen.file_name().unwrap(), "c.bms");
+        assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
     }
 
     /// Keys pressed during the play wait in the window's queue; the result

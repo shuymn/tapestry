@@ -34,6 +34,7 @@ mod measure;
 mod menu_screen;
 mod play;
 mod power;
+mod practice_page;
 #[cfg(feature = "dev-tools")]
 mod presentmon;
 #[cfg(feature = "dev-tools")]
@@ -1332,6 +1333,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             chart_input: None,
             pending: None,
             until: None,
+            practice: None,
+            shown: false,
+            rounds: 0,
         });
     }
     // Autoplay saves nothing, but in a scenario, whose logs' plays are
