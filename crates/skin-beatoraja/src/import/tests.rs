@@ -255,7 +255,7 @@ fn a_rejected_lane_approximation_refuses() {
     use super::{DeviationId, LaneApprox};
     let (r, ..) = run(&lanes("", ""));
     r.unwrap();
-    REJECTED.with(|c| c.set(Some(LaneApprox::LateTaps)));
+    REJECTED.with(|c| c.set(Some(LaneApprox::TopCrop)));
     let (r, ..) = run(&lanes("", ""));
     REJECTED.with(|c| c.set(None));
     match r {
@@ -263,7 +263,7 @@ fn a_rejected_lane_approximation_refuses() {
             (part, why),
             (
                 super::CriticalPart::Lanes,
-                NoteKind::Deviation(DeviationId::D9(LaneApprox::LateTaps))
+                NoteKind::Deviation(DeviationId::D9(LaneApprox::TopCrop))
             )
         ),
         other => panic!("{:?}", other.map(|i| i.report)),

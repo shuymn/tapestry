@@ -9,8 +9,12 @@
 //! lanes' own timer, conditions and window. HIDDEN+ is never drawn
 //! (owner decision 15, D11).
 
-use skin_model::{Blend, End, Filter, LaneParts, LanesDef, Side, Source, TimerRef};
+use skin_model::{
+    Blend, End, Filter, LaneParts, LaneStyle, LanesDef, MAX_COORD, Side, Source, SourceLanes,
+    TimerRef,
+};
 
+use super::super::asset::Crop;
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
 use super::super::report::{DeviationId, LaneApprox, NoteKind, Severity, Span};
@@ -47,8 +51,6 @@ pub(crate) struct LaneState {
     /// Lane 0's source `y` and `h` (`play/LaneRenderer.java:324-326`).
     y0: i32,
     h0: i32,
-    /// Where SUDDEN+'s lower edge sits at 0 %: the source's lane top.
-    cover_at: i32,
     timer: TimerRef,
     cond_src: String,
     window: Window,
@@ -58,19 +60,26 @@ pub(crate) struct LaneState {
     pub(crate) kept_after: bool,
 }
 
-impl LaneState {
-    /// The model's lanes: SUDDEN+ anchored at the source's lane top when
-    /// it maps, LIFT at the lanes' bottom when it maps.
-    pub(crate) fn def(&self) -> LanesDef {
-        let mut def = self.def;
-        if def.parts.cover.is_some() {
-            def.cover_at = self.cover_at;
-        }
-        if def.parts.lift.is_some() {
-            def.lift_at = def.bottom;
-        }
-        def
-    }
+/// The texels of a frame of `[iw, ih]` that stretch 5 keeps for
+/// destination `r`, exactly: `r.h × iw / r.w`
+/// (`skin/StretchType.java:65-68, 143-148`).
+/// `Some(None)` when the fitted frame is no taller than the destination,
+/// so nothing is cropped; `None` on overflow.
+fn trimmed(r: Rect, [iw, ih]: [u32; 2]) -> Option<Option<Q>> {
+    let kept = r.h.mul(Q::int(iw))?.div(r.w)?;
+    Some((kept < Q::int(ih)).then_some(kept))
+}
+
+/// The rows a frame at row `y`, `h` high, keeps when it keeps `kept`
+/// texels about its middle, its edges rounded half up as D1 rounds;
+/// `None` when no row is left or on overflow.
+fn crop_rows(y: u32, h: u32, kept: Q) -> Option<Crop> {
+    let top = Q::int(y).add(Q::int(h).sub(kept)?.half()?)?;
+    let (first, end) = (top.round()?, top.add(kept)?.round()?);
+    let rows = u32::try_from(end.checked_sub(first)?)
+        .ok()
+        .filter(|&n| n > 0)?;
+    Some([u32::try_from(first).ok()?, rows])
 }
 
 /// `v` exactly; `None` for one beyond the rationals' range.
@@ -424,25 +433,20 @@ impl Cx<'_> {
         // Note heights: `size[i]·r`, else the note's cell height
         // (`JsonPlaySkinObjectLoader.java:88-92`), plus the h offset.
         let sizes = self.floats(size, "size")?;
-        let mut heights = Vec::with_capacity(LANES);
-        for (u, cell) in cells.iter().enumerate() {
-            let nh = match sizes.get(u) {
+        let mut heights = [Q::ZERO; LANES];
+        for ((u, cell), h) in cells.iter().enumerate().zip(&mut heights) {
+            *h = match sizes.get(u) {
                 Some(&v) => f32_q(v).and_then(|q| q.mul(self.r)),
                 None => Q::int(cell[1]).mul(self.r),
             }
             .and_then(|q| q.add(Q::int(o.h)))
             .ok_or_else(|| self.range(at, "size"))?;
-            heights.push(nh);
         }
-        let rounded: Vec<i128> = heights
-            .iter()
-            .map(|h| h.round())
-            .collect::<Option<_>>()
-            .ok_or_else(|| self.range(at, "size"))?;
-        let Some(&note_h) = rounded.first() else {
-            return refuse(self, "size");
-        };
-        if rounded.len() != LANES || rounded.iter().any(|&h| h != note_h) || note_h < 1 {
+        // One height for every lane, kept unrounded; its rounding is the
+        // model's nominal note height.
+        let [nh, ..] = heights;
+        let note_h = nh.round().ok_or_else(|| self.range(at, "size"))?;
+        if heights.iter().any(|&h| h != nh) || note_h < 1 {
             return refuse(self, "size");
         }
         let note_h = u16::try_from(note_h).map_err(|_| self.range(at, "size"))?;
@@ -451,7 +455,6 @@ impl Cx<'_> {
         // lanes' bottom and top (`play/LaneRenderer.java:324-326`).
         let [_, y0, _, h0] = lane_rects.first().map_or([0; 4], |(_, r)| *r);
         let range = |cx: &Self| cx.range(at, "dst");
-        let nh = heights.first().copied().unwrap_or(Q::ZERO);
         let y_up = Q::int(y0).mul(self.r).ok_or_else(|| range(self))?;
         let h_up = Q::int(h0).mul(self.r).ok_or_else(|| range(self))?;
         let base = Q::int(HEIGHT).sub(y_up).ok_or_else(|| range(self))?;
@@ -465,17 +468,32 @@ impl Cx<'_> {
             .and_then(Q::round)
             .ok_or_else(|| range(self))?;
         let bottom = base.round().ok_or_else(|| range(self))?;
-        let cover_at = base
-            .sub(h_up)
-            .and_then(Q::round)
-            .ok_or_else(|| range(self))?;
         let i32_of = |cx: &Self, v: i128| i32::try_from(v).map_err(|_| range(cx));
-        let [top, line, bottom, cover_at] = [
+        let [top, line, bottom] = [
             i32_of(self, top)?,
             i32_of(self, line)?,
             i32_of(self, bottom)?,
-            i32_of(self, cover_at)?,
         ];
+        let region_top = base.sub(h_up).ok_or_else(|| range(self))?;
+        // The source draws a note's lower edge `y` offset above the lifted
+        // region's lower edge at its judgment time
+        // (`play/LaneRenderer.java:521-524`). An offset that puts that note
+        // below the lanes' bottom, which also takes the source's clipped
+        // long-note branch (`:577-581`), or above their top, refuses.
+        let oy = Q::int(o.y);
+        let fits = base
+            .sub(oy)
+            .and_then(|v| v.sub(nh))
+            .ok_or_else(|| range(self))?;
+        if o.y < 0 || fits < Q::int(top) {
+            return refuse(self, "offset");
+        }
+        let source = SourceLanes {
+            bottom: base.to_f32(),
+            height: h_up.to_f32(),
+            offset_y: oy.to_f32(),
+            note_h: nh.to_f32(),
+        };
 
         // The lane map (`play/LaneProperty.java:46-50`): source lane 7 is
         // the scratch, model lane 0.
@@ -529,13 +547,17 @@ impl Cx<'_> {
         let t = self.neutral_track(&c)?;
         let state = LaneState {
             def: LanesDef {
+                style: LaneStyle::Source(source),
                 lanes,
                 scratch,
                 top,
                 line,
                 bottom,
-                cover_at: top,
-                lift_at: line,
+                // SUDDEN+ and LIFT set their own extents when they map.
+                cover_at: region_top.to_f32(),
+                cover_h: 0.0,
+                lift_at: source.bottom,
+                lift_h: 0.0,
                 note_h,
                 mine_h: note_h,
                 bar_h: bar_h.unwrap_or(1),
@@ -546,7 +568,6 @@ impl Cx<'_> {
             lane_span: span,
             y0,
             h0,
-            cover_at,
             timer: c.timer,
             cond_src: c.cond_src.clone(),
             window: window(&c.track),
@@ -565,22 +586,21 @@ impl Cx<'_> {
         if hcn.iter().any(|l| !l.is_empty()) {
             self.ignored(at, NoteKind::Ignored { field: "hcn" });
         }
+        // The BPM, STOP and time guides, which the source draws only under
+        // player settings (`play/LaneRenderer.java:401-438`), are not drawn.
         let [bpm, stop, time] = self.def.fields(rec, ["bpm", "stop", "time"]);
         for (field, f) in [("bpm", bpm), ("stop", stop), ("time", time)] {
             if f.and_then(|f| self.tables.nested.get(&f))
                 .is_some_and(|l| !l.is_empty())
             {
-                self.ignored(at, NoteKind::Ignored { field });
+                self.note(
+                    Some(at),
+                    Severity::Dropped,
+                    NoteKind::UnsupportedField { field },
+                );
             }
         }
-        for a in [
-            LaneApprox::TopCrop,
-            LaneApprox::LateTaps,
-            LaneApprox::EarlyTaps,
-            LaneApprox::Mines,
-            LaneApprox::LnTail,
-            LaneApprox::LnBody,
-        ] {
+        for a in [LaneApprox::TopCrop, LaneApprox::LnBody] {
             self.lane_approx(at, part, a)?;
         }
         if dst2.is_some_and(|f| self.def.int(f, "dst2").is_ok_and(|v| v != i32::MIN)) {
@@ -800,26 +820,108 @@ impl Cx<'_> {
         let Some(l) = self.lanes.as_ref() else {
             return refuse(self, "offset");
         };
-        // Exactly over the lanes, its lower edge on their top.
+        // Exactly over the lanes, its lower edge on their top; the source
+        // moves it by an offset and draws it at its own height
+        // (`play/LaneRenderer.java:332-333`).
         let [xc, yc, wc, hc] = c.track.keys.first().map_or([0; 4], |k| k.rect);
         if !self.over_lanes(at, xc, wc)?
             || i64::from(yc) != i64::from(l.y0) + i64::from(l.h0)
-            || hc != l.h0
+            || hc < 0
         {
             return refuse(self, "dst");
         }
-        let Some((image, _)) = self.add_src_image(&c, rec, s, s.div)? else {
+        let Some((image, r)) = self.add_cover_image(&c, part, &dst, rec, s)? else {
             return refuse(self, "src");
         };
+        if r.h <= Q::int(0) {
+            return refuse(self, "dst");
+        }
+        let [_, lower] = self.cover_edges(at, r)?;
         let kept_after = self.lanes.as_ref().is_some_and(|l| l.kept_after);
         if let Some(l) = self.lanes.as_mut() {
             l.def.parts.cover = Some(image);
+            l.def.cover_at = lower.to_f32();
+            l.def.cover_h = r.h.to_f32();
         }
         self.lane_approx(at, part, LaneApprox::CoverAbove)?;
         if kept_after {
             self.lane_approx(at, part, LaneApprox::CoverOrder)?;
         }
         Ok(())
+    }
+
+    /// A cover's destination in reference pixels, y up.
+    fn cover_rect(&self, c: &Common) -> Result<Rect, ImportError> {
+        match c.track.keys.first() {
+            Some(k) => self.key_rect(c, k),
+            None => Err(self.range(c.span, "dst")),
+        }
+    }
+
+    /// A cover's image and its destination stretched against the image's
+    /// frame, y up: unchanged for identity; fit to its width for stretch
+    /// 4 (`skin/StretchType.java:61-64, 125-129`); for stretch 5 the same
+    /// unless the fitted frame is taller than the destination, when the
+    /// destination stays and the frame keeps its middle rows, which only
+    /// a single frame can (`:65-68, 143-153`). `None` when the image was
+    /// dropped.
+    fn add_cover_image(
+        &mut self,
+        c: &Common,
+        part: CriticalPart,
+        dst: &Dst,
+        rec: u32,
+        s: &SrcImage,
+    ) -> Result<Option<(u32, Rect)>, ImportError> {
+        let at = c.span;
+        let r = self.cover_rect(c)?;
+        let (mode, grid) = (dst.stretch, s.div);
+        let refuse = |cx: &Self, why: NoteKind| ImportError::Critical {
+            at: cx.loc(at),
+            part,
+            why,
+        };
+        let mut cropped = false;
+        let found = self.add_src_image_cropped(c, rec, s, grid, |cx, [_, y, w, h]| {
+            if mode != 5 {
+                return Ok(None);
+            }
+            let cell = [w / grid[0].max(1), h / grid[1].max(1)];
+            let Some(kept) = trimmed(r, cell).ok_or_else(|| cx.range(at, "dst"))? else {
+                return Ok(None);
+            };
+            if grid != [1, 1] {
+                return Err(refuse(cx, NoteKind::Stretch(mode)));
+            }
+            let Some(crop) = crop_rows(y, h, kept) else {
+                return Err(refuse(cx, NoteKind::UnsupportedField { field: "dst" }));
+            };
+            cropped = true;
+            Ok(Some(crop))
+        })?;
+        let Some((image, cell)) = found else {
+            return Ok(None);
+        };
+        if matches!(mode, 4 | 5) && !cropped {
+            let fitted = track::stretch(Stretch::FitWidth, r, cell);
+            return match fitted {
+                Some((r, _)) => Ok(Some((image, r))),
+                None => Err(self.range(at, "dst")),
+            };
+        }
+        Ok(Some((image, r)))
+    }
+
+    /// A cover's upper and lower edges, y down, each within
+    /// ±[`MAX_COORD`].
+    fn cover_edges(&self, at: Span, r: Rect) -> Result<[Q; 2], ImportError> {
+        let max = i128::from(MAX_COORD);
+        let near = |v: Q| Q::int(-max) <= v && v <= Q::int(max);
+        let lower = Q::int(HEIGHT).sub(r.y);
+        match (lower.and_then(|v| v.sub(r.h)), lower) {
+            (Some(upper), Some(lower)) if near(upper) && near(lower) => Ok([upper, lower]),
+            _ => Err(self.range(at, "dst")),
+        }
     }
 
     /// Whether `x` and `w` (source pixels) round to the lanes' span.
@@ -838,8 +940,9 @@ impl Cx<'_> {
     }
 
     /// SUDDEN+'s or LIFT's common part, refused unless it is static,
-    /// white, opaque, alpha-blended, unrotated, unstretched, not moved by
-    /// any user offset, and shown exactly when the lanes are.
+    /// white, opaque, alpha-blended, unrotated, unstretched or fit to its
+    /// width (stretch 4 or 5), not moved by any user offset, and shown
+    /// exactly when the lanes are.
     fn cover_common(
         &mut self,
         dst: &Dst,
@@ -862,6 +965,13 @@ impl Cx<'_> {
         let Some(l) = self.lanes.as_ref() else {
             return Ok(None);
         };
+        if !(Stretch::of(dst.stretch) == Stretch::Identity || matches!(dst.stretch, 4 | 5)) {
+            return Err(ImportError::Critical {
+                at: self.loc(at),
+                part,
+                why: NoteKind::Stretch(dst.stretch),
+            });
+        }
         let still = c.track.identical()
             && c.track
                 .keys
@@ -869,7 +979,6 @@ impl Cx<'_> {
                 .is_some_and(|k| k.color == [255; 4] && k.angle == 0)
             && c.blend == Blend::Alpha
             && dst.blend != 3
-            && Stretch::of(dst.stretch) == Stretch::Identity
             && c.offset == Offset::default()
             && !l.moved;
         let same = c.timer == l.timer && c.cond_src == l.cond_src && window(&c.track) == l.window;
@@ -922,20 +1031,39 @@ impl Cx<'_> {
             return Ok(());
         };
         let [xl, yl, wl, hl] = c.track.keys.first().map_or([0; 4], |k| k.rect);
+        // A destination without height refuses, even with stretch 4: at
+        // zero lift the source hides it, but a lift can pass its trim gate
+        // and stretch 4 would then grow it, changing its vertical extent
+        // (below).
         if !self.over_lanes(at, xl, wl)?
             || hl <= 0
             || i64::from(yl) + i64::from(hl) != i64::from(y0)
         {
             return refuse(self, "dst");
         }
-        let Some((image, _)) = self.add_src_image(&c, rec, &s, s.div)? else {
+        let unstretched = self.cover_rect(&c)?;
+        let Some((image, r)) = self.add_cover_image(&c, part, &dst, rec, &s)? else {
             return refuse(self, "src");
         };
+        // The source clips LIFT to its unstretched destination before
+        // stretching it (`play/SkinHidden.java:75-88`,
+        // `skin/SkinObject.java:655-656`): a stretch maps only when it
+        // keeps the destination's vertical extent, so the cover's upper
+        // edge stays on the raised line.
+        if (r.y, r.h) != (unstretched.y, unstretched.h) {
+            return Err(ImportError::Critical {
+                at: self.loc(at),
+                part,
+                why: NoteKind::Stretch(dst.stretch),
+            });
+        }
+        let [upper, _] = self.cover_edges(at, r)?;
         let kept_after = self.lanes.as_ref().is_some_and(|l| l.kept_after);
         if let Some(l) = self.lanes.as_mut() {
             l.def.parts.lift = Some(image);
+            l.def.lift_at = upper.to_f32();
+            l.def.lift_h = r.h.to_f32();
         }
-        self.lane_approx(at, part, LaneApprox::LiftStretch)?;
         if kept_after {
             self.lane_approx(at, part, LaneApprox::CoverOrder)?;
         }
@@ -970,7 +1098,7 @@ fn span_of(xs: &[[i128; 2]]) -> [i128; 2] {
 
 /// Whether a destination id is a negative number: a player-drawn image.
 fn ops_negative(id: &str) -> bool {
-    super::super::ops::java_int(id).is_some_and(|n| n < 0)
+    id.parse::<i32>().is_ok_and(|n| n < 0)
 }
 
 #[cfg(test)]
@@ -984,5 +1112,41 @@ mod tests {
         assert_eq!(f32_q(0.1), Q::new(13_421_773, 134_217_728));
         assert_eq!(f32_q(f32::INFINITY), None);
         assert_eq!(f32_q(f32::MAX), None);
+    }
+
+    fn rect(w: Q, h: Q) -> Rect {
+        Rect {
+            x: Q::int(20),
+            y: Q::int(800),
+            w,
+            h,
+        }
+    }
+
+    /// The crop of a `[iw, ih]` frame at row `y` under `w`×`h`.
+    fn crop(w: Q, h: Q, y: u32, [iw, ih]: [u32; 2]) -> Option<Crop> {
+        crop_rows(y, ih, trimmed(rect(w, h), [iw, ih]).unwrap()?)
+    }
+
+    #[test]
+    fn stretch_five_crops_exactly() {
+        let int = |v: i32| Q::int(v);
+        // A 25×128 frame over 430×258 keeps 258·25/430 = 15 rows about
+        // its middle: its edges 56.5 and 71.5 round to rows 57 to 71.
+        assert_eq!(crop(int(430), int(258), 0, [25, 128]), Some([57, 15]));
+        // A 1600×900 skin scales 430×86 to 516×103.2: a 15×4 frame keeps
+        // 3 rows from 0.5, rows 1 to 3.
+        let (w, h) = (int(516), Q::new(516, 5).unwrap());
+        assert_eq!(crop(w, h, 0, [15, 4]), Some([1, 3]));
+        // A 75×17 frame at row 24 under 430×86 keeps 15 rows from 25.
+        assert_eq!(crop(int(430), int(86), 24, [75, 17]), Some([25, 15]));
+        // A frame no taller than the destination once fit is not cropped.
+        assert_eq!(trimmed(rect(int(430), int(300)), [43, 30]), Some(None));
+        assert_eq!(
+            trimmed(rect(int(430), int(299)), [43, 30]),
+            Some(Q::new(299, 10))
+        );
+        // No row left: 0.4 texels about row 64.
+        assert_eq!(crop_rows(0, 128, Q::new(2, 5).unwrap()), None);
     }
 }

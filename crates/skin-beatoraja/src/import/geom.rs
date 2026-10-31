@@ -91,6 +91,17 @@ impl Q {
         self.mul(Self { n: 1, d: 2 })
     }
 
+    /// The nearest `f32`, for geometry the model keeps unrounded: exact
+    /// for the integers and halves of ordinary skins.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "the model keeps this geometry in f32"
+    )]
+    pub(crate) fn to_f32(self) -> f32 {
+        (self.n as f64 / self.d as f64) as f32
+    }
+
     /// The nearest integer, halves rounded up: `⌊self + ½⌋`.
     pub(crate) fn round(self) -> Option<i128> {
         let num = self.n.checked_mul(2)?.checked_add(self.d)?;

@@ -1362,6 +1362,7 @@ mod tests {
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         skin.attach_bitmap_text(&mut play, &ChartText::default());

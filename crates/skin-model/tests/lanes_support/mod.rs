@@ -11,8 +11,8 @@ use bms_model::{Lane, TimeUs};
 use image::{ImageFormat, Rgba, RgbaImage};
 use skin_model::{
     Anchor, Bind, Blend, Ease, ElementDef, End, FileDef, Filter, Fit, ImageDef, KeyDef, LaneParts,
-    LanesDef, LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef, Source,
-    TimerRef, Track, timer,
+    LaneStyle, LanesDef, LoadError, Place, Quad, Region, RegionDef, Sheet, Side, Skin, SkinDef,
+    Source, SourceLanes, TimerRef, Track, timer,
 };
 
 use crate::play_support::{Harness, REGIONS};
@@ -98,13 +98,16 @@ pub fn simple() -> LanesDef {
         *lane = [256 + 64 * (i32::try_from(k).unwrap() - 1), 64];
     }
     LanesDef {
+        style: LaneStyle::Simple,
         lanes,
         scratch: Side::Left,
         top: 80,
         line: 880,
         bottom: 960,
-        cover_at: 80,
-        lift_at: 880,
+        cover_at: 80.0,
+        cover_h: 800.0,
+        lift_at: 880.0,
+        lift_h: 880.0,
         note_h: 16,
         mine_h: 8,
         bar_h: 2,
@@ -122,6 +125,41 @@ pub fn simple() -> LanesDef {
             lift: Some(LIFT),
         },
     }
+}
+
+/// The source player's lanes on the simple skin's columns, as an imported
+/// skin's: the source region's lower edge at 880 and 600 high, notes and
+/// mines 20 high; `top` half a note above the region (270), `line` a
+/// note's centre at its judgment time (870), SUDDEN+ 600 high anchored at
+/// the region's top (280) and LIFT 200 high at its bottom.
+pub fn source() -> LanesDef {
+    LanesDef {
+        style: LaneStyle::Source(SourceLanes {
+            bottom: 880.0,
+            height: 600.0,
+            offset_y: 0.0,
+            note_h: 20.0,
+        }),
+        top: 270,
+        line: 870,
+        bottom: 880,
+        cover_at: 280.0,
+        cover_h: 600.0,
+        lift_at: 880.0,
+        lift_h: 200.0,
+        note_h: 20,
+        mine_h: 20,
+        ..simple()
+    }
+}
+
+/// [`source`] with `set` applied to its geometry.
+pub fn source_with(set: impl FnOnce(&mut SourceLanes)) -> LanesDef {
+    let mut def = source();
+    if let LaneStyle::Source(s) = &mut def.style {
+        set(s);
+    }
+    def
 }
 
 /// A track holding one key from 0.

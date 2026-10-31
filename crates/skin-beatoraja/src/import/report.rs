@@ -134,25 +134,17 @@ pub enum DeviationId {
 }
 
 /// How the lanes, SUDDEN+ and LIFT are drawn differently from the source
-/// (owner decision 12, items a–l).
+/// (owner decision 12, items a–k).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneApprox {
     /// a: notes and long-note bodies stop at the top of the lanes.
     TopCrop,
-    /// b: an unhit tap keeps falling below the judgment line until it is
-    /// judged a miss or leaves the lanes.
-    LateTaps,
-    /// c: a tap hit early disappears at once.
-    EarlyTaps,
-    /// d: a hit mine disappears when hit.
-    Mines,
     /// e: `dst2` is ignored.
     Dst2,
     /// f: `expansionrate` is ignored.
     Expansion,
-    /// g: a long note's end cap is drawn.
-    LnTail,
-    /// h: a long note's body runs between the caps' centres.
+    /// h: a long note within one note height of its end draws no body
+    /// (the source draws one of negative height).
     LnBody,
     /// i: the part of SUDDEN+ above the lanes is never drawn.
     CoverAbove,
@@ -162,8 +154,6 @@ pub enum LaneApprox {
     /// k: what the skin draws between the notes and SUDDEN+ or LIFT is
     /// drawn above them.
     CoverOrder,
-    /// l: the LIFT image is stretched over the covered area.
-    LiftStretch,
 }
 
 /// What a note is about.
