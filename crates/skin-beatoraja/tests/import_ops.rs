@@ -41,11 +41,6 @@ fn judged_image(fields: &str, after: bool) -> common::Loaded {
     ))
 }
 
-/// The judge's only note.
-fn region_note() -> NoteKind {
-    ignored("judge")
-}
-
 /// A critical EX score with `fields`.
 fn critical(fields: &str) -> common::Loaded {
     import_body(&format!(
@@ -138,7 +133,7 @@ fn gauge_ranges_and_the_perfect_judgment() {
     assert_eq!(d.frame(0, &[]).len(), 1);
     // 241 is the last judgment's perfect, a built-in although declared.
     let loaded = judged_image(r#""op": [241]"#, false);
-    assert_eq!(common::kinds(loaded.report()), [region_note()]);
+    assert_eq!(common::kinds(loaded.report()), [ignored("judge")]);
     let mut d = loaded.drawn();
     assert!(d.frame(0, &[]).is_empty());
     assert_eq!(d.frame(10, &[judged(10, Judgment::Perfect, 1)]).len(), 1);
