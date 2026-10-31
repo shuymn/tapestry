@@ -120,6 +120,20 @@ fn search_folds_width_and_kana() {
     assert_eq!(found(&lib, "ma"), titles(&["てすと"]));
 }
 
+/// A two-character kanji query (the `LIKE` path) matches only the fields
+/// holding both characters together, not one sharing the second.
+#[test]
+fn a_two_kanji_query_needs_both_characters() {
+    let fx = Fixture::new();
+    fx.chart("a.bms", &["TITLE 門", "GENRE テスト[魔界入口]"]);
+    fx.chart("b.bms", &["TITLE 冥界の門"]);
+    fx.chart("c.bms", &["TITLE 冥", "SUBTITLE 界"]);
+    let lib = fx.scanned();
+    assert_eq!(found(&lib, "冥界"), titles(&["冥界の門"]));
+    assert_eq!(found(&lib, "魔界"), titles(&["門"]));
+    assert_eq!(found(&lib, "界"), titles(&["門", "冥界の門", "冥"]));
+}
+
 #[test]
 fn search_is_literal_for_punctuation_quotes_and_wildcards() {
     let fx = Fixture::new();

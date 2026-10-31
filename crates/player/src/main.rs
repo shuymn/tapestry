@@ -745,6 +745,7 @@ fn rig<'a>(
         result_script: None,
         load_start: TimeUs(0),
         pending_retry: None,
+        window: None,
         retry_from: None,
         times: LoadTimes::default(),
         countdown_at: None,
@@ -968,14 +969,17 @@ fn play(
             return Err(e);
         }
     };
+    let link = window_thread.link();
     let make: MakeScreen = Box::new(move || {
         let target = Target::Window {
             window: surface.into(),
             width: surface.width,
             height: surface.height,
         };
-        Renderer::new(target, AdapterChoice::HighPerformance)
-            .map(|r| Box::new(MenuScreen::new(r, None)) as Box<dyn Screen>)
+        Renderer::new(target, AdapterChoice::HighPerformance).map(|r| {
+            let screen = MenuScreen::new(r, None).with_sink(Box::new(link.clone()));
+            Box::new(screen) as Box<dyn Screen>
+        })
     });
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
     let mut measure = measure(
@@ -1026,6 +1030,7 @@ fn play(
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
+    rig.window = Some(window_thread.shown());
     rig.restorer = restorer(&loaded, &rig);
     rig.gain = gain;
     rig.result_input = menus;
@@ -1287,9 +1292,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         }
     };
     let ime = window_thread.as_ref().map(window::WindowThread::ime);
+    let link = window_thread.as_ref().map(window::WindowThread::link);
     let refresh_mhz = surface.and_then(|s| s.refresh_mhz);
-    let make: MakeScreen = match surface {
-        Some(surface) => Box::new(move || {
+    let make: MakeScreen = match (surface, link) {
+        (Some(surface), Some(link)) => Box::new(move || {
             let target = Target::Window {
                 window: surface.into(),
                 width: surface.width,
@@ -1297,11 +1303,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             };
             let r = Renderer::new(target, AdapterChoice::HighPerformance)?;
             let fonts = render::text::Fonts::runtime()?;
-            Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
+            let screen = MenuScreen::new(r, Some(fonts)).with_sink(Box::new(link.clone()));
+            Ok(Box::new(screen) as Box<dyn Screen>)
         }),
         // Headless (dev-tools): offscreen on WARP.
         #[cfg(feature = "dev-tools")]
-        None => Box::new(|| {
+        _ => Box::new(|| {
             let target = Target::Offscreen {
                 width: 1280,
                 height: 720,
@@ -1312,7 +1319,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         }),
         // A production run always has its window.
         #[cfg(not(feature = "dev-tools"))]
-        None => Box::new(|| Err(render::RenderError::SurfaceUnsupported)),
+        _ => Box::new(|| Err(render::RenderError::SurfaceUnsupported)),
     };
     let measure = measure(
         clock,
@@ -1353,6 +1360,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         steps: probes.steps.0,
     };
     let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock);
+    rig.window = window_thread.as_ref().map(window::WindowThread::shown);
     rig.queue_most = opened.most_queued_periods;
     rig.result_input = menus;
     rig.selection = Some(selection::Selection {

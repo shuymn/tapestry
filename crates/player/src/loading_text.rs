@@ -82,6 +82,7 @@ impl LoadingText {
                 line(format!("プリセット: {}", self.preset), LineStyle::Chart),
                 line(stage.text(), LineStyle::Search),
             ],
+            caret: None,
         }
     }
 }
