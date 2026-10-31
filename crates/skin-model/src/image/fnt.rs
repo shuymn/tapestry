@@ -288,14 +288,11 @@ fn without_face(line: &[u8]) -> Vec<u8> {
 
 /// The padding of line 1, as the source reads it: the text after
 /// `padding=` up to the next space, four integers separated by commas
-/// (gdx 1.9.9 `load`:492-498). Read on the bytes, before the encoding is
-/// checked, so a binary file fails as the source fails.
-fn padding(line: &[u8]) -> Option<[i32; 4]> {
-    let key = b"padding=";
-    let at = line.windows(key.len()).position(|w| w == key)? + key.len();
-    let rest = line.get(at..)?;
-    let end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
-    let text = std::str::from_utf8(rest.get(..end)?).ok()?;
+/// (gdx 1.9.9 `load`:492-498).
+fn padding(line: &str) -> Option<[i32; 4]> {
+    let key = "padding=";
+    let rest = line.get(line.find(key)? + key.len()..)?;
+    let text = rest.split(' ').next()?;
     let mut parts = text.split(',');
     let mut out = [0; 4];
     for v in &mut out {
@@ -486,14 +483,13 @@ impl FntFile {
             no: 0,
         };
 
-        // Line 1: the padding, then `info`, then the size. The copy
-        // without `face` ends with the block.
+        // Line 1: the encoding outside `face`, the padding, then `info`,
+        // then the size. The copy without `face` ends with the block.
         let ([pad_top, pad_right, pad_bottom, pad_left], size) = {
             let (no, info) = lines.line()?;
-            let info = info.unwrap_or_default();
-            let pad = padding(info).ok_or(err(no, FntErrorKind::Padding))?;
-            let info = without_face(info);
+            let info = without_face(info.unwrap_or_default());
             let info = text(no, &info)?;
+            let pad = padding(info).ok_or(err(no, FntErrorKind::Padding))?;
             if pad.iter().any(|p| !(0..=MAX_FNT_VALUE).contains(p)) {
                 return Err(err(no, FntErrorKind::Value("padding")));
             }
@@ -904,12 +900,14 @@ mod tests {
     }
 
     #[test]
-    fn binary_and_xml_files_fail_as_the_source_fails() {
-        for s in ["BMF\u{3}\u{1}", "<?xml version=\"1.0\"?>\n<font>"] {
-            let e = kind(s);
-            assert_eq!(e, FntErrorKind::Padding);
-            assert!(e.upstream_fails());
-        }
+    fn a_binary_file_is_refused_by_its_encoding_and_an_xml_one_by_its_padding() {
+        let binary = b"BMF\x03\x01\x14\x00\x00\x00\xF4\xFF";
+        let e = FntFile::parse(binary, "", FntLimits::FILE).unwrap_err();
+        assert_eq!(e, err(1, FntErrorKind::Encoding));
+        assert!(!e.kind.upstream_fails());
+        let e = kind("<?xml version=\"1.0\"?>\n<font>");
+        assert_eq!(e, FntErrorKind::Padding);
+        assert!(e.upstream_fails());
         assert_eq!(kind(""), FntErrorKind::Padding);
     }
 
