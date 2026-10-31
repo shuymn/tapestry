@@ -1,6 +1,6 @@
 //! A loaded skin: its elements in draw order, its regions, its `when`
-//! timers, its images and its lanes, and the per-frame build into a
-//! [`QuadBatch`].
+//! timers, its images, its lanes and its text, and the per-frame build
+//! into a [`QuadBatch`].
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -18,12 +18,16 @@ use crate::play::{Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::schema::Ty;
 use crate::track::Track;
-use crate::widget::digits::{Digits, Number, NumberDef, NumberError};
+use crate::widget::digits::{Align, Digits, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError};
 use crate::widget::judge::{
     ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgeSlot,
 };
 use crate::widget::lanes::{Draw, LANE_QUADS, LANE_RESERVED, Lanes, LanesDef, LanesError, Side};
+use crate::widget::text::{
+    self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, Text, TextDef,
+    TextError, TextRequest, TextTable, TextTableError, TextValue,
+};
 use crate::widget::{Brush, Frame, ImageRef, sample};
 
 /// The most elements one skin may hold.
@@ -59,6 +63,9 @@ pub enum Source {
     /// The judge at this index of [`WidgetDefs::judges`]. Its track gives
     /// only color and alpha; the parts place themselves.
     Judge(u32),
+    /// The text at this index of [`WidgetDefs::texts`]. Its track's rect
+    /// is the line's box, whose height is the em.
+    Text(u32),
 }
 
 /// The widgets elements draw by index.
@@ -67,6 +74,7 @@ pub struct WidgetDefs {
     pub numbers: Vec<NumberDef>,
     pub gauges: Vec<GaugeDef>,
     pub judges: Vec<JudgeDef>,
+    pub texts: Vec<TextDef>,
 }
 
 /// The timer an element's track or an image's cycle runs on.
@@ -149,6 +157,8 @@ pub enum LoadError {
     Ops(#[source] CompileError),
     #[error("a widget table has {n} widgets, more than {MAX_ELEMENTS}")]
     TooManyWidgets { n: usize },
+    #[error("the skin has {n} text elements, more than {MAX_TEXT_ELEMENTS}")]
+    TooManyTexts { n: usize },
     #[error("element {element}'s widget does not exist")]
     UnknownWidget { element: usize },
     #[error("the widgets can push {n} quads a frame, more than {MAX_WIDGET_QUADS}")]
@@ -173,6 +183,12 @@ pub enum LoadError {
         #[source]
         error: JudgeError,
     },
+    #[error("element {element}'s text")]
+    Text {
+        element: usize,
+        #[source]
+        error: TextError,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -182,6 +198,8 @@ enum Kind {
     Number(usize),
     Gauge(usize),
     Judge(usize),
+    /// The text definition's index, and its layout.
+    Text(usize, Text),
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +233,10 @@ pub struct Skin {
     numbers: Box<[Number]>,
     gauges: Box<[Gauge]>,
     judges: Box<[Judge]>,
+    texts: Box<[TextDef]>,
+    /// The text elements: the length of the table
+    /// [`attach_text`](Skin::attach_text) takes.
+    text_slots: u16,
     /// The quads one frame's widget elements can push, the lanes aside.
     widget_quads: u32,
 }
@@ -288,6 +310,18 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
                 return Err(judge(JudgeError::Coordinates { part }));
             }
         }
+        if let Source::Text(_) = e.source {
+            let text = |error| LoadError::Text { element, error };
+            if p.bind != Bind::None {
+                return Err(text(TextError::Bound));
+            }
+            if p.fill != Fill::None {
+                return Err(text(TextError::Fill));
+            }
+            if e.track.rects().any(|[_, _, w, h]| h <= 0 || w < 0) {
+                return Err(text(TextError::Size));
+            }
+        }
     }
     let mut widgets = def.elements.iter().filter(|e| e.source == Source::Lanes);
     let lanes_in = widgets.next().map(|e| e.place.region);
@@ -307,14 +341,16 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// The images checks of [`Skin::new`] for one element's widget, whose
-/// index is valid: every image exists, and glyph images hold whole sets.
-/// `frames` gives an image's frame count, `None` for a missing image.
+/// The resource checks of [`Skin::new`] for one element's widget, whose
+/// index is valid: every image exists, glyph images hold whole sets, and
+/// a text's font file exists. `frames` gives an image's frame count,
+/// `None` for a missing image; the sheet has `fonts` font files.
 fn check_widget_images(
     element: usize,
     source: Source,
     w: &WidgetDefs,
     frames: &impl Fn(u32) -> Option<u16>,
+    fonts: usize,
 ) -> Result<(), LoadError> {
     match source {
         Source::Number(i) => {
@@ -352,6 +388,14 @@ fn check_widget_images(
                         .check_image(frames(c.digits.image))
                         .map_err(|error| judge(JudgeError::Combo { slot, error }))?;
                 }
+            }
+        }
+        Source::Text(i) => {
+            if let Some(FontRef::File(f)) = w.texts.get(index(i)).map(|t| t.font)
+                && index(f) >= fonts
+            {
+                let error = TextError::UnknownFont;
+                return Err(LoadError::Text { element, error });
             }
         }
         Source::Image(_) | Source::Lanes => {}
@@ -392,16 +436,26 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
                 }
             }
         }
+        Source::Text(i) => {
+            if let Some(TextValue::Literal(l)) = w.texts.get(index(i)).map(|t| &t.value)
+                && !text::literal_ok(l)
+            {
+                let error = TextError::Literal;
+                return Err(LoadError::Text { element, error });
+            }
+        }
         Source::Image(_) | Source::Lanes => {}
     }
     Ok(())
 }
 
 /// The widget quads one frame of `source`'s element can push at worst:
-/// 0 for an image or the lanes, which `quad_capacity` counts apart.
+/// 0 for an image or the lanes, which `quad_capacity` counts apart, and 1
+/// for a text.
 fn worst(source: Source, w: &WidgetDefs) -> u32 {
     match source {
         Source::Image(_) | Source::Lanes => 0,
+        Source::Text(_) => 1,
         Source::Number(i) => w
             .numbers
             .get(index(i))
@@ -433,7 +487,11 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
                 }
                 rect
             }
-            Source::Image(_) | Source::Gauge(_) | Source::Number(_) | Source::Judge(_) => {
+            Source::Image(_)
+            | Source::Gauge(_)
+            | Source::Number(_)
+            | Source::Judge(_)
+            | Source::Text(_) => {
                 let b = match e.source {
                     Source::Number(i) => def
                         .widgets
@@ -441,7 +499,10 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
                         .get(index(i))
                         .and_then(|n| n.digits.bounds(&e.track)),
                     Source::Judge(i) => def.widgets.judges.get(index(i)).and_then(JudgeDef::bounds),
-                    Source::Image(_) | Source::Gauge(_) | Source::Lanes => e.track.bounds(),
+                    // A text's box only: spilled ink does not count.
+                    Source::Image(_) | Source::Gauge(_) | Source::Text(_) | Source::Lanes => {
+                        e.track.bounds()
+                    }
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -489,16 +550,19 @@ impl Skin {
     /// Loads a skin.
     ///
     /// Checks, in order: the counts (elements, `when` timers, each widget
-    /// table, keys across all tracks, judge parts' included); every `when`
-    /// condition and visibility is a bool, judge parts' included, and
-    /// every number's value an int; every timer exists, judge parts'
-    /// included; every element's widget, every element's, widget's and
-    /// lane part's image exists, glyph images hold whole sets, and every
-    /// image's cycle timer exists; the places (regions under a fixed
-    /// canvas, fills outside `screen`, key coordinates within
-    /// ±[`MAX_COORD`], widget tracks that move, judges in `judge` and
-    /// unbound, one lanes widget in its region, bindings beside it); the
-    /// widgets' parameters; the lanes' definition and geometry; the total
+    /// table, text elements, keys across all tracks, judge parts'
+    /// included); every `when` condition and visibility is a bool, judge
+    /// parts' included, and every number's value an int; every timer
+    /// exists, judge parts' included; every element's widget, every
+    /// element's, widget's and lane part's image exists, glyph images hold
+    /// whole sets, every text's font file exists, and every image's cycle
+    /// timer exists; the places (regions under a fixed canvas, fills
+    /// outside `screen`, key coordinates within ±[`MAX_COORD`], widget
+    /// tracks that move, judges in `judge` and unbound, texts unbound,
+    /// without a fill and with every key's height positive and width not
+    /// negative, one lanes widget in its region, bindings beside it); the
+    /// widgets' parameters (a literal's length and characters); the
+    /// lanes' definition and geometry; the total
     /// operations, each `when` charged once however many elements share
     /// it, then each visibility in element order, then per element its
     /// number's value or its judge parts' visibilities; and the widgets'
@@ -528,10 +592,22 @@ impl Skin {
         if whens.len() > MAX_WHEN_TIMERS {
             return Err(LoadError::TooManyWhenTimers { n: whens.len() });
         }
-        for n in [w.numbers.len(), w.gauges.len(), w.judges.len()] {
+        for n in [
+            w.numbers.len(),
+            w.gauges.len(),
+            w.judges.len(),
+            w.texts.len(),
+        ] {
             if n > MAX_ELEMENTS {
                 return Err(LoadError::TooManyWidgets { n });
             }
+        }
+        let n = elements
+            .iter()
+            .filter(|e| matches!(e.source, Source::Text(_)))
+            .count();
+        if n > MAX_TEXT_ELEMENTS {
+            return Err(LoadError::TooManyTexts { n });
         }
         let keys = elements
             .iter()
@@ -573,7 +649,7 @@ impl Skin {
                         return Err(LoadError::Judge { element, error });
                     }
                 }
-                Source::Image(_) | Source::Lanes | Source::Gauge(_) => {}
+                Source::Image(_) | Source::Lanes | Source::Gauge(_) | Source::Text(_) => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -600,17 +676,22 @@ impl Skin {
             Source::Number(i) => w.numbers.get(index(i)).is_none(),
             Source::Gauge(i) => w.gauges.get(index(i)).is_none(),
             Source::Judge(i) => w.judges.get(index(i)).is_none(),
+            Source::Text(i) => w.texts.get(index(i)).is_none(),
         }) {
             return Err(LoadError::UnknownWidget { element });
         }
         if let Some(element) = elements.iter().position(|e| match e.source {
             Source::Image(i) => !exists(i),
-            Source::Lanes | Source::Number(_) | Source::Gauge(_) | Source::Judge(_) => false,
+            Source::Lanes
+            | Source::Number(_)
+            | Source::Gauge(_)
+            | Source::Judge(_)
+            | Source::Text(_) => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
         for (element, e) in elements.iter().enumerate() {
-            check_widget_images(element, e.source, w, &frames)?;
+            check_widget_images(element, e.source, w, &frames, def.sheet.font_count())?;
         }
         if let Some((part, _)) = def
             .lanes
@@ -694,6 +775,7 @@ impl Skin {
             numbers,
             gauges,
             judges,
+            texts,
         } = def.widgets;
         let numbers = numbers
             .into_iter()
@@ -730,6 +812,8 @@ impl Skin {
                 shift: j.shift,
             })
             .collect();
+        // Text slots in draw order; at most `MAX_TEXT_ELEMENTS`.
+        let mut text_slots = 0_u16;
         let elements = def
             .elements
             .into_iter()
@@ -741,6 +825,16 @@ impl Skin {
                     Source::Number(i) => Kind::Number(index(i)),
                     Source::Gauge(i) => Kind::Gauge(index(i)),
                     Source::Judge(i) => Kind::Judge(index(i)),
+                    Source::Text(i) => {
+                        let def = texts.get(index(i));
+                        let text = Text {
+                            slot: text_slots,
+                            align: def.map_or(Align::Left, |d| d.align),
+                            overflow: def.map_or(Overflow::Spill, |d| d.overflow),
+                        };
+                        text_slots = text_slots.saturating_add(1);
+                        Kind::Text(index(i), text)
+                    }
                 },
                 track: e.track,
                 slot,
@@ -767,6 +861,8 @@ impl Skin {
             numbers,
             gauges,
             judges,
+            texts: texts.into_boxed_slice(),
+            text_slots,
             widget_quads,
         })
     }
@@ -801,8 +897,8 @@ impl Skin {
 
     /// The quads a frame can push: one per image element, each widget
     /// element's worst case (a number's cells, a gauge's segments and its
-    /// flicker's tip, a judge's largest slot with its combo's cells), and
-    /// the lanes' budget with its reserved quads.
+    /// flicker's tip, a judge's largest slot with its combo's cells, a
+    /// text's one line), and the lanes' budget with its reserved quads.
     #[must_use]
     pub fn quad_capacity(&self) -> u32 {
         let images = self
@@ -859,11 +955,39 @@ impl Skin {
     /// elements whose visibility folds to false do not count. Exact rationals, no float. For `prepare`, not in play.
     #[must_use]
     pub fn variant(&self, target: [u32; 2], layout: &Layout) -> Variant {
+        let (fit, cw, ch) = self.fit(target);
+        let (fw, fh) = (cw.mul(Ratio(1, 1_920)), ch.mul(Ratio(1, 1_080)));
+        let k = u128::from(self.regions.lane_width(layout).min(100));
+        let one = Ratio(1, 1);
+        let hi = self.elements.iter().any(|e| {
+            let adjust = self.regions.effective(e.region, layout);
+            // A hidden region, or a visibility folded to false, never draws;
+            // a text has its own pixel size.
+            let never = e.visible.as_ref().and_then(Program::constant) == Some(0);
+            if !adjust.visible || never || matches!(e.kind, Kind::Text(..)) {
+                return false;
+            }
+            let fill = match e.fill {
+                Fill::None => one,
+                Fill::Cover => fw.max(fh),
+                Fill::Stretch => fw.min(fh),
+            };
+            let scale = Ratio(u128::from(adjust.scale), 100);
+            let bound = matches!(e.kind, Kind::Lanes) || e.bind != Bind::None;
+            let lane = if bound { Ratio(k, 100) } else { one };
+            fit.mul(scale).mul(fill).mul(lane).gt(one)
+        });
+        if hi { Variant::Hi } else { Variant::Lo }
+    }
+
+    /// For a `target`-pixel target: the canvas scale in target pixels per
+    /// reference pixel, and the canvas's width and height in reference
+    /// pixels, as exact fractions.
+    fn fit(&self, target: [u32; 2]) -> (Ratio, Ratio, Ratio) {
         let [tw, th] = target.map(|v| u128::from(v.max(1)));
         let wide = tw * 9 >= th * 16;
-        let fixed = self.regions.fit == Fit::Fixed;
         let [max_w, max_h] = MAX_CANVAS.map(u128::from);
-        let (fit, cw, ch) = if fixed {
+        if self.regions.fit == Fit::Fixed {
             let fit = Ratio(tw, 1_920).min(Ratio(th, 1_080));
             (fit, Ratio(1_920, 1), Ratio(1_080, 1))
         } else if wide {
@@ -880,28 +1004,83 @@ impl Skin {
                 Ratio(1_920 * th, tw)
             };
             (Ratio(tw, 1_920), Ratio(1_920, 1), ch)
-        };
-        let (fw, fh) = (cw.mul(Ratio(1, 1_920)), ch.mul(Ratio(1, 1_080)));
-        let k = u128::from(self.regions.lane_width(layout).min(100));
-        let one = Ratio(1, 1);
-        let hi = self.elements.iter().any(|e| {
-            let adjust = self.regions.effective(e.region, layout);
-            // A hidden region, or a visibility folded to false, never draws.
-            let never = e.visible.as_ref().and_then(Program::constant) == Some(0);
-            if !adjust.visible || never {
-                return false;
-            }
-            let fill = match e.fill {
-                Fill::None => one,
-                Fill::Cover => fw.max(fh),
-                Fill::Stretch => fw.min(fh),
+        }
+    }
+
+    /// The text elements: the length of the table
+    /// [`attach_text`](Self::attach_text) takes.
+    #[must_use]
+    pub fn text_slots(&self) -> usize {
+        usize::from(self.text_slots)
+    }
+
+    /// The lines to rasterize for `chart` on a `target`-pixel target with
+    /// `layout`, in slot order. For `prepare`, not in play: it allocates.
+    ///
+    /// A text element whose visibility folds to false gives no request,
+    /// nor does one whose string is empty once control characters are
+    /// dropped (after the full fields are joined) and it is cut to
+    /// [`MAX_TEXT_BYTES`](crate::MAX_TEXT_BYTES) at a character boundary.
+    /// The em is the element's largest key height times the canvas scale
+    /// and its region's effective scale, at most [`MAX_TEXT_EM_PX`]. An
+    /// element in a hidden region still gets a request, since the adjust
+    /// mode can show it.
+    #[must_use]
+    pub fn text_requests(
+        &self,
+        chart: &ChartText<'_>,
+        target: [u32; 2],
+        layout: &Layout,
+    ) -> Vec<TextRequest> {
+        let (fit, ..) = self.fit(target);
+        let mut out = Vec::new();
+        for e in &self.elements {
+            let Kind::Text(i, t) = e.kind else {
+                continue;
             };
-            let scale = Ratio(u128::from(adjust.scale), 100);
-            let bound = matches!(e.kind, Kind::Lanes) || e.bind != Bind::None;
-            let lane = if bound { Ratio(k, 100) } else { one };
-            fit.mul(scale).mul(fill).mul(lane).gt(one)
-        });
-        if hi { Variant::Hi } else { Variant::Lo }
+            if e.visible.as_ref().and_then(Program::constant) == Some(0) {
+                continue;
+            }
+            let Some(def) = self.texts.get(i) else {
+                continue;
+            };
+            let s = text::clean(&def.value.resolve(chart));
+            if s.is_empty() {
+                continue;
+            }
+            let h = e.track.rects().map(|[.., h]| h).max().unwrap_or(0);
+            let h = u128::try_from(h).unwrap_or(0);
+            let scale = self.regions.effective(e.region, layout).scale;
+            let em = Ratio(h, 1).mul(fit).mul(Ratio(u128::from(scale), 100));
+            // Both terms are below 2^60; rounding them to f64 is the intent.
+            let em_px = f32_of(em.0 as f64 / em.1 as f64).min(MAX_TEXT_EM_PX);
+            out.push(TextRequest {
+                slot: t.slot,
+                text: s,
+                font: def.font,
+                em_px,
+            });
+        }
+        out
+    }
+
+    /// Attaches the rasterized lines of `play`'s attempt, one per text
+    /// slot. A fresh [`prepare`](Self::prepare) starts with none, so no
+    /// text draws until its table is attached.
+    ///
+    /// # Errors
+    ///
+    /// A table whose length is not [`text_slots`](Self::text_slots).
+    pub fn attach_text(&self, play: &mut Play, table: TextTable) -> Result<(), TextTableError> {
+        let expected = self.text_slots();
+        if table.len() != expected {
+            return Err(TextTableError::Len {
+                expected,
+                got: table.len(),
+            });
+        }
+        play.set_text(table);
+        Ok(())
     }
 
     /// A fresh [`Play`] for one attempt of `chart`; a retry or the next
@@ -923,7 +1102,10 @@ impl Skin {
     /// `play` must come from this skin's [`prepare`](Self::prepare); one
     /// with another number of timers draws nothing. `uvs` must come from an
     /// atlas of this skin's sheet; a table of another sheet, or of another
-    /// length, draws nothing.
+    /// length, draws nothing. A text element draws its slot's line from
+    /// the table attached to `play` ([`attach_text`](Self::attach_text));
+    /// a slot without a line, or a table of another length, draws no
+    /// text.
     ///
     /// Each element shows its image's frame at the image's cycle timer:
     /// frame 0 while that timer is off, without a cycle, or with one frame.
@@ -956,6 +1138,8 @@ impl Skin {
         play.fill(frame, &self.whens);
         let play = &*play;
         let state = play.state();
+        // A table of another length draws no text.
+        let texts = play.text().len() == self.text_slots();
         let display = TimeUs(frame.now.0.saturating_add(frame.display_offset.0));
         for e in &self.elements {
             if !placement.region(e.region).visible {
@@ -1019,6 +1203,11 @@ impl Skin {
                             clip: e.key.clip,
                         };
                         j.draw(&d, out);
+                    }
+                }
+                Kind::Text(_, t) => {
+                    if let Some(image) = play.text().get(t.slot).filter(|_| texts) {
+                        t.draw(image, s.rect, &brush, out);
                     }
                 }
                 Kind::Lanes => {

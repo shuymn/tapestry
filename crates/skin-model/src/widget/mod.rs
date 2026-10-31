@@ -1,7 +1,7 @@
 //! Widgets: elements that draw many quads from player logic. Stage 3 S5
 //! has the lanes, whose scroll math is a copy of the simple skin's; S5b
 //! adds the glyph strips of `number` and the judge's combo, the `judge`
-//! and the `gauge`.
+//! and the `gauge`; S5c adds `text`.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -10,6 +10,7 @@ pub(crate) mod gauge;
 pub(crate) mod judge;
 pub(crate) mod lanes;
 pub(crate) mod scroll;
+pub(crate) mod text;
 
 use bms_model::TimeUs;
 
@@ -86,6 +87,20 @@ impl Brush {
     ) -> bool {
         let [fx, fy] = self.pivot;
         let pivot = [x + fx * w, y + fy * h];
+        self.push_about(out, [x, y, w, h], pivot, f, filter)
+    }
+
+    /// Pushes the quad showing `f` over the reference rect `[x, y, w, h]`
+    /// turned about the reference point `pivot`, both moved as
+    /// [`push`](Self::push) moves them. `false` when the batch refused it.
+    pub(crate) fn push_about(
+        &self,
+        out: &mut QuadBatch,
+        [x, y, w, h]: [f32; 4],
+        pivot: [f32; 2],
+        f: FrameUv,
+        filter: Filter,
+    ) -> bool {
         let (x, w, px) = (self.map.x(x), self.map.w(w), self.map.x(pivot[0]));
         out.push(
             self.key,

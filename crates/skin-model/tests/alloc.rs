@@ -678,6 +678,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
         numbers,
         gauges,
         judges: vec![judge(true), judge(false)],
+        texts: Vec::new(),
     }
 }
 

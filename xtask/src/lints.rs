@@ -293,6 +293,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/judge.rs"),
     Site::File("crates/skin-model/src/widget/lanes.rs"),
     Site::File("crates/skin-model/src/widget/scroll.rs"),
+    Site::File("crates/skin-model/src/widget/text.rs"),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],

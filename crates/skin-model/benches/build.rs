@@ -94,6 +94,7 @@ fn bench_widgets(c: &mut Criterion) {
                 },
             )],
             judges: vec![j],
+            texts: Vec::new(),
         },
     )
     .expect("valid skin");
