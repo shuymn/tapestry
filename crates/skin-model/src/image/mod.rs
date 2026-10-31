@@ -3,11 +3,13 @@
 //! [`Sheet::new`] checks every count before it touches the disk, then each
 //! file's path and length, then each header, then each image's rectangle
 //! and grid. It reads headers only: pixels are decoded when an atlas is
-//! built ([`Sheet::atlas`]).
+//! built ([`Sheet::atlas`]). [`Sheet::with_fonts`] adds the skin's font
+//! files, checked by their first bytes only.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 pub(crate) mod decode;
+pub(crate) mod font;
 pub(crate) mod path;
 
 use std::collections::BTreeMap;
@@ -243,6 +245,8 @@ pub struct Sheet {
     frames: Box<[u32]>,
     /// The distinct cells, ordered by file, then rectangle.
     cells: Box<[Cell]>,
+    /// The font files' names.
+    fonts: Box<[String]>,
 }
 
 /// A frame total, saturating.
@@ -311,6 +315,7 @@ impl Sheet {
             images: Box::new([]),
             frames: Box::new([]),
             cells: Box::new([]),
+            fonts: Box::new([]),
         }
     }
 
@@ -498,6 +503,7 @@ impl Sheet {
             images: drawn.into_boxed_slice(),
             frames: frames.into_boxed_slice(),
             cells: cells.into_boxed_slice(),
+            fonts: Box::new([]),
         })
     }
 

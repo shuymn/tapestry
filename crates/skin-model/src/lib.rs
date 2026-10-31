@@ -12,11 +12,12 @@
 //! into runs wherever the blend or the clip changes.
 //!
 //! A [`Sheet`] holds a skin's files and images: rectangles of the files cut
-//! into grids of frames, each image with its own frame cycle and filter.
-//! Loading it checks the counts, confines the paths to the skin folder and
-//! reads only the headers. [`Sheet::atlas`] decodes the files of one
-//! [`Variant`] (1x or @2x) into texture-array [`Page`]s with box-filtered
-//! mips and a [`UvTable`] that finds each frame in them.
+//! into grids of frames, each image with its own frame cycle and filter,
+//! and its font files. Loading it checks the counts, confines the paths to
+//! the skin folder and reads only the headers and the fonts' first bytes.
+//! [`Sheet::atlas`] decodes the files of one [`Variant`] (1x or @2x) into
+//! texture-array [`Page`]s with box-filtered mips and a [`UvTable`] that
+//! finds each frame in them.
 //!
 //! A [`Skin`] holds elements in draw order, each an image, a number, a
 //! gauge, a judgment display or the lanes widget on a keyframe [`Track`]
@@ -67,6 +68,7 @@ pub use expr::{
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
     compile,
 };
+pub use image::font::{FontDef, FontError, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
 pub use image::{
     CycleDef, FileAt, FileDef, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
     MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE, MAX_SKIN_FRAMES,
