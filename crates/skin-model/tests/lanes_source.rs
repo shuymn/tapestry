@@ -266,6 +266,25 @@ fn the_lift_and_the_cover_take_their_shares_of_the_region() {
 }
 
 #[test]
+fn sudden_plus_slides_at_its_own_height_over_the_whole_region() {
+    let chart = tap_at(3, 5_000);
+    let cover = |cover: u16, lift: u16| {
+        let mut h = harness(&chart);
+        h.view.cover = cover;
+        h.view.lift = lift;
+        h.frame(1_000, &[]);
+        rects(&h, COVER)
+    };
+    // At 0 ‰ its lowest half note shows above the region (from the
+    // lanes' top, 270, to its anchor, 280); at 1 000 ‰ its lower edge
+    // reaches the line, 600 below, and with the lift at 500 ‰ the raised
+    // line, 300 below.
+    assert_eq!(cover(0, 0), [[160.0, 270.0, 544.0, 10.0]]);
+    assert_eq!(cover(1_000, 0), [[160.0, 280.0, 544.0, 600.0]]);
+    assert_eq!(cover(1_000, 500), [[160.0, 270.0, 544.0, 310.0]]);
+}
+
+#[test]
 fn with_no_scroll_left_only_taps_and_mines_are_drawn_on_the_line() {
     let mut chart = ChartBuilder::new(BPM)
         .tap(lane(5), TimeUs(500 * MS))

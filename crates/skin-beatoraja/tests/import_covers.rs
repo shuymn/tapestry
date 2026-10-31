@@ -69,24 +69,46 @@ fn sudden_plus_maps_from_its_anchor() {
     let l = with("", &[&cover("")]);
     assert!(has(l.report(), d9(LaneApprox::CoverAbove)));
     assert!(!has(l.report(), d9(LaneApprox::CoverOrder)));
-    // 500 ‰ of the lane: the cover's lower edge at 280 + 300.
+    // 500 ‰ of the lane: the cover's lower edge at 280 + 300, the cover
+    // 600 high above it and cut at the lanes' top.
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 310]]);
+    // At 0 ‰ its lower edge is the anchor: what shows is the strip
+    // between the lanes' top and the anchor; 10 ‰ lowers it by 6.
+    assert_eq!(rects(&l, 5_000, 0, 0), [[20, 270, 430, 10]]);
+    assert_eq!(rects(&l, 5_000, 10, 0), [[20, 270, 430, 16]]);
+}
+
+#[test]
+fn sudden_plus_keeps_its_own_height() {
+    let short = cover("").replace(r#""h": 600"#, r#""h": 300"#);
+    let l = with("", &[&short]);
+    // 500 ‰: a 300 px cover over [280, 580] leaves the lane above it.
     assert_eq!(rects(&l, 5_000, 500, 0), [[20, 280, 430, 300]]);
-    // 0 ‰ draws no cover; 10 ‰ a strip from the anchor.
-    assert_eq!(rects(&l, 5_000, 0, 0), Vec::<[i32; 4]>::new());
-    assert_eq!(rects(&l, 5_000, 10, 0), [[20, 280, 430, 6]]);
+}
+
+#[test]
+fn lift_keeps_its_own_height() {
+    let short = lift("").replace(
+        r#""y": 0, "w": 430, "h": 200"#,
+        r#""y": 100, "w": 430, "h": 100"#,
+    );
+    let l = with(&lift_object(""), &[&short]);
+    // LIFT 500 ‰ raises its upper edge 300 px to 580; it is 100 high.
+    assert_eq!(rects(&l, 5_000, 0, 500), [[20, 580, 430, 100]]);
 }
 
 #[test]
 fn lift_and_sudden_plus_share_the_lane() {
     let l = with(&lift_object(""), &[&cover(""), &lift("")]);
-    assert!(has(l.report(), d9(LaneApprox::LiftStretch)));
+    assert!(!has(l.report(), d9(LaneApprox::CoverOrder)));
     // LIFT 200 ‰ takes 120 px, raising the line to 750; SUDDEN+ 500 ‰
     // takes half of the 480 px left: its edge at 520 (the source's
     // 1080 − 800 + 240), LIFT's top at 760 (the source's `hl`), and a
     // note half the visible time ahead halfway down the 240 px left.
+    // Each cover keeps its own height, cut to the lanes.
     assert_eq!(
         rects(&l, 1_300, 500, 200),
-        [[100, 620, 50, 20], [20, 280, 430, 240], [20, 760, 430, 120]]
+        [[100, 620, 50, 20], [20, 270, 430, 250], [20, 760, 430, 120]]
     );
 }
 
@@ -241,10 +263,10 @@ fn offset_four_elements_that_may_reach_the_lanes_refuse() {
 fn only_an_exact_cover_maps() {
     let at = |rect: &str| cover("").replace(r#""x": 20, "y": 800, "w": 430, "h": 600"#, rect);
     for (d, field) in [
-        // Split, one pixel wider, too short, too high.
+        // Split, one pixel wider, without height, too high.
         (at(r#""x": 20, "y": 800, "w": 215, "h": 600"#), "dst"),
         (at(r#""x": 20, "y": 800, "w": 431, "h": 600"#), "dst"),
-        (at(r#""x": 20, "y": 800, "w": 430, "h": 599"#), "dst"),
+        (at(r#""x": 20, "y": 800, "w": 430, "h": 0"#), "dst"),
         (at(r#""x": 20, "y": 801, "w": 430, "h": 600"#), "dst"),
         // Not white or not alpha-blended.
         (cover(r#""blend": 2"#), "dst"),
@@ -331,7 +353,7 @@ fn windows_compare_by_what_they_show() {
         {"time": 0, "x": 0, "y": 0, "w": 0, "h": 0},
         {"time": 1000, "x": 0, "y": 0, "w": 0, "h": 0}]}"#;
     let l = import_body(&body("", &note(""), &[notes, &cover(r#""loop": 0"#)]));
-    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 280, 430, 300]]);
+    assert_eq!(rects(&l, 5_000, 500, 0), [[20, 270, 430, 310]]);
 }
 
 #[test]

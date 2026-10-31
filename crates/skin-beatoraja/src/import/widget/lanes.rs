@@ -49,8 +49,6 @@ pub(crate) struct LaneState {
     /// Lane 0's source `y` and `h` (`play/LaneRenderer.java:324-326`).
     y0: i32,
     h0: i32,
-    /// Where SUDDEN+'s lower edge sits at 0 %: the source's lane top.
-    cover_at: i32,
     timer: TimerRef,
     cond_src: String,
     window: Window,
@@ -61,17 +59,9 @@ pub(crate) struct LaneState {
 }
 
 impl LaneState {
-    /// The model's lanes: SUDDEN+ anchored at the source's lane top when
-    /// it maps, LIFT at the lanes' bottom when it maps.
+    /// The model's lanes.
     pub(crate) fn def(&self) -> LanesDef {
-        let mut def = self.def;
-        if def.parts.cover.is_some() {
-            def.cover_at = self.cover_at;
-        }
-        if def.parts.lift.is_some() {
-            def.lift_at = def.bottom;
-        }
-        def
+        self.def
     }
 }
 
@@ -464,17 +454,13 @@ impl Cx<'_> {
             .and_then(Q::round)
             .ok_or_else(|| range(self))?;
         let bottom = base.round().ok_or_else(|| range(self))?;
-        let cover_at = base
-            .sub(h_up)
-            .and_then(Q::round)
-            .ok_or_else(|| range(self))?;
         let i32_of = |cx: &Self, v: i128| i32::try_from(v).map_err(|_| range(cx));
-        let [top, line, bottom, cover_at] = [
+        let [top, line, bottom] = [
             i32_of(self, top)?,
             i32_of(self, line)?,
             i32_of(self, bottom)?,
-            i32_of(self, cover_at)?,
         ];
+        let region_top = base.sub(h_up).ok_or_else(|| range(self))?;
         // The source draws a note's lower edge `y` offset above the lifted
         // region's lower edge at its judgment time
         // (`play/LaneRenderer.java:521-524`). An offset that puts that note
@@ -553,8 +539,11 @@ impl Cx<'_> {
                 top,
                 line,
                 bottom,
-                cover_at: top,
-                lift_at: line,
+                // SUDDEN+ and LIFT set their own extents when they map.
+                cover_at: region_top.to_f32(),
+                cover_h: 0.0,
+                lift_at: source.bottom,
+                lift_h: 0.0,
                 note_h,
                 mine_h: note_h,
                 bar_h: bar_h.unwrap_or(1),
@@ -565,7 +554,6 @@ impl Cx<'_> {
             lane_span: span,
             y0,
             h0,
-            cover_at,
             timer: c.timer,
             cond_src: c.cond_src.clone(),
             window: window(&c.track),
@@ -818,20 +806,26 @@ impl Cx<'_> {
         let Some(l) = self.lanes.as_ref() else {
             return refuse(self, "offset");
         };
-        // Exactly over the lanes, its lower edge on their top.
+        // Exactly over the lanes, its lower edge on their top; the source
+        // moves it by an offset and draws it at its own height
+        // (`play/LaneRenderer.java:332-333`).
         let [xc, yc, wc, hc] = c.track.keys.first().map_or([0; 4], |k| k.rect);
         if !self.over_lanes(at, xc, wc)?
             || i64::from(yc) != i64::from(l.y0) + i64::from(l.h0)
-            || hc != l.h0
+            || hc <= 0
         {
             return refuse(self, "dst");
         }
+        let Some(cover_h) = Q::int(hc).mul(self.r) else {
+            return Err(self.range(at, "dst"));
+        };
         let Some((image, _)) = self.add_src_image(&c, rec, s, s.div)? else {
             return refuse(self, "src");
         };
         let kept_after = self.lanes.as_ref().is_some_and(|l| l.kept_after);
         if let Some(l) = self.lanes.as_mut() {
             l.def.parts.cover = Some(image);
+            l.def.cover_h = cover_h.to_f32();
         }
         self.lane_approx(at, part, LaneApprox::CoverAbove)?;
         if kept_after {
@@ -946,14 +940,17 @@ impl Cx<'_> {
         {
             return refuse(self, "dst");
         }
+        let Some(lift_h) = Q::int(hl).mul(self.r) else {
+            return Err(self.range(at, "dst"));
+        };
         let Some((image, _)) = self.add_src_image(&c, rec, &s, s.div)? else {
             return refuse(self, "src");
         };
         let kept_after = self.lanes.as_ref().is_some_and(|l| l.kept_after);
         if let Some(l) = self.lanes.as_mut() {
             l.def.parts.lift = Some(image);
+            l.def.lift_h = lift_h.to_f32();
         }
-        self.lane_approx(at, part, LaneApprox::LiftStretch)?;
         if kept_after {
             self.lane_approx(at, part, LaneApprox::CoverOrder)?;
         }

@@ -422,18 +422,15 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!((u.elements, u.keys, u.images), (4, 4, 4), "{name}");
                 assert!(i.scratch.is_some(), "{name}");
                 let d9 = |a| NoteKind::Deviation(DeviationId::D9(a));
-                for a in [
-                    LaneApprox::BarLine,
-                    LaneApprox::CoverAbove,
-                    LaneApprox::LiftStretch,
-                ] {
+                for a in [LaneApprox::BarLine, LaneApprox::CoverAbove] {
                     assert!(kinds(&i).contains(&d9(a)), "{name}: {a:?}");
                 }
                 assert!(kinds(&i).contains(&NoteKind::Deviation(DeviationId::D11)));
                 // At 500 ms the eleven notes from 1 s to 1.1 s are on
                 // screen, the last with its lower edge on the region's
-                // top; the covers are at 0.
-                assert_eq!(drawn, [0, 0, 11, 0], "{name}");
+                // top. SUDDEN+ at 0 shows the strip above the region in
+                // every frame; LIFT at 0 is not drawn.
+                assert_eq!(drawn, [1, 1, 12, 1], "{name}");
             }
             "judge" => {
                 // Seven grades, combos of slots 0, 1, 2 and 6 (slots 3-5

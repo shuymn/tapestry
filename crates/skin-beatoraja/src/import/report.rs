@@ -151,8 +151,6 @@ pub enum LaneApprox {
     /// k: what the skin draws between the notes and SUDDEN+ or LIFT is
     /// drawn above them.
     CoverOrder,
-    /// l: the LIFT image is stretched over the covered area.
-    LiftStretch,
 }
 
 /// What a note is about.

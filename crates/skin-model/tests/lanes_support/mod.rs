@@ -104,8 +104,10 @@ pub fn simple() -> LanesDef {
         top: 80,
         line: 880,
         bottom: 960,
-        cover_at: 80,
-        lift_at: 880,
+        cover_at: 80.0,
+        cover_h: 800.0,
+        lift_at: 880.0,
+        lift_h: 880.0,
         note_h: 16,
         mine_h: 8,
         bar_h: 2,
@@ -128,8 +130,8 @@ pub fn simple() -> LanesDef {
 /// The source player's lanes on the simple skin's columns, as an imported
 /// skin's: the source region's lower edge at 880 and 600 high, notes and
 /// mines 20 high; `top` half a note above the region (270), `line` a
-/// note's centre at its judgment time (870), SUDDEN+ anchored at the
-/// region's top (280) and LIFT at its bottom.
+/// note's centre at its judgment time (870), SUDDEN+ 600 high anchored at
+/// the region's top (280) and LIFT 200 high at its bottom.
 pub fn source() -> LanesDef {
     LanesDef {
         style: LaneStyle::Source(SourceLanes {
@@ -141,8 +143,10 @@ pub fn source() -> LanesDef {
         top: 270,
         line: 870,
         bottom: 880,
-        cover_at: 280,
-        lift_at: 880,
+        cover_at: 280.0,
+        cover_h: 600.0,
+        lift_at: 880.0,
+        lift_h: 200.0,
         note_h: 20,
         mine_h: 20,
         ..simple()
