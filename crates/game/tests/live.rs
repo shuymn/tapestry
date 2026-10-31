@@ -1452,7 +1452,7 @@ fn shown(rig: &Fake, at: i64) -> &ResultScreen {
 /// The summary a result screen shows, which must be ready.
 fn ready(screen: &ResultScreen) -> game::ViewSummary {
     match screen.status() {
-        ViewStatus::Ready(s) => *s,
+        ViewStatus::Ready(s) => s.clone(),
         other => panic!("{other:?}"),
     }
 }
@@ -2305,4 +2305,68 @@ fn a_standing_listing_failure_shows_on_result_entry() {
     };
     assert_eq!(e.path, dir.path().join("presets"));
     assert!(ready(&s).as_played);
+}
+
+/// G7 and the shared axis: a user preset of the played rules under another
+/// name is a what-if whose graphs and deviations equal the play's own,
+/// which are not empty; under `late`, whose final deadline comes later,
+/// each gauge is condensed on the as-played axis, not on its own.
+#[test]
+fn what_ifs_are_condensed_on_the_as_played_axis() {
+    let dir = tempfile::tempdir().unwrap();
+    write_named(dir.path(), "same", &rules::tapestry());
+    write_named(dir.path(), "late", &late());
+    let (loaded, report) = played(dir.path(), "tapestry");
+    let mut s = ResultScreen::new(&report, loaded.shelf(), &chart(), game::RECORDING_MEMORY);
+    let own = ready(&s);
+    assert!(own.as_played);
+    let played = report.result.as_ref().unwrap().evaluation.as_ref().unwrap();
+    let axis = s.axis().unwrap();
+    assert_eq!(
+        axis,
+        game::Axis {
+            origin: TimeUs(0),
+            end: played.final_deadline,
+        }
+    );
+    // The press and the miss moved the normal gauge.
+    assert_eq!(own.graphs.timing.samples(), 1);
+    let normal = own.graphs.traces[0].unwrap();
+    let start = rules::tapestry().gauges[0].start;
+    assert!(normal.columns.iter().any(|c| c.high > start));
+    assert!(normal.columns.iter().any(|c| c.low < c.high));
+
+    view(&mut s, &user("same"), &report);
+    let same = ready(&s);
+    assert!(!same.as_played);
+    assert_eq!(same.graphs, own.graphs);
+    assert_eq!(same.gauges, own.gauges);
+
+    view(&mut s, &user("late"), &report);
+    let at_late = ready(&s);
+    let preset = s.viewed().unwrap().preset.clone().unwrap();
+    let ctx = game::ResultContext {
+        record: report.record.as_ref().unwrap(),
+        chart: &chart(),
+        preset: &report.preset,
+        live: &report.live,
+    };
+    let r = game::ReEvaluate::under(&ctx, &preset).unwrap();
+    assert!(r.evaluation.final_deadline > axis.end);
+    let own_axis = game::Axis {
+        end: r.evaluation.final_deadline,
+        ..axis
+    };
+    for (i, g) in r.evaluation.gauges.iter().enumerate() {
+        let mut on_play = [normal.columns[0]; game::GRAPH_COLUMNS];
+        let mut on_own = on_play;
+        game::condense(g, axis, &mut on_play);
+        game::condense(g, own_axis, &mut on_own);
+        assert_eq!(at_late.graphs.traces[i].unwrap().columns, on_play);
+        // The normal gauge rose at the press, which the two axes put in
+        // different columns.
+        if i == 0 {
+            assert_ne!(on_play, on_own);
+        }
+    }
 }

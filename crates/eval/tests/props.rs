@@ -85,6 +85,23 @@ fn check_stream(e: &Evaluation) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// An evaluation's final deadline is its evaluator's, whether it completed
+/// or stopped at a finalized watermark before it.
+fn check_final_deadline(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
+    let i = &play.input;
+    let probe = Evaluator::new(
+        &play.chart,
+        &play.preset,
+        &i.device,
+        &i.start,
+        i.section.as_ref(),
+        0,
+    )
+    .map_err(|e| TestCaseError::fail(format!("probe: {e:?}")))?;
+    prop_assert_eq!(e.final_deadline, probe.final_deadline());
+    Ok(())
+}
+
 /// P1 for one schedule: the live run equals batch evaluation finalized at
 /// the terminal watermark, and, once that watermark is past every deadline
 /// and input, batch evaluation of the whole log.
@@ -98,6 +115,7 @@ fn check_live(play: &Play, delivery: &Delivery) -> Result<Live, TestCaseError> {
     };
     let batch = eval_ok(play, &at_t)?;
     check_stream(&batch)?;
+    check_final_deadline(play, &batch)?;
     prop_assert_eq!(run.watermarks.last(), Some(&t));
     prop_assert_eq!(&run.events, &batch.events);
     prop_assert_eq!(run.tally, batch.tally);
@@ -116,11 +134,57 @@ fn check_live(play: &Play, delivery: &Delivery) -> Result<Live, TestCaseError> {
     Ok(run)
 }
 
-/// P3 and P4 on one evaluation.
+/// P3 and P4 on one evaluation, and each history against the stream: one
+/// point per gauge event of its gauge, with its time and values, in time
+/// order (input stays judgeable after the final deadline, so a point can
+/// come after it), one per judgment, empty POOR and mine hit, the last
+/// one the end value, or the start value without any.
 fn check_gauges(preset: &RulePreset, e: &Evaluation) -> Result<(), TestCaseError> {
     prop_assert_eq!(preset.gauges.len(), e.gauges.len());
-    for (rule, g) in preset.gauges.iter().zip(&e.gauges) {
+    let changes = e
+        .events
+        .iter()
+        .filter(|ev| {
+            matches!(
+                ev.kind,
+                JudgeEventKind::Judged { .. }
+                    | JudgeEventKind::EmptyPoor { .. }
+                    | JudgeEventKind::MineHit { .. }
+            )
+        })
+        .count();
+    for (i, (rule, g)) in preset.gauges.iter().zip(&e.gauges).enumerate() {
         let bounded = rule.min..=rule.max;
+        prop_assert!(
+            bounded.contains(&g.start),
+            "{} start {:?}",
+            rule.id,
+            g.start
+        );
+        let stream: Vec<_> = e
+            .events
+            .iter()
+            .filter_map(|ev| match ev.kind {
+                JudgeEventKind::Gauge {
+                    gauge,
+                    value,
+                    reference,
+                } if gauge == i => Some((ev.time, value, reference)),
+                _ => None,
+            })
+            .collect();
+        let history: Vec<_> = g
+            .history
+            .iter()
+            .map(|p| (p.time, p.value, p.reference))
+            .collect();
+        prop_assert_eq!(&history, &stream);
+        prop_assert_eq!(history.len(), changes);
+        prop_assert!(g.history.windows(2).all(|w| w[0].time <= w[1].time));
+        match g.history.last() {
+            Some(p) => prop_assert_eq!((p.value, p.reference), (g.value, g.reference)),
+            None => prop_assert_eq!(g.value, g.start),
+        }
         let points = g
             .history
             .iter()
@@ -437,6 +501,7 @@ proptest! {
         check_play(&play)?;
         let whole = eval_ok(&play, &play.input)?;
         check_stream(&whole)?;
+        check_final_deadline(&play, &whole)?;
         check_gauges(&play.preset, &whole)?;
     }
 

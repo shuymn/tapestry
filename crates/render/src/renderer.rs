@@ -16,7 +16,7 @@ use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
 use crate::simple::layout::{HEIGHT, WIDTH};
-use crate::simple::text_screen;
+use crate::simple::{result_screen, text_screen};
 use crate::text::MenuText;
 use crate::{FrameInput, PlaySkin, SimpleSkin, SkinError, Sprite, SpriteBatch};
 
@@ -402,6 +402,25 @@ impl Renderer {
         let start = Instant::now();
         self.batch.clear();
         text_screen(lines, &mut self.batch);
+        self.batch.stage(&mut self.staging);
+        self.draw(start, None)
+    }
+
+    /// Draws the result screen: `lines` in the bitmap font and, with
+    /// `graphs`, the gauge graph and the deviation histogram under them
+    /// ([`result_screen`]), as [`frame`](Self::frame) draws.
+    ///
+    /// # Errors
+    ///
+    /// As [`frame`](Self::frame).
+    pub fn result_frame(
+        &mut self,
+        lines: &[String],
+        graphs: Option<&game::ResultGraphs>,
+    ) -> Result<FrameTiming, RenderError> {
+        let start = Instant::now();
+        self.batch.clear();
+        result_screen(lines, graphs, &mut self.batch);
         self.batch.stage(&mut self.staging);
         self.draw(start, None)
     }

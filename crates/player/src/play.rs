@@ -29,7 +29,8 @@ use crate::measure::{
     AudioBase, Figures, PlayMeasure, Step, StepSample, judgment_samples, limits_line, measure_path,
     process_page_faults, to_toml,
 };
-use crate::render_side::{RenderEnd, RenderLink, RenderMsg, ScreenError};
+use crate::render_side::{EndPage, RenderEnd, RenderLink, RenderMsg, ScreenError};
+
 use crate::result_input::ResultInput;
 use crate::tuning::{Delivered, SettingsFiles};
 
@@ -87,9 +88,9 @@ pub struct PlayerRig<'a> {
     pub files: SettingsFiles,
     /// The settings keys' values last acted on.
     pub seen: Delivered,
-    /// The end screen's summary, while it shows; the settings lines are
-    /// added each time it is drawn.
-    pub end_lines: Option<Vec<String>>,
+    /// The end screen's page while it shows: the summary's lines and the
+    /// view's graphs; the settings lines are added each time it is sent.
+    pub end_page: Option<EndPage>,
     /// The end screen's key names.
     pub hints: Hints,
     /// The result screen's input.
@@ -225,12 +226,12 @@ impl PlayerRig<'_> {
         self.send_end(t);
     }
 
+    /// Hands the end screen's page, with the settings lines of `t` and the
+    /// view's graphs, to the render thread, while the end screen shows.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn send_end(&self, t: Tuning) {
-        if let Some(lines) = &self.end_lines {
-            let mut all = lines.clone();
-            all.extend(end_screen::settings_lines(t));
-            self.render.send(RenderMsg::Text(all));
+        if let Some(base) = &self.end_page {
+            self.render.show_end(end_screen::with_settings(base, t));
         }
     }
 
@@ -459,7 +460,7 @@ impl Rig for PlayerRig<'_> {
         self.retry_from = self.pending_retry.take();
         #[cfg(feature = "dev-tools")]
         self.scenario_pending();
-        self.render.prepare()
+        prepare_render(&mut self.end_page, &self.render)
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
@@ -628,7 +629,6 @@ impl Rig for PlayerRig<'_> {
         // with the input offset it starts with (design.md "Offset Changes and
         // the Watermark"); the other values are recorded as they are at the
         // start.
-        self.end_lines = None;
         self.result_input.release();
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
@@ -676,16 +676,20 @@ impl Rig for PlayerRig<'_> {
             steady_underruns: 0,
             next: end_screen::next_queue(self.queue.periods(), self.queue_most),
         });
-        self.end_lines = Some(end_screen::lines(
-            report,
-            screen,
-            self.input_offset_us,
-            self.times,
-            queue,
-            &self.hints,
-            self.autoplay,
-        ));
+        self.end_page = Some(EndPage {
+            lines: end_screen::lines(
+                report,
+                screen,
+                self.input_offset_us,
+                self.times,
+                queue,
+                &self.hints,
+                self.autoplay,
+            ),
+            graphs: end_screen::view_graphs(screen),
+        });
         self.send_end(tuning.get());
+
         self.result_shown();
         #[cfg(feature = "dev-tools")]
         for a in self.adjust_on_end.drain(..) {
@@ -699,6 +703,19 @@ impl Rig for PlayerRig<'_> {
             self.end_shown = Some(std::time::Instant::now());
         }
     }
+}
+
+/// Readies the screen for a play: the end screen, if it shows, is left
+/// first (a retry), its page and the render thread's slot emptied before
+/// the preparation's handshake, so no page of the result is drawn after,
+/// even one that waited while the render thread was behind.
+pub(crate) fn prepare_render(
+    end_page: &mut Option<EndPage>,
+    render: &RenderLink,
+) -> Result<(), ScreenError> {
+    *end_page = None;
+    render.clear_end();
+    render.prepare()
 }
 
 #[cfg(test)]

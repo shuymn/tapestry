@@ -5,7 +5,7 @@ use bms_model::{Chart, TimeUs};
 use eval::{EvalError, Evaluation, JudgeEvent, JudgeEventKind};
 use replay::PlayRecord;
 use replay::verify::ReEvaluation;
-use rules::{Implementation, RulePreset};
+use rules::{Implementation, Judgment, RulePreset};
 
 /// What a result extension reads at the end of a play.
 #[derive(Clone, Copy, Debug)]
@@ -129,19 +129,27 @@ impl ResultExtension for ReEvaluate {
     }
 }
 
+/// The judged presses of `events`, each with its judgment and its press
+/// deviation (press − note): every judgment that carries a deviation, a
+/// long note once, at its judgment, by its head's deviation. Misses, notes
+/// a press passed, empty POORs and the feedback of a held head carry none.
+/// The recommended offset and the result's early/late counts read these.
+pub fn press_deviations(events: &[JudgeEvent]) -> impl Iterator<Item = (Judgment, TimeUs)> {
+    events.iter().filter_map(|e| match e.kind {
+        JudgeEventKind::Judged {
+            judgment,
+            deviation: Some(d),
+            ..
+        } => Some((judgment, d)),
+        _ => None,
+    })
+}
+
 /// The median and interquartile spread of the judged presses' deviations,
 /// once there are [`MIN_OFFSET_SAMPLES`] of them. The quartiles are the
 /// sorted values at `n / 4`, `n / 2` and `3n / 4`.
 fn recommend(events: &[JudgeEvent]) -> Option<RecommendedOffset> {
-    let mut d: Vec<i64> = events
-        .iter()
-        .filter_map(|e| match e.kind {
-            JudgeEventKind::Judged {
-                deviation: Some(d), ..
-            } => Some(d.0),
-            _ => None,
-        })
-        .collect();
+    let mut d: Vec<i64> = press_deviations(events).map(|(_, d)| d.0).collect();
     let n = d.len();
     if n < MIN_OFFSET_SAMPLES {
         return None;

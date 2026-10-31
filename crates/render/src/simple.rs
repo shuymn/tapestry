@@ -16,6 +16,7 @@
 
 use bms_model::{Chart, LANE_COUNT, Lane, Note, NoteKind, Position, ScrollMap, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind, Section};
+use game::ResultGraphs;
 use rules::{GaugeValue, Judgment};
 
 use crate::atlas::{GLYPH_H, GLYPH_W, glyph_uv, solid_uv};
@@ -690,6 +691,236 @@ pub fn text_screen(lines: &[&str], out: &mut SpriteBatch) {
             return;
         }
         text(out, SCREEN_LEFT, y, SCREEN_SCALE, TEXT, line.as_bytes());
+    }
+}
+
+/// Left edge and top of the result screen's first line, the scale of its
+/// glyphs and the distance between its lines: the measurement overlay's
+/// size, so 27 lines end above the graphs.
+const RESULT_SCALE: f32 = 3.0;
+const RESULT_LINE: f32 = 28.0;
+
+/// The result screen's row of the first gauge cell; each row holds two,
+/// the second [`RESULT_CELL_COLUMN`] columns in.
+pub const RESULT_GAUGE_ROW: usize = 13;
+/// The column of a gauge row's second cell.
+pub const RESULT_CELL_COLUMN: usize = 39;
+
+/// The graphs' band, in layout pixels.
+const BAND_TOP: f32 = 860.0;
+const BAND_BOTTOM: f32 = 1040.0;
+const BAND_H: f32 = BAND_BOTTOM - BAND_TOP;
+/// The gauge graph: 4 px a column from x = 80.
+const GRAPH_LEFT: f32 = 80.0;
+const GRAPH_COLUMN_W: f32 = 4.0;
+/// The deviation histogram: 8 px a bar from x = 1280, the count before
+/// the bins, the 64 bins, then the count after them.
+const HISTOGRAM_LEFT: f32 = 1280.0;
+const BAR_W: f32 = 8.0;
+/// The scale of the histogram's labels.
+const LABEL_SCALE: f32 = 2.0;
+/// The side of a gauge cell's colour square.
+const LEGEND_SIDE: f32 = 12.0;
+
+const BAND_BG: Rgba = [0.07, 0.07, 0.08, 1.0];
+const NO_INPUT: Rgba = [0.45, 0.45, 0.45, 0.8];
+const FAILED: Rgba = [1.0, 0.25, 0.25, 1.0];
+const EARLY: Rgba = [0.35, 0.6, 1.0, 1.0];
+const LATE: Rgba = [1.0, 0.55, 0.25, 1.0];
+const CENTER: Rgba = [0.6, 0.6, 0.6, 1.0];
+/// A listed gauge's colour, by its slot.
+const TRACE: [Rgba; game::SHOWN_GAUGES] = [
+    [0.3, 0.85, 0.35, 1.0],
+    [1.0, 0.4, 0.4, 1.0],
+    [0.35, 0.6, 1.0, 1.0],
+    [1.0, 0.85, 0.3, 1.0],
+    [0.8, 0.45, 1.0, 1.0],
+    [0.3, 0.9, 0.9, 1.0],
+];
+/// How much of its colour a gauge that is not emphasized keeps.
+const DIM: f32 = 0.5;
+
+/// The colour of the gauge in `slot`, dimmed unless it is emphasized.
+fn trace_color(slot: usize, emphasized: bool) -> Rgba {
+    let [r, g, b, a] = TRACE.get(slot).copied().unwrap_or(TEXT);
+    if emphasized {
+        [r, g, b, a]
+    } else {
+        [r * DIM, g * DIM, b * DIM, a]
+    }
+}
+
+/// The result screen (design.md "Play Lifecycle"): its lines, glyphs
+/// 15×21 one every 28 layout pixels from the top left, stopping above the
+/// graphs; with `graphs`, a colour square left of each listed gauge's
+/// cell, the gauge graph bottom left and the deviation histogram bottom
+/// right ([`result_graphs`]).
+pub fn result_screen(
+    lines: &[impl AsRef<str>],
+    graphs: Option<&ResultGraphs>,
+    out: &mut SpriteBatch,
+) {
+    let glyph_h = GLYPH_H as f32 * RESULT_SCALE;
+    for (i, line) in lines.iter().enumerate() {
+        let y = SCREEN_TOP + i as f32 * RESULT_LINE;
+        if y + glyph_h > BAND_TOP {
+            break;
+        }
+        text(
+            out,
+            SCREEN_LEFT,
+            y,
+            RESULT_SCALE,
+            TEXT,
+            line.as_ref().as_bytes(),
+        );
+    }
+    if let Some(g) = graphs {
+        result_graphs(g, out);
+    }
+}
+
+/// The graphs under a result's text: a colour square left of each listed
+/// gauge's cell; the gauge graph, a column from each column's lowest to
+/// its highest value, the emphasized gauge last and wider with its clear
+/// or failure line, a tick where a survival gauge failed, a dim line where
+/// a what-if's input ends, and nothing from the column the evaluation did
+/// not reach; and the histogram of the press deviations, early bars and
+/// late bars either side of 0 ms. Allocates nothing.
+pub fn result_graphs(g: &ResultGraphs, out: &mut SpriteBatch) {
+    let advance = (GLYPH_W + 1) as f32 * RESULT_SCALE;
+    let graph_w = game::GRAPH_COLUMNS as f32 * GRAPH_COLUMN_W;
+    rect(
+        out,
+        Blend::Alpha,
+        GRAPH_LEFT,
+        BAND_TOP,
+        graph_w,
+        BAND_H,
+        BAND_BG,
+    );
+    let bars = game::TIMING_BINS + 2;
+    rect(
+        out,
+        Blend::Alpha,
+        HISTOGRAM_LEFT,
+        BAND_TOP,
+        bars as f32 * BAR_W,
+        BAND_H,
+        BAND_BG,
+    );
+    let top = g.top.0.max(1) as f32;
+    let y_of = |v: GaugeValue| BAND_BOTTOM - v.0.clamp(0, g.top.0) as f32 / top * BAND_H;
+    let reached = usize::from(g.reached).min(game::GRAPH_COLUMNS);
+    let emphasized = g.emphasized.map(usize::from);
+    for (slot, trace) in g.traces.iter().enumerate() {
+        if trace.is_none() {
+            continue;
+        }
+        let row = RESULT_GAUGE_ROW + slot / 2;
+        let column = slot % 2 * RESULT_CELL_COLUMN;
+        let x = SCREEN_LEFT + column as f32 * advance - LEGEND_SIDE - 3.0;
+        let y = SCREEN_TOP + row as f32 * RESULT_LINE + 4.0;
+        let color = trace_color(slot, true);
+        rect(out, Blend::Alpha, x, y, LEGEND_SIDE, LEGEND_SIDE, color);
+    }
+    // The emphasized gauge last, over the others.
+    let order = (0..game::SHOWN_GAUGES)
+        .filter(|&s| Some(s) != emphasized)
+        .chain(emphasized);
+    for slot in order {
+        let Some(Some(trace)) = g.traces.get(slot) else {
+            continue;
+        };
+        let bold = Some(slot) == emphasized;
+        let color = trace_color(slot, bold);
+        let (w, min_h) = if bold {
+            (GRAPH_COLUMN_W, 3.0)
+        } else {
+            (2.0, 2.0)
+        };
+        if bold {
+            let line = match trace.mark {
+                rules::GaugeKind::EndThreshold { clear } => clear,
+                rules::GaugeKind::Survival { fails_below } => fails_below,
+            };
+            let [r, gr, b, _] = color;
+            let width = reached as f32 * GRAPH_COLUMN_W;
+            rect(
+                out,
+                Blend::Alpha,
+                GRAPH_LEFT,
+                y_of(line) - 0.5,
+                width,
+                1.0,
+                [r, gr, b, 0.6],
+            );
+        }
+        for (c, col) in trace.columns.iter().take(reached).enumerate() {
+            let x = GRAPH_LEFT + c as f32 * GRAPH_COLUMN_W + (GRAPH_COLUMN_W - w) / 2.0;
+            let (y0, y1) = (y_of(col.high), y_of(col.low));
+            let h = (y1 - y0).max(min_h);
+            rect(out, Blend::Alpha, x, y1 - h, w, h, color);
+        }
+        if let Some(f) = trace.failed.filter(|&f| usize::from(f) < reached) {
+            let x = GRAPH_LEFT + f32::from(f) * GRAPH_COLUMN_W;
+            rect(out, Blend::Alpha, x, BAND_TOP, 2.0, BAND_H, FAILED);
+        }
+    }
+    if let Some(n) = g.no_input_from.filter(|&n| usize::from(n) < reached) {
+        let x = GRAPH_LEFT + f32::from(n) * GRAPH_COLUMN_W;
+        rect(out, Blend::Alpha, x, BAND_TOP, 2.0, BAND_H, NO_INPUT);
+    }
+    timing(&g.timing, out);
+}
+
+/// The histogram of `t`: the count before the bins, each bin, the count
+/// after them, as bars up to the largest count, and the 0 ms line with
+/// the labels −64, 0 and +64 under it. Without a press, only the line and
+/// the labels.
+fn timing(t: &game::Timing, out: &mut SpriteBatch) {
+    let counts = || {
+        std::iter::once(t.earlier)
+            .chain(t.bins.iter().copied())
+            .chain(std::iter::once(t.later))
+    };
+    let most = counts().max().unwrap_or(0);
+    let half = game::TIMING_BINS / 2 + 1;
+    if most > 0 {
+        for (i, n) in counts().enumerate().filter(|&(_, n)| n > 0) {
+            let h = (n as f32 / most as f32 * BAND_H).max(1.0);
+            let color = if i < half { EARLY } else { LATE };
+            let x = HISTOGRAM_LEFT + i as f32 * BAR_W;
+            rect(
+                out,
+                Blend::Alpha,
+                x + 1.0,
+                BAND_BOTTOM - h,
+                BAR_W - 2.0,
+                h,
+                color,
+            );
+        }
+    }
+    let center = HISTOGRAM_LEFT + half as f32 * BAR_W;
+    rect(
+        out,
+        Blend::Alpha,
+        center - 1.0,
+        BAND_TOP,
+        2.0,
+        BAND_H,
+        CENTER,
+    );
+    let y = BAND_BOTTOM + 6.0;
+    let last = HISTOGRAM_LEFT + (game::TIMING_BINS + 1) as f32 * BAR_W;
+    for (x, label) in [
+        (HISTOGRAM_LEFT + BAR_W, &b"-64"[..]),
+        (center, b"0"),
+        (last, b"+64"),
+    ] {
+        let w = text_width(label.len(), LABEL_SCALE);
+        text(out, x - w / 2.0, y, LABEL_SCALE, TEXT, label);
     }
 }
 
@@ -1621,5 +1852,165 @@ mod tests {
         assert_eq!(fade(TimeUs(600), TimeUs(100), 1_000), Some(0.5));
         assert_eq!(fade(TimeUs(1_100), TimeUs(100), 1_000), None);
         assert_eq!(fade(TimeUs(50), TimeUs(100), 1_000), Some(1.0));
+    }
+
+    /// A graph of `listed` gauges, each column of slot `s` from `s` % to
+    /// `s + 10` %, the gauge in `emphasized` emphasized, up to `reached`.
+    fn graphs(listed: usize, emphasized: Option<u8>, reached: u16) -> ResultGraphs {
+        let mut g = ResultGraphs::EMPTY;
+        for (s, slot) in g.traces.iter_mut().take(listed).enumerate() {
+            let pct = |n: usize| GaugeValue(i64::try_from(n).unwrap() * GaugeValue::PERCENT);
+            *slot = Some(game::GaugeTrace {
+                gauge: u16::try_from(s).unwrap(),
+                columns: [game::GaugeColumn {
+                    low: pct(s),
+                    high: pct(s + 10),
+                    last: pct(s + 10),
+                }; game::GRAPH_COLUMNS],
+                mark: rules::GaugeKind::Survival {
+                    fails_below: GaugeValue::EMPTY,
+                },
+                failed: None,
+            });
+        }
+        g.emphasized = emphasized;
+        g.reached = reached;
+        g
+    }
+
+    /// The trace sprites of `batch`: inside the graph's x range and its
+    /// band, narrower than a column or a column wide.
+    fn trace_rects(batch: &SpriteBatch) -> Vec<Sprite> {
+        batch
+            .alpha()
+            .iter()
+            .filter(|s| {
+                let [x, y, w, h] = s.rect;
+                (GRAPH_LEFT..GRAPH_LEFT + 288.0 * GRAPH_COLUMN_W).contains(&x)
+                    && y >= BAND_TOP - 2.0
+                    && y + h <= BAND_BOTTOM + 0.01
+                    && w <= GRAPH_COLUMN_W
+                    && h < BAND_H
+            })
+            .copied()
+            .collect()
+    }
+
+    /// R1: one sprite per drawn column per listed gauge, from its highest
+    /// to its lowest value, none from the column the evaluation did not
+    /// reach, the emphasized gauge last and a column wide.
+    #[test]
+    fn result_graph_draws_a_rect_per_column_per_gauge() {
+        let mut batch = SpriteBatch::with_capacity(8_192);
+        result_graphs(&graphs(3, Some(1), 100), &mut batch);
+        let traces = trace_rects(&batch);
+        assert_eq!(traces.len(), 3 * 100);
+        // Slot 1, emphasized, last: its columns are 4 px wide, from 11 %
+        // down to 1 % of the 100 % scale.
+        let last = &traces[200..];
+        assert!(
+            last.iter()
+                .all(|s| s.rect[2] == GRAPH_COLUMN_W && s.color == TRACE[1])
+        );
+        let per_pct = BAND_H / 100.0;
+        let [x, y, _, h] = last[99].rect;
+        assert_eq!(x, GRAPH_LEFT + 99.0 * GRAPH_COLUMN_W);
+        assert!((y - (BAND_BOTTOM - 11.0 * per_pct)).abs() < 0.01, "{y}");
+        assert!((h - 10.0 * per_pct).abs() < 0.01, "{h}");
+        // The others are thinner and dimmed, and none reaches column 100.
+        assert!(traces[..200].iter().all(|s| s.rect[2] < GRAPH_COLUMN_W));
+        assert!(
+            traces
+                .iter()
+                .all(|s| s.rect[0] < GRAPH_LEFT + 100.0 * GRAPH_COLUMN_W)
+        );
+        // Nothing reached: no trace at all.
+        let mut batch = SpriteBatch::with_capacity(8_192);
+        result_graphs(&graphs(3, Some(1), 0), &mut batch);
+        assert!(trace_rects(&batch).is_empty());
+    }
+
+    /// A failed survival gauge gets a tick in its column, a what-if's input
+    /// end a dim line; a histogram without presses draws only its 0 ms
+    /// line and labels; with presses, a bar per nonzero count, the largest
+    /// the band's height.
+    #[test]
+    fn result_graph_marks_failure_input_end_and_presses() {
+        let mut g = graphs(2, Some(0), 288);
+        if let Some(t) = g.traces[1].as_mut() {
+            t.failed = Some(40);
+        }
+        g.no_input_from = Some(250);
+        let mut batch = SpriteBatch::with_capacity(8_192);
+        result_graphs(&g, &mut batch);
+        let tall = |color: Rgba, x: f32| {
+            batch
+                .alpha()
+                .iter()
+                .any(|s| s.color == color && s.rect[0] == x && s.rect[3] == BAND_H)
+        };
+        assert!(tall(FAILED, GRAPH_LEFT + 40.0 * GRAPH_COLUMN_W));
+        assert!(tall(NO_INPUT, GRAPH_LEFT + 250.0 * GRAPH_COLUMN_W));
+        let bars = |batch: &SpriteBatch| {
+            batch
+                .alpha()
+                .iter()
+                .filter(|s| s.color == EARLY || s.color == LATE)
+                .map(|s| s.rect)
+                .collect::<Vec<_>>()
+        };
+        assert!(bars(&batch).is_empty());
+        let center = HISTOGRAM_LEFT + 33.0 * BAR_W;
+        assert!(tall(CENTER, center - 1.0));
+        g.timing.bins[31] = 4;
+        g.timing.bins[32] = 2;
+        g.timing.later = 1;
+        let mut batch = SpriteBatch::with_capacity(8_192);
+        result_graphs(&g, &mut batch);
+        let b = bars(&batch);
+        assert_eq!(b.len(), 3);
+        assert_eq!(
+            b[0],
+            [
+                HISTOGRAM_LEFT + 32.0 * BAR_W + 1.0,
+                BAND_TOP,
+                BAR_W - 2.0,
+                BAND_H
+            ]
+        );
+        assert_eq!(b[1][3], BAND_H / 2.0);
+        assert_eq!(b[2][0], HISTOGRAM_LEFT + 65.0 * BAR_W + 1.0);
+    }
+
+    /// The worst page: six gauges, each failed, an input end, every bin
+    /// pressed, and 27 lines of 76 glyphs, the text stopping above the
+    /// graphs; it fits the renderer's batch with room left.
+    #[test]
+    fn a_full_result_page_drops_no_sprite() {
+        let mut g = graphs(6, Some(5), 288);
+        for t in g.traces.iter_mut().flatten() {
+            t.failed = Some(10);
+        }
+        g.no_input_from = Some(200);
+        g.timing.bins = [1; game::TIMING_BINS];
+        g.timing.earlier = 1;
+        g.timing.later = 1;
+        let lines = vec!["W".repeat(76); 27];
+        let mut batch = SpriteBatch::with_capacity(crate::MAX_SPRITES);
+        result_screen(&lines, Some(&g), &mut batch);
+        assert_eq!(batch.dropped(), 0);
+        let glyphs = batch
+            .alpha()
+            .iter()
+            .filter(|s| s.uv == glyph_uv(b'W'))
+            .collect::<Vec<_>>();
+        assert_eq!(glyphs.len(), 27 * 76);
+        let lowest = glyphs
+            .iter()
+            .map(|s| s.rect[1] + s.rect[3])
+            .fold(0.0, f32::max);
+        assert!(lowest <= BAND_TOP, "{lowest}");
+        println!("indicator: worst result page {} sprites", batch.len());
+        assert!(batch.len() < 4_000, "{}", batch.len());
     }
 }

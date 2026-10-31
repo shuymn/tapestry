@@ -3,7 +3,8 @@
 //! preallocated [`SpriteBatch`], with effects, and the staging of the batch
 //! into instances. `Renderer::build` runs the same function before
 //! `Renderer::submit` calls into wgpu, whose own allocations are out of
-//! scope, so the test drives it without a GPU.
+//! scope, so the test drives it without a GPU. The result screen's page,
+//! drawn every frame while it shows, allocates nothing either.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -186,9 +187,42 @@ fn frame_does_not_allocate_after_warmup() {
             drawn += staging.len();
         }
     }
+    let allocs = ALLOCS.swap(0, Ordering::Relaxed);
+    // The result screen's page, its graphs at their fullest, allocates
+    // nothing either: built from lines already made and graphs held.
+    let mut graphs = game::ResultGraphs::EMPTY;
+    graphs.traces.fill(Some(game::GaugeTrace {
+        gauge: 0,
+        columns: [game::GaugeColumn {
+            low: rules::GaugeValue(0),
+            high: rules::GaugeValue::FULL,
+            last: rules::GaugeValue::FULL,
+        }; game::GRAPH_COLUMNS],
+        mark: rules::GaugeKind::Survival {
+            fails_below: rules::GaugeValue(1),
+        },
+        failed: Some(100),
+    }));
+    graphs.emphasized = Some(2);
+    graphs.no_input_from = Some(200);
+    graphs.timing.bins = [3; game::TIMING_BINS];
+    let lines: Vec<String> = TRACK.with(|t| {
+        t.set(false);
+        let lines = vec!["RESULT".repeat(12); 27];
+        t.set(true);
+        lines
+    });
+    for _ in 0..3 {
+        batch.clear();
+        render::result_screen(&lines, Some(&graphs), &mut batch);
+        batch.stage(&mut staging);
+        assert!(staging.len() > 27 * 60);
+    }
+    let result_allocs = ALLOCS.load(Ordering::Relaxed);
     TRACK.with(|t| t.set(false));
-    let allocs = ALLOCS.load(Ordering::Relaxed);
+    assert_eq!(result_allocs, 0, "the result page allocated");
     assert_eq!(next, taps.len(), "every tap judged");
+
     assert!(drawn > 0);
     assert_eq!((held, ended), (7, 7), "every long note held and finished");
     assert_eq!(allocs, 0);

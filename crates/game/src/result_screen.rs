@@ -8,7 +8,10 @@
 //! - **Landing** on an entry resolves its status: the play's own summary
 //!   for the record's hash, a cached summary, a file that never loaded, an
 //!   evaluation over the budget, or else an evaluation now, on the caller's
-//!   thread, condensed into a [`ViewSummary`] and cached.
+//!   thread, condensed into a [`ViewSummary`] and cached, the least
+//!   recently viewed summary evicted first when the cache is full.
+//! - **Graphs** of every view are condensed on one time axis, fixed when
+//!   the screen is built ([`Axis`]).
 //! - **A sync** with the shelf, when its revision moved, rebuilds the
 //!   entries, works out what changed for each by comparing the two
 //!   snapshots, keeps the latest notices, and lands the view again on its
@@ -21,7 +24,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bms_model::Chart;
+use bms_model::{Chart, TimeUs};
 use eval::{Evaluation, Tally};
 use replay::PlayRecord;
 use replay::verify::Coverage;
@@ -29,6 +32,7 @@ use rules::{GaugeValue, RulePreset};
 use rules_toml::PresetFileError;
 
 use crate::presets::Shelf;
+use crate::result_graphs::{Axis, ResultGraphs, listed};
 use crate::results::{ReEvaluate, ReEvaluationError, ResultContext};
 use crate::session::PlayReport;
 
@@ -72,56 +76,100 @@ pub struct ViewEntry {
     pub error: Option<PresetFileError>,
 }
 
-/// A gauge at the end of a view's evaluation.
+/// A listed gauge at the end of a view's evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GaugeEnd {
+    /// Its index in the viewed preset.
+    pub gauge: u16,
     /// Its value.
     pub value: GaugeValue,
     /// Whether it is cleared.
     pub cleared: bool,
+    /// When a survival gauge failed, if it did.
+    pub failed_at: Option<TimeUs>,
+    /// It started at its start value, the practice record holding no
+    /// value it accepts.
+    pub started_at_default: bool,
 }
 
-/// What a view shows of the play under one preset: the totals, the first
-/// gauges and what the input covers. About 100 bytes, whatever the play.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The bytes a [`ViewSummary`] holds on the heap: its graphs' one
+/// allocation, the reference counts included. The same for every play.
+pub const SUMMARY_BYTES: usize = size_of::<ArcBlock>();
+
+/// The layout of an `Arc<ResultGraphs>`'s allocation: two counts, then
+/// the value.
+#[expect(dead_code, reason = "measured for its size only")]
+struct ArcBlock {
+    strong: usize,
+    weak: usize,
+    value: ResultGraphs,
+}
+
+/// What a view shows of the play under one preset: the totals, the listed
+/// gauges, what the input covers, the gauges' graphs and the deviations.
+/// [`SUMMARY_BYTES`] on the heap and a fixed size inline, whatever the
+/// play.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewSummary {
     /// Counts, EX score, BP, max combo and empty POORs.
     pub tally: Tally,
-    /// The first [`SHOWN_GAUGES`] gauges, in the preset's order.
+    /// The listed gauges, in the list's order
+    /// ([`listed`](crate::result_graphs::listed)): the preset's first six,
+    /// or its first five with the emphasized one in the fifth slot when it
+    /// is not among them.
     pub gauges: [Option<GaugeEnd>; SHOWN_GAUGES],
-    /// How many gauges are not shown.
+    /// How many gauges are not listed.
     pub more_gauges: u16,
     /// What the recorded input covers.
     pub coverage: Coverage,
     /// Whether this is the play as it was judged.
     pub as_played: bool,
-    /// A bit per shown gauge: it started at its start value, the practice
-    /// record holding no value it accepts.
-    pub started_at_default: u8,
+    /// The listed gauges' graphs and the press deviations.
+    pub graphs: Arc<ResultGraphs>,
 }
 
 impl ViewSummary {
-    fn of(e: &Evaluation, coverage: Coverage, as_played: bool, defaults: &[bool]) -> Self {
+    /// The summary of `e`, evaluated under `preset`, on `axis`: `defaults`
+    /// says per gauge whether it started at its start value (empty for a
+    /// full play), and the gauge of ID `displayed`, if the preset has one,
+    /// is emphasized, or else the preset's first. Allocates only the
+    /// graphs, [`SUMMARY_BYTES`].
+    #[must_use]
+    pub fn of(
+        e: &Evaluation,
+        preset: &RulePreset,
+        axis: Axis,
+        coverage: Coverage,
+        as_played: bool,
+        defaults: &[bool],
+        displayed: Option<&str>,
+    ) -> Self {
+        let count = e.gauges.len().min(preset.gauges.len());
+        let emphasized = (count > 0).then(|| {
+            displayed
+                .and_then(|id| preset.gauges.iter().take(count).position(|g| g.id == id))
+                .unwrap_or(0)
+        });
+        let (list, n) = listed(count, emphasized);
+        let list = list.get(..n).unwrap_or_default();
         let mut gauges = [None; SHOWN_GAUGES];
-        for (slot, g) in gauges.iter_mut().zip(&e.gauges) {
-            *slot = Some(GaugeEnd {
+        for (slot, &i) in gauges.iter_mut().zip(list) {
+            *slot = e.gauges.get(i).map(|g| GaugeEnd {
+                gauge: u16::try_from(i).unwrap_or(u16::MAX),
                 value: g.value,
                 cleared: g.cleared,
+                failed_at: g.failed_at,
+                started_at_default: defaults.get(i).copied().unwrap_or(false),
             });
         }
-        let started_at_default = defaults
-            .iter()
-            .take(SHOWN_GAUGES)
-            .enumerate()
-            .fold(0_u8, |bits, (i, &d)| bits | (u8::from(d) << i));
+        let graphs = ResultGraphs::of(e, &preset.gauges, list, emphasized, axis, coverage);
         Self {
             tally: e.tally,
             gauges,
-            more_gauges: u16::try_from(e.gauges.len().saturating_sub(SHOWN_GAUGES))
-                .unwrap_or(u16::MAX),
+            more_gauges: u16::try_from(e.gauges.len().saturating_sub(n)).unwrap_or(u16::MAX),
             coverage,
             as_played,
-            started_at_default,
+            graphs: Arc::new(graphs),
         }
     }
 }
@@ -195,6 +243,12 @@ pub struct ResultScreen {
     played: [u8; 32],
     /// The play's own summary; `None` without a record.
     own: Option<Result<ViewSummary, ReEvaluationError>>,
+    /// The time axis every view is condensed on: from the play's start to
+    /// the as-played final deadline, or, when the play has no own
+    /// evaluation, the first what-if's.
+    axis: Option<Axis>,
+    /// The ID of the gauge the play displayed.
+    displayed: Option<String>,
     cache: Vec<Cached>,
     uses: u64,
     landed: Landed,
@@ -214,6 +268,24 @@ impl ResultScreen {
             .record
             .as_ref()
             .map_or_else(|| replay::preset_hash(&report.preset), |r| r.preset.sha256);
+        let displayed = report
+            .preset
+            .gauges
+            .get(report.displayed_gauge.0)
+            .map(|g| g.id.clone());
+        let origin = report
+            .record
+            .as_ref()
+            .and_then(|r| r.play_type.practice())
+            .map_or(TimeUs(0), |p| p.start);
+        let axis = report
+            .result
+            .as_ref()
+            .and_then(|s| s.evaluation.as_ref().ok())
+            .map(|e| Axis {
+                origin,
+                end: e.final_deadline,
+            });
         let own = report
             .record
             .as_ref()
@@ -226,7 +298,21 @@ impl ResultScreen {
                 };
                 s.evaluation
                     .as_ref()
-                    .map(|e| ViewSummary::of(e, coverage, true, &[]))
+                    .map(|e| {
+                        let axis = Axis {
+                            origin,
+                            end: e.final_deadline,
+                        };
+                        ViewSummary::of(
+                            e,
+                            &report.preset,
+                            axis,
+                            coverage,
+                            true,
+                            &[],
+                            displayed.as_deref(),
+                        )
+                    })
                     .map_err(Clone::clone)
             });
         let mut screen = Self {
@@ -236,6 +322,8 @@ impl ResultScreen {
             listing_error: shelf.listing_error().cloned(),
             played,
             own,
+            axis,
+            displayed,
             cache: Vec::new(),
             uses: 0,
             landed: Landed::Nothing,
@@ -328,6 +416,13 @@ impl ResultScreen {
     #[must_use]
     pub const fn last_evaluation(&self) -> Option<Duration> {
         self.last_evaluation
+    }
+
+    /// The time axis every view is condensed on, once any evaluation
+    /// fixed it.
+    #[must_use]
+    pub const fn axis(&self) -> Option<Axis> {
+        self.axis
     }
 
     /// How many summaries are cached.
@@ -501,6 +596,18 @@ impl ResultScreen {
             };
             return;
         }
+        // Evicted before the new summary is condensed: the cache never
+        // holds more than its capacity.
+        if self.cache.len() >= RESULT_CACHE
+            && let Some(lru) = self
+                .cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| c.used)
+                .map(|(i, _)| i)
+        {
+            self.cache.swap_remove(lru);
+        }
         let began = Instant::now();
         let evaluated = ReEvaluate::under(
             &ResultContext {
@@ -513,25 +620,23 @@ impl ResultScreen {
         );
         self.last_evaluation = Some(began.elapsed());
         self.evaluations += 1;
-        // Condensed at once: the event stream goes with the evaluation.
+        // Condensed at once: the event stream and the histories go with
+        // the evaluation.
         let summary = evaluated.map(|r| {
+            let axis = *self.axis.get_or_insert(Axis {
+                origin: record.play_type.practice().map_or(TimeUs(0), |p| p.start),
+                end: r.evaluation.final_deadline,
+            });
             ViewSummary::of(
                 &r.evaluation,
+                &preset,
+                axis,
                 r.coverage,
                 r.as_played,
                 &r.started_at_default,
+                self.displayed.as_deref(),
             )
         });
-        if self.cache.len() >= RESULT_CACHE
-            && let Some(lru) = self
-                .cache
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, c)| c.used)
-                .map(|(i, _)| i)
-        {
-            self.cache.swap_remove(lru);
-        }
         self.cache.push(Cached {
             hash,
             summary,
@@ -540,12 +645,15 @@ impl ResultScreen {
     }
 }
 
-/// The bytes evaluating `record` of `chart` under `preset` holds at its
-/// peak (`replay::verify::batch_bytes`, the estimate a rebuild admits each
-/// record with); `None` when the evaluator refuses them, which the
-/// evaluation then reports. Every lane object counts, a section's record
-/// included.
+/// The bytes evaluating `record` of `chart` under `preset` and condensing
+/// it hold at their peak: `replay::verify::batch_bytes`, the estimate a
+/// rebuild admits each record with, and the summary built while the
+/// evaluation is alive ([`SUMMARY_BYTES`]); `None` when the evaluator
+/// refuses them, which the evaluation then reports. Every lane object
+/// counts, a section's record included.
 #[must_use]
 pub fn what_if_bytes(chart: &Chart, preset: &RulePreset, record: &PlayRecord) -> Option<usize> {
-    replay::verify::batch_bytes(record, chart, preset).ok()
+    replay::verify::batch_bytes(record, chart, preset)
+        .ok()
+        .map(|b| b.saturating_add(SUMMARY_BYTES))
 }
