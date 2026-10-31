@@ -14,13 +14,18 @@
 //! which reports it to the IME so its candidate window opens beside the
 //! composition.
 //!
-//! A screen that has a window to tell draws a splash page until the game
-//! sends what to draw ([`Screen::splash`]), and tells the window when its
-//! first frame was presented: the window stays hidden until then, so the
-//! empty window is never seen.
+//! A screen that has a window to tell draws a launch screen until the game
+//! sends what to draw ([`Screen::splash`]), and tells the window when a
+//! frame was presented: the window stays hidden until then, so the empty
+//! window is never seen. With the menu font (the select screen's launch)
+//! it is the game's name and version, fading in from black and out again
+//! over [`SPLASH`], and the first page follows it; a screen for plays
+//! only draws black, so `tapestry play` starts at once.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use std::time::Duration;
 
 use bms_model::Chart;
 use eval::Section;
@@ -116,17 +121,52 @@ pub trait WindowSink: Send {
     fn presented(&self) -> Arc<AtomicBool>;
 }
 
-/// The splash page: the game's name and version, until the select
-/// screen's first page or a play replaces it.
-pub fn splash_page() -> MenuPage {
-    let line = |text: String, style| MenuLine { text, style };
-    let mut lines = vec![line(String::new(), LineStyle::Chart); 10];
-    lines.push(line("tapestry".to_owned(), LineStyle::Title));
-    lines.push(line(
-        format!("version {}", env!("CARGO_PKG_VERSION")),
-        LineStyle::Help,
-    ));
-    MenuPage { lines, caret: None }
+/// The launch screen's fade in from black, and its fade out.
+const SPLASH_FADE: Duration = Duration::from_millis(300);
+/// How long the launch screen shows, fades included: the select screen's
+/// first page comes after it, or once startup is done if that is later.
+pub const SPLASH: Duration = Duration::from_millis(1_500);
+
+/// The launch screen's opacity `elapsed` after it began: up from 0 over
+/// [`SPLASH_FADE`], 255 while it holds, down to 0 over the last
+/// [`SPLASH_FADE`] of [`SPLASH`], and 0 after.
+pub fn splash_alpha(elapsed: Duration) -> u8 {
+    let fade = SPLASH_FADE.as_micros();
+    let at = elapsed.as_micros();
+    let left = SPLASH.as_micros().saturating_sub(at);
+    let ramp = at.min(left).min(fade);
+    // At most 255 × fade / fade.
+    u8::try_from(ramp * 255 / fade).unwrap_or(u8::MAX)
+}
+
+/// The launch screen's text, laid out once, and the opacity last
+/// prepared.
+struct Splash {
+    name: TextBlock,
+    version: TextBlock,
+    alpha: Option<u8>,
+}
+
+impl Splash {
+    /// The game's name and version, centered.
+    fn new(fonts: &mut Fonts) -> Self {
+        let centered = |fonts: &mut Fonts, text: &str, top: f32, size: f32, color: [u8; 4]| {
+            let style = |left| TextStyle {
+                left,
+                top,
+                size,
+                color,
+            };
+            let width = TextBlock::new(fonts, text, style(0.0)).width();
+            TextBlock::new(fonts, text, style((1920.0 - width) / 2.0))
+        };
+        let version = format!("version {}", env!("CARGO_PKG_VERSION"));
+        Self {
+            name: centered(fonts, "tapestry", 420.0, 120.0, [255, 255, 255, 0]),
+            version: centered(fonts, &version, 590.0, 30.0, [150, 150, 150, 0]),
+            alpha: None,
+        }
+    }
 }
 
 /// The caret's area on `page`, `[left, top, width, height]` in layout
@@ -174,6 +214,8 @@ pub struct MenuScreen {
     presented: Option<Arc<AtomicBool>>,
     /// The caret's area last sent there; `None` before the first.
     sent: Option<Option<[f32; 4]>>,
+    /// The launch screen, once drawn.
+    splash: Option<Splash>,
 }
 
 impl MenuScreen {
@@ -188,6 +230,7 @@ impl MenuScreen {
             sink: None,
             presented: None,
             sent: None,
+            splash: None,
         }
     }
 
@@ -322,15 +365,14 @@ impl Screen for MenuScreen {
         Ok(self.shown(presented))
     }
 
-    fn splash(&mut self) -> Option<Result<bool, RenderError>> {
+    fn splash(&mut self, elapsed: Duration) -> Option<Result<bool, RenderError>> {
         self.sink.as_ref()?;
-        let page = splash_page();
         Some(if self.fonts.is_some() {
-            self.menu(&page, false).map(|t| t.presented)
+            self.fade_splash(splash_alpha(elapsed))
+                .and_then(|()| self.splash_frame())
         } else {
-            // A screen for plays only has no menu font: the bitmap font.
-            let lines: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
-            self.text(&lines)
+            // A screen for plays only: black, so the window shows.
+            self.text(&[])
         })
     }
 
@@ -349,6 +391,38 @@ impl Screen for MenuScreen {
 }
 
 impl MenuScreen {
+    /// Prepares the launch screen at opacity `alpha`, laid out the first
+    /// time only and prepared again only when `alpha` changed.
+    fn fade_splash(&mut self, alpha: u8) -> Result<(), RenderError> {
+        let Some(fonts) = self.fonts.as_mut() else {
+            return Ok(());
+        };
+        let splash = self.splash.get_or_insert_with(|| Splash::new(fonts));
+        if splash.alpha == Some(alpha) {
+            return Ok(());
+        }
+        splash.name.set_alpha(alpha);
+        splash.version.set_alpha(alpha);
+        let text = self
+            .text
+            .get_or_insert_with(|| MenuText::new(&self.renderer));
+        text.prepare(&self.renderer, fonts, &[&splash.name, &splash.version])?;
+        splash.alpha = Some(alpha);
+        // The page prepared before, if any, is gone from the text.
+        self.cursor = None;
+        self.underline = None;
+        Ok(())
+    }
+
+    /// Draws the launch screen as last prepared.
+    fn splash_frame(&mut self) -> Result<bool, RenderError> {
+        let Some(text) = &self.text else {
+            return Err(RenderError::OtherRenderersText);
+        };
+        let presented = self.renderer.menu_frame(|_| {}, text)?.presented;
+        Ok(self.shown(presented))
+    }
+
     /// Draws `page`, laid out again when `changed`.
     fn menu_frame(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
         if changed || self.text.is_none() {
@@ -434,21 +508,88 @@ mod tests {
         .unwrap()
     }
 
-    /// A screen with a window to tell draws the splash page, in the menu
-    /// font or, for plays only, the bitmap font, and its presented frame
-    /// tells the window; a screen without one draws no splash.
+    /// The launch screen fades in from black over 0.3 s, holds, and fades
+    /// out over its last 0.3 s, black after.
+    #[test]
+    fn the_splash_fades_in_and_out() {
+        use std::time::Duration;
+        let at = |ms| super::splash_alpha(Duration::from_millis(ms));
+        assert_eq!(at(0), 0);
+        assert_eq!(at(150), 127);
+        assert_eq!(at(300), 255);
+        assert_eq!(at(750), 255);
+        assert_eq!(at(1_200), 255);
+        assert_eq!(at(1_350), 127);
+        assert_eq!(at(1_500), 0);
+        assert_eq!(at(5_000), 0);
+    }
+
+    /// A screen with a window to tell draws the launch screen, the game's
+    /// name at the opacity of its time, and its presented frame tells the
+    /// window, black ones included; one for plays only draws black, and
+    /// one without a window draws no launch screen.
     #[test]
     fn the_splash_tells_the_window_of_its_frame() {
-        for fonts in [Some(Fonts::runtime().unwrap()), None] {
-            let sent = Sent::default();
-            let mut screen = MenuScreen::new(warp(), fonts).with_sink(Box::new(sent.clone()));
-            assert!(!sent.1.load(Ordering::Acquire));
-            assert!(matches!(screen.splash(), Some(Ok(true))));
-            assert!(screen.renderer.read_back().chunks(4).any(|p| p[0] > 200));
-            assert!(sent.1.load(Ordering::Acquire));
-        }
+        use std::time::Duration;
+        let lit = |screen: &MenuScreen| {
+            screen
+                .renderer
+                .read_back()
+                .chunks(4)
+                .filter(|p| p[0] > 200)
+                .count()
+        };
+        let sent = Sent::default();
+        let fonts = Some(Fonts::runtime().unwrap());
+        let mut screen = MenuScreen::new(warp(), fonts).with_sink(Box::new(sent.clone()));
+        assert!(!sent.1.load(Ordering::Acquire));
+        assert!(matches!(screen.splash(Duration::ZERO), Some(Ok(true))));
+        assert_eq!(lit(&screen), 0);
+        assert!(sent.1.load(Ordering::Acquire));
+        assert!(matches!(
+            screen.splash(Duration::from_millis(750)),
+            Some(Ok(true))
+        ));
+        assert!(lit(&screen) > 100);
+        // A page after it draws the page alone.
+        let page = SelectScreen::new(Vec::new()).page("");
+        screen.menu(&page, true).unwrap();
+
+        let sent = Sent::default();
+        let mut screen = MenuScreen::new(warp(), None).with_sink(Box::new(sent.clone()));
+        assert!(matches!(
+            screen.splash(Duration::from_millis(750)),
+            Some(Ok(true))
+        ));
+        assert_eq!(lit(&screen), 0);
+        assert!(sent.1.load(Ordering::Acquire));
         let mut screen = MenuScreen::new(warp(), None);
-        assert!(screen.splash().is_none());
+        assert!(screen.splash(Duration::ZERO).is_none());
+    }
+
+    /// Fading the launch screen lays nothing out again: once its glyphs are
+    /// in the atlas, a step allocates only inside wgpu's write of the
+    /// glyphs' vertices (its staging, as every frame's sprite upload has),
+    /// a few, where laying the text out would allocate per glyph; a frame
+    /// at the same opacity prepares nothing.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_splash_fade_lays_nothing_out_again() {
+        let mut screen = MenuScreen::new(warp(), Some(Fonts::runtime().unwrap()));
+        screen.fade_splash(255).unwrap();
+        screen.fade_splash(254).unwrap();
+        let before = crate::alloc_count::this_thread();
+        for _ in 0..100 {
+            screen.fade_splash(254).unwrap();
+        }
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+        let mut steps = Vec::with_capacity(254);
+        for alpha in (0..=253).rev() {
+            let before = crate::alloc_count::this_thread();
+            screen.fade_splash(alpha).unwrap();
+            steps.push(crate::alloc_count::this_thread() - before);
+        }
+        assert!(steps.iter().all(|&n| n <= 8), "{steps:?}");
     }
 
     /// The search box's caret lies after the typed text and spans the
