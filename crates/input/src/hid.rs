@@ -480,7 +480,8 @@ impl HidDevice {
     /// in the mode its conversion uses ([`SourceSet::axis_relative`]).
     /// Buttons it does not carry keep their state. Button presses are
     /// offered to `capture`, and so is an axis once it has turned
-    /// [`capture_travel`] since the capture was armed.
+    /// [`capture_travel`] since the capture was armed, net and the short
+    /// way round, with the direction it turned.
     ///
     /// `background` is the packet's Raw Input mark: a background report
     /// trips the focus gate even when nothing in it changed
@@ -564,8 +565,11 @@ impl HidDevice {
             sources.packet(&p);
             *travel = travel.saturating_add(moved);
             if travel.abs() >= capture_travel(&cap) {
+                // Offered as a press, its sign the direction it turned
+                // ([`Capture::lower`]).
+                let value = if *travel < 0 { -1 } else { 1 };
                 *travel = 0;
-                let offer = Packet { value: 1, ..p };
+                let offer = Packet { value, ..p };
                 capture.offer_controller(&offer, product, recording);
             }
         }

@@ -19,15 +19,18 @@ use input::{Capture, DeviceId, DeviceKind, Packet};
 #[derive(Clone, Copy)]
 enum Step {
     Offer(DeviceKind, u32, bool, bool),
-    /// The scratch axis turned far enough to be captured.
+    /// The scratch axis turned far enough to be captured, toward higher
+    /// values.
     Turn,
+    /// The same, toward lower values.
+    TurnBack,
     /// A report of the scratch axis, as the input thread passes it to a
     /// watch.
     Report(i32),
     Close,
 }
 
-use Step::{Close, Offer, Report, Turn};
+use Step::{Close, Offer, Report, Turn, TurnBack};
 
 const AXIS: u32 = 0x1_0030;
 
@@ -73,6 +76,8 @@ struct Scripted {
     last: Option<i32>,
     /// What the flow had learnt of the scratch axis's range at the end.
     learnt: Option<game::LearntRange>,
+    /// The shows that asked for the scratch axis's menu direction.
+    asked: usize,
 }
 
 impl Scripted {
@@ -84,6 +89,7 @@ impl Scripted {
             shown: Vec::new(),
             last: None,
             learnt: None,
+            asked: 0,
         }
     }
 }
@@ -92,6 +98,7 @@ impl KeyScreen for Scripted {
     fn show(&mut self, flow: &KeyConfigFlow) {
         self.shown.push((flow.role(), flow.refused()));
         self.learnt = flow.learnt();
+        self.asked += usize::from(flow.turning());
     }
 
     fn wait(&mut self) {
@@ -110,11 +117,13 @@ impl KeyScreen for Scripted {
                         .offer_controller(&packet, Some(MODEL_A), recording),
                 }
             }
-            Some(Turn) => {
+            Some(step @ (Turn | TurnBack)) => {
+                // Offered as the input thread offers a turn: its sign the
+                // direction.
                 let packet = Packet {
                     device: DeviceId(3),
                     control: ControlId(AXIS),
-                    value: 1,
+                    value: if matches!(step, TurnBack) { -1 } else { 1 },
                     background: false,
                 };
                 self.capture.offer_controller(&packet, Some(MODEL_A), false);
@@ -158,7 +167,7 @@ fn run(steps: &[Step]) -> (KeyConfigEnd, Scripted) {
     let capture = Capture::new();
     let mut screen = Scripted::new(&capture, steps);
     let end = capture_keys(&capture, &mut screen, current());
-    if let KeyConfigEnd::Done(keys, _) = &end {
+    if let KeyConfigEnd::Done(keys, ..) = &end {
         saves(keys);
     }
     (end, screen)
@@ -240,6 +249,7 @@ fn key_config_capture_binds_next_press() {
                 },
                 controller_device: Some(MODEL_A),
             },
+            None,
             None
         )
     );
@@ -504,12 +514,19 @@ fn keep_the_rest() -> Vec<Step> {
     vec![key(0x58); 9]
 }
 
-/// Runs `steps` with `limit` for the range learning.
+/// Runs `steps` with `limit` for the range learning, the menu direction
+/// taken at once.
 fn run_within(steps: &[Step], limit: Duration) -> (KeyConfigEnd, Scripted) {
+    run_settled(steps, limit, Duration::ZERO)
+}
+
+/// Runs `steps` with `limit` for the range learning and `settle` before
+/// the menu direction is taken.
+fn run_settled(steps: &[Step], limit: Duration, settle: Duration) -> (KeyConfigEnd, Scripted) {
     let capture = Capture::new();
     let mut screen = Scripted::new(&capture, steps);
-    let end = capture_keys_within(&capture, &mut screen, current(), limit);
-    if let KeyConfigEnd::Done(keys, _) = &end {
+    let end = capture_keys_within(&capture, &mut screen, current(), limit, settle);
+    if let KeyConfigEnd::Done(keys, ..) = &end {
         saves(keys);
     }
     (end, screen)
@@ -525,11 +542,14 @@ fn an_axis_covers_both_directions_and_learns_its_range() {
     let mut steps = vec![Report(100), Turn];
     steps.extend([110, 127, -128, -120, -60, 0, 60].map(Report));
     steps.extend([-90, -127, -128, 127, 110].map(Report));
+    // Then turned toward lower values for menus to scroll down.
+    steps.push(TurnBack);
     steps.extend(keep_the_rest());
     let (end, screen) = run_within(&steps, HOUR);
-    let KeyConfigEnd::Done(keys, widened) = end else {
+    let KeyConfigEnd::Done(keys, widened, menu_reversed) = end else {
         panic!("{end:?}");
     };
+    assert_eq!(menu_reversed, Some(true));
     assert_eq!(
         keys.controller.lanes,
         [LaneKey {
@@ -554,9 +574,13 @@ fn a_genuine_255_position_axis_keeps_its_range() {
     // Crossing 127 to -127 both ways, never beyond: nothing to save.
     let mut steps = vec![Report(0), Turn];
     steps.extend([100, 127, -127, -100, -127, 127].map(Report));
+    steps.push(Turn);
     steps.extend(keep_the_rest());
     let (end, screen) = run_within(&steps, HOUR);
-    assert!(matches!(end, KeyConfigEnd::Done(_, None)), "{end:?}");
+    assert!(
+        matches!(end, KeyConfigEnd::Done(_, None, Some(false))),
+        "{end:?}"
+    );
     assert_eq!(
         screen.learnt.map(|l| (l.wrap, l.widened)),
         Some((255, false))
@@ -565,21 +589,25 @@ fn a_genuine_255_position_axis_keeps_its_range() {
 
 #[test]
 fn learning_ends_on_f12_or_at_its_time_limit() {
-    // F12 while turning: decided from what it reported so far.
-    let mut steps = vec![Report(0), Turn, Report(-128), key(0x58)];
+    // F12 while turning: decided from what it reported so far. F12 again
+    // keeps the menu direction.
+    let mut steps = vec![Report(0), Turn, Report(-128), key(0x58), key(0x58)];
     steps.extend(keep_the_rest());
     let (end, screen) = run_within(&steps, HOUR);
-    assert!(matches!(end, KeyConfigEnd::Done(_, Some(256))), "{end:?}");
+    assert!(
+        matches!(end, KeyConfigEnd::Done(_, Some(256), None)),
+        "{end:?}"
+    );
     assert_eq!(screen.learnt.map(|l| l.observed), Some((-128, -128)));
     // Out of time at once: decided after one wait, from nothing seen.
     let mut steps = vec![Report(0), Turn, Close];
     steps.extend(keep_the_rest());
     let (end, _) = run_within(&steps[..3], Duration::ZERO);
     assert_eq!(end, KeyConfigEnd::Closed);
-    let mut steps = vec![Report(0), Turn, Report(5)];
+    let mut steps = vec![Report(0), Turn, Report(5), key(0x58)];
     steps.extend(keep_the_rest());
     let (end, screen) = run_within(&steps, Duration::ZERO);
-    assert!(matches!(end, KeyConfigEnd::Done(_, None)), "{end:?}");
+    assert!(matches!(end, KeyConfigEnd::Done(_, None, None)), "{end:?}");
     assert_eq!(
         screen.learnt.map(|l| (l.observed, l.wrap)),
         Some(((5, 5), 255))
@@ -589,22 +617,76 @@ fn learning_ends_on_f12_or_at_its_time_limit() {
     assert_eq!(end, KeyConfigEnd::Cancelled);
 }
 
+/// After its range, the scratch axis is turned the way that scrolls menus
+/// down: a turn toward higher values keeps menus as they are, one toward
+/// lower values reverses them, and F12 keeps the current setting. Other
+/// controls are no answer and bind nothing; Escape cancels and closing the
+/// window ends the screen. A turn before the settle time is no answer.
+#[test]
+fn the_scratch_axis_is_turned_for_the_menu_direction() {
+    // Learning ends at once (limit 0) after its first report.
+    let learnt = || vec![Report(0), Turn, Report(5)];
+    let answered = |answer: &[Step]| {
+        let mut steps = learnt();
+        steps.extend_from_slice(answer);
+        steps.extend(keep_the_rest());
+        let (end, screen) = run_within(&steps, Duration::ZERO);
+        let KeyConfigEnd::Done(keys, _, menu_reversed) = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(
+            keys.controller.lanes,
+            [LaneKey {
+                control: AXIS,
+                lane: 0
+            }]
+        );
+        assert!(screen.asked >= 1);
+        menu_reversed
+    };
+    assert_eq!(answered(&[Turn]), Some(false));
+    assert_eq!(answered(&[TurnBack]), Some(true));
+    assert_eq!(answered(&[key(0x58)]), None);
+    // A button, a key and a report are not answers.
+    assert_eq!(
+        answered(&[button(5), key(0x2c), Report(9), TurnBack]),
+        Some(true)
+    );
+    for (last, want) in [
+        (key(0x01), KeyConfigEnd::Cancelled),
+        (Close, KeyConfigEnd::Closed),
+    ] {
+        let mut steps = learnt();
+        steps.push(last);
+        let (end, _) = run_within(&steps, Duration::ZERO);
+        assert_eq!(end, want);
+    }
+    // Still turning as the prompt shows: not taken before the settle time.
+    let mut steps = learnt();
+    steps.extend([TurnBack, key(0x58)]);
+    steps.extend(keep_the_rest());
+    let (end, _) = run_settled(&steps, Duration::ZERO, HOUR);
+    assert!(matches!(end, KeyConfigEnd::Done(_, None, None)), "{end:?}");
+}
+
 #[test]
 fn a_button_or_key_scratch_is_asked_for_both_directions() {
-    // Two buttons: both on lane 0.
+    // Two buttons: both on lane 0, in binding order up and down for menus,
+    // so no menu direction is asked for.
     let mut steps = vec![button(40), button(41)];
     steps.extend(vec![key(0x58); 9]);
-    let (end, _) = run(&steps);
-    let KeyConfigEnd::Done(keys, None) = end else {
+    let (end, screen) = run(&steps);
+    let KeyConfigEnd::Done(keys, None, None) = end else {
         panic!("{end:?}");
     };
+    assert_eq!(screen.asked, 0);
     let lane = |control, lane| LaneKey { control, lane };
     assert_eq!(keys.controller.lanes, [lane(40, 0), lane(41, 0)]);
     // A key, then F12 for none: one direction only.
     let mut steps = vec![key(0x36), key(0x58)];
     steps.extend(vec![key(0x58); 9]);
     let (end, _) = run(&steps);
-    let KeyConfigEnd::Done(keys, None) = end else {
+    let KeyConfigEnd::Done(keys, None, None) = end else {
         panic!("{end:?}");
     };
     assert_eq!(

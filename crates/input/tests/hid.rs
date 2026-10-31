@@ -232,6 +232,7 @@ fn capture_takes_buttons_and_turned_axes() {
         }],
     );
     assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
+    assert!(!capture.lower(), "turned toward higher values");
 
     // Arming again starts the count again: 8 before and 8 after is not
     // enough; the relative dial needs 16 too.
@@ -272,6 +273,7 @@ fn capture_takes_buttons_and_turned_axes() {
         }],
     );
     assert_eq!(capture.take(), Some((DIAL, DeviceKind::Controller)));
+    assert!(capture.lower(), "turned toward lower values");
     // A button press is captured at once, its release never.
     capture.arm();
     batch(
@@ -296,6 +298,7 @@ fn capture_takes_buttons_and_turned_axes() {
         capture.take(),
         Some((button_control(4), DeviceKind::Controller))
     );
+    assert!(!capture.lower(), "a button has no direction");
     // Through the wrap: from 250, 4 is +10 the short way round (not -246,
     // which would capture), and 10 then makes 16.
     let (high, low, past) = ([Some(250), None], [Some(4), None], [Some(10), None]);
@@ -310,6 +313,12 @@ fn capture_takes_buttons_and_turned_axes() {
     assert_eq!(capture.take(), None);
     batch(&mut dev, &mut set, &capture, 90, &[at(&past)]);
     assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
+    assert!(!capture.lower(), "forward through the wrap");
+    // And back: from 10, 250 is -16 the short way round (not +240).
+    capture.arm();
+    batch(&mut dev, &mut set, &capture, 100, &[at(&high)]);
+    assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
+    assert!(capture.lower(), "backward through the wrap");
 }
 
 #[test]

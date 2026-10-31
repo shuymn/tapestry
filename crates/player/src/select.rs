@@ -75,15 +75,16 @@ pub enum MenuInput {
 /// confirm, the white key 7 sends its own event (the next play preset
 /// there), the black keys 2, 4 and 6 go back, and the scratch scrolls: an
 /// axis one line per press threshold of movement, toward higher values
-/// down and lower values up, and a scratch of two buttons up for the first
-/// bound and down for the second, a line per press.
-fn lane_menu(lane: u8, axis: bool, nth_scratch: usize) -> Option<MenuAction> {
+/// down and lower values up (the other way round when `reversed`), and a
+/// scratch of two buttons up for the first bound and down for the second,
+/// a line per press.
+fn lane_menu(lane: u8, axis: bool, nth_scratch: usize, reversed: bool) -> Option<MenuAction> {
     use input::MenuEvent::{Back, Confirm, Down, Extra, Up};
     Some(match (lane, axis) {
-        (0, true) => MenuAction::Turn {
-            forward: Down,
-            backward: Up,
-        },
+        (0, true) => {
+            let (forward, backward) = if reversed { (Up, Down) } else { (Down, Up) };
+            MenuAction::Turn { forward, backward }
+        }
         (0, false) if nth_scratch == 0 => MenuAction::Press(Up),
         (0, false) if nth_scratch == 1 => MenuAction::Press(Down),
         (1 | 3 | 5, _) => MenuAction::Press(Confirm),
@@ -97,7 +98,8 @@ fn lane_menu(lane: u8, axis: bool, nth_scratch: usize) -> Option<MenuAction> {
 /// controller is configured: each bound lane control as [`lane_menu`]
 /// says, of the configured controller, an axis stepping every press
 /// threshold of `scratch`'s movement, measured in the revolution play
-/// converts it with (`scratch`'s mode and revolution when set).
+/// converts it with (`scratch`'s mode and revolution when set), scrolling
+/// the way `scratch`'s menu direction says.
 pub fn menu_bindings(
     config: &game::KeyConfig,
     device: Option<HidProduct>,
@@ -115,7 +117,7 @@ pub fn menu_bindings(
             if k.lane == 0 && !axis {
                 scratch_buttons += 1;
             }
-            lane_menu(k.lane, axis, nth).map(|a| (control, a))
+            lane_menu(k.lane, axis, nth, scratch.menu_reversed).map(|a| (control, a))
         })
         .collect();
     Some(MenuBindings {
@@ -768,6 +770,20 @@ mod tests {
             },
         ));
         assert_eq!(b.controls, want);
+        // The menu direction reversed: the axis scrolls up toward higher
+        // values, and nothing else changes.
+        let reversed = game::ScratchConfig {
+            menu_reversed: true,
+            ..scratch
+        };
+        if let Some((_, turn)) = want.last_mut() {
+            *turn = MenuAction::Turn {
+                forward: MenuEvent::Up,
+                backward: MenuEvent::Down,
+            };
+        }
+        let b = menu_bindings(&config, Some(product), &reversed).unwrap();
+        assert_eq!(b.controls, want);
         // A scratch of two buttons, bound after key 1; a third plays the
         // lane but sends nothing.
         let config = KeyConfig {
@@ -783,6 +799,13 @@ mod tests {
                 (ControlId(20), press(MenuEvent::Up)),
                 (ControlId(21), press(MenuEvent::Down)),
             ]
+        );
+        // The menu direction is the axis's alone.
+        assert_eq!(
+            menu_bindings(&config, Some(product), &reversed)
+                .unwrap()
+                .controls,
+            b.controls
         );
         assert_eq!(menu_bindings(&config, None, &scratch), None);
         assert_eq!(event_key(MenuEvent::Confirm), MenuKey::Enter);

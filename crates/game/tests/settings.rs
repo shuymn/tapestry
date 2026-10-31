@@ -75,6 +75,7 @@ fn changed() -> Settings {
                 press_threshold: 5,
                 hold_threshold: 3,
                 release_after_us: 80_000,
+                menu_reversed: true,
             },
             queued_periods: 3,
             library: LibrarySettings {
@@ -94,6 +95,7 @@ fn missing_files_give_the_defaults() {
     let (_dir, root) = temp_root();
     let s = Settings::load(&root).unwrap();
     assert_eq!(s.device, DeviceSettings::default());
+    assert!(!s.device.scratch.menu_reversed);
     assert_eq!(s.player, PlayerSettings::default());
     assert_eq!(s.player.preset, "beatoraja-style");
 }
@@ -129,6 +131,12 @@ fn device_and_player_settings_round_trip() {
         Settings::load(&root).unwrap().device.library,
         s.device.library
     );
+    // The scratch's menu direction as a person writes it; absent, it is
+    // not reversed.
+    fs::write(root.device_settings(), "[scratch]\nmenu_reversed = true\n").unwrap();
+    assert!(Settings::load(&root).unwrap().device.scratch.menu_reversed);
+    fs::write(root.device_settings(), "[scratch]\npress_threshold = 5\n").unwrap();
+    assert!(!Settings::load(&root).unwrap().device.scratch.menu_reversed);
     fs::write(root.device_settings(), "[library]\nroot = 'D:\\BMS'\n").unwrap();
     assert!(matches!(
         load_settings::<DeviceSettings>(&root.device_settings()),
@@ -219,7 +227,23 @@ fn key_config_gives_profiles_and_recorded_controls() {
         bits: 16,
         signed: false,
     }];
-    let profile = s.profile(&[DeviceKind::Controller, DeviceKind::Keyboard], &[declared]);
+    let kinds = [DeviceKind::Controller, DeviceKind::Keyboard];
+    let profile = s.profile(&kinds, std::slice::from_ref(&declared));
+    // The menu direction never reaches play: with it either way the
+    // evaluator reads the same profile, so it converts the same presses
+    // and the record is the same, and the input thread counts against the
+    // same range.
+    assert!(s.scratch.menu_reversed);
+    let mut forward = s.clone();
+    forward.scratch.menu_reversed = false;
+    assert_eq!(
+        forward.profile(&kinds, std::slice::from_ref(&declared)),
+        profile
+    );
+    assert_eq!(
+        forward.scratch.range(&declared[0]),
+        s.scratch.range(&declared[0])
+    );
     let lane = |n| Lane::new(n).unwrap();
     assert_eq!(
         profile.sources,
