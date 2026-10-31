@@ -52,7 +52,7 @@ pub const ANALYSIS_VERSION: u32 = 1;
 /// computes. A change of any of them fails that test until
 /// [`MIXER_VERSION`] or [`ANALYSIS_VERSION`] is bumped and this updated.
 pub const MEASUREMENT_DEPENDENCIES: &str =
-    "307f1b5eb7f292d6b92f57b764c27704f076852a47cc6d364d77e7b5fd3b3e82";
+    "5b22868cf844730d038fc2c853f86258c8b51ab5d244898911a7dca6d6e74b52";
 
 /// The integrated loudness the normalization aims at, LUFS.
 pub const TARGET_LUFS: f64 = -18.0;
@@ -244,6 +244,13 @@ impl Analysis {
             }
             // A sound the bank lacks starts nothing, as in play.
             let _ = self.mixer.trigger(&self.bank, event.sound, at);
+        }
+        // A full pending queue stops the admission before the schedule's
+        // end is seen: look ahead, so the block that ends the program is
+        // known as such.
+        if self.next.is_none() && !self.exhausted {
+            self.next = events.next();
+            self.exhausted = self.next.is_none();
         }
         if self.ended() {
             // Nothing was started: no frame to meter.

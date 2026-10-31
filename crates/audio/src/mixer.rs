@@ -429,7 +429,9 @@ impl Mixer {
 
     /// The output frame after the last sample, fade included, of every
     /// voice that has played to its end: where the sum fell silent once
-    /// nothing sounds.
+    /// nothing sounds. Voices stopped otherwise (a cut, a seek, a ring-out's
+    /// end) do not move it; the loudness analysis, which reads it, stops
+    /// none.
     #[must_use]
     pub fn last_end(&self) -> u64 {
         u64::try_from(self.last_end).unwrap_or(0)

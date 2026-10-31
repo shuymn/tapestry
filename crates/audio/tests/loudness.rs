@@ -237,12 +237,13 @@ fn analysis_version_pins_the_reference_tone() {
 /// The crates whose code computes samples or measurements: the decoder
 /// (`symphonia` and its codec, format and shared crates, with the codec
 /// algorithms and extended floats they use), the resampler (`rubato`, its
-/// buffer adapters, and the FFT and numeric crates under it), and the
-/// meter (`ebur128` and the `dasp` sample and frame crates). Crates that
-/// only move bytes, log, derive code (`syn`, `quote`, `thiserror`) or
-/// detect the compiler (`autocfg`) cannot change a sample, so their
-/// updates need no version bump. None of these crates generates numeric
-/// code at build time.
+/// buffer adapters, the window functions its sinc filters are made from,
+/// and the FFT and numeric crates under it), and the meter (`ebur128` and
+/// the `dasp` sample and frame crates). Crates that only move bytes, log,
+/// derive code (`syn`, `quote`, `thiserror`, `visibility`) or detect the
+/// compiler (`autocfg`) cannot change a sample, so their updates need no
+/// version bump. None of these crates generates numeric code at build
+/// time.
 fn shapes_measurement(name: &str) -> bool {
     const NAMES: &[&str] = &[
         "audio-codec-algorithms",
@@ -256,6 +257,7 @@ fn shapes_measurement(name: &str) -> bool {
         "num-traits",
         "strength_reduce",
         "transpose",
+        "windowfunctions",
         "ebur128",
     ];
     ["symphonia", "audioadapter", "dasp_"]
@@ -264,21 +266,43 @@ fn shapes_measurement(name: &str) -> bool {
         || NAMES.contains(&name)
 }
 
-/// The dependency entry of `name` in a manifest, continuation lines
-/// included: `name = ...` or `name.workspace = ...`, with any features.
-fn dependency_entry(manifest: &str, name: &str) -> Option<String> {
-    let mut lines = manifest.lines();
-    let first = lines.find(|l| {
-        l.strip_prefix(name)
-            .is_some_and(|r| r.starts_with(" =") || r.starts_with('.'))
-    })?;
-    let mut entry = first.trim().to_owned();
-    let open = |s: &str| s.matches(['[', '{']).count() > s.matches([']', '}']).count();
-    while open(&entry) {
-        entry.push(' ');
-        entry.push_str(lines.next()?.trim());
-    }
-    Some(entry)
+/// The resolved dependency of `name` as the manifests declare it: the
+/// workspace's entry and `audio`'s, each a full TOML table (any form, the
+/// dotted `name.features = [...]` included), written canonically.
+fn dependency_entries(workspace: &str, member: &str, name: &str) -> String {
+    let workspace: toml::Table = workspace.parse().unwrap();
+    let member: toml::Table = member.parse().unwrap();
+    let entry = |table: &toml::Table, path: &[&str]| {
+        let mut value = toml::Value::Table(table.clone());
+        for key in path {
+            value = value
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {name} at {path:?}"));
+        }
+        let mut wrapped = toml::Table::new();
+        wrapped.insert(name.to_owned(), value);
+        toml::to_string(&wrapped).unwrap()
+    };
+    format!(
+        "workspace: {}audio: {}",
+        entry(&workspace, &["workspace", "dependencies", name]),
+        entry(&member, &["dependencies", name]),
+    )
+}
+
+/// A feature declared in the dotted form changes the entry hashed.
+#[test]
+fn dotted_dependency_features_are_pinned() {
+    let workspace = "[workspace.dependencies]\nsymphonia = { version = \"0.6.1\" }\n";
+    let plain = "[dependencies]\nsymphonia.workspace = true\n";
+    let dotted = "[dependencies]\nsymphonia.workspace = true\nsymphonia.features = [\"aiff\"]\n";
+    let inline = "[dependencies]\nsymphonia = { workspace = true, features = [\"aiff\"] }\n";
+    let a = dependency_entries(workspace, plain, "symphonia");
+    let b = dependency_entries(workspace, dotted, "symphonia");
+    assert_ne!(a, b);
+    assert_eq!(b, dependency_entries(workspace, inline, "symphonia"));
+    assert!(b.contains("aiff"), "{b}");
 }
 
 /// The resolved crates that shape a measurement ([`shapes_measurement`])
@@ -368,18 +392,21 @@ fn analysis_dependencies_are_pinned() {
         })
         .collect();
     lines.sort();
-    for name in ["rustfft", "ebur128", "dasp_frame", "symphonia-core"] {
+    for name in [
+        "rustfft",
+        "windowfunctions",
+        "ebur128",
+        "dasp_frame",
+        "symphonia-core",
+        "symphonia-codec-vorbis",
+    ] {
         assert!(
             lines.iter().any(|l| l.starts_with(&format!("{name} "))),
             "{name} is not in the closure"
         );
     }
-    for (manifest, which) in manifests.iter().zip(["workspace", "audio"]) {
-        for name in roots {
-            let entry = dependency_entry(manifest, name)
-                .unwrap_or_else(|| panic!("no {name} in the {which} manifest"));
-            lines.push(format!("{which}: {entry}"));
-        }
+    for name in roots {
+        lines.push(dependency_entries(&manifests[0], &manifests[1], name));
     }
     let hash: String = Sha256::digest(lines.join("\n"))
         .iter()
@@ -530,6 +557,25 @@ fn a_program_shorter_than_a_gating_block_has_no_integrated_loudness() {
             assert_eq!(normalization_gain(&m), HEADROOM, "{rate} {ms}");
         }
     }
+}
+
+/// Exactly as many starts as can wait at once, all of a 100 ms sound: the
+/// admission fills the pending queue before it sees the schedule's end,
+/// yet the program still ends at its last sample and has no integrated
+/// loudness.
+#[test]
+fn a_full_pending_queue_still_ends_the_program_at_its_last_sample() {
+    const RATE: u32 = 8_000;
+    let n = audio::MAX_PENDING_STARTS;
+    let bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        (0..n).map(|_| sine(RATE, 440.0, 3_000.0, 800)).collect(),
+    ));
+    let events: Vec<BgmEvent> = (0..n).map(|k| event(0, k as u16)).collect();
+    let (m, steps) = analyze(&bank, &events);
+    assert_eq!(m.frames, 800);
+    assert_eq!(m.integrated, None, "{m:?}");
+    assert_eq!(steps, 1);
 }
 
 /// A bank with no sound stored is done at once, metering nothing however

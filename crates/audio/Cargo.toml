@@ -33,6 +33,7 @@ windows = { workspace = true, features = [
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+toml.workspace = true
 
 [[bench]]
 name = "loudness"
