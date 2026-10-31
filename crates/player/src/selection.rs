@@ -21,7 +21,6 @@
 //!   measurement's checks, or is taken once the load is over (the load's
 //!   waits are all bounded).
 
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -37,7 +36,7 @@ use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log
 use crate::loading_page::{LoadingPage, Stage};
 use crate::log_file;
 use crate::play::{PlayerRig, since};
-use crate::render_side::{RenderLink, RenderMsg, ScreenError};
+use crate::render_side::{LoadingSink, RenderLink, RenderMsg, ScreenError};
 use crate::result_input::{Owner, Pad, ResultInput};
 use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
 #[cfg(feature = "dev-tools")]
@@ -889,23 +888,26 @@ fn show_stage(render: &RenderLink, page: Option<&LoadingPage>, stage: Stage) {
         return;
     };
     println!("load: {}", stage.label());
-    render.send(RenderMsg::Loading(Box::new(page.page(stage))));
+    render.loading().show(page.page(stage));
 }
 
-/// How often the sounds' progress is sent at most: the render thread
-/// draws a frame for every page it takes.
+/// How often the sounds' progress is shown at most: more often would only
+/// lay out pages a frame never draws, the slot keeping the newest.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
 /// The sounds' progress on the loading page, sent from the decode pool.
 struct Progress {
-    render: Mutex<(Sender<RenderMsg>, Option<Instant>)>,
+    render: LoadingSink,
+    /// When progress was last shown.
+    shown: Mutex<Option<Instant>>,
     page: Option<LoadingPage>,
 }
 
 impl Progress {
-    const fn new(render: Sender<RenderMsg>, page: Option<LoadingPage>) -> Self {
+    const fn new(render: LoadingSink, page: Option<LoadingPage>) -> Self {
         Self {
-            render: Mutex::new((render, None)),
+            render,
+            shown: Mutex::new(None),
             page,
         }
     }
@@ -916,18 +918,13 @@ impl Progress {
         let Some(page) = &self.page else {
             return;
         };
-        let mut render = self.render.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
-        if done < files
-            && render
-                .1
-                .is_some_and(|t| now.duration_since(t) < PROGRESS_EVERY)
-        {
+        if done < files && shown.is_some_and(|t| now.duration_since(t) < PROGRESS_EVERY) {
             return;
         }
-        render.1 = Some(now);
-        let page = page.page(Stage::Sounds { done, files });
-        let _ = render.0.send(RenderMsg::Loading(Box::new(page)));
+        *shown = Some(now);
+        self.render.show(page.page(Stage::Sounds { done, files }));
     }
 }
 
@@ -1429,7 +1426,7 @@ impl AppRig for PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
-        let progress = Progress::new(self.render.sender(), page.clone());
+        let progress = Progress::new(self.render.loading(), page.clone());
         let bank = Arc::new(
             audio::load_bank_reporting(
                 chart,
@@ -1574,6 +1571,7 @@ impl AppRig for PlayerRig<'_> {
             self.selection.as_mut().map(|s| &mut s.shelf),
         );
         self.render.clear_end();
+        self.render.clear_loading();
         let Some(sel) = &mut self.selection else {
             return;
         };
@@ -1595,6 +1593,7 @@ impl AppRig for PlayerRig<'_> {
             self.selection.as_mut().map(|s| &mut s.shelf),
         );
         self.render.clear_end();
+        self.render.clear_loading();
         if let Some(sel) = &mut self.selection {
             sel.loading = None;
         }
