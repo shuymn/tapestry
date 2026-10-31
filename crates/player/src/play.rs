@@ -460,7 +460,7 @@ impl Rig for PlayerRig<'_> {
         self.retry_from = self.pending_retry.take();
         #[cfg(feature = "dev-tools")]
         self.scenario_pending();
-        self.render.prepare()
+        prepare_render(&mut self.end_page, &self.render)
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
@@ -629,8 +629,6 @@ impl Rig for PlayerRig<'_> {
         // with the input offset it starts with (design.md "Offset Changes and
         // the Watermark"); the other values are recorded as they are at the
         // start.
-        self.end_page = None;
-        self.render.clear_end();
         self.result_input.release();
         let t = self.controls.tuning().close_end_screen();
         t.apply_to(settings);
@@ -705,6 +703,19 @@ impl Rig for PlayerRig<'_> {
             self.end_shown = Some(std::time::Instant::now());
         }
     }
+}
+
+/// Readies the screen for a play: the end screen, if it shows, is left
+/// first (a retry), its page and the render thread's slot emptied before
+/// the preparation's handshake, so no page of the result is drawn after,
+/// even one that waited while the render thread was behind.
+pub(crate) fn prepare_render(
+    end_page: &mut Option<EndPage>,
+    render: &RenderLink,
+) -> Result<(), ScreenError> {
+    *end_page = None;
+    render.clear_end();
+    render.prepare()
 }
 
 #[cfg(test)]

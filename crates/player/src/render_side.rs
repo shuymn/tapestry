@@ -179,10 +179,9 @@ pub enum RenderMsg {
     },
     /// Draw the end screen instead of a play: the newest page in the slot
     /// ([`RenderLink::show_end`]), or the one drawn last when an earlier
-    /// signal already took this one's page or a newer one; nothing when
-    /// the page was cleared ([`RenderLink::clear_end`]). The number is the
-    /// page's, counting from 1.
-    End(u64),
+    /// signal already took this one's page or a newer one; nothing once
+    /// the pages shown were cleared ([`RenderLink::clear_end`]).
+    End,
     /// The run ends.
     Exit,
 }
@@ -232,20 +231,50 @@ struct Shared {
     failed: AtomicBool,
     /// When the current play's first frame was drawn, on the clock.
     first_frame: AtomicI64,
-    /// The end screen's newest page with its number, until the render
-    /// thread takes it or the end screen is left.
-    end_page: Mutex<Option<(u64, EndPage)>>,
+    /// The end screen's slot: its newest page, and the pages left with the
+    /// end screen.
+    end_page: Mutex<EndSlot>,
     /// The number of the end page last presented, after the frame sink
     /// saw it (dev-tools).
     #[cfg(feature = "dev-tools")]
     end_drawn: AtomicU64,
 }
 
+/// The end screen's newest page with its number, until the render thread
+/// takes it or the end screen is left, and the number of the last page
+/// shown when it was last left: no page up to it is drawn again.
+#[derive(Debug, Default)]
+struct EndSlot {
+    page: Option<(u64, EndPage)>,
+    cleared: u64,
+}
+
 impl Shared {
-    /// Swaps `page` into the slot, returning what it held.
-    fn swap_end(&self, page: Option<(u64, EndPage)>) -> Option<(u64, EndPage)> {
-        let mut slot = self.end_page.lock().unwrap_or_else(PoisonError::into_inner);
-        std::mem::replace(&mut slot, page)
+    fn slot(&self) -> std::sync::MutexGuard<'_, EndSlot> {
+        self.end_page.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Puts page `n` into the slot, returning what it held.
+    fn put_end(&self, n: u64, page: EndPage) -> Option<(u64, EndPage)> {
+        self.slot().page.replace((n, page))
+    }
+
+    /// Leaves the end screen with page `upto` shown last: the slot is
+    /// emptied, returning what it held, and no page up to `upto` is valid.
+    fn clear_end(&self, upto: u64) -> Option<(u64, EndPage)> {
+        let mut slot = self.slot();
+        slot.cleared = slot.cleared.max(upto);
+        slot.page.take()
+    }
+
+    /// Takes the waiting page, if any.
+    fn take_end(&self) -> Option<(u64, EndPage)> {
+        self.slot().page.take()
+    }
+
+    /// The number of the last page cleared.
+    fn end_cleared(&self) -> u64 {
+        self.slot().cleared
     }
 }
 
@@ -288,14 +317,17 @@ impl RenderLink {
     /// whatever the render thread's pace.
     pub fn show_end(&self, page: EndPage) {
         let n = self.end_pages.fetch_add(1, Ordering::Relaxed) + 1;
-        drop(self.shared.swap_end(Some((n, page))));
-        self.send(RenderMsg::End(n));
+        drop(self.shared.put_end(n, page));
+        self.send(RenderMsg::End);
     }
 
     /// The end screen is left (a retry, selection, the practice page): a
-    /// page still waiting is dropped and never drawn.
+    /// page still waiting is dropped, and no page shown so far is drawn
+    /// again, by a signal still pending or by a frame of the page drawn
+    /// last.
     pub fn clear_end(&self) {
-        drop(self.shared.swap_end(None));
+        let upto = self.end_pages.load(Ordering::Relaxed);
+        drop(self.shared.clear_end(upto));
     }
 
     /// Waits at most `timeout` until the end page shown last has been
@@ -425,7 +457,7 @@ pub fn spawn(
     let shared = Arc::new(Shared {
         failed: AtomicBool::new(false),
         first_frame: AtomicI64::new(i64::MIN),
-        end_page: Mutex::new(None),
+        end_page: Mutex::new(EndSlot::default()),
         #[cfg(feature = "dev-tools")]
         end_drawn: AtomicU64::new(0),
     });
@@ -617,21 +649,13 @@ impl Run {
                 // Without a screen (it failed), the failure stays reported
                 // and nothing is drawn: the game builds the screen again
                 // through a preparation, which can fail.
-                Ok(RenderMsg::End(n)) => {
-                    if let Some(page) = self.shared.swap_end(None) {
+                // Its page, or a newer one an earlier signal took; whether
+                // it may still be drawn is checked before every end frame.
+                Ok(RenderMsg::End) => {
+                    if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
                     }
-                    // Its page, or a newer one, was taken; otherwise it
-                    // was cleared with the end screen, which is left: the
-                    // page drawn last goes too, and nothing is drawn until
-                    // what comes next.
-                    if self.end_page.0 >= n {
-                        mode = Mode::End;
-                    } else {
-                        self.end_page.1 = EndPage::default();
-                        mode = Mode::Idle;
-                        continue;
-                    }
+                    mode = Mode::End;
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
                     // Judgments still queued were never drawn in this play:
@@ -656,6 +680,13 @@ impl Run {
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(16));
+            }
+            // The end screen was left (its pages cleared): the page drawn
+            // last goes, and nothing is drawn until what comes next.
+            if matches!(mode, Mode::End) && self.end_page.0 <= self.shared.end_cleared() {
+                self.end_page.1 = EndPage::default();
+                mode = Mode::Idle;
+                continue;
             }
             let drawn = match &mut mode {
                 Mode::Idle => continue,
@@ -2269,6 +2300,70 @@ mod tests {
         release.send(()).unwrap();
         assert!(link.wait_end_drawn(Duration::from_secs(10)));
         assert_eq!(drew.lock().unwrap().last().unwrap().0, "waiting");
+        link.exit();
+    }
+
+    /// Two pages coalesced: the first signal took and drew the newer page,
+    /// and the second signal is still pending when the end screen is left.
+    /// Neither the pending signal nor further frames draw that page again;
+    /// left with no message pending, the page drawn last stops too.
+    #[test]
+    fn a_cleared_page_is_not_drawn_again() {
+        let (link, drew, hold, release) = ends();
+        let count = |line: &str| drew.lock().unwrap().iter().filter(|d| d.0 == line).count();
+        hold.store(true, Ordering::SeqCst);
+        link.show_end(page("page 1", None));
+        assert!(wait_until(|| !hold.load(Ordering::SeqCst)));
+        link.show_end(page("page 2", None));
+        link.show_end(page("page 3", None));
+        // The next end frame, page 3's for the signal of page 2, holds too.
+        hold.store(true, Ordering::SeqCst);
+        release.send(()).unwrap();
+        assert!(wait_until(|| !hold.load(Ordering::SeqCst)));
+        assert_eq!(count("page 3"), 1);
+        // Page 3's own signal is pending.
+        link.clear_end();
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(count("page 3"), 1, "{:?}", drew.lock().unwrap());
+        assert_eq!(count("page 2"), 0);
+
+        // Nothing pending: the page drawn last keeps being drawn until the
+        // end screen is left, then stops.
+        let (link, drew, _, _) = ends();
+        let count = |line: &str| drew.lock().unwrap().iter().filter(|d| d.0 == line).count();
+        link.show_end(page("shown", None));
+        assert!(wait_until(|| count("shown") >= 3));
+        link.clear_end();
+        std::thread::sleep(Duration::from_millis(50));
+        let after = count("shown");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(count("shown"), after);
+        link.exit();
+    }
+
+    /// A retry in the production order: the rig leaves the end screen and
+    /// then prepares the screen ([`crate::play::prepare_render`]), while
+    /// the render thread is stuck in an end frame with a newer page
+    /// waiting; the preparation's reply comes without that page drawn.
+    #[test]
+    fn a_retry_leaves_the_end_screen_before_preparing() {
+        let (link, drew, hold, release) = ends();
+        hold.store(true, Ordering::SeqCst);
+        link.show_end(page("shown", None));
+        assert!(wait_until(|| !hold.load(Ordering::SeqCst)));
+        link.show_end(page("waiting", None));
+        let mut end_page = Some(super::EndPage::default());
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+        });
+        assert!(crate::play::prepare_render(&mut end_page, &link).is_ok());
+        resume.join().unwrap();
+        assert_eq!(end_page, None);
+        std::thread::sleep(Duration::from_millis(100));
+        let lines: Vec<String> = drew.lock().unwrap().iter().map(|d| d.0.clone()).collect();
+        assert_eq!(lines, ["shown"]);
         link.exit();
     }
 }
