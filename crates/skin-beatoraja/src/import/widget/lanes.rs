@@ -429,7 +429,11 @@ impl Cx<'_> {
             .ok_or_else(|| self.range(at, "size"))?;
             heights.push(nh);
         }
-        let rounded: Vec<i128> = heights.iter().filter_map(|h| h.round()).collect();
+        let rounded: Vec<i128> = heights
+            .iter()
+            .map(|h| h.round())
+            .collect::<Option<_>>()
+            .ok_or_else(|| self.range(at, "size"))?;
         let Some(&note_h) = rounded.first() else {
             return refuse(self, "size");
         };

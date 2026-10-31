@@ -264,6 +264,14 @@ fn note_heights_come_from_size_or_the_cell() {
     assert_eq!(rects_over(&l, &tap(1, 1_000), 1_000), [[100, 860, 50, 20]]);
     refused(sizes("20, 20, 20, 20, 20, 20, 20, 21"), "size");
     refused(sizes("0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4"), "size");
+    // −2^127 as `f32`, the rationals' negative boundary, and beyond.
+    for v in ["-1.7014118346046923e38", "-1.7014119e38", "-3.4e38"] {
+        let l = sizes(&format!("{v}, 20, 20, 20, 20, 20, 20, 20"));
+        assert!(
+            matches!(l.err(), ImportError::Range { field: "size", .. }),
+            "{v}"
+        );
+    }
     // The note's height is the line's anchor: 190 % of a 600 px lane
     // leaves no room above the line once SUDDEN+ anchors at the top.
     let l = lanes(
