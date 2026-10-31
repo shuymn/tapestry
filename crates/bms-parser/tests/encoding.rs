@@ -90,6 +90,25 @@ fn euc_kr_guess_wins_over_valid_shift_jis() {
     assert_eq!(loaded.chart.sounds[0].name, "소리.wav");
 }
 
+/// Kana in EUC-JP can be valid Shift_JIS too; a guess of EUC-JP keeps it.
+#[test]
+fn euc_jp_guess_wins_over_valid_shift_jis() {
+    let title = "にほんごのうた";
+    let text = chart_text(title, "うみ", "おと.wav");
+    let bytes = encode(encoding_rs::EUC_JP, &text);
+    assert!(
+        encoding_rs::SHIFT_JIS
+            .decode_without_bom_handling_and_without_replacement(&bytes)
+            .is_some(),
+        "the case needs bytes that are valid Shift_JIS"
+    );
+    let loaded = load(&bytes);
+    assert_eq!(loaded.chart.meta.title, title);
+    assert_eq!(loaded.chart.sounds[0].name, "おと.wav");
+    let header = read_header(&bytes, &Limits::default()).unwrap();
+    assert_eq!(header.artist.as_deref(), Some("うみ"));
+}
+
 /// Bytes invalid as UTF-8 and as Shift_JIS fall back to the guess.
 #[test]
 fn invalid_in_both_falls_back_to_the_guess() {

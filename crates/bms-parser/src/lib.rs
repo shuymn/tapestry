@@ -18,10 +18,10 @@
 //! - **Text encoding:** a UTF-8 or UTF-16 BOM decides the encoding. Without
 //!   one, text that is valid UTF-8 (pure ASCII included) is UTF-8; then
 //!   text that decodes as Shift_JIS (CP932) without an error is Shift_JIS,
-//!   unless chardetng guesses EUC-KR; then chardetng's guess, with no
-//!   top-level-domain hint. Malformed bytes in the chosen encoding become
-//!   U+FFFD with one [`WarningKind::DecodeErrors`] warning. [`read_header`]
-//!   decodes alike.
+//!   unless chardetng guesses EUC-KR or EUC-JP; then chardetng's guess,
+//!   with no top-level-domain hint. Malformed bytes in the chosen encoding
+//!   become U+FFFD with one [`WarningKind::DecodeErrors`] warning.
+//!   [`read_header`] decodes alike.
 //! - **Time:** each object's time is accumulated in exact rationals and
 //!   floored to µs once; the time's denominator has at most
 //!   [`Limits::max_time_bits`] bits (an error otherwise). BPM, `#STOPxx`,
@@ -348,9 +348,9 @@ fn decode<'a>(bytes: &'a [u8], warnings: &mut Vec<Warning>) -> Cow<'a, str> {
 /// before Shift_JIS since Shift_JIS text with Japanese characters is almost
 /// never valid UTF-8, and Shift_JIS comes before the guess since a guess
 /// over mostly ASCII text with a few Japanese characters can name a Western
-/// or Chinese encoding. A guess of EUC-KR is the exception: Hangul in EUC-KR
-/// is often valid Shift_JIS too, as pairs of half-width katakana, which
-/// Japanese text rarely holds.
+/// or Chinese encoding. A guess of EUC-KR or EUC-JP is the exception: their
+/// two-byte characters are often valid Shift_JIS too, as pairs of half-width
+/// katakana, which Japanese text in Shift_JIS rarely holds.
 fn decode_detected(bytes: &[u8]) -> (Cow<'_, str>, bool) {
     // chardetng depends on encoding_rs without default features; the direct
     // dependency turns on the `alloc` feature that decoding needs.
@@ -364,6 +364,7 @@ fn decode_detected(bytes: &[u8]) -> (Cow<'_, str>, bool) {
     detector.feed(bytes, true);
     let guess = detector.guess(None, chardetng::Utf8Detection::Deny);
     if guess != encoding_rs::EUC_KR
+        && guess != encoding_rs::EUC_JP
         && let Some(text) =
             encoding_rs::SHIFT_JIS.decode_without_bom_handling_and_without_replacement(bytes)
     {
