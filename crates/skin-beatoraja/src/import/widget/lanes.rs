@@ -11,7 +11,7 @@
 
 use skin_model::{Blend, End, Filter, LaneParts, LanesDef, Side, Source, TimerRef};
 
-use super::super::geom::{HEIGHT, Offset, Q};
+use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
 use super::super::report::{DeviationId, LaneApprox, NoteKind, Severity, Span};
 use super::super::track::{self, Accepted, Stretch};
@@ -715,17 +715,10 @@ impl Cx<'_> {
             SpanHint::Undetermined => return Ok(false),
         };
         let range = |cx: &Self| cx.range(dst.span, "dst");
-        let (ow, oxw) = (Q::int(o.w), Q::int(o.x));
         let mut hull: Option<(Q, Q)> = None;
         for k in &keys.keys {
-            let [x, _, w, _] = k.rect;
-            let x = Q::int(x)
-                .mul(self.r)
-                .and_then(|v| v.add(oxw)?.sub(ow.half()?))
-                .ok_or_else(|| range(self))?;
-            let w = Q::int(w)
-                .mul(self.r)
-                .and_then(|v| v.add(ow))
+            let Rect { x, w, .. } = Rect::scaled(k.rect, self.r)
+                .and_then(|r| r.offset(o))
                 .ok_or_else(|| range(self))?;
             let x1 = x.add(w).ok_or_else(|| range(self))?;
             let (lo, hi) = (x.min(x1), x.max(x1));
