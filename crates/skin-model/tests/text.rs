@@ -119,7 +119,7 @@ fn text_error(r: Result<Skin, LoadError>) -> (usize, TextError) {
 
 /// A harness over `skin` with `lines` attached, after a frame at 100 ms.
 fn drawn(skin: Skin, lines: Vec<Option<TextImage>>) -> Harness {
-    let mut h = Harness::new(skin, &chart(), &full(0));
+    let mut h = widget_support::harness(skin);
     h.skin
         .attach_text(&mut h.play, TextTable::new(lines))
         .unwrap();
@@ -250,7 +250,12 @@ fn a_text_font_exists_in_the_sheet() {
         ))
     };
     assert_eq!(text_error(one(0, 0)), (0, TextError::UnknownFont));
-    one(0, 1).unwrap();
+    // The request carries the element's font.
+    let fonts: Vec<_> = requests(&one(0, 1).unwrap(), &NO_CHART)
+        .into_iter()
+        .map(|r| r.font)
+        .collect();
+    assert_eq!(fonts, [FontRef::File(0)]);
     assert_eq!(text_error(one(1, 1)), (0, TextError::UnknownFont));
 }
 
@@ -528,12 +533,21 @@ fn ink_left_of_the_pen_widens_the_line() {
 
 #[test]
 fn a_line_turns_about_the_box() {
+    // Turned 90° about the pivot.
+    let mut props = [None; 9];
+    for (p, v) in props.iter_mut().zip([100, 50, 300, 40]) {
+        *p = Some(v);
+    }
+    props[8] = Some(90);
     let e = |pivot| {
         let place = Place {
             pivot,
             ..Place::SCREEN
         };
-        element(Source::Text(0), BOX, place)
+        ElementDef {
+            track: lanes_support::still(props),
+            ..element(Source::Text(0), BOX, place)
+        }
     };
     let skin = load(
         vec![e(Anchor::Center), e(Anchor::BottomRight)],
@@ -544,6 +558,11 @@ fn a_line_turns_about_the_box() {
     let h = drawn(skin, vec![image, image]);
     let pivots: Vec<_> = h.batch.quads().iter().map(|q| q.pivot).collect();
     assert_eq!(pivots, [[250.0, 70.0], [400.0, 90.0]]);
+    let quarter = 90_f64.to_radians() as f32;
+    for q in h.batch.quads() {
+        assert_eq!(q.angle, quarter);
+        assert_eq!(q.rect, [100.0, 55.0, 80.0, 50.0]);
+    }
 }
 
 #[test]
