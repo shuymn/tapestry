@@ -34,10 +34,6 @@ pub const LANE_VISITS: u32 = 2 * LANE_QUADS;
 /// The quads reserved beyond [`LANE_QUADS`]: the judgment line, the lane
 /// cover and the lift cover.
 pub const LANE_RESERVED: u32 = 3;
-/// The most of the lane the lift may take, in ‰: the painted cover always
-/// leaves 100 ‰ of the lane uncovered above the judgment line, and the
-/// lift stops where that tenth would start below the cover's anchor.
-pub const MAX_COVERED: u16 = 900;
 
 /// Which side of the key lanes the scratch lane is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -613,7 +609,7 @@ impl Lanes {
         let band = len / 10.0;
         let (line, cover_at) = (f64::from(self.line), f64::from(self.cover_at));
         // Both clamps are at least 0 by the anchors' check; with
-        // `top ≤ cover_at`, the lift's keeps it within `MAX_COVERED`.
+        // `top ≤ cover_at`, the lift's keeps it within 900 ‰ of the lane.
         let lift_px = (len * f64::from(view.lift) / 1_000.0).min(line - cover_at - band);
         let line_y = line - lift_px;
         let above = len - lift_px;
