@@ -35,6 +35,7 @@
 mod bank;
 mod clock;
 mod engine;
+mod loudness;
 mod mixer;
 mod output;
 mod run;
@@ -52,6 +53,11 @@ pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use engine::{
     AudioEngine, ChartSounds, EngineError, Scheduled, ScheduledKind, SeekError, SoundCmd,
     StepReport,
+};
+pub use loudness::{
+    ANALYSIS_VERSION, Analysis, AnalysisError, BLOCK_FRAMES, CEILING_LUFS,
+    MEASUREMENT_DEPENDENCIES, MIXER_VERSION, Measurement, PEAK_CEILING_DBTP, Step, TARGET_LUFS,
+    normalization_gain,
 };
 pub use mixer::{
     Gain, HEADROOM, InvalidGain, InvalidVolume, MAX_GAIN, MAX_PENDING_STARTS, MAX_VOICES,

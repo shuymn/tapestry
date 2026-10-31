@@ -37,7 +37,7 @@ sha2 = { version = "0.11.1", default-features = false }
 # replay
 zstd = { version = "0.14.3", default-features = false }
 
-# eval, bms-parser, library, render and skin-model (dev only): benchmarks (docs/setup.md "Benchmarks")
+# eval, bms-parser, library, render, skin-model and audio (dev only): benchmarks (docs/setup.md "Benchmarks")
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 # eval, replay and skin-model (dev only): property tests
@@ -49,6 +49,8 @@ rtrb = "0.4.0"
 # audio
 rubato = { version = "5.0.1", default-features = false, features = ["fft_resampler"] }
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "pcm", "adpcm", "ogg", "vorbis", "flac", "mp3"] }
+# audio: loudness (EBU R128)
+ebur128 = { version = "0.1.11", default-features = false }
 
 # input (Windows only)
 windows = "0.62.2"

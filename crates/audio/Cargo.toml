@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bms-model.workspace = true
+ebur128.workspace = true
 rtrb.workspace = true
 rubato.workspace = true
 sha2.workspace = true
@@ -29,8 +30,13 @@ windows = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "loudness"
+harness = false
 
 [lints]
 workspace = true
