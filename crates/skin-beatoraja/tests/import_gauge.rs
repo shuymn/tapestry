@@ -8,6 +8,7 @@ mod common;
 use common::play::round;
 use common::{Loaded, has, import_sized};
 use skin_beatoraja::{CriticalPart, DeviationId, ImportError, NoteKind};
+use skin_model::Filter;
 
 /// Node images n0..n35, each an 8×8 cell of `a`, and `extra` records.
 fn images(extra: &str) -> String {
@@ -136,6 +137,7 @@ fn nodes_draw_their_first_frame_nearest() {
     for field in ["stretch", "filter"] {
         assert!(has(l.report(), NoteKind::Ignored { field }), "{field}");
     }
+    assert_eq!(l.quads(1_000)[0].filter, Filter::Nearest);
     // Two keys at one time differing only in the ignored angle.
     let body = format!(
         r#"{}, "gauge": {{"id": "g", "nodes": {}, "parts": 10}},
