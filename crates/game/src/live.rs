@@ -21,15 +21,19 @@
 //! - An aborted play closes recording and only then drains what is left in the
 //!   source queues into its record, unevaluated, so input that arrived after
 //!   the abort is kept (design.md "Play Lifecycle").
-//! - A completed play seals its key sounds; the tail ends when the audio
-//!   side reports the sealed audio done.
-//! - A practice round ([`crate::practice`]) opens recording
-//!   [`RESTORE_AHEAD`](crate::RESTORE_AHEAD) before its lead-in, has its
-//!   audio restored at the lead-in's start ([`crate::restore`]), and is
-//!   evaluated in its section. At completion it rings out instead of the tail: the ring-out
-//!   ends when the audio side reports it done and the play's time has
-//!   reached its end. A repeated round that rang out to its end is followed
-//!   by the next round at the following step, with no result between.
+//! - A completed play enters one tail stage ([`TailStage`]), a round's end
+//!   stage of which a full play's audio tail is the special case: a
+//!   practice round ([`crate::practice`]) rings out and its stage ends when
+//!   the audio side reports it done and the play's time has reached the
+//!   ring-out's end; a full play seals its key sounds and its stage ends
+//!   when the audio is done. The controls and failures act on every stage
+//!   alike: once the play is complete, the quit key skips the rest of the
+//!   stage to the result instead of leaving the chart ([`TailAction`]). A
+//!   repeated round whose stage ran to its end is followed by the next
+//!   round at the following step, with no result between.
+//! - A practice round opens recording [`RESTORE_AHEAD`](crate::RESTORE_AHEAD)
+//!   before its lead-in, has its audio restored at the lead-in's start
+//!   ([`crate::restore`]), and is evaluated in its section.
 //! - Opening and closing recording wait a bounded time for the input
 //!   thread. One that is gone or does not answer ends the run with
 //!   [`LiveError::Input`], after the play's record is saved: a failed close
@@ -292,6 +296,30 @@ pub enum Leave {
     Quit,
 }
 
+/// What a command does once the play is complete, during its audio tail or
+/// a round's ring-out (design.md "Audio tail"). Skipping to the result is
+/// its own action, not a quit: the quit key is its only trigger for now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailAction {
+    /// The rest of the tail is skipped: its audio stops and the play's
+    /// result shows.
+    SkipToResult,
+    /// The tail is cut with this cause, which decides what follows (a
+    /// retry retries; anything else shows the result).
+    Cut(AbortCause),
+}
+
+impl TailAction {
+    /// What `c` does in the tail.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn of(c: Command) -> Self {
+        match c {
+            Command::Quit => Self::SkipToResult,
+            Command::Retry | Command::Suspend => Self::Cut(c.cause()),
+        }
+    }
+}
+
 /// How the plays of a chart are left: closing the window ends the run,
 /// anything else leaves the chart; a known input-thread failure ends the
 /// run with its cause.
@@ -306,8 +334,9 @@ fn leave<R: Rig>(rig: &R) -> Result<Leave, LiveError<R::ScreenError>> {
 
 /// Plays one chart until the player leaves it: every play's report goes
 /// to [`Rig::ended`]; a play that neither quit nor retried shows its
-/// result, which waits for a [`MenuCommand`]. A quit leaves the chart
-/// ([`Leave::Back`]); closing the window ends the run ([`Leave::Quit`]).
+/// result, which waits for a [`MenuCommand`]. A quit before the play is
+/// complete leaves the chart ([`Leave::Back`]); after it, it skips the
+/// tail to the result. Closing the window ends the run ([`Leave::Quit`]).
 ///
 /// # Errors
 ///
@@ -319,7 +348,12 @@ pub fn run_chart<R: Rig>(
     rig: &mut R,
 ) -> Result<Leave, LiveError<R::ScreenError>> {
     loop {
-        let Some((report, next)) = play_and_next(loaded, rig)? else {
+        let Some(Played {
+            report,
+            next,
+            next_round,
+        }) = play_and_next(loaded, rig)?
+        else {
             return leave(rig);
         };
         rig.ended(&report);
@@ -334,13 +368,10 @@ pub fn run_chart<R: Rig>(
         if by(AbortCause::Retry) {
             continue;
         }
-        // A repeated round whose ring-out ran to its end is followed by the
-        // next round, whose countdown begins at the following step; any
-        // other end of a round shows its result as a full play's does.
-        if report.end == PlayEnd::Completed
-            && report.tail_cut.is_none()
-            && loaded.practice().is_some_and(|p| p.repeat)
-        {
+        // A tail stage that ran to its end and repeats (a repeated round's
+        // ring-out) is followed by the next round, whose countdown begins at
+        // the following step; any other end shows the result.
+        if next_round {
             rig.wait();
             continue;
         }
@@ -416,11 +447,19 @@ pub fn play<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
 ) -> Result<Option<PlayReport>, LiveError<R::ScreenError>> {
-    Ok(play_and_next(loaded, rig)?.map(|(report, _)| report))
+    Ok(play_and_next(loaded, rig)?.map(|p| p.report))
 }
 
-/// A play's report and the command that arrived as recording closed.
-type Played = (PlayReport, Option<Command>);
+/// A play's report, and what follows it.
+struct Played {
+    report: PlayReport,
+    /// The command that arrived as recording closed after an abort: the
+    /// run's next step.
+    next: Option<Command>,
+    /// The play's tail stage ran to its end and is followed by the next
+    /// round, with no result between.
+    next_round: bool,
+}
 
 /// [`play`], with the command that arrived as recording closed after an
 /// abort: the run's next step (a completed play's tail takes it).
@@ -503,9 +542,8 @@ fn play_and_next<R: Rig>(
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
     let round = restore_at.is_some();
-    // A round's ring-out, once it completed: where its fade starts and
-    // where it ends, in its chart time.
-    let mut ring_out = None;
+    // The tail stage, once the play completed.
+    let mut stage = None;
     let mut output_error = None;
     let mut input_error = None;
     // A suspend while recording is open marks the record incomplete, whichever
@@ -550,16 +588,7 @@ fn play_and_next<R: Rig>(
             break PlayEnd::Aborted(cause);
         }
         if advance.complete {
-            // A round rings out from the step that completed it, as a full
-            // play's audio tail follows it.
-            if round {
-                let end_at = TimeUs(now.0.saturating_add(RING_OUT.0));
-                let fade_at = TimeUs(end_at.0.saturating_sub(FADE.0));
-                rig.ring_out(fade_at, end_at);
-                ring_out = Some(end_at);
-            } else {
-                rig.seal_audio();
-            }
+            stage = Some(TailStage::begin(rig, loaded, round, now));
             break PlayEnd::Completed;
         }
         // An audio failure after a step that did not complete ends the play
@@ -610,74 +639,24 @@ fn play_and_next<R: Rig>(
     let view = logic.view();
     let record = logic.into_record();
 
-    // The audio tail of a completed play, or a round's ring-out: nothing is
-    // recorded, and a control, an input-thread failure, focus loss, removal
-    // of the last device, an audio failure or a screen failure cuts it
-    // short; the play stays complete, and its frozen record is saved after
-    // it either way.
-    let mut tail_cut = None;
-    if end == PlayEnd::Completed
-        && let Some(c) = carried
-    {
-        tail_cut = Some(c.cause());
-        rig.cancel_audio();
-    } else if end == PlayEnd::Completed
-        && let Some(e) = rig.input_failure()
-    {
-        input_error = Some(e);
-        tail_cut = Some(AbortCause::InputFailed);
-        rig.cancel_audio();
-    } else if end == PlayEnd::Completed
-        && let Some(e) = rig.audio_failure()
-    {
-        output_error = Some(e);
-        tail_cut = Some(AbortCause::OutputFailed);
-        rig.cancel_audio();
-    }
-    // A round's ring-out ends once the audio is done and its time has
-    // reached the ring-out's end: the audio side mixes ahead, so its report
-    // alone can come early.
-    let tail_over = |rig: &R| {
-        rig.audio_done() && ring_out.is_none_or(|end_at| rig.now().0 - origin.0 >= end_at.0)
+    let tail = match stage {
+        Some(stage) => run_tail(
+            rig,
+            stage,
+            origin,
+            carried,
+            &mut input_error,
+            &mut output_error,
+        ),
+        None => TailEnd::NoTail,
     };
-    while end == PlayEnd::Completed && tail_cut.is_none() && !tail_over(rig) {
-        rig.wait();
-        tail_cut = if rig.quitting() {
-            Some(AbortCause::Quit)
-        } else if let Some(c) = rig.take() {
-            Some(c.cause())
-        } else if let Some(e) = rig.input_failure() {
-            input_error = Some(e);
-            Some(AbortCause::InputFailed)
-        } else if rig.focus_lost() {
-            Some(AbortCause::FocusLoss)
-        } else if !rig.connected() {
-            Some(AbortCause::LastSourceRemoved)
-        } else if let Some(e) = rig.audio_failure() {
-            output_error = Some(e);
-            Some(AbortCause::OutputFailed)
-        } else if rig.screen_failed() {
-            Some(AbortCause::ScreenFailed)
-        } else {
-            None
-        };
-        if tail_cut.is_none() {
-            rig.stepped(false);
-            if let Some(e) = rig.audio_failure() {
-                output_error = Some(e);
-                tail_cut = Some(AbortCause::OutputFailed);
-            }
-        }
-        if tail_cut.is_some() {
-            rig.cancel_audio();
-        }
-    }
 
     rig.play_over();
     let report = loaded.finish_play(PlayOutcome {
         start,
         end,
-        tail_cut,
+        tail_cut: tail.cut(),
+        tail_skipped: tail == TailEnd::Skipped,
         output_error,
         input_error,
         live,
@@ -690,5 +669,162 @@ fn play_and_next<R: Rig>(
     });
     // A completed play's tail took the carried command.
     let next = carried.filter(|_| end != PlayEnd::Completed);
-    Ok(Some((report, next)))
+    let next_round = stage.is_some_and(|s| s.repeats) && tail == TailEnd::RanOut;
+    Ok(Some(Played {
+        report,
+        next,
+        next_round,
+    }))
+}
+
+/// The stage after a completed play: a round's end stage, of which a full
+/// play's audio tail is the special case (design.md "Audio tail",
+/// "Mid-Chart Start and Section Repeat"). Nothing is recorded, and the
+/// controls and failures act on every stage alike ([`run_tail`]); a stage
+/// differs only in its data: where it ends, and what follows it once it
+/// ran to its end. A full play is the stage that ends when the audio is
+/// done and does not repeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TailStage {
+    /// Where the stage's ring-out ends, in the play's time: it then ends
+    /// once the audio is done and the play's time has reached it, since
+    /// the audio side mixes ahead and its report alone can come early.
+    /// `None`: it ends when the audio is done (a full play).
+    ring_out_end: Option<TimeUs>,
+    /// Whether a stage run to its end is followed by the next round, with
+    /// no result between (a repeated round); otherwise the result shows.
+    repeats: bool,
+}
+
+impl TailStage {
+    /// The stage of a play completed at play time `now`: a round rings out
+    /// from that step; a full play, with no ring-out, seals its key sounds
+    /// and lets its audio end by itself.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn begin<R: Rig>(rig: &mut R, loaded: &Loaded, round: bool, now: TimeUs) -> Self {
+        if round {
+            let end_at = TimeUs(now.0.saturating_add(RING_OUT.0));
+            let fade_at = TimeUs(end_at.0.saturating_sub(FADE.0));
+            rig.ring_out(fade_at, end_at);
+            Self {
+                ring_out_end: Some(end_at),
+                repeats: loaded.practice().is_some_and(|p| p.repeat),
+            }
+        } else {
+            rig.seal_audio();
+            Self {
+                ring_out_end: None,
+                repeats: false,
+            }
+        }
+    }
+
+    /// Whether the stage has run to its end, for a play whose chart time 0
+    /// lies at `origin`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn over<R: Rig>(self, rig: &R, origin: TimeUs) -> bool {
+        rig.audio_done()
+            && self
+                .ring_out_end
+                .is_none_or(|end_at| rig.now().0 - origin.0 >= end_at.0)
+    }
+}
+
+/// How a play's tail stage ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailEnd {
+    /// The play did not complete: it had no tail.
+    NoTail,
+    /// It ran to its end.
+    RanOut,
+    /// The player skipped it to the result.
+    Skipped,
+    /// It was cut short with this cause.
+    Cut(AbortCause),
+}
+
+impl TailEnd {
+    /// What `action` ends the tail with.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn of(action: TailAction) -> Self {
+        match action {
+            TailAction::SkipToResult => Self::Skipped,
+            TailAction::Cut(cause) => Self::Cut(cause),
+        }
+    }
+
+    /// The cause that cut the tail, if one did.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn cut(self) -> Option<AbortCause> {
+        match self {
+            Self::Cut(cause) => Some(cause),
+            Self::NoTail | Self::RanOut | Self::Skipped => None,
+        }
+    }
+}
+
+/// Runs a completed play's tail stage until it ends (design.md "Audio
+/// tail"). The command `carried` from the close, or an input-thread or
+/// audio failure already known, ends it at once. Then, at each wait,
+/// skipping to the result ends it, as do a retry or a suspend, closing the
+/// window, an input-thread failure, focus loss, removal of the last device,
+/// an audio failure or a screen failure, which cut it with their cause.
+/// Whatever ends it early stops its audio; the play stays complete either
+/// way.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn run_tail<R: Rig>(
+    rig: &mut R,
+    stage: TailStage,
+    origin: TimeUs,
+    carried: Option<Command>,
+    input_error: &mut Option<InputWaitError>,
+    output_error: &mut Option<OutputError>,
+) -> TailEnd {
+    let early = if let Some(c) = carried {
+        Some(TailEnd::of(TailAction::of(c)))
+    } else if let Some(e) = rig.input_failure() {
+        *input_error = Some(e);
+        Some(TailEnd::Cut(AbortCause::InputFailed))
+    } else if let Some(e) = rig.audio_failure() {
+        *output_error = Some(e);
+        Some(TailEnd::Cut(AbortCause::OutputFailed))
+    } else {
+        None
+    };
+    if let Some(end) = early {
+        rig.cancel_audio();
+        return end;
+    }
+    while !stage.over(rig, origin) {
+        rig.wait();
+        // Closing the window ends the run: no command is taken with it.
+        let ended = if rig.quitting() {
+            Some(TailEnd::Cut(AbortCause::Quit))
+        } else if let Some(c) = rig.take() {
+            Some(TailEnd::of(TailAction::of(c)))
+        } else if let Some(e) = rig.input_failure() {
+            *input_error = Some(e);
+            Some(TailEnd::Cut(AbortCause::InputFailed))
+        } else if rig.focus_lost() {
+            Some(TailEnd::Cut(AbortCause::FocusLoss))
+        } else if !rig.connected() {
+            Some(TailEnd::Cut(AbortCause::LastSourceRemoved))
+        } else if let Some(e) = rig.audio_failure() {
+            *output_error = Some(e);
+            Some(TailEnd::Cut(AbortCause::OutputFailed))
+        } else if rig.screen_failed() {
+            Some(TailEnd::Cut(AbortCause::ScreenFailed))
+        } else {
+            rig.stepped(false);
+            rig.audio_failure().map(|e| {
+                *output_error = Some(e);
+                TailEnd::Cut(AbortCause::OutputFailed)
+            })
+        };
+        if let Some(end) = ended {
+            rig.cancel_audio();
+            return end;
+        }
+    }
+    TailEnd::RanOut
 }

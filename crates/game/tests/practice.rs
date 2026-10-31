@@ -174,6 +174,8 @@ struct Rounds {
     engine_origin: i64,
     /// A refusal `restore_audio` gives instead of planning.
     refuse_restore: Option<RestoreError>,
+    /// The results shown, by round.
+    shown: Vec<usize>,
 }
 
 impl Rounds {
@@ -214,6 +216,7 @@ impl Rounds {
             restore: None,
             engine_origin: 0,
             refuse_restore: None,
+            shown: Vec::new(),
         }
     }
 
@@ -403,7 +406,11 @@ impl Rig for Rounds {
         self.reports.push(report.clone());
     }
 
-    fn show_end(&mut self, _report: &PlayReport, _screen: &game::ResultScreen) {}
+    fn show_end(&mut self, _report: &PlayReport, _screen: &game::ResultScreen) {
+        if self.shown.last() != Some(&self.round) {
+            self.shown.push(self.round);
+        }
+    }
 }
 
 fn config() -> SessionConfig {
@@ -704,11 +711,60 @@ fn retry_cuts_the_ring_out_and_saves() {
     assert_eq!(run.reports.len(), 2);
 }
 
+/// The quit key during a round's ring-out skips the rest of it to the
+/// round's result, a repeated round's too, instead of leaving the rounds:
+/// the audio stops in that step, the frozen record is saved complete, and
+/// the quit key on the result then leaves (design.md "Audio tail").
+#[test]
+fn quit_skips_the_ring_out_to_the_rounds_result() {
+    let run = example_rounds(
+        2,
+        0,
+        &[
+            (1, 20_900 * MS, Command::Quit),
+            (1, 21_500 * MS, Command::Quit),
+        ],
+    );
+    let [round1] = &run.reports[..] else {
+        panic!("{} rounds", run.reports.len());
+    };
+    assert_eq!(round1.end, PlayEnd::Completed);
+    assert!(round1.tail_skipped);
+    assert_eq!(round1.tail_cut, None);
+    assert_eq!(run.rig.shown, [1]);
+    let cancel = first(&run, |e| match *e {
+        Ev::Cancel { at } => Some(at),
+        _ => None,
+    });
+    assert_eq!(cancel, 20_900 * MS);
+    let saved = first(&run, |e| match *e {
+        Ev::Save { at } => Some(at),
+        _ => None,
+    });
+    assert_eq!(saved, 20_900 * MS);
+    assert!(round1.saved.as_ref().is_some_and(Result::is_ok));
+    assert_eq!(run.records.len(), 1);
+    assert_eq!(run.records[0].status.end, replay::EndStatus::PlayedToEnd);
+    assert_eq!(run.records[0].status.finalized, TimeUs(19_680_999));
+    // Nothing sounds after the skip: frame `n` plays at
+    // `CLOCK_START + (n + 480) / RATE`, round 1's chart time 7.8 s at
+    // `CLOCK_START`, and the output queues two periods ahead.
+    let left: Vec<f32> = run.rig.out.samples().iter().step_by(2).copied().collect();
+    let cut = usize::try_from((20_900 - 7_800 + 20) * MS * i64::from(RATE) / 1_000_000).unwrap();
+    assert!(left[..cut].iter().any(|&x| x != 0.0));
+    assert!(left[cut..].iter().all(|&x| x == 0.0));
+}
+
 #[test]
 fn saving_never_delays_the_ring_out() {
-    // A ring-out run to its end, and one quit at 20.9 s, each with an
-    // instant save and one taking 400 ms.
-    for commands in [vec![], vec![(1, 20_900 * MS, Command::Quit)]] {
+    // A ring-out run to its end, and one skipped to the round's result by
+    // the quit key at 20.9 s and left there, each with an instant save and
+    // one taking 400 ms.
+    let skipped = vec![
+        (1, 20_900 * MS, Command::Quit),
+        (1, 21_500 * MS, Command::Quit),
+    ];
+    for commands in [vec![], skipped] {
         let instant = example_rounds(2, 0, &commands);
         let slow = example_rounds(2, 400 * MS, &commands);
         // Everything of round 1 up to its save, at the same times.
@@ -726,7 +782,8 @@ fn saving_never_delays_the_ring_out() {
                 .iter()
                 .any(|e| matches!(e, Ev::RingOut { .. }))
         );
-        // The quit cuts the ring-out in its step, before the save.
+        // The quit skips the rest of the ring-out in its step, before the
+        // save.
         if !commands.is_empty() {
             assert!(round1(&slow).contains(&Ev::Cancel {
                 at: CLOCK_START + 20_900 * MS - 7_800 * MS
@@ -736,7 +793,7 @@ fn saving_never_delays_the_ring_out() {
         // the ring-out's end.
         // Frame `n` plays at `CLOCK_START + (n + 480) / RATE`, and round
         // 1's chart time 7.8 s at `CLOCK_START`.
-        // A quit ends the run, and the output, at 20.9 s.
+        // A skip stops the output at 20.9 s.
         let end = usize::try_from((21_181 - 7_800) * MS * i64::from(RATE) / 1_000_000).unwrap();
         let (a, b) = (instant.rig.out.samples(), slow.rig.out.samples());
         let n = (2 * end).min(a.len());

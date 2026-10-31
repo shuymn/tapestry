@@ -2370,3 +2370,146 @@ fn what_ifs_are_condensed_on_the_as_played_axis() {
         }
     }
 }
+
+/// An event the player or the system brings, at a clock time.
+#[derive(Clone, Copy, Debug)]
+enum Event {
+    QuitKey,
+    Retry,
+    Close,
+    FocusLoss,
+}
+
+/// How a chart's first play went: its end, the tail's cut and skip, how
+/// many plays ran, how many results were shown, and how the chart was
+/// left.
+type Went = (PlayEnd, Option<AbortCause>, bool, usize, usize, game::Leave);
+
+/// `event` at clock time `at` in a play that opens at 7.3 s (origin 8.3
+/// s), completes at 9.983 s and has a 2 s audio tail; the quit key at 15 s
+/// leaves a result shown by then, and the window closes at 16 s.
+fn went(event: Event, at: i64) -> Went {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut commands = vec![(15_000_000, Command::Quit)];
+    let mut quit_at = 16_000_000;
+    match event {
+        Event::QuitKey => commands.push((at, Command::Quit)),
+        Event::Retry => commands.push((at, Command::Retry)),
+        Event::Close => quit_at = at,
+        Event::FocusLoss => items.push(ScriptItem {
+            at: TimeUs(at),
+            action: Action::FocusLoss,
+        }),
+    }
+    let mut rig = Fake::new(items, &commands, quit_at);
+    rig.tail_waits = 2_000;
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let one = &rig.reports[0];
+    (
+        one.end,
+        one.tail_cut,
+        one.tail_skipped,
+        rig.reports.len(),
+        rig.shows,
+        left,
+    )
+}
+
+/// The state × event table of design.md "Play Lifecycle": in the countdown
+/// and while playing, the quit key aborts the play and leaves the chart;
+/// once the play is complete, in its audio tail, it skips to the result,
+/// which the next quit leaves. Retry retries from every state, closing the
+/// window ends the run from every state, and focus loss ends the play, or
+/// cuts its tail, and shows the result.
+#[test]
+fn every_state_and_event_of_a_play() {
+    use game::Leave::{Back, Quit};
+    let aborted = PlayEnd::Aborted;
+    let done = PlayEnd::Completed;
+    // The countdown (play time -0.5 s) and playing (1.2 s).
+    for (state, at) in [("countdown", 7_800_000), ("playing", 9_500_000)] {
+        let cases = [
+            (
+                Event::QuitKey,
+                (aborted(AbortCause::Quit), None, false, 1, 0, Back),
+            ),
+            (
+                Event::Retry,
+                (aborted(AbortCause::Retry), None, false, 2, 1, Back),
+            ),
+            (
+                Event::Close,
+                (aborted(AbortCause::Quit), None, false, 1, 0, Quit),
+            ),
+            (
+                Event::FocusLoss,
+                (aborted(AbortCause::FocusLoss), None, false, 1, 1, Back),
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(went(event, at), expected, "{state}, {event:?}");
+        }
+    }
+    // The tail (play time 1.8 s).
+    let tail = [
+        (Event::QuitKey, (done, None, true, 1, 1, Back)),
+        (
+            Event::Retry,
+            (done, Some(AbortCause::Retry), false, 2, 1, Back),
+        ),
+        (
+            Event::Close,
+            (done, Some(AbortCause::Quit), false, 1, 0, Quit),
+        ),
+        (
+            Event::FocusLoss,
+            (done, Some(AbortCause::FocusLoss), false, 1, 1, Back),
+        ),
+    ];
+    for (event, expected) in tail {
+        assert_eq!(went(event, 10_100_000), expected, "tail, {event:?}");
+    }
+}
+
+/// The quit key in the tail stops the audio in that step, shows the
+/// result there, and saves the record complete.
+#[test]
+fn a_quit_in_the_tail_stops_the_audio_and_shows_the_result_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let commands = [(10_100_000, Command::Quit), (10_500_000, Command::Quit)];
+    let mut rig = Fake::new(items, &commands, i64::MAX);
+    rig.tail_waits = 2_000;
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    let [one] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!((one.end, one.tail_cut), (PlayEnd::Completed, None));
+    assert!(one.tail_skipped);
+    assert_eq!(rig.cancels, 1);
+    assert_eq!(rig.shown_at.first(), Some(&10_100_000));
+    assert!(matches!(one.saved, Some(Ok(_))), "{:?}", one.saved);
+    assert_eq!(status(one).end, replay::EndStatus::PlayedToEnd);
+}
+
+/// The quit key that arrives as a completed play's recording closes skips
+/// the tail too.
+#[test]
+fn a_quit_during_close_after_completion_skips_to_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(10_500_000, Command::Quit)], i64::MAX);
+    rig.tail_waits = 2_000;
+    rig.in_close = Some(Command::Quit);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    let one = &rig.reports[0];
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert!(one.tail_skipped);
+    assert_eq!((rig.cancels, rig.shows), (1, 1));
+}

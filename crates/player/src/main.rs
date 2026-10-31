@@ -572,8 +572,8 @@ fn start_engine(
 }
 
 /// What `tapestry play`'s load lends its loudness measurement: the 1×
-/// chart and bank for a chart at another speed, and the close as its
-/// cancel.
+/// chart and bank for a chart at another speed, and the close or the quit
+/// key as its cancel.
 struct PlayHost<'a> {
     loaded: &'a Loaded,
     rate: u32,
@@ -595,7 +595,7 @@ impl loudness::Host for PlayHost<'_> {
     fn measuring(&mut self, _name: &str) {}
 
     fn cancelled(&mut self) -> bool {
-        self.controls.quitting()
+        self.controls.quitting() || self.controls.leaving()
     }
 }
 
@@ -678,10 +678,15 @@ fn view(controls: &Controls) -> View {
 }
 
 /// The controls, with the settings keys starting from the loaded values,
-/// waking the calling thread: the game thread.
+/// waking the calling thread: the game thread. The quit key is taken once
+/// by the play or result it arrives in, with or without selection: before
+/// a play is complete it leaves the chart, after it it skips the tail to
+/// the result (design.md "Audio tail"); only closing the window latches
+/// quitting.
 fn controls(s: &Settings, clock: QpcClock) -> Arc<Controls> {
     let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volume(s.device.master_volume);
     let controls = Controls::with_tuning(clock, Arc::new(tuning));
+    controls.quit_leaves();
     controls.set_game(std::thread::current());
     Arc::new(controls)
 }
@@ -1176,7 +1181,6 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         }
     };
     let controls = controls(&settings, clock);
-    controls.quit_leaves();
     let waker = Waker::new().context("input")?;
     #[cfg(feature = "dev-tools")]
     let _suspend = if headless {
@@ -1566,6 +1570,25 @@ mod tests {
         Controls, Mode, axis_mode, diagnostic, input_side, menu_input, open_window_and_input,
         sources,
     };
+
+    /// Both launch paths, `tapestry play <chart>` as song selection, make
+    /// the quit key a command taken once by the play or result it arrives
+    /// in, so a complete play's tail can skip to the result; only closing
+    /// the window latches quitting.
+    #[test]
+    fn the_quit_key_is_taken_once_in_both_launch_paths() {
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let c = super::controls(&settings, QpcClock::start());
+        c.command(game::Command::Quit);
+        assert!(!c.quitting());
+        assert_eq!(c.take(), Some(game::Command::Quit));
+        assert_eq!(c.take(), None);
+        c.close();
+        assert!(c.quitting());
+    }
 
     /// Both launch paths take the menus' input from `menu_input`: the
     /// window's queue is the one the result screen reads, and a configured
