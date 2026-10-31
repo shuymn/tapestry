@@ -165,7 +165,10 @@ fn what_if_peak_stays_within_its_budget() {
                 live: &[],
             };
             let mut evaluated = None;
-            let peak = peak_of(&mut || evaluated = Some(ReEvaluate::under(&ctx, &what_if)));
+            // The record's own buffers are held throughout, outside the
+            // closure: the estimate counts them.
+            let peak = peak_of(&mut || evaluated = Some(ReEvaluate::under(&ctx, &what_if)))
+                + record_bytes(&record);
             let evaluated = evaluated.unwrap().unwrap();
             assert!(!evaluated.as_played);
             assert_eq!(evaluated.evaluation.gauges.len(), gauges);
@@ -184,9 +187,42 @@ fn what_if_peak_stays_within_its_budget() {
             }
         }
         // The played preset's own budget would not have covered more gauges.
+
         if gauges > played.gauges.len() {
             let own = what_if_bytes(&chart, &played, &record).unwrap();
             assert!(own < what_if_bytes(&chart, &what_if, &record).unwrap());
         }
     }
+    // One gauge whose ID is near the preset file's 1 MiB limit, on a few
+    // inputs: hashing the preset must not hold its canonical encoding,
+    // which would be larger than the evaluation itself.
+    let mut long = rules::tapestry();
+    long.id = "long".to_owned();
+    long.gauges = vec![rules::GaugeRule {
+        id: "g".repeat(900_000),
+        ..normal
+    }];
+    let mut record = record.clone();
+    record.events.truncate(64);
+    let budget = what_if_bytes(&chart, &long, &record).unwrap();
+    let ctx = ResultContext {
+        record: &record,
+        chart: &chart,
+        preset: &played,
+        live: &[],
+    };
+    let mut evaluated = None;
+    let peak =
+        peak_of(&mut || evaluated = Some(ReEvaluate::under(&ctx, &long))) + record_bytes(&record);
+    assert!(evaluated.unwrap().is_ok());
+    assert!(
+        peak <= budget,
+        "long gauge ID: peak {peak} over the budget {budget}"
+    );
+}
+
+/// The bytes the record's input buffers hold, which the estimate counts.
+fn record_bytes(record: &PlayRecord) -> usize {
+    record.events.capacity() * size_of::<eval::PhysicalInputEvent>()
+        + record.start.held.capacity() * eval::HELD_BYTES
 }

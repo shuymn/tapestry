@@ -145,10 +145,14 @@ impl Default for DecodeLimits {
     }
 }
 
-/// SHA-256 of the preset's canonical bytes, which identifies it in records.
+/// SHA-256 of the preset's canonical bytes, which identifies it in records,
+/// hashed as they are written: it allocates nothing, so evaluating a record
+/// under a preset of long names needs no buffer for them.
 #[must_use]
 pub fn preset_hash(p: &RulePreset) -> [u8; 32] {
-    Sha256::digest(p.canonical_bytes()).into()
+    let mut h = Sha256::new();
+    p.write_canonical(|b| h.update(b));
+    h.finalize().into()
 }
 
 /// Encodes `rec` as a file.

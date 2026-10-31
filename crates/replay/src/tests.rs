@@ -892,6 +892,21 @@ fn preset_hash_is_sha256_of_canonical_bytes() {
         hash,
         <[u8; 32]>::from(Sha256::digest(preset.canonical_bytes()))
     );
+    // Of every built-in, and of one with long names, written in pieces.
+    for name in rules::BUILT_IN_PRESETS {
+        let p = rules::built_in(name).unwrap();
+        assert_eq!(
+            preset_hash(&p),
+            <[u8; 32]>::from(Sha256::digest(p.canonical_bytes()))
+        );
+    }
+    let mut long = rules::tapestry();
+    long.id = "p".repeat(5_000);
+    long.gauges[0].id = "g".repeat(70_000);
+    assert_eq!(
+        preset_hash(&long),
+        <[u8; 32]>::from(Sha256::digest(long.canonical_bytes()))
+    );
     let rec = PresetRecord::of(&preset);
     assert_eq!(rec.sha256, hash);
     assert_eq!(rec.id, preset.id);

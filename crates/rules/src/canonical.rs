@@ -51,6 +51,18 @@ impl RulePreset {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
+        self.encode(&mut w);
+        w.0
+    }
+
+    /// Hands the [canonical bytes](Self::canonical_bytes) to `out` in
+    /// order, a few at a time, without holding them: a hash of them needs
+    /// no buffer as large as the preset's strings.
+    pub fn write_canonical(&self, out: impl FnMut(&[u8])) {
+        self.encode(&mut Writer(Stream(out)));
+    }
+
+    fn encode<S: Sink>(&self, w: &mut Writer<S>) {
         w.uint(CANONICAL_VERSION);
         let Self {
             id,
@@ -105,7 +117,6 @@ impl RulePreset {
             TotalMode::ScalesIncrease => 0,
         });
         w.mine(mine);
-        w.0
     }
 
     /// Decodes [`canonical_bytes`](Self::canonical_bytes) of the current
@@ -194,18 +205,38 @@ impl RulePreset {
     }
 }
 
-struct Writer(Vec<u8>);
+/// Where a [`Writer`] puts the bytes.
+trait Sink {
+    fn put(&mut self, bytes: &[u8]);
+}
 
-impl Writer {
+impl Sink for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+/// Bytes handed on as they are written.
+struct Stream<F>(F);
+
+impl<F: FnMut(&[u8])> Sink for Stream<F> {
+    fn put(&mut self, bytes: &[u8]) {
+        (self.0)(bytes);
+    }
+}
+
+struct Writer<S = Vec<u8>>(S);
+
+impl<S: Sink> Writer<S> {
     fn uint(&mut self, mut v: u64) {
         loop {
             let byte = (v & 0x7f) as u8;
             v >>= 7;
             if v == 0 {
-                self.0.push(byte);
+                self.0.put(&[byte]);
                 return;
             }
-            self.0.push(byte | 0x80);
+            self.0.put(&[byte | 0x80]);
         }
     }
 
@@ -228,7 +259,7 @@ impl Writer {
 
     fn str(&mut self, s: &str) {
         self.len(s.len());
-        self.0.extend_from_slice(s.as_bytes());
+        self.0.put(s.as_bytes());
     }
 
     fn time(&mut self, t: TimeUs) {
