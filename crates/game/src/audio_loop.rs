@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ::audio::{
-    AudioEngine, AudioOutput, BgmSchedule, InvalidVolume, MAX_VOLUME, OutputError, ScheduledKind,
-    SoundBank,
+    AudioEngine, AudioOutput, BgmSchedule, Gain, InvalidVolume, MAX_VOLUME, OutputError,
+    ScheduledKind, SoundBank,
 };
 use bms_model::TimeUs;
 
@@ -103,7 +103,7 @@ pub enum AudioCtl {
         id: u64,
     },
     /// A play starts: chart time 0 at `origin` on the output's timeline,
-    /// key sounds from `queue`.
+    /// key sounds from `queue`, the sum at `gain` for the whole play.
     Play {
         /// Where chart time 0 lies.
         origin: TimeUs,
@@ -111,6 +111,9 @@ pub enum AudioCtl {
         queue: AudioQueue,
         /// The play's number.
         generation: u64,
+        /// The play's fixed gain on the sum: [`Gain::HEADROOM`], or the
+        /// chart's normalization gain (design.md "Algorithms").
+        gain: Gain,
     },
     /// The play was aborted: every sound stops.
     Cancel,
@@ -363,15 +366,31 @@ impl AudioControl {
         }
     }
 
-    /// Starts a play. One play switch is in flight at most: the previous
-    /// start's retired queue comes back first ([`ready`](Self::ready)), so
-    /// the return queue always has room and the audio thread never frees
-    /// one.
+    /// Starts a play at [`Gain::HEADROOM`] ([`play_at`](Self::play_at)).
     ///
     /// # Errors
     ///
     /// As [`ready`](Self::ready); nothing is sent.
     pub fn play(&mut self, origin: TimeUs, queue: AudioQueue) -> Result<(), AudioWaitError> {
+        self.play_at(origin, queue, Gain::HEADROOM)
+    }
+
+    /// Starts a play whose sum takes `gain` from its first frame to its
+    /// end: the gain travels with the start, so it never changes inside a
+    /// play, unlike the volume. One play switch is in flight at most: the
+    /// previous start's retired queue comes back first
+    /// ([`ready`](Self::ready)), so the return queue always has room and
+    /// the audio thread never frees one.
+    ///
+    /// # Errors
+    ///
+    /// As [`ready`](Self::ready); nothing is sent.
+    pub fn play_at(
+        &mut self,
+        origin: TimeUs,
+        queue: AudioQueue,
+        gain: Gain,
+    ) -> Result<(), AudioWaitError> {
         self.ready()?;
         self.in_flight = true;
         self.generation += 1;
@@ -380,6 +399,7 @@ impl AudioControl {
             origin,
             queue,
             generation,
+            gain,
         });
         Ok(())
     }
@@ -637,7 +657,10 @@ impl AudioWorker {
                     origin,
                     queue,
                     generation,
+                    gain,
                 } => {
+                    // A `Gain` is always in range.
+                    let _ = self.engine.set_gain(gain.get());
                     self.engine.restart(origin);
                     let old = std::mem::replace(&mut self.queue, queue);
                     // The return queue has room: the game thread took the

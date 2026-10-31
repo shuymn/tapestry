@@ -3,9 +3,10 @@
 //! file hashes and descriptive header, kept current by a background [`Scan`];
 //! and the personal bests derived from the saved records (design.md
 //! "Personal Bests"), counted live through a [`BestWriter`] and caught up by
-//! the bests phase of a scan pass.
+//! the bests phase of a scan pass; and the cached loudness measurements of
+//! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 3
+//! # Schema version 4
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
@@ -33,6 +34,9 @@
 //!   ([`PlayId`]).
 //! - `refused(path, size, mtime_ns, reason, waits_for)`: records refused for
 //!   a terminal reason, or waiting for the chart of hash `waits_for`.
+//! - `loudness(resolved_hash, sounds, mixer_version, analysis_version, rate,
+//!   integrated, true_peak, over_range)`: one loudness measurement
+//!   ([`LoudnessRow`]) per [`LoudnessKey`], unlinked from `charts`.
 //!
 //! A change of [`Search`]'s normalization changes what the stored text
 //! means, so it bumps the version too.
@@ -70,6 +74,7 @@ extern crate self as library;
 
 mod bests;
 mod db;
+mod loudness;
 mod scan;
 mod search;
 
@@ -89,6 +94,7 @@ pub use bests::{
 };
 pub use bms_parser::Header;
 pub use db::Tuple;
+pub use loudness::{LoudnessKey, LoudnessRow};
 pub use scan::{
     BATCH, BEST_BATCH, BestsReport, HEADER_FIELD_BYTES, REBUILD_MEMORY, Refusal, Refusals, Scan,
     ScanError, ScanOptions, ScanReport, ThreadStart, stamp,
@@ -96,7 +102,7 @@ pub use scan::{
 pub use search::{SEPARATOR, Search, Sort};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -493,6 +499,34 @@ impl Library {
         ln_mode: i64,
     ) -> Result<HashMap<[u8; 32], Score>, LibraryError> {
         bests::scores(&self.reader, preset_sha256, ln_mode).map_err(|e| self.database(e))
+    }
+
+    /// The loudness measured under `key`, if one is stored.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn loudness(&self, key: &LoudnessKey) -> Result<Option<LoudnessRow>, LibraryError> {
+        loudness::get(&self.reader, key).map_err(|e| self.database(e))
+    }
+
+    /// Stores the loudness measured under `key`, in one transaction that
+    /// also removes the rows of other mixer and analysis versions. Call it
+    /// while no scan pass may be committing: once its pause is
+    /// acknowledged, or with none running.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses; nothing was written.
+    pub fn store_loudness(
+        &mut self,
+        key: &LoudnessKey,
+        row: &LoudnessRow,
+    ) -> Result<(), LibraryError> {
+        loudness::put(&mut self.reader, key, row).map_err(|source| LibraryError::Database {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     /// Opens the connection that counts live plays.

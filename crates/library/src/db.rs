@@ -170,6 +170,17 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              reason INTEGER NOT NULL,
              waits_for BLOB
          ) WITHOUT ROWID;
+         CREATE TABLE loudness (
+             resolved_hash BLOB NOT NULL CHECK (length(resolved_hash) = 32),
+             sounds BLOB NOT NULL CHECK (length(sounds) = 32),
+             mixer_version INTEGER NOT NULL,
+             analysis_version INTEGER NOT NULL,
+             rate INTEGER NOT NULL,
+             integrated REAL,
+             true_peak REAL NOT NULL,
+             over_range INTEGER NOT NULL,
+             PRIMARY KEY (resolved_hash, sounds, mixer_version, analysis_version, rate)
+         ) WITHOUT ROWID;
          PRAGMA user_version = {SCHEMA_VERSION};
          COMMIT;"
     ))

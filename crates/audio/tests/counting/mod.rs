@@ -4,8 +4,9 @@
 //! registers it with `#[global_allocator]` and calls [`self_check`] where
 //! it starts tracking.
 //!
-//! On a tracked thread it also keeps the bytes live and their peak, and,
-//! while [`watch_all`] is on, the largest single allocation on any thread.
+//! On a tracked thread it also keeps the bytes allocated, the bytes live
+//! and their peak, and, while [`watch_all`] is on, the largest single
+//! allocation on any thread.
 
 #![allow(dead_code)]
 
@@ -25,6 +26,7 @@ thread_local! {
     // Signed: a tracked thread may free what it allocated before tracking.
     static LIVE: Cell<i64> = const { Cell::new(0) };
     static PEAK: Cell<i64> = const { Cell::new(0) };
+    static TOTAL: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Starts or stops counting this thread's allocations.
@@ -46,6 +48,12 @@ pub fn reset_peak() {
 /// then.
 pub fn peak_bytes(since: i64) -> u64 {
     u64::try_from(PEAK.get() - since).unwrap_or(0)
+}
+
+/// Bytes this thread has allocated while tracked, freed or not; a
+/// reallocation counts its new size.
+pub fn allocated_bytes() -> u64 {
+    TOTAL.get()
 }
 
 /// Bytes this thread allocated and has not freed while tracked.
@@ -83,6 +91,7 @@ fn note(size: usize) {
     }
     if TRACK.try_with(Cell::get).unwrap_or(false) {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
+        let _ = TOTAL.try_with(|total| total.set(total.get() + size as u64));
         let _ = LIVE.try_with(|live| {
             let now = live.get() + size as i64;
             live.set(now);

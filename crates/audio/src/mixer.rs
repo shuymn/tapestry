@@ -1,6 +1,6 @@
 //! The mixer: preallocated voices summed in `f32`, one sounding instance per
-//! sound id, oldest-voice stealing with a raised-cosine fade, volume, a fixed
-//! headroom gain and a static soft clipper.
+//! sound id, oldest-voice stealing with a raised-cosine fade, volume, the
+//! play's fixed gain and a static soft clipper.
 //!
 //! A triggered sound waits as a pending start at an absolute output frame,
 //! and rendering applies pending starts in time order as it reaches them, so
@@ -36,10 +36,12 @@
 //!
 //! The sum is never gain-ridden: a limiter that lowers the whole mix when a
 //! key sound pushes it over full scale would make the background audibly dip
-//! and pump back with every hit. Instead the sum takes a fixed [`HEADROOM`]
-//! gain and then [`soft_clip`], which is the identity up to [`SOFT_CLIP_KNEE`]
+//! and pump back with every hit. Instead the sum takes the play's fixed gain
+//! ([`HEADROOM`], or the chart's normalization gain, design.md "Algorithms")
+//! and then [`soft_clip`], which is the identity up to [`SOFT_CLIP_KNEE`]
 //! and saturates smoothly to full scale above it, sample by sample, with no
-//! state, look-ahead or latency.
+//! state, look-ahead or latency. [`Mixer::mix_raw`] is the sum alone, which
+//! the loudness analysis measures.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -56,9 +58,13 @@ pub const MAX_PENDING_STARTS: usize = 1024;
 pub const MAX_VOLUME: f32 = 16.0;
 /// Fade applied to a stolen voice.
 pub const STEAL_FADE_MS: u32 = 2;
-/// Fixed gain on the sum (-6 dB), so a full-scale background and a
-/// full-scale key sound together just reach full scale.
+/// The gain on the sum of a play without a loudness analysis (-6 dB), so a
+/// full-scale background and a full-scale key sound together just reach
+/// full scale.
 pub const HEADROOM: f32 = 0.5;
+/// The largest gain on the sum (+6 dB, `10^(6/20)`), the normalization's
+/// cap.
+pub const MAX_GAIN: f32 = 1.995_262_3;
 /// Level below which [`soft_clip`] passes samples unchanged.
 pub const SOFT_CLIP_KNEE: f32 = 0.8;
 
@@ -266,6 +272,40 @@ impl Envelope {
 #[error("volume {0} is outside 0 to {MAX_VOLUME}")]
 pub struct InvalidVolume(pub f32);
 
+/// A gain that is not above 0 and at most [`MAX_GAIN`] (NaN included).
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+#[error("gain {0} is not above 0 and at most {MAX_GAIN}")]
+pub struct InvalidGain(pub f32);
+
+/// A play's fixed gain on the sum: above 0 and at most [`MAX_GAIN`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gain(f32);
+
+impl Gain {
+    /// The gain of a play without a loudness analysis.
+    pub const HEADROOM: Self = Self(HEADROOM);
+
+    /// `gain`, checked.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidGain`] for a gain not above 0 or above [`MAX_GAIN`], NaN
+    /// included.
+    pub fn new(gain: f32) -> Result<Self, InvalidGain> {
+        if gain > 0.0 && gain <= MAX_GAIN {
+            Ok(Self(gain))
+        } else {
+            Err(InvalidGain(gain))
+        }
+    }
+
+    /// The gain as a factor.
+    #[must_use]
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+}
+
 /// The static soft clipper: `x` unchanged while `|x|` is at most
 /// [`SOFT_CLIP_KNEE`]; above it, `knee + (1 - knee) tanh((|x| - knee) /
 /// (1 - knee))` with the sign of `x`, which meets the identity with the
@@ -301,10 +341,15 @@ pub struct Mixer {
     mixed_to: u64,
     seq: u64,
     volume: f32,
-    /// Samples above [`SOFT_CLIP_KNEE`] after the volume and headroom.
+    /// The play's fixed gain on the sum.
+    gain: f32,
+    /// Samples above [`SOFT_CLIP_KNEE`] after the volume and the gain.
     saturated: u64,
     counts: Counts,
     dropped_starts: u64,
+    /// The frame after the last sample (fade included) of every voice that
+    /// has played to its end.
+    last_end: i64,
     /// A ring-out's envelope, until everything stops.
     envelope: Option<Envelope>,
 }
@@ -330,9 +375,11 @@ impl Mixer {
             mixed_to: 0,
             seq: 0,
             volume: 1.0,
+            gain: HEADROOM,
             saturated: 0,
             counts: Counts::default(),
             dropped_starts: 0,
+            last_end: 0,
             envelope: None,
         }
     }
@@ -380,6 +427,16 @@ impl Mixer {
         self.counts.hard_cuts
     }
 
+    /// The output frame after the last sample, fade included, of every
+    /// voice that has played to its end: where the sum fell silent once
+    /// nothing sounds. Voices stopped otherwise (a cut, a seek, a ring-out's
+    /// end) do not move it; the loudness analysis, which reads it, stops
+    /// none.
+    #[must_use]
+    pub fn last_end(&self) -> u64 {
+        u64::try_from(self.last_end).unwrap_or(0)
+    }
+
     /// Starts dropped because [`MAX_PENDING_STARTS`] were already waiting.
     #[must_use]
     pub fn dropped_starts(&self) -> u64 {
@@ -398,14 +455,14 @@ impl Mixer {
         self.pending.len() < MAX_PENDING_STARTS
     }
 
-    /// Output samples so far whose level, after the volume and
-    /// [`HEADROOM`], was above [`SOFT_CLIP_KNEE`] and so saturated.
+    /// Output samples so far whose level, after the volume and the gain,
+    /// was above [`SOFT_CLIP_KNEE`] and so saturated.
     #[must_use]
     pub fn saturated(&self) -> u64 {
         self.saturated
     }
 
-    /// Sets the master volume, applied with [`HEADROOM`] before the soft
+    /// Sets the master volume, applied with the gain before the soft
     /// clipper.
     ///
     /// # Errors
@@ -418,6 +475,24 @@ impl Mixer {
         }
         self.volume = volume;
         Ok(())
+    }
+
+    /// Sets the play's fixed gain on the sum, applied with the volume
+    /// before the soft clipper: [`HEADROOM`] until set.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidGain`] for a gain not above 0 or above [`MAX_GAIN`], which
+    /// is not applied.
+    pub fn set_gain(&mut self, gain: f32) -> Result<(), InvalidGain> {
+        self.gain = Gain::new(gain)?.get();
+        Ok(())
+    }
+
+    /// The play's fixed gain on the sum.
+    #[must_use]
+    pub fn gain(&self) -> f32 {
+        self.gain
     }
 
     /// Stops every voice, release, pending start and seek (a retry), and
@@ -537,6 +612,7 @@ impl Mixer {
     /// freed.
     fn mix(&mut self, bank: &SoundBank, out: &mut [f32], block_start: i64, from: i64, to: i64) {
         let fade = &self.fade;
+        let mut last_end = self.last_end;
         for v in self.live.all_mut().filter(|v| v.active) {
             if v.start >= to {
                 continue;
@@ -571,17 +647,51 @@ impl Mixer {
             }
             if src_end <= to {
                 v.active = false;
+                last_end = last_end.max(src_end);
             }
         }
+        self.last_end = last_end;
     }
 
     /// Renders the next `out.len() / 2` frames into interleaved stereo
     /// `out` (overwritten), starting at [`Mixer::mixed_to`]: every voice
     /// summed, with each pending start applied and a placed seek's voices
     /// entered when their frame is reached (the seek first), then the
-    /// volume, [`HEADROOM`] and [`soft_clip`], then a ring-out's envelope.
+    /// volume, the gain and [`soft_clip`], then a ring-out's envelope.
     /// Every voice stops at a ring-out's end frame.
     pub fn render(&mut self, bank: &SoundBank, out: &mut [f32]) {
+        let (block_start, block_end) = self.sum(bank, out);
+        let gain = self.volume * self.gain;
+        for x in out.iter_mut() {
+            let y = *x * gain;
+            if y.abs() > SOFT_CLIP_KNEE {
+                self.saturated += 1;
+            }
+            *x = soft_clip(y);
+        }
+        if let Some(e) = self.envelope.filter(|e| e.fade < block_end) {
+            for (f, frame) in (block_start..).zip(out.as_chunks_mut::<CHANNELS>().0) {
+                let g = e.gain(f);
+                for x in frame {
+                    *x *= g;
+                }
+            }
+        }
+    }
+
+    /// The next `out.len() / 2` frames as [`render`](Self::render) sums
+    /// them, into interleaved stereo `out` (overwritten): every voice at
+    /// unity gain, with pending starts, a placed seek and a ring-out's end
+    /// applied, before the volume, the gain, the soft clipper and a
+    /// ring-out's fade. The saturation count is not touched. What the
+    /// loudness analysis measures; it allocates nothing.
+    pub fn mix_raw(&mut self, bank: &SoundBank, out: &mut [f32]) {
+        self.sum(bank, out);
+    }
+
+    /// The voice sum of the next block into `out` (overwritten), which ends
+    /// the block: returns its first frame and the frame after it.
+    fn sum(&mut self, bank: &SoundBank, out: &mut [f32]) -> (i64, i64) {
         out.fill(0.0);
         let block_start = signed(self.mixed_to);
         let block_end = block_start + (out.len() / CHANNELS) as i64;
@@ -626,23 +736,8 @@ impl Mixer {
             self.pending.pop();
             self.live.apply(voice, &mut self.counts);
         }
-        let gain = self.volume * HEADROOM;
-        for x in out.iter_mut() {
-            let y = *x * gain;
-            if y.abs() > SOFT_CLIP_KNEE {
-                self.saturated += 1;
-            }
-            *x = soft_clip(y);
-        }
-        if let Some(e) = self.envelope.filter(|e| e.fade < block_end) {
-            for (f, frame) in (block_start..).zip(out.as_chunks_mut::<CHANNELS>().0) {
-                let g = e.gain(f);
-                for x in frame {
-                    *x *= g;
-                }
-            }
-        }
         self.mixed_to = block_end as u64;
+        (block_start, block_end)
     }
 }
 

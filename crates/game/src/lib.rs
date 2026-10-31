@@ -42,7 +42,7 @@ pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
     Probed, SWITCH_TIMEOUT, audio_control,
 };
-pub use autoplay::{Autoplay, AutoplayError};
+pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{BestScore, BestView, SavedPlay};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;

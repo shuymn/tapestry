@@ -430,6 +430,8 @@ pub struct SoundBank {
     sounds: Vec<Sound>,
     warnings: Vec<BankWarning>,
     stats: LoadStats,
+    /// What the referenced sounds' files held ([`SoundBank::sound_digest`]).
+    sound_digest: Option<[u8; 32]>,
 }
 
 impl SoundBank {
@@ -500,6 +502,58 @@ impl SoundBank {
     pub fn stats(&self) -> LoadStats {
         self.stats
     }
+
+    /// The sound-content digest of a loaded bank: SHA-256 over the domain
+    /// `tapestry sounds v1` and, for each referenced sound id in ascending
+    /// order, the id (`u16` little-endian) and a tag: 0 when the sound has
+    /// no file, 1 when its file could not be read, 2 followed by the
+    /// SHA-256 of the file's bytes when it was read, decodable or not. It
+    /// changes when any referenced file's contents change, at no cost: the
+    /// files are hashed for deduplication anyway. Part of the loudness
+    /// cache key (design.md "Algorithms"); `None` for a bank made in code
+    /// ([`from_sounds`](Self::from_sounds)), which is never cached.
+    #[must_use]
+    pub fn sound_digest(&self) -> Option<[u8; 32]> {
+        self.sound_digest
+    }
+}
+
+/// The domain of [`SoundBank::sound_digest`].
+const SOUND_DIGEST_DOMAIN: &[u8] = b"tapestry sounds v1";
+
+/// [`SoundBank::sound_digest`] of `chart`'s referenced sounds, given the
+/// hash of each distinct path's bytes (`None` when it was not read).
+fn sound_digest(
+    chart: &Chart,
+    path_index: &HashMap<&Path, usize>,
+    hashes: &[Option<[u8; 32]>],
+) -> [u8; 32] {
+    let mut d = Sha256::new();
+    d.update(SOUND_DIGEST_DOMAIN);
+    for id in referenced(chart) {
+        d.update(id.0.to_le_bytes());
+        let path = chart
+            .sounds
+            .get(usize::from(id.0))
+            .and_then(|s| s.path.as_deref());
+        let Some(path) = path else {
+            d.update([0]);
+            continue;
+        };
+        match path_index
+            .get(path)
+            .and_then(|&i| hashes.get(i))
+            .copied()
+            .flatten()
+        {
+            Some(hash) => {
+                d.update([2]);
+                d.update(hash);
+            }
+            None => d.update([1]),
+        }
+    }
+    d.finalize().into()
 }
 
 /// Frames at `rate` for `frames` at `src_rate`, rounded up.
@@ -713,22 +767,27 @@ struct Shared<'a> {
 }
 
 /// Reads, hashes and decodes the file at path index `i`, holding its bytes
-/// only until it returns.
-fn process(i: usize, path: &Path, sound: SoundId, shared: &Shared<'_>) -> Outcome {
+/// only until it returns; with the hash of its bytes when they were read.
+fn process(
+    i: usize,
+    path: &Path,
+    sound: SoundId,
+    shared: &Shared<'_>,
+) -> (Option<[u8; 32]>, Outcome) {
     if shared.stop.load(Ordering::Relaxed) {
-        return Outcome::Stopped(Stop::Cancelled);
+        return (None, Outcome::Stopped(Stop::Cancelled));
     }
     let mut raw = RawBytes::new(&shared.raw_live);
     let max = shared.limits.max_file_bytes;
     let bytes = match read_capped(path, max, sound, &mut raw, &shared.raw_peak) {
         Ok(bytes) => bytes,
-        Err(stop) => return Outcome::Stopped(stop),
+        Err(stop) => return (None, Outcome::Stopped(stop)),
     };
     let hash: [u8; 32] = Sha256::digest(&bytes).into();
     {
         let mut taken = shared.taken.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&owner) = taken.get(&hash) {
-            return Outcome::Duplicate(owner);
+            return (Some(hash), Outcome::Duplicate(owner));
         }
         taken.insert(hash, i);
     }
@@ -739,10 +798,11 @@ fn process(i: usize, path: &Path, sound: SoundId, shared: &Shared<'_>) -> Outcom
                 "the decoder failed on malformed data".into(),
             ))
         });
-    match decoded {
+    let outcome = match decoded {
         Ok(s) => Outcome::Stored(s),
         Err(stop) => Outcome::Stopped(stop),
-    }
+    };
+    (Some(hash), outcome)
 }
 
 fn decode(
@@ -1054,13 +1114,15 @@ pub fn load_bank_at(
         stop: AtomicBool::new(false),
         taken: Mutex::new(HashMap::new()),
     };
-    let mut outcomes = pool(threads, paths.len(), |i| {
+    let (hashes, mut outcomes): (Vec<_>, Vec<_>) = pool(threads, paths.len(), |i| {
         let r = process(i, paths[i].0, paths[i].1[0], &shared);
-        if matches!(r, Outcome::Stopped(Stop::Cap(_))) {
+        if matches!(r.1, Outcome::Stopped(Stop::Cap(_))) {
             shared.stop.store(true, Ordering::Relaxed);
         }
         r
-    });
+    })
+    .into_iter()
+    .unzip();
     // The first cap error in path order refuses the bank.
     for o in &mut outcomes {
         if let Outcome::Stopped(Stop::Cap(e)) = o {
@@ -1099,12 +1161,14 @@ pub fn load_bank_at(
         }
     }
     warnings.sort_by_key(|BankWarning::Undecodable { sound, .. }| *sound);
+    let sound_digest = Some(sound_digest(chart, &path_index, &hashes));
     Ok(SoundBank {
         rate,
         speed,
         slots,
         sounds,
         warnings,
+        sound_digest,
         stats: LoadStats {
             decode_threads: threads,
             files: paths.len(),

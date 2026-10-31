@@ -13,7 +13,7 @@ use rtrb::Consumer;
 use crate::CHANNELS;
 use crate::bank::SoundBank;
 use crate::clock::MixClock;
-use crate::mixer::{InvalidVolume, Mixer};
+use crate::mixer::{InvalidGain, InvalidVolume, Mixer};
 use crate::output::{AudioOutput, OutputError};
 use crate::seek::{BgmSchedule, FrameLine, SeekPlan, SeekSource, schedule_hash};
 
@@ -296,6 +296,16 @@ impl AudioEngine {
     /// not applied.
     pub fn set_volume(&mut self, volume: f32) -> Result<(), InvalidVolume> {
         self.mixer.set_volume(volume)
+    }
+
+    /// Sets the play's fixed gain on the sum ([`Mixer::set_gain`]).
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidGain`] for a gain not above 0 or above
+    /// [`MAX_GAIN`](crate::MAX_GAIN), which is not applied.
+    pub fn set_gain(&mut self, gain: f32) -> Result<(), InvalidGain> {
+        self.mixer.set_gain(gain)
     }
 
     /// Sets the audio output latency offset: BGM is scheduled this much

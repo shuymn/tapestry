@@ -58,6 +58,77 @@ fn identical_files_are_stored_once() {
     assert!(bank.warnings().is_empty(), "{:?}", bank.warnings());
 }
 
+/// The sound-content digest, computed here from its definition: the domain,
+/// then per referenced id its number and tag, with the file's SHA-256 for a
+/// file that was read.
+fn digest_of(sounds: &[(u16, Option<Option<&[u8]>>)]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut d = Sha256::new();
+    d.update(b"tapestry sounds v1");
+    for (id, sound) in sounds {
+        d.update(id.to_le_bytes());
+        match sound {
+            None => d.update([0]),
+            Some(None) => d.update([1]),
+            Some(Some(bytes)) => {
+                d.update([2]);
+                d.update(Sha256::digest(bytes));
+            }
+        }
+    }
+    d.finalize().into()
+}
+
+/// The digest follows what the referenced files hold, not their names: a
+/// file rewritten with other samples of the same size changes it; ids
+/// whose files are identical each carry that file's hash; a sound without
+/// a file, one whose file cannot be read and one whose file is not a sound
+/// are told apart. A bank made in code has none.
+#[test]
+fn sound_digest_follows_file_contents() {
+    let dir = tmp();
+    let first = wav(RATE, 1, &ramp(300, -9_000, 61));
+    let second = wav(RATE, 1, &ramp(300, 4_000, -37));
+    assert_eq!(first.len(), second.len());
+    let a = put(dir.path(), "a.wav", &first);
+    let b = put(dir.path(), "b.wav", &first);
+    let junk = put(dir.path(), "junk.wav", b"not a sound");
+    let gone = dir.path().join("gone.wav");
+    let digest = |paths: &[Option<std::path::PathBuf>]| {
+        load_bank(&chart_of(paths), RATE, &BankLimits::default())
+            .unwrap()
+            .sound_digest()
+            .unwrap()
+    };
+
+    let before = digest(&[Some(a.clone())]);
+    assert_eq!(before, digest_of(&[(0, Some(Some(&first)))]));
+    put(dir.path(), "a.wav", &second);
+    let after = digest(&[Some(a.clone())]);
+    assert_ne!(after, before);
+    assert_eq!(after, digest_of(&[(0, Some(Some(&second)))]));
+    put(dir.path(), "a.wav", &first);
+
+    // b holds a's bytes: stored once, both ids carry the hash.
+    assert_eq!(
+        digest(&[Some(a.clone()), Some(b)]),
+        digest_of(&[(0, Some(Some(&first))), (1, Some(Some(&first)))])
+    );
+
+    // No file, an unreadable file and an undecodable one.
+    let none = digest(&[None]);
+    let unreadable = digest(&[Some(gone)]);
+    let undecodable = digest(&[Some(junk)]);
+    assert_eq!(none, digest_of(&[(0, None)]));
+    assert_eq!(unreadable, digest_of(&[(0, Some(None))]));
+    assert_eq!(undecodable, digest_of(&[(0, Some(Some(b"not a sound")))]));
+    assert_ne!(none, unreadable);
+    assert_ne!(unreadable, undecodable);
+
+    let made = audio::SoundBank::from_sounds(RATE, vec![audio::Sound::mono(vec![1; 4])]);
+    assert_eq!(made.sound_digest(), None);
+}
+
 /// Four stereo sounds each declaring the 10-minute cap (28 800 000 frames at
 /// 48 kHz, 115 200 000 bytes) and a fifth declaring the rest of 512 MiB:
 /// 536 870 912 − 4 × 115 200 000 = 76 070 912 bytes = 19 017 728 frames

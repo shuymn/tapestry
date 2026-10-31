@@ -149,7 +149,7 @@ egui comes with the first form-like screen.
 | 1 | PR12 | `roots`; `charts(path UNIQUE, size, mtime_ns, sha256, md5, header fields)` |
 | 2 | PR13 | `norm_text` (the searched fields normalized and joined); `title_key` and `artist_key` (normalized sort keys, so full-width and katakana titles sort with the rest), with the index `charts_title` for the unfiltered title order; `folder` (the path's folder, for grouping without string work per row); `charts_fts` |
 | 3 | PR18 | `meta`, `scores`, `counted`, `refused`; the index `charts_sha` |
-| 4 | PR25 | `loudness` |
+| 4 | PR25 | `loudness(resolved_hash, sounds, mixer_version, analysis_version, rate, integrated, true_peak, over_range)` |
 
 **On a different version (decided).** Everything in the database is derived, so the game deletes the file with its `-wal` and `-shm`, rebuilds it by a full scan, and logs one line. Only the version number is read from the old file.
 
@@ -547,6 +547,8 @@ Each change is covered by round trips and changes D8's interpretation tuple.
 **Analysis.**
 - After load, a background job mixes the 1× autoplay schedule offline through `Mixer::mix_raw`, at unity gain, before volume, headroom and the clipper. The job pauses during play.
 - Blocks of 4,096 frames feed `ebur128` in mode `I | TRUE_PEAK | HISTOGRAM`. Histogram mode keeps whole-chart integrated loudness (to bin resolution) with fixed memory. History is not truncated.
+- L is read once the schedule is exhausted and nothing sounds, from the completed gating blocks only: a program shorter than one 400 ms block has no L and keeps 0.5. The true peak is read after zeros for the interpolator's delay.
+- The histogram ends at +30 LUFS. Each gating block's loudness is read where the meter completes it; one at or above +30 LUFS marks the measurement over range, and L is then taken as +30 LUFS, a lower bound, so the gain does not jump there.
 
 **Memory contract.**
 - Fixed from the job's start, whatever the chart's duration: the mix block, the analyzer state (histogram, true-peak interpolator, gating), and the mixer's voices.
@@ -554,7 +556,7 @@ Each change is covered by round trips and changes D8's interpretation tuple.
 
 **Cache key.**
 - The resolved hash.
-- A sound-content digest: SHA-256 over each sound's (id, file SHA-256).
+- A sound-content digest: SHA-256 over each referenced sound's id and its file's SHA-256 (or that it has no file, or one that cannot be read).
 - The mixer and analysis versions.
 - The device rate.
 
@@ -1103,9 +1105,9 @@ Each one holds the behavior D5 and D6 state.
 - `--dev-start <ms>` starts the play at that time;
 - the exit scenario's practice round passes.
 
-### PR25. Loudness normalization (`audio`, `library`, `player`)
+### PR25. Loudness normalization (`audio`, `game`, `library`, `player`)
 
-**Touches.** `Mixer::mix_raw`, the block job with histogram mode, schema 4, the gain, design.md "Algorithms".
+**Touches.** `Mixer::mix_raw`, the block job with histogram mode, the sound-content digest, `game::schedule_iter`, schema 4, the gain on `AudioCtl::Play`, design.md "Algorithms".
 
 **Depends on.** PR15, PR18.
 

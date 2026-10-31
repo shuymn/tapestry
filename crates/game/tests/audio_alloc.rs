@@ -68,7 +68,9 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
             });
         }
         let (mut sink, queue) = audio_link_at(64, origin);
-        control.play(origin, queue).unwrap();
+        // Each play carries its own gain, applied on the audio thread.
+        let gain = audio::Gain::new(if play % 2 == 0 { 1.0 } else { 0.5 }).unwrap();
+        control.play_at(origin, queue, gain).unwrap();
         for k in 0..3 {
             sink.receive(&JudgeEvent {
                 seq: k,

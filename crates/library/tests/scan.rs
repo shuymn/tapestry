@@ -256,7 +256,7 @@ fn other_schema_version_is_rebuilt() {
         old.execute_batch(
             "CREATE TABLE charts (path TEXT, title TEXT);
              INSERT INTO charts VALUES ('stale.bms', 'Stale');
-             PRAGMA user_version = 7;",
+             PRAGMA user_version = 3;",
         )
         .unwrap();
         for suffix in ["-wal", "-shm"] {
@@ -270,11 +270,11 @@ fn other_schema_version_is_rebuilt() {
     assert!(!stale_wal.is_empty());
 
     let (lib, opened) = fx.open();
-    assert_eq!(opened, Opened::Rebuilt { old_version: 7 });
+    assert_eq!(opened, Opened::Rebuilt { old_version: 3 });
     assert!(
         opened
             .to_string()
-            .contains(&format!("schema version 7 is not {SCHEMA_VERSION}"))
+            .contains(&format!("schema version 3 is not {SCHEMA_VERSION}"))
     );
     assert_ne!(fs::read(beside("-wal")).unwrap_or_default(), stale_wal);
     assert_eq!(lib.charts().unwrap(), Vec::new());
@@ -292,6 +292,92 @@ fn other_schema_version_is_rebuilt() {
     let (lib, opened) = fx.open();
     assert_eq!(opened, Opened::Current);
     assert_eq!(titles(&lib).len(), 1);
+}
+
+/// A loudness row is found by its whole key, and by nothing less: a change
+/// of any part misses. Storing a row of other versions removes every row of
+/// the old ones, and a row survives reopening and rescanning.
+#[test]
+fn loudness_round_trips_by_its_whole_key() {
+    use library::{LoudnessKey, LoudnessRow};
+    let fx = Fixture::new();
+    fx.write("a.bms", chart_text("Alpha").as_bytes());
+    let (mut lib, _) = fx.open();
+    let key = LoudnessKey {
+        resolved_hash: [1; 32],
+        sounds: [2; 32],
+        mixer_version: 1,
+        analysis_version: 1,
+        rate: 48_000,
+    };
+    let row = LoudnessRow {
+        integrated: Some(-14.25),
+        true_peak: 1.5,
+        over_range: false,
+    };
+    assert_eq!(lib.loudness(&key).unwrap(), None);
+    lib.store_loudness(&key, &row).unwrap();
+    assert_eq!(lib.loudness(&key).unwrap(), Some(row));
+    let others = [
+        LoudnessKey {
+            resolved_hash: [9; 32],
+            ..key
+        },
+        LoudnessKey {
+            sounds: [9; 32],
+            ..key
+        },
+        LoudnessKey {
+            mixer_version: 2,
+            ..key
+        },
+        LoudnessKey {
+            analysis_version: 2,
+            ..key
+        },
+        LoudnessKey {
+            rate: 44_100,
+            ..key
+        },
+    ];
+    for other in &others {
+        assert_eq!(lib.loudness(other).unwrap(), None, "{other:?}");
+    }
+    // Silence (no integrated loudness) and an over-range row round-trip;
+    // a store replaces the row of its key.
+    let silent = LoudnessRow {
+        integrated: None,
+        true_peak: 0.0,
+        over_range: false,
+    };
+    let over = LoudnessKey {
+        sounds: [3; 32],
+        ..key
+    };
+    let loud = LoudnessRow {
+        integrated: Some(29.5),
+        true_peak: 40.0,
+        over_range: true,
+    };
+    lib.store_loudness(&over, &loud).unwrap();
+    lib.store_loudness(&key, &silent).unwrap();
+    assert_eq!(lib.loudness(&key).unwrap(), Some(silent));
+    assert_eq!(lib.loudness(&over).unwrap(), Some(loud));
+    // Kept across a scan and a reopening.
+    scan(&lib, std::slice::from_ref(&fx.root));
+    drop(lib);
+    let (mut lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Current);
+    assert_eq!(lib.loudness(&key).unwrap(), Some(silent));
+    // Another mixer version's row prunes both of version 1.
+    let newer = LoudnessKey {
+        mixer_version: 2,
+        ..key
+    };
+    lib.store_loudness(&newer, &row).unwrap();
+    assert_eq!(lib.loudness(&newer).unwrap(), Some(row));
+    assert_eq!(lib.loudness(&key).unwrap(), None);
+    assert_eq!(lib.loudness(&over).unwrap(), None);
 }
 
 #[test]

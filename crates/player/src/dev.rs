@@ -27,6 +27,7 @@ use replay::DecodeLimits;
 
 use crate::args::{Command, UsageError};
 use crate::measure::Drawn;
+use crate::recording::SoundRecording;
 use crate::render_side::{FrameSink, Screen};
 
 pub mod scenario;
@@ -322,6 +323,10 @@ pub enum SelectStep {
     /// Wait this many milliseconds on the select screen and print how often
     /// the input thread woke meanwhile.
     Idle(u64),
+    /// Wait on the select screen until the loaded chart's loudness analysis
+    /// has finished, however long a loaded machine takes (within
+    /// [`ANALYSIS_TIMEOUT`]).
+    Analyzed,
     /// Press Enter.
     Enter,
     /// A play starts, fed as it says (a scenario's `play`).
@@ -342,14 +347,19 @@ pub enum SelectStep {
 
 /// How long a scripted step waits for its chart.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the `analyzed` step waits: the analysis runs in background
+/// mode, which a loaded machine can starve, so the bound only catches an
+/// analysis that never ends.
+pub const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
-/// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`, `enter`,
-/// `back`, `retry`, `next`, `prev` and `close`. Selection steps run on the
-/// select screen, `back`, `retry`, `next` and `prev` on a result; a step
-/// out of place, or a chart not listed within [`STEP_TIMEOUT`], fails the
-/// run. A scenario ([`scenario`]) compiles into the same steps, each with
-/// the scenario step it comes from.
+/// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
+/// `idle=<ms>`, `analyzed`, `enter`, `back`, `retry`, `next`, `prev` and
+/// `close`. Selection steps run on the select screen, `back`, `retry`,
+/// `next` and `prev` on a result; a step out of place, or a chart not
+/// listed within [`STEP_TIMEOUT`], fails the run. A scenario
+/// ([`scenario`]) compiles into the same steps, each with the scenario step
+/// it comes from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SelectScript {
     steps: std::collections::VecDeque<(SelectStep, Option<scenario::Origin>)>,
@@ -386,12 +396,13 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, enter, back, retry, next, prev or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, analyzed, enter, back, retry, next, prev or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
                     .map(SelectStep::Idle)
                     .map_err(|_| format!("{s} takes milliseconds")),
+                None if s == "analyzed" => Ok(SelectStep::Analyzed),
                 None if s == "enter" => Ok(SelectStep::Enter),
                 None if s == "back" => Ok(SelectStep::Back),
                 None if s == "retry" => Ok(SelectStep::Retry),
@@ -399,7 +410,7 @@ impl SelectScript {
                 None if s == "prev" => Ok(SelectStep::Prev),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, enter, back, retry, next, prev or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, analyzed, enter, back, retry, next, prev or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))
@@ -457,19 +468,31 @@ impl SelectScript {
     /// The front step waits on; `false` once it has waited
     /// [`STEP_TIMEOUT`], which fails the script.
     pub fn waiting(&mut self) -> bool {
-        if !self.expired() {
+        self.waiting_for(STEP_TIMEOUT)
+    }
+
+    /// The front step waits on; `false` once it has waited `bound`, which
+    /// fails the script.
+    pub fn waiting_for(&mut self, bound: Duration) -> bool {
+        if !self.expired_after(bound) {
             return true;
         }
         let step = format!("{:?}", self.front());
-        self.fail(format!("{step} waited {} s", STEP_TIMEOUT.as_secs()));
+        self.fail(format!("{step} waited {} s", bound.as_secs()));
         false
     }
 
     /// Whether the front step has waited [`STEP_TIMEOUT`] since it became
     /// the front.
     pub fn expired(&mut self) -> bool {
+        self.expired_after(STEP_TIMEOUT)
+    }
+
+    /// Whether the front step has waited `bound` since it became the
+    /// front.
+    fn expired_after(&mut self, bound: Duration) -> bool {
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
-        since.elapsed() >= STEP_TIMEOUT
+        since.elapsed() >= bound
     }
 
     /// The script failed at its front step: no step runs from here on.
@@ -838,8 +861,40 @@ impl<O: AudioOutput + Wakes> AudioOutput for Paced<O> {
     }
 }
 
+/// The sound-only recording of a scripted run with song selection: 48 kHz,
+/// 10 ms periods, waking first now, keeping up to `seconds` of what
+/// sounds. A run with selection waits for loading, analyses and screens
+/// between its plays, so it records each play's sound and one silent period
+/// for each silence: every onset still follows a period of silence, and the
+/// capacity is spent on the plays however long the run waits between them.
+pub fn sound_recording(clock: QpcClock, seconds: usize) -> Paced<SoundRecording> {
+    let device = SimDevice::new(SimConfig::steady(48_000, 480, clock.now()));
+    Paced {
+        inner: SoundRecording::new(device, 48_000 * seconds),
+        clock,
+    }
+}
+
+/// An output whose written samples were kept.
+pub trait Recorded {
+    /// The interleaved stereo samples kept.
+    fn samples(&self) -> &[f32];
+}
+
+impl Recorded for RecordingOutput<SimDevice> {
+    fn samples(&self) -> &[f32] {
+        RecordingOutput::samples(self)
+    }
+}
+
+impl Recorded for SoundRecording {
+    fn samples(&self) -> &[f32] {
+        SoundRecording::samples(self)
+    }
+}
+
 /// Prints what the recording output kept.
-pub fn report_audio(out: &Paced<RecordingOutput<SimDevice>>) {
+pub fn report_audio<R: Recorded>(out: &Paced<R>) {
     let samples = out.inner.samples();
     let peak = samples.iter().fold(0.0_f32, |p, s| p.max(s.abs()));
     println!(

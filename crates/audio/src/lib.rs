@@ -8,9 +8,10 @@
 //!   converts them for a practice [`Speed`] in a second [`Stage`], with each
 //!   stage's workspace bound charged before it is built.
 //! - [`Mixer`] sums preallocated voices in `f32`, steals the oldest voice
-//!   with a short fade when all are busy, applies the volume and a fixed
-//!   headroom, and a static soft clipper that keeps the sum within full
-//!   scale without riding its gain or adding latency.
+//!   with a short fade when all are busy, applies the volume and the play's
+//!   fixed gain (0.5, or the chart's normalization gain), and a static soft
+//!   clipper that keeps the sum within full scale without riding its gain
+//!   or adding latency.
 //! - [`MixClock`] maps output frames to the judgment timeline from the
 //!   buffer events, re-anchored on every period.
 //! - [`AudioEngine::step`] is one wake of the audio thread: it drains sound
@@ -34,6 +35,7 @@
 mod bank;
 mod clock;
 mod engine;
+mod loudness;
 mod mixer;
 mod output;
 mod run;
@@ -52,9 +54,14 @@ pub use engine::{
     AudioEngine, ChartSounds, EngineError, Scheduled, ScheduledKind, SeekError, SoundCmd,
     StepReport,
 };
+pub use loudness::{
+    ANALYSIS_VERSION, Analysis, AnalysisError, BLOCK_FRAMES, CEILING_LUFS,
+    MEASUREMENT_DEPENDENCIES, MIXER_VERSION, Measurement, PEAK_CEILING_DBTP, Step, TARGET_LUFS,
+    normalization_gain,
+};
 pub use mixer::{
-    HEADROOM, InvalidVolume, MAX_PENDING_STARTS, MAX_VOICES, MAX_VOLUME, Mixer, SOFT_CLIP_KNEE,
-    STEAL_FADE_MS, soft_clip,
+    Gain, HEADROOM, InvalidGain, InvalidVolume, MAX_GAIN, MAX_PENDING_STARTS, MAX_VOICES,
+    MAX_VOLUME, Mixer, SOFT_CLIP_KNEE, STEAL_FADE_MS, soft_clip,
 };
 pub use output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, RecordingOutput, Wake};
 pub use run::{RunReport, run_audio};
