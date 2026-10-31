@@ -407,9 +407,15 @@ impl Rig for PlayerRig<'_> {
         // Before the play is sent: the audio thread may mix its first wake
         // before this thread runs again.
         let audio = AudioBase::new(self.audio.control.counters());
+        // The play's gain, fixed for the whole play: its chart's
+        // normalization gain once measured, else the headroom.
+        let gain = self
+            .selection
+            .as_ref()
+            .map_or(audio::Gain::HEADROOM, |s| s.shelf.gain());
         // Audio was readied before recording opened, so this does not
         // wait; a worker gone since shows as the output's failure.
-        let _ = self.audio.control.play(origin, sounds);
+        let _ = self.audio.control.play_at(origin, sounds, gain);
         self.generation = self.audio.control.generation();
         self.steps_dropped = 0;
         let measure = PlayMeasure {

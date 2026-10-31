@@ -8,7 +8,9 @@
 //!   input; a chart refused on the way returns to selection with why.
 //! - **The scan** pauses from the choice to each countdown, which waits for
 //!   its acknowledgment ([`PlayerRig`]'s audio preparation); every entry
-//!   into selection and every result releases it.
+//!   into selection and every result releases it. A chart's loudness
+//!   analysis pauses and resumes with it, and its measurement is stored
+//!   and taken as the next play's gain once that pause is acknowledged.
 //! - Loading runs on the game thread: the window thread keeps the window
 //!   answering meanwhile, and a close is latched and taken once the load
 //!   is over (the load's waits are all bounded).
@@ -268,6 +270,14 @@ impl Selection {
                         return false;
                     }
                 }
+                Some(SelectStep::Analyzed) => {
+                    if self.shelf.analyzing() {
+                        if !script.waiting_for(crate::dev::ANALYSIS_TIMEOUT) {
+                            controls.close();
+                        }
+                        return false;
+                    }
+                }
                 Some(SelectStep::Enter) => typed.push(MenuInput::Key(MenuKey::Enter)),
                 Some(SelectStep::Close) => {
                     script.done();
@@ -456,8 +466,17 @@ impl PlayerRig<'_> {
             crate::shelf::Paused::Idle => println!("library: no scan before the countdown"),
             crate::shelf::Paused::Cancelled => {
                 println!("library: the wait for the scan was cancelled");
+                return;
             }
         }
+        // The scan is quiet: a measurement may be stored now, and the next
+        // play takes its chart's gain.
+        if shelf.analyzing() {
+            println!("loudness: the analysis paused before the countdown");
+        } else {
+            println!("loudness: no analysis before the countdown");
+        }
+        shelf.store_loudness();
     }
 
     /// Prints which preset the result views when that changed, and how
@@ -530,17 +549,33 @@ impl AppRig for PlayerRig<'_> {
         } else {
             (chart.bgm.clone(), None)
         };
-        let bank = audio::load_bank(chart, rate, &audio::BankLimits::default())
-            .map_err(ChartLoadError::Sounds)?;
+        // The chart before's analysis stops before these sounds are
+        // decoded, so it never holds its bank beside them.
+        if let Some(sel) = &mut self.selection {
+            sel.shelf.cancel_analysis();
+        }
+        let bank = Arc::new(
+            audio::load_bank(chart, rate, &audio::BankLimits::default())
+                .map_err(ChartLoadError::Sounds)?,
+        );
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
         self.audio
             .control
-            .load(Arc::new(bank), audio::BgmSchedule::new(schedule))
+            .load(Arc::clone(&bank), audio::BgmSchedule::new(schedule))
             .map_err(ChartLoadError::Audio)?;
+        let shared = Arc::new(chart.clone());
         self.render
-            .load(Arc::new(chart.clone()))
+            .load(Arc::clone(&shared))
             .map_err(ChartLoadError::Screen)?;
+        // Its gain, from the cache, or its analysis.
+        if let Some(sel) = &mut self.selection {
+            let name = sel
+                .screen
+                .selected()
+                .map_or_else(|| "the chart".to_owned(), |e| file_name(&e.path));
+            sel.shelf.loaded(shared, bank, name);
+        }
         let ready = self.clock.now();
         if let Some((input, capacity, recorded)) = feed {
             self.input.feed(input, capacity);

@@ -29,6 +29,7 @@ mod end_screen;
 mod input_side;
 mod keys;
 mod log_file;
+mod loudness;
 mod measure;
 mod menu_screen;
 mod play;
@@ -983,7 +984,8 @@ fn wasapi_audio(clock: QpcClock) -> anyhow::Result<(audio_side::AudioThread, aud
     Ok(spawned)
 }
 
-/// The simulated output a headless run records into (dev-tools).
+/// The simulated output a headless run with selection records what sounds
+/// into (dev-tools).
 #[cfg(feature = "dev-tools")]
 fn recorded_audio(
     clock: QpcClock,
@@ -992,7 +994,7 @@ fn recorded_audio(
     let spawned = audio_side::spawn(
         // The simulated output always opens.
         move || -> Result<_, std::convert::Infallible> {
-            let out = dev::recording_output(clock, seconds);
+            let out = dev::sound_recording(clock, seconds);
             Ok((out, Some(audio::MAX_QUEUE_PERIODS)))
         },
         dev::report_audio,
