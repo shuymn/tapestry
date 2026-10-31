@@ -43,7 +43,7 @@ use self::budget::Budget;
 use self::geom::{Offset, Q, Rect};
 use self::object::Objects;
 use self::ops::Cond;
-use self::policy::{Outcome, Role};
+use self::policy::Role;
 use self::report::{Notes, Span};
 use self::timer::{Custom, Timer};
 use self::track::{Accepted, SrcKey, Stretch};
@@ -328,7 +328,7 @@ impl<'d> Cx<'d> {
         self.note(Some(at), Severity::Ignored, kind);
     }
 
-    fn drop_el(&mut self, role: Role, at: Span, why: NoteKind) -> Result<Outcome, ImportError> {
+    fn drop_el(&mut self, role: Role, at: Span, why: NoteKind) -> Result<(), ImportError> {
         let r = policy::unsupported(&self.def.arena, role, at, why, &mut self.notes);
         self.budget.usage.notes = u32::try_from(self.notes.list.len()).unwrap_or(u32::MAX);
         r

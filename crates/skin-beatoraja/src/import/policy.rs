@@ -74,13 +74,6 @@ pub(crate) enum Role {
     Decorative,
 }
 
-/// What became of an element.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Outcome {
-    /// Left out, with a note.
-    Dropped,
-}
-
 /// Something `role`'s element at `at` needs that the importer cannot
 /// reproduce: a critical element refuses the import; a decorative one is
 /// dropped with a note (owner decision 6).
@@ -90,7 +83,7 @@ pub(crate) fn unsupported(
     at: Span,
     why: NoteKind,
     notes: &mut Notes,
-) -> Result<Outcome, ImportError> {
+) -> Result<(), ImportError> {
     match role {
         Role::Critical(part) => Err(ImportError::Critical {
             at: arena.loc_at(at.file, at.offset),
@@ -99,7 +92,7 @@ pub(crate) fn unsupported(
         }),
         Role::Decorative => {
             notes.push(Some(at), Severity::Dropped, why);
-            Ok(Outcome::Dropped)
+            Ok(())
         }
     }
 }
