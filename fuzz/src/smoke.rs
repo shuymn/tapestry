@@ -6,8 +6,11 @@ use std::path::Path;
 
 use replay::{DecodeError, DecodeLimits, Section};
 use rules::{CanonicalError, RuleError};
+use skin_beatoraja::{Header, ImportError, Syntax};
 
-use crate::{RawSummary, bms_load, preset_canonical, raw_input, replay_body, replay_file, seeds};
+use crate::{
+    RawSummary, bms_load, preset_canonical, raw_input, replay_body, replay_file, seeds, skin_json,
+};
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
 /// fails the test instead of going unchecked.
@@ -235,4 +238,77 @@ fn bms_seed_charts_load_and_refuse() {
     }
     assert!(charts >= 3, "{charts} charts in {}", dir.display());
     assert!(ok > 0, "no chart loaded");
+}
+
+fn option_names(h: &Header) -> Vec<&str> {
+    h.options
+        .iter()
+        .map(|o| o.name.as_deref().unwrap_or(""))
+        .collect()
+}
+
+#[test]
+fn skin_json_seeds_resolve_or_fail_as_built() {
+    let seeds = seeds::skin_jsons();
+    assert_names(
+        &seeds,
+        &[
+            "options", "choices", "lenient", "cycle", "not_play", "size", "syntax", "missing",
+        ],
+    );
+    for (name, data) in seeds {
+        let result = skin_json(&data);
+        match name {
+            "options" => {
+                let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(
+                    option_names(&h),
+                    ["mode", "included", "when on", "nested"],
+                    "{name}"
+                );
+                assert_eq!(h.files[0].candidates.len(), 4, "{name}");
+                assert_eq!(h.offsets.len(), 1, "{name}");
+            }
+            "choices" => {
+                let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(h.files.len(), 1, "{name}");
+                assert_eq!(h.files[0].name.as_deref(), Some("one"), "{name}");
+                assert_eq!(h.offsets.len(), 2, "{name}");
+            }
+            "lenient" => {
+                let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(h.name.as_deref(), Some("unquoted name"), "{name}");
+                assert_eq!(option_names(&h), ["a", "b"], "{name}");
+                assert_eq!(h.offsets[0].id, 10, "{name}");
+                assert!(h.offsets[0].x, "{name}");
+            }
+            "cycle" => assert!(
+                matches!(result, Err(ImportError::IncludeCycle { .. })),
+                "{name}: {result:?}"
+            ),
+            "not_play" => assert!(
+                matches!(result, Err(ImportError::NotPlay7 { .. })),
+                "{name}: {result:?}"
+            ),
+            "size" => assert!(
+                matches!(result, Err(ImportError::Resolution { .. })),
+                "{name}: {result:?}"
+            ),
+            "syntax" => assert!(
+                matches!(
+                    result,
+                    Err(ImportError::Syntax {
+                        what: Syntax::ExpectedSeparator,
+                        ..
+                    })
+                ),
+                "{name}: {result:?}"
+            ),
+            "missing" => assert!(
+                matches!(result, Err(ImportError::Read { .. })),
+                "{name}: {result:?}"
+            ),
+            _ => panic!("no expectation for seed {name}"),
+        }
+    }
 }

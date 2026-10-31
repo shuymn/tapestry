@@ -9,6 +9,7 @@
 
 pub mod seeds;
 
+use std::collections::BTreeSet;
 use std::hint::black_box;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -18,6 +19,7 @@ use bms_parser::{LoadError, LoadOptions, Loaded};
 use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
+use skin_beatoraja::{Header, ImportError, SIZES, read_header, resolve};
 
 /// An empty folder for the chart's sounds. Nothing is written to it, so
 /// every `#WAV` name resolves to no file.
@@ -196,6 +198,91 @@ fn decode_block(block: &[u8], summary: &mut RawSummary) -> bool {
         assert!(total <= block.len(), "reports longer than their block");
     }
     packet.is_some()
+}
+
+/// The files a `skin_json` input is split into, in order: the entry file,
+/// then files it may include.
+pub const SKIN_FILES: [&str; 4] = ["s.json", "i1.json", "i2.json", "i3.json"];
+
+/// A folder for the skin definitions, rewritten by each input.
+fn skin_dir() -> &'static Path {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("tapestry-fuzz-skin-")
+            .tempdir()
+            .expect("create a skin folder")
+    })
+    .path()
+}
+
+/// The header's counts are inside their caps, its size is an accepted
+/// one and every file choice's entries are sorted.
+fn check_header(h: &Header) {
+    use skin_beatoraja::limits::{
+        MAX_FILE_CHOICES, MAX_LIST_ENTRIES, MAX_OFFSETS, MAX_OPTION_ITEMS, MAX_OPTIONS,
+    };
+    assert!(SIZES.contains(&h.size), "a size outside the list");
+    assert!(h.options.len() <= MAX_OPTIONS, "too many options");
+    let items: usize = h.options.iter().map(|o| o.items.len()).sum();
+    assert!(items <= MAX_OPTION_ITEMS, "too many option items");
+    assert!(h.files.len() <= MAX_FILE_CHOICES, "too many file choices");
+    assert!(h.offsets.len() <= MAX_OFFSETS, "too many offsets");
+    let entries: usize = h.files.iter().map(|f| f.candidates.len()).sum();
+    assert!(entries <= MAX_LIST_ENTRIES, "too many folder entries");
+    for f in &h.files {
+        assert!(
+            f.candidates.is_sorted(),
+            "a file choice's entries are not sorted"
+        );
+    }
+}
+
+/// Target `skin_json`: skin definition files separated by NUL bytes, at
+/// most [`SKIN_FILES`]`.len()` of them, written to a temporary skin folder
+/// under those names. The header is read with no option enabled, then
+/// resolved again with every option item's number enabled, then once more
+/// with none.
+///
+/// # Errors
+///
+/// What [`read_header`], [`resolve`] or [`Resolved::header`] refuse.
+///
+/// # Panics
+///
+/// If a header breaks [`check_header`]'s bounds, or resolving again with
+/// no option enabled gives another header than the first pass.
+///
+/// [`Resolved::header`]: skin_beatoraja::Resolved::header
+pub fn skin_json(data: &[u8]) -> Result<Header, ImportError> {
+    let dir = skin_dir();
+    let mut parts = data.splitn(SKIN_FILES.len(), |&b| b == 0);
+    for name in SKIN_FILES {
+        let path = dir.join(name);
+        match parts.next() {
+            Some(part) => std::fs::write(&path, part).expect("write a skin file"),
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(&path).expect("remove a skin file");
+                }
+            }
+        }
+    }
+    let (mut def, header) = read_header(dir, SKIN_FILES[0])?;
+    check_header(&header);
+    let enabled: BTreeSet<i32> = header
+        .options
+        .iter()
+        .flat_map(|o| o.items.iter().map(|i| i.op))
+        .collect();
+    let configured = resolve(&mut def, &enabled)?.header()?;
+    check_header(&configured);
+    let again = resolve(&mut def, &BTreeSet::new())?.header()?;
+    assert!(
+        again == header,
+        "resolving again with no option enabled changed the header"
+    );
+    Ok(configured)
 }
 
 /// Target `canary`, for the self-test only (scripts/fuzz-selftest.sh): one
