@@ -7,9 +7,10 @@
 //! tests'.
 //!
 //! `skin_model_build_widgets` is `Skin::build` of a skin of widgets only:
-//! four 11-cell numbers, a 50-segment flicker gauge and a judgment display
-//! with every grade and 4-cell combos, all drawn. The skin helpers are the
-//! widget tests'.
+//! four 11-cell numbers, a 50-segment flicker gauge, a judgment display
+//! with every grade and 4-cell combos, and two lines of text (one
+//! squeezed, one spilling), all drawn. The skin helpers are the widget
+//! tests'.
 
 #[path = "../tests/lanes_support/mod.rs"]
 mod lanes_support;
@@ -25,7 +26,10 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use lanes_support::{lanes_skin, simple};
 use play_support::{Harness, MS, full, lane, pct};
 use rules::Judgment;
-use skin_model::{Align, DigitsDef, GlyphSet, JudgeSlot, Motion, Pad, Place, Source, WidgetDefs};
+use skin_model::{
+    Align, DigitsDef, FontRef, FrameUv, GlyphSet, JudgeSlot, Motion, Overflow, Pad, Place, Source,
+    TextDef, TextImage, TextTable, TextValue, WidgetDefs,
+};
 use widget_support::{
     TEN, combo, digits, element, gauge, harness, judge_all, judge_element, judgment, load, number,
 };
@@ -60,8 +64,8 @@ fn bench_build(c: &mut Criterion) {
     });
 }
 
-/// 4 · 11 cells, 50 segments and the flicker's tip, and a grade with a
-/// 4-cell combo: 44 + 51 + 5 quads a frame.
+/// 4 · 11 cells, 50 segments and the flicker's tip, a grade with a 4-cell
+/// combo, and two lines: 44 + 51 + 5 + 2 quads a frame.
 fn bench_widgets(c: &mut Criterion) {
     let mut j = judge_all([800, 500, 200, 80]);
     let strip = DigitsDef {
@@ -80,6 +84,15 @@ fn bench_widgets(c: &mut Criterion) {
         .collect();
     elements.push(element(Source::Gauge(0), [0, 200, 500, 20], Place::SCREEN));
     elements.push(judge_element(0));
+    // A line 100 wide at an em of 40: squeezed into 60, spilling from 300.
+    elements.push(element(Source::Text(0), [600, 0, 60, 40], Place::SCREEN));
+    elements.push(element(Source::Text(1), [600, 50, 300, 40], Place::SCREEN));
+    let text = |overflow| TextDef {
+        value: TextValue::Literal("TEXT".into()),
+        font: FontRef::Default,
+        align: Align::Center,
+        overflow,
+    };
     let skin = load(
         elements,
         WidgetDefs {
@@ -94,15 +107,23 @@ fn bench_widgets(c: &mut Criterion) {
                 },
             )],
             judges: vec![j],
-            texts: Vec::new(),
+            texts: vec![text(Overflow::Shrink), text(Overflow::Spill)],
         },
     )
     .expect("valid skin");
     let mut h = harness(skin);
+    let uv = FrameUv {
+        uv: [0.0, 0.0, 1.0, 1.0],
+        layer: 1,
+    };
+    let line = TextImage::new(uv, [0.0, 0.125, 2.5, 1.25], 2.5);
+    h.skin
+        .attach_text(&mut h.play, TextTable::new(vec![line; 2]))
+        .expect("a table per slot");
     h.tally = play_support::tally(1_234);
     h.gauges[0].value = pct(50);
     h.frame(500, &[judgment(500, Judgment::Great, 1_234)]);
-    assert_eq!(h.batch.quads().len(), 100, "every widget drawn");
+    assert_eq!(h.batch.quads().len(), 102, "every widget drawn");
     assert_eq!(h.batch.dropped(), 0, "the batch has room");
     c.bench_function("skin_model_build_widgets", |b| {
         b.iter(|| {

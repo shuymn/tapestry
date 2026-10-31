@@ -2,8 +2,8 @@
 //! reducer, the snapshot into the fields, every timer, the `when` timers,
 //! each image's frame and its place in the atlas, the canvas and the
 //! regions' placement as the target, the layout and the scratch side
-//! change, the lanes, number, gauge and judge widgets, and the elements
-//! into the batch.
+//! change, the lanes, number, gauge, judge and text widgets, and the
+//! elements into the batch.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -31,6 +31,9 @@ use skin_model::{
     LaneView, Layout as SkinLayout, Motion, NumberDef, Pad, Place, Play, PlayContext, QuadBatch,
     Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable,
     Variant, lane_timer, timer,
+};
+use skin_model::{
+    ChartText, FontRef, FrameUv, Overflow, TextDef, TextField, TextImage, TextTable, TextValue,
 };
 
 struct Counting;
@@ -674,12 +677,65 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             },
         ));
     }
+    // The title, centred and squeezed while its box is narrower than the
+    // line, and a literal, right-aligned and spilling.
+    let grow = |at: i64, w: i32| {
+        let mut props = [None; 9];
+        props[..4].copy_from_slice(&[Some(700), Some(20), Some(w), Some(TEXT_H)]);
+        KeyDef {
+            at: TimeUs(at),
+            props,
+        }
+    };
+    let keys = [grow(0, 20), grow(400 * MS, 200)];
+    let squeeze = Track::new(&keys, Ease::Linear, End::Loop { from: TimeUs(0) }).unwrap();
+    let ready = TimerRef::Builtin(timer::READY);
+    elements.push(widget(Source::Text(0), squeeze, ready, Place::SCREEN));
+    let top = Place {
+        region: Region::Top,
+        ..Place::SCREEN
+    };
+    let fixed = lanes_support::rect([900, 20, 300, TEXT_H]);
+    elements.push(widget(Source::Text(1), fixed, ready, top));
+    let text = |value, align, overflow| TextDef {
+        value,
+        font: FontRef::Default,
+        align,
+        overflow,
+    };
     skin_model::WidgetDefs {
         numbers,
         gauges,
         judges: vec![judge(true), judge(false)],
-        texts: Vec::new(),
+        texts: vec![
+            text(
+                TextValue::Field(TextField::Title),
+                Align::Center,
+                Overflow::Shrink,
+            ),
+            text(
+                TextValue::Literal("MAX".into()),
+                Align::Right,
+                Overflow::Spill,
+            ),
+        ],
     }
+}
+
+/// The text elements' key height.
+const TEXT_H: i32 = 40;
+/// Where the text lines lie: outside every page's 0..1, so no image frame
+/// shares them.
+const TITLE_UV: [f32; 4] = [2.0, 2.0, 3.0, 3.0];
+const LITERAL_UV: [f32; 4] = [4.0, 4.0, 5.0, 5.0];
+/// The lines' ink, in em: 2.5 wide and 1.25 tall, so the title (100 at an
+/// em of 40) is squeezed in boxes narrower than 100.
+const TEXT_INK: [f32; 4] = [0.0, 0.125, 2.5, 1.25];
+
+/// The table every attempt attaches, untracked, after its prepare.
+fn text_table() -> TextTable {
+    let line = |uv| TextImage::new(FrameUv { uv, layer: 0 }, TEXT_INK, 2.5);
+    TextTable::new(vec![line(TITLE_UV), line(LITERAL_UV)])
 }
 
 /// 2 000 elements, 30 on every built-in timer and 350 over 32 `when`s,
@@ -850,6 +906,9 @@ struct Widgets {
     sign: bool,
     overlay: bool,
     looks: [bool; 2],
+    /// The text quads drawn, and whether the title drew squeezed.
+    text_quads: u32,
+    text_squeezed: bool,
 }
 
 impl Widgets {
@@ -862,6 +921,8 @@ impl Widgets {
         for (a, b) in self.looks.iter_mut().zip(o.looks) {
             *a |= b;
         }
+        self.text_quads += o.text_quads;
+        self.text_squeezed |= o.text_squeezed;
     }
 
     /// What one frame's quads show, `shown` the gauge index it showed.
@@ -871,6 +932,12 @@ impl Widgets {
         let mut combo = false;
         let mut flicker = 0;
         for q in quads {
+            if q.uv == TITLE_UV || q.uv == LITERAL_UV {
+                self.text_quads += 1;
+                // Squeezed: narrower for its height than the ink.
+                let [.., iw, ih] = TEXT_INK;
+                self.text_squeezed |= q.uv == TITLE_UV && q.rect[2] * ih < q.rect[3] * iw * 0.99;
+            }
             let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv)) else {
                 continue;
             };
@@ -1163,8 +1230,9 @@ fn build_does_not_allocate() {
     let mut seen = Witness::new();
     let mut beams = Vec::new();
     for (name, ctx, events, from) in &attempts {
-        // Prepared untracked, as between plays.
+        // Prepared untracked, as between plays, with the text attached.
         let mut play = skin.prepare(&chart, ctx).unwrap();
+        skin.attach_text(&mut play, text_table()).unwrap();
         let mut tally = tally(0);
         let initial = match ctx.attempt {
             Attempt::Full { .. } => [descs[0].start, descs[1].start],
@@ -1237,6 +1305,8 @@ fn build_does_not_allocate() {
     assert!(ws.sign, "no sign glyph drew");
     assert!(ws.overlay, "no flicker tip was pushed");
     assert_eq!(ws.looks, [true; 2], "a shown gauge never drew its look");
+    assert!(ws.text_quads > 0, "no text drew");
+    assert!(ws.text_squeezed, "the title never drew squeezed");
     // The beam follows the scratch: authored at 152 on the left, 600 with
     // the scratch on the right (tests/lanes.rs).
     assert_eq!(beams, [152.0, 600.0, 152.0]);
@@ -1265,6 +1335,7 @@ fn build_does_not_allocate() {
     );
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
+    skin.attach_text(&mut play, text_table()).unwrap();
     let t = tally(0);
     let gauges = [descs[0].start, descs[1].start].map(state);
     batch.clear();
@@ -1283,4 +1354,12 @@ fn build_does_not_allocate() {
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch);
     assert!(!batch.quads().is_empty());
     assert_eq!(batch.dropped(), 0);
+    // Both text elements ask for a line; the title is the chart's.
+    let chart_text = ChartText {
+        title: "Title",
+        ..ChartText::default()
+    };
+    let requests = skin.text_requests(&chart_text, TARGETS[0], &views.layouts[0]);
+    let texts: Vec<_> = requests.iter().map(|r| (r.slot, r.text.as_str())).collect();
+    assert_eq!(texts, [(0, "Title"), (1, "MAX")]);
 }
