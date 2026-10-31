@@ -28,7 +28,10 @@
 //! [[step]]
 //! play = { input = "auto", until = "end" }
 //! # input = "auto" | "<input log, relative to this file>"
-//! # until = "end" | { at_ms = 2250, command = "retry" | "quit" }
+//! # until = "end" | { at_ms = 2250, command = "retry" | "quit" | "skip" }
+//! # "quit": the quit key before the play completes, back to selection;
+//! # "skip": the quit key once it is complete, its tail still sounding,
+//! # which skips to its result
 //!
 //! [[step]]
 //! result = "next-preset"         # "prev-preset" | "retry" | "back"
@@ -142,7 +145,48 @@ pub struct PlayStep {
     /// The play's input.
     pub input: InputRef,
     /// When, in chart time, and which command ends the play early.
-    pub until: Option<(TimeUs, Command)>,
+    pub until: Option<(TimeUs, UntilCommand)>,
+}
+
+/// What an `until` sends, and so where the play lands: each is the key it
+/// names, and the run checks the play's end against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UntilCommand {
+    /// The retry key: the chart is played again.
+    Retry,
+    /// The quit key before the play completes: back to selection.
+    Quit,
+    /// The quit key once the play is complete, its tail still sounding:
+    /// the tail is skipped to the result (design.md "Audio tail").
+    Skip,
+}
+
+impl UntilCommand {
+    /// The command its key sends.
+    #[must_use]
+    pub const fn command(self) -> Command {
+        match self {
+            Self::Retry => Command::Retry,
+            Self::Quit | Self::Skip => Command::Quit,
+        }
+    }
+
+    /// Why a play that ended as `report` did not land where this command
+    /// says, if it did not.
+    #[must_use]
+    pub fn missed(self, report: &game::PlayReport) -> Option<&'static str> {
+        let completed = report.end == game::PlayEnd::Completed;
+        match self {
+            Self::Quit if completed => Some(
+                "the quit came after the play completed, which skips to its result: \
+                 use command = \"skip\"",
+            ),
+            Self::Skip if !report.tail_skipped => {
+                Some("the play was not complete, its tail still sounding, at at_ms")
+            }
+            Self::Retry | Self::Quit | Self::Skip => None,
+        }
+    }
 }
 
 /// `--dev-scenario`'s arguments.
@@ -265,6 +309,7 @@ struct AtSpec {
 enum CommandWord {
     Retry,
     Quit,
+    Skip,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -556,8 +601,9 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                             .checked_mul(1_000)
                             .ok_or_else(|| at("at_ms is too large".to_owned()))?;
                         let command = match a.command {
-                            CommandWord::Retry => Command::Retry,
-                            CommandWord::Quit => Command::Quit,
+                            CommandWord::Retry => UntilCommand::Retry,
+                            CommandWord::Quit => UntilCommand::Quit,
+                            CommandWord::Skip => UntilCommand::Skip,
                         };
                         Some((TimeUs(us), command))
                     }
@@ -565,9 +611,9 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 steps.push((SelectStep::Play(PlayStep { input, until }), o));
                 waiting.clear();
                 match until {
-                    None => Seq::Result,
-                    Some((_, Command::Retry)) => Seq::Replay,
-                    Some(_) => Seq::Select,
+                    None | Some((_, UntilCommand::Skip)) => Seq::Result,
+                    Some((_, UntilCommand::Retry)) => Seq::Replay,
+                    Some((_, UntilCommand::Quit)) => Seq::Select,
                 }
             }
             (Seq::Result, Step::Result(r)) => {
@@ -1111,7 +1157,10 @@ pub struct State {
     /// The `play` step whose play is being readied.
     pub pending: Option<Origin>,
     /// The current play's `until`, until it is sent.
-    pub until: Option<(TimeUs, Command)>,
+    pub until: Option<(TimeUs, UntilCommand)>,
+    /// The current play's `until` command once sent, until its end is
+    /// checked against it.
+    pub sent: Option<UntilCommand>,
     /// The practice page as last shown.
     pub practice: Option<game::PracticeScreen>,
     /// Whether the page was shown since a step last pressed a key on it:
@@ -1213,11 +1262,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use bms_model::TimeUs;
-    use game::Command;
 
     use super::{
-        CaptureState, Captures, InputRef, Origin, PlayStep, SelectStep, StepKind, find, parse,
-        write_new,
+        CaptureState, Captures, InputRef, Origin, PlayStep, SelectStep, StepKind, UntilCommand,
+        find, parse, write_new,
     };
 
     /// A folder with `library/a/a.bms` and `library/b/b.bms`.
@@ -1297,7 +1345,7 @@ mod tests {
             (got[1].0.clone(), origin(2, StepKind::Select)),
             (SelectStep::Enter, origin(2, StepKind::Select)),
             (
-                play(Some((TimeUs(2_000), Command::Retry))),
+                play(Some((TimeUs(2_000), UntilCommand::Retry))),
                 origin(3, StepKind::Play),
             ),
             (play(None), origin(4, StepKind::Play)),
@@ -1313,7 +1361,7 @@ mod tests {
             ),
             (SelectStep::Enter, origin(7, StepKind::Select)),
             (
-                play(Some((TimeUs(3_000), Command::Quit))),
+                play(Some((TimeUs(3_000), UntilCommand::Quit))),
                 origin(8, StepKind::Play),
             ),
             (SelectStep::Close, origin(9, StepKind::Quit)),
@@ -1321,6 +1369,52 @@ mod tests {
         assert_eq!(got, expected);
         assert_eq!(origin(7, StepKind::Select).to_string(), "step 7 (select)");
         assert!(dir.path().join("out").is_dir());
+    }
+
+    /// A timed quit lands where its word says: `quit`, before completion,
+    /// on the select screen; `skip`, once the play is complete, on its
+    /// result, which a `result` step then takes and a `select` cannot.
+    #[test]
+    fn a_timed_quit_lands_where_its_word_says() {
+        let dir = folder();
+        let select = "select = { path = \"library/a/a.bms\" }";
+        let at = |word: &str| {
+            format!(
+                "play = {{ input = \"auto\", until = {{ at_ms = 5000, command = \"{word}\" }} }}"
+            )
+        };
+        let skip = at("skip");
+        let quit = at("quit");
+        let s = parse(
+            &file(None, &[select, &skip, "result = \"back\"", "quit = {}"]),
+            dir.path(),
+        )
+        .unwrap();
+        let mut script = s.script;
+        let mut got = Vec::new();
+        while let Some(step) = script.front().cloned() {
+            got.push(step);
+            script.done();
+        }
+        assert!(got.contains(&SelectStep::Play(PlayStep {
+            input: InputRef::Auto,
+            until: Some((TimeUs(5_000_000), UntilCommand::Skip)),
+        })));
+        assert!(got.contains(&SelectStep::Back));
+        assert_eq!(
+            refused(dir.path(), None, &[select, &skip, select, "quit = {}"]),
+            "step 3 (select): select cannot follow step 2 (play)"
+        );
+        assert_eq!(
+            refused(
+                dir.path(),
+                None,
+                &[select, &quit, "result = \"back\"", "quit = {}"]
+            ),
+            "step 3 (result): result cannot follow step 2 (play)"
+        );
+        let after_quit = parse(&file(None, &[select, &quit, "quit = {}"]), dir.path());
+        assert!(after_quit.is_ok(), "{:?}", after_quit.err());
     }
 
     /// A step where its screen does not show is refused, naming it and the

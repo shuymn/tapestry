@@ -741,6 +741,7 @@ mod tests {
             attempt: 2,
             end: game::PlayEnd::Completed,
             tail_cut: None,
+            tail_skipped: false,
             reload_error: None,
             output_error: None,
             input_error: None,

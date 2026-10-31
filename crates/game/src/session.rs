@@ -296,6 +296,9 @@ pub struct PlayReport {
     /// What ended the audio tail of a completed play early, if anything;
     /// the play stays complete.
     pub tail_cut: Option<AbortCause>,
+    /// Whether the player skipped the rest of a completed play's audio
+    /// tail to its result; the play stays complete.
+    pub tail_skipped: bool,
     /// Why the preset file changed at this retry but was not used; the
     /// previous preset played instead.
     pub reload_error: Option<PresetFileError>,
@@ -397,6 +400,9 @@ pub struct PlayOutcome {
     pub end: PlayEnd,
     /// What ended the audio tail of a completed play early, if anything.
     pub tail_cut: Option<AbortCause>,
+    /// Whether the player skipped the rest of the audio tail to the
+    /// result.
+    pub tail_skipped: bool,
     /// The audio output's failure, if it stopped the play or its tail.
     pub output_error: Option<OutputError>,
     /// The input thread's failure, if it ended the play, its recording or
@@ -983,6 +989,7 @@ impl Loaded {
             start,
             end,
             tail_cut,
+            tail_skipped,
             output_error,
             input_error,
             live,
@@ -1107,6 +1114,7 @@ impl Loaded {
             attempt,
             end,
             tail_cut,
+            tail_skipped,
             reload_error,
             output_error,
             input_error,

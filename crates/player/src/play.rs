@@ -346,11 +346,11 @@ pub(crate) fn since(from: TimeUs, to: TimeUs) -> Duration {
 /// play whose chart time 0 lies at `origin`: taken, so it is sent once.
 #[cfg(feature = "dev-tools")]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-pub(crate) fn until_fired(
-    until: &mut Option<(TimeUs, Command)>,
+pub(crate) fn until_fired<C: Copy>(
+    until: &mut Option<(TimeUs, C)>,
     origin: Option<TimeUs>,
     now: TimeUs,
-) -> Option<Command> {
+) -> Option<C> {
     let (Some(origin), Some((at, command))) = (origin, *until) else {
         return None;
     };
@@ -386,7 +386,8 @@ impl Rig for PlayerRig<'_> {
         if let Some(sc) = &mut self.scenario
             && let Some(command) = until_fired(&mut sc.until, self.origin, self.clock.now())
         {
-            self.controls.command(command);
+            sc.sent = Some(command);
+            self.controls.command(command.command());
         }
         #[cfg(feature = "dev-tools")]
         if let Some(origin) = self.origin
@@ -659,6 +660,8 @@ impl Rig for PlayerRig<'_> {
             }
         }
         self.print(report);
+        #[cfg(feature = "dev-tools")]
+        self.scenario_ended(report);
         self.print_restored();
         self.judge_queue();
         self.write_measure(report);

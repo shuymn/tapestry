@@ -6,7 +6,7 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 4
+//! # Schema version 5
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
@@ -38,8 +38,10 @@
 //!   integrated, true_peak, over_range)`: one loudness measurement
 //!   ([`LoudnessRow`]) per [`LoudnessKey`], unlinked from `charts`.
 //!
-//! A change of [`Search`]'s normalization changes what the stored text
-//! means, so it bumps the version too.
+//! A change of [`Search`]'s normalization, or of how
+//! [`bms_parser::read_header`] decodes text, changes what the stored text
+//! means, so it bumps the version too: a chart whose size and modification
+//! time are unchanged is not read again otherwise.
 //!
 //! Everything in the database is derived from the chart files, so a file of
 //! any other version is deleted with its `-wal` and `-shm` files and created
@@ -102,7 +104,7 @@ pub use scan::{
 pub use search::{SEPARATOR, Search, Sort};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
