@@ -214,12 +214,45 @@ fn combos_sit_under_the_grade_centred() {
             NoteKind::UnsupportedField { field: "divx" }
         )
     );
-    // The shift wraps as the source's `int` does, out of range here.
-    let far = judge(&grades(1), &[combo("ten", i32::MIN)]);
-    assert!(
-        matches!(far.err(), ImportError::Range { field: "dst", .. }),
-        "wrapped"
+}
+
+/// A combo of `ten` (three digits) with the keys `keys`.
+fn combo_keys(keys: &str) -> String {
+    format!(r#"{{"id": "ten", "dst": [{keys}]}}"#)
+}
+
+#[test]
+fn a_combo_shift_outside_i32_refuses() {
+    let range_x = |keys: &str| {
+        let l = judge(&grades(1), &[combo_keys(keys)]);
+        assert!(
+            matches!(l.err(), ImportError::Range { field: "x", .. }),
+            "{keys}"
+        );
+    };
+    // `w · 3` overflows.
+    range_x(r#"{"x": 0, "y": 0, "w": 2147483647, "h": 20}"#);
+    // `x − 15` overflows.
+    range_x(r#"{"x": -2147483647, "y": 0, "w": 10, "h": 20}"#);
+    // `x − 3` is the omission mark, `i32::MIN`.
+    range_x(r#"{"x": -2147483645, "y": 0, "w": 2, "h": 20}"#);
+    // Only one of the two is given.
+    range_x(r#"{"x": 10, "y": 0, "h": 20}"#);
+    range_x(r#"{"y": 0, "w": 10, "h": 20}"#);
+}
+
+#[test]
+fn a_combo_key_omitting_x_and_w_inherits_the_shifted_x() {
+    let one = judge(&grades(1), &[combo("ten", 10)]);
+    let two = judge(
+        &grades(1),
+        &[combo_keys(
+            r#"{"time": 0, "x": 10, "y": 0, "w": 10, "h": 20},
+               {"time": 5000, "y": 0, "h": 20}"#,
+        )],
     );
+    let at = |l: &Loaded| shown(l, of(Judgment::Perfect, 12), 12, false);
+    assert_eq!(at(&two), at(&one));
 }
 
 #[test]
