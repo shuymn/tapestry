@@ -70,6 +70,23 @@ fn piecewise_modes_need_one_branch() {
     assert!(loaded.report().notes.is_empty(), "{:?}", loaded.report());
 }
 
+/// The source region, columns and rows, the source draws of the 2×3
+/// frame at `ms` of the mode-5 track (2×3 at 0 ms, 4×6 at 7 ms): its
+/// width fixes the scale, and a box shorter than the scaled frame crops
+/// the rows to `(int)(h / scale)`.
+#[expect(clippy::cast_possible_truncation, reason = "the source truncates")]
+fn mode5_source_region(ms: u8) -> [i32; 2] {
+    let rate = f32::from(ms) / 7.0;
+    let w = 2.0 + (4.0 - 2.0) * rate;
+    let h = 3.0 + (6.0 - 3.0) * rate;
+    let scale = w / 2.0;
+    if h < scale * 3.0 {
+        [2, (h / scale) as i32]
+    } else {
+        [2, 3]
+    }
+}
+
 #[test]
 fn trimmed_modes_are_refused() {
     // The f32 crop of mode 5 drops source rows: a 2×3 frame from 2×3 to
@@ -82,6 +99,12 @@ fn trimmed_modes_are_refused() {
     assert!(has(loaded.report(), NoteKind::Stretch(5)));
     assert_eq!(loaded.report().usage.images, 0);
     assert!(loaded.quads(3).is_empty());
+    // At 6 ms the source crops its frame in f32 (`StretchType.java:16-146`
+    // at `0.8.9`, interpolating as `SkinObject.java:384-411`): the exact
+    // region keeps all three rows, the source's keeps two.
+    assert_eq!(mode5_source_region(6), [2, 2]);
+    assert_eq!(mode5_source_region(0), [2, 3]);
+    assert_eq!(mode5_source_region(7), [2, 3]);
     for mode in [3, 7, 10] {
         let loaded = image([2, 3], mode, r#"{"w": 4, "h": 6}"#);
         assert!(has(loaded.report(), NoteKind::Stretch(mode)), "{mode}");
