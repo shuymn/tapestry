@@ -53,12 +53,13 @@ use crate::header::Header;
 use crate::resolve::{Definition, Resolved, Tables, resolve};
 use crate::tree::{Kind, Scalar};
 
-/// What the user configured for one skin: the selected option items, the
-/// file chosen for each file choice, and the offsets.
+/// What the user configured for one skin: the item selected in each
+/// option, the file chosen for each file choice, and the offsets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
-    /// The selected option items' numbers.
-    pub options: BTreeSet<i32>,
+    /// Per option of the header, in its order: the selected item's
+    /// number, `None` for none. An option past the end selects none.
+    pub options: Vec<Option<i32>>,
     /// File choice name to the chosen candidate's name.
     pub files: BTreeMap<String, String>,
     pub offsets: BTreeMap<i32, OffsetValue>,
@@ -85,7 +86,7 @@ impl Config {
         let options = header
             .options
             .iter()
-            .filter_map(|o| {
+            .map(|o| {
                 let by_def = o
                     .def
                     .as_ref()
@@ -97,6 +98,13 @@ impl Config {
             options,
             ..Self::default()
         }
+    }
+
+    /// Every selected item's number: what the source tree's conditions
+    /// see (`JSONSkinLoader.java:254-260`).
+    #[must_use]
+    pub fn enabled(&self) -> BTreeSet<i32> {
+        self.options.iter().flatten().copied().collect()
     }
 }
 
@@ -143,8 +151,9 @@ pub fn import(
     header: &Header,
     config: &Config,
 ) -> Result<Imported, ImportError> {
-    let mut resolved = resolve(def, &config.options)?;
-    let tables = resolved.tables(&config.options)?;
+    let enabled = config.enabled();
+    let mut resolved = resolve(def, &enabled)?;
+    let tables = resolved.tables(&enabled)?;
     let Resolved { def, size, .. } = resolved;
     let mut files = Vec::new();
     let choices = Choices::new(header, config, &mut files);
@@ -255,8 +264,11 @@ pub(crate) struct Cx<'d> {
     custom: Custom,
     assets: Assets,
     choices: Choices,
-    /// Every declared option item's number.
-    declared: BTreeSet<i32>,
+    /// What a destination's numeric op reads of each declared option
+    /// item: whether it is its option's selection, a later option's entry
+    /// replacing an earlier one's for a shared number
+    /// (`JSONSkinLoader.java:291-297`).
+    items: BTreeMap<i32, bool>,
     whens: Vec<Program>,
     when_spans: Vec<Span>,
     ranks: [Option<u16>; 3],
@@ -304,11 +316,13 @@ impl<'d> Cx<'d> {
     ) -> Result<Self, ImportError> {
         let entry_dir = def.entry_dir().to_owned();
         let assets = Assets::new(def.root());
-        let declared = header
-            .options
-            .iter()
-            .flat_map(|o| o.items.iter().map(|i| i.op))
-            .collect();
+        let mut items = BTreeMap::new();
+        for (i, o) in header.options.iter().enumerate() {
+            let selected = config.options.get(i).copied().flatten();
+            for item in &o.items {
+                items.insert(item.op, Some(item.op) == selected);
+            }
+        }
         let mut cx = Self {
             def,
             header,
@@ -325,7 +339,7 @@ impl<'d> Cx<'d> {
             custom: Custom::default(),
             assets,
             choices,
-            declared,
+            items,
             whens: Vec::new(),
             when_spans: Vec::new(),
             ranks: [None; 3],
@@ -774,7 +788,7 @@ impl<'d> Cx<'d> {
                     if !seen.insert(*n) {
                         continue;
                     }
-                    ops::numeric(*n, &self.declared, &self.config.options)
+                    ops::numeric(*n, &self.items)
                 }
                 Op::Name(s) => match ops::named(s) {
                     Some(c) => c,
@@ -796,7 +810,7 @@ impl<'d> Cx<'d> {
             Prop::Null => {}
             Prop::Id(n) => {
                 if ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0)) {
-                    let c = ops::numeric(*n, &BTreeSet::new(), &BTreeSet::new());
+                    let c = ops::numeric(*n, &BTreeMap::new());
                     if !self.condition(role, at, c, &mut conds)? {
                         return Ok(None);
                     }

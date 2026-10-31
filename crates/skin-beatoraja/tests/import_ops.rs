@@ -34,6 +34,36 @@ fn ignored(field: &'static str) -> NoteKind {
     NoteKind::Ignored { field }
 }
 
+/// Two options sharing item 900: the first selects it, the later one
+/// selects 902. The source tree's conditions see every selection
+/// (`JSONSkinLoader.java:254-260`); a destination's op sees the later
+/// option's entry, which replaced the first's (`JSONSkinLoader.java:
+/// 291-297`).
+#[test]
+fn a_later_option_overrides_a_shared_item_for_ops() {
+    let shared = r#""property": [
+        {"name": "a", "item": [{"name": "x", "op": 900}, {"name": "y", "op": 901}], "def": "x"},
+        {"name": "b", "item": [{"name": "s", "op": 900}, {"name": "z", "op": 902}], "def": "z"}
+    ]"#;
+    let drawn = |dst: &str| {
+        import_body(&format!(
+            r#"{shared}, "image": [{{"id": "i", "src": "a", "w": 64, "h": 64}}],
+               "destination": [{dst}]"#
+        ))
+        .quads(0)
+        .len()
+    };
+    let key = r#""dst": [{"w": 10, "h": 10}]"#;
+    assert_eq!(
+        drawn(&format!(r#"{{"if": 900, "value": {{"id": "i", {key}}}}}"#)),
+        1
+    );
+    assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [900], {key}}}"#)), 0);
+    assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [-900], {key}}}"#)), 1);
+    assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [902], {key}}}"#)), 1);
+    assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [901], {key}}}"#)), 0);
+}
+
 #[test]
 fn op_0_is_no_condition() {
     let loaded = image(r#""op": [0, 0]"#);

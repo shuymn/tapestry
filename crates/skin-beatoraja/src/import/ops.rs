@@ -6,7 +6,7 @@
 //! items fold to constants (`Skin.java:214-226`). An id that is neither
 //! is never drawn, for either sign.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// The ids `BooleanPropertyFactory.getBooleanProperty(int)` knows, with
 /// their names (`BooleanPropertyFactory.java:349-~720`, the `BooleanType`
@@ -288,16 +288,16 @@ fn built_in_cond(id: i32, negative: bool) -> Cond {
 }
 
 /// Numeric op `op` (non-zero): built-ins first, then the declared items
-/// `declared`, folded against the selected `enabled`.
-pub(crate) fn numeric(op: i32, declared: &BTreeSet<i32>, enabled: &BTreeSet<i32>) -> Cond {
+/// `items`, each folded to whether it is selected.
+pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
     let Ok(id) = i32::try_from(op.unsigned_abs()) else {
         return Cond::Undefined(op);
     };
     if is_builtin(id) {
         return built_in_cond(id, op < 0);
     }
-    if declared.contains(&id) {
-        return Cond::Fold(enabled.contains(&id) == (op > 0));
+    if let Some(&on) = items.get(&id) {
+        return Cond::Fold(on == (op > 0));
     }
     Cond::Undefined(op)
 }
@@ -376,7 +376,7 @@ mod tests {
         let mut exprs = Vec::new();
         for &(id, _) in KNOWN_BOOLEAN_IDS {
             for op in [id, -id] {
-                if let Cond::Expr(e) = numeric(op, &BTreeSet::new(), &BTreeSet::new()) {
+                if let Cond::Expr(e) = numeric(op, &BTreeMap::new()) {
                     exprs.push(e);
                 }
             }
@@ -404,20 +404,19 @@ mod tests {
 
     #[test]
     fn built_ins_win_over_declared_items() {
-        let declared = BTreeSet::from([241, 900]);
-        let on = BTreeSet::from([900]);
+        let items = BTreeMap::from([(241, false), (900, true)]);
         assert_eq!(
-            numeric(-241, &declared, &on),
+            numeric(-241, &items),
             Cond::Expr("!(on(judge.perfect))".into())
         );
-        assert_eq!(numeric(900, &declared, &on), Cond::Fold(true));
-        assert_eq!(numeric(-900, &declared, &on), Cond::Fold(false));
-        assert_eq!(numeric(901, &declared, &on), Cond::Undefined(901));
-        assert_eq!(numeric(202, &declared, &on), Cond::Unsupported(202));
+        assert_eq!(numeric(900, &items), Cond::Fold(true));
+        assert_eq!(numeric(-900, &items), Cond::Fold(false));
+        assert_eq!(numeric(901, &items), Cond::Undefined(901));
+        assert_eq!(numeric(202, &items), Cond::Unsupported(202));
         // The BGA built-ins win over items declared with their numbers.
-        let declared = BTreeSet::from([40, 41]);
-        assert_eq!(numeric(40, &declared, &declared), Cond::Unsupported(40));
-        assert_eq!(numeric(-41, &declared, &declared), Cond::Unsupported(-41));
+        let items = BTreeMap::from([(40, true), (41, true)]);
+        assert_eq!(numeric(40, &items), Cond::Unsupported(40));
+        assert_eq!(numeric(-41, &items), Cond::Unsupported(-41));
         assert_eq!(named("!bgaon"), Some(Cond::Unsupported(-41)));
     }
 }
