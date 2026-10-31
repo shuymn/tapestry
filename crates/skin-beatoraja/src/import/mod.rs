@@ -26,9 +26,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, KeyDef, LoadError, MAX_GEOMETRY, PLAY,
-    Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track, Ty,
-    WidgetDefs, compile, timer as slot,
+    Anchor, Blend, CompileError, CycleDef, Ease, ElementDef, ErrorKind, Filter, Fit, KeyDef,
+    LoadError, MAX_GEOMETRY, MAX_SOURCE_BYTES, PLAY, Place, Program, Region, RegionDef, Scope,
+    Skin, SkinDef, Source, Span as ExprSpan, TimerRef, Track, Ty, WidgetDefs, compile,
+    timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -805,7 +806,9 @@ impl<'d> Cx<'d> {
     }
 
     /// Applies one condition: `Ok(false)` when the element is dropped or
-    /// never drawn.
+    /// never drawn. A repeated expression adds nothing, and the joined
+    /// source is kept within the compiler's limit as it grows, so a long
+    /// list of conditions builds no more than that.
     fn condition(
         &mut self,
         role: Role,
@@ -815,6 +818,23 @@ impl<'d> Cx<'d> {
     ) -> Result<bool, ImportError> {
         match c {
             Cond::Expr(e) => {
+                if conds.contains(&e) {
+                    return Ok(true);
+                }
+                // `(a) && (b)`: each term in parentheses, joined by ` && `.
+                let len = conds.iter().map(|c| c.len() + 2 + 4).sum::<usize>() + e.len() + 2;
+                if len > MAX_SOURCE_BYTES {
+                    return Err(ImportError::Expr {
+                        at: self.loc(at),
+                        source: CompileError {
+                            span: ExprSpan {
+                                start: 0,
+                                end: u32::try_from(len).unwrap_or(u32::MAX),
+                            },
+                            kind: ErrorKind::TooLong { len },
+                        },
+                    });
+                }
                 conds.push(e);
                 Ok(true)
             }

@@ -144,3 +144,35 @@ fn names_use_the_same_table() {
     assert!(has(loaded.report(), ignored("draw")));
     assert_eq!(loaded.quads(0).len(), 1);
 }
+
+#[test]
+fn repeated_conditions_add_nothing() {
+    // 500 000 repeats of one name build one condition, not a source past
+    // the compiler's limit.
+    let many = vec![r#""judge_1p_perfect""#; 500_000].join(",");
+    let once = image(r#""op": ["judge_1p_perfect"]"#);
+    let repeated = image(&format!(r#""op": [{many}], "draw": "judge_1p_perfect""#));
+    assert_eq!(
+        repeated.ok().skin.ops().total(),
+        once.ok().skin.ops().total()
+    );
+    let mut d = repeated.drawn();
+    assert!(d.frame(10, &[]).is_empty());
+    assert_eq!(d.frame(20, &[judged(20, Judgment::Perfect, 1)]).len(), 1);
+    // Every supported condition and its negation together fit.
+    let all: Vec<String> = (0..=10)
+        .map(|k| format!(r#""gauge_1p_{}""#, gauge_name(k)))
+        .chain(std::iter::once(r#""judge_1p_perfect""#.to_owned()))
+        .flat_map(|n| [n.clone(), n.replacen('"', "\"!", 1)])
+        .collect();
+    let loaded = image(&format!(r#""op": [{}]"#, all.join(",")));
+    assert!(loaded.ok().skin.ops().total() > 0);
+}
+
+fn gauge_name(k: u32) -> String {
+    if k == 10 {
+        "100".to_owned()
+    } else {
+        format!("{}_{}", 10 * k, 10 * (k + 1))
+    }
+}
