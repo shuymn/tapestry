@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use replay::PlayRecord;
 use tempfile::NamedTempFile;
 
+use crate::bests::{BestView, SavedPlay};
 use crate::error::IoFailure;
 
 /// A complete temporary file in `dir`, under a name no other writer uses; it
@@ -65,6 +66,15 @@ pub trait RecordSink {
     ///
     /// Why it could not be saved.
     fn save(&mut self, rec: &PlayRecord) -> Result<RecordRef, SaveError>;
+
+    /// Hears about a play once its record was saved, or failed to be, and
+    /// its result is summarized; what it returns, the play's standing
+    /// against its personal best, goes to the end screen. Nothing by
+    /// default.
+    fn after_result(&mut self, play: &SavedPlay<'_>) -> Option<BestView> {
+        let _ = play;
+        None
+    }
 }
 
 /// Numbers tried from the first free one before saving gives up: that many

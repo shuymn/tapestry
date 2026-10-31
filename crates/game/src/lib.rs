@@ -17,6 +17,7 @@
 pub mod app;
 mod audio_loop;
 mod autoplay;
+mod bests;
 mod error;
 mod keys;
 pub mod live;
@@ -42,6 +43,7 @@ pub use audio_loop::{
     Probed, SWITCH_TIMEOUT, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError};
+pub use bests::{BestScore, BestView, SavedPlay};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use keys::{

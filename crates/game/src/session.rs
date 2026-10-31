@@ -28,6 +28,7 @@ use replay::{
 use rules::{GaugeKind, RulePreset};
 
 use crate::autoplay::{Autoplay, AutoplayError};
+use crate::bests::{BestView, SavedPlay};
 use crate::live::{Closing, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
@@ -311,6 +312,10 @@ pub struct PlayReport {
     pub saved: Option<Result<RecordRef, SaveError>>,
     /// The result extension's summary of a recorded play.
     pub result: Option<ResultSummary>,
+    /// The play's standing against its personal best, as the record sink
+    /// answered ([`RecordSink::after_result`]); `None` when it says
+    /// nothing, or there is no sink, record or summary.
+    pub best: Option<BestView>,
     /// The preset the play was evaluated under: after a reload at a
     /// retry, the new one.
     pub preset: RulePreset,
@@ -1004,6 +1009,23 @@ impl Loaded {
                 live: &live,
             })
         });
+        let best = match (
+            parts.records.as_mut(),
+            play_record.as_ref(),
+            saved.as_ref(),
+            result.as_ref(),
+        ) {
+            (Some(sink), Some(record), Some(saved), Some(summary)) => {
+                sink.after_result(&SavedPlay {
+                    record,
+                    saved: saved.as_ref(),
+                    summary,
+                    chart: &self.chart,
+                    preset,
+                })
+            }
+            _ => None,
+        };
         let retried =
             end == PlayEnd::Aborted(AbortCause::Retry) || tail_cut == Some(AbortCause::Retry);
         if retried {
@@ -1023,6 +1045,7 @@ impl Loaded {
             record: play_record,
             saved,
             result,
+            best,
             preset: preset.clone(),
         }
     }

@@ -675,6 +675,7 @@ mod tests {
                 matches_live: true,
                 recommended_offset: None,
             }),
+            best: None,
             preset,
         }
     }
