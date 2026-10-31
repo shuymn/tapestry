@@ -1663,6 +1663,11 @@ mod menu_tests {
         /// The configured controller connected, with its menu, the window
         /// focused, and the thread in its tail as at its start.
         fn new() -> Self {
+            Self::with(ScratchConfig::default())
+        }
+
+        /// [`new`](Self::new) with the menu bound under `scratch`.
+        fn with(scratch: ScratchConfig) -> Self {
             let mut sources = SourceSet::new(SourceConfig {
                 max_devices: 4,
                 max_sources: 4,
@@ -1677,7 +1682,6 @@ mod menu_tests {
             sources.set_product(DeviceId(10), PAD);
             sources.add_axes(DeviceId(10), &caps);
             sources.end_batch(TimeUs(0));
-            let scratch = ScratchConfig::default();
             let bindings = menu_bindings(&keys(), Some(PAD), &scratch).unwrap();
             let (tap, menu) = input::menu_queue(bindings);
             sources.set_menu(tap);
@@ -1799,6 +1803,48 @@ mod menu_tests {
         ];
         assert!(rig.unparks(turns));
         assert_eq!(rig.events(), [Down, Up]);
+    }
+
+    /// With the menu direction reversed in `device.toml`, the scratch axis
+    /// scrolls the other way on every menu that takes it: toward higher
+    /// values up the select screen's list, to the result's previous preset
+    /// and up the practice page's rows, toward lower values the other way.
+    #[test]
+    fn a_reversed_scratch_axis_scrolls_every_menu_the_other_way() {
+        use crate::result_input::{Owner, ResultInput};
+        use crate::select::MenuQueue;
+        use game::{MenuCommand, PracticeInput};
+
+        let higher_then_lower: Reports<'_> =
+            &[(&[], Some(100)), (&[], Some(102)), (&[], Some(100))];
+        // As the default has it, for comparison.
+        let mut rig = Rig::new();
+        rig.idle();
+        rig.batch(higher_then_lower, false);
+        assert_eq!(rig.events(), [MenuEvent::Down, MenuEvent::Up]);
+
+        let reversed = ScratchConfig {
+            menu_reversed: true,
+            ..ScratchConfig::default()
+        };
+        let mut rig = Rig::with(reversed);
+        rig.idle();
+        // The select screen takes the events as they come.
+        rig.batch(higher_then_lower, false);
+        assert_eq!(rig.events(), [MenuEvent::Up, MenuEvent::Down]);
+        // The result screen and the practice page read them through the
+        // menus' shared input.
+        let (_, spare) = input::menu_queue(menu_bindings(&keys(), Some(PAD), &reversed).unwrap());
+        let pad = std::mem::replace(&mut rig.menu, spare);
+        let mut menus = ResultInput::new(Arc::new(MenuQueue::default()), Some(pad));
+        menus.take_over(Owner::Result);
+        rig.batch(higher_then_lower, false);
+        let result: Vec<_> = std::iter::from_fn(|| menus.take()).collect();
+        assert_eq!(result, [MenuCommand::PrevPreset, MenuCommand::NextPreset]);
+        menus.take_over(Owner::Practice);
+        rig.batch(higher_then_lower, false);
+        let practice: Vec<_> = std::iter::from_fn(|| menus.take_practice()).collect();
+        assert_eq!(practice, [PracticeInput::Up, PracticeInput::Down]);
     }
 
     /// While Open or Tail no menu events are sent; once Idle again they

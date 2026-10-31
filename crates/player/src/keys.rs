@@ -93,6 +93,9 @@ pub fn lines(flow: &KeyConfigFlow) -> Vec<String> {
                 )
             },
         ));
+    } else if flow.turning() {
+        l.push("TURN THE TURNTABLE THE WAY THAT SCROLLS MENUS DOWN (F12: KEEP)".to_owned());
+        l.push(String::new());
     } else {
         match flow.role() {
             Some(r @ (Role::Retry | Role::Quit)) => {
@@ -164,6 +167,29 @@ impl KeyScreen for Screen<'_> {
     }
 }
 
+/// Puts a finished key config into `device`: the bindings, the scratch
+/// axis's revolution when it was learnt beyond its declared range, and its
+/// menu direction when it was turned for it (else the current one stays).
+fn apply(
+    device: &mut DeviceSettings,
+    keys: KeyConfigs,
+    widened: Option<u32>,
+    menu_reversed: Option<bool>,
+) {
+    device.keyboard = keys.keyboard;
+    device.controller = keys.controller;
+    device.controller_device = keys.controller_device.map(Into::into);
+    if let Some(wrap) = widened {
+        device.scratch.wrap = Some(wrap);
+        println!(
+            "keys: the scratch axis reported beyond its declared range; its revolution is set to {wrap} values"
+        );
+    }
+    if let Some(reversed) = menu_reversed {
+        device.scratch.menu_reversed = reversed;
+    }
+}
+
 /// Runs the key config screen. `script` (dev-tools) offers presses in
 /// place of a person.
 ///
@@ -221,23 +247,15 @@ pub fn run(
         controller: device.controller.clone(),
         controller_device: device.controller_device.map(Into::into),
     };
-    let end = capture_keys(&capture, &mut screen, current);
+    let end = capture_keys(&capture, &mut screen, current, device.scratch.wrap);
     drop(screen);
     #[cfg(feature = "dev-tools")]
     drop(script);
     drop(input);
     window_thread.close();
     match end {
-        KeyConfigEnd::Done(keys, widened) => {
-            device.keyboard = keys.keyboard;
-            device.controller = keys.controller;
-            device.controller_device = keys.controller_device.map(Into::into);
-            if let Some(wrap) = widened {
-                device.scratch.wrap = Some(wrap);
-                println!(
-                    "keys: the scratch axis reported beyond its declared range; its revolution is set to {wrap} values"
-                );
-            }
+        KeyConfigEnd::Done(keys, widened, menu_reversed) => {
+            apply(&mut device, keys, widened, menu_reversed);
             save_settings(&path, &device).with_context(|| path.display().to_string())?;
             println!("keys: saved to {}", path.display());
         }
@@ -249,10 +267,117 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use game::{Bound, DeviceSettings, KeyConfig, KeyConfigFlow, KeyConfigs};
-    use input::DeviceKind;
+    use std::time::Duration;
 
-    use super::{lines, name};
+    use eval::ControlId;
+    use game::{
+        Bound, DeviceSettings, KeyConfig, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen,
+        capture_keys_within,
+    };
+    use input::{Capture, DeviceId, DeviceKind, Packet};
+
+    use super::{apply, lines, name};
+
+    const MODEL: input::hid::HidProduct = input::hid::HidProduct {
+        vendor_id: 0x1A2B,
+        product_id: 0x3C4D,
+        interface: None,
+    };
+    const AXIS: u32 = 0x1_0030;
+
+    /// Offers one packet per wait, as the input thread offers them: a
+    /// keyboard key (`Ok`) or the scratch axis turned (`Err`, its value's
+    /// sign the direction). Keeps the lines shown while the menu direction
+    /// is asked for.
+    struct Scripted {
+        capture: Capture,
+        steps: std::vec::IntoIter<Result<u32, i32>>,
+        asked: Vec<String>,
+    }
+
+    impl KeyScreen for Scripted {
+        fn show(&mut self, flow: &KeyConfigFlow) {
+            if flow.turning() {
+                self.asked = lines(flow);
+            }
+        }
+
+        fn wait(&mut self) {
+            let (control, value, kind) = match self.steps.next().expect("the script ran out") {
+                Ok(key) => (key, 1, DeviceKind::Keyboard),
+                Err(value) => (AXIS, value, DeviceKind::Controller),
+            };
+            let packet = Packet {
+                device: DeviceId(3),
+                control: ControlId(control),
+                value,
+                background: false,
+            };
+            match kind {
+                DeviceKind::Keyboard => self.capture.offer(&packet, kind, false),
+                DeviceKind::Controller => {
+                    self.capture.offer_controller(&packet, Some(MODEL), false)
+                }
+            }
+        }
+
+        fn closed(&self) -> bool {
+            false
+        }
+    }
+
+    /// Key config with the scratch bound to the axis, its range skipped
+    /// (F12), `answer` at the menu direction prompt, and the rest kept,
+    /// written over `device` as `tapestry keys` writes it.
+    fn configured(answer: Result<u32, i32>, device: &mut DeviceSettings) -> Vec<String> {
+        let capture = Capture::new();
+        let mut steps = vec![Err(1), Ok(game::KEEP_KEY), answer];
+        steps.extend([Ok(game::KEEP_KEY); 9]);
+        let mut screen = Scripted {
+            capture: capture.clone(),
+            steps: steps.into_iter(),
+            asked: Vec::new(),
+        };
+        let current = KeyConfigs {
+            keyboard: device.keyboard.clone(),
+            controller: device.controller.clone(),
+            controller_device: device.controller_device.map(Into::into),
+        };
+        let end = capture_keys_within(
+            &capture,
+            &mut screen,
+            current,
+            device.scratch.wrap,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let KeyConfigEnd::Done(keys, widened, menu_reversed) = end else {
+            panic!("{end:?}");
+        };
+        apply(device, keys, widened, menu_reversed);
+        assert_eq!(device.validate(), Ok(()));
+        screen.asked
+    }
+
+    /// The axis turned toward lower values at the prompt writes the menu
+    /// direction reversed, toward higher values not reversed, and F12
+    /// keeps what `device.toml` had.
+    #[test]
+    fn key_config_writes_the_menu_direction_turned() {
+        let mut device = DeviceSettings::default();
+        let asked = configured(Err(-1), &mut device);
+        assert_eq!(
+            asked[2],
+            "TURN THE TURNTABLE THE WAY THAT SCROLLS MENUS DOWN (F12: KEEP)"
+        );
+        assert!(device.scratch.menu_reversed);
+        configured(Ok(game::KEEP_KEY), &mut device);
+        assert!(device.scratch.menu_reversed, "F12 keeps it");
+        configured(Err(1), &mut device);
+        assert!(!device.scratch.menu_reversed);
+        configured(Ok(game::KEEP_KEY), &mut device);
+        assert!(!device.scratch.menu_reversed, "F12 keeps it");
+    }
 
     #[test]
     fn the_screen_shows_prompt_refusal_and_bindings() {

@@ -373,7 +373,8 @@ const fn axis_of(kind: DeviceKind, control: u32) -> bool {
 /// revolution has come from the device's declaration unless set here; the
 /// thresholds and release time default to [`ScratchSettings::DEFAULT`],
 /// starting points tuned by playing. The resolved settings are what the
-/// input log records.
+/// input log records; [`menu_reversed`](Self::menu_reversed) is not among
+/// them, since it never reaches play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ScratchConfig {
@@ -390,6 +391,10 @@ pub struct ScratchConfig {
     pub hold_threshold: u32,
     /// How long after the axis stops the lane is released, µs.
     pub release_after_us: u32,
+    /// Whether the axis scrolls menus down when turned toward lower values
+    /// rather than higher ones (design.md "Menu input"). Menus only: play
+    /// and the input log never see it.
+    pub menu_reversed: bool,
 }
 
 impl Default for ScratchConfig {
@@ -401,6 +406,7 @@ impl Default for ScratchConfig {
             press_threshold: d.press_threshold,
             hold_threshold: d.hold_threshold,
             release_after_us: d.release_after_us,
+            menu_reversed: false,
         }
     }
 }
