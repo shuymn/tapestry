@@ -177,6 +177,8 @@ fn advance_does_not_allocate() {
     let mut gauged = rules::beatoraja_style();
     let mut scaled = gauged.gauges[3].clone();
     scaled.id = "scaled".to_owned();
+    // Ranks are distinct; beatoraja-style's run 0 to 5.
+    scaled.lamp = 6;
     scaled.kind = rules::GaugeKind::Survival {
         fails_below: rules::GaugeValue(2 * rules::GaugeValue::PERCENT),
     };

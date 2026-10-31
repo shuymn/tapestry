@@ -164,6 +164,7 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
             "non_minimal_varint",
             "count_beyond_data",
             "unknown_tag",
+            "duplicate_lamp",
             "varint_overflow",
             "invalid_utf8",
             "value_too_large",
@@ -180,8 +181,8 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
         let result = preset_canonical(&bytes).map(|_| ());
         let expected = match name {
             "tapestry" | "beatoraja_style" | "lr2_style" | "gauge_policies" | "long" => Ok(()),
-            "other_version" => Err(CanonicalError::UnsupportedVersion(11)),
-            "older_version" => Err(CanonicalError::UnsupportedVersion(9)),
+            "other_version" => Err(CanonicalError::UnsupportedVersion(12)),
+            "older_version" => Err(CanonicalError::UnsupportedVersion(10)),
             "wrong_percent_length" => Err(CanonicalError::WrongLength {
                 field: "rank_percent",
                 len: 6,
@@ -195,6 +196,11 @@ fn preset_canonical_seeds_decode_or_fail_as_built() {
                 field: "gauge kind",
                 tag: 2,
             }),
+            "duplicate_lamp" => Err(CanonicalError::Invalid(RuleError::DuplicateLamp {
+                rank: 0,
+                first: "normal".to_owned(),
+                second: "survival".to_owned(),
+            })),
             "varint_overflow" => Err(CanonicalError::VarintOverflow),
             "invalid_utf8" => Err(CanonicalError::InvalidUtf8 { field: "id" }),
             "value_too_large" => Err(CanonicalError::ValueTooLarge { field: "version" }),

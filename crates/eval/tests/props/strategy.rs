@@ -340,6 +340,25 @@ fn raw_preset() -> impl Strategy<Value = RawPreset> {
         )
 }
 
+/// The first bit of `RawPreset::flags` that holds lamp ranks rather than a
+/// policy flag.
+const LAMP_FLAG_SHIFT: u32 = 21;
+
+/// Lamp ranks for `n` gauges (at most 3): a permutation of `0..n`, chosen
+/// by `raw` (decoded as a factorial-base number), times a stride of 1 to 4,
+/// so ranks reach every order and need not be contiguous.
+fn lamp_ranks(n: usize, raw: u32) -> Vec<u16> {
+    let mut pool: Vec<u16> = (0..u16::try_from(n).unwrap()).collect();
+    let mut raw = raw;
+    let mut order = Vec::with_capacity(n);
+    for k in (1..=u32::try_from(n).unwrap()).rev() {
+        order.push(pool.remove(usize::try_from(raw % k).unwrap()));
+        raw /= k;
+    }
+    let stride = u16::try_from(raw % 4).unwrap() + 1;
+    order.into_iter().map(|pos| pos * stride).collect()
+}
+
 /// A window edge increment: a grid multiple (so deadlines meet inputs),
 /// or any µs count; the first edge may be 0.
 fn edge_step(raw: u32, first: bool) -> i64 {
@@ -392,7 +411,7 @@ fn delta(sel: u8, v: u32) -> GaugeDelta {
     }
 }
 
-fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
+fn build_gauge(raw: &RawGauge, id: usize, lamp: u16) -> GaugeRule {
     let [a, b, c, d] = raw.bounds.map(u64::from);
     let (sel, v) = raw.policy;
     let (kind, min, start, max) = if raw.survival {
@@ -464,6 +483,7 @@ fn build_gauge(raw: &RawGauge, id: usize) -> GaugeRule {
     low_damage.dedup_by_key(|b| b.below);
     GaugeRule {
         id: format!("g{id}"),
+        lamp,
         kind,
         start: GaugeValue(start),
         min: GaugeValue(min),
@@ -696,11 +716,17 @@ fn build_preset(raw: &RawPreset) -> RulePreset {
         2 => DefaultTotal::NotesCurve,
         _ => DefaultTotal::NotesLinear,
     };
+    // Lamp ranks from the flags' top bits, which no policy flag reads: a
+    // draw of their own would shift the deterministic samples that
+    // `generators_reach_the_fragile_spots` counts, and one rare spot would
+    // then go unreached (`lamp_bits_are_no_policy_flag`).
+    let lamps = lamp_ranks(raw.gauges.len(), raw.flags >> LAMP_FLAG_SHIFT);
     p.gauges = raw
         .gauges
         .iter()
+        .zip(lamps)
         .enumerate()
-        .map(|(i, g)| build_gauge(g, i))
+        .map(|(i, (g, lamp))| build_gauge(g, i, lamp))
         .collect();
     let ex = raw.ex.map(|e| u32::from(e % 4));
     p.score.ex = PerJudgment {
@@ -1981,4 +2007,30 @@ pub fn build_held_through(raw: &RawHeldThrough) -> HeldThrough {
         deviation,
         windows,
     }
+}
+
+/// The flag bits that hold lamp ranks change nothing else: flipping all of
+/// them leaves every preset equal but for its ranks, and they do reach the
+/// ranks.
+#[test]
+fn lamp_bits_are_no_policy_flag() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let unranked = |mut p: RulePreset| {
+        for g in &mut p.gauges {
+            g.lamp = 0;
+        }
+        p
+    };
+    let mut runner = TestRunner::deterministic();
+    let mut reranked = 0;
+    for _ in 0..256 {
+        let raw = raw_preset().new_tree(&mut runner).unwrap().current();
+        let mut other = raw.clone();
+        other.flags ^= u32::MAX << LAMP_FLAG_SHIFT;
+        let (a, b) = (build_preset(&raw), build_preset(&other));
+        reranked += usize::from(a.gauges != b.gauges);
+        assert_eq!(unranked(a), unranked(b));
+    }
+    assert!(reranked > 0, "the lamp bits never changed a rank");
 }
