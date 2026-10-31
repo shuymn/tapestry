@@ -65,6 +65,12 @@ pub struct PlayContext<'a> {
     /// The preset's long-note mode for a chart that declares none
     /// (`rule.ln_mode.default`).
     pub ln_default: rules::LnMode,
+    /// The end of the attempt's notes on the play clock, from which
+    /// `last_note` is sampled: the last note's time in a normal play, the
+    /// last timeline's (background sounds included) in autoplay, and in
+    /// practice the section's end plus 1 s, scaled by the play speed
+    /// (`play/BMSPlayer.java:199, 587`).
+    pub last_note_end: TimeUs,
 }
 
 /// What one frame gives the skin.
@@ -86,6 +92,10 @@ pub struct SkinFrame<'a> {
     /// Whether evaluation is complete (the play view's `complete`): a
     /// section attempt then rings out without notes.
     pub complete: bool,
+    /// Whether this frame's update entered the play in its playing state:
+    /// false during the countdown and after a stop, the finish or the fade
+    /// out. A gauge failure during the frame's own update leaves it true.
+    pub playing: bool,
     /// The render target's size in pixels; the skin computes its canvas
     /// from it.
     pub target: [u32; 2],
@@ -122,6 +132,10 @@ pub struct Play {
     beat: Option<(i128, i64)>,
     ready_at: TimeUs,
     play_at: TimeUs,
+    /// The context's [`PlayContext::last_note_end`].
+    last_note_end: TimeUs,
+    /// `last_note`'s start, once sampled.
+    last_note: Option<TimeUs>,
     scratch: Side,
     /// Whether a long note's release is judged on its own (CN and HCN).
     separate_end_judgment: bool,
@@ -148,12 +162,14 @@ pub(crate) struct Notes {
 
 impl Play {
     /// A fresh attempt with `whens` `when` timers, keeping the chart's
-    /// notes when the skin has `lanes`.
+    /// notes when the skin has `lanes`; grades up to `bomb_up_to` give a
+    /// bomb.
     pub(crate) fn new(
         chart: &Chart,
         ctx: &PlayContext<'_>,
         whens: usize,
         lanes: bool,
+        bomb_up_to: Option<schema::Grade>,
     ) -> Result<Self, PrepareError> {
         let (play_at, lead_in, section) = match ctx.attempt {
             Attempt::Full { lead_in } => (TimeUs(0), lead_in, None),
@@ -181,8 +197,9 @@ impl Play {
             chart,
             section,
             initial,
-            ready_at,
+            play_at,
             ctx.empty_poor_breaks_combo,
+            bomb_up_to,
         );
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
         let bounds = section.map(|s| (s.start, s.end));
@@ -212,6 +229,8 @@ impl Play {
             beat: None,
             ready_at,
             play_at,
+            last_note_end: ctx.last_note_end,
+            last_note: None,
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
             // a new preset mode must be placed here.
@@ -368,6 +387,7 @@ mod tests {
             lanes: None,
             elements: Vec::new(),
             widgets: crate::WidgetDefs::default(),
+            bomb_up_to: Some(crate::Grade::Bad),
         })
         .unwrap();
         let limits = AtlasLimits {
@@ -388,6 +408,7 @@ mod tests {
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
+            last_note_end: TimeUs(3_000 * MS),
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {
@@ -421,6 +442,7 @@ mod tests {
                 gauge: 0,
                 effects,
                 complete: false,
+                playing: true,
                 target: [1_920, 1_080],
                 layout: &layout,
                 lanes: LaneView {

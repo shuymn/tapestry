@@ -181,6 +181,7 @@ fn bench_bitmap_text(c: &mut Criterion) {
             texts: vec![text; MAX_TEXT_ELEMENTS],
             ..WidgetDefs::default()
         },
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
     .expect("valid skin");
     let mut h = harness(skin);

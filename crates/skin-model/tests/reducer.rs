@@ -1,6 +1,6 @@
 //! The reducer through `Skin::build`: one script of every effect kind split
-//! at every point, long-note feedback, `full_combo` and `last_note`,
-//! `gauge_max`, `failed` and `combo.up`, with lost effects.
+//! at every point, long-note feedback, the bomb threshold, `full_combo`,
+//! `last_note`, `gauge_max`, `failed` and `combo.up`, with lost effects.
 
 mod play_support;
 
@@ -75,7 +75,6 @@ fn script() -> Vec<JudgeEvent> {
 }
 
 // Slots, for the tables below.
-const LAST: u16 = timer::LAST_NOTE;
 const GMAX: u16 = timer::GAUGE_MAX;
 const J: u16 = timer::JUDGE;
 const UP: u16 = timer::COMBO_UP;
@@ -219,7 +218,6 @@ const EXPECTED: [&[(u16, i64)]; 16] = [
         (B5, 1_400),
         (M0, 1_050),
         (M7, 1_750),
-        (LAST, 2_000),
     ],
     &[
         (J, 2_000),
@@ -231,7 +229,6 @@ const EXPECTED: [&[(u16, i64)]; 16] = [
         (B5, 1_400),
         (M0, 1_050),
         (M7, 1_750),
-        (LAST, 2_000),
     ],
 ];
 
@@ -253,13 +250,12 @@ const FINAL: &[(u16, i64)] = &[
     (B5, 1_400 * MS),
     (M0, 1_050 * MS),
     (M7, 1_750 * MS),
-    (LAST, 2_000 * MS),
 ];
 
 /// Whether a slot is effect-sourced: every built-in but `ready`, `play`,
-/// `failed` and `beat`.
+/// `failed`, `last_note` and `beat`.
 fn effect_sourced(slot: u16) -> bool {
-    !matches!(slot, 0..=2 | 6)
+    !matches!(slot, 0..=3 | 6)
 }
 
 #[track_caller]
@@ -438,7 +434,7 @@ fn taps_chart() -> Chart {
 }
 
 #[test]
-fn full_combo_and_last_note() {
+fn full_combo() {
     use Judgment::{Great, Perfect, Poor};
     let chart = taps_chart();
     let mut h = Harness::empty(&chart, &full(0));
@@ -454,11 +450,8 @@ fn full_combo_and_last_note() {
     assert_eq!(h.start_ms(timer::FULL_COMBO), None);
     h.frame(3_000, &[ev(3_000, judged(1, 2, Perfect, Some(0), None, 3))]);
     assert_eq!(h.start_ms(timer::FULL_COMBO), Some(3_000));
-    assert_eq!(h.start_ms(timer::LAST_NOTE), Some(3_000));
-    h.frame(3_500, &[ev(3_500, JudgeEventKind::SongEnd)]);
-    assert_eq!(h.start_ms(timer::LAST_NOTE), Some(3_000));
 
-    // A break keeps `full_combo` off; the last judgment still ends it.
+    // A break keeps it off.
     let mut h = Harness::empty(&chart, &full(0));
     h.frame(
         3_000,
@@ -469,7 +462,6 @@ fn full_combo_and_last_note() {
         ],
     );
     assert_eq!(h.start_ms(timer::FULL_COMBO), None);
-    assert_eq!(h.start_ms(timer::LAST_NOTE), Some(3_000));
 
     // A snapshot at combo 3 without the effect starts nothing.
     let mut h = Harness::empty(&chart, &full(0));
@@ -477,33 +469,119 @@ fn full_combo_and_last_note() {
     h.frame(3_000, &[]);
     assert_eq!(h.field(skin_model::field::COMBO), 3);
     assert_eq!(h.start_ms(timer::FULL_COMBO), None);
-    assert_eq!(h.start_ms(timer::LAST_NOTE), None);
+}
 
-    // The last judgment dropped: `last_note` at `SongEnd`, no full combo.
-    let mut h = Harness::empty(&chart, &full(0));
+/// `last_note` is sampled, not effect-sourced: it starts at the first
+/// playing frame whose whole ms is past the notes' end and within the
+/// finish margin (`play/BMSPlayer.java:683-697`), at that frame's time.
+#[test]
+fn last_note_is_sampled_past_the_notes_end() {
+    use Judgment::Perfect;
+    let chart = taps_chart();
+    let ctx = PlayContext {
+        last_note_end: TimeUs(3_000 * MS),
+        ..full(0)
+    };
+    // The frame at the end does not start it; 1 ms after does.
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame(3_000, &[ev(3_000, judged(1, 2, Perfect, Some(0), None, 3))]);
+    assert_eq!(h.start(timer::LAST_NOTE), None);
+    // Within the same whole ms of the end: still off.
+    h.frame_us(3_000 * MS + 999, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), None);
+    h.frame(3_001, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(3_001 * MS));
+    // A late miss after the end and `SongEnd` do not move it.
     h.frame(
-        2_000,
+        3_400,
         &[
-            ev(1_000, judged(1, 0, Perfect, Some(0), None, 1)),
-            ev(2_000, judged(1, 1, Perfect, Some(0), None, 2)),
+            ev(3_300, judged(1, 2, Judgment::Poor, None, None, 0)),
+            ev(3_400, JudgeEventKind::SongEnd),
         ],
     );
-    h.frame(3_500, &[ev(3_500, JudgeEventKind::SongEnd)]);
-    assert_eq!(h.start_ms(timer::LAST_NOTE), Some(3_500));
-    assert_eq!(h.start_ms(timer::FULL_COMBO), None);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(3_001 * MS));
 
-    // Both the last judgment and `SongEnd` dropped: it stays off.
-    let mut h = Harness::empty(&chart, &full(0));
-    h.frame(
-        2_000,
-        &[
-            ev(1_000, judged(1, 0, Perfect, Some(0), None, 1)),
-            ev(2_000, judged(1, 1, Perfect, Some(0), None, 2)),
-        ],
-    );
+    // A frame 100 ms late records its own time.
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame(2_990, &[]);
+    h.frame_us(3_100 * MS + 500, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(3_100 * MS + 500));
+
+    // The last moment before the finish starts it; one past does not.
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame_us(8_000 * MS + 999, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(8_000 * MS + 999));
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame(8_001, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), None);
     h.frame(9_000, &[]);
-    assert_eq!(h.start_ms(timer::LAST_NOTE), None);
-    assert_eq!(h.start_ms(timer::FULL_COMBO), None);
+    assert_eq!(h.start(timer::LAST_NOTE), None);
+
+    // A jump from before the end to past the finish starts nothing.
+    let mut h = Harness::empty(&chart, &ctx);
+    h.frame(2_900, &[]);
+    h.frame(8_001, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), None);
+
+    // A failed gauge that keeps playing still starts it.
+    let mut h = Harness::empty(&chart, &ctx);
+    h.gauges[0] = GaugeState {
+        value: GaugeValue(0),
+        reference: GaugeValue(0),
+        failed_at: Some(TimeUs(2_000 * MS)),
+    };
+    h.frame(2_500, &[]);
+    h.frame(3_001, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(3_001 * MS));
+
+    // Frames that are not playing (a stopped play) never start it.
+    let mut h = Harness::empty(&chart, &ctx);
+    h.playing = false;
+    for ms in [3_001, 4_000, 8_000] {
+        h.frame(ms, &[]);
+    }
+    assert_eq!(h.start(timer::LAST_NOTE), None);
+    h.playing = true;
+    h.frame(8_000, &[]);
+    assert_eq!(h.start(timer::LAST_NOTE), Some(8_000 * MS));
+}
+
+/// The bomb threshold covers grades from PERFECT through `bomb_up_to`,
+/// an empty POOR on its lane last (`play/JudgeManager.java:673`).
+#[test]
+fn the_bomb_threshold() {
+    use Judgment::{Bad, Good, Great, Perfect, Poor};
+    let chart = taps_chart();
+    let presses = [
+        (1_u8, judged(1, 0, Perfect, Some(0), None, 1)),
+        (2, judged(2, 0, Great, Some(0), None, 1)),
+        (3, judged(3, 0, Good, Some(0), None, 1)),
+        (4, judged(4, 0, Bad, Some(0), None, 0)),
+        (5, judged(5, 0, Poor, Some(0), None, 0)),
+        (6, empty_poor(6)),
+    ];
+    for (up_to, bombs) in [
+        (None, 0),
+        (Some(Grade::Perfect), 1),
+        (Some(Grade::Great), 2),
+        (Some(Grade::Good), 3),
+        (Some(Grade::Bad), 4),
+        (Some(Grade::Poor), 5),
+        (Some(Grade::EmptyPoor), 6),
+    ] {
+        let skin = Skin::new(skin_model::SkinDef {
+            bomb_up_to: up_to,
+            ..play_support::def(Vec::new(), play_support::white_sheet(), Vec::new())
+        })
+        .unwrap();
+        let mut h = Harness::new(skin, &chart, &full(0));
+        let effects: Vec<_> = presses.iter().map(|&(_, k)| ev(1_000, k)).collect();
+        h.frame(1_000, &effects);
+        for &(l, _) in &presses {
+            let want = (usize::from(l) <= bombs).then_some(1_000);
+            assert_eq!(h.start_ms(bomb(l)), want, "lane {l}, up to {up_to:?}");
+        }
+    }
 }
 
 #[test]
@@ -582,8 +660,16 @@ fn gauge_max_from_an_initial_full_gauge() {
     };
     let mut h = Harness::empty(&taps_chart(), &ctx);
     h.gauges[0] = state(GaugeValue::FULL);
+    // Off during the countdown; on from the play's start
+    // (`play/BMSPlayer.java:639`).
     h.frame(-1_500, &[]);
-    assert_eq!(h.start_ms(timer::GAUGE_MAX), Some(-2_000));
+    assert_eq!(h.start_ms(timer::GAUGE_MAX), None);
+    h.frame_us(-1, &[]);
+    assert_eq!(h.start_ms(timer::GAUGE_MAX), None);
+    h.frame(0, &[]);
+    assert_eq!(h.start_ms(timer::GAUGE_MAX), Some(0));
+    h.frame(500, &[]);
+    assert_eq!(h.start_ms(timer::GAUGE_MAX), Some(0));
 }
 
 #[test]

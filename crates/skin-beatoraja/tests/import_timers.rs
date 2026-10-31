@@ -40,6 +40,64 @@ fn cycled(t: &str) -> common::Loaded {
     ))
 }
 
+/// `judgetimer` decides which grades start a lane's bomb timer: a
+/// judgment at or below it, PERFECT 0 to empty POOR 5
+/// (`play/JudgeManager.java:673`); 1 when absent (`JsonSkin.java:20`).
+#[test]
+fn judgetimer_is_the_bomb_threshold() {
+    use bms_model::{Lane, TimeUs};
+    use eval::{JudgeEvent, JudgeEventKind};
+    let grades = [
+        Judgment::Perfect,
+        Judgment::Great,
+        Judgment::Good,
+        Judgment::Bad,
+        Judgment::Poor,
+    ];
+    // Grade `g`'s press at 100 ms on lane 1, 5 for an empty POOR.
+    let press = |g: usize| JudgeEvent {
+        seq: 0,
+        time: TimeUs(100 * common::play::MS),
+        origin: None,
+        kind: match grades.get(g) {
+            Some(&judgment) => JudgeEventKind::Judged {
+                lane: Lane::new(1).unwrap(),
+                note: 0,
+                judgment,
+                deviation: Some(TimeUs(0)),
+                release: None,
+                combo: 0,
+            },
+            None => JudgeEventKind::EmptyPoor {
+                lane: Lane::new(1).unwrap(),
+            },
+        },
+    };
+    for (field, up_to) in [
+        ("", Some(1)),
+        (r#""judgetimer": 0,"#, Some(0)),
+        (r#""judgetimer": 1,"#, Some(1)),
+        (r#""judgetimer": 2,"#, Some(2)),
+        (r#""judgetimer": 3,"#, Some(3)),
+        (r#""judgetimer": 4,"#, Some(4)),
+        (r#""judgetimer": 5,"#, Some(5)),
+        (r#""judgetimer": -1,"#, None),
+        (r#""judgetimer": 2147483647,"#, Some(5)),
+    ] {
+        for g in 0..=5 {
+            let mut d = import_body(&format!(
+                r#"{field}
+                   "image": [{{"id": "i", "src": "a", "w": 64, "h": 64}}],
+                   "destination": [{{"id": "i", "timer": 51,
+                                     "dst": [{{"w": 10, "h": 10}}]}}]"#
+            ))
+            .drawn();
+            let drawn = !d.frame(100, &[press(g)]).is_empty();
+            assert_eq!(drawn, up_to.is_some_and(|u| g <= u), "{field} grade {g}");
+        }
+    }
+}
+
 #[test]
 fn timer_446_is_the_judgment_timer() {
     let mut d = images(&[r#""timer": 46,"#, r#""timer": 446,"#], "").drawn();

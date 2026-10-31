@@ -27,8 +27,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, KeyDef, LoadError, MAX_GEOMETRY, PLAY,
-    Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track, Ty,
+    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Grade, KeyDef, LoadError, MAX_GEOMETRY,
+    PLAY, Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track, Ty,
     WidgetDefs, compile, timer as slot,
 };
 
@@ -1165,7 +1165,20 @@ impl<'d> Cx<'d> {
         self.opt_string(path, "path")
     }
 
+    /// The grades that give a bomb, from the top-level `judgetimer`
+    /// (`JsonSkin.java:20`, default 1): a judgment at or below it, PERFECT
+    /// 0 to empty POOR 5 (`play/JudgeManager.java:673`). Its whole domain
+    /// maps exactly: below 0 none, above 5 every grade.
+    fn bomb_up_to(&mut self) -> Result<Option<Grade>, ImportError> {
+        let [f] = self.def.fields(self.def.top(), ["judgetimer"]);
+        let n = self.int_or(f, "judgetimer", 1)?;
+        Ok(usize::try_from(n)
+            .ok()
+            .map(|i| Grade::ALL.get(i).copied().unwrap_or(Grade::EmptyPoor)))
+    }
+
     fn finish(mut self, files: Vec<FileChoice>) -> Result<Imported, ImportError> {
+        let bomb_up_to = self.bomb_up_to()?;
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
         let def = SkinDef {
@@ -1176,6 +1189,7 @@ impl<'d> Cx<'d> {
             lanes: self.lanes.as_ref().map(|l| l.def),
             elements: std::mem::take(&mut self.elements),
             widgets: std::mem::take(&mut self.widgets),
+            bomb_up_to,
         };
         let skin = Skin::new(def).map_err(|source| {
             let at = self.load_loc(&source);

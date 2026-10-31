@@ -834,6 +834,7 @@ fn skin() -> Loaded {
         lanes: Some(lanes()),
         elements,
         widgets,
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
     .unwrap();
     // A page of 256 holds only some of the frames.
@@ -1118,6 +1119,7 @@ fn stretch(
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
             lanes: views.lanes[(frame_no / 23) % views.lanes.len()],
+            playing: true,
         };
         let use_small = frame_no % 100 == 99;
         let out = if use_small { &mut *small } else { &mut *batch };
@@ -1191,6 +1193,7 @@ fn build_does_not_allocate() {
         empty_poor_breaks_combo: true,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -1352,6 +1355,7 @@ fn build_does_not_allocate() {
         target: TARGETS[0],
         layout: &views.layouts[0],
         lanes: views.lanes[0],
+        playing: true,
     };
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch);
     assert!(!batch.quads().is_empty());
@@ -1397,6 +1401,7 @@ fn build_does_not_allocate() {
             target: TARGETS[0],
             layout: &views.layouts[0],
             lanes: views.lanes[0],
+            playing: true,
         };
         bitmap.build(&mut play, &frame, &uvs, &mut batch);
         glyphs += batch.quads().len();
@@ -1466,6 +1471,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
             texts: vec![text(Overflow::Spill), text(Overflow::Shrink)],
             ..skin_model::WidgetDefs::default()
         },
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
     .unwrap();
     (root, skin)
@@ -1507,6 +1513,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 cover,
                 lift,
             },
+            playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch);
         quads += batch.quads().len();

@@ -44,6 +44,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         empty_poor_breaks_combo: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
     }
 }
 
@@ -370,7 +371,6 @@ fn a_practice_round() {
                 ev(16_000, play_support::ln_held(2, 0, Judgment::Perfect)),
             ],
         );
-        assert_eq!(h.start(timer::LAST_NOTE), None);
         h.frame(
             19_000,
             &[
@@ -378,7 +378,6 @@ fn a_practice_round() {
                 ev(19_000, judged(2, 0, Judgment::Perfect, Some(0), None, 3)),
             ],
         );
-        assert_eq!(h.start(timer::LAST_NOTE), Some(19_000 * MS));
         assert_eq!(h.start(timer::FULL_COMBO), Some(19_000 * MS));
     }
 }
@@ -403,6 +402,7 @@ fn targets_match_the_evaluators() {
         empty_poor_breaks_combo: preset.empty_poor.breaks_combo,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
     };
     let section_ctx = PlayContext {
         attempt: Attempt::Section(&edge),

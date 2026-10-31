@@ -40,6 +40,7 @@ fn fixed(elements: Vec<ElementDef>) -> Skin {
         lanes: None,
         elements,
         widgets: skin_model::WidgetDefs::default(),
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
     .unwrap()
 }

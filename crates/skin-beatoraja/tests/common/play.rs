@@ -13,6 +13,9 @@ use skin_model::{
 
 pub const MS: i64 = 1_000;
 
+/// A notes' end past every frame the tests build: timer 143 stays off.
+pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
+
 const GAUGES: [GaugeDesc; 1] = [GaugeDesc {
     start: GaugeValue(20 * GaugeValue::PERCENT),
     max: GaugeValue::FULL,
@@ -99,6 +102,7 @@ impl Drawn {
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
+            last_note_end: NO_END,
         };
         let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
@@ -170,6 +174,7 @@ impl Drawn {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             lanes: self.view,
+            playing: true,
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch);

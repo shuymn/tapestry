@@ -111,6 +111,7 @@ pub fn load_fit(
         lanes,
         elements,
         widgets,
+        bomb_up_to: Some(skin_model::Grade::Bad),
     })
 }
 
