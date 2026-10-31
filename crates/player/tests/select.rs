@@ -548,3 +548,51 @@ fn a_preset_that_cannot_be_written_still_plays() {
         "{stdout}"
     );
 }
+
+/// In a window, whose swap chain paces frames with one frame of latency,
+/// the quit key (bound to Q) on a result returns to a select screen that is
+/// drawn: each of three results left that way is followed by select
+/// frames, reported as the screen is left for the next chart or the run
+/// ends. Leaving a result while the render thread waits for an end frame
+/// once lost the frame the wait granted, and nothing was drawn after.
+#[test]
+#[ignore = "opens a window: needs an interactive desktop"]
+fn the_select_screen_is_drawn_after_a_results_quit_key() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let mut device = DeviceSettings {
+        library: LibrarySettings {
+            roots: vec![fx.library.display().to_string()],
+        },
+        ..DeviceSettings::default()
+    };
+    // Q's scan code, as `tapestry keys` captures it.
+    device.keyboard.quit = Some(0x10);
+    let root = DataRoot::new(fx.appdata.join("tapestry"));
+    save_settings(&root.device_settings(), &device).unwrap();
+    let round = "pick=a.bms,enter,drawn,back,wait=a.bms,sleep=1000";
+    let steps = format!("{round},{round},{round},close");
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .args(["--auto", "--dev-select", &steps])
+        .env("LOCALAPPDATA", &fx.appdata)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let all: Vec<&str> = stdout.lines().collect();
+    let results: Vec<usize> = (0..all.len())
+        .filter(|&i| all[i].starts_with("result: viewing "))
+        .collect();
+    assert_eq!(results.len(), 3, "{stdout}");
+    for (n, &at) in results.iter().enumerate() {
+        let next = results.get(n + 1).copied().unwrap_or(all.len());
+        assert!(
+            all[at..next]
+                .iter()
+                .any(|l| l.starts_with("dev: select frames ")),
+            "no select frames after result {}:\n{stdout}",
+            n + 1
+        );
+    }
+}

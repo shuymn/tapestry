@@ -491,6 +491,7 @@ pub fn spawn(
                 frames,
                 shared: thread_shared,
                 end_page: (0, EndPage::default()),
+                granted: false,
                 #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
             };
@@ -558,6 +559,12 @@ struct Run {
     shared: Arc<Shared>,
     /// The end screen's page last taken from the slot, and its number.
     end_page: (u64, EndPage),
+    /// The screen's wait granted a frame that no draw has taken yet: the
+    /// end screen was left or nothing was to be drawn. Only a presented
+    /// frame gives the grant back (a swap chain's waitable object, one
+    /// frame of latency), so the next frame takes it instead of waiting
+    /// again, which would never end; until a new screen is built.
+    granted: bool,
     /// The select screen's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
@@ -675,14 +682,16 @@ impl Run {
                 continue;
             };
             if screen.paced() {
-                if !screen.wait() {
+                if !self.granted && !screen.wait() {
                     continue;
                 }
+                self.granted = true;
             } else {
                 std::thread::sleep(Duration::from_millis(16));
             }
             // The end screen was left (its pages cleared): the page drawn
-            // last goes, and nothing is drawn until what comes next.
+            // last goes, and nothing is drawn until what comes next, which
+            // takes the frame granted.
             if matches!(mode, Mode::End) && self.end_page.0 <= self.shared.end_cleared() {
                 self.end_page.1 = EndPage::default();
                 mode = Mode::Idle;
@@ -777,6 +786,7 @@ impl Run {
                     (timing, None)
                 }),
             };
+            self.granted = false;
             match drawn {
                 Ok((timing, play)) => {
                     let d = Drawn {
@@ -838,6 +848,7 @@ impl Run {
             self.shared.failed.store(false, Ordering::Release);
         } else {
             self.screen = None;
+            self.granted = false;
         }
         ready
     }
@@ -2364,6 +2375,180 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let lines: Vec<String> = drew.lock().unwrap().iter().map(|d| d.0.clone()).collect();
         assert_eq!(lines, ["shown"]);
+        link.exit();
+    }
+
+    /// A screen paced as a swap chain's waitable object with one frame of
+    /// latency: a wait takes the one grant, a frame drawn gives it back,
+    /// and with none a wait times out (after 5 ms). While `hold` is set,
+    /// the wait that takes the grant waits for `release` once.
+    struct Paced {
+        drew: Arc<std::sync::Mutex<Vec<String>>>,
+        grants: AtomicU32,
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Paced {
+        fn drawn(&self, what: String) {
+            self.drew.lock().unwrap().push(what);
+            self.grants.store(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Screen for Paced {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            let took = self
+                .grants
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |g| g.checked_sub(1));
+            if took.is_err() {
+                std::thread::sleep(Duration::from_millis(5));
+                return false;
+            }
+            if self.hold.swap(false, Ordering::SeqCst) {
+                let _ = self.release.recv_timeout(Duration::from_secs(10));
+            }
+            true
+        }
+        fn paced(&self) -> bool {
+            true
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) {}
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            self.drawn("<play>".to_owned());
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            panic!("an end page is drawn with its graphs")
+        }
+        fn end(&mut self, page: &super::EndPage) -> Result<bool, RenderError> {
+            self.drawn(page.lines.first().cloned().unwrap_or_default());
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.drawn("<menu>".to_owned());
+            Ok(timing(true))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The render thread over a [`Paced`] screen, the end page `result`
+    /// drawn and the thread held in the wait for its next frame: the link,
+    /// what it drew and the release.
+    fn held_in_a_wait() -> (
+        super::RenderLink,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let drew = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, released) = std::sync::mpsc::channel();
+        let mut released = Some(released);
+        let (noted, held) = (Arc::clone(&drew), Arc::clone(&hold));
+        let make: MakeScreen = Box::new(move || {
+            let release = released.take().expect("built once");
+            Ok(Box::new(Paced {
+                drew: Arc::clone(&noted),
+                grants: AtomicU32::new(1),
+                hold: Arc::clone(&held),
+                release,
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.show_end(page("result", None));
+        assert!(drawn(&drew, "result"));
+        hold.store(true, Ordering::SeqCst);
+        assert!(wait_until(|| !hold.load(Ordering::SeqCst)));
+        (link, drew, release)
+    }
+
+    /// Whether `drew` noted `what` within the bound.
+    fn drawn(drew: &std::sync::Mutex<Vec<String>>, what: &str) -> bool {
+        wait_until(|| drew.lock().unwrap().iter().any(|d| d == what))
+    }
+
+    /// Selection or the practice page entered while the render thread
+    /// waits for a frame of the end screen, in the rig's order: the end
+    /// screen is left ([`super::RenderLink::clear_end`]), then the page is
+    /// sent. The frame the wait granted goes to the page instead of being
+    /// lost with the end page, so on a screen paced by one frame of
+    /// latency the page is drawn, and no end frame after it.
+    #[test]
+    fn a_menu_entered_during_an_end_frame_wait_is_drawn() {
+        let (link, drew, release) = held_in_a_wait();
+        link.clear_end();
+        link.send(RenderMsg::Menu(Box::default()));
+        release.send(()).unwrap();
+        assert!(drawn(&drew, "<menu>"), "{:?}", drew.lock().unwrap());
+        let drew = drew.lock().unwrap().clone();
+        let menu = drew.iter().position(|d| d == "<menu>").unwrap();
+        assert!(drew[menu..].iter().all(|d| d != "result"), "{drew:?}");
+        link.exit();
+    }
+
+    /// [`a_menu_entered_during_an_end_frame_wait_is_drawn`] for a retry:
+    /// the end screen is left as the screen is prepared
+    /// ([`crate::play::prepare_render`]), and the next play's frames are
+    /// drawn.
+    #[test]
+    fn a_retry_during_an_end_frame_wait_draws_its_play() {
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
+        let (_logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let (link, drew, release) = held_in_a_wait();
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+        });
+        let mut end_page = Some(super::EndPage::default());
+        assert!(crate::play::prepare_render(&mut end_page, &link).is_ok());
+        resume.join().unwrap();
+        let clock = QpcClock::start();
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(clock.now()),
+        });
+        assert!(drawn(&drew, "<play>"), "{:?}", drew.lock().unwrap());
         link.exit();
     }
 }
