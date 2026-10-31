@@ -380,6 +380,12 @@ pub enum SelectStep {
     /// Close the window once the next chart's load starts measuring its
     /// loudness: a close during the load.
     CloseMeasuring,
+    /// Press the quit key once the next chart's load starts measuring its
+    /// loudness.
+    QuitMeasuring,
+    /// Press the quit key once the next chart's load has decoded its first
+    /// sound file.
+    QuitDecoding,
     /// The next chart's load holds this many milliseconds before its
     /// sounds, cancelled by the quit key or a close as the measurement is:
     /// a slow load.
@@ -410,11 +416,13 @@ pub struct SlowLoad {
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
 /// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
 /// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
-/// `back`, `retry`, `next`, `prev`, `close-measuring`, `slow-load=<ms>`,
-/// `quit-loading`, `close-loading` and `close`. Selection steps run on the
-/// select screen (`prev-preset` and `next-preset` press F11 and F12;
-/// `close-measuring` closes the window once the next load measures a
-/// chart's loudness; `slow-load` holds the next load that long, and
+/// `back`, `retry`, `next`, `prev`, `close-measuring`, `quit-measuring`,
+/// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading` and
+/// `close`. Selection steps run on the select screen (`prev-preset` and
+/// `next-preset` press F11 and F12; `close-measuring` and
+/// `quit-measuring` close the window or press the quit key once the next
+/// load measures a chart's loudness, `quit-decoding` once it has decoded
+/// its first sound file; `slow-load` holds the next load that long, and
 /// `quit-loading` and `close-loading` press the quit key or close the
 /// window halfway through it),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
@@ -432,6 +440,12 @@ pub struct SelectScript {
     /// The next load's loudness measurement closes the window
     /// (`close-measuring`).
     pub close_measuring: bool,
+    /// The next load's loudness measurement presses the quit key
+    /// (`quit-measuring`).
+    pub quit_measuring: bool,
+    /// The next load's first decoded file presses the quit key
+    /// (`quit-decoding`).
+    pub quit_decoding: bool,
     /// How long the next load holds (`slow-load`), and what happens
     /// halfway through it (`quit-loading`, `close-loading`).
     pub slow_load: Option<SlowLoad>,
@@ -464,7 +478,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-loading, close-loading or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -483,11 +497,13 @@ impl SelectScript {
                 None if s == "next" => Ok(SelectStep::Next),
                 None if s == "prev" => Ok(SelectStep::Prev),
                 None if s == "close-measuring" => Ok(SelectStep::CloseMeasuring),
+                None if s == "quit-measuring" => Ok(SelectStep::QuitMeasuring),
+                None if s == "quit-decoding" => Ok(SelectStep::QuitDecoding),
                 None if s == "quit-loading" => Ok(SelectStep::QuitLoading),
                 None if s == "close-loading" => Ok(SelectStep::CloseLoading),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-loading, close-loading or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

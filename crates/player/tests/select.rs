@@ -522,6 +522,83 @@ fn the_quit_key_during_a_load_returns_to_selection() {
     assert!(!frames_of(&stdout, "loading").is_empty(), "{stdout}");
 }
 
+/// A chart `name` in folder `folder` whose `files` notes each sound a file
+/// of its own.
+fn write_many_sounds(library: &Path, folder: &str, name: &str, files: usize) {
+    let dir = library.join(folder);
+    fs::create_dir_all(&dir).unwrap();
+    let mut text = "#PLAYER 1\n#TITLE 多い\n#BPM 120\n".to_owned();
+    let mut notes = String::new();
+    for i in 1..=files {
+        // Distinct contents, so none is stored as another's duplicate.
+        let amplitude = i16::try_from(1_000 + i * 50).unwrap();
+        write_wav(&dir.join(format!("s{i}.wav")), amplitude);
+        text.push_str(&format!("#WAV{i:02} s{i}.wav\n"));
+        notes.push_str(&format!("{i:02}"));
+    }
+    text.push_str(&format!("#00101:{notes}\n#00211:01\n"));
+    fs::write(dir.join(name), text).unwrap();
+}
+
+/// The quit key during the sound decode stops it at the next file: the
+/// load returns to selection without decoding the rest or measuring the
+/// loudness, and nothing is kept, so the next choice decodes and measures
+/// the chart whole and plays it.
+#[test]
+fn the_quit_key_stops_the_sound_decode() {
+    let fx = fixture();
+    write_many_sounds(&fx.library, "m", "m.bms", 64);
+    let (_, stdout) = run(
+        &fx,
+        "pick=m.bms,quit-decoding,enter,pick=m.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let first = at(0, "load: the play screen loads m.bms");
+    let stopped = at(first, "load: cancelled while loading the sounds");
+    let back = at(stopped, "select: 1 charts listed");
+    assert!(
+        find_from(&stdout, first, "loudness: measuring m.bms").is_some_and(|m| m > back),
+        "measured before the cancel:\n{stdout}"
+    );
+    let again = at(back, "load: the play screen loads m.bms");
+    let ready = at(again, "load: the chart is ready ");
+    at(ready, "play started");
+    assert_eq!(
+        stdout.lines().filter(|l| *l == "load: cancelled").count(),
+        1
+    );
+    assert_eq!(lines(&stdout, "loudness: measuring m.bms").len(), 1);
+}
+
+/// The quit key during the loudness measurement stops it at the next
+/// block: the load returns to selection, nothing is stored, and the next
+/// choice measures the chart again and plays it.
+#[test]
+fn the_quit_key_stops_the_loudness_measurement() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,quit-measuring,enter,pick=a.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let measuring = at(0, "loudness: measuring a.bms");
+    let stopped = at(measuring, "loudness: a.bms: the measurement was cancelled");
+    let cancelled = at(stopped, "load: cancelled");
+    let back = at(cancelled, "select: 1 charts listed");
+    let again = at(back, "loudness: measuring a.bms");
+    let measured = at(again, "loudness: a.bms measured in ");
+    at(measured, "play started");
+    assert_eq!(lines(&stdout, "loudness: a.bms measured in ").len(), 1);
+    assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+}
+
 /// Closing the window during a load cancels it and ends the run at once
 /// with 0, before any countdown.
 #[test]

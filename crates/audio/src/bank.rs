@@ -319,6 +319,10 @@ pub enum BankError {
         /// The cap in the same unit.
         limit: u64,
     },
+    /// The load was cancelled ([`load_bank_reporting`]'s `cancel`): no
+    /// bank is made.
+    #[error("the load was cancelled")]
+    Cancelled,
 }
 
 /// A referenced sound left silent.
@@ -762,8 +766,29 @@ struct Shared<'a> {
     raw_live: AtomicU64,
     raw_peak: AtomicU64,
     stop: AtomicBool,
+    /// Whether the load should stop, asked before each file and each
+    /// packet.
+    cancel: &'a (dyn Fn() -> bool + Sync),
+    /// The load stopped because `cancel` said so.
+    cancelled: AtomicBool,
     /// Contents hash to the path index that decodes them.
     taken: Mutex<HashMap<[u8; 32], usize>>,
+}
+
+impl Shared<'_> {
+    /// Whether the workers stop: a cap was crossed, or the load was
+    /// cancelled, which then stops every worker.
+    fn stopped(&self) -> bool {
+        if self.stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        if (self.cancel)() {
+            self.cancelled.store(true, Ordering::Relaxed);
+            self.stop.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
 }
 
 /// Reads, hashes and decodes the file at path index `i`, holding its bytes
@@ -774,7 +799,7 @@ fn process(
     sound: SoundId,
     shared: &Shared<'_>,
 ) -> (Option<[u8; 32]>, Outcome) {
-    if shared.stop.load(Ordering::Relaxed) {
+    if shared.stopped() {
         return (None, Outcome::Stopped(Stop::Cancelled));
     }
     let mut raw = RawBytes::new(&shared.raw_live);
@@ -876,7 +901,7 @@ fn decode(
     let mut scratch: Vec<i16> = Vec::new();
     let mut src_frames = 0u64;
     loop {
-        if shared.stop.load(Ordering::Relaxed) {
+        if shared.stopped() {
             return Err(Stop::Cancelled);
         }
         let packet = match opened.format.next_packet() {
@@ -1081,24 +1106,26 @@ pub fn load_bank_at(
     speed: Speed,
     limits: &BankLimits,
 ) -> Result<SoundBank, BankError> {
-    load_bank_reporting(chart, rate, speed, limits, &|_, _| {})
+    load_bank_reporting(chart, rate, speed, limits, &|_, _| {}, &|| false)
 }
 
 /// [`load_bank_at`], calling `progress(done, files)` from the decode pool
 /// each time it is done with one of the bank's distinct files, whatever
 /// became of it: `done` counts from 1 to `files`, in the order the files
 /// finish, which is not the path order. The bank is the same as without
-/// it.
+/// it. `cancel` is asked from the pool before each file and each decoded
+/// packet; once it says so, every worker stops there and no bank is made.
 ///
 /// # Errors
 ///
-/// As [`load_bank_at`].
+/// As [`load_bank_at`]; [`BankError::Cancelled`] once `cancel` said so.
 pub fn load_bank_reporting(
     chart: &Chart,
     rate: u32,
     speed: Speed,
     limits: &BankLimits,
     progress: &(dyn Fn(usize, usize) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SoundBank, BankError> {
     if !(MIN_RATE..=MAX_RATE).contains(&rate) {
         return Err(BankError::RateOutOfRange { rate });
@@ -1131,6 +1158,8 @@ pub fn load_bank_reporting(
         raw_live: AtomicU64::new(0),
         raw_peak: AtomicU64::new(0),
         stop: AtomicBool::new(false),
+        cancel,
+        cancelled: AtomicBool::new(false),
         taken: Mutex::new(HashMap::new()),
     };
     let finished = AtomicUsize::new(0);
@@ -1144,6 +1173,10 @@ pub fn load_bank_reporting(
     })
     .into_iter()
     .unzip();
+    // A cancelled load makes no bank, whatever it had decoded.
+    if shared.cancelled.load(Ordering::Relaxed) {
+        return Err(BankError::Cancelled);
+    }
     // The first cap error in path order refuses the bank.
     for o in &mut outcomes {
         if let Outcome::Stopped(Stop::Cap(e)) = o {
@@ -1359,6 +1392,59 @@ mod tests {
         failure_then_healthy(Fault::Panic, true, "panics-known");
     }
 
+    /// A cancel stops the decode at the next packet, mid-file, and makes no
+    /// bank; the same file decodes whole, asking at every packet, when it
+    /// never comes.
+    #[test]
+    fn a_cancel_stops_the_decode_at_the_next_packet() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("audio-unit-")
+            .tempdir_in(root)
+            .unwrap();
+        let path = dir.path().join("long.wav");
+        // 20 s at 8 kHz: many packets.
+        std::fs::write(&path, wav(&[100; 160_000], true)).unwrap();
+        let mut chart = ChartBuilder::new(120_000)
+            .sound("long.wav")
+            .bgm(TimeUs(0), SoundId(0))
+            .build()
+            .unwrap();
+        chart.sounds[0].path = Some(path);
+        let limits = BankLimits {
+            max_decode_threads: 1,
+            ..BankLimits::default()
+        };
+        let asked = AtomicUsize::new(0);
+        let asked = &asked;
+        let cancel_at = |n: usize| move || asked.fetch_add(1, Ordering::Relaxed) + 1 >= n;
+        let cancelled = load_bank_reporting(
+            &chart,
+            8_000,
+            Speed::NORMAL,
+            &limits,
+            &|_, _| {},
+            &cancel_at(5),
+        );
+        assert!(
+            matches!(cancelled, Err(BankError::Cancelled)),
+            "{cancelled:?}"
+        );
+        assert_eq!(asked.swap(0, Ordering::Relaxed), 5);
+        let whole = load_bank_reporting(
+            &chart,
+            8_000,
+            Speed::NORMAL,
+            &limits,
+            &|_, _| {},
+            &cancel_at(usize::MAX),
+        )
+        .unwrap();
+        assert_eq!(whole.get(SoundId(0)).unwrap().frames(), 160_000);
+        assert!(asked.load(Ordering::Relaxed) > 5);
+    }
+
     /// Progress counts each distinct file once, a duplicate and one that
     /// does not decode included, up to the file count, from the decode
     /// pool; the bank is the one loaded without it.
@@ -1390,9 +1476,16 @@ mod tests {
             ..BankLimits::default()
         };
         let seen = std::sync::Mutex::new(Vec::new());
-        let bank = load_bank_reporting(&chart, 8_000, Speed::NORMAL, &limits, &|done, n| {
-            seen.lock().unwrap().push((done, n));
-        })
+        let bank = load_bank_reporting(
+            &chart,
+            8_000,
+            Speed::NORMAL,
+            &limits,
+            &|done, n| {
+                seen.lock().unwrap().push((done, n));
+            },
+            &|| false,
+        )
         .unwrap();
         let mut seen = seen.into_inner().unwrap();
         seen.sort_unstable();

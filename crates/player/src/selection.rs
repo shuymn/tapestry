@@ -74,16 +74,23 @@ struct LoadHost<'a> {
     /// dev-tools).
     #[cfg(feature = "dev-tools")]
     close: bool,
+    /// The measurement presses the quit key (a script's `quit-measuring`,
+    /// dev-tools).
+    #[cfg(feature = "dev-tools")]
+    quit: bool,
 }
 
 impl crate::loudness::Host for LoadHost<'_> {
     fn at_normal(&mut self) -> anyhow::Result<(bms_model::Chart, Arc<audio::SoundBank>)> {
         let chart = self.loaded.chart_at(bms_model::Speed::NORMAL)?;
-        let bank = audio::load_bank_at(
+        let controls = self.controls;
+        let bank = audio::load_bank_reporting(
             &chart,
             self.rate,
             bms_model::Speed::NORMAL,
             &audio::BankLimits::default(),
+            &|_, _| {},
+            &|| controls.quitting() || controls.leaving(),
         )?;
         Ok((chart, Arc::new(bank)))
     }
@@ -93,6 +100,10 @@ impl crate::loudness::Host for LoadHost<'_> {
         #[cfg(feature = "dev-tools")]
         if self.close {
             self.controls.close();
+        }
+        #[cfg(feature = "dev-tools")]
+        if self.quit {
+            self.controls.command(game::Command::Quit);
         }
     }
 
@@ -444,6 +455,8 @@ impl Selection {
                     }
                 }
                 Some(SelectStep::CloseMeasuring) => script.close_measuring = true,
+                Some(SelectStep::QuitMeasuring) => script.quit_measuring = true,
+                Some(SelectStep::QuitDecoding) => script.quit_decoding = true,
                 Some(SelectStep::SlowLoad(ms)) => script.slow_load.get_or_insert_default().ms = ms,
                 Some(SelectStep::QuitLoading) => {
                     script.slow_load.get_or_insert_default().quit = true
@@ -1430,16 +1443,40 @@ impl AppRig for PlayerRig<'_> {
             return Ok(Loading::Cancelled);
         }
         let progress = Progress::new(self.render.loading(), page.clone());
-        let bank = Arc::new(
-            audio::load_bank_reporting(
-                chart,
-                rate,
-                speed,
-                &audio::BankLimits::default(),
-                &|done, files| progress.decoded(done, files),
-            )
-            .map_err(ChartLoadError::Sounds)?,
+        let controls = self.controls;
+        // A script's `quit-decoding` presses the quit key once the first
+        // file is decoded (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        let quit_decoding = self
+            .selection
+            .as_mut()
+            .and_then(|s| s.script.as_mut())
+            .is_some_and(|s| std::mem::take(&mut s.quit_decoding));
+        // The quit key or a close stops the decode at the next file or
+        // packet, and no bank is made.
+        let decoded_bank = audio::load_bank_reporting(
+            chart,
+            rate,
+            speed,
+            &audio::BankLimits::default(),
+            &|done, files| {
+                progress.decoded(done, files);
+                #[cfg(feature = "dev-tools")]
+                if quit_decoding && done == 1 {
+                    controls.command(game::Command::Quit);
+                }
+            },
+            &|| controls.quitting() || controls.leaving(),
         );
+        let bank = match decoded_bank {
+            Ok(bank) => Arc::new(bank),
+            Err(audio::BankError::Cancelled) => {
+                println!("load: cancelled while loading the sounds");
+                println!("load: cancelled");
+                return Ok(Loading::Cancelled);
+            }
+            Err(e) => return Err(ChartLoadError::Sounds(e)),
+        };
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
         // The engine frees the chart before's bank here, so a measurement's
@@ -1462,6 +1499,11 @@ impl AppRig for PlayerRig<'_> {
             .script
             .as_mut()
             .is_some_and(|s| std::mem::take(&mut s.close_measuring));
+        #[cfg(feature = "dev-tools")]
+        let quit = sel
+            .script
+            .as_mut()
+            .is_some_and(|s| std::mem::take(&mut s.quit_measuring));
         let mut host = LoadHost {
             loaded,
             rate,
@@ -1470,6 +1512,8 @@ impl AppRig for PlayerRig<'_> {
             page: page.as_ref(),
             #[cfg(feature = "dev-tools")]
             close,
+            #[cfg(feature = "dev-tools")]
+            quit,
         };
         if sel.shelf.loaded(chart, &bank, &name, &mut host) == Loading::Cancelled {
             // Closing or the quit key: nothing more is prepared, and the

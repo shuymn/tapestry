@@ -113,6 +113,8 @@ pub fn measure(
                 analyze(&c, b, &mut || host.cancelled())
             }
             Ok(_) => Analyzed::Failed("the sounds changed while they were read again".to_owned()),
+            // The quit key or a close stopped the 1× sounds' decode.
+            Err(_) if host.cancelled() => Analyzed::Cancelled,
             Err(e) => Analyzed::Failed(format!("the 1× sounds cannot be read: {e:#}")),
         }
     };
