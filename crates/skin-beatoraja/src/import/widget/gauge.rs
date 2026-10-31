@@ -14,61 +14,45 @@ use crate::error::ImportError;
 /// 2 back, 4 tip (`SkinGauge.java:179, 190-191`).
 const NODES: usize = 36;
 
-/// For 4, 8 and 12 nodes, the indices each node fills
-/// (`JsonSkinObjectLoader.java:510-519`); 36 nodes fill their own.
-fn index_map(nodes: usize) -> Option<&'static [&'static [usize]]> {
-    const FOUR: [&[usize]; 4] = [
-        &[0, 4, 6, 10, 12, 16, 18, 22, 24, 28, 30, 34],
-        &[1, 5, 7, 11, 13, 17, 19, 23, 25, 29, 31, 35],
-        &[2, 8, 14, 20, 26, 32],
-        &[3, 9, 15, 21, 27, 33],
+/// The node filling each of the 36 indices, for `nodes` nodes; `None` for
+/// a count the source does not index. For 4, 8 and 12 nodes these are the
+/// source's index lists (`JsonSkinObjectLoader.java:510-519`) by index;
+/// 36 nodes fill their own.
+pub(super) fn node_of(nodes: usize) -> Option<[usize; NODES]> {
+    #[rustfmt::skip]
+    const FOUR: [usize; NODES] = [
+        0, 1, 2, 3, 0, 1,
+        0, 1, 2, 3, 0, 1,
+        0, 1, 2, 3, 0, 1,
+        0, 1, 2, 3, 0, 1,
+        0, 1, 2, 3, 0, 1,
+        0, 1, 2, 3, 0, 1,
     ];
-    const EIGHT: [&[usize]; 8] = [
-        &[12, 16, 18, 22],
-        &[13, 17, 19, 23],
-        &[14, 20],
-        &[15, 21],
-        &[0, 4, 6, 10, 24, 28, 30, 34],
-        &[1, 5, 7, 11, 25, 29, 31, 35],
-        &[2, 8, 26, 32],
-        &[3, 9, 27, 33],
+    #[rustfmt::skip]
+    const EIGHT: [usize; NODES] = [
+        4, 5, 6, 7, 4, 5,
+        4, 5, 6, 7, 4, 5,
+        0, 1, 2, 3, 0, 1,
+        0, 1, 2, 3, 0, 1,
+        4, 5, 6, 7, 4, 5,
+        4, 5, 6, 7, 4, 5,
     ];
-    const TWELVE: [&[usize]; 12] = [
-        &[12, 18],
-        &[13, 19],
-        &[14, 20],
-        &[15, 21],
-        &[0, 6, 24, 30],
-        &[1, 7, 25, 31],
-        &[2, 8, 26, 32],
-        &[3, 9, 27, 33],
-        &[16, 22],
-        &[17, 23],
-        &[4, 10, 28, 34],
-        &[5, 11, 29, 35],
+    #[rustfmt::skip]
+    const TWELVE: [usize; NODES] = [
+        4, 5, 6, 7, 10, 11,
+        4, 5, 6, 7, 10, 11,
+        0, 1, 2, 3, 8, 9,
+        0, 1, 2, 3, 8, 9,
+        4, 5, 6, 7, 10, 11,
+        4, 5, 6, 7, 10, 11,
     ];
     match nodes {
-        4 => Some(&FOUR),
-        8 => Some(&EIGHT),
-        12 => Some(&TWELVE),
+        4 => Some(FOUR),
+        8 => Some(EIGHT),
+        12 => Some(TWELVE),
+        NODES => Some(std::array::from_fn(|i| i)),
         _ => None,
     }
-}
-
-/// The node filling each of the 36 indices, for `nodes` nodes; `None` for
-/// a count the source does not index.
-pub(super) fn node_of(nodes: usize) -> Option<[usize; NODES]> {
-    if nodes == NODES {
-        return Some(std::array::from_fn(|i| i));
-    }
-    let map = index_map(nodes)?;
-    let mut out = [usize::MAX; NODES];
-    for (node, indices) in map.iter().enumerate() {
-        for &i in *indices {
-            *out.get_mut(i)? = node;
-        }
-    }
-    out.iter().all(|&n| n < nodes).then_some(out)
 }
 
 /// The motion of `kind` with `range` and `cycle` ms
