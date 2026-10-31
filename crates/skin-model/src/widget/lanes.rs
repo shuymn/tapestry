@@ -112,9 +112,11 @@ pub struct LaneView {
     /// The time a note takes from the uncovered top to the line, at the
     /// chart's initial rate.
     pub visible_time: TimeUs,
-    /// The lane cover, in ‰ of the lane height left above the lift.
+    /// The lane cover, in ‰ of the length left above the lift: the
+    /// original lane length (`line − top`) less the lift's.
     pub cover: u16,
-    /// The lift, in ‰ of the same length: the line moves up by it.
+    /// The lift, in ‰ of the original lane length (`line − top`, not
+    /// shortened by either cover): the line moves up by it.
     pub lift: u16,
 }
 
