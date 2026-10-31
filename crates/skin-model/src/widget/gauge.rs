@@ -332,31 +332,39 @@ impl Gauge {
         let [x, y, w, h] = rect;
         let (x, w) = (f64::from(x), f64::from(w));
         let pf = f64::from(p);
+        // The look's six frames at `now`, resolved once for every segment.
+        let resolve = |images: &[ImageRef; 2]| {
+            images.map(|i| (i.frame(d.at.play, d.at.now, d.at.uvs), i.filter))
+        };
+        let (front, back, tip) = (
+            resolve(&look.front),
+            resolve(&look.back),
+            resolve(&look.tip),
+        );
         let (m, border) = (i128::from(desc.max.0), i128::from(desc.border.0));
         for i in 1..=p {
             let side = usize::from(i128::from(i) * m < border * i128::from(p));
             let part = if flicker.is_some() {
-                if i <= n { &look.front } else { &look.back }
+                if i <= n { &front } else { &back }
             } else if i == n {
-                &look.tip
+                &tip
             } else if i64::from(i) + a < i64::from(n) {
-                &look.front
+                &front
             } else {
-                &look.back
+                &back
             };
             let cell = [f32_of(x + w * f64::from(i - 1) / pf), y, f32_of(w / pf), h];
-            let Some(image) = part.get(side) else {
+            let Some(&(frame, filter)) = part.get(side) else {
                 continue;
             };
-            if let Some(f) = image.frame(d.at.play, d.at.now, d.at.uvs)
-                && !brush.push(out, cell, f, image.filter)
+            if let Some(f) = frame
+                && !brush.push(out, cell, f, filter)
             {
                 return;
             }
             if let Some(period) = flicker
                 && i == n
-                && let Some(tip) = look.tip.get(side)
-                && let Some(f) = tip.frame(d.at.play, d.at.now, d.at.uvs)
+                && let Some(&(Some(f), tip_filter)) = tip.get(side)
             {
                 #[expect(clippy::cast_precision_loss, reason = "below 2^35, exact in f64")]
                 let (phase, period) = ((d.t.max(0) % period) as f64, period as f64);
@@ -366,7 +374,7 @@ impl Gauge {
                     color: [r, gg, b, alpha * f32_of(k)],
                     ..*brush
                 };
-                if !tip_brush.push(out, cell, f, tip.filter) {
+                if !tip_brush.push(out, cell, f, tip_filter) {
                     return;
                 }
             }
