@@ -50,20 +50,8 @@ impl Cx<'_> {
         Ok(self.images.as_ref().and_then(|m| m.get(id)).copied())
     }
 
-    /// The `String[]` items of a literal array field; empty when absent.
-    pub(super) fn strings(
-        &mut self,
-        field: Option<u32>,
-        name: &'static str,
-    ) -> Result<Vec<String>, ImportError> {
-        Ok(self
-            .opt_strings(field, name)?
-            .into_iter()
-            .map(Option::unwrap_or_default)
-            .collect())
-    }
-
-    /// [`Self::strings`] with each `null` item kept as `None`.
+    /// The `String[]` items of a literal array field, each `null` item
+    /// `None`; empty when absent.
     pub(super) fn opt_strings(
         &mut self,
         field: Option<u32>,

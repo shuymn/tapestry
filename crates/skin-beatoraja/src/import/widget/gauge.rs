@@ -134,7 +134,12 @@ impl Cx<'_> {
         if nodes.is_none() {
             return refuse(self, "nodes");
         }
-        let nodes = self.strings(nodes, "nodes")?;
+        // A `null` node names no image, unlike an empty id
+        // (`JsonSkinObjectLoader.java:523-525` fails on it).
+        let nodes = self.opt_strings(nodes, "nodes")?;
+        let Some(nodes) = nodes.into_iter().collect::<Option<Vec<String>>>() else {
+            return refuse(self, "nodes");
+        };
         let Some(node_of) = node_of(nodes.len()) else {
             return refuse(self, "nodes");
         };

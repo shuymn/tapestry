@@ -93,6 +93,17 @@ fn node_counts_the_source_indexes_import() {
         ),
         "nodes",
     );
+    // An image of the empty id is a node; a `null` entry is none.
+    let empty = r#", {"id": "", "src": "a", "x": 0, "y": 32, "w": 8, "h": 8}"#;
+    gauge_with(r#""nodes": ["n0", "n1", "n2", ""], "parts": 10"#, "", empty).ok();
+    refused(
+        gauge_with(
+            r#""nodes": ["n0", "n1", "n2", null], "parts": 10"#,
+            "",
+            empty,
+        ),
+        "nodes",
+    );
     // A node of fewer frames than the last.
     let two = r#", {"id": "two", "src": "a", "w": 16, "h": 8, "divx": 2}"#;
     refused(
