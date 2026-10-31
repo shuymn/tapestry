@@ -276,6 +276,9 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "ops",
             "offsets",
             "choices_default",
+            "lanes",
+            "judge",
+            "gauge",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -411,6 +414,41 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(i.report.files[0].rule, Rule::Default, "{name}");
                 assert!(!i.report.files[0].ambiguous, "{name}");
                 assert_eq!(drawn, [1, 1, 1, 1], "{name}");
+            }
+            "lanes" => {
+                use skin_beatoraja::{DeviationId, LaneApprox};
+                // The lanes, SUDDEN+, LIFT and HIDDEN+; the notes, bar,
+                // SUDDEN+ and LIFT images over one file.
+                assert_eq!((u.elements, u.keys, u.images), (4, 4, 4), "{name}");
+                assert!(i.scratch.is_some(), "{name}");
+                let d9 = |a| NoteKind::Deviation(DeviationId::D9(a));
+                for a in [
+                    LaneApprox::BarLine,
+                    LaneApprox::CoverAbove,
+                    LaneApprox::LiftStretch,
+                ] {
+                    assert!(kinds(&i).contains(&d9(a)), "{name}: {a:?}");
+                }
+                assert!(kinds(&i).contains(&NoteKind::Deviation(DeviationId::D11)));
+                // At 500 ms the ten notes from 1 s are on screen; the
+                // covers are at 0.
+                assert_eq!(drawn, [0, 0, 10, 0], "{name}");
+            }
+            "judge" => {
+                // Seven grades, combos of slots 0, 1, 2 and 6 (slots 3-5
+                // noted): the widest state is a grade and 4 cells.
+                assert_eq!(u.widget_quads, 5, "{name}");
+                assert_eq!(kinds(&i), [NoteKind::Ignored { field: "numbers" }; 3]);
+                // The perfect and its combo of 1.
+                assert_eq!(drawn, [2, 2, 2, 2], "{name}");
+            }
+            "gauge" => {
+                assert_eq!(u.widget_quads, 51, "{name}");
+                assert_eq!(
+                    kinds(&i),
+                    [NoteKind::Deviation(skin_beatoraja::DeviationId::D10)]
+                );
+                assert_eq!(drawn, [51, 51, 51, 51], "{name}");
             }
             _ => panic!("no expectation for seed {name}"),
         }

@@ -683,7 +683,7 @@ fn play_skin(body: &str) -> Vec<u8> {
 }
 
 /// `skin_json` seeds that import: images, numbers, text, tracks, ops,
-/// offsets and a default file choice.
+/// offsets, a default file choice and the play objects.
 #[must_use]
 pub fn skin_imports() -> Vec<Seed> {
     vec![
@@ -760,7 +760,88 @@ pub fn skin_imports() -> Vec<Seed> {
                 "destination": [{"id": "i", "stretch": 9, "dst": [{"w": 100, "h": 100}]}]"#,
             ),
         ),
+        ("lanes", play_skin(&lanes_body())),
+        (
+            "judge",
+            play_skin(
+                r#""image": [
+                    {"id": "g0", "src": "grid", "w": 4, "h": 4}, {"id": "g1", "src": "grid", "x": 4, "w": 4, "h": 4},
+                    {"id": "g2", "src": "grid", "y": 4, "w": 4, "h": 4}, {"id": "g3", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4}],
+                "value": [
+                    {"id": "ten", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 4},
+                    {"id": "eleven", "src": "strip", "w": 99, "h": 10, "divx": 11, "digit": 3}],
+                "judge": [{"id": "j", "index": 0, "shift": true,
+                    "images": [
+                        {"id": "g0", "timer": 46, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]},
+                        {"id": "g1", "timer": 46, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]},
+                        {"id": "g2", "timer": 46, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]},
+                        {"id": "g3", "timer": 46, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]},
+                        {"id": "g3", "timer": 46, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]},
+                        {"id": "g3", "timer": 46, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]},
+                        {"id": "g0", "timer": 46, "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]}],
+                    "numbers": [
+                        {"id": "ten", "timer": 46, "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]},
+                        {"id": "eleven", "timer": 46, "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]},
+                        {"id": "ten", "timer": 46, "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]},
+                        {"id": "ten", "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]},
+                        {"id": "ten", "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]},
+                        {"id": "ten", "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]},
+                        {"id": "eleven", "timer": 46, "dst": [{"x": 10, "y": 0, "w": 10, "h": 20}]}]}],
+                "destination": [{"id": "j", "dst": [{"w": 0, "h": 0}]}]"#,
+            ),
+        ),
+        (
+            "gauge",
+            play_skin(
+                r#""image": [
+                    {"id": "n0", "src": "grid", "w": 4, "h": 4}, {"id": "n1", "src": "grid", "x": 4, "w": 4, "h": 4},
+                    {"id": "n2", "src": "grid", "y": 4, "w": 4, "h": 4}, {"id": "n3", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4}],
+                "gauge": {"id": "gg", "nodes": ["n0", "n1", "n2", "n3"], "parts": 50, "type": 3, "cycle": 100},
+                "destination": [{"id": "gg", "dst": [{"x": 600, "y": 100, "w": 500, "h": 10}]}]"#,
+            ),
+        ),
     ]
+}
+
+/// Lanes of `grid` parts over x 20..450, y 200..800, with a bar line,
+/// SUDDEN+, LIFT and HIDDEN+.
+fn lanes_body() -> String {
+    let eight = [r#""p""#; 8].join(", ");
+    let lists = [
+        "note",
+        "lnstart",
+        "lnend",
+        "lnbody",
+        "lnactive",
+        "mine",
+        "hcnstart",
+        "hcnend",
+        "hcnbody",
+        "hcnactive",
+        "hcndamage",
+        "hcnreactive",
+    ]
+    .map(|f| format!(r#""{f}": [{eight}]"#))
+    .join(", ");
+    let mut lanes: Vec<String> = (0..7)
+        .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))
+        .collect();
+    lanes.push(r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#.to_owned());
+    format!(
+        r#""image": [{{"id": "p", "src": "grid", "w": 4, "h": 4}},
+                     {{"id": "bar", "src": "grid", "y": 4, "w": 4, "h": 1}},
+                     {{"id": "cv", "src": "grid", "x": 4, "w": 4, "h": 4}}],
+            "note": {{"id": "notes", {lists}, "size": [20, 20, 20, 20, 20, 20, 20, 20], "dst": [{}],
+                     "group": [{{"id": "bar", "dst": [{{"x": 0, "y": 0, "w": 4, "h": 2}}]}}]}},
+            "liftCover": [{{"id": "lc", "src": "grid", "x": 4, "y": 4, "w": 4, "h": 4, "disapearLine": 200}}],
+            "hiddenCover": [{{"id": "hid", "src": "grid"}}],
+            "destination": [
+                {{"id": "notes", "dst": [{{"w": 0, "h": 0}}]}},
+                {{"id": "cv", "offset": 4, "dst": [{{"x": 20, "y": 800, "w": 430, "h": 600}}]}},
+                {{"id": "lc", "dst": [{{"x": 20, "y": 0, "w": 430, "h": 200}}]}},
+                {{"id": "hid", "dst": [{{"x": 20, "y": 200, "w": 430, "h": 600}}]}}]"#,
+        lanes.join(", ")
+    )
 }
 
 /// A header pass of 600 includes; the configured pass makes them too, then
