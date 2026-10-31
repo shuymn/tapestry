@@ -573,6 +573,41 @@ fn the_quit_key_stops_the_sound_decode() {
     assert_eq!(lines(&stdout, "loudness: measuring m.bms").len(), 1);
 }
 
+/// A chart of one sound whose loudness is stored: the quit key as its only
+/// file finishes decoding, after the decode's last check, still cancels
+/// the load there. The bank is not installed and the stored measurement
+/// not even looked up; selection follows, and the next choice plays.
+#[test]
+fn a_quit_after_the_last_file_is_decoded_cancels_the_load() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    // The first run measures the chart and stores it at its countdown.
+    let (_, first) = run(&fx, "pick=a.bms,enter,back,close", &[]);
+    assert_eq!(lines(&first, "loudness: a.bms measured in ").len(), 1);
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,quit-decoding,enter,pick=a.bms,enter,back,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let shown = at(0, "load: the play screen loads a.bms");
+    let stopped = at(shown, "load: cancelled while loading the sounds");
+    let back = at(stopped, "select: 1 charts listed");
+    // Nothing of the cancelled load past its sounds.
+    for line in ["loudness: a.bms: gain ", "load: the chart is ready "] {
+        assert!(
+            find_from(&stdout, shown, line).is_some_and(|l| l > back),
+            "{line} before the cancel:\n{stdout}"
+        );
+    }
+    let ready = at(back, "load: the chart is ready ");
+    at(ready, "play started");
+    assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
+    assert!(lines(&stdout, "loudness: measuring").is_empty(), "{stdout}");
+}
+
 /// The quit key during the loudness measurement stops it at the next
 /// block: the load returns to selection, nothing is stored, and the next
 /// choice measures the chart again and plays it.

@@ -896,6 +896,11 @@ pub enum ChartLoadError {
     NoSelection,
 }
 
+/// Whether the quit key or a window close cancels the load.
+fn cancelled(controls: &crate::controls::Controls) -> bool {
+    controls.quitting() || controls.leaving()
+}
+
 /// Shows the load's lines of `page` at `stage` on the play screen, and
 /// says so on the console; nothing without them.
 fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
@@ -1479,6 +1484,12 @@ impl AppRig for PlayerRig<'_> {
         };
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
+        // A quit or a close since the decode's last check: the bank is not
+        // installed.
+        if cancelled(self.controls) {
+            println!("load: cancelled");
+            return Ok(Loading::Cancelled);
+        }
         // The engine frees the chart before's bank here, so a measurement's
         // 1× bank is never held beside both.
         self.audio
@@ -1522,6 +1533,12 @@ impl AppRig for PlayerRig<'_> {
             return Ok(Loading::Cancelled);
         }
         let measured = self.clock.now();
+        // A cached measurement asks nothing: the screen is not waited for
+        // after a quit or a close.
+        if cancelled(self.controls) {
+            println!("load: cancelled");
+            return Ok(Loading::Cancelled);
+        }
         show_stage(&self.render, page.as_ref(), Stage::Screen);
         screen.wait(&self.render).map_err(ChartLoadError::Screen)?;
         let ready = self.clock.now();

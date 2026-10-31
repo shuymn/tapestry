@@ -155,7 +155,33 @@ impl Stage {
     ///
     /// The resampler's construction or processing error.
     pub fn convert(&self, samples: &[i16], out_frames: u64) -> Result<Vec<i16>, String> {
-        resample(samples, self.channels, self.from, self.to, out_frames)
+        resample(
+            samples,
+            self.channels,
+            self.from,
+            self.to,
+            out_frames,
+            &|| false,
+        )
+        .map(Option::unwrap_or_default)
+    }
+
+    /// [`Self::convert`], asking `stopped` before each chunk: `Ok(None)`
+    /// once it says so, with nothing converted kept.
+    fn convert_until(
+        &self,
+        samples: &[i16],
+        out_frames: u64,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<i16>>, String> {
+        resample(
+            samples,
+            self.channels,
+            self.from,
+            self.to,
+            out_frames,
+            stopped,
+        )
     }
 }
 
@@ -948,7 +974,9 @@ fn decode(
         reservation
             .resize(held + pcm_bytes(out_frames, ch) + stage.workspace_bound())
             .map_err(over_bank)?;
-        samples = stage.convert(&samples, out_frames)?;
+        samples = stage
+            .convert_until(&samples, out_frames, &|| shared.stopped())?
+            .ok_or(Stop::Cancelled)?;
     } else if samples.capacity() > samples.len() {
         // Shrinking copies into a buffer of the length beside the old one.
         reservation
@@ -961,7 +989,9 @@ fn decode(
         reservation
             .resize(cap_bytes(&samples) + pcm_bytes(frames, ch) + stage.workspace_bound())
             .map_err(over_bank)?;
-        samples = stage.convert(&samples, frames)?;
+        samples = stage
+            .convert_until(&samples, frames, &|| shared.stopped())?
+            .ok_or(Stop::Cancelled)?;
     }
     reservation.resize(cap_bytes(&samples)).map_err(over_bank)?;
     reservation.commit();
@@ -973,14 +1003,16 @@ fn decode(
     })
 }
 
-/// [`Stage::convert`] from `src_rate` to `rate`.
+/// [`Stage::convert`] from `src_rate` to `rate`, asking `stopped` before
+/// each chunk: `Ok(None)` once it says so.
 fn resample(
     samples: &[i16],
     ch: usize,
     src_rate: u32,
     rate: u32,
     out_frames: u64,
-) -> Result<Vec<i16>, String> {
+    stopped: &dyn Fn() -> bool,
+) -> Result<Option<Vec<i16>>, String> {
     let mut resampler = Fft::<f32>::new(
         src_rate as usize,
         rate as usize,
@@ -996,6 +1028,9 @@ fn resample(
     let mut out: Vec<i16> = Vec::with_capacity(want);
     let mut pos = 0;
     while out.len() < want {
+        if stopped() {
+            return Ok(None);
+        }
         let need = resampler.input_frames_next();
         // Past the end of the sound, zeros flush the resampler.
         for (k, x) in input[..need * ch].iter_mut().enumerate() {
@@ -1021,7 +1056,7 @@ fn resample(
             out.push((x * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16);
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// Runs `f(0..jobs)` on `threads` threads, results in job order.
@@ -1113,8 +1148,9 @@ pub fn load_bank_at(
 /// each time it is done with one of the bank's distinct files, whatever
 /// became of it: `done` counts from 1 to `files`, in the order the files
 /// finish, which is not the path order. The bank is the same as without
-/// it. `cancel` is asked from the pool before each file and each decoded
-/// packet; once it says so, every worker stops there and no bank is made.
+/// it. `cancel` is asked from the pool before each file, each decoded
+/// packet and each converted chunk, and once more after the pool; once it
+/// says so, every worker stops there and no bank is made.
 ///
 /// # Errors
 ///
@@ -1173,8 +1209,9 @@ pub fn load_bank_reporting(
     })
     .into_iter()
     .unzip();
-    // A cancelled load makes no bank, whatever it had decoded.
-    if shared.cancelled.load(Ordering::Relaxed) {
+    // A cancelled load makes no bank, whatever it had decoded; asked once
+    // more here, so a cancel after the last file's checks is seen too.
+    if shared.cancelled.load(Ordering::Relaxed) || (shared.cancel)() {
         return Err(BankError::Cancelled);
     }
     // The first cap error in path order refuses the bank.
@@ -1443,6 +1480,55 @@ mod tests {
         .unwrap();
         assert_eq!(whole.get(SoundId(0)).unwrap().frames(), 160_000);
         assert!(asked.load(Ordering::Relaxed) > 5);
+    }
+
+    /// A cancel during a long sound's conversion to the device rate stops
+    /// it at the next chunk and makes no bank: the cancel comes after every
+    /// check the decode itself makes.
+    #[test]
+    fn a_cancel_stops_the_conversion_at_the_next_chunk() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("audio-unit-")
+            .tempdir_in(root)
+            .unwrap();
+        let path = dir.path().join("long.wav");
+        // 20 s at 8 kHz, converted to 48 kHz.
+        std::fs::write(&path, wav(&[100; 160_000], true)).unwrap();
+        let mut chart = ChartBuilder::new(120_000)
+            .sound("long.wav")
+            .bgm(TimeUs(0), SoundId(0))
+            .build()
+            .unwrap();
+        chart.sounds[0].path = Some(path);
+        let limits = BankLimits {
+            max_decode_threads: 1,
+            ..BankLimits::default()
+        };
+        let load = |rate: u32, cancel_at: usize| {
+            let asked = AtomicUsize::new(0);
+            let bank =
+                load_bank_reporting(&chart, rate, Speed::NORMAL, &limits, &|_, _| {}, &|| {
+                    asked.fetch_add(1, Ordering::Relaxed) + 1 >= cancel_at
+                });
+            (bank, asked.into_inner())
+        };
+        // At the file's own rate nothing is converted: asked before the
+        // file, at each packet and once after the pool.
+        let (same, decode) = load(8_000, usize::MAX);
+        assert_eq!(same.unwrap().get(SoundId(0)).unwrap().frames(), 160_000);
+        // Converted to 48 kHz it is asked at each chunk too: a cancel at the
+        // third chunk, past every decode check, stops it there.
+        let at = decode + 2;
+        let (cancelled, asked) = load(48_000, at);
+        assert!(
+            matches!(cancelled, Err(BankError::Cancelled)),
+            "{cancelled:?}"
+        );
+        assert_eq!(asked, at);
+        let (whole, _) = load(48_000, usize::MAX);
+        assert_eq!(whole.unwrap().get(SoundId(0)).unwrap().frames(), 960_000);
     }
 
     /// Progress counts each distinct file once, a duplicate and one that
