@@ -430,9 +430,10 @@ fn skin_import_seeds_import_and_draw_as_built() {
                     assert!(kinds(&i).contains(&d9(a)), "{name}: {a:?}");
                 }
                 assert!(kinds(&i).contains(&NoteKind::Deviation(DeviationId::D11)));
-                // At 500 ms the ten notes from 1 s are on screen; the
-                // covers are at 0.
-                assert_eq!(drawn, [0, 0, 10, 0], "{name}");
+                // At 500 ms the eleven notes from 1 s to 1.1 s are on
+                // screen, the last with its lower edge on the region's
+                // top; the covers are at 0.
+                assert_eq!(drawn, [0, 0, 11, 0], "{name}");
             }
             "judge" => {
                 // Seven grades, combos of slots 0, 1, 2 and 6 (slots 3-5

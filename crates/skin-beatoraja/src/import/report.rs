@@ -136,20 +136,12 @@ pub enum DeviationId {
 pub enum LaneApprox {
     /// a: notes and long-note bodies stop at the top of the lanes.
     TopCrop,
-    /// b: an unhit tap keeps falling below the judgment line until it is
-    /// judged a miss or leaves the lanes.
-    LateTaps,
-    /// c: a tap hit early disappears at once.
-    EarlyTaps,
-    /// d: a hit mine disappears when hit.
-    Mines,
     /// e: `dst2` is ignored.
     Dst2,
     /// f: `expansionrate` is ignored.
     Expansion,
-    /// g: a long note's end cap is drawn.
-    LnTail,
-    /// h: a long note's body runs between the caps' centres.
+    /// h: a long note within one note height of its end draws no body
+    /// (the source draws one of negative height).
     LnBody,
     /// i: the part of SUDDEN+ above the lanes is never drawn.
     CoverAbove,

@@ -9,7 +9,9 @@
 //! lanes' own timer, conditions and window. HIDDEN+ is never drawn
 //! (owner decision 15, D11).
 
-use skin_model::{Blend, End, Filter, LaneParts, LaneStyle, LanesDef, Side, Source, TimerRef};
+use skin_model::{
+    Blend, End, Filter, LaneParts, LaneStyle, LanesDef, Side, Source, SourceLanes, TimerRef,
+};
 
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{self, CriticalPart, Role};
@@ -434,15 +436,13 @@ impl Cx<'_> {
             .ok_or_else(|| self.range(at, "size"))?;
             heights.push(nh);
         }
-        let rounded: Vec<i128> = heights
-            .iter()
-            .map(|h| h.round())
-            .collect::<Option<_>>()
-            .ok_or_else(|| self.range(at, "size"))?;
-        let Some(&note_h) = rounded.first() else {
+        // One height for every lane, kept unrounded; its rounding is the
+        // model's nominal note height.
+        let Some(&nh) = heights.first() else {
             return refuse(self, "size");
         };
-        if rounded.len() != LANES || rounded.iter().any(|&h| h != note_h) || note_h < 1 {
+        let note_h = nh.round().ok_or_else(|| self.range(at, "size"))?;
+        if heights.len() != LANES || heights.iter().any(|&h| h != nh) || note_h < 1 {
             return refuse(self, "size");
         }
         let note_h = u16::try_from(note_h).map_err(|_| self.range(at, "size"))?;
@@ -451,7 +451,6 @@ impl Cx<'_> {
         // lanes' bottom and top (`play/LaneRenderer.java:324-326`).
         let [_, y0, _, h0] = lane_rects.first().map_or([0; 4], |(_, r)| *r);
         let range = |cx: &Self| cx.range(at, "dst");
-        let nh = heights.first().copied().unwrap_or(Q::ZERO);
         let y_up = Q::int(y0).mul(self.r).ok_or_else(|| range(self))?;
         let h_up = Q::int(h0).mul(self.r).ok_or_else(|| range(self))?;
         let base = Q::int(HEIGHT).sub(y_up).ok_or_else(|| range(self))?;
@@ -476,6 +475,25 @@ impl Cx<'_> {
             i32_of(self, bottom)?,
             i32_of(self, cover_at)?,
         ];
+        // The source draws a note's lower edge `y` offset above the lifted
+        // region's lower edge at its judgment time
+        // (`play/LaneRenderer.java:521-524`). An offset that puts that note
+        // below the lanes' bottom, which also takes the source's clipped
+        // long-note branch (`:577-581`), or above their top, refuses.
+        let oy = Q::int(o.y);
+        let fits = base
+            .sub(oy)
+            .and_then(|v| v.sub(nh))
+            .ok_or_else(|| range(self))?;
+        if o.y < 0 || fits < Q::int(top) {
+            return refuse(self, "offset");
+        }
+        let source = SourceLanes {
+            bottom: base.to_f32(),
+            height: h_up.to_f32(),
+            offset_y: oy.to_f32(),
+            note_h: nh.to_f32(),
+        };
 
         // The lane map (`play/LaneProperty.java:46-50`): source lane 7 is
         // the scratch, model lane 0.
@@ -529,7 +547,7 @@ impl Cx<'_> {
         let t = self.neutral_track(&c)?;
         let state = LaneState {
             def: LanesDef {
-                style: LaneStyle::Simple,
+                style: LaneStyle::Source(source),
                 lanes,
                 scratch,
                 top,
@@ -580,14 +598,7 @@ impl Cx<'_> {
                 );
             }
         }
-        for a in [
-            LaneApprox::TopCrop,
-            LaneApprox::LateTaps,
-            LaneApprox::EarlyTaps,
-            LaneApprox::Mines,
-            LaneApprox::LnTail,
-            LaneApprox::LnBody,
-        ] {
+        for a in [LaneApprox::TopCrop, LaneApprox::LnBody] {
             self.lane_approx(at, part, a)?;
         }
         if dst2.is_some_and(|f| self.def.int(f, "dst2").is_ok_and(|v| v != i32::MIN)) {

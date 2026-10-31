@@ -4,7 +4,7 @@
 
 mod common;
 
-use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
+use bms_model::{Chart, ChartBuilder, Lane, LnMode, TimeUs};
 use common::lanes::{NOTES, body, cover, eight, lane_rects, lift_object, note, note_with};
 use common::play::{Drawn, MS, judged, round};
 use common::{Loaded, has, import_body, import_config, import_sized};
@@ -95,14 +95,7 @@ fn rects_with(i: usize, rect: &str) -> String {
 fn lanes_import_with_their_approximations() {
     let l = lanes(r#""size": [20, 20, 20, 20, 20, 20, 20, 20]"#, &[]);
     let r = l.report();
-    for a in [
-        LaneApprox::TopCrop,
-        LaneApprox::LateTaps,
-        LaneApprox::EarlyTaps,
-        LaneApprox::Mines,
-        LaneApprox::LnTail,
-        LaneApprox::LnBody,
-    ] {
+    for a in [LaneApprox::TopCrop, LaneApprox::LnBody] {
         assert!(has(r, NoteKind::Deviation(DeviationId::D9(a))), "{a:?}");
     }
     for a in [LaneApprox::Dst2, LaneApprox::Expansion, LaneApprox::BarLine] {
@@ -142,7 +135,7 @@ fn lanes_map_source_seven_to_the_scratch() {
     r.sort_unstable();
     assert_eq!(
         r,
-        [[30, 760, 120, 20], [150, 760, 75, 20], [600, 760, 75, 20]]
+        [[30, 761, 120, 20], [150, 761, 75, 20], [600, 761, 75, 20]]
     );
     assert_eq!(l.ok().scratch, Some(Side::Left));
     // The scratch right of the keys.
@@ -206,8 +199,9 @@ fn overlapping_lanes_refuse() {
 
 #[test]
 fn the_vertical_mapping_follows_the_source() {
-    // r = 3/2, y 200, h 400, size 13: top 170, line 770, bottom 780,
-    // note height 20 (19.5 rounds up).
+    // r = 3/2, y 200, h 400, size 13: top 170, line 770, bottom 780, a
+    // region 600 high and notes 19.5 high, kept unrounded: at its
+    // judgment time a note spans 760.5–780 (rounded here: 761, 20 high).
     let objects = |extra: &str| {
         note_with(
             &lane_rects(200, 400),
@@ -217,15 +211,18 @@ fn the_vertical_mapping_follows_the_source() {
     let at =
         |objects: String, dsts: &[&str]| import_sized([1_280, 720], &body("", &objects, dsts), &[]);
     let l = at(objects(""), &[NOTES]);
-    // A note on the line, and one 600 ms ahead centred on the top, its
-    // upper half cut (D9 TopCrop).
+    // A note on the line, and one 600 ms ahead with its lower edge on the
+    // region's top, cut at the lanes' top (D9 TopCrop).
     let chart = taps(&[(1, 1_000), (2, 1_600)]);
     assert_eq!(
         rects_over(&l, &chart, 1_000),
-        [[150, 760, 75, 20], [225, 170, 75, 10]]
+        [[150, 761, 75, 20], [225, 170, 75, 10]]
     );
-    // The bottom: a late tap is cut there.
-    assert_eq!(rects_over(&l, &tap(1, 1_000), 1_005), [[150, 765, 75, 15]]);
+    // Nothing is drawn below the line.
+    assert_eq!(
+        rects_over(&l, &tap(1, 1_000), 1_005),
+        Vec::<[i32; 4]>::new()
+    );
     // SUDDEN+ anchors at the lanes' top (180), LIFT at the bottom (780):
     // the lift of 100 ‰ takes 60 px from 780, and a cover of 500 ‰ takes
     // half of the 540 px left, 270 px from 180.
@@ -239,12 +236,12 @@ fn the_vertical_mapping_follows_the_source() {
     d.view.lift = 100;
     let r = d.rects(1_000);
     assert_eq!(r, [[30, 180, 645, 270], [30, 720, 645, 60]]);
-    // Without them, the cover would anchor at the top (170) and the
-    // lift at the line (770): 100 ‰ of the lift lowers the line by 60.
+    // Without them, 100 ‰ of lift still raises the line by 60 px of the
+    // region: a note's lower edge on 720.
     let l = at(objects(""), &[NOTES]);
     let mut d = drawn(&l, &tap(1, 1_000));
     d.view.lift = 100;
-    assert_eq!(d.rects(1_000), [[150, 700, 75, 20]]);
+    assert_eq!(d.rects(1_000), [[150, 701, 75, 20]]);
 }
 
 #[test]
@@ -256,10 +253,16 @@ fn note_heights_come_from_size_or_the_cell() {
     let tall = tall.replace(r#""id": "nt""#, r#""id": "tall""#);
     let l = import_body(&body(&tall, &objects, &[NOTES]));
     assert_eq!(rects_over(&l, &tap(1, 1_000), 1_000), [[100, 860, 50, 20]]);
-    // Sizes equal after rounding pass; unequal ones refuse.
+    // Every lane's size is one height, kept unrounded: unequal sizes
+    // refuse, even below a pixel.
     let sizes = |s: &str| lanes(&format!(r#""size": [{s}]"#), &[]);
-    let l = sizes("20, 20, 20, 20, 20, 20, 20, 20.4");
-    assert_eq!(rects_over(&l, &tap(1, 1_000), 1_000), [[100, 860, 50, 20]]);
+    let l = sizes("20.5, 20.5, 20.5, 20.5, 20.5, 20.5, 20.5, 20.5");
+    let q = drawn(&l, &tap(1, 1_000)).frame(1_000, &[]);
+    assert_eq!(
+        q.iter().map(|q| q.rect).collect::<Vec<_>>(),
+        [[100.0, 859.5, 50.0, 20.5]]
+    );
+    refused(sizes("20, 20, 20, 20, 20, 20, 20, 20.4"), "size");
     refused(sizes("20, 20, 20, 20, 20, 20, 20, 21"), "size");
     refused(sizes("0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4"), "size");
     // −2^127 as `f32`, the rationals' negative boundary, and beyond.
@@ -550,25 +553,110 @@ fn mine_hit(ms: i64, l: u8) -> JudgeEvent {
 }
 
 #[test]
-fn the_lane_approximations_show_in_build() {
+fn taps_and_mines_stay_until_their_time() {
     let l = lanes("", &[]);
-    // A late tap is drawn below the line, cut at the bottom.
-    assert_eq!(rects_over(&l, &tap(1, 1_000), 1_005), [[100, 865, 50, 15]]);
-    // An early-judged tap is gone.
+    let none = Vec::<[i32; 4]>::new();
+    // A late tap is not drawn below the line.
+    assert_eq!(rects_over(&l, &tap(1, 1_000), 1_005), none);
+    // An early-judged tap stays until its time.
     let mut d = drawn(&l, &tap(1, 1_000));
     d.frame(900, &[judged(900, Judgment::Great, 1)]);
-    assert_eq!(d.rects(950), Vec::<[i32; 4]>::new());
-    // An unhit mine leaves at its time; a hit one when hit.
+    assert_eq!(d.rects(950), [[100, 810, 50, 20]]);
+    // A mine leaves at its time, hit or not.
     let mines = ChartBuilder::new(150_000)
         .mine(Lane::new(2).unwrap(), TimeUs(1_000 * MS), 10)
         .build()
         .unwrap();
     let mut d = drawn(&l, &mines);
     assert_eq!(d.rects(999), [[150, 859, 50, 20]]);
-    assert_eq!(d.rects(1_001), Vec::<[i32; 4]>::new());
+    assert_eq!(d.rects(1_001), none);
     let mut d = drawn(&l, &mines);
     d.frame(900, &[mine_hit(900, 2)]);
-    assert_eq!(d.rects(910), Vec::<[i32; 4]>::new());
+    assert_eq!(d.rects(910), [[150, 770, 50, 20]]);
+}
+
+/// A long note on model lane 1 from 1 s to 1.3 s in `mode`, with a STOP
+/// of `stop` ms at its end.
+fn long_note(mode: Option<LnMode>, stop: i64) -> Chart {
+    let mut b = ChartBuilder::new(150_000).long(
+        Lane::new(1).unwrap(),
+        TimeUs(1_000 * MS),
+        TimeUs(1_300 * MS),
+    );
+    if stop > 0 {
+        b = b.stop(TimeUs(1_300 * MS), TimeUs(stop * MS));
+    }
+    let mut chart = b.build().unwrap();
+    chart.meta.ln_mode = mode;
+    chart
+}
+
+#[test]
+fn long_notes_draw_as_the_source_draws_them() {
+    let l = lanes("", &[]);
+    // At 1.15 s the head is held on the line (860–880) and the end is
+    // 150 px ahead: the body runs from the end's lower edge (730) to the
+    // head's upper edge. A plain LN shows no end cap; CN and HCN do.
+    for (mode, end) in [
+        (None, false),
+        (Some(LnMode::Ln), false),
+        (Some(LnMode::Cn), true),
+        (Some(LnMode::Hcn), true),
+    ] {
+        let mut want = vec![[100, 730, 50, 130]];
+        if end {
+            want.push([100, 710, 50, 20]);
+        }
+        want.push([100, 860, 50, 20]);
+        assert_eq!(rects_over(&l, &long_note(mode, 0), 1_150), want, "{mode:?}");
+    }
+}
+
+#[test]
+fn a_long_note_expires_at_its_end_time() {
+    let l = lanes("", &[]);
+    for stop in [0, 200] {
+        let chart = long_note(Some(LnMode::Cn), stop);
+        let mut d = drawn(&l, &chart);
+        assert_eq!(d.rects(1_250).len(), 3, "{stop}");
+        // Within a note of its end: its caps, no body (D9 LnBody).
+        assert_eq!(d.rects(1_299).len(), 2, "{stop}");
+        assert!(d.rects(1_300).is_empty(), "{stop}");
+        assert!(d.rects(1_400).is_empty(), "{stop}");
+    }
+}
+
+#[test]
+fn a_note_offset_off_the_lanes_refuses() {
+    let header = r#""offset": [{"name": "n", "id": 40, "y": true, "h": true}]"#;
+    let with = |extra: &str, ov: OffsetValue| {
+        let objects = format!("{header}, {}", note(extra));
+        let notes = r#"{"id": "notes", "offset": 40, "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#;
+        import_config(
+            [1_920, 1_080],
+            &body("", &objects, &[notes]),
+            &[],
+            |c: &mut Config| {
+                c.offsets.insert(40, ov);
+            },
+        )
+    };
+    let y = |y: i32| OffsetValue {
+        y,
+        ..OffsetValue::default()
+    };
+    // Below the lanes' bottom at its judgment time: refused.
+    refused(with("", y(-1)), "offset");
+    // On it, or raised by the offset: drawn with the lower edge raised.
+    with("", y(0)).ok();
+    let l = with("", y(30));
+    assert_eq!(rects_over(&l, &tap(1, 1_000), 1_000), [[100, 830, 50, 20]]);
+    // Above the lanes' top at its judgment time (a note more than twice
+    // the region's height, with the top half a note above the region):
+    // refused at 1201, drawn at 1200.
+    let size = |s: &str| format!(r#""size": [{s}, {s}, {s}, {s}, {s}, {s}, {s}, {s}]"#);
+    refused(with(&size("1201"), y(0)), "offset");
+    with(&size("1200"), y(0)).ok();
 }
 
 #[test]
