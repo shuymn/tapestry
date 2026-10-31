@@ -375,7 +375,7 @@ impl Rig for Rounds {
         self.reports.push(report.clone());
     }
 
-    fn show_end(&mut self, _report: &PlayReport) {}
+    fn show_end(&mut self, _report: &PlayReport, _screen: &game::ResultScreen) {}
 }
 
 fn config() -> SessionConfig {

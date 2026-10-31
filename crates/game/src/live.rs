@@ -40,13 +40,15 @@ use eval::{InputStart, JudgeEvent};
 use input::{Arrival, DeviceKind};
 use replay::Incomplete;
 
+use crate::app::IDLE_WAIT;
 use crate::audio_loop::AudioWaitError;
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::policy::SessionEvent;
 use crate::practice::{FADE, RING_OUT};
 use crate::render::RenderSide;
+use crate::result_screen::ResultScreen;
 use crate::session::{
-    Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, PresetReload, Settings,
+    Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, RECORDING_MEMORY, Settings,
 };
 use crate::sound::{AudioQueue, audio_link_at};
 
@@ -104,6 +106,13 @@ pub trait Rig {
     /// Waits for the next step: production parks until the input thread
     /// publishes or a short timeout; a virtual rig moves its clock.
     fn wait(&mut self);
+    /// Waits idly on a screen (the select screen, a result) until something
+    /// happens, or until `deadline` on the rig's clock at the latest. By
+    /// default, one [`wait`](Self::wait).
+    fn idle_wait(&mut self, deadline: TimeUs) {
+        let _ = deadline;
+        self.wait();
+    }
     /// After a step's decisions (`aborted`: the step ended the play).
     /// A virtual rig steps its audio through the step's own time here;
     /// threads need nothing.
@@ -210,15 +219,10 @@ pub trait Rig {
     }
     /// The play ended: its report, before any end screen.
     fn ended(&mut self, report: &PlayReport);
-    /// Shows the end screen of a play that neither quit nor retried.
-    fn show_end(&mut self, report: &PlayReport);
-    /// While the end screen of `report` shows, a poll found the chosen
-    /// preset reloaded, with the play re-evaluated under it, or its file
-    /// failing to load (design.md "Tuning Without Restart"). By default
-    /// nothing is shown.
-    fn preset_reloaded(&mut self, report: &PlayReport, reload: &PresetReload) {
-        let _ = (report, reload);
-    }
+    /// Shows the end screen of a play that neither quit nor retried, with
+    /// its result screen's view; called again whenever the view changes or
+    /// the screen was built again.
+    fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen);
     /// Before each play opens recording: settings changed since the previous
     /// play are written into `settings`, which the play is evaluated and
     /// recorded with. The input offset changes only here, so a change takes
@@ -318,41 +322,59 @@ pub fn run_chart<R: Rig>(
         loaded.emit(&SessionEvent::Result {
             attempt: report.attempt,
         });
-        rig.show_end(&report);
+        let mut screen =
+            ResultScreen::new(&report, loaded.shelf(), loaded.chart(), RECORDING_MEMORY);
+        rig.show_end(&report, &screen);
         loop {
-            rig.wait();
+            // The wait ends at the shelf's poll deadline at the latest, so
+            // a wake just before it does not put the check off.
+            let now = rig.now();
+            let deadline = loaded.shelf().deadline().next(now);
+            rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(deadline.0)));
             if rig.quitting() {
                 return leave(rig);
             }
             // The user preset files are polled while the result shows, never
-            // during a play; a reload is used by plays from the next one on.
-            if let Some(reload) = loaded.poll_presets(rig.now(), &report) {
-                rig.preset_reloaded(&report, &reload);
-            }
+            // during a play; a reload is used by plays from the next one on,
+            // and the view sees every change through the shelf's revision.
+            let _ = loaded.poll_presets(rig.now());
+            let mut dirty = screen.sync(&report, loaded.shelf(), loaded.chart());
             // Retry and back are taken before the screen is rebuilt, so a
             // known input failure ends the run without another handshake
             // with the screen; a retry's preparation rebuilds it anyway.
             // A preset switch changes only the result's view, never the
             // play preset (design.md "Play Lifecycle").
             // Commands queued behind the one that leaves the result belong
-            // to that result and are dropped with it.
-            match rig.take_menu() {
-                Some(MenuCommand::Retry) => {
-                    while rig.take_menu().is_some() {}
-                    break;
+            // to that result and are dropped with it. Every switch queued
+            // is taken in one wake.
+            let mut retry = false;
+            while let Some(c) = rig.take_menu() {
+                match c {
+                    MenuCommand::Retry => {
+                        retry = true;
+                        break;
+                    }
+                    MenuCommand::Back => {
+                        while rig.take_menu().is_some() {}
+                        return leave(rig);
+                    }
+                    MenuCommand::NextPreset => dirty |= screen.step(1, &report, loaded.chart()),
+                    MenuCommand::PrevPreset => dirty |= screen.step(-1, &report, loaded.chart()),
                 }
-                Some(MenuCommand::Back) => {
-                    while rig.take_menu().is_some() {}
-                    return leave(rig);
-                }
-                Some(MenuCommand::NextPreset | MenuCommand::PrevPreset) | None => {}
+            }
+            if retry {
+                while rig.take_menu().is_some() {}
+                break;
             }
             // The screen failed during the play, its tail or this wait: it
             // is built again, acknowledged, before the end screen shows
             // again; if it cannot be, the run ends with the reason.
             if rig.screen_failed() {
                 rig.prepare_screen().map_err(LiveError::Screen)?;
-                rig.show_end(&report);
+                dirty = true;
+            }
+            if dirty {
+                rig.show_end(&report, &screen);
             }
         }
     }
