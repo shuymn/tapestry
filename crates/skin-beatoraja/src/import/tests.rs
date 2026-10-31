@@ -249,3 +249,48 @@ fn a_rejected_lane_approximation_refuses() {
         other => panic!("{:?}", other.map(|i| i.report)),
     }
 }
+
+/// The memory fixture's judges at J = 3 (`tests/import_memory.rs` F5):
+/// every timed grade key is kept, and the outer and combo tracks keep one.
+#[test]
+fn judges_retain_every_grade_key() {
+    use super::widget::judge::RETAINED;
+    let judges: Vec<String> = [(11, "240"), (11, "-230, -231"), (10, "-230, -231")]
+        .iter()
+        .enumerate()
+        .map(|(i, (keys, op))| {
+            let track: Vec<String> = (0..*keys)
+                .map(|t| {
+                    format!(
+                        r#"{{"time": {t}, "x": {}, "y": 500, "w": 80, "h": 20}}"#,
+                        100 + t
+                    )
+                })
+                .collect();
+            format!(
+                r#"{{"id": "j{i}", "index": 0,
+                    "images": [{{"id": "i", "timer": 46, "op": [{op}], "loop": 0, "dst": [{}]}}],
+                    "numbers": [{{"id": "v", "dst": [{{"x": 10, "y": 0, "w": 6, "h": 6}}]}}]}}"#,
+                track.join(", ")
+            )
+        })
+        .collect();
+    let json = format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080,
+            "source": [{{"id": "a", "path": "a.png"}}],
+            "image": [{A}],
+            "value": [{{"id": "v", "src": "a", "w": 60, "h": 6, "divx": 10, "digit": 2}}],
+            "judge": [{}],
+            "destination": [{}]}}"#,
+        judges.join(", "),
+        (0..3)
+            .map(|i| format!(r#"{{"id": "j{i}", "dst": [{{"w": 0, "h": 0}}]}}"#))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    RETAINED.with(|r| r.borrow_mut().clear());
+    let (r, ..) = run(&json);
+    r.unwrap();
+    let kept = RETAINED.with(|r| r.take());
+    assert_eq!(kept, [[1, 1, 11], [1, 1, 11], [1, 1, 10]]);
+}

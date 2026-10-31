@@ -22,6 +22,21 @@ use super::super::{Common, Cx, Dst, Opts};
 use super::number;
 use crate::error::ImportError;
 
+#[cfg(test)]
+thread_local! {
+    /// Each judge's retained keys this thread imported: the outer track's,
+    /// slot 0's combo's and slot 0's grade's.
+    pub(crate) static RETAINED: std::cell::RefCell<Vec<[usize; 3]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn retained(def: &JudgeDef, outer: &Track) -> [usize; 3] {
+    let combo = def.combos[0].as_ref().map_or(0, |c| c.track.key_count());
+    let grade = def.grades[0].as_ref().map_or(0, |g| g.track.key_count());
+    [outer.key_count(), combo, grade]
+}
+
 /// The slots whose combo the source draws (`SkinJudge.java:104-111`).
 const COMBO_SLOTS: [usize; 4] = [0, 1, 2, 6];
 
@@ -168,6 +183,8 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?;
         let t = self.neutral_track(&c)?;
         let index = u32::try_from(self.widgets.judges.len()).unwrap_or(u32::MAX);
+        #[cfg(test)]
+        RETAINED.with(|r| r.borrow_mut().push(retained(&def, &t)));
         self.widgets.judges.push(def);
         self.push(c, Source::Judge(index), t);
         Ok(())
