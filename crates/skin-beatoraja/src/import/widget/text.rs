@@ -339,7 +339,8 @@ impl Cx<'_> {
                                     FntFailure::Fnt(e) if !e.kind.upstream_fails() => {
                                         Severity::Dropped
                                     }
-                                    _ => Severity::Ignored,
+                                    FntFailure::Refused => Severity::Dropped,
+                                    FntFailure::Fnt(_) | FntFailure::Missing => Severity::Ignored,
                                 };
                                 let why = failure_note(failure);
                                 self.note(Some(at), severity, why);
@@ -400,7 +401,7 @@ impl Cx<'_> {
 /// The note for a `.fnt` file that failed.
 fn failure_note(failure: FntFailure) -> NoteKind {
     match failure {
-        FntFailure::Missing => NoteKind::MissingAsset,
+        FntFailure::Missing | FntFailure::Refused => NoteKind::MissingAsset,
         FntFailure::Fnt(e) => NoteKind::BitmapFont(e),
     }
 }

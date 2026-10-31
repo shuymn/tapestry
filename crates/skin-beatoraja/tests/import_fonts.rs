@@ -415,3 +415,32 @@ fn a_fallback_refused_only_by_our_rules_is_dropped() {
     assert_eq!(notes, [(Severity::Dropped, kind)]);
     assert_eq!(i.report.usage.texts, 1);
 }
+
+#[test]
+fn a_fallback_outside_the_folder_is_dropped_and_a_missing_one_ignored() {
+    // The source loads a fallback beside the skin folder; we refuse its
+    // name. A missing file fails there too.
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("skin");
+    std::fs::create_dir(&dir).unwrap();
+    fnt(root.path(), "f.fnt", &[(66, 0, 4, 20, 0, 3, 12)]);
+    fnt(&dir, "p.fnt", &[A, M]);
+    for (path, severity) in [
+        ("../f.fnt", Severity::Dropped),
+        ("none.fnt", Severity::Ignored),
+    ] {
+        let fonts =
+            format!(r#"{{"id": "a", "path": "p.fnt", "fallback": [{{"path": "{path}"}}]}}"#);
+        let s = json([1_920, 1_080], &fonts, &[("a", 24, "AB")]);
+        write(&dir, "s.json", s.as_bytes());
+        let i = import(&dir).unwrap();
+        let notes: Vec<_> = i
+            .report
+            .notes
+            .iter()
+            .map(|n| (n.severity, n.kind))
+            .collect();
+        assert_eq!(notes, [(severity, NoteKind::MissingAsset)], "{path}");
+        assert_eq!(i.report.usage.texts, 1, "{path}");
+    }
+}

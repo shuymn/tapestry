@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 
 use skin_model::{
-    AdmitError, BitmapFontError, FileDef, FntAdmitError, FntError, FntLimit, FontAdmitError,
-    FontDef, ImageDef, ImageError, MAX_PATH_BYTES, Refused, Root, Sheet, SheetBuilder,
+    AdmitError, BitmapFontError, FileDef, FntAdmitError, FntError, FntFileError, FntLimit,
+    FontAdmitError, FontDef, FontError, ImageDef, ImageError, MAX_PATH_BYTES, Refused, Root, Sheet,
+    SheetBuilder,
 };
 
 use super::Config;
@@ -154,6 +155,9 @@ pub(crate) enum Font {
 pub(crate) enum FntFailure {
     /// The file could not be found or read.
     Missing,
+    /// Its name or size refused by the folder's confinement and file
+    /// limits, where the source may load it.
+    Refused,
     /// Its text or a page was refused.
     Fnt(FntError),
 }
@@ -345,6 +349,11 @@ impl Assets {
                     FntLimit::Kernings => ImportLimit::Kernings,
                 });
             }
+            Err(FntAdmitError::File(FntFileError::Font(
+                FontError::PathRejected { .. }
+                | FontError::PathEscapes { .. }
+                | FontError::TooLarge { .. },
+            ))) => Err(FntFailure::Refused),
             Err(FntAdmitError::File(e)) => {
                 Err(e.fnt().map_or(FntFailure::Missing, FntFailure::Fnt))
             }
