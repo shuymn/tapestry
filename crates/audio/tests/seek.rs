@@ -457,6 +457,32 @@ fn run_to(e: &mut AudioEngine, out: &mut RecordingOutput<SimDevice>, frames: usi
 }
 
 #[test]
+fn seek_source_matches_its_schedule() {
+    // The engine's own schedule matches; one with a start moved by 1 µs,
+    // one sound swapped, one start fewer, or the schedule a load replaced
+    // does not.
+    let bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        vec![sound(80, false, 1, 1), sound(80, false, 1, 1)],
+    ));
+    let bgm = events(&[(0, 0), (300, 1)]);
+    let mut e = AudioEngine::new(Arc::clone(&bank), &bgm, RATE, PERIOD, 4, 0).unwrap();
+    let source = e.seek_source();
+    assert!(source.matches(&bgm));
+    let mut moved = bgm.clone();
+    moved[1].time = TimeUs(300_001);
+    assert!(!source.matches(&moved));
+    assert!(!source.matches(&events(&[(0, 1), (300, 1)])));
+    assert!(!source.matches(&bgm[..1]));
+    let next = events(&[(100, 1)]);
+    e.replace(bank, audio::BgmSchedule::new(next.clone()))
+        .unwrap();
+    let source = e.seek_source();
+    assert!(source.matches(&next));
+    assert!(!source.matches(&bgm));
+}
+
+#[test]
 fn a_plan_for_another_play_or_an_expired_frame_is_refused() {
     // A seek to 0.5 s is taken; then plans from an engine with another
     // schedule of the same length, from one with another bank, on a line
