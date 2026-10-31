@@ -1,0 +1,40 @@
+# Bitmap font tokens for the skin_fnt target (libFuzzer -dict format).
+
+# Line heads.
+"info "
+"common "
+"page "
+"chars "
+"char "
+"kernings "
+"kerning "
+
+# Keys.
+"padding="
+"lineHeight="
+"base="
+"pages="
+"file=\""
+"id="
+"size="
+"scaleW="
+"scaleH="
+"count="
+"face=\""
+"x="
+"y="
+"width="
+"height="
+"xoffset="
+"yoffset="
+"xadvance="
+"page="
+"first="
+"second="
+"amount="
+
+# Values and separators.
+"0,0,0,0"
+"-1"
+"16384"
+"\r\n"
