@@ -97,7 +97,7 @@ pub use layout::{
     Adjust, Anchor, Controls, LANE_WIDTH_PCT, Layout, LayoutError, MAX_INSET, MAX_OFFSET, Region,
     RegionDef, SCALE_PCT,
 };
-pub use place::{Affine, Bind, Fill, MIN_VISIBLE, Place, Placement, RegionPlacement};
+pub use place::{Affine, Bind, Fill, MIN_VISIBLE, Native, Place, Placement, RegionPlacement};
 pub use play::schema::{
     GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, PLAY, field, lane_timer, timer,
 };

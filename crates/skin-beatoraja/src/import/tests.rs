@@ -51,8 +51,8 @@ fn each_compile_follows_its_charges_and_each_admission_its_image_charge() {
     use Event::{Admit, Charge, Compile};
     let json = skin(
         A,
-        r#"{"id": "i", "timer": 348, "op": [241], "dst": [{"w": 1, "h": 1}]},
-           {"id": "i", "timer": 348, "op": [241], "dst": [{"w": 1, "h": 1}]}"#,
+        r#"{"id": "i", "timer": 348, "op": [232], "dst": [{"w": 1, "h": 1}]},
+           {"id": "i", "timer": 348, "op": [232], "dst": [{"w": 1, "h": 1}]}"#,
     );
     let (r, trace, admits) = run(&json);
     r.unwrap();

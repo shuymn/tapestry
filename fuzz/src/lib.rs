@@ -289,6 +289,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
         empty_poor_breaks_combo: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -364,6 +365,7 @@ pub fn draw(imported: &Imported) -> Vec<usize> {
                 cover: 0,
                 lift: 0,
             },
+            playing: true,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch);
         let n = batch.quads().len();

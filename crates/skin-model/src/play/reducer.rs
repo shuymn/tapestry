@@ -3,17 +3,18 @@
 //!
 //! It reads only each event's kind and chart time, never the frame, so its
 //! state after a sequence of effects does not depend on how drains split
-//! the sequence. Feedback follows the play screen's rules: a press gives a
-//! bomb unless it is a POOR, a long note's completion gives its judgment
-//! text but never a bomb or a hold, and the visual hold starts at a head
-//! press before the long note's end, a BAD head included.
+//! the sequence. Feedback follows the play screen's rules: a press, an
+//! empty POOR included, gives a bomb when its grade is within the skin's
+//! bomb threshold, a long note's completion gives its judgment text but
+//! never a bomb or a hold, and the visual hold starts at a head press
+//! before the long note's end, a BAD head included.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
 use bms_model::{Chart, LANE_COUNT, NoteKind, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind, Section};
-use rules::{GaugeValue, Judgment, LnMode};
+use rules::{GaugeValue, LnMode};
 
 use super::schema::Grade;
 
@@ -70,9 +71,7 @@ pub(crate) struct Reducer {
     pub(crate) mine: [Option<TimeUs>; LANE_COUNT],
     pub(crate) judge: Option<(Grade, TimeUs)>,
     pub(crate) combo_up: Option<TimeUs>,
-    judged: u32,
     targets: u32,
-    pub(crate) last_note: Option<TimeUs>,
     pub(crate) full_combo: Option<TimeUs>,
     /// Per gauge: when it reached its maximum, if it is there by the
     /// effects delivered so far.
@@ -80,6 +79,8 @@ pub(crate) struct Reducer {
     /// Per gauge: its maximum.
     pub(crate) gauge_top: Box<[GaugeValue]>,
     empty_poor_breaks_combo: bool,
+    /// The last grade that gives a bomb, `None` for none.
+    bomb_up_to: Option<Grade>,
 }
 
 /// Whether a long note's body is drawn active under `mode`, given whether
@@ -99,13 +100,15 @@ pub(crate) fn is_target(section: Option<(TimeUs, TimeUs)>, time: TimeUs, end: Ti
 impl Reducer {
     /// A clean reducer for one attempt: `initial` gives each gauge's
     /// initial value and maximum, and a gauge whose initial value is at its
-    /// maximum reads on from `ready_at`.
+    /// maximum reads on from `play_at`, the attempt's start after the
+    /// countdown.
     pub(crate) fn new(
         chart: &Chart,
         section: Option<&Section>,
         initial: impl Iterator<Item = (GaugeValue, GaugeValue)>,
-        ready_at: TimeUs,
+        play_at: TimeUs,
         empty_poor_breaks_combo: bool,
+        bomb_up_to: Option<Grade>,
     ) -> Self {
         let mut targets: u32 = 0;
         for note in chart.lanes.iter().flatten() {
@@ -128,7 +131,7 @@ impl Reducer {
         });
         let done = std::array::from_fn(|l| Bits::sized(chart.lanes.get(l).map_or(0, Vec::len)));
         let (gauge_max, gauge_top): (Vec<_>, Vec<_>) = initial
-            .map(|(value, top)| ((value >= top).then_some(ready_at), top))
+            .map(|(value, top)| ((value >= top).then_some(play_at), top))
             .unzip();
         Self {
             longs,
@@ -139,13 +142,12 @@ impl Reducer {
             mine: [None; LANE_COUNT],
             judge: None,
             combo_up: None,
-            judged: 0,
             targets,
-            last_note: None,
             full_combo: None,
             gauge_max: gauge_max.into_boxed_slice(),
             gauge_top: gauge_top.into_boxed_slice(),
             empty_poor_breaks_combo,
+            bomb_up_to,
         }
     }
 
@@ -177,15 +179,9 @@ impl Reducer {
             } => {
                 let l = lane.index();
                 self.judge = Some((Grade::of(judgment), t));
-                self.judged = self.judged.saturating_add(1);
                 self.combo_up = (combo > 0).then_some(t);
                 if self.targets > 0 && combo == self.targets && self.full_combo.is_none() {
                     self.full_combo = Some(t);
-                }
-                if (self.judged == self.targets || combo == self.targets)
-                    && self.last_note.is_none()
-                {
-                    self.last_note = Some(t);
                 }
                 self.end_hold(l, note);
                 let long = self.long(l, note);
@@ -193,7 +189,7 @@ impl Reducer {
                     if let Some(bits) = self.done.get_mut(l) {
                         bits.set(note);
                     }
-                    self.feedback(l, judgment, t);
+                    self.feedback(l, Grade::of(judgment), t);
                     return;
                 };
                 // A completion: finished by a release, or at its end after
@@ -219,7 +215,7 @@ impl Reducer {
                         end,
                     });
                 }
-                self.feedback(l, judgment, t);
+                self.feedback(l, Grade::of(judgment), t);
             }
             JudgeEventKind::LnHeld {
                 lane,
@@ -237,7 +233,7 @@ impl Reducer {
                     });
                 }
                 self.judge = Some((Grade::of(judgment), t));
-                self.feedback(l, judgment, t);
+                self.feedback(l, Grade::of(judgment), t);
             }
             JudgeEventKind::LnHoldEnded { lane, note } => self.end_hold(lane.index(), note),
             JudgeEventKind::MineHit { lane, note } => {
@@ -249,11 +245,12 @@ impl Reducer {
                     bits.set(note);
                 }
             }
-            JudgeEventKind::EmptyPoor { .. } => {
+            JudgeEventKind::EmptyPoor { lane } => {
                 self.judge = Some((Grade::EmptyPoor, t));
                 if self.empty_poor_breaks_combo {
                     self.combo_up = None;
                 }
+                self.feedback(lane.index(), Grade::EmptyPoor, t);
             }
             JudgeEventKind::Gauge { gauge, value, .. } => {
                 if let (Some(at), Some(&top)) =
@@ -266,14 +263,7 @@ impl Reducer {
                     }
                 }
             }
-            JudgeEventKind::SongEnd => {
-                // Best effort: a dropped final `Judged` still ends the
-                // play here; a dropped `SongEnd` as well leaves it off.
-                if self.last_note.is_none() {
-                    self.last_note = Some(t);
-                }
-            }
-            JudgeEventKind::PlaySound { .. } => {}
+            JudgeEventKind::SongEnd | JudgeEventKind::PlaySound { .. } => {}
         }
     }
 
@@ -291,9 +281,11 @@ impl Reducer {
         }
     }
 
-    /// A press's bomb on lane `l`, unless it is a POOR.
-    fn feedback(&mut self, l: usize, judgment: Judgment, at: TimeUs) {
-        if judgment != Judgment::Poor
+    /// A press's bomb on lane `l` when `grade` is within the bomb
+    /// threshold: grades are ordered PERFECT first and empty POOR last
+    /// (`play/JudgeManager.java:673`).
+    fn feedback(&mut self, l: usize, grade: Grade, at: TimeUs) {
+        if self.bomb_up_to.is_some_and(|up| grade as u8 <= up as u8)
             && let Some(bomb) = self.bomb.get_mut(l)
         {
             *bomb = Some(at);

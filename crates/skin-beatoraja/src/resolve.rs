@@ -184,6 +184,11 @@ impl Definition {
         &self.root
     }
 
+    /// The entry file's top-level object.
+    pub(crate) fn top(&self) -> u32 {
+        self.top
+    }
+
     /// The entry file's folder: file choices resolve from it.
     pub(crate) fn entry_dir(&self) -> &str {
         &self.arena.files[0].dir

@@ -742,7 +742,7 @@ pub fn skin_imports() -> Vec<Seed> {
             "images",
             play_skin(
                 r#""image": [
-                    {"id": "s", "src": "strip", "w": 100, "h": 10, "divx": 10, "timer": 46, "cycle": 100},
+                    {"id": "s", "src": "strip", "w": 100, "h": 10, "divx": 10, "timer": 41, "cycle": 100},
                     {"id": "g", "src": "grid", "w": 8, "h": 8, "divx": 2, "divy": 2}],
                 "destination": [
                     {"id": "s", "timer": 41, "dst": [{"x": 10, "y": 10, "w": 20, "h": 20}]},
@@ -798,7 +798,7 @@ pub fn skin_imports() -> Vec<Seed> {
                 r#""property": [{"name": "p", "item": [{"name": "x", "op": 900}]}],
                 "image": [{"id": "g", "src": "grid", "w": 4, "h": 4}],
                 "destination": [
-                    {"id": "g", "op": [241], "dst": [{"w": 4, "h": 4}]},
+                    {"id": "g", "op": [-233], "dst": [{"w": 4, "h": 4}]},
                     {"id": "g", "op": [232, 900], "dst": [{"w": 4, "h": 4}]},
                     {"id": "g", "op": [7777], "dst": [{"w": 4, "h": 4}]}]"#,
             ),

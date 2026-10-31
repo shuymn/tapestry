@@ -39,6 +39,7 @@ fn harness_with(g: GaugeDef, descs: &[GaugeDesc]) -> Harness {
         empty_poor_breaks_combo: false,
         scratch: Side::Left,
         ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
     };
     Harness::new(skin_of(g).unwrap(), &chart(), &ctx)
 }

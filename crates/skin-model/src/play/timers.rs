@@ -11,6 +11,10 @@ use super::schema::{GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, lane_timer, tim
 use super::{Play, SkinFrame};
 use crate::expr::{Program, State, TIMER_OFF};
 
+/// How long past the notes' end the play keeps playing before it
+/// finishes, in ms (`play/BMSPlayer.java:66`).
+const FINISH_MARGIN_MS: i64 = 5_000;
+
 /// A full gauge's value per ‰ of the gauge field.
 const GAUGE_UNIT: i64 = GaugeValue::FULL.0 / GAUGE_PERMILLE as i64;
 
@@ -102,16 +106,29 @@ impl Play {
         let play = (now >= self.play_at).then_some(self.play_at);
         let shown = frame.gauges.get(frame.gauge);
         let failed = shown.and_then(|g| g.failed_at);
-        // The reducer's start, masked while the snapshot is below the
-        // maximum: a dropped below-maximum effect cannot leave it on.
+        // The reducer's start, masked during the countdown and while the
+        // snapshot is below the maximum: a dropped below-maximum effect
+        // cannot leave it on (`play/BMSPlayer.java:639`).
         let gauge_max = match (
+            play,
             self.reducer.gauge_max.get(frame.gauge).copied().flatten(),
             shown,
             self.reducer.gauge_top.get(frame.gauge),
         ) {
-            (Some(at), Some(g), Some(&top)) if g.value >= top => Some(at),
+            (Some(_), Some(at), Some(g), Some(&top)) if g.value >= top => Some(at),
             _ => None,
         };
+        // Sampled on whole ms of the play clock, at the first playing
+        // frame past the notes' end and before the finish
+        // (`play/BMSPlayer.java:683-697`); once set, only this keeps it.
+        let mut last_note = self.timer(timer::LAST_NOTE);
+        if last_note.is_none() && frame.playing {
+            let at = now.0.div_euclid(1_000);
+            let end = self.last_note_end.0.div_euclid(1_000);
+            if end < at && at <= end.saturating_add(FINISH_MARGIN_MS) {
+                last_note = Some(now);
+            }
+        }
         let beat = ready.and_then(|_| self.beat_start(now, frame.display_offset));
         let judge = self.reducer.judge;
         let mut set = |slot: u16, start: Option<TimeUs>| {
@@ -122,7 +139,7 @@ impl Play {
         set(timer::READY, ready);
         set(timer::PLAY, play);
         set(timer::FAILED, failed);
-        set(timer::LAST_NOTE, self.reducer.last_note);
+        set(timer::LAST_NOTE, last_note);
         set(timer::FULL_COMBO, self.reducer.full_combo);
         set(timer::GAUGE_MAX, gauge_max);
         set(timer::BEAT, beat);

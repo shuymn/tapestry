@@ -23,11 +23,13 @@ mise exec -- lefthook install
 mise exec -- cargo fmt --check
 mise exec -- cargo clippy --workspace --all-targets -- -D warnings
 mise exec -- cargo test --workspace
+mise exec -- cargo clippy -p player -p game --all-targets --features player/dev-tools,game/dev-tools -- -D warnings
+mise exec -- cargo test -p player -p game --features player/dev-tools,game/dev-tools
 mise exec -- cargo xtask portable test
 mise exec -- cargo xtask check-arch
 mise exec -- cargo xtask check-lints
 ```
 
-`cargo xtask portable <command>` runs a cargo command on every crate except the Windows-only ones (what Linux CI builds and tests). `cargo xtask check-arch` checks the rules above that can be checked mechanically. `cargo xtask check-lints` checks that the lints enforcing them are configured (workspace lints, `eval`'s `clippy.toml`, the crate-root cast lines, the in-play attributes) and still fire on one fixture per lint.
+The two `dev-tools` commands build and test the development features, which the workspace commands leave out. `cargo xtask portable <command>` runs a cargo command on every crate except the Windows-only ones (what Linux CI builds and tests). `cargo xtask check-arch` checks the rules above that can be checked mechanically. `cargo xtask check-lints` checks that the lints enforcing them are configured (workspace lints, `eval`'s `clippy.toml`, the crate-root cast lines, the in-play attributes) and still fire on one fixture per lint.
 
 Linux-side tools (fuzzing, Linux builds) run inside `nix develop` via the WSL wrapper script (docs/setup.md "Linux-Side Tools (WSL)"). The fuzz crate `fuzz/` is outside the workspace: check it with `--manifest-path fuzz/Cargo.toml` (fmt, clippy, test); running the fuzzer is in docs/setup.md "Fuzzing".

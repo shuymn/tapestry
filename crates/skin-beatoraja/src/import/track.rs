@@ -1,8 +1,8 @@
 //! Tracks and stretch: a destination's keys read with the
 //! source's inheritance, sorted, accepted or refused, and the stretch
-//! modes baked into each key.
+//! modes baked into each key or, for 8 and 9, kept for placement.
 
-use skin_model::{End, MAX_KEY_US};
+use skin_model::{End, MAX_KEY_US, Native};
 
 use super::geom::{Q, Rect};
 use super::report::TrackWhy;
@@ -247,9 +247,27 @@ impl Stretch {
     }
 }
 
+impl Stretch {
+    /// The size a quad of a `cell`-texel frame keeps in target pixels:
+    /// stretch 8 and 9 size it after the source scales the destination
+    /// to the window (`skin/SkinObject.java:626-629`,
+    /// `skin/StretchType.java:85-98`), so the model applies them at
+    /// placement instead of baking them into the keys.
+    pub(crate) fn native(self, cell: [u32; 2]) -> Option<Native> {
+        match self {
+            Self::NoExpanding => Some(Native::NoLarger(cell)),
+            Self::NoResize => Some(Native::Exact(cell)),
+            _ => None,
+        }
+    }
+}
+
 /// The branches a key's stretch can take, a bit per branch; an exact tie
 /// takes either.
-type Branches = u8;
+pub(crate) type Branches = u8;
+
+/// Every branch: where the intersection of the keys' branches starts.
+pub(crate) const ANY_BRANCH: Branches = 0xFF;
 
 fn fit_height(r: Rect, h: Q) -> Option<Rect> {
     Some(Rect {
@@ -310,10 +328,11 @@ pub(crate) fn stretch(mode: Stretch, r: Rect, [iw, ih]: [u32; 2]) -> Option<(Rec
     })
 }
 
-/// Whether every key's branches share one: a piecewise mode is baked only
-/// then (the modes are continuous at branch boundaries).
-pub(crate) fn one_branch(branches: impl IntoIterator<Item = Branches>) -> bool {
-    branches.into_iter().fold(0xFF, |acc, b| acc & b) != 0
+/// Whether the intersection of every key's branches keeps one: a
+/// piecewise mode is baked only then (the modes are continuous at branch
+/// boundaries).
+pub(crate) fn one_branch(shared: Branches) -> bool {
+    shared != 0
 }
 
 #[cfg(test)]
@@ -378,7 +397,7 @@ mod tests {
         let (_, a) = stretch(Stretch::Inner, r(2, 4), [1, 1]).unwrap();
         let (_, b) = stretch(Stretch::Inner, r(4, 2), [1, 1]).unwrap();
         let (_, c) = stretch(Stretch::Inner, r(3, 3), [1, 1]).unwrap();
-        assert!(!one_branch([a, b]));
-        assert!(one_branch([a, c]) && one_branch([b, c]));
+        assert!(!one_branch(ANY_BRANCH & a & b));
+        assert!(one_branch(ANY_BRANCH & a & c) && one_branch(ANY_BRANCH & b & c));
     }
 }

@@ -13,6 +13,9 @@ use skin_model::{
 
 pub const MS: i64 = 1_000;
 
+/// A notes' end past every frame the tests build: timer 143 stays off.
+pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
+
 const GAUGES: [GaugeDesc; 1] = [GaugeDesc {
     start: GaugeValue(20 * GaugeValue::PERCENT),
     max: GaugeValue::FULL,
@@ -70,6 +73,8 @@ pub struct Drawn {
     pub batch: QuadBatch,
     /// The hi-speed and covers each frame shows.
     pub view: LaneView,
+    /// The render target's size each frame draws at.
+    pub target: [u32; 2],
 }
 
 /// A chart with `notes` notes on lane 1, one every 10 ms from 1 s.
@@ -99,6 +104,7 @@ impl Drawn {
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
             ln_default: rules::LnMode::Ln,
+            last_note_end: NO_END,
         };
         let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
@@ -118,6 +124,7 @@ impl Drawn {
                 cover: 0,
                 lift: 0,
             },
+            target: [1_920, 1_080],
         }
     }
 
@@ -167,9 +174,10 @@ impl Drawn {
             gauge: 0,
             effects,
             complete: false,
-            target: [1_920, 1_080],
+            target: self.target,
             layout: &Layout::AUTHOR,
             lanes: self.view,
+            playing: true,
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch);
