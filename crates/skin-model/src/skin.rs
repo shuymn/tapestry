@@ -396,8 +396,8 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
     Ok(())
 }
 
-/// The quads one frame of `source`'s element can push at worst, the
-/// lanes' aside (an image's 1 included).
+/// The widget quads one frame of `source`'s element can push at worst:
+/// 0 for an image or the lanes, which `quad_capacity` counts apart.
 fn worst(source: Source, w: &WidgetDefs) -> u32 {
     let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
     match source {
@@ -506,6 +506,11 @@ impl Skin {
     /// number's value or its judge parts' visibilities; and the widgets'
     /// quads within [`MAX_WIDGET_QUADS`]. So the per-frame cost is known
     /// here. Then each region's box is computed from its elements' keys.
+    ///
+    /// The widget checks past the table counts and the key count cover the
+    /// definitions an element references; an unreferenced definition is
+    /// not checked and never drawn, its missing images and timers falling
+    /// back to nothing and off.
     ///
     /// These counts check what was built. A front end (an importer, the
     /// authored format's loader) enforces the same element, widget, `when`
