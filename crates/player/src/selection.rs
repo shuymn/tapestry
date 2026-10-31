@@ -80,6 +80,23 @@ impl Selection {
                 log::warn!("{line}");
             }
         }
+        self.refresh_bests();
+        self.dirty = true;
+    }
+
+    /// Reads the bests of the chosen preset again, for the list.
+    fn refresh_bests(&mut self) {
+        let Some(preset) = self.screen.bests_preset() else {
+            return;
+        };
+        match self.shelf.bests(&replay::preset_hash(preset)) {
+            Ok(bests) => self.screen.set_bests(bests),
+            Err(e) => {
+                let line = format!("library: the bests cannot be read: {}", Chain(&e));
+                eprintln!("{line}");
+                log::warn!("{line}");
+            }
+        }
         self.dirty = true;
     }
 
@@ -175,7 +192,8 @@ impl Selection {
     fn show(&mut self, render: &RenderLink, status: Option<&str>) {
         if self.dirty {
             self.dirty = false;
-            let page = self.screen.page(status.unwrap_or(self.shelf.status()));
+            let shelf = self.shelf.status();
+            let page = self.screen.page(status.unwrap_or(&shelf));
             render.send(RenderMsg::Menu(Box::new(page)));
         }
     }
@@ -413,6 +431,7 @@ impl PlayerRig<'_> {
         let controls = self.controls;
         let render = &self.render;
         let Selection { shelf, screen, .. } = sel;
+        let began = Instant::now();
         let paused = shelf.wait_paused(
             crate::shelf::PAUSE_SLICE,
             // Closing the window or the quit key ends the wait, and the
@@ -427,7 +446,12 @@ impl PlayerRig<'_> {
         );
         match paused {
             crate::shelf::Paused::Acknowledged => {
-                println!("library: the scan paused before the countdown");
+                let line = format!(
+                    "library: the scan paused before the countdown in {} ms",
+                    began.elapsed().as_millis()
+                );
+                println!("{line}");
+                log::info!("{line}");
             }
             crate::shelf::Paused::Idle => println!("library: no scan before the countdown"),
             crate::shelf::Paused::Cancelled => {
@@ -566,6 +590,10 @@ impl AppRig for PlayerRig<'_> {
         });
         if let Some(sel) = &mut self.selection {
             sel.presets(name, error, shelf.is_ok());
+            // The list shows the bests of the chosen preset.
+            sel.screen
+                .set_bests_preset(shelf.ok().map(|s| s.chosen().clone()));
+            sel.refresh_bests();
             sel.show(&self.render, None);
         }
     }
@@ -618,7 +646,7 @@ mod tests {
             std::fs::write(charts.join(format!("{file}.bms")), text).unwrap();
         }
         let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
-        let shelf = Shelf::new(library, vec![charts.clone()], Duration::from_secs(60));
+        let shelf = Shelf::new(library, vec![charts.clone()], Duration::from_secs(60), None);
         let mut sel = Selection {
             shelf,
             screen: SelectScreen::new(vec![charts]),
@@ -858,5 +886,54 @@ mod tests {
         assert!(sel.drain(&mut Pad::default()).is_none());
         assert!(!sel.search_pending);
         assert_eq!(sel.screen.listed(), 1);
+    }
+
+    /// A play counted while the chart played shows on the select screen
+    /// once selection is entered again, which searches the list and reads
+    /// the bests of the chosen preset anew.
+    #[test]
+    fn bests_refresh_on_entering_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let preset = rules::tapestry();
+        sel.screen.set_bests_preset(Some(preset.clone()));
+        sel.refresh();
+        let line = |sel: &Selection| {
+            sel.screen
+                .page("")
+                .lines
+                .into_iter()
+                .find(|l| l.text.ends_with(" A  / Z"))
+                .unwrap()
+                .text
+        };
+        assert!(line(&sel).starts_with(&format!("{} ☆", " ".repeat(4 + 17))));
+        let chart = sel.screen.selected().unwrap().sha256;
+        let c = library::Contribution {
+            key: library::Key {
+                preset_sha256: replay::preset_hash(&preset),
+                ln_mode: library::LN_MODE,
+                chart_sha256: chart,
+            },
+            id: library::PlayId {
+                path: "ab/1-1.tprl".to_owned(),
+                body_sha256: [7; 32],
+                size: 1,
+                mtime_ns: 1,
+            },
+            best: Some(library::Best {
+                ex: 2,
+                bp: 0,
+                cleared: vec![0b1],
+                full_combo: false,
+            }),
+            ineligible: None,
+        };
+        sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
+        // Unchanged until selection is entered.
+        assert!(line(&sel).starts_with(&format!("{} ☆", " ".repeat(4 + 17))));
+        sel.refresh();
+        let lamp = preset.gauges[0].id.to_uppercase();
+        assert_eq!(line(&sel), format!("    {lamp:11}     2 ☆-   A  / Z"));
     }
 }

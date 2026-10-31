@@ -393,11 +393,17 @@ pub fn lines(
         set(
             9,
             format!(
-                "EX SCORE {}  MAX COMBO {}  BP {}",
-                t.ex_score, t.max_combo, t.bp
+                "EX SCORE {}  MAX COMBO {}  BP {}  EMPTY POOR {}",
+                t.ex_score, t.max_combo, t.bp, t.empty_poor
             ),
         );
-        set(10, format!("EMPTY POOR {}", t.empty_poor));
+    }
+    // The play's best, under the preset it was played with, whatever is
+    // viewed.
+    if let Some(best) = &report.best {
+        set(10, crate::bests::best_line(best));
+    }
+    if let ViewStatus::Ready(s) = status {
         let preset = viewed.and_then(|e| e.preset.as_deref());
         let width = (COLUMNS - 2) / 2;
         for (row, pair) in gauge_cells(s, preset, width).chunks(2).enumerate() {

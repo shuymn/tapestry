@@ -21,6 +21,7 @@ compile_error!("player is Windows-only");
 mod alloc_count;
 mod args;
 mod audio_side;
+mod bests;
 mod controls;
 #[cfg(feature = "dev-tools")]
 mod dev;
@@ -1013,6 +1014,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     let (library, opened) = shelf::open(&root)?;
     println!("{opened}");
     log::info!("{opened}");
+    let bests = library.bests_state();
+    println!("{bests}");
+    log::info!("{bests}");
     let settings = settings(&root)?;
     let autoplay = matches!(s.input, PlayInput::Autoplay);
     let roots: Vec<PathBuf> = settings
@@ -1031,7 +1035,16 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     );
     #[cfg(not(feature = "dev-tools"))]
     let rescan = shelf::RESCAN_AFTER;
-    let shelf = shelf::Shelf::new(library, roots.clone(), rescan);
+    let shelf = shelf::Shelf::new(library, roots.clone(), rescan, Some(root.records()));
+    let best_writer = match shelf.best_writer() {
+        Ok(w) => Some(w),
+        Err(e) => {
+            let line = format!("library: plays are not counted live: {}", game::Chain(&e));
+            eprintln!("{line}");
+            log::warn!("{line}");
+            None
+        }
+    };
     let controls = controls(&settings, clock);
     controls.quit_leaves();
     let waker = Waker::new().context("input")?;
@@ -1227,10 +1240,24 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         )
     } else {
         let records = root.clone();
+        // Each saved play is counted into the bests as its result shows;
+        // without the writer, plays are saved and the next launch's
+        // catch-up counts them.
+        let bests = best_writer.map(|w| Arc::new(std::sync::Mutex::new(w)));
         (
             ReceiveMethod::RawInput,
             None,
-            Box::new(move |s: &Settings| Parts::standard(&records, &s.player)),
+            Box::new(move |s: &Settings| {
+                let mut parts = Parts::standard(&records, &s.player);
+                if let Some(bests) = &bests {
+                    parts.records = Some(Box::new(bests::BestsRecords {
+                        local: game::LocalRecords::new(records.records()),
+                        dir: records.records(),
+                        bests: Arc::clone(bests),
+                    }));
+                }
+                parts
+            }),
         )
     };
     let mut app = game::App::new(

@@ -12,7 +12,7 @@
 //! ([`event_key`]). Everything here runs on menus, where allocation is
 //! allowed.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -20,7 +20,8 @@ use std::sync::{Mutex, PoisonError};
 use eval::ControlId;
 use input::hid::{HidProduct, is_axis};
 use input::{MenuAction, MenuBindings, MenuEvent};
-use library::{ChartEntry, Search, Sort};
+use library::{ChartEntry, Score, Search, Sort};
+use rules::RulePreset;
 
 use crate::menu_screen::{LineStyle, MenuLine, MenuPage, PAGE_LINES};
 
@@ -257,6 +258,10 @@ pub struct SelectScreen {
     preset_error: Option<String>,
     /// The library roots, for folder names.
     roots: Vec<PathBuf>,
+    /// The chosen preset, whose bests the list shows.
+    bests_preset: Option<RulePreset>,
+    /// Its scores, by chart SHA-256.
+    bests: HashMap<[u8; 32], Score>,
 }
 
 impl SelectScreen {
@@ -359,6 +364,24 @@ impl SelectScreen {
     pub fn set_preset(&mut self, name: String, error: Option<String>) {
         self.preset = name;
         self.preset_error = error;
+    }
+
+    /// The preset whose bests the list shows; `None` shows none.
+    pub fn set_bests_preset(&mut self, preset: Option<RulePreset>) {
+        if preset.is_none() {
+            self.bests.clear();
+        }
+        self.bests_preset = preset;
+    }
+
+    /// The preset whose bests the list shows.
+    pub const fn bests_preset(&self) -> Option<&RulePreset> {
+        self.bests_preset.as_ref()
+    }
+
+    /// The scores of [`bests_preset`](Self::bests_preset), by chart.
+    pub fn set_bests(&mut self, bests: HashMap<[u8; 32], Score>) {
+        self.bests = bests;
     }
 
     /// Acts on one input.
@@ -524,8 +547,9 @@ impl SelectScreen {
         format!("▼ {}", under.display())
     }
 
-    /// Chart `i`'s line: level, title, subtitle and artist, or its file
-    /// name when it has no title.
+    /// Chart `i`'s line: its lamp and best EX under the chosen preset
+    /// ([`crate::bests::chart_cell`]), level, title, subtitle and artist,
+    /// or its file name when it has no title.
     fn chart_line(&self, i: usize) -> String {
         let Some(e) = self.entries.get(i) else {
             return String::new();
@@ -536,7 +560,14 @@ impl SelectScreen {
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
         });
-        let mut text = format!("    ☆{:<3} {title}", h.playlevel.as_deref().unwrap_or("-"));
+        let cell = self.bests_preset.as_ref().map_or_else(
+            || " ".repeat(crate::bests::LAMP_COLUMNS + 6),
+            |p| crate::bests::chart_cell(self.bests.get(&e.sha256), p),
+        );
+        let mut text = format!(
+            "    {cell} ☆{:<3} {title}",
+            h.playlevel.as_deref().unwrap_or("-")
+        );
         if let Some(sub) = &h.subtitle {
             text.push(' ');
             text.push_str(sub);
@@ -822,5 +853,58 @@ mod tests {
         assert_eq!(s.selected().unwrap().path, Path::new(r"C:\charts\a\0.bms"));
         assert!(s.select_path(Path::new(r"C:\charts\a\0.bms")));
         assert!(!s.select_path(Path::new(r"C:\charts\a\9.bms")));
+    }
+
+    /// Each chart line starts with the chart's lamp and best EX under the
+    /// chosen preset: blank for a chart never played under it, `-` for one
+    /// played with no best (a `#RANDOM` chart).
+    #[test]
+    fn chart_line_shows_lamp_and_ex_of_the_chosen_preset() {
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        let mut scored = entry(r"C:\charts\a\1.bms", "あ");
+        scored.sha256 = [1; 32];
+        scored.header.playlevel = Some("12".to_owned());
+        let mut random = entry(r"C:\charts\a\2.bms", "い");
+        random.sha256 = [2; 32];
+        let unplayed = entry(r"C:\charts\a\3.bms", "う");
+        s.set_entries(vec![scored, random, unplayed]);
+        let preset = rules::tapestry();
+        s.set_bests_preset(Some(preset.clone()));
+        let hard = preset
+            .gauges
+            .iter()
+            .position(|g| g.id == "survival")
+            .unwrap();
+        s.set_bests(std::collections::HashMap::from([
+            (
+                [1; 32],
+                library::Score {
+                    plays: 3,
+                    best: Some(library::Best {
+                        ex: 1234,
+                        bp: 5,
+                        cleared: vec![1 << hard],
+                        full_combo: false,
+                    }),
+                },
+            ),
+            (
+                [2; 32],
+                library::Score {
+                    plays: 2,
+                    best: None,
+                },
+            ),
+        ]));
+        let page = s.page("");
+        let lines: Vec<&str> = page.lines[4..7].iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "    SURVIVAL     1234 ☆12  あ",
+                "    -               - ☆-   い",
+                "                      ☆-   う",
+            ]
+        );
     }
 }

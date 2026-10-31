@@ -18,12 +18,17 @@
 //! - **Priority.** The scan thread runs in background mode (lowered CPU and
 //!   I/O priority), set by its start hook.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use game::{Chain, DataRoot};
-use library::{ChartEntry, Library, LibraryError, Opened, Scan, ScanOptions, ScanReport, Search};
+use library::{
+    BestWriter, ChartEntry, Library, LibraryError, Opened, Scan, ScanOptions, ScanReport, Score,
+    Search,
+};
 
 /// How long the last pass is over before the next starts, at the select
 /// screen.
@@ -83,12 +88,25 @@ pub fn open(root: &DataRoot) -> Result<(Library, Opened), OpenError> {
         root: root.path().to_owned(),
         source,
     })?;
-    Library::open(&database(root)).map_err(|e| match e {
+    let (library, opened) = Library::open(&database(root)).map_err(|e| match e {
         LibraryError::AlreadyOpen { .. } => OpenError::Running {
             root: root.path().to_owned(),
         },
         e => OpenError::Library(e),
-    })
+    })?;
+    // Each launch catches the bests up with the records, so plays saved
+    // without a library (`tapestry play`) are counted (design.md
+    // "Personal Bests"). A request that cannot be written is held by the
+    // library for its next pass.
+    if let Err(e) = library.request_bests_pass() {
+        let line = format!(
+            "library: a bests catch-up cannot be requested: {}",
+            Chain(&e)
+        );
+        eprintln!("{line}");
+        log::warn!("{line}");
+    }
+    Ok((library, opened))
 }
 
 /// What a countdown's wait for the pause found.
@@ -121,10 +139,18 @@ pub struct Shelf {
 }
 
 impl Shelf {
-    /// Keeps `library` current over `roots`, starting the first pass.
-    pub fn new(library: Library, roots: Vec<PathBuf>, rescan_after: Duration) -> Self {
+    /// Keeps `library` current over `roots`, and its bests over the
+    /// records in `records`, if given, starting the first pass.
+    pub fn new(
+        library: Library,
+        roots: Vec<PathBuf>,
+        rescan_after: Duration,
+        records: Option<PathBuf>,
+    ) -> Self {
         let options = ScanOptions {
             on_thread_start: Some(Arc::new(background_mode)),
+            records,
+            ..ScanOptions::default()
         };
         Self::with_options(library, roots, rescan_after, options)
     }
@@ -151,13 +177,38 @@ impl Shelf {
         shelf
     }
 
-    /// What the library is doing, for the select screen.
-    pub fn status(&self) -> &str {
-        if self.scan.is_some() {
-            "スキャン中"
-        } else {
-            &self.status
+    /// What the library is doing, for the select screen: scanning, or
+    /// rebuilding the bests with the plays counted so far.
+    pub fn status(&self) -> Cow<'_, str> {
+        match &self.scan {
+            Some(scan) => {
+                let bests = scan.report().bests;
+                if bests.running {
+                    Cow::Owned(format!("ベスト再構築中 {}", bests.counted))
+                } else {
+                    Cow::Borrowed("スキャン中")
+                }
+            }
+            None => Cow::Borrowed(&self.status),
         }
+    }
+
+    /// Every chart's score under the preset of SHA-256 `preset`.
+    ///
+    /// # Errors
+    ///
+    /// Why the database refused the query.
+    pub fn bests(&self, preset: &[u8; 32]) -> Result<HashMap<[u8; 32], Score>, LibraryError> {
+        self.library.bests(preset, library::LN_MODE)
+    }
+
+    /// The connection that counts live plays.
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be opened.
+    pub fn best_writer(&self) -> Result<BestWriter, LibraryError> {
+        self.library.best_writer()
     }
 
     /// The charts `search` finds.
@@ -196,7 +247,8 @@ impl Shelf {
         if let Some(scan) = &self.scan {
             if !scan.wait_finished(Duration::ZERO) {
                 let r = scan.report();
-                let batches = (r.read + r.removed) / library::BATCH as u64;
+                // Chart batches, and the bests phase's commits.
+                let batches = (r.read + r.removed) / library::BATCH as u64 + r.bests.commits;
                 let changed = batches != self.seen;
                 self.seen = batches;
                 return changed;
@@ -224,6 +276,28 @@ impl Shelf {
                     let line = format!(
                         "library: {} charts found, {} read, {} unchanged, {} skipped, {} removed",
                         r.found, r.read, r.unchanged, r.skipped, r.removed
+                    );
+                    println!("{line}");
+                    log::info!("{line}");
+                }
+                let b = r.bests;
+                if b.catch_up || b.retried > 0 {
+                    let refused = b.refused.to_string();
+                    let line = format!(
+                        "library: bests: {} plays counted, {} counted before, {} unchanged, \
+                         {} refused before, {} retried, {} refused ({}), listing {}",
+                        b.counted,
+                        b.already,
+                        b.skipped_unchanged,
+                        b.skipped_refused,
+                        b.retried,
+                        b.refused.total(),
+                        if refused.is_empty() { "none" } else { &refused },
+                        if b.enumeration_complete || !b.catch_up {
+                            "complete"
+                        } else {
+                            "incomplete"
+                        },
                     );
                     println!("{line}");
                     log::info!("{line}");
@@ -406,7 +480,12 @@ mod tests {
         let charts = dir.path().join("charts");
         chart(&charts, "refused.bms");
         let (library, _) = open(&root).unwrap();
-        let mut shelf = Shelf::new(library, vec![charts.clone()], Duration::from_millis(20));
+        let mut shelf = Shelf::new(
+            library,
+            vec![charts.clone()],
+            Duration::from_millis(20),
+            None,
+        );
         pass_ends(&mut shelf);
         assert!(holds(&shelf, "refused.bms"));
         // A chart is chosen.
@@ -442,7 +521,7 @@ mod tests {
             chart(&charts.join(format!("f{}", k / 50)), &format!("{k}.bms"));
         }
         let (library, _) = open(&root).unwrap();
-        let mut shelf = Shelf::new(library, vec![charts], Duration::from_secs(60));
+        let mut shelf = Shelf::new(library, vec![charts], Duration::from_secs(60), None);
         assert!(shelf.has_scan());
         assert_eq!(wait(&mut shelf), Paused::Acknowledged);
         assert!(shelf.paused());
@@ -454,6 +533,33 @@ mod tests {
         // A second wait, as a retry's, is acknowledged again.
         assert_ne!(wait(&mut shelf), Paused::Cancelled);
         shelf.release();
+    }
+
+    /// Each launch's opening requests a bests catch-up, which the first
+    /// pass completes: a play saved by a run without a library is counted
+    /// at the next launch.
+    #[test]
+    fn each_launch_requests_a_bests_catch_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().join("data"));
+        let charts = dir.path().join("charts");
+        chart(&charts, "a.bms");
+        let launch = |root: &DataRoot| {
+            let (library, _) = open(root).unwrap();
+            assert!(library.bests_pending().unwrap(), "no catch-up requested");
+            let mut shelf = Shelf::new(
+                library,
+                vec![charts.clone()],
+                Duration::from_secs(60),
+                Some(root.records()),
+            );
+            pass_ends(&mut shelf);
+            assert!(!shelf.library.bests_pending().unwrap());
+        };
+        launch(&root);
+        // The second launch finds the database current, its last catch-up
+        // complete.
+        launch(&root);
     }
 
     /// The library lock refuses a second opening of the data root with an
@@ -487,6 +593,7 @@ mod tests {
                     open = changed.wait(open).unwrap();
                 }
             })),
+            ..library::ScanOptions::default()
         };
         let shelf = Shelf::with_options(library, vec![charts], Duration::from_secs(60), options);
         (shelf, gate)
