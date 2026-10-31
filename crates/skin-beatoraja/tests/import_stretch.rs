@@ -136,10 +136,11 @@ fn whole(stretch: i32, keys: &str) -> String {
 
 #[test]
 fn no_resize_keeps_its_texels_on_any_target() {
-    // 200×100 at 1280×720 is 300×150 on the 1920×1080 canvas, 600×300
-    // on a 3840×2160 target: the 64×64 frame stays 64 target pixels,
-    // centred (`skin/StretchType.java:94-98`).
+    // 200×100 at 1280×720 is 300×150 on the 1920×1080 canvas, 200×100
+    // on a 1280×720 target and 600×300 on a 3840×2160 one: the 64×64
+    // frame stays 64 target pixels, centred (`skin/StretchType.java:94-98`).
     let body = whole(9, r#"{"x": 0, "y": 0, "w": 200, "h": 100}"#);
+    assert_eq!(target_rects(&body, [1_280, 720], 0), [[68, 638, 64, 64]]);
     assert_eq!(target_rects(&body, [1_920, 1_080], 0), [[118, 973, 64, 64]]);
     assert_eq!(
         target_rects(&body, [3_840, 2_160], 0),
@@ -159,17 +160,19 @@ fn no_resize_keeps_its_texels_on_any_target() {
 
 #[test]
 fn no_expanding_shrinks_only_below_its_texels() {
-    // Room for the frame: 64 target pixels on either target
+    // Room for the frame: 64 target pixels on every target
     // (`skin/StretchType.java:85-93`).
     let body = whole(8, r#"{"x": 0, "y": 0, "w": 200, "h": 100}"#);
+    assert_eq!(target_rects(&body, [1_280, 720], 0), [[68, 638, 64, 64]]);
     assert_eq!(target_rects(&body, [1_920, 1_080], 0), [[118, 973, 64, 64]]);
     assert_eq!(
         target_rects(&body, [3_840, 2_160], 0),
         [[268, 1_978, 64, 64]]
     );
-    // 40×20 is 60×30 on the canvas: 30 target pixels at 1920×1080, and
-    // on 3840×2160 120×60, so 60.
+    // 40×20 is 60×30 on the canvas: 20 target pixels at 1280×720, 30 at
+    // 1920×1080, and on 3840×2160 120×60, so 60.
     let body = whole(8, r#"{"x": 0, "y": 0, "w": 40, "h": 20}"#);
+    assert_eq!(target_rects(&body, [1_280, 720], 0), [[10, 700, 20, 20]]);
     assert_eq!(
         target_rects(&body, [1_920, 1_080], 0),
         [[15, 1_050, 30, 30]]
