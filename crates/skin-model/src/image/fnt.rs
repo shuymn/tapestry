@@ -44,6 +44,9 @@ const MAX_BMP: u32 = 0xFFFF;
 /// The glyphs whose height is the cap height, in order
 /// (`BitmapFont$BitmapFontData` `capChars`, gdx 1.9.9 `load`:643-658).
 const CAP_CHARS: &[u8] = b"MNBDCEFKAGHIJLOPQRSTUVWXYZ";
+/// The glyphs the x-height is probed with, in order
+/// (`BitmapFont$BitmapFontData` `xChars`, gdx 1.9.9).
+const X_CHARS: &[u8] = b"xeaonsrcumvwz";
 /// The glyphs whose raw y offset represents the font, in order
 /// (`SkinTextBitmap.java:869` at `0.8.9`).
 const ANCHORS: [u32; 13] = [
@@ -263,11 +266,15 @@ fn unsigned16(v: i32) -> u16 {
 
 /// Line 1 without its quoted `face` value, which may hold any bytes.
 fn without_face(line: &[u8]) -> Vec<u8> {
-    let key = b"face=\"";
-    let Some(start) = line.windows(key.len()).position(|w| w == key) else {
+    let key = b" face=\"";
+    let Some(start) = line
+        .windows(key.len())
+        .position(|w| w == key)
+        .map(|at| at + 1)
+    else {
         return line.to_vec();
     };
-    let open = start + key.len();
+    let open = start + key.len() - 1;
     let Some(close) = line
         .get(open..)
         .and_then(|rest| rest.iter().position(|&b| b == b'"'))
@@ -344,7 +351,11 @@ impl<'a> Iterator for Lines<'a> {
             None => (rest, None),
         };
         self.rest = next;
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // Only a carriage return before a line feed ends a line.
+        let line = match next {
+            Some(_) => line.strip_suffix(b"\r").unwrap_or(line),
+            None => line,
+        };
         let line = if line.contains(&b'\r') {
             Err(err(self.no, FntErrorKind::LoneCr))
         } else {
@@ -561,6 +572,10 @@ impl FntFile {
                 chars.push(no, line, pages, limits)?;
                 char_lines += 1;
             } else if line.starts_with("chars ") {
+                // One declaration; a second is not allowed.
+                if declared_chars.is_some() {
+                    return Err(err(no, FntErrorKind::Unexpected));
+                }
                 declared_chars = Some(count(line, no, "chars")?);
             } else if line.starts_with("kernings ") {
                 kerning_header = Some(count(line, no, "kernings")?);
@@ -668,6 +683,18 @@ impl FntFile {
             }
             g.src[2] = unsigned16(w);
             g.xoff = narrow16(-pad_left);
+        }
+        // Without any of `X_CHARS`, the x-height probe takes the first
+        // basic-plane glyph drawn with a size, which must exist (gdx
+        // 1.9.9 `load`:635-641, `getFirstGlyph`:748-755); the missing
+        // glyph is not in that table, and a space with a height counts.
+        if !X_CHARS.iter().any(|&c| chars.get(u32::from(c)).is_some())
+            && !chars
+                .glyphs
+                .iter()
+                .any(|(g, _)| g.code <= MAX_BMP && g.src[2] != 0 && g.src[3] != 0)
+        {
+            return Err(err(0, FntErrorKind::NoGlyphs));
         }
 
         // Cap height and ascent (gdx 1.9.9 `load`:643-660).
@@ -1147,5 +1174,48 @@ mod tests {
                 .kind,
             FntErrorKind::PageName
         );
+    }
+
+    #[test]
+    fn a_font_needs_a_drawn_basic_plane_glyph_without_an_x_char() {
+        let space = ch(32, [0, 0], [0, 0, 4]);
+        let missing = ch(0, [3, 3], [0, 0, 4]);
+        let emoji = ch(0x1_F600, [5, 5], [0, 0, 7]);
+        for chars in [[space.clone(), missing.clone()], [space.clone(), emoji]] {
+            assert_eq!(kind(&font(&chars, "")), FntErrorKind::NoGlyphs);
+        }
+        // An `x` char, even an empty one, is what the probe takes.
+        let x = ch(120, [0, 0], [0, 0, 4]);
+        assert!(parse(&font(&[space.clone(), missing, x], "")).is_ok());
+        // A space with a height is drawn with a size once it has a width.
+        assert!(parse(&font(&[ch(32, [0, 3], [0, 0, 4])], "")).is_ok());
+    }
+
+    #[test]
+    fn a_negative_synthesised_space_is_refused() {
+        let l = ch(108, [2, 9], [0, 0, -5]);
+        assert_eq!(kind(&font(&[l], "")), FntErrorKind::Value("width"));
+    }
+
+    #[test]
+    fn the_face_exception_needs_its_own_attribute() {
+        let mut bytes = b"info preface=\"\xFF\" size=10 padding=0,0,0,0\n".to_vec();
+        bytes.extend_from_slice(font(&[a()], "").split_once('\n').unwrap().1.as_bytes());
+        assert_eq!(
+            FntFile::parse(&bytes, "", FntLimits::FILE).unwrap_err(),
+            err(1, FntErrorKind::Encoding)
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_ends_a_line_only_before_a_line_feed() {
+        let s = format!("{}\r", font(&[a()], "").trim_end_matches('\n'));
+        assert_eq!(parse(&s).unwrap_err(), err(5, FntErrorKind::LoneCr));
+    }
+
+    #[test]
+    fn the_char_count_is_declared_once() {
+        let s = font(&[a()], "").replacen("chars count=1", "chars count=1\nchars count=1", 1);
+        assert_eq!(parse(&s).unwrap_err(), err(5, FntErrorKind::Unexpected));
     }
 }
