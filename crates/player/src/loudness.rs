@@ -34,21 +34,24 @@ use bms_model::Chart;
 use game::Chain;
 use library::{Library, LoudnessKey, LoudnessRow};
 
-/// Where the job's thread is, for the hook a test holds it at.
+/// Where the job's thread is, for its hook: its start in the game (where
+/// it enters background mode), and the barriers tests hold it at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Point {
     /// The thread started, before anything else.
     Start,
     /// Before the analysis is built (after the first pause check).
+    #[cfg(test)]
     Construct,
     /// Before each block's step (after its pause check).
+    #[cfg(test)]
     Step,
     /// Before the result is published.
+    #[cfg(test)]
     Publish,
 }
 
-/// The hook the job's thread calls at each [`Point`]: background mode at
-/// its start in the game, barriers in tests.
+/// The hook the job's thread calls at each [`Point`].
 pub type Hook = Arc<dyn Fn(Point) + Send + Sync>;
 
 /// Why an analysis gave no measurement.
@@ -76,6 +79,8 @@ struct State {
     finished: bool,
     /// What the analysis came to, once it did.
     result: Option<Result<Measurement, JobError>>,
+    /// The time spent analyzing, pauses excluded.
+    busy: Duration,
 }
 
 impl State {
@@ -148,7 +153,6 @@ pub struct Job {
     key: LoudnessKey,
     /// The chart's file name, for the log.
     name: String,
-    started: Instant,
 }
 
 impl Job {
@@ -183,9 +187,13 @@ impl Job {
                 let ending = ending;
                 hook(Point::Start);
                 let result = analyze(&ending.0, &chart, bank, &*hook);
-                if let Some(result) = result {
+                if let Some((result, busy)) = result {
+                    #[cfg(test)]
                     hook(Point::Publish);
-                    ending.0.update(|s| s.result = Some(result));
+                    ending.0.update(|s| {
+                        s.result = Some(result);
+                        s.busy = busy;
+                    });
                 }
             })?;
         Ok(Self {
@@ -193,7 +201,6 @@ impl Job {
             thread: Some(thread),
             key,
             name,
-            started: Instant::now(),
         })
     }
 
@@ -238,9 +245,10 @@ impl Job {
         }
     }
 
-    /// How long ago it started.
-    pub fn elapsed(&self) -> Duration {
-        self.started.elapsed()
+    /// The time the analysis spent working, pauses and the wait for its
+    /// collection excluded.
+    pub fn busy(&self) -> Duration {
+        self.shared.lock().busy
     }
 
     fn wait_for(&self, timeout: Duration, done: impl Fn(&State) -> bool) -> bool {
@@ -292,31 +300,40 @@ impl Drop for Job {
     }
 }
 
-/// The job's work: `None` when it was stopped.
+/// The job's work, with the time spent on it outside pauses: `None` when
+/// it was stopped.
+#[cfg_attr(not(test), expect(unused_variables, reason = "the hook's test points"))]
 fn analyze(
     shared: &Shared,
     chart: &Chart,
     bank: Arc<SoundBank>,
     hook: &dyn Fn(Point),
-) -> Option<Result<Measurement, JobError>> {
+) -> Option<(Result<Measurement, JobError>, Duration)> {
     if !shared.checkpoint() {
         return None;
     }
+    #[cfg(test)]
     hook(Point::Construct);
+    let began = Instant::now();
     let mut analysis = match Analysis::new(bank) {
         Ok(a) => a,
-        Err(e) => return Some(Err(JobError::Analysis(e))),
+        Err(e) => return Some((Err(JobError::Analysis(e)), began.elapsed())),
     };
     let mut events = game::schedule_iter(chart);
+    let mut busy = began.elapsed();
     loop {
         if !shared.checkpoint() {
             return None;
         }
+        #[cfg(test)]
         hook(Point::Step);
-        match analysis.step(&mut events) {
+        let began = Instant::now();
+        let step = analysis.step(&mut events);
+        busy += began.elapsed();
+        match step {
             Ok(Step::More) => {}
-            Ok(Step::Done(m)) => return Some(Ok(m)),
-            Err(e) => return Some(Err(JobError::Analysis(e))),
+            Ok(Step::Done(m)) => return Some((Ok(m), busy)),
+            Err(e) => return Some((Err(JobError::Analysis(e)), busy)),
         }
     }
 }
@@ -425,7 +442,7 @@ impl Loudness {
                 log_line(
                     &format!(
                         "loudness: {name} analyzed in {} ms: {} LUFS{}, {:.2} dBTP; gain {:.2} dB from the next play",
-                        job.elapsed().as_millis(),
+                        job.busy().as_millis(),
                         m.integrated
                             .map_or_else(|| "-".to_owned(), |l| format!("{l:.2}")),
                         if m.over_range { " (over range)" } else { "" },
@@ -523,21 +540,23 @@ impl Loudness {
         }
     }
 
+    /// Stores every measurement in memory; one the database refuses is
+    /// logged and kept.
     fn flush(&mut self, library: &mut Library) {
-        let mut failed = HashMap::new();
-        for (key, row) in self.measured.drain() {
-            if let Err(e) = library.store_loudness(&key, &row) {
-                log_line(
-                    &format!(
-                        "loudness: the measurement cannot be stored: {}; it is kept for this run",
-                        Chain(&e)
-                    ),
-                    true,
-                );
-                failed.insert(key, row);
-            }
-        }
-        self.measured = failed;
+        self.measured
+            .retain(|key, row| match library.store_loudness(key, row) {
+                Ok(()) => false,
+                Err(e) => {
+                    log_line(
+                        &format!(
+                            "loudness: the measurement cannot be stored: {}; it is kept for this run",
+                            Chain(&e)
+                        ),
+                        true,
+                    );
+                    true
+                }
+            });
     }
 
     /// At the end of a run: a finished measurement is stored if the scan
@@ -900,8 +919,9 @@ mod tests {
         let mut lib = library(dir.path());
         let songs = dir.path().join("song");
         write_sound(&songs, &square(1.0, 3_000));
+        // One second at 8 kHz is two blocks: the second fails.
         let gate = Gate::holding(&[]);
-        gate.panic_at(2);
+        gate.panic_at(1);
         let mut loudness = Loudness::new(gate.hook());
         let c = chart(&songs, 1);
         let b = bank(&c);
@@ -935,7 +955,8 @@ mod tests {
         let key = super::key(&c, &b).unwrap();
 
         // Paused from the start: nothing is built until the release.
-        let gate = Gate::holding(&[Point::Step]);
+        let gate = Gate::holding(&[Point::Step, Point::Publish]);
+        let begun = Instant::now();
         let job = Job::start(
             Arc::clone(&c),
             Arc::clone(&b),
@@ -964,21 +985,33 @@ mod tests {
         assert!(!job.wait_paused(Duration::from_millis(50)));
         gate.allow(Point::Step, 1);
         assert!(job.wait_paused(WATCHDOG));
-        // Released to its end: a pause asked during the last blocks is
-        // answered by the end itself.
+        // Released to its last block (two seconds at 8 kHz: four blocks),
+        // held there a while, and a pause asked: the block ends the
+        // analysis, and only its publication answers the pause.
         job.release();
+        gate.allow(Point::Step, 1);
+        gate.reached(Point::Step, 4);
+        let held = Instant::now();
         job.request_pause();
-        gate.open();
-        let begun = Instant::now();
-        while !job.finished() {
-            assert!(job.wait_paused(WATCHDOG));
-            job.release();
-            assert!(begun.elapsed() < WATCHDOG);
-            job.request_pause();
-        }
-        assert!(job.wait_paused(Duration::ZERO));
+        std::thread::sleep(Duration::from_millis(200));
+        let held = held.elapsed();
+        gate.allow(Point::Step, 1);
+        gate.reached(Point::Publish, 1);
+        assert!(!job.wait_paused(Duration::from_millis(50)));
+        assert!(!job.finished());
+        gate.allow(Point::Publish, 1);
+        assert!(job.wait_paused(WATCHDOG));
+        assert!(job.finished());
+        let wall = begun.elapsed();
+        assert_eq!(gate.count(Point::Step), 4);
         assert!(matches!(job.take_result(), Some(Ok(_))));
         assert!(job.take_result().is_none(), "taken twice");
+        // The time it reports excludes its pauses and holds.
+        assert!(
+            job.busy() + held <= wall,
+            "{:?} {held:?} {wall:?}",
+            job.busy()
+        );
 
         // A pause asked during a block that fails: answered by the end.
         let gate = Gate::holding(&[Point::Step]);

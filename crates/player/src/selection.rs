@@ -551,11 +551,10 @@ impl AppRig for PlayerRig<'_> {
         };
         // The chart before's analysis stops before these sounds are
         // decoded, so it never holds its bank beside them.
-        if let Some(sel) = &mut self.selection {
-            sel.shelf.cancel_analysis();
-        }
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         let bank = Arc::new(
-            audio::load_bank(chart, rate, &audio::BankLimits::default())
+            sel.shelf
+                .decode(|| audio::load_bank(chart, rate, &audio::BankLimits::default()))
                 .map_err(ChartLoadError::Sounds)?,
         );
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));

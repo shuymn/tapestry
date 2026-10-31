@@ -397,10 +397,12 @@ impl Shelf {
         }
     }
 
-    /// Before another chart's sounds are decoded: the loudness analysis of
-    /// the chart before stops, a finished one kept in memory.
-    pub fn cancel_analysis(&mut self) {
+    /// Decodes another chart's sounds with `decode` once the loudness
+    /// analysis of the chart before has stopped (a finished one kept in
+    /// memory), so its bank is never held beside the new one.
+    pub fn decode<T>(&mut self, decode: impl FnOnce() -> T) -> T {
         self.loudness.cancel();
+        decode()
     }
 
     /// The chart `name` was loaded with `bank`: its plays' gain is looked
@@ -873,6 +875,46 @@ mod tests {
         assert!(library.loudness(&key).unwrap().is_some());
     }
 
+    /// The next chart's sounds are decoded only once the analysis of the
+    /// chart before has stopped and dropped its bank.
+    #[test]
+    fn the_analysis_stops_before_the_next_sounds_are_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = sound::Gate::holding(&[Point::Step]);
+        let mut shelf = unscanned(dir.path(), &gate);
+        let songs = dir.path().join("song");
+        write_sound(&songs, &square(2.0, 3_000));
+        let c = sound::chart(&songs, 1);
+        let held = bank(&c);
+        shelf.loaded(
+            std::sync::Arc::clone(&c),
+            std::sync::Arc::clone(&held),
+            "a.bms".to_owned(),
+        );
+        gate.reached(Point::Step, 1);
+        assert_eq!(std::sync::Arc::strong_count(&held), 2);
+        let next = std::thread::scope(|s| {
+            s.spawn(|| {
+                // The stop waits for the block in hand.
+                std::thread::sleep(Duration::from_millis(50));
+                gate.open();
+            });
+            shelf.decode(|| {
+                assert_eq!(
+                    std::sync::Arc::strong_count(&held),
+                    1,
+                    "decoded beside the old bank"
+                );
+                bank(&c)
+            })
+        });
+        shelf.loaded(c, next, "a.bms".to_owned());
+        assert!(
+            shelf.loudness.job().is_some(),
+            "the next analysis did not start"
+        );
+    }
+
     /// At an exit whose scan does not stop (it may still commit), a
     /// finished analysis is not stored; a job paused at the exit stops at
     /// once and stores nothing.
@@ -908,9 +950,10 @@ mod tests {
         shelf.pause();
         let key = load(&mut shelf, dir.path());
         assert_eq!(wait(&mut shelf), Paused::Idle);
+        // The paused job stops at once; the bound only catches a hang.
         let started = Instant::now();
         drop(shelf);
-        assert!(started.elapsed() < super::STOP_TIMEOUT);
+        assert!(started.elapsed() < WATCHDOG);
         assert_eq!(job_gate.count(Point::Construct), 0);
         let (library, _) = open(&DataRoot::new(dir.path().join("data"))).unwrap();
         assert_eq!(library.loudness(&key).unwrap(), None);
