@@ -17,8 +17,8 @@ mod mip;
 mod pack;
 pub(crate) mod uv;
 
-use crate::image::decode;
 use crate::image::path;
+use crate::image::{self, decode};
 use crate::image::{FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES, Sheet};
 use pack::PackError;
 use uv::{FrameUv, UvTable};
@@ -293,19 +293,7 @@ impl Sheet {
 
         let mut budget = MAX_TOTAL_FILE_BYTES;
         for ((at, canonical, dims), &(_, start, end)) in resolved.into_iter().zip(&used) {
-            let (mut file, len) = path::open(&canonical).map_err(|e| ImageError::path(at, e))?;
-            let limit = MAX_FILE_BYTES.min(budget);
-            let (bytes, more) = decode::read_capped(&mut file, len, limit)
-                .map_err(|source| ImageError::Io { at, source })?;
-            drop(file);
-            if more {
-                return Err(if limit < MAX_FILE_BYTES {
-                    ImageError::TotalBytesTooLarge { at }
-                } else {
-                    ImageError::FileTooLarge { at }
-                }
-                .into());
-            }
+            let bytes = image::read_encoded(&canonical, at, MAX_FILE_BYTES.min(budget))?;
             budget = budget.saturating_sub(u64::try_from(bytes.len()).unwrap_or(budget));
             let image = decode::decode(bytes, dims).map_err(|e| ImageError::decode(at, e))?;
             for i in start..end {

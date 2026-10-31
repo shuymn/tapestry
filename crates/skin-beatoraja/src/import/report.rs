@@ -120,7 +120,6 @@ pub enum DeviationId {
     D4,
     D5,
     D6,
-    D7,
     D8,
     /// A lane approximation (owner decision 12).
     D9(LaneApprox),
@@ -128,6 +127,10 @@ pub enum DeviationId {
     D10,
     /// HIDDEN+ is never drawn (owner decision 15).
     D11,
+    /// A bitmap font's size rounded to a whole reference pixel.
+    D12,
+    /// A distance-field bitmap font drawn with the default font.
+    D13,
 }
 
 /// How the lanes, SUDDEN+ and LIFT are drawn differently from the source
@@ -196,6 +199,10 @@ pub enum NoteKind {
     /// A file that is missing or failed to load, or a choice with no
     /// candidate.
     MissingAsset,
+    /// A bitmap `.fnt` file refused: ignored when the source also fails to
+    /// load it, dropped when only the importer refuses it; a fallback
+    /// file is skipped.
+    BitmapFont(skin_model::FntError),
     /// A field with no effect, or a value the source does not draw.
     Ignored {
         field: &'static str,
@@ -223,6 +230,7 @@ impl fmt::Display for NoteKind {
             Self::Timer(why) => write!(f, "an unsupported timer ({why:?})"),
             Self::Deviation(d) => write!(f, "deviation {d:?}"),
             Self::MissingAsset => f.write_str("a missing or unreadable file"),
+            Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
         }
     }
@@ -276,6 +284,8 @@ pub struct Usage {
     pub file_attempts: u32,
     pub files: u32,
     pub fonts: u32,
+    pub glyphs: u32,
+    pub kernings: u32,
     pub texts: u32,
     pub widget_quads: u32,
     pub notes: u32,
