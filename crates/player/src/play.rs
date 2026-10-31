@@ -466,7 +466,7 @@ impl Rig for PlayerRig<'_> {
             .map_or(audio::Gain::HEADROOM, |s| s.shelf.gain());
         // Audio was readied before recording opened, so this does not
         // wait; a worker gone since shows as the output's failure.
-        let _ = self.audio.control.play_at(origin, sounds, gain);
+        let _ = self.audio.control.play_at(origin, sounds, gain, None);
         self.generation = self.audio.control.generation();
         self.steps_dropped = 0;
         let measure = PlayMeasure {

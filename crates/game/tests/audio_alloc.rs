@@ -1,7 +1,7 @@
-//! The audio thread neither allocates nor frees across retries and loads:
-//! each play's command queue, and each bank a load replaces, goes back to
-//! the game thread to be dropped there, and the control messages travel
-//! through a preallocated queue. Only the audio loop's steps are counted
+//! The audio thread neither allocates nor frees across retries, loads and
+//! practice rounds' restores: each play's command queue and restore, and
+//! each bank a load replaces, go back to the game thread to be dropped
+//! there, and the control messages travel through a preallocated queue. Only the audio loop's steps are counted
 //! (see `counting`); this file holds a single test. Profiles and the
 //! positive control: design.md "Scope of No Allocation".
 
@@ -70,7 +70,7 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         let (mut sink, queue) = audio_link_at(64, origin);
         // Each play carries its own gain, applied on the audio thread.
         let gain = audio::Gain::new(if play % 2 == 0 { 1.0 } else { 0.5 }).unwrap();
-        control.play_at(origin, queue, gain).unwrap();
+        control.play_at(origin, queue, gain, None).unwrap();
         for k in 0..3 {
             sink.receive(&JudgeEvent {
                 seq: k,
@@ -91,5 +91,54 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
     }
     assert!(control.done());
     assert_eq!(control.queued_periods(), Some(Some(2)));
+    assert_eq!(counting::calls(), 0);
+    // Three practice rounds whose restores are placed, fall back and are
+    // refused, the last rung out to its end: the plans are made and freed
+    // here, and travel with the starts.
+    let restorer = game::Restorer::new(control.seek_source(), chart.bgm.clone());
+    for (round, late) in [(0, 0), (1, 25), (2, 75)] {
+        // Chart time 1 s is 200 ms after the opening.
+        let written = i64::try_from(worker.engine().written()).unwrap();
+        let origin = TimeUs(written * 1_000 / 48 + 10 * MS - 800 * MS);
+        let restore = restorer
+            .plan(control.counters().frame_line(origin), TimeUs(1_000 * MS))
+            .unwrap();
+        // A slow game thread: the output passes the first plan's frame, or
+        // both plans' frames.
+        steps(&mut worker, late);
+        let (mut sink, queue) = audio_link_at(64, origin);
+        control
+            .play_at(origin, queue, audio::Gain::HEADROOM, Some(restore))
+            .unwrap();
+        sink.receive(&JudgeEvent {
+            seq: 0,
+            time: TimeUs(0),
+            origin: Some(origin),
+            kind: JudgeEventKind::PlaySound {
+                lane: lane(1),
+                sound: SoundId(0),
+            },
+        });
+        steps(&mut worker, 2);
+        let want = match round {
+            0 => game::Restored::First,
+            1 => game::Restored::Fallback,
+            _ => game::Restored::Refused(game::RestoreRefusal::Late),
+        };
+        assert_eq!(
+            control.counters().restored(control.generation()),
+            Some(want)
+        );
+        if round == 2 {
+            control.ring_out(TimeUs(1_700 * MS), TimeUs(1_800 * MS));
+        }
+        steps(&mut worker, 10);
+    }
+    let mut n = 0;
+    while !control.done() {
+        steps(&mut worker, 1);
+        n += 1;
+        assert!(n < 200, "never done");
+    }
     assert_eq!(counting::calls(), 0);
 }

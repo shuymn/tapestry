@@ -241,7 +241,9 @@ fn a_plays_gain_applies_from_its_play() {
     };
     let (mut sink, queue) = audio_link_at(8, TimeUs(50 * MS));
     let unity = audio::Gain::new(1.0).unwrap();
-    control.play_at(TimeUs(50 * MS), queue, unity).unwrap();
+    control
+        .play_at(TimeUs(50 * MS), queue, unity, None)
+        .unwrap();
     steps(&mut worker, &mut out);
     assert_eq!(worker.engine().mixer().gain(), 1.0);
     // The volume halves mid-play; the gain stays.
@@ -522,4 +524,323 @@ fn a_timed_out_load_refuses_others_until_it_is_answered() {
     // The first bank's answer and its replacement were freed on this
     // thread: only the engine holds the first's successor now.
     assert_eq!(Arc::strong_count(&first), 1);
+}
+
+/// A practice round's restore on the audio thread (design.md "Mid-Chart
+/// Start and Section Repeat"): the round opens at chart time 7.8 s and its
+/// audio is restored at its lead-in's start, 8 s. Sound 0 lasts 4 s at the
+/// level `1 + its millisecond`, played as BGM at 5 s, so it is 3 s in at
+/// 8 s; sound 1 (10 ms at 2,000) is BGM at 8.05 s; sound 2 (10 ms at
+/// 3,000) is the key sound.
+mod restore {
+    use std::sync::Arc;
+
+    use audio::{
+        AudioEngine, Gain, MAX_VOICES, RecordingOutput, SeekPlan, SimConfig, SimDevice, Sound,
+        SoundBank,
+    };
+    use bms_model::{BgmEvent, SoundId, TimeUs};
+    use game::{
+        AudioControl, AudioWorker, EventSink, RESTORE_RETRY, RestoreRefusal, Restored, Restorer,
+        audio_control, audio_link_at,
+    };
+
+    use super::common::{MS, PERIOD, RATE, lane};
+
+    const OPENS_AT: i64 = 7_800 * MS;
+    const RESTORE_AT: TimeUs = TimeUs(8_000 * MS);
+    /// Steps before the round opens.
+    const WARM: usize = 3;
+
+    fn bank() -> Arc<SoundBank> {
+        let ms = RATE as usize / 1_000;
+        Arc::new(SoundBank::from_sounds(
+            RATE,
+            vec![
+                Sound::mono(
+                    (0..4 * RATE as usize)
+                        .map(|k| i16::try_from(k / ms + 1).unwrap())
+                        .collect(),
+                ),
+                Sound::mono(vec![2_000; 480]),
+                Sound::mono(vec![3_000; 480]),
+            ],
+        ))
+    }
+
+    fn schedule() -> Vec<BgmEvent> {
+        [(5_000, 0), (8_050, 1)]
+            .map(|(t, s)| BgmEvent {
+                time: TimeUs(t * MS),
+                sound: SoundId(s),
+            })
+            .to_vec()
+    }
+
+    fn engine(bank: Arc<SoundBank>) -> AudioEngine {
+        AudioEngine::with_schedule(bank, schedule(), RATE, PERIOD, MAX_VOICES, 0).unwrap()
+    }
+
+    fn output() -> RecordingOutput<SimDevice> {
+        RecordingOutput::new(
+            SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+            2 * RATE as usize,
+        )
+    }
+
+    fn rig() -> (AudioControl, AudioWorker, RecordingOutput<SimDevice>) {
+        let (control, worker) = audio_control(engine(bank()));
+        (control, worker, output())
+    }
+
+    /// The frame output time `us` falls in: frame `n` plays at
+    /// `(n + 480) / RATE`.
+    fn frame(us: i64) -> usize {
+        usize::try_from((us - 10 * MS) * 48 / 1_000).unwrap()
+    }
+
+    /// The mono level of frame `f`, at `gain`.
+    fn level(out: &RecordingOutput<SimDevice>, f: usize, gain: f32) -> f32 {
+        out.samples()[2 * f] / gain * 32_768.0
+    }
+
+    /// The origin of a round opening when output time `opened` is due: its
+    /// chart time 7.8 s there.
+    fn origin(opened: i64) -> TimeUs {
+        TimeUs(opened - OPENS_AT)
+    }
+
+    /// What a reference engine plays when, after `before` steps, it starts
+    /// a play at `origin` and `gain` and seeks to `at` there, for `steps`
+    /// steps more; and its frame line after the restart.
+    fn reference(
+        before: usize,
+        origin: TimeUs,
+        gain: Gain,
+        at: Option<TimeUs>,
+        steps: usize,
+    ) -> (Vec<f32>, audio::FrameLine) {
+        let mut e = engine(bank());
+        e.stop();
+        let mut out = output();
+        let (_tx, mut rx) = rtrb::RingBuffer::new(1);
+        for _ in 0..before {
+            e.step(&mut out, &mut rx).unwrap();
+        }
+        e.set_gain(gain.get()).unwrap();
+        e.restart(origin);
+        let line = e.frame_line();
+        if let Some(at) = at {
+            let plan = SeekPlan::new(&e.seek_source(), &schedule(), line, at).unwrap();
+            e.seek(&plan).unwrap();
+        }
+        for _ in 0..steps {
+            e.step(&mut out, &mut rx).unwrap();
+        }
+        (out.samples().to_vec(), line)
+    }
+
+    fn steps(worker: &mut AudioWorker, out: &mut RecordingOutput<SimDevice>, n: usize) {
+        for _ in 0..n {
+            worker.step(out).unwrap();
+        }
+    }
+
+    #[test]
+    fn play_restores_at_its_committed_origin() {
+        let (mut control, mut worker, mut out) = rig();
+        steps(&mut worker, &mut out, WARM);
+        // The opening at 30 ms fixes the origin; the restore is planned on
+        // its line for the lead-in's start, 200 ms later.
+        let origin = origin(30 * MS);
+        let line = control.counters().frame_line(origin);
+        let restore = Restorer::new(control.seek_source(), schedule())
+            .plan(line, RESTORE_AT)
+            .unwrap();
+        let (_sink, queue) = audio_link_at(4, origin);
+        control
+            .play_at(origin, queue, Gain::HEADROOM, Some(restore))
+            .unwrap();
+        steps(&mut worker, &mut out, 60);
+        assert_eq!(
+            control.counters().restored(control.generation()),
+            Some(Restored::First)
+        );
+        // The published line is the engine's after the restart, and the
+        // output is a reference engine's that restarted and sought there.
+        let (want, want_line) = reference(WARM, origin, Gain::HEADROOM, Some(RESTORE_AT), 60);
+        assert_eq!(line, want_line);
+        assert_eq!(out.samples(), &want[..]);
+        // Silent until the lead-in's start at 230 ms, where the long voice
+        // enters 3 s in; the BGM event 50 ms into the lead-in sounds over it.
+        let at = frame(230 * MS);
+        assert!(out.samples()[..2 * at].iter().all(|&x| x == 0.0));
+        assert_eq!(level(&out, at, audio::HEADROOM), 3_001.0);
+        let bgm = frame(280 * MS);
+        assert_eq!(level(&out, bgm - 1, audio::HEADROOM), 3_050.0);
+        assert_eq!(level(&out, bgm, audio::HEADROOM), 3_051.0 + 2_000.0);
+    }
+
+    /// Steps the worker until it has written past `us`'s frame: the
+    /// steps taken.
+    fn past(worker: &mut AudioWorker, out: &mut RecordingOutput<SimDevice>, us: i64) -> usize {
+        let mut n = 0;
+        while worker.engine().written() <= frame(us) as u64 + u64::from(PERIOD) {
+            worker.step(out).unwrap();
+            n += 1;
+            assert!(n < 200);
+        }
+        n
+    }
+
+    #[test]
+    fn a_missed_origin_falls_back() {
+        let (mut control, mut worker, mut out) = rig();
+        steps(&mut worker, &mut out, WARM);
+        let origin = origin(30 * MS);
+        let restore = Restorer::new(control.seek_source(), schedule())
+            .plan(control.counters().frame_line(origin), RESTORE_AT)
+            .unwrap();
+        // The game thread was slow: the output passed the lead-in's start
+        // before the start reached the audio thread.
+        let late = WARM + past(&mut worker, &mut out, 230 * MS);
+        let (_sink, queue) = audio_link_at(4, origin);
+        control
+            .play_at(origin, queue, Gain::HEADROOM, Some(restore))
+            .unwrap();
+        steps(&mut worker, &mut out, 60);
+        assert_eq!(
+            control.counters().restored(control.generation()),
+            Some(Restored::Fallback)
+        );
+        let fallback = TimeUs(RESTORE_AT.0 + RESTORE_RETRY.0);
+        let (want, _) = reference(late, origin, Gain::HEADROOM, Some(fallback), 60);
+        assert_eq!(out.samples(), &want[..]);
+        // Silent until 500 ms later, where the long voice enters 3.5 s in.
+        let at = frame(730 * MS);
+        assert!(out.samples()[..2 * at].iter().all(|&x| x == 0.0));
+        assert_eq!(level(&out, at, audio::HEADROOM), 3_501.0);
+    }
+
+    #[test]
+    fn a_refused_restore_plays_silent() {
+        let (mut control, mut worker, mut out) = rig();
+        steps(&mut worker, &mut out, WARM);
+        let origin = origin(30 * MS);
+        let restore = Restorer::new(control.seek_source(), schedule())
+            .plan(control.counters().frame_line(origin), RESTORE_AT)
+            .unwrap();
+        // Both plans are late.
+        past(&mut worker, &mut out, 730 * MS);
+        let (mut sink, queue) = audio_link_at(4, origin);
+        control
+            .play_at(origin, queue, Gain::HEADROOM, Some(restore))
+            .unwrap();
+        // A key sound is still heard, and the ring-out still ends.
+        let now = TimeUs(i64::try_from(worker.engine().written()).unwrap() * 1_000 / 48);
+        sink.receive(&eval::JudgeEvent {
+            seq: 0,
+            time: TimeUs(0),
+            origin: Some(now),
+            kind: eval::JudgeEventKind::PlaySound {
+                lane: lane(1),
+                sound: SoundId(2),
+            },
+        });
+        let end = TimeUs(now.0 - origin.0 + 200 * MS);
+        control.ring_out(TimeUs(end.0 - 50 * MS), end);
+        let mut n = 0;
+        while !control.done() {
+            worker.step(&mut out).unwrap();
+            n += 1;
+            assert!(n < 100, "never done");
+        }
+        assert_eq!(
+            control.counters().restored(control.generation()),
+            Some(Restored::Refused(RestoreRefusal::Late))
+        );
+        // No BGM started, not from chart time 0 nor later: only the key
+        // sound's 480 frames sounded.
+        assert_eq!(worker.engine().bgm_left(), 0);
+        let heard: Vec<f32> = out
+            .samples()
+            .iter()
+            .step_by(2)
+            .copied()
+            .filter(|&x| x != 0.0)
+            .collect();
+        assert_eq!(heard, vec![3_000.0 / 65_536.0; 480]);
+    }
+
+    #[test]
+    fn load_answer_carries_the_seek_source() {
+        let (mut control, mut worker, mut out) = rig();
+        steps(&mut worker, &mut out, WARM);
+        let stale = control.seek_source();
+        // The same sounds and schedule loaded again: another chart for the
+        // engine, so the source taken before is out of date.
+        std::thread::scope(|s| {
+            let load = s.spawn(|| control.load(bank(), audio::BgmSchedule::new(schedule())));
+            while !load.is_finished() {
+                worker.step(&mut out).unwrap();
+            }
+            load.join().unwrap().unwrap();
+        });
+        let fresh = control.seek_source();
+        assert!(fresh.matches(&schedule()));
+        for (source, want) in [
+            (stale, Restored::Refused(RestoreRefusal::Source)),
+            (fresh, Restored::First),
+        ] {
+            let opened = i64::try_from(worker.engine().written()).unwrap() * 1_000 / 48;
+            let origin = origin(opened);
+            let restore = Restorer::new(source, schedule())
+                .plan(control.counters().frame_line(origin), RESTORE_AT)
+                .unwrap();
+            let (_sink, queue) = audio_link_at(4, origin);
+            control
+                .play_at(origin, queue, Gain::HEADROOM, Some(restore))
+                .unwrap();
+            steps(&mut worker, &mut out, 2);
+            assert_eq!(
+                control.counters().restored(control.generation()),
+                Some(want)
+            );
+        }
+    }
+
+    #[test]
+    fn restore_keeps_the_plays_gain_across_rounds() {
+        // Two rounds at gain 1 (not the headroom), the first rung out to
+        // its end: each restores its long voice at full level.
+        let unity = Gain::new(1.0).unwrap();
+        let (mut control, mut worker, mut out) = rig();
+        steps(&mut worker, &mut out, WARM);
+        let mut opened = 30 * MS;
+        for round in 0..2 {
+            let origin = origin(opened);
+            let restore = Restorer::new(control.seek_source(), schedule())
+                .plan(control.counters().frame_line(origin), RESTORE_AT)
+                .unwrap();
+            let (_sink, queue) = audio_link_at(4, origin);
+            control
+                .play_at(origin, queue, unity, Some(restore))
+                .unwrap();
+            steps(&mut worker, &mut out, 30);
+            assert_eq!(
+                control.counters().restored(control.generation()),
+                Some(Restored::First),
+                "round {round}"
+            );
+            let at = frame(opened + 200 * MS);
+            assert_eq!(out.samples()[2 * at - 2], 0.0, "round {round}");
+            assert_eq!(level(&out, at, 1.0), 3_001.0, "round {round}");
+            // Round 1 rings out 60 ms past its lead-in's start.
+            control.ring_out(TimeUs(8_040 * MS), TimeUs(8_060 * MS));
+            while !control.done() {
+                worker.step(&mut out).unwrap();
+            }
+            opened = i64::try_from(worker.engine().written()).unwrap() * 1_000 / 48 + 10 * MS;
+        }
+    }
 }

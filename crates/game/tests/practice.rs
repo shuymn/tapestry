@@ -17,16 +17,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use audio::{
-    AudioEngine, HEADROOM, RecordingOutput, ScheduledKind, SeekPlan, SimConfig, SimDevice, Sound,
-    SoundBank,
+    AudioEngine, HEADROOM, RecordingOutput, ScheduledKind, SimConfig, SimDevice, Sound, SoundBank,
 };
 use bms_model::{Chart, ChartBuilder, SoundId, Speed, TimeUs};
 use common::{MS, lane, tapestry_settings};
 use eval::{ControlId, JudgeEventKind};
 use game::{
     AudioQueue, ChartIngest, Closing, Command, DataRoot, IngestError, Ingested, InputWaitError,
-    Loaded, Opening, Parts, PlayEnd, PlayReport, Practice, RecordRef, RecordSink, RenderSide, Rig,
-    SaveError, SessionConfig,
+    Loaded, Opening, Parts, PlayEnd, PlayReport, Practice, RESTORE_AHEAD, RecordRef, RecordSink,
+    RenderSide, Restore, RestoreError, Restored, Restorer, Rig, SaveError, SessionConfig,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -119,6 +118,7 @@ enum Ev {
     RingOut { at: i64, fade: TimeUs, end: TimeUs },
     Done { at: i64 },
     Cancel { at: i64 },
+    Restored { at: i64, how: Restored },
     Close { at: i64 },
     Save { at: i64 },
 }
@@ -165,6 +165,14 @@ struct Rounds {
     done: Cell<bool>,
     log: Log,
     reports: Vec<PlayReport>,
+    /// The rounds' restorer, as the player's rig keeps one.
+    restorer: Option<Restorer>,
+    /// The round's restore, planned at its opening.
+    restore: Option<Box<Restore>>,
+    /// The origin the engine plays on.
+    engine_origin: i64,
+    /// A refusal `restore_audio` gives instead of planning.
+    refuse_restore: Option<RestoreError>,
 }
 
 impl Rounds {
@@ -180,7 +188,9 @@ impl Rounds {
             action: Action::Connect(DeviceId(4), DeviceKind::Keyboard),
         }]);
         script.poll(TimeUs(CLOCK_START), &mut sources);
-        let engine = AudioEngine::with_schedule(bank(), schedule, RATE, PERIOD, 64, 4_096).unwrap();
+        let engine =
+            AudioEngine::with_schedule(bank(), schedule.clone(), RATE, PERIOD, 64, 4_096).unwrap();
+        let restorer = Some(Restorer::new(engine.seek_source(), schedule));
         let dev = SimDevice::new(SimConfig {
             queue_periods: queued,
             ..SimConfig::steady(RATE, PERIOD, TimeUs(CLOCK_START))
@@ -199,6 +209,10 @@ impl Rounds {
             done: Cell::new(false),
             log: Rc::clone(log),
             reports: Vec::new(),
+            restorer,
+            restore: None,
+            engine_origin: 0,
+            refuse_restore: None,
         }
     }
 
@@ -292,22 +306,35 @@ impl Rig for Rounds {
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, _screen: RenderSide) {
         self.engine.restart(origin);
+        self.engine_origin = origin.0;
+        // As the audio thread applies a round's restore with its start.
+        if let Some(r) = self.restore.take() {
+            let how = r.apply(&mut self.engine);
+            self.push(Ev::Restored { at: self.at(), how });
+        }
         self.queue = sounds;
         self.sealed = false;
         self.done.set(false);
     }
 
-    fn restore_audio(&mut self, at: TimeUs) {
-        // As the headless session restores: at the first frame not yet
-        // written if `at`'s already is.
-        let line = self.engine.frame_line();
-        let written = i128::from(self.engine.written());
-        let first = (written * 1_000_000 + i128::from(RATE) - 1) / i128::from(RATE)
-            - i128::from(line.base_us);
-        let at = TimeUs(at.0.max(i64::try_from(first).unwrap()));
-        let plan =
-            SeekPlan::new(&self.engine.seek_source(), self.engine.schedule(), line, at).unwrap();
-        self.engine.seek(&plan).unwrap();
+    fn restore_ready(&mut self, _at: TimeUs) -> Result<(), RestoreError> {
+        self.restorer
+            .as_ref()
+            .ok_or(RestoreError::NotPrepared)?
+            .check()
+    }
+
+    fn restore_audio(&mut self, origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
+        if let Some(e) = self.refuse_restore {
+            return Err(e);
+        }
+        // The line of the opening's origin, as the player's rig reads it
+        // from the audio thread.
+        let mut line = self.engine.frame_line();
+        line.base_us += origin.0 - self.engine_origin;
+        let restorer = self.restorer.as_ref().ok_or(RestoreError::NotPrepared)?;
+        self.restore = Some(restorer.plan(line, at)?);
+        Ok(())
     }
 
     fn focus_lost(&self) -> bool {
@@ -406,14 +433,47 @@ fn d15_practice(loaded: &Loaded) -> Practice {
 
 /// The chart loaded under the tapestry preset, saving to `saves`.
 fn load(dir: &Path, chart: Chart, saves: Saves, config: SessionConfig) -> Loaded {
+    load_with(dir, chart, saves, config, 0, None)
+}
+
+/// Session events seen, in order.
+#[derive(Clone, Default)]
+struct Events(Rc<RefCell<Vec<game::SessionEvent>>>);
+
+impl game::SessionEventSink for Events {
+    fn on_event(&mut self, ev: &game::SessionEvent) {
+        self.0.borrow_mut().push(*ev);
+    }
+}
+
+/// [`load`] with the keyboard's input offset, and the session events into
+/// `events`.
+fn load_with(
+    dir: &Path,
+    chart: Chart,
+    saves: Saves,
+    config: SessionConfig,
+    input_offset_us: i64,
+    events: Option<Events>,
+) -> Loaded {
     let root = DataRoot::new(dir.to_owned());
-    let settings = tapestry_settings(&root);
+    let mut settings = tapestry_settings(&root);
+    settings.device.input_offset_us = input_offset_us;
     let chart_path = dir.join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
-    let parts = Parts {
-        ingest: Box::new(Built(chart)),
-        records: Some(Box::new(saves)),
-        ..Parts::standard(&root, &settings.player)
+    let standard = Parts::standard(&root, &settings.player);
+    let parts = match events {
+        Some(events) => Parts {
+            ingest: Box::new(Built(chart)),
+            records: Some(Box::new(saves)),
+            events: Box::new(events),
+            ..standard
+        },
+        None => Parts {
+            ingest: Box::new(Built(chart)),
+            records: Some(Box::new(saves)),
+            ..standard
+        },
     };
     Loaded::load(root, settings, &chart_path, config, parts).unwrap()
 }
@@ -433,7 +493,7 @@ impl Run {
         let Some(&Ev::Open { at: opened, .. }) = self.log.first() else {
             panic!("no round opened");
         };
-        at - opened + SECTION.0 - LEAD_IN.0
+        at - opened + SECTION.0 - LEAD_IN.0 - RESTORE_AHEAD.0
     }
 }
 
@@ -479,12 +539,13 @@ fn section_round_rings_out_and_repeats() {
     let round1 = &run.reports[0];
     assert_eq!(round1.end, PlayEnd::Completed);
     assert_eq!(round1.tail_cut, None);
-    // Round 1 opened at its lead-in's start, chart time 8 s.
+    // Round 1 opened 200 ms before its lead-in's start, at chart time
+    // 7.8 s.
     assert_eq!(
         run.log[0],
         Ev::Open {
             at: CLOCK_START,
-            opened_at: TimeUs(8_000 * MS)
+            opened_at: TimeUs(7_800 * MS)
         }
     );
     // SongEnd at the section's final deadline, 19.5 s + 180 ms.
@@ -540,7 +601,7 @@ fn section_round_rings_out_and_repeats() {
         assert!(starts.contains(&t), "{t} {starts:?}");
     }
     assert!(!starts.contains(&(30_000 * MS)), "{starts:?}");
-    // Round 2's countdown began at 21.182 s, at its own chart time 8 s.
+    // Round 2's recording opened at 21.182 s, at its own chart time 7.8 s.
     let opens: Vec<(i64, TimeUs)> = run
         .log
         .iter()
@@ -549,25 +610,35 @@ fn section_round_rings_out_and_repeats() {
             _ => None,
         })
         .collect();
-    assert_eq!(opens[1], (21_182 * MS, TimeUs(8_000 * MS)));
+    assert_eq!(opens[1], (21_182 * MS, TimeUs(7_800 * MS)));
+    // Each round's restore was planned on its opening's origin and placed
+    // at its lead-in's start.
+    let restored: Vec<Restored> = run
+        .log
+        .iter()
+        .filter_map(|e| match *e {
+            Ev::Restored { how, .. } => Some(how),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(restored, [Restored::First, Restored::First]);
     // The 60 s BGM voice that started at 5 s is playing 3 s in at round 2's
-    // countdown, restored, at full gain: the first frame it sounds is
-    // its 3.00-3.05 s block.
+    // lead-in start, 200 ms after its opening, restored at full gain: the
+    // first frame that sounds is that start's, the first of its 3.00 s
+    // block.
     let left: Vec<f32> = run.rig.out.samples().iter().step_by(2).copied().collect();
     // Frame `n` plays at `CLOCK_START + (n + 480) / RATE`, and round 1's
-    // chart time 8 s at `CLOCK_START`.
-    let countdown =
-        usize::try_from((21_182 - 8_000 - 10) * MS * i64::from(RATE) / 1_000_000).unwrap();
-    let entry = (countdown..).find(|&f| left[f] != 0.0).unwrap();
-    assert!(
-        entry < countdown + 4 * PERIOD as usize,
-        "{entry} {countdown}"
-    );
+    // chart time 7.8 s at `CLOCK_START`.
+    let lead_in =
+        usize::try_from((21_382 - 7_800 - 10) * MS * i64::from(RATE) / 1_000_000).unwrap();
+    let entry = (lead_in - 4 * PERIOD as usize..)
+        .find(|&f| left[f] != 0.0)
+        .unwrap();
+    assert_eq!(entry, lead_in);
     let level = left[entry] / HEADROOM * 32_768.0;
-    assert_eq!(level.fract(), 0.0, "{level}");
-    assert!((301.0..=306.0).contains(&level), "{level}");
+    assert_eq!(level, 301.0);
     // Silent before, from round 1's ring-out's end at 21.181 s.
-    let rung = usize::try_from((21_181 - 8_000 - 10) * MS * i64::from(RATE) / 1_000_000).unwrap();
+    let rung = usize::try_from((21_181 - 7_800 - 10) * MS * i64::from(RATE) / 1_000_000).unwrap();
     assert!(left[rung - 1] > 0.0);
     assert!(left[rung..entry].iter().all(|&x| x == 0.0));
 }
@@ -655,15 +726,15 @@ fn saving_never_delays_the_ring_out() {
         // The quit cuts the ring-out in its step, before the save.
         if !commands.is_empty() {
             assert!(round1(&slow).contains(&Ev::Cancel {
-                at: CLOCK_START + 20_900 * MS - 8_000 * MS
+                at: CLOCK_START + 20_900 * MS - 7_800 * MS
             }));
         }
         // The fade and the stop on the output, sample for sample, through
         // the ring-out's end.
         // Frame `n` plays at `CLOCK_START + (n + 480) / RATE`, and round
-        // 1's chart time 8 s at `CLOCK_START`.
+        // 1's chart time 7.8 s at `CLOCK_START`.
         // A quit ends the run, and the output, at 20.9 s.
-        let end = usize::try_from((21_181 - 8_000) * MS * i64::from(RATE) / 1_000_000).unwrap();
+        let end = usize::try_from((21_181 - 7_800) * MS * i64::from(RATE) / 1_000_000).unwrap();
         let (a, b) = (instant.rig.out.samples(), slow.rig.out.samples());
         let n = (2 * end).min(a.len());
         assert!(n > 2 * 600_000, "{n}");
@@ -725,7 +796,7 @@ fn section_round_records_its_conditions() {
     };
     assert_eq!(records[0].play_type, PlayType::SectionRepeat(round(1)));
     assert_eq!(records[1].play_type, PlayType::MidChartStart(round(2)));
-    assert_eq!(records[0].start.opened_at, TimeUs(8_000 * MS));
+    assert_eq!(records[0].start.opened_at, TimeUs(7_800 * MS));
     for r in records.iter() {
         assert_eq!(r.speed, Speed::NORMAL);
         let back = replay::decode(&replay::encode(r), &replay::DecodeLimits::STANDARD).unwrap();
@@ -764,10 +835,10 @@ fn practice_window_is_sized_by_the_section() {
     let dir = tempfile::tempdir().unwrap();
     let mut seen = 0;
     for (k, window) in [
-        (10, 21_180_000),
-        (13, 16_795_384),
-        (20, 11_680_000),
-        (30, 8_513_333),
+        (10, 21_380_000),
+        (13, 16_995_384),
+        (20, 11_880_000),
+        (30, 8_713_333),
     ] {
         let speed = Speed::from_twentieths(k).unwrap();
         let mut loaded = load_bms(dir.path(), text, speed);
@@ -812,9 +883,10 @@ fn practice_window_includes_ln_end_deadlines() {
     loaded.set_practice(Some(practice)).unwrap();
     let plan = loaded.plan(&[DeviceKind::Keyboard], &[]).unwrap();
     // The deadline is the LN end, 19.900 s, not the head's miss (18.180 s):
-    // a window of 11.900 s from 8 s, and a capacity of 12 seconds.
-    assert_eq!(plan.window, TimeUs(11_900_000));
-    assert_eq!(plan.logic.inputs, 12 * 240 + 4);
+    // a window of 12.100 s from the opening at 7.8 s, and a capacity of 13
+    // seconds.
+    assert_eq!(plan.window, TimeUs(12_100_000));
+    assert_eq!(plan.logic.inputs, 13 * 240 + 4);
 }
 
 #[test]
@@ -947,7 +1019,10 @@ fn excerpt_matches_mid_chart_start_end_to_end() {
     };
     let full = play(false);
     let round = play(true);
-    assert_eq!(round.start.opened_at, TimeUs(section.0 - LEAD_IN.0));
+    assert_eq!(
+        round.start.opened_at,
+        TimeUs(section.0 - LEAD_IN.0 - RESTORE_AHEAD.0)
+    );
     assert!(
         round.start.held.iter().any(|&(_, c, v)| c == x && v != 0),
         "lane 3's key is held at the opening"
@@ -983,4 +1058,361 @@ fn excerpt_matches_mid_chart_start_end_to_end() {
         12
     );
     assert_eq!(excerpt, started);
+}
+
+#[test]
+fn restore_lands_at_the_lead_in_start() {
+    // Round 1 opens at chart time 7.8 s, and its audio is restored at the
+    // lead-in's start, 8 s: the 60 s BGM voice that started at 5 s enters
+    // there 3 s in, at its 3.00 s block's level, from the first frame, and
+    // nothing sounds between the opening and it.
+    let run = d15(2, 0, &[]);
+    assert_eq!(
+        run.log[0],
+        Ev::Open {
+            at: CLOCK_START,
+            opened_at: TimeUs(7_800 * MS)
+        }
+    );
+    assert!(run.log.contains(&Ev::Restored {
+        at: CLOCK_START,
+        how: Restored::First
+    }));
+    let left: Vec<f32> = run.rig.out.samples().iter().step_by(2).copied().collect();
+    // Frame `n` plays at `CLOCK_START + (n + 480) / RATE`: the opening's
+    // first frame is 0, the lead-in's start 200 ms later.
+    let lead_in = usize::try_from(190 * MS * i64::from(RATE) / 1_000_000).unwrap();
+    assert!(left[..lead_in].iter().all(|&x| x == 0.0));
+    assert_eq!(left[lead_in] / HEADROOM * 32_768.0, 301.0);
+    // 50 ms in, the voice is 3.05 s into its sound.
+    assert_eq!(left[lead_in + 2_400] / HEADROOM * 32_768.0, 306.0);
+}
+
+/// What a refused round left: the error it ended with, the rig, the
+/// records saved and the session events.
+type Refused = (
+    game::LiveError<std::convert::Infallible>,
+    Rounds,
+    Vec<PlayRecord>,
+    Vec<game::SessionEvent>,
+);
+
+/// D15's round with `restorer` in place of the engine's, and `refuse`
+/// given by `restore_audio`.
+fn refused_round(
+    restorer: impl FnOnce(&AudioEngine) -> Option<Restorer>,
+    refuse: Option<RestoreError>,
+) -> Refused {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Rc::new(Cell::new(CLOCK_START));
+    let log = Log::default();
+    let records = Rc::new(RefCell::new(Vec::new()));
+    let saves = Saves {
+        clock: Rc::clone(&clock),
+        log: Rc::clone(&log),
+        delay: 0,
+        records: Rc::clone(&records),
+    };
+    let events = Events::default();
+    let mut loaded = load_with(
+        dir.path(),
+        d15_chart(),
+        saves,
+        config(),
+        0,
+        Some(events.clone()),
+    );
+    loaded.set_practice(Some(d15_practice(&loaded))).unwrap();
+    let mut rig = Rounds::new(loaded.audio_schedule(), 2, &log, &clock);
+    rig.restorer = restorer(&rig.engine);
+    rig.refuse_restore = refuse;
+    let err = game::live::run_chart(&mut loaded, &mut rig).unwrap_err();
+    let records = records.borrow().clone();
+    let events = events.0.borrow().clone();
+    (err, rig, records, events)
+}
+
+fn started(events: &[game::SessionEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, game::SessionEvent::Start { .. }))
+}
+
+#[test]
+fn a_schedule_mismatch_refuses_the_round_before_opening() {
+    // The rig's restorer holds the chart's BGM, not the round's schedule
+    // (the BGM with the key sounds of the notes outside the section) that
+    // the engine plays.
+    let (err, rig, records, events) = refused_round(
+        |e| Some(Restorer::new(e.seek_source(), d15_chart().bgm)),
+        None,
+    );
+    assert!(
+        matches!(err, game::LiveError::Restore(RestoreError::Schedule)),
+        "{err:?}"
+    );
+    // Nothing opened: no recording, no start, no record, no sound.
+    assert!(rig.log.borrow().is_empty(), "{:?}", rig.log.borrow());
+    assert!(rig.reports.is_empty());
+    assert!(records.is_empty());
+    assert!(!started(&events), "{events:?}");
+    assert!(rig.out.samples().iter().all(|&x| x == 0.0));
+    // A rig without a restorer refuses the round the same way.
+    let (err, rig, records, events) = refused_round(|_| None, None);
+    assert!(
+        matches!(err, game::LiveError::Restore(RestoreError::NotPrepared)),
+        "{err:?}"
+    );
+    assert!(rig.log.borrow().is_empty());
+    assert!(records.is_empty());
+    assert!(!started(&events), "{events:?}");
+}
+
+#[test]
+fn a_restore_refused_after_the_opening_closes_recording() {
+    let (err, rig, records, events) = refused_round(
+        |e| Some(Restorer::new(e.seek_source(), e.schedule().to_vec())),
+        Some(RestoreError::Plan(audio::SeekError::Source)),
+    );
+    assert!(
+        matches!(
+            err,
+            game::LiveError::Restore(RestoreError::Plan(audio::SeekError::Source))
+        ),
+        "{err:?}"
+    );
+    // Recording opened and closed again in the same step; nothing started,
+    // played or was saved.
+    assert_eq!(
+        *rig.log.borrow(),
+        [
+            Ev::Open {
+                at: CLOCK_START,
+                opened_at: TimeUs(7_800 * MS)
+            },
+            Ev::Close { at: CLOCK_START }
+        ]
+    );
+    assert!(rig.reports.is_empty());
+    assert!(records.is_empty());
+    assert!(!started(&events), "{events:?}");
+    assert!(rig.out.samples().iter().all(|&x| x == 0.0));
+}
+
+#[test]
+fn chart_end_stays_past_the_last_note_at_every_speed() {
+    // 60 BPM: a final tap at exactly 3 s, and a final long note from 1 s to
+    // 3 s. Floors tie at 150 %: one microsecond past the 1× end maps to
+    // floor(3,000,001 × 2/3) = 2,000,000, the note's own mapped time, so a
+    // section ending there would leave the note out.
+    let charts = [
+        "#BPM 60\n#WAV01 a.wav\n#00011:01000001\n",
+        "#BPM 60\n#WAV01 a.wav\n#00011:01\n#00052:00010001\n",
+    ];
+    let naive = |t: i64, k: u32| (i128::from(t) * 20).div_euclid(i128::from(k));
+    assert_eq!(naive(3_000_001, 30), 2_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    for text in charts {
+        let mut seen = 0;
+        for speed in Speed::ladder() {
+            let mut loaded = load_bms(dir.path(), text, speed);
+            let end = game::chart_end(loaded.chart(), speed);
+            let last = loaded
+                .chart()
+                .lanes
+                .iter()
+                .flatten()
+                .map(|n| n.end().0)
+                .max()
+                .unwrap();
+            let practice = Practice {
+                start: TimeUs(0),
+                end,
+                lead_in: LEAD_IN,
+                initial_gauges: loaded.preset().gauges.iter().map(|g| g.start).collect(),
+                repeat: false,
+            };
+            let section = practice.section(speed);
+            assert!(section.end.0 > last, "{speed:?}");
+            for n in loaded.chart().lanes.iter().flatten() {
+                assert!(section.is_target(n), "{speed:?} {n:?}");
+            }
+            loaded.set_practice(Some(practice)).unwrap();
+            seen += 1;
+        }
+        assert_eq!(seen, 21);
+    }
+}
+
+#[test]
+fn a_section_without_targets_is_refused() {
+    // Taps at 2 s and 6 s, a mine at 4 s: [3 s, 5 s) holds only the mine,
+    // [7 s, 9 s) nothing.
+    let chart = ChartBuilder::new(120_000)
+        .tap(lane(1), TimeUs(2_000 * MS))
+        .mine(lane(2), TimeUs(4_000 * MS), 10)
+        .tap(lane(1), TimeUs(6_000 * MS))
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let saves = Saves {
+        clock: Rc::new(Cell::new(0)),
+        log: Log::default(),
+        delay: 0,
+        records: Rc::default(),
+    };
+    let mut loaded = load(dir.path(), chart.clone(), saves, config());
+    for (start, end) in [(3_000, 5_000), (7_000, 9_000)] {
+        let practice = Practice {
+            start: TimeUs(start * MS),
+            end: TimeUs(end * MS),
+            ..d15_practice(&loaded)
+        };
+        assert_eq!(
+            loaded.set_practice(Some(practice.clone())),
+            Err(game::PracticeError::NoTargets),
+            "[{start}, {end})"
+        );
+        assert!(loaded.practice().is_none());
+        // The evaluator's own answer for the same section is unchanged: it
+        // takes it, and its final deadline is the mine or the start.
+        let device = eval::DeviceProfile {
+            sources: Vec::new(),
+        };
+        let section = practice.section(Speed::NORMAL);
+        let e = eval::Evaluator::new(
+            &chart,
+            loaded.preset(),
+            &device,
+            &eval::InputStart::default(),
+            Some(&section),
+            0,
+        )
+        .unwrap();
+        let want = if start == 3_000 {
+            TimeUs(4_000 * MS)
+        } else {
+            section.start
+        };
+        assert_eq!(e.final_deadline(), want);
+    }
+    // One with the tap at 2 s is taken.
+    let practice = Practice {
+        start: TimeUs(1_000 * MS),
+        end: TimeUs(5_000 * MS),
+        ..d15_practice(&loaded)
+    };
+    loaded.set_practice(Some(practice)).unwrap();
+}
+
+#[test]
+fn input_before_the_lead_in_feeds_conversion_only() {
+    // Section [4 s, 10 s) with a 2 s lead-in: recording opens at 1.8 s.
+    // Lane 1's key and the scratch key are pressed at 1.9 s, before the
+    // lead-in, and held across target mines at 4 s and 4.5 s; lane 3 is
+    // tapped at 6 s. The keyboard's input offset is 3 ms.
+    let lshift = ControlId(0x2a);
+    let x = ControlId(0x2d);
+    let chart = ChartBuilder::new(120_000)
+        .mine(lane(1), TimeUs(4_000 * MS), 10)
+        .mine(lane(0), TimeUs(4_500 * MS), 10)
+        .tap(lane(3), TimeUs(6_000 * MS))
+        .build()
+        .unwrap();
+    let presses: Vec<(i64, ControlId, i32)> = vec![
+        (1_900 * MS, Z, 1),
+        (1_900 * MS, lshift, 1),
+        (4_200 * MS, Z, 0),
+        (4_700 * MS, lshift, 0),
+        (6_003 * MS, x, 1),
+        (6_050 * MS, x, 0),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Rc::new(Cell::new(CLOCK_START));
+    let log = Log::default();
+    let records = Rc::new(RefCell::new(Vec::new()));
+    let saves = Saves {
+        clock: Rc::clone(&clock),
+        log: Rc::clone(&log),
+        delay: 0,
+        records: Rc::clone(&records),
+    };
+    let mut loaded = load_with(dir.path(), chart.clone(), saves, config(), 3_000, None);
+    let practice = Practice {
+        start: TimeUs(4_000 * MS),
+        end: TimeUs(10_000 * MS),
+        lead_in: LEAD_IN,
+        initial_gauges: loaded.preset().gauges.iter().map(|g| g.start).collect(),
+        repeat: false,
+    };
+    loaded.set_practice(Some(practice)).unwrap();
+    assert_eq!(loaded.opens_at(), TimeUs(1_800 * MS));
+    assert_eq!(loaded.restore_at(), Some(TimeUs(2_000 * MS)));
+    let mut rig = Rounds::new(loaded.audio_schedule(), 2, &log, &clock);
+    let shift = CLOCK_START - loaded.opens_at().0;
+    let mut items: Vec<ScriptItem> = presses
+        .iter()
+        .map(|&(t, control, value)| ScriptItem {
+            at: TimeUs(shift + t),
+            action: Action::Packet(Packet {
+                device: DeviceId(4),
+                control,
+                value,
+                background: false,
+            }),
+        })
+        .collect();
+    items.push(ScriptItem {
+        at: TimeUs(i64::MIN),
+        action: Action::Connect(DeviceId(4), DeviceKind::Keyboard),
+    });
+    rig.sources = SourceSet::new(common::sources()).unwrap();
+    rig.script = ScriptedInput::new(items);
+    rig.script.poll(TimeUs(CLOCK_START - 1), &mut rig.sources);
+    rig.commands.push((1, 20_000 * MS, Command::Quit));
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let report = &rig.reports[0];
+    assert_eq!(report.end, PlayEnd::Completed);
+    // Live: the early presses judged and sounded nothing, and both mines
+    // went off on the keys held since then.
+    let mines: Vec<(usize, TimeUs)> = report
+        .live
+        .iter()
+        .filter_map(|e| match e.kind {
+            JudgeEventKind::MineHit { lane, .. } => Some((lane.index(), e.time)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(mines, [(1, TimeUs(4_000 * MS)), (0, TimeUs(4_500 * MS))]);
+    assert!(
+        report
+            .live
+            .iter()
+            .filter(|e| matches!(
+                e.kind,
+                JudgeEventKind::Judged { .. }
+                    | JudgeEventKind::PlaySound { .. }
+                    | JudgeEventKind::EmptyPoor { .. }
+            ))
+            .all(|e| e.time >= TimeUs(6_000 * MS)),
+        "{:?}",
+        report.live
+    );
+    assert!(report.result.as_ref().unwrap().matches_live);
+    // The record keeps the early presses, and re-evaluates to the same
+    // events after a round trip through its encoding.
+    let records = records.borrow();
+    let record = &records[0];
+    assert_eq!(record.start.opened_at, TimeUs(1_800 * MS));
+    let early = record
+        .events
+        .iter()
+        .filter(|e| e.received < TimeUs(2_000 * MS))
+        .count();
+    assert_eq!(early, 2);
+    let back = replay::decode(&replay::encode(record), &replay::DecodeLimits::STANDARD).unwrap();
+    assert_eq!(&back, record);
+    let re = replay::verify::evaluate_under(&back, &chart, loaded.preset()).unwrap();
+    assert!(re.as_played);
+    assert_eq!(re.evaluation.events, report.live);
 }

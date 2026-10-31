@@ -19,16 +19,26 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ::audio::{
-    AudioEngine, AudioOutput, BgmSchedule, Gain, InvalidVolume, MAX_VOLUME, OutputError,
-    ScheduledKind, SoundBank,
+    AudioEngine, AudioOutput, BgmSchedule, FrameLine, Gain, InvalidVolume, MAX_VOLUME, OutputError,
+    ScheduledKind, SeekSource, SoundBank,
 };
 use bms_model::TimeUs;
 
+use crate::restore::{Restore, Restored};
 use crate::sound::{AudioQueue, audio_link};
+
+/// A play's key sound queue and its restore, retired at the next play and
+/// freed on the game thread.
+type RetiredPlay = (AudioQueue, Option<Box<Restore>>);
+
+/// How many times a read of the frame line is tried before the last read
+/// is taken: the audio thread publishes it in three stores, so a read that
+/// overlaps them is tried again.
+const LINE_READS: usize = 64;
 
 /// Control messages a play sends at most (start, seal or ring-out, cancel,
 /// and one to spare), times the plays that may queue before the audio thread wakes.
@@ -87,6 +97,9 @@ struct Retired {
     id: u64,
     /// Whether the engine took the load.
     taken: bool,
+    /// What the engine plays after the load, for planning its seeks: one
+    /// `Arc` clone, freed with the answer on the game thread.
+    source: SeekSource,
 }
 
 /// What the game thread tells the audio thread.
@@ -103,7 +116,10 @@ pub enum AudioCtl {
         id: u64,
     },
     /// A play starts: chart time 0 at `origin` on the output's timeline,
-    /// key sounds from `queue`, the sum at `gain` for the whole play.
+    /// key sounds from `queue`, the sum at `gain` for the whole play, and a
+    /// practice round's audio restored by `restore` (design.md "Mid-Chart
+    /// Start and Section Repeat"): one message, so no pass runs between the
+    /// start and the seek.
     Play {
         /// Where chart time 0 lies.
         origin: TimeUs,
@@ -114,6 +130,9 @@ pub enum AudioCtl {
         /// The play's fixed gain on the sum: [`Gain::HEADROOM`], or the
         /// chart's normalization gain (design.md "Algorithms").
         gain: Gain,
+        /// A round's restore, planned on `origin`'s frame line; it goes
+        /// back to the game thread with `queue` at the next play.
+        restore: Option<Box<Restore>>,
     },
     /// The play was aborted: every sound stops.
     Cancel,
@@ -199,6 +218,49 @@ impl AudioCounters {
     pub fn steals(&self) -> u64 {
         self.0.steals.load(Ordering::Acquire)
     }
+
+    /// How play `generation`'s audio was restored, once the audio thread
+    /// took its start; `None` for a play without a restore, or another play.
+    #[must_use]
+    pub fn restored(&self, generation: u64) -> Option<Restored> {
+        let packed = self.0.restored.load(Ordering::Acquire);
+        if packed >> 8 == generation {
+            Restored::from_code((packed & 0xff) as u8)
+        } else {
+            None
+        }
+    }
+
+    /// Where the chart times of a play whose chart time 0 lies at `origin`
+    /// fall on the output, by the audio thread's last step: its mix clock,
+    /// output offset and written frames, read together. For planning a
+    /// round's restore ([`crate::Restorer::plan`]) once the play's origin is
+    /// fixed.
+    #[must_use]
+    pub fn frame_line(&self, origin: TimeUs) -> FrameLine {
+        let s = &*self.0;
+        let mut read = (0, 0);
+        for _ in 0..LINE_READS {
+            let before = s.line_seq.load(Ordering::Acquire);
+            read = (
+                s.line_shift.load(Ordering::Acquire),
+                s.line_written.load(Ordering::Acquire),
+            );
+            if before.is_multiple_of(2) && s.line_seq.load(Ordering::Acquire) == before {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        // A read the audio thread kept overlapping is at worst a clock
+        // moved since: the seek is then degraded but bounded (design.md
+        // "Audio").
+        FrameLine {
+            rate: s.rate,
+            period: s.period,
+            block_start: read.1,
+            base_us: origin.0.saturating_sub(read.0),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -226,6 +288,20 @@ struct Shared {
     deferred_wakes: AtomicU64,
     /// The mixer's stolen voices so far.
     steals: AtomicU64,
+    /// How the latest play's restore went: its generation shifted left 8
+    /// bits, with [`Restored`]'s code (0: no restore).
+    restored: AtomicU64,
+    /// The frame line's publication count: odd while the audio thread
+    /// writes it.
+    line_seq: AtomicU64,
+    /// A play's origin minus its frame line's base: the output offset plus
+    /// the mix clock's anchor.
+    line_shift: AtomicI64,
+    /// The first frame not yet written, a pass's first.
+    line_written: AtomicU64,
+    /// The output's rate and pass size, fixed for the engine.
+    rate: u32,
+    period: u32,
     failure: OnceLock<OutputError>,
 }
 
@@ -233,7 +309,10 @@ struct Shared {
 #[derive(Debug)]
 pub struct AudioControl {
     ctl: rtrb::Producer<AudioCtl>,
-    retired: rtrb::Consumer<AudioQueue>,
+    retired: rtrb::Consumer<RetiredPlay>,
+    /// What the engine plays, as of its latest load: for planning a round's
+    /// restore.
+    source: SeekSource,
     /// Whether a start was sent whose retired queue has not come back.
     in_flight: bool,
     /// Banks and schedules a load replaced, freed here.
@@ -256,17 +335,21 @@ pub struct AudioControl {
 pub struct AudioWorker {
     engine: AudioEngine,
     ctl: rtrb::Consumer<AudioCtl>,
-    retired: rtrb::Producer<AudioQueue>,
+    retired: rtrb::Producer<RetiredPlay>,
     loads: rtrb::Producer<Retired>,
     /// A replaced bank the full return queue did not take.
     unreturned_load: Option<Retired>,
     shared: Arc<Shared>,
     queue: AudioQueue,
+    /// The current play's restore, kept until the next play retires it.
+    restore: Option<Box<Restore>>,
+    /// The current play's origin.
+    origin: TimeUs,
     generation: u64,
     sealed: bool,
     exited: bool,
-    /// A retired queue the full return queue did not take.
-    unreturned: Option<AudioQueue>,
+    /// A retired play the full return queue did not take.
+    unreturned: Option<RetiredPlay>,
     /// Where key sound latencies go, if anywhere; a full queue drops them.
     probe: Option<rtrb::Producer<AudioProbe>>,
     /// The number of the latest queue change applied.
@@ -285,39 +368,49 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
     let (ret_tx, ret_rx) = rtrb::RingBuffer::new(RETIRED_CAPACITY);
     let (loads_tx, loads_rx) = rtrb::RingBuffer::new(LOADS_CAPACITY);
     let rate = engine.bank().rate();
-    let shared = Arc::new(Shared::default());
-    (
-        AudioControl {
-            ctl: ctl_tx,
-            retired: ret_rx,
-            in_flight: false,
-            loads: loads_rx,
-            load_id: 0,
-            outstanding: None,
-            rate,
-            shared: Arc::clone(&shared),
-            generation: 0,
-            queue_change: 0,
-        },
-        AudioWorker {
-            engine,
-            ctl: ctl_rx,
-            retired: ret_tx,
-            loads: loads_tx,
-            unreturned_load: None,
-            shared,
-            // Before the first play: a queue nothing sends to.
-            queue: audio_link(1).1,
-            generation: 0,
-            sealed: false,
-            exited: false,
-            unreturned: None,
-            probe: None,
-            queue_change: 0,
-            steady_from: None,
-            steady: 0,
-        },
-    )
+    let line = engine.frame_line();
+    let source = engine.seek_source();
+    let shared = Arc::new(Shared {
+        rate: line.rate,
+        period: line.period,
+        ..Shared::default()
+    });
+    let control = AudioControl {
+        ctl: ctl_tx,
+        retired: ret_rx,
+        source,
+        in_flight: false,
+        loads: loads_rx,
+        load_id: 0,
+        outstanding: None,
+        rate,
+        shared: Arc::clone(&shared),
+        generation: 0,
+        queue_change: 0,
+    };
+    let worker = AudioWorker {
+        engine,
+        ctl: ctl_rx,
+        retired: ret_tx,
+        loads: loads_tx,
+        unreturned_load: None,
+        shared,
+        // Before the first play: a queue nothing sends to.
+        queue: audio_link(1).1,
+        restore: None,
+        origin: TimeUs(0),
+        generation: 0,
+        sealed: false,
+        exited: false,
+        unreturned: None,
+        probe: None,
+        queue_change: 0,
+        steady_from: None,
+        steady: 0,
+    };
+    // Before its first step, the line of an engine that has not woken.
+    worker.publish_line();
+    (control, worker)
 }
 
 impl AudioControl {
@@ -345,6 +438,8 @@ impl AudioControl {
     pub fn ready(&mut self) -> Result<(), AudioWaitError> {
         let deadline = Instant::now() + SWITCH_TIMEOUT;
         loop {
+            // The retired queue and restore are freed here, never on the
+            // audio thread.
             if self.in_flight
                 && let Ok(retired) = self.retired.pop()
             {
@@ -372,7 +467,7 @@ impl AudioControl {
     ///
     /// As [`ready`](Self::ready); nothing is sent.
     pub fn play(&mut self, origin: TimeUs, queue: AudioQueue) -> Result<(), AudioWaitError> {
-        self.play_at(origin, queue, Gain::HEADROOM)
+        self.play_at(origin, queue, Gain::HEADROOM, None)
     }
 
     /// Starts a play whose sum takes `gain` from its first frame to its
@@ -382,6 +477,14 @@ impl AudioControl {
     /// ([`ready`](Self::ready)), so the return queue always has room and
     /// the audio thread never frees one.
     ///
+    /// A practice round's `restore`, planned on `origin`'s frame line
+    /// ([`AudioCounters::frame_line`]), is applied with the start: the
+    /// first plan, the fallback when the first is late, and otherwise the
+    /// schedule is stopped, so the round plays with its BGM silent rather
+    /// than from chart time 0 ([`Restore::apply`]); the outcome is
+    /// [`AudioCounters::restored`]. The box comes back with the queue and is
+    /// freed here.
+    ///
     /// # Errors
     ///
     /// As [`ready`](Self::ready); nothing is sent.
@@ -390,6 +493,7 @@ impl AudioControl {
         origin: TimeUs,
         queue: AudioQueue,
         gain: Gain,
+        restore: Option<Box<Restore>>,
     ) -> Result<(), AudioWaitError> {
         self.ready()?;
         self.in_flight = true;
@@ -400,8 +504,16 @@ impl AudioControl {
             queue,
             generation,
             gain,
+            restore,
         });
         Ok(())
+    }
+
+    /// What the engine plays, as of its latest load: for a round's
+    /// [`Restorer`](crate::Restorer). One `Arc` clone.
+    #[must_use]
+    pub fn seek_source(&self) -> SeekSource {
+        self.source.clone()
     }
 
     /// Hands another chart's `bank` and `schedule` to the engine, between
@@ -457,6 +569,9 @@ impl AudioControl {
         loop {
             if let Ok(retired) = self.loads.pop() {
                 let (answered, taken) = (retired.id, retired.taken);
+                if answered == id && taken {
+                    self.source = retired.source.clone();
+                }
                 drop(retired);
                 if answered == id {
                     self.outstanding = None;
@@ -632,19 +747,16 @@ impl AudioWorker {
                 AudioCtl::Load { bank, schedule, id } => {
                     self.steady_from = None;
                     while self.queue.commands().pop().is_ok() {}
-                    let retired = match self.engine.replace(bank, schedule) {
-                        Ok((bank, schedule)) => Retired {
-                            _bank: bank,
-                            _schedule: schedule,
-                            id,
-                            taken: true,
-                        },
-                        Err((bank, schedule)) => Retired {
-                            _bank: bank,
-                            _schedule: schedule,
-                            id,
-                            taken: false,
-                        },
+                    let (taken, (bank, schedule)) = match self.engine.replace(bank, schedule) {
+                        Ok(old) => (true, old),
+                        Err(refused) => (false, refused),
+                    };
+                    let retired = Retired {
+                        _bank: bank,
+                        _schedule: schedule,
+                        id,
+                        taken,
+                        source: self.engine.seek_source(),
                     };
                     // One load is outstanding at a time, so the queue has
                     // room; were it full, the answer would wait here, still
@@ -658,14 +770,27 @@ impl AudioWorker {
                     queue,
                     generation,
                     gain,
+                    restore,
                 } => {
                     // A `Gain` is always in range.
                     let _ = self.engine.set_gain(gain.get());
                     self.engine.restart(origin);
-                    let old = std::mem::replace(&mut self.queue, queue);
+                    self.origin = origin;
+                    // A round's restore: the first plan, the fallback when
+                    // it is late, else silence; never the schedule from 0.
+                    let restored = restore
+                        .as_deref()
+                        .map_or(0, |r| r.apply(&mut self.engine).code());
+                    self.shared
+                        .restored
+                        .store(generation << 8 | u64::from(restored), Ordering::Release);
+                    let old = (
+                        std::mem::replace(&mut self.queue, queue),
+                        std::mem::replace(&mut self.restore, restore),
+                    );
                     // The return queue has room: the game thread took the
                     // previous start's queue before sending this one. Were
-                    // it full, the queue would wait here, still owned,
+                    // it full, the pair would wait here, still owned,
                     // rather than be freed on this thread.
                     if let Err(rtrb::PushError::Full(old)) = self.retired.push(old) {
                         self.unreturned = Some(old);
@@ -690,6 +815,21 @@ impl AudioWorker {
             }
         }
         !self.exited
+    }
+
+    /// Publishes where a play's chart times fall on the output now
+    /// ([`AudioCounters::frame_line`]): the two stores sit between two
+    /// steps of the publication count, so a reader sees them together.
+    fn publish_line(&self) {
+        let line = self.engine.frame_line();
+        let s = &*self.shared;
+        s.line_seq.fetch_add(1, Ordering::AcqRel);
+        s.line_shift.store(
+            self.origin.0.saturating_sub(line.base_us),
+            Ordering::Release,
+        );
+        s.line_written.store(line.block_start, Ordering::Release);
+        s.line_seq.fetch_add(1, Ordering::AcqRel);
     }
 
     fn publish_steady(&self) {
@@ -736,6 +876,7 @@ impl AudioWorker {
                 return Err(e);
             }
         };
+        self.publish_line();
         self.shared
             .underruns
             .store(self.engine.underruns(), Ordering::Release);
@@ -804,5 +945,35 @@ impl AudioWorker {
     #[must_use]
     pub const fn engine(&self) -> &AudioEngine {
         &self.engine
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use ::audio::{AudioEngine, SoundBank};
+    use bms_model::TimeUs;
+
+    use super::audio_control;
+
+    /// A read of the frame line overlapping a publication that never ends
+    /// (the audio thread stopped between its stores) gives up after a
+    /// bounded number of tries and takes what it read, rather than spin.
+    #[test]
+    fn a_frame_line_read_is_bounded() {
+        let bank = Arc::new(SoundBank::from_sounds(48_000, Vec::new()));
+        let engine = AudioEngine::new(bank, &[], 48_000, 480, 4, 0).unwrap();
+        let (control, worker) = audio_control(engine);
+        let counters = control.counters();
+        let settled = counters.frame_line(TimeUs(1_000));
+        assert_eq!(settled.base_us, 1_000);
+        assert_eq!((settled.rate, settled.period), (48_000, 480));
+        // Mid-publication: odd, with a shift the worker never finished.
+        worker.shared.line_seq.fetch_add(1, Ordering::AcqRel);
+        worker.shared.line_shift.store(500, Ordering::Release);
+        let torn = counters.frame_line(TimeUs(1_000));
+        assert_eq!(torn.base_us, 500);
     }
 }

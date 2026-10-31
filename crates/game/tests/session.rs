@@ -2333,3 +2333,66 @@ fn failed_save_reaches_the_sink_unsaved() {
         Some(game::BestView::NotCounted("heard 1".to_owned()))
     );
 }
+
+#[test]
+fn a_session_round_restores_at_its_lead_in_start() {
+    // A 60 s BGM sound at 5 s whose level counts its 10 ms blocks, and
+    // targets at 10 and 12 s. The round of [10 s, 13 s) opens at 7.8 s and
+    // its audio is restored at 8 s: the first frame that sounds is the
+    // sound's 3.00 s block, and the BGM goes on from there.
+    let (_dir, root) = temp_root();
+    let chart = ChartBuilder::new(120_000)
+        .sound("long.wav")
+        .bgm(TimeUs(5_000 * MS), SoundId(0))
+        .tap(lane(1), TimeUs(10_000 * MS))
+        .tap(lane(1), TimeUs(12_000 * MS))
+        .build()
+        .unwrap();
+    let level = |k: usize| i16::try_from(k / 480 % 1_000 + 1).unwrap();
+    let bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        vec![Sound::mono((0..60 * RATE as usize).map(level).collect())],
+    ));
+    let settings = tapestry_settings(&root);
+    let events = Events::default();
+    let loaded = Loaded::load(
+        root.clone(),
+        settings,
+        &chart_file(&root),
+        config(),
+        parts(&root, &chart, &events),
+    )
+    .unwrap();
+    let engine = AudioEngine::new(bank, &chart.bgm, RATE, PERIOD, MAX_VOICES, 64).unwrap();
+    let device = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let audio = RunnerAudio::new(engine, RecordingOutput::new(device, 20 * RATE as usize));
+    let mut session = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
+    let practice = game::Practice {
+        start: TimeUs(10_000 * MS),
+        end: TimeUs(13_000 * MS),
+        lead_in: game::LEAD_IN,
+        initial_gauges: session.preset().gauges.iter().map(|g| g.start).collect(),
+        repeat: false,
+    };
+    session.set_practice(Some(practice)).unwrap();
+    let report = session
+        .play(script(vec![connect(0)], &[(9_000 * MS, Command::Quit)]))
+        .unwrap();
+    assert_eq!(report.end, PlayEnd::Aborted(AbortCause::Quit));
+    assert_eq!(
+        report.record.as_ref().unwrap().start.opened_at,
+        TimeUs(7_800 * MS)
+    );
+    let left: Vec<f32> = session
+        .audio()
+        .output()
+        .samples()
+        .iter()
+        .step_by(2)
+        .copied()
+        .collect();
+    let first = left.iter().position(|&x| x != 0.0).unwrap();
+    let at = |f: usize| (left[f] / audio::HEADROOM * 32_768.0).round();
+    assert_eq!(at(first), 301.0);
+    assert_eq!(at(first + 480), 302.0);
+}
