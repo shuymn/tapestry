@@ -220,6 +220,12 @@ pub struct Skin {
     widget_quads: u32,
 }
 
+/// A table index from a definition's `u32`, past every table when it
+/// does not fit.
+fn index(i: u32) -> usize {
+    usize::try_from(i).unwrap_or(usize::MAX)
+}
+
 /// The slot `timer` reads with `whens` `when` timers: a built-in slot, or
 /// `BUILTIN` plus the `when` index.
 fn slot_of(timer: TimerRef, whens: usize) -> Option<usize> {
@@ -274,9 +280,7 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
             if p.bind != Bind::None {
                 return Err(judge(JudgeError::Bound));
             }
-            let def = usize::try_from(i)
-                .ok()
-                .and_then(|i| def.widgets.judges.get(i));
+            let def = def.widgets.judges.get(index(i));
             if let Some((part, _)) = def
                 .into_iter()
                 .flat_map(JudgeDef::tracks)
@@ -313,10 +317,9 @@ fn check_widget_images(
     w: &WidgetDefs,
     frames: &impl Fn(u32) -> Option<u16>,
 ) -> Result<(), LoadError> {
-    let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
     match source {
         Source::Number(i) => {
-            if let Some(n) = w.numbers.get(at(i)) {
+            if let Some(n) = w.numbers.get(index(i)) {
                 n.digits
                     .check_image(frames(n.digits.image))
                     .map_err(|error| LoadError::Number { element, error })?;
@@ -325,7 +328,7 @@ fn check_widget_images(
         Source::Gauge(i) => {
             if let Some((look, part, below, _)) = w
                 .gauges
-                .get(at(i))
+                .get(index(i))
                 .into_iter()
                 .flat_map(GaugeDef::images)
                 .find(|&(.., image)| frames(image).is_none())
@@ -335,7 +338,7 @@ fn check_widget_images(
             }
         }
         Source::Judge(i) => {
-            let Some(j) = w.judges.get(at(i)) else {
+            let Some(j) = w.judges.get(index(i)) else {
                 return Ok(());
             };
             let judge = |error| LoadError::Judge { element, error };
@@ -360,23 +363,22 @@ fn check_widget_images(
 /// The widget parameter checks of [`Skin::new`] for one element's
 /// widget, whose index is valid.
 fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result<(), LoadError> {
-    let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
     match source {
         Source::Number(i) => {
-            if let Some(n) = w.numbers.get(at(i)) {
+            if let Some(n) = w.numbers.get(index(i)) {
                 n.digits
                     .check()
                     .map_err(|error| LoadError::Number { element, error })?;
             }
         }
         Source::Gauge(i) => {
-            if let Some(g) = w.gauges.get(at(i)) {
+            if let Some(g) = w.gauges.get(index(i)) {
                 g.check()
                     .map_err(|error| LoadError::Gauge { element, error })?;
             }
         }
         Source::Judge(i) => {
-            let Some(j) = w.judges.get(at(i)) else {
+            let Some(j) = w.judges.get(index(i)) else {
                 return Ok(());
             };
             let judge = |error| LoadError::Judge { element, error };
@@ -399,15 +401,14 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
 /// The widget quads one frame of `source`'s element can push at worst:
 /// 0 for an image or the lanes, which `quad_capacity` counts apart.
 fn worst(source: Source, w: &WidgetDefs) -> u32 {
-    let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
     match source {
         Source::Image(_) | Source::Lanes => 0,
         Source::Number(i) => w
             .numbers
-            .get(at(i))
+            .get(index(i))
             .map_or(0, |n| u32::from(n.digits.cells)),
-        Source::Gauge(i) => w.gauges.get(at(i)).map_or(0, GaugeDef::quads),
-        Source::Judge(i) => w.judges.get(at(i)).map_or(0, JudgeDef::quads),
+        Source::Gauge(i) => w.gauges.get(index(i)).map_or(0, GaugeDef::quads),
+        Source::Judge(i) => w.judges.get(index(i)).map_or(0, JudgeDef::quads),
     }
 }
 
@@ -435,14 +436,12 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
             }
             Source::Image(_) | Source::Gauge(_) | Source::Number(_) | Source::Judge(_) => {
                 let b = match e.source {
-                    Source::Number(i) => usize::try_from(i)
-                        .ok()
-                        .and_then(|i| def.widgets.numbers.get(i))
+                    Source::Number(i) => def
+                        .widgets
+                        .numbers
+                        .get(index(i))
                         .and_then(|n| n.digits.bounds(&e.track)),
-                    Source::Judge(i) => usize::try_from(i)
-                        .ok()
-                        .and_then(|i| def.widgets.judges.get(i))
-                        .and_then(JudgeDef::bounds),
+                    Source::Judge(i) => def.widgets.judges.get(index(i)).and_then(JudgeDef::bounds),
                     Source::Image(_) | Source::Gauge(_) | Source::Lanes => e.track.bounds(),
                 };
                 if let Some(b) = b {
@@ -552,12 +551,11 @@ impl Skin {
         {
             return Err(LoadError::VisibleNotBool { element });
         }
-        let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
         for (element, e) in elements.iter().enumerate() {
             match e.source {
                 Source::Number(i) => {
                     if w.numbers
-                        .get(at(i))
+                        .get(index(i))
                         .is_some_and(|n| n.value.ty() != Ty::Int)
                     {
                         let error = NumberError::NotInt;
@@ -567,7 +565,7 @@ impl Skin {
                 Source::Judge(i) => {
                     if let Some((part, _)) = w
                         .judges
-                        .get(at(i))
+                        .get(index(i))
                         .into_iter()
                         .flat_map(JudgeDef::visibles)
                         .find(|(_, v)| v.ty() != Ty::Bool)
@@ -586,7 +584,7 @@ impl Skin {
             if let Source::Judge(i) = e.source
                 && let Some((part, _)) = w
                     .judges
-                    .get(at(i))
+                    .get(index(i))
                     .into_iter()
                     .flat_map(JudgeDef::timers)
                     .find(|&(_, t)| slot_of(t, whens.len()).is_none())
@@ -597,12 +595,12 @@ impl Skin {
         }
         let images = def.sheet.images();
         let exists = |i: u32| usize::try_from(i).is_ok_and(|i| i < images.len());
-        let frames = |i: u32| images.get(at(i)).map(|m| m.frames);
+        let frames = |i: u32| images.get(index(i)).map(|m| m.frames);
         if let Some(element) = elements.iter().position(|e| match e.source {
             Source::Image(_) | Source::Lanes => false,
-            Source::Number(i) => w.numbers.get(at(i)).is_none(),
-            Source::Gauge(i) => w.gauges.get(at(i)).is_none(),
-            Source::Judge(i) => w.judges.get(at(i)).is_none(),
+            Source::Number(i) => w.numbers.get(index(i)).is_none(),
+            Source::Gauge(i) => w.gauges.get(index(i)).is_none(),
+            Source::Judge(i) => w.judges.get(index(i)).is_none(),
         }) {
             return Err(LoadError::UnknownWidget { element });
         }
@@ -654,11 +652,11 @@ impl Skin {
         // part visibilities, so they are charged per referencing element.
         let per_element = elements.iter().flat_map(|e| {
             let number = match e.source {
-                Source::Number(i) => w.numbers.get(at(i)).map(|n| &n.value),
+                Source::Number(i) => w.numbers.get(index(i)).map(|n| &n.value),
                 _ => None,
             };
             let judge = match e.source {
-                Source::Judge(i) => w.judges.get(at(i)),
+                Source::Judge(i) => w.judges.get(index(i)),
                 _ => None,
             };
             number
@@ -680,12 +678,11 @@ impl Skin {
         }
         let widget_quads = u32::try_from(widget_quads).unwrap_or(MAX_WIDGET_QUADS);
         let image = |i: u32| {
-            let i = usize::try_from(i).unwrap_or(usize::MAX);
-            let m = images.get(i);
+            let m = images.get(index(i));
             ImageRef {
                 first: m.map_or(0, |m| m.first),
                 frames: m.map_or(0, |m| m.frames),
-                cycle: cycles.get(i).copied().flatten(),
+                cycle: cycles.get(index(i)).copied().flatten(),
                 filter: m.map_or(Filter::Linear, |m| m.filter),
             }
         };
@@ -742,9 +739,9 @@ impl Skin {
                 kind: match e.source {
                     Source::Image(i) => Kind::Image(image(i)),
                     Source::Lanes => Kind::Lanes,
-                    Source::Number(i) => Kind::Number(at(i)),
-                    Source::Gauge(i) => Kind::Gauge(at(i)),
-                    Source::Judge(i) => Kind::Judge(at(i)),
+                    Source::Number(i) => Kind::Number(index(i)),
+                    Source::Gauge(i) => Kind::Gauge(index(i)),
+                    Source::Judge(i) => Kind::Judge(index(i)),
                 },
                 track: e.track,
                 slot,
