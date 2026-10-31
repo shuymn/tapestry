@@ -79,31 +79,40 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// Every refusal, by its stored number (its index).
-    const ALL: [Self; 15] = [
-        Self::Missing,
-        Self::Unreadable,
-        Self::Decode,
-        Self::Evaluator,
-        Self::PresetCopy,
-        Self::Loader,
-        Self::ChartNotInLibrary,
-        Self::ChartUnreadable,
-        Self::Load,
-        Self::Resolved,
-        Self::Played,
-        Self::Transform,
-        Self::TooLarge,
-        Self::Eval,
-        Self::Panicked,
+    /// Every refusal with its name, its index the number it is stored as.
+    const TABLE: [(Self, &'static str); 15] = [
+        (Self::Missing, "missing"),
+        (Self::Unreadable, "unreadable"),
+        (Self::Decode, "decode"),
+        (Self::Evaluator, "evaluator"),
+        (Self::PresetCopy, "preset copy"),
+        (Self::Loader, "loader"),
+        (Self::ChartNotInLibrary, "chart not in library"),
+        (Self::ChartUnreadable, "chart unreadable"),
+        (Self::Load, "load"),
+        (Self::Resolved, "resolved"),
+        (Self::Played, "played"),
+        (Self::Transform, "transform"),
+        (Self::TooLarge, "too large"),
+        (Self::Eval, "eval"),
+        (Self::Panicked, "panicked"),
     ];
 
+    /// The number it is stored as.
     fn number(self) -> i64 {
-        Self::ALL
+        Self::TABLE
             .iter()
-            .position(|&r| r == self)
+            .position(|&(r, _)| r == self)
             .and_then(|i| i64::try_from(i).ok())
             .unwrap_or(-1)
+    }
+
+    /// The refusal stored as `n`.
+    fn of_number(n: i64) -> Option<Self> {
+        usize::try_from(n)
+            .ok()
+            .and_then(|i| Self::TABLE.get(i))
+            .map(|&(r, _)| r)
     }
 
     /// Whether the refusal stands as long as the record file and the
@@ -168,8 +177,9 @@ pub struct Refusals {
 }
 
 impl Refusals {
-    fn count(&mut self, r: Refusal) {
-        let n = match r {
+    /// The count of `r`.
+    const fn of(&mut self, r: Refusal) -> &mut u64 {
+        match r {
             Refusal::Missing => &mut self.missing,
             Refusal::Unreadable => &mut self.unreadable,
             Refusal::Decode => &mut self.decode,
@@ -185,53 +195,32 @@ impl Refusals {
             Refusal::TooLarge => &mut self.too_large,
             Refusal::Eval => &mut self.eval,
             Refusal::Panicked => &mut self.panicked,
-        };
-        *n += 1;
+        }
+    }
+
+    fn count(&mut self, r: Refusal) {
+        *self.of(r) += 1;
+    }
+
+    /// Each reason with its name and count, in [`Refusal`]'s order.
+    fn counts(mut self) -> impl Iterator<Item = (&'static str, u64)> {
+        Refusal::TABLE
+            .map(|(r, name)| (name, *self.of(r)))
+            .into_iter()
     }
 
     /// Every refusal counted.
     #[must_use]
-    pub const fn total(&self) -> u64 {
-        self.missing
-            + self.unreadable
-            + self.decode
-            + self.evaluator
-            + self.preset_copy
-            + self.loader
-            + self.chart_not_in_library
-            + self.chart_unreadable
-            + self.load
-            + self.resolved
-            + self.played
-            + self.transform
-            + self.too_large
-            + self.eval
-            + self.panicked
+    pub fn total(&self) -> u64 {
+        self.counts().map(|(_, n)| n).sum()
     }
 }
 
 impl fmt::Display for Refusals {
     /// The reasons counted, `reason n` each, comma separated.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let all = [
-            ("missing", self.missing),
-            ("unreadable", self.unreadable),
-            ("decode", self.decode),
-            ("evaluator", self.evaluator),
-            ("preset copy", self.preset_copy),
-            ("loader", self.loader),
-            ("chart not in library", self.chart_not_in_library),
-            ("chart unreadable", self.chart_unreadable),
-            ("load", self.load),
-            ("resolved", self.resolved),
-            ("played", self.played),
-            ("transform", self.transform),
-            ("too large", self.too_large),
-            ("eval", self.eval),
-            ("panicked", self.panicked),
-        ];
         let mut first = true;
-        for (name, n) in all.into_iter().filter(|&(_, n)| n > 0) {
+        for (name, n) in self.counts().filter(|&(_, n)| n > 0) {
             if !first {
                 f.write_str(", ")?;
             }
@@ -288,11 +277,14 @@ pub(super) enum Item {
     },
 }
 
-/// What processing one record came to.
+/// What verifying one record came to.
 enum Outcome {
-    Item(Item),
-    Skipped,
+    /// Its contribution.
+    Counted(Box<Contribution>),
+    /// Why it was refused.
     Refused(Refusal),
+    /// The scan is being dropped.
+    Stop,
 }
 
 /// How the phase goes on after a step.
@@ -348,9 +340,8 @@ fn refused_unchanged(
         )
         .optional()?;
     Ok(reason
-        .and_then(|n| usize::try_from(n).ok())
-        .and_then(|i| Refusal::ALL.get(i))
-        .is_some_and(|r| r.terminal()))
+        .and_then(Refusal::of_number)
+        .is_some_and(Refusal::terminal))
 }
 
 /// Whether the play `(path, body)` is counted.
@@ -637,13 +628,12 @@ impl Scanner<'_> {
             return Ok(Flow::Go);
         }
         match self.verify(path, &record, id, chart)? {
-            (Flow::Stop, _) => Ok(Flow::Stop),
-            (Flow::Go, Outcome::Item(item)) => {
-                self.push_item(item)?;
+            Outcome::Stop => Ok(Flow::Stop),
+            Outcome::Counted(c) => {
+                self.push_item(Item::Counted(c))?;
                 Ok(Flow::Go)
             }
-            (Flow::Go, Outcome::Skipped) => Ok(Flow::Go),
-            (Flow::Go, Outcome::Refused(reason)) => {
+            Outcome::Refused(reason) => {
                 let waits = matches!(
                     reason,
                     Refusal::ChartNotInLibrary | Refusal::ChartUnreadable
@@ -684,11 +674,11 @@ impl Scanner<'_> {
         record: &PlayRecord,
         id: PlayId,
         chart: &mut Option<ChartFile>,
-    ) -> rusqlite::Result<(Flow, Outcome)> {
+    ) -> rusqlite::Result<Outcome> {
         macro_rules! step {
             () => {
                 if let Flow::Stop = self.step()? {
-                    return Ok((Flow::Stop, Outcome::Skipped));
+                    return Ok(Outcome::Stop);
                 }
             };
         }
@@ -696,7 +686,7 @@ impl Scanner<'_> {
             ($e:expr) => {
                 match $e {
                     Ok(v) => v,
-                    Err(reason) => return Ok((Flow::Go, Outcome::Refused(reason))),
+                    Err(reason) => return Ok(Outcome::Refused(reason)),
                 }
             };
         }
@@ -722,8 +712,8 @@ impl Scanner<'_> {
         }
         let (chart_file, bytes) = match chart.as_ref().map(|c| &c.file) {
             Some(Ok((p, bytes))) => (p.clone(), bytes),
-            Some(Err(reason)) => return Ok((Flow::Go, Outcome::Refused(*reason))),
-            None => return Ok((Flow::Go, Outcome::Refused(Refusal::ChartUnreadable))),
+            Some(Err(reason)) => return Ok(Outcome::Refused(*reason)),
+            None => return Ok(Outcome::Refused(Refusal::ChartUnreadable)),
         };
         step!();
         #[cfg(test)]
@@ -756,10 +746,7 @@ impl Scanner<'_> {
                 &preset,
             ))
         }));
-        Ok((
-            Flow::Go,
-            Outcome::Item(Item::Counted(Box::new(contribution))),
-        ))
+        Ok(Outcome::Counted(Box::new(contribution)))
     }
 }
 
