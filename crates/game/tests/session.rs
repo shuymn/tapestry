@@ -185,9 +185,13 @@ fn status(report: &PlayReport) -> (EndStatus, TimeUs) {
     (s.end, s.finalized)
 }
 
-fn file_name(report: &PlayReport) -> String {
+/// The number of the saved record's file, `<n>-<time>.tprl`.
+fn number(report: &PlayReport) -> u64 {
     let saved = report.saved.as_ref().unwrap().as_ref().unwrap();
-    saved.path.file_name().unwrap().to_str().unwrap().to_owned()
+    let name = saved.path.file_name().unwrap().to_str().unwrap();
+    let (n, time) = name.trim_end_matches(".tprl").split_once('-').unwrap();
+    assert!(time.parse::<u64>().is_ok(), "{name}");
+    n.parse().unwrap()
 }
 
 const NOTES: [(u8, i64); 6] = [
@@ -225,10 +229,7 @@ fn retry_resets_judgment_and_starts_a_new_log() {
     assert_eq!(two.tally.counts.perfect, 6);
     assert_eq!(two.live[0].seq, 0);
     // Two logs, numbered in order, each decoding to its record.
-    assert_eq!(
-        (file_name(&one), file_name(&two)),
-        ("1.tprl".to_owned(), "2.tprl".to_owned())
-    );
+    assert_eq!((number(&one), number(&two)), (1, 2));
     for r in [&one, &two] {
         let path = &r.saved.as_ref().unwrap().as_ref().unwrap().path;
         let decoded = replay::decode(&fs::read(path).unwrap(), &DecodeLimits::STANDARD).unwrap();
@@ -906,7 +907,7 @@ fn retry_in_the_countdown() {
     assert_eq!((one.record.as_ref(), one.saved.as_ref()), (None, None));
     assert_eq!(status(&two), (EndStatus::EndedMidway, TimeUs(-501_001)));
     assert!(judgments(&two.live).is_empty());
-    assert_eq!(file_name(&two), "1.tprl");
+    assert_eq!(number(&two), 1);
 }
 
 #[test]

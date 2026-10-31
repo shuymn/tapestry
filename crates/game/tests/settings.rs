@@ -448,12 +448,20 @@ fn two_writers_never_replace_each_others_records() {
         }
     }
     let dir = all[0].parent().unwrap();
-    let mut numbers: Vec<u64> = names(dir)
-        .iter()
-        .map(|n| n.trim_end_matches(".tprl").parse().unwrap())
-        .collect();
-    numbers.sort_unstable();
-    assert_eq!(numbers, (1..=50).collect::<Vec<u64>>());
+    assert_eq!(names(dir).len(), 50);
+    // Each writer numbers after the highest it sees; two saved in the same
+    // moment may share a number, never a name.
+    for paths in &saved {
+        let numbers: Vec<u64> = paths
+            .iter()
+            .map(|p| number(p.file_name().unwrap().to_str().unwrap()))
+            .collect();
+        assert!(numbers.is_sorted_by(|a, b| a < b), "{numbers:?}");
+        assert!(
+            numbers.iter().all(|&n| (1..=50).contains(&n)),
+            "{numbers:?}"
+        );
+    }
 }
 
 #[test]
@@ -473,32 +481,30 @@ fn a_record_numbered_last_leaves_no_number_to_save_under() {
     assert_eq!(names(&dir).len(), 1);
 }
 
+/// A record file's number: its name up to the time of saving.
+fn number(name: &str) -> u64 {
+    let stem = name.trim_end_matches(".tprl");
+    stem.split_once('-')
+        .map_or(stem, |(n, _)| n)
+        .parse()
+        .unwrap()
+}
+
+/// Deleting the newest record gives its number again, never its name: an
+/// identical play saved then lands at a new path, so it counts as another
+/// play (design.md "Personal Bests").
 #[test]
-fn saving_gives_up_after_the_bound_of_taken_numbers() {
+fn a_deleted_record_never_gives_its_name_again() {
     let (_dir, root) = temp_root();
     let mut records = LocalRecords::new(root.records());
-    let first = records.save(&sample()).unwrap().path;
-    let dir = first.parent().unwrap().to_owned();
-    fs::remove_file(&first).unwrap();
-    // Names taken by something other than a record file: the scan does not
-    // count them, and publishing moves past each.
-    let taken = |n: u64| fs::create_dir(dir.join(format!("{n}.tprl"))).unwrap();
-    for n in 1..game::SAVE_ATTEMPTS {
-        taken(n);
-    }
-    let last = records.save(&sample()).unwrap().path;
-    assert_eq!(last, dir.join(format!("{}.tprl", game::SAVE_ATTEMPTS)));
-    fs::remove_file(&last).unwrap();
-    taken(game::SAVE_ATTEMPTS);
-    assert!(matches!(
-        records.save(&sample()),
-        Err(game::SaveError::Io(game::IoFailure {
-            kind: std::io::ErrorKind::AlreadyExists,
-            ..
-        }))
-    ));
-    // No temporary file is left either way.
-    assert!(names(&dir).iter().all(|n| n.ends_with(".tprl")));
+    records.save(&sample()).unwrap();
+    let newest = records.save(&sample()).unwrap().path;
+    fs::remove_file(&newest).unwrap();
+    let again = records.save(&sample()).unwrap().path;
+    assert_ne!(again, newest);
+    let name = |p: &std::path::Path| p.file_name().unwrap().to_str().unwrap().to_owned();
+    assert_eq!(number(&name(&again)), 2);
+    assert_eq!(fs::read(&again).unwrap(), replay::encode(&sample()));
 }
 
 #[test]
@@ -523,13 +529,13 @@ fn records_are_numbered_per_chart() {
     let a2 = records.save(&rec(0xab)).unwrap();
     let b1 = records.save(&rec(0xcd)).unwrap();
     let name = |p: &std::path::Path| p.file_name().unwrap().to_str().unwrap().to_owned();
-    assert_eq!(name(&a1.path), "1.tprl");
-    assert_eq!(name(&a2.path), "2.tprl");
-    assert_eq!(name(&b1.path), "1.tprl");
+    assert_eq!(number(&name(&a1.path)), 1);
+    assert_eq!(number(&name(&a2.path)), 2);
+    assert_eq!(number(&name(&b1.path)), 1);
     assert_eq!(dir.file_name().unwrap().to_str().unwrap(), "ab".repeat(32));
     // A number beyond a gap continues from the highest.
-    fs::write(dir.join("9.tprl"), b"x").unwrap();
-    assert_eq!(name(&records.save(&rec(0xab)).unwrap().path), "10.tprl");
+    fs::write(dir.join("9-1.tprl"), b"x").unwrap();
+    assert_eq!(number(&name(&records.save(&rec(0xab)).unwrap().path)), 10);
 }
 
 fn sample() -> replay::PlayRecord {

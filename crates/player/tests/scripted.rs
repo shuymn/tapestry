@@ -464,7 +464,11 @@ fn run_retried(fx: &Fixture, extra: &[&str]) -> (String, Vec<PlayRecord>) {
         assert!(stdout.contains(&line), "{line} in {stdout}");
     }
     let mut paths = records(&fx.appdata);
-    let number = |p: &PathBuf| -> u64 { p.file_stem().unwrap().to_str().unwrap().parse().unwrap() };
+    // `<n>-<time>.tprl`: by number.
+    let number = |p: &PathBuf| -> u64 {
+        let stem = p.file_stem().unwrap().to_str().unwrap();
+        stem.split_once('-').unwrap().0.parse().unwrap()
+    };
     paths.sort_by_key(number);
     let recs = paths
         .iter()
