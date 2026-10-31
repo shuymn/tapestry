@@ -232,6 +232,7 @@ fn capture_takes_buttons_and_turned_axes() {
         }],
     );
     assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
+    assert!(!capture.lower(), "turned toward higher values");
 
     // Arming again starts the count again: 8 before and 8 after is not
     // enough; the relative dial needs 16 too.
@@ -272,6 +273,7 @@ fn capture_takes_buttons_and_turned_axes() {
         }],
     );
     assert_eq!(capture.take(), Some((DIAL, DeviceKind::Controller)));
+    assert!(capture.lower(), "turned toward lower values");
     // A button press is captured at once, its release never.
     capture.arm();
     batch(
@@ -296,6 +298,7 @@ fn capture_takes_buttons_and_turned_axes() {
         capture.take(),
         Some((button_control(4), DeviceKind::Controller))
     );
+    assert!(!capture.lower(), "a button has no direction");
     // Through the wrap: from 250, 4 is +10 the short way round (not -246,
     // which would capture), and 10 then makes 16.
     let (high, low, past) = ([Some(250), None], [Some(4), None], [Some(10), None]);
@@ -310,6 +313,65 @@ fn capture_takes_buttons_and_turned_axes() {
     assert_eq!(capture.take(), None);
     batch(&mut dev, &mut set, &capture, 90, &[at(&past)]);
     assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
+    assert!(!capture.lower(), "forward through the wrap");
+    // And back: from 10, 250 is -16 the short way round (not +240).
+    capture.arm();
+    batch(&mut dev, &mut set, &capture, 100, &[at(&high)]);
+    assert_eq!(capture.take(), Some((X, DeviceKind::Controller)));
+    assert!(capture.lower(), "backward through the wrap");
+}
+
+/// A turn is counted toward a capture in the revolution key config sets
+/// for the axis, as menus will count it: an axis declared with 128 values
+/// that really has 256 moving +80 turned toward higher values, which its
+/// declared range would take as -48. Other axes, and the axis once it is
+/// cleared, count in their declared range.
+#[test]
+fn capture_counts_turns_in_the_revolution_set() {
+    let (mut set, _reader) = recording();
+    set.close_recording();
+    let narrow = [AxisCap {
+        wrap: 128,
+        max: 127,
+        ..caps()[0]
+    }];
+    let capture = Capture::new();
+    let mut dev = HidDevice::new(PAD, &layout(&narrow));
+    let at = |v| [Some(v)];
+    let (low, high) = (at(10), at(90));
+    let turn = |dev: &mut HidDevice, set: &mut SourceSet, t, axes: &[Option<i32>; 1]| {
+        batch(
+            dev,
+            set,
+            &capture,
+            t,
+            &[HidReport {
+                id: 0,
+                buttons: None,
+                axes,
+            }],
+        );
+        capture.take()
+    };
+    turn(&mut dev, &mut set, 10, &low);
+    capture.set_revolution(X, 256);
+    assert_eq!(capture.revolution(X), Some(256));
+    assert_eq!(capture.revolution(DIAL), None);
+    capture.arm();
+    assert_eq!(
+        turn(&mut dev, &mut set, 20, &high),
+        Some((X, DeviceKind::Controller))
+    );
+    assert!(!capture.lower(), "+80 in 256 values");
+    capture.clear_revolution();
+    assert_eq!(capture.revolution(X), None);
+    turn(&mut dev, &mut set, 30, &low);
+    capture.arm();
+    assert_eq!(
+        turn(&mut dev, &mut set, 40, &high),
+        Some((X, DeviceKind::Controller))
+    );
+    assert!(capture.lower(), "-48 in the declared 128");
 }
 
 #[test]

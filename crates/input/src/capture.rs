@@ -49,6 +49,13 @@ struct Slot {
     /// The captured controller press's product ([`pack_product`]); 0 for
     /// a keyboard key or a controller whose product is unknown.
     product: AtomicU64,
+    /// Whether the captured press was an axis turned toward lower values.
+    lower: AtomicBool,
+    /// The axis whose turns are counted in `turn_wrap` values, plus
+    /// [`PRESENT`]; 0 when none.
+    turn_control: AtomicU64,
+    /// Its revolution.
+    turn_wrap: AtomicU64,
     /// How many times the slot was armed.
     armings: AtomicU64,
     /// The axis watched, plus [`PRESENT`]; 0 when none.
@@ -136,6 +143,40 @@ impl Capture {
     #[must_use]
     pub fn product(&self) -> Option<HidProduct> {
         unpack_product(self.0.product.load(Ordering::Acquire))
+    }
+
+    /// Whether the press [`take`](Self::take) returned last was an axis
+    /// turned toward lower values: its offered value was negative. A
+    /// button, a key, or an axis turned toward higher values is not. It
+    /// stays until the next capture.
+    #[must_use]
+    pub fn lower(&self) -> bool {
+        self.0.lower.load(Ordering::Acquire)
+    }
+
+    /// Counts the absolute axis `control`'s turns toward a capture the
+    /// short way round `wrap` values (0: it does not wrap) instead of its
+    /// declared range: the revolution its conversion resolves, which key
+    /// config may just have learnt. Setting it again replaces it.
+    pub fn set_revolution(&self, control: ControlId, wrap: u32) {
+        self.0.turn_wrap.store(u64::from(wrap), Ordering::Relaxed);
+        self.0
+            .turn_control
+            .store(u64::from(control.0) | PRESENT, Ordering::Release);
+    }
+
+    /// Counts every axis's turns in its declared range again.
+    pub fn clear_revolution(&self) {
+        self.0.turn_control.store(0, Ordering::Release);
+    }
+
+    /// The revolution [`set_revolution`](Self::set_revolution) set for
+    /// `control`, if any.
+    #[must_use]
+    pub fn revolution(&self, control: ControlId) -> Option<u32> {
+        let set = self.0.turn_control.load(Ordering::Acquire);
+        (set == u64::from(control.0) | PRESENT)
+            .then(|| self.0.turn_wrap.load(Ordering::Relaxed) as u32)
     }
 
     /// Watches the absolute axis `control`: the input thread notes the
@@ -260,6 +301,7 @@ impl Capture {
             self.0
                 .product
                 .store(product.map_or(0, pack_product), Ordering::Relaxed);
+            self.0.lower.store(packet.value < 0, Ordering::Relaxed);
             let stored = u64::from(packet.control.0) | kind | PRESENT;
             self.0.control.store(stored, Ordering::Release);
         }

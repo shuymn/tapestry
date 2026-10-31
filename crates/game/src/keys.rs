@@ -16,9 +16,10 @@
 //! `device.toml` (scan code 1).
 //!
 //! The scratch has two directions. An axis covers both, and is then
-//! turned a few revolutions so its real range is learnt
-//! ([`capture_keys`]); a button or a key covers one, and the scratch is
-//! prompted for again for the other direction, which F12 skips.
+//! turned a few revolutions so its real range is learnt, then turned the
+//! way that scrolls menus down ([`capture_keys`]); a button or a key
+//! covers one, and the scratch is prompted for again for the other
+//! direction, which F12 skips.
 
 use std::time::{Duration, Instant};
 
@@ -149,6 +150,12 @@ pub struct KeyConfigFlow {
     /// shown so far.
     learning: Option<Option<Watched>>,
     learnt: Option<LearntRange>,
+    /// While the scratch axis is to be turned the way that scrolls menus
+    /// down.
+    turning: bool,
+    /// The menu direction that turn showed: whether down is toward lower
+    /// values.
+    menu_reversed: Option<bool>,
 }
 
 impl KeyConfigFlow {
@@ -163,6 +170,8 @@ impl KeyConfigFlow {
             device: None,
             learning: None,
             learnt: None,
+            turning: false,
+            menu_reversed: None,
         }
     }
 
@@ -197,6 +206,21 @@ impl KeyConfigFlow {
     #[must_use]
     pub fn widened(&self) -> Option<u32> {
         self.learnt.filter(|l| l.widened).map(|l| l.wrap)
+    }
+
+    /// Whether the scratch axis is to be turned the way that scrolls menus
+    /// down.
+    #[must_use]
+    pub const fn turning(&self) -> bool {
+        self.turning
+    }
+
+    /// The scratch axis's menu direction to save in `device.toml`: whether
+    /// it scrolls down toward lower values, as it was turned; `None` when
+    /// it was not (F12 keeps the current setting).
+    #[must_use]
+    pub const fn menu_reversed(&self) -> Option<bool> {
+        self.menu_reversed
     }
 
     /// The role prompted for; `None` once every role is bound.
@@ -359,8 +383,9 @@ pub trait KeyScreen {
 pub enum KeyConfigEnd {
     /// Every role was bound; with the scratch axis's revolution to save,
     /// when it was learnt beyond its declared range
-    /// ([`KeyConfigFlow::widened`]).
-    Done(KeyConfigs, Option<u32>),
+    /// ([`KeyConfigFlow::widened`]), and its menu direction to save, when
+    /// it was turned for it ([`KeyConfigFlow::menu_reversed`]).
+    Done(KeyConfigs, Option<u32>, Option<bool>),
     /// Escape was pressed.
     Cancelled,
     /// The window closed.
@@ -371,6 +396,11 @@ pub enum KeyConfigEnd {
 /// learn its range.
 pub const LEARN_TIME: Duration = Duration::from_secs(10);
 
+/// How long a turn of the scratch axis is not taken as its menu direction
+/// after that prompt shows, so the turning that ended the range learning
+/// does not answer it.
+pub const SETTLE_TIME: Duration = Duration::from_millis(500);
+
 /// Runs the key config screen: each next press `capture` takes (recording
 /// is closed, so none is recorded) goes to the flow, until every role is
 /// bound, Escape is pressed, or the screen closes. Nothing is written
@@ -379,21 +409,30 @@ pub const LEARN_TIME: Duration = Duration::from_secs(10);
 /// When the scratch is bound to an axis, the player turns it a few full
 /// revolutions: its reports are watched until it has crossed its boundary
 /// both ways, [`LEARN_TIME`] has passed, or F12 skips, and the revolution
-/// is decided from what it reported ([`LearntRange`]).
+/// is decided from what it reported ([`LearntRange`]). Then the player
+/// turns it the way that scrolls menus down: the direction of its first
+/// capture turn ([`Capture::lower`]) begun after [`SETTLE_TIME`] decides
+/// it, counted in the revolution menus will count it in (the one learnt
+/// beyond the declared range, else `wrap`, the one `device.toml` sets,
+/// else the declared one), and F12 keeps the current setting.
 pub fn capture_keys(
     capture: &Capture,
     screen: &mut impl KeyScreen,
     current: KeyConfigs,
+    wrap: Option<u32>,
 ) -> KeyConfigEnd {
-    capture_keys_within(capture, screen, current, LEARN_TIME)
+    capture_keys_within(capture, screen, current, wrap, LEARN_TIME, SETTLE_TIME)
 }
 
-/// [`capture_keys`] with `limit` for the range learning.
+/// [`capture_keys`] with `limit` for the range learning and `settle`
+/// before the menu direction is taken.
 pub fn capture_keys_within(
     capture: &Capture,
     screen: &mut impl KeyScreen,
     current: KeyConfigs,
+    wrap: Option<u32>,
     limit: Duration,
+    settle: Duration,
 ) -> KeyConfigEnd {
     let mut flow = KeyConfigFlow::new(current);
     capture.arm();
@@ -415,7 +454,9 @@ pub fn capture_keys_within(
             DeviceKind::Controller => capture.product(),
         };
         match flow.press_from(pressed, product) {
-            Press::Done(keys) => return KeyConfigEnd::Done(keys, flow.widened()),
+            Press::Done(keys) => {
+                return KeyConfigEnd::Done(keys, flow.widened(), flow.menu_reversed);
+            }
             Press::Cancelled => return KeyConfigEnd::Cancelled,
             Press::Bound(Role::Lane(0), ref chosen)
                 if flow.bound.len() == 1
@@ -423,7 +464,13 @@ pub fn capture_keys_within(
                     && chosen[0].kind == DeviceKind::Controller
                     && is_axis(ControlId(chosen[0].control)) =>
             {
-                if let Some(end) = learn_range(capture, screen, &mut flow, control, limit) {
+                // The axis bound: the one turned, or the one kept with F12.
+                let axis = ControlId(chosen[0].control);
+                if let Some(end) = learn_range(capture, screen, &mut flow, axis, limit) {
+                    return end;
+                }
+                let wrap = flow.widened().or(wrap);
+                if let Some(end) = learn_direction(capture, screen, &mut flow, axis, wrap, settle) {
                     return end;
                 }
                 capture.arm();
@@ -485,4 +532,58 @@ fn learn_range(
         }
     });
     None
+}
+
+/// Asks for the scratch axis `control` to be turned the way that scrolls
+/// menus down, and keeps the direction of its first capture turn begun
+/// after `settle`: the way it moved, net and the short way round its
+/// revolution as menus count it (`wrap`, else the declared one). At
+/// `settle` the capture is armed again, dropping a turn captured or
+/// counted before it. F12 keeps the current setting; any other control is
+/// not an answer. Returns how the screen ended if it was cancelled or
+/// closed meanwhile.
+fn learn_direction(
+    capture: &Capture,
+    screen: &mut impl KeyScreen,
+    flow: &mut KeyConfigFlow,
+    control: ControlId,
+    wrap: Option<u32>,
+    settle: Duration,
+) -> Option<KeyConfigEnd> {
+    flow.turning = true;
+    if let Some(wrap) = wrap {
+        capture.set_revolution(control, wrap);
+    }
+    capture.arm();
+    let started = Instant::now();
+    // Armed at the start: with no settle time, already settled.
+    let mut settled = settle.is_zero();
+    let end = loop {
+        screen.show(flow);
+        screen.wait();
+        if screen.closed() {
+            break Some(KeyConfigEnd::Closed);
+        }
+        // Settling now: whatever the axis did before counts for nothing.
+        let settling = !settled && started.elapsed() >= settle;
+        settled |= settling;
+        match capture.take() {
+            Some((ControlId(CANCEL_KEY), DeviceKind::Keyboard)) => {
+                break Some(KeyConfigEnd::Cancelled);
+            }
+            Some((ControlId(KEEP_KEY), DeviceKind::Keyboard)) => break None,
+            Some((c, DeviceKind::Controller))
+                if settled && !settling && c == control && capture.product() == flow.device =>
+            {
+                flow.menu_reversed = Some(capture.lower());
+                break None;
+            }
+            Some(_) => capture.arm(),
+            None if settling => capture.arm(),
+            None => {}
+        }
+    };
+    capture.clear_revolution();
+    flow.turning = false;
+    end
 }

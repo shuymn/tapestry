@@ -51,7 +51,7 @@ pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
-    LearntRange, Press, ROLES, Refusal, capture_keys, capture_keys_within,
+    LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
 };
 pub use live::{Closing, InputWaitError, Leave, LiveError, Opening, Rig};
 pub use logic::{
