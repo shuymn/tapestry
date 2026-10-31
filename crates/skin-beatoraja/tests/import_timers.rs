@@ -120,6 +120,14 @@ fn rank_timers_open_at_their_thresholds() {
         // The timer starts when the condition first holds.
         assert_eq!(d.rects(70), [[50, 1_070, 10, 10]]);
     }
+    // At 27 notes each threshold is a whole score, 2·i, and opens there.
+    for (id, ex) in [(348, 36), (349, 42), (350, 48)] {
+        let mut d = images(&[&format!(r#""timer": {id},"#)], "").drawn_over(27);
+        d.tally = tally(ex - 1, 1);
+        assert!(d.frame(10, &[]).is_empty(), "{id}");
+        d.tally = tally(ex, 1);
+        assert_eq!(d.frame(20, &[]).len(), 1, "{id}");
+    }
     // No notes: never.
     let mut d = images(&[r#""timer": 348,"#], "").drawn_over(0);
     d.tally = tally(1_000, 1);
