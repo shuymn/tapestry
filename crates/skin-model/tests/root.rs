@@ -132,7 +132,7 @@ fn a_listing_skips_links_out_and_counts_them() {
     write(&skin, "bg/a.png", b"");
     fs::create_dir_all(skin.join("bg/sub")).unwrap();
     write(&away, "x.png", b"");
-    link_dir(&skin.join("bg/out"), &away);
+    link_dir(&skin.join("bg").join("out"), &away);
     let root = Root::new(&skin).unwrap();
     let listing = root.list("bg", 16).unwrap();
     assert_eq!(
