@@ -609,17 +609,26 @@ impl AppRig for PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             return;
         };
-        sel.entered_at = self.clock.now();
         // What was typed during the chart belongs to it.
         self.result_input.clear();
-        sel.screen.end_composition();
-        sel.shelf.release();
-        if let Some(ime) = &sel.ime {
-            ime.set(sel.screen.searching());
-        }
-        sel.refresh();
+        sel.entered(self.clock.now());
         println!("select: {} charts listed", sel.screen.listed());
         sel.show(&self.render, None);
+    }
+}
+
+impl Selection {
+    /// Selection is entered at `now`: the composition left from the chart
+    /// goes, the scan goes on, and the list and the bests of the chosen
+    /// preset are read anew, with what the chart's plays counted.
+    fn entered(&mut self, now: TimeUs) {
+        self.entered_at = now;
+        self.screen.end_composition();
+        self.shelf.release();
+        if let Some(ime) = &self.ime {
+            ime.set(self.screen.searching());
+        }
+        self.refresh();
     }
 }
 
@@ -897,7 +906,7 @@ mod tests {
         let mut sel = selection(dir.path());
         let preset = rules::tapestry();
         sel.screen.set_bests_preset(Some(preset.clone()));
-        sel.refresh();
+        sel.entered(TimeUs(1));
         let line = |sel: &Selection| {
             sel.screen
                 .page("")
@@ -932,7 +941,8 @@ mod tests {
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
         // Unchanged until selection is entered.
         assert!(line(&sel).starts_with(&format!("{} ☆", " ".repeat(4 + 17))));
-        sel.refresh();
+        sel.entered(TimeUs(5));
+        assert_eq!(sel.entered_at, TimeUs(5));
         let lamp = preset.gauges[0].id.to_uppercase();
         assert_eq!(line(&sel), format!("    {lamp:11}     2 ☆-   A  / Z"));
     }
