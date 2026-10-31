@@ -32,8 +32,13 @@ fn chart_text(title: &str) -> String {
 
 /// A 50 ms mono 16-bit square wave at 44.1 kHz.
 fn write_wav(path: &Path) {
+    write_wav_at(path, 8_000);
+}
+
+/// [`write_wav`] of `amplitude`.
+fn write_wav_at(path: &Path, amplitude: i16) {
     let samples: Vec<i16> = (0..2_205)
-        .map(|i| if i % 50 < 25 { 8_000 } else { -8_000 })
+        .map(|i| if i % 50 < 25 { amplitude } else { -amplitude })
         .collect();
     let data = u32::try_from(samples.len() * 2).unwrap();
     let mut b = Vec::new();
@@ -226,10 +231,12 @@ fn int(t: &toml::Table, table: &str, key: &str) -> Option<i64> {
 
 /// The exit scenario: chart A by autoplay and its result under each
 /// preset, A again with an input log played to the end, retried from the
-/// result, retried and left during the play, then B found by search; the
-/// steps run in scene order, the log's plays are saved, re-evaluate equal
-/// and are counted into the bests, and the capture is the log's first
-/// play's frame.
+/// result, retried and left during the play, then B found by search, then
+/// one practice round of A at 75 % with the log, left at the next round's
+/// start; the steps run in scene order, the log's plays are saved,
+/// re-evaluate equal and are counted into the bests, the round is saved
+/// as a section repeat at 75 % played to the end, and the capture is the
+/// log's first play's frame.
 #[test]
 fn exit_scenario_plays_select_result_retry_repeatedly() {
     let fx = Fixture::new();
@@ -291,7 +298,14 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         "play started",
         "play 1: Completed; perfect 4 great 0 good 0 bad 0 poor 0",
         "dev: scenario: step 15 (result)",
-        "dev: scenario: step 16 (quit)",
+        "dev: scenario: step 16 (practice)",
+        "select: chose a.bms to practice ",
+        "play started",
+        // The log's presses fall on 1× times: at 75 % they miss.
+        "play 1: Completed; ",
+        "play started",
+        "play 2: Aborted(Quit); nothing recorded",
+        "dev: scenario: step 17 (quit)",
     ];
     assert_eq!(
         scene.len(),
@@ -327,7 +341,7 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
     // event up to where it was cut; the figures of each were measured
     // with no allocation in the render thread's app region.
     let records = fx.records();
-    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(records.len(), 4, "{records:?}");
     let decoded: Vec<PlayRecord> = records
         .iter()
         .map(|r| replay::decode(&fs::read(r).unwrap(), &DecodeLimits::default()).unwrap())
@@ -346,6 +360,21 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
             path.display(),
             rec.events
         );
+    }
+    // The practice round: a section repeat of the whole chart at 75 %,
+    // played to the end, holding the log replayed from its start.
+    let round = &decoded[3];
+    let replay::PlayType::SectionRepeat(practice) = &round.play_type else {
+        panic!("{:?}", round.play_type);
+    };
+    assert_eq!(practice.attempt, 1);
+    assert_eq!(practice.lead_in, TimeUs(2_000_000));
+    let twenty = rules::GaugeValue(20 * rules::GaugeValue::PERCENT);
+    assert_eq!(practice.initial_gauges[0].value, twenty);
+    assert_eq!(round.speed, bms_model::Speed::from_twentieths(15).unwrap());
+    assert_eq!(round.status.end, EndStatus::PlayedToEnd);
+    assert_eq!(round.events, log);
+    for (rec, path) in decoded.iter().zip(&records) {
         assert_eq!(rec.devices.sources[0].receive, ReceiveMethod::Scripted);
         let m: toml::Table = fs::read_to_string(path.with_extension("measure.toml"))
             .unwrap()
@@ -355,11 +384,12 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         assert_eq!(int(&m, "allocations", "render_app"), Some(0), "{m:?}");
     }
 
-    // The bests: three plays of A counted live, the best set by the
-    // completed one; B's autoplay counts nothing.
+    // The bests: four plays of A counted live, the best set by the
+    // completed full play (a round at 75 % sets none); B's autoplay counts
+    // nothing.
     assert_eq!(
         lines(&stdout, "bests: the play was counted").len(),
-        3,
+        4,
         "{stdout}"
     );
     let (library, _) = library::Library::open(&fx.data().join("library.db")).unwrap();
@@ -368,7 +398,7 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         .unwrap();
     assert_eq!(scores.len(), 1, "{scores:?}");
     let score = scores.values().next().unwrap();
-    assert_eq!(score.plays, 3);
+    assert_eq!(score.plays, 4);
     let best = score.best.as_ref().unwrap();
     assert_eq!((best.ex, best.bp, best.full_combo), (4, 2, false));
 
@@ -565,6 +595,123 @@ fn a_linked_output_is_refused() {
     assert!(lines(&stdout, "dev: scenario: step").is_empty(), "{stdout}");
     assert!(!fx.data().join("library.db").exists());
     assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+/// Chart A by autoplay, then a practice of A with a log that presses only
+/// key 7, at 3.25 s: the practice's chart is set up with the log, not
+/// autoplay, so the round's record holds exactly the log's events and none
+/// generated. Autoplay's key sounds, which no BGM holds, play before the
+/// practice: its four, and nothing else sounds in the run.
+#[test]
+fn practice_after_autoplay_plays_its_log() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let key7 = bms_parser::load_bms(
+        b"#BPM 120\n#00119:0000000000010000\n",
+        &fx.base,
+        &Default::default(),
+    )
+    .unwrap()
+    .chart;
+    let log = hits(&key7, |_| true);
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0].received, TimeUs(3_250_000));
+    write_log(&fx.base.join("logs").join("k7.tprl"), &log, 1);
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 100, \
+         lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 1 }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let records = fx.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let round = replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert!(
+        matches!(round.play_type, PlayType::SectionRepeat(_)),
+        "{:?}",
+        round.play_type
+    );
+    assert_eq!(round.events, log);
+    assert_eq!(round.status.end, EndStatus::PlayedToEnd);
+    assert_eq!(
+        lines(
+            &stdout,
+            "play 1: Completed; perfect 4 great 0 good 0 bad 0 poor 0"
+        )
+        .len(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(lines(&stdout, "dev: audio onsets 4:").len(), 1, "{stdout}");
+}
+
+/// The peaks the recording output found after each sound's onset.
+fn onset_peaks(stdout: &str) -> Vec<f64> {
+    let line = lines(stdout, "dev: audio onset peaks:")[0];
+    line.trim_start_matches("dev: audio onset peaks:")
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect()
+}
+
+/// A quiet chart's gain is measured at 1× and cached by one run; a
+/// practice of it at 75 % in another plays with that gain, found by the
+/// chart's 1× key, not the headroom: its sounds peak as loud as the 1×
+/// play's at the gain, about four times the headroom's.
+#[test]
+fn practice_at_a_speed_keeps_the_charts_gain() {
+    let fx = Fixture::new();
+    let a = write_chart(&fx.library(), "a", "譜面A");
+    write_wav_at(&fx.library().join("a").join("key.wav"), 1_000);
+    write_log(&fx.base.join("logs").join("a.tprl"), &hits(&a, |_| true), 1);
+    // The first run analyzes A at 1× and stores its gain at the second
+    // play's countdown, which plays with it.
+    let root = game::DataRoot::new(fx.data());
+    fs::create_dir_all(root.path()).unwrap();
+    let device = DeviceSettings {
+        library: game::LibrarySettings {
+            roots: vec![fx.library().display().to_string()],
+        },
+        ..DeviceSettings::default()
+    };
+    game::save_settings(&root.device_settings(), &device).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .args(["--auto", "--dev-headless", "--dev-select"])
+        .arg("pick=a.bms,enter,back,analyzed,pick=a.bms,enter,back,close")
+        .args(["--dev-render-timeout", "600"])
+        .env("LOCALAPPDATA", &fx.appdata)
+        .output()
+        .unwrap();
+    let first = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{first}");
+    let peaks = onset_peaks(&first);
+    assert_eq!(peaks.len(), 8, "{first}");
+    let (headroom, gained) = (peaks[0], peaks[4]);
+    assert!(gained > headroom * 3.0, "{peaks:?}");
+    // The practice: its round's four presses sound at the gain.
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 75, \
+         lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/a.tprl\", rounds = 1 }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        lines(&stdout, "loudness: ")
+            .iter()
+            .all(|l| !l.contains("analyzed")),
+        "{stdout}"
+    );
+    let round = onset_peaks(&stdout);
+    assert_eq!(round.len(), 4, "{stdout}");
+    for p in round {
+        assert!(
+            (p / gained - 1.0).abs() < 0.15,
+            "{p} against {gained}: {stdout}"
+        );
+    }
 }
 
 /// A log of as many keyboards as the input thread keeps devices for, then
