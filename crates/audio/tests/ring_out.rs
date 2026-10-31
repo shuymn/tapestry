@@ -15,7 +15,8 @@ const RATE: u32 = 48_000;
 const MS: i64 = 1_000;
 /// Where chart time 0 lies on the device's timeline.
 const ORIGIN: i64 = 100 * MS;
-/// The ring-out of D15's example, 1 s and 1.5 s after a completion at 1 s.
+/// A ring-out as in the example of design.md "Mid-Chart Start and Section
+/// Repeat", 1 s and 1.5 s after a completion at 1 s.
 const FADE_AT: TimeUs = TimeUs(2_000 * MS);
 const END_AT: TimeUs = TimeUs(2_500 * MS);
 /// The long sound's level, and the level the output holds for it.

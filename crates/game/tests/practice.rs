@@ -2,12 +2,13 @@
 //! round's opening, its section and recording window, its ring-out and the
 //! next round, its record, and the excerpt property end to end.
 //!
-//! Most tests run D15's example: 100 % speed, a 2 s lead-in, input offset
-//! 0, aligned 1 ms steps and 48 kHz output; section `[10 s, 20 s)` of a
-//! 180 s chart whose last target is a tap at 19.5 s, with the tapestry
-//! preset's 180 ms late BAD edge. The rig below drives the shared play
-//! lifecycle on a virtual clock with a real audio engine on a simulated
-//! device, and logs when each thing happens on round 1's timeline.
+//! Most tests run the example given there: 100 % speed, a 2 s lead-in,
+//! input offset 0, aligned 1 ms steps and 48 kHz output; section
+//! `[10 s, 20 s)` of a 180 s chart whose last target is a tap at 19.5 s,
+//! with the tapestry preset's 180 ms late BAD edge. The rig below drives
+//! the shared play lifecycle on a virtual clock with a real audio engine on
+//! a simulated device, and logs when each thing happens on round 1's
+//! timeline.
 
 mod common;
 
@@ -41,7 +42,7 @@ const CLOCK_START: i64 = 1_000 * MS;
 /// Lane 1's key in the default key config (Z).
 const Z: ControlId = ControlId(0x2c);
 
-/// The section and lead-in of D15's example.
+/// The section and lead-in of the example.
 const SECTION: (i64, i64) = (10_000 * MS, 20_000 * MS);
 const LEAD_IN: TimeUs = TimeUs(2_000 * MS);
 
@@ -71,11 +72,11 @@ impl ChartIngest for Built {
     }
 }
 
-/// D15's chart: a 60 s BGM sound at 5 s (sound 0), a short one at 20.5 s
+/// The example's chart: a 60 s BGM sound at 5 s (sound 0), a short one at 20.5 s
 /// and 30 s (sound 1); taps on lane 1 at 9 s, then the targets at 10, 12,
 /// 14, 16 and 19.5 s, and at 179 s; a tap on lane 2 at 20.4 s with key
 /// sound 2, after the section.
-fn d15_chart() -> Chart {
+fn example_chart() -> Chart {
     let mut b = ChartBuilder::new(120_000)
         .sound("long.wav")
         .sound("short.wav")
@@ -420,8 +421,8 @@ fn config() -> SessionConfig {
     }
 }
 
-/// D15's practice: the section repeated, every gauge at its start.
-fn d15_practice(loaded: &Loaded) -> Practice {
+/// The example's practice: the section repeated, every gauge at its start.
+fn example_practice(loaded: &Loaded) -> Practice {
     Practice {
         start: TimeUs(SECTION.0),
         end: TimeUs(SECTION.1),
@@ -478,7 +479,7 @@ fn load_with(
     Loaded::load(root, settings, &chart_path, config, parts).unwrap()
 }
 
-/// What a run of D15's rounds left: the log, the reports, the saved
+/// What a run of the example's rounds left: the log, the reports, the saved
 /// records, the rig, and round 1's origin on the clock.
 struct Run {
     log: Vec<Ev>,
@@ -497,9 +498,9 @@ impl Run {
     }
 }
 
-/// Runs D15's rounds with `queued` periods on the output, a save taking
+/// Runs the example's rounds with `queued` periods on the output, a save taking
 /// `save_delay`, and `commands`, until a quit in round 2 at 9 s.
-fn d15(queued: u32, save_delay: i64, commands: &[(usize, i64, Command)]) -> Run {
+fn example_rounds(queued: u32, save_delay: i64, commands: &[(usize, i64, Command)]) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let clock = Rc::new(Cell::new(CLOCK_START));
     let log = Log::default();
@@ -510,8 +511,10 @@ fn d15(queued: u32, save_delay: i64, commands: &[(usize, i64, Command)]) -> Run 
         delay: save_delay,
         records: Rc::clone(&records),
     };
-    let mut loaded = load(dir.path(), d15_chart(), saves, config());
-    loaded.set_practice(Some(d15_practice(&loaded))).unwrap();
+    let mut loaded = load(dir.path(), example_chart(), saves, config());
+    loaded
+        .set_practice(Some(example_practice(&loaded)))
+        .unwrap();
     let mut rig = Rounds::new(loaded.audio_schedule(), queued, &log, &clock);
     rig.commands = commands.to_vec();
     rig.commands.push((2, 9_000 * MS, Command::Quit));
@@ -534,7 +537,7 @@ fn first(run: &Run, pick: impl Fn(&Ev) -> Option<i64>) -> i64 {
 
 #[test]
 fn section_round_rings_out_and_repeats() {
-    let mut run = d15(2, 0, &[]);
+    let mut run = example_rounds(2, 0, &[]);
     assert_eq!(run.reports.len(), 2);
     let round1 = &run.reports[0];
     assert_eq!(round1.end, PlayEnd::Completed);
@@ -646,7 +649,7 @@ fn section_round_rings_out_and_repeats() {
 #[test]
 fn early_done_report_waits_for_end_at() {
     for queued in [2, 3] {
-        let run = d15(queued, 0, &[]);
+        let run = example_rounds(queued, 0, &[]);
         let done = first(&run, |e| match *e {
             Ev::Done { at } => Some(at),
             _ => None,
@@ -672,7 +675,7 @@ fn early_done_report_waits_for_end_at() {
 
 #[test]
 fn retry_cuts_the_ring_out_and_saves() {
-    let run = d15(2, 0, &[(1, 20_900 * MS, Command::Retry)]);
+    let run = example_rounds(2, 0, &[(1, 20_900 * MS, Command::Retry)]);
     let round1 = &run.reports[0];
     assert_eq!(round1.end, PlayEnd::Completed);
     assert_eq!(round1.tail_cut, Some(game::AbortCause::Retry));
@@ -706,8 +709,8 @@ fn saving_never_delays_the_ring_out() {
     // A ring-out run to its end, and one quit at 20.9 s, each with an
     // instant save and one taking 400 ms.
     for commands in [vec![], vec![(1, 20_900 * MS, Command::Quit)]] {
-        let instant = d15(2, 0, &commands);
-        let slow = d15(2, 400 * MS, &commands);
+        let instant = example_rounds(2, 0, &commands);
+        let slow = example_rounds(2, 400 * MS, &commands);
         // Everything of round 1 up to its save, at the same times.
         let round1 = |run: &Run| -> Vec<Ev> {
             let to = run
@@ -755,7 +758,7 @@ fn section_round_records_its_conditions() {
         delay: 0,
         records: Rc::clone(&records),
     };
-    let mut loaded = load(dir.path(), d15_chart(), saves, config());
+    let mut loaded = load(dir.path(), example_chart(), saves, config());
     let ids: Vec<String> = loaded
         .preset()
         .gauges
@@ -768,7 +771,7 @@ fn section_round_records_its_conditions() {
         let practice = Practice {
             initial_gauges: vec![pct(50), pct(70)],
             repeat,
-            ..d15_practice(&loaded)
+            ..example_practice(&loaded)
         };
         loaded.set_practice(Some(practice)).unwrap();
         let mut rig = Rounds::new(loaded.audio_schedule(), 2, &log, &clock);
@@ -803,7 +806,7 @@ fn section_round_records_its_conditions() {
         assert_eq!(&back, r);
         // The record re-evaluates as played, in its section, from its
         // recorded gauges.
-        let chart = d15_chart();
+        let chart = example_chart();
         let re = replay::verify::evaluate_under(r, &chart, loaded.preset()).unwrap();
         assert!(re.as_played);
         assert_eq!(re.started_at_default, [false, false]);
@@ -878,7 +881,7 @@ fn practice_window_includes_ln_end_deadlines() {
         records: Rc::default(),
     };
     let mut loaded = load(dir.path(), chart, saves, config());
-    let mut practice = d15_practice(&loaded);
+    let mut practice = example_practice(&loaded);
     practice.end = TimeUs(20_000 * MS);
     loaded.set_practice(Some(practice)).unwrap();
     let plan = loaded.plan(&[DeviceKind::Keyboard], &[]).unwrap();
@@ -1066,7 +1069,7 @@ fn restore_lands_at_the_lead_in_start() {
     // lead-in's start, 8 s: the 60 s BGM voice that started at 5 s enters
     // there 3 s in, at its 3.00 s block's level, from the first frame, and
     // nothing sounds between the opening and it.
-    let run = d15(2, 0, &[]);
+    let run = example_rounds(2, 0, &[]);
     assert_eq!(
         run.log[0],
         Ev::Open {
@@ -1097,7 +1100,7 @@ type Refused = (
     Vec<game::SessionEvent>,
 );
 
-/// D15's round with `restorer` in place of the engine's, and `refuse`
+/// The example's round with `restorer` in place of the engine's, and `refuse`
 /// given by `restore_audio`.
 fn refused_round(
     restorer: impl FnOnce(&AudioEngine) -> Option<Restorer>,
@@ -1116,13 +1119,15 @@ fn refused_round(
     let events = Events::default();
     let mut loaded = load_with(
         dir.path(),
-        d15_chart(),
+        example_chart(),
         saves,
         config(),
         0,
         Some(events.clone()),
     );
-    loaded.set_practice(Some(d15_practice(&loaded))).unwrap();
+    loaded
+        .set_practice(Some(example_practice(&loaded)))
+        .unwrap();
     let mut rig = Rounds::new(loaded.audio_schedule(), 2, &log, &clock);
     rig.restorer = restorer(&rig.engine);
     rig.refuse_restore = refuse;
@@ -1144,7 +1149,7 @@ fn a_schedule_mismatch_refuses_the_round_before_opening() {
     // (the BGM with the key sounds of the notes outside the section) that
     // the engine plays.
     let (err, rig, records, events) = refused_round(
-        |e| Some(Restorer::new(e.seek_source(), d15_chart().bgm)),
+        |e| Some(Restorer::new(e.seek_source(), example_chart().bgm)),
         None,
     );
     assert!(
@@ -1266,7 +1271,7 @@ fn a_section_without_targets_is_refused() {
         let practice = Practice {
             start: TimeUs(start * MS),
             end: TimeUs(end * MS),
-            ..d15_practice(&loaded)
+            ..example_practice(&loaded)
         };
         assert_eq!(
             loaded.set_practice(Some(practice.clone())),
@@ -1300,7 +1305,7 @@ fn a_section_without_targets_is_refused() {
     let practice = Practice {
         start: TimeUs(1_000 * MS),
         end: TimeUs(5_000 * MS),
-        ..d15_practice(&loaded)
+        ..example_practice(&loaded)
     };
     loaded.set_practice(Some(practice)).unwrap();
 }
