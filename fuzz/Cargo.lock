@@ -546,7 +546,6 @@ name = "skin-beatoraja"
 version = "0.0.0"
 dependencies = [
  "skin-model",
- "thiserror",
 ]
 
 [[package]]

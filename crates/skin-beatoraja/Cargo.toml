@@ -9,7 +9,6 @@ publish.workspace = true
 
 [dependencies]
 skin-model.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

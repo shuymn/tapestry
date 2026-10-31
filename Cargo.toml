@@ -91,7 +91,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # bms-parser and xtask, library (dev only)
 encoding_rs = "0.8.42"
 
-# bms-parser, replay, game, library, audio, input, render, skin-model, skin-beatoraja and player (error types)
+# bms-parser, replay, game, library, audio, input, render, skin-model and player (error types)
 thiserror = "2.0.21"
 
 # player and xtask (error reports) and game (tests)
