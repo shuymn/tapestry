@@ -209,12 +209,17 @@ pub fn chart_cell(score: Option<&Score>, preset: &RulePreset) -> String {
     format!("{lamp:LAMP_COLUMNS$} {ex:>5}")
 }
 
+// The library's bests fixture, declared at the file level so its path is
+// relative to this file's folder, which exists on every platform.
+#[cfg(test)]
+#[path = "../../library/tests/common/mod.rs"]
+mod common;
+
 #[cfg(test)]
 mod tests {
-    #[path = "../../../../library/tests/common/mod.rs"]
-    mod common;
-
     use std::sync::{Arc, Mutex};
+
+    use super::common;
 
     use game::{BestScore, BestView, RecordSink as _};
     use library::{Best, Score};
