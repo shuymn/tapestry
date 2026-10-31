@@ -198,7 +198,7 @@ egui comes with the first form-like screen.
 
 **Values.**
 - `scores` holds the best EX, the best BP, a lamp, and the play count.
-- The lamp is the hardest gauge cleared (easiest first) or FULL COMBO.
+- The lamp is the cleared gauge with the highest `lamp` rank (design.md "Rule Presets"), or FULL COMBO. Presets list their gauges in display order, not in order of difficulty, so each gauge states its rank (PR18a).
 - The play count counts every saved, verified record under the key, so plays of a `#RANDOM` chart count across its branches even though they set no best.
 
 **Idempotence.** One ingest function serves live updates and rebuilds. `counted(record_file PRIMARY KEY)` makes ingesting the same record twice a no-op.
@@ -956,11 +956,30 @@ Each one holds the behavior D5 and D6 state.
 
 **Note.** The shelf reports changes only for the chosen preset (`Shelf::check`); listing every preset on the select and result screens may need a change notice per entry.
 
+### PR18a. Lamp ranks in presets (`rules`, `rules-toml`)
+
+**Touches.**
+- `rules`: `GaugeRule` gains `lamp: u16`, a higher rank a harder clear; validation refuses a repeated rank (`RuleError::DuplicateLamp`); the canonical encoding writes and reads `lamp` after the gauge's `id`, and its version, now exported as `rules::CANONICAL_VERSION`, goes from 10 to 11, so older encodings and the preset copies of older records are refused; the built-ins state their ranks (design.md "Standard Presets").
+- `rules-toml`: every gauge of a file states `lamp`; a file without it is refused with the older-file hint.
+- Every gauge built in test code and the fuzz seeds follow: the property generators draw the ranks as a permutation.
+- design.md "Rule Presets", "Standard Presets" and "User Presets".
+
+**Depends on.** PR8, PR16.
+
+**Done when.**
+- If two gauges of a preset share a rank, then validation shall refuse it with `DuplicateLamp` naming the rank and both gauges, and distinct ranks that are not contiguous shall validate (`lamp_ranks_must_be_distinct`).
+- The gauge IDs of each built-in sorted by rank shall be `assist_easy`, `easy`, `normal`, `hard`, `ex_hard`, `hazard` for beatoraja-style and LR2-style, and `normal`, `survival` for tapestry (`built_in_lamp_ranks`).
+- When a preset is encoded and decoded, the result shall equal it, and changing one rank shall change its hash (`canonical_round_trips_lamp_ranks`; the canonical round-trip property over generated rank permutations).
+- If canonical bytes repeat a rank, then decoding shall refuse them as invalid (`canonical_decoder_refuses_duplicate_lamp_ranks`).
+- If canonical bytes carry version 10, then decoding shall refuse them with `UnsupportedVersion(10)` (`other_canonical_version_is_refused`).
+- If a preset file has a gauge without `lamp`, then loading shall refuse it as unreadable, with the hint to export a built-in (`preset_file_without_lamp_is_refused_with_the_hint`).
+- When `eval-cli preset export beatoraja-style <path>` runs, the file shall state a `lamp` per gauge and load equal to the built-in apart from its ID (`export_writes_lamp_ranks`).
+
 ### PR18. Personal bests (`library`, `game`, `player`)
 
 **Touches.** Schema 3, `counts_for_best`, the ingest path, the rebuild, the display.
 
-**Depends on.** PR5, PR13, PR17.
+**Depends on.** PR5, PR13, PR17, PR18a.
 
 **Done when.**
 - `completed_full_play_updates_the_best`;
@@ -1098,6 +1117,7 @@ Each one holds the behavior D5 and D6 state.
 
 **Then:**
 - PR1 → PR7 → PR7e → PR7a → PR7b → PR7d → PR8 → PR16
+- PR8 + PR16 → PR18a (the lamp ranks of the built-ins and the file)
 - PR7e → PR7c → PR8
 - PR7a–PR7e → PR18 (bests key on the preset bytes and the interpretation tuple, so the standard presets and the loader version settle first)
 - PR4 → PR5
@@ -1106,7 +1126,7 @@ Each one holds the behavior D5 and D6 state.
 - PR11 + PR13 + PR14 → PR15
 - PR9 + PR15 → PR10
 - PR5 + PR15 + PR16 → PR17
-- PR5 + PR13 + PR17 → PR18
+- PR5 + PR13 + PR17 + PR18a → PR18
 - PR8 + PR18 → PR19
 - PR5 → PR20
 - PR2 + PR14 + PR20 + PR22 → PR23
@@ -1114,7 +1134,7 @@ Each one holds the behavior D5 and D6 state.
 - PR15 + PR18 → PR25
 - PR7d → PR26
 
-**Format numbering.** Library schema numbers follow the order PR12 < PR13 < PR18 < PR25. Replay format bumps (PR9, PR20, PR23), canonical encoding bumps (PR7e, PR7a–PR7d, PR8) and the loader version bump (PR7e) take the next number at merge.
+**Format numbering.** Library schema numbers follow the order PR12 < PR13 < PR18 < PR25. Replay format bumps (PR9, PR20, PR23), canonical encoding bumps (PR7e, PR7a–PR7d, PR8, PR18a) and the loader version bump (PR7e) take the next number at merge.
 
 ## 4. Verifying the stage exit
 
