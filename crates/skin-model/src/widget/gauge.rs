@@ -247,18 +247,22 @@ pub(crate) fn lit(value: GaugeValue, max: GaugeValue, p: u16) -> u16 {
 impl Motion {
     /// The offset `a` at local time `t` (µs, at least 0).
     pub(crate) fn offset(self, t: i64) -> i64 {
-        let (range, step, kind) = match self {
-            Self::Still | Self::Flicker { .. } => return 0,
-            Self::Random { range, step } => (range, step, 0),
-            Self::Rise { range, step } => (range, step, 1),
-            Self::Fall { range, step } => (range, step, 2),
-        };
-        let k = t.max(0) / step.0.max(1);
-        let r = i64::from(range) + 1;
-        match kind {
-            0 => i64::try_from(mix(k.unsigned_abs()) % r.unsigned_abs()).unwrap_or(0),
-            1 => (-k).rem_euclid(r),
-            _ => k.rem_euclid(r),
+        // The step `k` and the modulus `range + 1`.
+        let at = |range: u16, step: TimeUs| (t.max(0) / step.0.max(1), i64::from(range) + 1);
+        match self {
+            Self::Still | Self::Flicker { .. } => 0,
+            Self::Random { range, step } => {
+                let (k, r) = at(range, step);
+                i64::try_from(mix(k.unsigned_abs()) % r.unsigned_abs()).unwrap_or(0)
+            }
+            Self::Rise { range, step } => {
+                let (k, r) = at(range, step);
+                (-k).rem_euclid(r)
+            }
+            Self::Fall { range, step } => {
+                let (k, r) = at(range, step);
+                k.rem_euclid(r)
+            }
         }
     }
 }
