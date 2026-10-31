@@ -185,7 +185,7 @@ fn drawn(chart: &Chart, now: i64, offset: i64, effects: &[JudgeEvent]) -> usize 
 }
 
 /// The events the evaluator emits up to logic time `to` for key 2
-/// pressed at `press` and released at `release` (µs), with the custom
+/// pressed at `press` and released at `release` (µs), with the tapestry
 /// preset and one keyboard source.
 fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent> {
     let device = eval::DeviceProfile {
