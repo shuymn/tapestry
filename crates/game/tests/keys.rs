@@ -24,13 +24,17 @@ enum Step {
     Turn,
     /// The same, toward lower values.
     TurnBack,
+    /// [`TurnBack`](Step::TurnBack), then this long before the wait ends.
+    TurnBackThenPause(Duration),
+    /// Nothing offered, this long before the wait ends.
+    Pause(Duration),
     /// A report of the scratch axis, as the input thread passes it to a
     /// watch.
     Report(i32),
     Close,
 }
 
-use Step::{Close, Offer, Report, Turn, TurnBack};
+use Step::{Close, Offer, Pause, Report, Turn, TurnBack, TurnBackThenPause};
 
 const AXIS: u32 = 0x1_0030;
 
@@ -78,6 +82,12 @@ struct Scripted {
     learnt: Option<game::LearntRange>,
     /// The shows that asked for the scratch axis's menu direction.
     asked: usize,
+    /// The revolution the capture counted the axis's turns in at the last
+    /// show that asked for it.
+    revolution: Option<u32>,
+    /// How many times the capture had been armed at each show that asked
+    /// for it.
+    armings: Vec<u64>,
 }
 
 impl Scripted {
@@ -90,6 +100,8 @@ impl Scripted {
             last: None,
             learnt: None,
             asked: 0,
+            revolution: None,
+            armings: Vec::new(),
         }
     }
 }
@@ -98,7 +110,11 @@ impl KeyScreen for Scripted {
     fn show(&mut self, flow: &KeyConfigFlow) {
         self.shown.push((flow.role(), flow.refused()));
         self.learnt = flow.learnt();
-        self.asked += usize::from(flow.turning());
+        if flow.turning() {
+            self.asked += 1;
+            self.revolution = self.capture.revolution(ControlId(AXIS));
+            self.armings.push(self.capture.armings());
+        }
     }
 
     fn wait(&mut self) {
@@ -116,6 +132,17 @@ impl KeyScreen for Scripted {
                         .capture
                         .offer_controller(&packet, Some(MODEL_A), recording),
                 }
+            }
+            Some(Pause(pause)) => std::thread::sleep(pause),
+            Some(TurnBackThenPause(pause)) => {
+                let packet = Packet {
+                    device: DeviceId(3),
+                    control: ControlId(AXIS),
+                    value: -1,
+                    background: false,
+                };
+                self.capture.offer_controller(&packet, Some(MODEL_A), false);
+                std::thread::sleep(pause);
             }
             Some(step @ (Turn | TurnBack)) => {
                 // Offered as the input thread offers a turn: its sign the
@@ -166,7 +193,7 @@ fn current() -> KeyConfigs {
 fn run(steps: &[Step]) -> (KeyConfigEnd, Scripted) {
     let capture = Capture::new();
     let mut screen = Scripted::new(&capture, steps);
-    let end = capture_keys(&capture, &mut screen, current());
+    let end = capture_keys(&capture, &mut screen, current(), None);
     if let KeyConfigEnd::Done(keys, ..) = &end {
         saves(keys);
     }
@@ -523,9 +550,21 @@ fn run_within(steps: &[Step], limit: Duration) -> (KeyConfigEnd, Scripted) {
 /// Runs `steps` with `limit` for the range learning and `settle` before
 /// the menu direction is taken.
 fn run_settled(steps: &[Step], limit: Duration, settle: Duration) -> (KeyConfigEnd, Scripted) {
+    run_from(steps, current(), None, limit, settle)
+}
+
+/// Runs `steps` over `current`, whose `device.toml` sets the revolution
+/// `wrap`.
+fn run_from(
+    steps: &[Step],
+    current: KeyConfigs,
+    wrap: Option<u32>,
+    limit: Duration,
+    settle: Duration,
+) -> (KeyConfigEnd, Scripted) {
     let capture = Capture::new();
     let mut screen = Scripted::new(&capture, steps);
-    let end = capture_keys_within(&capture, &mut screen, current(), limit, settle);
+    let end = capture_keys_within(&capture, &mut screen, current, wrap, limit, settle);
     if let KeyConfigEnd::Done(keys, ..) = &end {
         saves(keys);
     }
@@ -667,6 +706,102 @@ fn the_scratch_axis_is_turned_for_the_menu_direction() {
     steps.extend(keep_the_rest());
     let (end, _) = run_settled(&steps, Duration::ZERO, HOUR);
     assert!(matches!(end, KeyConfigEnd::Done(_, None, None)), "{end:?}");
+}
+
+/// F12 keeping a scratch bound to the axis learns and asks about that
+/// axis, not about F12: its turns answer the prompt.
+#[test]
+fn keeping_the_scratch_axis_asks_about_that_axis() {
+    let mut keyboard = DeviceSettings::default().keyboard;
+    keyboard.lanes.retain(|k| k.lane != 0);
+    let kept = KeyConfigs {
+        keyboard,
+        controller: KeyConfig {
+            lanes: vec![LaneKey {
+                control: AXIS,
+                lane: 0,
+            }],
+            retry: None,
+            quit: None,
+        },
+        controller_device: Some(MODEL_A),
+    };
+    // F12 for the scratch, the range learnt from its report, then a turn
+    // toward lower values.
+    let mut steps = vec![key(0x58), Report(0), TurnBack];
+    steps.extend(keep_the_rest());
+    let (end, screen) = run_from(&steps, kept, None, Duration::ZERO, Duration::ZERO);
+    let KeyConfigEnd::Done(keys, _, menu_reversed) = end else {
+        panic!("{end:?}");
+    };
+    assert_eq!(menu_reversed, Some(true));
+    assert_eq!(keys.controller.lanes.len(), 1);
+    assert_eq!(screen.learnt.map(|l| l.observed), Some((0, 0)));
+}
+
+/// The direction is counted in the revolution menus count it in: the one
+/// just learnt beyond the declared range, else the one `device.toml` sets,
+/// else the declared one; afterwards the capture counts in the declared
+/// one again.
+#[test]
+fn the_menu_direction_is_counted_in_the_resolved_revolution() {
+    // Learnt: -128 under the declared -127..=127 widens it to 256, which
+    // wins over the file's 300.
+    let mut steps = vec![Report(0), Turn, Report(-128), key(0x58), Turn];
+    steps.extend(keep_the_rest());
+    let (end, screen) = run_from(&steps, current(), Some(300), HOUR, Duration::ZERO);
+    assert!(
+        matches!(end, KeyConfigEnd::Done(_, Some(256), Some(false))),
+        "{end:?}"
+    );
+    assert_eq!(screen.revolution, Some(256));
+    // Not widened: the file's.
+    let mut steps = vec![Report(0), Turn, Report(5), Turn];
+    steps.extend(keep_the_rest());
+    let (end, screen) = run_from(&steps, current(), Some(300), Duration::ZERO, Duration::ZERO);
+    assert!(
+        matches!(end, KeyConfigEnd::Done(_, None, Some(false))),
+        "{end:?}"
+    );
+    assert_eq!(screen.revolution, Some(300));
+    assert_eq!(screen.capture.revolution(ControlId(AXIS)), None);
+    // Neither: the declared one.
+    let (_, screen) = run_from(&steps, current(), None, Duration::ZERO, Duration::ZERO);
+    assert_eq!(screen.revolution, None);
+}
+
+/// A turn captured before the settle time ends but taken after it is no
+/// answer: the capture starts over there, and the next turn answers. With
+/// nothing captured, the capture is armed again at the settle time all the
+/// same, so movement counted toward a turn before it is dropped.
+#[test]
+fn a_turn_across_the_settle_time_is_no_answer() {
+    let settle = Duration::from_millis(50);
+    let mut steps = vec![Report(0), Turn, Report(5)];
+    steps.extend([TurnBackThenPause(settle * 2), Turn]);
+    steps.extend(keep_the_rest());
+    let (end, _) = run_settled(&steps, Duration::ZERO, settle);
+    assert!(
+        matches!(end, KeyConfigEnd::Done(_, None, Some(false))),
+        "{end:?}"
+    );
+    let mut steps = vec![Report(0), Turn, Report(5)];
+    steps.extend([Pause(settle * 2), Turn]);
+    steps.extend(keep_the_rest());
+    let (end, screen) = run_settled(&steps, Duration::ZERO, settle);
+    assert!(
+        matches!(end, KeyConfigEnd::Done(_, None, Some(false))),
+        "{end:?}"
+    );
+    assert_eq!(
+        screen
+            .armings
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .collect::<Vec<_>>(),
+        [1],
+        "armed once more, at the settle time"
+    );
 }
 
 #[test]

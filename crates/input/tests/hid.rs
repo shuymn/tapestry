@@ -321,6 +321,59 @@ fn capture_takes_buttons_and_turned_axes() {
     assert!(capture.lower(), "backward through the wrap");
 }
 
+/// A turn is counted toward a capture in the revolution key config sets
+/// for the axis, as menus will count it: an axis declared with 128 values
+/// that really has 256 moving +80 turned toward higher values, which its
+/// declared range would take as -48. Other axes, and the axis once it is
+/// cleared, count in their declared range.
+#[test]
+fn capture_counts_turns_in_the_revolution_set() {
+    let (mut set, _reader) = recording();
+    set.close_recording();
+    let narrow = [AxisCap {
+        wrap: 128,
+        max: 127,
+        ..caps()[0]
+    }];
+    let capture = Capture::new();
+    let mut dev = HidDevice::new(PAD, &layout(&narrow));
+    let at = |v| [Some(v)];
+    let (low, high) = (at(10), at(90));
+    let turn = |dev: &mut HidDevice, set: &mut SourceSet, t, axes: &[Option<i32>; 1]| {
+        batch(
+            dev,
+            set,
+            &capture,
+            t,
+            &[HidReport {
+                id: 0,
+                buttons: None,
+                axes,
+            }],
+        );
+        capture.take()
+    };
+    turn(&mut dev, &mut set, 10, &low);
+    capture.set_revolution(X, 256);
+    assert_eq!(capture.revolution(X), Some(256));
+    assert_eq!(capture.revolution(DIAL), None);
+    capture.arm();
+    assert_eq!(
+        turn(&mut dev, &mut set, 20, &high),
+        Some((X, DeviceKind::Controller))
+    );
+    assert!(!capture.lower(), "+80 in 256 values");
+    capture.clear_revolution();
+    assert_eq!(capture.revolution(X), None);
+    turn(&mut dev, &mut set, 30, &low);
+    capture.arm();
+    assert_eq!(
+        turn(&mut dev, &mut set, 40, &high),
+        Some((X, DeviceKind::Controller))
+    );
+    assert!(capture.lower(), "-48 in the declared 128");
+}
+
 #[test]
 fn capture_travel_is_a_sixteenth_turn_at_least_16() {
     let cap = |wrap| AxisCap {

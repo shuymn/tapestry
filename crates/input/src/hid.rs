@@ -481,7 +481,8 @@ impl HidDevice {
     /// Buttons it does not carry keep their state. Button presses are
     /// offered to `capture`, and so is an axis once it has turned
     /// [`capture_travel`] since the capture was armed, net and the short
-    /// way round, with the direction it turned.
+    /// way round its revolution ([`Capture::revolution`], else the
+    /// declared one), with the direction it turned.
     ///
     /// `background` is the packet's Raw Input mark: a background report
     /// trips the focus gate even when nothing in it changed
@@ -555,7 +556,13 @@ impl HidDevice {
                 match last.replace(value) {
                     None => 0,
                     Some(prev) if prev == value => continue,
-                    Some(prev) => wrapped(i64::from(value) - i64::from(prev), cap.wrap),
+                    // In the revolution key config resolved for it, if
+                    // any ([`Capture::set_revolution`]), else the declared
+                    // one.
+                    Some(prev) => wrapped(
+                        i64::from(value) - i64::from(prev),
+                        capture.revolution(cap.control).unwrap_or(cap.wrap),
+                    ),
                 }
             };
             if relative && value == 0 {

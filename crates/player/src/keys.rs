@@ -247,7 +247,7 @@ pub fn run(
         controller: device.controller.clone(),
         controller_device: device.controller_device.map(Into::into),
     };
-    let end = capture_keys(&capture, &mut screen, current);
+    let end = capture_keys(&capture, &mut screen, current, device.scratch.wrap);
     drop(screen);
     #[cfg(feature = "dev-tools")]
     drop(script);
@@ -347,6 +347,7 @@ mod tests {
             &capture,
             &mut screen,
             current,
+            device.scratch.wrap,
             Duration::ZERO,
             Duration::ZERO,
         );

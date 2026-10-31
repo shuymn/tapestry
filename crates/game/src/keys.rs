@@ -411,14 +411,17 @@ pub const SETTLE_TIME: Duration = Duration::from_millis(500);
 /// both ways, [`LEARN_TIME`] has passed, or F12 skips, and the revolution
 /// is decided from what it reported ([`LearntRange`]). Then the player
 /// turns it the way that scrolls menus down: the direction of its first
-/// capture turn ([`Capture::lower`]) after [`SETTLE_TIME`] decides it, and
-/// F12 keeps the current setting.
+/// capture turn ([`Capture::lower`]) begun after [`SETTLE_TIME`] decides
+/// it, counted in the revolution menus will count it in (the one learnt
+/// beyond the declared range, else `wrap`, the one `device.toml` sets,
+/// else the declared one), and F12 keeps the current setting.
 pub fn capture_keys(
     capture: &Capture,
     screen: &mut impl KeyScreen,
     current: KeyConfigs,
+    wrap: Option<u32>,
 ) -> KeyConfigEnd {
-    capture_keys_within(capture, screen, current, LEARN_TIME, SETTLE_TIME)
+    capture_keys_within(capture, screen, current, wrap, LEARN_TIME, SETTLE_TIME)
 }
 
 /// [`capture_keys`] with `limit` for the range learning and `settle`
@@ -427,6 +430,7 @@ pub fn capture_keys_within(
     capture: &Capture,
     screen: &mut impl KeyScreen,
     current: KeyConfigs,
+    wrap: Option<u32>,
     limit: Duration,
     settle: Duration,
 ) -> KeyConfigEnd {
@@ -460,10 +464,13 @@ pub fn capture_keys_within(
                     && chosen[0].kind == DeviceKind::Controller
                     && is_axis(ControlId(chosen[0].control)) =>
             {
-                if let Some(end) = learn_range(capture, screen, &mut flow, control, limit) {
+                // The axis bound: the one turned, or the one kept with F12.
+                let axis = ControlId(chosen[0].control);
+                if let Some(end) = learn_range(capture, screen, &mut flow, axis, limit) {
                     return end;
                 }
-                if let Some(end) = learn_direction(capture, screen, &mut flow, control, settle) {
+                let wrap = flow.widened().or(wrap);
+                if let Some(end) = learn_direction(capture, screen, &mut flow, axis, wrap, settle) {
                     return end;
                 }
                 capture.arm();
@@ -528,44 +535,55 @@ fn learn_range(
 }
 
 /// Asks for the scratch axis `control` to be turned the way that scrolls
-/// menus down, and keeps the direction of its first capture turn once
-/// `settle` has passed: the way it moved, net and the short way round, as
-/// menu movement is counted. F12 keeps the current setting; any other
-/// control is not an answer. Returns how the screen ended if it was
-/// cancelled or closed meanwhile.
+/// menus down, and keeps the direction of its first capture turn begun
+/// after `settle`: the way it moved, net and the short way round its
+/// revolution as menus count it (`wrap`, else the declared one). At
+/// `settle` the capture is armed again, dropping a turn captured or
+/// counted before it. F12 keeps the current setting; any other control is
+/// not an answer. Returns how the screen ended if it was cancelled or
+/// closed meanwhile.
 fn learn_direction(
     capture: &Capture,
     screen: &mut impl KeyScreen,
     flow: &mut KeyConfigFlow,
     control: ControlId,
+    wrap: Option<u32>,
     settle: Duration,
 ) -> Option<KeyConfigEnd> {
     flow.turning = true;
+    if let Some(wrap) = wrap {
+        capture.set_revolution(control, wrap);
+    }
     capture.arm();
     let started = Instant::now();
+    // Armed at the start: with no settle time, already settled.
+    let mut settled = settle.is_zero();
     let end = loop {
         screen.show(flow);
         screen.wait();
         if screen.closed() {
             break Some(KeyConfigEnd::Closed);
         }
-        let Some(taken) = capture.take() else {
-            continue;
-        };
-        match taken {
-            (ControlId(CANCEL_KEY), DeviceKind::Keyboard) => break Some(KeyConfigEnd::Cancelled),
-            (ControlId(KEEP_KEY), DeviceKind::Keyboard) => break None,
-            (c, DeviceKind::Controller)
-                if c == control
-                    && capture.product() == flow.device
-                    && started.elapsed() >= settle =>
+        // Settling now: whatever the axis did before counts for nothing.
+        let settling = !settled && started.elapsed() >= settle;
+        settled |= settling;
+        match capture.take() {
+            Some((ControlId(CANCEL_KEY), DeviceKind::Keyboard)) => {
+                break Some(KeyConfigEnd::Cancelled);
+            }
+            Some((ControlId(KEEP_KEY), DeviceKind::Keyboard)) => break None,
+            Some((c, DeviceKind::Controller))
+                if settled && !settling && c == control && capture.product() == flow.device =>
             {
                 flow.menu_reversed = Some(capture.lower());
                 break None;
             }
-            _ => capture.arm(),
+            Some(_) => capture.arm(),
+            None if settling => capture.arm(),
+            None => {}
         }
     };
+    capture.clear_revolution();
     flow.turning = false;
     end
 }
