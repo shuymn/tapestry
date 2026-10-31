@@ -799,14 +799,30 @@ fn read_source(r: &mut Reader<'_>, n_sources: usize) -> Result<SourceId, DecodeE
     }
 }
 
+/// The held-input snapshot: at most as many controls per source, and in
+/// all, as the evaluator lets a profile bind (buttons and axes), each named
+/// once; the count is checked before anything is allocated for it.
 fn read_start(r: &mut Reader<'_>, n_sources: usize) -> Result<InputStart, DecodeError> {
     let opened_at = TimeUs(r.int()?);
     let n = r.count(3)?;
+    if n > eval::MAX_BINDINGS + eval::MAX_AXES {
+        return Err(DecodeError::TooManyHeld);
+    }
     let mut held = Vec::with_capacity(n);
     for _ in 0..n {
         let source = read_source(r, n_sources)?;
         let control = ControlId(r.u32()?);
         held.push((source, control, r.i32()?));
+    }
+    let mut named: Vec<(SourceId, ControlId)> = held.iter().map(|&(s, c, _)| (s, c)).collect();
+    named.sort_unstable();
+    let per_source = eval::MAX_BINDINGS_PER_SOURCE + eval::MAX_AXES_PER_SOURCE;
+    let repeated = named.windows(2).any(|w| w[0] == w[1]);
+    let crowded = named
+        .chunk_by(|a, b| a.0 == b.0)
+        .any(|controls| controls.len() > per_source);
+    if repeated || crowded {
+        return Err(DecodeError::TooManyHeld);
     }
     Ok(InputStart { opened_at, held })
 }

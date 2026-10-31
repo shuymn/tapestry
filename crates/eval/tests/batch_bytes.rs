@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{MS, device, lane, press, release};
-use eval::{DeviceProfile, EvalInput, Evaluator, InputStart, PhysicalInputEvent};
+use eval::{
+    ControlId, DeviceProfile, EvalInput, Evaluator, InputStart, PhysicalInputEvent, SourceId,
+};
 use rules::RulePreset;
 
 struct Peak;
@@ -145,13 +147,28 @@ fn check(
     device: &DeviceProfile,
     events: &[PhysicalInputEvent],
 ) {
+    check_held(chart, preset, device, events, 0);
+}
+
+/// [`check`], with a held-input snapshot of `held` controls of source 0,
+/// none of them bound, in the record and copied with it.
+fn check_held(
+    chart: &Chart,
+    preset: &RulePreset,
+    device: &DeviceProfile,
+    events: &[PhysicalInputEvent],
+    held: u32,
+) {
     let start = InputStart {
         opened_at: TimeUs(-1_000 * MS),
-        held: Vec::new(),
+        held: (0..held)
+            .map(|c| (SourceId(0), ControlId(10_000 + c), 1))
+            .collect(),
     };
     let estimate = Evaluator::new(chart, preset, device, &start, None, 0)
         .unwrap()
-        .batch_bytes(events.len());
+        .batch_bytes(events.len(), start.held.len());
+    let snapshot = start.held.capacity() * eval::HELD_BYTES;
     let record = events.to_vec();
     let peak = peak_of(&mut || {
         let input = EvalInput {
@@ -163,7 +180,8 @@ fn check(
         };
         let evaluated = eval::evaluate(chart, &input, preset).unwrap();
         drop(std::hint::black_box(evaluated));
-    }) + record.capacity() * size_of::<PhysicalInputEvent>();
+    }) + record.capacity() * size_of::<PhysicalInputEvent>()
+        + snapshot;
     assert!(
         peak <= estimate,
         "{peak} > {estimate}: {} gauges, {} inputs, {} sources",
@@ -205,5 +223,10 @@ fn batch_bytes_covers_evaluate() {
             &device(&offsets),
             &inputs(&mixed, sources),
         );
+    }
+    // A held-input snapshot, one note and no input: the snapshot's copies
+    // are most of the peak.
+    for held in [1, 1_000, 100_000] {
+        check_held(&single, &preset(1), &one, &[], held);
     }
 }

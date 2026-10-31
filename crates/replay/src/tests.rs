@@ -815,6 +815,39 @@ fn records_binding_more_than_the_limits_are_refused() {
     assert_eq!(decoded(&huge), refused);
 }
 
+/// The held-input snapshot names each control once, at most as many per
+/// source and in all as a profile can bind; a hundred thousand entries in
+/// a small record are refused at their count, before anything is
+/// allocated for them.
+#[test]
+fn an_oversized_held_snapshot_is_refused() {
+    let with = |sources: u16, per_source: u32| {
+        let mut rec = golden();
+        rec.devices.sources = vec![rec.devices.sources[1].clone(); usize::from(sources)];
+        rec.events.clear();
+        rec.start.held = (0..sources)
+            .flat_map(|s| (0..per_source).map(move |c| (SourceId(s), ControlId(c), 1)))
+            .collect();
+        rec
+    };
+    let decoded = |rec: &PlayRecord| decode(&encode(rec), &limits()).map(|_| ());
+    let refused = Err(DecodeError::TooManyHeld);
+    let per_source =
+        u32::try_from(eval::MAX_BINDINGS_PER_SOURCE + eval::MAX_AXES_PER_SOURCE).unwrap();
+    assert_eq!(decoded(&with(1, per_source)), Ok(()));
+    assert_eq!(decoded(&with(1, per_source + 1)), refused);
+    // In all: four full sources fit, a fifth does not.
+    assert_eq!(decoded(&with(3, per_source)), Ok(()));
+    assert_eq!(decoded(&with(5, per_source)), refused);
+    // One control named twice.
+    let mut twice = with(1, 2);
+    twice.start.held.push((SourceId(0), ControlId(1), 0));
+    assert_eq!(decoded(&twice), refused);
+    let huge = with(1, 100_000);
+    assert!(body_bytes(&huge).len() < 2 << 20);
+    assert_eq!(decoded(&huge), refused);
+}
+
 #[test]
 fn two_thousand_notes_fit_in_tens_of_kb() {
     // Autoplay of 2000 taps 60 ms apart over 2 minutes, cycling the 8

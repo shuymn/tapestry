@@ -174,7 +174,7 @@ pub fn batch_bytes(
 ) -> Result<usize, EvalError> {
     let device = record.devices.profile();
     let probe = Evaluator::new(chart, preset, &device, &record.start, None, 0)?;
-    Ok(probe.batch_bytes(record.events.len()))
+    Ok(probe.batch_bytes(record.events.len(), record.start.held.len()))
 }
 
 /// Admits the evaluation of `record` on `chart` under `preset` against a

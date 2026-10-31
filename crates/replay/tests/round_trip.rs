@@ -269,10 +269,14 @@ fn record() -> impl Strategy<Value = PlayRecord> {
                     speed: Speed::from_twentieths(speed).unwrap(),
                     start: InputStart {
                         opened_at: TimeUs(opened_at),
-                        held: held
-                            .into_iter()
-                            .map(|(s, c, v)| (source(s), ControlId(c), v))
-                            .collect(),
+                        // Each control named once, as the decoder requires.
+                        held: {
+                            let mut seen = std::collections::HashSet::new();
+                            held.into_iter()
+                                .map(|(s, c, v)| (source(s), ControlId(c), v))
+                                .filter(|&(s, c, _)| seen.insert((s, c)))
+                                .collect()
+                        },
                     },
                     // Small times sit near `opened_at`, so deltas are small
                     // too; full-range ones wrap.
