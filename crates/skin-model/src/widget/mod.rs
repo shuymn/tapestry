@@ -7,6 +7,7 @@
 
 pub(crate) mod digits;
 pub(crate) mod gauge;
+pub(crate) mod glyphs;
 pub(crate) mod judge;
 pub(crate) mod lanes;
 pub(crate) mod scroll;
