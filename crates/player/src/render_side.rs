@@ -5,7 +5,9 @@
 //! screen ([`crate::menu_screen`]) on song selection. The end screen's page
 //! goes through a slot a newer page replaces ([`RenderLink::show_end`]), so
 //! however far the render thread falls behind, one page waits for it and
-//! it holds one, the graphs of each shared with the result screen's cache.
+//! it holds one, the graphs of each shared with the result screen's cache;
+//! leaving the end screen empties the slot ([`RenderLink::clear_end`]), and
+//! a signal whose page went with it draws nothing.
 //! With selection the
 //! chart is not known at the start: each chosen chart is loaded on request
 //! ([`RenderMsg::Load`]) and stays until the next. A window target
@@ -18,7 +20,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -176,9 +178,11 @@ pub enum RenderMsg {
         reply: mpsc::SyncSender<Option<Figures>>,
     },
     /// Draw the end screen instead of a play: the newest page in the slot
-    /// ([`RenderLink::show_end`]), or the one drawn last when a later
-    /// message already took it.
-    End,
+    /// ([`RenderLink::show_end`]), or the one drawn last when an earlier
+    /// signal already took this one's page or a newer one; nothing when
+    /// the page was cleared ([`RenderLink::clear_end`]). The number is the
+    /// page's, counting from 1.
+    End(u64),
     /// The run ends.
     Exit,
 }
@@ -228,13 +232,14 @@ struct Shared {
     failed: AtomicBool,
     /// When the current play's first frame was drawn, on the clock.
     first_frame: AtomicI64,
-    /// The end screen's newest page, until the render thread takes it.
-    end_page: Mutex<Option<EndPage>>,
+    /// The end screen's newest page with its number, until the render
+    /// thread takes it or the end screen is left.
+    end_page: Mutex<Option<(u64, EndPage)>>,
 }
 
 impl Shared {
     /// Swaps `page` into the slot, returning what it held.
-    fn swap_end(&self, page: Option<EndPage>) -> Option<EndPage> {
+    fn swap_end(&self, page: Option<(u64, EndPage)>) -> Option<(u64, EndPage)> {
         let mut slot = self.end_page.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::replace(&mut slot, page)
     }
@@ -264,6 +269,8 @@ pub struct RenderLink {
     exit_timeout: Duration,
     /// How long a play's figures are waited for.
     finish_timeout: Duration,
+    /// The number of the last end page shown.
+    end_pages: AtomicU64,
 }
 
 impl RenderLink {
@@ -276,8 +283,15 @@ impl RenderLink {
     /// has not taken yet, which is dropped here, so at most one waits
     /// whatever the render thread's pace.
     pub fn show_end(&self, page: EndPage) {
-        drop(self.shared.swap_end(Some(page)));
-        self.send(RenderMsg::End);
+        let n = self.end_pages.fetch_add(1, Ordering::Relaxed) + 1;
+        drop(self.shared.swap_end(Some((n, page))));
+        self.send(RenderMsg::End(n));
+    }
+
+    /// The end screen is left (a retry, selection, the practice page): a
+    /// page still waiting is dropped and never drawn.
+    pub fn clear_end(&self) {
+        drop(self.shared.swap_end(None));
     }
 
     /// Readies the screen for a play and waits until it is.
@@ -420,7 +434,7 @@ pub fn spawn(
                 measure,
                 frames,
                 shared: thread_shared,
-                end_page: EndPage::default(),
+                end_page: (0, EndPage::default()),
                 #[cfg(feature = "dev-tools")]
                 menu_stats: crate::dev::MenuStats::default(),
             };
@@ -436,6 +450,7 @@ pub fn spawn(
             answer_timeout: LOAD_TIMEOUT,
             exit_timeout: EXIT_TIMEOUT,
             finish_timeout: FINISH_TIMEOUT,
+            end_pages: AtomicU64::new(0),
         }),
         Ok(Err(e)) => {
             let _ = handle.join();
@@ -485,8 +500,8 @@ struct Run {
     measure: Measure,
     frames: Box<dyn FrameSink>,
     shared: Arc<Shared>,
-    /// The end screen's page last taken from the slot.
-    end_page: EndPage,
+    /// The end screen's page last taken from the slot, and its number.
+    end_page: (u64, EndPage),
     /// The select screen's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     menu_stats: crate::dev::MenuStats,
@@ -578,11 +593,21 @@ impl Run {
                 // Without a screen (it failed), the failure stays reported
                 // and nothing is drawn: the game builds the screen again
                 // through a preparation, which can fail.
-                Ok(RenderMsg::End) => {
+                Ok(RenderMsg::End(n)) => {
                     if let Some(page) = self.shared.swap_end(None) {
                         self.end_page = page;
                     }
-                    mode = Mode::End;
+                    // Its page, or a newer one, was taken; otherwise it
+                    // was cleared with the end screen, which is left: the
+                    // page drawn last goes too, and nothing is drawn until
+                    // what comes next.
+                    if self.end_page.0 >= n {
+                        mode = Mode::End;
+                    } else {
+                        self.end_page.1 = EndPage::default();
+                        mode = Mode::Idle;
+                        continue;
+                    }
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
                     // Judgments still queued were never drawn in this play:
@@ -686,7 +711,7 @@ impl Run {
                     *changed = false;
                     drawn
                 }
-                Mode::End => screen.end(&self.end_page).map(|presented| {
+                Mode::End => screen.end(&self.end_page.1).map(|presented| {
                     let timing = FrameTiming {
                         cpu: Duration::ZERO,
                         sprites: 0,
@@ -1966,7 +1991,7 @@ mod tests {
     struct Ends {
         drew: Arc<std::sync::Mutex<Vec<Drew>>>,
         hold: Arc<std::sync::atomic::AtomicBool>,
-        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        release: std::sync::mpsc::Receiver<()>,
     }
 
     impl Screen for Ends {
@@ -1994,13 +2019,17 @@ mod tests {
             let first = page.lines.first().cloned().unwrap_or_default();
             self.drew.lock().unwrap().push((first, page.graphs.clone()));
             if self.hold.swap(false, Ordering::SeqCst) {
-                let _ = self
-                    .release
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(10));
+                let _ = self.release.recv_timeout(Duration::from_secs(10));
             }
             Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            self.drew.lock().unwrap().push(("<menu>".to_owned(), None));
+            Ok(timing(true))
         }
         #[cfg(feature = "dev-tools")]
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -2022,14 +2051,14 @@ mod tests {
         let drew = Arc::new(std::sync::Mutex::new(Vec::new()));
         let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (release, released) = std::sync::mpsc::channel();
-        let released = std::sync::Mutex::new(Some(released));
+        let mut released = Some(released);
         let (noted, held) = (Arc::clone(&drew), Arc::clone(&hold));
         let make: MakeScreen = Box::new(move || {
-            let release = released.lock().unwrap().take().expect("built once");
+            let release = released.take().expect("built once");
             Ok(Box::new(Ends {
                 drew: Arc::clone(&noted),
                 hold: Arc::clone(&held),
-                release: std::sync::Mutex::new(release),
+                release,
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
@@ -2122,5 +2151,69 @@ mod tests {
         // screen's note of it is left.
         assert_eq!(Arc::strong_count(&first), 2);
         link.exit();
+    }
+
+    /// Left for a retry (a preparation follows) or for a menu screen
+    /// (selection, the practice page): once the rig clears the slot, a
+    /// page still waiting in it is never drawn, nor the page drawn before,
+    /// whether the render thread was stuck in that page's frame or not.
+    #[test]
+    fn a_left_end_screen_draws_no_stale_page() {
+        for (stalled, retry) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (link, drew, hold, release) = ends();
+            let old = graphs(1);
+            hold.store(stalled, Ordering::SeqCst);
+            link.show_end(page("old", Some(&old)));
+            assert!(wait_until(|| !drew.lock().unwrap().is_empty()));
+            let waiting = graphs(2);
+            if stalled {
+                // A settings change while the frame is stuck: its page waits.
+                link.show_end(page("waiting", Some(&waiting)));
+                assert_eq!(Arc::strong_count(&waiting), 2);
+            }
+            // What the rig does on leaving: the slot is emptied first.
+            link.clear_end();
+            assert_eq!(Arc::strong_count(&waiting), 1);
+            if retry {
+                if stalled {
+                    release.send(()).unwrap();
+                }
+                assert!(link.prepare().is_ok());
+            } else {
+                link.send(RenderMsg::Menu(Box::default()));
+                if stalled {
+                    release.send(()).unwrap();
+                }
+                assert!(wait_until(|| {
+                    drew.lock().unwrap().iter().any(|d| d.0 == "<menu>")
+                }));
+            }
+            let ends = |drew: &[Drew]| drew.iter().filter(|d| d.0 != "<menu>").count();
+            let before = ends(&drew.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+            let lines: Vec<String> = drew.lock().unwrap().iter().map(|d| d.0.clone()).collect();
+            assert!(!lines.iter().any(|l| l == "waiting"), "{lines:?}");
+            // No end frame once the screen was left.
+            assert_eq!(ends(&drew.lock().unwrap()), before, "{lines:?}");
+            if stalled {
+                // Only the stuck frame of the old page.
+                assert_eq!(before, 1, "{lines:?}");
+            }
+            if let Some(m) = lines.iter().position(|l| l == "<menu>") {
+                assert!(lines[m..].iter().all(|l| l == "<menu>"), "{lines:?}");
+            }
+            // The render thread let go of the old page too: only the
+            // screen's notes of it are left.
+            let notes = drew
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|d| d.1.as_ref().is_some_and(|g| Arc::ptr_eq(g, &old)))
+                .count();
+            if stalled {
+                assert_eq!(Arc::strong_count(&old), 1 + notes, "{retry}");
+            }
+            link.exit();
+        }
     }
 }

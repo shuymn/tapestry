@@ -519,10 +519,10 @@ fn recover(
     owner: Owner,
     input: &crate::input_side::InputLink,
     in_play: &mut bool,
-    end_lines: &mut Option<Vec<String>>,
+    end_page: &mut Option<crate::render_side::EndPage>,
     shelf: Option<&mut Shelf>,
 ) {
-    *end_lines = None;
+    *end_page = None;
     menus.take_over(owner);
     *in_play = false;
     input.idle();
@@ -1267,9 +1267,10 @@ impl AppRig for PlayerRig<'_> {
             Owner::Select,
             &self.input,
             &mut self.in_play,
-            &mut self.end_lines,
+            &mut self.end_page,
             self.selection.as_mut().map(|s| &mut s.shelf),
         );
+        self.render.clear_end();
         let Some(sel) = &mut self.selection else {
             return;
         };
@@ -1287,9 +1288,10 @@ impl AppRig for PlayerRig<'_> {
             Owner::Practice,
             &self.input,
             &mut self.in_play,
-            &mut self.end_lines,
+            &mut self.end_page,
             self.selection.as_mut().map(|s| &mut s.shelf),
         );
+        self.render.clear_end();
         if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
             ime.set(false);
         }
@@ -1588,7 +1590,8 @@ mod tests {
         if from_result {
             assert!(menus.enter());
         }
-        let (mut in_play, mut end_lines) = (true, Some(vec!["result".to_owned()]));
+        let mut in_play = true;
+        let mut end_page = Some(crate::render_side::EndPage::default());
         sel.shelf.pause();
         // Input queued meanwhile: a window key and a controller press from
         // when the menu was last on.
@@ -1601,12 +1604,12 @@ mod tests {
             Owner::Practice,
             &link,
             &mut in_play,
-            &mut end_lines,
+            &mut end_page,
             Some(&mut sel.shelf),
         );
         assert_eq!(hook.wake(&mut set, TimeUs(3_000)), input::Phase::Idle);
         assert!(!in_play);
-        assert_eq!(end_lines, None);
+        assert_eq!(end_page, None);
         assert!(!sel.shelf.paused());
         assert_eq!(menus.owner(), Owner::Practice);
         assert_eq!(menus.take_practice(), None);

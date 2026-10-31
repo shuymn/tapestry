@@ -198,7 +198,7 @@ fn frame_does_not_allocate_after_warmup() {
             high: rules::GaugeValue::FULL,
             last: rules::GaugeValue::FULL,
         }; game::GRAPH_COLUMNS],
-        mark: game::GaugeMark::Survival {
+        mark: rules::GaugeKind::Survival {
             fails_below: rules::GaugeValue(1),
         },
         failed: Some(100),

@@ -841,8 +841,8 @@ pub fn result_graphs(g: &ResultGraphs, out: &mut SpriteBatch) {
         };
         if bold {
             let line = match trace.mark {
-                game::GaugeMark::EndThreshold { clear } => clear,
-                game::GaugeMark::Survival { fails_below } => fails_below,
+                rules::GaugeKind::EndThreshold { clear } => clear,
+                rules::GaugeKind::Survival { fails_below } => fails_below,
             };
             let [r, gr, b, _] = color;
             let width = reached as f32 * GRAPH_COLUMN_W;
@@ -912,7 +912,6 @@ fn timing(t: &game::Timing, out: &mut SpriteBatch) {
         BAND_H,
         CENTER,
     );
-    let advance = (GLYPH_W + 1) as f32 * LABEL_SCALE;
     let y = BAND_BOTTOM + 6.0;
     let last = HISTOGRAM_LEFT + (game::TIMING_BINS + 1) as f32 * BAR_W;
     for (x, label) in [
@@ -920,7 +919,7 @@ fn timing(t: &game::Timing, out: &mut SpriteBatch) {
         (center, b"0"),
         (last, b"+64"),
     ] {
-        let w = label.len() as f32 * advance;
+        let w = text_width(label.len(), LABEL_SCALE);
         text(out, x - w / 2.0, y, LABEL_SCALE, TEXT, label);
     }
 }
@@ -1868,7 +1867,7 @@ mod tests {
                     high: pct(s + 10),
                     last: pct(s + 10),
                 }; game::GRAPH_COLUMNS],
-                mark: game::GaugeMark::Survival {
+                mark: rules::GaugeKind::Survival {
                     fails_below: GaugeValue::EMPTY,
                 },
                 failed: None,

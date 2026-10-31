@@ -79,21 +79,6 @@ impl GaugeColumn {
     };
 }
 
-/// The line a gauge's graph marks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GaugeMark {
-    /// Cleared at or above this value at the end.
-    EndThreshold {
-        /// The clear threshold.
-        clear: GaugeValue,
-    },
-    /// Fails below this value.
-    Survival {
-        /// The failure threshold.
-        fails_below: GaugeValue,
-    },
-}
-
 /// One listed gauge's graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GaugeTrace {
@@ -101,8 +86,8 @@ pub struct GaugeTrace {
     pub gauge: u16,
     /// Its history over the axis.
     pub columns: [GaugeColumn; GRAPH_COLUMNS],
-    /// Its clear or failure line.
-    pub mark: GaugeMark,
+    /// How it decides a clear: its clear or failure line.
+    pub mark: GaugeKind,
     /// The column a survival gauge failed in, if it did.
     pub failed: Option<u16>,
 }
@@ -111,7 +96,7 @@ impl GaugeTrace {
     const EMPTY: Self = Self {
         gauge: 0,
         columns: [GaugeColumn::AT_ZERO; GRAPH_COLUMNS],
-        mark: GaugeMark::EndThreshold {
+        mark: GaugeKind::EndThreshold {
             clear: GaugeValue::EMPTY,
         },
         failed: None,
@@ -257,10 +242,7 @@ impl ResultGraphs {
             let mut t = GaugeTrace::EMPTY;
             t.gauge = u16::try_from(i).unwrap_or(u16::MAX);
             condense(result, axis, &mut t.columns);
-            t.mark = match rule.kind {
-                GaugeKind::EndThreshold { clear } => GaugeMark::EndThreshold { clear },
-                GaugeKind::Survival { fails_below } => GaugeMark::Survival { fails_below },
-            };
+            t.mark = rule.kind;
             t.failed = result.failed_at.map(|f| axis.column(f));
             *trace = Some(t);
             if emphasized == Some(i) {

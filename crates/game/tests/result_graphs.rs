@@ -334,8 +334,7 @@ fn coverage_sets_reached_and_no_input() {
     let r = re(&chart, &rec, &preset);
     assert_eq!(r.coverage, Coverage::EndedMidway(w));
     let s = summary(&r, &preset, axis);
-    // The axis ends at the final deadline, the last tap's miss after 2.5 s.
-    let expected = u16::try_from(1_600 * MS * 288 / end.0 + 1).unwrap();
+    let expected = axis.column(w) + 1;
     assert_eq!(s.graphs.reached, expected);
     assert!(expected < N);
     // Played to the end, the watermark recorded early: a what-if runs past
@@ -535,4 +534,103 @@ fn own_timing_matches_the_recommendation_and_emphasis_follows_the_display() {
     assert!(emphasized.contains(&("swapped".to_owned(), Some(0))));
     assert!(emphasized.contains(&("renamed".to_owned(), Some(0))));
     assert!(emphasized.contains(&("tapestry".to_owned(), Some(1))));
+}
+
+/// The tapestry preset named `id` with BAD's late edge at `late_ms`, so
+/// its final deadline moves with it.
+fn late_edge(id: &str, late_ms: i64) -> RulePreset {
+    let mut p = rules::tapestry();
+    p.id = id.to_owned();
+    for t in [&mut p.tables.keys, &mut p.tables.scratch] {
+        t.windows.bad.late = TimeUs(late_ms * MS);
+    }
+    p
+}
+
+/// Without an evaluation of its own (the record names another preset),
+/// the screen's axis is fixed by the first what-if, and a later what-if
+/// whose final deadline differs is condensed on that same axis.
+#[test]
+fn the_first_what_if_fixes_the_axis_without_an_own_evaluation() {
+    let chart = taps(4);
+    let preset = rules::tapestry();
+    let events: Vec<_> = (0..4)
+        .flat_map(|i| {
+            let t = 1_000 * MS + i * 500 * MS + 2 * MS;
+            [press(t, 0, lane(1)), release(t + 50 * MS, lane(1))]
+        })
+        .collect();
+    let end = deadline(&chart, &preset);
+    let rec = record(&preset, events, EndStatus::PlayedToEnd, end);
+    let tally = re(&chart, &rec, &preset).evaluation.tally;
+    let report = game::PlayReport {
+        attempt: 1,
+        end: game::PlayEnd::Completed,
+        tail_cut: None,
+        reload_error: None,
+        output_error: None,
+        input_error: None,
+        live: Vec::new(),
+        tally,
+        displayed_gauge: GaugeIndex(0),
+        record: Some(rec),
+        saved: None,
+        result: Some(game::ResultSummary {
+            evaluation: Err(game::ReEvaluationError::PresetMismatch),
+            matches_live: false,
+            recommended_offset: None,
+        }),
+        best: None,
+        preset: preset.clone(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let presets = dir.path().join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    for (name, ms) in [("early", 110), ("late", 220)] {
+        let toml = game::preset_to_toml(&late_edge(name, ms));
+        std::fs::write(presets.join(format!("{name}.toml")), toml).unwrap();
+    }
+    let shelf = game::Shelf::open(presets, "tapestry").unwrap();
+    let mut screen = ResultScreen::new(&report, &shelf, &chart, game::RECORDING_MEMORY);
+    assert!(matches!(screen.status(), ViewStatus::Failed(_)));
+    assert_eq!(screen.axis(), None);
+    let mut step_to = |name: &str| {
+        while screen.viewed().unwrap().name != name {
+            screen.step(-1, &report, &chart);
+        }
+        let ViewStatus::Ready(s) = screen.status() else {
+            panic!("{:?}", screen.status());
+        };
+        (s.clone(), screen.axis().unwrap())
+    };
+    // From tapestry back one: `late` first, then `early`.
+    let (_, axis) = step_to("late");
+    let late_end = deadline(&chart, &late_edge("late", 220));
+    assert_eq!(
+        axis,
+        Axis {
+            origin: TimeUs(0),
+            end: late_end,
+        }
+    );
+    let (early, still) = step_to("early");
+    assert_eq!(still, axis);
+    let ctx = ResultContext {
+        record: report.record.as_ref().unwrap(),
+        chart: &chart,
+        preset: &preset,
+        live: &[],
+    };
+    let r = ReEvaluate::under(&ctx, &late_edge("early", 110)).unwrap();
+    assert!(r.evaluation.final_deadline < late_end);
+    let mut on_axis = [early.graphs.traces[0].unwrap().columns[0]; GRAPH_COLUMNS];
+    let mut on_own = on_axis;
+    condense(&r.evaluation.gauges[0], axis, &mut on_axis);
+    let own_axis = Axis {
+        end: r.evaluation.final_deadline,
+        ..axis
+    };
+    condense(&r.evaluation.gauges[0], own_axis, &mut on_own);
+    assert_eq!(early.graphs.traces[0].unwrap().columns, on_axis);
+    assert_ne!(on_axis, on_own);
 }

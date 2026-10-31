@@ -557,15 +557,13 @@ pub fn view_graphs(screen: &ResultScreen) -> Option<Arc<ResultGraphs>> {
     }
 }
 
-/// The end screen's page: the summary's `lines`, the settings lines of `t`
-/// under them, and the view's `graphs`, which a settings change keeps.
-pub fn end_page(lines: &[String], graphs: Option<&Arc<ResultGraphs>>, t: Tuning) -> EndPage {
-    let mut all = lines.to_vec();
-    all.extend(settings_lines(t));
-    EndPage {
-        lines: all,
-        graphs: graphs.cloned(),
-    }
+/// The end screen's page to draw: `base` (the summary's lines and the
+/// view's graphs, which a settings change keeps) with the settings lines of
+/// `t` under its lines.
+pub fn with_settings(base: &EndPage, t: Tuning) -> EndPage {
+    let mut page = base.clone();
+    page.lines.extend(settings_lines(t));
+    page
 }
 
 /// The settings keys and their values, under the summary, on the two lines
@@ -1162,17 +1160,19 @@ mod tests {
         let graphs = super::view_graphs(&s).unwrap();
         assert!(Arc::ptr_eq(&graphs, &own.graphs));
         assert!(graphs.traces[0].is_some());
-        let lines = vec!["A".to_owned()];
+        let base = super::EndPage {
+            lines: vec!["A".to_owned()],
+            graphs: Some(Arc::clone(&graphs)),
+        };
         let t = game::Tuning {
             visible_time_ms: 575,
             volume_percent: 100,
             display_offset_us: 0,
             input_offset_us: 0,
         };
-        let page = super::end_page(&lines, Some(&graphs), t);
-        let changed = super::end_page(
-            &lines,
-            Some(&graphs),
+        let page = super::with_settings(&base, t);
+        let changed = super::with_settings(
+            &base,
             game::Tuning {
                 volume_percent: 35,
                 ..t
