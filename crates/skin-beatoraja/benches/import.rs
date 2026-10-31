@@ -1,7 +1,8 @@
 //! CPU benchmarks of importing a JSON skin: `read_header` then `import`.
 //!
 //! `skin_beatoraja_import_typical` is a generated skin of about 2,000
-//! images, 64 numbers, 64 texts and 200 conditions over 16 files.
+//! images, 64 numbers, 64 texts and 200 conditions over 16 files, with the
+//! lanes, one judge and a 36-node gauge.
 //! `skin_beatoraja_import_element_cap` is a skin at the element cap, each
 //! element its own image.
 
@@ -20,20 +21,65 @@ fn typical(root: &Path) {
         png(root, &format!("s{i}.png"), 256, 256);
     }
     png(root, "n.png", 120, 20);
+    png(root, "a.png", 64, 64);
     font(root, "f.ttf");
     let sources = join(
         (0..16)
             .map(|i| format!(r#"{{"id": "s{i}", "path": "s{i}.png"}}"#))
-            .chain([r#"{"id": "n", "path": "n.png"}"#.to_owned()]),
+            .chain([
+                r#"{"id": "n", "path": "n.png"}"#.to_owned(),
+                r#"{"id": "a", "path": "a.png"}"#.to_owned(),
+            ]),
     );
-    let images = join((0..2_000).map(|i| {
-        format!(
-            r#"{{"id": "i{i}", "src": "s{}", "x": {}, "y": {}, "w": 16, "h": 16}}"#,
-            i % 16,
-            (i % 16) * 16,
-            (i / 16 % 16) * 16
-        )
-    }));
+    // The play objects: lanes of one part image, a judge of one grade and
+    // a 6-digit combo, a 36-node gauge.
+    let eight = join((0..8).map(|_| r#""lp""#.to_owned()));
+    let lists = join(
+        [
+            "note",
+            "lnstart",
+            "lnend",
+            "lnbody",
+            "lnactive",
+            "mine",
+            "hcnstart",
+            "hcnend",
+            "hcnbody",
+            "hcnactive",
+            "hcndamage",
+            "hcnreactive",
+        ]
+        .iter()
+        .map(|f| format!(r#""{f}": [{eight}]"#)),
+    );
+    let lanes = join(
+        (0..7)
+            .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))
+            .chain([r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#.to_owned()]),
+    );
+    let nodes = join((0..36).map(|_| r#""gd""#.to_owned()));
+    let play = format!(
+        r#""note": {{"id": "notes", {lists}, "dst": [{lanes}]}},
+           "judge": [{{"id": "j", "index": 0,
+                      "images": [{{"id": "gd", "dst": [{{"x": 600, "y": 500, "w": 80, "h": 20}}]}}],
+                      "numbers": [{{"id": "v0", "dst": [{{"x": 10, "y": 0, "w": 12, "h": 20}}]}}]}}],
+           "gauge": {{"id": "gg", "nodes": [{nodes}], "parts": 50}}"#
+    );
+    let images = join(
+        (0..2_000)
+            .map(|i| {
+                format!(
+                    r#"{{"id": "i{i}", "src": "s{}", "x": {}, "y": {}, "w": 16, "h": 16}}"#,
+                    i % 16,
+                    (i % 16) * 16,
+                    (i / 16 % 16) * 16
+                )
+            })
+            .chain([
+                r#"{"id": "lp", "src": "a", "w": 8, "h": 20}"#.to_owned(),
+                r#"{"id": "gd", "src": "a", "y": 20, "w": 8, "h": 8}"#.to_owned(),
+            ]),
+    );
     let values = join((0..64).map(|i| {
         format!(
             r#"{{"id": "v{i}", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 6,
@@ -60,14 +106,19 @@ fn typical(root: &Path) {
             }))
             .chain((0..64).map(|i| {
                 format!(r#"{{"id": "t{i}", "dst": [{{"x": 900, "y": {}, "w": 300, "h": 14}}]}}"#, i * 15)
-            })),
+            }))
+            .chain([
+                r#"{"id": "notes", "dst": [{"w": 0, "h": 0}]}"#.to_owned(),
+                r#"{"id": "j", "dst": [{"w": 0, "h": 0}]}"#.to_owned(),
+                r#"{"id": "gg", "dst": [{"x": 600, "y": 100, "w": 500, "h": 10}]}"#.to_owned(),
+            ]),
     );
     write(
         root,
         "s.json",
         hd(&format!(
             r#""source": [{sources}], "font": [{{"id": "f", "path": "f.ttf"}}],
-               "image": [{images}], "value": [{values}], "text": [{texts}],
+               "image": [{images}], "value": [{values}], "text": [{texts}], {play},
                "destination": [{dsts}]"#
         ))
         .as_bytes(),
@@ -104,7 +155,7 @@ fn run(root: &Path) -> usize {
 fn bench_import(c: &mut Criterion) {
     let d = tempfile::tempdir().unwrap();
     typical(d.path());
-    assert_eq!(run(d.path()), 2_128);
+    assert_eq!(run(d.path()), 2_131);
     c.bench_function("skin_beatoraja_import_typical", |b| {
         b.iter(|| black_box(run(black_box(d.path()))));
     });
