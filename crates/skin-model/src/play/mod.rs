@@ -289,9 +289,9 @@ impl Play {
 
     /// Whether the lanes draw `note`'s body on `lane` active, as of the
     /// last build: by the LN mode, from whether the lane's visual hold is
-    /// on it with its head held (not a BAD head).
+    /// on it.
     pub(crate) fn body_active(&self, lane: Lane, note: usize) -> bool {
-        let held = self.hold(lane).is_some_and(|h| h.note == note && h.held);
+        let held = self.hold(lane).is_some_and(|h| h.note == note);
         reducer::body_active(self.reducer.ln_mode, held)
     }
 }
@@ -445,15 +445,15 @@ mod tests {
         assert_eq!(play.hold_note(lane(2)), None);
         // A judged long note stays drawn: it is never done.
         assert!(!play.done(2, 0));
-        // A BAD head holds without `LnHeld`, but its body is not active;
-        // it stays drawn.
+        // A BAD head holds without `LnHeld`, its body active; it stays
+        // drawn.
         frame(
             &mut play,
             1_400,
             &[ev(1_400, judged(5, 0, Judgment::Bad, Some(-100), None))],
         );
         assert_eq!(play.hold_note(lane(5)), Some(0));
-        assert!(!play.body_active(lane(5), 0));
+        assert!(play.body_active(lane(5), 0));
         assert!(!play.done(5, 0));
         // Another note's end leaves it; its own ends it.
         frame(&mut play, 1_420, &[ev(1_420, ended(5, 1))]);

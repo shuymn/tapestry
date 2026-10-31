@@ -127,9 +127,9 @@ const NOTE_WHITE: Rgba = [0.95, 0.95, 0.95, 1.0];
 const NOTE_BLUE: Rgba = [0.35, 0.55, 1.0, 1.0];
 const NOTE_SCRATCH: Rgba = [1.0, 0.35, 0.35, 1.0];
 const MINE: Rgba = [0.6, 0.1, 0.1, 1.0];
-/// A long note's body has two looks: active while it is held, inactive
-/// otherwise (before its head, after a miss, a BAD head or a release),
-/// drawn darker.
+/// A long note's body has two looks: active while it is held (a BAD head
+/// included), inactive otherwise (before its head, after a miss or a
+/// release), drawn darker.
 const LN_BODY_ACTIVE: f32 = 0.6;
 const LN_BODY_INACTIVE: f32 = 0.3;
 const GAUGE_BG: Rgba = [0.12, 0.12, 0.12, 1.0];
@@ -204,9 +204,9 @@ pub struct SimpleSkin {
     /// The long-note judgment mode the notes are drawn by: LN, the only
     /// mode judged (design.md "LN Judgment Modes").
     ln_mode: LnMode,
-    /// Per lane, the long note being held: its head was held
-    /// ([`JudgeEventKind::LnHeld`]) and its visual hold has not ended
-    /// ([`JudgeEventKind::LnHoldEnded`]).
+    /// Per lane, the long note being held: a press took its head before its
+    /// end (held, or decided BAD at the press) and its visual hold has not
+    /// ended ([`JudgeEventKind::LnHoldEnded`]).
     active: [Option<usize>; LANE_COUNT],
     /// Latest press per lane, for the key beam.
     pressed: [Option<TimeUs>; LANE_COUNT],
@@ -286,21 +286,29 @@ impl SimpleSkin {
                 note,
                 judgment,
                 deviation,
+                release,
                 ..
             } => {
                 let l = lane.index();
-                let long = matches!(
-                    self.lanes[l].get(note).map(|n| n.kind),
-                    Some(NoteKind::Long { .. })
-                );
+                let end = match self.lanes[l].get(note).map(|n| n.kind) {
+                    Some(NoteKind::Long { end, .. }) => Some(end),
+                    Some(NoteKind::Tap | NoteKind::Mine { .. }) | None => None,
+                };
                 self.judgment = Some((judgment, ev.time));
+                let Some(end) = end else {
+                    self.done[l].set(note);
+                    self.feedback(l, judgment, deviation.is_some(), ev.time);
+                    return;
+                };
                 // A long note stays drawn when judged, until its end passes
                 // the line. Held earlier, its press already gave its
-                // feedback.
-                if !long {
-                    self.done[l].set(note);
-                } else if self.held[l].get(note) {
+                // feedback; decided at a press before its end (a BAD head),
+                // it is held while the lane stays held.
+                if self.held[l].get(note) {
                     return;
+                }
+                if deviation.is_some() && release.is_none() && ev.time < end {
+                    self.active[l] = Some(note);
                 }
                 self.feedback(l, judgment, deviation.is_some(), ev.time);
             }
@@ -1156,8 +1164,8 @@ mod tests {
     fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
         // Displayed at 1.15 s, 800 px per 600 ms: the head 150 ms past the
         // line is pinned to it (y 880), the tail 150 ms ahead at y 680. The
-        // body from 680 to 880 is active only while it is held (`LnHeld`
-        // until its hold ends); a BAD head is never held.
+        // body from 680 to 880 is active only while its head was pressed
+        // and the lane stays held, whatever the judgment.
         let chart = long_note();
         let v = view();
         let caps = vec![[320.0, 672.0, 64.0, 16.0], [320.0, 872.0, 64.0, 16.0]];
@@ -1197,7 +1205,7 @@ mod tests {
                     None,
                     Some(850 * MS),
                 )],
-                false,
+                true,
             ),
             (
                 "a BAD head released",
@@ -1360,32 +1368,35 @@ mod tests {
     fn a_long_note_turns_inactive_at_its_logic_end_while_its_tail_still_shows() {
         // The long note from 1 s to 1.3 s, drawn with a display offset of
         // −100 ms, so its tail is still 100 ms ahead of the line when its
-        // logic end passes. A head on time, released exactly at the end or
-        // held through it (released at 1.5 s, judged by the end deadline):
-        // the body is active at logic 1.29 s, and inactive from the logic
-        // end on, with the tail drawn (at 1.31 s, 90 ms ahead: y 760).
+        // logic end passes. A GOOD-or-better head (on time) and a BAD head
+        // (150 ms early), each released exactly at the end or held through
+        // it (released at 1.5 s, judged by the end deadline): the body is
+        // active at logic 1.29 s, and inactive from the logic end on, with
+        // the tail drawn (at 1.31 s, 90 ms ahead: y 760).
         let chart = long_note();
         let v = view();
         let end = 1_300 * MS;
         let offset = -100 * MS;
         let tail = [320.0, 752.0, 64.0, 16.0];
-        for release in [end, 1_500 * MS] {
-            for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
-                let effects = evaluated(&chart, 1_000 * MS, release, now);
-                let mut s = skin(&chart);
-                let f = FrameInput {
-                    display_offset: TimeUs(offset),
-                    ..frame(&v, now, &effects)
-                };
-                let [on, off, caps] = long_parts(&build(&mut s, &f), lane(2));
-                let case = format!("release {release}, at {now}");
-                assert_eq!(
-                    (on.len(), off.len()),
-                    (usize::from(active), usize::from(!active)),
-                    "{case}"
-                );
-                if now == end + 10 * MS {
-                    assert_eq!(caps[0], tail, "{case}");
+        for press in [1_000 * MS, 850 * MS] {
+            for release in [end, 1_500 * MS] {
+                for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
+                    let effects = evaluated(&chart, press, release, now);
+                    let mut s = skin(&chart);
+                    let f = FrameInput {
+                        display_offset: TimeUs(offset),
+                        ..frame(&v, now, &effects)
+                    };
+                    let [on, off, caps] = long_parts(&build(&mut s, &f), lane(2));
+                    let case = format!("press {press}, release {release}, at {now}");
+                    assert_eq!(
+                        (on.len(), off.len()),
+                        (usize::from(active), usize::from(!active)),
+                        "{case}"
+                    );
+                    if now == end + 10 * MS {
+                        assert_eq!(caps[0], tail, "{case}");
+                    }
                 }
             }
         }
@@ -1415,7 +1426,7 @@ mod tests {
         let end = 2_000 * MS;
         // (case, press, release, [(at, active)]), in ms.
         type Case = (&'static str, i64, i64, &'static [(i64, bool)]);
-        let cases: [Case; 5] = [
+        let cases: [Case; 6] = [
             (
                 "a missed head",
                 2_500,
@@ -1423,10 +1434,22 @@ mod tests {
                 &[(1_170, false), (1_200, false), (1_900, false)],
             ),
             (
-                "a BAD head still held",
+                "a BAD head released before the end",
+                850,
+                1_400,
+                &[
+                    (849, false),
+                    (850, true),
+                    (1_399, true),
+                    (1_400, false),
+                    (1_900, false),
+                ],
+            ),
+            (
+                "a BAD head held through its end",
                 850,
                 2_500,
-                &[(849, false), (850, false), (1_900, false)],
+                &[(850, true), (1_999, true)],
             ),
             (
                 "a release before the end",

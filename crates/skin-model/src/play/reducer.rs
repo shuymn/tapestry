@@ -6,8 +6,7 @@
 //! the sequence. Feedback follows the play screen's rules: a press gives a
 //! bomb unless it is a POOR, a long note's completion gives its judgment
 //! text but never a bomb or a hold, and the visual hold starts at a head
-//! press before the long note's end. Only a held head (`LnHeld`) draws its
-//! body active; a BAD head's hold runs the `hold` timer alone.
+//! press before the long note's end, a BAD head included.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
@@ -54,9 +53,6 @@ pub(crate) struct Hold {
     /// The long note's end: the hold reads off from here even if its
     /// `LnHoldEnded` was dropped.
     pub(crate) end: TimeUs,
-    /// Whether its head is held (`LnHeld`), not a BAD head decided at its
-    /// press.
-    pub(crate) held: bool,
 }
 
 /// The effect-sourced state of one attempt.
@@ -212,7 +208,7 @@ impl Reducer {
                     return;
                 }
                 // A head judged at its press: a press before the end (a
-                // BAD head) starts the visual hold, but is not held.
+                // BAD head) starts the visual hold.
                 if deviation.is_some()
                     && t < end
                     && let Some(hold) = self.hold.get_mut(l)
@@ -221,7 +217,6 @@ impl Reducer {
                         note,
                         start: t,
                         end,
-                        held: false,
                     });
                 }
                 self.feedback(l, judgment, t);
@@ -239,7 +234,6 @@ impl Reducer {
                         note,
                         start: t,
                         end,
-                        held: true,
                     });
                 }
                 self.judge = Some((Grade::of(judgment), t));

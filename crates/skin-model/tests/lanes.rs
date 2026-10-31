@@ -77,8 +77,8 @@ fn long_note() -> Chart {
 fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
     // Displayed at 1.15 s, 800 px per 600 ms: the head 150 ms past the
     // line is pinned to it (y 880), the tail 150 ms ahead at y 680. The
-    // body from 680 to 880 is active only while it is held (`LnHeld` until
-    // its hold ends); a BAD head is never held.
+    // body from 680 to 880 is active only while its head was pressed and
+    // the lane stays held, whatever the judgment.
     let chart = long_note();
     let caps = vec![[320.0, 672.0, 64.0, 16.0], [320.0, 872.0, 64.0, 16.0]];
     let body = vec![[320.0, 680.0, 64.0, 200.0]];
@@ -110,7 +110,7 @@ fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
         (
             "a BAD head decided at its press",
             vec![ln(850, Judgment::Bad, Some(-150), None)],
-            false,
+            true,
         ),
         (
             "a BAD head released",
@@ -227,28 +227,31 @@ fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent
 fn a_long_note_turns_inactive_at_its_logic_end_while_its_tail_still_shows() {
     // The long note from 1 s to 1.3 s, drawn with a display offset of
     // −100 ms, so its tail is still 100 ms ahead of the line when its
-    // logic end passes. A head on time, released exactly at the end or
-    // held through it (released at 1.5 s, judged by the end deadline): the
-    // body is active at logic 1.29 s, and inactive from the logic end on,
-    // with the tail drawn (at 1.31 s, 90 ms ahead: y 760).
+    // logic end passes. A GOOD-or-better head (on time) and a BAD head
+    // (150 ms early), each released exactly at the end or held through
+    // it (released at 1.5 s, judged by the end deadline): the body is
+    // active at logic 1.29 s, and inactive from the logic end on, with
+    // the tail drawn (at 1.31 s, 90 ms ahead: y 760).
     let chart = long_note();
     let end = 1_300 * MS;
     let tail = [320.0, 752.0, 64.0, 16.0];
-    for release in [end, 1_500 * MS] {
-        for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
-            let effects = evaluated(&chart, 1_000 * MS, release, now);
-            let mut h = harness(&chart);
-            h.offset = TimeUs(-100 * MS);
-            h.frame_us(now, &effects);
-            let [on, off, caps] = long_parts(&h, lane(2));
-            let case = format!("release {release}, at {now}");
-            assert_eq!(
-                (on.len(), off.len()),
-                (usize::from(active), usize::from(!active)),
-                "{case}"
-            );
-            if now == end + 10 * MS {
-                assert_eq!(caps[0], tail, "{case}");
+    for press in [1_000 * MS, 850 * MS] {
+        for release in [end, 1_500 * MS] {
+            for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
+                let effects = evaluated(&chart, press, release, now);
+                let mut h = harness(&chart);
+                h.offset = TimeUs(-100 * MS);
+                h.frame_us(now, &effects);
+                let [on, off, caps] = long_parts(&h, lane(2));
+                let case = format!("press {press}, release {release}, at {now}");
+                assert_eq!(
+                    (on.len(), off.len()),
+                    (usize::from(active), usize::from(!active)),
+                    "{case}"
+                );
+                if now == end + 10 * MS {
+                    assert_eq!(caps[0], tail, "{case}");
+                }
             }
         }
     }
@@ -277,7 +280,7 @@ fn a_long_note_is_drawn_until_its_end_active_only_while_held() {
     let end = 2_000 * MS;
     // (case, press, release, [(at, active)]), in ms.
     type Case = (&'static str, i64, i64, &'static [(i64, bool)]);
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         (
             "a missed head",
             2_500,
@@ -285,10 +288,22 @@ fn a_long_note_is_drawn_until_its_end_active_only_while_held() {
             &[(1_170, false), (1_200, false), (1_900, false)],
         ),
         (
-            "a BAD head still held",
+            "a BAD head released before the end",
+            850,
+            1_400,
+            &[
+                (849, false),
+                (850, true),
+                (1_399, true),
+                (1_400, false),
+                (1_900, false),
+            ],
+        ),
+        (
+            "a BAD head held through its end",
             850,
             2_500,
-            &[(849, false), (850, false), (1_900, false)],
+            &[(850, true), (1_999, true)],
         ),
         (
             "a release before the end",
