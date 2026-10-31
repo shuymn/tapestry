@@ -4,7 +4,7 @@ Stage 3 of the roadmap (design.md "Roadmap") is the look and effects of the play
 
 **Status.** Decided; the decisions that change design.md are in it ("Goals", "Rendering and Skins", "Custom Skin Format", "beatoraja Lua Skins", "Extension Boundaries", "Settings Scopes", "Language and Crate Structure", "Libraries", "Roadmap", "Open Questions"). The fast and slow counts in `Tally` go into design.md with the evaluator change that adds them (S9). This file holds the plan and the details, and is removed when stage 3 exits.
 
-**Citations.** `file:N` points into the repository at commit 17e17de unless it names another revision, and design.md is cited by section name. "ED" is LR2oraja Endless Dream; "upstream" is beatoraja itself. What is said about their skin loaders was read from their published source as a description of the file format; none of their code is ported (design.md "Libraries").
+**Citations.** `file:N` points into the repository at commit 17e17de unless it names another revision (8622dd7 for the canvas, regions and lanes of S5), and design.md is cited by section name. "ED" is LR2oraja Endless Dream; "upstream" is beatoraja itself. What is said about their skin loaders was read from their published source as a description of the file format; none of their code is ported (design.md "Libraries").
 
 **What the skin system must do:**
 - **Existing skins first.** Skins made for beatoraja-family players become playable in tapestry before tapestry's own format exists. The importers are separate from the format and never shape it.
@@ -51,7 +51,7 @@ Times are integer milliseconds in files and microseconds inside. For an element 
 - Local time is `t = now − start(T)`; an element without a timer uses `ready`, so it is drawn during the countdown as the target loaders draw untimed objects from the screen's start.
 - After the last key, one of three behaviors, named by the author: **hold** (keep the last key's values), **hide** (drawn while `t ≤ kn`, not after), or **loop from `L`** (`k0 ≤ L < kn`): for `t > L`, `t' = L + (t − L) mod (kn − L)`, so `t = kn` already shows `L`. This matches the target loaders exactly (ED `SkinObject.prepareRegion`), so the export is one-to-one.
 - Before `k0` the element is not drawn.
-- Between keys, x, y, w, h, alpha, r, g, b and angle interpolate; a field left out of a key keeps the previous key's value. Rotation and scaling use a 9-point pivot.
+- Between keys, x, y, w, h, alpha, r, g, b and angle interpolate; a field left out of a key keeps the previous key's value. A key's `(x, y)` is the rect's top-left corner, as in the target loaders' destinations, so an importer maps them one to one. Each element names a 9-point pivot, a point of the sampled rect (corner, edge midpoint or centre), about which it rotates: with x = 100 and w from 40 to 80 the corner stays and a centre pivot moves from 120 to 140. The angle is in degrees and interpolates numerically (350 to 10 passes 180); drawing reduces it into `[0, 2π)` (`rem_euclid` before the conversion, so large keys keep their precision). `Quad` carries the pivot as a canvas point and the angle in radians.
 - Ease per track: linear, in, out, step (in and out are quadratic). Cubic and per-keyframe ease come into the runtime model with the importer that needs them.
 - **Image frames** are not part of the track: an image's frame cycle runs on the image's own timer, so an element can show on `ready` while its frames restart on `judge`. With `n` frames over a period `p` (1 µs to the longest key time), `t` after that timer started shows frame `((t mod p) · n) / p`; frame 0 shows while the timer is off, without a cycle, or with one frame. Both timers come from the same frame's fill, before any element is drawn. Whether the target loaders show frame 0 while a cycle's timer is off is checked when S6 imports; the importer adapts, the rule stays.
 - In the authored format, keys must be strictly increasing from `k0 ≥ 0` and a loop point must lie inside the track (the target loaders hide a finished track by setting its time to −1, which a negative key would make visible again); anything else is a load error. The target loaders accept unsorted and equal-time keys and apply a loop only when the last key is after 0; the importer reproduces that, and the exporter emits only tracks that need neither. Tests pin `k0`, `kn` and `L` at exactly and ±1 µs, for hold, hide, loop and a single-key track.
@@ -89,7 +89,7 @@ Expressions give conditions and values; they never move or color anything (§4).
 
 ### R5. Layout: canvas, regions and player adjustment
 
-**Canvas.** The canvas is 1080 reference pixels tall and `1080 × aspect` wide; narrower than 16:9 it is 1920 wide and grows taller instead (§7, decision 3). It is scaled uniformly to the render target. At 16:9 every coordinate is exactly what the author wrote, so authors keep drawing at 1920×1080.
+**Canvas.** The canvas is 1080 reference pixels tall and `1080 × aspect` wide; narrower than 16:9 it is 1920 wide and grows taller instead (§7, decision 3). The aspect is capped at 4:1 (4320 wide) and 1:2 (3840 tall), with bars beyond; the branch is decided in integers, so a target just narrower than 16:9 grows taller, never narrower. It is scaled uniformly to the render target. At 16:9 every coordinate is exactly what the author wrote, so authors keep drawing at 1920×1080. `Skin::canvas` computes it from the target size; a skin with `Fit::Fixed` (imports) uses 1920×1080 pillarboxed or letterboxed, as render's letterbox does today (crates/render/src/renderer.rs:681 at 8622dd7).
 
 **Regions** are a fixed set defined by the format, so the player sees the same controls on every skin:
 
@@ -100,26 +100,36 @@ Expressions give conditions and values; they never move or color anything (§4).
 | `left`, `right`, `top`, `bottom` | HUD elements the author tags | x, y, scale, visible (when marked optional) |
 | `screen` | Everything untagged, backgrounds (`fill = cover`, `stretch` or `none`) | nothing |
 
-- Each region has a 9-point anchor; on a wider canvas it moves with its anchor. The player can also set a side inset that keeps edge regions near the centre on very wide screens.
-- The transform order is: author coordinates → region scale about the anchor → region translation → anchor shift → canvas to target. `judge` is placed relative to `playfield`: it is scaled about its own anchor and translated by its own adjustment first, then moved by the playfield's translation and anchor shift, once, so the inherited move is never scaled; it does not take the playfield's scale or lane width. A test with the judge at a scale other than 100 % moves the playfield and checks the judge moves exactly as far. Adjustments are integers (reference pixels and percent) with bounds that keep a region on the canvas.
-- **Lane width** scales lane-bound elements horizontally; nine-slice frames keep their borders.
+- Each region has a 9-point anchor; on a wider or taller canvas it shifts by `(i + fx·(cw − 2i − 1920), fy·(ch − 1080))` for anchor fractions `fx`, `fy` and side inset `i`. The player's inset keeps edge regions near the centre on very wide screens; it is clamped to `max(0, (cw − 1920) / 2)` each frame and never moves `screen`.
+- A region's box is the union of its elements' key rects (unrotated), computed at load; the point of its anchor in that box is its scale pivot.
+- The transform order is: author coordinates → lane width (playfield, horizontal) → region scale about the anchor point → region translation → anchor shift → canvas to target. A `fill` background on `screen` (`cover` or `stretch`) skips the regions and fills the canvas. `judge` is placed relative to `playfield`: it is scaled about its own anchor and translated by its own adjustment first, then moved by the playfield's translation and anchor shift, once, so the inherited move is never scaled; it does not take the playfield's scale or lane width. A test with the judge at a scale other than 100 % moves the playfield and checks the judge moves exactly as far.
+- **Ranges and the clamp.** Adjustments are integers: offsets within ±4320 reference pixels, scale and lane width 50–200 %, inset ≤ 1200; `Layout` refuses anything else. Each frame the translation is clamped per axis so that the region's logical box (its box after lane width, scale, translation and anchor shift) overlaps the canvas by at least `min(extent, 64)` pixels. `judge` and `playfield` are clamped jointly: with `P` the playfield's range and `J` the judge's (its inherited anchor shift included), the judge's own offset is clamped to `[Jlo − Phi, Jhi − Plo]`, then the playfield's to `P ∩ (J − local)`, so the judge still moves exactly as far as the playfield. A range whose author placement overlaps less keeps 0. The clamp does not promise that rotated geometry or a pivot stays on screen; `visible` is the control for hiding.
+- **Controls.** `Skin::controls` says what the skin offers per region (this table; lane width only with the lanes in `playfield`, none for a region without elements or under `Fit::Fixed`); the layout's value for a control the skin does not offer is ignored.
+- **Lane width** scales lane-bound elements horizontally about the playfield's anchor; nine-slice frames keep their borders.
 - **Judgment-line height** is the `playfield` y: the whole field moves, its top included, so the visible time is unchanged. Lift, which shortens the lane and changes the visible range, stays a play setting (design.md "Algorithms").
 - **Storage:** layout settings outside the skin, keyed by skin and aspect class (16:9, 21:9, 32:9, 16:10), so a skin update keeps them; a reset returns a region to the author's layout; they are device settings, one file per skin under the data root's `layouts\` (§7, decision 2).
 - **Adjusting:** an adjust mode on the ready screen. A key or the turntable selects a region, arrows or the turntable move it, a modifier scales it, and region outlines are drawn with sprites, so no `egui` is needed. The values are also editable in the settings file.
-- **Imported skins** sit in one `screen` region and are pillarboxed at other aspects, never stretched. They get no composition adjustment, since `screen` has no controls.
+- **Imported skins** use `Fit::Fixed`: one `screen` region, pillarboxed at other aspects, never stretched. They get no composition adjustment, since `screen` has no controls.
 
-**Resize.** Today `prepare` gets the GPU and the chart and `build` gets no viewport (crates/render/src/skin.rs:14-34, 63-66). `prepare` gains the target's pixel size, from which it picks @2x images and rasterizes text at final size, and `FrameInput` gains the canvas size, so a resize during play recomputes anchors and the canvas fit without allocating. Assets chosen by pixel size stay as prepared until the next `prepare`, which runs between plays; a scale change in the adjust mode takes effect on screen at once and in the assets at the next `prepare`. Tests cover two pixel sizes of one aspect, and a resize during a prepared play followed by the next `prepare`.
+**Resize.** Today `prepare` gets the GPU and the chart and `build` gets no viewport (crates/render/src/skin.rs:14-34, 63-66). `prepare` gains the target's pixel size, from which it picks @2x images and rasterizes text at final size, and `FrameInput` gains the target size, from which the skin computes the canvas each frame (`SkinFrame::target`), so a resize during play recomputes anchors and the canvas fit without allocating. Assets chosen by pixel size stay as prepared until the next `prepare`, which runs between plays; a scale change in the adjust mode takes effect on screen at once and in the assets at the next `prepare`. Tests cover two pixel sizes of one aspect, and a resize during a prepared play followed by the next `prepare`.
 
 **Rejected:** free per-element offsets (every skin would invent its own and players would face a different set per skin), constraint or flex layout (hard to learn, no export), per-element editing (players do not think in elements), non-uniform stretch (distorts).
 
 ### R6. Widgets
 
 Built in, because they carry player logic or the scroll math, which stays in the player:
-- `lanes`: notes, long-note head, active and inactive bodies, tail, mines, bar lines, the judgment line, and the lane cover. The scroll math is today's `layout::Scale` (crates/render/src/simple.rs:60-115), copied into `skin-model` until render switches over and then deleted from render.
-- `judge`: grade images, the combo number placed relative to it, the shift that makes room for the combo.
-- `gauge`: segments with images per gauge kind and state.
-- `number`: a glyph strip of digits, with digit count, alignment and zero padding.
-- `text`: chart-bound strings (title, artist and so on), rasterized at `prepare`, and literal strings.
+- `lanes` (S5): notes, long-note head, active and inactive bodies, tail, mines, bar lines, the judgment line, the lane cover and the lift cover, one image per part and lane.
+  - **Geometry.** Explicit lane rects `[x, w]` with an authored scratch side, the scratch outside every key. On the other side, the scratch moves to `span_start + span_end − x − w` and the key block to the near end, each key keeping its offset inside the block. Elements bound to a lane (`Bind::Lane`) or to the span (`Bind::Lanes`) map their x and w from the authored lane to the current one; `Skin::placement` takes the scratch side, which `build` reads from the attempt (`PlayContext::scratch`).
+  - **Cover and lift** in ‰ of the lane length, lift at most 900 and cover at most `900 − lift`; the scroll span is the uncovered length and the lift raises the judgment line.
+  - **Section targets.** In a practice round only the section's targets are drawn (notes from its start, ending before its end, as the evaluator decides), and once evaluation is complete the round rings out without notes (`SkinFrame::complete`).
+  - **Budget.** `LANE_QUADS` (8 192) quads for notes and bar lines plus 3 reserved for the line, the cover and the lift, and `LANE_VISITS` (16 384) candidates visited, charged before any skip (judged, outside the section, culled); running out stops the frame's lanes with one drop.
+  - **Cropping.** A part crossing the lanes' top or bottom is cut with its uv, never squashed.
+  - A widget's track gives its color and alpha only; geometry or an angle is a load error.
+  - The scroll math is today's `layout::Scale` (crates/render/src/simple.rs:60-115), copied into `skin-model` parameterized by the span and the line, until render switches over and then deleted from render; with no cover or lift every output bit equals render's, and a test reads render's source to guard the copy.
+- `judge` (S5b): grade images, the combo number placed relative to it, the shift that makes room for the combo.
+- `gauge` (S5b): segments with images per gauge kind and state.
+- `number` (S5b): a glyph strip of digits, with digit count, alignment and zero padding.
+- `text` (S5c): chart-bound strings (title, artist and so on), rasterized at `prepare`, and literal strings.
 - `bga`.
 
 Composed by authors from elements, per-lane repetition and timers: key beams, bombs, key pads, progress (a `bar`), frames and backgrounds.
@@ -131,7 +141,7 @@ Before play, never per frame, so per-frame cost is unchanged apart from trilinea
 - **Mipmaps** generated on the CPU, 4 levels, with premultiplied alpha (`(c·a + 127) / 255`) and a 2×2 box filter in stored (non-sRGB) space. Every frame of a grid and every glyph of a digit strip is packed on its own with an 8-texel gutter, its allocation aligned to 8, so every texel of every level covers one allocation and lower levels never mix neighbouring frames. The gutter and any rounding in the allocation repeat the frame's nearest edge texel, as clamp-to-edge would. Two images cutting the same rectangle share one packed frame. The tests use contrasting adjacent frames and colored transparent edges and sample them at every level.
 - **Per-image filter:** linear by default, nearest for pixel art: nearest within a level and between levels, so shrinking still uses the box-filtered levels and never blurs two levels together.
 - **Text** rasterized at `prepare` at its final pixel size with `cosmic-text` and swash. The play screen still never calls into `render::text`.
-- **@2x variants** (S4): a file may name an @2x file at exactly twice its size. The atlas reads them when the canvas is magnified on both axes (`variant_for`), doubling the frames' rectangles; a file without one keeps its 1x frames, and track geometry does not change. Per-region picks come with regions (S5). The authored syntax for @2x, and nine-slice, come with the authored format (S12).
+- **@2x variants** (S4): a file may name an @2x file at exactly twice its size. `Skin::variant` picks them when some image the skin can draw is magnified on both axes: per element the canvas scale times its region's scale (hidden regions skipped), a `cover` or `stretch` fill's own scale on `screen`, and for lane-bound images and the lanes `min(lane width, 100 %)` on x, so a lane width alone never picks @2x; exact rationals, one variant for the sheet. The atlas then doubles the frames' rectangles; a file without one keeps its 1x frames, and track geometry does not change. A scale change in the adjust mode reaches the assets at the next `prepare`. The authored syntax for @2x, and nine-slice, come with the authored format (S12).
 - **Elements and quads** (S4): an element's source is an image of the sheet; `Skin::build` takes the uv table of an atlas of the skin's sheet (a table of another sheet draws nothing) and writes the frame's uv and layer and the image's filter into the `Quad`. Neither breaks a run: blend and clip alone do (R1).
 - **Bounds:** file, image and frame counts, name length, file size, header position, image dimensions and texels per file and per variant, atlas texels, and element, keyframe and timer counts are capped before anything that grows with them is allocated, and one file's decoding is bounded (design.md "Memory Budget"). Every referenced file resolves inside the skin's folder and must be a regular file, checked before opening and on the handle (design.md threat model "Skins", with its precondition and the decoder exception).
 
@@ -194,9 +204,9 @@ All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `
 ### Render, after stage 2 exits
 
 - `SpriteBatch` becomes one ordered list with runs broken at each blend or clip change; a pipeline per blend and a scissor per clip.
-- `Sprite` grows from 48 to 64 bytes with an atlas layer and flags; the atlas becomes a texture array of one page side, the bitmap font in reserved layer 0 and the skin's pages after it (R7), uploaded with their mips as `Rgba8Unorm`, with a linear and a nearest sampler chosen per quad. `AtlasLimits` comes from `Device::limits()`. The uv table and the uploaded pages have one owner, and the memory budget counts the old atlas alive during a reload and the upload staging.
+- `Sprite` grows from 48 to 64 bytes with an atlas layer and flags, and carries the quad's angle and pivot, still 64 bytes; the atlas becomes a texture array of one page side, the bitmap font in reserved layer 0 and the skin's pages after it (R7), uploaded with their mips as `Rgba8Unorm`, with a linear and a nearest sampler chosen per quad. `AtlasLimits` comes from `Device::limits()`. The uv table and the uploaded pages have one owner, and the memory budget counts the old atlas alive during a reload and the upload staging.
 - Premultiplied alpha throughout: every pipeline, the bitmap font and `text_screen` (today `ALPHA_BLENDING`, crates/render/src/renderer.rs:799).
-- The letterbox (renderer.rs:678) becomes the canvas fit, and `FrameInput` carries the canvas size.
+- The canvas projection replaces the letterbox (renderer.rs:678), and `FrameInput` carries the target size.
 - `PlaySkin::prepare` gains the play context and the target's pixel size; `DeclSkin: PlaySkin` uploads the atlas pages in `prepare` and delegates `build` to `skin-model`.
 
 ### Tests
@@ -205,7 +215,7 @@ All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `
 - Expressions: unit tests, range and bound errors, and a property test against a reference interpreter.
 - Tracks: the endpoint table of R2.
 - The reducer: effect scripts split across drains at every point, long-note feedback, `failed_at`, retry.
-- `lanes`: `SimpleSkin`'s long-note, culling and density tests ported unchanged.
+- `lanes`: `SimpleSkin`'s long-note, culling and density tests ported with their literal values unchanged; the scroll copy against a reference copy of render's `Scale` (equal bits) with a drift guard on render's source, removed in S14.
 - Golden quad lists and preview PNGs at 16:9, 21:9 and 16:10 with a bundled test font, a resize of one prepared play, adjusted regions, an alpha/add/alpha overlap that fails if blend order is lost, and two same-blend elements with different clips followed by an unclipped one, checked by expected pixels.
 - An allocation test around `build` on a dense chart, in dev and release (design.md "Scope of No Allocation").
 - Importer: self-made fixtures, and the sandbox tests of §3.
@@ -226,16 +236,18 @@ All are `GPL-3.0-or-later` (design.md "Licenses") and portable: each goes into `
 | S2 | `skin-model`: schema, expressions, `Quad` types | [mac] |
 | S3 | Tracks, timers and the reducer; the allocation test | [mac] |
 | S4 | Images, atlas pages, mips; the @2x mechanism and its pick | [mac] |
-| S5 | Canvas, regions, widgets with the scroll copy | [mac] |
+| S5 | Canvas, regions, layout and its clamp, rotation with the 9-point pivot, `Skin::variant`; the `lanes` widget with the scroll copy | [mac] |
+| S5b | The `judge`, `number` and `gauge` widgets | [mac] |
+| S5c | The `text` widget | [mac] |
 | S6 | `skin-beatoraja`: JSON; enforces the element, `when` and key limits cumulatively while building, before compiling or allocating each item | [mac] |
 | S7 | `skin-beatoraja`: Lua, sandbox, conversion, report tool | [mac] |
 | S8 | `skin-cli`: `check`, `preview`, goldens | [mac] |
 | S9 | Lane input in `PlayView`; fast and slow counts in `Tally` | coordinated with stage 2: it changes `game` and `eval`, and `PlayView` literals in render |
-| S10 | Render integration; `SimpleSkin` stays the default | after stage 2 |
+| S10 | Render integration: the target size in `FrameInput`, the canvas projection; `SimpleSkin` stays the default | after stage 2 |
 | S11 | Player: skin choice, layout settings, adjust mode | after stage 2 |
 | S12 | `skin-toml`: the authored format; nine-slice and the @2x syntax; the same cumulative limits as S6 | [mac] |
 | S13 | `skin-export` and `build` | [mac] |
-| S14 | The standard skin; `SimpleSkin` removed | |
+| S14 | The standard skin; `SimpleSkin` removed with the scroll drift guard | |
 | S15 | BGA | |
 
 S6 to S11 make existing beatoraja skins playable before S12 starts the authored format. The exit (design.md "Roadmap"): an existing beatoraja skin and the standard skin both play, and playing with the standard skin is fun.

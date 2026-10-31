@@ -4,17 +4,19 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
-mod reducer;
+pub(crate) mod reducer;
 pub(crate) mod schema;
 pub(crate) mod timers;
 
-use bms_model::{Chart, Lane, ScrollMap, TimeUs};
+use bms_model::{Chart, LANE_COUNT, Lane, Note, Position, ScrollMap, TimeUs};
 use eval::{GaugeState, JudgeEvent, Section, Tally};
 use rules::{GaugeRule, GaugeValue};
 
 use self::reducer::Reducer;
 use self::schema::{field, timer};
 use crate::expr::{State, TIMER_OFF};
+use crate::layout::Layout;
+use crate::widget::lanes::{LaneView, Side};
 
 /// What the skin knows of one of the preset's gauges, in the preset's
 /// order.
@@ -61,6 +63,8 @@ pub struct PlayContext<'a> {
     /// Whether an empty POOR breaks the combo (the preset's
     /// `empty_poor.breaks_combo`), which turns `combo.up` off.
     pub empty_poor_breaks_combo: bool,
+    /// The player's scratch side, which the lanes are laid out for.
+    pub scratch: Side,
 }
 
 /// What one frame gives the skin.
@@ -79,6 +83,16 @@ pub struct SkinFrame<'a> {
     pub gauge: usize,
     /// The effects drained since the last frame, in emission order.
     pub effects: &'a [JudgeEvent],
+    /// Whether evaluation is complete (the play view's `complete`): a
+    /// section attempt then rings out without notes.
+    pub complete: bool,
+    /// The render target's size in pixels; the skin computes its canvas
+    /// from it.
+    pub target: [u32; 2],
+    /// The player's layout.
+    pub layout: &'a Layout,
+    /// The hi-speed and the covers.
+    pub lanes: LaneView,
 }
 
 /// Why [`Skin::prepare`](crate::Skin::prepare) refused an attempt.
@@ -108,14 +122,30 @@ pub struct Play {
     beat: Option<(i128, i64)>,
     ready_at: TimeUs,
     play_at: TimeUs,
+    scratch: Side,
+    notes: Option<Box<Notes>>,
+}
+
+/// The chart's notes and bar lines, kept for a skin with lanes.
+#[derive(Clone, Debug)]
+pub(crate) struct Notes {
+    pub(crate) lanes: [Box<[Note]>; LANE_COUNT],
+    pub(crate) bars: Box<[Position]>,
+    /// Per lane: the indices of the notes from the section's start to its
+    /// end (every note without one); the last may still not be a target.
+    pub(crate) range: [(usize, usize); LANE_COUNT],
+    /// The section's start and end.
+    pub(crate) section: Option<(TimeUs, TimeUs)>,
 }
 
 impl Play {
-    /// A fresh attempt with `whens` `when` timers.
+    /// A fresh attempt with `whens` `when` timers, keeping the chart's
+    /// notes when the skin has `lanes`.
     pub(crate) fn new(
         chart: &Chart,
         ctx: &PlayContext<'_>,
         whens: usize,
+        lanes: bool,
     ) -> Result<Self, PrepareError> {
         let (play_at, lead_in, section) = match ctx.attempt {
             Attempt::Full { lead_in } => (TimeUs(0), lead_in, None),
@@ -147,6 +177,24 @@ impl Play {
             ctx.empty_poor_breaks_combo,
         );
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
+        let bounds = section.map(|s| (s.start, s.end));
+        let notes = lanes.then(|| {
+            let range = std::array::from_fn(|l| {
+                chart.lanes.get(l).map_or((0, 0), |notes| match bounds {
+                    None => (0, notes.len()),
+                    Some((start, end)) => (
+                        notes.partition_point(|n| n.time < start),
+                        notes.partition_point(|n| n.time < end),
+                    ),
+                })
+            });
+            Box::new(Notes {
+                lanes: chart.lanes.clone().map(Vec::into_boxed_slice),
+                bars: chart.bar_lines.clone().into_boxed_slice(),
+                range,
+                section: bounds,
+            })
+        });
         Ok(Self {
             reducer,
             starts: vec![None; slots].into_boxed_slice(),
@@ -156,6 +204,8 @@ impl Play {
             beat: None,
             ready_at,
             play_at,
+            scratch: ctx.scratch,
+            notes,
         })
     }
 
@@ -183,22 +233,29 @@ impl Play {
         }
     }
 
-    /// Whether the long note `note` on `lane` was held (its `LnHeld` was
-    /// delivered). For the lanes widget (S5).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the lanes widget (S5) reads it")
-    )]
-    pub(crate) fn held(&self, lane: Lane, note: usize) -> bool {
-        self.reducer.held(lane.index(), note)
+    /// The attempt's scratch side.
+    pub(crate) fn scratch(&self) -> Side {
+        self.scratch
     }
 
-    /// The long note whose visual hold `lane` shows, as of the last build.
-    /// For the lanes widget (S5).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the lanes widget (S5) reads it")
-    )]
+    /// The chart's notes, kept when the skin has lanes.
+    pub(crate) fn notes(&self) -> Option<&Notes> {
+        self.notes.as_deref()
+    }
+
+    /// The chart's scroll map.
+    pub(crate) fn scroll(&self) -> &ScrollMap {
+        &self.scroll
+    }
+
+    /// Whether `note` on lane `l` is no longer drawn: a judged tap or a hit
+    /// mine, as of the last build.
+    pub(crate) fn done(&self, l: usize, note: usize) -> bool {
+        self.reducer.done(l, note)
+    }
+
+    /// The long note whose visual hold `lane` shows, as of the last build:
+    /// the lanes draw its body active.
     pub(crate) fn hold_note(&self, lane: Lane) -> Option<usize> {
         self.reducer
             .hold
@@ -216,7 +273,9 @@ mod tests {
     use rules::{GaugeValue, Judgment, PerJudgment};
 
     use super::{Attempt, GaugeDesc, PlayContext, SkinFrame};
-    use crate::{AtlasLimits, QuadBatch, Sheet, Skin, Variant};
+    use crate::{
+        AtlasLimits, Fit, LaneView, Layout, QuadBatch, Region, Sheet, Side, Skin, SkinDef, Variant,
+    };
 
     const MS: i64 = 1_000;
 
@@ -233,18 +292,31 @@ mod tests {
         }
     }
 
-    /// The held bits and hold notes the lanes widget reads, after each
+    /// The done bits and hold notes the lanes widget reads, after each
     /// frame of effects.
     #[test]
-    fn held_bits_and_hold_notes_follow_the_effects() {
+    fn done_bits_and_hold_notes_follow_the_effects() {
         let chart = ChartBuilder::new(150_000)
             .long(lane(2), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
             .long(lane(2), TimeUs(2_000 * MS), TimeUs(2_300 * MS))
             .long(lane(5), TimeUs(1_500 * MS), TimeUs(1_800 * MS))
             .tap(lane(5), TimeUs(3_000 * MS))
+            .mine(lane(6), TimeUs(3_000 * MS), 10)
             .build()
             .unwrap();
-        let skin = Skin::new(Vec::new(), Sheet::empty(), Vec::new()).unwrap();
+        let region = crate::RegionDef {
+            anchor: crate::Anchor::TopLeft,
+            optional: false,
+        };
+        let skin = Skin::new(SkinDef {
+            fit: Fit::Adapt,
+            regions: [region; Region::COUNT],
+            whens: Vec::new(),
+            sheet: Sheet::empty(),
+            lanes: None,
+            elements: Vec::new(),
+        })
+        .unwrap();
         let limits = AtlasLimits {
             max_side: 256,
             max_layers: 2,
@@ -259,6 +331,7 @@ mod tests {
             gauges: &gauges,
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
+            scratch: Side::Left,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {
@@ -281,6 +354,7 @@ mod tests {
             reference: GaugeValue(0),
             failed_at: None,
         }];
+        let layout = Layout::AUTHOR;
         let mut batch = QuadBatch::with_capacity(0, 0);
         let mut frame = |play: &mut super::Play, now_ms: i64, effects: &[JudgeEvent]| {
             let frame = SkinFrame {
@@ -290,6 +364,14 @@ mod tests {
                 gauges: &snapshot,
                 gauge: 0,
                 effects,
+                complete: false,
+                target: [1_920, 1_080],
+                layout: &layout,
+                lanes: LaneView {
+                    visible_time: TimeUs(600 * MS),
+                    cover: 0,
+                    lift: 0,
+                },
             };
             skin.build(play, &frame, &uvs, &mut batch);
         };
@@ -303,8 +385,17 @@ mod tests {
             lane: lane(n),
             note,
         };
+        let judged = |n: u8, note: usize, judgment, deviation: Option<i64>, release| {
+            JudgeEventKind::Judged {
+                lane: lane(n),
+                note,
+                judgment,
+                deviation: deviation.map(|d| TimeUs(d * MS)),
+                release,
+                combo: 1,
+            }
+        };
         frame(&mut play, 1_000, &[ev(1_000, held(2, 0, Judgment::Great))]);
-        assert!(play.held(lane(2), 0));
         assert_eq!(play.hold_note(lane(2)), Some(0));
         frame(
             &mut play,
@@ -313,37 +404,20 @@ mod tests {
                 ev(1_250, ended(2, 0)),
                 ev(
                     1_250,
-                    JudgeEventKind::Judged {
-                        lane: lane(2),
-                        note: 0,
-                        judgment: Judgment::Good,
-                        deviation: Some(TimeUs(0)),
-                        release: Some(TimeUs(-50 * MS)),
-                        combo: 1,
-                    },
+                    judged(2, 0, Judgment::Good, Some(0), Some(TimeUs(-50 * MS))),
                 ),
             ],
         );
-        assert!(play.held(lane(2), 0));
         assert_eq!(play.hold_note(lane(2)), None);
-        // A BAD head holds without the held bit.
+        // A judged long note stays drawn: it is never done.
+        assert!(!play.done(2, 0));
+        // A BAD head holds without `LnHeld`.
         frame(
             &mut play,
             1_400,
-            &[ev(
-                1_400,
-                JudgeEventKind::Judged {
-                    lane: lane(5),
-                    note: 0,
-                    judgment: Judgment::Bad,
-                    deviation: Some(TimeUs(-100 * MS)),
-                    release: None,
-                    combo: 0,
-                },
-            )],
+            &[ev(1_400, judged(5, 0, Judgment::Bad, Some(-100), None))],
         );
         assert_eq!(play.hold_note(lane(5)), Some(0));
-        assert!(!play.held(lane(5), 0));
         // Another note's end leaves it; its own ends it.
         frame(&mut play, 1_420, &[ev(1_420, ended(5, 1))]);
         assert_eq!(play.hold_note(lane(5)), Some(0));
@@ -355,22 +429,40 @@ mod tests {
             2_000,
             &[ev(2_000, held(2, 1, Judgment::Perfect))],
         );
-        assert!(play.held(lane(2), 1));
         assert_eq!(play.hold_note(lane(2)), Some(1));
         frame(&mut play, 2_300, &[]);
         assert_eq!(play.hold_note(lane(2)), None);
-        // A tap or a stray index is no hold; the stray bit is ignored.
+        // A judged tap and a hit mine are done; a tap's `LnHeld` is no
+        // hold, and stray indices are ignored.
+        assert!(!play.done(5, 1));
         frame(
             &mut play,
             3_000,
             &[
                 ev(3_000, held(5, 1, Judgment::Great)),
-                ev(3_000, held(5, 99, Judgment::Great)),
+                ev(3_000, judged(5, 1, Judgment::Poor, None, None)),
+                ev(3_000, judged(5, 99, Judgment::Great, Some(0), None)),
+                ev(
+                    3_000,
+                    JudgeEventKind::MineHit {
+                        lane: lane(6),
+                        note: 0,
+                    },
+                ),
+                ev(
+                    3_000,
+                    JudgeEventKind::MineHit {
+                        lane: lane(6),
+                        note: 70,
+                    },
+                ),
             ],
         );
         assert_eq!(play.hold_note(lane(5)), None);
-        assert!(play.held(lane(5), 1));
-        assert!(!play.held(lane(5), 99));
-        assert!(!play.held(lane(6), 0));
+        assert!(play.done(5, 1));
+        assert!(play.done(6, 0));
+        assert!(!play.done(5, 99));
+        assert!(!play.done(6, 70));
+        assert!(!play.done(1, 0));
     }
 }
