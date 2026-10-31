@@ -74,7 +74,7 @@ pub struct FntGlyph {
 pub struct FntKerning {
     pub first: u16,
     pub second: u16,
-    /// Stored as the source stores it: wrapped to a byte.
+    /// −128 to 127; a file with any other amount is refused.
     pub amount: i8,
 }
 
@@ -594,8 +594,9 @@ impl FntFile {
                         ranged(v, i32::MIN, i32::MAX).ok_or(err(no, FntErrorKind::Value(key)))
                     };
                     let (first, second) = (code(first, "first")?, code(second, "second")?);
-                    let amount = ranged(amount, -MAX_FNT_VALUE, MAX_FNT_VALUE)
-                        .ok_or(err(no, FntErrorKind::Value("amount")))?;
+                    let amount = amount
+                        .parse::<i8>()
+                        .map_err(|_| err(no, FntErrorKind::Value("amount")))?;
                     // Kept only within the basic plane and after an existing
                     // glyph (gdx 1.9.9 `load`:600-618).
                     let (Ok(first), Ok(second)) = (u16::try_from(first), u16::try_from(second))
@@ -608,13 +609,10 @@ impl FntFile {
                     if kernings.len() >= limits.kernings {
                         return Err(err(no, FntErrorKind::TooManyKernings));
                     }
-                    // `Glyph.setKerning` stores the amount as a byte
-                    // (gdx 1.9.9 `BitmapFont$Glyph.setKerning`:416).
-                    let amount = amount.to_le_bytes().first().copied().unwrap_or(0);
                     kernings.push(FntKerning {
                         first,
                         second,
-                        amount: i8::from_le_bytes([amount]),
+                        amount,
                     });
                 } else if line.trim_matches(' ').is_empty() {
                     tail = true;
@@ -983,14 +981,24 @@ mod tests {
     }
 
     #[test]
-    fn kernings_wrap_to_a_byte_and_the_last_pair_wins() {
+    fn kernings_are_bytes_and_the_last_pair_wins() {
         let b = ch(66, [4, 9], [0, 1, 6]);
-        let tail = "kernings count=4\nkerning first=65 second=66 amount=200\n\
-                    kerning first=66 second=65 amount=1\nkerning first=66 second=65 amount=-3\n\
+        let tail = "kernings count=4\nkerning first=65 second=66 amount=-128\n\
+                    kerning first=66 second=65 amount=1\nkerning first=66 second=65 amount=127\n\
                     kerning first=67 second=65 amount=2\n\n";
         let f = parse(&font(&[a(), b.clone()], tail)).unwrap();
-        assert_eq!(f.kerning(65, 66), -56);
-        assert_eq!(f.kerning(66, 65), -3);
+        assert_eq!(f.kerning(65, 66), -128);
+        assert_eq!(f.kerning(66, 65), 127);
+        // An amount past a byte refuses the file, a dropped pair's too.
+        for (from, to) in [
+            ("-128", "-129"),
+            ("=127", "=128"),
+            ("amount=2\n", "amount=200\n"),
+        ] {
+            let over = font(&[a(), b.clone()], &tail.replacen(from, to, 1));
+            assert_eq!(kind(&over), FntErrorKind::Value("amount"), "{to}");
+        }
+        assert!(!FntErrorKind::Value("amount").upstream_fails());
         // No glyph 67: its pair is not kept.
         assert_eq!(f.kerning(67, 65), 0);
         assert_eq!(f.kernings().len(), 2);
