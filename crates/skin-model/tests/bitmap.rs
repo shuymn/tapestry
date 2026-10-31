@@ -415,7 +415,7 @@ fn bitmap_text_is_laid_out_only_when_asked() {
     h.frame(100, &[]);
     // "AB": `B` is missing and the font has no missing glyph.
     assert_eq!(h.batch.quads().len(), 1);
-    // A visibility folded to false lays out nothing.
+    // A visibility folded to false draws nothing.
     let mut e = element(Source::Text(0), def.1, Place::SCREEN);
     e.visible = Some(boolean("false"));
     let skin = Skin::new(SkinDef {
@@ -505,6 +505,10 @@ fn bitmap_texts_fill_the_widget_quads() {
         Skin::new(def(elements, vec![one])),
         Err(LoadError::TooManyWidgetQuads { n }) if n == u64::from(MAX_WIDGET_QUADS) + 1
     ));
+    // A literal reserves a quad per character, not per byte.
+    let accented = text(literal("AÀA"), 0, Align::Left, Overflow::Spill);
+    let skin = load(s.clone(), vec![(accented, [0, 0, 10, 10])]).unwrap();
+    assert_eq!(skin.quad_capacity(), 3);
     // An unknown bitmap font.
     let bad = text(literal("A"), 1, Align::Left, Overflow::Spill);
     assert!(matches!(
