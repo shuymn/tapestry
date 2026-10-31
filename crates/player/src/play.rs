@@ -114,6 +114,8 @@ pub struct PlayerRig<'a> {
     pub times: LoadTimes,
     /// When the current play's countdown started, on the clock.
     pub countdown_at: Option<TimeUs>,
+    /// Where the current play's chart time 0 lies on the clock.
+    pub origin: Option<TimeUs>,
     /// Where each logic step's measurement goes (the render thread).
     pub steps: rtrb::Producer<StepSample>,
     /// Step samples of the current play the full queue refused.
@@ -324,37 +326,30 @@ pub(crate) fn since(from: TimeUs, to: TimeUs) -> Duration {
 }
 
 /// The command of a scenario's `until`, once it is due at `now` for the
-/// play whose countdown started at `countdown_at`: taken, so it is sent
-/// once.
+/// play whose chart time 0 lies at `origin`: taken, so it is sent once.
 #[cfg(feature = "dev-tools")]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 pub(crate) fn until_fired(
     until: &mut Option<(TimeUs, Command)>,
-    countdown_at: Option<TimeUs>,
-    lead_in: TimeUs,
+    origin: Option<TimeUs>,
     now: TimeUs,
 ) -> Option<Command> {
-    let (Some(c), Some((at, command))) = (countdown_at, *until) else {
+    let (Some(origin), Some((at, command))) = (origin, *until) else {
         return None;
     };
-    if !until_due(c, lead_in, at, now) {
+    if !until_due(origin, at, now) {
         return None;
     }
     *until = None;
     Some(command)
 }
 
-/// Whether chart time `at` has come at `now` for a play whose countdown
-/// started at `countdown_at` and lasts `lead_in`, all on the clock.
+/// Whether chart time `at` has come at `now` for a play whose chart time 0
+/// lies at `origin`, both on the clock.
 #[cfg(feature = "dev-tools")]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-pub(crate) const fn until_due(
-    countdown_at: TimeUs,
-    lead_in: TimeUs,
-    at: TimeUs,
-    now: TimeUs,
-) -> bool {
-    now.0 - countdown_at.0 - lead_in.0 >= at.0
+pub(crate) const fn until_due(origin: TimeUs, at: TimeUs, now: TimeUs) -> bool {
+    now.0 - origin.0 >= at.0
 }
 
 impl Rig for PlayerRig<'_> {
@@ -372,19 +367,14 @@ impl Rig for PlayerRig<'_> {
         // A scenario's `until`: the command, sent once, as its key would.
         #[cfg(feature = "dev-tools")]
         if let Some(sc) = &mut self.scenario
-            && let Some(command) = until_fired(
-                &mut sc.until,
-                self.countdown_at,
-                self.lead_in,
-                self.clock.now(),
-            )
+            && let Some(command) = until_fired(&mut sc.until, self.origin, self.clock.now())
         {
             self.controls.command(command);
         }
         #[cfg(feature = "dev-tools")]
-        if let Some(c) = self.countdown_at
+        if let Some(origin) = self.origin
             && !self.adjust_in_play.is_empty()
-            && until_due(c, self.lead_in, self.adjust_at, self.clock.now())
+            && until_due(origin, self.adjust_at, self.clock.now())
         {
             for a in self.adjust_in_play.drain(..) {
                 self.controls.tuning().adjust(a);
@@ -478,6 +468,7 @@ impl Rig for PlayerRig<'_> {
         let page_faults = process_page_faults();
         let countdown_at = TimeUs(origin.0 - self.lead_in.0);
         self.countdown_at = Some(countdown_at);
+        self.origin = Some(origin);
         println!("play started");
         // A chart's first play: a retry runs from its own receipt.
         if let Some(sel) = &self.selection
@@ -703,17 +694,16 @@ mod tests {
 
     use super::{until_due, until_fired};
 
-    /// A scenario's `until` is due at its chart time exactly: the countdown
-    /// started at 5 s on the clock and lasts 1 s, so chart time 2.25 s is
-    /// clock time 8.25 s.
+    /// A scenario's `until` is due at its chart time exactly: chart time 0
+    /// lies at 6 s on the clock, so chart time 2.25 s is clock time 8.25 s.
     #[test]
     fn until_is_due_exactly_at_its_time() {
-        let (countdown, lead_in) = (TimeUs(5_000_000), TimeUs(1_000_000));
+        let origin = TimeUs(6_000_000);
         let at = TimeUs(2_250_000);
-        assert!(!until_due(countdown, lead_in, at, TimeUs(8_249_999)));
-        assert!(until_due(countdown, lead_in, at, TimeUs(8_250_000)));
-        assert!(!until_due(countdown, lead_in, TimeUs(0), TimeUs(5_999_999)));
-        assert!(until_due(countdown, lead_in, TimeUs(0), TimeUs(6_000_000)));
+        assert!(!until_due(origin, at, TimeUs(8_249_999)));
+        assert!(until_due(origin, at, TimeUs(8_250_000)));
+        assert!(!until_due(origin, TimeUs(0), TimeUs(5_999_999)));
+        assert!(until_due(origin, TimeUs(0), TimeUs(6_000_000)));
     }
 
     /// The `until` command is sent once, at its time on the play's clock:
@@ -721,26 +711,20 @@ mod tests {
     /// command, then nothing again.
     #[test]
     fn until_fires_once_at_its_time() {
-        let (countdown, lead_in) = (TimeUs(5_000_000), TimeUs(1_000_000));
+        let origin = TimeUs(6_000_000);
         let mut until = Some((TimeUs(2_250_000), Command::Retry));
-        assert_eq!(
-            until_fired(&mut until, None, lead_in, TimeUs(9_000_000)),
-            None
-        );
+        assert_eq!(until_fired(&mut until, None, TimeUs(9_000_000)), None);
         for now in [5_000_000, 7_000_000, 8_249_999] {
-            assert_eq!(
-                until_fired(&mut until, Some(countdown), lead_in, TimeUs(now)),
-                None
-            );
+            assert_eq!(until_fired(&mut until, Some(origin), TimeUs(now)), None);
         }
         assert!(until.is_some());
         assert_eq!(
-            until_fired(&mut until, Some(countdown), lead_in, TimeUs(8_250_000)),
+            until_fired(&mut until, Some(origin), TimeUs(8_250_000)),
             Some(Command::Retry)
         );
         assert_eq!(until, None);
         assert_eq!(
-            until_fired(&mut until, Some(countdown), lead_in, TimeUs(8_250_001)),
+            until_fired(&mut until, Some(origin), TimeUs(8_250_001)),
             None
         );
     }

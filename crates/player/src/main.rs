@@ -701,6 +701,7 @@ fn rig<'a>(
         retry_from: None,
         times: LoadTimes::default(),
         countdown_at: None,
+        origin: None,
         steps,
         steps_dropped: 0,
         figures: None,
