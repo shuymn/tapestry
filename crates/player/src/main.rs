@@ -655,6 +655,7 @@ fn rig<'a>(
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
         result_input: result_input::ResultInput::new(Arc::new(MenuQueue::default()), None),
         viewed: None,
+        evaluated: 0,
         #[cfg(feature = "dev-tools")]
         result_script: None,
         load_start: TimeUs(0),
@@ -766,25 +767,29 @@ fn open_window_and_clocked(
     }
 }
 
-/// The configured controller's lane controls as menu events for the select
-/// and result screens, tapped from `sources`; none without a configured
-/// controller, and none for autoplay, which receives no device.
-fn menu_pad(
+/// The menus' input, the same in both launch paths: the window's queue,
+/// which the window fills and the select and result screens read (one
+/// queue, returned for the window), and the configured controller's lane
+/// controls as menu events, tapped from `sources`; no controller without a
+/// configured one, and none for autoplay, which receives no device.
+fn menu_input(
     device: &game::DeviceSettings,
     autoplay: bool,
     sources: &mut SourceSet,
-) -> Option<input::MenuReceiver> {
+) -> (Arc<MenuQueue>, result_input::ResultInput) {
     let bindings = select::menu_bindings(
         &device.controller,
         device.controller_device.map(Into::into),
         &device.scratch,
     )
     .filter(|_| !autoplay);
-    bindings.map(|b| {
+    let pad = bindings.map(|b| {
         let (tap, receiver) = input::menu_queue(b);
         sources.set_menu(tap);
         receiver
-    })
+    });
+    let menu = Arc::new(MenuQueue::default());
+    (Arc::clone(&menu), result_input::ResultInput::new(menu, pad))
 }
 
 /// The game: WASAPI and a window, with the devices' input through Raw
@@ -829,8 +834,7 @@ fn play(
     if raw_input {
         axis_mode(&mut sources, device);
     }
-    let pad = menu_pad(device, !raw_input, &mut sources);
-    let menu = Arc::new(MenuQueue::default());
+    let (menu, menus) = menu_input(device, !raw_input, &mut sources);
     let keys = (device.keyboard.retry, device.keyboard.quit);
     let monitor = device.monitor.clone();
     let wake = move |s: &mut SourceSet, now| {
@@ -928,10 +932,12 @@ fn play(
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
-    rig.result_input = result_input::ResultInput::new(menu, pad);
+    rig.result_input = menus;
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run_chart(&mut loaded, &mut rig);
+    #[cfg(feature = "dev-tools")]
+    let script_failed = result_script_failure(&rig);
     let rendered = rig.shut_down();
     window_thread.close_after(rendered);
     // Not joined: an input thread that stopped answering must not hold up
@@ -944,7 +950,20 @@ fn play(
         t.detach();
     }
     ran?;
+    #[cfg(feature = "dev-tools")]
+    if let Some(why) = script_failed {
+        anyhow::bail!("dev: the result script failed: {why}");
+    }
     Ok(())
+}
+
+/// Why the scripted result input of a run without selection failed, if it
+/// did (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn result_script_failure(rig: &PlayerRig<'_>) -> Option<String> {
+    rig.result_script
+        .as_ref()
+        .and_then(|s| s.failure().map(str::to_owned))
 }
 
 /// What makes the extension points of each chart the scene flow loads.
@@ -1053,7 +1072,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     } else {
         axis_mode(&mut sources, &settings.device);
     }
-    let pad = menu_pad(&settings.device, autoplay, &mut sources);
+    let (menu, menus) = menu_input(&settings.device, autoplay, &mut sources);
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {
@@ -1067,7 +1086,6 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         alloc_count::tag(alloc_count::Tag::Input);
         hook.wake(s, now)
     };
-    let menu = Arc::new(MenuQueue::default());
     let device = &settings.device;
     let keys = (device.keyboard.retry, device.keyboard.quit);
     let monitor = device.monitor.clone();
@@ -1185,12 +1203,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     };
     let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock);
     rig.queue_most = opened.most_queued_periods;
-    rig.result_input = result_input::ResultInput::new(Arc::clone(&menu), pad);
+    rig.result_input = menus;
     rig.selection = Some(selection::Selection {
         shelf,
         screen: select::SelectScreen::new(roots),
         menu,
         dropped: 0,
+        preset_refusal: false,
         search_pending: false,
         ime,
         rate: opened.rate,
@@ -1347,11 +1366,15 @@ fn headless(
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
     let ran = game::live::run_chart(&mut loaded, &mut rig);
+    let script_failed = result_script_failure(&rig);
     // Offscreen: no window to keep.
     let _ = rig.shut_down();
     // As in `play`: not joined.
     input_thread.detach();
     ran?;
+    if let Some(why) = script_failed {
+        anyhow::bail!("dev: the result script failed: {why}");
+    }
     Ok(())
 }
 
@@ -1362,8 +1385,44 @@ mod tests {
     use input::QpcClock;
 
     use super::{
-        Controls, Mode, axis_mode, diagnostic, input_side, open_window_and_input, sources,
+        Controls, Mode, axis_mode, diagnostic, input_side, menu_input, open_window_and_input,
+        sources,
     };
+
+    /// Both launch paths take the menus' input from `menu_input`: the
+    /// window's queue is the one the result screen reads, and a configured
+    /// controller's lane controls are tapped from the sources, but not for
+    /// autoplay or without a configured controller.
+    #[test]
+    fn the_menus_share_the_window_queue_and_tap_the_controller() {
+        let configured = game::DeviceSettings {
+            controller_device: Some(game::ControllerDevice {
+                vendor_id: 1,
+                product_id: 2,
+                interface: None,
+            }),
+            ..game::DeviceSettings::default()
+        };
+        let mut set = sources();
+        let (window, mut menus) = menu_input(&configured, false, &mut set);
+        assert!(Arc::ptr_eq(&window, &menus.menu));
+        assert!(menus.pad.receiver.is_some());
+        assert!(set.menu_mut().is_some());
+        // A key the window queues reaches the result once it shows.
+        assert!(menus.enter());
+        window.push(crate::select::MenuInput::Key(crate::select::MenuKey::Right));
+        assert_eq!(menus.take(), Some(game::MenuCommand::NextPreset));
+        for (device, autoplay) in [
+            (&configured, true),
+            (&game::DeviceSettings::default(), false),
+        ] {
+            let mut set = sources();
+            let (window, menus) = menu_input(device, autoplay, &mut set);
+            assert!(Arc::ptr_eq(&window, &menus.menu));
+            assert!(menus.pad.receiver.is_none());
+            assert!(set.menu_mut().is_none());
+        }
+    }
 
     /// `device.toml`'s scratch mode reaches the configured controller's
     /// axes bound to lanes, and nothing else: not its buttons, not an

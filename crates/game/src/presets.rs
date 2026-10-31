@@ -145,7 +145,7 @@ pub struct Shelf {
 impl Shelf {
     /// Lists the built-ins and the user presets in `dir`, choosing `chosen`.
     /// A built-in is chosen without reading any file; a folder that cannot
-    /// be listed then lists only the built-ins.
+    /// be listed then lists only the built-ins, with its listing error.
     ///
     /// # Errors
     ///
@@ -161,6 +161,7 @@ impl Shelf {
         }
         let user_chosen = built_in_chosen.is_none().then_some(chosen);
         let mut users = BTreeMap::new();
+        let mut listing_error = None;
         match list(&dir) {
             Ok(files) => {
                 read(&mut users, &files, &dir, user_chosen);
@@ -168,7 +169,8 @@ impl Shelf {
             Err(kind) if built_in_chosen.is_none() => {
                 return Err(ShelfError::Io { path: dir, kind });
             }
-            Err(_) => {}
+            // Kept until a listing succeeds, as a check keeps it.
+            Err(kind) => listing_error = Some(PresetFileError::io(dir.clone(), kind)),
         }
         let current = match built_in_chosen {
             Some(p) => p,
@@ -192,7 +194,7 @@ impl Shelf {
             current,
             deadline: PollDeadline::default(),
             revision: 0,
-            listing_error: None,
+            listing_error,
         })
     }
 

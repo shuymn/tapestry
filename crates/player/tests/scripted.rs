@@ -840,6 +840,22 @@ fn direct_play_result_switches_presets() {
     );
 }
 
+/// A result script step that has no place on a result fails the direct
+/// play's run with a nonzero exit that names it.
+#[test]
+fn direct_play_result_script_failure_fails_the_run() {
+    let (_dir, chart, appdata) = auto_fixture();
+    let out = auto_run(
+        &chart,
+        &appdata,
+        &["--dev-result".as_ref(), "enter".as_ref()],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("the result script failed"), "{stderr}");
+    assert!(stderr.contains("Enter on a result"), "{stderr}");
+}
+
 /// Every file under `dir`, recursively.
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

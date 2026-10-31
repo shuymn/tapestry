@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use game::{
-    AbortCause, Chain, Notice, PlayEnd, PlayReport, PresetFileError, ResultScreen, SHOWN_GAUGES,
-    ShelfError, Tuning, ViewEntry, ViewStatus, ViewSummary,
+    AbortCause, Chain, EntryId, Notice, PlayEnd, PlayReport, PresetFileError, ResultScreen,
+    SHOWN_GAUGES, ShelfError, Tuning, ViewEntry, ViewStatus, ViewSummary,
 };
 use replay::verify::Coverage;
 use rules::{GaugeValue, RulePreset};
@@ -178,7 +178,16 @@ pub fn preset_error_text(e: &PresetFileError) -> String {
 /// cause, never a path.
 pub fn shelf_error_text(e: &ShelfError) -> String {
     match e {
-        ShelfError::Unknown(u) => u.to_string(),
+        // The name as the file names it, only when it is a name: a value
+        // that is not could be a path. The console and the log have it.
+        ShelfError::Unknown(u)
+            if rules::built_in(&u.0).is_some() || game::check_user_preset_name(&u.0).is_ok() =>
+        {
+            u.to_string()
+        }
+        ShelfError::Unknown(_) => {
+            "the chosen preset in player.toml is not a preset name".to_owned()
+        }
         ShelfError::Preset(e) => preset_error_text(e),
         ShelfError::Io { path, kind } => {
             let name = path
@@ -187,6 +196,29 @@ pub fn shelf_error_text(e: &ShelfError) -> String {
             format!("{name}: {kind}")
         }
     }
+}
+
+/// What the console and the log say of the view: its entry, and what it
+/// shows with any error's full chain. The caller prints it again whenever
+/// either changes, so a switch between two entries of one name, or a new
+/// error on the same entry, is said.
+pub fn view_log(screen: &ResultScreen) -> Option<(EntryId, String)> {
+    let entry = screen.viewed()?;
+    let what = match screen.status() {
+        ViewStatus::Ready(s) if s.as_played => "as played".to_owned(),
+        ViewStatus::Ready(s) => format!("what-if, {:?}", s.coverage),
+        ViewStatus::CannotLoad(e) => format!("cannot load: {}", Chain(e)),
+        ViewStatus::OverBudget { needed, budget } => {
+            format!("too large to re-evaluate: {needed} bytes, budget {budget}")
+        }
+        ViewStatus::Failed(e) => format!("no re-evaluation: {}", Chain(e)),
+        ViewStatus::NothingRecorded => "nothing recorded".to_owned(),
+    };
+    let mut line = format!("result: viewing {} ({what})", entry.name);
+    if let Some(e) = screen.file_error() {
+        line.push_str(&format!("; {}", Chain(e)));
+    }
+    Some((entry.id.clone(), line))
 }
 
 /// `t` in seconds with three decimals.
@@ -803,32 +835,81 @@ mod tests {
         broken("windows = [");
         shelf.check();
         s.sync(&played, &shelf, &chart());
-        // A second file failing rolls the notices over.
-        std::fs::write(presets.join("zz.toml"), "windows = [").unwrap();
-        shelf.check();
-        s.sync(&played, &shelf, &chart());
+        // Two more files failing roll the viewed file's notice out.
+        for other in ["zz.toml", "yy.toml"] {
+            std::fs::write(presets.join(other), "windows = [").unwrap();
+            shelf.check();
+            s.sync(&played, &shelf, &chart());
+        }
         let lines = lines_of(&played, &s, false);
         let error = "MINE.TOML: THE PRESET FILE CANNOT BE READ";
         let got: Vec<&str> = lines[1..8].iter().map(String::as_str).collect();
-        assert_eq!(got[0], "< LR2-STYLE  >MINE!<  ZZ! >  4/5");
+        assert_eq!(got[0], "< LR2-STYLE  >MINE!<  YY! >  4/6");
         assert_eq!(got[1], "WHAT-IF UNDER MINE");
         assert_eq!(got[2], "NO INPUT AFTER 1.180 S");
         assert!(
             got[3].starts_with(&format!("FILE DID NOT RELOAD: {error}")),
             "{got:?}"
         );
-        assert!(got[4].starts_with(error), "{got:?}");
-        assert!(got[5].starts_with("ZZ.TOML: "), "{got:?}");
+        assert!(got[4].starts_with("ZZ.TOML: "), "{got:?}");
+        assert!(got[5].starts_with("YY.TOML: "), "{got:?}");
         assert_eq!(
             got[6],
             "THIS PLAY USED THE PREVIOUS TAPESTRY: TAPESTRY-OLD.TOML: ENTITY NOT FOUND"
         );
+        // The viewed file's notice went; its standing error did not.
         assert!(
-            s.notices().all(|n| matches!(n, Notice::Failed(_))),
+            s.notices()
+                .all(|n| matches!(n, Notice::Failed(e) if e.path != mine)),
             "{:?}",
             s.notices().collect::<Vec<_>>()
         );
+        assert_eq!(s.file_error().map(|e| &e.path), Some(&mine));
         assert!(lines.iter().all(|l| l.len() <= COLUMNS), "{lines:?}");
+    }
+
+    /// The console says the view again when its entry changes, even to one
+    /// of the same name, and when its error changes.
+    #[test]
+    fn the_view_is_logged_by_entry_and_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let presets = dir.path().join("presets");
+        std::fs::create_dir_all(&presets).unwrap();
+        let mine = presets.join("mine.toml");
+        let write = |text: &str| {
+            std::fs::write(&mine, text).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&mine)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                .unwrap();
+        };
+        // Played under `mine`, whose file changed since: `mine` as played is
+        // pinned beside the file `mine`.
+        let played_preset = rules::RulePreset {
+            id: "mine".to_owned(),
+            ..rules::tapestry()
+        };
+        let mut lr2 = rules::lr2_style();
+        lr2.id = "mine".to_owned();
+        write(&game::preset_to_toml(&lr2));
+        let played = report(played_preset);
+        let mut shelf = game::Shelf::open(presets.clone(), "mine").unwrap();
+        let mut s = ResultScreen::new(&played, &shelf, &chart(), game::RECORDING_MEMORY);
+        let pinned = super::view_log(&s).unwrap();
+        assert!(matches!(pinned.0, game::EntryId::AsPlayed(_)));
+        s.step(1, &played, &chart());
+        let file = super::view_log(&s).unwrap();
+        assert_eq!(file.0, game::EntryId::UserFile("mine".to_owned()));
+        assert_ne!(pinned, file);
+        write("windows = [");
+        shelf.check();
+        s.sync(&played, &shelf, &chart());
+        let broken = super::view_log(&s).unwrap();
+        assert_eq!(broken.0, file.0);
+        assert_ne!(broken, file);
+        assert!(broken.1.contains("mine.toml"), "{}", broken.1);
     }
 
     /// Long names and errors are cut to the line with a trailing `..`, a
@@ -908,8 +989,18 @@ mod tests {
             kind: std::io::ErrorKind::PermissionDenied,
         };
         assert_eq!(super::shelf_error_text(&io), "presets: permission denied");
-        let unknown = game::ShelfError::Unknown(game::UnknownPreset("mine".to_owned()));
-        assert!(!super::shelf_error_text(&unknown).contains('/'));
+        // A name is drawn; a value that is not a name, a path perhaps, never.
+        let unknown = |v: &str| {
+            super::shelf_error_text(&game::ShelfError::Unknown(game::UnknownPreset(
+                v.to_owned(),
+            )))
+        };
+        assert!(unknown("mine").contains("`mine`"), "{}", unknown("mine"));
+        let path = unknown("C:/Users/me/presets/custom.toml");
+        assert_eq!(
+            path,
+            "the chosen preset in player.toml is not a preset name"
+        );
     }
 
     /// Whatever the summary holds, the key hints stay on their line and the

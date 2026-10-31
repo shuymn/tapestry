@@ -245,6 +245,11 @@ impl ResultScreen {
             last_evaluation: None,
         };
         screen.entries = screen.snapshot(report, shelf);
+        // A folder that could not be listed before the result showed is
+        // still not listed: said on entry, as a later failure would be.
+        if let Some(e) = shelf.listing_error() {
+            screen.notify(Notice::ListingFailed(e.clone()));
+        }
         screen.cursor = screen.played_entry();
         screen.land(report, chart);
         screen
@@ -366,28 +371,30 @@ impl ResultScreen {
             _ => {}
         }
         self.listing_error = shelf.listing_error().cloned();
-        for new in &self.entries.clone() {
+        let mut found = Vec::new();
+        for new in &self.entries {
             let Some(before) = old.iter().find(|o| o.id == new.id) else {
-                if let Some(e) = &new.error {
-                    self.notify(Notice::Failed(e.clone()));
-                }
+                found.extend(new.error.clone().map(Notice::Failed));
                 continue;
             };
             let reloaded = new.hash.is_some() && new.hash != before.hash;
             if reloaded && (new.chosen || viewed.as_ref() == Some(&new.id)) {
-                self.notify(Notice::Reloaded(new.name.clone()));
+                found.push(Notice::Reloaded(new.name.clone()));
             }
             if reloaded && new.chosen {
-                self.notify(Notice::NextPlayUsesIt(new.name.clone()));
+                found.push(Notice::NextPlayUsesIt(new.name.clone()));
             }
             match (&new.error, &before.error) {
-                (Some(e), b) if b.as_ref() != Some(e) => self.notify(Notice::Failed(e.clone())),
+                (Some(e), b) if b.as_ref() != Some(e) => found.push(Notice::Failed(e.clone())),
                 // Recovered: the file's failure notices go.
                 (None, Some(b)) => self
                     .notices
                     .retain(|n| !matches!(n, Notice::Failed(f) if f.path == b.path)),
                 _ => {}
             }
+        }
+        for notice in found {
+            self.notify(notice);
         }
         let at = viewed.and_then(|id| self.entries.iter().position(|e| e.id == id));
         self.cursor = match at {

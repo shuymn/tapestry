@@ -85,8 +85,10 @@ pub struct PlayerRig<'a> {
     pub hints: Hints,
     /// The result screen's input.
     pub result_input: ResultInput,
-    /// The view last printed: its entry's name, and the evaluations made.
-    pub viewed: Option<(String, u64)>,
+    /// The view last printed: its entry and line ([`crate::end_screen::view_log`]).
+    pub viewed: Option<(game::EntryId, String)>,
+    /// The evaluations the shown result had made when last printed.
+    pub evaluated: u64,
     /// The result screen's input, scripted, without selection (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub result_script: Option<crate::dev::SelectScript>,
@@ -541,6 +543,7 @@ impl Rig for PlayerRig<'_> {
         // On entry: what was queued during the play is no result's.
         if self.result_input.enter() {
             self.viewed = None;
+            self.evaluated = 0;
         }
         self.print_view(screen);
         let tuning = self.controls.tuning();

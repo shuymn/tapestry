@@ -88,6 +88,9 @@ enum Chosen<B> {
     Refused(Refused<B>),
 }
 
+/// How a chosen chart went on rig `R`, or the failure that ends the run.
+type Went<R> = Result<Chosen<<R as AppRig>::BankError>, LiveError<<R as Rig>::ScreenError>>;
+
 /// What the scene flow loads every chart with.
 pub struct App {
     root: DataRoot,
@@ -219,6 +222,15 @@ impl App {
                 // wake just before it does not put the check off.
                 let now = rig.now();
                 if self.poll(now) {
+                    // A refusal for the shelf that would not open is over
+                    // once it opens: it is not shown again.
+                    if self.shelf.is_ok()
+                        && refusal.as_ref().is_some_and(|r| {
+                            matches!(r.reason, Refused::Chart(SessionError::Preset(_)))
+                        })
+                    {
+                        refusal = None;
+                    }
                     rig.presets_changed(self.shelf.as_ref());
                 }
                 let deadline = self.next_poll(now);
@@ -240,14 +252,22 @@ impl App {
         chart: &Path,
         rig: &mut R,
     ) -> Result<Chosen<R::BankError>, LiveError<R::ScreenError>> {
-        let shelf = match &self.shelf {
-            Ok(_) => std::mem::replace(&mut self.shelf, Err(lent())),
-            Err(e) => Err(e.clone()),
-        };
-        let shelf = match shelf {
+        let shelf = match std::mem::replace(&mut self.shelf, Err(lent())) {
             Ok(shelf) => shelf,
-            Err(e) => return Ok(Chosen::Refused(Refused::Chart(SessionError::Preset(e)))),
+            Err(e) => {
+                self.shelf = Err(e.clone());
+                return Ok(Chosen::Refused(Refused::Chart(SessionError::Preset(e))));
+            }
         };
+        // The one way back for the shelf, whatever the chart did.
+        let (shelf, chosen) = self.play_on(shelf, chart, rig);
+        self.shelf = Ok(shelf);
+        chosen
+    }
+
+    /// [`play_chart`](Self::play_chart) on the lent `shelf`, which comes
+    /// back with how the chart went.
+    fn play_on<R: AppRig>(&mut self, shelf: Shelf, chart: &Path, rig: &mut R) -> (Shelf, Went<R>) {
         // Every chart reports to the run's one sink, never the parts' own.
         let mut loaded = match Loaded::load_reporting_to(
             self.root.clone(),
@@ -261,25 +281,19 @@ impl App {
             Ok(loaded) => loaded,
             Err(refused) => {
                 let (e, shelf) = *refused;
-                self.shelf = Ok(shelf);
-                return Ok(Chosen::Refused(Refused::Chart(e)));
+                return (shelf, Ok(Chosen::Refused(Refused::Chart(e))));
             }
         };
-        let left = match rig.load_chart(&loaded) {
-            Ok(()) => Ok(run_chart(&mut loaded, rig)),
-            Err(e) => Err(e),
+        let chosen = match rig.load_chart(&loaded) {
+            Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
+            Ok(()) => match run_chart(&mut loaded, rig) {
+                Ok(leave) => Ok(Chosen::Left(leave)),
+                Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
+                Err(e) => Err(e),
+            },
         };
         self.settings = loaded.settings().clone();
-        self.shelf = Ok(loaded.into_shelf());
-        let left = match left {
-            Ok(left) => left,
-            Err(e) => return Ok(Chosen::Refused(Refused::Bank(e))),
-        };
-        match left {
-            Ok(leave) => Ok(Chosen::Left(leave)),
-            Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
-            Err(e) => Err(e),
-        }
+        (loaded.into_shelf(), chosen)
     }
 }
 

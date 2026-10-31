@@ -2279,3 +2279,22 @@ fn a_listing_failure_is_noticed_then_cleared() {
     assert_eq!(s.notices().count(), 0);
     assert!(ready(&s).as_played);
 }
+
+/// The presets folder already cannot be listed when the chart loads, with a
+/// built-in chosen: the result says so from its entry, though no check
+/// during the result changes anything.
+#[test]
+fn a_standing_listing_failure_shows_on_result_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    // A file where the folder is: listing it fails.
+    std::fs::write(dir.path().join("presets"), b"").unwrap();
+    let (loaded, report) = played(dir.path(), "tapestry");
+    assert!(loaded.shelf().listing_error().is_some());
+    let s = ResultScreen::new(&report, loaded.shelf(), &chart(), game::RECORDING_MEMORY);
+    let notices: Vec<Notice> = s.notices().cloned().collect();
+    let [Notice::ListingFailed(e)] = &notices[..] else {
+        panic!("{notices:?}");
+    };
+    assert_eq!(e.path, dir.path().join("presets"));
+    assert!(ready(&s).as_played);
+}

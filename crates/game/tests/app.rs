@@ -1195,75 +1195,114 @@ fn shelf_survives_returning_to_select() {
     assert_eq!(app.shelf().unwrap().chosen_error(), None);
 }
 
-/// However a chart ends, the run's shelf comes back the same: a chart-load
-/// refusal, a bank refusal, a logic refusal, a close before recording
-/// opens, a quit mid-play, and a fatal screen failure.
+/// However a chart ends, the run's shelf comes back as it was lent: a
+/// chart-load refusal, a bank refusal, a logic refusal, a close before
+/// recording opens, a quit mid-play, and a fatal screen failure. Before the
+/// chart, `mine` reloaded (a revision past 0) and then broke, so the shelf
+/// holds the last good `mine` with its error, which a shelf opened again
+/// would not: it would refuse to open.
 #[test]
 fn shelf_returns_on_every_outcome() {
     type Setup = fn(&mut Headless);
+    type Check = fn(&Headless, &Result<(), LiveError<SurfaceLost>>) -> bool;
     let none: Setup = |_| {};
-    type Case = (&'static str, Refusal, Vec<(i64, Act)>, Setup);
-    let cases: [Case; 6] = [
+    let refused: fn(&'static str) -> Check = |kind| match kind {
+        "io" => |r, ran| ran.is_ok() && r.refusals == ["io"],
+        "bank" => |r, ran| ran.is_ok() && r.refusals == ["bank"],
+        _ => |r, ran| ran.is_ok() && r.refusals == ["no notes"],
+    };
+    let cases: [(&str, Refusal, Act, Setup, Check); 6] = [
         (
             "load refusal",
             Refusal::Missing,
-            vec![(0, Act::Choose(2))],
+            Act::Choose(2),
             none,
+            refused("io"),
         ),
         (
             "bank refusal",
             Refusal::Bank,
-            vec![(0, Act::Choose(2))],
+            Act::Choose(2),
             none,
+            refused("bank"),
         ),
         (
             "logic refusal",
             Refusal::Silent,
-            vec![(0, Act::Choose(2))],
+            Act::Choose(2),
             none,
+            refused("no notes"),
         ),
         (
             "close before recording",
             Refusal::Missing,
-            vec![(0, Act::Choose(0))],
+            Act::Choose(0),
             |r| r.close_in_load = true,
+            |r, ran| ran.is_ok() && r.loads.len() == 1 && r.starts == 0,
         ),
         (
             "quit mid-play",
             Refusal::Missing,
-            vec![(0, Act::Choose(0)), (1_500, Act::Quit)],
-            none,
+            Act::Choose(0),
+            |r| r.acts.insert(1, (1_500, Act::Quit)),
+            |r, ran| {
+                ran.is_ok()
+                    && r.reports().map(|p| p.end).collect::<Vec<_>>()
+                        == [PlayEnd::Aborted(AbortCause::Quit)]
+            },
         ),
         (
             "fatal screen failure",
             Refusal::Missing,
-            vec![(0, Act::Choose(0)), (10_000, Act::Close)],
+            Act::Choose(0),
             |r| {
-                r.screen_fails_at = CLOCK_START + 1_500 * MS;
+                r.screen_fails_at = CLOCK_START + 2_200 * MS;
                 r.prepare_fails_from = 2;
+            },
+            |r, ran| {
+                matches!(ran, Err(LiveError::Screen(_)))
+                    && r.reports().map(|p| p.end).collect::<Vec<_>>()
+                        == [PlayEnd::Aborted(AbortCause::ScreenFailed)]
             },
         ),
     ];
-    for (name, refusal, mut acts, setup) in cases {
-        acts.push((500, Act::Close));
-        let (rig, app, _dir, ran) = run_mine(refusal, acts, |r, _| setup(r));
-        if name == "fatal screen failure" {
-            assert!(matches!(ran, Err(LiveError::Screen(_))), "{name}: {ran:?}");
-        } else {
-            ran.unwrap();
-        }
+    let (reloaded, broken) = (CLOCK_START + 100 * MS, CLOCK_START + 400 * MS);
+    for (name, refusal, choose, setup, happened) in cases {
+        let acts = vec![(700, choose), (10_000, Act::Close)];
+        let (rig, app, dir, ran) = run_mine(refusal, acts, |r, dir| {
+            edit(
+                r,
+                reloaded,
+                &mine_path(dir),
+                game::preset_to_toml(&flat_normal()),
+            );
+            edit(r, broken, &mine_path(dir), "windows = [".to_owned());
+            setup(r);
+        });
+        assert!(happened(&rig, &ran), "{name}: {ran:?} {:?}", rig.seen);
+        // What selection was shown last before the choice.
+        let Some((_, Ok((revision, Some(error))))) = rig
+            .presets
+            .iter()
+            .rev()
+            .find(|(at, _)| *at < CLOCK_START + 700 * MS)
+            .cloned()
+        else {
+            panic!("{name}: {:?}", rig.presets);
+        };
+        assert!(revision >= 2, "{name}: {revision}");
+        assert_eq!(error.path, mine_path(dir.path()), "{name}");
         let shelf = app.shelf().unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        assert_eq!(shelf.chosen(), &mine(rules::tapestry()), "{name}");
-        assert_eq!(shelf.revision(), 0, "{name}");
-        if name == "logic refusal" {
-            assert_eq!(rig.refusals, ["no notes"], "{name}");
-        }
+        assert_eq!(shelf.revision(), revision, "{name}");
+        assert_eq!(shelf.chosen(), &mine(flat_normal()), "{name}");
+        assert_eq!(shelf.chosen_error(), Some(&error), "{name}");
     }
 }
 
 /// A chosen preset that never loaded refuses the chart with its error;
 /// once the file is fixed, the next poll opens the shelf, selection is
-/// shown it, and the next chart plays.
+/// shown it, and the refusal is over: a selection built again after a
+/// screen failure does not show it again, and the next chart plays.
 #[test]
 fn unloadable_chosen_preset_refuses_then_heals_on_select() {
     let acts = vec![
@@ -1271,11 +1310,24 @@ fn unloadable_chosen_preset_refuses_then_heals_on_select() {
         (500, Act::Choose(0)),
         (4_000, Act::Close),
     ];
-    let (rig, _, ran) = run(Refusal::Preset, acts, |_| {});
+    let (rig, _, ran) = run(Refusal::Preset, acts, |r| {
+        r.screen_fails_at = CLOCK_START + 300 * MS;
+    });
     ran.unwrap();
     assert_eq!(rig.refusals, ["preset"]);
+    assert_eq!(
+        rig.seen,
+        [
+            Seen::Select,
+            Seen::Select,
+            Seen::Refused(2),
+            Seen::Select,
+            Seen::Load(0),
+            Seen::Shown(1),
+        ]
+    );
     let errs: Vec<bool> = rig.presets.iter().map(|(_, s)| s.is_err()).collect();
-    assert_eq!(errs, [true, true, false], "{:?}", rig.presets);
+    assert_eq!(errs, [true, true, false, false], "{:?}", rig.presets);
     // The refusal fixed the file: the next poll, within an interval of
     // the entry, opens it.
     let entered = rig.presets[1].0;

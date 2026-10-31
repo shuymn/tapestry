@@ -73,7 +73,8 @@ pub use results::{
     ResultExtension, ResultSummary,
 };
 pub use rules_toml::{
-    NameError, PresetError, PresetFileCause, PresetFileError, load_preset_toml, preset_to_toml,
+    NameError, PresetError, PresetFileCause, PresetFileError, check_user_preset_name,
+    load_preset_toml, preset_to_toml,
 };
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};

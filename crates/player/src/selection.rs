@@ -18,11 +18,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bms_model::{TimeSource, TimeUs};
-use game::{AppRig, Chain, LoadRefusal, Loaded, Refused, ResultScreen, SessionError, ViewStatus};
+use game::{AppRig, Chain, LoadRefusal, Loaded, Refused, ResultScreen, SessionError};
 
 #[cfg(feature = "dev-tools")]
 use crate::controls::Controls;
-use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text};
+use crate::end_screen::{LoadTimes, preset_error_text, shelf_error_text, view_log};
 use crate::log_file;
 use crate::play::{PlayerRig, since};
 use crate::render_side::{RenderLink, RenderMsg, ScreenError};
@@ -47,6 +47,9 @@ pub struct Selection {
     pub menu: Arc<MenuQueue>,
     /// The window's keys the queue dropped, as last reported.
     pub dropped: u64,
+    /// Whether the notice shown is a refusal because the shelf of presets
+    /// would not open: it goes once the shelf opens.
+    pub preset_refusal: bool,
     /// The window's IME, allowed while the search box has focus; none
     /// headless.
     pub ime: Option<ImeSwitch>,
@@ -144,6 +147,27 @@ impl Selection {
             self.dropped = dropped;
         }
         None
+    }
+
+    /// Shows on the page that `chart` was refused, and why (`text`);
+    /// `preset` when the refusal was the shelf's, which cannot open.
+    fn refused(&mut self, chart: &std::path::Path, text: String, preset: bool) {
+        self.screen.select_path(chart);
+        self.screen.set_notice(Some(text));
+        self.preset_refusal = preset;
+        self.dirty = true;
+    }
+
+    /// Shows the chosen preset `name` and its file's `error`; once the
+    /// shelf is `opened`, a refusal because it would not open is over, and
+    /// its notice goes.
+    fn presets(&mut self, name: String, error: Option<String>, opened: bool) {
+        self.screen.set_preset(name, error);
+        if opened && self.preset_refusal {
+            self.screen.set_notice(None);
+            self.preset_refusal = false;
+        }
+        self.dirty = true;
     }
 
     /// Sends the page if it changed, with `status` in its title (the
@@ -392,36 +416,19 @@ impl PlayerRig<'_> {
     /// Prints which preset the result views when that changed, and how
     /// long a new evaluation took, with any error's full chain.
     pub(crate) fn print_view(&mut self, screen: &ResultScreen) {
-        let Some(entry) = screen.viewed() else {
-            return;
-        };
-        let evaluations = screen.evaluations();
-        let before = self.viewed.replace((entry.name.clone(), evaluations));
-        if let Some(t) = screen.last_evaluation()
-            && before
-                .as_ref()
-                .map_or(evaluations > 0, |(_, n)| *n < evaluations)
+        if let (Some(t), Some(entry)) = (screen.last_evaluation(), screen.viewed())
+            && screen.evaluations() > self.evaluated
         {
             println!("result: evaluated {} in {} ms", entry.name, t.as_millis());
+            self.evaluated = screen.evaluations();
         }
-        if before.is_some_and(|(name, n)| name == entry.name && n == evaluations) {
-            return;
-        }
-        let what = match screen.status() {
-            ViewStatus::Ready(s) if s.as_played => "as played".to_owned(),
-            ViewStatus::Ready(s) => format!("what-if, {:?}", s.coverage),
-            ViewStatus::CannotLoad(e) => format!("cannot load: {}", Chain(e)),
-            ViewStatus::OverBudget { needed, budget } => {
-                format!("too large to re-evaluate: {needed} bytes, budget {budget}")
+        let view = view_log(screen);
+        if view.is_some() && view != self.viewed {
+            if let Some((_, line)) = &view {
+                println!("{line}");
+                log::info!("{line}");
             }
-            ViewStatus::Failed(e) => format!("no re-evaluation: {}", Chain(e)),
-            ViewStatus::NothingRecorded => "nothing recorded".to_owned(),
-        };
-        println!("result: viewing {} ({what})", entry.name);
-        log::info!("result: viewing {} ({what})", entry.name);
-        if let Some(e) = screen.file_error() {
-            eprintln!("result: {}", Chain(e));
-            log::warn!("result: {}", Chain(e));
+            self.viewed = view;
         }
     }
 
@@ -514,41 +521,41 @@ impl AppRig for PlayerRig<'_> {
         println!("select: refused {name}: {why}");
         log::warn!("select: refused {}: {why}", refusal.chart.display());
         // A preset's error is shown by its file's name, never its path.
-        let shown = match &refusal.reason {
+        let (shown, preset) = match &refusal.reason {
             Refused::Chart(SessionError::Preset(e)) => {
-                format!("{}: {}", refusal.reason, shelf_error_text(e))
+                (format!("{}: {}", refusal.reason, shelf_error_text(e)), true)
             }
-            _ => why,
+            _ => (why, false),
         };
         if let Some(sel) = &mut self.selection {
-            sel.screen.select_path(&refusal.chart);
-            sel.screen.set_notice(Some(format!("{name}: {shown}")));
-            sel.dirty = true;
+            sel.refused(&refusal.chart, format!("{name}: {shown}"), preset);
             sel.show(&self.render, None);
         }
     }
 
     fn presets_changed(&mut self, shelf: Result<&game::Shelf, &game::ShelfError>) {
+        let say = |e: &(dyn std::error::Error + 'static)| {
+            let line = format!("presets: {}", Chain(e));
+            eprintln!("{line}");
+            log::warn!("{line}");
+        };
+        // The chosen file's error, else a folder that cannot be listed,
+        // which a chosen built-in shows too.
         let (name, error) = match shelf {
             Ok(shelf) => (
                 shelf.chosen_name().to_owned(),
-                shelf.chosen_error().map(|e| {
-                    let line = format!("presets: {}", Chain(e));
-                    eprintln!("{line}");
-                    log::warn!("{line}");
+                shelf.chosen_error().or(shelf.listing_error()).map(|e| {
+                    say(e);
                     preset_error_text(e)
                 }),
             ),
             Err(e) => {
-                let line = format!("presets: {}", Chain(e));
-                eprintln!("{line}");
-                log::warn!("{line}");
+                say(e);
                 ("-".to_owned(), Some(shelf_error_text(e)))
             }
         };
         if let Some(sel) = &mut self.selection {
-            sel.screen.set_preset(name, error);
-            sel.dirty = true;
+            sel.presets(name, error, shelf.is_ok());
             sel.show(&self.render, None);
         }
     }
@@ -607,6 +614,7 @@ mod tests {
             screen: SelectScreen::new(vec![charts]),
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            preset_refusal: false,
             ime: None,
             rate: 48_000,
             chosen_at: TimeUs(0),
@@ -735,6 +743,35 @@ mod tests {
         menu.push(MenuInput::Key(MenuKey::Left));
         assert_eq!(result.take(), Some(game::MenuCommand::PrevPreset));
         assert_eq!(result.take(), None);
+    }
+
+    /// A chart refused because the shelf would not open shows why on the
+    /// notice line; once the shelf opens, that notice goes. Another refusal
+    /// stays when the shelf changes, and a folder that cannot be listed
+    /// shows with a built-in chosen.
+    #[test]
+    fn a_preset_refusal_clears_once_the_shelf_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let notice = |sel: &Selection| sel.screen.page("").lines[2].text.clone();
+        let chart = dir.path().join("charts").join("a.bms");
+        sel.presets("-".to_owned(), Some("mine.toml: broken".to_owned()), false);
+        sel.refused(&chart, "a.bms: the preset cannot open".to_owned(), true);
+        assert_eq!(notice(&sel), "a.bms: the preset cannot open");
+        sel.presets("-".to_owned(), Some("mine.toml: broken".to_owned()), false);
+        assert_eq!(notice(&sel), "a.bms: the preset cannot open");
+        sel.presets("mine".to_owned(), None, true);
+        assert_eq!(notice(&sel), "");
+        // A refusal of the chart itself is not the shelf's to clear.
+        sel.refused(&chart, "a.bms: no adapter reads it".to_owned(), false);
+        sel.presets(
+            "tapestry".to_owned(),
+            Some("presets: denied".to_owned()),
+            true,
+        );
+        assert_eq!(notice(&sel), "a.bms: no adapter reads it");
+        sel.screen.set_notice(None);
+        assert_eq!(notice(&sel), "presets: denied");
     }
 
     /// Consecutive edits of the search are searched once, at the end.

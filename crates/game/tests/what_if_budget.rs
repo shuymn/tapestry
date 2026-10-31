@@ -127,36 +127,65 @@ fn what_if_peak_stays_within_its_budget() {
             incomplete: Incomplete::default(),
         },
     };
-    // Eight gauges where the play had two: every event carries one change
-    // per gauge, which the play's own admission never sized.
-    let mut what_if = rules::tapestry();
-    what_if.id = "many".to_owned();
-    let normal = what_if.gauges[0].clone();
-    what_if.gauges = (0..8)
-        .map(|i| rules::GaugeRule {
-            id: format!("g{i}"),
-            ..normal.clone()
-        })
-        .collect();
-    let budget = what_if_bytes(&chart, &what_if, &record).unwrap();
-    let ctx = ResultContext {
-        record: &record,
-        chart: &chart,
-        preset: &played,
-        live: &[],
+    // The counter sees allocations: a positive control.
+    let peak_of = |f: &mut dyn FnMut()| {
+        LIVE.store(0, Ordering::Relaxed);
+        PEAK.store(0, Ordering::Relaxed);
+        TRACK.with(|t| t.set(true));
+        f();
+        TRACK.with(|t| t.set(false));
+        usize::try_from(PEAK.load(Ordering::Relaxed)).unwrap()
     };
-    LIVE.store(0, Ordering::Relaxed);
-    PEAK.store(0, Ordering::Relaxed);
-    TRACK.with(|t| t.set(true));
-    let evaluated = ReEvaluate::under(&ctx, &what_if);
-    TRACK.with(|t| t.set(false));
-    let peak = usize::try_from(PEAK.load(Ordering::Relaxed)).unwrap();
-    let evaluated = evaluated.unwrap();
-    assert!(!evaluated.as_played);
-    assert_eq!(evaluated.evaluation.gauges.len(), 8);
-    assert!(peak <= budget, "peak {peak} over the budget {budget}");
-    // The played preset's own budget would not have covered it.
-    let own = what_if_bytes(&chart, &played, &record).unwrap();
-    assert!(own < budget, "{own} {budget}");
-    println!("indicator: what-if peak {peak} bytes, budget {budget} bytes");
+    let control = peak_of(&mut || drop(std::hint::black_box(Vec::<u8>::with_capacity(4_096))));
+    assert!(control >= 4_096, "{control}");
+    // 1, 8 and 64 gauges where the play had two: every event carries one
+    // change per gauge, which the play's own admission never sized; each
+    // with the input at and past the steps where the gauge histories and
+    // the event stream double, and in full.
+    let all = record.events.len();
+    let normal = played.gauges[0].clone();
+    for gauges in [1, 8, 64] {
+        let mut what_if = rules::tapestry();
+        what_if.id = "many".to_owned();
+        what_if.gauges = (0..gauges)
+            .map(|i| rules::GaugeRule {
+                id: format!("g{i}"),
+                ..normal.clone()
+            })
+            .collect();
+        for inputs in [64, 65, 128, 129, 256, 257, all] {
+            let mut record = record.clone();
+            record.events.truncate(inputs);
+            let budget = what_if_bytes(&chart, &what_if, &record).unwrap();
+            let ctx = ResultContext {
+                record: &record,
+                chart: &chart,
+                preset: &played,
+                live: &[],
+            };
+            let mut evaluated = None;
+            let peak = peak_of(&mut || evaluated = Some(ReEvaluate::under(&ctx, &what_if)));
+            let evaluated = evaluated.unwrap().unwrap();
+            assert!(!evaluated.as_played);
+            assert_eq!(evaluated.evaluation.gauges.len(), gauges);
+            // What the evaluation still holds was counted.
+            let stream = evaluated.evaluation.events.capacity() * size_of::<eval::JudgeEvent>();
+            assert!(
+                peak >= stream,
+                "{gauges} gauges, {inputs} inputs: {peak} < {stream}"
+            );
+            assert!(
+                peak <= budget,
+                "{gauges} gauges, {inputs} inputs: peak {peak} over the budget {budget}"
+            );
+            if inputs == all {
+                println!("indicator: {gauges} gauges, peak {peak} bytes, budget {budget} bytes");
+            }
+        }
+        // The played preset's own budget would not have covered more gauges.
+        if gauges > played.gauges.len() {
+            let own = what_if_bytes(&chart, &played, &record).unwrap();
+            assert!(own < what_if_bytes(&chart, &what_if, &record).unwrap());
+        }
+    }
 }
