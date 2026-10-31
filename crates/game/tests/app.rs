@@ -241,7 +241,17 @@ struct Headless {
     play: Option<Play>,
     /// Whether each play handed over finalized a watermark, in order.
     finalized: Vec<bool>,
+    /// Each idle wait: when it began and its deadline.
+    idle_waits: Vec<(i64, i64)>,
+    /// Edits of the files run once the clock reaches their time.
+    edits: Vec<(i64, Box<dyn FnOnce()>)>,
+    /// Each shelf state selection was shown, with its clock time: the
+    /// revision and the chosen file's error, or why it cannot open.
+    presets: Vec<(i64, PresetsSeen)>,
 }
+
+/// What selection was shown of the shelf.
+type PresetsSeen = Result<(u64, Option<game::PresetFileError>), game::ShelfError>;
 
 /// A play between its handoff and its close.
 struct Play {
@@ -307,6 +317,9 @@ impl Headless {
             count_allocs: false,
             play: None,
             finalized: Vec::new(),
+            idle_waits: Vec::new(),
+            edits: Vec::new(),
+            presets: Vec::new(),
         }
     }
 
@@ -345,6 +358,10 @@ impl Headless {
         }
         if let Some(s) = &mut self.sounds {
             while s.commands().pop().is_ok() {}
+        }
+        let now = self.at();
+        while let Some(i) = self.edits.iter().position(|(at, _)| *at <= now) {
+            (self.edits.remove(i).1)();
         }
         match self.due_act() {
             Some(Act::Close) => {
@@ -561,12 +578,35 @@ impl Rig for Headless {
         self.loads.last_mut().unwrap().1.push(report.clone());
     }
 
-    fn show_end(&mut self, report: &PlayReport) {
+    fn idle_wait(&mut self, deadline: TimeUs) {
+        self.idle_waits.push((self.at(), deadline.0));
+        // Up to the deadline, or to the next action or edit if that is
+        // sooner.
+        let next = if self.next < self.acts.len() {
+            self.due.max(self.at() + MS)
+        } else {
+            i64::MAX
+        };
+        let edit = self
+            .edits
+            .iter()
+            .map(|(at, _)| *at)
+            .min()
+            .unwrap_or(i64::MAX);
+        let to = deadline.0.min(next).min(edit).max(self.at() + 1);
+        self.clock.advance(TimeUs(to - self.at()));
+        self.tick();
+    }
+
+    fn show_end(&mut self, report: &PlayReport, _screen: &game::ResultScreen) {
         if self.in_selection {
             self.violations
                 .push("a result shown in selection".to_owned());
         }
-        self.seen.push(Seen::Shown(report.attempt));
+        // A result drawn again (its view changed) is the same result.
+        if self.seen.last() != Some(&Seen::Shown(report.attempt)) {
+            self.seen.push(Seen::Shown(report.attempt));
+        }
     }
 }
 
@@ -601,22 +641,6 @@ impl AppRig for Headless {
         Ok(())
     }
 
-    fn idle_wait(&mut self, deadline: TimeUs) {
-        if !self.in_selection {
-            self.violations
-                .push("an idle wait outside selection".to_owned());
-        }
-        // Up to the deadline, or to the next action if that is sooner.
-        let next = if self.next < self.acts.len() {
-            self.due.max(self.at() + MS)
-        } else {
-            i64::MAX
-        };
-        let to = deadline.0.min(next).max(self.at() + MS);
-        self.clock.advance(TimeUs(to - self.at()));
-        self.tick();
-    }
-
     fn show_refusal(&mut self, refusal: &LoadRefusal<BankLost>) {
         if !self.in_selection {
             self.violations
@@ -647,6 +671,13 @@ impl AppRig for Headless {
         }
     }
 
+    fn presets_changed(&mut self, shelf: Result<&game::Shelf, &game::ShelfError>) {
+        let seen = shelf
+            .map(|s| (s.revision(), s.chosen_error().cloned()))
+            .map_err(Clone::clone);
+        self.presets.push((self.at(), seen));
+    }
+
     fn entered_selection(&mut self) {
         self.in_selection = true;
         self.entries += 1;
@@ -655,19 +686,24 @@ impl AppRig for Headless {
 }
 
 fn app(dir: &Path, refusal: Refusal, events: &Events) -> App {
-    let root = DataRoot::new(dir.to_owned());
-    let mut settings = Settings::load(&root).unwrap();
     if refusal == Refusal::Preset {
         let presets = dir.join("presets");
         std::fs::create_dir_all(&presets).unwrap();
         std::fs::write(presets.join("mine.toml"), b"not a preset").unwrap();
     }
-    settings.player.preset = if refusal == Refusal::Preset {
+    let preset = if refusal == Refusal::Preset {
         "mine"
     } else {
         "tapestry"
-    }
-    .to_owned();
+    };
+    app_named(dir, refusal, preset, events)
+}
+
+/// [`app`] choosing the preset named `preset`.
+fn app_named(dir: &Path, refusal: Refusal, preset: &str, events: &Events) -> App {
+    let root = DataRoot::new(dir.to_owned());
+    let mut settings = Settings::load(&root).unwrap();
+    settings.player.preset = preset.to_owned();
     let config = SessionConfig {
         lead_in: TimeUs(1_000 * MS),
         step: TimeUs(MS),
@@ -1020,6 +1056,270 @@ fn close_while_loading_ends_the_run() {
     assert_eq!(rig.seen, [Seen::Select, Seen::Load(0)]);
     assert_eq!(rig.starts, 0);
     assert!(rig.refused_opens.is_empty());
+}
+
+/// The user preset `mine`'s file in `dir`.
+fn mine_path(dir: &Path) -> PathBuf {
+    dir.join("presets").join("mine.toml")
+}
+
+/// The tapestry preset named `mine`, as `presets/mine.toml` loads it.
+fn mine(preset: rules::RulePreset) -> rules::RulePreset {
+    rules::RulePreset {
+        id: "mine".to_owned(),
+        ..preset
+    }
+}
+
+/// The tapestry preset whose normal gauge gains nothing on a PERFECT.
+fn flat_normal() -> rules::RulePreset {
+    let mut p = rules::tapestry();
+    p.gauges[0].change.perfect = rules::GaugeDelta::Fixed(rules::GaugeValue(0));
+    p
+}
+
+/// Runs the flow over `acts` with the user preset `mine`, holding the
+/// tapestry preset's rules, chosen; also the app, for its shelf, and the
+/// data root, for the files.
+fn run_mine(
+    refusal: Refusal,
+    acts: Vec<(i64, Act)>,
+    setup: impl FnOnce(&mut Headless, &Path),
+) -> (
+    Headless,
+    App,
+    tempfile::TempDir,
+    Result<(), LiveError<SurfaceLost>>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("presets")).unwrap();
+    // Refused as a preset: the file never loads.
+    let text = if refusal == Refusal::Preset {
+        "not a preset".to_owned()
+    } else {
+        game::preset_to_toml(&rules::tapestry())
+    };
+    std::fs::write(mine_path(dir.path()), text).unwrap();
+    let mut app = app_named(dir.path(), refusal, "mine", &Events::default());
+    let mut rig = Headless::new(dir.path(), refusal, acts);
+    setup(&mut rig, dir.path());
+    let ran = app.run(&mut rig);
+    (rig, app, dir, ran)
+}
+
+/// An edit of `path` to `text` at clock time `at`.
+fn edit(rig: &mut Headless, at: i64, path: &Path, text: String) {
+    let path = path.to_owned();
+    rig.edits
+        .push((at, Box::new(move || common::rewrite(&path, &text))));
+}
+
+/// The chosen preset's file changes, then breaks, while selection shows:
+/// each is seen at the next poll, within one poll interval, and selection
+/// is shown the shelf's new state, then the file's error.
+#[test]
+fn select_screen_polls_the_shelf() {
+    let (changed, broken) = (CLOCK_START + 500 * MS, CLOCK_START + 1_500 * MS);
+    let (rig, app, dir, ran) = run_mine(Refusal::Missing, vec![(3_000, Act::Close)], |r, dir| {
+        edit(
+            r,
+            changed,
+            &mine_path(dir),
+            game::preset_to_toml(&flat_normal()),
+        );
+        edit(r, broken, &mine_path(dir), "windows = [".to_owned());
+    });
+    ran.unwrap();
+    let within = |t: i64, from: i64| (from..=from + game::POLL_INTERVAL.0).contains(&t);
+    let [
+        (t0, Ok((r0, None))),
+        (t1, Ok((r1, None))),
+        (t2, Ok((r2, Some(e)))),
+    ] = &rig.presets[..]
+    else {
+        panic!("{:?}", rig.presets);
+    };
+    assert_eq!(*t0, CLOCK_START);
+    assert!(within(*t1, changed), "{t1}");
+    assert!(within(*t2, broken), "{t2}");
+    assert!(r0 < r1 && r1 < r2, "{r0} {r1} {r2}");
+    assert_eq!(e.path, mine_path(dir.path()));
+    // The reload is chosen; the broken file leaves it in use.
+    let shelf = app.shelf().unwrap();
+    assert_eq!(shelf.chosen(), &mine(flat_normal()));
+    assert_eq!(shelf.chosen_error(), Some(e));
+}
+
+/// Chart A plays under `mine`; back in selection, `mine.toml` breaks, and
+/// chart B, chosen next, plays the last good `mine`, its first report
+/// naming the error. Fixing the file clears the error selection shows.
+#[test]
+fn shelf_survives_returning_to_select() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (4_000, Act::Back),
+        (1_000, Act::Choose(1)),
+        (4_000, Act::Back),
+        (1_000, Act::Close),
+    ];
+    let (broken, fixed) = (CLOCK_START + 4_500 * MS, CLOCK_START + 9_500 * MS);
+    let (rig, app, dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
+        edit(r, broken, &mine_path(dir), "windows = [".to_owned());
+        edit(
+            r,
+            fixed,
+            &mine_path(dir),
+            game::preset_to_toml(&rules::tapestry()),
+        );
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let [(0, a), (1, b)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    let good = replay::preset_hash(&mine(rules::tapestry()));
+    assert_eq!(a[0].record.as_ref().unwrap().preset.sha256, good);
+    assert_eq!(a[0].reload_error, None);
+    assert_eq!(b[0].record.as_ref().unwrap().preset.sha256, good);
+    let e = b[0].reload_error.as_ref().unwrap();
+    assert_eq!(e.path, mine_path(dir.path()));
+    // Selection was shown the error, then its recovery.
+    let errors: Vec<bool> = rig
+        .presets
+        .iter()
+        .map(|(_, s)| s.as_ref().unwrap().1.is_some())
+        .collect();
+    let first_error = errors.iter().position(|&e| e).unwrap();
+    assert!(errors[first_error..].contains(&false), "{errors:?}");
+    assert!(!errors.last().unwrap());
+    assert_eq!(app.shelf().unwrap().chosen_error(), None);
+}
+
+/// However a chart ends, the run's shelf comes back the same: a chart-load
+/// refusal, a bank refusal, a logic refusal, a close before recording
+/// opens, a quit mid-play, and a fatal screen failure.
+#[test]
+fn shelf_returns_on_every_outcome() {
+    type Setup = fn(&mut Headless);
+    let none: Setup = |_| {};
+    type Case = (&'static str, Refusal, Vec<(i64, Act)>, Setup);
+    let cases: [Case; 6] = [
+        (
+            "load refusal",
+            Refusal::Missing,
+            vec![(0, Act::Choose(2))],
+            none,
+        ),
+        (
+            "bank refusal",
+            Refusal::Bank,
+            vec![(0, Act::Choose(2))],
+            none,
+        ),
+        (
+            "logic refusal",
+            Refusal::Silent,
+            vec![(0, Act::Choose(2))],
+            none,
+        ),
+        (
+            "close before recording",
+            Refusal::Missing,
+            vec![(0, Act::Choose(0))],
+            |r| r.close_in_load = true,
+        ),
+        (
+            "quit mid-play",
+            Refusal::Missing,
+            vec![(0, Act::Choose(0)), (1_500, Act::Quit)],
+            none,
+        ),
+        (
+            "fatal screen failure",
+            Refusal::Missing,
+            vec![(0, Act::Choose(0)), (10_000, Act::Close)],
+            |r| {
+                r.screen_fails_at = CLOCK_START + 1_500 * MS;
+                r.prepare_fails_from = 2;
+            },
+        ),
+    ];
+    for (name, refusal, mut acts, setup) in cases {
+        acts.push((500, Act::Close));
+        let (rig, app, _dir, ran) = run_mine(refusal, acts, |r, _| setup(r));
+        if name == "fatal screen failure" {
+            assert!(matches!(ran, Err(LiveError::Screen(_))), "{name}: {ran:?}");
+        } else {
+            ran.unwrap();
+        }
+        let shelf = app.shelf().unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(shelf.chosen(), &mine(rules::tapestry()), "{name}");
+        assert_eq!(shelf.revision(), 0, "{name}");
+        if name == "logic refusal" {
+            assert_eq!(rig.refusals, ["no notes"], "{name}");
+        }
+    }
+}
+
+/// A chosen preset that never loaded refuses the chart with its error;
+/// once the file is fixed, the next poll opens the shelf, selection is
+/// shown it, and the next chart plays.
+#[test]
+fn unloadable_chosen_preset_refuses_then_heals_on_select() {
+    let acts = vec![
+        (0, Act::Choose(2)),
+        (500, Act::Choose(0)),
+        (4_000, Act::Close),
+    ];
+    let (rig, _, ran) = run(Refusal::Preset, acts, |_| {});
+    ran.unwrap();
+    assert_eq!(rig.refusals, ["preset"]);
+    let errs: Vec<bool> = rig.presets.iter().map(|(_, s)| s.is_err()).collect();
+    assert_eq!(errs, [true, true, false], "{:?}", rig.presets);
+    // The refusal fixed the file: the next poll, within an interval of
+    // the entry, opens it.
+    let entered = rig.presets[1].0;
+    let healed = rig.presets[2].0;
+    assert!(
+        healed - entered <= game::POLL_INTERVAL.0,
+        "{entered} {healed}"
+    );
+    let (0, plays) = rig.loads.last().unwrap() else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(plays[0].preset, mine(rules::tapestry()));
+}
+
+/// A wake 1 µs before selection's poll deadline does not check; the wait
+/// after it ends at the deadline, where the check runs, not an idle wait
+/// later. The same holds for a shelf that cannot open yet.
+#[test]
+fn select_poll_runs_at_its_deadline_after_an_early_wake() {
+    // The first poll runs at the entry; the next is due an interval later.
+    let deadline = CLOCK_START + game::POLL_INTERVAL.0;
+    for refusal in [Refusal::Missing, Refusal::Preset] {
+        let (rig, _, _, ran) = run_mine(refusal, vec![(1_000, Act::Close)], |r, dir| {
+            edit(
+                r,
+                deadline - 2,
+                &mine_path(dir),
+                game::preset_to_toml(&flat_normal()),
+            );
+            r.edits.push((deadline - 1, Box::new(|| {})));
+        });
+        ran.unwrap();
+        let woke = rig
+            .idle_waits
+            .iter()
+            .find(|&&(at, _)| at == deadline - 1)
+            .unwrap_or_else(|| panic!("{refusal:?}: {:?}", rig.idle_waits));
+        assert_eq!(woke.1, deadline, "{refusal:?}");
+        let [(_, first), (at, Ok(_))] = &rig.presets[..] else {
+            panic!("{refusal:?}: {:?}", rig.presets);
+        };
+        assert_eq!(first.is_err(), refusal == Refusal::Preset);
+        assert_eq!(*at, deadline, "{refusal:?}");
+    }
 }
 
 fn act() -> impl Strategy<Value = Act> {

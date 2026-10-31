@@ -1776,8 +1776,8 @@ fn result_switches_presets_and_labels_what_if() {
     assert_eq!(viewed(shown(&rig, 11_500_000)), user("narrow"));
 
     // Aborted by focus loss at play time 1.65 s: after `narrow`'s final
-    // deadline (1.6 s), before the tapestry preset's (1.68 s).
-    let mut loaded = loaded(dir.path());
+    // deadline (1.61 s), before the tapestry preset's (1.68 s).
+    let mut loaded = loaded_with(dir.path(), "tapestry");
     let items = vec![
         key(9_303_000, Z, 1),
         key(9_353_000, Z, 0),
@@ -1957,4 +1957,325 @@ fn plays_use_reloads_from_the_next_play() {
         replay::preset_hash(&mine(flat_normal()))
     );
     assert_eq!(two.reload_error, None);
+}
+
+/// One play of [`chart`] under the preset named `preset` in `dir`, left on
+/// its result: the loaded chart and the report.
+fn played(dir: &Path, preset: &str) -> (Loaded, PlayReport) {
+    let mut loaded = loaded_with(dir, preset);
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 11_000_000);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let report = rig.reports.pop().unwrap();
+    (loaded, report)
+}
+
+/// A shelf of `dir`'s presets choosing `name`, apart from the chart's.
+fn shelf_of(dir: &Path, name: &str) -> game::Shelf {
+    game::Shelf::open(dir.join("presets"), name).unwrap()
+}
+
+/// The screen's view moved to the entry `id`, stepping forward.
+fn view(screen: &mut ResultScreen, id: &EntryId, report: &PlayReport) {
+    for _ in 0..screen.entries().len() {
+        if viewed(screen) == *id {
+            return;
+        }
+        screen.step(1, report, &chart());
+    }
+    panic!("{id:?} not listed");
+}
+
+/// Every view status moves on a switch: Ready, CannotLoad, OverBudget and
+/// Failed each land on the next entry, a Failed summary is cached and not
+/// evaluated again, and with nothing recorded every view stays so, a file
+/// that cannot load included.
+#[test]
+fn every_status_moves_on_a_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    write_named(dir.path(), "broken", &rules::tapestry());
+    common::rewrite(
+        &dir.path().join("presets").join("broken.toml"),
+        "windows = [",
+    );
+    let (loaded, report) = played(dir.path(), "tapestry");
+    let shelf = loaded.shelf();
+    let budget = game::RECORDING_MEMORY;
+    let built_in = |n: &str| EntryId::BuiltIn(n.to_owned());
+
+    // C → the next entry, then back to C.
+    let mut s = ResultScreen::new(&report, shelf, &chart(), budget);
+    view(&mut s, &user("broken"), &report);
+    assert!(matches!(s.status(), ViewStatus::CannotLoad(e) if e.path.ends_with("broken.toml")));
+    s.step(1, &report, &chart());
+    assert_eq!(viewed(&s), built_in("tapestry"));
+    assert!(ready(&s).as_played);
+    s.step(-1, &report, &chart());
+    assert!(matches!(s.status(), ViewStatus::CannotLoad(_)));
+
+    // R (what-if) → R, and O → R.
+    s.step(-1, &report, &chart());
+    assert!(!ready(&s).as_played);
+    let mut tiny = ResultScreen::new(&report, shelf, &chart(), 1_024);
+    assert!(ready(&tiny).as_played);
+    tiny.step(1, &report, &chart());
+    assert!(matches!(
+        tiny.status(),
+        ViewStatus::OverBudget { needed, budget: 1_024 } if needed > 1_024
+    ));
+    tiny.step(1, &report, &chart());
+    assert!(matches!(tiny.status(), ViewStatus::OverBudget { .. }));
+    tiny.step(-2, &report, &chart());
+    assert!(ready(&tiny).as_played);
+    assert_eq!(tiny.evaluations(), 0);
+
+    // F → F, cached: a record of another evaluator version.
+    let mut other = report.clone();
+    other.record.as_mut().unwrap().versions.evaluator += 1;
+    let mut f = ResultScreen::new(&other, shelf, &chart(), budget);
+    f.step(1, &other, &chart());
+    assert!(matches!(
+        f.status(),
+        ViewStatus::Failed(game::ReEvaluationError::UnsupportedEvaluator(_))
+    ));
+    f.step(1, &other, &chart());
+    assert!(matches!(f.status(), ViewStatus::Failed(_)));
+    assert_eq!(f.evaluations(), 2);
+    f.step(-1, &other, &chart());
+    assert!(matches!(f.status(), ViewStatus::Failed(_)));
+    assert_eq!(
+        f.evaluations(),
+        2,
+        "a cached failure is not evaluated again"
+    );
+
+    // N everywhere, CannotLoad included.
+    let mut nothing = report.clone();
+    nothing.record = None;
+    nothing.result = None;
+    let mut n = ResultScreen::new(&nothing, shelf, &chart(), budget);
+    assert_eq!(n.status(), ViewStatus::NothingRecorded);
+    for _ in 0..n.entries().len() {
+        n.step(1, &nothing, &chart());
+        assert_eq!(n.status(), ViewStatus::NothingRecorded, "{:?}", viewed(&n));
+    }
+    view(&mut n, &user("broken"), &nothing);
+    assert_eq!(n.status(), ViewStatus::NothingRecorded);
+    assert_eq!(n.evaluations(), 0);
+}
+
+/// A 1 KiB budget refuses every what-if without evaluating it, with the
+/// bytes it needs.
+#[test]
+fn over_budget_view_is_refused_without_evaluating() {
+    let dir = tempfile::tempdir().unwrap();
+    let (loaded, report) = played(dir.path(), "tapestry");
+    let mut s = ResultScreen::new(&report, loaded.shelf(), &chart(), 1_024);
+    for _ in 1..s.entries().len() {
+        s.step(1, &report, &chart());
+        let ViewStatus::OverBudget { needed, budget } = s.status() else {
+            panic!("{:?}", s.status());
+        };
+        let preset = s.viewed().unwrap().preset.clone().unwrap();
+        let expected = game::what_if_bytes(&chart(), &preset, report.record.as_ref().unwrap());
+        assert_eq!((Some(needed), budget), (expected, 1_024));
+    }
+    assert_eq!(s.evaluations(), 0);
+}
+
+/// The viewed entry's file goes away: the view returns to the play's own
+/// preset with a notice. With nothing recorded it moves there and stays
+/// so. The pinned as-played entry going away, once a file has the play's
+/// hash again, is no removal.
+#[test]
+fn viewed_entry_removed_returns_to_as_played() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_named(dir.path(), "other", &rules::tapestry());
+    let (loaded, report) = played(dir.path(), "tapestry");
+    let mut shelf = shelf_of(dir.path(), "tapestry");
+    let mut nothing = report.clone();
+    nothing.record = None;
+    nothing.result = None;
+    let mut s = ResultScreen::new(&report, &shelf, &chart(), game::RECORDING_MEMORY);
+    let mut n = ResultScreen::new(&nothing, loaded.shelf(), &chart(), game::RECORDING_MEMORY);
+    view(&mut s, &user("other"), &report);
+    view(&mut n, &user("other"), &nothing);
+    std::fs::remove_file(&path).unwrap();
+    shelf.check();
+    assert!(s.sync(&report, &shelf, &chart()));
+    assert!(n.sync(&nothing, &shelf, &chart()));
+    assert_eq!(viewed(&s), EntryId::BuiltIn("tapestry".to_owned()));
+    assert!(ready(&s).as_played);
+    assert_eq!(
+        s.notices().cloned().collect::<Vec<_>>(),
+        [Notice::Removed("other".to_owned())]
+    );
+    assert_eq!(viewed(&n), EntryId::BuiltIn("tapestry".to_owned()));
+    assert_eq!(n.status(), ViewStatus::NothingRecorded);
+
+    // Played under `mine`, edited away: the play is pinned as played.
+    // Restoring the file drops the pin, with no notice.
+    let mine_path = write_user_preset(dir.path(), &rules::tapestry());
+    let (_, report) = played(dir.path(), "mine");
+    let mut shelf = shelf_of(dir.path(), "mine");
+    rewrite_preset(&mine_path, &flat_normal());
+    shelf.check();
+    let mut s = ResultScreen::new(&report, &shelf, &chart(), game::RECORDING_MEMORY);
+    let pinned = EntryId::AsPlayed(replay::preset_hash(&mine(rules::tapestry())));
+    assert_eq!(viewed(&s), pinned);
+    rewrite_preset(&mine_path, &rules::tapestry());
+    shelf.check();
+    assert!(s.sync(&report, &shelf, &chart()));
+    assert_eq!(viewed(&s), user("mine"));
+    assert!(ready(&s).as_played);
+    assert!(!s.entries().iter().any(|e| e.id == pinned));
+    assert!(
+        !s.notices().any(|n| matches!(n, Notice::Removed(_))),
+        "{:?}",
+        s.notices().collect::<Vec<_>>()
+    );
+}
+
+/// A viewed file that breaks keeps its last good version on view, with its
+/// error beside it; a recovery clears both the error and its notice. Only
+/// the latest two notices are kept.
+#[test]
+fn viewed_failure_keeps_the_view_and_recovery_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_named(dir.path(), "a", &flat_normal());
+    let b = write_named(dir.path(), "b", &rules::tapestry());
+    let c = write_named(dir.path(), "c", &rules::tapestry());
+    let (_, report) = played(dir.path(), "tapestry");
+    let mut shelf = shelf_of(dir.path(), "tapestry");
+    let mut s = ResultScreen::new(&report, &shelf, &chart(), game::RECORDING_MEMORY);
+    view(&mut s, &user("a"), &report);
+    let was = ready(&s);
+    common::rewrite(&a, "windows = [");
+    shelf.check();
+    s.sync(&report, &shelf, &chart());
+    assert_eq!(viewed(&s), user("a"));
+    assert_eq!(ready(&s), was);
+    let e = s.file_error().unwrap().clone();
+    assert_eq!(e.path, a);
+    rewrite_preset(&a, &flat_normal());
+    shelf.check();
+    s.sync(&report, &shelf, &chart());
+    assert_eq!(s.file_error(), None);
+    assert_eq!(s.notices().count(), 0);
+    assert_eq!(ready(&s), was);
+    // Three failures: the latest two are kept.
+    for p in [&a, &b, &c] {
+        common::rewrite(p, "windows = [");
+        shelf.check();
+        s.sync(&report, &shelf, &chart());
+    }
+    let failed: Vec<_> = s
+        .notices()
+        .map(|n| match n {
+            Notice::Failed(e) => e.path.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(failed, [b, c]);
+    assert_eq!(game::NOTICES, 2);
+}
+
+/// Past [`game::RESULT_CACHE`] presets viewed, the least recently viewed
+/// summary goes, never the viewed one: viewing it again evaluates it again.
+#[test]
+fn result_cache_evicts_the_least_recently_viewed() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = game::RESULT_CACHE + 1;
+    for i in 0..n {
+        let mut p = rules::tapestry();
+        p.gauges[0].start = rules::GaugeValue(p.gauges[0].start.0 + i64::try_from(i).unwrap());
+        write_named(dir.path(), &format!("p{i:02}"), &p);
+    }
+    let (loaded, report) = played(dir.path(), "tapestry");
+    let mut s = ResultScreen::new(&report, loaded.shelf(), &chart(), game::RECORDING_MEMORY);
+    // On the way, beatoraja-style and lr2-style are evaluated first.
+    view(&mut s, &user("p00"), &report);
+    let base = s.evaluations();
+    for _ in 1..n {
+        s.step(1, &report, &chart());
+        assert!(!ready(&s).as_played);
+    }
+    let last = user(&format!("p{:02}", n - 1));
+    assert_eq!(viewed(&s), last);
+    let evaluated = base + u64::try_from(n - 1).unwrap();
+    assert_eq!(s.evaluations(), evaluated);
+    assert_eq!(s.cached(), game::RESULT_CACHE);
+    // The viewed one stays cached.
+    s.step(0, &report, &chart());
+    assert_eq!(s.evaluations(), evaluated);
+    // p00 went with the two viewed before it: viewing it evaluates again.
+    s.step(-isize::try_from(n - 1).unwrap(), &report, &chart());
+    assert_eq!(viewed(&s), user("p00"));
+    assert_eq!(s.evaluations(), evaluated + 1);
+    assert_eq!(s.cached(), game::RESULT_CACHE);
+    // And the last one, viewed most recently but one, is still cached.
+    s.step(isize::try_from(n - 1).unwrap(), &report, &chart());
+    assert_eq!(viewed(&s), last);
+    assert_eq!(s.evaluations(), evaluated + 1);
+}
+
+/// A refused `tapestry.toml` sits beside the built-in `tapestry`: the view on
+/// the file stays on it across rebuilds, and switching never takes one
+/// for the other.
+#[test]
+fn duplicate_stem_beside_a_built_in_keeps_the_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let presets = dir.path().join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    std::fs::write(presets.join("tapestry.toml"), game::preset_to_toml(&late())).unwrap();
+    let other = write_named(dir.path(), "other", &rules::tapestry());
+    let (_, report) = played(dir.path(), "tapestry");
+    let mut shelf = shelf_of(dir.path(), "tapestry");
+    let mut s = ResultScreen::new(&report, &shelf, &chart(), game::RECORDING_MEMORY);
+    let file = user("tapestry");
+    let built_in = EntryId::BuiltIn("tapestry".to_owned());
+    assert_eq!(viewed(&s), built_in);
+    view(&mut s, &file, &report);
+    assert!(matches!(s.status(), ViewStatus::CannotLoad(_)));
+    for preset in [flat_normal(), late()] {
+        rewrite_preset(&other, &preset);
+        shelf.check();
+        assert!(s.sync(&report, &shelf, &chart()));
+        assert_eq!(viewed(&s), file);
+    }
+    let ids: Vec<_> = s.entries().iter().map(|e| e.id.clone()).collect();
+    assert_eq!(ids.iter().filter(|id| **id == file).count(), 1);
+    assert_eq!(ids.iter().filter(|id| **id == built_in).count(), 1);
+    s.step(-(isize::try_from(ids.len()).unwrap()), &report, &chart());
+    assert_eq!(viewed(&s), file);
+}
+
+/// With a built-in chosen, the presets folder cannot be listed, then can
+/// again with the same files: a notice says so, then goes; the view stays.
+#[test]
+fn a_listing_failure_is_noticed_then_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    write_named(dir.path(), "other", &rules::tapestry());
+    let (_, report) = played(dir.path(), "tapestry");
+    let presets = dir.path().join("presets");
+    let mut shelf = shelf_of(dir.path(), "tapestry");
+    let mut s = ResultScreen::new(&report, &shelf, &chart(), game::RECORDING_MEMORY);
+    let kept = presets.with_extension("kept");
+    std::fs::rename(&presets, &kept).unwrap();
+    // A file where the folder was: listing it fails.
+    std::fs::write(&presets, b"").unwrap();
+    shelf.check();
+    assert!(shelf.listing_error().is_some());
+    assert!(s.sync(&report, &shelf, &chart()));
+    assert!(matches!(
+        s.notices().cloned().collect::<Vec<_>>()[..],
+        [Notice::ListingFailed(_)]
+    ));
+    assert!(s.entries().iter().any(|e| e.id == user("other")));
+    std::fs::remove_file(&presets).unwrap();
+    std::fs::rename(&kept, &presets).unwrap();
+    shelf.check();
+    assert!(s.sync(&report, &shelf, &chart()));
+    assert_eq!(s.notices().count(), 0);
+    assert!(ready(&s).as_played);
 }
