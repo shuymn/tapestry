@@ -480,6 +480,7 @@ fn hidden_regions_and_offered_controls() {
         sheet: lanes_support::sheet(),
         lanes: None,
         elements: vec![image(WHITE, [0; 4], Place::SCREEN)],
+        widgets: skin_model::WidgetDefs::default(),
     })
     .unwrap();
     for r in Region::ALL {

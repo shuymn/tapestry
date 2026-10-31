@@ -572,6 +572,7 @@ fn gauge_max_from_an_initial_full_gauge() {
         skin_model::GaugeDesc {
             start: GaugeValue::FULL,
             max: GaugeValue::FULL,
+            ..GAUGES[0]
         },
         GAUGES[1],
     ];
