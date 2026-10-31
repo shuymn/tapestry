@@ -39,7 +39,7 @@
 //! it), and only the last of duplicate ordinary fields is resolved (the
 //! source reads every one and keeps the last).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use skin_model::{FileId, Root, RootError};
@@ -436,6 +436,13 @@ pub(crate) struct Tables {
     pub(crate) keys: Vec<u32>,
     /// Per destination: its keys' end in `keys`.
     pub(crate) key_ends: Vec<u32>,
+    /// The nested arrays of the play objects, by the field's node: the
+    /// `note` record's `dst`, `group`, `bpm`, `stop` and `time`, each
+    /// judge's `images` and `numbers`, and the `dst` of every destination
+    /// in them (`JsonSkinSerializer.java:69-94`: `Destination[]` and
+    /// `Animation[]` have array serializers). Primitive arrays stay
+    /// literal.
+    pub(crate) nested: HashMap<u32, Vec<u32>>,
 }
 
 impl Resolved<'_> {
@@ -477,6 +484,29 @@ impl Resolved<'_> {
                 *out = r.record(id, 2)?;
             }
         }
+        if let Some(note) = RECORDS
+            .iter()
+            .position(|n| *n == "note")
+            .and_then(|i| t.records.get(i).copied().flatten())
+        {
+            let [dst, group, bpm, stop, time] =
+                r.def.fields(note, ["dst", "group", "bpm", "stop", "time"]);
+            if let Some(dst) = dst {
+                r.nested_array(dst, 3, &mut t.nested)?;
+            }
+            for list in [group, bpm, stop, time].into_iter().flatten() {
+                r.nested_destinations(list, 3, &mut t.nested)?;
+            }
+        }
+        if let Some(i) = ARRAYS.iter().position(|n| *n == "judge") {
+            let judges = t.arrays.get(i).cloned().unwrap_or_default();
+            for judge in judges {
+                let [images, numbers] = r.def.fields(judge, ["images", "numbers"]);
+                for list in [images, numbers].into_iter().flatten() {
+                    r.nested_destinations(list, 4, &mut t.nested)?;
+                }
+            }
+        }
         let [.., destinations] = &t.arrays;
         let destinations = destinations.clone();
         for d in destinations {
@@ -500,6 +530,34 @@ struct Resolver<'d, 'e> {
 impl Resolver<'_, '_> {
     fn arena(&self) -> &Arena {
         &self.def.arena
+    }
+
+    /// The array field `id` at `depth`, resolved into `nested` under it.
+    fn nested_array(
+        &mut self,
+        id: u32,
+        depth: u32,
+        nested: &mut HashMap<u32, Vec<u32>>,
+    ) -> Result<Vec<u32>, ImportError> {
+        let mut out = Vec::new();
+        self.array(id, depth, &mut out)?;
+        nested.insert(id, out.clone());
+        Ok(out)
+    }
+
+    /// A `Destination[]` field at `depth`, and each destination's `dst`.
+    fn nested_destinations(
+        &mut self,
+        id: u32,
+        depth: u32,
+        nested: &mut HashMap<u32, Vec<u32>>,
+    ) -> Result<(), ImportError> {
+        for d in self.nested_array(id, depth, nested)? {
+            if let Some(dst) = self.def.fields(d, ["dst"])[0] {
+                self.nested_array(dst, depth + 2, nested)?;
+            }
+        }
+        Ok(())
     }
 
     /// Adds `record` to `out`, counting it first.

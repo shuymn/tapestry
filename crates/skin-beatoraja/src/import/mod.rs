@@ -1,6 +1,7 @@
-//! The mapping (S6b-1): a resolved definition's images, numbers and text
-//! to a [`skin_model::SkinDef`], with a [`Report`] of what was changed,
-//! dropped or ignored.
+//! The mapping: a resolved definition's images, numbers, text and play
+//! objects (lanes, SUDDEN+, LIFT, judge and gauge) to a
+//! [`skin_model::SkinDef`], with a [`Report`] of what was changed, dropped
+//! or ignored.
 //!
 //! [`import`] resolves the definition again with the configured options,
 //! walks the destinations in source order, maps each element (its role,
@@ -34,8 +35,8 @@ use skin_model::{
 pub use budget::ImportLimit;
 pub use policy::CriticalPart;
 pub use report::{
-    DeviationId, FileChoice, Note, NoteKind, NoteLoc, Object, PropertyKind, Report, Rule, Severity,
-    TimerWhy, TrackWhy, Usage,
+    DeviationId, FileChoice, LaneApprox, Note, NoteKind, NoteLoc, Object, PropertyKind, Report,
+    Rule, Severity, TimerWhy, TrackWhy, Usage,
 };
 
 use self::asset::{Assets, Choices};
@@ -104,6 +105,10 @@ impl Config {
 pub struct Imported {
     pub skin: Skin,
     pub report: Report,
+    /// The side the skin draws the scratch lane on; `None` without lanes.
+    /// The caller plays with it until the player has a setting (owner
+    /// decision 11).
+    pub scratch: Option<skin_model::Side>,
 }
 
 /// Every region anchored top left; a fixed-canvas skin uses only
@@ -115,6 +120,10 @@ const REGIONS: [RegionDef; Region::COUNT] = [RegionDef {
 
 /// The runtime offsets the play sets (`SkinProperty.java:943-947`).
 const RUNTIME_OFFSETS: std::ops::RangeInclusive<i32> = 1..=5;
+/// The offset that moves with LIFT (`SkinProperty.java:944`).
+const OFFSET_LIFT: i32 = 3;
+/// The offset SUDDEN+ moves (`SkinProperty.java:947`).
+const OFFSET_LANECOVER: i32 = 4;
 /// The all-elements offset, set by the player's settings (S11).
 const OFFSET_ALL: i32 = 10;
 /// The highest offset id (`SkinProperty.java:972`).
@@ -146,6 +155,7 @@ pub fn import(
     })?;
     let mut cx = Cx::new(def, header, config, tables, choices, r)?;
     let destinations = object::records(&cx.tables, "destination").to_vec();
+    cx.span_hint = cx.lane_span_hint(&destinations);
     for (index, rec) in destinations.into_iter().enumerate() {
         cx.destination(index, rec)?;
     }
@@ -185,6 +195,24 @@ enum Op {
     Name(String),
 }
 
+/// How [`Cx::common_with`] reads a destination.
+#[derive(Clone, Copy, Default)]
+struct Opts<'a> {
+    /// A `text`: no angle, the blend only noted.
+    text: bool,
+    /// Run-time offsets the element takes.
+    allow: &'a [i32],
+    /// A play widget's outer destination: the source's constructor key
+    /// at 0 joins the keys, every key is neutral (rect 0, white, opaque),
+    /// and blend and colour are not consumed.
+    neutral: bool,
+    /// The offsets are not consumed: noted, never refused.
+    no_offsets: bool,
+    /// A judge's combo: its digits, which shift each raw key left
+    /// ([`track::read`]).
+    digits: Option<i32>,
+}
+
 /// What the common part of an element decided.
 struct Common {
     role: Role,
@@ -200,6 +228,8 @@ struct Common {
     stretch: Stretch,
     stretch_mode: i32,
     untimed: bool,
+    /// The joined visibility source, empty when always visible.
+    cond_src: String,
 }
 
 /// The import's running state.
@@ -228,6 +258,13 @@ pub(crate) struct Cx<'d> {
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
     widgets: WidgetDefs,
+    /// The lanes, once the note destination is mapped.
+    lanes: Option<widget::lanes::LaneState>,
+    /// The lanes' rounded span, read ahead of the walk for the offset-4
+    /// rule; `None` without readable lanes.
+    span_hint: Option<[i128; 2]>,
+    /// The judge records already drawn.
+    judges: Vec<u32>,
 }
 
 /// A witness of the order of an import's work.
@@ -291,6 +328,9 @@ impl<'d> Cx<'d> {
             elements: Vec::new(),
             element_spans: Vec::new(),
             widgets: WidgetDefs::default(),
+            lanes: None,
+            span_hint: None,
+            judges: Vec::new(),
         };
         cx.config_notes();
         cx.custom_timers()?;
@@ -455,6 +495,40 @@ impl<'d> Cx<'d> {
     }
 
     fn read_dst(&mut self, index: usize, rec: u32) -> Result<(Option<String>, Dst), ImportError> {
+        let start = index
+            .checked_sub(1)
+            .and_then(|i| self.tables.key_ends.get(i))
+            .map_or(0, |&e| e as usize);
+        let end = self
+            .tables
+            .key_ends
+            .get(index)
+            .map_or(start, |&e| e as usize);
+        let keys = self
+            .tables
+            .keys
+            .get(start..end)
+            .unwrap_or_default()
+            .to_vec();
+        self.read_dst_keys(rec, keys)
+    }
+
+    /// A nested destination (a play object's), its keys resolved under
+    /// its `dst` field.
+    fn read_nested(&mut self, rec: u32) -> Result<(Option<String>, Dst), ImportError> {
+        let keys = match self.def.fields(rec, ["dst"]) {
+            [Some(f)] => self.tables.nested.get(&f).cloned().unwrap_or_default(),
+            [None] => Vec::new(),
+        };
+        self.read_dst_keys(rec, keys)
+    }
+
+    /// A destination record's fields with `keys` as its `dst`.
+    fn read_dst_keys(
+        &mut self,
+        rec: u32,
+        keys: Vec<u32>,
+    ) -> Result<(Option<String>, Dst), ImportError> {
         let [
             id,
             blend,
@@ -502,21 +576,6 @@ impl<'d> Cx<'d> {
                 }
             }
         }
-        let start = index
-            .checked_sub(1)
-            .and_then(|i| self.tables.key_ends.get(i))
-            .map_or(0, |&e| e as usize);
-        let end = self
-            .tables
-            .key_ends
-            .get(index)
-            .map_or(start, |&e| e as usize);
-        let keys = self
-            .tables
-            .keys
-            .get(start..end)
-            .unwrap_or_default()
-            .to_vec();
         let dst = Dst {
             span: self.arena_span(rec),
             blend: self.int_or(blend, "blend", 0)?,
@@ -561,31 +620,48 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
-        let part = match object {
-            Object::Note => Some(CriticalPart::Lanes),
-            Object::Judge => Some(CriticalPart::Judge),
-            Object::Gauge => Some(CriticalPart::Gauge),
-            Object::HiddenCover => Some(CriticalPart::Cover),
-            Object::LiftCover => Some(CriticalPart::Lift),
-            _ => None,
-        };
-        if let Some(part) = part {
+        // The source draws the character when its file exists and the
+        // notes otherwise: one id cannot be both.
+        if object == Object::PmChara && self.objects.is_note(self.def, &self.tables, &id)? {
             return Err(ImportError::Critical {
                 at: self.loc(at),
-                part,
-                why: NoteKind::NotYet { object },
+                part: CriticalPart::Lanes,
+                why: NoteKind::UnsupportedField { field: "id" },
             });
         }
+        // Only an image can be decorative while it lists SUDDEN+'s offset
+        // (`widget::lanes`).
+        let image = matches!(object, Object::Image | Object::ImageSet);
+        if !image && object != Object::HiddenCover && dst.offsets.contains(&OFFSET_LANECOVER) {
+            return Err(ImportError::Critical {
+                at: self.loc(at),
+                part: CriticalPart::Cover,
+                why: NoteKind::RuntimeOffset(OFFSET_LANECOVER),
+            });
+        }
+        let lanes = self.elements.len();
         match object {
-            Object::Image => self.image(dst, orec, None),
-            Object::ImageSet => self.image_set(dst, orec),
-            Object::Value => self.number(dst, orec),
-            Object::Text => self.text(dst, orec),
+            Object::Image => self.image(dst, orec, None)?,
+            Object::ImageSet => self.image_set(dst, orec)?,
+            Object::Value => self.number(dst, orec)?,
+            Object::Text => self.text(dst, orec)?,
+            Object::Note => self.lanes_element(dst, orec)?,
+            Object::HiddenCover => self.hidden_cover(at),
+            Object::LiftCover => self.lift_cover(dst, orec)?,
+            Object::Judge => self.judge(dst, orec)?,
+            Object::Gauge => self.gauge(dst, orec)?,
             _ => {
                 self.drop_el(Role::Decorative, at, NoteKind::Unsupported { object })?;
-                Ok(())
             }
         }
+        // An element kept after the notes is drawn below SUDDEN+ and LIFT.
+        if object != Object::Note
+            && self.elements.len() > lanes
+            && let Some(l) = self.lanes.as_mut()
+        {
+            l.kept_after = true;
+        }
+        Ok(())
     }
 
     /// The common part of an element: track, conditions,
@@ -596,16 +672,56 @@ impl<'d> Cx<'d> {
     /// (`SkinTextFont.java:158-176`): its keys' angles are cleared before
     /// the track is accepted, and an angle or a blend is only noted.
     fn common(&mut self, role: Role, dst: &Dst, text: bool) -> Result<Option<Common>, ImportError> {
+        self.common_with(
+            role,
+            dst,
+            Opts {
+                text,
+                ..Opts::default()
+            },
+        )
+    }
+
+    /// [`Self::common`] read as `o` says.
+    fn common_with(
+        &mut self,
+        role: Role,
+        dst: &Dst,
+        o: Opts<'_>,
+    ) -> Result<Option<Common>, ImportError> {
+        let text = o.text;
         let at = dst.span;
         if dst.mouse {
             self.ignored(at, NoteKind::Ignored { field: "mouseRect" });
         }
-        // Keys: charged as written, before the track is built.
+        let mut keys = track::read(self.def, &dst.keys, o.digits)?;
+        if o.neutral {
+            // The constructor's key at 0 (`SkinObject.java:234-254`), then
+            // the destination's times; values are not consumed.
+            keys.keys.push(track::SrcKey::NEUTRAL);
+            for k in &mut keys.keys {
+                *k = track::SrcKey {
+                    at: k.at,
+                    ..track::SrcKey::NEUTRAL
+                };
+            }
+            if keys.clip {
+                self.ignored(at, NoteKind::Ignored { field: "clip" });
+                keys.clip = false;
+            }
+        }
+        // Keys: charged as written, or as emitted when more (a neutral
+        // track emits its first and last), before the track is built.
+        let emitted = if o.neutral {
+            let last = keys.keys.iter().map(|k| k.at).max().unwrap_or(0);
+            1 + usize::from(last > 0)
+        } else {
+            0
+        };
         let fits = self
             .budget
-            .keys(dst.keys.len())
+            .keys(dst.keys.len().max(emitted))
             .map_err(|l| self.limit(at, l))?;
-        let mut keys = track::read(self.def, &dst.keys)?;
         let mut text_angle = false;
         if text {
             for k in &mut keys.keys {
@@ -729,7 +845,14 @@ impl<'d> Cx<'d> {
         }
         let mut offset = Offset::default();
         let mut alpha: Vec<i64> = Vec::new();
+        if o.no_offsets && !ids.is_empty() {
+            self.ignored(at, NoteKind::Ignored { field: "offset" });
+            ids.clear();
+        }
         for id in ids {
+            if o.allow.contains(&id) {
+                continue;
+            }
             if RUNTIME_OFFSETS.contains(&id) {
                 self.drop_el(role, at, NoteKind::RuntimeOffset(id))?;
                 return Ok(None);
@@ -753,6 +876,15 @@ impl<'d> Cx<'d> {
             }
         }
         let mut track = track;
+        if o.neutral && !alpha.is_empty() {
+            self.ignored(
+                at,
+                NoteKind::Ignored {
+                    field: "offset alpha",
+                },
+            );
+            alpha.clear();
+        }
         if !alpha.is_empty() {
             let same_sign = alpha.iter().all(|&a| a > 0) || alpha.iter().all(|&a| a < 0);
             if !track.fixed_color() || !same_sign {
@@ -773,7 +905,7 @@ impl<'d> Cx<'d> {
                 self.ignored(at, NoteKind::Ignored { field: "blend 3" });
                 Blend::Add
             }
-            4 | 9 if text => {
+            4 | 9 if text || o.neutral => {
                 self.ignored(at, NoteKind::Ignored { field: "blend" });
                 Blend::Alpha
             }
@@ -785,18 +917,18 @@ impl<'d> Cx<'d> {
         };
 
         // Visibility, compiled after its charges.
+        let mut src = String::new();
+        for c in &conds {
+            if !src.is_empty() {
+                src.push_str(" && ");
+            }
+            src.push('(');
+            src.push_str(c);
+            src.push(')');
+        }
         let visible = if conds.is_empty() {
             None
         } else {
-            let mut src = String::new();
-            for c in &conds {
-                if !src.is_empty() {
-                    src.push_str(" && ");
-                }
-                src.push('(');
-                src.push_str(c);
-                src.push(')');
-            }
             Some(self.compile(&src, Ty::Bool, at)?)
         };
 
@@ -824,6 +956,7 @@ impl<'d> Cx<'d> {
             stretch_mode: dst.stretch,
             untimed,
             track,
+            cond_src: src,
         }))
     }
 
@@ -1025,7 +1158,7 @@ impl<'d> Cx<'d> {
             regions: REGIONS,
             whens: std::mem::take(&mut self.whens),
             sheet,
-            lanes: None,
+            lanes: self.lanes.as_ref().map(widget::lanes::LaneState::def),
             elements: std::mem::take(&mut self.elements),
             widgets: std::mem::take(&mut self.widgets),
         };
@@ -1047,7 +1180,11 @@ impl<'d> Cx<'d> {
             suppressed: self.notes.suppressed,
             usage: self.budget.usage,
         };
-        Ok(Imported { skin, report })
+        Ok(Imported {
+            skin,
+            report,
+            scratch: self.lanes.as_ref().map(|l| l.def.scratch),
+        })
     }
 
     /// Where a model error points: the element or `when` it names.
@@ -1068,6 +1205,9 @@ impl<'d> Cx<'d> {
             | LoadError::Judge { element, .. }
             | LoadError::Text { element, .. } => Some(self.element_spans.get(element)?),
             LoadError::WhenNotBool { when } => Some(self.when_spans.get(when)?),
+            LoadError::Lanes(_) | LoadError::LanesTwice | LoadError::LanesRegion => {
+                Some(&self.lanes.as_ref()?.span)
+            }
             _ => None,
         };
         element.map(|&s| self.loc(s))

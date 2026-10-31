@@ -161,6 +161,16 @@ impl Rect {
         })
     }
 
+    /// With the offsets of a relative object applied: only its size
+    /// (`SkinObject.java:403-411`).
+    pub(crate) fn offset_relative(self, o: Offset) -> Option<Self> {
+        Some(Self {
+            w: self.w.add(Q::int(o.w))?,
+            h: self.h.add(Q::int(o.h))?,
+            ..self
+        })
+    }
+
     /// The edges reflected to y down and rounded half up: left, top,
     /// right, bottom.
     pub(crate) fn edges(self) -> Option<[i128; 4]> {

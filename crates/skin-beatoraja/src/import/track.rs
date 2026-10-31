@@ -21,6 +21,14 @@ pub(crate) struct SrcKey {
 }
 
 impl SrcKey {
+    /// A key at 0 drawing nothing of its own: rect 0, white, opaque.
+    pub(crate) const NEUTRAL: Self = Self {
+        at: 0,
+        rect: [0; 4],
+        color: [255; 4],
+        angle: 0,
+    };
+
     fn same_values(&self, o: &Self) -> bool {
         self.rect == o.rect && self.color == o.color && self.angle == o.angle
     }
@@ -42,7 +50,16 @@ pub(crate) struct Keys {
 /// fields default to 0 (255 for colour), a later key's to the previous
 /// key's. Colour is clamped per key, as libGDX's `Color` constructor
 /// does (`Color.java:88` at 1.9.9).
-pub(crate) fn read(def: &mut Definition, ids: &[u32]) -> Result<Keys, ImportError> {
+///
+/// With `digits`, each key's raw `x` first moves left by half `w` times
+/// the digits, in the source's wrapping `int` arithmetic and before any
+/// inheritance, as a judge's combo does
+/// (`JsonPlaySkinObjectLoader.java:268-270`).
+pub(crate) fn read(
+    def: &mut Definition,
+    ids: &[u32],
+    digits: Option<i32>,
+) -> Result<Keys, ImportError> {
     const FIELDS: [&str; 15] = [
         "time", "x", "y", "w", "h", "acc", "a", "r", "g", "b", "angle", "clip_x", "clip_y",
         "clip_w", "clip_h",
@@ -74,6 +91,9 @@ pub(crate) fn read(def: &mut Definition, ids: &[u32]) -> Result<Keys, ImportErro
             if let Some(f) = field {
                 *slot = def.int(f, name)?;
             }
+        }
+        if let (Some(d), [_, x, _, w, ..]) = (digits, &mut v) {
+            *x = x.wrapping_sub(w.wrapping_mul(d) / 2);
         }
         for (i, slot) in v.iter_mut().enumerate() {
             if *slot == i32::MIN {

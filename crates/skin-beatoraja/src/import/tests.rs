@@ -143,3 +143,109 @@ fn the_location_pass_walks_each_file_once() {
         assert_eq!((at.line, at.col), (3 + u32::try_from(k).unwrap(), 1));
     }
 }
+
+/// Lanes of image `p` (x 20..450, y 200, 600 tall) with `objects` and the
+/// destinations `dsts` after the notes; image `bad` reads `bad.png`.
+fn lanes(objects: &str, dsts: &str) -> String {
+    let eight = format!("[{}]", [r#""p""#; 8].join(", "));
+    let mut rects: Vec<String> = (0..7)
+        .map(|i| format!(r#"{{"x": {}, "y": 200, "w": 50, "h": 600}}"#, 100 + 50 * i))
+        .collect();
+    rects.push(r#"{"x": 20, "y": 200, "w": 80, "h": 600}"#.to_owned());
+    let lists = ["note", "lnstart", "lnend", "lnbody", "lnactive", "mine"]
+        .into_iter()
+        .chain([
+            "hcnstart",
+            "hcnend",
+            "hcnbody",
+            "hcnactive",
+            "hcndamage",
+            "hcnreactive",
+        ])
+        .map(|f| format!(r#""{f}": {eight}"#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sep = if objects.is_empty() { "" } else { ", " };
+    format!(
+        r#"{{"type": 0, "w": 1920, "h": 1080,
+            "source": [{{"id": "a", "path": "a.png"}}, {{"id": "b", "path": "bad.png"}}],
+            "image": [{{"id": "p", "src": "a", "w": 8, "h": 20}},
+                      {{"id": "cv", "src": "a", "w": 16, "h": 16}},
+                      {{"id": "bad", "src": "b", "w": 8, "h": 8}}],
+            "note": {{"id": "notes", {lists}, "dst": [{}]}}{sep}{objects},
+            "destination": [{{"id": "notes", "dst": [{{"w": 0, "h": 0}}]}}{dsts}]}}"#,
+        rects.join(", ")
+    )
+}
+
+/// A LIFT object of source `src` and its destination.
+fn lift(id: &str, src: &str) -> (String, String) {
+    (
+        format!(r#"{{"id": "{id}", "src": "{src}", "w": 8, "h": 8, "disapearLine": 200}}"#),
+        format!(r#", {{"id": "{id}", "dst": [{{"x": 20, "y": 0, "w": 430, "h": 200}}]}}"#),
+    )
+}
+
+#[test]
+fn refused_and_ignored_covers_admit_nothing() {
+    let (r, _, base) = run(&lanes("", ""));
+    r.unwrap();
+    assert_eq!(base, 1);
+    // HIDDEN+ of the malformed file.
+    let hidden = lanes(
+        r#""hiddenCover": [{"id": "hid", "src": "b", "w": 8, "h": 8}]"#,
+        r#", {"id": "hid", "dst": [{"x": 20, "y": 200, "w": 430, "h": 600}]}"#,
+    );
+    let (r, _, admits) = run(&hidden);
+    r.unwrap();
+    assert_eq!(admits, base);
+    // A second LIFT of the malformed file.
+    let (o1, d1) = lift("l1", "a");
+    let (o2, d2) = lift("l2", "b");
+    let (r, _, admits) = run(&lanes(
+        &format!(r#""liftCover": [{o1}, {o2}]"#),
+        &format!("{d1}{d2}"),
+    ));
+    assert!(matches!(
+        r,
+        Err(ImportError::Critical {
+            part: super::CriticalPart::Lift,
+            ..
+        })
+    ));
+    assert_eq!(admits, base);
+    // An offset-4 image that may reach the lanes, of the malformed file.
+    let (r, _, admits) = run(&lanes(
+        "",
+        r#", {"id": "bad", "offset": 4, "dst": [{"x": 0, "y": 0, "w": 100, "h": 8}]}"#,
+    ));
+    assert!(matches!(
+        r,
+        Err(ImportError::Critical {
+            part: super::CriticalPart::Cover,
+            ..
+        })
+    ));
+    assert_eq!(admits, base);
+}
+
+#[test]
+fn a_rejected_lane_approximation_refuses() {
+    use super::widget::lanes::REJECTED;
+    use super::{DeviationId, LaneApprox};
+    let (r, ..) = run(&lanes("", ""));
+    r.unwrap();
+    REJECTED.with(|c| c.set(Some(LaneApprox::LateTaps)));
+    let (r, ..) = run(&lanes("", ""));
+    REJECTED.with(|c| c.set(None));
+    match r {
+        Err(ImportError::Critical { part, why, .. }) => assert_eq!(
+            (part, why),
+            (
+                super::CriticalPart::Lanes,
+                NoteKind::Deviation(DeviationId::D9(LaneApprox::LateTaps))
+            )
+        ),
+        other => panic!("{:?}", other.map(|i| i.report)),
+    }
+}

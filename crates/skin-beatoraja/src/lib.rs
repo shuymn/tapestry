@@ -47,7 +47,8 @@ mod tree;
 pub use error::{ImportError, InputLimit, Loc, Syntax};
 pub use header::{FileSpec, Header, OffsetSpec, OptionItem, OptionSpec, SIZES, read_header};
 pub use import::{
-    Config, CriticalPart, DeviationId, FileChoice, ImportLimit, Imported, Note, NoteKind, NoteLoc,
-    Object, OffsetValue, PropertyKind, Report, Rule, Severity, TimerWhy, TrackWhy, Usage, import,
+    Config, CriticalPart, DeviationId, FileChoice, ImportLimit, Imported, LaneApprox, Note,
+    NoteKind, NoteLoc, Object, OffsetValue, PropertyKind, Report, Rule, Severity, TimerWhy,
+    TrackWhy, Usage, import,
 };
 pub use resolve::{Definition, Resolved, resolve};

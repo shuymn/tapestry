@@ -27,12 +27,34 @@
 //! 10. Text content and layout fallbacks: literals cut at 256 bytes,
 //!     control characters removed, overflow 2 shrinks, outline, shadow and
 //!     wrapping removed (D6, [`super::widget::text`]).
+//! 11. The scratch side of an imported skin: the side the skin draws it
+//!     on, given to the caller as `Imported::scratch` (a setting comes
+//!     with S11).
+//! 12. The lane approximations (D9, [`LaneApprox`]), each accepted by
+//!     default ([`lane_approx_accepted`]): a notes and long-note bodies
+//!     stop at the top of the lanes; b an unhit tap keeps falling below
+//!     the line until it is judged a miss or leaves the lanes; c a tap hit
+//!     early disappears at once; d a hit mine disappears when hit (an unhit
+//!     one leaves at its time, as the source does); e `dst2` is ignored;
+//!     f `expansionrate` is ignored; g a long note's end cap is drawn and a
+//!     skin without one is refused; h a long note's body runs between the
+//!     caps' centres; i the part of SUDDEN+ above the lanes is never
+//!     drawn; j bar lines are drawn across the lanes at note centres, white
+//!     and opaque, until they leave the lanes' bottom, also before the
+//!     chart starts and through a STOP; k what the skin draws between the
+//!     notes and SUDDEN+ or LIFT is drawn above them; l the LIFT image is
+//!     stretched over the covered area.
+//! 13. A bar line outside the accepted mapping is dropped with a note
+//!     instead of refusing the skin ([`super::widget::lanes`]).
+//! 14. Judgment and gauge parts that move with LIFT (offset 3) are
+//!     refused, as every run-time offset on them is.
+//! 15. HIDDEN+ is never drawn (D11): the skin imports with a note.
 
 use std::fmt;
 
 use skin_model::End;
 
-use super::report::{NoteKind, Notes, Severity, Span};
+use super::report::{LaneApprox, NoteKind, Notes, Severity, Span};
 use crate::error::ImportError;
 use crate::tree::Arena;
 
@@ -41,15 +63,15 @@ use crate::tree::Arena;
 pub enum CriticalPart {
     ExScore,
     MaxCombo,
-    /// The note lanes (imported later).
+    /// The note lanes.
     Lanes,
-    /// The judgment display (imported later).
+    /// The judgment display.
     Judge,
-    /// The gauge (imported later).
+    /// The gauge.
     Gauge,
-    /// The lane cover (imported later).
+    /// The SUDDEN+ cover.
     Cover,
-    /// The lift (imported later).
+    /// The LIFT cover.
     Lift,
 }
 
@@ -61,8 +83,8 @@ impl fmt::Display for CriticalPart {
             Self::Lanes => "note lanes",
             Self::Judge => "judgment display",
             Self::Gauge => "gauge",
-            Self::Cover => "lane cover",
-            Self::Lift => "lift",
+            Self::Cover => "SUDDEN+ cover",
+            Self::Lift => "LIFT cover",
         })
     }
 }
@@ -102,4 +124,23 @@ pub(crate) fn unsupported(
 /// first at 0, a perpetual end, and an image cycle absent or on a timer.
 pub(crate) fn untimed_ok(identical: bool, first_at_zero: bool, end: End, cycle_ok: bool) -> bool {
     identical && first_at_zero && matches!(end, End::Hold | End::Loop { .. }) && cycle_ok
+}
+
+/// Whether the owner accepts lane approximation `a` (decision 12): all
+/// are accepted.
+pub(crate) fn lane_approx_accepted(a: LaneApprox) -> bool {
+    match a {
+        LaneApprox::TopCrop
+        | LaneApprox::LateTaps
+        | LaneApprox::EarlyTaps
+        | LaneApprox::Mines
+        | LaneApprox::Dst2
+        | LaneApprox::Expansion
+        | LaneApprox::LnTail
+        | LaneApprox::LnBody
+        | LaneApprox::CoverAbove
+        | LaneApprox::BarLine
+        | LaneApprox::CoverOrder
+        | LaneApprox::LiftStretch => true,
+    }
 }

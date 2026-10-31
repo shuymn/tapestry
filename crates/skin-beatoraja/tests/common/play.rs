@@ -68,6 +68,8 @@ pub struct Drawn {
     pub tally: Tally,
     pub gauges: Vec<GaugeState>,
     pub batch: QuadBatch,
+    /// The hi-speed and covers each frame shows.
+    pub view: LaneView,
 }
 
 /// A chart with `notes` notes on lane 1, one every 10 ms from 1 s.
@@ -85,6 +87,11 @@ fn chart(notes: u32) -> bms_model::Chart {
 
 impl Drawn {
     pub fn new(skin: Skin, notes: u32) -> Self {
+        Self::over(skin, &chart(notes))
+    }
+
+    /// `skin` played over `chart`.
+    pub fn over(skin: Skin, chart: &bms_model::Chart) -> Self {
         let uvs = skin.atlas(Variant::Lo, LIMITS).unwrap().into_parts().1;
         let ctx = PlayContext {
             gauges: &GAUGES,
@@ -92,7 +99,7 @@ impl Drawn {
             empty_poor_breaks_combo: false,
             scratch: Side::Left,
         };
-        let play = skin.prepare(&chart(notes), &ctx).unwrap();
+        let play = skin.prepare(chart, &ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
             skin,
@@ -105,6 +112,11 @@ impl Drawn {
                 failed_at: None,
             }],
             batch,
+            view: LaneView {
+                visible_time: TimeUs(600 * MS),
+                cover: 0,
+                lift: 0,
+            },
         }
     }
 
@@ -147,11 +159,7 @@ impl Drawn {
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
-            lanes: LaneView {
-                visible_time: TimeUs(600 * MS),
-                cover: 0,
-                lift: 0,
-            },
+            lanes: self.view,
         };
         self.skin
             .build(&mut self.play, &frame, &self.uvs, &mut self.batch);

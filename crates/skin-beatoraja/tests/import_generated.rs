@@ -32,7 +32,10 @@ fn key() -> impl Strategy<Value = String> {
 
 fn destination() -> impl Strategy<Value = String> {
     (
-        prop::sample::select(vec!["img", "cyc", "ex", "pg", "big", "txt", "fnt", "none"]),
+        prop::sample::select(vec![
+            "img", "cyc", "ex", "pg", "big", "txt", "fnt", "none", "notes", "cover", "liftc",
+            "hid", "j", "gg",
+        ]),
         prop::collection::vec(key(), 1..5),
         prop::sample::select(vec![-1, 0, 50, 100, 500]),
         prop::sample::select(vec!["", r#""timer": 0,"#, r#""timer": 2,"#, r#""timer": 41,"#,
@@ -41,17 +44,53 @@ fn destination() -> impl Strategy<Value = String> {
         prop::sample::select(vec![0, 2, 3, 4]),
         prop::sample::select(vec![-1, 1, 4, 5, 9]),
         0..12_i32,
-        prop::bool::ANY,
+        prop::sample::select(vec!["", r#""offset": 40,"#, r#""offset": 4,"#, r#""offset": 3,"#]),
     )
         .prop_map(|(id, keys, l, timer, ops, blend, stretch, center, offset)| {
             let ops = ops.iter().map(i32::to_string).collect::<Vec<_>>().join(",");
-            let offset = if offset { r#""offset": 40,"# } else { "" };
             format!(
                 r#"{{"id": "{id}", {timer} {offset} "loop": {l}, "op": [{ops}], "blend": {blend},
                     "stretch": {stretch}, "center": {center}, "dst": [{}]}}"#,
                 keys.join(",")
             )
         })
+}
+
+/// The play objects: lanes, LIFT, HIDDEN+, a judge and a gauge.
+fn play_objects() -> String {
+    let eight = |id: &str| format!("[{}]", vec![format!("\"{id}\""); 8].join(", "));
+    let mut rects: Vec<String> = (0..7)
+        .map(|i| format!(r#"{{"x": {}, "y": 140, "w": 30, "h": 400}}"#, 100 + 30 * i))
+        .collect();
+    rects.push(r#"{"x": 40, "y": 140, "w": 60, "h": 400}"#.to_owned());
+    let lists = [
+        "note",
+        "lnstart",
+        "lnend",
+        "lnbody",
+        "lnactive",
+        "mine",
+        "hcnstart",
+        "hcnend",
+        "hcnbody",
+        "hcnactive",
+        "hcndamage",
+        "hcnreactive",
+    ]
+    .map(|f| format!(r#""{f}": {}"#, eight("img")))
+    .join(", ");
+    format!(
+        r#""note": {{"id": "notes", {lists}, "dst": [{}],
+                     "group": [{{"id": "img", "dst": [{{"x": 0, "y": 0, "w": 8, "h": 2}}]}}]}},
+           "liftCover": [{{"id": "liftc", "src": "a", "w": 8, "h": 8, "disapearLine": 140}}],
+           "hiddenCover": [{{"id": "hid", "src": "a", "w": 8, "h": 8}}],
+           "judge": [{{"id": "j", "index": 0, "shift": true,
+                      "images": [{{"id": "img", "dst": [{{"x": 300, "y": 300, "w": 60, "h": 20}}]}}],
+                      "numbers": [{{"id": "pg", "dst": [{{"x": 0, "y": 0, "w": 10, "h": 20}}]}}]}}],
+           "gauge": {{"id": "gg", "nodes": ["img", "img", "img", "img"], "parts": 50,
+                      "type": 3, "cycle": 100}}"#,
+        rects.join(", ")
+    )
 }
 
 fn skin_json(dsts: &[String]) -> String {
@@ -64,7 +103,8 @@ fn skin_json(dsts: &[String]) -> String {
             "customTimers": [{{"id": 10000, "timer": 41}}],
             "image": [
                 {{"id": "img", "src": "a", "x": 0, "y": 0, "w": 64, "h": 64}},
-                {{"id": "cyc", "src": "a", "w": 64, "h": 32, "divx": 2, "timer": 46, "cycle": 50}}
+                {{"id": "cyc", "src": "a", "w": 64, "h": 32, "divx": 2, "timer": 46, "cycle": 50}},
+                {{"id": "cover", "src": "a", "w": 16, "h": 16}}
             ],
             "value": [
                 {{"id": "ex", "src": "a", "w": 60, "h": 6, "divx": 10, "digit": 4, "ref": 71}},
@@ -76,7 +116,9 @@ fn skin_json(dsts: &[String]) -> String {
                 {{"id": "txt", "font": "f", "size": 20, "ref": 10, "align": 1}},
                 {{"id": "fnt", "font": "b", "size": 20, "constantText": "x\u0007y", "overflow": 2}}
             ],
+            {},
             "destination": [{}]}}"#,
+        play_objects(),
         dsts.join(",")
     )
 }
@@ -108,4 +150,25 @@ proptest! {
             Err(_) => {}
         }
     }
+}
+
+/// The grammar's play objects import when placed exactly.
+#[test]
+fn the_play_objects_import() {
+    let dsts = [
+        r#"{"id": "notes", "dst": [{"w": 0, "h": 0}]}"#,
+        r#"{"id": "cover", "offset": 4, "dst": [{"x": 40, "y": 540, "w": 270, "h": 400}]}"#,
+        r#"{"id": "liftc", "dst": [{"x": 40, "y": 0, "w": 270, "h": 140}]}"#,
+        r#"{"id": "hid", "dst": [{"x": 40, "y": 140, "w": 270, "h": 400}]}"#,
+        r#"{"id": "j", "dst": [{"w": 0, "h": 0}]}"#,
+        r#"{"id": "gg", "dst": [{"x": 0, "y": 0, "w": 100, "h": 10}]}"#,
+    ]
+    .map(str::to_owned);
+    let dir = skin(&[("s.json", &skin_json(&dsts))]);
+    png(dir.path(), "a.png", 64, 64);
+    font(dir.path(), "f.ttf");
+    let (mut def, header) = read_header(dir.path(), "s.json").unwrap();
+    let imported = import(&mut def, &header, &Config::defaults(&header)).unwrap();
+    assert!(imported.scratch.is_some());
+    assert_eq!(imported.report.usage.widget_quads, 51 + 4);
 }
