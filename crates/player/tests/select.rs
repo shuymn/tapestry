@@ -200,9 +200,14 @@ fn result_switches_presets_on_the_real_threads() {
     assert!(evaluated[0].starts_with("result: evaluated lr2-style in "));
     assert!(evaluated[1].starts_with("result: evaluated tapestry in "));
     assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
-    assert_eq!(
-        lines(&stdout, "select: 1 charts listed").len(),
-        2,
+    // Back returns to selection. The first entry may list the chart only
+    // once the scan has read it, so only the listing after the result
+    // counts.
+    let all: Vec<&str> = stdout.lines().collect();
+    let last_view = all.iter().rposition(|l| l.starts_with("result: viewing "));
+    let back = all.iter().rposition(|l| *l == "select: 1 charts listed");
+    assert!(
+        matches!((last_view, back), (Some(v), Some(b)) if v < b),
         "{stdout}"
     );
 }

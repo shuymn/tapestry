@@ -35,9 +35,14 @@ jobs:
       # Only the tools in install_args are needed; keep `mise exec` from
       # installing the rest on demand.
       MISE_EXEC_AUTO_INSTALL: "false"
-      # One target directory, so criterion's saved baseline of the merge
-      # base is the one the head run compares against.
+      # The head builds here and the merge base into a directory of its own:
+      # cargo gives a workspace crate's artifacts the same name in both
+      # checkouts and judges them by modification time, so in one shared
+      # directory the head run can reuse the merge base's binaries.
+      # Criterion's results share one directory, so the head run compares
+      # against the baseline the merge base saved.
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CRITERION_HOME: ${{ github.workspace }}/target/criterion
     steps:
       # The head commit itself, not the merge commit a pull request would
       # check out by default, and the full history to find the merge base.
@@ -75,7 +80,7 @@ jobs:
           if [ -f "$RUNNER_TEMP/base/crates/skin-model/benches/build.rs" ]; then
             benches+=(-p skin-model --bench build)
           fi
-          if mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" "${benches[@]}" -- --save-baseline base; then
+          if CARGO_TARGET_DIR="$RUNNER_TEMP/base-target" mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" "${benches[@]}" -- --save-baseline base; then
             echo "saved=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::The benchmarks of the merge base failed."
@@ -113,6 +118,7 @@ jobs:
     env:
       MISE_EXEC_AUTO_INSTALL: "false"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CRITERION_HOME: ${{ github.workspace }}/target/criterion
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -135,7 +141,7 @@ jobs:
             echo "::notice::The merge base has no render benchmark; there is nothing to compare."
             exit 0
           fi
-          if mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" -p render --bench skin -- --save-baseline base; then
+          if CARGO_TARGET_DIR="$RUNNER_TEMP/base-target" mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" -p render --bench skin -- --save-baseline base; then
             echo "saved=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::The render benchmark of the merge base failed."
