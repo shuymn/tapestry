@@ -3,9 +3,12 @@
 //! links are followed and must stay inside, reads and listings are bounded
 //! before any content is read or any entry examined.
 
+mod image_support;
+
 use std::fs::{self, File};
 use std::path::Path;
 
+use image_support::link_dir;
 use skin_model::{Entry, MAX_PATH_BYTES, Root, RootError};
 use tempfile::TempDir;
 
@@ -17,25 +20,6 @@ fn write(root: &Path, name: &str, bytes: &[u8]) {
     let path = root.join(name);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
-}
-
-/// A directory junction on Windows, a symbolic link elsewhere.
-fn link_dir(link: &Path, target: &Path) {
-    #[cfg(windows)]
-    {
-        let status = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(link)
-            .arg(target)
-            .stdout(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
 }
 
 #[test]

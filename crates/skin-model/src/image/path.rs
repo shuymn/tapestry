@@ -232,9 +232,7 @@ impl Root {
     /// may not step above the folder; then the canonical path, links
     /// followed, must stay inside the folder.
     fn locate(&self, name: &str) -> Result<(PathBuf, String), RootError> {
-        if !is_relative_form(name) {
-            return Err(RootError::Rejected);
-        }
+        Self::check_name(name)?;
         let normal = normalise(name).ok_or(RootError::Underflow)?;
         let canonical = match self.dir.join(&normal).canonicalize() {
             Ok(c) => c,
