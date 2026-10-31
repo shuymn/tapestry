@@ -710,3 +710,90 @@ fn user_preset_named_like_a_built_in_is_refused() {
         "eval-cli: tapestry.toml: `tapestry` is the name of a built-in preset"
     );
 }
+
+/// The memory budget an evaluation is admitted against.
+const BUDGET: usize = 512 << 20;
+
+/// The tapestry preset with `n` gauges, each a copy of its first under its
+/// own id and lamp.
+fn many_gauges(n: u16) -> RulePreset {
+    let mut p = rules::tapestry();
+    p.id = "many".to_owned();
+    let first = p.gauges[0].clone();
+    p.gauges = (0..n)
+        .map(|i| {
+            let mut g = first.clone();
+            g.id = format!("g{i}");
+            g.lamp = i;
+            g
+        })
+        .collect();
+    p
+}
+
+/// A record whose evaluation under its own preset copy, or under a preset
+/// file, would need more than the budget is refused with what it needs,
+/// without being evaluated.
+#[test]
+fn a_record_over_the_memory_budget_is_refused() {
+    let dir = folder();
+    let preset = many_gauges(2_000);
+    let mut record = played(CHART);
+    // Presses and releases of key 1 every 100 µs before the first note.
+    record.events = (0..10_000)
+        .map(|i| press(100 * (i + 1), i32::from(i % 2 == 0)))
+        .collect();
+    let chart = load_bms(CHART.as_bytes(), dir.path(), &LoadOptions::default())
+        .unwrap()
+        .chart;
+    let needed = replay::verify::batch_bytes(&record, &chart, &preset).unwrap();
+    assert!(needed > BUDGET, "{needed}");
+    let refused =
+        format!("refused: evaluating the record needs {needed} bytes, over the budget of {BUDGET}");
+
+    // Under its own preset copy.
+    let mut own = record.clone();
+    own.preset = PresetRecord::of(&preset);
+    save(dir.path(), "own.tprl", &own);
+    // Under a preset file; the record's own copy is small.
+    save(dir.path(), "file.tprl", &record);
+    fs::write(
+        dir.path().join("many.toml"),
+        rules_toml::preset_to_toml(&preset),
+    )
+    .unwrap();
+
+    let o = run(dir.path(), &["--chart", "chart.bms", "own.tprl"]);
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(o.stderr.is_empty(), "{o:?}");
+    assert_eq!(
+        stdout(&o),
+        format!("own.tprl | recorded preset | {refused}\n")
+    );
+    let o = run(
+        dir.path(),
+        &[
+            "--chart",
+            "chart.bms",
+            "--preset",
+            "many.toml",
+            "--preset",
+            "tapestry",
+            "file.tprl",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let out = stdout(&o);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert_eq!(
+        lines[0],
+        format!("file.tprl | preset many.toml | {refused}")
+    );
+    // The same record under a preset within the budget is evaluated.
+    assert!(
+        lines[1].starts_with("file.tprl | preset tapestry | as played"),
+        "{out}"
+    );
+}
