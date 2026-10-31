@@ -202,18 +202,11 @@ impl Cx<'_> {
         let [path] = self.def.fields(font_rec, ["path"]);
         let path = self.opt_string(path, "path")?.unwrap_or_default();
 
-        let Some(mut c) = self.common(role, &dst)? else {
+        let Some(mut c) = self.common(role, &dst, true)? else {
             return Ok(());
         };
-        if c.track.keys.iter().any(|k| k.angle != 0) || c.angle != 0 {
-            self.ignored(at, NoteKind::Ignored { field: "angle" });
-        }
         if dst.stretch > 0 {
             self.ignored(at, NoteKind::Ignored { field: "stretch" });
-        }
-        c.angle = 0;
-        for k in &mut c.track.keys {
-            k.angle = 0;
         }
         let tf = if path.to_ascii_lowercase().ends_with(".fnt") {
             self.note(

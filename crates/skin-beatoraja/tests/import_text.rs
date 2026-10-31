@@ -226,3 +226,34 @@ fn fonts_and_boxes_that_cannot_draw() {
     };
     assert_eq!(l.report().usage.texts, 0);
 }
+
+#[test]
+fn text_ignores_the_angle_and_blend_it_does_not_consume() {
+    let ignored = |field| NoteKind::Ignored { field };
+    for blend in [4, 9] {
+        let l = text(
+            [1_920, 1_080],
+            r#""font": "f", "constantText": "x""#,
+            &format!(r#""blend": {blend}, {BOX}"#),
+        );
+        assert_eq!(l.report().usage.texts, 1, "{blend}");
+        assert!(has(l.report(), ignored("blend")), "{blend}");
+        let mut d = l.drawn();
+        d.attach_lines(1.0, 1.0);
+        assert_eq!(d.frame(0, &[]).len(), 1, "{blend}");
+    }
+    // Equal-time keys that differ only in angle are one key for text.
+    let l = text(
+        [1_920, 1_080],
+        r#""font": "f", "constantText": "x""#,
+        r#""dst": [{"time": 0, "x": 400, "y": 800, "w": 300, "h": 30},
+                   {"time": 0, "angle": 30}]"#,
+    );
+    assert_eq!(l.report().usage.texts, 1);
+    assert!(has(l.report(), ignored("angle")));
+    let mut d = l.drawn();
+    d.attach_lines(1.0, 1.0);
+    let quads = d.frame(0, &[]);
+    assert_eq!(quads.len(), 1);
+    assert_eq!(quads[0].angle, 0.0);
+}

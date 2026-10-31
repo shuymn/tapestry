@@ -167,7 +167,7 @@ impl Cx<'_> {
             self.drop_el(role, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(());
         }
-        let Some(c) = self.common(role, &dst)? else {
+        let Some(c) = self.common(role, &dst, false)? else {
             return Ok(());
         };
         let program = self.compile(shown.expr(), Ty::Int, at)?;

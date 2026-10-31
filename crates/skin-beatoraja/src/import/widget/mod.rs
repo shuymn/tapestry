@@ -218,7 +218,7 @@ impl Cx<'_> {
             self.drop_el(Role::Decorative, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(());
         }
-        let Some(c) = self.common(Role::Decorative, &dst)? else {
+        let Some(c) = self.common(Role::Decorative, &dst, false)? else {
             return Ok(());
         };
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {

@@ -593,7 +593,11 @@ impl<'d> Cx<'d> {
     /// The common part of an element: track, conditions,
     /// timer, offsets, blend and pivot, each through the role policy.
     /// `None` when the element was dropped or is never drawn.
-    fn common(&mut self, role: Role, dst: &Dst) -> Result<Option<Common>, ImportError> {
+    ///
+    /// A `text` consumes neither the angle nor the blend
+    /// (`SkinTextFont.java:158-176`): its keys' angles are cleared before
+    /// the track is accepted, and an angle or a blend is only noted.
+    fn common(&mut self, role: Role, dst: &Dst, text: bool) -> Result<Option<Common>, ImportError> {
         let at = dst.span;
         if dst.mouse {
             self.ignored(at, NoteKind::Ignored { field: "mouseRect" });
@@ -603,7 +607,14 @@ impl<'d> Cx<'d> {
             .budget
             .keys(dst.keys.len())
             .map_err(|l| self.limit(at, l))?;
-        let keys = track::read(self.def, &dst.keys)?;
+        let mut keys = track::read(self.def, &dst.keys)?;
+        let mut text_angle = false;
+        if text {
+            for k in &mut keys.keys {
+                text_angle |= k.angle != 0;
+                k.angle = 0;
+            }
+        }
         if keys.clip {
             self.drop_el(role, at, NoteKind::UnsupportedField { field: "clip" })?;
             return Ok(None);
@@ -764,6 +775,10 @@ impl<'d> Cx<'d> {
                 self.ignored(at, NoteKind::Ignored { field: "blend 3" });
                 Blend::Add
             }
+            4 | 9 if text => {
+                self.ignored(at, NoteKind::Ignored { field: "blend" });
+                Blend::Alpha
+            }
             4 | 9 => {
                 self.drop_el(role, at, NoteKind::Blend(dst.blend))?;
                 return Ok(None);
@@ -783,6 +798,13 @@ impl<'d> Cx<'d> {
             Some(self.compile(&src, Ty::Bool, at)?)
         };
 
+        let mut angle = offset_angle(&offset);
+        if text {
+            if text_angle || angle != 0 {
+                self.ignored(at, NoteKind::Ignored { field: "angle" });
+            }
+            angle = 0;
+        }
         Ok(Some(Common {
             role,
             span: at,
@@ -797,7 +819,7 @@ impl<'d> Cx<'d> {
             },
             pivot: pivot(dst.center),
             offset,
-            angle: offset_angle(&offset),
+            angle,
             stretch: Stretch::of(dst.stretch),
             stretch_mode: dst.stretch,
             untimed,
