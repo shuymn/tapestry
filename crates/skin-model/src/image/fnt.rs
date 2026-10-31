@@ -44,9 +44,6 @@ const MAX_BMP: u32 = 0xFFFF;
 /// The glyphs whose height is the cap height, in order
 /// (`BitmapFont$BitmapFontData` `capChars`, gdx 1.9.9 `load`:643-658).
 const CAP_CHARS: &[u8] = b"MNBDCEFKAGHIJLOPQRSTUVWXYZ";
-/// The glyphs the x-height is probed with, in order
-/// (`BitmapFont$BitmapFontData` `xChars`, gdx 1.9.9).
-const X_CHARS: &[u8] = b"xeaonsrcumvwz";
 /// The glyphs whose raw y offset represents the font, in order
 /// (`SkinTextBitmap.java:869` at `0.8.9`).
 const ANCHORS: [u32; 13] = [
@@ -142,7 +139,7 @@ pub enum FntErrorKind {
     /// A declared `chars count` or `kernings count` not equal to the
     /// lines read.
     Count(&'static str),
-    /// No glyph to give a synthesised space its advance.
+    /// No basic-plane glyph drawn with a size, the missing glyph aside.
     NoGlyphs,
     /// More glyphs than the limit.
     TooManyGlyphs,
@@ -198,7 +195,7 @@ impl fmt::Display for FntErrorKind {
             Self::GlyphPage => f.write_str("a glyph on a page the font does not have"),
             Self::Unexpected => f.write_str("a line not allowed here"),
             Self::Count(k) => write!(f, "`{k} count` is not the number of lines"),
-            Self::NoGlyphs => f.write_str("no glyph to give a space its advance"),
+            Self::NoGlyphs => f.write_str("no basic-plane glyph drawn with a size"),
             Self::TooManyGlyphs => f.write_str("too many glyphs"),
             Self::TooManyKernings => f.write_str("too many kerning pairs"),
             Self::GlyphOutside { code } => write!(f, "glyph {code} lies outside its page"),
@@ -668,15 +665,13 @@ impl FntFile {
             g.src[2] = unsigned16(w);
             g.xoff = narrow16(-pad_left);
         }
-        // Without any of `X_CHARS`, the x-height probe takes the first
-        // basic-plane glyph drawn with a size, which must exist (gdx
-        // 1.9.9 `load`:635-641, `getFirstGlyph`:748-755); the missing
-        // glyph is not in that table, and a space with a height counts.
-        if !X_CHARS.iter().any(|&c| chars.get(u32::from(c)).is_some())
-            && !chars
-                .glyphs
-                .iter()
-                .any(|(g, _)| g.code <= MAX_BMP && g.src[2] != 0 && g.src[3] != 0)
+        // A font needs a basic-plane glyph drawn with a size; the missing
+        // glyph is not one, and a space with a height is once it has a
+        // width.
+        if !chars
+            .glyphs
+            .iter()
+            .any(|(g, _)| g.code <= MAX_BMP && g.src[2] != 0 && g.src[3] != 0)
         {
             return Err(err(0, FntErrorKind::NoGlyphs));
         }
@@ -1173,16 +1168,22 @@ mod tests {
     }
 
     #[test]
-    fn a_font_needs_a_drawn_basic_plane_glyph_without_an_x_char() {
+    fn a_font_needs_a_drawn_basic_plane_glyph() {
         let space = ch(32, [0, 0], [0, 0, 4]);
         let missing = ch(0, [3, 3], [0, 0, 4]);
         let emoji = ch(0x1_F600, [5, 5], [0, 0, 7]);
-        for chars in [[space.clone(), missing.clone()], [space.clone(), emoji]] {
+        let x = ch(120, [0, 0], [0, 0, 4]);
+        let l = ch(108, [3, 0], [0, 0, 4]);
+        for chars in [
+            [space.clone(), missing.clone()],
+            [space.clone(), emoji],
+            [space.clone(), x],
+            // `l` gives the synthesised space its advance but is not drawn.
+            [l, missing],
+        ] {
             assert_eq!(kind(&font(&chars, "")), FntErrorKind::NoGlyphs);
         }
-        // An `x` char, even an empty one, is what the probe takes.
-        let x = ch(120, [0, 0], [0, 0, 4]);
-        assert!(parse(&font(&[space.clone(), missing, x], "")).is_ok());
+        assert!(FntErrorKind::NoGlyphs.upstream_fails());
         // A space with a height is drawn with a size once it has a width.
         assert!(parse(&font(&[ch(32, [0, 3], [0, 0, 4])], "")).is_ok());
     }
