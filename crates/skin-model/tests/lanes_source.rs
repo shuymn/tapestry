@@ -185,6 +185,19 @@ fn a_long_note_leaves_at_its_end_time() {
     assert!(drawn(&stopped, end - 1) > 0);
     assert_eq!(drawn(&stopped, end), 0);
     assert_eq!(drawn(&stopped, end + 100 * MS), 0);
+    // A STOP ending at the end: through it the end sits on the line, so
+    // the long note leaves when the STOP starts, before its end time.
+    let stop = end - 200 * MS;
+    let mut held = ChartBuilder::new(BPM)
+        .long(lane(2), TimeUs(1_000 * MS), TimeUs(end))
+        .stop(TimeUs(stop), TimeUs(200 * MS))
+        .build()
+        .unwrap();
+    held.meta.ln_mode = Some(LnMode::Cn);
+    assert_eq!(drawn(&held, stop - 50 * MS), 3);
+    assert!(drawn(&held, stop - 1) > 0);
+    assert_eq!(drawn(&held, stop), 0);
+    assert_eq!(drawn(&held, end - 1), 0);
 }
 
 /// A chart at 199.999 BPM with `channel` notes at measure 1's start and
