@@ -951,6 +951,38 @@ mod tests {
         }
     }
 
+    /// A play's figures are waited for as long as the bound set says: a
+    /// render thread blocked in a chart's load does not answer the play's
+    /// end, and the wait gives up at the bound, far below the production
+    /// one.
+    #[test]
+    fn a_blocked_thread_bounds_the_figures_wait() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut blocked = Some(blocked);
+        let make: MakeScreen = Box::new(move || {
+            let release = blocked.take().expect("built once");
+            Ok(Box::new(Blocking { release }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let mut link = spawn(
+            make,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.set_timeouts(Duration::from_millis(200), Duration::from_millis(200));
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        assert!(matches!(link.load(chart), Err(ScreenError::NoAnswer)));
+        let started = Instant::now();
+        assert!(link.finish(clock.now()).is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(link.exit(), super::RenderEnd::Stuck);
+        release.send(()).unwrap();
+    }
+
     /// A chart's load that blocks the render thread bounds every wait on
     /// it: the load and a preparation give up, and the close that follows
     /// returns, saying the thread did not end, so the window stays open.
