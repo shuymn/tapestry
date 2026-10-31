@@ -5,7 +5,6 @@
 mod image_support;
 
 use std::fs::File;
-use std::path::Path;
 
 use image_support::{dir, file, link_dir, load, load_files, save, solid, whole};
 use skin_model::{FileAt, ImageError, MAX_FILE_BYTES, MAX_PATH_BYTES};
@@ -109,7 +108,7 @@ fn only_regular_files_are_read() {
 /// Folder `path`, or the same folder relative to the working folder when
 /// that is shorter: a socket's path has a small length limit.
 #[cfg(unix)]
-fn short(path: &Path) -> std::path::PathBuf {
+fn short(path: &std::path::Path) -> std::path::PathBuf {
     let path = path.canonicalize().unwrap();
     let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
     let common = path
