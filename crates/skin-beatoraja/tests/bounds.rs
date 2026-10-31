@@ -26,9 +26,13 @@ fn a_definition_file_is_bounded_from_its_metadata() {
     assert_eq!(header(&d).unwrap().name.as_deref(), Some("x"));
     sparse(d.path(), "s.json", MAX_FILE_BYTES + 1);
     assert_eq!(limit(header(&d)), InputLimit::FileBytes);
-    // A terabyte is refused as fast: it is never read.
-    sparse(d.path(), "s.json", 1 << 40);
-    assert_eq!(limit(header(&d)), InputLimit::FileBytes);
+    // A terabyte is refused as fast: it is never read. NTFS allocates a
+    // file extended by `set_len`, so only here.
+    #[cfg(unix)]
+    {
+        sparse(d.path(), "s.json", 1 << 40);
+        assert_eq!(limit(header(&d)), InputLimit::FileBytes);
+    }
     // An included file too.
     write(
         d.path(),

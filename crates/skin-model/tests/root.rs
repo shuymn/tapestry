@@ -185,20 +185,24 @@ fn reads_are_bounded_before_reading() {
         .unwrap()
         .set_len(65)
         .unwrap();
-    File::create(d.path().join("huge.json"))
-        .unwrap()
-        .set_len(1 << 40)
-        .unwrap();
     let root = Root::new(d.path()).unwrap();
     assert_eq!(root.read("cap.json", 64).unwrap().0.len(), 64);
     assert!(matches!(
         root.read("over.json", 64),
         Err(RootError::TooLarge { len: 65, max: 64 })
     ));
-    assert!(matches!(
-        root.read("huge.json", 64),
-        Err(RootError::TooLarge { len, max: 64 }) if len == 1 << 40
-    ));
+    // NTFS allocates a file extended by `set_len`, so only here.
+    #[cfg(unix)]
+    {
+        File::create(d.path().join("huge.json"))
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+        assert!(matches!(
+            root.read("huge.json", 64),
+            Err(RootError::TooLarge { len, max: 64 }) if len == 1 << 40
+        ));
+    }
 }
 
 #[test]
