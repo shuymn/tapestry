@@ -851,6 +851,35 @@ fn a_quit_during_a_rounds_save_shows_its_result() {
     assert_eq!(opens, 1);
 }
 
+/// The quit key pressed while a round the quit key ended at 15 s, as it
+/// played, is saved is taken with that round: its result shows and stays
+/// until the quit key on it at 25 s leaves the rounds.
+#[test]
+fn a_quit_during_an_aborted_rounds_save_keeps_its_result() {
+    let run = example_rounds_pressing(
+        2,
+        0,
+        &[
+            (1, 15_000 * MS, Command::Quit),
+            (1, 25_000 * MS, Command::Quit),
+        ],
+        true,
+    );
+    let [round1] = &run.reports[..] else {
+        panic!("{} rounds", run.reports.len());
+    };
+    assert_eq!(round1.end, PlayEnd::Aborted(game::AbortCause::Quit));
+    assert!(round1.saved.as_ref().is_some_and(Result::is_ok));
+    assert_eq!(run.rig.shown, [1]);
+    assert!(run.rig.pressed.borrow().is_empty());
+    // Left by the quit at 25 s, not at once.
+    assert!(
+        run.t(run.rig.at()) >= 25_000 * MS,
+        "{}",
+        run.t(run.rig.at())
+    );
+}
+
 #[test]
 fn saving_never_delays_the_ring_out() {
     // A ring-out run to its end, and one skipped to the round's result by

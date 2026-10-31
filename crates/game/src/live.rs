@@ -681,26 +681,26 @@ fn play_and_next<R: Rig>(
         incomplete,
     });
     // A completed play's tail took the carried command.
-    let mut next = carried.filter(|_| end != PlayEnd::Completed);
+    let next = carried.filter(|_| end != PlayEnd::Completed);
     // The quit key before the chart started (in the countdown, or as
     // recording closed on a play aborted there) leaves the chart without a
     // result; from its start on, the aborted play's result shows, and a
     // quit that arrived as recording closed is taken with the play.
     let counted_down = last < loaded.starts_at()
         && (end == PlayEnd::Aborted(AbortCause::Quit) || next == Some(Command::Quit));
+    let mut next = next.filter(|&c| c != Command::Quit);
     let mut next_round = stage.is_some_and(|s| s.repeats) && tail == TailEnd::RanOut;
-    // Commands still pending once a completed play's stage is over, pressed
-    // as it ended or during the save, belong to that play: the quit key is
-    // the skip to its result (a repeated round shows its result instead of
-    // starting the next), never the result's back; a retry retries; a
-    // suspend means nothing there.
-    if end == PlayEnd::Completed {
-        while let Some(c) = rig.take() {
-            match TailAction::of(c) {
-                TailAction::SkipToResult => next_round = false,
-                TailAction::Cut(AbortCause::Retry) => next = next.or(Some(c)),
-                TailAction::Cut(_) => {}
-            }
+    // Commands still pending once the play is over, pressed as it ended or
+    // during the save, belong to that play, completed or aborted: the quit
+    // key is taken with it (for a completed play, the skip to its result:
+    // a repeated round shows its result instead of starting the next),
+    // never the result's back; a retry retries; a suspend means nothing
+    // there.
+    while let Some(c) = rig.take() {
+        match TailAction::of(c) {
+            TailAction::SkipToResult => next_round = false,
+            TailAction::Cut(AbortCause::Retry) => next = next.or(Some(c)),
+            TailAction::Cut(_) => {}
         }
     }
     Ok(Some(Played {

@@ -2597,11 +2597,25 @@ impl game::RecordSink for QuitWhileSaving {
     }
 }
 
-/// The quit key pressed while a completed play is saved, after its tail
-/// ran out, is the skip to its result: the result shows and stays until
-/// the next quit at 11 s, instead of reading that press as its back.
+/// The quit key pressed while a play is saved belongs to that play, never
+/// to its result: after a completed play's tail ran out it is the skip to
+/// its result, and after a play the quit key ended at 9.5 s, while the
+/// chart played, it is taken with that play; either way the result shows
+/// and stays until the next quit at 11 s, instead of reading that press
+/// as its back.
 #[test]
 fn a_quit_during_the_save_shows_the_result() {
+    for (abort, end) in [
+        (None, PlayEnd::Completed),
+        (Some(9_500_000), PlayEnd::Aborted(AbortCause::Quit)),
+    ] {
+        quit_during_the_save(abort, end);
+    }
+}
+
+/// [`a_quit_during_the_save_shows_the_result`] with the quit key at
+/// `abort`, if given, and the play ending as `end`.
+fn quit_during_the_save(abort: Option<i64>, end: PlayEnd) {
     let dir = tempfile::tempdir().unwrap();
     let root = DataRoot::new(dir.path().to_owned());
     let settings = tapestry_settings(&root);
@@ -2627,16 +2641,23 @@ fn a_quit_during_the_save_shows_the_result() {
     };
     let mut loaded = Loaded::load(root, settings, &chart_path, config, parts).unwrap();
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(11_000_000, Command::Quit)], i64::MAX);
+    let mut commands = vec![(11_000_000, Command::Quit)];
+    commands.extend(abort.map(|at| (at, Command::Quit)));
+    let mut rig = Fake::new(items, &commands, i64::MAX);
     rig.pressed = pressed;
     let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
-    assert_eq!(left, game::Leave::Back);
+    assert_eq!(left, game::Leave::Back, "{end:?}");
     let [one] = &rig.reports[..] else {
-        panic!("{} plays", rig.reports.len());
+        panic!("{end:?}: {} plays", rig.reports.len());
     };
-    assert_eq!((one.end, one.tail_cut), (PlayEnd::Completed, None));
-    assert_eq!(rig.shows, 1);
-    assert!(rig.pressed.lock().unwrap().is_empty());
+    assert_eq!((one.end, one.tail_cut), (end, None));
+    assert!(matches!(one.saved, Some(Ok(_))), "{end:?}: {:?}", one.saved);
+    assert_eq!(rig.shows, 1, "{end:?}");
+    assert!(rig.pressed.lock().unwrap().is_empty(), "{end:?}");
     // Left by the quit at 11 s, not at once.
-    assert!(rig.clock.now().0 >= 11_000_000, "{}", rig.clock.now().0);
+    assert!(
+        rig.clock.now().0 >= 11_000_000,
+        "{end:?}: {}",
+        rig.clock.now().0
+    );
 }
