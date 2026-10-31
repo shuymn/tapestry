@@ -202,7 +202,7 @@ egui comes with the first form-like screen.
 - The lamp is the cleared gauge with the highest `lamp` rank (design.md "Rule Presets"), or FULL COMBO, drawn from the stored set when shown. Presets list their gauges in display order, not in order of difficulty, so each gauge states its rank (PR18a).
 - The play count counts every saved, verified record under the key, so plays of a `#RANDOM` chart count across its branches even though they set no best.
 
-**Idempotence.** One ingest function serves live updates and rebuilds. A play is (its record's path relative to `records\`, the SHA-256 of its canonical body); `counted(path, body_sha256)` makes ingesting the same play twice a no-op. A record recompressed at its path is the same play, identical plays in two files are two, and a byte copy under another name counts again. Records are written once, and a record name never comes back after a deletion (`<n>-<t>.tprl`).
+**Idempotence.** One ingest function serves live updates and rebuilds. A play is (its record's path relative to `records\`, the SHA-256 of its canonical body); `counted(path, body_sha256)` makes ingesting the same play twice a no-op. A record recompressed at its path is the same play, identical plays in two files are two, and a byte copy under another name counts again. Records are written once, and a record name never comes back after a deletion (`<n>-<id>.tprl`).
 
 **Invalidation.**
 - `meta` stores the interpretation tuple: replay format, canonical encoding, evaluator and loader versions, and `BESTS_VERSION`, the version of these rules; it also holds the durable catch-up counters `requested` and `completed`.
@@ -989,7 +989,7 @@ Each one holds the behavior D5 and D6 state.
 **Touches.**
 - `eval`: the shared memory components and `Evaluator::batch_bytes`; `replay::verify`: `check_record`, `batch_bytes` and `admit` (`TooLarge`).
 - `library`: schema 3, the tuple check at open, `counts_for_best`, `Contribution`, the one `ingest`, the bests phase of a scan pass, `BestWriter`, the bests query.
-- `game`: `RecordSink::after_result` with `SavedPlay` and `BestView`, called from `finish_play` (`PlayReport::best`); record names `<n>-<t>.tprl`; `Reservation` composed from `eval`'s components; the what-if budget on `batch_bytes`.
+- `game`: `RecordSink::after_result` with `SavedPlay` and `BestView`, called from `finish_play` (`PlayReport::best`); record names `<n>-<id>.tprl`; `Reservation` composed from `eval`'s components; the what-if budget on `batch_bytes`.
 - `player`: the `BestsRecords` sink, the launch's catch-up request, the select screen's lamp and EX, the end screen's best line, the shelf's bests status and log.
 
 **Depends on.** PR5, PR13, PR17, PR18a.
