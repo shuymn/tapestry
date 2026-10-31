@@ -314,6 +314,8 @@ impl Arena {
     /// lines by `\n`, columns in characters, a leading byte order mark not
     /// counted.
     pub(crate) fn loc_at(&self, file: u16, offset: u32) -> Loc {
+        #[cfg(test)]
+        RESCANS.with(|n| n.set(n.get() + 1));
         let t = &self.files[usize::from(file)];
         let before = t.bytes.get(..offset as usize).unwrap_or(&t.bytes);
         let line_start = before
@@ -348,6 +350,13 @@ impl Arena {
             limit,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many locations this thread has built, each a rescan of its
+    /// file: successful resolution must build none.
+    pub(crate) static RESCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A UTF-8 byte order mark, skipped before parsing (an intentional

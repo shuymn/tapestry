@@ -98,17 +98,18 @@ fn dir_of(name: &str) -> String {
 }
 
 /// Reads `name` from `root` with what remains of the input allowance,
-/// at most [`MAX_FILE_BYTES`].
+/// at most [`MAX_FILE_BYTES`]. `at` gives the error's location, built
+/// only on failure.
 fn read_file(
     root: &Root,
     name: &str,
     used: u64,
-    at: Option<Loc>,
+    at: impl FnOnce() -> Option<Loc>,
 ) -> Result<(Vec<u8>, FileId), ImportError> {
     let max = MAX_FILE_BYTES.min(MAX_INPUT_BYTES.saturating_sub(used));
     root.read(name, max).map_err(|source| match source {
         RootError::TooLarge { len, .. } => ImportError::Input {
-            at,
+            at: at(),
             limit: if len > MAX_FILE_BYTES {
                 InputLimit::FileBytes
             } else {
@@ -116,7 +117,7 @@ fn read_file(
             },
         },
         source => ImportError::Read {
-            at,
+            at: at(),
             name: name.to_owned(),
             source,
         },
@@ -158,7 +159,7 @@ impl Definition {
             name: root.display().to_string(),
             source,
         })?;
-        let (bytes, entry) = read_file(&root, file, 0, None)?;
+        let (bytes, entry) = read_file(&root, file, 0, || None)?;
         let entry_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let mut arena = Arena::with_estimate(bytes.len() / 4 + 16);
         arena.files.push(Text {
@@ -552,33 +553,35 @@ impl Resolver<'_, '_> {
         let Some(member) = self.arena().first_member_ci(obj, "include") else {
             return Err(self.def.type_error(obj, "include", "a file name"));
         };
-        let at = self.def.loc(member);
+        // The location is built only for an error: it rescans the file.
         let Some(name) = self.def.string(member, "include")? else {
             return Err(self.def.type_error(member, "include", "a file name"));
         };
         // Both counts are reserved before anything is read.
         if self.chain.len() > MAX_INCLUDE_DEPTH as usize {
             return Err(ImportError::Input {
-                at: Some(at),
+                at: Some(self.def.loc(member)),
                 limit: InputLimit::IncludeDepth,
             });
         }
         if self.def.run.parses >= MAX_INCLUDE_PARSES {
             return Err(ImportError::Input {
-                at: Some(at),
+                at: Some(self.def.loc(member)),
                 limit: InputLimit::IncludeParses,
             });
         }
         self.def.run.parses += 1;
         if name.starts_with(['/', '\\']) {
             return Err(ImportError::Read {
-                at: Some(at),
+                at: Some(self.def.loc(member)),
                 name,
                 source: RootError::Rejected,
             });
         }
         if name.contains('*') {
-            return Err(ImportError::IncludeWildcard { at });
+            return Err(ImportError::IncludeWildcard {
+                at: self.def.loc(member),
+            });
         }
         let file = self.arena().node(member).file;
         let dir = &self.arena().files[usize::from(file)].dir;
@@ -587,20 +590,20 @@ impl Resolver<'_, '_> {
         } else {
             format!("{dir}/{name}")
         };
-        let (bytes, id) = read_file(
-            &self.def.root,
-            &joined,
-            self.def.run.input_bytes,
-            Some(at.clone()),
-        )?;
+        let (bytes, id) = read_file(&self.def.root, &joined, self.def.run.input_bytes, || {
+            Some(self.def.loc(member))
+        })?;
         if self.chain.contains(&id) {
             let mut chain: Vec<String> = self.chain.iter().map(|f| f.name().to_owned()).collect();
             chain.push(id.name().to_owned());
-            return Err(ImportError::IncludeCycle { at, chain });
+            return Err(ImportError::IncludeCycle {
+                at: self.def.loc(member),
+                chain,
+            });
         }
         self.def.run.input_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let index = u16::try_from(self.arena().files.len()).map_err(|_| ImportError::Input {
-            at: Some(at.clone()),
+            at: Some(self.def.loc(member)),
             limit: InputLimit::IncludeParses,
         })?;
         self.def.arena.files.push(Text {

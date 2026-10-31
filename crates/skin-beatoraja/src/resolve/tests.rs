@@ -60,3 +60,42 @@ fn decoded_bytes_are_counted_before_they_are_allocated() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn successful_resolution_builds_no_location() {
+    use crate::tree::RESCANS;
+    let d = skin(
+        r#"{"type":0,
+        "property":[{"name":"p","item":[{"name":"i","op":901}]},
+          {"include":"p.json"},
+          {"if":901,"values":{"include":"p.json"}},
+          [{"if":-901,"value":{"include":"q.json"}}]],
+        "filepath":[{"include":"f.json"}, {"name":"g","path":"*.json"}],
+        "offset":{"include":"o.json"}}"#,
+    );
+    for (name, src) in [
+        ("p.json", r#"[{"name":"q"}]"#),
+        ("q.json", r#"{"name":"r"}"#),
+        ("f.json", r#"[{"name":"f","path":"*.JSON"}]"#),
+        ("o.json", r#"[{"id":1,"x":true}]"#),
+    ] {
+        std::fs::write(d.path().join(name), src).unwrap();
+    }
+    RESCANS.with(|n| n.set(0));
+    let mut def = Definition::read_with(d.path(), "s.json", Limits::STANDARD).unwrap();
+    let first = resolve(&mut def, &BTreeSet::new())
+        .unwrap()
+        .header()
+        .unwrap();
+    let configured = resolve(&mut def, &BTreeSet::from([901]))
+        .unwrap()
+        .header()
+        .unwrap();
+    assert_eq!(RESCANS.with(std::cell::Cell::get), 0);
+    assert_eq!(first.options.len(), 3);
+    assert_eq!(configured.options.len(), 3);
+    assert_eq!(first.files[0].candidates.len(), 5);
+    // The counter sees a location when one is built.
+    let _ = def.loc(def.top);
+    assert_eq!(RESCANS.with(std::cell::Cell::get), 1);
+}
