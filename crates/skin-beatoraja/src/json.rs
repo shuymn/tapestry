@@ -160,6 +160,13 @@ impl Parser<'_> {
                     top.sep = Sep::NewlineComma;
                     self.pos += 1;
                 }
+                // In an object only `}` closes; a `]` where a name may
+                // start begins an unquoted name (rl:216-268).
+                (Sep::Start | Sep::Comma | Sep::Newline | Sep::NewlineComma, b']') if object => {
+                    top.sep = Sep::Item;
+                    let key = self.name()?;
+                    self.value(Some(key), &mut stack)?;
+                }
                 (Sep::Start | Sep::Comma | Sep::Item | Sep::Newline, b'}' | b']') => {
                     if c != close {
                         return Err(Fail::Syntax(self.pos, Syntax::MismatchedClose));

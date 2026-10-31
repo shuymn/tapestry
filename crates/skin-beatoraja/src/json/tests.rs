@@ -119,6 +119,10 @@ fn unquoted_names_end_at_a_colon_line_break_or_comment() {
     assert_eq!(read("{a/*c*/:1}"), "{a=1}");
     // A brace or comma does not end a name.
     assert_eq!(read("{a}b,c:1}"), "{a}b,c=1}");
+    // Only `}` closes an object: a `]` where a name may start begins one.
+    assert_eq!(read("{type:0,]ignored:1}"), "{type=0,]ignored=1}");
+    assert_eq!(read("{]a:1\n]b:2}"), "{]a=1,]b=2}");
+    assert_eq!(refused(b"{a:1]").0, Syntax::MismatchedClose);
     assert_eq!(refused(b"{a 1}").0, Syntax::UnexpectedEnd);
     assert_eq!(refused(b"{\"a\" 1}").0, Syntax::ExpectedColon);
 }
