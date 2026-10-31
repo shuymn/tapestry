@@ -278,7 +278,7 @@ Its own rules, each with an example in crates/eval/tests/style_lr2.rs:
 **Policies are choices, not replacements (decided).** Each is a new variant beside today's behavior, which stays available: tapestry keeps nearest assignment, misses at the press for overtaken notes, a miss at the edge and a BAD head scored at the press, and reads judgment headers as loader version 6 does, so its results do not change. Only the selection variants a supported preset uses are added (combo priority); beatoraja's other algorithms wait for a preset that uses one.
 
 **Versions.**
-- A new field or variant bumps the canonical encoding version (`FORMAT_VERSION` in crates/rules/src/canonical.rs), so older records are refused. A new field also changes the file shape, and older files are refused with the existing hint; a new variant alone adds no key, so a user preset file naming an existing variant still reads with its own values and hash.
+- A new field or variant bumps the canonical encoding version (`rules::CANONICAL_VERSION`), so older records are refused. A new field also changes the file shape, and older files are refused with the existing hint; a new variant alone adds no key, so a user preset file naming an existing variant still reads with its own values and hash.
 - The evaluator version (`Implementation::STANDARD_VERSION`) bumps only when an existing variant's meaning changes.
 - The judgment-header model bumps `LOADER_VERSION`; records of loader version 6 are refused, also under an override (design.md "Determinism"), and cannot gain the declarations they did not keep.
 
