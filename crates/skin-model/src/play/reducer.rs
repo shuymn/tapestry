@@ -13,7 +13,7 @@
 
 use bms_model::{Chart, LANE_COUNT, NoteKind, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind, Section};
-use rules::{GaugeValue, Judgment};
+use rules::{GaugeValue, Judgment, LnMode};
 
 use super::schema::Grade;
 
@@ -60,8 +60,13 @@ pub(crate) struct Hold {
 pub(crate) struct Reducer {
     /// Per lane and note: the long note's times, `None` for a tap or mine.
     longs: [Box<[Option<Long>]>; LANE_COUNT],
-    /// Per lane: the notes no longer drawn, judged taps and hit mines.
+    /// Per lane: the notes no longer drawn, judged taps, hit mines, and
+    /// long notes whose judgment was decided before their end when the LN
+    /// mode hides them.
     done: [Bits; LANE_COUNT],
+    /// The long-note judgment mode the notes are drawn by: LN, the only
+    /// mode judged (design.md "LN Judgment Modes").
+    ln_mode: LnMode,
     pub(crate) hold: [Option<Hold>; LANE_COUNT],
     pub(crate) bomb: [Option<TimeUs>; LANE_COUNT],
     pub(crate) mine: [Option<TimeUs>; LANE_COUNT],
@@ -77,6 +82,15 @@ pub(crate) struct Reducer {
     /// Per gauge: its maximum.
     pub(crate) gauge_top: Box<[GaugeValue]>,
     empty_poor_breaks_combo: bool,
+}
+
+/// Whether a long note whose judgment is decided before its end stops being
+/// drawn under `mode`: in LN mode its one judgment finishes it, so its
+/// remaining body is not drawn.
+const fn hides_decided(mode: LnMode) -> bool {
+    match mode {
+        LnMode::Ln => true,
+    }
 }
 
 /// Whether a note from `time` to `end` is a target of the section from
@@ -122,6 +136,7 @@ impl Reducer {
         Self {
             longs,
             done,
+            ln_mode: LnMode::Ln,
             hold: [None; LANE_COUNT],
             bomb: [None; LANE_COUNT],
             mine: [None; LANE_COUNT],
@@ -142,9 +157,9 @@ impl Reducer {
         self.targets
     }
 
-    /// Whether `note` on lane `l` is no longer drawn: a judged tap or a
-    /// hit mine. A long note is never done; it is drawn until its end
-    /// passes the line.
+    /// Whether `note` on lane `l` is no longer drawn: a judged tap, a hit
+    /// mine, or a long note decided before its end where the LN mode hides
+    /// it. Any other long note is drawn until its end passes the line.
     pub(crate) fn done(&self, l: usize, note: usize) -> bool {
         self.done.get(l).is_some_and(|b| b.get(note))
     }
@@ -184,6 +199,15 @@ impl Reducer {
                     self.feedback(l, judgment, t);
                     return;
                 };
+                // Decided before its end (a missed head, a BAD head at its
+                // press, a release before the end), a long note stops being
+                // drawn where its mode hides it.
+                if t < end
+                    && hides_decided(self.ln_mode)
+                    && let Some(bits) = self.done.get_mut(l)
+                {
+                    bits.set(note);
+                }
                 // A completion: finished by a release, or at its end after
                 // a head press before the end. Its press already gave the
                 // feedback, even if that press's `LnHeld` was dropped.

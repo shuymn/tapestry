@@ -270,8 +270,8 @@ impl Play {
         &self.scroll
     }
 
-    /// Whether `note` on lane `l` is no longer drawn: a judged tap or a hit
-    /// mine, as of the last build.
+    /// Whether `note` on lane `l` is no longer drawn: a judged tap, a hit
+    /// mine, or a long note decided before its end, as of the last build.
     pub(crate) fn done(&self, l: usize, note: usize) -> bool {
         self.reducer.done(l, note)
     }
@@ -324,6 +324,7 @@ mod tests {
             .long(lane(5), TimeUs(1_500 * MS), TimeUs(1_800 * MS))
             .tap(lane(5), TimeUs(3_000 * MS))
             .mine(lane(6), TimeUs(3_000 * MS), 10)
+            .long(lane(7), TimeUs(1_000 * MS), TimeUs(1_300 * MS))
             .build()
             .unwrap();
         let region = crate::RegionDef {
@@ -434,15 +435,25 @@ mod tests {
             ],
         );
         assert_eq!(play.hold_note(lane(2)), None);
-        // A judged long note stays drawn: it is never done.
-        assert!(!play.done(2, 0));
-        // A BAD head holds without `LnHeld`.
+        // Decided before its end, a long note is done: here by a release,
+        // and by its head's miss; the other lanes' notes are not.
+        assert!(play.done(2, 0));
+        assert!(!play.done(7, 0) && !play.done(5, 0));
+        frame(
+            &mut play,
+            1_280,
+            &[ev(1_280, judged(7, 0, Judgment::Poor, None, None))],
+        );
+        assert!(play.done(7, 0));
+        assert!(!play.done(5, 0) && !play.done(2, 1));
+        // A BAD head holds without `LnHeld`, and is done at its press.
         frame(
             &mut play,
             1_400,
             &[ev(1_400, judged(5, 0, Judgment::Bad, Some(-100), None))],
         );
         assert_eq!(play.hold_note(lane(5)), Some(0));
+        assert!(play.done(5, 0));
         // Another note's end leaves it; its own ends it.
         frame(&mut play, 1_420, &[ev(1_420, ended(5, 1))]);
         assert_eq!(play.hold_note(lane(5)), Some(0));
@@ -457,6 +468,13 @@ mod tests {
         assert_eq!(play.hold_note(lane(2)), Some(1));
         frame(&mut play, 2_300, &[]);
         assert_eq!(play.hold_note(lane(2)), None);
+        // Held through its end, it is judged there and stays drawn.
+        frame(
+            &mut play,
+            2_300,
+            &[ev(2_300, judged(2, 1, Judgment::Perfect, Some(0), None))],
+        );
+        assert!(!play.done(2, 1));
         // A judged tap and a hit mine are done; a tap's `LnHeld` is no
         // hold, and stray indices are ignored.
         assert!(!play.done(5, 1));

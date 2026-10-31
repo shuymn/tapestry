@@ -74,11 +74,12 @@ fn long_note() -> Chart {
 }
 
 #[test]
-fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
+fn a_long_note_is_drawn_in_its_state_until_decided_before_its_end() {
     // Displayed at 1.15 s, 800 px per 600 ms: the head 150 ms past the
     // line is pinned to it (y 880), the tail 150 ms ahead at y 680. The
     // body from 680 to 880 is active only while its head was pressed and
-    // the lane stays held, whatever the judgment.
+    // the lane stays held; a long note whose judgment was decided before
+    // its end (`None`) is not drawn at all.
     let chart = long_note();
     let caps = vec![[320.0, 672.0, 64.0, 16.0], [320.0, 872.0, 64.0, 16.0]];
     let body = vec![[320.0, 680.0, 64.0, 200.0]];
@@ -86,17 +87,17 @@ fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
     let ln = |at: i64, judgment, deviation, release| {
         ev(at, judged(2, 0, judgment, deviation, release, 1))
     };
-    let cases: [(&str, Vec<JudgeEvent>, bool); 6] = [
-        ("never pressed", vec![], false),
+    let cases: [(&str, Vec<JudgeEvent>, Option<bool>); 6] = [
+        ("never pressed", vec![], Some(false)),
         (
             "head missed",
             vec![ln(1_180, Judgment::Poor, None, None)],
-            false,
+            None,
         ),
         (
             "held",
             vec![ev(1_000, ln_held(2, 0, Judgment::Great))],
-            true,
+            Some(true),
         ),
         (
             "released early",
@@ -105,12 +106,12 @@ fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
                 ev(1_100, hold_ended(2, 0)),
                 ln(1_100, Judgment::Bad, Some(0), Some(-200)),
             ],
-            false,
+            None,
         ),
         (
             "a BAD head decided at its press",
             vec![ln(850, Judgment::Bad, Some(-150), None)],
-            true,
+            None,
         ),
         (
             "a BAD head released",
@@ -118,16 +119,16 @@ fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
                 ln(850, Judgment::Bad, Some(-150), None),
                 ev(1_100, hold_ended(2, 0)),
             ],
-            false,
+            None,
         ),
     ];
     for (name, effects, active) in cases {
         let mut h = harness(&chart);
         h.frame(1_150, &effects);
-        let expected = if active {
-            [body.clone(), none.clone(), caps.clone()]
-        } else {
-            [none.clone(), body.clone(), caps.clone()]
+        let expected = match active {
+            Some(true) => [body.clone(), none.clone(), caps.clone()],
+            Some(false) => [none.clone(), body.clone(), caps.clone()],
+            None => [none.clone(), none.clone(), none.clone()],
         };
         assert_eq!(long_parts(&h, lane(2)), expected, "{name}");
     }
@@ -158,7 +159,7 @@ fn a_long_note_stays_drawn_whatever_its_judgment_in_its_state() {
 }
 
 #[test]
-fn a_held_long_notes_judgment_leaves_it_drawn_inactive() {
+fn a_held_long_notes_judgment_before_its_end_hides_it() {
     // The lane parts of the simple skin's test of the same name (its
     // feedback is the reducer's, tests/reducer.rs).
     let chart = long_note();
@@ -169,10 +170,7 @@ fn a_held_long_notes_judgment_leaves_it_drawn_inactive() {
     let released = ev(1_250, hold_ended(2, 0));
     let judged = ev(1_250, judged(2, 0, Judgment::Good, Some(0), Some(-50), 1));
     h.frame(1_250, &[released, judged]);
-    let [active, inactive, caps] = long_parts(&h, lane(2));
-    assert!(active.is_empty());
-    assert_eq!(inactive.len(), 1);
-    assert_eq!(caps.len(), 2);
+    assert_eq!(long_parts(&h, lane(2)), <[Vec<[f32; 4]>; 3]>::default());
 }
 
 /// The long note's parts drawn at `now` (µs) with `offset`, after
@@ -227,33 +225,119 @@ fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent
 fn a_long_note_turns_inactive_at_its_logic_end_while_its_tail_still_shows() {
     // The long note from 1 s to 1.3 s, drawn with a display offset of
     // −100 ms, so its tail is still 100 ms ahead of the line when its
-    // logic end passes. A GOOD-or-better head (on time) and a BAD head
-    // (150 ms early), each released exactly at the end or held through
-    // it (released at 1.5 s, judged by the end deadline): the body is
-    // active at logic 1.29 s, and inactive from the logic end on, with
-    // the tail drawn (at 1.31 s, 90 ms ahead: y 760).
+    // logic end passes. A head on time, released exactly at the end or
+    // held through it (released at 1.5 s, judged by the end deadline): the
+    // body is active at logic 1.29 s, and inactive from the logic end on,
+    // with the tail drawn (at 1.31 s, 90 ms ahead: y 760).
     let chart = long_note();
     let end = 1_300 * MS;
     let tail = [320.0, 752.0, 64.0, 16.0];
-    for press in [1_000 * MS, 850 * MS] {
-        for release in [end, 1_500 * MS] {
-            for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
-                let effects = evaluated(&chart, press, release, now);
-                let mut h = harness(&chart);
-                h.offset = TimeUs(-100 * MS);
-                h.frame_us(now, &effects);
-                let [on, off, caps] = long_parts(&h, lane(2));
-                let case = format!("press {press}, release {release}, at {now}");
-                assert_eq!(
-                    (on.len(), off.len()),
-                    (usize::from(active), usize::from(!active)),
-                    "{case}"
-                );
-                if now == end + 10 * MS {
-                    assert_eq!(caps[0], tail, "{case}");
-                }
+    for release in [end, 1_500 * MS] {
+        for (now, active) in [(end - 10 * MS, true), (end, false), (end + 10 * MS, false)] {
+            let effects = evaluated(&chart, 1_000 * MS, release, now);
+            let mut h = harness(&chart);
+            h.offset = TimeUs(-100 * MS);
+            h.frame_us(now, &effects);
+            let [on, off, caps] = long_parts(&h, lane(2));
+            let case = format!("release {release}, at {now}");
+            assert_eq!(
+                (on.len(), off.len()),
+                (usize::from(active), usize::from(!active)),
+                "{case}"
+            );
+            if now == end + 10 * MS {
+                assert_eq!(caps[0], tail, "{case}");
             }
         }
+    }
+}
+
+/// The long notes' parts in `l` drawn at `now` (µs), after the events the
+/// evaluator emits up to then for key 2 pressed at `press` and released at
+/// `release`.
+fn played(chart: &Chart, l: u8, press: i64, release: i64, now: i64) -> [Vec<[f32; 4]>; 3] {
+    let effects = evaluated(chart, press, release, now);
+    let mut h = harness(chart);
+    h.frame_us(now, &effects);
+    long_parts(&h, lane(l))
+}
+
+#[test]
+fn a_long_note_decided_before_its_end_is_no_longer_drawn() {
+    // The simple skin's test of the same name. Key 2's long note from 1 s
+    // to 2 s, and key 3's from 1.3 s to 2.3 s, never pressed, whose head
+    // is missed only after 1.4 s.
+    let chart = ChartBuilder::new(BPM)
+        .long(lane(2), TimeUs(1_000 * MS), TimeUs(2_000 * MS))
+        .long(lane(3), TimeUs(1_300 * MS), TimeUs(2_300 * MS))
+        .build()
+        .unwrap();
+    let nothing = <[Vec<[f32; 4]>; 3]>::default();
+    // Each is drawn up to `before` and decided by `after`, before the end:
+    // gone from then on, still held or not.
+    let cases = [
+        (
+            "a missed head",
+            2_500 * MS,
+            2_550 * MS,
+            1_170 * MS,
+            1_200 * MS,
+        ),
+        (
+            "a BAD head still held",
+            850 * MS,
+            2_500 * MS,
+            849 * MS,
+            850 * MS,
+        ),
+        (
+            "a release before the end",
+            1_000 * MS,
+            1_400 * MS,
+            1_399 * MS,
+            1_400 * MS,
+        ),
+    ];
+    for (name, press, release, before, after) in cases {
+        // Its body and head are on screen.
+        let [on, off, caps] = played(&chart, 2, press, release, before);
+        assert_eq!(on.len() + off.len(), 1, "{name}");
+        assert!(!caps.is_empty(), "{name}");
+        for now in [after, 1_900 * MS] {
+            assert_eq!(
+                played(&chart, 2, press, release, now),
+                nothing,
+                "{name} at {now}"
+            );
+        }
+        // Key 3's long note is drawn as without any effect.
+        for now in [before, after] {
+            let mut h = harness(&chart);
+            h.frame_us(now, &[]);
+            let plain = long_parts(&h, lane(3));
+            assert!(!plain[1].is_empty(), "{name} at {now}");
+            assert_eq!(
+                played(&chart, 3, press, release, now),
+                plain,
+                "{name} at {now}"
+            );
+        }
+    }
+    // Held to its end, released there or later: active until the end, and
+    // at the end its tail on the line with both caps.
+    for release in [2_000 * MS, 2_500 * MS] {
+        let [on, off, caps] = played(&chart, 2, 1_000 * MS, release, 1_999 * MS);
+        assert_eq!(
+            (on.len(), off.len(), caps.len()),
+            (1, 0, 2),
+            "release {release}"
+        );
+        let [on, off, caps] = played(&chart, 2, 1_000 * MS, release, 2_000 * MS);
+        assert_eq!(
+            (on.len(), off.len(), caps.len()),
+            (0, 0, 2),
+            "release {release}"
+        );
     }
 }
 
