@@ -798,3 +798,50 @@ fn autoplay_after_a_full_log_chart_plays() {
         "{stdout}"
     );
 }
+
+/// A preset chosen on the select screen (F12, from the default
+/// beatoraja-style) is the one the next launch plays: a scripted run
+/// chooses it and closes, then a scenario on the same data root plays a
+/// log, saved under lr2-style.
+#[test]
+fn restart_keeps_the_chosen_preset() {
+    let fx = Fixture::new();
+    let a = write_chart(&fx.library(), "a", "譜面A");
+    write_log(&fx.base.join("logs").join("a.tprl"), &hits(&a, |_| true), 1);
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .args([
+            "--auto",
+            "--dev-headless",
+            "--dev-select",
+            "next-preset,sleep=300,close",
+        ])
+        .args(["--dev-render-timeout", "600"])
+        .env("LOCALAPPDATA", &fx.appdata)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert_eq!(
+        lines(&stdout, "select: preset "),
+        ["select: preset lr2-style"]
+    );
+
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/a.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(lines(&stdout, "select: preset ").is_empty(), "{stdout}");
+    let records = fx.records();
+    let [record] = &records[..] else {
+        panic!("{records:?}\n{stdout}");
+    };
+    let decoded = replay::decode(&fs::read(record).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(decoded.preset.id, "lr2-style");
+    assert_eq!(
+        decoded.preset.sha256,
+        replay::preset_hash(&rules::lr2_style())
+    );
+}
