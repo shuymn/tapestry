@@ -212,8 +212,7 @@ impl Cx<'_> {
     /// The `value` record of id `id`, the first of it
     /// (`JsonPlaySkinObjectLoader.java:247`).
     fn value_rec(&mut self, id: &str) -> Result<Option<u32>, ImportError> {
-        let recs = super::super::object::records(&self.tables, "value").to_vec();
-        for rec in recs {
+        for &rec in super::super::object::records(&self.tables, "value") {
             if super::super::object::id_of(self.def, rec)?.as_deref() == Some(id) {
                 return Ok(Some(rec));
             }
