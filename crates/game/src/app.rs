@@ -11,6 +11,10 @@
 //!   that does not load, and a play the logic step refuses at the opening.
 //! - Only the screen, audio and input-thread failures [`LiveError`] carries
 //!   end the run; closing the window ends it from any scene.
+//! - One shelf of presets serves the run (design.md "Tuning Without
+//!   Restart"): opened once, polled while selection shows, lent to each
+//!   chart and handed back however the chart ends. A shelf that cannot
+//!   open refuses every chart and is opened again at each poll.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -20,11 +24,12 @@ use bms_model::TimeUs;
 use crate::live::{Leave, LiveError, Rig, run_chart, run_over};
 use crate::logic::LogicError;
 use crate::policy::{SessionEvent, SessionEventSink, SharedEvents};
+use crate::presets::{PollDeadline, Shelf, ShelfError, UnknownPreset};
 use crate::session::{Loaded, Parts, SessionConfig, SessionError, Settings};
 use crate::settings::DataRoot;
 
-/// The longest idle wait on the select screen, on the rig's clock: the
-/// flow looks again at least this often.
+/// The longest idle wait on the select screen and a result, on the rig's
+/// clock: the flow looks again at least this often.
 pub const IDLE_WAIT: TimeUs = TimeUs(250_000);
 
 /// The world the scene flow runs in.
@@ -41,14 +46,17 @@ pub trait AppRig: Rig {
     ///
     /// Why the bank cannot be built: the chart is refused.
     fn load_chart(&mut self, loaded: &Loaded) -> Result<(), Self::BankError>;
-    /// Waits on a menu until something happens, or until `deadline` on
-    /// the rig's clock at the latest.
-    fn idle_wait(&mut self, deadline: TimeUs);
     /// Shows on the select screen why the chosen chart was refused.
     fn show_refusal(&mut self, refusal: &LoadRefusal<Self::BankError>);
     /// Song selection was entered: called on every entry, before anything
     /// is shown there.
     fn entered_selection(&mut self);
+    /// The shelf, or why it cannot open: called on every entry into
+    /// selection, right after [`entered_selection`](Self::entered_selection),
+    /// and after every poll there that changed it.
+    fn presets_changed(&mut self, shelf: Result<&Shelf, &ShelfError>) {
+        let _ = shelf;
+    }
 }
 
 /// Why a chosen chart was refused.
@@ -87,6 +95,11 @@ pub struct App {
     config: SessionConfig,
     parts: Box<dyn FnMut(&Settings) -> Parts>,
     events: SharedEvents,
+    /// The run's shelf, or why it cannot open.
+    shelf: Result<Shelf, ShelfError>,
+    /// When a shelf that cannot open is tried again; an opened shelf keeps
+    /// its own deadline.
+    reopen: PollDeadline,
 }
 
 impl fmt::Debug for App {
@@ -94,6 +107,7 @@ impl fmt::Debug for App {
         f.debug_struct("App")
             .field("root", &self.root)
             .field("config", &self.config)
+            .field("shelf", &self.shelf)
             .finish_non_exhaustive()
     }
 }
@@ -102,7 +116,8 @@ impl App {
     /// The scene flow under `root`, starting from `settings`; a chart's
     /// plays may change them, and the next chart starts from those. `parts`
     /// makes the extension points of each chart loaded; their session
-    /// events go to `events` whatever `parts` sets, as selection's do.
+    /// events go to `events` whatever `parts` sets, as selection's do. The
+    /// run's shelf opens here, with the preset `settings` names chosen.
     #[must_use]
     pub fn new(
         root: DataRoot,
@@ -111,12 +126,58 @@ impl App {
         parts: Box<dyn FnMut(&Settings) -> Parts>,
         events: Box<dyn SessionEventSink>,
     ) -> Self {
+        let shelf = Shelf::open(root.presets(), &settings.player.preset);
         Self {
             root,
             settings,
             config,
             parts,
             events: SharedEvents::new(events),
+            shelf,
+            reopen: PollDeadline::default(),
+        }
+    }
+
+    /// The run's shelf, or why it cannot open.
+    pub fn shelf(&self) -> Result<&Shelf, &ShelfError> {
+        self.shelf.as_ref()
+    }
+
+    /// When selection next polls the shelf, or tries to open it again.
+    fn next_poll(&self, now: TimeUs) -> TimeUs {
+        match &self.shelf {
+            Ok(shelf) => shelf.deadline().next(now),
+            Err(_) => self.reopen.next(now),
+        }
+    }
+
+    /// Polls the shelf at `now` if it is due, or opens it again if it
+    /// cannot open yet; whether what the rig shows of it changed.
+    fn poll(&mut self, now: TimeUs) -> bool {
+        match &mut self.shelf {
+            Ok(shelf) => {
+                let before = shelf.revision();
+                let _ = shelf.poll(now);
+                shelf.revision() != before
+            }
+            Err(e) => {
+                if !self.reopen.due(now) {
+                    return false;
+                }
+                match Shelf::open(self.root.presets(), &self.settings.player.preset) {
+                    Ok(mut shelf) => {
+                        // The cadence carries over to the opened shelf.
+                        shelf.set_deadline(self.reopen);
+                        self.shelf = Ok(shelf);
+                        true
+                    }
+                    Err(again) if again == *e => false,
+                    Err(again) => {
+                        *e = again;
+                        true
+                    }
+                }
+            }
         }
     }
 
@@ -130,6 +191,7 @@ impl App {
         let mut refusal = None;
         'select: loop {
             rig.entered_selection();
+            rig.presets_changed(self.shelf.as_ref());
             self.events.on_event(&SessionEvent::Select);
             if let Some(r) = &refusal {
                 rig.show_refusal(r);
@@ -152,7 +214,15 @@ impl App {
                 if let Some(chart) = rig.choose() {
                     break chart;
                 }
-                rig.idle_wait(TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0)));
+                // The user preset files are polled while selection shows,
+                // and the wait ends at the poll deadline at the latest, so a
+                // wake just before it does not put the check off.
+                let now = rig.now();
+                if self.poll(now) {
+                    rig.presets_changed(self.shelf.as_ref());
+                }
+                let deadline = self.next_poll(now);
+                rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(deadline.0)));
             };
             refusal = None;
             match self.play_chart(&chart, rig)? {
@@ -164,12 +234,20 @@ impl App {
     }
 
     /// Loads `chart` and plays it until the player leaves it, or refuses
-    /// it.
+    /// it. The shelf is lent to the chart and comes back on every outcome.
     fn play_chart<R: AppRig>(
         &mut self,
         chart: &Path,
         rig: &mut R,
     ) -> Result<Chosen<R::BankError>, LiveError<R::ScreenError>> {
+        let shelf = match &self.shelf {
+            Ok(_) => std::mem::replace(&mut self.shelf, Err(lent())),
+            Err(e) => Err(e.clone()),
+        };
+        let shelf = match shelf {
+            Ok(shelf) => shelf,
+            Err(e) => return Ok(Chosen::Refused(Refused::Chart(SessionError::Preset(e)))),
+        };
         // Every chart reports to the run's one sink, never the parts' own.
         let mut loaded = match Loaded::load_reporting_to(
             self.root.clone(),
@@ -178,19 +256,35 @@ impl App {
             self.config.clone(),
             (self.parts)(&self.settings),
             self.events.clone(),
+            shelf,
         ) {
             Ok(loaded) => loaded,
-            Err(e) => return Ok(Chosen::Refused(Refused::Chart(e))),
+            Err(refused) => {
+                let (e, shelf) = *refused;
+                self.shelf = Ok(shelf);
+                return Ok(Chosen::Refused(Refused::Chart(e)));
+            }
         };
-        if let Err(e) = rig.load_chart(&loaded) {
-            return Ok(Chosen::Refused(Refused::Bank(e)));
-        }
-        let left = run_chart(&mut loaded, rig);
+        let left = match rig.load_chart(&loaded) {
+            Ok(()) => Ok(run_chart(&mut loaded, rig)),
+            Err(e) => Err(e),
+        };
         self.settings = loaded.settings().clone();
+        self.shelf = Ok(loaded.into_shelf());
+        let left = match left {
+            Ok(left) => left,
+            Err(e) => return Ok(Chosen::Refused(Refused::Bank(e))),
+        };
         match left {
             Ok(leave) => Ok(Chosen::Left(leave)),
             Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
             Err(e) => Err(e),
         }
     }
+}
+
+/// What the run's shelf holds while a chart has it: never seen, since
+/// every way out of [`App::play_chart`] puts the shelf back first.
+fn lent() -> ShelfError {
+    ShelfError::Unknown(UnknownPreset(String::new()))
 }

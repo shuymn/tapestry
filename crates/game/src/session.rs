@@ -39,13 +39,10 @@ use crate::prepare::{BmsIngest, ChartIngest, ChartTransform, IngestError, Passth
 use crate::presets::{PresetChange, Shelf, ShelfError};
 use crate::render::PlayView;
 use crate::render::RenderSide;
-use crate::results::{
-    ReEvaluate, ReEvaluationError, ResultContext, ResultExtension, ResultSummary,
-};
+use crate::results::{ReEvaluate, ResultContext, ResultExtension, ResultSummary};
 use crate::save::{LocalRecords, RecordRef, RecordSink, SaveError};
 use crate::settings::{DataRoot, DeviceSettings, KeyConfig, PlayerSettings, SettingsError};
 use crate::sound::{AudioQueue, RunnerAudio, Wakes};
-use replay::verify::ReEvaluation;
 use rules_toml::PresetFileError;
 
 /// Every extension point the session calls through, each with one
@@ -339,6 +336,9 @@ pub struct Loaded {
     warnings: Vec<String>,
     preset: RulePreset,
     shelf: Shelf,
+    /// The chosen file's standing error when the chart loaded, which its
+    /// first play reports: the shelf plays its last good version.
+    first_error: Option<PresetFileError>,
     attempt: u32,
     /// Where the session events go, out of the parts so a play can report
     /// its start while its logic step borrows the chart.
@@ -357,23 +357,6 @@ pub struct PlayStart {
     /// Why the preset file changed at this retry but was not used; the
     /// previous preset plays instead.
     pub reload_error: Option<PresetFileError>,
-}
-
-/// What a poll of the presets found while a result screen shows
-/// ([`Loaded::poll_presets`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PresetReload {
-    /// The chosen preset reloaded: the next play uses it.
-    Reloaded {
-        /// The reloaded preset.
-        preset: Box<RulePreset>,
-        /// The play's record re-evaluated under it; `None` without a
-        /// record.
-        result: Option<Box<Result<ReEvaluation, ReEvaluationError>>>,
-    },
-    /// The chosen preset's file changed and does not load: the previous
-    /// preset stays in use.
-    Failed(PresetFileError),
 }
 
 /// What one play is sized and evaluated with, once its participating
@@ -447,11 +430,20 @@ impl Loaded {
             &mut parts.events,
             Box::new(NoSessionEvents),
         ));
-        Self::load_reporting_to(root, settings, chart_path, config, parts, events)
+        if config.step.0 <= 0 {
+            return Err(SessionError::InvalidStep(config.step));
+        }
+        let shelf =
+            Shelf::open(root.presets(), &settings.player.preset).map_err(SessionError::Preset)?;
+        Self::load_reporting_to(root, settings, chart_path, config, parts, events, shelf)
+            .map_err(|b| b.0)
     }
 
-    /// [`load`](Self::load), with the session events going to `events`
-    /// instead of the parts' sink.
+    /// [`load`](Self::load) on a shelf song selection lends, with the
+    /// session events going to `events` instead of the parts' sink. The
+    /// shelf is checked first, and its chosen preset plays; the chosen
+    /// file's standing error goes with the first play's report. A refusal
+    /// hands the shelf back with its reason.
     pub(crate) fn load_reporting_to(
         root: DataRoot,
         settings: Settings,
@@ -459,13 +451,42 @@ impl Loaded {
         config: SessionConfig,
         parts: Parts,
         events: SharedEvents,
-    ) -> Result<Self, SessionError> {
+        mut shelf: Shelf,
+    ) -> Result<Self, Box<(SessionError, Shelf)>> {
         if config.step.0 <= 0 {
-            return Err(SessionError::InvalidStep(config.step));
+            return Err(Box::new((SessionError::InvalidStep(config.step), shelf)));
         }
-        let shelf =
-            Shelf::open(root.presets(), &settings.player.preset).map_err(SessionError::Preset)?;
-        let preset = shelf.chosen().clone();
+        shelf.check();
+        match Self::read_chart(chart_path, &config, &parts) {
+            Ok((chart, chart_record, warnings)) => {
+                events.on_event(&SessionEvent::Load);
+                Ok(Self {
+                    root,
+                    settings,
+                    config,
+                    parts,
+                    chart,
+                    chart_record,
+                    warnings,
+                    preset: shelf.chosen().clone(),
+                    first_error: shelf.chosen_error().cloned(),
+                    shelf,
+                    attempt: 0,
+                    events,
+                    practice: None,
+                })
+            }
+            Err(e) => Err(Box::new((e, shelf))),
+        }
+    }
+
+    /// Reads, ingests and transforms the chart at `chart_path`: the chart,
+    /// its record and what the loader skipped or assumed.
+    fn read_chart(
+        chart_path: &Path,
+        config: &SessionConfig,
+        parts: &Parts,
+    ) -> Result<(Chart, ChartRecord, Vec<String>), SessionError> {
         if !parts.ingest.accepts(chart_path) {
             return Err(SessionError::UnsupportedChart(chart_path.to_owned()));
         }
@@ -493,21 +514,13 @@ impl Loaded {
             random_seed: config.seed,
             transform: parts.transform.id().record(),
         };
-        events.on_event(&SessionEvent::Load);
-        Ok(Self {
-            root,
-            settings,
-            config,
-            parts,
-            chart,
-            chart_record,
-            warnings: ingested.warnings,
-            preset,
-            shelf,
-            attempt: 0,
-            events,
-            practice: None,
-        })
+        Ok((chart, chart_record, ingested.warnings))
+    }
+
+    /// The shelf, handed back once the chart's plays are over.
+    #[must_use]
+    pub fn into_shelf(self) -> Shelf {
+        self.shelf
     }
 
     /// Sets up practice (design.md "Mid-Chart Start and Section Repeat"):
@@ -596,33 +609,13 @@ impl Loaded {
         &self.shelf
     }
 
-    /// While a result screen shows: checks the user preset files if
-    /// [`POLL_INTERVAL`](crate::POLL_INTERVAL) has passed at `now`
-    /// (design.md "Tuning Without Restart"). When the chosen preset
-    /// reloaded, `report`'s play is re-evaluated under it; plays take it from
-    /// the next one on. `None` when nothing changed for the chosen preset.
-    pub fn poll_presets(&mut self, now: TimeUs, report: &PlayReport) -> Option<PresetReload> {
-        match self.shelf.poll(now)? {
-            PresetChange::Failed(e) => Some(PresetReload::Failed(e)),
-            PresetChange::Reloaded => {
-                let preset = self.shelf.chosen().clone();
-                let result = report.record.as_ref().map(|record| {
-                    Box::new(ReEvaluate::under(
-                        &ResultContext {
-                            record,
-                            chart: &self.chart,
-                            preset: &report.preset,
-                            live: &report.live,
-                        },
-                        &preset,
-                    ))
-                });
-                Some(PresetReload::Reloaded {
-                    preset: Box::new(preset),
-                    result,
-                })
-            }
-        }
+    /// While a result screen shows: checks the user preset files if the
+    /// shelf's poll deadline is due at `now` (design.md "Tuning Without
+    /// Restart"). Plays take a reloaded chosen preset from the next one on;
+    /// the result screen sees every change in the shelf's revision. What
+    /// changed for the chosen preset, if anything.
+    pub fn poll_presets(&mut self, now: TimeUs) -> Option<PresetChange> {
+        self.shelf.poll(now)
     }
 
     /// The settings the session runs with.
@@ -673,14 +666,16 @@ impl Loaded {
     /// Numbers the next play, before recording opens; its start is reported
     /// once it is [`admitted`](Self::admitted). Every play after the first
     /// is a retry: a preset file changed since the previous play is used
-    /// from this one on.
+    /// from this one on. The first play reports the chosen file's error
+    /// standing when the chart loaded, a retry only an error its check
+    /// found.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
         let attempt = self.attempt;
         let reload_error = if attempt > 1 {
             self.reload_preset()
         } else {
-            None
+            self.first_error.take()
         };
         PlayStart {
             attempt,
@@ -1350,7 +1345,7 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
 
     fn ended(&mut self, _report: &PlayReport) {}
 
-    fn show_end(&mut self, _report: &PlayReport) {}
+    fn show_end(&mut self, _report: &PlayReport, _screen: &crate::result_screen::ResultScreen) {}
 }
 
 const fn replay_kind(kind: DeviceKind) -> replay::DeviceKind {
