@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use skin_model::{
-    AdmitError, FileDef, FontAdmitError, FontDef, ImageDef, ImageError, MAX_PATH_BYTES, Root,
-    Sheet, SheetBuilder,
+    AdmitError, BitmapFontError, FileDef, FntAdmitError, FntError, FntLimit, FontAdmitError,
+    FontDef, ImageDef, ImageError, MAX_PATH_BYTES, Refused, Root, Sheet, SheetBuilder,
 };
 
 use super::Config;
@@ -149,6 +149,15 @@ pub(crate) enum Font {
     Failed,
 }
 
+/// Why a `.fnt` file was not admitted, for its users.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FntFailure {
+    /// The file could not be found or read.
+    Missing,
+    /// Its text or a page was refused.
+    Fnt(FntError),
+}
+
 /// An image cache key: the source object, a linear filter, and the cut
 /// (columns and rows kept).
 pub(crate) type ImageKey = (u32, bool, [u32; 2]);
@@ -160,6 +169,10 @@ pub(crate) struct Assets {
     files: HashMap<(String, Option<String>), Result<u32, Option<ImageError>>>,
     images: HashMap<ImageKey, (u32, [u32; 2])>,
     fonts: HashMap<String, Font>,
+    /// Admitted `.fnt` files and cached failures, by name.
+    fnt_files: HashMap<String, Result<u16, FntFailure>>,
+    /// Bitmap fonts by font record, or the primary file's failure.
+    bitmap_fonts: HashMap<u32, Result<u32, FntFailure>>,
 }
 
 #[cfg(test)]
@@ -176,6 +189,8 @@ impl Assets {
             files: HashMap::new(),
             images: HashMap::new(),
             fonts: HashMap::new(),
+            fnt_files: HashMap::new(),
+            bitmap_fonts: HashMap::new(),
         }
     }
 
@@ -280,6 +295,88 @@ impl Assets {
         Ok(font)
     }
 
+    /// Admits `.fnt` file `name` and its pages once: a repeated request
+    /// returns the first outcome. Each attempt, image and frame is charged
+    /// to `budget` as the builder reaches it; the builder's own totals
+    /// bound the bytes, glyphs and kerning pairs.
+    ///
+    /// # Errors
+    ///
+    /// An aggregate limit.
+    pub(crate) fn fnt_file(
+        &mut self,
+        budget: &mut Budget,
+        name: &str,
+    ) -> Result<Result<u16, FntFailure>, ImportLimit> {
+        if let Some(&r) = self.fnt_files.get(name) {
+            return Ok(r);
+        }
+        let mut refused = None;
+        let admitted = self.builder.admit_fnt(name, &mut |c| {
+            budget.fnt_charge(c).map_err(|l| {
+                refused = Some(l);
+                Refused
+            })
+        });
+        let (glyphs, kernings) = self.builder.fnt_totals();
+        budget.usage.glyphs = u32::try_from(glyphs).unwrap_or(u32::MAX);
+        budget.usage.kernings = u32::try_from(kernings).unwrap_or(u32::MAX);
+        let result = match admitted {
+            Ok(i) => {
+                budget.usage.fonts = budget.usage.fonts.saturating_add(1);
+                Ok(i)
+            }
+            Err(FntAdmitError::Limit(l)) => {
+                return Err(match l {
+                    FntLimit::Charge(_) => refused.unwrap_or(ImportLimit::FileAttempts),
+                    FntLimit::Attempts => ImportLimit::FileAttempts,
+                    FntLimit::Fonts | FntLimit::FontBytes => ImportLimit::Fonts,
+                    FntLimit::ImageBytes | FntLimit::Texels => ImportLimit::FileTotals,
+                    FntLimit::Images => ImportLimit::Images,
+                    FntLimit::Frames => ImportLimit::Frames,
+                    FntLimit::Glyphs => ImportLimit::Glyphs,
+                    FntLimit::Kernings => ImportLimit::Kernings,
+                });
+            }
+            Err(FntAdmitError::File(e)) => {
+                Err(e.fnt().map_or(FntFailure::Missing, FntFailure::Fnt))
+            }
+        };
+        self.fnt_files.insert(name.to_owned(), result);
+        Ok(result)
+    }
+
+    /// The bitmap font made for font record `rec`, or its primary file's
+    /// failure.
+    pub(crate) fn bitmap_font(&self, rec: u32) -> Option<Result<u32, FntFailure>> {
+        self.bitmap_fonts.get(&rec).copied()
+    }
+
+    /// Records font record `rec`'s outcome: a bitmap font of admitted
+    /// files `primary` and `fallbacks`, or the primary's failure.
+    ///
+    /// # Errors
+    ///
+    /// More bitmap fonts than the model holds.
+    pub(crate) fn add_bitmap_font(
+        &mut self,
+        rec: u32,
+        files: Result<(u16, &[u16]), FntFailure>,
+    ) -> Result<Result<u32, FntFailure>, ImportLimit> {
+        let outcome = match files {
+            Ok((primary, fallbacks)) => match self.builder.add_bitmap_font(primary, fallbacks) {
+                Ok(i) => Ok(i),
+                Err(BitmapFontError::UnknownFile) => Err(FntFailure::Missing),
+                Err(BitmapFontError::TooManyFonts | BitmapFontError::TooManyFallbacks) => {
+                    return Err(ImportLimit::Fonts);
+                }
+            },
+            Err(f) => Err(f),
+        };
+        self.bitmap_fonts.insert(rec, outcome);
+        Ok(outcome)
+    }
+
     pub(crate) fn finish(self) -> Sheet {
         self.builder.finish()
     }
@@ -317,6 +414,50 @@ mod tests {
             choose(&[], Some("bg"), None, &config),
             (None, Rule::None, false)
         );
+    }
+
+    /// A `w`×`h` PNG at `dir/name`.
+    fn png(dir: &std::path::Path, name: &str, w: u32, h: u32) {
+        let file = std::fs::File::create(dir.join(name)).unwrap();
+        let mut enc = png::Encoder::new(file, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        let mut out = enc.write_header().unwrap();
+        out.write_image_data(&vec![255; (w * h * 4) as usize])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_bitmap_page_past_the_image_budget_stops_before_it_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let two = "info face=\"t\" size=8 padding=0,0,0,0\n\
+                   common lineHeight=8 base=6 scaleW=4 scaleH=4 pages=2\n\
+                   page id=0 file=\"a.png\"\npage id=1 file=\"b.png\"\n\
+                   char id=65 x=0 y=0 width=1 height=1 xoffset=0 yoffset=0 xadvance=1 page=1\n";
+        std::fs::write(dir.path().join("p.fnt"), two).unwrap();
+        png(dir.path(), "a.png", 4, 4);
+        png(dir.path(), "b.png", 4, 4);
+        let mut assets = Assets::new(&Root::new(dir.path()).unwrap());
+        // All but one image allowance spent on images that failed: the
+        // builder holds none of them.
+        let mut budget = Budget::default();
+        budget.usage.images = u32::try_from(skin_model::MAX_IMAGES - 1).unwrap();
+        assert_eq!(
+            assets.fnt_file(&mut budget, "p.fnt"),
+            Err(ImportLimit::Images)
+        );
+        // The file and both pages were attempted; one page's image and
+        // frame were charged.
+        assert_eq!(budget.usage.file_attempts, 3);
+        assert_eq!(budget.usage.images as usize, skin_model::MAX_IMAGES);
+        assert_eq!(budget.usage.frames, 1);
+        assert_eq!(budget.usage.fonts, 0);
+        // With the allowance, the font is admitted once.
+        let mut budget = Budget::default();
+        let mut assets = Assets::new(&Root::new(dir.path()).unwrap());
+        assert_eq!(assets.fnt_file(&mut budget, "p.fnt"), Ok(Ok(0)));
+        assert_eq!(assets.fnt_file(&mut budget, "p.fnt"), Ok(Ok(0)));
+        assert_eq!((budget.usage.images, budget.usage.file_attempts), (2, 3));
+        assert_eq!((budget.usage.fonts, budget.usage.glyphs), (1, 2));
     }
 
     #[test]

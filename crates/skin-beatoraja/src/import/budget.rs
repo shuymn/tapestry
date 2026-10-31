@@ -5,8 +5,9 @@
 use std::fmt;
 
 use skin_model::{
-    MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGES, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS,
-    MAX_TEXT_ELEMENTS, MAX_TRACK_KEYS, MAX_WHEN_TIMERS, MAX_WIDGET_QUADS, Program, SkinOps,
+    Charge, MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_IMAGES, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
+    MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TRACK_KEYS,
+    MAX_WHEN_TIMERS, MAX_WIDGET_QUADS, Program, SkinOps,
 };
 
 use super::report::Usage;
@@ -32,6 +33,11 @@ pub enum ImportLimit {
     FileTotals,
     /// More than [`MAX_FONTS`] fonts, or their bytes past the total.
     Fonts,
+    /// More than [`MAX_SHEET_GLYPHS`] glyphs across the bitmap fonts.
+    Glyphs,
+    /// More than [`MAX_SHEET_KERNINGS`] kerning pairs across the bitmap
+    /// fonts.
+    Kernings,
     /// More than [`MAX_TEXT_ELEMENTS`] text elements.
     Texts,
     /// More than [`MAX_WIDGET_QUADS`] widget quads a frame.
@@ -50,6 +56,8 @@ impl fmt::Display for ImportLimit {
             Self::FileAttempts => write!(f, "more than {MAX_FILES} image file admissions"),
             Self::FileTotals => f.write_str("the image files' total bytes or texels"),
             Self::Fonts => write!(f, "more than {MAX_FONTS} fonts, or their total bytes"),
+            Self::Glyphs => write!(f, "more than {MAX_SHEET_GLYPHS} bitmap glyphs"),
+            Self::Kernings => write!(f, "more than {MAX_SHEET_KERNINGS} bitmap kerning pairs"),
             Self::Texts => write!(f, "more than {MAX_TEXT_ELEMENTS} text elements"),
             Self::WidgetQuads => write!(f, "more than {MAX_WIDGET_QUADS} widget quads"),
         }
@@ -114,6 +122,11 @@ impl Budget {
     /// One image of `frames` frames, before its file is admitted.
     pub(crate) fn image(&mut self, frames: u32) -> Result<(), ImportLimit> {
         charge(&mut self.usage.images, 1, MAX_IMAGES, ImportLimit::Images)?;
+        self.frames(frames)
+    }
+
+    /// `frames` more frames.
+    fn frames(&mut self, frames: u32) -> Result<(), ImportLimit> {
         let n = usize::try_from(frames).unwrap_or(usize::MAX);
         charge(
             &mut self.usage.frames,
@@ -121,6 +134,18 @@ impl Budget {
             MAX_SKIN_FRAMES,
             ImportLimit::Frames,
         )
+    }
+
+    /// A charge of a bitmap font's admission: its attempts, its pages'
+    /// images and frames. Its bytes are bounded by the sheet builder's
+    /// totals, the same ones every font and image file counts against.
+    pub(crate) fn fnt_charge(&mut self, c: Charge) -> Result<(), ImportLimit> {
+        match c {
+            Charge::FileAttempt => self.file_attempt(),
+            Charge::Image => charge(&mut self.usage.images, 1, MAX_IMAGES, ImportLimit::Images),
+            Charge::Frames(n) => self.frames(n),
+            Charge::FontBytes(_) | Charge::ImageBytes { .. } => Ok(()),
+        }
     }
 
     /// One file admission, failed ones and refused names included.
@@ -145,15 +170,15 @@ impl Budget {
         )
     }
 
-    /// One text element and its quad.
-    pub(crate) fn text(&mut self) -> Result<(), ImportLimit> {
+    /// One text element and its `quads` at worst.
+    pub(crate) fn text(&mut self, quads: u32) -> Result<(), ImportLimit> {
         charge(
             &mut self.usage.texts,
             1,
             MAX_TEXT_ELEMENTS,
             ImportLimit::Texts,
         )?;
-        self.widget_quads(1)
+        self.widget_quads(quads)
     }
 }
 

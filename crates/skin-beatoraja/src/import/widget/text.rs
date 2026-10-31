@@ -1,31 +1,28 @@
 //! Text: the effective string, the font, the box and the
-//! fallbacks of D5–D7. All text is decorative.
+//! deviations D5, D6, D12 and D13. All text is decorative.
 
-use skin_model::{Align, FontRef, MAX_TEXT_BYTES, Overflow, Source, TextDef, TextField, TextValue};
+use skin_model::{
+    Align, FontRef, MAX_FALLBACKS, MAX_TEXT_BYTES, Overflow, Source, TextDef, TextField, TextValue,
+};
 
-use super::super::asset::{self, Font};
+use super::super::asset::{self, FntFailure, Font};
+use super::super::budget::ImportLimit;
 use super::super::geom::{Q, coords};
 use super::super::policy::Role;
 use super::super::property::{self, StrProp};
-use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity};
+use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity, Span};
 use super::super::{Cx, Dst, Prop};
 use crate::error::ImportError;
+use crate::tree::{Kind, Scalar};
 
 /// A text's font as the model draws it.
 enum TextFont {
     /// A model font, the em the destination's height.
     Model(FontRef),
-    /// A bitmap font drawn with another font at a fixed em, its top kept.
+    /// A font at the source's size, `size · r` reference pixels, with the
+    /// destination's top kept (`JsonSkinObjectLoader.java:652` at
+    /// `0.8.9`).
     Fixed(FontRef, Q),
-}
-
-/// D7, owner decision 3: a bitmap `.fnt` font is drawn with the default
-/// font at the source's size, `size · r` reference pixels, with the
-/// destination's top kept (`JsonSkinObjectLoader.java:652`,
-/// `SkinTextBitmap.java:86-110` at `0.8.9`). Bitmap-font support replaces
-/// this function.
-fn bitmap_font(size: i32, r: Q) -> Option<TextFont> {
-    Some(TextFont::Fixed(FontRef::Default, Q::int(size).mul(r)?))
 }
 
 /// The chart field of string property `id` 10–16.
@@ -209,12 +206,39 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "stretch" });
         }
         let tf = if path.to_ascii_lowercase().ends_with(".fnt") {
-            self.note(
-                Some(at),
-                Severity::Deviation,
-                NoteKind::Deviation(DeviationId::D7),
-            );
-            bitmap_font(size, self.r).ok_or_else(|| self.range(at, "size"))?
+            // A non-positive size cannot be drawn: the source's
+            // `setScale` throws at 0 (gdx 1.9.9 `setScale`, jar lines
+            // 868-869) and mirrors the text below it.
+            if size <= 0 {
+                self.ignored(at, NoteKind::Ignored { field: "size" });
+                return Ok(());
+            }
+            let em = Q::int(size)
+                .mul(self.r)
+                .ok_or_else(|| self.range(at, "size"))?;
+            let [kind] = self.def.fields(font_rec, ["type"]);
+            if matches!(self.int_or(kind, "type", 0)?, 1 | 2) {
+                // D13: a distance-field font is drawn with the default font.
+                self.note(
+                    Some(at),
+                    Severity::Deviation,
+                    NoteKind::Deviation(DeviationId::D13),
+                );
+                TextFont::Fixed(FontRef::Default, em)
+            } else {
+                let Some(font) = self.bitmap_font(role, at, font_rec, &path)? else {
+                    return Ok(());
+                };
+                // D12: the size is rounded to a whole reference pixel.
+                if em.round().map(Q::int) != Some(em) {
+                    self.note(
+                        Some(at),
+                        Severity::Deviation,
+                        NoteKind::Deviation(DeviationId::D12),
+                    );
+                }
+                TextFont::Fixed(FontRef::Bitmap(font), em)
+            }
         } else {
             let name = asset::join(&self.entry_dir, &path);
             match self
@@ -252,10 +276,18 @@ impl Cx<'_> {
             rects.push(v);
         }
         let t = self.model_track(&c, &rects)?;
-        self.budget.text().map_err(|l| self.limit(at, l))?;
         let font = match tf {
             TextFont::Model(f) | TextFont::Fixed(f, _) => f,
         };
+        // A bitmap line pushes a quad per character at most.
+        let quads = match (font, &text) {
+            (FontRef::Bitmap(_), TextValue::Literal(s)) => s.chars().count(),
+            (FontRef::Bitmap(_), TextValue::Field(_)) => MAX_TEXT_BYTES,
+            _ => 1,
+        };
+        self.budget
+            .text(u32::try_from(quads).unwrap_or(u32::MAX))
+            .map_err(|l| self.limit(at, l))?;
         let index = u32::try_from(self.widgets.texts.len()).unwrap_or(u32::MAX);
         self.widgets.texts.push(TextDef {
             value: text,
@@ -267,6 +299,100 @@ impl Cx<'_> {
         c.blend = skin_model::Blend::Alpha;
         self.push(c, Source::Text(index), t);
         Ok(())
+    }
+
+    /// The bitmap font of `.fnt` font record `rec` with primary `path`:
+    /// made once per record, its files admitted once per name. A fallback
+    /// that fails is skipped with a note; a primary that fails ignores
+    /// the element when the source also draws nothing, and drops it
+    /// otherwise. `None` when the element went.
+    fn bitmap_font(
+        &mut self,
+        role: Role,
+        at: Span,
+        rec: u32,
+        path: &str,
+    ) -> Result<Option<u32>, ImportError> {
+        let outcome = match self.assets.bitmap_font(rec) {
+            Some(o) => o,
+            None => {
+                let names = self.fallbacks(rec, at)?;
+                let primary = asset::join(&self.entry_dir, path);
+                let primary = self
+                    .assets
+                    .fnt_file(&mut self.budget, &primary)
+                    .map_err(|l| self.limit(at, l))?;
+                let mut fallbacks = Vec::with_capacity(names.len());
+                if primary.is_ok() {
+                    for name in &names {
+                        match self
+                            .assets
+                            .fnt_file(&mut self.budget, name)
+                            .map_err(|l| self.limit(at, l))?
+                        {
+                            Ok(f) => fallbacks.push(f),
+                            Err(failure) => {
+                                let why = failure_note(failure);
+                                self.note(Some(at), Severity::Ignored, why);
+                            }
+                        }
+                    }
+                }
+                let files = primary.map(|p| (p, fallbacks.as_slice()));
+                self.assets
+                    .add_bitmap_font(rec, files)
+                    .map_err(|l| self.limit(at, l))?
+            }
+        };
+        match outcome {
+            Ok(font) => Ok(Some(font)),
+            Err(FntFailure::Fnt(e)) if e.kind.upstream_fails() => {
+                self.ignored(at, NoteKind::BitmapFont(e));
+                Ok(None)
+            }
+            Err(failure) => {
+                self.drop_el(role, at, failure_note(failure))?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// The fallback files of font record `rec`, joined to the
+    /// definition's folder: the `path` of each `fallback[]` entry that has
+    /// one (`JsonSkinObjectLoader.java:637-649`). The count is checked
+    /// before anything is kept.
+    fn fallbacks(&mut self, rec: u32, at: Span) -> Result<Vec<String>, ImportError> {
+        let [field] = self.def.fields(rec, ["fallback"]);
+        let Some(f) = field else {
+            return Ok(Vec::new());
+        };
+        if self.def.arena.node(f).kind != Kind::Array {
+            return Err(self.def.type_error(f, "fallback", "an array"));
+        }
+        let n = self.def.arena.children(f).count();
+        if n > MAX_FALLBACKS {
+            return Err(self.limit(at, ImportLimit::Fonts));
+        }
+        let items: Vec<u32> = self.def.arena.children(f).collect();
+        let mut names = Vec::with_capacity(n);
+        for item in items {
+            if !matches!(self.def.arena.scalar(item), Scalar::Object) {
+                continue;
+            }
+            let [path] = self.def.fields(item, ["path"]);
+            if let Some(p) = self.opt_string(path, "path")? {
+                names.push(asset::join(&self.entry_dir, &p));
+            }
+        }
+        Ok(names)
+    }
+}
+
+/// The note for a `.fnt` file that failed.
+fn failure_note(failure: FntFailure) -> NoteKind {
+    match failure {
+        FntFailure::Missing => NoteKind::MissingAsset,
+        FntFailure::Fnt(e) => NoteKind::BitmapFont(e),
     }
 }
 
