@@ -615,12 +615,12 @@ fn long_note_edge_cases() {
 #[test]
 fn resolved_hash_matches_golden() {
     // Computed at authoring time by an independent script encoding the
-    // documented fields of this chart: version 7, the 120 BPM rate
+    // documented fields of this chart: version 8, the 120 BPM rate
     // (floor(2^80 / 500_000) units per µs) before time 0 and as the one
     // segment from 0, one tap at 2 s and 4 beats on key 1 with sound 0, bar
     // lines at 0 and 4 beats, the sound name `a.wav`, an empty title and no
     // other values (no judgment-header declarations, no LN mode).
-    const GOLDEN: &str = "8389c3821cf1dda5921d67bbcd21862fab56bbe6d85c3478290d4bb8ea6be3fa";
+    const GOLDEN: &str = "017b3a8cb8565179f5b6ceb246899dadfe0fe4279417d19d869707cd1c198139";
     let loaded = load_text("#BPM 120\n#WAV01 a.wav\n#00111:01\n").unwrap();
     let hex: String = loaded
         .chart
