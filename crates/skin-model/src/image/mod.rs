@@ -10,6 +10,7 @@
 
 pub(crate) mod builder;
 pub(crate) mod decode;
+pub(crate) mod fnt;
 pub(crate) mod font;
 pub(crate) mod path;
 
@@ -248,6 +249,10 @@ pub struct Sheet {
     cells: Box<[Cell]>,
     /// The font files' names.
     fonts: Box<[String]>,
+    /// The bitmap font files, each with its pages.
+    fnts: Box<[fnt::Fnt]>,
+    /// The bitmap fonts: each a primary file, then its fallbacks.
+    bitmap_fonts: Box<[Box<[u16]>]>,
 }
 
 /// Image `image`'s frame count: its grid has a column and a row, and at
@@ -526,6 +531,8 @@ impl Sheet {
             frames: Box::new([]),
             cells: Box::new([]),
             fonts: Box::new([]),
+            fnts: Box::new([]),
+            bitmap_fonts: Box::new([]),
         }
     }
 
@@ -608,6 +615,8 @@ impl Sheet {
             frames: frames.into_boxed_slice(),
             cells: cells.into_boxed_slice(),
             fonts: Box::new([]),
+            fnts: Box::new([]),
+            bitmap_fonts: Box::new([]),
         })
     }
 
@@ -649,5 +658,19 @@ impl Sheet {
 
     pub(crate) fn cells(&self) -> &[Cell] {
         &self.cells
+    }
+
+    /// The bitmap fonts ([`SheetBuilder::add_bitmap_font`](builder::SheetBuilder::add_bitmap_font)).
+    #[must_use]
+    pub fn bitmap_font_count(&self) -> usize {
+        self.bitmap_fonts.len()
+    }
+
+    pub(crate) fn fnts(&self) -> &[fnt::Fnt] {
+        &self.fnts
+    }
+
+    pub(crate) fn bitmap_fonts(&self) -> &[Box<[u16]>] {
+        &self.bitmap_fonts
     }
 }

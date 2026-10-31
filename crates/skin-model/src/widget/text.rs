@@ -11,12 +11,17 @@
 //! [`Align`]; spilled text overflows the box, centred text both ways. The
 //! quad is the ink rect `[x + off + (ink.x − left)·h·sx, y + ink.y·h,
 //! ink.w·h·sx, ink.h·h]`, turned about the element's pivot on the box.
+//!
+//! A text in a bitmap font ([`FontRef::Bitmap`]) is laid out before play
+//! instead ([`glyphs`](super::glyphs)) and drawn as one quad per glyph,
+//! by the same width, squeeze and alignment.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use super::Brush;
 use super::digits::Align;
-use crate::atlas::uv::FrameUv;
+use super::glyphs::GlyphLine;
+use crate::atlas::uv::{FrameUv, UvTable};
 use crate::quad::{Filter, QuadBatch};
 
 /// The most text elements one skin may hold.
@@ -60,6 +65,10 @@ pub enum FontRef {
     /// The sheet's font file at this index
     /// ([`Sheet::with_fonts`](crate::Sheet::with_fonts)).
     File(u32),
+    /// The sheet's bitmap font at this index
+    /// ([`SheetBuilder::add_bitmap_font`](crate::SheetBuilder::add_bitmap_font)),
+    /// laid out by [`Skin::attach_bitmap_text`](crate::Skin::attach_bitmap_text).
+    Bitmap(u32),
 }
 
 /// What a line wider than its box does.
@@ -79,6 +88,23 @@ pub struct TextDef {
     /// Which edge of the box the line sits on: left, centre or right.
     pub align: Align,
     pub overflow: Overflow,
+}
+
+impl TextDef {
+    /// The quads one frame of this text can push at worst: 1, or with a
+    /// bitmap font one per character, a literal's or a field's
+    /// [`MAX_TEXT_BYTES`].
+    pub(crate) fn quads(&self) -> u32 {
+        match (self.font, &self.value) {
+            (FontRef::Bitmap(_), TextValue::Literal(s)) => {
+                u32::try_from(s.chars().count()).unwrap_or(u32::MAX)
+            }
+            (FontRef::Bitmap(_), TextValue::Field(_)) => {
+                u32::try_from(MAX_TEXT_BYTES).unwrap_or(u32::MAX)
+            }
+            (FontRef::Default | FontRef::File(_), _) => 1,
+        }
+    }
 }
 
 /// Why a text element was refused.
@@ -257,6 +283,8 @@ pub(crate) struct Text {
     pub(crate) slot: u16,
     pub(crate) align: Align,
     pub(crate) overflow: Overflow,
+    /// The bitmap font, for a bitmap line.
+    pub(crate) bitmap: Option<u32>,
 }
 
 impl Text {
@@ -294,5 +322,61 @@ impl Text {
         let [fx, fy] = brush.pivot;
         let pivot = [x + fx * w, y + fy * h];
         brush.push_about(out, rect, pivot, image.uv, Filter::Linear);
+    }
+
+    /// Pushes the glyphs of bitmap line `line` laid out in the box
+    /// `[x, y, w, h]`, `h` the font's size: the line's width
+    /// `tw = width·h`, squeezed to `w` by `sx` under [`Overflow::Shrink`]
+    /// when wider, sits at the box's left, centre or right; each glyph's
+    /// quad is `[x + off + ink.x·h·sx, y + ink.y·h, ink.w·h·sx,
+    /// ink.h·h]`, turned about the element's pivot on the box. Each
+    /// glyph's uv is found in its page's frame now, so a line never
+    /// depends on how an atlas packed the pages; a missing frame draws
+    /// nothing. Allocates nothing.
+    pub(crate) fn draw_glyphs(
+        &self,
+        line: &GlyphLine,
+        [x, y, w, h]: [f32; 4],
+        brush: &Brush,
+        uvs: &UvTable,
+        out: &mut QuadBatch,
+    ) {
+        let tw = line.width_em * h;
+        let sx = if self.overflow == Overflow::Shrink && tw > w {
+            w / tw
+        } else {
+            1.0
+        };
+        let d = tw * sx;
+        let off = match self.align {
+            Align::Left => 0.0,
+            Align::Center => (w - d) / 2.0,
+            Align::Right => w - d,
+        };
+        let [fx, fy] = brush.pivot;
+        let pivot = [x + fx * w, y + fy * h];
+        for q in &line.quads {
+            let Some(f) = uvs.get(q.frame) else {
+                continue;
+            };
+            // A page is a whole frame: `(u1 − u0) / width` is exactly one
+            // over the atlas side, so each uv is exact.
+            let [u0, v0, u1, v1] = f.uv;
+            let [pw, ph] = q.page.map(f32::from);
+            let (ku, kv) = ((u1 - u0) / pw, (v1 - v0) / ph);
+            let [gx, gy, gw, gh] = q.src.map(f32::from);
+            let uv = FrameUv {
+                uv: [
+                    u0 + gx * ku,
+                    v0 + gy * kv,
+                    u0 + (gx + gw) * ku,
+                    v0 + (gy + gh) * kv,
+                ],
+                layer: f.layer,
+            };
+            let [ix, iy, iw, ih] = q.ink;
+            let rect = [x + off + ix * h * sx, y + iy * h, iw * h * sx, ih * h];
+            brush.push_about(out, rect, pivot, uv, Filter::Linear);
+        }
     }
 }

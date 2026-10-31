@@ -56,7 +56,7 @@ pub enum FontError {
 }
 
 impl FontError {
-    fn path(font: usize, e: PathError) -> Self {
+    pub(crate) fn path(font: usize, e: PathError) -> Self {
         match e {
             PathError::Rejected => Self::PathRejected { font },
             PathError::Missing => Self::Missing { font },

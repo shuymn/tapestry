@@ -20,6 +20,7 @@ use crate::schema::Ty;
 use crate::track::Track;
 use crate::widget::digits::{Align, Digits, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError};
+use crate::widget::glyphs;
 use crate::widget::judge::{
     ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgeSlot,
 };
@@ -343,14 +344,15 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
 
 /// The resource checks of [`Skin::new`] for one element's widget, whose
 /// index is valid: every image exists, glyph images hold whole sets, and
-/// a text's font file exists. `frames` gives an image's frame count,
-/// `None` for a missing image; the sheet has `fonts` font files.
+/// a text's font exists. `frames` gives an image's frame count, `None`
+/// for a missing image; the sheet has `fonts` font files and `bitmaps`
+/// bitmap fonts.
 fn check_widget_images(
     element: usize,
     source: Source,
     w: &WidgetDefs,
     frames: &impl Fn(u32) -> Option<u16>,
-    fonts: usize,
+    [fonts, bitmaps]: [usize; 2],
 ) -> Result<(), LoadError> {
     match source {
         Source::Number(i) => {
@@ -391,9 +393,12 @@ fn check_widget_images(
             }
         }
         Source::Text(i) => {
-            if let Some(FontRef::File(f)) = w.texts.get(index(i)).map(|t| t.font)
-                && index(f) >= fonts
-            {
+            let known = match w.texts.get(index(i)).map(|t| t.font) {
+                Some(FontRef::File(f)) => index(f) < fonts,
+                Some(FontRef::Bitmap(f)) => index(f) < bitmaps,
+                Some(FontRef::Default) | None => true,
+            };
+            if !known {
                 let error = TextError::UnknownFont;
                 return Err(LoadError::Text { element, error });
             }
@@ -450,12 +455,13 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
 }
 
 /// The widget quads one frame of `source`'s element can push at worst:
-/// 0 for an image or the lanes, which `quad_capacity` counts apart, and 1
-/// for a text.
+/// 0 for an image or the lanes, which `quad_capacity` counts apart; for a
+/// text, 1, or with a bitmap font one per character: a literal's
+/// characters, or [`MAX_TEXT_BYTES`] for a field.
 fn worst(source: Source, w: &WidgetDefs) -> u32 {
     match source {
         Source::Image(_) | Source::Lanes => 0,
-        Source::Text(_) => 1,
+        Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
             .numbers
             .get(index(i))
@@ -691,7 +697,8 @@ impl Skin {
             return Err(LoadError::UnknownImage { element });
         }
         for (element, e) in elements.iter().enumerate() {
-            check_widget_images(element, e.source, w, &frames, def.sheet.font_count())?;
+            let fonts = [def.sheet.font_count(), def.sheet.bitmap_font_count()];
+            check_widget_images(element, e.source, w, &frames, fonts)?;
         }
         if let Some((part, _)) = def
             .lanes
@@ -831,6 +838,10 @@ impl Skin {
                             slot: text_slots,
                             align: def.map_or(Align::Left, |d| d.align),
                             overflow: def.map_or(Overflow::Spill, |d| d.overflow),
+                            bitmap: match def.map(|d| d.font) {
+                                Some(FontRef::Bitmap(f)) => Some(f),
+                                _ => None,
+                            },
                         };
                         text_slots = text_slots.saturating_add(1);
                         Kind::Text(index(i), text)
@@ -898,7 +909,8 @@ impl Skin {
     /// The quads a frame can push: one per image element, each widget
     /// element's worst case (a number's cells, a gauge's segments and its
     /// flicker's tip, a judge's largest slot with its combo's cells, a
-    /// text's one line), and the lanes' budget with its reserved quads.
+    /// text's one line or its bitmap glyphs), and the lanes' budget with
+    /// its reserved quads.
     #[must_use]
     pub fn quad_capacity(&self) -> u32 {
         let images = self
@@ -1044,6 +1056,9 @@ impl Skin {
             let Some(def) = self.texts.get(i) else {
                 continue;
             };
+            if t.bitmap.is_some() {
+                continue;
+            }
             let s = text::clean(&def.value.resolve(chart));
             if s.is_empty() {
                 continue;
@@ -1064,9 +1079,39 @@ impl Skin {
         out
     }
 
+    /// Lays out `play`'s bitmap lines for `chart`, one per text slot in a
+    /// bitmap font ([`FontRef::Bitmap`]). For `prepare`, not in play: it
+    /// allocates. A fresh [`prepare`](Self::prepare) starts with none, so
+    /// no bitmap text draws until this is called.
+    ///
+    /// The string is chosen and cleaned as
+    /// [`text_requests`](Self::text_requests) does; an element whose
+    /// visibility folds to false, or whose line has a value beyond
+    /// ±[`MAX_TEXT_EM`](crate::MAX_TEXT_EM) em, gets no line.
+    pub fn attach_bitmap_text(&self, play: &mut Play, chart: &ChartText<'_>) {
+        let mut lines = vec![None; self.text_slots()];
+        for e in &self.elements {
+            let Kind::Text(i, t) = e.kind else {
+                continue;
+            };
+            let (Some(font), Some(def)) = (t.bitmap, self.texts.get(i)) else {
+                continue;
+            };
+            if e.visible.as_ref().and_then(Program::constant) == Some(0) {
+                continue;
+            }
+            let s = text::clean(&def.value.resolve(chart));
+            if let Some(slot) = lines.get_mut(usize::from(t.slot)) {
+                *slot = glyphs::layout(&self.sheet, font, &s);
+            }
+        }
+        play.set_bitmap(lines.into_boxed_slice());
+    }
+
     /// Attaches the rasterized lines of `play`'s attempt, one per text
-    /// slot. A fresh [`prepare`](Self::prepare) starts with none, so no
-    /// text draws until its table is attached.
+    /// slot; a slot in a bitmap font draws its bitmap line instead. A
+    /// fresh [`prepare`](Self::prepare) starts with none, so no text draws
+    /// until its table is attached.
     ///
     /// # Errors
     ///
@@ -1140,6 +1185,7 @@ impl Skin {
         let state = play.state();
         // A table of another length draws no text.
         let texts = play.text().len() == self.text_slots();
+        let bitmaps = play.bitmap().len() == self.text_slots();
         let display = TimeUs(frame.now.0.saturating_add(frame.display_offset.0));
         for e in &self.elements {
             if !placement.region(e.region).visible {
@@ -1206,7 +1252,13 @@ impl Skin {
                     }
                 }
                 Kind::Text(_, t) => {
-                    if let Some(image) = play.text().get(t.slot).filter(|_| texts) {
+                    if t.bitmap.is_some() {
+                        if let Some(Some(line)) =
+                            play.bitmap().get(usize::from(t.slot)).filter(|_| bitmaps)
+                        {
+                            t.draw_glyphs(line, s.rect, &brush, uvs, out);
+                        }
+                    } else if let Some(image) = play.text().get(t.slot).filter(|_| texts) {
                         t.draw(image, s.rect, &brush, out);
                     }
                 }
