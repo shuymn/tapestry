@@ -242,7 +242,7 @@ fn check_header(h: &Header) {
 /// most [`SKIN_FILES`]`.len()` of them, written to a temporary skin folder
 /// under those names. The header is read with no option enabled, then
 /// resolved again with every option item's number enabled, then once more
-/// with none.
+/// with none, also after that configured pass fails.
 ///
 /// # Errors
 ///
@@ -251,7 +251,7 @@ fn check_header(h: &Header) {
 /// # Panics
 ///
 /// If a header breaks [`check_header`]'s bounds, or resolving again with
-/// no option enabled gives another header than the first pass.
+/// no option enabled gives another header than the first pass or fails.
 ///
 /// [`Resolved::header`]: skin_beatoraja::Resolved::header
 pub fn skin_json(data: &[u8]) -> Result<Header, ImportError> {
@@ -275,14 +275,18 @@ pub fn skin_json(data: &[u8]) -> Result<Header, ImportError> {
         .iter()
         .flat_map(|o| o.items.iter().map(|i| i.op))
         .collect();
-    let configured = resolve(&mut def, &enabled)?.header()?;
-    check_header(&configured);
-    let again = resolve(&mut def, &BTreeSet::new())?.header()?;
+    // The configured pass may fail part way, leaving included files in the
+    // arena; the pass after it must start from the entry file regardless.
+    let configured = resolve(&mut def, &enabled).and_then(|mut r| r.header());
+    if let Ok(h) = &configured {
+        check_header(h);
+    }
+    let again = resolve(&mut def, &BTreeSet::new()).and_then(|mut r| r.header());
     assert!(
-        again == header,
-        "resolving again with no option enabled changed the header"
+        matches!(&again, Ok(h) if *h == header),
+        "resolving again with no option enabled changed the header: {again:?}"
     );
-    Ok(configured)
+    configured
 }
 
 /// Target `canary`, for the self-test only (scripts/fuzz-selftest.sh): one

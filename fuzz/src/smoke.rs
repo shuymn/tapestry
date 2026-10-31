@@ -259,7 +259,15 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
     assert_names(
         &seeds,
         &[
-            "options", "choices", "lenient", "cycle", "not_play", "size", "syntax", "missing",
+            "options",
+            "choices",
+            "lenient",
+            "cycle",
+            "not_play",
+            "size",
+            "syntax",
+            "missing",
+            "configured_fails",
         ],
     );
     for (name, data) in seeds {
@@ -308,6 +316,12 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                         ..
                     })
                 ),
+                "{name}: {result:?}"
+            ),
+            // The configured pass's error, after the pass with none
+            // enabled replayed and matched.
+            "configured_fails" => assert!(
+                matches!(result, Err(ImportError::Read { ref name, .. }) if name == "none.json"),
                 "{name}: {result:?}"
             ),
             "missing" => assert!(

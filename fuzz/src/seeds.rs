@@ -627,6 +627,7 @@ pub fn skin_jsons() -> Vec<Seed> {
     let lenient = "\u{feff}// a comment\n{type: 0, name: unquoted name  ,\n\
         property: [\n  {name: a /* block */}\n  {name: b},\n],\n\
         offset: [{id: 10.7, x: TRUE}]}";
+    let configured_fails = configured_fails_entry();
     vec![
         (
             "options",
@@ -663,5 +664,17 @@ pub fn skin_jsons() -> Vec<Seed> {
             "missing",
             skin_input(&[r#"{"type": 0, "offset": [{"include": "none.json"}]}"#]),
         ),
+        ("configured_fails", skin_input(&[&configured_fails, "[]"])),
     ]
+}
+
+/// A header pass of 600 includes; the configured pass makes them too, then
+/// fails on a missing file, so the pass after it starts from a partly
+/// filled arena and counts that are only right if they start again.
+fn configured_fails_entry() -> String {
+    let includes = vec![r#"{"include": "i1.json"}"#; 600].join(",");
+    format!(
+        r#"{{"type": 0, "property": [{{"name": "m", "item": [{{"op": 901}}]}}, {includes},
+        {{"if": 901, "values": {{"include": "none.json"}}}}]}}"#
+    )
 }
