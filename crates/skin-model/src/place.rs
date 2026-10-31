@@ -192,7 +192,10 @@ impl Axis {
     }
 }
 
-#[expect(clippy::cast_precision_loss, reason = "box edges are within ±2^22")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "box edges are within ±2^26: a glyph strip of 11 cells of ±2^21 pitch from a corner within ±2^21"
+)]
 fn f(v: i64) -> f64 {
     v as f64
 }

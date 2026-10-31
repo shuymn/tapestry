@@ -201,6 +201,7 @@ pub fn skin_with(
         sheet: sheet(),
         lanes,
         elements,
+        widgets: skin_model::WidgetDefs::default(),
     })
 }
 

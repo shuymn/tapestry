@@ -18,17 +18,18 @@
 //! [`Variant`] (1x or @2x) into texture-array [`Page`]s with box-filtered
 //! mips and a [`UvTable`] that finds each frame in them.
 //!
-//! A [`Skin`] holds elements in draw order, each an image or the lanes
-//! widget on a keyframe [`Track`] on a timer, placed in one of seven
-//! [`Region`]s, and `when` timers. The target size gives the [`Canvas`];
-//! the player's [`Layout`] moves, scales and hides regions within the
-//! translation clamp, and the scratch side and lane width re-lay the lanes
-//! ([`Skin::placement`]). [`Skin::prepare`] makes one attempt's [`Play`];
+//! A [`Skin`] holds elements in draw order, each an image, a number, a
+//! gauge, a judgment display or the lanes widget on a keyframe [`Track`]
+//! on a timer, placed in one of seven [`Region`]s, and `when` timers. The
+//! target size gives the [`Canvas`]; the player's [`Layout`] moves, scales
+//! and hides regions within the translation clamp, and the scratch side
+//! and lane width re-lay the lanes ([`Skin::placement`]). [`Skin::prepare`] makes one attempt's [`Play`];
 //! [`Skin::build`] runs each frame's drained effects through its reducer,
 //! reads the play view's snapshot into the [`PLAY`] schema's fields,
 //! starts the timers and pushes each drawn element's quads: an image's
-//! current frame from the uv table, turned about its pivot, or the lanes'
-//! notes, bar lines, judgment line and covers.
+//! current frame from the uv table, turned about its pivot; a number's
+//! glyph cells; a gauge's lit and unlit segments; the judgment's grade
+//! and combo; or the lanes' notes, bar lines, judgment line and covers.
 //!
 //! Expressions use integers only; floats appear only in a quad's geometry,
 //! after evaluation. The cast lints below reject `as` casts that may
@@ -83,12 +84,19 @@ pub use play::{Attempt, GaugeDesc, Play, PlayContext, PrepareError, SkinFrame};
 pub use quad::{Blend, ClipId, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use skin::{
-    ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS, Skin, SkinDef,
-    Source, TimerRef,
+    ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
+    MAX_WIDGET_QUADS, Skin, SkinDef, Source, TimerRef, WidgetDefs,
 };
 pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
 };
+pub use widget::digits::{
+    Align, DigitsDef, GlyphSet, I32_DIGITS, MAX_CELLS, NumberDef, NumberError, Pad,
+};
+pub use widget::gauge::{
+    GaugeDef, GaugeError, GaugeLook, GaugePart, GaugeParts, MAX_SEGMENTS, Motion,
+};
+pub use widget::judge::{Attach, ComboPart, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot};
 pub use widget::lanes::{
     LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneView, LanesDef, LanesError,
     MAX_COVERED, Side,

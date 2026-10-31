@@ -10,33 +10,28 @@ pub(crate) mod timers;
 
 use bms_model::{Chart, LANE_COUNT, Lane, Note, Position, ScrollMap, TimeUs};
 use eval::{GaugeState, JudgeEvent, Section, Tally};
-use rules::{GaugeRule, GaugeValue};
+use rules::GaugeValue;
 
 use self::reducer::Reducer;
 use self::schema::{field, timer};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
+use crate::widget::gauge::GaugeLook;
 use crate::widget::lanes::{LaneView, Side};
 
 /// What the skin knows of one of the preset's gauges, in the preset's
-/// order.
+/// order ([`GaugeDesc::from_rule`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GaugeDesc {
     /// The value a whole-chart attempt starts at.
     pub start: GaugeValue,
     /// The value `gauge_max` turns on at.
     pub max: GaugeValue,
-}
-
-impl GaugeDesc {
-    /// The descriptor of a preset's gauge rule.
-    #[must_use]
-    pub fn from_rule(rule: &GaugeRule) -> Self {
-        Self {
-            start: rule.start,
-            max: rule.max,
-        }
-    }
+    /// The images a `gauge` widget draws it with.
+    pub look: GaugeLook,
+    /// Where a `gauge` widget's segments change from below the border to
+    /// at or above it.
+    pub border: GaugeValue,
 }
 
 /// What one attempt plays.
@@ -124,6 +119,8 @@ pub struct Play {
     play_at: TimeUs,
     scratch: Side,
     notes: Option<Box<Notes>>,
+    /// The context's gauge descriptors.
+    gauges: Box<[GaugeDesc]>,
 }
 
 /// The chart's notes and bar lines, kept for a skin with lanes.
@@ -206,6 +203,7 @@ impl Play {
             play_at,
             scratch: ctx.scratch,
             notes,
+            gauges: ctx.gauges.into(),
         })
     }
 
@@ -231,6 +229,17 @@ impl Play {
             fields: &self.fields,
             timers: &self.ms,
         }
+    }
+
+    /// The descriptor of the context's gauge `i`.
+    pub(crate) fn gauge_desc(&self, i: usize) -> Option<&GaugeDesc> {
+        self.gauges.get(i)
+    }
+
+    /// The latest judgment's grade as of the last build, `None` before
+    /// the first.
+    pub(crate) fn judge(&self) -> Option<schema::Grade> {
+        self.reducer.judge.map(|(g, _)| g)
     }
 
     /// The attempt's scratch side.
@@ -315,6 +324,7 @@ mod tests {
             sheet: Sheet::empty(),
             lanes: None,
             elements: Vec::new(),
+            widgets: crate::WidgetDefs::default(),
         })
         .unwrap();
         let limits = AtlasLimits {
@@ -326,6 +336,8 @@ mod tests {
         let gauges = [GaugeDesc {
             start: GaugeValue(0),
             max: GaugeValue::FULL,
+            look: crate::GaugeLook::Normal,
+            border: GaugeValue(80 * GaugeValue::PERCENT),
         }];
         let ctx = PlayContext {
             gauges: &gauges,

@@ -39,6 +39,7 @@ fn fixed(elements: Vec<ElementDef>) -> Skin {
         sheet: sheet(),
         lanes: None,
         elements,
+        widgets: skin_model::WidgetDefs::default(),
     })
     .unwrap()
 }
