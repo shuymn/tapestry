@@ -43,6 +43,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         attempt: Attempt::Section(s),
         empty_poor_breaks_combo: false,
         scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
     }
 }
 
@@ -401,6 +402,7 @@ fn targets_match_the_evaluators() {
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: preset.empty_poor.breaks_combo,
         scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
     };
     let section_ctx = PlayContext {
         attempt: Attempt::Section(&edge),

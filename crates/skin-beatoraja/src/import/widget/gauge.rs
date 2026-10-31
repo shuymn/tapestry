@@ -75,13 +75,10 @@ fn motion(kind: i32, range: i32, cycle: i32, parts: i32) -> Result<Option<Motion
         Ok(Some(make(r, period()?)))
     };
     match (kind, range) {
-        // `(int) (random · (range + 1))` is 0 for −2 ≤ range ≤ 0, and
-        // `% (range + 1)` is 0 for range −2 (`% −1`); range −1 divides
-        // Rise and Fall by zero.
-        (0, -2..=0) | (1 | 2, -2 | 0) => Ok(Some(Motion::Still)),
-        (1 | 2, -1) => Err("range"),
-        // A negative phase the model's range cannot hold.
-        (0..=2, ..=-3) => Err("range"),
+        // A range of 0 or less is still for every kind the source draws
+        // (stage3.md, the gauge mapping); the source's arithmetic on a
+        // negative range is not reproduced.
+        (0..=3, ..=0) => Ok(Some(Motion::Still)),
         (0, _) => moving(|range, step| Motion::Random { range, step }),
         (1, _) => moving(|range, step| Motion::Rise { range, step }),
         (2, _) => moving(|range, step| Motion::Fall { range, step }),
@@ -288,18 +285,21 @@ mod tests {
             }))
         );
         assert_eq!(
-            motion(3, -5, 40, 50),
+            motion(3, 1, 40, 50),
             Ok(Some(Motion::Flicker { period: us(40) }))
         );
-        for kind in 0..=2 {
-            assert_eq!(motion(kind, 0, 0, 50), Ok(Some(Motion::Still)), "{kind}");
-            assert_eq!(motion(kind, -2, 33, 50), Ok(Some(Motion::Still)), "{kind}");
-            assert_eq!(motion(kind, -3, 33, 50), Err("range"), "{kind}");
+        // A range of 0 or less is still for every kind, whatever the cycle.
+        for kind in 0..=3 {
+            for range in [0, -1, -2, -3, i32::MIN] {
+                assert_eq!(
+                    motion(kind, range, 0, 50),
+                    Ok(Some(Motion::Still)),
+                    "{kind} {range}"
+                );
+            }
         }
-        assert_eq!(motion(0, -1, 33, 50), Ok(Some(Motion::Still)));
-        assert_eq!(motion(1, -1, 33, 50), Err("range"));
-        assert_eq!(motion(2, -1, 33, 50), Err("range"));
         assert_eq!(motion(4, 3, 33, 50), Ok(None));
+        assert_eq!(motion(4, -1, 33, 50), Ok(None));
         assert_eq!(motion(0, 51, 33, 50), Err("range"));
         assert_eq!(
             motion(0, 50, 33, 50),
@@ -313,39 +313,5 @@ mod tests {
         let max = i32::try_from(MAX_KEY_US / 1000).unwrap();
         assert!(motion(3, 3, max, 50).is_ok());
         assert_eq!(motion(3, 3, max + 1, 50), Err("cycle"));
-    }
-
-    /// Java's `%` keeps the dividend's sign: the phases for range −2 are
-    /// all 0, and range −3 reaches −1 (Random, Rise) or 1 (Fall).
-    #[test]
-    fn negative_ranges_follow_java_arithmetic() {
-        let rise = |range: i32| {
-            let mut a = 0_i32;
-            (0..6)
-                .map(|_| {
-                    a = (a + range) % (range + 1);
-                    a
-                })
-                .collect::<Vec<_>>()
-        };
-        let fall = |range: i32| {
-            let mut a = 0_i32;
-            (0..6)
-                .map(|_| {
-                    a = (a + 1) % (range + 1);
-                    a
-                })
-                .collect::<Vec<_>>()
-        };
-        assert!(rise(-2).iter().all(|&a| a == 0));
-        assert!(fall(-2).iter().all(|&a| a == 0));
-        assert!(rise(-3).contains(&-1));
-        assert!(fall(-3).contains(&1));
-        // Random truncates toward zero: (−1, 0] for range −2, (−2, 0] for
-        // range −3.
-        #[expect(clippy::cast_possible_truncation, reason = "Java's (int)")]
-        let random = |range: i32, x: f64| (x * f64::from(range + 1)) as i32;
-        assert_eq!(random(-2, 0.999), 0);
-        assert_eq!(random(-3, 0.999), -1);
     }
 }

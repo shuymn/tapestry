@@ -302,15 +302,6 @@ pub(crate) fn numeric(op: i32, declared: &BTreeSet<i32>, enabled: &BTreeSet<i32>
     Cond::Undefined(op)
 }
 
-/// `s` as Java's `Integer.parseInt` reads it: a sign, then ASCII digits.
-pub(crate) fn java_int(s: &str) -> Option<i32> {
-    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
-}
-
 /// The id of boolean property `name`, without `!` prefixes.
 fn named_id(name: &str) -> Option<i32> {
     if let Some(&(id, _)) = KNOWN_BOOLEAN_IDS.iter().find(|(_, n)| *n == name) {
@@ -321,7 +312,7 @@ fn named_id(name: &str) -> Option<i32> {
         Some(d) => (d, PRACTICE_ITEM_SELECTED),
         None => (rest, PRACTICE_ITEM),
     };
-    let n = java_int(digits)?;
+    let n = digits.parse::<i32>().ok()?;
     (1..=PRACTICE_ITEMS).contains(&n).then(|| first + n - 1)
 }
 

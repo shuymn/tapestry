@@ -166,12 +166,19 @@ pub(crate) enum FntFailure {
 /// (columns and rows kept).
 pub(crate) type ImageKey = (u32, bool, [u32; 2]);
 
+/// The source rows an image keeps of its single frame: the first row and
+/// the count.
+pub(crate) type Crop = [u32; 2];
+
 /// The sheet being built, with the importer's caches.
 pub(crate) struct Assets {
     builder: SheetBuilder,
     /// Admitted files and cached failures, by name and @2x name.
     files: HashMap<(String, Option<String>), Result<u32, Option<ImageError>>>,
-    images: HashMap<ImageKey, (u32, [u32; 2])>,
+    /// Each key's uncropped image and cell, once one of its images is
+    /// added.
+    bases: HashMap<ImageKey, (ImageDef, [u32; 2])>,
+    images: HashMap<(ImageKey, Option<Crop>), (u32, [u32; 2])>,
     fonts: HashMap<String, Font>,
     /// Admitted `.fnt` files and cached failures, by name.
     fnt_files: HashMap<String, Result<u16, FntFailure>>,
@@ -191,6 +198,7 @@ impl Assets {
         Self {
             builder: SheetBuilder::new(root),
             files: HashMap::new(),
+            bases: HashMap::new(),
             images: HashMap::new(),
             fonts: HashMap::new(),
             fnt_files: HashMap::new(),
@@ -259,21 +267,41 @@ impl Assets {
         self.builder.file_dims(file)
     }
 
-    /// The model image for `key` and its cell size, if one was added.
-    pub(crate) fn image(&self, key: ImageKey) -> Option<(u32, [u32; 2])> {
-        self.images.get(&key).copied()
+    /// The model image for `key` cropped to `crop` and its cell size, if
+    /// one was added.
+    pub(crate) fn image(&self, key: ImageKey, crop: Option<Crop>) -> Option<(u32, [u32; 2])> {
+        self.images.get(&(key, crop)).copied()
     }
 
-    /// Adds image `def` with cells of `cell` under `key`.
+    /// `key`'s uncropped image and cell, once one of its images was added.
+    pub(crate) fn base(&self, key: ImageKey) -> Option<(ImageDef, [u32; 2])> {
+        self.bases.get(&key).copied()
+    }
+
+    /// Adds image `def` with cells of `cell` under `key`, its single
+    /// frame cut to the rows of `crop` when there is one; returns the
+    /// image and its cell.
     pub(crate) fn add_image(
         &mut self,
         key: ImageKey,
+        crop: Option<Crop>,
         def: ImageDef,
         cell: [u32; 2],
-    ) -> Result<u32, ImageError> {
-        let i = self.builder.add_image(def)?;
-        self.images.insert(key, (i, cell));
-        Ok(i)
+    ) -> Result<(u32, [u32; 2]), ImageError> {
+        let (added, added_cell) = match (crop, def.rect) {
+            (Some([y, rows]), Some([x, _, w, _])) => (
+                ImageDef {
+                    rect: Some([x, y, w, rows]),
+                    ..def
+                },
+                [cell[0], rows],
+            ),
+            _ => (def, cell),
+        };
+        let i = self.builder.add_image(added)?;
+        self.bases.insert(key, (def, cell));
+        self.images.insert((key, crop), (i, added_cell));
+        Ok((i, added_cell))
     }
 
     /// Admits font file `path` once.

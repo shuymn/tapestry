@@ -2,8 +2,6 @@
 //! property factories return for an id or a name, and which of those the
 //! model shows.
 
-use super::ops::java_int;
-
 /// The ids of `IntegerPropertyFactory.ValueType` with their names
 /// (`IntegerPropertyFactory.java:64-~490` at `0.8.9`), sorted by id.
 pub(crate) const VALUE_TYPES: &[(i32, &str)] = &[
@@ -335,7 +333,11 @@ pub(crate) fn int_by_id(id: i32) -> IntProp {
 /// Whether `name` is `prefix`, a number in `first..first + count`, and
 /// `suffix`.
 fn numbered(name: &str, prefix: &str, suffix: &str, first: i32, count: i32) -> Option<i32> {
-    let n = java_int(name.strip_prefix(prefix)?.strip_suffix(suffix)?)?;
+    let n = name
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse::<i32>()
+        .ok()?;
     (first..first + count).contains(&n).then_some(n)
 }
 
