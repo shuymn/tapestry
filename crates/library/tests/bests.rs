@@ -8,8 +8,8 @@ use std::fs;
 
 use bms_model::Speed;
 use common::{
-    CHART, Fixture, MS, RANDOM_CHART, contribution, hex, hits, key, played, record_of, score_of,
-    sql, tables,
+    CHART, Fixture, MS, RANDOM_CHART, contribution, hex, hits, key, played, record_of, refused,
+    score_of, sql, tables,
 };
 use library::{Best, BestsState, Ineligible, Ingested, LN_MODE, Score, Tuple};
 use replay::{EndStatus, InitialGauge, PlayRecord, PlayType, Practice};
@@ -20,36 +20,52 @@ fn completed_full_play_updates_the_best() {
     fx.chart("a.bms", CHART);
     let lib = fx.open();
     fx.pass(&lib);
-    // On time: every note PERFECT, a FULL COMBO; both tapestry gauges
-    // cleared.
-    let first = played(0);
+    // 30 ms late: every note GREAT (EX 3), still a
+    // FULL COMBO with both tapestry gauges cleared.
+    let first = played(30);
     let (rel, _) = fx.save(&first, "1-1.tprl");
     let Ingested::Counted { previous, current } = fx.live(&lib, &rel, CHART, &first) else {
         panic!("not counted");
     };
     assert_eq!(previous, None);
-    assert_eq!(
-        current,
-        Score {
-            plays: 1,
-            best: Some(Best {
-                ex: 6,
-                bp: 0,
-                cleared: vec![0b11],
-                full_combo: true,
-            }),
-        }
-    );
-    assert_eq!(score_of(&lib, &first), Some(current.clone()));
-    // A worse play changes only the count; a better EX raises it.
+    let late = Score {
+        plays: 1,
+        best: Some(Best {
+            ex: 3,
+            bp: 0,
+            cleared: vec![0b11],
+            full_combo: true,
+        }),
+    };
+    assert_eq!(current, late);
+    assert_eq!(score_of(&lib, &first), Some(late.clone()));
+    // On time: every note PERFECT, which raises the EX.
+    let better = played(0);
+    let (rel, _) = fx.save(&better, "2-1.tprl");
+    let Ingested::Counted { previous, current } = fx.live(&lib, &rel, CHART, &better) else {
+        panic!("not counted");
+    };
+    assert_eq!(previous, Some(late));
+    let best = Score {
+        plays: 2,
+        best: Some(Best {
+            ex: 6,
+            bp: 0,
+            cleared: vec![0b11],
+            full_combo: true,
+        }),
+    };
+    assert_eq!(current, best);
+    // A worse play, its long note released early and its last tap
+    // missed, changes only the count.
     let mut worse = played(0);
     worse.events.truncate(3);
     worse.events.push(key(2, 3_010 * MS, 0));
-    let (rel, _) = fx.save(&worse, "2-1.tprl");
+    let (rel, _) = fx.save(&worse, "3-1.tprl");
     fx.live(&lib, &rel, CHART, &worse);
     let after = score_of(&lib, &first).unwrap();
-    assert_eq!(after.plays, 2);
-    assert_eq!(after.best, current.best);
+    assert_eq!(after.plays, 3);
+    assert_eq!(after.best, best.best);
 }
 
 #[test]
@@ -293,10 +309,15 @@ fn version_change_invalidates_bests_without_schema_change() {
         fx.chart("a.bms", CHART);
         let record = played(0);
         fx.save(&record, "1-1.tprl");
+        // A record refused for good: stored in `refused`.
+        let mut old = played(0);
+        old.versions.evaluator += 1;
+        fx.save(&old, "2-1.tprl");
         let lib = fx.open();
         fx.pass(&lib);
         let counted = score_of(&lib, &record).unwrap();
         assert_eq!(counted.plays, 1);
+        assert_eq!(refused(&fx.db()).len(), 1, "{field}");
         drop(lib);
         sql(&fx.db(), &format!("UPDATE meta SET {field} = {field} + 1"));
         let (lib, opened) = library::Library::open(&fx.db()).unwrap();
@@ -305,11 +326,13 @@ fn version_change_invalidates_bests_without_schema_change() {
             panic!("{field}: {:?}", lib.bests_state());
         };
         assert_ne!(old, Tuple::current(), "{field}");
-        // Both tables empty before any scan, and a catch-up pending.
+        // The tables empty before any scan, and a catch-up pending.
         assert_eq!(tables(&fx.db()), (Vec::new(), Vec::new()), "{field}");
+        assert_eq!(refused(&fx.db()), Vec::<String>::new(), "{field}");
         assert!(lib.bests_pending().unwrap());
         fx.pass(&lib);
         assert_eq!(score_of(&lib, &record), Some(counted), "{field}");
+        assert_eq!(refused(&fx.db()).len(), 1, "{field}");
         assert!(!lib.bests_pending().unwrap());
         drop(lib);
         let (lib, _) = library::Library::open(&fx.db()).unwrap();
@@ -447,17 +470,48 @@ fn full_combo_needs_no_combo_break_including_empty_poor() {
             .full_combo
     };
     assert!(fc(&played(0), "1-1.tprl"));
-    // A press with no note near: an empty POOR, which breaks the combo
-    // under the tapestry preset.
-    let mut empty = played(0);
-    empty.events.insert(0, key(3, 500 * MS, 1));
-    empty.events.insert(1, key(3, 550 * MS, 0));
-    let preset = rules::tapestry();
-    assert_eq!(fc(&empty, "2-1.tprl"), !preset.empty_poor.breaks_combo);
+    // A press of key 1 300 ms before its note at 4 s: past the BAD window,
+    // within the empty POOR range, so an empty POOR. It sets the FULL
+    // COMBO apart only when the preset says it breaks the combo, whether
+    // or not it is also counted as a POOR.
+    let mut n = 1;
+    for breaks_combo in [false, true] {
+        for counted in [false, true] {
+            let mut preset = rules::tapestry();
+            preset.empty_poor.breaks_combo = breaks_combo;
+            preset.empty_poor.counted = counted;
+            let mut empty = played(0);
+            let at = empty
+                .events
+                .iter()
+                .position(|e| e.received.0 >= 3_700 * MS)
+                .unwrap();
+            empty.events.insert(at, key(1, 3_700 * MS, 1));
+            empty.events.insert(at + 1, key(1, 3_710 * MS, 0));
+            empty.preset = replay::PresetRecord::of(&preset);
+            n += 1;
+            let (rel, _) = fx.save(&empty, &format!("{n}-1.tprl"));
+            let c = contribution(&fx.records, &rel, CHART, &empty);
+            let dir = tempfile::tempdir().unwrap();
+            let chart =
+                replay::verify::load_recorded_chart(&empty, CHART.as_bytes(), dir.path()).unwrap();
+            let tally = replay::verify::evaluate_record(&empty, &chart, None)
+                .unwrap()
+                .evaluation
+                .tally;
+            assert_eq!(tally.empty_poor, 1, "{breaks_combo} {counted}");
+            assert_eq!(tally.counts.poor, u32::from(counted));
+            assert_eq!(
+                c.best.unwrap().full_combo,
+                !breaks_combo,
+                "{breaks_combo} {counted}"
+            );
+        }
+    }
     // A missed note breaks it.
     let mut missed = played(0);
     missed.events.retain(|e| e.received.0 < 3_500 * MS);
-    assert!(!fc(&missed, "3-1.tprl"));
+    assert!(!fc(&missed, "9-1.tprl"));
 }
 
 #[test]

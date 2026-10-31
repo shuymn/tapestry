@@ -308,6 +308,17 @@ pub fn tables(db: &Path) -> (Vec<CountedRow>, Vec<ScoreRow>) {
     (counted, scores)
 }
 
+/// The paths in `refused`, through a connection of its own.
+pub fn refused(db: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.prepare("SELECT path FROM refused ORDER BY path")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
 /// Runs `sql` on the database through a connection of its own.
 pub fn sql(db: &Path, sql: &str) {
     let conn = rusqlite::Connection::open(db).unwrap();
