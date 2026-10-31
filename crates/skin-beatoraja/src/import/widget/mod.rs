@@ -4,11 +4,12 @@
 pub(super) mod number;
 pub(super) mod text;
 
-use skin_model::{ImageDef, Source};
+use skin_model::{ImageDef, MAX_SKIN_FRAMES, Source};
 
 use super::asset::{self, Failed, Path};
+use super::budget::ImportLimit;
 use super::policy::Role;
-use super::report::{NoteKind, Object, PropertyKind, TrackWhy};
+use super::report::{NoteKind, Object, PropertyKind, Span, TrackWhy};
 use super::track::{self, Stretch};
 use super::{Common, Cx, Dst, Prop};
 use crate::error::ImportError;
@@ -24,13 +25,17 @@ pub(super) struct SrcImage {
     cycle: i32,
 }
 
-impl SrcImage {
-    pub(super) fn frames(&self) -> u32 {
-        self.div[0] * self.div[1]
-    }
-}
-
 impl Cx<'_> {
+    /// The frames of a `div` grid. A grid of more than the skin's frames
+    /// is the aggregate frame limit, refused before anything reads it.
+    pub(super) fn grid_frames(&self, at: Span, div: [u32; 2]) -> Result<u32, ImportError> {
+        let n = u64::from(div[0]) * u64::from(div[1]);
+        u32::try_from(n)
+            .ok()
+            .filter(|&n| usize::try_from(n).is_ok_and(|n| n <= MAX_SKIN_FRAMES))
+            .ok_or_else(|| self.limit(at, ImportLimit::Frames))
+    }
+
     /// Reads record `rec`'s source-image fields.
     pub(super) fn src_image(&mut self, rec: u32) -> Result<SrcImage, ImportError> {
         let [src, x, y, w, h, divx, divy, timer, cycle] = self.def.fields(
@@ -67,7 +72,8 @@ impl Cx<'_> {
     ) -> Result<Option<(u32, [u32; 2])>, ImportError> {
         let at = c.span;
         let role = c.role;
-        let (cycle, cycle_on_timer) = match self.cycle(at, grid[0] * grid[1], &s.timer, s.cycle)? {
+        let frames = self.grid_frames(at, grid)?;
+        let (cycle, cycle_on_timer) = match self.cycle(at, frames, &s.timer, s.cycle)? {
             Ok(v) => v,
             Err(why) => {
                 self.drop_el(role, at, why)?;
@@ -91,7 +97,6 @@ impl Cx<'_> {
         if let Some(found) = self.assets.image(key) {
             return Ok(Some(found));
         }
-        let frames = grid[0] * grid[1];
         self.budget.image(frames).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         super::trace(super::Event::Charge);

@@ -355,3 +355,27 @@ fn total_file_bytes() {
         ImportLimit::FileTotals,
     );
 }
+
+#[test]
+fn grids_past_the_frames_are_the_limit() {
+    // 65 536 × 65 536 frames do not fit a `u32`: the grid is refused as
+    // the frame limit before its cycle or glyph set is read.
+    let grid = r#""divx": 65536, "divy": 65536"#;
+    let image = format!(
+        r#""image": [{{"id": "i", "src": "a", "w": 64, "h": 64, {grid}, "timer": 41, "cycle": 100}}],
+           "destination": [{{"id": "i", "dst": [{KEY}]}}]"#
+    );
+    limit(load(&image, |_| {}), ImportLimit::Frames);
+    let number = format!(
+        r#""value": [{{"id": "v", "src": "a", "w": 64, "h": 64, {grid}, "digit": 4, "ref": 71}}],
+           "destination": [{{"id": "v", "timer": 41, "dst": [{KEY}]}}]"#
+    );
+    limit(load(&number, |_| {}), ImportLimit::Frames);
+    // One grid one past the skin's frames.
+    let past = format!(
+        r#""image": [{{"id": "i", "src": "a", "w": 64, "h": 64, "divx": {}, "divy": 1}}],
+           "destination": [{{"id": "i", "dst": [{KEY}]}}]"#,
+        MAX_SKIN_FRAMES + 1
+    );
+    limit(load(&past, |_| {}), ImportLimit::Frames);
+}

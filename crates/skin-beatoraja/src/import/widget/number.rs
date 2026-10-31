@@ -111,7 +111,7 @@ impl Cx<'_> {
             return Ok(());
         }
         let s = self.src_image(rec)?;
-        let frames = s.frames();
+        let frames = self.grid_frames(at, s.div)?;
         let (set, pad, d) = if frames.is_multiple_of(24) {
             let pad = match zeropadding {
                 ..=0 => Pad::Blank,
