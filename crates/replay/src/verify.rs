@@ -11,7 +11,9 @@
 //! runs every check and [`evaluate_record`] the first two again, so each
 //! entry point refuses in that order on its own. The chart file's SHA-256
 //! is not compared: an edited file that resolves to the same chart, at
-//! the record's speed too, verifies.
+//! the record's speed too, verifies. [`check_record`] runs the checks made
+//! before the chart is read, and [`admit`] compares an evaluation's peak
+//! memory with a budget before it is run.
 
 use std::path::Path;
 
@@ -58,6 +60,15 @@ pub enum VerifyError {
     /// The evaluator refused the record.
     #[error("the record cannot be evaluated")]
     Eval(#[source] EvalError),
+    /// Evaluating the record would hold more than the memory budget at its
+    /// peak ([`admit`]); it was not evaluated.
+    #[error("evaluating the record needs {needed} bytes, over the budget of {budget}")]
+    TooLarge {
+        /// The bytes the evaluation may hold at its peak.
+        needed: usize,
+        /// The budget.
+        budget: usize,
+    },
 }
 
 /// What part of a re-evaluation the recorded input covers.
@@ -130,6 +141,63 @@ fn recorded_preset(record: &PlayRecord) -> Result<RulePreset, VerifyError> {
         .map_err(VerifyError::PresetCopy)
 }
 
+/// The checks a record passes before its chart is read, in their order:
+/// the evaluator version, the recorded preset copy and the loader version.
+/// Returns the decoded preset copy.
+///
+/// # Errors
+///
+/// [`UnsupportedEvaluator`](VerifyError::UnsupportedEvaluator),
+/// [`PresetCopy`](VerifyError::PresetCopy) or
+/// [`UnsupportedLoader`](VerifyError::UnsupportedLoader).
+pub fn check_record(record: &PlayRecord) -> Result<RulePreset, VerifyError> {
+    let preset = recorded_preset(record)?;
+    let loader = record.chart.identity.loader_version;
+    if loader != LOADER_VERSION {
+        return Err(VerifyError::UnsupportedLoader(loader));
+    }
+    Ok(preset)
+}
+
+/// The most bytes evaluating `record` on `chart` under `preset` holds at
+/// its peak, the record's input included ([`Evaluator::batch_bytes`]),
+/// counted with an evaluator built for it with no input capacity, which
+/// counts every object of the chart. Nothing is evaluated.
+///
+/// # Errors
+///
+/// What [`Evaluator::new`] refuses.
+pub fn batch_bytes(
+    record: &PlayRecord,
+    chart: &Chart,
+    preset: &RulePreset,
+) -> Result<usize, EvalError> {
+    let device = record.devices.profile();
+    let probe = Evaluator::new(chart, preset, &device, &record.start, None, 0)?;
+    Ok(probe.batch_bytes(record.events.len()))
+}
+
+/// Admits the evaluation of `record` on `chart` under `preset` against a
+/// memory `budget` in bytes ([`batch_bytes`]), before anything is
+/// evaluated (design.md "Determinism").
+///
+/// # Errors
+///
+/// [`TooLarge`](VerifyError::TooLarge) over the budget, or
+/// [`Eval`](VerifyError::Eval) when the evaluator refuses the record.
+pub fn admit(
+    record: &PlayRecord,
+    chart: &Chart,
+    preset: &RulePreset,
+    budget: usize,
+) -> Result<(), VerifyError> {
+    let needed = batch_bytes(record, chart, preset).map_err(VerifyError::Eval)?;
+    if needed > budget {
+        return Err(VerifyError::TooLarge { needed, budget });
+    }
+    Ok(())
+}
+
 /// Loads the record's chart from its file `bytes`, sounds resolving inside
 /// `dir`, and returns it as the play evaluated it.
 ///
@@ -148,12 +216,8 @@ pub fn load_recorded_chart(
     bytes: &[u8],
     dir: &Path,
 ) -> Result<Chart, VerifyError> {
-    recorded_preset(record)?;
+    check_record(record)?;
     let recorded = &record.chart;
-    let loader = recorded.identity.loader_version;
-    if loader != LOADER_VERSION {
-        return Err(VerifyError::UnsupportedLoader(loader));
-    }
     // At the recorded speed: the recorded input is in its real time. The
     // resolved hash is the 1× chart's at every speed.
     let opts = LoadOptions {
