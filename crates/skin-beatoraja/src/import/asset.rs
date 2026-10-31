@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use skin_model::{
-    AdmitError, BitmapFontError, FileDef, FntAdmitError, FntError, FntFileError, FntLimit,
+    AdmitError, BitmapFontError, Charge, FileDef, FntAdmitError, FntError, FntFileError, FntLimit,
     FontAdmitError, FontDef, FontError, ImageDef, ImageError, MAX_PATH_BYTES, Refused, Root, Sheet,
     SheetBuilder,
 };
@@ -315,14 +315,10 @@ impl Assets {
         if let Some(&r) = self.fnt_files.get(name) {
             return Ok(r);
         }
-        let mut refused = None;
         let files = self.builder.file_count();
-        let admitted = self.builder.admit_fnt(name, &mut |c| {
-            budget.fnt_charge(c).map_err(|l| {
-                refused = Some(l);
-                Refused
-            })
-        });
+        let admitted = self
+            .builder
+            .admit_fnt(name, &mut |c| budget.fnt_charge(c).map_err(|_| Refused));
         let (glyphs, kernings) = self.builder.fnt_totals();
         budget.usage.glyphs = u32::try_from(glyphs).unwrap_or(u32::MAX);
         budget.usage.kernings = u32::try_from(kernings).unwrap_or(u32::MAX);
@@ -339,7 +335,14 @@ impl Assets {
             }
             Err(FntAdmitError::Limit(l)) => {
                 return Err(match l {
-                    FntLimit::Charge(_) => refused.unwrap_or(ImportLimit::FileAttempts),
+                    // The limit `Budget::fnt_charge` refuses each charge with.
+                    FntLimit::Charge(c) => match c {
+                        Charge::FileAttempt => ImportLimit::FileAttempts,
+                        Charge::Image => ImportLimit::Images,
+                        Charge::Frames(_) => ImportLimit::Frames,
+                        Charge::FontBytes(_) => ImportLimit::Fonts,
+                        Charge::ImageBytes { .. } => ImportLimit::FileTotals,
+                    },
                     FntLimit::Attempts => ImportLimit::FileAttempts,
                     FntLimit::Fonts | FntLimit::FontBytes => ImportLimit::Fonts,
                     FntLimit::ImageBytes | FntLimit::Texels => ImportLimit::FileTotals,
