@@ -15,6 +15,8 @@
 //! into grids of frames, each image with its own frame cycle and filter,
 //! and its font files. Loading it checks the counts, confines the paths to
 //! the skin folder and reads only the headers and the fonts' first bytes.
+//! A [`SheetBuilder`] also admits bitmap `.fnt` fonts ([`FntFile`]),
+//! whose pages become whole-file images.
 //! [`Sheet::atlas`] decodes the files of one [`Variant`] (1x or @2x) into
 //! texture-array [`Page`]s with box-filtered mips and a [`UvTable`] that
 //! finds each frame in them.
@@ -30,7 +32,8 @@
 //! clamp, and the scratch side and lane width re-lay the lanes
 //! ([`Skin::placement`]). [`Skin::prepare`] makes one attempt's [`Play`];
 //! [`Skin::text_requests`] lists the lines of text to rasterize, and
-//! [`Skin::attach_text`] hands the play their images in a [`TextTable`].
+//! [`Skin::attach_text`] hands the play their images in a [`TextTable`];
+//! [`Skin::attach_bitmap_text`] lays out the lines in bitmap fonts.
 //! [`Skin::build`] runs each frame's drained effects through its reducer,
 //! reads the play view's snapshot into the [`PLAY`] schema's fields,
 //! starts the timers and pushes each drawn element's quads: an image's
@@ -75,7 +78,14 @@ pub use expr::{
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
     compile,
 };
-pub use image::builder::{AdmitError, FontAdmitError, SheetBuilder};
+pub use image::builder::{
+    AdmitError, BitmapFontError, Charge, FntAdmitError, FntFileError, FntLimit, FontAdmitError,
+    MAX_BITMAP_FONTS, MAX_FALLBACKS, Refused, SheetBuilder,
+};
+pub use image::fnt::{
+    FntError, FntErrorKind, FntFile, FntGlyph, FntKerning, FntLimits, MAX_FNT_BYTES, MAX_FNT_PAGES,
+    MAX_FNT_VALUE, MAX_FONT_GLYPHS, MAX_FONT_KERNINGS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
+};
 pub use image::font::{FontDef, FontError, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
 pub use image::path::{Entry, FileId, Listing, Root, RootError};
 pub use image::{

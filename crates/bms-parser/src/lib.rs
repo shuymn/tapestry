@@ -10,11 +10,18 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 7
+//! # Loader version 8
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 7; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 8; changing any of them
 //! changes the version.
 //!
+//! - **Text encoding:** a UTF-8 or UTF-16 BOM decides the encoding. Without
+//!   one, text that is valid UTF-8 (pure ASCII included) is UTF-8; then
+//!   text that decodes as Shift_JIS (CP932) without an error is Shift_JIS,
+//!   unless chardetng guesses EUC-KR or EUC-JP; then chardetng's guess,
+//!   with no top-level-domain hint. Malformed bytes in the chosen encoding
+//!   become U+FFFD with one [`WarningKind::DecodeErrors`] warning.
+//!   [`read_header`] decodes alike.
 //! - **Time:** each object's time is accumulated in exact rationals and
 //!   floored to µs once; the time's denominator has at most
 //!   [`Limits::max_time_bits`] bits (an error otherwise). BPM, `#STOPxx`,
@@ -155,7 +162,7 @@ pub use error::{LoadError, Warning, WarningKind};
 pub use header::{Header, read_header};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 7;
+pub const LOADER_VERSION: u32 = 8;
 
 /// Bounds on the work a chart may cause (design.md "Loading Limits"). The
 /// defaults sit far above real charts.
@@ -324,14 +331,10 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
     Ok(Loaded { chart, warnings })
 }
 
-/// Decodes the text in its detected encoding (Shift_JIS, UTF-8, ...).
+/// Decodes the text in the encoding of the "Text encoding" rule, warning with
+/// [`WarningKind::DecodeErrors`] when it holds malformed bytes.
 fn decode<'a>(bytes: &'a [u8], warnings: &mut Vec<Warning>) -> Cow<'a, str> {
-    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
-    detector.feed(bytes, true);
-    // chardetng depends on encoding_rs without default features; the direct
-    // dependency turns on the `alloc` feature that `decode` needs.
-    let encoding: &encoding_rs::Encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
-    let (text, _, had_errors) = encoding.decode(bytes);
+    let (text, had_errors) = decode_detected(bytes);
     if had_errors {
         warnings.push(Warning {
             line: None,
@@ -339,4 +342,33 @@ fn decode<'a>(bytes: &'a [u8], warnings: &mut Vec<Warning>) -> Cow<'a, str> {
         });
     }
     text
+}
+
+/// [`decode`]'s text and whether it held malformed bytes. Valid UTF-8 comes
+/// before Shift_JIS since Shift_JIS text with Japanese characters is almost
+/// never valid UTF-8, and Shift_JIS comes before the guess since a guess
+/// over mostly ASCII text with a few Japanese characters can name a Western
+/// or Chinese encoding. A guess of EUC-KR or EUC-JP is the exception: their
+/// two-byte characters are often valid Shift_JIS too, as pairs of half-width
+/// katakana, which Japanese text in Shift_JIS rarely holds.
+fn decode_detected(bytes: &[u8]) -> (Cow<'_, str>, bool) {
+    // chardetng depends on encoding_rs without default features; the direct
+    // dependency turns on the `alloc` feature that decoding needs.
+    if let Some((encoding, _)) = encoding_rs::Encoding::for_bom(bytes) {
+        return encoding.decode_with_bom_removal(bytes);
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return (Cow::Borrowed(text), false);
+    }
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    detector.feed(bytes, true);
+    let guess = detector.guess(None, chardetng::Utf8Detection::Deny);
+    if guess != encoding_rs::EUC_KR
+        && guess != encoding_rs::EUC_JP
+        && let Some(text) =
+            encoding_rs::SHIFT_JIS.decode_without_bom_handling_and_without_replacement(bytes)
+    {
+        return (text, false);
+    }
+    guess.decode_without_bom_handling(bytes)
 }

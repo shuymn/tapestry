@@ -147,6 +147,15 @@ impl Drawn {
             .unwrap();
     }
 
+    /// Lays out the bitmap lines for a chart titled `title`.
+    pub fn attach_bitmap(&mut self, title: &str) {
+        let chart = ChartText {
+            title,
+            ..ChartText::default()
+        };
+        self.skin.attach_bitmap_text(&mut self.play, &chart);
+    }
+
     /// The quads of the frame at `ms` with `effects`.
     pub fn frame(&mut self, ms: i64, effects: &[JudgeEvent]) -> Vec<Quad> {
         self.batch.clear();

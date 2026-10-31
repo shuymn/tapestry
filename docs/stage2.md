@@ -535,7 +535,7 @@ Each change is covered by round trips and changes D8's interpretation tuple.
 - Library roots, the output folder and input logs are relative to the file. The roots replace `device.toml`'s for the run only.
 - Steps, in `[[step]]` tables of one kind each:
   - `select { search | path }`: a path matches the listed chart of the same file, whatever its spelling;
-  - `play { input = "auto" | log, until = "end" | { at_ms, command = "retry" | "quit" } }`: every play of one chart uses its first input;
+  - `play { input = "auto" | log, until = "end" | { at_ms, command = "retry" | "quit" | "skip" } }`: every play of one chart uses its first input; `quit` is the quit key before the play completes (back to selection), `skip` the quit key once it is complete with its tail still sounding (its result), and the run fails when the play does not land there;
   - `result = "next-preset" | "prev-preset" | "retry" | "back"`;
   - `capture { at, file }`: the first presented frame at or after `at` of the next play that starts, written under `output`;
   - `practice { path | search, from, to, speed, lead_in_ms, gauge, repeat = true, input = log, rounds }`: chooses the chart as `select` does, opens its practice page with P, sets measures `from` to `to` (from 1, both included), the speed in percent (a multiple of 5 from 50 to 150), the lead-in (on the 500 ms grid from 1,000 to 10,000), the displayed gauge's initial value in percent and repeat through the page's keys, starts, plays `rounds` rounds of the log (autoplay refuses practice, so `"auto"` is refused) and quits at the next round's start, then goes back to selection; it stands where `select` does, and `repeat = false` is not built. A `to` past the chart's measures fails the run at that step;

@@ -1082,6 +1082,26 @@ impl PlayerRig<'_> {
         }
     }
 
+    /// A play ended (a scenario): an `until` sent during it fails the run
+    /// when the play did not land where its command says (a quit after
+    /// completion, a skip before it).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn scenario_ended(&mut self, report: &game::PlayReport) {
+        let (Some(sc), Some(script)) = (
+            &mut self.scenario,
+            self.selection.as_mut().and_then(|s| s.script.as_mut()),
+        ) else {
+            return;
+        };
+        let Some(sent) = sc.sent.take() else {
+            return;
+        };
+        if let (Some(why), Some(o)) = (sent.missed(report), script.last_done()) {
+            script.fail_at(o, why);
+            self.controls.close();
+        }
+    }
+
     /// A play is over and its frames drawn (a scenario): an `until` it
     /// never reached, and each capture bound to it that failed, fail the
     /// run; each written is printed.
@@ -1843,6 +1863,7 @@ mod tests {
             chart_input: None,
             pending: None,
             until: None,
+            sent: None,
             practice: Some(screen),
             shown: true,
             rounds: 0,

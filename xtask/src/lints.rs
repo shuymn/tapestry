@@ -177,7 +177,17 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/game/src/sound.rs"),
     Site::Fns(
         "crates/game/src/live.rs",
-        &["play_and_next", "Rig::stepped", "Rig::input_failure"],
+        &[
+            "play_and_next",
+            "run_tail",
+            "TailStage::begin",
+            "TailStage::over",
+            "TailAction::of",
+            "TailEnd::of",
+            "TailEnd::cut",
+            "Rig::stepped",
+            "Rig::input_failure",
+        ],
     ),
     Site::Fns(
         "crates/game/src/session.rs",

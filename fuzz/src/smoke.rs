@@ -10,7 +10,7 @@ use skin_beatoraja::{Header, ImportError, Imported, NoteKind, Rule, Syntax, Usag
 
 use crate::{
     RawSummary, bms_load, draw, preset_canonical, raw_input, replay_body, replay_file, seeds,
-    skin_json,
+    skin_fnt, skin_json,
 };
 
 /// Every seed in `expected` is generated, and no other: a deleted seed
@@ -272,6 +272,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "images",
             "numbers",
             "text",
+            "bitmap_text",
             "tracks",
             "ops",
             "offsets",
@@ -386,6 +387,16 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // EX score 150: three glyphs; the perfect count 1: one.
                 assert_eq!(drawn, [4, 4, 4, 4], "{name}");
             }
+            "bitmap_text" => {
+                // One font of 4 glyphs (a space added) and a pair, read
+                // once for both texts.
+                assert_eq!((u.texts, u.fonts), (2, 1), "{name}");
+                assert_eq!((u.glyphs, u.kernings), (5, 1), "{name}");
+                assert_eq!(u.file_attempts, 2, "{name}");
+                assert_eq!(kinds(&i), [], "{name}");
+                // `ABl?` and `t`, the last two as the missing glyph.
+                assert_eq!(drawn, [5, 5, 5, 5], "{name}");
+            }
             "text" => {
                 assert_eq!((u.texts, u.fonts), (2, 1), "{name}");
                 assert_eq!(
@@ -466,4 +477,60 @@ fn skin_json_accepts_ops_charged_for_a_dropped_element() {
     assert!(i.report.usage.ops > 0);
     assert_eq!(i.skin.ops().total(), 0);
     assert_eq!(kinds(&i), [NoteKind::MissingAsset]);
+}
+
+#[test]
+fn skin_fnt_seeds_parse_or_fail_as_built() {
+    use skin_model::FntErrorKind as K;
+    let seeds = seeds::skin_fnts();
+    assert_names(
+        &seeds,
+        &[
+            "font",
+            "crlf",
+            "two_pages",
+            "supplementary",
+            "binary",
+            "no_size",
+            "page_id",
+            "glyph_page",
+            "duplicate_id",
+            "count",
+            "trailing",
+            "lone_cr",
+            "no_glyphs",
+        ],
+    );
+    for (name, bytes) in seeds {
+        let result = skin_fnt(&bytes);
+        let expected = match name {
+            "font" | "crlf" | "supplementary" => {
+                let f = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!((f.glyphs().len(), f.kernings().len()), (4, 1), "{name}");
+                assert!(f.missing().is_some(), "{name}");
+                assert_eq!(f.pages(), ["fonts/font_0.png"], "{name}");
+                continue;
+            }
+            "two_pages" => {
+                let f = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(f.pages(), ["fonts/font_0.png", "fonts/sub/font_1.png"]);
+                continue;
+            }
+            "binary" => K::Padding,
+            "no_size" => K::Metadata("size"),
+            "page_id" => K::PageId,
+            "glyph_page" => K::GlyphPage,
+            "duplicate_id" => K::DuplicateId,
+            "count" => K::Count("chars"),
+            "trailing" => K::Unexpected,
+            "lone_cr" => K::LoneCr,
+            "no_glyphs" => K::NoGlyphs,
+            _ => panic!("no expectation for seed {name}"),
+        };
+        assert_eq!(
+            result.map(|_| ()).map_err(|e| e.kind),
+            Err(expected),
+            "{name}"
+        );
+    }
 }

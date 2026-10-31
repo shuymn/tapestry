@@ -1670,6 +1670,24 @@ fn focus_loss_and_device_removal_cut_the_tail() {
     }
 }
 
+/// The quit key in the tail skips it to the result: the engine's voices
+/// stop in that step, and the play stays complete.
+#[test]
+fn quit_in_the_tail_skips_it_and_stops_the_audio() {
+    let (_dir, root) = temp_root();
+    let mut s = tail_session(&root, &Events::default());
+    // At 2.0 s of play time, inside the BGM tail (it plays to 4.0 s).
+    let one = s
+        .play(script(busy_items(), &[(2_000 * MS, Command::Quit)]))
+        .unwrap();
+    assert_eq!((one.end, one.tail_cut), (PlayEnd::Completed, None));
+    assert!(one.tail_skipped);
+    assert_eq!(status(&one), (EndStatus::PlayedToEnd, TimeUs(1_280_999)));
+    // Play time 2.0 s is session time 3.0 s, and the audio stops there.
+    assert_eq!(s.now(), TimeUs(3_000 * MS));
+    assert_eq!(s.audio().engine().mixer().sounding(), 0);
+}
+
 #[test]
 fn a_reconnect_during_play_does_not_hide_a_removal_in_the_tail() {
     let (_dir, root) = temp_root();

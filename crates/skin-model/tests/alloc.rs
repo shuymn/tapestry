@@ -1364,6 +1364,111 @@ fn build_does_not_allocate() {
     let requests = skin.text_requests(&chart_text, TARGETS[0], &views.layouts[0]);
     let texts: Vec<_> = requests.iter().map(|r| (r.slot, r.text.as_str())).collect();
     assert_eq!(texts, [(0, "Title"), (1, "MAX")]);
+
+    // Bitmap text, laid out untracked, draws its glyphs every frame
+    // without allocating, squeezed or not, with a fallback glyph.
+    let (_fonts, bitmap) = bitmap_skin();
+    let uvs = bitmap
+        .atlas(Variant::Lo, LIMITS_SMALL)
+        .unwrap()
+        .into_parts()
+        .1;
+    let mut play = bitmap.prepare(&chart, &full).unwrap();
+    bitmap.attach_bitmap_text(
+        &mut play,
+        &ChartText {
+            title: "ABAB",
+            ..ChartText::default()
+        },
+    );
+    let mut batch = QuadBatch::with_capacity(bitmap.quad_capacity(), bitmap.run_capacity());
+    let mut glyphs = 0;
+    TRACK.with(|t| t.set(true));
+    for ms in (0..2_000).step_by(16) {
+        batch.clear();
+        let frame = SkinFrame {
+            now: TimeUs(ms * MS),
+            display_offset: TimeUs(0),
+            tally: &t,
+            gauges: &gauges,
+            gauge: 0,
+            effects: &[],
+            complete: false,
+            target: TARGETS[0],
+            layout: &views.layouts[0],
+            lanes: views.lanes[0],
+        };
+        bitmap.build(&mut play, &frame, &uvs, &mut batch);
+        glyphs += batch.quads().len();
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "bitmap text: allocations"
+    );
+    assert!(glyphs > 0, "no glyph drew");
+}
+
+const LIMITS_SMALL: AtlasLimits = AtlasLimits {
+    max_side: 256,
+    max_layers: 4,
+    reserved_layers: 1,
+};
+
+/// Two bitmap texts of the title: `A` from the primary file, `B` from its
+/// fallback; the second squeezed into its box.
+fn bitmap_skin() -> (tempfile::TempDir, Skin) {
+    let root = dir();
+    let fnt = |name: &str, code: u32| {
+        let s = format!(
+            "info face=\"t\" size=10 padding=0,0,0,0\n\
+             common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
+             page id=0 file=\"{name}.png\"\n\
+             char id={code} x=0 y=0 width=6 height=9 xoffset=1 yoffset=1 xadvance=8 page=0\n"
+        );
+        std::fs::write(root.path().join(format!("{name}.fnt")), s).unwrap();
+        save(
+            root.path(),
+            &format!("{name}.png"),
+            &solid(16, 16, [255; 4]),
+        );
+    };
+    fnt("a", 65);
+    fnt("b", 66);
+    let mut b = skin_model::SheetBuilder::new(&skin_model::Root::new(root.path()).unwrap());
+    let a = b.admit_fnt("a.fnt", &mut |_| Ok(())).unwrap();
+    let f = b.admit_fnt("b.fnt", &mut |_| Ok(())).unwrap();
+    b.add_bitmap_font(a, &[f]).unwrap();
+    let text = |overflow| TextDef {
+        value: TextValue::Field(TextField::Title),
+        font: FontRef::Bitmap(0),
+        align: Align::Center,
+        overflow,
+    };
+    let element = |i: u16| ElementDef {
+        source: Source::Text(u32::from(i)),
+        track: track(i, Ease::Linear, End::Hold),
+        timer: TimerRef::Builtin(timer::READY),
+        visible: None,
+        blend: Blend::Alpha,
+        clip: None,
+        place: Place::SCREEN,
+    };
+    let skin = Skin::new(SkinDef {
+        fit: Fit::Adapt,
+        regions: regions(),
+        whens: Vec::new(),
+        sheet: b.finish(),
+        lanes: None,
+        elements: vec![element(0), element(1)],
+        widgets: skin_model::WidgetDefs {
+            texts: vec![text(Overflow::Spill), text(Overflow::Shrink)],
+            ..skin_model::WidgetDefs::default()
+        },
+    })
+    .unwrap();
+    (root, skin)
 }
 
 /// The source player's lanes (`lanes_support::source`) on `chart` played

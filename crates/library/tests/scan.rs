@@ -294,6 +294,43 @@ fn other_schema_version_is_rebuilt() {
     assert_eq!(titles(&lib).len(), 1);
 }
 
+/// A library of schema 4 holds titles as the loader then decoded them, a
+/// mostly ASCII Shift_JIS title as windows-1252; opening it under this
+/// version rebuilds it, so the next scan reads the unchanged chart again.
+#[test]
+fn schema_4_reads_shift_jis_titles_again() {
+    let fx = Fixture::new();
+    let text = chart_text("迎撃-NIGHT SKY PATROL-");
+    let (bytes, _, unmappable) = encoding_rs::SHIFT_JIS.encode(&text);
+    assert!(!unmappable);
+    let chart = fx.write("a.bms", &bytes);
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+    }
+    let (stored, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(&bytes);
+    let stored_title = stored
+        .lines()
+        .find_map(|l| l.strip_prefix("#TITLE "))
+        .unwrap()
+        .to_owned();
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        old.execute("UPDATE charts SET title = ?1", [&stored_title])
+            .unwrap();
+        old.pragma_update(None, "user_version", 4).unwrap();
+    }
+
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 4 });
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (1, 1), "a full scan");
+    assert_eq!(
+        titles(&lib),
+        vec![(chart, "迎撃-NIGHT SKY PATROL-".to_owned())]
+    );
+}
+
 /// A loudness row is found by its whole key, and by nothing less: a change
 /// of any part misses. Storing a row of other versions removes every row of
 /// the old ones, and a row survives reopening and rescanning.

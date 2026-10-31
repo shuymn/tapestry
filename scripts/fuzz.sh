@@ -16,7 +16,7 @@
 # directory and exits with the fuzzer's status.
 set -euo pipefail
 
-targets=(bms_load replay_file replay_body raw_input preset_canonical skin_json)
+targets=(bms_load replay_file replay_body raw_input preset_canonical skin_json skin_fnt)
 # The per-input limits of every run: seconds, then MiB of RSS and of one
 # allocation.
 limits=(-timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=2048)
@@ -138,6 +138,7 @@ run_target() {
   [ -n "$seed" ] && options+=(-seed="$seed")
   [ "$target" = bms_load ] && options+=(-dict=fuzz/dict/bms.dict)
   [ "$target" = skin_json ] && options+=(-dict=fuzz/dict/skin.dict)
+  [ "$target" = skin_fnt ] && options+=(-dict=fuzz/dict/fnt.dict)
   echo "=== $target: $seconds s"
   status=0
   cargo_fuzz run "$target" "${corpora[@]}" -- "${options[@]}" || status=$?

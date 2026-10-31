@@ -17,6 +17,7 @@ use self::schema::{field, timer};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::widget::gauge::GaugeLook;
+use crate::widget::glyphs::GlyphLine;
 use crate::widget::lanes::{LaneView, Side};
 use crate::widget::text::TextTable;
 
@@ -129,6 +130,8 @@ pub struct Play {
     gauges: Box<[GaugeDesc]>,
     /// The attempt's rasterized lines, empty until one is attached.
     text: TextTable,
+    /// The attempt's bitmap lines by text slot, empty until laid out.
+    bitmap: Box<[Option<GlyphLine>]>,
 }
 
 /// The chart's notes and bar lines, kept for a skin with lanes.
@@ -219,6 +222,7 @@ impl Play {
             notes,
             gauges: ctx.gauges.into(),
             text: TextTable::default(),
+            bitmap: Box::new([]),
         })
     }
 
@@ -253,6 +257,15 @@ impl Play {
 
     pub(crate) fn set_text(&mut self, table: TextTable) {
         self.text = table;
+    }
+
+    /// The attempt's bitmap lines, by text slot.
+    pub(crate) fn bitmap(&self) -> &[Option<GlyphLine>] {
+        &self.bitmap
+    }
+
+    pub(crate) fn set_bitmap(&mut self, lines: Box<[Option<GlyphLine>]>) {
+        self.bitmap = lines;
     }
 
     /// The descriptor of the context's gauge `i`.
