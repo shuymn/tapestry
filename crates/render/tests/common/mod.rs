@@ -37,7 +37,7 @@ pub fn warp(chart: &Chart) -> Renderer {
     println!("adapter: {name}");
     assert_eq!(name, WARP);
     assert!(!r.has_frame_waitable());
-    r.load(chart).expect("load the chart");
+    r.load(chart, None).expect("load the chart");
     r
 }
 

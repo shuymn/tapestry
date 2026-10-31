@@ -89,7 +89,7 @@ fn frame_does_not_allocate_after_warmup() {
     }
     let chart = b.build().unwrap();
     let mut skin = SimpleSkin::new();
-    skin.load(&chart);
+    skin.load(&chart, None);
     let mut batch = SpriteBatch::with_capacity(MAX_SPRITES);
     let mut staging: Vec<Sprite> = Vec::with_capacity(MAX_SPRITES);
     let v = view(42, 1_234);
