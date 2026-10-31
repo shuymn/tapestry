@@ -147,11 +147,16 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
     let input = p.input;
     #[cfg(feature = "dev-tools")]
     let mut dev_options = p.dev;
+    // A mid-chart start (`--dev-start`).
+    #[cfg(feature = "dev-tools")]
+    let start = dev_options.start;
+    #[cfg(not(feature = "dev-tools"))]
+    let start = None;
     #[cfg(feature = "dev-tools")]
     if dev_options.headless || matches!(input, PlayInput::Script(_)) {
         let auto = u32::from(dev_options.auto_retry);
         let frames = dev_options.frames.take();
-        return report(headless(&chart, input, frames, auto, clock, |rig| {
+        return report(headless(&chart, input, start, frames, auto, clock, |rig| {
             if dev_options.overlay {
                 rig.controls.toggle_overlay();
             }
@@ -167,6 +172,7 @@ fn play_command(p: args::Play, clock: QpcClock) -> ExitCode {
     report(play(
         &chart,
         input,
+        start,
         clock,
         #[cfg(feature = "dev-tools")]
         false,
@@ -228,7 +234,7 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
     } else {
         PlayInput::Devices
     };
-    let ran = play(chart, input, clock, true, move |rig| {
+    let ran = play(chart, input, None, clock, true, move |rig| {
         rig.measured_plays = Some(kept);
         rig.load_start = load_start;
         rig.quit_after_end = Some(std::time::Duration::from_millis(300));
@@ -450,9 +456,23 @@ struct Prepared {
 
 /// Loads the session `input` chooses and makes what its input side
 /// starts with. Autoplay's input and schedule are made here, before
-/// anything opens; a chart over the recording budget is refused here.
-fn prepare(chart: &Path, input: &PlayInput) -> anyhow::Result<Prepared> {
-    let loaded = load(chart, input)?;
+/// anything opens; a chart over the recording budget is refused here. With
+/// `start`, every play is a mid-chart start from that time of the chart's
+/// 1× time to its end (design.md "Mid-Chart Start and Section Repeat"),
+/// refused here, before any thread starts, when the practice refuses it.
+fn prepare(chart: &Path, input: &PlayInput, start: Option<TimeUs>) -> anyhow::Result<Prepared> {
+    let mut loaded = load(chart, input)?;
+    if let Some(start) = start {
+        let practice = game::mid_chart_start(
+            loaded.chart(),
+            loaded.config().speed,
+            loaded.preset(),
+            start,
+        );
+        loaded
+            .set_practice(Some(practice))
+            .with_context(|| format!("a mid-chart start at {} ms", start.0 / 1_000))?;
+    }
     match input {
         PlayInput::Devices => Ok(Prepared {
             loaded,
@@ -506,8 +526,9 @@ fn generated(loaded: Loaded, chart: &Path) -> anyhow::Result<Prepared> {
 }
 
 /// Loads the bank at the output's rate and hands the engine, playing
-/// `schedule` or else the chart's BGM, to the audio thread, which keeps it
-/// silent until the first play.
+/// `schedule` or else the session's ([`Loaded::audio_schedule`]: a round's,
+/// or the chart's BGM), to the audio thread, which keeps it silent until
+/// the first play.
 fn start_engine(
     loaded: &Loaded,
     schedule: Option<Vec<BgmEvent>>,
@@ -527,7 +548,7 @@ fn start_engine(
     log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
     let mut engine = AudioEngine::with_schedule(
         Arc::new(bank),
-        schedule.unwrap_or_else(|| chart.bgm.clone()),
+        schedule.unwrap_or_else(|| loaded.audio_schedule()),
         opened.rate,
         opened.period,
         MAX_VOICES,
@@ -536,6 +557,15 @@ fn start_engine(
     .context("the audio engine cannot start")?;
     loaded.settings().device.apply_to(&mut engine);
     Ok(audio.start(engine, probe))
+}
+
+/// What restores the rounds of a practice set up at load: the engine's
+/// seek source and the rounds' schedule, the one the engine was started
+/// with; `None` for full plays.
+fn restorer(loaded: &Loaded, rig: &PlayerRig<'_>) -> Option<game::Restorer> {
+    loaded
+        .section()
+        .map(|_| game::Restorer::new(rig.audio.control.seek_source(), loaded.audio_schedule()))
 }
 
 /// The measurement's queues: logic steps and key sounds to the render
@@ -684,6 +714,9 @@ fn rig<'a>(
         #[cfg(feature = "dev-tools")]
         scenario: None,
         lead_in: LEAD_IN,
+        restorer: None,
+        restore: None,
+        restore_at: None,
         in_play: false,
         #[cfg(feature = "dev-tools")]
         quit_after_end: None,
@@ -809,6 +842,7 @@ fn menu_input(
 fn play(
     chart: &Path,
     input: PlayInput,
+    start: Option<TimeUs>,
     clock: QpcClock,
     #[cfg(feature = "dev-tools")] keep_presents: bool,
     tune: impl FnOnce(&mut PlayerRig<'_>),
@@ -821,7 +855,7 @@ fn play(
         sources,
         schedule,
         keyboard,
-    } = prepare(chart, &input)?;
+    } = prepare(chart, &input, start)?;
     let controls = controls(loaded.settings(), clock);
     let waker = Waker::new().context("input")?;
     let _suspend = power::SuspendWatch::register(Arc::clone(&controls))?;
@@ -943,6 +977,7 @@ fn play(
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
+    rig.restorer = restorer(&loaded, &rig);
     rig.result_input = menus;
     rig.queue_most = opened.most_queued_periods;
     tune(&mut rig);
@@ -1364,6 +1399,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
 fn headless(
     chart: &Path,
     input: PlayInput,
+    start: Option<TimeUs>,
     frames: Option<PathBuf>,
     auto_retries: u32,
     clock: QpcClock,
@@ -1376,7 +1412,7 @@ fn headless(
         sources,
         schedule,
         keyboard,
-    } = prepare(chart, &input)?;
+    } = prepare(chart, &input, start)?;
     let controls = controls(loaded.settings(), clock);
     let waker = Waker::new().context("input")?;
     let last_note = loaded
@@ -1453,6 +1489,7 @@ fn headless(
     if let Some(keyboard) = keyboard {
         rig.recorded.keyboard = keyboard;
     }
+    rig.restorer = restorer(&loaded, &rig);
     rig.quit_after_end = Some(std::time::Duration::from_millis(300));
     rig.auto_retries = auto_retries;
     rig.queue_most = opened.most_queued_periods;

@@ -17,7 +17,7 @@ use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
     Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, MenuCommand,
-    Opening, PlayReport, RenderSide, ResultScreen, Rig, Settings, Tuning,
+    Opening, PlayReport, RenderSide, RestoreError, Restored, ResultScreen, Rig, Settings, Tuning,
 };
 use input::{QpcClock, SourceReader};
 
@@ -66,8 +66,17 @@ pub struct PlayerRig<'a> {
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
-    /// The countdown's length.
+    /// The countdown's length: from the opening to chart time 0, as the
+    /// current play's opening was given it.
     pub lead_in: TimeUs,
+    /// What restores a practice round's audio: the engine's seek source and
+    /// the round's schedule; `None` without practice, which refuses a round.
+    pub restorer: Option<game::Restorer>,
+    /// The current round's restore, planned at its opening, until its start
+    /// sends it.
+    pub restore: Option<Box<game::Restore>>,
+    /// Where the current round's audio is restored, in its chart time.
+    pub restore_at: Option<TimeUs>,
     /// From recording's open to the end of the play's audio tail: the
     /// game thread parks [`PARK`] at most, else [`IDLE_PARK`].
     pub in_play: bool,
@@ -254,6 +263,25 @@ impl PlayerRig<'_> {
         let _: Figures = fig;
     }
 
+    /// How the ended round's audio was restored, if it was a round.
+    fn print_restored(&mut self) {
+        let Some(at) = self.restore_at.take() else {
+            return;
+        };
+        let ms = |t: TimeUs| t.0 / 1_000;
+        match self.audio.control.counters().restored(self.generation) {
+            Some(Restored::First) => println!("audio: restored at {} ms (first)", ms(at)),
+            Some(Restored::Fallback) => println!(
+                "audio: restored at {} ms (fallback)",
+                ms(TimeUs(at.0.saturating_add(game::RESTORE_RETRY.0)))
+            ),
+            Some(Restored::Refused(why)) => {
+                println!("audio: not restored ({why:?}); the background music was silent");
+            }
+            None => println!("audio: the restore was not taken"),
+        }
+    }
+
     fn print(&self, report: &PlayReport) {
         let result = report.result.as_ref();
         let counts = result
@@ -433,6 +461,9 @@ impl Rig for PlayerRig<'_> {
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
         self.in_play = true;
+        // A round's opening is not the full play's countdown: the countdown
+        // and a scenario's `until` run from it.
+        self.lead_in = lead_in;
         self.input.open(Request::Open {
             lead_in,
             logic: thread::current(),
@@ -466,7 +497,10 @@ impl Rig for PlayerRig<'_> {
             .map_or(audio::Gain::HEADROOM, |s| s.shelf.gain());
         // Audio was readied before recording opened, so this does not
         // wait; a worker gone since shows as the output's failure.
-        let _ = self.audio.control.play_at(origin, sounds, gain, None);
+        let _ = self
+            .audio
+            .control
+            .play_at(origin, sounds, gain, self.restore.take());
         self.generation = self.audio.control.generation();
         self.steps_dropped = 0;
         let measure = PlayMeasure {
@@ -487,6 +521,27 @@ impl Rig for PlayerRig<'_> {
             gauge: self.gauge,
             measure: Box::new(measure),
         });
+    }
+
+    fn restore_ready(&mut self, at: TimeUs) -> Result<(), RestoreError> {
+        self.restore = None;
+        self.restore_at = None;
+        // A round is never played as a full play.
+        self.restorer
+            .as_ref()
+            .ok_or(RestoreError::NotPrepared)?
+            .check()?;
+        self.restore_at = Some(at);
+        Ok(())
+    }
+
+    fn restore_audio(&mut self, origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
+        let restorer = self.restorer.as_ref().ok_or(RestoreError::NotPrepared)?;
+        // On the line of the opening's origin, by the audio thread's last
+        // step: the lead-in's start is `RESTORE_AHEAD` in its future.
+        let line = self.audio.control.counters().frame_line(origin);
+        self.restore = Some(restorer.plan(line, at)?);
+        Ok(())
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -595,6 +650,7 @@ impl Rig for PlayerRig<'_> {
             }
         }
         self.print(report);
+        self.print_restored();
         self.judge_queue();
         self.write_measure(report);
         self.persist();
