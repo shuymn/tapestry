@@ -486,3 +486,55 @@ fn a_saturated_channel_leaves_the_other_unchanged() {
     assert_eq!(frames, 100);
     assert_eq!(m.saturated(), 100);
 }
+
+/// `render` is `mix_raw` followed by the volume and the play's gain, the
+/// soft clipper and a ring-out's envelope, bit for bit, from identical
+/// mixers; `mix_raw` leaves the saturation count alone and the sum above
+/// full scale.
+#[test]
+fn render_is_mix_raw_then_gain_and_clipper() {
+    let bank = split_bank();
+    for (volume, gain) in [(1.0, H), (0.75, 1.3), (2.0, audio::MAX_GAIN)] {
+        let mut m = Mixer::new(8, RATE);
+        m.set_volume(volume).unwrap();
+        m.set_gain(gain).unwrap();
+        for (s, at) in SPLIT_TRIGGERS {
+            m.trigger(&bank, SoundId(s), at).unwrap();
+        }
+        // The envelope fades from frame 3 000 to 5 000.
+        m.ring_out(3_000, 5_000);
+        let mut raw_mixer = m.clone();
+        let mut out = Vec::new();
+        let mut raw = Vec::new();
+        for _ in 0..13 {
+            out.extend(render(&mut m, &bank, 480));
+            let mut block = vec![0.0; 480 * 2];
+            raw_mixer.mix_raw(&bank, &mut block);
+            raw.extend(block);
+        }
+        assert_eq!(raw_mixer.saturated(), 0);
+        assert!(m.saturated() > 0, "{volume} {gain}");
+        assert!(raw.iter().any(|x| x.abs() > 1.0));
+        let expected: Vec<f32> = raw
+            .chunks(2)
+            .enumerate()
+            .flat_map(|(f, frame)| {
+                let f = f as i64;
+                let e = if f < 3_000 {
+                    1.0
+                } else if f >= 5_000 {
+                    0.0
+                } else {
+                    ((5_000 - f) as f64 / 2_000.0) as f32
+                };
+                frame
+                    .iter()
+                    .map(move |&x| audio::soft_clip(x * (volume * gain)) * e)
+            })
+            .collect();
+        assert_eq!(out.len(), expected.len());
+        for (i, (a, b)) in out.iter().zip(&expected).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "sample {i} at {volume} {gain}");
+        }
+    }
+}

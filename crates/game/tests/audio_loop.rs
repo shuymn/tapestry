@@ -222,6 +222,55 @@ fn volume_change_scales_mixed_samples() {
     assert_eq!(heard, expected);
 }
 
+/// A play's gain travels with its start and holds for the whole play: a
+/// play at gain 1 mixes at twice the level of one at the 0.5 headroom,
+/// while the volume still changes mid-play. A gain out of range cannot be
+/// made, so no start carries one.
+#[test]
+fn a_plays_gain_applies_from_its_play() {
+    for refused in [0.0, -0.5, f32::NAN, f32::INFINITY, audio::MAX_GAIN * 1.01] {
+        assert!(audio::Gain::new(refused).is_err(), "{refused}");
+    }
+    assert!(audio::Gain::new(audio::MAX_GAIN).is_ok());
+    let chart = chart();
+    let (mut control, mut worker, mut out) = rig(&chart);
+    let steps = |worker: &mut AudioWorker, out: &mut RecordingOutput<SimDevice>| {
+        for _ in 0..15 {
+            worker.step(out).unwrap();
+        }
+    };
+    let (mut sink, queue) = audio_link_at(8, TimeUs(50 * MS));
+    let unity = audio::Gain::new(1.0).unwrap();
+    control.play_at(TimeUs(50 * MS), queue, unity).unwrap();
+    steps(&mut worker, &mut out);
+    assert_eq!(worker.engine().mixer().gain(), 1.0);
+    // The volume halves mid-play; the gain stays.
+    control.set_volume(0.5).unwrap();
+    sink.receive(&key_sound(150 * MS));
+    steps(&mut worker, &mut out);
+    // The next play, at the headroom: its BGM at a quarter (volume 0.5).
+    let (_sink, queue) = audio_link_at(8, TimeUs(600 * MS));
+    control.play(TimeUs(600 * MS), queue).unwrap();
+    for _ in 0..4 {
+        steps(&mut worker, &mut out);
+    }
+    assert_eq!(worker.engine().mixer().gain(), audio::HEADROOM);
+    let heard: Vec<f32> = out
+        .samples()
+        .iter()
+        .step_by(2)
+        .copied()
+        .filter(|&s| s != 0.0)
+        .collect();
+    // Exact: every level, volume and gain is a power-of-two fraction.
+    let bgm = 1_000.0 / 32_768.0;
+    let key = 1_007.0 / 32_768.0;
+    let mut expected = vec![bgm; 480];
+    expected.extend([key * 0.5; 480]);
+    expected.extend([bgm * 0.5 * 0.5; 480]);
+    assert_eq!(heard, expected);
+}
+
 /// Each key sound's press → sound scheduled latency reaches the probe,
 /// tagged with its play: the time the device plays the sound's first
 /// frame (found in the recording and timed by the simulated device, not
