@@ -637,3 +637,46 @@ fn survival_gauge_never_recovers() {
     assert_eq!(e.gauges[0].value, GaugeValue::FULL);
     assert!(e.gauges[0].cleared);
 }
+
+/// A whole chart's gauges start at their rules' start values, and the
+/// evaluation's final deadline is its evaluator's, completed or stopped at
+/// a finalized watermark before it.
+#[test]
+fn gauges_start_at_their_rule_and_final_deadline_is_the_evaluators() {
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(1), TimeUs(2_000 * MS))
+        .build()
+        .unwrap();
+    let preset = rules::tapestry();
+    let e = play(&chart, vec![press(1_000 * MS, 0, 1)]);
+    let starts: Vec<_> = e.gauges.iter().map(|g| g.start).collect();
+    assert_eq!(starts, [GaugeValue(2_000_000), GaugeValue(10_000_000)]);
+    assert_eq!(
+        starts,
+        preset.gauges.iter().map(|g| g.start).collect::<Vec<_>>()
+    );
+    let deadline = eval::Evaluator::new(
+        &chart,
+        &preset,
+        &device(&[0]),
+        &InputStart::default(),
+        None,
+        0,
+    )
+    .unwrap()
+    .final_deadline();
+    // The second tap's miss, past its 2 s.
+    assert!(deadline > TimeUs(2_000 * MS));
+    assert_eq!(e.final_deadline, deadline);
+    let input = EvalInput {
+        events: vec![press(1_000 * MS, 0, 1)],
+        device: device(&[0]),
+        start: InputStart::default(),
+        finalized: Some(TimeUs(1_500 * MS)),
+        section: None,
+    };
+    let aborted = evaluate(&chart, &input, &preset).unwrap();
+    assert!(!aborted.completed);
+    assert_eq!(aborted.final_deadline, deadline);
+}

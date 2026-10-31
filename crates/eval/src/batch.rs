@@ -42,6 +42,9 @@ pub struct GaugePoint {
 /// One gauge at the end of evaluation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GaugeResult {
+    /// The value it started at: the section's initial value for it, or
+    /// else the rule's start value.
+    pub start: GaugeValue,
     /// The real value.
     pub value: GaugeValue,
     /// The value had the gauge never failed.
@@ -52,7 +55,7 @@ pub struct GaugeResult {
     /// decided at the end, the value is at or above its threshold, or, for a
     /// survival gauge, it never failed.
     pub cleared: bool,
-    /// The value after every event that changed gauges.
+    /// The value after every event that changed gauges, in time order.
     pub history: Vec<GaugePoint>,
 }
 
@@ -68,6 +71,9 @@ pub struct Evaluation {
     /// Whether evaluation reached the final deadline of the chart, or of
     /// the section.
     pub completed: bool,
+    /// The final deadline of the chart, or of the section: where a play
+    /// that completes ends, whether or not this one did.
+    pub final_deadline: TimeUs,
 }
 
 /// Evaluates a recorded play: merges its sources' events as live play does,
@@ -125,12 +131,19 @@ pub fn evaluate(
         .iter()
         .zip(ev.gauges())
         .zip(histories)
-        .map(|((rule, state), history)| {
+        .enumerate()
+        .map(|(i, ((rule, state), history))| {
             let passed = match rule.kind {
                 GaugeKind::EndThreshold { clear } => state.value >= clear,
                 GaugeKind::Survival { .. } => state.failed_at.is_none(),
             };
             GaugeResult {
+                start: input
+                    .section
+                    .as_ref()
+                    .and_then(|s| s.initial_gauges.get(i))
+                    .copied()
+                    .unwrap_or(rule.start),
                 value: state.value,
                 reference: state.reference,
                 failed_at: state.failed_at,
@@ -143,6 +156,7 @@ pub fn evaluate(
         tally: *ev.tally(),
         gauges,
         completed,
+        final_deadline: ev.final_deadline(),
         events,
     })
 }

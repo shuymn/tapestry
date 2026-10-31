@@ -654,7 +654,8 @@ mod tests {
         let gauges = preset
             .gauges
             .iter()
-            .map(|_| GaugeResult {
+            .map(|g| GaugeResult {
+                start: g.start,
                 value: GaugeValue(6_123_400),
                 reference: GaugeValue(6_123_400),
                 failed_at: None,
@@ -680,6 +681,7 @@ mod tests {
                     tally,
                     gauges,
                     completed: true,
+                    final_deadline: TimeUs(1_200_000),
                 }),
                 matches_live: true,
                 recommended_offset: None,

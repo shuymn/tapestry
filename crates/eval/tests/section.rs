@@ -519,6 +519,7 @@ fn gauges_after(press_it: bool, initial: [i64; 2]) -> Result<Vec<GaugeValue>, Ev
     let ev = Evaluator::new(&chart, &preset, &dev, &InputStart::default(), Some(&s), 0)?;
     let before: Vec<_> = ev.gauges().iter().map(|g| g.value).collect();
     assert_eq!(before, initial.map(GaugeValue));
+    let deadline = ev.final_deadline();
     let events = if press_it {
         vec![press(10 * S, 0, 1), release(10 * S + 1, 0, 1)]
     } else {
@@ -532,6 +533,12 @@ fn gauges_after(press_it: bool, initial: [i64; 2]) -> Result<Vec<GaugeValue>, Ev
         events,
         Some(s),
     );
+    // Each gauge started at the section's value for it, and the axis ends
+    // at the section's final deadline, the tap's miss.
+    let starts: Vec<_> = e.gauges.iter().map(|g| g.start).collect();
+    assert_eq!(starts, initial.map(GaugeValue));
+    assert_eq!(e.final_deadline, deadline);
+    assert!(deadline > TimeUs(10 * S) && deadline < TimeUs(30 * S));
     Ok(e.gauges.iter().map(|g| g.value).collect())
 }
 
