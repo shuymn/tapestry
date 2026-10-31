@@ -11,8 +11,8 @@ use super::super::track::{self, Stretch};
 use super::super::{Cx, Dst, Prop};
 use crate::error::ImportError;
 
-/// The most cells the model draws (`skin_model::MAX_CELLS`).
-const CELLS: i32 = 11;
+/// The most cells the model draws.
+const CELLS: i32 = skin_model::MAX_CELLS as i32;
 
 impl Cx<'_> {
     /// The effective integer property (`JsonSkinObjectLoader.java:
