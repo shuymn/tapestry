@@ -131,7 +131,7 @@ pub enum DeviationId {
 }
 
 /// How the lanes, SUDDEN+ and LIFT are drawn differently from the source
-/// (owner decision 12, items a–l).
+/// (owner decision 12, items a–k).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneApprox {
     /// a: notes and long-note bodies stop at the top of the lanes.
