@@ -2,7 +2,8 @@
 //! reducer, the snapshot into the fields, every timer, the `when` timers,
 //! each image's frame and its place in the atlas, the canvas and the
 //! regions' placement as the target, the layout and the scratch side
-//! change, the lanes widget, and the elements into the batch.
+//! change, the lanes, number, gauge and judge widgets, and the elements
+//! into the batch.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -24,10 +25,12 @@ use image_support::{dir, file, save, solid, whole};
 use play_support::{bool_program, state, tally};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
-    Adjust, Anchor, AtlasLimits, Attempt, Bind, Blend, ClipId, CycleDef, Ease, ElementDef, End,
-    Fill, Filter, Fit, GaugeDesc, ImageDef, KeyDef, LaneParts, LaneTimer, LaneView,
-    Layout as SkinLayout, Place, Play, PlayContext, QuadBatch, Region, RegionDef, Sheet, Side,
-    Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable, Variant, lane_timer, timer,
+    Adjust, Align, Anchor, AtlasLimits, Attach, Attempt, Bind, Blend, ClipId, ComboPart, CycleDef,
+    DigitsDef, Ease, ElementDef, End, Fill, Filter, Fit, GaugeDef, GaugeDesc, GaugeLook,
+    GaugeParts, GlyphSet, GradePart, ImageDef, JudgeDef, JudgeSlot, KeyDef, LaneParts, LaneTimer,
+    LaneView, Layout as SkinLayout, Motion, NumberDef, Pad, Place, Play, PlayContext, QuadBatch,
+    Region, RegionDef, Sheet, Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Track, UvTable,
+    Variant, lane_timer, timer,
 };
 
 struct Counting;
@@ -257,7 +260,20 @@ const PARTS: u16 = timer::BUILTIN + WHEN_IMAGES;
 const NOTE: u16 = PARTS;
 const BODY_ON: u16 = PARTS + 3;
 const BEAM: u16 = PARTS + 10;
-const IMAGES: u16 = BEAM + 1;
+/// The widgets' images after the beam: the numbers' glyphs (two sets of
+/// ten and of twenty-four, cycled; eleven), the combos' (ten, eleven,
+/// twenty-four), a grade per judge slot, the gauges' two look sets of
+/// six, and the flicker gauge's six.
+const DIGITS_10: u16 = BEAM + 1;
+const DIGITS_11: u16 = BEAM + 2;
+const DIGITS_24: u16 = BEAM + 3;
+const COMBO_10: u16 = BEAM + 4;
+const COMBO_11: u16 = BEAM + 5;
+const COMBO_24: u16 = BEAM + 6;
+const GRADES: u16 = BEAM + 7;
+const LOOKS: u16 = GRADES + 7;
+const FLICKER: u16 = LOOKS + 12;
+const IMAGES: u16 = FLICKER + 6;
 /// The reserved layers of the atlas.
 const RESERVED: u16 = 1;
 
@@ -294,6 +310,16 @@ struct Loaded {
 fn frames_of(k: u16) -> u16 {
     if k == NOTE {
         4
+    } else if k == DIGITS_10 {
+        20
+    } else if k == DIGITS_11 || k == COMBO_11 {
+        11
+    } else if k == DIGITS_24 {
+        48
+    } else if k == COMBO_10 {
+        10
+    } else if k == COMBO_24 {
+        24
     } else if k < PARTS && k.is_multiple_of(3) {
         4 + k % 5
     } else {
@@ -314,8 +340,10 @@ fn images() -> (tempfile::TempDir, Sheet) {
         let cols = frames_of(k);
         let (w, h) = if k < PARTS {
             (u32::from(12 + k % 5), u32::from(10 + k % 3))
-        } else {
+        } else if k <= BEAM {
             (u32::from(k), 16)
+        } else {
+            (4, u32::from(4 + k % 3))
         };
         let name = format!("{k}.png");
         save(
@@ -324,7 +352,7 @@ fn images() -> (tempfile::TempDir, Sheet) {
             &solid(w * u32::from(cols), h, [k as u8, 0, 0, 255]),
         );
         files.push(file(&name));
-        let timer = if k == NOTE {
+        let timer = if k == NOTE || k == DIGITS_10 || k == DIGITS_24 {
             TimerRef::Builtin(timer::READY)
         } else if k < timer::BUILTIN && k % 2 == 0 {
             TimerRef::Builtin(k)
@@ -393,6 +421,264 @@ fn background(image: u16, fill: Fill) -> ElementDef {
         ..Place::SCREEN
     };
     lanes_support::image(u32::from(image), [0, 0, 1_920, 1_080], place)
+}
+
+/// An element on `timer` drawing `source` over `track` in `place`.
+fn widget(source: Source, track: Track, timer: TimerRef, place: Place) -> ElementDef {
+    ElementDef {
+        source,
+        track,
+        timer,
+        visible: None,
+        blend: Blend::Alpha,
+        clip: None,
+        place,
+    }
+}
+
+/// The widgets, their elements appended to `elements`:
+/// - numbers in the three glyph layouts, every alignment and padding,
+///   the cycled sets, bound to the span and a lane or not, turning, with
+///   values going negative, overflowing and reaching `i32::MIN`;
+/// - a gauge in each motion, the flicker's with its own images;
+/// - two judges with every slot and a combo of each layout, one shifting
+///   the grade and one not, their parts animated, additive or hidden.
+fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
+    let int = |src: &str| {
+        skin_model::compile(
+            src,
+            &skin_model::Scope::new(&skin_model::PLAY),
+            skin_model::Ty::Int,
+        )
+        .unwrap()
+    };
+    let strip = |image: u16, set, cells, align, pad, space| DigitsDef {
+        image: u32::from(image),
+        set,
+        cells,
+        align,
+        pad,
+        space,
+    };
+    let numbers = vec![
+        (
+            strip(DIGITS_10, GlyphSet::Ten, 4, Align::Right, Pad::Blank, 2),
+            "combo * 100",
+        ),
+        (
+            strip(DIGITS_11, GlyphSet::Eleven, 6, Align::Left, Pad::Glyph, -3),
+            "ex_score - 50",
+        ),
+        (
+            strip(
+                DIGITS_24,
+                GlyphSet::TwentyFour,
+                5,
+                Align::Center,
+                Pad::Blank,
+                0,
+            ),
+            "combo - 10",
+        ),
+        (
+            strip(
+                DIGITS_24,
+                GlyphSet::TwentyFour,
+                11,
+                Align::Right,
+                Pad::Zero,
+                1,
+            ),
+            "if combo % 2 == 0 then -2147483647 - 1 else combo",
+        ),
+        (
+            strip(DIGITS_10, GlyphSet::Ten, 3, Align::Center, Pad::Zero, 4),
+            "bp - 3",
+        ),
+    ];
+    let places = [
+        Place {
+            region: Region::Playfield,
+            bind: Bind::Lanes,
+            pivot: Anchor::Center,
+            fill: Fill::None,
+        },
+        Place {
+            region: Region::Left,
+            pivot: Anchor::BottomRight,
+            ..Place::SCREEN
+        },
+        Place {
+            region: Region::Top,
+            pivot: Anchor::Top,
+            ..Place::SCREEN
+        },
+        Place::SCREEN,
+        Place {
+            region: Region::Playfield,
+            bind: Bind::Lane(Lane::new(3).unwrap()),
+            ..Place::SCREEN
+        },
+    ];
+    for (i, place) in (0_u16..).zip(places) {
+        elements.push(widget(
+            Source::Number(u32::from(i)),
+            track(300 + 7 * i, Ease::Linear, End::Hold),
+            TimerRef::Builtin(timer::READY),
+            place,
+        ));
+    }
+    let numbers = numbers
+        .into_iter()
+        .map(|(digits, src)| NumberDef {
+            digits,
+            value: int(src),
+        })
+        .collect();
+    let look = |first: u16| {
+        let at = |k: u16| [u32::from(first + 2 * k), u32::from(first + 2 * k + 1)];
+        GaugeParts {
+            front: at(0),
+            back: at(1),
+            tip: at(2),
+        }
+    };
+    let looks = |hard: GaugeParts| {
+        let mut out = [look(LOOKS); GaugeLook::COUNT];
+        out[GaugeLook::Hard.index()] = hard;
+        out
+    };
+    let step = TimeUs(70 * MS);
+    let gauges = vec![
+        GaugeDef {
+            segments: 50,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Still,
+        },
+        GaugeDef {
+            segments: 40,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Random { range: 5, step },
+        },
+        GaugeDef {
+            segments: 30,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Rise { range: 3, step },
+        },
+        GaugeDef {
+            segments: 20,
+            looks: looks(look(LOOKS + 6)),
+            motion: Motion::Fall { range: 2, step },
+        },
+        GaugeDef {
+            segments: 50,
+            looks: [look(FLICKER); GaugeLook::COUNT],
+            motion: Motion::Flicker {
+                period: TimeUs(330 * MS),
+            },
+        },
+    ];
+    let regions = [
+        Region::Bottom,
+        Region::Right,
+        Region::Screen,
+        Region::Left,
+        Region::Top,
+    ];
+    for (i, region) in (0_u16..).zip(regions) {
+        elements.push(widget(
+            Source::Gauge(u32::from(i)),
+            track(400 + 11 * i, Ease::Out, End::Hold),
+            TimerRef::Builtin(timer::PLAY),
+            Place {
+                region,
+                pivot: Anchor::ALL[usize::from(i)],
+                ..Place::SCREEN
+            },
+        ));
+    }
+    let combos = [
+        strip(COMBO_10, GlyphSet::Ten, 4, Align::Center, Pad::Blank, 0),
+        strip(COMBO_11, GlyphSet::Eleven, 5, Align::Right, Pad::Glyph, 2),
+        strip(
+            COMBO_24,
+            GlyphSet::TwentyFour,
+            11,
+            Align::Left,
+            Pad::Zero,
+            -2,
+        ),
+    ];
+    let judge = |shift: bool| {
+        let mut j = JudgeDef {
+            grades: Default::default(),
+            combos: Default::default(),
+            shift,
+        };
+        for s in JudgeSlot::ALL {
+            let k = u16::try_from(s.index()).unwrap();
+            let grade_key = |at: i64, y: i32| {
+                let mut props = [None; 9];
+                props[0] = Some(800);
+                props[1] = Some(y);
+                props[2] = Some(200);
+                props[3] = Some(80);
+                props[8] = Some(i32::from(k) * 10);
+                KeyDef {
+                    at: TimeUs(at),
+                    props,
+                }
+            };
+            j.grades[s.index()] = Some(GradePart {
+                image: u32::from(GRADES + k),
+                track: Track::new(
+                    &[grade_key(0, 520), grade_key(200 * MS, 500)],
+                    Ease::In,
+                    End::Hold,
+                )
+                .unwrap(),
+                timer: TimerRef::Builtin(timer::JUDGE),
+                pivot: Anchor::ALL[s.index()],
+                blend: if k % 2 == 0 { Blend::Alpha } else { Blend::Add },
+                visible: (k == 3).then(|| bool_program("bp < 100000")),
+            });
+            j.combos[s.index()] = Some(ComboPart {
+                digits: combos[s.index() % 3],
+                track: track(10 + k, Ease::Linear, End::Hold),
+                timer: if k == 4 {
+                    TimerRef::Builtin(timer::COMBO_UP)
+                } else {
+                    TimerRef::Builtin(timer::JUDGE)
+                },
+                attach: if k % 2 == 0 {
+                    Attach::Top
+                } else {
+                    Attach::Bottom
+                },
+                pivot: Anchor::Center,
+                blend: Blend::Alpha,
+                visible: (k == 2).then(|| bool_program("combo % 3 != 0")),
+            });
+        }
+        j
+    };
+    let still = lanes_support::still([None; 9]);
+    for i in 0..2 {
+        elements.push(widget(
+            Source::Judge(i),
+            still.clone(),
+            TimerRef::Builtin(timer::READY),
+            Place {
+                region: Region::Judge,
+                ..Place::SCREEN
+            },
+        ));
+    }
+    skin_model::WidgetDefs {
+        numbers,
+        gauges,
+        judges: vec![judge(true), judge(false)],
+    }
 }
 
 /// 2 000 elements, 30 on every built-in timer and 350 over 32 `when`s,
@@ -481,6 +767,7 @@ fn skin() -> Loaded {
         blend: Blend::Add,
         ..lanes_support::image(u32::from(BEAM), [152, 824, 112, 112], beam)
     });
+    let widgets = widgets(&mut elements);
     let (_dir, sheet) = images();
     let skin = Skin::new(SkinDef {
         fit: Fit::Adapt,
@@ -489,6 +776,7 @@ fn skin() -> Loaded {
         sheet,
         lanes: Some(lanes()),
         elements,
+        widgets,
     })
     .unwrap();
     // A page of 256 holds only some of the frames.
@@ -508,7 +796,7 @@ fn skin() -> Loaded {
         for f in 0..frames_of(k) {
             let frame = uvs.get(next).unwrap();
             assert!(shows.insert(uv_key(frame.uv), (k, f)).is_none());
-            if k >= PARTS {
+            if (PARTS..=BEAM).contains(&k) {
                 let old = parts.insert(part_key(frame.uv, frame.layer), k);
                 // A cycle's frames may share a column.
                 assert!(old.is_none_or(|o| o == k), "{k} and {old:?}");
@@ -547,11 +835,79 @@ struct Witness {
     turned: bool,
     /// The beam's x per target, at the author's layout.
     beam: [Option<f32>; TARGETS.len()],
+    /// The widgets': a combo drew and the shifting judge's grade lay apart
+    /// from the other's; the full-gauge PERFECT showed; a sign glyph drew;
+    /// the flicker's tip was pushed; each shown gauge drew its own look.
+    widgets: Widgets,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Widgets {
+    combo: bool,
+    shifted: bool,
+    at_max: bool,
+    sign: bool,
+    overlay: bool,
+    looks: [bool; 2],
+}
+
+impl Widgets {
+    fn merge(&mut self, o: Self) {
+        self.combo |= o.combo;
+        self.shifted |= o.shifted;
+        self.at_max |= o.at_max;
+        self.sign |= o.sign;
+        self.overlay |= o.overlay;
+        for (a, b) in self.looks.iter_mut().zip(o.looks) {
+            *a |= b;
+        }
+    }
+
+    /// What one frame's quads show, `shown` the gauge index it showed.
+    fn see(&mut self, loaded: &Loaded, quads: &[skin_model::Quad], shown: usize) {
+        let mut grades = [None; 2];
+        let mut n_grades = 0;
+        let mut combo = false;
+        let mut flicker = 0;
+        for q in quads {
+            let Some(&(image, frame)) = loaded.shows.get(&uv_key(q.uv)) else {
+                continue;
+            };
+            match image {
+                COMBO_10 | COMBO_11 | COMBO_24 => combo = true,
+                DIGITS_24 if frame % 12 == 11 => self.sign = true,
+                FLICKER..IMAGES => flicker += 1,
+                LOOKS..FLICKER => {
+                    let set = usize::from((image - LOOKS) / 6);
+                    if set == shown {
+                        self.looks[set] = true;
+                    }
+                }
+                GRADES..LOOKS => {
+                    self.at_max |= image == GRADES + 6;
+                    if let Some(g) = grades.get_mut(n_grades) {
+                        *g = Some(q.rect[0]);
+                    }
+                    n_grades += 1;
+                }
+                _ => {}
+            }
+        }
+        self.combo |= combo;
+        if let [Some(a), Some(b)] = grades
+            && combo
+            && n_grades == 2
+        {
+            self.shifted |= a != b;
+        }
+        self.overlay |= flicker == 51;
+    }
 }
 
 impl Witness {
     fn new() -> Self {
         Self {
+            widgets: Widgets::default(),
             split_drains: 0,
             small_drops: 0,
             other_drops: 0,
@@ -646,7 +1002,7 @@ fn stretch(
     let mut now = from;
     let mut frame_no = 0_usize;
     let mut offset = TimeUs(0);
-    let mut shown = 0;
+    let mut stalled = false;
     let midway = from + (to - from) / 2;
     let last = events.last().map_or(0, |e| e.time.0);
     while now <= to {
@@ -654,7 +1010,7 @@ fn stretch(
             now += 1_000 * MS;
             gauges[1].failed_at = Some(TimeUs(now));
             offset = TimeUs(40 * MS);
-            shown = 1;
+            stalled = true;
         }
         let pending = events[next..].partition_point(|e| e.time.0 <= now);
         let take = pending.min(DRAIN);
@@ -678,6 +1034,9 @@ fn stretch(
                 _ => {}
             }
         }
+        // After the stall the shown gauge is mostly gauge 1, every 4th
+        // frame gauge 0.
+        let shown = usize::from(stalled && !frame_no.is_multiple_of(4));
         let target_no = (frame_no / 5) % TARGETS.len();
         let layout_no = (frame_no / 37) % views.layouts.len();
         let frame = SkinFrame {
@@ -700,6 +1059,7 @@ fn stretch(
             w.small_drops += out.dropped();
         } else {
             w.other_drops += out.dropped();
+            w.widgets.see(loaded, out.quads(), shown);
             if out.quads().is_empty() {
                 w.empty_frames_after_ready += 1;
             }
@@ -742,10 +1102,14 @@ fn build_does_not_allocate() {
         GaugeDesc {
             start: GaugeValue(50 * GaugeValue::PERCENT),
             max: GaugeValue::FULL,
+            look: GaugeLook::Normal,
+            border: GaugeValue(80 * GaugeValue::PERCENT),
         },
         GaugeDesc {
             start: GaugeValue::FULL,
             max: GaugeValue::FULL,
+            look: GaugeLook::Hard,
+            border: GaugeValue::EMPTY,
         },
     ];
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
@@ -862,7 +1226,16 @@ fn build_does_not_allocate() {
         for (a, b) in seen.drawn.iter_mut().zip(w.drawn) {
             *a |= b;
         }
+        seen.widgets.merge(w.widgets);
     }
+    // The widgets' witnesses, seen inside the counted stretches.
+    let ws = seen.widgets;
+    assert!(ws.combo, "no combo drew");
+    assert!(ws.shifted, "no grade shifted");
+    assert!(ws.at_max, "PERFECT at a full gauge never showed");
+    assert!(ws.sign, "no sign glyph drew");
+    assert!(ws.overlay, "no flicker tip was pushed");
+    assert_eq!(ws.looks, [true; 2], "a shown gauge never drew its look");
     // The beam follows the scratch: authored at 152 on the left, 600 with
     // the scratch on the right (tests/lanes.rs).
     assert_eq!(beams, [152.0, 600.0, 152.0]);
