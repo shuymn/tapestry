@@ -1207,26 +1207,41 @@ fn dev_start_starts_the_play_at_that_time() {
     assert_eq!(practice.lead_in, TimeUs(2_000_000));
     assert_eq!(practice.attempt, 1);
     assert_eq!(rec.start.opened_at, TimeUs(1_800_000));
-    // The restored long voice's click (3.0 s) and the marker (3.5 s) sound
-    // exactly 0.5 s apart, whichever plan was placed: both restore before
-    // 3.0 s. Nothing due before the restore sounds (no 1.0 s click, nor
-    // the schedule from chart time 0), and the 2.05 s click only after a
-    // restore at the lead-in's start.
+    // The run is on real threads, so which plan lands depends on how fast
+    // the game thread got from the opening to the start: the first plan
+    // within 200 ms minus the queued output, the fallback within 700 ms;
+    // past that the restore is refused as late and the round plays with
+    // its background music stopped. Whichever it is, nothing due before
+    // the restore point sounds: not the 1.0 s click, nor the schedule from
+    // chart time 0.
     let first = stdout.contains("audio: restored at 2000 ms (first)");
     let fallback = stdout.contains("audio: restored at 2500 ms (fallback)");
-    assert!(first ^ fallback, "{stdout}");
+    let refused = stdout.contains("audio: not restored (Late)");
+    assert_eq!(
+        u8::from(first) + u8::from(fallback) + u8::from(refused),
+        1,
+        "{stdout}"
+    );
     let onsets = printed_onsets(&stdout);
+    // Refused: only the targets' two key sounds, sent from their
+    // judgments.
+    if refused {
+        assert_eq!(onsets.len(), 2, "{onsets:?}");
+        return;
+    }
+    // The restored long voice's click (3.0 s) and the marker (3.5 s) sound
+    // exactly 0.5 s apart, both restore points being before 3.0 s; the
+    // 2.05 s click only after a restore at the lead-in's start; then the
+    // two key sounds.
     let gaps: Vec<i64> = onsets.windows(2).map(|w| w[1] - w[0]).collect();
     let near = |gap: i64, want: i64| (gap - want).abs() <= 1;
     let lead = usize::from(first);
-    assert!(gaps.len() > lead + 1, "{onsets:?}");
+    assert_eq!(onsets.len(), lead + 4, "{onsets:?}");
     if first {
         // 2.05 s to 3.0 s.
         assert!(near(gaps[0], 45_600), "{onsets:?}");
     }
     assert!(near(gaps[lead], 24_000), "{onsets:?}");
-    // Then only the targets' key sounds, sent from their judgments.
-    assert_eq!(onsets.len(), lead + 4, "{onsets:?}");
 }
 
 #[test]
