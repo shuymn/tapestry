@@ -100,6 +100,25 @@ impl Cx<'_> {
         if numbers.len() < images.len() && has_values {
             return refuse(self, at, field("numbers"));
         }
+        // The source compares every image's id, and every number's for
+        // each image, with the skin's records, and fails on a missing one
+        // (`JsonPlaySkinObjectLoader.java:230-232, 243-244`).
+        let has_images = !super::super::object::records(&self.tables, "image").is_empty();
+        let lists = [
+            (&images[..], has_images, "images"),
+            (
+                numbers.get(..images.len()).unwrap_or(&numbers),
+                has_values,
+                "numbers",
+            ),
+        ];
+        for (list, compared, name) in lists {
+            for &r in list {
+                if compared && super::super::object::id_of(self.def, r)?.is_none() {
+                    return refuse(self, self.arena_span(r), field(name));
+                }
+            }
+        }
 
         // The outer destination: lifetime, timer and conditions.
         let Some(c) = self.common_with(

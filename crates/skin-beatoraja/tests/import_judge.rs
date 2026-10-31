@@ -244,6 +244,33 @@ fn combos_exist_for_four_slots() {
 }
 
 #[test]
+fn judge_entries_need_an_id() {
+    let refused = |field| (CriticalPart::Judge, NoteKind::UnsupportedField { field });
+    let no_id = r#"{"dst": [{"x": 100, "y": 500, "w": 80, "h": 20}]}"#.to_owned();
+    // An id naming no record leaves its slot empty.
+    let mut images = grades(1);
+    images.push(NONE.to_owned());
+    judge(&images, &[combo("ten", 10), NONE.to_owned()]).ok();
+    // A missing one refuses, for an image past the slots too.
+    let mut images = grades(1);
+    images.push(no_id.clone());
+    assert_eq!(
+        critical(judge(&images, &[combo("ten", 10), NONE.to_owned()])),
+        refused("images")
+    );
+    let mut images = grades(7);
+    images.push(no_id.clone());
+    let numbers = vec![NONE.to_owned(); 8];
+    assert_eq!(critical(judge(&images, &numbers)), refused("images"));
+    assert_eq!(
+        critical(judge(&grades(2), &[combo("ten", 10), no_id.clone()])),
+        refused("numbers")
+    );
+    // A number past the images is never read.
+    judge(&grades(1), &[combo("ten", 10), no_id]).ok();
+}
+
+#[test]
 fn quads_count_the_widest_state() {
     let l = judge(&grades(2), &[combo("ten", 10), combo("five", 10)]);
     assert_eq!(l.report().usage.widget_quads, 6);
