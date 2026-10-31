@@ -417,8 +417,30 @@ impl SelectScreen {
         self.bests = bests;
     }
 
-    /// Acts on one input.
+    /// Acts on one input. With dev-tools, each text, composition and key
+    /// the search box takes is logged with the search text after it, so
+    /// the order an IME sends them in can be read back.
     pub fn input(&mut self, input: MenuInput) -> Acted {
+        #[cfg(feature = "dev-tools")]
+        let kind = match &input {
+            MenuInput::Text(_) => Some("text".to_owned()),
+            MenuInput::Preedit(p) => Some(format!("composition of {}", p.chars().count())),
+            MenuInput::Key(k) if self.searching => Some(format!("key {k:?}")),
+            MenuInput::Key(_) => None,
+        };
+        let acted = self.act(input);
+        #[cfg(feature = "dev-tools")]
+        if let Some(kind) = kind {
+            log::info!(
+                "select: {kind}, searching {}, query {:?}",
+                self.searching,
+                self.query
+            );
+        }
+        acted
+    }
+
+    fn act(&mut self, input: MenuInput) -> Acted {
         if self.searching {
             return self.search_input(input);
         }
