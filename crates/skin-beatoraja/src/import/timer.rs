@@ -98,10 +98,7 @@ impl Custom {
         }
         match self.aliases.get(&id) {
             Some(&Some(target)) if (0..=BUILTIN_MAX).contains(&target) => {
-                match builtin(target, self.judge_region) {
-                    t @ (Timer::Builtin(_) | Timer::Rank(_) | Timer::Unset) => t,
-                    Timer::Unsupported => Timer::Unsupported,
-                }
+                builtin(target, self.judge_region)
             }
             _ => Timer::Unsupported,
         }
