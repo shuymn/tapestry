@@ -187,9 +187,8 @@ impl fmt::Display for At<'_> {
 impl fmt::Display for ImportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Read { at, name, source } => {
-                write!(f, "{}cannot read {name}: {source}", At(at))
-            }
+            // The cause is `source()`, not repeated here.
+            Self::Read { at, name, .. } => write!(f, "{}cannot read {name}", At(at)),
             Self::Syntax { at, what } => write!(f, "{at}: {what}"),
             Self::Input { at, limit } => write!(f, "{}{limit}", At(at)),
             Self::IncludeCycle { at, chain } => {

@@ -204,12 +204,19 @@ fn nothing_is_read_where_wrappers_are_not_enabled() {
         "s.json",
         &play(r#""property": {"include": "missing.json"}"#),
     )]);
-    match header(&d) {
-        Err(ImportError::Read {
+    let err = header(&d).map(|_| ()).unwrap_err();
+    // The message is this step; the cause is only its source.
+    assert!(
+        err.to_string().ends_with(": cannot read missing.json"),
+        "{err}"
+    );
+    assert!(std::error::Error::source(&err).is_some());
+    match err {
+        ImportError::Read {
             at: Some(at),
             name,
             source: RootError::Missing,
-        }) => {
+        } => {
             assert_eq!(name, "missing.json");
             assert_eq!((at.file.as_str(), at.line), ("s.json", 1));
         }
