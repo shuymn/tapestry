@@ -242,8 +242,11 @@ fn a_part_s_track_runs_on_its_timer() {
 
 #[test]
 fn the_combo_follows_its_attach_edge() {
-    // The grade grows from 80 to 100 tall over 400 ms on `judge`, its
-    // bottom fixed at 580; the combo is still, on `ready`.
+    // The grade grows from 80 to 100 tall over 400 ms on `judge`, which
+    // starts at the judgment at 1 000 ms, its bottom fixed at 580. The
+    // combo moves its relative y from −70 to −50 over 2 000 ms on `ready`,
+    // which starts at 0: −60 at 1 000 ms and −56 at 1 400 ms, where the
+    // grade's clock would give −70 and −66.
     let shown = |attach: Attach| {
         let mut j = empty_judge();
         j.grades[1] = Some(GradePart {
@@ -252,19 +255,26 @@ fn the_combo_follows_its_attach_edge() {
         });
         j.combos[1] = Some(ComboPart {
             attach,
+            track: timed(
+                [210, -70, 20, 60],
+                [210, -50, 20, 60],
+                2_000 * MS,
+                End::Hold,
+            ),
             timer: TimerRef::Builtin(timer::READY),
             ..combo(strip(), [210, -70, 20, 60])
         });
         let mut h = harness(skin_of(j));
         h.tally = tally(5);
-        h.frame(0, &[judgment(0, Judgment::Great, 5)]);
+        h.frame(1_000, &[judgment(1_000, Judgment::Great, 5)]);
         let before = quads(&h)[0].2[1];
-        h.frame(400, &[]);
+        h.frame(1_400, &[]);
         let after = quads(&h)[0].2[1];
         (before, after)
     };
-    assert_eq!(shown(Attach::Bottom), (510.0, 510.0));
-    assert_eq!(shown(Attach::Top), (430.0, 410.0));
+    // Bottom: 580 − 60 and 580 − 56. Top: 500 − 60 and 480 − 56.
+    assert_eq!(shown(Attach::Bottom), (520.0, 524.0));
+    assert_eq!(shown(Attach::Top), (440.0, 424.0));
 }
 
 #[test]
@@ -627,12 +637,12 @@ fn keys(n: usize) -> Track {
 
 #[test]
 fn judge_part_keys_count_toward_the_skin_s_keys() {
-    // One 1-key element; 255 full parts and one of `last` keys, over
-    // judges of seven grade parts each, every stored part counted once.
+    // One 1-key element; 255 full grade parts over judges of seven grade
+    // parts each, and a combo part of `last` keys on the last judge, every
+    // stored part counted once.
     let judges = |last: usize| -> Vec<JudgeDef> {
-        let mut tracks: Vec<Track> = (0..255).map(|_| keys(MAX_TRACK_KEYS)).collect();
-        tracks.push(keys(last));
-        tracks
+        let tracks: Vec<Track> = (0..255).map(|_| keys(MAX_TRACK_KEYS)).collect();
+        let mut judges: Vec<JudgeDef> = tracks
             .chunks(7)
             .map(|c| {
                 let mut j = empty_judge();
@@ -644,7 +654,14 @@ fn judge_part_keys_count_toward_the_skin_s_keys() {
                 }
                 j
             })
-            .collect()
+            .collect();
+        if let Some(j) = judges.last_mut() {
+            j.combos[0] = Some(ComboPart {
+                track: keys(last),
+                ..combo(strip(), COMBO_KEY)
+            });
+        }
+        judges
     };
     let with = |last| {
         load(
