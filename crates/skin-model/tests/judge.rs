@@ -436,6 +436,18 @@ fn capacity_counts_the_largest_resolved_state() {
         COMBO_KEY,
     ));
     assert_eq!(skin_of(j).quad_capacity(), 12);
+    // The other way round: only the full-gauge PERFECT has a grade, and
+    // its combo falls back to PERFECT's eleven cells.
+    let mut j = empty_judge();
+    j.grades[6] = Some(grade(GRADE + 6, GRADE_KEY));
+    j.combos[0] = Some(combo(
+        DigitsDef {
+            cells: 11,
+            ..strip()
+        },
+        COMBO_KEY,
+    ));
+    assert_eq!(skin_of(j).quad_capacity(), 12);
 }
 
 fn refused(elements: Vec<ElementDef>, j: JudgeDef) -> LoadError {
