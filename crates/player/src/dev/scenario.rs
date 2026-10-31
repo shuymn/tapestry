@@ -12,7 +12,7 @@
 //! thread's frame sink.
 //!
 //! ```toml
-//! version = 1
+//! version = 2
 //! output = "out"                 # needed by captures; made by the run
 //!
 //! [library]
@@ -29,9 +29,11 @@
 //! play = { input = "auto", until = "end" }
 //! # input = "auto" | "<input log, relative to this file>"
 //! # until = "end" | { at_ms = 2250, command = "retry" | "quit" | "skip" }
-//! # "quit": the quit key before the play completes, back to selection;
-//! # "skip": the quit key once it is complete, its tail still sounding,
-//! # which skips to its result
+//! # "quit": the quit key before the play completes, which ends it midway
+//! # on its result; "skip": the quit key once it is complete, its tail
+//! # still sounding, which skips to its result. Both land on the result,
+//! # which a `result` step leaves; at_ms is never in the countdown, where
+//! # the quit key would leave the chart without one
 //!
 //! [[step]]
 //! result = "next-preset"         # "prev-preset" | "retry" | "back"
@@ -40,7 +42,8 @@
 //! practice = { path = "library/a/a.bms", from = 1, to = 2, speed = 75, lead_in_ms = 2000, gauge = 20, repeat = true, input = "logs/a.tprl", rounds = 1 }
 //! # or { search = "text", … }; measures from 1, both included; speed in
 //! # percent; the displayed gauge's initial value in percent; rounds
-//! # played, then the quit key at the next round's start and back
+//! # played, then the quit key at the next round's start, in its countdown,
+//! # which returns to the page, and back
 //!
 //! [[step]]
 //! quit = {}
@@ -69,7 +72,7 @@ use crate::measure::Drawn;
 use crate::render_side::{FrameSink, RenderEnd, Screen};
 
 /// The one version of the file this build reads.
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 
 /// The largest file read.
 const MAX_FILE: usize = 1 << 20;
@@ -154,7 +157,8 @@ pub struct PlayStep {
 pub enum UntilCommand {
     /// The retry key: the chart is played again.
     Retry,
-    /// The quit key before the play completes: back to selection.
+    /// The quit key before the play completes: it ends midway, and its
+    /// result shows.
     Quit,
     /// The quit key once the play is complete, its tail still sounding:
     /// the tail is skipped to the result (design.md "Audio tail").
@@ -610,10 +614,11 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 };
                 steps.push((SelectStep::Play(PlayStep { input, until }), o));
                 waiting.clear();
+                // A quit, at chart time 0 or later, ends the play midway on
+                // its result, as a skip does once it is complete.
                 match until {
-                    None | Some((_, UntilCommand::Skip)) => Seq::Result,
+                    None | Some((_, UntilCommand::Quit | UntilCommand::Skip)) => Seq::Result,
                     Some((_, UntilCommand::Retry)) => Seq::Replay,
-                    Some((_, UntilCommand::Quit)) => Seq::Select,
                 }
             }
             (Seq::Result, Step::Result(r)) => {
@@ -1281,7 +1286,7 @@ mod tests {
 
     /// The file of `steps` (TOML `[[step]]` bodies, one per entry).
     fn file(output: Option<&str>, steps: &[&str]) -> String {
-        let mut text = "version = 1\n".to_owned();
+        let mut text = "version = 2\n".to_owned();
         if let Some(o) = output {
             writeln!(text, "output = \"{o}\"").unwrap();
         }
@@ -1371,11 +1376,12 @@ mod tests {
         assert!(dir.path().join("out").is_dir());
     }
 
-    /// A timed quit lands where its word says: `quit`, before completion,
-    /// on the select screen; `skip`, once the play is complete, on its
-    /// result, which a `result` step then takes and a `select` cannot.
+    /// A timed quit lands on the play's result whichever its word: `quit`,
+    /// before completion, ends the play midway; `skip`, once it is
+    /// complete, skips its tail. A `result` step then takes the result and
+    /// a `select` cannot.
     #[test]
-    fn a_timed_quit_lands_where_its_word_says() {
+    fn a_timed_quit_lands_on_the_result() {
         let dir = folder();
         let select = "select = { path = \"library/a/a.bms\" }";
         let at = |word: &str| {
@@ -1405,13 +1411,14 @@ mod tests {
             refused(dir.path(), None, &[select, &skip, select, "quit = {}"]),
             "step 3 (select): select cannot follow step 2 (play)"
         );
+        let back = parse(
+            &file(None, &[select, &quit, "result = \"back\"", "quit = {}"]),
+            dir.path(),
+        );
+        assert!(back.is_ok(), "{:?}", back.err());
         assert_eq!(
-            refused(
-                dir.path(),
-                None,
-                &[select, &quit, "result = \"back\"", "quit = {}"]
-            ),
-            "step 3 (result): result cannot follow step 2 (play)"
+            refused(dir.path(), None, &[select, &quit, select, "quit = {}"]),
+            "step 3 (select): select cannot follow step 2 (play)"
         );
         let after_quit = parse(&file(None, &[select, &quit, "quit = {}"]), dir.path());
         assert!(after_quit.is_ok(), "{:?}", after_quit.err());
@@ -1661,7 +1668,7 @@ mod tests {
     #[test]
     fn bounds_are_checked() {
         let dir = folder();
-        let mut text = "version = 1\nstep = [".to_owned();
+        let mut text = "version = 2\nstep = [".to_owned();
         for _ in 0..=u16::MAX {
             text.push_str("{quit={}},");
         }
@@ -1709,7 +1716,7 @@ mod tests {
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.toml");
-        let mut text = "version = 1\n".to_owned();
+        let mut text = "version = 2\n".to_owned();
         text.push_str(&"#".repeat(super::MAX_FILE));
         fs::write(&path, text).unwrap();
         let e = format!("{:#}", super::load(&path).unwrap_err());
@@ -1729,15 +1736,16 @@ mod tests {
             let e = refused(dir.path(), None, &[step]);
             assert!(e.contains(&format!("line {line}")), "{step}: {e}");
         }
-        let e = parse("version = 1\nfast = true\n", dir.path()).unwrap_err();
+        let e = parse("version = 2\nfast = true\n", dir.path()).unwrap_err();
         assert!(e.contains("fast"), "{e}");
+        // Another version, the previous one too, is refused.
         assert_eq!(
-            parse("version = 2\nfast = true\n", dir.path()).unwrap_err(),
-            "version 2 is not supported; this build reads version 1"
+            parse("version = 1\nfast = true\n", dir.path()).unwrap_err(),
+            "version 1 is not supported; this build reads version 2"
         );
         assert_eq!(
             parse("[library]\n", dir.path()).unwrap_err(),
-            "no version; this build reads version 1"
+            "no version; this build reads version 2"
         );
     }
 

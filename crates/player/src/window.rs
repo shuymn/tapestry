@@ -1,28 +1,36 @@
 //! The window thread: the winit window and its events (design.md "Rendering and
 //! Skins"). The window is borderless fullscreen on the primary monitor and
 //! takes no device events (Raw Input has one target window per device type per
-//! process, and the input thread owns it). Focus, the retry and quit keys, the
-//! settings keys F1 to F8 and closing go to [`Controls`], which wakes the game
+//! process, and the input thread owns it). It is made hidden and shown once
+//! the render thread presented its first frame, or after [`SHOW_TIMEOUT`]
+//! at the latest ([`Showing`]), so the empty window Windows would paint
+//! first is never seen; a play's recording waits for the show
+//! ([`WindowShown`]). Focus, the retry and quit keys, the settings keys F1
+//! to F8 and closing go to [`Controls`], which wakes the game
 //! thread for each, and the input thread on a focus change once the focus
 //! latch is set (design.md "Input"). With song selection the menu keys and
 //! the text typed or composed through the IME go to the select screen too
 //! ([`crate::select::MenuInput`], design.md "Play Lifecycle"), through a
 //! queue that drops only keys past its bound ([`MenuQueue`]); the IME is
-//! allowed only while the search box has focus. The event loop runs
-//! on a thread of its own, so the game keeps the main thread and the loaded
-//! chart never has to move.
+//! allowed only while the search box has focus, and told where its caret
+//! is ([`ImeState`]) so the candidate window opens beside it. The event
+//! loop runs on a thread of its own, so the game keeps the main thread and
+//! the loaded chart never has to move.
 
 use std::num::NonZeroIsize;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use eval::ControlId;
 use game::{Adjust, Command};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop, EventLoopProxy};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::monitor::MonitorHandle;
 use winit::platform::scancode::PhysicalKeyExtScancode;
@@ -34,14 +42,209 @@ use winit::raw_window_handle::{
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::controls::Controls;
+use crate::menu_screen::WindowSink;
 use crate::select::{MenuInput, MenuKey, MenuQueue};
 
-/// What the game thread asks of the window thread.
+/// What the game and render threads ask of the window thread.
 enum Ask {
     /// End the event loop.
     Exit,
     /// Allow the IME (the search box has focus), or stop it.
     Ime(bool),
+    /// The caret moved: its area is in [`Shared::caret`] (from the render
+    /// thread).
+    Caret,
+}
+
+/// What the window thread shares with the threads that draw into the
+/// window and wait for it.
+#[derive(Debug, Default)]
+struct Shared {
+    /// Set by a frame presented: the hidden window looks at it every
+    /// [`SHOW_POLL`] until it is shown. A flag, so a play's frame tells it
+    /// with nothing allocated.
+    presented: Arc<AtomicBool>,
+    /// The caret's latest area in layout pixels: moves are coalesced, so
+    /// the window takes the latest only.
+    caret: Mutex<Option<[f32; 4]>>,
+    /// An [`Ask::Caret`] is on its way for [`caret`](Self::caret).
+    caret_queued: AtomicBool,
+    /// Whether the window was shown, for [`WindowShown`].
+    shown: Mutex<bool>,
+    shown_changed: Condvar,
+}
+
+impl Shared {
+    fn mark_shown(&self) {
+        *self.shown.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.shown_changed.notify_all();
+    }
+}
+
+/// The longest the window stays hidden waiting for its first frame: a
+/// render thread that never presents must not leave a window nobody can
+/// see or close.
+pub const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the hidden window looks for its first frame.
+const SHOW_POLL: Duration = Duration::from_millis(10);
+
+/// What showing the window needs of it: [`Window`], or a fake in tests.
+trait ShowWindow {
+    /// Shows the window and brings it to the foreground.
+    fn show(&self);
+    fn has_focus(&self) -> bool;
+}
+
+impl ShowWindow for Window {
+    fn show(&self) {
+        self.set_visible(true);
+        // Made hidden, the window was not brought to the foreground when
+        // it was made fullscreen.
+        self.focus_window();
+    }
+
+    fn has_focus(&self) -> bool {
+        Window::has_focus(self)
+    }
+}
+
+/// Whether the hidden window was shown: on the first frame presented, or
+/// at its deadline without one.
+#[derive(Debug)]
+struct Showing {
+    shown: bool,
+    deadline: Instant,
+}
+
+impl Showing {
+    fn new(now: Instant) -> Self {
+        Self {
+            shown: false,
+            deadline: now + SHOW_TIMEOUT,
+        }
+    }
+
+    /// Shows `window` once a frame was presented or the deadline passed
+    /// at `now`; when it waits on, the time to look again, `None` once it
+    /// is shown.
+    fn poll(
+        &mut self,
+        window: &impl ShowWindow,
+        controls: &Controls,
+        shared: &Shared,
+        now: Instant,
+    ) -> Option<Instant> {
+        if self.shown {
+            return None;
+        }
+        if shared.presented.load(Ordering::Acquire) {
+            self.show(window, controls, shared);
+            return None;
+        }
+        if now >= self.deadline {
+            println!("window: no frame within {SHOW_TIMEOUT:?}; shown anyway");
+            self.show(window, controls, shared);
+            return None;
+        }
+        Some((now + SHOW_POLL).min(self.deadline))
+    }
+
+    /// Shows `window` and tells `controls` whether it has focus, so the
+    /// focus latch and the input thread see the window gain focus even
+    /// when no focus event follows the show; then wakes whoever waits for
+    /// the show.
+    fn show(&mut self, window: &impl ShowWindow, controls: &Controls, shared: &Shared) {
+        self.shown = true;
+        window.show();
+        controls.focus(window.has_focus());
+        shared.mark_shown();
+    }
+}
+
+/// What the window's IME needs of the window: [`Window`], or a fake in
+/// tests.
+trait ImeWindow {
+    /// The client size in pixels.
+    fn client_size(&self) -> (u32, u32);
+    fn allow_ime(&self, allowed: bool);
+    /// The caret's area in client pixels: the IME opens its candidate
+    /// window beside it.
+    fn ime_area(&self, at: PhysicalPosition<i32>, size: PhysicalSize<u32>);
+}
+
+impl ImeWindow for Window {
+    fn client_size(&self) -> (u32, u32) {
+        let s = self.inner_size();
+        (s.width, s.height)
+    }
+
+    fn allow_ime(&self, allowed: bool) {
+        self.set_ime_allowed(allowed);
+    }
+
+    fn ime_area(&self, at: PhysicalPosition<i32>, size: PhysicalSize<u32>) {
+        self.set_ime_cursor_area(at, size);
+    }
+}
+
+/// The IME's state on the window thread: whether it is allowed and where
+/// the caret is. The caret's area is reported to the IME whenever it is
+/// allowed, the caret moves or the window's size changes, so its
+/// candidate window opens beside the search box, not where Windows would
+/// guess; a context the IME is not allowed has nothing to report to (the
+/// window has no input context then).
+#[derive(Debug, Default)]
+struct ImeState {
+    allowed: bool,
+    /// The caret's area in layout pixels, as the last page drawn has it.
+    caret: Option<[f32; 4]>,
+}
+
+impl ImeState {
+    /// The IME allowed (the search box gained focus) or stopped (lost it).
+    fn allow(&mut self, window: &impl ImeWindow, allowed: bool) {
+        self.allowed = allowed;
+        window.allow_ime(allowed);
+        self.report(window);
+    }
+
+    /// The caret moved, or no text box has focus any more (`None`).
+    fn caret(&mut self, window: &impl ImeWindow, caret: Option<[f32; 4]>) {
+        self.caret = caret;
+        self.report(window);
+    }
+
+    /// Reports the caret's area to an allowed IME at the window's current
+    /// size (also on a resize).
+    fn report(&self, window: &impl ImeWindow) {
+        let Some(caret) = self.caret.filter(|_| self.allowed) else {
+            return;
+        };
+        let (width, height) = window.client_size();
+        let (at, size) = client_area(caret, width, height);
+        window.ime_area(at, size);
+    }
+}
+
+/// `area` (`[left, top, width, height]` in layout pixels) in the client
+/// pixels of a `width` × `height` window, through the letterbox the
+/// layout is drawn in ([`render::letterbox`]); at least a pixel each way.
+fn client_area(
+    area: [f32; 4],
+    width: u32,
+    height: u32,
+) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let [x, y, w, h] = area;
+    let [left, top, scaled, _] = render::letterbox(width, height);
+    // The layout is 1920 pixels wide.
+    let s = scaled / 1920.0;
+    // Client pixels: far inside i32 and u32.
+    let at = PhysicalPosition::new((left + x * s).round() as i32, (top + y * s).round() as i32);
+    let size = PhysicalSize::new(
+        ((w * s).round() as u32).max(1),
+        ((h * s).round() as u32).max(1),
+    );
+    (at, size)
 }
 
 struct App {
@@ -53,6 +256,10 @@ struct App {
     window: Option<Window>,
     /// Where the select screen's input goes, with song selection.
     menu: Option<Arc<MenuQueue>>,
+    ime: ImeState,
+    /// Set once the window is made.
+    showing: Option<Showing>,
+    shared: Arc<Shared>,
 }
 
 impl ApplicationHandler<Ask> for App {
@@ -71,6 +278,7 @@ impl ApplicationHandler<Ask> for App {
         }
         let attrs = Window::default_attributes()
             .with_title("tapestry")
+            .with_visible(false)
             .with_fullscreen(Some(Fullscreen::Borderless(monitor)));
         match event_loop.create_window(attrs) {
             Ok(w) => {
@@ -79,6 +287,8 @@ impl ApplicationHandler<Ask> for App {
                 let surface = surface(&w);
                 let _ = ready.send(surface);
                 self.window = Some(w);
+                self.showing = Some(Showing::new(Instant::now()));
+                self.poll_showing(event_loop);
             }
             Err(e) => {
                 let _ = ready.send(Err(e).context("the window cannot be created"));
@@ -123,21 +333,54 @@ impl ApplicationHandler<Ask> for App {
                     }
                 }
             }
+            WindowEvent::Resized(_) => {
+                if let Some(w) = &self.window {
+                    self.ime.report(w);
+                }
+            }
             WindowEvent::CloseRequested => self.controls.close(),
             _ => {}
         }
     }
 
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
+        self.poll_showing(event_loop);
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Ask) {
-        if let Ask::Ime(allowed) = event {
-            if let Some(w) = &self.window {
-                w.set_ime_allowed(allowed);
+        match (event, &self.window) {
+            (Ask::Ime(allowed), Some(w)) => self.ime.allow(w, allowed),
+            (Ask::Caret, Some(w)) => {
+                // Cleared first: a move after the read sends again.
+                self.shared.caret_queued.store(false, Ordering::Release);
+                let caret = *self
+                    .shared
+                    .caret
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                self.ime.caret(w, caret);
             }
-            return;
+            (Ask::Ime(_) | Ask::Caret, None) => {}
+            (Ask::Exit, _) => {
+                // The window goes before the loop ends, on its own thread.
+                self.window = None;
+                event_loop.exit();
+            }
         }
-        // The window goes before the loop ends, on its own thread.
-        self.window = None;
-        event_loop.exit();
+    }
+}
+
+impl App {
+    /// Shows the hidden window once its first frame was presented, or at
+    /// its deadline; until then the loop wakes to look again.
+    fn poll_showing(&mut self, event_loop: &ActiveEventLoop) {
+        if let (Some(w), Some(showing)) = (&self.window, &mut self.showing) {
+            let flow = match showing.poll(w, &self.controls, &self.shared, Instant::now()) {
+                Some(next) => ControlFlow::WaitUntil(next),
+                None => ControlFlow::Wait,
+            };
+            event_loop.set_control_flow(flow);
+        }
     }
 }
 
@@ -145,6 +388,7 @@ impl ApplicationHandler<Ask> for App {
 pub struct WindowThread {
     proxy: EventLoopProxy<Ask>,
     handle: JoinHandle<()>,
+    shared: Arc<Shared>,
 }
 
 /// Allows or stops the window's IME from the game thread.
@@ -179,6 +423,73 @@ impl WindowThread {
     /// The switch of the window's IME.
     pub fn ime(&self) -> ImeSwitch {
         ImeSwitch(self.proxy.clone())
+    }
+
+    /// Where the render thread tells the window what it drew.
+    pub fn link(&self) -> WindowLink {
+        WindowLink {
+            proxy: self.proxy.clone(),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// Where the game waits for the window to show.
+    pub fn shown(&self) -> WindowShown {
+        WindowShown(Arc::clone(&self.shared))
+    }
+}
+
+/// The render thread's line to the window: the caret's area of each menu
+/// page drawn, the latest only, and the flag a presented frame sets; a
+/// window already closed ignores them.
+#[derive(Clone)]
+pub struct WindowLink {
+    proxy: EventLoopProxy<Ask>,
+    shared: Arc<Shared>,
+}
+
+impl WindowSink for WindowLink {
+    fn caret(&self, area: Option<[f32; 4]>) {
+        *self
+            .shared
+            .caret
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = area;
+        if !self.shared.caret_queued.swap(true, Ordering::AcqRel) {
+            let _ = self.proxy.send_event(Ask::Caret);
+        }
+    }
+
+    fn presented(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shared.presented)
+    }
+}
+
+/// Whether the window was shown: a play's recording opens only once it
+/// is, so the focus it gains when shown is the play's (a hidden window
+/// has none, and would latch the play's focus loss at its opening).
+#[derive(Clone)]
+pub struct WindowShown(Arc<Shared>);
+
+impl WindowShown {
+    /// Waits until the window is shown before a play opens, at most
+    /// [`SHOW_TIMEOUT`]: by then the window has shown itself, unless its
+    /// thread ended.
+    pub fn wait_to_open(&self) {
+        if !self.wait(SHOW_TIMEOUT) {
+            eprintln!("window: not shown within {SHOW_TIMEOUT:?}; the play opens anyway");
+        }
+    }
+
+    /// Waits until the window is shown, at most `timeout`; whether it was.
+    fn wait(&self, timeout: Duration) -> bool {
+        let shown = self.0.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        let (shown, _) = self
+            .0
+            .shown_changed
+            .wait_timeout_while(shown, timeout, |shown| !*shown)
+            .unwrap_or_else(PoisonError::into_inner);
+        *shown
     }
 }
 
@@ -226,6 +537,8 @@ pub fn open(
 ) -> anyhow::Result<(WindowThread, Surface)> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proxy_tx, proxy_rx) = mpsc::channel();
+    let shared = Arc::new(Shared::default());
+    let thread_shared = Arc::clone(&shared);
     let handle = std::thread::Builder::new()
         .name("window".into())
         .spawn(move || {
@@ -248,6 +561,9 @@ pub fn open(
                 ready: Some(ready_tx),
                 window: None,
                 menu,
+                ime: ImeState::default(),
+                showing: None,
+                shared: thread_shared,
             };
             if let Err(e) = event_loop.run_app(&mut app) {
                 eprintln!("the event loop failed: {e}");
@@ -262,7 +578,11 @@ pub fn open(
     let proxy = proxy_rx.recv().map_err(|_| ended());
     let window = match (window, proxy) {
         (Ok(w), Ok(proxy)) => {
-            let thread = WindowThread { proxy, handle };
+            let thread = WindowThread {
+                proxy,
+                handle,
+                shared,
+            };
             return Ok((thread, w));
         }
         (Err(e), Ok(proxy)) => {
@@ -403,6 +723,207 @@ fn menu_key(key: PhysicalKey, repeat: bool) -> Option<MenuKey> {
 
 #[cfg(test)]
 mod tests {
+    /// The window as the IME handler sees it: its size, and what it was
+    /// asked.
+    struct FakeWindow {
+        size: std::cell::Cell<(u32, u32)>,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeWindow {
+        fn new(width: u32, height: u32) -> Self {
+            Self {
+                size: std::cell::Cell::new((width, height)),
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn take(&self) -> Vec<String> {
+            self.asked.take()
+        }
+    }
+
+    impl super::ImeWindow for FakeWindow {
+        fn client_size(&self) -> (u32, u32) {
+            self.size.get()
+        }
+
+        fn allow_ime(&self, allowed: bool) {
+            self.asked.borrow_mut().push(format!("allow {allowed}"));
+        }
+
+        fn ime_area(
+            &self,
+            at: winit::dpi::PhysicalPosition<i32>,
+            size: winit::dpi::PhysicalSize<u32>,
+        ) {
+            self.asked.borrow_mut().push(format!(
+                "area {} {} {} {}",
+                at.x, at.y, size.width, size.height
+            ));
+        }
+    }
+
+    /// The hidden window as showing sees it.
+    #[derive(Default)]
+    struct FakeShow {
+        shows: std::cell::Cell<u32>,
+        focused: bool,
+    }
+
+    impl super::ShowWindow for FakeShow {
+        fn show(&self) {
+            self.shows.set(self.shows.get() + 1);
+        }
+
+        fn has_focus(&self) -> bool {
+            self.focused && self.shows.get() > 0
+        }
+    }
+
+    /// The window side once a frame was presented: the hidden window shows
+    /// at its next look, once, its focus reaches the controls, and a play
+    /// waiting to open goes on.
+    #[test]
+    fn a_presented_frame_shows_the_window_and_lets_the_play_open() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let c = Controls::new(QpcClock::start());
+        let w = FakeShow {
+            focused: true,
+            ..FakeShow::default()
+        };
+        let shared = std::sync::Arc::new(super::Shared::default());
+        let shown = super::WindowShown(std::sync::Arc::clone(&shared));
+        let start = Instant::now();
+        let mut showing = super::Showing::new(start);
+        // Made hidden, the window had no focus.
+        c.focus(false);
+        // Nothing presented: it looks again soon, still hidden.
+        assert_eq!(
+            showing.poll(&w, &c, &shared, start),
+            Some(start + super::SHOW_POLL)
+        );
+        assert_eq!(w.shows.get(), 0);
+        assert!(!shown.wait(Duration::ZERO));
+        shared.presented.store(true, Ordering::Release);
+        assert_eq!(showing.poll(&w, &c, &shared, start), None);
+        assert_eq!(w.shows.get(), 1);
+        assert!(c.focused());
+        assert!(shown.wait(Duration::ZERO));
+        assert_eq!(showing.poll(&w, &c, &shared, start), None);
+        assert_eq!(w.shows.get(), 1);
+    }
+
+    /// A play that asks to open before the window shows waits for it: the
+    /// window thread's show, made later, ends the wait.
+    #[test]
+    fn a_play_opening_before_the_show_waits_for_it() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let shared = std::sync::Arc::new(super::Shared::default());
+        let shown = super::WindowShown(std::sync::Arc::clone(&shared));
+        let window_side = std::sync::Arc::clone(&shared);
+        let opener = std::thread::spawn(move || shown.wait_to_open());
+        std::thread::sleep(Duration::from_millis(100));
+        // Still waiting: nothing showed the window.
+        assert!(!opener.is_finished());
+        let c = Controls::new(QpcClock::start());
+        let mut showing = super::Showing::new(Instant::now());
+        window_side.presented.store(true, Ordering::Release);
+        let showed = Instant::now();
+        assert_eq!(
+            showing.poll(&FakeShow::default(), &c, &window_side, showed),
+            None
+        );
+        opener.join().unwrap();
+        // Woken by the show, not by the wait's bound.
+        assert!(
+            showed.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            showed.elapsed()
+        );
+    }
+
+    /// Without a frame the window is shown at its deadline, and not before;
+    /// a play never waits past the deadline either.
+    #[test]
+    fn a_window_without_a_frame_is_shown_at_its_deadline() {
+        use std::time::{Duration, Instant};
+        let c = Controls::new(QpcClock::start());
+        let w = FakeShow::default();
+        let shared = super::Shared::default();
+        let start = Instant::now();
+        let mut showing = super::Showing::new(start);
+        let late = start + super::SHOW_TIMEOUT - Duration::from_millis(1);
+        assert_eq!(
+            showing.poll(&w, &c, &shared, late),
+            Some(start + super::SHOW_TIMEOUT)
+        );
+        assert_eq!(w.shows.get(), 0);
+        assert_eq!(
+            showing.poll(&w, &c, &shared, start + super::SHOW_TIMEOUT),
+            None
+        );
+        assert_eq!(w.shows.get(), 1);
+        assert!(!c.focused());
+        // A window thread that never shows: the wait ends at its bound.
+        let never = super::WindowShown(std::sync::Arc::new(super::Shared::default()));
+        let asked = Instant::now();
+        assert!(!never.wait(Duration::from_millis(50)));
+        assert!(asked.elapsed() >= Duration::from_millis(50));
+    }
+
+    /// A layout area lands on the window's pixels through the letterbox:
+    /// scaled with the layout, shifted past the bars, at least a pixel.
+    #[test]
+    fn the_caret_area_maps_through_the_letterbox() {
+        let area = [300.0, 72.0, 60.0, 42.0];
+        let mapped = |w, h| {
+            let (at, size) = super::client_area(area, w, h);
+            (at.x, at.y, size.width, size.height)
+        };
+        assert_eq!(mapped(1920, 1080), (300, 72, 60, 42));
+        assert_eq!(mapped(3840, 2160), (600, 144, 120, 84));
+        assert_eq!(mapped(2560, 1440), (400, 96, 80, 56));
+        // Bars left and right (21:9): 320 pixels each side.
+        assert_eq!(mapped(2560, 1080), (620, 72, 60, 42));
+        // Bars above and below (5:4): scaled by 2/3, 152 pixels down.
+        assert_eq!(mapped(1280, 1024), (200, 200, 40, 28));
+        // A sliver of an area is still a pixel.
+        let (_, size) = super::client_area([0.0, 0.0, 0.1, 0.1], 960, 540);
+        assert_eq!((size.width, size.height), (1, 1));
+    }
+
+    /// The search box's focus allows the IME and reports where its caret
+    /// is; a caret move and a resize report it again, and losing focus
+    /// stops the IME with nothing more reported.
+    #[test]
+    fn focus_reports_the_caret_to_the_ime_and_leaving_stops_it() {
+        let w = FakeWindow::new(1920, 1080);
+        let mut ime = super::ImeState::default();
+        // The page is drawn before the focus reaches the window: nothing to
+        // report to yet.
+        ime.caret(&w, Some([200.0, 72.0, 1.0, 42.0]));
+        assert!(w.take().is_empty());
+        ime.allow(&w, true);
+        assert_eq!(w.take(), ["allow true", "area 200 72 1 42"]);
+        ime.caret(&w, Some([230.0, 72.0, 60.0, 42.0]));
+        assert_eq!(w.take(), ["area 230 72 60 42"]);
+        w.size.set((3840, 2160));
+        ime.report(&w);
+        assert_eq!(w.take(), ["area 460 144 120 84"]);
+        ime.allow(&w, false);
+        assert_eq!(w.take(), ["allow false"]);
+        ime.caret(&w, None);
+        ime.report(&w);
+        assert!(w.take().is_empty());
+        // Focus again before the next page: that page's caret is reported.
+        ime.allow(&w, true);
+        assert_eq!(w.take(), ["allow true"]);
+        ime.caret(&w, Some([200.0, 72.0, 1.0, 42.0]));
+        assert_eq!(w.take(), ["area 400 144 2 84"]);
+    }
     use game::{Adjust, Command, DeviceSettings};
     use input::{DeviceKind, QpcClock};
     use winit::keyboard::{KeyCode, PhysicalKey};
@@ -578,5 +1099,96 @@ mod tests {
             }
         }
         assert_eq!(pairs, 5);
+    }
+
+    /// Counts the carets the window thread is asked to take, and what it
+    /// reads then.
+    #[cfg(feature = "dev-tools")]
+    struct CaretAsks {
+        shared: std::sync::Arc<super::Shared>,
+        read: Vec<Option<[f32; 4]>>,
+    }
+
+    #[cfg(feature = "dev-tools")]
+    impl winit::application::ApplicationHandler<super::Ask> for CaretAsks {
+        fn resumed(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {}
+
+        fn window_event(
+            &mut self,
+            _event_loop: &winit::event_loop::ActiveEventLoop,
+            _id: winit::window::WindowId,
+            _event: winit::event::WindowEvent,
+        ) {
+        }
+
+        fn user_event(
+            &mut self,
+            _event_loop: &winit::event_loop::ActiveEventLoop,
+            ask: super::Ask,
+        ) {
+            use std::sync::atomic::Ordering;
+            if matches!(ask, super::Ask::Caret) {
+                self.shared.caret_queued.store(false, Ordering::Release);
+                self.read.push(*self.shared.caret.lock().unwrap());
+            }
+        }
+    }
+
+    /// Over the window's real event loop proxy: the first frame presented,
+    /// a play's included, tells the window with nothing allocated, and
+    /// caret moves made before the window takes one reach it as one ask,
+    /// with the latest area. (The only test that makes an event loop: one
+    /// per process.)
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_play_frame_tells_the_window_unallocated_and_carets_coalesce() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use render::{AdapterChoice, Renderer, Target};
+        use winit::event_loop::EventLoop;
+        use winit::platform::pump_events::EventLoopExtPumpEvents;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        use crate::menu_screen::{MenuScreen, WindowSink};
+
+        let mut event_loop = EventLoop::<super::Ask>::with_user_event()
+            .with_any_thread(true)
+            .build()
+            .unwrap();
+        let shared = std::sync::Arc::new(super::Shared::default());
+        let link = super::WindowLink {
+            proxy: event_loop.create_proxy(),
+            shared: std::sync::Arc::clone(&shared),
+        };
+        let target = Target::Offscreen {
+            width: 64,
+            height: 36,
+        };
+        let renderer = Renderer::new(target, AdapterChoice::Warp).unwrap();
+        let screen = MenuScreen::new(renderer, None).with_sink(Box::new(link.clone()));
+
+        let before = crate::alloc_count::this_thread();
+        assert!(screen.shown(true));
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+        assert!(shared.presented.load(Ordering::Acquire));
+
+        let mut asks = CaretAsks {
+            shared: std::sync::Arc::clone(&shared),
+            read: Vec::new(),
+        };
+        for x in [1.0, 2.0, 3.0] {
+            link.caret(Some([x, 0.0, 1.0, 1.0]));
+        }
+        for _ in 0..10 {
+            let _ = event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut asks);
+        }
+        assert_eq!(asks.read, [Some([3.0, 0.0, 1.0, 1.0])]);
+        link.caret(None);
+        for _ in 0..10 {
+            let _ = event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut asks);
+        }
+        assert_eq!(asks.read.last(), Some(&None));
+        assert_eq!(asks.read.len(), 2);
     }
 }

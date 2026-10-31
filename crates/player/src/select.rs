@@ -24,7 +24,7 @@ use input::{MenuAction, MenuBindings, MenuEvent};
 use library::{ChartEntry, Score, Search, Sort};
 use rules::RulePreset;
 
-use crate::menu_screen::{LineStyle, MenuLine, MenuPage, PAGE_LINES};
+use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage, PAGE_LINES};
 
 /// The most charts one search lists; a search that finds more says so.
 pub const LIMIT: usize = 5_000;
@@ -515,11 +515,16 @@ impl SelectScreen {
             ),
             LineStyle::Title,
         )];
+        let mut caret = None;
         lines.push(if self.searching {
-            line(
-                format!("検索: {}{}_", self.query, self.preedit),
-                LineStyle::Search,
-            )
+            let text = format!("検索: {}", self.query);
+            let start = text.len();
+            caret = Some(Caret {
+                line: lines.len(),
+                start,
+                end: start + self.preedit.len(),
+            });
+            line(format!("{text}{}_", self.preedit), LineStyle::Search)
         } else {
             line(format!("検索 (Tab): {}", self.query), LineStyle::Search)
         });
@@ -570,7 +575,7 @@ impl SelectScreen {
                 .to_owned(),
             LineStyle::Help,
         ));
-        MenuPage { lines }
+        MenuPage { lines, caret }
     }
 
     /// The heading of chart `i`'s folder: its path under its root.
