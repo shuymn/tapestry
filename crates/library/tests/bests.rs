@@ -755,6 +755,35 @@ fn a_failure_reading_the_requests_ends_the_pass_pending() {
     assert!(!lib.bests_pending().unwrap());
 }
 
+/// From no catch-up pending, a pass indexes the chart a record waits for,
+/// then cannot read the requests: the record is left to a catch-up.
+#[test]
+fn a_failure_reading_the_requests_after_a_chart_keeps_its_records_pending() {
+    let fx = Fixture::new();
+    let record = played(0);
+    fx.save(&record, "1-1.tprl");
+    let lib = fx.open();
+    assert_eq!(fx.pass(&lib).bests.refused.chart_not_in_library, 1);
+    assert!(!lib.bests_pending().unwrap());
+    fx.chart("a.bms", CHART);
+    sql(&fx.db(), "ALTER TABLE meta RENAME TO hidden;");
+    let ended = lib
+        .scan(std::slice::from_ref(&fx.charts), fx.options())
+        .unwrap()
+        .finish();
+    assert!(
+        matches!(ended, Err(library::ScanError::Database(_))),
+        "{ended:?}"
+    );
+    sql(&fx.db(), "ALTER TABLE hidden RENAME TO meta;");
+    assert!(lib.bests_pending().unwrap());
+    let report = fx.pass(&lib);
+    assert_eq!(report.read, 0);
+    assert!(report.bests.catch_up);
+    assert_eq!(score_of(&lib, &record).unwrap().plays, 1);
+    assert!(!lib.bests_pending().unwrap());
+}
+
 #[test]
 fn a_failure_writing_completion_rolls_back_its_batch() {
     let fx = Fixture::new();

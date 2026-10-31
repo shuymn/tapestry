@@ -620,8 +620,21 @@ impl<'a> Scanner<'a> {
         changed
     }
 
-    /// Runs the scan to its end or the drop, committing what it holds.
+    /// Runs the scan to its end or the drop, committing what it holds. The
+    /// charts read are forgotten with the pass, so when it fails after
+    /// reading one, the records that may wait for it are left to a
+    /// catch-up, requested (written, or held in memory) before the failure
+    /// is reported.
     fn run(mut self, roots: &[PathBuf]) -> rusqlite::Result<()> {
+        let ended = self.pass(roots);
+        if ended.is_err() && self.options.records.is_some() && !self.read.is_empty() {
+            let _ = self.owner.request(&self.conn);
+        }
+        ended
+    }
+
+    /// One pass: the charts, then the bests phase.
+    fn pass(&mut self, roots: &[PathBuf]) -> rusqlite::Result<()> {
         let Prepared {
             roots,
             known,
