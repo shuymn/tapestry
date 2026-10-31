@@ -1,4 +1,4 @@
-//! Tracks (§4.4): inheritance and colour clamping, then acceptance, each
+//! Tracks: inheritance and colour clamping, then acceptance, each
 //! accepted track checked against a reference sampler written from the
 //! source's description (`SkinObject.java:347-411, 545-575` at `0.8.9`)
 //! at every millisecond.

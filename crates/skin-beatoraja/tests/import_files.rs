@@ -1,4 +1,4 @@
-//! File choices (§6.1, owner decision 2) and source files: the chosen
+//! File choices (owner decision 2) and source files: the chosen
 //! candidate substituted into source paths, reported; uncovered globs and
 //! names of the wrong form.
 

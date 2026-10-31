@@ -1,4 +1,4 @@
-//! Draw conditions (§4.7): numeric ops and boolean properties.
+//! Draw conditions: numeric ops and boolean properties.
 //!
 //! A numeric op names a built-in boolean property or a declared option
 //! item (`SkinObject.java:282-299` at `0.8.9`): the built-in wins, a

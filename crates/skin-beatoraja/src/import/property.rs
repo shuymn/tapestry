@@ -1,4 +1,4 @@
-//! Effective number and text properties (§4.1): what the source's
+//! Effective number and text properties: what the source's
 //! property factories return for an id or a name, and which of those the
 //! model shows.
 
@@ -305,7 +305,7 @@ pub(crate) enum IntProp {
     Unsupported(Option<i32>),
 }
 
-/// The model value of known integer property `id` (§4.9).
+/// The model value of known integer property `id`.
 fn shown(id: i32) -> Option<Value> {
     Some(match id {
         71 | 101 => Value::ExScore,

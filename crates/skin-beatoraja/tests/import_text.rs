@@ -1,4 +1,4 @@
-//! Text (§4.10): the effective string, the box, the fonts and the
+//! Text: the effective string, the box, the fonts and the
 //! fallbacks of D5–D7.
 
 mod common;

@@ -1,4 +1,4 @@
-//! Timers (§4.8): the built-in namespace 0..=2999, custom timers above
+//! Timers: the built-in namespace 0..=2999, custom timers above
 //! it, and the rank timers as `when` conditions.
 
 use std::collections::BTreeMap;

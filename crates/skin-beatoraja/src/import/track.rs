@@ -1,4 +1,4 @@
-//! Tracks (§4.4) and stretch (§4.5): a destination's keys read with the
+//! Tracks and stretch: a destination's keys read with the
 //! source's inheritance, sorted, accepted or refused, and the stretch
 //! modes baked into each key.
 
@@ -124,8 +124,8 @@ impl Accepted {
     }
 }
 
-/// Sorts `keys` stably by time and accepts them with loop point `l`
-/// (§4.4): `Ok(None)` for a track the source never draws.
+/// Sorts `keys` stably by time and accepts them with loop point `l`:
+/// `Ok(None)` for a track the source never draws.
 ///
 /// # Errors
 ///

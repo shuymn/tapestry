@@ -1,4 +1,4 @@
-//! Ops and draw conditions (§4.7): built-ins first, declared options
+//! Ops and draw conditions: built-ins first, declared options
 //! folded, undefined ids never drawn, names through the same table.
 
 mod common;

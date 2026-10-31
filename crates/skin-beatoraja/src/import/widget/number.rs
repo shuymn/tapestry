@@ -1,4 +1,4 @@
-//! Numbers (§4.9): the effective property, the glyph set and its cut, and
+//! Numbers: the effective property, the glyph set and its cut, and
 //! the strip's layout from each key's exact geometry.
 
 use skin_model::{Align, DigitsDef, GlyphSet, MAX_COORD, NumberDef, Pad, Source, Ty};
@@ -15,7 +15,7 @@ use crate::error::ImportError;
 const CELLS: i32 = 11;
 
 impl Cx<'_> {
-    /// The effective integer property (§4.1, `JsonSkinObjectLoader.java:
+    /// The effective integer property (`JsonSkinObjectLoader.java:
     /// 104-160`): `value` when it resolves, else `ref`.
     fn int_prop(&mut self, value: Prop, r: i32) -> IntProp {
         let resolved = match value {
@@ -175,7 +175,7 @@ impl Cx<'_> {
             return Ok(());
         };
 
-        // Layout (§4.9), from each key's offset geometry.
+        // Layout, from each key's offset geometry.
         let range = |cx: &Self| cx.range(at, "dst");
         let sr = Q::int(spaces).mul(self.r).ok_or_else(|| range(self))?;
         let n = Q::int(cells - 1);

@@ -1,4 +1,4 @@
-//! Offsets (§4.6): ids from both fields once each, values from the
+//! Offsets: ids from both fields once each, values from the
 //! configuration in unscaled reference pixels, alpha folded only on fixed
 //! colour with one sign, run-time ids refused.
 

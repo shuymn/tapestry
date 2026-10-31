@@ -1,4 +1,4 @@
-//! The geometry rule (§4.0, owner decision 1): exact rationals scaled,
+//! The geometry rule (owner decision 1): exact rationals scaled,
 //! offset and stretched, reflected to y down and rounded half up once per
 //! edge; the pivot from `center` and the angle negated.
 

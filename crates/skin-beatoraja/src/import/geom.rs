@@ -126,7 +126,7 @@ pub(crate) struct Rect {
 }
 
 /// The sum of a destination's offsets in reference pixels and degrees
-/// (§4.6): the source adds `x − w/2`, `y − h/2`, `w`, `h` and `r`.
+/// (the source adds `x − w/2`, `y − h/2`, `w`, `h` and `r`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Offset {
     pub(crate) x: i64,

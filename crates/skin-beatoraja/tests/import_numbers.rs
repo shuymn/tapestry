@@ -1,4 +1,4 @@
-//! Numbers (§§4.1, 4.9): the effective property and its role, the glyph
+//! Numbers: the effective property and its role, the glyph
 //! sets and their cut, and the strip's exact layout.
 
 mod common;

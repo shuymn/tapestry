@@ -1,4 +1,4 @@
-//! Stretch (§4.5): the affine modes baked per key, the piecewise modes
+//! Stretch: the affine modes baked per key, the piecewise modes
 //! only within one branch, the trimmed modes refused, and numbers only
 //! with the identity.
 

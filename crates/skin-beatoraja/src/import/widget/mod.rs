@@ -187,7 +187,7 @@ impl Cx<'_> {
         }
     }
 
-    /// An image object (§6.3).
+    /// An image object.
     pub(super) fn image(
         &mut self,
         dst: Dst,

@@ -1,4 +1,4 @@
-//! Text (§4.10): the effective string, the font, the box and the
+//! Text: the effective string, the font, the box and the
 //! fallbacks of D5–D7. All text is decorative.
 
 use skin_model::{Align, FontRef, MAX_TEXT_BYTES, Overflow, Source, TextDef, TextField, TextValue};

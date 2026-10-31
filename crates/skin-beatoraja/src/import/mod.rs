@@ -335,7 +335,7 @@ impl<'d> Cx<'d> {
         r
     }
 
-    /// Configuration entries the header does not know (§2.2).
+    /// Configuration entries the header does not know.
     fn config_notes(&mut self) {
         let names: BTreeSet<&str> = self
             .header
@@ -350,7 +350,7 @@ impl<'d> Cx<'d> {
             .filter(|n| !names.contains(n.as_str()))
             .count();
         // A configured value that is not a candidate, "Random" among them
-        // (§6.1), leaves the choice to its default.
+        // leaves the choice to its default.
         let not_candidates = self
             .header
             .files
@@ -589,7 +589,7 @@ impl<'d> Cx<'d> {
         }
     }
 
-    /// The common part of an element (§§4.3-4.8): track, conditions,
+    /// The common part of an element: track, conditions,
     /// timer, offsets, blend and pivot, each through the role policy.
     /// `None` when the element was dropped or is never drawn.
     fn common(&mut self, role: Role, dst: &Dst) -> Result<Option<Common>, ImportError> {
@@ -629,7 +629,7 @@ impl<'d> Cx<'d> {
             }
         };
 
-        // Conditions (§4.7).
+        // Conditions.
         let mut conds: Vec<String> = Vec::new();
         let mut seen = BTreeSet::new();
         for op in &dst.ops {
@@ -684,7 +684,7 @@ impl<'d> Cx<'d> {
             }
         }
 
-        // Timer (§4.8).
+        // Timer.
         let (timer, untimed) = match dst.timer {
             Prop::Null => (TimerRef::Builtin(slot::READY), true),
             Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::READY), true),
@@ -710,7 +710,7 @@ impl<'d> Cx<'d> {
             },
         };
 
-        // Offsets (§4.6).
+        // Offsets.
         let mut ids: Vec<i32> = Vec::new();
         for &id in &dst.offsets {
             if (1..=OFFSET_MAX).contains(&id) && !ids.contains(&id) {
@@ -1049,7 +1049,7 @@ impl<'d> Cx<'d> {
 
 impl Common {
     /// Key `k`'s model angle: the source's plus the offsets, negated
-    /// (§4.11).
+    /// for the model, which turns clockwise.
     fn angle_of(&self, k: &SrcKey) -> i64 {
         -(i64::from(k.angle) + self.angle)
     }

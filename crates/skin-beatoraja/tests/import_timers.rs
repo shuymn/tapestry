@@ -1,4 +1,4 @@
-//! Timers (§4.8): the built-in namespace, custom aliases, the rank `when`
+//! Timers: the built-in namespace, custom aliases, the rank `when`
 //! conditions, and untimed critical numbers (D3).
 
 mod common;

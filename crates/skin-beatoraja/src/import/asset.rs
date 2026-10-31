@@ -1,4 +1,4 @@
-//! Assets (§6): file choices, source paths, file admission through the
+//! Assets: file choices, source paths, file admission through the
 //! model's [`SheetBuilder`] with request and failure caches, images per
 //! (object, filter, cut), and fonts.
 
