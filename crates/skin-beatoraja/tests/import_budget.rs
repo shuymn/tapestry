@@ -7,7 +7,7 @@ mod common;
 
 use std::fs;
 
-use common::{Loaded, font, hd, import_with, png, skin};
+use common::{Loaded, font, hd, import_with, join, png, skin};
 use skin_beatoraja::{ImportError, ImportLimit};
 use skin_model::{
     MAX_ELEMENTS, MAX_FILES, MAX_FONTS, MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS,
@@ -41,10 +41,6 @@ fn limit(l: Loaded, want: ImportLimit) {
         }
         other => panic!("{:?}", other.map(|i| i.report)),
     }
-}
-
-fn join(items: impl Iterator<Item = String>) -> String {
-    items.collect::<Vec<_>>().join(",")
 }
 
 const KEY: &str = r#"{"w": 1, "h": 1}"#;

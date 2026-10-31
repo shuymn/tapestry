@@ -11,13 +11,9 @@ mod common;
 use std::hint::black_box;
 use std::path::Path;
 
-use common::{font, hd, png, write};
+use common::{font, hd, join, png, write};
 use criterion::{Criterion, criterion_group, criterion_main};
 use skin_beatoraja::{Config, import, read_header};
-
-fn join(items: impl Iterator<Item = String>) -> String {
-    items.collect::<Vec<_>>().join(",")
-}
 
 fn typical(root: &Path) {
     for i in 0..16 {

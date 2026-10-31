@@ -21,6 +21,11 @@ pub fn skin(files: &[(&str, &str)]) -> TempDir {
     d
 }
 
+/// `items` joined by commas: the members of a JSON list.
+pub fn join(items: impl Iterator<Item = String>) -> String {
+    items.collect::<Vec<_>>().join(",")
+}
+
 pub fn write(root: &Path, name: &str, bytes: &[u8]) {
     let path = root.join(name);
     fs::create_dir_all(path.parent().unwrap()).unwrap();

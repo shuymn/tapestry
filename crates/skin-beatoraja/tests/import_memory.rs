@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use common::play::{Drawn, judged};
-use common::{font, png, write};
+use common::{font, join, png, write};
 use rules::{GaugeValue, Judgment};
 use skin_beatoraja::limits::{
     MAX_FILE_CHOICES, MAX_INPUT_BYTES, MAX_LIST_ENTRIES, MAX_NODES, MAX_NOTES, MAX_OFFSETS,
@@ -121,10 +121,6 @@ fn measure(root: &Path, check: impl FnOnce(&Header, Imported)) -> i64 {
 fn refused(root: &Path) -> ImportError {
     let (mut def, header) = read_header(root, "s.json").unwrap();
     import(&mut def, &header, &Config::defaults(&header)).unwrap_err()
-}
-
-fn join(items: impl Iterator<Item = String>) -> String {
-    items.collect::<Vec<_>>().join(",")
 }
 
 fn as_u32(n: usize) -> u32 {
