@@ -40,7 +40,7 @@ mod settings;
 mod sound;
 mod tuning;
 
-pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Pick, Refused};
+pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
     Probed, SWITCH_TIMEOUT, audio_control,

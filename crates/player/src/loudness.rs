@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use audio::{Analysis, AnalysisError, Gain, Measurement, SoundBank, Speed, Step};
 use bms_model::Chart;
-use game::Chain;
+use game::{Chain, Loading};
 use library::{Library, LoudnessKey, LoudnessRow};
 
 /// What a load lends its loudness measurement.
@@ -90,15 +90,19 @@ fn analyze(chart: &Chart, bank: Arc<SoundBank>, cancelled: &mut dyn FnMut() -> b
 
 /// Measures `chart` loaded with `bank` (`name` names it in the log): at a
 /// bank's other speed, the chart and bank `host` reads again at 1×, whose
-/// key must be `key` when one is given. `None`, logged, when it cannot be
-/// measured.
+/// key must be `key` when one is given. `Ok(None)`, logged, when it cannot
+/// be measured.
+///
+/// # Errors
+///
+/// [`Cancelled`] when the load was cancelled during the measurement.
 pub fn measure(
     chart: &Chart,
     bank: &Arc<SoundBank>,
     key: Option<&LoudnessKey>,
     name: &str,
     host: &mut dyn Host,
-) -> Option<Measurement> {
+) -> Result<Option<Measurement>, Cancelled> {
     host.measuring(name);
     log_line(&format!("loudness: measuring {name}"), false);
     let analyzed = if bank.speed() == Speed::NORMAL {
@@ -127,35 +131,42 @@ pub fn measure(
                 ),
                 false,
             );
-            Some(m)
+            Ok(Some(m))
         }
         Analyzed::Cancelled => {
             log_line(
                 &format!("loudness: {name}: the measurement was cancelled"),
                 false,
             );
-            None
+            Err(Cancelled)
         }
         Analyzed::Failed(why) => {
             log_line(
                 &format!("loudness: {name}: {why}; it plays at the headroom"),
                 true,
             );
-            None
+            Ok(None)
         }
     }
 }
 
+/// The load was cancelled during the measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cancelled;
+
 /// The gain of a play of `chart` loaded with `bank` without a library
 /// (`tapestry play`): measured at each load, the headroom when it cannot
-/// be.
+/// be or the measurement was cancelled (the run then ends before a play).
 pub fn unstored_gain(
     chart: &Chart,
     bank: &Arc<SoundBank>,
     name: &str,
     host: &mut dyn Host,
 ) -> Gain {
-    measure(chart, bank, None, name, host).map_or(Gain::HEADROOM, |m| gain(&row(&m)))
+    match measure(chart, bank, None, name, host) {
+        Ok(Some(m)) => gain(&row(&m)),
+        Ok(None) | Err(Cancelled) => Gain::HEADROOM,
+    }
 }
 
 /// A measurement as a cached row.
@@ -235,7 +246,8 @@ impl Loudness {
     /// of its key in memory, else in `library`; on a miss it is measured
     /// now ([`measure`]) and kept in memory, or plays at the headroom when
     /// it cannot be. A bank without a digest is never cached and plays at
-    /// the headroom.
+    /// the headroom. [`Loading::Cancelled`] when the load was cancelled
+    /// during the measurement: the load stops there.
     pub fn load(
         &mut self,
         library: &Library,
@@ -243,10 +255,10 @@ impl Loudness {
         bank: &Arc<SoundBank>,
         name: &str,
         host: &mut dyn Host,
-    ) {
+    ) -> Loading {
         self.gain = Gain::HEADROOM;
         let Some(key) = key(chart, bank) else {
-            return;
+            return Loading::Ready;
         };
         if let Some(row) = self.lookup(library, &key) {
             self.gain = gain(&row);
@@ -257,12 +269,17 @@ impl Loudness {
                 ),
                 false,
             );
-            return;
+            return Loading::Ready;
         }
-        if let Some(m) = measure(chart, bank, Some(&key), name, host) {
-            let row = row(&m);
-            self.measured.insert(key, row);
-            self.gain = gain(&row);
+        match measure(chart, bank, Some(&key), name, host) {
+            Ok(Some(m)) => {
+                let row = row(&m);
+                self.measured.insert(key, row);
+                self.gain = gain(&row);
+                Loading::Ready
+            }
+            Ok(None) => Loading::Ready,
+            Err(Cancelled) => Loading::Cancelled,
         }
     }
 
@@ -429,8 +446,8 @@ mod tests {
     use game::DataRoot;
     use library::Library;
 
-    use super::Loudness;
     use super::fixture::{Host, bank, bank_at, chart, square, write_sound};
+    use super::{Loading, Loudness};
 
     fn library(dir: &Path) -> Library {
         crate::shelf::open(&DataRoot::new(dir.join("data")))
@@ -479,7 +496,8 @@ mod tests {
 
     /// An analysis that fails (it panics at its second block), and one
     /// cancelled at its second block, leave the headroom and keep nothing:
-    /// nothing is stored, and the next load measures again.
+    /// nothing is stored, and the next load measures again. A failed
+    /// load still plays; a cancelled one stops the load.
     #[test]
     fn a_failed_or_cancelled_measurement_leaves_the_headroom() {
         let dir = tempfile::tempdir().unwrap();
@@ -489,19 +507,25 @@ mod tests {
         let c = chart(&songs, 1);
         let b = bank(&c);
         let key = super::key(&c, &b).unwrap();
-        for host in [
-            Host {
-                panic_at: Some(1),
-                ..Host::default()
-            },
-            Host {
-                cancel_at: Some(1),
-                ..Host::default()
-            },
+        for (host, outcome) in [
+            (
+                Host {
+                    panic_at: Some(1),
+                    ..Host::default()
+                },
+                Loading::Ready,
+            ),
+            (
+                Host {
+                    cancel_at: Some(1),
+                    ..Host::default()
+                },
+                Loading::Cancelled,
+            ),
         ] {
             let mut host = host;
             let mut loudness = Loudness::default();
-            loudness.load(&lib, &c, &b, "a.bms", &mut host);
+            assert_eq!(loudness.load(&lib, &c, &b, "a.bms", &mut host), outcome);
             // It stopped at the block it was told to.
             assert_eq!(host.blocks, 2);
             assert_eq!(loudness.gain(), Gain::HEADROOM);

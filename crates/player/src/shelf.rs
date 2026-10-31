@@ -393,8 +393,8 @@ impl Shelf {
         bank: &Arc<SoundBank>,
         name: &str,
         host: &mut dyn Host,
-    ) {
-        self.loudness.load(&self.library, chart, bank, name, host);
+    ) -> game::Loading {
+        self.loudness.load(&self.library, chart, bank, name, host)
     }
 
     /// Before a countdown, once [`wait_paused`](Self::wait_paused) found

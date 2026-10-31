@@ -377,6 +377,9 @@ pub enum SelectStep {
     Rounds(u16),
     /// On the practice page: back to selection (Escape).
     PracticeBack,
+    /// Close the window once the next chart's load starts measuring its
+    /// loudness: a close during the load.
+    CloseMeasuring,
     /// Close the window.
     Close,
 }
@@ -387,8 +390,10 @@ pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
 /// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
 /// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
-/// `back`, `retry`, `next`, `prev` and `close`. Selection steps run on the
-/// select screen (`prev-preset` and `next-preset` press F11 and F12),
+/// `back`, `retry`, `next`, `prev`, `close-measuring` and `close`. Selection
+/// steps run on the select screen (`prev-preset` and `next-preset` press
+/// F11 and F12; `close-measuring` closes the window once the next load
+/// measures a chart's loudness),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
 /// and `prev` on a result; a step out of place, or a chart not
 /// listed within [`STEP_TIMEOUT`], fails the run. A scenario
@@ -401,6 +406,9 @@ pub struct SelectScript {
     since: Option<std::time::Instant>,
     /// The input thread's wakes when an `idle` step began.
     pub idle_from: Option<u64>,
+    /// The next load's loudness measurement closes the window
+    /// (`close-measuring`).
+    pub close_measuring: bool,
     /// Why the script failed.
     failed: Option<String>,
     /// The scenario step last announced.
@@ -430,7 +438,7 @@ impl SelectScript {
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, enter, prev-preset, next-preset, drawn, back, retry, next, prev or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -444,9 +452,10 @@ impl SelectScript {
                 None if s == "retry" => Ok(SelectStep::Retry),
                 None if s == "next" => Ok(SelectStep::Next),
                 None if s == "prev" => Ok(SelectStep::Prev),
+                None if s == "close-measuring" => Ok(SelectStep::CloseMeasuring),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, enter, prev-preset, next-preset, drawn, back, retry, next, prev or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

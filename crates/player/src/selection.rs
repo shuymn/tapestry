@@ -20,8 +20,8 @@ use std::time::Instant;
 
 use bms_model::{TimeSource, TimeUs};
 use game::{
-    AppRig, Chain, LoadRefusal, Loaded, Pick, PracticeInput, PracticeScreen, Refused, ResultScreen,
-    SessionError,
+    AppRig, Chain, LoadRefusal, Loaded, Loading, Pick, PracticeInput, PracticeScreen, Refused,
+    ResultScreen, SessionError,
 };
 
 #[cfg(feature = "dev-tools")]
@@ -62,6 +62,10 @@ struct LoadHost<'a> {
     /// The select page, which says the chart is being measured; none for a
     /// practice's rounds, whose page stays.
     screen: Option<&'a SelectScreen>,
+    /// The measurement closes the window (a script's `close-measuring`,
+    /// dev-tools).
+    #[cfg(feature = "dev-tools")]
+    close: bool,
 }
 
 impl crate::loudness::Host for LoadHost<'_> {
@@ -80,6 +84,10 @@ impl crate::loudness::Host for LoadHost<'_> {
         if let Some(screen) = self.screen {
             let page = screen.page(&format!("音量を測定中: {name}"));
             self.render.send(RenderMsg::Menu(Box::new(page)));
+        }
+        #[cfg(feature = "dev-tools")]
+        if self.close {
+            self.controls.close();
         }
     }
 
@@ -425,6 +433,7 @@ impl Selection {
                         c.arm(k);
                     }
                 }
+                Some(SelectStep::CloseMeasuring) => script.close_measuring = true,
                 // Due here only when the chosen chart did not play.
                 Some(SelectStep::Play(_)) => {
                     if let Some(why) = script.refusal() {
@@ -1197,7 +1206,7 @@ impl AppRig for PlayerRig<'_> {
         self.look()
     }
 
-    fn load_chart(&mut self, loaded: &Loaded) -> Result<(), ChartLoadError> {
+    fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
         // A practice's Start chooses again: its load times run from it.
         let now = self.clock.now();
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
@@ -1262,6 +1271,11 @@ impl AppRig for PlayerRig<'_> {
             .selected()
             .map_or_else(|| "the chart".to_owned(), |e| file_name(&e.path));
         let practice = loaded.section().is_some();
+        #[cfg(feature = "dev-tools")]
+        let close = sel
+            .script
+            .as_mut()
+            .is_some_and(|s| std::mem::take(&mut s.close_measuring));
         let Selection { shelf, screen, .. } = sel;
         let mut host = LoadHost {
             loaded,
@@ -1269,8 +1283,15 @@ impl AppRig for PlayerRig<'_> {
             controls: self.controls,
             render: &self.render,
             screen: (!practice).then_some(&*screen),
+            #[cfg(feature = "dev-tools")]
+            close,
         };
-        shelf.loaded(chart, &bank, &name, &mut host);
+        if shelf.loaded(chart, &bank, &name, &mut host) == Loading::Cancelled {
+            // Closing or the quit key: nothing more is prepared, and the
+            // flow leaves the chart.
+            println!("load: cancelled");
+            return Ok(Loading::Cancelled);
+        }
         let measured = self.clock.now();
         self.render
             .load(Arc::new(chart.clone()), loaded.section().cloned())
@@ -1296,7 +1317,7 @@ impl AppRig for PlayerRig<'_> {
             ms(engine, measured),
             ms(decoded, engine) + ms(measured, ready),
         );
-        Ok(())
+        Ok(Loading::Ready)
     }
 
     fn show_refusal(&mut self, refusal: &LoadRefusal<ChartLoadError>) {

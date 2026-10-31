@@ -47,12 +47,13 @@ pub trait AppRig: Rig {
     /// whether to play or practice it.
     fn choose(&mut self) -> Option<Pick>;
     /// Builds what the plays of `loaded` need beside it: its sound bank
-    /// and the screen's chart, replacing the previous chart's.
+    /// and the screen's chart, replacing the previous chart's; or stops at
+    /// a cancel ([`Loading::Cancelled`]), and the chart is left.
     ///
     /// # Errors
     ///
     /// Why the bank cannot be built: the chart is refused.
-    fn load_chart(&mut self, loaded: &Loaded) -> Result<(), Self::BankError>;
+    fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError>;
     /// Shows on the select screen why the chosen chart was refused.
     fn show_refusal(&mut self, refusal: &LoadRefusal<Self::BankError>);
     /// Song selection was entered: called on every entry, before anything
@@ -102,6 +103,17 @@ pub enum Pick {
     Play(PathBuf),
     /// Open its practice screen.
     Practice(PathBuf),
+}
+
+/// How a chart's load ([`AppRig::load_chart`]) ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loading {
+    /// The chart is ready to play.
+    Ready,
+    /// The load stopped before it was ready: the window is closing, or
+    /// the quit key left the chart. Nothing further is prepared, and the
+    /// chart is left.
+    Cancelled,
 }
 
 /// Why a chosen chart was refused.
@@ -412,7 +424,8 @@ impl App {
         } else {
             match rig.load_chart(&loaded) {
                 Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
-                Ok(()) => match run_chart(&mut loaded, rig) {
+                Ok(Loading::Cancelled) => cancelled(rig).map(Chosen::Left),
+                Ok(Loading::Ready) => match run_chart(&mut loaded, rig) {
                     Ok(leave) => Ok(Chosen::Left(leave)),
                     Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
                     Err(e) => Err(e),
@@ -522,13 +535,29 @@ fn start_rounds<R: AppRig>(
     loaded
         .set_practice(Some(practice))
         .map_err(|e| notice(&e))?;
-    rig.load_chart(loaded).map_err(|e| notice(&e))?;
+    if rig.load_chart(loaded).map_err(|e| notice(&e))? == Loading::Cancelled {
+        return cancelled(rig).map_err(Stopped::Run);
+    }
     match run_chart(loaded, rig) {
         Ok(leave) => Ok(leave),
         Err(LiveError::Logic(e)) => Err(notice(&e)),
         Err(LiveError::Restore(e)) => Err(notice(&e)),
         Err(e) => Err(Stopped::Run(e)),
     }
+}
+
+/// A load the rig cancelled: the quit that cancelled it is taken with it,
+/// so it leaves only the load, and nothing more is prepared (no screen or
+/// audio handshake). A close ends the run; the quit key returns to where
+/// the chart was chosen.
+fn cancelled<R: AppRig>(rig: &mut R) -> Result<Leave, LiveError<R::ScreenError>> {
+    run_over(rig)?;
+    while rig.take().is_some() {}
+    Ok(if rig.quitting() {
+        Leave::Quit
+    } else {
+        Leave::Back
+    })
 }
 
 /// What the run's shelf holds while a chart has it: never seen, since

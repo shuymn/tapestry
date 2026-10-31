@@ -346,6 +346,40 @@ fn the_first_play_has_the_measured_gain() {
     assert!(a[0] < 0.8 && b[0] < 0.8, "{peaks:?}");
 }
 
+/// Closing the window while a chart's loudness is measured cancels the
+/// measurement and the load: nothing more is prepared (the chart is never
+/// ready, no countdown starts), nothing is stored, and the run ends at
+/// once with 0. The next run measures the chart again.
+#[test]
+fn closing_during_the_measurement_leaves_the_load() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
+    let (_, stdout) = run(&fx, "pick=a.bms,close-measuring,enter", &[]);
+    assert_eq!(
+        lines(&stdout, "loudness: measuring a.bms").len(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        lines(&stdout, "loudness: a.bms: the measurement was cancelled").len(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(lines(&stdout, "load: cancelled").len(), 1, "{stdout}");
+    assert!(
+        lines(&stdout, "load: the chart is ready").is_empty(),
+        "{stdout}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+    let (_, again) = run(&fx, "pick=a.bms,enter,back,close", &[]);
+    assert_eq!(
+        lines(&again, "loudness: measuring a.bms").len(),
+        1,
+        "{again}"
+    );
+    assert_eq!(lines(&again, "play started").len(), 1, "{again}");
+}
+
 /// A chart that cannot be loaded returns to selection with its reason
 /// shown, and stays selected: Enter chooses it again. The threads keep
 /// running: a valid chart plays after it.
