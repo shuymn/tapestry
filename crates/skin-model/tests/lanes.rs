@@ -198,7 +198,7 @@ fn evaluated(chart: &Chart, press: i64, release: i64, to: i64) -> Vec<JudgeEvent
             axes: Vec::new(),
         }],
     };
-    let preset = rules::custom();
+    let preset = rules::tapestry();
     let key = |at: i64, value: i32| eval::PhysicalInputEvent {
         received: TimeUs(at),
         source: eval::SourceId(0),
