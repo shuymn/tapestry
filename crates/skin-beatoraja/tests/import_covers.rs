@@ -12,10 +12,12 @@ use bms_model::{ChartBuilder, Lane, TimeUs};
 use common::lanes::{NOTES, body, cover, lift, lift_object, note};
 use common::play::{Drawn, MS};
 use common::{Loaded, has, import_body, import_config, import_sized};
+use skin_beatoraja::ImportLimit;
 use skin_beatoraja::{
     Config, CriticalPart, DeviationId, ImportError, LaneApprox, NoteKind, OffsetValue, Severity,
 };
 use skin_model::Blend;
+use skin_model::MAX_IMAGES;
 
 /// The lanes with `objects` beside the note and `dsts` after it.
 fn with(objects: &str, dsts: &[&str]) -> Loaded {
@@ -510,9 +512,15 @@ fn stretched(id: &str, mode: i32) -> String {
     cover(&format!(r#""stretch": {mode}"#)).replace(r#""id": "cover""#, &format!(r#""id": "{id}""#))
 }
 
-/// The rows of its frame the one quad drawn keeps, from its uv's aspect
-/// against the frame's `width` texels (the atlas pages are square).
+/// The rows of its frame SUDDEN+ keeps at 1 000 ‰ (see [`rows_at`]).
 fn rows_drawn(l: &Loaded, width: f32) -> f32 {
+    rows_at(l, [20.0, 280.0, 430.0, 600.0], width)
+}
+
+/// The rows of its frame the one quad drawn over `rect` keeps, from its
+/// uv's aspect against the frame's `width` texels (the atlas pages are
+/// square).
+fn rows_at(l: &Loaded, rect: [f32; 4], width: f32) -> f32 {
     let chart = ChartBuilder::new(150_000)
         .tap(Lane::new(1).unwrap(), TimeUs(5_000 * MS))
         .build()
@@ -523,7 +531,7 @@ fn rows_drawn(l: &Loaded, width: f32) -> f32 {
     let q: Vec<_> = d
         .frame(1_000, &[])
         .into_iter()
-        .filter(|q| q.rect == [20.0, 280.0, 430.0, 600.0])
+        .filter(|q| q.rect == rect)
         .collect();
     assert_eq!(q.len(), 1);
     let [u0, v0, u1, v1] = q[0].uv;
@@ -548,6 +556,19 @@ fn fit_width_covers_take_the_frames_aspect() {
             "{mode}"
         );
     }
+}
+
+#[test]
+fn a_fit_width_cover_takes_its_height_from_the_frame() {
+    // A destination with no height: stretch 4 makes the 43×30 frame 300
+    // high, centred on the destination's lower edge, 280: from 130 to 430.
+    let flat = |h: i32| stretched("cw", 4).replace(r#""h": 600"#, &format!(r#""h": {h}"#));
+    let l = tall(WIDE, "", &[&flat(0)]);
+    assert_eq!(rects(&l, 5_000, 0, 0), [[20, 270, 430, 160]]);
+    // Without a stretch it has no height, and a negative height refuses.
+    let none = cover("").replace(r#""h": 600"#, r#""h": 0"#);
+    refused(tall(WIDE, "", &[&none]), CriticalPart::Cover, "dst");
+    refused(tall(WIDE, "", &[&flat(-1)]), CriticalPart::Cover, "dst");
 }
 
 #[test]
@@ -584,11 +605,15 @@ fn a_cropped_cover_is_its_own_image_of_the_same_file() {
     let (a, b) = (alone.report().usage, both.report().usage);
     assert_eq!((b.images, b.frames), (a.images + 1, a.frames + 1));
     assert_eq!(b.files, a.files);
-    assert_eq!(rows_drawn(&both, 43.0), 60.0);
-    // Drawn whole after the cover cropped it, it is added too.
+    // Drawn whole after the cover cropped it, it is added too. In either
+    // order the cover keeps 60 rows and the plain image all 120.
     let after = tall(frame, "", &[&stretched("ct", 5), plain]);
     assert_eq!(after.report().usage.images, b.images);
-    assert_eq!(rows_drawn(&after, 43.0), 60.0);
+    let whole = [0.0, 1_070.0, 10.0, 10.0];
+    for l in [&both, &after] {
+        assert_eq!(rows_drawn(l, 43.0), 60.0);
+        assert_eq!(rows_at(l, whole, 43.0), 120.0);
+    }
 }
 
 #[test]
@@ -631,5 +656,34 @@ fn lift_fits_its_width_only_in_place() {
         let l = with(&exact, &[&lift(&format!(r#""stretch": {mode}"#))]);
         // LIFT 200 ‰ raises its upper edge 120 px to 760.
         assert_eq!(rects(&l, 5_000, 0, 200), [[20, 760, 430, 120]], "{mode}");
+    }
+}
+
+/// The lanes' six part images, `plain` decorative images and a cropped
+/// SUDDEN+ over `n.png`, which nothing else reads.
+fn with_plain_images(plain: usize) -> Loaded {
+    let mut extra: Vec<String> = (0..plain)
+        .map(|i| format!(r#"{{"id": "p{i}", "src": "a", "w": 1, "h": 1}}"#))
+        .collect();
+    extra.push(r#"{"id": "cf", "src": "n", "x": 0, "y": 0, "w": 4, "h": 20}"#.to_owned());
+    let dsts: Vec<String> = (0..plain)
+        .map(|i| format!(r#"{{"id": "p{i}", "dst": [{{"x": 0, "y": 0, "w": 1, "h": 1}}]}}"#))
+        .collect();
+    let mut all: Vec<&str> = dsts.iter().map(String::as_str).collect();
+    let cover = stretched("cf", 5);
+    all.push(&cover);
+    tall(&extra.join(", "), "", &all)
+}
+
+#[test]
+fn a_cropped_cover_is_charged_before_its_file_is_read() {
+    // At the image cap the cover maps; one image more refuses at the
+    // cover's charge, before `n.png` is admitted.
+    let at_cap = with_plain_images(MAX_IMAGES - 7);
+    assert_eq!(at_cap.report().usage.images as usize, MAX_IMAGES);
+    assert_eq!(rows_drawn(&at_cap, 4.0), 6.0);
+    match with_plain_images(MAX_IMAGES - 6).result {
+        Err(ImportError::Limit { limit, .. }) => assert_eq!(limit, ImportLimit::Images),
+        other => panic!("{:?}", other.map(|i| i.report)),
     }
 }

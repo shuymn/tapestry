@@ -67,29 +67,26 @@ impl LaneState {
     }
 }
 
-/// The height stretch 5 keeps of a frame of `[iw, ih]` texels for
-/// destination `r` when it crops the frame's rows, computed in `f32` as
-/// the source does (`skin/StretchType.java:65-68, 143-148`).
-#[expect(clippy::cast_precision_loss, reason = "the source's float arithmetic")]
-fn trimmed(r: Rect, [iw, ih]: [u32; 2]) -> Option<f32> {
-    let scale = r.w.to_f32() / iw as f32;
-    let (h, fitted) = (r.h.to_f32(), scale * ih as f32);
-    (h < fitted).then(|| h / scale)
+/// The texels of a frame of `[iw, ih]` that stretch 5 keeps for
+/// destination `r`, exactly: the frame's height times the destination's
+/// aspect over the frame's (`skin/StretchType.java:65-68, 143-148`).
+/// `Some(None)` when the fitted frame is no taller than the destination,
+/// so nothing is cropped; `None` on overflow.
+fn trimmed(r: Rect, [iw, ih]: [u32; 2]) -> Option<Option<Q>> {
+    let kept = r.h.mul(Q::int(iw))?.div(r.w)?;
+    Some((kept < Q::int(ih)).then_some(kept))
 }
 
-/// The rows a frame at row `y`, `h` high, keeps about its middle when it
-/// keeps `kept` texels, truncated as the source does
-/// (`skin/StretchType.java:146-149`); `None` when no row is left.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    reason = "the source's float arithmetic"
-)]
-fn crop_rows(y: u32, h: u32, kept: f32) -> Option<Crop> {
-    let middle = y as f32 + h as f32 * 0.5;
-    let first = u32::try_from((middle - kept * 0.5) as i32).ok()?;
-    let rows = u32::try_from(kept as i32).ok().filter(|&n| n > 0)?;
-    Some([first, rows])
+/// The rows a frame at row `y`, `h` high, keeps when it keeps `kept`
+/// texels about its middle, its edges rounded half up as D1 rounds;
+/// `None` when no row is left or on overflow.
+fn crop_rows(y: u32, h: u32, kept: Q) -> Option<Crop> {
+    let top = Q::int(y).add(Q::int(h).sub(kept)?.half()?)?;
+    let (first, end) = (top.round()?, top.add(kept)?.round()?);
+    let rows = u32::try_from(end.checked_sub(first)?)
+        .ok()
+        .filter(|&n| n > 0)?;
+    Some([u32::try_from(first).ok()?, rows])
 }
 
 /// `v` exactly; `None` for one beyond the rationals' range.
@@ -839,7 +836,7 @@ impl Cx<'_> {
         let [xc, yc, wc, hc] = c.track.keys.first().map_or([0; 4], |k| k.rect);
         if !self.over_lanes(at, xc, wc)?
             || i64::from(yc) != i64::from(l.y0) + i64::from(l.h0)
-            || hc <= 0
+            || hc < 0
         {
             return refuse(self, "dst");
         }
@@ -896,8 +893,11 @@ impl Cx<'_> {
         };
         let mut cropped = false;
         let found = self.add_src_image_cropped(c, rec, s, grid, |cx, [_, y, w, h]| {
+            if mode != 5 {
+                return Ok(None);
+            }
             let cell = [w / grid[0].max(1), h / grid[1].max(1)];
-            let Some(kept) = (mode == 5).then(|| trimmed(r, cell)).flatten() else {
+            let Some(kept) = trimmed(r, cell).ok_or_else(|| cx.range(at, "dst"))? else {
                 return Ok(None);
             };
             if grid != [1, 1] {
@@ -1120,30 +1120,39 @@ mod tests {
         assert_eq!(f32_q(f32::MAX), None);
     }
 
-    fn rect(w: i32, h: i32) -> Rect {
+    fn rect(w: Q, h: Q) -> Rect {
         Rect {
             x: Q::int(20),
             y: Q::int(800),
-            w: Q::int(w),
-            h: Q::int(h),
+            w,
+            h,
         }
     }
 
+    /// The crop of a `[iw, ih]` frame at row `y` under `w`×`h`.
+    fn crop(w: Q, h: Q, y: u32, [iw, ih]: [u32; 2]) -> Option<Crop> {
+        crop_rows(y, ih, trimmed(rect(w, h), [iw, ih]).unwrap()?)
+    }
+
     #[test]
-    fn stretch_five_crops_in_the_sources_floats() {
-        // A 25×128 frame over 430×258 keeps 258 / 17.2 rows: exactly 15,
-        // but 14.999999 in `f32`, which truncates to 14.
-        let kept = trimmed(rect(430, 258), [25, 128]).unwrap();
-        assert!(kept < 15.0, "{kept}");
-        assert_eq!(crop_rows(0, 128, kept), Some([56, 14]));
-        // A 75×17 frame at row 24 over 430×86 keeps about 15 rows about
-        // its middle, 32.5: from row 25.
-        let kept = trimmed(rect(430, 86), [75, 17]).unwrap();
-        assert_eq!(crop_rows(24, 17, kept).map(|c| c[0]), Some(25));
+    fn stretch_five_crops_exactly() {
+        let int = |v: i32| Q::int(v);
+        // A 25×128 frame over 430×258 keeps 258·25/430 = 15 rows about
+        // its middle: its edges 56.5 and 71.5 round to rows 57 to 71.
+        assert_eq!(crop(int(430), int(258), 0, [25, 128]), Some([57, 15]));
+        // A 1600×900 skin scales 430×86 to 516×103.2: a 15×4 frame keeps
+        // 3 rows from 0.5, rows 1 to 3.
+        let (w, h) = (int(516), Q::new(516, 5).unwrap());
+        assert_eq!(crop(w, h, 0, [15, 4]), Some([1, 3]));
+        // A 75×17 frame at row 24 under 430×86 keeps 15 rows from 25.
+        assert_eq!(crop(int(430), int(86), 24, [75, 17]), Some([25, 15]));
         // A frame no taller than the destination once fit is not cropped.
-        assert_eq!(trimmed(rect(430, 300), [43, 30]), None);
-        assert_eq!(trimmed(rect(430, 299), [43, 30]), Some(29.9));
-        // No row left.
-        assert_eq!(crop_rows(0, 128, 0.5), None);
+        assert_eq!(trimmed(rect(int(430), int(300)), [43, 30]), Some(None));
+        assert_eq!(
+            trimmed(rect(int(430), int(299)), [43, 30]),
+            Some(Q::new(299, 10))
+        );
+        // No row left: 0.4 texels about row 64.
+        assert_eq!(crop_rows(0, 128, Q::new(2, 5).unwrap()), None);
     }
 }
