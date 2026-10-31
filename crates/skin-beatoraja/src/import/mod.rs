@@ -26,10 +26,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, Blend, CompileError, CycleDef, Ease, ElementDef, ErrorKind, Filter, Fit, KeyDef,
-    LoadError, MAX_GEOMETRY, MAX_SOURCE_BYTES, PLAY, Place, Program, Region, RegionDef, Scope,
-    Skin, SkinDef, Source, Span as ExprSpan, TimerRef, Track, Ty, WidgetDefs, compile,
-    timer as slot,
+    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, KeyDef, LoadError, MAX_GEOMETRY, PLAY,
+    Place, Program, Region, RegionDef, Scope, Skin, SkinDef, Source, TimerRef, Track, Ty,
+    WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -790,11 +789,15 @@ impl<'d> Cx<'d> {
         let visible = if conds.is_empty() {
             None
         } else {
-            let src = conds
-                .iter()
-                .map(|c| format!("({c})"))
-                .collect::<Vec<_>>()
-                .join(" && ");
+            let mut src = String::new();
+            for c in &conds {
+                if !src.is_empty() {
+                    src.push_str(" && ");
+                }
+                src.push('(');
+                src.push_str(c);
+                src.push(')');
+            }
             Some(self.compile(&src, Ty::Bool, at)?)
         };
 
@@ -828,9 +831,9 @@ impl<'d> Cx<'d> {
     }
 
     /// Applies one condition: `Ok(false)` when the element is dropped or
-    /// never drawn. A repeated expression adds nothing, and the joined
-    /// source is kept within the compiler's limit as it grows, so a long
-    /// list of conditions builds no more than that.
+    /// never drawn. A repeated expression adds nothing: the supported
+    /// conditions are a closed set whose joined source fits the
+    /// compiler's limit (`ops`' tests), so a long list builds no more.
     fn condition(
         &mut self,
         role: Role,
@@ -840,24 +843,9 @@ impl<'d> Cx<'d> {
     ) -> Result<bool, ImportError> {
         match c {
             Cond::Expr(e) => {
-                if conds.contains(&e) {
-                    return Ok(true);
+                if !conds.contains(&e) {
+                    conds.push(e);
                 }
-                // `(a) && (b)`: each term in parentheses, joined by ` && `.
-                let len = conds.iter().map(|c| c.len() + 2 + 4).sum::<usize>() + e.len() + 2;
-                if len > MAX_SOURCE_BYTES {
-                    return Err(ImportError::Expr {
-                        at: self.loc(at),
-                        source: CompileError {
-                            span: ExprSpan {
-                                start: 0,
-                                end: u32::try_from(len).unwrap_or(u32::MAX),
-                            },
-                            kind: ErrorKind::TooLong { len },
-                        },
-                    });
-                }
-                conds.push(e);
                 Ok(true)
             }
             Cond::Fold(true) => Ok(true),

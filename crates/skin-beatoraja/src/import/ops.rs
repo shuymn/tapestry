@@ -379,6 +379,25 @@ mod tests {
     }
 
     #[test]
+    fn every_supported_condition_fits_one_source() {
+        // The built-ins with an expression, each sign: the closed set a
+        // destination's conditions come from, deduplicated.
+        let mut exprs = Vec::new();
+        for &(id, _) in KNOWN_BOOLEAN_IDS {
+            for op in [id, -id] {
+                if let Cond::Expr(e) = numeric(op, &BTreeSet::new(), &BTreeSet::new()) {
+                    exprs.push(e);
+                }
+            }
+        }
+        assert_eq!(exprs.len(), 24);
+        let joined: usize =
+            exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
+        assert_eq!(joined, 806);
+        assert!(joined <= skin_model::MAX_SOURCE_BYTES);
+    }
+
+    #[test]
     fn names_negate_and_patterns_parse() {
         assert_eq!(
             named("!!judge_1p_perfect"),
