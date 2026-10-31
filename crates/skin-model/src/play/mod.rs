@@ -134,8 +134,6 @@ pub struct Play {
     play_at: TimeUs,
     /// The context's [`PlayContext::last_note_end`].
     last_note_end: TimeUs,
-    /// `last_note`'s start, once sampled.
-    last_note: Option<TimeUs>,
     scratch: Side,
     /// Whether a long note's release is judged on its own (CN and HCN).
     separate_end_judgment: bool,
@@ -230,7 +228,6 @@ impl Play {
             ready_at,
             play_at,
             last_note_end: ctx.last_note_end,
-            last_note: None,
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
             // a new preset mode must be placed here.

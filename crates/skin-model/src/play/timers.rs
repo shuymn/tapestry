@@ -120,12 +120,13 @@ impl Play {
         };
         // Sampled on whole ms of the play clock, at the first playing
         // frame past the notes' end and before the finish
-        // (`play/BMSPlayer.java:683-697`).
-        if self.last_note.is_none() && frame.playing {
+        // (`play/BMSPlayer.java:683-697`); once set, only this keeps it.
+        let mut last_note = self.timer(timer::LAST_NOTE);
+        if last_note.is_none() && frame.playing {
             let at = now.0.div_euclid(1_000);
             let end = self.last_note_end.0.div_euclid(1_000);
             if end < at && at <= end.saturating_add(FINISH_MARGIN_MS) {
-                self.last_note = Some(now);
+                last_note = Some(now);
             }
         }
         let beat = ready.and_then(|_| self.beat_start(now, frame.display_offset));
@@ -138,7 +139,7 @@ impl Play {
         set(timer::READY, ready);
         set(timer::PLAY, play);
         set(timer::FAILED, failed);
-        set(timer::LAST_NOTE, self.last_note);
+        set(timer::LAST_NOTE, last_note);
         set(timer::FULL_COMBO, self.reducer.full_combo);
         set(timer::GAUGE_MAX, gauge_max);
         set(timer::BEAT, beat);
