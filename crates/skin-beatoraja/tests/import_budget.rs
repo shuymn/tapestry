@@ -430,6 +430,40 @@ fn judge_skin(filler_keys: usize, keys: usize, op: &str) -> Loaded {
 }
 
 #[test]
+fn a_key_overflow_wins_over_a_malformed_key() {
+    // Two keys, the second unreadable: alone a type error; past the
+    // keys their charge comes first, for an image and for the lanes.
+    let keys = r#"{"time": 0, "w": 1, "h": 1}, {"time": [], "w": 1, "h": 1}"#;
+    let deco = format!(r#"{{"id": "deco", "dst": [{keys}]}}"#);
+    let notes = format!(r#"{{"id": "notes", "dst": [{keys}]}}"#);
+    for last in [&deco, &notes] {
+        let alone = play(&common::lanes::note(""), std::slice::from_ref(last));
+        assert!(matches!(alone.err(), ImportError::Type { .. }), "{last}");
+        let mut dsts = filler(MAX_SKIN_KEYS - 1);
+        dsts.push(last.clone());
+        limit(play(&common::lanes::note(""), &dsts), ImportLimit::Keys);
+    }
+}
+
+#[test]
+fn offset_four_images_charge_their_keys() {
+    // An image listing offset 4 clear of the lanes is dropped, its key
+    // charged; SUDDEN+ charges its key once.
+    let deco = r#"{"id": "deco", "offset": 4, "dst": [{"x": 600, "w": 10, "h": 10}]}"#;
+    for last in [deco.to_owned(), common::lanes::cover("")] {
+        let with = |n: usize| {
+            let mut dsts = filler(n);
+            dsts.push(common::lanes::NOTES.to_owned());
+            dsts.push(last.clone());
+            play(&common::lanes::note(""), &dsts)
+        };
+        let l = with(MAX_SKIN_KEYS - 2);
+        assert_eq!(l.report().usage.keys, as_u32(MAX_SKIN_KEYS), "{last}");
+        limit(with(MAX_SKIN_KEYS - 1), ImportLimit::Keys);
+    }
+}
+
+#[test]
 fn judge_parts_charge_their_keys() {
     // The outer track emits one key, the grade its 200.
     let l = judge_skin(MAX_SKIN_KEYS - 201, 200, "");

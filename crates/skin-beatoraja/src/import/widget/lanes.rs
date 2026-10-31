@@ -748,6 +748,10 @@ impl Cx<'_> {
         group: bool,
     ) -> Result<(), ImportError> {
         let at = dst.span;
+        // The keys as written, charged once before either reading.
+        self.budget
+            .keys(dst.keys.len())
+            .map_err(|l| self.limit(at, l))?;
         if self.decorative_offset4(&dst)? {
             self.drop_el(
                 Role::Decorative,
@@ -831,6 +835,7 @@ impl Cx<'_> {
             dst,
             Opts {
                 allow,
+                charged: part == CriticalPart::Cover,
                 ..Opts::default()
             },
         )?

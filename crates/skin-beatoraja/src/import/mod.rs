@@ -211,6 +211,8 @@ struct Opts<'a> {
     /// A judge's combo: its digits, which shift each raw key left
     /// ([`track::read`]).
     digits: Option<i32>,
+    /// The keys as written were charged before this read.
+    charged: bool,
 }
 
 /// What the common part of an element decided.
@@ -694,6 +696,14 @@ impl<'d> Cx<'d> {
         if dst.mouse {
             self.ignored(at, NoteKind::Ignored { field: "mouseRect" });
         }
+        // Keys: charged as written before they are read, then as emitted
+        // when more (a neutral track emits its first and last).
+        let written = dst.keys.len();
+        let fits = if o.charged {
+            written <= skin_model::MAX_TRACK_KEYS
+        } else {
+            self.budget.keys(written).map_err(|l| self.limit(at, l))?
+        };
         let mut keys = track::read(self.def, &dst.keys, o.digits)?;
         if o.neutral {
             // The constructor's key at 0 (`SkinObject.java:234-254`), then
@@ -710,18 +720,15 @@ impl<'d> Cx<'d> {
                 keys.clip = false;
             }
         }
-        // Keys: charged as written, or as emitted when more (a neutral
-        // track emits its first and last), before the track is built.
-        let emitted = if o.neutral {
+        if o.neutral {
             let last = keys.keys.iter().map(|k| k.at).max().unwrap_or(0);
-            1 + usize::from(last > 0)
-        } else {
-            0
-        };
-        let fits = self
-            .budget
-            .keys(dst.keys.len().max(emitted))
-            .map_err(|l| self.limit(at, l))?;
+            let emitted = 1 + usize::from(last > 0);
+            if emitted > written {
+                self.budget
+                    .keys(emitted - written)
+                    .map_err(|l| self.limit(at, l))?;
+            }
+        }
         let mut text_angle = false;
         if text {
             for k in &mut keys.keys {
