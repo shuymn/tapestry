@@ -447,25 +447,69 @@ fn native_grades_keep_the_combos_anchor() {
     );
 }
 
+/// The refusal of a skin whose judge `j` shares its id with `record`
+/// in `table` (the image table gets it beside the grades).
+fn shared_id(table: &str, record: &str) -> (CriticalPart, NoteKind) {
+    let images = if table == "image" {
+        images().replacen(r#""image": ["#, &format!(r#""image": [{record}, "#), 1)
+    } else {
+        format!(r#"{}, "{table}": [{record}]"#, images())
+    };
+    let body = format!(
+        r#"{images}, "value": [], "judge": [{}], "destination": [{DST}]"#,
+        judge_rec(&grades(1), &[], "")
+    );
+    critical(import_sized([1_920, 1_080], &body, &[]))
+}
+
+const SHARED: (CriticalPart, NoteKind) = (
+    CriticalPart::Judge,
+    NoteKind::UnsupportedField { field: "id" },
+);
+
+// The source makes the judge, and its region, for an id it shares when
+// the earlier object comes out null; whether it does is a load-order rule
+// not reproduced, so the id is refused.
+
 #[test]
 fn an_image_may_not_share_the_judges_id() {
-    // The source makes the judge, and its region, only when the image's
-    // file fails to load (`JsonSkinObjectLoader.java:71`); either way the
-    // id is refused.
+    // Null when its file fails to load (`JsonSkinObjectLoader.java:71`).
     for src in ["gone", "a"] {
-        let image = format!(r#""image": [{{"id": "j", "src": "{src}", "w": 8, "h": 8}}, "#);
-        let body = format!(
-            r#"{}, "value": [], "judge": [{}], "destination": [{DST}]"#,
-            images().replacen(r#""image": ["#, &image, 1),
-            judge_rec(&grades(1), &[], "")
-        );
-        assert_eq!(
-            critical(import_sized([1_920, 1_080], &body, &[])),
-            (
-                CriticalPart::Judge,
-                NoteKind::UnsupportedField { field: "id" }
-            ),
-            "{src}"
-        );
+        let image = format!(r#"{{"id": "j", "src": "{src}", "w": 8, "h": 8}}"#);
+        assert_eq!(shared_id("image", &image), SHARED, "{src}");
     }
+}
+
+#[test]
+fn a_text_may_not_share_the_judges_id() {
+    // Null when no font has its id (`JsonSkinObjectLoader.java:387-391, 628`).
+    assert_eq!(
+        shared_id("text", r#"{"id": "j", "font": "none", "ref": 12}"#),
+        SHARED
+    );
+}
+
+#[test]
+fn a_slider_may_not_share_the_judges_id() {
+    // Null without a texture (`JsonSkinObjectLoader.java:396-416`).
+    assert_eq!(shared_id("slider", r#"{"id": "j", "src": "gone"}"#), SHARED);
+}
+
+#[test]
+fn a_graph_may_not_share_the_judges_id() {
+    // Null without a texture, on either branch
+    // (`JsonSkinObjectLoader.java:420-453`).
+    for kind in [-1, 0] {
+        let graph = format!(r#"{{"id": "j", "src": "gone", "type": {kind}}}"#);
+        assert_eq!(shared_id("graph", &graph), SHARED, "{kind}");
+    }
+}
+
+#[test]
+fn a_lift_may_not_share_the_judges_id() {
+    // Skipped without a texture (`JsonPlaySkinObjectLoader.java:200-213`).
+    assert_eq!(
+        shared_id("liftCover", r#"{"id": "j", "src": "gone"}"#),
+        SHARED
+    );
 }
