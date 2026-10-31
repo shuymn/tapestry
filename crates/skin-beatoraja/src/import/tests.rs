@@ -86,14 +86,24 @@ fn a_dropped_element_admits_nothing() {
     assert!(!trace.contains(&Event::Admit));
 }
 
+/// 1,000 references to one malformed PNG, through 500 images each drawn
+/// with both filters, admit it once; one admission reads its header once
+/// (`skin_model`'s builder witness), so the file's header is read once.
 #[test]
 fn repeated_bad_references_read_one_header() {
-    let images = r#"{"id": "x", "src": "b", "w": 8, "h": 8},
-                    {"id": "y", "src": "b", "w": 4, "h": 4}"#;
-    let dsts = r#"{"id": "x", "dst": [{"w": 1, "h": 1}]},
-                  {"id": "y", "dst": [{"w": 1, "h": 1}]},
-                  {"id": "x", "filter": 1, "dst": [{"w": 1, "h": 1}]}"#;
-    let (r, _, admits) = run(&skin(images, dsts));
+    let images: Vec<String> = (0..500)
+        .map(|i| format!(r#"{{"id": "{i}", "src": "b", "w": {}, "h": 8}}"#, 1 + i % 8))
+        .collect();
+    let dsts: Vec<String> = (0..1_000)
+        .map(|i| {
+            format!(
+                r#"{{"id": "{}", "filter": {}, "dst": [{{"w": 1, "h": 1}}]}}"#,
+                i / 2,
+                i % 2
+            )
+        })
+        .collect();
+    let (r, _, admits) = run(&skin(&images.join(","), &dsts.join(",")));
     let imported = r.unwrap();
     let missing = imported
         .report
@@ -101,7 +111,7 @@ fn repeated_bad_references_read_one_header() {
         .iter()
         .filter(|n| n.kind == NoteKind::MissingAsset)
         .count();
-    assert_eq!(missing, 3);
+    assert_eq!(missing, 1_000);
     assert_eq!(admits, 1);
     assert_eq!(imported.report.usage.file_attempts, 1);
 }

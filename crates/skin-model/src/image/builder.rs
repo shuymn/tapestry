@@ -345,10 +345,13 @@ mod tests {
         let mut b = builder(dir.path());
         b.admit_file(file("a.png")).unwrap();
         let (lo, texels) = (b.lo_bytes.sum, b.lo_texels.sum);
+        let before = reads();
         assert!(matches!(
             b.admit_file(file("bad.png")),
             Err(AdmitError::File(ImageError::Unsupported { .. }))
         ));
+        // A malformed file's admission reads its header once.
+        assert_eq!(reads(), before + 1);
         assert_eq!((b.lo_bytes.sum, b.lo_texels.sum), (lo, texels));
         assert_eq!(b.attempts, 2);
     }
