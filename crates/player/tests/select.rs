@@ -454,11 +454,15 @@ fn refused_load_releases_the_scan_pause() {
 
 /// Charts a scan lists above the chart under the cursor while the select
 /// screen is up keep the cursor on that chart and on its line: the list
-/// scrolls down by what was listed.
+/// scrolls down by what was listed, and stays so when that chart is then
+/// chosen and refused.
 #[test]
 fn charts_listed_above_keep_the_cursor_on_its_chart() {
     let fx = fixture();
-    for i in 0..30 {
+    let m = fx.library.join("m");
+    fs::create_dir_all(&m).unwrap();
+    fs::write(m.join("m00.bms"), "#TITLE M00\n#LNTYPE 2\n#00111:01\n").unwrap();
+    for i in 1..30 {
         write_chart(
             &fx.library,
             "m",
@@ -469,7 +473,7 @@ fn charts_listed_above_keep_the_cursor_on_its_chart() {
     }
     let mut child = select(
         &fx,
-        "pick=m00.bms,wait=a04.bms,close",
+        "pick=m00.bms,wait=a04.bms,enter,close",
         &["--dev-rescan-ms", "50"],
     )
     .stdout(Stdio::piped())
@@ -499,8 +503,13 @@ fn charts_listed_above_keep_the_cursor_on_its_chart() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(added, "{stdout}\n{stderr}");
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    // Every page sent, the last one listing the charts added among them,
-    // has the cursor on its chart and line.
+    assert_eq!(
+        lines(&stdout, "select: refused m00.bms").len(),
+        1,
+        "{stdout}"
+    );
+    // Every page sent, those listing the charts added and the refusal's
+    // among them, has the cursor on its chart and line.
     let shown = lines(&stdout, "dev: select cursor: ");
     assert!(
         shown

@@ -363,12 +363,15 @@ impl SelectScreen {
     }
 
     /// Puts the cursor on the chart at `path`; `false` when it is not
-    /// listed.
+    /// listed. The list stays as it is when the chart is already under the
+    /// cursor.
     pub fn select_path(&mut self, path: &Path) -> bool {
         match self.entries.iter().position(|e| e.path == path) {
             Some(i) => {
-                self.cursor = i;
-                self.scroll(CURSOR_LINE);
+                if i != self.cursor {
+                    self.cursor = i;
+                    self.scroll(CURSOR_LINE);
+                }
                 true
             }
             None => false,
