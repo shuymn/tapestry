@@ -374,13 +374,21 @@ impl AudioEngine {
     /// planning a seek ([`SeekPlan::new`]).
     #[must_use]
     pub fn frame_line(&self) -> FrameLine {
+        self.frame_line_at(self.play_origin)
+    }
+
+    /// Where the chart times of a play whose chart time 0 lies at `origin`
+    /// would fall on the output now: the line a play started there
+    /// ([`restart`](Self::restart)) gets, for planning its seek before it
+    /// starts.
+    #[must_use]
+    pub fn frame_line_at(&self, origin: TimeUs) -> FrameLine {
         let anchor = self.clock.anchor_us().unwrap_or(0);
         FrameLine {
             rate: self.rate,
             period: self.period,
             block_start: self.written(),
-            base_us: self
-                .play_origin
+            base_us: origin
                 .0
                 .saturating_sub(self.output_offset.0)
                 .saturating_sub(anchor),

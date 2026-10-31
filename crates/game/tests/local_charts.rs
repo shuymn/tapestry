@@ -263,7 +263,10 @@ fn sweep_one(path: &Path) -> Result<(usize, usize), &'static str> {
             input,
             commands: Vec::new(),
         })
-        .map_err(|e| logic_category(&e))?;
+        .map_err(|e| match e {
+            game::SessionPlayError::Logic(e) => logic_category(&e),
+            game::SessionPlayError::Restore(_) => "restore refusal",
+        })?;
 
     assert_eq!(report.end, PlayEnd::Completed);
     assert!(notes > 0);

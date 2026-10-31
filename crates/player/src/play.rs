@@ -114,6 +114,8 @@ pub struct PlayerRig<'a> {
     pub times: LoadTimes,
     /// When the current play's countdown started, on the clock.
     pub countdown_at: Option<TimeUs>,
+    /// Where the current play's chart time 0 lies on the clock.
+    pub origin: Option<TimeUs>,
     /// Where each logic step's measurement goes (the render thread).
     pub steps: rtrb::Producer<StepSample>,
     /// Step samples of the current play the full queue refused.
@@ -319,42 +321,48 @@ impl PlayerRig<'_> {
     }
 }
 
+/// A round's restore at chart time `at`, its lead-in's start, planned on
+/// the line the audio thread last published for a play whose chart time 0
+/// lies at `origin`, the opening's: `at` is then `RESTORE_AHEAD` in the
+/// output's future (design.md "Mid-Chart Start and Section Repeat").
+fn plan_restore(
+    restorer: &game::Restorer,
+    counters: &game::AudioCounters,
+    origin: TimeUs,
+    at: TimeUs,
+) -> Result<Box<game::Restore>, RestoreError> {
+    restorer.plan(counters.frame_line(origin), at)
+}
+
 pub(crate) fn since(from: TimeUs, to: TimeUs) -> Duration {
     Duration::from_micros(u64::try_from(to.0 - from.0).unwrap_or(0))
 }
 
 /// The command of a scenario's `until`, once it is due at `now` for the
-/// play whose countdown started at `countdown_at`: taken, so it is sent
-/// once.
+/// play whose chart time 0 lies at `origin`: taken, so it is sent once.
 #[cfg(feature = "dev-tools")]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 pub(crate) fn until_fired(
     until: &mut Option<(TimeUs, Command)>,
-    countdown_at: Option<TimeUs>,
-    lead_in: TimeUs,
+    origin: Option<TimeUs>,
     now: TimeUs,
 ) -> Option<Command> {
-    let (Some(c), Some((at, command))) = (countdown_at, *until) else {
+    let (Some(origin), Some((at, command))) = (origin, *until) else {
         return None;
     };
-    if !until_due(c, lead_in, at, now) {
+    if !until_due(origin, at, now) {
         return None;
     }
     *until = None;
     Some(command)
 }
 
-/// Whether chart time `at` has come at `now` for a play whose countdown
-/// started at `countdown_at` and lasts `lead_in`, all on the clock.
+/// Whether chart time `at` has come at `now` for a play whose chart time 0
+/// lies at `origin`, both on the clock.
 #[cfg(feature = "dev-tools")]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-pub(crate) const fn until_due(
-    countdown_at: TimeUs,
-    lead_in: TimeUs,
-    at: TimeUs,
-    now: TimeUs,
-) -> bool {
-    now.0 - countdown_at.0 - lead_in.0 >= at.0
+pub(crate) const fn until_due(origin: TimeUs, at: TimeUs, now: TimeUs) -> bool {
+    now.0 - origin.0 >= at.0
 }
 
 impl Rig for PlayerRig<'_> {
@@ -372,19 +380,14 @@ impl Rig for PlayerRig<'_> {
         // A scenario's `until`: the command, sent once, as its key would.
         #[cfg(feature = "dev-tools")]
         if let Some(sc) = &mut self.scenario
-            && let Some(command) = until_fired(
-                &mut sc.until,
-                self.countdown_at,
-                self.lead_in,
-                self.clock.now(),
-            )
+            && let Some(command) = until_fired(&mut sc.until, self.origin, self.clock.now())
         {
             self.controls.command(command);
         }
         #[cfg(feature = "dev-tools")]
-        if let Some(c) = self.countdown_at
+        if let Some(origin) = self.origin
             && !self.adjust_in_play.is_empty()
-            && until_due(c, self.lead_in, self.adjust_at, self.clock.now())
+            && until_due(origin, self.adjust_at, self.clock.now())
         {
             for a in self.adjust_in_play.drain(..) {
                 self.controls.tuning().adjust(a);
@@ -478,6 +481,7 @@ impl Rig for PlayerRig<'_> {
         let page_faults = process_page_faults();
         let countdown_at = TimeUs(origin.0 - self.lead_in.0);
         self.countdown_at = Some(countdown_at);
+        self.origin = Some(origin);
         println!("play started");
         // A chart's first play: a retry runs from its own receipt.
         if let Some(sel) = &self.selection
@@ -537,10 +541,12 @@ impl Rig for PlayerRig<'_> {
 
     fn restore_audio(&mut self, origin: TimeUs, at: TimeUs) -> Result<(), RestoreError> {
         let restorer = self.restorer.as_ref().ok_or(RestoreError::NotPrepared)?;
-        // On the line of the opening's origin, by the audio thread's last
-        // step: the lead-in's start is `RESTORE_AHEAD` in its future.
-        let line = self.audio.control.counters().frame_line(origin);
-        self.restore = Some(restorer.plan(line, at)?);
+        self.restore = Some(plan_restore(
+            restorer,
+            &self.audio.control.counters(),
+            origin,
+            at,
+        )?);
         Ok(())
     }
 
@@ -695,6 +701,63 @@ impl Rig for PlayerRig<'_> {
     }
 }
 
+#[cfg(test)]
+mod restore_tests {
+    use std::sync::Arc;
+
+    use audio::{AudioEngine, Gain, RecordingOutput, SimConfig, SimDevice, Sound, SoundBank};
+    use bms_model::{BgmEvent, SoundId, TimeUs};
+    use game::{RESTORE_AHEAD, Restored, Restorer, audio_control, audio_link_at};
+
+    use super::plan_restore;
+
+    /// The player's planning, on the line a stepped audio worker publishes
+    /// over a simulated device, restores a round at its lead-in's start:
+    /// the round opens at chart time 7.8 s when the output is at 30 ms, and
+    /// a 4 s BGM sound at 5 s enters there 3 s in, on time.
+    #[test]
+    fn a_round_planned_on_the_published_line_restores_at_its_lead_in() {
+        let bank = Arc::new(SoundBank::from_sounds(
+            48_000,
+            vec![Sound::mono(vec![1_000; 4 * 48_000])],
+        ));
+        let schedule = vec![BgmEvent {
+            time: TimeUs(5_000_000),
+            sound: SoundId(0),
+        }];
+        let engine =
+            AudioEngine::with_schedule(bank, schedule.clone(), 48_000, 480, 16, 0).unwrap();
+        let (mut control, mut worker) = audio_control(engine);
+        let mut out = RecordingOutput::new(
+            SimDevice::new(SimConfig::steady(48_000, 480, TimeUs(0))),
+            48_000,
+        );
+        for _ in 0..3 {
+            worker.step(&mut out).unwrap();
+        }
+        let at = TimeUs(8_000_000);
+        let origin = TimeUs(30_000 - (at.0 - RESTORE_AHEAD.0));
+        let restorer = Restorer::new(control.seek_source(), schedule);
+        let restore = plan_restore(&restorer, &control.counters(), origin, at).unwrap();
+        assert_eq!(restore.at(), at);
+        let (_sink, queue) = audio_link_at(4, origin);
+        control
+            .play_at(origin, queue, Gain::HEADROOM, Some(restore))
+            .unwrap();
+        for _ in 0..40 {
+            worker.step(&mut out).unwrap();
+        }
+        assert_eq!(
+            control.counters().restored(control.generation()),
+            Some(Restored::First)
+        );
+        // Frame `n` plays at `(n + 480) / 48 kHz`: the lead-in's start, 230
+        // ms, is frame 10 560; silent before it.
+        let left: Vec<f32> = out.samples().iter().step_by(2).copied().collect();
+        assert_eq!(left.iter().position(|&x| x != 0.0), Some(10_560));
+    }
+}
+
 #[cfg(all(test, feature = "dev-tools"))]
 mod tests {
     use bms_model::TimeUs;
@@ -703,17 +766,16 @@ mod tests {
 
     use super::{until_due, until_fired};
 
-    /// A scenario's `until` is due at its chart time exactly: the countdown
-    /// started at 5 s on the clock and lasts 1 s, so chart time 2.25 s is
-    /// clock time 8.25 s.
+    /// A scenario's `until` is due at its chart time exactly: chart time 0
+    /// lies at 6 s on the clock, so chart time 2.25 s is clock time 8.25 s.
     #[test]
     fn until_is_due_exactly_at_its_time() {
-        let (countdown, lead_in) = (TimeUs(5_000_000), TimeUs(1_000_000));
+        let origin = TimeUs(6_000_000);
         let at = TimeUs(2_250_000);
-        assert!(!until_due(countdown, lead_in, at, TimeUs(8_249_999)));
-        assert!(until_due(countdown, lead_in, at, TimeUs(8_250_000)));
-        assert!(!until_due(countdown, lead_in, TimeUs(0), TimeUs(5_999_999)));
-        assert!(until_due(countdown, lead_in, TimeUs(0), TimeUs(6_000_000)));
+        assert!(!until_due(origin, at, TimeUs(8_249_999)));
+        assert!(until_due(origin, at, TimeUs(8_250_000)));
+        assert!(!until_due(origin, TimeUs(0), TimeUs(5_999_999)));
+        assert!(until_due(origin, TimeUs(0), TimeUs(6_000_000)));
     }
 
     /// The `until` command is sent once, at its time on the play's clock:
@@ -721,26 +783,20 @@ mod tests {
     /// command, then nothing again.
     #[test]
     fn until_fires_once_at_its_time() {
-        let (countdown, lead_in) = (TimeUs(5_000_000), TimeUs(1_000_000));
+        let origin = TimeUs(6_000_000);
         let mut until = Some((TimeUs(2_250_000), Command::Retry));
-        assert_eq!(
-            until_fired(&mut until, None, lead_in, TimeUs(9_000_000)),
-            None
-        );
+        assert_eq!(until_fired(&mut until, None, TimeUs(9_000_000)), None);
         for now in [5_000_000, 7_000_000, 8_249_999] {
-            assert_eq!(
-                until_fired(&mut until, Some(countdown), lead_in, TimeUs(now)),
-                None
-            );
+            assert_eq!(until_fired(&mut until, Some(origin), TimeUs(now)), None);
         }
         assert!(until.is_some());
         assert_eq!(
-            until_fired(&mut until, Some(countdown), lead_in, TimeUs(8_250_000)),
+            until_fired(&mut until, Some(origin), TimeUs(8_250_000)),
             Some(Command::Retry)
         );
         assert_eq!(until, None);
         assert_eq!(
-            until_fired(&mut until, Some(countdown), lead_in, TimeUs(8_250_001)),
+            until_fired(&mut until, Some(origin), TimeUs(8_250_001)),
             None
         );
     }

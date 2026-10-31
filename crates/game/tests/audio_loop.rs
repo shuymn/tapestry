@@ -817,6 +817,31 @@ mod restore {
     }
 
     #[test]
+    fn a_late_load_answer_carries_the_seek_source() {
+        // A load the audio thread takes only after it timed out: its answer
+        // is drained by the next load, which times out too, and the source
+        // is then the late load's, what the engine plays.
+        let (mut control, mut worker, mut out) = rig();
+        steps(&mut worker, &mut out, WARM);
+        let late = vec![BgmEvent {
+            time: TimeUs(6_000 * MS),
+            sound: SoundId(0),
+        }];
+        let timeout = Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout));
+        assert_eq!(
+            control.load(bank(), audio::BgmSchedule::new(late.clone())),
+            timeout
+        );
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(
+            control.load(bank(), audio::BgmSchedule::new(Vec::new())),
+            timeout
+        );
+        assert!(control.seek_source().matches(&late));
+        assert!(!control.seek_source().matches(&schedule()));
+    }
+
+    #[test]
     fn restore_keeps_the_plays_gain_across_rounds() {
         // Two rounds at gain 1 (not the headroom), the first rung out to
         // its end: each restores its long voice at full level.

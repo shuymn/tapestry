@@ -94,7 +94,7 @@ pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, wr
 pub use session::{
     AutoKeySounds, Command, Loaded, MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport,
     PlayScript, PlayStart, RECORDING_MEMORY, Reservation, SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS,
-    Session, SessionConfig, SessionError, Settings, wake_policy,
+    Session, SessionConfig, SessionError, SessionPlayError, Settings, wake_policy,
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,
