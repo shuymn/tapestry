@@ -60,13 +60,6 @@ pub(crate) struct LaneState {
     pub(crate) kept_after: bool,
 }
 
-impl LaneState {
-    /// The model's lanes.
-    pub(crate) fn def(&self) -> LanesDef {
-        self.def
-    }
-}
-
 /// The texels of a frame of `[iw, ih]` that stretch 5 keeps for
 /// destination `r`, exactly: `r.h × iw / r.w`
 /// (`skin/StretchType.java:65-68, 143-148`).
@@ -440,23 +433,20 @@ impl Cx<'_> {
         // Note heights: `size[i]·r`, else the note's cell height
         // (`JsonPlaySkinObjectLoader.java:88-92`), plus the h offset.
         let sizes = self.floats(size, "size")?;
-        let mut heights = Vec::with_capacity(LANES);
-        for (u, cell) in cells.iter().enumerate() {
-            let nh = match sizes.get(u) {
+        let mut heights = [Q::ZERO; LANES];
+        for ((u, cell), h) in cells.iter().enumerate().zip(&mut heights) {
+            *h = match sizes.get(u) {
                 Some(&v) => f32_q(v).and_then(|q| q.mul(self.r)),
                 None => Q::int(cell[1]).mul(self.r),
             }
             .and_then(|q| q.add(Q::int(o.h)))
             .ok_or_else(|| self.range(at, "size"))?;
-            heights.push(nh);
         }
         // One height for every lane, kept unrounded; its rounding is the
         // model's nominal note height.
-        let Some(&nh) = heights.first() else {
-            return refuse(self, "size");
-        };
+        let [nh, ..] = heights;
         let note_h = nh.round().ok_or_else(|| self.range(at, "size"))?;
-        if heights.len() != LANES || heights.iter().any(|&h| h != nh) || note_h < 1 {
+        if heights.iter().any(|&h| h != nh) || note_h < 1 {
             return refuse(self, "size");
         }
         let note_h = u16::try_from(note_h).map_err(|_| self.range(at, "size"))?;

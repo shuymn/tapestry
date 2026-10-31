@@ -1173,7 +1173,7 @@ impl<'d> Cx<'d> {
             regions: REGIONS,
             whens: std::mem::take(&mut self.whens),
             sheet,
-            lanes: self.lanes.as_ref().map(widget::lanes::LaneState::def),
+            lanes: self.lanes.as_ref().map(|l| l.def),
             elements: std::mem::take(&mut self.elements),
             widgets: std::mem::take(&mut self.widgets),
         };
