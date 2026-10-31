@@ -280,19 +280,19 @@ impl Cx<'_> {
             "group",
         ];
         let fields = self.def.fields(rec, FIELDS);
-        let mut lists: Vec<Vec<String>> = Vec::with_capacity(18);
+        let mut lists: Vec<Vec<Option<String>>> = Vec::with_capacity(18);
         for (f, name) in fields.iter().zip(FIELDS).take(18) {
-            lists.push(self.strings(*f, name)?);
+            lists.push(self.opt_strings(*f, name)?);
         }
         let list = |i: usize| lists.get(i).cloned().unwrap_or_default();
         let [note, lnstart, lnend, lnbody, lnbody_active, lnactive] = [0, 1, 2, 3, 4, 5].map(list);
-        let hcn: Vec<Vec<String>> = (6..15).map(list).collect();
+        let hcn: Vec<Vec<Option<String>>> = (6..15).map(list).collect();
         let [mine, hidden, processed] = [15, 16, 17].map(list);
         let [.., dst2, expansion, size, group] = fields;
 
         // Preconditions (`SkinNote.java:27-40`, `JsonPlaySkinObjectLoader.
         // java:50-93`): eight notes and lanes, long-note arrays at least
-        // `lnend`'s length; every lane's mine resolves with the other parts.
+        // `lnend`'s length, eight mines.
         let lane_rects = self.lane_rects(rec)?;
         if note.len() != LANES || lane_rects.len() != LANES {
             return refuse(self, "dst");
@@ -317,6 +317,9 @@ impl Cx<'_> {
             || hcn_lists.iter().any(|&i| hcn_len(i) < tail)
         {
             return refuse(self, "lnend");
+        }
+        if mine.len() < LANES {
+            return refuse(self, "mine");
         }
         let ys: Vec<i32> = lane_rects.iter().map(|(_, r)| r[1]).collect();
         if ys.windows(2).any(|w| matches!(w, [a, b] if a != b)) {
@@ -387,7 +390,7 @@ impl Cx<'_> {
         };
         let mut cells = [[0_u32; 2]; LANES];
         let mut images = [[0_u32; 6]; LANES];
-        let names: [(&Vec<String>, &'static str); 6] = [
+        let names: [(&Vec<Option<String>>, &'static str); 6] = [
             (&note, "note"),
             (&lnstart, "lnstart"),
             (&lnend, "lnend"),
@@ -397,8 +400,12 @@ impl Cx<'_> {
         ];
         for u in 0..LANES {
             for (p, (names, field)) in names.iter().enumerate() {
-                let name = names.get(u).cloned().unwrap_or_default();
-                let Some(img) = self.image_rec(&name)? else {
+                // A `null` entry names no image, unlike an empty id
+                // (`JsonSkinObjectLoader.java:584-599` fails on it).
+                let Some(Some(name)) = names.get(u) else {
+                    return refuse(self, field);
+                };
+                let Some(img) = self.image_rec(name)? else {
                     return refuse(self, field);
                 };
                 let s = self.src_image(img)?;

@@ -230,6 +230,26 @@ fn refused_and_ignored_covers_admit_nothing() {
 }
 
 #[test]
+fn a_short_mine_list_admits_nothing() {
+    let eight = format!("[{}]", [r#""p""#; 8].join(", "));
+    let seven = format!("[{}]", [r#""p""#; 7].join(", "));
+    let json = lanes("", "").replace(
+        &format!(r#""mine": {eight}"#),
+        &format!(r#""mine": {seven}"#),
+    );
+    let (r, _, admits) = run(&json);
+    assert!(matches!(
+        r,
+        Err(ImportError::Critical {
+            part: super::CriticalPart::Lanes,
+            why: NoteKind::UnsupportedField { field: "mine" },
+            ..
+        })
+    ));
+    assert_eq!(admits, 0);
+}
+
+#[test]
 fn a_rejected_lane_approximation_refuses() {
     use super::widget::lanes::REJECTED;
     use super::{DeviationId, LaneApprox};

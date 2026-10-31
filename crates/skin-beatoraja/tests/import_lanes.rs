@@ -316,6 +316,19 @@ fn the_part_lists_are_checked() {
     );
     let mines = format!(r#""mine": {}, "#, eight("mi"));
     refused(with(&mines, ""), "mine");
+    // An image of the empty id resolves an empty name, never a missing
+    // entry or a `null` one.
+    let empty = r#"{"id": "", "src": "a", "x": 40, "y": 0, "w": 8, "h": 20}"#;
+    let with_empty = |to: &str| {
+        let n = note("").replacen(&mines, to, 1);
+        load(&body(empty, &n, &[NOTES]))
+    };
+    with_empty(&format!(r#""mine": {}, "#, eight(""))).ok();
+    refused(with_empty(""), "mine");
+    let seven = r#""mine": ["", "", "", "", "", "", ""], "#;
+    refused(with_empty(seven), "mine");
+    let null = r#""mine": ["", "", "", "", "", "", "", null], "#;
+    refused(with_empty(null), "mine");
     let ends = format!(r#""lnend": {}"#, eight("le"));
     refused(with(&ends, r#""lnends": []"#), "lnend");
 }

@@ -56,6 +56,19 @@ impl Cx<'_> {
         field: Option<u32>,
         name: &'static str,
     ) -> Result<Vec<String>, ImportError> {
+        Ok(self
+            .opt_strings(field, name)?
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect())
+    }
+
+    /// [`Self::strings`] with each `null` item kept as `None`.
+    pub(super) fn opt_strings(
+        &mut self,
+        field: Option<u32>,
+        name: &'static str,
+    ) -> Result<Vec<Option<String>>, ImportError> {
         let Some(f) = field else {
             return Ok(Vec::new());
         };
@@ -65,7 +78,7 @@ impl Cx<'_> {
         let items: Vec<u32> = self.def.arena.children(f).collect();
         items
             .into_iter()
-            .map(|i| Ok(self.def.string(i, name)?.unwrap_or_default()))
+            .map(|i| self.def.string(i, name))
             .collect()
     }
 
