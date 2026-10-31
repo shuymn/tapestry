@@ -17,6 +17,7 @@
 pub mod app;
 mod audio_loop;
 mod autoplay;
+mod bests;
 mod error;
 mod keys;
 pub mod live;
@@ -42,7 +43,9 @@ pub use audio_loop::{
     Probed, SWITCH_TIMEOUT, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError};
+pub use bests::{BestScore, BestView, SavedPlay};
 pub use error::{Chain, IoFailure};
+pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
     LearntRange, Press, ROLES, Refusal, capture_keys, capture_keys_within,
@@ -81,7 +84,7 @@ pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, wr
 pub use session::{
     AutoKeySounds, Command, Loaded, MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport,
     PlayScript, PlayStart, RECORDING_MEMORY, Reservation, SMALL_PARTS_BYTES, SYSTEM_CONTROL_INPUTS,
-    Session, SessionConfig, SessionError, Settings, TABLE_BYTES_PER_OBJECT, wake_policy,
+    Session, SessionConfig, SessionError, Settings, wake_policy,
 };
 pub use settings::{
     ControllerDevice, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError, LaneKey,

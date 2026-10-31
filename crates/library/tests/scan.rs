@@ -307,6 +307,7 @@ fn thread_start_hook_runs_first_on_the_scan_thread() {
             let name = std::thread::current().name().map(str::to_owned);
             record.lock().unwrap().push(name);
         })),
+        ..ScanOptions::default()
     };
     lib.scan(std::slice::from_ref(&fx.root), options)
         .unwrap()
@@ -339,6 +340,7 @@ fn a_stuck_scan_stops_within_its_bound_and_keeps_the_lock() {
                 open = changed.wait(open).unwrap();
             }
         })),
+        ..ScanOptions::default()
     };
     let scan = lib.scan(&[charts], options).unwrap();
     let started = std::time::Instant::now();
@@ -401,6 +403,7 @@ fn a_stop_waits_for_the_work_not_the_thread() {
         on_thread_start: Some(Arc::new(move || {
             HELD.with(|h| *h.borrow_mut() = Some(Blocks(Arc::clone(&held))));
         })),
+        ..ScanOptions::default()
     };
     let scan = lib.scan(&[charts], options).unwrap();
     assert!(scan.wait_finished(Duration::from_secs(10)));

@@ -7,7 +7,9 @@ use rules::{CanonicalError, RulePreset, Window};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use super::{Coverage, VerifyError, evaluate_record, load_recorded_chart};
+use super::{
+    Coverage, VerifyError, admit, batch_bytes, check_record, evaluate_record, load_recorded_chart,
+};
 use crate::{
     BuildProvenance, ChartRecord, DecodeError, DecodeLimits, DeviceKind, DeviceRecord, EndStatus,
     Incomplete, PASSTHROUGH, PlayRecord, PlayType, PresetRecord, ReceiveMethod, SourceRecord,
@@ -852,4 +854,52 @@ fn out_of_bounds_initial_gauge_uses_the_default() {
         starts(&[("survival", pct(2))]),
         (vec![pct(20), pct(2)], vec![true, false])
     );
+}
+
+/// The checks made before the chart is read run in their order: the
+/// evaluator, the preset copy, then the loader; a record passing them
+/// returns its preset copy.
+#[test]
+fn check_record_runs_the_checks_before_the_chart() {
+    let (_dir, record) = played();
+    assert_eq!(check_record(&record), Ok(rules::tapestry()));
+    let mut loader = record.clone();
+    loader.chart.identity.loader_version = LOADER_VERSION + 1;
+    assert_eq!(
+        check_record(&loader),
+        Err(VerifyError::UnsupportedLoader(LOADER_VERSION + 1))
+    );
+    let mut copy = with_preset_bytes(loader, vec![0, 1, 2]);
+    assert!(matches!(
+        check_record(&copy),
+        Err(VerifyError::PresetCopy(_))
+    ));
+    copy.versions.evaluator += 1;
+    assert_eq!(
+        check_record(&copy),
+        Err(VerifyError::UnsupportedEvaluator(copy.versions.evaluator))
+    );
+}
+
+/// Admission compares the evaluation's peak estimate with the budget,
+/// including it, and refuses one byte less without evaluating.
+#[test]
+fn admission_compares_the_estimate_with_the_budget() {
+    let (dir, record) = played();
+    let chart = load_recorded_chart(&record, CHART.as_bytes(), dir.path()).unwrap();
+    let preset = rules::tapestry();
+    let needed = batch_bytes(&record, &chart, &preset).unwrap();
+    assert!(needed > record.events.len() * size_of::<PhysicalInputEvent>());
+    assert_eq!(admit(&record, &chart, &preset, needed), Ok(()));
+    assert_eq!(
+        admit(&record, &chart, &preset, needed - 1),
+        Err(VerifyError::TooLarge {
+            needed,
+            budget: needed - 1
+        })
+    );
+    // Each further input costs more.
+    let mut more = record.clone();
+    more.events.push(press(5_000 * MS, 1));
+    assert!(batch_bytes(&more, &chart, &preset).unwrap() > needed);
 }

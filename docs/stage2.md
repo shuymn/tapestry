@@ -148,7 +148,7 @@ egui comes with the first form-like screen.
 | --- | --- | --- |
 | 1 | PR12 | `roots`; `charts(path UNIQUE, size, mtime_ns, sha256, md5, header fields)` |
 | 2 | PR13 | `norm_text` (the searched fields normalized and joined); `title_key` and `artist_key` (normalized sort keys, so full-width and katakana titles sort with the rest), with the index `charts_title` for the unfiltered title order; `folder` (the path's folder, for grouping without string work per row); `charts_fts` |
-| 3 | PR18 | `meta`, `scores`, `counted` |
+| 3 | PR18 | `meta`, `scores`, `counted`, `refused`; the index `charts_sha` |
 | 4 | PR25 | `loudness` |
 
 **On a different version (decided).** Everything in the database is derived, so the game deletes the file with its `-wal` and `-shm`, rebuilds it by a full scan, and logs one line. Only the version number is read from the old file.
@@ -186,27 +186,29 @@ egui comes with the first form-like screen.
 **Key.** Bests are keyed by (file SHA-256, preset SHA-256, LN mode).
 
 **Charts with `#RANDOM` get no best yet.** Whether a best is kept per resolved branch or per file is left open: a file whose branches hold 10 and 100 notes would otherwise either show several bests or compare a perfect 10-note play with a 100-note branch's 200 EX.
-- A play whose load resolved any `#RANDOM` is saved as usual, but `counts_for_best` is false for it and selection shows no best for the chart.
-- Records keep their seed and resolved-chart hash, and the bests are a cache rebuilt from records. Either rule can therefore be adopted later by a schema bump and a rebuild, with no play lost.
+- A play whose load resolved any `#RANDOM` (or `#SETRANDOM`, recorded in the same field) is saved as usual, but `counts_for_best` is false for it and selection shows `-` for the chart. Whether the chart resolved one is read from the chart as loaded, never from the record's fields.
+- Records keep their seed and resolved-chart hash, and the bests are a cache rebuilt from records. Either rule can therefore be adopted later by a `BESTS_VERSION` bump and a rebuild, with no play lost.
 
-**Eligibility.** One predicate, `counts_for_best(record, verified, saved)`, serves live updates and rebuilds alike. It holds only when all of these are true:
+**Eligibility.** One predicate, `counts_for_best(record, verified, saved)`, serves live updates and rebuilds alike; `Verified { completed, random }` is what verification established (the rebuild's re-evaluation and loaded chart, or the result's as-played evaluation and the chart just loaded). It holds only when all of these are true:
 - `verify` accepts the record;
+- the record was saved;
 - the record is not incomplete;
-- the play ended `PlayedToEnd`;
+- the play ended `PlayedToEnd`, and its evaluation completed;
 - it was a full play at 1×;
-- the record was saved.
+- the chart resolved no `#RANDOM`.
 
 **Values.**
-- `scores` holds the best EX, the best BP, a lamp, and the play count.
-- The lamp is the cleared gauge with the highest `lamp` rank (design.md "Rule Presets"), or FULL COMBO. Presets list their gauges in display order, not in order of difficulty, so each gauge states its rank (PR18a).
+- `scores` holds the best EX, the best BP, the set of the preset's gauges cleared, FULL COMBO, and the play count; each merges commutatively.
+- The lamp is the cleared gauge with the highest `lamp` rank (design.md "Rule Presets"), or FULL COMBO, drawn from the stored set when shown. Presets list their gauges in display order, not in order of difficulty, so each gauge states its rank (PR18a).
 - The play count counts every saved, verified record under the key, so plays of a `#RANDOM` chart count across its branches even though they set no best.
 
-**Idempotence.** One ingest function serves live updates and rebuilds. `counted(record_file PRIMARY KEY)` makes ingesting the same record twice a no-op.
+**Idempotence.** One ingest function serves live updates and rebuilds. A play is (its record's path relative to `records\`, the SHA-256 of its canonical body); `counted(path, body_sha256)` makes ingesting the same play twice a no-op. A record recompressed at its path is the same play, identical plays in two files are two, and a byte copy under another name counts again. Records are written once, and a deleted record's name returns only if two random 64-bit ids collide, a negligible risk (`<n>-<id>.tprl`).
 
 **Invalidation.**
-- `meta` stores the interpretation tuple: replay format, canonical encoding, evaluator and loader versions.
-- If the tuple differs on open, `scores` and `counted` are cleared before anything is shown, and a rebuild runs in the background.
-- Refused records are counted by reason.
+- `meta` stores the interpretation tuple: replay format, canonical encoding, evaluator and loader versions, and `BESTS_VERSION`, the version of these rules; it also holds the durable catch-up counters `requested` and `completed`.
+- If the tuple differs on open, `scores`, `counted` and `refused` are cleared before anything is shown, and a catch-up rebuilds them in the background (design.md "Personal Bests").
+- Every launch requests a catch-up, so plays saved by `tapestry play`, which opens no library, are counted then.
+- Refused records are counted by reason; a terminal refusal is skipped by the file's stamp until the file or the tuple changes, and a record waiting for its chart is retried when a pass reads that chart.
 
 ### D9. The result screen re-evaluates the same input under any preset
 
@@ -311,9 +313,12 @@ Its own rules, each with an example in crates/eval/tests/style_lr2.rs:
 
 The file SHA-256 is not compared.
 
+**Admission.** Before a saved record is evaluated, `replay::verify::admit` compares `eval`'s estimate of the batch evaluation's peak (`Evaluator::batch_bytes`) with a budget and refuses the record as too large, without evaluating it. The rebuild of the bests (PR18) admits within 512 MiB after the transform check, and the result screen's what-if within the same figure.
+
 **Callers.**
 - `eval-cli` refuses incomplete records.
 - The result screen re-evaluates the chart just played, without `verify`.
+- The rebuild of the bests runs every check, then admission, then the evaluation.
 
 ### D13. Section evaluation
 
@@ -948,7 +953,7 @@ Each one holds the behavior D5 and D6 state.
 **Depends on.** PR5, PR15, PR16.
 
 **Touches.**
-- `game`: presets.rs (a revision counter, a listing error, the absolute poll deadline), app.rs (one shelf for the run, lent to each chart and handed back on every outcome, polled on the select screen), session.rs (`load_reporting_to` takes the shelf; a chart's first play reports the chosen file's standing error), live.rs (the result loop drives the new `result_screen.rs` and waits to the poll deadline; `Rig::preset_reloaded` goes), and `result_screen.rs` (entries by identity, the view, its summaries and cache, and the evaluation budget, which reuses `Reservation`).
+- `game`: presets.rs (a revision counter, a listing error, the absolute poll deadline), app.rs (one shelf for the run, lent to each chart and handed back on every outcome, polled on the select screen), session.rs (`load_reporting_to` takes the shelf; a chart's first play reports the chosen file's standing error), live.rs (the result loop drives the new `result_screen.rs` and waits to the poll deadline; `Rig::preset_reloaded` goes), and `result_screen.rs` (entries by identity, the view, its summaries and cache, and the evaluation budget, sized as a batch evaluation of the record (`what_if_bytes`, since PR18 on `eval`'s `batch_bytes`)).
 - `player`: the result screen's keyboard and controller commands in both launch paths, read only while a result shows; the end screen's fixed layout; the select screen's chosen preset and its error.
 
 **Done when.**
@@ -981,7 +986,11 @@ Each one holds the behavior D5 and D6 state.
 
 ### PR18. Personal bests (`library`, `game`, `player`)
 
-**Touches.** Schema 3, `counts_for_best`, the ingest path, the rebuild, the display.
+**Touches.**
+- `eval`: the shared memory components and `Evaluator::batch_bytes`; `replay::verify`: `check_record`, `batch_bytes` and `admit` (`TooLarge`).
+- `library`: schema 3, the tuple check at open, `counts_for_best`, `Contribution`, the one `ingest`, the bests phase of a scan pass, `BestWriter`, the bests query.
+- `game`: `RecordSink::after_result` with `SavedPlay` and `BestView`, called from `finish_play` (`PlayReport::best`); record names `<n>-<id>.tprl`; `Reservation` composed from `eval`'s components; the what-if budget on `batch_bytes`.
+- `player`: the `BestsRecords` sink, the launch's catch-up request, the select screen's lamp and EX, the end screen's best line, the shelf's bests status and log.
 
 **Depends on.** PR5, PR13, PR17, PR18a.
 
@@ -993,7 +1002,12 @@ Each one holds the behavior D5 and D6 state.
 - `random_charts_get_no_best_and_still_save`: two plays resolving different branches set no best and count 2, before and after a rebuild;
 - `version_change_invalidates_bests_without_schema_change`;
 - `ingest_is_idempotent`;
-- `rebuild_from_records_skips_refused`.
+- `rebuild_from_records_skips_refused`;
+- If a record's evaluation would exceed the budget, then the rebuild shall refuse it as too large without evaluating it (`over_budget_record_is_refused_before_evaluation`; `batch_bytes_covers_evaluate` measures the estimate against `evaluate`'s peak);
+- When the run exits during a rebuild, the next pass shall keep the committed rows and count each play once (`rebuild_resumes_after_exit_without_clearing`);
+- If a catch-up request cannot be written, then it shall be held until a later phase writes it (`a_request_failing_while_idle_is_held_until_written`, `a_request_failing_while_paused_is_held_until_written`).
+
+**Measured.** `crates/library/tests/rebuild_time.rs` (ignored; run in release) times each step of the bests phase on a chart near the loader's object limit and on a record as dense as admission allows; the figures are indicators of the longest wait for a pause.
 
 ### PR19. Scenario launch (dev-tools, CI)
 

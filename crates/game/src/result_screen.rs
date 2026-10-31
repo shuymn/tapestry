@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bms_model::Chart;
-use eval::{Evaluation, Evaluator, Tally};
+use eval::{Evaluation, Tally};
 use replay::PlayRecord;
 use replay::verify::Coverage;
 use rules::{GaugeValue, RulePreset};
@@ -30,7 +30,7 @@ use rules_toml::PresetFileError;
 
 use crate::presets::Shelf;
 use crate::results::{ReEvaluate, ReEvaluationError, ResultContext};
-use crate::session::{PlayReport, Reservation};
+use crate::session::PlayReport;
 
 /// The most summaries the screen keeps; the least recently viewed goes
 /// first, never the viewed one.
@@ -540,14 +540,12 @@ impl ResultScreen {
     }
 }
 
-/// The bytes evaluating `record` of `chart` under `preset` may hold at its
-/// peak, as a play under `preset` with the record's devices and input
-/// count is admitted ([`Reservation`]); `None` when the evaluator refuses
-/// them, which the evaluation then reports. Every lane object counts, a
-/// section's record included.
+/// The bytes evaluating `record` of `chart` under `preset` holds at its
+/// peak (`replay::verify::batch_bytes`, the estimate a rebuild admits each
+/// record with); `None` when the evaluator refuses them, which the
+/// evaluation then reports. Every lane object counts, a section's record
+/// included.
 #[must_use]
 pub fn what_if_bytes(chart: &Chart, preset: &RulePreset, record: &PlayRecord) -> Option<usize> {
-    let device = record.devices.profile();
-    let probe = Evaluator::new(chart, preset, &device, &record.start, None, 0).ok()?;
-    Some(Reservation::from_probe(&probe, chart, &device, 0).bytes(record.events.len()))
+    replay::verify::batch_bytes(record, chart, preset).ok()
 }

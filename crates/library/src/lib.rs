@@ -1,8 +1,11 @@
 //! The library database (design.md "Loading and Song Selection"): one row per
 //! chart file under the configured roots, with its size, modification time,
-//! file hashes and descriptive header, kept current by a background [`Scan`].
+//! file hashes and descriptive header, kept current by a background [`Scan`];
+//! and the personal bests derived from the saved records (design.md
+//! "Personal Bests"), counted live through a [`BestWriter`] and caught up by
+//! the bests phase of a scan pass.
 //!
-//! # Schema version 2
+//! # Schema version 3
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
@@ -19,6 +22,17 @@
 //!   returns.
 //! - `charts_fts(norm_text)`: an FTS5 trigram index of `charts.norm_text`,
 //!   kept in the same transactions as `charts` by triggers.
+//! - `charts_sha(sha256, path)`: the index by which a record finds its
+//!   chart.
+//! - `meta(id = 1, replay_format, canonical, evaluator, loader, bests,
+//!   requested, completed)`: the interpretation the bests were derived under
+//!   ([`Tuple`]), and the catch-up counters.
+//! - `scores(preset_sha256, ln_mode, chart_sha256, plays, best_ex, best_bp,
+//!   cleared, full_combo)`: one [`Score`] per [`Key`].
+//! - `counted(path, body_sha256, size, mtime_ns)`: each play counted
+//!   ([`PlayId`]).
+//! - `refused(path, size, mtime_ns, reason, waits_for)`: records refused for
+//!   a terminal reason, or waiting for the chart of hash `waits_for`.
 //!
 //! A change of [`Search`]'s normalization changes what the stored text
 //! means, so it bumps the version too.
@@ -49,10 +63,17 @@
     clippy::cast_sign_loss
 )]
 
+// The bests tests' fixture, shared with the integration tests, names the
+// crate as they do.
+#[cfg(test)]
+extern crate self as library;
+
+mod bests;
 mod db;
 mod scan;
 mod search;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
@@ -62,12 +83,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::Connection;
 
+pub use bests::{
+    BESTS_VERSION, Best, Contribution, Ineligible, Ingested, Key, LN_MODE, PlayId, Score, Verified,
+    counts_for_best, ineligible,
+};
 pub use bms_parser::Header;
-pub use scan::{BATCH, HEADER_FIELD_BYTES, Scan, ScanError, ScanOptions, ScanReport, ThreadStart};
+pub use db::Tuple;
+pub use scan::{
+    BATCH, BEST_BATCH, BestsReport, HEADER_FIELD_BYTES, REBUILD_MEMORY, Refusal, Refusals, Scan,
+    ScanError, ScanOptions, ScanReport, ThreadStart, stamp,
+};
 pub use search::{SEPARATOR, Search, Sort};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -178,6 +207,16 @@ pub struct ChartEntry {
 struct Owner {
     _lock: File,
     scanning: AtomicBool,
+    /// A catch-up was requested and its write failed: the next bests phase
+    /// writes it, and forgets it only once the write succeeds.
+    catch_up: AtomicBool,
+}
+
+impl Owner {
+    /// Requests a catch-up through `conn`, durably, or else holds it here.
+    fn request(&self, conn: &Connection) -> rusqlite::Result<()> {
+        db::request(conn).inspect_err(|_| self.catch_up.store(true, Ordering::Release))
+    }
 }
 
 impl Owner {
@@ -203,6 +242,7 @@ impl Owner {
             Ok(()) => Ok(Arc::new(Self {
                 _lock: lock,
                 scanning: AtomicBool::new(false),
+                catch_up: AtomicBool::new(false),
             })),
             Err(TryLockError::WouldBlock) => Err(LibraryError::AlreadyOpen {
                 path: path.to_owned(),
@@ -272,6 +312,85 @@ pub struct Library {
     // Before `owner`, so the connection closes before the lock is released.
     reader: Connection,
     owner: Arc<Owner>,
+    bests: BestsState,
+}
+
+/// What opening found of the stored bests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BestsState {
+    /// They were derived under this build's interpretation.
+    Current,
+    /// They were derived under another, or the file had none: they were
+    /// cleared before anything could show them, and a catch-up rebuilds
+    /// them from the records.
+    Invalidated {
+        /// The interpretation found, `None` when there was none.
+        old: Option<Tuple>,
+    },
+}
+
+impl fmt::Display for BestsState {
+    /// The line to log.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Current => f.write_str("library: personal bests are current"),
+            Self::Invalidated { old: None } => {
+                f.write_str("library: personal bests are rebuilt from the records")
+            }
+            Self::Invalidated { old: Some(old) } => write!(
+                f,
+                "library: personal bests were derived under {old}, not {}; \
+                 they were cleared and are rebuilt from the records",
+                Tuple::current()
+            ),
+        }
+    }
+}
+
+/// The connection that counts live plays into the bests, beside the reader
+/// and the scan's writer (design.md "Personal Bests"). It keeps the lock
+/// beside the database while it lives.
+#[derive(Debug)]
+pub struct BestWriter {
+    path: PathBuf,
+    // Before `owner`, so the connection closes before the lock is released.
+    conn: Connection,
+    owner: Arc<Owner>,
+}
+
+impl BestWriter {
+    fn database(&self, source: rusqlite::Error) -> LibraryError {
+        LibraryError::Database {
+            path: self.path.clone(),
+            source,
+        }
+    }
+
+    /// Counts a live play, in one transaction: the key's score before and
+    /// after, or that the play was counted before.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses; nothing was written.
+    pub fn ingest(&mut self, c: &Contribution) -> Result<Ingested, LibraryError> {
+        let run = |conn: &mut Connection| {
+            let tx = conn.transaction()?;
+            let ingested = bests::ingest(&tx, c)?;
+            tx.commit()?;
+            Ok(ingested)
+        };
+        run(&mut self.conn).map_err(|e| self.database(e))
+    }
+
+    /// Requests a catch-up ([`Library::request_bests_pass`]).
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when the request cannot be written; it is
+    /// then held in memory for the next bests phase.
+    pub fn request_pass(&self) -> Result<(), LibraryError> {
+        self.owner.request(&self.conn).map_err(|e| self.database(e))
+    }
 }
 
 impl Library {
@@ -304,18 +423,89 @@ impl Library {
         if opened != Opened::Current {
             db::remove(path)?;
         }
-        let reader = db::connect(path).map_err(database)?;
+        let mut reader = db::connect(path).map_err(database)?;
         if opened != Opened::Current {
             db::create(&reader).map_err(database)?;
         }
+        let bests = match db::check_tuple(&mut reader).map_err(database)? {
+            None => BestsState::Current,
+            Some(old) => BestsState::Invalidated { old },
+        };
         Ok((
             Self {
                 path: path.to_owned(),
                 reader,
                 owner,
+                bests,
             },
             opened,
         ))
+    }
+
+    fn database(&self, source: rusqlite::Error) -> LibraryError {
+        LibraryError::Database {
+            path: self.path.clone(),
+            source,
+        }
+    }
+
+    /// What opening found of the stored bests, for the log.
+    #[must_use]
+    pub const fn bests_state(&self) -> BestsState {
+        self.bests
+    }
+
+    /// Requests a catch-up of the bests: the next scan pass counts every
+    /// record not yet counted (design.md "Personal Bests"). The player
+    /// requests one at each launch, so plays saved by a run without a
+    /// library are counted too.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when the request cannot be written; it is
+    /// then held in memory for the next bests phase of this library.
+    pub fn request_bests_pass(&self) -> Result<(), LibraryError> {
+        self.owner
+            .request(&self.reader)
+            .map_err(|e| self.database(e))
+    }
+
+    /// Whether a catch-up is pending: requested and not yet completed, or
+    /// held in memory after its write failed.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn bests_pending(&self) -> Result<bool, LibraryError> {
+        let (requested, completed) = db::progress(&self.reader).map_err(|e| self.database(e))?;
+        Ok(requested > completed || self.owner.catch_up.load(Ordering::Acquire))
+    }
+
+    /// Every chart's score under a preset (by its SHA-256) and LN mode, by
+    /// chart SHA-256: one query over the key's prefix.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn bests(
+        &self,
+        preset_sha256: &[u8; 32],
+        ln_mode: i64,
+    ) -> Result<HashMap<[u8; 32], Score>, LibraryError> {
+        bests::scores(&self.reader, preset_sha256, ln_mode).map_err(|e| self.database(e))
+    }
+
+    /// Opens the connection that counts live plays.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when the connection cannot be opened.
+    pub fn best_writer(&self) -> Result<BestWriter, LibraryError> {
+        Ok(BestWriter {
+            path: self.path.clone(),
+            conn: db::connect(&self.path).map_err(|e| self.database(e))?,
+            owner: Arc::clone(&self.owner),
+        })
     }
 
     /// Every indexed chart, by path.
