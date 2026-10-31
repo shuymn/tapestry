@@ -43,6 +43,7 @@ const VALUES: &str = r#""value": [
     {"id": "five", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 5},
     {"id": "two", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 2},
     {"id": "zero", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 0},
+    {"id": "wide", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 13},
     {"id": "offs", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 3,
      "offset": [{"x": 1}]}]"#;
 
@@ -246,6 +247,19 @@ fn combos_exist_for_four_slots() {
 fn quads_count_the_widest_state() {
     let l = judge(&grades(2), &[combo("ten", 10), combo("five", 10)]);
     assert_eq!(l.report().usage.widget_quads, 6);
+}
+
+#[test]
+fn blank_cells_past_the_models_shift_half_a_cell_each() {
+    // 13 digits: the raw x 130 less 65 is 65 from the grade's left (100);
+    // the model draws 11 cells, and the two blank cells past them shift
+    // it by one 10 px cell to 75. "12" centred in 11 cells moves 45 more:
+    // 220 and 230, where the source centres it in 13 cells from 165.
+    let l = judge(&grades(1), &[combo("wide", 130)]);
+    assert_eq!(
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [[220, 560, 10, 20], [230, 560, 10, 20], [100, 560, 80, 20]]
+    );
 }
 
 #[test]
