@@ -607,7 +607,19 @@ fn what_the_model_does_not_draw_is_noted() {
         eight("deco")
     );
     let l = lanes(&extra, &[]);
-    for field in ["bpm", "stop", "time", "hidden", "processed", "hcn"] {
+    // The guides the source draws under player settings are dropped.
+    for field in ["bpm", "stop", "time"] {
+        assert!(
+            l.report()
+                .notes
+                .iter()
+                .any(|n| n.severity == Severity::Dropped
+                    && n.kind == NoteKind::UnsupportedField { field }),
+            "{field}"
+        );
+        assert!(!has(l.report(), NoteKind::Ignored { field }), "{field}");
+    }
+    for field in ["hidden", "processed", "hcn"] {
         assert!(has(l.report(), NoteKind::Ignored { field }), "{field}");
     }
 }

@@ -565,12 +565,18 @@ impl Cx<'_> {
         if hcn.iter().any(|l| !l.is_empty()) {
             self.ignored(at, NoteKind::Ignored { field: "hcn" });
         }
+        // The BPM, STOP and time guides, which the source draws only under
+        // player settings (`play/LaneRenderer.java:401-438`), are not drawn.
         let [bpm, stop, time] = self.def.fields(rec, ["bpm", "stop", "time"]);
         for (field, f) in [("bpm", bpm), ("stop", stop), ("time", time)] {
             if f.and_then(|f| self.tables.nested.get(&f))
                 .is_some_and(|l| !l.is_empty())
             {
-                self.ignored(at, NoteKind::Ignored { field });
+                self.note(
+                    Some(at),
+                    Severity::Dropped,
+                    NoteKind::UnsupportedField { field },
+                );
             }
         }
         for a in [
