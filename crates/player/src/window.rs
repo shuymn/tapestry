@@ -824,22 +824,25 @@ mod tests {
         let shared = std::sync::Arc::new(super::Shared::default());
         let shown = super::WindowShown(std::sync::Arc::clone(&shared));
         let window_side = std::sync::Arc::clone(&shared);
-        let opener = std::thread::spawn(move || {
-            let asked = Instant::now();
-            shown.wait_to_open();
-            asked.elapsed()
-        });
+        let opener = std::thread::spawn(move || shown.wait_to_open());
         std::thread::sleep(Duration::from_millis(100));
+        // Still waiting: nothing showed the window.
+        assert!(!opener.is_finished());
         let c = Controls::new(QpcClock::start());
         let mut showing = super::Showing::new(Instant::now());
         window_side.presented.store(true, Ordering::Release);
+        let showed = Instant::now();
         assert_eq!(
-            showing.poll(&FakeShow::default(), &c, &window_side, Instant::now()),
+            showing.poll(&FakeShow::default(), &c, &window_side, showed),
             None
         );
-        let waited = opener.join().unwrap();
-        assert!(waited >= Duration::from_millis(100), "{waited:?}");
-        assert!(waited < super::SHOW_TIMEOUT, "{waited:?}");
+        opener.join().unwrap();
+        // Woken by the show, not by the wait's bound.
+        assert!(
+            showed.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            showed.elapsed()
+        );
     }
 
     /// Without a frame the window is shown at its deadline, and not before;
