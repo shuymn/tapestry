@@ -679,6 +679,13 @@ mod restore {
         let bgm = frame(280 * MS);
         assert_eq!(level(&out, bgm - 1, audio::HEADROOM), 3_050.0);
         assert_eq!(level(&out, bgm, audio::HEADROOM), 3_051.0 + 2_000.0);
+        // A full play after it restores nothing, and the round's box has
+        // come back to this thread with its queue.
+        let (_sink, queue) = audio_link_at(4, TimeUs(0));
+        control.play(TimeUs(0), queue).unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(control.counters().restored(control.generation()), None);
+        control.ready().unwrap();
     }
 
     /// Steps the worker until it has written past `us`'s frame: the
